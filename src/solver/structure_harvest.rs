@@ -584,6 +584,475 @@ fn duplicate_atom(
     Ok((child, child_rho))
 }
 
+// ===========================================================================
+// #977 — per-atom topology RACE at birth.
+//
+// A born atom must not inherit atom-0's circle template by fiat. Its TOPOLOGY is
+// chosen by EVIDENCE: each candidate basis whose required intrinsic dimension
+// matches the born atom's ARD-selected `d_k` is fit to the residual-factor image
+// the atom would reconstruct, and the winner is the lowest TK-normalized REML —
+// the SAME gauge-invariant comparison [`select_topology_with_fit`] applies to the
+// smooth-term topology race, so cross-topology scores are commensurable. The
+// dictionary the learner discovers is therefore genuinely heterogeneous: a born
+// atom on a circular residual gets a circle, one on a straight residual a line.
+// ===========================================================================
+
+/// Ridge on the candidate-fit normal equations, added to the intrinsic roughness
+/// Gram so the per-candidate penalized least-squares solve is well-posed even on
+/// a near-degenerate residual image. Small relative to the design scale (the
+/// reconstruction target is the already-fit residual factor, O(1)) — it pins the
+/// solve, it does not shape the verdict (every candidate pays the same ridge).
+const TOPOLOGY_FIT_RIDGE: f64 = 1e-6;
+
+/// One realized candidate of the birth topology race: the fitted evaluator, its
+/// penalized-least-squares decoder against the birth target, the chart manifold
+/// the winning atom will carry, and the basis kind tag. Carried as the
+/// `select_topology_with_fit` fit handle so the winner's basis seeds the born
+/// atom directly (no re-fit, no cold restart).
+#[derive(Clone)]
+struct TopologyRaceFit {
+    evaluator: Arc<dyn SaeBasisEvaluator>,
+    basis_kind: SaeAtomBasisKind,
+    manifold: LatentManifold,
+    latent_dim: usize,
+    /// Fitted basis design `Φ(coords)` (`n × m`).
+    phi: Array2<f64>,
+    /// Fitted basis Jacobian `∂Φ` (`n × m × d`).
+    jet: ndarray::Array3<f64>,
+    /// Penalized-least-squares decoder `B` (`m × p`).
+    decoder: Array2<f64>,
+    /// Intrinsic roughness Gram `S` (`m × m`) the atom is seeded with.
+    penalty: Array2<f64>,
+}
+
+/// A candidate topology paired with the evaluator + coordinates + manifold it
+/// realizes for a `d`-dimensional birth. The evaluator is built fresh (cold) for
+/// each candidate; the race then fits it to the birth target.
+struct TopologyCandidateSpec {
+    kind: AutoTopologyKind,
+    basis_kind: SaeAtomBasisKind,
+    manifold: LatentManifold,
+    latent_dim: usize,
+    evaluator: Arc<dyn SaeBasisEvaluator>,
+    /// The `(n, d)` coordinates this candidate evaluates its basis at. A `d = 1`
+    /// candidate reads the template coordinate column; a `d = 2` candidate reads
+    /// the first two columns (or pads with the single column the seed carries).
+    coords: Array2<f64>,
+}
+
+/// Build the topology candidate set whose required intrinsic dimension matches
+/// the born atom's `d_k`, each realized over `coords` (`n × d_seed`, the
+/// template's coordinate block). The candidate set is the realizable subset of
+/// the smooth-term topology race — every member is a CORE basis evaluator
+/// (`src/terms/sae/basis.rs`), so no FFI round-trip and no cold curved family
+/// that the joint refit cannot warm-start:
+///
+/// * **`d = 1`** — `Circle` ([`PeriodicHarmonicEvaluator`]) vs `Euclidean` line
+///   ([`EuclideanPatchEvaluator`] degree 3). These are the line-vs-circle race
+///   the #1026 curved-vs-linear rung adjudicates post-fit, lifted to BIRTH.
+/// * **`d = 2`** — `Torus` ([`TorusHarmonicEvaluator`]), `Sphere`
+///   ([`SphereChartEvaluator`]), and a flat `Euclidean` patch
+///   ([`EuclideanPatchEvaluator`] degree 2). `Cylinder` (`S¹ × ℝ`) has no core
+///   evaluator — there is no mixed periodic/flat tensor basis in the rank-aware
+///   basis (`src/terms/sae/basis.rs`, settled), so it is honestly EXCLUDED from
+///   the realizable race rather than faked by a torus stand-in.
+///
+/// The fixed harmonic / degree budgets mirror the seed-dictionary builder
+/// (`sae_build_atom_plans`): periodic gets `2·d_k + 1` columns, torus two
+/// harmonics per axis, the patch degree 3 (`d = 1`) / 2 (`d = 2`).
+fn topology_candidates_for_dim(
+    coords: ArrayView2<'_, f64>,
+    d_k: usize,
+) -> Result<Vec<TopologyCandidateSpec>, String> {
+    let n = coords.nrows();
+    let d_seed = coords.ncols();
+    if d_k == 0 {
+        // d_k = 0 is the cluster-null rung — it is NOT a manifold topology and is
+        // adjudicated below the race (the bottom rung), never inside it.
+        return Ok(Vec::new());
+    }
+    // Project the seed coordinates onto the candidate's intrinsic dimension. A
+    // d=1 candidate uses the first column; a d=2 candidate uses the first two
+    // (padding the second from the first when the seed carries only one column,
+    // so a 1-D seed can still present a 2-D candidate to the race).
+    let coords_d = |d: usize| -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((n, d));
+        for row in 0..n {
+            for col in 0..d {
+                let src = col.min(d_seed.saturating_sub(1));
+                out[[row, col]] = coords[[row, src]];
+            }
+        }
+        out
+    };
+
+    let mut specs: Vec<TopologyCandidateSpec> = Vec::new();
+    match d_k {
+        1 => {
+            let n_harmonics = (2 * d_k + 1).max(3) | 1; // odd, ≥ 3
+            specs.push(TopologyCandidateSpec {
+                kind: AutoTopologyKind::Circle,
+                basis_kind: SaeAtomBasisKind::Periodic,
+                manifold: LatentManifold::Circle { period: 1.0 },
+                latent_dim: 1,
+                evaluator: Arc::new(PeriodicHarmonicEvaluator::new(n_harmonics)?),
+                coords: coords_d(1),
+            });
+            specs.push(TopologyCandidateSpec {
+                kind: AutoTopologyKind::Euclidean,
+                basis_kind: SaeAtomBasisKind::EuclideanPatch,
+                manifold: LatentManifold::Euclidean,
+                latent_dim: 1,
+                evaluator: Arc::new(EuclideanPatchEvaluator::new(1, 3)?),
+                coords: coords_d(1),
+            });
+        }
+        2 => {
+            specs.push(TopologyCandidateSpec {
+                kind: AutoTopologyKind::Torus,
+                basis_kind: SaeAtomBasisKind::Torus,
+                manifold: LatentManifold::Euclidean,
+                latent_dim: 2,
+                evaluator: Arc::new(TorusHarmonicEvaluator::new(2, 2)?),
+                coords: coords_d(2),
+            });
+            specs.push(TopologyCandidateSpec {
+                kind: AutoTopologyKind::Sphere,
+                basis_kind: SaeAtomBasisKind::Sphere,
+                manifold: LatentManifold::Sphere { dim: 2 },
+                latent_dim: 2,
+                evaluator: Arc::new(SphereChartEvaluator),
+                coords: coords_d(2),
+            });
+            specs.push(TopologyCandidateSpec {
+                kind: AutoTopologyKind::Euclidean,
+                basis_kind: SaeAtomBasisKind::EuclideanPatch,
+                manifold: LatentManifold::Euclidean,
+                latent_dim: 2,
+                evaluator: Arc::new(EuclideanPatchEvaluator::new(2, 2)?),
+                coords: coords_d(2),
+            });
+        }
+        _ => {
+            // d_k ≥ 3: a flat Euclidean patch is the only realizable core basis
+            // (the curved families top out at d = 2). The race degenerates to a
+            // single candidate — still honest (the winner is reported), just not
+            // a contest.
+            specs.push(TopologyCandidateSpec {
+                kind: AutoTopologyKind::Euclidean,
+                basis_kind: SaeAtomBasisKind::EuclideanPatch,
+                manifold: LatentManifold::Euclidean,
+                latent_dim: d_k,
+                evaluator: Arc::new(EuclideanPatchEvaluator::new(d_k, 2)?),
+                coords: coords_d(d_k),
+            });
+        }
+    }
+    Ok(specs)
+}
+
+/// Fit one topology candidate to the birth target `Y` (`n × p`) over `weights`
+/// (`n`, the candidate's per-row reconstruction mass) by penalized least
+/// squares, and return its TK evidence inputs + the realized fit handle.
+///
+/// The reduced per-atom Gaussian-reconstruction evidence is computed on EXACTLY
+/// the scale the #1026 curved-vs-linear rung and the smooth-term topology race
+/// use, so it is commensurable under the shared TK normalizer:
+///
+/// * `raw_reml = ½·(weighted residual SSE) + ½·log|Φᵀ W Φ + S|` — the rank-aware
+///   Laplace negative log evidence of the penalized fit (data-fit deviance + the
+///   Hessian logdet that prices the parameters against the effective sample).
+/// * `null_dim` / `null_space_logdet` — the roughness Gram's null space (the
+///   unpenalized polynomial/constant directions) and its Hessian logdet over that
+///   null space, the gauge-invariance term the TK normalizer subtracts.
+/// * `effective_dim = tr[(Φᵀ W Φ + S)⁻¹ Φᵀ W Φ]` — the penalized effective degrees
+///   of freedom, the per-effective-dim scale's denominator.
+fn fit_topology_candidate(
+    spec: &TopologyCandidateSpec,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Result<TopologyAutoFitEvidence<TopologyRaceFit>, String> {
+    let n = target.nrows();
+    let p = target.ncols();
+    let (phi, jet) = spec.evaluator.evaluate(spec.coords.view())?;
+    let m = phi.ncols();
+    if phi.nrows() != n {
+        return Err(format!(
+            "fit_topology_candidate: basis rows {} != target rows {n}",
+            phi.nrows()
+        ));
+    }
+    if weights.len() != n {
+        return Err(format!(
+            "fit_topology_candidate: weights length {} != target rows {n}",
+            weights.len()
+        ));
+    }
+
+    // Weighted normal equations Φᵀ W Φ and Φᵀ W Y, plus the weighted total mass.
+    let mut gram = Array2::<f64>::zeros((m, m)); // Φᵀ W Φ
+    let mut rhs = Array2::<f64>::zeros((m, p)); // Φᵀ W Y
+    let mut w_sum = 0.0_f64;
+    for row in 0..n {
+        let w = weights[row];
+        if !(w.is_finite() && w >= 0.0) {
+            return Err("fit_topology_candidate: weights must be finite and non-negative".into());
+        }
+        w_sum += w;
+        if w == 0.0 {
+            continue;
+        }
+        for a in 0..m {
+            let pa = phi[[row, a]];
+            let wpa = w * pa;
+            for b in a..m {
+                gram[[a, b]] += wpa * phi[[row, b]];
+            }
+            for out in 0..p {
+                rhs[[a, out]] += wpa * target[[row, out]];
+            }
+        }
+    }
+    // Symmetrize the upper triangle into the lower.
+    for a in 0..m {
+        for b in (a + 1)..m {
+            gram[[b, a]] = gram[[a, b]];
+        }
+    }
+    if !(w_sum > 0.0 && w_sum.is_finite()) {
+        return Err("fit_topology_candidate: degenerate (zero-mass) birth target".into());
+    }
+
+    // The intrinsic roughness Gram of this candidate basis. An atom built from the
+    // evaluator seeds its penalty via `refresh_intrinsic_smooth_penalty`; here we
+    // need the same operator to price smoothness in the evidence. Seed a tiny
+    // ridge so the unpenalized null space is still pinned for the solve, and read
+    // the candidate's analytic raw roughness from a throwaway atom seeded with an
+    // identity penalty (the refresh recomputes the pullback-metric Gram from the
+    // decoder + coordinates, exactly the production seeding).
+    let identity = Array2::<f64>::eye(m);
+    let zero_decoder = Array2::<f64>::zeros((m, p));
+    let mut probe = SaeManifoldAtom::new(
+        "topology_race_probe",
+        spec.basis_kind.clone(),
+        spec.latent_dim,
+        phi.clone(),
+        jet.clone(),
+        zero_decoder,
+        identity,
+    )?
+    .with_basis_evaluator(spec.evaluator.clone());
+    // The intrinsic penalty depends on the decoder via the pullback metric; seed
+    // it from the least-squares decoder once it is solved (below), then read it
+    // back. For the evidence Hessian we use the penalty at the FITTED decoder so
+    // the smoothness price matches the seeded atom.
+
+    // Penalized normal-equations matrix H = Φᵀ W Φ + S(+ridge). Use the raw
+    // roughness Gram (decoder-independent) for the penalty so the solve does not
+    // chase its own decoder; the production atom then refreshes the pullback
+    // penalty from this very decoder.
+    let s_raw = probe.smooth_penalty_raw.clone();
+    let mut h = gram.clone();
+    for a in 0..m {
+        for b in 0..m {
+            h[[a, b]] += s_raw[[a, b]];
+        }
+        h[[a, a]] += TOPOLOGY_FIT_RIDGE;
+    }
+    let h_chol = h
+        .cholesky(Side::Lower)
+        .map_err(|e| format!("fit_topology_candidate: penalized Hessian Cholesky: {e:?}"))?;
+    let decoder = h_chol.solve_mat(&rhs); // (ΦᵀWΦ + S)⁻¹ Φᵀ W Y, m × p
+
+    // Seed the probe atom's pullback penalty from the fitted decoder so the
+    // returned penalty matches what the production atom carries.
+    probe.decoder_coefficients = decoder.clone();
+    probe.refresh_intrinsic_smooth_penalty();
+
+    // Weighted residual SSE of the penalized reconstruction.
+    let mut sse = 0.0_f64;
+    for row in 0..n {
+        let w = weights[row];
+        if w == 0.0 {
+            continue;
+        }
+        for out in 0..p {
+            let mut pred = 0.0_f64;
+            for a in 0..m {
+                pred += phi[[row, a]] * decoder[[a, out]];
+            }
+            let r = target[[row, out]] - pred;
+            sse += w * r * r;
+        }
+    }
+
+    // Hessian logdet (the parameter price). H is SPD (ridge + Gram), so its
+    // logdet is 2·Σ log(diag(L)) of its Cholesky — but FaerCholeskyFactor exposes
+    // only solves, so recompute the logdet from the symmetric eigenvalues, which
+    // we also need for the null-space accounting.
+    let (h_evals, _h_evecs) = h
+        .eigh(Side::Lower)
+        .map_err(|e| format!("fit_topology_candidate: Hessian eigendecomposition: {e:?}"))?;
+    let mut log_det_h = 0.0_f64;
+    for &ev in &h_evals {
+        if !(ev > 0.0) {
+            return Err("fit_topology_candidate: penalized Hessian not positive definite".into());
+        }
+        log_det_h += ev.ln();
+    }
+
+    // Rank-aware Laplace negative log evidence on the smooth-rung scale:
+    // ½·SSE (the Gaussian deviance, unit dispersion — the constant cancels in the
+    // TK race) + ½·log|H|.
+    let raw_reml = 0.5 * sse + 0.5 * log_det_h;
+
+    // Null space of the roughness Gram S (the unpenalized constant/polynomial
+    // directions): null_dim = nullity(S), and the null-space Hessian logdet is
+    // the logdet of H restricted to ker(S). Over ker(S), H = Φᵀ W Φ (+ridge) — the
+    // data curvature of the unpenalized directions, which is what the TK
+    // normalizer prices to make cross-topology scores gauge-invariant.
+    let (s_evals, s_evecs) = s_raw
+        .eigh(Side::Lower)
+        .map_err(|e| format!("fit_topology_candidate: penalty eigendecomposition: {e:?}"))?;
+    let s_max = s_evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+    let s_tol = 1e-9 * (1.0 + s_max);
+    let null_cols: Vec<usize> = s_evals
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v <= s_tol)
+        .map(|(i, _)| i)
+        .collect();
+    let null_dim = null_cols.len();
+    let null_space_logdet = if null_dim == 0 {
+        None
+    } else {
+        // H restricted to ker(S): Uᵀ H U where U are the null eigenvectors.
+        let mut h_null = Array2::<f64>::zeros((null_dim, null_dim));
+        for (ii, &ci) in null_cols.iter().enumerate() {
+            // H · u_ci
+            let mut hu = Array1::<f64>::zeros(m);
+            for a in 0..m {
+                let mut acc = 0.0_f64;
+                for b in 0..m {
+                    acc += h[[a, b]] * s_evecs[[b, ci]];
+                }
+                hu[a] = acc;
+            }
+            for (jj, &cj) in null_cols.iter().enumerate() {
+                let mut acc = 0.0_f64;
+                for a in 0..m {
+                    acc += s_evecs[[a, cj]] * hu[a];
+                }
+                h_null[[ii, jj]] = acc;
+            }
+        }
+        let (hn_evals, _) = h_null
+            .eigh(Side::Lower)
+            .map_err(|e| format!("fit_topology_candidate: null-space Hessian eigh: {e:?}"))?;
+        let mut ld = 0.0_f64;
+        for &ev in &hn_evals {
+            if !(ev > 0.0) {
+                return Err(
+                    "fit_topology_candidate: null-space Hessian not positive definite".into(),
+                );
+            }
+            ld += ev.ln();
+        }
+        Some(ld)
+    };
+
+    // Effective degrees of freedom tr[H⁻¹ (Φᵀ W Φ)] = Σ_a (H⁻¹ Gram)_{aa}.
+    let h_inv_gram = h_chol.solve_mat(&gram); // H⁻¹ (Φᵀ W Φ), m × m
+    let mut effective_dim = 0.0_f64;
+    for a in 0..m {
+        effective_dim += h_inv_gram[[a, a]];
+    }
+    if !(effective_dim.is_finite() && effective_dim > 0.0) {
+        // A fully-penalized fit (no effective parameters) cannot be scored on the
+        // per-effective-dim scale; floor at a single effective parameter so the
+        // race still ranks it (the data-fit term dominates the verdict anyway).
+        effective_dim = 1.0;
+    }
+    if !raw_reml.is_finite() {
+        return Err("fit_topology_candidate: non-finite raw REML".into());
+    }
+
+    let penalty = probe.smooth_penalty.clone();
+    Ok(TopologyAutoFitEvidence {
+        topology_name: spec.kind.as_str().to_string(),
+        raw_reml,
+        null_dim: null_dim as f64,
+        null_space_logdet,
+        effective_dim,
+        n_obs: n,
+        fit_handle: TopologyRaceFit {
+            evaluator: spec.evaluator.clone(),
+            basis_kind: spec.basis_kind.clone(),
+            manifold: spec.manifold.clone(),
+            latent_dim: spec.latent_dim,
+            phi,
+            jet,
+            decoder,
+            penalty,
+        },
+    })
+}
+
+/// Race the candidate topologies whose required intrinsic dimension matches the
+/// born atom's `d_k` against the birth target `Y` (`n × p`, the residual-factor
+/// image the atom would reconstruct) over the template coordinates `coords`, and
+/// return the EVIDENCE-WINNING fit. The winner is the lowest TK-normalized REML
+/// via [`select_topology_with_fit`] — the gauge-invariant comparison the
+/// smooth-term topology race already applies — so a circular residual gets a
+/// circle, a straight residual a line, a spherical residual a sphere, etc.
+///
+/// Returns `None` when the race has no realizable candidate (`d_k = 0`, the
+/// cluster-null rung, handled below the race) or the birth target is degenerate;
+/// the caller then falls back to the template basis (warm inheritance) and the
+/// post-fit curved-vs-linear rung adjudicates as before.
+fn race_birth_topology(
+    coords: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    d_k: usize,
+) -> Result<Option<(TopologyRaceFit, String)>, String> {
+    let specs = topology_candidates_for_dim(coords, d_k)?;
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let selector = TopologyAutoSelector {
+        // The race is over EXACTLY the candidate set we built; do not let the
+        // selector's constant-curvature fuse drop one — pass them through as-is.
+        candidates: specs.iter().map(|s| s.kind).collect(),
+        // Per-effective-dim normalization so a low-parameter line and a
+        // high-parameter sphere are compared on the same per-parameter scale (the
+        // smooth-term race default).
+        score_scale: TopologyScoreScale::PerEffectiveDim,
+        latent: None,
+    };
+    // Index the realized specs by kind so the fit closure can find the right
+    // evaluator/coords for the kind the selector hands it (the selector may fuse
+    // or reorder).
+    let mut by_kind: std::collections::HashMap<AutoTopologyKind, &TopologyCandidateSpec> =
+        std::collections::HashMap::with_capacity(specs.len());
+    for spec in &specs {
+        by_kind.insert(spec.kind, spec);
+    }
+    let ranked = select_topology_with_fit(&selector, |kind| {
+        let spec = by_kind.get(&kind).ok_or_else(|| {
+            format!(
+                "race_birth_topology: no realized candidate for fused topology {:?}",
+                kind.as_str()
+            )
+        })?;
+        fit_topology_candidate(spec, target, weights)
+    })?;
+    let winner = ranked
+        .winner()
+        .ok_or_else(|| "race_birth_topology: empty ranking".to_string())?;
+    Ok(Some((winner.fit_handle.clone(), winner.topology_name.clone())))
+}
+
 /// A small neutral routing logit a born atom is seeded at: large enough that the
 /// refit can grow it if the residual-factor direction is real, small relative to
 /// the established atoms so it does not perturb the current routing.

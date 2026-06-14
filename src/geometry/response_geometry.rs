@@ -819,8 +819,11 @@ pub fn response_curvature_criterion(
 /// Fit curvature as an estimand on a constant-curvature response geometry.
 ///
 /// κ̂ is the minimiser of the profiled criterion [`response_curvature_criterion`]
-/// (the σ-profiled Gaussian negative log-evidence of the tangent model), found by
-/// a golden-section search inside the chart-validity bracket. The exact outer
+/// (the σ-profiled honest change-of-variables negative log-evidence of the wrapped
+/// normal w.r.t. ambient measure), found by a golden-section search inside the
+/// chart-validity bracket. The base point μ is the κ-independent flat centroid, so
+/// every `V_p` evaluation scores the SAME geometry without re-entangling κ with the
+/// chart scale (the #1104 fix). The exact outer
 /// curvature `V_p''(κ̂)` is taken by a central second difference of the same
 /// criterion and handed to [`profile_ci_walk`](crate::geometry::profile_ci_walk)
 /// to size the initial Wald step; the CI itself is the exact χ²₁ profile crossing.
@@ -851,7 +854,8 @@ pub fn fit_response_curvature(
     let (kappa_min, kappa_max) = response_kappa_bounds(values);
 
     // `V_p` as a closure over the criterion; threaded through both the κ̂ search
-    // and the CI walk so every evaluation re-solves the intrinsic mean at its κ.
+    // and the CI walk. Every evaluation uses the same κ-independent flat-centroid
+    // base, so the criterion is a clean 1-D function of κ.
     let mut v_p = |kappa: f64| -> Result<f64, String> {
         response_curvature_criterion(values, dim, kappa, tol, max_iter).map(|(v, _)| v)
     };
