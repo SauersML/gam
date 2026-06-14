@@ -3003,6 +3003,72 @@ fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, 
     Ok(max_kappa)
 }
 
+/// The constant-curvature geodesic-length jet `(s, s′, s″)` of one atom's latent
+/// chart at curvature `kappa`, captured for the #1099 curvature-evidence profile.
+///
+/// `s(κ)` is the mean pairwise GEODESIC distance between the atom's *active*
+/// latent coordinates on the [`ConstantCurvature`] chart of the atom's latent
+/// dimension, evaluated exactly (with its first/second κ-derivatives) through
+/// [`distance_kappa_jet`]. This is the same data-relative geodesic scale the
+/// constant-curvature smooth normalises its kernel length by to hold basis
+/// flexibility κ-invariant — so as κ moves, the atom's roughness penalty must
+/// rescale by `(s(κ_centre)/s(κ))^{2 r}` (see
+/// [`crate::sae_identifiability::AtomInnerFit::geodesic_length_jet`]).
+///
+/// Returns `None` when the chart is degenerate — fewer than two active rows, a
+/// non-positive mean distance (all coordinates coincident), or any non-finite
+/// jet — in which case no κ-evidence profile exists and the curvature CI is
+/// reported `None`.
+fn atom_latent_geodesic_length_jet(
+    term: &SaeManifoldTerm,
+    atom_idx: usize,
+    active: &[usize],
+    kappa: f64,
+) -> Option<crate::sae_identifiability::GeodesicLengthJet> {
+    use crate::geometry::constant_curvature::{ConstantCurvature, distance_kappa_jet};
+    if !kappa.is_finite() || active.len() < 2 {
+        return None;
+    }
+    let coords = term.assignment.coords[atom_idx].as_matrix();
+    let d = coords.ncols();
+    if d == 0 {
+        return None;
+    }
+    let manifold = ConstantCurvature::new(d, kappa);
+    let mut s = 0.0_f64;
+    let mut s1 = 0.0_f64;
+    let mut s2 = 0.0_f64;
+    let mut cnt = 0.0_f64;
+    for (ii, &ri) in active.iter().enumerate() {
+        for &rj in active.iter().skip(ii + 1) {
+            let xi = coords.row(ri);
+            let xj = coords.row(rj);
+            let (dist, d1, d2) = distance_kappa_jet(&manifold, xi, xj).ok()?;
+            if !(dist.is_finite() && d1.is_finite() && d2.is_finite()) {
+                return None;
+            }
+            s += dist;
+            s1 += d1;
+            s2 += d2;
+            cnt += 1.0;
+        }
+    }
+    if !(cnt > 0.0) {
+        return None;
+    }
+    let s = s / cnt;
+    let ds = s1 / cnt;
+    let dds = s2 / cnt;
+    if !(s.is_finite() && s > 0.0 && ds.is_finite() && dds.is_finite()) {
+        return None;
+    }
+    Some(crate::sae_identifiability::GeodesicLengthJet {
+        kappa_centre: kappa,
+        s,
+        ds,
+        dds,
+    })
+}
 
 fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, Array2<f64>), String> {
     let p = tangent.nrows();

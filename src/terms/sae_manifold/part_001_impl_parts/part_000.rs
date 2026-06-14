@@ -206,6 +206,10 @@ impl SaeManifoldTerm {
         let mut derivative_design = Array2::<f64>::zeros((n_active, m));
         let mut row_scores = Array2::<f64>::zeros((n_active, m));
         let mut weights = Array1::<f64>::zeros(n_active);
+        // REML cross term b = ΦᵀW z and total zᵀW z on the captured channel —
+        // the #1099 κ-profile re-solves β(κ) = H(κ)⁻¹ b from exactly these.
+        let mut xtw_z = Array1::<f64>::zeros(m);
+        let mut ztw_z = 0.0_f64;
         for (slot, &row) in active.iter().enumerate() {
             let a_ik = assignments[row][atom_idx];
             let w_i = a_ik * a_ik;
@@ -227,7 +231,9 @@ impl SaeManifoldTerm {
             let scale = -w_i * res_i / dispersion;
             for col in 0..m {
                 row_scores[[slot, col]] = scale * design[[slot, col]];
+                xtw_z[col] += w_i * z_i * design[[slot, col]];
             }
+            ztw_z += w_i * z_i * z_i;
         }
 
         // Penalized inner Hessian H = ΦᵀWΦ + S̃_k.
@@ -290,6 +296,17 @@ impl SaeManifoldTerm {
 
         let kappa_hat = atom_curvature_bound(self, atom_idx)?;
 
+        // The constant-curvature geodesic-length jet of this atom's own latent
+        // chart at the fitted κ̂ — the M_κ channel the #1099 curvature profile
+        // moves κ through (see AtomInnerFit::geodesic_length_jet). It is the mean
+        // pairwise geodesic distance s(κ) between the atom's active latent
+        // coordinates, with its first/second κ-derivatives, evaluated exactly via
+        // `distance_kappa_jet` — the same data-relative geodesic scale the
+        // constant-curvature smooth normalises by to hold flexibility κ-invariant.
+        let penalty_order = atom.smooth_penalty_order;
+        let geodesic_length_jet =
+            atom_latent_geodesic_length_jet(self, atom_idx, &active, kappa_hat);
+
         Ok(Some(crate::sae_identifiability::AtomInnerFit {
             design,
             derivative_design,
@@ -303,6 +320,10 @@ impl SaeManifoldTerm {
             mode_design_row,
             kappa_hat,
             smooth_edf,
+            geodesic_length_jet,
+            penalty_order,
+            xtw_z,
+            ztw_z,
         }))
     }
 
