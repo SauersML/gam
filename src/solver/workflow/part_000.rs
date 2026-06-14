@@ -4,7 +4,7 @@ use crate::custom_family::{
 };
 
 use crate::estimate::{
-    AdaptiveRegularizationOptions, EstimationError, FitOptions, FittedLinkState, UnifiedFitResult,
+    AdaptiveRegularizationOptions, FitOptions, FittedLinkState, UnifiedFitResult,
 };
 
 use crate::families::bms::{

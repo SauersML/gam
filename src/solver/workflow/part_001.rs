@@ -1087,10 +1087,6 @@ struct SurvivalLocationScaleProfile {
 
 
 impl SurvivalLocationScaleProfile {
-    fn objective(&self) -> f64 {
-        self.fit.fit.reml_score
-    }
-
     fn into_result(self) -> SurvivalLocationScaleFitResult {
         SurvivalLocationScaleFitResult {
             fit: self.fit,
@@ -3307,30 +3303,219 @@ fn fit_survival_location_scale_model(
         wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
     ) -> Result<SurvivalLocationScaleProfile, String> {
-        // Inverse-link parameters (SAS epsilon/log_delta, BetaLogistic shape,
-        // Mixture rho) have no analytic ∂LAML/∂θ_link. The only optimizer that
-        // could fit them was the gradient-free compass search, which has been
-        // purged. There is no solver left for these parameters, so fail loudly
-        // rather than silently fitting at the (un-optimized) seed link state.
+        // Analytic-gradient BFGS over the inverse-link parameters θ_link
+        // (SAS ε/log_δ, BetaLogistic ε/log_δ, Mixture ρ). The link enters the
+        // location-scale likelihood through the standardized residual it maps,
+        // and the EXACT data-fit θ-gradient
+        //   ∂(−ℓ)/∂θ_link = −Σ_i w_i·( event_mix(d, ∂logφ(u1), ∂logS(u1)) − ∂logS(u0) )
+        // is formed analytically from the inverse-link param partials
+        // (`SurvivalLocationScaleFamily::link_param_data_fit_gradient`, carried
+        // on the fit result as `link_param_data_fit_gradient`). We optimize the
+        // *profile penalized NLL* `−ℓ + ½βᵀSβ` — not the LAML `reml_score` whose
+        // ½log|H+S_λ| term has its own θ_link dependence through H(β̂,θ) — so the
+        // envelope-theorem gradient matches the cost surface; the final fit
+        // downstream still picks ρ on the full REML surface at the converged link.
+        fn optimize_link_parameters<R>(
+            data: ArrayView2<'_, f64>,
+            spec: &SurvivalLocationScaleTermSpec,
+            kappa_options: &SpatialLengthScaleOptimizationOptions,
+            init: Array1<f64>,
+            name: &str,
+            final_wiggle: Option<LinkWiggleConfig>,
+            wiggle_cfg: Option<LinkWiggleConfig>,
+            make_link: impl Fn(&Array1<f64>) -> Result<InverseLink, String>,
+            recover: R,
+        ) -> Result<SurvivalLocationScaleProfile, String>
+        where
+            R: Fn(&Array1<f64>) -> Option<InverseLink>,
+        {
+            use crate::solver::outer_strategy::{
+                DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
+            };
+            let dim = init.len();
+            // Box bounds keep line-search probes inside a physically admissible
+            // region (|ε|, |log δ| ≤ 6 gives the SAS link a finite range on both
+            // tails; mixture logits stay in a numerically sane band). With an
+            // analytic gradient and no declared Hessian the planner routes this
+            // to BFGS.
+            let lower = init.mapv(|v| v - 6.0);
+            let upper = init.mapv(|v| v + 6.0);
+            let problem = OuterProblem::new(dim)
+                .with_gradient(Derivative::Analytic)
+                .with_hessian(DeclaredHessianForm::Unavailable)
+                .with_tolerance(1e-4)
+                .with_max_iter(240)
+                .with_bounds(lower, upper)
+                .with_initial_rho(init.clone())
+                .with_seed_config(crate::seeding::SeedConfig {
+                    max_seeds: 1,
+                    seed_budget: 1,
+                    num_auxiliary_trailing: dim,
+                    ..Default::default()
+                });
+            let context = format!("survival inverse-link optimization ({name}, dim={dim})");
+            // The objective returns the profile-NLL cost and the exact analytic
+            // θ_link-gradient from the converged fit at this candidate link.
+            let eval_link = move |theta: &Array1<f64>| -> Result<(f64, Array1<f64>), String> {
+                let link = make_link(theta)?;
+                let profile = profile_survival_location_scale_with_inverse_link(
+                    data,
+                    spec,
+                    link,
+                    wiggle_cfg.clone(),
+                    kappa_options,
+                )?;
+                let cost = -profile.fit.fit.log_likelihood
+                    + 0.5 * profile.fit.fit.stable_penalty_term;
+                if !cost.is_finite() {
+                    return Err(format!(
+                        "survival inverse-link ({name}): non-finite profile cost \
+                         (log_likelihood={}, stable_penalty_term={})",
+                        profile.fit.fit.log_likelihood, profile.fit.fit.stable_penalty_term
+                    ));
+                }
+                let gradient = profile
+                    .fit
+                    .link_param_data_fit_gradient
+                    .clone()
+                    .ok_or_else(|| {
+                        format!(
+                            "survival inverse-link ({name}): fit reported no link-parameter \
+                             data-fit gradient"
+                        )
+                    })?;
+                if gradient.len() != theta.len() {
+                    return Err(format!(
+                        "survival inverse-link ({name}): gradient dim {} != theta dim {}",
+                        gradient.len(),
+                        theta.len()
+                    ));
+                }
+                Ok((cost, gradient))
+            };
+            let cost_eval = eval_link.clone();
+            let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
+                cost_eval(theta)
+                    .map(|(cost, _)| cost)
+                    .map_err(crate::estimate::EstimationError::InvalidInput)
+            };
+            let eval_fn = move |_: &mut (), theta: &Array1<f64>| {
+                let (cost, gradient) =
+                    eval_link(theta).map_err(crate::estimate::EstimationError::InvalidInput)?;
+                Ok(OuterEval {
+                    cost,
+                    gradient,
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            };
+            let mut obj = problem.build_objective(
+                (),
+                cost_fn,
+                eval_fn,
+                None::<fn(&mut ())>,
+                None::<
+                    fn(
+                        &mut (),
+                        &Array1<f64>,
+                    )
+                        -> Result<
+                            crate::solver::outer_strategy::EfsEval,
+                            crate::estimate::EstimationError,
+                        >,
+                >,
+            );
+            let result = problem
+                .run(&mut obj, &context)
+                .map_err(|err| format!("{context} failed: {err}"))?;
+            let link = recover_converged_survival_inverse_link(result, &context, recover)?;
+            profile_survival_location_scale_with_inverse_link(
+                data,
+                spec,
+                link,
+                final_wiggle,
+                kappa_options,
+            )
+            .map_err(|err| format!("{context} final profiling failed: {err}"))
+        }
+
         match spec.inverse_link.clone() {
-            InverseLink::Sas(_) => Err(
-                "survival inverse-link optimization (SAS) requires the gradient-free \
-                 compass-search optimizer, which was removed; the SAS epsilon/log_delta \
-                 link parameters have no analytic gradient and no remaining solver"
-                    .to_string(),
+            InverseLink::Sas(state0) => optimize_link_parameters(
+                data,
+                spec,
+                kappa_options,
+                Array1::from_vec(vec![state0.epsilon, state0.log_delta]),
+                "SAS",
+                wiggle.clone(),
+                wiggle.clone(),
+                |theta| {
+                    state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: theta[0],
+                        initial_log_delta: theta[1],
+                    })
+                    .map(InverseLink::Sas)
+                },
+                |rho| {
+                    state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: rho[0],
+                        initial_log_delta: rho[1],
+                    })
+                    .ok()
+                    .map(InverseLink::Sas)
+                },
             ),
-            InverseLink::BetaLogistic(_) => Err(
-                "survival inverse-link optimization (BetaLogistic) requires the \
-                 gradient-free compass-search optimizer, which was removed; the link \
-                 parameters have no analytic gradient and no remaining solver"
-                    .to_string(),
+            InverseLink::BetaLogistic(state0) => optimize_link_parameters(
+                data,
+                spec,
+                kappa_options,
+                Array1::from_vec(vec![state0.epsilon, state0.log_delta]),
+                "BetaLogistic",
+                wiggle.clone(),
+                wiggle.clone(),
+                |theta| {
+                    state_from_beta_logisticspec(SasLinkSpec {
+                        initial_epsilon: theta[0],
+                        initial_log_delta: theta[1],
+                    })
+                    .map(InverseLink::BetaLogistic)
+                },
+                |rho| {
+                    state_from_beta_logisticspec(SasLinkSpec {
+                        initial_epsilon: rho[0],
+                        initial_log_delta: rho[1],
+                    })
+                    .ok()
+                    .map(InverseLink::BetaLogistic)
+                },
             ),
-            InverseLink::Mixture(state0) if !state0.rho.is_empty() => Err(
-                "survival inverse-link optimization (mixture) requires the gradient-free \
-                 compass-search optimizer, which was removed; the mixture rho parameters \
-                 have no analytic gradient and no remaining solver"
-                    .to_string(),
-            ),
+            InverseLink::Mixture(state0) if !state0.rho.is_empty() => {
+                let components = state0.components.clone();
+                let components_recover = components.clone();
+                optimize_link_parameters(
+                    data,
+                    spec,
+                    kappa_options,
+                    state0.rho.clone(),
+                    "mixture",
+                    wiggle.clone(),
+                    wiggle.clone(),
+                    move |rho| {
+                        state_fromspec(&MixtureLinkSpec {
+                            components: components.clone(),
+                            initial_rho: rho.clone(),
+                        })
+                        .map(InverseLink::Mixture)
+                    },
+                    move |rho| {
+                        state_fromspec(&MixtureLinkSpec {
+                            components: components_recover.clone(),
+                            initial_rho: rho.to_owned(),
+                        })
+                        .ok()
+                        .map(InverseLink::Mixture)
+                    },
+                )
+            }
             _ => profile_survival_location_scale(data, spec.clone(), wiggle, kappa_options),
         }
     }
