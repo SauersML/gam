@@ -4320,16 +4320,6 @@ impl<'a> RemlState<'a> {
         crate::solver::persistent_warm_start::open_outer_session(&key)
     }
 
-    /// Engage the cross-process ON-DISK warm-start layer. Called by the
-    /// workflow dispatcher only when the caller attached a cache session (the
-    /// magic-by-default opt-in signal for cross-process / repeat-fit
-    /// persistence). Until this is set the disk load/store/eviction-scan path
-    /// is skipped entirely and only the in-memory warm start is used.
-    pub(crate) fn enable_persistent_warm_start_disk(&self) {
-        self.persistent_warm_start_disk_enabled
-            .store(true, Ordering::Relaxed);
-    }
-
     fn persistent_warm_start_cache_key(&self) -> Option<String> {
         if let Some(key) = self.persistent_warm_start_key.read().unwrap().clone() {
             return Some(key);
