@@ -3136,10 +3136,36 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // modes only; the null space contributes none), so it is exactly the
             // model decrease of the unconstrained modified-Newton step. A genuine
             // defect (real curvature AND large gradient) yields a LARGE decrement,
-            // so this never certifies a non-converged iterate. Requiring the
-            // objective to also be flat (`objective_change ≤ objective_tol`)
-            // confirms we are AT the plateau, not one big step away from it.
-            if objective_change <= objective_tol
+            // so this never certifies a non-converged iterate.
+            //
+            // Precondition (gam#1082): the original gate required the LAST cycle's
+            // `objective_change ≤ objective_tol` to "confirm we are AT the plateau,
+            // not one big step away." That precondition is the multinomial
+            // smooth-by-factor blocker: the coupled-softmax select=TRUE gauge mode
+            // is a NEAR-null (weak-but-above-`KKT_REFUSAL_RANK_TOL` curvature), so
+            // the iterate keeps DRIFTING along it with a small but nonzero
+            // `objective_change` every cycle (exactly the gam#979 survival
+            // signature) — `objective_change ≤ objective_tol` never holds, the
+            // decrement certificate never fires, and the solve crawls to
+            // `inner_max_cycles` paying one ~p³ Newton-step eigh per cycle (the
+            // eu-stack-profiled #1082 blow-up). But the decrement bound is itself
+            // the correct, curvature-aware stopping test: by Conn–Gould–Toint Thm
+            // 6.4.6 `decrement ≤ objective_tol` ALONE certifies the iterate is the
+            // penalized optimum to tolerance — no model-resolvable step (gauge
+            // drift included) lowers the objective by more than tol. So the
+            // objective-flat precondition is replaced by the RESIDUAL-STALL window
+            // (`cycles_since_residual_improved ≥ DECREMENT_STALL_WINDOW`): the
+            // certificate fires once the raw residual has stopped descending and
+            // the decrement confirms no resolvable improvement remains. This reuses
+            // the EXACT degeneracy classification the Newton step uses (the
+            // decrement skips every `|γ_k| ≤ null_cutoff` mode), so it catches the
+            // near-null gauge direction the raw-`H_pen` range projection's absolute
+            // `1e-10·λ_max` cutoff misses — without ever accepting a genuinely
+            // curved (large-decrement) unconverged iterate. A still-progressing
+            // solve never reaches the stall window (its residual keeps improving,
+            // resetting the counter).
+            const DECREMENT_STALL_WINDOW: usize = 3;
+            if cycles_since_residual_improved >= DECREMENT_STALL_WINDOW
                 && let Some(decrement) = joint_spectrum
                     .as_ref()
                     .map(|spectrum| spectrum.newton_decrement())
@@ -3147,19 +3173,20 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && decrement <= objective_tol
             {
                 log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | Newton-decrement certificate (gam#1040/#1088): \
-                     residual={:.3e} (tol={:.3e}) stalled above tol on a weakly-identified block, but the \
-                     unconstrained modified-Newton step's predicted objective decrease (Newton decrement \
-                     ½gᵀH⁻¹g over identified modes)={:.3e} ≤ objective_tol={:.3e} and |Δobjective|={:.3e} ≤ {:.3e} \
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | Newton-decrement certificate (gam#1040/#1088/#1082): \
+                     residual={:.3e} (tol={:.3e}) stalled above tol for {} cycles on a weakly-identified block (last \
+                     |Δobjective|={:.3e}, drifting along a near-null gauge mode), but the unconstrained modified-Newton \
+                     step's predicted objective decrease (Newton decrement ½gᵀH⁻¹g over identified modes, the SAME \
+                     |γ_k|≤null_cutoff degeneracy classification the Newton step uses)={:.3e} ≤ objective_tol={:.3e} \
                      — no model-resolvable step lowers the penalized objective by more than tolerance, so the \
                      iterate is the REML optimum on the identifiable subspace (Conn–Gould–Toint Thm 6.4.6); \
                      the un-resolvable residual mass lies on near-null directions the outer IFT projects out.",
                     cycle,
                     residual,
                     residual_tol,
-                    decrement,
-                    objective_tol,
+                    cycles_since_residual_improved,
                     objective_change,
+                    decrement,
                     objective_tol,
                 );
                 // Record the residual this exit certified on so the terminal
