@@ -3044,10 +3044,6 @@ fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, u
     }
 }
 
-/// Shrink-only debt ledger of grandfathered mechanical-split files (crate-root
-/// relative). New mechanical part-files must NOT be added here.
-const MECHANICAL_PARTS_BASELINE: &str = "mechanical_parts_baseline.txt";
-
 /// Is this repo-relative path a mechanical line-count split rather than a logical
 /// module? True when the file stem is `part_<digits>` OR any ancestor directory
 /// component ends in `_parts` or is exactly `split_parts`.
@@ -3073,19 +3069,9 @@ fn is_mechanical_part_path(rel: &Path) -> bool {
 }
 
 /// Ban mechanical file-splitting (`part_<NNN>.rs`, `*_parts/`, `split_parts/`).
-/// Existing offenders are grandfathered by `mechanical_parts_baseline.txt` (a
-/// ratchet that may only shrink); any mechanical part-file NOT in that ledger is
-/// a fresh violation and fails the build. Split by cohesive concern into
-/// descriptively-named modules instead.
+/// HARD ban with NO grandfathering: every such path fails the build. Split each
+/// module by cohesive concern into descriptively-named modules instead.
 fn scan_for_mechanical_part_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
-    let baseline_text =
-        fs::read_to_string(root.join(MECHANICAL_PARTS_BASELINE)).unwrap_or_default();
-    let baseline: std::collections::HashSet<&str> = baseline_text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
-
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -3109,14 +3095,14 @@ fn scan_for_mechanical_part_files(root: &Path, offenders: &mut Vec<(PathBuf, usi
             continue;
         }
         let rel = PathBuf::from(&rel_text);
-        if !is_mechanical_part_path(&rel) || baseline.contains(rel_text.as_str()) {
+        if !is_mechanical_part_path(&rel) {
             continue;
         }
         offenders.push((
             rel,
             0,
-            "mechanical line-count split; decompose by cohesive concern into named modules \
-             (and never add to mechanical_parts_baseline.txt)"
+            "mechanical line-count split; decompose by cohesive concern into descriptively-named \
+             modules — this is a HARD ban, no grandfathering"
                 .to_string(),
         ));
     }
