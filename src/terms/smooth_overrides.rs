@@ -582,6 +582,11 @@ fn apply_measure_jet(
     {
         spec.double_penalty = double_penalty;
     }
+    // Multiscale (per-scale spectral split + ψ dials + ridge) is an explicit
+    // opt-in (#1116); default single-scale at any center count.
+    if let Some(multiscale) = descriptor.get("multiscale").and_then(JsonValue::as_bool) {
+        spec.multiscale = multiscale;
+    }
     Ok(())
 }
 

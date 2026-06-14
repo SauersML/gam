@@ -2081,6 +2081,7 @@ pub fn build_smooth_basis(
                     "scales",
                     "length_scale",
                     "double_penalty",
+                    "multiscale",
                     "id",
                     "__by_col",
                 ],
@@ -2118,6 +2119,10 @@ pub fn build_smooth_basis(
             if centers < 3 {
                 return Err("measurejet smooth requires at least 3 centers".to_string());
             }
+            // Multiscale (per-scale spectral split + (α, lnτ) ψ dials + the
+            // affine-preserving ridge) is an explicit opt-in (#1116): default
+            // single-scale at any center count, the Duchon/Matérn footprint.
+            let multiscale = option_bool(options, "multiscale").unwrap_or(false);
             Ok(SmoothBasisSpec::MeasureJet {
                 feature_cols: cols.to_vec(),
                 spec: MeasureJetBasisSpec {
@@ -2129,9 +2134,10 @@ pub fn build_smooth_basis(
                     tau0,
                     num_scales,
                     // 0.0 sentinel = auto initialization in the basis builder
-                    // (median nearest-center spacing, doubled).
+                    // (median nearest-center spacing).
                     length_scale,
                     double_penalty: smooth_double_penalty,
+                    multiscale,
                     identifiability: MeasureJetIdentifiability::CenterSumToZero,
                     frozen_quadrature: None,
                 },

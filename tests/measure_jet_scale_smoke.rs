@@ -66,10 +66,13 @@ fn filament_coordinate(row: usize, dim: usize) -> f64 {
 fn measure_jet_build_scale_smoke_200k_rows() {
     let data = Array2::<f64>::from_shape_fn((N_ROWS, N_DIMS), |(i, k)| filament_coordinate(i, k));
 
+    // Multiscale (per-scale spectral split) is an explicit opt-in (#1116);
+    // this smoke exercises the spectral build path, so it opts in.
     let spec = MeasureJetBasisSpec {
         center_strategy: CenterStrategy::FarthestPoint {
             num_centers: N_CENTERS,
         },
+        multiscale: true,
         ..Default::default()
     };
 
@@ -91,8 +94,8 @@ fn measure_jet_build_scale_smoke_200k_rows() {
          (bound {WALL_CLOCK_BOUND_SECS}s) — an O(n²) regression in the build path?"
     );
 
-    // (c) per-level (spectral) mode is the default (order_s = 0.0 sentinel):
-    // one penalty candidate per band scale plus the double-penalty ridge.
+    // (c) per-level (spectral) mode under the multiscale opt-in (#1116): one
+    // penalty candidate per band scale plus the double-penalty ridge.
     let BasisMetadata::MeasureJet {
         eps_band, order_s, ..
     } = &built.metadata
@@ -101,7 +104,7 @@ fn measure_jet_build_scale_smoke_200k_rows() {
     };
     assert_eq!(
         *order_s, 0.0,
-        "default spec must persist the per-level (spectral) sentinel"
+        "default order keeps the auto (spectral) sentinel"
     );
     assert!(
         !eps_band.is_empty(),

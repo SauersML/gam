@@ -285,8 +285,8 @@ fn support_domination_variance_monotone() {
 // Gate §7.3 — near-miss strand decoupling under the single-scale-mode default.
 // ===========================================================================
 
-/// Centers per parallel strand (kept well under the multiscale-mode threshold of 64
-/// so the single-scale-mode default energy is exercised).
+/// Centers per parallel strand. Multiscale is opt-in (#1116), so the default
+/// spec exercises the single-scale-mode energy at any center count.
 const NM_M1: usize = 20;
 /// Along-strand center spacing.
 const NM_H: f64 = 0.25;

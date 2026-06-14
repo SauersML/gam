@@ -585,11 +585,12 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
     };
 
     // Measure-jet scale spectrum: one compact line per term (only if present).
-    // Two realized shapes, matching the single-scale/multiscale auto-split (#1039): a
-    // single fused penalty (single-scale mode, the default below ~64 centers — see
-    // `measure_jet_multiscale_mode`) carries an empty `per_scale`, so we print just
-    // the band and the spec order and skip the slope readout; the per-scale
-    // spectrum (multiscale mode) prints the fitted lambda_l and the implied order.
+    // Two realized shapes, matching the single-scale/multiscale opt-in (#1116): a
+    // single fused penalty (single-scale mode, the default at any center count
+    // unless `multiscale=true` — see `measure_jet_multiscale_mode`) carries an
+    // empty `per_scale`, so we print just the band and the spec order and skip the
+    // slope readout; the per-scale spectrum (multiscale mode) prints the fitted
+    // lambda_l and the implied order.
     let measure_jet_section = if input.measure_jet_spectra.is_empty() {
         String::new()
     } else {
