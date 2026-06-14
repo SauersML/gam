@@ -2439,6 +2439,17 @@ fn cholesky_solve_vector_fixed<const D: usize>(
     l: ArrayView2<'_, f64>,
     b: ArrayView1<'_, f64>,
 ) -> Array1<f64> {
+    // Precondition: `l` is a Cholesky factor whose diagonals are strictly
+    // positive and finite (every f64 factor in this module is produced by
+    // `cholesky_lower`, which rejects `!is_finite() || sum <= 0.0` pivots). The
+    // back/forward substitution below divides by `l[[i, i]]` with no per-row
+    // guard; a future caller that hands an unvalidated factor here would emit a
+    // silent `NaN` into the Schur reduction (#1038). Catch that loudly in
+    // debug/CI rather than letting it flow into the evidence/gradient.
+    debug_assert!(
+        (0..D).all(|i| l[[i, i]].is_finite() && l[[i, i]].abs() >= f64::MIN_POSITIVE),
+        "cholesky_solve_vector_fixed: factor diagonal must be finite and non-subnormal"
+    );
     let mut y = [0.0_f64; D];
     for i in 0..D {
         let mut sum = b[i];
@@ -5224,7 +5235,13 @@ fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
                 pivot_row = row;
             }
         }
-        if pivot_mag == 0.0 || !lu[[pivot_row, col]].is_finite() {
+        // Reject not just an exactly-zero pivot, but any non-finite or
+        // subnormal magnitude: dividing by a subnormal in the elimination /
+        // back-solve produces `Inf`/`NaN` that would otherwise flow silently
+        // into the Woodbury inverse and the evidence log-det (#1038). A
+        // capacitance this degenerate is a desync the caller must surface
+        // (→ `Ok(None)` cross-row-absent / `SchurFactorFailed`), not consume.
+        if !pivot_mag.is_finite() || pivot_mag < f64::MIN_POSITIVE {
             return None;
         }
         if pivot_row != col {
@@ -5242,6 +5259,17 @@ fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
                 let v = lu[[col, c]];
                 lu[[row, c]] -= factor * v;
             }
+        }
+    }
+    // Post-elimination invariant: every U diagonal is finite and not subnormal.
+    // The per-column pivot guard above validates each diagonal as it is chosen,
+    // but assert it explicitly so `SmallLu::solve` can divide by `lu[[i, i]]`
+    // without a per-entry guard and so a `SmallLu` value can never carry a
+    // factor that would silently emit `Inf`/`NaN` into the capacitance solve.
+    for i in 0..r {
+        let u = lu[[i, i]];
+        if !u.is_finite() || u.abs() < f64::MIN_POSITIVE {
+            return None;
         }
     }
     Some(SmallLu { lu, piv, perm_sign })
@@ -5268,7 +5296,15 @@ impl SmallLu {
     }
 
     /// Solve `C x = b` reusing the factorization (in place into a fresh vector).
-    fn solve(&self, b: &Array1<f64>) -> Array1<f64> {
+    ///
+    /// Returns `None` when the solve cannot produce a finite result — either a
+    /// `U` diagonal is non-finite/subnormal (defensive: `small_lu_factor`
+    /// already rejects such factors, but a future construction path might not)
+    /// or the back-substitution overflows to `Inf`/`NaN` for an extreme RHS on
+    /// an ill-conditioned (yet validly factored) capacitance. Surfacing `None`
+    /// lets the Woodbury / evidence consumers fail loudly (#1038) instead of
+    /// flowing a silent `NaN` into the log-det and outer gradient.
+    fn solve(&self, b: &Array1<f64>) -> Option<Array1<f64>> {
         let r = self.dim();
         // Apply the row permutation: y = P b.
         let mut y = Array1::<f64>::zeros(r);
@@ -5290,9 +5326,17 @@ impl SmallLu {
             for j in (i + 1)..r {
                 sum -= self.lu[[i, j]] * x[j];
             }
-            x[i] = sum / self.lu[[i, i]];
+            let pivot = self.lu[[i, i]];
+            if !pivot.is_finite() || pivot.abs() < f64::MIN_POSITIVE {
+                return None;
+            }
+            x[i] = sum / pivot;
         }
-        x
+        if x.iter().all(|v| v.is_finite()) {
+            Some(x)
+        } else {
+            None
+        }
     }
 }
 
@@ -5382,28 +5426,42 @@ impl CrossRowWoodbury {
     /// `C⁻¹ D` as a dense `R × R` matrix (`R` capacitance solves; column `l` is
     /// `d_l · C⁻¹ e_l`). Shared by the inverse-diagonal correction and any
     /// adjoint trace that needs the selected inverse of the capacitance.
-    pub fn capacitance_inv_times_d(&self) -> Array2<f64> {
+    ///
+    /// Returns `None` when any capacitance solve fails to produce a finite
+    /// result (#1038); the consumer must surface this as a loud failure rather
+    /// than propagate a `NaN` into the evidence/gradient.
+    pub fn capacitance_inv_times_d(&self) -> Option<Array2<f64>> {
         let r = self.d.len();
         let mut out = Array2::<f64>::zeros((r, r));
         let mut e_l = Array1::<f64>::zeros(r);
         for l in 0..r {
             e_l.fill(0.0);
             e_l[l] = 1.0;
-            let col = self.capacitance_lu.solve(&e_l);
+            let col = self.capacitance_lu.solve(&e_l)?;
             for k in 0..r {
                 out[[k, l]] = col[k] * self.d[l];
             }
         }
-        out
+        Some(out)
     }
 
     /// Subtract the rank-`R` Woodbury term from the latent inverse diagonal:
     /// `diag ← diag − diag(H₀'⁻¹U C⁻¹ D Uᵀ H₀'⁻¹)`. With `G = h0inv_u` and
     /// `(C⁻¹D) = capacitance_inv_times_d()`, the entry at global index `g` is
     /// `Σ_{k,l} G[g,k] (C⁻¹D)[k,l] G[g,l]`.
-    fn subtract_inverse_diagonal(&self, diag: &mut Array1<f64>) {
+    fn subtract_inverse_diagonal(
+        &self,
+        diag: &mut Array1<f64>,
+    ) -> Result<(), ArrowSchurError> {
         let r = self.d.len();
-        let cinv_d = self.capacitance_inv_times_d();
+        let cinv_d = self.capacitance_inv_times_d().ok_or_else(|| {
+            ArrowSchurError::SchurFactorFailed {
+                reason: "cross-row Woodbury capacitance solve produced a non-finite \
+                         C⁻¹D for the inverse-diagonal correction (#1038): \
+                         singular/ill-conditioned cross-row capacitance"
+                    .to_string(),
+            }
+        })?;
         let total_len = self.h0inv_u.nrows();
         for g in 0..total_len {
             let mut acc = 0.0_f64;
@@ -5418,6 +5476,7 @@ impl CrossRowWoodbury {
             }
             diag[g] -= acc;
         }
+        Ok(())
     }
 
     /// `log det(I_R + D·M)` (the matrix-determinant-lemma correction). Returns
@@ -5452,7 +5511,7 @@ impl CrossRowWoodbury {
         entries: &[(usize, usize, f64)],
         u_t: &mut Array1<f64>,
         u_beta: &mut Array1<f64>,
-    ) {
+    ) -> Result<(), ArrowSchurError> {
         let r = self.d.len();
         // p = D Uᵀ (H₀'⁻¹ rhs)_t.
         let mut p = Array1::<f64>::zeros(r);
@@ -5462,8 +5521,17 @@ impl CrossRowWoodbury {
         for k in 0..r {
             p[k] *= self.d[k];
         }
-        // q = C⁻¹ p.
-        let q = self.capacitance_lu.solve(&p);
+        // q = C⁻¹ p. A non-finite solve is a singular/ill-conditioned cross-row
+        // capacitance (#1038): fail loudly rather than write `NaN` into the
+        // Newton step / adjoint solve.
+        let q = self.capacitance_lu.solve(&p).ok_or_else(|| {
+            ArrowSchurError::SchurFactorFailed {
+                reason: "cross-row Woodbury capacitance solve produced a non-finite \
+                         C⁻¹p for the inverse correction (#1038): \
+                         singular/ill-conditioned cross-row capacitance"
+                    .to_string(),
+            }
+        })?;
         // u_t -= (H₀'⁻¹U)_t · q.
         for g in 0..u_t.len() {
             let mut acc = 0.0_f64;
@@ -5480,6 +5548,7 @@ impl CrossRowWoodbury {
             }
             u_beta[c] -= acc;
         }
+        Ok(())
     }
 }
 
@@ -5809,7 +5878,7 @@ impl ArrowFactorCache {
             // (by symmetry of `H₀'⁻¹`) `(Uᵀ H₀'⁻¹)_t = Gᵀ`, the diagonal entry at
             // global index `g` is `Σ_{k,l} G[g,k] (C⁻¹D)[k,l] G[g,l]`. Form the
             // `R×R` matrix `C⁻¹D` once (R solves), then contract per row index.
-            woodbury.subtract_inverse_diagonal(&mut out);
+            woodbury.subtract_inverse_diagonal(&mut out)?;
         }
         Ok(out)
     }
@@ -5855,7 +5924,7 @@ impl ArrowFactorCache {
                 woodbury.source_entries(),
                 &mut u_t,
                 &mut u_beta,
-            );
+            )?;
         }
         Ok((u_t, u_beta))
     }
@@ -6190,7 +6259,7 @@ pub fn solve_arrow_newton_step_with_options(
                 &source.entries,
                 &mut delta_t,
                 &mut delta_beta,
-            );
+            )?;
             cache.cross_row_woodbury = Some(woodbury);
         }
     }
@@ -7225,6 +7294,15 @@ fn solve_arrow_system_f32(
 
 fn cholesky_solve_lower_f32(l: &Array2<f32>, b: &Array1<f32>) -> Array1<f32> {
     let n = l.nrows();
+    // Precondition: positive, finite factor diagonals (see
+    // `cholesky_solve_vector_fixed`). The certified mixed-precision streaming
+    // path refines in f64 and falls back when this f32 solve is not usable, but
+    // guard the precondition loudly in debug/CI so a future factor source that
+    // skips that refinement cannot divide by a zero/non-finite pivot silently.
+    debug_assert!(
+        (0..n).all(|i| l[[i, i]].is_finite() && l[[i, i]].abs() >= f32::MIN_POSITIVE),
+        "cholesky_solve_lower_f32: factor diagonal must be finite and non-subnormal"
+    );
     let mut y = Array1::<f32>::zeros(n);
     for i in 0..n {
         let mut sum = b[i];
@@ -7908,6 +7986,14 @@ fn dot2(a_t: &Array1<f64>, a_beta: &Array1<f64>, b_t: &Array1<f64>, b_beta: &Arr
 /// Solve `L Lᵀ x = b` given the lower Cholesky factor `L`.
 fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
     let n = l.nrows();
+    // Precondition: positive, finite factor diagonals (see
+    // `cholesky_solve_vector_fixed`). Guard loudly in debug/CI so a future
+    // caller supplying an unvalidated factor cannot divide by a zero/non-finite
+    // pivot and leak a silent `NaN` into the Schur β-solve (#1038).
+    debug_assert!(
+        (0..n).all(|i| l[[i, i]].is_finite() && l[[i, i]].abs() >= f64::MIN_POSITIVE),
+        "cholesky_solve_lower: factor diagonal must be finite and non-subnormal"
+    );
     // Forward solve L y = b.
     let mut y = Array1::<f64>::zeros(n);
     for i in 0..n {
