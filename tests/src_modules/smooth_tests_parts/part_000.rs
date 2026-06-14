@@ -7,6 +7,7 @@
     };
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};
+    use crate::solver::outer_strategy::OuterEvalOrder;
     use ndarray::{Axis, array};
     use rand::RngExt;
     use rand::SeedableRng;
@@ -4226,9 +4227,8 @@
                             "Hessian shape mismatch at ψ={psi:.4} ρ={:+.2}",
                             rho[0],
                         );
-                        for ((r, c), (vs, vt)) in hs
-                            .indexed_iter()
-                            .zip(ht.indexed_iter())
+                        for (((r, c), vs), (_, vt)) in
+                            hs.indexed_iter().zip(ht.indexed_iter())
                         {
                             let habs = (vs - vt).abs();
                             let hrel = habs / (1.0 + vs.abs());
