@@ -388,3 +388,43 @@ fn lsh_routed_encode_matches_direct_atom_encode() {
         "routed coordinates must equal the direct encode; max abs diff = {coord_diff}"
     );
 }
+
+#[test]
+fn lsh_routed_encode_rejects_declared_latent_dim_mismatch() {
+    let atom = planted_circle_atom(8);
+    let atlas = EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        1.0,
+        AtlasConfig {
+            grid_resolution: 32,
+            ridge: 1.0e-9,
+            newton_steps: 2,
+        },
+    )
+    .expect("atlas build");
+
+    let frame = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap();
+    let sketch =
+        RandomProjectionFrameSketch::from_decoder_blocks(&[frame], 8, 7).expect("sketch build");
+    let index = SaeCandidateIndex::build(&sketch, IndexConfig::auto(8, 1, 7)).expect("index build");
+
+    let targets = Array2::from_shape_vec((1, P), circle_target(0.2).to_vec()).unwrap();
+    let amplitudes = Array1::<f64>::ones(1);
+
+    let err = atlas
+        .certified_encode_with_index(
+            std::slice::from_ref(&atom),
+            &index,
+            &sketch,
+            targets.view(),
+            amplitudes.view(),
+            2,
+        )
+        .expect_err("declared latent_dim mismatch must be rejected");
+
+    assert!(
+        err.contains("returned t.len()=1") && err.contains("declared latent_dim=2"),
+        "unexpected error: {err}"
+    );
+}
