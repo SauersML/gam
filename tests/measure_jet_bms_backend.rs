@@ -244,31 +244,28 @@ fn bms_marginal_slope_accepts_measure_jet_backbone() {
     );
 
     // (c) Measure-jet diagnostic: with `centers=16` and no `multiscale` opt-in
-    // (#1116) the mjs term resolves to single-scale mode — exactly ONE fused
-    // jet-energy penalty per surface, the same one-λ outer footprint as
-    // Duchon/Matérn (#1039). The per-scale spectral split is reserved for the
-    // explicit multiscale opt-in where the spectrum is identifiable; the
-    // affine-preserving ridge is likewise multiscale-only
-    // (#1116: in single-scale the one fused candidate already penalizes the
-    // entire non-affine span, so a second λ only over-shrinks and doubles the
-    // outer search). Here single-scale would otherwise inflate the
-    // marginal-slope family's O(n) per-evaluation cost for no benefit. The band
-    // is still realized (frozen quadrature non-empty), it just feeds one fused
-    // penalty.
+    // (#1116) the mjs term resolves to single-scale mode — the fused
+    // jet-energy penalty PLUS the affine-preserving nullspace-stabilizing ridge
+    // per surface (two candidates), the Duchon/Matérn-class footprint (#1039).
+    // The per-scale spectral split is reserved for the explicit multiscale
+    // opt-in where the spectrum is identifiable; opting it in here would only
+    // inflate the marginal-slope family's O(n) per-evaluation cost for no
+    // benefit. The band is still realized (frozen quadrature non-empty), it
+    // just feeds one fused energy penalty alongside the ridge.
     assert!(
         mjs_band_len(&out.marginalspec_resolved, "marginal") >= 1,
         "marginal mjs surface must still realize a scale band"
     );
     assert_eq!(
         out.marginal_design.penalties.len(),
-        1,
-        "small-centers mjs surface must be single-scale: exactly one fused penalty, got {}",
+        2,
+        "small-centers mjs surface must be single-scale: fused penalty + ridge, got {}",
         out.marginal_design.penalties.len()
     );
     assert_eq!(
         out.logslope_design.penalties.len(),
-        1,
-        "small-centers logslope mjs surface must be single-scale: exactly one fused penalty, got {}",
+        2,
+        "small-centers logslope mjs surface must be single-scale: fused penalty + ridge, got {}",
         out.logslope_design.penalties.len()
     );
 }
