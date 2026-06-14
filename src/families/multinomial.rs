@@ -1174,10 +1174,26 @@ pub fn fit_penalized_multinomial_formula(
     // tighter than the softmax objective's f64 noise floor on near-separable
     // fits (see `MULTINOMIAL_FORMULA_INNER_TOL`).
     let outer_max_iter = max_iter.max(1);
+    // The OUTER REML/LAML smoothing-parameter search must converge to a
+    // well-calibrated ρ-gradient tolerance, NOT to the caller's (typically very
+    // tight) INNER KKT tolerance. The #715 control-split repurposed the caller's
+    // `tol` as the outer control, but feeding an inner-scale `tol = 1e-8`
+    // straight into `outer_tol` makes REML grind dozens of extra exact-gradient
+    // outer iterations (each an O(D·p³) Laplace-derivative assembly over the
+    // full P·M joint design) to squeeze ρ digits that no longer move the fitted
+    // surface — the smooth-by-factor 269s wall-clock overrun (#1082). The
+    // framework's calibrated default (`BlockwiseFitOptions::default().outer_tol`,
+    // 1e-5) is the right scale for ρ selection: at that tolerance the selected λ
+    // (and thus η and the recovered probability surface) is already pinned to
+    // far below the test's accuracy bars. So the outer tolerance is floored at
+    // the framework default — never tighter than it — while the caller's `tol`
+    // continues to drive the INNER joint-Newton KKT target (`inner_tol` below),
+    // where its precision actually matters.
+    let default_outer_tol = BlockwiseFitOptions::default().outer_tol;
     let outer_tol = if tol.is_finite() && tol > 0.0 {
-        tol
+        tol.max(default_outer_tol)
     } else {
-        BlockwiseFitOptions::default().outer_tol
+        default_outer_tol
     };
     let inner_tol = MULTINOMIAL_FORMULA_INNER_TOL.max(tol.max(0.0));
 
