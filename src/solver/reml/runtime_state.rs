@@ -1008,11 +1008,32 @@ fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
 /// distinguish good seeds from bad. The penalty vanishes at the true inner
 /// mode (r_g → 0), so converged screening fits incur no penalty.
 ///
-/// Outside of screening, partial fits never reach this helper:
+/// In the standard two-loop driver, partial fits never reach this helper:
 /// `execute_pirls_if_needed` surfaces `MaxIterationsReached` and
-/// `LmStepSearchExhausted` as `EstimationError::PirlsDidNotConverge`, so
-/// production REML evaluations always operate on certified inner modes
-/// and this helper is a strict no-op for them.
+/// `LmStepSearchExhausted` as `EstimationError::PirlsDidNotConverge`, so those
+/// REML evaluations always operate on certified inner modes and this helper is
+/// a strict no-op for them. The EFS single-loop strategy is the exception: it
+/// intentionally ACCEPTS a partial (`is_failed_max_iterations`) inner state at
+/// large n (the bam / Wood 2015 amortization tradeoff; see
+/// `execute_pirls_if_needed`'s `in_efs_single_loop` branch), so an uncertified
+/// inner mode can flow into cost assembly with the barrier active.
+///
+/// SINGLE SOURCE OF TRUTH (objective↔gradient consistency): this helper is the
+/// one and only place the outer objective VALUE gains the `+0.5·r_g²` barrier.
+/// Every outer-cost emission in the REML evaluator MUST route through it so the
+/// `eval_cost` line-search value (`compute_cost`), the value+gradient/Hessian
+/// path (`compute_outer_eval_with_order`), and the EFS step value
+/// (`assemble_and_evaluate_efs`) report the IDENTICAL objective. The barrier
+/// carries no analytic ρ/ψ-gradient and vanishes at every converged point, so
+/// the analytic gradient is exact wherever the barrier is inactive; the only
+/// requirement is that the reported VALUE never drifts from the gradient's
+/// objective. Omitting the wrap on any one path reintroduces the
+/// objective↔gradient desync that stalls the EFS iso-κ optimizer at large n
+/// with a nonzero `final_grad_norm` (#1122). The complete caller set is:
+///   * `compute_cost` (dense + sparse) — the `eval_cost` value
+///   * `compute_outer_eval_with_order` (value-only early return + main path)
+///   * `assemble_and_evaluate_efs` — the EFS step value
+/// Add the wrap to any future outer-cost emission as well.
 #[inline]
 fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
     if !cost.is_finite() || !pr.status.is_failed_max_iterations() {

@@ -2083,6 +2083,19 @@ impl<'a> RemlState<'a> {
         let cost_result =
             self.apply_alo_stabilization_to_result(rho, bundle, eval_mode, cost_result)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &cost_result);
+        // SINGLE SOURCE OF TRUTH for the outer objective VALUE across optimizer
+        // strategies: the EFS `cost` reported here must equal the BFGS/Newton
+        // path (`compute_outer_eval_with_order`) and the `eval_cost`
+        // line-search value (`compute_cost`), all of which apply the
+        // `screening_residual_penalty` barrier. The EFS step itself is driven by
+        // the gradient channel (the barrier carries no analytic ρ/ψ-gradient and
+        // is inactive at every converged point), so wrapping only the reported
+        // `cost` keeps the EFS fixed-point unchanged while making EFS
+        // backtracking and the cross-strategy cost comparison consume the
+        // identical objective — closing the objective↔gradient desync on the EFS
+        // arm too (#1122).
+        let efs_cost =
+            screening_residual_penalty(cost_result.cost, bundle.pirls_result.as_ref());
         let gradient =
             cost_result
                 .gradient
@@ -2120,7 +2133,7 @@ impl<'a> RemlState<'a> {
                 Some(hybrid.psi_indices)
             };
             crate::solver::outer_strategy::EfsEval {
-                cost: cost_result.cost,
+                cost: efs_cost,
                 steps: hybrid.steps,
                 beta: Some(beta_for_barrier),
                 psi_gradient,
@@ -2143,7 +2156,7 @@ impl<'a> RemlState<'a> {
             );
             self.record_efs_single_loop_bias(rho, diagnostics)?;
             crate::solver::outer_strategy::EfsEval {
-                cost: cost_result.cost,
+                cost: efs_cost,
                 steps,
                 beta: Some(beta_for_barrier),
                 psi_gradient: None,
@@ -2604,9 +2617,19 @@ impl<'a> RemlState<'a> {
                 self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?
             };
             store_ift_residual_energy_for_outer_theta(p, result.ift_residual_energy);
+            // SINGLE SOURCE OF TRUTH for the outer objective VALUE: apply the
+            // exact same `screening_residual_penalty` wrap that `compute_cost`
+            // (the `eval_cost` line-search value) applies. Without this, a ρ/ψ
+            // at which the inner P-IRLS caps out (`is_failed_max_iterations`)
+            // would be reported with cost `V + 0.5·r_g²` through `eval_cost`
+            // but raw `V` through this `OuterEval` path — the classic
+            // objective↔gradient desync that lets the line-search and the
+            // gradient descend two different functions (the #1122 matern stall
+            // signature: nonzero final_grad_norm at a capped-inner regime).
+            let cost = screening_residual_penalty(result.cost, bundle.pirls_result.as_ref());
             log::debug!(
                 "[REML] outer-eval value-only done | cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
-                result.cost,
+                cost,
                 t_assemble.elapsed().as_secs_f64() * 1000.0,
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
@@ -2615,7 +2638,7 @@ impl<'a> RemlState<'a> {
             // force a re-evaluation the moment the optimiser asks for a real
             // gradient at the same ρ. A value-only probe is cheap to repeat.
             return Ok(OuterEval {
-                cost: result.cost,
+                cost,
                 gradient: Array1::zeros(p.len()),
                 hessian: HessianResult::Unavailable,
                 inner_beta_hint: self.current_original_basis_beta(),
@@ -2673,8 +2696,22 @@ impl<'a> RemlState<'a> {
             None => HessianResult::Unavailable,
         };
 
+        // SINGLE SOURCE OF TRUTH for the outer objective VALUE: this
+        // value+gradient (and value+gradient+Hessian) path must report the
+        // EXACT same cost as `compute_cost` (the `eval_cost` line-search value),
+        // so apply the identical `screening_residual_penalty` wrap. The penalty
+        // is a continuous barrier (`+0.5·r_g²`) that is non-zero ONLY when the
+        // inner P-IRLS capped out at this ρ/ψ; it vanishes at every converged
+        // point, so the analytic `gradient` below — which differentiates the
+        // un-penalized LAML objective `V` — is the exact gradient wherever the
+        // barrier is inactive. Reporting raw `V` here while `eval_cost` reports
+        // `V + 0.5·r_g²` was an objective↔gradient desync: the line-search and
+        // the BFGS direction descended two different functions at capped-inner
+        // ρ/ψ, producing the stall-with-nonzero-final-grad-norm signature of
+        // the #1122 matern iso-κ optimizer.
+        let cost = screening_residual_penalty(result.cost, bundle.pirls_result.as_ref());
         let eval = OuterEval {
-            cost: result.cost,
+            cost,
             gradient,
             hessian,
             inner_beta_hint: self.current_original_basis_beta(),
