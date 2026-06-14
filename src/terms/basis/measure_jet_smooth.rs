@@ -1785,12 +1785,26 @@ pub fn build_measure_jet_basis_psi_derivatives(
         penalties_first.insert(0, (0..n_cands).map(|_| zero_p()).collect());
         penalties_second_diag.insert(0, (0..n_cands).map(|_| zero_p()).collect());
     }
-    let shifted_pairs: Vec<(usize, usize)> = pairs
+    let n_coords_total = n_coords + coord_offset;
+    // Penalty-dial cross pairs, shifted past the ℓ coordinate.
+    let mut all_pairs: Vec<(usize, usize)> = pairs
         .iter()
         .map(|&(a, b)| (a + coord_offset, b + coord_offset))
         .collect();
+    let mut all_crosses: Vec<Vec<Array2<f64>>> = crosses;
+    // ℓ (coord 0) × every penalty coordinate: the penalty is ℓ-independent and
+    // the penalty dials carry zero design drift, so each cross block is zero —
+    // but the pair MUST be registered (the consumer queries every coordinate
+    // pair `(a, b)`), else the provider errors on an unregistered ℓ pair.
+    if coord_offset == 1 {
+        for c in 1..n_coords_total {
+            all_pairs.push((0, c));
+            all_crosses.push((0..n_cands).map(|_| zero_p()).collect());
+        }
+    }
     let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> =
-        shifted_pairs.iter().copied().zip(crosses.into_iter()).collect();
+        all_pairs.iter().copied().zip(all_crosses.into_iter()).collect();
+    let shifted_pairs = all_pairs;
     let provider = AnisoPenaltyCrossProvider::new(move |a, b| {
         pair_index
             .iter()
@@ -1802,7 +1816,6 @@ pub fn build_measure_jet_basis_psi_derivatives(
                 ))
             })
     });
-    let n_coords_total = n_coords + coord_offset;
     let mut design_first: Vec<Array2<f64>> = (0..n_coords_total)
         .map(|_| Array2::<f64>::zeros((n, p)))
         .collect();
