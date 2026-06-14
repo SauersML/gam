@@ -2793,17 +2793,23 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // null space exists; fall back to the raw per-block residual when it does
             // not (there range == whole space, so they coincide and the strict gate
             // is unchanged for every well-identified family).
-            let block_stationarity_for_gate = projected_residual_range_space_per_block_inf(
-                &projected_residual_vec,
-                &joint_hessian_source,
-                &ranges,
-                &s_lambdas,
-                ridge,
-                options.ridge_policy,
-                total_p,
-            )
-            .unwrap_or_else(|| block_stationarity_norms.clone());
-            let all_block_stationarity_small = block_stationarity_for_gate
+            //
+            // PERF (gam#1082): the range projection eigendecomposes the FULL P·M
+            // joint penalized Hessian — an O((P·M)³) cost. The two certificates
+            // that consume the range-projected gate (the residual-stall and
+            // relative-plateau exits below) only fire under rare preconditions
+            // (`tr_clamped_during_stall` after a long no-improve streak; a latched
+            // objective plateau). Computing the eigh EVERY inner cycle therefore
+            // added a redundant O(p³) eigendecomposition per cycle to every
+            // penalized family carrying a null space (every tp-smooth model) — the
+            // multinomial smooth-by-factor >250s wall-clock regression.
+            //
+            // The eigh is now deferred to `range_projected_block_stationarity_small`
+            // (called ONLY inside a certificate branch whose cheap precondition has
+            // already passed via short-circuit `&&`). The cheap RAW gate
+            // (`raw_all_block_stationarity_small`, no eigh) is kept for the
+            // per-cycle diagnostic so logging never triggers the expensive path.
+            let raw_all_block_stationarity_small = block_stationarity_norms
                 .iter()
                 .zip(&block_stationarity_tolerances)
                 .all(|(norm, tol)| {
@@ -2811,6 +2817,25 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         && tol.is_finite()
                         && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * *tol
                 });
+            let range_projected_block_stationarity_small = || -> bool {
+                projected_residual_range_space_per_block_inf(
+                    &projected_residual_vec,
+                    &joint_hessian_source,
+                    &ranges,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    total_p,
+                )
+                .unwrap_or_else(|| block_stationarity_norms.clone())
+                .iter()
+                .zip(&block_stationarity_tolerances)
+                .all(|(norm, tol)| {
+                    norm.is_finite()
+                        && tol.is_finite()
+                        && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * *tol
+                })
+            };
             // #979 divergence trace: separate the RAW likelihood gradient
             // (‖∇ℓ‖∞ per block) from the constraint-PROJECTED stationarity
             // residual (active-set dual mass subtracted). A raw gradient that
@@ -2879,7 +2904,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     .as_ref()
                     .map(|spectrum| spectrum.newton_decrement());
                 log::info!(
-                    "[JN-CONV-DIAG #979] cycle={cycle} resid={residual:.3e} residual_tol={residual_tol:.3e} range_residual={range_residual_diag:?} newton_decrement={decrement_diag:?} all_block_stationarity_small={all_block_stationarity_small} block_stat_norms={:?} block_stat_tols={:?}",
+                    "[JN-CONV-DIAG #979] cycle={cycle} resid={residual:.3e} residual_tol={residual_tol:.3e} range_residual={range_residual_diag:?} newton_decrement={decrement_diag:?} raw_all_block_stationarity_small={raw_all_block_stationarity_small} block_stat_norms={:?} block_stat_tols={:?}",
                     block_stationarity_norms
                         .iter()
                         .map(|v| format!("{v:.3e}"))
@@ -3886,7 +3911,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
                 && tr_clamped_during_stall
-                && all_block_stationarity_small
+                && range_projected_block_stationarity_small()
             {
                 // Penalty-null-space certificate at the STALL exit (gam#1040).
                 // The survival marginal-slope joint block carries free gauge
@@ -4036,7 +4061,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // identifiable subspace. Report converged.
             let plateau_verdict = obj_flat_streak.note(objective_change <= objective_tol);
             if plateau_verdict == crate::solver::loop_guard::LoopVerdict::Plateaued
-                && all_block_stationarity_small
+                && range_projected_block_stationarity_small()
                 && let Some(range_residual) = projected_residual_range_space_inf(
                     &projected_residual_vec,
                     &joint_hessian_source,
