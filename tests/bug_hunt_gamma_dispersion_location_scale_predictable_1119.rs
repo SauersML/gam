@@ -34,8 +34,7 @@
 
 use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
-use gam::matrix::DesignMatrix;
-use gam::predict::interval_policy::{PredictPass, PredictionTransform};
+use gam::predict::interval_policy::PredictPass;
 use gam::predict::{DispersionLocationScalePredictor, InferenceCovarianceMode, PredictInput};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{pearson, rmse};
