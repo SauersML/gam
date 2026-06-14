@@ -91,5 +91,5 @@
 //! hook, re-read the inner/outer cost split documented above first.
 
 // Split from the original oversized module; keep included in order.
-include!("arrow_schur_parts/part_000.rs");
-include!("arrow_schur_parts/part_001.rs");
+include!("arrow_schur_penalty_ops_and_newton.rs");
+include!("arrow_schur_reduced_solve_and_tests.rs");
