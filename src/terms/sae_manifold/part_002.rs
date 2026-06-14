@@ -902,8 +902,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        // Value-only comparison path (compass polls, EFS backtracking, seed
-        // validation, FD certificate probes): no gradient/Hessian is ever
+        // Value-only comparison path (EFS backtracking, seed validation, FD
+        // certificate probes): no gradient/Hessian is ever
         // consumed at this iterate, so it takes the cheap probe refine budget
         // (#1029). Accepted points are always re-polished through
         // `eval`/`eval_with_order(ValueAndGradient|ValueGradientHessian)`
