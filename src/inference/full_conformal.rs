@@ -2657,15 +2657,16 @@ impl ExactFullConformalSubstrate {
         // research-core Layer 3 and is not asserted here. A degenerate certificate
         // computation must NOT void the exact set, so its failure maps to "not
         // certified" rather than an error.
-        let frozen_rho_certified = GaussianRemlRhoResponse::new(
-            &self.x,
-            &self.y,
-            &self.s_lambda,
-            x_star,
-        )
-        .and_then(|response| response.certified_full_conformal(alpha))
-        .map(|certified| matches!(certified.certificate, FrozenRhoCertificate::Certified { .. }))
-        .unwrap_or(false);
+        let frozen_rho_certified =
+            GaussianRemlRhoResponse::new(&self.x, &self.y, &self.s_lambda, x_star)
+                .and_then(|response| response.certified_full_conformal(alpha))
+                .map(|certified| {
+                    matches!(
+                        certified.certificate,
+                        FrozenRhoCertificate::Certified { .. }
+                    )
+                })
+                .unwrap_or(false);
 
         let (lo, hi) = if set.intervals.is_empty() {
             // No candidate qualifies (pathological tiny α·(n+1)); collapse to the
