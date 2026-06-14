@@ -11,7 +11,6 @@ use super::*;
 /// learnable gate.
 const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
 
-
 /// Shared band predicate for JumpReLU optimization inclusion. An atom is kept
 /// optimizable (compact-layout inclusion and prior-gradient support) when its
 /// logit is above the reactivation band's lower edge `threshold − MARGIN·τ`.
@@ -52,7 +51,6 @@ pub struct SaeRowLayout {
     pub coord_dims: Vec<usize>,
 }
 
-
 impl SaeRowLayout {
     /// JumpReLU optimization active set: atoms inside the smooth prior's
     /// machine-precision support `(logit - threshold)/tau > -36` (see
@@ -61,7 +59,7 @@ impl SaeRowLayout {
     /// Newton system for value-consistent prior terms. Their forward
     /// reconstruction contribution and data-fit logit JVP remain hard-zero while
     /// `a_k = 0`.
-    fn from_jumprelu(
+    pub(crate) fn from_jumprelu(
         n: usize,
         k_atoms: usize,
         threshold: f64,
@@ -88,7 +86,7 @@ impl SaeRowLayout {
     /// `assignments[row]` is the dense length-`K` assignment vector `a_{n,·}`.
     /// The active set is always non-empty (the single largest-magnitude atom is
     /// retained even if below `cutoff`) so every row keeps a valid block.
-    fn from_dense_weights(
+    pub(crate) fn from_dense_weights(
         assignments: &[Array1<f64>],
         k_active_cap: usize,
         cutoff: f64,

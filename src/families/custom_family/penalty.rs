@@ -42,8 +42,6 @@ pub enum PenaltyMatrix {
     },
 }
 
-
-
 impl PenaltyMatrix {
     /// Number of rows (= number of columns, since penalties are square).
     pub fn dim(&self) -> usize {
@@ -274,8 +272,6 @@ impl PenaltyMatrix {
         self.dim()
     }
 }
-
-
 
 impl From<Array2<f64>> for PenaltyMatrix {
     fn from(m: Array2<f64>) -> Self {

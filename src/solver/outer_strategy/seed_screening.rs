@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// One recorded ContinuationPath demotion: a structural defect that, for a
 /// continuation-entry objective, routes a seed to a heavier path regime instead
 /// of disqualifying it. Carried in the seed-loop ledger so the startup stats
@@ -9,13 +8,12 @@ use super::*;
 #[derive(Clone, Debug)]
 pub(crate) struct PathDemotionRecord {
     /// 0-based seed index whose structural defect triggered the demotion.
-    seed_idx: usize,
+    pub(crate) seed_idx: usize,
     /// The path regime the seed was re-entered at after the demotion.
-    regime: crate::solver::continuation_path::PathRegime,
+    pub(crate) regime: crate::solver::continuation_path::PathRegime,
     /// Human-readable reason (the underlying structural diagnosis message).
-    reason: String,
+    pub(crate) reason: String,
 }
-
 
 /// Bidirectional inner-PIRLS feedback channel.
 ///
@@ -69,7 +67,6 @@ pub struct InnerProgressFeedback {
     pub accept_rho: Arc<AtomicU64>,
 }
 
-
 impl InnerProgressFeedback {
     /// Snapshot the read-back atomics for the cap schedule. Returns `None`
     /// when no inner solve has reported yet (`last_iters == 0`); the
@@ -83,7 +80,7 @@ impl InnerProgressFeedback {
     /// distinguishes the two cleanly. Both ends of the atomic share
     /// `crate::solver::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS`
     /// implicitly via the same bit pattern.
-    fn snapshot(&self) -> Option<InnerProgressSnapshot> {
+    pub(crate) fn snapshot(&self) -> Option<InnerProgressSnapshot> {
         let iters = self.last_iters.load(Ordering::Relaxed);
         if iters == 0 {
             None
@@ -117,24 +114,22 @@ impl InnerProgressFeedback {
     }
 }
 
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InnerProgressSnapshot {
-    last_iters: usize,
-    last_converged: bool,
+    pub(crate) last_iters: usize,
+    pub(crate) last_converged: bool,
     /// Most-recent IFT predictor residual (see field doc on
     /// `InnerProgressFeedback`). `None` when the predictor has not
     /// reported yet, when the cache was reset, or when the previous
     /// solve fell back to flat warm-start (no IFT prediction
     /// consumed).
-    last_ift_residual: Option<f64>,
+    pub(crate) last_ift_residual: Option<f64>,
     /// Most-recent accepted LM gain ratio (see field doc on
     /// `InnerProgressFeedback::accept_rho`). `None` when no step was
     /// accepted in the previous solve (rejection-exhausted) or when
     /// the cache was reset.
-    last_accept_rho: Option<f64>,
+    pub(crate) last_accept_rho: Option<f64>,
 }
-
 
 #[inline]
 pub(crate) fn effective_seed_budget(
@@ -154,7 +149,6 @@ pub(crate) fn effective_seed_budget(
     requested_budget.min(capped)
 }
 
-
 #[inline]
 pub(crate) fn should_screen_seeds(
     config: &OuterConfig,
@@ -170,7 +164,6 @@ pub(crate) fn should_screen_seeds(
         )
 }
 
-
 #[inline]
 pub(crate) fn expensive_unsuccessful_seed_limit(
     solver: Solver,
@@ -183,7 +176,6 @@ pub(crate) fn expensive_unsuccessful_seed_limit(
         _ => None,
     }
 }
-
 
 /// Multipliers for the seed-screening cap cascade, applied to the user's
 /// `screen_max_inner_iterations`.
@@ -202,12 +194,10 @@ pub(crate) fn expensive_unsuccessful_seed_limit(
 /// every cap stage collapsed all seeds to non-finite cost.
 pub(crate) const SEED_SCREENING_CASCADE_MULTIPLIERS: [usize; 3] = [1, 4, 16];
 
-
 /// Sentinel cap value passed to the inner solver to mean "no cap — use
 /// the full `pirls_config.max_iterations`". Always the final cascade
 /// stage after the geometric escalation exhausts.
 pub(crate) const SEED_SCREENING_UNCAPPED: usize = 0;
-
 
 pub(crate) fn rank_seeds_with_screening(
     obj: &mut dyn OuterObjective,
@@ -458,7 +448,6 @@ pub(crate) fn rank_seeds_with_screening(
     ordered
 }
 
-
 /// ρ margin (in log-λ units) within which a smoothing coordinate counts as
 /// sitting on the over-smoothing upper bound. The separation-stability seed is
 /// generated *exactly* at the bound, so a small margin suffices; it is kept
@@ -467,7 +456,6 @@ pub(crate) fn rank_seeds_with_screening(
 /// log-λ units below any realistic bound).
 pub(crate) const OVERSMOOTH_BOUNDARY_MARGIN: f64 = 0.5;
 
-
 /// Whether `seed` is pinned at the over-smoothing ρ upper bound in *every*
 /// smoothing coordinate — the degenerate plateau where the penalized
 /// coefficients collapse into the penalty null space and the REML/LAML
@@ -475,7 +463,11 @@ pub(crate) const OVERSMOOTH_BOUNDARY_MARGIN: f64 = 0.5;
 /// are inspected; trailing ψ/auxiliary coordinates have their own geometry and
 /// never make ρ a flat plateau. Used to keep such seeds from becoming the outer
 /// optimizer's descent origin (see `rank_seeds_with_screening`).
-pub(crate) fn seed_is_oversmoothing_boundary(seed: &Array1<f64>, rho_dim: usize, upper: &[f64]) -> bool {
+pub(crate) fn seed_is_oversmoothing_boundary(
+    seed: &Array1<f64>,
+    rho_dim: usize,
+    upper: &[f64],
+) -> bool {
     if rho_dim == 0 || seed.len() < rho_dim {
         return false;
     }
@@ -484,7 +476,6 @@ pub(crate) fn seed_is_oversmoothing_boundary(seed: &Array1<f64>, rho_dim: usize,
         hi.is_finite() && seed[i] >= hi - OVERSMOOTH_BOUNDARY_MARGIN
     })
 }
-
 
 #[inline]
 pub(crate) fn candidate_improves_best(candidate: &OuterResult, best: Option<&OuterResult>) -> bool {

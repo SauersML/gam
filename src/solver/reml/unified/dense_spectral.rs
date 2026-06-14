@@ -51,7 +51,6 @@ pub enum PseudoLogdetMode {
     HardPseudo,
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Dense spectral HessianOperator implementation
 // ═══════════════════════════════════════════════════════════════════════════
@@ -93,7 +92,6 @@ pub struct DenseSpectralOperator {
     /// Full dimension.
     pub(crate) n_dim: usize,
 }
-
 
 impl DenseSpectralOperator {
     pub fn reg_eigenvalue(&self, k: usize) -> f64 {
@@ -268,7 +266,7 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
-    fn rotate_to_eigenbasis(&self, matrix: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn rotate_to_eigenbasis(&self, matrix: &Array2<f64>) -> Array2<f64> {
         let left = crate::faer_ndarray::fast_atb(&self.eigenvectors, matrix);
         crate::faer_ndarray::fast_ab(&left, &self.eigenvectors)
     }
@@ -314,13 +312,17 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
-    fn projected_matrix(&self, matrix: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn projected_matrix(&self, matrix: &Array2<f64>) -> Array2<f64> {
         let left = crate::faer_ndarray::fast_atb(&self.w_factor, matrix);
         crate::faer_ndarray::fast_ab(&left, &self.w_factor)
     }
 
     #[inline]
-    fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
+    pub(crate) fn projected_operator(
+        &self,
+        factor: &Array2<f64>,
+        op: &dyn HyperOperator,
+    ) -> Array2<f64> {
         if log::log_enabled!(log::Level::Info) {
             let start = std::time::Instant::now();
             let result = op.projected_matrix_cached(factor, &self.projected_factor_cache);
@@ -338,7 +340,7 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
-    fn trace_projected_cross(&self, left: &Array2<f64>, right: &Array2<f64>) -> f64 {
+    pub(crate) fn trace_projected_cross(&self, left: &Array2<f64>, right: &Array2<f64>) -> f64 {
         let mut result = 0.0;
         for (left_row, right_col) in left.rows().into_iter().zip(right.columns().into_iter()) {
             for (left_value, right_value) in left_row.iter().copied().zip(right_col.iter().copied())
@@ -350,7 +352,7 @@ impl DenseSpectralOperator {
     }
 
     #[inline]
-    fn trace_logdet_hessian_cross_rotated(
+    pub(crate) fn trace_logdet_hessian_cross_rotated(
         &self,
         h_i_rot: &Array2<f64>,
         h_j_rot: &Array2<f64>,
@@ -375,7 +377,6 @@ impl DenseSpectralOperator {
         result
     }
 }
-
 
 /// Coalesce repeated identical `[STAGE]` log lines from `DenseSpectralOperator`
 /// methods. First occurrence of a (method, dims, implicit-flags) signature
@@ -449,7 +450,6 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
         next_heartbeat: 2,
     });
 }
-
 
 impl HessianOperator for DenseSpectralOperator {
     fn logdet(&self) -> f64 {

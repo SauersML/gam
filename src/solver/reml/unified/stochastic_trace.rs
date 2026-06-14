@@ -26,7 +26,6 @@ pub struct StochasticTraceConfig {
     pub hutchpp_sketch_dim: Option<usize>,
 }
 
-
 impl Default for StochasticTraceConfig {
     fn default() -> Self {
         Self {
@@ -40,7 +39,6 @@ impl Default for StochasticTraceConfig {
         }
     }
 }
-
 
 impl StochasticTraceConfig {
     /// Fast, scale-aware estimator for second-order outer-Hessian traces.
@@ -64,7 +62,6 @@ impl StochasticTraceConfig {
         }
     }
 }
-
 
 /// Stochastic trace estimator using Rademacher probes with adaptive stopping.
 ///
@@ -92,7 +89,6 @@ pub struct StochasticTraceEstimator {
     trace_state: Arc<Mutex<StochasticTraceState>>,
 }
 
-
 pub(crate) enum StochasticTraceTargets<'a> {
     Dense(&'a [&'a Array2<f64>]),
     Mixed {
@@ -104,7 +100,6 @@ pub(crate) enum StochasticTraceTargets<'a> {
         implicit_ops: &'a [&'a ImplicitHyperOperator],
     },
 }
-
 
 impl StochasticTraceTargets<'_> {
     fn len(&self) -> usize {
@@ -122,7 +117,6 @@ impl StochasticTraceTargets<'_> {
     }
 }
 
-
 impl StochasticTraceEstimator {
     /// Create a new estimator with the given configuration.
     pub fn new(config: StochasticTraceConfig) -> Self {
@@ -133,7 +127,7 @@ impl StochasticTraceEstimator {
     }
 
     /// Create a new estimator sharing fit-level stochastic trace state.
-    fn with_shared_trace_state(
+    pub(crate) fn with_shared_trace_state(
         mut config: StochasticTraceConfig,
         trace_state: Arc<Mutex<StochasticTraceState>>,
     ) -> Self {
@@ -159,7 +153,7 @@ impl StochasticTraceEstimator {
         Self::new(StochasticTraceConfig::outer_hessian(dim, n_coords))
     }
 
-    fn for_outer_hessian_with_trace_state(
+    pub(crate) fn for_outer_hessian_with_trace_state(
         dim: usize,
         n_coords: usize,
         trace_state: Arc<Mutex<StochasticTraceState>>,
@@ -983,7 +977,6 @@ impl StochasticTraceEstimator {
     }
 }
 
-
 pub(crate) fn stochastic_trace_hinv_products_with_floor(
     hop: &dyn HessianOperator,
     targets: StochasticTraceTargets<'_>,
@@ -1012,7 +1005,6 @@ pub(crate) fn stochastic_trace_hinv_products_with_floor(
     }
 }
 
-
 pub(crate) fn stochastic_trace_hinv_crosses<'a>(
     hop: &dyn HessianOperator,
     dense_matrices: &'a [Array2<f64>],
@@ -1032,7 +1024,6 @@ pub(crate) fn stochastic_trace_hinv_crosses<'a>(
         None,
     )
 }
-
 
 pub(crate) fn stochastic_trace_hinv_crosses_with_floor<'a>(
     hop: &dyn HessianOperator,
@@ -1080,7 +1071,6 @@ pub(crate) fn stochastic_trace_hinv_crosses_with_floor<'a>(
     mapped
 }
 
-
 // Lightweight xoshiro256ss RNG
 //
 // We use a self-contained xoshiro256ss implementation so that the stochastic
@@ -1096,7 +1086,6 @@ pub(crate) fn stochastic_trace_hinv_crosses_with_floor<'a>(
 struct Xoshiro256SS {
     s: [u64; 4],
 }
-
 
 impl Xoshiro256SS {
     /// Seed from a single u64 via splitmix64 expansion.
@@ -1135,20 +1124,17 @@ impl Xoshiro256SS {
     }
 }
 
-
 /// Splitmix64: deterministic expansion of a single u64 seed into a sequence.
 #[inline]
 fn splitmix64(state: &mut u64) -> u64 {
     crate::linalg::utils::splitmix64(state)
 }
 
-
 #[inline]
 fn stochastic_trace_probe_id(seed: u64, probe_index: usize) -> u64 {
     let mut state = seed ^ (probe_index as u64).wrapping_mul(0xD1B54A32D192ED03);
     splitmix64(&mut state)
 }
-
 
 fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) {
     let mut bits: u64 = 0;
@@ -1164,7 +1150,6 @@ fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) 
         remaining_bits -= 1;
     }
 }
-
 
 /// Modified Gram–Schmidt orthonormalization of the columns of `y`,
 /// writing the orthonormal basis into `q` and returning the retained
@@ -1212,7 +1197,6 @@ fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
     }
     rank
 }
-
 
 /// Shared Hutch++ stochastic-trace scaffold (Meyer–Musco 2021, SOSA).
 ///
@@ -1324,7 +1308,6 @@ where
     t_low + mean_residual
 }
 
-
 /// Hutch++ estimate of `tr(H⁻¹ M)` where `M` is accessed through its
 /// matrix-vector product (operator-only, dim p).
 ///
@@ -1376,7 +1359,6 @@ where
     })
 }
 
-
 /// Hutch++ estimate of `tr((H⁻¹ A)²) = tr(H⁻¹ A H⁻¹ A)` for a symmetric
 /// HVP-only operator `A`. Cost per applied "matvec" is 2 H⁻¹ solves and
 /// 2 A applies; total cost is `2 m_s + m_h` such matvecs.
@@ -1404,7 +1386,6 @@ where
         hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
     })
 }
-
 
 /// Hutch++-style estimate of `tr(H⁻¹ A_left H⁻¹ A_right)` for two
 /// (possibly distinct) symmetric HVP-only operators. Uses a shared

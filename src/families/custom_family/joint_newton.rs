@@ -52,8 +52,6 @@ pub(crate) fn joint_hessian_has_cross_block_coupling(
     false
 }
 
-
-
 pub(crate) fn exact_newton_joint_hessian_from_exact_blocks<F: CustomFamily + ?Sized>(
     family: &F,
     block_states: &[ParameterBlockState],
@@ -108,8 +106,6 @@ pub(crate) fn exact_newton_joint_hessian_from_exact_blocks<F: CustomFamily + ?Si
     }
     Ok(Some(joint))
 }
-
-
 
 pub(crate) fn exact_newton_joint_hessian_from_working_sets<F: CustomFamily + ?Sized>(
     family: &F,
@@ -170,9 +166,9 @@ pub(crate) fn exact_newton_joint_hessian_from_working_sets<F: CustomFamily + ?Si
     Ok(Some(joint))
 }
 
-
-
-pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_blocks<F: CustomFamily + ?Sized>(
+pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_blocks<
+    F: CustomFamily + ?Sized,
+>(
     family: &F,
     block_states: &[ParameterBlockState],
     d_beta_flat: &Array1<f64>,
@@ -217,8 +213,6 @@ pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_blocks<F: C
     Ok(Some(joint))
 }
 
-
-
 /// Block-diagonal aggregator for the joint second directional derivative.
 ///
 /// Mirrors `exact_newton_joint_hessian_directional_derivative_from_blocks`:
@@ -234,7 +228,9 @@ pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_blocks<F: C
 /// contribution.  Aggregating here mirrors the first-derivative path so
 /// outer REML receives the curvature term whenever the per-block
 /// `exact_newton_hessian_second_directional_derivative` is implemented.
-pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_from_blocks<F: CustomFamily + ?Sized>(
+pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_from_blocks<
+    F: CustomFamily + ?Sized,
+>(
     family: &F,
     block_states: &[ParameterBlockState],
     d_beta_u_flat: &Array1<f64>,
@@ -279,9 +275,9 @@ pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_from_block
     Ok(Some(joint))
 }
 
-
-
-pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: CustomFamily + ?Sized>(
+pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_working_sets<
+    F: CustomFamily + ?Sized,
+>(
     family: &F,
     block_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
@@ -409,9 +405,9 @@ pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_working_set
     Ok(Some(joint))
 }
 
-
-
-pub(crate) fn exact_newton_joint_hessian_symmetrized<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn exact_newton_joint_hessian_symmetrized<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
@@ -434,16 +430,12 @@ pub(crate) fn exact_newton_joint_hessian_symmetrized<F: CustomFamily + Clone + S
     Ok(Some(h))
 }
 
-
-
 /// Scale-aware exact joint curvature payload for the outer REML evaluator.
 pub struct ExactNewtonOuterCurvature {
     pub hessian: Array2<f64>,
     pub rho_curvature_scale: f64,
     pub hessian_logdet_correction: f64,
 }
-
-
 
 pub(crate) enum JointHessianSource {
     Dense(Array2<f64>),
@@ -473,11 +465,7 @@ pub(crate) enum JointHessianSource {
     },
 }
 
-
-
 pub(crate) const EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES: usize = 512 * 1024 * 1024;
-
-
 
 pub(crate) fn exact_joint_hessian_dense_bytes(total: usize) -> Result<usize, String> {
     total
@@ -486,9 +474,10 @@ pub(crate) fn exact_joint_hessian_dense_bytes(total: usize) -> Result<usize, Str
         .ok_or_else(|| format!("joint Hessian dense byte count overflow for dim={total}"))
 }
 
-
-
-pub(crate) fn ensure_exact_joint_hessian_dense_budget(total: usize, context: &str) -> Result<(), String> {
+pub(crate) fn ensure_exact_joint_hessian_dense_budget(
+    total: usize,
+    context: &str,
+) -> Result<(), String> {
     let bytes = exact_joint_hessian_dense_bytes(total)?;
     if bytes > EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES {
         return Err(CustomFamilyError::UnsupportedConfiguration {
@@ -503,8 +492,6 @@ pub(crate) fn ensure_exact_joint_hessian_dense_budget(total: usize, context: &st
     }
     Ok(())
 }
-
-
 
 pub(crate) struct JointHessianBundle<'a> {
     source: JointHessianSource,
@@ -545,28 +532,21 @@ pub(crate) struct JointHessianBundle<'a> {
     hessian_logdet_correction: f64,
 }
 
-
-
 pub(crate) type DriftDerivFn<'a> =
     dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync + 'a;
 
-
 pub(crate) type DriftDerivManyFn<'a> =
     dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync + 'a;
-
 
 pub(crate) type DriftSecondDerivFn<'a> = dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
     + Send
     + Sync
     + 'a;
 
-
 pub(crate) type DriftSecondDerivManyFn<'a> = dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
     + Send
     + Sync
     + 'a;
-
-
 
 /// Cheap, deterministic non-finite-curvature probe for the joint Hessian
 /// source (gam#1088). A `NaN`/`Inf` in the penalized Hessian `H_pen = H +
@@ -592,8 +572,6 @@ pub(crate) fn joint_hessian_source_curvature_is_finite(source: &JointHessianSour
         JointHessianSource::Operator { diagonal, .. } => diagonal.iter().all(|v| v.is_finite()),
     }
 }
-
-
 
 pub(crate) fn materialize_joint_hessian_source(
     source: &JointHessianSource,
@@ -651,8 +629,6 @@ pub(crate) fn materialize_joint_hessian_source(
     }
 }
 
-
-
 pub(crate) fn exact_newton_joint_hessian_source_from_workspace(
     workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
     total: usize,
@@ -690,8 +666,6 @@ pub(crate) fn exact_newton_joint_hessian_source_from_workspace(
 
     exact_newton_joint_hessian_operator_source_from_workspace(workspace, total, intent, context)
 }
-
-
 
 pub(crate) fn exact_newton_joint_hessian_operator_source_from_workspace(
     workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
@@ -891,8 +865,6 @@ pub(crate) fn exact_newton_joint_hessian_operator_source_from_workspace(
     }))
 }
 
-
-
 pub(crate) fn symmetrized_square_matrix(
     mut matrix: Array2<f64>,
     expected: usize,
@@ -916,8 +888,6 @@ pub(crate) fn symmetrized_square_matrix(
     symmetrize_dense_in_place(&mut matrix);
     Ok(matrix)
 }
-
-
 
 /// Try exact Newton joint Hessian first, then surrogate. Returns `None` if
 /// neither path provides a joint Hessian. When successful, returns the joint
@@ -1216,8 +1186,6 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
     Ok(None)
 }
 
-
-
 /// Build a closure computing dH[v] using exact Newton derivatives on synced states.
 /// Non-finite derivative output is treated as a hard error.
 /// Symmetrize-and-scale the dH Dense result, optionally rejecting non-finite
@@ -1244,8 +1212,6 @@ pub(crate) fn finalize_dh_dense(
     }
     Ok(Some(DriftDerivResult::Dense(sym)))
 }
-
-
 
 /// Single source of truth for the dH[v] three-way dispatch shared by the
 /// borrowed (`exact_newton_dh_closure`) and owned
@@ -1313,8 +1279,6 @@ pub(crate) fn exact_newton_dh_apply<F: CustomFamily + Sync>(
     }
 }
 
-
-
 pub(crate) fn exact_newton_dh_closure<'a, F: CustomFamily + Sync>(
     family: &'a F,
     synced_states: Arc<Vec<ParameterBlockState>>,
@@ -1339,8 +1303,6 @@ pub(crate) fn exact_newton_dh_closure<'a, F: CustomFamily + Sync>(
     }
 }
 
-
-
 pub(crate) fn exact_newton_dh_many_closure<'a>(
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
@@ -1362,8 +1324,6 @@ pub(crate) fn exact_newton_dh_many_closure<'a>(
             .collect()
     }))
 }
-
-
 
 /// Single source of truth for the d²H[u,v] three-way dispatch shared by the
 /// borrowed (`exact_newton_d2h_closure`) and owned
@@ -1428,8 +1388,6 @@ pub(crate) fn exact_newton_d2h_apply<F: CustomFamily + Sync>(
     }
 }
 
-
-
 /// Build a closure computing d²H[u,v] using exact Newton derivatives on synced states.
 pub(crate) fn exact_newton_d2h_closure<'a, F: CustomFamily + Sync>(
     family: &'a F,
@@ -1456,8 +1414,6 @@ pub(crate) fn exact_newton_d2h_closure<'a, F: CustomFamily + Sync>(
     }
 }
 
-
-
 pub(crate) fn exact_newton_d2h_many_closure<'a>(
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
@@ -1475,8 +1431,6 @@ pub(crate) fn exact_newton_d2h_many_closure<'a>(
             .collect()
     }))
 }
-
-
 
 pub(crate) fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: F,
@@ -1502,8 +1456,6 @@ pub(crate) fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Syn
     })
 }
 
-
-
 pub(crate) fn exact_newton_dh_many_closure_owned(
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
@@ -1523,8 +1475,6 @@ pub(crate) fn exact_newton_dh_many_closure_owned(
             .collect()
     }))
 }
-
-
 
 pub(crate) fn exact_newton_d2h_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: F,
@@ -1551,8 +1501,6 @@ pub(crate) fn exact_newton_d2h_closure_owned<F: CustomFamily + Clone + Send + Sy
     })
 }
 
-
-
 pub(crate) fn exact_newton_d2h_many_closure_owned(
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
@@ -1577,8 +1525,6 @@ pub(crate) fn exact_newton_d2h_many_closure_owned(
     }))
 }
 
-
-
 pub(crate) fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(
     family: &F,
     options: &BlockwiseFitOptions,
@@ -1590,8 +1536,6 @@ pub(crate) fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(
                 | ExactNewtonOuterObjective::StrictPseudoLaplace
         )
 }
-
-
 
 pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     family: &F,
@@ -1635,8 +1579,6 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     (gradient, hessian)
 }
 
-
-
 pub(crate) fn include_exact_newton_logdet_s<F: CustomFamily + ?Sized>(
     family: &F,
     options: &BlockwiseFitOptions,
@@ -1645,13 +1587,9 @@ pub(crate) fn include_exact_newton_logdet_s<F: CustomFamily + ?Sized>(
         && options.use_remlobjective
 }
 
-
-
 pub(crate) fn use_exact_newton_strict_spd<F: CustomFamily + ?Sized>(family: &F) -> bool {
     family.exact_newton_outerobjective() == ExactNewtonOuterObjective::StrictPseudoLaplace
 }
-
-
 
 pub(crate) fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -1663,9 +1601,9 @@ pub(crate) fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'st
     blockwise_logdet_terms_with_workspace(family, specs, states, block_log_lambdas, options, None)
 }
 
-
-
-pub(crate) fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn blockwise_logdet_terms_with_workspace<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &mut [ParameterBlockState],
@@ -1996,8 +1934,6 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Se
     Ok((logdet_h_total, logdet_s_total))
 }
 
-
-
 /// Snapshot of a single block's eta for line-search rollback.
 ///
 /// Created from a specific block's state; can only restore to or update
@@ -2006,8 +1942,6 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Se
 pub(crate) struct BlockEtaCheckpoint {
     saved: Array1<f64>,
 }
-
-
 
 impl BlockEtaCheckpoint {
     /// Capture the current eta of `state`.
@@ -2053,8 +1987,6 @@ impl BlockEtaCheckpoint {
     }
 }
 
-
-
 /// Classification of which branch of the trust-region radius policy
 /// fired on a single update — surfaced in cycle logs so it is possible
 /// to tell at a glance whether the inner solver is being throttled by
@@ -2087,8 +2019,6 @@ pub(crate) enum JointTrustRegionDecision {
     RejectFloor,
 }
 
-
-
 impl JointTrustRegionDecision {
     fn label(&self) -> &'static str {
         match self {
@@ -2102,8 +2032,6 @@ impl JointTrustRegionDecision {
     }
 }
 
-
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JointTrustRegionUpdate {
     rho: f64,
@@ -2111,8 +2039,6 @@ pub(crate) struct JointTrustRegionUpdate {
     accepted: bool,
     decision: JointTrustRegionDecision,
 }
-
-
 
 pub(crate) fn update_joint_trust_region_radius(
     old_radius: f64,
@@ -2197,13 +2123,9 @@ pub(crate) fn update_joint_trust_region_radius(
     }
 }
 
-
-
 pub(crate) fn joint_objective_roundoff_slack(old_objective: f64, trial_objective: f64) -> f64 {
     (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs())).max(1.0e-10)
 }
-
-
 
 // True iff the line search detected a noise-level realized reduction (i.e.
 // the trial step neither helped nor hurt the objective beyond round-off)
@@ -2236,8 +2158,6 @@ pub(crate) fn joint_objective_floor_reached(
             ))
 }
 
-
-
 /// True iff the joint-Newton proposal is already at the step-tolerance floor —
 /// the unclamped Newton step's inf-norm is within `STEP_FLOOR_CERT_FACTOR ×
 /// step_tol` (the same round-off band the constrained-stationary certificate
@@ -2255,14 +2175,13 @@ pub(crate) fn joint_proposal_at_step_floor(proposal_step_inf: f64, step_tol: f64
         && proposal_step_inf <= STEP_FLOOR_CERT_FACTOR * step_tol
 }
 
-
-
-pub(crate) fn joint_trust_region_metric_step_norm(delta: &Array1<f64>, metric_diag: &Array1<f64>) -> f64 {
+pub(crate) fn joint_trust_region_metric_step_norm(
+    delta: &Array1<f64>,
+    metric_diag: &Array1<f64>,
+) -> f64 {
     assert_eq!(delta.len(), metric_diag.len());
     joint_trust_region_metric_step_norm_view(delta.view(), metric_diag.view())
 }
-
-
 
 pub(crate) fn joint_trust_region_metric_step_norm_view(
     delta: ArrayView1<f64>,
@@ -2276,8 +2195,6 @@ pub(crate) fn joint_trust_region_metric_step_norm_view(
         .sum::<f64>()
         .sqrt()
 }
-
-
 
 pub(crate) fn joint_trust_region_block_metric_norms(
     delta: &Array1<f64>,
@@ -2295,8 +2212,6 @@ pub(crate) fn joint_trust_region_block_metric_norms(
         })
         .collect()
 }
-
-
 
 pub(crate) fn truncate_joint_step_to_block_metric_radii(
     delta: &mut Array1<f64>,
@@ -2322,13 +2237,9 @@ pub(crate) fn truncate_joint_step_to_block_metric_radii(
     norms
 }
 
-
-
 pub(crate) fn joint_block_step_hit_trust_boundary(step_norm: f64, radius: f64) -> bool {
     step_norm.is_finite() && radius > 0.0 && step_norm >= 0.99 * radius
 }
-
-
 
 /// Per-block dogleg step (Powell, blending the Cauchy and Newton points within
 /// the block's M-metric trust radius). This is the principled globalization for
@@ -2448,8 +2359,6 @@ pub(crate) fn joint_dogleg_step_to_block_metric_radii(
     norms
 }
 
-
-
 /// Unconstrained Cauchy point of the joint penalized quadratic model in the
 /// block-diagonal M-metric: `δ_C = τ·p_sd` with `p_sd = M⁻¹·rhs` (the M-metric
 /// steepest-descent direction of the model `m(δ) = −rhs·δ + ½·δᵀHδ` at δ=0)
@@ -2460,7 +2369,11 @@ pub(crate) fn joint_dogleg_step_to_block_metric_radii(
 /// `H_pen·p_sd` for the SAME penalized (and Firth-augmented, when armed) Hessian
 /// the trust-region model uses, so the dogleg path is consistent with the
 /// accept/reject quadratic.
-pub(crate) fn joint_cauchy_step(rhs: &Array1<f64>, p_sd: &Array1<f64>, h_psd: &Array1<f64>) -> Array1<f64> {
+pub(crate) fn joint_cauchy_step(
+    rhs: &Array1<f64>,
+    p_sd: &Array1<f64>,
+    h_psd: &Array1<f64>,
+) -> Array1<f64> {
     let directional = rhs.dot(p_sd);
     if !directional.is_finite() || directional <= 0.0 {
         // `p_sd` is not an ascent direction of −m (no descent on the objective);
@@ -2479,8 +2392,6 @@ pub(crate) fn joint_cauchy_step(rhs: &Array1<f64>, p_sd: &Array1<f64>, h_psd: &A
     // trust boundary (the model decreases without bound along p_sd there).
     delta
 }
-
-
 
 pub(crate) fn shrink_active_joint_block_trust_radii(
     block_radii: &mut [f64],
@@ -2577,8 +2488,6 @@ pub(crate) fn shrink_active_joint_block_trust_radii(
     block_radii.iter().copied().fold(0.0_f64, f64::max)
 }
 
-
-
 pub(crate) fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
     family: &F,
     states: &[ParameterBlockState],
@@ -2636,13 +2545,9 @@ pub(crate) fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
     }
 }
 
-
-
 pub(crate) fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
     residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol
 }
-
-
 
 /// Per-iterate diagnostic snapshot assembled when the joint Newton inner solve
 /// refuses to certify constrained-stationarity. The report breaks the failure
@@ -2688,8 +2593,6 @@ pub(crate) struct KktRefusalReport {
     diagnosis: KktRefusalDiagnosis,
 }
 
-
-
 /// Three-way classification of why the cert refused, computed from the
 /// H_pen spectrum and the projected residual at the refusing iterate.
 /// `RankDeficientHPen` is the regression canary the nullspace lead's
@@ -2708,8 +2611,6 @@ pub(crate) enum KktRefusalDiagnosis {
     /// rho-anneal will not recover.
     AliasingDetectedAtFit,
 }
-
-
 
 impl KktRefusalDiagnosis {
     pub(crate) fn as_str(&self) -> &'static str {
@@ -2772,22 +2673,16 @@ impl KktRefusalDiagnosis {
     }
 }
 
-
-
 /// Relative rank tolerance applied to `|λ|/λ_max` when counting the
 /// nullity of `H_pen`. Matches the threshold the surrounding REML
 /// penalty-rank machinery uses for "structurally zero".
 pub(crate) const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
-
-
 
 /// Joint width above which the pairwise Jeffreys second-order endgame
 /// completion fallback (`p(p+1)/2` exact second-directional joint-Hessian
 /// calls per endgame cycle, gam#979) is not attempted. Wide systems may still
 /// get the exact completion from a family-provided contracted trace hook.
 pub(crate) const JEFFREYS_COMPLETION_MAX_P: usize = 64;
-
-
 
 /// Residual band (as a multiple of the KKT residual tolerance) inside which
 /// the inner joint Newton is considered to be in its convergence ENDGAME and
@@ -2796,8 +2691,6 @@ pub(crate) const JEFFREYS_COMPLETION_MAX_P: usize = 64;
 /// exactness buys nothing there; in the endgame it converts the
 /// divided-difference model's linear sawtooth into quadratic convergence.
 pub(crate) const JEFFREYS_COMPLETION_RESIDUAL_BAND: f64 = 300.0;
-
-
 
 /// Self-vanishing Levenberg–Marquardt damping factor for the range-restricted
 /// spectral Newton step (`solve_joint_newton_step_on_spectral_range`). The
@@ -2820,8 +2713,6 @@ pub(crate) const JEFFREYS_COMPLETION_RESIDUAL_BAND: f64 = 300.0;
 /// curvature on a well-conditioned problem.
 pub(crate) const JOINT_SPECTRAL_LEVENBERG_FACTOR: f64 = 1.0e-3;
 
-
-
 /// Condition number above which a FULL-RANK (`nullity == 0`) penalized Hessian is
 /// treated as ill-conditioned enough that a family opting into
 /// [`CustomFamily::levenberg_on_ill_conditioning`] gets the self-vanishing
@@ -2830,8 +2721,6 @@ pub(crate) const JOINT_SPECTRAL_LEVENBERG_FACTOR: f64 = 1.0e-3;
 /// convergence; the survival marginal-slope joint sits at cond ≈ 5.8e6, far above
 /// this gate, while a tiny well-conditioned constrained AFT sits well below it.
 pub(crate) const LEVENBERG_ILL_CONDITIONING_THRESHOLD: f64 = 1.0e4;
-
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct JointSpectralNewtonStep {
@@ -2851,13 +2740,11 @@ pub(crate) struct JointSpectralNewtonStep {
     most_negative_eigenvalue: f64,
 }
 
-
-
 /// Production home for the exact trust-region engine ([`WhitenedHessianSpectrum`]),
 /// wired into the unconstrained dense-spectral joint-Newton step in
 /// `inner_blockwise_fit` (gam#979). Kept in its own module so the engine's
 /// helpers stay namespaced; the parent reaches it via `whitened_spectrum::`.
-mod whitened_spectrum {
+pub(crate) mod whitened_spectrum {
     use super::super::*;
 
     /// Eigendecomposition of the metric-whitened penalized Hessian, retained so
@@ -2910,7 +2797,7 @@ mod whitened_spectrum {
     /// (the gam#553 Moore–Penrose range restriction): an unidentified gauge direction
     /// carries no finite Newton step and is left unchanged, its stationarity-residual
     /// component reported via [`JointSpectralNewtonStep::null_rhs_inf`].
-    pub(super) struct WhitenedHessianSpectrum {
+    pub(crate) struct WhitenedHessianSpectrum {
         /// Generalized eigenvalues `γ_k` of `(H_pen, D)` = eigenvalues of the
         /// whitened matrix `A = D^{-1/2} H_pen D^{-1/2}`.
         gamma: Array1<f64>,
@@ -2934,7 +2821,7 @@ mod whitened_spectrum {
         /// estimate becomes a safe positive scale). `rank_tol` is the relative
         /// near-singularity cutoff; the genuine numerical-rank floor is derived from
         /// the whitened spectrum exactly as the legacy spectral solve did.
-        pub(super) fn decompose(
+        pub(crate) fn decompose(
             h_pen: &Array2<f64>,
             rhs: &Array1<f64>,
             metric_diag: &Array1<f64>,
@@ -3030,7 +2917,7 @@ mod whitened_spectrum {
         /// objective by more than `objective_tol`, so continuing is wall-clock
         /// waste. A genuine defect (real curvature AND large gradient) produces
         /// a LARGE decrement, so this never masks one.
-        pub(super) fn newton_decrement(&self) -> f64 {
+        pub(crate) fn newton_decrement(&self) -> f64 {
             let mut acc = 0.0;
             for k in 0..self.gamma.len() {
                 let abs_gamma = self.gamma[k].abs();
@@ -3107,7 +2994,7 @@ mod whitened_spectrum {
         /// of radius `trust_radius`. When `trust_radius` is non-finite or `≤ 0` the
         /// unconstrained (Moore–Penrose, range-restricted) Newton step is returned —
         /// i.e. the caller opted out of the trust region.
-        pub(super) fn trust_region_step(&self, trust_radius: f64) -> JointSpectralNewtonStep {
+        pub(crate) fn trust_region_step(&self, trust_radius: f64) -> JointSpectralNewtonStep {
             // Smallest identified curvature (signed). Empty identified set ⇒ pure
             // null space ⇒ zero step.
             let mut gamma_min_id = f64::INFINITY;
@@ -3285,8 +3172,6 @@ mod whitened_spectrum {
     }
 }
 
-
-
 #[cfg(test)]
 mod trust_region_subproblem_tests {
     use super::super::*;
@@ -3452,8 +3337,6 @@ mod trust_region_subproblem_tests {
         );
     }
 }
-
-
 
 pub(crate) fn compute_kkt_refusal_report(
     cycle: usize,
@@ -3711,8 +3594,6 @@ pub(crate) fn compute_kkt_refusal_report(
     }
 }
 
-
-
 impl KktRefusalReport {
     fn carrying_block_label(&self) -> String {
         match self.block_carrying_residual {
@@ -3843,23 +3724,15 @@ impl KktRefusalReport {
     }
 }
 
-
-
 pub(crate) const JOINT_PCG_REL_TOL: f64 = 1e-8;
-
 
 pub(crate) const PCG_ETA_MAX: f64 = 1.0e-1;
 
-
 pub(crate) const PCG_ETA_MIN: f64 = 1.0e-8;
-
 
 pub(crate) const PCG_GAMMA: f64 = 0.9;
 
-
 pub(crate) const PCG_ALPHA: f64 = 1.618_033_988_749_895;
-
-
 
 /// Eisenstat–Walker adaptive forcing term for the inner PCG tolerance:
 /// when the previous outer KKT residual is known, scale the next inner
@@ -3867,7 +3740,10 @@ pub(crate) const PCG_ALPHA: f64 = 1.618_033_988_749_895;
 /// `[PCG_ETA_MIN, PCG_ETA_MAX]`. On the first cycle (no previous
 /// residual) we use the loose `PCG_ETA_MAX` to avoid over-solving when
 /// the iterate is far from the optimum.
-pub(crate) fn joint_pcg_eisenstat_walker_forcing(prev_kkt_norm: Option<f64>, current_kkt_norm: f64) -> f64 {
+pub(crate) fn joint_pcg_eisenstat_walker_forcing(
+    prev_kkt_norm: Option<f64>,
+    current_kkt_norm: f64,
+) -> f64 {
     if !current_kkt_norm.is_finite() || current_kkt_norm < 0.0 {
         return JOINT_PCG_REL_TOL;
     }
@@ -3883,8 +3759,6 @@ pub(crate) fn joint_pcg_eisenstat_walker_forcing(prev_kkt_norm: Option<f64>, cur
     }
     (PCG_GAMMA * ratio.powf(PCG_ALPHA)).clamp(PCG_ETA_MIN, PCG_ETA_MAX)
 }
-
-
 
 pub(crate) fn apply_joint_penalized_hessian_into(
     source: &JointHessianSource,
@@ -3907,8 +3781,6 @@ pub(crate) fn apply_joint_penalized_hessian_into(
         joint_full_width,
     )
 }
-
-
 
 /// Variant of [`apply_joint_penalized_hessian_into`] that reuses a
 /// caller-supplied scratch buffer for the penalty term instead of
@@ -3949,8 +3821,6 @@ pub(crate) fn apply_joint_penalized_hessian_into_with_workspace(
     Ok(())
 }
 
-
-
 pub(crate) fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
     family: &F,
     source: &JointHessianSource,
@@ -3984,8 +3854,6 @@ pub(crate) fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
     base_diagonal_ridge + shift
 }
 
-
-
 pub(crate) fn joint_quadratic_predicted_reduction(
     rhs: &Array1<f64>,
     hpen_delta: &Array1<f64>,
@@ -3993,8 +3861,6 @@ pub(crate) fn joint_quadratic_predicted_reduction(
 ) -> f64 {
     rhs.dot(delta) - 0.5 * delta.dot(hpen_delta)
 }
-
-
 
 pub(crate) fn joint_preconditioned_descent_delta(
     source: &JointHessianSource,
@@ -4040,8 +3906,6 @@ pub(crate) fn joint_preconditioned_descent_delta(
     Ok(delta)
 }
 
-
-
 pub(crate) fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     line_search_options: &BlockwiseFitOptions,
@@ -4051,8 +3915,6 @@ pub(crate) fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + 
         .log_likelihood_only_with_options(states, line_search_options)
         .map(|log_likelihood| (log_likelihood, None))
 }
-
-
 
 pub(crate) fn coefficient_line_search_options(
     options: &BlockwiseFitOptions,
@@ -4080,16 +3942,12 @@ pub(crate) fn coefficient_line_search_options(
     line_search_options
 }
 
-
-
 pub(crate) type JointGradientLoad = (
     f64,
     Option<Array1<f64>>,
     Option<FamilyEvaluation>,
     Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 );
-
-
 
 pub(crate) fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -4130,8 +3988,6 @@ pub(crate) fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sy
     Ok((log_likelihood, gradient, Some(eval), workspace))
 }
 
-
-
 pub(crate) fn require_projected_kkt_residual(
     residual: Option<ProjectedKktResidual>,
     context: &str,
@@ -4145,16 +4001,12 @@ pub(crate) fn require_projected_kkt_residual(
     }
 }
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConstrainedStationaryCertificate {
     NotCandidate,
     Accept,
     RefusePhantomMultiplier,
 }
-
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct JointNewtonMathDiagnostic {
@@ -4167,8 +4019,6 @@ pub(crate) struct JointNewtonMathDiagnostic {
     proposal_inf: f64,
 }
 
-
-
 impl JointNewtonMathDiagnostic {
     fn scalar_model_relative_error(&self) -> f64 {
         (self.actual_reduction - self.predicted_reduction).abs()
@@ -4179,8 +4029,6 @@ impl JointNewtonMathDiagnostic {
         self.linearized_next_kkt_inf / (1.0 + self.old_kkt_inf)
     }
 }
-
-
 
 pub(crate) fn constrained_stationary_certificate_decision(
     math: &JointNewtonMathDiagnostic,
@@ -4232,8 +4080,6 @@ pub(crate) fn constrained_stationary_certificate_decision(
     }
 }
 
-
-
 /// True iff the recent KKT-residual tail (`history`, oldest→newest) shows STEADY
 /// geometric descent: every consecutive pair strictly decreased by at least the
 /// factor `(1 - min_drop)` over the whole window.
@@ -4248,7 +4094,9 @@ pub(crate) fn constrained_stationary_certificate_decision(
 /// drop over `≥ window` cycles (not a single lucky decrease) keeps a noisy
 /// near-plateau from being falsely extended, and the inner cycle cap still
 /// bounds the extra work.
-pub(crate) fn residual_in_steady_geometric_descent(history: &std::collections::VecDeque<f64>) -> bool {
+pub(crate) fn residual_in_steady_geometric_descent(
+    history: &std::collections::VecDeque<f64>,
+) -> bool {
     let window = history.len();
     if window < 3 {
         return false;
@@ -4261,8 +4109,6 @@ pub(crate) fn residual_in_steady_geometric_descent(history: &std::collections::V
             prev.is_finite() && next.is_finite() && *prev > 0.0 && *next < (1.0 - min_drop) * *prev
         })
 }
-
-
 
 /// Inf-norm of the active-set-projected stationarity residual restricted to the
 /// **range** of the joint penalized Hessian `H_pen = H + S(λ) + ridge·I`.

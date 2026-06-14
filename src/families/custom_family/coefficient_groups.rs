@@ -88,7 +88,7 @@ fn validate_group_rho_prior_coordinate(
 
 /// Shared validation of penalized-complexity hyperparameters: `upper` finite and
 /// strictly positive, `tail_prob` a probability in the open interval `(0, 1)`.
-pub(super) fn validate_penalized_complexity_prior(
+pub(crate) fn validate_penalized_complexity_prior(
     context: &str,
     upper: f64,
     tail_prob: f64,

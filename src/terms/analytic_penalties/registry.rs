@@ -12,14 +12,12 @@ pub struct AnalyticPenaltyOp {
     pub penalty: Arc<dyn AnalyticPenalty>,
 }
 
-
 impl AnalyticPenaltyOp {
     #[must_use]
     pub fn new(penalty: Arc<dyn AnalyticPenalty>) -> Self {
         Self { penalty }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Registration helper — collects penalty kinds for the outer REML driver
@@ -158,9 +156,7 @@ macro_rules! define_analytic_penalty_kind {
     };
 }
 
-
 crate::analytic_penalty_registry!(define_analytic_penalty_kind);
-
 
 impl AnalyticPenaltyKind {
     pub(crate) fn isometry_scalar_weight(&self) -> Option<f64> {
@@ -177,7 +173,6 @@ impl AnalyticPenaltyKind {
     }
 }
 
-
 /// Registry of analytic penalties active in a single fit. The owning
 /// `RemlState` builder concatenates the per-penalty ρ-axes onto its global
 /// ρ vector in the order they appear here, so the rho-index bookkeeping
@@ -187,7 +182,6 @@ pub struct AnalyticPenaltyRegistry {
     pub penalties: Vec<AnalyticPenaltyKind>,
 }
 
-
 impl std::fmt::Debug for AnalyticPenaltyRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnalyticPenaltyRegistry")
@@ -195,7 +189,6 @@ impl std::fmt::Debug for AnalyticPenaltyRegistry {
             .finish()
     }
 }
-
 
 impl AnalyticPenaltyRegistry {
     #[must_use]
@@ -257,7 +250,6 @@ impl AnalyticPenaltyRegistry {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // PenaltyOp integration
 // ---------------------------------------------------------------------------
@@ -283,7 +275,6 @@ pub struct FrozenAnalyticPenaltyOp {
     rho: Array1<f64>,
 }
 
-
 const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
 
 const HUTCHINSON_DIAG_SAMPLES: usize = 32;
@@ -291,7 +282,6 @@ const HUTCHINSON_DIAG_SAMPLES: usize = 32;
 const ORTHOGONALITY_LOGDET_SLQ_PROBES: usize = 16;
 
 const ORTHOGONALITY_LOGDET_LANCZOS_STEPS: usize = 32;
-
 
 impl FrozenAnalyticPenaltyOp {
     #[must_use]
@@ -309,7 +299,6 @@ impl FrozenAnalyticPenaltyOp {
         &self.penalty
     }
 }
-
 
 impl PenaltyOp for FrozenAnalyticPenaltyOp {
     fn dim(&self) -> usize {
@@ -624,7 +613,6 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     }
 }
 
-
 impl FrozenAnalyticPenaltyOp {
     fn diag_via_matvec(&self) -> Array1<f64> {
         match &self.penalty {
@@ -813,7 +801,6 @@ impl FrozenAnalyticPenaltyOp {
     }
 }
 
-
 fn rademacher_unit_probe_into(mut z: ArrayViewMut1<'_, f64>, probe: u64, scale: f64) {
     let mut state = 0x6A09E667F3BCC909_u64 ^ probe.wrapping_mul(0xD1B54A32D192ED03);
     let mut bits = 0_u64;
@@ -829,12 +816,10 @@ fn rademacher_unit_probe_into(mut z: ArrayViewMut1<'_, f64>, probe: u64, scale: 
     }
 }
 
-
 #[inline]
 const fn splitmix64(state: &mut u64) -> u64 {
     crate::linalg::utils::splitmix64(state)
 }
-
 
 impl AnalyticPenaltyKind {
     /// Freeze this kind at `(target, rho)` and return an `Arc<dyn PenaltyOp>`
@@ -844,5 +829,3 @@ impl AnalyticPenaltyKind {
         Arc::new(FrozenAnalyticPenaltyOp::new(self.clone(), target, rho))
     }
 }
-
-

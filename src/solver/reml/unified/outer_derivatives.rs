@@ -2,35 +2,29 @@ use super::*;
 
 const HESSIAN_UNAVAILABLE_PREFIX: &str = "outer Hessian unavailable:";
 
-
 /// Minimum coefficient dimension at which the matrix-free operator path is
 /// selected unconditionally — once `p` is this large the dense `p × p`
 /// assembly itself dominates and operator HVPs win regardless of `n` or `K`.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD: usize = 512;
-
 
 /// Sample-count threshold for the (`n`, `p`) crossover branch: when `n` is
 /// large enough that per-row work dominates, the operator path wins even
 /// at moderate `p`.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
 
-
 /// Coefficient dimension paired with [`MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD`]
 /// in the (`n`, `p`) crossover branch.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N: usize = 32;
-
 
 /// `n · p` linear-work cutoff: per-eval `O(K · n · p²)` dense assembly
 /// dominates once `n · p` crosses this threshold even when both `n` and `p`
 /// are individually below the per-axis thresholds.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD: usize = 4_000_000;
 
-
 /// Smoothing-parameter count above which the operator path wins regardless
 /// of `n` and `p`: the per-outer-eval Hessian-assembly cost is
 /// `O(K · n · p²)`, so `K` itself drives the crossover.
 pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
-
 
 /// Row-pair work cutoff for callback-backed outer Hessians.
 ///
@@ -40,7 +34,6 @@ pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
 /// contractions over the upper-triangular coordinate pairs.
 pub(crate) const CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD: usize = 25_000_000;
 
-
 /// Coefficient-dimension threshold above which a stochastic (Hutch++) trace
 /// kernel is preferred over the exact dense trace for the logdet-H⁻¹ and ψ-Gram
 /// paths. Below this the exact dense O(p³) work is cheap enough that the
@@ -48,12 +41,10 @@ pub(crate) const CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD: usize = 25_000_
 /// estimator's O(p²·m) cost wins.
 pub(crate) const STOCHASTIC_TRACE_DIM_THRESHOLD: usize = 500;
 
-
 /// Elapsed-time (ms) above which a sparse-Cholesky trace path emits a timing
 /// diagnostic. Purely observational — surfaces slow per-eval trace solves to the
 /// bench runner without affecting the fit.
 pub(crate) const REML_TRACE_SLOW_LOG_MS: f64 = 100.0;
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OuterHessianRoutePlan {
@@ -63,9 +54,8 @@ pub(crate) struct OuterHessianRoutePlan {
     pub(crate) dense_workspace_bytes: usize,
 }
 
-
 impl OuterHessianRoutePlan {
-    fn choice(self) -> &'static str {
+    pub(crate) fn choice(self) -> &'static str {
         if self.use_operator {
             "operator"
         } else {
@@ -74,19 +64,16 @@ impl OuterHessianRoutePlan {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OuterHessianScaleDecision {
     prefers_operator: bool,
     pub(crate) reason: &'static str,
 }
 
-
 fn saturating_f64_matrix_bytes(rows: usize, cols: usize) -> usize {
     rows.saturating_mul(cols)
         .saturating_mul(std::mem::size_of::<f64>())
 }
-
 
 fn outer_hessian_dense_workspace_bytes(p: usize, k: usize) -> usize {
     // Dense assembly keeps first-order drifts for each coordinate and uses at
@@ -97,16 +84,13 @@ fn outer_hessian_dense_workspace_bytes(p: usize, k: usize) -> usize {
     saturating_f64_matrix_bytes(p, p).saturating_mul(drift_count)
 }
 
-
 fn outer_hessian_dense_workspace_budget_bytes() -> usize {
     crate::resource::ResourcePolicy::default_library().max_single_materialization_bytes
 }
 
-
 fn dense_outer_hessian_workspace_fits(p: usize, k: usize) -> bool {
     outer_hessian_dense_workspace_bytes(p, k) <= outer_hessian_dense_workspace_budget_bytes()
 }
-
 
 fn generic_outer_hessian_scale_decision(n: usize, p: usize, k: usize) -> OuterHessianScaleDecision {
     if !dense_outer_hessian_workspace_fits(p, k) {
@@ -147,7 +131,6 @@ fn generic_outer_hessian_scale_decision(n: usize, p: usize, k: usize) -> OuterHe
     }
 }
 
-
 fn callback_outer_hessian_scale_decision(
     n: usize,
     p: usize,
@@ -182,7 +165,6 @@ fn callback_outer_hessian_scale_decision(
         reason: "below_crossover",
     }
 }
-
 
 pub(crate) fn outer_hessian_route_plan(
     n: usize,
@@ -220,7 +202,6 @@ pub(crate) fn outer_hessian_route_plan(
     }
 }
 
-
 /// Predicate for selecting the matrix-free Hv-operator outer-Hessian
 /// representation over the dense `K × K` assembly.  Cost selects
 /// representation, never capability — the operator path delivers the same
@@ -230,11 +211,9 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
     generic_outer_hessian_scale_decision(n, p, k).prefers_operator
 }
 
-
 pub(crate) fn is_hessian_unavailable(error: &str) -> bool {
     error.starts_with(HESSIAN_UNAVAILABLE_PREFIX)
 }
-
 
 //   C[u]            = Xᵀ diag(c ⊙ Xu) X
 //   h^G             = diag(X G_ε(H) Xᵀ)
@@ -283,7 +262,6 @@ fn compute_adjoint_z_c(
     }
 }
 
-
 /// Compute the fourth-derivative trace: tr(G_ε(H) Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).
 ///
 /// Identity: tr(G_ε Xᵀ diag(w) X) = Σᵢ wᵢ · h^G[i].
@@ -311,7 +289,6 @@ fn compute_fourth_derivative_trace(
         .for_each(|&d, &xvk, &xvl, &h| acc += d * xvk * xvl * h);
     Ok(Some(acc))
 }
-
 
 /// Compute every fourth-derivative trace for a coordinate set in one pass.
 ///
@@ -376,7 +353,6 @@ fn compute_fourth_derivative_trace_matrix(
         });
     Ok(Some(crate::faer_ndarray::fast_atb(&x_modes, &weighted)))
 }
-
 
 /// Compute the IFT second-derivative correction contribution to h2_trace.
 ///
@@ -452,7 +428,6 @@ fn compute_ift_correction_trace(
     }
 }
 
-
 /// Compute the β-dependent drift derivative traces: M_i[β_j] + M_j[β_i].
 ///
 /// When a coordinate's fixed-β Hessian drift B depends on β, the second
@@ -503,7 +478,6 @@ fn compute_drift_deriv_traces(
     trace
 }
 
-
 /// Compute the base trace of the fixed-β second Hessian drift: tr(G_ε ∂²H/∂θ_i∂θ_j|_β).
 ///
 /// Uses the operator-backed path when available, otherwise falls back to
@@ -531,7 +505,6 @@ fn compute_base_h2_trace(
         0.0
     }
 }
-
 
 fn compute_base_h2_traces(
     hop: &dyn HessianOperator,
@@ -637,7 +610,6 @@ fn compute_base_h2_traces(
         .collect()
 }
 
-
 fn trace_logdet_hessian_cross_dense_drift(
     hop: &dyn HessianOperator,
     dense: &Array2<f64>,
@@ -650,7 +622,6 @@ fn trace_logdet_hessian_cross_dense_drift(
         }
     }
 }
-
 
 fn trace_logdet_hessian_crosses_dense_spectral_drifts(
     dense_hop: &DenseSpectralOperator,
@@ -706,7 +677,6 @@ fn trace_logdet_hessian_crosses_dense_spectral_drifts(
     out
 }
 
-
 #[inline]
 pub(crate) fn can_use_stochastic_logdet_hinv_kernel(
     hop: &dyn HessianOperator,
@@ -718,7 +688,6 @@ pub(crate) fn can_use_stochastic_logdet_hinv_kernel(
         && hop.logdet_traces_match_hinv_kernel()
         && incl_logdet_h
 }
-
 
 /// Shared precomputed REML derivative intermediates threaded from the
 /// gradient pass into the dense Hessian assembler so the per-coordinate
@@ -732,12 +701,10 @@ pub(crate) struct RemlDerivativeWorkspace<'a> {
     pub coord_corrections: &'a [Option<DriftDerivResult>],
 }
 
-
 struct KktRhoCorrections {
     pub(crate) gradient: Array1<f64>,
     pub(crate) hessian: Option<Array2<f64>>,
 }
-
 
 fn solve_kkt_residual_kernel(
     hop: &dyn HessianOperator,
@@ -752,7 +719,6 @@ fn solve_kkt_residual_kernel(
         hop.solve(rhs)
     }
 }
-
 
 pub(crate) fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
     let latest_theta = super::super::runtime::latest_outer_theta_for_ift();
@@ -779,7 +745,6 @@ pub(crate) fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
         })
         .collect()
 }
-
 
 /// Derivatives of the same Newton/IFT residual correction used by the cost:
 ///
@@ -945,7 +910,6 @@ pub(crate) fn compute_kkt_residual_rho_corrections(
 
     Ok(KktRhoCorrections { gradient, hessian })
 }
-
 
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
 ///
@@ -1943,13 +1907,11 @@ pub(crate) fn compute_outer_hessian(
     Ok(hess)
 }
 
-
 struct StoredFirstDrift {
     pub(crate) dense: Option<Array2<f64>>,
     dense_rotated: Option<Array2<f64>>,
     pub(crate) operators: Vec<Arc<dyn HyperOperator>>,
 }
-
 
 impl StoredFirstDrift {
     fn from_parts(
@@ -1992,12 +1954,10 @@ impl StoredFirstDrift {
     }
 }
 
-
 struct BorrowedStoredDriftOperator<'a> {
     pub(crate) drift: &'a StoredFirstDrift,
     pub(crate) dim_hint: usize,
 }
-
 
 impl HyperOperator for BorrowedStoredDriftOperator<'_> {
     fn dim(&self) -> usize {
@@ -2064,7 +2024,6 @@ impl HyperOperator for BorrowedStoredDriftOperator<'_> {
     }
 }
 
-
 /// Linear combination of `HyperOperator` factors with explicit scalar
 /// weights. Used to bundle a coord's per-mode drift operators (or any other
 /// per-term linear combination) into a single matrix-free operator that
@@ -2074,7 +2033,6 @@ pub struct WeightedHyperOperator {
     pub(crate) terms: Vec<(f64, Arc<dyn HyperOperator>)>,
     pub(crate) dim_hint: usize,
 }
-
 
 impl HyperOperator for WeightedHyperOperator {
     fn as_weighted(&self) -> Option<&WeightedHyperOperator> {
@@ -2234,7 +2192,6 @@ impl HyperOperator for WeightedHyperOperator {
     }
 }
 
-
 /// Per-matvec contraction of the ψψ-block second-order hook (#740), with each
 /// `D²_ψ H_L` drift already traced through the logdet kernel into `base_h2`.
 /// Indexed by ψ output row `i = idx - k_rho`.
@@ -2244,7 +2201,6 @@ struct PsiContractedContrib {
     pub(crate) ld_s: Array1<f64>,
     base_h2: Vec<f64>,
 }
-
 
 struct OuterHessianCoord {
     pub(crate) a: f64,
@@ -2256,13 +2212,11 @@ struct OuterHessianCoord {
     b_depends_on_beta: bool,
 }
 
-
 impl OuterHessianCoord {
     fn is_ext(&self) -> bool {
         self.ext_index.is_some()
     }
 }
-
 
 struct UnifiedOuterHessianOperator {
     pub(crate) hop: Arc<dyn HessianOperator>,
@@ -2307,7 +2261,6 @@ struct UnifiedOuterHessianOperator {
     /// representation of the ψψ block, not the math.
     contracted_psi: Option<ContractedPsiSecondOrderFn>,
 }
-
 
 impl UnifiedOuterHessianOperator {
     /// Exact implicit-function-theorem mode response of the inner coefficient
@@ -2632,7 +2585,6 @@ impl UnifiedOuterHessianOperator {
     }
 }
 
-
 impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessianOperator {
     fn dim(&self) -> usize {
         self.coords.len()
@@ -2743,7 +2695,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             })
     }
 }
-
 
 pub(crate) fn build_outer_hessian_operator(
     solution: &InnerSolution<'_>,
@@ -3536,7 +3487,6 @@ pub(crate) fn build_outer_hessian_operator(
         contracted_psi: solution.contracted_psi_second_order.clone(),
     })
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Extended Fellner–Schall (EFS) update for all hyperparameters

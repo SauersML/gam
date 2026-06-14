@@ -1,6 +1,6 @@
 use super::*;
 
-fn ctn_penalty_scale_log_lambdas(
+pub(crate) fn ctn_penalty_scale_log_lambdas(
     penalties: &[PenaltyMatrix],
     likelihood_gram: &Array2<f64>,
 ) -> Array1<f64> {
@@ -27,7 +27,6 @@ fn ctn_penalty_scale_log_lambdas(
     }))
 }
 
-
 fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
     match penalty {
         PenaltyMatrix::Dense(matrix) => {
@@ -46,7 +45,6 @@ fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
     }
 }
 
-
 fn matrix_diag_mean_abs(matrix: &Array2<f64>) -> f64 {
     let d = matrix.nrows().min(matrix.ncols());
     if d == 0 {
@@ -55,16 +53,14 @@ fn matrix_diag_mean_abs(matrix: &Array2<f64>) -> f64 {
     matrix.diag().iter().map(|v| v.abs()).sum::<f64>() / d as f64
 }
 
-
 fn matrix_frobenius_rms(matrix: &Array2<f64>) -> f64 {
     let d = matrix.nrows().max(1).min(matrix.ncols().max(1));
     (matrix.iter().map(|v| v * v).sum::<f64>() / d as f64).sqrt()
 }
 
-
 /// Weighted cross-product of two rowwise-Kronecker designs, kept strictly
 /// factored: output block (a, c) equals `B^T diag(w_i A_{ia} C_{ic}) D`.
-fn factored_weighted_cross(
+pub(crate) fn factored_weighted_cross(
     a: &Array2<f64>,
     b: &Array2<f64>,
     weights: ndarray::ArrayView1<'_, f64>,
@@ -108,7 +104,6 @@ fn factored_weighted_cross(
 
     Ok(out)
 }
-
 
 /// Chunked weighted B^T diag(w) D product without materializing any
 /// full rowwise-Kronecker intermediate.
@@ -171,7 +166,6 @@ fn chunked_weighted_bt_d(
     out
 }
 
-
 /// Chunked weighted `B^T diag(w) D` product where `B` and `D` are
 /// operator-backed `DesignMatrix` instances. Materializes only one row chunk
 /// at a time using the operator's `row_chunk` primitive, so neither factor's
@@ -181,7 +175,7 @@ fn chunked_weighted_bt_d(
 /// with `Accum::Add` rather than `out += &bl.t().dot(&dw)`. This drops one
 /// `Array2` allocation per chunk and routes the inner GEMM through faer's
 /// multi-threaded kernel with a work-aware parallelism choice.
-fn chunked_weighted_bt_d_designmatrix(
+pub(crate) fn chunked_weighted_bt_d_designmatrix(
     b: &DesignMatrix,
     weights: ndarray::ArrayView1<'_, f64>,
     d: &DesignMatrix,

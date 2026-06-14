@@ -10,7 +10,6 @@ use joint_packing::{
     gaussian_pack_wiggle_joint_score, gaussian_pack_wiggle_joint_symmetrichessian,
 };
 
-
 /// Typed errors surfaced from this module's helpers and family
 /// implementations. The `Display` impl writes the carried `reason` verbatim,
 /// so callers that historically returned `Result<_, String>` keep their
@@ -41,7 +40,6 @@ pub enum GamlssError {
     NumericalFailure { reason: String },
 }
 
-
 impl std::fmt::Display for GamlssError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -55,16 +53,13 @@ impl std::fmt::Display for GamlssError {
     }
 }
 
-
 impl std::error::Error for GamlssError {}
-
 
 impl From<GamlssError> for String {
     fn from(err: GamlssError) -> Self {
         err.to_string()
     }
 }
-
 
 /// Numerical floor on μ ∈ (0, 1) used only for downstream `1/μ` and
 /// `1/(1-μ)` divisions and for `μ.ln()` / `(1-μ).ln()` in the generic
@@ -106,7 +101,6 @@ use crate::solver::pirls::MIN_WEIGHT;
 /// numerical regime.
 pub(crate) const ETA_HARD_CLAMP: f64 = 30.0;
 
-
 /// Saturated `exp(η)` used by every log-link mean reconstruction in this
 /// module: clamp η into `[−ETA_HARD_CLAMP, ETA_HARD_CLAMP]` so `exp` stays
 /// finite, then floor at `MIN_WEIGHT` so downstream divisions never see
@@ -120,7 +114,6 @@ pub(crate) fn saturated_exp_eta(eta: f64) -> f64 {
         .max(MIN_WEIGHT)
 }
 
-
 /// Floor applied to a fitted smoothing parameter λ before `ln(λ)` is taken to
 /// seed an outer-loop `initial_log_lambdas` warm start. A pilot fit can return
 /// λ underflowed to exactly 0 for a deselected (effectively unpenalized) term;
@@ -130,7 +123,6 @@ pub(crate) fn saturated_exp_eta(eta: f64) -> f64 {
 /// outer optimizer would select, so a genuinely tiny pilot λ still seeds the
 /// search near its lower edge.
 pub(crate) const WARMSTART_LOG_LAMBDA_FLOOR: f64 = 1e-12;
-
 
 pub(crate) const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
@@ -143,7 +135,6 @@ pub(crate) const GAMLSS_PROJECTED_TRACE_TARGET_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const GAMLSS_PROJECTED_TRACE_MIN_CHUNK_ROWS: usize = 64;
 
 pub(crate) const GAMLSS_PROJECTED_TRACE_MAX_CHUNK_ROWS: usize = 8192;
-
 
 pub(crate) fn gamlss_projected_trace_chunk_rows(
     rank: usize,
@@ -162,7 +153,6 @@ pub(crate) fn gamlss_projected_trace_chunk_rows(
     )
 }
 
-
 pub(crate) fn gamlss_rowwise_map<F>(n: usize, f: F) -> Array1<f64>
 where
     F: Fn(usize) -> f64 + Sync,
@@ -173,7 +163,6 @@ where
         Array1::from_iter((0..n).map(f))
     }
 }
-
 
 pub(crate) fn gamlss_rowwise_map_result<F>(n: usize, f: F) -> Result<Array1<f64>, String>
 where
@@ -191,13 +180,11 @@ where
     }
 }
 
-
 pub(crate) enum DenseOrOperator<'a> {
     Borrowed(&'a Array2<f64>),
     Owned(Array2<f64>),
     Operator(DesignMatrix),
 }
-
 
 impl DenseOrOperator<'_> {
     fn nrows(&self) -> usize {
@@ -245,7 +232,6 @@ impl DenseOrOperator<'_> {
     }
 }
 
-
 /// Resolve a single dense block design from a `ParameterBlockSpec`, falling
 /// back to materializing the sparse representation through the policy when
 /// the dense form isn't already cached. Returns `Cow::Borrowed` whenever the
@@ -268,7 +254,6 @@ pub(crate) fn dense_block_from_spec<'a>(
         )),
     }
 }
-
 
 /// Resolve the (primary, log-σ) pair of dense block designs that every
 /// LocationScale family's spec-aware exact path needs. The primary block is
@@ -307,7 +292,6 @@ pub(crate) fn dense_locscale_block_designs_fromspecs<'a>(
     )?;
     Ok((primary, log_sigma))
 }
-
 
 /// Materialize a single location-scale family's two cached block designs
 /// (`primary` = mu/threshold, plus `log_sigma`) into dense matrices, borrowing
@@ -352,7 +336,6 @@ pub(crate) fn dense_locscale_block_designs_cached<'a>(
     Ok((primary, log_sigma))
 }
 
-
 /// One resolved ψ-direction for a two-axis (primary + log-σ) location-scale
 /// family. Holds the neutral pieces shared by every such family's
 /// `exact_newton_joint_psi_direction`; each family wraps these into its own
@@ -365,7 +348,6 @@ pub(crate) struct LocScalePsiDirectionParts {
     primary_z: Array1<f64>,
     log_sigma_z: Array1<f64>,
 }
-
 
 /// Shared body of every two-axis location-scale family's
 /// `exact_newton_joint_psi_direction`. Walks the flat ψ-derivative list,
@@ -464,7 +446,6 @@ pub(crate) fn locscale_joint_psi_direction_parts(
     Ok(None)
 }
 
-
 /// Shared second-derivative design drift assembly for two-axis location-scale
 /// joint-ψ paths. The family-specific methods differ only by block constants,
 /// labels, and field names; the ψψ map lookup and `X_{ab} β` action are the
@@ -479,7 +460,6 @@ pub(crate) struct LocScalePsiDriftConfig<'a> {
     primary_label: &'a str,
     policy: &'a crate::resource::ResourcePolicy,
 }
-
 
 pub(crate) fn locscale_joint_psisecond_design_drifts(
     block_states: &[ParameterBlockState],
@@ -553,7 +533,6 @@ pub(crate) fn locscale_joint_psisecond_design_drifts(
     })
 }
 
-
 pub(crate) fn psi_psi_map_to_drift_slots(
     deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
     deriv_b: &crate::custom_family::CustomFamilyBlockPsiDerivative,
@@ -591,7 +570,6 @@ pub(crate) fn psi_psi_map_to_drift_slots(
     }
 }
 
-
 pub(crate) fn dense_block_or_operator<'a>(
     design: &'a DesignMatrix,
     n: usize,
@@ -614,7 +592,6 @@ pub(crate) fn dense_block_or_operator<'a>(
     DenseOrOperator::Operator(design.clone())
 }
 
-
 pub(crate) fn dense_blocks_planned_budget(blocks: &[&DesignMatrix]) -> Vec<usize> {
     let mut planned = vec![0; blocks.len()];
     let mut total = 0usize;
@@ -635,7 +612,6 @@ pub(crate) fn dense_blocks_planned_budget(blocks: &[&DesignMatrix]) -> Vec<usize
     planned
 }
 
-
 pub(crate) fn exact_design_row_chunks(
     n: usize,
     p: usize,
@@ -650,7 +626,6 @@ pub(crate) fn exact_design_row_chunks(
         .step_by(rows)
         .map(move |start| start..(start + rows).min(n))
 }
-
 
 pub(crate) fn design_weighted_column_squares(
     design: &DesignMatrix,
@@ -687,7 +662,6 @@ pub(crate) fn design_weighted_column_squares(
     Ok(out)
 }
 
-
 #[inline]
 pub(crate) fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
     if !rawweight.is_finite() || rawweight <= 0.0 {
@@ -696,7 +670,6 @@ pub(crate) fn floor_positiveweight(rawweight: f64, minweight: f64) -> f64 {
         rawweight.max(minweight)
     }
 }
-
 
 #[inline]
 pub(crate) fn logb_dlog_sigma_deta(sigma: f64, d_sigma_deta: f64) -> f64 {
@@ -711,7 +684,6 @@ pub(crate) fn logb_dlog_sigma_deta(sigma: f64, d_sigma_deta: f64) -> f64 {
         }
     }
 }
-
 
 #[inline]
 pub(crate) fn gaussian_log_sigma_irlsinfo_directional_derivative(
@@ -741,7 +713,6 @@ pub(crate) fn gaussian_log_sigma_irlsinfo_directional_derivative(
     if dw.is_finite() { dw } else { 0.0 }
 }
 
-
 #[derive(Clone, Copy)]
 pub(crate) struct GaussianDiagonalRowKernel {
     log_likelihood: f64,
@@ -750,7 +721,6 @@ pub(crate) struct GaussianDiagonalRowKernel {
     log_sigma_working_weight: f64,
     log_sigma_working_response: f64,
 }
-
 
 #[inline]
 pub(crate) fn gaussian_diagonal_row_kernel(
@@ -808,8 +778,6 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         log_sigma_working_response,
     }
 }
-
-
 
 /// Link identifiers for distribution parameters in multi-parameter GAMLSS families.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

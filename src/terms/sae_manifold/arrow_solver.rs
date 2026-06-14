@@ -6,7 +6,6 @@ pub struct SaeArrowVector {
     pub beta: Array1<f64>,
 }
 
-
 pub(crate) struct DeflatedArrowSolver<'a> {
     cache: &'a ArrowFactorCache,
     gauge_basis: Vec<Array1<f64>>,
@@ -15,9 +14,8 @@ pub(crate) struct DeflatedArrowSolver<'a> {
     gauge_stiffness_recip: f64,
 }
 
-
 impl<'a> DeflatedArrowSolver<'a> {
-    fn plain(cache: &'a ArrowFactorCache) -> Self {
+    pub(crate) fn plain(cache: &'a ArrowFactorCache) -> Self {
         Self {
             cache,
             gauge_basis: Vec::new(),
@@ -27,7 +25,7 @@ impl<'a> DeflatedArrowSolver<'a> {
         }
     }
 
-    fn from_orthonormal_gauges(
+    pub(crate) fn from_orthonormal_gauges(
         cache: &'a ArrowFactorCache,
         gauge_basis: Vec<Array1<f64>>,
         stiffness: f64,
@@ -91,7 +89,7 @@ impl<'a> DeflatedArrowSolver<'a> {
         })
     }
 
-    fn solve(
+    pub(crate) fn solve(
         &self,
         rhs_t: ArrayView1<'_, f64>,
         rhs_beta: ArrayView1<'_, f64>,
@@ -142,7 +140,7 @@ impl<'a> DeflatedArrowSolver<'a> {
         })
     }
 
-    fn latent_inverse_diagonal(&self) -> Result<Array1<f64>, String> {
+    pub(crate) fn latent_inverse_diagonal(&self) -> Result<Array1<f64>, String> {
         if self.woodbury_factor.is_none() {
             return self
                 .cache
@@ -162,7 +160,6 @@ impl<'a> DeflatedArrowSolver<'a> {
     }
 }
 
-
 fn flatten_arrow_parts(t: ArrayView1<'_, f64>, beta: ArrayView1<'_, f64>) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(t.len() + beta.len());
     for i in 0..t.len() {
@@ -173,7 +170,6 @@ fn flatten_arrow_parts(t: ArrayView1<'_, f64>, beta: ArrayView1<'_, f64>) -> Arr
     }
     out
 }
-
 
 fn apply_cached_arrow_hessian(
     cache: &ArrowFactorCache,
@@ -254,7 +250,6 @@ fn apply_cached_arrow_hessian(
     })
 }
 
-
 fn cholesky_factor_apply(factor: ArrayView2<'_, f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
     let n = factor.nrows();
     let mut lt_v = Array1::<f64>::zeros(n);
@@ -276,33 +271,29 @@ fn cholesky_factor_apply(factor: ArrayView2<'_, f64>, vector: ArrayView1<'_, f64
     out
 }
 
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SaeLocalRowVar {
     Logit { atom: usize },
     Coord { atom: usize, axis: usize },
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct SaeBorderChannel {
-    atom: usize,
-    basis_col: usize,
-    index: usize,
-    output: Vec<f64>,
+    pub(crate) atom: usize,
+    pub(crate) basis_col: usize,
+    pub(crate) index: usize,
+    pub(crate) output: Vec<f64>,
 }
-
 
 #[derive(Debug, Clone)]
 pub(crate) struct SaeRowJets {
-    vars: Vec<SaeLocalRowVar>,
-    first: Vec<Vec<f64>>,
-    second: Vec<Vec<Vec<f64>>>,
-    beta: Vec<Vec<f64>>,
-    beta_deriv: Vec<Vec<Vec<f64>>>,
-    beta_l_deriv: Vec<Vec<Vec<f64>>>,
+    pub(crate) vars: Vec<SaeLocalRowVar>,
+    pub(crate) first: Vec<Vec<f64>>,
+    pub(crate) second: Vec<Vec<Vec<f64>>>,
+    pub(crate) beta: Vec<Vec<f64>>,
+    pub(crate) beta_deriv: Vec<Vec<Vec<f64>>>,
+    pub(crate) beta_l_deriv: Vec<Vec<Vec<f64>>>,
 }
-
 
 fn sae_dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()

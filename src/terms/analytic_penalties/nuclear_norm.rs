@@ -50,13 +50,11 @@ pub struct NuclearNormPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-
 struct NuclearSvdCache {
     u: Array2<f64>,
     singular: Array1<f64>,
     vt: Array2<f64>,
 }
-
 
 impl NuclearNormPenalty {
     #[must_use = "build error must be handled"]
@@ -572,7 +570,6 @@ impl NuclearNormPenalty {
     }
 }
 
-
 impl AnalyticPenalty for NuclearNormPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -656,5 +653,3 @@ impl AnalyticPenalty for NuclearNormPenalty {
 
     impl_scalar_apply_schedule!(weight);
 }
-
-

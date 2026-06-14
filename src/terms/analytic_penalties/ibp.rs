@@ -30,7 +30,6 @@ pub struct IBPAssignmentPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-
 impl IBPAssignmentPenalty {
     #[must_use]
     pub fn new(k_max: usize, alpha: f64, tau: f64, learnable_alpha: bool) -> Self {
@@ -358,7 +357,6 @@ impl IBPAssignmentPenalty {
     }
 }
 
-
 /// Exact logit third-derivative channels of [`IBPAssignmentPenalty::hessian_diag`]
 /// for the SAE outer-ρ log-det adjoint Γ (#1006). Row-major `(N, K)` layout.
 #[derive(Debug, Clone)]
@@ -381,7 +379,6 @@ pub struct IbpHessianDiagThirdChannels {
     /// Length `K`.
     pub cross_row_d: Array1<f64>,
 }
-
 
 impl AnalyticPenalty for IBPAssignmentPenalty {
     fn tier(&self) -> PenaltyTier {
@@ -647,5 +644,3 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
     }
 }
-
-

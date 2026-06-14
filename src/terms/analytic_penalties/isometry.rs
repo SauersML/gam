@@ -17,7 +17,6 @@ pub enum IsometryReference {
     UserSupplied(Arc<Array2<f64>>), // (n_obs, d*d) row-major flattened
 }
 
-
 impl std::fmt::Debug for IsometryReference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -29,7 +28,6 @@ impl std::fmt::Debug for IsometryReference {
         }
     }
 }
-
 
 /// Per-observation behavioral-metric field `W_n ∈ ℝ^{p × p}`, stored in
 /// **low-rank factored form** `W_n = U_n U_n^T` with `U_n ∈ ℝ^{p × r_n}`.
@@ -63,7 +61,6 @@ pub enum WeightField {
     },
 }
 
-
 /// Radial Duchon decoder metadata used to materialize
 /// `∂J_n[i, a] / ∂t_{n, c}` from `φ'(r)` and `φ''(r)` on demand.
 ///
@@ -85,7 +82,6 @@ pub struct IsometryDuchonRadialSource {
     pub power: usize,
 }
 
-
 impl std::fmt::Debug for WeightField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -99,7 +95,6 @@ impl std::fmt::Debug for WeightField {
         }
     }
 }
-
 
 impl WeightField {
     /// Apply `U_n^T J_n` for a specific row, given both the row's `J_n` flat
@@ -126,7 +121,6 @@ impl WeightField {
         m
     }
 }
-
 
 /// Isometry-to-reference penalty (canonical-coordinate gauge term).
 ///
@@ -252,7 +246,6 @@ pub struct IsometryPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-
 struct IsometryHvpState<'a> {
     d: usize,
     n_obs: usize,
@@ -263,7 +256,6 @@ struct IsometryHvpState<'a> {
     wj_rows: Vec<Array2<f64>>,
 }
 
-
 #[derive(Debug, Clone)]
 struct IsometryMetricState {
     g: Array2<f64>,
@@ -273,7 +265,6 @@ struct IsometryMetricState {
     trace_denominator: f64,
     residual_dot_g: f64,
 }
-
 
 impl IsometryMetricState {
     fn residual_direction(&self, delta_g: ArrayView2<'_, f64>, d: usize) -> (Array2<f64>, f64) {
@@ -332,7 +323,6 @@ impl IsometryMetricState {
     }
 }
 
-
 fn isometry_dg_entry(
     jac2: ArrayView2<'_, f64>,
     wj: ArrayView2<'_, f64>,
@@ -350,7 +340,6 @@ fn isometry_dg_entry(
     }
     s
 }
-
 
 fn isometry_row_delta_g(
     jac2: ArrayView2<'_, f64>,
@@ -372,7 +361,6 @@ fn isometry_row_delta_g(
     }
     delta_g
 }
-
 
 impl IsometryPenalty {
     pub const DEFAULT_VALUE_ON_MISSING_CACHE: f64 = 0.0;
@@ -470,7 +458,6 @@ impl IsometryPenalty {
     }
 }
 
-
 impl Clone for IsometryPenalty {
     fn clone(&self) -> Self {
         Self {
@@ -488,7 +475,6 @@ impl Clone for IsometryPenalty {
         }
     }
 }
-
 
 impl IsometryPenalty {
     /// Attach a cached third decoder derivative
@@ -828,7 +814,10 @@ impl IsometryPenalty {
         }
     }
 
-    fn hvp_state<'a>(&'a self, target: ArrayView1<'_, f64>) -> Option<IsometryHvpState<'a>> {
+    pub(crate) fn hvp_state<'a>(
+        &'a self,
+        target: ArrayView1<'_, f64>,
+    ) -> Option<IsometryHvpState<'a>> {
         let d = self
             .target
             .latent_dim
@@ -860,7 +849,7 @@ impl IsometryPenalty {
         })
     }
 
-    fn hvp_with_precomputed_state(
+    pub(crate) fn hvp_with_precomputed_state(
         &self,
         state: &IsometryHvpState<'_>,
         rho: ArrayView1<'_, f64>,
@@ -1130,7 +1119,6 @@ impl IsometryPenalty {
     }
 }
 
-
 impl AnalyticPenalty for IsometryPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -1348,5 +1336,3 @@ impl AnalyticPenalty for IsometryPenalty {
 
     impl_scalar_apply_schedule!(scalar_weight);
 }
-
-

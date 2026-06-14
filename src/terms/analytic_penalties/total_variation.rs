@@ -13,7 +13,6 @@ pub enum DifferenceOpKind {
     GraphEdges(Vec<(usize, usize)>),
 }
 
-
 /// Coordinatewise/anisotropic smoothed-L¹ total variation on a row-major
 /// `(n_eff, d)` latent block.
 ///
@@ -36,7 +35,6 @@ pub struct TotalVariationPenalty {
     pub rho_index: usize,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl TotalVariationPenalty {
     #[must_use = "build error must be handled"]
@@ -320,7 +318,6 @@ impl TotalVariationPenalty {
     }
 }
 
-
 impl AnalyticPenalty for TotalVariationPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -421,7 +418,6 @@ impl AnalyticPenalty for TotalVariationPenalty {
     impl_scalar_apply_schedule!(weight);
 }
 
-
 // ---------------------------------------------------------------------------
 // Monotonicity penalty (1D shape constraint)
 // ---------------------------------------------------------------------------
@@ -454,7 +450,6 @@ pub struct MonotonicityPenalty {
     pub rho_index: usize,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl MonotonicityPenalty {
     #[must_use = "build error must be handled"]
@@ -557,7 +552,6 @@ impl MonotonicityPenalty {
     }
 }
 
-
 impl AnalyticPenalty for MonotonicityPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -642,5 +636,3 @@ impl AnalyticPenalty for MonotonicityPenalty {
 
     impl_scalar_apply_schedule!(weight);
 }
-
-

@@ -28,9 +28,8 @@ pub enum SaeAtomBasisKind {
     Precomputed(String),
 }
 
-
 impl SaeAtomBasisKind {
-    fn latent_manifold(&self, latent_dim: usize) -> LatentManifold {
+    pub(crate) fn latent_manifold(&self, latent_dim: usize) -> LatentManifold {
         match self {
             // `Periodic` uses [`PeriodicHarmonicEvaluator`], whose basis
             // functions are `cos(2π·h·t), sin(2π·h·t)` — i.e. `t` is a
@@ -89,17 +88,20 @@ impl SaeAtomBasisKind {
             // ball origin, optimised in the unconstrained tangent chart (the
             // hyperbolic geometry enters through the penalty, not a constrained
             // retraction), so it shares the Euclidean latent manifold.
-            Self::Duchon
-            | Self::EuclideanPatch
-            | Self::Poincare
-            | Self::Precomputed(_) => LatentManifold::Euclidean,
+            Self::Duchon | Self::EuclideanPatch | Self::Poincare | Self::Precomputed(_) => {
+                LatentManifold::Euclidean
+            }
         }
     }
 
     /// Dense candidate coordinates spanning compact latents for fixed-decoder
     /// out-of-sample projection. Unbounded/basis-linear latents return `None`
     /// because their PCA seed already lies in the convex training hull.
-    fn projection_seed_grid(&self, latent_dim: usize, resolution: usize) -> Option<Array2<f64>> {
+    pub(crate) fn projection_seed_grid(
+        &self,
+        latent_dim: usize,
+        resolution: usize,
+    ) -> Option<Array2<f64>> {
         match self {
             Self::Periodic => torus_projection_seed_grid(latent_dim, resolution),
             Self::Sphere if latent_dim == 2 => sphere_projection_seed_grid(resolution),
@@ -112,7 +114,6 @@ impl SaeAtomBasisKind {
         }
     }
 }
-
 
 fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     use std::f64::consts::PI;
@@ -128,7 +129,6 @@ fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     }
     Some(grid)
 }
-
 
 fn torus_projection_seed_grid(latent_dim: usize, resolution: usize) -> Option<Array2<f64>> {
     if latent_dim == 0 || latent_dim >= usize::BITS as usize {
@@ -164,7 +164,6 @@ fn torus_projection_seed_grid(latent_dim: usize, resolution: usize) -> Option<Ar
     }
     Some(grid)
 }
-
 
 /// Per-axis ARD coordinate prior, evaluated as a smooth energy in the latent
 /// coordinate `t` with precision `alpha = exp(log_ard)`.
@@ -212,18 +211,17 @@ fn torus_projection_seed_grid(latent_dim: usize, resolution: usize) -> Option<Ar
 /// that the prior energy it implies stays consistent with `ard_value`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArdAxisPrior {
-    value: f64,
-    grad: f64,
-    hess: f64,
-    sq_equiv: f64,
+    pub(crate) value: f64,
+    pub(crate) grad: f64,
+    pub(crate) hess: f64,
+    pub(crate) sq_equiv: f64,
 }
-
 
 impl ArdAxisPrior {
     /// Evaluate the per-axis prior at coordinate `t` with precision `alpha`.
     /// `period == None` selects the Euclidean Gaussian; `Some(p)` selects the
     /// von-Mises periodic energy with period `p`.
-    fn eval(alpha: f64, t: f64, period: Option<f64>) -> Self {
+    pub(crate) fn eval(alpha: f64, t: f64, period: Option<f64>) -> Self {
         match period {
             None => Self {
                 value: 0.5 * alpha * t * t,
@@ -246,7 +244,6 @@ impl ArdAxisPrior {
     }
 }
 
-
 /// Large-argument (`|x| >= 3.75`) Abramowitz & Stegun 9.8.2 polynomial for the
 /// *exponentially-scaled* `I0`: `√x · e^{−x} · I0(x) ≈ poly(3.75/x)`. Factoring
 /// the `e^{x}/√x` envelope out lets the log-partition and the `I1/I0` ratio be
@@ -263,7 +260,6 @@ fn bessel_i0_scaled_poly(ax: f64) -> f64 {
                             + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377)))))))
 }
 
-
 /// Large-argument (`|x| >= 3.75`) Abramowitz & Stegun 9.8.4 polynomial for the
 /// *exponentially-scaled* `I1`: `√x · e^{−x} · I1(x) ≈ poly(3.75/x)`. Pairs with
 /// [`bessel_i0_scaled_poly`] so their shared `e^{x}/√x` envelope cancels exactly
@@ -278,7 +274,6 @@ fn bessel_i1_scaled_poly(ax: f64) -> f64 {
                         + y * (0.02282967
                             + y * (-0.02895312 + y * (0.01787654 - y * 0.00420059)))))))
 }
-
 
 /// Modified Bessel function of the first kind, order zero, `I0(x)`.
 ///
@@ -300,7 +295,6 @@ fn bessel_i0(x: f64) -> f64 {
     }
 }
 
-
 /// Modified Bessel function of the first kind, order one, `I1(x)`.
 ///
 /// Uses the Abramowitz & Stegun approximations paired with [`bessel_i0`]. This is
@@ -320,7 +314,6 @@ fn bessel_i1(x: f64) -> f64 {
     };
     if x < 0.0 { -value } else { value }
 }
-
 
 /// Overflow-free `(log I0(η), I1(η)/I0(η))` for `η >= 0`, the only two Bessel
 /// quantities the von-Mises ARD precision normaliser and its ρ-gradient need.
@@ -445,7 +438,6 @@ pub struct SaeManifoldAtom {
     /// atoms; never a flag the user controls.
     pub chart_canonicalized: bool,
 }
-
 
 impl SaeManifoldAtom {
     #[must_use = "build error must be handled"]
@@ -1033,7 +1025,11 @@ impl SaeManifoldAtom {
         // `1/λ²` factor. For the monomial patch (`d = 1`) the tangent coordinate
         // is the linear monomial column (`Φ = [1, t, …]`, so column 1 is `t`).
         let hyperbolic = matches!(self.basis_kind, SaeAtomBasisKind::Poincare);
-        let linear_col = if hyperbolic && m >= 2 { Some(1usize) } else { None };
+        let linear_col = if hyperbolic && m >= 2 {
+            Some(1usize)
+        } else {
+            None
+        };
         for row in 0..n {
             self.fill_decoded_derivative_row(row, 0, &mut deriv);
             let mut speed_sq = 0.0_f64;
@@ -1132,7 +1128,6 @@ impl SaeManifoldAtom {
         }
     }
 }
-
 
 /// Null-space dimension of the symmetric PSD roughness Gram `S` — the order
 /// `r` of the difference / Duchon penalty it encodes (`nullity(S) = r`, since

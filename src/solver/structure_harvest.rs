@@ -61,7 +61,9 @@ use crate::terms::sae::basis::{
     EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisSecondJet, SphereChartEvaluator,
     TorusHarmonicEvaluator,
 };
-use crate::terms::sae_manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
+use crate::terms::sae_manifold::{
+    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+};
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
 /// that row when deriving the discrete co-activation support. A soft softmax /
@@ -932,7 +934,7 @@ fn fit_topology_candidate(
     let null_cols: Vec<usize> = s_evals
         .iter()
         .enumerate()
-        .filter(|(_, &v)| v <= s_tol)
+        .filter(|&(_, &v)| v <= s_tol)
         .map(|(i, _)| i)
         .collect();
     let null_dim = null_cols.len();
@@ -1207,11 +1209,12 @@ fn born_atom(
             // Coordinate block matched to the winning evaluator's intrinsic dim,
             // carrying the winning chart manifold so the joint refit retracts on
             // the right geometry.
-            let coord_block = crate::terms::latent_coord::LatentCoordValues::from_matrix_with_manifold(
-                fit.coords.view(),
-                LatentIdMode::None,
-                fit.manifold.clone(),
-            );
+            let coord_block =
+                crate::terms::latent_coord::LatentCoordValues::from_matrix_with_manifold(
+                    fit.coords.view(),
+                    LatentIdMode::None,
+                    fit.manifold.clone(),
+                );
             (atom, coord_block)
         }
         None => {
@@ -1806,8 +1809,7 @@ mod tests {
             max_fissions: 0,
             max_births: 2,
         };
-        let report =
-            harvest_move_proposals(&term, &rho, zero_residual.view(), &params).unwrap();
+        let report = harvest_move_proposals(&term, &rho, zero_residual.view(), &params).unwrap();
         let births: usize = report
             .proposals
             .iter()
@@ -2134,22 +2136,13 @@ mod tests {
 
         let weights = Array1::<f64>::ones(n);
 
-        let circle_fit = race_birth_topology(
-            coords.view(),
-            circle_target.view(),
-            weights.view(),
-            1,
-        )
-        .expect("circle race runs")
-        .expect("circle race has a realizable candidate");
-        let line_fit = race_birth_topology(
-            coords.view(),
-            line_target.view(),
-            weights.view(),
-            1,
-        )
-        .expect("line race runs")
-        .expect("line race has a realizable candidate");
+        let circle_fit =
+            race_birth_topology(coords.view(), circle_target.view(), weights.view(), 1)
+                .expect("circle race runs")
+                .expect("circle race has a realizable candidate");
+        let line_fit = race_birth_topology(coords.view(), line_target.view(), weights.view(), 1)
+            .expect("line race runs")
+            .expect("line race has a realizable candidate");
 
         assert_eq!(
             circle_fit.basis_kind,

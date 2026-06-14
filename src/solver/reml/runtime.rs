@@ -32,7 +32,7 @@ pub(crate) use crate::linalg::utils::{
 };
 pub(crate) use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 pub(crate) use crate::pirls::PirlsWorkspace;
-pub(crate) use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
+use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 pub(crate) use crate::solver::outer_strategy::{HessianResult, OuterEval};
 pub(crate) use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, load_record, store_record,
@@ -47,8 +47,11 @@ pub(crate) use std::ops::Range;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
+#[path = "gradient_hessian.rs"]
 mod gradient_hessian;
+#[path = "objective.rs"]
 mod objective;
+#[path = "state_caches.rs"]
 mod state_caches;
 
 pub(crate) use gradient_hessian::*;

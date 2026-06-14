@@ -23,7 +23,6 @@ pub enum PenaltyConcavity {
     Scad,
 }
 
-
 /// Element-wise SCAD/MCP family penalty on a row-major latent block.
 ///
 /// Lives on the extension-coordinate tier. The target is a row-major
@@ -70,7 +69,6 @@ pub struct ScadMcpPenalty {
     pub rho_index: usize,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl ScadMcpPenalty {
     #[must_use = "build error must be handled"]
@@ -338,7 +336,6 @@ impl ScadMcpPenalty {
     }
 }
 
-
 impl AnalyticPenalty for ScadMcpPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -429,5 +426,3 @@ impl AnalyticPenalty for ScadMcpPenalty {
 
     impl_scalar_apply_schedule!(weight);
 }
-
-

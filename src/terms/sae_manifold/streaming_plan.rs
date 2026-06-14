@@ -30,7 +30,6 @@ pub struct SaeStreamingPlan {
     pub matrix_free_admitted: bool,
 }
 
-
 fn sae_streaming_plan_from_budget(
     n_obs: usize,
     total_basis: usize,
@@ -88,7 +87,6 @@ fn sae_streaming_plan_from_budget(
     }
 }
 
-
 pub fn sae_streaming_plan_for_shape(
     n_obs: usize,
     total_basis: usize,
@@ -134,9 +132,13 @@ pub fn sae_streaming_plan_for_shape(
     )
 }
 
-
 impl SaeStreamingPlan {
-    fn admitted_or_error(self, n: usize, p: usize, k_atoms: usize) -> Result<Self, String> {
+    pub(crate) fn admitted_or_error(
+        self,
+        n: usize,
+        p: usize,
+        k_atoms: usize,
+    ) -> Result<Self, String> {
         if self.direct_admitted || self.matrix_free_admitted {
             Ok(self)
         } else {
@@ -147,7 +149,7 @@ impl SaeStreamingPlan {
         }
     }
 
-    fn solve_options_for_border_dim(self, border_dim: usize) -> ArrowSolveOptions {
+    pub(crate) fn solve_options_for_border_dim(self, border_dim: usize) -> ArrowSolveOptions {
         if self.direct_admitted {
             ArrowSolveOptions::automatic(border_dim)
         } else {
@@ -155,11 +157,10 @@ impl SaeStreamingPlan {
         }
     }
 
-    fn direct_logdet_admitted(self) -> bool {
+    pub(crate) fn direct_logdet_admitted(self) -> bool {
         self.direct_admitted
     }
 }
-
 
 fn sae_host_available_memory_bytes() -> usize {
     let mut sys = sysinfo::System::new();
@@ -171,7 +172,6 @@ fn sae_host_available_memory_bytes() -> usize {
         available
     }
 }
-
 
 fn sae_host_in_core_budget_bytes() -> (usize, usize) {
     let available = sae_host_available_memory_bytes();

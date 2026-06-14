@@ -20,7 +20,7 @@ use super::TransformationNormalError;
 /// Stable `log[Φ(upper) − Φ(lower)]` for `lower < upper`, evaluated via
 /// `normal_logcdf` and a `log1mexp` correction so the endpoint mass survives
 /// far-tail underflow.
-pub(super) fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
+pub(crate) fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
     if !(upper.is_finite() && lower.is_finite()) {
         return Err(TransformationNormalError::InvalidInput {
             reason: format!("finite support endpoints required, got lower={lower}, upper={upper}"),
@@ -56,7 +56,7 @@ pub(super) fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String>
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct LogNormalCdfDiffDerivatives {
+pub(crate) struct LogNormalCdfDiffDerivatives {
     pub(super) log_z: f64,
     pub(super) first: [f64; 2],
     pub(super) second: [[f64; 2]; 2],
@@ -64,11 +64,11 @@ pub(super) struct LogNormalCdfDiffDerivatives {
     pub(super) fourth: [[[[f64; 2]; 2]; 2]; 2],
 }
 
-pub(super) fn endpoint_chain_first(q: &LogNormalCdfDiffDerivatives, a: [f64; 2]) -> f64 {
+pub(crate) fn endpoint_chain_first(q: &LogNormalCdfDiffDerivatives, a: [f64; 2]) -> f64 {
     q.first[0] * a[0] + q.first[1] * a[1]
 }
 
-pub(super) fn endpoint_chain_second(
+pub(crate) fn endpoint_chain_second(
     q: &LogNormalCdfDiffDerivatives,
     a: [f64; 2],
     b: [f64; 2],
@@ -83,7 +83,7 @@ pub(super) fn endpoint_chain_second(
     out
 }
 
-pub(super) fn endpoint_chain_third(
+pub(crate) fn endpoint_chain_third(
     q: &LogNormalCdfDiffDerivatives,
     a: [f64; 2],
     b: [f64; 2],
@@ -105,7 +105,7 @@ pub(super) fn endpoint_chain_third(
     out
 }
 
-pub(super) fn endpoint_chain_fourth(
+pub(crate) fn endpoint_chain_fourth(
     q: &LogNormalCdfDiffDerivatives,
     a: [f64; 2],
     b: [f64; 2],
@@ -151,7 +151,7 @@ pub(super) fn endpoint_chain_fourth(
     out
 }
 
-pub(super) fn log_normal_cdf_diff_derivatives(
+pub(crate) fn log_normal_cdf_diff_derivatives(
     upper: f64,
     lower: f64,
 ) -> Result<LogNormalCdfDiffDerivatives, String> {

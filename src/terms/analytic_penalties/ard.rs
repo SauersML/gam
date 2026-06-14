@@ -58,7 +58,6 @@ pub struct ARDPenalty {
     pub n_eff: f64,
 }
 
-
 impl ARDPenalty {
     #[must_use]
     pub fn new(target: PsiSlice, latent_dim: usize) -> Self {
@@ -111,7 +110,6 @@ impl ARDPenalty {
         out
     }
 }
-
 
 impl AnalyticPenalty for ARDPenalty {
     fn tier(&self) -> PenaltyTier {
@@ -191,5 +189,3 @@ impl AnalyticPenalty for ARDPenalty {
 
     impl_scalar_apply_schedule!(weight);
 }
-
-

@@ -22,11 +22,7 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub implicit_group_id: Option<usize>,
 }
 
-
-
 pub(crate) type SharedDerivativeBlocks = Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>>;
-
-
 
 impl CustomFamilyBlockPsiDerivative {
     /// Public constructor for use in tests and external consumers.
@@ -56,8 +52,6 @@ impl CustomFamilyBlockPsiDerivative {
         }
     }
 }
-
-
 
 pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
@@ -136,8 +130,6 @@ pub(crate) trait CustomFamilyPsiDerivativeOperator: Send + Sync + Any {
     }
 }
 
-
-
 /// Diagnostic / small-data extension that exposes dense materialization of
 /// `\partial X / \partial \psi`. Production exact-Hessian code MUST NOT depend
 /// on dense second-derivative materialization; second-order paths use the
@@ -150,8 +142,6 @@ pub(crate) trait MaterializablePsiDerivativeOperator:
         axis: usize,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError>;
 }
-
-
 
 impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
     fn as_any(&self) -> &dyn Any {
@@ -280,8 +270,6 @@ impl CustomFamilyPsiDerivativeOperator for crate::terms::basis::ImplicitDesignPs
     }
 }
 
-
-
 impl MaterializablePsiDerivativeOperator for crate::terms::basis::ImplicitDesignPsiDerivative {
     fn materialize_first(
         &self,
@@ -291,15 +279,11 @@ impl MaterializablePsiDerivativeOperator for crate::terms::basis::ImplicitDesign
     }
 }
 
-
-
 pub(crate) struct EmbeddedImplicitPsiDerivativeOperator {
     base: Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
     total_p: usize,
     global_range: Range<usize>,
 }
-
-
 
 impl EmbeddedImplicitPsiDerivativeOperator {
     pub(crate) fn new(
@@ -355,8 +339,6 @@ impl EmbeddedImplicitPsiDerivativeOperator {
         Ok(u.slice(ndarray::s![self.global_range.clone()]).to_owned())
     }
 }
-
-
 
 impl CustomFamilyPsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator {
     fn as_any(&self) -> &dyn Any {
@@ -469,8 +451,6 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator
     }
 }
 
-
-
 impl MaterializablePsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperator {
     fn materialize_first(
         &self,
@@ -484,8 +464,6 @@ impl MaterializablePsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperat
         .materialize())
     }
 }
-
-
 
 /// Non-allocating zero operator for `\partial X / \partial \psi` derivative
 /// blocks whose ψ coordinate does not move the design matrix at all (e.g.
@@ -502,15 +480,11 @@ pub(crate) struct ZeroPsiDerivativeOperator {
     p: usize,
 }
 
-
-
 impl ZeroPsiDerivativeOperator {
     pub(crate) fn new(n: usize, p: usize) -> Self {
         Self { n, p }
     }
 }
-
-
 
 impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
     fn as_any(&self) -> &dyn Any {
@@ -667,8 +641,6 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
     }
 }
 
-
-
 pub(crate) fn stack_dense_row_blocks(blocks: &[Array2<f64>]) -> Array2<f64> {
     let total_rows = blocks.iter().map(Array2::nrows).sum();
     let p = blocks.first().map(Array2::ncols).unwrap_or(0);
@@ -685,8 +657,6 @@ pub(crate) fn stack_dense_row_blocks(blocks: &[Array2<f64>]) -> Array2<f64> {
     stacked
 }
 
-
-
 pub(crate) struct EmbeddedDensePsiDerivativeOperator {
     axis: usize,
     total_p: usize,
@@ -695,8 +665,6 @@ pub(crate) struct EmbeddedDensePsiDerivativeOperator {
     second_diag_local: Array2<f64>,
     second_cross_local: HashMap<usize, Array2<f64>>,
 }
-
-
 
 impl EmbeddedDensePsiDerivativeOperator {
     fn new(
@@ -788,8 +756,6 @@ impl EmbeddedDensePsiDerivativeOperator {
         })
     }
 }
-
-
 
 impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
     fn as_any(&self) -> &dyn Any {
@@ -956,8 +922,6 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
     }
 }
 
-
-
 impl MaterializablePsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
     fn materialize_first(
         &self,
@@ -970,8 +934,6 @@ impl MaterializablePsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator 
         )
     }
 }
-
-
 
 pub(crate) fn build_embedded_dense_psi_operator(
     first_local: &Array2<f64>,
@@ -998,8 +960,6 @@ pub(crate) fn build_embedded_dense_psi_operator(
     )?))
 }
 
-
-
 pub(crate) struct RowwiseKroneckerPsiDerivativeOperator {
     base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     time_bases: Vec<Arc<Array2<f64>>>,
@@ -1007,8 +967,6 @@ pub(crate) struct RowwiseKroneckerPsiDerivativeOperator {
     p_time: usize,
     p_out: usize,
 }
-
-
 
 impl RowwiseKroneckerPsiDerivativeOperator {
     fn new(
@@ -1152,8 +1110,6 @@ impl RowwiseKroneckerPsiDerivativeOperator {
     }
 }
 
-
-
 impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator {
     fn as_any(&self) -> &dyn Any {
         self
@@ -1262,8 +1218,6 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
     }
 }
 
-
-
 impl MaterializablePsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator {
     fn materialize_first(
         &self,
@@ -1285,8 +1239,6 @@ impl MaterializablePsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperat
     }
 }
 
-
-
 pub(crate) fn build_rowwise_kronecker_psi_operator(
     base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     time_bases: Vec<Arc<Array2<f64>>>,
@@ -1296,8 +1248,6 @@ pub(crate) fn build_rowwise_kronecker_psi_operator(
     )?))
 }
 
-
-
 #[derive(Clone)]
 pub(crate) struct CustomFamilyPsiDesignAction {
     operator: Arc<dyn CustomFamilyPsiDerivativeOperator>,
@@ -1305,8 +1255,6 @@ pub(crate) struct CustomFamilyPsiDesignAction {
     row_range: Range<usize>,
     p: usize,
 }
-
-
 
 impl CustomFamilyPsiDesignAction {
     pub(crate) fn from_first_derivative(
@@ -1440,15 +1388,11 @@ impl CustomFamilyPsiDesignAction {
     }
 }
 
-
-
 #[derive(Clone, Copy)]
 pub(crate) enum CustomFamilyPsiSecondDesignLevel {
     Diag(usize),
     Cross(usize, usize),
 }
-
-
 
 #[derive(Clone)]
 pub(crate) struct CustomFamilyPsiSecondDesignAction {
@@ -1457,8 +1401,6 @@ pub(crate) struct CustomFamilyPsiSecondDesignAction {
     row_range: Range<usize>,
     p: usize,
 }
-
-
 
 impl CustomFamilyPsiSecondDesignAction {
     pub(crate) fn from_second_derivative(
@@ -1585,8 +1527,6 @@ impl CustomFamilyPsiSecondDesignAction {
     }
 }
 
-
-
 #[derive(Clone, Copy)]
 pub(crate) enum CustomFamilyPsiLinearMapRef<'a> {
     Dense(&'a Array2<f64>),
@@ -1594,8 +1534,6 @@ pub(crate) enum CustomFamilyPsiLinearMapRef<'a> {
     Second(&'a CustomFamilyPsiSecondDesignAction),
     Zero { nrows: usize, ncols: usize },
 }
-
-
 
 impl CustomFamilyPsiLinearMapRef<'_> {
     pub(crate) fn nrows(&self) -> usize {
@@ -1673,8 +1611,6 @@ impl CustomFamilyPsiLinearMapRef<'_> {
     }
 }
 
-
-
 #[derive(Clone)]
 pub(crate) enum PsiDesignMap {
     Zero {
@@ -1691,8 +1627,6 @@ pub(crate) enum PsiDesignMap {
         action: CustomFamilyPsiSecondDesignAction,
     },
 }
-
-
 
 impl PsiDesignMap {
     pub(crate) fn ncols(&self) -> usize {
@@ -1763,13 +1697,9 @@ impl PsiDesignMap {
     }
 }
 
-
-
 pub(crate) fn is_zero_array(a: &Array2<f64>) -> bool {
     a.iter().all(|x| *x == 0.0)
 }
-
-
 
 pub(crate) fn weighted_crossprod_psi_maps(
     left: CustomFamilyPsiLinearMapRef<'_>,
@@ -1828,8 +1758,6 @@ pub(crate) fn weighted_crossprod_psi_maps(
     Ok(out)
 }
 
-
-
 pub(crate) fn first_psi_linear_map<'a>(
     action: Option<&'a CustomFamilyPsiDesignAction>,
     dense: Option<&'a Array2<f64>>,
@@ -1847,8 +1775,6 @@ pub(crate) fn first_psi_linear_map<'a>(
         CustomFamilyPsiLinearMapRef::Zero { nrows, ncols }
     }
 }
-
-
 
 pub(crate) fn second_psi_linear_map<'a>(
     action: Option<&'a CustomFamilyPsiSecondDesignAction>,
@@ -1868,15 +1794,11 @@ pub(crate) fn second_psi_linear_map<'a>(
     }
 }
 
-
-
 pub(crate) struct CustomFamilyJointDesignChannel {
     range: Range<usize>,
     design: DesignMatrix,
     psi_derivative: Option<CustomFamilyPsiDesignAction>,
 }
-
-
 
 impl CustomFamilyJointDesignChannel {
     pub(crate) fn new<D>(
@@ -1908,16 +1830,12 @@ impl CustomFamilyJointDesignChannel {
     }
 }
 
-
-
 pub(crate) struct CustomFamilyJointDesignPairContribution {
     left_channel: usize,
     right_channel: usize,
     weights: Array1<f64>,
     drift_weights: Array1<f64>,
 }
-
-
 
 impl CustomFamilyJointDesignPairContribution {
     pub(crate) fn new(
@@ -1935,8 +1853,6 @@ impl CustomFamilyJointDesignPairContribution {
     }
 }
 
-
-
 pub(crate) struct CustomFamilyJointPsiOperator {
     total_dim: usize,
     channels: Vec<CustomFamilyJointDesignChannel>,
@@ -1945,8 +1861,6 @@ pub(crate) struct CustomFamilyJointPsiOperator {
     /// that don't warrant their own weighted-Gram channel.
     dense_correction: Option<Array2<f64>>,
 }
-
-
 
 impl CustomFamilyJointPsiOperator {
     pub(crate) fn new(
@@ -1962,8 +1876,6 @@ impl CustomFamilyJointPsiOperator {
         }
     }
 }
-
-
 
 impl HyperOperator for CustomFamilyJointPsiOperator {
     fn dim(&self) -> usize {
@@ -2128,16 +2040,12 @@ impl HyperOperator for CustomFamilyJointPsiOperator {
     }
 }
 
-
-
-pub(crate) fn shared_dense_design_cache() -> &'static Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>
-{
+pub(crate) fn shared_dense_design_cache()
+-> &'static Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>> {
     static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Weak<Array2<f64>>>>> =
         OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
-
 
 pub(crate) fn shared_dense_arc(x: &Array2<f64>) -> Arc<Array2<f64>> {
     let key = (x.as_ptr() as usize, x.nrows(), x.ncols());
@@ -2154,8 +2062,6 @@ pub(crate) fn shared_dense_arc(x: &Array2<f64>) -> Arc<Array2<f64>> {
         Arc::new(x.clone())
     }
 }
-
-
 
 pub(crate) fn resolve_custom_family_x_psi_map(
     deriv: &CustomFamilyBlockPsiDerivative,
@@ -2236,8 +2142,6 @@ pub(crate) fn resolve_custom_family_x_psi_map(
     }
     .into())
 }
-
-
 
 pub(crate) fn resolve_custom_family_x_psi_psi_map(
     deriv_i: &CustomFamilyBlockPsiDerivative,
@@ -2346,8 +2250,6 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
     })
 }
 
-
-
 #[derive(Clone)]
 pub struct ExactNewtonJointPsiTerms {
     pub objective_psi: f64,
@@ -2355,8 +2257,6 @@ pub struct ExactNewtonJointPsiTerms {
     pub hessian_psi: Array2<f64>,
     pub hessian_psi_operator: Option<Arc<dyn HyperOperator>>,
 }
-
-
 
 impl std::fmt::Debug for ExactNewtonJointPsiTerms {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2372,8 +2272,6 @@ impl std::fmt::Debug for ExactNewtonJointPsiTerms {
     }
 }
 
-
-
 impl ExactNewtonJointPsiTerms {
     fn zeros(total: usize) -> Self {
         Self {
@@ -2385,16 +2283,12 @@ impl ExactNewtonJointPsiTerms {
     }
 }
 
-
-
 pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub objective_psi_psi: f64,
     pub score_psi_psi: Array1<f64>,
     pub hessian_psi_psi: Array2<f64>,
     pub hessian_psi_psi_operator: Option<Box<dyn HyperOperator>>,
 }
-
-
 
 /// Direction-contracted second-order ψ terms for the profiled θ-HVP (#740).
 ///
@@ -2433,15 +2327,11 @@ pub struct ExactNewtonJointPsiSecondOrderContracted {
     pub hessian: Vec<DriftDerivResult>,
 }
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JointHessianSourcePreference {
     Dense,
     Operator,
 }
-
-
 
 /// What the consumer is going to *do* with the joint Hessian. This is the
 /// intent half of #738's capability-vs-representation split: the call site
@@ -2475,8 +2365,6 @@ pub enum MaterializationIntent {
     /// Outer-gradient / IFT term assembly.
     OuterGradient,
 }
-
-
 
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// Pre-build any per-row jet caches the workspace will hand to the
@@ -2728,8 +2616,6 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     }
 }
 
-
-
 pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
     fn first_order_terms(&self, idx: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         assert!(idx < usize::MAX);
@@ -2779,15 +2665,11 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
     ) -> Result<Option<DriftDerivResult>, String>;
 }
 
-
-
 pub(crate) struct ExactNewtonJointPsiDirectCache<T> {
     entries: Vec<Mutex<Option<Option<Arc<T>>>>>,
     lru: Mutex<std::collections::VecDeque<usize>>,
     limit: usize,
 }
-
-
 
 impl<T> ExactNewtonJointPsiDirectCache<T> {
     pub(crate) fn new(len: usize) -> Self {

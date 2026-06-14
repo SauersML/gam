@@ -49,7 +49,6 @@ pub struct NestedPrefixPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-
 impl NestedPrefixPenalty {
     /// Build a new nested-prefix penalty.
     ///
@@ -167,7 +166,6 @@ impl NestedPrefixPenalty {
         w
     }
 }
-
 
 impl AnalyticPenalty for NestedPrefixPenalty {
     fn tier(&self) -> PenaltyTier {
@@ -304,5 +302,3 @@ impl AnalyticPenalty for NestedPrefixPenalty {
         }
     }
 }
-
-

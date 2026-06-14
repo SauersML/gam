@@ -39,7 +39,6 @@ pub struct PenaltyLogdetDerivs {
     pub second: Option<Array2<f64>>,
 }
 
-
 /// Unified representation of a single smoothing-parameter penalty coordinate.
 ///
 /// A rho-coordinate always contributes
@@ -88,7 +87,6 @@ pub enum PenaltyCoordinate {
         total_dim: usize,
     },
 }
-
 
 impl PenaltyCoordinate {
     pub fn from_dense_root(root: Array2<f64>) -> Self {
@@ -642,7 +640,6 @@ impl PenaltyCoordinate {
     }
 }
 
-
 // PenaltyLogdetEigenspace, build_penalty_logdet_eigenspace,
 // scaled_penalty_logdet_nullspace_leakage, and frobenius_inner_same_shape
 // have been replaced by the canonical PenaltyPseudologdet in
@@ -687,7 +684,6 @@ pub struct PenaltySubspaceTrace {
     pub u_s: Array2<f64>,
     pub h_proj_inverse: Array2<f64>,
 }
-
 
 impl PenaltySubspaceTrace {
     /// Compute `tr(K · A)` where `K = U_S · h_proj_inverse · U_Sᵀ` — the
@@ -988,7 +984,6 @@ impl PenaltySubspaceTrace {
     }
 }
 
-
 /// Per-evaluation handle that combines a penalty-projected
 /// [`PenaltySubspaceTrace`] with an active inequality-constraint block,
 /// producing the constraint-aware pseudo-inverse
@@ -1007,7 +1002,6 @@ pub struct ConstrainedSubspaceKernel<'a> {
     m_inv: Array2<f64>,
     k_active: usize,
 }
-
 
 impl<'a> ConstrainedSubspaceKernel<'a> {
     /// Apply `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S` to `a`. The result
@@ -1033,7 +1027,6 @@ impl<'a> ConstrainedSubspaceKernel<'a> {
     }
 }
 
-
 /// Tangency self-audit gate for the constrained mode-response arm: the
 /// emitted `v = K_T · rhs` must lie in `ker(A_act)` by construction, so
 /// `|A_act · v|` is compared against this fraction of the cancellation
@@ -1043,7 +1036,6 @@ impl<'a> ConstrainedSubspaceKernel<'a> {
 /// never trip it; the historical failure mode it guards (the d6b17a7f
 /// `1/σ_min ≈ 10¹²` null-space amplification) exceeds it by six orders.
 const THETA_MODE_RESPONSE_TANGENCY_GATE: f64 = 1e-6;
-
 
 /// #931 migration pass 2 — the ThetaDirection shared-drift pass: the ONE
 /// per-evaluation selection of the IFT mode-response kernel behind every
@@ -1099,7 +1091,6 @@ pub(crate) struct ThetaModeResponseKernel<'s> {
     /// pre-port code rebuilt it per consumer site.
     constrained: Option<ConstrainedSubspaceKernel<'s>>,
 }
-
 
 impl<'s> ThetaModeResponseKernel<'s> {
     /// The ONE place the mode-response kernel selection rule lives.
@@ -1191,7 +1182,6 @@ impl<'s> ThetaModeResponseKernel<'s> {
     }
 }
 
-
 /// Subspace represented by a stored KKT residual.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KktResidualSubspace {
@@ -1202,7 +1192,6 @@ pub enum KktResidualSubspace {
     /// `r_R = R Rᵀ r_A`.
     ReducedRange,
 }
-
 
 /// KKT residual `r = ∇_β L_pen(β̂)` at the converged inner iterate, with its
 /// exact represented subspace tagged.
@@ -1235,7 +1224,6 @@ pub struct ProjectedKktResidual {
     /// joint-Newton certificate's strength.
     free_rank: Option<usize>,
 }
-
 
 impl ProjectedKktResidual {
     /// Construct from `r_A = P_T(Sβ + Γβ - ∇ℓ)`, with active constraint
@@ -1285,7 +1273,10 @@ impl ProjectedKktResidual {
         self.subspace
     }
 
-    fn projected_into_reduced_range(&self, kernel: &PenaltySubspaceTrace) -> Result<Self, String> {
+    pub(crate) fn projected_into_reduced_range(
+        &self,
+        kernel: &PenaltySubspaceTrace,
+    ) -> Result<Self, String> {
         match self.subspace {
             KktResidualSubspace::ReducedRange => Ok(self.clone()),
             KktResidualSubspace::ActiveProjected => {
@@ -1340,5 +1331,3 @@ impl ProjectedKktResidual {
         self.free_rank
     }
 }
-
-

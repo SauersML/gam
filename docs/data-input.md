@@ -48,6 +48,10 @@ strings; explicit casting to float is unnecessary.
 Column lengths must agree. Mismatches raise `ValueError` before the
 engine sees the data.
 
+Tables must have at least one column and at least one row. Duplicate
+column names in pandas, polars, and pyarrow inputs are rejected because
+prediction columns are matched by name.
+
 String columns are accepted for terms like `group(site)` and are
 encoded by the engine.
 
@@ -61,13 +65,17 @@ encoded by the engine.
 
 ## What `predict()` returns
 
-By default, pandas/polars/numpy/pyarrow prediction inputs return the
-same kind, while other inputs fall back to the training kind, then to
-`dict`. Override with `return_type=`:
+For standard scalar GAM/GLM models, `model.predict(data)` returns a 1-D
+`numpy.ndarray` of response-scale point predictions by default.
+
+Tabular output is returned when `interval=`, `id_column=`, or
+`return_type=` is supplied. In that tabular path, `return_type=None`
+mirrors the prediction input kind for pandas/polars/numpy/pyarrow inputs,
+else the training kind, else `dict`. Override with `return_type=`:
 
 | `return_type` | Returns |
 | --- | --- |
-| `None` (default) | Input kind for pandas/polars/numpy/pyarrow inputs, else training kind, else `dict`. |
+| `None` | Tabular path only: input kind for pandas/polars/numpy/pyarrow inputs, else training kind, else `dict`. |
 | `"dict"` | `dict[str, list]`. |
 | `"numpy"` | 2-D `numpy.ndarray` with columns in fixed order. |
 | `"pandas"` | `pandas.DataFrame`. |

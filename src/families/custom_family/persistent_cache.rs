@@ -144,7 +144,7 @@ fn custom_family_cache_shape(specs: &[ParameterBlockSpec]) -> (usize, Vec<String
     (n_rows, block_names, block_dims)
 }
 
-pub(super) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
+pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -222,7 +222,7 @@ fn persistent_block_inner_summary(
     })
 }
 
-pub(super) fn store_persistent_custom_family_warm_start(
+pub(crate) fn store_persistent_custom_family_warm_start(
     key: Option<&str>,
     specs: &[ParameterBlockSpec],
     warm_start: &ConstrainedWarmStart,
@@ -282,7 +282,7 @@ pub(super) fn store_persistent_custom_family_warm_start(
 
 const CUSTOM_OUTER_INNER_CAP_MARGIN: usize = 5;
 
-pub(super) fn update_custom_outer_inner_cap_from_warm_start(
+pub(crate) fn update_custom_outer_inner_cap_from_warm_start(
     options: &BlockwiseFitOptions,
     warm_start: &ConstrainedWarmStart,
     gradient_norm: Option<f64>,

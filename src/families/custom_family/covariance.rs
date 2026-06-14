@@ -7,28 +7,19 @@ use super::*;
 
 pub(crate) const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
 
-
 pub(crate) const JOINT_MATRIX_FREE_MIN_ROWS: usize = 50_000;
-
 
 pub(crate) const JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N: usize = 128;
 
-
 pub(crate) const JOINT_MATRIX_FREE_MIN_LINEAR_WORK: usize = 4_000_000;
-
 
 pub(crate) const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 
-
 pub(crate) const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
-
-
 
 pub(crate) fn joint_exact_analytic_outer_hessian_available() -> bool {
     true
 }
-
-
 
 pub(crate) fn joint_observation_count(states: &[ParameterBlockState]) -> usize {
     states
@@ -37,8 +28,6 @@ pub(crate) fn joint_observation_count(states: &[ParameterBlockState]) -> usize {
         .max()
         .unwrap_or(0)
 }
-
-
 
 /// Whether the unified evaluator will pick the matrix-free joint Hessian path
 /// for a problem of size `(total_p, total_n)`. Exposed at crate scope so
@@ -60,8 +49,6 @@ pub(crate) fn use_joint_matrix_free_path(total_p: usize, total_n: usize) -> bool
             && total_n.saturating_mul(total_p) >= JOINT_MATRIX_FREE_MIN_LINEAR_WORK)
 }
 
-
-
 pub(crate) fn apply_joint_block_penalty(
     ranges: &[(usize, usize)],
     s_lambdas: &[Array2<f64>],
@@ -80,8 +67,6 @@ pub(crate) fn apply_joint_block_penalty(
     );
     out
 }
-
-
 
 /// In-place variant of [`apply_joint_block_penalty`]. Caller supplies the
 /// output buffer to eliminate per-call allocation.
@@ -191,8 +176,6 @@ pub(crate) fn apply_joint_block_penalty_into(
     }
 }
 
-
-
 /// Penalty-aware Jacobi preconditioner used by every matrix-free PCG path
 /// in the inner coefficient solve.
 ///
@@ -233,8 +216,6 @@ pub(crate) fn positive_joint_diagonal_entry(value: f64) -> f64 {
         1.0e-10
     }
 }
-
-
 
 pub(crate) fn joint_penalty_preconditioner_diag(
     base_diagonal: &Array1<f64>,
@@ -277,8 +258,6 @@ pub(crate) fn joint_penalty_preconditioner_diag(
     diag.mapv(positive_joint_diagonal_entry)
 }
 
-
-
 pub(crate) fn log_joint_pcg_diagnostics(
     cycle: usize,
     total_p: usize,
@@ -320,8 +299,6 @@ pub(crate) fn log_joint_pcg_diagnostics(
     );
 }
 
-
-
 pub(crate) fn add_joint_penalty_to_matrix(
     matrix: &mut Array2<f64>,
     ranges: &[(usize, usize)],
@@ -346,8 +323,6 @@ pub(crate) fn add_joint_penalty_to_matrix(
     }
 }
 
-
-
 pub(crate) fn flatten_state_betas(
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
@@ -361,8 +336,6 @@ pub(crate) fn flatten_state_betas(
     }
     beta
 }
-
-
 
 pub(crate) fn set_states_from_flat_beta(
     states: &mut [ParameterBlockState],
@@ -389,9 +362,9 @@ pub(crate) fn set_states_from_flat_beta(
     Ok(())
 }
 
-
-
-pub(crate) fn synchronized_states_from_flat_beta<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn synchronized_states_from_flat_beta<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
@@ -402,8 +375,6 @@ pub(crate) fn synchronized_states_from_flat_beta<F: CustomFamily + Clone + Send 
     refresh_all_block_etas(family, specs, &mut synced)?;
     Ok(synced)
 }
-
-
 
 /// Inf-norm of the penalized stationarity residual with valid KKT multipliers
 /// projected out at active linear constraints.
@@ -450,8 +421,6 @@ pub(crate) fn projected_stationarity_inf_norm(
     .unwrap_or(raw_inf)
 }
 
-
-
 pub(crate) fn projected_linear_constraint_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
@@ -472,8 +441,6 @@ pub(crate) fn projected_linear_constraint_stationarity_inf_norm(
             .max(primal_violation),
     )
 }
-
-
 
 pub(crate) fn linear_constraint_primal_violation(
     beta: &Array1<f64>,
@@ -499,8 +466,6 @@ pub(crate) fn linear_constraint_primal_violation(
     }
     Some(primal_violation)
 }
-
-
 
 pub(crate) fn projected_linear_constraint_stationarity_vector(
     residual: &Array1<f64>,
@@ -576,8 +541,6 @@ pub(crate) fn projected_linear_constraint_stationarity_vector(
     project_stationarity_residual_on_constraint_cone(residual, &a_active)
         .map(|(projected, _)| projected)
 }
-
-
 
 pub(crate) fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
     family: &F,
@@ -660,8 +623,6 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>
     }
     Ok(Some(inf_norm))
 }
-
-
 
 pub(crate) fn exact_newton_joint_gradient_from_eval(
     eval: &FamilyEvaluation,
@@ -760,8 +721,6 @@ pub(crate) fn exact_newton_joint_gradient_from_eval(
     Ok(Some(gradient))
 }
 
-
-
 pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     gradient: &Array1<f64>,
     states: &[ParameterBlockState],
@@ -841,8 +800,6 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     Ok(inf_norm)
 }
 
-
-
 pub(crate) fn exact_newton_joint_stationarity_vector_from_gradient(
     gradient: &Array1<f64>,
     states: &[ParameterBlockState],
@@ -881,8 +838,6 @@ pub(crate) fn exact_newton_joint_stationarity_vector_from_gradient(
     }
     Ok(residual)
 }
-
-
 
 pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
     gradient: &Array1<f64>,
@@ -963,8 +918,6 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
     Ok(residual)
 }
 
-
-
 /// Build the free-space-projected KKT residual for the IFT correction.
 ///
 /// The active set passed via `block_active_sets` is consumed by the inner
@@ -999,9 +952,9 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
     )
 }
 
-
-
-pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<F: CustomFamily + ?Sized>(
+pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<
+    F: CustomFamily + ?Sized,
+>(
     family: &F,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
@@ -1034,8 +987,6 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<F: Cu
         block_active_sets,
     )
 }
-
-
 
 pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
     gradient: &Array1<f64>,
@@ -1087,8 +1038,6 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
         Ok(None)
     }
 }
-
-
 
 pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -1163,8 +1112,6 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
     }
 }
 
-
-
 pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1182,8 +1129,6 @@ pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send +
             reason: format!("joint covariance computation failed: {e}"),
         })
 }
-
-
 
 /// Compute joint working-set geometry at convergence for ALO diagnostics.
 pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -1319,8 +1264,6 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         working_response: Array1::zeros(working_len),
     }))
 }
-
-
 
 pub(crate) fn joint_penalty_subspace_trace_parts(
     h_joint_unpen: &JointHessianSource,

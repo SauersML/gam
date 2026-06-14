@@ -49,8 +49,6 @@ pub enum CustomFamilyError {
     },
 }
 
-
-
 impl From<String> for CustomFamilyError {
     fn from(value: String) -> Self {
         Self::InvalidInput {
@@ -59,8 +57,6 @@ impl From<String> for CustomFamilyError {
         }
     }
 }
-
-
 
 impl From<CustomFamilyError> for String {
     fn from(value: CustomFamilyError) -> Self {

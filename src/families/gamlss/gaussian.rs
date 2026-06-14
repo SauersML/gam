@@ -21,7 +21,6 @@ pub struct GaussianLocationScaleFamily {
         std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
 
-
 impl Clone for GaussianLocationScaleFamily {
     fn clone(&self) -> Self {
         Self {
@@ -40,7 +39,6 @@ impl Clone for GaussianLocationScaleFamily {
     }
 }
 
-
 pub(crate) struct LocationScaleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
@@ -50,7 +48,6 @@ pub(crate) struct LocationScaleJointPsiDirection {
     z_ls_psi: Array1<f64>,
 }
 
-
 pub(crate) struct LocationScaleJointPsiSecondDrifts {
     x_primary_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
     x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
@@ -59,7 +56,6 @@ pub(crate) struct LocationScaleJointPsiSecondDrifts {
     z_primary_ab: Array1<f64>,
     z_ls_ab: Array1<f64>,
 }
-
 
 /// Shared interface that the Gaussian and Binomial location-scale families (and
 /// their wiggle variants) expose to the unified joint ψ workspace.
@@ -121,7 +117,6 @@ pub(crate) trait LocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
         subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String>;
 }
-
 
 impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
     type Direction = LocationScaleJointPsiDirection;
@@ -197,7 +192,6 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
         )
     }
 }
-
 
 impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
     type Direction = LocationScaleJointPsiDirection;
@@ -297,7 +291,6 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
     }
 }
 
-
 /// Generic joint exact-Newton ψ workspace shared by every location-scale
 /// family (Gaussian / Binomial, with or without a wiggle block) via the
 /// [`LocationScaleJointPsiFamily`] trait.
@@ -322,7 +315,6 @@ pub(crate) struct LocationScaleJointPsiWorkspace<F: LocationScaleJointPsiFamily>
     psi_directions: ExactNewtonJointPsiDirectCache<F::Direction>,
     outer_score_subsample: Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
 }
-
 
 impl<F: LocationScaleJointPsiFamily> LocationScaleJointPsiWorkspace<F> {
     fn new(
@@ -390,7 +382,6 @@ impl<F: LocationScaleJointPsiFamily> LocationScaleJointPsiWorkspace<F> {
     }
 }
 
-
 impl<F> ExactNewtonJointPsiWorkspace for LocationScaleJointPsiWorkspace<F>
 where
     F: LocationScaleJointPsiFamily,
@@ -440,13 +431,11 @@ where
     }
 }
 
-
 pub(crate) type GaussianLocationScaleExactNewtonJointPsiWorkspace =
     LocationScaleJointPsiWorkspace<GaussianLocationScaleFamily>;
 
 pub(crate) type GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace =
     LocationScaleJointPsiWorkspace<GaussianLocationScaleWiggleFamily>;
-
 
 #[derive(Clone)]
 pub struct GaussianJointRowScalars {
@@ -467,7 +456,6 @@ pub struct GaussianJointRowScalars {
     kappa_dprime: Array1<f64>,
 }
 
-
 pub(crate) struct GaussianJointPsiFirstWeights {
     objective_psirow: Array1<f64>,
     scoremu: Array1<f64>,
@@ -482,7 +470,6 @@ pub(crate) struct GaussianJointPsiFirstWeights {
     dh_ls_ls: Array1<f64>,
 }
 
-
 pub(crate) struct GaussianJointPsiSecondWeights {
     objective_psi_psirow: Array1<f64>,
     d2scoremu: Array1<f64>,
@@ -492,7 +479,6 @@ pub(crate) struct GaussianJointPsiSecondWeights {
     d2h_ls_ls: Array1<f64>,
 }
 
-
 pub(crate) struct GaussianJointPsiMixedDriftWeights {
     dhmumu_u: Array1<f64>,
     dhmu_ls_u: Array1<f64>,
@@ -501,7 +487,6 @@ pub(crate) struct GaussianJointPsiMixedDriftWeights {
     d2hmu_ls: Array1<f64>,
     d2h_ls_ls: Array1<f64>,
 }
-
 
 /// Apply a Horvitz–Thompson outer-row subsample mask to every per-row array
 /// of a `GaussianJointPsiFirstWeights` in place: each sampled row's
@@ -556,7 +541,6 @@ pub(crate) fn apply_ht_mask_first(
     weights.dh_ls_ls = dhll;
 }
 
-
 /// HT mask for `GaussianJointPsiSecondWeights`. Same semantics as
 /// `apply_ht_mask_first`: each per-row contribution is scaled by 1/π_i and
 /// non-sampled rows are zeroed. Consumed row-linearly by
@@ -591,7 +575,6 @@ pub(crate) fn apply_ht_mask_second(
     weights.d2h_ls_ls = d2hll;
 }
 
-
 /// HT mask for `GaussianJointPsiMixedDriftWeights`. Same semantics as the
 /// other `apply_ht_mask_*` helpers; consumed row-linearly by
 /// `gaussian_joint_psi_mixedhessian_drift_fromweights`.
@@ -623,7 +606,6 @@ pub(crate) fn apply_ht_mask_mixed(
     weights.d2hmu_ls = d2hml;
     weights.d2h_ls_ls = d2hll;
 }
-
 
 pub(crate) fn gaussian_jointrow_scalars(
     y: &Array1<f64>,
@@ -690,7 +672,6 @@ pub(crate) fn gaussian_jointrow_scalars(
     })
 }
 
-
 pub(crate) fn gaussian_joint_first_directionalweights(
     scalars: &GaussianJointRowScalars,
     dotmu: &Array1<f64>,
@@ -721,7 +702,6 @@ pub(crate) fn gaussian_joint_first_directionalweights(
     let (w_u, c_u, d_u) = unsafe { (w_u.assume_init(), c_u.assume_init(), d_u.assume_init()) };
     (w_u, c_u, d_u)
 }
-
 
 pub(crate) fn gaussian_jointsecond_directionalweights(
     scalars: &GaussianJointRowScalars,
@@ -768,7 +748,6 @@ pub(crate) fn gaussian_jointsecond_directionalweights(
         unsafe { (w_uv.assume_init(), c_uv.assume_init(), d_uv.assume_init()) };
     (w_uv, c_uv, d_uv)
 }
-
 
 pub(crate) fn gaussian_joint_psi_firstweights(
     scalars: &GaussianJointRowScalars,
@@ -851,7 +830,6 @@ pub(crate) fn gaussian_joint_psi_firstweights(
         }
     }
 }
-
 
 pub(crate) fn gaussian_joint_psisecondweights(
     scalars: &GaussianJointRowScalars,
@@ -939,7 +917,6 @@ pub(crate) fn gaussian_joint_psisecondweights(
     }
 }
 
-
 pub(crate) fn gaussian_joint_psi_mixed_driftweights(
     scalars: &GaussianJointRowScalars,
     // Only the log-σ–channel directions enter the surviving (μ,μ) and (ls,ls)
@@ -1001,7 +978,6 @@ pub(crate) fn gaussian_joint_psi_mixed_driftweights(
     }
 }
 
-
 /// Canonical Gaussian location-scale Fisher (expected) joint-Hessian row
 /// coefficients `(mm, ml, ll)` — the SINGLE source of truth for this curvature,
 /// shared by every representation that assembles the value Hessian (the dense
@@ -1025,7 +1001,6 @@ pub(crate) fn gaussian_locscale_fisher_joint_row_coeffs(
     let ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
     (mm, ml, ll)
 }
-
 
 pub(crate) fn gaussian_joint_hessian_from_designs(
     xmu: &DenseOrOperator<'_>,
@@ -1069,7 +1044,6 @@ pub(crate) fn gaussian_joint_hessian_from_designs(
     Ok(out)
 }
 
-
 pub(crate) fn gaussian_joint_psihessian_fromweights(
     xmu: &Array2<f64>,
     x_ls: &Array2<f64>,
@@ -1105,7 +1079,6 @@ pub(crate) fn gaussian_joint_psihessian_fromweights(
         &hmumu, &hmu_ls, &h_ls_ls,
     ))
 }
-
 
 pub(crate) fn build_two_block_custom_family_joint_psi_operator_from_actions(
     left_action: Option<CustomFamilyPsiDesignAction>,
@@ -1166,7 +1139,6 @@ pub(crate) fn build_two_block_custom_family_joint_psi_operator_from_actions(
         CustomFamilyJointPsiOperator::new(total, channels, pair_contributions),
     )))
 }
-
 
 pub(crate) fn gaussian_joint_psisecondhessian_fromweights(
     xmu: &Array2<f64>,
@@ -1271,7 +1243,6 @@ pub(crate) fn gaussian_joint_psisecondhessian_fromweights(
     ))
 }
 
-
 pub(crate) fn gaussian_joint_psi_mixedhessian_drift_fromweights(
     xmu: &Array2<f64>,
     x_ls: &Array2<f64>,
@@ -1305,7 +1276,6 @@ pub(crate) fn gaussian_joint_psi_mixedhessian_drift_fromweights(
     ))
 }
 
-
 #[inline]
 pub(crate) fn exp_sigma_derivs_up_to_fourth_array(
     eta: ArrayView1<'_, f64>,
@@ -1336,7 +1306,6 @@ pub(crate) fn exp_sigma_derivs_up_to_fourth_array(
     }
     (sigma, d1, d2, d3, d4)
 }
-
 
 impl GaussianLocationScaleFamily {
     pub const BLOCK_MU: usize = 0;
@@ -2211,7 +2180,6 @@ impl GaussianLocationScaleFamily {
     }
 }
 
-
 /// Per-subject 2×2 channel Hessian `W_i` for Gaussian location-scale.
 ///
 /// The row negative log-likelihood (with per-row weight `w_i`, response `y_i`,
@@ -2235,7 +2203,6 @@ pub struct GaussianLocationScaleChannelHessian {
     /// Row-major `(n × 2 × 2)` PSD-clamped per-subject Hessian.
     h: ndarray::Array3<f64>,
 }
-
 
 impl GaussianLocationScaleChannelHessian {
     /// Construct the raw (un-PSD-clamped) per-subject observed Hessian.
@@ -2329,7 +2296,6 @@ impl GaussianLocationScaleChannelHessian {
     }
 }
 
-
 impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
     fn n_outputs(&self) -> usize {
         2
@@ -2351,7 +2317,6 @@ impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
         self.h.clone()
     }
 }
-
 
 impl CustomFamily for GaussianLocationScaleFamily {
     /// The Gaussian location-scale joint Hessian depends on β because the
@@ -3030,7 +2995,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
     }
 }
 
-
 impl CustomFamilyGenerative for GaussianLocationScaleFamily {
     fn generativespec(
         &self,
@@ -3057,7 +3021,6 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
     }
 }
 
-
 /// One channel of a `RowCoeffOperator`: a row-major `Arc<Array2<f64>>`
 /// design matrix indexed by row coefficient pairs. Channels with the same
 /// `block` value contribute their `X^T r` outputs into the same coefficient
@@ -3068,7 +3031,6 @@ pub(crate) struct RowCoeffChannel {
     design: Arc<Array2<f64>>,
 }
 
-
 /// Symmetric pair coefficients `c_{ab}` for `a ≤ b`. The operator adds
 /// `X_a^T diag(c_{ab}) X_b` to block `block_a`'s output and the transpose
 /// contribution `X_b^T diag(c_{ab}) X_a` to block `block_b` when `a != b`.
@@ -3077,7 +3039,6 @@ pub(crate) struct RowCoeffPair {
     b: usize,
     coeff: Array1<f64>,
 }
-
 
 /// Pooled per-call scratch for `RowCoeffOperator::mul_vec`. Each call
 /// pops a buffer set; if the pool is empty (parallel callers exhausted
@@ -3093,7 +3054,6 @@ pub(crate) struct RowCoeffScratch {
     u: Vec<Array1<f64>>,
     r: Vec<Array1<f64>>,
 }
-
 
 /// Matrix-free operator for two-block-style joint-Hessian directional
 /// derivatives that decompose as `H = sum_{a,b} X_a^T diag(c_{ab}) X_b`
@@ -3114,7 +3074,6 @@ pub(crate) struct RowCoeffOperator {
     nrows: usize,
     scratch_pool: std::sync::Mutex<Vec<RowCoeffScratch>>,
 }
-
 
 impl RowCoeffOperator {
     /// One-line constructor for the standard (channels, pair-coeffs)
@@ -3285,8 +3244,6 @@ impl RowCoeffOperator {
     }
 }
 
-
-
 impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator {
     fn dim(&self) -> usize {
         self.dim
@@ -3423,7 +3380,6 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
     }
 }
 
-
 /// Two-block row-coefficient operator backed by `DesignMatrix`.
 ///
 /// This is the operator-form counterpart to `DesignTwoBlockRowCoeffOperator`'s
@@ -3441,7 +3397,6 @@ struct DesignTwoBlockRowCoeffOperator {
     nrows: usize,
     pa: usize,
 }
-
 
 impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRowCoeffOperator {
     fn dim(&self) -> usize {
@@ -3535,7 +3490,6 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         true
     }
 }
-
 
 impl DesignTwoBlockRowCoeffOperator {
     fn design_cache_token(design: &DesignMatrix) -> usize {
@@ -3651,7 +3605,6 @@ impl DesignTwoBlockRowCoeffOperator {
     }
 }
 
-
 /// Matrix-free joint-Hessian operator for the two-block Gaussian
 /// location-scale family. The dense Hessian decomposes as
 ///
@@ -3675,7 +3628,6 @@ struct GaussianLocationScaleHessianWorkspace {
     coeff_ml: Array1<f64>,
     coeff_ll: Array1<f64>,
 }
-
 
 impl GaussianLocationScaleHessianWorkspace {
     fn new(
@@ -3732,7 +3684,6 @@ impl GaussianLocationScaleHessianWorkspace {
         self.coeff_ll = mask_ll;
     }
 }
-
 
 impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
@@ -3939,7 +3890,6 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
     }
 }
 
-
 /// Build a `RowCoeffOperator` for the standard two-block GAMLSS structure
 /// with one design per block and three pair coefficients (a,a), (a,b), (b,b).
 /// The resulting matrix mirrors the dense
@@ -3963,7 +3913,6 @@ fn make_two_block_row_coeff_operator(
         nrows,
     )
 }
-
 
 pub(crate) fn make_two_block_design_row_coeff_operator(
     x_a: DesignMatrix,
@@ -3997,7 +3946,6 @@ pub(crate) fn make_two_block_design_row_coeff_operator(
     })
 }
 
-
 struct GaussianLocationScaleWiggleGeometry {
     basis: Array2<f64>,
     basis_d1: Array2<f64>,
@@ -4008,7 +3956,6 @@ struct GaussianLocationScaleWiggleGeometry {
     d3q_dq03: Array1<f64>,
     d4q_dq04: Array1<f64>,
 }
-
 
 /// Per-row pieces of the 3-block Gaussian location-scale-wiggle joint
 /// Hessian. Both the dense path and the matrix-free workspace share these
@@ -4025,7 +3972,6 @@ struct GaussianLocationScaleWiggleHessianRowPieces {
     basis_d1: Array2<f64>,
 }
 
-
 impl GaussianLocationScaleWiggleHessianRowPieces {
     fn assemble_dense(&self, xmu: &Array2<f64>, x_ls: &Array2<f64>) -> Result<Array2<f64>, String> {
         let h_mm = xt_diag_x_dense(xmu, &self.coeff_mm)?;
@@ -4040,7 +3986,6 @@ impl GaussianLocationScaleWiggleHessianRowPieces {
         ))
     }
 }
-
 
 pub struct GaussianLocationScaleWiggleFamily {
     pub y: Array1<f64>,
@@ -4057,7 +4002,6 @@ pub struct GaussianLocationScaleWiggleFamily {
     cached_row_scalars:
         std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
-
 
 impl Clone for GaussianLocationScaleWiggleFamily {
     fn clone(&self) -> Self {
@@ -4078,7 +4022,6 @@ impl Clone for GaussianLocationScaleWiggleFamily {
         }
     }
 }
-
 
 impl GaussianLocationScaleWiggleFamily {
     pub const BLOCK_MU: usize = 0;
@@ -4299,7 +4242,6 @@ impl GaussianLocationScaleWiggleFamily {
     }
 }
 
-
 /// Row-coefficient bundle for the GLS Wiggle joint second directional
 /// derivative, shared by the matrix-free operator and the dense
 /// `_from_designs` assemblies. Holds exactly the quantities both consumers
@@ -4322,7 +4264,6 @@ struct GlsWiggleSecondDirCoeffs {
     dw_uv: Array1<f64>,
 }
 
-
 /// The two probe directions resolved to row space for the GLS Wiggle joint
 /// second directional derivative: `xi`/`zeta` are the X_mu/X_ls contractions,
 /// and `q`/`s1`/`g2` are the mixed first/second-derivative wiggle pieces.
@@ -4339,7 +4280,6 @@ struct GlsWiggleDirPieces<'a> {
     g2_v: &'a Array1<f64>,
     g2_uv: &'a Array1<f64>,
 }
-
 
 /// Compute the shared GLS Wiggle second-directional row coefficients from the
 /// per-row scalars, wiggle geometry, and the resolved probe directions.
@@ -4426,7 +4366,6 @@ fn gls_wiggle_second_directional_coeffs(
         dw_uv,
     }
 }
-
 
 impl GaussianLocationScaleWiggleFamily {
     fn exact_newton_joint_hessian_for_specs(
@@ -6018,7 +5957,6 @@ impl GaussianLocationScaleWiggleFamily {
     }
 }
 
-
 impl CustomFamily for GaussianLocationScaleWiggleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
@@ -6634,7 +6572,6 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
     }
 }
 
-
 /// Matrix-free joint-Hessian operator for the 3-block Gaussian
 /// location-scale wiggle family. See `GaussianLocationScaleWiggleHessianRowPieces`
 /// for the per-row weight structure. The matvec applies
@@ -6655,7 +6592,6 @@ struct GaussianLocationScaleWiggleHessianWorkspace {
     x_ls: Arc<Array2<f64>>,
     pieces: GaussianLocationScaleWiggleHessianRowPieces,
 }
-
 
 impl GaussianLocationScaleWiggleHessianWorkspace {
     fn new(
@@ -6720,7 +6656,6 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
         self.pieces.coeff_ww = maskww;
     }
 }
-
 
 impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
@@ -6894,7 +6829,6 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
     }
 }
 
-
 impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
     fn generativespec(
         &self,
@@ -6922,7 +6856,6 @@ impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
     }
 }
 
-
 fn expect_single_block<'a>(
     block_states: &'a [ParameterBlockState],
     family_name: &str,
@@ -6935,7 +6868,6 @@ fn expect_single_block<'a>(
     }
     Ok(&block_states[0])
 }
-
 
 #[derive(Clone)]
 pub struct BinomialMeanWiggleFamily {
@@ -6951,7 +6883,6 @@ pub struct BinomialMeanWiggleFamily {
     pub policy: crate::resource::ResourcePolicy,
 }
 
-
 struct BinomialMeanWiggleGeometry {
     basis: Array2<f64>,
     basis_d1: Array2<f64>,
@@ -6963,12 +6894,10 @@ struct BinomialMeanWiggleGeometry {
     d4q_dq04: Array1<f64>,
 }
 
-
 struct BinomialMeanWiggleJointPsiDirection {
     x_eta_psi: Option<Array2<f64>>,
     z_eta_psi: Array1<f64>,
 }
-
 
 impl BinomialMeanWiggleFamily {
     pub const BLOCK_ETA: usize = 0;
@@ -7543,7 +7472,6 @@ impl BinomialMeanWiggleFamily {
         .block_effective_jacobian(specs, block_idx)
     }
 }
-
 
 impl CustomFamily for BinomialMeanWiggleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -8446,14 +8374,12 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     }
 }
 
-
 struct BinomialMeanWiggleHessianWorkspace {
     family: BinomialMeanWiggleFamily,
     block_states: Vec<ParameterBlockState>,
     x_eta: Arc<Array2<f64>>,
     hessian_operator: Arc<RowCoeffOperator>,
 }
-
 
 impl BinomialMeanWiggleHessianWorkspace {
     fn new(
@@ -8471,7 +8397,6 @@ impl BinomialMeanWiggleHessianWorkspace {
         })
     }
 }
-
 
 impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
     fn hessian_matvec_available(&self) -> bool {
@@ -8534,7 +8459,6 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
     }
 }
 
-
 impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
     fn generativespec(
         &self,
@@ -8569,14 +8493,12 @@ impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
     }
 }
 
-
 /// Built-in Poisson log-link family (single parameter block).
 #[derive(Clone)]
 pub struct PoissonLogFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
 }
-
 
 impl PoissonLogFamily {
     pub const BLOCK_ETA: usize = 0;
@@ -8598,7 +8520,6 @@ impl PoissonLogFamily {
     }
 }
 
-
 /// Per-row IRLS contribution that a single-parameter log-link family must
 /// produce. The shared driver `evaluate_log_link_diagonal_irls` consumes
 /// these and assembles the full `FamilyEvaluation` so the three pieces of
@@ -8615,7 +8536,6 @@ struct DiagonalIrlsRow {
     /// driver only handles the active-clamp / zero-weight guard.
     working_step: f64,
 }
-
 
 /// Trait implemented by single-block log-link families that share the
 /// diagonal IRLS structure (Poisson, Gamma). Each impl is responsible only
@@ -8644,7 +8564,6 @@ trait LogLinkDiagonalIrlsFamily {
     /// is computed by the driver and handed in.
     fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow;
 }
-
 
 /// Shared IRLS driver for [`LogLinkDiagonalIrlsFamily`]. Centralises the
 /// size-check, η-clamp, saturated-exp, active-clamp guard, ll accumulation,
@@ -8696,7 +8615,6 @@ fn evaluate_log_link_diagonal_irls<F: LogLinkDiagonalIrlsFamily + ?Sized>(
     })
 }
 
-
 impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
     fn family_label(&self) -> &'static str {
         "PoissonLogFamily"
@@ -8733,13 +8651,11 @@ impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
     }
 }
 
-
 impl CustomFamily for PoissonLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
     }
 }
-
 
 impl CustomFamilyGenerative for PoissonLogFamily {
     fn generativespec(
@@ -8755,7 +8671,6 @@ impl CustomFamilyGenerative for PoissonLogFamily {
     }
 }
 
-
 /// Built-in Gamma log-link family (single parameter block, fixed shape).
 #[derive(Clone)]
 pub struct GammaLogFamily {
@@ -8763,7 +8678,6 @@ pub struct GammaLogFamily {
     pub weights: Array1<f64>,
     pub shape: f64,
 }
-
 
 impl GammaLogFamily {
     pub const BLOCK_ETA: usize = 0;
@@ -8784,7 +8698,6 @@ impl GammaLogFamily {
         }
     }
 }
-
 
 impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
     fn family_label(&self) -> &'static str {
@@ -8840,7 +8753,6 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
         }
     }
 }
-
 
 impl CustomFamily for GammaLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -8900,7 +8812,6 @@ impl CustomFamily for GammaLogFamily {
     }
 }
 
-
 impl CustomFamilyGenerative for GammaLogFamily {
     fn generativespec(
         &self,
@@ -8914,7 +8825,6 @@ impl CustomFamilyGenerative for GammaLogFamily {
         })
     }
 }
-
 
 /// Built-in binomial location-scale family with a configurable inverse link.
 ///
@@ -8934,7 +8844,6 @@ pub struct BinomialLocationScaleFamily {
     /// when the family is built without an explicit policy.
     pub policy: crate::resource::ResourcePolicy,
 }
-
 
 /// Both Binomial location-scale families plug into the unified
 /// [`LocationScaleJointPsiFamily`] trait with byte-identical thin delegations
@@ -9021,7 +8930,6 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
     };
 }
 
-
 impl_binomial_location_scale_joint_psi_family!(
     BinomialLocationScaleFamily,
     "BinomialLocationScaleFamily"
@@ -9031,7 +8939,6 @@ impl_binomial_location_scale_joint_psi_family!(
     BinomialLocationScaleWiggleFamily,
     "BinomialLocationScaleWiggleFamily"
 );
-
 
 pub(crate) type BinomialLocationScaleExactNewtonJointPsiWorkspace =
     LocationScaleJointPsiWorkspace<BinomialLocationScaleFamily>;

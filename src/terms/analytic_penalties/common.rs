@@ -2,30 +2,25 @@ use super::*;
 
 pub(crate) const MIN_CONDITIONAL_PRECISION: f64 = 1.0e-12;
 
-
 /// Floor applied to an assignment probability before taking its logarithm in the
 /// entropic / softmax-assignment penalties, keeping `ln(a)` finite (and the
 /// `a·ln(a)` contribution → 0) as `a → 0` without changing the value anywhere a
 /// is not numerically zero.
 pub(crate) const ENTROPY_LOG_PROBABILITY_FLOOR: f64 = 1e-300;
 
-
 /// Half-width of the open-interval clamp `[ε, 1−ε]` applied to IBP-assignment
 /// probabilities before `ln`/`1/p` so the Bernoulli cross-entropy and its score
 /// stay finite at the simplex boundary.
 pub(crate) const IBP_PROBABILITY_CLAMP: f64 = 1.0e-12;
-
 
 /// Interior tolerance for the IBP straight-through Bernoulli mean: the
 /// pass-through Jacobian `∂π/∂(mass)` is taken only when the unclamped mean lies
 /// strictly inside `(δ, 1−δ)`; at the saturated boundary the gradient is zero.
 pub(crate) const IBP_INTERIOR_TOL: f64 = 1.0e-9;
 
-
 /// Floor on the IBP posterior-count denominator `n + a − 1`, guarding the
 /// per-component mean against a zero (or negative) effective count.
 pub(crate) const IBP_COUNT_DENOM_FLOOR: f64 = 1.0e-9;
-
 
 // ---------------------------------------------------------------------------
 // Common trait
@@ -43,7 +38,6 @@ pub enum PenaltyTier {
     Rho,
 }
 
-
 /// Reference for the column / coordinate range a penalty operates over.
 ///
 /// Mirrors `BlockwisePenalty::col_range` for the β tier and is the natural
@@ -57,7 +51,6 @@ pub struct PsiSlice {
     /// reshape the flat slice into per-row `(n_obs, d)` blocks.
     pub latent_dim: Option<usize>,
 }
-
 
 impl PsiSlice {
     #[must_use]
@@ -76,7 +69,6 @@ impl PsiSlice {
         self.range.is_empty()
     }
 }
-
 
 /// Resolve a learnable penalty strength `base_weight · exp(rho)` without ever
 /// overflowing to `inf` or (for a nonzero base weight) underflowing to exact
@@ -112,7 +104,6 @@ pub(crate) fn resolve_learnable_weight(base_weight: f64, rho: f64) -> f64 {
     clamped.exp().copysign(base_weight)
 }
 
-
 /// Exponentiate a learnable log-precision `exp(log_alpha)` with the exponent
 /// clamped into the finite-normal band, returning a finite, strictly-positive
 /// precision.
@@ -133,7 +124,6 @@ pub(crate) fn stable_exp_log_precision(log_alpha: f64) -> f64 {
         .max(f64::MIN_POSITIVE)
 }
 
-
 /// Scalar annealing schedule for analytic penalty weights.
 ///
 /// This is the penalty-weight analogue of [`crate::terms::sae_manifold::GumbelTemperatureSchedule`]:
@@ -152,7 +142,6 @@ pub struct ScalarWeightSchedule {
     pub kind: ScheduleKind,
     pub iter_count: usize,
 }
-
 
 impl ScalarWeightSchedule {
     #[must_use = "build error must be handled"]
@@ -221,7 +210,6 @@ impl ScalarWeightSchedule {
         weight
     }
 }
-
 
 /// Uniform interface implemented by every analytic penalty in this module.
 ///
@@ -365,7 +353,6 @@ pub trait AnalyticPenalty: Send + Sync {
     }
 }
 
-
 pub(crate) fn advance_scalar_weight(
     weight: &mut f64,
     schedule: &mut Option<ScalarWeightSchedule>,
@@ -376,7 +363,6 @@ pub(crate) fn advance_scalar_weight(
         schedule.iter_count = iter + 1;
     }
 }
-
 
 /// Emit the standard scalar-weight-schedule builder for a penalty struct whose
 /// scalar weight lives in `$field` and whose schedule lives in
@@ -396,7 +382,6 @@ macro_rules! impl_with_weight_schedule {
     };
 }
 
-
 /// Emit the standard [`AnalyticPenalty::apply_schedule`] override for a penalty
 /// whose scalar weight lives in `$field`. Invoke inside the `impl
 /// AnalyticPenalty for …` block.
@@ -407,7 +392,6 @@ macro_rules! impl_scalar_apply_schedule {
         }
     };
 }
-
 
 /// Emit the standard learnable-scalar-weight [`AnalyticPenalty::grad_rho`] for a
 /// penalty whose single owned ρ-axis is the (optionally learnable) log-weight at
@@ -426,7 +410,6 @@ macro_rules! impl_learnable_weight_grad_rho {
     };
 }
 
-
 /// Emit the standard learnable-scalar-weight [`AnalyticPenalty::rho_count`]:
 /// one ρ-axis when the weight is learnable, none otherwise. Invoke inside the
 /// `impl AnalyticPenalty for …` block.
@@ -437,5 +420,3 @@ macro_rules! impl_learnable_weight_rho_count {
         }
     };
 }
-
-

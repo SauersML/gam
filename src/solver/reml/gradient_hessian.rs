@@ -3,11 +3,11 @@ use super::*;
 impl<'a> RemlState<'a> {
     const POLISH_NORM_RATIO: f64 = 0.25;
 
-    fn hypergradient_owner_key(&self) -> usize {
+    pub(crate) fn hypergradient_owner_key(&self) -> usize {
         self as *const _ as usize
     }
 
-    fn ift_quality_step_cap(&self, default_cap: f64) -> f64 {
+    pub(crate) fn ift_quality_step_cap(&self, default_cap: f64) -> f64 {
         let states = ift_quality_states().lock().unwrap();
         states
             .get(&self.hypergradient_owner_key())
@@ -16,7 +16,7 @@ impl<'a> RemlState<'a> {
             .unwrap_or(default_cap)
     }
 
-    fn take_ift_quality_flat_override(&self) -> bool {
+    pub(crate) fn take_ift_quality_flat_override(&self) -> bool {
         let mut states = ift_quality_states().lock().unwrap();
         let Some(state) = states.get_mut(&self.hypergradient_owner_key()) else {
             return false;
@@ -26,12 +26,16 @@ impl<'a> RemlState<'a> {
         fallback
     }
 
-    fn clear_ift_quality_runtime_state(&self) {
+    pub(crate) fn clear_ift_quality_runtime_state(&self) {
         let mut states = ift_quality_states().lock().unwrap();
         states.remove(&self.hypergradient_owner_key());
     }
 
-    fn record_ift_prediction_quality(&self, quality: f64, current_cap: f64) -> Option<f64> {
+    pub(crate) fn record_ift_prediction_quality(
+        &self,
+        quality: f64,
+        current_cap: f64,
+    ) -> Option<f64> {
         if !quality.is_finite() || quality < 0.0 || !current_cap.is_finite() || current_cap <= 0.0 {
             return None;
         }
@@ -55,12 +59,14 @@ impl<'a> RemlState<'a> {
         Some(next_step_cap)
     }
 
-    fn reset_hypergradient_budget_controller(&self) {
+    pub(crate) fn reset_hypergradient_budget_controller(&self) {
         let mut budgets = hypergradient_budgets().lock().unwrap();
         budgets.remove(&self.hypergradient_owner_key());
     }
 
-    fn hypergradient_trace_state(&self) -> Arc<Mutex<super::unified::StochasticTraceState>> {
+    pub(crate) fn hypergradient_trace_state(
+        &self,
+    ) -> Arc<Mutex<super::unified::StochasticTraceState>> {
         let mut budgets = hypergradient_budgets().lock().unwrap();
         let state = budgets
             .entry(self.hypergradient_owner_key())
@@ -68,7 +74,7 @@ impl<'a> RemlState<'a> {
         Arc::clone(&state.trace_state)
     }
 
-    fn reset_hypergradient_trace_telemetry(
+    pub(crate) fn reset_hypergradient_trace_telemetry(
         trace_state: &Arc<Mutex<super::unified::StochasticTraceState>>,
     ) {
         let mut trace = match trace_state.lock() {
@@ -80,7 +86,7 @@ impl<'a> RemlState<'a> {
         trace.last_probe_count = 0;
     }
 
-    fn hypergradient_adaptive_kkt_override(
+    pub(crate) fn hypergradient_adaptive_kkt_override(
         &self,
         pirls_config: &pirls::PirlsConfig,
     ) -> Option<pirls::AdaptiveKktTolerance> {
@@ -106,7 +112,7 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    fn update_hypergradient_budget_after_outer_eval(
+    pub(crate) fn update_hypergradient_budget_after_outer_eval(
         &self,
         rho: &Array1<f64>,
         gradient: &Array1<f64>,
@@ -244,7 +250,7 @@ impl<'a> RemlState<'a> {
         );
     }
 
-    fn apply_inner_polish_step_to_warm_start(
+    pub(crate) fn apply_inner_polish_step_to_warm_start(
         &self,
         bundle: &EvalShared,
         solution_beta: &Array1<f64>,
@@ -320,16 +326,16 @@ impl<'a> RemlState<'a> {
     }
 
     #[inline]
-    fn large_n_efs_single_loop_lane(&self) -> bool {
+    pub(crate) fn large_n_efs_single_loop_lane(&self) -> bool {
         (self.x.nrows() as f64) * (self.x.ncols() as f64) > LARGE_N_EFS_THRESHOLD
     }
 
     #[inline]
-    fn efs_single_loop_cap_active(&self) -> bool {
+    pub(crate) fn efs_single_loop_cap_active(&self) -> bool {
         decode_efs_single_loop_cap(self.outer_inner_cap.load(Ordering::Relaxed)).is_some()
     }
 
-    fn record_efs_single_loop_bias(
+    pub(crate) fn record_efs_single_loop_bias(
         &self,
         rho: &Array1<f64>,
         diagnostics: super::unified::EfsSingleLoopDiagnostics,
@@ -445,7 +451,7 @@ impl<'a> RemlState<'a> {
     /// the logit 5th-derivative jet (`logit_inverse_link_jet5`). Non-logit Firth
     /// fits skip the TK refinement and use plain Laplace REML, which is
     /// link-general; logit fits keep the full higher-order correction.
-    fn tk_correction_is_canonical_logit(&self) -> bool {
+    pub(crate) fn tk_correction_is_canonical_logit(&self) -> bool {
         let spec = reml_spec(&self.config.likelihood);
         matches!(spec.response, ResponseFamily::Binomial)
             && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
@@ -464,7 +470,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn bundle_matrix_in_original_basis(
+    pub(crate) fn bundle_matrix_in_original_basis(
         &self,
         pirls_result: &PirlsResult,
         matrix: &Array2<f64>,
@@ -488,7 +494,7 @@ impl<'a> RemlState<'a> {
             .map(|bundle| bundle.ridge_passport.delta)
     }
 
-    fn dense_penalty_logdet_derivs(
+    pub(crate) fn dense_penalty_logdet_derivs(
         &self,
         rho: &Array1<f64>,
         e_for_logdet: &Array2<f64>,
@@ -612,7 +618,7 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    fn tk_shared_intermediates<S>(
+    pub(crate) fn tk_shared_intermediates<S>(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         c_array: &Array1<f64>,
@@ -649,7 +655,7 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    fn tk_scalar_from_shared(
+    pub(crate) fn tk_scalar_from_shared(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         d_array: &Array1<f64>,
@@ -692,7 +698,7 @@ impl<'a> RemlState<'a> {
         Ok(value)
     }
 
-    fn tk_active_blocks(c_array: &Array1<f64>) -> Vec<TkActiveBlock> {
+    pub(crate) fn tk_active_blocks(c_array: &Array1<f64>) -> Vec<TkActiveBlock> {
         let n = c_array.len();
         let mut blocks = Vec::with_capacity(n.div_ceil(TK_BLOCK_SIZE));
         for start in (0..n).step_by(TK_BLOCK_SIZE) {
@@ -714,7 +720,7 @@ impl<'a> RemlState<'a> {
         blocks
     }
 
-    fn tk_active_weighted_trace(
+    pub(crate) fn tk_active_weighted_trace(
         active_blocks: &[TkActiveBlock],
         x_vk: &Array1<f64>,
         lev_p: &Array1<f64>,
@@ -729,7 +735,7 @@ impl<'a> RemlState<'a> {
         trace
     }
 
-    fn tk_fill_gram_block(
+    pub(crate) fn tk_fill_gram_block(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         i0: usize,
@@ -748,7 +754,7 @@ impl<'a> RemlState<'a> {
         ndarray::linalg::general_mat_mul(1.0, &x_block, &z_block, 0.0, &mut target);
     }
 
-    fn tk_fill_gram_block_entries_scalar(
+    pub(crate) fn tk_fill_gram_block_entries_scalar(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         i_block: &TkActiveBlock,
@@ -767,7 +773,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn tk_gradient_from_shared(
+    pub(crate) fn tk_gradient_from_shared(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         c_array: &Array1<f64>,
@@ -1021,7 +1027,7 @@ impl<'a> RemlState<'a> {
         Ok(gradient)
     }
 
-    fn tk_firth_beta_hessian_trace(
+    pub(crate) fn tk_firth_beta_hessian_trace(
         firth_op: Option<&super::FirthDenseOperator>,
         beta_dir: &Array1<f64>,
         p_total: &Array2<f64>,
@@ -1071,7 +1077,7 @@ impl<'a> RemlState<'a> {
     ///   q' = Xᵀ(c'⊙h + c⊙h') + X'ᵀ(c⊙h).
     /// The remaining `H`-drift part of dV_TK/dθ is assembled by
     /// `tk_gradient_from_shared`.
-    fn tk_direct_gradient_from_cd_and_design(
+    pub(crate) fn tk_direct_gradient_from_cd_and_design(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         c_array: &Array1<f64>,
@@ -1212,7 +1218,7 @@ impl<'a> RemlState<'a> {
         Ok(value)
     }
 
-    fn tk_cd_direct_active_blocks(
+    pub(crate) fn tk_cd_direct_active_blocks(
         c_array: &Array1<f64>,
         c_prime: &Array1<f64>,
     ) -> Vec<TkActiveBlock> {
@@ -1238,7 +1244,7 @@ impl<'a> RemlState<'a> {
         blocks
     }
 
-    fn tk_penalty_dense(
+    pub(crate) fn tk_penalty_dense(
         cp: &crate::construction::CanonicalPenalty,
         lambda: f64,
         p: usize,
@@ -1257,12 +1263,12 @@ impl<'a> RemlState<'a> {
         out
     }
 
-    fn tk_xt_diag_x(x_dense: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
+    pub(crate) fn tk_xt_diag_x(x_dense: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
         let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
         Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted)
     }
 
-    fn tk_hessian_rho_canonical_logit<S>(
+    pub(crate) fn tk_hessian_rho_canonical_logit<S>(
         x_dense: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
@@ -1522,7 +1528,7 @@ impl<'a> RemlState<'a> {
         Ok(total.h)
     }
 
-    fn tierney_kadane_analytic_core<S>(
+    pub(crate) fn tierney_kadane_analytic_core<S>(
         &self,
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
@@ -1650,7 +1656,7 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    fn tierney_kadane_terms(
+    pub(crate) fn tierney_kadane_terms(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -1946,7 +1952,7 @@ impl<'a> RemlState<'a> {
         )
     }
 
-    fn validate_tk_ext_coords(
+    pub(crate) fn validate_tk_ext_coords(
         &self,
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
@@ -1967,7 +1973,7 @@ impl<'a> RemlState<'a> {
         Ok(())
     }
 
-    fn apply_tk_to_result(
+    pub(crate) fn apply_tk_to_result(
         &self,
         mut result: super::unified::RemlLamlResult,
         tk_terms: TkCorrectionTerms,
@@ -2005,7 +2011,7 @@ impl<'a> RemlState<'a> {
     /// Build the inverse link from the runtime link state, mirroring the
     /// dispatch in `hessian_cde_arrays`. Used by the #784 block-local sampled
     /// marginalization to evaluate μ at displaced η.
-    fn runtime_inverse_link(&self) -> InverseLink {
+    pub(crate) fn runtime_inverse_link(&self) -> InverseLink {
         let link_function = self.config.link_function();
         if let Some(state) = self.runtime_mixture_link_state.clone() {
             InverseLink::Mixture(state)
@@ -2066,7 +2072,7 @@ impl<'a> RemlState<'a> {
     /// band. The correction value therefore vanishes continuously as a
     /// direction approaches the threshold, so the spliced objective is
     /// continuous to leading order and does not bias ρ selection.
-    fn block_local_sampled_correction(
+    pub(crate) fn block_local_sampled_correction(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2441,7 +2447,7 @@ impl<'a> RemlState<'a> {
             && (eval_idx == 1 || eval_idx.is_multiple_of(HOT_DIAGNOSTIC_EVAL_INTERVAL))
     }
 
-    fn invalidate_link_dependent_state(&self) {
+    pub(crate) fn invalidate_link_dependent_state(&self) {
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
         // Under a link change the previous link's working-weight
@@ -2468,7 +2474,7 @@ impl<'a> RemlState<'a> {
     /// warm-start machinery can leak stale state across the
     /// invalidation boundary and produce β-drift regressions
     /// (caught by `tests/warm_start_quality_regression.rs`).
-    fn clear_warm_start_predictor_state(&self) {
+    pub(crate) fn clear_warm_start_predictor_state(&self) {
         self.warm_start_beta.write().unwrap().take();
         self.warm_start_rho.write().unwrap().take();
         self.prev_warm_start_beta.write().unwrap().take();
@@ -2478,15 +2484,15 @@ impl<'a> RemlState<'a> {
         self.clear_ift_mode_response_cache();
     }
 
-    fn ift_mode_response_cache_key(&self) -> usize {
+    pub(crate) fn ift_mode_response_cache_key(&self) -> usize {
         self as *const Self as usize
     }
 
-    fn pending_joint_ift_theta(&self) -> Option<Array1<f64>> {
+    pub(crate) fn pending_joint_ift_theta(&self) -> Option<Array1<f64>> {
         latest_outer_theta_for_ift()
     }
 
-    fn clear_joint_ift_mode_response_cache(&self) {
+    pub(crate) fn clear_joint_ift_mode_response_cache(&self) {
         if let Some(caches) = IFT_JOINT_MODE_RESPONSE_CACHES.get() {
             caches
                 .lock()
@@ -2495,7 +2501,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn clear_ift_mode_response_cache(&self) {
+    pub(crate) fn clear_ift_mode_response_cache(&self) {
         if let Some(caches) = IFT_MODE_RESPONSE_CACHES.get() {
             caches
                 .lock()
@@ -2504,7 +2510,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn mode_response_cols_for_warm_start(
+    pub(crate) fn mode_response_cols_for_warm_start(
         &self,
         bundle: &EvalShared,
         cols: &Array2<f64>,
@@ -2531,7 +2537,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn store_ift_mode_response_cache_from_result(
+    pub(crate) fn store_ift_mode_response_cache_from_result(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2648,7 +2654,7 @@ impl<'a> RemlState<'a> {
         );
     }
 
-    fn cached_ift_rho_mode_response_cols(
+    pub(crate) fn cached_ift_rho_mode_response_cols(
         &self,
         cache: &super::IftWarmStartCache,
     ) -> Option<Array2<f64>> {
@@ -2677,7 +2683,7 @@ impl<'a> RemlState<'a> {
         Some(cols.clone())
     }
 
-    fn predict_warm_start_beta_joint_ift_with_outcome(
+    pub(crate) fn predict_warm_start_beta_joint_ift_with_outcome(
         &self,
         new_rho: &Array1<f64>,
         max_dtheta_cap: f64,
@@ -2777,7 +2783,7 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    fn joint_ift_cache_matches_pending_theta(&self, new_rho: &Array1<f64>) -> bool {
+    pub(crate) fn joint_ift_cache_matches_pending_theta(&self, new_rho: &Array1<f64>) -> bool {
         let Some(theta) = self.pending_joint_ift_theta() else {
             return false;
         };
@@ -2801,7 +2807,7 @@ impl<'a> RemlState<'a> {
     /// regressions (the inner solve takes longer than it should),
     /// which the bench runner's [PHASE summary] line catches via
     /// the `pirls_conv_*` and `ift_*` fields.
-    fn clear_warm_start_adaptive_signals(&self) {
+    pub(crate) fn clear_warm_start_adaptive_signals(&self) {
         self.last_inner_iters.store(0, Ordering::Relaxed);
         self.last_inner_converged.store(false, Ordering::Relaxed);
         self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
@@ -2850,7 +2856,7 @@ impl<'a> RemlState<'a> {
     /// the outer Hessian's Q[v_k, v_l] correction term. Using the observed
     /// versions is required for the exact Laplace approximation; Fisher
     /// versions would yield a PQL-type surrogate. See response.md Section 3.
-    fn hessian_cd_arrays(
+    pub(crate) fn hessian_cd_arrays(
         &self,
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
@@ -2860,7 +2866,7 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    fn hessian_surface_arrays(
+    pub(crate) fn hessian_surface_arrays(
         &self,
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
@@ -2903,7 +2909,7 @@ impl<'a> RemlState<'a> {
     /// `inverse_link_pdf{third,fourth}_derivative_for_inverse_link`)
     /// and the variance jet V, V₁..V₄. The production path is fully
     /// analytic.
-    fn hessian_cde_arrays(
+    pub(crate) fn hessian_cde_arrays(
         &self,
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
@@ -3047,7 +3053,7 @@ impl<'a> RemlState<'a> {
         Ok((c_array, d_array, e_array))
     }
 
-    fn hessian_cdef_arrays(
+    pub(crate) fn hessian_cdef_arrays(
         &self,
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
@@ -3208,7 +3214,7 @@ impl<'a> RemlState<'a> {
     /// malformed prior folds into the objective as `+inf` cost (and `NaN`
     /// gradient/Hessian) so the outer optimizer steps away from it. The math
     /// itself is shared with custom-family handling.
-    fn evaluate_configured_rho_prior(
+    pub(crate) fn evaluate_configured_rho_prior(
         &self,
         rho: &Array1<f64>,
     ) -> super::rho_prior_eval::RhoPriorEval {
@@ -3293,7 +3299,7 @@ impl<'a> RemlState<'a> {
     /// dominated by the O(n) REML curvature wherever λ is well identified,
     /// leaving clean λ-selection unbiased (the zero-downside / information-limit
     /// reduction to plain REML).
-    fn effective_rho_prior(&self) -> std::borrow::Cow<'_, RhoPrior> {
+    pub(crate) fn effective_rho_prior(&self) -> std::borrow::Cow<'_, RhoPrior> {
         resolve_effective_rho_prior(&self.rho_prior)
     }
 
@@ -3315,7 +3321,7 @@ impl<'a> RemlState<'a> {
     /// With all weights 1 this is exactly 0. Summed over the SAME positive-weight rows
     /// counted in `n_observations` (zero-weight rows are dropped; `log(0)` is
     /// undefined).
-    fn gaussian_weight_log_sum_half(&self) -> f64 {
+    pub(crate) fn gaussian_weight_log_sum_half(&self) -> f64 {
         0.5 * self
             .weights
             .iter()
@@ -3390,15 +3396,18 @@ impl<'a> RemlState<'a> {
         if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
-    fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
+    pub(crate) fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
         self.evaluate_configured_rho_prior(rho).cost
     }
 
-    fn compute_configured_rho_prior_grad(&self, rho: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn compute_configured_rho_prior_grad(&self, rho: &Array1<f64>) -> Array1<f64> {
         self.evaluate_configured_rho_prior(rho).gradient
     }
 
-    fn compute_configured_rho_prior_hess(&self, rho: &Array1<f64>) -> Option<Array2<f64>> {
+    pub(crate) fn compute_configured_rho_prior_hess(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Option<Array2<f64>> {
         self.evaluate_configured_rho_prior(rho).hessian
     }
 
@@ -3794,7 +3803,10 @@ impl<'a> RemlState<'a> {
         Ok(bundle.h_total.as_ref().clone())
     }
 
-    fn previous_outer_gradient_norm(&self, current_key: &Option<Vec<u64>>) -> Option<f64> {
+    pub(crate) fn previous_outer_gradient_norm(
+        &self,
+        current_key: &Option<Vec<u64>>,
+    ) -> Option<f64> {
         let guard = self.cache_manager.current_outer_eval.read().unwrap();
         let (cached_key, eval) = guard.as_ref()?;
         if current_key
@@ -3898,7 +3910,7 @@ impl<'a> RemlState<'a> {
     ///
     /// Delegates to `BarrierConfig::from_constraints` and logs a diagnostic
     /// barrier-curvature check at a test point near the bounds.
-    fn barrier_config_from_constraints(
+    pub(crate) fn barrier_config_from_constraints(
         constraints: &crate::pirls::LinearInequalityConstraints,
     ) -> Option<super::unified::BarrierConfig> {
         let config = super::unified::BarrierConfig::from_constraints(Some(constraints))?;
@@ -4075,7 +4087,7 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    fn fixed_subspace_penalty_rank_and_logdet_from_subspace(
+    pub(crate) fn fixed_subspace_penalty_rank_and_logdet_from_subspace(
         &self,
         penalty_subspace: &PenaltySubspace,
     ) -> (usize, f64) {
@@ -4372,7 +4384,7 @@ impl<'a> RemlState<'a> {
             .store(true, Ordering::Relaxed);
     }
 
-    fn persistent_warm_start_cache_key(&self) -> Option<String> {
+    pub(crate) fn persistent_warm_start_cache_key(&self) -> Option<String> {
         if let Some(key) = self.persistent_warm_start_key.read().unwrap().clone() {
             return Some(key);
         }
@@ -4439,7 +4451,7 @@ impl<'a> RemlState<'a> {
         Some(key)
     }
 
-    fn persistent_latent_values_cache_key(&self) -> Option<String> {
+    pub(crate) fn persistent_latent_values_cache_key(&self) -> Option<String> {
         let latent_fingerprint = self.persistent_latent_values_fingerprint?;
         self.persistent_warm_start_cache_key()
             .map(|key| format!("persistent-latent-values-v2:{key}:{latent_fingerprint:016x}"))
@@ -4473,7 +4485,7 @@ impl<'a> RemlState<'a> {
             .insert(key, values.clone());
     }
 
-    fn load_persistent_warm_start_once(&self) {
+    pub(crate) fn load_persistent_warm_start_once(&self) {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -4546,7 +4558,7 @@ impl<'a> RemlState<'a> {
         log::info!("[warm-start-cache] restored persistent warm start key={key}");
     }
 
-    fn store_persistent_warm_start(&self) {
+    pub(crate) fn store_persistent_warm_start(&self) {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -5225,10 +5237,7 @@ impl<'a> RemlState<'a> {
     /// that the trial's converged working weight has not drifted past tolerance
     /// from the frozen snapshot, so the frozen-W Gram is a faithful stand-in for
     /// the trial's first-iteration `XᵀWX`.
-    pub(crate) fn install_glm_first_step_gram(
-        &self,
-        gram: Arc<ndarray::Array2<f64>>,
-    ) -> bool {
+    pub(crate) fn install_glm_first_step_gram(&self, gram: Arc<ndarray::Array2<f64>>) -> bool {
         if gram.nrows() != self.p || gram.ncols() != self.p {
             return false;
         }
@@ -6330,7 +6339,6 @@ impl<'a> RemlState<'a> {
     }
 }
 
-
 /// Default cap on |Δρ_k| beyond which the IFT linear predictor rejects.
 /// Δρ = log(λ_new / λ_old); 2.0 corresponds to a 7.4× change in λ along
 /// any single penalty direction — well outside the regime where the local
@@ -6339,7 +6347,6 @@ impl<'a> RemlState<'a> {
 /// tightening policy. This default is used when no IFT-quality history
 /// is available yet (the first PIRLS solve at a fresh surface).
 const IFT_WARM_START_DEFAULT_MAX_DRHO: f64 = 2.0;
-
 
 /// Shared relative-residual tier breakpoints for the warm-start linear
 /// predictors. `r = ‖β_converged − β_predicted‖ / ‖β_converged‖` from the
@@ -6355,7 +6362,6 @@ const IFT_RESIDUAL_TIER_VERY_GOOD: f64 = 0.05;
 const IFT_RESIDUAL_TIER_OK: f64 = 0.20;
 
 const IFT_RESIDUAL_TIER_MARGINAL: f64 = 0.50;
-
 
 /// Adaptive |Δρ| cap for the IFT predictor, driven by the residual of
 /// the previous IFT prediction (see `last_ift_prediction_residual`).
@@ -6400,7 +6406,6 @@ fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
     }
 }
 
-
 /// Default upper cap on the tangent-line predictor's α (extrapolation
 /// fraction beyond the previous ρ-step). 1.5 means "we permit at most
 /// 50% extrapolation past the last step length"; the original hardcoded
@@ -6411,7 +6416,6 @@ fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
 /// `adaptive_tangent_alpha_cap` adjusts this based on the IFT
 /// residual signal when present.
 const TANGENT_ALPHA_DEFAULT_CAP: f64 = 1.5;
-
 
 /// Adaptive α-cap for the tangent-line predictor, sharing the IFT
 /// residual signal as a proxy for "how trustworthy is the local linear
@@ -6451,7 +6455,6 @@ fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
     }
 }
 
-
 /// What the IFT predictor's inner computation actually did with the
 /// β it returned. Surfaced by the inner predictor so callers don't
 /// need to re-derive noop-ness via O(p) array comparison against
@@ -6469,7 +6472,6 @@ pub(crate) enum IftPredictionOutcome {
     /// quality probe on the returned β.
     Noop,
 }
-
 
 /// Tag identifying which branch of the warm-start linear-predictor
 /// stack actually produced the β returned by
@@ -6494,12 +6496,10 @@ pub(crate) enum WarmStartPredictionSource {
     Flat,
 }
 
-
 /// Below this magnitude in any Δρ_k, the per-component IFT contribution is
 /// numerically negligible and skipped (saves one back-solve per inactive
 /// component).
 const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
-
 
 /// Bit-pattern sentinel used by `RemlObjectiveState::last_ift_prediction_residual`
 /// to encode "no signal yet" unambiguously. Decodes via `f64::from_bits`
@@ -6521,7 +6521,6 @@ const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
 /// writer but the reader treats it as "no signal" and silently
 /// drops the adaptive cap-margin signal.
 pub(crate) const IFT_RESIDUAL_NO_SIGNAL_BITS: u64 = 0x7ff8_0000_0000_0000;
-
 
 /// Adaptive clamp for the `initial_lm_lambda` warm-start hint passed
 /// from `execute_pirls_if_needed` into PIRLS. Selects one of three
@@ -6579,7 +6578,6 @@ pub(crate) fn adaptive_lm_lambda_hint(
         };
     Some(cached_lambda.clamp(floor, ceiling))
 }
-
 
 fn predict_warm_start_beta_ift_inner_with_outcome(
     cache: &super::IftWarmStartCache,
@@ -6860,7 +6858,6 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
         IftPredictionOutcome::Predicted,
     ))
 }
-
 
 fn predict_warm_start_beta_ift_from_mode_response_cols(
     cache: &super::IftWarmStartCache,

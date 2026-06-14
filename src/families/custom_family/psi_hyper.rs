@@ -208,8 +208,6 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     Ok(coords)
 }
 
-
-
 /// Build the direction-contracted ψψ second-order hook for the profiled θ-HVP
 /// (#740).
 ///
@@ -405,8 +403,6 @@ pub(crate) fn build_contracted_psi_hook(
 
     Ok(Some(Arc::new(hook) as ContractedPsiSecondOrderFn))
 }
-
-
 
 /// Build pair callbacks for ψ-ψ and ρ-ψ Hessian entries.
 ///
@@ -775,8 +771,6 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     Ok((ext_ext, rho_ext))
 }
 
-
-
 /// Build the M_i[u] = D_β B_i[u] callback for ψ coordinates.
 ///
 /// This wraps `family.exact_newton_joint_psihessian_directional_derivative`
@@ -840,9 +834,9 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     ))
 }
 
-
-
-pub(crate) fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn evaluate_custom_family_hyper_internal<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -866,9 +860,9 @@ pub(crate) fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Se
     )
 }
 
-
-
-pub(crate) fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn evaluate_custom_family_hyper_internal_shared<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -1860,8 +1854,6 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clo
     Ok(eval_result)
 }
 
-
-
 pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1891,8 +1883,6 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
 }
-
-
 
 pub(crate) fn evaluate_custom_family_joint_hyper_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,
@@ -1925,8 +1915,6 @@ pub(crate) fn evaluate_custom_family_joint_hyper_shared<
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
 }
-
-
 
 pub(crate) fn derivative_quality_options_and_warm_start(
     options: &BlockwiseFitOptions,
@@ -1977,8 +1965,6 @@ pub(crate) fn derivative_quality_options_and_warm_start(
     (eval_options, psi_safe_warm_start)
 }
 
-
-
 pub(crate) fn joint_hyper_options_for_outer_tolerance(
     options: &BlockwiseFitOptions,
     outer_tol: f64,
@@ -1987,8 +1973,6 @@ pub(crate) fn joint_hyper_options_for_outer_tolerance(
     eval_options.outer_tol = eval_options.outer_tol.max(outer_tol);
     eval_options
 }
-
-
 
 pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,
@@ -2347,8 +2331,6 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     Ok((efs_eval, warm, inner.converged))
 }
 
-
-
 /// Evaluate the joint custom-family hyper-surface in fixed-point form for the
 /// outer EFS / hybrid-EFS planners.
 pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -2372,8 +2354,6 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
         warm_start,
     )
 }
-
-
 
 pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,

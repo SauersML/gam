@@ -10,8 +10,6 @@ pub enum ExactNewtonOuterObjective {
     StrictPseudoLaplace,
 }
 
-
-
 /// Highest exact outer derivative order a family wants to expose at the
 /// current realized problem scale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,8 +18,6 @@ pub enum ExactOuterDerivativeOrder {
     First,
     Second,
 }
-
-
 
 impl ExactOuterDerivativeOrder {
     pub const fn has_gradient(self) -> bool {
@@ -32,8 +28,6 @@ impl ExactOuterDerivativeOrder {
         matches!(self, Self::Second)
     }
 }
-
-
 
 /// Exact outer derivative order for families that expose second-order
 /// coefficient geometry.
@@ -60,8 +54,6 @@ pub(crate) fn assert_valid_blockspecs(specs: &[ParameterBlockSpec], context: &st
     );
 }
 
-
-
 pub(crate) fn assert_valid_options(options: &BlockwiseFitOptions, context: &str) {
     assert!(
         options.inner_tol.is_finite() && options.inner_tol >= 0.0,
@@ -86,8 +78,6 @@ pub(crate) fn assert_valid_options(options: &BlockwiseFitOptions, context: &str)
         );
     }
 }
-
-
 
 pub(crate) fn assert_states_match_specs(
     states: &[ParameterBlockState],
@@ -117,8 +107,6 @@ pub(crate) fn assert_states_match_specs(
     }
 }
 
-
-
 pub(crate) fn assert_derivative_blocks_match_specs(
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     specs: &[ParameterBlockSpec],
@@ -131,9 +119,11 @@ pub(crate) fn assert_derivative_blocks_match_specs(
     );
 }
 
-
-
-pub(crate) fn assert_rho_matches_specs(rho: &Array1<f64>, specs: &[ParameterBlockSpec], context: &str) {
+pub(crate) fn assert_rho_matches_specs(
+    rho: &Array1<f64>,
+    specs: &[ParameterBlockSpec],
+    context: &str,
+) {
     let expected = specs.iter().map(|spec| spec.penalties.len()).sum::<usize>();
     assert_eq!(
         rho.len(),
@@ -141,8 +131,6 @@ pub(crate) fn assert_rho_matches_specs(rho: &Array1<f64>, specs: &[ParameterBloc
         "{context}: rho length does not match penalty count"
     );
 }
-
-
 
 pub(crate) fn validate_hessian_workspace_ready(
     hessian_workspace: &Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
@@ -156,8 +144,6 @@ pub(crate) fn validate_hessian_workspace_ready(
     Ok(())
 }
 
-
-
 pub fn exact_outer_order_from_capability(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
@@ -168,8 +154,6 @@ pub fn exact_outer_order_from_capability(
         _ => ExactOuterDerivativeOrder::Second,
     }
 }
-
-
 
 /// Capability-aware variant of [`exact_outer_order_from_capability`].
 ///
@@ -191,8 +175,6 @@ pub fn exact_outer_order_with_outer_hvp(
         exact_outer_order_from_capability(specs, coefficient_cost)
     }
 }
-
-
 
 /// Realized outer-derivative policy at the current problem size.
 ///
@@ -252,8 +234,6 @@ pub struct OuterDerivativePolicy {
     /// to set this `true`.
     pub subsample_capable: bool,
 }
-
-
 
 impl OuterDerivativePolicy {
     /// Per-eval gradient work ceiling above which the κ schedule switches
@@ -333,8 +313,6 @@ impl OuterDerivativePolicy {
     }
 }
 
-
-
 /// Total outer-coordinate dimensionality used by the default policy work
 /// model: `rho_dim + psi_dim`. Each outer evaluation propagates one
 /// directional derivative per outer coordinate through the inner solve.
@@ -346,8 +324,6 @@ pub(crate) fn outer_coord_dim_for_policy(specs: &[ParameterBlockSpec], psi_dim: 
         .fold(0u128, |acc, k| acc.saturating_add(k));
     rho_total.saturating_add(psi_dim as u128)
 }
-
-
 
 /// Default predicted-cost model for [`OuterDerivativePolicy`]:
 ///
@@ -373,8 +349,6 @@ pub fn default_outer_derivative_policy_costs(
     (grad, hess)
 }
 
-
-
 /// Default coefficient-space Hessian cost: `Σ_b n_b · p_b²`, summed across
 /// blocks. Represents the work to assemble or apply the dense block-diagonal
 /// inner Hessian once.
@@ -388,8 +362,6 @@ pub fn default_coefficient_hessian_cost(specs: &[ParameterBlockSpec]) -> u64 {
         })
         .fold(0u64, |acc, c| acc.saturating_add(c))
 }
-
-
 
 /// Joint-coupled coefficient-space Hessian cost: `n · (Σ_b p_b)²`. The honest
 /// per-evaluation work for any family whose row likelihood couples every block
@@ -408,8 +380,6 @@ pub fn joint_coupled_coefficient_hessian_cost(n: u64, specs: &[ParameterBlockSpe
     n.saturating_mul(p_total.saturating_mul(p_total))
 }
 
-
-
 /// Default coefficient-space gradient cost: half the Hessian cost.
 ///
 /// The first-order analytic gradient in the unified evaluator runs the same
@@ -424,8 +394,6 @@ pub fn joint_coupled_coefficient_hessian_cost(n: u64, specs: &[ParameterBlockSpe
 pub fn default_coefficient_gradient_cost(specs: &[ParameterBlockSpec]) -> u64 {
     default_coefficient_hessian_cost(specs) / 2
 }
-
-
 
 /// Compute β-block column ranges from a slice of `ParameterBlockSpec`s.
 ///
@@ -456,8 +424,6 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
     Arc::from(ranges.into_boxed_slice())
 }
 
-
-
 /// Bound first-order outer iterations when each analytic-gradient evaluation is
 /// already large-scale work. This is only applied after the planner has
 /// selected a gradient-only route; second-order/ARC plans keep their requested
@@ -478,8 +444,6 @@ pub fn cost_gated_first_order_max_iter(
     requested.min(affordable.max(MIN_FIRST_ORDER_ITERS))
 }
 
-
-
 /// Local trust budget for first-order outer BFGS on log-smoothing parameters.
 ///
 /// One unit in `rho = log(lambda)` is an `e`-fold smoothing-parameter change.
@@ -497,15 +461,11 @@ pub const fn first_order_bfgs_loglambda_step_cap(has_outer_hessian: bool) -> Opt
     if has_outer_hessian { None } else { Some(5.0) }
 }
 
-
-
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
     family: &F,
 ) -> bool {
     family.exact_newton_outerobjective() == ExactNewtonOuterObjective::StrictPseudoLaplace
 }
-
-
 
 /// Stable public API for installing outer-score subsampling.
 #[derive(Clone)]
@@ -661,11 +621,7 @@ pub struct BlockwiseFitOptions {
     pub seed_screening: bool,
 }
 
-
-
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
-
-
 
 impl Default for BlockwiseFitOptions {
     fn default() -> Self {

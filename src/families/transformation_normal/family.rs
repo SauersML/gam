@@ -8,7 +8,6 @@ fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
             .all(|(&left, &right)| left.to_bits() == right.to_bits())
 }
 
-
 /// Optional warm-start for the transformation model: per-observation location and
 /// scale values from a prior mean/SD normalizer.
 #[derive(Clone, Debug)]
@@ -18,7 +17,6 @@ pub struct TransformationWarmStart {
     /// τ(x_i): conditional standard deviation at each observation's covariates.
     pub scale: Array1<f64>,
 }
-
 
 // ---------------------------------------------------------------------------
 // The family
@@ -106,19 +104,17 @@ pub struct TransformationNormalFamily {
     outer_subsample_weights: Option<Arc<Array1<f64>>>,
 }
 
-
 #[derive(Clone)]
-struct TransformationNormalRowQuantityCache {
-    beta: Arc<Array1<f64>>,
-    gamma: Arc<Array2<f64>>,
-    h: Arc<Array1<f64>>,
-    h_prime: Arc<Array1<f64>>,
-    h_lower: Arc<Array1<f64>>,
-    h_upper: Arc<Array1<f64>>,
-    endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
-    log_likelihood: f64,
+pub(crate) struct TransformationNormalRowQuantityCache {
+    pub(crate) beta: Arc<Array1<f64>>,
+    pub(crate) gamma: Arc<Array2<f64>>,
+    pub(crate) h: Arc<Array1<f64>>,
+    pub(crate) h_prime: Arc<Array1<f64>>,
+    pub(crate) h_lower: Arc<Array1<f64>>,
+    pub(crate) h_upper: Arc<Array1<f64>>,
+    pub(crate) endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
+    pub(crate) log_likelihood: f64,
 }
-
 
 #[derive(Debug)]
 struct TransformationNormalRowDerived {
@@ -126,13 +122,11 @@ struct TransformationNormalRowDerived {
     endpoint_q: Vec<LogNormalCdfDiffDerivatives>,
 }
 
-
 impl TransformationNormalRowQuantityCache {
     fn matches_beta(&self, beta: &Array1<f64>) -> bool {
         beta_bits_match(&self.beta, beta)
     }
 }
-
 
 fn build_transformation_row_derived(
     h: &Array1<f64>,
@@ -261,8 +255,6 @@ fn build_transformation_row_derived(
         endpoint_q,
     })
 }
-
-
 
 impl TransformationNormalFamily {
     /// Build a transformation model from response values and a pre-built covariate
@@ -1018,5 +1010,4 @@ impl TransformationNormalFamily {
         *cache = Some(row_quantities.clone());
         Ok(row_quantities)
     }
-
 }

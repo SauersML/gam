@@ -68,8 +68,9 @@ response-column name, and gamfit prepends `<target> ~`.
 | `check(X)` | `SchemaCheck` | Delegates to `model_.check()`. Scalar models only. |
 | `report(path)` | `str` | Delegates to `model_.report(path)`. Scalar models only. |
 
-The fitted `Model` is available at `est.model_` for access to the full
-`gamfit.Model` API (`sample`, `predict(..., interval=...)`, etc.).
+The fitted model is available at `est.model_` for access to the full
+`gamfit.Model` API (`sample`, `predict(..., interval=...)`, etc.) when
+the fit is a scalar GAM.
 
 ## GAMClassifier
 
@@ -79,14 +80,22 @@ from gamfit.sklearn import GAMClassifier
 est = GAMClassifier(formula="y ~ s(x)", family="binomial")
 est.fit(X, y)
 
-probs = est.predict_proba(X)   # (n, 2): [P(y=0), P(y=1)]
-hard  = est.predict(X)         # (n,) int, highest-probability class
-acc   = est.score(X, y)        # accuracy_score
+probs = est.predict_proba(X)   # (n, 2): [P(classes_[0]), P(classes_[1])]
+hard  = est.predict(X)         # (n,), highest-probability class label
+auc   = est.score(X, y)        # ROC AUC
 ```
 
-`classes_` is `np.array([0, 1])` after `fit()`. `predict_proba()` clips the
-positive-class probability to `[0, 1]` and stacks `[1 - p, p]`.
-`predict()` returns `classes_[argmax(predict_proba(X), axis=1)]`.
+`classes_` is the sorted pair of labels observed at fit time. The wrapper
+encodes `classes_[1]` as the positive class before fitting, so string
+labels and non-`{0, 1}` binary labels round-trip. `predict_proba()` clips
+the positive-class probability to `[0, 1]` and stacks
+`[P(classes_[0]), P(classes_[1])]`. `predict()` returns
+`classes_[argmax(predict_proba(X), axis=1)]`.
+
+`score(X, y, sample_weight=None)` returns AUC, not accuracy. If
+`sample_weight` is supplied, rows with weight `<= 0` are dropped before
+computing AUC. Use `metrics(X, y)` for the full panel: `auc`, `pr_auc`,
+`brier`, `logloss`, `nagelkerke_r2`, and `ece`.
 
 ## Pipeline
 

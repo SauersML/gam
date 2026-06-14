@@ -2,6 +2,7 @@
 //! Newton solve that pins the baseline intercept slot for a row.
 
 use super::*;
+use crate::families::monotone_root;
 
 impl SurvivalMarginalSlopeFamily {
     pub(crate) fn solve_row_survival_intercept_with_slot(
@@ -37,7 +38,7 @@ impl SurvivalMarginalSlopeFamily {
                 .and_then(|cache| cache.load(row, kind, beta_tag))
         });
         let a_init = cached_a.unwrap_or(a_closed_form);
-        let mut solve_result = super::monotone_root::solve_monotone_root_detailed(
+        let mut solve_result = monotone_root::solve_monotone_root_detailed(
             eval,
             a_init,
             "survival intercept",
@@ -50,7 +51,7 @@ impl SurvivalMarginalSlopeFamily {
         // current root (e.g., after a large β step) that the bracketing search
         // exhausts; the closed-form seed always sits in the correct basin.
         if cached_a.is_some() && solve_result.is_err() {
-            solve_result = super::monotone_root::solve_monotone_root_detailed(
+            solve_result = monotone_root::solve_monotone_root_detailed(
                 eval,
                 a_closed_form,
                 "survival intercept",
@@ -148,6 +149,4 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok((a, abs_deriv))
     }
-
 }
-

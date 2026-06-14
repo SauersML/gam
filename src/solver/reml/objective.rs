@@ -2095,8 +2095,7 @@ impl<'a> RemlState<'a> {
         // backtracking and the cross-strategy cost comparison consume the
         // identical objective — closing the objective↔gradient desync on the EFS
         // arm too (#1122).
-        let efs_cost =
-            screening_residual_penalty(cost_result.cost, bundle.pirls_result.as_ref());
+        let efs_cost = screening_residual_penalty(cost_result.cost, bundle.pirls_result.as_ref());
         let gradient =
             cost_result
                 .gradient
@@ -2970,14 +2969,12 @@ impl<'a> RemlState<'a> {
     }
 }
 
-
 fn positive_penalty_rank_and_logdet(eigenvalues: &[f64]) -> (usize, f64) {
     let threshold = super::unified::positive_eigenvalue_threshold(eigenvalues);
     let rank = eigenvalues.iter().filter(|&&ev| ev > threshold).count();
     let log_det = super::unified::exact_pseudo_logdet(eigenvalues, threshold);
     (rank, log_det)
 }
-
 
 #[cfg(test)]
 mod tk_math_tests {
@@ -3613,7 +3610,6 @@ mod tk_math_tests {
     }
 }
 
-
 #[cfg(test)]
 mod adaptive_lm_lambda_tests {
     use super::adaptive_lm_lambda_hint;
@@ -3703,7 +3699,6 @@ mod adaptive_lm_lambda_tests {
         assert_eq!(adaptive_lm_lambda_hint(1e-5, 9, true), Some(1e-5));
     }
 }
-
 
 #[cfg(test)]
 mod ift_warm_start_tests {
@@ -4522,7 +4517,6 @@ mod ift_warm_start_tests {
     }
 }
 
-
 #[cfg(test)]
 mod tests_diagnostics {
     //! Diagnostic inherent-method extensions on `RemlState`.
@@ -4565,7 +4559,6 @@ mod tests_diagnostics {
         }
     }
 }
-
 
 #[cfg(test)]
 mod warm_start_key_stability_tests {

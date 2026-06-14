@@ -4,14 +4,12 @@
 // resolve through the parent namespace.
 use super::*;
 
-
 #[derive(Clone, Copy)]
 pub(crate) struct GamlssLambdaLayout {
     k_mean: usize,
     k_noise: usize,
     kwiggle: usize,
 }
-
 
 impl GamlssLambdaLayout {
     fn two_block(k_mean: usize, k_noise: usize) -> Self {
@@ -85,14 +83,12 @@ impl GamlssLambdaLayout {
     }
 }
 
-
 #[derive(Clone, Copy)]
 pub(crate) struct GamlssBetaLayout {
     pt: usize,
     pls: usize,
     pw: usize,
 }
-
 
 impl GamlssBetaLayout {
     fn withwiggle(pt: usize, pls: usize, pw: usize) -> Self {
@@ -126,7 +122,6 @@ impl GamlssBetaLayout {
     }
 }
 
-
 #[derive(Clone, Debug)]
 pub struct FamilyMetadata {
     pub name: &'static str,
@@ -134,13 +129,13 @@ pub struct FamilyMetadata {
     pub parameter_links: &'static [ParameterLink],
 }
 
-
 pub(crate) const DEFAULT_GAUGE_PRIORITY: u8 = 100;
 
 pub(crate) const LINK_WIGGLE_GAUGE_PRIORITY: u8 = 80;
 
-
-pub(crate) fn initial_log_lambdas_orzeros(block: &ParameterBlockInput) -> Result<Array1<f64>, String> {
+pub(crate) fn initial_log_lambdas_orzeros(
+    block: &ParameterBlockInput,
+) -> Result<Array1<f64>, String> {
     let k = block.penalties.len();
     let lambdas = block
         .initial_log_lambdas
@@ -158,7 +153,6 @@ pub(crate) fn initial_log_lambdas_orzeros(block: &ParameterBlockInput) -> Result
     }
     Ok(lambdas)
 }
-
 
 pub(crate) fn build_two_block_exact_joint_setup(
     data: ArrayView2<'_, f64>,
@@ -186,7 +180,6 @@ pub(crate) fn build_two_block_exact_joint_setup(
     // with the two linear predictors (mean, noise) in theta order.
     build_location_scale_exact_joint_setup(data, &[meanspec, noisespec], rho0vec, kappa_options)
 }
-
 
 pub(crate) fn solve_penalizedweighted_projection(
     design: &DesignMatrix,
@@ -263,7 +256,6 @@ pub(crate) fn solve_penalizedweighted_projection(
     Ok(beta)
 }
 
-
 pub(crate) fn gaussian_location_scalewarm_start(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -326,12 +318,10 @@ pub(crate) fn gaussian_location_scalewarm_start(
     Ok((betamu, beta_log_sigma, sigma_hat))
 }
 
-
 /// Total output count for every two-block location-scale family in this
 /// module (mu/log_sigma or threshold/log_sigma). The wiggle variants add a
 /// third zero-channel block but still drive only two output channels.
 pub(crate) const LOCATION_SCALE_N_OUTPUTS: usize = 2;
-
 
 /// Construct a fully wired location-scale parameter block.
 ///
@@ -386,7 +376,6 @@ pub(crate) fn build_location_scale_block(
     Ok(spec)
 }
 
-
 /// Construct the wiggle block that accompanies a two-block location-scale
 /// family. The wiggle modulates the inverse link nonlinearly and
 /// contributes no linear effective Jacobian — the installed callback
@@ -425,7 +414,6 @@ pub(crate) fn build_location_scale_wiggle_block(
     Ok(spec)
 }
 
-
 pub(crate) fn prepared_gaussian_log_sigma_design(
     mu_design: &DesignMatrix,
     log_sigma_design: &DesignMatrix,
@@ -453,7 +441,6 @@ pub(crate) fn prepared_gaussian_log_sigma_design(
     Ok(log_sigma_design.clone())
 }
 
-
 pub(crate) fn identified_binomial_log_sigma_design(
     threshold_design: &TermCollectionDesign,
     log_sigma_design: &TermCollectionDesign,
@@ -476,7 +463,6 @@ pub(crate) fn identified_binomial_log_sigma_design(
     )
 }
 
-
 pub(crate) fn identity_penalty(dim: usize) -> Array2<f64> {
     let mut penalty = Array2::<f64>::zeros((dim, dim));
     for i in 0..dim {
@@ -484,7 +470,6 @@ pub(crate) fn identity_penalty(dim: usize) -> Array2<f64> {
     }
     penalty
 }
-
 
 /// Orthogonal projector `P₀ = U₀U₀ᵀ` onto the joint null space of the supplied
 /// penalty blocks over a `dim`-column coefficient space.
@@ -565,8 +550,9 @@ pub(crate) fn penalty_nullspace_projector(penalties: &[PenaltyMatrix], dim: usiz
     projector
 }
 
-
-pub(crate) fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectionDesign) {
+pub(crate) fn append_binomial_log_sigma_shrinkage_penalty_design(
+    design: &mut TermCollectionDesign,
+) {
     let p = design.design.ncols();
     design
         .penalties
@@ -588,7 +574,6 @@ pub(crate) fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut Te
         },
     });
 }
-
 
 /// Build the (mean, log-σ) parameter-block pair for a Gaussian location-scale
 /// family. Shared verbatim by the non-wiggle and wiggle Gaussian builders so the
@@ -679,7 +664,6 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
     Ok((meanspec, noisespec))
 }
 
-
 /// Build the (threshold, log-σ) parameter-block pair for a Binomial
 /// location-scale family. Shared by the non-wiggle and wiggle Binomial builders;
 /// mirrors [`build_gaussian_mean_and_scale_blocks`] but with the binomial-
@@ -750,11 +734,12 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     Ok((thresholdspec, log_sigmaspec))
 }
 
-
 /// Convert a wiggle block's `PenaltySpec`s into the `PenaltyMatrix` list the
 /// location-scale wiggle block expects. Shared by the Gaussian and Binomial
 /// wiggle builders, which previously inlined the identical match.
-pub(crate) fn wiggle_block_penalty_matrices(wiggle_block: &ParameterBlockInput) -> Vec<PenaltyMatrix> {
+pub(crate) fn wiggle_block_penalty_matrices(
+    wiggle_block: &ParameterBlockInput,
+) -> Vec<PenaltyMatrix> {
     let p_wiggle = wiggle_block.design.ncols();
     wiggle_block
         .penalties
@@ -775,7 +760,6 @@ pub(crate) fn wiggle_block_penalty_matrices(wiggle_block: &ParameterBlockInput) 
         .collect()
 }
 
-
 pub(crate) fn binomial_location_scale_link_eta_from_probability(
     link_kind: &InverseLink,
     probability: f64,
@@ -792,8 +776,10 @@ pub(crate) fn binomial_location_scale_link_eta_from_probability(
     }
 }
 
-
-pub(crate) fn weighted_binomial_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> Result<f64, String> {
+pub(crate) fn weighted_binomial_prevalence(
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+) -> Result<f64, String> {
     if y.len() != weights.len() {
         return Err(GamlssError::DimensionMismatch { reason: format!(
             "binomial location-scale warm start dimension mismatch: y has length {}, weights have length {}",
@@ -826,7 +812,6 @@ pub(crate) fn weighted_binomial_prevalence(y: &Array1<f64>, weights: &Array1<f64
     Ok(success_sum / weight_sum)
 }
 
-
 pub(crate) fn project_constant_eta_into_block(
     block: &ParameterBlockSpec,
     weights: &Array1<f64>,
@@ -843,7 +828,6 @@ pub(crate) fn project_constant_eta_into_block(
         1e-10,
     )
 }
-
 
 // Deterministic warm start for the binomial location-scale model. This stays
 // out of the optimizer: it projects a prevalence-matched threshold and neutral
@@ -876,7 +860,6 @@ pub(crate) fn binomial_location_scalewarm_start(
     Ok((beta_threshold, beta_log_sigma))
 }
 
-
 #[derive(Clone)]
 pub(crate) struct BinomialMeanWiggleSpec {
     pub y: Array1<f64>,
@@ -888,7 +871,6 @@ pub(crate) struct BinomialMeanWiggleSpec {
     pub wiggle_block: ParameterBlockInput,
 }
 
-
 #[derive(Clone)]
 pub struct GaussianLocationScaleTermSpec {
     pub y: Array1<f64>,
@@ -898,7 +880,6 @@ pub struct GaussianLocationScaleTermSpec {
     pub mean_offset: Array1<f64>,
     pub log_sigma_offset: Array1<f64>,
 }
-
 
 #[derive(Clone)]
 pub struct GaussianLocationScaleWiggleTermSpec {
@@ -913,7 +894,6 @@ pub struct GaussianLocationScaleWiggleTermSpec {
     pub wiggle_block: ParameterBlockInput,
 }
 
-
 #[derive(Clone)]
 pub struct BinomialLocationScaleTermSpec {
     pub y: Array1<f64>,
@@ -924,7 +904,6 @@ pub struct BinomialLocationScaleTermSpec {
     pub threshold_offset: Array1<f64>,
     pub log_sigma_offset: Array1<f64>,
 }
-
 
 #[derive(Clone)]
 pub struct BinomialLocationScaleWiggleTermSpec {
@@ -940,7 +919,6 @@ pub struct BinomialLocationScaleWiggleTermSpec {
     pub wiggle_block: ParameterBlockInput,
 }
 
-
 #[derive(Clone, Debug)]
 pub struct BlockwiseTermFitResult {
     pub fit: UnifiedFitResult,
@@ -950,7 +928,6 @@ pub struct BlockwiseTermFitResult {
     pub noise_design: TermCollectionDesign,
 }
 
-
 pub(crate) struct BlockwiseTermFitResultParts {
     pub fit: UnifiedFitResult,
     pub meanspec_resolved: TermCollectionSpec,
@@ -959,13 +936,11 @@ pub(crate) struct BlockwiseTermFitResultParts {
     pub noise_design: TermCollectionDesign,
 }
 
-
 pub struct BlockwiseTermWiggleFitResult {
     pub fit: BlockwiseTermFitResult,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
 }
-
 
 pub struct BinomialMeanWiggleTermFitResult {
     pub fit: UnifiedFitResult,
@@ -975,13 +950,11 @@ pub struct BinomialMeanWiggleTermFitResult {
     pub wiggle_degree: usize,
 }
 
-
 pub(crate) struct BlockwiseTermWiggleFitResultParts {
     pub fit: BlockwiseTermFitResult,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
 }
-
 
 pub(crate) fn validate_term_collection_design(
     label: &str,
@@ -1094,7 +1067,6 @@ pub(crate) fn validate_term_collection_design(
     Ok(())
 }
 
-
 impl BlockwiseTermFitResult {
     pub(crate) fn try_from_parts(parts: BlockwiseTermFitResultParts) -> Result<Self, String> {
         let BlockwiseTermFitResultParts {
@@ -1190,7 +1162,6 @@ impl BlockwiseTermFitResult {
     }
 }
 
-
 impl BlockwiseTermWiggleFitResult {
     fn try_from_parts(parts: BlockwiseTermWiggleFitResultParts) -> Result<Self, String> {
         let BlockwiseTermWiggleFitResultParts {
@@ -1230,14 +1201,12 @@ impl BlockwiseTermWiggleFitResult {
     }
 }
 
-
 pub struct BinomialLocationScaleFitResult {
     pub fit: BlockwiseTermFitResult,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
     pub beta_link_wiggle: Option<Vec<f64>>,
 }
-
 
 pub struct GaussianLocationScaleFitResult {
     pub fit: BlockwiseTermFitResult,
@@ -1274,7 +1243,6 @@ pub struct GaussianLocationScaleFitResult {
     /// `1.0` when no standardization was needed (degenerate constant response).
     pub response_scale: f64,
 }
-
 
 pub(crate) fn fit_binomial_mean_wiggle(
     spec: BinomialMeanWiggleSpec,
@@ -1345,7 +1313,6 @@ pub(crate) fn fit_binomial_mean_wiggle(
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
 }
 
-
 pub(crate) trait LocationScaleFamilyBuilder {
     type Family: CustomFamily + Clone + Send + Sync + 'static;
 
@@ -1405,7 +1372,6 @@ pub(crate) trait LocationScaleFamilyBuilder {
         term_design2: &TermCollectionDesign,
     ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String>;
 }
-
 
 pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     data: ndarray::ArrayView2<'_, f64>,
@@ -1895,7 +1861,6 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     })
 }
 
-
 pub(crate) struct GaussianLocationScaleTermBuilder {
     y: Array1<f64>,
     weights: Array1<f64>,
@@ -1904,7 +1869,6 @@ pub(crate) struct GaussianLocationScaleTermBuilder {
     mean_offset: Array1<f64>,
     noise_offset: Array1<f64>,
 }
-
 
 impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
     type Family = GaussianLocationScaleFamily;
@@ -2021,7 +1985,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
     }
 }
 
-
 pub(crate) struct GaussianLocationScaleWiggleTermBuilder {
     y: Array1<f64>,
     weights: Array1<f64>,
@@ -2033,7 +1996,6 @@ pub(crate) struct GaussianLocationScaleWiggleTermBuilder {
     wiggle_degree: usize,
     wiggle_block: ParameterBlockInput,
 }
-
 
 impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
     type Family = GaussianLocationScaleWiggleFamily;
@@ -2170,7 +2132,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
     }
 }
 
-
 pub(crate) struct BinomialLocationScaleTermBuilder {
     y: Array1<f64>,
     weights: Array1<f64>,
@@ -2180,7 +2141,6 @@ pub(crate) struct BinomialLocationScaleTermBuilder {
     mean_offset: Array1<f64>,
     noise_offset: Array1<f64>,
 }
-
 
 impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
     type Family = BinomialLocationScaleFamily;
@@ -2290,7 +2250,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
     }
 }
 
-
 pub(crate) struct BinomialLocationScaleWiggleTermBuilder {
     y: Array1<f64>,
     weights: Array1<f64>,
@@ -2303,7 +2262,6 @@ pub(crate) struct BinomialLocationScaleWiggleTermBuilder {
     wiggle_degree: usize,
     wiggle_block: ParameterBlockInput,
 }
-
 
 impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
     type Family = BinomialLocationScaleWiggleFamily;
@@ -2439,7 +2397,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
     }
 }
 
-
 pub(crate) fn fit_gaussian_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: GaussianLocationScaleTermSpec,
@@ -2461,7 +2418,6 @@ pub(crate) fn fit_gaussian_location_scale_terms(
         kappa_options,
     )
 }
-
 
 pub(crate) fn fit_gaussian_location_scalewiggle_terms(
     data: ndarray::ArrayView2<'_, f64>,
@@ -2492,7 +2448,6 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms(
     )
 }
 
-
 pub(crate) fn select_gaussian_location_scale_link_wiggle_basis_from_pilot(
     pilot: &BlockwiseTermFitResult,
     wiggle_cfg: &WiggleBlockConfig,
@@ -2507,7 +2462,6 @@ pub(crate) fn select_gaussian_location_scale_link_wiggle_basis_from_pilot(
         .view();
     select_wiggle_basis_from_seed(q_seed, wiggle_cfg, wiggle_penalty_orders)
 }
-
 
 pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
     data: ndarray::ArrayView2<'_, f64>,
@@ -2546,7 +2500,6 @@ pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
     })
 }
 
-
 pub(crate) fn fit_binomial_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: BinomialLocationScaleTermSpec,
@@ -2569,7 +2522,6 @@ pub(crate) fn fit_binomial_location_scale_terms(
         kappa_options,
     )
 }
-
 
 pub(crate) fn fit_binomial_location_scalewiggle_terms(
     data: ndarray::ArrayView2<'_, f64>,
@@ -2601,7 +2553,6 @@ pub(crate) fn fit_binomial_location_scalewiggle_terms(
     )
 }
 
-
 pub(crate) fn select_binomial_location_scale_link_wiggle_basis_from_pilot(
     pilot: &BlockwiseTermFitResult,
     wiggle_cfg: &WiggleBlockConfig,
@@ -2625,7 +2576,6 @@ pub(crate) fn select_binomial_location_scale_link_wiggle_basis_from_pilot(
     let q_seed = Array1::from_iter(eta_t.iter().zip(sigma.iter()).map(|(&t, &s)| -t / s));
     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
 }
-
 
 pub(crate) fn fit_binomial_location_scale_terms_with_selected_wiggle(
     data: ndarray::ArrayView2<'_, f64>,
@@ -2665,7 +2615,6 @@ pub(crate) fn fit_binomial_location_scale_terms_with_selected_wiggle(
     })
 }
 
-
 pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
     pilot_design: &TermCollectionDesign,
     pilot_fit: &UnifiedFitResult,
@@ -2675,7 +2624,6 @@ pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
     let q_seed = pilot_design.design.dot(&pilot_fit.beta);
     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
 }
-
 
 pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     data: ndarray::ArrayView2<'_, f64>,
@@ -3231,4 +3179,3 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         wiggle_degree,
     })
 }
-

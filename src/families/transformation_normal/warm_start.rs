@@ -11,7 +11,7 @@ use super::*;
 /// least-squares solve fits the wrong parameterization, so the warm start
 /// initializes shape rows to a positive constant derivative scale and then
 /// solves only the location row `b(x)` against the remaining affine target.
-fn compute_warm_start(
+pub(crate) fn compute_warm_start(
     response: &Array1<f64>,
     weights: &Array1<f64>,
     offset: &Array1<f64>,
@@ -151,7 +151,6 @@ fn compute_warm_start(
     Ok(beta)
 }
 
-
 fn estimate_default_warm_start(
     response: &Array1<f64>,
     weights: &Array1<f64>,
@@ -227,8 +226,7 @@ fn estimate_default_warm_start(
     Ok(TransformationWarmStart { location, scale })
 }
 
-
-fn calibrate_transformation_scores(
+pub(crate) fn calibrate_transformation_scores(
     family: &TransformationNormalFamily,
     mut fit: UnifiedFitResult,
 ) -> Result<(UnifiedFitResult, TransformationScoreCalibration), String> {
@@ -283,5 +281,3 @@ fn calibrate_transformation_scores(
     fit.deviance = -2.0 * row_quantities.log_likelihood;
     Ok((fit, TransformationScoreCalibration::finite_support_pit()))
 }
-
-

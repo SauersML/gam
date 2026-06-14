@@ -21,7 +21,6 @@ pub enum SparsityKind {
     Log { delta: f64 },
 }
 
-
 /// Sparsity penalty on a slice of β (SAE codes) or ext-coords (soft atom assignments).
 ///
 /// The smoothed-L¹ default `Σ_i sqrt(x_i² + ε²)` is the simplest analytic
@@ -49,7 +48,6 @@ pub struct SparsityPenalty {
     pub eps_rho_index: Option<usize>,
 }
 
-
 /// Entropy sparsity over row-wise softmax assignment logits.
 ///
 /// This is the SAE-manifold soft-assignment penalty. The target is a flat
@@ -72,7 +70,6 @@ pub struct SoftmaxAssignmentSparsityPenalty {
     pub weight: f64,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl SoftmaxAssignmentSparsityPenalty {
     #[must_use]
@@ -240,7 +237,6 @@ impl SoftmaxAssignmentSparsityPenalty {
         dh
     }
 }
-
 
 impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     fn tier(&self) -> PenaltyTier {
@@ -432,8 +428,6 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     impl_scalar_apply_schedule!(weight);
 }
 
-
-
 impl SparsityPenalty {
     #[must_use = "build error must be handled"]
     pub fn smoothed_l1(target_tier: PenaltyTier, eps: f64) -> Result<Self, String> {
@@ -512,7 +506,6 @@ impl SparsityPenalty {
         (strength, smoothing)
     }
 }
-
 
 impl AnalyticPenalty for SparsityPenalty {
     fn tier(&self) -> PenaltyTier {
@@ -804,8 +797,6 @@ impl AnalyticPenalty for SparsityPenalty {
     impl_scalar_apply_schedule!(weight);
 }
 
-
-
 // ---------------------------------------------------------------------------
 // TopK activation penalty
 // ---------------------------------------------------------------------------
@@ -818,7 +809,6 @@ pub struct TopKActivationPenalty {
     pub weight: f64,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl TopKActivationPenalty {
     #[must_use = "build error must be handled"]
@@ -866,7 +856,6 @@ impl TopKActivationPenalty {
         }
     }
 }
-
 
 impl AnalyticPenalty for TopKActivationPenalty {
     fn tier(&self) -> PenaltyTier {
@@ -953,7 +942,6 @@ impl AnalyticPenalty for TopKActivationPenalty {
     impl_scalar_apply_schedule!(weight);
 }
 
-
 // ---------------------------------------------------------------------------
 // JumpReLU penalty
 // ---------------------------------------------------------------------------
@@ -967,7 +955,6 @@ pub struct JumpReLUPenalty {
     pub smoothing_eps: f64,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl JumpReLUPenalty {
     #[must_use = "build error must be handled"]
@@ -1062,7 +1049,6 @@ impl JumpReLUPenalty {
     }
 }
 
-
 /// JumpReLU activation gate `φ(z) = z · 1[z > τ]` together with the
 /// straight-through-estimator derivatives of its smooth surrogate
 /// `φ̃(z) = z · σ((z − τ)/ε)`. The forward value is the hard gate; the backward
@@ -1086,7 +1072,6 @@ pub fn jumprelu_gate_value_grad(z: f64, tau: f64, smoothing_eps: f64) -> (f64, f
     let dphi_dtau = -slope;
     (value, dphi_dz, dphi_dtau)
 }
-
 
 impl AnalyticPenalty for JumpReLUPenalty {
     fn tier(&self) -> PenaltyTier {
@@ -1214,5 +1199,3 @@ impl AnalyticPenalty for JumpReLUPenalty {
 
     impl_scalar_apply_schedule!(weight);
 }
-
-

@@ -11,8 +11,6 @@ pub(crate) fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, us
         .collect()
 }
 
-
-
 /// Build the joint Jeffreys/Firth basis `Z_J` (block-diagonal stack of each
 /// block's per-block span) for the universal robustness term.
 ///
@@ -72,8 +70,6 @@ pub(crate) fn build_joint_jeffreys_subspace(
     }
     Ok(Some(z_joint))
 }
-
-
 
 /// CHEAP, matrix-free conditioning pre-check: can the always-on Jeffreys term be
 /// PROVABLY skipped at this working point WITHOUT forming the dense joint Hessian
@@ -137,8 +133,6 @@ pub(crate) fn jeffreys_term_skippable_for_source(
     crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(hv, total_p)
 }
 
-
-
 /// Evaluate ONLY the Jeffreys objective value `Phi = 1/2 log|Z_J^T H Z_J|` at
 /// the current working point. Cheaper than the full term (no directional
 /// derivatives), used to keep the trust-region accept/reject objective
@@ -147,7 +141,9 @@ pub(crate) fn jeffreys_term_skippable_for_source(
 /// or the reduced Fisher information is not yet SPD (the value contribution is
 /// then simply omitted for that trial point — the step machinery still bounds
 /// the coefficient, and the next accepted cycle re-folds a finite value).
-pub(crate) fn custom_family_joint_jeffreys_value<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn custom_family_joint_jeffreys_value<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
@@ -171,8 +167,6 @@ pub(crate) fn custom_family_joint_jeffreys_value<F: CustomFamily + Clone + Send 
         Err(_) => 0.0,
     }
 }
-
-
 
 /// Evaluate the family-general Jeffreys term `(Phi, grad, H_Phi)` at the current
 /// working point from the coupled joint Hessian (Tier-B path). Returns `None`
@@ -209,33 +203,22 @@ pub(crate) fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send +
     Ok(Some(term))
 }
 
-
-
 pub(crate) const JEFFREYS_REDUCED_INFO_RELATIVE_FLOOR: f64 = 1e-10;
-
 
 pub(crate) const JEFFREYS_REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 
-
 pub(crate) const JEFFREYS_CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
-
 
 pub(crate) const JEFFREYS_CONDITIONING_GATE_ABSOLUTE: f64 = 1.0;
 
-
 pub(crate) const JEFFREYS_CONDITIONING_GATE_ABSOLUTE_CLEAR: f64 = 16.0;
 
-
 pub(crate) const JEFFREYS_CONDITIONING_GATE_RELATIVE_CLEAR: f64 = 1e-6;
-
-
 
 #[inline]
 pub(crate) fn custom_family_jeffreys_cap(floor: f64) -> f64 {
     JEFFREYS_CONDITIONING_GATE_ABSOLUTE_CLEAR.max(floor)
 }
-
-
 
 #[inline]
 pub(crate) fn custom_family_jeffreys_floored_inverse(lam: f64, floor: f64) -> f64 {
@@ -252,10 +235,11 @@ pub(crate) fn custom_family_jeffreys_floored_inverse(lam: f64, floor: f64) -> f6
     }
 }
 
-
-
 #[inline]
-pub(crate) fn custom_family_jeffreys_conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
+pub(crate) fn custom_family_jeffreys_conditioning_gate_weight(
+    lambda_min: f64,
+    lambda_max: f64,
+) -> f64 {
     if lambda_max <= 0.0 || !lambda_min.is_finite() {
         return 1.0;
     }
@@ -283,8 +267,6 @@ pub(crate) fn custom_family_jeffreys_conditioning_gate_weight(lambda_min: f64, l
     );
     w_abs.max(w_rel)
 }
-
-
 
 pub(crate) fn custom_family_joint_jeffreys_contract_weight(
     h_joint: ndarray::ArrayView2<'_, f64>,
@@ -347,8 +329,6 @@ pub(crate) fn custom_family_joint_jeffreys_contract_weight(
     Ok(Some((gate_weight, weight_full)))
 }
 
-
-
 pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -398,8 +378,6 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
         None => Ok(None),
     }
 }
-
-
 
 /// Outer-REML full-span Jeffreys curvature `H_Φ` for the coupled joint Hessian.
 /// Returns `None` when there is no coefficient system or the family exposes no
@@ -483,8 +461,6 @@ pub(crate) fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send +
     Ok(Some((phi, hphi, completion)))
 }
 
-
-
 pub(crate) fn batched_outer_gradient_contract_allows_override(
     robust_jeffreys_hphi: Option<&Array2<f64>>,
 ) -> bool {
@@ -493,8 +469,6 @@ pub(crate) fn batched_outer_gradient_contract_allows_override(
         Some(hphi) => hphi.iter().all(|value| *value == 0.0),
     }
 }
-
-
 
 /// Build the Tier-B Jeffreys-curvature drift closure `D_β H_Φ[δβ]` for the outer
 /// gradient, evaluated at the current outer point (states = β̂(ρ)).
@@ -516,7 +490,9 @@ pub(crate) fn batched_outer_gradient_contract_allows_override(
 /// pseudo-inverse inside `joint_jeffreys_hphi_directional_derivative` reproduce
 /// the value path's, so when the value's `H_Φ` is zero (gated/clean fit) the
 /// drift is identically zero too.
-pub(crate) fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn custom_family_outer_jeffreys_hphi_drift<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],

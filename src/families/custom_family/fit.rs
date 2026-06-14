@@ -13,8 +13,6 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     fit_custom_family_with_rho_prior(family, specs, options, crate::types::RhoPrior::Flat)
 }
 
-
-
 /// Lift reduced-space `ParameterBlockState`s back to the raw block
 /// dimensions described by `canonical.gauge`. Each block's
 /// `beta` becomes `T_i · θ_i` (selection-T zeros dropped raw entries);
@@ -35,8 +33,6 @@ pub(crate) fn lift_block_states_to_raw(
         })
         .collect()
 }
-
-
 
 /// Lift a reduced-space conditional covariance / joint geometry pair
 /// back to the raw coordinate system by sandwiching with the joint
@@ -63,8 +59,6 @@ pub(crate) fn lift_fit_geometry_to_raw(
     (lifted_cov, lifted_geom)
 }
 
-
-
 pub(crate) struct BlockwiseFitAssembly<'a> {
     rho_physical: Array1<f64>,
     covariance_conditional: Option<Array2<f64>>,
@@ -78,8 +72,6 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     outer_converged: bool,
     context: &'static str,
 }
-
-
 
 pub(crate) fn assemble_custom_family_fit_result(
     inner: BlockwiseInnerResult,
@@ -137,8 +129,6 @@ pub(crate) fn assemble_custom_family_fit_result(
     )
     .map_err(|reason| CustomFamilyError::Optimization { context, reason })
 }
-
-
 
 /// Install the channel-aware `AdditiveBlockJacobian` callbacks declared by a
 /// family's [`CustomFamily::output_channel_assignment`].
@@ -205,8 +195,6 @@ pub(crate) fn wire_output_channels<F: CustomFamily + ?Sized>(
     Ok(Some(wired))
 }
 
-
-
 /// True iff an outer-smoothing `Err` is a POST-AUDIT NUMERICAL pathology that
 /// the never-fail posterior-sampling rung can recover from (gam#860), rather
 /// than an ill-posed input that must keep raising.
@@ -262,8 +250,6 @@ pub(crate) fn outer_startup_failure_is_escalatable(err: &EstimationError) -> boo
     }
 }
 
-
-
 /// Minimum effective degrees of freedom a penalized term must retain in the
 /// outer λ-selection. One effective dimension is the smallest non-arbitrary
 /// floor: it asserts the penalized component must explain at least ONE effective
@@ -272,8 +258,6 @@ pub(crate) fn outer_startup_failure_is_escalatable(err: &EstimationError) -> boo
 /// boundary between "the smooth contributes" and "the smooth is statistically
 /// indistinguishable from its null-space limit".
 pub(crate) const EFFECTIVE_DF_FLOOR: f64 = 1.0;
-
-
 
 /// Unit-weight effective degrees of freedom of a single penalized term as a
 /// function of `ρ = log λ`, expressed through the design/penalty generalized
@@ -296,8 +280,6 @@ pub(crate) fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> f64 {
         .map(|&g| if g > 0.0 { g / (g + lambda) } else { 0.0 })
         .sum()
 }
-
-
 
 /// Generalized eigenvalues `γ_j` of the design column Gram `G = XᵀX` against the
 /// penalty `S` on `range(S)`, computed structurally (unit weights).
@@ -329,7 +311,10 @@ pub(crate) fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> f64 {
 /// penalties are expanded, but `Blockwise`/total-dim penalties whose dense form
 /// is not `p×p` are skipped rather than risk a mis-projected curvature that could
 /// bias the REML selection.
-pub(crate) fn design_penalty_range_gammas(design: &DesignMatrix, penalty: &PenaltyMatrix) -> Option<Vec<f64>> {
+pub(crate) fn design_penalty_range_gammas(
+    design: &DesignMatrix,
+    penalty: &PenaltyMatrix,
+) -> Option<Vec<f64>> {
     let p = design.ncols();
     if p == 0 {
         return None;
@@ -411,8 +396,6 @@ pub(crate) fn design_penalty_range_gammas(design: &DesignMatrix, penalty: &Penal
     Some(gammas)
 }
 
-
-
 /// Per-outer-coordinate ρ UPPER bound enforcing the effective-df floor.
 ///
 /// For each penalized term, the structural unit-weight edf `Σ_j γ_j/(γ_j+e^ρ)`
@@ -492,8 +475,6 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
     }
     upper
 }
-
-
 
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -1636,8 +1617,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     )
 }
 
-
-
 pub(crate) fn fit_custom_family_fixed_log_lambdas<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -1704,8 +1683,6 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
         },
     )
 }
-
-
 
 pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
     F: CustomFamily + Clone + Send + Sync + 'static,

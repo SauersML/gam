@@ -1,6 +1,5 @@
 use super::*;
 
-
 fn reconstruction_explained_variance(
     target: ArrayView2<'_, f64>,
     fitted: ArrayView2<'_, f64>,
@@ -36,7 +35,6 @@ fn reconstruction_explained_variance(
         None
     }
 }
-
 
 /// Outer REML objective for the SAE-manifold term.
 ///
@@ -76,7 +74,6 @@ pub struct SaeManifoldOuterObjective {
     /// β, the next inner solve opens from it instead of cold.
     seeded_beta: Option<Array1<f64>>,
 }
-
 
 impl SaeManifoldOuterObjective {
     pub fn new(
@@ -871,7 +868,6 @@ impl SaeManifoldOuterObjective {
     }
 }
 
-
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let plan = self.term.streaming_plan();
@@ -1092,7 +1088,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 }
 
-
 fn sae_manifold_newton_directional_decrease(
     sys: &ArrowSchurSystem,
     delta_ext_coord: ArrayView1<'_, f64>,
@@ -1114,7 +1109,6 @@ fn sae_manifold_newton_directional_decrease(
     }
     -gradient_dot_step
 }
-
 
 /// Per-atom decoder-smoothness GEMM `S_k · B_k`, batched across ALL GPUs.
 ///
@@ -1266,7 +1260,6 @@ fn batched_smooth_sb(
         .collect()
 }
 
-
 /// A detected bifurcation on the curvature-homotopy branch (#1007): the arrow
 /// factor's smallest Cholesky pivot collapsed below the safe-SPD tolerance at a
 /// homotopy parameter `η`, so the optimal branch the tracker was following lost
@@ -1280,7 +1273,6 @@ pub struct CurvatureBifurcation {
     /// squared lower-Cholesky diagonal); below the safe-SPD floor.
     pub min_pivot: f64,
 }
-
 
 /// Outcome of one certified curvature-homotopy entry walk (#1007).
 ///
@@ -1316,7 +1308,6 @@ pub struct CurvatureWalkReport {
     pub reseeds: usize,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct LinearSpanAtomAnchor {
     pub gate_weight: f64,
@@ -1325,14 +1316,12 @@ pub struct LinearSpanAtomAnchor {
     pub singular_values: Array1<f64>,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct LinearSpanAnchor {
     pub atoms: Vec<LinearSpanAtomAnchor>,
     pub reconstruction: Array2<f64>,
     pub residual_norm_sq: f64,
 }
-
 
 /// Curvature-homotopy linear-span anchor at `eta = 0`.
 ///
@@ -1419,7 +1408,6 @@ pub fn linear_span_anchor(
     })
 }
 
-
 fn sae_cholesky_solve_neg_gradient(
     h: ArrayView2<'_, f64>,
     g: ArrayView1<'_, f64>,
@@ -1472,14 +1460,12 @@ fn sae_cholesky_solve_neg_gradient(
     Ok(x)
 }
 
-
 fn solve_basis_transport(
     new_phi: ArrayView2<'_, f64>,
     old_phi: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, String> {
     solve_design_least_squares(new_phi, old_phi)
 }
-
 
 fn transport_smooth_penalty_for_decoder(
     decoder_transport: ArrayView2<'_, f64>,
@@ -1505,7 +1491,6 @@ fn transport_smooth_penalty_for_decoder(
         &fast_ab(&old_smooth_penalty.to_owned(), &transport_inverse),
     ))
 }
-
 
 pub(crate) fn solve_design_least_squares(
     design: ArrayView2<'_, f64>,
@@ -1540,3 +1525,4 @@ pub(crate) fn solve_design_least_squares(
         }
     }
     Ok(vt.t().dot(&scaled))
+}

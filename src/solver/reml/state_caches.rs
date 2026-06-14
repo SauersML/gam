@@ -1,6 +1,5 @@
 use super::*;
 
-
 pub(crate) const TK_BLOCK_SIZE: usize = 128;
 
 /// Upper bound on the parallel row-chunk length for the TK accumulation, so a
@@ -67,14 +66,12 @@ pub(crate) const HGB_SENS_FLOOR: f64 = 1e-6;
 
 pub(crate) const IFT_QUALITY_HISTORY_CAP: usize = 5;
 
-
 /// Clamp bound on a linear predictor `eta` so `exp(eta)` cannot overflow f64
 /// (`exp` overflows near `709`). Mirrors the canonical PIRLS `ETA_CLAMP`; kept
 /// as a local const because that one is private to the `pirls` module. Used to
 /// detect out-of-range η rows when materializing the logit fifth-derivative
 /// channel (an out-of-range row contributes zero rather than a garbage jet).
 pub(crate) const ETA_OVERFLOW_CLAMP: f64 = 700.0;
-
 
 /// Rolling-quality bands and step-cap adjustment factors for the IFT step-cap
 /// controller (`record_ift_prediction_quality`). `quality` is the relative
@@ -92,7 +89,6 @@ pub(crate) const IFT_STEP_CAP_GROW_FACTOR: f64 = 1.5;
 
 pub(crate) const IFT_STEP_CAP_SHRINK_FACTOR: f64 = 0.5;
 
-
 // KKT residual acceptance tolerances for the active-set inner solver.
 // Primal/dual/complementarity are checked at 1e-7 (matches the inner
 // barrier-stopping tolerance used in PIRLS); stationarity uses a looser
@@ -106,20 +102,17 @@ pub(crate) const KKT_TOL_COMP: f64 = 1e-7;
 
 pub(crate) const KKT_TOL_STAT: f64 = 5e-6;
 
-
 // Slack threshold below which a linear-inequality constraint Aβ ≥ b is
 // considered active when extracting the constraint-free tangent basis.
 // Chosen ~3 orders of magnitude above f64 roundoff on the dot product so
 // constraints that just-touch within IRLS roundoff are correctly flagged.
 pub(crate) const ACTIVE_CONSTRAINT_SLACK_TOL: f64 = 1e-8;
 
-
 // Norm threshold for accepting a Gram–Schmidt residual as a basis
 // direction when orthonormalising active-row vectors / null-space
 // directions. One order of magnitude below ACTIVE_CONSTRAINT_SLACK_TOL
 // because we are comparing squared-norm residuals after subtraction.
 pub(crate) const ORTHONORM_DROP_TOL: f64 = 1e-10;
-
 
 #[derive(Debug, Clone)]
 pub(crate) struct AloStabilizationEval {
@@ -129,7 +122,6 @@ pub(crate) struct AloStabilizationEval {
     pub(crate) max_leverage: f64,
     pub(crate) min_denominator: f64,
 }
-
 
 // --- ALO-stabilization constants (conservative stabilization choices) ---
 //
@@ -229,7 +221,6 @@ const ALO_DEVIANCE_SATURATION: f64 = 9.0;
 // gate-off path).
 const ALO_GRADIENT_MAX_WORK: usize = 4_000_000;
 
-
 /// Shared factorization of the stabilized penalized Hessian, computed once on
 /// the value path and threaded into the ALO ρ-gradient so the gradient never
 /// re-materializes dense `X` or re-factorizes the same matrix (#862). The
@@ -244,12 +235,10 @@ struct AloFactoredHessian<'a> {
     h_inv_xt: &'a Array2<f64>,
 }
 
-
 fn alo_leverage_barrier(h: f64) -> f64 {
     let excess = (h - ALO_MAX_LEVERAGE_THRESHOLD).max(0.0);
     excess * excess
 }
-
 
 fn alo_leverage_barrier_derivative(h: f64) -> f64 {
     if h > ALO_MAX_LEVERAGE_THRESHOLD {
@@ -259,14 +248,12 @@ fn alo_leverage_barrier_derivative(h: f64) -> f64 {
     }
 }
 
-
 /// Raw standardized leave-one-out deviance contribution
 /// d = w·(y − η̃)²/φ for one observation, before saturation.
 fn gaussian_alo_raw_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
     let residual = y - eta_loo;
     prior_weight * residual * residual / phi.max(f64::MIN_POSITIVE)
 }
-
 
 /// Saturated per-observation Gaussian ALO deviance contribution
 /// g(d) = cap·tanh(d/cap) with d the raw standardized squared LOO residual.
@@ -279,7 +266,6 @@ fn gaussian_alo_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f
     ALO_DEVIANCE_SATURATION * (raw / ALO_DEVIANCE_SATURATION).tanh()
 }
 
-
 /// Saturator derivative g'(d) = 1 − tanh²(d/cap) evaluated at the raw
 /// standardized squared LOO residual `raw`. Used to chain-rule the analytic
 /// ρ-gradient of the saturated deviance term: ∂g(d_i)/∂η̃_i = g'(d_i)·∂d_i/∂η̃_i.
@@ -287,7 +273,6 @@ fn gaussian_alo_deviance_saturation_factor(raw: f64) -> f64 {
     let t = (raw / ALO_DEVIANCE_SATURATION).tanh();
     1.0 - t * t
 }
-
 
 fn transformed_penalty_matvec(
     penalty: &crate::construction::CanonicalPenalty,
@@ -301,7 +286,6 @@ fn transformed_penalty_matvec(
         .assign(&local);
     out
 }
-
 
 impl EvalShared {
     /// Canonical penalty scores `S_k β̂` at this bundle's inner mode
@@ -350,26 +334,21 @@ impl EvalShared {
     }
 }
 
-
 static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> = OnceLock::new();
 
 static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
-
 
 fn outer_ift_residual_energy_cache() -> &'static Mutex<HashMap<Vec<u64>, (f64, u64)>> {
     OUTER_IFT_RESIDUAL_ENERGY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-
 pub(crate) fn record_current_outer_iter_for_ift(iter: u64) {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.store(iter, Ordering::Relaxed);
 }
 
-
 pub(crate) fn current_outer_iter() -> u64 {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.load(Ordering::Relaxed)
 }
-
 
 pub(crate) fn clear_outer_ift_residual_energy_for_fit() {
     if let Some(cache) = OUTER_IFT_RESIDUAL_ENERGY.get()
@@ -379,7 +358,6 @@ pub(crate) fn clear_outer_ift_residual_energy_for_fit() {
     }
     OUTER_IFT_RESIDUAL_ENERGY_ITER.store(0, Ordering::Relaxed);
 }
-
 
 fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option<f64>) {
     let Some(key) = super::cache::sanitized_rhokey(theta) else {
@@ -394,12 +372,10 @@ fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option
     }
 }
 
-
 pub(super) struct PenaltySubspace {
     evals: Array1<f64>,
     rank: usize,
 }
-
 
 pub(crate) struct HyperGradHistoryEntry {
     pub(crate) rho: Array1<f64>,
@@ -409,7 +385,6 @@ pub(crate) struct HyperGradHistoryEntry {
     pub(crate) sigma_sq: f64,
     pub(crate) k: usize,
 }
-
 
 /// Online controller that allocates a target hypergradient-MSE budget across
 /// the inner-PIRLS, linear-solve, and trace-probe channels using sensitivity
@@ -468,13 +443,12 @@ pub(crate) struct HyperGradientBudget {
     pub(crate) history: VecDeque<HyperGradHistoryEntry>,
     /// Recent successful sensitivity estimates used to decide when HGB warmup
     /// can safely engage.
-    sensitivity_history: VecDeque<[f64; 3]>,
-    warmup_engaged: bool,
+    pub(crate) sensitivity_history: VecDeque<[f64; 3]>,
+    pub(crate) warmup_engaged: bool,
 }
 
-
 impl HyperGradientBudget {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             target_mse: 0.0,
             inner_floor: HGB_INNER_FLOOR,
@@ -489,14 +463,14 @@ impl HyperGradientBudget {
         }
     }
 
-    fn push(&mut self, entry: HyperGradHistoryEntry) {
+    pub(crate) fn push(&mut self, entry: HyperGradHistoryEntry) {
         self.history.push_back(entry);
         while self.history.len() > HGB_HISTORY_CAP {
             self.history.pop_front();
         }
     }
 
-    fn previous_gradient_norm(&self) -> f64 {
+    pub(crate) fn previous_gradient_norm(&self) -> f64 {
         self.history
             .iter()
             .rev()
@@ -507,7 +481,7 @@ impl HyperGradientBudget {
             .unwrap_or(0.0)
     }
 
-    fn reestimate_sensitivities(&mut self) -> Option<[f64; 3]> {
+    pub(crate) fn reestimate_sensitivities(&mut self) -> Option<[f64; 3]> {
         let pairs = self.finite_difference_pairs();
         if pairs.len() < HGB_MIN_PAIRS_FOR_SENSITIVITY {
             log::info!(
@@ -673,7 +647,7 @@ impl HyperGradientBudget {
         (std.is_finite() && std > 0.0).then_some(std)
     }
 
-    fn allocate_with_sensitivities(
+    pub(crate) fn allocate_with_sensitivities(
         &self,
         s_inner: f64,
         s_linear: f64,
@@ -709,7 +683,7 @@ impl HyperGradientBudget {
         )
     }
 
-    fn sensitivities_stable(&self) -> bool {
+    pub(crate) fn sensitivities_stable(&self) -> bool {
         if self.sensitivity_history.len() < HGB_WARMUP_ITERS_MIN {
             return false;
         }
@@ -732,16 +706,14 @@ impl HyperGradientBudget {
     }
 }
 
-
-struct HyperGradientRuntimeState {
-    budget: HyperGradientBudget,
-    adaptive_kkt_override: Option<f64>,
-    trace_state: Arc<Mutex<super::unified::StochasticTraceState>>,
+pub(crate) struct HyperGradientRuntimeState {
+    pub(crate) budget: HyperGradientBudget,
+    pub(crate) adaptive_kkt_override: Option<f64>,
+    pub(crate) trace_state: Arc<Mutex<super::unified::StochasticTraceState>>,
 }
 
-
 impl HyperGradientRuntimeState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             budget: HyperGradientBudget::new(),
             adaptive_kkt_override: None,
@@ -750,32 +722,26 @@ impl HyperGradientRuntimeState {
     }
 }
 
-
 static HYPERGRADIENT_BUDGETS: OnceLock<Mutex<HashMap<usize, HyperGradientRuntimeState>>> =
     OnceLock::new();
 
-
-fn hypergradient_budgets() -> &'static Mutex<HashMap<usize, HyperGradientRuntimeState>> {
+pub(crate) fn hypergradient_budgets() -> &'static Mutex<HashMap<usize, HyperGradientRuntimeState>> {
     HYPERGRADIENT_BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-
 #[derive(Default)]
-struct IftQualityRuntimeState {
-    quality_history: Vec<f64>,
-    next_step_cap: Option<f64>,
-    fallback_next_flat: bool,
+pub(crate) struct IftQualityRuntimeState {
+    pub(crate) quality_history: Vec<f64>,
+    pub(crate) next_step_cap: Option<f64>,
+    pub(crate) fallback_next_flat: bool,
 }
-
 
 static IFT_QUALITY_STATES: OnceLock<Mutex<HashMap<usize, IftQualityRuntimeState>>> =
     OnceLock::new();
 
-
-fn ift_quality_states() -> &'static Mutex<HashMap<usize, IftQualityRuntimeState>> {
+pub(crate) fn ift_quality_states() -> &'static Mutex<HashMap<usize, IftQualityRuntimeState>> {
     IFT_QUALITY_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
 
 #[derive(Clone)]
 struct IftModeResponseRuntimeCache {
@@ -784,15 +750,12 @@ struct IftModeResponseRuntimeCache {
     ext_mode_response_cols: Option<Array2<f64>>,
 }
 
-
 static IFT_MODE_RESPONSE_CACHES: OnceLock<Mutex<HashMap<usize, IftModeResponseRuntimeCache>>> =
     OnceLock::new();
-
 
 fn ift_mode_response_caches() -> &'static Mutex<HashMap<usize, IftModeResponseRuntimeCache>> {
     IFT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
 
 #[derive(Clone)]
 struct IftJointModeResponseRuntimeCache {
@@ -803,17 +766,14 @@ struct IftJointModeResponseRuntimeCache {
     active_constraints: bool,
 }
 
-
 static IFT_JOINT_MODE_RESPONSE_CACHES: OnceLock<
     Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>>,
 > = OnceLock::new();
-
 
 fn ift_joint_mode_response_caches()
 -> &'static Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>> {
     IFT_JOINT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
 
 fn joint_ift_cache_matches_theta(
     cache: &IftJointModeResponseRuntimeCache,
@@ -839,11 +799,9 @@ fn joint_ift_cache_matches_theta(
     true
 }
 
-
 static IFT_LATEST_OUTER_THETA: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
 
 static IFT_LATEST_OUTER_RHO_UPPER_BOUNDS: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
-
 
 pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
     let value = if theta.is_empty() || theta.iter().any(|v| !v.is_finite()) {
@@ -857,7 +815,6 @@ pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
         .unwrap() = value;
 }
 
-
 pub(crate) fn record_current_outer_rho_upper_bounds_for_ift(upper: &Array1<f64>) {
     let value = if upper.is_empty() || upper.iter().any(|v| !v.is_finite()) {
         None
@@ -870,7 +827,6 @@ pub(crate) fn record_current_outer_rho_upper_bounds_for_ift(upper: &Array1<f64>)
         .unwrap() = value;
 }
 
-
 pub(crate) fn latest_outer_rho_upper_bounds_for_ift() -> Option<Array1<f64>> {
     IFT_LATEST_OUTER_RHO_UPPER_BOUNDS
         .get_or_init(|| Mutex::new(None))
@@ -878,7 +834,6 @@ pub(crate) fn latest_outer_rho_upper_bounds_for_ift() -> Option<Array1<f64>> {
         .unwrap()
         .clone()
 }
-
 
 pub(crate) fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
     IFT_LATEST_OUTER_THETA
@@ -888,11 +843,9 @@ pub(crate) fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
         .clone()
 }
 
-
 fn l2_norm(values: &Array1<f64>) -> f64 {
     values.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
-
 
 fn mean_positive(values: &[f64]) -> Option<f64> {
     let mut sum = 0.0;
@@ -906,13 +859,11 @@ fn mean_positive(values: &[f64]) -> Option<f64> {
     (count > 0).then_some(sum / count as f64)
 }
 
-
 #[derive(Default)]
-struct EfsSingleLoopBiasGuardState {
-    owner: usize,
-    consecutive: usize,
+pub(crate) struct EfsSingleLoopBiasGuardState {
+    pub(crate) owner: usize,
+    pub(crate) consecutive: usize,
 }
-
 
 // `LazyLock` (not `OnceLock` lazy init) so the init closure never parks
 // callers on the OS condvar. The init body here is trivial — just a default-
@@ -922,24 +873,21 @@ struct EfsSingleLoopBiasGuardState {
 // forbids the lazy `OnceLock` accessor in any rayon-adjacent file.
 // `LazyLock`'s initializer runs at first deref under its own dedicated
 // synchronization that does not interact with rayon's worker pool.
-static EFS_SINGLE_LOOP_BIAS_GUARD: LazyLock<Mutex<EfsSingleLoopBiasGuardState>> =
+pub(crate) static EFS_SINGLE_LOOP_BIAS_GUARD: LazyLock<Mutex<EfsSingleLoopBiasGuardState>> =
     LazyLock::new(|| Mutex::new(EfsSingleLoopBiasGuardState::default()));
 
-
 #[inline]
-fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
+pub(crate) fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
     mode != super::unified::EvalMode::ValueOnly
 }
 
-
 #[inline]
-fn efs_single_loop_encoded_cap() -> usize {
+pub(crate) fn efs_single_loop_encoded_cap() -> usize {
     EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL + EFS_SINGLE_LOOP_PIRLS_SWEEPS
 }
 
-
 #[inline]
-fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
+pub(crate) fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
     // `.then_some` evaluates its argument eagerly, so the subtraction must be
     // guarded by `.then(|| ...)` to avoid usize underflow when raw_cap <
     // SENTINEL (the common path for non-EFS-single-loop iterates).
@@ -947,7 +895,6 @@ fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
         .then(|| raw_cap - EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL)
         .filter(|cap| *cap > 0)
 }
-
 
 /// Apply the screening residual penalty to a cost.
 ///
@@ -998,7 +945,7 @@ fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
 ///   * `assemble_and_evaluate_efs` — the EFS step value
 /// Add the wrap to any future outer-cost emission as well.
 #[inline]
-fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
+pub(crate) fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
     if !cost.is_finite() || !pr.status.is_failed_max_iterations() {
         return cost;
     }
@@ -1010,14 +957,12 @@ fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
     }
 }
 
-
 fn hash_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {
     hasher.write_usize(values.len());
     for &value in values {
         hasher.write_f64(value);
     }
 }
-
 
 fn hash_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     hasher.write_usize(values.nrows());
@@ -1026,7 +971,6 @@ fn hash_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
         hasher.write_f64(value);
     }
 }
-
 
 fn hash_aux_prior_strength(
     hasher: &mut Fingerprinter,
@@ -1041,7 +985,6 @@ fn hash_aux_prior_strength(
         }
     }
 }
-
 
 pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
     id_mode: &crate::terms::latent_coord::LatentIdMode,
@@ -1096,7 +1039,6 @@ pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
     hasher.finish_u64()
 }
 
-
 fn hash_array3(hasher: &mut Fingerprinter, values: &ndarray::Array3<f64>) {
     let (a, b, c) = values.dim();
     hasher.write_usize(a);
@@ -1106,7 +1048,6 @@ fn hash_array3(hasher: &mut Fingerprinter, values: &ndarray::Array3<f64>) {
         hasher.write_f64(value);
     }
 }
-
 
 fn hash_psi_slice(hasher: &mut Fingerprinter, target: &crate::terms::analytic_penalties::PsiSlice) {
     hasher.write_usize(target.range.start);
@@ -1119,7 +1060,6 @@ fn hash_psi_slice(hasher: &mut Fingerprinter, target: &crate::terms::analytic_pe
         None => hasher.write_bool(false),
     }
 }
-
 
 fn hash_scalar_weight_schedule(
     hasher: &mut Fingerprinter,
@@ -1143,7 +1083,6 @@ fn hash_scalar_weight_schedule(
     hasher.write_usize(schedule.iter_count);
 }
 
-
 fn hash_weight_schedule_option(
     hasher: &mut Fingerprinter,
     schedule: &Option<crate::terms::analytic_penalties::ScalarWeightSchedule>,
@@ -1156,7 +1095,6 @@ fn hash_weight_schedule_option(
         None => hasher.write_bool(false),
     }
 }
-
 
 fn hash_gumbel_temperature_schedule(
     hasher: &mut Fingerprinter,
@@ -1180,7 +1118,6 @@ fn hash_gumbel_temperature_schedule(
     hasher.write_usize(schedule.iter_count);
 }
 
-
 fn hash_gumbel_schedule_option(
     hasher: &mut Fingerprinter,
     schedule: &Option<crate::terms::sae_manifold::GumbelTemperatureSchedule>,
@@ -1193,7 +1130,6 @@ fn hash_gumbel_schedule_option(
         None => hasher.write_bool(false),
     }
 }
-
 
 fn hash_isometry_reference(
     hasher: &mut Fingerprinter,
@@ -1209,7 +1145,6 @@ fn hash_isometry_reference(
         }
     }
 }
-
 
 fn hash_weight_field(
     hasher: &mut Fingerprinter,
@@ -1227,7 +1162,6 @@ fn hash_weight_field(
         }
     }
 }
-
 
 fn hash_sparsity_kind(
     hasher: &mut Fingerprinter,
@@ -1248,7 +1182,6 @@ fn hash_sparsity_kind(
     }
 }
 
-
 fn hash_difference_op_kind(
     hasher: &mut Fingerprinter,
     kind: &crate::terms::analytic_penalties::DifferenceOpKind,
@@ -1268,7 +1201,6 @@ fn hash_difference_op_kind(
     }
 }
 
-
 fn hash_groups(hasher: &mut Fingerprinter, groups: &[Vec<usize>]) {
     hasher.write_usize(groups.len());
     for group in groups {
@@ -1278,7 +1210,6 @@ fn hash_groups(hasher: &mut Fingerprinter, groups: &[Vec<usize>]) {
         }
     }
 }
-
 
 fn hash_analytic_penalty_kind(
     hasher: &mut Fingerprinter,
@@ -1574,7 +1505,6 @@ fn hash_analytic_penalty_kind(
     }
 }
 
-
 pub(crate) fn analytic_penalty_registry_fingerprint(
     registry: &crate::terms::analytic_penalties::AnalyticPenaltyRegistry,
 ) -> u64 {
@@ -1586,7 +1516,6 @@ pub(crate) fn analytic_penalty_registry_fingerprint(
     }
     hasher.finish_u64()
 }
-
 
 fn hash_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
     // Stream the design through fixed-byte row blocks so a large-scale design
@@ -1613,7 +1542,6 @@ fn hash_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Resu
     Ok(())
 }
 
-
 fn hash_canonical_penalties(
     hasher: &mut Fingerprinter,
     penalties: &[crate::construction::CanonicalPenalty],
@@ -1635,7 +1563,6 @@ fn hash_canonical_penalties(
     }
 }
 
-
 fn finite_positive_from_bits(bits: u64) -> Option<f64> {
     if bits == 0 {
         return None;
@@ -1648,7 +1575,6 @@ fn finite_positive_from_bits(bits: u64) -> Option<f64> {
     }
 }
 
-
 fn finite_nonnegative_from_bits(bits: u64) -> Option<f64> {
     let value = f64::from_bits(bits);
     if value.is_finite() && value >= 0.0 {
@@ -1658,7 +1584,6 @@ fn finite_nonnegative_from_bits(bits: u64) -> Option<f64> {
     }
 }
 
-
 fn finite_nonnegative_bits_or_no_signal(value: Option<f64>) -> u64 {
     value
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -1666,28 +1591,24 @@ fn finite_nonnegative_bits_or_no_signal(value: Option<f64>) -> u64 {
         .unwrap_or(IFT_RESIDUAL_NO_SIGNAL_BITS)
 }
 
-
-struct TkCorrectionTerms {
+pub(crate) struct TkCorrectionTerms {
     value: f64,
     gradient: Option<Array1<f64>>,
     hessian: Option<Array2<f64>>,
 }
 
-
-struct TkSharedIntermediates {
+pub(crate) struct TkSharedIntermediates {
     h_diag: Array1<f64>,
     x_m: Array1<f64>,
     y: Array1<f64>,
     active_blocks: Vec<TkActiveBlock>,
 }
 
-
-struct TkActiveBlock {
+pub(crate) struct TkActiveBlock {
     start: usize,
     end: usize,
     entries: Vec<(usize, f64)>,
 }
-
 
 /// Family-dependent derivative context shared by all assembly builders.
 ///
@@ -1702,20 +1623,17 @@ struct DerivativeContext {
     barrier_config: Option<super::unified::BarrierConfig>,
 }
 
-
 /// Project a `GlmLikelihoodSpec` onto a `LikelihoodSpec` for pattern matching
 /// on the `(response, link)` form used elsewhere in the codebase.
 #[inline]
-fn reml_spec(likelihood: &GlmLikelihoodSpec) -> LikelihoodSpec {
+pub(crate) fn reml_spec(likelihood: &GlmLikelihoodSpec) -> LikelihoodSpec {
     likelihood.spec.clone()
 }
 
-
 #[inline]
-fn reml_is_gaussian_identity(likelihood: &GlmLikelihoodSpec) -> bool {
+pub(crate) fn reml_is_gaussian_identity(likelihood: &GlmLikelihoodSpec) -> bool {
     reml_spec(likelihood).is_gaussian_identity()
 }
-
 
 /// Inverse link of a Binomial family for which a Fisher-weight jet exists, i.e.
 /// the links the link-general Jeffreys term can regularize. This includes
@@ -1734,7 +1652,6 @@ fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<Invers
         None
     }
 }
-
 
 /// Resolve whether the Jeffreys/Firth term should be assembled on the REML path
 /// and, if so, the inverse link to evaluate the Fisher weight with.
@@ -1756,7 +1673,6 @@ pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLi
     reml_jeffreys_supported_link(&config.likelihood)
 }
 
-
 /// `upper`/`tail_prob` calibrating the firth-general default barrier on an unset
 /// smoothing coordinate. The tail statement `P(d > upper) = tail_prob` on the
 /// marginal-SD distance scale `d = exp(−ρ/2)` calibrates the exponential rate
@@ -1765,7 +1681,6 @@ pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLi
 const FIRTH_DEFAULT_PC_UPPER: f64 = 10.0;
 
 const FIRTH_DEFAULT_PC_TAIL_PROB: f64 = 0.01;
-
 
 /// Weakly-informative DEFAULT outer ρ prior used by the firth-general policy on
 /// any smoothing coordinate the caller left unset (`RhoPrior::Flat`).
@@ -1791,7 +1706,6 @@ fn firth_default_pc_prior() -> RhoPrior {
     }
 }
 
-
 /// Per-coordinate `true` where the firth-general default barrier (rather than an
 /// explicitly-configured prior) governs that smoothing coordinate. A coordinate
 /// is a firth default exactly when the caller left it `Flat`: the whole prior is
@@ -1807,7 +1721,6 @@ fn firth_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec<bool> {
         _ => vec![false; len],
     }
 }
-
 
 /// Resolve the *effective* outer ρ prior under the (unconditional) firth-general
 /// default policy.
@@ -1838,7 +1751,6 @@ fn resolve_effective_rho_prior(configured: &RhoPrior) -> std::borrow::Cow<'_, Rh
     }
 }
 
-
 #[inline]
 fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     let spec = reml_spec(likelihood);
@@ -1867,13 +1779,11 @@ fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     }
 }
 
-
 /// Minimum importance-sampling effective-sample fraction below which the #784
 /// block-local sampled marginalization is declined (the Monte-Carlo estimate
 /// would be noisier than the Laplace error it corrects). Auto-derived constant,
 /// not a tunable flag.
 const MIN_IMPORTANCE_ESS_FRACTION: f64 = 0.10;
-
 
 /// Block-local non-Gaussian-remainder target for the adaptive Laplace-to-
 /// sampling fallback (issue #784).
@@ -1929,7 +1839,6 @@ struct Gam784BlockTarget<'t> {
     /// Deviance at the base mode.
     base_deviance: f64,
 }
-
 
 impl Gam784BlockTarget<'_> {
     /// Map a whitened block displacement `t` to the coefficient displacement
@@ -1992,7 +1901,6 @@ impl Gam784BlockTarget<'_> {
         out
     }
 }
-
 
 impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
     fn block_dim(&self) -> usize {

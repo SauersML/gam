@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Exact dense-materialization route exposed by an outer Hessian operator.
 ///
 /// The optimizer uses this as a work-model contract before turning a
@@ -19,13 +18,11 @@ pub enum OuterHessianMaterialization {
     Explicit,
 }
 
-
 impl OuterHessianMaterialization {
-    fn is_available(self) -> bool {
+    pub(crate) fn is_available(self) -> bool {
         !matches!(self, Self::Unavailable)
     }
 }
-
 
 /// Typed error for the outer-strategy Hessian-operator surface.
 ///
@@ -46,7 +43,6 @@ pub enum OuterStrategyError {
     RhoBlockShape { reason: String },
 }
 
-
 impl std::fmt::Display for OuterStrategyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -57,16 +53,13 @@ impl std::fmt::Display for OuterStrategyError {
     }
 }
 
-
 impl std::error::Error for OuterStrategyError {}
-
 
 impl From<OuterStrategyError> for String {
     fn from(err: OuterStrategyError) -> String {
         err.to_string()
     }
 }
-
 
 /// Matrix-free outer Hessian operator.
 ///
@@ -235,13 +228,11 @@ pub trait OuterHessianOperator: Send + Sync {
     }
 }
 
-
 pub(crate) struct RhoBlockAdditiveOuterHessian {
     base: Arc<dyn OuterHessianOperator>,
     rho_block: Array2<f64>,
     dim: usize,
 }
-
 
 impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
     fn dim(&self) -> usize {
@@ -346,13 +337,11 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
     }
 }
 
-
 /// Upper safety bound for operator materialization after the operator has
 /// explicitly declared that dense probing is cheap. Dimension alone is never
 /// sufficient: a 50-column operator can still mean 50 full row-streaming CTN,
 /// Duchon, or survival passes.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
-
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,7 +351,6 @@ pub enum Derivative {
     /// No analytic derivative; must be approximated or skipped.
     Unavailable,
 }
-
 
 /// Capability-time declaration of what shape the outer Hessian takes.
 /// Replaces the binary `Derivative` for the Hessian field on
@@ -397,7 +385,6 @@ pub enum DeclaredHessianForm {
     Either,
     Unavailable,
 }
-
 
 impl DeclaredHessianForm {
     /// Coarse "is an analytic Hessian declared?" projection. `true`

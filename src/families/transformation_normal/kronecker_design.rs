@@ -347,7 +347,7 @@ impl DenseDesignOperator for KroneckerDesign {
 /// A penalty matrix in separable Kronecker form: `S_left ⊗ S_right`.
 ///
 /// Build tensor product penalties in Kronecker-separable form.
-fn build_tensor_penalties_kronecker(
+pub(crate) fn build_tensor_penalties_kronecker(
     response_penalties: &[Array2<f64>],
     covariate_penalties: Vec<PenaltyMatrix>,
     p_resp: usize,

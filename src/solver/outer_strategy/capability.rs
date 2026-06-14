@@ -1,7 +1,5 @@
 use super::*;
 
-
-
 /// Declares what a specific model path can provide to the outer optimizer.
 ///
 /// Each call site that optimizes smoothing parameters constructs one of these
@@ -11,13 +9,11 @@ pub(crate) const SMALL_OUTER_BFGS_MAX_PARAMS: usize = 8;
 
 pub(crate) const SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS: usize = 64;
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OuterThetaLayout {
     pub n_params: usize,
     pub psi_dim: usize,
 }
-
 
 impl OuterThetaLayout {
     pub const fn new(n_params: usize, psi_dim: usize) -> Self {
@@ -38,7 +34,7 @@ impl OuterThetaLayout {
         Ok::<(), _>(())
     }
 
-    fn validate_point_len(
+    pub(crate) fn validate_point_len(
         &self,
         theta: &Array1<f64>,
         context: &str,
@@ -55,7 +51,7 @@ impl OuterThetaLayout {
         Ok::<(), _>(())
     }
 
-    fn validate_gradient_len(
+    pub(crate) fn validate_gradient_len(
         &self,
         gradient: &Array1<f64>,
         context: &str,
@@ -72,7 +68,7 @@ impl OuterThetaLayout {
         Ok::<(), _>(())
     }
 
-    fn validate_hessian_shape(
+    pub(crate) fn validate_hessian_shape(
         &self,
         hessian: &Array2<f64>,
         context: &str,
@@ -91,7 +87,11 @@ impl OuterThetaLayout {
         Ok::<(), _>(())
     }
 
-    fn validate_efs_eval(&self, eval: &EfsEval, context: &str) -> Result<(), ObjectiveEvalError> {
+    pub(crate) fn validate_efs_eval(
+        &self,
+        eval: &EfsEval,
+        context: &str,
+    ) -> Result<(), ObjectiveEvalError> {
         if eval.steps.len() != self.n_params {
             return Err(ObjectiveEvalError::recoverable(format!(
                 "{context}: outer EFS step length mismatch: got {}, expected {} (rho_dim={}, psi_dim={})",
@@ -128,7 +128,6 @@ impl OuterThetaLayout {
         Ok(())
     }
 }
-
 
 #[derive(Clone, Debug)]
 pub struct OuterCapability {
@@ -201,7 +200,6 @@ pub struct OuterCapability {
     pub disable_fixed_point: bool,
 }
 
-
 impl OuterCapability {
     pub const fn theta_layout(&self) -> OuterThetaLayout {
         OuterThetaLayout::new(self.n_params, self.psi_dim)
@@ -243,7 +241,6 @@ impl OuterCapability {
     }
 }
 
-
 /// Which solver algorithm to use for the outer optimization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Solver {
@@ -277,8 +274,6 @@ pub enum Solver {
     HybridEfs,
 }
 
-
-
 /// How the Hessian will be obtained for the outer optimizer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HessianSource {
@@ -295,7 +290,6 @@ pub enum HessianSource {
     HybridEfsFixedPoint,
 }
 
-
 /// Requested derivative order for an outer objective evaluation.
 ///
 /// This enum is for the shared `eval` bridge where the runner needs value-only,
@@ -310,7 +304,6 @@ pub enum OuterEvalOrder {
     ValueGradientHessian,
 }
 
-
 /// The outer optimization plan. Produced by [`plan`], consumed by the runner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OuterPlan {
@@ -318,9 +311,7 @@ pub struct OuterPlan {
     pub hessian_source: HessianSource,
 }
 
-
 pub(crate) const EFS_FIRST_ORDER_FALLBACK_MARKER: &str = "[outer-efs-first-order-fallback]";
-
 
 /// Whether outer_strategy should automatically derive a retry ladder from the
 /// primary capability, or disable retries entirely.
@@ -332,7 +323,6 @@ pub enum FallbackPolicy {
     Disabled,
 }
 
-
 impl std::fmt::Display for OuterPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -342,7 +332,6 @@ impl std::fmt::Display for OuterPlan {
         )
     }
 }
-
 
 impl OuterPlan {
     /// Stable, grep-friendly routing token for large-scale/log regression
@@ -358,7 +347,6 @@ impl OuterPlan {
         )
     }
 }
-
 
 /// Select the outer optimization strategy from the declared capability.
 ///
@@ -432,7 +420,6 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
     }
 }
 
-
 /// Log the outer optimization plan. Called once per fit at the start of
 /// outer optimization so the user can see what strategy was selected and why.
 pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
@@ -466,11 +453,9 @@ pub fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPlan) {
     );
 }
 
-
 pub(crate) fn requests_immediate_first_order_fallback(message: &str) -> bool {
     message.contains(EFS_FIRST_ORDER_FALLBACK_MARKER)
 }
-
 
 /// Disable the EFS/HybridEfs planner path, forcing BFGS-class solvers on the
 /// next attempt. Returns `None` if fixed-point is already disabled.
@@ -483,7 +468,6 @@ pub(crate) fn disable_fixed_point(cap: &OuterCapability) -> Option<OuterCapabili
         },
     )
 }
-
 
 pub(crate) fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     // Production fallback ladder is strictly analytic-gradient.
@@ -526,7 +510,6 @@ pub(crate) fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCap
     attempts
 }
 
-
 pub(crate) fn disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(
     cap: &OuterCapability,
     config: &OuterConfig,
@@ -535,7 +518,6 @@ pub(crate) fn disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(
         && cap.gradient == Derivative::Analytic
         && matches!(plan(cap).solver, Solver::HybridEfs)
 }
-
 
 pub(crate) fn primary_capability_for_config(
     mut cap: OuterCapability,
@@ -558,3 +540,4 @@ pub(crate) fn primary_capability_for_config(
         cap.disable_fixed_point = true;
     }
     cap
+}

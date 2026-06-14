@@ -11,7 +11,7 @@ use super::*;
 /// the shape rows, so `H v` must be evaluated through the rowwise chain rule.
 /// This workspace keeps the accepted `β` and row quantities and applies
 /// `H`, `D H[u]`, and `D²H[u,v]` without materializing a dense p×p matrix.
-struct TransformationNormalJointHessianWorkspace {
+pub(crate) struct TransformationNormalJointHessianWorkspace {
     /// Shared family handle. Cloning the workspace's family for each downstream
     /// matrix-free operator (dH, d²H per psi coord and per pair) would copy
     /// the full row-space Kronecker designs (~hundreds of MiB at large-scale
@@ -22,9 +22,8 @@ struct TransformationNormalJointHessianWorkspace {
     dense_hessian_cache: OnceLock<Array2<f64>>,
 }
 
-
 impl TransformationNormalJointHessianWorkspace {
-    fn new(
+    pub(crate) fn new(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         row_quantities: TransformationNormalRowQuantityCache,
@@ -37,11 +36,11 @@ impl TransformationNormalJointHessianWorkspace {
         })
     }
 
-    fn p_total(&self) -> usize {
+    pub(crate) fn p_total(&self) -> usize {
         self.family.x_val_kron.ncols()
     }
 
-    fn dense_hessian_cache_enabled(&self) -> bool {
+    pub(crate) fn dense_hessian_cache_enabled(&self) -> bool {
         let p_total = self.p_total();
         if p_total > SCOP_HESSIAN_HVP_DENSE_CACHE_MAX_DIM {
             return false;
@@ -99,7 +98,11 @@ impl TransformationNormalJointHessianWorkspace {
         Ok(out)
     }
 
-    fn apply_hessian_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), String> {
+    pub(crate) fn apply_hessian_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
         if v.len() != self.p_total() || out.len() != self.p_total() {
             return Err(format!(
                 "CTN joint Hessian matvec_into dimension mismatch: v={} out={} p_total={}",
@@ -126,7 +129,6 @@ impl TransformationNormalJointHessianWorkspace {
             .scop_hessian_diagonal(&self.beta, &self.row_quantities)
     }
 }
-
 
 impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
@@ -245,23 +247,21 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
     }
 }
 
-
 /// Matrix-free directional derivative of the CTN joint Hessian.
 ///
 /// SCOP makes the derivative row-dependent through `γ_k(x)`, so this operator
 /// evaluates `D H[direction] · v` by streaming rows through the exact chain
 /// rule instead of using the old scalar-weighted `X_deriv' diag(.) X_deriv`
 /// identity.
-struct TransformationNormalDhMatrixFreeOperator {
+pub(crate) struct TransformationNormalDhMatrixFreeOperator {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
     row_quantities: TransformationNormalRowQuantityCache,
     direction: Array1<f64>,
 }
 
-
 impl TransformationNormalDhMatrixFreeOperator {
-    fn new(
+    pub(crate) fn new(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         row_quantities: TransformationNormalRowQuantityCache,
@@ -292,7 +292,6 @@ impl TransformationNormalDhMatrixFreeOperator {
         family_ptr ^ design_dims.rotate_left(23)
     }
 }
-
 
 impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
     fn dim(&self) -> usize {
@@ -366,13 +365,12 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
     }
 }
 
-
 /// Matrix-free second directional derivative of the CTN joint Hessian.
 ///
 /// This is the SCOP rowwise chain-rule operator for `D²H[u, v] · w`; it keeps
 /// the memory profile of matrix-free REML while matching the dense exact
 /// second derivative.
-struct TransformationNormalD2hMatrixFreeOperator {
+pub(crate) struct TransformationNormalD2hMatrixFreeOperator {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
     row_quantities: TransformationNormalRowQuantityCache,
@@ -380,9 +378,8 @@ struct TransformationNormalD2hMatrixFreeOperator {
     direction_v: Array1<f64>,
 }
 
-
 impl TransformationNormalD2hMatrixFreeOperator {
-    fn new(
+    pub(crate) fn new(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         row_quantities: TransformationNormalRowQuantityCache,
@@ -414,7 +411,6 @@ impl TransformationNormalD2hMatrixFreeOperator {
             .expect("validated CTN d2H operator inputs should not fail")
     }
 }
-
 
 impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
     fn dim(&self) -> usize {
@@ -455,8 +451,7 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
     }
 }
 
-
-struct TransformationNormalPsiHessianOperator {
+pub(crate) struct TransformationNormalPsiHessianOperator {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
     op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
@@ -467,9 +462,8 @@ struct TransformationNormalPsiHessianOperator {
     row_quantities: TransformationNormalRowQuantityCache,
 }
 
-
 impl TransformationNormalPsiHessianOperator {
-    fn new(
+    pub(crate) fn new(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
@@ -493,7 +487,7 @@ impl TransformationNormalPsiHessianOperator {
         )
     }
 
-    fn new_with_trace_axes(
+    pub(crate) fn new_with_trace_axes(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
@@ -616,7 +610,6 @@ impl TransformationNormalPsiHessianOperator {
     }
 }
 
-
 impl HyperOperator for TransformationNormalPsiHessianOperator {
     fn dim(&self) -> usize {
         self.beta.len()
@@ -697,8 +690,7 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
     }
 }
 
-
-struct TransformationNormalPsiDhMatrixFreeOperator {
+pub(crate) struct TransformationNormalPsiDhMatrixFreeOperator {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
     direction: Array1<f64>,
@@ -718,9 +710,8 @@ struct TransformationNormalPsiDhMatrixFreeOperator {
     dense_cache: crate::resource::RayonSafeOnce<Array2<f64>>,
 }
 
-
 impl TransformationNormalPsiDhMatrixFreeOperator {
-    fn new(
+    pub(crate) fn new(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         direction: Array1<f64>,
@@ -946,7 +937,6 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
     }
 }
 
-
 impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
     fn dim(&self) -> usize {
         self.p_total()
@@ -1005,8 +995,7 @@ impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
     }
 }
 
-
-struct TransformationNormalPsiPsiHessianOperator {
+pub(crate) struct TransformationNormalPsiPsiHessianOperator {
     family: Arc<TransformationNormalFamily>,
     beta: Array1<f64>,
     op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
@@ -1022,9 +1011,8 @@ struct TransformationNormalPsiPsiHessianOperator {
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
 }
 
-
 impl TransformationNormalPsiPsiHessianOperator {
-    fn new(
+    pub(crate) fn new(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
@@ -1058,7 +1046,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         )
     }
 
-    fn new_with_trace_axes(
+    pub(crate) fn new_with_trace_axes(
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
@@ -1244,7 +1232,6 @@ impl TransformationNormalPsiPsiHessianOperator {
     }
 }
 
-
 impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
     fn dim(&self) -> usize {
         self.p_total()
@@ -1345,5 +1332,3 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
         true
     }
 }
-
-

@@ -34,8 +34,6 @@ pub(crate) fn aggregate_labeled_hessian(
     Ok(out)
 }
 
-
-
 /// Adapter over the shared [`rho_prior_eval`](crate::solver::estimate::reml::rho_prior_eval)
 /// engine using the custom-family invalid-prior policy
 /// (`HardError`): the prior math is shared with the REML/LAML runtime, and a
@@ -60,8 +58,6 @@ pub(crate) fn rho_prior_cost_gradient_hessian(
         }
     }
 }
-
-
 
 pub(crate) fn add_labeled_rho_prior_to_outer_eval(
     mut result: OuterObjectiveEvalResult,
@@ -107,8 +103,6 @@ pub(crate) fn add_labeled_rho_prior_to_outer_eval(
     Ok(result)
 }
 
-
-
 pub(crate) fn physical_warm_start_for_labeled(
     warm_start: Option<&ConstrainedWarmStart>,
     physical_rho: &Array1<f64>,
@@ -123,8 +117,6 @@ pub(crate) fn physical_warm_start_for_labeled(
         physical_seed
     })
 }
-
-
 
 pub(crate) fn pullback_labeled_outer_eval(
     mut result: OuterObjectiveEvalResult,
@@ -159,9 +151,9 @@ pub(crate) fn pullback_labeled_outer_eval(
     add_labeled_rho_prior_to_outer_eval(result, rho, rho_prior, eval_mode)
 }
 
-
-
-pub(crate) fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn outerobjectivegradienthessian_labeled<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -186,9 +178,9 @@ pub(crate) fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Se
     pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
 }
 
-
-
-pub(crate) fn custom_family_seed_screening_proxy_labeled<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn custom_family_seed_screening_proxy_labeled<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -242,8 +234,6 @@ pub(crate) fn custom_family_seed_screening_proxy_labeled<F: CustomFamily + Clone
     Ok((score, warm, inner.converged))
 }
 
-
-
 pub(crate) fn split_log_lambdas(
     flat: &Array1<f64>,
     penalty_counts: &[usize],
@@ -266,8 +256,6 @@ pub(crate) fn split_log_lambdas(
     }
     Ok(out)
 }
-
-
 
 pub(crate) fn buildblock_states<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -317,8 +305,6 @@ pub(crate) fn buildblock_states<F: CustomFamily + Clone + Send + Sync + 'static>
     Ok(states)
 }
 
-
-
 pub(crate) fn refresh_all_block_etas<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -349,8 +335,6 @@ pub(crate) fn refresh_all_block_etas<F: CustomFamily + Clone + Send + Sync + 'st
     Ok(())
 }
 
-
-
 pub(crate) fn refresh_single_block_eta<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -364,8 +348,6 @@ pub(crate) fn refresh_single_block_eta<F: CustomFamily + Clone + Send + Sync + '
     })?;
     Ok(())
 }
-
-
 
 #[inline]
 pub(crate) fn capped_inner_max_cycles(options: &BlockwiseFitOptions, base_cycles: usize) -> usize {
@@ -393,8 +375,6 @@ pub(crate) fn capped_inner_max_cycles(options: &BlockwiseFitOptions, base_cycles
     }
     cap.max(1)
 }
-
-
 
 pub(crate) fn weighted_normal_equations(
     x: &DesignMatrix,
@@ -426,8 +406,6 @@ pub(crate) fn weighted_normal_equations(
     Ok((xtwx, xtwy))
 }
 
-
-
 /// Smallest diagonal shift that makes the penalized joint Hessian
 /// Cholesky-factorable (i.e. positive definite at the solver floor), or `None`
 /// when the matrix is already PD and needs no shift.
@@ -445,7 +423,10 @@ pub(crate) fn weighted_normal_equations(
 /// near-singular cycles — strictly cheaper than the full eigh and short-circuiting
 /// on the first PD factorization. The resulting shift makes `H_pen + δI` PD,
 /// which is exactly what the downstream solve requires.
-pub(crate) fn exact_newton_stabilizing_shift(lhs_dense: &Array2<f64>, ridge_floor: f64) -> Option<f64> {
+pub(crate) fn exact_newton_stabilizing_shift(
+    lhs_dense: &Array2<f64>,
+    ridge_floor: f64,
+) -> Option<f64> {
     let floor = effective_solverridge(ridge_floor);
     // Fast path: already PD at zero shift ⇒ no stabilization needed. One Cholesky
     // (O(p³/3)), the common case on a well-conditioned cycle.
@@ -495,8 +476,6 @@ pub(crate) fn exact_newton_stabilizing_shift(lhs_dense: &Array2<f64>, ridge_floo
     Some(floor - gershgorin_min)
 }
 
-
-
 pub(crate) fn stabilize_exact_newton_lhs_in_place<F: CustomFamily + ?Sized>(
     family: &F,
     lhs_dense: &mut Array2<f64>,
@@ -511,8 +490,6 @@ pub(crate) fn stabilize_exact_newton_lhs_in_place<F: CustomFamily + ?Sized>(
         }
     }
 }
-
-
 
 pub(crate) fn shift_linear_constraints_to_delta(
     constraints: &LinearInequalityConstraints,
@@ -530,8 +507,6 @@ pub(crate) fn shift_linear_constraints_to_delta(
     })
 }
 
-
-
 pub(crate) fn collect_block_linear_constraints<F: CustomFamily + ?Sized>(
     family: &F,
     states: &[ParameterBlockState],
@@ -543,8 +518,6 @@ pub(crate) fn collect_block_linear_constraints<F: CustomFamily + ?Sized>(
     }
     Ok(constraints)
 }
-
-
 
 pub(crate) fn reject_constrained_post_update_repair(
     block_idx: usize,
@@ -600,8 +573,6 @@ pub(crate) fn reject_constrained_post_update_repair(
     Ok(())
 }
 
-
-
 pub(crate) fn assemble_joint_linear_constraints(
     block_constraints: &[Option<LinearInequalityConstraints>],
     ranges: &[(usize, usize)],
@@ -652,8 +623,6 @@ pub(crate) fn assemble_joint_linear_constraints(
     Ok(Some(LinearInequalityConstraints { a, b }))
 }
 
-
-
 pub(crate) fn flatten_joint_active_set(
     block_active_sets: &[Option<Vec<usize>>],
     block_constraints: &[Option<LinearInequalityConstraints>],
@@ -684,8 +653,6 @@ pub(crate) fn flatten_joint_active_set(
         Some(joint_active)
     }
 }
-
-
 
 pub(crate) fn scatter_joint_active_set(
     joint_active: &[usize],
@@ -718,8 +685,6 @@ pub(crate) fn scatter_joint_active_set(
     }
     per_block
 }
-
-
 
 /// Assemble the **active rows** of the joint linear inequality constraint
 /// matrix into a single `(k_active × total_p)` block, suitable for the
@@ -788,15 +753,11 @@ pub(crate) fn assemble_active_constraint_block(
     Some(crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock { a })
 }
 
-
-
 pub(crate) struct SimpleLowerBounds {
     lower_bounds: Array1<f64>,
     row_to_coeff: Vec<usize>,
     coeff_to_row: Vec<Option<usize>>,
 }
-
-
 
 pub(crate) fn extract_simple_lower_bounds(
     constraints: &LinearInequalityConstraints,
@@ -845,8 +806,6 @@ pub(crate) fn extract_simple_lower_bounds(
     }))
 }
 
-
-
 pub(crate) fn lower_bound_active_rows_to_coeffs(
     bounds: &SimpleLowerBounds,
     active_rows: Option<&[usize]>,
@@ -864,8 +823,6 @@ pub(crate) fn lower_bound_active_rows_to_coeffs(
     active_coeffs
 }
 
-
-
 pub(crate) fn lower_bound_active_coeffs_to_rows(
     bounds: &SimpleLowerBounds,
     active_coeffs: &[usize],
@@ -879,8 +836,6 @@ pub(crate) fn lower_bound_active_coeffs_to_rows(
     active_rows.dedup();
     active_rows
 }
-
-
 
 pub(crate) fn lower_bound_active_coeffs_from_solution(
     bounds: &SimpleLowerBounds,
@@ -901,8 +856,6 @@ pub(crate) fn lower_bound_active_coeffs_from_solution(
     active_coeffs
 }
 
-
-
 pub(crate) fn project_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
     for i in 0..beta.len() {
         let lower = lower_bounds[i];
@@ -911,8 +864,6 @@ pub(crate) fn project_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Arr
         }
     }
 }
-
-
 
 pub(crate) fn solve_quadratic_with_simple_lower_bounds(
     lhs: &Array2<f64>,
@@ -940,8 +891,6 @@ pub(crate) fn solve_quadratic_with_simple_lower_bounds(
     Ok((beta_new, active))
 }
 
-
-
 pub(crate) fn normalize_active_set(mut active_set: Vec<usize>) -> Option<Vec<usize>> {
     active_set.sort_unstable();
     active_set.dedup();
@@ -952,16 +901,14 @@ pub(crate) fn normalize_active_set(mut active_set: Vec<usize>) -> Option<Vec<usi
     }
 }
 
-
-
-pub(crate) fn normalize_active_sets(active_sets: Vec<Option<Vec<usize>>>) -> Vec<Option<Vec<usize>>> {
+pub(crate) fn normalize_active_sets(
+    active_sets: Vec<Option<Vec<usize>>>,
+) -> Vec<Option<Vec<usize>>> {
     active_sets
         .into_iter()
         .map(|active_set| active_set.and_then(normalize_active_set))
         .collect()
 }
-
-
 
 pub(crate) struct BlockUpdateContext<'a> {
     family: &'a dyn CustomFamily,
@@ -974,25 +921,22 @@ pub(crate) struct BlockUpdateContext<'a> {
     cached_active_set: Option<&'a [usize]>,
 }
 
-
-
 pub(crate) struct BlockUpdateResult {
     beta_new_raw: Array1<f64>,
     active_set: Option<Vec<usize>>,
 }
 
-
-
 #[inline]
-pub(crate) fn floor_positiveworking_weights(working_weights: &Array1<f64>, minweight: f64) -> Array1<f64> {
+pub(crate) fn floor_positiveworking_weights(
+    working_weights: &Array1<f64>,
+    minweight: f64,
+) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(working_weights.len());
     ndarray::Zip::from(&mut out)
         .and(working_weights)
         .par_for_each(|o, &wi| *o = if wi <= 0.0 { 0.0 } else { wi.max(minweight) });
     out
 }
-
-
 
 pub(crate) trait ParameterBlockUpdater {
     fn compute_update_step(
@@ -1001,14 +945,10 @@ pub(crate) trait ParameterBlockUpdater {
     ) -> Result<BlockUpdateResult, String>;
 }
 
-
-
 pub(crate) struct DiagonalBlockUpdater<'a> {
     working_response: &'a Array1<f64>,
     working_weights: &'a Array1<f64>,
 }
-
-
 
 impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
     fn compute_update_step(
@@ -1104,14 +1044,10 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
     }
 }
 
-
-
 pub(crate) struct ExactNewtonBlockUpdater<'a> {
     gradient: &'a Array1<f64>,
     hessian: &'a SymmetricMatrix,
 }
-
-
 
 impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
     fn compute_update_step(
@@ -1304,8 +1240,6 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
     }
 }
 
-
-
 impl BlockWorkingSet {
     fn updater(&self) -> Box<dyn ParameterBlockUpdater + '_> {
         match self {
@@ -1322,8 +1256,6 @@ impl BlockWorkingSet {
         }
     }
 }
-
-
 
 pub(crate) fn check_linear_feasibility(
     beta: &Array1<f64>,
@@ -1357,14 +1289,10 @@ pub(crate) fn check_linear_feasibility(
     Ok(())
 }
 
-
-
 #[inline]
 pub(crate) fn effective_solverridge(ridge_floor: f64) -> f64 {
     ridge_floor.max(1e-15)
 }
-
-
 
 pub(crate) fn block_quadratic_penalty(
     beta: &Array1<f64>,
@@ -1378,8 +1306,6 @@ pub(crate) fn block_quadratic_penalty(
     }
     value
 }
-
-
 
 pub(crate) fn block_penalized_hessian_vector(
     spec: &ParameterBlockSpec,
@@ -1407,8 +1333,6 @@ pub(crate) fn block_penalized_hessian_vector(
     hpen
 }
 
-
-
 pub(crate) fn symmetric_matrix_diagonal(matrix: &SymmetricMatrix) -> Array1<f64> {
     match matrix {
         SymmetricMatrix::Dense(mat) => mat.diag().to_owned(),
@@ -1428,8 +1352,6 @@ pub(crate) fn symmetric_matrix_diagonal(matrix: &SymmetricMatrix) -> Array1<f64>
         }
     }
 }
-
-
 
 pub(crate) fn block_penalized_metric_diagonal(
     spec: &ParameterBlockSpec,
@@ -1462,8 +1384,6 @@ pub(crate) fn block_penalized_metric_diagonal(
     Ok(diagonal)
 }
 
-
-
 pub(crate) fn block_penalized_metric_norm(
     spec: &ParameterBlockSpec,
     work: &BlockWorkingSet,
@@ -1483,8 +1403,6 @@ pub(crate) fn block_penalized_metric_norm(
     Ok(joint_trust_region_metric_step_norm(direction, &diagonal))
 }
 
-
-
 pub(crate) fn truncate_block_step_to_metric_radius(
     spec: &ParameterBlockSpec,
     work: &BlockWorkingSet,
@@ -1502,16 +1420,11 @@ pub(crate) fn truncate_block_step_to_metric_radius(
     }
 }
 
-
-
 pub(crate) const TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS: usize = 4;
-
 
 // Avoid Rayon overhead for a few tiny blocks; this approximates the dense
 // mat-vec work in βᵀSβ before splitting independent block penalties.
 pub(crate) const TOTAL_QUADRATIC_PENALTY_PAR_MIN_DENSE_WORK: usize = 16_384;
-
-
 
 pub(crate) fn total_quadratic_penalty_parallel_worthwhile(
     states: &[ParameterBlockState],
@@ -1535,8 +1448,6 @@ pub(crate) fn total_quadratic_penalty_parallel_worthwhile(
         })
         .is_none()
 }
-
-
 
 pub(crate) fn total_quadratic_penalty(
     states: &[ParameterBlockState],
@@ -1575,8 +1486,6 @@ pub(crate) fn total_quadratic_penalty(
     per_block + joint
 }
 
-
-
 /// Locate the first non-finite entry in a Hessian and report it as a
 /// canonical "smooth-regularized logdet boundary" error. The same
 /// message is used at every site that refuses to factor or iterate on
@@ -1604,8 +1513,6 @@ pub(crate) fn smooth_regularized_logdet_hessian_finite_check(
         "smooth-regularized logdet Hessian contains non-finite entry at ({row}, {col}): {value}{block_context}"
     ) }.into())
 }
-
-
 
 /// Validate that every exact-Newton block working set in a family
 /// evaluation has a finite Hessian. Returns Err on the first
@@ -1652,8 +1559,6 @@ pub(crate) fn validate_block_hessians_finite(eval: &FamilyEvaluation) -> Result<
     }
     Ok(())
 }
-
-
 
 pub(crate) fn stable_logdet_with_ridge_policy(
     matrix: &Array2<f64>,
@@ -1738,8 +1643,6 @@ pub(crate) fn stable_logdet_with_ridge_policy(
     }
 }
 
-
-
 /// Try Cholesky with an escalating diagonal ridge.
 ///
 /// On attempt `k` (zero-indexed) the diagonal of `matrix` is boosted by
@@ -1777,8 +1680,6 @@ pub(crate) fn try_cholesky_with_escalating_ridge<R>(
     }
     None
 }
-
-
 
 /// Fallback for penalty pseudo-logdet when eigendecomposition fails.
 ///
@@ -1844,9 +1745,10 @@ pub(crate) fn penalty_logdet_cholesky_fallback(
     .into())
 }
 
-
-
-pub(crate) fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
+pub(crate) fn resolved_ridge_determinant_mode(
+    ridge_policy: RidgePolicy,
+    dim: usize,
+) -> RidgeDeterminantMode {
     assert!(
         dim.checked_add(1).is_some(),
         "ridge determinant dimension overflow"
@@ -1856,8 +1758,6 @@ pub(crate) fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: us
         mode => mode,
     }
 }
-
-
 
 pub(crate) fn inverse_spdwith_retry(
     matrix: &Array2<f64>,
@@ -1897,13 +1797,9 @@ pub(crate) fn inverse_spdwith_retry(
     .into())
 }
 
-
-
 pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
     crate::linalg::matrix::symmetrize_in_place(matrix);
 }
-
-
 
 pub(crate) fn validate_flat_direction_length(
     direction: &Array1<f64>,
@@ -1922,9 +1818,10 @@ pub(crate) fn validate_flat_direction_length(
     Ok::<(), _>(())
 }
 
-
-
-pub(crate) fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
+pub(crate) fn strict_solve_spd(
+    matrix: &Array2<f64>,
+    rhs: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
     let chol = sym
@@ -1932,8 +1829,6 @@ pub(crate) fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Resul
         .map_err(|_| "strict pseudo-laplace SPD solve failed".to_string())?;
     Ok(chol.solvevec(rhs))
 }
-
-
 
 /// Statistics about a Levenberg-Marquardt-style δ-ridge SPD continuation.
 /// Recorded by `strict_solve_spd_with_lm_continuation` and surfaced for
@@ -1946,8 +1841,6 @@ pub(crate) struct StrictSpdLmStats {
     /// Number of escalations performed before Cholesky succeeded.
     pub(crate) escalations: usize,
 }
-
-
 
 /// Strict-mode SPD solve with internal Levenberg-Marquardt δ-ridge
 /// continuation: solves `(H + δI) x = b` with δ escalated geometrically
@@ -1967,10 +1860,7 @@ pub(crate) struct StrictSpdLmStats {
 /// change updates the solve / inverse / logdet paths in lockstep.
 pub(crate) const STRICT_SPD_LM_MAX_ESCALATIONS: usize = 16;
 
-
 pub(crate) const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
-
-
 
 /// Floor applied to IRLS working weights so downstream divisions cannot hit
 /// exact zero. Used as the default `minweight` in `CustomFamilyOptions` and
@@ -1982,14 +1872,10 @@ pub(crate) const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 /// `minweight` defaults.
 pub(crate) const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = crate::solver::pirls::MIN_WEIGHT;
 
-
-
 /// Default initial ridge δ for the explicit-stabilization Cholesky escalation
 /// schedule. Enters the quadratic term, the Laplace Hessian, and the penalty
 /// log-determinant via the active `RidgePolicy`.
 pub(crate) const CUSTOM_FAMILY_RIDGE_FLOOR: f64 = 1e-12;
-
-
 
 /// Relative eigenvalue floor used wherever an eigendecomposition needs to
 /// distinguish "real" curvature from noise: `eps_floor = EVAL_FLOOR · max|λ|`.
@@ -1997,14 +1883,10 @@ pub(crate) const CUSTOM_FAMILY_RIDGE_FLOOR: f64 = 1e-12;
 /// pseudo-inverse, and penalty-direction projection.
 pub(crate) const CUSTOM_FAMILY_EVAL_FLOOR: f64 = 1e-12;
 
-
-
 /// Absolute relative-condition guard used to prevent the eigen / spectral
 /// floors from collapsing to zero when `max|λ|` is itself tiny. Combined with
 /// `CUSTOM_FAMILY_EVAL_FLOOR · max|λ|` via `.max(...)`.
 pub(crate) const CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR: f64 = 1e-14;
-
-
 
 /// Shared engine: try the bare strict path, fall through to an escalating
 /// LM δ-ridge Cholesky, and finally an eigen-floor fallback that clamps every
@@ -2078,8 +1960,6 @@ pub(crate) fn strict_spd_lm_engine<R>(
     ))
 }
 
-
-
 pub(crate) fn strict_solve_spd_with_lm_continuation(
     matrix: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -2113,8 +1993,6 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
         },
     )
 }
-
-
 
 /// Exact pseudo-Laplace log-determinant `log|H + S_λ|` of the REML/LAML
 /// objective, computed from the eigenspectrum with **no δ-ridge** so the value
@@ -2203,9 +2081,10 @@ pub(crate) fn strict_exact_pseudo_logdet(
         .sum())
 }
 
-
-
-pub(crate) fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
+pub(crate) fn pinv_positive_part(
+    matrix: &Array2<f64>,
+    ridge_floor: f64,
+) -> Result<Array2<f64>, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
     let (eigenvalues, eigenvectors) = sym
@@ -2231,8 +2110,6 @@ pub(crate) fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Resu
     symmetrize_dense_in_place(&mut pinv);
     Ok(pinv)
 }
-
-
 
 /// Numerical nullity of a symmetric penalized Hessian at the shared
 /// `KKT_REFUSAL_RANK_TOL` relative cutoff (the same threshold the spectral
@@ -2271,8 +2148,6 @@ pub(crate) fn symmetric_psd_projection(matrix: &Array2<f64>) -> Array2<f64> {
     let scaled = &evecs * &clamped.view().insert_axis(ndarray::Axis(0));
     scaled.dot(&evecs.t())
 }
-
-
 
 /// Modified-Newton convexification of a symmetric (penalized) Hessian: reflect
 /// every negative-curvature eigen-direction to its magnitude `|λ|` and floor the
@@ -2326,8 +2201,6 @@ pub(crate) fn symmetric_negative_curvature_reflected(matrix: &Array2<f64>) -> Ar
     scaled.dot(&evecs.t())
 }
 
-
-
 /// Smallest (signed) eigenvalue of a symmetric matrix; `NaN` if the
 /// eigendecomposition fails. Diagnostic helper for the #1040 convexification
 /// trace — reads the most-negative curvature so the log can confirm whether the
@@ -2340,8 +2213,6 @@ pub(crate) fn symmetric_min_eigenvalue_signed(matrix: &Array2<f64>) -> f64 {
         Err(_) => f64::NAN,
     }
 }
-
-
 
 pub(crate) fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<usize> {
     let p = lhs.nrows();
@@ -2356,8 +2227,6 @@ pub(crate) fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<u
     let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
     Some(evals.iter().filter(|x| x.abs() < cutoff).count())
 }
-
-
 
 /// Numerical null-space count AND the (range-space) condition number of a
 /// symmetric penalized Hessian, from ONE eigendecomposition.

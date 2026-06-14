@@ -120,7 +120,7 @@ used over — where each manifold lives, what shape, and how confident.
 ```python
 fit = gamfit.sae_manifold_fit(Z=acts, K=16, d_atom=1, atom_topology="circle")
 recon = fit.predict(acts)              # (N, p) reconstruction
-band = fit.shape_band(0)               # {"coords","mean","sd","lower","upper"}
+band = fit.shape_uncertainty(0)        # {"coords","mean","sd","lower","upper"}
 extent = fit.coords[0].min(0), fit.coords[0].max(0)   # where atom 0 lives
 ```
 

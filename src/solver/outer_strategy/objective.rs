@@ -1,12 +1,8 @@
 use super::*;
 
-
 pub(crate) fn outer_strategy_contract_panic(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())
 }
-
-
-
 
 /// Result of one outer objective evaluation.
 ///
@@ -25,7 +21,6 @@ pub struct OuterEval {
     pub inner_beta_hint: Option<Array1<f64>>,
 }
 
-
 impl OuterEval {
     /// Conventional representation of an infeasible trial point.
     ///
@@ -42,7 +37,6 @@ impl OuterEval {
     }
 }
 
-
 /// Explicit Hessian result replacing `Option<Array2<f64>>`.
 pub enum HessianResult {
     /// Analytic Hessian was computed and returned.
@@ -55,7 +49,6 @@ pub enum HessianResult {
     Unavailable,
 }
 
-
 impl Clone for OuterEval {
     fn clone(&self) -> Self {
         Self {
@@ -67,7 +60,6 @@ impl Clone for OuterEval {
     }
 }
 
-
 impl std::fmt::Debug for OuterEval {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OuterEval")
@@ -78,7 +70,6 @@ impl std::fmt::Debug for OuterEval {
     }
 }
 
-
 impl Clone for HessianResult {
     fn clone(&self) -> Self {
         match self {
@@ -88,7 +79,6 @@ impl Clone for HessianResult {
         }
     }
 }
-
 
 impl std::fmt::Debug for HessianResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -105,7 +95,6 @@ impl std::fmt::Debug for HessianResult {
         }
     }
 }
-
 
 impl HessianResult {
     /// Extract the Hessian matrix, panicking if unavailable.
@@ -224,7 +213,6 @@ impl HessianResult {
     }
 }
 
-
 /// Result of an EFS (Extended Fellner-Schall) evaluation at a given rho.
 ///
 /// Contains the REML/LAML cost at the current rho and the additive step
@@ -284,7 +272,6 @@ pub struct EfsEval {
     pub logdet_enclosure_gap: Option<f64>,
 }
 
-
 impl EfsEval {
     /// Attach a certified logdet-enclosure gap to this eval (the #1011 contract).
     /// The EFS engine then refuses to declare convergence on a cost the
@@ -295,7 +282,6 @@ impl EfsEval {
         self
     }
 }
-
 
 /// Outcome of [`OuterObjective::seed_inner_state`].
 ///
@@ -333,7 +319,6 @@ pub enum SeedOutcome {
     /// The objective has no inner-β slot; the β was discarded.
     NoSlot,
 }
-
 
 /// Common interface for outer smoothing-parameter objectives.
 ///
@@ -585,7 +570,6 @@ pub trait OuterObjective {
     }
 }
 
-
 // ─── Persistent warm-start checkpoint plumbing ────────────────────────
 //
 // `CheckpointingObjective` wraps any `OuterObjective` to write a copy of
@@ -616,12 +600,10 @@ pub(crate) struct IteratePayload {
     eval_id: u64,
 }
 
-
 /// Entries with a different schema id are rejected by `decode_iterate`
 /// so incompatible on-disk payloads fall through to cold start instead
 /// of seeding the inner solve with a malformed iterate.
 pub(crate) const ITERATE_PAYLOAD_SCHEMA: u32 = 2;
-
 
 pub(crate) fn encode_iterate(
     rho: &Array1<f64>,
@@ -639,7 +621,6 @@ pub(crate) fn encode_iterate(
     serde_json::to_vec(&p).ok()
 }
 
-
 pub(crate) fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayload> {
     let p: IteratePayload = serde_json::from_slice(bytes).ok()?;
     if p.schema != ITERATE_PAYLOAD_SCHEMA {
@@ -656,7 +637,6 @@ pub(crate) fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<It
     }
     Some(p)
 }
-
 
 /// Outcome of inspecting a cache entry as a seed for the outer optimizer.
 ///
@@ -710,7 +690,6 @@ pub(crate) enum CacheSeedDecision {
     },
 }
 
-
 pub(crate) fn classify_cache_entry_for_outer(
     loaded: &crate::cache::LoadedEntry,
     expected_rho_dim: usize,
@@ -759,7 +738,6 @@ pub(crate) fn classify_cache_entry_for_outer(
     }
 }
 
-
 pub(crate) fn cache_entry_would_help_outer(
     loaded: &crate::cache::LoadedEntry,
     expected_rho_dim: usize,
@@ -769,7 +747,6 @@ pub(crate) fn cache_entry_would_help_outer(
         CacheSeedDecision::ExactFinal { .. } | CacheSeedDecision::Seed { .. }
     )
 }
-
 
 pub(crate) struct CheckpointingObjective<'a> {
     inner: &'a mut dyn OuterObjective,
@@ -784,9 +761,8 @@ pub(crate) struct CheckpointingObjective<'a> {
     last_inner_beta: std::sync::Mutex<Option<Array1<f64>>>,
 }
 
-
 impl<'a> CheckpointingObjective<'a> {
-    fn new(
+    pub(crate) fn new(
         inner: &'a mut dyn OuterObjective,
         session: Arc<CacheSession>,
         mirror_sessions: Vec<Arc<CacheSession>>,
@@ -800,7 +776,7 @@ impl<'a> CheckpointingObjective<'a> {
         }
     }
 
-    fn last_inner_beta(&self) -> Option<Array1<f64>> {
+    pub(crate) fn last_inner_beta(&self) -> Option<Array1<f64>> {
         self.last_inner_beta.lock().ok().and_then(|g| g.clone())
     }
 
@@ -827,7 +803,6 @@ impl<'a> CheckpointingObjective<'a> {
         }
     }
 }
-
 
 impl<'a> OuterObjective for CheckpointingObjective<'a> {
     fn capability(&self) -> OuterCapability {
@@ -899,7 +874,6 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
     }
 }
 
-
 /// Closure-based adapter for [`OuterObjective`].
 ///
 /// This allows any call site to construct an `OuterObjective` from closures
@@ -939,7 +913,6 @@ pub struct ClosureObjective<
     /// cache/warm-start replay but declines the expensive rho-anneal pre-pass.
     pub(crate) continuation_prewarm: bool,
 }
-
 
 impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> OuterObjective
     for ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
@@ -1025,7 +998,6 @@ where
     }
 }
 
-
 impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
 where
     Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
@@ -1057,11 +1029,9 @@ where
     }
 }
 
-
 pub(crate) fn into_objective_error(context: &str, err: EstimationError) -> ObjectiveEvalError {
     ObjectiveEvalError::recoverable(format!("{context}: {err}"))
 }
-
 
 pub(crate) fn finite_cost_or_error(context: &str, cost: f64) -> Result<f64, ObjectiveEvalError> {
     if cost.is_finite() {
@@ -1072,7 +1042,6 @@ pub(crate) fn finite_cost_or_error(context: &str, cost: f64) -> Result<f64, Obje
         )))
     }
 }
-
 
 pub(crate) fn finite_outer_eval_or_error(
     context: &str,
@@ -1115,7 +1084,6 @@ pub(crate) fn finite_outer_eval_or_error(
     Ok(eval)
 }
 
-
 pub(crate) fn finite_outer_first_order_eval_or_error(
     context: &str,
     layout: OuterThetaLayout,
@@ -1134,7 +1102,6 @@ pub(crate) fn finite_outer_first_order_eval_or_error(
     }
     Ok(eval)
 }
-
 
 pub(crate) fn validate_second_order_seed_hessian(
     context: &str,
@@ -1169,4 +1136,3 @@ pub(crate) fn validate_second_order_seed_hessian(
 
     Ok(())
 }
-

@@ -4172,5 +4172,3 @@ impl TransformationNormalFamily {
         Ok(accum.value)
     }
 }
-
-}

@@ -148,7 +148,7 @@ pub(crate) fn build_response_basis(
     Ok((resp_val, resp_deriv, resp_penalties, knots, transform))
 }
 
-fn response_endpoint_value_bases(transform: &Array2<f64>) -> (Array1<f64>, Array1<f64>) {
+pub(crate) fn response_endpoint_value_bases(transform: &Array2<f64>) -> (Array1<f64>, Array1<f64>) {
     let mut lower = Array1::<f64>::zeros(transform.ncols() + 1);
     let mut upper = Array1::<f64>::zeros(transform.ncols() + 1);
     lower[0] = 1.0;
@@ -159,7 +159,7 @@ fn response_endpoint_value_bases(transform: &Array2<f64>) -> (Array1<f64>, Array
     (lower, upper)
 }
 
-fn response_floor_offsets(
+pub(crate) fn response_floor_offsets(
     response: &Array1<f64>,
     knots: &Array1<f64>,
     response_median: f64,
@@ -282,7 +282,7 @@ pub(crate) fn effective_response_num_internal_knots(
 // Tensor product construction
 // ---------------------------------------------------------------------------
 
-fn assert_rowwise_kronecker_dimensions(
+pub(crate) fn assert_rowwise_kronecker_dimensions(
     n: usize,
     p_resp: usize,
     p_cov: usize,

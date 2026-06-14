@@ -71,15 +71,16 @@ smoothing weights selected by REML. Each piece plays a distinct role
 
 - **Cross-atom decoder incoherence** (`decoder_incoherence_weight=1.0`, **on
   by default**, issue #671). The separability lever. For `K >= 2` it
-  penalizes the squared cross-Gram `||B_j^T B_k||_F^2` between the decoder
-  column-spaces of *co-activating* atom pairs, weighted by their empirical
-  co-activation `mean_n gate_j·gate_k`. This drives co-firing atoms toward
-  perpendicular ambient subspaces, conditioning the joint solve and making
-  the decomposition identifiable. Set the weight to `0.0` to disable.
+  penalizes the squared output-space cross-Gram `||B_j B_k^T||_F^2` between
+  the `(M_k, p)` decoder blocks of *co-activating* atom pairs, weighted by
+  their empirical co-activation `mean_n gate_j·gate_k`. This drives co-firing
+  atoms toward perpendicular ambient subspaces, conditioning the joint solve
+  and making the decomposition identifiable. Set the weight to `0.0` to
+  disable.
 
-- **Nuclear-norm embedding-rank selection** (`nuclear_norm_weight=0.0`, opt
-  in; `nuclear_norm_max_rank=` optional cap, issue #672). Adds a smoothed
-  sum-of-singular-values penalty on each atom's `(M_k, p)` decoder matrix,
+- **Nuclear-norm embedding-rank selection** (`nuclear_norm_weight=1.0`, **on
+  by default**; `nuclear_norm_max_rank=` optional cap, issue #672). Adds a
+  smoothed sum-of-singular-values penalty on each atom's `(M_k, p)` decoder matrix,
   shrinking its singular spectrum so the **embedding dimension** — how many
   ambient output directions the atom spends — is *selected* rather than
   fixed. Routed to the decoder (`"beta"`) block, complementary to the
@@ -92,28 +93,23 @@ smoothing weights selected by REML. Each piece plays a distinct role
   count per atom is `fit.atoms[k].active_dim` (also `fit.summary()
   ["active_dims"]`).
 
-- **Isometry gauge** (`isometry_weight=1.0`, **on by default**, issue #673).
-  `IsometryPenalty` drives the pulled-back metric `g = J^T J` toward the
-  identity, making the latent coordinate `t` a (near) arc-length, *canonical*
-  parameterization. This matters because the decoder smoothness penalty — and
-  hence the REML Occam term inside `fit.reml_score` — is computed in the **raw
-  coordinate `t`, not arc-length**, so it inherits the gauge of `t`. Topology
-  evidence (`reml_score`) is therefore **gauge-conditional**: comparing it
-  across topologies (e.g. circle vs euclidean) is only well posed when the
-  parameterization is approximately isometric. Setting
-  `isometry_weight <= 0` disables the penalty and raises a `UserWarning`,
-  because the resulting `reml_score` is no longer safe to rank topologies by.
+- **Isometry gauge** (`isometry_weight=0.0`, **off by default**, issue #673).
+  `IsometryPenalty` drives the pulled-back metric
+  `g = J^T J` toward a unit-average-speed chart, making `t` easier to read as
+  near arc length when the penalty is enabled. It is no longer required for
+  topology evidence: the Rust core reparameterizes decoder roughness by the
+  pulled-back metric, so `fit.reml_score` is gauge-invariant with
+  `isometry_weight=0.0`.
 
 - **Smoothness** (`smoothness_weight=1.0`). Roughness penalty on each atom's
   decoded curve, a fixed finite-/cyclic-difference Gram in the latent
   coordinate.
 
-- **Optional non-convex gate sparsity** (`gate_sparsity="l1"` default;
-  `"scad"` / `"mcp"`). Replaces the `l1` assignment-prior path with a
-  row-block `ScadMcpPenalty` on the latent block, using `sparsity_weight=` as
-  its strength and `scad_mcp_gamma=` as the concavity/taper (defaults SCAD
-  `3.7`, MCP `2.5`). The non-convex taper de-biases the surviving gates
-  relative to `l1`.
+- **Gate sparsity penalty** (`gate_sparsity="scad"` default; `"l1"` /
+  `"mcp"` alternatives). `scad` and `mcp` emit a row-block `ScadMcpPenalty` on
+  the latent block, using `sparsity_weight=` as its strength and
+  `scad_mcp_gamma=` as the concavity/taper (defaults SCAD `3.7`, MCP `2.5`).
+  `l1` keeps the historical assignment-prior sparsity path.
 
 Two more knobs: `decoder_feature_sparsity_groups=` group-lassoes the decoder
 over a partition of the `p` output features (encouraging each basis function
@@ -139,12 +135,12 @@ sampling) to a per-channel ambient band:
 Var_c(t) = Σ_{b1,b2} Φ_k(t)[b1] Φ_k(t)[b2] · Cov(β_k)[(b1,c),(b2,c)]
 ```
 
-`fit.shape_band(k)` returns the mean curve and its `±sd` envelope for atom
+`fit.shape_uncertainty(k)` returns the mean curve and its `±sd` envelope for atom
 `k`, evaluated along the atom's own coordinates (so the band reports
 uncertainty exactly where the data lives):
 
 ```python
-band = fit.shape_band(0, n_sd=1.96)   # n_sd=1.96 -> pointwise 95% band
+band = fit.shape_uncertainty(0, n_sd=1.96)   # pointwise 95% band
 band["coords"]   # (G, d_k)  the coordinates the band is evaluated at
 band["mean"]     # (G, p)    fitted ambient point m_k(t)
 band["sd"]       # (G, p)    posterior sd per channel
@@ -172,7 +168,7 @@ the manifold is pinned far more tightly than any single noisy observation.
 !!! note
     The uncertainty arrays are populated only on a **freshly-fit** model.
     A model round-tripped through `save` / `load` (or `to_dict` /
-    `from_dict`) drops them, and `shape_band` then raises `ValueError`.
+    `from_dict`) drops them, and `shape_uncertainty` then raises `ValueError`.
 
 ### Typical coordinate range
 
@@ -186,7 +182,7 @@ coords_k = fit.coords[0]                       # (N, d_k) per-token coordinate
 lo, hi   = coords_k.min(0), coords_k.max(0)    # full observed extent per axis
 p5, p95  = np.percentile(coords_k, [5, 95], 0) # robust central range
 
-band = fit.shape_band(0)
+band = fit.shape_uncertainty(0)
 # The band coordinates are an evenly-strided subset of the per-token
 # coordinates, so band["mean"] already traces the shape across exactly the
 # range the atom occupies. To inspect a sub-range, mask on band["coords"]:
@@ -206,21 +202,12 @@ Fresh SAE fits also carry a first-class per-atom curvature report:
 ```python
 curv = fit.curvature()
 curv[0]["kappa_hat"]          # fitted empirical curvature estimate for atom 0
-curv[0]["ci_lo"], curv[0]["ci_hi"]
-curv[0]["flatness_p_value"]
 ```
 
-`kappa_hat` is the empirical second-fundamental-form norm used by the
-curved-dictionary identifiability certificate. The report uses the same field
-names as `Model.curvature(...)` (`ci_lo`, `ci_hi`, `verdict`,
-`flatness_lr_stat`, `flatness_p_value`) so downstream report code can consume a
-stable schema.
-
-For SAE dictionaries, the profile-likelihood CI and flatness LR test are not
-computed yet because the fixed-κ SAE profile criterion is not exposed through
-the fit. Those fields are therefore present but set to `None`, with
-`ci_available=False` and `ci_method="unavailable"`. This is intentional: no
-Wald or geometry-bound substitute is reported as a confidence interval.
+`kappa_hat` is the empirical curvature bound used by the curved-dictionary
+certificate. SAE dictionaries do not currently expose a profile-likelihood CI
+or flatness LR test, so the per-atom rows are intentionally just
+`{"atom", "kappa_hat"}`.
 
 ## The `ManifoldSAE` result
 
@@ -238,7 +225,8 @@ the full surface):
 | `reconstruction_r2` / `reml_score` / `dispersion` | fit-quality / evidence / noise scale |
 
 Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
-`project(X, k)` and `per_atom_latent_for(X)` (coordinates), `shape_band(k)`,
+`project(X, k)` and `per_atom_latent_for(X)` (coordinates),
+`shape_uncertainty(k)`, `coordinate_range(k)`, `typical_shape(k)`,
 `curvature()` / `atom_curvature(k)`, `summary()`, `get_decoder()` /
 `get_anchors()`, and `to_dict` / `from_dict` / `save` / `load`.
 

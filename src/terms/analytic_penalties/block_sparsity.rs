@@ -29,7 +29,6 @@ pub struct BlockSparsityPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-
 impl BlockSparsityPenalty {
     #[must_use = "build error must be handled"]
     pub fn new(
@@ -234,7 +233,6 @@ impl BlockSparsityPenalty {
     }
 }
 
-
 impl AnalyticPenalty for BlockSparsityPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -319,7 +317,6 @@ impl AnalyticPenalty for BlockSparsityPenalty {
     impl_scalar_apply_schedule!(weight);
 }
 
-
 // ---------------------------------------------------------------------------
 // Mechanism-sparsity penalty
 // ---------------------------------------------------------------------------
@@ -336,7 +333,6 @@ pub struct MechanismSparsityPenalty {
     pub learnable_weight: bool,
     pub rho_index: usize,
 }
-
 
 impl MechanismSparsityPenalty {
     #[must_use = "build error must be handled"]
@@ -555,7 +551,6 @@ impl MechanismSparsityPenalty {
     }
 }
 
-
 impl AnalyticPenalty for MechanismSparsityPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Beta
@@ -650,5 +645,3 @@ impl AnalyticPenalty for MechanismSparsityPenalty {
         }
     }
 }
-
-

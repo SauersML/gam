@@ -4,8 +4,6 @@
 // resolve through the parent namespace.
 use super::*;
 
-
-
 pub(crate) struct BinomialLocationScaleCore {
     sigma: Array1<f64>,
     dsigma_deta: Array1<f64>,
@@ -17,7 +15,6 @@ pub(crate) struct BinomialLocationScaleCore {
     log_likelihood: f64,
 }
 
-
 #[derive(Clone, Copy)]
 pub(crate) struct NonWiggleQDerivs {
     q_t: f64,
@@ -28,7 +25,6 @@ pub(crate) struct NonWiggleQDerivs {
     q_ll_ls: f64,
 }
 
-
 #[derive(Clone, Copy)]
 pub(crate) struct NonWiggleQDirectional {
     delta_q: f64,
@@ -38,7 +34,6 @@ pub(crate) struct NonWiggleQDirectional {
     delta_q_ll: f64,
 }
 
-
 #[derive(Clone, Copy)]
 pub(crate) struct BinomialLocationScaleRow {
     sigma: f64,
@@ -47,7 +42,6 @@ pub(crate) struct BinomialLocationScaleRow {
     inverse_link: crate::mixture_link::InverseLinkJet,
     ll: f64,
 }
-
 
 /// Non-wiggle location-scale map derivatives via shared scalar core.
 pub(crate) fn nonwiggle_q_derivs(eta_t: f64, sigma: f64) -> NonWiggleQDerivs {
@@ -67,7 +61,6 @@ pub(crate) fn nonwiggle_q_derivs(eta_t: f64, sigma: f64) -> NonWiggleQDerivs {
         q_ll_ls,
     }
 }
-
 
 /// Directional derivatives along (d_eta_t, d_eta_ls):
 /// delta_q = q_t d_eta_t + q_ls d_eta_ls
@@ -103,7 +96,6 @@ pub(crate) fn nonwiggle_q_directional(
     }
 }
 
-
 #[inline]
 pub(crate) fn log1mexp_neg_positive(z: f64) -> f64 {
     assert!(z >= 0.0);
@@ -116,9 +108,12 @@ pub(crate) fn log1mexp_neg_positive(z: f64) -> f64 {
     }
 }
 
-
 #[inline]
-pub(crate) fn bernoulli_log_likelihood_from_probability(y: f64, weight: f64, mu: f64) -> Result<f64, String> {
+pub(crate) fn bernoulli_log_likelihood_from_probability(
+    y: f64,
+    weight: f64,
+    mu: f64,
+) -> Result<f64, String> {
     if weight == 0.0 {
         return Ok(0.0);
     }
@@ -153,12 +148,10 @@ pub(crate) fn bernoulli_log_likelihood_from_probability(y: f64, weight: f64, mu:
     }
 }
 
-
 #[inline]
 pub(crate) fn binomial_location_scale_q0(eta_t: f64, sigma: f64) -> f64 {
     -eta_t / sigma
 }
-
 
 #[inline]
 pub(crate) fn binomial_location_scale_log_likelihood(
@@ -201,7 +194,6 @@ pub(crate) fn binomial_location_scale_log_likelihood(
     }
 }
 
-
 #[inline]
 pub(crate) fn binomial_expected_q_information_derivatives(
     weight: f64,
@@ -240,7 +232,6 @@ pub(crate) fn binomial_expected_q_information_derivatives(
     }
 }
 
-
 pub(crate) fn binomial_expected_location_scale_second_coefficients(
     q: NonWiggleQDerivs,
     f: f64,
@@ -276,7 +267,6 @@ pub(crate) fn binomial_expected_location_scale_second_coefficients(
         + 2.0 * f * (q.q_ls * q_ls_uv + u.delta_q_ls * v.delta_q_ls);
     (tt, tl, ll)
 }
-
 
 pub(crate) fn binomial_location_scalerow(
     y: f64,
@@ -314,7 +304,6 @@ pub(crate) fn binomial_location_scalerow(
         ll,
     })
 }
-
 
 /// Compute only the log-likelihood scalar for the binomial location-scale model.
 /// This avoids allocating 7 n-vectors that `binomial_location_scale_core` would produce,
@@ -357,7 +346,6 @@ pub(crate) fn binomial_location_scale_ll_only(
         )
         .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))
 }
-
 
 pub(crate) fn binomial_location_scale_core(
     y: &Array1<f64>,
@@ -478,7 +466,6 @@ pub(crate) fn binomial_location_scale_core(
     })
 }
 
-
 #[inline]
 pub(crate) fn binomial_location_scale_nll_tower(
     y: f64,
@@ -512,7 +499,6 @@ pub(crate) fn binomial_location_scale_nll_tower(
     Ok(q.compose_unary([-ll, m1, m2, m3, m4]))
 }
 
-
 #[inline]
 pub(crate) fn binomial_location_scale_nll_tower_from_core_row(
     y: f64,
@@ -539,7 +525,6 @@ pub(crate) fn binomial_location_scale_nll_tower_from_core_row(
         include_fourth,
     )
 }
-
 
 /// Pure row-coefficient builder for the binomial location-scale joint
 /// directional derivative `D_β H_L[u]`. Returns `(c_tt, c_tl, c_ll)` such
@@ -580,7 +565,6 @@ pub(crate) fn binomial_location_scale_first_directional_coefficients(
     }
     Ok((coeff_tt, coeff_tl, coeff_ll))
 }
-
 
 /// Pure row-coefficient builder for the binomial location-scale joint
 /// second directional derivative `D²_β H_L[u, v]`. Returns
@@ -625,12 +609,9 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
     Ok((coeff_tt, coeff_tl, coeff_ll))
 }
 
-
 /// Built-in Gaussian location-scale family:
 /// - Block 0: location μ(·) with identity link
 /// - Block 1: log-scale log σ(·) with log link
-
-
 
 impl BinomialLocationScaleFamily {
     pub const BLOCK_T: usize = 0;
@@ -2957,7 +2938,6 @@ impl BinomialLocationScaleFamily {
     }
 }
 
-
 impl CustomFamily for BinomialLocationScaleFamily {
     /// The Binomial location-scale joint Hessian depends on β because the
     /// Hessian blocks are functions of q = -t/σ and the link derivatives,
@@ -3554,7 +3534,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
     }
 }
 
-
 impl CustomFamilyGenerative for BinomialLocationScaleFamily {
     fn generativespec(
         &self,
@@ -3591,7 +3570,6 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
     }
 }
 
-
 /// Matrix-free joint-Hessian operator for the two-block binomial
 /// location-scale family.
 ///
@@ -3623,12 +3601,10 @@ struct BinomialLocationScaleHessianWorkspace {
     // the per-pair cache was a memory-only loss at large-scale shape.
 }
 
-
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct BinomialDirectionKey {
     bits: Vec<u64>,
 }
-
 
 impl BinomialDirectionKey {
     fn from_array(v: &Array1<f64>) -> Self {
@@ -3638,19 +3614,16 @@ impl BinomialDirectionKey {
     }
 }
 
-
 struct BinomialDirectionEta {
     t: Array1<f64>,
     ls: Array1<f64>,
 }
-
 
 struct BinomialRowCoeffTriple {
     tt: Arc<Array1<f64>>,
     tl: Arc<Array1<f64>>,
     ll: Arc<Array1<f64>>,
 }
-
 
 impl BinomialLocationScaleHessianWorkspace {
     fn new(
@@ -3812,7 +3785,6 @@ impl BinomialLocationScaleHessianWorkspace {
     }
 }
 
-
 impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         // Same Hv structure as `hessian_matvec`, built once via 3 GEMMs:
@@ -3972,7 +3944,6 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
     }
 }
 
-
 /// Built-in binomial location-scale family with a configurable inverse link and learnable wiggle on q.
 ///
 /// Block structure:
@@ -3994,7 +3965,6 @@ pub struct BinomialLocationScaleWiggleFamily {
     /// when the family is built without an explicit policy.
     pub policy: crate::resource::ResourcePolicy,
 }
-
 
 impl BinomialLocationScaleWiggleFamily {
     pub const BLOCK_T: usize = 0;
@@ -6587,7 +6557,6 @@ impl BinomialLocationScaleWiggleFamily {
     }
 }
 
-
 /// Per-row pieces of the 3-block wiggle joint Hessian.
 ///
 /// `coeff_*` are diagonal weights (length n). `b0` and `d0` are the realized
@@ -6614,7 +6583,6 @@ struct BinomialLocationScaleWiggleHessianRowPieces {
     d0: Array2<f64>,
 }
 
-
 struct ExpectedWiggleGeometryInputs<'a> {
     x_t: Cow<'a, Array2<f64>>,
     x_ls: Cow<'a, Array2<f64>>,
@@ -6622,7 +6590,6 @@ struct ExpectedWiggleGeometryInputs<'a> {
     eta_ls: &'a Array1<f64>,
     etaw: &'a Array1<f64>,
 }
-
 
 impl BinomialLocationScaleWiggleHessianRowPieces {
     fn assemble_dense(&self, x_t: &Array2<f64>, x_ls: &Array2<f64>) -> Result<Array2<f64>, String> {
@@ -6666,7 +6633,6 @@ impl BinomialLocationScaleWiggleHessianRowPieces {
     }
 }
 
-
 /// Per-row coefficient arrays for the BLS Wiggle joint first-directional
 /// Hessian derivative `D_β H_L[u]`, shared by the dense `_directional_derivative`
 /// assembly and the matrix-free `bls_wiggle_directional_operator`.
@@ -6684,7 +6650,6 @@ struct BinomialWiggleDhRowCoeffs {
     coeffww_db: Array1<f64>,
 }
 
-
 /// All references needed to evaluate [`BinomialWiggleDhRowCoeffs`].
 struct BinomialWiggleDhRowInputs<'a> {
     core0: &'a BinomialLocationScaleCore,
@@ -6701,7 +6666,6 @@ struct BinomialWiggleDhRowInputs<'a> {
     d_eta_t: &'a Array1<f64>,
     d_eta_ls: &'a Array1<f64>,
 }
-
 
 impl BinomialLocationScaleWiggleFamily {
     /// Per-row coefficient loop for the joint first-directional Hessian
@@ -6839,7 +6803,6 @@ impl BinomialLocationScaleWiggleFamily {
         .block_effective_jacobian(specs, block_idx)
     }
 }
-
 
 impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// The Binomial location-scale-wiggle joint Hessian depends on β because
@@ -8038,7 +8001,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 }
 
-
 impl BinomialLocationScaleWiggleFamily {
     /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
     /// directional derivative `D_β H_L[u]`. Channels (in order):
@@ -8619,7 +8581,6 @@ impl BinomialLocationScaleWiggleFamily {
     }
 }
 
-
 /// Matrix-free joint-Hessian operator for the 3-block binomial
 /// location-scale wiggle family. See `BinomialLocationScaleWiggleHessianRowPieces`
 /// for the per-row weight structure.
@@ -8630,8 +8591,6 @@ struct BinomialLocationScaleWiggleHessianWorkspace {
     x_ls: Arc<Array2<f64>>,
     pieces: BinomialLocationScaleWiggleHessianRowPieces,
 }
-
-
 
 impl BinomialLocationScaleWiggleHessianWorkspace {
     fn new(
@@ -8696,7 +8655,6 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
         self.pieces.coeffww = maskww;
     }
 }
-
 
 impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
@@ -8851,7 +8809,6 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         )
     }
 }
-
 
 impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
     fn generativespec(

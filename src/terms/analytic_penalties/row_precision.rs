@@ -25,7 +25,6 @@ pub struct RowPrecisionPriorPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-
 impl RowPrecisionPriorPenalty {
     #[must_use = "build error must be handled"]
     pub fn new(
@@ -233,7 +232,6 @@ impl RowPrecisionPriorPenalty {
     }
 }
 
-
 impl AnalyticPenalty for RowPrecisionPriorPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -358,7 +356,6 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
     impl_scalar_apply_schedule!(weight);
 }
 
-
 // ---------------------------------------------------------------------------
 // iVAE ridge conditional-mean gauge penalty
 // ---------------------------------------------------------------------------
@@ -385,7 +382,6 @@ pub struct IvaeRidgeMeanGauge {
     pub target: PsiSlice,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl IvaeRidgeMeanGauge {
     #[must_use = "build error must be handled"]
@@ -636,7 +632,6 @@ impl IvaeRidgeMeanGauge {
     }
 }
 
-
 impl AnalyticPenalty for IvaeRidgeMeanGauge {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -717,7 +712,6 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
     impl_scalar_apply_schedule!(weight);
 }
 
-
 // ---------------------------------------------------------------------------
 // Parametric row-precision prior penalty
 // ---------------------------------------------------------------------------
@@ -744,7 +738,6 @@ pub struct ParametricRowPrecisionPriorPenalty {
     pub target: PsiSlice,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl ParametricRowPrecisionPriorPenalty {
     #[must_use = "build error must be handled"]
@@ -1022,7 +1015,6 @@ impl ParametricRowPrecisionPriorPenalty {
     }
 }
 
-
 impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -1142,5 +1134,3 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
 
     impl_scalar_apply_schedule!(weight);
 }
-
-

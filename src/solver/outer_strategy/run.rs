@@ -1,23 +1,20 @@
 use super::*;
 
-
 pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
-
-
 
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 pub(crate) struct OuterConfig {
-    tolerance: f64,
-    max_iter: usize,
-    bounds: Option<(Array1<f64>, Array1<f64>)>,
-    seed_config: crate::seeding::SeedConfig,
-    rho_bound: f64,
-    heuristic_lambdas: Option<Vec<f64>>,
-    initial_rho: Option<Array1<f64>>,
-    fallback_policy: FallbackPolicy,
-    screening_cap: Option<Arc<AtomicUsize>>,
-    screen_initial_rho: bool,
+    pub(crate) tolerance: f64,
+    pub(crate) max_iter: usize,
+    pub(crate) bounds: Option<(Array1<f64>, Array1<f64>)>,
+    pub(crate) seed_config: crate::seeding::SeedConfig,
+    pub(crate) rho_bound: f64,
+    pub(crate) heuristic_lambdas: Option<Vec<f64>>,
+    pub(crate) initial_rho: Option<Array1<f64>>,
+    pub(crate) fallback_policy: FallbackPolicy,
+    pub(crate) screening_cap: Option<Arc<AtomicUsize>>,
+    pub(crate) screen_initial_rho: bool,
     /// Outer-aware inner-PIRLS iteration cap (sibling of `screening_cap`).
     /// When set, the BFGS bridge drives this atomic on every accepted
     /// gradient eval to coarsen the inner Newton solve at early outer iters
@@ -26,44 +23,44 @@ pub(crate) struct OuterConfig {
     /// does NOT suppress cache writes / warm-start updates / KKT
     /// enforcement; it is purely a budget. See
     /// `RemlObjectiveState::outer_inner_cap` for dual-cap semantics.
-    outer_inner_cap: Option<InnerProgressFeedback>,
-    operator_initial_trust_radius: Option<f64>,
-    arc_initial_regularization: Option<f64>,
+    pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
+    pub(crate) operator_initial_trust_radius: Option<f64>,
+    pub(crate) arc_initial_regularization: Option<f64>,
     /// Optional scale factor for the objective's natural magnitude.
     /// Used to widen the absolute gradient-norm floor on objectives whose
     /// gradient lives on a non-unit scale (e.g. Gaussian-identity REML at
     /// large `n`, whose ∂/∂logλ inherits the O(n) likelihood constant).
     /// `None` falls back to the bare `tolerance` floor.
-    objective_scale: Option<f64>,
+    pub(crate) objective_scale: Option<f64>,
     /// BFGS line-search infinity-norm cap applied to the leading `rho_dim`
     /// outer parameters (log-λ axes). Documented natural step for
     /// `log(lambda)` is ≈ 5 (`e^5 ≈ 148`-fold smoothing-parameter change
     /// per accepted outer iter — matches typical quasi-Newton direction
     /// magnitude on flat REML surfaces). Setting this `None` disables the
     /// rho-axis cap entirely.
-    bfgs_step_cap: Option<f64>,
+    pub(crate) bfgs_step_cap: Option<f64>,
     /// BFGS line-search infinity-norm cap applied to the trailing `psi_dim`
     /// outer parameters (kappa / aniso-log-scale axes). Required because
     /// the kernel scale axes need much tighter control (`e^1 ≈ 2.7`-fold
     /// per iter is plenty) — using the rho-axis cap here lets the optimizer
     /// jump kappa by orders of magnitude per step and oscillate. Setting
     /// this `None` disables the psi-axis cap.
-    bfgs_step_cap_psi: Option<f64>,
+    pub(crate) bfgs_step_cap_psi: Option<f64>,
     /// Optional persistent-cache session. When `Some`, every finite objective
     /// evaluation is written through to disk (rate-limited, atomic-rename)
     /// and the best on-disk rho is prepended as a seed at the start of each
     /// plan attempt. Defaulted off so test-only paths skip filesystem I/O.
-    cache_session: Option<Arc<CacheSession>>,
+    pub(crate) cache_session: Option<Arc<CacheSession>>,
     /// Optional mirror cache sessions. Checkpoints and successful finalize
     /// writes are also written to each of these sessions (different keys,
     /// shared store). Used for hierarchical broadcast: the current best ρ is
     /// written to the exact-key (primary) AND the data-independent
     /// seed-prefix key so the next fit with related structure can warm-start
     /// from this one, even after an interrupted run.
-    cache_mirror_sessions: Vec<Arc<CacheSession>>,
-    rho_uncertainty_problem_size: crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
+    pub(crate) cache_mirror_sessions: Vec<Arc<CacheSession>>,
+    pub(crate) rho_uncertainty_problem_size:
+        crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
 }
-
 
 impl Default for OuterConfig {
     fn default() -> Self {
@@ -91,7 +88,6 @@ impl Default for OuterConfig {
         }
     }
 }
-
 
 // ─── OuterProblem builder ─────────────────────────────────────────────
 //
@@ -133,7 +129,6 @@ pub struct OuterProblem {
     rho_uncertainty_problem_size: crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
     continuation_prewarm: bool,
 }
-
 
 impl OuterProblem {
     pub fn new(n_params: usize) -> Self {
@@ -741,7 +736,6 @@ impl OuterProblem {
     }
 }
 
-
 /// Result of a completed outer optimization.
 #[derive(Clone, Debug)]
 pub struct OuterResult {
@@ -785,7 +779,6 @@ pub struct OuterResult {
         Option<crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic>,
 }
 
-
 impl OuterResult {
     pub fn new(
         rho: Array1<f64>,
@@ -820,7 +813,6 @@ impl OuterResult {
     }
 }
 
-
 // ─── First-order optimality certificate (#934) ────────────────────────
 //
 // The objective↔gradient desync bug genus (#748, #752, #808, #901, …) has a
@@ -848,12 +840,10 @@ impl OuterResult {
 /// error bars (and also fail the relative gate).
 pub(crate) const CERTIFICATE_Z_GATE: f64 = 4.0;
 
-
 /// Relative agreement gate: differences below this fraction of the larger
 /// directional derivative are consistent regardless of the (possibly
 /// underestimated) FD error bar.
 pub(crate) const CERTIFICATE_RELATIVE_GATE: f64 = 1e-3;
-
 
 /// ρ margin (in log-λ units) within which an outer smoothing coordinate
 /// counts as railed against its box bound — the #752 signature (λ → ∞ when
@@ -861,7 +851,6 @@ pub(crate) const CERTIFICATE_RELATIVE_GATE: f64 = 1e-3;
 /// [`OVERSMOOTH_BOUNDARY_MARGIN`], which classifies seed *starts*; this one
 /// classifies returned *optima*.
 pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
-
 
 /// First-order optimality certificate: gradient-vs-objective FD audit at the
 /// returned optimum (#934).
@@ -896,7 +885,6 @@ pub struct CriterionCertificate {
     /// [`CERTIFICATE_RAIL_MARGIN`] of either box bound at the optimum.
     pub lambdas_railed: Vec<usize>,
 }
-
 
 impl CriterionCertificate {
     /// Whether the analytic directional derivative agrees with the finite
@@ -946,7 +934,6 @@ impl CriterionCertificate {
         )
     }
 }
-
 
 /// Deterministic unit direction on the θ sphere for the certificate audit.
 ///
@@ -1001,7 +988,6 @@ pub(crate) fn certificate_audit_direction(theta: &Array1<f64>, context: &str) ->
     }
 }
 
-
 /// Plain Cholesky positive-definiteness probe for the (small, outer-dim)
 /// final Hessian. Returns `None` when the matrix is empty, non-square, or
 /// non-finite; `Some(false)` on any non-positive pivot.
@@ -1030,7 +1016,6 @@ pub(crate) fn certificate_hessian_is_pd(hessian: &Array2<f64>) -> Option<bool> {
     Some(true)
 }
 
-
 /// Smoothing coordinates (leading ρ block) railed against the outer box.
 pub(crate) fn certificate_railed_lambdas(
     rho: &Array1<f64>,
@@ -1049,7 +1034,6 @@ pub(crate) fn certificate_railed_lambdas(
         })
         .collect()
 }
-
 
 /// Perform the randomized first-order self-audit at the returned optimum.
 ///
@@ -1147,7 +1131,6 @@ pub(crate) fn audit_first_order_optimality(
     }
     Some(certificate)
 }
-
 
 pub(crate) fn compute_rho_uncertainty_diagnostic(
     obj: &mut dyn OuterObjective,
@@ -1280,7 +1263,6 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
     diagnostic
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorTrustRegionStopReason {
     Converged,
@@ -1292,7 +1274,6 @@ pub enum OperatorTrustRegionStopReason {
     /// (e.g. BFGS gradient-only) instead of trusting the partial result.
     RoutingMismatch,
 }
-
 
 /// Run the outer smoothing-parameter optimization.
 ///
@@ -1329,7 +1310,6 @@ pub(crate) fn run_outer(
     ));
     Ok(result)
 }
-
 
 /// The solver ladder behind [`run_outer`], without the #934 self-audit.
 pub(crate) fn run_outer_uncertified(
@@ -1554,7 +1534,6 @@ pub(crate) fn run_outer_uncertified(
     }))
 }
 
-
 // ─── Frontier ρ-scaling auto-switch (issue #986) ─────────────────────────
 //
 // ARD-per-atom assigns one smoothing coordinate per dictionary atom, so the
@@ -1579,7 +1558,6 @@ pub(crate) fn run_outer_uncertified(
 pub fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
     crate::solver::estimate::reml::per_atom_efs::per_atom_efs_eligible(cap)
 }
-
 
 /// Auto-switch entry point: when `cap` is frontier-scale per-atom-EFS-eligible,
 /// run the per-atom decoupled EFS primary and return its [`OuterResult`];
@@ -1653,13 +1631,11 @@ pub(crate) fn run_per_atom_efs_if_frontier(
     Ok(Some(result.into_outer_result(the_plan)))
 }
 
-
 pub(crate) fn outer_bounds(lo: &Array1<f64>, hi: &Array1<f64>) -> Result<Bounds, EstimationError> {
     Bounds::new(lo.clone(), hi.clone(), 1e-6).map_err(|err| {
         EstimationError::InvalidInput(format!("outer rho bounds are invalid: {err}"))
     })
 }
-
 
 pub(crate) fn outer_bounds_template(config: &OuterConfig, n: usize) -> (Array1<f64>, Array1<f64>) {
     config.bounds.clone().unwrap_or_else(|| {
@@ -1670,12 +1646,10 @@ pub(crate) fn outer_bounds_template(config: &OuterConfig, n: usize) -> (Array1<f
     })
 }
 
-
 pub(crate) fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> {
     Tolerance::new(value)
         .map_err(|err| EstimationError::InvalidInput(format!("outer tolerance is invalid: {err}")))
 }
-
 
 pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientTolerance {
     let abs = config
@@ -1690,12 +1664,10 @@ pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientToleranc
     }
 }
 
-
 pub(crate) fn outer_max_iterations(value: usize) -> Result<MaxIterations, EstimationError> {
     MaxIterations::new(value)
         .map_err(|err| EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}")))
 }
-
 
 pub(crate) fn sanitized_operator_trust_restart_radius(radius: Option<f64>) -> Option<f64> {
     radius
@@ -1703,8 +1675,10 @@ pub(crate) fn sanitized_operator_trust_restart_radius(radius: Option<f64>) -> Op
         .map(|value| value.max(OPERATOR_TRUST_RESTART_RADIUS_FLOOR))
 }
 
-
-pub(crate) fn bfgs_axis_step_caps(config: &OuterConfig, layout: OuterThetaLayout) -> Option<Array1<f64>> {
+pub(crate) fn bfgs_axis_step_caps(
+    config: &OuterConfig,
+    layout: OuterThetaLayout,
+) -> Option<Array1<f64>> {
     if config.bfgs_step_cap.is_none() && config.bfgs_step_cap_psi.is_none() {
         return None;
     }
@@ -1722,13 +1696,11 @@ pub(crate) fn bfgs_axis_step_caps(config: &OuterConfig, layout: OuterThetaLayout
     Some(caps)
 }
 
-
 pub(crate) enum FixedPointOuterRunError {
     SeedRejected(EstimationError),
     ImmediateFallback(EstimationError),
     Failed(EstimationError),
 }
-
 
 pub(crate) fn run_fixed_point_outer_solver(
     obj: &mut dyn OuterObjective,

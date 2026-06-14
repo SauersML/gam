@@ -13,11 +13,11 @@ Supported geometries:
 | --- | --- | --- |
 | `"spherical"` / `"sphere"` | unit sphere | geodesic log-map at the Karcher/Fréchet mean (lives in the ambient tangent plane; norm equals geodesic distance) |
 | `"simplex"` / `"clr"` | strictly positive simplex | centered log-ratio |
-| `"alr"` | strictly positive simplex | additive log-ratio |
-| `"spd"` | symmetric positive-definite matrices | log-Euclidean / affine-invariant tangent chart, depending on the fitted descriptor |
-| `"grassmann(k=...)"` | k-dimensional subspaces | Grassmann log map at the intrinsic mean |
-| `"stiefel(k=...)"` | orthonormal k-frames | Stiefel tangent chart |
-| `"poincare"` | hyperbolic ball with fixed negative curvature | Poincare log map |
+| `"alr"` | strictly positive simplex | additive log-ratio, with the Aitchison Gram installed automatically unless `fisher_rao_w=` is supplied |
+| `"spd"` | symmetric positive-definite matrices | SPD log map; response columns are a flattened square matrix |
+| `"grassmann(k=...)"` | k-dimensional subspaces | Grassmann log map at the intrinsic mean; `n` is inferred from the column count unless supplied |
+| `"stiefel(k=...)"` | orthonormal k-frames | Stiefel tangent chart; `n` is inferred from the column count unless supplied |
+| `"poincare"` / `"poincare(curvature=-0.5)"` | hyperbolic ball with fixed negative curvature | Poincare log map; default curvature is `-1.0` |
 | `"constant_curvature"` | learned constant-curvature family | REML/evidence estimates curvature and reports the spherical / flat / hyperbolic verdict |
 
 For simplex responses, the base point is the Aitchison Fréchet mean
@@ -42,6 +42,14 @@ Pass `response_coordinates="alr"` (or `response_geometry="alr"`) to fit
 a `D − 1` dimensional ALR chart instead of the default `D`-column CLR
 representation. `response_reference=` selects the ALR denominator by
 integer component index and defaults to the last response-column position.
+Because Euclidean ALR is not Aitchison-isometric, the fit path supplies the
+ALR Aitchison Gram as the tangent residual precision when `fisher_rao_w=` is
+not supplied.
+
+`response_geometry="constant_curvature"` first estimates `kappa_hat` from the
+responses, then fits and predicts on `constant_curvature(dim=D,kappa=kappa_hat)`.
+`model.summary()["curvature"]` carries `kappa_hat`, the profile CI, the
+flatness LR test, and the verdict.
 
 For curved matrix / subspace responses, pass response columns containing
 the flattened representation expected by the corresponding geometry

@@ -112,7 +112,6 @@
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 //! | BlockOrthogonality | ext-coord (latent t) | 0 or 1 (log μ_block_orth) |
 
-
 // Re-exported so every concern submodule can pull the shared external imports
 // through `use super::*;` without re-listing them.
 pub(crate) use faer::Side;
@@ -134,9 +133,11 @@ pub(crate) use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleK
 pub(crate) use crate::terms::sheaf::SheafConsistencyPenalty;
 pub(crate) use crate::terms::smooth::BlockwisePenalty;
 
+#[macro_use]
+mod common;
+
 mod ard;
 mod block_sparsity;
-mod common;
 mod ibp;
 mod isometry;
 mod nested_prefix;

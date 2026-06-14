@@ -821,7 +821,7 @@ pub(crate) struct TransformationNormalPsiWorkspace {
 }
 
 impl TransformationNormalPsiWorkspace {
-    fn new(
+    pub(crate) fn new(
         family: TransformationNormalFamily,
         block_states: Vec<ParameterBlockState>,
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,

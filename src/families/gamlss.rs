@@ -31,6 +31,7 @@
 //! [`weighted_design_products`], [`row_linalg`], and [`joint_packing`].
 
 use crate::basis::{BasisOptions, PenaltyInfo, PenaltySource};
+use crate::pirls::MIN_WEIGHT;
 
 use crate::custom_family::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,

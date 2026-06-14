@@ -1,41 +1,48 @@
 # Exceptions
 
-`gamfit` raises a small set of dedicated exception types. They share a
-common base for mapped Rust/binding failures.
+`gamfit` raises Rust-defined Python exception classes and re-exports them
+from `gamfit`. Engine errors share the `GamError` base, which inherits
+from `ValueError`; the Rust extension unavailable case remains an
+`ImportError`.
 
 ## Hierarchy
 
 ```
 Exception
-└── GamError
-    ├── FormulaError
-    ├── SchemaMismatchError
-    └── PredictionError
+└── ValueError
+    └── GamError
+        ├── FormulaError
+        │   ├── ColumnNotFoundError
+        │   └── TermBuilderError
+        ├── SchemaMismatchError
+        └── PredictionError
+            ├── PredictInputError
+            └── SurvivalPredictError
 
 ImportError
 └── RustExtensionUnavailableError
 ```
 
-`map_exception` (in `gamfit._exceptions`) inspects the message of an
-exception raised by the Rust binding and returns the most specific class.
-The classification rules are keyword-based on the lower-cased message:
+Most engine errors have more specific subclasses under `GamError`, such
+as `InvalidInputError`, `RemlConvergenceError`,
+`HessianNotPositiveDefiniteError`, `IllConditionedError`,
+`InvalidSpecificationError`, `DataError`, `SmoothError`, `GamlssError`,
+`SurvivalError`, and location-scale/custom-family errors. Catch `GamError` for a
+stable package-level umbrella, or catch a specific subclass when recovery
+depends on the failure mode.
 
-| Keyword in message | Mapped class |
-| --- | --- |
-| `formula` or `parse` | `FormulaError` |
-| `schema`, `missing required column`, `unknown column` | `SchemaMismatchError` |
-| `prediction` or `predict` | `PredictionError` |
-| (any other Rust error) | `GamError` |
-
-`RustExtensionUnavailableError` is returned unchanged.
+`map_exception` (in `gamfit._exceptions`) preserves typed Rust
+`GamError` subclasses unchanged. `RustExtensionUnavailableError` is also
+returned unchanged. Python-native `TypeError`, `LookupError`, and
+`ArithmeticError` pass through; other `ValueError`s from remaining string
+FFI paths are promoted to `GamError`.
 
 ## When each is raised
 
 ### `GamError`
 
-Base class. Raised for engine errors that do not match a more specific
-keyword. Catch this to handle mapped Rust/binding failures after the
-extension has loaded.
+Base class for engine errors after the extension has loaded. It is also a
+`ValueError`, so existing value-contract handlers continue to catch it.
 
 ### `FormulaError`
 
@@ -43,6 +50,9 @@ The formula is invalid or unsupported. Common causes:
 
 - Syntax error (missing `~`, unbalanced parentheses).
 - Parser-level unknown identifiers, such as unsupported term or link names.
+- Missing formula columns, reported as `ColumnNotFoundError`, a
+  `FormulaError` subclass with structured attributes such as `column`,
+  `available`, and `similar` when available.
 
 ```python
 try:
@@ -68,7 +78,9 @@ if not check.ok:
 ### `PredictionError`
 
 Prediction failed for a reason other than a schema mismatch — numerical
-issues, an unsupported prediction mode for the fitted model class, etc.
+issues, an unsupported prediction mode for the fitted model class, or a
+prediction-time input error. Some prediction families raise subclasses
+such as `PredictInputError` or `SurvivalPredictError`.
 
 ### `RustExtensionUnavailableError`
 

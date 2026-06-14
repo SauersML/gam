@@ -1,447 +1,763 @@
 //! Unit tests for the custom-family blockwise carrier. Declared from `mod.rs`
 //! as `#[cfg(test)] mod tests;`; reaches the FD helper via `super::test_support`.
 
-    use super::*;
+use super::*;
 
-    #[derive(Clone)]
-    struct BatchedOuterHessianTestFamily {
-        matrix: Array2<f64>,
+#[derive(Clone)]
+struct BatchedOuterHessianTestFamily {
+    matrix: Array2<f64>,
+}
+
+struct TestOuterHessianOperator {
+    matrix: Array2<f64>,
+}
+
+impl crate::solver::outer_strategy::OuterHessianOperator for TestOuterHessianOperator {
+    fn dim(&self) -> usize {
+        self.matrix.nrows()
     }
 
-    struct TestOuterHessianOperator {
-        matrix: Array2<f64>,
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        Ok(self.matrix.dot(v))
     }
 
-    impl crate::solver::outer_strategy::OuterHessianOperator for TestOuterHessianOperator {
-        fn dim(&self) -> usize {
-            self.matrix.nrows()
-        }
+    fn is_cheap_to_materialize(&self) -> bool {
+        true
+    }
+}
 
-        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-            Ok(self.matrix.dot(v))
-        }
-
-        fn is_cheap_to_materialize(&self) -> bool {
-            true
-        }
+impl CustomFamily for BatchedOuterHessianTestFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![],
+        })
     }
 
-    impl CustomFamily for BatchedOuterHessianTestFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![],
-            })
-        }
-
-        fn outer_hyper_hessian_hvp_available(&self, block_specs: &[ParameterBlockSpec]) -> bool {
-            assert!(block_specs.len() <= isize::MAX as usize);
-            true
-        }
-
-        fn outer_hyper_hessian_operator(
-            &self,
-            block_specs: &[ParameterBlockSpec],
-        ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
-            assert!(block_specs.len() <= isize::MAX as usize);
-            Some(Arc::new(TestOuterHessianOperator {
-                matrix: self.matrix.clone(),
-            }))
-        }
+    fn outer_hyper_hessian_hvp_available(&self, block_specs: &[ParameterBlockSpec]) -> bool {
+        assert!(block_specs.len() <= isize::MAX as usize);
+        true
     }
 
-    #[test]
-    fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical_geometry_rows() {
-        let canonical_design = DesignMatrix::from(Array2::ones((2, 1)));
-        let stacked_design = DesignMatrix::from(Array2::ones((6, 1)));
-        let spec = ParameterBlockSpec {
-            name: "stacked".to_string(),
-            design: canonical_design,
-            offset: Array1::zeros(2),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: Some(stacked_design),
-            stacked_offset: Some(Array1::zeros(6)),
-        };
-        let state = ParameterBlockState {
-            beta: array![0.25],
-            eta: Array1::zeros(6),
-        };
-        let fit = blockwise_fit_from_parts(
-            BlockwiseFitResultParts {
-                block_states: vec![state],
-                log_likelihood: -1.0,
-                log_lambdas: Array1::zeros(0),
-                lambdas: Array1::zeros(0),
-                covariance_conditional: Some(Array2::eye(1)),
-                stable_penalty_term: 0.0,
-                penalized_objective: 1.0,
-                outer_iterations: 0,
-                outer_gradient_norm: Some(0.0),
-                criterion_certificate: None,
-                inner_cycles: 0,
-                outer_converged: true,
-                geometry: Some(FitGeometry {
-                    penalized_hessian: Array2::eye(1).into(),
-                    working_weights: Array1::ones(2),
-                    working_response: Array1::zeros(2),
-                }),
-                precomputed_edf: Some((1.0, Vec::new(), vec![1.0])),
-            },
-            &[spec],
-        )
-        .expect("stacked solver eta should assemble against canonical geometry rows");
-
-        assert_eq!(fit.block_states[0].eta.len(), 6);
-        assert_eq!(fit.geometry.as_ref().unwrap().working_weights.len(), 2);
+    fn outer_hyper_hessian_operator(
+        &self,
+        block_specs: &[ParameterBlockSpec],
+    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        assert!(block_specs.len() <= isize::MAX as usize);
+        Some(Arc::new(TestOuterHessianOperator {
+            matrix: self.matrix.clone(),
+        }))
     }
+}
 
-    #[test]
-    fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
-        let exact = array![[4.0, -1.0], [-1.0, 3.0]];
-        let family = BatchedOuterHessianTestFamily {
-            matrix: exact.clone(),
-        };
-        // rho.len() must equal sum(spec.penalties.len()); empty specs ⇒ empty rho.
-        let terms = family
-            .batched_outer_hessian_terms(&[], &[], &[], &Array1::<f64>::zeros(0), None)
-            .expect("batched Hessian hook succeeds")
-            .expect("test family exposes batched HVP terms");
-        let operator = match terms.outer_hessian {
-            crate::solver::outer_strategy::HessianResult::Operator(operator) => operator,
-            _ => panic!("batched hook should expose an operator"),
-        };
-        let dense = operator
-            .mul_mat(Array2::<f64>::eye(2).view())
-            .expect("operator materializes on small exact case");
-        assert_eq!(dense, exact);
-    }
+#[test]
+fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical_geometry_rows() {
+    let canonical_design = DesignMatrix::from(Array2::ones((2, 1)));
+    let stacked_design = DesignMatrix::from(Array2::ones((6, 1)));
+    let spec = ParameterBlockSpec {
+        name: "stacked".to_string(),
+        design: canonical_design,
+        offset: Array1::zeros(2),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: Some(stacked_design),
+        stacked_offset: Some(Array1::zeros(6)),
+    };
+    let state = ParameterBlockState {
+        beta: array![0.25],
+        eta: Array1::zeros(6),
+    };
+    let fit = blockwise_fit_from_parts(
+        BlockwiseFitResultParts {
+            block_states: vec![state],
+            log_likelihood: -1.0,
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            covariance_conditional: Some(Array2::eye(1)),
+            stable_penalty_term: 0.0,
+            penalized_objective: 1.0,
+            outer_iterations: 0,
+            outer_gradient_norm: Some(0.0),
+            criterion_certificate: None,
+            inner_cycles: 0,
+            outer_converged: true,
+            geometry: Some(FitGeometry {
+                penalized_hessian: Array2::eye(1).into(),
+                working_weights: Array1::ones(2),
+                working_response: Array1::zeros(2),
+            }),
+            precomputed_edf: Some((1.0, Vec::new(), vec![1.0])),
+        },
+        &[spec],
+    )
+    .expect("stacked solver eta should assemble against canonical geometry rows");
 
-    #[test]
-    fn batched_outer_hessian_operator_selected_only_for_hessian_eval() {
-        let family = BatchedOuterHessianTestFamily {
-            matrix: array![[2.0, 0.5], [0.5, 5.0]],
-        };
-        let selected = custom_family_batched_outer_hessian_operator(
-            &family,
-            &[],
-            &[],
-            &[],
-            &Array1::<f64>::zeros(0),
-            None,
-            EvalMode::ValueGradientHessian,
-        )
-        .expect("selection check succeeds");
-        assert!(
-            selected.is_some(),
-            "supported Hessian/HVP families should select the batched operator path"
-        );
+    assert_eq!(fit.block_states[0].eta.len(), 6);
+    assert_eq!(fit.geometry.as_ref().unwrap().working_weights.len(), 2);
+}
 
-        let not_selected = custom_family_batched_outer_hessian_operator(
-            &family,
-            &[],
-            &[],
-            &[],
-            &Array1::<f64>::zeros(0),
-            None,
-            EvalMode::ValueAndGradient,
-        )
-        .expect("non-Hessian selection check succeeds");
-        assert!(
-            not_selected.is_none(),
-            "batched Hessian terms must not run for gradient-only evaluations"
-        );
-    }
+#[test]
+fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
+    let exact = array![[4.0, -1.0], [-1.0, 3.0]];
+    let family = BatchedOuterHessianTestFamily {
+        matrix: exact.clone(),
+    };
+    // rho.len() must equal sum(spec.penalties.len()); empty specs ⇒ empty rho.
+    let terms = family
+        .batched_outer_hessian_terms(&[], &[], &[], &Array1::<f64>::zeros(0), None)
+        .expect("batched Hessian hook succeeds")
+        .expect("test family exposes batched HVP terms");
+    let operator = match terms.outer_hessian {
+        crate::solver::outer_strategy::HessianResult::Operator(operator) => operator,
+        _ => panic!("batched hook should expose an operator"),
+    };
+    let dense = operator
+        .mul_mat(Array2::<f64>::eye(2).view())
+        .expect("operator materializes on small exact case");
+    assert_eq!(dense, exact);
+}
 
-    #[test]
-    fn batched_outer_gradient_override_rejected_when_jeffreys_curvature_is_active() {
-        assert!(
-            batched_outer_gradient_contract_allows_override(None),
-            "released objective without robust Jeffreys curvature may use a family-owned batched gradient"
-        );
+#[test]
+fn batched_outer_hessian_operator_selected_only_for_hessian_eval() {
+    let family = BatchedOuterHessianTestFamily {
+        matrix: array![[2.0, 0.5], [0.5, 5.0]],
+    };
+    let selected = custom_family_batched_outer_hessian_operator(
+        &family,
+        &[],
+        &[],
+        &[],
+        &Array1::<f64>::zeros(0),
+        None,
+        EvalMode::ValueGradientHessian,
+    )
+    .expect("selection check succeeds");
+    assert!(
+        selected.is_some(),
+        "supported Hessian/HVP families should select the batched operator path"
+    );
 
-        let zero_hphi = Array2::<f64>::zeros((2, 2));
-        assert!(
-            batched_outer_gradient_contract_allows_override(Some(&zero_hphi)),
-            "a gated zero Jeffreys curvature leaves the batched gradient contract unchanged"
-        );
+    let not_selected = custom_family_batched_outer_hessian_operator(
+        &family,
+        &[],
+        &[],
+        &[],
+        &Array1::<f64>::zeros(0),
+        None,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("non-Hessian selection check succeeds");
+    assert!(
+        not_selected.is_none(),
+        "batched Hessian terms must not run for gradient-only evaluations"
+    );
+}
 
-        let active_hphi = array![[0.0, 0.0], [0.0, 1.0e-6]];
-        assert!(
-            !batched_outer_gradient_contract_allows_override(Some(&active_hphi)),
-            "nonzero H_phi changes the logdet operator and needs the unified H_phi-aware gradient"
-        );
-    }
+#[test]
+fn batched_outer_gradient_override_rejected_when_jeffreys_curvature_is_active() {
+    assert!(
+        batched_outer_gradient_contract_allows_override(None),
+        "released objective without robust Jeffreys curvature may use a family-owned batched gradient"
+    );
 
-    use crate::families::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
-    use crate::matrix::DesignMatrix;
-    use crate::test_support::binomial_location_scale_base_fixture;
-    use approx::assert_relative_eq;
-    use faer::sparse::{SparseColMat, Triplet};
-    use ndarray::{Array1, Array2, array};
+    let zero_hphi = Array2::<f64>::zeros((2, 2));
+    assert!(
+        batched_outer_gradient_contract_allows_override(Some(&zero_hphi)),
+        "a gated zero Jeffreys curvature leaves the batched gradient contract unchanged"
+    );
 
-    fn assert_kronecker_factored_matches_dense(
-        left: Array2<f64>,
-        right: Array2<f64>,
-        vectors: Vec<Array1<f64>>,
-    ) {
-        let penalty = PenaltyMatrix::KroneckerFactored { left, right };
-        let dense = penalty.to_dense();
-        for v in vectors {
-            let factored_dot = penalty.dot(&v);
-            let dense_dot = dense.dot(&v);
-            for i in 0..v.len() {
-                assert!(
-                    (factored_dot[i] - dense_dot[i]).abs() <= 1.0e-14,
-                    "Kronecker dot mismatch at component {i}: factored={}, dense={}",
-                    factored_dot[i],
-                    dense_dot[i],
-                );
-            }
+    let active_hphi = array![[0.0, 0.0], [0.0, 1.0e-6]];
+    assert!(
+        !batched_outer_gradient_contract_allows_override(Some(&active_hphi)),
+        "nonzero H_phi changes the logdet operator and needs the unified H_phi-aware gradient"
+    );
+}
 
-            let factored_quad = penalty.quadratic_form(&v);
-            let dense_quad = v.dot(&dense_dot);
+use crate::families::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
+use crate::matrix::DesignMatrix;
+use crate::test_support::binomial_location_scale_base_fixture;
+use approx::assert_relative_eq;
+use faer::sparse::{SparseColMat, Triplet};
+use ndarray::{Array1, Array2, array};
+
+fn assert_kronecker_factored_matches_dense(
+    left: Array2<f64>,
+    right: Array2<f64>,
+    vectors: Vec<Array1<f64>>,
+) {
+    let penalty = PenaltyMatrix::KroneckerFactored { left, right };
+    let dense = penalty.to_dense();
+    for v in vectors {
+        let factored_dot = penalty.dot(&v);
+        let dense_dot = dense.dot(&v);
+        for i in 0..v.len() {
             assert!(
-                (factored_quad - dense_quad).abs() <= 1.0e-14,
-                "Kronecker quadratic form mismatch: factored={factored_quad}, dense={dense_quad}",
+                (factored_dot[i] - dense_dot[i]).abs() <= 1.0e-14,
+                "Kronecker dot mismatch at component {i}: factored={}, dense={}",
+                factored_dot[i],
+                dense_dot[i],
             );
         }
-    }
 
-    #[test]
-    fn kronecker_factored_dot_and_quadratic_form_match_dense_row_major_operator() {
-        let left_diag = array![[10.0, 0.0], [0.0, 100.0]];
-        let right_diag = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
-        let mut diag_vectors = Vec::new();
-        for i in 0..6 {
-            let mut v = Array1::<f64>::zeros(6);
-            v[i] = 1.0;
-            diag_vectors.push(v);
+        let factored_quad = penalty.quadratic_form(&v);
+        let dense_quad = v.dot(&dense_dot);
+        assert!(
+            (factored_quad - dense_quad).abs() <= 1.0e-14,
+            "Kronecker quadratic form mismatch: factored={factored_quad}, dense={dense_quad}",
+        );
+    }
+}
+
+#[test]
+fn kronecker_factored_dot_and_quadratic_form_match_dense_row_major_operator() {
+    let left_diag = array![[10.0, 0.0], [0.0, 100.0]];
+    let right_diag = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
+    let mut diag_vectors = Vec::new();
+    for i in 0..6 {
+        let mut v = Array1::<f64>::zeros(6);
+        v[i] = 1.0;
+        diag_vectors.push(v);
+    }
+    diag_vectors.push(array![0.25, -1.5, 2.0, 0.75, -0.5, 3.25]);
+    assert_kronecker_factored_matches_dense(left_diag, right_diag, diag_vectors);
+
+    let left_nondiag = array![[1.0, 2.0], [3.0, 4.0]];
+    let right_nondiag = array![[0.0, 1.0], [1.0, 0.0]];
+    let mut nondiag_vectors = Vec::new();
+    for i in 0..4 {
+        let mut v = Array1::<f64>::zeros(4);
+        v[i] = 1.0;
+        nondiag_vectors.push(v);
+    }
+    nondiag_vectors.push(array![1.25, -0.75, 2.5, -3.0]);
+    assert_kronecker_factored_matches_dense(left_nondiag, right_nondiag, nondiag_vectors);
+}
+
+/// The marker-free coupled-joint-Hessian gate (#727, #729) trusts a family
+/// that returns a genuinely coupled joint Hessian — nonzero off-diagonal
+/// blocks — without a hand-set `has_explicit_joint_hessian()`. Pin the
+/// structural probe that drives every `_with_specs` dispatch: block-diagonal
+/// (the trait default) is NOT coupling, a single nonzero off-block IS, and a
+/// shape disagreement must never be claimed as coupling.
+#[test]
+fn joint_hessian_coupling_probe_detects_off_diagonal_blocks() {
+    // Two blocks of width 2 each → a 4×4 joint Hessian. Only `beta.len()`
+    // is read, so the `eta` lengths are immaterial.
+    let states = vec![
+        ParameterBlockState {
+            beta: Array1::zeros(2),
+            eta: Array1::zeros(3),
+        },
+        ParameterBlockState {
+            beta: Array1::zeros(2),
+            eta: Array1::zeros(3),
+        },
+    ];
+
+    // Strictly block-diagonal (per-block curvature, zero off-blocks): the
+    // trait default shape, NOT coupling.
+    let block_diagonal = array![
+        [1.0_f64, 0.5, 0.0, 0.0],
+        [0.5, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 2.0, 0.3],
+        [0.0, 0.0, 0.3, 2.0],
+    ];
+    assert!(
+        !joint_hessian_has_cross_block_coupling(&block_diagonal, &states),
+        "block-diagonal joint Hessian must not be treated as coupled"
+    );
+
+    // A single nonzero off-diagonal-block entry (and its transpose) is
+    // genuine cross-block curvature the block-diagonal default can never
+    // produce, so it must be trusted as coupled.
+    let mut coupled = block_diagonal.clone();
+    coupled[[0, 2]] = 1.0e-9;
+    coupled[[2, 0]] = 1.0e-9;
+    assert!(
+        joint_hessian_has_cross_block_coupling(&coupled, &states),
+        "a nonzero off-diagonal block must be detected as coupling"
+    );
+
+    // A matrix whose dimension disagrees with the total β width is
+    // malformed; the probe must answer the coupling question with `false`
+    // rather than claim coupling for a mis-shaped Hessian.
+    let wrong_shape = Array2::<f64>::zeros((3, 3));
+    assert!(
+        !joint_hessian_has_cross_block_coupling(&wrong_shape, &states),
+        "shape disagreement must not be claimed as coupling"
+    );
+}
+
+fn solve_blockweighted_system(
+    x: &DesignMatrix,
+    y_star: &Array1<f64>,
+    w: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    ridge_floor: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<Array1<f64>, String> {
+    let n = x.nrows();
+    if y_star.len() != n || w.len() != n {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "weighted-system dimension mismatch".to_string(),
         }
-        diag_vectors.push(array![0.25, -1.5, 2.0, 0.75, -0.5, 3.25]);
-        assert_kronecker_factored_matches_dense(left_diag, right_diag, diag_vectors);
-
-        let left_nondiag = array![[1.0, 2.0], [3.0, 4.0]];
-        let right_nondiag = array![[0.0, 1.0], [1.0, 0.0]];
-        let mut nondiag_vectors = Vec::new();
-        for i in 0..4 {
-            let mut v = Array1::<f64>::zeros(4);
-            v[i] = 1.0;
-            nondiag_vectors.push(v);
-        }
-        nondiag_vectors.push(array![1.25, -0.75, 2.5, -3.0]);
-        assert_kronecker_factored_matches_dense(left_nondiag, right_nondiag, nondiag_vectors);
+        .into());
     }
+    let xtwy = x.compute_xtwy(w, y_star)?;
+    x.solve_systemwith_policy(w, &xtwy, Some(s_lambda), ridge_floor, ridge_policy)
+        .map_err(|_| "block solve failed after ridge retries".to_string())
+}
 
-    /// The marker-free coupled-joint-Hessian gate (#727, #729) trusts a family
-    /// that returns a genuinely coupled joint Hessian — nonzero off-diagonal
-    /// blocks — without a hand-set `has_explicit_joint_hessian()`. Pin the
-    /// structural probe that drives every `_with_specs` dispatch: block-diagonal
-    /// (the trait default) is NOT coupling, a single nonzero off-block IS, and a
-    /// shape disagreement must never be claimed as coupling.
-    #[test]
-    fn joint_hessian_coupling_probe_detects_off_diagonal_blocks() {
-        // Two blocks of width 2 each → a 4×4 joint Hessian. Only `beta.len()`
-        // is read, so the `eta` lengths are immaterial.
-        let states = vec![
-            ParameterBlockState {
-                beta: Array1::zeros(2),
-                eta: Array1::zeros(3),
-            },
-            ParameterBlockState {
-                beta: Array1::zeros(2),
-                eta: Array1::zeros(3),
-            },
-        ];
+#[test]
+fn default_inner_cycle_budget_covers_large_scale_joint_newton_tail() {
+    let options = BlockwiseFitOptions::default();
 
-        // Strictly block-diagonal (per-block curvature, zero off-blocks): the
-        // trait default shape, NOT coupling.
-        let block_diagonal = array![
-            [1.0_f64, 0.5, 0.0, 0.0],
-            [0.5, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 2.0, 0.3],
-            [0.0, 0.0, 0.3, 2.0],
-        ];
-        assert!(
-            !joint_hessian_has_cross_block_coupling(&block_diagonal, &states),
-            "block-diagonal joint Hessian must not be treated as coupled"
-        );
+    assert_eq!(
+        options.inner_max_cycles,
+        DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES
+    );
+    assert!(
+        options.inner_max_cycles > 300,
+        "startup validation must not reject still-descending exact joint solves at the old cap"
+    );
+}
 
-        // A single nonzero off-diagonal-block entry (and its transpose) is
-        // genuine cross-block curvature the block-diagonal default can never
-        // produce, so it must be trusted as coupled.
-        let mut coupled = block_diagonal.clone();
-        coupled[[0, 2]] = 1.0e-9;
-        coupled[[2, 0]] = 1.0e-9;
-        assert!(
-            joint_hessian_has_cross_block_coupling(&coupled, &states),
-            "a nonzero off-diagonal block must be detected as coupling"
-        );
+#[test]
+fn startup_validation_failure_routes_to_never_fail_escalation() {
+    use crate::estimate::EstimationError;
 
-        // A matrix whose dimension disagrees with the total β width is
-        // malformed; the probe must answer the coupling question with `false`
-        // rather than claim coupling for a mis-shaped Hessian.
-        let wrong_shape = Array2::<f64>::zeros((3, 3));
-        assert!(
-            !joint_hessian_has_cross_block_coupling(&wrong_shape, &states),
-            "shape disagreement must not be claimed as coupling"
-        );
-    }
+    let all_seeds_rejected = EstimationError::RemlOptimizationFailed(
+        "no candidate seeds passed outer startup validation (custom family):\n  generated=4"
+            .to_string(),
+    );
+    assert!(
+        outer_startup_failure_is_escalatable(&all_seeds_rejected),
+        "post-audit all-seeds startup rejection must reach the never-fail escalation net"
+    );
 
-    fn solve_blockweighted_system(
-        x: &DesignMatrix,
-        y_star: &Array1<f64>,
-        w: &Array1<f64>,
-        s_lambda: &Array2<f64>,
-        ridge_floor: f64,
-        ridge_policy: RidgePolicy,
-    ) -> Result<Array1<f64>, String> {
-        let n = x.nrows();
-        if y_star.len() != n || w.len() != n {
-            return Err(CustomFamilyError::DimensionMismatch {
-                reason: "weighted-system dimension mismatch".to_string(),
-            }
-            .into());
-        }
-        let xtwy = x.compute_xtwy(w, y_star)?;
-        x.solve_systemwith_policy(w, &xtwy, Some(s_lambda), ridge_floor, ridge_policy)
-            .map_err(|_| "block solve failed after ridge retries".to_string())
-    }
+    let non_finite_eval = EstimationError::RemlOptimizationFailed(
+        "outer eval failed: objective returned a non-finite cost".to_string(),
+    );
+    assert!(
+        outer_startup_failure_is_escalatable(&non_finite_eval),
+        "non-finite startup evals are the same post-audit numerical pathology"
+    );
 
-    #[test]
-    fn default_inner_cycle_budget_covers_large_scale_joint_newton_tail() {
-        let options = BlockwiseFitOptions::default();
+    let structural_input = EstimationError::InvalidInput(
+        "zero-event survival marginal-slope input remains structurally invalid".to_string(),
+    );
+    assert!(
+        !outer_startup_failure_is_escalatable(&structural_input),
+        "structural input errors must not be converted into sampled fits"
+    );
+}
 
-        assert_eq!(
-            options.inner_max_cycles,
-            DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES
-        );
-        assert!(
-            options.inner_max_cycles > 300,
-            "startup validation must not reject still-descending exact joint solves at the old cap"
-        );
-    }
+#[test]
+fn joint_penalty_subspace_trace_matches_projected_logdet_derivative() {
+    let ranges = vec![(0, 3)];
+    let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+    let penalties = vec![s_lambda];
+    let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
+    // `∂Sλ/∂ρ` is supported on range(Sλ) (here the leading 2×2 block, the
+    // positive-eigenvalue subspace of `S`). Since #901 the kernel is the
+    // full spectral `M⁺`, whose trace differentiates `log|H+Sλ|₊` exactly
+    // for EVERY drift; a range(Sλ)-supported drift exercises the same
+    // contract the production `∂Sλ/∂ρ` does (and is where the old
+    // range(Sλ)-block kernel and `M⁺` agree, so this pin is stable
+    // across the kernel generalization).
+    let drift = array![[0.7, -0.4, 0.0], [-0.4, 1.3, 0.0], [0.0, 0.0, 0.0]];
 
-    #[test]
-    fn startup_validation_failure_routes_to_never_fail_escalation() {
-        use crate::estimate::EstimationError;
+    let (logdet, kernel) = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h.clone()),
+        &ranges,
+        &penalties,
+        3,
+        0.0,
+        None,
+    )
+    .expect("projection parts build");
+    let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
+    // Kernel basis = kept eigenvectors of M = H + Sλ (full rank 3 here),
+    // NOT the rank-2 range(Sλ) basis of the pre-#901 reduced kernel.
+    assert_eq!(kernel.u_s.ncols(), 3);
+    // logdet is the FULL identifiable-subspace `log|H + Sλ|₊`. Here H + Sλ
+    // is full rank (3), so this is the ordinary log-det of
+    //   M = [[5, 0.2, 7], [0.2, 11, -3], [7, -3, 30]],  det(M) = 1056.4.
+    let m = array![[5.0, 0.2, 7.0], [0.2, 11.0, -3.0], [7.0, -3.0, 30.0]];
+    let (m_evals, _) = m.eigh(faer::Side::Lower).expect("M eigendecomposition");
+    let expected_logdet: f64 = m_evals.iter().map(|&v| v.ln()).sum();
+    assert_relative_eq!(logdet, expected_logdet, epsilon = 1e-10);
 
-        let all_seeds_rejected = EstimationError::RemlOptimizationFailed(
-            "no candidate seeds passed outer startup validation (custom family):\n  generated=4"
-                .to_string(),
-        );
-        assert!(
-            outer_startup_failure_is_escalatable(&all_seeds_rejected),
-            "post-audit all-seeds startup rejection must reach the never-fail escalation net"
-        );
+    let analytic = kernel.trace_projected_logdet(&drift);
+    let eps = 1.0e-6;
+    let h_plus = &h + &(drift.mapv(|v| eps * v));
+    let h_minus = &h - &(drift.mapv(|v| eps * v));
+    let (logdet_plus, _) = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h_plus),
+        &ranges,
+        &penalties,
+        3,
+        0.0,
+        None,
+    )
+    .expect("plus projection parts build");
+    let (logdet_minus, _) = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h_minus),
+        &ranges,
+        &penalties,
+        3,
+        0.0,
+        None,
+    )
+    .expect("minus projection parts build");
+    let finite_difference = (logdet_plus - logdet_minus) / (2.0 * eps);
 
-        let non_finite_eval = EstimationError::RemlOptimizationFailed(
-            "outer eval failed: objective returned a non-finite cost".to_string(),
-        );
-        assert!(
-            outer_startup_failure_is_escalatable(&non_finite_eval),
-            "non-finite startup evals are the same post-audit numerical pathology"
-        );
+    assert_relative_eq!(
+        analytic,
+        finite_difference,
+        epsilon = 1e-8,
+        max_relative = 1e-8
+    );
+}
 
-        let structural_input = EstimationError::InvalidInput(
-            "zero-event survival marginal-slope input remains structurally invalid".to_string(),
-        );
-        assert!(
-            !outer_startup_failure_is_escalatable(&structural_input),
-            "structural input errors must not be converted into sampled fits"
-        );
-    }
+#[test]
+fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penalty() {
+    let ranges = vec![(0, 3)];
+    let rho = array![0.0];
+    let beta = array![1.0, -1.0, 3.0];
+    let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+    let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
+    let spec = ParameterBlockSpec {
+        name: "surface".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+            1, 3,
+        )))),
+        offset: Array1::zeros(1),
+        penalties: vec![PenaltyMatrix::Dense(s_lambda.clone())],
+        nullspace_dims: vec![1],
+        initial_log_lambdas: rho.clone(),
+        initial_beta: Some(beta.clone()),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![spec];
+    let inner = BlockwiseInnerResult {
+        block_states: vec![ParameterBlockState {
+            beta: beta.clone(),
+            eta: Array1::zeros(1),
+        }],
+        active_sets: vec![None],
+        log_likelihood: 0.0,
+        penalty_value: 0.5 * beta.dot(&fast_av(&s_lambda, &beta)),
+        cycles: 1,
+        converged: true,
+        block_logdet_h: 0.0,
+        block_logdet_s: 0.0,
+        s_lambdas: vec![s_lambda.clone()],
+        joint_workspace: None,
+        kkt_residual: None,
+        active_constraints: None,
+    };
+    let per_block = vec![rho.clone()];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        use_outer_hessian: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let no_dh = |_direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+    let no_d2h = |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+        Ok(None)
+    };
 
-    #[test]
-    fn joint_penalty_subspace_trace_matches_projected_logdet_derivative() {
-        let ranges = vec![(0, 3)];
-        let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
-        let penalties = vec![s_lambda];
-        let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
-        // `∂Sλ/∂ρ` is supported on range(Sλ) (here the leading 2×2 block, the
-        // positive-eigenvalue subspace of `S`). Since #901 the kernel is the
-        // full spectral `M⁺`, whose trace differentiates `log|H+Sλ|₊` exactly
-        // for EVERY drift; a range(Sλ)-supported drift exercises the same
-        // contract the production `∂Sλ/∂ρ` does (and is where the old
-        // range(Sλ)-block kernel and `M⁺` agree, so this pin is stable
-        // across the kernel generalization).
-        let drift = array![[0.7, -0.4, 0.0], [-0.4, 1.3, 0.0], [0.0, 0.0, 0.0]];
+    let projected = joint_outer_evaluate(
+        &inner,
+        &specs,
+        &per_block,
+        &rho,
+        &beta,
+        JointHessianSource::Dense(h.clone()),
+        &ranges,
+        3,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        true,
+        true,
+        false,
+        true,
+        EvalMode::ValueAndGradient,
+        &options,
+        crate::types::RhoPrior::Flat,
+        PseudoLogdetMode::Smooth,
+        &no_dh,
+        None,
+        &no_d2h,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("projected outer evaluation succeeds");
 
-        let (logdet, kernel) = joint_penalty_subspace_trace_parts(
-            &JointHessianSource::Dense(h.clone()),
-            &ranges,
-            &penalties,
-            3,
-            0.0,
-            None,
-        )
-        .expect("projection parts build");
-        let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
-        // Kernel basis = kept eigenvectors of M = H + Sλ (full rank 3 here),
-        // NOT the rank-2 range(Sλ) basis of the pre-#901 reduced kernel.
-        assert_eq!(kernel.u_s.ncols(), 3);
-        // logdet is the FULL identifiable-subspace `log|H + Sλ|₊`. Here H + Sλ
-        // is full rank (3), so this is the ordinary log-det of
-        //   M = [[5, 0.2, 7], [0.2, 11, -3], [7, -3, 30]],  det(M) = 1056.4.
-        let m = array![[5.0, 0.2, 7.0], [0.2, 11.0, -3.0], [7.0, -3.0, 30.0]];
-        let (m_evals, _) = m.eigh(faer::Side::Lower).expect("M eigendecomposition");
-        let expected_logdet: f64 = m_evals.iter().map(|&v| v.ln()).sum();
-        assert_relative_eq!(logdet, expected_logdet, epsilon = 1e-10);
+    let unprojected = joint_outer_evaluate(
+        &inner,
+        &specs,
+        &per_block,
+        &rho,
+        &beta,
+        JointHessianSource::Dense(h.clone()),
+        &ranges,
+        3,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        true,
+        true,
+        false,
+        false,
+        EvalMode::ValueAndGradient,
+        &options,
+        crate::types::RhoPrior::Flat,
+        PseudoLogdetMode::Smooth,
+        &no_dh,
+        None,
+        &no_d2h,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("unprojected outer evaluation succeeds");
 
-        let analytic = kernel.trace_projected_logdet(&drift);
-        let eps = 1.0e-6;
-        let h_plus = &h + &(drift.mapv(|v| eps * v));
-        let h_minus = &h - &(drift.mapv(|v| eps * v));
-        let (logdet_plus, _) = joint_penalty_subspace_trace_parts(
-            &JointHessianSource::Dense(h_plus),
-            &ranges,
-            &penalties,
-            3,
-            0.0,
-            None,
-        )
-        .expect("plus projection parts build");
-        let (logdet_minus, _) = joint_penalty_subspace_trace_parts(
-            &JointHessianSource::Dense(h_minus),
-            &ranges,
-            &penalties,
-            3,
-            0.0,
-            None,
-        )
-        .expect("minus projection parts build");
-        let finite_difference = (logdet_plus - logdet_minus) / (2.0 * eps);
+    let (_, kernel) = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h.clone()),
+        &ranges,
+        std::slice::from_ref(&s_lambda),
+        3,
+        0.0,
+        None,
+    )
+    .expect("projection kernel builds");
+    let projected_trace = kernel
+        .expect("rank-deficient penalty has positive subspace")
+        .trace_projected_logdet(&s_lambda);
+    let expected_gradient =
+        0.5 * beta.dot(&fast_av(&s_lambda, &beta)) + 0.5 * projected_trace - 0.5 * 2.0;
 
-        assert_relative_eq!(
-            analytic,
-            finite_difference,
-            epsilon = 1e-8,
-            max_relative = 1e-8
-        );
-    }
+    assert_relative_eq!(
+        projected.gradient[0],
+        expected_gradient,
+        epsilon = 1e-12,
+        max_relative = 1e-12
+    );
+    // Post gh#752/#901 contract: the trace kernel is the FULL spectral
+    // pseudo-inverse `M⁺ = (H+Sλ)⁺` over range(H+Sλ). On a NONSINGULAR `M`
+    // (this fixture) that is exactly `M⁻¹`, so the projected route and the
+    // full-space operator route compute the same generalized determinant
+    // and the same ρ-trace — the projection must be INVARIANT here. (The
+    // historical assertion that they differ encoded the pre-#752 range(Sλ)
+    // reduction, which dropped the penalty-null likelihood curvature and
+    // was itself the bug. The case where the routes genuinely diverge — a
+    // singular `M` whose ker(H+Sλ) the pseudo-logdet must drop — is
+    // asserted in `joint_outer_gradient_projected_trace_drops_joint_null`.)
+    assert_relative_eq!(
+        projected.gradient[0],
+        unprojected.gradient[0],
+        epsilon = 1e-8,
+        max_relative = 1e-8
+    );
+}
 
-    #[test]
-    fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penalty() {
-        let ranges = vec![(0, 3)];
-        let rho = array![0.0];
-        let beta = array![1.0, -1.0, 3.0];
-        let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
-        let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
+/// The discriminating case for `project_hessian_logdet`: a joint Hessian
+/// whose ker(H) overlaps ker(Sλ), so `M = H + Sλ` is genuinely singular.
+/// The projected route must drop the unidentified direction (pseudo-logdet
+/// + `M⁺` trace kernel over range(M)) and produce the exact closed-form
+/// gradient; a full-space `M⁻¹` route has no finite answer here. This is
+/// the routing guard the nonsingular fixture above cannot provide (there
+/// the two routes coincide by design).
+#[test]
+fn joint_outer_gradient_projected_trace_drops_joint_null() {
+    let ranges = vec![(0, 3)];
+    let rho = array![0.0];
+    let beta = array![1.0, -1.0, 3.0];
+    let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+    // ker(h) = span(e3) = ker(s_lambda) ⇒ M = H + Sλ is singular with the
+    // unidentified direction e3.
+    let h = array![[4.0, 0.2, 0.0], [0.2, 9.0, 0.0], [0.0, 0.0, 0.0]];
+    let spec = ParameterBlockSpec {
+        name: "surface".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+            1, 3,
+        )))),
+        offset: Array1::zeros(1),
+        penalties: vec![PenaltyMatrix::Dense(s_lambda.clone())],
+        nullspace_dims: vec![1],
+        initial_log_lambdas: rho.clone(),
+        initial_beta: Some(beta.clone()),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![spec];
+    let inner = BlockwiseInnerResult {
+        block_states: vec![ParameterBlockState {
+            beta: beta.clone(),
+            eta: Array1::zeros(1),
+        }],
+        active_sets: vec![None],
+        log_likelihood: 0.0,
+        penalty_value: 0.5 * beta.dot(&fast_av(&s_lambda, &beta)),
+        cycles: 1,
+        converged: true,
+        block_logdet_h: 0.0,
+        block_logdet_s: 0.0,
+        s_lambdas: vec![s_lambda.clone()],
+        joint_workspace: None,
+        kkt_residual: None,
+        active_constraints: None,
+    };
+    let per_block = vec![rho.clone()];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        use_outer_hessian: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let no_dh = |_direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+    let no_d2h = |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+        Ok(None)
+    };
+
+    let projected = joint_outer_evaluate(
+        &inner,
+        &specs,
+        &per_block,
+        &rho,
+        &beta,
+        JointHessianSource::Dense(h.clone()),
+        &ranges,
+        3,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        true,
+        true,
+        false,
+        true,
+        EvalMode::ValueAndGradient,
+        &options,
+        crate::types::RhoPrior::Flat,
+        PseudoLogdetMode::Smooth,
+        &no_dh,
+        None,
+        &no_d2h,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("projected outer evaluation succeeds on a singular joint Hessian");
+
+    let (_, kernel) = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h.clone()),
+        &ranges,
+        std::slice::from_ref(&s_lambda),
+        3,
+        0.0,
+        None,
+    )
+    .expect("projection kernel builds");
+    let projected_trace = kernel
+        .expect("rank-deficient joint Hessian has a positive subspace")
+        .trace_projected_logdet(&s_lambda);
+    let expected_gradient =
+        0.5 * beta.dot(&fast_av(&s_lambda, &beta)) + 0.5 * projected_trace - 0.5 * 2.0;
+
+    assert!(
+        projected.objective.is_finite(),
+        "pseudo-logdet objective must stay finite when ker(H+Sλ) is dropped"
+    );
+    assert_relative_eq!(
+        projected.gradient[0],
+        expected_gradient,
+        epsilon = 1e-10,
+        max_relative = 1e-10
+    );
+}
+
+// Experimental scan documenting that on THIS fixture's geometry the
+// joint_outer_evaluate path does not show divergence between
+// project_hessian_logdet=true and =false at large-scale ρ: the dominant
+// term ½ λ β'Sβ grows linearly in λ regardless of projection, and the trace
+// pair cancels in both routes here. The clustered-PC marginal-slope failure
+// (#808/#787) is a DIFFERENT geometry — a near-collinear penalty-null trend
+// whose likelihood determinant the range(Sλ)-only route drops. That route is
+// now disabled for all marginal-slope families: the project_hessian_logdet
+// flag at every joint_outer_evaluate/_efs call site reads
+// `use_projected_penalty_logdet()` (default true), so value and analytic
+// gradient share the range(H+Sλ) generalized determinant.
+#[test]
+fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant() {
+    // Same fixture shape as the rank-deficient projected-trace test,
+    // but with H_unpen scaled to data-Hessian magnitude (n ~ 2e5).
+    let ranges = vec![(0, 3)];
+    let beta = array![1.0, -1.0, 3.0];
+    let s_unit: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+    let n_scale = 2.0e5_f64;
+    let h: Array2<f64> =
+        array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]].mapv(|v| v * n_scale);
+
+    let no_dh = |_d: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+    let no_d2h = |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+        Ok(None)
+    };
+
+    let mut g_un_at_10 = 0.0_f64;
+    let mut g_pr_at_10 = 0.0_f64;
+
+    for &rho_val in &[0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0] {
+        let lam = rho_val.exp();
+        let rho = array![rho_val];
+        let s_lambda = s_unit.mapv(|v| v * lam);
+
         let spec = ParameterBlockSpec {
             name: "surface".to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
                 1, 3,
             )))),
             offset: Array1::zeros(1),
-            penalties: vec![PenaltyMatrix::Dense(s_lambda.clone())],
+            penalties: vec![PenaltyMatrix::Dense(s_unit.clone())],
             nullspace_dims: vec![1],
             initial_log_lambdas: rho.clone(),
             initial_beta: Some(beta.clone()),
@@ -458,7 +774,7 @@
             }],
             active_sets: vec![None],
             log_likelihood: 0.0,
-            penalty_value: 0.5 * beta.dot(&fast_av(&s_lambda, &beta)),
+            penalty_value: 0.5 * lam * beta.dot(&fast_av(&s_unit, &beta)),
             cycles: 1,
             converged: true,
             block_logdet_h: 0.0,
@@ -474,12 +790,8 @@
             use_outer_hessian: false,
             ..BlockwiseFitOptions::default()
         };
-        let no_dh =
-            |_direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-        let no_d2h = |_u: &Array1<f64>,
-                      _v: &Array1<f64>|
-         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
 
+        // project_hessian_logdet = true (current main behavior)
         let projected = joint_outer_evaluate(
             &inner,
             &specs,
@@ -516,8 +828,9 @@
             None,
             None,
         )
-        .expect("projected outer evaluation succeeds");
+        .expect("projected eval ok");
 
+        // project_hessian_logdet = false (the 0.1.92 / pre-fix behavior)
         let unprojected = joint_outer_evaluate(
             &inner,
             &specs,
@@ -554,2418 +867,1200 @@
             None,
             None,
         )
-        .expect("unprojected outer evaluation succeeds");
+        .expect("unprojected eval ok");
 
-        let (_, kernel) = joint_penalty_subspace_trace_parts(
-            &JointHessianSource::Dense(h.clone()),
-            &ranges,
-            std::slice::from_ref(&s_lambda),
-            3,
-            0.0,
-            None,
-        )
-        .expect("projection kernel builds");
-        let projected_trace = kernel
-            .expect("rank-deficient penalty has positive subspace")
-            .trace_projected_logdet(&s_lambda);
-        let expected_gradient =
-            0.5 * beta.dot(&fast_av(&s_lambda, &beta)) + 0.5 * projected_trace - 0.5 * 2.0;
-
-        assert_relative_eq!(
-            projected.gradient[0],
-            expected_gradient,
-            epsilon = 1e-12,
-            max_relative = 1e-12
-        );
-        // Post gh#752/#901 contract: the trace kernel is the FULL spectral
-        // pseudo-inverse `M⁺ = (H+Sλ)⁺` over range(H+Sλ). On a NONSINGULAR `M`
-        // (this fixture) that is exactly `M⁻¹`, so the projected route and the
-        // full-space operator route compute the same generalized determinant
-        // and the same ρ-trace — the projection must be INVARIANT here. (The
-        // historical assertion that they differ encoded the pre-#752 range(Sλ)
-        // reduction, which dropped the penalty-null likelihood curvature and
-        // was itself the bug. The case where the routes genuinely diverge — a
-        // singular `M` whose ker(H+Sλ) the pseudo-logdet must drop — is
-        // asserted in `joint_outer_gradient_projected_trace_drops_joint_null`.)
-        assert_relative_eq!(
-            projected.gradient[0],
-            unprojected.gradient[0],
-            epsilon = 1e-8,
-            max_relative = 1e-8
-        );
+        let g_un = unprojected.gradient[0];
+        let g_pr = projected.gradient[0];
+        if rho_val == 10.0 {
+            g_un_at_10 = g_un.abs();
+            g_pr_at_10 = g_pr.abs();
+        }
     }
 
-    /// The discriminating case for `project_hessian_logdet`: a joint Hessian
-    /// whose ker(H) overlaps ker(Sλ), so `M = H + Sλ` is genuinely singular.
-    /// The projected route must drop the unidentified direction (pseudo-logdet
-    /// + `M⁺` trace kernel over range(M)) and produce the exact closed-form
-    /// gradient; a full-space `M⁻¹` route has no finite answer here. This is
-    /// the routing guard the nonsingular fixture above cannot provide (there
-    /// the two routes coincide by design).
-    #[test]
-    fn joint_outer_gradient_projected_trace_drops_joint_null() {
-        let ranges = vec![(0, 3)];
-        let rho = array![0.0];
-        let beta = array![1.0, -1.0, 3.0];
-        let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
-        // ker(h) = span(e3) = ker(s_lambda) ⇒ M = H + Sλ is singular with the
-        // unidentified direction e3.
-        let h = array![[4.0, 0.2, 0.0], [0.2, 9.0, 0.0], [0.0, 0.0, 0.0]];
-        let spec = ParameterBlockSpec {
-            name: "surface".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
-                1, 3,
-            )))),
+    // Finding: at this fixture geometry the two routes agree to
+    // ~1e-6 relative precision at every ρ in [0, 10].  Both grow
+    // linearly in λ (≈ ½ λ β'Sβ + bounded trace contribution).
+    // The optimizer-visible blow-up in large-scale therefore cannot be
+    // a missing projection in joint_outer_evaluate — it must live
+    // in the survival-marginal-slope custom gradient path.
+    let rel_diff = (g_un_at_10 - g_pr_at_10).abs() / g_pr_at_10.max(1e-30);
+    assert!(
+        rel_diff < 1e-4,
+        "projection should be near-invariant on this fixture at rho=10; \
+             got g_un={:.6e}, g_pr={:.6e}, rel_diff={:.3e}",
+        g_un_at_10,
+        g_pr_at_10,
+        rel_diff
+    );
+}
+
+// ── Large-scale reproducer for the marginal-slope ρ-saturation
+// failure ────────────────────────────────────────────────────────────
+//
+// Failure being investigated:
+//   outer iter=60, |g|=4.18e13, three of four ρ-coords pinned at the
+//   box bound ±10 (`with_rho_bound(10.0)`). The dominant explicit term
+//   ½λβ'Sβ at large scale (n≈2e5, p≈60, β'Sβ~10⁴, λ=exp(10)≈22k) is
+//   only ~10⁸ — observed gradient is ~10¹³, FIVE orders of magnitude
+//   beyond what the projected-trace kernel cancellation predicts.
+//
+// The existing `large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant`
+// test uses single-block, p=3, nullspace_dims=1, and supplies
+// `compute_dh = Ok(None)` — that path SKIPS the trace pair entirely and
+// therefore cannot reproduce the failure. The large-scale fit has:
+//   - 3 blocks (time_surface, marginal_surface, logslope_surface)
+//   - 4 penalty coords (time:1, marginal:2 [anisotropic], logslope:1)
+//   - Duchon-shape penalties: large nullspace_dims (d+1=4 for d=3 PCs)
+//     producing rank-deficient S with many zero eigenvalues
+//   - n ~ 2e5 → H_unpen scale ~ n × diag-of-design-Gram
+//   - Realistic `compute_dh(d)` returning the per-coord penalty drift
+//     ∂H/∂ρ_k = λ_k S_k (chained through the direction d)
+//
+// This test reproduces the SHAPE: builds large-scale-dimensioned blocks
+// with rank-deficient Duchon-shape penalties, scales H to large-scale
+// magnitude, supplies a realistic penalty-drift `compute_dh`, evaluates
+// `joint_outer_evaluate` at the actual failure ρ point
+// [time=10, marg=10, marg=10, logslope=4.5], and asserts every gradient
+// entry is BOUNDED by a physically reasonable multiple of the dominant
+// ½λβ'Sβ term.
+//
+// If this test passes with reasonable bounds: the bug is NOT in
+//   joint_outer_evaluate itself — it must live in the marginal-slope-
+//   specific drift derivatives (`evaluate_exact_newton_joint_gradient_*`
+//   in survival_marginal_slope.rs) that feed the closure.
+// If this test fails: joint_outer_evaluate has a numerical defect that
+//   surfaces at large scale + realistic Ḣ. We then bisect inside the
+//   evaluator.
+//
+#[test]
+fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_bounded() {
+    // LargeScale-realistic dimensions for binary-outcome marginal-slope.
+    // Duchon(PC1,PC2,PC3, centers=10, order=1) → p_basis = centers +
+    // null_basis(d+1=4) = 14 columns per spatial block, nullspace dim=4.
+    // The actual fit has time_surface with a different basis (B-spline
+    // along entry/exit age) — we approximate with p_time=10, null=2.
+    let p_time = 10usize;
+    let p_marg = 14usize;
+    let p_logs = 14usize;
+    let p_total = p_time + p_marg + p_logs;
+
+    // Block ranges in the joint coefficient vector.
+    let ranges = vec![
+        (0, p_time),
+        (p_time, p_time + p_marg),
+        (p_time + p_marg, p_total),
+    ];
+
+    // ── Build rank-deficient Duchon-shape penalty matrices.
+    // S = U diag(σ) Uᵀ where σ has `nullspace_dims` trailing zeros.
+    // We use deterministic orthonormal columns from a simple QR of a
+    // structured matrix to mimic the eigenstructure without random.
+    fn build_duchon_shape(p: usize, nullspace: usize, signal_scale: f64) -> Array2<f64> {
+        // Diagonal eigenvalue spectrum, geometric decay across the
+        // signal subspace then zeros on the nullspace.
+        let rank = p - nullspace;
+        let mut eigvals = vec![0.0_f64; p];
+        for i in 0..rank {
+            // 1.0, 0.5, 0.25, ... — physical Duchon penalty spectrum
+            // has spectrum decaying like 1/k for high-frequency modes;
+            // geometric decay is a faithful caricature.
+            eigvals[i] = signal_scale * 0.5_f64.powi(i as i32);
+        }
+        // Use a deterministic orthogonal basis: discrete cosine basis.
+        // U[i,j] = sqrt(2/p) cos(π (i+0.5) j / p) for j>0; U[i,0]=1/√p.
+        let mut u = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            u[[i, 0]] = 1.0 / (p as f64).sqrt();
+            for j in 1..p {
+                u[[i, j]] = (2.0 / p as f64).sqrt()
+                    * (std::f64::consts::PI * (i as f64 + 0.5) * j as f64 / p as f64).cos();
+            }
+        }
+        // S = U diag(eigvals) Uᵀ.
+        let mut s = Array2::<f64>::zeros((p, p));
+        for k in 0..p {
+            if eigvals[k] == 0.0 {
+                continue;
+            }
+            for i in 0..p {
+                for j in 0..p {
+                    s[[i, j]] += eigvals[k] * u[[i, k]] * u[[j, k]];
+                }
+            }
+        }
+        s
+    }
+
+    // time_surface: 1 penalty (nullspace=2: constant + linear in age).
+    let s_time = build_duchon_shape(p_time, 2, 1.0);
+    // marginal_surface: 2 penalties (nullspace=4 each, anisotropic).
+    let s_marg_0 = build_duchon_shape(p_marg, 4, 1.0);
+    let s_marg_1 = build_duchon_shape(p_marg, 4, 0.7);
+    // logslope_surface: 1 penalty (nullspace=4).
+    let s_logs = build_duchon_shape(p_logs, 4, 1.0);
+
+    // ── Failure-point ρ = [10, 10, 10, 4.5]. λ = exp(ρ).
+    let rho = array![10.0_f64, 10.0, 10.0, 4.5];
+    let lams: Array1<f64> = rho.mapv(f64::exp);
+
+    // λ-scaled S matrices (per-block, in block-local indexing — this
+    // is what BlockwiseInnerResult.s_lambdas stores).
+    let s_lambdas_local: Vec<Array2<f64>> = vec![
+        s_time.mapv(|v| v * lams[0]),
+        // marginal block has TWO penalties — they are summed into one
+        // local s_lambda (this matches how BlockwiseInnerResult stores
+        // a per-block sum of all penalties in that block):
+        (&s_marg_0 * lams[1]) + &(&s_marg_1 * lams[2]),
+        s_logs.mapv(|v| v * lams[3]),
+    ];
+
+    // β at large scale: |β|∞ ~ 1, β'Sβ ~ trace(S) ~ O(p) ~ 10.
+    let beta_flat = Array1::<f64>::from_iter((0..p_total).map(|i| ((i as f64) * 0.13).sin()));
+
+    // ── Large-scale joint unpenalized Hessian.
+    // Real survival Hessian = Xᵀ W X with W diagonal and n=2e5. We
+    // mimic the SCALE by H = n * (I + small dense perturbation).
+    let n_scale = 2.0e5_f64;
+    let mut h = Array2::<f64>::eye(p_total) * n_scale;
+    // Add a small off-diagonal coupling to make it non-trivial but SPD.
+    for i in 0..p_total {
+        for j in 0..p_total {
+            if i != j {
+                let v = 0.05_f64
+                    * n_scale
+                    * ((i as f64 - j as f64).abs() / p_total as f64).exp().recip();
+                h[[i, j]] = v;
+            }
+        }
+    }
+
+    // ── Hessian β-chain closure.
+    // CONTRACT: `compute_dh(v_k)` takes a β-space direction `v_k`
+    // (length p_total = `∂β/∂ρ_k` under the envelope) and returns
+    // `D_beta H[v_k]` — the third-order tensor of H contracted with
+    // `v_k`. The penalty-drift component `λ_k S_k` is added by
+    // `joint_outer_evaluate` automatically from `inner.s_lambdas` —
+    // this closure adds ONLY the β-chained piece.
+    //
+    // For an idealized H_unpen that is independent of β (linear model
+    // limit, no nonlinear inner geometry), `D_beta H = 0` and the
+    // closure returns `Ok(None)`. This is exactly the regime the
+    // existing single-block `large_scale_rho_scan_*` test exercises
+    // and finds projection-invariant. The marginal-slope family's
+    // Hessian DOES depend on β (through the joint geometry), so the
+    // closure is non-trivial in production — and that is the
+    // candidate source of the gradient blowup.
+    //
+    // This test takes the idealized path (`Ok(None)`) so any blowup
+    // observed here is attributable to `joint_outer_evaluate`'s
+    // multi-block / rank-deficient-S handling alone. If this test
+    // PASSES (gradient bounded), the bug must live in the family's
+    // `hessian_derivative_correction_result` β-chain — not in the
+    // evaluator. If it FAILS, the evaluator itself has the defect at
+    // large scale + Duchon-shape S.
+    let no_dh = |_v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+    let compute_dh = no_dh;
+    let no_d2h = |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+        Ok(None)
+    };
+
+    // ── ParameterBlockSpec for each block.
+    let mk_spec = |name: &str,
+                   p: usize,
+                   penalties: Vec<Array2<f64>>,
+                   null: usize,
+                   rho_block: Array1<f64>|
+     -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::zeros((1, p)),
+            )),
             offset: Array1::zeros(1),
-            penalties: vec![PenaltyMatrix::Dense(s_lambda.clone())],
-            nullspace_dims: vec![1],
-            initial_log_lambdas: rho.clone(),
-            initial_beta: Some(beta.clone()),
+            penalties: penalties.into_iter().map(PenaltyMatrix::Dense).collect(),
+            nullspace_dims: vec![null],
+            initial_log_lambdas: rho_block,
+            initial_beta: Some(beta_flat.slice(s![..p]).to_owned()),
             gauge_priority: 100,
             jacobian_callback: None,
             stacked_design: None,
             stacked_offset: None,
-        };
-        let specs = vec![spec];
-        let inner = BlockwiseInnerResult {
-            block_states: vec![ParameterBlockState {
-                beta: beta.clone(),
+        }
+    };
+    let specs = vec![
+        mk_spec(
+            "time_surface",
+            p_time,
+            vec![s_time.clone()],
+            2,
+            array![rho[0]],
+        ),
+        mk_spec(
+            "marginal_surface",
+            p_marg,
+            vec![s_marg_0.clone(), s_marg_1.clone()],
+            4,
+            array![rho[1], rho[2]],
+        ),
+        mk_spec(
+            "logslope_surface",
+            p_logs,
+            vec![s_logs.clone()],
+            4,
+            array![rho[3]],
+        ),
+    ];
+
+    let per_block = vec![array![rho[0]], array![rho[1], rho[2]], array![rho[3]]];
+
+    let inner = BlockwiseInnerResult {
+        block_states: vec![
+            ParameterBlockState {
+                beta: beta_flat.slice(s![0..p_time]).to_owned(),
                 eta: Array1::zeros(1),
-            }],
-            active_sets: vec![None],
-            log_likelihood: 0.0,
-            penalty_value: 0.5 * beta.dot(&fast_av(&s_lambda, &beta)),
-            cycles: 1,
-            converged: true,
-            block_logdet_h: 0.0,
-            block_logdet_s: 0.0,
-            s_lambdas: vec![s_lambda.clone()],
-            joint_workspace: None,
-            kkt_residual: None,
-            active_constraints: None,
-        };
-        let per_block = vec![rho.clone()];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            use_outer_hessian: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let no_dh =
-            |_direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-        let no_d2h = |_u: &Array1<f64>,
-                      _v: &Array1<f64>|
-         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-
-        let projected = joint_outer_evaluate(
-            &inner,
-            &specs,
-            &per_block,
-            &rho,
-            &beta,
-            JointHessianSource::Dense(h.clone()),
-            &ranges,
-            3,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            true,
-            true,
-            false,
-            true,
-            EvalMode::ValueAndGradient,
-            &options,
-            crate::types::RhoPrior::Flat,
-            PseudoLogdetMode::Smooth,
-            &no_dh,
-            None,
-            &no_d2h,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("projected outer evaluation succeeds on a singular joint Hessian");
-
-        let (_, kernel) = joint_penalty_subspace_trace_parts(
-            &JointHessianSource::Dense(h.clone()),
-            &ranges,
-            std::slice::from_ref(&s_lambda),
-            3,
-            0.0,
-            None,
-        )
-        .expect("projection kernel builds");
-        let projected_trace = kernel
-            .expect("rank-deficient joint Hessian has a positive subspace")
-            .trace_projected_logdet(&s_lambda);
-        let expected_gradient =
-            0.5 * beta.dot(&fast_av(&s_lambda, &beta)) + 0.5 * projected_trace - 0.5 * 2.0;
-
-        assert!(
-            projected.objective.is_finite(),
-            "pseudo-logdet objective must stay finite when ker(H+Sλ) is dropped"
-        );
-        assert_relative_eq!(
-            projected.gradient[0],
-            expected_gradient,
-            epsilon = 1e-10,
-            max_relative = 1e-10
-        );
-    }
-
-    // Experimental scan documenting that on THIS fixture's geometry the
-    // joint_outer_evaluate path does not show divergence between
-    // project_hessian_logdet=true and =false at large-scale ρ: the dominant
-    // term ½ λ β'Sβ grows linearly in λ regardless of projection, and the trace
-    // pair cancels in both routes here. The clustered-PC marginal-slope failure
-    // (#808/#787) is a DIFFERENT geometry — a near-collinear penalty-null trend
-    // whose likelihood determinant the range(Sλ)-only route drops. That route is
-    // now disabled for all marginal-slope families: the project_hessian_logdet
-    // flag at every joint_outer_evaluate/_efs call site reads
-    // `use_projected_penalty_logdet()` (default true), so value and analytic
-    // gradient share the range(H+Sλ) generalized determinant.
-    #[test]
-    fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant() {
-        // Same fixture shape as the rank-deficient projected-trace test,
-        // but with H_unpen scaled to data-Hessian magnitude (n ~ 2e5).
-        let ranges = vec![(0, 3)];
-        let beta = array![1.0, -1.0, 3.0];
-        let s_unit: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
-        let n_scale = 2.0e5_f64;
-        let h: Array2<f64> =
-            array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]].mapv(|v| v * n_scale);
-
-        let no_dh = |_d: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-        let no_d2h = |_u: &Array1<f64>,
-                      _v: &Array1<f64>|
-         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-
-        let mut g_un_at_10 = 0.0_f64;
-        let mut g_pr_at_10 = 0.0_f64;
-
-        for &rho_val in &[0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0] {
-            let lam = rho_val.exp();
-            let rho = array![rho_val];
-            let s_lambda = s_unit.mapv(|v| v * lam);
-
-            let spec = ParameterBlockSpec {
-                name: "surface".to_string(),
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
-                    (1, 3),
-                ))),
-                offset: Array1::zeros(1),
-                penalties: vec![PenaltyMatrix::Dense(s_unit.clone())],
-                nullspace_dims: vec![1],
-                initial_log_lambdas: rho.clone(),
-                initial_beta: Some(beta.clone()),
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            };
-            let specs = vec![spec];
-            let inner = BlockwiseInnerResult {
-                block_states: vec![ParameterBlockState {
-                    beta: beta.clone(),
-                    eta: Array1::zeros(1),
-                }],
-                active_sets: vec![None],
-                log_likelihood: 0.0,
-                penalty_value: 0.5 * lam * beta.dot(&fast_av(&s_unit, &beta)),
-                cycles: 1,
-                converged: true,
-                block_logdet_h: 0.0,
-                block_logdet_s: 0.0,
-                s_lambdas: vec![s_lambda.clone()],
-                joint_workspace: None,
-                kkt_residual: None,
-                active_constraints: None,
-            };
-            let per_block = vec![rho.clone()];
-            let options = BlockwiseFitOptions {
-                use_remlobjective: true,
-                use_outer_hessian: false,
-                ..BlockwiseFitOptions::default()
-            };
-
-            // project_hessian_logdet = true (current main behavior)
-            let projected = joint_outer_evaluate(
-                &inner,
-                &specs,
-                &per_block,
-                &rho,
-                &beta,
-                JointHessianSource::Dense(h.clone()),
-                &ranges,
-                3,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-                true,
-                true,
-                false,
-                true,
-                EvalMode::ValueAndGradient,
-                &options,
-                crate::types::RhoPrior::Flat,
-                PseudoLogdetMode::Smooth,
-                &no_dh,
-                None,
-                &no_d2h,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("projected eval ok");
-
-            // project_hessian_logdet = false (the 0.1.92 / pre-fix behavior)
-            let unprojected = joint_outer_evaluate(
-                &inner,
-                &specs,
-                &per_block,
-                &rho,
-                &beta,
-                JointHessianSource::Dense(h.clone()),
-                &ranges,
-                3,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-                true,
-                true,
-                false,
-                false,
-                EvalMode::ValueAndGradient,
-                &options,
-                crate::types::RhoPrior::Flat,
-                PseudoLogdetMode::Smooth,
-                &no_dh,
-                None,
-                &no_d2h,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("unprojected eval ok");
-
-            let g_un = unprojected.gradient[0];
-            let g_pr = projected.gradient[0];
-            if rho_val == 10.0 {
-                g_un_at_10 = g_un.abs();
-                g_pr_at_10 = g_pr.abs();
-            }
-        }
-
-        // Finding: at this fixture geometry the two routes agree to
-        // ~1e-6 relative precision at every ρ in [0, 10].  Both grow
-        // linearly in λ (≈ ½ λ β'Sβ + bounded trace contribution).
-        // The optimizer-visible blow-up in large-scale therefore cannot be
-        // a missing projection in joint_outer_evaluate — it must live
-        // in the survival-marginal-slope custom gradient path.
-        let rel_diff = (g_un_at_10 - g_pr_at_10).abs() / g_pr_at_10.max(1e-30);
-        assert!(
-            rel_diff < 1e-4,
-            "projection should be near-invariant on this fixture at rho=10; \
-             got g_un={:.6e}, g_pr={:.6e}, rel_diff={:.3e}",
-            g_un_at_10,
-            g_pr_at_10,
-            rel_diff
-        );
-    }
-
-    // ── Large-scale reproducer for the marginal-slope ρ-saturation
-    // failure ────────────────────────────────────────────────────────────
-    //
-    // Failure being investigated:
-    //   outer iter=60, |g|=4.18e13, three of four ρ-coords pinned at the
-    //   box bound ±10 (`with_rho_bound(10.0)`). The dominant explicit term
-    //   ½λβ'Sβ at large scale (n≈2e5, p≈60, β'Sβ~10⁴, λ=exp(10)≈22k) is
-    //   only ~10⁸ — observed gradient is ~10¹³, FIVE orders of magnitude
-    //   beyond what the projected-trace kernel cancellation predicts.
-    //
-    // The existing `large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant`
-    // test uses single-block, p=3, nullspace_dims=1, and supplies
-    // `compute_dh = Ok(None)` — that path SKIPS the trace pair entirely and
-    // therefore cannot reproduce the failure. The large-scale fit has:
-    //   - 3 blocks (time_surface, marginal_surface, logslope_surface)
-    //   - 4 penalty coords (time:1, marginal:2 [anisotropic], logslope:1)
-    //   - Duchon-shape penalties: large nullspace_dims (d+1=4 for d=3 PCs)
-    //     producing rank-deficient S with many zero eigenvalues
-    //   - n ~ 2e5 → H_unpen scale ~ n × diag-of-design-Gram
-    //   - Realistic `compute_dh(d)` returning the per-coord penalty drift
-    //     ∂H/∂ρ_k = λ_k S_k (chained through the direction d)
-    //
-    // This test reproduces the SHAPE: builds large-scale-dimensioned blocks
-    // with rank-deficient Duchon-shape penalties, scales H to large-scale
-    // magnitude, supplies a realistic penalty-drift `compute_dh`, evaluates
-    // `joint_outer_evaluate` at the actual failure ρ point
-    // [time=10, marg=10, marg=10, logslope=4.5], and asserts every gradient
-    // entry is BOUNDED by a physically reasonable multiple of the dominant
-    // ½λβ'Sβ term.
-    //
-    // If this test passes with reasonable bounds: the bug is NOT in
-    //   joint_outer_evaluate itself — it must live in the marginal-slope-
-    //   specific drift derivatives (`evaluate_exact_newton_joint_gradient_*`
-    //   in survival_marginal_slope.rs) that feed the closure.
-    // If this test fails: joint_outer_evaluate has a numerical defect that
-    //   surfaces at large scale + realistic Ḣ. We then bisect inside the
-    //   evaluator.
-    //
-    #[test]
-    fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_bounded() {
-        // LargeScale-realistic dimensions for binary-outcome marginal-slope.
-        // Duchon(PC1,PC2,PC3, centers=10, order=1) → p_basis = centers +
-        // null_basis(d+1=4) = 14 columns per spatial block, nullspace dim=4.
-        // The actual fit has time_surface with a different basis (B-spline
-        // along entry/exit age) — we approximate with p_time=10, null=2.
-        let p_time = 10usize;
-        let p_marg = 14usize;
-        let p_logs = 14usize;
-        let p_total = p_time + p_marg + p_logs;
-
-        // Block ranges in the joint coefficient vector.
-        let ranges = vec![
-            (0, p_time),
-            (p_time, p_time + p_marg),
-            (p_time + p_marg, p_total),
-        ];
-
-        // ── Build rank-deficient Duchon-shape penalty matrices.
-        // S = U diag(σ) Uᵀ where σ has `nullspace_dims` trailing zeros.
-        // We use deterministic orthonormal columns from a simple QR of a
-        // structured matrix to mimic the eigenstructure without random.
-        fn build_duchon_shape(p: usize, nullspace: usize, signal_scale: f64) -> Array2<f64> {
-            // Diagonal eigenvalue spectrum, geometric decay across the
-            // signal subspace then zeros on the nullspace.
-            let rank = p - nullspace;
-            let mut eigvals = vec![0.0_f64; p];
-            for i in 0..rank {
-                // 1.0, 0.5, 0.25, ... — physical Duchon penalty spectrum
-                // has spectrum decaying like 1/k for high-frequency modes;
-                // geometric decay is a faithful caricature.
-                eigvals[i] = signal_scale * 0.5_f64.powi(i as i32);
-            }
-            // Use a deterministic orthogonal basis: discrete cosine basis.
-            // U[i,j] = sqrt(2/p) cos(π (i+0.5) j / p) for j>0; U[i,0]=1/√p.
-            let mut u = Array2::<f64>::zeros((p, p));
-            for i in 0..p {
-                u[[i, 0]] = 1.0 / (p as f64).sqrt();
-                for j in 1..p {
-                    u[[i, j]] = (2.0 / p as f64).sqrt()
-                        * (std::f64::consts::PI * (i as f64 + 0.5) * j as f64 / p as f64).cos();
-                }
-            }
-            // S = U diag(eigvals) Uᵀ.
-            let mut s = Array2::<f64>::zeros((p, p));
-            for k in 0..p {
-                if eigvals[k] == 0.0 {
-                    continue;
-                }
-                for i in 0..p {
-                    for j in 0..p {
-                        s[[i, j]] += eigvals[k] * u[[i, k]] * u[[j, k]];
-                    }
-                }
-            }
-            s
-        }
-
-        // time_surface: 1 penalty (nullspace=2: constant + linear in age).
-        let s_time = build_duchon_shape(p_time, 2, 1.0);
-        // marginal_surface: 2 penalties (nullspace=4 each, anisotropic).
-        let s_marg_0 = build_duchon_shape(p_marg, 4, 1.0);
-        let s_marg_1 = build_duchon_shape(p_marg, 4, 0.7);
-        // logslope_surface: 1 penalty (nullspace=4).
-        let s_logs = build_duchon_shape(p_logs, 4, 1.0);
-
-        // ── Failure-point ρ = [10, 10, 10, 4.5]. λ = exp(ρ).
-        let rho = array![10.0_f64, 10.0, 10.0, 4.5];
-        let lams: Array1<f64> = rho.mapv(f64::exp);
-
-        // λ-scaled S matrices (per-block, in block-local indexing — this
-        // is what BlockwiseInnerResult.s_lambdas stores).
-        let s_lambdas_local: Vec<Array2<f64>> = vec![
-            s_time.mapv(|v| v * lams[0]),
-            // marginal block has TWO penalties — they are summed into one
-            // local s_lambda (this matches how BlockwiseInnerResult stores
-            // a per-block sum of all penalties in that block):
-            (&s_marg_0 * lams[1]) + &(&s_marg_1 * lams[2]),
-            s_logs.mapv(|v| v * lams[3]),
-        ];
-
-        // β at large scale: |β|∞ ~ 1, β'Sβ ~ trace(S) ~ O(p) ~ 10.
-        let beta_flat = Array1::<f64>::from_iter((0..p_total).map(|i| ((i as f64) * 0.13).sin()));
-
-        // ── Large-scale joint unpenalized Hessian.
-        // Real survival Hessian = Xᵀ W X with W diagonal and n=2e5. We
-        // mimic the SCALE by H = n * (I + small dense perturbation).
-        let n_scale = 2.0e5_f64;
-        let mut h = Array2::<f64>::eye(p_total) * n_scale;
-        // Add a small off-diagonal coupling to make it non-trivial but SPD.
-        for i in 0..p_total {
-            for j in 0..p_total {
-                if i != j {
-                    let v = 0.05_f64
-                        * n_scale
-                        * ((i as f64 - j as f64).abs() / p_total as f64).exp().recip();
-                    h[[i, j]] = v;
-                }
-            }
-        }
-
-        // ── Hessian β-chain closure.
-        // CONTRACT: `compute_dh(v_k)` takes a β-space direction `v_k`
-        // (length p_total = `∂β/∂ρ_k` under the envelope) and returns
-        // `D_beta H[v_k]` — the third-order tensor of H contracted with
-        // `v_k`. The penalty-drift component `λ_k S_k` is added by
-        // `joint_outer_evaluate` automatically from `inner.s_lambdas` —
-        // this closure adds ONLY the β-chained piece.
-        //
-        // For an idealized H_unpen that is independent of β (linear model
-        // limit, no nonlinear inner geometry), `D_beta H = 0` and the
-        // closure returns `Ok(None)`. This is exactly the regime the
-        // existing single-block `large_scale_rho_scan_*` test exercises
-        // and finds projection-invariant. The marginal-slope family's
-        // Hessian DOES depend on β (through the joint geometry), so the
-        // closure is non-trivial in production — and that is the
-        // candidate source of the gradient blowup.
-        //
-        // This test takes the idealized path (`Ok(None)`) so any blowup
-        // observed here is attributable to `joint_outer_evaluate`'s
-        // multi-block / rank-deficient-S handling alone. If this test
-        // PASSES (gradient bounded), the bug must live in the family's
-        // `hessian_derivative_correction_result` β-chain — not in the
-        // evaluator. If it FAILS, the evaluator itself has the defect at
-        // large scale + Duchon-shape S.
-        let no_dh = |_v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-        let compute_dh = no_dh;
-        let no_d2h = |_u: &Array1<f64>,
-                      _v: &Array1<f64>|
-         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-
-        // ── ParameterBlockSpec for each block.
-        let mk_spec = |name: &str,
-                       p: usize,
-                       penalties: Vec<Array2<f64>>,
-                       null: usize,
-                       rho_block: Array1<f64>|
-         -> ParameterBlockSpec {
-            ParameterBlockSpec {
-                name: name.to_string(),
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    Array2::<f64>::zeros((1, p)),
-                )),
-                offset: Array1::zeros(1),
-                penalties: penalties.into_iter().map(PenaltyMatrix::Dense).collect(),
-                nullspace_dims: vec![null],
-                initial_log_lambdas: rho_block,
-                initial_beta: Some(beta_flat.slice(s![..p]).to_owned()),
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            }
-        };
-        let specs = vec![
-            mk_spec(
-                "time_surface",
-                p_time,
-                vec![s_time.clone()],
-                2,
-                array![rho[0]],
-            ),
-            mk_spec(
-                "marginal_surface",
-                p_marg,
-                vec![s_marg_0.clone(), s_marg_1.clone()],
-                4,
-                array![rho[1], rho[2]],
-            ),
-            mk_spec(
-                "logslope_surface",
-                p_logs,
-                vec![s_logs.clone()],
-                4,
-                array![rho[3]],
-            ),
-        ];
-
-        let per_block = vec![array![rho[0]], array![rho[1], rho[2]], array![rho[3]]];
-
-        let inner = BlockwiseInnerResult {
-            block_states: vec![
-                ParameterBlockState {
-                    beta: beta_flat.slice(s![0..p_time]).to_owned(),
-                    eta: Array1::zeros(1),
-                },
-                ParameterBlockState {
-                    beta: beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
-                    eta: Array1::zeros(1),
-                },
-                ParameterBlockState {
-                    beta: beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
-                    eta: Array1::zeros(1),
-                },
-            ],
-            active_sets: vec![None, None, None],
-            log_likelihood: 0.0,
-            penalty_value: 0.5
-                * (lams[0]
-                    * beta_flat.slice(s![0..p_time]).dot(&fast_av(
-                        &s_time,
-                        &beta_flat.slice(s![0..p_time]).to_owned(),
-                    ))
-                    + lams[1]
-                        * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
-                            &s_marg_0,
-                            &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
-                        ))
-                    + lams[2]
-                        * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
-                            &s_marg_1,
-                            &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
-                        ))
-                    + lams[3]
-                        * beta_flat.slice(s![p_time + p_marg..p_total]).dot(&fast_av(
-                            &s_logs,
-                            &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
-                        ))),
-            cycles: 1,
-            converged: true,
-            block_logdet_h: 0.0,
-            block_logdet_s: 0.0,
-            s_lambdas: s_lambdas_local,
-            joint_workspace: None,
-            kkt_residual: None,
-            active_constraints: None,
-        };
-
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            use_outer_hessian: false,
-            ..BlockwiseFitOptions::default()
-        };
-
-        let projected = joint_outer_evaluate(
-            &inner,
-            &specs,
-            &per_block,
-            &rho,
-            &beta_flat,
-            JointHessianSource::Dense(h.clone()),
-            &ranges,
-            p_total,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            true,
-            true,
-            false,
-            true,
-            EvalMode::ValueAndGradient,
-            &options,
-            crate::types::RhoPrior::Flat,
-            PseudoLogdetMode::Smooth,
-            &compute_dh,
-            None,
-            &no_d2h,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("large-scale projected eval");
-
-        // Physical-bound check: ½λ_k β'_k S_k β_k is the dominant explicit
-        // term per coord. For large-scale shape this is ~10⁸ at ρ=10 with
-        // β-scale O(1). The full gradient including the projected trace
-        // pair should be of THE SAME ORDER (or smaller after cancellation),
-        // never 10⁵× larger.
-        let dominant_terms = [
-            0.5 * lams[0]
+            },
+            ParameterBlockState {
+                beta: beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
+                eta: Array1::zeros(1),
+            },
+        ],
+        active_sets: vec![None, None, None],
+        log_likelihood: 0.0,
+        penalty_value: 0.5
+            * (lams[0]
                 * beta_flat.slice(s![0..p_time]).dot(&fast_av(
                     &s_time,
                     &beta_flat.slice(s![0..p_time]).to_owned(),
-                )),
-            0.5 * lams[1]
-                * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
-                    &s_marg_0,
-                    &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
-                )),
-            0.5 * lams[2]
-                * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
-                    &s_marg_1,
-                    &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
-                )),
-            0.5 * lams[3]
-                * beta_flat.slice(s![p_time + p_marg..p_total]).dot(&fast_av(
-                    &s_logs,
-                    &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
-                )),
-        ];
-        assert_eq!(
-            projected.gradient.len(),
-            dominant_terms.len(),
-            "projected gradient dimension changed"
-        );
-        for (k, (&g, &dominant_term)) in projected
-            .gradient
-            .iter()
-            .zip(dominant_terms.iter())
-            .enumerate()
-        {
-            // Bound: trace pair adds ~p contributions, plus H⁻¹ Ḣ trace
-            // bounded by Σ |λ_k| / |H_diag| × p ~ λ_k p / n ~ tiny at
-            // large scale. Total gradient should be within 10× of the
-            // dominant term (allowing for projection-correction sign).
-            let bound = dominant_term.abs().max(1.0) * 100.0;
-            assert!(g.is_finite(), "gradient[{k}] is non-finite: {g}");
-            assert!(
-                g.abs() <= bound,
-                "gradient[{k}] = {:.6e} exceeds physical bound 100·|½λβ'Sβ| = {:.6e} \
+                ))
+                + lams[1]
+                    * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                        &s_marg_0,
+                        &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                    ))
+                + lams[2]
+                    * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                        &s_marg_1,
+                        &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                    ))
+                + lams[3]
+                    * beta_flat.slice(s![p_time + p_marg..p_total]).dot(&fast_av(
+                        &s_logs,
+                        &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
+                    ))),
+        cycles: 1,
+        converged: true,
+        block_logdet_h: 0.0,
+        block_logdet_s: 0.0,
+        s_lambdas: s_lambdas_local,
+        joint_workspace: None,
+        kkt_residual: None,
+        active_constraints: None,
+    };
+
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        use_outer_hessian: false,
+        ..BlockwiseFitOptions::default()
+    };
+
+    let projected = joint_outer_evaluate(
+        &inner,
+        &specs,
+        &per_block,
+        &rho,
+        &beta_flat,
+        JointHessianSource::Dense(h.clone()),
+        &ranges,
+        p_total,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        true,
+        true,
+        false,
+        true,
+        EvalMode::ValueAndGradient,
+        &options,
+        crate::types::RhoPrior::Flat,
+        PseudoLogdetMode::Smooth,
+        &compute_dh,
+        None,
+        &no_d2h,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("large-scale projected eval");
+
+    // Physical-bound check: ½λ_k β'_k S_k β_k is the dominant explicit
+    // term per coord. For large-scale shape this is ~10⁸ at ρ=10 with
+    // β-scale O(1). The full gradient including the projected trace
+    // pair should be of THE SAME ORDER (or smaller after cancellation),
+    // never 10⁵× larger.
+    let dominant_terms = [
+        0.5 * lams[0]
+            * beta_flat.slice(s![0..p_time]).dot(&fast_av(
+                &s_time,
+                &beta_flat.slice(s![0..p_time]).to_owned(),
+            )),
+        0.5 * lams[1]
+            * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                &s_marg_0,
+                &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+            )),
+        0.5 * lams[2]
+            * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                &s_marg_1,
+                &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+            )),
+        0.5 * lams[3]
+            * beta_flat.slice(s![p_time + p_marg..p_total]).dot(&fast_av(
+                &s_logs,
+                &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
+            )),
+    ];
+    assert_eq!(
+        projected.gradient.len(),
+        dominant_terms.len(),
+        "projected gradient dimension changed"
+    );
+    for (k, (&g, &dominant_term)) in projected
+        .gradient
+        .iter()
+        .zip(dominant_terms.iter())
+        .enumerate()
+    {
+        // Bound: trace pair adds ~p contributions, plus H⁻¹ Ḣ trace
+        // bounded by Σ |λ_k| / |H_diag| × p ~ λ_k p / n ~ tiny at
+        // large scale. Total gradient should be within 10× of the
+        // dominant term (allowing for projection-correction sign).
+        let bound = dominant_term.abs().max(1.0) * 100.0;
+        assert!(g.is_finite(), "gradient[{k}] is non-finite: {g}");
+        assert!(
+            g.abs() <= bound,
+            "gradient[{k}] = {:.6e} exceeds physical bound 100·|½λβ'Sβ| = {:.6e} \
                  (dominant_term={:.6e}); this reproduces the large-scale blowup \
                  inside joint_outer_evaluate.",
-                g,
-                bound,
-                dominant_term
-            );
-        }
+            g,
+            bound,
+            dominant_term
+        );
     }
+}
 
-    #[test]
-    fn direct_joint_hyper_inner_tolerance_follows_outer_target() {
-        let options = BlockwiseFitOptions {
-            inner_tol: 1e-6,
-            outer_tol: 1e-5,
-            inner_max_cycles: 100,
+#[test]
+fn direct_joint_hyper_inner_tolerance_follows_outer_target() {
+    let options = BlockwiseFitOptions {
+        inner_tol: 1e-6,
+        outer_tol: 1e-5,
+        inner_max_cycles: 100,
+        ..BlockwiseFitOptions::default()
+    };
+    let (eval_options, strict_warm_start) =
+        derivative_quality_options_and_warm_start(&options, None, true);
+
+    assert_eq!(
+        eval_options.inner_tol, options.outer_tol,
+        "default exact joint-hyper eval should use the outer optimizer scale"
+    );
+    assert_eq!(eval_options.inner_max_cycles, options.inner_max_cycles);
+    assert!(
+        strict_warm_start.is_none(),
+        "loosening to the outer scale should not discard cached inner state"
+    );
+    let large_scale_objective = 3.689e5;
+    let posted_residual = 6.788e-1;
+    let posted_objective_change = 4.209e-2;
+    let eval_tol = eval_options.inner_tol * (1.0 + large_scale_objective);
+    assert!(
+        posted_residual <= 2.0 * eval_tol && posted_objective_change <= eval_tol,
+        "the exact outer startup validation should accept numerically flat inner solves at outer scale"
+    );
+    let (rho_default, _) = derivative_quality_options_and_warm_start(&options, None, false);
+    assert_eq!(
+        rho_default.inner_tol, options.inner_tol,
+        "rho-only exact joint-hyper eval must preserve the rho-only outer surface"
+    );
+
+    let tighter_options = BlockwiseFitOptions {
+        inner_tol: 1e-3,
+        outer_tol: 1e-5,
+        inner_max_cycles: 100,
+        ..BlockwiseFitOptions::default()
+    };
+    let (tightened, _) = derivative_quality_options_and_warm_start(&tighter_options, None, true);
+    assert_eq!(tightened.inner_tol, tighter_options.outer_tol);
+    assert_eq!(tightened.inner_max_cycles, 200);
+
+    let (rho_only, _) = derivative_quality_options_and_warm_start(&tighter_options, None, false);
+    assert_eq!(rho_only.inner_tol, tighter_options.inner_tol);
+    assert_eq!(rho_only.inner_max_cycles, tighter_options.inner_max_cycles);
+}
+
+#[test]
+fn exact_spatial_joint_hyper_inner_tolerance_follows_spatial_outer_target() {
+    let options = BlockwiseFitOptions {
+        inner_tol: 1e-6,
+        outer_tol: 1e-10,
+        inner_max_cycles: 200,
+        ..BlockwiseFitOptions::default()
+    };
+    let spatial_outer_tol = 1e-4;
+    let eval_input = joint_hyper_options_for_outer_tolerance(&options, spatial_outer_tol);
+    let (eval_options, strict_warm_start) =
+        derivative_quality_options_and_warm_start(&eval_input, None, true);
+
+    assert_eq!(eval_options.outer_tol, spatial_outer_tol);
+    assert_eq!(
+        eval_options.inner_tol, spatial_outer_tol,
+        "exact spatial [rho, psi] evaluations should certify beta only to the tolerance of the outer optimizer consuming the derivative"
+    );
+    assert!(
+        strict_warm_start.is_none(),
+        "loosening an over-tight caller tolerance should preserve the cached inner state"
+    );
+
+    let large_scale_objective = 3.689e5;
+    let posted_residual_plateau = 6.788e-1;
+    let posted_objective_change = 4.209e-2;
+    let eval_tol = eval_options.inner_tol * (1.0 + large_scale_objective);
+    assert!(
+        posted_residual_plateau <= eval_tol && posted_objective_change <= eval_tol,
+        "the posted saturated Newton plateau is below the spatial outer derivative accuracy target"
+    );
+}
+
+fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    penalty_counts: &[usize],
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
+    let (obj, grad, _, warm) = super::test_support::outerobjectivegradienthessian(
+        family,
+        specs,
+        options,
+        penalty_counts,
+        rho,
+        warm_start,
+        EvalMode::ValueAndGradient,
+    )?;
+    Ok((obj, grad, warm))
+}
+
+struct BinomialLocationScaleWiggleOuterFixture {
+    family: BinomialLocationScaleWiggleFamily,
+    specs: Vec<ParameterBlockSpec>,
+    penalty_counts: Vec<usize>,
+    rho: Array1<f64>,
+    options: BlockwiseFitOptions,
+}
+
+fn binomial_location_scale_wiggle_outer_fixture() -> BinomialLocationScaleWiggleOuterFixture {
+    let base = binomial_location_scale_base_fixture();
+    let q_seed = Array1::linspace(-1.4, 1.4, base.n);
+    let knots = crate::families::wiggle::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
+        .expect("knots");
+    let wiggle_block = crate::families::wiggle::buildwiggle_block_input_from_knots(
+        q_seed.view(),
+        &knots,
+        3,
+        2,
+        false,
+    )
+    .expect("wiggle block");
+    let wigglespec = ParameterBlockSpec {
+        name: "wiggle".to_string(),
+        design: wiggle_block.design.clone(),
+        offset: wiggle_block.offset.clone(),
+        penalties: wiggle_block
+            .penalties
+            .iter()
+            .map(|ps| match ps {
+                crate::solver::estimate::PenaltySpec::Block {
+                    local, col_range, ..
+                } => PenaltyMatrix::Blockwise {
+                    local: local.clone(),
+                    col_range: col_range.clone(),
+                    total_dim: wiggle_block.design.ncols(),
+                },
+                crate::solver::estimate::PenaltySpec::Dense(m)
+                | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                    PenaltyMatrix::Dense(m.clone())
+                }
+            })
+            .collect(),
+        nullspace_dims: wiggle_block.nullspace_dims.clone(),
+        initial_log_lambdas: array![0.1],
+        initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let family = BinomialLocationScaleWiggleFamily {
+        y: base.y,
+        weights: base.weights,
+        link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
+        threshold_design: Some(base.threshold_design),
+        log_sigma_design: Some(base.log_sigma_design),
+        wiggle_knots: knots,
+        wiggle_degree: 3,
+        policy: crate::resource::ResourcePolicy::default_library(),
+    };
+    BinomialLocationScaleWiggleOuterFixture {
+        family,
+        specs: vec![base.threshold_spec, base.log_sigma_spec, wigglespec],
+        penalty_counts: vec![1usize, 1usize, 1usize],
+        rho: array![0.05, -0.15, 0.1],
+        options: BlockwiseFitOptions {
+            use_remlobjective: true,
+            ridge_floor: 1e-10,
+            outer_max_iter: 1,
             ..BlockwiseFitOptions::default()
-        };
-        let (eval_options, strict_warm_start) =
-            derivative_quality_options_and_warm_start(&options, None, true);
+        },
+    }
+}
 
-        assert_eq!(
-            eval_options.inner_tol, options.outer_tol,
-            "default exact joint-hyper eval should use the outer optimizer scale"
-        );
-        assert_eq!(eval_options.inner_max_cycles, options.inner_max_cycles);
-        assert!(
-            strict_warm_start.is_none(),
-            "loosening to the outer scale should not discard cached inner state"
-        );
-        let large_scale_objective = 3.689e5;
-        let posted_residual = 6.788e-1;
-        let posted_objective_change = 4.209e-2;
-        let eval_tol = eval_options.inner_tol * (1.0 + large_scale_objective);
-        assert!(
-            posted_residual <= 2.0 * eval_tol && posted_objective_change <= eval_tol,
-            "the exact outer startup validation should accept numerically flat inner solves at outer scale"
-        );
-        let (rho_default, _) = derivative_quality_options_and_warm_start(&options, None, false);
-        assert_eq!(
-            rho_default.inner_tol, options.inner_tol,
-            "rho-only exact joint-hyper eval must preserve the rho-only outer surface"
-        );
+#[derive(Clone)]
+struct OneBlockIdentityFamily;
 
-        let tighter_options = BlockwiseFitOptions {
-            inner_tol: 1e-3,
-            outer_tol: 1e-5,
-            inner_max_cycles: 100,
-            ..BlockwiseFitOptions::default()
-        };
-        let (tightened, _) =
-            derivative_quality_options_and_warm_start(&tighter_options, None, true);
-        assert_eq!(tightened.inner_tol, tighter_options.outer_tol);
-        assert_eq!(tightened.inner_max_cycles, 200);
+#[test]
+fn joint_coupled_coefficient_hessian_cost_matches_n_times_p_total_squared() {
+    // Three blocks p_b = (12, 20, 8), n=200. Joint-coupled cost is
+    // n·(Σp_b)² = 200·40² = 320_000. Block-diagonal default with the
+    // same designs would give n·Σp_b² = 200·(144+400+64) = 121_600.
+    // The cross-block fill 2·n·(p_t·p_m + p_t·p_l + p_m·p_l) =
+    // 2·200·(240+96+160) = 198_400 accounts for the difference.
+    let mk_spec = |p: usize| ParameterBlockSpec {
+        name: "test".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+            200, p,
+        )))),
+        offset: Array1::zeros(200),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![mk_spec(12), mk_spec(20), mk_spec(8)];
+    assert_eq!(
+        joint_coupled_coefficient_hessian_cost(200, &specs),
+        200 * 40 * 40
+    );
+    assert_eq!(
+        default_coefficient_hessian_cost(&specs),
+        200 * (144 + 400 + 64)
+    );
+    assert!(
+        joint_coupled_coefficient_hessian_cost(200, &specs)
+            > default_coefficient_hessian_cost(&specs)
+    );
+}
 
-        let (rho_only, _) =
-            derivative_quality_options_and_warm_start(&tighter_options, None, false);
-        assert_eq!(rho_only.inner_tol, tighter_options.inner_tol);
-        assert_eq!(rho_only.inner_max_cycles, tighter_options.inner_max_cycles);
+#[test]
+fn large_scale_exact_adaptive_hessian_order_stays_second_order() {
+    let n_train = 320_000u64;
+    let p = 101usize;
+    let retained_rho_dim = 3usize;
+    let spec = ParameterBlockSpec {
+        name: "matern60".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+            1, p,
+        )))),
+        offset: Array1::zeros(1),
+        penalties: (0..retained_rho_dim)
+            .map(|_| PenaltyMatrix::Dense(Array2::eye(p)))
+            .collect(),
+        nullspace_dims: vec![0; retained_rho_dim],
+        initial_log_lambdas: Array1::zeros(retained_rho_dim),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let coefficient_hessian_cost = n_train * (p as u64) * (p as u64);
+
+    assert_eq!(coefficient_hessian_cost, 3_264_320_000);
+    assert_eq!(
+        retained_rho_dim as u64 * coefficient_hessian_cost,
+        9_792_960_000
+    );
+    assert_eq!(
+        exact_outer_order_from_capability(&[spec], coefficient_hessian_cost),
+        ExactOuterDerivativeOrder::Second
+    );
+}
+
+#[test]
+fn use_joint_matrix_free_path_triggers_at_each_documented_threshold() {
+    // p ≥ 512 is sufficient regardless of n.
+    assert!(use_joint_matrix_free_path(512, 1));
+    assert!(use_joint_matrix_free_path(2048, 4));
+    assert!(!use_joint_matrix_free_path(511, 1));
+
+    // n ≥ 50_000 AND p ≥ 128: both must hold. This keeps p≈51 FLEX
+    // marginal-slope large-scale fits on the bounded dense-materialized path.
+    assert!(use_joint_matrix_free_path(128, 50_000));
+    assert!(!use_joint_matrix_free_path(127, 50_000));
+    assert!(!use_joint_matrix_free_path(128, 31_249));
+    assert!(!use_joint_matrix_free_path(51, 320_000));
+
+    // n · p ≥ 4_000_000 is the linear-work fallback, but only after the
+    // same moderate-p guard; below that, materializing `p` columns is a
+    // deterministic small-p bound on expensive row-kernel HVPs.
+    assert!(use_joint_matrix_free_path(128, 31_250));
+    assert!(!use_joint_matrix_free_path(127, 31_497));
+
+    // Below every threshold: dense path.
+    assert!(!use_joint_matrix_free_path(8, 100));
+    assert!(!use_joint_matrix_free_path(64, 1000));
+}
+
+#[test]
+fn large_scale_shape_margslope_flex_cycle0_uses_bounded_dense_route() {
+    let total_p = 51;
+    let total_n = 320_000;
+    let max_pcg_hvps_before_fix = JOINT_PCG_MAX_ITER_MULTIPLIER * total_p;
+
+    assert_eq!(max_pcg_hvps_before_fix, 204);
+    assert!(
+        !use_joint_matrix_free_path(total_p, total_n),
+        "p=51/n=320k should materialize exactly 51 columns instead of risking up to {max_pcg_hvps_before_fix} expensive PCG matvecs in cycle 0"
+    );
+}
+
+struct CountingHessianWorkspace {
+    dense_calls: Arc<AtomicUsize>,
+    matvec_calls: Arc<AtomicUsize>,
+    source_preference: JointHessianSourcePreference,
+}
+
+impl ExactNewtonJointHessianWorkspace for CountingHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        self.dense_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(Array2::eye(2)))
     }
 
-    #[test]
-    fn exact_spatial_joint_hyper_inner_tolerance_follows_spatial_outer_target() {
-        let options = BlockwiseFitOptions {
-            inner_tol: 1e-6,
-            outer_tol: 1e-10,
-            inner_max_cycles: 200,
-            ..BlockwiseFitOptions::default()
-        };
-        let spatial_outer_tol = 1e-4;
-        let eval_input = joint_hyper_options_for_outer_tolerance(&options, spatial_outer_tol);
-        let (eval_options, strict_warm_start) =
-            derivative_quality_options_and_warm_start(&eval_input, None, true);
-
-        assert_eq!(eval_options.outer_tol, spatial_outer_tol);
-        assert_eq!(
-            eval_options.inner_tol, spatial_outer_tol,
-            "exact spatial [rho, psi] evaluations should certify beta only to the tolerance of the outer optimizer consuming the derivative"
-        );
-        assert!(
-            strict_warm_start.is_none(),
-            "loosening an over-tight caller tolerance should preserve the cached inner state"
-        );
-
-        let large_scale_objective = 3.689e5;
-        let posted_residual_plateau = 6.788e-1;
-        let posted_objective_change = 4.209e-2;
-        let eval_tol = eval_options.inner_tol * (1.0 + large_scale_objective);
-        assert!(
-            posted_residual_plateau <= eval_tol && posted_objective_change <= eval_tol,
-            "the posted saturated Newton plateau is below the spatial outer derivative accuracy target"
-        );
+    fn hessian_source_preference(&self) -> JointHessianSourcePreference {
+        self.source_preference
     }
 
-    fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
-        family: &F,
-        specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
-        penalty_counts: &[usize],
-        rho: &Array1<f64>,
-        warm_start: Option<&ConstrainedWarmStart>,
-    ) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
-        let (obj, grad, _, warm) = super::test_support::outerobjectivegradienthessian(
-            family,
-            specs,
-            options,
-            penalty_counts,
-            rho,
-            warm_start,
-            EvalMode::ValueAndGradient,
-        )?;
-        Ok((obj, grad, warm))
+    fn hessian_matvec_available(&self) -> bool {
+        true
     }
 
-    struct BinomialLocationScaleWiggleOuterFixture {
-        family: BinomialLocationScaleWiggleFamily,
-        specs: Vec<ParameterBlockSpec>,
-        penalty_counts: Vec<usize>,
-        rho: Array1<f64>,
-        options: BlockwiseFitOptions,
+    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        self.matvec_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(v.clone()))
     }
 
-    fn binomial_location_scale_wiggle_outer_fixture() -> BinomialLocationScaleWiggleOuterFixture {
-        let base = binomial_location_scale_base_fixture();
-        let q_seed = Array1::linspace(-1.4, 1.4, base.n);
-        let knots = crate::families::wiggle::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
-            .expect("knots");
-        let wiggle_block = crate::families::wiggle::buildwiggle_block_input_from_knots(
-            q_seed.view(),
-            &knots,
-            3,
-            2,
-            false,
-        )
-        .expect("wiggle block");
-        let wigglespec = ParameterBlockSpec {
-            name: "wiggle".to_string(),
-            design: wiggle_block.design.clone(),
-            offset: wiggle_block.offset.clone(),
-            penalties: wiggle_block
-                .penalties
-                .iter()
-                .map(|ps| match ps {
-                    crate::solver::estimate::PenaltySpec::Block {
-                        local, col_range, ..
-                    } => PenaltyMatrix::Blockwise {
-                        local: local.clone(),
-                        col_range: col_range.clone(),
-                        total_dim: wiggle_block.design.ncols(),
-                    },
-                    crate::solver::estimate::PenaltySpec::Dense(m)
-                    | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
-                        PenaltyMatrix::Dense(m.clone())
-                    }
-                })
-                .collect(),
-            nullspace_dims: wiggle_block.nullspace_dims.clone(),
-            initial_log_lambdas: array![0.1],
-            initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let family = BinomialLocationScaleWiggleFamily {
-            y: base.y,
-            weights: base.weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
-            threshold_design: Some(base.threshold_design),
-            log_sigma_design: Some(base.log_sigma_design),
-            wiggle_knots: knots,
-            wiggle_degree: 3,
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
-        BinomialLocationScaleWiggleOuterFixture {
-            family,
-            specs: vec![base.threshold_spec, base.log_sigma_spec, wigglespec],
-            penalty_counts: vec![1usize, 1usize, 1usize],
-            rho: array![0.05, -0.15, 0.1],
-            options: BlockwiseFitOptions {
-                use_remlobjective: true,
-                ridge_floor: 1e-10,
-                outer_max_iter: 1,
-                ..BlockwiseFitOptions::default()
-            },
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        Ok(Some(Array1::ones(2)))
+    }
+
+    fn directional_derivative(&self, arr: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(None)
+    }
+}
+
+#[test]
+fn workspace_hessian_source_prefers_dense_without_zero_matvec_probe() {
+    let dense_calls = Arc::new(AtomicUsize::new(0));
+    let matvec_calls = Arc::new(AtomicUsize::new(0));
+    let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> = Arc::new(CountingHessianWorkspace {
+        dense_calls: Arc::clone(&dense_calls),
+        matvec_calls: Arc::clone(&matvec_calls),
+        source_preference: JointHessianSourcePreference::Dense,
+    });
+
+    let source = exact_newton_joint_hessian_source_from_workspace(
+        &workspace,
+        2,
+        MaterializationIntent::InnerSolve,
+        "counting workspace",
+    )
+    .expect("hessian source should build")
+    .expect("hessian source should be present");
+
+    assert_eq!(dense_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
+    match source {
+        JointHessianSource::Dense(hessian) => assert_eq!(hessian, Array2::<f64>::eye(2)),
+        JointHessianSource::Operator { .. } => panic!("dense source was not preferred"),
+    }
+    assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn workspace_hessian_source_honors_operator_preference_before_dense_probe() {
+    let dense_calls = Arc::new(AtomicUsize::new(0));
+    let matvec_calls = Arc::new(AtomicUsize::new(0));
+    let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> = Arc::new(CountingHessianWorkspace {
+        dense_calls: Arc::clone(&dense_calls),
+        matvec_calls: Arc::clone(&matvec_calls),
+        source_preference: JointHessianSourcePreference::Operator,
+    });
+
+    let source = exact_newton_joint_hessian_source_from_workspace(
+        &workspace,
+        2,
+        MaterializationIntent::InnerSolve,
+        "operator-preferred counting workspace",
+    )
+    .expect("hessian source should build")
+    .expect("hessian source should be present");
+
+    assert_eq!(
+        dense_calls.load(Ordering::Relaxed),
+        0,
+        "operator-preferred source construction must not probe hessian_dense"
+    );
+    match source {
+        JointHessianSource::Operator { apply, .. } => {
+            let v = array![3.0, -2.0];
+            assert_eq!(apply(&v).expect("operator apply should succeed"), v);
+            assert_eq!(matvec_calls.load(Ordering::Relaxed), 1);
+        }
+        JointHessianSource::Dense(_) => panic!("operator source was not preferred"),
+    }
+}
+
+/// A workspace that exposes both a dense build and a matrix-free HVP and
+/// refines its representation per intent (#738): matrix-free for the inner
+/// solve, dense for logdet factorization. Mirrors CTN's contract.
+struct IntentRefiningHessianWorkspace {
+    dense_calls: Arc<AtomicUsize>,
+    matvec_calls: Arc<AtomicUsize>,
+}
+
+impl ExactNewtonJointHessianWorkspace for IntentRefiningHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        self.dense_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(Array2::eye(2)))
+    }
+
+    fn hessian_source_preference(&self) -> JointHessianSourcePreference {
+        JointHessianSourcePreference::Operator
+    }
+
+    fn hessian_source_preference_for_intent(
+        &self,
+        intent: MaterializationIntent,
+    ) -> JointHessianSourcePreference {
+        match intent {
+            MaterializationIntent::LogdetFactorization => JointHessianSourcePreference::Dense,
+            MaterializationIntent::InnerSolve
+            | MaterializationIntent::OuterEvaluation
+            | MaterializationIntent::OuterGradient => JointHessianSourcePreference::Operator,
         }
     }
 
-    #[derive(Clone)]
-    struct OneBlockIdentityFamily;
-
-    #[test]
-    fn joint_coupled_coefficient_hessian_cost_matches_n_times_p_total_squared() {
-        // Three blocks p_b = (12, 20, 8), n=200. Joint-coupled cost is
-        // n·(Σp_b)² = 200·40² = 320_000. Block-diagonal default with the
-        // same designs would give n·Σp_b² = 200·(144+400+64) = 121_600.
-        // The cross-block fill 2·n·(p_t·p_m + p_t·p_l + p_m·p_l) =
-        // 2·200·(240+96+160) = 198_400 accounts for the difference.
-        let mk_spec = |p: usize| ParameterBlockSpec {
-            name: "test".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
-                200, p,
-            )))),
-            offset: Array1::zeros(200),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let specs = vec![mk_spec(12), mk_spec(20), mk_spec(8)];
-        assert_eq!(
-            joint_coupled_coefficient_hessian_cost(200, &specs),
-            200 * 40 * 40
-        );
-        assert_eq!(
-            default_coefficient_hessian_cost(&specs),
-            200 * (144 + 400 + 64)
-        );
-        assert!(
-            joint_coupled_coefficient_hessian_cost(200, &specs)
-                > default_coefficient_hessian_cost(&specs)
-        );
+    fn hessian_matvec_available(&self) -> bool {
+        true
     }
 
-    #[test]
-    fn large_scale_exact_adaptive_hessian_order_stays_second_order() {
-        let n_train = 320_000u64;
-        let p = 101usize;
-        let retained_rho_dim = 3usize;
-        let spec = ParameterBlockSpec {
-            name: "matern60".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
-                1, p,
-            )))),
-            offset: Array1::zeros(1),
-            penalties: (0..retained_rho_dim)
-                .map(|_| PenaltyMatrix::Dense(Array2::eye(p)))
-                .collect(),
-            nullspace_dims: vec![0; retained_rho_dim],
-            initial_log_lambdas: Array1::zeros(retained_rho_dim),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let coefficient_hessian_cost = n_train * (p as u64) * (p as u64);
-
-        assert_eq!(coefficient_hessian_cost, 3_264_320_000);
-        assert_eq!(
-            retained_rho_dim as u64 * coefficient_hessian_cost,
-            9_792_960_000
-        );
-        assert_eq!(
-            exact_outer_order_from_capability(&[spec], coefficient_hessian_cost),
-            ExactOuterDerivativeOrder::Second
-        );
+    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        self.matvec_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(v.clone()))
     }
 
-    #[test]
-    fn use_joint_matrix_free_path_triggers_at_each_documented_threshold() {
-        // p ≥ 512 is sufficient regardless of n.
-        assert!(use_joint_matrix_free_path(512, 1));
-        assert!(use_joint_matrix_free_path(2048, 4));
-        assert!(!use_joint_matrix_free_path(511, 1));
-
-        // n ≥ 50_000 AND p ≥ 128: both must hold. This keeps p≈51 FLEX
-        // marginal-slope large-scale fits on the bounded dense-materialized path.
-        assert!(use_joint_matrix_free_path(128, 50_000));
-        assert!(!use_joint_matrix_free_path(127, 50_000));
-        assert!(!use_joint_matrix_free_path(128, 31_249));
-        assert!(!use_joint_matrix_free_path(51, 320_000));
-
-        // n · p ≥ 4_000_000 is the linear-work fallback, but only after the
-        // same moderate-p guard; below that, materializing `p` columns is a
-        // deterministic small-p bound on expensive row-kernel HVPs.
-        assert!(use_joint_matrix_free_path(128, 31_250));
-        assert!(!use_joint_matrix_free_path(127, 31_497));
-
-        // Below every threshold: dense path.
-        assert!(!use_joint_matrix_free_path(8, 100));
-        assert!(!use_joint_matrix_free_path(64, 1000));
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        Ok(Some(Array1::ones(2)))
     }
 
-    #[test]
-    fn large_scale_shape_margslope_flex_cycle0_uses_bounded_dense_route() {
-        let total_p = 51;
-        let total_n = 320_000;
-        let max_pcg_hvps_before_fix = JOINT_PCG_MAX_ITER_MULTIPLIER * total_p;
-
-        assert_eq!(max_pcg_hvps_before_fix, 204);
-        assert!(
-            !use_joint_matrix_free_path(total_p, total_n),
-            "p=51/n=320k should materialize exactly 51 columns instead of risking up to {max_pcg_hvps_before_fix} expensive PCG matvecs in cycle 0"
-        );
+    fn directional_derivative(&self, arr: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(None)
     }
+}
 
-    struct CountingHessianWorkspace {
-        dense_calls: Arc<AtomicUsize>,
-        matvec_calls: Arc<AtomicUsize>,
-        source_preference: JointHessianSourcePreference,
-    }
+#[test]
+fn logdet_intent_takes_dense_while_inner_solve_takes_operator() {
+    let dense_calls = Arc::new(AtomicUsize::new(0));
+    let matvec_calls = Arc::new(AtomicUsize::new(0));
+    let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
+        Arc::new(IntentRefiningHessianWorkspace {
+            dense_calls: Arc::clone(&dense_calls),
+            matvec_calls: Arc::clone(&matvec_calls),
+        });
 
-    impl ExactNewtonJointHessianWorkspace for CountingHessianWorkspace {
-        fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
-            self.dense_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(Array2::eye(2)))
-        }
-
-        fn hessian_source_preference(&self) -> JointHessianSourcePreference {
-            self.source_preference
-        }
-
-        fn hessian_matvec_available(&self) -> bool {
-            true
-        }
-
-        fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
-            self.matvec_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(v.clone()))
-        }
-
-        fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-            Ok(Some(Array1::ones(2)))
-        }
-
-        fn directional_derivative(&self, arr: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(None)
+    // Logdet factorization intent: the consumer factorizes H + S_lambda,
+    // so the workspace hands back the structural dense build directly,
+    // probing hessian_dense and skipping the operator wrapper.
+    let logdet_source = exact_newton_joint_hessian_source_from_workspace(
+        &workspace,
+        2,
+        MaterializationIntent::LogdetFactorization,
+        "intent-refining logdet",
+    )
+    .expect("logdet source should build")
+    .expect("logdet source should be present");
+    assert_eq!(dense_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
+    match logdet_source {
+        JointHessianSource::Dense(hessian) => assert_eq!(hessian, Array2::<f64>::eye(2)),
+        JointHessianSource::Operator { .. } => {
+            panic!("logdet intent must take the dense representation")
         }
     }
 
-    #[test]
-    fn workspace_hessian_source_prefers_dense_without_zero_matvec_probe() {
-        let dense_calls = Arc::new(AtomicUsize::new(0));
-        let matvec_calls = Arc::new(AtomicUsize::new(0));
-        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
-            Arc::new(CountingHessianWorkspace {
-                dense_calls: Arc::clone(&dense_calls),
-                matvec_calls: Arc::clone(&matvec_calls),
-                source_preference: JointHessianSourcePreference::Dense,
-            });
-
-        let source = exact_newton_joint_hessian_source_from_workspace(
-            &workspace,
-            2,
-            MaterializationIntent::InnerSolve,
-            "counting workspace",
-        )
-        .expect("hessian source should build")
-        .expect("hessian source should be present");
-
-        assert_eq!(dense_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
-        match source {
-            JointHessianSource::Dense(hessian) => assert_eq!(hessian, Array2::<f64>::eye(2)),
-            JointHessianSource::Operator { .. } => panic!("dense source was not preferred"),
+    // Inner solve intent: only H · v is applied, so the same workspace
+    // hands back the matrix-free operator without touching hessian_dense.
+    let inner_source = exact_newton_joint_hessian_source_from_workspace(
+        &workspace,
+        2,
+        MaterializationIntent::InnerSolve,
+        "intent-refining inner solve",
+    )
+    .expect("inner source should build")
+    .expect("inner source should be present");
+    assert_eq!(
+        dense_calls.load(Ordering::Relaxed),
+        1,
+        "inner-solve intent must not probe hessian_dense"
+    );
+    match inner_source {
+        JointHessianSource::Operator { apply, .. } => {
+            let v = array![1.5, -4.0];
+            assert_eq!(apply(&v).expect("operator apply should succeed"), v);
+            assert_eq!(matvec_calls.load(Ordering::Relaxed), 1);
         }
-        assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn workspace_hessian_source_honors_operator_preference_before_dense_probe() {
-        let dense_calls = Arc::new(AtomicUsize::new(0));
-        let matvec_calls = Arc::new(AtomicUsize::new(0));
-        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
-            Arc::new(CountingHessianWorkspace {
-                dense_calls: Arc::clone(&dense_calls),
-                matvec_calls: Arc::clone(&matvec_calls),
-                source_preference: JointHessianSourcePreference::Operator,
-            });
-
-        let source = exact_newton_joint_hessian_source_from_workspace(
-            &workspace,
-            2,
-            MaterializationIntent::InnerSolve,
-            "operator-preferred counting workspace",
-        )
-        .expect("hessian source should build")
-        .expect("hessian source should be present");
-
-        assert_eq!(
-            dense_calls.load(Ordering::Relaxed),
-            0,
-            "operator-preferred source construction must not probe hessian_dense"
-        );
-        match source {
-            JointHessianSource::Operator { apply, .. } => {
-                let v = array![3.0, -2.0];
-                assert_eq!(apply(&v).expect("operator apply should succeed"), v);
-                assert_eq!(matvec_calls.load(Ordering::Relaxed), 1);
-            }
-            JointHessianSource::Dense(_) => panic!("operator source was not preferred"),
+        JointHessianSource::Dense(_) => {
+            panic!("inner-solve intent must take the operator representation")
         }
     }
+}
 
-    /// A workspace that exposes both a dense build and a matrix-free HVP and
-    /// refines its representation per intent (#738): matrix-free for the inner
-    /// solve, dense for logdet factorization. Mirrors CTN's contract.
-    struct IntentRefiningHessianWorkspace {
-        dense_calls: Arc<AtomicUsize>,
-        matvec_calls: Arc<AtomicUsize>,
-    }
+#[test]
+fn default_coefficient_gradient_cost_is_half_of_hessian_cost() {
+    // The gradient-only sweep through the inner Newton solve does
+    // roughly half the per-evaluation arithmetic of the full Hessian
+    // assembly path (skips K-fold pairwise B_{j,k} blocks and K-fold
+    // inner derivative solves). The default trait method preserves
+    // this 2× ratio; families that override `coefficient_hessian_cost`
+    // (e.g. GAMLSS via `joint_coupled_coefficient_hessian_cost`)
+    // automatically inherit a consistent gradient-cost scaling without
+    // a per-family override.
+    let mk_spec = |n: usize, p: usize| ParameterBlockSpec {
+        name: "test".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+            n, p,
+        )))),
+        offset: Array1::zeros(n),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![mk_spec(500, 10), mk_spec(500, 14)];
+    let h_cost = default_coefficient_hessian_cost(&specs);
+    let g_cost = default_coefficient_gradient_cost(&specs);
+    assert_eq!(h_cost, 500 * 100 + 500 * 196);
+    assert_eq!(g_cost, h_cost / 2);
+}
 
-    impl ExactNewtonJointHessianWorkspace for IntentRefiningHessianWorkspace {
-        fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
-            self.dense_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(Array2::eye(2)))
-        }
+#[test]
+fn first_order_outer_iter_gate_caps_expensive_gradient_paths() {
+    assert_eq!(
+        cost_gated_first_order_max_iter(60, 10_000_000_000, false),
+        8
+    );
+    assert_eq!(
+        cost_gated_first_order_max_iter(60, 100_000_000_000, false),
+        4
+    );
+    assert_eq!(
+        cost_gated_first_order_max_iter(60, 100_000_000_000, true),
+        60
+    );
+}
 
-        fn hessian_source_preference(&self) -> JointHessianSourcePreference {
-            JointHessianSourcePreference::Operator
-        }
+#[test]
+fn custom_family_default_outer_seed_config_is_tightened_for_expensive_paths() {
+    let family = OneBlockIdentityFamily;
 
-        fn hessian_source_preference_for_intent(
-            &self,
-            intent: MaterializationIntent,
-        ) -> JointHessianSourcePreference {
-            match intent {
-                MaterializationIntent::LogdetFactorization => JointHessianSourcePreference::Dense,
-                MaterializationIntent::InnerSolve
-                | MaterializationIntent::OuterEvaluation
-                | MaterializationIntent::OuterGradient => JointHessianSourcePreference::Operator,
-            }
-        }
+    let small = family.outer_seed_config(4);
+    assert_eq!(small.max_seeds, 6);
+    assert_eq!(small.seed_budget, 1);
+    assert_eq!(small.screen_max_inner_iterations, 2);
 
-        fn hessian_matvec_available(&self) -> bool {
-            true
-        }
+    let large = family.outer_seed_config(16);
+    assert_eq!(large.max_seeds, 4);
+    assert_eq!(large.seed_budget, 1);
+    assert_eq!(large.screen_max_inner_iterations, 2);
+}
 
-        fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
-            self.matvec_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(v.clone()))
-        }
+#[test]
+fn floor_positiveworking_weights_preserves_exactzeros() {
+    let weights = array![0.0, 1.0e-16, 0.25];
+    let floored = floor_positiveworking_weights(&weights, 1.0e-6);
+    assert_eq!(floored[0], 0.0);
+    assert_eq!(floored[1], 1.0e-6);
+    assert_eq!(floored[2], 0.25);
+}
 
-        fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-            Ok(Some(Array1::ones(2)))
-        }
+#[test]
+fn screened_outer_warm_start_reuses_any_matching_rho_dimension() {
+    let rho_far = array![2.25, -0.5];
+    let cache = Some(ConstrainedWarmStart {
+        rho: array![0.0, -0.5],
+        block_beta: vec![array![1.0, -1.0]],
+        active_sets: vec![None],
+        cached_inner: None,
+    });
 
-        fn directional_derivative(&self, arr: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(None)
-        }
-    }
+    let retained = screened_outer_warm_start(cache.as_ref(), &rho_far)
+        .expect("matching-dimension warm starts should remain reusable");
+    assert_eq!(retained.rho, array![0.0, -0.5]);
+    assert_eq!(retained.block_beta[0], array![1.0, -1.0]);
+    assert_eq!(retained.active_sets[0], None);
+}
 
-    #[test]
-    fn logdet_intent_takes_dense_while_inner_solve_takes_operator() {
-        let dense_calls = Arc::new(AtomicUsize::new(0));
-        let matvec_calls = Arc::new(AtomicUsize::new(0));
-        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
-            Arc::new(IntentRefiningHessianWorkspace {
-                dense_calls: Arc::clone(&dense_calls),
-                matvec_calls: Arc::clone(&matvec_calls),
-            });
+#[test]
+fn cached_beta_warm_start_splits_blocks_and_validates_shape() {
+    let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+            3, p,
+        )))),
+        offset: Array1::zeros(3),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![mk_spec("a", 2), mk_spec("b", 3)];
 
-        // Logdet factorization intent: the consumer factorizes H + S_lambda,
-        // so the workspace hands back the structural dense build directly,
-        // probing hessian_dense and skipping the operator wrapper.
-        let logdet_source = exact_newton_joint_hessian_source_from_workspace(
-            &workspace,
-            2,
-            MaterializationIntent::LogdetFactorization,
-            "intent-refining logdet",
-        )
-        .expect("logdet source should build")
-        .expect("logdet source should be present");
-        assert_eq!(dense_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
-        match logdet_source {
-            JointHessianSource::Dense(hessian) => assert_eq!(hessian, Array2::<f64>::eye(2)),
-            JointHessianSource::Operator { .. } => {
-                panic!("logdet intent must take the dense representation")
-            }
-        }
+    let warm = constrained_warm_start_from_cached_beta(4, &specs, &array![1., 2., 3., 4., 5.])
+        .expect("matching beta");
+    assert_eq!(warm.rho.len(), 4);
+    assert_eq!(warm.block_beta, vec![array![1., 2.], array![3., 4., 5.]]);
+    assert_eq!(warm.active_sets, vec![None, None]);
+    assert!(warm.cached_inner.is_none());
 
-        // Inner solve intent: only H · v is applied, so the same workspace
-        // hands back the matrix-free operator without touching hessian_dense.
-        let inner_source = exact_newton_joint_hessian_source_from_workspace(
-            &workspace,
-            2,
-            MaterializationIntent::InnerSolve,
-            "intent-refining inner solve",
-        )
-        .expect("inner source should build")
-        .expect("inner source should be present");
-        assert_eq!(
-            dense_calls.load(Ordering::Relaxed),
-            1,
-            "inner-solve intent must not probe hessian_dense"
-        );
-        match inner_source {
-            JointHessianSource::Operator { apply, .. } => {
-                let v = array![1.5, -4.0];
-                assert_eq!(apply(&v).expect("operator apply should succeed"), v);
-                assert_eq!(matvec_calls.load(Ordering::Relaxed), 1);
-            }
-            JointHessianSource::Dense(_) => {
-                panic!("inner-solve intent must take the operator representation")
-            }
-        }
-    }
+    let err = match constrained_warm_start_from_cached_beta(4, &specs, &array![1., 2., 3.]) {
+        Ok(_) => panic!("wrong beta length should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("cached inner beta has length 3, but custom-family blocks require length 5"),
+        "{err}"
+    );
+}
 
-    #[test]
-    fn default_coefficient_gradient_cost_is_half_of_hessian_cost() {
-        // The gradient-only sweep through the inner Newton solve does
-        // roughly half the per-evaluation arithmetic of the full Hessian
-        // assembly path (skips K-fold pairwise B_{j,k} blocks and K-fold
-        // inner derivative solves). The default trait method preserves
-        // this 2× ratio; families that override `coefficient_hessian_cost`
-        // (e.g. GAMLSS via `joint_coupled_coefficient_hessian_cost`)
-        // automatically inherit a consistent gradient-cost scaling without
-        // a per-family override.
-        let mk_spec = |n: usize, p: usize| ParameterBlockSpec {
-            name: "test".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
-                n, p,
-            )))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let specs = vec![mk_spec(500, 10), mk_spec(500, 14)];
-        let h_cost = default_coefficient_hessian_cost(&specs);
-        let g_cost = default_coefficient_gradient_cost(&specs);
-        assert_eq!(h_cost, 500 * 100 + 500 * 196);
-        assert_eq!(g_cost, h_cost / 2);
-    }
+#[test]
+fn cached_beta_warm_start_rejects_nonfinite_entries() {
+    let spec = ParameterBlockSpec {
+        name: "a".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+            3, 2,
+        )))),
+        offset: Array1::zeros(3),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
 
-    #[test]
-    fn first_order_outer_iter_gate_caps_expensive_gradient_paths() {
-        assert_eq!(
-            cost_gated_first_order_max_iter(60, 10_000_000_000, false),
-            8
-        );
-        assert_eq!(
-            cost_gated_first_order_max_iter(60, 100_000_000_000, false),
-            4
-        );
-        assert_eq!(
-            cost_gated_first_order_max_iter(60, 100_000_000_000, true),
-            60
-        );
-    }
+    let err = match constrained_warm_start_from_cached_beta(1, &[spec], &array![1.0, f64::NAN]) {
+        Ok(_) => panic!("non-finite beta should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("cached inner beta contains non-finite entries"),
+        "{err}"
+    );
+}
 
-    #[test]
-    fn custom_family_default_outer_seed_config_is_tightened_for_expensive_paths() {
-        let family = OneBlockIdentityFamily;
+#[test]
+fn custom_outer_state_reset_preserves_seeded_cached_beta() {
+    let spec = ParameterBlockSpec {
+        name: "a".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+            3, 2,
+        )))),
+        offset: Array1::zeros(3),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let mut state = CustomOuterState::new(None);
+    state
+        .seed_cached_beta(1, &[spec], &array![4.0, -2.0])
+        .expect("cached beta seed");
 
-        let small = family.outer_seed_config(4);
-        assert_eq!(small.max_seeds, 6);
-        assert_eq!(small.seed_budget, 1);
-        assert_eq!(small.screen_max_inner_iterations, 2);
+    state.warm_cache = None;
+    state.reset();
 
-        let large = family.outer_seed_config(16);
-        assert_eq!(large.max_seeds, 4);
-        assert_eq!(large.seed_budget, 1);
-        assert_eq!(large.screen_max_inner_iterations, 2);
-    }
+    let warm = state
+        .warm_cache
+        .as_ref()
+        .expect("reset should restore cached beta seed");
+    assert_eq!(warm.rho.len(), 1);
+    assert_eq!(warm.block_beta, vec![array![4.0, -2.0]]);
+    assert!(warm.cached_inner.is_none());
+}
 
-    #[test]
-    fn floor_positiveworking_weights_preserves_exactzeros() {
-        let weights = array![0.0, 1.0e-16, 0.25];
-        let floored = floor_positiveworking_weights(&weights, 1.0e-6);
-        assert_eq!(floored[0], 0.0);
-        assert_eq!(floored[1], 1.0e-6);
-        assert_eq!(floored[2], 0.25);
-    }
+#[test]
+fn custom_outer_state_reset_preserves_existing_persistent_warm_start() {
+    let persistent = ConstrainedWarmStart {
+        rho: array![0.25],
+        block_beta: vec![array![1.0, 2.0]],
+        active_sets: vec![None],
+        cached_inner: None,
+    };
+    let mut state = CustomOuterState::new(Some(persistent.clone()));
 
-    #[test]
-    fn screened_outer_warm_start_reuses_any_matching_rho_dimension() {
-        let rho_far = array![2.25, -0.5];
-        let cache = Some(ConstrainedWarmStart {
+    state.warm_cache = None;
+    state.reset();
+
+    let warm = state
+        .warm_cache
+        .as_ref()
+        .expect("reset should restore persistent warm start");
+    assert_eq!(warm.rho, persistent.rho);
+    assert_eq!(warm.block_beta, persistent.block_beta);
+}
+
+#[test]
+fn public_warm_start_compatibility_checks_rho_dimension() {
+    let warm = CustomFamilyWarmStart {
+        inner: ConstrainedWarmStart {
             rho: array![0.0, -0.5],
             block_beta: vec![array![1.0, -1.0]],
             active_sets: vec![None],
             cached_inner: None,
-        });
+        },
+    };
 
-        let retained = screened_outer_warm_start(cache.as_ref(), &rho_far)
-            .expect("matching-dimension warm starts should remain reusable");
-        assert_eq!(retained.rho, array![0.0, -0.5]);
-        assert_eq!(retained.block_beta[0], array![1.0, -1.0]);
-        assert_eq!(retained.active_sets[0], None);
-    }
+    assert!(warm.compatible_with_rho(&array![0.75, -0.5]));
+    assert!(warm.compatible_with_rho(&array![1.75, -0.5]));
+    assert!(!warm.compatible_with_rho(&array![0.0]));
+}
 
-    #[test]
-    fn cached_beta_warm_start_splits_blocks_and_validates_shape() {
-        let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
-            name: name.to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
-                3, p,
-            )))),
-            offset: Array1::zeros(3),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let specs = vec![mk_spec("a", 2), mk_spec("b", 3)];
-
-        let warm = constrained_warm_start_from_cached_beta(4, &specs, &array![1., 2., 3., 4., 5.])
-            .expect("matching beta");
-        assert_eq!(warm.rho.len(), 4);
-        assert_eq!(warm.block_beta, vec![array![1., 2.], array![3., 4., 5.]]);
-        assert_eq!(warm.active_sets, vec![None, None]);
-        assert!(warm.cached_inner.is_none());
-
-        let err = match constrained_warm_start_from_cached_beta(4, &specs, &array![1., 2., 3.]) {
-            Ok(_) => panic!("wrong beta length should be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains(
-                "cached inner beta has length 3, but custom-family blocks require length 5"
-            ),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn cached_beta_warm_start_rejects_nonfinite_entries() {
-        let spec = ParameterBlockSpec {
-            name: "a".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
-                3, 2,
-            )))),
-            offset: Array1::zeros(3),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-
-        let err = match constrained_warm_start_from_cached_beta(1, &[spec], &array![1.0, f64::NAN])
-        {
-            Ok(_) => panic!("non-finite beta should be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("cached inner beta contains non-finite entries"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn custom_outer_state_reset_preserves_seeded_cached_beta() {
-        let spec = ParameterBlockSpec {
-            name: "a".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
-                3, 2,
-            )))),
-            offset: Array1::zeros(3),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let mut state = CustomOuterState::new(None);
-        state
-            .seed_cached_beta(1, &[spec], &array![4.0, -2.0])
-            .expect("cached beta seed");
-
-        state.warm_cache = None;
-        state.reset();
-
-        let warm = state
-            .warm_cache
-            .as_ref()
-            .expect("reset should restore cached beta seed");
-        assert_eq!(warm.rho.len(), 1);
-        assert_eq!(warm.block_beta, vec![array![4.0, -2.0]]);
-        assert!(warm.cached_inner.is_none());
-    }
-
-    #[test]
-    fn custom_outer_state_reset_preserves_existing_persistent_warm_start() {
-        let persistent = ConstrainedWarmStart {
-            rho: array![0.25],
-            block_beta: vec![array![1.0, 2.0]],
-            active_sets: vec![None],
-            cached_inner: None,
-        };
-        let mut state = CustomOuterState::new(Some(persistent.clone()));
-
-        state.warm_cache = None;
-        state.reset();
-
-        let warm = state
-            .warm_cache
-            .as_ref()
-            .expect("reset should restore persistent warm start");
-        assert_eq!(warm.rho, persistent.rho);
-        assert_eq!(warm.block_beta, persistent.block_beta);
-    }
-
-    #[test]
-    fn public_warm_start_compatibility_checks_rho_dimension() {
-        let warm = CustomFamilyWarmStart {
-            inner: ConstrainedWarmStart {
-                rho: array![0.0, -0.5],
-                block_beta: vec![array![1.0, -1.0]],
-                active_sets: vec![None],
-                cached_inner: None,
-            },
-        };
-
-        assert!(warm.compatible_with_rho(&array![0.75, -0.5]));
-        assert!(warm.compatible_with_rho(&array![1.75, -0.5]));
-        assert!(!warm.compatible_with_rho(&array![0.0]));
-    }
-
-    #[test]
-    fn psi_drift_deriv_workspace_preserves_block_local_operator() {
-        #[derive(Clone)]
-        struct ZeroFamily;
-
-        impl CustomFamily for ZeroFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                assert!(block_states.len() <= isize::MAX as usize);
-                Ok(FamilyEvaluation {
-                    log_likelihood: 0.0,
-                    blockworking_sets: vec![],
-                })
-            }
-        }
-
-        struct BlockLocalPsiWorkspace;
-
-        impl ExactNewtonJointPsiWorkspace for BlockLocalPsiWorkspace {
-            fn second_order_terms(
-                &self,
-                idx: usize,
-                idx2: usize,
-            ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-                assert!(idx < usize::MAX);
-                assert!(idx2 < usize::MAX);
-                Ok(None)
-            }
-
-            fn hessian_directional_derivative(
-                &self,
-                psi_index: usize,
-                arr: &Array1<f64>,
-            ) -> Result<Option<DriftDerivResult>, String> {
-                assert!(arr.iter().all(|v| !v.is_nan()));
-                assert_eq!(psi_index, 0);
-                Ok(Some(DriftDerivResult::Operator(Arc::new(
-                    crate::solver::estimate::reml::unified::BlockLocalDrift {
-                        local: array![[3.0, 1.0], [1.0, 2.0]],
-                        start: 1,
-                        end: 3,
-                        total_dim: 3,
-                    },
-                ))))
-            }
-        }
-
-        let callback = build_psi_drift_deriv_callback(
-            &ZeroFamily,
-            &[],
-            &[],
-            Arc::new(Vec::new()),
-            false,
-            Some(Arc::new(BlockLocalPsiWorkspace)),
-        )
-        .expect("non-Gaussian psi drift callback should be available");
-
-        let result = callback(0, &array![1.0, 2.0, 3.0])
-            .expect("workspace-backed psi drift derivative should be returned");
-
-        match result {
-            DriftDerivResult::Dense(_) => {
-                panic!("workspace-backed block-local psi drift derivative was densified")
-            }
-            DriftDerivResult::Operator(op) => {
-                let (local, start, end) = op
-                    .block_local_data()
-                    .expect("block-local operator metadata should be preserved");
-                assert_eq!((start, end), (1, 3));
-                assert_eq!(local, &array![[3.0, 1.0], [1.0, 2.0]]);
-            }
-        }
-    }
-
-    #[test]
-    fn custom_family_outer_derivatives_respects_missing_second_order_capability() {
-        #[derive(Clone)]
-        struct OneBlockFirstOrderOnlyFamily;
-
-        impl CustomFamily for OneBlockFirstOrderOnlyFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                let n = block_states[0].eta.len();
-                Ok(FamilyEvaluation {
-                    log_likelihood: 0.0,
-                    blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                        working_response: Array1::zeros(n),
-                        working_weights: Array1::ones(n),
-                    }],
-                })
-            }
-
-            fn exact_outer_derivative_order(
-                &self,
-                block_specs: &[ParameterBlockSpec],
-                options: &BlockwiseFitOptions,
-            ) -> ExactOuterDerivativeOrder {
-                assert!(block_specs.len() <= isize::MAX as usize);
-                assert!(std::mem::size_of_val(options) > 0);
-                ExactOuterDerivativeOrder::First
-            }
-        }
-
-        let specs = vec![ParameterBlockSpec {
-            name: "x".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }];
-        let (gradient, hessian) = custom_family_outer_derivatives(
-            &OneBlockFirstOrderOnlyFamily,
-            &specs,
-            &BlockwiseFitOptions::default(),
-        );
-        assert_eq!(
-            gradient,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
-        assert_eq!(
-            hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
-        );
-    }
-
+#[test]
+fn psi_drift_deriv_workspace_preserves_block_local_operator() {
     #[derive(Clone)]
-    struct DefaultDiagonalExactHookFamily;
+    struct ZeroFamily;
 
-    impl CustomFamily for DefaultDiagonalExactHookFamily {
+    impl CustomFamily for ZeroFamily {
         fn evaluate(
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-            let eta = block_states[0].eta.clone();
-            let weights = eta.mapv(|value| 2.0 + value * value);
-            Ok(FamilyEvaluation {
-                log_likelihood: -0.5 * eta.dot(&eta),
-                blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                    working_response: Array1::zeros(eta.len()),
-                    working_weights: weights,
-                }],
-            })
-        }
-
-        fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
-            true
-        }
-
-        fn diagonalworking_weights_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            idx: usize,
-            d_eta: &Array1<f64>,
-        ) -> Result<Option<Array1<f64>>, String> {
-            assert!(idx < usize::MAX);
-            Ok(Some((&block_states[0].eta * d_eta) * 2.0))
-        }
-
-        fn exact_newton_joint_hessiansecond_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            u: &Array1<f64>,
-            v: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            let spec = default_diagonal_exact_hook_spec();
-            let u_eta = spec.design.apply(u);
-            let v_eta = spec.design.apply(v);
-            assert_eq!(block_states[0].eta.len(), u_eta.len());
-            spec.design
-                .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&u_eta * &v_eta) * 2.0)))
-                .map(Some)
-        }
-    }
-
-    fn default_diagonal_exact_hook_spec() -> ParameterBlockSpec {
-        ParameterBlockSpec {
-            name: "default_exact".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0, 0.5],
-                [0.0, 1.0],
-                [2.0, -1.0]
-            ])),
-            offset: Array1::zeros(3),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(2))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.2, -0.1]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }
-    }
-
-    #[test]
-    fn default_custom_family_exact_hessian_hooks_assemble_diagonal_working_sets() {
-        let family = DefaultDiagonalExactHookFamily;
-        let spec = default_diagonal_exact_hook_spec();
-        let beta = array![0.2, -0.1];
-        let eta = spec.design.apply(&beta);
-        let states = vec![ParameterBlockState {
-            beta: beta.clone(),
-            eta: eta.clone(),
-        }];
-
-        let h = family
-            .exact_newton_joint_hessian_with_specs(&states, &[spec.clone()])
-            .expect("default joint Hessian hook should succeed")
-            .expect("diagonal working sets should assemble an exact joint Hessian");
-        let expected_h = spec
-            .design
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(
-                &eta.mapv(|value| 2.0 + value * value),
-            ))
-            .unwrap();
-        assert_eq!(h, expected_h);
-
-        let direction = array![0.3, -0.4];
-        let dh = family
-            .exact_newton_joint_hessian_directional_derivative_with_specs(
-                &states,
-                &[spec.clone()],
-                &direction,
-            )
-            .expect("default joint dH hook should succeed")
-            .expect("diagonal weight derivative should assemble an exact joint dH");
-        let d_eta = spec.design.apply(&direction);
-        let expected_dh = spec
-            .design
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&eta * &d_eta) * 2.0)))
-            .unwrap();
-        assert_eq!(dh, expected_dh);
-
-        let d2h = family
-            .exact_newton_joint_hessiansecond_directional_derivative(&states, &direction, &beta)
-            .expect("family second directional hook should succeed")
-            .expect("second directional hook should be exact");
-        let beta_eta = spec.design.apply(&beta);
-        let expected_d2h = spec
-            .design
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&d_eta * &beta_eta) * 2.0)))
-            .unwrap();
-        assert_eq!(d2h, expected_d2h);
-    }
-
-    #[test]
-    fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hessian() {
-        let mut spec = default_diagonal_exact_hook_spec();
-        spec.initial_beta = Some(Array1::zeros(2));
-        let result = evaluate_custom_family_joint_hyper(
-            &DefaultDiagonalExactHookFamily,
-            &[spec],
-            &BlockwiseFitOptions {
-                use_remlobjective: true,
-                use_outer_hessian: true,
-                compute_covariance: false,
-                inner_max_cycles: 1,
-                ..BlockwiseFitOptions::default()
-            },
-            &array![0.0],
-            &[vec![]],
-            None,
-            EvalMode::ValueGradientHessian,
-        )
-        .expect("profiled outer Hessian should use default exact Hessian hooks");
-
-        assert_eq!(result.gradient.len(), 1);
-        match result.outer_hessian {
-            crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
-                assert_eq!(hessian.dim(), (1, 1));
-                assert!(hessian[[0, 0]].is_finite());
-            }
-            _ => panic!("outer Hessian should be analytic"),
-        }
-    }
-
-    #[test]
-    fn nonconverged_inner_refuses_profile_derivatives() {
-        let spec = default_diagonal_exact_hook_spec();
-        let result = evaluate_custom_family_joint_hyper(
-            &DefaultDiagonalExactHookFamily,
-            &[spec],
-            &BlockwiseFitOptions {
-                use_remlobjective: true,
-                use_outer_hessian: true,
-                compute_covariance: false,
-                inner_max_cycles: 1,
-                ..BlockwiseFitOptions::default()
-            },
-            &array![0.0],
-            &[vec![]],
-            None,
-            EvalMode::ValueGradientHessian,
-        );
-
-        let err = match result {
-            Ok(_) => panic!("non-converged inner solve must not expose derivatives"),
-            Err(e) => e,
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("inner solve did not converge") && msg.contains("refusing to expose"),
-            "unexpected error: {msg}"
-        );
-    }
-
-    #[test]
-    fn custom_family_seed_screening_proxy_accepts_finite_partial_inner_fit() {
-        let specs = vec![default_diagonal_exact_hook_spec()];
-        let penalty_counts = validate_blockspecs(&specs).expect("valid test spec");
-        let layout = penalty_label_layout(&specs, penalty_counts).expect("valid label layout");
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            use_outer_hessian: true,
-            compute_covariance: false,
-            inner_max_cycles: 1,
-            ..BlockwiseFitOptions::default()
-        };
-
-        let (score, warm_start, inner_converged) = custom_family_seed_screening_proxy_labeled(
-            &DefaultDiagonalExactHookFamily,
-            &specs,
-            &options,
-            &layout,
-            &array![0.0],
-            None,
-            &crate::types::RhoPrior::Flat,
-        )
-        .expect("screening proxy should score a finite partial inner solve");
-
-        assert!(score.is_finite());
-        assert!(
-            !inner_converged,
-            "one-cycle screening is expected to be a partial inner fit"
-        );
-        assert_eq!(warm_start.rho, array![0.0]);
-        assert_eq!(warm_start.block_beta.len(), 1);
-    }
-
-    #[test]
-    fn custom_family_outer_derivatives_exposes_surrogate_second_order_geometry() {
-        // RidgedQuadraticReml is the default objective; its analytic outer
-        // Hessian is routed to ARC, which handles indefinite Hessians via
-        // cubic regularization. The previous behavior forced these families
-        // onto BFGS+BfgsApprox and caused benchmark hangs at iter 0.
-        #[derive(Clone)]
-        struct SurrogateFamily;
-
-        impl CustomFamily for SurrogateFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                let n = block_states[0].eta.len();
-                Ok(FamilyEvaluation {
-                    log_likelihood: 0.0,
-                    blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                        working_response: Array1::zeros(n),
-                        working_weights: Array1::ones(n),
-                    }],
-                })
-            }
-        }
-
-        let specs = vec![ParameterBlockSpec {
-            name: "x".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            use_outer_hessian: true,
-            ..BlockwiseFitOptions::default()
-        };
-        let (gradient, hessian) =
-            custom_family_outer_derivatives(&SurrogateFamily, &specs, &options);
-        assert_eq!(
-            gradient,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
-        assert_eq!(
-            hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::Either
-        );
-    }
-
-    #[test]
-    fn custom_family_outer_derivatives_keeps_strict_second_order_geometry() {
-        #[derive(Clone)]
-        struct StrictFamily;
-
-        impl CustomFamily for StrictFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                let n = block_states[0].eta.len();
-                Ok(FamilyEvaluation {
-                    log_likelihood: 0.0,
-                    blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                        working_response: Array1::zeros(n),
-                        working_weights: Array1::ones(n),
-                    }],
-                })
-            }
-
-            fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-                ExactNewtonOuterObjective::StrictPseudoLaplace
-            }
-        }
-
-        let specs = vec![ParameterBlockSpec {
-            name: "x".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            use_outer_hessian: true,
-            ..BlockwiseFitOptions::default()
-        };
-        let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
-        assert_eq!(
-            gradient,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
-        assert_eq!(
-            hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::Either
-        );
-    }
-
-    #[derive(Clone)]
-    struct OneBlockQuarticExactFamily {
-        linear: f64,
-        curvature: f64,
-        second_scale: f64,
-    }
-
-    impl CustomFamily for OneBlockQuarticExactFamily {
-        fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
-            // h(β) = 1 + curvature·β² genuinely depends on β; the default
-            // (false for RidgedQuadraticReml) would short-circuit the joint
-            // d²H aggregator to zeros and drop the per-block override below
-            // before it ever reaches the outer Hessian's drift contribution.
-            true
-        }
-
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let beta = block_states[0].beta[0];
-            let log_likelihood =
-                self.linear * beta - 0.5 * beta * beta - self.curvature * beta.powi(4) / 12.0;
-            let gradient = self.linear - beta - self.curvature * beta.powi(3) / 3.0;
-            let hessian = 1.0 + self.curvature * beta * beta;
-            Ok(FamilyEvaluation {
-                log_likelihood,
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![gradient],
-                    hessian: SymmetricMatrix::Dense(array![[hessian]]),
-                }],
-            })
-        }
-
-        fn exact_newton_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            direction: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert_eq!(block_idx, 0);
-            let beta = block_states[0].beta[0];
-            Ok(Some(array![[2.0 * self.curvature * beta * direction[0]]]))
-        }
-
-        fn exact_newton_hessian_second_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            u: &Array1<f64>,
-            v: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
             assert!(block_states.len() <= isize::MAX as usize);
-            assert_eq!(block_idx, 0);
-            let value = 2.0 * self.curvature * self.second_scale * u[0] * v[0];
-            Ok(Some(array![[value]]))
-        }
-    }
-
-    #[test]
-    fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
-        let spec = ParameterBlockSpec {
-            name: "quartic".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.75]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            inner_tol: 1e-11,
-            use_remlobjective: true,
-            use_outer_hessian: true,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let penalty_counts = vec![1];
-        let rho = array![0.0];
-
-        let with_d2 = evaluate_custom_family_hyper_internal(
-            &OneBlockQuarticExactFamily {
-                linear: 3.0,
-                curvature: 0.5,
-                second_scale: 1.0,
-            },
-            std::slice::from_ref(&spec),
-            &options,
-            &penalty_counts,
-            &rho,
-            &[vec![]],
-            None,
-            crate::types::RhoPrior::Flat,
-            EvalMode::ValueGradientHessian,
-        )
-        .expect("single-block fallback with exact d2H should evaluate");
-        let without_d2_contribution = evaluate_custom_family_hyper_internal(
-            &OneBlockQuarticExactFamily {
-                linear: 3.0,
-                curvature: 0.5,
-                second_scale: 0.0,
-            },
-            &[spec],
-            &options,
-            &penalty_counts,
-            &rho,
-            &[vec![]],
-            None,
-            crate::types::RhoPrior::Flat,
-            EvalMode::ValueGradientHessian,
-        )
-        .expect("single-block fallback with zero d2H should evaluate");
-
-        let h_with = with_d2.outer_hessian.unwrap_analytic();
-        let h_without = without_d2_contribution.outer_hessian.unwrap_analytic();
-        let d2h_delta = h_with[[0, 0]] - h_without[[0, 0]];
-        assert!(
-            d2h_delta.abs() > 1e-8,
-            "expected nonzero outer Hessian contribution from d2H; with={:?}, without={:?}",
-            h_with,
-            h_without
-        );
-    }
-
-    fn jeffreys_seam_spec(p: usize) -> ParameterBlockSpec {
-        ParameterBlockSpec {
-            name: "jeffreys-seam".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::eye(p))),
-            offset: Array1::zeros(p),
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }
-    }
-
-    fn jeffreys_seam_state(beta: Array1<f64>) -> ParameterBlockState {
-        let eta = beta.clone();
-        ParameterBlockState { beta, eta }
-    }
-
-    /// Observed-default family for the gam#1020 seam contract: implements only
-    /// the observed joint Newton Hessian (and its directional derivatives) and
-    /// relies on the trait defaults for the Jeffreys information hooks.
-    #[derive(Clone)]
-    struct ObservedJeffreysSeamFamily;
-
-    impl CustomFamily for ObservedJeffreysSeamFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let n = block_states
-                .first()
-                .ok_or_else(|| "missing block 0".to_string())?
-                .eta
-                .len();
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                    working_response: Array1::zeros(n),
-                    working_weights: Array1::ones(n),
-                }],
+                blockworking_sets: vec![],
             })
         }
-
-        fn exact_newton_joint_hessian_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert_eq!(block_states.len(), specs.len());
-            let beta = &block_states[0].beta;
-            Ok(Some(array![
-                [2.0 + beta[0] * beta[0], 0.3],
-                [0.3, 1.5 + beta[1] * beta[1]]
-            ]))
-        }
-
-        fn exact_newton_joint_hessian_directional_derivative_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-            d_beta_flat: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert_eq!(block_states.len(), specs.len());
-            let beta = &block_states[0].beta;
-            Ok(Some(array![
-                [2.0 * beta[0] * d_beta_flat[0], 0.0],
-                [0.0, 2.0 * beta[1] * d_beta_flat[1]]
-            ]))
-        }
-
-        fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-            d_beta_u_flat: &Array1<f64>,
-            d_betav_flat: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert_eq!(block_states.len(), specs.len());
-            Ok(Some(array![
-                [2.0 * d_beta_u_flat[0] * d_betav_flat[0], 0.0],
-                [0.0, 2.0 * d_beta_u_flat[1] * d_betav_flat[1]]
-            ]))
-        }
     }
 
-    /// gam#1020 acceptance: families that do NOT override the Jeffreys
-    /// information hooks get the OBSERVED joint Newton quantities — the seam
-    /// defaults are exact delegations, so behavior is unchanged.
-    #[test]
-    fn joint_jeffreys_information_defaults_delegate_to_observed_hessian() {
-        let family = ObservedJeffreysSeamFamily;
-        let specs = vec![jeffreys_seam_spec(2)];
-        let states = vec![jeffreys_seam_state(array![0.4, -0.7])];
-        let u = array![0.3, -0.2];
-        let v = array![-0.1, 0.5];
+    struct BlockLocalPsiWorkspace;
 
-        let observed = family
-            .exact_newton_joint_hessian_with_specs(&states, &specs)
-            .expect("observed H")
-            .expect("observed H present");
-        let info = family
-            .joint_jeffreys_information_with_specs(&states, &specs)
-            .expect("jeffreys info")
-            .expect("jeffreys info present");
-        assert_eq!(info, observed, "default Jeffreys info must be observed H");
-
-        let observed_dot = family
-            .exact_newton_joint_hessian_directional_derivative_with_specs(&states, &specs, &u)
-            .expect("observed Hdot")
-            .expect("observed Hdot present");
-        let info_dot = family
-            .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, &u)
-            .expect("jeffreys dI")
-            .expect("jeffreys dI present");
-        assert_eq!(
-            info_dot, observed_dot,
-            "default Jeffreys dI must be observed Hdot"
-        );
-
-        let observed_ddot = family
-            .exact_newton_joint_hessian_second_directional_derivative_with_specs(
-                &states, &specs, &u, &v,
-            )
-            .expect("observed H2dot")
-            .expect("observed H2dot present");
-        let info_ddot = family
-            .joint_jeffreys_information_second_directional_derivative_with_specs(
-                &states, &specs, &u, &v,
-            )
-            .expect("jeffreys d2I")
-            .expect("jeffreys d2I present");
-        assert_eq!(
-            info_ddot, observed_ddot,
-            "default Jeffreys d2I must be observed H2dot"
-        );
-
-        // Contracted hook defaults: declared unavailable and returns None, so
-        // the completion keeps the pairwise H2dot fallback.
-        assert!(!family.joint_jeffreys_information_contracted_trace_hessian_available());
-        let weight = Array2::<f64>::eye(2);
-        let contracted = family
-            .joint_jeffreys_information_contracted_trace_hessian_with_specs(
-                &states, &specs, &weight,
-            )
-            .expect("contracted default");
-        assert!(
-            contracted.is_none(),
-            "default contracted trace hook must be None"
-        );
-
-        // Observed-default families keep the matvec skip pre-checks armed.
-        assert!(family.joint_jeffreys_information_matches_observed_hessian());
-    }
-
-    /// gam#1020: family supplying the contracted trace Hessian. The pairwise
-    /// second-directional path returns wildly different values so the test
-    /// detects which path the completion dispatched to.
-    #[derive(Clone)]
-    struct ContractedJeffreysSeamFamily;
-
-    impl CustomFamily for ContractedJeffreysSeamFamily {
-        fn evaluate(
+    impl ExactNewtonJointPsiWorkspace for BlockLocalPsiWorkspace {
+        fn second_order_terms(
             &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let n = block_states
-                .first()
-                .ok_or_else(|| "missing block 0".to_string())?
-                .eta
-                .len();
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                    working_response: Array1::zeros(n),
-                    working_weights: Array1::ones(n),
-                }],
-            })
+            idx: usize,
+            idx2: usize,
+        ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+            assert!(idx < usize::MAX);
+            assert!(idx2 < usize::MAX);
+            Ok(None)
         }
 
-        fn joint_jeffreys_information_second_directional_derivative_with_specs(
+        fn hessian_directional_derivative(
             &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-            d_beta_u_flat: &Array1<f64>,
-            d_betav_flat: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert_eq!(block_states.len(), specs.len());
-            let scale = 1.0e6 * d_beta_u_flat.dot(d_betav_flat);
-            Ok(Some(scale * Array2::<f64>::eye(2)))
-        }
-
-        fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-            weight: &Array2<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert_eq!(block_states.len(), specs.len());
-            assert_eq!(weight.dim(), (2, 2));
-            Ok(Some(7.0 * Array2::<f64>::eye(2)))
-        }
-
-        fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
-            true
-        }
-    }
-
-    /// gam#1020 acceptance: the second-order completion takes the contracted
-    /// trace hook when the family provides one (the wide-p route), scaling it
-    /// by `−½·gate`; the pairwise H2dot path is not consulted.
-    #[test]
-    fn jeffreys_second_order_completion_prefers_contracted_hook() {
-        let family = ContractedJeffreysSeamFamily;
-        let specs = vec![jeffreys_seam_spec(2)];
-        let states = vec![jeffreys_seam_state(Array1::zeros(2))];
-        // λ_min = 1e-4 is far below the absolute conditioning gate, so the
-        // gate weight is exactly 1 and the completion is −½ · contracted.
-        let h_joint = array![[1.0e-4, 0.0], [0.0, 1.0]];
-        let z_joint = Array2::<f64>::eye(2);
-        let completion = custom_family_joint_jeffreys_second_order_completion(
-            &family, &states, &specs, &h_joint, &z_joint, true,
-        )
-        .expect("completion")
-        .expect("completion present");
-        let expected = -3.5 * Array2::<f64>::eye(2);
-        for i in 0..2 {
-            for j in 0..2 {
-                assert!(
-                    (completion[[i, j]] - expected[[i, j]]).abs() < 1e-12,
-                    "contracted completion mismatch at ({i},{j}): {} vs {}",
-                    completion[[i, j]],
-                    expected[[i, j]]
-                );
-            }
-        }
-    }
-
-    /// gam#1020: family without a contracted hook — the completion must fall
-    /// back to the exact pairwise second-directional path, and must return
-    /// `None` when the pairwise fallback is not allowed (width cap exceeded).
-    #[derive(Clone)]
-    struct PairwiseJeffreysSeamFamily;
-
-    impl CustomFamily for PairwiseJeffreysSeamFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let n = block_states
-                .first()
-                .ok_or_else(|| "missing block 0".to_string())?
-                .eta
-                .len();
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                    working_response: Array1::zeros(n),
-                    working_weights: Array1::ones(n),
-                }],
-            })
-        }
-
-        fn joint_jeffreys_information_second_directional_derivative_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-            d_beta_u_flat: &Array1<f64>,
-            d_betav_flat: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert_eq!(block_states.len(), specs.len());
-            let scale = d_beta_u_flat.dot(d_betav_flat);
-            Ok(Some(scale * array![[2.0, 1.0], [1.0, 3.0]]))
-        }
-    }
-
-    #[test]
-    fn jeffreys_second_order_completion_pairwise_fallback_when_hook_absent() {
-        let family = PairwiseJeffreysSeamFamily;
-        let specs = vec![jeffreys_seam_spec(2)];
-        let states = vec![jeffreys_seam_state(Array1::zeros(2))];
-        let h_joint = array![[1.0e-4, 0.0], [0.0, 1.0]];
-        let z_joint = Array2::<f64>::eye(2);
-
-        let completion = custom_family_joint_jeffreys_second_order_completion(
-            &family, &states, &specs, &h_joint, &z_joint, true,
-        )
-        .expect("completion")
-        .expect("completion present");
-        let direct =
-            crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
-                h_joint.view(),
-                z_joint.view(),
-                |u: &Array1<f64>, v: &Array1<f64>| {
-                    family.joint_jeffreys_information_second_directional_derivative_with_specs(
-                        &states, &specs, u, v,
-                    )
+            psi_index: usize,
+            arr: &Array1<f64>,
+        ) -> Result<Option<DriftDerivResult>, String> {
+            assert!(arr.iter().all(|v| !v.is_nan()));
+            assert_eq!(psi_index, 0);
+            Ok(Some(DriftDerivResult::Operator(Arc::new(
+                crate::solver::estimate::reml::unified::BlockLocalDrift {
+                    local: array![[3.0, 1.0], [1.0, 2.0]],
+                    start: 1,
+                    end: 3,
+                    total_dim: 3,
                 },
-            )
-            .expect("direct pairwise completion")
-            .expect("direct pairwise completion present");
-        assert_eq!(
-            completion, direct,
-            "fallback must be the exact pairwise completion"
-        );
-        assert!(
-            completion.iter().any(|value| value.abs() > 0.0),
-            "pairwise completion should be nonzero on this gated fixture"
-        );
-
-        let blocked = custom_family_joint_jeffreys_second_order_completion(
-            &family, &states, &specs, &h_joint, &z_joint, false,
-        )
-        .expect("blocked completion");
-        assert!(
-            blocked.is_none(),
-            "completion must decline (None) when the pairwise fallback is disallowed and no hook exists"
-        );
-    }
-
-    #[test]
-    fn custom_family_outer_derivatives_keeps_second_order_for_large_inner_problem() {
-        // Inner (n, p) scale does not block the analytic outer Hessian: the
-        // outer Hessian assembled by `compute_outer_hessian` is shape
-        // (K+ext_dim)×(K+ext_dim) where K = total penalties. For large inner
-        // problems with modest K (the common case: n=50000, p=50, K=2) the
-        // outer Hessian is tiny and must remain available so ARC can drive
-        // the outer iteration. Prior versions of this test enforced an
-        // inner-size cutoff that disabled the Hessian for exactly the
-        // benchmark sizes (medium: n=50000,p=50; pathological: n=50000,p=80)
-        // that were hanging 45-minute GH jobs on BFGS+BfgsApprox Strong Wolfe
-        // failures at iter 0.
-        #[derive(Clone)]
-        struct StrictFamily;
-
-        impl CustomFamily for StrictFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                let n = block_states[0].eta.len();
-                Ok(FamilyEvaluation {
-                    log_likelihood: 0.0,
-                    blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                        working_response: Array1::zeros(n),
-                        working_weights: Array1::ones(n),
-                    }],
-                })
-            }
-
-            fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-                ExactNewtonOuterObjective::StrictPseudoLaplace
-            }
+            ))))
         }
-
-        let specs = vec![ParameterBlockSpec {
-            name: "x".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::<f64>::zeros((20_100, 50)),
-            )),
-            offset: Array1::zeros(20_100),
-            penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(50))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            use_outer_hessian: true,
-            ..BlockwiseFitOptions::default()
-        };
-
-        let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
-        assert_eq!(
-            gradient,
-            crate::solver::outer_strategy::Derivative::Analytic
-        );
-        assert_eq!(
-            hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::Either
-        );
     }
 
-    impl CustomFamily for OneBlockIdentityFamily {
+    let callback = build_psi_drift_deriv_callback(
+        &ZeroFamily,
+        &[],
+        &[],
+        Arc::new(Vec::new()),
+        false,
+        Some(Arc::new(BlockLocalPsiWorkspace)),
+    )
+    .expect("non-Gaussian psi drift callback should be available");
+
+    let result = callback(0, &array![1.0, 2.0, 3.0])
+        .expect("workspace-backed psi drift derivative should be returned");
+
+    match result {
+        DriftDerivResult::Dense(_) => {
+            panic!("workspace-backed block-local psi drift derivative was densified")
+        }
+        DriftDerivResult::Operator(op) => {
+            let (local, start, end) = op
+                .block_local_data()
+                .expect("block-local operator metadata should be preserved");
+            assert_eq!((start, end), (1, 3));
+            assert_eq!(local, &array![[3.0, 1.0], [1.0, 2.0]]);
+        }
+    }
+}
+
+#[test]
+fn custom_family_outer_derivatives_respects_missing_second_order_capability() {
+    #[derive(Clone)]
+    struct OneBlockFirstOrderOnlyFamily;
+
+    impl CustomFamily for OneBlockFirstOrderOnlyFamily {
         fn evaluate(
             &self,
             block_states: &[ParameterBlockState],
@@ -2974,99 +2069,3851 @@
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                    working_response: Array1::ones(n),
+                    working_response: Array1::zeros(n),
+                    working_weights: Array1::ones(n),
+                }],
+            })
+        }
+
+        fn exact_outer_derivative_order(
+            &self,
+            block_specs: &[ParameterBlockSpec],
+            options: &BlockwiseFitOptions,
+        ) -> ExactOuterDerivativeOrder {
+            assert!(block_specs.len() <= isize::MAX as usize);
+            assert!(std::mem::size_of_val(options) > 0);
+            ExactOuterDerivativeOrder::First
+        }
+    }
+
+    let specs = vec![ParameterBlockSpec {
+        name: "x".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let (gradient, hessian) = custom_family_outer_derivatives(
+        &OneBlockFirstOrderOnlyFamily,
+        &specs,
+        &BlockwiseFitOptions::default(),
+    );
+    assert_eq!(
+        gradient,
+        crate::solver::outer_strategy::Derivative::Analytic
+    );
+    assert_eq!(
+        hessian,
+        crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+    );
+}
+
+#[derive(Clone)]
+struct DefaultDiagonalExactHookFamily;
+
+impl CustomFamily for DefaultDiagonalExactHookFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let eta = block_states[0].eta.clone();
+        let weights = eta.mapv(|value| 2.0 + value * value);
+        Ok(FamilyEvaluation {
+            log_likelihood: -0.5 * eta.dot(&eta),
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: Array1::zeros(eta.len()),
+                working_weights: weights,
+            }],
+        })
+    }
+
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
+    fn diagonalworking_weights_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        d_eta: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        assert!(idx < usize::MAX);
+        Ok(Some((&block_states[0].eta * d_eta) * 2.0))
+    }
+
+    fn exact_newton_joint_hessiansecond_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let spec = default_diagonal_exact_hook_spec();
+        let u_eta = spec.design.apply(u);
+        let v_eta = spec.design.apply(v);
+        assert_eq!(block_states[0].eta.len(), u_eta.len());
+        spec.design
+            .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&u_eta * &v_eta) * 2.0)))
+            .map(Some)
+    }
+}
+
+fn default_diagonal_exact_hook_spec() -> ParameterBlockSpec {
+    ParameterBlockSpec {
+        name: "default_exact".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+            [1.0, 0.5],
+            [0.0, 1.0],
+            [2.0, -1.0]
+        ])),
+        offset: Array1::zeros(3),
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(2))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.2, -0.1]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }
+}
+
+#[test]
+fn default_custom_family_exact_hessian_hooks_assemble_diagonal_working_sets() {
+    let family = DefaultDiagonalExactHookFamily;
+    let spec = default_diagonal_exact_hook_spec();
+    let beta = array![0.2, -0.1];
+    let eta = spec.design.apply(&beta);
+    let states = vec![ParameterBlockState {
+        beta: beta.clone(),
+        eta: eta.clone(),
+    }];
+
+    let h = family
+        .exact_newton_joint_hessian_with_specs(&states, &[spec.clone()])
+        .expect("default joint Hessian hook should succeed")
+        .expect("diagonal working sets should assemble an exact joint Hessian");
+    let expected_h = spec
+        .design
+        .xt_diag_x_signed_op(SignedWeightsView::from_array(
+            &eta.mapv(|value| 2.0 + value * value),
+        ))
+        .unwrap();
+    assert_eq!(h, expected_h);
+
+    let direction = array![0.3, -0.4];
+    let dh = family
+        .exact_newton_joint_hessian_directional_derivative_with_specs(
+            &states,
+            &[spec.clone()],
+            &direction,
+        )
+        .expect("default joint dH hook should succeed")
+        .expect("diagonal weight derivative should assemble an exact joint dH");
+    let d_eta = spec.design.apply(&direction);
+    let expected_dh = spec
+        .design
+        .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&eta * &d_eta) * 2.0)))
+        .unwrap();
+    assert_eq!(dh, expected_dh);
+
+    let d2h = family
+        .exact_newton_joint_hessiansecond_directional_derivative(&states, &direction, &beta)
+        .expect("family second directional hook should succeed")
+        .expect("second directional hook should be exact");
+    let beta_eta = spec.design.apply(&beta);
+    let expected_d2h = spec
+        .design
+        .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&d_eta * &beta_eta) * 2.0)))
+        .unwrap();
+    assert_eq!(d2h, expected_d2h);
+}
+
+#[test]
+fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hessian() {
+    let mut spec = default_diagonal_exact_hook_spec();
+    spec.initial_beta = Some(Array1::zeros(2));
+    let result = evaluate_custom_family_joint_hyper(
+        &DefaultDiagonalExactHookFamily,
+        &[spec],
+        &BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            compute_covariance: false,
+            inner_max_cycles: 1,
+            ..BlockwiseFitOptions::default()
+        },
+        &array![0.0],
+        &[vec![]],
+        None,
+        EvalMode::ValueGradientHessian,
+    )
+    .expect("profiled outer Hessian should use default exact Hessian hooks");
+
+    assert_eq!(result.gradient.len(), 1);
+    match result.outer_hessian {
+        crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+            assert_eq!(hessian.dim(), (1, 1));
+            assert!(hessian[[0, 0]].is_finite());
+        }
+        _ => panic!("outer Hessian should be analytic"),
+    }
+}
+
+#[test]
+fn nonconverged_inner_refuses_profile_derivatives() {
+    let spec = default_diagonal_exact_hook_spec();
+    let result = evaluate_custom_family_joint_hyper(
+        &DefaultDiagonalExactHookFamily,
+        &[spec],
+        &BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            compute_covariance: false,
+            inner_max_cycles: 1,
+            ..BlockwiseFitOptions::default()
+        },
+        &array![0.0],
+        &[vec![]],
+        None,
+        EvalMode::ValueGradientHessian,
+    );
+
+    let err = match result {
+        Ok(_) => panic!("non-converged inner solve must not expose derivatives"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("inner solve did not converge") && msg.contains("refusing to expose"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn custom_family_seed_screening_proxy_accepts_finite_partial_inner_fit() {
+    let specs = vec![default_diagonal_exact_hook_spec()];
+    let penalty_counts = validate_blockspecs(&specs).expect("valid test spec");
+    let layout = penalty_label_layout(&specs, penalty_counts).expect("valid label layout");
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        use_outer_hessian: true,
+        compute_covariance: false,
+        inner_max_cycles: 1,
+        ..BlockwiseFitOptions::default()
+    };
+
+    let (score, warm_start, inner_converged) = custom_family_seed_screening_proxy_labeled(
+        &DefaultDiagonalExactHookFamily,
+        &specs,
+        &options,
+        &layout,
+        &array![0.0],
+        None,
+        &crate::types::RhoPrior::Flat,
+    )
+    .expect("screening proxy should score a finite partial inner solve");
+
+    assert!(score.is_finite());
+    assert!(
+        !inner_converged,
+        "one-cycle screening is expected to be a partial inner fit"
+    );
+    assert_eq!(warm_start.rho, array![0.0]);
+    assert_eq!(warm_start.block_beta.len(), 1);
+}
+
+#[test]
+fn custom_family_outer_derivatives_exposes_surrogate_second_order_geometry() {
+    // RidgedQuadraticReml is the default objective; its analytic outer
+    // Hessian is routed to ARC, which handles indefinite Hessians via
+    // cubic regularization. The previous behavior forced these families
+    // onto BFGS+BfgsApprox and caused benchmark hangs at iter 0.
+    #[derive(Clone)]
+    struct SurrogateFamily;
+
+    impl CustomFamily for SurrogateFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = block_states[0].eta.len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n),
                     working_weights: Array1::ones(n),
                 }],
             })
         }
     }
 
-    #[test]
-    fn fit_custom_family_rejects_invalid_blockspec_before_output_channel_probe() {
-        let spec = ParameterBlockSpec {
-            name: "bad_penalty".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [2.0],
-            ])),
-            offset: Array1::zeros(2),
-            penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2))],
-            nullspace_dims: vec![0],
-            initial_log_lambdas: array![0.0],
+    let specs = vec![ParameterBlockSpec {
+        name: "x".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        use_outer_hessian: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let (gradient, hessian) = custom_family_outer_derivatives(&SurrogateFamily, &specs, &options);
+    assert_eq!(
+        gradient,
+        crate::solver::outer_strategy::Derivative::Analytic
+    );
+    assert_eq!(
+        hessian,
+        crate::solver::outer_strategy::DeclaredHessianForm::Either
+    );
+}
+
+#[test]
+fn custom_family_outer_derivatives_keeps_strict_second_order_geometry() {
+    #[derive(Clone)]
+    struct StrictFamily;
+
+    impl CustomFamily for StrictFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = block_states[0].eta.len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n),
+                    working_weights: Array1::ones(n),
+                }],
+            })
+        }
+
+        fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+            ExactNewtonOuterObjective::StrictPseudoLaplace
+        }
+    }
+
+    let specs = vec![ParameterBlockSpec {
+        name: "x".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        use_outer_hessian: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
+    assert_eq!(
+        gradient,
+        crate::solver::outer_strategy::Derivative::Analytic
+    );
+    assert_eq!(
+        hessian,
+        crate::solver::outer_strategy::DeclaredHessianForm::Either
+    );
+}
+
+#[derive(Clone)]
+struct OneBlockQuarticExactFamily {
+    linear: f64,
+    curvature: f64,
+    second_scale: f64,
+}
+
+impl CustomFamily for OneBlockQuarticExactFamily {
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        // h(β) = 1 + curvature·β² genuinely depends on β; the default
+        // (false for RidgedQuadraticReml) would short-circuit the joint
+        // d²H aggregator to zeros and drop the per-block override below
+        // before it ever reaches the outer Hessian's drift contribution.
+        true
+    }
+
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = block_states[0].beta[0];
+        let log_likelihood =
+            self.linear * beta - 0.5 * beta * beta - self.curvature * beta.powi(4) / 12.0;
+        let gradient = self.linear - beta - self.curvature * beta.powi(3) / 3.0;
+        let hessian = 1.0 + self.curvature * beta * beta;
+        Ok(FamilyEvaluation {
+            log_likelihood,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![gradient],
+                hessian: SymmetricMatrix::Dense(array![[hessian]]),
+            }],
+        })
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_eq!(block_idx, 0);
+        let beta = block_states[0].beta[0];
+        Ok(Some(array![[2.0 * self.curvature * beta * direction[0]]]))
+    }
+
+    fn exact_newton_hessian_second_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert_eq!(block_idx, 0);
+        let value = 2.0 * self.curvature * self.second_scale * u[0] * v[0];
+        Ok(Some(array![[value]]))
+    }
+}
+
+#[test]
+fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
+    let spec = ParameterBlockSpec {
+        name: "quartic".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.75]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        inner_tol: 1e-11,
+        use_remlobjective: true,
+        use_outer_hessian: true,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_counts = vec![1];
+    let rho = array![0.0];
+
+    let with_d2 = evaluate_custom_family_hyper_internal(
+        &OneBlockQuarticExactFamily {
+            linear: 3.0,
+            curvature: 0.5,
+            second_scale: 1.0,
+        },
+        std::slice::from_ref(&spec),
+        &options,
+        &penalty_counts,
+        &rho,
+        &[vec![]],
+        None,
+        crate::types::RhoPrior::Flat,
+        EvalMode::ValueGradientHessian,
+    )
+    .expect("single-block fallback with exact d2H should evaluate");
+    let without_d2_contribution = evaluate_custom_family_hyper_internal(
+        &OneBlockQuarticExactFamily {
+            linear: 3.0,
+            curvature: 0.5,
+            second_scale: 0.0,
+        },
+        &[spec],
+        &options,
+        &penalty_counts,
+        &rho,
+        &[vec![]],
+        None,
+        crate::types::RhoPrior::Flat,
+        EvalMode::ValueGradientHessian,
+    )
+    .expect("single-block fallback with zero d2H should evaluate");
+
+    let h_with = with_d2.outer_hessian.unwrap_analytic();
+    let h_without = without_d2_contribution.outer_hessian.unwrap_analytic();
+    let d2h_delta = h_with[[0, 0]] - h_without[[0, 0]];
+    assert!(
+        d2h_delta.abs() > 1e-8,
+        "expected nonzero outer Hessian contribution from d2H; with={:?}, without={:?}",
+        h_with,
+        h_without
+    );
+}
+
+fn jeffreys_seam_spec(p: usize) -> ParameterBlockSpec {
+    ParameterBlockSpec {
+        name: "jeffreys-seam".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::eye(p))),
+        offset: Array1::zeros(p),
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }
+}
+
+fn jeffreys_seam_state(beta: Array1<f64>) -> ParameterBlockState {
+    let eta = beta.clone();
+    ParameterBlockState { beta, eta }
+}
+
+/// Observed-default family for the gam#1020 seam contract: implements only
+/// the observed joint Newton Hessian (and its directional derivatives) and
+/// relies on the trait defaults for the Jeffreys information hooks.
+#[derive(Clone)]
+struct ObservedJeffreysSeamFamily;
+
+impl CustomFamily for ObservedJeffreysSeamFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .eta
+            .len();
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: Array1::zeros(n),
+                working_weights: Array1::ones(n),
+            }],
+        })
+    }
+
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_eq!(block_states.len(), specs.len());
+        let beta = &block_states[0].beta;
+        Ok(Some(array![
+            [2.0 + beta[0] * beta[0], 0.3],
+            [0.3, 1.5 + beta[1] * beta[1]]
+        ]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_eq!(block_states.len(), specs.len());
+        let beta = &block_states[0].beta;
+        Ok(Some(array![
+            [2.0 * beta[0] * d_beta_flat[0], 0.0],
+            [0.0, 2.0 * beta[1] * d_beta_flat[1]]
+        ]))
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_eq!(block_states.len(), specs.len());
+        Ok(Some(array![
+            [2.0 * d_beta_u_flat[0] * d_betav_flat[0], 0.0],
+            [0.0, 2.0 * d_beta_u_flat[1] * d_betav_flat[1]]
+        ]))
+    }
+}
+
+/// gam#1020 acceptance: families that do NOT override the Jeffreys
+/// information hooks get the OBSERVED joint Newton quantities — the seam
+/// defaults are exact delegations, so behavior is unchanged.
+#[test]
+fn joint_jeffreys_information_defaults_delegate_to_observed_hessian() {
+    let family = ObservedJeffreysSeamFamily;
+    let specs = vec![jeffreys_seam_spec(2)];
+    let states = vec![jeffreys_seam_state(array![0.4, -0.7])];
+    let u = array![0.3, -0.2];
+    let v = array![-0.1, 0.5];
+
+    let observed = family
+        .exact_newton_joint_hessian_with_specs(&states, &specs)
+        .expect("observed H")
+        .expect("observed H present");
+    let info = family
+        .joint_jeffreys_information_with_specs(&states, &specs)
+        .expect("jeffreys info")
+        .expect("jeffreys info present");
+    assert_eq!(info, observed, "default Jeffreys info must be observed H");
+
+    let observed_dot = family
+        .exact_newton_joint_hessian_directional_derivative_with_specs(&states, &specs, &u)
+        .expect("observed Hdot")
+        .expect("observed Hdot present");
+    let info_dot = family
+        .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, &u)
+        .expect("jeffreys dI")
+        .expect("jeffreys dI present");
+    assert_eq!(
+        info_dot, observed_dot,
+        "default Jeffreys dI must be observed Hdot"
+    );
+
+    let observed_ddot = family
+        .exact_newton_joint_hessian_second_directional_derivative_with_specs(
+            &states, &specs, &u, &v,
+        )
+        .expect("observed H2dot")
+        .expect("observed H2dot present");
+    let info_ddot = family
+        .joint_jeffreys_information_second_directional_derivative_with_specs(
+            &states, &specs, &u, &v,
+        )
+        .expect("jeffreys d2I")
+        .expect("jeffreys d2I present");
+    assert_eq!(
+        info_ddot, observed_ddot,
+        "default Jeffreys d2I must be observed H2dot"
+    );
+
+    // Contracted hook defaults: declared unavailable and returns None, so
+    // the completion keeps the pairwise H2dot fallback.
+    assert!(!family.joint_jeffreys_information_contracted_trace_hessian_available());
+    let weight = Array2::<f64>::eye(2);
+    let contracted = family
+        .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states, &specs, &weight)
+        .expect("contracted default");
+    assert!(
+        contracted.is_none(),
+        "default contracted trace hook must be None"
+    );
+
+    // Observed-default families keep the matvec skip pre-checks armed.
+    assert!(family.joint_jeffreys_information_matches_observed_hessian());
+}
+
+/// gam#1020: family supplying the contracted trace Hessian. The pairwise
+/// second-directional path returns wildly different values so the test
+/// detects which path the completion dispatched to.
+#[derive(Clone)]
+struct ContractedJeffreysSeamFamily;
+
+impl CustomFamily for ContractedJeffreysSeamFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .eta
+            .len();
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: Array1::zeros(n),
+                working_weights: Array1::ones(n),
+            }],
+        })
+    }
+
+    fn joint_jeffreys_information_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_eq!(block_states.len(), specs.len());
+        let scale = 1.0e6 * d_beta_u_flat.dot(d_betav_flat);
+        Ok(Some(scale * Array2::<f64>::eye(2)))
+    }
+
+    fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_eq!(block_states.len(), specs.len());
+        assert_eq!(weight.dim(), (2, 2));
+        Ok(Some(7.0 * Array2::<f64>::eye(2)))
+    }
+
+    fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+        true
+    }
+}
+
+/// gam#1020 acceptance: the second-order completion takes the contracted
+/// trace hook when the family provides one (the wide-p route), scaling it
+/// by `−½·gate`; the pairwise H2dot path is not consulted.
+#[test]
+fn jeffreys_second_order_completion_prefers_contracted_hook() {
+    let family = ContractedJeffreysSeamFamily;
+    let specs = vec![jeffreys_seam_spec(2)];
+    let states = vec![jeffreys_seam_state(Array1::zeros(2))];
+    // λ_min = 1e-4 is far below the absolute conditioning gate, so the
+    // gate weight is exactly 1 and the completion is −½ · contracted.
+    let h_joint = array![[1.0e-4, 0.0], [0.0, 1.0]];
+    let z_joint = Array2::<f64>::eye(2);
+    let completion = custom_family_joint_jeffreys_second_order_completion(
+        &family, &states, &specs, &h_joint, &z_joint, true,
+    )
+    .expect("completion")
+    .expect("completion present");
+    let expected = -3.5 * Array2::<f64>::eye(2);
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (completion[[i, j]] - expected[[i, j]]).abs() < 1e-12,
+                "contracted completion mismatch at ({i},{j}): {} vs {}",
+                completion[[i, j]],
+                expected[[i, j]]
+            );
+        }
+    }
+}
+
+/// gam#1020: family without a contracted hook — the completion must fall
+/// back to the exact pairwise second-directional path, and must return
+/// `None` when the pairwise fallback is not allowed (width cap exceeded).
+#[derive(Clone)]
+struct PairwiseJeffreysSeamFamily;
+
+impl CustomFamily for PairwiseJeffreysSeamFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .eta
+            .len();
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: Array1::zeros(n),
+                working_weights: Array1::ones(n),
+            }],
+        })
+    }
+
+    fn joint_jeffreys_information_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_eq!(block_states.len(), specs.len());
+        let scale = d_beta_u_flat.dot(d_betav_flat);
+        Ok(Some(scale * array![[2.0, 1.0], [1.0, 3.0]]))
+    }
+}
+
+#[test]
+fn jeffreys_second_order_completion_pairwise_fallback_when_hook_absent() {
+    let family = PairwiseJeffreysSeamFamily;
+    let specs = vec![jeffreys_seam_spec(2)];
+    let states = vec![jeffreys_seam_state(Array1::zeros(2))];
+    let h_joint = array![[1.0e-4, 0.0], [0.0, 1.0]];
+    let z_joint = Array2::<f64>::eye(2);
+
+    let completion = custom_family_joint_jeffreys_second_order_completion(
+        &family, &states, &specs, &h_joint, &z_joint, true,
+    )
+    .expect("completion")
+    .expect("completion present");
+    let direct = crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+        h_joint.view(),
+        z_joint.view(),
+        |u: &Array1<f64>, v: &Array1<f64>| {
+            family.joint_jeffreys_information_second_directional_derivative_with_specs(
+                &states, &specs, u, v,
+            )
+        },
+    )
+    .expect("direct pairwise completion")
+    .expect("direct pairwise completion present");
+    assert_eq!(
+        completion, direct,
+        "fallback must be the exact pairwise completion"
+    );
+    assert!(
+        completion.iter().any(|value| value.abs() > 0.0),
+        "pairwise completion should be nonzero on this gated fixture"
+    );
+
+    let blocked = custom_family_joint_jeffreys_second_order_completion(
+        &family, &states, &specs, &h_joint, &z_joint, false,
+    )
+    .expect("blocked completion");
+    assert!(
+        blocked.is_none(),
+        "completion must decline (None) when the pairwise fallback is disallowed and no hook exists"
+    );
+}
+
+#[test]
+fn custom_family_outer_derivatives_keeps_second_order_for_large_inner_problem() {
+    // Inner (n, p) scale does not block the analytic outer Hessian: the
+    // outer Hessian assembled by `compute_outer_hessian` is shape
+    // (K+ext_dim)×(K+ext_dim) where K = total penalties. For large inner
+    // problems with modest K (the common case: n=50000, p=50, K=2) the
+    // outer Hessian is tiny and must remain available so ARC can drive
+    // the outer iteration. Prior versions of this test enforced an
+    // inner-size cutoff that disabled the Hessian for exactly the
+    // benchmark sizes (medium: n=50000,p=50; pathological: n=50000,p=80)
+    // that were hanging 45-minute GH jobs on BFGS+BfgsApprox Strong Wolfe
+    // failures at iter 0.
+    #[derive(Clone)]
+    struct StrictFamily;
+
+    impl CustomFamily for StrictFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = block_states[0].eta.len();
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n),
+                    working_weights: Array1::ones(n),
+                }],
+            })
+        }
+
+        fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+            ExactNewtonOuterObjective::StrictPseudoLaplace
+        }
+    }
+
+    let specs = vec![ParameterBlockSpec {
+        name: "x".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::<f64>::zeros((20_100, 50)),
+        )),
+        offset: Array1::zeros(20_100),
+        penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(50))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        use_outer_hessian: true,
+        ..BlockwiseFitOptions::default()
+    };
+
+    let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
+    assert_eq!(
+        gradient,
+        crate::solver::outer_strategy::Derivative::Analytic
+    );
+    assert_eq!(
+        hessian,
+        crate::solver::outer_strategy::DeclaredHessianForm::Either
+    );
+}
+
+impl CustomFamily for OneBlockIdentityFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n = block_states[0].eta.len();
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: Array1::ones(n),
+                working_weights: Array1::ones(n),
+            }],
+        })
+    }
+}
+
+#[test]
+fn fit_custom_family_rejects_invalid_blockspec_before_output_channel_probe() {
+    let spec = ParameterBlockSpec {
+        name: "bad_penalty".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            array![[1.0], [2.0],],
+        )),
+        offset: Array1::zeros(2),
+        penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2))],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+
+    let err = fit_custom_family(
+        &OneBlockIdentityFamily,
+        &[spec],
+        &BlockwiseFitOptions::default(),
+    )
+    .expect_err("invalid block spec should return a typed error");
+    let message = err.to_string();
+    assert!(
+        message.contains("block 0 penalty 0 must be 1x1, got 2x2"),
+        "unexpected error: {message}",
+    );
+}
+
+#[derive(Clone)]
+struct OneBlockGaussianFamily {
+    y: Array1<f64>,
+}
+
+impl CustomFamily for OneBlockGaussianFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let eta = &block_states[0].eta;
+        let resid = eta - &self.y;
+        let ll = -0.5 * resid.dot(&resid);
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: self.y.clone(),
+                working_weights: Array1::ones(self.y.len()),
+            }],
+        })
+    }
+
+    fn diagonalworking_weights_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        d_eta: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(idx < usize::MAX);
+        Ok(Some(Array1::zeros(d_eta.len())))
+    }
+
+    fn diagonalworking_weights_second_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        d_eta_u: &Array1<f64>,
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(idx < usize::MAX);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(Array1::zeros(d_eta_u.len())))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockConstrainedExactFamily {
+    target: f64,
+    lower: f64,
+}
+
+impl CustomFamily for OneBlockConstrainedExactFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .first()
+            .copied()
+            .ok_or_else(|| "missing coefficient".to_string())?;
+        let g = self.target - beta;
+        let ll = -0.5 * (beta - self.target) * (beta - self.target);
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![g],
+                hessian: SymmetricMatrix::Dense(array![[1.0]]),
+            }],
+        })
+    }
+
+    fn block_linear_constraints(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        block_spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(!block_spec.name.is_empty());
+        if block_idx != 0 {
+            return Ok(None);
+        }
+        Ok(Some(LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![self.lower],
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockConstrainedNaNHessianFamily;
+
+impl CustomFamily for OneBlockConstrainedNaNHessianFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![0.0],
+                hessian: SymmetricMatrix::Dense(array![[f64::NAN]]),
+            }],
+        })
+    }
+
+    fn block_linear_constraints(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        block_spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(!block_spec.name.is_empty());
+        if block_idx != 0 {
+            return Ok(None);
+        }
+        Ok(Some(LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockConstrainedIndefiniteHessianFamily;
+
+impl CustomFamily for OneBlockConstrainedIndefiniteHessianFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![-1.0],
+                hessian: SymmetricMatrix::Dense(array![[-1.0]]),
+            }],
+        })
+    }
+
+    fn block_linear_constraints(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        block_spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(!block_spec.name.is_empty());
+        if block_idx != 0 {
+            return Ok(None);
+        }
+        Ok(Some(LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![1.0],
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockLinearLikelihoodExactFamily {
+    score: f64,
+}
+
+impl CustomFamily for OneBlockLinearLikelihoodExactFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .first()
+            .copied()
+            .ok_or_else(|| "missing coefficient".to_string())?;
+        Ok(FamilyEvaluation {
+            log_likelihood: self.score * beta,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![self.score],
+                hessian: SymmetricMatrix::Dense(array![[0.0]]),
+            }],
+        })
+    }
+}
+
+#[derive(Clone)]
+struct PreferJointExactFamily;
+
+impl CustomFamily for PreferJointExactFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![0.0],
+                hessian: SymmetricMatrix::Dense(array![[2.0]]),
+            }],
+        })
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(idx < usize::MAX);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Err(
+            "blockwise exact-newton path should not be used when joint path is available"
+                .to_string(),
+        )
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(Some(array![[2.0]]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(array![[0.0]]))
+    }
+}
+
+#[derive(Clone)]
+struct TwoBlockJointConstrainedFamily {
+    coupling: f64,
+}
+
+impl CustomFamily for TwoBlockJointConstrainedFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta0 = block_states[0].beta[0];
+        let beta1 = block_states[1].beta[0];
+        let g0 = 1.0 - beta0 - self.coupling * beta1;
+        let g1 = 1.0 - beta1 - self.coupling * beta0;
+        Ok(FamilyEvaluation {
+            log_likelihood: -0.5
+                * (beta0 * beta0 + beta1 * beta1 + 2.0 * self.coupling * beta0 * beta1)
+                + beta0
+                + beta1,
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![g0],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![g1],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                },
+            ],
+        })
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(Some(array![[1.0, self.coupling], [self.coupling, 1.0]]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(Array2::zeros((2, 2))))
+    }
+
+    fn block_linear_constraints(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        block_spec: &ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(!block_spec.name.is_empty());
+        if block_idx >= 2 {
+            return Ok(None);
+        }
+        Ok(Some(LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct TwoBlockPersistentGradientFamily;
+
+impl CustomFamily for TwoBlockPersistentGradientFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta0 = block_states[0].beta[0];
+        let beta1 = block_states[1].beta[0];
+        Ok(FamilyEvaluation {
+            log_likelihood: beta0 + beta1,
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![1.0],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![1.0],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                },
+            ],
+        })
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(Some(array![[1.0, 0.25], [0.25, 1.0]]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(Array2::zeros((2, 2))))
+    }
+
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+}
+
+/// gam#1088 fixture. A coupled two-block family whose joint Hessian carries
+/// a `NaN` curvature entry — the degenerate-curvature signature seen in the
+/// link-wiggle and location-scale benchmark timeouts (a collapsed/`0÷0` row
+/// weight assembling into `XᵀWX`). The penalized Hessian `H_pen = H + S(λ)`
+/// and its spectrum then degrade to `NaN`, so the KKT certificate is
+/// structurally unreachable. The non-finite-curvature guard must detect
+/// this at the head of the cycle and exit far below the budget, instead of
+/// grinding the full `inner_max_cycles`.
+#[derive(Clone)]
+struct TwoBlockNonFiniteCurvatureFamily;
+
+impl CustomFamily for TwoBlockNonFiniteCurvatureFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta0 = block_states[0].beta[0];
+        let beta1 = block_states[1].beta[0];
+        Ok(FamilyEvaluation {
+            log_likelihood: beta0 + beta1,
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![1.0],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![1.0],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                },
+            ],
+        })
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        // A finite, symmetric, otherwise-PD curvature with a single NaN
+        // diagonal entry: exactly the degenerate `H_pen` spectrum the guard
+        // exists to catch (a real collapsed-weight curvature defect).
+        Ok(Some(array![[f64::NAN, 0.25], [0.25, 1.0]]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(Array2::zeros((2, 2))))
+    }
+
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone)]
+struct TwoBlockJointSurrogateFamily;
+
+impl CustomFamily for TwoBlockJointSurrogateFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n0 = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .eta
+            .len();
+        let n1 = block_states
+            .get(1)
+            .ok_or_else(|| "missing block 1".to_string())?
+            .eta
+            .len();
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![
+                BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n0),
+                    working_weights: Array1::ones(n0),
+                },
+                BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n1),
+                    working_weights: Array1::ones(n1),
+                },
+            ],
+        })
+    }
+
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        Ok(Some(Array2::eye(p)))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        Ok(Some(Array2::zeros((p, p))))
+    }
+
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        arr: &Array1<f64>,
+        arr2: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        assert!(arr2.iter().all(|v| !v.is_nan()));
+        let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        Ok(Some(Array2::zeros((p, p))))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockPseudoLaplaceExactFamily {
+    target: f64,
+}
+
+impl CustomFamily for OneBlockPseudoLaplaceExactFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .first()
+            .copied()
+            .ok_or_else(|| "missing coefficient".to_string())?;
+        let resid = beta - self.target;
+        Ok(FamilyEvaluation {
+            log_likelihood: -resid * resid,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![-2.0 * resid],
+                hessian: SymmetricMatrix::Dense(array![[2.0]]),
+            }],
+        })
+    }
+
+    fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+        ExactNewtonOuterObjective::StrictPseudoLaplace
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(Some(array![[2.0]]))
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(idx < usize::MAX);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(array![[0.0]]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(array![[0.0]]))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockExactPsiHookFamily;
+
+impl CustomFamily for OneBlockExactPsiHookFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![0.0],
+                hessian: SymmetricMatrix::Dense(array![[1.0]]),
+            }],
+        })
+    }
+
+    fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+        ExactNewtonOuterObjective::StrictPseudoLaplace
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(Some(array![[1.0]]))
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(idx < usize::MAX);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(array![[0.0]]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        arr: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        Ok(Some(array![[0.0]]))
+    }
+
+    fn exact_newton_joint_psi_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        idx: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(derivative_blocks.len() <= isize::MAX as usize);
+        assert!(idx < usize::MAX);
+        Ok(Some(ExactNewtonJointPsiTerms {
+            objective_psi: 3.5,
+            score_psi: array![0.0],
+            hessian_psi: array![[0.0]],
+            hessian_psi_operator: None,
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockIndefinitePseudoLaplaceFamily;
+
+impl CustomFamily for OneBlockIndefinitePseudoLaplaceFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![0.0],
+                hessian: SymmetricMatrix::Dense(array![[-1.0]]),
+            }],
+        })
+    }
+
+    fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+        ExactNewtonOuterObjective::StrictPseudoLaplace
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(Some(array![[-1.0]]))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockNearlySymmetricPseudoLaplaceFamily;
+
+impl CustomFamily for OneBlockNearlySymmetricPseudoLaplaceFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .clone();
+        let h = array![[2.0, 0.1], [3.0, 2.0]];
+        let gradient = -h.dot(&beta);
+        Ok(FamilyEvaluation {
+            log_likelihood: -0.5 * beta.dot(&h.dot(&beta)),
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(h),
+            }],
+        })
+    }
+
+    fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+        ExactNewtonOuterObjective::StrictPseudoLaplace
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Ok(Some(array![[2.0, 0.1], [3.0, 2.0]]))
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockAlwaysErrorFamily;
+
+impl CustomFamily for OneBlockAlwaysErrorFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        Err("synthetic outer objective failure: block[0] evaluate()".to_string())
+    }
+}
+
+#[derive(Clone)]
+struct OneBlockCovarianceErrorFamily;
+
+impl CustomFamily for OneBlockCovarianceErrorFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n = block_states[0].eta.len();
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: Array1::zeros(n),
+                working_weights: Array1::ones(n),
+            }],
+        })
+    }
+
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
+        Err("synthetic covariance assembly failure".to_string())
+    }
+}
+
+#[test]
+fn effectiveridge_is_never_below_solver_floor() {
+    assert!((effective_solverridge(0.0) - 1e-15).abs() < 1e-30);
+    assert!((effective_solverridge(1e-8) - 1e-8).abs() < 1e-20);
+}
+
+#[test]
+fn objective_includes_solverridge_quadratic_term() {
+    // One-parameter block with X=1, y*=1, w=1, no explicit penalties.
+    // Inner solve gives beta = 1 / (1 + ridge), so objective should include
+    // 0.5 * ridge * beta^2 even when no smoothing penalties are present.
+    let spec = ParameterBlockSpec {
+        name: "b0".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        inner_tol: 0.0,
+        outer_max_iter: 1,
+        outer_tol: 1e-8,
+        minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
+        ridge_floor: 1e-4,
+        ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+        use_remlobjective: false,
+        compute_covariance: false,
+        use_outer_hessian: false,
+        screening_max_inner_iterations: None,
+        outer_inner_max_iterations: None,
+        seed_screening: false,
+        early_exit_threshold: None,
+        outer_score_subsample: None,
+        auto_outer_subsample: false,
+        outer_eval_context: None,
+        cache_session: None,
+        cache_mirror_sessions: Vec::new(),
+        joint_penalties: None,
+        screen_initial_rho: true,
+    };
+
+    let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
+        .expect("custom family fit should succeed");
+    let ridge = effective_solverridge(options.ridge_floor);
+    let beta = result.block_states[0].beta[0];
+    let expected_penalty = 0.5 * ridge * beta * beta;
+    assert!(
+        (result.penalized_objective - expected_penalty).abs() < 1e-12,
+        "penalized objective should equal ridge quadratic term when ll=0 and S=0; got {}, expected {}",
+        result.penalized_objective,
+        expected_penalty
+    );
+}
+
+#[test]
+fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() {
+    let family = OneBlockGaussianFamily { y: array![1.0] };
+    let spec = ParameterBlockSpec {
+        name: "b0".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![10.0_f64.ln()],
+        initial_beta: Some(array![1.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 20,
+        inner_tol: 1e-10,
+        outer_max_iter: 1,
+        outer_tol: 1e-8,
+        minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
+        ridge_floor: 0.0,
+        ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+        use_remlobjective: false,
+        compute_covariance: false,
+        use_outer_hessian: false,
+        screening_max_inner_iterations: None,
+        outer_inner_max_iterations: None,
+        seed_screening: false,
+        early_exit_threshold: None,
+        outer_score_subsample: None,
+        auto_outer_subsample: false,
+        outer_eval_context: None,
+        cache_session: None,
+        cache_mirror_sessions: Vec::new(),
+        joint_penalties: None,
+        screen_initial_rho: true,
+    };
+    let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
+    let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
+        .expect("inner blockwise fit should succeed");
+
+    let beta = inner.block_states[0].beta[0];
+    assert!(
+        beta < 0.5,
+        "beta should shrink toward penalized mode; got {}",
+        beta
+    );
+    assert!(
+        inner.log_likelihood < -1e-8,
+        "raw log-likelihood should drop for this strongly penalized move; got {}",
+        inner.log_likelihood
+    );
+}
+
+#[test]
+fn exact_newton_backtracking_descent_includes_explicit_ridge() {
+    let family = OneBlockLinearLikelihoodExactFamily { score: 0.5 };
+    let spec = ParameterBlockSpec {
+        name: "b0".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![1.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        inner_tol: 0.0,
+        outer_max_iter: 1,
+        outer_tol: 1e-8,
+        minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
+        ridge_floor: 1.0,
+        ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+        use_remlobjective: false,
+        compute_covariance: false,
+        use_outer_hessian: false,
+        screening_max_inner_iterations: None,
+        outer_inner_max_iterations: None,
+        seed_screening: false,
+        early_exit_threshold: None,
+        outer_score_subsample: None,
+        auto_outer_subsample: false,
+        outer_eval_context: None,
+        cache_session: None,
+        cache_mirror_sessions: Vec::new(),
+        joint_penalties: None,
+        screen_initial_rho: true,
+    };
+    let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
+        .expect("inner blockwise fit should succeed");
+
+    let beta = inner.block_states[0].beta[0];
+    let objective = -inner.log_likelihood + inner.penalty_value;
+    assert!(
+        beta < 1.0 - 1e-12,
+        "ridge-aware fallback descent should shrink beta after rejecting the uphill Newton step; got {}",
+        beta
+    );
+    assert!(
+        objective < -1e-12,
+        "accepted fallback step should lower the penalized objective; got {}",
+        objective
+    );
+}
+
+#[test]
+fn outergradient_matches_finite_difference_for_one_block() {
+    let n = 8usize;
+    let y = Array1::from_vec(vec![0.4, -0.2, 0.8, 1.0, -0.5, 0.3, 0.1, -0.7]);
+    let spec = ParameterBlockSpec {
+        name: "b0".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+            (n, 1),
+            1.0,
+        ))),
+        offset: Array1::zeros(n),
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.2],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        ridge_floor: 1e-10,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_counts = vec![1usize];
+    let rho = array![0.1];
+    let (f0, g0, _) = outerobjective_andgradient(
+        &OneBlockGaussianFamily { y: y.clone() },
+        std::slice::from_ref(&spec),
+        &options,
+        &penalty_counts,
+        &rho,
+        None,
+    )
+    .expect("objective/gradient");
+
+    let h = 1e-5;
+    let rho_p = array![rho[0] + h];
+    let rho_m = array![rho[0] - h];
+    let (fp, _, _) = outerobjective_andgradient(
+        &OneBlockGaussianFamily { y: y.clone() },
+        std::slice::from_ref(&spec),
+        &options,
+        &penalty_counts,
+        &rho_p,
+        None,
+    )
+    .expect("objective+");
+    let (fm, _, _) = outerobjective_andgradient(
+        &OneBlockGaussianFamily { y },
+        std::slice::from_ref(&spec),
+        &options,
+        &penalty_counts,
+        &rho_m,
+        None,
+    )
+    .expect("objective-");
+    let gfd = (fp - fm) / (2.0 * h);
+    let rel = (g0[0] - gfd).abs() / gfd.abs().max(1e-8);
+
+    assert!(f0.is_finite());
+    assert_eq!(
+        g0[0].signum(),
+        gfd.signum(),
+        "outer gradient sign mismatch: analytic={} fd={}",
+        g0[0],
+        gfd
+    );
+    assert!(
+        rel < 5e-3,
+        "outer gradient mismatch: analytic={} fd={} rel={}",
+        g0[0],
+        gfd,
+        rel
+    );
+}
+
+#[test]
+fn outergradient_prefers_joint_exact_pathwhen_available() {
+    let spec = ParameterBlockSpec {
+        name: "joint_exact".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        ridge_floor: 1e-10,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_counts = vec![1usize];
+    let rho = array![0.0];
+
+    let result = outerobjective_andgradient(
+        &PreferJointExactFamily,
+        std::slice::from_ref(&spec),
+        &options,
+        &penalty_counts,
+        &rho,
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "joint exact path should be preferred over blockwise fallback: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn innerfit_uses_joint_exact_path_for_multiblock_constraints() {
+    let spec0 = ParameterBlockSpec {
+        name: "block0".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let spec1 = ParameterBlockSpec {
+        name: "block1".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        inner_tol: 1e-10,
+        ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
+        ..BlockwiseFitOptions::default()
+    };
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+
+    let result = inner_blockwise_fit(
+        &TwoBlockJointConstrainedFamily { coupling: 0.25 },
+        &[spec0, spec1],
+        &per_block,
+        &options,
+        None,
+    )
+    .expect("joint constrained inner fit should succeed");
+
+    assert!(
+        result.converged,
+        "joint constrained inner fit should converge in one cycle"
+    );
+    assert_eq!(result.cycles, 1);
+    assert!((result.block_states[0].beta[0] - 0.8).abs() < 1e-8);
+    assert!((result.block_states[1].beta[0] - 0.8).abs() < 1e-8);
+    assert_eq!(result.active_sets, vec![None, None]);
+}
+
+#[test]
+fn joint_newton_budget_exhaustion_refuses_coupled_exact_inner() {
+    let spec0 = ParameterBlockSpec {
+        name: "block0".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let spec1 = ParameterBlockSpec {
+        name: "block1".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        inner_tol: 1e-12,
+        ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
+        ..BlockwiseFitOptions::default()
+    };
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+
+    let err = inner_blockwise_fit(
+        &TwoBlockPersistentGradientFamily,
+        &[spec0, spec1],
+        &per_block,
+        &options,
+        None,
+    )
+    .expect_err("coupled exact-joint max-budget exhaustion must fail loudly");
+    assert!(
+        err.contains("exhausted the joint Newton budget without KKT convergence"),
+        "budget exhaustion should be named explicitly: {err}"
+    );
+    assert!(
+        err.contains("block_residual_inf"),
+        "error should carry per-block residual diagnostics: {err}"
+    );
+}
+
+/// gam#1088 regression. A `NaN` in the joint Hessian curvature makes
+/// `H_pen = H + S(λ)` and its spectrum degenerate, so the KKT certificate
+/// can never be issued. Without the non-finite-curvature guard the coupled
+/// joint-Newton loop runs to the full `inner_max_cycles` ceiling (1200 in
+/// production) on every outer ρ-eval, which is the multi-hour benchmark
+/// timeout. The guard must detect the degenerate curvature at the head of
+/// the cycle and exit FAR below the ceiling — at cycle 0 — as a non-
+/// converged, structured non-budget exit so the outer optimizer rejects
+/// the ρ-evaluation cleanly.
+#[test]
+fn non_finite_curvature_exits_joint_newton_far_below_budget() {
+    let spec0 = ParameterBlockSpec {
+        name: "block0".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let spec1 = ParameterBlockSpec {
+        name: "block1".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    // The PRODUCTION ceiling: the bug is that all 1200 cycles are burned.
+    // The guard must make the solve exit immediately regardless of how
+    // large the budget is, so we set the real ceiling here and prove the
+    // exit does not depend on a small budget.
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+        inner_tol: 1e-12,
+        ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
+        ..BlockwiseFitOptions::default()
+    };
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+
+    let err = inner_blockwise_fit(
+        &TwoBlockNonFiniteCurvatureFamily,
+        &[spec0, spec1],
+        &per_block,
+        &options,
+        None,
+    )
+    .expect_err("a non-finite joint Hessian must fail the coupled exact-joint inner solve");
+    // The exit is via the structured "exited the joint Newton path before
+    // convergence" branch (an immediate early break), NOT the budget-
+    // exhaustion branch — proving the loop did not grind to the ceiling.
+    assert!(
+        err.contains("exited the joint Newton path before convergence"),
+        "non-finite curvature must take the early structured exit, not the \
+             budget path: {err}"
+    );
+    assert!(
+        !err.contains("exhausted the joint Newton budget"),
+        "non-finite curvature must NOT consume the joint Newton budget: {err}"
+    );
+}
+
+/// gam#787 binary matern centers=12 regression. Near a flat-objective
+/// optimum the joint-Newton proposal shrinks to the step-tol floor while
+/// `predicted_reduction = rhs·δ − ½δᵀHδ` becomes round-off-signed. The
+/// `predicted_reduction ≤ 0` branch must NOT fire the preconditioned-descent
+/// substitution there (it would replace the tiny KKT-polishing step with an
+/// objective-descent step that catapults the residual off the near-converged
+/// iterate). `joint_proposal_at_step_floor` is the suppression gate.
+#[test]
+fn joint_proposal_at_step_floor_suppresses_descent_substitution_near_optimum() {
+    // The exact c12 cycle-10 operating point: proposal_inf=1.413e-5,
+    // step_tol=1.355e-5 (proposal a hair = 1.04× above tol). The iterate is
+    // polishing KKT, so a pred≤0 here is round-off — the gate must fire.
+    assert!(
+        joint_proposal_at_step_floor(1.413e-5, 1.355e-5),
+        "a proposal within 4× step_tol is at the convergence floor; \
+             the descent substitution must be suppressed"
+    );
+    // Exactly at the 4× band edge: still at the floor.
+    assert!(joint_proposal_at_step_floor(4.0 * 1.355e-5, 1.355e-5));
+    // A genuinely large proposal (model-invalid direction far from the
+    // optimum) is NOT at the floor — the descent substitution must still run.
+    assert!(
+        !joint_proposal_at_step_floor(1.182e-2, 1.355e-5),
+        "an O(1e-2) proposal is far above the step floor; the \
+             preconditioned-descent fallback must remain active there"
+    );
+    // Non-finite inputs never certify the floor (so the substitution path
+    // keeps its existing non-finite handling).
+    assert!(!joint_proposal_at_step_floor(f64::NAN, 1.0e-5));
+    assert!(!joint_proposal_at_step_floor(1.0e-6, f64::INFINITY));
+}
+
+/// Independent derivation and direct numerical proof of the
+/// ρ ≈ 2 inner-PIRLS pathology pinned by the large-scale saturated-probit
+/// failure trace.
+///
+/// # Mechanism
+///
+/// Inner Newton on the penalized objective `f(β) = -ℓ(β) + ½βᵀSβ`
+/// uses two different ridge values:
+///   * **APPLY** path (`apply_joint_penalized_hessian_into`, called
+///     inside `joint_quadratic_predicted_reduction`) uses
+///     `joint_solver_diagonal_ridge`, which equals
+///     `joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE +
+///     stabilizing_shift`, where the stabilizing shift is whatever
+///     positive quantity `stabilized_joint_solver_diagonal_ridge`
+///     adds to lift a negative-eigenvalue joint Hessian above the
+///     SPD floor.
+///   * **TRIAL OBJECTIVE** path (`total_quadratic_penalty`) uses
+///     only `joint_mode_diagonal_ridge` (= `effective_solverridge`),
+///     which is the true penalty in the objective `f` and does NOT
+///     include the stabilizing shift.
+///
+/// Let `Δ = joint_solver_diagonal_ridge - joint_mode_diagonal_ridge`
+/// (the gap between the SOLVE / APPLY matrix and the TRUE Hessian).
+/// For a Newton step `δ = (H_NLL + S + joint_solver_diagonal_ridge·I)⁻¹·rhs`,
+/// the Newton identity gives `δᵀ·H_used·δ = rhs·δ`, so:
+///
+///     predicted = rhs·δ − ½·δᵀ·H_used·δ = ½·rhs·δ
+///     actual    = rhs·δ − ½·δᵀ·H_true·δ
+///               = rhs·δ − ½·(δᵀ·H_used·δ − Δ·‖δ‖²)
+///               = ½·rhs·δ + ½·Δ·‖δ‖²
+///     ρ = actual / predicted = 1 + Δ·‖δ‖² / (rhs·δ)
+///
+/// When `δ ∈ null(H_true)` (e.g. the marginal-block cancellation
+/// direction from `marginal_block_hessian_cancels_in_saturated_regime`
+/// combined with an unpenalized direction in the smoothing penalty's
+/// null space), `H_true·δ = 0`, so `H_used·δ = Δ·δ` and therefore
+/// `rhs = Δ·δ`, giving `rhs·δ = Δ·‖δ‖²`. Substituting:
+///
+///     ρ = 1 + Δ·‖δ‖² / (Δ·‖δ‖²) = 2  EXACTLY.
+///
+/// This is independent of `Δ`, of the data size, and of `‖δ‖` — it
+/// is a structural consequence of "SOLVE/APPLY add a stabilizing
+/// shift that TRIAL OBJECTIVE doesn't see" combined with "Newton
+/// step lies in the null space of the true Hessian".
+///
+/// # Test
+///
+/// We construct a 2D synthetic case with H_NLL indefinite (one
+/// negative eigenvalue, mimicking the entry-survival concave term),
+/// `S = 0`, and `joint_mode_diagonal_ridge = 0` (i.e. the policy
+/// does NOT include the ridge in the objective). The stabilizing
+/// shift lifts the negative eigenvalue to the SPD floor; the Newton
+/// step lies in the formerly-near-null direction; predicted and
+/// actual are computed by the exact same routines the inner solver
+/// uses; ρ comes out to exactly 2.0 to floating-point precision.
+#[test]
+fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction() {
+    // Synthetic 3D joint Hessian with the structure of the
+    // saturated-probit failure case at large scale:
+    //   - dim 0: indefinite contribution (eigenvalue −1) from the
+    //     concave entry-survival term `+w·log Φ(−η₀)`. This triggers
+    //     the SPD stabilizer in the solver.
+    //   - dim 1: positive contribution (+1) from a non-saturated
+    //     coefficient direction.
+    //   - dim 2: ZERO from the marginal-block Hessian cancellation
+    //     proven separately in `marginal_block_hessian_cancels_in_saturated_regime`.
+    //     This is the saturating direction that sits in null(H_true).
+    let h_nll = array![[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
+    let source = JointHessianSource::Dense(h_nll.clone());
+    let ranges = vec![(0, 3)];
+    // Smoothing penalty `S` is zero in the saturating direction
+    // (dim 2) — mirrors the duchon-smooth polynomial null space
+    // containing constants/linears.
+    let s_lambdas = vec![Array2::<f64>::zeros((3, 3))];
+
+    // Stabilized solver ridge: should add ~1.0 to lift the
+    // -1 eigenvalue to the SPD floor (~ridge_floor).
+    let base = JOINT_TRACE_STABILITY_RIDGE;
+    let ridge_floor = 1.0e-12_f64;
+    let joint_mode_diagonal_ridge = 0.0_f64; // policy: ridge NOT in objective
+    // `stabilized_joint_solver_diagonal_ridge` consults the family only
+    // for `use_exact_newton_strict_spd`, which defaults to false; we
+    // simulate that branch by computing the shift directly via
+    // `exact_newton_stabilizing_shift`.
+    let mut lhs = h_nll.clone();
+    add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, base, None);
+    let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor)
+        .expect("indefinite Hessian must yield a positive stabilizing shift");
+    assert!(
+        shift > 0.9,
+        "shift should lift the -1 eigenvalue; got {shift}"
+    );
+    let joint_solver_diagonal_ridge = base + shift;
+    let big_delta = joint_solver_diagonal_ridge - joint_mode_diagonal_ridge;
+
+    // True Hessian (what TRIAL OBJECTIVE sees):
+    //   H_true = H_NLL + S + joint_mode_diagonal_ridge·I
+    //          = diag(-1, 1, 0)
+    //   ⇒ dim 2 is a null direction of H_true.
+    // Used Hessian (what SOLVE / APPLY uses):
+    //   H_used = H_NLL + S + joint_solver_diagonal_ridge·I
+    //          = diag(-1+Δ, 1+Δ, Δ)   where Δ ≈ 1.0
+    //   ⇒ dim 2 has curvature Δ (purely from the stabilizing shift,
+    //     which fires because dim 0 is negative).
+    // rhs aimed entirely in dim 2 puts the Newton step in null(H_true).
+    let rhs = array![0.0_f64, 0.0, 1.0];
+    let h_used_22 = 0.0 + joint_solver_diagonal_ridge;
+    let delta = array![0.0, 0.0, rhs[2] / h_used_22];
+
+    // Compute hpen_delta via the SAME helper the inner solver uses.
+    let mut hpen_delta = Array1::<f64>::zeros(3);
+    apply_joint_penalized_hessian_into(
+        &source,
+        &ranges,
+        &s_lambdas,
+        joint_solver_diagonal_ridge,
+        &delta,
+        &mut hpen_delta,
+        None,
+    )
+    .expect("apply joint penalized hessian must succeed");
+
+    // Predicted = the exact formula the inner solver uses.
+    let predicted = joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &delta);
+
+    // Actual (true) reduction: f(β=0) − f(β+δ) for the true objective
+    //   f(β) = ½·βᵀ·H_NLL·β + ½·βᵀ·S·β + ½·joint_mode_diagonal_ridge·‖β‖² + bᵀ·β
+    // taking β_start = 0 and using the Newton identity for the truth:
+    //   actual = rhs·δ − ½·δᵀ·H_true·δ
+    // where H_true = H_NLL + S + joint_mode_diagonal_ridge·I.
+    let mut h_true_delta = Array1::<f64>::zeros(3);
+    apply_joint_penalized_hessian_into(
+        &source,
+        &ranges,
+        &s_lambdas,
+        joint_mode_diagonal_ridge,
+        &delta,
+        &mut h_true_delta,
+        None,
+    )
+    .expect("apply true (un-stabilized) hessian must succeed");
+    let actual = rhs.dot(&delta) - 0.5 * delta.dot(&h_true_delta);
+
+    let rho = actual / predicted;
+
+    // ρ must be EXACTLY 2 to floating-point precision (not just "close to 2").
+    // This is the structural fingerprint of the SOLVE/APPLY-vs-OBJECTIVE
+    // ridge-stabilization gap in the saturated regime.
+    assert!(
+        (rho - 2.0).abs() <= 1e-10,
+        "ρ should be EXACTLY 2 when Newton step lies in null(H_true) with stabilizing-shift gap; got {rho}",
+    );
+
+    // Sanity: the identity rhs·δ = Δ·‖δ‖² must hold (this is the
+    // mathematical core of why ρ = 2 specifically and not 1.5 or 3).
+    let rhs_dot_delta = rhs.dot(&delta);
+    let delta_sq_times_big_delta = big_delta * delta.dot(&delta);
+    assert!(
+        (rhs_dot_delta - delta_sq_times_big_delta).abs() <= 1e-10 * rhs_dot_delta.abs(),
+        "Newton-identity null-space condition: rhs·δ ({rhs_dot_delta}) should equal Δ·‖δ‖² ({delta_sq_times_big_delta})",
+    );
+
+    // And ρ = 2 holds AT ALL MAGNITUDES of δ — verify by scaling rhs:
+    for scale in [0.001_f64, 0.029, 1.0, 988.0] {
+        let scaled_rhs = &rhs * scale;
+        let scaled_delta = &delta * scale;
+        let mut scaled_hpen = Array1::<f64>::zeros(3);
+        apply_joint_penalized_hessian_into(
+            &source,
+            &ranges,
+            &s_lambdas,
+            joint_solver_diagonal_ridge,
+            &scaled_delta,
+            &mut scaled_hpen,
+            None,
+        )
+        .expect("apply scaled");
+        let scaled_predicted =
+            joint_quadratic_predicted_reduction(&scaled_rhs, &scaled_hpen, &scaled_delta);
+        let mut scaled_h_true_delta = Array1::<f64>::zeros(3);
+        apply_joint_penalized_hessian_into(
+            &source,
+            &ranges,
+            &s_lambdas,
+            joint_mode_diagonal_ridge,
+            &scaled_delta,
+            &mut scaled_h_true_delta,
+            None,
+        )
+        .expect("apply scaled true");
+        let scaled_actual =
+            scaled_rhs.dot(&scaled_delta) - 0.5 * scaled_delta.dot(&scaled_h_true_delta);
+        let scaled_rho = scaled_actual / scaled_predicted;
+        assert!(
+            (scaled_rho - 2.0).abs() <= 1e-10,
+            "ρ invariance under step rescaling broke at scale {scale}: got {scaled_rho}",
+        );
+    }
+}
+
+#[test]
+fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
+    let family = TwoBlockJointConstrainedFamily { coupling: 2.0 };
+    let source = JointHessianSource::Dense(array![[1.0, 2.0], [2.0, 1.0]]);
+    let ranges = vec![(0, 1), (1, 2)];
+    let s_lambdas = vec![Array2::zeros((1, 1)), Array2::zeros((1, 1))];
+    let ridge = stabilized_joint_solver_diagonal_ridge(
+        &family,
+        &source,
+        &ranges,
+        &s_lambdas,
+        JOINT_TRACE_STABILITY_RIDGE,
+        1e-12,
+        None,
+    );
+
+    assert!(
+        ridge > 1.0,
+        "dense joint solver ridge should lift the negative eigenvalue; got {ridge}"
+    );
+    let mut stabilized = match source {
+        JointHessianSource::Dense(matrix) => matrix,
+        JointHessianSource::Operator { .. } => {
+            panic!("dense joint solver fixture must use a dense Hessian source")
+        }
+    };
+    add_joint_penalty_to_matrix(&mut stabilized, &ranges, &s_lambdas, ridge, None);
+    let min_eval = 0.5
+        * (stabilized[[0, 0]] + stabilized[[1, 1]]
+            - ((stabilized[[0, 0]] - stabilized[[1, 1]]).powi(2)
+                + 4.0 * stabilized[[0, 1]].powi(2))
+            .sqrt());
+    assert!(
+        min_eval > 0.0,
+        "stabilized dense joint Hessian should be SPD; min_eval={min_eval}"
+    );
+}
+
+#[test]
+fn outergradient_uses_joint_surrogate_formultiblock_diagonal_family() {
+    let spec0 = ParameterBlockSpec {
+        name: "block0".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]])),
+        offset: array![0.0, 0.0],
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let spec1 = ParameterBlockSpec {
+        name: "block1".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]])),
+        offset: array![0.0, 0.0],
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        ridge_floor: 1e-10,
+        outer_max_iter: 1,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_counts = vec![1usize, 1usize];
+    let rho = array![0.0, 0.0];
+
+    let result = outerobjective_andgradient(
+        &TwoBlockJointSurrogateFamily,
+        &[spec0, spec1],
+        &options,
+        &penalty_counts,
+        &rho,
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "default joint multi-block surrogate path should succeed without blockwise dW callbacks: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn exact_newton_pseudo_laplace_objective_uses_logdet_h_without_logdet_s() {
+    let spec = ParameterBlockSpec {
+        name: "pseudo_laplace".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let fit = fit_custom_family(
+        &OneBlockPseudoLaplaceExactFamily { target: 1.5 },
+        &[spec],
+        &options,
+    )
+    .expect("pseudo-laplace exact-newton fit");
+    let expected = 0.5 * 2.0_f64.ln();
+    assert!(
+        (fit.penalized_objective - expected).abs() < 1e-8,
+        "pseudo-Laplace objective mismatch: got {}, expected {}",
+        fit.penalized_objective,
+        expected
+    );
+}
+
+#[test]
+fn exact_newton_joint_psi_hook_can_supply_fixed_beta_termswithout_quadratic_spsi() {
+    let spec = ParameterBlockSpec {
+        name: "psi_hook".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let deriv = CustomFamilyBlockPsiDerivative {
+        penalty_index: None,
+        x_psi: Array2::zeros((1, 1)),
+        s_psi: Array2::zeros((1, 1)),
+        s_psi_components: None,
+        s_psi_penalty_components: None,
+        x_psi_psi: None,
+        s_psi_psi: None,
+        s_psi_psi_components: None,
+        s_psi_psi_penalty_components: None,
+        implicit_operator: None,
+        implicit_axis: 0,
+        implicit_group_id: None,
+    };
+    let result = evaluate_custom_family_joint_hyper(
+        &OneBlockExactPsiHookFamily,
+        &[spec],
+        &BlockwiseFitOptions {
+            use_remlobjective: true,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        },
+        &Array1::zeros(0),
+        &[vec![deriv]],
+        None,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("joint hyper eval with exact joint psi hook");
+    assert_eq!(result.gradient.len(), 1);
+    assert!(
+        (result.gradient[0] - 3.5).abs() < 1e-12,
+        "expected family-supplied joint psi term, got {}",
+        result.gradient[0]
+    );
+}
+
+#[test]
+fn pseudo_laplace_exact_newton_rejects_indefinite_hessian() {
+    // #748: an indefinite joint coefficient Hessian (here a 1×1 block with
+    // H=-1) is a real defect — a mis-signed / non-convex curvature, or a β
+    // that is not at the inner block optimum. The strict pseudo-Laplace
+    // REML logdet must REJECT such a ρ-trial, not mask it. The earlier path
+    // returned `log|H + δI|` with δ escalated to 10 (so H+δI=[[9]],
+    // logdet=log 9) and let the fit "succeed" — but the analytic REML
+    // gradient still used `tr((H+S_λ)⁻¹·)` on the un-ridged H, so value and
+    // gradient described two different objectives. Rejecting is the honest
+    // signal: the outer optimizer steps back instead of optimizing a biased,
+    // δ-shifted surface. The fit therefore now ERRORS where it formerly
+    // returned a masked result.
+    let spec = ParameterBlockSpec {
+        name: "indefinite".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let result = fit_custom_family(
+        &OneBlockIndefinitePseudoLaplaceFamily,
+        &[spec],
+        &BlockwiseFitOptions {
+            use_remlobjective: true,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        },
+    );
+    let err = result
+            .expect_err(
+                "strict pseudo-Laplace must reject the indefinite Hessian H=[[-1]], not δ-ridge mask it",
+            )
+            .to_string();
+    assert!(
+        err.contains("indefinite") || err.contains("below -tol"),
+        "rejection error should name the indefiniteness; got: {err}",
+    );
+}
+
+#[test]
+fn auto_determinant_mode_is_exact_full_logdet_policy() {
+    let h = array![[6.0, 0.8, 0.1], [0.8, 4.5, 0.4], [0.1, 0.4, 3.2]];
+    let exact =
+        stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::explicit_stabilization_full_exact())
+            .expect("exact logdet");
+    let auto =
+        stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::explicit_stabilization_full())
+            .expect("auto logdet");
+    assert!((auto - exact).abs() < 1e-12, "auto={auto}, exact={exact}");
+}
+
+#[test]
+fn indefinite_hessian_uses_smooth_regularized_logdet() {
+    // Indefinite Hessian: eigenvalues {-1, 2}.
+    //
+    // Old behaviour: silently drop the -1 direction from logdet, warn,
+    // and after enough repeats escalate to an EFS abort (first-order
+    // fallback marker).
+    //
+    // New behaviour: every eigenvalue contributes via the smooth
+    // regularizer r_ε(σ) = ½(σ + √(σ² + 4ε²)).  No direction is ignored,
+    // no escalation, and the logdet matches what the downstream
+    // `DenseSpectralOperator` gradient computes — eliminating the
+    // cost/gradient mismatch that broke BFGS line search.
+    let h = array![[-1.0, 0.0], [0.0, 2.0]];
+    let logdet =
+        stable_logdet_with_ridge_policy(&h, 1e-12, RidgePolicy::explicit_stabilization_pospart())
+            .expect("smooth-regularized logdet must be finite for indefinite H");
+    assert!(
+        logdet.is_finite(),
+        "smooth-regularized logdet should be finite, got {logdet}"
+    );
+    // Reference value using the same formula directly on the eigenvalues
+    // of H + ridge·I (ridge = 1e-12 here).  Since ε ≫ ridge (spectral_epsilon
+    // floors at √(eps_mach) ≈ 1.5e-8 for p=2), the ridge contribution is
+    // absorbed into ε and the expected value is Σ log r_ε(σ_j).
+    let eps = spectral_epsilon(&[-1.0_f64, 2.0]).max(1e-12_f64.max(1e-14));
+    // A + ridge·I has eigenvalues shifted by 1e-12, negligible relative to ε.
+    let expected: f64 = [-1.0_f64 + 1e-12, 2.0 + 1e-12]
+        .iter()
+        .map(|&s| spectral_regularize(s, eps).ln())
+        .sum();
+    assert!(
+        (logdet - expected).abs() < 1e-10,
+        "logdet={logdet}, expected={expected}"
+    );
+}
+
+#[test]
+fn pseudo_laplace_exact_newton_symmetrizes_nearly_symmetrichessian() {
+    let spec = ParameterBlockSpec {
+        name: "nearly_symmetric".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+            [1.0, 0.0],
+            [0.0, 1.0]
+        ])),
+        offset: array![0.0, 0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0, 0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let fit = fit_custom_family(
+        &OneBlockNearlySymmetricPseudoLaplaceFamily,
+        &[spec],
+        &BlockwiseFitOptions {
+            use_remlobjective: true,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        },
+    )
+    .expect("nearly symmetric pseudo-laplace Hessian should be accepted after symmetrization");
+    assert!(
+        fit.penalized_objective.is_finite(),
+        "expected finite pseudo-laplace objective, got {}",
+        fit.penalized_objective
+    );
+}
+
+#[test]
+fn outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active() {
+    let BinomialLocationScaleWiggleOuterFixture {
+        family,
+        specs,
+        penalty_counts,
+        rho,
+        options: base_options,
+    } = binomial_location_scale_wiggle_outer_fixture();
+    // FD/analytic noise floor below is `EPS·|cost|/h`, valid only when PIRLS
+    // converges to f64 precision; HardPseudo + σ_min~1e-10 amplifies the
+    // default 1e-6 inner residual into ~1e-7 cost slack that lifts both
+    // estimators above the machine-precision floor.
+    let options = BlockwiseFitOptions {
+        inner_tol: 1e-12,
+        inner_max_cycles: 500,
+        ..base_options
+    };
+
+    let (f0, g0, _) =
+        outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
+            .expect("objective/gradient");
+    assert!(f0.is_finite());
+    assert_eq!(g0.len(), rho.len());
+
+    let h = 1e-5;
+    for k in 0..rho.len() {
+        let mut rho_p = rho.clone();
+        let mut rho_m = rho.clone();
+        rho_p[k] += h;
+        rho_m[k] -= h;
+        let (fp, _, _) =
+            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho_p, None)
+                .expect("objective+");
+        let (fm, _, _) =
+            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho_m, None)
+                .expect("objective-");
+        let gfd = (fp - fm) / (2.0 * h);
+
+        // Noise floor for FD-vs-analytic comparisons.
+        //
+        // At a rank-deficient optimum (σ_min(H) ≲ ε_machine) the outer
+        // REML gradient is a DIFFERENCE of two nearly-equal O(1)
+        // quantities — ½ λ_k (H⁺[k,k] − S⁺[k,k]) — so the true gradient
+        // is very close to zero.  The FD estimator `(f_p − f_m)/(2h)`
+        // then measures cost-sum round-off: at f64 precision each cost
+        // value carries an uncertainty of ~EPS · |cost|, and the
+        // symmetric FD inflates that by 1/(2h), producing a noise floor
+        // of roughly `EPS · |cost| / h` on |gfd|.  Below that floor
+        // neither `|gfd|`, `|g0|`, nor `sign(gfd)` reflect the true
+        // derivative — they reflect arithmetic noise.
+        //
+        // Concretely: for this test `|cost| ~ 6`, `h = 1e-5`, so the
+        // floor is ~1.3e-10 (≈ f64::EPSILON · 6 / 1e-5).  We round up
+        // to a problem-scale-derived value and treat pairs where BOTH
+        // |g0| and |gfd| lie below the floor as a pass (the assertion
+        // is making a claim about the TRUE derivative, and a true
+        // derivative strictly less than noise is indistinguishable
+        // from zero — sign is not a correctness property there).
+        let cost_magnitude = f0.abs().max(1.0);
+        let noise_floor = (10.0 * f64::EPSILON * cost_magnitude / h).max(1e-9);
+        let both_in_noise = g0[k].abs() < noise_floor && gfd.abs() < noise_floor;
+
+        if !both_in_noise {
+            assert_eq!(
+                g0[k].signum(),
+                gfd.signum(),
+                "outer LAML gradient sign mismatch at {}: analytic={} fd={} noise_floor={:.3e}",
+                k,
+                g0[k],
+                gfd,
+                noise_floor,
+            );
+            let rel = (g0[k] - gfd).abs() / gfd.abs().max(noise_floor);
+            assert!(
+                rel < 2e-2,
+                "outer LAML gradient mismatch at {}: analytic={} fd={} rel={} noise_floor={:.3e}",
+                k,
+                g0[k],
+                gfd,
+                rel,
+                noise_floor,
+            );
+        }
+    }
+}
+
+#[test]
+fn rho_only_outer_objective_matches_joint_hyper_when_psi_is_empty() {
+    let BinomialLocationScaleWiggleOuterFixture {
+        family,
+        specs,
+        penalty_counts,
+        rho,
+        options,
+    } = binomial_location_scale_wiggle_outer_fixture();
+
+    let (outer_obj, outer_grad, outer_hessian, _) =
+        super::test_support::outerobjectivegradienthessian(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &rho,
+            None,
+            EvalMode::ValueGradientHessian,
+        )
+        .expect("rho-only outer objective");
+    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
+    let joint_result = evaluate_custom_family_joint_hyper(
+        &family,
+        &specs,
+        &options,
+        &rho,
+        &derivative_blocks,
+        None,
+        EvalMode::ValueGradientHessian,
+    )
+    .expect("joint hyper objective with empty psi");
+
+    assert!(
+        (outer_obj - joint_result.objective).abs() < 1e-12,
+        "objective mismatch: rho-only={} joint={}",
+        outer_obj,
+        joint_result.objective
+    );
+    assert_eq!(outer_grad.len(), joint_result.gradient.len());
+    let max_grad_diff = outer_grad
+        .iter()
+        .zip(joint_result.gradient.iter())
+        .map(|(lhs, rhs)| (lhs - rhs).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_grad_diff < 1e-12,
+        "gradient mismatch: max diff={}",
+        max_grad_diff
+    );
+
+    let outer_hessian = outer_hessian.expect("rho-only outer Hessian");
+    let joint_hessian = joint_result
+        .outer_hessian
+        .materialize_dense()
+        .expect("joint outer Hessian should materialize")
+        .expect("joint outer Hessian");
+    assert_eq!(outer_hessian.dim(), joint_hessian.dim());
+    let max_hessian_diff = outer_hessian
+        .iter()
+        .zip(joint_hessian.iter())
+        .map(|(lhs, rhs)| (lhs - rhs).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_hessian_diff < 1e-12,
+        "outer Hessian mismatch: max diff={}",
+        max_hessian_diff
+    );
+}
+
+/// Shared probit binomial-location-scale outer-derivative test fixture:
+/// builds the (threshold, log_sigma) block specs, family, penalty counts,
+/// and outer options that every `outer_laml*_binomial_location_scale_*`
+/// finite-difference test constructs identically apart from `y` and the
+/// two block initial betas.
+fn binomial_location_scale_outer_fixture(
+    y: Array1<f64>,
+    threshold_initial_beta: f64,
+    log_sigma_initial_beta: f64,
+) -> (
+    BinomialLocationScaleFamily,
+    Vec<ParameterBlockSpec>,
+    Vec<usize>,
+    BlockwiseFitOptions,
+) {
+    let n = y.len();
+    let weights = Array1::from_elem(n, 1.0);
+    let thresholdspec = ParameterBlockSpec {
+        name: "threshold".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+            (n, 1),
+            1.0,
+        ))),
+        offset: Array1::zeros(n),
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![threshold_initial_beta]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let log_sigmaspec = ParameterBlockSpec {
+        name: "log_sigma".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+            (n, 1),
+            1.0,
+        ))),
+        offset: Array1::zeros(n),
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![log_sigma_initial_beta]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let threshold_design = thresholdspec.design.clone();
+    let log_sigma_design = log_sigmaspec.design.clone();
+    let family = BinomialLocationScaleFamily {
+        y,
+        weights,
+        link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
+        threshold_design: Some(threshold_design),
+        log_sigma_design: Some(log_sigma_design),
+        policy: crate::resource::ResourcePolicy::default_library(),
+    };
+    let specs = vec![thresholdspec, log_sigmaspec];
+    let penalty_counts = vec![1usize, 1usize];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        ridge_floor: 1e-10,
+        outer_max_iter: 1,
+        ..BlockwiseFitOptions::default()
+    };
+    (family, specs, penalty_counts, options)
+}
+
+#[test]
+fn outer_lamlgradient_diagonal_binomial_location_scale_matchesfd() {
+    let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+    let (family, specs, penalty_counts, options) =
+        binomial_location_scale_outer_fixture(y, 0.0, 0.0);
+    let rho = array![0.0, 0.0];
+
+    let (f0, g0, _) =
+        outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
+            .expect("objective/gradient");
+    assert!(f0.is_finite());
+    assert_eq!(g0.len(), rho.len());
+
+    let h = 1e-5;
+    for k in 0..rho.len() {
+        let mut rho_p = rho.clone();
+        let mut rho_m = rho.clone();
+        rho_p[k] += h;
+        rho_m[k] -= h;
+        let (fp, _, _) =
+            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho_p, None)
+                .expect("objective+");
+        let (fm, _, _) =
+            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho_m, None)
+                .expect("objective-");
+        let gfd = (fp - fm) / (2.0 * h);
+        let abs = (g0[k] - gfd).abs();
+        let rel = abs / gfd.abs().max(1e-8);
+        if abs >= 2e-3 {
+            assert_eq!(
+                g0[k].signum(),
+                gfd.signum(),
+                "outer diagonal LAML gradient sign mismatch at {}: analytic={} fd={}",
+                k,
+                g0[k],
+                gfd
+            );
+        }
+        assert!(
+            abs < 2e-3 || rel < 2e-3,
+            "outer diagonal LAML gradient mismatch at {}: analytic={} fd={} abs={} rel={}",
+            k,
+            g0[k],
+            gfd,
+            abs,
+            rel
+        );
+    }
+}
+
+#[test]
+fn outer_lamlgradient_diagonal_binomial_location_scale_hard_case_matchesfd() {
+    let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+    let (family, specs, penalty_counts, options) =
+        binomial_location_scale_outer_fixture(y, 0.2, -0.1);
+    let rho = array![0.15, -0.25];
+
+    let (f0, g0, _) =
+        outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
+            .expect("objective/gradient");
+    assert!(f0.is_finite());
+    assert_eq!(g0.len(), rho.len());
+
+    let h = 1e-5;
+    for k in 0..rho.len() {
+        let mut rho_p = rho.clone();
+        let mut rho_m = rho.clone();
+        rho_p[k] += h;
+        rho_m[k] -= h;
+        let (fp, _, _) =
+            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho_p, None)
+                .expect("objective+");
+        let (fm, _, _) =
+            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho_m, None)
+                .expect("objective-");
+        let gfd = (fp - fm) / (2.0 * h);
+        let abs = (g0[k] - gfd).abs();
+        let rel = abs / gfd.abs().max(1e-8);
+        if abs >= 2e-3 {
+            assert_eq!(
+                g0[k].signum(),
+                gfd.signum(),
+                "outer diagonal hard-case LAML gradient sign mismatch at {}: analytic={} fd={}",
+                k,
+                g0[k],
+                gfd
+            );
+        }
+        assert!(
+            abs < 2e-3 || rel < 2e-3,
+            "outer diagonal hard-case LAML gradient mismatch at {}: analytic={} fd={} abs={} rel={}",
+            k,
+            g0[k],
+            gfd,
+            abs,
+            rel
+        );
+    }
+}
+
+#[test]
+fn outer_lamlhessian_joint_exact_binomial_location_scale_matchesfd() {
+    // Asymmetric y (6 ones / 4 zeros). A balanced 5/5 vector forces
+    // β̂_threshold = 0 by probit-link symmetry, which makes the joint
+    // observed Hessian block-diagonal in (threshold, log_sigma) at the
+    // inner mode. The outer LAML Hessian off-diagonals are then ~1e-11,
+    // below the central-FD noise floor (≈ pirls_tol / h) at h=1e-5, so
+    // FD-vs-analytic agreement cannot be enforced. Asymmetric y gives
+    // β̂_threshold ≠ 0, coupling the (β_0, β_1) blocks through the
+    // observed-information weights and making all four entries validatable.
+    let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0]);
+    let (family, specs, penalty_counts, options) =
+        binomial_location_scale_outer_fixture(y, 0.15, -0.05);
+    let rho = array![0.1, -0.2];
+
+    let (_, _, h0_opt, _) = super::test_support::outerobjectivegradienthessian(
+        &family,
+        &specs,
+        &options,
+        &penalty_counts,
+        &rho,
+        None,
+        EvalMode::ValueGradientHessian,
+    )
+    .expect("objective/gradient/hessian");
+    let h0 = h0_opt.expect("analytic outer Hessian should be available");
+    assert_eq!(h0.nrows(), rho.len());
+    assert_eq!(h0.ncols(), rho.len());
+
+    let h = 1e-5;
+    for l in 0..rho.len() {
+        let mut rho_p = rho.clone();
+        let mut rho_m = rho.clone();
+        rho_p[l] += h;
+        rho_m[l] -= h;
+        let (_, gp, _, _) = super::test_support::outerobjectivegradienthessian(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &rho_p,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("objective/gradient +");
+        let (_, gm, _, _) = super::test_support::outerobjectivegradienthessian(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &rho_m,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("objective/gradient -");
+
+        for k in 0..rho.len() {
+            let hfd = (gp[k] - gm[k]) / (2.0 * h);
+            let abs_err = (h0[[k, l]] - hfd).abs();
+            let rel = (h0[[k, l]] - hfd).abs() / hfd.abs().max(1e-7);
+            if h0[[k, l]].abs().max(hfd.abs()) > 1e-10 {
+                assert_eq!(
+                    h0[[k, l]].signum(),
+                    hfd.signum(),
+                    "outer Hessian sign mismatch at ({k},{l}): analytic={} fd={}",
+                    h0[[k, l]],
+                    hfd
+                );
+            }
+            assert!(
+                abs_err < 1e-8 || rel < 2e-2,
+                "outer Hessian mismatch at ({k},{l}): analytic={} fd={} abs={} rel={}",
+                h0[[k, l]],
+                hfd,
+                abs_err,
+                rel
+            );
+        }
+    }
+
+    for i in 0..h0.nrows() {
+        for j in 0..i {
+            let asym = (h0[[i, j]] - h0[[j, i]]).abs();
+            assert!(
+                asym < 1e-8,
+                "outer Hessian not symmetric at ({i},{j}): {asym}"
+            );
+        }
+    }
+}
+
+#[test]
+fn block_solve_sparse_matches_dense() {
+    let x_dense = array![
+        [1.0, 0.0, 2.0],
+        [0.0, 3.0, 0.0],
+        [4.0, 0.0, 5.0],
+        [0.0, 6.0, 0.0]
+    ];
+    let y_star = array![1.0, -1.0, 0.5, 2.0];
+    let w = array![1.0, 0.5, 2.0, 1.5];
+    let s_lambda = Array2::<f64>::eye(3) * 0.1;
+
+    let mut triplets = Vec::new();
+    for i in 0..x_dense.nrows() {
+        for j in 0..x_dense.ncols() {
+            let v = x_dense[[i, j]];
+            if v != 0.0 {
+                triplets.push(Triplet::new(i, j, v));
+            }
+        }
+    }
+    let x_sparse = SparseColMat::try_new_from_triplets(4, 3, &triplets)
+        .expect("sparse matrix build should succeed");
+
+    let beta_dense = solve_blockweighted_system(
+        &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_dense.clone())),
+        &y_star,
+        &w,
+        &s_lambda,
+        1e-12,
+        RidgePolicy::explicit_stabilization_pospart(),
+    )
+    .expect("dense solve should succeed");
+
+    let beta_sparse = solve_blockweighted_system(
+        &DesignMatrix::from(x_sparse),
+        &y_star,
+        &w,
+        &s_lambda,
+        1e-12,
+        RidgePolicy::explicit_stabilization_pospart(),
+    )
+    .expect("sparse solve should succeed");
+
+    for j in 0..beta_dense.len() {
+        assert!(
+            (beta_dense[j] - beta_sparse[j]).abs() < 1e-10,
+            "dense/sparse mismatch at {}: {} vs {}",
+            j,
+            beta_dense[j],
+            beta_sparse[j]
+        );
+    }
+}
+
+#[test]
+fn outer_lamlhessian_joint_exact_binomial_location_scale_hard_case_matchesfd() {
+    let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+    let (family, specs, penalty_counts, options) =
+        binomial_location_scale_outer_fixture(y, 0.2, -0.1);
+    let rho = array![0.15, -0.25];
+
+    let (_, _, h0_opt, _) = super::test_support::outerobjectivegradienthessian(
+        &family,
+        &specs,
+        &options,
+        &penalty_counts,
+        &rho,
+        None,
+        EvalMode::ValueGradientHessian,
+    )
+    .expect("objective/gradient/hessian");
+    let h0 = h0_opt.expect("analytic outer Hessian should be available");
+    assert_eq!(h0.nrows(), rho.len());
+    assert_eq!(h0.ncols(), rho.len());
+
+    let h = 1e-5;
+    for l in 0..rho.len() {
+        let mut rho_p = rho.clone();
+        let mut rho_m = rho.clone();
+        rho_p[l] += h;
+        rho_m[l] -= h;
+        let (_, gp, _, _) = super::test_support::outerobjectivegradienthessian(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &rho_p,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("objective/gradient +");
+        let (_, gm, _, _) = super::test_support::outerobjectivegradienthessian(
+            &family,
+            &specs,
+            &options,
+            &penalty_counts,
+            &rho_m,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("objective/gradient -");
+
+        for k in 0..rho.len() {
+            let hfd = (gp[k] - gm[k]) / (2.0 * h);
+            let abs_err = (h0[[k, l]] - hfd).abs();
+            let rel = abs_err / hfd.abs().max(1e-7);
+            if h0[[k, l]].abs().max(hfd.abs()) > 1e-10 {
+                assert_eq!(
+                    h0[[k, l]].signum(),
+                    hfd.signum(),
+                    "hard-case outer Hessian sign mismatch at ({k},{l}): analytic={} fd={}",
+                    h0[[k, l]],
+                    hfd
+                );
+            }
+            assert!(
+                abs_err < 1e-8 || rel < 2e-2,
+                "hard-case outer Hessian mismatch at ({k},{l}): analytic={} fd={} abs={} rel={}",
+                h0[[k, l]],
+                hfd,
+                abs_err,
+                rel
+            );
+        }
+    }
+}
+
+#[test]
+fn block_solve_falls_backwhen_llt_rejects_indefinite_system() {
+    let x_dense = array![[1.0, 0.0], [0.0, 0.0]];
+    let y_star = array![2.0, 0.0];
+    let w = array![1.0, 1.0];
+    let s_lambda = array![[0.0, 0.0], [0.0, -1e-12]];
+
+    let beta = solve_blockweighted_system(
+        &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_dense)),
+        &y_star,
+        &w,
+        &s_lambda,
+        1e-12,
+        RidgePolicy::explicit_stabilization_pospart(),
+    )
+    .expect("fallback solve should succeed");
+
+    assert!(beta.iter().all(|v| v.is_finite()));
+    assert!(
+        (beta[0] - 2.0).abs() < 1e-10,
+        "unexpected solved coefficient"
+    );
+    assert!(
+        beta[1].abs() < 1e-8,
+        "null-space coefficient should stay near zero"
+    );
+}
+
+#[test]
+fn exact_newton_block_enforces_linear_constraints() {
+    let spec = ParameterBlockSpec {
+        name: "exact_block".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![1.5]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let family = OneBlockConstrainedExactFamily {
+        target: 0.0,
+        lower: 1.0,
+    };
+    let fit = fit_custom_family(&family, &[spec], &BlockwiseFitOptions::default())
+        .expect("constrained exact-newton fit");
+    let beta = fit.block_states[0].beta[0];
+    assert!(
+        (beta - 1.0).abs() < 1e-8,
+        "expected constrained optimum at lower bound, got {beta}"
+    );
+}
+
+#[test]
+fn extract_simple_lower_bounds_accepts_axis_aligned_rows() {
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]],
+        b: array![0.25, 1.0, 1.5],
+    };
+    let bounds = extract_simple_lower_bounds(&constraints, 2)
+        .expect("lower-bound extraction should succeed")
+        .expect("axis-aligned rows should map to lower bounds");
+    assert_relative_eq!(bounds.lower_bounds[0], 0.5, epsilon = 1e-12);
+    assert_relative_eq!(bounds.lower_bounds[1], 0.5, epsilon = 1e-12);
+    assert_eq!(bounds.coeff_to_row, vec![Some(2), Some(1)]);
+}
+
+#[test]
+fn extract_simple_lower_bounds_rejects_coupled_rows() {
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0, 1.0]],
+        b: array![0.0],
+    };
+    assert!(
+        extract_simple_lower_bounds(&constraints, 2)
+            .expect("lower-bound extraction should not error on valid shapes")
+            .is_none(),
+        "coupled rows must stay on the generic linear-constraint path"
+    );
+}
+
+#[test]
+fn constrained_exact_newton_indefinite_hessian_uses_stabilized_delta_solve() {
+    let spec = ParameterBlockSpec {
+        name: "exact_block".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![1.5]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let states = vec![ParameterBlockState {
+        beta: array![1.5],
+        eta: array![1.5],
+    }];
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0]],
+        b: array![1.0],
+    };
+    let hessian = SymmetricMatrix::Dense(array![[-1.0]]);
+    let updater = ExactNewtonBlockUpdater {
+        gradient: &array![-1.0],
+        hessian: &hessian,
+    };
+    let s_lambda = Array2::zeros((1, 1));
+    let update = updater
+        .compute_update_step(&BlockUpdateContext {
+            family: &OneBlockConstrainedIndefiniteHessianFamily,
+            states: &states,
+            spec: &spec,
+            block_idx: 0,
+            s_lambda: &s_lambda,
+            options: &BlockwiseFitOptions::default(),
+            linear_constraints: Some(&constraints),
+            cached_active_set: None,
+        })
+        .expect("indefinite constrained exact-newton update should be stabilized");
+    assert_relative_eq!(update.beta_new_raw[0], 1.0, epsilon = 1e-12);
+    assert_eq!(update.active_set, Some(vec![0]));
+}
+
+#[test]
+fn quadratic_linear_constraints_release_positive_kkt_systemmultiplier() {
+    // max ll with exact Newton equivalent to minimizing
+    // 0.5 * x^2 - rhs*x with rhs=1 under 0 <= x <= 0.1.
+    // At x=0, active-set KKT solve gives lambda_sys=+1 for the lower bound,
+    // which must be released (lambda_true = -lambda_sys).
+    let hessian = array![[1.0]];
+    let rhs = array![1.0];
+    let beta_start = array![0.0];
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0], [-1.0]],
+        b: array![0.0, -0.1],
+    };
+
+    let (beta, active) =
+        solve_quadratic_with_linear_constraints(&hessian, &rhs, &beta_start, &constraints, None)
+            .expect("constrained quadratic solve should succeed");
+
+    assert!(
+        (beta[0] - 0.1).abs() <= 1e-10,
+        "expected constrained optimum at upper bound 0.1, got {}",
+        beta[0]
+    );
+    assert_eq!(active.len(), 1);
+}
+
+#[test]
+fn quadratic_linear_constraints_ignore_near_tangential_inactiverows() {
+    let hessian = array![[1.0, 0.0], [0.0, 1.0]];
+    let rhs = array![1.0, 0.0];
+    let beta_start = array![0.0, 0.0];
+    let constraints = LinearInequalityConstraints {
+        a: array![[-1e-16, 1.0]],
+        b: array![-1.0],
+    };
+
+    let (beta, active) =
+        solve_quadratic_with_linear_constraints(&hessian, &rhs, &beta_start, &constraints, None)
+            .expect("near-tangential inactive row should not block the quadratic step");
+
+    assert!(
+        (beta[0] - 1.0).abs() <= 1e-12,
+        "expected unconstrained x-solution of 1.0, got {}",
+        beta[0]
+    );
+    assert!(
+        beta[1].abs() <= 1e-12,
+        "expected zero y-solution, got {}",
+        beta[1]
+    );
+    assert!(active.is_empty(), "no row should become active");
+}
+
+#[test]
+fn quadratic_linear_constraints_projectwarm_activerows_back_to_boundary() {
+    let hessian = array![[2.0]];
+    let rhs = array![0.0];
+    let beta_start = array![1e-9];
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0]],
+        b: array![0.0],
+    };
+
+    let (beta, active) = solve_quadratic_with_linear_constraints(
+        &hessian,
+        &rhs,
+        &beta_start,
+        &constraints,
+        Some(&[0]),
+    )
+    .expect("constrained quadratic solve should project back to the boundary");
+
+    assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
+    assert_eq!(active, vec![0]);
+}
+
+#[test]
+fn quadratic_linear_constraints_handles_near_dependent_rows() {
+    // Three constraints in R^2 where the third is nearly a linear
+    // combination of the first two, making the naive KKT system
+    // ill-conditioned.  The rank-reducing compression should drop
+    // the dependent row and the QP should converge cleanly.
+    //
+    //   x1 >= 0,  x2 >= 0,  x1 + x2 + eps >= 0   (eps ≈ 0)
+    //
+    // Minimize 0.5 * ||x - [−1, −1]||^2  =>  optimum at origin.
+    let hessian = Array2::eye(2);
+    let rhs = array![-1.0, -1.0]; // gradient points toward (−1,−1)
+    let beta_start = array![0.0, 0.0];
+    let eps = 1e-14;
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0, 0.0], [0.0, 1.0], [1.0 + eps, 1.0]],
+        b: array![0.0, 0.0, 0.0],
+    };
+
+    let (beta, active) = solve_quadratic_with_linear_constraints(
+        &hessian,
+        &rhs,
+        &beta_start,
+        &constraints,
+        Some(&[0, 1, 2]), // all three active
+    )
+    .expect("near-dependent constraint QP should converge");
+
+    assert!(
+        beta[0].abs() <= 1e-10 && beta[1].abs() <= 1e-10,
+        "expected optimum at origin, got ({}, {})",
+        beta[0],
+        beta[1]
+    );
+    assert!(
+        active.len() <= 2,
+        "at most 2 independent constraints should remain active, got {}",
+        active.len()
+    );
+}
+
+#[test]
+fn quadratic_linear_constraints_release_merged_constraint_group_by_id() {
+    // Two redundant lower-bound rows compress into one active KKT row.
+    // Releasing that merged row must drop both original constraint ids,
+    // not transient positions in the active vector.
+    let hessian = array![[1.0]];
+    let rhs = array![1.0];
+    let beta_start = array![0.0];
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0], [2.0], [-1.0]],
+        b: array![0.0, 0.0, -0.1],
+    };
+
+    let (beta, active) = solve_quadratic_with_linear_constraints(
+        &hessian,
+        &rhs,
+        &beta_start,
+        &constraints,
+        Some(&[0, 1]),
+    )
+    .expect("merged active constraint group should release cleanly");
+
+    assert!(
+        (beta[0] - 0.1).abs() <= 1e-10,
+        "expected constrained optimum at upper bound 0.1, got {}",
+        beta[0]
+    );
+    assert_eq!(active, vec![2]);
+}
+
+#[test]
+fn quadratic_linear_constraints_release_merged_group_with_unsorted_active_positions() {
+    let hessian = array![[1.0]];
+    let rhs = array![1.0];
+    let beta_start = array![0.0];
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0], [2.0], [-1.0]],
+        b: array![0.0, 0.0, -0.1],
+    };
+
+    let (beta, active) = solve_quadratic_with_linear_constraints(
+        &hessian,
+        &rhs,
+        &beta_start,
+        &constraints,
+        Some(&[2, 0, 1]),
+    )
+    .expect("merged active group release should handle unsorted active positions");
+
+    assert!(
+        (beta[0] - 0.1).abs() <= 1e-10,
+        "expected constrained optimum at upper bound 0.1, got {}",
+        beta[0]
+    );
+    assert_eq!(active, vec![2]);
+}
+
+#[test]
+fn quadratic_linear_constraints_accept_boundary_kkt_after_rank_reduction() {
+    let hessian = array![[2.0]];
+    let rhs = array![0.0];
+    let beta_start = array![1e-9];
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0], [1.0 + 1e-13], [2.0], [3.0]],
+        b: array![0.0, 0.0, 0.0, 0.0],
+    };
+
+    let (beta, active) = solve_quadratic_with_linear_constraints(
+        &hessian,
+        &rhs,
+        &beta_start,
+        &constraints,
+        Some(&[0, 1, 2, 3]),
+    )
+    .expect("degenerate boundary KKT point should be accepted");
+
+    assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
+    assert!(
+        active.len() <= 1,
+        "rank-reduced boundary solution should keep at most one representative, got {:?}",
+        active
+    );
+}
+
+#[test]
+fn quadratic_linear_constraints_singular_kkt_uses_pseudoinverse_fallback() {
+    let hessian = Array2::<f64>::zeros((2, 2));
+    let rhs = array![0.0, 0.0];
+    let beta_start = array![0.0, 0.0];
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0, 1.0]],
+        b: array![0.0],
+    };
+
+    let (beta, active) = solve_quadratic_with_linear_constraints(
+        &hessian,
+        &rhs,
+        &beta_start,
+        &constraints,
+        Some(&[0]),
+    )
+    .expect("singular KKT system should fall back to a finite pseudoinverse solve");
+
+    assert!(beta.iter().all(|value| value.is_finite()));
+    assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
+    assert_relative_eq!(beta[1], 0.0, epsilon = 1e-14);
+    assert_eq!(active, vec![0]);
+}
+
+#[test]
+fn rank_reduce_drops_exactly_dependent_row() {
+    // Row 3 = Row 1 + Row 2 exactly. Rank reduction should drop it.
+    let a = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],];
+    let b = array![0.0, 0.0, 0.0];
+    let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
+    let (a_out, b_out, member_constraint_ids_out, _) =
+        crate::solver::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
+            a,
+            b,
+            member_constraint_ids,
+        );
+    assert_eq!(
+        a_out.nrows(),
+        2,
+        "should keep 2 independent rows, got {}",
+        a_out.nrows()
+    );
+    assert_eq!(b_out.len(), 2);
+    // The third constraint id should have been merged into one of the first two rows.
+    let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
+    assert_eq!(
+        total_constraint_ids, 3,
+        "all original constraint ids must be preserved"
+    );
+}
+
+#[test]
+fn rank_reduce_preserves_full_rank_matrix() {
+    let a = array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0],];
+    let b = array![0.0, 0.0, 0.0];
+    let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
+    let (a_out, b_out, member_constraint_ids_out, _) =
+        crate::solver::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
+            a,
+            b,
+            member_constraint_ids,
+        );
+    // All three rows are independent in R^2 (but we only have rank 2).
+    // The first two span R^2, so row 3 = row 1 + row 2 is dependent.
+    assert_eq!(a_out.nrows(), 2);
+    assert_eq!(b_out.len(), 2);
+    let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
+    assert_eq!(total_constraint_ids, 3);
+}
+
+#[test]
+fn constrained_exact_newton_nan_hessian_returns_feasible_noop_instead_of_failing() {
+    let spec = ParameterBlockSpec {
+        name: "exact_block".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let states = vec![ParameterBlockState {
+        beta: array![0.0],
+        eta: array![0.0],
+    }];
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0]],
+        b: array![0.0],
+    };
+    let hessian = SymmetricMatrix::Dense(array![[f64::NAN]]);
+    let updater = ExactNewtonBlockUpdater {
+        gradient: &array![0.0],
+        hessian: &hessian,
+    };
+    let s_lambda = Array2::zeros((1, 1));
+    let update = updater
+        .compute_update_step(&BlockUpdateContext {
+            family: &OneBlockConstrainedNaNHessianFamily,
+            states: &states,
+            spec: &spec,
+            block_idx: 0,
+            s_lambda: &s_lambda,
+            options: &BlockwiseFitOptions::default(),
+            linear_constraints: Some(&constraints),
+            cached_active_set: None,
+        })
+        .expect("constrained exact-newton NaN Hessian should produce a no-op update");
+    assert_relative_eq!(update.beta_new_raw[0], 0.0, epsilon = 1e-14);
+    assert_eq!(update.active_set, Some(vec![0]));
+}
+
+#[test]
+fn outerobjective_failure_context_is_preserved() {
+    // One penalty forces the outer rho optimizer to run, which should now preserve
+    // the real evaluation error instead of returning an opaque line-search failure.
+    let spec = ParameterBlockSpec {
+        name: "err_block".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]])),
+        offset: array![0.0, 0.0],
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        outer_max_iter: 3,
+        ..BlockwiseFitOptions::default()
+    };
+    let err = match fit_custom_family(&OneBlockAlwaysErrorFamily, &[spec], &options) {
+        Ok(_) => panic!("fit should fail when family evaluate always errors"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains(
+            "last objective error: synthetic outer objective failure: block[0] evaluate()"
+        ),
+        "expected preserved root-cause context in error, got: {err}"
+    );
+}
+
+#[test]
+fn fit_fails_when_requested_covariance_cannot_be_computed() {
+    let spec = ParameterBlockSpec {
+        name: "cov_block".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]])),
+        offset: array![0.0, 0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        use_remlobjective: false,
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let err = match fit_custom_family(&OneBlockCovarianceErrorFamily, &[spec], &options) {
+        Ok(_) => panic!("fit should fail when covariance computation fails"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("synthetic covariance assembly failure"),
+        "expected covariance root cause in fit error, got: {err}"
+    );
+}
+
+// Exact analytic Hessians must be finite. Non-finite Hessians are rejected
+// loudly instead of being masked by a surrogate update.
+
+/// A QuadraticReml family whose log_sigma block returns a Hessian containing
+/// NaN, simulating what happens when exp(eta_sigma) overflows during
+/// location-scale fitting.
+#[derive(Clone)]
+struct TwoBlockNaNHessianFamily;
+
+impl CustomFamily for TwoBlockNaNHessianFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n0 = block_states[0].eta.len();
+        let p1 = block_states[1].beta.len();
+        // Block 0 (mu): well-behaved diagonal working set.
+        // Block 1 (log_sigma): ExactNewton with NaN in the Hessian,
+        // simulating overflow from extreme coefficients.
+        let mut hessian = Array2::<f64>::eye(p1);
+        hessian[[0, 0]] = f64::NAN; // overflow poison
+        Ok(FamilyEvaluation {
+            log_likelihood: -0.5 * block_states[0].eta.iter().map(|&v| v * v).sum::<f64>(),
+            blockworking_sets: vec![
+                BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n0),
+                    working_weights: Array1::ones(n0),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: Array1::zeros(p1),
+                    hessian: SymmetricMatrix::Dense(hessian),
+                },
+            ],
+        })
+    }
+}
+
+/// Same two-block layout but with finite Hessians — the control group.
+#[derive(Clone)]
+struct TwoBlockFiniteHessianFamily;
+
+impl CustomFamily for TwoBlockFiniteHessianFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n0 = block_states[0].eta.len();
+        let p1 = block_states[1].beta.len();
+        let beta1 = &block_states[1].beta;
+        let resid1: f64 = beta1.iter().map(|&b| b * b).sum();
+        Ok(FamilyEvaluation {
+            log_likelihood: -0.5 * block_states[0].eta.iter().map(|&v| v * v).sum::<f64>()
+                - 0.5 * resid1,
+            blockworking_sets: vec![
+                BlockWorkingSet::Diagonal {
+                    working_response: Array1::zeros(n0),
+                    working_weights: Array1::ones(n0),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: -beta1.clone(),
+                    hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                },
+            ],
+        })
+    }
+}
+
+/// Same NaN-Hessian family but with PseudoLaplace objective, which takes
+/// the strict-SPD path and skips the eigendecomposition in compute_update_step.
+#[derive(Clone)]
+struct TwoBlockNaNHessianPseudoLaplaceFamily;
+
+impl CustomFamily for TwoBlockNaNHessianPseudoLaplaceFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        TwoBlockNaNHessianFamily.evaluate(block_states)
+    }
+
+    fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+        ExactNewtonOuterObjective::StrictPseudoLaplace
+    }
+}
+
+fn make_two_block_specs(n: usize) -> Vec<ParameterBlockSpec> {
+    vec![
+        ParameterBlockSpec {
+            name: "mu".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 1),
+                1.0,
+            ))),
+            offset: Array1::zeros(n),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
             stacked_design: None,
             stacked_offset: None,
-        };
+        },
+        ParameterBlockSpec {
+            name: "log_sigma".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, 2),
+                1.0,
+            ))),
+            offset: Array1::zeros(n),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0, 0.0]),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        },
+    ]
+}
 
-        let err = fit_custom_family(
-            &OneBlockIdentityFamily,
-            &[spec],
-            &BlockwiseFitOptions::default(),
-        )
-        .expect_err("invalid block spec should return a typed error");
-        let message = err.to_string();
-        assert!(
-            message.contains("block 0 penalty 0 must be 1x1, got 2x2"),
-            "unexpected error: {message}",
-        );
-    }
+#[test]
+fn exact_newton_nan_hessian_fails_loudly_before_eigendecomposition() {
+    // Exact Newton Hessians are part of the mathematical contract.  A
+    // NaN in a block Hessian means the family derivative is invalid; we
+    // should reject it at the logdet boundary instead of hiding it behind
+    // a conservative eigendecomposition fallback.
+    let specs = make_two_block_specs(4);
+    let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let result = inner_blockwise_fit(
+        &TwoBlockNaNHessianFamily,
+        &specs,
+        &per_block_log_lambdas,
+        &options,
+        None,
+    );
+    let err = result.expect_err("NaN exact Hessian must fail loudly");
+    assert!(
+        err.contains("smooth-regularized logdet Hessian contains non-finite entry"),
+        "expected explicit non-finite Hessian error, got: {err}"
+    );
+}
 
+#[test]
+fn exact_newton_finite_hessian_succeeds_where_nan_hessian_fails() {
+    // SUFFICIENCY (control): The identical two-block structure with a
+    // finite Hessian succeeds, proving that NaN in the Hessian is the
+    // specific trigger — not the block layout, penalty structure, or
+    // solver configuration.
+    let specs = make_two_block_specs(4);
+    let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let result = inner_blockwise_fit(
+        &TwoBlockFiniteHessianFamily,
+        &specs,
+        &per_block_log_lambdas,
+        &options,
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "inner fit should succeed with finite Hessian: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn checked_penalizedobjective_rejects_non_finite_values() {
+    let err = checked_penalizedobjective(-1.0, 0.5, f64::NAN, "test objective")
+        .expect_err("non-finite objective should fail loudly");
+    assert!(
+        err.contains("non-finite penalized objective"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn exact_newton_dh_closure_rejects_non_finite_directional_derivative() {
     #[derive(Clone)]
-    struct OneBlockGaussianFamily {
-        y: Array1<f64>,
-    }
+    struct OneBlockNonFiniteJointDhFamily;
 
-    impl CustomFamily for OneBlockGaussianFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let eta = &block_states[0].eta;
-            let resid = eta - &self.y;
-            let ll = -0.5 * resid.dot(&resid);
-            Ok(FamilyEvaluation {
-                log_likelihood: ll,
-                blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                    working_response: self.y.clone(),
-                    working_weights: Array1::ones(self.y.len()),
-                }],
-            })
-        }
-
-        fn diagonalworking_weights_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            idx: usize,
-            d_eta: &Array1<f64>,
-        ) -> Result<Option<Array1<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(idx < usize::MAX);
-            Ok(Some(Array1::zeros(d_eta.len())))
-        }
-
-        fn diagonalworking_weights_second_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            idx: usize,
-            d_eta_u: &Array1<f64>,
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array1<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(idx < usize::MAX);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(Array1::zeros(d_eta_u.len())))
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockConstrainedExactFamily {
-        target: f64,
-        lower: f64,
-    }
-
-    impl CustomFamily for OneBlockConstrainedExactFamily {
+    impl CustomFamily for OneBlockNonFiniteJointDhFamily {
         fn evaluate(
             &self,
             block_states: &[ParameterBlockState],
@@ -3075,516 +5922,14 @@
                 .first()
                 .ok_or_else(|| "missing block 0".to_string())?
                 .beta
-                .first()
-                .copied()
-                .ok_or_else(|| "missing coefficient".to_string())?;
-            let g = self.target - beta;
-            let ll = -0.5 * (beta - self.target) * (beta - self.target);
+                .clone();
             Ok(FamilyEvaluation {
-                log_likelihood: ll,
+                log_likelihood: -0.5 * beta.dot(&beta),
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![g],
+                    gradient: beta.mapv(|v| -v),
                     hessian: SymmetricMatrix::Dense(array![[1.0]]),
                 }],
             })
-        }
-
-        fn block_linear_constraints(
-            &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            block_spec: &ParameterBlockSpec,
-        ) -> Result<Option<LinearInequalityConstraints>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(!block_spec.name.is_empty());
-            if block_idx != 0 {
-                return Ok(None);
-            }
-            Ok(Some(LinearInequalityConstraints {
-                a: array![[1.0]],
-                b: array![self.lower],
-            }))
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockConstrainedNaNHessianFamily;
-
-    impl CustomFamily for OneBlockConstrainedNaNHessianFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![0.0],
-                    hessian: SymmetricMatrix::Dense(array![[f64::NAN]]),
-                }],
-            })
-        }
-
-        fn block_linear_constraints(
-            &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            block_spec: &ParameterBlockSpec,
-        ) -> Result<Option<LinearInequalityConstraints>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(!block_spec.name.is_empty());
-            if block_idx != 0 {
-                return Ok(None);
-            }
-            Ok(Some(LinearInequalityConstraints {
-                a: array![[1.0]],
-                b: array![0.0],
-            }))
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockConstrainedIndefiniteHessianFamily;
-
-    impl CustomFamily for OneBlockConstrainedIndefiniteHessianFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![-1.0],
-                    hessian: SymmetricMatrix::Dense(array![[-1.0]]),
-                }],
-            })
-        }
-
-        fn block_linear_constraints(
-            &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            block_spec: &ParameterBlockSpec,
-        ) -> Result<Option<LinearInequalityConstraints>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(!block_spec.name.is_empty());
-            if block_idx != 0 {
-                return Ok(None);
-            }
-            Ok(Some(LinearInequalityConstraints {
-                a: array![[1.0]],
-                b: array![1.0],
-            }))
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockLinearLikelihoodExactFamily {
-        score: f64,
-    }
-
-    impl CustomFamily for OneBlockLinearLikelihoodExactFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let beta = block_states
-                .first()
-                .ok_or_else(|| "missing block 0".to_string())?
-                .beta
-                .first()
-                .copied()
-                .ok_or_else(|| "missing coefficient".to_string())?;
-            Ok(FamilyEvaluation {
-                log_likelihood: self.score * beta,
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![self.score],
-                    hessian: SymmetricMatrix::Dense(array![[0.0]]),
-                }],
-            })
-        }
-    }
-
-    #[derive(Clone)]
-    struct PreferJointExactFamily;
-
-    impl CustomFamily for PreferJointExactFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![0.0],
-                    hessian: SymmetricMatrix::Dense(array![[2.0]]),
-                }],
-            })
-        }
-
-        fn exact_newton_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            idx: usize,
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(idx < usize::MAX);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Err(
-                "blockwise exact-newton path should not be used when joint path is available"
-                    .to_string(),
-            )
-        }
-
-        fn exact_newton_joint_hessian(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(Some(array![[2.0]]))
-        }
-
-        fn exact_newton_joint_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(array![[0.0]]))
-        }
-    }
-
-    #[derive(Clone)]
-    struct TwoBlockJointConstrainedFamily {
-        coupling: f64,
-    }
-
-    impl CustomFamily for TwoBlockJointConstrainedFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let beta0 = block_states[0].beta[0];
-            let beta1 = block_states[1].beta[0];
-            let g0 = 1.0 - beta0 - self.coupling * beta1;
-            let g1 = 1.0 - beta1 - self.coupling * beta0;
-            Ok(FamilyEvaluation {
-                log_likelihood: -0.5
-                    * (beta0 * beta0 + beta1 * beta1 + 2.0 * self.coupling * beta0 * beta1)
-                    + beta0
-                    + beta1,
-                blockworking_sets: vec![
-                    BlockWorkingSet::ExactNewton {
-                        gradient: array![g0],
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: array![g1],
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    },
-                ],
-            })
-        }
-
-        fn exact_newton_joint_hessian(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(Some(array![[1.0, self.coupling], [self.coupling, 1.0]]))
-        }
-
-        fn exact_newton_joint_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(Array2::zeros((2, 2))))
-        }
-
-        fn block_linear_constraints(
-            &self,
-            block_states: &[ParameterBlockState],
-            block_idx: usize,
-            block_spec: &ParameterBlockSpec,
-        ) -> Result<Option<LinearInequalityConstraints>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(!block_spec.name.is_empty());
-            if block_idx >= 2 {
-                return Ok(None);
-            }
-            Ok(Some(LinearInequalityConstraints {
-                a: array![[1.0]],
-                b: array![0.0],
-            }))
-        }
-    }
-
-    #[derive(Clone)]
-    struct TwoBlockPersistentGradientFamily;
-
-    impl CustomFamily for TwoBlockPersistentGradientFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let beta0 = block_states[0].beta[0];
-            let beta1 = block_states[1].beta[0];
-            Ok(FamilyEvaluation {
-                log_likelihood: beta0 + beta1,
-                blockworking_sets: vec![
-                    BlockWorkingSet::ExactNewton {
-                        gradient: array![1.0],
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: array![1.0],
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    },
-                ],
-            })
-        }
-
-        fn exact_newton_joint_hessian(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(Some(array![[1.0, 0.25], [0.25, 1.0]]))
-        }
-
-        fn exact_newton_joint_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(Array2::zeros((2, 2))))
-        }
-
-        fn has_explicit_joint_hessian(&self) -> bool {
-            true
-        }
-    }
-
-    /// gam#1088 fixture. A coupled two-block family whose joint Hessian carries
-    /// a `NaN` curvature entry — the degenerate-curvature signature seen in the
-    /// link-wiggle and location-scale benchmark timeouts (a collapsed/`0÷0` row
-    /// weight assembling into `XᵀWX`). The penalized Hessian `H_pen = H + S(λ)`
-    /// and its spectrum then degrade to `NaN`, so the KKT certificate is
-    /// structurally unreachable. The non-finite-curvature guard must detect
-    /// this at the head of the cycle and exit far below the budget, instead of
-    /// grinding the full `inner_max_cycles`.
-    #[derive(Clone)]
-    struct TwoBlockNonFiniteCurvatureFamily;
-
-    impl CustomFamily for TwoBlockNonFiniteCurvatureFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let beta0 = block_states[0].beta[0];
-            let beta1 = block_states[1].beta[0];
-            Ok(FamilyEvaluation {
-                log_likelihood: beta0 + beta1,
-                blockworking_sets: vec![
-                    BlockWorkingSet::ExactNewton {
-                        gradient: array![1.0],
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: array![1.0],
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    },
-                ],
-            })
-        }
-
-        fn exact_newton_joint_hessian(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            // A finite, symmetric, otherwise-PD curvature with a single NaN
-            // diagonal entry: exactly the degenerate `H_pen` spectrum the guard
-            // exists to catch (a real collapsed-weight curvature defect).
-            Ok(Some(array![[f64::NAN, 0.25], [0.25, 1.0]]))
-        }
-
-        fn exact_newton_joint_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(Array2::zeros((2, 2))))
-        }
-
-        fn has_explicit_joint_hessian(&self) -> bool {
-            true
-        }
-    }
-
-    #[derive(Clone)]
-    struct TwoBlockJointSurrogateFamily;
-
-    impl CustomFamily for TwoBlockJointSurrogateFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let n0 = block_states
-                .first()
-                .ok_or_else(|| "missing block 0".to_string())?
-                .eta
-                .len();
-            let n1 = block_states
-                .get(1)
-                .ok_or_else(|| "missing block 1".to_string())?
-                .eta
-                .len();
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![
-                    BlockWorkingSet::Diagonal {
-                        working_response: Array1::zeros(n0),
-                        working_weights: Array1::ones(n0),
-                    },
-                    BlockWorkingSet::Diagonal {
-                        working_response: Array1::zeros(n1),
-                        working_weights: Array1::ones(n1),
-                    },
-                ],
-            })
-        }
-
-        fn exact_newton_joint_hessian_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-            Ok(Some(Array2::eye(p)))
-        }
-
-        fn exact_newton_joint_hessian_directional_derivative_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-            Ok(Some(Array2::zeros((p, p))))
-        }
-
-        fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            specs: &[ParameterBlockSpec],
-            arr: &Array1<f64>,
-            arr2: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            assert!(arr2.iter().all(|v| !v.is_nan()));
-            let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-            Ok(Some(Array2::zeros((p, p))))
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockPseudoLaplaceExactFamily {
-        target: f64,
-    }
-
-    impl CustomFamily for OneBlockPseudoLaplaceExactFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let beta = block_states
-                .first()
-                .ok_or_else(|| "missing block 0".to_string())?
-                .beta
-                .first()
-                .copied()
-                .ok_or_else(|| "missing coefficient".to_string())?;
-            let resid = beta - self.target;
-            Ok(FamilyEvaluation {
-                log_likelihood: -resid * resid,
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![-2.0 * resid],
-                    hessian: SymmetricMatrix::Dense(array![[2.0]]),
-                }],
-            })
-        }
-
-        fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::StrictPseudoLaplace
-        }
-
-        fn exact_newton_joint_hessian(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(Some(array![[2.0]]))
-        }
-
-        fn exact_newton_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            idx: usize,
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(idx < usize::MAX);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(array![[0.0]]))
-        }
-
-        fn exact_newton_joint_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(array![[0.0]]))
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockExactPsiHookFamily;
-
-    impl CustomFamily for OneBlockExactPsiHookFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![0.0],
-                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                }],
-            })
-        }
-
-        fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::StrictPseudoLaplace
         }
 
         fn exact_newton_joint_hessian(
@@ -3595,18 +5940,6 @@
             Ok(Some(array![[1.0]]))
         }
 
-        fn exact_newton_hessian_directional_derivative(
-            &self,
-            block_states: &[ParameterBlockState],
-            idx: usize,
-            arr: &Array1<f64>,
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(idx < usize::MAX);
-            assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(array![[0.0]]))
-        }
-
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
             block_states: &[ParameterBlockState],
@@ -3614,1538 +5947,85 @@
         ) -> Result<Option<Array2<f64>>, String> {
             assert!(block_states.len() <= isize::MAX as usize);
             assert!(arr.iter().all(|v| !v.is_nan()));
-            Ok(Some(array![[0.0]]))
-        }
-
-        fn exact_newton_joint_psi_terms(
-            &self,
-            block_states: &[ParameterBlockState],
-            block_specs: &[ParameterBlockSpec],
-            derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-            idx: usize,
-        ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(block_specs.len() <= isize::MAX as usize);
-            assert!(derivative_blocks.len() <= isize::MAX as usize);
-            assert!(idx < usize::MAX);
-            Ok(Some(ExactNewtonJointPsiTerms {
-                objective_psi: 3.5,
-                score_psi: array![0.0],
-                hessian_psi: array![[0.0]],
-                hessian_psi_operator: None,
-            }))
+            Ok(Some(array![[f64::NAN]]))
         }
     }
 
-    #[derive(Clone)]
-    struct OneBlockIndefinitePseudoLaplaceFamily;
+    let family = OneBlockNonFiniteJointDhFamily;
+    let specs = vec![ParameterBlockSpec {
+        name: "beta".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+            (2, 1),
+            1.0,
+        ))),
+        offset: Array1::zeros(2),
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let states = vec![ParameterBlockState {
+        beta: array![0.0],
+        eta: Array1::zeros(2),
+    }];
+    let synced_states = Arc::new(
+        synchronized_states_from_flat_beta(&family, &specs, &states, &array![0.0])
+            .expect("sync states for exact_newton_dh_closure"),
+    );
+    let compute_dh = exact_newton_dh_closure(&family, synced_states, &specs, 1, false, 1.0, None);
+    let err = compute_dh(&array![1.0]).expect_err("non-finite dH should fail loudly");
+    assert!(err.contains("non-finite"), "unexpected error: {err}");
+}
 
-    impl CustomFamily for OneBlockIndefinitePseudoLaplaceFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient: array![0.0],
-                    hessian: SymmetricMatrix::Dense(array![[-1.0]]),
-                }],
-            })
+#[test]
+fn nan_propagating_min_detects_nan_eigenvalues() {
+    // Verify the fix: our NaN-propagating min correctly detects
+    // NaN eigenvalues, unlike f64::min which silently ignored them.
+    let mut mat = Array2::<f64>::eye(3);
+    mat[[1, 0]] = f64::NAN;
+    mat[[0, 1]] = f64::NAN;
+
+    use crate::faer_ndarray::FaerEigh;
+    match FaerEigh::eigh(&mat, faer::Side::Lower) {
+        Err(_) => {
+            // eigh failed — the fallback chain in compute_update_step
+            // now catches this and applies a conservative ridge.
         }
-
-        fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::StrictPseudoLaplace
-        }
-
-        fn exact_newton_joint_hessian(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(Some(array![[-1.0]]))
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockNearlySymmetricPseudoLaplaceFamily;
-
-    impl CustomFamily for OneBlockNearlySymmetricPseudoLaplaceFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let beta = block_states
-                .first()
-                .ok_or_else(|| "missing block 0".to_string())?
-                .beta
-                .clone();
-            let h = array![[2.0, 0.1], [3.0, 2.0]];
-            let gradient = -h.dot(&beta);
-            Ok(FamilyEvaluation {
-                log_likelihood: -0.5 * beta.dot(&h.dot(&beta)),
-                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                    gradient,
-                    hessian: SymmetricMatrix::Dense(h),
-                }],
-            })
-        }
-
-        fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::StrictPseudoLaplace
-        }
-
-        fn exact_newton_joint_hessian(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Ok(Some(array![[2.0, 0.1], [3.0, 2.0]]))
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockAlwaysErrorFamily;
-
-    impl CustomFamily for OneBlockAlwaysErrorFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            Err("synthetic outer objective failure: block[0] evaluate()".to_string())
-        }
-    }
-
-    #[derive(Clone)]
-    struct OneBlockCovarianceErrorFamily;
-
-    impl CustomFamily for OneBlockCovarianceErrorFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let n = block_states[0].eta.len();
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![BlockWorkingSet::Diagonal {
-                    working_response: Array1::zeros(n),
-                    working_weights: Array1::ones(n),
-                }],
-            })
-        }
-
-        fn exact_newton_joint_hessian_with_specs(
-            &self,
-            block_states: &[ParameterBlockState],
-            block_specs: &[ParameterBlockSpec],
-        ) -> Result<Option<Array2<f64>>, String> {
-            assert!(block_states.len() <= isize::MAX as usize);
-            assert!(block_specs.len() <= isize::MAX as usize);
-            Err("synthetic covariance assembly failure".to_string())
-        }
-    }
-
-    #[test]
-    fn effectiveridge_is_never_below_solver_floor() {
-        assert!((effective_solverridge(0.0) - 1e-15).abs() < 1e-30);
-        assert!((effective_solverridge(1e-8) - 1e-8).abs() < 1e-20);
-    }
-
-    #[test]
-    fn objective_includes_solverridge_quadratic_term() {
-        // One-parameter block with X=1, y*=1, w=1, no explicit penalties.
-        // Inner solve gives beta = 1 / (1 + ridge), so objective should include
-        // 0.5 * ridge * beta^2 even when no smoothing penalties are present.
-        let spec = ParameterBlockSpec {
-            name: "b0".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            inner_tol: 0.0,
-            outer_max_iter: 1,
-            outer_tol: 1e-8,
-            minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
-            ridge_floor: 1e-4,
-            ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
-            use_remlobjective: false,
-            compute_covariance: false,
-            use_outer_hessian: false,
-            screening_max_inner_iterations: None,
-            outer_inner_max_iterations: None,
-            seed_screening: false,
-            early_exit_threshold: None,
-            outer_score_subsample: None,
-            auto_outer_subsample: false,
-            outer_eval_context: None,
-            cache_session: None,
-            cache_mirror_sessions: Vec::new(),
-            joint_penalties: None,
-            screen_initial_rho: true,
-        };
-
-        let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
-            .expect("custom family fit should succeed");
-        let ridge = effective_solverridge(options.ridge_floor);
-        let beta = result.block_states[0].beta[0];
-        let expected_penalty = 0.5 * ridge * beta * beta;
-        assert!(
-            (result.penalized_objective - expected_penalty).abs() < 1e-12,
-            "penalized objective should equal ridge quadratic term when ll=0 and S=0; got {}, expected {}",
-            result.penalized_objective,
-            expected_penalty
-        );
-    }
-
-    #[test]
-    fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() {
-        let family = OneBlockGaussianFamily { y: array![1.0] };
-        let spec = ParameterBlockSpec {
-            name: "b0".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![10.0_f64.ln()],
-            initial_beta: Some(array![1.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 20,
-            inner_tol: 1e-10,
-            outer_max_iter: 1,
-            outer_tol: 1e-8,
-            minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
-            ridge_floor: 0.0,
-            ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
-            use_remlobjective: false,
-            compute_covariance: false,
-            use_outer_hessian: false,
-            screening_max_inner_iterations: None,
-            outer_inner_max_iterations: None,
-            seed_screening: false,
-            early_exit_threshold: None,
-            outer_score_subsample: None,
-            auto_outer_subsample: false,
-            outer_eval_context: None,
-            cache_session: None,
-            cache_mirror_sessions: Vec::new(),
-            joint_penalties: None,
-            screen_initial_rho: true,
-        };
-        let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
-        let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
-            .expect("inner blockwise fit should succeed");
-
-        let beta = inner.block_states[0].beta[0];
-        assert!(
-            beta < 0.5,
-            "beta should shrink toward penalized mode; got {}",
-            beta
-        );
-        assert!(
-            inner.log_likelihood < -1e-8,
-            "raw log-likelihood should drop for this strongly penalized move; got {}",
-            inner.log_likelihood
-        );
-    }
-
-    #[test]
-    fn exact_newton_backtracking_descent_includes_explicit_ridge() {
-        let family = OneBlockLinearLikelihoodExactFamily { score: 0.5 };
-        let spec = ParameterBlockSpec {
-            name: "b0".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![1.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            inner_tol: 0.0,
-            outer_max_iter: 1,
-            outer_tol: 1e-8,
-            minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
-            ridge_floor: 1.0,
-            ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
-            use_remlobjective: false,
-            compute_covariance: false,
-            use_outer_hessian: false,
-            screening_max_inner_iterations: None,
-            outer_inner_max_iterations: None,
-            seed_screening: false,
-            early_exit_threshold: None,
-            outer_score_subsample: None,
-            auto_outer_subsample: false,
-            outer_eval_context: None,
-            cache_session: None,
-            cache_mirror_sessions: Vec::new(),
-            joint_penalties: None,
-            screen_initial_rho: true,
-        };
-        let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
-            .expect("inner blockwise fit should succeed");
-
-        let beta = inner.block_states[0].beta[0];
-        let objective = -inner.log_likelihood + inner.penalty_value;
-        assert!(
-            beta < 1.0 - 1e-12,
-            "ridge-aware fallback descent should shrink beta after rejecting the uphill Newton step; got {}",
-            beta
-        );
-        assert!(
-            objective < -1e-12,
-            "accepted fallback step should lower the penalized objective; got {}",
-            objective
-        );
-    }
-
-    #[test]
-    fn outergradient_matches_finite_difference_for_one_block() {
-        let n = 8usize;
-        let y = Array1::from_vec(vec![0.4, -0.2, 0.8, 1.0, -0.5, 0.3, 0.1, -0.7]);
-        let spec = ParameterBlockSpec {
-            name: "b0".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.2],
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            ..BlockwiseFitOptions::default()
-        };
-        let penalty_counts = vec![1usize];
-        let rho = array![0.1];
-        let (f0, g0, _) = outerobjective_andgradient(
-            &OneBlockGaussianFamily { y: y.clone() },
-            std::slice::from_ref(&spec),
-            &options,
-            &penalty_counts,
-            &rho,
-            None,
-        )
-        .expect("objective/gradient");
-
-        let h = 1e-5;
-        let rho_p = array![rho[0] + h];
-        let rho_m = array![rho[0] - h];
-        let (fp, _, _) = outerobjective_andgradient(
-            &OneBlockGaussianFamily { y: y.clone() },
-            std::slice::from_ref(&spec),
-            &options,
-            &penalty_counts,
-            &rho_p,
-            None,
-        )
-        .expect("objective+");
-        let (fm, _, _) = outerobjective_andgradient(
-            &OneBlockGaussianFamily { y },
-            std::slice::from_ref(&spec),
-            &options,
-            &penalty_counts,
-            &rho_m,
-            None,
-        )
-        .expect("objective-");
-        let gfd = (fp - fm) / (2.0 * h);
-        let rel = (g0[0] - gfd).abs() / gfd.abs().max(1e-8);
-
-        assert!(f0.is_finite());
-        assert_eq!(
-            g0[0].signum(),
-            gfd.signum(),
-            "outer gradient sign mismatch: analytic={} fd={}",
-            g0[0],
-            gfd
-        );
-        assert!(
-            rel < 5e-3,
-            "outer gradient mismatch: analytic={} fd={} rel={}",
-            g0[0],
-            gfd,
-            rel
-        );
-    }
-
-    #[test]
-    fn outergradient_prefers_joint_exact_pathwhen_available() {
-        let spec = ParameterBlockSpec {
-            name: "joint_exact".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            ..BlockwiseFitOptions::default()
-        };
-        let penalty_counts = vec![1usize];
-        let rho = array![0.0];
-
-        let result = outerobjective_andgradient(
-            &PreferJointExactFamily,
-            std::slice::from_ref(&spec),
-            &options,
-            &penalty_counts,
-            &rho,
-            None,
-        );
-        assert!(
-            result.is_ok(),
-            "joint exact path should be preferred over blockwise fallback: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn innerfit_uses_joint_exact_path_for_multiblock_constraints() {
-        let spec0 = ParameterBlockSpec {
-            name: "block0".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let spec1 = ParameterBlockSpec {
-            name: "block1".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            inner_tol: 1e-10,
-            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
-            ..BlockwiseFitOptions::default()
-        };
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-
-        let result = inner_blockwise_fit(
-            &TwoBlockJointConstrainedFamily { coupling: 0.25 },
-            &[spec0, spec1],
-            &per_block,
-            &options,
-            None,
-        )
-        .expect("joint constrained inner fit should succeed");
-
-        assert!(
-            result.converged,
-            "joint constrained inner fit should converge in one cycle"
-        );
-        assert_eq!(result.cycles, 1);
-        assert!((result.block_states[0].beta[0] - 0.8).abs() < 1e-8);
-        assert!((result.block_states[1].beta[0] - 0.8).abs() < 1e-8);
-        assert_eq!(result.active_sets, vec![None, None]);
-    }
-
-    #[test]
-    fn joint_newton_budget_exhaustion_refuses_coupled_exact_inner() {
-        let spec0 = ParameterBlockSpec {
-            name: "block0".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let spec1 = ParameterBlockSpec {
-            name: "block1".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            inner_tol: 1e-12,
-            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
-            ..BlockwiseFitOptions::default()
-        };
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-
-        let err = inner_blockwise_fit(
-            &TwoBlockPersistentGradientFamily,
-            &[spec0, spec1],
-            &per_block,
-            &options,
-            None,
-        )
-        .expect_err("coupled exact-joint max-budget exhaustion must fail loudly");
-        assert!(
-            err.contains("exhausted the joint Newton budget without KKT convergence"),
-            "budget exhaustion should be named explicitly: {err}"
-        );
-        assert!(
-            err.contains("block_residual_inf"),
-            "error should carry per-block residual diagnostics: {err}"
-        );
-    }
-
-    /// gam#1088 regression. A `NaN` in the joint Hessian curvature makes
-    /// `H_pen = H + S(λ)` and its spectrum degenerate, so the KKT certificate
-    /// can never be issued. Without the non-finite-curvature guard the coupled
-    /// joint-Newton loop runs to the full `inner_max_cycles` ceiling (1200 in
-    /// production) on every outer ρ-eval, which is the multi-hour benchmark
-    /// timeout. The guard must detect the degenerate curvature at the head of
-    /// the cycle and exit FAR below the ceiling — at cycle 0 — as a non-
-    /// converged, structured non-budget exit so the outer optimizer rejects
-    /// the ρ-evaluation cleanly.
-    #[test]
-    fn non_finite_curvature_exits_joint_newton_far_below_budget() {
-        let spec0 = ParameterBlockSpec {
-            name: "block0".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let spec1 = ParameterBlockSpec {
-            name: "block1".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        // The PRODUCTION ceiling: the bug is that all 1200 cycles are burned.
-        // The guard must make the solve exit immediately regardless of how
-        // large the budget is, so we set the real ceiling here and prove the
-        // exit does not depend on a small budget.
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
-            inner_tol: 1e-12,
-            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
-            ..BlockwiseFitOptions::default()
-        };
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-
-        let err = inner_blockwise_fit(
-            &TwoBlockNonFiniteCurvatureFamily,
-            &[spec0, spec1],
-            &per_block,
-            &options,
-            None,
-        )
-        .expect_err("a non-finite joint Hessian must fail the coupled exact-joint inner solve");
-        // The exit is via the structured "exited the joint Newton path before
-        // convergence" branch (an immediate early break), NOT the budget-
-        // exhaustion branch — proving the loop did not grind to the ceiling.
-        assert!(
-            err.contains("exited the joint Newton path before convergence"),
-            "non-finite curvature must take the early structured exit, not the \
-             budget path: {err}"
-        );
-        assert!(
-            !err.contains("exhausted the joint Newton budget"),
-            "non-finite curvature must NOT consume the joint Newton budget: {err}"
-        );
-    }
-
-    /// gam#787 binary matern centers=12 regression. Near a flat-objective
-    /// optimum the joint-Newton proposal shrinks to the step-tol floor while
-    /// `predicted_reduction = rhs·δ − ½δᵀHδ` becomes round-off-signed. The
-    /// `predicted_reduction ≤ 0` branch must NOT fire the preconditioned-descent
-    /// substitution there (it would replace the tiny KKT-polishing step with an
-    /// objective-descent step that catapults the residual off the near-converged
-    /// iterate). `joint_proposal_at_step_floor` is the suppression gate.
-    #[test]
-    fn joint_proposal_at_step_floor_suppresses_descent_substitution_near_optimum() {
-        // The exact c12 cycle-10 operating point: proposal_inf=1.413e-5,
-        // step_tol=1.355e-5 (proposal a hair = 1.04× above tol). The iterate is
-        // polishing KKT, so a pred≤0 here is round-off — the gate must fire.
-        assert!(
-            joint_proposal_at_step_floor(1.413e-5, 1.355e-5),
-            "a proposal within 4× step_tol is at the convergence floor; \
-             the descent substitution must be suppressed"
-        );
-        // Exactly at the 4× band edge: still at the floor.
-        assert!(joint_proposal_at_step_floor(4.0 * 1.355e-5, 1.355e-5));
-        // A genuinely large proposal (model-invalid direction far from the
-        // optimum) is NOT at the floor — the descent substitution must still run.
-        assert!(
-            !joint_proposal_at_step_floor(1.182e-2, 1.355e-5),
-            "an O(1e-2) proposal is far above the step floor; the \
-             preconditioned-descent fallback must remain active there"
-        );
-        // Non-finite inputs never certify the floor (so the substitution path
-        // keeps its existing non-finite handling).
-        assert!(!joint_proposal_at_step_floor(f64::NAN, 1.0e-5));
-        assert!(!joint_proposal_at_step_floor(1.0e-6, f64::INFINITY));
-    }
-
-    /// Independent derivation and direct numerical proof of the
-    /// ρ ≈ 2 inner-PIRLS pathology pinned by the large-scale saturated-probit
-    /// failure trace.
-    ///
-    /// # Mechanism
-    ///
-    /// Inner Newton on the penalized objective `f(β) = -ℓ(β) + ½βᵀSβ`
-    /// uses two different ridge values:
-    ///   * **APPLY** path (`apply_joint_penalized_hessian_into`, called
-    ///     inside `joint_quadratic_predicted_reduction`) uses
-    ///     `joint_solver_diagonal_ridge`, which equals
-    ///     `joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE +
-    ///     stabilizing_shift`, where the stabilizing shift is whatever
-    ///     positive quantity `stabilized_joint_solver_diagonal_ridge`
-    ///     adds to lift a negative-eigenvalue joint Hessian above the
-    ///     SPD floor.
-    ///   * **TRIAL OBJECTIVE** path (`total_quadratic_penalty`) uses
-    ///     only `joint_mode_diagonal_ridge` (= `effective_solverridge`),
-    ///     which is the true penalty in the objective `f` and does NOT
-    ///     include the stabilizing shift.
-    ///
-    /// Let `Δ = joint_solver_diagonal_ridge - joint_mode_diagonal_ridge`
-    /// (the gap between the SOLVE / APPLY matrix and the TRUE Hessian).
-    /// For a Newton step `δ = (H_NLL + S + joint_solver_diagonal_ridge·I)⁻¹·rhs`,
-    /// the Newton identity gives `δᵀ·H_used·δ = rhs·δ`, so:
-    ///
-    ///     predicted = rhs·δ − ½·δᵀ·H_used·δ = ½·rhs·δ
-    ///     actual    = rhs·δ − ½·δᵀ·H_true·δ
-    ///               = rhs·δ − ½·(δᵀ·H_used·δ − Δ·‖δ‖²)
-    ///               = ½·rhs·δ + ½·Δ·‖δ‖²
-    ///     ρ = actual / predicted = 1 + Δ·‖δ‖² / (rhs·δ)
-    ///
-    /// When `δ ∈ null(H_true)` (e.g. the marginal-block cancellation
-    /// direction from `marginal_block_hessian_cancels_in_saturated_regime`
-    /// combined with an unpenalized direction in the smoothing penalty's
-    /// null space), `H_true·δ = 0`, so `H_used·δ = Δ·δ` and therefore
-    /// `rhs = Δ·δ`, giving `rhs·δ = Δ·‖δ‖²`. Substituting:
-    ///
-    ///     ρ = 1 + Δ·‖δ‖² / (Δ·‖δ‖²) = 2  EXACTLY.
-    ///
-    /// This is independent of `Δ`, of the data size, and of `‖δ‖` — it
-    /// is a structural consequence of "SOLVE/APPLY add a stabilizing
-    /// shift that TRIAL OBJECTIVE doesn't see" combined with "Newton
-    /// step lies in the null space of the true Hessian".
-    ///
-    /// # Test
-    ///
-    /// We construct a 2D synthetic case with H_NLL indefinite (one
-    /// negative eigenvalue, mimicking the entry-survival concave term),
-    /// `S = 0`, and `joint_mode_diagonal_ridge = 0` (i.e. the policy
-    /// does NOT include the ridge in the objective). The stabilizing
-    /// shift lifts the negative eigenvalue to the SPD floor; the Newton
-    /// step lies in the formerly-near-null direction; predicted and
-    /// actual are computed by the exact same routines the inner solver
-    /// uses; ρ comes out to exactly 2.0 to floating-point precision.
-    #[test]
-    fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction() {
-        // Synthetic 3D joint Hessian with the structure of the
-        // saturated-probit failure case at large scale:
-        //   - dim 0: indefinite contribution (eigenvalue −1) from the
-        //     concave entry-survival term `+w·log Φ(−η₀)`. This triggers
-        //     the SPD stabilizer in the solver.
-        //   - dim 1: positive contribution (+1) from a non-saturated
-        //     coefficient direction.
-        //   - dim 2: ZERO from the marginal-block Hessian cancellation
-        //     proven separately in `marginal_block_hessian_cancels_in_saturated_regime`.
-        //     This is the saturating direction that sits in null(H_true).
-        let h_nll = array![[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
-        let source = JointHessianSource::Dense(h_nll.clone());
-        let ranges = vec![(0, 3)];
-        // Smoothing penalty `S` is zero in the saturating direction
-        // (dim 2) — mirrors the duchon-smooth polynomial null space
-        // containing constants/linears.
-        let s_lambdas = vec![Array2::<f64>::zeros((3, 3))];
-
-        // Stabilized solver ridge: should add ~1.0 to lift the
-        // -1 eigenvalue to the SPD floor (~ridge_floor).
-        let base = JOINT_TRACE_STABILITY_RIDGE;
-        let ridge_floor = 1.0e-12_f64;
-        let joint_mode_diagonal_ridge = 0.0_f64; // policy: ridge NOT in objective
-        // `stabilized_joint_solver_diagonal_ridge` consults the family only
-        // for `use_exact_newton_strict_spd`, which defaults to false; we
-        // simulate that branch by computing the shift directly via
-        // `exact_newton_stabilizing_shift`.
-        let mut lhs = h_nll.clone();
-        add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, base, None);
-        let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor)
-            .expect("indefinite Hessian must yield a positive stabilizing shift");
-        assert!(
-            shift > 0.9,
-            "shift should lift the -1 eigenvalue; got {shift}"
-        );
-        let joint_solver_diagonal_ridge = base + shift;
-        let big_delta = joint_solver_diagonal_ridge - joint_mode_diagonal_ridge;
-
-        // True Hessian (what TRIAL OBJECTIVE sees):
-        //   H_true = H_NLL + S + joint_mode_diagonal_ridge·I
-        //          = diag(-1, 1, 0)
-        //   ⇒ dim 2 is a null direction of H_true.
-        // Used Hessian (what SOLVE / APPLY uses):
-        //   H_used = H_NLL + S + joint_solver_diagonal_ridge·I
-        //          = diag(-1+Δ, 1+Δ, Δ)   where Δ ≈ 1.0
-        //   ⇒ dim 2 has curvature Δ (purely from the stabilizing shift,
-        //     which fires because dim 0 is negative).
-        // rhs aimed entirely in dim 2 puts the Newton step in null(H_true).
-        let rhs = array![0.0_f64, 0.0, 1.0];
-        let h_used_22 = 0.0 + joint_solver_diagonal_ridge;
-        let delta = array![0.0, 0.0, rhs[2] / h_used_22];
-
-        // Compute hpen_delta via the SAME helper the inner solver uses.
-        let mut hpen_delta = Array1::<f64>::zeros(3);
-        apply_joint_penalized_hessian_into(
-            &source,
-            &ranges,
-            &s_lambdas,
-            joint_solver_diagonal_ridge,
-            &delta,
-            &mut hpen_delta,
-            None,
-        )
-        .expect("apply joint penalized hessian must succeed");
-
-        // Predicted = the exact formula the inner solver uses.
-        let predicted = joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &delta);
-
-        // Actual (true) reduction: f(β=0) − f(β+δ) for the true objective
-        //   f(β) = ½·βᵀ·H_NLL·β + ½·βᵀ·S·β + ½·joint_mode_diagonal_ridge·‖β‖² + bᵀ·β
-        // taking β_start = 0 and using the Newton identity for the truth:
-        //   actual = rhs·δ − ½·δᵀ·H_true·δ
-        // where H_true = H_NLL + S + joint_mode_diagonal_ridge·I.
-        let mut h_true_delta = Array1::<f64>::zeros(3);
-        apply_joint_penalized_hessian_into(
-            &source,
-            &ranges,
-            &s_lambdas,
-            joint_mode_diagonal_ridge,
-            &delta,
-            &mut h_true_delta,
-            None,
-        )
-        .expect("apply true (un-stabilized) hessian must succeed");
-        let actual = rhs.dot(&delta) - 0.5 * delta.dot(&h_true_delta);
-
-        let rho = actual / predicted;
-
-        // ρ must be EXACTLY 2 to floating-point precision (not just "close to 2").
-        // This is the structural fingerprint of the SOLVE/APPLY-vs-OBJECTIVE
-        // ridge-stabilization gap in the saturated regime.
-        assert!(
-            (rho - 2.0).abs() <= 1e-10,
-            "ρ should be EXACTLY 2 when Newton step lies in null(H_true) with stabilizing-shift gap; got {rho}",
-        );
-
-        // Sanity: the identity rhs·δ = Δ·‖δ‖² must hold (this is the
-        // mathematical core of why ρ = 2 specifically and not 1.5 or 3).
-        let rhs_dot_delta = rhs.dot(&delta);
-        let delta_sq_times_big_delta = big_delta * delta.dot(&delta);
-        assert!(
-            (rhs_dot_delta - delta_sq_times_big_delta).abs() <= 1e-10 * rhs_dot_delta.abs(),
-            "Newton-identity null-space condition: rhs·δ ({rhs_dot_delta}) should equal Δ·‖δ‖² ({delta_sq_times_big_delta})",
-        );
-
-        // And ρ = 2 holds AT ALL MAGNITUDES of δ — verify by scaling rhs:
-        for scale in [0.001_f64, 0.029, 1.0, 988.0] {
-            let scaled_rhs = &rhs * scale;
-            let scaled_delta = &delta * scale;
-            let mut scaled_hpen = Array1::<f64>::zeros(3);
-            apply_joint_penalized_hessian_into(
-                &source,
-                &ranges,
-                &s_lambdas,
-                joint_solver_diagonal_ridge,
-                &scaled_delta,
-                &mut scaled_hpen,
-                None,
-            )
-            .expect("apply scaled");
-            let scaled_predicted =
-                joint_quadratic_predicted_reduction(&scaled_rhs, &scaled_hpen, &scaled_delta);
-            let mut scaled_h_true_delta = Array1::<f64>::zeros(3);
-            apply_joint_penalized_hessian_into(
-                &source,
-                &ranges,
-                &s_lambdas,
-                joint_mode_diagonal_ridge,
-                &scaled_delta,
-                &mut scaled_h_true_delta,
-                None,
-            )
-            .expect("apply scaled true");
-            let scaled_actual =
-                scaled_rhs.dot(&scaled_delta) - 0.5 * scaled_delta.dot(&scaled_h_true_delta);
-            let scaled_rho = scaled_actual / scaled_predicted;
+        Ok((evals, _)) => {
+            // NaN-propagating fold (matches the production code):
+            let new_min = evals.iter().copied().fold(f64::INFINITY, |a, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.min(b)
+                }
+            });
             assert!(
-                (scaled_rho - 2.0).abs() <= 1e-10,
-                "ρ invariance under step rescaling broke at scale {scale}: got {scaled_rho}",
+                !new_min.is_finite(),
+                "NaN-propagating min should detect NaN eigenvalues, got {new_min}"
             );
         }
     }
+}
 
-    #[test]
-    fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
-        let family = TwoBlockJointConstrainedFamily { coupling: 2.0 };
-        let source = JointHessianSource::Dense(array![[1.0, 2.0], [2.0, 1.0]]);
-        let ranges = vec![(0, 1), (1, 2)];
-        let s_lambdas = vec![Array2::zeros((1, 1)), Array2::zeros((1, 1))];
-        let ridge = stabilized_joint_solver_diagonal_ridge(
-            &family,
-            &source,
-            &ranges,
-            &s_lambdas,
-            JOINT_TRACE_STABILITY_RIDGE,
-            1e-12,
-            None,
-        );
+#[test]
+fn multiblock_generic_outer_fallback_returns_error_instead_of_panicking() {
+    let family = TwoBlockFiniteHessianFamily;
+    let specs = make_two_block_specs(4);
+    let penalty_counts = vec![0usize, 0usize];
+    let rho = Array1::zeros(0);
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        outer_max_iter: 1,
+        ..BlockwiseFitOptions::default()
+    };
 
-        assert!(
-            ridge > 1.0,
-            "dense joint solver ridge should lift the negative eigenvalue; got {ridge}"
-        );
-        let mut stabilized = match source {
-            JointHessianSource::Dense(matrix) => matrix,
-            JointHessianSource::Operator { .. } => {
-                panic!("dense joint solver fixture must use a dense Hessian source")
-            }
-        };
-        add_joint_penalty_to_matrix(&mut stabilized, &ranges, &s_lambdas, ridge, None);
-        let min_eval = 0.5
-            * (stabilized[[0, 0]] + stabilized[[1, 1]]
-                - ((stabilized[[0, 0]] - stabilized[[1, 1]]).powi(2)
-                    + 4.0 * stabilized[[0, 1]].powi(2))
-                .sqrt());
-        assert!(
-            min_eval > 0.0,
-            "stabilized dense joint Hessian should be SPD; min_eval={min_eval}"
-        );
-    }
-
-    #[test]
-    fn outergradient_uses_joint_surrogate_formultiblock_diagonal_family() {
-        let spec0 = ParameterBlockSpec {
-            name: "block0".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [1.0]
-            ])),
-            offset: array![0.0, 0.0],
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let spec1 = ParameterBlockSpec {
-            name: "block1".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [1.0]
-            ])),
-            offset: array![0.0, 0.0],
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        };
-        let penalty_counts = vec![1usize, 1usize];
-        let rho = array![0.0, 0.0];
-
-        let result = outerobjective_andgradient(
-            &TwoBlockJointSurrogateFamily,
-            &[spec0, spec1],
-            &options,
-            &penalty_counts,
-            &rho,
-            None,
-        );
-        assert!(
-            result.is_ok(),
-            "default joint multi-block surrogate path should succeed without blockwise dW callbacks: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn exact_newton_pseudo_laplace_objective_uses_logdet_h_without_logdet_s() {
-        let spec = ParameterBlockSpec {
-            name: "pseudo_laplace".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let fit = fit_custom_family(
-            &OneBlockPseudoLaplaceExactFamily { target: 1.5 },
-            &[spec],
-            &options,
-        )
-        .expect("pseudo-laplace exact-newton fit");
-        let expected = 0.5 * 2.0_f64.ln();
-        assert!(
-            (fit.penalized_objective - expected).abs() < 1e-8,
-            "pseudo-Laplace objective mismatch: got {}, expected {}",
-            fit.penalized_objective,
-            expected
-        );
-    }
-
-    #[test]
-    fn exact_newton_joint_psi_hook_can_supply_fixed_beta_termswithout_quadratic_spsi() {
-        let spec = ParameterBlockSpec {
-            name: "psi_hook".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let deriv = CustomFamilyBlockPsiDerivative {
-            penalty_index: None,
-            x_psi: Array2::zeros((1, 1)),
-            s_psi: Array2::zeros((1, 1)),
-            s_psi_components: None,
-            s_psi_penalty_components: None,
-            x_psi_psi: None,
-            s_psi_psi: None,
-            s_psi_psi_components: None,
-            s_psi_psi_penalty_components: None,
-            implicit_operator: None,
-            implicit_axis: 0,
-            implicit_group_id: None,
-        };
-        let result = evaluate_custom_family_joint_hyper(
-            &OneBlockExactPsiHookFamily,
-            &[spec],
-            &BlockwiseFitOptions {
-                use_remlobjective: true,
-                compute_covariance: false,
-                ..BlockwiseFitOptions::default()
-            },
-            &Array1::zeros(0),
-            &[vec![deriv]],
-            None,
-            EvalMode::ValueAndGradient,
-        )
-        .expect("joint hyper eval with exact joint psi hook");
-        assert_eq!(result.gradient.len(), 1);
-        assert!(
-            (result.gradient[0] - 3.5).abs() < 1e-12,
-            "expected family-supplied joint psi term, got {}",
-            result.gradient[0]
-        );
-    }
-
-    #[test]
-    fn pseudo_laplace_exact_newton_rejects_indefinite_hessian() {
-        // #748: an indefinite joint coefficient Hessian (here a 1×1 block with
-        // H=-1) is a real defect — a mis-signed / non-convex curvature, or a β
-        // that is not at the inner block optimum. The strict pseudo-Laplace
-        // REML logdet must REJECT such a ρ-trial, not mask it. The earlier path
-        // returned `log|H + δI|` with δ escalated to 10 (so H+δI=[[9]],
-        // logdet=log 9) and let the fit "succeed" — but the analytic REML
-        // gradient still used `tr((H+S_λ)⁻¹·)` on the un-ridged H, so value and
-        // gradient described two different objectives. Rejecting is the honest
-        // signal: the outer optimizer steps back instead of optimizing a biased,
-        // δ-shifted surface. The fit therefore now ERRORS where it formerly
-        // returned a masked result.
-        let spec = ParameterBlockSpec {
-            name: "indefinite".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let result = fit_custom_family(
-            &OneBlockIndefinitePseudoLaplaceFamily,
-            &[spec],
-            &BlockwiseFitOptions {
-                use_remlobjective: true,
-                compute_covariance: false,
-                ..BlockwiseFitOptions::default()
-            },
-        );
-        let err = result
-            .expect_err(
-                "strict pseudo-Laplace must reject the indefinite Hessian H=[[-1]], not δ-ridge mask it",
-            )
-            .to_string();
-        assert!(
-            err.contains("indefinite") || err.contains("below -tol"),
-            "rejection error should name the indefiniteness; got: {err}",
-        );
-    }
-
-    #[test]
-    fn auto_determinant_mode_is_exact_full_logdet_policy() {
-        let h = array![[6.0, 0.8, 0.1], [0.8, 4.5, 0.4], [0.1, 0.4, 3.2]];
-        let exact = stable_logdet_with_ridge_policy(
-            &h,
-            1e-8,
-            RidgePolicy::explicit_stabilization_full_exact(),
-        )
-        .expect("exact logdet");
-        let auto =
-            stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::explicit_stabilization_full())
-                .expect("auto logdet");
-        assert!((auto - exact).abs() < 1e-12, "auto={auto}, exact={exact}");
-    }
-
-    #[test]
-    fn indefinite_hessian_uses_smooth_regularized_logdet() {
-        // Indefinite Hessian: eigenvalues {-1, 2}.
-        //
-        // Old behaviour: silently drop the -1 direction from logdet, warn,
-        // and after enough repeats escalate to an EFS abort (first-order
-        // fallback marker).
-        //
-        // New behaviour: every eigenvalue contributes via the smooth
-        // regularizer r_ε(σ) = ½(σ + √(σ² + 4ε²)).  No direction is ignored,
-        // no escalation, and the logdet matches what the downstream
-        // `DenseSpectralOperator` gradient computes — eliminating the
-        // cost/gradient mismatch that broke BFGS line search.
-        let h = array![[-1.0, 0.0], [0.0, 2.0]];
-        let logdet = stable_logdet_with_ridge_policy(
-            &h,
-            1e-12,
-            RidgePolicy::explicit_stabilization_pospart(),
-        )
-        .expect("smooth-regularized logdet must be finite for indefinite H");
-        assert!(
-            logdet.is_finite(),
-            "smooth-regularized logdet should be finite, got {logdet}"
-        );
-        // Reference value using the same formula directly on the eigenvalues
-        // of H + ridge·I (ridge = 1e-12 here).  Since ε ≫ ridge (spectral_epsilon
-        // floors at √(eps_mach) ≈ 1.5e-8 for p=2), the ridge contribution is
-        // absorbed into ε and the expected value is Σ log r_ε(σ_j).
-        let eps = spectral_epsilon(&[-1.0_f64, 2.0]).max(1e-12_f64.max(1e-14));
-        // A + ridge·I has eigenvalues shifted by 1e-12, negligible relative to ε.
-        let expected: f64 = [-1.0_f64 + 1e-12, 2.0 + 1e-12]
-            .iter()
-            .map(|&s| spectral_regularize(s, eps).ln())
-            .sum();
-        assert!(
-            (logdet - expected).abs() < 1e-10,
-            "logdet={logdet}, expected={expected}"
-        );
-    }
-
-    #[test]
-    fn pseudo_laplace_exact_newton_symmetrizes_nearly_symmetrichessian() {
-        let spec = ParameterBlockSpec {
-            name: "nearly_symmetric".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0, 0.0],
-                [0.0, 1.0]
-            ])),
-            offset: array![0.0, 0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0, 0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let fit = fit_custom_family(
-            &OneBlockNearlySymmetricPseudoLaplaceFamily,
-            &[spec],
-            &BlockwiseFitOptions {
-                use_remlobjective: true,
-                compute_covariance: false,
-                ..BlockwiseFitOptions::default()
-            },
-        )
-        .expect("nearly symmetric pseudo-laplace Hessian should be accepted after symmetrization");
-        assert!(
-            fit.penalized_objective.is_finite(),
-            "expected finite pseudo-laplace objective, got {}",
-            fit.penalized_objective
-        );
-    }
-
-    #[test]
-    fn outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active() {
-        let BinomialLocationScaleWiggleOuterFixture {
-            family,
-            specs,
-            penalty_counts,
-            rho,
-            options: base_options,
-        } = binomial_location_scale_wiggle_outer_fixture();
-        // FD/analytic noise floor below is `EPS·|cost|/h`, valid only when PIRLS
-        // converges to f64 precision; HardPseudo + σ_min~1e-10 amplifies the
-        // default 1e-6 inner residual into ~1e-7 cost slack that lifts both
-        // estimators above the machine-precision floor.
-        let options = BlockwiseFitOptions {
-            inner_tol: 1e-12,
-            inner_max_cycles: 500,
-            ..base_options
-        };
-
-        let (f0, g0, _) =
-            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
-                .expect("objective/gradient");
-        assert!(f0.is_finite());
-        assert_eq!(g0.len(), rho.len());
-
-        let h = 1e-5;
-        for k in 0..rho.len() {
-            let mut rho_p = rho.clone();
-            let mut rho_m = rho.clone();
-            rho_p[k] += h;
-            rho_m[k] -= h;
-            let (fp, _, _) = outerobjective_andgradient(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_p,
-                None,
-            )
-            .expect("objective+");
-            let (fm, _, _) = outerobjective_andgradient(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_m,
-                None,
-            )
-            .expect("objective-");
-            let gfd = (fp - fm) / (2.0 * h);
-
-            // Noise floor for FD-vs-analytic comparisons.
-            //
-            // At a rank-deficient optimum (σ_min(H) ≲ ε_machine) the outer
-            // REML gradient is a DIFFERENCE of two nearly-equal O(1)
-            // quantities — ½ λ_k (H⁺[k,k] − S⁺[k,k]) — so the true gradient
-            // is very close to zero.  The FD estimator `(f_p − f_m)/(2h)`
-            // then measures cost-sum round-off: at f64 precision each cost
-            // value carries an uncertainty of ~EPS · |cost|, and the
-            // symmetric FD inflates that by 1/(2h), producing a noise floor
-            // of roughly `EPS · |cost| / h` on |gfd|.  Below that floor
-            // neither `|gfd|`, `|g0|`, nor `sign(gfd)` reflect the true
-            // derivative — they reflect arithmetic noise.
-            //
-            // Concretely: for this test `|cost| ~ 6`, `h = 1e-5`, so the
-            // floor is ~1.3e-10 (≈ f64::EPSILON · 6 / 1e-5).  We round up
-            // to a problem-scale-derived value and treat pairs where BOTH
-            // |g0| and |gfd| lie below the floor as a pass (the assertion
-            // is making a claim about the TRUE derivative, and a true
-            // derivative strictly less than noise is indistinguishable
-            // from zero — sign is not a correctness property there).
-            let cost_magnitude = f0.abs().max(1.0);
-            let noise_floor = (10.0 * f64::EPSILON * cost_magnitude / h).max(1e-9);
-            let both_in_noise = g0[k].abs() < noise_floor && gfd.abs() < noise_floor;
-
-            if !both_in_noise {
-                assert_eq!(
-                    g0[k].signum(),
-                    gfd.signum(),
-                    "outer LAML gradient sign mismatch at {}: analytic={} fd={} noise_floor={:.3e}",
-                    k,
-                    g0[k],
-                    gfd,
-                    noise_floor,
-                );
-                let rel = (g0[k] - gfd).abs() / gfd.abs().max(noise_floor);
-                assert!(
-                    rel < 2e-2,
-                    "outer LAML gradient mismatch at {}: analytic={} fd={} rel={} noise_floor={:.3e}",
-                    k,
-                    g0[k],
-                    gfd,
-                    rel,
-                    noise_floor,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rho_only_outer_objective_matches_joint_hyper_when_psi_is_empty() {
-        let BinomialLocationScaleWiggleOuterFixture {
-            family,
-            specs,
-            penalty_counts,
-            rho,
-            options,
-        } = binomial_location_scale_wiggle_outer_fixture();
-
-        let (outer_obj, outer_grad, outer_hessian, _) =
-            super::test_support::outerobjectivegradienthessian(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho,
-                None,
-                EvalMode::ValueGradientHessian,
-            )
-            .expect("rho-only outer objective");
-        let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
-        let joint_result = evaluate_custom_family_joint_hyper(
-            &family,
-            &specs,
-            &options,
-            &rho,
-            &derivative_blocks,
-            None,
-            EvalMode::ValueGradientHessian,
-        )
-        .expect("joint hyper objective with empty psi");
-
-        assert!(
-            (outer_obj - joint_result.objective).abs() < 1e-12,
-            "objective mismatch: rho-only={} joint={}",
-            outer_obj,
-            joint_result.objective
-        );
-        assert_eq!(outer_grad.len(), joint_result.gradient.len());
-        let max_grad_diff = outer_grad
-            .iter()
-            .zip(joint_result.gradient.iter())
-            .map(|(lhs, rhs)| (lhs - rhs).abs())
-            .fold(0.0_f64, f64::max);
-        assert!(
-            max_grad_diff < 1e-12,
-            "gradient mismatch: max diff={}",
-            max_grad_diff
-        );
-
-        let outer_hessian = outer_hessian.expect("rho-only outer Hessian");
-        let joint_hessian = joint_result
-            .outer_hessian
-            .materialize_dense()
-            .expect("joint outer Hessian should materialize")
-            .expect("joint outer Hessian");
-        assert_eq!(outer_hessian.dim(), joint_hessian.dim());
-        let max_hessian_diff = outer_hessian
-            .iter()
-            .zip(joint_hessian.iter())
-            .map(|(lhs, rhs)| (lhs - rhs).abs())
-            .fold(0.0_f64, f64::max);
-        assert!(
-            max_hessian_diff < 1e-12,
-            "outer Hessian mismatch: max diff={}",
-            max_hessian_diff
-        );
-    }
-
-    /// Shared probit binomial-location-scale outer-derivative test fixture:
-    /// builds the (threshold, log_sigma) block specs, family, penalty counts,
-    /// and outer options that every `outer_laml*_binomial_location_scale_*`
-    /// finite-difference test constructs identically apart from `y` and the
-    /// two block initial betas.
-    fn binomial_location_scale_outer_fixture(
-        y: Array1<f64>,
-        threshold_initial_beta: f64,
-        log_sigma_initial_beta: f64,
-    ) -> (
-        BinomialLocationScaleFamily,
-        Vec<ParameterBlockSpec>,
-        Vec<usize>,
-        BlockwiseFitOptions,
-    ) {
-        let n = y.len();
-        let weights = Array1::from_elem(n, 1.0);
-        let thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![threshold_initial_beta]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![log_sigma_initial_beta]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let threshold_design = thresholdspec.design.clone();
-        let log_sigma_design = log_sigmaspec.design.clone();
-        let family = BinomialLocationScaleFamily {
-            y,
-            weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
-            threshold_design: Some(threshold_design),
-            log_sigma_design: Some(log_sigma_design),
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
-        let specs = vec![thresholdspec, log_sigmaspec];
-        let penalty_counts = vec![1usize, 1usize];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        };
-        (family, specs, penalty_counts, options)
-    }
-
-    #[test]
-    fn outer_lamlgradient_diagonal_binomial_location_scale_matchesfd() {
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-        let (family, specs, penalty_counts, options) =
-            binomial_location_scale_outer_fixture(y, 0.0, 0.0);
-        let rho = array![0.0, 0.0];
-
-        let (f0, g0, _) =
-            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
-                .expect("objective/gradient");
-        assert!(f0.is_finite());
-        assert_eq!(g0.len(), rho.len());
-
-        let h = 1e-5;
-        for k in 0..rho.len() {
-            let mut rho_p = rho.clone();
-            let mut rho_m = rho.clone();
-            rho_p[k] += h;
-            rho_m[k] -= h;
-            let (fp, _, _) = outerobjective_andgradient(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_p,
-                None,
-            )
-            .expect("objective+");
-            let (fm, _, _) = outerobjective_andgradient(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_m,
-                None,
-            )
-            .expect("objective-");
-            let gfd = (fp - fm) / (2.0 * h);
-            let abs = (g0[k] - gfd).abs();
-            let rel = abs / gfd.abs().max(1e-8);
-            if abs >= 2e-3 {
-                assert_eq!(
-                    g0[k].signum(),
-                    gfd.signum(),
-                    "outer diagonal LAML gradient sign mismatch at {}: analytic={} fd={}",
-                    k,
-                    g0[k],
-                    gfd
-                );
-            }
-            assert!(
-                abs < 2e-3 || rel < 2e-3,
-                "outer diagonal LAML gradient mismatch at {}: analytic={} fd={} abs={} rel={}",
-                k,
-                g0[k],
-                gfd,
-                abs,
-                rel
-            );
-        }
-    }
-
-    #[test]
-    fn outer_lamlgradient_diagonal_binomial_location_scale_hard_case_matchesfd() {
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-        let (family, specs, penalty_counts, options) =
-            binomial_location_scale_outer_fixture(y, 0.2, -0.1);
-        let rho = array![0.15, -0.25];
-
-        let (f0, g0, _) =
-            outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
-                .expect("objective/gradient");
-        assert!(f0.is_finite());
-        assert_eq!(g0.len(), rho.len());
-
-        let h = 1e-5;
-        for k in 0..rho.len() {
-            let mut rho_p = rho.clone();
-            let mut rho_m = rho.clone();
-            rho_p[k] += h;
-            rho_m[k] -= h;
-            let (fp, _, _) = outerobjective_andgradient(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_p,
-                None,
-            )
-            .expect("objective+");
-            let (fm, _, _) = outerobjective_andgradient(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_m,
-                None,
-            )
-            .expect("objective-");
-            let gfd = (fp - fm) / (2.0 * h);
-            let abs = (g0[k] - gfd).abs();
-            let rel = abs / gfd.abs().max(1e-8);
-            if abs >= 2e-3 {
-                assert_eq!(
-                    g0[k].signum(),
-                    gfd.signum(),
-                    "outer diagonal hard-case LAML gradient sign mismatch at {}: analytic={} fd={}",
-                    k,
-                    g0[k],
-                    gfd
-                );
-            }
-            assert!(
-                abs < 2e-3 || rel < 2e-3,
-                "outer diagonal hard-case LAML gradient mismatch at {}: analytic={} fd={} abs={} rel={}",
-                k,
-                g0[k],
-                gfd,
-                abs,
-                rel
-            );
-        }
-    }
-
-    #[test]
-    fn outer_lamlhessian_joint_exact_binomial_location_scale_matchesfd() {
-        // Asymmetric y (6 ones / 4 zeros). A balanced 5/5 vector forces
-        // β̂_threshold = 0 by probit-link symmetry, which makes the joint
-        // observed Hessian block-diagonal in (threshold, log_sigma) at the
-        // inner mode. The outer LAML Hessian off-diagonals are then ~1e-11,
-        // below the central-FD noise floor (≈ pirls_tol / h) at h=1e-5, so
-        // FD-vs-analytic agreement cannot be enforced. Asymmetric y gives
-        // β̂_threshold ≠ 0, coupling the (β_0, β_1) blocks through the
-        // observed-information weights and making all four entries validatable.
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0]);
-        let (family, specs, penalty_counts, options) =
-            binomial_location_scale_outer_fixture(y, 0.15, -0.05);
-        let rho = array![0.1, -0.2];
-
-        let (_, _, h0_opt, _) = super::test_support::outerobjectivegradienthessian(
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::test_support::outerobjectivegradienthessian(
             &family,
             &specs,
             &options,
@@ -5154,1284 +6034,250 @@
             None,
             EvalMode::ValueGradientHessian,
         )
-        .expect("objective/gradient/hessian");
-        let h0 = h0_opt.expect("analytic outer Hessian should be available");
-        assert_eq!(h0.nrows(), rho.len());
-        assert_eq!(h0.ncols(), rho.len());
+    }));
 
-        let h = 1e-5;
-        for l in 0..rho.len() {
-            let mut rho_p = rho.clone();
-            let mut rho_m = rho.clone();
-            rho_p[l] += h;
-            rho_m[l] -= h;
-            let (_, gp, _, _) = super::test_support::outerobjectivegradienthessian(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_p,
-                None,
-                EvalMode::ValueAndGradient,
-            )
-            .expect("objective/gradient +");
-            let (_, gm, _, _) = super::test_support::outerobjectivegradienthessian(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_m,
-                None,
-                EvalMode::ValueAndGradient,
-            )
-            .expect("objective/gradient -");
+    let outcome = result.expect("multi-block outer fallback must return an error, not panic");
+    let err = match outcome {
+        Ok(_) => panic!("multi-block family without a joint path should fail loudly"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("multi-block families must provide a joint outer path"),
+        "unexpected error: {err}"
+    );
+}
 
-            for k in 0..rho.len() {
-                let hfd = (gp[k] - gm[k]) / (2.0 * h);
-                let abs_err = (h0[[k, l]] - hfd).abs();
-                let rel = (h0[[k, l]] - hfd).abs() / hfd.abs().max(1e-7);
-                if h0[[k, l]].abs().max(hfd.abs()) > 1e-10 {
-                    assert_eq!(
-                        h0[[k, l]].signum(),
-                        hfd.signum(),
-                        "outer Hessian sign mismatch at ({k},{l}): analytic={} fd={}",
-                        h0[[k, l]],
-                        hfd
-                    );
-                }
-                assert!(
-                    abs_err < 1e-8 || rel < 2e-2,
-                    "outer Hessian mismatch at ({k},{l}): analytic={} fd={} abs={} rel={}",
-                    h0[[k, l]],
-                    hfd,
-                    abs_err,
-                    rel
-                );
-            }
-        }
-
-        for i in 0..h0.nrows() {
-            for j in 0..i {
-                let asym = (h0[[i, j]] - h0[[j, i]]).abs();
-                assert!(
-                    asym < 1e-8,
-                    "outer Hessian not symmetric at ({i},{j}): {asym}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn block_solve_sparse_matches_dense() {
-        let x_dense = array![
-            [1.0, 0.0, 2.0],
-            [0.0, 3.0, 0.0],
-            [4.0, 0.0, 5.0],
-            [0.0, 6.0, 0.0]
-        ];
-        let y_star = array![1.0, -1.0, 0.5, 2.0];
-        let w = array![1.0, 0.5, 2.0, 1.5];
-        let s_lambda = Array2::<f64>::eye(3) * 0.1;
-
-        let mut triplets = Vec::new();
-        for i in 0..x_dense.nrows() {
-            for j in 0..x_dense.ncols() {
-                let v = x_dense[[i, j]];
-                if v != 0.0 {
-                    triplets.push(Triplet::new(i, j, v));
-                }
-            }
-        }
-        let x_sparse = SparseColMat::try_new_from_triplets(4, 3, &triplets)
-            .expect("sparse matrix build should succeed");
-
-        let beta_dense = solve_blockweighted_system(
-            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_dense.clone())),
-            &y_star,
-            &w,
-            &s_lambda,
-            1e-12,
-            RidgePolicy::explicit_stabilization_pospart(),
-        )
-        .expect("dense solve should succeed");
-
-        let beta_sparse = solve_blockweighted_system(
-            &DesignMatrix::from(x_sparse),
-            &y_star,
-            &w,
-            &s_lambda,
-            1e-12,
-            RidgePolicy::explicit_stabilization_pospart(),
-        )
-        .expect("sparse solve should succeed");
-
-        for j in 0..beta_dense.len() {
+#[test]
+fn pseudo_laplace_path_skips_eigendecomposition_avoiding_nan_crash() {
+    // SUFFICIENCY: The PseudoLaplace path takes strict_solve_spd instead
+    // of eigendecomposition-based ridging.  It will still fail (the Hessian
+    // is NaN so the solve produces garbage), but the failure is NOT the
+    // eigendecomposition NoConvergence error — it's a different error
+    // downstream.  This proves the eigendecomposition call is the unique
+    // failure point for QuadraticReml families.
+    let specs = make_two_block_specs(4);
+    let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let result = inner_blockwise_fit(
+        &TwoBlockNaNHessianPseudoLaplaceFamily,
+        &specs,
+        &per_block_log_lambdas,
+        &options,
+        None,
+    );
+    // The PseudoLaplace path may fail for other reasons (NaN in solve),
+    // but it must NOT fail with the eigendecomposition error.
+    match result {
+        Ok(_) => {} // Acceptable — strict_solve_spd might produce NaN
+        // betas which don't trigger a hard error.
+        Err(ref msg) => {
             assert!(
-                (beta_dense[j] - beta_sparse[j]).abs() < 1e-10,
-                "dense/sparse mismatch at {}: {} vs {}",
-                j,
-                beta_dense[j],
-                beta_sparse[j]
-            );
-        }
-    }
-
-    #[test]
-    fn outer_lamlhessian_joint_exact_binomial_location_scale_hard_case_matchesfd() {
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-        let (family, specs, penalty_counts, options) =
-            binomial_location_scale_outer_fixture(y, 0.2, -0.1);
-        let rho = array![0.15, -0.25];
-
-        let (_, _, h0_opt, _) = super::test_support::outerobjectivegradienthessian(
-            &family,
-            &specs,
-            &options,
-            &penalty_counts,
-            &rho,
-            None,
-            EvalMode::ValueGradientHessian,
-        )
-        .expect("objective/gradient/hessian");
-        let h0 = h0_opt.expect("analytic outer Hessian should be available");
-        assert_eq!(h0.nrows(), rho.len());
-        assert_eq!(h0.ncols(), rho.len());
-
-        let h = 1e-5;
-        for l in 0..rho.len() {
-            let mut rho_p = rho.clone();
-            let mut rho_m = rho.clone();
-            rho_p[l] += h;
-            rho_m[l] -= h;
-            let (_, gp, _, _) = super::test_support::outerobjectivegradienthessian(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_p,
-                None,
-                EvalMode::ValueAndGradient,
-            )
-            .expect("objective/gradient +");
-            let (_, gm, _, _) = super::test_support::outerobjectivegradienthessian(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_m,
-                None,
-                EvalMode::ValueAndGradient,
-            )
-            .expect("objective/gradient -");
-
-            for k in 0..rho.len() {
-                let hfd = (gp[k] - gm[k]) / (2.0 * h);
-                let abs_err = (h0[[k, l]] - hfd).abs();
-                let rel = abs_err / hfd.abs().max(1e-7);
-                if h0[[k, l]].abs().max(hfd.abs()) > 1e-10 {
-                    assert_eq!(
-                        h0[[k, l]].signum(),
-                        hfd.signum(),
-                        "hard-case outer Hessian sign mismatch at ({k},{l}): analytic={} fd={}",
-                        h0[[k, l]],
-                        hfd
-                    );
-                }
-                assert!(
-                    abs_err < 1e-8 || rel < 2e-2,
-                    "hard-case outer Hessian mismatch at ({k},{l}): analytic={} fd={} abs={} rel={}",
-                    h0[[k, l]],
-                    hfd,
-                    abs_err,
-                    rel
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn block_solve_falls_backwhen_llt_rejects_indefinite_system() {
-        let x_dense = array![[1.0, 0.0], [0.0, 0.0]];
-        let y_star = array![2.0, 0.0];
-        let w = array![1.0, 1.0];
-        let s_lambda = array![[0.0, 0.0], [0.0, -1e-12]];
-
-        let beta = solve_blockweighted_system(
-            &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_dense)),
-            &y_star,
-            &w,
-            &s_lambda,
-            1e-12,
-            RidgePolicy::explicit_stabilization_pospart(),
-        )
-        .expect("fallback solve should succeed");
-
-        assert!(beta.iter().all(|v| v.is_finite()));
-        assert!(
-            (beta[0] - 2.0).abs() < 1e-10,
-            "unexpected solved coefficient"
-        );
-        assert!(
-            beta[1].abs() < 1e-8,
-            "null-space coefficient should stay near zero"
-        );
-    }
-
-    #[test]
-    fn exact_newton_block_enforces_linear_constraints() {
-        let spec = ParameterBlockSpec {
-            name: "exact_block".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![1.5]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let family = OneBlockConstrainedExactFamily {
-            target: 0.0,
-            lower: 1.0,
-        };
-        let fit = fit_custom_family(&family, &[spec], &BlockwiseFitOptions::default())
-            .expect("constrained exact-newton fit");
-        let beta = fit.block_states[0].beta[0];
-        assert!(
-            (beta - 1.0).abs() < 1e-8,
-            "expected constrained optimum at lower bound, got {beta}"
-        );
-    }
-
-    #[test]
-    fn extract_simple_lower_bounds_accepts_axis_aligned_rows() {
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]],
-            b: array![0.25, 1.0, 1.5],
-        };
-        let bounds = extract_simple_lower_bounds(&constraints, 2)
-            .expect("lower-bound extraction should succeed")
-            .expect("axis-aligned rows should map to lower bounds");
-        assert_relative_eq!(bounds.lower_bounds[0], 0.5, epsilon = 1e-12);
-        assert_relative_eq!(bounds.lower_bounds[1], 0.5, epsilon = 1e-12);
-        assert_eq!(bounds.coeff_to_row, vec![Some(2), Some(1)]);
-    }
-
-    #[test]
-    fn extract_simple_lower_bounds_rejects_coupled_rows() {
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0, 1.0]],
-            b: array![0.0],
-        };
-        assert!(
-            extract_simple_lower_bounds(&constraints, 2)
-                .expect("lower-bound extraction should not error on valid shapes")
-                .is_none(),
-            "coupled rows must stay on the generic linear-constraint path"
-        );
-    }
-
-    #[test]
-    fn constrained_exact_newton_indefinite_hessian_uses_stabilized_delta_solve() {
-        let spec = ParameterBlockSpec {
-            name: "exact_block".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![1.5]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let states = vec![ParameterBlockState {
-            beta: array![1.5],
-            eta: array![1.5],
-        }];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0]],
-            b: array![1.0],
-        };
-        let hessian = SymmetricMatrix::Dense(array![[-1.0]]);
-        let updater = ExactNewtonBlockUpdater {
-            gradient: &array![-1.0],
-            hessian: &hessian,
-        };
-        let s_lambda = Array2::zeros((1, 1));
-        let update = updater
-            .compute_update_step(&BlockUpdateContext {
-                family: &OneBlockConstrainedIndefiniteHessianFamily,
-                states: &states,
-                spec: &spec,
-                block_idx: 0,
-                s_lambda: &s_lambda,
-                options: &BlockwiseFitOptions::default(),
-                linear_constraints: Some(&constraints),
-                cached_active_set: None,
-            })
-            .expect("indefinite constrained exact-newton update should be stabilized");
-        assert_relative_eq!(update.beta_new_raw[0], 1.0, epsilon = 1e-12);
-        assert_eq!(update.active_set, Some(vec![0]));
-    }
-
-    #[test]
-    fn quadratic_linear_constraints_release_positive_kkt_systemmultiplier() {
-        // max ll with exact Newton equivalent to minimizing
-        // 0.5 * x^2 - rhs*x with rhs=1 under 0 <= x <= 0.1.
-        // At x=0, active-set KKT solve gives lambda_sys=+1 for the lower bound,
-        // which must be released (lambda_true = -lambda_sys).
-        let hessian = array![[1.0]];
-        let rhs = array![1.0];
-        let beta_start = array![0.0];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0], [-1.0]],
-            b: array![0.0, -0.1],
-        };
-
-        let (beta, active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            None,
-        )
-        .expect("constrained quadratic solve should succeed");
-
-        assert!(
-            (beta[0] - 0.1).abs() <= 1e-10,
-            "expected constrained optimum at upper bound 0.1, got {}",
-            beta[0]
-        );
-        assert_eq!(active.len(), 1);
-    }
-
-    #[test]
-    fn quadratic_linear_constraints_ignore_near_tangential_inactiverows() {
-        let hessian = array![[1.0, 0.0], [0.0, 1.0]];
-        let rhs = array![1.0, 0.0];
-        let beta_start = array![0.0, 0.0];
-        let constraints = LinearInequalityConstraints {
-            a: array![[-1e-16, 1.0]],
-            b: array![-1.0],
-        };
-
-        let (beta, active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            None,
-        )
-        .expect("near-tangential inactive row should not block the quadratic step");
-
-        assert!(
-            (beta[0] - 1.0).abs() <= 1e-12,
-            "expected unconstrained x-solution of 1.0, got {}",
-            beta[0]
-        );
-        assert!(
-            beta[1].abs() <= 1e-12,
-            "expected zero y-solution, got {}",
-            beta[1]
-        );
-        assert!(active.is_empty(), "no row should become active");
-    }
-
-    #[test]
-    fn quadratic_linear_constraints_projectwarm_activerows_back_to_boundary() {
-        let hessian = array![[2.0]];
-        let rhs = array![0.0];
-        let beta_start = array![1e-9];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0]],
-            b: array![0.0],
-        };
-
-        let (beta, active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            Some(&[0]),
-        )
-        .expect("constrained quadratic solve should project back to the boundary");
-
-        assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
-        assert_eq!(active, vec![0]);
-    }
-
-    #[test]
-    fn quadratic_linear_constraints_handles_near_dependent_rows() {
-        // Three constraints in R^2 where the third is nearly a linear
-        // combination of the first two, making the naive KKT system
-        // ill-conditioned.  The rank-reducing compression should drop
-        // the dependent row and the QP should converge cleanly.
-        //
-        //   x1 >= 0,  x2 >= 0,  x1 + x2 + eps >= 0   (eps ≈ 0)
-        //
-        // Minimize 0.5 * ||x - [−1, −1]||^2  =>  optimum at origin.
-        let hessian = Array2::eye(2);
-        let rhs = array![-1.0, -1.0]; // gradient points toward (−1,−1)
-        let beta_start = array![0.0, 0.0];
-        let eps = 1e-14;
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0, 0.0], [0.0, 1.0], [1.0 + eps, 1.0]],
-            b: array![0.0, 0.0, 0.0],
-        };
-
-        let (beta, active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            Some(&[0, 1, 2]), // all three active
-        )
-        .expect("near-dependent constraint QP should converge");
-
-        assert!(
-            beta[0].abs() <= 1e-10 && beta[1].abs() <= 1e-10,
-            "expected optimum at origin, got ({}, {})",
-            beta[0],
-            beta[1]
-        );
-        assert!(
-            active.len() <= 2,
-            "at most 2 independent constraints should remain active, got {}",
-            active.len()
-        );
-    }
-
-    #[test]
-    fn quadratic_linear_constraints_release_merged_constraint_group_by_id() {
-        // Two redundant lower-bound rows compress into one active KKT row.
-        // Releasing that merged row must drop both original constraint ids,
-        // not transient positions in the active vector.
-        let hessian = array![[1.0]];
-        let rhs = array![1.0];
-        let beta_start = array![0.0];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0], [2.0], [-1.0]],
-            b: array![0.0, 0.0, -0.1],
-        };
-
-        let (beta, active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            Some(&[0, 1]),
-        )
-        .expect("merged active constraint group should release cleanly");
-
-        assert!(
-            (beta[0] - 0.1).abs() <= 1e-10,
-            "expected constrained optimum at upper bound 0.1, got {}",
-            beta[0]
-        );
-        assert_eq!(active, vec![2]);
-    }
-
-    #[test]
-    fn quadratic_linear_constraints_release_merged_group_with_unsorted_active_positions() {
-        let hessian = array![[1.0]];
-        let rhs = array![1.0];
-        let beta_start = array![0.0];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0], [2.0], [-1.0]],
-            b: array![0.0, 0.0, -0.1],
-        };
-
-        let (beta, active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            Some(&[2, 0, 1]),
-        )
-        .expect("merged active group release should handle unsorted active positions");
-
-        assert!(
-            (beta[0] - 0.1).abs() <= 1e-10,
-            "expected constrained optimum at upper bound 0.1, got {}",
-            beta[0]
-        );
-        assert_eq!(active, vec![2]);
-    }
-
-    #[test]
-    fn quadratic_linear_constraints_accept_boundary_kkt_after_rank_reduction() {
-        let hessian = array![[2.0]];
-        let rhs = array![0.0];
-        let beta_start = array![1e-9];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0], [1.0 + 1e-13], [2.0], [3.0]],
-            b: array![0.0, 0.0, 0.0, 0.0],
-        };
-
-        let (beta, active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            Some(&[0, 1, 2, 3]),
-        )
-        .expect("degenerate boundary KKT point should be accepted");
-
-        assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
-        assert!(
-            active.len() <= 1,
-            "rank-reduced boundary solution should keep at most one representative, got {:?}",
-            active
-        );
-    }
-
-    #[test]
-    fn quadratic_linear_constraints_singular_kkt_uses_pseudoinverse_fallback() {
-        let hessian = Array2::<f64>::zeros((2, 2));
-        let rhs = array![0.0, 0.0];
-        let beta_start = array![0.0, 0.0];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0, 1.0]],
-            b: array![0.0],
-        };
-
-        let (beta, active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &constraints,
-            Some(&[0]),
-        )
-        .expect("singular KKT system should fall back to a finite pseudoinverse solve");
-
-        assert!(beta.iter().all(|value| value.is_finite()));
-        assert_relative_eq!(beta[0], 0.0, epsilon = 1e-14);
-        assert_relative_eq!(beta[1], 0.0, epsilon = 1e-14);
-        assert_eq!(active, vec![0]);
-    }
-
-    #[test]
-    fn rank_reduce_drops_exactly_dependent_row() {
-        // Row 3 = Row 1 + Row 2 exactly. Rank reduction should drop it.
-        let a = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],];
-        let b = array![0.0, 0.0, 0.0];
-        let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
-        let (a_out, b_out, member_constraint_ids_out, _) =
-            crate::solver::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
-                a,
-                b,
-                member_constraint_ids,
-            );
-        assert_eq!(
-            a_out.nrows(),
-            2,
-            "should keep 2 independent rows, got {}",
-            a_out.nrows()
-        );
-        assert_eq!(b_out.len(), 2);
-        // The third constraint id should have been merged into one of the first two rows.
-        let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
-        assert_eq!(
-            total_constraint_ids, 3,
-            "all original constraint ids must be preserved"
-        );
-    }
-
-    #[test]
-    fn rank_reduce_preserves_full_rank_matrix() {
-        let a = array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0],];
-        let b = array![0.0, 0.0, 0.0];
-        let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
-        let (a_out, b_out, member_constraint_ids_out, _) =
-            crate::solver::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
-                a,
-                b,
-                member_constraint_ids,
-            );
-        // All three rows are independent in R^2 (but we only have rank 2).
-        // The first two span R^2, so row 3 = row 1 + row 2 is dependent.
-        assert_eq!(a_out.nrows(), 2);
-        assert_eq!(b_out.len(), 2);
-        let total_constraint_ids: usize = member_constraint_ids_out.iter().map(|g| g.len()).sum();
-        assert_eq!(total_constraint_ids, 3);
-    }
-
-    #[test]
-    fn constrained_exact_newton_nan_hessian_returns_feasible_noop_instead_of_failing() {
-        let spec = ParameterBlockSpec {
-            name: "exact_block".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-            offset: array![0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let states = vec![ParameterBlockState {
-            beta: array![0.0],
-            eta: array![0.0],
-        }];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0]],
-            b: array![0.0],
-        };
-        let hessian = SymmetricMatrix::Dense(array![[f64::NAN]]);
-        let updater = ExactNewtonBlockUpdater {
-            gradient: &array![0.0],
-            hessian: &hessian,
-        };
-        let s_lambda = Array2::zeros((1, 1));
-        let update = updater
-            .compute_update_step(&BlockUpdateContext {
-                family: &OneBlockConstrainedNaNHessianFamily,
-                states: &states,
-                spec: &spec,
-                block_idx: 0,
-                s_lambda: &s_lambda,
-                options: &BlockwiseFitOptions::default(),
-                linear_constraints: Some(&constraints),
-                cached_active_set: None,
-            })
-            .expect("constrained exact-newton NaN Hessian should produce a no-op update");
-        assert_relative_eq!(update.beta_new_raw[0], 0.0, epsilon = 1e-14);
-        assert_eq!(update.active_set, Some(vec![0]));
-    }
-
-    #[test]
-    fn outerobjective_failure_context_is_preserved() {
-        // One penalty forces the outer rho optimizer to run, which should now preserve
-        // the real evaluation error instead of returning an opaque line-search failure.
-        let spec = ParameterBlockSpec {
-            name: "err_block".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [1.0]
-            ])),
-            offset: array![0.0, 0.0],
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            outer_max_iter: 3,
-            ..BlockwiseFitOptions::default()
-        };
-        let err = match fit_custom_family(&OneBlockAlwaysErrorFamily, &[spec], &options) {
-            Ok(_) => panic!("fit should fail when family evaluate always errors"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string().contains(
-                "last objective error: synthetic outer objective failure: block[0] evaluate()"
-            ),
-            "expected preserved root-cause context in error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn fit_fails_when_requested_covariance_cannot_be_computed() {
-        let spec = ParameterBlockSpec {
-            name: "cov_block".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0],
-                [1.0]
-            ])),
-            offset: array![0.0, 0.0],
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let options = BlockwiseFitOptions {
-            use_remlobjective: false,
-            compute_covariance: true,
-            ..BlockwiseFitOptions::default()
-        };
-        let err = match fit_custom_family(&OneBlockCovarianceErrorFamily, &[spec], &options) {
-            Ok(_) => panic!("fit should fail when covariance computation fails"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string()
-                .contains("synthetic covariance assembly failure"),
-            "expected covariance root cause in fit error, got: {err}"
-        );
-    }
-
-    // Exact analytic Hessians must be finite. Non-finite Hessians are rejected
-    // loudly instead of being masked by a surrogate update.
-
-    /// A QuadraticReml family whose log_sigma block returns a Hessian containing
-    /// NaN, simulating what happens when exp(eta_sigma) overflows during
-    /// location-scale fitting.
-    #[derive(Clone)]
-    struct TwoBlockNaNHessianFamily;
-
-    impl CustomFamily for TwoBlockNaNHessianFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let n0 = block_states[0].eta.len();
-            let p1 = block_states[1].beta.len();
-            // Block 0 (mu): well-behaved diagonal working set.
-            // Block 1 (log_sigma): ExactNewton with NaN in the Hessian,
-            // simulating overflow from extreme coefficients.
-            let mut hessian = Array2::<f64>::eye(p1);
-            hessian[[0, 0]] = f64::NAN; // overflow poison
-            Ok(FamilyEvaluation {
-                log_likelihood: -0.5 * block_states[0].eta.iter().map(|&v| v * v).sum::<f64>(),
-                blockworking_sets: vec![
-                    BlockWorkingSet::Diagonal {
-                        working_response: Array1::zeros(n0),
-                        working_weights: Array1::ones(n0),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: Array1::zeros(p1),
-                        hessian: SymmetricMatrix::Dense(hessian),
-                    },
-                ],
-            })
-        }
-    }
-
-    /// Same two-block layout but with finite Hessians — the control group.
-    #[derive(Clone)]
-    struct TwoBlockFiniteHessianFamily;
-
-    impl CustomFamily for TwoBlockFiniteHessianFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            let n0 = block_states[0].eta.len();
-            let p1 = block_states[1].beta.len();
-            let beta1 = &block_states[1].beta;
-            let resid1: f64 = beta1.iter().map(|&b| b * b).sum();
-            Ok(FamilyEvaluation {
-                log_likelihood: -0.5 * block_states[0].eta.iter().map(|&v| v * v).sum::<f64>()
-                    - 0.5 * resid1,
-                blockworking_sets: vec![
-                    BlockWorkingSet::Diagonal {
-                        working_response: Array1::zeros(n0),
-                        working_weights: Array1::ones(n0),
-                    },
-                    BlockWorkingSet::ExactNewton {
-                        gradient: -beta1.clone(),
-                        hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
-                    },
-                ],
-            })
-        }
-    }
-
-    /// Same NaN-Hessian family but with PseudoLaplace objective, which takes
-    /// the strict-SPD path and skips the eigendecomposition in compute_update_step.
-    #[derive(Clone)]
-    struct TwoBlockNaNHessianPseudoLaplaceFamily;
-
-    impl CustomFamily for TwoBlockNaNHessianPseudoLaplaceFamily {
-        fn evaluate(
-            &self,
-            block_states: &[ParameterBlockState],
-        ) -> Result<FamilyEvaluation, String> {
-            TwoBlockNaNHessianFamily.evaluate(block_states)
-        }
-
-        fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
-            ExactNewtonOuterObjective::StrictPseudoLaplace
-        }
-    }
-
-    fn make_two_block_specs(n: usize) -> Vec<ParameterBlockSpec> {
-        vec![
-            ParameterBlockSpec {
-                name: "mu".to_string(),
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    Array2::from_elem((n, 1), 1.0),
-                )),
-                offset: Array1::zeros(n),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: Some(array![0.0]),
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-            ParameterBlockSpec {
-                name: "log_sigma".to_string(),
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    Array2::from_elem((n, 2), 1.0),
-                )),
-                offset: Array1::zeros(n),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: Some(array![0.0, 0.0]),
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-        ]
-    }
-
-    #[test]
-    fn exact_newton_nan_hessian_fails_loudly_before_eigendecomposition() {
-        // Exact Newton Hessians are part of the mathematical contract.  A
-        // NaN in a block Hessian means the family derivative is invalid; we
-        // should reject it at the logdet boundary instead of hiding it behind
-        // a conservative eigendecomposition fallback.
-        let specs = make_two_block_specs(4);
-        let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let result = inner_blockwise_fit(
-            &TwoBlockNaNHessianFamily,
-            &specs,
-            &per_block_log_lambdas,
-            &options,
-            None,
-        );
-        let err = result.expect_err("NaN exact Hessian must fail loudly");
-        assert!(
-            err.contains("smooth-regularized logdet Hessian contains non-finite entry"),
-            "expected explicit non-finite Hessian error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn exact_newton_finite_hessian_succeeds_where_nan_hessian_fails() {
-        // SUFFICIENCY (control): The identical two-block structure with a
-        // finite Hessian succeeds, proving that NaN in the Hessian is the
-        // specific trigger — not the block layout, penalty structure, or
-        // solver configuration.
-        let specs = make_two_block_specs(4);
-        let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let result = inner_blockwise_fit(
-            &TwoBlockFiniteHessianFamily,
-            &specs,
-            &per_block_log_lambdas,
-            &options,
-            None,
-        );
-        assert!(
-            result.is_ok(),
-            "inner fit should succeed with finite Hessian: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn checked_penalizedobjective_rejects_non_finite_values() {
-        let err = checked_penalizedobjective(-1.0, 0.5, f64::NAN, "test objective")
-            .expect_err("non-finite objective should fail loudly");
-        assert!(
-            err.contains("non-finite penalized objective"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn exact_newton_dh_closure_rejects_non_finite_directional_derivative() {
-        #[derive(Clone)]
-        struct OneBlockNonFiniteJointDhFamily;
-
-        impl CustomFamily for OneBlockNonFiniteJointDhFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                let beta = block_states
-                    .first()
-                    .ok_or_else(|| "missing block 0".to_string())?
-                    .beta
-                    .clone();
-                Ok(FamilyEvaluation {
-                    log_likelihood: -0.5 * beta.dot(&beta),
-                    blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                        gradient: beta.mapv(|v| -v),
-                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
-                    }],
-                })
-            }
-
-            fn exact_newton_joint_hessian(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<Option<Array2<f64>>, String> {
-                assert!(block_states.len() <= isize::MAX as usize);
-                Ok(Some(array![[1.0]]))
-            }
-
-            fn exact_newton_joint_hessian_directional_derivative(
-                &self,
-                block_states: &[ParameterBlockState],
-                arr: &Array1<f64>,
-            ) -> Result<Option<Array2<f64>>, String> {
-                assert!(block_states.len() <= isize::MAX as usize);
-                assert!(arr.iter().all(|v| !v.is_nan()));
-                Ok(Some(array![[f64::NAN]]))
-            }
-        }
-
-        let family = OneBlockNonFiniteJointDhFamily;
-        let specs = vec![ParameterBlockSpec {
-            name: "beta".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (2, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(2),
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(array![0.0]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }];
-        let states = vec![ParameterBlockState {
-            beta: array![0.0],
-            eta: Array1::zeros(2),
-        }];
-        let synced_states = Arc::new(
-            synchronized_states_from_flat_beta(&family, &specs, &states, &array![0.0])
-                .expect("sync states for exact_newton_dh_closure"),
-        );
-        let compute_dh =
-            exact_newton_dh_closure(&family, synced_states, &specs, 1, false, 1.0, None);
-        let err = compute_dh(&array![1.0]).expect_err("non-finite dH should fail loudly");
-        assert!(err.contains("non-finite"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn nan_propagating_min_detects_nan_eigenvalues() {
-        // Verify the fix: our NaN-propagating min correctly detects
-        // NaN eigenvalues, unlike f64::min which silently ignored them.
-        let mut mat = Array2::<f64>::eye(3);
-        mat[[1, 0]] = f64::NAN;
-        mat[[0, 1]] = f64::NAN;
-
-        use crate::faer_ndarray::FaerEigh;
-        match FaerEigh::eigh(&mat, faer::Side::Lower) {
-            Err(_) => {
-                // eigh failed — the fallback chain in compute_update_step
-                // now catches this and applies a conservative ridge.
-            }
-            Ok((evals, _)) => {
-                // NaN-propagating fold (matches the production code):
-                let new_min = evals.iter().copied().fold(f64::INFINITY, |a, b| {
-                    if a.is_nan() || b.is_nan() {
-                        f64::NAN
-                    } else {
-                        a.min(b)
-                    }
-                });
-                assert!(
-                    !new_min.is_finite(),
-                    "NaN-propagating min should detect NaN eigenvalues, got {new_min}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn multiblock_generic_outer_fallback_returns_error_instead_of_panicking() {
-        let family = TwoBlockFiniteHessianFamily;
-        let specs = make_two_block_specs(4);
-        let penalty_counts = vec![0usize, 0usize];
-        let rho = Array1::zeros(0);
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        };
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::test_support::outerobjectivegradienthessian(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho,
-                None,
-                EvalMode::ValueGradientHessian,
-            )
-        }));
-
-        let outcome = result.expect("multi-block outer fallback must return an error, not panic");
-        let err = match outcome {
-            Ok(_) => panic!("multi-block family without a joint path should fail loudly"),
-            Err(err) => err.to_string(),
-        };
-        assert!(
-            err.contains("multi-block families must provide a joint outer path"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn pseudo_laplace_path_skips_eigendecomposition_avoiding_nan_crash() {
-        // SUFFICIENCY: The PseudoLaplace path takes strict_solve_spd instead
-        // of eigendecomposition-based ridging.  It will still fail (the Hessian
-        // is NaN so the solve produces garbage), but the failure is NOT the
-        // eigendecomposition NoConvergence error — it's a different error
-        // downstream.  This proves the eigendecomposition call is the unique
-        // failure point for QuadraticReml families.
-        let specs = make_two_block_specs(4);
-        let per_block_log_lambdas = vec![Array1::zeros(0), Array1::zeros(0)];
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let result = inner_blockwise_fit(
-            &TwoBlockNaNHessianPseudoLaplaceFamily,
-            &specs,
-            &per_block_log_lambdas,
-            &options,
-            None,
-        );
-        // The PseudoLaplace path may fail for other reasons (NaN in solve),
-        // but it must NOT fail with the eigendecomposition error.
-        match result {
-            Ok(_) => {} // Acceptable — strict_solve_spd might produce NaN
-            // betas which don't trigger a hard error.
-            Err(ref msg) => {
-                assert!(
-                    !msg.contains("exact-newton eigendecomposition failed"),
-                    "PseudoLaplace path should NOT hit eigendecomposition; \
+                !msg.contains("exact-newton eigendecomposition failed"),
+                "PseudoLaplace path should NOT hit eigendecomposition; \
                      got eigendecomposition error anyway: {msg}"
-                );
-            }
+            );
         }
     }
+}
 
-    /// Regression check: when `strict_solve_spd_with_lm_continuation` is given a
-    /// strongly negative-definite matrix whose `|λ_min|` exceeds the LM δ-ridge
-    /// schedule's terminal δ (≈ ε · trace_scale · 10¹⁶), the bare schedule can't
-    /// rescue Cholesky and the terminal eigen-floor fallback must return a
-    /// finite solution equal to `Q diag(1/Λ̃) Qᵀ rhs`, with
-    /// `Λ̃_i = max(Λ_i, ε λ_max)`.
-    ///
-    /// We also exercise the schedule-success path with a milder matrix to lock
-    /// in that the eigen-floor doesn't perturb the LM-δ output for cases the
-    /// schedule can already handle.
-    #[test]
-    fn strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
-        // δ schedule from `delta0 = max(ε·tr/p, 1e-12)`, growth 10×, 16 steps.
-        // With `tr = 4·1e30` we get `delta0 ≈ ε·1e30 ≈ 2.2e14`; terminal δ at
-        // escalation 16 is `2.2e14 · 1e16 = 2.2e30`. Set `λ_min ≈ -1e32` to
-        // outpace the schedule and force the eigen-floor branch.
-        let p = 4usize;
-        let mut h = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            h[[i, i]] = -1e32 - (i as f64) * 1e30;
-        }
-        h[[0, 1]] = 5e29;
-        h[[1, 0]] = 5e29;
-        let rhs = Array1::from_vec(vec![1e30, -5e29, 2.5e29, 7.5e29]);
+/// Regression check: when `strict_solve_spd_with_lm_continuation` is given a
+/// strongly negative-definite matrix whose `|λ_min|` exceeds the LM δ-ridge
+/// schedule's terminal δ (≈ ε · trace_scale · 10¹⁶), the bare schedule can't
+/// rescue Cholesky and the terminal eigen-floor fallback must return a
+/// finite solution equal to `Q diag(1/Λ̃) Qᵀ rhs`, with
+/// `Λ̃_i = max(Λ_i, ε λ_max)`.
+///
+/// We also exercise the schedule-success path with a milder matrix to lock
+/// in that the eigen-floor doesn't perturb the LM-δ output for cases the
+/// schedule can already handle.
+#[test]
+fn strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
+    // δ schedule from `delta0 = max(ε·tr/p, 1e-12)`, growth 10×, 16 steps.
+    // With `tr = 4·1e30` we get `delta0 ≈ ε·1e30 ≈ 2.2e14`; terminal δ at
+    // escalation 16 is `2.2e14 · 1e16 = 2.2e30`. Set `λ_min ≈ -1e32` to
+    // outpace the schedule and force the eigen-floor branch.
+    let p = 4usize;
+    let mut h = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        h[[i, i]] = -1e32 - (i as f64) * 1e30;
+    }
+    h[[0, 1]] = 5e29;
+    h[[1, 0]] = 5e29;
+    let rhs = Array1::from_vec(vec![1e30, -5e29, 2.5e29, 7.5e29]);
 
-        let (x, stats) = strict_solve_spd_with_lm_continuation(&h, &rhs)
-            .expect("eigen-floor fallback must succeed on the negative-definite matrix");
+    let (x, stats) = strict_solve_spd_with_lm_continuation(&h, &rhs)
+        .expect("eigen-floor fallback must succeed on the negative-definite matrix");
+    assert!(
+        stats.escalations > 16,
+        "expected eigen-floor terminal fallback (escalations > MAX_ESCALATIONS), got {}",
+        stats.escalations,
+    );
+    for &v in x.iter() {
         assert!(
-            stats.escalations > 16,
-            "expected eigen-floor terminal fallback (escalations > MAX_ESCALATIONS), got {}",
-            stats.escalations,
+            v.is_finite(),
+            "eigen-floor solve returned non-finite component {v}"
         );
-        for &v in x.iter() {
-            assert!(
-                v.is_finite(),
-                "eigen-floor solve returned non-finite component {v}"
-            );
-        }
+    }
 
-        // Reconstruct the analytic floored solve and compare component-wise.
-        let mut sym = h.clone();
-        symmetrize_dense_in_place(&mut sym);
-        let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
-        let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
-        let mut want = Array1::<f64>::zeros(p);
-        for k in 0..p {
-            let mut q_t_rhs = 0.0;
-            for i in 0..p {
-                q_t_rhs += evecs[[i, k]] * rhs[i];
-            }
-            let scaled = q_t_rhs / evals[k].max(eps_floor);
-            for i in 0..p {
-                want[i] += evecs[[i, k]] * scaled;
-            }
-        }
+    // Reconstruct the analytic floored solve and compare component-wise.
+    let mut sym = h.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
+    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
+    let mut want = Array1::<f64>::zeros(p);
+    for k in 0..p {
+        let mut q_t_rhs = 0.0;
         for i in 0..p {
-            let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
-            assert!(
-                (want[i] - x[i]).abs() <= tol,
-                "eigen-floor solve component {i}: want={:.6e}, got={:.6e}",
-                want[i],
-                x[i],
-            );
+            q_t_rhs += evecs[[i, k]] * rhs[i];
+        }
+        let scaled = q_t_rhs / evals[k].max(eps_floor);
+        for i in 0..p {
+            want[i] += evecs[[i, k]] * scaled;
         }
     }
-
-    // ---------- eta_backup heterogeneous-shape regression tests ----------
-    //
-    // Regression note: a previous `inner_blockwise_fit` implementation
-    // reused a single `eta_backup` buffer across blocks during line search.
-    // With heterogeneous eta lengths (e.g. survival time block = 3n,
-    // threshold/log-sigma = n), that buffer could be left at the wrong
-    // shape for the next block update and trigger an ndarray broadcast
-    // panic:
-    //   "could not broadcast array from shape: [n] to: [3n]"
-
-    /// Minimal two-block family where block 0 has design nrows=3n and
-    /// block 1 has design nrows=n. Both use ExactNewton. Block 0's
-    /// gradient is nonzero so the Newton step exceeds tol and exercises
-    /// the line-search path that previously mishandled heterogeneous
-    /// eta buffer shapes.
-    #[derive(Clone)]
-    struct HeterogeneousEtaLengthFamily {
-        n: usize,
+    for i in 0..p {
+        let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+        assert!(
+            (want[i] - x[i]).abs() <= tol,
+            "eigen-floor solve component {i}: want={:.6e}, got={:.6e}",
+            want[i],
+            x[i],
+        );
     }
+}
 
-    impl CustomFamily for HeterogeneousEtaLengthFamily {
+// ---------- eta_backup heterogeneous-shape regression tests ----------
+//
+// Regression note: a previous `inner_blockwise_fit` implementation
+// reused a single `eta_backup` buffer across blocks during line search.
+// With heterogeneous eta lengths (e.g. survival time block = 3n,
+// threshold/log-sigma = n), that buffer could be left at the wrong
+// shape for the next block update and trigger an ndarray broadcast
+// panic:
+//   "could not broadcast array from shape: [n] to: [3n]"
+
+/// Minimal two-block family where block 0 has design nrows=3n and
+/// block 1 has design nrows=n. Both use ExactNewton. Block 0's
+/// gradient is nonzero so the Newton step exceeds tol and exercises
+/// the line-search path that previously mishandled heterogeneous
+/// eta buffer shapes.
+#[derive(Clone)]
+struct HeterogeneousEtaLengthFamily {
+    n: usize,
+}
+
+impl CustomFamily for HeterogeneousEtaLengthFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n = self.n;
+        let eta0 = &block_states[0].eta;
+        let eta1 = &block_states[1].eta;
+        assert_eq!(eta0.len(), 3 * n, "block 0 eta must be 3n");
+        assert_eq!(eta1.len(), n, "block 1 eta must be n");
+        let p0 = block_states[0].beta.len();
+        let p1 = block_states[1].beta.len();
+        // Simple quadratic log-likelihood so optimum is at beta=0.
+        let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
+        // Nonzero gradient drives a real step in both blocks.
+        let grad0 = &(-&block_states[0].beta) + &Array1::from_elem(p0, 0.1);
+        let grad1 = &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1);
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad0,
+                    hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad1,
+                    hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                },
+            ],
+        })
+    }
+}
+
+fn make_heterogeneous_eta_specs(n: usize) -> Vec<ParameterBlockSpec> {
+    let p0 = 2;
+    let p1 = 2;
+    vec![
+        ParameterBlockSpec {
+            name: "big_block".to_string(),
+            // 3n rows — mimics survival time block stacking
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (3 * n, p0),
+                1.0,
+            ))),
+            offset: Array1::zeros(3 * n),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(Array1::from_elem(p0, 1.0)),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        },
+        ParameterBlockSpec {
+            name: "small_block".to_string(),
+            // n rows — mimics threshold/log-sigma block
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+                (n, p1),
+                1.0,
+            ))),
+            offset: Array1::zeros(n),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(Array1::from_elem(p1, 1.0)),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        },
+    ]
+}
+
+/// Regression guard: blocks with identical eta lengths never exercised
+/// the old heterogeneous-shape failure mode.
+#[test]
+fn uniform_eta_lengths_do_not_panic() {
+    let n = 10;
+    #[derive(Clone)]
+    struct UniformEtaFamily;
+    impl CustomFamily for UniformEtaFamily {
         fn evaluate(
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-            let n = self.n;
-            let eta0 = &block_states[0].eta;
-            let eta1 = &block_states[1].eta;
-            assert_eq!(eta0.len(), 3 * n, "block 0 eta must be 3n");
-            assert_eq!(eta1.len(), n, "block 1 eta must be n");
             let p0 = block_states[0].beta.len();
             let p1 = block_states[1].beta.len();
-            // Simple quadratic log-likelihood so optimum is at beta=0.
+            let eta0 = &block_states[0].eta;
+            let eta1 = &block_states[1].eta;
             let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
-            // Nonzero gradient drives a real step in both blocks.
-            let grad0 = &(-&block_states[0].beta) + &Array1::from_elem(p0, 0.1);
-            let grad1 = &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1);
             Ok(FamilyEvaluation {
                 log_likelihood: ll,
                 blockworking_sets: vec![
                     BlockWorkingSet::ExactNewton {
-                        gradient: grad0,
+                        gradient: &(-&block_states[0].beta) + &Array1::from_elem(p0, 0.1),
                         hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
                     },
                     BlockWorkingSet::ExactNewton {
-                        gradient: grad1,
+                        gradient: &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1),
                         hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
                     },
                 ],
             })
         }
     }
-
-    fn make_heterogeneous_eta_specs(n: usize) -> Vec<ParameterBlockSpec> {
-        let p0 = 2;
-        let p1 = 2;
+    // Both blocks have n rows — no shape mismatch possible.
+    let specs =
         vec![
-            ParameterBlockSpec {
-                name: "big_block".to_string(),
-                // 3n rows — mimics survival time block stacking
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    Array2::from_elem((3 * n, p0), 1.0),
-                )),
-                offset: Array1::zeros(3 * n),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: Some(Array1::from_elem(p0, 1.0)),
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-            ParameterBlockSpec {
-                name: "small_block".to_string(),
-                // n rows — mimics threshold/log-sigma block
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    Array2::from_elem((n, p1), 1.0),
-                )),
-                offset: Array1::zeros(n),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: Some(Array1::from_elem(p1, 1.0)),
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-        ]
-    }
-
-    /// Regression guard: blocks with identical eta lengths never exercised
-    /// the old heterogeneous-shape failure mode.
-    #[test]
-    fn uniform_eta_lengths_do_not_panic() {
-        let n = 10;
-        #[derive(Clone)]
-        struct UniformEtaFamily;
-        impl CustomFamily for UniformEtaFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                let p0 = block_states[0].beta.len();
-                let p1 = block_states[1].beta.len();
-                let eta0 = &block_states[0].eta;
-                let eta1 = &block_states[1].eta;
-                let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
-                Ok(FamilyEvaluation {
-                    log_likelihood: ll,
-                    blockworking_sets: vec![
-                        BlockWorkingSet::ExactNewton {
-                            gradient: &(-&block_states[0].beta) + &Array1::from_elem(p0, 0.1),
-                            hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
-                        },
-                        BlockWorkingSet::ExactNewton {
-                            gradient: &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1),
-                            hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
-                        },
-                    ],
-                })
-            }
-        }
-        // Both blocks have n rows — no shape mismatch possible.
-        let specs = vec![
             ParameterBlockSpec {
                 name: "block_a".to_string(),
                 design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -6463,1284 +6309,1445 @@
                 stacked_offset: None,
             },
         ];
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 3,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        // Must NOT panic — uniform eta lengths keep eta_backup
-        // compatible with every block's eta after mem::swap.
-        let result = inner_blockwise_fit(&UniformEtaFamily, &specs, &per_block, &options, None);
-        assert!(
-            result.is_ok(),
-            "uniform eta lengths should not panic: {result:?}"
-        );
-    }
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 3,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    // Must NOT panic — uniform eta lengths keep eta_backup
+    // compatible with every block's eta after mem::swap.
+    let result = inner_blockwise_fit(&UniformEtaFamily, &specs, &per_block, &options, None);
+    assert!(
+        result.is_ok(),
+        "uniform eta lengths should not panic: {result:?}"
+    );
+}
 
-    /// Regression guard: heterogeneous eta lengths (3n vs n) must not
-    /// prevent the inner fit from completing. Older code could panic with
-    /// "could not broadcast array from shape: [n] to: [3n]" due to the
-    /// eta_backup swap bug.
-    #[test]
-    fn heterogeneous_eta_lengths_inner_fit_completes() {
-        let n = 10;
-        let family = HeterogeneousEtaLengthFamily { n };
-        let specs = make_heterogeneous_eta_specs(n);
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 3,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
-        assert!(result.is_ok(), "inner fit should complete: {result:?}");
-    }
+/// Regression guard: heterogeneous eta lengths (3n vs n) must not
+/// prevent the inner fit from completing. Older code could panic with
+/// "could not broadcast array from shape: [n] to: [3n]" due to the
+/// eta_backup swap bug.
+#[test]
+fn heterogeneous_eta_lengths_inner_fit_completes() {
+    let n = 10;
+    let family = HeterogeneousEtaLengthFamily { n };
+    let specs = make_heterogeneous_eta_specs(n);
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 3,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
+    assert!(result.is_ok(), "inner fit should complete: {result:?}");
+}
 
-    /// SUFFICIENCY (single-cycle): even one inner cycle must complete
-    /// without panic when blocks have heterogeneous eta lengths.
-    #[test]
-    fn heterogeneous_eta_single_cycle_completes() {
-        let n = 10;
-        let family = HeterogeneousEtaLengthFamily { n };
-        let specs = make_heterogeneous_eta_specs(n);
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
-        assert!(
-            result.is_ok(),
-            "single-cycle inner fit should complete: {result:?}"
-        );
-    }
+/// SUFFICIENCY (single-cycle): even one inner cycle must complete
+/// without panic when blocks have heterogeneous eta lengths.
+#[test]
+fn heterogeneous_eta_single_cycle_completes() {
+    let n = 10;
+    let family = HeterogeneousEtaLengthFamily { n };
+    let specs = make_heterogeneous_eta_specs(n);
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
+    assert!(
+        result.is_ok(),
+        "single-cycle inner fit should complete: {result:?}"
+    );
+}
 
-    /// Regression guard: when all blocks have step <= tol, the line-search
-    /// path is skipped for every block, so this case should remain safe
-    /// even with heterogeneous eta lengths.
-    #[test]
-    fn heterogeneous_eta_no_panic_when_all_blocks_converged() {
-        let n = 10;
-        #[derive(Clone)]
-        struct AllConvergedFamily {
-            n: usize,
+/// Regression guard: when all blocks have step <= tol, the line-search
+/// path is skipped for every block, so this case should remain safe
+/// even with heterogeneous eta lengths.
+#[test]
+fn heterogeneous_eta_no_panic_when_all_blocks_converged() {
+    let n = 10;
+    #[derive(Clone)]
+    struct AllConvergedFamily {
+        n: usize,
+    }
+    impl CustomFamily for AllConvergedFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = self.n;
+            let eta0 = &block_states[0].eta;
+            let eta1 = &block_states[1].eta;
+            assert_eq!(eta0.len(), 3 * n);
+            assert_eq!(eta1.len(), n);
+            let p0 = block_states[0].beta.len();
+            let p1 = block_states[1].beta.len();
+            let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
+            Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                blockworking_sets: vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(p0),
+                        hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: Array1::zeros(p1),
+                        hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                    },
+                ],
+            })
         }
-        impl CustomFamily for AllConvergedFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                let n = self.n;
-                let eta0 = &block_states[0].eta;
-                let eta1 = &block_states[1].eta;
-                assert_eq!(eta0.len(), 3 * n);
-                assert_eq!(eta1.len(), n);
-                let p0 = block_states[0].beta.len();
-                let p1 = block_states[1].beta.len();
-                let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
-                Ok(FamilyEvaluation {
-                    log_likelihood: ll,
-                    blockworking_sets: vec![
-                        BlockWorkingSet::ExactNewton {
-                            gradient: Array1::zeros(p0),
-                            hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
-                        },
-                        BlockWorkingSet::ExactNewton {
-                            gradient: Array1::zeros(p1),
-                            hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
-                        },
-                    ],
-                })
-            }
-        }
-        let mut specs = make_heterogeneous_eta_specs(n);
-        specs[0].initial_beta = Some(Array1::zeros(2));
-        specs[1].initial_beta = Some(Array1::zeros(2));
-        let family = AllConvergedFamily { n };
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        // All blocks converged → step=0 → `continue` before swap →
-        // eta_backup never participates → no broadcast panic.
-        let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
-        assert!(
-            result.is_ok(),
-            "should not panic when all blocks are converged: {result:?}"
-        );
     }
+    let mut specs = make_heterogeneous_eta_specs(n);
+    specs[0].initial_beta = Some(Array1::zeros(2));
+    specs[1].initial_beta = Some(Array1::zeros(2));
+    let family = AllConvergedFamily { n };
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    // All blocks converged → step=0 → `continue` before swap →
+    // eta_backup never participates → no broadcast panic.
+    let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
+    assert!(
+        result.is_ok(),
+        "should not panic when all blocks are converged: {result:?}"
+    );
+}
 
-    /// Regression guard: even when only the second (smaller) block takes
-    /// a step, the fit must complete. Earlier code could still panic here
-    /// after reusing an oversized eta_backup buffer across blocks.
-    #[test]
-    fn heterogeneous_eta_completes_when_only_small_block_steps() {
-        let n = 10;
-        #[derive(Clone)]
-        struct OnlySmallBlockStepsFamily {
-            n: usize,
-        }
-        impl CustomFamily for OnlySmallBlockStepsFamily {
-            fn evaluate(
-                &self,
-                block_states: &[ParameterBlockState],
-            ) -> Result<FamilyEvaluation, String> {
-                let n = self.n;
-                let eta0 = &block_states[0].eta;
-                let eta1 = &block_states[1].eta;
-                assert_eq!(eta0.len(), 3 * n);
-                assert_eq!(eta1.len(), n);
-                let p0 = block_states[0].beta.len();
-                let p1 = block_states[1].beta.len();
-                let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
-                Ok(FamilyEvaluation {
-                    log_likelihood: ll,
-                    blockworking_sets: vec![
-                        BlockWorkingSet::ExactNewton {
-                            // Block 0: converged, step=0
-                            gradient: Array1::zeros(p0),
-                            hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
-                        },
-                        BlockWorkingSet::ExactNewton {
-                            // Block 1: nontrivial step
-                            gradient: &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1),
-                            hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
-                        },
-                    ],
-                })
-            }
-        }
-        let mut specs = make_heterogeneous_eta_specs(n);
-        specs[0].initial_beta = Some(Array1::zeros(2)); // block 0 at optimum
-        let family = OnlySmallBlockStepsFamily { n };
-        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
-        let options = BlockwiseFitOptions {
-            inner_max_cycles: 1,
-            use_remlobjective: false,
-            compute_covariance: false,
-            ..BlockwiseFitOptions::default()
-        };
-        let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
-        assert!(
-            result.is_ok(),
-            "fit should complete when only small block steps: {result:?}"
-        );
+/// Regression guard: even when only the second (smaller) block takes
+/// a step, the fit must complete. Earlier code could still panic here
+/// after reusing an oversized eta_backup buffer across blocks.
+#[test]
+fn heterogeneous_eta_completes_when_only_small_block_steps() {
+    let n = 10;
+    #[derive(Clone)]
+    struct OnlySmallBlockStepsFamily {
+        n: usize,
     }
-
-    /// Direct test of the KKT-aware projection in
-    /// `projected_stationarity_inf_norm`.
-    ///
-    /// Contract:
-    ///   (i)   with no constraints, returns the plain inf-norm of the residual;
-    ///   (ii)  at an active lower bound with multiplier-signed residual
-    ///         (`β_j == lb_j` and `residual_j > 0`) the coordinate is skipped;
-    ///   (iii) at an active lower bound with wrong-signed residual
-    ///         (`residual_j < 0`) the coordinate still contributes;
-    ///   (iv)  interior coordinates always contribute regardless of
-    ///         residual sign.
-    ///
-    /// This pins the exact convergence semantics that the joint-Newton loop
-    /// relies on: a genuine constrained-KKT optimum must score zero, while
-    /// infeasibility and interior non-stationarity remain observable.
-    #[test]
-    fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
-        assert!(file!().ends_with(".rs"));
-        // Test (i): no constraints → plain inf-norm.
-        let beta = array![1.0, 2.0, -0.5];
-        let residual = array![0.3, -0.1, 0.2];
-        let inf_nocon = projected_stationarity_inf_norm(&residual, &beta, None, None);
-        assert_relative_eq!(inf_nocon, 0.3_f64, epsilon = 1e-12);
-
-        // Test (ii): β_j at its lower bound with residual_j > 0 is a KKT
-        // multiplier; projection drops it, so only the interior entry (-0.1)
-        // contributes.
-        let beta_active = array![0.0, 2.0];
-        let residual_active = array![0.5, -0.1];
-        let constraints_lb0 = LinearInequalityConstraints {
-            a: array![[1.0, 0.0], [0.0, 1.0]],
-            b: array![0.0, f64::NEG_INFINITY], // only β_0 has a finite lower bound
-        };
-        // Build a minimal single-row constraint first (β_0 ≥ 0) so the
-        // "active lower bound + positive residual" branch of the projection
-        // is exercised in isolation.  β_1 is left unconstrained relative to
-        // this single-row constraint matrix (it's not pinned by any row),
-        // so its contribution (|-0.1| = 0.1) stays in the inf-norm.
-        let single = LinearInequalityConstraints {
-            a: array![[1.0, 0.0]],
-            b: array![0.0],
-        };
-        let inf_projected =
-            projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single), None);
-        assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
-        let vec_projected = projected_linear_constraint_stationarity_vector(
-            &residual_active,
-            &beta_active,
-            &single,
-            None,
-        )
-        .expect("active lower-bound projection should succeed");
-        assert_relative_eq!(vec_projected[0], 0.0_f64, epsilon = 1e-10);
-        assert_relative_eq!(vec_projected[1], -0.1_f64, epsilon = 1e-12);
-
-        // Also verify the per-coord handling of an explicitly-unconstrained
-        // row (b = -inf) in the two-row form: β_0 has a finite lower bound
-        // of 0 (from row 0), β_1 gets lb = -inf (from row 1 via b/a), which
-        // `lb.is_finite() == false` routes to the "no lower bound" branch of
-        // the projection.  The active-bound drop still fires on coord 0, so
-        // the result matches the single-row case: 0.1.  This documents that
-        // the projection's per-coord `lb.is_finite()` gate is what makes the
-        // unconstrained-coord case work — NOT rejection of the whole
-        // constraint set by `extract_simple_lower_bounds`.
-        let inf_with_two_row = projected_stationarity_inf_norm(
-            &residual_active,
-            &beta_active,
-            Some(&constraints_lb0),
-            None,
-        );
-        assert_relative_eq!(inf_with_two_row, 0.1_f64, epsilon = 1e-12);
-
-        // Test (iii): β_j at its bound but residual points the WRONG way
-        // (residual_j < 0 means the KKT dual feasibility λ_j ≥ 0 is violated
-        // — i.e. the bound should release).  Keep that coordinate in the
-        // norm so the optimizer does not declare convergence on an infeasible
-        // multiplier.
-        let beta_wrong_sign = array![0.0];
-        let residual_wrong_sign = array![-0.2];
-        let single1 = LinearInequalityConstraints {
-            a: array![[1.0]],
-            b: array![0.0],
-        };
-        let inf_wrong_sign = projected_stationarity_inf_norm(
-            &residual_wrong_sign,
-            &beta_wrong_sign,
-            Some(&single1),
-            None,
-        );
-        assert_relative_eq!(inf_wrong_sign, 0.2_f64, epsilon = 1e-12);
-
-        // Test (iv): an interior coordinate with a valid lower bound keeps
-        // contributing to the norm, whatever the residual sign.
-        let beta_interior = array![1.5];
-        let residual_interior = array![0.4];
-        let inf_interior = projected_stationarity_inf_norm(
-            &residual_interior,
-            &beta_interior,
-            Some(&single1),
-            None,
-        );
-        assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
+    impl CustomFamily for OnlySmallBlockStepsFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let n = self.n;
+            let eta0 = &block_states[0].eta;
+            let eta1 = &block_states[1].eta;
+            assert_eq!(eta0.len(), 3 * n);
+            assert_eq!(eta1.len(), n);
+            let p0 = block_states[0].beta.len();
+            let p1 = block_states[1].beta.len();
+            let ll = -0.5 * eta0.dot(eta0) - 0.5 * eta1.dot(eta1);
+            Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                blockworking_sets: vec![
+                    BlockWorkingSet::ExactNewton {
+                        // Block 0: converged, step=0
+                        gradient: Array1::zeros(p0),
+                        hessian: SymmetricMatrix::Dense(Array2::eye(p0)),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        // Block 1: nontrivial step
+                        gradient: &(-&block_states[1].beta) + &Array1::from_elem(p1, 0.1),
+                        hessian: SymmetricMatrix::Dense(Array2::eye(p1)),
+                    },
+                ],
+            })
+        }
     }
+    let mut specs = make_heterogeneous_eta_specs(n);
+    specs[0].initial_beta = Some(Array1::zeros(2)); // block 0 at optimum
+    let family = OnlySmallBlockStepsFamily { n };
+    let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let result = inner_blockwise_fit(&family, &specs, &per_block, &options, None);
+    assert!(
+        result.is_ok(),
+        "fit should complete when only small block steps: {result:?}"
+    );
+}
 
-    /// Pins the constrained-stationary certificate semantics.
-    ///
-    /// The certificate combines three local signals from the most recent
-    /// accepted Newton step:
-    ///
-    ///   1. `linearized_rel = ‖g + Hδ‖∞ / (1 + ‖g‖∞)` ≥ 0.5
-    ///      — the linear solve refused to neutralise most of `g`; the
-    ///        unreduced component lives in the constraint-active subspace
-    ///        and IS a Lagrange multiplier, not a defect of the solve.
-    ///
-    ///   2. `scalar_model_relative_error()` ≤ 1e-3
-    ///      — the local quadratic Newton model agrees with the observed
-    ///        objective change to roundoff, proving the Hessian+gradient
-    ///        are correct at this β.  Rules out genuine model mismatch
-    ///        masquerading as a multiplier.
-    ///
-    ///   3. `|Δobjective|` ≤ `objective_tol`
-    ///      — the objective has ceased moving.
-    ///
-    /// Reproduces the large-scale survival-marginal-slope failure numerics:
-    /// `old_kkt ≈ 8.6e5`, `linearized_next ≈ 8.6e5`, `actual ≈ pred ≈ 1.6e-2`.
-    #[test]
-    fn joint_newton_math_constrained_stationary_signature_matches_aou_failure() {
-        let math = JointNewtonMathDiagnostic {
-            old_kkt_inf: 8.613e5,
-            linearized_next_kkt_inf: 8.580e5,
-            predicted_reduction: 1.589e-2,
-            actual_reduction: 1.589e-2,
-            trust_ratio: 1.000,
-            step_inf: 1.270e-2,
-            proposal_inf: 1.270e-2,
-        };
-        // (1) The linearized solve neutralised <1% of g — Lagrange multiplier
-        // pattern, not a defect of the solve.
-        let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
-        assert!(
-            linearized_rel >= 0.5,
-            "large-scale exit has linearized_rel = {:.3e}, must be >= 0.5 for the \
+/// Direct test of the KKT-aware projection in
+/// `projected_stationarity_inf_norm`.
+///
+/// Contract:
+///   (i)   with no constraints, returns the plain inf-norm of the residual;
+///   (ii)  at an active lower bound with multiplier-signed residual
+///         (`β_j == lb_j` and `residual_j > 0`) the coordinate is skipped;
+///   (iii) at an active lower bound with wrong-signed residual
+///         (`residual_j < 0`) the coordinate still contributes;
+///   (iv)  interior coordinates always contribute regardless of
+///         residual sign.
+///
+/// This pins the exact convergence semantics that the joint-Newton loop
+/// relies on: a genuine constrained-KKT optimum must score zero, while
+/// infeasibility and interior non-stationarity remain observable.
+#[test]
+fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
+    assert!(file!().ends_with(".rs"));
+    // Test (i): no constraints → plain inf-norm.
+    let beta = array![1.0, 2.0, -0.5];
+    let residual = array![0.3, -0.1, 0.2];
+    let inf_nocon = projected_stationarity_inf_norm(&residual, &beta, None, None);
+    assert_relative_eq!(inf_nocon, 0.3_f64, epsilon = 1e-12);
+
+    // Test (ii): β_j at its lower bound with residual_j > 0 is a KKT
+    // multiplier; projection drops it, so only the interior entry (-0.1)
+    // contributes.
+    let beta_active = array![0.0, 2.0];
+    let residual_active = array![0.5, -0.1];
+    let constraints_lb0 = LinearInequalityConstraints {
+        a: array![[1.0, 0.0], [0.0, 1.0]],
+        b: array![0.0, f64::NEG_INFINITY], // only β_0 has a finite lower bound
+    };
+    // Build a minimal single-row constraint first (β_0 ≥ 0) so the
+    // "active lower bound + positive residual" branch of the projection
+    // is exercised in isolation.  β_1 is left unconstrained relative to
+    // this single-row constraint matrix (it's not pinned by any row),
+    // so its contribution (|-0.1| = 0.1) stays in the inf-norm.
+    let single = LinearInequalityConstraints {
+        a: array![[1.0, 0.0]],
+        b: array![0.0],
+    };
+    let inf_projected =
+        projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single), None);
+    assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
+    let vec_projected = projected_linear_constraint_stationarity_vector(
+        &residual_active,
+        &beta_active,
+        &single,
+        None,
+    )
+    .expect("active lower-bound projection should succeed");
+    assert_relative_eq!(vec_projected[0], 0.0_f64, epsilon = 1e-10);
+    assert_relative_eq!(vec_projected[1], -0.1_f64, epsilon = 1e-12);
+
+    // Also verify the per-coord handling of an explicitly-unconstrained
+    // row (b = -inf) in the two-row form: β_0 has a finite lower bound
+    // of 0 (from row 0), β_1 gets lb = -inf (from row 1 via b/a), which
+    // `lb.is_finite() == false` routes to the "no lower bound" branch of
+    // the projection.  The active-bound drop still fires on coord 0, so
+    // the result matches the single-row case: 0.1.  This documents that
+    // the projection's per-coord `lb.is_finite()` gate is what makes the
+    // unconstrained-coord case work — NOT rejection of the whole
+    // constraint set by `extract_simple_lower_bounds`.
+    let inf_with_two_row = projected_stationarity_inf_norm(
+        &residual_active,
+        &beta_active,
+        Some(&constraints_lb0),
+        None,
+    );
+    assert_relative_eq!(inf_with_two_row, 0.1_f64, epsilon = 1e-12);
+
+    // Test (iii): β_j at its bound but residual points the WRONG way
+    // (residual_j < 0 means the KKT dual feasibility λ_j ≥ 0 is violated
+    // — i.e. the bound should release).  Keep that coordinate in the
+    // norm so the optimizer does not declare convergence on an infeasible
+    // multiplier.
+    let beta_wrong_sign = array![0.0];
+    let residual_wrong_sign = array![-0.2];
+    let single1 = LinearInequalityConstraints {
+        a: array![[1.0]],
+        b: array![0.0],
+    };
+    let inf_wrong_sign = projected_stationarity_inf_norm(
+        &residual_wrong_sign,
+        &beta_wrong_sign,
+        Some(&single1),
+        None,
+    );
+    assert_relative_eq!(inf_wrong_sign, 0.2_f64, epsilon = 1e-12);
+
+    // Test (iv): an interior coordinate with a valid lower bound keeps
+    // contributing to the norm, whatever the residual sign.
+    let beta_interior = array![1.5];
+    let residual_interior = array![0.4];
+    let inf_interior =
+        projected_stationarity_inf_norm(&residual_interior, &beta_interior, Some(&single1), None);
+    assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
+}
+
+/// Pins the constrained-stationary certificate semantics.
+///
+/// The certificate combines three local signals from the most recent
+/// accepted Newton step:
+///
+///   1. `linearized_rel = ‖g + Hδ‖∞ / (1 + ‖g‖∞)` ≥ 0.5
+///      — the linear solve refused to neutralise most of `g`; the
+///        unreduced component lives in the constraint-active subspace
+///        and IS a Lagrange multiplier, not a defect of the solve.
+///
+///   2. `scalar_model_relative_error()` ≤ 1e-3
+///      — the local quadratic Newton model agrees with the observed
+///        objective change to roundoff, proving the Hessian+gradient
+///        are correct at this β.  Rules out genuine model mismatch
+///        masquerading as a multiplier.
+///
+///   3. `|Δobjective|` ≤ `objective_tol`
+///      — the objective has ceased moving.
+///
+/// Reproduces the large-scale survival-marginal-slope failure numerics:
+/// `old_kkt ≈ 8.6e5`, `linearized_next ≈ 8.6e5`, `actual ≈ pred ≈ 1.6e-2`.
+#[test]
+fn joint_newton_math_constrained_stationary_signature_matches_aou_failure() {
+    let math = JointNewtonMathDiagnostic {
+        old_kkt_inf: 8.613e5,
+        linearized_next_kkt_inf: 8.580e5,
+        predicted_reduction: 1.589e-2,
+        actual_reduction: 1.589e-2,
+        trust_ratio: 1.000,
+        step_inf: 1.270e-2,
+        proposal_inf: 1.270e-2,
+    };
+    // (1) The linearized solve neutralised <1% of g — Lagrange multiplier
+    // pattern, not a defect of the solve.
+    let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+    assert!(
+        linearized_rel >= 0.5,
+        "large-scale exit has linearized_rel = {:.3e}, must be >= 0.5 for the \
              constrained-stationary certificate to fire",
-            linearized_rel,
-        );
-        // (2) Scalar Newton model is correct to roundoff — Hessian+gradient OK.
-        let relerr = math.scalar_model_relative_error();
-        assert!(
-            relerr <= 1e-3,
-            "large-scale exit has scalar_model_relerr = {:.3e}, must be <= 1e-3 \
+        linearized_rel,
+    );
+    // (2) Scalar Newton model is correct to roundoff — Hessian+gradient OK.
+    let relerr = math.scalar_model_relative_error();
+    assert!(
+        relerr <= 1e-3,
+        "large-scale exit has scalar_model_relerr = {:.3e}, must be <= 1e-3 \
              (model agrees with actual ⇒ residual is a real multiplier)",
-            relerr,
-        );
-        // (3) Objective change at obj_tol scale. At |obj| ~ 3.5e5 and
-        // inner_tol ~ 1e-6, obj_tol ≈ 0.348, and observed Δobj ≈ 1.6e-2.
-        let objective_change = 1.589e-2_f64;
-        let objective_tol = 1e-6 * (1.0 + 3.484783e5_f64);
-        assert!(
-            objective_change <= objective_tol,
-            "large-scale exit has |Δobj| = {:.3e}, must be <= obj_tol {:.3e}",
+        relerr,
+    );
+    // (3) Objective change at obj_tol scale. At |obj| ~ 3.5e5 and
+    // inner_tol ~ 1e-6, obj_tol ≈ 0.348, and observed Δobj ≈ 1.6e-2.
+    let objective_change = 1.589e-2_f64;
+    let objective_tol = 1e-6 * (1.0 + 3.484783e5_f64);
+    assert!(
+        objective_change <= objective_tol,
+        "large-scale exit has |Δobj| = {:.3e}, must be <= obj_tol {:.3e}",
+        objective_change,
+        objective_tol,
+    );
+}
+
+/// Reproduces the post-diagnostic large-scale trace: the scalar Newton model
+/// and objective plateau tests alone look like a constrained-stationary
+/// point, but the projected KKT residual is hundreds of times above
+/// tolerance and the accepted Newton step is still macroscopic. That is
+/// not a terminal certificate; it is a normal in-progress Newton cycle.
+#[test]
+fn constrained_stationary_certificate_keeps_iterating_when_step_is_large() {
+    let math = JointNewtonMathDiagnostic {
+        old_kkt_inf: 2.708e4,
+        linearized_next_kkt_inf: 2.707e4,
+        predicted_reduction: 3.421e-1,
+        actual_reduction: 3.421e-1,
+        trust_ratio: 1.0,
+        step_inf: 2.891e-2,
+        proposal_inf: 2.891e-2,
+    };
+    let objective_change = 3.421e-1;
+    let objective_tol = 3.479e-1;
+    let residual = 8.102;
+    let residual_tol = 2.707e-2;
+    let step_tol = 1.2e-5;
+
+    // These are the three non-step conditions that made 0.1.126 reject a
+    // seed as soon as objective change touched tolerance.
+    let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+    assert!(linearized_rel >= 0.5);
+    assert!(math.scalar_model_relative_error() <= 1e-3);
+    assert!(objective_change <= objective_tol);
+    assert!(math.step_inf > step_tol);
+
+    // The projected residual still rules out accepting convergence, but
+    // the large step rules out terminal refusal. The loop must continue.
+    assert!(residual > residual_tol);
+    assert_eq!(
+        constrained_stationary_certificate_decision(
+            &math,
             objective_change,
             objective_tol,
-        );
-    }
-
-    /// Reproduces the post-diagnostic large-scale trace: the scalar Newton model
-    /// and objective plateau tests alone look like a constrained-stationary
-    /// point, but the projected KKT residual is hundreds of times above
-    /// tolerance and the accepted Newton step is still macroscopic. That is
-    /// not a terminal certificate; it is a normal in-progress Newton cycle.
-    #[test]
-    fn constrained_stationary_certificate_keeps_iterating_when_step_is_large() {
-        let math = JointNewtonMathDiagnostic {
-            old_kkt_inf: 2.708e4,
-            linearized_next_kkt_inf: 2.707e4,
-            predicted_reduction: 3.421e-1,
-            actual_reduction: 3.421e-1,
-            trust_ratio: 1.0,
-            step_inf: 2.891e-2,
-            proposal_inf: 2.891e-2,
-        };
-        let objective_change = 3.421e-1;
-        let objective_tol = 3.479e-1;
-        let residual = 8.102;
-        let residual_tol = 2.707e-2;
-        let step_tol = 1.2e-5;
-
-        // These are the three non-step conditions that made 0.1.126 reject a
-        // seed as soon as objective change touched tolerance.
-        let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
-        assert!(linearized_rel >= 0.5);
-        assert!(math.scalar_model_relative_error() <= 1e-3);
-        assert!(objective_change <= objective_tol);
-        assert!(math.step_inf > step_tol);
-
-        // The projected residual still rules out accepting convergence, but
-        // the large step rules out terminal refusal. The loop must continue.
-        assert!(residual > residual_tol);
-        assert_eq!(
-            constrained_stationary_certificate_decision(
-                &math,
-                objective_change,
-                objective_tol,
-                step_tol,
-                None,
-                residual,
-                residual_tol,
-            ),
-            ConstrainedStationaryCertificate::NotCandidate,
-        );
-    }
-
-    #[test]
-    fn residual_steady_geometric_descent_distinguishes_converging_from_plateau() {
-        use std::collections::VecDeque;
-        // gam#787 duchon centers≥20: the logslope block converged geometrically
-        // (~0.33×/cycle) but `linearized_rel ≥ 0.5` + flat objective routed it
-        // into the plateau-refusal break a few cycles short of tol. The
-        // steady-descent guard must keep it iterating.
-        let converging: VecDeque<f64> = [6.985e-4, 2.388e-4, 7.987e-5, 2.597e-5]
-            .into_iter()
-            .collect();
-        assert!(
-            residual_in_steady_geometric_descent(&converging),
-            "a steadily ~0.33x/cycle descending residual must be recognized as converging"
-        );
-        // A genuine multiplier/null plateau: residual flat/oscillating above tol.
-        let plateau: VecDeque<f64> = [2.066e0, 2.063e0, 2.066e0, 2.063e0].into_iter().collect();
-        assert!(
-            !residual_in_steady_geometric_descent(&plateau),
-            "a flat/oscillating residual plateau must NOT be treated as converging"
-        );
-        // A single lucky drop inside an otherwise flat window must not qualify.
-        let noisy: VecDeque<f64> = [2.0e0, 2.0e0, 1.0e-3].into_iter().collect();
-        assert!(
-            !residual_in_steady_geometric_descent(&noisy),
-            "a single-cycle drop must not be mistaken for steady descent"
-        );
-        // Too few cycles to judge steadiness.
-        let short: VecDeque<f64> = [1.0e-3, 3.0e-4].into_iter().collect();
-        assert!(
-            !residual_in_steady_geometric_descent(&short),
-            "fewer than the window of cycles must not assert steady descent"
-        );
-    }
-
-    #[test]
-    fn constrained_stationary_certificate_refuses_only_when_step_is_exhausted() {
-        let math = JointNewtonMathDiagnostic {
-            old_kkt_inf: 2.708e4,
-            linearized_next_kkt_inf: 2.707e4,
-            predicted_reduction: 3.421e-1,
-            actual_reduction: 3.421e-1,
-            trust_ratio: 1.0,
-            step_inf: 2.891e-7,
-            proposal_inf: 2.891e-7,
-        };
-        let objective_change = 3.421e-1;
-        let objective_tol = 3.479e-1;
-        let step_tol = 1.0e-6;
-        let residual_tol = 2.707e-2;
-
-        // Inside the certification band (`residual <= 4x residual_tol`, the
-        // documented gam#797 conditioning/round-off allowance) a fully
-        // stationary iterate is accepted.
-        assert_eq!(
-            constrained_stationary_certificate_decision(
-                &math,
-                objective_change,
-                objective_tol,
-                step_tol,
-                None,
-                residual_tol,
-                residual_tol,
-            ),
-            ConstrainedStationaryCertificate::Accept,
-        );
-        assert_eq!(
-            constrained_stationary_certificate_decision(
-                &math,
-                objective_change,
-                objective_tol,
-                step_tol,
-                None,
-                // Still within 4x: a residual a hair above 1x must remain
-                // accepted, because the active-projected residual genuinely
-                // floors just above the scale-relative tolerance.
-                residual_tol + 1.0e-12,
-                residual_tol,
-            ),
-            ConstrainedStationaryCertificate::Accept,
-        );
-        // Beyond the 4x band the residual is too large to be a mere
-        // conditioning floor: the certificate must refuse the phantom
-        // multiplier rather than fake convergence.
-        assert_eq!(
-            constrained_stationary_certificate_decision(
-                &math,
-                objective_change,
-                objective_tol,
-                step_tol,
-                None,
-                4.0 * residual_tol + 1.0e-6,
-                residual_tol,
-            ),
-            ConstrainedStationaryCertificate::RefusePhantomMultiplier,
-        );
-    }
-
-    /// Negative case: a genuine non-stationary state must NOT trigger
-    /// the certificate. We construct numbers where the linear solve
-    /// successfully neutralises g (linearized_rel small) — meaning Newton
-    /// is making real progress on an unconstrained problem — and verify
-    /// the certificate does NOT fire.
-    #[test]
-    fn joint_newton_math_unconstrained_progress_does_not_match_certificate() {
-        let math = JointNewtonMathDiagnostic {
-            // Unconstrained Newton: linear solve reduces ‖g‖ by O(1e-12).
-            old_kkt_inf: 1.0e3,
-            linearized_next_kkt_inf: 1.0e-9,
-            predicted_reduction: 5.0e-1,
-            actual_reduction: 5.0e-1,
-            trust_ratio: 1.0,
-            step_inf: 1.0e-1,
-            proposal_inf: 1.0e-1,
-        };
-        let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
-        assert!(
-            linearized_rel < 0.5,
-            "unconstrained Newton must have linearized_rel < 0.5 (was {:.3e})",
-            linearized_rel,
-        );
-    }
-
-    #[test]
-    fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multipliers() {
-        assert!(file!().ends_with(".rs"));
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0, 1.0]],
-            b: array![1.0],
-        };
-        let beta_active = array![0.25, 0.75];
-
-        let residual_valid_multiplier = array![3.0, 3.0];
-        let inf_valid = projected_stationarity_inf_norm(
-            &residual_valid_multiplier,
-            &beta_active,
-            Some(&constraints),
+            step_tol,
             None,
-        );
-        assert_relative_eq!(inf_valid, 0.0_f64, epsilon = 1e-10);
-        let vec_valid = projected_linear_constraint_stationarity_vector(
-            &residual_valid_multiplier,
-            &beta_active,
-            &constraints,
+            residual,
+            residual_tol,
+        ),
+        ConstrainedStationaryCertificate::NotCandidate,
+    );
+}
+
+#[test]
+fn residual_steady_geometric_descent_distinguishes_converging_from_plateau() {
+    use std::collections::VecDeque;
+    // gam#787 duchon centers≥20: the logslope block converged geometrically
+    // (~0.33×/cycle) but `linearized_rel ≥ 0.5` + flat objective routed it
+    // into the plateau-refusal break a few cycles short of tol. The
+    // steady-descent guard must keep it iterating.
+    let converging: VecDeque<f64> = [6.985e-4, 2.388e-4, 7.987e-5, 2.597e-5]
+        .into_iter()
+        .collect();
+    assert!(
+        residual_in_steady_geometric_descent(&converging),
+        "a steadily ~0.33x/cycle descending residual must be recognized as converging"
+    );
+    // A genuine multiplier/null plateau: residual flat/oscillating above tol.
+    let plateau: VecDeque<f64> = [2.066e0, 2.063e0, 2.066e0, 2.063e0].into_iter().collect();
+    assert!(
+        !residual_in_steady_geometric_descent(&plateau),
+        "a flat/oscillating residual plateau must NOT be treated as converging"
+    );
+    // A single lucky drop inside an otherwise flat window must not qualify.
+    let noisy: VecDeque<f64> = [2.0e0, 2.0e0, 1.0e-3].into_iter().collect();
+    assert!(
+        !residual_in_steady_geometric_descent(&noisy),
+        "a single-cycle drop must not be mistaken for steady descent"
+    );
+    // Too few cycles to judge steadiness.
+    let short: VecDeque<f64> = [1.0e-3, 3.0e-4].into_iter().collect();
+    assert!(
+        !residual_in_steady_geometric_descent(&short),
+        "fewer than the window of cycles must not assert steady descent"
+    );
+}
+
+#[test]
+fn constrained_stationary_certificate_refuses_only_when_step_is_exhausted() {
+    let math = JointNewtonMathDiagnostic {
+        old_kkt_inf: 2.708e4,
+        linearized_next_kkt_inf: 2.707e4,
+        predicted_reduction: 3.421e-1,
+        actual_reduction: 3.421e-1,
+        trust_ratio: 1.0,
+        step_inf: 2.891e-7,
+        proposal_inf: 2.891e-7,
+    };
+    let objective_change = 3.421e-1;
+    let objective_tol = 3.479e-1;
+    let step_tol = 1.0e-6;
+    let residual_tol = 2.707e-2;
+
+    // Inside the certification band (`residual <= 4x residual_tol`, the
+    // documented gam#797 conditioning/round-off allowance) a fully
+    // stationary iterate is accepted.
+    assert_eq!(
+        constrained_stationary_certificate_decision(
+            &math,
+            objective_change,
+            objective_tol,
+            step_tol,
             None,
-        )
-        .expect("coupled active projection should succeed");
-        assert_relative_eq!(vec_valid[0], 0.0_f64, epsilon = 1e-10);
-        assert_relative_eq!(vec_valid[1], 0.0_f64, epsilon = 1e-10);
-
-        let residual_wrong_sign = array![-3.0, -3.0];
-        let inf_wrong = projected_stationarity_inf_norm(
-            &residual_wrong_sign,
-            &beta_active,
-            Some(&constraints),
+            residual_tol,
+            residual_tol,
+        ),
+        ConstrainedStationaryCertificate::Accept,
+    );
+    assert_eq!(
+        constrained_stationary_certificate_decision(
+            &math,
+            objective_change,
+            objective_tol,
+            step_tol,
             None,
-        );
-        assert_relative_eq!(inf_wrong, 3.0_f64, epsilon = 1e-12);
-
-        let beta_interior = array![0.75, 0.75];
-        let inf_interior = projected_stationarity_inf_norm(
-            &residual_valid_multiplier,
-            &beta_interior,
-            Some(&constraints),
+            // Still within 4x: a residual a hair above 1x must remain
+            // accepted, because the active-projected residual genuinely
+            // floors just above the scale-relative tolerance.
+            residual_tol + 1.0e-12,
+            residual_tol,
+        ),
+        ConstrainedStationaryCertificate::Accept,
+    );
+    // Beyond the 4x band the residual is too large to be a mere
+    // conditioning floor: the certificate must refuse the phantom
+    // multiplier rather than fake convergence.
+    assert_eq!(
+        constrained_stationary_certificate_decision(
+            &math,
+            objective_change,
+            objective_tol,
+            step_tol,
             None,
-        );
-        assert_relative_eq!(inf_interior, 3.0_f64, epsilon = 1e-12);
-    }
+            4.0 * residual_tol + 1.0e-6,
+            residual_tol,
+        ),
+        ConstrainedStationaryCertificate::RefusePhantomMultiplier,
+    );
+}
 
-    #[test]
-    fn joint_stationarity_from_gradient_projects_coupled_linear_constraints() {
-        assert!(file!().ends_with(".rs"));
-        let spec = ParameterBlockSpec {
-            name: "coupled".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0, 0.0],
-                [0.0, 1.0]
-            ])),
-            offset: array![0.0, 0.0],
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let state = ParameterBlockState {
-            beta: array![0.25, 0.75],
-            eta: array![0.25, 0.75],
-        };
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0, 1.0]],
-            b: array![1.0],
-        };
-        let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
+/// Negative case: a genuine non-stationary state must NOT trigger
+/// the certificate. We construct numbers where the linear solve
+/// successfully neutralises g (linearized_rel small) — meaning Newton
+/// is making real progress on an unconstrained problem — and verify
+/// the certificate does NOT fire.
+#[test]
+fn joint_newton_math_unconstrained_progress_does_not_match_certificate() {
+    let math = JointNewtonMathDiagnostic {
+        // Unconstrained Newton: linear solve reduces ‖g‖ by O(1e-12).
+        old_kkt_inf: 1.0e3,
+        linearized_next_kkt_inf: 1.0e-9,
+        predicted_reduction: 5.0e-1,
+        actual_reduction: 5.0e-1,
+        trust_ratio: 1.0,
+        step_inf: 1.0e-1,
+        proposal_inf: 1.0e-1,
+    };
+    let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+    assert!(
+        linearized_rel < 0.5,
+        "unconstrained Newton must have linearized_rel < 0.5 (was {:.3e})",
+        linearized_rel,
+    );
+}
 
-        // residual = S beta - gradient = [4, 4] = A_active^T lambda,
-        // lambda=4.  This is a valid constrained KKT point and must not be
-        // reported as a large free-gradient residual.
-        let residual_multiplier = array![4.0, 4.0];
-        let gradient = -&residual_multiplier;
-        let projected = exact_newton_joint_stationarity_inf_norm_from_gradient(
-            &gradient,
-            &[state.clone()],
-            std::slice::from_ref(&spec),
-            &s_lambdas,
-            0.0,
-            RidgePolicy::explicit_stabilization_full(),
-            &[Some(constraints.clone())],
-            None,
-        )
-        .expect("stationarity projection should succeed");
-        assert_relative_eq!(projected, 0.0_f64, epsilon = 1e-10);
-        let kkt_residual = exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
-            &gradient,
-            std::slice::from_ref(&spec),
-            &[state.clone()],
-            &s_lambdas,
-            0.0,
-            RidgePolicy::explicit_stabilization_full(),
-            &[Some(constraints.clone())],
-            None,
-        )
-        .expect("KKT residual assembly should succeed")
-        .expect("exact-gradient path should produce residual");
-        assert_relative_eq!(kkt_residual.as_array()[0], 0.0_f64, epsilon = 1e-10);
-        assert_relative_eq!(kkt_residual.as_array()[1], 0.0_f64, epsilon = 1e-10);
+#[test]
+fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multipliers() {
+    assert!(file!().ends_with(".rs"));
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0, 1.0]],
+        b: array![1.0],
+    };
+    let beta_active = array![0.25, 0.75];
 
-        // Wrong-signed normal residual means the active constraint wants to
-        // release. That is not convergence and must remain visible.
-        let wrong_signed_gradient = residual_multiplier;
-        let unprojected = exact_newton_joint_stationarity_inf_norm_from_gradient(
-            &wrong_signed_gradient,
-            &[state],
-            &[spec],
-            &s_lambdas,
-            0.0,
-            RidgePolicy::explicit_stabilization_full(),
-            &[Some(constraints)],
-            None,
-        )
-        .expect("stationarity projection should succeed");
-        assert_relative_eq!(unprojected, 4.0_f64, epsilon = 1e-12);
-    }
+    let residual_valid_multiplier = array![3.0, 3.0];
+    let inf_valid = projected_stationarity_inf_norm(
+        &residual_valid_multiplier,
+        &beta_active,
+        Some(&constraints),
+        None,
+    );
+    assert_relative_eq!(inf_valid, 0.0_f64, epsilon = 1e-10);
+    let vec_valid = projected_linear_constraint_stationarity_vector(
+        &residual_valid_multiplier,
+        &beta_active,
+        &constraints,
+        None,
+    )
+    .expect("coupled active projection should succeed");
+    assert_relative_eq!(vec_valid[0], 0.0_f64, epsilon = 1e-10);
+    assert_relative_eq!(vec_valid[1], 0.0_f64, epsilon = 1e-10);
 
-    #[test]
-    fn kkt_residual_uses_cached_joint_gradient_without_re_evaluating_family() {
-        assert!(file!().ends_with(".rs"));
-        let spec = ParameterBlockSpec {
-            name: "cached-gradient".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0, 0.0],
-                [0.0, 1.0]
-            ])),
-            offset: array![0.0, 0.0],
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let state = ParameterBlockState {
-            beta: array![2.0, -1.0],
-            eta: array![2.0, -1.0],
-        };
-        let s_lambda = Array2::<f64>::eye(2);
-        let expected_residual = array![0.25, -0.5];
-        let cached_gradient = s_lambda.dot(&state.beta) - &expected_residual;
+    let residual_wrong_sign = array![-3.0, -3.0];
+    let inf_wrong = projected_stationarity_inf_norm(
+        &residual_wrong_sign,
+        &beta_active,
+        Some(&constraints),
+        None,
+    );
+    assert_relative_eq!(inf_wrong, 3.0_f64, epsilon = 1e-12);
 
-        let residual = exact_newton_joint_kkt_residual_for_ift_from_cached_gradient(
-            &OneBlockAlwaysErrorFamily,
-            std::slice::from_ref(&spec),
-            std::slice::from_ref(&state),
-            std::slice::from_ref(&s_lambda),
-            0.0,
-            RidgePolicy::explicit_stabilization_full(),
-            None,
-            Some(&cached_gradient),
-        )
-        .expect("cached gradient path should not call family.evaluate()")
-        .expect("cached gradient should produce a KKT residual");
+    let beta_interior = array![0.75, 0.75];
+    let inf_interior = projected_stationarity_inf_norm(
+        &residual_valid_multiplier,
+        &beta_interior,
+        Some(&constraints),
+        None,
+    );
+    assert_relative_eq!(inf_interior, 3.0_f64, epsilon = 1e-12);
+}
 
-        assert_relative_eq!(
-            residual.as_array()[0],
-            expected_residual[0],
-            epsilon = 1e-12
-        );
-        assert_relative_eq!(
-            residual.as_array()[1],
-            expected_residual[1],
-            epsilon = 1e-12
-        );
-    }
+#[test]
+fn joint_stationarity_from_gradient_projects_coupled_linear_constraints() {
+    assert!(file!().ends_with(".rs"));
+    let spec = ParameterBlockSpec {
+        name: "coupled".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+            [1.0, 0.0],
+            [0.0, 1.0]
+        ])),
+        offset: array![0.0, 0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let state = ParameterBlockState {
+        beta: array![0.25, 0.75],
+        eta: array![0.25, 0.75],
+    };
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0, 1.0]],
+        b: array![1.0],
+    };
+    let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
 
-    #[test]
-    fn projected_stationarity_vector_uses_penalized_residual_not_raw_score() {
-        let spec = ParameterBlockSpec {
-            name: "score-cancellation".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
-                [1.0, 0.0],
-                [0.0, 1.0]
-            ])),
-            offset: array![0.0, 0.0],
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let state = ParameterBlockState {
-            beta: array![10.0, -4.0],
-            eta: array![10.0, -4.0],
-        };
-        let s_lambda = array![[2.0, 0.0], [0.0, 3.0]];
-        let gradient = array![19.5, -12.25];
+    // residual = S beta - gradient = [4, 4] = A_active^T lambda,
+    // lambda=4.  This is a valid constrained KKT point and must not be
+    // reported as a large free-gradient residual.
+    let residual_multiplier = array![4.0, 4.0];
+    let gradient = -&residual_multiplier;
+    let projected = exact_newton_joint_stationarity_inf_norm_from_gradient(
+        &gradient,
+        &[state.clone()],
+        std::slice::from_ref(&spec),
+        &s_lambdas,
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        &[Some(constraints.clone())],
+        None,
+    )
+    .expect("stationarity projection should succeed");
+    assert_relative_eq!(projected, 0.0_f64, epsilon = 1e-10);
+    let kkt_residual = exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
+        &gradient,
+        std::slice::from_ref(&spec),
+        &[state.clone()],
+        &s_lambdas,
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        &[Some(constraints.clone())],
+        None,
+    )
+    .expect("KKT residual assembly should succeed")
+    .expect("exact-gradient path should produce residual");
+    assert_relative_eq!(kkt_residual.as_array()[0], 0.0_f64, epsilon = 1e-10);
+    assert_relative_eq!(kkt_residual.as_array()[1], 0.0_f64, epsilon = 1e-10);
 
-        let residual = exact_newton_joint_projected_stationarity_vector_from_gradient(
-            &gradient,
-            std::slice::from_ref(&state),
-            std::slice::from_ref(&spec),
-            std::slice::from_ref(&s_lambda),
-            0.0,
-            RidgePolicy::explicit_stabilization_full(),
-            &[None],
-            None,
-        )
-        .expect("projected stationarity residual should assemble");
+    // Wrong-signed normal residual means the active constraint wants to
+    // release. That is not convergence and must remain visible.
+    let wrong_signed_gradient = residual_multiplier;
+    let unprojected = exact_newton_joint_stationarity_inf_norm_from_gradient(
+        &wrong_signed_gradient,
+        &[state],
+        &[spec],
+        &s_lambdas,
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        &[Some(constraints)],
+        None,
+    )
+    .expect("stationarity projection should succeed");
+    assert_relative_eq!(unprojected, 4.0_f64, epsilon = 1e-12);
+}
 
-        assert_relative_eq!(residual[0], 0.5, epsilon = 1e-12);
-        assert_relative_eq!(residual[1], 0.25, epsilon = 1e-12);
-    }
+#[test]
+fn kkt_residual_uses_cached_joint_gradient_without_re_evaluating_family() {
+    assert!(file!().ends_with(".rs"));
+    let spec = ParameterBlockSpec {
+        name: "cached-gradient".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+            [1.0, 0.0],
+            [0.0, 1.0]
+        ])),
+        offset: array![0.0, 0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let state = ParameterBlockState {
+        beta: array![2.0, -1.0],
+        eta: array![2.0, -1.0],
+    };
+    let s_lambda = Array2::<f64>::eye(2);
+    let expected_residual = array![0.25, -0.5];
+    let cached_gradient = s_lambda.dot(&state.beta) - &expected_residual;
 
-    #[test]
-    fn zero_psi_derivative_operator_acts_as_zero_map() {
-        let n = 17usize;
-        let p = 5usize;
-        let op = ZeroPsiDerivativeOperator::new(n, p);
+    let residual = exact_newton_joint_kkt_residual_for_ift_from_cached_gradient(
+        &OneBlockAlwaysErrorFamily,
+        std::slice::from_ref(&spec),
+        std::slice::from_ref(&state),
+        std::slice::from_ref(&s_lambda),
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        None,
+        Some(&cached_gradient),
+    )
+    .expect("cached gradient path should not call family.evaluate()")
+    .expect("cached gradient should produce a KKT residual");
 
-        assert_eq!(op.n_data(), n);
-        assert_eq!(op.p_out(), p);
+    assert_relative_eq!(
+        residual.as_array()[0],
+        expected_residual[0],
+        epsilon = 1e-12
+    );
+    assert_relative_eq!(
+        residual.as_array()[1],
+        expected_residual[1],
+        epsilon = 1e-12
+    );
+}
 
-        let u = Array1::from_iter((0..p).map(|k| 1.0 + k as f64));
-        let v = Array1::from_iter((0..n).map(|k| 1.0 - 0.5 * k as f64));
+#[test]
+fn projected_stationarity_vector_uses_penalized_residual_not_raw_score() {
+    let spec = ParameterBlockSpec {
+        name: "score-cancellation".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+            [1.0, 0.0],
+            [0.0, 1.0]
+        ])),
+        offset: array![0.0, 0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let state = ParameterBlockState {
+        beta: array![10.0, -4.0],
+        eta: array![10.0, -4.0],
+    };
+    let s_lambda = array![[2.0, 0.0], [0.0, 3.0]];
+    let gradient = array![19.5, -12.25];
 
-        let fwd = op.forward_mul(0, &u.view()).expect("forward_mul");
-        assert_eq!(fwd.len(), n);
-        assert!(fwd.iter().all(|x| *x == 0.0));
+    let residual = exact_newton_joint_projected_stationarity_vector_from_gradient(
+        &gradient,
+        std::slice::from_ref(&state),
+        std::slice::from_ref(&spec),
+        std::slice::from_ref(&s_lambda),
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        &[None],
+        None,
+    )
+    .expect("projected stationarity residual should assemble");
 
-        let trn = op.transpose_mul(0, &v.view()).expect("transpose_mul");
-        assert_eq!(trn.len(), p);
-        assert!(trn.iter().all(|x| *x == 0.0));
+    assert_relative_eq!(residual[0], 0.5, epsilon = 1e-12);
+    assert_relative_eq!(residual[1], 0.25, epsilon = 1e-12);
+}
 
-        let fwd2 = op
-            .forward_mul_second_diag(0, &u.view())
-            .expect("forward_mul_second_diag");
-        assert_eq!(fwd2.len(), n);
-        assert!(fwd2.iter().all(|x| *x == 0.0));
+#[test]
+fn zero_psi_derivative_operator_acts_as_zero_map() {
+    let n = 17usize;
+    let p = 5usize;
+    let op = ZeroPsiDerivativeOperator::new(n, p);
 
-        let trn2 = op
-            .transpose_mul_second_diag(0, &v.view())
-            .expect("transpose_mul_second_diag");
-        assert_eq!(trn2.len(), p);
-        assert!(trn2.iter().all(|x| *x == 0.0));
+    assert_eq!(op.n_data(), n);
+    assert_eq!(op.p_out(), p);
 
-        let fwd_cross = op
-            .forward_mul_second_cross(0, 1, &u.view())
-            .expect("forward_mul_second_cross");
-        assert_eq!(fwd_cross.len(), n);
-        assert!(fwd_cross.iter().all(|x| *x == 0.0));
+    let u = Array1::from_iter((0..p).map(|k| 1.0 + k as f64));
+    let v = Array1::from_iter((0..n).map(|k| 1.0 - 0.5 * k as f64));
 
-        let trn_cross = op
-            .transpose_mul_second_cross(0, 1, &v.view())
-            .expect("transpose_mul_second_cross");
-        assert_eq!(trn_cross.len(), p);
-        assert!(trn_cross.iter().all(|x| *x == 0.0));
+    let fwd = op.forward_mul(0, &u.view()).expect("forward_mul");
+    assert_eq!(fwd.len(), n);
+    assert!(fwd.iter().all(|x| *x == 0.0));
 
-        let chunk = op.row_chunk_first(0, 3..7).expect("row_chunk_first");
-        assert_eq!(chunk.dim(), (4, p));
-        assert!(chunk.iter().all(|x| *x == 0.0));
+    let trn = op.transpose_mul(0, &v.view()).expect("transpose_mul");
+    assert_eq!(trn.len(), p);
+    assert!(trn.iter().all(|x| *x == 0.0));
 
-        let chunk_diag = op
-            .row_chunk_second_diag(0, 0..n)
-            .expect("row_chunk_second_diag");
-        assert_eq!(chunk_diag.dim(), (n, p));
-        assert!(chunk_diag.iter().all(|x| *x == 0.0));
+    let fwd2 = op
+        .forward_mul_second_diag(0, &u.view())
+        .expect("forward_mul_second_diag");
+    assert_eq!(fwd2.len(), n);
+    assert!(fwd2.iter().all(|x| *x == 0.0));
 
-        let chunk_cross = op
-            .row_chunk_second_cross(0, 1, 1..3)
-            .expect("row_chunk_second_cross");
-        assert_eq!(chunk_cross.dim(), (2, p));
-        assert!(chunk_cross.iter().all(|x| *x == 0.0));
+    let trn2 = op
+        .transpose_mul_second_diag(0, &v.view())
+        .expect("transpose_mul_second_diag");
+    assert_eq!(trn2.len(), p);
+    assert!(trn2.iter().all(|x| *x == 0.0));
 
-        let mut row = Array1::from_elem(p, 9.5);
-        op.row_vector_first_into(0, 4, row.view_mut())
-            .expect("row_vector_first_into");
-        assert!(row.iter().all(|x| *x == 0.0));
+    let fwd_cross = op
+        .forward_mul_second_cross(0, 1, &u.view())
+        .expect("forward_mul_second_cross");
+    assert_eq!(fwd_cross.len(), n);
+    assert!(fwd_cross.iter().all(|x| *x == 0.0));
 
-        // The operator must not advertise dense materialization — production
-        // hot paths rely on this to avoid forming an (n, p) buffer.
-        assert!(op.as_materializable().is_none());
-    }
+    let trn_cross = op
+        .transpose_mul_second_cross(0, 1, &v.view())
+        .expect("transpose_mul_second_cross");
+    assert_eq!(trn_cross.len(), p);
+    assert!(trn_cross.iter().all(|x| *x == 0.0));
 
-    /// At large scale (n=320 000, p=101) a dense `Array2::zeros((n, p))`
-    /// for an unused ψ-derivative slot consumes ≈ 0.24 GiB; the spatial-
-    /// adaptive baseline used to allocate one per ψ coordinate (≈ 1.4 GiB
-    /// of guaranteed-zero memory at six coords). Replacing the dense zero
-    /// matrix with a `(0, 0)` shape sentinel — without an implicit
-    /// operator — must still resolve to `PsiDesignMap::Zero` so callers
-    /// see exact-zero semantics with O(1) memory.
-    #[test]
-    fn spatial_adaptive_zero_xpsi_uses_zero_map_without_dense_allocation() {
-        let n = 320_000usize;
-        let p = 101usize;
-        let deriv = CustomFamilyBlockPsiDerivative {
-            penalty_index: None,
-            x_psi: Array2::<f64>::zeros((0, 0)),
-            s_psi: Array2::<f64>::zeros((0, 0)),
-            s_psi_components: None,
-            s_psi_penalty_components: None,
-            x_psi_psi: None,
-            s_psi_psi: None,
-            s_psi_psi_components: None,
-            s_psi_psi_penalty_components: None,
-            implicit_operator: None,
-            implicit_axis: 0,
-            implicit_group_id: None,
-        };
-        let policy = ResourcePolicy::default_library();
-        let map = resolve_custom_family_x_psi_map(
-            &deriv,
-            n,
-            p,
-            0..n,
-            "spatial-adaptive zero sentinel",
-            &policy,
-        )
-        .expect("resolve x_psi map for (0, 0)-sentinel deriv");
-        match map {
-            PsiDesignMap::Zero { nrows, ncols } => {
-                assert_eq!(nrows, n);
-                assert_eq!(ncols, p);
-            }
-            other => panic!(
-                "(0, 0) x_psi sentinel must resolve to PsiDesignMap::Zero, got {:?}",
-                std::mem::discriminant(&other)
-            ),
+    let chunk = op.row_chunk_first(0, 3..7).expect("row_chunk_first");
+    assert_eq!(chunk.dim(), (4, p));
+    assert!(chunk.iter().all(|x| *x == 0.0));
+
+    let chunk_diag = op
+        .row_chunk_second_diag(0, 0..n)
+        .expect("row_chunk_second_diag");
+    assert_eq!(chunk_diag.dim(), (n, p));
+    assert!(chunk_diag.iter().all(|x| *x == 0.0));
+
+    let chunk_cross = op
+        .row_chunk_second_cross(0, 1, 1..3)
+        .expect("row_chunk_second_cross");
+    assert_eq!(chunk_cross.dim(), (2, p));
+    assert!(chunk_cross.iter().all(|x| *x == 0.0));
+
+    let mut row = Array1::from_elem(p, 9.5);
+    op.row_vector_first_into(0, 4, row.view_mut())
+        .expect("row_vector_first_into");
+    assert!(row.iter().all(|x| *x == 0.0));
+
+    // The operator must not advertise dense materialization — production
+    // hot paths rely on this to avoid forming an (n, p) buffer.
+    assert!(op.as_materializable().is_none());
+}
+
+/// At large scale (n=320 000, p=101) a dense `Array2::zeros((n, p))`
+/// for an unused ψ-derivative slot consumes ≈ 0.24 GiB; the spatial-
+/// adaptive baseline used to allocate one per ψ coordinate (≈ 1.4 GiB
+/// of guaranteed-zero memory at six coords). Replacing the dense zero
+/// matrix with a `(0, 0)` shape sentinel — without an implicit
+/// operator — must still resolve to `PsiDesignMap::Zero` so callers
+/// see exact-zero semantics with O(1) memory.
+#[test]
+fn spatial_adaptive_zero_xpsi_uses_zero_map_without_dense_allocation() {
+    let n = 320_000usize;
+    let p = 101usize;
+    let deriv = CustomFamilyBlockPsiDerivative {
+        penalty_index: None,
+        x_psi: Array2::<f64>::zeros((0, 0)),
+        s_psi: Array2::<f64>::zeros((0, 0)),
+        s_psi_components: None,
+        s_psi_penalty_components: None,
+        x_psi_psi: None,
+        s_psi_psi: None,
+        s_psi_psi_components: None,
+        s_psi_psi_penalty_components: None,
+        implicit_operator: None,
+        implicit_axis: 0,
+        implicit_group_id: None,
+    };
+    let policy = ResourcePolicy::default_library();
+    let map = resolve_custom_family_x_psi_map(
+        &deriv,
+        n,
+        p,
+        0..n,
+        "spatial-adaptive zero sentinel",
+        &policy,
+    )
+    .expect("resolve x_psi map for (0, 0)-sentinel deriv");
+    match map {
+        PsiDesignMap::Zero { nrows, ncols } => {
+            assert_eq!(nrows, n);
+            assert_eq!(ncols, p);
         }
+        other => panic!(
+            "(0, 0) x_psi sentinel must resolve to PsiDesignMap::Zero, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+#[test]
+fn zero_psi_derivative_operator_resolves_to_zero_design_map() {
+    let n = 12usize;
+    let p = 4usize;
+    let zero_op: Arc<dyn CustomFamilyPsiDerivativeOperator> =
+        Arc::new(ZeroPsiDerivativeOperator::new(n, p));
+    let deriv = CustomFamilyBlockPsiDerivative {
+        penalty_index: None,
+        x_psi: Array2::<f64>::zeros((0, 0)),
+        s_psi: Array2::<f64>::zeros((0, 0)),
+        s_psi_components: None,
+        s_psi_penalty_components: None,
+        x_psi_psi: None,
+        s_psi_psi: None,
+        s_psi_psi_components: None,
+        s_psi_psi_penalty_components: None,
+        implicit_operator: Some(Arc::clone(&zero_op)),
+        implicit_axis: 0,
+        implicit_group_id: None,
+    };
+    let policy = ResourcePolicy::default_library();
+    let map = resolve_custom_family_x_psi_map(&deriv, n, p, 0..n, "zero", &policy)
+        .expect("resolve x_psi map");
+    let u = Array1::from_iter((0..p).map(|k| 1.0 + k as f64));
+    let fwd = map.forward_mul(u.view()).expect("forward_mul map");
+    assert_eq!(fwd.len(), n);
+    assert!(fwd.iter().all(|x| *x == 0.0));
+
+    let chunk = map.row_chunk(2..5).expect("row_chunk map");
+    assert_eq!(chunk.dim(), (3, p));
+    assert!(chunk.iter().all(|x| *x == 0.0));
+
+    let map_second =
+        resolve_custom_family_x_psi_psi_map(&deriv, &deriv, 0, n, p, 0..n, "zero", &policy)
+            .expect("resolve x_psi_psi map");
+    let fwd_second = map_second
+        .forward_mul(u.view())
+        .expect("forward_mul second");
+    assert_eq!(fwd_second.len(), n);
+    assert!(fwd_second.iter().all(|x| *x == 0.0));
+}
+
+#[test]
+fn rowwise_kronecker_psi_row_chunks_are_window_consistent() {
+    let first = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+    let second_diag = array![[0.5, 1.0], [1.5, 2.0], [2.5, 3.0]];
+    let second_cross = array![[-1.0, 0.25], [-1.5, 0.5], [-2.0, 0.75]];
+    let base = build_embedded_dense_psi_operator(
+        &first,
+        &second_diag,
+        Some(&vec![(1, second_cross.clone())]),
+        0..2,
+        2,
+        0,
+    )
+    .expect("embedded dense base");
+    let time_a = Arc::new(array![[1.0, 0.0], [0.5, 1.0], [1.5, -0.5]]);
+    let time_b = Arc::new(array![[0.25, 2.0], [-1.0, 0.75], [0.0, 1.25]]);
+    let op = build_rowwise_kronecker_psi_operator(base, vec![time_a, time_b])
+        .expect("rowwise kronecker psi operator");
+    let mat = op
+        .as_materializable()
+        .expect("rowwise operator dense reference");
+    let rows = 1..5;
+
+    let first_dense = mat.materialize_first(0).expect("dense first");
+    let first_chunk = op.row_chunk_first(0, rows.clone()).expect("chunk first");
+    assert_eq!(
+        first_chunk,
+        first_dense.slice(ndarray::s![rows.clone(), ..]).to_owned()
+    );
+
+    let diag_full = op
+        .row_chunk_second_diag(0, 0..op.n_data())
+        .expect("full row-chunk diag");
+    let diag_chunk = op
+        .row_chunk_second_diag(0, rows.clone())
+        .expect("chunk diag");
+    assert_eq!(
+        diag_chunk,
+        diag_full.slice(ndarray::s![rows.clone(), ..]).to_owned()
+    );
+
+    let cross_full = op
+        .row_chunk_second_cross(0, 1, 0..op.n_data())
+        .expect("full row-chunk cross");
+    let cross_chunk = op
+        .row_chunk_second_cross(0, 1, rows.clone())
+        .expect("chunk cross");
+    assert_eq!(
+        cross_chunk,
+        cross_full.slice(ndarray::s![rows, ..]).to_owned()
+    );
+}
+
+#[test]
+fn joint_trust_region_radius_update_accept_reject_logic() {
+    let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 1.0);
+    assert!(accepted.accepted);
+    assert!((accepted.rho - 1.0).abs() < 1.0e-12);
+    assert!((accepted.radius - 2.0).abs() < 1.0e-12);
+    assert_eq!(accepted.decision.label(), "grow_at_boundary");
+
+    let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 1.0);
+    assert!(!rejected.accepted);
+    assert!(rejected.rho < 0.0);
+    assert!((rejected.radius - 0.25).abs() < 1.0e-12);
+    assert_eq!(rejected.decision.label(), "shrink_reject");
+
+    let rejected_inside_radius = update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 1.0);
+    assert!(!rejected_inside_radius.accepted);
+    assert!(
+        rejected_inside_radius.radius < 1.0e-3,
+        "a rejected in-radius step must be outside the next trust region"
+    );
+    assert!((rejected_inside_radius.radius - 5.0e-4).abs() < 1.0e-12);
+    assert_eq!(rejected_inside_radius.decision.label(), "shrink_reject");
+
+    let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0);
+    assert!(poor.accepted);
+    assert!((poor.rho - 0.1).abs() < 1.0e-12);
+    assert!((poor.radius - 0.25).abs() < 1.0e-12);
+    assert_eq!(poor.decision.label(), "shrink_marginal_accept");
+}
+
+#[test]
+fn joint_trust_region_noise_floor_accepts_round_off_negative_actual() {
+    // Near-converged iterate at large objective scale: both the
+    // model-predicted decrease and the realized objective change are
+    // below the noise floor. Round-off can flip the sign of `actual`;
+    // the principled response is to accept (rho ≈ 1) rather than
+    // declare failure on the sign of noise. Mirrors the noise-floor
+    // branch in `src/solver/pirls.rs`.
+    let objective_scale = 1.66e5;
+    let noise_floor = objective_scale * 1e-14;
+    let predicted = noise_floor * 0.1;
+    let actual = -noise_floor * 0.5;
+    let update = update_joint_trust_region_radius(1.0, 0.05, actual, predicted, objective_scale);
+    assert!(
+        update.accepted,
+        "sub-noise-floor sign flip must not reject as failure"
+    );
+    assert!((update.rho - 1.0).abs() < 1.0e-12);
+}
+
+#[test]
+fn joint_trust_region_noise_floor_rejects_genuine_increase() {
+    // Genuine objective increase clearly beyond the noise floor must
+    // still be rejected even when predicted_reduction is sub-floor:
+    // this is real model failure, not round-off.
+    let objective_scale = 1.66e5;
+    let noise_floor = objective_scale * 1e-14;
+    let predicted = noise_floor * 0.1;
+    let actual = -1.0;
+    let update = update_joint_trust_region_radius(1.0, 0.5, actual, predicted, objective_scale);
+    assert!(
+        !update.accepted,
+        "objective increase beyond noise must reject"
+    );
+    assert!(update.rho.is_infinite() && update.rho < 0.0);
+}
+
+#[test]
+fn joint_objective_roundoff_slack_accepts_large_scale_wobble() {
+    let old_objective = 1.218530e5;
+    let trial_objective = old_objective + 2.183e-10;
+    assert!(
+        trial_objective
+            <= old_objective + joint_objective_roundoff_slack(old_objective, trial_objective),
+        "sub-nanounit objective wobble at large scale should not burn all trust attempts"
+    );
+}
+
+#[test]
+fn joint_objective_floor_only_accepts_sub_tolerance_model_steps() {
+    let old_objective = 1.218942e5_f64;
+    let objective_tol = 1e-6 * (1.0 + old_objective.abs());
+    let actual_reduction = -3.783e-10;
+    let predicted_reduction = 9.481e-15;
+    let trial_objective = old_objective - actual_reduction;
+    assert!(
+        joint_objective_floor_reached(
+            old_objective,
+            trial_objective,
+            actual_reduction,
+            predicted_reduction,
+            objective_tol,
+        ),
+        "the repeated large-scale roundoff wobble should terminate immediately"
+    );
+
+    assert!(
+        !joint_objective_floor_reached(
+            old_objective,
+            old_objective + 2.0,
+            -2.0,
+            predicted_reduction,
+            objective_tol,
+        ),
+        "real objective increases must still be rejected"
+    );
+    assert!(
+        !joint_objective_floor_reached(
+            old_objective,
+            trial_objective,
+            actual_reduction,
+            10.0 * objective_tol,
+            objective_tol,
+        ),
+        "non-negligible predicted progress must not be hidden by the floor exit"
+    );
+    // A positive-but-noise-level `actual_reduction` must NOT trigger the
+    // floor (asymmetric guard). At rank-deficient optima the outer-gradient
+    // FD identity (`outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active`,
+    // inner_tol=1e-12) relies on the trust-region loop running the same
+    // number of attempts at neighbouring λ probes; accepting positive-noise
+    // reductions exits a cycle earlier on the probe where round-off
+    // happened to land positive and decorrelates the null-space drift.
+    let positive_noise_actual = 3.783e-10_f64;
+    let positive_noise_trial = old_objective - positive_noise_actual;
+    assert!(
+        !joint_objective_floor_reached(
+            old_objective,
+            positive_noise_trial,
+            positive_noise_actual,
+            predicted_reduction,
+            objective_tol,
+        ),
+        "positive-noise reductions must NOT trigger the floor; symmetric exit breaks rank-deficient FD identity"
+    );
+}
+
+#[test]
+fn joint_inner_convergence_rejects_objective_flat_non_kkt_stall() {
+    // Direct reproduction of the bad 0.1.79 log shape:
+    //
+    //   obj=4.472714e5 Δobj=5.381e-2 |δ|∞=2.794e-2
+    //   residual=5.980e1 tol=4.473e-1
+    //
+    // The objective and step are both flat at this scale, but the KKT
+    // residual is 134x tolerance. Accepting this as an inner optimum makes
+    // the envelope-theorem outer gradient invalid, which is what surfaced
+    // as outer BFGS objective stalls with |g|≈1e14-1e16.
+    let objective = 4.472714e5_f64;
+    let inner_tol = 1.0e-6_f64;
+    let objective_change = 5.381e-2_f64;
+    let accepted_step_inf = 2.794e-2_f64;
+    let residual = 5.980e1_f64;
+    let residual_tol = inner_tol * (1.0 + objective);
+    let step_tol = 1.242e-3_f64;
+    let objective_tol = residual_tol;
+    let old_flat_step_predicate = objective_change <= objective_tol
+        && accepted_step_inf <= objective_tol.sqrt().max(step_tol);
+
+    assert!(
+        old_flat_step_predicate,
+        "the historical objective-flat/step-flat predicate would have accepted this stalled inner solve"
+    );
+    assert!(
+        !joint_inner_kkt_converged(residual, residual_tol),
+        "inner convergence must require KKT residual <= tolerance"
+    );
+    assert!(
+        !joint_inner_kkt_converged(1.5 * residual_tol, residual_tol),
+        "near-miss residual slack would still invalidate the outer envelope gradient"
+    );
+}
+
+#[test]
+fn joint_trust_region_block_metric_does_not_starve_unrelated_blocks() {
+    const TIME_W: usize = 12;
+    const MARG_W: usize = 11;
+    const LOG_W: usize = 10;
+    const P: usize = TIME_W + MARG_W + LOG_W;
+
+    let mut h = Array2::<f64>::zeros((P, P));
+    let mut g = Array1::<f64>::zeros(P);
+    h[[0, 0]] = 2.24e8;
+    g[0] = -5.6e8;
+    for i in 1..TIME_W {
+        h[[i, i]] = 1.0 + 0.3 * i as f64;
+        g[i] = -0.3 - 0.07 * i as f64;
+    }
+    for j in 0..MARG_W {
+        let idx = TIME_W + j;
+        h[[idx, idx]] = 1.2 + 0.2 * j as f64;
+        g[idx] = -0.9;
+    }
+    let log0 = TIME_W + MARG_W;
+    h[[log0, log0]] = 1.0e-5;
+    g[log0] = -2.173;
+    for k in 1..LOG_W {
+        let idx = log0 + k;
+        h[[idx, idx]] = 1.5 + 0.1 * k as f64;
+        g[idx] = -0.4;
     }
 
-    #[test]
-    fn zero_psi_derivative_operator_resolves_to_zero_design_map() {
-        let n = 12usize;
-        let p = 4usize;
-        let zero_op: Arc<dyn CustomFamilyPsiDerivativeOperator> =
-            Arc::new(ZeroPsiDerivativeOperator::new(n, p));
-        let deriv = CustomFamilyBlockPsiDerivative {
-            penalty_index: None,
-            x_psi: Array2::<f64>::zeros((0, 0)),
-            s_psi: Array2::<f64>::zeros((0, 0)),
-            s_psi_components: None,
-            s_psi_penalty_components: None,
-            x_psi_psi: None,
-            s_psi_psi: None,
-            s_psi_psi_components: None,
-            s_psi_psi_penalty_components: None,
-            implicit_operator: Some(Arc::clone(&zero_op)),
-            implicit_axis: 0,
-            implicit_group_id: None,
-        };
-        let policy = ResourcePolicy::default_library();
-        let map = resolve_custom_family_x_psi_map(&deriv, n, p, 0..n, "zero", &policy)
-            .expect("resolve x_psi map");
-        let u = Array1::from_iter((0..p).map(|k| 1.0 + k as f64));
-        let fwd = map.forward_mul(u.view()).expect("forward_mul map");
-        assert_eq!(fwd.len(), n);
-        assert!(fwd.iter().all(|x| *x == 0.0));
-
-        let chunk = map.row_chunk(2..5).expect("row_chunk map");
-        assert_eq!(chunk.dim(), (3, p));
-        assert!(chunk.iter().all(|x| *x == 0.0));
-
-        let map_second =
-            resolve_custom_family_x_psi_psi_map(&deriv, &deriv, 0, n, p, 0..n, "zero", &policy)
-                .expect("resolve x_psi_psi map");
-        let fwd_second = map_second
-            .forward_mul(u.view())
-            .expect("forward_mul second");
-        assert_eq!(fwd_second.len(), n);
-        assert!(fwd_second.iter().all(|x| *x == 0.0));
+    let mut newton = Array1::<f64>::zeros(P);
+    for i in 0..P {
+        newton[i] = -g[i] / h[[i, i]];
     }
 
-    #[test]
-    fn rowwise_kronecker_psi_row_chunks_are_window_consistent() {
-        let first = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
-        let second_diag = array![[0.5, 1.0], [1.5, 2.0], [2.5, 3.0]];
-        let second_cross = array![[-1.0, 0.25], [-1.5, 0.5], [-2.0, 0.75]];
-        let base = build_embedded_dense_psi_operator(
-            &first,
-            &second_diag,
-            Some(&vec![(1, second_cross.clone())]),
-            0..2,
-            2,
-            0,
-        )
-        .expect("embedded dense base");
-        let time_a = Arc::new(array![[1.0, 0.0], [0.5, 1.0], [1.5, -0.5]]);
-        let time_b = Arc::new(array![[0.25, 2.0], [-1.0, 0.75], [0.0, 1.25]]);
-        let op = build_rowwise_kronecker_psi_operator(base, vec![time_a, time_b])
-            .expect("rowwise kronecker psi operator");
-        let mat = op
-            .as_materializable()
-            .expect("rowwise operator dense reference");
-        let rows = 1..5;
-
-        let first_dense = mat.materialize_first(0).expect("dense first");
-        let first_chunk = op.row_chunk_first(0, rows.clone()).expect("chunk first");
-        assert_eq!(
-            first_chunk,
-            first_dense.slice(ndarray::s![rows.clone(), ..]).to_owned()
-        );
-
-        let diag_full = op
-            .row_chunk_second_diag(0, 0..op.n_data())
-            .expect("full row-chunk diag");
-        let diag_chunk = op
-            .row_chunk_second_diag(0, rows.clone())
-            .expect("chunk diag");
-        assert_eq!(
-            diag_chunk,
-            diag_full.slice(ndarray::s![rows.clone(), ..]).to_owned()
-        );
-
-        let cross_full = op
-            .row_chunk_second_cross(0, 1, 0..op.n_data())
-            .expect("full row-chunk cross");
-        let cross_chunk = op
-            .row_chunk_second_cross(0, 1, rows.clone())
-            .expect("chunk cross");
-        assert_eq!(
-            cross_chunk,
-            cross_full.slice(ndarray::s![rows, ..]).to_owned()
-        );
+    let mut raw_global = newton.clone();
+    let raw_norm = raw_global.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if raw_norm.is_finite() && raw_norm > 20.0 {
+        raw_global.mapv_inplace(|v| v * (20.0 / raw_norm));
     }
+    let raw_linearized = (&g + &h.dot(&raw_global))
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0_f64, f64::max)
+        / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+    assert!(
+        raw_linearized > 0.99,
+        "raw concatenated L2 truncation should reproduce the starvation mechanism"
+    );
 
-    #[test]
-    fn joint_trust_region_radius_update_accept_reject_logic() {
-        let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 1.0);
-        assert!(accepted.accepted);
-        assert!((accepted.rho - 1.0).abs() < 1.0e-12);
-        assert!((accepted.radius - 2.0).abs() < 1.0e-12);
-        assert_eq!(accepted.decision.label(), "grow_at_boundary");
+    let ranges = vec![(0, TIME_W), (TIME_W, TIME_W + MARG_W), (TIME_W + MARG_W, P)];
+    let metric_diag = h.diag().to_owned();
+    let full_block_norms = joint_trust_region_block_metric_norms(&newton, &ranges, &metric_diag);
+    let mut block_metric = newton.clone();
+    let block_radii = vec![full_block_norms[0], full_block_norms[1], 20.0];
+    truncate_joint_step_to_block_metric_radii(
+        &mut block_metric,
+        &ranges,
+        &metric_diag,
+        &block_radii,
+    );
+    let block_linearized = (&g + &h.dot(&block_metric))
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0_f64, f64::max)
+        / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+    assert!(
+        block_linearized < 1.0e-6,
+        "block-local curvature metric must let the time block neutralize its KKT defect; got {block_linearized:.3e}"
+    );
+}
 
-        let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 1.0);
-        assert!(!rejected.accepted);
-        assert!(rejected.rho < 0.0);
-        assert!((rejected.radius - 0.25).abs() < 1.0e-12);
-        assert_eq!(rejected.decision.label(), "shrink_reject");
+#[test]
+fn shrink_active_joint_block_trust_radii_strictly_decreases_max_radius() {
+    // Regression for the joint-Newton fully-rejected stall. Before the
+    // fix, when a boundary block's radius was already at the 1e-12 floor
+    // and an interior block held the max, `shrink_active_joint_block_trust_radii`
+    // returned the same `max(block_radii)` on every call — the trust
+    // region never actually shrank, the dogleg recomputed an identical
+    // joint δ, and the inner solver burned `inner_loop_hard_ceiling`
+    // cycles before the 8-cycle stall guard finally bailed it out. The
+    // fix must guarantee that every call strictly decreases the joint
+    // trust radius until the floor.
+    let mut block_radii = vec![1.0, 1.0e-12];
+    // Boundary block (#1) sits at the radius floor with step at boundary;
+    // interior block (#0) has step well inside its radius. Before the
+    // fix: only block #1 participates, its radius re-clamps to 1e-12,
+    // returned max stays at 1.0 — byte-identical to the previous call.
+    let block_step_norms = vec![1.0e-3, 1.0e-12];
+    let old_max = block_radii.iter().copied().fold(0.0_f64, f64::max);
+    let new_max = shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
+    assert!(
+        new_max < old_max,
+        "joint trust radius must strictly decrease when a step is rejected (was {old_max:.3e}, now {new_max:.3e})"
+    );
+    // Interior block must have shrunk below its current step norm so the
+    // next dogleg step is forced strictly smaller in that block.
+    assert!(
+        block_radii[0] < block_step_norms[0],
+        "interior block radius must drop below its step norm to force a strictly smaller next step (radius {:.3e}, step {:.3e})",
+        block_radii[0],
+        block_step_norms[0]
+    );
+}
 
-        let rejected_inside_radius = update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 1.0);
-        assert!(!rejected_inside_radius.accepted);
-        assert!(
-            rejected_inside_radius.radius < 1.0e-3,
-            "a rejected in-radius step must be outside the next trust region"
-        );
-        assert!((rejected_inside_radius.radius - 5.0e-4).abs() < 1.0e-12);
-        assert_eq!(rejected_inside_radius.decision.label(), "shrink_reject");
-
-        let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0);
-        assert!(poor.accepted);
-        assert!((poor.rho - 0.1).abs() < 1.0e-12);
-        assert!((poor.radius - 0.25).abs() < 1.0e-12);
-        assert_eq!(poor.decision.label(), "shrink_marginal_accept");
-    }
-
-    #[test]
-    fn joint_trust_region_noise_floor_accepts_round_off_negative_actual() {
-        // Near-converged iterate at large objective scale: both the
-        // model-predicted decrease and the realized objective change are
-        // below the noise floor. Round-off can flip the sign of `actual`;
-        // the principled response is to accept (rho ≈ 1) rather than
-        // declare failure on the sign of noise. Mirrors the noise-floor
-        // branch in `src/solver/pirls.rs`.
-        let objective_scale = 1.66e5;
-        let noise_floor = objective_scale * 1e-14;
-        let predicted = noise_floor * 0.1;
-        let actual = -noise_floor * 0.5;
-        let update =
-            update_joint_trust_region_radius(1.0, 0.05, actual, predicted, objective_scale);
-        assert!(
-            update.accepted,
-            "sub-noise-floor sign flip must not reject as failure"
-        );
-        assert!((update.rho - 1.0).abs() < 1.0e-12);
-    }
-
-    #[test]
-    fn joint_trust_region_noise_floor_rejects_genuine_increase() {
-        // Genuine objective increase clearly beyond the noise floor must
-        // still be rejected even when predicted_reduction is sub-floor:
-        // this is real model failure, not round-off.
-        let objective_scale = 1.66e5;
-        let noise_floor = objective_scale * 1e-14;
-        let predicted = noise_floor * 0.1;
-        let actual = -1.0;
-        let update = update_joint_trust_region_radius(1.0, 0.5, actual, predicted, objective_scale);
-        assert!(
-            !update.accepted,
-            "objective increase beyond noise must reject"
-        );
-        assert!(update.rho.is_infinite() && update.rho < 0.0);
-    }
-
-    #[test]
-    fn joint_objective_roundoff_slack_accepts_large_scale_wobble() {
-        let old_objective = 1.218530e5;
-        let trial_objective = old_objective + 2.183e-10;
-        assert!(
-            trial_objective
-                <= old_objective + joint_objective_roundoff_slack(old_objective, trial_objective),
-            "sub-nanounit objective wobble at large scale should not burn all trust attempts"
-        );
-    }
-
-    #[test]
-    fn joint_objective_floor_only_accepts_sub_tolerance_model_steps() {
-        let old_objective = 1.218942e5_f64;
-        let objective_tol = 1e-6 * (1.0 + old_objective.abs());
-        let actual_reduction = -3.783e-10;
-        let predicted_reduction = 9.481e-15;
-        let trial_objective = old_objective - actual_reduction;
-        assert!(
-            joint_objective_floor_reached(
-                old_objective,
-                trial_objective,
-                actual_reduction,
-                predicted_reduction,
-                objective_tol,
-            ),
-            "the repeated large-scale roundoff wobble should terminate immediately"
-        );
-
-        assert!(
-            !joint_objective_floor_reached(
-                old_objective,
-                old_objective + 2.0,
-                -2.0,
-                predicted_reduction,
-                objective_tol,
-            ),
-            "real objective increases must still be rejected"
-        );
-        assert!(
-            !joint_objective_floor_reached(
-                old_objective,
-                trial_objective,
-                actual_reduction,
-                10.0 * objective_tol,
-                objective_tol,
-            ),
-            "non-negligible predicted progress must not be hidden by the floor exit"
-        );
-        // A positive-but-noise-level `actual_reduction` must NOT trigger the
-        // floor (asymmetric guard). At rank-deficient optima the outer-gradient
-        // FD identity (`outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active`,
-        // inner_tol=1e-12) relies on the trust-region loop running the same
-        // number of attempts at neighbouring λ probes; accepting positive-noise
-        // reductions exits a cycle earlier on the probe where round-off
-        // happened to land positive and decorrelates the null-space drift.
-        let positive_noise_actual = 3.783e-10_f64;
-        let positive_noise_trial = old_objective - positive_noise_actual;
-        assert!(
-            !joint_objective_floor_reached(
-                old_objective,
-                positive_noise_trial,
-                positive_noise_actual,
-                predicted_reduction,
-                objective_tol,
-            ),
-            "positive-noise reductions must NOT trigger the floor; symmetric exit breaks rank-deficient FD identity"
-        );
-    }
-
-    #[test]
-    fn joint_inner_convergence_rejects_objective_flat_non_kkt_stall() {
-        // Direct reproduction of the bad 0.1.79 log shape:
-        //
-        //   obj=4.472714e5 Δobj=5.381e-2 |δ|∞=2.794e-2
-        //   residual=5.980e1 tol=4.473e-1
-        //
-        // The objective and step are both flat at this scale, but the KKT
-        // residual is 134x tolerance. Accepting this as an inner optimum makes
-        // the envelope-theorem outer gradient invalid, which is what surfaced
-        // as outer BFGS objective stalls with |g|≈1e14-1e16.
-        let objective = 4.472714e5_f64;
-        let inner_tol = 1.0e-6_f64;
-        let objective_change = 5.381e-2_f64;
-        let accepted_step_inf = 2.794e-2_f64;
-        let residual = 5.980e1_f64;
-        let residual_tol = inner_tol * (1.0 + objective);
-        let step_tol = 1.242e-3_f64;
-        let objective_tol = residual_tol;
-        let old_flat_step_predicate = objective_change <= objective_tol
-            && accepted_step_inf <= objective_tol.sqrt().max(step_tol);
-
-        assert!(
-            old_flat_step_predicate,
-            "the historical objective-flat/step-flat predicate would have accepted this stalled inner solve"
-        );
-        assert!(
-            !joint_inner_kkt_converged(residual, residual_tol),
-            "inner convergence must require KKT residual <= tolerance"
-        );
-        assert!(
-            !joint_inner_kkt_converged(1.5 * residual_tol, residual_tol),
-            "near-miss residual slack would still invalidate the outer envelope gradient"
-        );
-    }
-
-    #[test]
-    fn joint_trust_region_block_metric_does_not_starve_unrelated_blocks() {
-        const TIME_W: usize = 12;
-        const MARG_W: usize = 11;
-        const LOG_W: usize = 10;
-        const P: usize = TIME_W + MARG_W + LOG_W;
-
-        let mut h = Array2::<f64>::zeros((P, P));
-        let mut g = Array1::<f64>::zeros(P);
-        h[[0, 0]] = 2.24e8;
-        g[0] = -5.6e8;
-        for i in 1..TIME_W {
-            h[[i, i]] = 1.0 + 0.3 * i as f64;
-            g[i] = -0.3 - 0.07 * i as f64;
-        }
-        for j in 0..MARG_W {
-            let idx = TIME_W + j;
-            h[[idx, idx]] = 1.2 + 0.2 * j as f64;
-            g[idx] = -0.9;
-        }
-        let log0 = TIME_W + MARG_W;
-        h[[log0, log0]] = 1.0e-5;
-        g[log0] = -2.173;
-        for k in 1..LOG_W {
-            let idx = log0 + k;
-            h[[idx, idx]] = 1.5 + 0.1 * k as f64;
-            g[idx] = -0.4;
-        }
-
-        let mut newton = Array1::<f64>::zeros(P);
-        for i in 0..P {
-            newton[i] = -g[i] / h[[i, i]];
-        }
-
-        let mut raw_global = newton.clone();
-        let raw_norm = raw_global.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if raw_norm.is_finite() && raw_norm > 20.0 {
-            raw_global.mapv_inplace(|v| v * (20.0 / raw_norm));
-        }
-        let raw_linearized = (&g + &h.dot(&raw_global))
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max)
-            / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
-        assert!(
-            raw_linearized > 0.99,
-            "raw concatenated L2 truncation should reproduce the starvation mechanism"
-        );
-
-        let ranges = vec![(0, TIME_W), (TIME_W, TIME_W + MARG_W), (TIME_W + MARG_W, P)];
-        let metric_diag = h.diag().to_owned();
-        let full_block_norms =
-            joint_trust_region_block_metric_norms(&newton, &ranges, &metric_diag);
-        let mut block_metric = newton.clone();
-        let block_radii = vec![full_block_norms[0], full_block_norms[1], 20.0];
-        truncate_joint_step_to_block_metric_radii(
-            &mut block_metric,
-            &ranges,
-            &metric_diag,
-            &block_radii,
-        );
-        let block_linearized = (&g + &h.dot(&block_metric))
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max)
-            / (1.0 + g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
-        assert!(
-            block_linearized < 1.0e-6,
-            "block-local curvature metric must let the time block neutralize its KKT defect; got {block_linearized:.3e}"
-        );
-    }
-
-    #[test]
-    fn shrink_active_joint_block_trust_radii_strictly_decreases_max_radius() {
-        // Regression for the joint-Newton fully-rejected stall. Before the
-        // fix, when a boundary block's radius was already at the 1e-12 floor
-        // and an interior block held the max, `shrink_active_joint_block_trust_radii`
-        // returned the same `max(block_radii)` on every call — the trust
-        // region never actually shrank, the dogleg recomputed an identical
-        // joint δ, and the inner solver burned `inner_loop_hard_ceiling`
-        // cycles before the 8-cycle stall guard finally bailed it out. The
-        // fix must guarantee that every call strictly decreases the joint
-        // trust radius until the floor.
-        let mut block_radii = vec![1.0, 1.0e-12];
-        // Boundary block (#1) sits at the radius floor with step at boundary;
-        // interior block (#0) has step well inside its radius. Before the
-        // fix: only block #1 participates, its radius re-clamps to 1e-12,
-        // returned max stays at 1.0 — byte-identical to the previous call.
-        let block_step_norms = vec![1.0e-3, 1.0e-12];
-        let old_max = block_radii.iter().copied().fold(0.0_f64, f64::max);
-        let new_max =
-            shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
-        assert!(
-            new_max < old_max,
-            "joint trust radius must strictly decrease when a step is rejected (was {old_max:.3e}, now {new_max:.3e})"
-        );
-        // Interior block must have shrunk below its current step norm so the
-        // next dogleg step is forced strictly smaller in that block.
-        assert!(
-            block_radii[0] < block_step_norms[0],
-            "interior block radius must drop below its step norm to force a strictly smaller next step (radius {:.3e}, step {:.3e})",
-            block_radii[0],
-            block_step_norms[0]
-        );
-    }
-
-    #[test]
-    fn shrink_active_joint_block_trust_radii_decreases_max_when_max_held_by_interior_block() {
-        // Production stall (Rust CI Test job ~2-hour hang, cycles
-        // 117..305+ all logging
-        // `r=1.562e-2 (held) decision=shrink_reject |δ|=1.562e-2`
-        // identically): the Moré–Sorensen inner trust-region step
-        // (`spectrum.trust_region_step(joint_trust_radius)`) uses the
-        // SCALAR `joint_trust_radius = max(block_radii)` as its trust
-        // constraint. When a boundary block hits its per-block radius
-        // (and shrinks) while an interior block holds the joint MAX
-        // radius — but the boundary block is NOT yet at the floor, so
-        // the `all_boundary_blocks_at_floor` carve-out doesn't fire —
-        // only the boundary block participates, the interior max-holder
-        // keeps its radius, `max(block_radii)` is held, MS re-computes
-        // the byte-identical rejected step, and the inner Newton loop
-        // stalls at `inner_loop_hard_ceiling`. The fix makes the
-        // max-holder participate even when it's an interior block, so
-        // the scalar joint radius strictly decreases on every rejected
-        // attempt until the floor (where the `FULLY_REJECTED_STALL_MAX_CYCLES`
-        // guard bails cleanly).
-        let mut block_radii = vec![1.562e-2, 1.562e-2];
-        // Block 0: step at per-block boundary (the boundary block).
-        // Block 1: interior step well below its radius.
-        // Both blocks share the joint max radius 1.562e-2 — the MS step
-        // is constrained by that scalar value.
-        let block_step_norms = vec![1.562e-2, 1.0e-6];
-        let old_max = block_radii.iter().copied().fold(0.0_f64, f64::max);
-        let new_max =
-            shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
-        assert!(
-            new_max < old_max,
-            "joint trust radius (= scalar Moré–Sorensen constraint) must \
+#[test]
+fn shrink_active_joint_block_trust_radii_decreases_max_when_max_held_by_interior_block() {
+    // Production stall (Rust CI Test job ~2-hour hang, cycles
+    // 117..305+ all logging
+    // `r=1.562e-2 (held) decision=shrink_reject |δ|=1.562e-2`
+    // identically): the Moré–Sorensen inner trust-region step
+    // (`spectrum.trust_region_step(joint_trust_radius)`) uses the
+    // SCALAR `joint_trust_radius = max(block_radii)` as its trust
+    // constraint. When a boundary block hits its per-block radius
+    // (and shrinks) while an interior block holds the joint MAX
+    // radius — but the boundary block is NOT yet at the floor, so
+    // the `all_boundary_blocks_at_floor` carve-out doesn't fire —
+    // only the boundary block participates, the interior max-holder
+    // keeps its radius, `max(block_radii)` is held, MS re-computes
+    // the byte-identical rejected step, and the inner Newton loop
+    // stalls at `inner_loop_hard_ceiling`. The fix makes the
+    // max-holder participate even when it's an interior block, so
+    // the scalar joint radius strictly decreases on every rejected
+    // attempt until the floor (where the `FULLY_REJECTED_STALL_MAX_CYCLES`
+    // guard bails cleanly).
+    let mut block_radii = vec![1.562e-2, 1.562e-2];
+    // Block 0: step at per-block boundary (the boundary block).
+    // Block 1: interior step well below its radius.
+    // Both blocks share the joint max radius 1.562e-2 — the MS step
+    // is constrained by that scalar value.
+    let block_step_norms = vec![1.562e-2, 1.0e-6];
+    let old_max = block_radii.iter().copied().fold(0.0_f64, f64::max);
+    let new_max = shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
+    assert!(
+        new_max < old_max,
+        "joint trust radius (= scalar Moré–Sorensen constraint) must \
              strictly decrease on rejection even when the max is held by \
              an interior block (was {old_max:.3e}, now {new_max:.3e})"
-        );
-    }
+    );
+}
 
-    #[test]
-    fn shrink_active_joint_block_trust_radii_pulls_radius_below_step_norm() {
-        // The accept-path radius update (`update_joint_trust_region_radius`)
-        // pulls the new radius below `0.5 * step_norm` on rejection so the
-        // next step is provably smaller; the reject-path block shrink must
-        // do the same. Otherwise an interior block with `step_norm <<
-        // factor * radius` re-takes the identical Newton step on the next
-        // dogleg attempt and the trust-region globalization is degenerate.
-        let mut block_radii = vec![1.0];
-        let block_step_norms = vec![1.0e-3];
-        let new_max =
-            shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
-        assert!(
-            new_max <= 0.5 * block_step_norms[0],
-            "shrunken radius must be ≤ 0.5 · step_norm to force a strictly smaller next step (was {new_max:.3e}, step {:.3e})",
-            block_step_norms[0]
-        );
-    }
+#[test]
+fn shrink_active_joint_block_trust_radii_pulls_radius_below_step_norm() {
+    // The accept-path radius update (`update_joint_trust_region_radius`)
+    // pulls the new radius below `0.5 * step_norm` on rejection so the
+    // next step is provably smaller; the reject-path block shrink must
+    // do the same. Otherwise an interior block with `step_norm <<
+    // factor * radius` re-takes the identical Newton step on the next
+    // dogleg attempt and the trust-region globalization is degenerate.
+    let mut block_radii = vec![1.0];
+    let block_step_norms = vec![1.0e-3];
+    let new_max = shrink_active_joint_block_trust_radii(&mut block_radii, &block_step_norms, 0.25);
+    assert!(
+        new_max <= 0.5 * block_step_norms[0],
+        "shrunken radius must be ≤ 0.5 · step_norm to force a strictly smaller next step (was {new_max:.3e}, step {:.3e})",
+        block_step_norms[0]
+    );
+}
 
-    #[test]
-    fn blockwise_trust_region_uses_penalized_metric_not_raw_coefficient_size() {
-        let spec = ParameterBlockSpec {
-            name: "single_block".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::<f64>::zeros((1, 3)),
-            )),
+#[test]
+fn blockwise_trust_region_uses_penalized_metric_not_raw_coefficient_size() {
+    let spec = ParameterBlockSpec {
+        name: "single_block".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::<f64>::zeros((1, 3)),
+        )),
+        offset: Array1::zeros(1),
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0e-10]];
+    let work = BlockWorkingSet::ExactNewton {
+        gradient: array![0.0, 0.0, 0.0],
+        hessian: SymmetricMatrix::Dense(h.clone()),
+    };
+    let s_lambda = Array2::<f64>::zeros((3, 3));
+    let raw_delta: Array1<f64> = array![2.0, -1.0, 2.0e5];
+    let raw_inf = raw_delta.iter().fold(0.0_f64, |m, v| {
+        let value: f64 = *v;
+        m.max(value.abs())
+    });
+    let radius = 20.0_f64;
+
+    let raw_inf_scaled = &raw_delta * (radius / raw_inf);
+    assert!(
+        raw_inf_scaled[0].abs() < 1.0e-3,
+        "the old raw coefficient cap would starve ordinary coordinates inside the block"
+    );
+
+    let (metric_delta, metric_norm) = truncate_block_step_to_metric_radius(
+        &spec,
+        &work,
+        &s_lambda,
+        raw_delta,
+        radius,
+        0.0,
+        RidgePolicy::explicit_stabilization_pospart(),
+    )
+    .expect("block metric truncation should succeed");
+    assert!(
+        metric_norm < radius,
+        "the near-null coordinate is large in beta-space but small in the block's penalized-Hessian metric"
+    );
+    assert!(
+        (metric_delta[0] - 2.0).abs() < 1.0e-12
+            && (metric_delta[1] + 1.0).abs() < 1.0e-12
+            && (metric_delta[2] - 2.0e5).abs() < 1.0e-6,
+        "blockwise trust regions must size steps in objective curvature units, not raw coefficient units"
+    );
+}
+
+#[test]
+fn blockwise_trust_region_never_reverts_to_raw_beta_norm_on_indefinite_curvature() {
+    let spec = ParameterBlockSpec {
+        name: "single_block".to_string(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::<f64>::zeros((1, 3)),
+        )),
+        offset: Array1::zeros(1),
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0e-8]];
+    let work = BlockWorkingSet::ExactNewton {
+        gradient: array![0.0, 0.0, 0.0],
+        hessian: SymmetricMatrix::Dense(h),
+    };
+    let s_lambda = Array2::<f64>::zeros((3, 3));
+    let raw_delta: Array1<f64> = array![2.0, -1.0, 2.0e5];
+    let radius = 20.0_f64;
+
+    let old_quadratic = raw_delta.dot(&array![2.0, -1.0, -2.0e-3]);
+    assert!(
+        old_quadratic < 0.0,
+        "fixture must hit the historical non-SPD branch"
+    );
+
+    let (metric_delta, metric_norm) = truncate_block_step_to_metric_radius(
+        &spec,
+        &work,
+        &s_lambda,
+        raw_delta,
+        radius,
+        0.0,
+        RidgePolicy::explicit_stabilization_pospart(),
+    )
+    .expect("block metric truncation should succeed");
+    assert!(
+        metric_norm < radius,
+        "indefinite curvature must still use the positive penalized diagonal metric, not raw beta length"
+    );
+    assert!(
+        (metric_delta[0] - 2.0).abs() < 1.0e-12
+            && (metric_delta[1] + 1.0).abs() < 1.0e-12
+            && (metric_delta[2] - 2.0e5).abs() < 1.0e-6,
+        "non-SPD local curvature must not resurrect coefficient-space trust-region scaling"
+    );
+}
+
+#[test]
+fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
+    // Local Rosenbrock-at-the-valley quadratic in variables (x, y):
+    // f ≈ 0.5 * [dx, dy]' H [dx, dy], H = [[802, -400], [-400, 200]].
+    // Add a tiny ridge to make the test SPD and use a gradient whose full
+    // Newton step crosses the radius, exercising truncation before the
+    // objective is evaluated.
+    let h = array![[802.0, -400.0], [-400.0, 200.1]];
+    let unconstrained = array![1.0, 1.0];
+    let gradient = -h.dot(&unconstrained);
+    let rhs = -&gradient;
+    let mut step = unconstrained.clone();
+    let unconstrained_norm = unconstrained.iter().map(|v| v * v).sum::<f64>().sqrt();
+    assert!(unconstrained_norm > 0.25);
+    step.mapv_inplace(|v| v * (0.25 / unconstrained_norm));
+    let step_norm = step.iter().map(|v| v * v).sum::<f64>().sqrt();
+    assert!(step_norm <= 0.25 + 1.0e-12);
+
+    let h_step = h.dot(&step);
+    let predicted = joint_quadratic_predicted_reduction(&rhs, &h_step, &step);
+    let old_objective = 0.0;
+    let trial_objective = gradient.dot(&step) + 0.5 * step.dot(&h_step);
+    let actual = old_objective - trial_objective;
+    assert!(predicted > 0.0);
+    assert!((predicted - actual).abs() < 1.0e-10);
+
+    let update =
+        update_joint_trust_region_radius(0.25, step_norm, actual, predicted, old_objective);
+    assert!(update.accepted);
+    assert!(trial_objective < old_objective);
+}
+
+// Inline RED REPRO moved to tests/joint_newton_isotropic_tr_starvation.rs
+// so it survives in-progress refactors of the surrounding test
+// support module (this `mod tests { }` currently does not compile due
+// to `crate::test_support::*` / `test_outerobjective_andgradient` WIP).
+
+/// Synthetic 3-block fixture where the joint penalized Hessian is
+/// rank-deficient inside block 2 (block-diagonal H with two
+/// well-conditioned 3x3 identity blocks and a rank-1 third block; all
+/// s_lambdas are zero so the penalty does not lift the deficiency).
+/// The gradient is concentrated on block 2's null directions so the
+/// stationarity residual is dominated by block 2. The report must
+/// (a) classify the refusal as `RankDeficientHPen`, (b) record
+/// nullity > 0, and (c) name block 2 as the carrying block.
+#[test]
+fn kkt_refusal_report_classifies_rank_deficient_hpen_third_block() {
+    let block_widths = [3usize, 3, 3];
+    let total_p: usize = block_widths.iter().sum();
+    let block_count = block_widths.len();
+
+    let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
+    let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
+    let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
+    let names = ["block_a", "block_b", "block_c_rank_deficient"];
+    let mut offset = 0usize;
+    for (b, &width) in block_widths.iter().enumerate() {
+        let start = offset;
+        let end = start + width;
+        offset = end;
+        ranges.push((start, end));
+        specs.push(ParameterBlockSpec {
+            name: names[b].to_string(),
+            design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
             offset: Array1::zeros(1),
             penalties: vec![],
             nullspace_dims: vec![],
@@ -7750,625 +7757,455 @@
             jacobian_callback: None,
             stacked_design: None,
             stacked_offset: None,
-        };
-        let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0e-10]];
-        let work = BlockWorkingSet::ExactNewton {
-            gradient: array![0.0, 0.0, 0.0],
-            hessian: SymmetricMatrix::Dense(h.clone()),
-        };
-        let s_lambda = Array2::<f64>::zeros((3, 3));
-        let raw_delta: Array1<f64> = array![2.0, -1.0, 2.0e5];
-        let raw_inf = raw_delta.iter().fold(0.0_f64, |m, v| {
-            let value: f64 = *v;
-            m.max(value.abs())
         });
-        let radius = 20.0_f64;
-
-        let raw_inf_scaled = &raw_delta * (radius / raw_inf);
-        assert!(
-            raw_inf_scaled[0].abs() < 1.0e-3,
-            "the old raw coefficient cap would starve ordinary coordinates inside the block"
-        );
-
-        let (metric_delta, metric_norm) = truncate_block_step_to_metric_radius(
-            &spec,
-            &work,
-            &s_lambda,
-            raw_delta,
-            radius,
-            0.0,
-            RidgePolicy::explicit_stabilization_pospart(),
-        )
-        .expect("block metric truncation should succeed");
-        assert!(
-            metric_norm < radius,
-            "the near-null coordinate is large in beta-space but small in the block's penalized-Hessian metric"
-        );
-        assert!(
-            (metric_delta[0] - 2.0).abs() < 1.0e-12
-                && (metric_delta[1] + 1.0).abs() < 1.0e-12
-                && (metric_delta[2] - 2.0e5).abs() < 1.0e-6,
-            "blockwise trust regions must size steps in objective curvature units, not raw coefficient units"
-        );
+        states.push(ParameterBlockState {
+            beta: Array1::zeros(width),
+            eta: Array1::zeros(1),
+        });
+        s_lambdas.push(Array2::<f64>::zeros((width, width)));
     }
 
-    #[test]
-    fn blockwise_trust_region_never_reverts_to_raw_beta_norm_on_indefinite_curvature() {
-        let spec = ParameterBlockSpec {
-            name: "single_block".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::<f64>::zeros((1, 3)),
-            )),
-            offset: Array1::zeros(1),
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0e-8]];
-        let work = BlockWorkingSet::ExactNewton {
-            gradient: array![0.0, 0.0, 0.0],
-            hessian: SymmetricMatrix::Dense(h),
-        };
-        let s_lambda = Array2::<f64>::zeros((3, 3));
-        let raw_delta: Array1<f64> = array![2.0, -1.0, 2.0e5];
-        let radius = 20.0_f64;
-
-        let old_quadratic = raw_delta.dot(&array![2.0, -1.0, -2.0e-3]);
-        assert!(
-            old_quadratic < 0.0,
-            "fixture must hit the historical non-SPD branch"
-        );
-
-        let (metric_delta, metric_norm) = truncate_block_step_to_metric_radius(
-            &spec,
-            &work,
-            &s_lambda,
-            raw_delta,
-            radius,
-            0.0,
-            RidgePolicy::explicit_stabilization_pospart(),
-        )
-        .expect("block metric truncation should succeed");
-        assert!(
-            metric_norm < radius,
-            "indefinite curvature must still use the positive penalized diagonal metric, not raw beta length"
-        );
-        assert!(
-            (metric_delta[0] - 2.0).abs() < 1.0e-12
-                && (metric_delta[1] + 1.0).abs() < 1.0e-12
-                && (metric_delta[2] - 2.0e5).abs() < 1.0e-6,
-            "non-SPD local curvature must not resurrect coefficient-space trust-region scaling"
-        );
+    // Block-diagonal H: I(3) ⊕ I(3) ⊕ e0 e0ᵀ (third block rank 1, nullity 2).
+    let mut h = Array2::<f64>::zeros((total_p, total_p));
+    for i in 0..3 {
+        h[[i, i]] = 1.0;
+        h[[3 + i, 3 + i]] = 1.0;
     }
+    h[[6, 6]] = 1.0;
 
-    #[test]
-    fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
-        // Local Rosenbrock-at-the-valley quadratic in variables (x, y):
-        // f ≈ 0.5 * [dx, dy]' H [dx, dy], H = [[802, -400], [-400, 200]].
-        // Add a tiny ridge to make the test SPD and use a gradient whose full
-        // Newton step crosses the radius, exercising truncation before the
-        // objective is evaluated.
-        let h = array![[802.0, -400.0], [-400.0, 200.1]];
-        let unconstrained = array![1.0, 1.0];
-        let gradient = -h.dot(&unconstrained);
-        let rhs = -&gradient;
-        let mut step = unconstrained.clone();
-        let unconstrained_norm = unconstrained.iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(unconstrained_norm > 0.25);
-        step.mapv_inplace(|v| v * (0.25 / unconstrained_norm));
-        let step_norm = step.iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(step_norm <= 0.25 + 1.0e-12);
+    let source = JointHessianSource::Dense(h);
 
-        let h_step = h.dot(&step);
-        let predicted = joint_quadratic_predicted_reduction(&rhs, &h_step, &step);
-        let old_objective = 0.0;
-        let trial_objective = gradient.dot(&step) + 0.5 * step.dot(&h_step);
-        let actual = old_objective - trial_objective;
-        assert!(predicted > 0.0);
-        assert!((predicted - actual).abs() < 1.0e-10);
+    // Concentrate the gradient on block 2's null directions (rows 7,8).
+    // With s_lambdas all zero and β=0, the stationarity residual equals
+    // -gradient, so block 2 carries the dominant residual mass.
+    let mut joint_grad = Array1::<f64>::zeros(total_p);
+    joint_grad[7] = 5.0;
+    joint_grad[8] = 3.0;
+    joint_grad[0] = 1.0e-6;
 
-        let update =
-            update_joint_trust_region_radius(0.25, step_norm, actual, predicted, old_objective);
-        assert!(update.accepted);
-        assert!(trial_objective < old_objective);
-    }
+    let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
+    let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
 
-    // Inline RED REPRO moved to tests/joint_newton_isotropic_tr_starvation.rs
-    // so it survives in-progress refactors of the surrounding test
-    // support module (this `mod tests { }` currently does not compile due
-    // to `crate::test_support::*` / `test_outerobjective_andgradient` WIP).
+    let math = JointNewtonMathDiagnostic {
+        old_kkt_inf: 5.0,
+        linearized_next_kkt_inf: 4.9,
+        predicted_reduction: 1.0e-4,
+        actual_reduction: 1.0e-4,
+        trust_ratio: 1.0,
+        step_inf: 1.0e-9,
+        proposal_inf: 1.0e-3,
+    };
 
-    /// Synthetic 3-block fixture where the joint penalized Hessian is
-    /// rank-deficient inside block 2 (block-diagonal H with two
-    /// well-conditioned 3x3 identity blocks and a rank-1 third block; all
-    /// s_lambdas are zero so the penalty does not lift the deficiency).
-    /// The gradient is concentrated on block 2's null directions so the
-    /// stationarity residual is dominated by block 2. The report must
-    /// (a) classify the refusal as `RankDeficientHPen`, (b) record
-    /// nullity > 0, and (c) name block 2 as the carrying block.
-    #[test]
-    fn kkt_refusal_report_classifies_rank_deficient_hpen_third_block() {
-        let block_widths = [3usize, 3, 3];
-        let total_p: usize = block_widths.iter().sum();
-        let block_count = block_widths.len();
+    let residual_tol = 1.0e-6;
+    let projected_residual_inf = 5.0;
 
-        let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
-        let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
-        let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
-        let names = ["block_a", "block_b", "block_c_rank_deficient"];
-        let mut offset = 0usize;
-        for (b, &width) in block_widths.iter().enumerate() {
-            let start = offset;
-            let end = start + width;
-            offset = end;
-            ranges.push((start, end));
-            specs.push(ParameterBlockSpec {
-                name: names[b].to_string(),
-                design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
-                offset: Array1::zeros(1),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: None,
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            });
-            states.push(ParameterBlockState {
-                beta: Array1::zeros(width),
-                eta: Array1::zeros(1),
-            });
-            s_lambdas.push(Array2::<f64>::zeros((width, width)));
-        }
+    let report = compute_kkt_refusal_report(
+        42,
+        &states,
+        &specs,
+        &s_lambdas,
+        &ranges,
+        Some(&joint_grad),
+        &cached_active_sets,
+        &block_constraints,
+        Some(&source),
+        total_p,
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        1.0e-9,
+        1.0e-3,
+        1.0,
+        residual_tol,
+        1.0e-6,
+        1.0e-6,
+        1.0e-8,
+        projected_residual_inf,
+        Some(&math),
+    );
 
-        // Block-diagonal H: I(3) ⊕ I(3) ⊕ e0 e0ᵀ (third block rank 1, nullity 2).
-        let mut h = Array2::<f64>::zeros((total_p, total_p));
-        for i in 0..3 {
-            h[[i, i]] = 1.0;
-            h[[3 + i, 3 + i]] = 1.0;
-        }
-        h[[6, 6]] = 1.0;
+    assert_eq!(
+        report.diagnosis,
+        KktRefusalDiagnosis::RankDeficientHPen,
+        "block-2 rank-1 H_pen with zero s_lambdas must classify as RankDeficientHPen, got {:?}",
+        report.diagnosis,
+    );
+    assert!(
+        report.hpen_nullity_at_rank_tol > 0,
+        "rank-1 block embedded in 9x9 block-diagonal H must register nullity > 0, got {}",
+        report.hpen_nullity_at_rank_tol,
+    );
+    assert_eq!(
+        report.block_carrying_residual,
+        Some(2),
+        "block 2 must carry the largest |∇L − Sβ|∞ component; got {:?}, residuals={:?}",
+        report.block_carrying_residual,
+        report.block_residual_inf,
+    );
+    assert_eq!(report.block_names.len(), block_count);
+    assert_eq!(
+        report.block_names[2], "block_c_rank_deficient",
+        "carrying-block name should be the third block",
+    );
+    assert!(
+        report
+            .format_structured_log(residual_tol)
+            .contains("rank_deficient_H_pen"),
+        "structured log must surface the diagnosis label",
+    );
+    assert!(
+        report
+            .format_bubbled_error()
+            .contains("block_c_rank_deficient"),
+        "bubbled error must name the carrying block by spec.name",
+    );
+    assert!(
+        report
+            .format_bubbled_error()
+            .contains("structural or numerical null direction"),
+        "rank-deficient refusals should no longer emit the old polynomial-only guidance",
+    );
+}
 
-        let source = JointHessianSource::Dense(h);
-
-        // Concentrate the gradient on block 2's null directions (rows 7,8).
-        // With s_lambdas all zero and β=0, the stationarity residual equals
-        // -gradient, so block 2 carries the dominant residual mass.
-        let mut joint_grad = Array1::<f64>::zeros(total_p);
-        joint_grad[7] = 5.0;
-        joint_grad[8] = 3.0;
-        joint_grad[0] = 1.0e-6;
-
-        let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
-        let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
-
-        let math = JointNewtonMathDiagnostic {
-            old_kkt_inf: 5.0,
-            linearized_next_kkt_inf: 4.9,
-            predicted_reduction: 1.0e-4,
-            actual_reduction: 1.0e-4,
-            trust_ratio: 1.0,
-            step_inf: 1.0e-9,
-            proposal_inf: 1.0e-3,
-        };
-
-        let residual_tol = 1.0e-6;
-        let projected_residual_inf = 5.0;
-
-        let report = compute_kkt_refusal_report(
-            42,
-            &states,
-            &specs,
-            &s_lambdas,
-            &ranges,
-            Some(&joint_grad),
-            &cached_active_sets,
-            &block_constraints,
-            Some(&source),
-            total_p,
-            0.0,
-            RidgePolicy::explicit_stabilization_full(),
-            1.0e-9,
-            1.0e-3,
-            1.0,
-            residual_tol,
-            1.0e-6,
-            1.0e-6,
-            1.0e-8,
-            projected_residual_inf,
-            Some(&math),
-        );
-
-        assert_eq!(
-            report.diagnosis,
-            KktRefusalDiagnosis::RankDeficientHPen,
-            "block-2 rank-1 H_pen with zero s_lambdas must classify as RankDeficientHPen, got {:?}",
-            report.diagnosis,
-        );
-        assert!(
-            report.hpen_nullity_at_rank_tol > 0,
-            "rank-1 block embedded in 9x9 block-diagonal H must register nullity > 0, got {}",
-            report.hpen_nullity_at_rank_tol,
-        );
-        assert_eq!(
-            report.block_carrying_residual,
-            Some(2),
-            "block 2 must carry the largest |∇L − Sβ|∞ component; got {:?}, residuals={:?}",
-            report.block_carrying_residual,
-            report.block_residual_inf,
-        );
-        assert_eq!(report.block_names.len(), block_count);
-        assert_eq!(
-            report.block_names[2], "block_c_rank_deficient",
-            "carrying-block name should be the third block",
-        );
-        assert!(
-            report
-                .format_structured_log(residual_tol)
-                .contains("rank_deficient_H_pen"),
-            "structured log must surface the diagnosis label",
-        );
-        assert!(
-            report
-                .format_bubbled_error()
-                .contains("block_c_rank_deficient"),
-            "bubbled error must name the carrying block by spec.name",
-        );
-        assert!(
-            report
-                .format_bubbled_error()
-                .contains("structural or numerical null direction"),
-            "rank-deficient refusals should no longer emit the old polynomial-only guidance",
-        );
-    }
-
-    /// Round-trip: every variant's `as_str()` output, when embedded in the
-    /// `diagnosis: <label>` slot of the bubbled-error format, must parse
-    /// back via `parse_from_error`. seed-accounting's `InnerStatus`
-    /// classifier reads diagnoses out of bubbled error strings via that
-    /// parser; if a variant's label diverges between formatter and parser
-    /// the classifier silently falls back to "unknown" and the early-exit
-    /// canary degrades to a generic non-converged result.
-    #[test]
-    fn kkt_refusal_diagnosis_string_round_trip_through_bubbled_error_parser() {
-        for diagnosis in [
-            KktRefusalDiagnosis::RankDeficientHPen,
-            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
-            KktRefusalDiagnosis::ActiveSetIncomplete,
-            KktRefusalDiagnosis::AliasingDetectedAtFit,
-        ] {
-            let label = diagnosis.as_str();
-            // Mimic the trailing slot exactly as `format_bubbled_error`
-            // emits it (label at the very end after `; diagnosis: `).
-            let synthetic_error = format!(
-                "coupled exact-joint inner solve exited the joint Newton path before convergence \
+/// Round-trip: every variant's `as_str()` output, when embedded in the
+/// `diagnosis: <label>` slot of the bubbled-error format, must parse
+/// back via `parse_from_error`. seed-accounting's `InnerStatus`
+/// classifier reads diagnoses out of bubbled error strings via that
+/// parser; if a variant's label diverges between formatter and parser
+/// the classifier silently falls back to "unknown" and the early-exit
+/// canary degrades to a generic non-converged result.
+#[test]
+fn kkt_refusal_diagnosis_string_round_trip_through_bubbled_error_parser() {
+    for diagnosis in [
+        KktRefusalDiagnosis::RankDeficientHPen,
+        KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
+        KktRefusalDiagnosis::ActiveSetIncomplete,
+        KktRefusalDiagnosis::AliasingDetectedAtFit,
+    ] {
+        let label = diagnosis.as_str();
+        // Mimic the trailing slot exactly as `format_bubbled_error`
+        // emits it (label at the very end after `; diagnosis: `).
+        let synthetic_error = format!(
+            "coupled exact-joint inner solve exited the joint Newton path before convergence \
                  — cycle=7 cert REFUSED: residual=1.0e-2 > tol=1.0e-6; \
                  diagnosis: {label}"
-            );
-            let parsed = KktRefusalDiagnosis::parse_from_error(&synthetic_error);
-            assert_eq!(
-                parsed,
-                Some(diagnosis),
-                "label '{label}' must round-trip through parse_from_error; got {:?}",
-                parsed,
-            );
-        }
-    }
-
-    #[test]
-    fn kkt_refusal_guidance_distinguishes_marginal_slope_coupling_from_polynomial_nullspace() {
-        let phantom = KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH.guidance();
-        assert!(phantom.contains("marginal/logslope coupling"));
-        assert!(phantom.contains("rather than a"));
-        assert!(phantom.contains("Matérn/Duchon polynomial-nullspace failure"));
-
-        let active = KktRefusalDiagnosis::ActiveSetIncomplete.guidance();
-        assert!(active.contains("active-set certification failure"));
-        assert!(active.contains("not a polynomial-nullspace diagnosis"));
-
-        let alias = KktRefusalDiagnosis::AliasingDetectedAtFit.guidance();
-        assert!(alias.contains("drop or reparameterize"));
-    }
-
-    /// Regression canary: a synthetic 3-block fixture chosen to mimic the
-    /// large-scale rank-deficient-H_pen failure mode — block-diagonal H with
-    /// a fully degenerate third block and zero s_lambdas — must classify
-    /// as `RankDeficientHPen` with nullity matching the structural rank
-    /// deficiency. When `nullspace-lead`'s smooth-construction
-    /// reparameterization lands and absorbs polynomial null spaces into
-    /// the parametric block, the SAME fixture (rewritten with a
-    /// full-rank reparameterized basis) should fit cleanly with no
-    /// refusal. That follow-up half is wired below behind `#[ignore]`
-    /// per the lead's note; the diagnosis half here is active so the
-    /// canary fires today on the failure mode the rework targets.
-    #[test]
-    fn rank_deficient_hpen_canary_fires_on_large_scale_shaped_failure() {
-        let block_widths = [4usize, 4, 4];
-        let total_p: usize = block_widths.iter().sum();
-        let block_count = block_widths.len();
-
-        let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
-        let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
-        let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
-        let names = ["location_block", "scale_block", "marginal_slope_block"];
-        let mut offset = 0usize;
-        for (b, &width) in block_widths.iter().enumerate() {
-            let start = offset;
-            let end = start + width;
-            offset = end;
-            ranges.push((start, end));
-            specs.push(ParameterBlockSpec {
-                name: names[b].to_string(),
-                design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
-                offset: Array1::zeros(1),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: None,
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            });
-            states.push(ParameterBlockState {
-                beta: Array1::zeros(width),
-                eta: Array1::zeros(1),
-            });
-            s_lambdas.push(Array2::<f64>::zeros((width, width)));
-        }
-
-        // H = I(4) ⊕ I(4) ⊕ 0 — the third block is the marginal-slope
-        // pathology: zero Hessian curvature on a 4-D null space the
-        // penalty does not constrain (s_lambdas are zero everywhere).
-        let mut h = Array2::<f64>::zeros((total_p, total_p));
-        for i in 0..4 {
-            h[[i, i]] = 1.0;
-            h[[4 + i, 4 + i]] = 1.0;
-        }
-        // Marginal-slope block left as the zero matrix → nullity = 4.
-
-        let source = JointHessianSource::Dense(h);
-
-        // Gradient mass concentrated on the marginal-slope block. With
-        // β=0 and S=0, the stationarity residual on that block equals
-        // −gradient there, so the carrying block is unambiguous.
-        let mut joint_grad = Array1::<f64>::zeros(total_p);
-        joint_grad[8] = 4.2;
-        joint_grad[9] = 1.7;
-        joint_grad[10] = -2.5;
-        joint_grad[11] = 0.9;
-
-        let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
-        let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
-        let math = JointNewtonMathDiagnostic {
-            old_kkt_inf: 4.2,
-            linearized_next_kkt_inf: 4.2,
-            predicted_reduction: 0.0,
-            actual_reduction: 0.0,
-            trust_ratio: 0.0,
-            step_inf: 0.0,
-            proposal_inf: 1.0e-3,
-        };
-
-        let report = compute_kkt_refusal_report(
-            123,
-            &states,
-            &specs,
-            &s_lambdas,
-            &ranges,
-            Some(&joint_grad),
-            &cached_active_sets,
-            &block_constraints,
-            Some(&source),
-            total_p,
-            0.0,
-            RidgePolicy::explicit_stabilization_full(),
-            0.0,
-            1.0e-3,
-            1.0,
-            1.0e-6,
-            1.0e-6,
-            1.0e-6,
-            0.0,
-            4.2,
-            Some(&math),
         );
-
+        let parsed = KktRefusalDiagnosis::parse_from_error(&synthetic_error);
         assert_eq!(
-            report.diagnosis,
-            KktRefusalDiagnosis::RankDeficientHPen,
-            "large-scale-shaped marginal-slope failure must classify as RankDeficientHPen \
+            parsed,
+            Some(diagnosis),
+            "label '{label}' must round-trip through parse_from_error; got {:?}",
+            parsed,
+        );
+    }
+}
+
+#[test]
+fn kkt_refusal_guidance_distinguishes_marginal_slope_coupling_from_polynomial_nullspace() {
+    let phantom = KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH.guidance();
+    assert!(phantom.contains("marginal/logslope coupling"));
+    assert!(phantom.contains("rather than a"));
+    assert!(phantom.contains("Matérn/Duchon polynomial-nullspace failure"));
+
+    let active = KktRefusalDiagnosis::ActiveSetIncomplete.guidance();
+    assert!(active.contains("active-set certification failure"));
+    assert!(active.contains("not a polynomial-nullspace diagnosis"));
+
+    let alias = KktRefusalDiagnosis::AliasingDetectedAtFit.guidance();
+    assert!(alias.contains("drop or reparameterize"));
+}
+
+/// Regression canary: a synthetic 3-block fixture chosen to mimic the
+/// large-scale rank-deficient-H_pen failure mode — block-diagonal H with
+/// a fully degenerate third block and zero s_lambdas — must classify
+/// as `RankDeficientHPen` with nullity matching the structural rank
+/// deficiency. When `nullspace-lead`'s smooth-construction
+/// reparameterization lands and absorbs polynomial null spaces into
+/// the parametric block, the SAME fixture (rewritten with a
+/// full-rank reparameterized basis) should fit cleanly with no
+/// refusal. That follow-up half is wired below behind `#[ignore]`
+/// per the lead's note; the diagnosis half here is active so the
+/// canary fires today on the failure mode the rework targets.
+#[test]
+fn rank_deficient_hpen_canary_fires_on_large_scale_shaped_failure() {
+    let block_widths = [4usize, 4, 4];
+    let total_p: usize = block_widths.iter().sum();
+    let block_count = block_widths.len();
+
+    let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
+    let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
+    let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
+    let names = ["location_block", "scale_block", "marginal_slope_block"];
+    let mut offset = 0usize;
+    for (b, &width) in block_widths.iter().enumerate() {
+        let start = offset;
+        let end = start + width;
+        offset = end;
+        ranges.push((start, end));
+        specs.push(ParameterBlockSpec {
+            name: names[b].to_string(),
+            design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
+            offset: Array1::zeros(1),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        });
+        states.push(ParameterBlockState {
+            beta: Array1::zeros(width),
+            eta: Array1::zeros(1),
+        });
+        s_lambdas.push(Array2::<f64>::zeros((width, width)));
+    }
+
+    // H = I(4) ⊕ I(4) ⊕ 0 — the third block is the marginal-slope
+    // pathology: zero Hessian curvature on a 4-D null space the
+    // penalty does not constrain (s_lambdas are zero everywhere).
+    let mut h = Array2::<f64>::zeros((total_p, total_p));
+    for i in 0..4 {
+        h[[i, i]] = 1.0;
+        h[[4 + i, 4 + i]] = 1.0;
+    }
+    // Marginal-slope block left as the zero matrix → nullity = 4.
+
+    let source = JointHessianSource::Dense(h);
+
+    // Gradient mass concentrated on the marginal-slope block. With
+    // β=0 and S=0, the stationarity residual on that block equals
+    // −gradient there, so the carrying block is unambiguous.
+    let mut joint_grad = Array1::<f64>::zeros(total_p);
+    joint_grad[8] = 4.2;
+    joint_grad[9] = 1.7;
+    joint_grad[10] = -2.5;
+    joint_grad[11] = 0.9;
+
+    let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
+    let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
+    let math = JointNewtonMathDiagnostic {
+        old_kkt_inf: 4.2,
+        linearized_next_kkt_inf: 4.2,
+        predicted_reduction: 0.0,
+        actual_reduction: 0.0,
+        trust_ratio: 0.0,
+        step_inf: 0.0,
+        proposal_inf: 1.0e-3,
+    };
+
+    let report = compute_kkt_refusal_report(
+        123,
+        &states,
+        &specs,
+        &s_lambdas,
+        &ranges,
+        Some(&joint_grad),
+        &cached_active_sets,
+        &block_constraints,
+        Some(&source),
+        total_p,
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        0.0,
+        1.0e-3,
+        1.0,
+        1.0e-6,
+        1.0e-6,
+        1.0e-6,
+        0.0,
+        4.2,
+        Some(&math),
+    );
+
+    assert_eq!(
+        report.diagnosis,
+        KktRefusalDiagnosis::RankDeficientHPen,
+        "large-scale-shaped marginal-slope failure must classify as RankDeficientHPen \
              (this is the canary nullspace-lead's smooth-construction rework targets)",
-        );
-        assert!(
-            report.hpen_nullity_at_rank_tol >= 4,
-            "fully degenerate marginal-slope block (4 zero eigenvalues) must contribute \
+    );
+    assert!(
+        report.hpen_nullity_at_rank_tol >= 4,
+        "fully degenerate marginal-slope block (4 zero eigenvalues) must contribute \
              nullity >= 4; got {}",
-            report.hpen_nullity_at_rank_tol,
-        );
-        assert_eq!(
-            report.block_carrying_residual,
-            Some(2),
-            "marginal_slope_block (idx 2) must carry the residual; got {:?}, residuals={:?}",
-            report.block_carrying_residual,
-            report.block_residual_inf,
-        );
-        let bubbled = report.format_bubbled_error();
-        assert_eq!(
-            KktRefusalDiagnosis::parse_from_error(&bubbled),
-            Some(KktRefusalDiagnosis::RankDeficientHPen),
-            "canary's bubbled-error string must parse back via the classifier's parser",
-        );
+        report.hpen_nullity_at_rank_tol,
+    );
+    assert_eq!(
+        report.block_carrying_residual,
+        Some(2),
+        "marginal_slope_block (idx 2) must carry the residual; got {:?}, residuals={:?}",
+        report.block_carrying_residual,
+        report.block_residual_inf,
+    );
+    let bubbled = report.format_bubbled_error();
+    assert_eq!(
+        KktRefusalDiagnosis::parse_from_error(&bubbled),
+        Some(KktRefusalDiagnosis::RankDeficientHPen),
+        "canary's bubbled-error string must parse back via the classifier's parser",
+    );
+    assert!(
+        bubbled.contains("marginal-slope fits can also expose callback-owned weak directions"),
+        "BMS-shaped refusal should mention the callback-owned weak-direction mechanism"
+    );
+}
+
+/// Post-fix half of the canary: once `nullspace-lead`'s smooth
+/// reparameterization absorbs polynomial null spaces into the
+/// parametric block, the marginal-slope synthetic above (rewritten
+/// to use a full-rank reparameterized basis with the absorbed null
+/// columns moved into a separate identifiable block) should fit
+/// without any cert refusal.
+#[test]
+fn rank_deficient_hpen_canary_disappears_after_nullspace_absorption() {
+    let block_widths = [4usize, 4, 4];
+    let total_p: usize = block_widths.iter().sum();
+    let block_count = block_widths.len();
+
+    let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
+    let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
+    let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
+    let names = ["location_block", "scale_block", "marginal_slope_block"];
+    let mut offset = 0usize;
+    for (b, &width) in block_widths.iter().enumerate() {
+        let start = offset;
+        let end = start + width;
+        offset = end;
+        ranges.push((start, end));
+        specs.push(ParameterBlockSpec {
+            name: names[b].to_string(),
+            design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
+            offset: Array1::zeros(1),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        });
+        states.push(ParameterBlockState {
+            beta: Array1::zeros(width),
+            eta: Array1::zeros(1),
+        });
+        s_lambdas.push(Array2::<f64>::zeros((width, width)));
+    }
+
+    // Full-rank H across all three blocks — the post-absorption
+    // shape: the polynomial null space has been moved out of the
+    // smooth and the remaining basis is fully identified by the
+    // likelihood Hessian.
+    let h = Array2::<f64>::eye(total_p);
+    let source = JointHessianSource::Dense(h);
+    let joint_grad = Array1::<f64>::zeros(total_p);
+    let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
+    let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
+    let math = JointNewtonMathDiagnostic {
+        old_kkt_inf: 0.0,
+        linearized_next_kkt_inf: 0.0,
+        predicted_reduction: 0.0,
+        actual_reduction: 0.0,
+        trust_ratio: 1.0,
+        step_inf: 0.0,
+        proposal_inf: 0.0,
+    };
+
+    let report = compute_kkt_refusal_report(
+        0,
+        &states,
+        &specs,
+        &s_lambdas,
+        &ranges,
+        Some(&joint_grad),
+        &cached_active_sets,
+        &block_constraints,
+        Some(&source),
+        total_p,
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        0.0,
+        0.0,
+        1.0,
+        1.0e-6,
+        1.0e-6,
+        1.0e-6,
+        0.0,
+        0.0,
+        Some(&math),
+    );
+
+    assert_eq!(
+        report.hpen_nullity_at_rank_tol, 0,
+        "post-absorption: full-rank H_pen must register nullity 0",
+    );
+    assert_ne!(
+        report.diagnosis,
+        KktRefusalDiagnosis::RankDeficientHPen,
+        "post-absorption: the rank-deficiency diagnosis must no longer fire",
+    );
+}
+
+/// Pins the structural effective-df machinery to the exact trace identity
+///
+/// ```text
+/// Σ_j γ_j/(γ_j + λ) = tr{ G (G + λ S)⁻¹ }
+/// ```
+///
+/// on a NON-commuting Gram/penalty pair, where the historical Rayleigh-quotient
+/// implementation (diagonal of B only) gave the wrong answer. With
+/// `S = diag(1, 4)` and `G = [[1, 0.8], [0.8, 1]]` the true generalized
+/// eigenvalues are eig(D^{-1/2} Uᵀ G U D^{-1/2}) ≈ [0.0767072, 1.1732928],
+/// whereas the Rayleigh quotients are [1, 0.25]; only the former reproduce the
+/// trace identity, and they disagree at λ = 1 (≈0.6111 vs the buggy 0.7000).
+#[test]
+fn structural_edf_matches_trace_identity_noncommuting_pair() {
+    // Penalty S = diag(1, 4).
+    let s = array![[1.0, 0.0], [0.0, 4.0]];
+    // Design with Gram G = XᵀX = [[1, 0.8], [0.8, 1]]. Use the symmetric
+    // square root G^{1/2} so that XᵀX = G exactly:
+    //   G = 1.8·v1v1ᵀ + 0.2·v2v2ᵀ, v1=[1,1]/√2, v2=[1,-1]/√2.
+    let off = 0.5 * (1.8_f64.sqrt() - 0.2_f64.sqrt());
+    let diag = 0.5 * (1.8_f64.sqrt() + 0.2_f64.sqrt());
+    let x = array![[diag, off], [off, diag]];
+    let design = DesignMatrix::from(x);
+    let penalty = PenaltyMatrix::Dense(s.clone());
+
+    let gammas = design_penalty_range_gammas(&design, &penalty)
+        .expect("2x2 full-rank p×p pair must yield generalized eigenvalues");
+    assert_eq!(gammas.len(), 2, "range(S) is full rank ⇒ two γ_j");
+
+    // Reference: G = XᵀX, and tr(G (G+λS)⁻¹) computed via the closed-form
+    // 2×2 inverse of M = G + λ S (det/adjugate), independent of the helper.
+    let g = array![[1.0, 0.8], [0.8, 1.0]];
+    let trace_g_minv = |lambda: f64| -> f64 {
+        let m00 = g[(0, 0)] + lambda * s[(0, 0)];
+        let m01 = g[(0, 1)] + lambda * s[(0, 1)];
+        let m10 = g[(1, 0)] + lambda * s[(1, 0)];
+        let m11 = g[(1, 1)] + lambda * s[(1, 1)];
+        let det = m00 * m11 - m01 * m10;
+        // M⁻¹ = (1/det) [[m11, -m01], [-m10, m00]];
+        // tr(G M⁻¹) = (1/det) · [ G00·m11 - G01·m10 - G10·m01 + G11·m00 ].
+        (g[(0, 0)] * m11 - g[(0, 1)] * m10 - g[(1, 0)] * m01 + g[(1, 1)] * m00) / det
+    };
+
+    for &lambda in &[1.0_f64, 0.3] {
+        let rho = lambda.ln();
+        let edf = unit_weight_term_edf(&gammas, rho);
+        let trace = trace_g_minv(lambda);
         assert!(
-            bubbled.contains("marginal-slope fits can also expose callback-owned weak directions"),
-            "BMS-shaped refusal should mention the callback-owned weak-direction mechanism"
+            (edf - trace).abs() < 1e-9,
+            "structural edf {edf} must equal tr(G(G+λS)⁻¹) {trace} at λ={lambda}",
         );
     }
 
-    /// Post-fix half of the canary: once `nullspace-lead`'s smooth
-    /// reparameterization absorbs polynomial null spaces into the
-    /// parametric block, the marginal-slope synthetic above (rewritten
-    /// to use a full-rank reparameterized basis with the absorbed null
-    /// columns moved into a separate identifiable block) should fit
-    /// without any cert refusal.
-    #[test]
-    fn rank_deficient_hpen_canary_disappears_after_nullspace_absorption() {
-        let block_widths = [4usize, 4, 4];
-        let total_p: usize = block_widths.iter().sum();
-        let block_count = block_widths.len();
-
-        let mut specs: Vec<ParameterBlockSpec> = Vec::with_capacity(block_count);
-        let mut states: Vec<ParameterBlockState> = Vec::with_capacity(block_count);
-        let mut s_lambdas: Vec<Array2<f64>> = Vec::with_capacity(block_count);
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_count);
-        let names = ["location_block", "scale_block", "marginal_slope_block"];
-        let mut offset = 0usize;
-        for (b, &width) in block_widths.iter().enumerate() {
-            let start = offset;
-            let end = start + width;
-            offset = end;
-            ranges.push((start, end));
-            specs.push(ParameterBlockSpec {
-                name: names[b].to_string(),
-                design: DesignMatrix::from(Array2::<f64>::zeros((1, width))),
-                offset: Array1::zeros(1),
-                penalties: vec![],
-                nullspace_dims: vec![],
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: None,
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            });
-            states.push(ParameterBlockState {
-                beta: Array1::zeros(width),
-                eta: Array1::zeros(1),
-            });
-            s_lambdas.push(Array2::<f64>::zeros((width, width)));
-        }
-
-        // Full-rank H across all three blocks — the post-absorption
-        // shape: the polynomial null space has been moved out of the
-        // smooth and the remaining basis is fully identified by the
-        // likelihood Hessian.
-        let h = Array2::<f64>::eye(total_p);
-        let source = JointHessianSource::Dense(h);
-        let joint_grad = Array1::<f64>::zeros(total_p);
-        let cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; block_count];
-        let block_constraints: Vec<Option<LinearInequalityConstraints>> = vec![None; block_count];
-        let math = JointNewtonMathDiagnostic {
-            old_kkt_inf: 0.0,
-            linearized_next_kkt_inf: 0.0,
-            predicted_reduction: 0.0,
-            actual_reduction: 0.0,
-            trust_ratio: 1.0,
-            step_inf: 0.0,
-            proposal_inf: 0.0,
-        };
-
-        let report = compute_kkt_refusal_report(
-            0,
-            &states,
-            &specs,
-            &s_lambdas,
-            &ranges,
-            Some(&joint_grad),
-            &cached_active_sets,
-            &block_constraints,
-            Some(&source),
-            total_p,
-            0.0,
-            RidgePolicy::explicit_stabilization_full(),
-            0.0,
-            0.0,
-            1.0,
-            1.0e-6,
-            1.0e-6,
-            1.0e-6,
-            0.0,
-            0.0,
-            Some(&math),
-        );
-
-        assert_eq!(
-            report.hpen_nullity_at_rank_tol, 0,
-            "post-absorption: full-rank H_pen must register nullity 0",
-        );
-        assert_ne!(
-            report.diagnosis,
-            KktRefusalDiagnosis::RankDeficientHPen,
-            "post-absorption: the rank-deficiency diagnosis must no longer fire",
-        );
-    }
-
-    /// Pins the structural effective-df machinery to the exact trace identity
-    ///
-    /// ```text
-    /// Σ_j γ_j/(γ_j + λ) = tr{ G (G + λ S)⁻¹ }
-    /// ```
-    ///
-    /// on a NON-commuting Gram/penalty pair, where the historical Rayleigh-quotient
-    /// implementation (diagonal of B only) gave the wrong answer. With
-    /// `S = diag(1, 4)` and `G = [[1, 0.8], [0.8, 1]]` the true generalized
-    /// eigenvalues are eig(D^{-1/2} Uᵀ G U D^{-1/2}) ≈ [0.0767072, 1.1732928],
-    /// whereas the Rayleigh quotients are [1, 0.25]; only the former reproduce the
-    /// trace identity, and they disagree at λ = 1 (≈0.6111 vs the buggy 0.7000).
-    #[test]
-    fn structural_edf_matches_trace_identity_noncommuting_pair() {
-        // Penalty S = diag(1, 4).
-        let s = array![[1.0, 0.0], [0.0, 4.0]];
-        // Design with Gram G = XᵀX = [[1, 0.8], [0.8, 1]]. Use the symmetric
-        // square root G^{1/2} so that XᵀX = G exactly:
-        //   G = 1.8·v1v1ᵀ + 0.2·v2v2ᵀ, v1=[1,1]/√2, v2=[1,-1]/√2.
-        let off = 0.5 * (1.8_f64.sqrt() - 0.2_f64.sqrt());
-        let diag = 0.5 * (1.8_f64.sqrt() + 0.2_f64.sqrt());
-        let x = array![[diag, off], [off, diag]];
-        let design = DesignMatrix::from(x);
-        let penalty = PenaltyMatrix::Dense(s.clone());
-
-        let gammas = design_penalty_range_gammas(&design, &penalty)
-            .expect("2x2 full-rank p×p pair must yield generalized eigenvalues");
-        assert_eq!(gammas.len(), 2, "range(S) is full rank ⇒ two γ_j");
-
-        // Reference: G = XᵀX, and tr(G (G+λS)⁻¹) computed via the closed-form
-        // 2×2 inverse of M = G + λ S (det/adjugate), independent of the helper.
-        let g = array![[1.0, 0.8], [0.8, 1.0]];
-        let trace_g_minv = |lambda: f64| -> f64 {
-            let m00 = g[(0, 0)] + lambda * s[(0, 0)];
-            let m01 = g[(0, 1)] + lambda * s[(0, 1)];
-            let m10 = g[(1, 0)] + lambda * s[(1, 0)];
-            let m11 = g[(1, 1)] + lambda * s[(1, 1)];
-            let det = m00 * m11 - m01 * m10;
-            // M⁻¹ = (1/det) [[m11, -m01], [-m10, m00]];
-            // tr(G M⁻¹) = (1/det) · [ G00·m11 - G01·m10 - G10·m01 + G11·m00 ].
-            (g[(0, 0)] * m11 - g[(0, 1)] * m10 - g[(1, 0)] * m01 + g[(1, 1)] * m00) / det
-        };
-
-        for &lambda in &[1.0_f64, 0.3] {
-            let rho = lambda.ln();
-            let edf = unit_weight_term_edf(&gammas, rho);
-            let trace = trace_g_minv(lambda);
-            assert!(
-                (edf - trace).abs() < 1e-9,
-                "structural edf {edf} must equal tr(G(G+λS)⁻¹) {trace} at λ={lambda}",
-            );
-        }
-
-        // Sanity: the buggy Rayleigh quotients [1, 0.25] would give 0.7 at λ=1,
-        // which the trace identity (≈0.6111) rejects — guard against regression
-        // to the diagonal-only computation.
-        let edf_at_one = unit_weight_term_edf(&gammas, 0.0_f64);
-        assert!(
-            (edf_at_one - 0.611111_f64).abs() < 1e-5,
-            "edf at λ=1 must be ≈0.6111 (true), not 0.7000 (Rayleigh-quotient bug): got {edf_at_one}",
-        );
-    }
+    // Sanity: the buggy Rayleigh quotients [1, 0.25] would give 0.7 at λ=1,
+    // which the trace identity (≈0.6111) rejects — guard against regression
+    // to the diagonal-only computation.
+    let edf_at_one = unit_weight_term_edf(&gammas, 0.0_f64);
+    assert!(
+        (edf_at_one - 0.611111_f64).abs() < 1e-5,
+        "edf at λ=1 must be ≈0.6111 (true), not 0.7000 (Rayleigh-quotient bug): got {edf_at_one}",
+    );
+}

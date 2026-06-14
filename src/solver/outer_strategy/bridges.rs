@@ -1,6 +1,5 @@
 use super::*;
 
-
 pub(crate) struct OuterFirstOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
@@ -87,11 +86,9 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     consecutive_probe_refusals: usize,
 }
 
-
 pub(crate) const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
 
 pub(crate) const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
-
 
 /// Number of consecutive recoverable `eval_cost` failures (every line-search
 /// probe infeasible) before the bridge escalates to `Fatal` and forces an
@@ -109,7 +106,6 @@ pub(crate) const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
 /// pure waste.
 pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD: usize = 150;
 
-
 /// Tighter probe-refusal threshold used when the bridge has never seen a
 /// `eval_grad` call of its own — i.e. the seed (cost, gradient) was supplied
 /// via `with_initial_sample` so `last_value_grad_rho` is `None` and every
@@ -122,13 +118,11 @@ pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD: usize = 150;
 /// 150 probes × ~3 s each would otherwise cause an observed ~97 min hang.
 pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED: usize = 25;
 
-
 /// Sentinel prefix embedded in the [`ObjectiveEvalError::Fatal`] message the
 /// bridge returns when [`PROBE_REFUSAL_FATAL_THRESHOLD`] fires. The seed-loop
 /// runner matches this prefix and routes the failed seed to
 /// `rejection_reasons` rather than propagating a fatal error.
 pub(crate) const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL";
-
 
 /// Sentinel embedded in the [`ObjectiveEvalError::Fatal`] message the bridge
 /// returns when [`CostStallGuard`] halts BFGS on a cost stall. `opt::Bfgs`
@@ -141,7 +135,6 @@ pub(crate) const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL
 /// residual gradient still exceeds that tolerance is a flat-valley stall, not a
 /// stationary optimum, and is reported `converged = false`.
 pub(crate) const COST_STALL_CONVERGED_SENTINEL: &str = "OUTER_COST_STALL_CONVERGED";
-
 
 /// Verdict produced by folding one accepted outer iterate into
 /// [`CostStallGuard::observe`].
@@ -162,7 +155,6 @@ pub(crate) enum CostStallVerdict {
     FlatValleyStall { residual_grad_norm: f64 },
 }
 
-
 /// Number of consecutive accepted outer iterates with negligible relative
 /// objective improvement required before the cost-stall guard declares
 /// convergence. Matches the spirit of `opt`'s own `StallPolicy { window: 3 }`
@@ -170,26 +162,24 @@ pub(crate) enum CostStallVerdict {
 /// which is the condition `opt` never checks in isolation.
 pub(crate) const COST_STALL_WINDOW: usize = 6;
 
-
 /// Best iterate captured by a cost-stall convergence, handed from the bridge
 /// (which is moved into `opt::Bfgs`) back to the seed-loop runner via the
 /// guard's shared cell.
 #[derive(Clone)]
 pub(crate) struct CostStallExit {
-    rho: Array1<f64>,
-    value: f64,
-    grad_norm: f64,
+    pub(crate) rho: Array1<f64>,
+    pub(crate) value: f64,
+    pub(crate) grad_norm: f64,
     /// Accepted outer iterates observed when the stall fired (for the runner's
     /// `OuterResult.iterations` field and logging).
-    iterations: usize,
+    pub(crate) iterations: usize,
     /// Whether the best iterate is a genuine stationary optimum: `true` only
     /// when its projected gradient norm cleared the outer gradient tolerance
     /// (legitimately-flat REML surface). `false` for a flat-valley stall whose
     /// residual gradient remains above tolerance — the runner reports the
     /// rebuilt outer result as non-converged in that case.
-    converged: bool,
+    pub(crate) converged: bool,
 }
-
 
 /// Tracks the monotone best accepted-iterate REML objective and a
 /// no-improvement streak, firing a gradient-independent convergence once the
@@ -221,9 +211,8 @@ pub(crate) struct CostStallGuard {
     exit: Arc<Mutex<Option<CostStallExit>>>,
 }
 
-
 impl CostStallGuard {
-    fn new(
+    pub(crate) fn new(
         rel_tol: f64,
         window: usize,
         grad_threshold: f64,
@@ -313,13 +302,11 @@ impl CostStallGuard {
     }
 }
 
-
 #[derive(Clone)]
 pub(crate) struct ValueProbeCacheEntry {
     rho: Array1<f64>,
     outcome: CachedValueProbeOutcome,
 }
-
 
 #[derive(Clone)]
 pub(crate) enum CachedValueProbeOutcome {
@@ -327,7 +314,6 @@ pub(crate) enum CachedValueProbeOutcome {
     Recoverable(String),
     Fatal(String),
 }
-
 
 pub(crate) fn trial_rho_distance(reference: Option<&Array1<f64>>, trial: &Array1<f64>) -> f64 {
     let Some(reference) = reference else {
@@ -347,7 +333,6 @@ pub(crate) fn trial_rho_distance(reference: Option<&Array1<f64>>, trial: &Array1
         .sqrt()
 }
 
-
 pub(crate) fn same_outer_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
     a.len() == b.len()
         && a.iter()
@@ -355,8 +340,9 @@ pub(crate) fn same_outer_point(a: &Array1<f64>, b: &Array1<f64>) -> bool {
             .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
-
-pub(crate) fn cached_value_probe_result(outcome: &CachedValueProbeOutcome) -> Result<f64, ObjectiveEvalError> {
+pub(crate) fn cached_value_probe_result(
+    outcome: &CachedValueProbeOutcome,
+) -> Result<f64, ObjectiveEvalError> {
     match outcome {
         CachedValueProbeOutcome::Cost(cost) => Ok(*cost),
         CachedValueProbeOutcome::Recoverable(message) => {
@@ -368,8 +354,9 @@ pub(crate) fn cached_value_probe_result(outcome: &CachedValueProbeOutcome) -> Re
     }
 }
 
-
-pub(crate) fn cache_value_probe_result(result: &Result<f64, ObjectiveEvalError>) -> CachedValueProbeOutcome {
+pub(crate) fn cache_value_probe_result(
+    result: &Result<f64, ObjectiveEvalError>,
+) -> CachedValueProbeOutcome {
     match result {
         Ok(cost) => CachedValueProbeOutcome::Cost(*cost),
         Err(ObjectiveEvalError::Recoverable { message }) => {
@@ -381,7 +368,6 @@ pub(crate) fn cache_value_probe_result(result: &Result<f64, ObjectiveEvalError>)
     }
 }
 
-
 pub(crate) fn value_probe_outcome_label(outcome: &CachedValueProbeOutcome) -> &'static str {
     match outcome {
         CachedValueProbeOutcome::Cost(_) => "cost",
@@ -390,14 +376,12 @@ pub(crate) fn value_probe_outcome_label(outcome: &CachedValueProbeOutcome) -> &'
     }
 }
 
-
 pub(crate) fn value_probe_reject_outcome(outcome: &CachedValueProbeOutcome) -> bool {
     match outcome {
         CachedValueProbeOutcome::Cost(cost) => *cost >= VALUE_PROBE_REJECT_COST_FLOOR,
         CachedValueProbeOutcome::Recoverable(_) | CachedValueProbeOutcome::Fatal(_) => true,
     }
 }
-
 
 pub(crate) fn remember_value_probe(
     cache: &mut Vec<ValueProbeCacheEntry>,
@@ -419,7 +403,6 @@ pub(crate) fn remember_value_probe(
         outcome,
     });
 }
-
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
@@ -520,8 +503,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                 // line_search_budget doing inner solves that all fail.
                 // Escalate to Fatal so BFGS exits immediately; the seed
                 // loop routes it as a rejected seed.
-                self.consecutive_probe_refusals =
-                    self.consecutive_probe_refusals.saturating_add(1);
+                self.consecutive_probe_refusals = self.consecutive_probe_refusals.saturating_add(1);
                 // When the bridge seed (cost, gradient) was supplied via
                 // `with_initial_sample` the bridge's own `eval_grad` is
                 // never called, so `last_value_grad_rho` stays `None` and
@@ -569,7 +551,6 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         result
     }
 }
-
 
 impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
@@ -718,23 +699,19 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     }
 }
 
-
 /// Outer gradient-decay ratio `‖g_now‖/‖g_initial‖` below which the outer is
 /// treated as essentially converged: the inner cap is lifted entirely so the
 /// cached β reaches full inner tolerance before the convergence guard runs.
 pub(crate) const INNER_CAP_CONVERGENCE_OVERRIDE_RATIO: f64 = 0.01;
 
-
 /// Floor on the adaptive inner-PIRLS cap. Any cap below this is below the
 /// inner-Newton noise level and would reject usable warm-started steps.
 pub(crate) const INNER_CAP_FLOOR: usize = 3;
-
 
 /// Ceiling on the adaptive inner-PIRLS cap, set at the inner-Newton noise
 /// floor at large scale; further iterations are pure waste once the warm
 /// start is close.
 pub(crate) const INNER_CAP_CEILING: usize = 64;
-
 
 /// Adaptive inner-PIRLS cap schedule. Replaces the older hardcoded
 /// iter-tier (3/5/10/20) and ratio-tier (0.50/0.20/0.05/0.01) schedule
@@ -845,10 +822,8 @@ pub(crate) fn first_order_inner_cap_schedule(
     }
 }
 
-
 #[cfg(test)]
 mod inner_cap_schedule_tests;
-
 
 pub(crate) struct OuterSecondOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
@@ -886,7 +861,6 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// displacement in line-search / trial-acceptance STAGE traces.
     last_value_grad_rho: Option<Array1<f64>>,
 }
-
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
@@ -926,7 +900,6 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
         Ok(cost)
     }
 }
-
 
 impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
@@ -1029,7 +1002,6 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     }
 }
 
-
 impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
@@ -1127,7 +1099,6 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     }
 }
 
-
 // =====================================================================
 // opt 0.4 matrix-free TR adapter (Phase 6)
 // =====================================================================
@@ -1166,7 +1137,6 @@ pub(crate) struct OuterAcceptObserver {
     feedback: InnerProgressFeedback,
 }
 
-
 impl OptimizerObserver for OuterAcceptObserver {
     fn on_step_accepted(&mut self, info: &StepInfo) {
         log::trace!(
@@ -1180,9 +1150,7 @@ impl OptimizerObserver for OuterAcceptObserver {
     }
 }
 
-
 pub(crate) struct OuterToOptHessianOperator(Arc<dyn OuterHessianOperator>);
-
 
 impl HessianOperator for OuterToOptHessianOperator {
     fn dim(&self) -> usize {
@@ -1226,7 +1194,6 @@ impl HessianOperator for OuterToOptHessianOperator {
     }
 }
 
-
 /// Translate a gam `HessianResult` into an `opt::HessianValue` for
 /// consumption by `MatrixFreeTrustRegion`. `Analytic` becomes
 /// `Dense`; `Operator` is wrapped in the adapter; `Unavailable` is
@@ -1241,7 +1208,6 @@ pub(crate) fn hessian_result_to_value(hessian: HessianResult) -> HessianValue {
         HessianResult::Unavailable => HessianValue::Unavailable,
     }
 }
-
 
 /// Bridge that exposes gam's outer objective as an
 /// `opt::OperatorObjective`. Used on the matrix-free trust-region
@@ -1264,7 +1230,6 @@ pub(crate) struct OuterOperatorBridge<'a> {
     /// displacement in line-search STAGE traces.
     last_value_grad_rho: Option<Array1<f64>>,
 }
-
 
 impl ZerothOrderObjective for OuterOperatorBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
@@ -1305,7 +1270,6 @@ impl ZerothOrderObjective for OuterOperatorBridge<'_> {
     }
 }
 
-
 impl FirstOrderObjective for OuterOperatorBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
@@ -1328,7 +1292,6 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
         })
     }
 }
-
 
 impl OperatorObjective for OuterOperatorBridge<'_> {
     fn eval_value_grad_op(
@@ -1387,14 +1350,16 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
     }
 }
 
-
 // Helpers preserved across the Phase 6 rewrite. Both were previously
 // shared with `run_operator_trust_region` (now deleted in favor of
 // `opt::MatrixFreeTrustRegion`), but they remain in use by the dense
 // ARC and BFGS arms of the seed loop.
 
 #[inline]
-pub(crate) fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)>) -> Array1<f64> {
+pub(crate) fn project_to_bounds(
+    x: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+) -> Array1<f64> {
     match bounds {
         Some((lower, upper)) => {
             let mut out = x.clone();
@@ -1406,7 +1371,6 @@ pub(crate) fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, A
         None => x.clone(),
     }
 }
-
 
 /// Translate an `OuterEval`'s Hessian into the `Option<Array2<f64>>`
 /// shape expected by `opt::SecondOrderSample`, enforcing the contract
@@ -1481,7 +1445,6 @@ pub(crate) fn build_bridge_hessian_for_source(
     }
 }
 
-
 pub(crate) struct OuterFixedPointBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
@@ -1495,7 +1458,6 @@ pub(crate) struct OuterFixedPointBridge<'a> {
     /// gradient-based solver where ψ stationarity ∇_ψ V = 0 can be enforced.
     consecutive_psi_zero_iters: usize,
 }
-
 
 impl OuterFixedPointBridge<'_> {
     fn reject_nonstationary_tiny_psi_step(
@@ -1534,7 +1496,6 @@ impl OuterFixedPointBridge<'_> {
     }
 }
 
-
 /// Maximum number of α halvings for the cost line search wrapping the EFS
 /// step.
 ///
@@ -1549,13 +1510,11 @@ impl OuterFixedPointBridge<'_> {
 /// staying inside one cache-warm Hessian factorization budget.
 pub(crate) const MAX_EFS_BACKTRACK: usize = 8;
 
-
 /// Step components below this threshold (in θ-space) are treated as zero
 /// for backtracking purposes — there is no point line-searching a step of
 /// magnitude `1e-12`, and skipping the trial keeps the convergence path
 /// numerically clean (no spurious cost decreases from ULP noise).
 pub(crate) const EFS_NEGLIGIBLE_STEP: f64 = 1e-12;
-
 
 /// Maximum infinity-norm of the EFS step (in θ-space) at which we skip the
 /// cost line search and trust the multiplicative formula's quadratic
@@ -1573,14 +1532,12 @@ pub(crate) const EFS_NEGLIGIBLE_STEP: f64 = 1e-12;
 /// applied unchanged, so correctness is preserved.
 pub(crate) const EFS_LINESEARCH_THRESHOLD: f64 = 0.5;
 
-
 /// Relative tolerance for the descent condition `c < current_cost` during
 /// EFS backtracking. Without this, ULP-level cost noise near a fixed point
 /// can cause spurious backtracking even when the step is mathematically
 /// correct. We accept any trial whose cost is within
 /// `EFS_COST_DESCENT_TOL · |current_cost|` of the current value.
 pub(crate) const EFS_COST_DESCENT_TOL: f64 = 1e-12;
-
 
 /// Maximum number of consecutive HybridEFS iterations whose ψ block was
 /// zeroed before the bridge bails out and triggers a solver switch.
@@ -1594,7 +1551,6 @@ pub(crate) const EFS_COST_DESCENT_TOL: f64 = 1e-12;
 /// gradient-based solver (BFGS / L-BFGS) where ψ stationarity is part of
 /// the optimality condition.
 pub(crate) const MAX_CONSECUTIVE_PSI_STAGNATION: usize = 1;
-
 
 impl FixedPointObjective for OuterFixedPointBridge<'_> {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
@@ -1902,7 +1858,6 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
     }
 }
 
-
 impl OuterFixedPointBridge<'_> {
     /// Backtrack the cost along `raw_step` by halving α ∈ {1, 1/2, …, 2^-k}
     /// up to `max_halvings` times. Returns `Some(α·raw_step)` for the first
@@ -1976,7 +1931,6 @@ impl OuterFixedPointBridge<'_> {
     }
 }
 
-
 pub(crate) fn solution_into_outer_result(
     solution: Solution,
     converged: bool,
@@ -1995,7 +1949,6 @@ pub(crate) fn solution_into_outer_result(
     result
 }
 
-
 pub(crate) fn outer_result_with_gradient_norm(
     rho: Array1<f64>,
     final_value: f64,
@@ -2008,7 +1961,6 @@ pub(crate) fn outer_result_with_gradient_norm(
     result.final_grad_norm = final_grad_norm;
     result
 }
-
 
 pub(crate) fn outer_result_with_gradient(
     rho: Array1<f64>,
@@ -2031,9 +1983,7 @@ pub(crate) fn outer_result_with_gradient(
     result
 }
 
-
 use crate::inference::diagnostics::format_top_abs as format_top_abs_components;
-
 
 pub(crate) fn bfgs_line_search_failure_message(
     context: &str,

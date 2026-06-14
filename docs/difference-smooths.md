@@ -11,9 +11,9 @@ Difference smooths compare trajectories between groups without asking users to d
 
 ## Inference API
 
-`model.difference_smooth(data=data, group="group", view="x")` builds two design matrices on a grid, forms `X_B - X_A`, and computes the contrast standard error from the joint coefficient covariance. `simultaneous=True` uses posterior simulation of the maximum standardized deviation over the grid to return a simultaneous band for regional claims.
+`model.difference_smooth(data=data, group="group", view="x")` builds two design matrices on a grid, forms `X_B - X_A`, and computes the contrast standard error from the joint coefficient covariance. If `group` is omitted, the implementation uses the first categorical schema column other than `view`. `simultaneous=True` uses posterior simulation of the maximum standardized deviation over the grid to return a simultaneous band for regional claims.
 
-By default `difference_smooth` marginalises saved random-effect blocks (`marginalise_random=True`). The treatment-coded factor main effect added for categorical `by=` smooths is stored in that block layout, so pass `marginalise_random=False` when the returned contrast should include the parametric group offset. With random-effect blocks retained, `group_means=False` zeros the saved group main-effect block to return the smooth-shape contrast without that offset.
+By default `difference_smooth` marginalises saved random-effect blocks (`marginalise_random=True`). When `group_means=True` (the default), the compared factor's own treatment-coded main-effect columns are retained even though other random-effect blocks are zeroed, so categorical `by=` contrasts include the group offset. Set `group_means=False` to zero that saved group main-effect block and return the smooth-shape contrast without the offset.
 
 ## Choosing among them
 

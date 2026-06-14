@@ -2803,11 +2803,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     .iter()
                     .map(|a| a.as_ref().map(|v| v.len()).unwrap_or(0))
                     .collect();
-                let beta0_min = states[0]
-                    .beta
-                    .iter()
-                    .copied()
-                    .fold(f64::INFINITY, f64::min);
+                let beta0_min = states[0].beta.iter().copied().fold(f64::INFINITY, f64::min);
                 let beta0_max = states[0]
                     .beta
                     .iter()
@@ -2825,10 +2821,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     ridge,
                     options.ridge_policy,
                 );
-                let s0_max_abs = s_lambdas[0]
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max);
+                let s0_max_abs = s_lambdas[0].iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
                 // Min eigenvalue of the assembled time-block λS. If negative, the
                 // penalty matrix is NOT PSD — the source of the negative quadratic
                 // penalty value (a ½βᵀSβ with PSD S cannot be < 0). Also break out
@@ -5371,8 +5364,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     })
 }
 
-
-
 /// Borrowed derivative provider for joint models that wraps closures with
 /// non-`'static` lifetimes.
 ///
@@ -5402,8 +5393,6 @@ pub(crate) struct BorrowedJointDerivProvider<'a> {
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
 
-
-
 /// Shared `(term1, term2)` second-derivative correction assembly used by both
 /// the borrowed and owned joint derivative providers. `compute_dh` supplies the
 /// drift derivative `D_β H[u_kl]` (term1) and `compute_d2h` the mixed second
@@ -5431,8 +5420,6 @@ pub(crate) fn joint_second_derivative_correction_result(
     };
     Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
 }
-
-
 
 impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
     fn hessian_derivative_correction(
@@ -5548,8 +5535,6 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
     }
 }
 
-
-
 pub(crate) struct OwnedJointDerivProvider {
     compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     compute_dh_many: Option<
@@ -5572,8 +5557,6 @@ pub(crate) struct OwnedJointDerivProvider {
     family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
-
-
 
 impl HessianDerivativeProvider for OwnedJointDerivProvider {
     fn hessian_derivative_correction(
@@ -5701,8 +5684,6 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
     }
 }
 
-
-
 /// Drift closure producing the Tier-B Jeffreys-curvature drift
 /// `D_β H_Φ[δβ]` for a mode-response direction `δβ = dβ̂/dρ_k`.
 ///
@@ -5714,8 +5695,6 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 /// the wrapper falls back to the inner provider's drift unchanged.
 pub(crate) type JeffreysHphiDriftFn =
     Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>;
-
-
 
 /// Jeffreys-`H_Φ`-aware joint derivative provider.
 ///
@@ -5738,8 +5717,6 @@ pub(crate) struct JeffreysHphiAwareJointDerivatives<'a> {
     p: usize,
 }
 
-
-
 impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
     fn new(
         inner: Box<dyn HessianDerivativeProvider + 'a>,
@@ -5755,8 +5732,6 @@ impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
         (self.drift)(&delta)
     }
 }
-
-
 
 impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
     fn hessian_derivative_correction(
@@ -5907,8 +5882,6 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
     }
 }
 
-
-
 /// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
 /// to an `InnerSolution` before calling the unified evaluator.
 pub(crate) struct ExtCoordBundle {
@@ -5925,14 +5898,10 @@ pub(crate) struct ExtCoordBundle {
     contracted_psi_fn: Option<ContractedPsiSecondOrderFn>,
 }
 
-
-
 pub(crate) struct ScaledHyperOperator {
     inner: Arc<dyn HyperOperator>,
     scale: f64,
 }
-
-
 
 impl HyperOperator for ScaledHyperOperator {
     fn dim(&self) -> usize {
@@ -5956,8 +5925,6 @@ impl HyperOperator for ScaledHyperOperator {
     }
 }
 
-
-
 pub(crate) fn scale_hypercoord_drift(mut drift: HyperCoordDrift, scale: f64) -> HyperCoordDrift {
     if scale == 1.0 {
         return drift;
@@ -5977,8 +5944,6 @@ pub(crate) fn scale_hypercoord_drift(mut drift: HyperCoordDrift, scale: f64) -> 
     drift
 }
 
-
-
 pub(crate) fn scale_hypercoord(mut coord: HyperCoord, scale: f64) -> HyperCoord {
     if scale == 1.0 {
         return coord;
@@ -5997,8 +5962,6 @@ pub(crate) fn scale_hypercoord(mut coord: HyperCoord, scale: f64) -> HyperCoord 
     coord
 }
 
-
-
 pub(crate) fn scale_hypercoord_pair(mut pair: HyperCoordPair, scale: f64) -> HyperCoordPair {
     if scale == 1.0 {
         return pair;
@@ -6013,8 +5976,6 @@ pub(crate) fn scale_hypercoord_pair(mut pair: HyperCoordPair, scale: f64) -> Hyp
     }
     pair
 }
-
-
 
 pub(crate) fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> DriftDerivResult {
     if scale == 1.0 {
@@ -6033,8 +5994,6 @@ pub(crate) fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> 
         }
     }
 }
-
-
 
 impl ExtCoordBundle {
     fn scaled(self, scale: f64) -> Self {
@@ -6089,8 +6048,6 @@ impl ExtCoordBundle {
         }
     }
 }
-
-
 
 /// Build the canonical unified REML/LAML assembly for a custom-family outer
 /// evaluation.
@@ -6213,14 +6170,10 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     Ok((evaluator, ext_dim))
 }
 
-
-
 pub(crate) struct FirstOrderTraceSkipOperator {
     inner: Arc<dyn HessianOperator>,
     remaining_first_order_traces: AtomicUsize,
 }
-
-
 
 impl FirstOrderTraceSkipOperator {
     fn new(inner: Arc<dyn HessianOperator>, skip_count: usize) -> Self {
@@ -6250,8 +6203,6 @@ impl FirstOrderTraceSkipOperator {
         false
     }
 }
-
-
 
 impl HessianOperator for FirstOrderTraceSkipOperator {
     fn logdet(&self) -> f64 {
@@ -6480,8 +6431,6 @@ impl HessianOperator for FirstOrderTraceSkipOperator {
     }
 }
 
-
-
 /// Build an `InnerSolution` from joint Hessian data and call the unified evaluator.
 ///
 /// Bridge between the custom family's joint Hessian infrastructure and the
@@ -6563,8 +6512,6 @@ pub(crate) fn unified_joint_cost_gradient(
 
     Ok((cost, gradient, hessian))
 }
-
-
 
 pub(crate) fn unified_joint_efs_eval(
     inner: &BlockwiseInnerResult,
@@ -6684,8 +6631,6 @@ pub(crate) fn unified_joint_efs_eval(
         })
     }
 }
-
-
 
 /// Shared implementation for the joint exact-Newton and surrogate outer paths.
 ///
@@ -7126,8 +7071,6 @@ pub(crate) fn joint_outer_evaluate(
     })
 }
 
-
-
 pub(crate) fn joint_outer_evaluate_efs(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
@@ -7338,11 +7281,11 @@ pub(crate) fn joint_outer_evaluate_efs(
     )
 }
 
-
-
 /// Evaluate the rho-only custom-family outer objective through the unified
 /// joint hyperpath with no external ψ coordinates attached.
-pub(crate) fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn outerobjectivegradienthessian_internal<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -7366,8 +7309,6 @@ pub(crate) fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + S
     )
     .map_err(String::from)
 }
-
-
 
 pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -7773,8 +7714,6 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     Ok((efs_eval, warm, inner.converged))
 }
 
-
-
 pub(crate) fn normalize_outer_eval_error_detail(error: &str) -> &str {
     // Any `String` round-tripped through `CustomFamilyError::From<String>`
     // gets re-wrapped as `InvalidInput { context: "custom-family string
@@ -7792,7 +7731,6 @@ pub(crate) fn normalize_outer_eval_error_detail(error: &str) -> &str {
         .strip_prefix("custom-family invalid input: ")
         .unwrap_or(stripped)
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Section: joint outer hyper surface — unified calculus for [rho, psi]
@@ -7882,7 +7820,6 @@ pub(crate) fn normalize_outer_eval_error_detail(error: &str) -> &str {
 //  Unified HyperCoord builders for ψ coordinates
 // ═══════════════════════════════════════════════════════════════════════════
 
-
 /// Assemble the penalty derivative matrix S_ψ = Σ_k exp(ρ_k) ∂S_k/∂ψ
 /// in the *block-local* coefficient space (p_block × p_block).
 ///
@@ -7915,8 +7852,6 @@ pub(crate) fn assemble_block_local_s_psi(
         Array2::<f64>::zeros((p_block, p_block))
     }
 }
-
-
 
 /// Assemble the second penalty derivative matrix S_{ψ_i ψ_j} in block-local
 /// coefficient space.
@@ -7962,7 +7897,6 @@ pub(crate) fn assemble_block_local_s_psi_psi(
     }
 }
 
-
 #[derive(Clone)]
 pub struct BlockwiseInnerResult {
     pub block_states: Vec<ParameterBlockState>,
@@ -7990,8 +7924,6 @@ pub struct BlockwiseInnerResult {
         Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
-
-
 impl std::fmt::Debug for BlockwiseInnerResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockwiseInnerResult")
@@ -8012,8 +7944,6 @@ impl std::fmt::Debug for BlockwiseInnerResult {
     }
 }
 
-
-
 #[derive(Clone)]
 pub(crate) struct ConstrainedWarmStart {
     rho: Array1<f64>,
@@ -8021,8 +7951,6 @@ pub(crate) struct ConstrainedWarmStart {
     active_sets: Vec<Option<Vec<usize>>>,
     cached_inner: Option<CachedInnerMode>,
 }
-
-
 
 #[derive(Clone)]
 pub(crate) struct CachedInnerMode {
@@ -8037,16 +7965,12 @@ pub(crate) struct CachedInnerMode {
     active_constraints: Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
-
-
 pub(crate) fn screened_outer_warm_start<'a>(
     warm_start: Option<&'a ConstrainedWarmStart>,
     rho: &Array1<f64>,
 ) -> Option<&'a ConstrainedWarmStart> {
     warm_start.filter(|seed| seed.rho.len() == rho.len())
 }
-
-
 
 pub(crate) fn warm_start_matches_block_log_lambdas(
     seed: &ConstrainedWarmStart,
@@ -8070,8 +7994,6 @@ pub(crate) fn warm_start_matches_block_log_lambdas(
     true
 }
 
-
-
 pub(crate) fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> CachedInnerMode {
     CachedInnerMode {
         log_likelihood: result.log_likelihood,
@@ -8085,8 +8007,6 @@ pub(crate) fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> Ca
         active_constraints: result.active_constraints.clone(),
     }
 }
-
-
 
 pub(crate) fn constrained_warm_start_from_inner(
     rho: &Array1<f64>,
@@ -8103,8 +8023,6 @@ pub(crate) fn constrained_warm_start_from_inner(
         cached_inner: Some(cached_inner_mode_from_result(inner)),
     }
 }
-
-
 
 pub(crate) fn constrained_warm_start_from_cached_beta(
     rho_dim: usize,
@@ -8137,8 +8055,6 @@ pub(crate) fn constrained_warm_start_from_cached_beta(
     })
 }
 
-
-
 pub(crate) fn inner_penalized_objective(
     inner: &BlockwiseInnerResult,
     include_logdet_h: bool,
@@ -8161,8 +8077,6 @@ pub(crate) fn inner_penalized_objective(
         context,
     )
 }
-
-
 
 pub(crate) fn nonconverged_outer_efs_result(
     inner: &BlockwiseInnerResult,
@@ -8194,8 +8108,6 @@ pub(crate) fn nonconverged_outer_efs_result(
     ))
 }
 
-
-
 pub(crate) fn warm_start_without_cached_inner_for_psi_derivatives(
     warm_start: Option<&ConstrainedWarmStart>,
     has_psi_derivatives: bool,
@@ -8208,8 +8120,6 @@ pub(crate) fn warm_start_without_cached_inner_for_psi_derivatives(
         warm
     })
 }
-
-
 
 /// Helper struct mirroring the old `BlockwiseFitResultParts`.
 pub struct BlockwiseFitResultParts {
@@ -8245,8 +8155,6 @@ pub struct BlockwiseFitResultParts {
     pub precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>)>,
 }
 
-
-
 pub(crate) fn validate_parameter_block_state_finiteness(
     label: &str,
     state: &ParameterBlockState,
@@ -8257,8 +8165,6 @@ pub(crate) fn validate_parameter_block_state_finiteness(
         .map_err(|e| e.to_string())?;
     Ok(())
 }
-
-
 
 pub(crate) fn validate_lambda_pair_consistency(
     log_lambdas: &Array1<f64>,
@@ -8286,8 +8192,6 @@ pub(crate) fn validate_lambda_pair_consistency(
     }
     Ok(())
 }
-
-
 
 /// Effective degrees of freedom for a converged blockwise custom-family fit,
 /// computed from the joint penalized Hessian `H = X'W_HX + S(λ)` and the
@@ -8440,8 +8344,6 @@ pub(crate) fn custom_family_blockwise_edf(
     Ok((edf_total, edf_by_penalty, block_edf))
 }
 
-
-
 /// Compute reduced-space effective degrees of freedom for a converged fit,
 /// to be carried through `BlockwiseFitResultParts::precomputed_edf`.
 ///
@@ -8473,8 +8375,6 @@ pub(crate) fn reduced_blockwise_edf(
         }
     }
 }
-
-
 
 /// Build a `UnifiedFitResult` from blockwise-specific fields.
 pub fn blockwise_fit_from_parts(
@@ -8747,8 +8647,6 @@ pub fn blockwise_fit_from_parts(
     .map_err(|e| e.to_string())
 }
 
-
-
 pub(crate) fn checked_penalizedobjective(
     log_likelihood: f64,
     penalty_value: f64,
@@ -8770,14 +8668,10 @@ pub(crate) fn checked_penalizedobjective(
     }
 }
 
-
-
 #[derive(Clone)]
 pub struct CustomFamilyWarmStart {
     inner: ConstrainedWarmStart,
 }
-
-
 
 impl CustomFamilyWarmStart {
     pub(crate) fn compatible_with_rho(&self, rho: &Array1<f64>) -> bool {
@@ -8849,16 +8743,12 @@ impl CustomFamilyWarmStart {
     }
 }
 
-
-
 pub(crate) struct CustomOuterState {
     warm_cache: Option<ConstrainedWarmStart>,
     reset_warm_cache: Option<ConstrainedWarmStart>,
     last_error: Option<String>,
     initial_gradient_norm: Option<f64>,
 }
-
-
 
 impl CustomOuterState {
     fn new(warm_start: Option<ConstrainedWarmStart>) -> Self {
@@ -8888,8 +8778,6 @@ impl CustomOuterState {
     }
 }
 
-
-
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
@@ -8905,8 +8793,6 @@ pub struct CustomFamilyJointHyperResult {
     pub inner_converged: bool,
 }
 
-
-
 pub struct CustomFamilyJointHyperEfsResult {
     pub efs_eval: crate::solver::outer_strategy::EfsEval,
     pub warm_start: CustomFamilyWarmStart,
@@ -8915,8 +8801,6 @@ pub struct CustomFamilyJointHyperEfsResult {
     pub inner_converged: bool,
 }
 
-
-
 pub(crate) struct OuterObjectiveEvalResult {
     objective: f64,
     gradient: Array1<f64>,
@@ -8924,8 +8808,6 @@ pub(crate) struct OuterObjectiveEvalResult {
     warm_start: ConstrainedWarmStart,
     inner_converged: bool,
 }
-
-
 
 pub(crate) fn outer_eval_result_to_joint_hyper_result(
     result: OuterObjectiveEvalResult,
@@ -8941,13 +8823,9 @@ pub(crate) fn outer_eval_result_to_joint_hyper_result(
     }
 }
 
-
-
 pub(crate) struct OwnedDenseOuterHessianOperator {
     matrix: Array2<f64>,
 }
-
-
 
 impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHessianOperator {
     fn dim(&self) -> usize {
@@ -9002,8 +8880,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHess
     }
 }
 
-
-
 pub(crate) struct LabeledOuterHessianOperator {
     base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
     physical_to_outer: Vec<Option<usize>>,
@@ -9013,8 +8889,6 @@ pub(crate) struct LabeledOuterHessianOperator {
     /// `(physical_in, physical_out)`, each of length `physical_to_outer.len()`.
     scratch: std::sync::Mutex<(ndarray::Array1<f64>, ndarray::Array1<f64>)>,
 }
-
-
 
 impl LabeledOuterHessianOperator {
     fn new(
@@ -9033,8 +8907,6 @@ impl LabeledOuterHessianOperator {
         }
     }
 }
-
-
 
 impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessianOperator {
     fn dim(&self) -> usize {
@@ -9162,8 +9034,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
     }
 }
 
-
-
 pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
     family: &F,
     states: &[ParameterBlockState],
@@ -9190,8 +9060,6 @@ pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
     }
 }
 
-
-
 pub(crate) fn outer_efs_result_to_joint_hyper_efs_result(
     efs_eval: crate::solver::outer_strategy::EfsEval,
     warm_start: ConstrainedWarmStart,
@@ -9203,7 +9071,6 @@ pub(crate) fn outer_efs_result_to_joint_hyper_efs_result(
         inner_converged,
     }
 }
-
 
 // Unified exact joint hyper-calculus over theta = [rho, psi].
 //
@@ -9296,7 +9163,6 @@ pub(crate) fn outer_efs_result_to_joint_hyper_efs_result(
 // so every exact outer derivative must be assembled in this joint flattened
 // space.
 
-
 pub(crate) fn with_block_geometry<F: CustomFamily + ?Sized, T>(
     family: &F,
     block_states: &[ParameterBlockState],
@@ -9343,8 +9209,6 @@ pub(crate) fn with_block_geometry<F: CustomFamily + ?Sized, T>(
     }
 }
 
-
-
 pub(crate) fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
     let total = specs
         .iter()
@@ -9363,8 +9227,6 @@ pub(crate) fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
     out
 }
 
-
-
 #[derive(Clone, Debug)]
 pub(crate) struct PenaltyLabelLayout {
     penalty_counts: Vec<usize>,
@@ -9372,8 +9234,6 @@ pub(crate) struct PenaltyLabelLayout {
     fixed_log_lambdas: Vec<Option<f64>>,
     initial_rho: Array1<f64>,
 }
-
-
 
 impl PenaltyLabelLayout {
     fn physical_count(&self) -> usize {
@@ -9384,8 +9244,6 @@ impl PenaltyLabelLayout {
         self.initial_rho.len() != self.physical_to_outer.len()
     }
 }
-
-
 
 pub(crate) fn penalty_label_layout(
     specs: &[ParameterBlockSpec],
@@ -9443,8 +9301,6 @@ pub(crate) fn penalty_label_layout(
     })
 }
 
-
-
 pub(crate) fn expand_labeled_log_lambdas(
     rho: &Array1<f64>,
     layout: &PenaltyLabelLayout,
@@ -9476,8 +9332,6 @@ pub(crate) fn expand_labeled_log_lambdas(
     Ok(expanded)
 }
 
-
-
 pub(crate) fn split_labeled_log_lambdas(
     rho: &Array1<f64>,
     layout: &PenaltyLabelLayout,
@@ -9485,8 +9339,6 @@ pub(crate) fn split_labeled_log_lambdas(
     let expanded = expand_labeled_log_lambdas(rho, layout)?;
     split_log_lambdas(&expanded, &layout.penalty_counts)
 }
-
-
 
 pub(crate) fn aggregate_labeled_gradient(
     gradient: &Array1<f64>,

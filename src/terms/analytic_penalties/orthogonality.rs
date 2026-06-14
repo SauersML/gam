@@ -47,7 +47,6 @@ pub struct BlockOrthogonalityPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-
 impl BlockOrthogonalityPenalty {
     #[must_use = "build error must be handled"]
     pub fn new(
@@ -316,7 +315,6 @@ impl BlockOrthogonalityPenalty {
     }
 }
 
-
 impl AnalyticPenalty for BlockOrthogonalityPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
@@ -435,7 +433,6 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
 
     impl_scalar_apply_schedule!(weight);
 }
-
 
 // ---------------------------------------------------------------------------
 // Decoder column-space incoherence penalty
@@ -708,7 +705,6 @@ impl DecoderIncoherencePenalty {
     }
 }
 
-
 impl AnalyticPenalty for DecoderIncoherencePenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Beta
@@ -856,7 +852,6 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
     impl_scalar_apply_schedule!(weight);
 }
 
-
 // ---------------------------------------------------------------------------
 // Orthogonality penalty
 // ---------------------------------------------------------------------------
@@ -880,7 +875,6 @@ pub struct OrthogonalityPenalty {
     pub rho_index: usize,
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
-
 
 impl OrthogonalityPenalty {
     #[must_use = "build error must be handled"]
@@ -943,11 +937,14 @@ impl OrthogonalityPenalty {
         }
     }
 
-    fn scale(&self, rho: ArrayView1<'_, f64>) -> f64 {
+    pub(crate) fn scale(&self, rho: ArrayView1<'_, f64>) -> f64 {
         self.resolved_weight(rho) / self.n_eff as f64
     }
 
-    fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
+    pub(crate) fn target_matrix<'a>(
+        &self,
+        target: ArrayView1<'a, f64>,
+    ) -> Option<ArrayView2<'a, f64>> {
         let d = self.latent_dim;
         if !target.len().is_multiple_of(d) {
             assert_eq!(
@@ -961,7 +958,7 @@ impl OrthogonalityPenalty {
         target.into_shape_with_order((n_obs, d)).ok()
     }
 
-    fn gram_minus_identity(t: ArrayView2<'_, f64>) -> Array2<f64> {
+    pub(crate) fn gram_minus_identity(t: ArrayView2<'_, f64>) -> Array2<f64> {
         let n_obs = t.nrows();
         let d = t.ncols();
         let mut gram = Array2::<f64>::zeros((d, d));
@@ -990,7 +987,7 @@ impl OrthogonalityPenalty {
         out
     }
 
-    fn hvp_with_precomputed_m(
+    pub(crate) fn hvp_with_precomputed_m(
         &self,
         t: ArrayView2<'_, f64>,
         m: ArrayView2<'_, f64>,
@@ -1031,7 +1028,7 @@ impl OrthogonalityPenalty {
         out
     }
 
-    fn as_dense_with_precomputed_m(
+    pub(crate) fn as_dense_with_precomputed_m(
         &self,
         t: ArrayView2<'_, f64>,
         m: ArrayView2<'_, f64>,
@@ -1071,7 +1068,6 @@ impl OrthogonalityPenalty {
         dense
     }
 }
-
 
 impl AnalyticPenalty for OrthogonalityPenalty {
     fn tier(&self) -> PenaltyTier {
@@ -1145,5 +1141,3 @@ impl AnalyticPenalty for OrthogonalityPenalty {
 
     impl_scalar_apply_schedule!(weight);
 }
-
-

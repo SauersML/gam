@@ -66,12 +66,11 @@ pub(crate) fn transformation_normal_pit_score(
         .map_err(|err| format!("transformation-normal PIT quantile failed: {err}"))
 }
 
-
 /// Accumulates the second-order monotone-transform quantities
 /// `(h_i, h_j, h_ij, hp_i, hp_j, hp_ij)` for one row from the response value /
 /// derivative bases and the per-response-knot gamma directional derivatives.
 /// Shared verbatim across the SCOP Hessian/HVP/bilinear row loops.
-fn scop_second_order_h(
+pub(crate) fn scop_second_order_h(
     rv: ArrayView1<'_, f64>,
     rd: ArrayView1<'_, f64>,
     p_resp: usize,
@@ -101,11 +100,10 @@ fn scop_second_order_h(
     [h_i, h_j, h_ij, hp_i, hp_j, hp_ij]
 }
 
-
 /// Accumulates the second-order endpoint-normalizer chain inputs
 /// `(endpoint_i, endpoint_j, endpoint_ij)` for one row. Shared verbatim across
 /// the SCOP Hessian/HVP/bilinear row loops.
-fn scop_second_order_endpoints(
+pub(crate) fn scop_second_order_endpoints(
     endpoint_basis: [&[f64]; 2],
     p_resp: usize,
     gamma: &[f64],
@@ -130,11 +128,10 @@ fn scop_second_order_endpoints(
     (endpoint_i, endpoint_j, endpoint_ij)
 }
 
-
 /// Accumulates the psi-direction transform quantities `(h_psi, hp_psi,
 /// endpoint_psi)` for one row from the response bases and the per-knot psi
 /// directional derivatives. Shared verbatim across the SCOP psi setup loops.
-fn scop_psi_marginal(
+pub(crate) fn scop_psi_marginal(
     rv: ArrayView1<'_, f64>,
     rd: ArrayView1<'_, f64>,
     p_resp: usize,
@@ -160,8 +157,6 @@ fn scop_psi_marginal(
     (h_psi, hp_psi, endpoint_psi)
 }
 
-
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
-

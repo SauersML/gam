@@ -111,12 +111,12 @@ import torch
 from gamfit.torch import ManifoldSAE, ManifoldSAEConfig
 
 cfg = ManifoldSAEConfig(
-    input_dim=D, K=F, intrinsic_rank=1,
+    input_dim=D, n_atoms=F, intrinsic_rank=1,
     atom_manifold="circle",
     atom_basis="fourier", basis_order=2, n_basis_per_atom=K,
     sparsity={"kind": "ibp_gumbel", "init_alpha": 0.1,
               "tau_schedule": "linear:4.0->1.0"},
-    decoder={"ortho_weight": 1e-2, "monotonicity_weight": 1e-3},
+    decoder={"ortho_weight": 0.0, "monotonicity_weight": 0.0},
     reml={"enabled": True, "select": ["lambda", "tau"]},
 )
 sae = ManifoldSAE(cfg)
@@ -128,11 +128,16 @@ curves = sae.extract_feature_curves(grid_size=128)   # {atom_idx -> Tensor(grid,
 
 **Parity contract.** `ManifoldSAE.fit(...)` and `gamfit.sae_manifold_fit(...)`
 share a Rust kernel. Given equivalent configurations they return identical
-numerics on synthetic data (see `tests/torch/test_manifold_sae_parity.py`).
+numerics on synthetic data for supported closed-form configurations (see
+`tests/torch/test_manifold_sae_parity.py`). Closed-form `.fit()` rejects
+nonzero decoder orthogonality / monotonicity penalties and cylinder atoms
+because those objectives are not represented by the Rust SAE primitive.
 
 Supported atom manifolds: `circle`, `cylinder`, `sphere`, `product`. Supported
-bases-on-manifold: `duchon`, `bspline`, `fourier`. Sparsity layers: `ibp_gumbel`,
-`softmax_topk`, `jumprelu`.
+bases-on-manifold: `duchon`, `bspline`, `fourier`. Sparsity layers:
+`ibp_gumbel`, `softmax_topk`, `jumprelu`. In the closed-form `.fit()` path,
+`circle` maps to a periodic atom, `sphere` maps to a sphere atom, and `product`
+maps to a Duchon Euclidean patch; `bspline` remains a torch-training basis.
 
 ## Related reading
 

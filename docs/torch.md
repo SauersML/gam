@@ -70,11 +70,16 @@ back through the inputs. The wrapped model has no trainable parameters
 
 Torch implementations of the simplex and unit-sphere transforms:
 
-`closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`,
+`gamfit.torch` exports `closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`,
 `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`,
 `sphere_exp_map`, `sphere_frechet_mean`. Autograd flows through these
 except `sphere_frechet_mean`, which calls the Rust spherical mean routine
 and is forward-only.
+
+`gamfit.torch.geometry` also exposes `ilr`, `inverse_ilr`, and
+`aitchison_metric`. Its simplex log/exp maps default to the isometric ILR chart
+(`coordinates="ilr"` / `"simplex"`), while `coordinates="alr"` remains a
+non-isometric chart whose Aitchison Gram is `aitchison_metric(d)`.
 
 ## Device and dtype
 
@@ -100,7 +105,7 @@ workloads, prefer `gamfit.torch.fit` or the batched and additive primitives
 | Harvest / Fisher factors | `HarvestShard`, `harvest_output_fisher_factors`, `harvest_downstream_output_fisher_factors`, `save_harvest_shard`, `load_harvest_shard` |
 | Hyperbolic / interchange | `PoincareAtoms`, `InterchangeSwapDecoder` |
 | Skip transcoder | `SkipAffineSmooth`, `SkipTranscoderResult`, `skip_transcoder` |
-| Response geometry | `closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`, `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`, `sphere_exp_map`, `sphere_frechet_mean` |
+| Response geometry | `closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`, `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`, `sphere_exp_map`, `sphere_frechet_mean`; in `gamfit.torch.geometry`: `ilr`, `inverse_ilr`, `aitchison_metric` |
 | Fitted-model loader | `from_fitted` |
 
 Low-level value-producing wrappers are bit-exact equal to their NumPy

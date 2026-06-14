@@ -11,14 +11,10 @@ pub struct FamilyEvaluation {
     pub blockworking_sets: Vec<BlockWorkingSet>,
 }
 
-
-
 pub struct ExactNewtonJointGradientEvaluation {
     pub log_likelihood: f64,
     pub gradient: Array1<f64>,
 }
-
-
 
 /// Batched per-θ_j contributions to the analytic outer gradient.
 ///
@@ -51,8 +47,6 @@ pub struct BatchedOuterHessianTerms {
     pub outer_hessian: crate::solver::outer_strategy::HessianResult,
 }
 
-
-
 pub struct BatchedOuterGradientTerms {
     /// Explicit ∂J/∂θ_j contributions evaluated at the converged β̂ holding
     /// β fixed (i.e. the part that does NOT flow through H or S):
@@ -66,8 +60,6 @@ pub struct BatchedOuterGradientTerms {
     /// `tr(S⁺ · ∂S/∂θ_j)` for each j (penalty pseudo-logdet first derivative).
     pub trace_s_pinv_sdot: Array1<f64>,
 }
-
-
 
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {
@@ -1695,8 +1687,6 @@ pub trait CustomFamily {
     }
 }
 
-
-
 /// Scope of an outer-evaluation context — distinguishes a real outer
 /// derivative evaluation (where auto-subsample is allowed to install a
 /// fresh stratified mask and emit phase prints) from an inner
@@ -1712,8 +1702,6 @@ pub enum EvalScope {
     /// outer eval, so auto-subsample must not install a fresh mask.
     InnerCoefficient,
 }
-
-
 
 /// Context published by the outer smoothing optimizer for every
 /// downstream family evaluation. Carries the current outer ρ and a

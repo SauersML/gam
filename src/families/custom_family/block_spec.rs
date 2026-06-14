@@ -121,8 +121,6 @@ pub trait FamilyChannelHessian: Send + Sync {
     }
 }
 
-
-
 /// A [`FamilyChannelHessian`] backed directly by a pre-computed
 /// `(n × K × K)` tensor. Used by the default `channel_hessian_at`
 /// implementation and by tests.
@@ -132,8 +130,6 @@ pub trait FamilyChannelHessian: Send + Sync {
 pub struct TensorChannelHessian {
     pub h: ndarray::Array3<f64>,
 }
-
-
 
 impl FamilyChannelHessian for TensorChannelHessian {
     fn n_outputs(&self) -> usize {
@@ -158,8 +154,6 @@ impl FamilyChannelHessian for TensorChannelHessian {
         self.h.clone()
     }
 }
-
-
 
 /// β-linearization state passed to [`BlockEffectiveJacobian::effective_jacobian_at`].
 ///
@@ -192,8 +186,6 @@ pub struct FamilyLinearizationState<'a> {
     /// evaluation time and thus stay correct across outer-loop σ updates.
     pub probit_frailty_scale: f64,
 }
-
-
 
 /// β-dependent Jacobian callback for a parameter block.
 ///
@@ -260,8 +252,6 @@ pub trait BlockEffectiveJacobian: Send + Sync {
     }
 }
 
-
-
 /// A [`BlockEffectiveJacobian`] for any block that contributes linearly to
 /// exactly one output of a multi-output family.
 ///
@@ -277,8 +267,6 @@ pub struct AdditiveBlockJacobian {
     pub own_output: usize,
     pub n_family_outputs: usize,
 }
-
-
 
 impl BlockEffectiveJacobian for AdditiveBlockJacobian {
     fn effective_jacobian_rows(
@@ -310,8 +298,6 @@ impl BlockEffectiveJacobian for AdditiveBlockJacobian {
     }
 }
 
-
-
 /// A [`BlockEffectiveJacobian`] for a single-output block whose contribution
 /// to the linear predictor is `diag(eta_scaling) · design` (row-wise scaling).
 ///
@@ -323,8 +309,6 @@ pub struct RowScaledJacobian {
     pub design: Arc<Array2<f64>>,
     pub eta_scaling: Arc<[f64]>,
 }
-
-
 
 impl BlockEffectiveJacobian for RowScaledJacobian {
     fn effective_jacobian_rows(
@@ -366,15 +350,11 @@ impl BlockEffectiveJacobian for RowScaledJacobian {
     }
 }
 
-
-
 pub(crate) fn clamp_jacobian_rows(rows: Range<usize>, n: usize) -> Range<usize> {
     let start = rows.start.min(n);
     let end = rows.end.min(n);
     start..end.max(start)
 }
-
-
 
 /// Static specification for one parameter block in a custom family.
 ///
@@ -446,8 +426,6 @@ pub struct ParameterBlockSpec {
     pub stacked_offset: Option<Array1<f64>>,
 }
 
-
-
 impl std::fmt::Debug for ParameterBlockSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParameterBlockSpec")
@@ -469,8 +447,6 @@ impl std::fmt::Debug for ParameterBlockSpec {
             .finish()
     }
 }
-
-
 
 impl ParameterBlockSpec {
     /// Returns a ParameterBlockSpec with sensible defaults for all optional
@@ -564,23 +540,17 @@ impl ParameterBlockSpec {
     }
 }
 
-
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoefficientBlockSelector {
     Name(String),
     Index(usize),
 }
 
-
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoefficientLabel {
     pub block: CoefficientBlockSelector,
     pub column: usize,
 }
-
-
 
 impl CoefficientLabel {
     pub fn by_block_name(block: impl Into<String>, column: usize) -> Self {
@@ -591,13 +561,9 @@ impl CoefficientLabel {
     }
 }
 
-
-
 pub fn coefficient_label(block: impl Into<String>, column: usize) -> CoefficientLabel {
     CoefficientLabel::by_block_name(block, column)
 }
-
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoefficientGroupPrior {
@@ -617,8 +583,6 @@ pub enum CoefficientGroupPrior {
         tail_prob: f64,
     },
 }
-
-
 
 impl CoefficientGroupPrior {
     pub fn to_rho_prior(&self) -> crate::types::RhoPrior {
@@ -673,8 +637,6 @@ impl CoefficientGroupPrior {
     }
 }
 
-
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoefficientGroupSpec {
     pub label: String,
@@ -683,8 +645,6 @@ pub struct CoefficientGroupSpec {
     pub prior: Option<CoefficientGroupPrior>,
     pub initial_log_precision: Option<f64>,
 }
-
-
 
 impl CoefficientGroupSpec {
     pub fn new(label: impl Into<String>, coefficients: Vec<CoefficientLabel>) -> Self {
@@ -708,8 +668,6 @@ impl CoefficientGroupSpec {
     }
 }
 
-
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealizedCoefficientGroup {
     pub label: String,
@@ -718,8 +676,6 @@ pub struct RealizedCoefficientGroup {
     pub prior: Option<CoefficientGroupPrior>,
     pub initial_log_precision: f64,
 }
-
-
 
 #[derive(Debug, Clone)]
 pub struct RealizedCoefficientGroupSpecs {
@@ -734,8 +690,6 @@ pub struct RealizedCoefficientGroupSpecs {
     pub rho_prior: crate::types::RhoPrior,
     pub outer_labels: Vec<String>,
 }
-
-
 
 pub(crate) fn custom_family_block_role(
     name: &str,
@@ -761,16 +715,12 @@ pub(crate) fn custom_family_block_role(
     }
 }
 
-
-
 /// Current state for a parameter block.
 #[derive(Clone, Debug)]
 pub struct ParameterBlockState {
     pub beta: Array1<f64>,
     pub eta: Array1<f64>,
 }
-
-
 
 #[derive(Clone)]
 pub struct BlockGeometryDirectionalDerivative {
@@ -779,8 +729,6 @@ pub struct BlockGeometryDirectionalDerivative {
     /// Directional derivative of the block offset along the same direction.
     pub d_offset: Array1<f64>,
 }
-
-
 
 /// Working quantities supplied by a custom family for one block.
 ///
@@ -827,8 +775,6 @@ pub enum BlockWorkingSet {
     },
 }
 
-
-
 impl BlockWorkingSet {
     /// Construct a `Diagonal` working set with the length invariant
     /// (`working_response.len() == working_weights.len()`) enforced at the
@@ -854,8 +800,6 @@ impl BlockWorkingSet {
     }
 }
 
-
-
 pub(crate) fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
     // `fit_custom_family` is a fit entry point and genuinely requires at least
     // one parameter block — an empty model has nothing to estimate. This is a
@@ -869,8 +813,6 @@ pub(crate) fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<us
     }
     validate_blockspec_consistency(specs)
 }
-
-
 
 /// Validate the *internal consistency* of a slice of parameter block specs
 /// (unique names; design/offset/initial_beta/penalty dimensions agree) without
