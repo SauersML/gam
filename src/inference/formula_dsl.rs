@@ -1986,6 +1986,51 @@ pub fn parse_surv_response(
     }
 }
 
+/// Parsed `SurvInterval(L, R, event)` interval-censored response.
+///
+/// Returns `Some((left_col, right_col, event_col))` when the left-hand side is a
+/// `SurvInterval(...)` call, `None` otherwise (so a plain `Surv(...)` or a bare
+/// column response falls through to the other response parsers).
+///
+/// Interval censoring observes only a bracket `T ∈ (L, R]` — the exact event
+/// time is never seen — and its row contribution is the survival-mass difference
+/// `log[S(L) − S(R)]`, distinct from both the exact-event point density and the
+/// single-sided right-censored survival. A *dedicated call name* (rather than
+/// overloading the 3-argument `Surv(entry, exit, event)` delayed-entry form,
+/// which is also 3-argument and semantically incompatible) is the unambiguous
+/// DSL spelling: it mirrors flexsurv's `Surv(L, R, type="interval2")` intent
+/// without colliding with the existing left-truncation grammar.
+pub fn parse_surv_interval_response(
+    lhs: &str,
+) -> Result<Option<(String, String, String)>, FormulaDslError> {
+    let trimmed = lhs.trim();
+    let call = match parse_function_call(trimmed) {
+        Ok(call) => call,
+        Err(_) => return Ok(None),
+    };
+    if !call.name.eq_ignore_ascii_case("survinterval") {
+        return Ok(None);
+    }
+    let vars = call
+        .args
+        .iter()
+        .filter_map(|arg| match arg {
+            CallArgSpec::Positional(v) => Some(v.trim().to_string()),
+            CallArgSpec::Named { .. } => None,
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    match vars.len() {
+        3 => Ok(Some((vars[0].clone(), vars[1].clone(), vars[2].clone()))),
+        n => Err(FormulaDslError::InvalidArgument {
+            reason: format!(
+                "SurvInterval(...) expects SurvInterval(L, R, event) (interval-censored, the \
+                 observed bracket T ∈ (L, R]); got {n} columns"
+            ),
+        }),
+    }
+}
+
 fn top_level_formula_separator(input: &str) -> Result<Option<usize>, String> {
     let mut depth = 0_i32;
     let mut in_single = false;

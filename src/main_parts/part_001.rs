@@ -1029,6 +1029,12 @@ fn required_columns_for_formula(parsed: &ParsedFormula) -> Result<Vec<String>, S
         }
         out.insert(exit);
         out.insert(event);
+    } else if let Some((left, right, event)) =
+        parse_surv_interval_response(&parsed.response)?
+    {
+        out.insert(left);
+        out.insert(right);
+        out.insert(event);
     } else {
         out.insert(parsed.response.clone());
     }

@@ -2475,7 +2475,53 @@ fn materialize_survival<'a>(
         age_exit[i] = x;
     }
 
+    // Interval-censored `SurvInterval(L, R, event)`: `exit_col` carried the
+    // LEFT boundary `L` (resolved into `age_exit` above), and `interval_right_col`
+    // carries the RIGHT boundary `R`. The kernel's interval contribution
+    // `log[S(L) − S(R)]` requires a finite `R ≥ L` per row (`event >= 0.5`); a
+    // row with `event < 0.5` is right-censored at `L` (its `R` is ignored). We
+    // resolve `age_right` here so the downstream latent time stack can evaluate
+    // the baseline at `R`.
+    let age_right = if let Some(right_col) = interval_right_col {
+        let right_idx = resolve_role_col(col_map, right_col, "interval right")?;
+        let mut right = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let r = data.values[[i, right_idx]];
+            let is_bracketed = data.values[[i, event_idx]] >= 0.5;
+            if is_bracketed {
+                if !(r.is_finite()) || r < age_exit[i] {
+                    return Err(WorkflowError::InvalidConfig {
+                        reason: format!(
+                            "SurvInterval(L, R, event) requires a finite R >= L on bracketed rows (event >= 1); row {} has L={}, R={r}",
+                            i + 1,
+                            age_exit[i]
+                        ),
+                    });
+                }
+                right[i] = r;
+            } else {
+                // Right-censored row: R is unused by the likelihood. Pin it to L
+                // so the (ignored) right channel stays well-defined and the
+                // `age_exit <= age_right` time-basis invariant holds.
+                right[i] = age_exit[i];
+            }
+        }
+        Some(right)
+    } else {
+        None
+    };
+
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    if age_right.is_some() && survival_mode != SurvivalLikelihoodMode::Latent {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "interval-censored SurvInterval(L, R, event) is only defined for the latent \
+                 hazard-window survival likelihood (its kernel carries the log[S(L) − S(R)] \
+                 interval contribution); got survival_likelihood='{}'",
+                config.survival_likelihood
+            ),
+        });
+    }
     // Fail fast on all-censored (zero-event) survival data for every survival
     // likelihood (#789B / construction-time fittability split). With no row
     // marking a target event, the survival likelihood has no event score: the
@@ -2648,6 +2694,29 @@ fn materialize_survival<'a>(
         &mut time_build.x_exit_time,
         &time_anchor_row,
     )?;
+    // Interval-censored data needs the SAME monotone time basis evaluated at the
+    // RIGHT boundary `R` (so `q_right = X_time(R)·β_time + offset_right`). Rebuild
+    // it from the FROZEN knots (`resolved_time_cfg`, carrying the knot vector the
+    // exit basis just inferred) at `age_right` in the exit slot — no knot drift —
+    // and anchor-center its exit design identically. The resulting `x_exit_time`
+    // row is exactly the design at `R`. `time_build_right.x_entry_time` /
+    // `x_derivative_time` are unused by the interval-right channel.
+    let time_build_right = if let Some(age_right) = age_right.as_ref() {
+        let mut build_right = build_survival_time_basis(
+            &age_entry,
+            age_right,
+            resolved_time_cfg.clone(),
+            Some((config.time_num_internal_knots, config.time_smooth_lambda)),
+        )?;
+        center_survival_time_designs_at_anchor(
+            &mut build_right.x_entry_time,
+            &mut build_right.x_exit_time,
+            &time_anchor_row,
+        )?;
+        Some(build_right)
+    } else {
+        None
+    };
     if effective_timewiggle.is_some() && baseline_cfg.target == SurvivalBaselineTarget::Linear {
         return Err(
             "timewiggle requires a non-linear scalar survival baseline target; \
@@ -3254,6 +3323,58 @@ fn materialize_survival<'a>(
                 None,
                 Some(loading),
             )?;
+            // Interval-censored: build the matching time stack at the RIGHT
+            // boundary `R` (the exit slot holds `age_right`, evaluated through the
+            // frozen-knot `time_build_right`). Its exit channel is exactly the
+            // `R`-evaluated design / offset / unloaded mass, which feed the
+            // dedicated `_right` spec fields the kernel consumes for
+            // `log[S(L) − S(R)]`. The `event_target` then marks bracketed rows
+            // (`event >= 1`) with the `LATENT_SURVIVAL_EVENT_INTERVAL` sentinel
+            // and leaves `event < 1` rows right-censored at `L`.
+            let (time_design_right, time_offset_right, unloaded_mass_right, event_target) =
+                if let (Some(age_right), Some(time_build_right)) =
+                    (age_right.as_ref(), time_build_right.as_ref())
+                {
+                    let prepared_right = prepare_survival_time_stack(
+                        &age_entry,
+                        age_right,
+                        candidate,
+                        survival_mode,
+                        None,
+                        time_anchor,
+                        exact_derivative_guard,
+                        time_build_right,
+                        None,
+                        Some(loading),
+                    )?;
+                    if prepared_right.time_design_exit.ncols() != prepared.time_design_exit.ncols() {
+                        return Err(format!(
+                            "interval-censored right time design has {} columns but the left/exit design has {}; the right boundary basis must share the exit basis columns",
+                            prepared_right.time_design_exit.ncols(),
+                            prepared.time_design_exit.ncols()
+                        ));
+                    }
+                    let event_target = event.mapv(|v| {
+                        if v >= 0.5 {
+                            crate::families::latent_survival::LATENT_SURVIVAL_EVENT_INTERVAL
+                        } else {
+                            0
+                        }
+                    });
+                    (
+                        Some(prepared_right.time_design_exit.clone()),
+                        Some(prepared_right.eta_offset_exit.clone()),
+                        prepared_right.unloaded_mass_exit.clone(),
+                        event_target,
+                    )
+                } else {
+                    (
+                        None,
+                        None,
+                        Array1::zeros(0),
+                        event.mapv(|v| if v >= 0.5 { 1 } else { 0 }),
+                    )
+                };
             let time_p = prepared.time_design_exit.ncols();
             let time_initial_log_lambdas = if prepared.time_penalties.is_empty() {
                 None
@@ -3281,15 +3402,15 @@ fn materialize_survival<'a>(
                 spec: LatentSurvivalTermSpec {
                     age_entry: age_entry.clone(),
                     age_exit: age_exit.clone(),
-                    event_target: event.mapv(|v| if v >= 0.5 { 1 } else { 0 }),
+                    event_target,
                     weights: weights.clone(),
                     derivative_guard: exact_derivative_guard,
                     time_block,
-                    time_design_right: None,
-                    time_offset_right: None,
+                    time_design_right,
+                    time_offset_right,
                     unloaded_mass_entry: prepared.unloaded_mass_entry,
                     unloaded_mass_exit: prepared.unloaded_mass_exit,
-                    unloaded_mass_right: Array1::zeros(0),
+                    unloaded_mass_right,
                     unloaded_hazard_exit: prepared.unloaded_hazard_exit,
                     meanspec: termspec.clone(),
                     mean_offset: threshold_offset.clone(),
