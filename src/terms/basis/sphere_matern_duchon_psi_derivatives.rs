@@ -2198,6 +2198,19 @@ fn build_matern_design_psi_derivatives(
 }
 
 
+/// Build the Matérn double-penalty **primary** block (the projected kernel
+/// Gram `A = Zᵀ K Z`, embedded into the `total_cols` coefficient space) and its
+/// log-κ ψ-derivatives, in BOTH the un-normalized and the Frobenius-normalized
+/// forms.
+///
+/// Returns `(s_norm, s_norm_psi, s_norm_psi_psi, c, a_raw, a_raw_psi,
+/// a_raw_psi_psi)` where the `s_norm*` are the normalized primary penalty and
+/// its ψ-derivatives (the active `PenaltySource::Primary` block) and the
+/// `a_raw*` are the UN-normalized projected kernel and its ψ-derivatives. The
+/// un-normalized triplet is what `build_nullspace_shrinkage_penalty` eigen-
+/// decomposes in the value build, so it is exactly the matrix whose spectral
+/// projector — and therefore the `DoublePenaltyNullspace` shrinkage block —
+/// must be differentiated against (#1122).
 fn build_matern_double_penalty_primarywith_psi_derivatives(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
@@ -2205,7 +2218,18 @@ fn build_matern_double_penalty_primarywith_psi_derivatives(
     include_intercept: bool,
     z_opt: Option<&Array2<f64>>,
     aniso_log_scales: Option<&[f64]>,
-) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, f64), BasisError> {
+) -> Result<
+    (
+        Array2<f64>,
+        Array2<f64>,
+        Array2<f64>,
+        f64,
+        Array2<f64>,
+        Array2<f64>,
+        Array2<f64>,
+    ),
+    BasisError,
+> {
     let k = centers.nrows();
     let kernel_cols = z_opt.map(|z| z.ncols()).unwrap_or(k);
     let total_cols = kernel_cols + usize::from(include_intercept);
@@ -2258,24 +2282,218 @@ fn build_matern_double_penalty_primarywith_psi_derivatives(
     s_psi_psi
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&kernel_psi_psi);
+    // `s`/`s_psi`/`s_psi_psi` are the UN-normalized projected kernel Gram
+    // `A = Zᵀ K Z` (embedded into `total_cols`) and its exact log-κ
+    // ψ-derivatives. `build_nullspace_shrinkage_penalty` (value build) eigen-
+    // decomposes exactly this `A`, so the shrinkage-block derivative is the
+    // spectral-projector derivative driven by `s_psi` / `s_psi_psi`.
     let (s_norm, s_norm_psi, s_norm_psi_psi, c) =
         normalize_penaltywith_psi_derivatives(&s, &s_psi, &s_psi_psi);
-    Ok((s_norm, s_norm_psi, s_norm_psi_psi, c))
+    Ok((s_norm, s_norm_psi, s_norm_psi_psi, c, s, s_psi, s_psi_psi))
 }
 
 
+/// Frozen-eigenbasis frame of the un-normalized projected Matérn kernel Gram
+/// `A`, plus the constant data needed to differentiate the spectral projector
+/// onto its near-null eigenspace `N = { i : |λ_i| ≤ tol }`.
+///
+/// The value build forms the `DoublePenaltyNullspace` block
+/// (`build_nullspace_shrinkage_penalty`) as the Frobenius-normalized projector
+///   `R~ = P / ‖P‖_F`,   `P = Σ_{i ∈ N} u_i u_iᵀ`,
+/// at the SAME spectral tolerance used here. `P` is an orthogonal projector, so
+/// `‖P‖_F = √r` with `r = |N|` the (FrozenTransform-pinned) null dimension — a
+/// hyperparameter-independent constant. Hence every projector derivative is
+/// scaled by `1/√r`.
+///
+/// `P` moves with the hyperparameters because `A` does, so its earlier hard-
+/// coded zero derivative was an objective↔gradient desync that stalled the
+/// isotropic-κ joint REML (#1122). Derivatives come from exact eigen-
+/// perturbation in this frozen eigenbasis `U`.
+struct ShrinkageProjectorFrame {
+    /// Eigenvectors of `sym(A)`, columns ascending in eigenvalue.
+    u: Array2<f64>,
+    /// Eigenvalues (ascending).
+    evals: Array1<f64>,
+    /// `1` on near-null indices `N`, `0` elsewhere.
+    in_null: Vec<f64>,
+    /// Null dimension `r = |N|`.
+    null_dim: usize,
+    /// Connection-gap floor `tol` (pairs closer than this have no resolvable
+    /// gap; their eigenvector sensitivity is ambiguous and they do not move the
+    /// projector, so the connection entry is set to zero).
+    gap_floor: f64,
+}
+
+impl ShrinkageProjectorFrame {
+    /// Build the frame from the un-normalized projected kernel Gram `A`.
+    /// Returns `None` when `A` has no near-null eigenspace at this tolerance
+    /// (the value build emits no shrinkage block, so there is nothing to
+    /// differentiate).
+    fn build(a_raw: &Array2<f64>) -> Result<Option<Self>, BasisError> {
+        if a_raw.nrows() == 0 {
+            return Ok(None);
+        }
+        let (sym, evals, evecs) = spectral_summary(a_raw)?;
+        let tol = spectral_tolerance(&sym, &evals);
+        let in_null: Vec<f64> = evals
+            .iter()
+            .map(|&ev| if ev.abs() <= tol { 1.0 } else { 0.0 })
+            .collect();
+        let null_dim = in_null.iter().filter(|&&b| b != 0.0).count();
+        if null_dim == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            u: evecs,
+            evals,
+            in_null,
+            null_dim,
+            gap_floor: tol.max(f64::MIN_POSITIVE),
+        }))
+    }
+
+    fn dim(&self) -> usize {
+        self.u.nrows()
+    }
+
+    /// Skew connection `Ω_d[m,k] = (Uᵀ A_d U)[m,k] / (λ_k − λ_m)` for a single
+    /// direction's `A_d = ∂A/∂η_d` (`m ≠ k`, floored at small gaps), together
+    /// with the eigenbasis representation `B̂_d = Uᵀ A_d U` and the
+    /// Hellmann–Feynman eigenvalue derivatives `λ_k' = B̂_d[k,k]`.
+    fn connection(&self, a_dir: &Array2<f64>) -> (Array2<f64>, Array2<f64>, Vec<f64>) {
+        let p = self.dim();
+        let b_hat = fast_atb(&self.u, &fast_ab(&symmetrize(a_dir), &self.u));
+        let mut omega = Array2::<f64>::zeros((p, p));
+        for m in 0..p {
+            for k in 0..p {
+                if m == k {
+                    continue;
+                }
+                let gap = self.evals[k] - self.evals[m];
+                if gap.abs() > self.gap_floor {
+                    omega[[m, k]] = b_hat[[m, k]] / gap;
+                }
+            }
+        }
+        let lam_prime: Vec<f64> = (0..p).map(|k| b_hat[[k, k]]).collect();
+        (omega, b_hat, lam_prime)
+    }
+
+    /// `P̂_d' = Ω_d I_N − I_N Ω_d` (frozen-frame projector first derivative for
+    /// direction `d`; nonzero only across `N`↔`R`).
+    fn projector_first_hat(&self, omega: &Array2<f64>) -> Array2<f64> {
+        let p = self.dim();
+        let mut out = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                let coeff = self.in_null[j] - self.in_null[i];
+                if coeff != 0.0 {
+                    out[[i, j]] = omega[[i, j]] * coeff;
+                }
+            }
+        }
+        out
+    }
+
+    /// Lab-frame, `1/√r`-normalized first derivative of the shrinkage block for
+    /// direction `d`: `R~_d = U P̂_d' Uᵀ / √r`.
+    fn first(&self, a_dir: &Array2<f64>) -> Array2<f64> {
+        let (omega, _b_hat, _lam) = self.connection(a_dir);
+        let p1_hat = self.projector_first_hat(&omega);
+        self.to_lab(&p1_hat)
+    }
+
+    /// Lab-frame, `1/√r`-normalized mixed second derivative of the shrinkage
+    /// block for directions `(a, b)`:
+    ///   `Uᵀ P_ab U = ∂_b(P̂_a') + Ω_b P̂_a' − P̂_a' Ω_b`,
+    /// `∂_b(P̂_a') = (∂_b Ω_a) I_N − I_N (∂_b Ω_a)`,
+    /// `∂_b Ω_a[m,k] = B̂_a'^{(b)}[m,k]/(λ_k−λ_m) − B̂_a[m,k]·(λ_k'^{(b)}−λ_m'^{(b)})/(λ_k−λ_m)²`,
+    /// `B̂_a'^{(b)} = Uᵀ A_ab U + B̂_a Ω_b − Ω_b B̂_a`,  `λ_k'^{(b)} = B̂_b[k,k]`.
+    /// For the diagonal case `a == b` this is the ordinary second derivative.
+    fn second(
+        &self,
+        a_dir_a: &Array2<f64>,
+        a_dir_b: &Array2<f64>,
+        a_cross: &Array2<f64>,
+    ) -> Array2<f64> {
+        let p = self.dim();
+        let (omega_a, b_hat_a, _lam_a) = self.connection(a_dir_a);
+        let (omega_b, _b_hat_b, lam_prime_b) = self.connection(a_dir_b);
+        let p1a_hat = self.projector_first_hat(&omega_a);
+        // B̂_a'^{(b)} = Uᵀ A_ab U + B̂_a Ω_b − Ω_b B̂_a.
+        let c_hat = fast_atb(&self.u, &fast_ab(&symmetrize(a_cross), &self.u));
+        let b_hat_a_prime =
+            &c_hat + &(fast_ab(&b_hat_a, &omega_b) - fast_ab(&omega_b, &b_hat_a));
+        // ∂_b Ω_a.
+        let mut omega_a_db = Array2::<f64>::zeros((p, p));
+        for m in 0..p {
+            for k in 0..p {
+                if m == k {
+                    continue;
+                }
+                let gap = self.evals[k] - self.evals[m];
+                if gap.abs() > self.gap_floor {
+                    omega_a_db[[m, k]] = b_hat_a_prime[[m, k]] / gap
+                        - b_hat_a[[m, k]] * (lam_prime_b[k] - lam_prime_b[m]) / (gap * gap);
+                }
+            }
+        }
+        // P̂_ab = (∂_b Ω_a) I_N − I_N (∂_b Ω_a) + Ω_b P̂_a' − P̂_a' Ω_b.
+        let mut p2_hat = fast_ab(&omega_b, &p1a_hat) - fast_ab(&p1a_hat, &omega_b);
+        for i in 0..p {
+            for j in 0..p {
+                let coeff = self.in_null[j] - self.in_null[i];
+                if coeff != 0.0 {
+                    p2_hat[[i, j]] += omega_a_db[[i, j]] * coeff;
+                }
+            }
+        }
+        self.to_lab(&p2_hat)
+    }
+
+    /// Map a frozen-frame projector derivative `P̂` back to the lab frame and
+    /// apply the constant `1/√r` normalization: `symmetrize(U P̂ Uᵀ) / √r`.
+    fn to_lab(&self, p_hat: &Array2<f64>) -> Array2<f64> {
+        let inv_norm = 1.0 / (self.null_dim as f64).sqrt();
+        symmetrize(&fast_ab(&self.u, &fast_abt(p_hat, &self.u))).mapv(|v| v * inv_norm)
+    }
+}
+
+/// Exact isotropic-κ (`ρ = log κ`) first and second ψ-derivatives of the
+/// Matérn double-penalty `DoublePenaltyNullspace` shrinkage block, driven by
+/// the un-normalized projected-kernel Gram `A` and its log-κ derivatives.
+/// Returns `(R~', R~'')`. Zeros when no shrinkage subspace exists at this ρ.
+fn matern_nullspace_shrinkage_psi_derivatives(
+    a_raw: &Array2<f64>,
+    a_raw_psi: &Array2<f64>,
+    a_raw_psi_psi: &Array2<f64>,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let p = a_raw.nrows();
+    let zero = || Array2::<f64>::zeros((p, p));
+    let Some(frame) = ShrinkageProjectorFrame::build(a_raw)? else {
+        return Ok((zero(), zero()));
+    };
+    let first = frame.first(a_raw_psi);
+    let second = frame.second(a_raw_psi, a_raw_psi, a_raw_psi_psi);
+    Ok((first, second))
+}
+
+
+/// Assemble the active Matérn double-penalty ψ-derivative blocks (first or
+/// second order), index-aligned with `penaltyinfo`. The `Primary` block uses
+/// the projected-kernel-Gram derivative; the `DoublePenaltyNullspace` block
+/// uses the exact spectral-projector derivative (#1122) supplied per block.
 fn active_matern_double_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     primary_derivative: &Array2<f64>,
+    shrinkage_derivative: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
     penaltyinfo
         .iter()
         .filter(|info| info.active)
         .map(|info| match &info.source {
             PenaltySource::Primary => Ok(primary_derivative.clone()),
-            PenaltySource::DoublePenaltyNullspace => {
-                Ok(Array2::<f64>::zeros(primary_derivative.raw_dim()))
-            }
+            PenaltySource::DoublePenaltyNullspace => Ok(shrinkage_derivative.clone()),
             other => Err(BasisError::InvalidInput(format!(
                 "unexpected Matérn penalty source in double-penalty path: {other:?}"
             ))),
@@ -2333,18 +2551,47 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     )?;
     let (penalties_derivative, penaltiessecond_derivative) = if spec.double_penalty {
         let base = build_matern_basiswithworkspace(data, spec, workspace)?;
-        let (_, primary_derivative, primarysecond_derivative, _) =
-            build_matern_double_penalty_primarywith_psi_derivatives(
-                centers.view(),
-                spec.length_scale,
-                spec.nu,
-                spec.include_intercept,
-                z_opt.as_ref(),
-                aniso,
-            )?;
+        let (
+            _,
+            primary_derivative,
+            primarysecond_derivative,
+            _,
+            a_raw,
+            a_raw_psi,
+            a_raw_psi_psi,
+        ) = build_matern_double_penalty_primarywith_psi_derivatives(
+            centers.view(),
+            spec.length_scale,
+            spec.nu,
+            spec.include_intercept,
+            z_opt.as_ref(),
+            aniso,
+        )?;
+        // Exact log-κ ψ-derivatives of the `DoublePenaltyNullspace` shrinkage
+        // projector, driven by the UN-normalized projected-kernel ψ-derivatives
+        // (#1122). Computed only when an active shrinkage block exists.
+        let (shrinkage_first, shrinkagesecond) =
+            if base.penaltyinfo.iter().any(|info| {
+                info.active && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
+            }) {
+                matern_nullspace_shrinkage_psi_derivatives(&a_raw, &a_raw_psi, &a_raw_psi_psi)?
+            } else {
+                (
+                    Array2::<f64>::zeros(a_raw.raw_dim()),
+                    Array2::<f64>::zeros(a_raw.raw_dim()),
+                )
+            };
         (
-            active_matern_double_penalty_derivatives(&base.penaltyinfo, &primary_derivative)?,
-            active_matern_double_penalty_derivatives(&base.penaltyinfo, &primarysecond_derivative)?,
+            active_matern_double_penalty_derivatives(
+                &base.penaltyinfo,
+                &primary_derivative,
+                &shrinkage_first,
+            )?,
+            active_matern_double_penalty_derivatives(
+                &base.penaltyinfo,
+                &primarysecond_derivative,
+                &shrinkagesecond,
+            )?,
         )
     } else {
         build_matern_operator_penalty_psi_derivatives(
@@ -2592,14 +2839,61 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         }
 
         let base = build_matern_basiswithworkspace(data, spec, &mut BasisWorkspace::default())?;
+        let has_shrinkage = base.penaltyinfo.iter().any(|info| {
+            info.active && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
+        });
+        // The un-normalized projected aniso kernel Gram `A = Zᵀ K Z` (embedded
+        // into `total_cols`) is what the value build's shrinkage block eigen-
+        // decomposes; its per-axis η_a derivatives are `primary_first[a]`. The
+        // shrinkage-projector derivative (#1122) is driven by exactly these.
+        let shrinkage_frame = if has_shrinkage {
+            let kernel = build_matern_kernel_penalty(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                Some(eta),
+            )?;
+            let kblock = kernel.slice(s![0..k, 0..k]).to_owned();
+            let mut a_raw = Array2::<f64>::zeros((total_cols, total_cols));
+            let projected = if let Some(z) = z_opt.as_ref() {
+                z.t().dot(&kblock).dot(z)
+            } else {
+                kblock
+            };
+            a_raw
+                .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+                .assign(&projected);
+            ShrinkageProjectorFrame::build(&a_raw)?
+        } else {
+            None
+        };
+        let shrinkage_first: Vec<Array2<f64>> = (0..dim)
+            .map(|a| match &shrinkage_frame {
+                Some(frame) => frame.first(&primary_first[a]),
+                None => Array2::<f64>::zeros((total_cols, total_cols)),
+            })
+            .collect();
+        let shrinkage_second_diag: Vec<Array2<f64>> = (0..dim)
+            .map(|a| match &shrinkage_frame {
+                Some(frame) => {
+                    frame.second(&primary_first[a], &primary_first[a], &primary_second_diag[a])
+                }
+                None => Array2::<f64>::zeros((total_cols, total_cols)),
+            })
+            .collect();
         result.penalties_first = Vec::with_capacity(dim);
         result.penalties_second_diag = Vec::with_capacity(dim);
         for a in 0..dim {
-            let pf =
-                active_matern_double_penalty_derivatives(&base.penaltyinfo, &primary_first[a])?;
+            let pf = active_matern_double_penalty_derivatives(
+                &base.penaltyinfo,
+                &primary_first[a],
+                &shrinkage_first[a],
+            )?;
             let ps = active_matern_double_penalty_derivatives(
                 &base.penaltyinfo,
                 &primary_second_diag[a],
+                &shrinkage_second_diag[a],
             )?;
             result.penalties_first.push(pf);
             result.penalties_second_diag.push(ps);
@@ -2611,6 +2905,11 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let penaltyinfo = base.penaltyinfo.clone();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
+        // Per-axis projected first derivatives ∂A/∂η_a (embedded), so the
+        // cross-pair shrinkage second derivative `∂²P/∂η_a∂η_b` can be formed
+        // exactly inside the provider (#1122).
+        let primary_first_owned = primary_first.clone();
+        let include_intercept = spec.include_intercept;
         result.penalties_cross_provider = Some(AnisoPenaltyCrossProvider::new(
             move |axis_a: usize, axis_b: usize| {
                 let (a, b) = if axis_a < axis_b {
@@ -2638,7 +2937,39 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                 padded
                     .slice_mut(s![0..kernel_cols, 0..kernel_cols])
                     .assign(&projected);
-                active_matern_double_penalty_derivatives(&penaltyinfo, &padded)
+                // Exact cross second derivative of the shrinkage projector, if
+                // an active shrinkage block exists at this hyperparameter.
+                let shrinkage_cross = if penaltyinfo.iter().any(|info| {
+                    info.active && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
+                }) {
+                    let kernel = build_matern_kernel_penalty(
+                        centers_owned.view(),
+                        length_scale,
+                        nu,
+                        include_intercept,
+                        Some(&eta_owned),
+                    )?;
+                    let k = centers_owned.nrows();
+                    let kblock = kernel.slice(s![0..k, 0..k]).to_owned();
+                    let projected_a = if let Some(z) = z_owned.as_ref() {
+                        z.t().dot(&kblock).dot(z)
+                    } else {
+                        kblock
+                    };
+                    let mut a_raw = Array2::<f64>::zeros((total_cols, total_cols));
+                    a_raw
+                        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+                        .assign(&projected_a);
+                    match ShrinkageProjectorFrame::build(&a_raw)? {
+                        Some(frame) => {
+                            frame.second(&primary_first_owned[a], &primary_first_owned[b], &padded)
+                        }
+                        None => Array2::<f64>::zeros((total_cols, total_cols)),
+                    }
+                } else {
+                    Array2::<f64>::zeros((total_cols, total_cols))
+                };
+                active_matern_double_penalty_derivatives(&penaltyinfo, &padded, &shrinkage_cross)
             },
         ));
     } else {
