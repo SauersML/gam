@@ -71,12 +71,22 @@ pub(crate) const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
 /// Eckart-Young LINEAR anchor can converge (legitimately, on the gauge/decoder-
 /// null quotient) into a degenerate basin whose reconstruction is worse than the
 /// data mean (a NEGATIVE EV). When the post-polish EV is below this floor the
-/// arrival is demoted to a recorded bifurcation so the documented seed cascade —
-/// which cold-starts near the data manifold — recovers the good branch. The
-/// floor sits well below a genuine recovery (a real circle reconstructs at
-/// EV ≳ 0.9) but firmly above the worse-than-trivial basins, so a clean arrival
-/// is never demoted while a garbage basin always is.
+/// walk runs a bounded joint Newton recovery from the pristine seed, and on
+/// failure demotes to a recorded bifurcation so the documented seed cascade
+/// recovers the good branch. The floor sits well below a genuine recovery (a
+/// real circle reconstructs at EV ≳ 0.9) but firmly above the worse-than-trivial
+/// basins, so a clean arrival is never touched while a garbage basin always is.
 pub(crate) const CURVATURE_WALK_ARRIVAL_EV_FLOOR: f64 = 0.5;
+
+/// Joint Newton iteration budget for the curvature-walk degenerate-basin
+/// recovery (#1117). When the walk lands on a sub-`CURVATURE_WALK_ARRIVAL_EV_
+/// FLOOR` reconstruction, the recovery runs a REAL joint fit from the pristine
+/// (circle-aware) seed with at least this many inner iterations, independent of
+/// the outer objective's possibly-frozen `inner_max_iter = 0` — otherwise the
+/// recovery (and the fallback cascade) would re-freeze at the cold seed and
+/// never escape the linear basin. Matches the cold-start budget that recovers
+/// EV ≈ 0.94 on the K = 1 periodic circle.
+pub(crate) const CURVATURE_WALK_RECOVERY_INNER_ITERS: usize = 25;
 
 /// Relative floor on the Newton directional decrease, expressed as a tiny
 /// multiple of `‖g‖·‖Δ‖`. A predicted decrease below this is at the level of

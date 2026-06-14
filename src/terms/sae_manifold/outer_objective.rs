@@ -646,16 +646,27 @@ impl SaeManifoldOuterObjective {
         // walk from the Eckart-Young LINEAR anchor can track into a degenerate
         // basin that is stationary on the gauge/decoder-null quotient (so the
         // inner solve legitimately converges there) yet reconstructs the data
-        // badly (a NEGATIVE explained variance: worse than the data mean). The
-        // decoder-LSQ polish above is the first rescue; when even that cannot
-        // lift the EV to the arrival floor, declaring "arrived" pins the whole
-        // fit to that garbage basin (EV = -0.59 on the K = 1 periodic p = 512
-        // circle) instead of letting the documented multi-seed cascade — which
-        // cold-starts near the circle and recovers EV ≈ 0.94 — take over. So a
-        // sub-floor post-polish reconstruction DEMOTES the walk to a recorded
-        // bifurcation: the cascade runs (a ~30s cold fit here, no stall) and
-        // finds the good branch. A genuinely good arrival (the common case, and
-        // every fit that was already passing) is untouched.
+        // badly (a NEGATIVE explained variance: worse than the data mean). For a
+        // K = 1 PERIODIC (circle) atom the linear anchor IS that wrong basin — a
+        // straight chord through the arc — and neither the IFT predictor nor the
+        // decoder-LSQ polish (which alternates a decoder LSQ with a coordinate
+        // re-projection ONTO that same bad decoder) can escape it: it is a fixed
+        // point. The walk then reported `arrived = true` on EV = -0.59.
+        //
+        // Crucially, the production outer objective can carry `inner_max_iter = 0`
+        // (a value-only / frozen-inner configuration), so neither the cascade
+        // `eval` NOR `into_fitted`'s basin re-solve runs a real joint Newton fit
+        // — only the homotopy + polish produce any fit, and they are stuck on the
+        // linear anchor. Demoting to a bifurcation alone therefore does NOT
+        // recover the circle (the cascade re-freezes at the cold seed). So the
+        // recovery itself must run a REAL bounded joint Newton fit from the
+        // pristine baseline term (which carries the circle-aware PCA seed the
+        // cold path recovers EV ≈ 0.94 from), with a nonzero budget independent
+        // of the objective's frozen `inner_max_iter`. If that recovers a good
+        // reconstruction we adopt it (the walk genuinely arrives on the curved
+        // branch); otherwise we demote to a recorded bifurcation so the cascade
+        // takes over from the pristine baseline. A genuinely good arrival (the
+        // common case, every fit already passing) never enters this block.
         if arrived
             && let Ok(final_fit) = self.term.try_fitted_for_rho(&rho)
             && let Some(final_ev) =
@@ -664,16 +675,62 @@ impl SaeManifoldOuterObjective {
         {
             log::info!(
                 "[#1007] curvature walk reached η=1 but the reconstruction is degenerate \
-                 (EV={final_ev:.4} < arrival floor {CURVATURE_WALK_ARRIVAL_EV_FLOOR}); demoting to \
-                 a branch bifurcation so the seed cascade can recover the good branch"
+                 (EV={final_ev:.4} < arrival floor {CURVATURE_WALK_ARRIVAL_EV_FLOOR}); running a \
+                 bounded joint Newton fit from the pristine seed to recover the curved branch"
             );
-            arrived = false;
-            self.term.set_homotopy_eta(1.0).ok();
-            if bifurcation.is_none() {
-                bifurcation = Some(CurvatureBifurcation {
-                    eta: 1.0,
-                    min_pivot: 0.0,
-                });
+            // Real joint Newton fit from the pristine baseline (circle-aware
+            // seed), at the full η = 1 basis, with a budget that does NOT collapse
+            // to the objective's frozen `inner_max_iter`.
+            let recovery_iters = self.inner_max_iter.max(CURVATURE_WALK_RECOVERY_INNER_ITERS);
+            let mut recovered_term = self.baseline_term.clone();
+            recovered_term.set_homotopy_eta(1.0).ok();
+            let mut recovery_rho = rho.clone();
+            let recovery_fit = recovered_term.run_joint_fit_arrow_schur(
+                self.target.view(),
+                &mut recovery_rho,
+                self.registry.as_ref(),
+                recovery_iters,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            );
+            let recovered_ev = recovery_fit.as_ref().ok().and_then(|_| {
+                recovered_term
+                    .try_fitted_for_rho(&rho)
+                    .ok()
+                    .and_then(|fit| {
+                        reconstruction_explained_variance(self.target.view(), fit.view())
+                    })
+            });
+            match (recovery_fit, recovered_ev) {
+                (Ok(loss), Some(ev)) if ev > final_ev && ev >= CURVATURE_WALK_ARRIVAL_EV_FLOOR => {
+                    // The bounded joint fit found the curved branch: adopt it and
+                    // keep `arrived = true` (the walk delivered a usable fit).
+                    log::info!(
+                        "[#1007] curvature degenerate-basin recovery succeeded \
+                         (EV {final_ev:.4} -> {ev:.4}); adopting the recovered curved branch"
+                    );
+                    self.term = recovered_term;
+                    self.current_rho = rho.clone();
+                    self.last_loss = Some(loss);
+                }
+                _ => {
+                    // Recovery could not improve the reconstruction: demote to a
+                    // recorded bifurcation so the outer seed loop resets to the
+                    // pristine baseline and the documented cascade takes over.
+                    log::info!(
+                        "[#1007] curvature degenerate-basin recovery did not clear the arrival \
+                         floor (EV stayed {final_ev:.4}); demoting to a branch bifurcation"
+                    );
+                    arrived = false;
+                    self.term.set_homotopy_eta(1.0).ok();
+                    if bifurcation.is_none() {
+                        bifurcation = Some(CurvatureBifurcation {
+                            eta: 1.0,
+                            min_pivot: 0.0,
+                        });
+                    }
+                }
             }
         }
         let collapse_events = self.term.collapse_events().len();
