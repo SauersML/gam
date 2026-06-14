@@ -47,9 +47,6 @@
 //! ([`crate::inference::row_metric::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
-use crate::geometry::curvature_estimand::{
-    CurvatureVerdict, FlatnessTest, KappaProfileCi, flatness_lr_test, profile_ci_walk,
-};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{
@@ -938,58 +935,21 @@ pub struct AtomInnerFit {
     pub peak_design_row: Array1<f64>,
     /// Design row at the latent mode `t_mode` (largest assignment mass).
     pub mode_design_row: Array1<f64>,
-    /// The atom's geometric curvature estimate `κ̂` (the dictionary
-    /// `per_atom_kappa_hat[k]`); echoed so the curvature-CI report has its
-    /// point estimate without re-deriving it.
+    /// The atom's plug-in curvature estimate `κ̂ = atom_curvature_bound(β̂)` (the
+    /// dictionary `per_atom_kappa_hat[k]`): a sup-norm extrinsic-curvature BOUND
+    /// read off the fitted decoder coefficients. Echoed so the curvature-CI
+    /// report has its point estimate without re-deriving it.
     pub kappa_hat: f64,
-    /// The constant-curvature geodesic-length jet of the atom's own latent
-    /// chart, captured at the fitted curvature so the #1099 κ-profile can move κ
-    /// through the *exact* `M_κ` evidence machinery rather than a surrogate.
-    ///
-    /// This is the mean pairwise geodesic distance `s(κ)` between the atom's
-    /// latent coordinates on the
-    /// [`ConstantCurvature`](crate::geometry::ConstantCurvature) chart, with its
-    /// first/second κ-derivatives, **evaluated at the fitted `κ_geom`** (the
-    /// linearisation centre). It is the same data-relative geodesic scale the
-    /// constant-curvature smooth normalises by to hold basis flexibility
-    /// κ-invariant: the roughness penalty's effective smoothing strength scales
-    /// as `(s(κ_centre)/s(κ))^{2 r}` with roughness order `r`, so as κ moves the
-    /// penalty re-weights exactly as the realized design's resolution does.
-    /// `None` when the atom's latent chart is degenerate (coincident / single
-    /// coordinate) or carries no analytic geodesic jet, in which case no
-    /// κ-evidence profile exists and the curvature CI is reported `None`.
-    pub geodesic_length_jet: Option<GeodesicLengthJet>,
-    /// The roughness operator order `r` of [`AtomInnerFit::penalty`]
-    /// (`smooth_penalty_order`), the exponent in the geodesic penalty rescale
-    /// `(s(κ_centre)/s(κ))^{2 r}`.
-    pub penalty_order: usize,
-    /// The fitted REML weighted-least-squares cross term `ΦᵀW z` on the captured
-    /// channel (`z` = the per-row working response). Together with
-    /// [`AtomInnerFit::penalized_hessian`] and [`AtomInnerFit::penalty`] this is
-    /// everything the κ-profile re-solve needs to re-fit
-    /// `β(κ) = H(κ)⁻¹ ΦᵀW z` at a rescaled penalty and evaluate the Gaussian
-    /// penalized REML log-evidence.
-    pub xtw_z: Array1<f64>,
-    /// The fitted REML weighted total sum of squares `zᵀW z` on the captured
-    /// channel — the constant the penalized residual sum of squares
-    /// `RSS(κ) = zᵀW z − 2 β(κ)ᵀ ΦᵀW z + β(κ)ᵀ ΦᵀWΦ β(κ)` is built from.
-    pub ztw_z: f64,
-}
-
-/// The constant-curvature geodesic-length scale `s(κ)` of an atom's latent
-/// chart and its κ-derivatives — the `M_κ` quantity the #1099 curvature profile
-/// moves κ through. Captured at the fitted curvature `kappa_centre`.
-#[derive(Debug, Clone, Copy)]
-pub struct GeodesicLengthJet {
-    /// The curvature the jet was linearised around (the atom's fitted `κ_geom`).
-    pub kappa_centre: f64,
-    /// `s(κ_centre)` — mean pairwise geodesic distance among the atom's latent
-    /// coordinates at the fitted curvature. Strictly positive.
-    pub s: f64,
-    /// `∂s/∂κ` at `kappa_centre`.
-    pub ds: f64,
-    /// `∂²s/∂κ²` at `kappa_centre`.
-    pub dds: f64,
+    /// The gradient `∂κ/∂β ∈ ℝ^{M_k}` of the curvature functional
+    /// `atom_curvature_bound` with respect to the captured decoder channel's
+    /// coefficients, evaluated at `β̂`. Captured at fit time (where the full
+    /// second-jet geometry the bound is built from lives) by finite-differencing
+    /// the bound in each coefficient. This is the delta-method sensitivity the
+    /// #1099 curvature SE propagates through the inner-fit Hessian inverse:
+    /// `SE = sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))`. `None` when the bound carries no usable
+    /// gradient (degenerate chart / infinite bound), in which case the curvature
+    /// CI is reported `None`.
+    pub kappa_grad: Option<Array1<f64>>,
 }
 
 impl FittedAtom {
@@ -1033,14 +993,31 @@ pub struct AtomFunctionalReport {
     pub decoder_variation_norm: Option<RieszDebiasReport>,
 }
 
-/// Per-atom curvature confidence interval and interior-point flatness test
-/// (#1099), profiling the atom's penalized neg-log-evidence along the curvature
-/// channel `κ` around the fitted `κ̂`.
+/// Per-atom curvature point estimate and delta-method standard error (#1099).
+///
+/// `kappa_hat = atom_curvature_bound(β̂)` is a sup-norm extrinsic-curvature BOUND
+/// read off the already-fitted decoder coefficients — nothing in any
+/// optimisation moves it, so there is no profiled criterion `V_p(κ)` to walk and
+/// no likelihood κ-channel. The honest uncertainty is therefore a plug-in
+/// delta-method SE: `SE = sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))`, with `∂κ/∂β` the gradient
+/// of the curvature functional at `β̂` ([`AtomInnerFit::kappa_grad`]) and `H⁻¹`
+/// the inner-fit penalized Hessian inverse ([`AtomInnerFit::penalized_hessian`]).
+/// `ci_normal` is the Wald interval `κ̂ ± z_{0.975} · SE`.
+///
+/// CAVEAT (honest, non-standard): `atom_curvature_bound` is a sup/max functional
+/// of the per-row, per-axis curvatures. At the fitted optimum one argmax row/axis
+/// is active; the delta method linearises around it, so the normal interval is
+/// approximate and breaks down near the active-argmax switch (where κ̂ is
+/// non-differentiable in β). It is a local sensitivity band, not an exact
+/// coverage-valid confidence set.
 #[derive(Debug, Clone)]
 pub struct AtomCurvatureCi {
+    /// The plug-in curvature bound `κ̂ = atom_curvature_bound(β̂)`.
     pub kappa_hat: f64,
-    pub ci: KappaProfileCi,
-    pub flatness_test: FlatnessTest,
+    /// Delta-method standard error `sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))`.
+    pub se: f64,
+    /// Wald normal interval `(κ̂ − z·SE, κ̂ + z·SE)` at 95% (`z = 1.959964`).
+    pub ci_normal: (f64, f64),
 }
 
 /// Any-n-valid structure evidence that one atom's inner smooth `h_k(t)` is
@@ -2919,280 +2896,72 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
     })
 }
 
-/// #1099 Per-atom curvature confidence interval and interior-point flatness
-/// test, profiling the atom's penalized neg-log-evidence along the latent
-/// curvature channel `κ` around the fitted `κ̂` ([`AtomInnerFit::kappa_hat`]).
+/// #1099 Per-atom curvature point estimate `κ̂` and delta-method standard error.
 ///
-/// **The profiled criterion is the exact `M_κ` penalized REML evidence.** The
-/// issue asks for `V_p(κ) =` the atom's inner REML evaluated at varying `κ`,
-/// holding the other hyperparameters fixed — *not* a Wald surrogate. We compute
-/// exactly that. The atom's inner decoder is the Gaussian penalized smooth
-/// `z_i ≈ Φ_k(t_i)ᵀ β` with roughness penalty `S_k` and dispersion `φ`. The
-/// curvature `κ` enters through the constant-curvature geometry that builds the
-/// chart: it rescales the design's *resolution*, and the constant-curvature
-/// smooth holds basis flexibility κ-invariant by normalising the kernel length
-/// by the data-relative geodesic scale `s(κ)`
-/// (`constant_curvature_effective_length_jet`). Moving `κ` therefore re-weights
-/// the roughness penalty by the geodesic-length ratio
+/// `κ̂ = atom_curvature_bound(β̂)` is a sup-norm extrinsic-curvature BOUND read
+/// off the fitted decoder coefficients ([`AtomInnerFit::kappa_hat`]). Nothing in
+/// any optimisation moves κ, so there is no profiled criterion `V_p(κ)` to walk
+/// and no likelihood κ-channel — a profile-likelihood CI would be a category
+/// error. The honest uncertainty is the plug-in delta method:
 ///
 /// ```text
-///   S(κ) = τ(κ) · S_k,   τ(κ) = (s(κ_c) / s(κ))^{2 r},
+///   SE = sqrt( (∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β) ),
 /// ```
 ///
-/// with roughness order `r` ([`AtomInnerFit::penalty_order`]) and `s(κ)` the
-/// captured geodesic-length jet ([`AtomInnerFit::geodesic_length_jet`], a
-/// second-order κ-Taylor about the fitted `κ_c`). At fixed working response and
-/// weights the Gaussian penalized REML negative log-evidence is then the *exact*
-/// 1-D profile
+/// with `∂κ/∂β` ([`AtomInnerFit::kappa_grad`]) the gradient of the curvature
+/// functional at `β̂` (captured at fit time by finite-differencing
+/// `atom_curvature_bound` in each decoder coefficient, where the full second-jet
+/// geometry lives) and `H⁻¹` the inner-fit penalized Hessian inverse. The
+/// reported interval is the Wald band `κ̂ ± z_{0.975}·SE`.
 ///
-/// ```text
-///   β(κ) = H(κ)⁻¹ b,   H(κ) = A + S(κ),   A = ΦᵀWΦ,   b = ΦᵀW z,
-///   RSS(κ) = zᵀW z − 2 β(κ)ᵀ b + β(κ)ᵀ A β(κ),
-///   2 V_p(κ) = (RSS(κ) + β(κ)ᵀ S(κ) β(κ)) / φ + log|H(κ)| − log₊|S(κ)|,
-/// ```
+/// CAVEAT (honest): `atom_curvature_bound` is a sup/max over per-row, per-axis
+/// curvatures; the delta method linearises around whatever argmax row/axis is
+/// active at `β̂`, so the normal interval is approximate and non-standard near
+/// the active-argmax switch (where κ̂ is non-differentiable in β). It is a local
+/// sensitivity band, not an exact coverage-valid set.
 ///
-/// where `log₊|S(κ)| = r₊ log τ(κ) + log₊|S_k|` (`r₊` = rank `S_k`; the `S_k`
-/// constant cancels in every profile *difference* `V_p(κ) − V_p(κ̂)` the CI walk
-/// and LR test consume). Each call re-solves the inner smooth — a genuine
-/// fixed-κ inner re-fit on the captured design, exactly the "small fixed-κ inner
-/// re-solve" the issue calls for. `v_pp = ∂²V_p/∂κ²` at κ̂ is a central finite
-/// difference of this same `V_p` (no analytic κ-channel is exposed on the SAE
-/// snapshot; the FD of the true evidence is the principled second-derivative).
-/// The CI is the exact χ²₁ Wilks crossing of `V_p` via [`profile_ci_walk`]; the
-/// flatness test is the interior-point LR of `V_p(0)` via [`flatness_lr_test`].
-/// The geometric κ̂ supplies the curvature *sign* (sphere vs hyperbolic), which
-/// `s(κ)` carries through `κ` directly.
-///
-/// Returns `None` when the snapshot lacks the geodesic-length jet (degenerate
-/// latent chart — no `M_κ` evidence exists), the Hessian is not SPD, the
-/// dispersion is non-positive, or `v_pp` is non-finite/non-positive (κ̂ pinned at
-/// a boundary of the chart): the genuine prerequisites for a likelihood-based
-/// curvature claim are then absent.
+/// Returns `None` when the inner Hessian is not SPD, the captured gradient is
+/// absent/non-finite, or `κ̂` is non-finite (a degenerate inner fit): the genuine
+/// prerequisites for a delta-method band are then absent.
 fn atom_curvature_ci(fit: &AtomInnerFit) -> Option<AtomCurvatureCi> {
     let m = fit.design.ncols();
-    if m <= 1 || fit.beta.len() != m {
+    if m == 0 || fit.beta.len() != m {
         return None;
     }
-    if fit.penalty.dim() != (m, m)
-        || fit.penalized_hessian.dim() != (m, m)
-        || fit.xtw_z.len() != m
-    {
+    if fit.penalized_hessian.dim() != (m, m) {
         return None;
     }
-    // φ — the fitted Gaussian dispersion the REML deviance is divided by.
-    let phi = if fit.dispersion.is_finite() && fit.dispersion > 0.0 {
-        fit.dispersion
-    } else {
-        return None;
-    };
-    // The geodesic-length jet is the M_κ channel: no jet ⇒ no κ-evidence profile
-    // (degenerate latent chart). This is the genuine architectural prerequisite.
-    let jet = fit.geodesic_length_jet?;
-    if !(jet.s.is_finite() && jet.s > 0.0 && jet.ds.is_finite() && jet.dds.is_finite()) {
+    let kappa_hat = fit.kappa_hat;
+    if !kappa_hat.is_finite() {
         return None;
     }
-    let kappa_centre = jet.kappa_centre;
-    if !kappa_centre.is_finite() {
-        return None;
-    }
-    // Roughness order r drives the penalty rescale exponent 2r. A nullity-0
-    // (mass) penalty (r = 0) gives τ ≡ 1 — κ does not move the evidence, so no
-    // curvature inference is possible from this atom; refuse.
-    let r = fit.penalty_order;
-    if r == 0 {
-        return None;
-    }
-    let two_r = (2 * r) as f64;
-
-    // A = ΦᵀWΦ = H − S_k (the unpenalized data Gram), reconstructed exactly.
-    let a_gram = &fit.penalized_hessian - &fit.penalty;
-    // Effective rank of S_k (r₊) for the log₊|S(κ)| = r₊ log τ + const term.
-    let s_rank = penalty_effective_rank(fit.penalty.view());
-    if s_rank == 0 {
-        return None;
-    }
-    let log_s_rank = s_rank as f64;
-
-    // s(κ) from the captured 2nd-order jet about κ_c: a faithful local model of
-    // the geodesic length, exact to O((κ−κ_c)³). Within the CI/LR walk window
-    // (a few SE around κ̂) this is the realized M_κ scale.
-    let s_of = |k: f64| -> f64 {
-        let dk = k - kappa_centre;
-        jet.s + jet.ds * dk + 0.5 * jet.dds * dk * dk
-    };
-
-    // 2·V_p(κ): the exact Gaussian penalized REML negative log-evidence, modulo
-    // the κ-independent log₊|S_k| constant (cancels in every profile difference).
-    let two_v_p = |k: f64| -> Result<f64, String> {
-        let s_k = s_of(k);
-        if !(s_k.is_finite() && s_k > 0.0) {
-            return Err("geodesic length s(kappa) non-positive in V_p".into());
-        }
-        let tau = (jet.s / s_k).powf(two_r); // (s(κ_c)/s(κ))^{2r}
-        if !(tau.is_finite() && tau > 0.0) {
-            return Err("penalty rescale tau(kappa) non-finite in V_p".into());
-        }
-        // S(κ) = τ S_k, H(κ) = A + τ S_k.
-        let s_kappa = &fit.penalty * tau;
-        let h_kappa = &a_gram + &s_kappa;
-        // β(κ) = H(κ)⁻¹ b, and log|H(κ)|, via one Cholesky.
-        let chol = h_kappa.cholesky(Side::Lower).map_err(|e| {
-            format!("V_p: penalized Hessian not SPD at kappa={k}: {e}")
-        })?;
-        let beta_k = chol.solvevec(&fit.xtw_z);
-        // log|H| = 2 Σ log L_ii from the lower Cholesky factor L's diagonal.
-        let l_diag = chol.diag();
-        let mut log_det_h = 0.0_f64;
-        for &lii in l_diag.iter() {
-            if !(lii.is_finite() && lii > 0.0) {
-                return Err("V_p: non-positive Cholesky pivot".into());
-            }
-            log_det_h += lii.ln();
-        }
-        log_det_h *= 2.0;
-        // RSS(κ) = zᵀWz − 2 βᵀb + βᵀAβ; penalty energy βᵀS(κ)β = τ βᵀS_kβ.
-        let a_beta = a_gram.dot(&beta_k);
-        let rss = fit.ztw_z - 2.0 * beta_k.dot(&fit.xtw_z) + beta_k.dot(&a_beta);
-        let s_beta_k = fit.penalty.dot(&beta_k);
-        let pen_energy = tau * beta_k.dot(&s_beta_k);
-        // log₊|S(κ)| = r₊ log τ + log₊|S_k|  (drop the κ-free log₊|S_k| const).
-        let log_det_s_plus = log_s_rank * tau.ln();
-        let val = (rss + pen_energy) / phi + log_det_h - log_det_s_plus;
-        if val.is_finite() {
-            Ok(val)
-        } else {
-            Err("V_p produced a non-finite value".into())
-        }
-    };
-    // V_p(κ) = ½ · (2 V_p)(κ) — the convention profile_ci_walk consumes (the ½
-    // makes 2[V_p(κ̂)−V_p(κ)] the raw REML deviance drop ~ χ²₁).
-    let v_p = |k: f64| -> Result<f64, String> { two_v_p(k).map(|v| 0.5 * v) };
-
-    // κ̂ = the profile minimiser. The geometric per_atom_kappa_hat is the anchor,
-    // but the M_κ evidence has its OWN argmin; if it differs we report the
-    // profiled optimum (the issue's "better" choice) found by a short local
-    // descent seeded at the geometric κ̂, clamped to the chart window. Document:
-    // we trust the evidence's own minimiser so the CI is centred at its argmin,
-    // statistically coherent with the curvature it walks.
-    let kappa_geom = fit.kappa_hat;
-    if !kappa_geom.is_finite() {
-        return None;
-    }
-    // Chart window: κ must keep s(κ) > 0 within the 2nd-order jet model and stay
-    // where the evidence is finite. Bracket generously around both anchors.
-    let scale = jet.s.abs().max(1.0);
-    let half_window = (kappa_geom.abs() + 4.0 * scale).max(1.0);
-    let kappa_min = kappa_centre - half_window;
-    let kappa_max = kappa_centre + half_window;
-    let kappa_hat = refine_kappa_argmin(&v_p, kappa_geom, kappa_min, kappa_max)?;
-
-    // v_pp = ∂²V_p/∂κ² at κ̂ via central finite difference of the true evidence.
-    // Step scaled to the geodesic curvature window, floored for conditioning.
-    let h_fd = (1e-3 * scale).clamp(1e-6, 1e-1);
-    let v_hat = v_p(kappa_hat).ok()?;
-    let v_plus = v_p(kappa_hat + h_fd).ok()?;
-    let v_minus = v_p(kappa_hat - h_fd).ok()?;
-    let v_pp = (v_plus - 2.0 * v_hat + v_minus) / (h_fd * h_fd);
-    if !(v_pp.is_finite() && v_pp > 0.0) {
-        // κ̂ is at a boundary / the evidence is locally non-convex in κ: the
-        // curvature is not identified, so no likelihood CI is reportable.
+    // ∂κ/∂β, captured at fit time where the curvature functional's full
+    // second-jet geometry lives. Its absence (degenerate chart / infinite bound)
+    // means no delta-method band exists.
+    let grad = fit.kappa_grad.as_ref()?;
+    if grad.len() != m || grad.iter().any(|g| !g.is_finite()) {
         return None;
     }
 
-    let level = 0.95;
-    let ci = profile_ci_walk(&v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, 1e-7).ok()?;
-    // Interior-point flatness LR at κ = 0 — only when κ = 0 is inside the chart
-    // window AND the evidence is evaluable there (the 2nd-order jet keeps
-    // s(0) > 0). When κ = 0 is unreachable (s(0) ≤ 0 / outside the window) the
-    // flatness null is geometrically excluded: report a non-rejecting degenerate
-    // statistic rather than discarding an otherwise-valid CI.
-    let flatness_in_window = kappa_min <= 0.0 && kappa_max >= 0.0;
-    let flatness_test = match (flatness_in_window, flatness_lr_test(&v_p, kappa_hat)) {
-        (true, Ok(t)) => t,
-        _ => FlatnessTest {
-            lr_stat: 0.0,
-            p_value: 1.0,
-            kappa_hat,
-        },
-    };
+    // SE² = gᵀ H⁻¹ g, via one Cholesky solve H x = g (H = ΦᵀWΦ + S_k SPD).
+    let chol = fit.penalized_hessian.cholesky(Side::Lower).ok()?;
+    let h_inv_g = chol.solvevec(grad);
+    let var = grad.dot(&h_inv_g);
+    if !(var.is_finite() && var >= 0.0) {
+        return None;
+    }
+    let se = var.sqrt();
+
+    // Wald normal band κ̂ ± z_{0.975}·SE. z is the two-sided 95% normal quantile.
+    const Z_95: f64 = 1.959_963_984_540_054;
+    let half = Z_95 * se;
+    let ci_normal = (kappa_hat - half, kappa_hat + half);
+
     Some(AtomCurvatureCi {
         kappa_hat,
-        ci,
-        flatness_test,
+        se,
+        ci_normal,
     })
-}
-
-/// Effective rank of a symmetric PSD penalty Gram `S` — the number of strictly
-/// positive eigenvalues above a relative tolerance, i.e. `r₊` in
-/// `log₊|S| = Σ_{λ>0} log λ`. Used for the κ-rescale of the REML log-evidence's
-/// `log₊|S(κ)| = r₊ log τ(κ) + log₊|S|` term.
-fn penalty_effective_rank(s: ArrayView2<'_, f64>) -> usize {
-    let (eigenvalues, _vecs) = match s.eigh(Side::Lower) {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-    let max_ev = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    if !(max_ev > 0.0) {
-        return 0;
-    }
-    let tol = 1e-10 * max_ev;
-    eigenvalues.iter().filter(|&&v| v > tol).count()
-}
-
-/// Local minimiser of the profiled curvature evidence `V_p`, seeded at the
-/// geometric κ̂ and confined to the chart window `[lo, hi]`. A golden-section
-/// search after a coarse grid bracket — the M_κ evidence is smooth and unimodal
-/// in κ within the window, so this returns the profiled argmin the CI centres on.
-/// Returns `None` if every probe is non-finite.
-fn refine_kappa_argmin<F>(v_p: &F, seed: f64, lo: f64, hi: f64) -> Option<f64>
-where
-    F: Fn(f64) -> Result<f64, String>,
-{
-    let seed = seed.clamp(lo, hi);
-    // Coarse grid (including the seed) to bracket the basin robustly.
-    const GRID: usize = 24;
-    let mut best_k = seed;
-    let mut best_v = v_p(seed).ok()?;
-    let mut grid_pts: Vec<f64> = (0..=GRID)
-        .map(|i| lo + (hi - lo) * (i as f64) / (GRID as f64))
-        .collect();
-    grid_pts.push(seed);
-    for &k in &grid_pts {
-        if let Ok(v) = v_p(k) {
-            if v < best_v {
-                best_v = v;
-                best_k = k;
-            }
-        }
-    }
-    // Golden-section refine in the cell around best_k.
-    let cell = (hi - lo) / (GRID as f64);
-    let mut a = (best_k - cell).max(lo);
-    let mut b = (best_k + cell).min(hi);
-    const GR: f64 = 0.618_033_988_749_894_8;
-    let mut c = b - GR * (b - a);
-    let mut d = a + GR * (b - a);
-    let mut fc = v_p(c).ok()?;
-    let mut fd = v_p(d).ok()?;
-    for _ in 0..60 {
-        if (b - a).abs() < 1e-9 {
-            break;
-        }
-        if fc < fd {
-            b = d;
-            d = c;
-            fd = fc;
-            c = b - GR * (b - a);
-            fc = v_p(c).ok()?;
-        } else {
-            a = c;
-            c = d;
-            fc = fd;
-            d = a + GR * (b - a);
-            fd = v_p(d).ok()?;
-        }
-    }
-    Some(0.5 * (a + b))
 }
 
 /// Assemble the three post-PIRLS inference reports for every atom, reusing the
@@ -3201,12 +2970,10 @@ where
 /// * #1097 Riesz functionals and #1103 split-LRT smooth-structure e-value are computed from
 ///   the captured inner-decoder smooth (design, penalized Hessian, row scores,
 ///   roughness Gram) — they need only the fixed fitted snapshot.
-/// * #1099 curvature CI profiles the atom's penalized neg-log-evidence along the
-///   extrinsic curvature channel `κ`. The profiled oracle `V_p(κ)` is the
-///   second-order Laplace profile built from the captured inner-decoder smooth's
-///   curvature functional and its delta-method SE through the penalized Hessian
-///   ([`atom_curvature_ci`]) — a fixed-snapshot computation, so it is available
-///   here whenever the atom carries an [`AtomInnerFit`].
+/// * #1099 curvature CI reports the plug-in curvature bound `κ̂` and its
+///   delta-method SE `sqrt((∂κ/∂β)ᵀ H⁻¹ (∂κ/∂β))` through the inner-fit penalized
+///   Hessian ([`atom_curvature_ci`]) — a fixed-snapshot computation, available
+///   whenever the atom carries an [`AtomInnerFit`] with a captured `kappa_grad`.
 pub(crate) fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
     model
         .atoms
@@ -3508,17 +3275,6 @@ mod tests {
         let peak_design_row = design.row(peak_slot).to_owned();
         let mode_design_row = design.row(0).to_owned();
 
-        // REML cross terms for the #1099 κ-profile (z = the fitted curve here, so
-        // residuals are zero): b = ΦᵀW z, zᵀW z.
-        let mut xtw_z = A1::<f64>::zeros(m);
-        let mut ztw_z = 0.0_f64;
-        for i in 0..n {
-            let z_i = design.row(i).dot(&beta);
-            for col in 0..m {
-                xtw_z[col] += weights[i] * z_i * design[[i, col]];
-            }
-            ztw_z += weights[i] * z_i * z_i;
-        }
         let fit = AtomInnerFit {
             design: design.clone(),
             derivative_design: derivative_design.clone(),
@@ -3531,10 +3287,7 @@ mod tests {
             peak_design_row: peak_design_row.clone(),
             mode_design_row: mode_design_row.clone(),
             kappa_hat: 0.0,
-            geodesic_length_jet: None,
-            penalty_order: 1,
-            xtw_z,
-            ztw_z,
+            kappa_grad: None,
         };
 
         let report = atom_functional_report(&fit);

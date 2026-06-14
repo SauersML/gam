@@ -2955,6 +2955,26 @@ fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, 
             )
         })?
         .map_err(|e| format!("atom_curvature_bound: atom {atom_idx} second jet failed: {e}"))?;
+    atom_curvature_bound_with_decoder(
+        atom,
+        atom_idx,
+        second.view(),
+        atom.decoder_coefficients.view(),
+    )
+}
+
+/// The sup-norm extrinsic-curvature bound `atom_curvature_bound` as an explicit
+/// function of the decoder coefficient matrix `decoder` (shape `(M_k, p)`) and
+/// the precomputed second jet, so the #1099 delta-method gradient `∂κ/∂β` can be
+/// formed by finite-differencing it in the captured channel's coefficients
+/// without mutating the term. With `decoder = atom.decoder_coefficients` this is
+/// exactly `atom_curvature_bound`.
+fn atom_curvature_bound_with_decoder(
+    atom: &SaeManifoldAtom,
+    atom_idx: usize,
+    second: ArrayView4<'_, f64>,
+    decoder: ArrayView2<'_, f64>,
+) -> Result<f64, String> {
     let n = atom.n_obs();
     let m = atom.basis_size();
     let d = atom.latent_dim;
@@ -2965,15 +2985,27 @@ fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, 
             second.dim()
         ));
     }
+    if decoder.dim() != (m, p) {
+        return Err(format!(
+            "atom_curvature_bound: atom {atom_idx} decoder shape {:?} must be ({m}, {p})",
+            decoder.dim()
+        ));
+    }
     let mut max_kappa = 0.0_f64;
     let mut tangent = Array2::<f64>::zeros((p, d));
     let mut second_vec = vec![0.0_f64; p];
     for row in 0..n {
-        for axis in 0..d {
-            let mut col = vec![0.0_f64; p];
-            atom.fill_decoded_derivative_row(row, axis, &mut col);
-            for out in 0..p {
-                tangent[[out, axis]] = col[out];
+        // Tangent J(t) = Φ'(t) B on this row, formed from the explicit decoder.
+        tangent.fill(0.0);
+        for basis_col in 0..m {
+            for axis in 0..d {
+                let dphi = atom.basis_jacobian[[row, basis_col, axis]];
+                if dphi == 0.0 {
+                    continue;
+                }
+                for out in 0..p {
+                    tangent[[out, axis]] += dphi * decoder[[basis_col, out]];
+                }
             }
         }
         let tangent_rank = tangent_frame_rank(tangent.view())?;
@@ -2988,7 +3020,7 @@ fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, 
                         continue;
                     }
                     for out in 0..p {
-                        second_vec[out] += h * atom.decoder_coefficients[[basis_col, out]];
+                        second_vec[out] += h * decoder[[basis_col, out]];
                     }
                 }
                 let perp_norm = projected_perp_norm(&second_vec, q.view());
@@ -3003,71 +3035,51 @@ fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, 
     Ok(max_kappa)
 }
 
-/// The constant-curvature geodesic-length jet `(s, s′, s″)` of one atom's latent
-/// chart at curvature `kappa`, captured for the #1099 curvature-evidence profile.
-///
-/// `s(κ)` is the mean pairwise GEODESIC distance between the atom's *active*
-/// latent coordinates on the [`ConstantCurvature`] chart of the atom's latent
-/// dimension, evaluated exactly (with its first/second κ-derivatives) through
-/// [`distance_kappa_jet`]. This is the same data-relative geodesic scale the
-/// constant-curvature smooth normalises its kernel length by to hold basis
-/// flexibility κ-invariant — so as κ moves, the atom's roughness penalty must
-/// rescale by `(s(κ_centre)/s(κ))^{2 r}` (see
-/// [`crate::sae_identifiability::AtomInnerFit::geodesic_length_jet`]).
-///
-/// Returns `None` when the chart is degenerate — fewer than two active rows, a
-/// non-positive mean distance (all coordinates coincident), or any non-finite
-/// jet — in which case no κ-evidence profile exists and the curvature CI is
-/// reported `None`.
-fn atom_latent_geodesic_length_jet(
-    term: &SaeManifoldTerm,
+/// The #1099 delta-method gradient `∂κ/∂β ∈ ℝ^{M_k}` of the curvature bound with
+/// respect to the captured decoder channel `channel`'s coefficients, by central
+/// finite differences of [`atom_curvature_bound_with_decoder`]. Returns `None`
+/// when the bound is non-finite (infinite curvature / degenerate tangent at the
+/// base point) so no usable delta-method band exists.
+fn atom_curvature_bound_grad(
+    atom: &SaeManifoldAtom,
     atom_idx: usize,
-    active: &[usize],
-    kappa: f64,
-) -> Option<crate::sae_identifiability::GeodesicLengthJet> {
-    use crate::geometry::constant_curvature::{ConstantCurvature, distance_kappa_jet};
-    if !kappa.is_finite() || active.len() < 2 {
+    second: ArrayView4<'_, f64>,
+    channel: usize,
+) -> Option<Array1<f64>> {
+    let m = atom.basis_size();
+    let base = atom
+        .decoder_coefficients
+        .to_owned();
+    let kappa0 = atom_curvature_bound_with_decoder(atom, atom_idx, second, base.view()).ok()?;
+    if !kappa0.is_finite() {
         return None;
     }
-    let coords = term.assignment.coords[atom_idx].as_matrix();
-    let d = coords.ncols();
-    if d == 0 {
-        return None;
-    }
-    let manifold = ConstantCurvature::new(d, kappa);
-    let mut s = 0.0_f64;
-    let mut s1 = 0.0_f64;
-    let mut s2 = 0.0_f64;
-    let mut cnt = 0.0_f64;
-    for (ii, &ri) in active.iter().enumerate() {
-        for &rj in active.iter().skip(ii + 1) {
-            let xi = coords.row(ri);
-            let xj = coords.row(rj);
-            let (dist, d1, d2) = distance_kappa_jet(&manifold, xi, xj).ok()?;
-            if !(dist.is_finite() && d1.is_finite() && d2.is_finite()) {
-                return None;
-            }
-            s += dist;
-            s1 += d1;
-            s2 += d2;
-            cnt += 1.0;
+    // FD step scaled to the channel's coefficient magnitude, floored for
+    // conditioning. The bound is positively homogeneous of degree 1 in β, so a
+    // relative step keeps the perturbation in the locally-linear regime.
+    let chan_scale = (0..m)
+        .map(|r| base[[r, channel]].abs())
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let h = 1e-6 * chan_scale;
+    let mut grad = Array1::<f64>::zeros(m);
+    let mut perturbed = base.clone();
+    for r in 0..m {
+        let orig = base[[r, channel]];
+        perturbed[[r, channel]] = orig + h;
+        let kp = atom_curvature_bound_with_decoder(atom, atom_idx, second, perturbed.view()).ok()?;
+        perturbed[[r, channel]] = orig - h;
+        let km = atom_curvature_bound_with_decoder(atom, atom_idx, second, perturbed.view()).ok()?;
+        perturbed[[r, channel]] = orig;
+        if !(kp.is_finite() && km.is_finite()) {
+            return None;
         }
+        grad[r] = (kp - km) / (2.0 * h);
     }
-    if !(cnt > 0.0) {
+    if grad.iter().any(|g| !g.is_finite()) {
         return None;
     }
-    let s = s / cnt;
-    let ds = s1 / cnt;
-    let dds = s2 / cnt;
-    if !(s.is_finite() && s > 0.0 && ds.is_finite() && dds.is_finite()) {
-        return None;
-    }
-    Some(crate::sae_identifiability::GeodesicLengthJet {
-        kappa_centre: kappa,
-        s,
-        ds,
-        dds,
-    })
+    Some(grad)
 }
 
 fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, Array2<f64>), String> {
