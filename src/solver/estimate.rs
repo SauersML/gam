@@ -3137,6 +3137,44 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         }
     }
 
+    /// Build a certified frozen-weight GLM ψ-Gram tensor (#1111 / #1033
+    /// mechanism (c)) for the single design-moving hyperparameter ψ.
+    ///
+    /// Mirrors [`Self::build_and_set_psi_gram_tensor`] but for the GLM
+    /// design-moving lane: the working weight `w` and working response `z` are
+    /// FROZEN at the warm working point, and the tensor wraps the weighted
+    /// design `A(ψ) = diag(√w)·X_fit(ψ)`. Crucially `eval_raw_design` is threaded
+    /// through THIS evaluator's parametric column conditioning before the tensor
+    /// sees it, so the assembled frozen-`W` Gram `XᵀWX(ψ)` lives in the SAME
+    /// conditioned `x_fit` frame the inner PIRLS solve forms its Gram in — the
+    /// same frame-correctness contract the Gaussian lane relies on. Without this
+    /// the tensor would be assembled in the raw user-column frame and silently
+    /// mismatch any inner consumer.
+    ///
+    /// Returns the certified tensor (caller owns it, e.g. to re-use the
+    /// per-trial weight-drift guard), or `None` when no Chebyshev rung certifies
+    /// — the caller then keeps the exact per-trial PIRLS rebuild.
+    pub(crate) fn build_frozen_glm_gram_tensor(
+        &self,
+        mut eval_raw_design: impl FnMut(f64) -> Result<DesignMatrix, String>,
+        frozen_w: ArrayView1<'_, f64>,
+        working_z: ArrayView1<'_, f64>,
+        psi_lo: f64,
+        psi_hi: f64,
+    ) -> Option<crate::solver::glm_sufficient_lane::FrozenWeightGramTensor> {
+        let conditioning = self.conditioning.clone();
+        crate::solver::glm_sufficient_lane::FrozenWeightGramTensor::build(
+            |psi| {
+                let raw = eval_raw_design(psi)?;
+                Ok(conditioning.apply_to_design(&raw).to_dense())
+            },
+            frozen_w,
+            working_z,
+            psi_lo,
+            psi_hi,
+        )
+    }
+
     /// True when a certified ψ-Gram tensor is installed AND `psi` lies inside
     /// its certified GRADIENT sub-window — i.e. the n-free k-space ψ-derivatives
     /// `(∂G/∂ψ, ∂b/∂ψ)` will serve the Gaussian gradient HyperCoord, so the

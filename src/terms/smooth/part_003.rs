@@ -2159,12 +2159,21 @@ impl<'d> SpatialJointContext<'d> {
         };
         let theta_probe_base = theta.clone();
         let rho_dim = self.rho_dim;
-        let tensor = crate::solver::glm_sufficient_lane::FrozenWeightGramTensor::build(
+        // Build through the evaluator so the frozen-W Gram is assembled in the
+        // SAME conditioned `x_fit` column frame the inner PIRLS solve uses
+        // (the evaluator owns the ψ-invariant parametric conditioning). Disjoint
+        // mutable borrows of `cache` (in the realizer) and `evaluator` (the
+        // build host) — both fields of `self` — exactly as the Gaussian
+        // `build_and_set_psi_gram_tensor` site does.
+        let Self {
+            cache, evaluator, ..
+        } = self;
+        let tensor = evaluator.build_frozen_glm_gram_tensor(
             |psi| {
                 let mut theta_probe = theta_probe_base.clone();
                 theta_probe[rho_dim] = psi;
-                self.cache.ensure_theta(&theta_probe)?;
-                Ok(self.cache.design().design.to_dense())
+                cache.ensure_theta(&theta_probe)?;
+                Ok(cache.design().design.clone())
             },
             frozen_w.view(),
             working_z.view(),
