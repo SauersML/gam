@@ -19,10 +19,8 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::{
-    BernoulliMarginalSlopeFitResult, FitConfig, FitResult, encode_recordswith_inferred_schema,
-    fit_from_formula,
-};
+use gam::families::bms::BernoulliMarginalSlopeFitResult;
+use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 use ndarray::Array2;
 
 const N_TRAIN: usize = 1_500;
@@ -132,8 +130,8 @@ fn fit_bms(body: &str, ds: &gam::data::EncodedDataset) -> BernoulliMarginalSlope
     let result = fit_from_formula(&formula, ds, &config)
         .unwrap_or_else(|e| panic!("gam bms fit '{formula}': {e}"));
     match result {
-        FitResult::BernoulliMarginalSlope(fit) => *fit,
-        other => panic!("expected BernoulliMarginalSlope fit for '{body}', got {other:?}"),
+        FitResult::BernoulliMarginalSlope(fit) => fit,
+        _ => panic!("expected BernoulliMarginalSlope fit for '{body}'"),
     }
 }
 

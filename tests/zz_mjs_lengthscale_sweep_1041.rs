@@ -10,10 +10,8 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::{
-    BernoulliMarginalSlopeFitResult, FitConfig, FitResult, encode_recordswith_inferred_schema,
-    fit_from_formula,
-};
+use gam::families::bms::BernoulliMarginalSlopeFitResult;
+use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 use ndarray::Array2;
 
 const N_TRAIN: usize = 1_500;
@@ -105,7 +103,7 @@ fn fit_bms(body: &str, ds: &gam::data::EncodedDataset) -> Option<BernoulliMargin
         ..FitConfig::default()
     };
     match fit_from_formula(&formula, ds, &config) {
-        Ok(FitResult::BernoulliMarginalSlope(fit)) => Some(*fit),
+        Ok(FitResult::BernoulliMarginalSlope(fit)) => Some(fit),
         Ok(_) => None,
         Err(e) => {
             eprintln!("[mjs-ell-sweep] fit '{body}' ERROR: {e}");
