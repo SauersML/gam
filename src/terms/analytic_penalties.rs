@@ -112,6 +112,55 @@
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 //! | BlockOrthogonality | ext-coord (latent t) | 0 or 1 (log μ_block_orth) |
 
-// Split from the original oversized module; keep included in order.
-include!("analytic_penalties_core_traits.rs");
-include!("analytic_penalties_decoder_orthogonality_and_tests.rs");
+
+// Re-exported so every concern submodule can pull the shared external imports
+// through `use super::*;` without re-listing them.
+pub(crate) use faer::Side;
+pub(crate) use ndarray::{
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, CowArray, Ix2, Ix3,
+};
+pub(crate) use std::sync::{Arc, RwLock};
+
+pub(crate) use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
+pub(crate) use crate::linalg::lanczos::{
+    SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
+};
+pub(crate) use crate::terms::basis::{
+    BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
+};
+pub(crate) use crate::terms::penalties::PenaltyManifest;
+pub(crate) use crate::terms::penalty_op::PenaltyOp;
+pub(crate) use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
+pub(crate) use crate::terms::sheaf::SheafConsistencyPenalty;
+pub(crate) use crate::terms::smooth::BlockwisePenalty;
+
+mod ard;
+mod block_sparsity;
+mod common;
+mod ibp;
+mod isometry;
+mod nested_prefix;
+mod nuclear_norm;
+mod orthogonality;
+mod registry;
+mod row_precision;
+mod scad_mcp;
+mod sparsity;
+mod total_variation;
+
+pub use ard::*;
+pub use block_sparsity::*;
+pub use common::*;
+pub use ibp::*;
+pub use isometry::*;
+pub use nested_prefix::*;
+pub use nuclear_norm::*;
+pub use orthogonality::*;
+pub use registry::*;
+pub use row_precision::*;
+pub use scad_mcp::*;
+pub use sparsity::*;
+pub use total_variation::*;
+
+#[cfg(test)]
+mod tests;
