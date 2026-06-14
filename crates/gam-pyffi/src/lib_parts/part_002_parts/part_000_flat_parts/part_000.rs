@@ -1440,6 +1440,7 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         "sphere" => SaeAtomBasisKind::Sphere,
         "torus" => SaeAtomBasisKind::Torus,
         "euclidean" | "euclidean_patch" => SaeAtomBasisKind::EuclideanPatch,
+        "poincare" | "poincare_patch" | "hyperbolic" => SaeAtomBasisKind::Poincare,
         other => SaeAtomBasisKind::Precomputed(other.to_string()),
     }
 }
@@ -1639,10 +1640,9 @@ fn build_sae_basis_evaluators(
                     sae_duchon_atom_m(centers.ncols()),
                 )?)
             }
-            SaeAtomBasisKind::EuclideanPatch => Arc::new(EuclideanPatchEvaluator::new(
-                d,
-                SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
-            )?),
+            SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => Arc::new(
+                EuclideanPatchEvaluator::new(d, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?,
+            ),
             SaeAtomBasisKind::Precomputed(label) => {
                 return Err(format!(
                     "build_sae_basis_evaluators: atom {k} basis {label:?} is precomputed and has no \
@@ -4378,7 +4378,9 @@ fn sae_build_padded_basis_stacks(
                     .slice_mut(s![atom_idx, 0..m, 0..m])
                     .assign(&penalty);
             }
-            SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch => {
+            SaeAtomBasisKind::Duchon
+            | SaeAtomBasisKind::EuclideanPatch
+            | SaeAtomBasisKind::Poincare => {
                 let centers = plan
                     .duchon_centers
                     .as_ref()
@@ -4394,7 +4396,7 @@ fn sae_build_padded_basis_stacks(
                     ));
                 }
                 let (phi, jet, penalty) = match plan.kind {
-                    SaeAtomBasisKind::EuclideanPatch => {
+                    SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
                         sae_build_euclidean_atom(coords.view(), centers.view())?
                     }
                     _ => sae_build_duchon_atom(coords.view(), centers.view())?,
@@ -4552,7 +4554,9 @@ fn sae_build_atom_plans(
                     basis_size,
                 });
             }
-            SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch => {
+            SaeAtomBasisKind::Duchon
+            | SaeAtomBasisKind::EuclideanPatch
+            | SaeAtomBasisKind::Poincare => {
                 // A Duchon atom's curvature penalty degrades (and ultimately
                 // fails its D2 collocation) when the center count does not
                 // exceed the polynomial nullspace dimension of its resolved
@@ -4583,7 +4587,7 @@ fn sae_build_atom_plans(
                 // uses the thin-plate kernel.
                 let probe_pts = Array2::<f64>::zeros((1, d));
                 let (phi, _jet, _penalty) = match kind {
-                    SaeAtomBasisKind::EuclideanPatch => {
+                    SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
                         sae_build_euclidean_atom(probe_pts.view(), centers.view())?
                     }
                     _ => sae_build_duchon_atom(probe_pts.view(), centers.view())?,
@@ -4970,6 +4974,7 @@ fn sae_manifold_fit_minimal<'py>(
             SaeAtomBasisKind::Sphere => "sphere",
             SaeAtomBasisKind::Torus => "torus",
             SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
+            SaeAtomBasisKind::Poincare => "poincare",
             SaeAtomBasisKind::Precomputed(_) => "precomputed",
         };
         entry.set_item("kind", kind_name)?;
