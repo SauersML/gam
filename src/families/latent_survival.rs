@@ -666,6 +666,28 @@ pub fn fit_latent_survival_terms(
                 .collect();
             eprintln!("[#1108 WARM] seeded interval blocks: {}", seeded.join(" "));
         }
+        // [#1108 DIAG] remove after diagnosis. ISOLATION PROBE: run the INTERVAL
+        // family's inner solve at the seed lambda FROM the warm beta. This
+        // separates "does the interval inner joint-Newton converge in-basin"
+        // (this probe) from "does the outer rho-seed startup validation work"
+        // (the real fit_custom_family below). If this CONVERGES, the warm beta is
+        // in-basin and the failure is in the outer rho machinery, not the basin.
+        // If it FAILS, the warm beta is NOT in-basin / the interval inner solve
+        // diverges even warm-started, and the error text tells us why.
+        let interval_inner_probe = fit_custom_family_fixed_log_lambdas(
+            &family, &blocks, options, None, 0, None, false,
+        );
+        match &interval_inner_probe {
+            Ok(p) => {
+                let probe_sd = family.latent_sd(&p.block_states);
+                eprintln!(
+                    "[#1108 PROBE] interval inner solve from warm beta CONVERGED, sigma={probe_sd:?}"
+                );
+            }
+            Err(e) => {
+                eprintln!("[#1108 PROBE] interval inner solve from warm beta FAILED: {e}");
+            }
+        }
     }
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| {
         // [#1108 DIAG] remove after diagnosis.

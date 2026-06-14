@@ -1,6 +1,6 @@
+//! Unit tests for the custom-family blockwise carrier. Declared from `mod.rs`
+//! as `#[cfg(test)] mod tests;`; reaches the FD helper via `super::test_support`.
 
-#[cfg(test)]
-mod tests {
     use super::*;
 
     #[derive(Clone)]
@@ -8372,4 +8372,3 @@ mod tests {
             "edf at λ=1 must be ≈0.6111 (true), not 0.7000 (Rayleigh-quotient bug): got {edf_at_one}",
         );
     }
-}

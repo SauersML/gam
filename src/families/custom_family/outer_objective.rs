@@ -1,5 +1,14 @@
+//! The outer (ρ) objective: the `inner_blockwise_fit` driver, the joint
+//! derivative providers (borrowed / owned / Jeffreys-aware), the ext-coord bundle
+//! and scaled hyper-operators, inner-assembly construction, the unified joint
+//! cost/gradient/EFS evaluators, and the outer-objective entry points
+//! (`outerobjectivegradienthessian_internal`, `outerobjectiveefs`). Also the
+//! blockwise-fit assembly-from-parts, warm-start carriers, outer-Hessian operator
+//! wrappers, and labeled-lambda layout helpers shared with the outer engine.
 
-fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
+use super::*;
+
+pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     block_log_lambdas: &[Array1<f64>],
@@ -5363,6 +5372,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 }
 
 
+
 /// Borrowed derivative provider for joint models that wraps closures with
 /// non-`'static` lifetimes.
 ///
@@ -5375,7 +5385,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// The unified evaluator passes `v_k = H⁻¹(A_k β̂)` to `hessian_derivative_correction`.
 /// By the implicit function theorem, `dβ̂/dρ_k = −v_k`. The stored `compute_dh`
 /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
-struct BorrowedJointDerivProvider<'a> {
+pub(crate) struct BorrowedJointDerivProvider<'a> {
     compute_dh: &'a DriftDerivFn<'a>,
     compute_dh_many: Option<&'a DriftDerivManyFn<'a>>,
     compute_d2h: &'a DriftSecondDerivFn<'a>,
@@ -5393,12 +5403,13 @@ struct BorrowedJointDerivProvider<'a> {
 }
 
 
+
 /// Shared `(term1, term2)` second-derivative correction assembly used by both
 /// the borrowed and owned joint derivative providers. `compute_dh` supplies the
 /// drift derivative `D_β H[u_kl]` (term1) and `compute_d2h` the mixed second
 /// derivative `D²_β H[−v_l, −v_k]` (term2); the two are fused into a single
 /// `CompositeHyperOperator`. Returns `None` as soon as either term is absent.
-fn joint_second_derivative_correction_result(
+pub(crate) fn joint_second_derivative_correction_result(
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     v_k: &Array1<f64>,
@@ -5420,6 +5431,7 @@ fn joint_second_derivative_correction_result(
     };
     Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
 }
+
 
 
 impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
@@ -5537,7 +5549,8 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 }
 
 
-struct OwnedJointDerivProvider {
+
+pub(crate) struct OwnedJointDerivProvider {
     compute_dh: Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     compute_dh_many: Option<
         Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync>,
@@ -5559,6 +5572,7 @@ struct OwnedJointDerivProvider {
     family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
+
 
 
 impl HessianDerivativeProvider for OwnedJointDerivProvider {
@@ -5688,6 +5702,7 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 }
 
 
+
 /// Drift closure producing the Tier-B Jeffreys-curvature drift
 /// `D_β H_Φ[δβ]` for a mode-response direction `δβ = dβ̂/dρ_k`.
 ///
@@ -5697,8 +5712,9 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 /// convention and the inner `compute_dh` it composes with. Returns `None` when
 /// the Jeffreys term is gated out or the family lacks the exact derivatives, so
 /// the wrapper falls back to the inner provider's drift unchanged.
-type JeffreysHphiDriftFn =
+pub(crate) type JeffreysHphiDriftFn =
     Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>;
+
 
 
 /// Jeffreys-`H_Φ`-aware joint derivative provider.
@@ -5716,11 +5732,12 @@ type JeffreysHphiDriftFn =
 /// SIGN. The trait passes `v_k = H⁻¹(A_kβ̂)`; the mode response is `δβ = −v_k`.
 /// We negate before invoking the drift closure, so `corr = + D_β H_Φ[δβ]` is
 /// added on top of the inner provider's already-correct likelihood drift.
-struct JeffreysHphiAwareJointDerivatives<'a> {
+pub(crate) struct JeffreysHphiAwareJointDerivatives<'a> {
     inner: Box<dyn HessianDerivativeProvider + 'a>,
     drift: JeffreysHphiDriftFn,
     p: usize,
 }
+
 
 
 impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
@@ -5738,6 +5755,7 @@ impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
         (self.drift)(&delta)
     }
 }
+
 
 
 impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
@@ -5890,9 +5908,10 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
 }
 
 
+
 /// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
 /// to an `InnerSolution` before calling the unified evaluator.
-struct ExtCoordBundle {
+pub(crate) struct ExtCoordBundle {
     coords: Vec<HyperCoord>,
     ext_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     rho_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
@@ -5907,10 +5926,12 @@ struct ExtCoordBundle {
 }
 
 
-struct ScaledHyperOperator {
+
+pub(crate) struct ScaledHyperOperator {
     inner: Arc<dyn HyperOperator>,
     scale: f64,
 }
+
 
 
 impl HyperOperator for ScaledHyperOperator {
@@ -5936,7 +5957,8 @@ impl HyperOperator for ScaledHyperOperator {
 }
 
 
-fn scale_hypercoord_drift(mut drift: HyperCoordDrift, scale: f64) -> HyperCoordDrift {
+
+pub(crate) fn scale_hypercoord_drift(mut drift: HyperCoordDrift, scale: f64) -> HyperCoordDrift {
     if scale == 1.0 {
         return drift;
     }
@@ -5956,7 +5978,8 @@ fn scale_hypercoord_drift(mut drift: HyperCoordDrift, scale: f64) -> HyperCoordD
 }
 
 
-fn scale_hypercoord(mut coord: HyperCoord, scale: f64) -> HyperCoord {
+
+pub(crate) fn scale_hypercoord(mut coord: HyperCoord, scale: f64) -> HyperCoord {
     if scale == 1.0 {
         return coord;
     }
@@ -5975,7 +5998,8 @@ fn scale_hypercoord(mut coord: HyperCoord, scale: f64) -> HyperCoord {
 }
 
 
-fn scale_hypercoord_pair(mut pair: HyperCoordPair, scale: f64) -> HyperCoordPair {
+
+pub(crate) fn scale_hypercoord_pair(mut pair: HyperCoordPair, scale: f64) -> HyperCoordPair {
     if scale == 1.0 {
         return pair;
     }
@@ -5991,7 +6015,8 @@ fn scale_hypercoord_pair(mut pair: HyperCoordPair, scale: f64) -> HyperCoordPair
 }
 
 
-fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> DriftDerivResult {
+
+pub(crate) fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> DriftDerivResult {
     if scale == 1.0 {
         return result;
     }
@@ -6008,6 +6033,7 @@ fn scale_drift_deriv_result(result: DriftDerivResult, scale: f64) -> DriftDerivR
         }
     }
 }
+
 
 
 impl ExtCoordBundle {
@@ -6065,9 +6091,10 @@ impl ExtCoordBundle {
 }
 
 
+
 /// Build the canonical unified REML/LAML assembly for a custom-family outer
 /// evaluation.
-fn build_custom_family_inner_assembly<'dp>(
+pub(crate) fn build_custom_family_inner_assembly<'dp>(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
     per_block: &[Array1<f64>],
@@ -6187,10 +6214,12 @@ fn build_custom_family_inner_assembly<'dp>(
 }
 
 
-struct FirstOrderTraceSkipOperator {
+
+pub(crate) struct FirstOrderTraceSkipOperator {
     inner: Arc<dyn HessianOperator>,
     remaining_first_order_traces: AtomicUsize,
 }
+
 
 
 impl FirstOrderTraceSkipOperator {
@@ -6221,6 +6250,7 @@ impl FirstOrderTraceSkipOperator {
         false
     }
 }
+
 
 
 impl HessianOperator for FirstOrderTraceSkipOperator {
@@ -6451,11 +6481,12 @@ impl HessianOperator for FirstOrderTraceSkipOperator {
 }
 
 
+
 /// Build an `InnerSolution` from joint Hessian data and call the unified evaluator.
 ///
 /// Bridge between the custom family's joint Hessian infrastructure and the
 /// unified REML/LAML evaluator, routed through the canonical assembly module.
-fn unified_joint_cost_gradient(
+pub(crate) fn unified_joint_cost_gradient(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
     per_block: &[Array1<f64>],
@@ -6534,7 +6565,8 @@ fn unified_joint_cost_gradient(
 }
 
 
-fn unified_joint_efs_eval(
+
+pub(crate) fn unified_joint_efs_eval(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
     per_block: &[Array1<f64>],
@@ -6654,136 +6686,6 @@ fn unified_joint_efs_eval(
 }
 
 
-fn joint_penalty_subspace_trace_parts(
-    h_joint_unpen: &JointHessianSource,
-    ranges: &[(usize, usize)],
-    s_lambdas: &[Array2<f64>],
-    total: usize,
-    hessian_diagonal_ridge: f64,
-    // Pre-scaled outer-REML Jeffreys curvature (already multiplied by
-    // `rho_curvature_scale` to live in the same scaled space as `s_lambdas`).
-    // Folded into `M = H + Sλ (+ H_Φ)` so the projected logdet AND its trace
-    // kernel `(H+Sλ+H_Φ)⁺` match the Jeffreys-augmented operator the LAML score
-    // runs on. `None` ⇒ byte-identical released projected logdet.
-    scaled_jeffreys_hphi: Option<&Array2<f64>>,
-) -> Result<(f64, Option<PenaltySubspaceTrace>), String> {
-    if total == 0 {
-        return Ok((0.0, None));
-    }
-
-    // Structural-null gate: with no positive penalty eigenvalue there is no
-    // `log|Sλ|₊` term in the LAML ratio, hence no Hessian-side correction to
-    // pair with it — the caller keeps the operator's own logdet untouched.
-    // (The kernel itself no longer uses the Sλ eigenvectors: since #901 it is
-    // the full spectral `M⁺`, built from M's own eigendecomposition below.)
-    let mut s_lambda = Array2::<f64>::zeros((total, total));
-    add_joint_penalty_to_matrix(&mut s_lambda, ranges, s_lambdas, 0.0, None);
-    let s_evals = s_lambda
-        .eigh(Side::Lower)
-        .map_err(|e| format!("joint penalty subspace eigendecomposition failed: {e}"))?
-        .0;
-    let s_threshold = positive_eigenvalue_threshold(s_evals.as_slice().unwrap());
-    let rank = (0..total).filter(|&j| s_evals[j] > s_threshold).count();
-    if rank == 0 {
-        return Ok((0.0, None));
-    }
-
-    // ── REML log|H + Sλ|₊ and its trace kernel over the FULL identifiable
-    //    subspace range(H + Sλ) ──────────────────────────────────────────────
-    //
-    // The REML penalty-determinant term is `½ log|H + Sλ|₊`, and its ρ-gradient
-    // is the trace `½ tr((H + Sλ)⁻¹ ∂Sλ/∂ρ)`. BOTH must be taken over
-    // range(H + Sλ) — the full identifiable subspace — not over range(Sλ).
-    //
-    // The previous code projected onto range(Sλ): it computed
-    // `log|U_Sᵀ(H+Sλ)U_S| = log|M_rr|` and the kernel `M_rr⁻¹`. That DROPS the
-    // determinant of the penalty-null block `M_kk = U_kᵀ H U_k` (on ker(Sλ), Sλ
-    // vanishes, so this is pure likelihood curvature) and the Schur coupling
-    // between the two. `M_kk` is the unpenalized polynomial trend; on a
-    // near-collinear design (admixture-cline PCs at small n) its curvature is
-    // large and GROWS as the smooth part is shrunk. Omitting it from
-    // `log|H+Sλ|` while `½ log|Sλ|₊` is correctly taken over range(Sλ) makes
-    // the ρ-derivative of the REML criterion inconsistent in the marginal
-    // block: the outer optimizer drives that block's λ → ∞ chasing a
-    // flat-increasing profile (gh#752), the coupled inner joint-Newton can no
-    // longer certify stationarity on the now-ill-conditioned trend, and the
-    // envelope-theorem outer gradient — valid only at a stationary β̂ — diverges
-    // on the coupled (logslope) block while the objective stalls, so ARC never
-    // reaches a KKT point.
-    //
-    // The correct generalized determinant (mgcv's treatment) takes both terms
-    // over range(H + Sλ): identical to the ordinary log-det / inverse when
-    // H + Sλ is non-singular (the well-posed case), and dropping only the truly
-    // unidentified directions ker(H) ∩ ker(Sλ) when it is singular — exactly the
-    // directions `½ log|Sλ|₊` also omits, keeping value and gradient consistent.
-    //
-    // To preserve value/gradient consistency the trace kernel must be the
-    // FULL pseudo-inverse `M⁺ = (H+Sλ)⁺` itself, carried in spectral form
-    // `(U_M, diag(1/σ_a))` over the kept eigenpairs (#901; supersedes the
-    // intermediate #752 realization that reduced `M⁺` to its range(Sλ)
-    // block). For penalty-supported drifts `∂Sλ/∂ρ` the two coincide:
-    //   tr(M⁺ ∂Sλ) = tr(U_Sᵀ M⁺ U_S · U_Sᵀ ∂Sλ U_S) = ∂_ρ log|H+Sλ|₊.
-    // But the joint adaptive/ψ hyper-coordinates trace drifts with
-    // null(Sλ) support (basis κ-derivatives, the GLM cubic correction
-    // `D_β H[v]` through the intercept column), for which the range(Sλ)
-    // reduction silently discards the leaked component while the FD of
-    // `log|M|₊` keeps it. `tr(M⁺ Ḣ)` is the exact pseudo-logdet derivative
-    // for EVERY drift on a constant-rank stratum (first-order eigenvector
-    // motion cancels), so one spectral object serves the whole θ-vector.
-    // Value and kernel come from the same eigendecomposition of the same
-    // materialized `M` so they cannot drift apart.
-    //
-    // The #752 fix requires the full identifiable-subspace determinant. There
-    // is no lower-dimensional fallback that preserves that objective: the old
-    // range(Sλ) reduction is exactly the bug, because it drops the penalty-null
-    // likelihood determinant. If the dense path is over budget, fail loudly so
-    // the caller can choose a different Hessian representation instead of
-    // optimizing a different REML surface.
-    ensure_exact_joint_hessian_dense_budget(total, "joint penalty subspace logdet")?;
-    let m_dense =
-        materialize_joint_hessian_source(h_joint_unpen, total, "joint penalty subspace logdet")?;
-    let mut m = m_dense;
-    add_joint_penalty_to_matrix(&mut m, ranges, s_lambdas, hessian_diagonal_ridge, None);
-    if let Some(hphi) = scaled_jeffreys_hphi {
-        m += hphi;
-    }
-    symmetrize_dense_in_place(&mut m);
-    let (m_evals, m_evecs) = m.eigh(Side::Lower).map_err(|e| {
-        format!("joint penalty subspace full Hessian eigendecomposition failed: {e}")
-    })?;
-    let m_threshold = positive_eigenvalue_threshold(m_evals.as_slice().unwrap());
-    let logdet = exact_pseudo_logdet(m_evals.as_slice().unwrap(), m_threshold);
-    // Full Moore–Penrose pseudo-inverse `M⁺` (drop ker(H+Sλ)) in spectral
-    // form: kept eigenvectors as the kernel basis, diag(1/σ) as the reduced
-    // kernel. In this basis `h_proj_inverse = (U_Mᵀ M U_M)⁻¹ = diag(1/σ)`
-    // exactly, so every `PenaltySubspaceTrace` consumer evaluates the one
-    // true `tr(M⁺ ·)` / `M⁺`-bilinear — exact for penalty-supported AND
-    // null(Sλ)-leaking drifts alike (#901).
-    let kept: Vec<usize> = (0..total)
-        .filter(|&eig_idx| m_evals[eig_idx] > m_threshold)
-        .collect();
-    if kept.is_empty() {
-        return Ok((0.0, None));
-    }
-    let r_kept = kept.len();
-    let mut u_m = Array2::<f64>::zeros((total, r_kept));
-    let mut h_proj_inverse = Array2::<f64>::zeros((r_kept, r_kept));
-    for (out_col, &src_col) in kept.iter().enumerate() {
-        for row in 0..total {
-            u_m[[row, out_col]] = m_evecs[[row, src_col]];
-        }
-        h_proj_inverse[[out_col, out_col]] = 1.0 / m_evals[src_col];
-    }
-
-    Ok((
-        logdet,
-        Some(PenaltySubspaceTrace {
-            u_s: u_m,
-            h_proj_inverse,
-        }),
-    ))
-}
-
 
 /// Shared implementation for the joint exact-Newton and surrogate outer paths.
 ///
@@ -6796,7 +6698,7 @@ fn joint_penalty_subspace_trace_parts(
 /// This function encapsulates all shared logic: penalty assembly, mode inverse
 /// computation, precomputation of joint corrections + second-order traces, and
 /// routing through `unified_joint_cost_gradient`.
-fn joint_outer_evaluate(
+pub(crate) fn joint_outer_evaluate(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
     per_block: &[Array1<f64>],
@@ -7225,7 +7127,8 @@ fn joint_outer_evaluate(
 }
 
 
-fn joint_outer_evaluate_efs(
+
+pub(crate) fn joint_outer_evaluate_efs(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
     per_block: &[Array1<f64>],
@@ -7436,9 +7339,10 @@ fn joint_outer_evaluate_efs(
 }
 
 
+
 /// Evaluate the rho-only custom-family outer objective through the unified
 /// joint hyperpath with no external ψ coordinates attached.
-fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub(crate) fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -7464,7 +7368,8 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync 
 }
 
 
-fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
+
+pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -7869,7 +7774,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
 }
 
 
-fn normalize_outer_eval_error_detail(error: &str) -> &str {
+
+pub(crate) fn normalize_outer_eval_error_detail(error: &str) -> &str {
     // Any `String` round-tripped through `CustomFamilyError::From<String>`
     // gets re-wrapped as `InvalidInput { context: "custom-family string
     // boundary", … }`, which `Display`s as `custom-family invalid input
@@ -7976,6 +7882,7 @@ fn normalize_outer_eval_error_detail(error: &str) -> &str {
 //  Unified HyperCoord builders for ψ coordinates
 // ═══════════════════════════════════════════════════════════════════════════
 
+
 /// Assemble the penalty derivative matrix S_ψ = Σ_k exp(ρ_k) ∂S_k/∂ψ
 /// in the *block-local* coefficient space (p_block × p_block).
 ///
@@ -7984,7 +7891,7 @@ fn normalize_outer_eval_error_detail(error: &str) -> &str {
 /// `penalty_index` is stored the derivative `s_psi` is scaled by that
 /// penalty's current lambda.  If neither is present, the derivative is
 /// zero (the ψ coordinate does not move any realized penalty).
-fn assemble_block_local_s_psi(
+pub(crate) fn assemble_block_local_s_psi(
     deriv: &CustomFamilyBlockPsiDerivative,
     per_block_rho: &Array1<f64>,
     p_block: usize,
@@ -8010,13 +7917,14 @@ fn assemble_block_local_s_psi(
 }
 
 
+
 /// Assemble the second penalty derivative matrix S_{ψ_i ψ_j} in block-local
 /// coefficient space.
 ///
 /// This mirrors the psi/psi branch of `joint_theta_penaltysecond_matrix` but
 /// returns the block-local matrix directly instead of embedding it into the
 /// full flattened coefficient space.
-fn assemble_block_local_s_psi_psi(
+pub(crate) fn assemble_block_local_s_psi_psi(
     deriv_i: &CustomFamilyBlockPsiDerivative,
     local_j: usize,
     per_block_rho: &Array1<f64>,
@@ -8052,4 +7960,1553 @@ fn assemble_block_local_s_psi_psi(
     } else {
         Array2::<f64>::zeros((p_block, p_block))
     }
+}
+
+
+#[derive(Clone)]
+pub struct BlockwiseInnerResult {
+    pub block_states: Vec<ParameterBlockState>,
+    pub active_sets: Vec<Option<Vec<usize>>>,
+    pub log_likelihood: f64,
+    pub penalty_value: f64,
+    pub cycles: usize,
+    pub converged: bool,
+    pub block_logdet_h: f64,
+    pub block_logdet_s: f64,
+    /// Cached assembled penalty matrices S(ρ) = Σ_k exp(ρ_k) S_k per block.
+    /// Avoids redundant re-assembly in the outer objective evaluation.
+    pub s_lambdas: Vec<Array2<f64>>,
+    pub joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    /// Projected KKT residual at the converged inner iterate, propagated to
+    /// the unified evaluator's `InnerAssembly::kkt_residual` for the
+    /// outer REML/LAML scoring path. `None` when the solver path doesn't
+    /// produce a typed KKT diagnostic (blockwise NR fallback, eager-stop).
+    pub kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
+    /// Active linear-inequality constraint rows at the converged inner
+    /// iterate. When `Some`, the unified evaluator builds the
+    /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
+    /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
+    pub active_constraints:
+        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+}
+
+
+
+impl std::fmt::Debug for BlockwiseInnerResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockwiseInnerResult")
+            .field("block_states", &self.block_states)
+            .field("active_sets", &self.active_sets)
+            .field("log_likelihood", &self.log_likelihood)
+            .field("penalty_value", &self.penalty_value)
+            .field("cycles", &self.cycles)
+            .field("converged", &self.converged)
+            .field("block_logdet_h", &self.block_logdet_h)
+            .field("block_logdet_s", &self.block_logdet_s)
+            .field("s_lambdas", &self.s_lambdas)
+            .field(
+                "joint_workspace",
+                &self.joint_workspace.as_ref().map(|_| "<workspace>"),
+            )
+            .finish()
+    }
+}
+
+
+
+#[derive(Clone)]
+pub(crate) struct ConstrainedWarmStart {
+    rho: Array1<f64>,
+    block_beta: Vec<Array1<f64>>,
+    active_sets: Vec<Option<Vec<usize>>>,
+    cached_inner: Option<CachedInnerMode>,
+}
+
+
+
+#[derive(Clone)]
+pub(crate) struct CachedInnerMode {
+    log_likelihood: f64,
+    penalty_value: f64,
+    cycles: usize,
+    converged: bool,
+    block_logdet_h: f64,
+    block_logdet_s: f64,
+    joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
+    active_constraints: Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+}
+
+
+
+pub(crate) fn screened_outer_warm_start<'a>(
+    warm_start: Option<&'a ConstrainedWarmStart>,
+    rho: &Array1<f64>,
+) -> Option<&'a ConstrainedWarmStart> {
+    warm_start.filter(|seed| seed.rho.len() == rho.len())
+}
+
+
+
+pub(crate) fn warm_start_matches_block_log_lambdas(
+    seed: &ConstrainedWarmStart,
+    block_log_lambdas: &[Array1<f64>],
+) -> bool {
+    let expected = block_log_lambdas
+        .iter()
+        .map(|values| values.len())
+        .sum::<usize>();
+    if seed.rho.len() != expected {
+        return false;
+    }
+    let mut offset = 0usize;
+    for block in block_log_lambdas {
+        let end = offset + block.len();
+        if seed.rho.slice(s![offset..end]) != block.view() {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
+
+
+pub(crate) fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> CachedInnerMode {
+    CachedInnerMode {
+        log_likelihood: result.log_likelihood,
+        penalty_value: result.penalty_value,
+        cycles: result.cycles,
+        converged: result.converged,
+        block_logdet_h: result.block_logdet_h,
+        block_logdet_s: result.block_logdet_s,
+        joint_workspace: result.joint_workspace.clone(),
+        kkt_residual: result.kkt_residual.clone(),
+        active_constraints: result.active_constraints.clone(),
+    }
+}
+
+
+
+pub(crate) fn constrained_warm_start_from_inner(
+    rho: &Array1<f64>,
+    inner: &BlockwiseInnerResult,
+) -> ConstrainedWarmStart {
+    ConstrainedWarmStart {
+        rho: rho.clone(),
+        block_beta: inner
+            .block_states
+            .iter()
+            .map(|state| state.beta.clone())
+            .collect(),
+        active_sets: inner.active_sets.clone(),
+        cached_inner: Some(cached_inner_mode_from_result(inner)),
+    }
+}
+
+
+
+pub(crate) fn constrained_warm_start_from_cached_beta(
+    rho_dim: usize,
+    specs: &[ParameterBlockSpec],
+    beta: &Array1<f64>,
+) -> Result<ConstrainedWarmStart, EstimationError> {
+    let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    if beta.len() != expected {
+        crate::bail_invalid_estim!(
+            "cached inner beta has length {}, but custom-family blocks require length {}",
+            beta.len(),
+            expected
+        );
+    }
+    crate::families::marginal_slope_shared::bail_if_cached_beta_non_finite(beta)?;
+
+    let mut offset = 0usize;
+    let mut block_beta = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let end = offset + spec.design.ncols();
+        block_beta.push(beta.slice(s![offset..end]).to_owned());
+        offset = end;
+    }
+
+    Ok(ConstrainedWarmStart {
+        rho: Array1::zeros(rho_dim),
+        block_beta,
+        active_sets: vec![None; specs.len()],
+        cached_inner: None,
+    })
+}
+
+
+
+pub(crate) fn inner_penalized_objective(
+    inner: &BlockwiseInnerResult,
+    include_logdet_h: bool,
+    include_logdet_s: bool,
+    context: &str,
+) -> Result<f64, String> {
+    let reml_term = if include_logdet_h {
+        0.5 * inner.block_logdet_h
+    } else {
+        0.0
+    } - if include_logdet_s {
+        0.5 * inner.block_logdet_s
+    } else {
+        0.0
+    };
+    checked_penalizedobjective(
+        inner.log_likelihood,
+        inner.penalty_value,
+        reml_term,
+        context,
+    )
+}
+
+
+
+pub(crate) fn nonconverged_outer_efs_result(
+    inner: &BlockwiseInnerResult,
+    rho: &Array1<f64>,
+    theta_dim: usize,
+    include_logdet_h: bool,
+    include_logdet_s: bool,
+    context: &str,
+) -> Result<
+    (
+        crate::solver::outer_strategy::EfsEval,
+        ConstrainedWarmStart,
+        bool,
+    ),
+    String,
+> {
+    Ok((
+        crate::solver::outer_strategy::EfsEval {
+            cost: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
+            steps: vec![0.0; theta_dim],
+            beta: None,
+            psi_gradient: None,
+            psi_indices: None,
+            inner_hessian_scale: None,
+            logdet_enclosure_gap: None,
+        },
+        constrained_warm_start_from_inner(rho, inner),
+        false,
+    ))
+}
+
+
+
+pub(crate) fn warm_start_without_cached_inner_for_psi_derivatives(
+    warm_start: Option<&ConstrainedWarmStart>,
+    has_psi_derivatives: bool,
+) -> Option<ConstrainedWarmStart> {
+    if !has_psi_derivatives {
+        return None;
+    }
+    warm_start.cloned().map(|mut warm| {
+        warm.cached_inner = None;
+        warm
+    })
+}
+
+
+
+/// Helper struct mirroring the old `BlockwiseFitResultParts`.
+pub struct BlockwiseFitResultParts {
+    pub block_states: Vec<ParameterBlockState>,
+    pub log_likelihood: f64,
+    pub log_lambdas: Array1<f64>,
+    pub lambdas: Array1<f64>,
+    pub covariance_conditional: Option<Array2<f64>>,
+    pub stable_penalty_term: f64,
+    pub penalized_objective: f64,
+    pub outer_iterations: usize,
+    /// `None` = no gradient measured at termination (cache-hit, gradient-free,
+    /// or trivial early-exit); `Some(g)` = measured norm. `outer_converged`
+    /// is the authoritative convergence signal.
+    pub outer_gradient_norm: Option<f64>,
+    /// First-order optimality certificate from the outer smoothing solve
+    /// (#934); `None` when no outer ran (fixed-λ, one-cycle probe) or the
+    /// audit could not evaluate.
+    pub criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
+    pub inner_cycles: usize,
+    pub outer_converged: bool,
+    pub geometry: Option<FitGeometry>,
+    /// Effective degrees of freedom computed by the caller in the *reduced*
+    /// (canonical) coefficient space, where the penalized Hessian is full rank,
+    /// as `(edf_total, edf_by_penalty, block_edf)`. The trace edf is invariant
+    /// under the canonical reparameterization, so computing it in the reduced
+    /// space and reporting it on the raw fit is exact — and it avoids the
+    /// `tr((H_raw + εI)⁻¹ S_raw)` blow-up that a rank-deficient raw-lifted
+    /// Hessian (zero rows/cols on canonicalization-dropped directions) would
+    /// otherwise inject. `None` when the caller has no reduced geometry (e.g.
+    /// the one-cycle inner probe), in which case `blockwise_fit_from_parts`
+    /// falls back to computing edf from whatever geometry it was handed.
+    pub precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>)>,
+}
+
+
+
+pub(crate) fn validate_parameter_block_state_finiteness(
+    label: &str,
+    state: &ParameterBlockState,
+) -> Result<(), String> {
+    validate_all_finite_estimation(&format!("{label}.beta"), state.beta.iter().copied())
+        .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation(&format!("{label}.eta"), state.eta.iter().copied())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+
+
+pub(crate) fn validate_lambda_pair_consistency(
+    log_lambdas: &Array1<f64>,
+    lambdas: &Array1<f64>,
+    label: &str,
+) -> Result<(), String> {
+    if log_lambdas.len() != lambdas.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "{label} length mismatch: log_lambdas={}, lambdas={}",
+                log_lambdas.len(),
+                lambdas.len()
+            ),
+        }
+        .into());
+    }
+    for (idx, (&log_lambda, &lambda)) in log_lambdas.iter().zip(lambdas.iter()).enumerate() {
+        let expected = log_lambda.exp();
+        let tolerance = 1e-10 * expected.abs().max(1.0);
+        if (lambda - expected).abs() > tolerance {
+            return Err(format!(
+                "{label}[{idx}] inconsistent with exp(log_lambda): got {lambda}, expected {expected}",
+            ));
+        }
+    }
+    Ok(())
+}
+
+
+
+/// Effective degrees of freedom for a converged blockwise custom-family fit,
+/// computed from the joint penalized Hessian `H = X'W_HX + S(λ)` and the
+/// per-penalty matrices `S_k` exactly as the standard GAM path and mgcv do:
+///
+/// ```text
+/// edf_total   = p − Σ_k λ_k · tr(H⁻¹ S_k)
+/// edf_penalty = (rank_k − λ_k · tr(H⁻¹ S_k))   clamped to [0, rank_k]
+/// ```
+///
+/// `S_k` here is the *unscaled* penalty (its `λ_k` factor is applied here), and
+/// each `S_k.to_dense()` is already embedded in the joint `p × p` coefficient
+/// layout (the Blockwise / Kronecker variants place their local block at the
+/// correct column range), so the trace solve runs in the full joint space and
+/// no per-block offset bookkeeping is required.
+///
+/// The custom-family path (CTN transformation-normal, Dirichlet, …) builds its
+/// fit through `blockwise_fit_from_parts` and previously left `inference` at
+/// `None`, so `edf_total` was unavailable for every custom family even though
+/// the converged geometry already carries the penalized Hessian. This mirrors
+/// the survival-path repair (`survival_transformation_edf`, #565) for the
+/// blockwise engine: the same trace formula, factorized with the same
+/// ridge-retry stabilization so a marginally indefinite Hessian at a boundary
+/// optimum still yields a usable trace instead of dropping inference.
+///
+/// `edf_penalty` is returned aligned 1:1 with the flattened `lambdas`
+/// (one entry per penalty across all blocks), matching the
+/// `FitInference::edf_by_block` ↔ `lambdas` length invariant. The per-block
+/// aggregate edf (for `FittedBlock::edf`) is the sum of that block's penalty
+/// edfs, with an unpenalized block contributing its full column count.
+pub(crate) fn custom_family_blockwise_edf(
+    penalized_hessian: &Array2<f64>,
+    specs: &[ParameterBlockSpec],
+    lambdas: &ndarray::ArrayView1<'_, f64>,
+) -> Result<(f64, Vec<f64>, Vec<f64>), String> {
+    let p = penalized_hessian.nrows();
+    let total_cols: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    if penalized_hessian.ncols() != p || total_cols != p {
+        return Err(format!(
+            "custom-family edf: penalized Hessian {}x{} inconsistent with total block width {}",
+            penalized_hessian.nrows(),
+            penalized_hessian.ncols(),
+            total_cols
+        ));
+    }
+    let expected_rho: usize = specs.iter().map(|s| s.penalties.len()).sum();
+    if lambdas.len() != expected_rho {
+        return Err(format!(
+            "custom-family edf: lambdas length {} does not match total penalty count {}",
+            lambdas.len(),
+            expected_rho
+        ));
+    }
+
+    let h_sym = SymmetricMatrix::Dense(penalized_hessian.clone());
+    // Sparse-aware factorization with ridge retry (mirrors estimate.rs and
+    // survival_transformation_edf): a boundary-constrained optimum can leave
+    // the penalized Hessian marginally indefinite, in which case we add the
+    // smallest diagonal shift that restores definiteness so the trace solve
+    // succeeds rather than dropping inference for the whole fit.
+    let factor = {
+        let scale = h_sym.max_abs_diag();
+        let min_step = scale * 1e-10;
+        let mut ridge = 0.0_f64;
+        let mut attempts = 0_usize;
+        loop {
+            let candidate = if ridge > 0.0 {
+                h_sym.addridge(ridge).unwrap_or_else(|_| h_sym.clone())
+            } else {
+                h_sym.clone()
+            };
+            if let Ok(f) = candidate.factorize() {
+                break f;
+            }
+            attempts += 1;
+            if attempts >= 8 {
+                return Err(
+                    "custom-family edf: penalized Hessian could not be factorized".to_string(),
+                );
+            }
+            ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
+        }
+    };
+
+    let mut edf_by_penalty = vec![0.0_f64; expected_rho];
+    let mut block_edf = Vec::with_capacity(specs.len());
+    let mut total_trace = 0.0_f64;
+    let mut penalty_offset = 0usize;
+    let mut block_col_start = 0usize;
+    for spec in specs.iter() {
+        let block_cols = spec.design.ncols();
+        let mut block_edf_acc = block_cols as f64;
+        for (local_k, penalty) in spec.penalties.iter().enumerate() {
+            let global_k = penalty_offset + local_k;
+            let lambda = lambdas[global_k];
+            // Embed S_k into the full p×p joint layout. `PenaltyMatrix::to_dense`
+            // returns the *local* block matrix for the `Dense` variant but the
+            // already-embedded full-width matrix for `Blockwise`/`Kronecker`, so
+            // dispatch on the materialized dimension: a local (block_cols-wide)
+            // penalty is placed at this block's column range, a full-width
+            // penalty is used as-is (mirrors `survival_transformation_edf`'s
+            // explicit block placement).
+            let s_local = penalty.to_dense();
+            let mut s_full = Array2::<f64>::zeros((p, p));
+            if s_local.nrows() == p && s_local.ncols() == p {
+                s_full.assign(&s_local);
+            } else if s_local.nrows() == block_cols && s_local.ncols() == block_cols {
+                let r = block_col_start..block_col_start + block_cols;
+                s_full.slice_mut(ndarray::s![r.clone(), r]).assign(&s_local);
+            } else {
+                return Err(format!(
+                    "custom-family edf: penalty {global_k} materialized to {}x{}, expected {p}x{p} or {block_cols}x{block_cols}",
+                    s_local.nrows(),
+                    s_local.ncols()
+                ));
+            }
+            // tr(H⁻¹ S_k) via H Z = S_k, summing the diagonal of Z.
+            let z = factor.solvemulti(&s_full).map_err(|e| {
+                format!("custom-family edf trace solve failed for penalty {global_k}: {e}")
+            })?;
+            let mut trace = 0.0_f64;
+            for d in 0..p {
+                trace += z[[d, d]];
+            }
+            let lam_trace = if lambda > 0.0 { lambda * trace } else { 0.0 };
+            total_trace += lam_trace;
+            // Per-penalty edf is bounded by the columns this penalty acts on,
+            // i.e. its block's column count (a `Blockwise` penalty reports the
+            // full joint width from `dim()`, so cap at `block_cols`, not `dim()`).
+            let penalty_cols = block_cols as f64;
+            let edf_k = (penalty_cols - lam_trace).clamp(0.0, penalty_cols);
+            edf_by_penalty[global_k] = edf_k;
+            // The block's edf is the column count minus the total trace this
+            // block's penalties spend (so multiple penalties on one block
+            // compose), clamped to the block's column count.
+            block_edf_acc -= lam_trace;
+        }
+        block_edf.push(block_edf_acc.clamp(0.0, block_cols as f64));
+        penalty_offset += spec.penalties.len();
+        block_col_start += block_cols;
+    }
+
+    let edf_total = (p as f64 - total_trace).clamp(0.0, p as f64);
+    if !edf_total.is_finite()
+        || edf_by_penalty.iter().any(|v| !v.is_finite())
+        || block_edf.iter().any(|v| !v.is_finite())
+    {
+        return Err("custom-family edf: non-finite effective degrees of freedom".to_string());
+    }
+    Ok((edf_total, edf_by_penalty, block_edf))
+}
+
+
+
+/// Compute reduced-space effective degrees of freedom for a converged fit,
+/// to be carried through `BlockwiseFitResultParts::precomputed_edf`.
+///
+/// The reduced (canonical) geometry's penalized Hessian is full rank and its
+/// `reduced_specs` carry the pulled-back penalties `T_iᵀ S_k T_i`, so the trace
+/// edf is computed exactly here (no rank-deficiency ridge bias). Because the
+/// trace edf is invariant under the canonical reparameterization, the resulting
+/// `edf_total` / per-penalty / per-block values are the same as they would be
+/// in the raw basis and are reported directly on the lifted raw fit. Returns
+/// `None` when no reduced geometry is available, so the caller can leave
+/// `precomputed_edf` unset (and the raw-geometry fallback applies).
+pub(crate) fn reduced_blockwise_edf(
+    reduced_geometry: Option<&FitGeometry>,
+    canonical: &crate::solver::identifiability_canonical::CanonicalSpecs,
+    lambdas: &Array1<f64>,
+) -> Option<(f64, Vec<f64>, Vec<f64>)> {
+    let geom = reduced_geometry?;
+    match custom_family_blockwise_edf(
+        geom.penalized_hessian.as_array(),
+        &canonical.reduced_specs,
+        &lambdas.view(),
+    ) {
+        Ok(triple) => Some(triple),
+        Err(err) => {
+            log::warn!(
+                "[custom-family inference] reduced-space effective degrees of freedom unavailable: {err}"
+            );
+            None
+        }
+    }
+}
+
+
+
+/// Build a `UnifiedFitResult` from blockwise-specific fields.
+pub fn blockwise_fit_from_parts(
+    parts: BlockwiseFitResultParts,
+    specs: &[ParameterBlockSpec],
+) -> Result<crate::solver::estimate::UnifiedFitResult, String> {
+    let BlockwiseFitResultParts {
+        block_states,
+        log_likelihood,
+        log_lambdas,
+        lambdas,
+        covariance_conditional,
+        stable_penalty_term,
+        penalized_objective,
+        outer_iterations,
+        outer_gradient_norm,
+        criterion_certificate,
+        inner_cycles,
+        outer_converged,
+        geometry,
+        precomputed_edf,
+    } = parts;
+
+    if block_states.is_empty() {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "blockwise fit requires at least one block state".to_string(),
+        }
+        .into());
+    }
+    ensure_finite_scalar_estimation("blockwise_fit.log_likelihood", log_likelihood)
+        .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation("blockwise_fit.log_lambdas", log_lambdas.iter().copied())
+        .map_err(|e| e.to_string())?;
+    validate_all_finite_estimation("blockwise_fit.lambdas", lambdas.iter().copied())
+        .map_err(|e| e.to_string())?;
+    validate_lambda_pair_consistency(&log_lambdas, &lambdas, "blockwise_fit.lambdas")?;
+    ensure_finite_scalar_estimation("blockwise_fit.penalized_objective", penalized_objective)
+        .map_err(|e| e.to_string())?;
+    ensure_finite_scalar_estimation("blockwise_fit.stable_penalty_term", stable_penalty_term)
+        .map_err(|e| e.to_string())?;
+    if let Some(g) = outer_gradient_norm {
+        ensure_finite_scalar_estimation("blockwise_fit.outer_gradient_norm", g)
+            .map_err(|e| e.to_string())?;
+    }
+
+    if block_states.len() != specs.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "blockwise_fit.block_states length ({}) does not match specs length ({})",
+                block_states.len(),
+                specs.len()
+            ),
+        }
+        .into());
+    }
+    let n = specs[0].design.nrows();
+    let total_p = block_states
+        .iter()
+        .map(|state| state.beta.len())
+        .sum::<usize>();
+    for (idx, state) in block_states.iter().enumerate() {
+        validate_parameter_block_state_finiteness(
+            &format!("blockwise_fit.block_states[{idx}]"),
+            state,
+        )?;
+        let expected_rows = specs[idx].solver_design().nrows();
+        if state.eta.len() != expected_rows {
+            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+                "blockwise_fit.block_states[{idx}] eta length mismatch: got {}, expected {} (solver design rows)",
+                state.eta.len(),
+                expected_rows
+            ) }.into());
+        }
+    }
+
+    if let Some(cov) = covariance_conditional.as_ref() {
+        validate_all_finite_estimation("blockwise_fit.covariance_conditional", cov.iter().copied())
+            .map_err(|e| e.to_string())?;
+        let (rows, cols) = cov.dim();
+        if rows != total_p || cols != total_p {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "blockwise_fit.covariance_conditional must be {}x{}, got {}x{}",
+                    total_p, total_p, rows, cols
+                ),
+            }
+            .into());
+        }
+    }
+
+    if let Some(geom) = geometry.as_ref() {
+        geom.validate_numeric_finiteness()
+            .map_err(|e| e.to_string())?;
+        let (rows, cols) = geom.penalized_hessian.dim();
+        if rows != total_p || cols != total_p {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "blockwise_fit.geometry.penalized_hessian must be {}x{}, got {}x{}",
+                    total_p, total_p, rows, cols
+                ),
+            }
+            .into());
+        }
+        let geom_len = geom.working_weights.len();
+        if geom_len != geom.working_response.len() {
+            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+                "blockwise_fit.geometry working vector length mismatch: weights={}, response={}",
+                geom.working_weights.len(),
+                geom.working_response.len(),
+            ) }.into());
+        }
+        if geom_len != n && (n == 0 || geom_len % n != 0) {
+            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+                "blockwise_fit.geometry.working_weights length mismatch: got {geom_len}, expected {n} or a stacked multiple of {n}",
+            ) }.into());
+        }
+        if geom.working_response.len() != n && (n == 0 || geom.working_response.len() % n != 0) {
+            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n} or a stacked multiple of {n}",
+                geom.working_response.len(),
+            ) }.into());
+        }
+    }
+
+    // Build unified blocks from the blockwise states.
+    use crate::solver::estimate::{FittedBlock, FittedLinkState, UnifiedFitResultParts};
+    let expected_rho: usize = specs.iter().map(|s| s.penalties.len()).sum();
+    if lambdas.len() != expected_rho {
+        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+            "blockwise_fit.lambdas length ({}) does not match sum of per-block penalty counts ({})",
+            lambdas.len(),
+            expected_rho
+        ) }.into());
+    }
+    // Effective degrees of freedom and the inference block. When the
+    // converged geometry carries the joint penalized Hessian we compute the
+    // mgcv trace edf `p − Σ_k λ_k·tr(H⁻¹ S_k)` here so every custom-family fit
+    // (CTN transformation-normal, Dirichlet, …) reports `edf_total` /
+    // per-block `edf` like the standard GAM path, instead of leaving inference
+    // unpopulated. A factorization failure is non-fatal: the fit still returns
+    // with `edf=0`/`inference=None` rather than aborting, but in practice the
+    // ridge-retry inside `custom_family_blockwise_edf` recovers any boundary
+    // indefiniteness.
+    let (edf_total_opt, edf_by_penalty, block_edf): (Option<f64>, Vec<f64>, Vec<f64>) =
+        match precomputed_edf {
+            // Reduced-space edf supplied by the caller (the principled path:
+            // the trace is computed where the Hessian is full rank, then
+            // reported on the raw fit — exact because the trace edf is
+            // reparameterization-invariant).
+            Some((edf_total, edf_by_penalty, block_edf)) => {
+                (Some(edf_total), edf_by_penalty, block_edf)
+            }
+            // Fallback: compute from whatever geometry we were handed. Used
+            // only when the caller did not precompute (no reduced geometry);
+            // the ridge-retry factorization makes this robust to a marginally
+            // indefinite Hessian.
+            None => match geometry.as_ref() {
+                Some(geom) => {
+                    match custom_family_blockwise_edf(
+                        geom.penalized_hessian.as_array(),
+                        specs,
+                        &lambdas.view(),
+                    ) {
+                        Ok((edf_total, edf_by_penalty, block_edf)) => {
+                            (Some(edf_total), edf_by_penalty, block_edf)
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "[custom-family inference] effective degrees of freedom unavailable: {err}"
+                            );
+                            (None, Vec::new(), vec![0.0; block_states.len()])
+                        }
+                    }
+                }
+                None => (None, Vec::new(), vec![0.0; block_states.len()]),
+            },
+        };
+
+    let mut lambda_offset = 0usize;
+    let blocks: Vec<FittedBlock> = block_states
+        .iter()
+        .enumerate()
+        .map(|(i, bs)| {
+            let role = custom_family_block_role(&specs[i].name, i, block_states.len());
+            let k = specs[i].penalties.len();
+            let block_lambdas = lambdas
+                .slice(s![lambda_offset..lambda_offset + k])
+                .to_owned();
+            lambda_offset += k;
+            FittedBlock {
+                beta: bs.beta.clone(),
+                role,
+                edf: block_edf.get(i).copied().unwrap_or(0.0),
+                lambdas: block_lambdas,
+            }
+        })
+        .collect();
+    let deviance = -2.0 * log_likelihood;
+
+    // Assemble the inference block from the converged geometry. CTN and other
+    // custom families estimate their own likelihood scale, so the penalized
+    // Hessian is reported unscaled (dispersion = 1) — the EDF trace is
+    // dispersion-free, and downstream covariance scaling pairs `H` with the
+    // family's own dispersion where needed.
+    let inference = match (edf_total_opt, geometry.as_ref()) {
+        (Some(edf_total), Some(geom)) => Some(crate::solver::estimate::FitInference {
+            edf_by_block: edf_by_penalty,
+            edf_total,
+            smoothing_correction: None,
+            penalized_hessian: geom.penalized_hessian.clone(),
+            working_weights: geom.working_weights.clone(),
+            working_response: geom.working_response.clone(),
+            reparam_qs: None,
+            dispersion: crate::solver::estimate::Dispersion::Known(1.0),
+            beta_covariance: None,
+            beta_standard_errors: None,
+            beta_covariance_corrected: None,
+            beta_standard_errors_corrected: None,
+            beta_covariance_frequentist: None,
+            coefficient_influence: None,
+            weighted_gram: None,
+            bias_correction_beta: None,
+        }),
+        _ => None,
+    };
+
+    crate::solver::estimate::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+        blocks,
+        log_lambdas: log_lambdas.clone(),
+        lambdas: lambdas.clone(),
+        likelihood_family: None,
+        likelihood_scale: crate::types::LikelihoodScaleMetadata::Unspecified,
+        log_likelihood_normalization: crate::types::LogLikelihoodNormalization::UserProvided,
+        log_likelihood,
+        deviance,
+        reml_score: penalized_objective,
+        stable_penalty_term,
+        penalized_objective,
+        outer_iterations,
+        outer_converged,
+        outer_gradient_norm,
+        standard_deviation: 1.0,
+        covariance_conditional,
+        covariance_corrected: None,
+        inference,
+        fitted_link: FittedLinkState::Standard(None),
+        geometry,
+        block_states,
+        // Report the inner status honestly from the threaded `outer_converged`
+        // flag rather than hardcoding `Converged`. When the outer optimization
+        // did not converge (e.g. it escalated to posterior sampling), surface
+        // `StalledAtValidMinimum` — the same non-converged-but-usable bucket the
+        // smooth-term path maps to — so downstream consumers
+        // (`pirls_status.is_converged()`, `outer_converged` derivation) do not
+        // report a non-converged fit as converged.
+        pirls_status: if outer_converged {
+            crate::pirls::PirlsStatus::Converged
+        } else {
+            crate::pirls::PirlsStatus::StalledAtValidMinimum
+        },
+        max_abs_eta: 0.0,
+        constraint_kkt: None,
+        artifacts: crate::solver::estimate::FitArtifacts {
+            pirls: None,
+            criterion_certificate,
+            ..Default::default()
+        },
+        inner_cycles,
+    })
+    .map_err(|e| e.to_string())
+}
+
+
+
+pub(crate) fn checked_penalizedobjective(
+    log_likelihood: f64,
+    penalty_value: f64,
+    reml_term: f64,
+    context: &str,
+) -> Result<f64, String> {
+    let objective = -log_likelihood + penalty_value + reml_term;
+    if objective.is_finite() {
+        Ok(objective)
+    } else {
+        Err(CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "{context}: non-finite penalized objective \
+             (log_likelihood={log_likelihood}, penalty_value={penalty_value}, \
+             reml_term={reml_term}, objective={objective})"
+            ),
+        }
+        .into())
+    }
+}
+
+
+
+#[derive(Clone)]
+pub struct CustomFamilyWarmStart {
+    inner: ConstrainedWarmStart,
+}
+
+
+
+impl CustomFamilyWarmStart {
+    pub(crate) fn compatible_with_rho(&self, rho: &Array1<f64>) -> bool {
+        screened_outer_warm_start(Some(&self.inner), rho).is_some()
+    }
+
+    pub(crate) fn block_beta_len(&self, block_idx: usize) -> Option<usize> {
+        self.inner.block_beta.get(block_idx).map(|beta| beta.len())
+    }
+
+    pub(crate) fn block_beta_abs_argmax_in_range(
+        &self,
+        block_idx: usize,
+        range: std::ops::Range<usize>,
+    ) -> Option<(usize, f64)> {
+        let beta = self.inner.block_beta.get(block_idx)?;
+        let end = range.end.min(beta.len());
+        if range.start >= end {
+            return None;
+        }
+        beta.slice(s![range.start..end])
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, value)| (range.start + idx, value.abs()))
+            .filter(|(_, abs)| abs.is_finite())
+            .max_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// Build a warm-start payload from a flat cached β and the per-block
+    /// coefficient widths. The returned warm-start carries a zero `rho`
+    /// (the outer cache will overwrite it on the next eval) and empty
+    /// active sets; only the per-block β slices feed the next inner
+    /// PIRLS / Newton solve. Used by the spatial-joint outer cache to
+    /// seed the family-owned warm-start slot on cache hits so the inner
+    /// solve opens at the prior converged iterate instead of cold β.
+    pub fn from_cached_beta(
+        block_col_counts: &[usize],
+        beta: &Array1<f64>,
+    ) -> Result<Self, EstimationError> {
+        let expected: usize = block_col_counts.iter().copied().sum();
+        if beta.len() != expected {
+            crate::bail_invalid_estim!(
+                "cached inner beta has length {}, but spatial-joint blocks require length {}",
+                beta.len(),
+                expected
+            );
+        }
+        crate::families::marginal_slope_shared::bail_if_cached_beta_non_finite(beta)?;
+        let mut offset = 0usize;
+        let mut block_beta = Vec::with_capacity(block_col_counts.len());
+        for &width in block_col_counts {
+            let end = offset + width;
+            block_beta.push(beta.slice(s![offset..end]).to_owned());
+            offset = end;
+        }
+        Ok(CustomFamilyWarmStart {
+            inner: ConstrainedWarmStart {
+                rho: Array1::zeros(0),
+                block_beta,
+                active_sets: vec![None; block_col_counts.len()],
+                cached_inner: None,
+            },
+        })
+    }
+}
+
+
+
+pub(crate) struct CustomOuterState {
+    warm_cache: Option<ConstrainedWarmStart>,
+    reset_warm_cache: Option<ConstrainedWarmStart>,
+    last_error: Option<String>,
+    initial_gradient_norm: Option<f64>,
+}
+
+
+
+impl CustomOuterState {
+    fn new(warm_start: Option<ConstrainedWarmStart>) -> Self {
+        Self {
+            warm_cache: warm_start.clone(),
+            reset_warm_cache: warm_start,
+            last_error: None,
+            initial_gradient_norm: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.warm_cache = self.reset_warm_cache.clone();
+    }
+
+    fn seed_cached_beta(
+        &mut self,
+        rho_dim: usize,
+        specs: &[ParameterBlockSpec],
+        beta: &Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        let warm_start = constrained_warm_start_from_cached_beta(rho_dim, specs, beta)?;
+        self.reset_warm_cache = Some(warm_start.clone());
+        self.warm_cache = Some(warm_start);
+        self.last_error = None;
+        Ok(())
+    }
+}
+
+
+
+pub struct CustomFamilyJointHyperResult {
+    pub objective: f64,
+    pub gradient: Array1<f64>,
+    pub outer_hessian: crate::solver::outer_strategy::HessianResult,
+    pub warm_start: CustomFamilyWarmStart,
+    /// `false` when the inner blockwise/Newton solve hit its divergence
+    /// early-exit or its max-cycle cap. Envelope-theorem outer gradients
+    /// and analytic outer Hessians are valid only at a stationary β̂ —
+    /// callers that consume `gradient`/`outer_hessian` MUST gate on this
+    /// flag and treat non-converged evaluations as inexact (e.g. let ARC
+    /// back off the trust region) rather than feeding pathological
+    /// derivatives into the outer optimizer.
+    pub inner_converged: bool,
+}
+
+
+
+pub struct CustomFamilyJointHyperEfsResult {
+    pub efs_eval: crate::solver::outer_strategy::EfsEval,
+    pub warm_start: CustomFamilyWarmStart,
+    /// See [`CustomFamilyJointHyperResult::inner_converged`]. EFS gradients
+    /// also assume a stationary inner solve.
+    pub inner_converged: bool,
+}
+
+
+
+pub(crate) struct OuterObjectiveEvalResult {
+    objective: f64,
+    gradient: Array1<f64>,
+    outer_hessian: crate::solver::outer_strategy::HessianResult,
+    warm_start: ConstrainedWarmStart,
+    inner_converged: bool,
+}
+
+
+
+pub(crate) fn outer_eval_result_to_joint_hyper_result(
+    result: OuterObjectiveEvalResult,
+) -> CustomFamilyJointHyperResult {
+    CustomFamilyJointHyperResult {
+        objective: result.objective,
+        gradient: result.gradient,
+        outer_hessian: result.outer_hessian,
+        warm_start: CustomFamilyWarmStart {
+            inner: result.warm_start,
+        },
+        inner_converged: result.inner_converged,
+    }
+}
+
+
+
+pub(crate) struct OwnedDenseOuterHessianOperator {
+    matrix: Array2<f64>,
+}
+
+
+
+impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHessianOperator {
+    fn dim(&self) -> usize {
+        self.matrix.nrows()
+    }
+
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if v.len() != self.matrix.ncols() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "batched dense outer Hessian matvec length mismatch: got {}, expected {}",
+                    v.len(),
+                    self.matrix.ncols()
+                ),
+            }
+            .into());
+        }
+        Ok(self.matrix.dot(v))
+    }
+
+    /// Zero-alloc override: write `matrix · v` directly into `out` using a
+    /// row-dot loop, avoiding the `matrix.dot(v)` allocation.
+    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), String> {
+        if v.len() != self.matrix.ncols() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "batched dense outer Hessian apply_into input length mismatch: got {}, expected {}",
+                    v.len(),
+                    self.matrix.ncols()
+                ),
+            }
+            .into());
+        }
+        if out.len() != self.matrix.nrows() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "batched dense outer Hessian apply_into output length mismatch: got {}, expected {}",
+                    out.len(),
+                    self.matrix.nrows()
+                ),
+            }
+            .into());
+        }
+        for (row, cell) in self.matrix.rows().into_iter().zip(out.iter_mut()) {
+            *cell = row.dot(v);
+        }
+        Ok(())
+    }
+
+    fn is_cheap_to_materialize(&self) -> bool {
+        true
+    }
+}
+
+
+
+pub(crate) struct LabeledOuterHessianOperator {
+    base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    physical_to_outer: Vec<Option<usize>>,
+    outer_dim: usize,
+    /// Scratch buffers reused across `apply_into` calls to avoid
+    /// per-call allocation of the permuted input and output vectors.
+    /// `(physical_in, physical_out)`, each of length `physical_to_outer.len()`.
+    scratch: std::sync::Mutex<(ndarray::Array1<f64>, ndarray::Array1<f64>)>,
+}
+
+
+
+impl LabeledOuterHessianOperator {
+    fn new(
+        base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+        layout: &PenaltyLabelLayout,
+    ) -> Self {
+        let n_physical = layout.physical_to_outer.len();
+        Self {
+            base,
+            physical_to_outer: layout.physical_to_outer.clone(),
+            outer_dim: layout.initial_rho.len(),
+            scratch: std::sync::Mutex::new((
+                ndarray::Array1::zeros(n_physical),
+                ndarray::Array1::zeros(n_physical),
+            )),
+        }
+    }
+}
+
+
+
+impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessianOperator {
+    fn dim(&self) -> usize {
+        self.outer_dim
+    }
+
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if v.len() != self.outer_dim {
+            return Err(format!(
+                "labeled outer Hessian input length mismatch: got {}, expected {}",
+                v.len(),
+                self.outer_dim
+            ));
+        }
+        let mut physical = Array1::<f64>::zeros(self.physical_to_outer.len());
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            physical[physical_idx] = outer_idx.map(|idx| v[idx]).unwrap_or(0.0);
+        }
+        let physical_out = self.base.matvec(&physical)?;
+        if physical_out.len() != self.physical_to_outer.len() {
+            return Err(format!(
+                "labeled outer Hessian physical matvec length mismatch: got {}, expected {}",
+                physical_out.len(),
+                self.physical_to_outer.len()
+            ));
+        }
+        let mut out = Array1::<f64>::zeros(self.outer_dim);
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            if let Some(outer_idx) = *outer_idx {
+                out[outer_idx] += physical_out[physical_idx];
+            }
+        }
+        Ok(out)
+    }
+
+    /// Zero-alloc override: reuses hoisted scratch buffers to avoid the
+    /// per-call `physical` and `out` allocations in `matvec`.
+    fn apply_into(
+        &self,
+        v: &ndarray::Array1<f64>,
+        out: &mut ndarray::Array1<f64>,
+    ) -> Result<(), String> {
+        if v.len() != self.outer_dim {
+            return Err(format!(
+                "labeled outer Hessian apply_into input length mismatch: got {}, expected {}",
+                v.len(),
+                self.outer_dim
+            ));
+        }
+        if out.len() != self.outer_dim {
+            return Err(format!(
+                "labeled outer Hessian apply_into output length mismatch: got {}, expected {}",
+                out.len(),
+                self.outer_dim
+            ));
+        }
+        let mut guard = self
+            .scratch
+            .lock()
+            .map_err(|_| "labeled outer Hessian scratch lock poisoned".to_string())?;
+        let (physical_in, physical_out) = &mut *guard;
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            physical_in[physical_idx] = outer_idx.map(|idx| v[idx]).unwrap_or(0.0);
+        }
+        self.base.apply_into(physical_in, physical_out)?;
+        if physical_out.len() != self.physical_to_outer.len() {
+            return Err(format!(
+                "labeled outer Hessian physical apply_into length mismatch: got {}, expected {}",
+                physical_out.len(),
+                self.physical_to_outer.len()
+            ));
+        }
+        out.fill(0.0);
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            if let Some(outer_idx) = *outer_idx {
+                out[outer_idx] += physical_out[physical_idx];
+            }
+        }
+        Ok(())
+    }
+
+    fn mul_mat(&self, factor: ndarray::ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        if factor.nrows() != self.outer_dim {
+            return Err(format!(
+                "labeled outer Hessian factor row mismatch: got {}, expected {}",
+                factor.nrows(),
+                self.outer_dim
+            ));
+        }
+        let mut physical_factor =
+            Array2::<f64>::zeros((self.physical_to_outer.len(), factor.ncols()));
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            if let Some(outer_idx) = *outer_idx {
+                physical_factor
+                    .row_mut(physical_idx)
+                    .assign(&factor.row(outer_idx));
+            }
+        }
+        let physical_out = self.base.mul_mat(physical_factor.view())?;
+        if physical_out.nrows() != self.physical_to_outer.len() {
+            return Err(format!(
+                "labeled outer Hessian physical output row mismatch: got {}, expected {}",
+                physical_out.nrows(),
+                self.physical_to_outer.len()
+            ));
+        }
+        let mut out = Array2::<f64>::zeros((self.outer_dim, factor.ncols()));
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            if let Some(outer_idx) = *outer_idx {
+                let physical_row = physical_out.row(physical_idx);
+                out.row_mut(outer_idx).scaled_add(1.0, &physical_row);
+            }
+        }
+        Ok(out)
+    }
+
+    fn is_cheap_to_materialize(&self) -> bool {
+        self.base.is_cheap_to_materialize()
+    }
+
+    fn materialization_capability(
+        &self,
+    ) -> crate::solver::outer_strategy::OuterHessianMaterialization {
+        self.base.materialization_capability()
+    }
+}
+
+
+
+pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    rho: &Array1<f64>,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    eval_mode: EvalMode,
+) -> Result<Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>, String> {
+    if eval_mode != EvalMode::ValueGradientHessian {
+        return Ok(None);
+    }
+    let Some(terms) =
+        family.batched_outer_hessian_terms(states, specs, derivative_blocks, rho, workspace)?
+    else {
+        return Ok(None);
+    };
+    match terms.outer_hessian {
+        crate::solver::outer_strategy::HessianResult::Operator(operator) => Ok(Some(operator)),
+        crate::solver::outer_strategy::HessianResult::Analytic(matrix) => {
+            Ok(Some(Arc::new(OwnedDenseOuterHessianOperator { matrix })))
+        }
+        crate::solver::outer_strategy::HessianResult::Unavailable => Ok(None),
+    }
+}
+
+
+
+pub(crate) fn outer_efs_result_to_joint_hyper_efs_result(
+    efs_eval: crate::solver::outer_strategy::EfsEval,
+    warm_start: ConstrainedWarmStart,
+    inner_converged: bool,
+) -> CustomFamilyJointHyperEfsResult {
+    CustomFamilyJointHyperEfsResult {
+        efs_eval,
+        warm_start: CustomFamilyWarmStart { inner: warm_start },
+        inner_converged,
+    }
+}
+
+
+// Unified exact joint hyper-calculus over theta = [rho, psi].
+//
+// The correct outer problem is not “a rho objective plus a separate psi
+// objective”. It is one profiled/Laplace surface over one flattened hypervector
+//
+//   theta = [rho, psi],
+//
+// one flattened joint coefficient vector
+//
+//   beta = [beta_1; ...; beta_B],
+//
+// and one joint exact mode system
+//
+//   F(beta, theta) := V_beta(beta, theta) = 0,
+//   H(beta, theta) := V_beta_beta(beta, theta).
+//
+// For every hypercoordinate theta_i we need the fixed-beta objects
+//
+//   V_i = partial_{theta_i} V,
+//   g_i = partial_{theta_i} F,
+//   H_i = partial_{theta_i} H,
+//
+// and for every pair (i, j)
+//
+//   V_ij, g_ij, H_ij,
+//
+// together with the beta-curvature contractions
+//
+//   D_beta H[u],
+//   D_beta^2 H[u, v],
+//   T_i[u] := D_beta H_i[u].
+//
+// The exact profiled mode response and total Hessian drifts are then
+//
+//   beta_i  = -H^{-1} g_i,
+//   beta_ij = -H^{-1}(g_ij + H_i beta_j + H_j beta_i + D_beta H[beta_i] beta_j),
+//
+//   dot H_i
+//   = H_i + D_beta H[beta_i],
+//
+//   ddot H_ij
+//   = H_ij
+//     + T_i[beta_j]
+//     + T_j[beta_i]
+//     + D_beta H[beta_ij]
+//     + D_beta^2 H[beta_i, beta_j].
+//
+// Hence the exact joint profiled/Laplace derivatives are
+//
+//   J_i
+//   = V_i + 0.5 tr(H^{-1} dot H_i) - 0.5 partial_i log|S(theta)|_+,
+//
+//   J_ij
+//   = (V_ij - g_i^T H^{-1} g_j)
+//     + 0.5 [ tr(H^{-1} ddot H_ij)
+//             - tr(H^{-1} dot H_j H^{-1} dot H_i) ]
+//     - 0.5 partial^2_{ij} log|S(theta)|_+.
+//
+// In this unified view rho and psi are the same outer calculus. They differ
+// only in where their fixed-beta derivative objects come from:
+//
+// - rho coordinates often contribute only through the penalty surface,
+//     but the generic assembler intentionally treats the penalty as S(theta),
+//     not S(rho), so mixed rho/psi penalty terms are allowed whenever realized
+//     component penalties move with psi:
+//       V_i  = D_i  + 0.5 beta^T S_i beta
+//       g_i  = D_beta_i  + S_i beta
+//       H_i  = D_beta_beta_i + S_i
+//       V_ij = D_ij + 0.5 beta^T S_ij beta
+//       g_ij = D_beta_ij + S_ij beta
+//       H_ij = D_beta_beta_ij + S_ij.
+//
+// - psi coordinates come from the family-specific joint exact psi hooks, while
+//   the generic assembler still owns any realized-penalty motion through
+//   S_i / S_ij:
+//     objective_psi            <-> V_i
+//     score_psi                <-> g_i
+//     hessian_psi              <-> H_i
+//     objective_psi_psi        <-> V_ij
+//     score_psi_psi            <-> g_ij
+//     hessian_psi_psi          <-> H_ij
+//     D_beta H_psi[u]          <-> T_i[u].
+//
+// For coupled families this means any block-local psi path is wrong. Even when
+// g_i is sparse or penalty-local, beta_i is defined by the full joint solve
+//
+//   beta_i = -H^{-1} g_i,
+//
+// so every exact outer derivative must be assembled in this joint flattened
+// space.
+
+
+pub(crate) fn with_block_geometry<F: CustomFamily + ?Sized, T>(
+    family: &F,
+    block_states: &[ParameterBlockState],
+    spec: &ParameterBlockSpec,
+    block_idx: usize,
+    f: impl FnOnce(&DesignMatrix, &Array1<f64>) -> Result<T, String>,
+) -> Result<T, String> {
+    if family.block_geometry_is_dynamic() {
+        let (x_dyn, off_dyn) = family.block_geometry(block_states, spec)?;
+        let expected_rows = spec.solver_design().nrows();
+        if x_dyn.nrows() != expected_rows {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {block_idx} dynamic design row mismatch: got {}, expected {}",
+                    x_dyn.nrows(),
+                    expected_rows
+                ),
+            }
+            .into());
+        }
+        if x_dyn.ncols() != spec.design.ncols() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {block_idx} dynamic design col mismatch: got {}, expected {}",
+                    x_dyn.ncols(),
+                    spec.design.ncols()
+                ),
+            }
+            .into());
+        }
+        if off_dyn.len() != expected_rows {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {block_idx} dynamic offset length mismatch: got {}, expected {}",
+                    off_dyn.len(),
+                    expected_rows
+                ),
+            }
+            .into());
+        }
+        f(&x_dyn, &off_dyn)
+    } else {
+        f(spec.solver_design(), spec.solver_offset())
+    }
+}
+
+
+
+pub(crate) fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
+    let total = specs
+        .iter()
+        .map(|s| s.initial_log_lambdas.len())
+        .sum::<usize>();
+    let mut out = Array1::<f64>::zeros(total);
+    let mut at = 0usize;
+    for spec in specs {
+        let len = spec.initial_log_lambdas.len();
+        if len > 0 {
+            out.slice_mut(ndarray::s![at..at + len])
+                .assign(&spec.initial_log_lambdas);
+        }
+        at += len;
+    }
+    out
+}
+
+
+
+#[derive(Clone, Debug)]
+pub(crate) struct PenaltyLabelLayout {
+    penalty_counts: Vec<usize>,
+    physical_to_outer: Vec<Option<usize>>,
+    fixed_log_lambdas: Vec<Option<f64>>,
+    initial_rho: Array1<f64>,
+}
+
+
+
+impl PenaltyLabelLayout {
+    fn physical_count(&self) -> usize {
+        self.physical_to_outer.len()
+    }
+
+    fn has_tied_coordinates(&self) -> bool {
+        self.initial_rho.len() != self.physical_to_outer.len()
+    }
+}
+
+
+
+pub(crate) fn penalty_label_layout(
+    specs: &[ParameterBlockSpec],
+    penalty_counts: Vec<usize>,
+) -> Result<PenaltyLabelLayout, String> {
+    let mut label_to_outer = BTreeMap::<String, usize>::new();
+    let mut physical_to_outer = Vec::<Option<usize>>::new();
+    let mut fixed_log_lambdas = Vec::<Option<f64>>::new();
+    let mut initial = Vec::<f64>::new();
+
+    for (block_idx, spec) in specs.iter().enumerate() {
+        for penalty_idx in 0..spec.penalties.len() {
+            if let Some(fixed) = spec.penalties[penalty_idx].fixed_log_lambda() {
+                if !fixed.is_finite() {
+                    return Err(CustomFamilyError::ConstraintViolation {
+                        reason: format!(
+                            "block {block_idx} penalty {penalty_idx} fixed log-precision is non-finite: {fixed}"
+                        ),
+                    }
+                    .into());
+                }
+                physical_to_outer.push(None);
+                fixed_log_lambdas.push(Some(fixed));
+                continue;
+            }
+            let label = spec.penalties[penalty_idx]
+                .precision_label()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
+            let rho0 = spec.initial_log_lambdas[penalty_idx];
+            let outer = if let Some(&outer) = label_to_outer.get(&label) {
+                let first = initial[outer];
+                if first.is_finite() && rho0.is_finite() && (first - rho0).abs() > 1e-10 {
+                    return Err(CustomFamilyError::ConstraintViolation { reason: format!(
+                        "precision label '{label}' has inconsistent initial log-precisions: {first} and {rho0}"
+                    ) }.into());
+                }
+                outer
+            } else {
+                let outer = initial.len();
+                label_to_outer.insert(label, outer);
+                initial.push(rho0);
+                outer
+            };
+            physical_to_outer.push(Some(outer));
+            fixed_log_lambdas.push(None);
+        }
+    }
+
+    Ok(PenaltyLabelLayout {
+        penalty_counts,
+        physical_to_outer,
+        fixed_log_lambdas,
+        initial_rho: Array1::from_vec(initial),
+    })
+}
+
+
+
+pub(crate) fn expand_labeled_log_lambdas(
+    rho: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Array1<f64>, String> {
+    if rho.len() != layout.initial_rho.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "log-lambda label coordinate mismatch: got {}, expected {}",
+                rho.len(),
+                layout.initial_rho.len()
+            ),
+        }
+        .into());
+    }
+    let mut expanded = Array1::<f64>::zeros(layout.physical_count());
+    for (physical, outer) in layout.physical_to_outer.iter().enumerate() {
+        expanded[physical] = match *outer {
+            Some(outer) => rho[outer],
+            None => layout.fixed_log_lambdas[physical].ok_or_else(|| {
+                CustomFamilyError::ConstraintViolation {
+                    reason: format!(
+                        "fixed penalty layout missing value at physical slot {physical}"
+                    ),
+                }
+                .to_string()
+            })?,
+        };
+    }
+    Ok(expanded)
+}
+
+
+
+pub(crate) fn split_labeled_log_lambdas(
+    rho: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Vec<Array1<f64>>, String> {
+    let expanded = expand_labeled_log_lambdas(rho, layout)?;
+    split_log_lambdas(&expanded, &layout.penalty_counts)
+}
+
+
+
+pub(crate) fn aggregate_labeled_gradient(
+    gradient: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Array1<f64>, String> {
+    if gradient.len() != layout.physical_count() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "physical gradient length mismatch: got {}, expected {}",
+                gradient.len(),
+                layout.physical_count()
+            ),
+        }
+        .into());
+    }
+    let mut out = Array1::<f64>::zeros(layout.initial_rho.len());
+    for (physical, outer) in layout.physical_to_outer.iter().enumerate() {
+        if let Some(outer) = *outer {
+            out[outer] += gradient[physical];
+        }
+    }
+    Ok(out)
 }
