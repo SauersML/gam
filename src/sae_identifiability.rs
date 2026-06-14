@@ -47,9 +47,6 @@
 //! ([`crate::inference::row_metric::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
-use crate::geometry::curvature_estimand::{
-    FlatnessTest, KappaProfileCi, flatness_lr_test, profile_ci_walk,
-};
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{
