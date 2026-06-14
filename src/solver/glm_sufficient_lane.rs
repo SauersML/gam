@@ -80,9 +80,42 @@
 //!      holds for the trial's converged predictor, serve the first Fisher step's
 //!      `(XᵀWX, XᵀWz)` from the tensor n-free; otherwise keep the exact rebuild.
 //!
-//! The seam itself is owned by the teammate editing `src/terms/smooth.rs`; this
-//! module is the n-free provider it consumes, with the guard ([`weight_drift_within`])
-//! that keeps the approximation honest.
+//! ### The GLM outer-GRADIENT n-free provider (#1033 (c), gradient channel)
+//!
+//! The value lane above (the first-Fisher-step `XᵀWX`) only retires the inner
+//! P-IRLS first-iteration Gram build; the OUTER ψ-gradient still pays per-trial
+//! n-contractions when it assembles the `j == 0` HyperCoord — the envelope
+//! `a_j = −u·(X_τβ̂) + …`, the score `g_j = X_τᵀu − XᵀW(X_τβ̂) − S_τβ̂`. Both are
+//! PURE first-order objects with NO third-derivative curvature term, so at the
+//! converged β̂ they reduce EXACTLY (algebra identical to the Gaussian
+//! `gaussian_psi_gram_deriv` lane) to the frozen-W tensor derivatives:
+//!
+//! ```text
+//!   a_j = −(∂b/∂ψ·β̂ − ½β̂ᵀ(∂G/∂ψ)β̂) + ½β̂ᵀS_τβ̂
+//!   g_j =  ∂b/∂ψ − (∂G/∂ψ)·β̂ − S_τβ̂
+//! ```
+//!
+//! (using `u = W(z−η̂)` at the FROZEN `W`: `u·X_τβ̂ = ∂b/∂ψ·β̂ − ½β̂ᵀ∂G/∂ψ·β̂` and
+//! `X_τᵀu − XᵀW X_τβ̂ = ∂b/∂ψ − ∂G/∂ψ·β̂`). [`FrozenWeightGramTensor::gradient_pair_if_sound`]
+//! is the n-free provider for this channel: it returns `(∂G/∂ψ, ∂b/∂ψ)` only
+//! when ψ is in the certified gradient sub-window AND the converged working
+//! weight is within the TIGHT [`FrozenWeightGramTensor::GRADIENT_WEIGHT_DRIFT_RTOL`]
+//! of the frozen snapshot — unlike the value lane (which RECONVERGES the true
+//! `W`, so its value is exact at any drift), the gradient is read once at the
+//! converged point with no safety net, so the gate must keep the frozen-W
+//! derivative equal to the converged-W derivative to the outer-gradient bar.
+//! The drift `B_j` (Hessian) is NOT served by this provider: GLM `B_j` carries
+//! the irreducibly-n-dependent third-derivative curvature `Xᵀdiag(c⊙X_τβ̂)X`
+//! that the frozen tensor does not hold, so the drift stays on the exact path.
+//!
+//! The seam itself is owned by the teammate editing `src/terms/smooth.rs` and
+//! the evaluator (`src/solver/estimate.rs`): they snapshot the converged
+//! working weight, call `gradient_pair_if_sound`, and install the resulting
+//! conditioned-frame pair onto the inner REML surface (a GLM analogue of the
+//! Gaussian `install_gaussian_psi_gram_deriv` install). This module is the
+//! n-free provider they consume, with both guards ([`weight_drift_within`] for
+//! the value lane, [`FrozenWeightGramTensor::GRADIENT_WEIGHT_DRIFT_RTOL`] for
+//! the gradient lane) that keep the approximation honest.
 
 use crate::solver::psi_gram_tensor::PsiGramTensor;
 use ndarray::{Array1, Array2, ArrayView1};
@@ -209,6 +242,58 @@ impl FrozenWeightGramTensor {
     pub fn frozen_weights(&self) -> ArrayView1<'_, f64> {
         self.frozen_w.view()
     }
+
+    /// The n-free conditioned-frame ψ-gradient pair `(∂(XᵀWX)/∂ψ, ∂(XᵀWz)/∂ψ)`
+    /// at the frozen `W`, returned ONLY when it is sound to serve the GLM outer
+    /// gradient n-free for this trial — i.e. when BOTH
+    ///
+    ///   1. `ψ` lies inside the certified gradient sub-window
+    ///      ([`Self::contains_for_gradient`]) where the analytic Chebyshev
+    ///      derivative is bit-tight against the exact frozen-`W` design
+    ///      derivative, AND
+    ///   2. the trial's converged working weight `w_trial` is within the TIGHT
+    ///      [`Self::GRADIENT_WEIGHT_DRIFT_RTOL`] of the frozen `W`, so the
+    ///      frozen-`W` derivative IS the converged-`W` derivative to the
+    ///      outer-gradient bar.
+    ///
+    /// Returns `None` otherwise — the caller then keeps the exact per-trial n×k
+    /// `∂X/∂ψ` slab gradient. This is the GLM analogue of the Gaussian
+    /// `gaussian_psi_gram_deriv` lane: the design-derivative half of the
+    /// `j == 0` HyperCoord (`g_j`, the Fisher `B_j` drift) reduces EXACTLY to
+    /// these two k-space objects at the converged point (Fisher curvature only —
+    /// the same curvature the value channel's frozen Fisher step uses), so the
+    /// per-trial `XᵀW(X_τβ̂)` and `X_τᵀu` n-passes are retired on this channel.
+    pub fn gradient_pair_if_sound(
+        &self,
+        psi: f64,
+        w_trial: ArrayView1<'_, f64>,
+    ) -> Option<(Array2<f64>, Array1<f64>)> {
+        if !self.contains_for_gradient(psi) {
+            return None;
+        }
+        if !self.weight_drift_within(w_trial, Self::GRADIENT_WEIGHT_DRIFT_RTOL) {
+            return None;
+        }
+        Some((self.dgram_dpsi(psi), self.drhs_dpsi(psi)))
+    }
+
+    /// Relative weight-drift tolerance for the GRADIENT channel.
+    ///
+    /// The value channel ([`Self::weight_drift_within`] at the caller's loose
+    /// `FROZEN_GLM_WEIGHT_DRIFT_RTOL ≈ 1e-3`) can afford a loose gate because the
+    /// inner P-IRLS RECONVERGES the true (moving) `W` after the frozen first
+    /// Fisher step — so the trial's VALUE is exact regardless of drift; only the
+    /// first Gram BUILD is skipped. The outer GRADIENT has no such safety net:
+    /// it is read once at the converged point, so serving its design-derivative
+    /// `(∂(XᵀWX)/∂ψ, ∂(XᵀWz)/∂ψ)` from the FROZEN `W` instead of the converged
+    /// `W` injects a relative error of order `‖W_conv − W_frozen‖ / ‖W‖`
+    /// directly into `∂G/∂ψ` (since `∂(XᵀWX)/∂ψ = X_τᵀW X + XᵀW X_τ` is LINEAR in
+    /// `W`). The downstream outer REML gradient contracts `∂G/∂ψ` through `H⁻¹`
+    /// and `β̂`, so to stay below the `1e-7` outer-gradient bar with margin (the
+    /// same discipline as [`crate::solver::psi_gram_tensor::PSI_GRAM_GRAD_SPOT_RTOL`]
+    /// `= 1e-11` for the Gaussian lane) the gradient channel must only fire when
+    /// the converged `W` is within a TIGHT relative drift of the frozen `W`.
+    pub const GRADIENT_WEIGHT_DRIFT_RTOL: f64 = 1.0e-9;
 
     /// Per-trial honesty guard: true when the trial's converged working weight
     /// `w_trial` (formed from the new ψ's converged predictor) is within
@@ -456,6 +541,78 @@ mod tests {
         // Mismatched length is rejected.
         let w_short = Array1::<f64>::ones(n - 1);
         assert!(!tensor.weight_drift_within(w_short.view(), 1e-1));
+    }
+
+    #[test]
+    fn gradient_pair_sound_only_in_window_and_under_tight_drift() {
+        let (n, k) = (160usize, 4usize);
+        let (psi_lo, psi_hi) = (-0.5, 0.5);
+        let w = frozen_weights(n);
+        let z = working_z(n);
+        let tensor = FrozenWeightGramTensor::build(
+            |psi| synth_design(psi, n, k),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("frozen-W tensor must certify");
+
+        let psi = 0.0;
+        assert!(
+            tensor.contains_for_gradient(psi),
+            "interior must certify for the gradient lane"
+        );
+
+        // Zero drift (converged W == frozen W) inside the window: sound, and the
+        // returned pair must equal the raw n-free derivatives (one source of
+        // truth — no separate approximation injected by the gate).
+        let pair = tensor
+            .gradient_pair_if_sound(psi, w.view())
+            .expect("zero-drift in-window trial must serve the gradient n-free");
+        let dg = tensor.dgram_dpsi(psi);
+        let db = tensor.drhs_dpsi(psi);
+        for (a, b) in pair.0.iter().zip(dg.iter()) {
+            assert_eq!(a, b, "gradient_pair ∂G/∂ψ must be the raw derivative");
+        }
+        for (a, b) in pair.1.iter().zip(db.iter()) {
+            assert_eq!(a, b, "gradient_pair ∂b/∂ψ must be the raw derivative");
+        }
+
+        // A drift just above the tight gradient gate (but well inside the loose
+        // value gate) must REFUSE the gradient lane — the gradient has no
+        // reconvergence safety net, so the frozen-W derivative would inject
+        // ~1e-6 relative error past the outer-gradient bar.
+        let w_value_grade: Array1<f64> =
+            w.mapv(|v| v * (1.0 + 1e-6)); // value gate (1e-3) accepts this
+        assert!(
+            tensor.weight_drift_within(w_value_grade.view(), 1e-3),
+            "value-grade gate must accept a 1e-6 drift"
+        );
+        assert!(
+            tensor
+                .gradient_pair_if_sound(psi, w_value_grade.view())
+                .is_none(),
+            "gradient lane must refuse a drift past GRADIENT_WEIGHT_DRIFT_RTOL"
+        );
+
+        // A drift below the tight gradient gate is accepted.
+        let w_grad_grade: Array1<f64> = w.mapv(|v| v * (1.0 + 1e-11));
+        assert!(
+            tensor
+                .gradient_pair_if_sound(psi, w_grad_grade.view())
+                .is_some(),
+            "gradient lane must accept a drift within GRADIENT_WEIGHT_DRIFT_RTOL"
+        );
+
+        // Outside the gradient sub-window the lane refuses even at zero drift.
+        let psi_edge = psi_hi - 1e-6;
+        if !tensor.contains_for_gradient(psi_edge) {
+            assert!(
+                tensor.gradient_pair_if_sound(psi_edge, w.view()).is_none(),
+                "near-edge ψ outside the gradient sub-window must refuse the lane"
+            );
+        }
     }
 
     #[test]
