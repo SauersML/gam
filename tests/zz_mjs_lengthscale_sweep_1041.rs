@@ -146,10 +146,10 @@ fn mjs_lengthscale_sweep_localizes_1041_deficit() {
             marginal_prob_rmse(&f, &grid)
         );
     }
-    // measure-jet AUTO length-scale (the current default = 2x spacing).
+    // measure-jet AUTO length-scale (the current default = 1x spacing).
     if let Some(f) = fit_bms(&format!("mjs(x1, x2, centers={CENTERS})"), &ds) {
         eprintln!(
-            "[mjs-ell-sweep] mjs auto(2x)         rmse={:.5}",
+            "[mjs-ell-sweep] mjs auto(1x)         rmse={:.5}",
             marginal_prob_rmse(&f, &grid)
         );
     }
