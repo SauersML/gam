@@ -1926,7 +1926,10 @@ pub(crate) mod row_kernel;
 #[cfg(test)]
 #[path = "../../../tests/src_modules/families_bms_tests.rs"]
 mod tests;
-pub(crate) mod workspace;
+pub(crate) mod axis_direction_search;
+pub(crate) mod cell_moment_assembly;
+pub(crate) mod custom_family_impl;
+pub(crate) mod row_primary_hessian;
 
 pub use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use gradient_paths::{

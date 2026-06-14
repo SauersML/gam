@@ -1,3 +1,13 @@
+use super::cell_moment_assembly::{
+    BernoulliInterceptSolveStats, fill_link_basis_cell_coeff_gradient,
+    fill_link_basis_cell_coeff_jet, fill_score_basis_cell_coeff_jet,
+};
+use super::exact_eval_cache::*;
+use super::family::*;
+use super::gradient_paths::*;
+use super::hessian_paths::*;
+use super::row_kernel::*;
+use super::*;
 
 impl BernoulliMarginalSlopeFamily {
     pub(super) fn intercept_primary_point(

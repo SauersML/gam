@@ -20,7 +20,7 @@ use super::*;
 /// gradient / trace / trace-gradient / batched), which only differ in the
 /// target arrays and the label string passed to the iterator.
 #[inline]
-fn fill_score_basis_cell_coeff_jet(
+pub(super) fn fill_score_basis_cell_coeff_jet(
     idx: usize,
     basis_span: super::exact_kernel::LocalSpanCubic,
     b: f64,
@@ -47,7 +47,7 @@ fn fill_score_basis_cell_coeff_jet(
 /// required. Shared, unconditional body across the gradient call sites that
 /// only differ in target arrays and the iterator label string.
 #[inline]
-fn fill_link_basis_cell_coeff_gradient(
+pub(super) fn fill_link_basis_cell_coeff_gradient(
     idx: usize,
     basis_span: super::exact_kernel::LocalSpanCubic,
     a: f64,
@@ -76,7 +76,7 @@ fn fill_link_basis_cell_coeff_gradient(
 /// by `scale`. Identical across every link-wiggle call site, which only differ
 /// in the target arrays and the iterator label string.
 #[inline]
-fn fill_link_basis_cell_coeff_jet(
+pub(super) fn fill_link_basis_cell_coeff_jet(
     idx: usize,
     basis_span: super::exact_kernel::LocalSpanCubic,
     a: f64,
@@ -105,7 +105,7 @@ fn fill_link_basis_cell_coeff_jet(
 }
 
 
-fn assemble_bms_block_local_s_psi(
+pub(super) fn assemble_bms_block_local_s_psi(
     deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
     per_block_rho: &Array1<f64>,
     p_block: usize,
