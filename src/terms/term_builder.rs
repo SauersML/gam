@@ -1004,8 +1004,35 @@ fn parse_periods(
     options: &BTreeMap<String, String>,
     periodic_axes: &[bool],
 ) -> Result<Vec<Option<f64>>, String> {
-    let periods =
-        parse_optional_numeric_list(options, &["period", "periods"], periodic_axes.len())?;
+    let dim = periodic_axes.len();
+    // Broadcast a single-element `period=[v]` onto the lone periodic axis
+    // of a multi-axis smooth (e.g. `te(th, h, bc=['periodic','natural'],
+    // period=[2*pi])`): with only one periodic margin, the value can only
+    // belong there.
+    let lone_periodic_broadcast = options
+        .get("period")
+        .or_else(|| options.get("periods"))
+        .and_then(|raw| {
+            let values = split_list_option(raw);
+            if values.len() != 1 || dim <= 1 {
+                return None;
+            }
+            let mut iter = periodic_axes.iter().enumerate().filter(|(_, p)| **p);
+            let first = iter.next()?;
+            if iter.next().is_some() {
+                return None;
+            }
+            Some((first.0, values.into_iter().next().unwrap()))
+        });
+    let periods = if let Some((axis, value)) = lone_periodic_broadcast {
+        let mut out = vec![None; dim];
+        if !value.eq_ignore_ascii_case("none") {
+            out[axis] = Some(parse_numeric_expr(&value)?);
+        }
+        out
+    } else {
+        parse_optional_numeric_list(options, &["period", "periods"], dim)?
+    };
     for (axis, (periodic, period)) in periodic_axes.iter().zip(periods.iter()).enumerate() {
         if *periodic
             && let Some(value) = period
