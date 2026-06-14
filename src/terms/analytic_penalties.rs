@@ -113,5 +113,5 @@
 //! | BlockOrthogonality | ext-coord (latent t) | 0 or 1 (log μ_block_orth) |
 
 // Split from the original oversized module; keep included in order.
-include!("analytic_penalties_parts/part_000.rs");
-include!("analytic_penalties_parts/part_001.rs");
+include!("analytic_penalties_core_traits.rs");
+include!("analytic_penalties_decoder_orthogonality_and_tests.rs");
