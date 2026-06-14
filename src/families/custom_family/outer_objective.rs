@@ -5107,196 +5107,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         )?;
     }
 
-    ORPHAN_DELETE_MARKER_BEGIN
-            // Re-evaluate at current β to get the joint gradient and Hessian.
-            refresh_all_block_etas(family, specs, &mut states)?;
-            let eval_for_polish = family.evaluate(&states)?;
-            let grad_full =
-                match exact_newton_joint_gradient_from_eval(&eval_for_polish, specs, &states)? {
-                    Some(g) => g,
-                    None => break,
-                };
-            // Spec-aware joint Hessian: canonical coupled-curvature source
-            // (see the joint-Newton availability gate). Families overriding
-            // only `_with_specs` return `None` from the spec-less default.
-            let h_joint_opt = family.exact_newton_joint_hessian_with_specs(&states, specs)?;
-            let Some(h_joint) = h_joint_opt else { break };
-            let mut h_dense = match symmetrized_square_matrix(
-                h_joint,
-                total_p_joint,
-                "joint polish Hessian shape mismatch",
-            ) {
-                Ok(matrix) => matrix,
-                Err(_) => break,
-            };
-            add_joint_penalty_to_matrix(
-                &mut h_dense,
-                &ranges_joint,
-                &s_lambdas,
-                trace_diagonal_ridge,
-                joint_bundle,
-            );
-
-            let mut beta_joint = Array1::<f64>::zeros(total_p_joint);
-            for b in 0..specs.len() {
-                let (start, end) = ranges_joint[b];
-                beta_joint
-                    .slice_mut(ndarray::s![start..end])
-                    .assign(&states[b].beta);
-            }
-            let penalty_beta = apply_joint_block_penalty(
-                &ranges_joint,
-                &s_lambdas,
-                &beta_joint,
-                joint_mode_diagonal_ridge,
-                joint_bundle,
-            );
-            let rhs = &grad_full - &penalty_beta;
-
-            // Respect constraints that block line search on the boundary.
-            // Gauss-Seidel blockwise leaves the joint KKT residual at a floor
-            // around |λ_k S_k β̂| for boundary-active components. The residual
-            // magnitude on FREE components is a better measure of whether we
-            // should keep polishing: if β_i is clipped at the boundary and
-            // KKT multiplier μ_i > 0, then rhs[i] is the multiplier, not a
-            // free-space gradient violation.
-            let block_constraints_now = collect_block_linear_constraints(family, &states, specs)?;
-            let joint_constraints_now = assemble_joint_linear_constraints(
-                &block_constraints_now,
-                &ranges_joint,
-                total_p_joint,
-            )?;
-            let mut active_mask: Vec<bool> = vec![false; total_p_joint];
-            if let Some(ref constraints) = joint_constraints_now
-                && let Ok(Some(bounds)) = extract_simple_lower_bounds(constraints, total_p_joint)
-            {
-                for (idx, (bound, beta_val)) in bounds
-                    .lower_bounds
-                    .iter()
-                    .zip(beta_joint.iter())
-                    .enumerate()
-                {
-                    if *bound > f64::NEG_INFINITY && (*beta_val - *bound).abs() < 1e-12 {
-                        active_mask[idx] = true;
-                    }
-                }
-            }
-            let res_inf_free = rhs
-                .iter()
-                .zip(active_mask.iter())
-                .filter(|(_, active)| !**active)
-                .map(|(v, _)| v.abs())
-                .fold(0.0_f64, f64::max);
-            // Scale-aware residual tolerance — the joint stationarity
-            // residual ‖∇ℓ − Sβ‖_∞ scales with |obj| (≈ O(n) at large-scale
-            // scale), so the historical absolute `inner_tol = 1e-6` is
-            // unachievable here even at the true minimum. Same rationale
-            // as the joint-Newton convergence test above.
-            let polish_obj = -cached_eval.log_likelihood + current_penalty;
-            let polish_residual_tol = inner_tol * (1.0 + polish_obj.abs());
-            if res_inf_free <= polish_residual_tol {
-                converged = true;
-                break;
-            }
-
-            // Solve constrained Newton system if simple bounds are present,
-            // else unconstrained.
-            let delta = if let Some(ref constraints) = joint_constraints_now {
-                let warm = flatten_joint_active_set(&cached_active_sets, &block_constraints_now);
-                let lower_bounds_opt = extract_simple_lower_bounds(constraints, total_p_joint)
-                    .ok()
-                    .flatten();
-                if let Some(bounds) = lower_bounds_opt.as_ref() {
-                    match solve_quadratic_with_simple_lower_bounds(
-                        &h_dense,
-                        &rhs,
-                        &beta_joint,
-                        bounds,
-                        warm.as_deref(),
-                    ) {
-                        Ok((beta_new, _active)) => &beta_new - &beta_joint,
-                        Err(_) => break,
-                    }
-                } else {
-                    match solve_quadratic_with_linear_constraints(
-                        &h_dense,
-                        &rhs,
-                        &beta_joint,
-                        constraints,
-                        warm.as_deref(),
-                    ) {
-                        Ok((beta_new, _active)) => &beta_new - &beta_joint,
-                        Err(_) => break,
-                    }
-                }
-            } else {
-                let solver = crate::linalg::utils::StableSolver::new("joint polish");
-                match solver.solvevectorwithridge_retries(
-                    &h_dense,
-                    &rhs,
-                    JOINT_TRACE_STABILITY_RIDGE,
-                ) {
-                    Some(d) => d,
-                    None => break,
-                }
-            };
-            if !delta.iter().all(|v| v.is_finite()) {
-                break;
-            }
-            // Keep polishing until the free-space joint residual is small; a
-            // tiny delta alone is not a certificate of stationarity.
-            // Damped line search with projection.
-            let old_states: Vec<ParameterBlockState> = states.clone();
-            let old_obj = -eval_for_polish.log_likelihood + current_penalty;
-            let mut accepted_polish = false;
-            for bt in 0..10 {
-                let alpha = 0.5f64.powi(bt);
-                for b in 0..specs.len() {
-                    let (start, end) = ranges_joint[b];
-                    let mut trial_beta = old_states[b].beta.clone();
-                    trial_beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
-                    let projected = family.post_update_block_beta(
-                        &old_states,
-                        b,
-                        &specs[b],
-                        trial_beta.clone(),
-                    )?;
-                    reject_constrained_post_update_repair(
-                        b,
-                        &specs[b],
-                        &trial_beta,
-                        &projected,
-                        block_constraints_now[b].as_ref(),
-                    )?;
-                    states[b].beta.assign(&projected);
-                }
-                refresh_all_block_etas(family, specs, &mut states)?;
-                let trial_ll = match family.log_likelihood_only(&states) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        for (b, s) in old_states.iter().enumerate() {
-                            states[b] = s.clone();
-                        }
-                        refresh_all_block_etas(family, specs, &mut states)?;
-                        continue;
-                    }
-                };
-                let trial_penalty = total_quadratic_penalty(
-                    &states,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                    joint_bundle,
-                    Some(specs),
-                );
-                let trial_obj = -trial_ll + trial_penalty;
-                if trial_obj.is_finite() && trial_obj <= old_obj + 1e-12 {
-                    current_penalty = trial_penalty;
-                    cached_eval = family.evaluate(&states)?;
-                    accepted_polish = true;
-                    break;
-                }
-            }
     assemble_inner_blockwise_result(
         family,
         specs,
@@ -5312,6 +5122,261 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         cycles_done,
         last_residual_tol,
     )
+}
+
+/// Polishing joint-Newton step for the blockwise fall-through path of
+/// [`inner_blockwise_fit`].
+///
+/// For block-coupled multi-block families (e.g. GAMLSS wiggle), Gauss-Seidel
+/// blockwise iteration can reach `step_inf < inner_tol` while the joint KKT
+/// residual (`||Sβ − grad_ℓ||_∞`) remains at ~10× `inner_tol`. Once blockwise
+/// has placed β near the joint optimum, a few damped joint-Newton steps tighten
+/// the joint residual to the floor set by β magnitudes; this is essential for the
+/// outer REML gradient formula (which assumes exact β̂ stationarity).
+///
+/// Behavior is identical to the inline loop it replaced: the `?`-propagation, the
+/// per-iteration `break` exits (gradient/Hessian unavailable, non-finite delta,
+/// solver failure, residual-tolerance reached, line-search failure) and the
+/// inner backtracking-search `continue` are preserved verbatim. Mutates `states`,
+/// `cached_eval`, `current_penalty`, and `converged` in place exactly as before.
+fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    joint_bundle: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
+    inner_tol: f64,
+    cached_active_sets: &[Option<Vec<usize>>],
+    states: &mut Vec<ParameterBlockState>,
+    cached_eval: &mut FamilyEvaluation,
+    current_penalty: &mut f64,
+    converged: &mut bool,
+) -> Result<(), String> {
+    let ranges_joint: Vec<(usize, usize)> = {
+        let mut offset = 0;
+        specs
+            .iter()
+            .map(|s| {
+                let start = offset;
+                offset += s.design.ncols();
+                (start, offset)
+            })
+            .collect()
+    };
+    let total_p_joint: usize = ranges_joint.last().map_or(0, |r| r.1);
+    let joint_mode_diagonal_ridge =
+        if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
+            ridge
+        } else {
+            0.0
+        };
+    let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
+
+    // Allow up to a few polishing steps. The blockwise endpoint is close
+    // to optimum, so step sizes should be small and line search should
+    // accept full steps quickly.
+    const POLISH_MAX_ITER: usize = 16;
+    for _polish_iter in 0..POLISH_MAX_ITER {
+        // Re-evaluate at current β to get the joint gradient and Hessian.
+        refresh_all_block_etas(family, specs, states)?;
+        let eval_for_polish = family.evaluate(states)?;
+        let grad_full =
+            match exact_newton_joint_gradient_from_eval(&eval_for_polish, specs, states)? {
+                Some(g) => g,
+                None => break,
+            };
+        // Spec-aware joint Hessian: canonical coupled-curvature source
+        // (see the joint-Newton availability gate). Families overriding
+        // only `_with_specs` return `None` from the spec-less default.
+        let h_joint_opt = family.exact_newton_joint_hessian_with_specs(states, specs)?;
+        let Some(h_joint) = h_joint_opt else { break };
+        let mut h_dense = match symmetrized_square_matrix(
+            h_joint,
+            total_p_joint,
+            "joint polish Hessian shape mismatch",
+        ) {
+            Ok(matrix) => matrix,
+            Err(_) => break,
+        };
+        add_joint_penalty_to_matrix(
+            &mut h_dense,
+            &ranges_joint,
+            s_lambdas,
+            trace_diagonal_ridge,
+            joint_bundle,
+        );
+
+        let mut beta_joint = Array1::<f64>::zeros(total_p_joint);
+        for b in 0..specs.len() {
+            let (start, end) = ranges_joint[b];
+            beta_joint
+                .slice_mut(ndarray::s![start..end])
+                .assign(&states[b].beta);
+        }
+        let penalty_beta = apply_joint_block_penalty(
+            &ranges_joint,
+            s_lambdas,
+            &beta_joint,
+            joint_mode_diagonal_ridge,
+            joint_bundle,
+        );
+        let rhs = &grad_full - &penalty_beta;
+
+        // Respect constraints that block line search on the boundary.
+        // Gauss-Seidel blockwise leaves the joint KKT residual at a floor
+        // around |λ_k S_k β̂| for boundary-active components. The residual
+        // magnitude on FREE components is a better measure of whether we
+        // should keep polishing: if β_i is clipped at the boundary and
+        // KKT multiplier μ_i > 0, then rhs[i] is the multiplier, not a
+        // free-space gradient violation.
+        let block_constraints_now = collect_block_linear_constraints(family, states, specs)?;
+        let joint_constraints_now = assemble_joint_linear_constraints(
+            &block_constraints_now,
+            &ranges_joint,
+            total_p_joint,
+        )?;
+        let mut active_mask: Vec<bool> = vec![false; total_p_joint];
+        if let Some(ref constraints) = joint_constraints_now
+            && let Ok(Some(bounds)) = extract_simple_lower_bounds(constraints, total_p_joint)
+        {
+            for (idx, (bound, beta_val)) in bounds
+                .lower_bounds
+                .iter()
+                .zip(beta_joint.iter())
+                .enumerate()
+            {
+                if *bound > f64::NEG_INFINITY && (*beta_val - *bound).abs() < 1e-12 {
+                    active_mask[idx] = true;
+                }
+            }
+        }
+        let res_inf_free = rhs
+            .iter()
+            .zip(active_mask.iter())
+            .filter(|(_, active)| !**active)
+            .map(|(v, _)| v.abs())
+            .fold(0.0_f64, f64::max);
+        // Scale-aware residual tolerance — the joint stationarity
+        // residual ‖∇ℓ − Sβ‖_∞ scales with |obj| (≈ O(n) at large-scale
+        // scale), so the historical absolute `inner_tol = 1e-6` is
+        // unachievable here even at the true minimum. Same rationale
+        // as the joint-Newton convergence test above.
+        let polish_obj = -cached_eval.log_likelihood + *current_penalty;
+        let polish_residual_tol = inner_tol * (1.0 + polish_obj.abs());
+        if res_inf_free <= polish_residual_tol {
+            *converged = true;
+            break;
+        }
+
+        // Solve constrained Newton system if simple bounds are present,
+        // else unconstrained.
+        let delta = if let Some(ref constraints) = joint_constraints_now {
+            let warm = flatten_joint_active_set(cached_active_sets, &block_constraints_now);
+            let lower_bounds_opt = extract_simple_lower_bounds(constraints, total_p_joint)
+                .ok()
+                .flatten();
+            if let Some(bounds) = lower_bounds_opt.as_ref() {
+                match solve_quadratic_with_simple_lower_bounds(
+                    &h_dense,
+                    &rhs,
+                    &beta_joint,
+                    bounds,
+                    warm.as_deref(),
+                ) {
+                    Ok((beta_new, _active)) => &beta_new - &beta_joint,
+                    Err(_) => break,
+                }
+            } else {
+                match solve_quadratic_with_linear_constraints(
+                    &h_dense,
+                    &rhs,
+                    &beta_joint,
+                    constraints,
+                    warm.as_deref(),
+                ) {
+                    Ok((beta_new, _active)) => &beta_new - &beta_joint,
+                    Err(_) => break,
+                }
+            }
+        } else {
+            let solver = crate::linalg::utils::StableSolver::new("joint polish");
+            match solver.solvevectorwithridge_retries(
+                &h_dense,
+                &rhs,
+                JOINT_TRACE_STABILITY_RIDGE,
+            ) {
+                Some(d) => d,
+                None => break,
+            }
+        };
+        if !delta.iter().all(|v| v.is_finite()) {
+            break;
+        }
+        // Keep polishing until the free-space joint residual is small; a
+        // tiny delta alone is not a certificate of stationarity.
+        // Damped line search with projection.
+        let old_states: Vec<ParameterBlockState> = states.clone();
+        let old_obj = -eval_for_polish.log_likelihood + *current_penalty;
+        let mut accepted_polish = false;
+        for bt in 0..10 {
+            let alpha = 0.5f64.powi(bt);
+            for b in 0..specs.len() {
+                let (start, end) = ranges_joint[b];
+                let mut trial_beta = old_states[b].beta.clone();
+                trial_beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
+                let projected = family.post_update_block_beta(
+                    &old_states,
+                    b,
+                    &specs[b],
+                    trial_beta.clone(),
+                )?;
+                reject_constrained_post_update_repair(
+                    b,
+                    &specs[b],
+                    &trial_beta,
+                    &projected,
+                    block_constraints_now[b].as_ref(),
+                )?;
+                states[b].beta.assign(&projected);
+            }
+            refresh_all_block_etas(family, specs, states)?;
+            let trial_ll = match family.log_likelihood_only(states) {
+                Ok(v) => v,
+                Err(_) => {
+                    for (b, s) in old_states.iter().enumerate() {
+                        states[b] = s.clone();
+                    }
+                    refresh_all_block_etas(family, specs, states)?;
+                    continue;
+                }
+            };
+            let trial_penalty = total_quadratic_penalty(
+                states,
+                s_lambdas,
+                ridge,
+                options.ridge_policy,
+                joint_bundle,
+                Some(specs),
+            );
+            let trial_obj = -trial_ll + trial_penalty;
+            if trial_obj.is_finite() && trial_obj <= old_obj + 1e-12 {
+                *current_penalty = trial_penalty;
+                *cached_eval = family.evaluate(states)?;
+                accepted_polish = true;
+                break;
+            }
+        }
+        if !accepted_polish {
+            // Restore and stop polishing.
+            for (b, s) in old_states.iter().enumerate() {
+                states[b] = s.clone();
+            }
+            refresh_all_block_etas(family, specs, states)?;
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Final result assembly for the blockwise / polish fall-through path of
