@@ -34,8 +34,10 @@
 
 use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
-use gam::predict::interval_policy::PredictPass;
-use gam::predict::{DispersionLocationScalePredictor, InferenceCovarianceMode, PredictInput};
+use gam::predict::{
+    DispersionLocationScalePredictor, InferenceCovarianceMode, PosteriorMeanOptions, PredictInput,
+    PredictableModel,
+};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{pearson, rmse};
 use gam::{
@@ -236,50 +238,72 @@ fn gamma_dispersion_location_scale_assembles_covariance_and_is_predictable() {
         auxiliary_matrix: None,
     };
 
-    // ── 3. POSTERIOR-MEAN PREDICT returns ────────────────────────────────────
-    //    `linear_state(.., PredictPass::PosteriorMean, ..)` is the exact arm
-    //    that hard-failed in #1119 via `require_posterior_mean_backend` when the
-    //    covariance was absent. With the joint covariance assembled it must now
-    //    return finite means + covariance-derived SEs.
-    let state = predictor
-        .linear_state(
-            &input,
-            &fit.fit,
-            PredictPass::PosteriorMean,
-            InferenceCovarianceMode::Conditional,
-        )
+    // ── 3. POSTERIOR-MEAN PREDICT returns (with confidence bounds) ───────────
+    //    `predict_posterior_mean` is the canonical response-scale predict path
+    //    (the one the CLI / FFI drive). Its posterior-mean arm hard-failed in
+    //    #1119 via `require_posterior_mean_backend` when the covariance was
+    //    absent. With the joint covariance assembled it must now return finite
+    //    means, covariance-derived η SEs, and finite confidence bounds.
+    let pm_options = PosteriorMeanOptions {
+        confidence_level: Some(0.95),
+        covariance_mode: InferenceCovarianceMode::Conditional,
+        include_observation_interval: true,
+    };
+    let pred = predictor
+        .predict_posterior_mean(&input, &fit.fit, &pm_options)
         .expect(
             "posterior-mean predict must succeed for a gamma dispersion location-scale fit \
              (this is the call that aborted in #1119)",
         );
 
-    assert_eq!(state.mean.len(), grid_n, "one predicted mean per grid row");
-    for (xi, m) in grid_x.iter().zip(state.mean.iter()) {
+    assert_eq!(pred.mean.len(), grid_n, "one predicted mean per grid row");
+    for (xi, m) in grid_x.iter().zip(pred.mean.iter()) {
         assert!(
             m.is_finite() && *m > 0.0,
             "gamma predicted mean at x={xi} must be a finite positive response, got {m}"
         );
     }
 
-    // Covariance-derived standard errors must be present and finite (they were
+    // Covariance-derived η standard errors must be finite (they were
     // unavailable when the covariance was None).
-    let eta_se = state
-        .eta_se
-        .as_ref()
-        .expect("η standard errors must be available from the joint covariance");
-    let mean_se = state
-        .mean_se
-        .as_ref()
-        .expect("mean standard errors must be available from the joint covariance");
-    assert!(
-        eta_se.iter().all(|s| s.is_finite() && *s >= 0.0)
-            && mean_se.iter().all(|s| s.is_finite() && *s >= 0.0),
-        "predict standard errors must be finite and non-negative"
+    assert_eq!(
+        pred.eta_standard_error.len(),
+        grid_n,
+        "one η standard error per grid row"
     );
+    assert!(
+        pred.eta_standard_error
+            .iter()
+            .all(|s| s.is_finite() && *s >= 0.0),
+        "predict η standard errors must be finite and non-negative"
+    );
+
+    // Confidence bounds must be present (requested) and bracket the point mean.
+    let mean_lower: &Array1<f64> = pred
+        .mean_lower
+        .as_ref()
+        .expect("posterior-mean confidence lower bound must be available from the covariance");
+    let mean_upper: &Array1<f64> = pred
+        .mean_upper
+        .as_ref()
+        .expect("posterior-mean confidence upper bound must be available from the covariance");
+    for i in 0..grid_n {
+        assert!(
+            mean_lower[i].is_finite()
+                && mean_upper[i].is_finite()
+                && mean_lower[i] <= pred.mean[i] + 1e-9
+                && pred.mean[i] <= mean_upper[i] + 1e-9,
+            "confidence interval at grid row {i} must bracket the mean: \
+             [{}, {}] around {}",
+            mean_lower[i],
+            mean_upper[i],
+            pred.mean[i]
+        );
+    }
 
     // ---- truth recovery on the held-out grid -------------------------------
     let truth_mean: Vec<f64> = grid_x.iter().map(|&xi| mu_true(xi)).collect();
-    let pred_mean: Vec<f64> = state.mean.to_vec();
+    let pred_mean: Vec<f64> = pred.mean.to_vec();
     let log_pred: Vec<f64> = pred_mean.iter().map(|m| m.ln()).collect();
     let log_truth: Vec<f64> = truth_mean.iter().map(|m| m.ln()).collect();
     let corr = pearson(&pred_mean, &truth_mean);
