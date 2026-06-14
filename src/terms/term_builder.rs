@@ -2509,6 +2509,94 @@ pub fn build_smooth_basis(
                 .to_string());
             }
             let dim = cols.len();
+
+            // Genuine thin-plate tensor for explicit `te(..., bs=c('tp','tp',...))`
+            // (#1082). The default `te()` realizes B-spline marginal bases with
+            // 2nd-difference marginal penalties (the arm below). That B-spline
+            // tensor over-smooths a noisy wiggly surface relative to mgcv's
+            // thin-plate tensor: on the gaulss-tensor truth recovery mgcv reaches
+            // RMSE(mu)=0.123 while the B-spline tensor lands at 0.151, because the
+            // difference-penalty REML shrinks the genuine signal harder than
+            // thin-plate bending energy does at n=200 under noise. When the user
+            // EXPLICITLY asks for thin-plate margins (`bs=c('tp',...)`, every
+            // margin tp/tps), honor that by building gam's mature multi-D
+            // thin-plate basis (the same one `s(x,y,bs='tps')` uses — full design /
+            // bending-energy penalty / freeze / predict support) instead of
+            // substituting B-splines. This is a true root fix (match mgcv's
+            // construction), not a tune.
+            //
+            // Scope is strict: it fires ONLY for `te` (not `ti`/`t2`, whose
+            // marginal-sum-to-zero null-space semantics differ) with an explicit
+            // all-thin-plate `bs`/`type` VECTOR and no periodic axes and no
+            // B-spline-only knobs (degree / penalty_order / knot placement — those
+            // signal the user wants the B-spline tensor). Plain `te(x,z)` and every
+            // non-tp margin vector fall straight through to the unchanged B-spline
+            // tensor arm below, so the 7 passing `te_2d_*` tests and
+            // `te_tensor_2d_hifreq` are byte-identical. The only current test that
+            // passes `bs=c('tp','tp')` to gam's `te()` is the gaulss-tensor one.
+            let all_thin_plate_margins = matches!(kind, SmoothKind::Te)
+                && options
+                    .get("bs")
+                    .or_else(|| options.get("type"))
+                    .is_some_and(|raw| {
+                        bs_selector_is_vector(raw) && {
+                            let per_margin = parse_option_list(raw);
+                            per_margin.len() == dim
+                                && per_margin.iter().all(|m| {
+                                    matches!(
+                                        m.trim().to_ascii_lowercase().as_str(),
+                                        "tp" | "tps" | "thinplate" | "thin-plate"
+                                    )
+                                })
+                        }
+                    })
+                && parse_tensor_periodic_axes(options, dim)?.iter().all(|p| !p)
+                && !options.contains_key("degree")
+                && !options.contains_key("penalty_order")
+                && !options.contains_key("knot_placement")
+                && !options.contains_key("knot-placement")
+                && !options.contains_key("knotplacement");
+            if all_thin_plate_margins {
+                // mgcv's `te(tp,tp)` leaves the tensor null space unpenalized
+                // (`select = FALSE`); the multi-D thin-plate's bending penalty
+                // already spans only the range space and leaves the polynomial
+                // null space free, so no double penalty is added (an explicit
+                // user `double_penalty=`/`select=` still wins, matching the
+                // B-spline tensor arm below).
+                let tp_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
+                let plan = plan_spatial_basis(
+                    ds.values.nrows(),
+                    dim,
+                    CenterCountRequest::Default,
+                    DuchonNullspaceOrder::Linear,
+                    option_bool(options, "scale_dims").unwrap_or(false),
+                    policy,
+                )
+                .map_err(|e| e.to_string())?;
+                let centers = parse_countwith_basis_alias(
+                    options,
+                    "centers",
+                    cap_default_spatial_centers(options, plan.centers),
+                )?;
+                let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
+                    spatial_center_strategy_for_dimension(centers, dim)
+                } else {
+                    auto_spatial_center_strategy(centers, dim)
+                };
+                return Ok(SmoothBasisSpec::ThinPlate {
+                    feature_cols: cols.to_vec(),
+                    spec: ThinPlateBasisSpec {
+                        center_strategy,
+                        periodic: parse_periodic_axes_option(options, dim)?,
+                        length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
+                        double_penalty: tp_double_penalty,
+                        identifiability: parse_spatial_identifiability(options)
+                            .map_err(|e| e.to_string())?,
+                        radial_reparam: None,
+                    },
+                    input_scales: None,
+                });
+            }
             // Per-margin basis vector (`bs=c('tp','tp')` / `bs=['ps','cr']`):
             // validate each requested margin is a penalized-spline basis that
             // the tensor product realizes as a 1-D B-spline margin. mgcv's
