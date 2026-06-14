@@ -586,6 +586,20 @@ pub fn fit_latent_survival_terms(
         .event_target
         .iter()
         .any(|&code| code == LATENT_SURVIVAL_EVENT_INTERVAL);
+    let interval_row_count = spec
+        .event_target
+        .iter()
+        .filter(|&&code| code == LATENT_SURVIVAL_EVENT_INTERVAL)
+        .count();
+    // [#1108 DIAG] remove after diagnosis.
+    eprintln!(
+        "[#1108 WARM] fit_latent_survival_terms entry: n={} interval_rows={} has_interval={} latent_sd_fixed={:?} n_blocks={}",
+        n,
+        interval_row_count,
+        has_interval_rows,
+        latent_sd,
+        blocks.len(),
+    );
     if has_interval_rows {
         let warm_event_target = spec.event_target.mapv(|code| {
             if code == LATENT_SURVIVAL_EVENT_INTERVAL {
@@ -599,6 +613,8 @@ pub fn fit_latent_survival_terms(
         // The exact-event-at-L surrogate ignores the interval upper bound `R`, so
         // the (unused) `q_right` channel cannot drift the fit; leaving the right
         // design/mass in place is harmless (no interval row remains to read it).
+        // [#1108 DIAG] remove after diagnosis.
+        eprintln!("[#1108 WARM] attempting exact-event-at-L surrogate fit (fixed-lambda inner solve)");
         let warm_fit = fit_custom_family_fixed_log_lambdas(
             &warm_family,
             &blocks,
@@ -608,15 +624,54 @@ pub fn fit_latent_survival_terms(
             None,
             false,
         );
+        match &warm_fit {
+            Ok(wf) => {
+                let betas: Vec<String> = wf
+                    .block_states
+                    .iter()
+                    .map(|s| {
+                        let norm = s.beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        format!("|beta|={norm:.4e}(p={})", s.beta.len())
+                    })
+                    .collect();
+                let warm_sd = warm_family.latent_sd(&wf.block_states);
+                // [#1108 DIAG] remove after diagnosis.
+                eprintln!(
+                    "[#1108 WARM] surrogate CONVERGED: {} warm_sigma={:?}",
+                    betas.join(" "),
+                    warm_sd,
+                );
+            }
+            Err(e) => {
+                // [#1108 DIAG] remove after diagnosis.
+                eprintln!("[#1108 WARM] surrogate FAILED: {e}");
+            }
+        }
         if let Ok(warm_fit) = warm_fit {
             for (block, state) in blocks.iter_mut().zip(warm_fit.block_states.iter()) {
                 if state.beta.iter().all(|v| v.is_finite()) {
                     block.initial_beta = Some(state.beta.clone());
                 }
             }
+            // [#1108 DIAG] remove after diagnosis.
+            let seeded: Vec<String> = blocks
+                .iter()
+                .map(|b| match &b.initial_beta {
+                    Some(beta) => {
+                        let norm = beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        format!("|init_beta|={norm:.4e}")
+                    }
+                    None => "init_beta=None".to_string(),
+                })
+                .collect();
+            eprintln!("[#1108 WARM] seeded interval blocks: {}", seeded.join(" "));
         }
     }
-    let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
+    let fit = fit_custom_family(&family, &blocks, options).map_err(|e| {
+        // [#1108 DIAG] remove after diagnosis.
+        eprintln!("[#1108 WARM] interval fit_custom_family FAILED: {e}");
+        e.to_string()
+    })?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
     let baseline_offset_residuals = family.offset_channel_residuals(&fit.block_states)?;
     Ok(LatentSurvivalTermFitResult {
