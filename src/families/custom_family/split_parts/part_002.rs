@@ -5624,6 +5624,20 @@ fn symmetric_negative_curvature_reflected(matrix: &Array2<f64>) -> Array2<f64> {
 }
 
 
+/// Smallest (signed) eigenvalue of a symmetric matrix; `NaN` if the
+/// eigendecomposition fails. Diagnostic helper for the #1040 convexification
+/// trace — reads the most-negative curvature so the log can confirm whether the
+/// constrained-QP Hessian is indefinite and whether the reflection engaged.
+fn symmetric_min_eigenvalue_signed(matrix: &Array2<f64>) -> f64 {
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    match FaerEigh::eigh(&sym, Side::Lower) {
+        Ok((evals, _)) => evals.iter().copied().fold(f64::INFINITY, f64::min),
+        Err(_) => f64::NAN,
+    }
+}
+
+
 fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<usize> {
     let p = lhs.nrows();
     if p == 0 || lhs.ncols() != p {

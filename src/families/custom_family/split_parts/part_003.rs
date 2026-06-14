@@ -908,6 +908,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let solve_joint_constraints_dense = joint_constraints.is_some()
                 || !matrix_free_joint_requested
                 || joint_hessian_is_dense;
+            if cycle == 0 {
+                log::info!(
+                    "[JN-BRANCH-DIAG #1040] cycle=0 joint_constraints_is_some={} matrix_free_joint_requested={} joint_hessian_is_dense={} solve_joint_constraints_dense={} -> branch={} total_p={} levenberg_on_ill_cond={}",
+                    joint_constraints.is_some(),
+                    matrix_free_joint_requested,
+                    joint_hessian_is_dense,
+                    solve_joint_constraints_dense,
+                    if solve_joint_constraints_dense && joint_constraints.is_some() {
+                        "CONSTRAINED_QP"
+                    } else if matrix_free_joint_requested && !joint_hessian_is_dense {
+                        "MATRIX_FREE_PCG"
+                    } else {
+                        "DENSE_SPECTRAL"
+                    },
+                    total_p,
+                    family.levenberg_on_ill_conditioning(),
+                );
+            }
             // Exact trust-region subproblem factorization (gam#979). Populated on
             // the unconstrained dense-spectral path with the metric-whitened
             // eigendecomposition of the penalized Hessian, so the trust loop below
@@ -1158,7 +1176,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     ) {
                         joint_spectrum = Some(spectrum);
                     }
-                    let lhs = symmetric_negative_curvature_reflected(&lhs);
+                    let lhs_reflected = symmetric_negative_curvature_reflected(&lhs);
+                    if cycle <= 2 {
+                        let min_eval_raw = symmetric_min_eigenvalue_signed(&lhs);
+                        let min_eval_refl = symmetric_min_eigenvalue_signed(&lhs_reflected);
+                        log::info!(
+                            "[JN-REFLECT-DIAG #1040] cycle={cycle} CONSTRAINED_QP lambda_min_signed_raw={min_eval_raw:.3e} lambda_min_signed_reflected={min_eval_refl:.3e} (reflection {})",
+                            if min_eval_refl > min_eval_raw + min_eval_raw.abs() * 1e-9 {
+                                "CHANGED the spectrum"
+                            } else {
+                                "NO-OP (already PSD)"
+                            },
+                        );
+                    }
+                    let lhs = lhs_reflected;
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                     let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
                         solve_quadratic_with_simple_lower_bounds(
