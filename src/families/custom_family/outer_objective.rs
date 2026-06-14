@@ -2843,21 +2843,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // objective plateau). Computing the eigh EVERY inner cycle therefore
             // added a redundant O(p³) eigendecomposition per cycle to every
             // penalized family carrying a null space (every tp-smooth model) — the
-            // multinomial smooth-by-factor >250s wall-clock regression.
+            // multinomial smooth-by-factor wall-clock regression.
             //
-            // The eigh is now deferred to `range_projected_block_stationarity_small`
+            // The eigh is deferred to `range_projected_block_stationarity_small`
             // (called ONLY inside a certificate branch whose cheap precondition has
-            // already passed via short-circuit `&&`). The cheap RAW gate
-            // (`raw_all_block_stationarity_small`, no eigh) is kept for the
-            // per-cycle diagnostic so logging never triggers the expensive path.
-            let raw_all_block_stationarity_small = block_stationarity_norms
-                .iter()
-                .zip(&block_stationarity_tolerances)
-                .all(|(norm, tol)| {
-                    norm.is_finite()
-                        && tol.is_finite()
-                        && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * *tol
-                });
+            // already passed via short-circuit `&&`), so on the convergence-tail
+            // it runs at most once per accepted exit rather than once per cycle.
             let range_projected_block_stationarity_small = || -> bool {
                 projected_residual_range_space_per_block_inf(
                     &projected_residual_vec,
@@ -2877,112 +2868,24 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * *tol
                 })
             };
-            // #979 divergence trace: separate the RAW likelihood gradient
-            // (‖∇ℓ‖∞ per block) from the constraint-PROJECTED stationarity
-            // residual (active-set dual mass subtracted). A raw gradient that
-            // grows with a static β means the likelihood gradient itself is
-            // diverging (the unbounded flat-baseline-hazard direction). A
-            // projected residual that grows while the raw gradient is bounded
-            // means the active-set dual residual is the runaway. Also surface
-            // the time-block β extent and active-set sizes so we can see whether
-            // the hazard-floor constraint is pinning the runaway direction.
-            if cycle <= 40 {
-                let active_sizes: Vec<usize> = cached_active_sets
-                    .iter()
-                    .map(|a| a.as_ref().map(|v| v.len()).unwrap_or(0))
-                    .collect();
-                let beta0_min = states[0].beta.iter().copied().fold(f64::INFINITY, f64::min);
-                let beta0_max = states[0]
-                    .beta
-                    .iter()
-                    .copied()
-                    .fold(f64::NEG_INFINITY, f64::max);
-                // Penalty VALUE on block 0 (½β0ᵀ(λS)β0) vs its gradient norm
-                // (‖(λS)β0‖∞ = block_penalty_inf[0]). If the value is small while
-                // the gradient norm is 1.7e9, the objective the line search
-                // accepts on is NOT counting the penalty that the residual/step
-                // sees — the objective↔gradient desync. s_lambdas[0] direct so we
-                // also see whether the matrix itself carries the 1e9 scale.
-                let block0_quad_penalty = block_quadratic_penalty(
-                    &states[0].beta,
-                    &s_lambdas[0],
-                    ridge,
-                    options.ridge_policy,
-                );
-                let s0_max_abs = s_lambdas[0].iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                // Min eigenvalue of the assembled time-block λS. If negative, the
-                // penalty matrix is NOT PSD — the source of the negative quadratic
-                // penalty value (a ½βᵀSβ with PSD S cannot be < 0). Also break out
-                // the per-penalty quadratic forms βᵀS_kβ so we can see WHICH
-                // penalty matrix (I-spline curvature vs nullspace-shrinkage)
-                // carries the indefinite/negative direction.
-                let s0_min_eval = symmetric_min_eigenvalue_signed(&s_lambdas[0]);
-                let per_penalty_quad: Vec<String> = specs[0]
-                    .penalties
-                    .iter()
-                    .map(|s_k| {
-                        let q = states[0].beta.dot(&s_k.dot(&states[0].beta));
-                        format!("{q:.3e}")
-                    })
-                    .collect();
-                // Convergence-gate trace (gam#979 endgame): the range-space
-                // (identified-subspace) residual, the Newton decrement, and the
-                // residual/objective tolerances + gate booleans. After the PSD
-                // fix the solve is stationary (objective flat) but the absolute
-                // KKT residual plateaus above tol on the penalty-null affine
-                // direction; this surfaces exactly which certificate is being
-                // denied so we scale the right gate.
-                let range_residual_diag = projected_residual_range_space_inf(
-                    &projected_residual_vec,
-                    &joint_hessian_source,
-                    &ranges,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                    total_p,
-                );
-                let decrement_diag = joint_spectrum
-                    .as_ref()
-                    .map(|spectrum| spectrum.newton_decrement());
-                log::info!(
-                    "[JN-CONV-DIAG #979] cycle={cycle} resid={residual:.3e} residual_tol={residual_tol:.3e} range_residual={range_residual_diag:?} newton_decrement={decrement_diag:?} raw_all_block_stationarity_small={raw_all_block_stationarity_small} block_stat_norms={:?} block_stat_tols={:?}",
-                    block_stationarity_norms
-                        .iter()
-                        .map(|v| format!("{v:.3e}"))
-                        .collect::<Vec<_>>(),
-                    block_stationarity_tolerances
-                        .iter()
-                        .map(|v| format!("{v:.3e}"))
-                        .collect::<Vec<_>>(),
-                );
-                log::info!(
-                    "[JN-GRAD-DIAG #979] cycle={cycle} obj={:.6e} current_penalty={:.6e} block0_quad_penalty={:.6e} s0_max_abs={:.3e} s0_min_eval={:.3e} block0_n_penalties={} per_penalty_quad(betaᵀS_k beta)={:?} raw_block_grad_inf={:?} proj_block_resid={:?} block_penalty_inf={:?} active_sizes={:?} block0_beta=[{:.3e},{:.3e}] beta_inf={:.3e} resid={:.3e}",
-                    lastobjective,
-                    current_penalty,
-                    block0_quad_penalty,
-                    s0_max_abs,
-                    s0_min_eval,
-                    specs[0].penalties.len(),
-                    per_penalty_quad,
-                    block_gradient_norms
-                        .iter()
-                        .map(|v| format!("{v:.3e}"))
-                        .collect::<Vec<_>>(),
-                    block_stationarity_norms
-                        .iter()
-                        .map(|v| format!("{v:.3e}"))
-                        .collect::<Vec<_>>(),
-                    block_penalty_norms
-                        .iter()
-                        .map(|v| format!("{v:.3e}"))
-                        .collect::<Vec<_>>(),
-                    active_sizes,
-                    beta0_min,
-                    beta0_max,
-                    beta_inf,
-                    residual,
-                );
-            }
+            // gam#1082 perf: a per-cycle #979 divergence-trace logging block
+            // lived here and computed — EVERY inner cycle for the first 40
+            // cycles, purely to feed two `log::info!` lines — a FULL O((P·M)³)
+            // eigendecomposition (`projected_residual_range_space_inf`), a
+            // penalty-matrix min-eigenvalue, and per-penalty quadratic forms.
+            // On any penalized family with a penalty null space (every
+            // `select=TRUE` double-penalty tp-smooth model, including the
+            // multinomial smooth-by-factor fit) the eigh's `nullity > 0` branch
+            // actually ran, so each outer REML evaluation paid up to 40
+            // redundant O(p³) eigendecompositions inside its inner joint-Newton.
+            // That diagnostic instrumentation — not the outer iteration count —
+            // was the dominant wall-clock cost (the #1082 overrun the outer
+            // rel-cost decouple could not touch, because the cost is
+            // per-inner-cycle, not per-outer-iteration). The trace has served
+            // its #979 purpose and is removed from the production hot path; every
+            // convergence-relevant quantity (`residual`, `block_stationarity_norms`,
+            // and the lazily-evaluated range-space gate above) is still computed
+            // where the gate actually consumes it.
             let near_convergence = residual <= 10.0 * residual_tol;
             // Augmented-objective change: `(quad(new) − Φ_gated(new)) −
             // (quad(old) − Φ_gated(old))`. `lastobjective` is quadratic-only and
@@ -3035,71 +2938,21 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 beta_inf,
             );
 
-            // #1040 inner-conditioning probe. When the inner joint-Newton is
-            // grinding (residual stalled for several cycles, well above tol),
-            // dump the LIVE penalized-Hessian spectrum and the curvature seen
-            // by the projected residual's dominant direction. This is the
-            // measurement that distinguishes the survival marginal↔logslope
-            // weak-identifiability valley (residual mass sits on a near-null
-            // eigen-direction whose curvature is orders below the likelihood
-            // scale) from a genuine range-space defect, without relying on the
-            // post-loop budget-exhaustion report whose per-cycle Hessian source
-            // has already been dropped (it logs a NaN spectrum). Gated tightly
-            // so well-conditioned fits stay silent.
-            if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
-                && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
-                && residual.is_finite()
-                && residual > 4.0 * residual_tol
-                && let Ok(mut h_probe) = materialize_joint_hessian_source(
-                    &joint_hessian_source,
-                    total_p,
-                    "#1040 inner-conditioning probe",
-                )
-            {
-                let probe_ridge = if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
-                    ridge
-                } else {
-                    0.0
-                };
-                add_joint_penalty_to_matrix(&mut h_probe, &ranges, &s_lambdas, probe_ridge, None);
-                symmetrize_dense_in_place(&mut h_probe);
-                if let Ok((evals, evecs)) = FaerEigh::eigh(&h_probe, Side::Lower) {
-                    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
-                    let min_abs = evals
-                        .iter()
-                        .map(|x: &f64| x.abs())
-                        .fold(f64::INFINITY, f64::min);
-                    // Rayleigh quotient of H_pen along the (normalized) projected
-                    // residual: the effective curvature the stall sits on.
-                    let r_norm = projected_residual_vec.dot(&projected_residual_vec).sqrt();
-                    let resid_curvature = if r_norm > 0.0 {
-                        let mut acc = 0.0_f64;
-                        for k in 0..evals.len() {
-                            let c = evecs.column(k).dot(&projected_residual_vec);
-                            acc += evals[k] * c * c;
-                        }
-                        acc / (r_norm * r_norm)
-                    } else {
-                        f64::NAN
-                    };
-                    log::info!(
-                        "[PIRLS/JN/#1040-cond] cycle={cycle} resid={residual:.3e} (tol={residual_tol:.3e}) \
-                         per_block_resid=[{block_resid_sig}] H_pen: lambda_max={max_abs:.3e} lambda_min_abs={min_abs:.3e} \
-                         cond={:.3e} resid_curvature(Rayleigh)={resid_curvature:.3e} resid_curv_over_lambda_max={:.3e} \
-                         trust_radius={joint_trust_radius:.3e}",
-                        if min_abs > 0.0 {
-                            max_abs / min_abs
-                        } else {
-                            f64::INFINITY
-                        },
-                        if max_abs > 0.0 {
-                            resid_curvature / max_abs
-                        } else {
-                            f64::NAN
-                        },
-                    );
-                }
-            }
+            // gam#1082 perf: a tightly-gated `#1040 inner-conditioning probe`
+            // lived here. Once the inner joint-Newton stalled (residual stuck
+            // above tol for `RESIDUAL_STALL_NO_IMPROVE_CYCLES` cycles), it
+            // eigendecomposed the FULL P·M penalized Hessian (O((P·M)³)) plus an
+            // O(p²) Rayleigh-quotient loop EVERY cycle thereafter, purely to feed
+            // one `log::info!`. The gate's whole point is "the solve is
+            // grinding" — exactly the regime where it then fires on EVERY one of
+            // the remaining (up to `inner_max_cycles`) cycles, turning a stall
+            // into an O(p³)-per-cycle crawl (a dominant face of the #1082
+            // multinomial wall-clock overrun: the cost is per-stalled-cycle, not
+            // per-outer-iteration). The diagnostic is removed from the hot path;
+            // the inner solve's own stall handling (trust-region clamp,
+            // Newton-decrement and range-space convergence certificates) governs
+            // termination, and the cheap per-cycle convergence line above already
+            // surfaces residual/step/per-block-residual for observability.
 
             if verbose_cycle || near_convergence {
                 log::info!(
