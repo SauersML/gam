@@ -854,7 +854,7 @@ pub struct SurvivalLocationScaleTermSpec {
     /// Optional warm-start seed for the threshold-block log-smoothing parameters (ρ).
     /// When `Some`, its length must equal the number of threshold penalties; values are
     /// clamped to the outer-loop ρ bounds before being injected into `rho0`.
-    /// Used by the outer baseline-config CompassSearch to thread converged smoothing
+    /// Used by the outer baseline-config optimizer to thread converged smoothing
     /// from one probe into the next.
     pub initial_threshold_log_lambdas: Option<Array1<f64>>,
     /// Optional warm-start seed for the log-sigma-block log-smoothing parameters (ρ).

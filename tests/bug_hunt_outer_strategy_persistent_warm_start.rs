@@ -80,24 +80,11 @@ fn outer_strategy_selector_falls_back_to_bfgs_when_fixed_point_disabled() {
 }
 
 #[test]
-fn outer_strategy_selector_uses_compass_search_only_for_aux_gradient_free_class() {
-    let c = cap(
-        Derivative::Unavailable,
-        DeclaredHessianForm::Unavailable,
-        3,
-        0,
-        false,
-    );
-    let p = plan_with_class(&c, SolverClass::AuxiliaryGradientFree);
-    assert_eq!(
-        p.solver,
-        Solver::CompassSearch,
-        "Expected CompassSearch only for auxiliary gradient-free route"
-    );
-}
-
-#[test]
-fn outer_strategy_selector_does_not_route_primary_gradient_free_to_compass_search() {
+fn outer_strategy_selector_cost_only_fails_loudly_with_bfgs() {
+    // The gradient-free compass-search optimizer was purged. A cost-only
+    // capability (no gradient, no Hessian, no fixed-point lane) has no
+    // gradient-free solver left, so the planner emits Bfgs — which the runner
+    // rejects loudly for needing a gradient the objective cannot supply.
     let c = cap(
         Derivative::Unavailable,
         DeclaredHessianForm::Unavailable,
@@ -109,6 +96,6 @@ fn outer_strategy_selector_does_not_route_primary_gradient_free_to_compass_searc
     assert_eq!(
         p.solver,
         Solver::Bfgs,
-        "Primary route with unavailable derivatives must not silently route to CompassSearch"
+        "cost-only capability must fail loudly via Bfgs, never a gradient-free solver"
     );
 }
