@@ -17,9 +17,10 @@
 //! desync stalled the isotropic-κ joint REML at its iteration cap with a large
 //! residual gradient. This test FD-checks EACH active block's first and second
 //! log-κ derivative against a central difference of the forward (normalized)
-//! penalty, under `double_penalty: true`, on a low-κ (large length-scale)
-//! configuration whose projected Gram is rank-deficient — so the shrinkage
-//! block is ACTIVE and the previously-omitted derivative is exercised.
+//! penalty, under `double_penalty: true`, on a configuration with a few
+//! near-duplicate centers that put a STABLE near-null eigenspace in the projected
+//! Gram — so the shrinkage block is reliably ACTIVE (with a κ-moving eigenvector)
+//! and the previously-omitted derivative is genuinely exercised.
 
 use gam::terms::basis::{
     CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis,
@@ -27,7 +28,7 @@ use gam::terms::basis::{
 };
 use ndarray::Array2;
 
-/// Evaluation data: a 4×4 grid (16 rows).
+/// Evaluation data: a 4×4 grid (16 rows). Fewer rows than centers (see below).
 fn dataset() -> Array2<f64> {
     let mut rows = Vec::new();
     for i in 0..4 {
@@ -39,22 +40,43 @@ fn dataset() -> Array2<f64> {
     Array2::from_shape_vec((rows.len() / 2, 2), rows).unwrap()
 }
 
-/// Centers: a finer 6×6 grid (36 centers) — MORE centers than data rows.
+/// Tiny offset (in coordinate units) defining the near-duplicate centers below.
+/// At `δ = 1e-5` the near-coincident pair's small eigenvalue of the Matérn Gram
+/// is `≈ (3/2)(δ/ℓ)² ≈ 1.5e-10` — well below the shrinkage tolerance
+/// `tol = dim·1e-10·λ_max ≈ 2e-8` (≈ 130× margin), yet comfortably above the
+/// eigensolver round-off floor `eps·λ_max ≈ 2e-15` (≈ 1e5× margin). So the
+/// near-null eigenspace is present with a large, ρ-stable spectral gap (the rank
+/// does NOT flicker across `ρ ± h`) and is numerically well-resolved. Crucially
+/// `δ ≠ 0`, so `k(δ/ℓ) ≠ 1` and the near-null EIGENVECTOR genuinely rotates with
+/// κ — exactly the κ-dependence whose previously-omitted projector derivative
+/// stalled the iso-κ REML (#1122). An exact duplicate (`δ = 0`) would give a
+/// κ-invariant null (`P′ = 0`) and would not exercise the fix.
+const NEAR_DUP_OFFSET: f64 = 1.0e-5;
+
+/// Centers (`UserProvided`): a spread 5×5 base grid (25 distinct, well-spread
+/// points so `λ_max` and the bulk spectrum are well-conditioned) PLUS three
+/// near-duplicate points, each an existing grid point shifted by
+/// [`NEAR_DUP_OFFSET`]. The three near-coincidences put a STABLE rank-3 near-null
+/// eigenspace in the projected kernel Gram, so the `DoublePenaltyNullspace`
+/// shrinkage block is reliably emitted at any moderate κ.
 ///
-/// With `n < k` the Matérn `matern_rank_reduce_centers` RRQR pruning is skipped
-/// (it requires `n >= k`), so the value build and the derivative build use the
-/// SAME center set and their penalty-block lists stay index-aligned. This also
-/// mirrors the production iso-κ regime, where the FrozenTransform pins the
-/// centers so no κ-dependent reduction runs during the optimization. At a large
-/// length scale the projected kernel Gram `Zᵀ K Z` is numerically rank-deficient,
-/// so the `DoublePenaltyNullspace` shrinkage block is emitted.
+/// `k = 28 > n = 16`, so the Matérn `matern_rank_reduce_centers` RRQR pruning is
+/// skipped (it requires `n >= k`): the value build and the derivative build use
+/// the SAME center set, keeping their penalty-block lists index-aligned. This
+/// also mirrors the production iso-κ regime, where the FrozenTransform pins the
+/// centers so no κ-dependent reduction runs during the optimization.
 fn centers() -> Array2<f64> {
     let mut rows = Vec::new();
-    for i in 0..6 {
-        for j in 0..6 {
-            rows.push(i as f64 / 5.0);
-            rows.push(j as f64 / 5.0);
+    for i in 0..5 {
+        for j in 0..5 {
+            rows.push(i as f64 / 4.0);
+            rows.push(j as f64 / 4.0);
         }
+    }
+    // Three near-duplicates of distinct base grid points.
+    for &(bi, bj) in &[(0usize, 0usize), (2, 3), (4, 1)] {
+        rows.push(bi as f64 / 4.0 + NEAR_DUP_OFFSET);
+        rows.push(bj as f64 / 4.0);
     }
     Array2::from_shape_vec((rows.len() / 2, 2), rows).unwrap()
 }
@@ -86,9 +108,11 @@ fn max_abs(a: &Array2<f64>) -> f64 {
     a.iter().fold(0.0_f64, |m, &v| m.max(v.abs()))
 }
 
-/// Low κ (large length scale) so the projected Gram is rank-deficient and the
-/// `DoublePenaltyNullspace` shrinkage block is active.
-const RHO: f64 = -1.5;
+/// Moderate κ (ℓ = 1). The near-duplicate centers — not the length scale —
+/// supply the stable near-null eigenspace, so a moderate κ keeps the bulk
+/// spectrum well-conditioned and the rank-3 null's spectral gap large (no rank
+/// flicker across `ρ ± h`).
+const RHO: f64 = 0.0;
 
 #[test]
 fn matern_double_penalty_shrinkage_block_is_active_and_count_aligned() {
