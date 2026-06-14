@@ -1700,7 +1700,41 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
         &mut delta,
         Some(&mut active_hint),
     )?;
-    Ok((beta_start + &delta, active_hint))
+    let candidate = beta_start + &delta;
+    // FINAL FEASIBILITY CONTRACT (#1108). The active-set inner step computes its
+    // Newton direction only against the ACTIVE working rows and line-searches
+    // `alpha` against the inactive rows; a row whose approach rate falls inside
+    // `boundary_hit_step_fraction`'s directional tolerance is not clipped, so the
+    // returned `candidate` can overshoot a currently-inactive row and land
+    // outside the cone by a small-but-gate-failing amount (the interval-censored
+    // survival surrogate leaked 5.5e-3..2.2e-2 raw at cycles 3/9 here, accepted
+    // into `states`, then rejected by the next cycle's `check_linear_feasibility`
+    // — `infeasible iterate`). The solver's PUBLIC CONTRACT is a feasible point;
+    // enforce it at the single chokepoint every caller flows through. A genuinely
+    // converged feasible solve has `worst ~ 0`, so this is a no-op there and does
+    // not perturb a well-conditioned constrained fit. When the step did leak,
+    // project the iterate onto the feasible cone (the exact projection the #1108
+    // diag proves reaches ~0 violation: the nearest strictly-interior point) and
+    // return THAT. If no feasible repair is achievable, surface the active-set
+    // error rather than returning an infeasible point.
+    let (worst, _) = max_linear_constraint_violation(&candidate, constraints);
+    if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+        return Ok((candidate, active_hint));
+    }
+    let repaired = project_point_strictly_into_feasible_cone(&candidate, constraints).filter(|p| {
+        max_linear_constraint_violation(p, constraints).0 <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+    });
+    match repaired {
+        Some(feasible) => {
+            let active = canonicalize_active_constraint_ids(&feasible, constraints, &[])?;
+            Ok((feasible, active))
+        }
+        None => Err(EstimationError::ParameterConstraintViolation(format!(
+            "constrained quadratic solve returned an infeasible iterate \
+             (max scaled violation {worst:.3e}) and no feasible projection could be \
+             certified onto the constraint cone",
+        ))),
+    }
 }
 
 #[cfg(test)]
