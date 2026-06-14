@@ -2444,9 +2444,11 @@ fn cholesky_solve_vector_fixed<const D: usize>(
     // `cholesky_lower`, which rejects `!is_finite() || sum <= 0.0` pivots). The
     // back/forward substitution below divides by `l[[i, i]]` with no per-row
     // guard; a future caller that hands an unvalidated factor here would emit a
-    // silent `NaN` into the Schur reduction (#1038). Catch that loudly in
-    // debug/CI rather than letting it flow into the evidence/gradient.
-    debug_assert!(
+    // silent `NaN` into the Schur reduction (#1038). Catch that loudly —
+    // always, release included — rather than letting it flow into the
+    // evidence/gradient. The check is O(D) over a small fixed-size factor, so
+    // it is negligible next to the substitution it guards.
+    assert!(
         (0..D).all(|i| l[[i, i]].is_finite() && l[[i, i]].abs() >= f64::MIN_POSITIVE),
         "cholesky_solve_vector_fixed: factor diagonal must be finite and non-subnormal"
     );
@@ -7297,9 +7299,10 @@ fn cholesky_solve_lower_f32(l: &Array2<f32>, b: &Array1<f32>) -> Array1<f32> {
     // Precondition: positive, finite factor diagonals (see
     // `cholesky_solve_vector_fixed`). The certified mixed-precision streaming
     // path refines in f64 and falls back when this f32 solve is not usable, but
-    // guard the precondition loudly in debug/CI so a future factor source that
-    // skips that refinement cannot divide by a zero/non-finite pivot silently.
-    debug_assert!(
+    // guard the precondition loudly — always, release included — so a future
+    // factor source that skips that refinement cannot divide by a
+    // zero/non-finite pivot silently.
+    assert!(
         (0..n).all(|i| l[[i, i]].is_finite() && l[[i, i]].abs() >= f32::MIN_POSITIVE),
         "cholesky_solve_lower_f32: factor diagonal must be finite and non-subnormal"
     );
@@ -7987,10 +7990,11 @@ fn dot2(a_t: &Array1<f64>, a_beta: &Array1<f64>, b_t: &Array1<f64>, b_beta: &Arr
 fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
     let n = l.nrows();
     // Precondition: positive, finite factor diagonals (see
-    // `cholesky_solve_vector_fixed`). Guard loudly in debug/CI so a future
-    // caller supplying an unvalidated factor cannot divide by a zero/non-finite
-    // pivot and leak a silent `NaN` into the Schur β-solve (#1038).
-    debug_assert!(
+    // `cholesky_solve_vector_fixed`). Guard loudly — always, release included —
+    // so a future caller supplying an unvalidated factor cannot divide by a
+    // zero/non-finite pivot and leak a silent `NaN` into the Schur β-solve
+    // (#1038).
+    assert!(
         (0..n).all(|i| l[[i, i]].is_finite() && l[[i, i]].abs() >= f64::MIN_POSITIVE),
         "cholesky_solve_lower: factor diagonal must be finite and non-subnormal"
     );

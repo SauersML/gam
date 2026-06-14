@@ -1632,8 +1632,13 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
 /// `SolverClass::Primary` is the only class, so this is identical to [`plan`].
 /// (The auxiliary gradient-free class and its compass-search dispatch were
 /// purged; there is no derivative-free solver left to opt into.)
-pub fn plan_with_class(cap: &OuterCapability, _class: SolverClass) -> OuterPlan {
-    plan(cap)
+pub fn plan_with_class(cap: &OuterCapability, class: SolverClass) -> OuterPlan {
+    match class {
+        // `Primary` is the only class — the exhaustive match documents that
+        // contract and forces a deliberate plan choice if another class is
+        // ever reintroduced, rather than silently ignoring the argument.
+        SolverClass::Primary => plan(cap),
+    }
 }
 
 
