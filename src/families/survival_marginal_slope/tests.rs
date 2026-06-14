@@ -1,6 +1,5 @@
+//! Tests for the survival marginal-slope family (relocated verbatim).
 
-#[cfg(test)]
-mod tests {
     use super::*;
     use crate::custom_family::{BlockEffectiveJacobian, CustomFamily, ExactOuterDerivativeOrder};
     use crate::matrix::{DenseDesignMatrix, SymmetricMatrix};
@@ -6808,4 +6807,3 @@ mod tests {
         let dense_bil = v.dot(&dense.dot(&u));
         assert_relative_eq!(bil, dense_bil, max_relative = 1e-12);
     }
-}

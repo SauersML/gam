@@ -1,3 +1,6 @@
+//! The public fitting entry point `fit_survival_marginal_slope_terms`.
+
+use super::*;
 
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,

@@ -1,10 +1,191 @@
-// Split from the original oversized module; keep included in order.
-include!("imports.rs");
+//! Survival marginal-slope family, organized by concern.
+//!
+//! Each submodule owns one concern; cross-concern items are `pub(crate)`
+//! and re-exported here so every submodule's `use super::*;` sees the
+//! shared surface, while the family's public API (term spec, fit result,
+//! family + scalars, block Jacobians, the entry point, ...) is preserved
+//! at this module root via the glob re-exports (each item keeps its own
+//! `pub`/`pub(crate)` visibility). `poly_arith` holds the dense polynomial
+//! algebra; the other modules split the former monolith into: error/spec
+//! data contracts, the `family` container, block layout, closed-form row
+//! math, primary/time-wiggle geometry, Hessian assembly, the per-concern
+//! evaluation method groups, the inner-Newton workspaces and `RowKernel`,
+//! the `CustomFamily` impl, block Jacobians, fit setup, and the entry point.
+//!
+
+pub(crate) use crate::custom_family::{
+    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
+    evaluate_custom_family_joint_hyper_shared, fit_custom_family,
+    fit_custom_family_fixed_log_lambda_warm_start, joint_hyper_options_for_outer_tolerance,
+};
+
+pub(crate) use crate::estimate::UnifiedFitResult;
+
+pub(crate) use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
+
+pub(crate) use crate::families::bms::{
+    CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, LatentZNormalization,
+    LatentZPolicy, MarginalSlopeCovariance, ParametricAnchorBlock,
+    marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
+    marginal_slope_probit_eta, padded_deviation_seed,
+};
+
+pub(crate) use crate::families::bms::{
+    FlexCompileOutcome, build_link_deviation_block_from_knots_design_seed_and_weights,
+    build_score_warp_deviation_block_from_seed, install_compiled_flex_block_into_runtime,
+    project_monotone_feasible_beta, push_deviation_aux_blockspecs,
+    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z_with_policy,
+    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
+    unary_derivatives_sqrt,
+};
+
+pub(crate) use crate::families::cubic_cell_kernel as exact_kernel;
+
+pub(crate) use crate::families::jet_partitions::MultiDirJet;
+
+pub(crate) use crate::families::lognormal_kernel::FrailtySpec;
+
+pub(crate) use crate::families::marginal_slope_shared::{
+    CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
+    add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
+    build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
+    directional_obj_grad_hess, eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
+    observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
+    outer_row_weights_by_index, outer_weighted_rows, parameter_block_specs_match_rows,
+    probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
+    scale_coeff4,
+};
+
+pub(crate) use crate::families::parameter_block::ParameterBlockInput;
+
+pub(crate) use crate::families::row_kernel::{
+    RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
+    row_kernel_hessian_dense, row_kernel_log_likelihood,
+};
+
+pub(crate) use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+
+pub(crate) use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
+
+pub(crate) use crate::families::survival_location_scale::{
+    TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
+};
+
+pub(crate) use crate::families::survival_time_constraints::{
+    FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
+    build_time_derivative_guard_constraints,
+};
+
+pub(crate) use crate::families::wiggle::monotone_wiggle_basis_with_derivative_order;
+
+pub(crate) use crate::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
+
+pub(crate) use crate::pirls::LinearInequalityConstraints;
+
+pub(crate) use crate::probability::signed_probit_logcdf_and_mills_ratio;
+
+pub(crate) use crate::smooth::{
+    BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
+};
+
+pub(crate) use crate::solver::estimate::reml::unified::HyperOperator;
+
+pub(crate) use crate::types::{InverseLink, StandardLink};
+
+pub(crate) use crate::util::fnv::Fnv1a;
+
+pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
+
+pub(crate) use rayon::prelude::*;
+
+pub(crate) use smallvec::SmallVec;
+
+pub(crate) use std::cell::RefCell;
+
+pub(crate) use std::sync::atomic::AtomicUsize;
+
+pub(crate) use std::sync::{Arc, Mutex};
+
+
+/// Inline-stored polynomial coefficient vector for survival marginal-slope
+/// integrand assembly. `poly_*` helpers in this module routinely build
+/// degree ≤ ~28 polynomials (max product of four affine cell coefficient
+/// arrays of length 4) inside per-row hot loops; the previous `Vec<f64>`
+/// returns drove millions of mallocs per outer iteration on large-scale
+/// fits. Thirty-two inline slots cover every observed shape.
+pub(crate) type PolyVec = SmallVec<[f64; 32]>;
 
 mod poly_arith;
+mod error;
+mod spec;
+mod family;
+mod block_layout;
+mod row_math;
+mod primary_geometry;
+mod hessian;
+mod eval_score;
+mod eval_rigid;
+mod eval_sigma;
+mod timewiggle_geometry;
+mod calibration;
+mod intercept;
+mod feasibility;
+mod denested_cells;
+mod timepoint_exact;
+mod flex_sensitivity;
+mod contraction;
+mod accumulate;
+mod pullback;
+mod psi_terms;
+mod newton_operators;
+mod joint_workspace;
+mod row_kernel;
+mod joint_eval;
+mod custom_family_impl;
+mod block_jacobians;
+mod fit_setup;
+mod fit_entry;
 
-include!("types.rs");
-include!("family_impl.rs");
-include!("joint_newton.rs");
-include!("fit_entry.rs");
-include!("tests.rs");
+pub(crate) use poly_arith::{
+    poly_add, poly_add_jets, poly_coeff_mask, poly_mul, poly_mul_jets, poly_scale,
+    poly_scale_jets, poly_sub,
+};
+pub use error::*;
+pub use spec::*;
+pub use family::*;
+pub use block_layout::*;
+pub use row_math::*;
+pub use primary_geometry::*;
+pub use hessian::*;
+pub use eval_score::*;
+pub use eval_rigid::*;
+pub use eval_sigma::*;
+pub use timewiggle_geometry::*;
+pub use calibration::*;
+pub use intercept::*;
+pub use feasibility::*;
+pub use denested_cells::*;
+pub use timepoint_exact::*;
+pub use flex_sensitivity::*;
+pub use contraction::*;
+pub use accumulate::*;
+pub use pullback::*;
+pub use psi_terms::*;
+pub use newton_operators::*;
+pub use joint_workspace::*;
+pub use row_kernel::*;
+pub use joint_eval::*;
+pub use custom_family_impl::*;
+pub use block_jacobians::*;
+pub use fit_setup::*;
+pub use fit_entry::*;
+
+#[cfg(test)]
+mod tests;

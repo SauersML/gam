@@ -14,7 +14,7 @@ use crate::families::jet_partitions::MultiDirJet;
 use smallvec::{SmallVec, smallvec};
 
 #[inline]
-pub(super) fn poly_mul(lhs: &[f64], rhs: &[f64]) -> PolyVec {
+pub(crate) fn poly_mul(lhs: &[f64], rhs: &[f64]) -> PolyVec {
     if lhs.is_empty() || rhs.is_empty() {
         return PolyVec::new();
     }
@@ -35,7 +35,7 @@ pub(super) fn poly_mul(lhs: &[f64], rhs: &[f64]) -> PolyVec {
 }
 
 #[inline]
-pub(super) fn poly_sub(lhs: &[f64], rhs: &[f64]) -> PolyVec {
+pub(crate) fn poly_sub(lhs: &[f64], rhs: &[f64]) -> PolyVec {
     let mut out: PolyVec = SmallVec::new();
     out.extend_from_slice(lhs);
     if rhs.len() > lhs.len() {
@@ -48,7 +48,7 @@ pub(super) fn poly_sub(lhs: &[f64], rhs: &[f64]) -> PolyVec {
 }
 
 #[inline]
-pub(super) fn poly_add(lhs: &[f64], rhs: &[f64]) -> PolyVec {
+pub(crate) fn poly_add(lhs: &[f64], rhs: &[f64]) -> PolyVec {
     // Copy the longer operand verbatim, then add the shorter onto its
     // prefix. Avoids the redundant zero-fill of `smallvec![0.0; n]` plus
     // two additive passes from the legacy implementation.
@@ -66,7 +66,7 @@ pub(super) fn poly_add(lhs: &[f64], rhs: &[f64]) -> PolyVec {
 }
 
 #[inline]
-pub(super) fn poly_scale(poly: &[f64], scale: f64) -> PolyVec {
+pub(crate) fn poly_scale(poly: &[f64], scale: f64) -> PolyVec {
     let mut out: PolyVec = SmallVec::with_capacity(poly.len());
     for &v in poly {
         out.push(scale * v);
@@ -74,7 +74,7 @@ pub(super) fn poly_scale(poly: &[f64], scale: f64) -> PolyVec {
     out
 }
 
-pub(super) fn poly_add_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
+pub(crate) fn poly_add_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
     let count = lhs.len().max(rhs.len());
     let mut out = Vec::with_capacity(count);
     for idx in 0..count {
@@ -91,11 +91,11 @@ pub(super) fn poly_add_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<Mul
     out
 }
 
-pub(super) fn poly_scale_jets(poly: &[MultiDirJet], scale: &MultiDirJet) -> Vec<MultiDirJet> {
+pub(crate) fn poly_scale_jets(poly: &[MultiDirJet], scale: &MultiDirJet) -> Vec<MultiDirJet> {
     poly.iter().map(|coeff| coeff.mul(scale)).collect()
 }
 
-pub(super) fn poly_mul_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
+pub(crate) fn poly_mul_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
     if lhs.is_empty() || rhs.is_empty() {
         return Vec::new();
     }
@@ -109,6 +109,6 @@ pub(super) fn poly_mul_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<Mul
     out
 }
 
-pub(super) fn poly_coeff_mask(poly: &[MultiDirJet], mask: usize) -> Vec<f64> {
+pub(crate) fn poly_coeff_mask(poly: &[MultiDirJet], mask: usize) -> Vec<f64> {
     poly.iter().map(|coeff| coeff.coeff(mask)).collect()
 }
