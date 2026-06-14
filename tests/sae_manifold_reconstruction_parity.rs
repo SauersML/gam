@@ -581,7 +581,7 @@ fn linear_shatter_slots(k: usize, shards: usize) -> Vec<Slot> {
 #[test]
 fn sae_reconstruction_parity_curved_beats_linear_and_shatter_budget_recovers() {
     // A modest K so all three arms (including the K·shards shatter dictionary)
-    // fit fast and memory-light on MSI. K=8 circles in p=48 ambient dims, n=2400
+    // fit fast and memory-light. K=8 circles in p=48 ambient dims, n=2400
     // rows. 2K = 16 <= p, so the planted planes are mutually orthogonal.
     let k = 8usize;
     let p = 48usize;

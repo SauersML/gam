@@ -9,9 +9,6 @@
 //! production OuterProblem::run; B-A approximates the post-walk outer cost.
 //! Prints a timed breakdown under `--nocapture`; the assertion only guards a
 //! non-trivial fit (EV high), not timing.
-//!
-//! Run on MSI:
-//!   msi_probe.sh --test sae_k1_periodic_p2048_profile -- --nocapture
 
 use faer::Side as FaerSide;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};

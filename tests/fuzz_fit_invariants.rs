@@ -22,7 +22,7 @@
 //! sweep does not block CI on a known-open ticket.
 //!
 //! Design choices that keep it CI-cheap and deterministic:
-//!   - n is small (8..40) — edge cases live at tiny n, and the 8 GB / MSI
+//!   - n is small (8..40) — edge cases live at tiny n, and the 8 GB CI
 //!     build budget forbids large fixtures.
 //!   - the case grid is a fixed deterministic product of (shape × family ×
 //!     seed); no wall-clock or thread-order dependence.

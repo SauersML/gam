@@ -27,7 +27,7 @@
 //! ## What this test asserts
 //!
 //! - `fit_from_formula` RETURNS (the test process completing is the primary
-//!   assertion — if the outer loop spins, CI/MSI times the test out and the
+//!   assertion — if the outer loop spins, CI times the test out and the
 //!   backtrace localizes the wedge).
 //! - The fitted curve is genuinely periodic: `fitted(min) == fitted(max)` to a
 //!   tight tolerance — the defining guarantee of a cyclic basis, asserted on the

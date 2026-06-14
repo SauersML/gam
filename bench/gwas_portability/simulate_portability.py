@@ -24,7 +24,7 @@ from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 
-DEFAULT_OUT = Path("/projects/standard/hsiehph/sauer354/gam_gwas_portability/runs/manual")
+DEFAULT_OUT = Path("gwas_portability_runs/manual")
 N_PCS = 5
 TRAIN_DEME = "deme_0"
 HORIZON = 10.0
@@ -41,13 +41,6 @@ class DemeSpec:
     distance: int
     grid_x: int
     grid_y: int
-
-
-def require_project_path(path: Path) -> None:
-    root = Path("/projects/standard/hsiehph/sauer354").resolve()
-    resolved = path.resolve()
-    if root not in (resolved, *resolved.parents):
-        raise RuntimeError(f"Output path must be under {root}; got {resolved}")
 
 
 def build_serial1d_demography(n_demes: int, split_spacing: int) -> tuple[msprime.Demography, list[DemeSpec]]:
@@ -772,7 +765,6 @@ def main() -> None:
     parser.add_argument("--plink-memory-mb", type=int, default=64000)
     args = parser.parse_args()
 
-    require_project_path(args.out)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "run_config.json").write_text(json.dumps(vars(args), indent=2, default=str), encoding="utf-8")
     all_metrics = []

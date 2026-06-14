@@ -368,7 +368,7 @@ fn scan_routed_fit_recovers_truth_at_least_as_well_as_dense_path() {
 /// (shared-runner wall-clock is noisy); the HARD assertions are (a) the cost
 /// scales sub-quadratically from 1e5 → 1e6 (proves O(n), not O(n²)), (b)
 /// truth recovery within the injected noise, and (c) a sane EDF. The headline
-/// scan-vs-dense ratio is recorded on the issue from the MSI run.
+/// scan-vs-dense ratio is recorded on the issue from the large-scale run.
 #[test]
 fn spline_scan_million_row_fit_scales_linearly_and_recovers_truth() {
     init_parallelism();
