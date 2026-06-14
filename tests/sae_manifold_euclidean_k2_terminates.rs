@@ -54,12 +54,14 @@ fn idx_noise(seed: u64) -> f64 {
 /// 50/50 by index so each atom is truly active on its half.
 fn planted_two_lines() -> (Array2<f64>, [Vec<f64>; 2], Vec<usize>) {
     // atom A direction in axes (0,1); atom B direction in axes (2,3).
-    let dir = [[1.0_f64, 0.6, 0.0, 0.0, 0.0, 0.0], [
-        0.0, 0.0, 1.0, -0.5, 0.0, 0.0,
-    ]];
-    let off = [[0.2_f64, -0.1, 0.0, 0.0, 0.0, 0.0], [
-        0.0, 0.0, 0.3, 0.1, 0.0, 0.0,
-    ]];
+    let dir = [
+        [1.0_f64, 0.6, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, -0.5, 0.0, 0.0],
+    ];
+    let off = [
+        [0.2_f64, -0.1, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.3, 0.1, 0.0, 0.0],
+    ];
     let sigma = 0.03;
     let mut z = Array2::<f64>::zeros((N, P));
     let mut s_true = [vec![0.0; N], vec![0.0; N]];
@@ -98,7 +100,11 @@ fn build_cold_k2_term(s_true: &[Vec<f64>; 2], owner: &[usize], z: &Array2<f64>) 
     let mut manifolds = Vec::with_capacity(K);
     for k in 0..K {
         let coords = Array2::from_shape_fn((N, 1), |(i, _)| {
-            if owner[i] == k { s_true[k][i] + 0.05 } else { 0.0 }
+            if owner[i] == k {
+                s_true[k][i] + 0.05
+            } else {
+                0.0
+            }
         });
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
         let decoder = decoder_lsq_init(&phi, z);

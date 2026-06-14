@@ -85,20 +85,15 @@ fn gamma_log_rho_gradient_h_sweep() {
         &rho,
     )
     .expect("analytic gradient")[0];
-    assert!(analytic.is_finite(), "analytic gamma-log rho gradient must be finite");
+    assert!(
+        analytic.is_finite(),
+        "analytic gamma-log rho gradient must be finite"
+    );
 
     let cost = |r: &Array1<f64>| -> f64 {
-        evaluate_externalcost_andridge(
-            y.view(),
-            w.view(),
-            x.clone(),
-            offset.view(),
-            &s_list,
-            &o,
-            r,
-        )
-        .expect("cost")
-        .0
+        evaluate_externalcost_andridge(y.view(), w.view(), x.clone(), offset.view(), &s_list, &o, r)
+            .expect("cost")
+            .0
     };
 
     println!("ANALYTIC gamma-log rho-grad @ rho=0 : {analytic:.12e}");
@@ -108,7 +103,10 @@ fn gamma_log_rho_gradient_h_sweep() {
         let mut rm = rho.clone();
         rm[0] -= h;
         let fd = (cost(&rp) - cost(&rm)) / (2.0 * h);
-        assert!(fd.is_finite(), "finite-difference gradient must be finite at h={h:.1e}");
+        assert!(
+            fd.is_finite(),
+            "finite-difference gradient must be finite at h={h:.1e}"
+        );
         let rel = (analytic - fd).abs() / analytic.abs().max(1e-12);
         println!("h={h:.1e}  fd={fd:.12e}  rel_err={rel:.3e}");
     }

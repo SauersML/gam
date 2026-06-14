@@ -32,7 +32,12 @@ fn sample_negbin(mu: f64, theta: f64, rng: &mut StdRng) -> f64 {
     pois.sample(rng)
 }
 
-fn time_fit(label: &str, formula: &str, ds: &gam::inference::data::EncodedDataset, cfg: &FitConfig) {
+fn time_fit(
+    label: &str,
+    formula: &str,
+    ds: &gam::inference::data::EncodedDataset,
+    cfg: &FitConfig,
+) {
     let t0 = Instant::now();
     let result = fit_from_formula(formula, ds, cfg).expect("gam fit");
     let dt = t0.elapsed().as_secs_f64();
@@ -67,7 +72,9 @@ fn negbin_syn() {
     }
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
     let rows: Vec<csv::StringRecord> = (0..N)
-        .map(|i| csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()]))
+        .map(|i| {
+            csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()])
+        })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode negbin dataset");
     let cfg = FitConfig {
@@ -154,7 +161,9 @@ fn gaussian_te() {
     }
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
     let rows: Vec<csv::StringRecord> = (0..N)
-        .map(|i| csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()]))
+        .map(|i| {
+            csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()])
+        })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode gaussian dataset");
     let cfg = FitConfig::default();

@@ -1849,7 +1849,10 @@ mod tests {
         let fused = AutoTopologyKind::fuse_constant_curvature_family(&input);
         assert_eq!(
             fused,
-            vec![AutoTopologyKind::ConstantCurvature, AutoTopologyKind::Circle],
+            vec![
+                AutoTopologyKind::ConstantCurvature,
+                AutoTopologyKind::Circle
+            ],
             "explicit CC must absorb the fixed Euclidean form"
         );
     }

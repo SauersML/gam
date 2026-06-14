@@ -670,7 +670,10 @@ fn olive_oils_grassmann_distance_matches_geomstats_on_real_data() {
             continue;
         }
         area_names.push(area.clone());
-        train_frames.push(flatten_frame(&subspace_about(&train_rows, &global_centroid)));
+        train_frames.push(flatten_frame(&subspace_about(
+            &train_rows,
+            &global_centroid,
+        )));
         test_frames.push(flatten_frame(&subspace_about(&test_rows, &global_centroid)));
     }
     let n_areas = area_names.len();

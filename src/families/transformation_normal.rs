@@ -27,7 +27,6 @@
 // Split from the original oversized module; keep included in order.
 include!("transformation_normal/part_000.rs");
 
-
 mod endpoint_normalizer;
 
 include!("transformation_normal/part_001.rs");

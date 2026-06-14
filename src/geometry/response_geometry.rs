@@ -247,7 +247,9 @@ impl ResponseManifold {
             "constant_curvature" => {
                 let dim = get_usize("dim")?.unwrap_or(cols);
                 // κ defaults to 0 (flat initial point for the REML optimizer).
-                let kappa = get_f64("kappa")?.or_else(|| get_f64("curvature").ok().flatten()).unwrap_or(0.0);
+                let kappa = get_f64("kappa")?
+                    .or_else(|| get_f64("curvature").ok().flatten())
+                    .unwrap_or(0.0);
                 Self::resolve("constant_curvature", None, None, Some(dim), Some(kappa))
             }
             other => Err(format!(
@@ -311,7 +313,9 @@ impl ResponseManifold {
                 crate::geometry::poincare::log_map(base, value, *curvature)
             }
             // ConstantCurvature implements RiemannianManifold::log_map directly.
-            Self::ConstantCurvature { .. } | Self::Spd { .. } | Self::Grassmann { .. }
+            Self::ConstantCurvature { .. }
+            | Self::Spd { .. }
+            | Self::Grassmann { .. }
             | Self::Stiefel { .. } => self
                 .riemannian()
                 .expect("riemannian response manifold")
@@ -329,7 +333,9 @@ impl ResponseManifold {
             Self::Poincare { curvature, .. } => {
                 crate::geometry::poincare::exp_map(base, tangent, *curvature)
             }
-            Self::ConstantCurvature { .. } | Self::Spd { .. } | Self::Grassmann { .. }
+            Self::ConstantCurvature { .. }
+            | Self::Spd { .. }
+            | Self::Grassmann { .. }
             | Self::Stiefel { .. } => self
                 .riemannian()
                 .expect("riemannian response manifold")
@@ -351,7 +357,9 @@ impl ResponseManifold {
                 let lam = crate::geometry::poincare::conformal_factor(base, *curvature)?;
                 Ok(lam * lam * v.iter().map(|x| x * x).sum::<f64>())
             }
-            Self::ConstantCurvature { .. } | Self::Spd { .. } | Self::Grassmann { .. }
+            Self::ConstantCurvature { .. }
+            | Self::Spd { .. }
+            | Self::Grassmann { .. }
             | Self::Stiefel { .. } => {
                 let g = self
                     .riemannian()

@@ -66,7 +66,13 @@ fn marginal_survival(ctx: &QuadratureContext, b_t: f64, mu: f64, sigma: f64) -> 
 /// Summed interval-censored negative log-likelihood over the data, through gam's
 /// kernel. `b_left[i]`, `b_right[i]` are the baseline cumulative hazards B(L_i),
 /// B(R_i). No delayed entry (entry mass = 0).
-fn interval_nll(ctx: &QuadratureContext, b_left: &[f64], b_right: &[f64], mu: f64, sigma: f64) -> f64 {
+fn interval_nll(
+    ctx: &QuadratureContext,
+    b_left: &[f64],
+    b_right: &[f64],
+    mu: f64,
+    sigma: f64,
+) -> f64 {
     let mut nll = 0.0;
     for (&bl, &br) in b_left.iter().zip(b_right.iter()) {
         let row = LatentSurvivalRow::interval_censored(0.0, bl, br, 0.0, 0.0, 0.0);
@@ -227,10 +233,7 @@ fn gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines() {
         .map(|&r| if r.is_finite() { r } else { 1e6 })
         .collect();
     let ref_res = run_python(
-        &[
-            Column::new("L", &left_times),
-            Column::new("R", &r_finite),
-        ],
+        &[Column::new("L", &left_times), Column::new("R", &r_finite)],
         r#"
 import numpy as np
 from lifelines import WeibullFitter
@@ -267,12 +270,16 @@ emit("S_ref", list(S))
     assert!(
         mu_err < 0.18,
         "gam interval-censored MLE failed to recover mu*: |{:.4}-{:.4}|={:.4}",
-        mu_hat, mu_true, mu_err
+        mu_hat,
+        mu_true,
+        mu_err
     );
     assert!(
         sigma_err < 0.20,
         "gam interval-censored MLE failed to recover sigma*: |{:.4}-{:.4}|={:.4}",
-        sigma_hat, sigma_true, sigma_err
+        sigma_hat,
+        sigma_true,
+        sigma_err
     );
     assert!(
         gam_curve_rell2 < 0.06,
@@ -284,6 +291,7 @@ emit("S_ref", list(S))
     assert!(
         gam_curve_rell2 <= ref_curve_rell2 * 1.10 + 1e-3,
         "gam interval-censored survival-curve recovery ({:.4}) is worse than lifelines ({:.4}) by >10%",
-        gam_curve_rell2, ref_curve_rell2
+        gam_curve_rell2,
+        ref_curve_rell2
     );
 }

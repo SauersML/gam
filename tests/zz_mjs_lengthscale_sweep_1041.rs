@@ -143,11 +143,17 @@ fn mjs_lengthscale_sweep_localizes_1041_deficit() {
 
     // matern baseline.
     if let Some(f) = fit_bms(&format!("matern(x1, x2, k={CENTERS})"), &ds) {
-        eprintln!("[mjs-ell-sweep] matern               rmse={:.5}", marginal_prob_rmse(&f, &grid));
+        eprintln!(
+            "[mjs-ell-sweep] matern               rmse={:.5}",
+            marginal_prob_rmse(&f, &grid)
+        );
     }
     // measure-jet AUTO length-scale (the current default = 2x spacing).
     if let Some(f) = fit_bms(&format!("mjs(x1, x2, centers={CENTERS})"), &ds) {
-        eprintln!("[mjs-ell-sweep] mjs auto(2x)         rmse={:.5}", marginal_prob_rmse(&f, &grid));
+        eprintln!(
+            "[mjs-ell-sweep] mjs auto(2x)         rmse={:.5}",
+            marginal_prob_rmse(&f, &grid)
+        );
     }
     // measure-jet at explicit length-scales (10 centers on [0,1]^2 -> spacing ~0.3).
     for ell in [0.08_f64, 0.12, 0.16, 0.22, 0.30, 0.45, 0.60] {

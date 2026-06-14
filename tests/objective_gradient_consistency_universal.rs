@@ -579,7 +579,13 @@ fn glm_objective_gradient_consistent_interior_multifamily() {
         vec![1],
     );
     for rho in [Array1::from(vec![-0.1_f64]), Array1::from(vec![0.8_f64])] {
-        assert_glm_consistent("interior/beta-logit", &beta_fix, &beta_opts, &rho, TOL_INTERIOR);
+        assert_glm_consistent(
+            "interior/beta-logit",
+            &beta_fix,
+            &beta_opts,
+            &rho,
+            TOL_INTERIOR,
+        );
     }
 }
 

@@ -258,6 +258,14 @@ fn main() {
     let mut vendor_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_vendor_directories(&manifest_dir, &manifest_dir, &mut vendor_offenders);
 
+    // Tracked-file size ban. Issue #780 keeps source/data artifacts reviewable
+    // by requiring every tracked file to stay at or below 10k newline-counted
+    // lines. This intentionally scans all Git-tracked files, not only the
+    // text extensions handled by `visit_files`, so oversized CSVs or other
+    // line-oriented assets cannot bypass the build gate.
+    let mut oversized_file_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_oversized_tracked_files(&manifest_dir, &mut oversized_file_offenders);
+
     // Persistent unimplemented/todo/unreachable removal audit. Compares the
     // current set of marker-bearing functions against the on-disk ledger and
     // flags any function whose marker disappeared without a real implementation
@@ -571,6 +579,17 @@ fn main() {
                 "`vendor/` directory present — vendoring forks upstream dependencies past the same lint gate this scanner enforces; use `[dependencies]` in Cargo.toml (crates.io version or `git = ...`) instead"
                     .to_string(),
             rows: vendor_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !oversized_file_offenders.is_empty() {
+        sections.push(Section {
+            title: "tracked file over 10k lines (split the file; issue #780 line-count gate)"
+                .to_string(),
+            rows: oversized_file_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -2961,6 +2980,46 @@ fn scan_for_vendor_directories(
             continue;
         }
         scan_for_vendor_directories(root, &path, offenders);
+    }
+}
+
+const MAX_TRACKED_FILE_LINES: usize = 10_000;
+
+fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("ls-files")
+        .arg("-z")
+        .output()
+        .expect("failed to list Git-tracked files for line-count audit");
+    assert!(
+        output.status.success(),
+        "git ls-files failed during line-count audit"
+    );
+
+    for raw in output.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let rel_text = String::from_utf8(raw.to_vec())
+            .expect("git ls-files emitted a non-UTF-8 path; repository paths must be UTF-8");
+        let rel = PathBuf::from(&rel_text);
+        let path = root.join(&rel);
+        let bytes = fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read tracked file for line-count audit: {}: {e}",
+                rel.display()
+            )
+        });
+        let line_count = bytes.iter().filter(|byte| **byte == b'\n').count();
+        if line_count > MAX_TRACKED_FILE_LINES {
+            offenders.push((
+                rel,
+                line_count,
+                format!("{line_count} lines; limit is {MAX_TRACKED_FILE_LINES}"),
+            ));
+        }
     }
 }
 

@@ -47,9 +47,9 @@
 //! ([`crate::inference::row_metric::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
+use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
-use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::linalg::faer_ndarray::{
     FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };

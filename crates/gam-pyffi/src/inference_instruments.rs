@@ -263,8 +263,7 @@ pub(crate) fn select_probe_by_expected_evidence<'py>(
         predicted_mean_alt.as_array(),
         fisher.as_array(),
     )?;
-    let Some((idx, expected_log_growth)) =
-        core_select_probe_by_expected_evidence(&probes, &fisher)
+    let Some((idx, expected_log_growth)) = core_select_probe_by_expected_evidence(&probes, &fisher)
     else {
         return Ok(None);
     };
@@ -283,10 +282,7 @@ pub(crate) fn select_probe_by_expected_evidence<'py>(
 /// Expected observations needed for a probe with per-observation expected
 /// evidence growth `growth_nats_per_obs` to cross the Ville threshold `1/alpha`.
 #[pyfunction]
-pub(crate) fn expected_resolution_budget(
-    alpha: f64,
-    growth_nats_per_obs: f64,
-) -> Option<f64> {
+pub(crate) fn expected_resolution_budget(alpha: f64, growth_nats_per_obs: f64) -> Option<f64> {
     core_expected_resolution_budget(alpha, growth_nats_per_obs)
 }
 

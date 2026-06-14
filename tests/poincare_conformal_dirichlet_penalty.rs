@@ -22,7 +22,9 @@
 //!    radius, so the geometry (not just the shape) is pinned.
 
 use gam::geometry::poincare;
-use gam::terms::basis::{duchon_polynomial_first_derivative_nd, monomial_exponents, DuchonNullspaceOrder};
+use gam::terms::basis::{
+    DuchonNullspaceOrder, duchon_polynomial_first_derivative_nd, monomial_exponents,
+};
 use ndarray::{Array1, Array2, Array3};
 
 const CURV: f64 = -1.0;
@@ -158,7 +160,10 @@ fn d1_weight_is_exact_inverse_conformal_factor_monotone_in_radius() {
         // Linear column index is 1 (constant is 0); slice it to a 1×1×1 jet.
         let mut lin_jet = Array3::<f64>::zeros((1, 1, 1));
         lin_jet[[0, 0, 0]] = full_jet[[0, 1, 0]];
-        assert!((lin_jet[[0, 0, 0]] - 1.0).abs() < 1e-12, "linear monomial derivative must be 1");
+        assert!(
+            (lin_jet[[0, 0, 0]] - 1.0).abs() < 1e-12,
+            "linear monomial derivative must be 1"
+        );
 
         let gram =
             poincare::conformal_dirichlet_penalty(coords.view(), lin_jet.view(), CURV).unwrap();

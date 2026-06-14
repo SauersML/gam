@@ -55,21 +55,81 @@ struct Shape {
 /// column structure injected by `degeneracy`.
 const SHAPES: &[Shape] = &[
     // ── single 1-D smooths across families ──────────────────────────────
-    Shape { label: "gauss_s",        formula: "y ~ s(x0)",            family: "gaussian", ncols: 1 },
-    Shape { label: "gauss_matern",   formula: "y ~ matern(x0)",       family: "gaussian", ncols: 1 },
-    Shape { label: "gauss_duchon",   formula: "y ~ duchon(x0)",       family: "gaussian", ncols: 1 },
-    Shape { label: "pois_s",         formula: "y ~ s(x0)",            family: "poisson",  ncols: 1 },
-    Shape { label: "binom_s",        formula: "y ~ s(x0)",            family: "binomial", ncols: 1 },
-    Shape { label: "gamma_s",        formula: "y ~ s(x0)",            family: "gamma",    ncols: 1 },
+    Shape {
+        label: "gauss_s",
+        formula: "y ~ s(x0)",
+        family: "gaussian",
+        ncols: 1,
+    },
+    Shape {
+        label: "gauss_matern",
+        formula: "y ~ matern(x0)",
+        family: "gaussian",
+        ncols: 1,
+    },
+    Shape {
+        label: "gauss_duchon",
+        formula: "y ~ duchon(x0)",
+        family: "gaussian",
+        ncols: 1,
+    },
+    Shape {
+        label: "pois_s",
+        formula: "y ~ s(x0)",
+        family: "poisson",
+        ncols: 1,
+    },
+    Shape {
+        label: "binom_s",
+        formula: "y ~ s(x0)",
+        family: "binomial",
+        ncols: 1,
+    },
+    Shape {
+        label: "gamma_s",
+        formula: "y ~ s(x0)",
+        family: "gamma",
+        ncols: 1,
+    },
     // ── parametric / mixed ──────────────────────────────────────────────
-    Shape { label: "gauss_linear",   formula: "y ~ x0",               family: "gaussian", ncols: 1 },
-    Shape { label: "gauss_lin2",     formula: "y ~ x0 + x1",          family: "gaussian", ncols: 2 },
-    Shape { label: "gauss_mix",      formula: "y ~ x0 + s(x1)",       family: "gaussian", ncols: 2 },
-    Shape { label: "pois_mix",       formula: "y ~ x0 + s(x1)",       family: "poisson",  ncols: 2 },
+    Shape {
+        label: "gauss_linear",
+        formula: "y ~ x0",
+        family: "gaussian",
+        ncols: 1,
+    },
+    Shape {
+        label: "gauss_lin2",
+        formula: "y ~ x0 + x1",
+        family: "gaussian",
+        ncols: 2,
+    },
+    Shape {
+        label: "gauss_mix",
+        formula: "y ~ x0 + s(x1)",
+        family: "gaussian",
+        ncols: 2,
+    },
+    Shape {
+        label: "pois_mix",
+        formula: "y ~ x0 + s(x1)",
+        family: "poisson",
+        ncols: 2,
+    },
     // ── additive multi-smooth ───────────────────────────────────────────
-    Shape { label: "gauss_add2",     formula: "y ~ s(x0) + s(x1)",    family: "gaussian", ncols: 2 },
+    Shape {
+        label: "gauss_add2",
+        formula: "y ~ s(x0) + s(x1)",
+        family: "gaussian",
+        ncols: 2,
+    },
     // ── tensor product ──────────────────────────────────────────────────
-    Shape { label: "gauss_te",       formula: "y ~ te(x0, x1)",       family: "gaussian", ncols: 2 },
+    Shape {
+        label: "gauss_te",
+        formula: "y ~ te(x0, x1)",
+        family: "gaussian",
+        ncols: 2,
+    },
 ];
 
 /// Degeneracy injectors applied to a generated predictor column. These are the
@@ -248,7 +308,10 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
 
     // I1 finite β.
     if fit.fit.beta.iter().any(|v| !v.is_finite()) {
-        return Err(format!("{repro}\n  I1 VIOLATED: non-finite beta {:?}", fit.fit.beta));
+        return Err(format!(
+            "{repro}\n  I1 VIOLATED: non-finite beta {:?}",
+            fit.fit.beta
+        ));
     }
 
     // I3 finite objective.
@@ -281,11 +344,15 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
                 ));
             }
             if pred.iter().any(|v| !v.is_finite()) {
-                return Err(format!("{repro}\n  I2 VIOLATED: non-finite training prediction"));
+                return Err(format!(
+                    "{repro}\n  I2 VIOLATED: non-finite training prediction"
+                ));
             }
         }
         Err(e) => {
-            return Err(format!("{repro}\n  I2 VIOLATED: predict design rebuild failed: {e}"));
+            return Err(format!(
+                "{repro}\n  I2 VIOLATED: predict design rebuild failed: {e}"
+            ));
         }
     }
 
@@ -344,12 +411,7 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
 /// stream for the predictor block. The response draws happen AFTER the
 /// predictor draws in `build_data`, so reproducing only the predictor columns
 /// here uses the identical leading RNG sequence.
-fn training_predictor_matrix(
-    ncols: usize,
-    n: usize,
-    degen: Degeneracy,
-    seed: u64,
-) -> Array2<f64> {
+fn training_predictor_matrix(ncols: usize, n: usize, degen: Degeneracy, seed: u64) -> Array2<f64> {
     let mut rng = StdRng::seed_from_u64(seed);
     let unif = Uniform::new(0.0_f64, 1.0).expect("uniform");
     let mut cols: Vec<Vec<f64>> = (0..ncols)
@@ -437,7 +499,10 @@ fn fuzz_fit_universal_invariants() {
             )),
         }
     }
-    eprintln!("[fuzz] ran {ran} cases, {} invariant violations", violations.len());
+    eprintln!(
+        "[fuzz] ran {ran} cases, {} invariant violations",
+        violations.len()
+    );
     assert!(
         violations.is_empty(),
         "fuzz invariant violations ({} of {ran} cases):\n  - {}",

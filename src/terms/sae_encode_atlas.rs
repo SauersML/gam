@@ -399,6 +399,75 @@ fn decoder_row_norm_sum(decoder: ArrayView2<'_, f64>) -> f64 {
     acc
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReconstructionJetSups {
+    value: f64,
+    jacobian: f64,
+    hessian: f64,
+    third: f64,
+}
+
+fn pair_trig_decoder_sup(sin_row: ArrayView1<'_, f64>, cos_row: ArrayView1<'_, f64>) -> f64 {
+    let aa = sin_row.dot(&sin_row);
+    let bb = cos_row.dot(&cos_row);
+    let ab = sin_row.dot(&cos_row);
+    let trace = aa + bb;
+    let disc = ((aa - bb) * (aa - bb) + 4.0 * ab * ab).sqrt();
+    (0.5 * (trace + disc)).sqrt()
+}
+
+fn periodic_reconstruction_jet_sups(decoder: ArrayView2<'_, f64>) -> ReconstructionJetSups {
+    let mut value = 0.0;
+    let mut jacobian = 0.0;
+    let mut hessian = 0.0;
+    let mut third = 0.0;
+    if decoder.nrows() > 0 {
+        value += decoder.row(0).dot(&decoder.row(0)).sqrt();
+    }
+    let harmonics = decoder.nrows().saturating_sub(1) / 2;
+    for h in 1..=harmonics {
+        let sin_idx = 2 * h - 1;
+        let cos_idx = 2 * h;
+        let amp = pair_trig_decoder_sup(decoder.row(sin_idx), decoder.row(cos_idx));
+        let omega = std::f64::consts::TAU * h as f64;
+        value += amp;
+        jacobian += omega * amp;
+        hessian += omega.powi(2) * amp;
+        third += omega.powi(3) * amp;
+    }
+    for row in (1 + 2 * harmonics)..decoder.nrows() {
+        let amp = decoder.row(row).dot(&decoder.row(row)).sqrt();
+        value += amp;
+        let omega = std::f64::consts::TAU * harmonics.max(1) as f64;
+        jacobian += omega * amp;
+        hessian += omega.powi(2) * amp;
+        third += omega.powi(3) * amp;
+    }
+    ReconstructionJetSups {
+        value,
+        jacobian,
+        hessian,
+        third,
+    }
+}
+
+fn reconstruction_jet_sups(atom: &SaeManifoldAtom, sups: JetSups) -> ReconstructionJetSups {
+    if matches!(
+        atom.basis_kind,
+        crate::terms::sae_manifold::SaeAtomBasisKind::Periodic
+    ) {
+        periodic_reconstruction_jet_sups(atom.decoder_coefficients.view())
+    } else {
+        let decoder_norm_sum = decoder_row_norm_sum(atom.decoder_coefficients.view());
+        ReconstructionJetSups {
+            value: decoder_norm_sum * sups.value,
+            jacobian: decoder_norm_sum * sups.jacobian,
+            hessian: decoder_norm_sum * sups.hessian,
+            third: decoder_norm_sum * sups.third,
+        }
+    }
+}
+
 /// The Hessian-Lipschitz constant `L` of the per-row encode objective `f_k` on
 /// a chart, assembled in closed form from the basis jet sups and the decoder /
 /// amplitude / target magnitudes. See the module docs for the derivation:
@@ -411,23 +480,17 @@ fn decoder_row_norm_sum(decoder: ArrayView2<'_, f64>) -> f64 {
 ///
 /// `prior_lipschitz` is the caller-supplied closed-form `L_prior` of the
 /// ARD/von-Mises coordinate prior (`0.0` if no prior is active on the encode).
-#[allow(clippy::too_many_arguments)]
 fn hessian_lipschitz_constant(
-    jet_value: f64,
-    jet_jac: f64,
-    jet_hess: f64,
-    jet_third: f64,
-    decoder_norm_sum: f64,
+    recon_sups: ReconstructionJetSups,
     amplitude: f64,
     target_norm: f64,
     prior_lipschitz: f64,
 ) -> f64 {
     let z = amplitude.abs();
-    let s_b = decoder_norm_sum;
-    let m_jac = z * s_b * jet_jac;
-    let m_hess = z * s_b * jet_hess;
-    let m_third = z * s_b * jet_third;
-    let recon_value = z * s_b * jet_value;
+    let m_jac = z * recon_sups.jacobian;
+    let m_hess = z * recon_sups.hessian;
+    let m_third = z * recon_sups.third;
+    let recon_value = z * recon_sups.value;
     let r_norm = target_norm + recon_value;
     3.0 * m_jac * m_hess + r_norm * m_third + prior_lipschitz
 }
@@ -905,16 +968,9 @@ impl EncodeAtlas {
             let center = centers.row(c).to_owned();
             let region = chart_region(atom, center.clone(), nominal_radius);
             let sups = family_jet_sups(atom, &region)?;
-            let lipschitz = hessian_lipschitz_constant(
-                sups.value,
-                sups.jacobian,
-                sups.hessian,
-                sups.third,
-                decoder_norm_sum,
-                amplitude_bound,
-                target_norm_bound,
-                0.0,
-            );
+            let recon_sups = reconstruction_jet_sups(atom, sups);
+            let lipschitz =
+                hessian_lipschitz_constant(recon_sups, amplitude_bound, target_norm_bound, 0.0);
             // β at the chart center bounds the worst-case in-chart curvature
             // (the Gauss-Newton Hessian is continuous; the certified radius is
             // solved so the certificate is robust to the start within the ball).

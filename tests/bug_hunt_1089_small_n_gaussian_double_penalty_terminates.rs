@@ -20,7 +20,8 @@ use rand_distr::{Distribution, Normal, Uniform};
 
 /// A smooth Gaussian truth over five covariates, evaluated at one row.
 fn truth(x: &[f64; 5]) -> f64 {
-    (1.3 * x[0]).sin() + 0.5 * x[1] * x[1] - 0.7 * x[2] + (0.4 * x[3]).cos()
+    (1.3 * x[0]).sin() + 0.5 * x[1] * x[1] - 0.7 * x[2]
+        + (0.4 * x[3]).cos()
         + 0.2 * (x[4] - 0.5).abs()
 }
 
@@ -81,8 +82,8 @@ fn wine_shaped_double_penalty_fit_converges_promptly() {
     let data = build_data(30, 0.1, 1089);
 
     let start = std::time::Instant::now();
-    let result =
-        fit_from_formula(WINE_SHAPED_FORMULA, &data, &gaussian_cfg()).expect("n=30 wine-shaped fit");
+    let result = fit_from_formula(WINE_SHAPED_FORMULA, &data, &gaussian_cfg())
+        .expect("n=30 wine-shaped fit");
     let elapsed = start.elapsed();
 
     let FitResult::Standard(fit) = result else {
