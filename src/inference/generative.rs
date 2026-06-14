@@ -174,6 +174,40 @@ impl NoiseModel {
         }
     }
 
+    /// Build the observation `NoiseModel` for a dispersion location-scale fit
+    /// (#1125) from a fitted PER-ROW dispersion surface `dispersion[i]` (the
+    /// predictor's `exp(eta_d(x_i))` mapped into NoiseModel units — NB θ, Gamma
+    /// shape, Beta φ directly, Tweedie φ as the reciprocal). Unlike
+    /// `from_likelihood`, which broadcasts a single scalar dispersion to every
+    /// row, this threads the genuine per-observation precision channel so
+    /// generated data reproduces the fitted non-constant dispersion instead of
+    /// coming out homoscedastic at the seed.
+    pub fn from_likelihood_with_per_row_dispersion(
+        likelihood: &LikelihoodSpec,
+        dispersion: Array1<f64>,
+    ) -> Result<NoiseModel, EstimationError> {
+        match &likelihood.response {
+            ResponseFamily::Tweedie { p } => {
+                let p = *p;
+                if !is_valid_tweedie_power(p) {
+                    crate::bail_invalid_estim!(
+                        "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
+                    );
+                }
+                Ok(NoiseModel::Tweedie { p, phi: dispersion })
+            }
+            ResponseFamily::NegativeBinomial { .. } => {
+                Ok(NoiseModel::NegativeBinomial { theta: dispersion })
+            }
+            ResponseFamily::Beta { .. } => Ok(NoiseModel::Beta { phi: dispersion }),
+            ResponseFamily::Gamma => Ok(NoiseModel::Gamma { shape: dispersion }),
+            other => Err(EstimationError::InvalidInput(format!(
+                "per-row dispersion generative sampling is only defined for the dispersion \
+                 location-scale families (Gamma/NegativeBinomial/Beta/Tweedie); got {other:?}"
+            ))),
+        }
+    }
+
     fn require_noise_parameter(
         likelihood: &LikelihoodSpec,
         parameter_name: &str,
@@ -498,22 +532,31 @@ mod tests {
             (
                 LikelihoodSpec::tweedie_log(1.4),
                 Some(0.9),
-                NoiseModel::Tweedie { p: 1.4, phi: 0.9 },
+                NoiseModel::Tweedie {
+                    p: 1.4,
+                    phi: Array1::from_elem(nobs, 0.9),
+                },
             ),
             (
                 LikelihoodSpec::negative_binomial_log(2.5),
                 None,
-                NoiseModel::NegativeBinomial { theta: 2.5 },
+                NoiseModel::NegativeBinomial {
+                    theta: Array1::from_elem(nobs, 2.5),
+                },
             ),
             (
                 LikelihoodSpec::beta_logit(3.0),
                 None,
-                NoiseModel::Beta { phi: 3.0 },
+                NoiseModel::Beta {
+                    phi: Array1::from_elem(nobs, 3.0),
+                },
             ),
             (
                 LikelihoodSpec::gamma_log(),
                 Some(1.5),
-                NoiseModel::Gamma { shape: 1.5 },
+                NoiseModel::Gamma {
+                    shape: Array1::from_elem(nobs, 1.5),
+                },
             ),
         ];
 

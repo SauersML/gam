@@ -749,6 +749,21 @@ pub trait PredictableModel {
         input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError>;
 
+    /// Optional per-observation DISPERSION parameter for dispersion
+    /// location-scale families (#1125), expressed in the generative
+    /// `NoiseModel`'s own units: NB θ, Gamma shape and Beta φ are the per-row
+    /// precision `exp(eta_d(x))` directly; Tweedie φ is its reciprocal
+    /// (`Var = φ·μ^p`, precision `= 1/φ`). `None` for models without a per-row
+    /// dispersion channel — those keep the scalar dispersion the fit estimated.
+    /// This is what lets `gam generate` reproduce a fitted non-constant
+    /// dispersion surface instead of drawing homoscedastic data at the seed.
+    fn predict_dispersion_scale(
+        &self,
+        _input: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(None)
+    }
+
     /// Full prediction with confidence/observation intervals.
     ///
     /// Delegates to `predict_gamwith_uncertainty` for standard models.
@@ -4107,6 +4122,23 @@ impl PredictableModel for DispersionLocationScalePredictor {
         input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
         self.noise_sd(input).map(Some)
+    }
+
+    fn predict_dispersion_scale(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        // Per-row precision `exp(eta_d(x))` mapped into the generative
+        // NoiseModel's dispersion units (#1125): NB θ, Gamma shape and Beta φ
+        // ARE the precision; Tweedie φ is its reciprocal.
+        let precision = self.precision(input)?;
+        let dispersion = match self.likelihood.response {
+            ResponseFamily::Tweedie { .. } => {
+                precision.mapv(|pr| 1.0 / pr.max(f64::MIN_POSITIVE))
+            }
+            _ => precision,
+        };
+        Ok(Some(dispersion))
     }
 
     fn predict_full_uncertainty(

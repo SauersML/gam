@@ -295,6 +295,44 @@ pub(crate) fn run_generate_unified(
             mean: pred.mean,
             noise: gam::generative::NoiseModel::Gaussian { sigma },
         })
+    } else if model_class == PredictModelClass::DispersionLocationScale {
+        // Dispersion location-scale (#913/#1125): the fit learned a per-row
+        // precision surface `exp(eta_d(x))`. Thread it into the generative noise
+        // model so synthetic data reproduces the non-constant dispersion,
+        // exactly as the Gaussian-LS branch above threads per-row sigma. Without
+        // this the family fell into the scalar `else` branch and generated
+        // homoscedastic data at the seed dispersion.
+        let pred = predictor
+            .predict_plugin_response(&pred_input)
+            .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
+        match predictor
+            .predict_dispersion_scale(&pred_input)
+            .map_err(|e| format!("predict_dispersion_scale failed: {e}"))?
+        {
+            Some(dispersion) => {
+                let noise = gam::generative::NoiseModel::from_likelihood_with_per_row_dispersion(
+                    &likelihood,
+                    dispersion,
+                )
+                .map_err(|e| format!("failed to build per-row dispersion noise: {e}"))?;
+                Ok(gam::generative::GenerativeSpec {
+                    mean: pred.mean,
+                    noise,
+                })
+            }
+            None => {
+                // No usable per-row precision channel (e.g. a dispersion family
+                // fitted without a noise formula): fall back to the scalar
+                // estimated dispersion.
+                let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+                generativespec_from_predict(
+                    pred,
+                    likelihood,
+                    family_noise_parameter(&fit_saved, family),
+                )
+                .map_err(|e| format!("failed to build generative spec: {e}"))
+            }
+        }
     } else {
         // Non-Gaussian models produce their response-scale plug-in mean
         // directly here.
