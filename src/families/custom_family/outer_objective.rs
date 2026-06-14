@@ -231,6 +231,47 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         cached_active_sets = seed.active_sets.clone();
         refresh_all_block_etas(family, specs, &mut states)?;
     }
+    // Feasibility restoration for shape-constrained blocks (gam#1108). Every
+    // seed source has now been applied — `buildblock_states` (which routes the
+    // cold seed through `post_update_block_beta`) and, above, the warm-start
+    // copy (which routes a cached β through the SAME hook). For a family whose
+    // `post_update_block_beta` only VALIDATES feasibility against a scale-
+    // relative tolerance rather than projecting (the survival monotone
+    // time-warp block does exactly this), the resulting `states[b].beta` can be
+    // infeasible to the joint-Newton inner solve's active-set QP entry gate
+    // (`check_linear_feasibility`, fixed absolute `1e-8`): the interval-censored
+    // right-censored-at-L surrogate seed reaches it ≈5.8e-3 (scaled) outside the
+    // monotone cone, the gate rejects it as an "infeasible iterate", and the
+    // whole fit aborts. Restore feasibility ONCE here, BEFORE the first gradient
+    // evaluation (so the cached joint gradient / Hessian are built at a feasible
+    // β), by projecting each infeasible constrained block onto its polytope with
+    // the exact identity-Hessian active-set projection
+    // (`project_point_strictly_into_feasible_cone`: nearest strictly-interior
+    // point, clearing the gate by orders of magnitude in one certified solve).
+    // The per-cycle QP maintains feasibility from there. A block already
+    // feasible is left untouched (no perturbation of a well-conditioned fit); a
+    // malformed / empty-interior polytope yields `None` and is left for the gate
+    // to report honestly rather than silently forcing a point.
+    {
+        let entry_block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+        let mut restored_any = false;
+        for (b, constraint) in entry_block_constraints.iter().enumerate() {
+            if let Some(constraints) = constraint
+                && check_linear_feasibility(&states[b].beta, constraints, 1e-8).is_err()
+                && let Some(restored) =
+                    crate::solver::active_set::project_point_strictly_into_feasible_cone(
+                        &states[b].beta,
+                        constraints,
+                    )
+            {
+                states[b].beta = restored;
+                restored_any = true;
+            }
+        }
+        if restored_any {
+            refresh_all_block_etas(family, specs, &mut states)?;
+        }
+    }
     let load_joint_started = std::time::Instant::now();
     if prelude_log {
         log::info!(
