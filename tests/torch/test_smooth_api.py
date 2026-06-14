@@ -125,16 +125,99 @@ def test_fit_periodic_spline_curve_single():
     assert res.fitted.shape == (20, 1)
 
 
-def test_matern_fit_raises_notimplemented():
+def test_matern_fit_single_1d():
+    """Matern tensor backend is wired (#1105): kernel design vs centers, RKHS
+    covariance-Gram penalty. The fit must produce finite coefficients and a
+    fitted vector matching the response shape."""
     t, y = _inputs(n=20)
-    with pytest.raises(NotImplementedError):
-        gt.fit(t, y, gt.Matern(centers=_centers(6), nu=1.5, length_scale=1.0))
+    centers = _centers(6)
+    res = gt.fit(t, y, gt.Matern(centers=centers, nu=1.5, length_scale=1.0))
+
+    # One coefficient per center, single output column.
+    assert res.coefficients.shape == (6, 1)
+    assert res.fitted.shape == (20, 1)
+    assert torch.isfinite(res.coefficients).all()
+    assert torch.isfinite(res.fitted).all()
+    # The kernel ridge must actually track the smooth target, not collapse.
+    y2d = y.unsqueeze(1)
+    ss_res = ((res.fitted - y2d) ** 2).sum()
+    ss_tot = ((y2d - y2d.mean()) ** 2).sum()
+    assert float(ss_res / ss_tot) < 0.5
 
 
-def test_tensorbspline_fit_raises_notimplemented():
+def test_matern_fit_autograd_flows_to_points():
+    """The Matern design carries the input-location VJP back to ``points``
+    (the scalar-kernel autograd path), so a scalar of the fitted values has a
+    finite, non-zero gradient w.r.t. the input coordinates."""
+    t, _y = _inputs(n=20)
+    t = t.clone().requires_grad_(True)
+    y = torch.sin(3.0 * t.detach())
+    res = gt.fit(t, y, gt.Matern(centers=_centers(6), nu=1.5, length_scale=1.0))
+    loss = res.fitted.sum()
+    (grad,) = torch.autograd.grad(loss, t)
+    assert grad.shape == t.shape
+    assert torch.isfinite(grad).all()
+    assert float(grad.abs().sum()) > 0.0
+
+
+def _tensor_bspline_inputs(n=24, seed=1):
+    """2D (x, z) grid-ish points and a separable interaction target."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.rand(n, generator=g, dtype=torch.float64)
+    z = torch.rand(n, generator=g, dtype=torch.float64)
+    points = torch.stack([x, z], dim=1)
+    y = torch.sin(3.0 * x) * torch.cos(2.0 * z) + 0.02 * torch.randn(
+        n, generator=g, dtype=torch.float64,
+    )
+    return points, y
+
+
+def test_tensorbspline_fit_te_2d():
+    """TensorBSpline (te) tensor backend is wired (#1105): Khatri-Rao design
+    over both marginal B-spline bases, Kronecker-sum tensor penalty. The fit
+    must recover the interaction target on a 2D (x, z) input."""
+    points, y = _tensor_bspline_inputs()
+    knots = torch.linspace(0.0, 1.0, 8, dtype=torch.float64)
+    res = gt.fit(
+        points,
+        y,
+        gt.TensorBSpline(
+            marginals=[
+                gt.BSpline(knots=knots, degree=3),
+                gt.BSpline(knots=knots, degree=3),
+            ],
+        ),
+    )
+
+    # Coefficient space is the tensor product of the two marginal bases: its
+    # size is the product of each marginal B-spline's column count. Derive the
+    # marginal column count from the basis itself (avoids hardcoding the
+    # open-knot convention) and assert the Kronecker dimension.
+    from gamfit.torch._basis import bspline_basis as _bspline_basis
+
+    marg_cols = _bspline_basis(
+        points[:, 0], knots, degree=3, periodic=False,
+    ).shape[1]
+    assert marg_cols > 1
+    assert res.coefficients.dim() == 2
+    assert res.coefficients.shape[1] == 1
+    assert res.coefficients.shape[0] == marg_cols * marg_cols
+    assert res.fitted.shape == (points.shape[0], 1)
+    assert torch.isfinite(res.coefficients).all()
+    # The interaction surface must actually be tracked (additive s(x)+s(z)
+    # cannot represent sin(x)cos(z); the te must beat the variance floor).
+    y2d = y.unsqueeze(1)
+    ss_res = ((res.fitted - y2d) ** 2).sum()
+    ss_tot = ((y2d - y2d.mean()) ** 2).sum()
+    assert float(ss_res / ss_tot) < 0.6
+
+
+def test_tensorbspline_dim_mismatch_rejected():
+    """A 2-marginal TensorBSpline against 1D points is a shape error, not a
+    silent broadcast."""
     t, y = _inputs(n=20)
     knots = torch.linspace(0.0, 1.0, 8, dtype=torch.float64)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):
         gt.fit(
             t,
             y,
