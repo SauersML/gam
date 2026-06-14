@@ -480,6 +480,7 @@ class Model:
         x0: dict[str, Any] | None = None,
         x1: dict[str, Any] | None = None,
         weights: list[float] | None = None,
+        deriv_var: str | None = None,
     ) -> dict[str, float]:
         """Riesz-representer debiased / Neyman-orthogonal estimate of a smooth
         functional (#1055).
@@ -517,6 +518,11 @@ class Model:
         weights : list of float or None
             Per-row importance weights for ``"average_value"`` /
             ``"average_derivative"`` (length == number of training rows).
+        deriv_var : str or None
+            For ``"average_derivative"`` only: the covariate column to
+            differentiate with respect to. Auto-selected when the model has a
+            smooth over a single covariate; supply it explicitly when the model
+            has smooths over more than one covariate.
 
         Returns
         -------
@@ -535,6 +541,8 @@ class Model:
             spec["x1"] = {k: v for k, v in x1.items()}
         if weights is not None:
             spec["weights"] = list(weights)
+        if deriv_var is not None:
+            spec["deriv_var"] = deriv_var
         try:
             raw = rust_module().model_debiased_functional_json(
                 self._model_bytes, headers, rows, json.dumps(spec)

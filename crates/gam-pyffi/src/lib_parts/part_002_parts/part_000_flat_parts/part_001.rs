@@ -3439,9 +3439,15 @@ fn smooth_term_lr_inference_json(
 ///   saved model's design map.
 /// * For `"contrast"`: `"x0"` and `"x1"` — two query row dicts; the
 ///   functional is `m(x0) − m(x1)`.
-/// * For `"average_derivative"` / `"average_value"`: uses the design matrix
-///   at the training data rows (already materialized from `headers`/`rows`).
-///   Optional `"weights"` key: list of per-row weights.
+/// * For `"average_value"`: uses the value design matrix at the training data
+///   rows (already materialized from `headers`/`rows`).
+/// * For `"average_derivative"`: uses the basis-DERIVATIVE design `∂φ_j/∂x` at
+///   the training rows (built by central finite differences through the same
+///   frozen spec), differentiating with respect to the model's single smooth
+///   covariate, or the column named by an optional `"deriv_var"` key when the
+///   model has smooths over more than one covariate.
+/// * Both averaged targets accept an optional `"weights"` key: a list of
+///   per-row weights.
 ///
 /// Returns `{"target", "theta_plugin", "theta_debiased", "se",
 /// "penalty_bias", "ci_lower", "ci_upper", "ci_level"}`.
@@ -3667,8 +3673,22 @@ fn model_debiased_functional_json_impl(
                 .gradient()
                 .map_err(|e| format!("debiased_functional: average_value gradient: {e}"))?
             } else {
+                // average_derivative needs rows of basis-function DERIVATIVES
+                // ∂φ_j/∂x(x_i), NOT the value design φ_j(x_i). Feeding the value
+                // design returns mean_i w_i·m(x_i) (the average value) instead of
+                // mean_i w_i·m'(x_i) (#1120). Build the derivative design by
+                // central finite differences on the term-collection design with
+                // respect to the chosen covariate column, rebuilt through the
+                // same frozen spec so its columns align with beta.
+                let deriv_col = resolve_average_derivative_column(&spec, &dataset, &spec_val)?;
+                let dx = average_derivative_design_fd(
+                    standard.data.view(),
+                    &spec,
+                    deriv_col,
+                    x.ncols(),
+                )?;
                 SmoothFunctional::AverageDerivative {
-                    derivative_design: x_ref.view(),
+                    derivative_design: dx.view(),
                     weights: weights.as_ref().map(|w| w.view()),
                 }
                 .gradient()
@@ -3706,6 +3726,125 @@ fn model_debiased_functional_json_impl(
     });
     serde_json::to_string(&out)
         .map_err(|e| format!("debiased_functional: serialization failed: {e}"))
+}
+
+/// Resolve the covariate column index to differentiate for an
+/// `average_derivative` functional (#1120 / #1097).
+///
+/// If the target spec carries an explicit `"deriv_var"` column name, it is
+/// resolved against the materialized dataset headers. Otherwise the column is
+/// auto-selected (magic-by-default) as the single feature column shared by all
+/// smooth terms in the model; if the model has smooths over more than one
+/// covariate the caller must disambiguate via `"deriv_var"`.
+fn resolve_average_derivative_column(
+    spec: &TermCollectionSpec,
+    dataset: &EncodedDataset,
+    spec_val: &serde_json::Value,
+) -> Result<usize, String> {
+    if let Some(name) = spec_val.get("deriv_var").and_then(|v| v.as_str()) {
+        return dataset
+            .column_map()
+            .get(name)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "debiased_functional: average_derivative \"deriv_var\" '{name}' \
+                     is not a column of the training data"
+                )
+            });
+    }
+    let mut cols: Vec<usize> = spec
+        .smooth_terms
+        .iter()
+        .flat_map(smooth_term_feature_cols)
+        .collect();
+    cols.sort_unstable();
+    cols.dedup();
+    match cols.as_slice() {
+        [single] => Ok(*single),
+        [] => Err(
+            "debiased_functional: average_derivative requires at least one smooth term \
+             to differentiate; the model has no smooths"
+                .to_string(),
+        ),
+        _ => Err(
+            "debiased_functional: average_derivative is ambiguous because the model has \
+             smooths over more than one covariate; specify the covariate via the \
+             \"deriv_var\" key in the target spec"
+                .to_string(),
+        ),
+    }
+}
+
+/// Build the average-derivative design `∂φ_j/∂x_c(x_i)` by central finite
+/// differences on the term-collection design, rebuilt through the same frozen
+/// `spec` so its columns align with the fitted coefficient vector (#1120).
+///
+/// Column `deriv_col` of the training data is shifted by `±h` (a relative step
+/// scaled by the column's finite spread) and the design is re-evaluated; the
+/// derivative design is `(X(x+h) − X(x−h)) / (2h)`, accurate to `O(h²)`.
+fn average_derivative_design_fd(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    deriv_col: usize,
+    expected_cols: usize,
+) -> Result<ndarray::Array2<f64>, String> {
+    if deriv_col >= data.ncols() {
+        return Err(format!(
+            "debiased_functional: average_derivative column {deriv_col} out of range \
+             for training data with {} columns",
+            data.ncols()
+        ));
+    }
+    // Relative step from the finite spread of the differentiated column.
+    let (lo, hi) = data
+        .column(deriv_col)
+        .iter()
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+    let spread = if lo.is_finite() && hi.is_finite() && hi > lo {
+        hi - lo
+    } else {
+        1.0
+    };
+    let h = 1.0e-3 * spread;
+    if !(h.is_finite() && h > 0.0) {
+        return Err(format!(
+            "debiased_functional: average_derivative finite-difference step is non-positive \
+             (column spread {spread})"
+        ));
+    }
+
+    let build_shifted = |delta: f64| -> Result<ndarray::Array2<f64>, String> {
+        let mut shifted = data.to_owned();
+        shifted.column_mut(deriv_col).mapv_inplace(|v| v + delta);
+        let built = build_term_collection_design(shifted.view(), spec).map_err(|e| {
+            format!("debiased_functional: average_derivative design rebuild failed: {e}")
+        })?;
+        let dense = built
+            .design
+            .try_to_dense_arc("debiased_functional average_derivative design")
+            .map_err(|e| {
+                format!("debiased_functional: average_derivative densification failed: {e}")
+            })?;
+        if dense.ncols() != expected_cols {
+            return Err(format!(
+                "debiased_functional: average_derivative design width {} does not match \
+                 fitted coefficient width {expected_cols}",
+                dense.ncols()
+            ));
+        }
+        Ok(dense.as_ref().to_owned())
+    };
+
+    let x_plus = build_shifted(h)?;
+    let x_minus = build_shifted(-h)?;
+    let mut dx = x_plus;
+    dx -= &x_minus;
+    dx /= 2.0 * h;
+    Ok(dx)
 }
 
 #[pyfunction]

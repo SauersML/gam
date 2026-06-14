@@ -100,7 +100,7 @@ use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 
 use gam::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design,
+    freeze_term_collection_from_design, smooth_term_feature_cols,
 };
 
 use gam::solver::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
