@@ -2050,79 +2050,128 @@ mod tests {
         );
     }
 
-    /// Regression test for https://github.com/SauersML/gam/issues/1117.
+    /// Regression test for https://github.com/SauersML/gam/issues/1117
+    /// (the DEEP fix: rank-`r` basis-column reduction past the #1051 LM ridge).
     ///
-    /// On a near-degenerate input manifold (the `stage1-step0` PCA-32 checkpoint:
-    /// post-PCA std ≈ 0.04) the latent coordinate collapses so two of the circle
-    /// atom's basis columns are linearly dependent IN THE DATA — the bare data
-    /// Gram `G_k` is rank-deficient (`[SAE-AUDIT]` `rank 3/5`). At the ρ states the
-    /// outer BFGS visits, the smoothing penalty `λ·S_k` can fill those data-null
-    /// directions, so the PENALISED Gram is full rank and well-conditioned. Before
-    /// #1117 the β-ridge floor inspected ONLY the penalised Gram, found it
-    /// conditioned, and returned the negligible nominal ridge; the inner Newton
-    /// step then crawled the data-flat β-direction and the outer BFGS overran its
-    /// budget (the ~4 min stall). The floor must engage on the bare-data
-    /// deficiency even when the penalty masks it in the penalised block.
+    /// On a near-degenerate input manifold (the OLMo L25 PCA-32 circle, or the
+    /// `stage1-step0` checkpoint: post-PCA std ≈ 0.04) the latent coordinate
+    /// collapses so basis columns are linearly dependent IN THE DATA — the bare
+    /// data Gram `G_k` is rank-deficient (`[SAE-AUDIT]` `rank r/M`). The deep fix
+    /// discovers that dead subspace `N_k` from `G_k` and returns a projector
+    /// `Π_k = N_k N_kᵀ` (a) so the inner solve & evidence log-det deflate the dead
+    /// directions at unit stiffness (no ρ-dependent flat valley), and (b) so the
+    /// converged decoder is projected onto `range(G_k)` (the rank-`r` oracle).
+    ///
+    /// (a) Well-conditioned reduction + (b) rank-`r` oracle match: a decoder whose
+    /// data Gram drops one direction must yield a projector that, when subtracted,
+    /// pins the decoder's dead-direction component to zero (= the fit those
+    /// columns being absent would give) while leaving the data-fit reconstruction
+    /// untouched.
     #[test]
-    fn rank_deficient_data_gram_engages_beta_ridge_floor_when_penalty_masks_it() {
-        // Collapse the latent coordinate: every row sits at the SAME angle, so
-        // all three `Φ` rows are identical and the bare data Gram is rank 1/3 —
-        // the data-manifold degeneracy #1117 targets.
-        let coords = array![[0.3], [0.3], [0.3]];
+    fn data_null_projector_reduces_rank_deficient_circle_decoder_to_oracle() {
+        // Collapse the latent coordinate onto TWO distinct angles: the three
+        // periodic columns `[1, sin, cos]` then span a rank-2 data subspace, so
+        // exactly ONE direction is data-null (`rank 2/3`). This is the generic
+        // degeneracy the OLMo circle exhibits (one fewer harmonic excited than
+        // the basis carries), reduced to the minimal `M = 3` reproducer.
+        let coords = array![[0.2], [0.7], [0.2], [0.7]];
         let (phi, jet) = periodic_basis(&coords);
-        // A full-rank smoothness penalty (`I_3`) covers the two data-null
-        // directions, so the penalised Gram `G_k + λ·S_k` is full rank and would
-        // read as "conditioned" to the old penalised-only test.
         let penalty = Array2::<f64>::eye(3);
+        // A decoder with a deliberate component along the data-null direction.
+        let decoder = array![[0.05], [-0.05], [0.05]];
         let atom = SaeManifoldAtom::new(
             "periodic",
             SaeAtomBasisKind::Periodic,
             1,
-            phi,
+            phi.clone(),
             jet,
-            array![[0.05], [-0.05], [0.05]],
+            decoder.clone(),
             penalty,
         )
         .unwrap();
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-            // Full assignment mass so the data Gram is non-trivial (rank 1, not 0).
-            Array2::<f64>::ones((3, 1)),
+            Array2::<f64>::ones((4, 1)),
             vec![coords],
             vec![LatentManifold::Circle { period: 1.0 }],
             AssignmentMode::softmax(0.7),
         )
         .unwrap();
-        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-        // Moderate λ so the penalised Gram is genuinely well-conditioned (the
-        // masking regime); the bare data Gram is still rank-deficient.
-        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
-        let nominal = 1.0e-6;
-        let floored = term.rank_deficient_beta_ridge_floor(&rho, nominal);
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        let projectors = term.data_null_decoder_projectors();
+        let proj = projectors[0]
+            .as_ref()
+            .expect("rank-deficient circle decoder must yield a data-null projector");
+
+        // (a) The projector is a genuine non-trivial orthogonal projector onto the
+        // data-null subspace: symmetric, idempotent, and rank ≥ 1.
+        let pp = proj.dot(proj);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (proj[[i, j]] - proj[[j, i]]).abs() < 1e-9,
+                    "projector must be symmetric",
+                );
+                assert!(
+                    (pp[[i, j]] - proj[[i, j]]).abs() < 1e-7,
+                    "projector must be idempotent (Π² = Π); got Π²[{i},{j}]={} Π={}",
+                    pp[[i, j]],
+                    proj[[i, j]],
+                );
+            }
+        }
+        let proj_trace: f64 = (0..3).map(|i| proj[[i, i]]).sum();
         assert!(
-            floored > nominal,
-            "data-rank-deficient decoder must engage the LM ridge floor even when \
-             the penalty masks the deficiency in the penalised block (#1117); \
-             got floored={floored} == nominal={nominal}",
+            (proj_trace - 1.0).abs() < 1e-6,
+            "exactly one direction is data-null here, so tr(Π) = 1; got {proj_trace}",
+        );
+
+        // (b) Projecting the decoder onto range(G_k) leaves the data-fit
+        // reconstruction `Φ·B` unchanged (the dead direction carries no data
+        // signal) while removing the null component.
+        let recon_before = phi.dot(&decoder);
+        term.project_decoder_onto_data_range(&projectors);
+        let reduced = term.atoms[0].decoder_coefficients.clone();
+        let recon_after = phi.dot(&reduced);
+        for i in 0..recon_before.nrows() {
+            assert!(
+                (recon_before[[i, 0]] - recon_after[[i, 0]]).abs() < 1e-9,
+                "range projection must not change the data-fit reconstruction at \
+                 row {i}: before={} after={}",
+                recon_before[[i, 0]],
+                recon_after[[i, 0]],
+            );
+        }
+        // The reduced decoder has zero component along the data-null subspace
+        // (`Π·B_reduced ≈ 0`): it equals the rank-`r` oracle.
+        let null_component = proj.dot(&reduced);
+        let null_norm: f64 = null_component.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            null_norm < 1e-9,
+            "reduced decoder must have no data-null component (rank-r oracle); \
+             got ‖Π·B‖ = {null_norm}",
         );
     }
 
-    /// Companion to the #1117 floor test: a FULL-rank data Gram (the
-    /// `base`/`step_2300` regime) must keep the caller-nominal ridge bit-for-bit,
-    /// so the well-conditioned fit is unchanged.
+    /// Companion to the #1117 reduction test: a FULL-rank data Gram (the
+    /// `base`/`step_2300` regime) must produce NO projector (`None`), so the
+    /// well-conditioned fit takes the historical full-`B` path bit-for-bit and the
+    /// decoder is never perturbed.
     #[test]
-    fn full_rank_data_gram_keeps_nominal_beta_ridge() {
-        // Distinct coordinates → the three periodic columns are linearly
+    fn full_rank_data_gram_yields_no_data_null_projector() {
+        // Three distinct coordinates → the three periodic columns are linearly
         // independent in the data → bare data Gram is full rank.
         let coords = array![[0.1], [0.45], [0.8]];
         let (phi, jet) = periodic_basis(&coords);
         let penalty = Array2::<f64>::eye(3);
+        let decoder = array![[0.05], [-0.05], [0.05]];
         let atom = SaeManifoldAtom::new(
             "periodic",
             SaeAtomBasisKind::Periodic,
             1,
             phi,
             jet,
-            array![[0.05], [-0.05], [0.05]],
+            decoder.clone(),
             penalty,
         )
         .unwrap();
@@ -2133,15 +2182,23 @@ mod tests {
             AssignmentMode::softmax(0.7),
         )
         .unwrap();
-        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
-        let nominal = 1.0e-6;
-        let floored = term.rank_deficient_beta_ridge_floor(&rho, nominal);
-        assert_eq!(
-            floored, nominal,
-            "a full-rank, well-conditioned decoder must keep the nominal ridge \
-             bit-for-bit (the base/step_2300 path is unchanged); got {floored}",
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let projectors = term.data_null_decoder_projectors();
+        assert!(
+            projectors[0].is_none(),
+            "a full-rank, well-conditioned decoder must yield NO data-null \
+             projector (the base/step_2300 path is unchanged)",
         );
+        // And the decoder is bit-for-bit untouched by the (no-op) projection.
+        term.project_decoder_onto_data_range(&projectors);
+        let after = &term.atoms[0].decoder_coefficients;
+        for i in 0..3 {
+            assert_eq!(
+                after[[i, 0]],
+                decoder[[i, 0]],
+                "full-rank decoder must be unchanged by the range projection",
+            );
+        }
     }
 
     /// Regression test for https://github.com/SauersML/gam/issues/163 and #175.

@@ -3228,6 +3228,18 @@ pub struct SaeManifoldTerm {
     /// degenerate inner design. Read by [`Self::to_residual_gauge_model`], which
     /// attaches each onto its [`crate::sae_identifiability::FittedAtom`].
     atom_inner_fits: Option<Vec<Option<crate::sae_identifiability::AtomInnerFit>>>,
+    /// #1117 deep fix: per-atom data-null **range reduction** projectors
+    /// `Π_k = N_k N_kᵀ` for any decoder atom whose bare data Gram `G_k` is
+    /// rank-deficient at the spectral cutoff, one entry per [`Self::atoms`].
+    /// `Some(Π_k)` ⇒ atom `k` has a dead column subspace that is deflated
+    /// (unit-stiffness `⊗ I_p`) in the β-tier penalty operator and projected out
+    /// of the converged decoder; `None` ⇒ the full-rank atom keeps the historical
+    /// full-`B` β-tier bit-for-bit. Refreshed once per inner fit by
+    /// [`Self::data_null_decoder_projectors`] (held FIXED across the inner Newton
+    /// iterations so the deflated operator the solve descends and the undamped
+    /// log-det rank the SAME quotient), and read by `assemble_arrow_schur`. Empty
+    /// (`vec![]`) outside an inner fit, which assembly reads as "no deflation".
+    decoder_data_null_projectors: Vec<Option<Array2<f64>>>,
 }
 
 
@@ -3249,6 +3261,7 @@ impl Clone for SaeManifoldTerm {
                 .expected_evidence_gauge_deflated_directions,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
+            decoder_data_null_projectors: self.decoder_data_null_projectors.clone(),
         }
     }
 }
