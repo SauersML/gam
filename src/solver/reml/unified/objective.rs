@@ -298,10 +298,19 @@ pub fn reml_laml_evaluate(
             if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
                 (-0.5_f64 * kernel.bilinear_pseudo_inverse(r, r), "projected")
             } else {
-                let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
-                rhs.column_mut(0).assign(r);
-                let w_mat = hop.solve_multi(&rhs);
-                let w: Array1<f64> = w_mat.column(0).to_owned();
+                // Full-H IFT mode response `w = H⁻¹ r`. The cached
+                // `DenseSpectralOperator` (materialized once for `log_det_h`
+                // at the top of this evaluator and shared via `RayonSafeOnce`)
+                // turns this into a single per-eigendirection `solve` — two
+                // GEMVs against the already-factored eigenbasis, NOT a refactor
+                // or row re-stream. Use the single-vector `solve` directly: it
+                // is the exact per-eigendirection form the gradient stack's
+                // unconstrained `respond_stack` arm uses column-by-column, so
+                // the cost-side and gradient-side IFT inverse stay bit-identical
+                // by construction (no separate `(p,1)` Array2 allocation +
+                // column copy, no second BLAS-3 entry point to drift from the
+                // gradient kernel's `solve_multi`).
+                let w = hop.solve(r);
                 let cost_correction = -0.5_f64 * r.view().dot(&w);
                 inner_polish_step = Some(w);
                 (cost_correction, "full_h")
