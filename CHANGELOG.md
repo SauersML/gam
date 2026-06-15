@@ -1,3 +1,24 @@
+## gamfit 0.1.214 (2026-06-15)
+
+Biobank BMS speed sweep — attacks every recurring cost in the outer REML/LAML
+loop, all exact (bit-faithful, no approximation, no skip flags):
+- **coord_corrections** (the ~1.5–4min/eval Jeffreys H_phi drift): β-fixed base
+  hoisted out of the per-direction loop + both p-axis row-stream sweeps
+  parallelized across cores.
+- **gradient_reload** (~5s/inner-cycle): the accepted trust-region line-search
+  workspace is now reused, collapsing each accepted cycle from two row passes to one.
+- **Murphy–Topel** SE correction and the **latent-z Rao-gate** score+meat: per-row
+  scalar scatters replaced with single BLAS-3 GEMMs.
+- **identifiability audit**: joint RRQR now runs from a single shared Gram (was a
+  second full n-row stream); trivial full-rank case skips the redundant pass.
+- **FFI encode**: column-major borrow (no StringRecord clone), parse-once, and a
+  content-fingerprint cache so the shared base cohort is encoded once across diseases.
+- **outer BFGS eval count**: the converged outer Hessian is transferred across LOSO
+  folds to seed quasi-Newton, cutting line-search probes.
+- **large-p outer LAML logdet**: one-pass dense assembly instead of p matvecs.
+- BLAS-3 rigid Hessian fires for operator-backed designs; warm-start cross-fit
+  length-mismatch declines to ρ-only instead of cold-starting.
+
 ## gamfit 0.1.213 (2026-06-15)
 
 Continues the biobank BMS perf attack on the outer REML/LAML derivative path —
