@@ -634,6 +634,7 @@ fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
         rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
         flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
+        full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let direction =
         Array1::from_iter((0..cached.slices.total).map(|idx| 0.02 * ((idx % 5) as f64 - 2.0)));
@@ -713,6 +714,7 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
         rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
         flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
+        full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let direction =
         Array1::from_iter((0..host_cache.slices.total).map(|idx| 0.015 * ((idx % 7) as f64 - 3.0)));
@@ -796,6 +798,7 @@ fn bernoulli_flex_hvp_cache_timing_large_scale_shape_pattern() {
         rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
         flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
+        full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let directions: Vec<_> = (0..4)
         .map(|rep| {

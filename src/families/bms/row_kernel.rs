@@ -739,6 +739,36 @@ fn blas3_gram_chunk_rows(n: usize) -> usize {
     by_target.clamp(MIN_CHUNK_ROWS, MAX_CHUNK_ROWS).max(1)
 }
 
+/// Whole-design GPU dispatch for the rigid `Xᵀ diag(w) X` joint Hessian.
+/// Routes the full-n contracted weights `(w_mm, w_mg, w_gg)` and the two
+/// dense design views through [`crate::gpu::linalg::try_fast_joint_hessian_2x2`],
+/// the same auto-dispatch entry the manifold / Arrow-Schur paths use. The
+/// auto-dispatch gates on `GpuRuntime::global()` and the dense-reduction flop
+/// floor, returning `None` whenever the workload is below gate or the backend
+/// fails — the caller then runs the deterministic CPU chunked-BLAS3 fallback.
+/// Returns `None` whenever either design is operator-backed / residualised
+/// (no `as_dense_ref`): the device path needs a contiguous host matrix to
+/// stage, and densifying an operator design here would defeat the memory
+/// contract the chunked `try_row_chunk` path exists to honour.
+#[inline]
+fn rigid_joint_hessian_on_gpu(
+    marginal_design: &crate::linalg::matrix::DesignMatrix,
+    logslope_design: &crate::linalg::matrix::DesignMatrix,
+    w_mm: &Array1<f64>,
+    w_mg: &Array1<f64>,
+    w_gg: &Array1<f64>,
+) -> Option<Array2<f64>> {
+    let x_full = marginal_design.as_dense_ref()?;
+    let g_full = logslope_design.as_dense_ref()?;
+    crate::gpu::linalg::try_fast_joint_hessian_2x2(
+        x_full.view(),
+        g_full.view(),
+        w_mm.view(),
+        w_mg.view(),
+        w_gg.view(),
+    )
+}
+
 impl BernoulliRigidRowKernel {
     /// Chunked BLAS-3 implementation backing
     /// [`RowKernel::hessian_dense_override`]. `row_hessians[row]` is the cached

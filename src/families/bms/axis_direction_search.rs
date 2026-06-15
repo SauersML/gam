@@ -1282,7 +1282,7 @@ impl BernoulliMarginalSlopeFamily {
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
         // materialization by keeping one accumulator per ψ axis in the
         // rayon fold.
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let make_acc = || -> Vec<(f64, Array1<f64>, BernoulliBlockHessianAccumulator)> {
             (0..k)
                 .map(|_| {
@@ -1503,7 +1503,7 @@ impl BernoulliMarginalSlopeFamily {
         self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
         // Block-local accumulator path for second-order psi terms
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let (objective_psi_psi, score_psi_psi, block_acc) = weighted_rows
             .par_iter()
             .try_fold(
@@ -1906,7 +1906,7 @@ impl BernoulliMarginalSlopeFamily {
         // operators), plus the contracted objective scalar and score vector per
         // output row. The data rows are streamed ONCE; every output row reads the
         // same per-row primary grad/Hess and the same cached third/fourth jets.
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let per_row = weighted_rows
             .par_iter()
             .try_fold(
@@ -2276,7 +2276,7 @@ impl BernoulliMarginalSlopeFamily {
         // the third-order (degree-15) lookups (gam#683).
         self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let block_acc = weighted_rows
             .par_iter()
             .try_fold(
@@ -2418,7 +2418,7 @@ impl BernoulliMarginalSlopeFamily {
         // the third-order (degree-15) lookups (gam#683).
         self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let block_acc = weighted_rows
             .par_iter()
             .try_fold(
@@ -2530,7 +2530,7 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
 
         // ── Rigid closed-form: 3rd-order scalar kernel ───────────────
         if !self.effective_flex_active(block_states)? {
@@ -2620,7 +2620,7 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
 
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
@@ -2710,7 +2710,7 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let make_accs = || {
             (0..d_beta_flats.len())
                 .map(|_| BernoulliBlockHessianAccumulator::new(slices))
@@ -3236,7 +3236,7 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
 
         // Eager-prime the per-row uncontracted fourth-derivative cache *before*
         // entering the per-row `par_iter` so the cache's nested-`par_iter`
@@ -3343,7 +3343,7 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let make_acc = || BernoulliBlockHessianAccumulator::new(slices);
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
 
         // Eager-prime the per-row uncontracted fourth-derivative cache *before*
         // entering the per-row `par_iter` to avoid the lazy-cache-under-rayon
@@ -3443,7 +3443,7 @@ impl BernoulliMarginalSlopeFamily {
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
-        let weighted_rows = outer_weighted_rows(options, n);
+        let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let mut unique_dirs = Vec::<Array1<f64>>::new();
         let mut pair_indices = Vec::<(usize, usize)>::with_capacity(d_beta_pairs.len());
         for (u, v) in d_beta_pairs {
