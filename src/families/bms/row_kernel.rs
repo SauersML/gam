@@ -121,6 +121,67 @@ impl BernoulliRigidRowKernel {
         }
     }
 
+    /// Content fingerprint of every input the per-row rigid third/fourth jet
+    /// reads: the family/data identity (stable `Arc::as_ptr` of the immutable
+    /// `y`/`z`/`weights` buffers), the probit-frailty scale, the latent-measure
+    /// discriminant, the score-warp / link-deviation presence flags, and every
+    /// block's β + η. `rigid_row_third_full`/`rigid_row_fourth_full` are pure
+    /// functions of exactly these (the per-row build reads `block_states[*].eta`,
+    /// `self.z[row]`/`y[row]`/`weights[row]`, the frailty scale, and the latent
+    /// grid pinned by the data-buffer address), so equal fingerprints ⇒
+    /// bit-identical tensors. The `domain` byte separates the third- and
+    /// fourth-tensor key streams. Mirrors
+    /// `BernoulliMarginalSlopeFamily::shared_exact_cache_fingerprint`.
+    fn rigid_tensor_fingerprint(&self, domain: u8) -> u64 {
+        let mut hash = Fnv1a::new();
+        hash.mix_byte(domain);
+        for &ptr in &[
+            Arc::as_ptr(&self.family.y) as usize,
+            Arc::as_ptr(&self.family.z) as usize,
+            Arc::as_ptr(&self.family.weights) as usize,
+        ] {
+            for b in (ptr as u64).to_le_bytes() {
+                hash.mix_byte(b);
+            }
+        }
+        hash.mix_byte(0xf1);
+        match self.family.gaussian_frailty_sd {
+            Some(sd) => {
+                hash.mix_byte(0x01);
+                hash.mix_f64(sd);
+            }
+            None => hash.mix_byte(0x00),
+        }
+        let latent_byte: u8 = match self.family.latent_measure {
+            LatentMeasureKind::StandardNormal => 0x10,
+            LatentMeasureKind::GlobalEmpirical { .. } => 0x11,
+            LatentMeasureKind::LocalEmpirical { .. } => 0x12,
+        };
+        hash.mix_byte(latent_byte);
+        hash.mix_byte(0xf2);
+        hash.mix_byte(u8::from(self.family.score_warp.is_some()));
+        hash.mix_byte(u8::from(self.family.link_dev.is_some()));
+        hash.mix_byte(0xf3);
+        for b in (self.block_states.len() as u64).to_le_bytes() {
+            hash.mix_byte(b);
+        }
+        for state in &self.block_states {
+            for b in (state.beta.len() as u64).to_le_bytes() {
+                hash.mix_byte(b);
+            }
+            for &v in state.beta.iter() {
+                hash.mix_f64(v);
+            }
+            for b in (state.eta.len() as u64).to_le_bytes() {
+                hash.mix_byte(b);
+            }
+            for &v in state.eta.iter() {
+                hash.mix_f64(v);
+            }
+        }
+        hash.finish_nonzero()
+    }
+
     /// Lazy-build the per-row uncontracted third-derivative tensor cache. The
     /// first caller pays one parallel row pass that materialises the full
     /// `[[[f64; 2]; 2]; 2]` tensor for every observation; subsequent callers
@@ -129,18 +190,30 @@ impl BernoulliRigidRowKernel {
     /// likelihood is non-finite at the converged β snapshot — propagate via
     /// panic, mirroring how every other kernel-level numerical contract in
     /// this module surfaces post-PIRLS invariant violations.
-    pub(super) fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
+    pub(super) fn third_full_cache(&self) -> &[[[f64; 2]; 2]; 2] as_marker {
+        unreachable!()
+    }
+
+    pub(super) fn third_full_cache_slice(&self) -> &[[[[f64; 2]; 2]; 2]] {
         self.third_full_cache
             .get_or_compute(|| {
+                let fp = self.rigid_tensor_fingerprint(0xa3);
+                if let Some(hit) = shared_rigid_tensor_store()
+                    .lock()
+                    .expect("BMS rigid tensor store mutex poisoned on third read")
+                    .get_third(fp)
+                {
+                    return hit;
+                }
                 let n = self.family.y.len();
                 // Named heartbeat scope: this per-row uncontracted third-tensor
                 // build is the rigid coord_corrections cost suspect (one n-row
-                // pass per workspace; rebuilt each outer eval since a fresh
-                // kernel is constructed per eval).
+                // pass per distinct β̂; reused across the Value/Gradient pair and
+                // line-search re-probes via the same-β store).
                 let _scope = crate::heartbeat::track_scope(format!(
                     "BMS rigid third_full_cache build n={n}"
                 ));
-                (0..n)
+                let built: RigidThirdFull = (0..n)
                     .into_par_iter()
                     .map(|row| {
                         let marginal_eta = self.block_states[0].eta[row];
@@ -152,7 +225,13 @@ impl BernoulliRigidRowKernel {
                     .expect(
                         "BernoulliRigidRowKernel third-full cache build failed; \
                          per-row jet should not error at the converged β snapshot",
-                    )
+                    );
+                let shared = Arc::new(built);
+                shared_rigid_tensor_store()
+                    .lock()
+                    .expect("BMS rigid tensor store mutex poisoned on third write")
+                    .insert_third(fp, Arc::clone(&shared));
+                shared
             })
             .as_slice()
     }
