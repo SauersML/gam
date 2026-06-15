@@ -4,7 +4,7 @@ use super::*;
 ///
 /// The REML/LAML gradient requires ∂H/∂ρₖ. For Gaussian, this is just Aₖ = λₖSₖ.
 /// For non-Gaussian GLMs, the working curvature W(η) depends on β̂, so
-/// ∂H/∂ρₖ = Aₖ + Xᵀ diag(c ⊙ Xvₖ) X where vₖ = −dβ̂/dρₖ.
+/// ∂H/∂ρₖ = Aₖ − Xᵀ diag(c ⊙ Xvₖ) X where vₖ = −dβ̂/dρₖ.
 /// For block-coupled families (GAMLSS, survival), the correction is
 /// D_β H_L[−vₖ] using the joint likelihood Hessian.
 ///
