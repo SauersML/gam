@@ -271,19 +271,66 @@ impl BernoulliMarginalSlopeFamily {
         // designs are not necessarily resident on the device in this branch.
         if let Some(host_pin) = cache.row_primary_hessians.host_pin() {
             let r_pr = primary.total;
-            // Single scratch buffer reused across rows — no per-row Array1.
-            let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
             let mut v_rows = vec![0.0_f64; n * r_pr];
-            for row in 0..n {
+            // The per-row primary direction is a pure projection of `direction`
+            // through the two design rows (`dot_row_view`); each row writes its
+            // own disjoint `r_pr`-length slot in `v_rows`, so the fill is
+            // embarrassingly parallel. This runs once per HVP, and the HVP is
+            // called many times per Newton step (CG inner loop), so a serial
+            // `n`-row fill leaves every core idle while one thread walks the
+            // designs row-by-row (process-monitor `active_threads=0`).
+            //
+            // Deadlock-safety: `dot_row_view` on a kernel/coefficient-transform
+            // design lazily materialises its dense block via an internal
+            // `par_chunks_mut` build under a `OnceLock`. Touching a single row
+            // serially on the calling thread before the `par_chunks_mut` fan-out
+            // forces that build exactly once (matching the warm-up discipline in
+            // the directional-derivative passes), so the parallel chunks below
+            // read already-materialised rows in O(r_pr) with no nested lazy
+            // build / nested-rayon race. Fall back to a serial fill when already
+            // inside a rayon worker (an outer par_iter holds the pool) or when
+            // the pool is single-threaded.
+            if n > 0 {
+                let mut warm = Array1::<f64>::zeros(r_pr);
                 self.row_primary_direction_from_flat_into(
-                    row,
-                    slices,
-                    primary,
-                    direction,
-                    &mut row_dir_scratch,
+                    0, slices, primary, direction, &mut warm,
                 )?;
-                v_rows[row * r_pr..(row + 1) * r_pr]
-                    .copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
+                v_rows[0..r_pr].copy_from_slice(warm.as_slice().expect("contiguous"));
+            }
+            let fill_serial =
+                rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1;
+            if fill_serial {
+                let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
+                for row in 1..n {
+                    self.row_primary_direction_from_flat_into(
+                        row,
+                        slices,
+                        primary,
+                        direction,
+                        &mut row_dir_scratch,
+                    )?;
+                    v_rows[row * r_pr..(row + 1) * r_pr]
+                        .copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
+                }
+            } else {
+                use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+                use rayon::slice::ParallelSliceMut;
+                v_rows
+                    .par_chunks_mut(r_pr)
+                    .enumerate()
+                    .skip(1)
+                    .try_for_each(|(row, slot)| -> Result<(), String> {
+                        let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
+                        self.row_primary_direction_from_flat_into(
+                            row,
+                            slices,
+                            primary,
+                            direction,
+                            &mut row_dir_scratch,
+                        )?;
+                        slot.copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
+                        Ok(())
+                    })?;
             }
             let h_rows_arr = host_pin.hess();
             let h_rows_slice = h_rows_arr
@@ -2768,9 +2815,13 @@ impl BernoulliMarginalSlopeFamily {
                 for wr in weighted_rows.iter() {
                     let row = wr.index;
                     let w = wr.weight;
-                    let marginal_eta = block_states[0].eta[row];
-                    let marginal = self.marginal_link_map(marginal_eta)?;
-                    let g = block_states[1].eta[row];
+                    // The per-row uncontracted third tensor is
+                    // direction-independent; build it once per row (via the
+                    // serially-prewarmed cache, populated above) and fold each
+                    // direction in with the cheap `contract_third_full` bilinear
+                    // instead of recomputing the heavy empirical/closed-form jet
+                    // once per (row, direction) pair.
+                    let full = self.rigid_third_full_cached(block_states, cache, row)?;
                     for (idx, d_beta_flat) in d_beta_flats.iter().enumerate() {
                         let dq = self
                             .marginal_design
@@ -2778,7 +2829,7 @@ impl BernoulliMarginalSlopeFamily {
                         let dg = self
                             .logslope_design
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-                        let t = self.rigid_row_third_contracted(row, marginal, g, dq, dg)?;
+                        let t = contract_third_full(full, dq, dg);
                         accs[idx].add_pullback_rigid_2x2(self, row, &t, w);
                     }
                     bump_progress(&progress);
@@ -2791,9 +2842,13 @@ impl BernoulliMarginalSlopeFamily {
                     .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
                         let row = wr.index;
                         let w = wr.weight;
-                        let marginal_eta = block_states[0].eta[row];
-                        let marginal = self.marginal_link_map(marginal_eta)?;
-                        let g = block_states[1].eta[row];
+                        // Direction-independent per-row third tensor: read the
+                        // serially-prewarmed cache (built once before this
+                        // par_iter, so no nested lazy build / nested par_iter
+                        // races inside a Rayon worker) and contract each
+                        // direction cheaply, instead of rebuilding the heavy jet
+                        // `n_dirs` times per row.
+                        let full = self.rigid_third_full_cached(block_states, cache, row)?;
                         for (idx, d_beta_flat) in d_beta_flats.iter().enumerate() {
                             let dq = self
                                 .marginal_design
@@ -2801,7 +2856,7 @@ impl BernoulliMarginalSlopeFamily {
                             let dg = self
                                 .logslope_design
                                 .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-                            let t = self.rigid_row_third_contracted(row, marginal, g, dq, dg)?;
+                            let t = contract_third_full(full, dq, dg);
                             accs[idx].add_pullback_rigid_2x2(self, row, &t, w);
                         }
                         bump_progress(&progress);
