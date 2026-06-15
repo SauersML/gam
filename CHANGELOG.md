@@ -1,3 +1,15 @@
+## gamfit 0.1.204 (2026-06-15)
+
+Warm-start: cross-fit **β** transfer (Phase 2). A related later fit (notably an
+LOSO fold whose reduced coefficient width differs, e.g. 37 vs 35) now seeds its
+β from a structurally-matching parent fit's converged coefficients via
+function-space projection through the gauge (`θ_new = (TᵀT+εI)⁻¹Tᵀ β_raw`), not
+just ρ — the prior `[CACHE] beta-warm action=skip … length mismatch` becomes
+`action=projected`. Exactness-preserving (the inner Newton + outer REML still
+run to their KKT/REML certificate) and finite-guarded: any anomaly falls back to
+cold β for that block, never erroring a fit. Also folds in a DSL fix routing
+mgcv `bs='cr'/'cs'` through the 1-D B-spline dispatch.
+
 ## v0.3.117 — gam 0.3.117 / gamfit 0.1.203 (2026-06-15)
 
 crates.io catch-up release: publishes to the `gam` crate all the engine work
