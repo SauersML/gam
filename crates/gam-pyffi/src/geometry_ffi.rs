@@ -6532,22 +6532,21 @@ fn generative_replicates_impl(
         .predict_plugin_response(&predict_input)
         .map_err(|e| format!("generative_replicates: prediction failed: {e}"))?;
     let n_rows = prediction.mean.len();
-    // Extract the fitted dispersion parameter — the same mapping as
-    // `family_noise_parameter` in main.rs.
-    let gaussian_scale = match &family.response {
-        gam::types::ResponseFamily::Tweedie { .. } => {
-            fit.likelihood_scale.fixed_phi().or(Some(1.0))
-        }
-        gam::types::ResponseFamily::NegativeBinomial { theta, .. } => Some(*theta),
-        gam::types::ResponseFamily::Beta { phi } => {
-            fit.likelihood_scale.fixed_phi().or(Some(*phi))
-        }
-        gam::types::ResponseFamily::Gamma => fit
-            .likelihood_scale
-            .gamma_shape()
-            .or(Some(fit.standard_deviation)),
-        _ => Some(fit.standard_deviation),
-    };
+    // Extract the fitted dispersion through the SINGLE canonical picker that the
+    // CLI `gam generate` path also uses. This crate previously carried its own
+    // inline copy of the mapping, and its NB arm returned the *seed* theta
+    // (`Some(*theta)`) instead of `likelihood_scale.negbin_theta()` — so
+    // `Model.sample_replicates` drew Negative-Binomial counts at theta = 1
+    // regardless of the fitted overdispersion (the live remnant of #1124 in the
+    // Python path). Routing through `gam::generative::family_noise_parameter`
+    // keeps the supported families and the interpretation of every dispersion
+    // parameter identical across the CLI and Python front-ends — the whole point
+    // of unifying the picker — so this class of bug cannot diverge again.
+    let gaussian_scale = gam::generative::family_noise_parameter(
+        fit.likelihood_scale,
+        fit.standard_deviation,
+        &family,
+    );
     // Build the generative specification (mean + noise model).
     let spec = generativespec_from_predict(prediction, family, gaussian_scale)
     .map_err(|e| format!("generative_replicates: spec error: {e}"))?;
