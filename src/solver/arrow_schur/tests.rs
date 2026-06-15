@@ -2685,6 +2685,63 @@ pub(crate) fn parallel_cross_row_matvec_deterministic_and_matches_sequential() {
     }
 }
 
+/// The cross-row preconditioner solve `ArrowBlockDiagInverse::apply` (run once
+/// per cross-row CG iteration) parallelizes both its n-row passes (#1017). It
+/// must be (a) DETERMINISTIC run-to-run and (b) the exact inverse of the
+/// block-diagonal arrow operator `K0 + ridge`. With no cross-row penalties
+/// `P_cross = 0`, so `arrow_cross_row_matvec` IS `K0 + ridge`; the round trip
+/// `(K0+ridge)·apply(r)` must recover `r`.
+#[test]
+pub(crate) fn parallel_block_diag_inverse_apply_deterministic_and_solves() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
+    let d = 4usize;
+    let k = 72usize;
+    let sys = dense_arrow_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_t = 1e-4;
+    let ridge_beta = 1e-5;
+    let precond = ArrowBlockDiagInverse::build(&sys, ridge_t, ridge_beta, false, &backend)
+        .expect("block-diagonal inverse must build");
+    let total_dt = sys.row_offsets[n];
+    let r_t = Array1::from_iter((0..total_dt).map(|i| 0.15 * (i as f64).sin() + 0.02));
+    let r_beta = Array1::from_iter((0..k).map(|a| 0.25 * (a as f64).cos() - 0.05));
+
+    // (a) Determinism run-to-run on the parallel path.
+    let (xt_a, xb_a) = precond.apply(r_t.view(), r_beta.view());
+    let (xt_b, xb_b) = precond.apply(r_t.view(), r_beta.view());
+    for i in 0..total_dt {
+        assert_eq!(
+            xt_a[i].to_bits(),
+            xt_b[i].to_bits(),
+            "preconditioner x_t must be deterministic at {i}"
+        );
+    }
+    for a in 0..k {
+        assert_eq!(
+            xb_a[a].to_bits(),
+            xb_b[a].to_bits(),
+            "preconditioner x_beta must be deterministic at {a}"
+        );
+    }
+
+    // (b) Exact inverse: the round trip recovers the RHS.
+    let (yt, yb) =
+        arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, xt_a.view(), xb_a.view());
+    let scale_t = r_t.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    for i in 0..total_dt {
+        let rel = (yt[i] - r_t[i]).abs() / scale_t;
+        assert!(rel < 1e-9, "preconditioner round-trip y_t at {i}: rel {rel:e}");
+    }
+    let scale_b = r_beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    for a in 0..k {
+        let rel = (yb[a] - r_beta[a]).abs() / scale_b;
+        assert!(
+            rel < 1e-9,
+            "preconditioner round-trip y_beta at {a}: rel {rel:e}"
+        );
+    }
+}
+
 /// The dense `H_ββ` penalty-prologue GEMV parallelized over output rows at
 /// the wide SAE border (`k ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN`, #1017) must be
 /// **bit-identical** to the serial prologue — unlike the per-row reduction,

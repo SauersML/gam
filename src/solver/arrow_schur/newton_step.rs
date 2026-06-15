@@ -1553,48 +1553,129 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         &self,
         r_t: ArrayView1<'_, f64>,
         r_beta: ArrayView1<'_, f64>,
-    ) -> (Array1<f64>, Array1<f64>) {
+    ) -> (Array1<f64>, Array1<f64>)
+    where
+        B: Sync,
+    {
         let sys = self.sys;
         let n = sys.rows.len();
         let k = sys.k;
+        // This preconditioner solve runs once per cross-row CG iteration; at the
+        // SAE LLM shape (#1017) both its n-row passes are the apply's whole cost.
+        // Fan them out under the same floor + nesting guard `schur_matvec` uses
+        // (sequential below `SCHUR_MATVEC_PARALLEL_ROW_MIN` and inside a rayon
+        // worker, so the topology race's outer fan-out is not oversubscribed),
+        // with chunk-ordered reductions so the f64 sums are bit-identical
+        // run-to-run (the #1017 determinism gate).
+        let parallel =
+            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         // Reduced β RHS: r_β − Σ_i H_βt^(i) (H_tt^(i))⁻¹ r_t,i.
         let mut rhs_beta = r_beta.to_owned();
-        for i in 0..n {
-            let di = sys.row_dims[i];
-            let base = sys.row_offsets[i];
-            let r_ti = r_t.slice(ndarray::s![base..base + di]).to_owned();
-            let u_i = self
-                .backend
-                .solve_block_vector(self.htt_factors.factor(i), r_ti.view());
-            let mut acc = Array1::<f64>::zeros(k);
-            sys_htbeta_accumulate_transpose(sys, i, &sys.rows[i], u_i.view(), &mut acc);
-            for a in 0..k {
-                rhs_beta[a] -= acc[a];
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            // Each chunk folds its rows into a length-k partial; subtract the
+            // partials in chunk order (deterministic reassociation).
+            let partials: Vec<Array1<f64>> = (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let mut acc = Array1::<f64>::zeros(k);
+                    for i in idxs {
+                        let di = sys.row_dims[i];
+                        let base = sys.row_offsets[i];
+                        let r_ti = r_t.slice(ndarray::s![base..base + di]).to_owned();
+                        let u_i = self
+                            .backend
+                            .solve_block_vector(self.htt_factors.factor(i), r_ti.view());
+                        sys_htbeta_accumulate_transpose(sys, i, &sys.rows[i], u_i.view(), &mut acc);
+                    }
+                    acc
+                })
+                .collect();
+            for acc in &partials {
+                for a in 0..k {
+                    rhs_beta[a] -= acc[a];
+                }
+            }
+        } else {
+            for i in 0..n {
+                let di = sys.row_dims[i];
+                let base = sys.row_offsets[i];
+                let r_ti = r_t.slice(ndarray::s![base..base + di]).to_owned();
+                let u_i = self
+                    .backend
+                    .solve_block_vector(self.htt_factors.factor(i), r_ti.view());
+                let mut acc = Array1::<f64>::zeros(k);
+                sys_htbeta_accumulate_transpose(sys, i, &sys.rows[i], u_i.view(), &mut acc);
+                for a in 0..k {
+                    rhs_beta[a] -= acc[a];
+                }
             }
         }
         // x_β = S⁻¹ rhs_β.
         let x_beta = cholesky_solve_lower(&self.schur_factor, &rhs_beta);
-        // x_t,i = (H_tt^(i))⁻¹ (r_t,i − H_tβ^(i) x_β).
+        // x_t,i = (H_tt^(i))⁻¹ (r_t,i − H_tβ^(i) x_β). Disjoint per-row writes →
+        // no reduction; scatter each chunk's contiguous segment by offset.
         let total_dt = sys.row_offsets[n];
         let mut x_t = Array1::<f64>::zeros(total_dt);
-        let mut htbeta_xb = Array1::<f64>::zeros(sys.d);
-        for i in 0..n {
-            let di = sys.row_dims[i];
-            let base = sys.row_offsets[i];
-            for c in 0..di {
-                htbeta_xb[c] = 0.0;
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            let chunks: Vec<(usize, Vec<f64>)> = (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let first = idxs[0];
+                    let last = idxs[idxs.len() - 1];
+                    let seg_start = sys.row_offsets[first];
+                    let seg_end = sys.row_offsets[last] + sys.row_dims[last];
+                    let mut seg = vec![0.0_f64; seg_end - seg_start];
+                    for i in idxs {
+                        let di = sys.row_dims[i];
+                        let base = sys.row_offsets[i];
+                        let mut slab = Array1::<f64>::zeros(di);
+                        sys_htbeta_apply_row(sys, i, &sys.rows[i], x_beta.view(), &mut slab);
+                        let mut rhs_i = Array1::<f64>::zeros(di);
+                        for c in 0..di {
+                            rhs_i[c] = r_t[base + c] - slab[c];
+                        }
+                        let xi = self
+                            .backend
+                            .solve_block_vector(self.htt_factors.factor(i), rhs_i.view());
+                        let local = base - seg_start;
+                        for c in 0..di {
+                            seg[local + c] = xi[c];
+                        }
+                    }
+                    (seg_start, seg)
+                })
+                .collect();
+            for (seg_start, seg) in &chunks {
+                for (o, v) in seg.iter().enumerate() {
+                    x_t[seg_start + o] = *v;
+                }
             }
-            let mut slab = htbeta_xb.slice_mut(ndarray::s![..di]).to_owned();
-            sys_htbeta_apply_row(sys, i, &sys.rows[i], x_beta.view(), &mut slab);
-            let mut rhs_i = Array1::<f64>::zeros(di);
-            for c in 0..di {
-                rhs_i[c] = r_t[base + c] - slab[c];
-            }
-            let xi = self
-                .backend
-                .solve_block_vector(self.htt_factors.factor(i), rhs_i.view());
-            for c in 0..di {
-                x_t[base + c] = xi[c];
+        } else {
+            let mut htbeta_xb = Array1::<f64>::zeros(sys.d);
+            for i in 0..n {
+                let di = sys.row_dims[i];
+                let base = sys.row_offsets[i];
+                for c in 0..di {
+                    htbeta_xb[c] = 0.0;
+                }
+                let mut slab = htbeta_xb.slice_mut(ndarray::s![..di]).to_owned();
+                sys_htbeta_apply_row(sys, i, &sys.rows[i], x_beta.view(), &mut slab);
+                let mut rhs_i = Array1::<f64>::zeros(di);
+                for c in 0..di {
+                    rhs_i[c] = r_t[base + c] - slab[c];
+                }
+                let xi = self
+                    .backend
+                    .solve_block_vector(self.htt_factors.factor(i), rhs_i.view());
+                for c in 0..di {
+                    x_t[base + c] = xi[c];
+                }
             }
         }
         (x_t, x_beta)
