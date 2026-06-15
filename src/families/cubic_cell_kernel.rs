@@ -3521,6 +3521,32 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
 /// fine-rule error.
 const NON_AFFINE_LADDER_RTOL: f64 = 3e-15;
 
+/// Roundoff-floor multiplier for the ladder convergence test (see
+/// [`non_affine_ladder_converged`]).
+///
+/// Each moment slot is a sum over the rule's nodes,
+/// `M_k = Σ_i w_i · h · exp(-q(z_i)) · z_i^k`, accumulated in f64. The
+/// floating-point error of a length-`n` summation is bounded by
+/// `n · ε · Σ_i |term_i|`, and `Σ_i |term_i|` is `≈ scale` (the max moment
+/// magnitude) for these smooth, sign-stable integrands. Because the coarse
+/// and fine rungs evaluate on *disjoint* node sets, their roundoff errors are
+/// independent and add rather than cancel, so the smallest achievable
+/// difference between two converged rungs is
+/// `≈ (n_coarse + n_fine) · ε · scale`, which the `n_fine`-scaled term below
+/// bounds from above (`n_coarse < n_fine`, so `n_coarse + n_fine < 2·n_fine`).
+/// The factor 2 supplies that headroom plus a small allowance for the partial
+/// cancellation in the `exp(-q)` evaluation itself.
+///
+/// At rung 192 this floor is `2 · 192 · ε · scale ≈ 4.3e-14 · scale` — about
+/// 14× the bare relative tolerance `3e-15`, which is *below* the roundoff
+/// floor and therefore unsatisfiable once Gauss-Legendre's geometric
+/// truncation error has dropped beneath the noise. Admitting this absolute
+/// floor does not loosen accuracy: at the floor the coarse and fine results
+/// are equal to within f64 roundoff, so the finer 384-node rule cannot be
+/// more accurate than the certified rung — it only re-pays the same roundoff
+/// at twice the node cost.
+const NON_AFFINE_LADDER_ROUNDOFF_NODES: f64 = 2.0;
+
 /// Node counts of the progressive ladder below the 384-node terminal rung.
 /// All divisible by 4 so the SIMD sweep needs no scalar tail.
 const NON_AFFINE_LADDER_RUNGS: [usize; 5] = [12, 24, 48, 96, 192];
@@ -3579,10 +3605,22 @@ fn gauss_legendre_rule(n: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 /// Two-rule agreement certificate for the progressive ladder. `true` when
-/// every MOMENT slot agrees to `NON_AFFINE_LADDER_RTOL` relative to the fine
-/// result's max magnitude. Non-finite results never certify, so they fall
-/// through to the terminal 384-node rung and reproduce the fixed rule's
+/// every MOMENT slot agrees to within the larger of the relative tolerance
+/// `NON_AFFINE_LADDER_RTOL · scale` and the f64 roundoff floor
+/// `NON_AFFINE_LADDER_ROUNDOFF_NODES · n_fine · ε · scale` (`scale` = the fine
+/// result's max moment magnitude). Non-finite results never certify, so they
+/// fall through to the terminal 384-node rung and reproduce the fixed rule's
 /// behavior exactly.
+///
+/// The absolute roundoff floor is mandatory, not a loosening: a length-`n`
+/// f64 summation carries `≈ n · ε · scale` of accumulated rounding noise, and
+/// the coarse/fine rungs sum over disjoint node sets so their independent
+/// noise adds. Once Gauss-Legendre's geometric truncation error falls beneath
+/// that floor the two rungs can only differ by roundoff, which the bare `3e-15`
+/// relative test (≈14× below the floor at rung 192) can never satisfy — so
+/// without this floor essentially every non-affine cell pays the terminal
+/// 384-node rule for zero accuracy over the already-converged rung 192. See
+/// [`NON_AFFINE_LADDER_ROUNDOFF_NODES`] for the derivation.
 ///
 /// The decision is deliberately moment-only and independent of whether the
 /// caller also computed the cell value: the value- and derivative-only
@@ -3592,7 +3630,11 @@ fn gauss_legendre_rule(n: usize) -> (Vec<f64>, Vec<f64>) {
 /// The value integral converges at the same geometric Gauss-Legendre rate as
 /// the moments on the shared analytic integrand `exp(-q(z))`, so the
 /// moment-certified rung resolves the value to the same tolerance.
-fn non_affine_ladder_converged(coarse: &CellMomentVec, fine: &CellMomentVec) -> bool {
+fn non_affine_ladder_converged(
+    coarse: &CellMomentVec,
+    fine: &CellMomentVec,
+    fine_nodes: usize,
+) -> bool {
     let mut scale = 0.0_f64;
     let mut err = 0.0_f64;
     for (&c, &f) in coarse.iter().zip(fine.iter()) {
@@ -3602,7 +3644,10 @@ fn non_affine_ladder_converged(coarse: &CellMomentVec, fine: &CellMomentVec) -> 
     if !(scale.is_finite() && err.is_finite()) {
         return false;
     }
-    err <= NON_AFFINE_LADDER_RTOL * scale
+    let roundoff_floor =
+        NON_AFFINE_LADDER_ROUNDOFF_NODES * fine_nodes as f64 * f64::EPSILON * scale;
+    let tol = (NON_AFFINE_LADDER_RTOL * scale).max(roundoff_floor);
+    err <= tol
 }
 
 /// Per-rung certification histogram for the non-affine ladder, indexed by the
@@ -3648,7 +3693,7 @@ fn evaluate_non_affine_cell_simd<const COMPUTE_VALUE: bool>(
         let cur =
             evaluate_non_affine_cell_with_rule::<COMPUTE_VALUE>(cell, max_degree, nodes, weights);
         if let Some(prev) = prev.as_ref()
-            && non_affine_ladder_converged(&prev.0, &cur.0)
+            && non_affine_ladder_converged(&prev.0, &cur.0, nodes.len())
         {
             NON_AFFINE_LADDER_CERT_COUNTS[i].fetch_add(1, Ordering::Relaxed);
             return cur;
