@@ -10,6 +10,69 @@ use super::row_kernel::*;
 
 use super::*;
 
+use crate::util::fnv::Fnv1a;
+
+/// Bounded same-β reuse store for the BMS per-row cell-moment exact-cache.
+///
+/// The exact-cache (`BernoulliMarginalSlopeExactEvalCache`) — per-row solved
+/// intercept contexts plus the batched per-row cell-moment partition/moments
+/// — is a *pure* function of the family/data identity, the current coefficient
+/// state (`block_states` betas + etas), and the outer-score subsample mask.
+/// The outer BFGS issues a `Value` eval immediately followed by a
+/// `ValueAndGradient` eval at the SAME ρ (hence the same converged β̂), and the
+/// line search re-probes ρ values that map back to an already-evaluated β̂; each
+/// such revisit reconstructs a fresh Hessian workspace which rebuilds this
+/// exact-cache from scratch (`build_exact_eval_cache_with_options` →
+/// `Arc::new`). Together with the joint-Hessian build this O(n·cells) rebuild is
+/// the bulk of biobank-fit wall-clock.
+///
+/// This mirrors `custom_family::outer_objective::AssembledOperatorCache` one
+/// layer down: a module-level `OnceLock<Mutex<..>>`, FIFO capacity 2, keyed by a
+/// content fingerprint over EXACTLY the build inputs. Reuse is gated on exact
+/// byte-equality of that fingerprint, so a hit returns an `Arc` to a cache that
+/// is bit-identical to a fresh rebuild — identical row contexts, cell moments,
+/// gradient, Hessian, and LAML cost. A miss builds, stores (evicting the older
+/// of the two retained entries), and returns. Memory is bounded to the last two
+/// distinct β̂ exact-caches (each O(n·cells); at biobank scale ≈ a few hundred
+/// MB, well within the box's headroom, and the FIFO-2 cap is the same bound the
+/// assembled-operator cache uses one layer up).
+struct SharedExactCacheStore {
+    /// `(fingerprint, exact-cache)` for at most the last two distinct β̂ builds.
+    entries: Vec<(u64, Arc<BernoulliMarginalSlopeExactEvalCache>)>,
+}
+
+impl SharedExactCacheStore {
+    const CAPACITY: usize = 2;
+
+    fn get(&self, fingerprint: u64) -> Option<Arc<BernoulliMarginalSlopeExactEvalCache>> {
+        self.entries
+            .iter()
+            .find(|(key, _)| *key == fingerprint)
+            .map(|(_, cache)| Arc::clone(cache))
+    }
+
+    fn insert(&mut self, fingerprint: u64, cache: Arc<BernoulliMarginalSlopeExactEvalCache>) {
+        if self.entries.iter().any(|(key, _)| *key == fingerprint) {
+            return;
+        }
+        if self.entries.len() >= Self::CAPACITY {
+            // Evict the oldest entry (front); the newest builds stay resident so
+            // the immediate Value→ValueAndGradient pair at one β̂ always hits.
+            self.entries.remove(0);
+        }
+        self.entries.push((fingerprint, cache));
+    }
+}
+
+fn shared_exact_cache_store() -> &'static Mutex<SharedExactCacheStore> {
+    static STORE: OnceLock<Mutex<SharedExactCacheStore>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        Mutex::new(SharedExactCacheStore {
+            entries: Vec::with_capacity(SharedExactCacheStore::CAPACITY),
+        })
+    })
+}
+
 /// Fill one deviation-basis column of the *score-warp* coefficient jet.
 ///
 /// Shared body of the many `for_each_deviation_basis_cubic_at` visitor
@@ -980,6 +1043,162 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<[[f64; 2]; 2], String> {
         let full = self.rigid_row_third_full(row, marginal, slope)?;
         Ok(contract_third_full(&full, dir_q, dir_g))
+    }
+
+    /// Content fingerprint of every input that determines the per-row
+    /// cell-moment exact-cache, for same-β reuse via [`shared_exact_cache_store`].
+    ///
+    /// The exact-cache is `cache(family/data, β-state, subsample-mask,
+    /// want_primary_hessians)`. Reuse is gated on exact equality of this
+    /// fingerprint, so a hit means a bit-identical cache. The canonicalization
+    /// reuses the shared [`Fnv1a`] hasher (`mix_f64` maps `-0.0 → +0.0` so
+    /// numerically equal coefficients hash equal; `mix_opt_beta` is unused here
+    /// because we hash every block's β and η directly).
+    ///
+    /// Family/data identity is folded as the stable `Arc::as_ptr` addresses of
+    /// the immutable `y`/`z`/`weights` buffers (a fresh fit allocates fresh
+    /// `Arc`s, so two fits never share all three; repeated evals on one family
+    /// share them), plus the probit-frailty SD and a latent-measure variant
+    /// byte. The β-state is pinned by hashing, for every block, the full β
+    /// coefficient vector AND the linear-predictor η (the moments consume η, and
+    /// the flex deviation bases consume the score-warp / link-deviation β slices;
+    /// hashing all blocks' β and η covers both without per-block special-casing).
+    /// The outer-score subsample is folded by the `Arc::as_ptr` of its row mask
+    /// plus its scalar identity fields, so a distinct subsample misses rather
+    /// than aliasing. `want_primary_hessians` is in the key because the build
+    /// optionally materializes `row_primary_hessians`, which a consumer expecting
+    /// it must observe.
+    fn shared_exact_cache_fingerprint(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+        want_primary_hessians: bool,
+    ) -> u64 {
+        let mut hash = Fnv1a::new();
+        // Domain separator for the exact-cache fingerprint stream.
+        hash.mix_byte(0xe0);
+        // Family/data identity: stable Arc allocation addresses of the immutable
+        // data buffers (cheap O(1); distinct fits never share all three).
+        for &ptr in &[
+            Arc::as_ptr(&self.y) as usize,
+            Arc::as_ptr(&self.z) as usize,
+            Arc::as_ptr(&self.weights) as usize,
+        ] {
+            for b in (ptr as u64).to_le_bytes() {
+                hash.mix_byte(b);
+            }
+        }
+        // Probit-frailty scale source.
+        hash.mix_byte(0xe1);
+        match self.gaussian_frailty_sd {
+            Some(sd) => {
+                hash.mix_byte(0x01);
+                hash.mix_f64(sd);
+            }
+            None => hash.mix_byte(0x00),
+        }
+        // Latent-measure variant discriminant (the measure data itself is
+        // immutable and already pinned by the data-buffer addresses above).
+        let latent_byte: u8 = match self.latent_measure {
+            LatentMeasureKind::StandardNormal => 0x10,
+            LatentMeasureKind::GlobalEmpirical { .. } => 0x11,
+            LatentMeasureKind::LocalEmpirical { .. } => 0x12,
+        };
+        hash.mix_byte(latent_byte);
+        // Deviation-runtime presence flags (their knots/anchors are immutable
+        // and tied to this family instance, so the addresses above suffice;
+        // the presence bits guard against an unexpected shape mismatch).
+        hash.mix_byte(0xe2);
+        hash.mix_byte(u8::from(self.score_warp.is_some()));
+        hash.mix_byte(u8::from(self.link_dev.is_some()));
+        // β-state: every block's β coefficients and linear predictor η.
+        hash.mix_byte(0xe3);
+        for b in (block_states.len() as u64).to_le_bytes() {
+            hash.mix_byte(b);
+        }
+        for state in block_states {
+            for b in (state.beta.len() as u64).to_le_bytes() {
+                hash.mix_byte(b);
+            }
+            for &v in state.beta.iter() {
+                hash.mix_f64(v);
+            }
+            for b in (state.eta.len() as u64).to_le_bytes() {
+                hash.mix_byte(b);
+            }
+            for &v in state.eta.iter() {
+                hash.mix_f64(v);
+            }
+        }
+        // Outer-score subsample identity (the cache build restricts to its mask
+        // rows). A distinct subsample → distinct mask address → miss.
+        hash.mix_byte(0xe4);
+        match options.outer_score_subsample.as_ref() {
+            None => hash.mix_byte(0x00),
+            Some(subsample) => {
+                hash.mix_byte(0x01);
+                let mask_ptr = Arc::as_ptr(&subsample.mask) as usize as u64;
+                for b in mask_ptr.to_le_bytes() {
+                    hash.mix_byte(b);
+                }
+                for b in (subsample.mask.len() as u64).to_le_bytes() {
+                    hash.mix_byte(b);
+                }
+                for b in (subsample.n_full as u64).to_le_bytes() {
+                    hash.mix_byte(b);
+                }
+                for b in subsample.seed.to_le_bytes() {
+                    hash.mix_byte(b);
+                }
+                hash.mix_f64(subsample.weight_scale);
+            }
+        }
+        // Whether the build materializes `row_primary_hessians`.
+        hash.mix_byte(0xe5);
+        hash.mix_byte(u8::from(want_primary_hessians));
+        hash.finish_nonzero()
+    }
+
+    /// Build the per-row cell-moment exact-cache for the current β-state, or
+    /// reuse a bit-identical one already built at the same β (same ρ → same
+    /// converged β̂ across the BFGS `Value`/`ValueAndGradient` pair, or a
+    /// line-search ρ that maps back to a seen β̂).
+    ///
+    /// On a fingerprint hit the stored `Arc<...>` is returned directly; on a
+    /// miss the full cache is built (optionally materializing
+    /// `row_primary_hessians`), stored in the FIFO-2 [`shared_exact_cache_store`],
+    /// and returned. Because reuse is gated on exact byte-equality of every
+    /// build input (see [`Self::shared_exact_cache_fingerprint`]), a hit is
+    /// bit-identical to a fresh build, so the downstream gradient, Hessian, and
+    /// LAML cost are unchanged. Lazily-built interior fields (`row_cell_moments_d15/d21`,
+    /// `rigid_*_full`, `flex_axis_*`) are `RayonSafeOnce`/atomic, so sharing one
+    /// `Arc` across the paired evals is safe and yields the same values.
+    pub(super) fn build_or_reuse_shared_exact_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+        want_primary_hessians: bool,
+    ) -> Result<Arc<BernoulliMarginalSlopeExactEvalCache>, String> {
+        let fingerprint =
+            self.shared_exact_cache_fingerprint(block_states, options, want_primary_hessians);
+        if let Some(cache) = shared_exact_cache_store()
+            .lock()
+            .map_err(|e| format!("BMS exact-cache store mutex poisoned on read: {e}"))?
+            .get(fingerprint)
+        {
+            return Ok(cache);
+        }
+        let mut cache = self.build_exact_eval_cache_with_options(block_states, Some(options))?;
+        if want_primary_hessians {
+            cache.row_primary_hessians =
+                self.build_row_primary_hessian_cache(block_states, &cache)?;
+        }
+        let cache = Arc::new(cache);
+        shared_exact_cache_store()
+            .lock()
+            .map_err(|e| format!("BMS exact-cache store mutex poisoned on write: {e}"))?
+            .insert(fingerprint, Arc::clone(&cache));
+        Ok(cache)
     }
 
     /// Look up the per-row rigid uncontracted third-derivative tensor from

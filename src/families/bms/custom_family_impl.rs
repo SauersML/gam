@@ -1048,14 +1048,16 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
                     .map_or(family.y.len(), |subsample| subsample.len())
             );
         }
-        let mut cache =
-            family.build_exact_eval_cache_with_options(&block_states, Some(&options))?;
-        // Materialize per-row primary Hessians at construction time. The
-        // matrix-free CG / inner-Newton loops contract these against many
-        // trial directions at the same β, so caching the `r×r` blocks once
-        // amortizes the cell-moment + flex-jet rebuild over every Hv product.
-        cache.row_primary_hessians =
-            family.build_row_primary_hessian_cache(&block_states, &cache)?;
+        // Build (or reuse, at a bit-identical β) the exact-cache with per-row
+        // primary Hessians materialized at construction time. The matrix-free
+        // CG / inner-Newton loops contract these against many trial directions
+        // at the same β, so caching the `r×r` blocks once amortizes the
+        // cell-moment + flex-jet rebuild over every Hv product. The same-β
+        // reuse store additionally elides the whole O(n·cells) build when the
+        // outer loop revisits an already-evaluated β̂ (Value→ValueAndGradient at
+        // one ρ, or a line-search ρ that maps back to a seen β̂).
+        let cache =
+            family.build_or_reuse_shared_exact_cache(&block_states, &options, true)?;
         if log_exact_work(family.y.len()) {
             log::info!(
                 "[BMS Hessian-workspace] build done n={} p={} primary_hessian_cache={} elapsed={:.3}s",
@@ -1065,7 +1067,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
                 started.elapsed().as_secs_f64()
             );
         }
-        let workspace = Self::from_arc_cache(family, block_states, Arc::new(cache), options);
+        let workspace = Self::from_arc_cache(family, block_states, cache, options);
         drop(process_monitor_guard);
         workspace
     }
@@ -2410,16 +2412,22 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
-        let cache = family.build_exact_eval_cache_with_options(&block_states, Some(&options))?;
+        // Build (or reuse, at a bit-identical β) the exact-cache. This workspace
+        // does not materialize per-row primary Hessians, so it keys a separate
+        // store slot from the Hessian-workspace build.
+        let cache = family.build_or_reuse_shared_exact_cache(&block_states, &options, false)?;
         // Prime the per-row uncontracted third-derivative tensor at workspace
         // construction (rigid path only). The build runs at top-level rayon
         // here, so the parallel row pass uses all cores. If we instead let
         // it run lazily inside `build_psi_hyper_coords` axis calls, those
         // calls are themselves at top level — so leaving lazy would also be
         // parallel — but priming here lifts the first-axis cost out of the
-        // workspace's `first_order_terms` measurement.
+        // workspace's `first_order_terms` measurement. The warm-up writes the
+        // `RayonSafeOnce` interior fields of the (possibly shared) cache; that
+        // is idempotent and yields the same values across a shared `Arc`.
         if !family.effective_flex_active(&block_states)? {
-            let warmed_third = family.rigid_third_full_cached(&block_states, &cache, 0)?;
+            let warmed_third =
+                family.rigid_third_full_cached(&block_states, cache.as_ref(), 0)?;
             ensure_finite_third_full_cache_row(
                 warmed_third,
                 "BernoulliMarginalSlopeExactNewtonJointPsiWorkspace third-cache warm-up",
@@ -2428,7 +2436,8 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
             // (ψ-axis-i, ψ-axis-j) pair — prime here too so the 528-pair
             // sweep reads a populated cache instead of triggering the
             // 8-direction empirical jet on its first per-pair call.
-            let warmed_fourth = family.rigid_fourth_full_cached(&block_states, &cache, 0)?;
+            let warmed_fourth =
+                family.rigid_fourth_full_cached(&block_states, cache.as_ref(), 0)?;
             ensure_finite_fourth_full_cache_row(
                 warmed_fourth,
                 "BernoulliMarginalSlopeExactNewtonJointPsiWorkspace fourth-cache warm-up",
@@ -2439,7 +2448,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
             block_states,
             specs,
             derivative_blocks,
-            cache: std::sync::Arc::new(cache),
+            cache,
             options,
         })
     }
