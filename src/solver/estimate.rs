@@ -3394,6 +3394,13 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             log::debug!(
                 "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
             );
+        } else {
+            // In the VALUE window but outside the certified GRADIENT sub-window
+            // (or the deriv shape refused). The value cache above is sound and
+            // stays; clear any derivative pair left from a prior in-sub-window ψ
+            // so the gradient lane uses the exact slab for this trial rather than
+            // a stale derivative carried over on the design-revision fast path.
+            self.reml_state.clear_gaussian_psi_gram_deriv();
         }
     }
 
@@ -3776,6 +3783,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             s_list,
             nullspace_dims,
             linear_constraints,
+            theta,
+            rho_dim,
             warm_start_beta,
             context,
             design_revision,

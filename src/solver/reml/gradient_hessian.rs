@@ -5327,6 +5327,33 @@ impl<'a> RemlState<'a> {
         true
     }
 
+    /// Clear the ψ-keyed Gaussian sufficient-statistics cache (`XᵀWX(ψ)`,
+    /// `XᵀW(y−offset)(ψ)`) and its conditioned-frame ψ-derivative pair (#1033).
+    ///
+    /// Both slots are keyed to a SPECIFIC trial ψ from the certified ψ-Gram
+    /// tensor. The slow path nulls them inside [`Self::reset_surface`], but the
+    /// design-revision fast path skips `reset_surface`, so a trial that lands
+    /// OFF the certified ψ-window (or otherwise cannot re-install) must clear
+    /// the previous in-window ψ's Gram explicitly — otherwise the inner
+    /// Gaussian PLS would read a STALE Gram keyed to the wrong ψ. With the slot
+    /// cleared the inner solver restreams the exact Gram for this trial's
+    /// design, as it does whenever no tensor is installed.
+    pub(crate) fn clear_gaussian_fixed_cache(&self) {
+        *self.gaussian_fixed_cache.write().unwrap() = None;
+        *self.gaussian_psi_gram_deriv.write().unwrap() = None;
+    }
+
+    /// Clear ONLY the conditioned-frame Gaussian ψ-derivative pair (#1033),
+    /// keeping the value-lane `gaussian_fixed_cache` intact. Used when a trial's
+    /// ψ lies inside the certified VALUE window (so the n-free Gram is sound)
+    /// but OUTSIDE the narrower certified GRADIENT sub-window: the value cache
+    /// stays, but a derivative pair keyed to a prior in-sub-window ψ must be
+    /// dropped so the gradient lane falls back to the exact ∂X/∂ψ slab for this
+    /// trial instead of reading a stale derivative on the fast path.
+    pub(crate) fn clear_gaussian_psi_gram_deriv(&self) {
+        *self.gaussian_psi_gram_deriv.write().unwrap() = None;
+    }
+
     /// Conditioned-frame exact ψ-derivative pair, when installed for the
     /// current in-window Gaussian trial (#1033b). `None` keeps the slab path.
     pub(crate) fn gaussian_psi_gram_deriv(
