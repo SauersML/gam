@@ -3307,6 +3307,25 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains(psi))
     }
 
+    /// True when the design-revision fast path of [`Self::prepare_eval_state`]
+    /// would fire for `design_revision` — i.e. a prior eval has already pinned
+    /// `last_canonical_revision` to this exact realizer revision, so the next
+    /// `evaluate_with_order` at this revision will SKIP `reset_surface` (and the
+    /// n×k `apply_to_design` reconditioning) and instead re-install the ψ-keyed
+    /// `GaussianFixedCache` onto the existing surface (#1033).
+    ///
+    /// The spatial κ caller (`SpatialJointContext::eval_full`) consults this
+    /// BEFORE deciding to skip its own `ensure_theta` design re-realization: it
+    /// may only suppress the per-trial O(n·k) design rebuild when the evaluator
+    /// will take that fast path, because the fast path is exactly the lane that
+    /// keeps the (now intentionally stale) reference surface while serving the
+    /// trial's value + gradient n-free from the certified tensor. When this is
+    /// `false` the caller MUST realize the design so the slow path's
+    /// `reset_surface` rebuilds a faithful surface.
+    pub(crate) fn design_revision_fast_path_armed(&self, design_revision: u64) -> bool {
+        self.last_canonical_revision == Some(design_revision)
+    }
+
     /// Return the most-recently converged inner β from the last PIRLS solve, if
     /// it is finite and the right dimension. Used by `SpatialJointContext` to
     /// warm-start successive outer evaluations instead of cold-starting PIRLS
@@ -3328,13 +3347,23 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// without installing — the streamed exact path runs unchanged.
     fn install_psi_gram_statistics(&mut self, theta: &Array1<f64>, rho_dim: usize) {
         let Some(tensor) = self.psi_gram_tensor.as_ref() else {
+            // No tensor installed for this fit → the surface never carries a
+            // ψ-keyed Gaussian Gram, so there is nothing stale to clear.
             return;
         };
+        // #1033: every early return below is a trial for which we CANNOT serve
+        // the n-free per-ψ Gram (off-window, wrong shape, multi-ψ). On the
+        // design-revision fast path `reset_surface` is skipped, so a Gram keyed
+        // to the PREVIOUS in-window ψ would survive and be read stale by the
+        // inner Gaussian PLS. Clear it on every miss so the inner solver
+        // restreams the exact Gram for this trial's design.
         if theta.len() != rho_dim + 1 {
+            self.reml_state.clear_gaussian_fixed_cache();
             return;
         }
         let psi = theta[rho_dim];
         if !tensor.contains(psi) {
+            self.reml_state.clear_gaussian_fixed_cache();
             return;
         }
         // Clone the Arc handle so the immutable borrow of `self.psi_gram_tensor`
@@ -3344,6 +3373,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .reml_state
             .install_gaussian_fixed_cache(Arc::new(tensor.gaussian_fixed_cache_at(psi)))
         {
+            self.reml_state.clear_gaussian_fixed_cache();
             return;
         }
         log::debug!(
@@ -3631,6 +3661,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         s_list: &[BlockwisePenalty],
         nullspace_dims: &[usize],
         linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
         design_revision: Option<u64>,
@@ -3660,6 +3692,19 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // derivative (#1033 / #1111): clear it so a prior trial's ψ pair
             // never serves this probe's gradient; it restreams the exact slab.
             self.reml_state.clear_glm_psi_gram_deriv();
+            // #1033: the Gaussian-identity `gaussian_fixed_cache` is ALSO keyed to
+            // the trial's ψ (the certified ψ-Gram tensor's `XᵀWX(ψ)/XᵀWz(ψ)`), and
+            // a VALUE probe runs at a different ψ than the eval that installed it.
+            // On the fast path `reset_surface` is skipped, so without re-keying
+            // here the inner Gaussian PLS would read the PREVIOUS ψ's Gram — a
+            // stale-Gram correctness hazard. Re-install the n-free per-ψ Gram for
+            // THIS probe's ψ (in-window) so the value probe is both correct AND
+            // touches only k-dim sufficient statistics; off-window the installer
+            // is a no-op and the surface keeps its streamed Gram. The conditioned
+            // ψ-derivatives the installer also stages are gradient-channel objects
+            // unused by `compute_cost`, but keying them to this ψ keeps a single
+            // source of truth and avoids leaving a prior trial's pair installed.
+            self.install_psi_gram_statistics(theta, rho_dim);
             return Ok(());
         }
 
