@@ -1589,7 +1589,7 @@ impl JeffreysHphiDriftBase {
     // Then
     //   δH_Φ_raw[a,b] = −½ Σ_ij [δΨ_ij (Ṽ_a)_ij (Ṽ_b)_ij
     //                            + Ψ_ij ((δṼ_a)_ij (Ṽ_b)_ij + (Ṽ_a)_ij (δṼ_b)_ij)].
-    let dbar_red = evecs.t().dot(&dbar).dot(&evecs); // Vᵀ Ḋ V (m × m)
+    let dbar_red = evecs.t().dot(&dbar).dot(evecs); // Vᵀ Ḋ V (m × m)
     let dfloor = if floor_in_relative_regime {
         REDUCED_INFO_RELATIVE_FLOOR * dbar_red[[idx_max, idx_max]]
     } else {
