@@ -3165,7 +3165,7 @@
                     logdet_enclosure_gap: None,
                 })
             },
-            |_beta: &Array1<f64>| Ok(()),
+            |_beta: &Array1<f64>| Ok(crate::solver::outer_strategy::SeedOutcome::NoSlot),
         )
         .expect(expect_msg)
     }
@@ -5579,7 +5579,7 @@
                     logdet_enclosure_gap: None,
                 })
             },
-            |_beta: &Array1<f64>| Ok(()),
+            |_beta: &Array1<f64>| Ok(crate::solver::outer_strategy::SeedOutcome::NoSlot),
         )
         .expect("exact joint no-spatial fast path should succeed");
 

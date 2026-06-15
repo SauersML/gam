@@ -972,7 +972,7 @@ fn closure_objective_delegates() {
         }),
         efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
-        seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<(), EstimationError>>,
+        seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
     };
     assert_eq!(obj.capability().n_params, 1);
@@ -1008,12 +1008,12 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         reset_fn: None::<fn(&mut Vec<f64>)>,
         efs_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         screening_proxy_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>>,
-        seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<(), EstimationError>>,
+        seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
     }
     .with_seed_inner_state(|state: &mut Vec<f64>, beta: &Array1<f64>| {
         state.extend(beta.iter().copied());
-        Ok(())
+        Ok(SeedOutcome::Installed)
     });
 
     let outcome = obj.seed_inner_state(&array![1.5, -2.0]).unwrap();
@@ -1073,7 +1073,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
             })
         }),
         screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
-        seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
+        seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
     };
     let mut bridge = OuterFixedPointBridge {
