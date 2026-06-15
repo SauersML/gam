@@ -7619,19 +7619,27 @@ pub(crate) fn binomial_location_scale_expected_hphi_drift_matches_finite_differe
         .joint_jeffreys_information_with_specs(&states, &specs)
         .expect("expected info")
         .expect("expected info present");
+    // Mode-response drift `D_β H_Φ[δ]` via the production-level perturbation core
+    // (the `joint_jeffreys_hphi_directional_derivative` oracle is a thin wrapper
+    // over this: `Hdot[δ]` once, then the perturbation derivative). Calling the
+    // core directly keeps the oracle private to its own `#[cfg(test)]` module.
+    let pert_h = family
+        .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, &direction)
+        .expect("Hdot[delta]")
+        .expect("Hdot[delta] present");
     let analytic =
-        crate::estimate::reml::jeffreys_subspace::hphi_directional_oracle_tests::joint_jeffreys_hphi_directional_derivative(
+        crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_perturbation_derivative(
             info.view(),
             z.view(),
-            &direction,
             |axis: &Array1<f64>| {
                 family.joint_jeffreys_information_directional_derivative_with_specs(
                     &states, &specs, axis,
                 )
             },
-            |u: &Array1<f64>, v: &Array1<f64>| {
+            &pert_h,
+            |axis: &Array1<f64>| {
                 family.joint_jeffreys_information_second_directional_derivative_with_specs(
-                    &states, &specs, u, v,
+                    &states, &specs, &direction, axis,
                 )
             },
         )

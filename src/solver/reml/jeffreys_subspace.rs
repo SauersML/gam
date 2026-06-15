@@ -1225,7 +1225,7 @@ where
 }
 
 #[cfg(test)]
-pub(crate) mod hphi_directional_oracle_tests {
+mod hphi_directional_oracle_tests {
     use super::*;
 
     /// Exact directional derivative `D_β H_Φ[δ]` of the Tier-B Gauss-Newton Jeffreys
