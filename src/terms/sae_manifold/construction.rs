@@ -51,6 +51,7 @@ impl SaeManifoldTerm {
             curvature_walk_report: None,
             expected_evidence_gauge_deflated_directions: None,
             evidence_gauge_deflation_reanchors: 0,
+            dictionary_cocollapse_reseeds: 0,
             hybrid_split_report: None,
             atom_inner_fits: None,
         })
@@ -2088,6 +2089,154 @@ impl SaeManifoldTerm {
         }
         let collapsed = self.hybrid_collapsed_reconstruction(rho)?;
         Ok(reconstruction_explained_variance(target, collapsed.view()))
+    }
+
+    /// #1026 ladder item 2/3 — the AMORTIZED ENCODER, wired from the fitted
+    /// dictionary. Builds the offline certified [`EncodeAtlas`] over this term's
+    /// frozen atoms and encodes a target corpus `targets` (`n × p`) through the
+    /// per-chart distilled Jacobian predictor, with the Kantorovich certificate
+    /// gating each row and an exact-solve fallback for the rows the amortized
+    /// predictor cannot certify. Returns one [`EncodeResult`] per atom (the
+    /// per-atom encoded coordinates + per-row certificate mask), in dictionary
+    /// order.
+    ///
+    /// This is the thread's "encoder + certificate-gated exact fallback"
+    /// deployment made reachable from a fit: the distilled map approximates
+    /// inference at one mat-vec/row, and any row whose amortized prediction fails
+    /// `h ≤ ½` falls back to the chart-center-start exact Newton encode
+    /// ([`EncodeAtlas::certified_encode_row`]); rows that still cannot be
+    /// certified ride the [`EncodeResult::encode_uncertified_count`] flag for the
+    /// upstream exact multi-start solve (honesty, never a silent wrong encode).
+    ///
+    /// Magic by default: the atlas's worst-case bounds are auto-derived from the
+    /// fit — `amplitude_bound[k]` is the largest fitted assignment mass `a[i,k]`
+    /// the encode can produce for atom `k` (the encode recovers `t` from
+    /// `x ≈ z·γ_k(t)` at amplitude `z = a[i,k]`), and `target_norm_bound` is the
+    /// largest target row norm — so no caller supplies a knob. Per-row amplitudes
+    /// are the fitted assignment masses for the same target the dictionary was fit
+    /// against; an external corpus reuses the per-row masses the assignment
+    /// produces for it upstream (passed in `amplitudes`, one column per atom).
+    pub fn amortized_encode_target(
+        &self,
+        targets: ArrayView2<'_, f64>,
+        amplitudes: ArrayView2<'_, f64>,
+    ) -> Result<Vec<crate::terms::sae_encode_atlas::EncodeResult>, String> {
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        let n = targets.nrows();
+        if targets.ncols() != p {
+            return Err(format!(
+                "SaeManifoldTerm::amortized_encode_target: targets have {} cols but output_dim is {p}",
+                targets.ncols()
+            ));
+        }
+        if amplitudes.dim() != (n, k_atoms) {
+            return Err(format!(
+                "SaeManifoldTerm::amortized_encode_target: amplitudes {:?} must be (n={n}, K={k_atoms})",
+                amplitudes.dim()
+            ));
+        }
+
+        // Magic-by-default offline bounds, auto-derived from the fit so no caller
+        // supplies a knob. `target_norm_bound` is the largest target row L2 norm
+        // (bounds `‖x‖` over the corpus); `amplitude_bound[k]` is the largest
+        // fitted assignment mass for atom `k` (bounds `|z_k|`), with a strictly
+        // positive floor so a near-inactive atom still certifies a finite radius.
+        let mut target_norm_bound = 0.0_f64;
+        for row in 0..n {
+            let norm = targets.row(row).dot(&targets.row(row)).sqrt();
+            if norm.is_finite() && norm > target_norm_bound {
+                target_norm_bound = norm;
+            }
+        }
+        let mut amplitude_bound = vec![0.0_f64; k_atoms];
+        for atom_idx in 0..k_atoms {
+            let mut bound = 0.0_f64;
+            for row in 0..n {
+                let z = amplitudes[[row, atom_idx]].abs();
+                if z.is_finite() && z > bound {
+                    bound = z;
+                }
+            }
+            // A strictly positive amplitude floor keeps the offline Lipschitz
+            // scaling finite for atoms with no active row in this corpus (those
+            // rows encode to the chart center via the certificate anyway).
+            amplitude_bound[atom_idx] = bound.max(1.0);
+        }
+
+        let atlas = crate::terms::sae_encode_atlas::EncodeAtlas::build(
+            &self.atoms,
+            &amplitude_bound,
+            target_norm_bound,
+            crate::terms::sae_encode_atlas::AtlasConfig::default(),
+        )?;
+
+        // Per-atom amortized encode with a certificate-gated exact-solve fallback:
+        // a row whose distilled prediction fails `h ≤ ½` is retried from the
+        // chart-center start (the non-amortized exact Newton); a row that still
+        // cannot be certified stays flagged for the upstream multi-start solve.
+        // (The atlas is rho-free; the per-row amplitudes already carry the
+        // rho-resolved assignment masses the caller produced upstream.)
+        let mut results = Vec::with_capacity(k_atoms);
+        for atom_idx in 0..k_atoms {
+            let atom = &self.atoms[atom_idx];
+            let amp_col = amplitudes.column(atom_idx).to_owned();
+            let amortized =
+                atlas.amortized_encode_batch(atom, atom_idx, targets, amp_col.view())?;
+            let mut coords = amortized.coords;
+            let mut certified = amortized.certified;
+            for row in 0..n {
+                if certified[row] {
+                    continue;
+                }
+                let (t, cert) =
+                    atlas.certified_encode_row(atom, atom_idx, targets.row(row), amp_col[row])?;
+                if cert.certified() {
+                    coords.row_mut(row).assign(&t);
+                    certified[row] = true;
+                }
+            }
+            results.push(crate::terms::sae_encode_atlas::EncodeResult::from_rows(
+                coords, certified,
+            ));
+        }
+        Ok(results)
+    }
+
+    /// #1026 — the fitted per-row assignment masses `a[i,k]` (the activation
+    /// amplitudes `z_k` the amortized encode recovers `t` against), as an
+    /// `n × K` matrix. These are exactly the masses
+    /// [`Self::try_fitted_with_rho`] assembles the reconstruction from, so
+    /// feeding them to [`Self::amortized_encode_target`] re-encodes the SAME
+    /// inference the dictionary was fit against — the self-consistency the
+    /// distilled encoder is supervised to approximate.
+    pub fn fitted_assignment_amplitudes(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.n_obs();
+        let k_atoms = self.k_atoms();
+        let mut amplitudes = Array2::<f64>::zeros((n, k_atoms));
+        for row in 0..n {
+            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            for atom_idx in 0..k_atoms {
+                amplitudes[[row, atom_idx]] = a[atom_idx];
+            }
+        }
+        Ok(amplitudes)
+    }
+
+    /// #1026 — encode the dictionary's own fit-time target with the amortized
+    /// encoder, deriving the per-row amplitudes from the fitted assignment so the
+    /// caller supplies neither bounds nor amplitudes (magic by default). The
+    /// end-to-end "fit → distilled encoder → certificate-gated encode" path.
+    pub fn amortized_encode_fitted(
+        &self,
+        targets: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<crate::terms::sae_encode_atlas::EncodeResult>, String> {
+        let amplitudes = self.fitted_assignment_amplitudes(rho)?;
+        self.amortized_encode_target(targets, amplitudes.view())
     }
 
     pub fn loss(
@@ -4473,13 +4622,19 @@ impl SaeManifoldTerm {
                 // truly ill-posed evidence surface rather than a finite number of
                 // structural events. Each atom can contribute at most one
                 // birth/rank-reduction plus `SAE_ATOM_COLLAPSE_RESEED_BUDGET`
-                // reseeds, so a healthy walk re-anchors a bounded number of
-                // times. Exceeding that bound is the structural pathology, and
-                // there we refuse to compare.
+                // per-atom reseeds, and the whole dictionary can co-collapse and be
+                // multi-started at most `SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`
+                // times (each touching all K atoms), so a healthy walk re-anchors a
+                // bounded number of times. Exceeding that bound is the structural
+                // pathology, and there we refuse to compare.
                 self.evidence_gauge_deflation_reanchors += 1;
                 let reanchor_budget = self
                     .k_atoms()
-                    .saturating_mul(SAE_ATOM_COLLAPSE_RESEED_BUDGET + 1)
+                    .saturating_mul(
+                        SAE_ATOM_COLLAPSE_RESEED_BUDGET
+                            + SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET
+                            + 1,
+                    )
                     .saturating_add(1);
                 if self.evidence_gauge_deflation_reanchors > reanchor_budget {
                     return Err(format!(
@@ -7711,4 +7866,83 @@ pub fn refresh_isometry_caches_from_term(
         }
     }
     Ok(refreshed_with_second)
+}
+
+#[cfg(test)]
+mod amortized_encoder_tests {
+    use crate::terms::sae_manifold::tests::small_two_atom_periodic_term;
+
+    /// #1026 ladder item 2/3 — the amortized encoder is reachable end-to-end
+    /// from a fitted term and is certificate-honest: it encodes the dictionary's
+    /// own fit-time target, returns one result per atom with the right shape, and
+    /// every row is either certified or counted in
+    /// `encode_uncertified_count` (never silently miscounted), with the exact
+    /// fallback strictly reducing the uncertified count it inherits.
+    #[test]
+    fn amortized_encode_fitted_is_reachable_and_certificate_honest() {
+        let (term, target, rho) = small_two_atom_periodic_term();
+        let n = term.n_obs();
+        let k = term.k_atoms();
+
+        let results = term
+            .amortized_encode_fitted(target.view(), &rho)
+            .expect("amortized encode of the fit-time target runs end-to-end");
+        assert_eq!(
+            results.len(),
+            k,
+            "one encode result per atom in dictionary order"
+        );
+
+        for (atom_idx, result) in results.iter().enumerate() {
+            assert_eq!(
+                result.coords.nrows(),
+                n,
+                "atom {atom_idx} encode must produce one coordinate per row"
+            );
+            assert_eq!(
+                result.coords.ncols(),
+                term.atoms[atom_idx].latent_dim,
+                "atom {atom_idx} encode coords must match its latent dim"
+            );
+            // The uncertified count is the honest tally of rows the certificate
+            // could not gate — it must equal the false entries of the mask.
+            let uncertified = result.certified.iter().filter(|c| !**c).count();
+            assert_eq!(
+                result.encode_uncertified_count, uncertified,
+                "atom {atom_idx} uncertified count must match the certificate mask"
+            );
+            assert_eq!(
+                result.certified.len(),
+                n,
+                "atom {atom_idx} certificate mask must cover every row"
+            );
+        }
+    }
+
+    /// The fitted amplitudes the encoder derives are exactly the assignment
+    /// masses the reconstruction is assembled from — feeding them back is the
+    /// self-consistency the distilled map is supervised against.
+    #[test]
+    fn fitted_assignment_amplitudes_match_the_assignment_masses() {
+        let (term, _target, rho) = small_two_atom_periodic_term();
+        let n = term.n_obs();
+        let k = term.k_atoms();
+        let amplitudes = term
+            .fitted_assignment_amplitudes(&rho)
+            .expect("fitted amplitudes derive from the assignment");
+        assert_eq!(amplitudes.dim(), (n, k));
+        for row in 0..n {
+            let a = term
+                .assignment
+                .try_assignments_row_for_rho(row, &rho)
+                .expect("assignment row resolves");
+            for atom_idx in 0..k {
+                assert_eq!(
+                    amplitudes[[row, atom_idx]],
+                    a[atom_idx],
+                    "amplitude[{row},{atom_idx}] must equal the assignment mass"
+                );
+            }
+        }
+    }
 }

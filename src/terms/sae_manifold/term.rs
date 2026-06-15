@@ -264,6 +264,14 @@ pub struct SaeManifoldTerm {
     /// never settles is the genuine pathology the guard must still catch. Reset
     /// to `0` alongside `expected_evidence_gauge_deflated_directions`.
     pub(crate) evidence_gauge_deflation_reanchors: usize,
+    /// #976 / #1117 K>1 robustness: how many full-dictionary co-collapse
+    /// multi-starts the decoder-norm guard has already spent in the current
+    /// optimization. Bounded by [`SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`];
+    /// reset to `0` alongside [`Self::evidence_gauge_deflation_reanchors`] at the
+    /// start of each outer optimization. Distinct from the per-atom reseed
+    /// ledger in [`Self::collapse_events`] because a co-collapse reseed is a
+    /// whole-dictionary multi-start, not a per-atom second chance.
+    pub(crate) dictionary_cocollapse_reseeds: usize,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
@@ -303,6 +311,7 @@ impl Clone for SaeManifoldTerm {
             expected_evidence_gauge_deflated_directions: self
                 .expected_evidence_gauge_deflated_directions,
             evidence_gauge_deflation_reanchors: self.evidence_gauge_deflation_reanchors,
+            dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
         }

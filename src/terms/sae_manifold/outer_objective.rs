@@ -88,6 +88,7 @@ impl SaeManifoldOuterObjective {
     ) -> Self {
         term.expected_evidence_gauge_deflated_directions = None;
         term.evidence_gauge_deflation_reanchors = 0;
+        term.dictionary_cocollapse_reseeds = 0;
         let baseline_term = term.clone();
         let baseline_rho = init_rho.clone();
         Self {
