@@ -2170,7 +2170,49 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // penalty so the threshold is the NLL the trial must beat.
                 let line_search_options =
                     coefficient_line_search_options(options, old_objective + 1e-10 - trial_penalty);
-                let trial_ll =
+                // Accept-on-first-attempt fast path (gam#979 `gradient_reload`
+                // cost). On the FIRST trust-region attempt of a cycle the step
+                // is the undamped (radius-bumped) Newton proposal, which on the
+                // common ρ≈1 `hold_inside` large-scale pattern accepts outright.
+                // The cheap scalar sweep below would then run a full row stream
+                // and immediately discard it, leaving `gradient_reload` to
+                // re-stream every row at the SAME β to build the gradient
+                // workspace — the ~5s redundant second pass per accepted cycle.
+                //
+                // Instead, when a workspace gradient source is available, build
+                // the joint-Newton workspace ONCE at the trial β and read its
+                // `joint_log_likelihood_evaluation()` (the same `Σ wᵢ log Φ` the
+                // cheap sweep computes, on the same row measure — both derive
+                // from `options`). The materialised per-row cache is threaded
+                // forward as `accepted_joint_workspace`, so on accept the reload
+                // short-circuits through `joint_gradient_evaluation()` with NO
+                // second stream — collapsing the accepted cycle to one row pass.
+                //
+                // Only the first attempt takes this path: it is the only one
+                // expected to accept, so a rejected first attempt pays a single
+                // full (non-early-exited) sweep — paid back many-fold on the
+                // dominant accept-on-first-attempt cycle. Later backtracking
+                // attempts keep the cheap early-exiting sweep (they are expected
+                // to reject and the workspace they would build is discarded).
+                // A workspace build that *errors* (e.g. an infeasible trial η on
+                // the radius-bumped first proposal) must NOT abort the whole
+                // solve: the cheap-sweep path below classifies that same failure
+                // as a recoverable likelihood-reject and shrinks the radius. So
+                // treat an `Err`/`None` here as "fast path unavailable" and fall
+                // through to the cheap sweep, which owns the reject bookkeeping.
+                let fused_first_attempt = if trust_attempt == 0 && joint_workspace_requested {
+                    joint_line_search_log_likelihood_with_workspace(
+                        family, options, specs, &states,
+                    )
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                let trial_ll = if let Some((value, workspace)) = fused_first_attempt {
+                    accepted_joint_workspace = Some(workspace);
+                    value
+                } else {
                     match joint_line_search_log_likelihood(family, &line_search_options, &states) {
                         Ok((value, workspace)) => {
                             accepted_joint_workspace = workspace;
@@ -2192,7 +2234,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             );
                             continue;
                         }
-                    };
+                    }
+                };
                 let trialobjective = -trial_ll + trial_penalty;
                 // Row measure observed by the trial objective at β + δ. The
                 // line-search helper above runs under `coefficient_line_search_options`,
