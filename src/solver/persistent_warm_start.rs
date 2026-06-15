@@ -373,7 +373,7 @@ mod warm_start_artifact_tests {
         FIT_ARTIFACT_SCHEMA, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
         SerializableBasisMeta, TermArtifact, TermRole, term_identity,
     };
-    use crate::terms::basis::types::{BasisMetadata, DuchonNullspaceOrder};
+    use crate::terms::basis::{BasisMetadata, DuchonNullspaceOrder};
     use ndarray::Array2;
 
     fn duchon_meta(n_centers: usize) -> BasisMetadata {
