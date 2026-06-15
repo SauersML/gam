@@ -1297,39 +1297,28 @@ pub(crate) fn robust_conditional_score_pvalue(
             weights.len()
         ));
     }
-    let mut s = Array1::<f64>::zeros(r);
-    let mut omega = Array2::<f64>::zeros((r, r));
+    // Build the per-row scaled basis `B` with `B_i = (w_i u_i) ã_i` once, then
+    // recover both the score and the HC0 robust meat from it with two BLAS-3
+    // GEMMs over chunked row-blocks instead of an `O(n · r²)` per-row scatter:
+    //   • score  `s   = ãᵀ (w ∘ u) = Bᵀ 1`     (column sums of `B`),
+    //   • meat   `Ω̂  = Σ_i w_i² u_i² ã_i ã_iᵀ = BᵀB` since `(w_i u_i)² = w_i² u_i²`.
+    // A non-positive weight zeroes that row of `B` (its score and meat
+    // contributions both vanish), reproducing the `wi <= 0.0` skip EXACTLY.
+    // `fast_ata` is the same parallel Gramian the second-stage sandwich uses, so
+    // the statistic is numerically identical to the row-accumulated form up to
+    // the deterministic GEMM reduction order.
+    let mut b = a_centered.to_owned();
     for i in 0..n {
         let wi = weights[i];
-        if wi <= 0.0 {
+        let scale = if wi > 0.0 { wi * u[i] } else { 0.0 };
+        if scale == 0.0 {
+            b.row_mut(i).fill(0.0);
             continue;
         }
-        let ui = u[i];
-        let a_row = a_centered.row(i);
-        let wu = wi * ui;
-        for j in 0..r {
-            s[j] += wu * a_row[j];
-        }
-        // HC0 robust meat: Σ wᵢ² uᵢ² ãᵢ ãᵢᵀ.
-        let w2u2 = wi * wi * ui * ui;
-        if w2u2 == 0.0 {
-            continue;
-        }
-        for j in 0..r {
-            let aj = a_row[j];
-            if aj == 0.0 {
-                continue;
-            }
-            let scaled = w2u2 * aj;
-            for k in j..r {
-                let inc = scaled * a_row[k];
-                omega[[j, k]] += inc;
-                if k != j {
-                    omega[[k, j]] += inc;
-                }
-            }
-        }
+        b.row_mut(i).iter_mut().for_each(|value| *value *= scale);
     }
+    let s = b.sum_axis(ndarray::Axis(0));
+    let omega = crate::linalg::faer_ndarray::fast_ata(&b);
     if !s.iter().all(|v| v.is_finite()) || !omega.iter().all(|v| v.is_finite()) {
         return Ok(None);
     }
