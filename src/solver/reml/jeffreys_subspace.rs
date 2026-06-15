@@ -1339,84 +1339,198 @@ where
     )
 }
 
-/// Shared core for the joint-Jeffreys curvature perturbation derivative
-/// `D[gate·H_Φ_raw]`, given a perturbation that acts on `H_joint` through `pert_h`
-/// (a `p×p` matrix `∂H_joint`) and on each axis derivative `D_a` through
-/// `pert_hessian_dir(e_a)` (a `p×p` matrix `∂Hdot[e_a]`). `base_hessian_dir(e_a)`
-/// supplies the unperturbed `Hdot[e_a]` that forms the base `M_a = K D_a`.
+/// β-FIXED PREPARED BASE for the joint-Jeffreys curvature perturbation derivative.
 ///
-/// Both the mode-response drift (perturbation `Hdot[δ]`, `H²dot[δ,e_a]`) and the
-/// explicit ρ-derivative (perturbation `∂_ρ H_joint`, `∂_ρ Hdot[e_a]`) are
-/// instances. It reproduces the value path's reduced information, smooth
-/// conditioning gate, and floored pseudo-inverse, and differentiates the gate
-/// (`(D gate)·H_Φ_raw`) so the result is consistent with the gated `H_Φ` the
-/// objective folds into `½ log|H+S_λ+H_Φ|`. With `K = H_id⁻¹` the floored
-/// pseudo-inverse, `M_a = K D_a`, `H_Φ_raw[a,b] = ½⟨vec M_a, vec M_b⟩`:
-///   * `δK = −K Ḋ K`, `Ḋ = Z_Jᵀ (∂H_joint) Z_J` (exact on the unfloored spectrum,
-///     matching the value path; the floored-spectrum divided-difference correction
-///     is the same residual the value/gradient pair already carries),
-///   * `δM_a = −K Ḋ M_a + K (Z_Jᵀ ∂Hdot[e_a] Z_J)`,
-///   * `δH_Φ_raw[a,b] = ½(⟨δM_a, M_b⟩ + ⟨M_a, δM_b⟩)`.
-pub(crate) fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
-    h_joint: ArrayView2<'_, f64>,
-    z_j: ArrayView2<'_, f64>,
-    mut base_hessian_dir: BaseFn,
-    pert_h: &Array2<f64>,
-    mut pert_hessian_dir: PertFn,
-) -> Result<Array2<f64>, String>
-where
-    BaseFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-    PertFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-{
-    let p = h_joint.nrows();
-    if h_joint.ncols() != p {
-        return Err(format!(
-            "joint_jeffreys_hphi_perturbation_derivative: H must be square, got {}x{}",
-            h_joint.nrows(),
-            h_joint.ncols()
-        ));
-    }
-    if z_j.nrows() != p {
-        return Err(format!(
-            "joint_jeffreys_hphi_perturbation_derivative: Z_J has {} rows, expected {p}",
-            z_j.nrows()
-        ));
-    }
-    if pert_h.nrows() != p || pert_h.ncols() != p {
-        return Err(format!(
-            "joint_jeffreys_hphi_perturbation_derivative: pert_h shape {}x{} != {p}x{p}",
-            pert_h.nrows(),
-            pert_h.ncols()
-        ));
-    }
-    let m = z_j.ncols();
-    if m == 0 || p == 0 {
-        return Ok(Array2::zeros((p, p)));
+/// PERF (the biobank #979 outer-gradient black hole). Every mode-response drift
+/// `D_β H_Φ[v_k]` shares the SAME β̂-dependent base: the reduced-information
+/// eigendecomposition (`evals`, `evecs`), the floor/gate, the divided-difference
+/// kernel `Ψ`, AND — the dominant cost — the `p` per-axis first directional
+/// derivatives `Hdot[e_a]` (each an `O(n)` row-stream over n≈348k biobank rows)
+/// that form the base `M_a = K D_a` (stored as `a_rows = vec(Ṽ_a)`,
+/// `aw_rows = vec(Ψ∘Ṽ_a)`). NONE of these depend on the perturbation direction;
+/// the released code recomputed all `p` axis row-streams INSIDE every one of the
+/// `k` drift calls, i.e. `k·p` redundant full-data passes per outer gradient
+/// eval. Preparing the base ONCE and reusing it across all `k` directions
+/// collapses that to a single `p`-axis sweep; each direction then pays only its
+/// own genuinely-`δ`-dependent perturbation work (`Hdot[δ]` and the `p` second
+/// directional derivatives `H²dot[δ,e_a]`). The arithmetic per direction is
+/// byte-identical to [`joint_jeffreys_hphi_perturbation_derivative`].
+pub(crate) struct JeffreysHphiDriftBase {
+    p: usize,
+    m: usize,
+    z_j: Array2<f64>,
+    evals: Array1<f64>,
+    evecs: Array2<f64>,
+    floor: f64,
+    gate_weight: f64,
+    psi: Array2<f64>,
+    floor_in_relative_regime: bool,
+    idx_min: usize,
+    idx_max: usize,
+    /// Per-axis rotated base derivative rows `vec(Ṽ_a)` (`p × m·m`).
+    a_rows: Array2<f64>,
+    /// `vec(Ψ ∘ Ṽ_a)` (`p × m·m`).
+    aw_rows: Array2<f64>,
+}
+
+impl JeffreysHphiDriftBase {
+    /// Prepare the β-fixed base ONCE. Runs the `p` first-directional-derivative
+    /// row-streams via `base_hessian_dir`. Returns `Ok(None)` when the term is
+    /// gated out (`H_Φ ≡ 0` in a neighborhood ⇒ every drift vanishes) or the
+    /// family does not expose the exact first derivative on some axis (the
+    /// released per-direction code returned the zero matrix there; preparing
+    /// returns `None`, and the caller emits the same zero drift for every
+    /// direction).
+    pub(crate) fn prepare<BaseFn>(
+        h_joint: ArrayView2<'_, f64>,
+        z_j: ArrayView2<'_, f64>,
+        mut base_hessian_dir: BaseFn,
+    ) -> Result<Option<JeffreysHphiDriftBase>, String>
+    where
+        BaseFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    {
+        let p = h_joint.nrows();
+        if h_joint.ncols() != p {
+            return Err(format!(
+                "JeffreysHphiDriftBase::prepare: H must be square, got {}x{}",
+                h_joint.nrows(),
+                h_joint.ncols()
+            ));
+        }
+        if z_j.nrows() != p {
+            return Err(format!(
+                "JeffreysHphiDriftBase::prepare: Z_J has {} rows, expected {p}",
+                z_j.nrows()
+            ));
+        }
+        let m = z_j.ncols();
+        if m == 0 || p == 0 {
+            return Ok(None);
+        }
+        // Reproduce EXACTLY the value-path reduced information, conditioning gate,
+        // and floored pseudo-inverse so the derivative is consistent with the
+        // `H_Φ` the objective uses.
+        let hz0 = h_joint.dot(&z_j);
+        let h_id = z_j.t().dot(&hz0);
+        let mut h_id_sym = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                h_id_sym[[i, j]] = 0.5 * (h_id[[i, j]] + h_id[[j, i]]);
+            }
+        }
+        let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
+            format!("JeffreysHphiDriftBase::prepare: eigendecomposition failed: {e}")
+        })?;
+        let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let gate_weight = conditioning_gate_weight(lambda_min, lambda_max);
+        if gate_weight == 0.0 {
+            return Ok(None);
+        }
+        let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
+        let psi = floored_inverse_divided_differences(&evals, floor);
+        let floor_in_relative_regime = lambda_max > 0.0
+            && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
+        let mut idx_max = 0usize;
+        let mut idx_min = 0usize;
+        for i in 1..m {
+            if evals[i] > evals[idx_max] {
+                idx_max = i;
+            }
+            if evals[i] < evals[idx_min] {
+                idx_min = i;
+            }
+        }
+        // The β-FIXED per-axis base: `Ṽ_a = Vᵀ D_a V` and `Ψ ∘ Ṽ_a`, formed from
+        // the `p` first directional derivatives `Hdot[e_a]` (the dominant `O(n·p)`
+        // cost — done ONCE here, reused for every drift direction).
+        let z_owned = z_j.to_owned();
+        let mut a_rows = Array2::<f64>::zeros((p, m * m));
+        let mut aw_rows = Array2::<f64>::zeros((p, m * m));
+        let mut axis = Array1::<f64>::zeros(p);
+        for a in 0..p {
+            axis.fill(0.0);
+            axis[a] = 1.0;
+            let hdot_a = match base_hessian_dir(&axis)? {
+                Some(hd) => hd,
+                None => return Ok(None),
+            };
+            if hdot_a.nrows() != p || hdot_a.ncols() != p {
+                return Err(format!(
+                    "JeffreysHphiDriftBase::prepare: Hdot[e_a] shape {}x{} != {p}x{p}",
+                    hdot_a.nrows(),
+                    hdot_a.ncols()
+                ));
+            }
+            let d_a_raw = z_j.t().dot(&hdot_a.dot(&z_j));
+            let mut d_a = Array2::<f64>::zeros((m, m));
+            for i in 0..m {
+                for j in 0..m {
+                    d_a[[i, j]] = 0.5 * (d_a_raw[[i, j]] + d_a_raw[[j, i]]);
+                }
+            }
+            let a_a = evecs.t().dot(&d_a).dot(&evecs);
+            let mut col = 0usize;
+            for i in 0..m {
+                for j in 0..m {
+                    a_rows[[a, col]] = a_a[[i, j]];
+                    aw_rows[[a, col]] = psi[[i, j]] * a_a[[i, j]];
+                    col += 1;
+                }
+            }
+        }
+        Ok(Some(JeffreysHphiDriftBase {
+            p,
+            m,
+            z_j: z_owned,
+            evals,
+            evecs,
+            floor,
+            gate_weight,
+            psi,
+            floor_in_relative_regime,
+            idx_min,
+            idx_max,
+            a_rows,
+            aw_rows,
+        }))
     }
 
-    // Reproduce EXACTLY the value-path reduced information, conditioning gate, and
-    // floored pseudo-inverse so the derivative is consistent with the `H_Φ` the
-    // objective uses.
-    let hz0 = h_joint.dot(&z_j);
-    let h_id = z_j.t().dot(&hz0);
-    let mut h_id_sym = Array2::<f64>::zeros((m, m));
-    for i in 0..m {
-        for j in 0..m {
-            h_id_sym[[i, j]] = 0.5 * (h_id[[i, j]] + h_id[[j, i]]);
+    /// Per-direction drift `D[gate·H_Φ_raw]` reusing the prepared base. Only the
+    /// `δ`-dependent perturbation is evaluated here: the reduced perturbation
+    /// `Ḋ = Z_Jᵀ pert_h Z_J` and, per axis, `∂D_a = Z_Jᵀ pert_hessian_dir(e_a) Z_J`
+    /// (the genuinely `δ`-dependent second directional derivatives). Returns
+    /// `Ok(None)` (⇒ caller emits the zero drift) when the family does not expose
+    /// the exact second derivative on some axis, matching the released semantics.
+    pub(crate) fn perturbation_derivative<PertFn>(
+        &self,
+        pert_h: &Array2<f64>,
+        mut pert_hessian_dir: PertFn,
+    ) -> Result<Array2<f64>, String>
+    where
+        PertFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    {
+        let p = self.p;
+        if pert_h.nrows() != p || pert_h.ncols() != p {
+            return Err(format!(
+                "JeffreysHphiDriftBase::perturbation_derivative: pert_h shape {}x{} != {p}x{p}",
+                pert_h.nrows(),
+                pert_h.ncols()
+            ));
         }
-    }
-    let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
-        format!("joint_jeffreys_hphi_perturbation_derivative: eigendecomposition failed: {e}")
-    })?;
-    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
-    let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-    let gate_weight = conditioning_gate_weight(lambda_min, lambda_max);
-    if gate_weight == 0.0 {
-        // Fully gated out ⇒ H_Φ ≡ 0 in a neighborhood ⇒ its derivative vanishes.
-        return Ok(Array2::zeros((p, p)));
-    }
-    let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
-    // Ḋ = Z_Jᵀ (∂H_joint) Z_J, the reduced perturbation of the reduced information.
+        let m = self.m;
+        let z_j = self.z_j.view();
+        let evals = &self.evals;
+        let evecs = &self.evecs;
+        let floor = self.floor;
+        let gate_weight = self.gate_weight;
+        let psi = &self.psi;
+        let floor_in_relative_regime = self.floor_in_relative_regime;
+        let idx_min = self.idx_min;
+        let idx_max = self.idx_max;
+        let lambda_min = evals[idx_min];
+        let lambda_max = evals[idx_max];
+        // Ḋ = Z_Jᵀ (∂H_joint) Z_J, the reduced perturbation of the reduced information.
     let dbar_raw = z_j.t().dot(&pert_h.dot(&z_j)); // m x m
     let mut dbar = Array2::<f64>::zeros((m, m));
     for i in 0..m {
@@ -1449,15 +1563,6 @@ where
     //   δH_Φ_raw[a,b] = −½ Σ_ij [δΨ_ij (Ṽ_a)_ij (Ṽ_b)_ij
     //                            + Ψ_ij ((δṼ_a)_ij (Ṽ_b)_ij + (Ṽ_a)_ij (δṼ_b)_ij)].
     let dbar_red = evecs.t().dot(&dbar).dot(&evecs); // Vᵀ Ḋ V (m × m)
-    let psi = floored_inverse_divided_differences(&evals, floor);
-    let floor_in_relative_regime =
-        lambda_max > 0.0 && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
-    let mut idx_max = 0usize;
-    for i in 1..m {
-        if evals[i] > evals[idx_max] {
-            idx_max = i;
-        }
-    }
     let dfloor = if floor_in_relative_regime {
         REDUCED_INFO_RELATIVE_FLOOR * dbar_red[[idx_max, idx_max]]
     } else {
@@ -1504,36 +1609,31 @@ where
         }
     }
 
-    // Per canonical axis e_a: rotated base Ṽ_a, its Ψ-weighted partner, the
-    // perturbed rotation δṼ_a, and the δΨ/Ψ-weighted derivative rows, flattened
-    // so the final contraction is a pair of m·m inner products per (a,b).
-    let mut a_rows = Array2::<f64>::zeros((p, m * m)); // vec(Ṽ_a)
-    let mut aw_rows = Array2::<f64>::zeros((p, m * m)); // vec(Ψ ∘ Ṽ_a)
+    // Per canonical axis e_a: the rotated base Ṽ_a (REUSED from the prepared
+    // base — its `Hdot[e_a]` row-stream is NOT recomputed per direction) and its
+    // Ψ-weighted partner, plus the perturbed rotation δṼ_a and the δΨ/Ψ-weighted
+    // derivative rows, flattened so the final contraction is a pair of m·m inner
+    // products per (a,b). `a_rows`/`aw_rows` come from the base; only `da_rows`
+    // (vec(δṼ_a)) and `dw_rows` (vec(δΨ∘Ṽ_a + Ψ∘δṼ_a)) are direction-dependent.
+    let a_rows = &self.a_rows; // vec(Ṽ_a)
+    let aw_rows = &self.aw_rows; // vec(Ψ ∘ Ṽ_a)
     let mut da_rows = Array2::<f64>::zeros((p, m * m)); // vec(δṼ_a)
     let mut dw_rows = Array2::<f64>::zeros((p, m * m)); // vec(δΨ ∘ Ṽ_a + Ψ ∘ δṼ_a)
     let mut axis = Array1::<f64>::zeros(p);
+    // Reconstruct Ṽ_a (m × m) from the flattened base row for the rotation terms.
+    let mut a_a = Array2::<f64>::zeros((m, m));
     for a in 0..p {
         axis.fill(0.0);
         axis[a] = 1.0;
-        let hdot_a = match base_hessian_dir(&axis)? {
-            Some(hd) => hd,
-            None => return Ok(Array2::zeros((p, p))),
-        };
-        if hdot_a.nrows() != p || hdot_a.ncols() != p {
-            return Err(format!(
-                "joint_jeffreys_hphi_perturbation_derivative: Hdot[e_a] shape {}x{} != {p}x{p}",
-                hdot_a.nrows(),
-                hdot_a.ncols()
-            ));
-        }
-        let d_a_raw = z_j.t().dot(&hdot_a.dot(&z_j)); // Z_Jᵀ ∂_a H Z_J
-        let mut d_a = Array2::<f64>::zeros((m, m));
-        for i in 0..m {
-            for j in 0..m {
-                d_a[[i, j]] = 0.5 * (d_a_raw[[i, j]] + d_a_raw[[j, i]]);
+        {
+            let mut col = 0usize;
+            for i in 0..m {
+                for j in 0..m {
+                    a_a[[i, j]] = a_rows[[a, col]];
+                    col += 1;
+                }
             }
         }
-        let a_a = evecs.t().dot(&d_a).dot(&evecs); // Ṽ_a
 
         let pert_hdot_a = match pert_hessian_dir(&axis)? {
             Some(h2) => h2,
@@ -1541,7 +1641,7 @@ where
         };
         if pert_hdot_a.nrows() != p || pert_hdot_a.ncols() != p {
             return Err(format!(
-                "joint_jeffreys_hphi_perturbation_derivative: ∂Hdot[e_a] shape {}x{} != {p}x{p}",
+                "JeffreysHphiDriftBase::perturbation_derivative: ∂Hdot[e_a] shape {}x{} != {p}x{p}",
                 pert_hdot_a.nrows(),
                 pert_hdot_a.ncols()
             ));
@@ -1555,13 +1655,11 @@ where
         }
 
         // δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a.
-        let da_a = evecs.t().dot(&d_a_pert).dot(&evecs) + &a_a.dot(&rotation) - &rotation.dot(&a_a);
+        let da_a = evecs.t().dot(&d_a_pert).dot(evecs) + &a_a.dot(&rotation) - &rotation.dot(&a_a);
 
         let mut col = 0usize;
         for i in 0..m {
             for j in 0..m {
-                a_rows[[a, col]] = a_a[[i, j]];
-                aw_rows[[a, col]] = psi[[i, j]] * a_a[[i, j]];
                 da_rows[[a, col]] = da_a[[i, j]];
                 dw_rows[[a, col]] = dpsi[[i, j]] * a_a[[i, j]] + psi[[i, j]] * da_a[[i, j]];
                 col += 1;
@@ -1592,12 +1690,6 @@ where
     let mut result = out * gate_weight;
     let (g_dlmin, g_dlmax) = conditioning_gate_weight_grad(lambda_min, lambda_max);
     if g_dlmin != 0.0 || g_dlmax != 0.0 {
-        let mut idx_min = 0usize;
-        for i in 1..m {
-            if evals[i] < evals[idx_min] {
-                idx_min = i;
-            }
-        }
         let extreme_perturbation = |idx: usize| -> f64 {
             let v = evecs.column(idx);
             v.dot(&dbar.dot(&v))
@@ -1611,6 +1703,50 @@ where
         }
     }
     Ok(result)
+    }
+}
+
+/// Shared core for the joint-Jeffreys curvature perturbation derivative
+/// `D[gate·H_Φ_raw]`, given a perturbation that acts on `H_joint` through `pert_h`
+/// (a `p×p` matrix `∂H_joint`) and on each axis derivative `D_a` through
+/// `pert_hessian_dir(e_a)` (a `p×p` matrix `∂Hdot[e_a]`). `base_hessian_dir(e_a)`
+/// supplies the unperturbed `Hdot[e_a]` that forms the base `M_a = K D_a`.
+///
+/// Both the mode-response drift (perturbation `Hdot[δ]`, `H²dot[δ,e_a]`) and the
+/// explicit ρ-derivative (perturbation `∂_ρ H_joint`, `∂_ρ Hdot[e_a]`) are
+/// instances. It reproduces the value path's reduced information, smooth
+/// conditioning gate, and floored pseudo-inverse, and differentiates the gate
+/// (`(D gate)·H_Φ_raw`) so the result is consistent with the gated `H_Φ` the
+/// objective folds into `½ log|H+S_λ+H_Φ|`. With `K = H_id⁻¹` the floored
+/// pseudo-inverse, `M_a = K D_a`, `H_Φ_raw[a,b] = ½⟨vec M_a, vec M_b⟩`:
+///   * `δK = −K Ḋ K`, `Ḋ = Z_Jᵀ (∂H_joint) Z_J` (exact on the unfloored spectrum,
+///     matching the value path; the floored-spectrum divided-difference correction
+///     is the same residual the value/gradient pair already carries),
+///   * `δM_a = −K Ḋ M_a + K (Z_Jᵀ ∂Hdot[e_a] Z_J)`,
+///   * `δH_Φ_raw[a,b] = ½(⟨δM_a, M_b⟩ + ⟨M_a, δM_b⟩)`.
+///
+/// This is the single-perturbation entry point used by the explicit-ρ-derivative
+/// path; it prepares a [`JeffreysHphiDriftBase`] and applies one perturbation.
+/// The batched mode-response drift instead prepares the base ONCE and applies it
+/// across every direction (see `custom_family_outer_jeffreys_hphi_drift`).
+pub(crate) fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    base_hessian_dir: BaseFn,
+    pert_h: &Array2<f64>,
+    pert_hessian_dir: PertFn,
+) -> Result<Array2<f64>, String>
+where
+    BaseFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    PertFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+{
+    let p = h_joint.nrows();
+    match JeffreysHphiDriftBase::prepare(h_joint, z_j, base_hessian_dir)? {
+        // Gated out / no exact first derivative ⇒ H_Φ ≡ 0 in a neighborhood ⇒
+        // its derivative vanishes (byte-identical to the released zero return).
+        None => Ok(Array2::zeros((p, p))),
+        Some(base) => base.perturbation_derivative(pert_h, pert_hessian_dir),
+    }
 }
 
 #[cfg(test)]
