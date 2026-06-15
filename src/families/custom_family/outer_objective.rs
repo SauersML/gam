@@ -989,6 +989,21 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // the constrained-QP and matrix-free PCG paths, which keep their
             // existing globalization untouched.
             let mut joint_spectrum: Option<whitened_spectrum::WhitenedHessianSpectrum> = None;
+            // DENSE-FALLBACK OPERATOR MATERIALIZATION REUSE (gam#1040). On the
+            // DENSE_SPECTRAL path the inner Hessian `source` can be a matrix-free
+            // `Operator` (BMS flex, large n, p below the matrix-free joint-dim
+            // threshold so PCG is not requested): the dense-fallback below then
+            // calls `materialize_joint_hessian_source` to form the unpenalized
+            // dense `H` ONCE for the spectral `decompose`. Without capturing it,
+            // the per-cycle Cauchy leg and the up-to-`JOINT_TRUST_MAX_ATTEMPTS`
+            // predicted-reduction matvecs each re-apply the operator's `apply_into`
+            // — an `O(n·p)` row sweep over n≈196k rows, ~25× per cycle — when the
+            // identical action is already available as an `O(p²)` dense matvec.
+            // Capturing the unpenalized dense here and routing those matvecs
+            // through a `Dense` source is byte-identical (the dense build IS the
+            // operator's action by construction of `materialize_joint_hessian_source`)
+            // and removes the dominant residual per-cycle row work on this path.
+            let mut materialized_dense_unpenalized: Option<Array2<f64>> = None;
             let (candidate_beta, joint_active_set, joint_step_spectral_nullity) =
                 if solve_joint_constraints_dense
                     && let Some(constraints) = joint_constraints.as_ref()
@@ -1471,6 +1486,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             Ok(matrix) => matrix,
                             Err(_) => break,
                         };
+                        // Capture the unpenalized dense `H` for the rest of this
+                        // cycle (gam#1040): the Cauchy leg and trust-region
+                        // predicted-reduction matvecs below can then reuse it as a
+                        // cheap `O(p²)` dense matvec instead of re-applying a
+                        // matrix-free operator `O(n·p)` per attempt. Only when the
+                        // source is an `Operator` — a `Dense` source already gives
+                        // those matvecs the fast path, so cloning would be waste.
+                        if matches!(&joint_hessian_source, JointHessianSource::Operator { .. }) {
+                            materialized_dense_unpenalized = Some(lhs_true.clone());
+                        }
                         // Snapshot the Jeffreys information matrix only when a
                         // family supplies the contracted completion. The generic
                         // pairwise fallback costs p(p+1)/2 full second-directional
@@ -1619,6 +1644,19 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 hessian_and_qp_elapsed.as_secs_f64(),
             );
             let delta = &candidate_beta - &beta_joint;
+            // Effective Hessian source for the remaining per-cycle matvecs
+            // (Cauchy leg + trust-region predicted reduction). When the dense
+            // fallback above materialized a matrix-free `Operator` to dense, route
+            // those matvecs through that `Dense` snapshot so each is an `O(p²)`
+            // GEMV rather than an `O(n·p)` operator row-sweep repeated up to
+            // `JOINT_TRUST_MAX_ATTEMPTS` times (gam#1040). Byte-identical action
+            // (the dense build IS the operator's action by construction); falls
+            // back to the original source when no dense snapshot was taken (the
+            // already-`Dense` and PCG paths).
+            let dense_snapshot_source =
+                materialized_dense_unpenalized.map(JointHessianSource::Dense);
+            let effective_hessian_source: &JointHessianSource =
+                dense_snapshot_source.as_ref().unwrap_or(&joint_hessian_source);
 
             // Trust-region globalization for the joint Newton proposal.  The
             // previous implementation used up to eight backtracking likelihood
@@ -1784,7 +1822,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // unconstrained joint Newton path; the constrained-QP path keeps its
             // own globalization, so the dogleg is only built (and used) when no
             // active set is in force.
-            let dogleg_cauchy: Option<Array1<f64>> = if search_joint_active_set.is_none() {
+            // Only the dogleg/box-truncation globalization (no spectrum) ever
+            // consumes the Cauchy leg; when the exact Moré–Sorensen spectrum is
+            // present the trust loop re-solves from it and `dogleg_cauchy` is dead.
+            // Skipping its construction there removes one coupled Hessian-vector
+            // product per cycle — an `O(n·p)` operator row-sweep on the matrix-free
+            // DENSE_SPECTRAL path that produced no value (gam#1040).
+            let dogleg_cauchy: Option<Array1<f64>> = if search_joint_active_set.is_none()
+                && joint_spectrum.is_none()
+            {
                 let mut p_sd = Array1::<f64>::zeros(total_p);
                 for (i, (r, w)) in rhs.iter().zip(joint_trust_metric_diag.iter()).enumerate() {
                     p_sd[i] = r / positive_joint_diagonal_entry(*w);
@@ -1792,7 +1838,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 let mut h_psd = Array1::<f64>::zeros(total_p);
                 let mut cauchy_penalty_scratch = Array1::<f64>::zeros(total_p);
                 match apply_joint_penalized_hessian_into_with_workspace(
-                    &joint_hessian_source,
+                    effective_hessian_source,
                     &ranges,
                     &s_lambdas,
                     joint_mode_diagonal_ridge,
@@ -1961,7 +2007,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // allocating per attempt.
                 hpen_delta.fill(0.0);
                 if apply_joint_penalized_hessian_into_with_workspace(
-                    &joint_hessian_source,
+                    effective_hessian_source,
                     &ranges,
                     &s_lambdas,
                     joint_mode_diagonal_ridge,
@@ -2066,7 +2112,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     let constrained_path_active = search_joint_active_set.is_some();
                     if !tried_preconditioned_descent && !constrained_path_active {
                         match joint_preconditioned_descent_delta(
-                            &joint_hessian_source,
+                            effective_hessian_source,
                             &ranges,
                             &s_lambdas,
                             joint_solver_diagonal_ridge,
