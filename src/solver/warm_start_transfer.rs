@@ -16,7 +16,7 @@
 //! never fail a fit.
 
 use crate::solver::warm_start_artifact::{
-    FitArtifact, FitDescriptor, TermIdentityKey, TransferProvenance, RHO_SATURATION,
+    FitArtifact, FitDescriptor, RHO_SATURATION, TermIdentityKey, TransferProvenance,
 };
 use ndarray::Array1;
 
@@ -148,7 +148,11 @@ pub fn build_warm_start(
         }
 
         let mut copied_any = false;
-        for (slot, &parent_rho) in new_term.rho_slots.iter().zip(parent_term.rho_for_term.iter()) {
+        for (slot, &parent_rho) in new_term
+            .rho_slots
+            .iter()
+            .zip(parent_term.rho_for_term.iter())
+        {
             if *slot >= rho.len() {
                 // Out-of-range slot index: defensive skip (never panic).
                 continue;
@@ -185,8 +189,8 @@ pub fn build_warm_start(
 mod tests {
     use super::*;
     use crate::solver::warm_start_artifact::{
-        term_identity, GlobalFitSummary, ResponseSig, SerializableBasisMeta, TermArtifact, TermRole,
-        FIT_ARTIFACT_SCHEMA,
+        FIT_ARTIFACT_SCHEMA, GlobalFitSummary, ResponseSig, SerializableBasisMeta, TermArtifact,
+        TermRole, term_identity,
     };
     use crate::terms::basis::types::{BasisMetadata, DuchonNullspaceOrder};
     use ndarray::{Array1, Array2};

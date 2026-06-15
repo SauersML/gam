@@ -120,7 +120,9 @@ fn negative_binomial_generative_noise_uses_estimated_theta_not_seed() {
     };
     assert_eq!(theta.len(), N, "per-row theta must span all rows");
     assert!(
-        theta.iter().all(|&t| (t - theta_hat).abs() <= 1e-9 * theta_hat.max(1.0)),
+        theta
+            .iter()
+            .all(|&t| (t - theta_hat).abs() <= 1e-9 * theta_hat.max(1.0)),
         "NB generative noise draws at the seed theta=1, not the fitted theta_hat={theta_hat} \
          (#1124): Var would be mu+mu^2 instead of mu+mu^2/theta_hat"
     );

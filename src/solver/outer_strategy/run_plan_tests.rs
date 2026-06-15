@@ -335,13 +335,8 @@ fn certificate_does_not_false_flag_when_only_railed_coordinate_disagrees() {
          (artifact precondition): analytic={analytic_full} fd≈{fd_full_slope}",
     );
 
-    let cert = audit_at_railed_optimum(
-        &bounded,
-        theta_hat,
-        analytic_gradient,
-        value_slope_railed,
-    )
-    .expect("railed audit must still produce a certificate");
+    let cert = audit_at_railed_optimum(&bounded, theta_hat, analytic_gradient, value_slope_railed)
+        .expect("railed audit must still produce a certificate");
 
     assert_eq!(
         cert.lambdas_railed,
@@ -381,15 +376,15 @@ fn certificate_still_fires_on_genuine_interior_gradient_desync() {
     let analytic_gradient = array![0.0, -0.5]; // coord 0 wrong (should be 2.5)
     let value_slope_railed = 7.0;
 
-    let cert = audit_at_railed_optimum(
-        &bounded,
-        theta_hat,
-        analytic_gradient,
-        value_slope_railed,
-    )
-    .expect("railed audit must still produce a certificate");
+    let cert = audit_at_railed_optimum(&bounded, theta_hat, analytic_gradient, value_slope_railed)
+        .expect("railed audit must still produce a certificate");
 
-    assert_eq!(cert.lambdas_railed, vec![1], "coord 1 railed: {}", cert.summary());
+    assert_eq!(
+        cert.lambdas_railed,
+        vec![1],
+        "coord 1 railed: {}",
+        cert.summary()
+    );
     assert!(
         !cert.first_order_consistent(),
         "genuine interior (free-coordinate) desync was masked by the railed \

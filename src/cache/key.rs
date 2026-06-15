@@ -33,8 +33,7 @@ impl<'de> Deserialize<'de> for Fingerprint {
                 f.write_str("a 64-character hex-encoded SHA-256 fingerprint")
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Fingerprint, E> {
-                Fingerprint::from_hex(v)
-                    .ok_or_else(|| de::Error::custom("invalid hex fingerprint"))
+                Fingerprint::from_hex(v).ok_or_else(|| de::Error::custom("invalid hex fingerprint"))
             }
         }
         deserializer.deserialize_str(HexVisitor)

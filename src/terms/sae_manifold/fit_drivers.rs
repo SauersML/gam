@@ -1996,8 +1996,10 @@ impl SaeManifoldTerm {
             return Ok(());
         }
         let residual = self.reconstruction_residual(target, rho)?;
-        let basis_kinds: Vec<SaeAtomBasisKind> =
-            atoms.iter().map(|&a| self.atoms[a].basis_kind.clone()).collect();
+        let basis_kinds: Vec<SaeAtomBasisKind> = atoms
+            .iter()
+            .map(|&a| self.atoms[a].basis_kind.clone())
+            .collect();
         let dims: Vec<usize> = atoms.iter().map(|&a| self.atoms[a].latent_dim).collect();
         let seeded = sae_pca_seed_initial_coords(residual.view(), &basis_kinds, &dims)?;
         let n = self.n_obs();

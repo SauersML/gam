@@ -821,7 +821,10 @@ fn marginal_fitted_eta_sup_norm(design: &TermCollectionDesign, masked_beta: &Arr
 
 /// Build a copy of the marginal block β truncated to `design.design.ncols()`
 /// (drops any fixed-ridge absorber tail) so it can drive `X·β`.
-fn marginal_design_beta(design: &TermCollectionDesign, block_beta: ArrayView1<'_, f64>) -> Array1<f64> {
+fn marginal_design_beta(
+    design: &TermCollectionDesign,
+    block_beta: ArrayView1<'_, f64>,
+) -> Array1<f64> {
     let ncols = design.design.ncols();
     let mut masked = Array1::<f64>::zeros(ncols);
     let copy = ncols.min(block_beta.len());
@@ -1430,7 +1433,9 @@ mod runaway_tests {
         )
         .expect("separating |η|∞ at non-convergence must still trip the guard");
 
-        assert!(msg.contains("the inner solve failed while already carrying a separation-scale predictor"));
+        assert!(msg.contains(
+            "the inner solve failed while already carrying a separation-scale predictor"
+        ));
     }
 }
 

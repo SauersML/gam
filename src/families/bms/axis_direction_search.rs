@@ -2935,15 +2935,12 @@ impl BernoulliMarginalSlopeFamily {
                     // against this already-parallel chunk fan-out. The serial
                     // path above intentionally keeps top-level pool parallelism.
                     .map(|chunk| crate::faer_ndarray::with_nested_parallel(|| chunk_body(chunk)))
-                    .try_reduce(
-                    make_accs,
-                    |mut left, right| -> Result<_, String> {
+                    .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
                         for (l, r) in left.iter_mut().zip(right.iter()) {
                             l.add(r);
                         }
                         Ok(left)
-                    },
-                )?
+                    })?
             }
         } else {
             let row_body = |wr: WeightedOuterRow,
@@ -3795,86 +3792,90 @@ impl BernoulliMarginalSlopeFamily {
                     // intermittent `hessian_qp` stalls. Bit-identical: faer
                     // partitions the matmul output, never the contracted axis.
                     crate::faer_ndarray::with_nested_parallel(|| {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    let rows = end - start;
-                    // Zero-copy chunk binding: a materialised dense design lets us
-                    // borrow the chunk rows straight out of the stored matrix
-                    // (`Owned(None)` arm holds the owned fallback for sparse /
-                    // operator-backed designs). `try_row_chunk` would `.to_owned()`
-                    // a fresh `(rows × p)` `Array2` every chunk every inner cycle —
-                    // the `OwnedRepr<f64>` alloc/`drop_in_place` churn the cold
-                    // marginal-slope fit pays in its repeated ρ-homotopy / inner
-                    // Newton passes. The downstream `fast_atv` / `fast_xt_diag_x`
-                    // kernels are generic over the storage, so a borrowed view runs
-                    // identical BLAS-3 arithmetic — exact, just without the copy.
-                    let marginal_owned = match self.marginal_design.as_dense_ref() {
-                        Some(_) => None,
-                        None => Some(self.marginal_design.try_row_chunk(start..end).map_err(
-                            |e| format!("bernoulli marginal_design try_row_chunk: {e}"),
-                        )?),
-                    };
-                    let logslope_owned = match self.logslope_design.as_dense_ref() {
-                        Some(_) => None,
-                        None => Some(self.logslope_design.try_row_chunk(start..end).map_err(
-                            |e| format!("bernoulli logslope_design try_row_chunk: {e}"),
-                        )?),
-                    };
-                    let mut gm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                    let mut gl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                    let mut hm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                    let mut hl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                    let gm_w = &mut gm_w_buf[..rows];
-                    let gl_w = &mut gl_w_buf[..rows];
-                    let hm_w = &mut hm_w_buf[..rows];
-                    let hl_w = &mut hl_w_buf[..rows];
-                    for local_row in 0..rows {
-                        let row = start + local_row;
-                        let marginal_eta = block_states[0].eta[row];
-                        let marginal = self.marginal_link_map(marginal_eta)?;
-                        let g = block_states[1].eta[row];
-                        let (neglog, grad, h) = self.rigid_row_kernel_eval(row, marginal, g)?;
-                        ll -= neglog;
-                        gm_w[local_row] =
-                            Self::exact_newton_score_component_from_objective_gradient(grad[0]);
-                        gl_w[local_row] =
-                            Self::exact_newton_score_component_from_objective_gradient(grad[1]);
-                        hm_w[local_row] = h[0][0];
-                        hl_w[local_row] = h[1][1];
-                    }
-                    match (self.marginal_design.as_dense_ref(), &marginal_owned) {
-                        (Some(dense), _) => {
-                            let view = dense.slice(s![start..end, ..]);
-                            add_weighted_chunk_gradient(&view, gm_w, &mut gm);
-                            add_weighted_chunk_gram(&view, hm_w, &mut hm);
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        let rows = end - start;
+                        // Zero-copy chunk binding: a materialised dense design lets us
+                        // borrow the chunk rows straight out of the stored matrix
+                        // (`Owned(None)` arm holds the owned fallback for sparse /
+                        // operator-backed designs). `try_row_chunk` would `.to_owned()`
+                        // a fresh `(rows × p)` `Array2` every chunk every inner cycle —
+                        // the `OwnedRepr<f64>` alloc/`drop_in_place` churn the cold
+                        // marginal-slope fit pays in its repeated ρ-homotopy / inner
+                        // Newton passes. The downstream `fast_atv` / `fast_xt_diag_x`
+                        // kernels are generic over the storage, so a borrowed view runs
+                        // identical BLAS-3 arithmetic — exact, just without the copy.
+                        let marginal_owned = match self.marginal_design.as_dense_ref() {
+                            Some(_) => None,
+                            None => Some(self.marginal_design.try_row_chunk(start..end).map_err(
+                                |e| format!("bernoulli marginal_design try_row_chunk: {e}"),
+                            )?),
+                        };
+                        let logslope_owned = match self.logslope_design.as_dense_ref() {
+                            Some(_) => None,
+                            None => Some(self.logslope_design.try_row_chunk(start..end).map_err(
+                                |e| format!("bernoulli logslope_design try_row_chunk: {e}"),
+                            )?),
+                        };
+                        let mut gm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let mut gl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let mut hm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let mut hl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let gm_w = &mut gm_w_buf[..rows];
+                        let gl_w = &mut gl_w_buf[..rows];
+                        let hm_w = &mut hm_w_buf[..rows];
+                        let hl_w = &mut hl_w_buf[..rows];
+                        for local_row in 0..rows {
+                            let row = start + local_row;
+                            let marginal_eta = block_states[0].eta[row];
+                            let marginal = self.marginal_link_map(marginal_eta)?;
+                            let g = block_states[1].eta[row];
+                            let (neglog, grad, h) = self.rigid_row_kernel_eval(row, marginal, g)?;
+                            ll -= neglog;
+                            gm_w[local_row] =
+                                Self::exact_newton_score_component_from_objective_gradient(grad[0]);
+                            gl_w[local_row] =
+                                Self::exact_newton_score_component_from_objective_gradient(grad[1]);
+                            hm_w[local_row] = h[0][0];
+                            hl_w[local_row] = h[1][1];
                         }
-                        (None, Some(owned)) => {
-                            add_weighted_chunk_gradient(owned, gm_w, &mut gm);
-                            add_weighted_chunk_gram(owned, hm_w, &mut hm);
-                        }
-                        (None, None) => {
-                            return Err("bernoulli marginal chunk: owned fallback missing for \
+                        match (self.marginal_design.as_dense_ref(), &marginal_owned) {
+                            (Some(dense), _) => {
+                                let view = dense.slice(s![start..end, ..]);
+                                add_weighted_chunk_gradient(&view, gm_w, &mut gm);
+                                add_weighted_chunk_gram(&view, hm_w, &mut hm);
+                            }
+                            (None, Some(owned)) => {
+                                add_weighted_chunk_gradient(owned, gm_w, &mut gm);
+                                add_weighted_chunk_gram(owned, hm_w, &mut hm);
+                            }
+                            (None, None) => {
+                                return Err(
+                                    "bernoulli marginal chunk: owned fallback missing for \
                                  non-dense design"
-                                .to_string());
+                                        .to_string(),
+                                );
+                            }
                         }
-                    }
-                    match (self.logslope_design.as_dense_ref(), &logslope_owned) {
-                        (Some(dense), _) => {
-                            let view = dense.slice(s![start..end, ..]);
-                            add_weighted_chunk_gradient(&view, gl_w, &mut gl);
-                            add_weighted_chunk_gram(&view, hl_w, &mut hl);
-                        }
-                        (None, Some(owned)) => {
-                            add_weighted_chunk_gradient(owned, gl_w, &mut gl);
-                            add_weighted_chunk_gram(owned, hl_w, &mut hl);
-                        }
-                        (None, None) => {
-                            return Err("bernoulli logslope chunk: owned fallback missing for \
+                        match (self.logslope_design.as_dense_ref(), &logslope_owned) {
+                            (Some(dense), _) => {
+                                let view = dense.slice(s![start..end, ..]);
+                                add_weighted_chunk_gradient(&view, gl_w, &mut gl);
+                                add_weighted_chunk_gram(&view, hl_w, &mut hl);
+                            }
+                            (None, Some(owned)) => {
+                                add_weighted_chunk_gradient(owned, gl_w, &mut gl);
+                                add_weighted_chunk_gram(owned, hl_w, &mut hl);
+                            }
+                            (None, None) => {
+                                return Err(
+                                    "bernoulli logslope chunk: owned fallback missing for \
                                  non-dense design"
-                                .to_string());
+                                        .to_string(),
+                                );
+                            }
                         }
-                    }
-                    Ok((ll, gm, gl, hm, hl))
+                        Ok((ll, gm, gl, hm, hl))
                     })
                 },
             )

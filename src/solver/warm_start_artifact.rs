@@ -205,7 +205,10 @@ fn absorb_basis_structure(fp: &mut Fingerprinter, basis: &BasisMetadata) {
                 fp.absorb_u64(b"periodic", u64::from(p.is_some()));
             }
         }
-        BasisMetadata::SphereHarmonics { max_degree, radians } => {
+        BasisMetadata::SphereHarmonics {
+            max_degree,
+            radians,
+        } => {
             fp.absorb_str(b"basis-kind", "sphere_harmonics");
             fp.absorb_u64(b"max_degree", *max_degree as u64);
             fp.absorb_u64(b"radians", u64::from(*radians));
@@ -219,7 +222,10 @@ fn absorb_basis_structure(fp: &mut Fingerprinter, basis: &BasisMetadata) {
             fp.absorb_str(b"basis-kind", "by_smooth");
             fp.absorb_u64(b"by_col", *by_col as u64);
             fp.absorb_u64(b"ordered", u64::from(*ordered));
-            fp.absorb_u64(b"n_levels", levels.as_ref().map(|l| l.len() as u64).unwrap_or(0));
+            fp.absorb_u64(
+                b"n_levels",
+                levels.as_ref().map(|l| l.len() as u64).unwrap_or(0),
+            );
             absorb_basis_structure(fp, inner);
         }
         BasisMetadata::FactorSmooth {
@@ -599,7 +605,10 @@ mod tests {
         let vars = vec!["x".to_string(), "y".to_string()];
         let ka = term_identity(TermRole::Mean, &vars, &a);
         let kb = term_identity(TermRole::Mean, &vars, &b);
-        assert_eq!(ka, kb, "differing center coordinates must not split identity");
+        assert_eq!(
+            ka, kb,
+            "differing center coordinates must not split identity"
+        );
     }
 
     #[test]
@@ -716,11 +725,17 @@ mod tests {
         };
         assert!(artifact.is_usable());
         artifact.terms[0].raw_beta[2] = f64::NAN;
-        assert!(!artifact.is_usable(), "non-finite β must fail the usable guard");
+        assert!(
+            !artifact.is_usable(),
+            "non-finite β must fail the usable guard"
+        );
 
         artifact.terms[0].raw_beta[2] = 0.3;
         artifact.global.outer_objective = f64::INFINITY;
-        assert!(!artifact.is_usable(), "non-finite objective must fail the usable guard");
+        assert!(
+            !artifact.is_usable(),
+            "non-finite objective must fail the usable guard"
+        );
     }
 
     #[test]

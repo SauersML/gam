@@ -2539,9 +2539,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // full rejection by the likelihood path at a collapsed trust
                 // radius is the same numerically-flat-no-descent stall as a
                 // full objective rejection; counting either lets the guard fire.
-                let all_attempts_rejected = model_rejects
-                    + likelihood_rejects
-                    + objective_rejects
+                let all_attempts_rejected = model_rejects + likelihood_rejects + objective_rejects
                     == JOINT_TRUST_MAX_ATTEMPTS;
                 let radius_held_since_last_reject = match prev_rejected_trust_radius {
                     Some(prev) => {

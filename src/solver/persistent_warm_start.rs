@@ -370,8 +370,8 @@ fn unix_secs_now() -> u64 {
 mod warm_start_artifact_tests {
     use super::*;
     use crate::solver::warm_start_artifact::{
-        term_identity, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
-        SerializableBasisMeta, TermArtifact, TermRole, FIT_ARTIFACT_SCHEMA,
+        FIT_ARTIFACT_SCHEMA, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
+        SerializableBasisMeta, TermArtifact, TermRole, term_identity,
     };
     use crate::terms::basis::types::{BasisMetadata, DuchonNullspaceOrder};
     use ndarray::Array2;
@@ -466,7 +466,10 @@ mod warm_start_artifact_tests {
         // must equal the full-data key, so the load hits the stored artifact.
         let fold = sample_artifact(&family, "x", vec![1.7]);
         let fold_key = fold.descriptor.descriptor_key().to_hex();
-        assert_eq!(full_key, fold_key, "fold and full descriptor keys must match");
+        assert_eq!(
+            full_key, fold_key,
+            "fold and full descriptor keys must match"
+        );
 
         if persistent_store().is_none() {
             return;

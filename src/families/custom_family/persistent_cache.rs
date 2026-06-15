@@ -27,12 +27,12 @@ use std::any::type_name;
 use std::sync::atomic::Ordering;
 
 use crate::solver::warm_start_artifact::{
-    term_identity_from_block, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
+    FIT_ARTIFACT_SCHEMA, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
     RowPopulationTag, SerializableBasisMeta, TermArtifact, TermIdentityKey, TermRole,
-    FIT_ARTIFACT_SCHEMA,
+    term_identity_from_block,
 };
 use crate::solver::warm_start_transfer::{
-    build_warm_start, TermBuildContext, TransferConfig, TransferProvenance,
+    TermBuildContext, TransferConfig, TransferProvenance, build_warm_start,
 };
 
 /// Build the structural identity of each block at the fit-spec layer. The
@@ -191,8 +191,7 @@ pub(crate) fn consume_fit_artifact_rho<F: CustomFamily + ?Sized>(
     let (n_rows, _names, _dims) = custom_family_cache_shape(specs);
     let descriptor = descriptor_for(specs, family_kind, n_rows);
     let key_hex = descriptor.descriptor_key().to_hex();
-    let parent =
-        crate::solver::persistent_warm_start::load_fit_artifact_by_descriptor(&key_hex)?;
+    let parent = crate::solver::persistent_warm_start::load_fit_artifact_by_descriptor(&key_hex)?;
 
     let slots = per_block_rho_slots(specs, physical_to_outer);
     let new_terms: Vec<TermBuildContext> = specs
