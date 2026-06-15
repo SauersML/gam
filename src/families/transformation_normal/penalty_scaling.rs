@@ -87,20 +87,41 @@ pub(crate) fn factored_weighted_cross(
     let pd = d.ncols();
 
     let mut out = Array2::<f64>::zeros((pa * pb, pc * pd));
-    let mut pair_weights = Array1::<f64>::zeros(n);
 
-    for ia in 0..pa {
-        let a_col = a.column(ia);
-        for ic in 0..pc {
-            let c_col = c.column(ic);
-            for r in 0..n {
-                pair_weights[r] = weights[r] * a_col[r] * c_col[r];
-            }
-            let block = chunked_weighted_bt_d(b, pair_weights.view(), d, policy);
-            let mut slice = out.slice_mut(s![ia * pb..(ia + 1) * pb, ic * pd..(ic + 1) * pd]);
-            slice.assign(&block);
-        }
-    }
+    // The weighted Gram of a rowwise-Kronecker (te(x,z)) design is the `pa × pc`
+    // grid of independent `pb × pd` blocks `B^T diag(w · A_{·,ia} · C_{·,ic}) D`.
+    // Each block streams all `n` rows, so on a tensor smooth with modest marginal
+    // bases (te(x,z,k=7) ⇒ pb,pd ≈ 6) the per-block GEMM is tiny while the grid
+    // has `pa·pc` ≈ 36–49 fully independent entries — the prior serial double
+    // loop left every core but one idle and paid faer's parallel-dispatch
+    // overhead on each tiny block. Fan the OUTER `ia` rows across the Rayon pool:
+    // block `(ia, ic)` lands in output rows `ia·pb..` and never overlaps another
+    // `ia`, so `axis_chunks_iter_mut` hands each task a disjoint `pb`-row band —
+    // no unsafe, no shared writes. `with_nested_parallel` pins the inner
+    // `chunked_weighted_bt_d` GEMM to `Par::Seq` so the row fan-out does not
+    // multiply against the faer pool (gam#1082).
+    use crate::faer_ndarray::with_nested_parallel;
+    use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+
+    out.axis_chunks_iter_mut(ndarray::Axis(0), pb.max(1))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(ia, mut row_band)| {
+            with_nested_parallel(|| {
+                let a_col = a.column(ia);
+                let mut pair_weights = Array1::<f64>::zeros(n);
+                for ic in 0..pc {
+                    let c_col = c.column(ic);
+                    for r in 0..n {
+                        pair_weights[r] = weights[r] * a_col[r] * c_col[r];
+                    }
+                    let block = chunked_weighted_bt_d(b, pair_weights.view(), d, policy);
+                    row_band
+                        .slice_mut(s![.., ic * pd..(ic + 1) * pd])
+                        .assign(&block);
+                }
+            });
+        });
 
     Ok(out)
 }
