@@ -1868,6 +1868,144 @@ pub fn rrqr_with_permutation<S: Data<Elem = f64>>(
     })
 }
 
+/// Result of a Gram-driven column-pivoted RRQR (see
+/// [`rrqr_from_gram_with_permutation`]). Carries the same rank / permutation /
+/// tolerance as [`RrqrWithPermutation`], plus a `verdict_margin` that measures
+/// how unambiguous the rank cut is — the ratio between the smallest *kept*
+/// pivot and the rank tolerance. A large margin means squaring the design into
+/// a Gram could not have flipped any rank decision; a small margin means the
+/// verdict sits near the cliff and the caller should re-confirm on the full
+/// (un-squared) design to stay bit-exact.
+pub struct RrqrFromGram {
+    pub rank: usize,
+    pub column_permutation: Vec<usize>,
+    pub rank_tol: f64,
+    /// Leading pivot magnitude `|R[0,0]|` of the square-root factor — equal to
+    /// the largest column norm of the original tall design (col-piv QR pivots the
+    /// largest-norm column first), so it matches the tall path's
+    /// `RrqrWithPermutation::leading_diag_abs`.
+    pub leading_diag_abs: f64,
+    /// `min_kept_pivot / rank_tol` (∞ when full rank with no kept pivot below
+    /// tol, i.e. every pivot is comfortably above; `0` when rank is 0).
+    pub verdict_margin: f64,
+}
+
+/// Column-pivoted rank-revealing QR computed from the design's `p × p` Gram
+/// `G = AᵀA` (or penalty-augmented `AᵀA + SᵀS`) instead of from the tall
+/// `m × p` design itself.
+///
+/// # Why this is exact (in exact arithmetic)
+///
+/// Column-pivoted QR selects, at each step, the not-yet-pivoted column with the
+/// largest residual norm, where the residual is the part orthogonal to the
+/// already-chosen columns. Those residual norms — and the resulting pivot
+/// sequence, the diagonal magnitudes `|R[i,i]|`, and hence the rank cut — are a
+/// function of the column *inner products* only, i.e. of the Gram `G`. Running
+/// col-piv QR on the Cholesky factor `R₀` of `G` (`R₀ᵀR₀ = G`, `R₀` is `p × p`)
+/// reproduces the identical pivot order and identical `|R[i,i]|` as col-piv QR
+/// on the original `m × p` matrix, because both see the same column geometry.
+/// This is the standard "pivoted QR depends only on the Gram" identity and lets
+/// the joint identifiability rank verdict run in `O(p³)` instead of streaming
+/// all `m ≈ 2·10⁵` rows again.
+///
+/// # Tolerance
+///
+/// The rank cutoff must match what the tall-matrix [`rrqr_with_permutation`]
+/// would have used, so the caller passes `m_rows` (the row count of the
+/// original tall design, including any appended penalty rows). The tolerance is
+/// `rank_alpha · eps · max(m_rows, p) · max(|R[0,0]|, 1)` — bit-identical to the
+/// tall path, since `|R[0,0]|` (the leading pivot magnitude = largest column
+/// norm) is the same in both factorizations.
+///
+/// # Finite-precision guard
+///
+/// Forming `G = AᵀA` squares the condition number, so a rank decision that sits
+/// right at the tolerance cliff could in principle flip. The returned
+/// `verdict_margin` lets the caller detect that case and fall back to the exact
+/// tall RRQR; in the overwhelmingly common well-separated case (full column
+/// rank, smallest pivot orders of magnitude above tol) the margin is huge and
+/// no fallback is needed.
+pub fn rrqr_from_gram_with_permutation<S: Data<Elem = f64>>(
+    gram: &ArrayBase<S, Ix2>,
+    m_rows: usize,
+    rank_alpha: f64,
+) -> Result<RrqrFromGram, FaerLinalgError> {
+    let p = gram.ncols();
+    if p == 0 {
+        return Ok(RrqrFromGram {
+            rank: 0,
+            column_permutation: Vec::new(),
+            rank_tol: 0.0,
+            leading_diag_abs: 0.0,
+            verdict_margin: 0.0,
+        });
+    }
+    if gram.nrows() != p {
+        return Err(FaerLinalgError::FactorizationFailed {
+            context: "rrqr_from_gram_with_permutation: Gram is not square",
+        });
+    }
+    // Symmetric square-root factor F (p×p) with FᵀF = G. The Gram is PSD by
+    // construction (AᵀA), so its eigendecomposition G = V·diag(λ)·Vᵀ gives the
+    // factor F = diag(√λ₊)·Vᵀ (rows indexed by eigenpair, columns by original
+    // design column). Any factor with FᵀF = G reproduces the same column
+    // geometry, which is all col-piv QR consumes — we use the eigen square root
+    // rather than a bare Cholesky because Cholesky fails on the numerically
+    // semidefinite Gram that is exactly the rank-deficient case we must classify.
+    // Tiny-negative eigenvalues from finite precision are clamped to zero.
+    let (evals, evecs) = gram.eigh(Side::Lower)?;
+    let mut f = Array2::<f64>::zeros((p, p));
+    for k in 0..p {
+        let scale = evals[k].max(0.0).sqrt();
+        if scale == 0.0 {
+            continue;
+        }
+        for i in 0..p {
+            f[[k, i]] = scale * evecs[[i, k]];
+        }
+    }
+    // Single col-piv QR on F. Its pivot order, per-pivot |R[i,i]| magnitudes,
+    // and leading pivot equal those of col-piv QR on the original tall design
+    // (FᵀF = G), so this reproduces the exact tall-path geometry.
+    let faer_f = FaerArrayView::new(&f);
+    let qr = faer_f.as_ref().col_piv_qr();
+    let r = qr.thin_R();
+    let diag_len = r.nrows().min(r.ncols());
+    let pivots: Vec<f64> = (0..diag_len).map(|i| r[(i, i)].abs()).collect();
+    let leading_diag = pivots.first().copied().unwrap_or(0.0);
+    let (forward, _inverse) = qr.P().arrays();
+    let column_permutation: Vec<usize> =
+        forward.iter().copied().map(|idx| idx.unbound()).collect();
+    // Re-scale the tolerance from F's `max(p, p)=p` row dimension to the
+    // original tall design's `max(m_rows, p)`, keeping the rank cut bit-
+    // identical to what the tall [`rrqr_with_permutation`] would have produced.
+    let tol =
+        rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag.max(1.0);
+    let rank = pivots.iter().filter(|&&v| v > tol).count();
+    let min_kept = pivots[..rank].iter().copied().fold(f64::INFINITY, f64::min);
+    let max_dropped = pivots[rank..]
+        .iter()
+        .copied()
+        .fold(0.0f64, f64::max);
+    // Margin: how far the verdict is from the cliff. Use the smaller of
+    // (min_kept / tol) and (tol / max_dropped) so a near-tol dropped pivot also
+    // shrinks the margin. A margin ≫ 1 means no rank decision could flip.
+    let kept_margin = if rank == 0 { f64::INFINITY } else { min_kept / tol };
+    let dropped_margin = if rank == diag_len {
+        f64::INFINITY
+    } else {
+        tol / max_dropped.max(f64::MIN_POSITIVE)
+    };
+    let verdict_margin = kept_margin.min(dropped_margin);
+    Ok(RrqrFromGram {
+        rank,
+        column_permutation,
+        rank_tol: tol,
+        leading_diag_abs: leading_diag,
+        verdict_margin,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
