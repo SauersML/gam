@@ -1202,16 +1202,21 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
 
     fn hessian_dense_forced(&self) -> Result<Option<Array2<f64>>, String> {
         // Callers that genuinely require a dense joint Hessian (e.g. outer
-        // batched-gradient assembly that pulls back the dense `H_β`) bypass
-        // the matrix-free route gate above. The fused row pass is still the
-        // structural direct-dense path here — column-basis HVP fallback would
-        // be `total` extra row sweeps, which is exactly what the matrix-free
-        // inner solver is designed to amortize across far fewer iterations.
-        if self.cache.slices.total >= 512 {
-            return Ok(None);
-        }
-        // Block 9 Phase 6 shortcut: when the row-primary Hessian is already
-        // pinned on the GPU and `p_total` fits the dense-block kernel's
+        // batched-gradient assembly that pulls back the dense `H_β`, or the LAML
+        // logdet factorization in `MatrixFreeSpdOperator::materialize_dense_
+        // operator`) bypass the matrix-free route gate above. The fused row pass
+        // is the structural direct-dense path here: it streams every row exactly
+        // ONCE and uses BLAS-3 for the `XᵀWX` pullback — O(n·p²) total. The only
+        // alternative for a consumer that needs the full dense matrix is
+        // canonical-basis reconstruction `H·I`, which re-walks all `n` rows once
+        // per column = `total` full-n passes = O(total·n·p). One pass beats
+        // `total` passes at every scale, so there is NO size at which the matvec
+        // reconstruction wins; the previous `total >= 512` early-return forced
+        // exactly that losing path for the large-p outer logdet (the biobank BMS
+        // rigid/flex fit at p in the hundreds). The matrix-free INNER solve never
+        // calls `hessian_dense_forced` (it pulls HVPs through `hessian_matvec`),
+        // so serving the structural one-pass build here does not regress the
+        // inner solve it was designed to keep matrix-free.
         // shared-memory cap, dispatch the device-resident dense build
         // instead of round-tripping through the CPU fused gradient pass.
         // Numerics match the CPU pullback to within reduction-order f.p.

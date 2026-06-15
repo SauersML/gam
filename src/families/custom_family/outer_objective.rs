@@ -7426,13 +7426,59 @@ pub(crate) fn joint_outer_evaluate(
                             pseudo_logdet_mode,
                         ))
                     }
-                    JointHessianSource::Operator { apply, .. } => {
+                    JointHessianSource::Operator {
+                        apply, dense_forced, ..
+                    } => {
                         let apply_h = Arc::clone(apply);
                         let apply_ranges = ranges_vec.clone();
                         let apply_s = Arc::clone(&s_lambdas);
                         let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
                         let hphi_scale = rho_curvature_scale;
-                        Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                        // Single-pass dense assembly of the SAME penalized
+                        // operator `H_unpen + S_λ + scale·H_Φ`. When the
+                        // operator source can structurally build its full dense
+                        // `H_unpen` in one chunked BLAS-3 `XᵀWX` row pass
+                        // (`dense_forced`), the LAML logdet factorization assembles
+                        // it once here and adds the penalty/Jeffreys terms in
+                        // O(p²) — instead of `total` canonical-basis matvecs, each
+                        // a full n-row pass through `apply_h`. The matvec closure
+                        // below is the exact same algebra column-for-column, so the
+                        // materialized dense operator (and its logdet) are
+                        // numerically identical; the direct build is preferred only
+                        // when `dense_forced` actually yields a matrix.
+                        let dense_forced = Arc::clone(dense_forced);
+                        let dense_ranges = ranges_vec.clone();
+                        let dense_s = Arc::clone(&s_lambdas);
+                        let dense_hphi = robust_jeffreys_hphi_for_operator.clone();
+                        let dense_assemble: Arc<
+                            dyn Fn() -> Option<Array2<f64>> + Send + Sync,
+                        > = Arc::new(move || {
+                            let mut matrix = match dense_forced() {
+                                Ok(Some(matrix)) => matrix,
+                                Ok(None) => return None,
+                                Err(error) => {
+                                    log::warn!(
+                                        "joint exact-newton dense_forced failed during outer logdet materialization: {error}"
+                                    );
+                                    return None;
+                                }
+                            };
+                            if matrix.nrows() != total || matrix.ncols() != total {
+                                return None;
+                            }
+                            add_joint_penalty_to_matrix(
+                                &mut matrix,
+                                &dense_ranges,
+                                dense_s.as_ref(),
+                                trace_diagonal_ridge,
+                                None,
+                            );
+                            if let Some(hphi) = dense_hphi.as_ref() {
+                                matrix.scaled_add(hphi_scale, hphi);
+                            }
+                            Some(matrix)
+                        });
+                        Arc::new(MatrixFreeSpdOperator::new_with_mode_and_dense_assemble(
                             total,
                             move |v| {
                                 let mut out = match apply_h(v) {
@@ -7459,6 +7505,7 @@ pub(crate) fn joint_outer_evaluate(
                                 out
                             },
                             pseudo_logdet_mode,
+                            Some(dense_assemble),
                         ))
                     }
                 }
@@ -7768,11 +7815,46 @@ pub(crate) fn joint_outer_evaluate_efs(
                         pseudo_logdet_mode,
                     ))
                 }
-                JointHessianSource::Operator { apply, .. } => {
+                JointHessianSource::Operator {
+                    apply, dense_forced, ..
+                } => {
                     let apply_h = Arc::clone(apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                    // Single-pass dense assembly of the SAME penalized operator
+                    // `H_unpen + S_λ` (this fixed-point path carries no Jeffreys
+                    // term). One chunked BLAS-3 `XᵀWX` row pass via `dense_forced`
+                    // replaces `total` full-n canonical-basis matvecs for the LAML
+                    // logdet factorization; numerically identical to the matvec
+                    // reconstruction below.
+                    let dense_forced = Arc::clone(dense_forced);
+                    let dense_ranges = ranges_vec.clone();
+                    let dense_s = Arc::clone(&s_lambdas);
+                    let dense_assemble: Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync> =
+                        Arc::new(move || {
+                            let mut matrix = match dense_forced() {
+                                Ok(Some(matrix)) => matrix,
+                                Ok(None) => return None,
+                                Err(error) => {
+                                    log::warn!(
+                                        "joint exact-newton dense_forced failed during fixed-point logdet materialization: {error}"
+                                    );
+                                    return None;
+                                }
+                            };
+                            if matrix.nrows() != total || matrix.ncols() != total {
+                                return None;
+                            }
+                            add_joint_penalty_to_matrix(
+                                &mut matrix,
+                                &dense_ranges,
+                                dense_s.as_ref(),
+                                trace_diagonal_ridge,
+                                None,
+                            );
+                            Some(matrix)
+                        });
+                    Arc::new(MatrixFreeSpdOperator::new_with_mode_and_dense_assemble(
                         total,
                         move |v| {
                             let mut out = match apply_h(v) {
@@ -7795,6 +7877,7 @@ pub(crate) fn joint_outer_evaluate_efs(
                             out
                         },
                         pseudo_logdet_mode,
+                        Some(dense_assemble),
                     ))
                 }
             }

@@ -1042,6 +1042,19 @@ impl HessianOperator for BlockCoupledOperator {
 /// `DenseSpectralOperator`.
 pub struct MatrixFreeSpdOperator {
     pub(crate) apply: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    // Optional single-pass dense assembly of the SAME penalized operator that
+    // `apply` realizes matrix-free, i.e. `H_unpen + S_λ + scale·H_Φ`. When the
+    // operator source can structurally build its full dense matrix in one
+    // chunked BLAS-3 `XᵀWX` row pass (BMS's `hessian_dense_forced` +
+    // construction-site penalty/Jeffreys assembly), `materialize_dense_operator`
+    // calls THIS instead of `dim` canonical-basis matvecs — each of which is a
+    // full n-row pass through the matrix-free operator. One n-pass replaces
+    // `dim` n-passes for the LAML logdet factorization. The closure must return
+    // a matrix numerically identical (up to symmetrization) to the matvec
+    // reconstruction `H·I`; `None` means no direct build is available and the
+    // matvec path is used (the result is bit-for-bit the prior behavior).
+    pub(crate) dense_assemble:
+        Option<Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync>>,
     pub(crate) cached_logdet: crate::resource::RayonSafeOnce<f64>,
     pub(crate) n_dim: usize,
     // `RayonSafeOnce`, not `OnceLock`: `materialize_dense_operator` invokes
@@ -1073,10 +1086,27 @@ impl MatrixFreeSpdOperator {
     where
         F: Fn(&Array1<f64>) -> Array1<f64> + Send + Sync + 'static,
     {
+        Self::new_with_mode_and_dense_assemble(dim, apply, mode, None)
+    }
+
+    /// Like [`new_with_mode`], but additionally accepts an optional single-pass
+    /// dense assembly of the same penalized operator. When present and it yields
+    /// a matrix, `materialize_dense_operator` uses it instead of the `dim`
+    /// canonical-basis matvecs. See the field doc on `dense_assemble`.
+    pub fn new_with_mode_and_dense_assemble<F>(
+        dim: usize,
+        apply: F,
+        mode: PseudoLogdetMode,
+        dense_assemble: Option<Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync>>,
+    ) -> Self
+    where
+        F: Fn(&Array1<f64>) -> Array1<f64> + Send + Sync + 'static,
+    {
         let apply = Arc::new(apply);
 
         Self {
             apply,
+            dense_assemble,
             cached_logdet: crate::resource::RayonSafeOnce::new(),
             n_dim: dim,
             dense_spectral: crate::resource::RayonSafeOnce::new(),
@@ -1119,29 +1149,60 @@ impl MatrixFreeSpdOperator {
             return None;
         }
         let materialize_start = std::time::Instant::now();
-        let mut matrix = Array2::<f64>::zeros((self.n_dim, self.n_dim));
-        let mut basis = Array1::<f64>::zeros(self.n_dim);
-        for j in 0..self.n_dim {
-            basis[j] = 1.0;
-            let col = (self.apply)(&basis);
-            basis[j] = 0.0;
-            if col.len() != self.n_dim || !col.iter().all(|v| v.is_finite()) {
-                return None;
+        // Fast path: structural single-pass dense assembly of the SAME penalized
+        // operator (`H_unpen + S_λ + scale·H_Φ`). One chunked BLAS-3 `XᵀWX`
+        // row pass replaces `n_dim` canonical-basis matvecs, each a full n-row
+        // pass through the matrix-free operator. The matvec fallback below is the
+        // exact same algebra column-for-column, so the spectrum/logdet match.
+        let (matrix, matvec_count) = match self
+            .dense_assemble
+            .as_ref()
+            .and_then(|assemble| assemble())
+        {
+            Some(mut direct)
+                if direct.nrows() == self.n_dim
+                    && direct.ncols() == self.n_dim
+                    && direct.iter().all(|v| v.is_finite()) =>
+            {
+                // Symmetrize defensively; the direct build is structurally
+                // symmetric but reduction-order f.p. noise can desync mirror
+                // entries, exactly as the matvec path symmetrizes below.
+                for i in 0..self.n_dim {
+                    for j in (i + 1)..self.n_dim {
+                        let avg = 0.5 * (direct[[i, j]] + direct[[j, i]]);
+                        direct[[i, j]] = avg;
+                        direct[[j, i]] = avg;
+                    }
+                }
+                (direct, 0usize)
             }
-            matrix.column_mut(j).assign(&col);
-        }
-        for i in 0..self.n_dim {
-            for j in (i + 1)..self.n_dim {
-                let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
-                matrix[[i, j]] = avg;
-                matrix[[j, i]] = avg;
+            _ => {
+                let mut matrix = Array2::<f64>::zeros((self.n_dim, self.n_dim));
+                let mut basis = Array1::<f64>::zeros(self.n_dim);
+                for j in 0..self.n_dim {
+                    basis[j] = 1.0;
+                    let col = (self.apply)(&basis);
+                    basis[j] = 0.0;
+                    if col.len() != self.n_dim || !col.iter().all(|v| v.is_finite()) {
+                        return None;
+                    }
+                    matrix.column_mut(j).assign(&col);
+                }
+                for i in 0..self.n_dim {
+                    for j in (i + 1)..self.n_dim {
+                        let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
+                        matrix[[i, j]] = avg;
+                        matrix[[j, i]] = avg;
+                    }
+                }
+                (matrix, self.n_dim)
             }
-        }
+        };
         let result = DenseSpectralOperator::from_symmetric_with_mode(&matrix, self.mode).ok();
         log::info!(
             "[STAGE] matrix_free_spd materialize n_dim={} matvec_count={} elapsed={:.3}s",
             self.n_dim,
-            self.n_dim,
+            matvec_count,
             materialize_start.elapsed().as_secs_f64(),
         );
         result
