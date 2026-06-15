@@ -1549,6 +1549,27 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         want_gradient: bool,
     ) -> Result<Option<AloStabilizationEval>, EstimationError> {
+        // ρ-posterior sampling suppression (#979). The ALO-stabilization
+        // augmentation is an OUTER-OPTIMIZER aid (#813/#821): a leverage barrier
+        // that keeps the smoothing-parameter search off pathological high-
+        // leverage λ regions. The marginal smoothing-parameter posterior
+        // `π(ρ|y) ∝ exp(−LAML(ρ))` (#938) is a property of the genuine model
+        // criterion, and its Laplace proposal is built from the BASE REML
+        // Hessian (the augmentation's curvature term is dropped as dead, see
+        // `apply_alo_stabilization_to_result`). Evaluating the augmented cost
+        // while sampling therefore drives a target inconsistent with its own
+        // proposal AND pays the full ALO diagnostic suite on every leapfrog
+        // step — the dominant cost of `compute_inference` on poorly-identified ρ
+        // posteriors. Suppressing the augmentation during the certificate /
+        // NUTS evaluations (`without_alo_stabilization`) restores proposal↔target
+        // consistency and removes that cost.
+        if self
+            .alo_stabilization_suppression
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            return Ok(None);
+        }
         if self.config.firth_bias_reduction
             || !matches!(
                 self.config.likelihood.spec.response,

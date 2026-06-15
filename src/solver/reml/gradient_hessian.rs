@@ -3616,6 +3616,7 @@ impl<'a> RemlState<'a> {
             analytic_penalty_registry_fingerprint: 0,
             persistent_warm_start_loaded: AtomicBool::new(false),
             persistent_warm_start_store_suppression: AtomicUsize::new(0),
+            alo_stabilization_suppression: AtomicUsize::new(0),
             persistent_warm_start_disk_enabled: AtomicBool::new(false),
         })
     }
@@ -4687,6 +4688,30 @@ impl<'a> RemlState<'a> {
         self.persistent_warm_start_store_suppression
             .fetch_add(1, Ordering::Relaxed);
         let guard = StoreSuppressionGuard(&self.persistent_warm_start_store_suppression);
+        let out = f();
+        drop(guard);
+        out
+    }
+
+    /// Run `f` with the Gaussian-identity ALO-stabilization augmentation
+    /// disabled (#979). Used to evaluate the genuine LAML criterion during
+    /// ρ-posterior certificate / NUTS sampling, where the optimizer-stability
+    /// leverage barrier (#813/#821) is both inappropriate (it is not part of the
+    /// marginal posterior, whose Laplace proposal uses the base REML Hessian)
+    /// and ruinously expensive (its full ALO diagnostic suite would run on every
+    /// leapfrog step). Re-entrant via a counter, like
+    /// [`Self::without_persistent_warm_start_store`].
+    pub(crate) fn without_alo_stabilization<T>(&self, f: impl FnOnce() -> T) -> T {
+        struct AloSuppressionGuard<'a>(&'a AtomicUsize);
+        impl Drop for AloSuppressionGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        self.alo_stabilization_suppression
+            .fetch_add(1, Ordering::Relaxed);
+        let guard = AloSuppressionGuard(&self.alo_stabilization_suppression);
         let out = f();
         drop(guard);
         out

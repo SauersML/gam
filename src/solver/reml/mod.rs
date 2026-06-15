@@ -4754,6 +4754,16 @@ pub(crate) struct RemlState<'a> {
     /// evaluations. In-memory warm starts still update; only JSON/bin
     /// persistence and eviction sweeps are suppressed.
     pub(crate) persistent_warm_start_store_suppression: AtomicUsize,
+    /// Scoped counter disabling the Gaussian-identity ALO-stabilization
+    /// augmentation (#979). The leverage barrier `Σ_i (h_i − τ)₊²` is an OUTER
+    /// OPTIMIZER aid (#813/#821) that keeps the smoothing-parameter search off
+    /// pathological high-leverage λ regions. The marginal smoothing-parameter
+    /// posterior `π(ρ|y) ∝ exp(−LAML(ρ))` (#938) is a property of the genuine
+    /// model criterion, sampled against a Laplace proposal built from the BASE
+    /// REML Hessian, so the certificate / NUTS evaluations suppress the
+    /// augmentation (see `without_alo_stabilization`) — both for proposal↔target
+    /// consistency and to drop the per-leapfrog ALO diagnostic suite.
+    pub(crate) alo_stabilization_suppression: AtomicUsize,
     /// Whether the cross-process ON-DISK warm-start layer is engaged at all.
     ///
     /// Default `false`: the optimizer's IN-MEMORY warm start (the actual

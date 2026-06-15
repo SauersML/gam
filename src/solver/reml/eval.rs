@@ -568,30 +568,47 @@ impl<'a> RemlState<'a> {
         if final_rho.is_empty() {
             return (None, None);
         }
-        let Ok(outer_hessian) = self.compute_lamlhessian_consistent(final_rho) else {
+        // The Laplace proposal Hessian must be the same base-criterion curvature
+        // the suppressed sampling target uses (#979); the ALO-stabilization term
+        // contributes no curvature anyway (dropped as dead), so this only keeps
+        // the proposal and target derived from one consistent criterion.
+        let Ok(outer_hessian) =
+            self.without_alo_stabilization(|| self.compute_lamlhessian_consistent(final_rho))
+        else {
             return (None, None);
         };
-        let certificate = rho_posterior_certificate(
-            final_rho,
-            &outer_hessian,
-            |rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
-            n_samples,
-        );
-        let escalation = match certificate.as_ref().map(|c| c.certificate) {
-            Some(RhoCertificate::Escalate) => Some(escalate_rho_posterior(
+        // The certificate and the Tier-2 NUTS escalation both sample the genuine
+        // marginal criterion `π(ρ|y) ∝ exp(−LAML(ρ))`. The Gaussian-identity
+        // ALO-stabilization augmentation is suppressed throughout (#979): it is
+        // an outer-optimizer leverage barrier (#813/#821), not part of the
+        // marginal posterior — whose Laplace proposal here (`outer_hessian`) is
+        // the BASE REML Hessian — and its full per-evaluation ALO diagnostic
+        // suite would otherwise dominate the thousands of leapfrog evaluations.
+        let certificate = self.without_alo_stabilization(|| {
+            rho_posterior_certificate(
                 final_rho,
                 &outer_hessian,
                 |rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
-                |rho| {
-                    self.without_persistent_warm_start_store(|| {
-                        // NUTS leapfrog gradients need the criterion value and
-                        // gradient at the same rho; compute them through one
-                        // value+gradient outer evaluation so the inner PIRLS
-                        // solve and IFT state are shared by construction.
-                        self.compute_cost_and_gradient(rho).ok()
-                    })
-                },
-            )),
+                n_samples,
+            )
+        });
+        let escalation = match certificate.as_ref().map(|c| c.certificate) {
+            Some(RhoCertificate::Escalate) => self.without_alo_stabilization(|| {
+                Some(escalate_rho_posterior(
+                    final_rho,
+                    &outer_hessian,
+                    |rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
+                    |rho| {
+                        self.without_persistent_warm_start_store(|| {
+                            // NUTS leapfrog gradients need the criterion value and
+                            // gradient at the same rho; compute them through one
+                            // value+gradient outer evaluation so the inner PIRLS
+                            // solve and IFT state are shared by construction.
+                            self.compute_cost_and_gradient(rho).ok()
+                        })
+                    },
+                ))
+            }),
             _ => None,
         };
         (certificate, escalation)
