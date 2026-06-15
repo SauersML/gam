@@ -548,16 +548,18 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                     // (matching `joint_jeffreys_hphi_directional_derivative`).
                     None => return Ok(Some(Array2::<f64>::zeros((total_p, total_p)))),
                 };
-                base.perturbation_derivative(&pert_h, |axis: &Array1<f64>| {
-                    family_owned
-                        .joint_jeffreys_information_second_directional_derivative_with_specs(
-                            &states_owned,
-                            &specs_owned,
-                            delta,
-                            axis,
-                        )
-                })
-                .map(Some)
+                // Batched all-axes second-directional object `{H²dot[δ,e_a]}` in
+                // ONE pass (BLAS-3 for the rigid family; per-axis fallback for the
+                // rest). This collapses the dominant `p` independent full-data
+                // second-directional sweeps the per-axis closure used to run.
+                let pert_axis_matrices = family_owned
+                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
+                        &states_owned,
+                        &specs_owned,
+                        delta,
+                    )?;
+                base.perturbation_derivative_batched_axes(&pert_h, pert_axis_matrices)
+                    .map(Some)
             })
             .collect()
     });

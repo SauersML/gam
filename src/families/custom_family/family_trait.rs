@@ -1096,6 +1096,46 @@ pub trait CustomFamily {
         )
     }
 
+    /// BATCHED all-axes second beta-directional derivative of
+    /// [`Self::joint_jeffreys_information_with_specs`]: with `d_beta_u` fixed and
+    /// the second direction sweeping every canonical axis `e_a`, return the `p`
+    /// dense matrices `{H²dot[d_beta_u, e_a]}_{a=0..p}`.
+    ///
+    /// This is the dominant cost of the outer-REML Jeffreys `H_Φ` drift; a family
+    /// whose joint information is a pure design-row Gram (rigid Bernoulli
+    /// marginal-slope) can produce the whole object in one chunked BLAS-3 pass
+    /// instead of `p` independent per-axis sweeps. `None` ⇒ the family does not
+    /// expose the exact second derivative on some axis (zero drift), matching the
+    /// per-axis hook's first-`None` collapse.
+    ///
+    /// The default builds the object by calling the per-axis
+    /// [`Self::joint_jeffreys_information_second_directional_derivative_with_specs`]
+    /// for each unit axis `e_a` — bit-for-bit the prior per-axis path. Families
+    /// with a batched fast path override this.
+    fn joint_jeffreys_information_second_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        let mut axes = Vec::with_capacity(p);
+        for a in 0..p {
+            let mut axis = Array1::<f64>::zeros(p);
+            axis[a] = 1.0;
+            match self.joint_jeffreys_information_second_directional_derivative_with_specs(
+                block_states,
+                specs,
+                d_beta_u_flat,
+                &axis,
+            )? {
+                Some(m) => axes.push(m),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(axes))
+    }
+
     /// Optional contracted second beta-derivative of the observed joint
     /// Newton information:
     ///

@@ -1466,6 +1466,72 @@ impl JeffreysHphiDriftBase {
         PertFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
     {
         let p = self.p;
+        // Acquire the `p` second-directional axis matrices `{H²dot[δ,e_a]}` via the
+        // per-axis closure (the parallel sweep preserved from before the batched
+        // hook). The first `None` ⇒ the family lacks the exact second derivative
+        // on some axis ⇒ the whole drift collapses to zero, matching the released
+        // singular-hook semantics.
+        let pert_hdots: Vec<Array2<f64>> = {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+                .into_par_iter()
+                .map(|a| {
+                    let mut axis = Array1::<f64>::zeros(p);
+                    axis[a] = 1.0;
+                    crate::linalg::faer_ndarray::with_nested_parallel(|| pert_hessian_dir(&axis))
+                })
+                .collect();
+            let mut pert_hdots = Vec::with_capacity(p);
+            for result in results {
+                match result? {
+                    Some(h2) => pert_hdots.push(h2),
+                    None => return Ok(Array2::zeros((p, p))),
+                }
+            }
+            pert_hdots
+        };
+        self.perturbation_derivative_from_axis_matrices(pert_h, pert_hdots)
+    }
+
+    /// Batched-axes variant of [`Self::perturbation_derivative`]: the caller
+    /// supplies the full all-axes object `{H²dot[δ,e_a]}_{a=0..p}` in ONE shot
+    /// (e.g. via the row-kernel BLAS-3
+    /// `second_directional_derivative_all_axes_dense_override`), avoiding the `p`
+    /// independent full-data second-directional sweeps the per-axis closure runs.
+    /// `None` ⇒ the family lacks the exact second derivative ⇒ zero drift, exactly
+    /// as the per-axis path's first-`None` collapse. The reduction from the axis
+    /// matrices onward is shared with (and bit-identical to) the per-axis path.
+    pub(crate) fn perturbation_derivative_batched_axes(
+        &self,
+        pert_h: &Array2<f64>,
+        pert_axis_matrices: Option<Vec<Array2<f64>>>,
+    ) -> Result<Array2<f64>, String> {
+        let p = self.p;
+        let Some(pert_hdots) = pert_axis_matrices else {
+            return Ok(Array2::zeros((p, p)));
+        };
+        if pert_hdots.len() != p {
+            return Err(format!(
+                "JeffreysHphiDriftBase::perturbation_derivative_batched_axes: got {} axis \
+                 matrices, expected {p}",
+                pert_hdots.len()
+            ));
+        }
+        self.perturbation_derivative_from_axis_matrices(pert_h, pert_hdots)
+    }
+
+    /// Shared reduction core: given the reduced-base eigen-data and the already
+    /// acquired per-axis second-directional matrices `{H²dot[δ,e_a]}`, assemble
+    /// the gated curvature drift `D[gate·H_Φ_raw]`. Both
+    /// [`Self::perturbation_derivative`] (per-axis closure) and
+    /// [`Self::perturbation_derivative_batched_axes`] (batched all-axes) feed this,
+    /// so the two paths are bit-identical from the axis matrices onward.
+    fn perturbation_derivative_from_axis_matrices(
+        &self,
+        pert_h: &Array2<f64>,
+        pert_hdots: Vec<Array2<f64>>,
+    ) -> Result<Array2<f64>, String> {
+        let p = self.p;
         if pert_h.nrows() != p || pert_h.ncols() != p {
             return Err(format!(
                 "JeffreysHphiDriftBase::perturbation_derivative: pert_h shape {}x{} != {p}x{p}",
@@ -1575,44 +1641,18 @@ impl JeffreysHphiDriftBase {
         let mut da_rows = Array2::<f64>::zeros((p, m * m)); // vec(δṼ_a)
         let mut dw_rows = Array2::<f64>::zeros((p, m * m)); // vec(δΨ ∘ Ṽ_a + Ψ ∘ δṼ_a)
 
-        // PARALLEL SECOND-DIRECTIONAL SWEEP. Each axis `e_a` needs one FULL-DATA
-        // mixed second-directional row-stream `∂Hdot[e_a] = H²dot[δ, e_a]` (n≈348k
-        // biobank rows) — the genuinely δ-dependent dominant cost of this per-direction
-        // call. The `p` passes are independent pure evaluations of `(family, β̂, δ, e_a)`,
-        // so we fan them across the Rayon pool (the `Sync` bound on `PertFn`) with the
-        // nested-BLAS guard pinning each pass's faer GEMM to `Par::Seq`. The cheap
-        // per-axis reduction (`δṼ_a` rotation + row writes) stays serial over the
-        // index-ordered results, so the output is bit-identical to the original serial
-        // loop. First-anomaly semantics preserved: any `Err` propagates, and the first
-        // `None` (family lacks the exact second derivative on some axis) collapses the
-        // whole drift to the zero matrix exactly as before.
-        let pert_hdots: Vec<Array2<f64>> = {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
-                .into_par_iter()
-                .map(|a| {
-                    let mut axis = Array1::<f64>::zeros(p);
-                    axis[a] = 1.0;
-                    crate::linalg::faer_ndarray::with_nested_parallel(|| pert_hessian_dir(&axis))
-                })
-                .collect();
-            let mut pert_hdots = Vec::with_capacity(p);
-            for result in results {
-                let pert_hdot_a = match result? {
-                    Some(h2) => h2,
-                    None => return Ok(Array2::zeros((p, p))),
-                };
-                if pert_hdot_a.nrows() != p || pert_hdot_a.ncols() != p {
-                    return Err(format!(
-                        "JeffreysHphiDriftBase::perturbation_derivative: ∂Hdot[e_a] shape {}x{} != {p}x{p}",
-                        pert_hdot_a.nrows(),
-                        pert_hdot_a.ncols()
-                    ));
-                }
-                pert_hdots.push(pert_hdot_a);
+        // The per-axis second-directional matrices `{H²dot[δ,e_a]}` were acquired
+        // by the caller (per-axis closure sweep or batched all-axes override) and
+        // validated for count here; each must be the full `p×p` shape.
+        for (a, pert_hdot_a) in pert_hdots.iter().enumerate() {
+            if pert_hdot_a.nrows() != p || pert_hdot_a.ncols() != p {
+                return Err(format!(
+                    "JeffreysHphiDriftBase::perturbation_derivative: ∂Hdot[e_{a}] shape {}x{} != {p}x{p}",
+                    pert_hdot_a.nrows(),
+                    pert_hdot_a.ncols()
+                ));
             }
-            pert_hdots
-        };
+        }
         // Reconstruct Ṽ_a (m × m) from the flattened base row for the rotation terms.
         let mut a_a = Array2::<f64>::zeros((m, m));
         for (a, pert_hdot_a) in pert_hdots.into_iter().enumerate() {

@@ -2357,6 +2357,123 @@ fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
 }
 
 
+/// The rigid BLAS-3 batched all-axes second-directional override
+/// (`second_directional_derivative_all_axes_dense_override`, the #979 biobank
+/// `coord_corrections` perf lever) must reproduce, for EVERY canonical axis
+/// `e_a`, the generic per-axis scatter
+/// `row_kernel_second_directional_derivative(All, δ, e_a)` — the object the
+/// Jeffreys `H_Φ` drift consumed before the batched hook existed.
+///
+/// Two assertions:
+///   1. Batched axis `a` matches the BLAS-3 single-axis path bit-for-bit
+///      (`==`): the BATCHING itself introduces no reduction-order change
+///      (same chunked `Xᵀ diag(w) X` machinery, same per-row
+///      `contract_fourth_full` args, hoisted `δ`-projection).
+///   2. Batched axis `a` matches the generic per-row BLAS-1 scatter to tight
+///      tolerance — the only difference is the documented BLAS-3-vs-syr in-row
+///      Gram reduction order (same contract as `hessian_dense_blas3`).
+#[test]
+fn bernoulli_rigid_batched_all_axes_second_directional_matches_per_axis_scatter() {
+    use crate::families::row_kernel::{
+        RowSet, row_kernel_second_directional_derivative,
+        row_kernel_second_directional_derivative_all_axes,
+    };
+
+    let n = 40usize;
+    // Multi-column designs so the per-axis sweep is nontrivial in BOTH blocks
+    // (p_m = 3 marginal axes, p_g = 2 logslope axes ⇒ p = 5).
+    let y: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| if (i * 31 + 7) % 5 >= 3 { 1.0 } else { 0.0 }));
+    let weights: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| 0.5 + ((i * 13 + 4) % 7) as f64 * 0.1));
+    let z: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| -1.5 + 3.0 * ((i * 17 + 5) % n) as f64 / n as f64));
+    let marginal_design = Array2::from_shape_fn((n, 3), |(i, j)| {
+        1.0 + 0.37 * (((i * 7 + j * 11) % 9) as f64 - 4.0)
+    });
+    let logslope_design = Array2::from_shape_fn((n, 2), |(i, j)| {
+        0.5 + 0.21 * (((i * 5 + j * 3) % 7) as f64 - 3.0)
+    });
+    let p_m = marginal_design.ncols();
+    let p_g = logslope_design.ncols();
+    let p = p_m + p_g;
+
+    for frailty in [None, Some(0.7_f64)] {
+        let family = BernoulliMarginalSlopeFamily {
+            gaussian_frailty_sd: frailty,
+            ..test_family_with_dense_designs(
+                y.clone(),
+                weights.clone(),
+                z.clone(),
+                marginal_design.clone(),
+                logslope_design.clone(),
+            )
+        };
+        // Per-row varying primaries (the cached fourth tensor must vary by row).
+        let eta_m = Array1::from_iter((0..n).map(|i| -0.8 + 0.05 * i as f64));
+        let g_eta = Array1::from_iter((0..n).map(|i| 0.4 - 0.02 * i as f64));
+        let block_states = vec![
+            ParameterBlockState {
+                beta: Array1::from_iter((0..p_m).map(|j| 0.1 * (j as f64 + 1.0))),
+                eta: eta_m,
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter((0..p_g).map(|j| -0.05 * (j as f64 + 1.0))),
+                eta: g_eta,
+            },
+        ];
+        let kernel =
+            super::row_kernel::BernoulliRigidRowKernel::new(family.clone(), block_states.clone());
+
+        // Fixed direction δ with nontrivial projection onto both blocks.
+        let delta: Vec<f64> = (0..p).map(|a| 0.3 - 0.13 * a as f64).collect();
+
+        let batched =
+            row_kernel_second_directional_derivative_all_axes(&kernel, &RowSet::All, &delta)
+                .expect("batched all-axes BLAS-3 second directional");
+        assert_eq!(batched.len(), p, "one matrix per canonical axis");
+
+        for a in 0..p {
+            let mut axis = vec![0.0_f64; p];
+            axis[a] = 1.0;
+
+            // (2) Generic per-row BLAS-1 scatter reference.
+            let scatter = row_kernel_second_directional_derivative(
+                &kernel,
+                &RowSet::All,
+                &delta,
+                &axis,
+            )
+            .expect("generic per-axis scatter second directional");
+
+            let mut max_abs = 0.0_f64;
+            let mut max_rel = 0.0_f64;
+            for ((i, j), &got) in batched[a].indexed_iter() {
+                let want = scatter[[i, j]];
+                let abs = (got - want).abs();
+                max_abs = max_abs.max(abs);
+                max_rel = max_rel.max(abs / want.abs().max(1.0));
+            }
+            assert!(
+                max_rel < 1e-10,
+                "frailty {frailty:?} axis {a}: batched BLAS-3 all-axes H²dot[δ,e_a] \
+                 disagrees with generic per-row scatter: max_abs={max_abs:e} max_rel={max_rel:e}"
+            );
+
+            // Symmetric p×p output (the joint Hessian second directional is symmetric).
+            for i in 0..p {
+                for j in 0..p {
+                    assert!(
+                        (batched[a][[i, j]] - batched[a][[j, i]]).abs() < 1e-12,
+                        "axis {a}: batched output must be symmetric at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // #1028 / #905 — Murphy–Topel generated-regressor correction assembly.
 // These pin the engine-agnostic assembly that turns the ONE outstanding

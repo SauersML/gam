@@ -606,6 +606,59 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
     ))
 }
 
+/// Fused exact value+derivative stack for the signed-probit negative-log
+/// kernel: returns `[-w·logΦ(m), w·k1, w·k2, w·k3, w·k4]` in the `[f64; 5]`
+/// shape [`Tower4::compose_unary`] consumes.
+///
+/// This is the single-source replacement for the two-call pattern
+///
+/// ```ignore
+/// let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
+/// let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w)?;
+/// // → [-w*logcdf, k1, k2, k3, k4]
+/// ```
+///
+/// which evaluated `signed_probit_logcdf_and_mills_ratio` TWICE on the same
+/// `m` (once for `logΦ`, once again — discarding `logΦ` — for the Mills ratio
+/// `λ` that drives `k1..k4`). On the rigid standard-normal BMS path that pair
+/// of `erfcx`/`erfc` transcendentals is the dominant per-row arithmetic across
+/// all `n ≈ 356k` rows, so collapsing it to ONE call halves the transcendental
+/// budget of the jet build. The result is bit-identical: `logΦ` and `λ` are the
+/// exact same values the two-call form produced (same branch, same `ex`), and
+/// `k1..k4` are the same polynomials in `(m, λ)`.
+///
+/// Boundary semantics match [`unary_derivatives_neglog_phi`] (the prior
+/// two-call form): `+∞` is the saturated zero tail (all zero); `−∞` returns the
+/// `[+∞, −w, w·0, 0, 0]` limit (value `−w·logΦ(−∞)=+∞`, `k1=−λ→−∞` scaled by the
+/// `w` already folded by the numeric derivative helper); `NaN` propagates.
+#[inline]
+pub(crate) fn signed_probit_neglog_unary_stack(signed_margin: f64, weight: f64) -> [f64; 5] {
+    if weight == 0.0 || signed_margin == f64::INFINITY {
+        return [0.0; 5];
+    }
+    if signed_margin == f64::NEG_INFINITY {
+        // logΦ(−∞) = −∞ ⇒ value −w·(−∞) = +∞; the derivative helper's −∞ limit
+        // is (−∞, w, 0, 0) for (k1, k2, k3, k4) before the weight fold below.
+        return [f64::INFINITY, f64::NEG_INFINITY, weight, 0.0, 0.0];
+    }
+    if signed_margin.is_nan() {
+        return [f64::NAN; 5];
+    }
+    // ONE transcendental evaluation feeds both the value (logΦ) and every
+    // derivative (through the Mills ratio λ).
+    let (logcdf, lambda) = signed_probit_logcdf_and_mills_ratio(signed_margin);
+    let m = signed_margin;
+    let k1 = -lambda;
+    let k2 = lambda * (m + lambda);
+    let k3 = lambda * (1.0 - m * m - 3.0 * m * lambda - 2.0 * lambda * lambda);
+    let k4 = lambda
+        * ((m * m * m - 3.0 * m)
+            + (7.0 * m * m - 4.0) * lambda
+            + 12.0 * m * lambda * lambda
+            + 6.0 * lambda * lambda * lambda);
+    [-weight * logcdf, weight * k1, weight * k2, weight * k3, weight * k4]
+}
+
 #[inline]
 pub(super) fn rigid_observed_logslope(logslope: f64, probit_scale: f64) -> f64 {
     probit_scale * logslope
@@ -1346,6 +1399,39 @@ pub(crate) fn rigid_standard_normal_tower(
     w: f64,
     probit_scale: f64,
 ) -> Result<Tower4<2>, String> {
+    let signed = rigid_standard_normal_signed_jet(marginal, g, z, y, probit_scale);
+    // ONE transcendental per row: the fused stack reuses a single Mills-ratio
+    // evaluation for both logΦ and the k1..k4 derivative chain (bit-identical
+    // to the prior two-call (logcdf-discard + derivatives) form). The prior
+    // form's `?` rejected a non-finite `+∞`-excluded margin; preserve that
+    // fail-fast contract before the fused evaluation.
+    if !(signed.v.is_finite() || signed.v == f64::INFINITY) {
+        return Err(format!(
+            "non-finite signed margin in rigid probit tower: {}",
+            signed.v
+        ));
+    }
+    Ok(signed.compose_unary(signed_probit_neglog_unary_stack(signed.v, w)))
+}
+
+/// Branch-free `signed`-margin jet for the rigid standard-normal row kernel.
+///
+/// This is the order-≤4 polynomial part of [`rigid_standard_normal_tower`]
+/// *before* the single transcendental compose: it builds the `Tower4<2>` of the
+/// signed observed index `signed = (2y−1)·η`, `η = q·c(g) + g·(s·z)`,
+/// `c(g) = √(1 + (s·g)²)`, with no `erfc`/`exp`/`ln` call. Splitting this off
+/// lets the batched builder run all the cheap, branch-free jet products in one
+/// SIMD-friendly pass and isolate the (branchy, transcendental) Mills-ratio
+/// composition into its own tight pass. The returned jet is bit-identical to
+/// the `signed` jet inside `rigid_standard_normal_tower` (same op order).
+#[inline]
+fn rigid_standard_normal_signed_jet(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    probit_scale: f64,
+) -> Tower4<2> {
     let mut q = Tower4::<2>::constant(marginal.q);
     q.g[0] = marginal.q1;
     q.h[0][0] = marginal.q2;
@@ -1355,10 +1441,94 @@ pub(crate) fn rigid_standard_normal_tower(
     let observed_logslope = slope * probit_scale;
     let c = (observed_logslope * observed_logslope + 1.0).sqrt();
     let eta = q * c + slope * (probit_scale * z);
-    let signed = eta * (2.0 * y - 1.0);
-    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed.v);
-    let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(signed.v, w)?;
-    Ok(signed.compose_unary([-w * logcdf, k1, k2, k3, k4]))
+    eta * (2.0 * y - 1.0)
+}
+
+/// Batched, two-pass builder of the rigid standard-normal row `Tower4<2>` jets
+/// for a contiguous chunk of rows, written for the auto-vectorizer.
+///
+/// Per row the production path ([`rigid_standard_normal_tower`]) interleaves
+/// (1) cheap branch-free jet products to form the `signed` margin jet, (2) ONE
+/// branchy transcendental (`erfcx`/`exp`/`ln` via
+/// [`signed_probit_neglog_unary_stack`]) that dominates the per-row scalar-ALU
+/// budget across all `n ≈ 356k` rows, and (3) the branch-free Faà-di-Bruno
+/// `compose_unary` tensor assembly. The interleaving keeps the compiler from
+/// vectorizing the loop body because the transcendental's internal branches sit
+/// between the two pure-FMA blocks.
+///
+/// This builder runs the same work as three *separate* loops over the chunk:
+///
+/// * Pass A — build every `signed` jet (branch-free, [`rigid_standard_normal_signed_jet`]),
+///   spilling `signed.v` into a contiguous `margins` scratch buffer.
+/// * Pass B — fill the per-row unary derivative stack `[d0..d4]` from
+///   `margins`/`weights` (the transcendental, now back-to-back over a flat
+///   `&[f64]` so branch prediction and the polynomial `k1..k4` portion stream).
+/// * Pass C — `compose_unary` each `signed` jet against its stack (branch-free,
+///   pure FMA over the dense tensors → the vectorizable hot block).
+///
+/// Every scalar operation, and its order, is identical to the per-row path, so
+/// the produced jets are bit-for-bit equal; the win is making the n-row build
+/// memory-bandwidth-bound rather than scalar-ALU/branch-bound. The `fill`
+/// callback writes the consumer's per-row payload (e.g. `.t3` or `.t4`) from the
+/// finished jet, so neither tensor is materialized into an intermediate `Vec`.
+#[inline]
+pub(super) fn rigid_standard_normal_towers_batch<T>(
+    marginals: &[BernoulliMarginalLinkMap],
+    slopes: &[f64],
+    zs: &[f64],
+    ys: &[f64],
+    weights: &[f64],
+    probit_scale: f64,
+    out: &mut [T],
+    mut fill: impl FnMut(&Tower4<2>) -> Result<T, String>,
+) -> Result<(), String> {
+    let chunk = marginals.len();
+    if slopes.len() != chunk
+        || zs.len() != chunk
+        || ys.len() != chunk
+        || weights.len() != chunk
+        || out.len() != chunk
+    {
+        return Err(format!(
+            "rigid_standard_normal_towers_batch length mismatch: marginals={chunk}, \
+             slopes={}, zs={}, ys={}, weights={}, out={}",
+            slopes.len(),
+            zs.len(),
+            ys.len(),
+            weights.len(),
+            out.len()
+        ));
+    }
+
+    // Pass A: branch-free signed-margin jets + flat margin scratch.
+    let mut signed: Vec<Tower4<2>> = Vec::with_capacity(chunk);
+    let mut margins: Vec<f64> = Vec::with_capacity(chunk);
+    for i in 0..chunk {
+        let jet = rigid_standard_normal_signed_jet(marginals[i], slopes[i], zs[i], ys[i], probit_scale);
+        margins.push(jet.v);
+        signed.push(jet);
+    }
+
+    // Pass B: the transcendental, isolated over a flat margin slice. Each entry
+    // is the exact `[d0..d4]` `compose_unary` consumes; the production path's
+    // fail-fast on a non-finite (non-`+∞`) margin is preserved here.
+    let mut stacks: Vec<[f64; 5]> = Vec::with_capacity(chunk);
+    for i in 0..chunk {
+        let m = margins[i];
+        if !(m.is_finite() || m == f64::INFINITY) {
+            return Err(format!(
+                "non-finite signed margin in rigid probit tower batch: {m}"
+            ));
+        }
+        stacks.push(signed_probit_neglog_unary_stack(m, weights[i]));
+    }
+
+    // Pass C: branch-free dense compose + consumer fill.
+    for i in 0..chunk {
+        let tower = signed[i].compose_unary(stacks[i]);
+        out[i] = fill(&tower)?;
+    }
+    Ok(())
 }
 
 /// Second-order-only sibling of [`rigid_standard_normal_tower`].
@@ -1393,9 +1563,17 @@ pub(crate) fn rigid_standard_normal_tower2(
     let c = (observed_logslope * observed_logslope + 1.0).sqrt();
     let eta = q * c + slope * (probit_scale * z);
     let signed = eta * (2.0 * y - 1.0);
-    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed.v);
-    let (k1, k2, _k3, _k4) = signed_probit_neglog_derivatives_up_to_fourth(signed.v, w)?;
-    Ok(signed.compose_unary([-w * logcdf, k1, k2]))
+    // ONE transcendental per row (see `rigid_standard_normal_tower`): the fused
+    // stack shares a single Mills-ratio evaluation for logΦ and k1..k2. Tower2
+    // consumes only the first three entries, so the (exact) k3/k4 are dropped.
+    if !(signed.v.is_finite() || signed.v == f64::INFINITY) {
+        return Err(format!(
+            "non-finite signed margin in rigid probit tower2: {}",
+            signed.v
+        ));
+    }
+    let stack = signed_probit_neglog_unary_stack(signed.v, w);
+    Ok(signed.compose_unary([stack[0], stack[1], stack[2]]))
 }
 
 #[inline]
@@ -1454,15 +1632,21 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
     // the η-bilinear, exactly as in the Tower4<2> production path.
     let eta = q * c + slope * (z_var * probit_scale);
     let signed = eta * (2.0 * y - 1.0);
-    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed.v);
-    if !logcdf.is_finite() {
+    // ONE transcendental per row (see `rigid_standard_normal_tower`).
+    if !(signed.v.is_finite() || signed.v == f64::INFINITY) {
+        return Err(format!(
+            "rigid probit mixed-z sensitivity: non-finite signed margin {} at q={}, g={g}, z={z}, y={y}",
+            signed.v, marginal.q
+        ));
+    }
+    let stack = signed_probit_neglog_unary_stack(signed.v, w);
+    if !stack[0].is_finite() {
         return Err(format!(
             "rigid probit mixed-z sensitivity: non-finite log Φ at q={}, g={g}, z={z}, y={y}",
             marginal.q
         ));
     }
-    let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(signed.v, w)?;
-    let tower = signed.compose_unary([-w * logcdf, k1, k2, k3, k4]);
+    let tower = signed.compose_unary(stack);
     let s_q = tower.h[0][2];
     let s_g = tower.h[1][2];
     if !(s_q.is_finite() && s_g.is_finite()) {
@@ -1736,18 +1920,11 @@ pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     ]
 }
 pub(crate) fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
-    if weight == 0.0 || x == f64::INFINITY {
-        return [0.0, 0.0, 0.0, 0.0, 0.0];
-    }
-    if x == f64::NEG_INFINITY {
-        return [f64::INFINITY, f64::NEG_INFINITY, weight, 0.0, 0.0];
-    }
-    if x.is_nan() {
-        return [f64::NAN; 5];
-    }
-    let (d1, d2, d3, d4) = signed_probit_neglog_derivatives_up_to_fourth_numeric(x, weight);
-    let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(x);
-    [-weight * log_cdf, d1, d2, d3, d4]
+    // Single source of truth for the signed-probit value+derivative stack:
+    // one Mills-ratio transcendental feeds both logΦ and k1..k4 (the prior
+    // body evaluated `signed_probit_logcdf_and_mills_ratio` twice). The
+    // ±∞/NaN/zero-weight boundary limits are handled identically inside.
+    signed_probit_neglog_unary_stack(x, weight)
 }
 
 /// Derivatives of log(x) through 4th order.

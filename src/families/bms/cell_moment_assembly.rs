@@ -1225,18 +1225,95 @@ impl BernoulliMarginalSlopeFamily {
         row: usize,
     ) -> Result<&'a [[[f64; 2]; 2]; 2], String> {
         let stored = cache.rigid_third_full.get_or_compute(|| {
-            (0..self.y.len())
-                .into_par_iter()
-                .map(|r| {
-                    let marginal_eta = block_states[0].eta[r];
-                    let marginal = self.marginal_link_map(marginal_eta)?;
-                    let slope = block_states[1].eta[r];
-                    self.rigid_row_third_full(r, marginal, slope)
-                })
-                .collect::<Result<Vec<_>, String>>()
+            self.build_rigid_full_tensor_table(
+                block_states,
+                |r, marginal, slope| self.rigid_row_third_full(r, marginal, slope),
+                |tower| tower.t3,
+            )
         });
         let table = stored.as_ref().map_err(|err| err.clone())?;
         Ok(&table[row])
+    }
+
+    /// Build the per-row rigid full-derivative tensor table over all `n` rows.
+    ///
+    /// For the `StandardNormal` latent measure (the kernel the conditional
+    /// location-scale gate always selects) every row routes through the closed
+    /// `Tower4<2>` jet, so this fast-paths the whole-`n` build through the
+    /// chunked, SIMD-friendly [`rigid_standard_normal_towers_batch`]: it isolates
+    /// the one branchy transcendental per row from the dense branch-free tensor
+    /// assembly, making the build memory-bandwidth- rather than scalar-ALU-bound.
+    /// `extract` reads the consumer's tensor (`.t3`/`.t4`) off the finished jet.
+    ///
+    /// Any empirical-grid measure keeps the exact per-row dispatch (`row_fn`),
+    /// which carries the implicit-function-theorem closed forms. Both arms are
+    /// bit-identical to the prior per-row `into_par_iter().map(row_fn)` build.
+    fn build_rigid_full_tensor_table<T, R, E>(
+        &self,
+        block_states: &[ParameterBlockState],
+        row_fn: R,
+        extract: E,
+    ) -> Result<Vec<T>, String>
+    where
+        T: Copy + Send + Default,
+        R: Fn(usize, BernoulliMarginalLinkMap, f64) -> Result<T, String> + Sync,
+        E: Fn(&crate::families::jet_tower::Tower4<2>) -> T + Sync,
+    {
+        let n = self.y.len();
+        let marginal_eta = &block_states[0].eta;
+        let slope_eta = &block_states[1].eta;
+        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
+            return (0..n)
+                .into_par_iter()
+                .map(|r| {
+                    let marginal = self.marginal_link_map(marginal_eta[r])?;
+                    row_fn(r, marginal, slope_eta[r])
+                })
+                .collect::<Result<Vec<_>, String>>();
+        }
+
+        // Standard-normal whole-`n` chunked batch build.
+        const ROW_CHUNK: usize = 256;
+        let probit_scale = self.probit_frailty_scale();
+        let n_chunks = n.div_ceil(ROW_CHUNK).max(1);
+        let chunk_results: Result<Vec<Vec<T>>, String> = (0..n_chunks)
+            .into_par_iter()
+            .map(|c| {
+                let lo = c * ROW_CHUNK;
+                let hi = (lo + ROW_CHUNK).min(n);
+                let len = hi - lo;
+                let mut marginals: Vec<BernoulliMarginalLinkMap> = Vec::with_capacity(len);
+                let mut slopes: Vec<f64> = Vec::with_capacity(len);
+                let mut zs: Vec<f64> = Vec::with_capacity(len);
+                let mut ys: Vec<f64> = Vec::with_capacity(len);
+                let mut ws: Vec<f64> = Vec::with_capacity(len);
+                for r in lo..hi {
+                    marginals.push(self.marginal_link_map(marginal_eta[r])?);
+                    slopes.push(slope_eta[r]);
+                    zs.push(self.z[r]);
+                    ys.push(self.y[r]);
+                    ws.push(self.weights[r]);
+                }
+                let mut out = vec![T::default(); len];
+                rigid_standard_normal_towers_batch(
+                    &marginals,
+                    &slopes,
+                    &zs,
+                    &ys,
+                    &ws,
+                    probit_scale,
+                    &mut out,
+                    |tower| Ok(extract(tower)),
+                )?;
+                Ok(out)
+            })
+            .collect();
+        let chunks = chunk_results?;
+        let mut table: Vec<T> = Vec::with_capacity(n);
+        for chunk in chunks {
+            table.extend(chunk);
+        }
+        Ok(table)
     }
 
     /// Look up the per-row rigid uncontracted fourth-derivative tensor.
@@ -1253,15 +1330,11 @@ impl BernoulliMarginalSlopeFamily {
         row: usize,
     ) -> Result<&'a [[[[f64; 2]; 2]; 2]; 2], String> {
         let stored = cache.rigid_fourth_full.get_or_compute(|| {
-            (0..self.y.len())
-                .into_par_iter()
-                .map(|r| {
-                    let marginal_eta = block_states[0].eta[r];
-                    let marginal = self.marginal_link_map(marginal_eta)?;
-                    let slope = block_states[1].eta[r];
-                    self.rigid_row_fourth_full(r, marginal, slope)
-                })
-                .collect::<Result<Vec<_>, String>>()
+            self.build_rigid_full_tensor_table(
+                block_states,
+                |r, marginal, slope| self.rigid_row_fourth_full(r, marginal, slope),
+                |tower| tower.t4,
+            )
         });
         let table = stored.as_ref().map_err(|err| err.clone())?;
         Ok(&table[row])

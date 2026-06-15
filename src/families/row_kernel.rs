@@ -536,6 +536,57 @@ pub trait RowKernel<const K: usize>: Send + Sync {
         // override that declines (`None`) on a row-set it cannot accelerate.
         Some(row_kernel_hessian_dense_generic(self, rows, row_hessians))
     }
+
+    /// Optional BLAS-3 fast path for the BATCHED all-axes second directional
+    /// derivative of the dense Hessian: with one direction `d_beta_u` held fixed
+    /// and the second direction sweeping every canonical axis `e_a`, return the
+    /// `p` dense matrices `{H²dot[d_beta_u, e_a]}_{a=0..p}`,
+    ///
+    /// ```text
+    ///   H²dot[u, e_a] = Σ_i  Jᵢᵀ T⁴ᵢ[J·u, J·e_a] Jᵢ.
+    /// ```
+    ///
+    /// This is the dominant cost of the outer-REML Jeffreys `H_Φ` drift
+    /// (`coord_corrections`): the generic per-axis path
+    /// ([`row_kernel_second_directional_derivative`]) runs `p` independent
+    /// full-data sweeps, each scattering the `K×K` contracted fourth tensor
+    /// through `add_pullback_hessian` — a per-row rank-`K` BLAS-1 update — for a
+    /// total of `O(p · n · p²)` BLAS-1 scatter. For a kernel whose pullback is a
+    /// pure design-row Gram, the per-row jet work (the `J·u` projection and the
+    /// fourth-tensor partial contraction against `u`) is INDEPENDENT of the
+    /// swept axis, so it can be hoisted out of the `p`-loop and each axis closed
+    /// with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs reading the shared cached
+    /// fourth tensor. The default returns `None`, preserving the exact generic
+    /// per-axis path for every other kernel bit-for-bit. Overrides should claim
+    /// only the full-data unit-weight `RowSet::All` case; under a subsample /
+    /// non-unit-weight `RowSet` return `None` so the generic Horvitz-Thompson
+    /// per-row path runs per axis.
+    ///
+    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
+    /// per-axis `row_kernel_second_directional_derivative(self, rows, d_beta_u,
+    /// e_a)` reduced in deterministic in-row order (same contract as
+    /// [`Self::hessian_dense_override`]).
+    fn second_directional_derivative_all_axes_dense_override(
+        &self,
+        rows: &RowSet,
+        d_beta_u: &[f64],
+    ) -> Option<Result<Vec<Array2<f64>>, String>> {
+        // Default declines (the batched dispatcher then runs the generic
+        // per-axis sweep). A shape mismatch in the fixed direction is a hard
+        // caller-contract violation regardless of which path runs, so it is
+        // surfaced here where both `rows` and `d_beta_u` are consumed — keeping
+        // the default body free of unused bindings without masking a bad call.
+        if d_beta_u.len() != self.n_coefficients() {
+            let all = matches!(rows, RowSet::All);
+            return Some(Err(format!(
+                "second_directional_derivative_all_axes_dense_override: fixed direction has \
+                 {} entries, expected {} (rows::All = {all})",
+                d_beta_u.len(),
+                self.n_coefficients(),
+            )));
+        }
+        None
+    }
 }
 
 fn row_kernel_jacobian_action_matrix_generic<const K: usize>(
@@ -1027,6 +1078,45 @@ pub fn row_kernel_second_directional_derivative<const K: usize>(
         },
         |a, b| Ok(a + b),
     )
+}
+
+/// Batched all-axes second directional derivative: with `d_beta_u` fixed and the
+/// second direction sweeping every canonical axis `e_a`, return the `p` dense
+/// matrices `{H²dot[d_beta_u, e_a]}_{a=0..p}`.
+///
+/// Dispatches to [`RowKernel::second_directional_derivative_all_axes_dense_override`]
+/// when the kernel provides a BLAS-3 fast path on this row-set; otherwise falls
+/// back to `p` independent [`row_kernel_second_directional_derivative`] sweeps,
+/// one per unit axis `e_a` — bit-for-bit the generic per-axis path the Jeffreys
+/// `H_Φ` drift consumed before the batched hook existed. The fall-back runs the
+/// axis sweep on the Rayon pool (each axis is an independent full-data pure
+/// evaluation) so it is no slower than the prior per-axis parallel loop; the
+/// nested-BLAS guard pins each axis's GEMMs to `Par::Seq`.
+pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized + Sync),
+    rows: &RowSet,
+    d_beta_u: &[f64],
+) -> Result<Vec<Array2<f64>>, String> {
+    if let Some(result) = kern.second_directional_derivative_all_axes_dense_override(rows, d_beta_u)
+    {
+        return result;
+    }
+    let p = kern.n_coefficients();
+    // Generic fall-back: each axis `e_a` is one independent full-data
+    // second-directional sweep. Fan the `p` axes across the pool with the
+    // nested-BLAS guard so any inner GEMM stays `Par::Seq` (mirrors the prior
+    // Jeffreys per-axis parallel sweep). Index-ordered collection keeps the
+    // output bit-identical to a serial axis loop.
+    (0..p)
+        .into_par_iter()
+        .map(|a| {
+            let mut axis = vec![0.0_f64; p];
+            axis[a] = 1.0;
+            crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                row_kernel_second_directional_derivative(kern, rows, d_beta_u, &axis)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 struct RowKernelDirectionalDerivativeOperator<const K: usize, T: RowKernel<K>> {

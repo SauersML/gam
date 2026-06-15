@@ -92,7 +92,16 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .max(self.coefficient_gradient_cost(specs));
         let dense_available = self.outer_hyper_hessian_dense_available(specs);
         let hvp_available = self.outer_hyper_hessian_hvp_available(specs);
-        if flex_active {
+        // Flex (`score_warp` / `link_dev`) without a matrix-free outer θ-HVP
+        // would force the dense fourth-order outer-Hessian assembly, whose
+        // per-cell flex-jet cost is prohibitive at scale — so that case stays
+        // first-order. But when the exact profiled outer θ-HVP is available the
+        // operator reuses the flex row stream once per Hv (near-gradient cost)
+        // and PCG converges in a handful of iters; the outer Newton then
+        // converges in ≤ a couple of iterations instead of several BFGS line
+        // searches. Fall through to the HVP-aware order selection in that case
+        // rather than demoting flex to BFGS.
+        if flex_active && !hvp_available {
             if log_exact_work(self.y.len()) {
                 log::info!(
                     "[BMS outer-derivative-policy] n={} p={} flex=true order=First reason=flex-outer-hessian-fourth-order-cost dense_available={} outer_hvp_available={} coefficient_work={}",
@@ -748,6 +757,26 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         parameter_block_specs_match_rows(specs, self.y.len())
     }
 
+    fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        // Binary twin of `SurvivalMarginalSlopeFamily`: the exact profiled
+        // outer Hessian over θ=(ρ,ψ[,log σ]) is applied matrix-free, without
+        // pairwise θθ materialization. The coefficient-Hessian drift terms
+        // (D_β H[u_k]) come from `exact_newton_joint_hessian_directional_derivative`
+        // and `...second_directional_derivative`; the ψ-drift terms come from
+        // `exact_newton_joint_psi_terms`; the joint mode response H u_k = −g_k
+        // is solved through the inner Hv workspace. The generic exact
+        // joint-hyper assembler in `custom_family::outer_objective` consumes
+        // these directional kernels to produce an
+        // `OuterHessianOperator`, so advertising this capability lifts the
+        // outer-derivative order to `Second` and routes the planner to ARC /
+        // exact outer Newton instead of BFGS — converging the outer ρ-loop in
+        // ≤ a couple of iterations rather than several BFGS line searches, each
+        // of which costs a full inner re-solve. The operator is the EXACT
+        // analytic θ-HVP (no finite differences, no quasi-Newton surrogate),
+        // so the REML/LAML optimum is bit-identical to the first-order path.
+        parameter_block_specs_match_rows(specs, self.y.len())
+    }
+
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         parameter_block_specs_match_rows(specs, self.y.len())
     }
@@ -829,6 +858,59 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 &cache,
             )
         }
+    }
+
+    fn joint_jeffreys_information_second_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        // Same trust dispatch as the per-axis
+        // `exact_newton_joint_hessian_second_directional_derivative_with_specs`:
+        // an untrusted, structurally-decoupled spec returns `None` so the caller
+        // keeps the released zero-drift semantics, exactly as the per-axis path.
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+        // Flex-active fits use the dense exact-cache path; only the rigid
+        // marginal-slope kernel has the BLAS-3 design-row-Gram batched override.
+        // Fall back to the generic per-axis assembly (bit-for-bit identical to the
+        // trait default) when flex is active.
+        if self.effective_flex_active(block_states)? {
+            let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+            let mut axes = Vec::with_capacity(p);
+            for a in 0..p {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[a] = 1.0;
+                match self.joint_jeffreys_information_second_directional_derivative_with_specs(
+                    block_states,
+                    specs,
+                    d_beta_u_flat,
+                    &axis,
+                )? {
+                    Some(m) => axes.push(m),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(axes));
+        }
+        let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+        let su = d_beta_u_flat
+            .as_slice()
+            .ok_or("non-contiguous d_beta_u for batched all-axes second directional")?;
+        // The dispatcher takes the BLAS-3 override when available and otherwise
+        // runs the generic per-axis sweep — both bit-faithful to the per-axis
+        // `exact_newton_joint_hessiansecond_directional_derivative` the default
+        // would call.
+        crate::families::row_kernel::row_kernel_second_directional_derivative_all_axes(
+            &kern,
+            &crate::families::row_kernel::RowSet::All,
+            su,
+        )
+        .map(Some)
     }
 
     fn exact_newton_joint_psi_terms(
