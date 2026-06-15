@@ -438,6 +438,31 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     ) -> Array2<f64> {
         row_kernel_jacobian_action_matrix_generic_rows(self, factor, start, end)
     }
+
+    /// Optional BLAS-3 fast path for the first directional derivative of the
+    /// dense Hessian, `∂H/∂β[d_beta] = Σ_i w_i · Jᵢᵀ T³ᵢ[J·d_beta] Jᵢ`.
+    ///
+    /// The generic [`row_kernel_directional_derivative`] scatters, for every
+    /// row, the `K×K` contracted third tensor through `add_pullback_hessian`
+    /// — a per-row rank-`K` BLAS-1 update into the dense `p×p` accumulator.
+    /// When the Jeffreys/Firth head term drives this once per Jeffreys-subspace
+    /// column, that is `k·n·p²` BLAS-1 scatter (biobank rigid fit: the dominant
+    /// inner joint-Newton `hessian_qp` cost). A kernel whose pullback is a pure
+    /// design-row Gram (no structured cross terms) can instead accumulate the
+    /// per-row contraction weights over a row chunk and close each chunk with a
+    /// `Xᵀ diag(w) X` BLAS-3 product. The default returns `None`, preserving the
+    /// exact generic per-row path for every other kernel bit-for-bit.
+    ///
+    /// `rows == RowSet::All` is the only case an override should claim; under a
+    /// subsample / non-unit-weight `RowSet` the override must return `None` so
+    /// the generic Horvitz-Thompson per-row path runs.
+    fn directional_derivative_dense_override(
+        &self,
+        _rows: &RowSet,
+        _d_beta: &[f64],
+    ) -> Option<Result<Array2<f64>, String>> {
+        None
+    }
 }
 
 fn row_kernel_jacobian_action_matrix_generic<const K: usize>(
@@ -824,6 +849,9 @@ pub fn row_kernel_directional_derivative<const K: usize>(
     rows: &RowSet,
     d_beta: &[f64],
 ) -> Result<Array2<f64>, String> {
+    if let Some(result) = kern.directional_derivative_dense_override(rows, d_beta) {
+        return result;
+    }
     let n = kern.n_rows();
     let p = kern.n_coefficients();
     kern.warm_up_directional_caches()?;
