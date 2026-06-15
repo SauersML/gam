@@ -602,9 +602,27 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let penalty_counts = validate_blockspecs(specs)?;
 
     let label_layout = penalty_label_layout(specs, penalty_counts.clone())?;
-    let rho0 = label_layout.initial_rho.clone();
+    let mut rho0 = label_layout.initial_rho.clone();
     let (persistent_warm_start_key, persistent_warm_start) =
         load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
+
+    // Cross-fit warm start (Phase 1): when the exact response-keyed inner
+    // cache MISSES (a new fold / row population / reduced width), fall back to
+    // the descriptor-indexed FitArtifact store and transfer the smoothing
+    // parameters ρ from a structurally-matching prior fit. β stays cold. This
+    // is exactness-preserving — ρ only sets the outer optimizer's starting
+    // iterate, which still runs to its REML certificate — and behavior-neutral
+    // on a cold store (no parent ⇒ rho0 unchanged). It is the marquee LOSO win
+    // for the "cached inner beta length mismatch" cache-miss path.
+    if persistent_warm_start.is_none() && !rho0.is_empty() {
+        if let Some(warm_rho) =
+            consume_fit_artifact_rho::<F>(specs, &label_layout.physical_to_outer, &rho0)
+        {
+            if warm_rho.len() == rho0.len() && warm_rho.iter().all(|v| v.is_finite()) {
+                rho0 = warm_rho;
+            }
+        }
+    }
 
     if rho0.is_empty() {
         let physical_rho0 = expand_labeled_log_lambdas(&rho0, &label_layout)?;
@@ -649,6 +667,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             persistent_warm_start_key.as_deref(),
             specs,
             &warm_start,
+        );
+        // Cross-fit FitArtifact capture (Phase 0/1): persist the converged
+        // raw-β + ρ under the descriptor-indexed keyspace so a later fold
+        // can warm-start its ρ. Best-effort; never affects this fit.
+        capture_fit_artifact::<F>(
+            specs,
+            &canonical.gauge,
+            &warm_start.block_beta,
+            &warm_start.rho,
+            &label_layout.physical_to_outer,
+            penalized_objective,
+            inner.converged,
         );
         let inner_converged = inner.converged;
         return assemble_custom_family_fit_result(
@@ -1459,6 +1489,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         context: "fit_custom_family penalized objective",
         reason,
     })?;
+    // Cross-fit FitArtifact capture (Phase 0/1) for the converged smoothing
+    // fit: persist the descriptor-indexed raw-β + ρ so a later fold transfers
+    // ρ. Best-effort; never affects this fit's result.
+    capture_fit_artifact::<F>(
+        specs,
+        &canonical.gauge,
+        &final_warm_start.block_beta,
+        &final_warm_start.rho,
+        &label_layout.physical_to_outer,
+        penalized_objective,
+        !nonconvergence_escalation,
+    );
     // Never-fail terminal rung. Under escalation, sample the proper posterior
     // `N(β̂, H⁻¹)` whose precision `H` is the SAME penalized (Jeffreys-augmented)
     // joint Hessian the inner solve produced at the reached mode `β̂`, and report

@@ -26,6 +26,222 @@ use ndarray::{Array1, Array2};
 use std::any::type_name;
 use std::sync::atomic::Ordering;
 
+use crate::solver::warm_start_artifact::{
+    term_identity_from_block, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
+    RowPopulationTag, SerializableBasisMeta, TermArtifact, TermIdentityKey, TermRole,
+    FIT_ARTIFACT_SCHEMA,
+};
+use crate::solver::warm_start_transfer::{
+    build_warm_start, TermBuildContext, TransferConfig, TransferProvenance,
+};
+
+/// Build the structural identity of each block at the fit-spec layer. The
+/// returned `TermIdentityKey` is fold-invariant (keyed on block name +
+/// penalty structure, never on row-dependent values), which is exactly what
+/// lets an LOSO fold match a prior full-data artifact.
+fn block_term_identity(spec: &ParameterBlockSpec) -> TermIdentityKey {
+    let role = TermRole::from_block_name(&spec.name);
+    let labels: Vec<Option<String>> = spec
+        .penalties
+        .iter()
+        .map(|p| p.precision_label().map(str::to_owned))
+        .collect();
+    term_identity_from_block(role, &spec.name, &labels, &spec.nullspace_dims)
+}
+
+/// Map each block to the set of OUTER ρ indices its penalties occupy, using
+/// the label layout's flat `physical_to_outer` table sliced by per-block
+/// penalty counts. Fixed (`None`) penalties contribute no outer slot.
+fn per_block_rho_slots(
+    specs: &[ParameterBlockSpec],
+    physical_to_outer: &[Option<usize>],
+) -> Vec<Vec<usize>> {
+    let mut out = Vec::with_capacity(specs.len());
+    let mut physical = 0usize;
+    for spec in specs {
+        let mut slots = Vec::new();
+        for _ in 0..spec.penalties.len() {
+            if let Some(Some(outer)) = physical_to_outer.get(physical) {
+                slots.push(*outer);
+            }
+            physical += 1;
+        }
+        out.push(slots);
+    }
+    out
+}
+
+/// Build the [`FitDescriptor`] for a fit from its specs and family kind. The
+/// descriptor key (used for cross-fit lookup) excludes rows/response by
+/// construction (see [`FitDescriptor::descriptor_key`]).
+fn descriptor_for(specs: &[ParameterBlockSpec], family_kind: &str, n_rows: usize) -> FitDescriptor {
+    let term_identities = specs.iter().map(block_term_identity).collect();
+    FitDescriptor {
+        family_kind: family_kind.to_string(),
+        term_identities,
+        response_signature: ResponseSig {
+            family_kind: family_kind.to_string(),
+            n_response_channels: 1,
+        },
+        row_population: Some(RowPopulationTag {
+            n_rows,
+            label: None,
+        }),
+    }
+}
+
+/// Capture and persist a cross-fit [`FitArtifact`] from a converged fit.
+///
+/// `gauge` lifts the converged REDUCED per-block β to RAW coordinates (the
+/// identifiability transform is fit-specific, so we store gauge-free raw
+/// coefficients). `rho` is the converged outer log-smoothing vector;
+/// per-block slices are taken via the label layout. Best-effort: any anomaly
+/// (length mismatch, non-finite, lift failure) silently skips the capture —
+/// a missing artifact only forfeits a future warm start, never the fit.
+pub(crate) fn capture_fit_artifact<F: CustomFamily + ?Sized>(
+    specs: &[ParameterBlockSpec],
+    gauge: &crate::solver::gauge::Gauge,
+    reduced_block_beta: &[Array1<f64>],
+    rho: &Array1<f64>,
+    physical_to_outer: &[Option<usize>],
+    outer_objective: f64,
+    converged: bool,
+) {
+    let family_kind = type_name::<F>();
+    let (n_rows, _names, _dims) = custom_family_cache_shape(specs);
+    if reduced_block_beta.len() != specs.len() || gauge.n_blocks() != specs.len() {
+        return;
+    }
+    // Lift reduced θ -> raw β per block. Pre-validate every block's reduced
+    // width against the gauge so we degrade to a skip on any disagreement
+    // rather than tripping the gauge's internal width assertion.
+    if gauge.block_starts_reduced.len() != specs.len() + 1 {
+        return;
+    }
+    for (b, beta) in reduced_block_beta.iter().enumerate() {
+        let expected = gauge.block_starts_reduced[b + 1] - gauge.block_starts_reduced[b];
+        if beta.len() != expected {
+            return;
+        }
+    }
+    let raw_block_beta = gauge.lift_block_betas(reduced_block_beta);
+    let slots = per_block_rho_slots(specs, physical_to_outer);
+    let mut terms = Vec::with_capacity(specs.len());
+    for (idx, spec) in specs.iter().enumerate() {
+        let raw_beta: Vec<f64> = raw_block_beta[idx].iter().copied().collect();
+        if raw_beta.iter().any(|v| !v.is_finite()) {
+            return;
+        }
+        let rho_for_term: Vec<f64> = slots[idx]
+            .iter()
+            .filter_map(|&s| rho.get(s).copied())
+            .collect();
+        if rho_for_term.iter().any(|v| !v.is_finite()) {
+            return;
+        }
+        terms.push(TermArtifact {
+            identity: block_term_identity(spec),
+            role: TermRole::from_block_name(&spec.name),
+            // No BasisMetadata at this layer; record the minimal structural
+            // stub so the serialized term is self-describing.
+            basis_meta: SerializableBasisMeta {
+                kind: "block-spec".to_string(),
+                degree: None,
+                num_knots: None,
+                n_centers: Some(spec.design.ncols() as u64),
+                nullspace_order: None,
+                matern_nu: None,
+                periodic: false,
+            },
+            joint_null_rotation: None,
+            raw_beta,
+            rho_for_term,
+        });
+    }
+    let artifact = FitArtifact {
+        schema: FIT_ARTIFACT_SCHEMA,
+        created_unix_secs: now_unix_secs(),
+        descriptor: descriptor_for(specs, family_kind, n_rows),
+        // family_kind is the static type name (fold-invariant).
+        terms,
+        global: GlobalFitSummary {
+            outer_objective,
+            converged,
+            n_rows,
+        },
+    };
+    if let Err(err) = crate::solver::persistent_warm_start::store_fit_artifact(&artifact) {
+        log::debug!("[fit-artifact] capture skipped: {err}");
+    }
+}
+
+/// Consume the best matching parent [`FitArtifact`] (exact descriptor-key
+/// match) and build a warm ρ vector for the current fit. β stays cold in
+/// Phase 1. Returns `None` (cold start) on any miss / anomaly — this can
+/// never error a fit.
+///
+/// The returned ρ is laid out in the current fit's OUTER coordinate system
+/// (same length as `rho_default`); the caller seeds it into the outer solve.
+pub(crate) fn consume_fit_artifact_rho<F: CustomFamily + ?Sized>(
+    specs: &[ParameterBlockSpec],
+    physical_to_outer: &[Option<usize>],
+    rho_default: &Array1<f64>,
+) -> Option<Array1<f64>> {
+    let family_kind = type_name::<F>();
+    let (n_rows, _names, _dims) = custom_family_cache_shape(specs);
+    let descriptor = descriptor_for(specs, family_kind, n_rows);
+    let key_hex = descriptor.descriptor_key().to_hex();
+    let parent =
+        crate::solver::persistent_warm_start::load_fit_artifact_by_descriptor(&key_hex)?;
+
+    let slots = per_block_rho_slots(specs, physical_to_outer);
+    let new_terms: Vec<TermBuildContext> = specs
+        .iter()
+        .zip(slots.into_iter())
+        .map(|(spec, rho_slots)| TermBuildContext {
+            identity: block_term_identity(spec),
+            reduced_block_width: spec.design.ncols(),
+            rho_slots,
+        })
+        .collect();
+
+    match build_warm_start(
+        &descriptor,
+        &new_terms,
+        rho_default,
+        &parent,
+        TransferConfig::default(),
+    ) {
+        Ok(result) => {
+            let n_warm = result
+                .provenance
+                .iter()
+                .filter(|p| matches!(p, TransferProvenance::RhoOnly))
+                .count();
+            if n_warm == 0 {
+                return None;
+            }
+            log::info!(
+                "[fit-artifact] cross-fit ρ-transfer: {n_warm}/{} terms warm-started from parent \
+                 descriptor={key_hex}",
+                new_terms.len(),
+            );
+            Some(result.rho)
+        }
+        Err(err) => {
+            log::debug!("[fit-artifact] ρ-transfer skipped: {err:?}");
+            None
+        }
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub(crate) fn hash_cf_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {
     hasher.write_usize(values.len());
     for &value in values {

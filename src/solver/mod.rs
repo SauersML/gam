@@ -39,6 +39,8 @@ pub mod structure_search;
 pub mod topology_formula;
 pub mod topology_selector;
 pub mod visualizer;
+pub(crate) mod warm_start_artifact;
+pub(crate) mod warm_start_transfer;
 pub mod workflow;
 
 pub use evidence::{

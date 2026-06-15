@@ -6,12 +6,40 @@
 //! validators are the correctness fail-safe; the fingerprint is just a fast
 //! filter.
 
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// 256-bit cache key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; 32]);
+
+impl Serialize for Fingerprint {
+    /// Serialize as the canonical 64-char lowercase hex string so on-disk
+    /// payloads carrying a `Fingerprint` (e.g. the cross-fit `FitArtifact`
+    /// term identities) are stable and human-readable.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Fingerprint {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HexVisitor;
+        impl Visitor<'_> for HexVisitor {
+            type Value = Fingerprint;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a 64-character hex-encoded SHA-256 fingerprint")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Fingerprint, E> {
+                Fingerprint::from_hex(v)
+                    .ok_or_else(|| de::Error::custom("invalid hex fingerprint"))
+            }
+        }
+        deserializer.deserialize_str(HexVisitor)
+    }
+}
 
 impl Fingerprint {
     pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -478,6 +506,20 @@ mod tests {
         slow.write_f64_slice_payload_slow_iter(values.iter().copied());
 
         assert_eq!(fast.finalize(), slow.finalize());
+    }
+
+    #[test]
+    fn fingerprint_serde_roundtrips_as_hex() {
+        let mut fp = Fingerprinter::new();
+        fp.absorb_str(b"k", "fingerprint-serde");
+        let key = fp.finalize();
+        let json = serde_json::to_string(&key).expect("serialize");
+        // Serialized form is the canonical quoted hex string.
+        assert_eq!(json, format!("\"{}\"", key.to_hex()));
+        let back: Fingerprint = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(key, back);
+        // A malformed hex payload is rejected, not silently aliased.
+        assert!(serde_json::from_str::<Fingerprint>("\"not-hex\"").is_err());
     }
 
     #[test]

@@ -32,7 +32,12 @@ pub(crate) fn cache_schema_tag() -> String {
     // fits, so the outer `skip-outer-validation` warm hit was lost (#1048). The
     // bump walls off any entries written under the old, drifting keys; they are
     // simply never matched (and TTL-evicted) rather than aliasing.
-    "schema3-unified-fingerprinter-v2".to_string()
+    // Bumped to `v3` when the descriptor-indexed cross-fit `FitArtifact`
+    // keyspace ("fit-artifact-key") was introduced alongside the existing
+    // inner/outer warm-start records. The bump walls off any entries written
+    // under the old layouts so a mixed-schema store never aliases a legacy
+    // payload into the new artifact reader (and vice versa).
+    "schema3-unified-fingerprinter-v3".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -296,9 +301,179 @@ pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::cach
     Some(std::sync::Arc::new(crate::cache::Session::open(store, fp)))
 }
 
+/// Persist a descriptor-indexed cross-fit [`FitArtifact`] under the
+/// `fit-artifact-key` keyspace, keyed by the descriptor's structural key (so
+/// an LOSO fold of the same model retrieves a prior full-data fit). The
+/// schema tag is folded into the key so legacy layouts are walled off.
+///
+/// Best-effort: encoding / store failures are swallowed (a warm-start
+/// artifact is never required), oversize payloads are dropped.
+pub(crate) fn store_fit_artifact(
+    artifact: &crate::solver::warm_start_artifact::FitArtifact,
+) -> Result<(), String> {
+    if !artifact.is_usable() {
+        // Never persist a non-finite / wrong-schema artifact: it could only
+        // ever be rejected on load anyway.
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec(artifact)
+        .map_err(|e| format!("failed to encode fit-artifact record: {e}"))?;
+    if bytes.len() as u64 > MAX_ENTRY_BYTES {
+        return Ok(());
+    }
+    let Some(store) = persistent_store() else {
+        return Ok(());
+    };
+    let key = artifact.descriptor.descriptor_key().to_hex();
+    let mut fp = Fingerprinter::new();
+    fp.absorb_str(b"fit-artifact-key", &cache_schema_tag());
+    fp.absorb_str(b"fit-artifact-descriptor", &key);
+    store
+        .save(&fp.finalize(), &bytes, None, None, EntryKind::Checkpoint)
+        .map(|_| ())
+        .map_err(|e| format!("failed to persist fit-artifact record: {e}"))
+}
+
+/// Load the newest valid cross-fit [`FitArtifact`] whose descriptor key
+/// matches `descriptor_key_hex` (the hex of [`crate::solver::warm_start_artifact::FitDescriptor::descriptor_key`]).
+///
+/// Uses `lookup_latest` (newest-valid) rather than objective-ranked lookup:
+/// descriptor-key matches can be different folds / row sets whose objectives
+/// are not on a common scale, so "lowest objective" is the wrong rule.
+/// Returns `None` (cold fallback) on any miss or non-finite payload.
+pub(crate) fn load_fit_artifact_by_descriptor(
+    descriptor_key_hex: &str,
+) -> Option<crate::solver::warm_start_artifact::FitArtifact> {
+    let store = persistent_store()?;
+    let mut fp = Fingerprinter::new();
+    fp.absorb_str(b"fit-artifact-key", &cache_schema_tag());
+    fp.absorb_str(b"fit-artifact-descriptor", descriptor_key_hex);
+    let entry = store.lookup_latest(&fp.finalize()).ok().flatten()?;
+    if entry.payload.len() as u64 > MAX_ENTRY_BYTES {
+        return None;
+    }
+    let artifact: crate::solver::warm_start_artifact::FitArtifact =
+        serde_json::from_slice(&entry.payload).ok()?;
+    // Finite-guard on the way out: a corrupt payload must cold-fallback,
+    // never poison a fit.
+    artifact.is_usable().then_some(artifact)
+}
+
 fn unix_secs_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod warm_start_artifact_tests {
+    use super::*;
+    use crate::solver::warm_start_artifact::{
+        term_identity, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
+        SerializableBasisMeta, TermArtifact, TermRole, FIT_ARTIFACT_SCHEMA,
+    };
+    use crate::terms::basis::types::{BasisMetadata, DuchonNullspaceOrder};
+    use ndarray::Array2;
+
+    fn duchon_meta(n_centers: usize) -> BasisMetadata {
+        BasisMetadata::Duchon {
+            centers: Array2::<f64>::zeros((n_centers, 2)),
+            length_scale: None,
+            periodic: None,
+            power: 1.0,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability_transform: None,
+            input_scales: None,
+            aniso_log_scales: None,
+            operator_collocation_points: None,
+        }
+    }
+
+    fn sample_artifact(family: &str, var: &str, rho: Vec<f64>) -> FitArtifact {
+        let meta = duchon_meta(8);
+        let id = term_identity(TermRole::Mean, &[var.to_string()], &meta);
+        FitArtifact {
+            schema: FIT_ARTIFACT_SCHEMA,
+            created_unix_secs: unix_secs_now(),
+            descriptor: FitDescriptor {
+                family_kind: family.to_string(),
+                term_identities: vec![id],
+                response_signature: ResponseSig {
+                    family_kind: family.to_string(),
+                    n_response_channels: 1,
+                },
+                row_population: None,
+            },
+            terms: vec![TermArtifact {
+                identity: id,
+                role: TermRole::Mean,
+                basis_meta: SerializableBasisMeta::from_metadata(&meta),
+                joint_null_rotation: None,
+                raw_beta: vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.6, -0.7, 0.8],
+                rho_for_term: rho,
+            }],
+            global: GlobalFitSummary {
+                outer_objective: -42.0,
+                converged: true,
+                n_rows: 500,
+            },
+        }
+    }
+
+    #[test]
+    fn artifact_round_trips_on_disk_by_descriptor() {
+        // Use a unique family-kind tag so this test's descriptor key is
+        // disjoint from any other run's keyspace (the store is process-shared
+        // under the temp dir).
+        let family = format!("test-roundtrip-{}", unix_secs_now());
+        let artifact = sample_artifact(&family, "x", vec![2.5]);
+        let key_hex = artifact.descriptor.descriptor_key().to_hex();
+
+        // If the platform temp dir is unwritable, the store is None and the
+        // round-trip is a no-op; only assert when persistence is available.
+        if persistent_store().is_none() {
+            return;
+        }
+        store_fit_artifact(&artifact).expect("store fit artifact");
+        let loaded = load_fit_artifact_by_descriptor(&key_hex)
+            .expect("artifact must be retrievable by descriptor key");
+        assert_eq!(loaded.schema, artifact.schema);
+        assert_eq!(loaded.terms.len(), 1);
+        assert_eq!(loaded.terms[0].identity, artifact.terms[0].identity);
+        assert_eq!(loaded.terms[0].rho_for_term, vec![2.5]);
+        assert_eq!(loaded.terms[0].raw_beta, artifact.terms[0].raw_beta);
+        assert_eq!(
+            loaded.descriptor.descriptor_key(),
+            artifact.descriptor.descriptor_key()
+        );
+    }
+
+    #[test]
+    fn loso_fold_descriptor_matches_full_data_artifact() {
+        let family = format!("test-loso-{}", unix_secs_now());
+        // Full-data fit on 1000 rows.
+        let mut full = sample_artifact(&family, "x", vec![1.7]);
+        full.descriptor.row_population =
+            Some(crate::solver::warm_start_artifact::RowPopulationTag {
+                n_rows: 1000,
+                label: Some("full".to_string()),
+            });
+        full.global.n_rows = 1000;
+        let full_key = full.descriptor.descriptor_key().to_hex();
+
+        // LOSO fold: same term identities, fewer rows. Its descriptor key
+        // must equal the full-data key, so the load hits the stored artifact.
+        let fold = sample_artifact(&family, "x", vec![1.7]);
+        let fold_key = fold.descriptor.descriptor_key().to_hex();
+        assert_eq!(full_key, fold_key, "fold and full descriptor keys must match");
+
+        if persistent_store().is_none() {
+            return;
+        }
+        store_fit_artifact(&full).expect("store full-data artifact");
+        let loaded = load_fit_artifact_by_descriptor(&fold_key)
+            .expect("LOSO fold must retrieve the full-data artifact");
+        assert_eq!(loaded.terms[0].rho_for_term, vec![1.7]);
+    }
 }
