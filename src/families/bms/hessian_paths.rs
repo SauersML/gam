@@ -268,11 +268,27 @@ impl BernoulliBlockHessianAccumulator {
         w_mg: &Array1<f64>,
         w_gg: &Array1<f64>,
     ) {
-        self.h_mm += &crate::faer_ndarray::fast_xt_diag_x(x, w_mm);
-        if w_mg.iter().any(|value| *value != 0.0) {
-            self.h_mg += &crate::faer_ndarray::fast_xt_diag_y(x, w_mg, g);
+        // Biobank-scale lever: the marginal (`h_mm`) and logslope (`h_gg`)
+        // weighted Gram blocks are the dominant `Xᵀ diag(w) X` reductions over
+        // n ≈ 356k rows. Route each to the CUDA f64 GEMM when a device is
+        // present and the chunk clears the device flop floor; the CPU
+        // chunked-BLAS3 path is the f64 fallback (no device, below threshold,
+        // transient decline). Bit-faithful within the manifold-path GPU/CPU
+        // f64 parity.
+        match w_mm.as_slice().and_then(|w| try_gpu_xt_diag_x(x, w)) {
+            Some(gpu_mm) => self.h_mm += &gpu_mm,
+            None => self.h_mm += &crate::faer_ndarray::fast_xt_diag_x(x, w_mm),
         }
-        self.h_gg += &crate::faer_ndarray::fast_xt_diag_x(g, w_gg);
+        if w_mg.iter().any(|value| *value != 0.0) {
+            match w_mg.as_slice().and_then(|w| try_gpu_xt_diag_y(x, w, g)) {
+                Some(gpu_mg) => self.h_mg += &gpu_mg,
+                None => self.h_mg += &crate::faer_ndarray::fast_xt_diag_y(x, w_mg, g),
+            }
+        }
+        match w_gg.as_slice().and_then(|w| try_gpu_xt_diag_x(g, w)) {
+            Some(gpu_gg) => self.h_gg += &gpu_gg,
+            None => self.h_gg += &crate::faer_ndarray::fast_xt_diag_x(g, w_gg),
+        }
     }
 
     /// Batch the exact h/w pullback terms for one row chunk.
@@ -1050,6 +1066,93 @@ pub(super) fn add_weighted_chunk_gradient<S: ndarray::Data<Elem = f64>>(
     *target += &crate::faer_ndarray::fast_atv(chunk, &weights_view);
 }
 
+/// GPU-routed `Xᵀ diag(w) X` for one materialized row chunk.
+///
+/// This is the biobank-scale lever: the BMS rigid fit's dominant work is the
+/// repeated chunked `Xᵀ diag(w) X` Gram over `n ≈ 356k` rows. When a CUDA
+/// device is present (runtime auto-probe — the same `GpuRuntime::global()`
+/// gate the manifold / arrow-Schur dense paths use, NO flag, NO env var) and
+/// the per-chunk reduction work clears the device flop floor
+/// (`xtwx_target_is_gpu`, keyed on `(rows, cols)`), the symmetric crossprod is
+/// dispatched to cuBLAS f64 GEMM via [`crate::gpu::blas::xt_diag_x_cuda`].
+/// Returns `Some(gram)` on a device hit and `None` on any decline (no CUDA,
+/// below threshold, transient device-unavailable) so the caller transparently
+/// uses the CPU chunked-BLAS3 path. The device result is bit-faithful within
+/// the documented GPU/CPU f64 parity already accepted for the manifold dense
+/// Gram — both are an fp64 `Xᵀ diag(w) X` reduction over the identical rows.
+#[cfg(target_os = "linux")]
+fn try_gpu_xt_diag_x<S: ndarray::Data<Elem = f64>>(
+    chunk: &ndarray::ArrayBase<S, ndarray::Ix2>,
+    weights: &[f64],
+) -> Option<Array2<f64>> {
+    let runtime = crate::gpu::runtime::GpuRuntime::global()?;
+    let (rows, cols) = chunk.dim();
+    // The chunk is a materialized dense row block here (the caller already
+    // resolved the design to dense views / owned chunks before calling), so
+    // `materialized = true`.
+    if !runtime.policy().xtwx_target_is_gpu(rows, cols, true) {
+        return None;
+    }
+    let weights_view = ndarray::ArrayView1::from(weights);
+    crate::gpu::blas::xt_diag_x_cuda(runtime, chunk.view(), weights_view)
+}
+
+/// Off-Linux: no CUDA runtime exists, so the device crossprod is never
+/// attempted and the caller stays on the CPU chunked-BLAS3 Gram. The shapes
+/// are validated for parity with the Linux gate so a mis-sized chunk is
+/// rejected identically on both platforms.
+#[cfg(not(target_os = "linux"))]
+fn try_gpu_xt_diag_x<S: ndarray::Data<Elem = f64>>(
+    chunk: &ndarray::ArrayBase<S, ndarray::Ix2>,
+    weights: &[f64],
+) -> Option<Array2<f64>> {
+    crate::gpu::runtime::GpuRuntime::global()?;
+    let (rows, cols) = chunk.dim();
+    if rows == 0 || cols == 0 || rows != weights.len() {
+        return None;
+    }
+    None
+}
+
+/// GPU-routed `Xᵀ diag(w) Y` cross-Gram for one materialized row chunk.
+///
+/// Companion to [`try_gpu_xt_diag_x`] for the marginal↔logslope cross block
+/// (`h_mg`). Gates on `xtwy_target_is_gpu` (keyed on `(rows, p_x, q)`) and
+/// dispatches to [`crate::gpu::blas::xt_diag_y_cuda`]; `None` falls back to the
+/// CPU `fast_xt_diag_y`.
+#[cfg(target_os = "linux")]
+fn try_gpu_xt_diag_y<SX: ndarray::Data<Elem = f64>, SY: ndarray::Data<Elem = f64>>(
+    x: &ndarray::ArrayBase<SX, ndarray::Ix2>,
+    weights: &[f64],
+    y: &ndarray::ArrayBase<SY, ndarray::Ix2>,
+) -> Option<Array2<f64>> {
+    let runtime = crate::gpu::runtime::GpuRuntime::global()?;
+    let (rows, p_x) = x.dim();
+    let (rows_y, q) = y.dim();
+    if rows != rows_y || rows != weights.len() {
+        return None;
+    }
+    if !runtime.policy().xtwy_target_is_gpu(rows, p_x, q, true) {
+        return None;
+    }
+    let weights_view = ndarray::ArrayView1::from(weights);
+    crate::gpu::blas::xt_diag_y_cuda(runtime, x.view(), weights_view, y.view())
+}
+
+/// Off-Linux companion to [`try_gpu_xt_diag_y`]: no CUDA runtime, CPU fallback.
+#[cfg(not(target_os = "linux"))]
+fn try_gpu_xt_diag_y<SX: ndarray::Data<Elem = f64>, SY: ndarray::Data<Elem = f64>>(
+    x: &ndarray::ArrayBase<SX, ndarray::Ix2>,
+    weights: &[f64],
+    y: &ndarray::ArrayBase<SY, ndarray::Ix2>,
+) -> Option<Array2<f64>> {
+    crate::gpu::runtime::GpuRuntime::global()?;
+    if x.nrows() != y.nrows() || x.nrows() != weights.len() {
+        return None;
+    }
+    None
+}
+
 pub(super) fn new_cell_moment_lru_cache(
     policy: &crate::resource::ResourcePolicy,
 ) -> Arc<exact_kernel::CellMomentLruCache> {
@@ -1080,6 +1183,15 @@ pub(super) fn add_weighted_chunk_gram<S: ndarray::Data<Elem = f64>>(
     weights: &[f64],
     target: &mut Array2<f64>,
 ) {
+    // Biobank-scale lever: route the chunked `Xᵀ diag(w) X` Gram to the CUDA
+    // f64 GEMM when a device is present and the chunk clears the device flop
+    // floor; otherwise the CPU chunked-BLAS3 kernel below. Bit-faithful within
+    // the manifold-path GPU/CPU f64 parity (same fp64 reduction over the same
+    // rows).
+    if let Some(gpu_gram) = try_gpu_xt_diag_x(chunk, weights) {
+        *target += &gpu_gram;
+        return;
+    }
     let weights_view = ndarray::ArrayView1::from(weights);
     *target += &crate::faer_ndarray::fast_xt_diag_x(chunk, &weights_view);
 }
