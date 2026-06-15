@@ -1,3 +1,16 @@
+## gamfit 0.1.201 (2026-06-14)
+
+Performance: biobank marginal-slope fits no longer stall on the per-coefficient
+Jeffreys/Firth curvature. Two fixes to the joint-Newton hot path:
+- The exact Jeffreys curvature term H_phi was built by a serial p-pass loop, each
+  a full-data directional-derivative sweep (~55s deterministic on n~2e5, p=35,
+  arming at the ill-conditioned converged cycle). The p independent directions
+  now evaluate in parallel across the Rayon pool (bit-identical math).
+- Nested faer-BLAS GEMMs inside Rayon row-parallel assembly were pinned to
+  single-thread, collapsing rayon x BLAS thread oversubscription (~300 ->
+  cores) with no caps and no environment variables. gam owns parallelism and
+  saturates the hardware with one level of fan-out.
+
 ## gamfit 0.1.200 (2026-06-14)
 
 PyPI Linux-wheel refresh with post-0.1.199 fixes for generation,
