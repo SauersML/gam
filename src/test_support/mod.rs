@@ -310,6 +310,16 @@ pub mod debug_stash {
         /// the IFT direction taken from the kernel's own pseudo-inverse
         /// `v = H_pen⁺·coord.g` instead of the full `hop.solve`.
         pub correction_tr_proj: Option<f64>,
+        /// HVP ψ-gradient attribution (#740): the cost-derivative `a` term that
+        /// enters the outer gradient as `a + ½·logdet_h − ½·logdet_s`. Exposed
+        /// so a per-component FD of the outer VALUE can be matched against each
+        /// analytic piece (`a` ↔ FD of `−ℓ(β̂)+½β̂ᵀSλβ̂`, `½·production_tr` ↔ FD
+        /// of `½log|H+Sλ|`, `½·ld_s` ↔ FD of `½log|Sλ|₊`) to localize the
+        /// disagreement to a single term rather than the assembled gradient.
+        pub coord_a: Option<f64>,
+        /// HVP ψ-gradient attribution (#740): the `∂log|Sλ|₊/∂ψ` penalty-logdet
+        /// derivative `ld_s` for this coordinate (see [`Self::coord_a`]).
+        pub coord_ld_s: Option<f64>,
     }
 
     thread_local! {
@@ -322,6 +332,8 @@ pub mod debug_stash {
             frozen_tr: None,
             correction_tr: None,
             correction_tr_proj: None,
+            coord_a: None,
+            coord_ld_s: None,
         }) };
     }
 

@@ -1162,6 +1162,12 @@ pub fn reml_laml_evaluate(
             if let Some(stash) = diag_stash.as_mut() {
                 stash.projection_active = Some(solution.penalty_subspace_trace.is_some());
                 stash.production_tr = Some(trace_logdet_i);
+                // HVP ψ-gradient attribution (#740): expose the cost-derivative
+                // `a` and penalty-logdet `ld_s` pieces of this coordinate's
+                // outer gradient so a per-component FD of the outer value can be
+                // matched against each analytic term independently.
+                stash.coord_a = Some(coord.a);
+                stash.coord_ld_s = Some(coord.ld_s);
                 let correction = ext_corrections[ext_idx].as_ref();
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
                 let unprojected = match &drift {

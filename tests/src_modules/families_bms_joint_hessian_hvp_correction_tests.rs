@@ -2036,6 +2036,47 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let (cost_minus, _, _) = outer_at(-eps, 0.0, EvalMode::ValueOnly);
     let fd_psi_gradient = (cost_plus - cost_minus) / (2.0 * eps);
     let analytic_psi_gradient = grad0[n_rho];
+
+    // #740 HVP ψ-gradient attribution (read-only diagnostic; does NOT alter the
+    // assertion or tolerance below). Re-run the base ValueGradientHessian eval
+    // under a debug-stash CaptureGuard so the per-coordinate split of the outer
+    // ψ-gradient (`a`, `½·production_tr`, `−½·ld_s`, and the frozen-B_i vs cubic
+    // IFT-correction split of the logdet trace) is captured, and print it next to
+    // the FD total. The coordinator reads these MSI numbers to localize the
+    // disagreement to a single analytic term.
+    {
+        use crate::test_support::debug_stash;
+        let _capture = debug_stash::CaptureGuard::request();
+        let (base_obj, _, _) = outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
+        assert!(
+            base_obj.is_finite(),
+            "stash-capture base eval must reproduce a finite outer objective"
+        );
+        let stash = debug_stash::take_terms();
+        let half_prod = stash.production_tr.map(|t| 0.5 * t);
+        let half_ld_s = stash.coord_ld_s.map(|t| 0.5 * t);
+        let recon = match (stash.coord_a, half_prod, half_ld_s) {
+            (Some(a), Some(hp), Some(hs)) => Some(a + hp - hs),
+            _ => None,
+        };
+        println!(
+            "[HVP-attr] analytic_psi_grad={analytic_psi_gradient:.8e} fd_psi_grad={fd_psi_gradient:.8e} \
+             coord_a={:?} production_tr={:?} half_production_tr={:?} coord_ld_s={:?} \
+             half_ld_s={:?} recon_a+halfprod-halflds={:?} frozen_tr={:?} correction_tr={:?} \
+             correction_tr_proj={:?} projection_active={:?} unprojected_tr={:?}",
+            stash.coord_a,
+            stash.production_tr,
+            half_prod,
+            stash.coord_ld_s,
+            half_ld_s,
+            recon,
+            stash.frozen_tr,
+            stash.correction_tr,
+            stash.correction_tr_proj,
+            stash.projection_active,
+            stash.unprojected_tr,
+        );
+    }
     let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());
     let psi_gradient_rel = (analytic_psi_gradient - fd_psi_gradient).abs() / psi_gradient_scale;
     assert!(
