@@ -739,64 +739,6 @@ fn blas3_gram_chunk_rows(n: usize) -> usize {
     by_target.clamp(MIN_CHUNK_ROWS, MAX_CHUNK_ROWS).max(1)
 }
 
-/// Whole-design GPU dispatch for the rigid `Xᵀ diag(w) X` joint Hessian.
-///
-/// The CPU chunked-BLAS3 path (`hessian_dense_blas3` / the directional and
-/// second-directional `_blas3` builders) hand-partitions the n rows into
-/// `blas3_gram_chunk_rows`-sized blocks and fans them across the Rayon pool with
-/// each chunk's faer GEMM pinned to `Par::Seq` — the right design when the Gram
-/// is CPU-bound. But that same fragmentation is actively hostile to the GPU: at
-/// biobank scale it would fire ~208 *independent* tiny `fast_xt_diag_*` calls
-/// concurrently from 208 Rayon workers, each its own host→device staging + cuBLAS
-/// launch + device→host copy, swamping the device with launch/transfer overhead
-/// and contending streams. The embarrassingly-parallel f64 GEMM the device wants
-/// is the WHOLE `Xᵀ diag(w) X` over all n rows as one dispatch.
-///
-/// This helper takes the full-n contracted per-row weights `(w_mm, w_mg, w_gg)`
-/// (the jet output the caller has already materialised) and the two dense design
-/// views and routes the complete joint `(p_m+p_g)²` Hessian through
-/// [`crate::gpu::linalg::try_fast_joint_hessian_2x2`] — the same auto-dispatch
-/// entry the manifold / Arrow-Schur paths use. That entry:
-///   * gates on `GpuRuntime::global()` (a CUDA device was probed at startup — the
-///     runtime auto-detection, NO flag / NO env var) AND the whole-n workload
-///     clearing the dense-reduction flop floor, returning `None` otherwise;
-///   * tiles the row dimension across EVERY usable device via
-///     `pool::scatter_batched` when the pool has >1 GPU;
-///   * assembles the marginal block (`Xᵀ diag(w_mm) X`), the logslope block
-///     (`Gᵀ diag(w_gg) G`) and the cross block (`Xᵀ diag(w_mg) G`) into the full
-///     symmetric Hessian on-device, exactly the three blocks `to_dense` lays out;
-///   * returns `None` on any backend failure (OOM, launch error, below-gate
-///     shape) so the caller runs the deterministic CPU chunked-BLAS3 fallback.
-///
-/// f64 throughout: identical arithmetic to the CPU faer Grams modulo IEEE-754
-/// reduction order — the same GPU/CPU parity the codebase already accepts for the
-/// manifold dense reductions (a tile-order reassociation, never a precision
-/// downgrade). The fused entry mirrors the upper triangle into the lower, so the
-/// returned matrix is the full symmetric joint Hessian ready to return directly.
-///
-/// Returns `None` (CPU fallback) whenever either design is operator-backed /
-/// residualised (no `as_dense_ref`): the device path needs a contiguous host
-/// matrix to stage, and densifying an operator design here would defeat the
-/// memory contract the chunked `try_row_chunk` path exists to honour.
-#[inline]
-fn rigid_joint_hessian_on_gpu(
-    marginal_design: &crate::linalg::matrix::DesignMatrix,
-    logslope_design: &crate::linalg::matrix::DesignMatrix,
-    w_mm: &Array1<f64>,
-    w_mg: &Array1<f64>,
-    w_gg: &Array1<f64>,
-) -> Option<Array2<f64>> {
-    let x_full = marginal_design.as_dense_ref()?;
-    let g_full = logslope_design.as_dense_ref()?;
-    crate::gpu::linalg::try_fast_joint_hessian_2x2(
-        x_full.view(),
-        g_full.view(),
-        w_mm.view(),
-        w_mg.view(),
-        w_gg.view(),
-    )
-}
-
 impl BernoulliRigidRowKernel {
     /// Chunked BLAS-3 implementation backing
     /// [`RowKernel::hessian_dense_override`]. `row_hessians[row]` is the cached
