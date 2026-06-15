@@ -1106,6 +1106,9 @@ fn try_gpu_xt_diag_x<S: ndarray::Data<Elem = f64>>(
     chunk: &ndarray::ArrayBase<S, ndarray::Ix2>,
     weights: &[f64],
 ) -> Option<Array2<f64>> {
+    // `global()` is `None` off-Linux, so this returns before touching the
+    // chunk; the shape read keeps the params live and mirrors the Linux gate
+    // (a mis-sized chunk is rejected identically on both platforms).
     crate::gpu::runtime::GpuRuntime::global()?;
     let (rows, cols) = chunk.dim();
     if rows == 0 || cols == 0 || rows != weights.len() {
