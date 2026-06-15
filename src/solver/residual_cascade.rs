@@ -681,7 +681,11 @@ impl Core {
         // level is coarse the iterative route is degenerate anyway and the dense
         // route would have been taken, but guard regardless.
         let ncoarse = ncoarse.min(self.m);
-        {
+        // Debug-only coarse-space layout trace (#1032). Gated on the log level so
+        // the per-call string build stays out of this preconditioner hot path,
+        // and routed through `log` (an `eprintln!` here trips the src banned-macro
+        // gate and broke the build).
+        if log::log_enabled!(log::Level::Debug) {
             let mut s = String::new();
             for (li, level) in self.levels.iter().enumerate() {
                 let a = level.col_offset;
@@ -699,7 +703,7 @@ impl Core {
                     if coarse { "C" } else { "F" }
                 ));
             }
-            eprintln!(
+            log::debug!(
                 "[1032-COARSE] λ={lambda:.3e} m={} ncoarse={ncoarse} cap={COARSE_SPACE_MAX}{s}",
                 self.m
             );
