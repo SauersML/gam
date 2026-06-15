@@ -603,23 +603,45 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
 
     let label_layout = penalty_label_layout(specs, penalty_counts.clone())?;
     let mut rho0 = label_layout.initial_rho.clone();
-    let (persistent_warm_start_key, persistent_warm_start) =
+    let (persistent_warm_start_key, mut persistent_warm_start) =
         load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
 
-    // Cross-fit warm start (Phase 1): when the exact response-keyed inner
-    // cache MISSES (a new fold / row population / reduced width), fall back to
-    // the descriptor-indexed FitArtifact store and transfer the smoothing
-    // parameters ρ from a structurally-matching prior fit. β stays cold. This
-    // is exactness-preserving — ρ only sets the outer optimizer's starting
-    // iterate, which still runs to its REML certificate — and behavior-neutral
-    // on a cold store (no parent ⇒ rho0 unchanged). It is the marquee LOSO win
-    // for the "cached inner beta length mismatch" cache-miss path.
+    // Cross-fit warm start: when the exact response-keyed inner cache MISSES
+    // (a new fold / row population / reduced width), fall back to the
+    // descriptor-indexed FitArtifact store and transfer BOTH the smoothing
+    // parameters ρ AND a function-space-projected starting β from a
+    // structurally-matching prior fit. The parent stores RAW β; we least-
+    // squares project it onto this fold's reduced subspace via the new gauge
+    // lift `T_b`, so the transfer survives a differing reduced width (the LOSO
+    // p=37 vs p=35 case that the exact-key path skips with "cached inner beta
+    // length mismatch"). This is exactness-preserving — a warm (ρ, β) only sets
+    // the inner Newton / outer REML starting iterate, which still runs to its
+    // KKT/REML certificate — and behavior-neutral on a cold store (no parent ⇒
+    // rho0 + cold β unchanged). Any anomaly degrades that block (or the whole
+    // transfer) to cold.
     if persistent_warm_start.is_none() && !rho0.is_empty() {
-        if let Some(warm_rho) =
-            consume_fit_artifact_rho::<F>(specs, &label_layout.physical_to_outer, &rho0)
-        {
-            if warm_rho.len() == rho0.len() && warm_rho.iter().all(|v| v.is_finite()) {
-                rho0 = warm_rho;
+        if let Some(warm) = consume_fit_artifact::<F>(
+            specs,
+            &canonical.gauge,
+            &label_layout.physical_to_outer,
+            &rho0,
+        ) {
+            let beta_widths_ok = warm.block_beta.len() == specs.len()
+                && warm
+                    .block_beta
+                    .iter()
+                    .zip(specs.iter())
+                    .all(|(beta, spec)| beta.len() == spec.design.ncols());
+            if warm.rho.len() == rho0.len()
+                && warm.rho.iter().all(|v| v.is_finite())
+                && beta_widths_ok
+            {
+                rho0 = warm.rho.clone();
+                // Route the projected β through the same inner warm-start
+                // channel the exact-key path uses (`CustomOuterState::new`):
+                // the inner solve's cold-start path copies per-block β where
+                // the reduced width matches and ignores it otherwise.
+                persistent_warm_start = Some(warm);
             }
         }
     }

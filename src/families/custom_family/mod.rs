@@ -55,7 +55,7 @@ pub(crate) use faer::Side;
 pub(crate) use joint_newton::whitened_spectrum;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 pub(crate) use persistent_cache::{
-    capture_fit_artifact, consume_fit_artifact_rho, load_persistent_custom_family_warm_start,
+    capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
     store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
 };
 pub(crate) use std::any::Any;

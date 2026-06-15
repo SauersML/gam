@@ -173,31 +173,69 @@ pub(crate) fn capture_fit_artifact<F: CustomFamily + ?Sized>(
     }
 }
 
+/// Extract block `b`'s sub-matrix of the gauge lift `T : reduced → raw`
+/// (shape `raw_width_b × reduced_width_b`), used to project the parent's RAW β
+/// into this fold's reduced coordinates. The gauge may be block-diagonal or
+/// block-upper-triangular; we take the on-diagonal `(raw_b, reduced_b)` block,
+/// which is exactly the per-block reduction section. Returns `None` on any
+/// partition/shape anomaly so the term falls back to a cold β.
+fn gauge_block_t(gauge: &crate::solver::gauge::Gauge, b: usize) -> Option<Array2<f64>> {
+    let r0 = *gauge.block_starts_raw.get(b)?;
+    let r1 = *gauge.block_starts_raw.get(b + 1)?;
+    let c0 = *gauge.block_starts_reduced.get(b)?;
+    let c1 = *gauge.block_starts_reduced.get(b + 1)?;
+    if r1 < r0 || c1 < c0 || r1 > gauge.t_full.nrows() || c1 > gauge.t_full.ncols() {
+        return None;
+    }
+    Some(gauge.t_full.slice(ndarray::s![r0..r1, c0..c1]).to_owned())
+}
+
 /// Consume the best matching parent [`FitArtifact`] (exact descriptor-key
-/// match) and build a warm ρ vector for the current fit. β stays cold in
-/// Phase 1. Returns `None` (cold start) on any miss / anomaly — this can
-/// never error a fit.
+/// match) and build a warm `(ρ, β)` start for the current fit.
 ///
-/// The returned ρ is laid out in the current fit's OUTER coordinate system
-/// (same length as `rho_default`); the caller seeds it into the outer solve.
-pub(crate) fn consume_fit_artifact_rho<F: CustomFamily + ?Sized>(
+/// ρ transfers per matched term (the marquee LOSO win); β is least-squares
+/// projected from the parent's RAW coefficients onto this fold's reduced
+/// subspace via the new gauge lift `T_b` — this is the function-space
+/// cross-fit transfer that survives a differing reduced width (e.g. p=37 vs
+/// p=35). Any per-block anomaly degrades that block to a cold zero β; any
+/// whole-artifact anomaly returns `None` (full cold start). This can never
+/// error a fit: a warm start only seeds the inner Newton's starting iterate,
+/// which still runs to its KKT/REML certificate.
+///
+/// The returned `ConstrainedWarmStart` carries ρ in the OUTER coordinate
+/// system (same length as `rho_default`) and per-block β in the reduced
+/// (`spec.design.ncols()`) coordinates, with `cached_inner = None` so the
+/// inner solve replays from the seed rather than reusing a stale mode.
+pub(crate) fn consume_fit_artifact<F: CustomFamily + ?Sized>(
     specs: &[ParameterBlockSpec],
+    gauge: &crate::solver::gauge::Gauge,
     physical_to_outer: &[Option<usize>],
     rho_default: &Array1<f64>,
-) -> Option<Array1<f64>> {
+) -> Option<ConstrainedWarmStart> {
     let family_kind = type_name::<F>();
     let (n_rows, _names, _dims) = custom_family_cache_shape(specs);
     let descriptor = descriptor_for(specs, family_kind, n_rows);
     let key_hex = descriptor.descriptor_key().to_hex();
     let parent = crate::solver::persistent_warm_start::load_fit_artifact_by_descriptor(&key_hex)?;
 
+    // The gauge must partition into exactly the spec blocks for the per-block
+    // T extraction to be meaningful; otherwise we transfer ρ only.
+    let gauge_aligned = gauge.n_blocks() == specs.len();
+
     let slots = per_block_rho_slots(specs, physical_to_outer);
     let new_terms: Vec<TermBuildContext> = specs
         .iter()
+        .enumerate()
         .zip(slots.into_iter())
-        .map(|(spec, rho_slots)| TermBuildContext {
+        .map(|((b, spec), rho_slots)| TermBuildContext {
             identity: block_term_identity(spec),
             rho_slots,
+            reduced_width: spec.design.ncols(),
+            gauge_t_block: if gauge_aligned {
+                gauge_block_t(gauge, b)
+            } else {
+                None
+            },
         })
         .collect();
 
@@ -209,23 +247,46 @@ pub(crate) fn consume_fit_artifact_rho<F: CustomFamily + ?Sized>(
         TransferConfig::default(),
     ) {
         Ok(result) => {
-            let n_warm = result
+            let n_rho = result
                 .provenance
                 .iter()
-                .filter(|p| matches!(p, TransferProvenance::RhoOnly))
+                .filter(|p| {
+                    matches!(p, TransferProvenance::RhoOnly | TransferProvenance::Projected)
+                })
                 .count();
-            if n_warm == 0 {
+            let n_beta = result
+                .provenance
+                .iter()
+                .filter(|p| matches!(p, TransferProvenance::Projected))
+                .count();
+            if n_rho == 0 && n_beta == 0 {
+                return None;
+            }
+            // Final finite-guard: a non-finite warm iterate is never seeded.
+            if result.rho.iter().any(|v| !v.is_finite())
+                || result
+                    .block_beta
+                    .iter()
+                    .any(|b| b.iter().any(|v| !v.is_finite()))
+                || result.block_beta.len() != specs.len()
+            {
+                log::debug!("[fit-artifact] cross-fit transfer skipped: non-finite warm iterate");
                 return None;
             }
             log::info!(
-                "[fit-artifact] cross-fit ρ-transfer: {n_warm}/{} terms warm-started from parent \
-                 descriptor={key_hex}",
+                "[CACHE] beta-warm action=projected source=cross-fit descriptor={key_hex} \
+                 terms={} rho_warm={n_rho} beta_projected={n_beta}",
                 new_terms.len(),
             );
-            Some(result.rho)
+            Some(ConstrainedWarmStart {
+                rho: result.rho,
+                block_beta: result.block_beta,
+                active_sets: vec![None; specs.len()],
+                cached_inner: None,
+            })
         }
         Err(err) => {
-            log::debug!("[fit-artifact] ρ-transfer skipped: {err:?}");
+            log::debug!("[CACHE] beta-warm action=cold-fallback reason={err:?}");
             None
         }
     }
