@@ -3855,6 +3855,15 @@
                 rho_dim,
                 &kappa_options,
             )
+            .map(|outcome| match outcome {
+                SpatialJointOutcome::Optimized {
+                    theta_star,
+                    final_value,
+                } => (theta_star, final_value),
+                SpatialJointOutcome::NonConverged { final_value, .. } => panic!(
+                    "exact joint spatial optimization did not converge (final_value={final_value})"
+                ),
+            })
             .expect("exact joint spatial optimization")
         };
 
