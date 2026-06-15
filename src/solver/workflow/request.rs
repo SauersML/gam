@@ -1067,7 +1067,7 @@ impl Default for FitConfig {
             time_degree: 3,
             time_num_internal_knots: 8,
             time_smooth_lambda: 1e-2,
-            survival_likelihood: "location-scale".into(),
+            survival_likelihood: "transformation".into(),
             survival_distribution: "gaussian".into(),
             threshold_time_k: None,
             threshold_time_degree: 3,
