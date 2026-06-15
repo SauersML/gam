@@ -105,7 +105,13 @@ fn bernoulli_marginal_slope_outer_seed_config_screens_glm_stability_anchors() {
         crate::seeding::SeedRiskProfile::GeneralizedLinear
     );
     assert_eq!(config.seed_budget, 1);
-    assert_eq!(config.screen_max_inner_iterations, 2);
+    // The BMS marginal-slope startup screen caps inner iterations at the first
+    // viable reachability floor (8). Two cycles sits below the observed KKT
+    // reachability floor for these startup seeds: it rejects every candidate
+    // and then immediately pays a second screening pass at cap=8, so the
+    // production config (`outer_seed_config`) starts at 8 and lets the cascade
+    // escalate only when needed. See d388d12e7.
+    assert_eq!(config.screen_max_inner_iterations, 8);
     assert_eq!(config.max_seeds, 6);
 
     let seeds = crate::seeding::generate_rho_candidates(6, None, &config);
