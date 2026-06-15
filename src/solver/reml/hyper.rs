@@ -2136,22 +2136,21 @@ impl<'a> RemlState<'a> {
         // moving-W Hessian term is irreducibly n-dependent for a GLM, #1033).
         // Gated for the GLM case only (NOT Gaussian, which uses the branch
         // above), a single ψ coordinate, gradient-only, no Firth.
-        let glm_tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> = if !for_hessian
-            && !is_gaussian_identity
-            && psi_dim == 1
-            && firth_op_original.is_none()
-        {
-            self.glm_psi_gram_deriv().and_then(|deriv| {
-                let (dgram_c, drhs_c) = deriv.as_ref();
-                if dgram_c.nrows() == p_dim && dgram_c.ncols() == p_dim && drhs_c.len() == p_dim {
-                    Some((dgram_c.clone(), drhs_c.clone()))
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
+        let glm_tensor_psi_deriv: Option<(Array2<f64>, Array1<f64>)> =
+            if !for_hessian && !is_gaussian_identity && psi_dim == 1 && firth_op_original.is_none()
+            {
+                self.glm_psi_gram_deriv().and_then(|deriv| {
+                    let (dgram_c, drhs_c) = deriv.as_ref();
+                    if dgram_c.nrows() == p_dim && dgram_c.ncols() == p_dim && drhs_c.len() == p_dim
+                    {
+                        Some((dgram_c.clone(), drhs_c.clone()))
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
 
         let mut coords = Vec::with_capacity(psi_dim);
         for (j, dir) in hyper_dirs.iter().enumerate() {

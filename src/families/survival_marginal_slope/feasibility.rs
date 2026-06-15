@@ -86,7 +86,11 @@ impl SurvivalMarginalSlopeFamily {
         Ok(LinearInequalityConstraints::from_paired(a, b))
     }
 
-    pub(crate) fn validate_time_qd1_feasible(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {
+    pub(crate) fn validate_time_qd1_feasible(
+        &self,
+        beta: &Array1<f64>,
+        label: &str,
+    ) -> Result<(), String> {
         if beta.is_empty() {
             return Ok(());
         }
@@ -227,6 +231,4 @@ impl SurvivalMarginalSlopeFamily {
         }
         Ok(())
     }
-
 }
-

@@ -12,9 +12,11 @@ pub(crate) struct SurvivalMarginalSlopeRowKernel {
     pub(crate) slices: BlockSlices,
 }
 
-
 impl SurvivalMarginalSlopeRowKernel {
-    pub(crate) fn new(family: SurvivalMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
+    pub(crate) fn new(
+        family: SurvivalMarginalSlopeFamily,
+        block_states: Vec<ParameterBlockState>,
+    ) -> Self {
         let slices = block_slices(&family, &block_states);
         Self {
             family,
@@ -23,7 +25,6 @@ impl SurvivalMarginalSlopeRowKernel {
         }
     }
 }
-
 
 impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     fn n_rows(&self) -> usize {
@@ -212,7 +213,6 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     }
 }
 
-
 impl SurvivalMarginalSlopeRowKernel {
     /// Assemble the `(n_out × 4·rank)` joint Jacobian-action projection `Jᵢ · F`
     /// from the four primary axes — `[entry+marginal | exit+marginal |
@@ -224,7 +224,12 @@ impl SurvivalMarginalSlopeRowKernel {
     /// axes, so it is built once and dropped, and every other axis is a
     /// statement-scoped temporary — keeping the assembly peak at
     /// `output + one n_out×rank block` rather than five blocks at once.
-    pub(crate) fn assemble_jf<F>(&self, factor: ArrayView2<'_, f64>, n_out: usize, axis: F) -> Array2<f64>
+    pub(crate) fn assemble_jf<F>(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        n_out: usize,
+        axis: F,
+    ) -> Array2<f64>
     where
         F: Fn(&DesignMatrix, ArrayView2<'_, f64>) -> Array2<f64>,
     {
@@ -258,7 +263,6 @@ impl SurvivalMarginalSlopeRowKernel {
     }
 }
 
-
 pub(crate) fn survival_axis_jf_via_design(
     design: &DesignMatrix,
     factor_block: ArrayView2<'_, f64>,
@@ -281,7 +285,6 @@ pub(crate) fn survival_axis_jf_via_design(
         }
     }
 }
-
 
 /// Row-range analogue of [`survival_axis_jf_via_design`]: one design's
 /// `(end-start) × rank` Jacobian-action block over rows `[start, end)`. Dense
@@ -318,4 +321,3 @@ pub(crate) fn survival_axis_jf_via_design_rows(
         }
     }
 }
-

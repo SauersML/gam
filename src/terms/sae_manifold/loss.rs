@@ -10,7 +10,6 @@ pub struct SaeManifoldLoss {
     pub evidence_gauge_deflated_directions: usize,
 }
 
-
 impl SaeManifoldLoss {
     pub const fn total(&self) -> f64 {
         self.data_fit + self.assignment_sparsity + self.smoothness + self.ard
@@ -23,7 +22,6 @@ impl SaeManifoldLoss {
         -self.total()
     }
 }
-
 
 /// Componentized analytic derivative of the SAE REML criterion with respect to
 /// the flat [`SaeManifoldRho`] layout.
@@ -45,7 +43,6 @@ pub struct SaeOuterRhoGradientComponents {
     /// Whether `third_order_correction` is populated from analytic channels.
     pub third_order_correction_available: bool,
 }
-
 
 impl SaeOuterRhoGradientComponents {
     #[must_use]

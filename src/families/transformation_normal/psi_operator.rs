@@ -420,7 +420,11 @@ impl TensorKroneckerPsiOperator {
         Ok(out)
     }
 
-    pub(crate) fn materialize_lifted(&self, resp_basis: &Array2<f64>, cov: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn materialize_lifted(
+        &self,
+        resp_basis: &Array2<f64>,
+        cov: &Array2<f64>,
+    ) -> Array2<f64> {
         dense_rowwise_kronecker(resp_basis.view(), cov.view())
     }
 
@@ -842,7 +846,9 @@ impl TransformationNormalPsiWorkspace {
     /// per-axis [`scop_psi_terms`] path that reloads it once per axis. Op
     /// counts are identical to the per-axis path; only the loop nesting and
     /// reduction shape change.
-    pub(crate) fn compute_all_axes(&self) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
+    pub(crate) fn compute_all_axes(
+        &self,
+    ) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
         crate::util::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
             1,
@@ -1161,7 +1167,9 @@ impl TransformationNormalPsiWorkspace {
         Ok(out)
     }
 
-    pub(crate) fn axis_snapshots(&self) -> Result<Vec<TransformationNormalPsiWorkspaceAxisSnapshot>, String> {
+    pub(crate) fn axis_snapshots(
+        &self,
+    ) -> Result<Vec<TransformationNormalPsiWorkspaceAxisSnapshot>, String> {
         let mut guard = self
             .cache
             .lock()
@@ -1520,7 +1528,9 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
     }
 }
 
-pub(crate) fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f64>, String> {
+pub(crate) fn extract_covariate_penalty_factor(
+    penalty: &PenaltyMatrix,
+) -> Result<Array2<f64>, String> {
     match penalty {
         PenaltyMatrix::Dense(matrix) => Ok(matrix.clone()),
         PenaltyMatrix::Blockwise { .. } => Ok(penalty.to_dense()),

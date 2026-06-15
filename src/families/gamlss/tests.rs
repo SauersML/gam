@@ -3528,7 +3528,10 @@ pub(crate) fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_fa
     assert!((&wls_legacy - &wls_opt).iter().all(|v| v.abs() < 1e-12));
 }
 
-pub(crate) fn simple_matern_term_collection(feature_cols: &[usize], length_scale: f64) -> TermCollectionSpec {
+pub(crate) fn simple_matern_term_collection(
+    feature_cols: &[usize],
+    length_scale: f64,
+) -> TermCollectionSpec {
     TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
@@ -6314,7 +6317,8 @@ pub(crate) fn wiggle_family_joint_exacthessian_directional_derivative_matches_fi
 }
 
 #[test]
-pub(crate) fn wiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference() {
+pub(crate) fn wiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference()
+ {
     assert!(file!().ends_with(".rs"));
     let n = 7usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
@@ -6631,7 +6635,8 @@ pub(crate) fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_
 }
 
 #[test]
-pub(crate) fn nonwiggle_family_joint_exacthessian_directional_derivative_matches_finite_difference() {
+pub(crate) fn nonwiggle_family_joint_exacthessian_directional_derivative_matches_finite_difference()
+{
     let n = 8usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
@@ -6703,7 +6708,8 @@ pub(crate) fn nonwiggle_family_joint_exacthessian_directional_derivative_matches
 }
 
 #[test]
-pub(crate) fn nonwiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference() {
+pub(crate) fn nonwiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference()
+ {
     let n = 8usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);

@@ -1,4 +1,3 @@
-
 #[derive(Clone, Debug)]
 pub struct TransformationNormalConfig {
     /// B-spline degree for the response-direction deviation basis (default 3).

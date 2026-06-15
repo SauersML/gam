@@ -8,6 +8,16 @@ use std::time::{Duration, Instant};
 
 const PROCESS_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Maximum number of per-thread phase lines emitted in one periodic dump
+/// (ordered by deepest-frame age, oldest first); the remainder is summarized
+/// as a count so the dump stays readable on a many-threaded process.
+const PROCESS_MONITOR_MAX_PHASE_LINES: usize = 8;
+
+/// A thread whose deepest instrumented frame has been live longer than this is
+/// flagged with a loud `[process-monitor][STALL]` line so a long unlogged
+/// phase is impossible to miss in the log.
+const PROCESS_MONITOR_STALL_THRESHOLD: Duration = Duration::from_secs(120);
+
 static PROCESS_MONITOR: OnceLock<Arc<ProcessMonitorState>> = OnceLock::new();
 
 thread_local! {
@@ -76,30 +86,79 @@ impl ProcessMonitorState {
             .lock()
             .expect("process monitor registry poisoned");
         let resource = ProcessResourceSnapshot::read();
-        log::info!(
-            "[process-monitor] elapsed={} {} active_threads={}",
-            format_duration(self.started.elapsed()),
-            resource.format(),
-            threads.len(),
-        );
+        // `threads` only ever holds entries whose scope stack is non-empty
+        // (`update_thread` removes a thread the moment its stack drains), so
+        // its length is exactly the count of threads currently inside an
+        // instrumented scope — the meaningful "active" metric.
+        let active_threads = threads.len();
+
+        // Build a per-thread view keyed on the DEEPEST frame (the innermost
+        // phase the thread is actually executing) and how long it has been
+        // there. Order oldest-first so the most-likely-stalled phases sort to
+        // the top of the (capped) dump.
+        struct ThreadPhase<'a> {
+            thread_label: String,
+            depth: usize,
+            updated_ago: Duration,
+            deepest_label: &'a str,
+            deepest_age: Duration,
+        }
+        let mut phases: Vec<ThreadPhase<'_>> = Vec::with_capacity(threads.len());
         for (thread_id, thread) in threads.iter() {
+            let Some(deepest) = thread.stack.last() else {
+                continue;
+            };
             let thread_label = match &thread.name {
                 Some(name) => format!("{thread_id}/{name}"),
                 None => thread_id.clone(),
             };
-            log::info!(
-                "[process-monitor] stack thread={} depth={} updated_ago={}",
+            phases.push(ThreadPhase {
                 thread_label,
-                thread.stack.len(),
-                format_duration(thread.updated.elapsed()),
+                depth: thread.stack.len(),
+                updated_ago: thread.updated.elapsed(),
+                deepest_label: deepest.label.as_str(),
+                deepest_age: deepest.entered.elapsed(),
+            });
+        }
+        phases.sort_by(|a, b| b.deepest_age.cmp(&a.deepest_age));
+
+        log::info!(
+            "[process-monitor] elapsed={} {} active_threads={}",
+            format_duration(self.started.elapsed()),
+            resource.format(),
+            active_threads,
+        );
+
+        // STALL warnings first, loud and unconditional (not subject to the
+        // per-dump phase-line cap) so a long unlogged phase is never silent.
+        for phase in phases
+            .iter()
+            .filter(|p| p.deepest_age >= PROCESS_MONITOR_STALL_THRESHOLD)
+        {
+            log::warn!(
+                "[process-monitor][STALL] thread={} phase={:?} stuck={}",
+                phase.thread_label,
+                phase.deepest_label,
+                format_duration(phase.deepest_age),
             );
-            for (idx, frame) in thread.stack.iter().enumerate() {
-                log::info!(
-                    "[process-monitor]   #{idx}: {} [{}]",
-                    frame.label,
-                    format_duration(frame.entered.elapsed()),
-                );
-            }
+        }
+
+        // Compact per-thread phase summary: deepest frame label + age, capped.
+        for phase in phases.iter().take(PROCESS_MONITOR_MAX_PHASE_LINES) {
+            log::info!(
+                "[process-monitor] phase thread={} depth={} deepest={:?} in_frame={} updated_ago={}",
+                phase.thread_label,
+                phase.depth,
+                phase.deepest_label,
+                format_duration(phase.deepest_age),
+                format_duration(phase.updated_ago),
+            );
+        }
+        if phases.len() > PROCESS_MONITOR_MAX_PHASE_LINES {
+            log::info!(
+                "[process-monitor] phase ... and {} more active thread(s) omitted",
+                phases.len() - PROCESS_MONITOR_MAX_PHASE_LINES,
+            );
         }
     }
 }

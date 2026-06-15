@@ -10,7 +10,6 @@ use super::row_kernel::*;
 
 use super::*;
 
-
 /// Fill one deviation-basis column of the *score-warp* coefficient jet.
 ///
 /// Shared body of the many `for_each_deviation_basis_cubic_at` visitor
@@ -37,7 +36,6 @@ pub(super) fn fill_score_basis_cell_coeff_jet(
         scale,
     );
 }
-
 
 /// Fill one deviation-basis column of the *link-wiggle* coefficient jet to
 /// first order only (value plus the `a`/`b`-partials).
@@ -66,7 +64,6 @@ pub(super) fn fill_link_basis_cell_coeff_gradient(
     ca[idx] = scale_coeff4(dc_aw_raw, scale);
     cb[idx] = scale_coeff4(dc_bw_raw, scale);
 }
-
 
 /// Fill one deviation-basis column of the *link-wiggle* coefficient jet.
 ///
@@ -104,7 +101,6 @@ pub(super) fn fill_link_basis_cell_coeff_jet(
     cbb[idx] = scale_coeff4(dc_bbw_raw, scale);
 }
 
-
 pub(super) fn assemble_bms_block_local_s_psi(
     deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
     per_block_rho: &Array1<f64>,
@@ -131,7 +127,6 @@ pub(super) fn assemble_bms_block_local_s_psi(
         Array2::<f64>::zeros((p_block, p_block))
     }
 }
-
 
 impl BernoulliMarginalSlopeFamily {
     #[inline]
@@ -2467,7 +2462,6 @@ impl BernoulliMarginalSlopeFamily {
     }
 }
 
-
 #[derive(Default)]
 pub(super) struct BernoulliInterceptSolveStats {
     pub(super) cached_short_circuit: AtomicUsize,
@@ -2480,7 +2474,6 @@ pub(super) struct BernoulliInterceptSolveStats {
     pub(super) seed_residual_gt_abs_tol: AtomicUsize,
     pub(super) max_full_solver_iters: AtomicUsize,
 }
-
 
 impl BernoulliInterceptSolveStats {
     pub(super) fn record_seed_residual(&self, residual: f64, abs_tol: f64) {

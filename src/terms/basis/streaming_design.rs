@@ -32,7 +32,6 @@ pub enum RadialScalarKind {
     ThinPlate { length_scale: f64, dim: usize },
 }
 
-
 impl RadialScalarKind {
     /// Evaluate the `(phi, q, t)` radial scalars for a given distance `r`.
     ///
@@ -227,7 +226,6 @@ impl RadialScalarKind {
     }
 }
 
-
 /// Shared chunked-operator machinery for the streaming basis evaluators.
 ///
 /// `StreamingMaternEvaluator`, `StreamingSphereEvaluator` and
@@ -381,7 +379,6 @@ trait ChunkedDesign {
     const ROW_CHUNK_SHAPE_MISMATCH: &'static str;
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingMaternEvaluator {
     pub(crate) data: Arc<Array2<f64>>,
@@ -394,7 +391,6 @@ pub(crate) struct StreamingMaternEvaluator {
     pub(crate) chunk_size: usize,
     pub(crate) total_cols: usize,
 }
-
 
 impl StreamingMaternEvaluator {
     pub(crate) fn new(
@@ -501,7 +497,6 @@ impl StreamingMaternEvaluator {
     }
 }
 
-
 impl ChunkedDesign for StreamingMaternEvaluator {
     const NAME: &'static str = "StreamingMaternEvaluator";
     const ROW_RANGE_OOB: &'static str = "StreamingMaternEvaluator row range out of bounds";
@@ -529,7 +524,6 @@ impl ChunkedDesign for StreamingMaternEvaluator {
     }
 }
 
-
 impl LinearOperator for StreamingMaternEvaluator {
     fn nrows(&self) -> usize {
         self.op_nrows()
@@ -552,7 +546,6 @@ impl LinearOperator for StreamingMaternEvaluator {
     }
 }
 
-
 impl DenseDesignOperator for StreamingMaternEvaluator {
     fn row_chunk_into(
         &self,
@@ -566,7 +559,6 @@ impl DenseDesignOperator for StreamingMaternEvaluator {
         self.chunked_to_dense()
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingSphereEvaluator {
@@ -583,7 +575,6 @@ pub(crate) struct StreamingSphereEvaluator {
     pub(crate) chunk_size: usize,
     pub(crate) total_cols: usize,
 }
-
 
 impl StreamingSphereEvaluator {
     pub(crate) fn new(
@@ -734,7 +725,6 @@ impl StreamingSphereEvaluator {
     }
 }
 
-
 impl ChunkedDesign for StreamingSphereEvaluator {
     const NAME: &'static str = "StreamingSphereEvaluator";
     const ROW_RANGE_OOB: &'static str = "StreamingSphereEvaluator row range out of bounds";
@@ -762,7 +752,6 @@ impl ChunkedDesign for StreamingSphereEvaluator {
     }
 }
 
-
 impl LinearOperator for StreamingSphereEvaluator {
     fn nrows(&self) -> usize {
         self.op_nrows()
@@ -785,7 +774,6 @@ impl LinearOperator for StreamingSphereEvaluator {
     }
 }
 
-
 impl DenseDesignOperator for StreamingSphereEvaluator {
     fn row_chunk_into(
         &self,
@@ -800,7 +788,6 @@ impl DenseDesignOperator for StreamingSphereEvaluator {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingBSplineEvaluator {
     pub(crate) data: Arc<Array1<f64>>,
@@ -811,7 +798,6 @@ pub(crate) struct StreamingBSplineEvaluator {
     pub(crate) chunk_size: usize,
     pub(crate) total_cols: usize,
 }
-
 
 impl StreamingBSplineEvaluator {
     pub(crate) fn new(
@@ -864,7 +850,6 @@ impl StreamingBSplineEvaluator {
     }
 }
 
-
 impl ChunkedDesign for StreamingBSplineEvaluator {
     const NAME: &'static str = "StreamingBSplineEvaluator";
     const ROW_RANGE_OOB: &'static str = "StreamingBSplineEvaluator row range out of bounds";
@@ -892,7 +877,6 @@ impl ChunkedDesign for StreamingBSplineEvaluator {
     }
 }
 
-
 impl LinearOperator for StreamingBSplineEvaluator {
     fn nrows(&self) -> usize {
         self.op_nrows()
@@ -915,7 +899,6 @@ impl LinearOperator for StreamingBSplineEvaluator {
     }
 }
 
-
 impl DenseDesignOperator for StreamingBSplineEvaluator {
     fn row_chunk_into(
         &self,
@@ -930,7 +913,6 @@ impl DenseDesignOperator for StreamingBSplineEvaluator {
     }
 }
 
-
 /// Data stored for streaming (on-the-fly) recomputation of radial jet scalars.
 /// Instead of persisting O(n*k*(d+2)) arrays, the operator stores the original
 /// data/centers/eta and recomputes q/t/s per chunk during matvec operations.
@@ -942,7 +924,6 @@ pub(crate) enum StreamingAxisMode {
     /// scaled squared radius r² = Σ_a exp(2η_a) h_a².
     ScalarTotal { metric_weights: Arc<[f64]> },
 }
-
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingRadialState {
@@ -964,7 +945,6 @@ pub(crate) struct StreamingRadialState {
     pub(crate) triplet_cache: Arc<std::sync::OnceLock<Option<StreamingTripletCache>>>,
 }
 
-
 #[derive(Debug)]
 pub(crate) struct StreamingTripletCache {
     pub(crate) phi: Vec<f64>,
@@ -972,14 +952,12 @@ pub(crate) struct StreamingTripletCache {
     pub(crate) t: Vec<f64>,
 }
 
-
 /// Memory cap (bytes) above which we keep streaming the radial scalars
 /// instead of materializing the (phi, q, t) triplet cache. Three `Vec<f64>`
 /// arrays of length `n × n_knots` consume `24 × n × n_knots` bytes; the cap
 /// keeps the resident footprint bounded for designs that would blow past a
 /// few hundred MiB.
 pub(crate) const STREAMING_TRIPLET_CACHE_BYTE_BUDGET: usize = 1 << 30;
-
 
 impl StreamingRadialState {
     pub(crate) fn cache_fits_budget(&self) -> bool {

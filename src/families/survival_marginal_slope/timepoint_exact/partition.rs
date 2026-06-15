@@ -166,6 +166,4 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<CachedPartitionCells, String> {
         self.build_cached_partition_with_moment_order(primary, a, b, beta_h, beta_w, 24)
     }
-
 }
-

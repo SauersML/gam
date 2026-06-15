@@ -18,7 +18,6 @@ pub(crate) fn family_arg_canonical_name(arg: FamilyArg) -> Option<&'static str> 
     }
 }
 
-
 /// CLI adapter over the canonical family resolver.
 ///
 /// The fit-routing contract — explicit family vs link-implied family, the
@@ -57,7 +56,6 @@ pub(crate) fn resolve_family(
     )
 }
 
-
 pub(crate) fn inverse_link_from_fitted_link_state(state: &FittedLinkState) -> Option<InverseLink> {
     match state {
         FittedLinkState::Standard(Some(link)) => Some(InverseLink::Standard(*link)),
@@ -68,7 +66,6 @@ pub(crate) fn inverse_link_from_fitted_link_state(state: &FittedLinkState) -> Op
         FittedLinkState::Mixture { state, .. } => Some(InverseLink::Mixture(state.clone())),
     }
 }
-
 
 pub(crate) fn resolve_binomial_inverse_link_for_fit(
     family: LikelihoodSpec,
@@ -107,7 +104,6 @@ pub(crate) fn resolve_binomial_inverse_link_for_fit(
     }
 }
 
-
 pub(crate) fn binomial_mean_linkwiggle_supports_family(
     family: &LikelihoodSpec,
     link_choice: Option<&LinkChoice>,
@@ -123,7 +119,6 @@ pub(crate) fn binomial_mean_linkwiggle_supports_family(
         && !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
 }
 
-
 pub(crate) fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {
         return false;
@@ -131,7 +126,6 @@ pub(crate) fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     y.iter()
         .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
 }
-
 
 /// Project the CLI's `EncodedDataset` column-kind tag onto the
 /// [`ResponseColumnKind`] consumed by the family layer. Mirrors the helper

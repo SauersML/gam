@@ -5,7 +5,6 @@
 
 use super::*;
 
-
 // Fixed stabilization ridge for PIRLS/PLS. `penalty_term` carries this as
 // ridge * ||beta||^2 (equivalently 0.5 * ridge * ||beta||^2 in the
 // 0.5 * (deviance + penalty_term) objective), and it is constant w.r.t. rho.
@@ -18,7 +17,6 @@ use super::*;
 //   envelope-theorem gradient valid:
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
 pub(crate) const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
-
 
 pub(crate) struct GamWorkingModel<'a> {
     pub(crate) x_original: DesignMatrix,
@@ -102,7 +100,6 @@ pub(crate) struct GamWorkingModel<'a> {
     pub(crate) glm_first_step_gram_consumed: bool,
 }
 
-
 pub(crate) struct GamModelFinalState {
     pub(crate) likelihood: GlmLikelihoodSpec,
     pub(crate) coordinate_frame: PirlsCoordinateFrame,
@@ -117,7 +114,6 @@ pub(crate) struct GamModelFinalState {
     pub(crate) final_d3mu_deta3: Array1<f64>,
     pub(crate) penalty_term: f64,
 }
-
 
 impl<'a> GamWorkingModel<'a> {
     pub(crate) fn new(
@@ -381,7 +377,10 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    pub(crate) fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
+    pub(crate) fn penalized_hessian(
+        &mut self,
+        weights: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
         // #1111 / #1033 mechanism (c): the frozen-weight first-Fisher-step Gram
         // `XᵀWX` (in the original / `x_fit` conditioned frame) serves the FIRST
         // Fisher-scoring iteration n-free, eliding the dominant O(N·p²) weighted
@@ -647,7 +646,6 @@ impl<'a> GamWorkingModel<'a> {
         })
     }
 }
-
 
 impl<'a> WorkingModel for GamWorkingModel<'a> {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {

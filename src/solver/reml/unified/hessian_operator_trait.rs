@@ -1,6 +1,5 @@
 use super::*;
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Core traits
 // ═══════════════════════════════════════════════════════════════════════════
@@ -21,7 +20,6 @@ pub struct StochasticTraceState {
     pub last_probe_count: usize,
 }
 
-
 /// Abstract interface for Hessian linear algebra operations.
 ///
 /// All operations use the SAME internal decomposition, ensuring spectral
@@ -36,7 +34,6 @@ pub struct StochasticTraceState {
 /// `2·m_s + m_h` Hutch++ matvecs do not beat `dim` dense H⁻¹ HVPs, so the dense
 /// fallback is cheaper.
 pub(crate) const HUTCHPP_TRACE_MIN_DIM: usize = 128;
-
 
 /// Build the Hutch++ stochastic-trace configuration for an operator of the given
 /// dimension. The sketch dimension grows with `dim` (one column per 32 of
@@ -57,7 +54,6 @@ pub(crate) fn hutchpp_config_for_dim(dim: usize) -> StochasticTraceConfig {
     config.n_probes_min = sketch.max(PROBES_MIN_FLOOR);
     config
 }
-
 
 pub trait HessianOperator: Send + Sync {
     /// log|H|₊ — pseudo-logdet using only active eigenvalues/pivots.
@@ -564,7 +560,6 @@ pub trait HessianOperator: Send + Sync {
     }
 }
 
-
 /// Representative curvature scale for a Hessian operator.
 ///
 /// Returns the geometric mean of the active Hessian eigenvalues,
@@ -588,5 +583,3 @@ pub fn hessian_operator_geometric_scale(op: &dyn HessianOperator) -> Option<f64>
         None
     }
 }
-
-

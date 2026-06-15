@@ -57,7 +57,6 @@ impl From<String> for SurvivalLocationScaleError {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Overflow-safe arithmetic for the survival exact-Newton chain
 // ---------------------------------------------------------------------------

@@ -14,17 +14,14 @@ pub struct SparsePirlsDecision {
     pub density_h_est: Option<f64>,
 }
 
-
 pub(crate) fn fmt_opt_usize(v: Option<usize>) -> String {
     v.map(|v| v.to_string()).unwrap_or_else(|| "na".to_string())
 }
-
 
 pub(crate) fn fmt_opt_f64(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.4}"))
         .unwrap_or_else(|| "na".to_string())
 }
-
 
 impl SparsePirlsDecision {
     pub(crate) fn path_str(&self) -> &'static str {
@@ -67,7 +64,6 @@ impl SparsePirlsDecision {
     }
 }
 
-
 pub(crate) fn pirls_decision_repetition_count(log_key: String) -> usize {
     static PIRLS_DECISION_LOG_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
     let counts = PIRLS_DECISION_LOG_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -77,21 +73,17 @@ pub(crate) fn pirls_decision_repetition_count(log_key: String) -> usize {
     *count
 }
 
-
 pub(crate) fn should_log_pirls_decision_summary(repetition_count: usize) -> bool {
     repetition_count > 1 && repetition_count.is_power_of_two()
 }
 
-
 pub(crate) const SPARSE_NATIVE_MAX_H_DENSITY: f64 = 0.30;
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct SparsePenaltyPattern {
     pub(crate) upper_triplets: Vec<(usize, usize, f64)>,
     pub(crate) nnz_upper: usize,
 }
-
 
 impl SparsePenaltyPattern {
     pub(crate) fn from_dense_upper(matrix: &Array2<f64>, tol: f64) -> Self {
@@ -113,7 +105,6 @@ impl SparsePenaltyPattern {
     }
 }
 
-
 #[derive(Clone, Debug)]
 pub(crate) struct SparsePenalizedSystemStats {
     pub(crate) nnz_xtwx_symbolic: usize,
@@ -121,7 +112,6 @@ pub(crate) struct SparsePenalizedSystemStats {
     pub(crate) nnz_h_upper: usize,
     pub(crate) density_upper: f64,
 }
-
 
 // Phase 2 sparse-native PIRLS will reuse this cache for symbolic structure and
 // repeated numeric assembly of H = X'WX + S_lambda + ridge I.
@@ -155,7 +145,6 @@ pub(crate) struct SparsePenalizedSystemCache {
     pub(crate) h_upperrow_idx: Vec<usize>,
     pub(crate) p: usize,
 }
-
 
 impl SparsePenalizedSystemCache {
     pub(crate) fn new(
@@ -318,7 +307,6 @@ impl SparsePenalizedSystemCache {
     }
 }
 
-
 pub(crate) fn build_penalized_symbolic(
     p: usize,
     xtwx_col_ptr: &[usize],
@@ -363,4 +351,3 @@ pub(crate) fn build_penalized_symbolic(
     // exactly the CSC invariants skipped by new_unchecked.
     Ok(unsafe { SymbolicSparseColMat::new_unchecked(p, p, col_ptr, None, row_idx) })
 }
-

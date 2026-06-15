@@ -229,7 +229,6 @@ pub fn update_glmvectors(
     }
 }
 
-
 /// Family-dispatched GLM vector update helper.
 #[inline]
 pub fn update_glmvectors_by_family(
@@ -243,7 +242,6 @@ pub fn update_glmvectors_by_family(
 ) -> Result<(), EstimationError> {
     likelihood.irls_update(y, eta, priorweights, mu, weights, z, None, None)
 }
-
 
 pub(crate) fn integrated_inverse_link_from_family(
     spec: &LikelihoodSpec,
@@ -288,7 +286,6 @@ pub(crate) fn integrated_inverse_link_from_family(
         ))),
     }
 }
-
 
 /// Updates Bernoulli-family GLM working vectors using an integrated
 /// (uncertainty-aware) inverse-link runtime.
@@ -492,7 +489,6 @@ pub fn update_glmvectors_integrated_for_link(
     Ok(())
 }
 
-
 /// Family-dispatched integrated GLM vector update helper.
 ///
 /// This is the adapter from structural likelihood families onto the canonical
@@ -549,7 +545,6 @@ pub fn update_glmvectors_integrated_by_family(
         derivatives,
     )
 }
-
 
 /// Compute first/second eta derivatives of the PIRLS working curvature W(eta),
 /// consistent with the clamped working-geometry rules used by
@@ -842,7 +837,6 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
     }
     Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
 }
-
 
 // General noncanonical observed-information weight corrections
 //

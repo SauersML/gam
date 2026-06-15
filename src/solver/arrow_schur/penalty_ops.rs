@@ -10,7 +10,6 @@ pub(crate) struct BetaEdge {
     pub(crate) b: usize,
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct BetaCouplingGraph {
     pub(crate) num_blocks: usize,
@@ -18,7 +17,6 @@ pub(crate) struct BetaCouplingGraph {
     pub(crate) adj_start: Vec<usize>,
     pub(crate) adj_targets: Vec<usize>,
 }
-
 
 impl BetaCouplingGraph {
     pub(crate) fn build(block_offsets: &[Range<usize>], htbeta_rows: &[Array2<f64>]) -> Self {
@@ -147,7 +145,6 @@ impl BetaCouplingGraph {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BetaBlockId(pub usize);
 
-
 /// Matrix-free operator for the penalty side of `H_ββ`.
 ///
 /// Callers must satisfy the additive convention: every method **adds** its
@@ -180,10 +177,8 @@ pub trait BetaPenaltyOp: Send + Sync {
     fn fingerprint(&self, hasher: &mut Fingerprinter);
 }
 
-
 /// Dense fallback: wraps the existing `K×K` `H_ββ` accumulator.
 pub struct DensePenaltyOp(pub Array2<f64>);
-
 
 impl BetaPenaltyOp for DensePenaltyOp {
     fn dim(&self) -> usize {
@@ -239,7 +234,6 @@ impl BetaPenaltyOp for DensePenaltyOp {
     }
 }
 
-
 /// Block-local penalty operator: applies per-block penalty matrices
 /// (matching `ParameterBlockSpec` boundaries) without materialising a
 /// full `K×K` dense matrix.
@@ -252,7 +246,6 @@ pub struct BlockPenaltyOp {
     /// `(global_start, local_matrix)` for each atom/block.
     pub blocks: Vec<(usize, Array2<f64>)>,
 }
-
 
 impl BetaPenaltyOp for BlockPenaltyOp {
     fn dim(&self) -> usize {
@@ -347,7 +340,6 @@ impl BetaPenaltyOp for BlockPenaltyOp {
     }
 }
 
-
 /// Kronecker-product penalty: `P = A ⊗ B` applied without materialising
 /// the full `(p_a·p_b)×(p_a·p_b)` matrix.
 pub struct KroneckerPenaltyOp {
@@ -360,7 +352,6 @@ pub struct KroneckerPenaltyOp {
     /// Full β dimension `K`.
     pub k: usize,
 }
-
 
 impl BetaPenaltyOp for KroneckerPenaltyOp {
     fn dim(&self) -> usize {
@@ -487,7 +478,6 @@ impl BetaPenaltyOp for KroneckerPenaltyOp {
     }
 }
 
-
 /// Kronecker-product penalty with an identity right factor:
 /// `P = A ⊗ I_p`.
 ///
@@ -505,7 +495,6 @@ pub struct IdentityRightKroneckerPenaltyOp {
     /// Full β dimension `K`.
     pub k: usize,
 }
-
 
 impl BetaPenaltyOp for IdentityRightKroneckerPenaltyOp {
     fn dim(&self) -> usize {
@@ -611,7 +600,6 @@ impl BetaPenaltyOp for IdentityRightKroneckerPenaltyOp {
     }
 }
 
-
 /// One co-occurring atom-pair block of a block-sparse left factor `A`.
 ///
 /// `data` is the dense `(m_i × m_j)` coupling between the basis columns of
@@ -627,7 +615,6 @@ pub struct SparseGBlock {
     /// Dense `(m_i × m_j)` coupling block.
     pub data: Array2<f64>,
 }
-
 
 /// Block-sparse Kronecker penalty `P = A ⊗ I_p` where the left factor `A`
 /// (dimension `dim_a × dim_a` in `μ`-space) is stored only on its non-empty
@@ -657,13 +644,11 @@ pub struct SparseBlockKroneckerPenaltyOp {
     pub blocks: Vec<SparseGBlock>,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct DeviceSaeSmoothBlock {
     pub global_offset: usize,
     pub factor_a: Array2<f64>,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct DeviceSaePcgData {
@@ -675,7 +660,6 @@ pub struct DeviceSaePcgData {
     pub sparse_g_blocks: Vec<SparseGBlock>,
 }
 
-
 impl DeviceSaePcgData {
     /// Snapshot the per-row active-atom support `a_phi` into a shared `Arc<[…]>`
     /// for the CPU residency operator ([`SaeResidentReducedSchur`]). Cloned once
@@ -686,7 +670,6 @@ impl DeviceSaePcgData {
         Arc::from(self.a_phi.clone().into_boxed_slice())
     }
 }
-
 
 impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
     fn dim(&self) -> usize {
@@ -813,7 +796,6 @@ impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
     }
 }
 
-
 /// One co-occurring `(atom_i, atom_j)` block of the **frame-factored** data-fit
 /// Gauss–Newton β-Hessian (issue #972 / #977 T1). Carries the basis-space Gram
 /// `g` (`m_i × m_j`) AND the per-pair frame output factor `w = U_iᵀ U_j`
@@ -833,7 +815,6 @@ pub struct FactoredFrameGBlock {
     /// between the two frames.
     pub w: Array2<f64>,
 }
-
 
 /// Frame-factored data-fit Gauss–Newton β-Hessian operator (#972 / #977 T1):
 /// the `Σ_k M_k·r_k` reduced-border analogue of [`SparseBlockKroneckerPenaltyOp`].
@@ -867,7 +848,6 @@ pub struct FactoredFrameKroneckerOp {
     pub blocks: Vec<FactoredFrameGBlock>,
 }
 
-
 /// Frame output Gram `U_iᵀ U_j` (`r_i × r_j`) between two per-atom output
 /// frames (each `p × r`). This is the dense principal-angle cosine matrix that
 /// becomes the `w` factor of a [`FactoredFrameGBlock`]; for `i == j` with an
@@ -892,7 +872,6 @@ pub fn frame_output_gram(u_i: ArrayView2<f64>, u_j: ArrayView2<f64>) -> Array2<f
     }
     w
 }
-
 
 impl FactoredFrameKroneckerOp {
     /// Build from per-atom ranks + basis sizes and the co-occurring blocks.
@@ -1032,7 +1011,6 @@ impl FactoredFrameKroneckerOp {
         Self::new(ranks, basis_sizes.to_vec(), blocks)
     }
 }
-
 
 impl BetaPenaltyOp for FactoredFrameKroneckerOp {
     fn dim(&self) -> usize {
@@ -1177,7 +1155,6 @@ impl BetaPenaltyOp for FactoredFrameKroneckerOp {
     }
 }
 
-
 /// Composite penalty: sum of multiple `BetaPenaltyOp` operators.
 pub struct CompositePenaltyOp {
     /// Full β dimension `K`.
@@ -1185,7 +1162,6 @@ pub struct CompositePenaltyOp {
     /// Component operators, each contributing additively.
     pub ops: Vec<Arc<dyn BetaPenaltyOp>>,
 }
-
 
 impl BetaPenaltyOp for CompositePenaltyOp {
     fn dim(&self) -> usize {
@@ -1235,7 +1211,6 @@ impl BetaPenaltyOp for CompositePenaltyOp {
     }
 }
 
-
 /// Adapts a closure-based matrix-free `H_ββ` operator (from
 /// [`ArrowSchurSystem::set_shared_beta_operator`]) to the `BetaPenaltyOp` trait.
 ///
@@ -1247,7 +1222,6 @@ pub struct MatvecDiagPenaltyOp {
     pub(crate) diagonal_vec: Array1<f64>,
 }
 
-
 impl MatvecDiagPenaltyOp {
     pub fn new(k: usize, matvec: SharedBetaMatvec, diagonal_vec: Array1<f64>) -> Self {
         assert_eq!(diagonal_vec.len(), k);
@@ -1258,7 +1232,6 @@ impl MatvecDiagPenaltyOp {
         }
     }
 }
-
 
 impl BetaPenaltyOp for MatvecDiagPenaltyOp {
     fn dim(&self) -> usize {

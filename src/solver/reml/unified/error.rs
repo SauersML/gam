@@ -1,8 +1,6 @@
-
 pub(crate) fn reml_contract_panic(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Typed errors for the unified REML/LAML evaluator.
@@ -41,7 +39,6 @@ pub enum RemlError {
     ContractViolation { reason: String },
 }
 
-
 impl std::fmt::Display for RemlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -53,9 +50,7 @@ impl std::fmt::Display for RemlError {
     }
 }
 
-
 impl std::error::Error for RemlError {}
-
 
 impl From<RemlError> for String {
     fn from(err: RemlError) -> String {

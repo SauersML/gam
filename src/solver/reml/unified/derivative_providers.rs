@@ -169,7 +169,6 @@ pub trait HessianDerivativeProvider: Send + Sync {
     }
 }
 
-
 /// Raw ingredients for the adjoint trace optimization in scalar GLMs.
 ///
 /// For single-predictor GLMs, the third-derivative correction is
@@ -187,7 +186,6 @@ pub struct ScalarGlmIngredients<'a> {
     /// Design matrix X in the transformed basis.
     pub x: &'a DesignMatrix,
 }
-
 
 #[derive(Clone)]
 pub enum OuterHessianDerivativeKernel {
@@ -211,7 +209,6 @@ pub enum OuterHessianDerivativeKernel {
     },
 }
 
-
 impl OuterHessianDerivativeKernel {
     pub(crate) fn from_scalar_glm(ingredients: ScalarGlmIngredients<'_>) -> Self {
         Self::ScalarGlm {
@@ -222,10 +219,8 @@ impl OuterHessianDerivativeKernel {
     }
 }
 
-
 /// Null implementation for Gaussian families (c=d=0).
 pub struct GaussianDerivatives;
-
 
 impl HessianDerivativeProvider for GaussianDerivatives {
     fn outer_hessian_derivative_kernel(&self) -> Option<OuterHessianDerivativeKernel> {
@@ -243,7 +238,6 @@ impl HessianDerivativeProvider for GaussianDerivatives {
         false
     }
 }
-
 
 /// Single-predictor GLM derivative provider.
 ///
@@ -283,7 +277,6 @@ pub struct SinglePredictorGlmDerivatives {
     /// Design matrix X in the transformed basis.
     pub x_transformed: DesignMatrix,
 }
-
 
 impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
     fn hessian_derivative_correction(
@@ -417,7 +410,6 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
     }
 }
 
-
 /// Firth-aware GLM derivative provider.
 ///
 /// Wraps the base GLM corrections with Firth/Jeffreys Hφ corrections:
@@ -429,7 +421,6 @@ pub struct FirthAwareGlmDerivatives {
     pub(crate) base: SinglePredictorGlmDerivatives,
     pub(crate) firth_op: std::sync::Arc<super::super::FirthDenseOperator>,
 }
-
 
 impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
     fn hessian_derivative_correction(
@@ -534,7 +525,6 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
     }
 }
 
-
 /// Exact Jeffreys/Firth term used by the unified outer evaluator.
 ///
 /// The scalar contribution and all outer derivatives must be sourced from the
@@ -559,7 +549,6 @@ pub struct ExactJeffreysTerm {
     /// always `Some` (it IS the value).
     pub(crate) value_override: Option<f64>,
 }
-
 
 impl ExactJeffreysTerm {
     pub(crate) fn new(operator: std::sync::Arc<super::super::FirthDenseOperator>) -> Self {
@@ -613,7 +602,6 @@ impl ExactJeffreysTerm {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Guarded scalar correction (value + ρ-gradient under ONE include flag)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -642,7 +630,6 @@ pub(crate) struct GuardedCorrection {
     /// applied; when `true`, BOTH are.
     pub(crate) include: bool,
 }
-
 
 impl GuardedCorrection {
     /// Construct a guarded correction from a loose `(value, gradient)` pair and
@@ -676,7 +663,6 @@ impl GuardedCorrection {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Log-barrier support for constrained coefficients
 // ═══════════════════════════════════════════════════════════════════════════
@@ -697,7 +683,6 @@ pub struct BarrierConfig {
     /// Direction `s_j` for each coordinate constraint `s_j β_j >= b_j`.
     pub bound_signs: Vec<f64>,
 }
-
 
 impl BarrierConfig {
     /// Construct a `BarrierConfig` from linear inequality constraints `A β ≥ b`
@@ -909,7 +894,6 @@ impl BarrierConfig {
     }
 }
 
-
 /// Barrier-aware Hessian derivative provider wrapping an inner provider.
 ///
 /// Adds C_bar[u] = −2τ·diag(u ⊙ d^(3)) and Q_bar[u,v] = 6τ·diag(u ⊙ v ⊙ d^(4)).
@@ -921,7 +905,6 @@ pub struct BarrierDerivativeProvider<'a> {
     pub(crate) slacks: Vec<f64>,
     pub(crate) p: usize,
 }
-
 
 impl<'a> BarrierDerivativeProvider<'a> {
     pub fn new(
@@ -951,7 +934,11 @@ impl<'a> BarrierDerivativeProvider<'a> {
         result
     }
 
-    pub(crate) fn barrier_second_correction(&self, u: &Array1<f64>, v: &Array1<f64>) -> Array2<f64> {
+    pub(crate) fn barrier_second_correction(
+        &self,
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+    ) -> Array2<f64> {
         let mut result = Array2::zeros((self.p, self.p));
         for (ci, &idx) in self.constrained_indices.iter().enumerate() {
             let inv_4 = 1.0 / (self.slacks[ci].powi(4));
@@ -960,7 +947,6 @@ impl<'a> BarrierDerivativeProvider<'a> {
         result
     }
 }
-
 
 impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
     fn hessian_derivative_correction(
@@ -1060,7 +1046,6 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
         None
     }
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Link-wiggle derivative provider (exact second-order Hessian corrections)

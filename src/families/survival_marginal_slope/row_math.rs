@@ -22,19 +22,16 @@ pub(crate) fn rigid_observed_logslope(g: f64, probit_scale: f64) -> f64 {
     probit_scale * g
 }
 
-
 #[inline]
 pub(crate) fn rigid_observed_scale(g: f64, probit_scale: f64) -> f64 {
     let observed_g = rigid_observed_logslope(g, probit_scale);
     (1.0 + observed_g * observed_g).sqrt()
 }
 
-
 #[inline]
 pub(crate) fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f64 {
     q * rigid_observed_scale(g, probit_scale) + rigid_observed_logslope(g, probit_scale) * z
 }
-
 
 /// Survival row Hessian row metric at a β-independent pilot η, used to
 /// build the W inner product for cross-block orthogonalisation of the
@@ -120,7 +117,6 @@ pub(crate) fn survival_pilot_irls_row_metric_at_eta(
     Ok(w)
 }
 
-
 /// Build the SMGS rigid pooled-probit pilot η at training rows from the
 /// time-block offsets, marginal/logslope offsets, baseline slope and z. This
 /// is the survival analog of BMS `rigid_pooled_probit_pilot_eta`; the basis
@@ -143,7 +139,6 @@ pub(crate) fn survival_rigid_pilot_eta(
         rigid_observed_eta(q_exit, slope, z_primary[row], probit_scale)
     }))
 }
-
 
 /// One-step IRLS refinement of the rigid pilot η along the dominant η₁ row
 /// channel. Starts from `survival_rigid_pilot_eta` (offset+baseline), runs
@@ -414,7 +409,6 @@ pub(crate) fn survival_nonrigid_pilot_eta(
     Ok((pilot_eta, beta_logslope))
 }
 
-
 pub fn survival_marginal_slope_vector_scale(
     slopes: &[f64],
     covariance: &MarginalSlopeCovariance,
@@ -422,7 +416,6 @@ pub fn survival_marginal_slope_vector_scale(
 ) -> Result<f64, String> {
     marginal_slope_preserving_scale(slopes, covariance, probit_scale)
 }
-
 
 pub fn survival_marginal_slope_vector_eta(
     q: f64,
@@ -445,7 +438,6 @@ pub fn survival_marginal_slope_vector_eta(
         .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
 }
 
-
 /// Splice `at row {row}` between the reason prefix and the `:` details
 /// separator so that errors from the scalar `row_primary_closed_form*`
 /// kernels (which are intentionally row-agnostic) match the canonical
@@ -458,7 +450,6 @@ pub(crate) fn with_row_context(err: String, row: usize) -> String {
         format!("{err} at row {row}")
     }
 }
-
 
 pub fn survival_marginal_slope_vector_neglog(
     q0: f64,
@@ -510,7 +501,6 @@ pub fn survival_marginal_slope_vector_neglog(
             - event * ad1.ln()))
 }
 
-
 pub(crate) fn marginal_slope_covariance_matvec(
     covariance: &MarginalSlopeCovariance,
     vector: &[f64],
@@ -558,7 +548,6 @@ pub(crate) fn marginal_slope_covariance_matvec(
         }
     })
 }
-
 
 pub(crate) fn row_primary_closed_form_vector(
     q0: f64,
@@ -700,7 +689,6 @@ pub(crate) fn row_primary_closed_form_vector(
     Ok((nll, grad, hess))
 }
 
-
 pub(crate) fn standardize_latent_z_matrix_with_policy(
     z: &Array2<f64>,
     weights: &Array1<f64>,
@@ -727,7 +715,6 @@ pub(crate) fn standardize_latent_z_matrix_with_policy(
     Ok((out, first_norm))
 }
 
-
 /// Derivatives of c(g) = √(1 + (s_f g)^2) up to 4th order in the raw slope g.
 #[inline]
 pub(crate) fn c_derivatives(g: f64, probit_scale: f64) -> (f64, f64, f64, f64, f64) {
@@ -747,7 +734,6 @@ pub(crate) fn c_derivatives(g: f64, probit_scale: f64) -> (f64, f64, f64, f64, f
     (c, c1, c2d, c3d, c4d)
 }
 
-
 /// Derivatives of neglog(x) = -log(x): [-1/x, 1/x², -2/x³, 6/x⁴].
 #[inline]
 pub(crate) fn neglog_derivatives(x: f64) -> (f64, f64, f64, f64) {
@@ -756,7 +742,6 @@ pub(crate) fn neglog_derivatives(x: f64) -> (f64, f64, f64, f64) {
     let inv2 = inv * inv;
     (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
 }
-
 
 /// Row-level primary gradient (4-vector) and Hessian (4×4 symmetric)
 /// computed entirely from closed-form scalar formulas.
@@ -897,7 +882,6 @@ pub(crate) fn row_primary_closed_form(
     Ok((nll, grad, hess))
 }
 
-
 /// Crate-visible wrapper around `row_primary_closed_form` so the
 /// identifiability-compiler sibling module
 /// (`survival_marginal_slope_identifiability`) can build its 4×4
@@ -915,7 +899,6 @@ pub(crate) fn row_primary_for_compiler(
 ) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
     row_primary_closed_form(q0, q1, qd1, g, z, w, d, derivative_guard, probit_scale)
 }
-
 
 /// Shared-slope multi-z reduction for the rigid 4-primary row calculus.
 ///
@@ -1034,7 +1017,6 @@ pub(crate) fn row_primary_closed_form_shared_score(
     Ok((nll, grad, hess))
 }
 
-
 // ── Eval cache ────────────────────────────────────────────────────────
 //
 // Third and fourth order contracted derivatives for the outer REML path
@@ -1048,8 +1030,6 @@ pub(crate) struct RowPrimaryBase {
     pub(crate) hessian: Array2<f64>,
 }
 
-
 pub(crate) struct EvalCache {
     pub(crate) row_bases: Vec<RowPrimaryBase>,
 }
-

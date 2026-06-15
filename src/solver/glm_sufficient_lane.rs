@@ -583,8 +583,7 @@ mod tests {
         // value gate) must REFUSE the gradient lane — the gradient has no
         // reconvergence safety net, so the frozen-W derivative would inject
         // ~1e-6 relative error past the outer-gradient bar.
-        let w_value_grade: Array1<f64> =
-            w.mapv(|v| v * (1.0 + 1e-6)); // value gate (1e-3) accepts this
+        let w_value_grade: Array1<f64> = w.mapv(|v| v * (1.0 + 1e-6)); // value gate (1e-3) accepts this
         assert!(
             tensor.weight_drift_within(w_value_grade.view(), 1e-3),
             "value-grade gate must accept a 1e-6 drift"

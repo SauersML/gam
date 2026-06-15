@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 /// BA Schur solve variant for the reduced shared `β` system.
 ///
 /// * [`ArrowSolverMode::Direct`] is BA's dense reduced-camera-system solve:
@@ -40,7 +39,6 @@ pub enum ArrowSolverMode {
     InexactPCG,
 }
 
-
 impl ArrowSolverMode {
     /// BA-size heuristic: dense RCS for modest `K`, inexact Schur PCG for
     /// large shared systems. This follows Agarwal et al.'s direct-vs-iterative
@@ -65,7 +63,6 @@ impl ArrowSolverMode {
     }
 }
 
-
 /// Reason the Steihaug-CG loop stopped.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum PcgStopReason {
@@ -81,7 +78,6 @@ pub enum PcgStopReason {
     /// Non-positive or non-finite preconditioned residual after an update.
     Stagnation,
 }
-
 
 /// Per-solve instrumentation counters returned alongside the PCG solution.
 ///
@@ -111,7 +107,6 @@ pub struct PcgDiagnostics {
     pub used_device_arrow: bool,
 }
 
-
 /// Outcome of an opt-in mixed-precision arrow solve.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum MixedPrecisionStatus {
@@ -125,7 +120,6 @@ pub enum MixedPrecisionStatus {
     F64Fallback,
 }
 
-
 /// PCG controls for BA's inexact reduced-camera-system solve.
 ///
 /// The defaults mirror the loose inner tolerances used by inexact-step LM in
@@ -138,7 +132,6 @@ pub struct ArrowPcgOptions {
     pub relative_tolerance: f64,
 }
 
-
 impl Default for ArrowPcgOptions {
     fn default() -> Self {
         Self {
@@ -147,7 +140,6 @@ impl Default for ArrowPcgOptions {
         }
     }
 }
-
 
 /// Trust-region controls for Steihaug-CG on the reduced BA system.
 ///
@@ -162,7 +154,6 @@ pub struct ArrowTrustRegionOptions {
     pub max_iterations: usize,
 }
 
-
 impl Default for ArrowTrustRegionOptions {
     fn default() -> Self {
         Self {
@@ -172,7 +163,6 @@ impl Default for ArrowTrustRegionOptions {
         }
     }
 }
-
 
 /// Opt-in Carson--Higham mixed-precision refinement for dense arrow solves.
 ///
@@ -197,13 +187,11 @@ pub enum MixedPrecisionPolicy {
     },
 }
 
-
 impl Default for MixedPrecisionPolicy {
     fn default() -> Self {
         Self::Off
     }
 }
-
 
 impl MixedPrecisionPolicy {
     pub fn certified() -> Self {
@@ -218,7 +206,6 @@ impl MixedPrecisionPolicy {
         matches!(self, MixedPrecisionPolicy::Certified { .. })
     }
 }
-
 
 /// Complete BA Schur solve options.
 ///
@@ -264,7 +251,6 @@ pub struct ArrowSolveOptions {
     pub mixed_precision: MixedPrecisionPolicy,
 }
 
-
 impl std::fmt::Debug for ArrowSolveOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrowSolveOptions")
@@ -279,7 +265,6 @@ impl std::fmt::Debug for ArrowSolveOptions {
             .finish()
     }
 }
-
 
 /// Globalization guard for non-convex arrow-Schur inner steps.
 ///
@@ -312,7 +297,6 @@ pub struct ArrowProximalCorrectionOptions {
     pub convergence_objective_rel_tol: f64,
 }
 
-
 impl Default for ArrowProximalCorrectionOptions {
     fn default() -> Self {
         Self {
@@ -325,7 +309,6 @@ impl Default for ArrowProximalCorrectionOptions {
         }
     }
 }
-
 
 /// Accepted proximal arrow-Schur step and the damping that made it descent.
 #[derive(Debug, Clone)]
@@ -340,7 +323,6 @@ pub struct ArrowAcceptedProximalStep {
     pub gradient_dot_step: f64,
     pub attempts: usize,
 }
-
 
 impl ArrowSolveOptions {
     /// Select Direct for `K <= 2000` and InexactPCG above, following BA RCS
@@ -440,7 +422,6 @@ impl ArrowSolveOptions {
     }
 }
 
-
 /// CPU/GPU seam for BA point-block work.
 ///
 /// BA systems spend most time in independent point-block factorizations,
@@ -487,12 +468,10 @@ pub trait BatchedBlockSolver {
     fn block_gemm_subtract(&self, schur: &mut Array2<f64>, left: &Array2<f64>, right: &Array2<f64>);
 }
 
-
 #[derive(Debug, Clone)]
 pub struct ArrowRowGaugeDeflation {
     pub directions: Arc<[Vec<Array1<f64>>]>,
 }
-
 
 impl ArrowRowGaugeDeflation {
     pub fn new(directions: Vec<Vec<Array1<f64>>>) -> Self {
@@ -506,7 +485,6 @@ impl ArrowRowGaugeDeflation {
     }
 }
 
-
 /// Current CPU implementation of the BA batched block interface.
 ///
 /// It is intentionally plain Rust loops because `d` is tiny. The trait shape,
@@ -514,7 +492,6 @@ impl ArrowRowGaugeDeflation {
 /// Ceres backend.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBatchedBlockSolver;
-
 
 impl BatchedBlockSolver for CpuBatchedBlockSolver {
     fn factor_blocks(

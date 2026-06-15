@@ -436,26 +436,22 @@ pub(crate) fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send +
     //     not of the criterion (measured: ~10% uniform FD bias when solved
     //     on `M_DD`).
     // Callers therefore fold this term into the mode-response OPERATOR only.
-    // The contracted trace hook may supply it at any width; the pairwise
-    // `p(p+1)/2` fallback stays capped. `None` degrades safely to the
-    // divided-difference solve.
+    // The contracted trace hook may supply it in one family pass. The generic
+    // pairwise `p(p+1)/2` fallback is intentionally not selected here: in
+    // production large-n fits a "small" p still means hundreds of row-streamed
+    // second-directional Hessian passes. `None` degrades to the
+    // divided-difference solve, preserving the value/gradient contract.
     let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     let mut completion: Option<Array2<f64>> = None;
-    let completion_pairwise_fallback = total_p <= JEFFREYS_COMPLETION_MAX_P;
-    let completion_requested = completion_pairwise_fallback
-        || family.joint_jeffreys_information_contracted_trace_hessian_available();
+    let completion_requested =
+        family.joint_jeffreys_information_contracted_trace_hessian_available();
     if completion_requested
         && let Some(h_joint) = family.joint_jeffreys_information_with_specs(states, specs)?
         && h_joint.nrows() == total_p
         && h_joint.ncols() == total_p
     {
         completion = custom_family_joint_jeffreys_second_order_completion(
-            family,
-            states,
-            specs,
-            &h_joint,
-            &z_joint,
-            completion_pairwise_fallback,
+            family, states, specs, &h_joint, &z_joint, false,
         )?;
     }
     Ok(Some((phi, hphi, completion)))

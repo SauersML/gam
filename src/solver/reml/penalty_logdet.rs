@@ -65,7 +65,9 @@ use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 /// Multiple smoothing components may share the same block (for example tensor
 /// product marginals); those can still be factorized block-local.  Only partial
 /// overlaps force the dense assembled fallback.
-pub(crate) fn are_penalties_block_factored(penalties: &[crate::construction::CanonicalPenalty]) -> bool {
+pub(crate) fn are_penalties_block_factored(
+    penalties: &[crate::construction::CanonicalPenalty],
+) -> bool {
     for (i, a) in penalties.iter().enumerate() {
         for b in &penalties[i + 1..] {
             let overlaps =
@@ -611,7 +613,11 @@ impl PenaltyPseudologdet {
     ///
     /// Takes the W^T S_{τ_i} U₀ matrices (from `leakage()`) rather than
     /// the full L_i, to avoid recomputing.
-    pub(crate) fn moving_nullspace_correction(&self, wt_si_u0: &Array2<f64>, wt_sj_u0: &Array2<f64>) -> f64 {
+    pub(crate) fn moving_nullspace_correction(
+        &self,
+        wt_si_u0: &Array2<f64>,
+        wt_sj_u0: &Array2<f64>,
+    ) -> f64 {
         // tr(Σ₊⁻² L_i L_j^T) where L_i = diag(√σ) · wt_si_u0.
         // = Σ_r σ_r^{-2} Σ_m L_i[r,m] L_j[r,m]
         // = Σ_r σ_r^{-2} σ_r Σ_m wt_si_u0[r,m] wt_sj_u0[r,m]

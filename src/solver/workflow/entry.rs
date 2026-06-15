@@ -145,7 +145,6 @@ pub(crate) fn resolved_resource_policy(
     crate::resource::ResourcePolicy::for_problem(data.values.nrows(), 0, hints)
 }
 
-
 pub(crate) fn marginal_slope_hints(config: &FitConfig) -> crate::resource::ProblemHints {
     crate::resource::ProblemHints {
         marginal_slope_large_scale_active: config.logslope_formula.is_some()
@@ -208,7 +207,6 @@ fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>, WorkflowE
     Ok(Some(tau))
 }
 
-
 /// Per-row asymmetric LAWS weight `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`, scaled
 /// by the base prior weight. At the boundary `yᵢ = μᵢ` the two half-weights
 /// agree in the limit only at `τ = 0.5`; the convention `yᵢ > μᵢ ⇒ τ` (strict)
@@ -226,7 +224,6 @@ fn expectile_row_weights(
         base[i] * asym
     })
 }
-
 
 pub fn fit_from_formula(
     formula: &str,
@@ -298,7 +295,6 @@ pub fn fit_from_formula(
     // directly instead of stringifying then re-wrapping.
     fit_model(mat.request)
 }
-
 
 /// Least Asymmetrically Weighted Squares (LAWS) driver for expectile GAMs.
 ///
@@ -586,7 +582,6 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     Some(SplineScanInputs { x, y, w, order })
 }
 
-
 /// Formula-level entry for the exact O(n) cubic-smoothing-spline fast path.
 ///
 /// Materializes the formula exactly like [`fit_from_formula`], then runs the
@@ -632,7 +627,6 @@ fn past_dense_kernel_cliff(n: usize, d: usize) -> bool {
     crate::terms::basis::default_num_centers(n, d) >= DENSE_CENTER_CAP
 }
 
-
 /// Map a Duchon/Matérn smoothness order onto the cascade's Sobolev order,
 /// clamped into the Wendland-(3,1) native window `(d/2, (d+3)/2]` (issue
 /// caveat 1: the multilevel frame can only represent up to `H^{(d+3)/2}`).
@@ -643,7 +637,6 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
     let eps = 1e-6 * (hi - lo);
     requested.clamp(lo + eps, hi)
 }
-
 
 /// Detection seam for the O(n log n) multiresolution residual-cascade fast path
 /// (issue #1032).
@@ -783,7 +776,6 @@ pub fn residual_cascade_fast_path(
     })
 }
 
-
 /// Formula-level library entry for the O(n log n) residual-cascade fast path
 /// (issue #1032).
 ///
@@ -826,7 +818,6 @@ pub fn fit_residual_cascade_from_formula(
     }
 }
 
-
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
 pub fn materialize<'a>(
     formula: &str,
@@ -837,11 +828,13 @@ pub fn materialize<'a>(
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();
 
-    if let Some((left_col, right_col, event_col)) = parse_surv_interval_response(&parsed.response)? {
+    if let Some((left_col, right_col, event_col)) = parse_surv_interval_response(&parsed.response)?
+    {
         if config.transformation_normal {
             return Err(WorkflowError::InvalidConfig {
-                reason: "transformation_normal cannot be combined with a SurvInterval(...) response"
-                    .to_string(),
+                reason:
+                    "transformation_normal cannot be combined with a SurvInterval(...) response"
+                        .to_string(),
             });
         }
         // Interval censoring `T ∈ (L, R]` is only defined for the latent

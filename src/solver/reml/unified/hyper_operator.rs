@@ -96,7 +96,6 @@ pub struct HyperCoord {
     pub tk_x_fixed: Option<Array2<f64>>,
 }
 
-
 /// Second-order fixed-β objects for a pair of outer coordinates.
 ///
 /// Used by the outer Hessian computation. For ρ-ρ diagonal pairs, these
@@ -116,7 +115,6 @@ pub struct HyperCoordPair {
     pub ld_s: f64,
 }
 
-
 impl HyperCoordPair {
     /// Return a zero-valued pair (used as a no-op fallback when hyper-coordinate
     /// construction is skipped for large models).
@@ -130,7 +128,6 @@ impl HyperCoordPair {
         }
     }
 }
-
 
 /// Callback for computing M_i[u] = D_β B_i[u], the directional derivative
 /// of the fixed-β Hessian drift along direction u.
@@ -148,7 +145,6 @@ pub enum DriftDerivResult {
     Operator(Arc<dyn HyperOperator>),
 }
 
-
 impl std::fmt::Debug for DriftDerivResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -163,7 +159,6 @@ impl std::fmt::Debug for DriftDerivResult {
         }
     }
 }
-
 
 impl DriftDerivResult {
     pub fn into_operator(self) -> Arc<dyn HyperOperator> {
@@ -203,10 +198,8 @@ impl DriftDerivResult {
     }
 }
 
-
 pub type FixedDriftDerivFn =
     Box<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
-
 
 /// Direction-contracted ψψ-block second-order terms for the profiled θ-HVP
 /// (#740).
@@ -241,10 +234,8 @@ pub struct ContractedPsiSecondOrder {
     pub ld_s: Array1<f64>,
 }
 
-
 pub type ContractedPsiSecondOrderFn =
     Arc<dyn Fn(&[f64]) -> Result<Option<ContractedPsiSecondOrder>, String> + Send + Sync>;
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Implicit Hessian-drift operators for scalable anisotropic REML
@@ -476,7 +467,6 @@ pub trait HyperOperator: Send + Sync {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProjectedFactorKey {
     pub(crate) design_id: usize,
@@ -488,7 +478,6 @@ pub struct ProjectedFactorKey {
     pub(crate) value_hash: u64,
     pub(crate) value_hash2: u64,
 }
-
 
 impl ProjectedFactorKey {
     pub fn from_factor_view(design_id: usize, factor: ArrayView2<'_, f64>) -> Self {
@@ -507,7 +496,6 @@ impl ProjectedFactorKey {
     }
 }
 
-
 pub(crate) fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64) {
     let mut h1 = 0xcbf2_9ce4_8422_2325_u64;
     let mut h2 = 0x9e37_79b1_85eb_ca87_u64;
@@ -521,7 +509,6 @@ pub(crate) fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) ->
     }
     (h1, h2)
 }
-
 
 /// Memoizer for `X · F` design-projection products keyed on a
 /// `(design, factor)` fingerprint.
@@ -546,7 +533,6 @@ pub struct ProjectedFactorCache {
     pub(crate) inner: Mutex<ProjectedFactorCacheInner>,
 }
 
-
 pub(crate) struct ProjectedFactorCacheInner {
     pub(crate) entries: HashMap<ProjectedFactorKey, ProjectedFactorEntry>,
     pub(crate) in_progress: HashMap<ProjectedFactorKey, Arc<ProjectedFactorInProgress>>,
@@ -554,7 +540,6 @@ pub(crate) struct ProjectedFactorCacheInner {
     pub(crate) total_bytes: usize,
     pub(crate) budget_bytes: usize,
 }
-
 
 pub(crate) struct ProjectedFactorInProgress {
     pub(crate) state: Mutex<Option<ProjectedFactorInProgressState>>,
@@ -569,12 +554,10 @@ pub(crate) struct ProjectedFactorInProgress {
     pub(crate) subscriber_arrived: (Mutex<()>, Condvar),
 }
 
-
 pub(crate) enum ProjectedFactorInProgressState {
     Ready(Arc<Array2<f64>>),
     Failed,
 }
-
 
 pub(crate) struct ProjectedFactorEntry {
     pub(crate) value: Arc<Array2<f64>>,
@@ -582,13 +565,11 @@ pub(crate) struct ProjectedFactorEntry {
     pub(crate) last_used: u64,
 }
 
-
 impl Default for ProjectedFactorCache {
     fn default() -> Self {
         Self::with_budget(Self::DEFAULT_BUDGET_BYTES)
     }
 }
-
 
 impl ProjectedFactorCache {
     /// Default byte budget for the cache. Aligned with the large-scale
@@ -806,13 +787,11 @@ impl ProjectedFactorCache {
     }
 }
 
-
 /// Dense matrix wrapper implementing `HyperOperator`.
 #[derive(Clone)]
 pub struct DenseMatrixHyperOperator {
     pub matrix: Array2<f64>,
 }
-
 
 impl HyperOperator for DenseMatrixHyperOperator {
     fn dim(&self) -> usize {
@@ -858,14 +837,12 @@ impl HyperOperator for DenseMatrixHyperOperator {
     }
 }
 
-
 #[derive(Clone)]
 pub struct CompositeHyperOperator {
     pub dense: Option<Array2<f64>>,
     pub operators: Vec<Arc<dyn HyperOperator>>,
     pub dim_hint: usize,
 }
-
 
 /// Group composite operators by shared `(implicit_deriv, x_design, w_diag)`
 /// so every Duchon ψ-axis built atop the same implicit derivative runs
@@ -947,7 +924,6 @@ pub(crate) fn composite_trace_implicit_batched(
     trace
 }
 
-
 /// Vector form of the implicit-axis trace batching used by
 /// [`CompositeHyperOperator`].  It returns one exact `tr(Fᵀ B_i F)` value per
 /// input operator while sharing the expensive `X·F` projection and Duchon
@@ -1008,7 +984,6 @@ pub(crate) fn trace_projected_factors_batched(
     out
 }
 
-
 pub(crate) fn collect_projected_trace_terms<'a>(
     out_idx: usize,
     weight: f64,
@@ -1050,7 +1025,6 @@ pub(crate) fn collect_projected_trace_terms<'a>(
     }
 }
 
-
 pub(crate) fn collect_projected_matrix_terms<'a>(
     out_idx: usize,
     weight: f64,
@@ -1091,7 +1065,6 @@ pub(crate) fn collect_projected_matrix_terms<'a>(
         terms.push((out_idx, weight, op));
     }
 }
-
 
 pub(crate) fn trace_projected_operator_terms_batched(
     n_out: usize,
@@ -1152,7 +1125,6 @@ pub(crate) fn trace_projected_operator_terms_batched(
     out
 }
 
-
 pub(crate) fn projected_operator_terms_batched(
     n_out: usize,
     terms: &[(usize, f64, &dyn HyperOperator)],
@@ -1170,7 +1142,6 @@ pub(crate) fn projected_operator_terms_batched(
     out
 }
 
-
 pub(crate) fn project_hyper_operators_batched(
     n_out: usize,
     terms: &[(usize, f64, &dyn HyperOperator)],
@@ -1179,7 +1150,6 @@ pub(crate) fn project_hyper_operators_batched(
 ) -> Vec<Array2<f64>> {
     projected_operator_terms_batched(n_out, terms, factor, cache)
 }
-
 
 pub(crate) fn trace_logdet_drifts_projected_factor_batched(
     drifts: &[DriftDerivResult],
@@ -1205,14 +1175,12 @@ pub(crate) fn trace_logdet_drifts_projected_factor_batched(
     out
 }
 
-
 pub(crate) fn dense_spectral_trace_logdet_drifts_batched(
     ds: &DenseSpectralOperator,
     drifts: &[DriftDerivResult],
 ) -> Vec<f64> {
     trace_logdet_drifts_projected_factor_batched(drifts, &ds.g_factor, &ds.projected_factor_cache)
 }
-
 
 pub(crate) fn penalty_subspace_trace_factor(kernel: &PenaltySubspaceTrace) -> Array2<f64> {
     let (evals, evecs) = kernel
@@ -1246,7 +1214,6 @@ pub(crate) fn penalty_subspace_trace_factor(kernel: &PenaltySubspaceTrace) -> Ar
     crate::faer_ndarray::fast_ab(&kernel.u_s, &root)
 }
 
-
 pub(crate) fn penalty_subspace_trace_drifts_batched(
     kernel: &PenaltySubspaceTrace,
     drifts: &[DriftDerivResult],
@@ -1255,7 +1222,6 @@ pub(crate) fn penalty_subspace_trace_drifts_batched(
     let cache = ProjectedFactorCache::default();
     trace_logdet_drifts_projected_factor_batched(drifts, &factor, &cache)
 }
-
 
 pub(crate) fn penalty_subspace_reduce_drifts_batched(
     kernel: &PenaltySubspaceTrace,
@@ -1278,7 +1244,6 @@ pub(crate) fn penalty_subspace_reduce_drifts_batched(
         })
         .collect()
 }
-
 
 pub(crate) fn dense_spectral_trace_logdet_operators_batched(
     ds: &DenseSpectralOperator,
@@ -1307,7 +1272,6 @@ pub(crate) fn dense_spectral_trace_logdet_operators_batched(
         trace_projected_factors_batched(operators, &ds.g_factor, &ds.projected_factor_cache)
     }
 }
-
 
 impl HyperOperator for CompositeHyperOperator {
     fn as_composite(&self) -> Option<&CompositeHyperOperator> {
@@ -1522,7 +1486,6 @@ impl HyperOperator for CompositeHyperOperator {
     }
 }
 
-
 /// Fixed-β Hessian drift payload for a single hyper coordinate.
 ///
 /// Some coordinates are naturally dense. Others are most efficient as
@@ -1541,7 +1504,6 @@ pub struct BlockLocalDrift {
     /// `total_dim >= end`.
     pub total_dim: usize,
 }
-
 
 impl HyperOperator for BlockLocalDrift {
     fn dim(&self) -> usize {
@@ -1641,7 +1603,6 @@ impl HyperOperator for BlockLocalDrift {
     }
 }
 
-
 #[derive(Clone)]
 pub struct HyperCoordDrift {
     /// Full p×p dense matrix (forces dense fallback when present).
@@ -1651,7 +1612,6 @@ pub struct HyperCoordDrift {
     /// Implicit operator (fast path).
     pub operator: Option<Arc<dyn HyperOperator>>,
 }
-
 
 impl HyperCoordDrift {
     pub fn none() -> Self {
@@ -1778,7 +1738,6 @@ impl HyperCoordDrift {
     }
 }
 
-
 /// Implicit Hessian-drift operator for a single anisotropic ψ_d coordinate.
 ///
 /// Computes B_d · v on the fly:
@@ -1821,7 +1780,6 @@ mod implicit_matvec_scratch {
     }
 }
 
-
 pub struct ImplicitHyperOperator {
     /// The implicit design-derivative operator (shared across all axes).
     pub implicit_deriv: std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
@@ -1847,7 +1805,6 @@ pub struct ImplicitHyperOperator {
     /// identity (c ≡ 0 there).
     pub c_x_psi_beta: Option<std::sync::Arc<Array1<f64>>>,
 }
-
 
 impl HyperOperator for ImplicitHyperOperator {
     fn dim(&self) -> usize {
@@ -2064,7 +2021,6 @@ impl HyperOperator for ImplicitHyperOperator {
     }
 }
 
-
 /// Row-block size that keeps each streamed `n × cols` chunk near an 8 MiB
 /// working set, with a 512-row floor so a wide design still makes useful BLAS-3
 /// progress per block, capped at the total row count. Shared by the implicit
@@ -2077,7 +2033,6 @@ pub(crate) fn byte_balanced_row_chunk(cols: usize, n_rows: usize) -> usize {
         .max(MIN_CHUNK_ROWS)
         .min(n_rows)
 }
-
 
 impl ImplicitHyperOperator {
     /// Chunked `X · F` via faer SIMD-parallel GEMM. The chunk-row sizing
@@ -2123,7 +2078,11 @@ impl ImplicitHyperOperator {
     /// built atop the same `x_design` (e.g. axis-0 and axis-1 of a 32-axis
     /// ψ-block) consult the same cache slot and hit after the first
     /// computes.
-    pub(crate) fn cached_xf(&self, factor: &Array2<f64>, cache: &ProjectedFactorCache) -> Arc<Array2<f64>> {
+    pub(crate) fn cached_xf(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> Arc<Array2<f64>> {
         let design_id = Arc::as_ptr(&self.x_design) as usize;
         let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
         cache.get_or_insert_with(key, || self.compute_xf(factor))
@@ -2135,7 +2094,11 @@ impl ImplicitHyperOperator {
     /// per-axis work is the row-kernel build (`row_chunk_first_raw`),
     /// the `K_d · U_knot` GEMM, the fused `⟨W ⊙ DXF, XF⟩` inner products,
     /// and the small dense penalty contraction.
-    pub(crate) fn trace_projected_factor_with_xf(&self, factor: &Array2<f64>, xf: ArrayView2<'_, f64>) -> f64 {
+    pub(crate) fn trace_projected_factor_with_xf(
+        &self,
+        factor: &Array2<f64>,
+        xf: ArrayView2<'_, f64>,
+    ) -> f64 {
         let rank = factor.ncols();
         let n_obs = self.w_diag.len();
         assert_eq!(xf.dim(), (n_obs, rank));
@@ -2421,7 +2384,6 @@ impl ImplicitHyperOperator {
     }
 }
 
-
 /// Operator-backed fixed-β Hessian drift for sparse-exact τ coordinates.
 ///
 /// This stays in the original sparse/native coefficient basis and computes the
@@ -2447,7 +2409,6 @@ pub struct SparseDirectionalHyperOperator {
     /// Total coefficient dimension.
     pub(crate) p: usize,
 }
-
 
 impl HyperOperator for SparseDirectionalHyperOperator {
     fn dim(&self) -> usize {
@@ -2502,7 +2463,6 @@ impl HyperOperator for SparseDirectionalHyperOperator {
     }
 }
 
-
 /// Matrix-free GLM cubic-correction drift `C[v] = −Xᵀ diag(c ⊙ X v) X`
 /// (rows masked to the active Hessian-curvature surface, sign folded into
 /// the stored diagonal).
@@ -2534,7 +2494,6 @@ pub struct GlmCurvatureCorrectionOperator {
     pub(crate) p: usize,
 }
 
-
 impl HyperOperator for GlmCurvatureCorrectionOperator {
     fn dim(&self) -> usize {
         self.p
@@ -2552,8 +2511,6 @@ impl HyperOperator for GlmCurvatureCorrectionOperator {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Data structures
 // ═══════════════════════════════════════════════════════════════════════════
-

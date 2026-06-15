@@ -1,6 +1,5 @@
 use super::*;
 
-
 pub fn build_duchon_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
     collocationweights: Option<ArrayView1<'_, f64>>,
@@ -25,7 +24,6 @@ pub fn build_duchon_collocation_operator_matrices(
         &mut workspace,
     )
 }
-
 
 pub fn build_duchon_operator_penalty_matrices(
     centers: ArrayView2<'_, f64>,
@@ -56,7 +54,6 @@ pub fn build_duchon_operator_penalty_matrices(
     })
 }
 
-
 pub fn build_thin_plate_penalty_matrix(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
@@ -68,7 +65,6 @@ pub fn build_thin_plate_penalty_matrix(
     let (penalty, _) = normalize_penalty(&penalty);
     Ok(ThinPlatePenaltyMatrix { penalty })
 }
-
 
 pub fn build_duchon_collocation_operator_matriceswithworkspace(
     centers: ArrayView2<'_, f64>,
@@ -279,7 +275,6 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     })
 }
 
-
 #[inline(always)]
 pub(crate) fn bessel_k0_stable(x: f64) -> f64 {
     let x_pos = x.max(1e-300);
@@ -295,7 +290,6 @@ pub(crate) fn bessel_k0_stable(x: f64) -> f64 {
                         + y * (0.005_878_72 + y * (-0.002_515_40 + y * 0.000_532_08))))))
 }
 
-
 #[inline(always)]
 pub(crate) fn bessel_k1_stable(x: f64) -> f64 {
     let x_pos = x.max(1e-300);
@@ -310,7 +304,6 @@ pub(crate) fn bessel_k1_stable(x: f64) -> f64 {
                     + y * (0.015_042_68
                         + y * (-0.007_803_53 + y * (0.003_256_14 + y * -0.000_682_45))))))
 }
-
 
 #[inline(always)]
 pub(crate) fn bessel_k0_k1_small_series(x: f64) -> (f64, f64) {
@@ -342,23 +335,19 @@ pub(crate) fn bessel_k0_k1_small_series(x: f64) -> (f64, f64) {
     (k0, k1)
 }
 
-
 #[inline(always)]
 pub(crate) fn bessel_k0_small_series(x: f64) -> f64 {
     bessel_k0_k1_small_series(x).0
 }
-
 
 #[inline(always)]
 pub(crate) fn bessel_k1_small_series(x: f64) -> f64 {
     bessel_k0_k1_small_series(x).1
 }
 
-
 pub(crate) const DUCHON_DERIVATIVE_R_FLOOR_REL: f64 = 1e-5;
 
 pub(crate) const DUCHON_COLLISION_TAYLOR_REL: f64 = 1e-4;
-
 
 /// Minimum `(row, center)` pair count before a radial design sweep builds a
 /// certified [`radial_profile::RadialProfile`] instead of evaluating every
@@ -367,7 +356,6 @@ pub(crate) const DUCHON_COLLISION_TAYLOR_REL: f64 = 1e-4;
 /// beyond that; below the threshold the exact path keeps small fits
 /// bit-identical to the pre-profile behavior.
 pub(crate) const RADIAL_PROFILE_MIN_PAIRS: usize = 16_384;
-
 
 #[inline(always)]
 pub(crate) fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usize {
@@ -381,7 +369,6 @@ pub(crate) fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usiz
         DuchonNullspaceOrder::Degree(degree) => degree + 1,
     }
 }
-
 
 /// Returns the effective Duchon null-space order, auto-degrading when the
 /// requested order leaves no radial kernel degrees of freedom.
@@ -431,7 +418,6 @@ pub(crate) fn duchon_effective_nullspace_order(
     effective
 }
 
-
 #[inline(always)]
 pub(crate) fn gamma_lanczos(x: f64) -> f64 {
     // Numerical Recipes / Lanczos approximation with reflection formula.
@@ -460,7 +446,6 @@ pub(crate) fn gamma_lanczos(x: f64) -> f64 {
     (2.0 * std::f64::consts::PI).sqrt() * t.powf(z + 0.5) * (-t).exp() * a
 }
 
-
 #[inline(always)]
 pub(crate) fn bessel_k_integer_order(n: usize, z: f64) -> f64 {
     let zz = z.max(1e-300);
@@ -479,7 +464,6 @@ pub(crate) fn bessel_k_integer_order(n: usize, z: f64) -> f64 {
     }
     k
 }
-
 
 #[inline(always)]
 pub(crate) fn bessel_k_half_integer_order(l: usize, z: f64) -> f64 {
@@ -510,9 +494,11 @@ pub(crate) fn bessel_k_half_integer_order(l: usize, z: f64) -> f64 {
     k
 }
 
-
 #[inline(always)]
-pub(crate) fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Result<f64, BasisError> {
+pub(crate) fn bessel_k_real_half_integer_or_integer(
+    nu_abs: f64,
+    z: f64,
+) -> Result<f64, BasisError> {
     let two_nu = (2.0 * nu_abs).round();
     if (two_nu - 2.0 * nu_abs).abs() > 1e-12 {
         crate::bail_invalid_basis!(
@@ -529,7 +515,6 @@ pub(crate) fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Resu
     }
 }
 
-
 /// Precomputed coefficient for `polyharmonic_kernel` that depends only on
 /// `m` and `k_dim`, not on `r`.  Avoids repeated gamma_lanczos calls in the
 /// hot kernel evaluation loop (called n × k times per basis build).
@@ -539,7 +524,6 @@ pub(crate) struct PolyharmonicBlockCoeff {
     pub(crate) power: f64,
     pub(crate) is_log_case: bool,
 }
-
 
 impl PolyharmonicBlockCoeff {
     pub(crate) fn new(m: f64, k_dim: usize) -> Self {
@@ -604,11 +588,9 @@ impl PolyharmonicBlockCoeff {
     }
 }
 
-
 pub(crate) fn polyharmonic_kernel(r: f64, m: f64, k_dim: usize) -> f64 {
     PolyharmonicBlockCoeff::new(m, k_dim).eval(r)
 }
-
 
 #[inline(always)]
 pub(crate) fn signed_infinity(sign: f64) -> f64 {
@@ -619,9 +601,13 @@ pub(crate) fn signed_infinity(sign: f64) -> f64 {
     }
 }
 
-
 #[inline(always)]
-pub(crate) fn log_power_origin_limit(coeff: f64, exponent: f64, log_coeff: f64, pure_coeff: f64) -> f64 {
+pub(crate) fn log_power_origin_limit(
+    coeff: f64,
+    exponent: f64,
+    log_coeff: f64,
+    pure_coeff: f64,
+) -> f64 {
     if log_coeff == 0.0 && pure_coeff == 0.0 {
         return 0.0;
     }
@@ -641,7 +627,6 @@ pub(crate) fn log_power_origin_limit(coeff: f64, exponent: f64, log_coeff: f64, 
     }
 }
 
-
 #[inline(always)]
 pub(crate) fn polyharmonic_log_sign(m: usize, k_dim: usize) -> f64 {
     assert!(
@@ -650,7 +635,6 @@ pub(crate) fn polyharmonic_log_sign(m: usize, k_dim: usize) -> f64 {
     );
     (-1.0_f64).powi(m as i32 - (k_dim as i32 / 2) + 1)
 }
-
 
 #[inline(always)]
 pub(crate) fn duchon_matern_block(
@@ -685,7 +669,6 @@ pub(crate) fn duchon_matern_block(
     Ok(c * r.powf(nu) * k_nu)
 }
 
-
 #[inline(always)]
 pub(crate) fn polyharmonic_kernel_triplet(
     r: f64,
@@ -696,12 +679,10 @@ pub(crate) fn polyharmonic_kernel_triplet(
     Ok((value, first, second))
 }
 
-
 #[inline(always)]
 pub(crate) fn falling_factorial(alpha: f64, order: usize) -> f64 {
     (0..order).fold(1.0, |acc, idx| acc * (alpha - idx as f64))
 }
-
 
 #[inline(always)]
 pub(crate) fn falling_factorial_derivative(alpha: f64, order: usize) -> f64 {
@@ -720,7 +701,6 @@ pub(crate) fn falling_factorial_derivative(alpha: f64, order: usize) -> f64 {
     }
     total
 }
-
 
 /// Unified radial jet for one polyharmonic partial-fraction block.
 ///
@@ -786,16 +766,18 @@ pub(crate) fn polyharmonic_block_jet4(
     Ok((out[0], out[1], out[2], out[3], out[4]))
 }
 
-
 #[inline(always)]
-pub(crate) fn log_power_family_derivative(exponent: f64, log_coeff: f64, pure_coeff: f64) -> (f64, f64, f64) {
+pub(crate) fn log_power_family_derivative(
+    exponent: f64,
+    log_coeff: f64,
+    pure_coeff: f64,
+) -> (f64, f64, f64) {
     (
         exponent - 1.0,
         exponent * log_coeff,
         exponent * pure_coeff + log_coeff,
     )
 }
-
 
 #[inline(always)]
 pub(crate) fn log_power_family_value(
@@ -811,7 +793,6 @@ pub(crate) fn log_power_family_value(
         coeff * r.powf(exponent) * (log_coeff * r.ln() + pure_coeff)
     }
 }
-
 
 #[inline(always)]
 pub(crate) fn duchon_polyharmonic_operator_block_jets(
@@ -876,7 +857,6 @@ pub(crate) fn duchon_polyharmonic_operator_block_jets(
     Ok((q, t, t_r, t_rr))
 }
 
-
 /// Shared Bessel-K ladder for one evaluation point `z = κ·r`.
 ///
 /// Every Matérn partial-fraction block and every term of its radial
@@ -899,7 +879,6 @@ pub(crate) struct BesselKLadder {
     pub(crate) values: SmallVec<[f64; 16]>,
     pub(crate) half_integer: bool,
 }
-
 
 impl BesselKLadder {
     pub(crate) fn build(z: f64, half_integer: bool, max_order_steps: usize) -> Self {
@@ -934,7 +913,6 @@ impl BesselKLadder {
         self.values[idx]
     }
 }
-
 
 /// Radial-derivative jets of the Matérn family `coeff·r^μ·K_μ(κr)` up to
 /// order `max_j ≤ 4`, evaluated against a shared [`BesselKLadder`].
@@ -1025,7 +1003,6 @@ pub(crate) fn duchon_matern_family_jets_with_ladder(
     Ok(())
 }
 
-
 /// Maximum ladder steps (`K_base ..= K_{base+steps}`) needed by the q/t
 /// operator families of Matérn block `n` in dimension `k_dim`: the q-family
 /// reads `K_{|ν−1|}` and the t-family `K_{|ν−2−j|}` for `j ≤ 2`, ν = n − d/2.
@@ -1040,7 +1017,6 @@ pub(crate) fn duchon_matern_block_max_ladder_steps(n_order: usize, k_dim: usize)
     let max_abs = candidates.iter().copied().fold(0.0_f64, f64::max);
     max_abs.floor() as usize + 1
 }
-
 
 pub(crate) fn duchon_matern_operator_block_jets_with_ladder(
     r: f64,
@@ -1073,12 +1049,10 @@ pub(crate) fn duchon_matern_operator_block_jets_with_ladder(
     Ok((q_out[0], t_out[0], t_out[1], t_out[2]))
 }
 
-
 #[inline(always)]
 pub(crate) fn pure_duchon_block_order(p_order: usize, s_order: f64) -> f64 {
     p_order as f64 + s_order
 }
-
 
 pub(crate) fn validate_duchon_kernel_orders(
     length_scale: Option<f64>,
@@ -1149,7 +1123,6 @@ pub(crate) fn validate_duchon_kernel_orders(
     Ok(())
 }
 
-
 pub(crate) fn validate_duchon_collocation_orders(
     length_scale: Option<f64>,
     p_order: usize,
@@ -1186,13 +1159,11 @@ pub(crate) fn validate_duchon_collocation_orders(
     Ok(())
 }
 
-
 #[derive(Debug, Clone)]
 pub struct DuchonPartialFractionCoeffs {
     pub(crate) a: Vec<f64>,
     pub(crate) b: Vec<f64>,
 }
-
 
 #[inline(always)]
 pub(crate) fn duchon_partial_fraction_coeffs(
@@ -1235,7 +1206,6 @@ pub(crate) fn duchon_partial_fraction_coeffs(
     }
     DuchonPartialFractionCoeffs { a, b }
 }
-
 
 pub(crate) fn duchon_matern_kernel_general_from_distance(
     r: f64,
@@ -1302,7 +1272,6 @@ pub(crate) fn duchon_matern_kernel_general_from_distance(
     Ok(val.sum())
 }
 
-
 pub(crate) fn duchon_hybrid_kernel_collision_value(
     length_scale: f64,
     p_order: usize,
@@ -1350,7 +1319,6 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
     }
     Ok(value)
 }
-
 
 pub(crate) fn duchon_hybrid_kernel_near_collision_value(
     r: f64,
@@ -1403,7 +1371,6 @@ pub(crate) fn duchon_hybrid_kernel_near_collision_value(
     Ok(value)
 }
 
-
 #[inline(always)]
 pub(crate) fn stable_euclidean_norm<I>(components: I) -> f64
 where
@@ -1441,7 +1408,6 @@ where
     }
 }
 
-
 #[inline]
 pub(crate) fn centered_aniso_log_scale_mean(eta: &[f64]) -> f64 {
     if eta.len() <= 1 {
@@ -1451,24 +1417,20 @@ pub(crate) fn centered_aniso_log_scale_mean(eta: &[f64]) -> f64 {
     }
 }
 
-
 #[inline]
 pub(crate) fn centered_aniso_log_scale(value: f64, mean: f64) -> f64 {
     (value - mean).clamp(-50.0, 50.0)
 }
-
 
 #[inline]
 pub(crate) fn aniso_axis_scale(value: f64, mean: f64) -> f64 {
     centered_aniso_log_scale(value, mean).exp()
 }
 
-
 #[inline]
 pub(crate) fn aniso_metric_weight(value: f64, mean: f64) -> f64 {
     (2.0 * centered_aniso_log_scale(value, mean)).exp()
 }
-
 
 pub(crate) fn centered_aniso_metric_weights(eta: &[f64]) -> Vec<f64> {
     let mean = centered_aniso_log_scale_mean(eta);
@@ -1476,7 +1438,6 @@ pub(crate) fn centered_aniso_metric_weights(eta: &[f64]) -> Vec<f64> {
         .map(|&value| aniso_metric_weight(value, mean))
         .collect()
 }
-
 
 /// Compute anisotropic squared distance components and total distance.
 ///
@@ -1505,7 +1466,11 @@ pub(crate) fn centered_aniso_metric_weights(eta: &[f64]) -> Vec<f64> {
 ///   ∇²_ψ r     = (2/r) Diag(s) − (1/r³) ss'
 /// which is diagonal + rank-1, so Hessian-vector products are O(d).
 #[inline]
-pub(crate) fn aniso_distance_and_components(data_row: &[f64], center: &[f64], eta: &[f64]) -> (f64, Vec<f64>) {
+pub(crate) fn aniso_distance_and_components(
+    data_row: &[f64],
+    center: &[f64],
+    eta: &[f64],
+) -> (f64, Vec<f64>) {
     assert_eq!(data_row.len(), center.len());
     assert_eq!(data_row.len(), eta.len());
     let d = data_row.len();
@@ -1524,7 +1489,6 @@ pub(crate) fn aniso_distance_and_components(data_row: &[f64], center: &[f64], et
     (stable_euclidean_norm(scaled_components), s_vec)
 }
 
-
 /// Compute anisotropic distance without returning per-axis components.
 ///
 /// This is the lightweight version of [`aniso_distance_and_components`] for
@@ -1539,7 +1503,6 @@ pub(crate) fn aniso_distance(data_row: &[f64], center: &[f64], eta: &[f64]) -> f
     )
 }
 
-
 #[inline(always)]
 pub(crate) fn euclidean_distance_rows(
     lhs: ArrayView2<'_, f64>,
@@ -1551,7 +1514,6 @@ pub(crate) fn euclidean_distance_rows(
     stable_euclidean_norm((0..lhs.ncols()).map(|axis| lhs[[lhs_row, axis]] - rhs[[rhs_row, axis]]))
 }
 
-
 #[inline(always)]
 pub(crate) fn aniso_axis_scales(eta: &[f64]) -> Vec<f64> {
     let eta_mean = centered_aniso_log_scale_mean(eta);
@@ -1559,7 +1521,6 @@ pub(crate) fn aniso_axis_scales(eta: &[f64]) -> Vec<f64> {
         .map(|&value| aniso_axis_scale(value, eta_mean))
         .collect()
 }
-
 
 #[inline(always)]
 pub(crate) fn aniso_distance_rows_with_scales(
@@ -1577,8 +1538,10 @@ pub(crate) fn aniso_distance_rows_with_scales(
     )
 }
 
-
-pub(crate) fn fill_symmetric_from_row_kernel<F>(matrix: &mut Array2<f64>, kernel: F) -> Result<(), BasisError>
+pub(crate) fn fill_symmetric_from_row_kernel<F>(
+    matrix: &mut Array2<f64>,
+    kernel: F,
+) -> Result<(), BasisError>
 where
     F: Fn(usize, usize) -> Result<f64, BasisError> + Sync,
 {
@@ -1609,7 +1572,6 @@ where
     Ok(())
 }
 
-
 /// Return y-space points `y_{i,a} = exp(ψ_a) x_{i,a}` with
 /// `ψ_a = η_a - mean(η)` so Euclidean pairwise
 /// distances in y equal anisotropic kernel distances in x:
@@ -1628,7 +1590,6 @@ pub(crate) fn points_in_aniso_y_space(points: ArrayView2<'_, f64>, eta: &[f64]) 
     }
     y
 }
-
 
 /// Compute per-axis standard deviations of knot center coordinates.
 ///
@@ -1654,7 +1615,6 @@ pub fn knot_cloud_axis_scales(centers: ArrayView2<'_, f64>) -> Vec<f64> {
     scales
 }
 
-
 /// Compute initial anisotropy contrasts η_a from knot center geometry.
 ///
 /// Returns η_a = −ln(σ_a) + (1/d) Σ_b ln(σ_b), which satisfies Ση_a = 0
@@ -1677,7 +1637,6 @@ pub fn initial_aniso_contrasts(centers: ArrayView2<'_, f64>) -> Vec<f64> {
         .map(|&scale| -scale.ln() - mean_neg_log)
         .collect()
 }
-
 
 /// Pure forward transform of the supplied anisotropy log-scales: subtract the
 /// mean (so Σ η = 0) and zero tiny residuals. `None` (or a 1-D problem, where
@@ -1710,7 +1669,6 @@ pub(crate) fn centered_aniso_contrasts(aniso: Option<&[f64]>) -> Option<Vec<f64>
         None => None,
     }
 }
-
 
 /// Auto-seed anisotropy contrasts from knot-cloud geometry for callers that use
 /// an all-zero vector as the "initialize me" sentinel.
@@ -1752,7 +1710,6 @@ pub(crate) fn auto_seed_aniso_contrasts(
     }
 }
 
-
 /// How the Matérn forward design build interprets an *exactly all-zero*
 /// `aniso_log_scales` vector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1776,7 +1733,6 @@ pub enum AnisoSeedMode {
     Literal,
 }
 
-
 /// Resolve the anisotropy contrasts the Matérn forward design build applies,
 /// dispatching on the explicit [`AnisoSeedMode`].
 pub(crate) fn resolve_matern_forward_aniso(
@@ -1789,7 +1745,6 @@ pub(crate) fn resolve_matern_forward_aniso(
         AnisoSeedMode::AutoSeedFromGeometry => auto_seed_aniso_contrasts(centers, aniso),
     }
 }
-
 
 pub(crate) fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f64, f64)> {
     let n = points.nrows();
@@ -1814,7 +1769,6 @@ pub(crate) fn pairwise_distance_bounds(points: ArrayView2<'_, f64>) -> Option<(f
         None
     }
 }
-
 
 /// Capped-sample pairwise distance bounds for large point clouds.
 ///

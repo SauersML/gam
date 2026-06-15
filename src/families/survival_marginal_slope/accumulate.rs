@@ -760,6 +760,4 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok(acc.into_family_evaluation())
     }
-
 }
-

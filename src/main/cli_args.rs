@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[derive(Parser, Debug)]
 #[command(name = "gam")]
 #[command(about = "Formula-first GAM CLI", long_about = None)]
@@ -10,7 +9,6 @@ pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
 }
-
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
@@ -27,7 +25,6 @@ pub(crate) enum Command {
     /// Draw synthetic responses from the fitted model for given covariates.
     Generate(GenerateArgs),
 }
-
 
 #[derive(Args, Debug)]
 pub(crate) struct FitArgs {
@@ -179,7 +176,6 @@ pub(crate) struct FitArgs {
     pub(crate) out: Option<PathBuf>,
 }
 
-
 #[derive(Args, Debug)]
 pub(crate) struct PredictArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
@@ -212,7 +208,6 @@ pub(crate) struct PredictArgs {
     #[arg(long = "no-bias-correction", default_value_t = false)]
     pub(crate) no_bias_correction: bool,
 }
-
 
 #[derive(Debug, Clone)]
 pub(crate) struct SurvivalArgs {
@@ -258,7 +253,6 @@ pub(crate) struct SurvivalArgs {
     pub(crate) hazard_loading: Option<HazardLoadingArg>,
 }
 
-
 #[derive(Args, Debug)]
 pub(crate) struct DiagnoseArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
@@ -275,7 +269,6 @@ pub(crate) struct DiagnoseArgs {
     )]
     pub(crate) alo: bool,
 }
-
 
 #[derive(Args, Debug)]
 pub(crate) struct SampleArgs {
@@ -316,7 +309,6 @@ pub(crate) struct SampleArgs {
     pub(crate) out: Option<PathBuf>,
 }
 
-
 #[derive(Args, Debug)]
 pub(crate) struct GenerateArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
@@ -345,7 +337,6 @@ pub(crate) struct GenerateArgs {
     pub(crate) out: Option<PathBuf>,
 }
 
-
 #[derive(Args, Debug)]
 pub(crate) struct ReportArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
@@ -361,7 +352,6 @@ pub(crate) struct ReportArgs {
     )]
     pub(crate) out: Option<PathBuf>,
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum FamilyArg {
@@ -380,13 +370,11 @@ pub(crate) enum FamilyArg {
     TransformationNormal,
 }
 
-
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
 pub(crate) enum FrailtyKindArg {
     GaussianShift,
     HazardMultiplier,
 }
-
 
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
 pub(crate) enum HazardLoadingArg {
@@ -394,20 +382,17 @@ pub(crate) enum HazardLoadingArg {
     LoadedVsUnloaded,
 }
 
-
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
 pub(crate) enum CovarianceModeArg {
     Conditional,
     Corrected,
 }
 
-
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
 pub(crate) enum PredictModeArg {
     PosteriorMean,
     Map,
 }
-
 
 pub(crate) struct CliFirthValidation<'a> {
     pub(crate) enabled: bool,
@@ -417,8 +402,9 @@ pub(crate) struct CliFirthValidation<'a> {
     pub(crate) link_choice: Option<&'a LinkChoice>,
 }
 
-
-pub(crate) fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), CliError> {
+pub(crate) fn validate_cli_firth_configuration(
+    ctx: CliFirthValidation<'_>,
+) -> Result<(), CliError> {
     if !ctx.enabled {
         return Ok(());
     }
@@ -455,7 +441,6 @@ pub(crate) fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> R
     })
 }
 
-
 pub(crate) const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
 
 pub(crate) const FAMILY_BINOMIAL_LOCATION_SCALE: &str = "binomial-location-scale";
@@ -463,7 +448,6 @@ pub(crate) const FAMILY_BINOMIAL_LOCATION_SCALE: &str = "binomial-location-scale
 pub(crate) const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
 
 pub(crate) const FAMILY_TRANSFORMATION_NORMAL: &str = "transformation-normal";
-
 
 pub(crate) fn parse_positive_usize_cli(raw: &str) -> Result<usize, String> {
     let value = raw
@@ -475,7 +459,6 @@ pub(crate) fn parse_positive_usize_cli(raw: &str) -> Result<usize, String> {
     Ok(value)
 }
 
-
 pub(crate) fn parse_finite_f64_cli(raw: &str) -> Result<f64, String> {
     let value = raw
         .parse::<f64>()
@@ -486,7 +469,6 @@ pub(crate) fn parse_finite_f64_cli(raw: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-
 pub(crate) fn parse_positive_f64_cli(raw: &str) -> Result<f64, String> {
     let value = parse_finite_f64_cli(raw)?;
     if value <= 0.0 {
@@ -494,7 +476,6 @@ pub(crate) fn parse_positive_f64_cli(raw: &str) -> Result<f64, String> {
     }
     Ok(value)
 }
-
 
 pub(crate) fn parse_nonnegative_f64_cli(raw: &str) -> Result<f64, String> {
     let value = parse_finite_f64_cli(raw)?;
@@ -504,7 +485,6 @@ pub(crate) fn parse_nonnegative_f64_cli(raw: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-
 pub(crate) fn parse_probability_open_cli(raw: &str) -> Result<f64, String> {
     let value = parse_finite_f64_cli(raw)?;
     if value <= 0.0 || value >= 1.0 {
@@ -512,7 +492,6 @@ pub(crate) fn parse_probability_open_cli(raw: &str) -> Result<f64, String> {
     }
     Ok(value)
 }
-
 
 pub(crate) fn parse_time_basis_cli(raw: &str) -> Result<String, String> {
     let normalized = raw.trim().to_ascii_lowercase();
@@ -527,7 +506,6 @@ pub(crate) fn parse_time_basis_cli(raw: &str) -> Result<String, String> {
     }
 }
 
-
 pub(crate) fn require_dataset_rows(command: &str, path: &Path, rows: usize) -> Result<(), String> {
     if rows == 0 {
         return Err(format!(
@@ -537,7 +515,6 @@ pub(crate) fn require_dataset_rows(command: &str, path: &Path, rows: usize) -> R
     }
     Ok::<(), _>(())
 }
-
 
 pub(crate) fn default_output_path_from_model(model: &Path, suffix: &str) -> PathBuf {
     let stem = model

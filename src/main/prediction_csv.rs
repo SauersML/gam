@@ -1,6 +1,10 @@
 use super::*;
 
-pub(crate) fn write_matrix_csv(path: &Path, mat: &Array2<f64>, prefix: &str) -> Result<(), CliError> {
+pub(crate) fn write_matrix_csv(
+    path: &Path,
+    mat: &Array2<f64>,
+    prefix: &str,
+) -> Result<(), CliError> {
     let mut wtr = WriterBuilder::new()
         .has_headers(true)
         .from_path(path)
@@ -28,7 +32,6 @@ pub(crate) fn write_matrix_csv(path: &Path, mat: &Array2<f64>, prefix: &str) -> 
     })?;
     Ok(())
 }
-
 
 pub(crate) fn load_prediction_id_values(
     path: &Path,
@@ -76,7 +79,6 @@ pub(crate) fn load_prediction_id_values(
     Ok(out)
 }
 
-
 pub(crate) fn format_id_number(value: f64) -> String {
     if (value - value.round()).abs() <= 1e-9 {
         format!("{value:.0}")
@@ -87,7 +89,6 @@ pub(crate) fn format_id_number(value: f64) -> String {
             .to_string()
     }
 }
-
 
 pub(crate) fn prepend_id_column_to_prediction_csv(
     path: &Path,
@@ -155,13 +156,15 @@ pub(crate) fn prepend_id_column_to_prediction_csv(
     Ok(())
 }
 
-
 /// Unified CSV prediction writer.  Each column is a `(name, data)` pair;
 /// the function writes a header row from the names and one data row per
 /// element, formatting every value to 12 decimal places.
 ///
 /// All columns must have the same length.  An empty column list is an error.
-pub(crate) fn write_prediction_csv_unified(path: &Path, columns: &[(&str, &[f64])]) -> CliResult<()> {
+pub(crate) fn write_prediction_csv_unified(
+    path: &Path,
+    columns: &[(&str, &[f64])],
+) -> CliResult<()> {
     if columns.is_empty() {
         return Err(CliError::Internal {
             reason: "internal error: write_prediction_csv_unified called with no columns"
@@ -227,7 +230,6 @@ pub(crate) fn write_prediction_csv_unified(path: &Path, columns: &[(&str, &[f64]
     Ok(())
 }
 
-
 /// Convenience wrapper: builds a standard (non-survival, non-location-scale)
 /// prediction column list and delegates to [`write_prediction_csv_unified`].
 pub(crate) fn write_prediction_csv(
@@ -280,7 +282,6 @@ pub(crate) fn write_prediction_csv(
     write_prediction_csv_unified(path, &cols)
 }
 
-
 /// Convenience wrapper for Gaussian location-scale predictions (always
 /// includes a `sigma` column).
 pub(crate) fn write_gaussian_location_scale_prediction_csv(
@@ -322,7 +323,6 @@ pub(crate) fn write_gaussian_location_scale_prediction_csv(
 
     write_prediction_csv_unified(path, &cols)
 }
-
 
 /// Convenience wrapper for survival predictions. Survival output uses explicit
 /// probability semantics because the event probability is `1 - survival_prob`.
@@ -383,7 +383,6 @@ pub(crate) fn write_survival_prediction_csv(
 
     write_prediction_csv_unified(path, &cols)
 }
-
 
 /// Convenience wrapper for binary deployment predictions backed by a survival
 /// hazard window (includes explicit `event_prob`, `failure_prob`, and

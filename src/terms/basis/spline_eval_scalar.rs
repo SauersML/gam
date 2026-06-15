@@ -9,7 +9,6 @@ pub struct SplineScratch {
     pub(crate) left_offsets: Vec<f64>,
 }
 
-
 impl SplineScratch {
     pub fn new(degree: usize) -> Self {
         Self {
@@ -21,7 +20,6 @@ impl SplineScratch {
         }
     }
 }
-
 
 /// Evaluates B-spline basis functions at a single scalar point `x` into a provided buffer.
 ///
@@ -49,7 +47,6 @@ pub fn evaluate_bspline_basis_scalar(
     Ok(())
 }
 
-
 /// Configuration for a dense one-dimensional periodic B-spline basis.
 ///
 /// The basis lives on a circle parameterized by `origin + [0, period)`.  It is
@@ -71,7 +68,6 @@ pub struct PeriodicBSplineBasisSpec {
     pub penalty_order: usize,
 }
 
-
 impl PeriodicBSplineBasisSpec {
     /// Construct a validated-looking spec. Full semantic validation is still
     /// performed by builders so deserialized specs receive identical checks.
@@ -92,7 +88,6 @@ impl PeriodicBSplineBasisSpec {
     }
 }
 
-
 /// Fitted vector-valued periodic spline curve.
 ///
 /// `coefficients` has shape `(num_basis, ambient_dim)`. Evaluation multiplies
@@ -104,7 +99,6 @@ pub struct PeriodicSplineCurve {
     pub spec: PeriodicBSplineBasisSpec,
     pub coefficients: Array2<f64>,
 }
-
 
 impl PeriodicSplineCurve {
     /// Number of coordinates in the ambient output space.
@@ -149,8 +143,9 @@ impl PeriodicSplineCurve {
     }
 }
 
-
-pub(crate) fn validate_periodic_bspline_spec(spec: &PeriodicBSplineBasisSpec) -> Result<(), BasisError> {
+pub(crate) fn validate_periodic_bspline_spec(
+    spec: &PeriodicBSplineBasisSpec,
+) -> Result<(), BasisError> {
     if spec.degree < 1 {
         return Err(BasisError::InvalidDegree(spec.degree));
     }
@@ -182,7 +177,6 @@ pub(crate) fn validate_periodic_bspline_spec(spec: &PeriodicBSplineBasisSpec) ->
     Ok(())
 }
 
-
 #[inline]
 pub(crate) fn wrap_periodic_phase(u: f64, origin: f64, period: f64) -> f64 {
     let wrapped = (u - origin).rem_euclid(period);
@@ -190,7 +184,6 @@ pub(crate) fn wrap_periodic_phase(u: f64, origin: f64, period: f64) -> f64 {
     // returns period after extreme-roundoff cancellation.
     if wrapped >= period { 0.0 } else { wrapped }
 }
-
 
 pub(crate) fn cardinal_bspline_value(x: f64, degree: usize) -> f64 {
     if degree == 0 {
@@ -203,7 +196,6 @@ pub(crate) fn cardinal_bspline_value(x: f64, degree: usize) -> f64 {
     (x / p) * cardinal_bspline_value(x, degree - 1)
         + (((degree + 1) as f64 - x) / p) * cardinal_bspline_value(x - 1.0, degree - 1)
 }
-
 
 pub(crate) fn fill_periodic_bspline_unnormalized_value_row(
     u: f64,
@@ -230,7 +222,6 @@ pub(crate) fn fill_periodic_bspline_unnormalized_value_row(
     }
     rowsum
 }
-
 
 pub(crate) fn fill_periodic_bspline_unnormalized_derivative_row(
     u: f64,
@@ -260,7 +251,6 @@ pub(crate) fn fill_periodic_bspline_unnormalized_derivative_row(
     }
     rowsum_derivative
 }
-
 
 /// Build a dense periodic cardinal B-spline design for one circular parameter.
 ///
@@ -302,8 +292,10 @@ pub fn build_periodic_bspline_basis_1d(
     Ok(out)
 }
 
-
-pub(crate) fn solve_spd_cholesky(a: Array2<f64>, b: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn solve_spd_cholesky(
+    a: Array2<f64>,
+    b: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
     if a.ncols() != n || b.nrows() != n {
         crate::bail_dim_basis!(
@@ -385,7 +377,6 @@ pub(crate) fn solve_spd_cholesky(a: Array2<f64>, b: &Array2<f64>) -> Result<Arra
     ))
 }
 
-
 /// Fit a vector-valued 1D periodic spline curve by penalized least squares.
 ///
 /// `y` may have any positive number of columns. Each column is solved with the
@@ -445,7 +436,6 @@ pub fn fit_periodic_bspline_curve(
     })
 }
 
-
 /// Evaluates M-spline basis functions at a scalar point `x` into a provided buffer.
 ///
 /// Construction:
@@ -498,7 +488,6 @@ pub fn evaluate_mspline_scalar(
     }
     Ok(())
 }
-
 
 /// Evaluates I-spline basis functions at a scalar point `x` into a provided buffer.
 ///
@@ -648,7 +637,6 @@ pub fn evaluate_ispline_scalarwith_scratch(
     Ok(())
 }
 
-
 /// Compute the k-th derivative of an I-spline basis as a dense matrix.
 ///
 /// The I-spline of degree `degree` uses internal B-splines of degree `degree+1`.
@@ -758,7 +746,6 @@ pub fn create_ispline_derivative_dense(
     Ok(out)
 }
 
-
 pub fn evaluate_ispline_scalar(
     x: f64,
     knot_vector: ArrayView1<f64>,
@@ -771,7 +758,6 @@ pub fn evaluate_ispline_scalar(
     let mut scratch = SplineScratch::new(bs_degree);
     evaluate_ispline_scalarwith_scratch(x, knot_vector, degree, out, &mut scratch)
 }
-
 
 /// Evaluates B-spline basis derivatives at a single scalar point `x` into a provided buffer.
 ///
@@ -805,7 +791,6 @@ pub fn evaluate_bspline_derivative_scalar(
         &mut lower_scratch,
     )
 }
-
 
 /// Zero-allocation version: pass pre-allocated buffers for lower_basis and scratch.
 /// - `lower_basis`: length = knot_vector.len() - degree
@@ -879,7 +864,6 @@ pub fn evaluate_bspline_derivative_scalar_into(
     Ok(())
 }
 
-
 pub(crate) fn create_mspline_dense(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -921,7 +905,6 @@ pub(crate) fn create_mspline_dense(
     }
     Ok(out)
 }
-
 
 pub(crate) fn create_mspline_sparse(
     data: ArrayView1<f64>,
@@ -973,7 +956,6 @@ pub(crate) fn create_mspline_sparse(
         .map_err(|e| BasisError::SparseCreation(format!("{e:?}")))
 }
 
-
 pub(crate) fn validate_mspline_normalization_spans(
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -989,7 +971,6 @@ pub(crate) fn validate_mspline_normalization_spans(
     }
     Ok(())
 }
-
 
 pub(crate) fn create_ispline_dense(
     data: ArrayView1<f64>,
@@ -1082,7 +1063,6 @@ pub(crate) fn create_ispline_dense(
     Ok(out)
 }
 
-
 /// Reusable scratch arena for the shared B-spline higher-derivative recurrence.
 ///
 /// The derivative recursion
@@ -1103,7 +1083,6 @@ pub struct BsplineDerivativeWorkspace {
     /// Cox–de Boor scratch for the order-1 base case.
     pub(crate) lower_scratch: internal::BsplineScratch,
 }
-
 
 impl BsplineDerivativeWorkspace {
     /// Creates an empty workspace; buffers are sized lazily on first use.
@@ -1129,7 +1108,6 @@ impl BsplineDerivativeWorkspace {
         buf
     }
 }
-
 
 /// Shared engine for B-spline derivatives of order `derivative_order ≥ 1`.
 ///
@@ -1245,7 +1223,6 @@ pub(crate) fn evaluate_bspline_derivative_recurrence_into(
     Ok(())
 }
 
-
 /// Evaluates B-spline second derivatives at a single scalar point `x` into `out`.
 ///
 /// Thin adapter over [`evaluate_bspline_derivative_recurrence_into`] with
@@ -1264,7 +1241,6 @@ pub fn evaluate_bsplinesecond_derivative_scalar(
     evaluate_bspline_derivative_recurrence_into(2, x, knot_vector, degree, out, &mut workspace, 0)
 }
 
-
 /// Evaluates B-spline third derivatives at a single scalar point `x` into `out`.
 ///
 /// Thin adapter over [`evaluate_bspline_derivative_recurrence_into`] with
@@ -1282,7 +1258,6 @@ pub fn evaluate_bsplinethird_derivative_scalar(
     let mut workspace = BsplineDerivativeWorkspace::new();
     evaluate_bspline_derivative_recurrence_into(3, x, knot_vector, degree, out, &mut workspace, 0)
 }
-
 
 /// Evaluates B-spline fourth derivatives at a single scalar point `x` into `out`.
 ///

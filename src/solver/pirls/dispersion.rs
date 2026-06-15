@@ -7,14 +7,11 @@
 
 use super::*;
 
-
-
 pub(crate) const GAMMA_SHAPE_MIN: f64 = 1e-8;
 
 pub(crate) const GAMMA_SHAPE_MAX: f64 = 1e12;
 
 pub(crate) const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
-
 
 /// Saturation threshold for `|η|` diagnostics at inner P-IRLS iterates.
 ///
@@ -23,12 +20,10 @@ pub(crate) const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
 /// logic classify a stalled fit pinned deep in a separated/saturated tail.
 pub(super) const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
-
 #[inline]
 pub(crate) fn gamma_shape_score(shape: f64, target: f64) -> f64 {
     shape.ln() - digamma(shape) - target
 }
-
 
 pub(crate) fn estimate_gamma_shape_from_eta(
     y: ArrayView1<'_, f64>,
@@ -91,7 +86,6 @@ pub(crate) fn estimate_gamma_shape_from_eta(
     0.5 * (lo + hi)
 }
 
-
 /// Method-of-moments estimate of the Beta-regression precision `phi` from the
 /// current linear predictor `eta` (logit link).
 ///
@@ -140,7 +134,6 @@ pub(crate) fn estimate_beta_phi_from_eta(
     let one_plus_phi = (total_weight / weighted_pearson).max(1.0 + PHI_MIN);
     (one_plus_phi - 1.0).clamp(PHI_MIN, PHI_MAX)
 }
-
 
 /// Pearson moment estimate of the Tweedie dispersion `phi` from the current
 /// linear predictor `eta` (log link, `mu = exp(eta)`).
@@ -205,7 +198,6 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
     (weighted_pearson / total_weight).clamp(PHI_MIN, PHI_MAX)
 }
 
-
 /// Admissible band for the estimated Negative-Binomial overdispersion `theta`.
 /// `THETA_MIN` caps the heaviest overdispersion the estimator will report;
 /// `THETA_MAX` is the effective Poisson limit (`Var → mu`) used when the data is
@@ -213,7 +205,6 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
 pub(crate) const NEGBIN_THETA_MIN: f64 = 1e-3;
 
 pub(crate) const NEGBIN_THETA_MAX: f64 = 1e6;
-
 
 /// Prior-weighted Negative-Binomial `theta` ML score and observed information at
 /// a single `theta`, evaluated at the log-link mean `mu = exp(eta)`.
@@ -263,7 +254,6 @@ pub(crate) fn negbin_theta_score_and_info(
         );
     (score, info)
 }
-
 
 /// Maximum-likelihood estimate of the Negative-Binomial overdispersion `theta`
 /// from the current linear predictor `eta` (log link, `mu = exp(eta)`).
@@ -381,4 +371,3 @@ pub(crate) fn estimate_negbin_theta_from_eta(
     }
     theta.clamp(NEGBIN_THETA_MIN, NEGBIN_THETA_MAX)
 }
-

@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ConstraintNullspaceCacheKey {
     pub(crate) centersrows: usize,
@@ -9,13 +8,11 @@ pub(crate) struct ConstraintNullspaceCacheKey {
     pub(crate) order: ConstraintNullspaceOrderKey,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ConstraintNullspaceOrderKey {
     Duchon(DuchonNullspaceOrder),
     ThinPlate,
 }
-
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ConstraintNullspaceCache {
@@ -23,9 +20,7 @@ pub(crate) struct ConstraintNullspaceCache {
     pub(crate) order: Vec<ConstraintNullspaceCacheKey>,
 }
 
-
 pub(crate) const CONSTRAINT_NULLSPACE_CACHE_MAX_ENTRIES: usize = 32;
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct OwnedDataCacheKey {
@@ -36,13 +31,11 @@ pub(crate) struct OwnedDataCacheKey {
     pub(crate) stride1: isize,
 }
 
-
 #[derive(Debug)]
 pub(crate) struct BasisCacheContext {
     pub(crate) constraint_nullspace: ConstraintNullspaceCache,
     pub(crate) owned_data: crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
 }
-
 
 impl BasisCacheContext {
     pub(crate) fn with_policy(policy: &crate::resource::ResourcePolicy) -> Self {
@@ -56,13 +49,11 @@ impl BasisCacheContext {
     }
 }
 
-
 impl Default for BasisCacheContext {
     fn default() -> Self {
         Self::with_policy(&crate::resource::ResourcePolicy::default_library())
     }
 }
-
 
 /// Explicit per-run workspace for reusable basis-construction caches.
 ///
@@ -78,7 +69,6 @@ pub struct BasisWorkspace {
     pub(crate) cache: BasisCacheContext,
     pub(crate) policy: crate::resource::ResourcePolicy,
 }
-
 
 impl BasisWorkspace {
     pub fn new() -> Self {
@@ -102,13 +92,11 @@ impl BasisWorkspace {
     }
 }
 
-
 impl Default for BasisWorkspace {
     fn default() -> Self {
         Self::default_library()
     }
 }
-
 
 pub(crate) fn hash_arrayview2(values: ArrayView2<'_, f64>) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -119,7 +107,6 @@ pub(crate) fn hash_arrayview2(values: ArrayView2<'_, f64>) -> u64 {
     }
     hasher.finish()
 }
-
 
 pub(crate) fn shared_owned_data_matrix(
     data: ArrayView2<'_, f64>,
@@ -145,7 +132,6 @@ pub(crate) fn shared_owned_data_matrix(
     owned
 }
 
-
 /// Minimal cache-less intern: wraps an `ArrayView2` into an `Arc<Array2<f64>>`.
 ///
 /// Used by derivative-operator builders that don't have a `BasisCacheContext`
@@ -158,16 +144,16 @@ pub(crate) fn shared_owned_data_matrix_from_view(data: ArrayView2<'_, f64>) -> A
     Arc::new(data.to_owned())
 }
 
-
 /// Minimal cache-less intern for knot centers; mirrors
 /// `shared_owned_data_matrix_from_view`. Centers are typically k×d with k
 /// much smaller than n, but the `Arc::clone` pattern still avoids a k×d
 /// copy per axis when the same operator feeds multiple derivative paths.
 #[inline]
-pub(crate) fn shared_owned_centers_matrix_from_view(centers: ArrayView2<'_, f64>) -> Arc<Array2<f64>> {
+pub(crate) fn shared_owned_centers_matrix_from_view(
+    centers: ArrayView2<'_, f64>,
+) -> Arc<Array2<f64>> {
     Arc::new(centers.to_owned())
 }
-
 
 /// Compute the kernel reparameterisation transform `Z = null(P_centers^T)`.
 ///
@@ -234,7 +220,6 @@ pub(crate) fn kernel_constraint_nullspace(
     Ok((*z).clone())
 }
 
-
 pub(crate) fn thin_plate_kernel_constraint_nullspace(
     centers: ArrayView2<'_, f64>,
     cache: &mut BasisCacheContext,
@@ -288,7 +273,6 @@ pub(crate) fn thin_plate_kernel_constraint_nullspace(
     Ok((*z).clone())
 }
 
-
 pub(crate) fn matern_identifiability_transform(
     centers: ArrayView2<'_, f64>,
     identifiability: &MaternIdentifiability,
@@ -322,7 +306,6 @@ pub(crate) fn matern_identifiability_transform(
     }
 }
 
-
 pub(crate) fn build_matern_operator_penalty_candidates(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
@@ -351,7 +334,6 @@ pub(crate) fn build_matern_operator_penalty_candidates(
         &matern_spec,
     ))
 }
-
 
 /// Decide whether the matern double-penalty path emits the
 /// `DoublePenaltyNullspace` shrinkage candidate, honoring a FROZEN bootstrap-κ
@@ -408,7 +390,6 @@ pub(crate) fn matern_double_penalty_candidates_with_decision(
     Ok((candidates, survived))
 }
 
-
 pub(crate) fn build_matern_double_penalty_candidates(
     spline: &MaternSplineBasis,
     full_transform: Option<&Array2<f64>>,
@@ -417,7 +398,6 @@ pub(crate) fn build_matern_double_penalty_candidates(
     let primary = project_penalty_matrix(&spline.penalty_kernel, full_transform);
     matern_double_penalty_candidates_with_decision(&primary, frozen_nullspace_shrinkage_survived)
 }
-
 
 /// Creates a Matérn spline basis from data and centers.
 ///
@@ -568,7 +548,6 @@ pub fn create_matern_spline_basiswithworkspace(
     })
 }
 
-
 #[inline]
 pub(crate) fn validate_lat_lon_matrix(
     data: ArrayView2<'_, f64>,
@@ -610,7 +589,6 @@ pub(crate) fn validate_lat_lon_matrix(
     Ok(())
 }
 
-
 pub fn spherical_wahba_kernel_matrix(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -625,7 +603,6 @@ pub fn spherical_wahba_kernel_matrix(
         SphereWahbaKernel::Sobolev,
     )
 }
-
 
 pub fn spherical_wahba_kernel_matrix_with_kind(
     data: ArrayView2<'_, f64>,
@@ -744,7 +721,6 @@ pub fn spherical_wahba_kernel_matrix_with_kind(
     Ok(out)
 }
 
-
 pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     weights: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
@@ -779,7 +755,6 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     Ok(z)
 }
 
-
 pub(crate) fn sphere_area_weights(centers: ArrayView2<'_, f64>, radians: bool) -> Array1<f64> {
     let to_rad = if radians {
         1.0
@@ -793,9 +768,12 @@ pub(crate) fn sphere_area_weights(centers: ArrayView2<'_, f64>, radians: bool) -
     )
 }
 
-
 #[inline]
-pub(crate) fn spherical_chord_distance2(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>, radians: bool) -> f64 {
+pub(crate) fn spherical_chord_distance2(
+    a: ArrayView1<'_, f64>,
+    b: ArrayView1<'_, f64>,
+    radians: bool,
+) -> f64 {
     let to_rad = if radians {
         1.0
     } else {
@@ -808,7 +786,6 @@ pub(crate) fn spherical_chord_distance2(a: ArrayView1<'_, f64>, b: ArrayView1<'_
     let cos_gamma = lat_a.sin() * lat_b.sin() + lat_a.cos() * lat_b.cos() * (lon_a - lon_b).cos();
     2.0 * (1.0 - cos_gamma.clamp(-1.0, 1.0))
 }
-
 
 pub fn select_spherical_farthest_point_centers(
     data: ArrayView2<'_, f64>,
@@ -887,7 +864,6 @@ pub fn select_spherical_farthest_point_centers(
     Ok(centers)
 }
 
-
 /// Auto-derive a streaming row chunk size for dense basis evaluation.
 ///
 /// The opt-in `streaming_chunk_size` knob has been removed from public specs:
@@ -913,7 +889,6 @@ pub fn auto_streaming_chunk_size_for_dense(n_rows: usize, n_basis_cols: usize) -
     let clamped = raw_chunk.max(MIN_CHUNK_ROWS).min(n_rows);
     Some(clamped)
 }
-
 
 /// GPU dispatch for the raw `(n × m)` Wahba truncated-spectral kernel
 /// matrix. Returns `None` when the kernel variant is not one of the

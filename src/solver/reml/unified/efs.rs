@@ -4,7 +4,6 @@ use super::*;
 /// overshooting). Each iteration changes `λ` by at most `exp(EFS_MAX_STEP)`.
 pub(crate) const EFS_MAX_STEP: f64 = 5.0;
 
-
 /// Extended Fellner–Schall update for ρ and penalty-like (τ) hyperparameters.
 ///
 /// Universal-form multiplicative log-λ update driven by the *full* outer
@@ -126,7 +125,6 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
     steps
 }
 
-
 /// Diagnostics for the bam-style single-loop EFS route.
 ///
 /// `gradient_residual` is the normalized difference between the full
@@ -144,7 +142,6 @@ pub(crate) struct EfsSingleLoopDiagnostics {
     pub(crate) gradient_norm: f64,
     pub(crate) step_inf_norm: f64,
 }
-
 
 /// Estimate how far the single-loop EFS surrogate has drifted from the
 /// current outer-gradient geometry.
@@ -224,14 +221,12 @@ pub(crate) fn efs_single_loop_diagnostics(
     }
 }
 
-
 /// Regularization threshold for pseudoinverse of the trace Gram matrix.
 ///
 /// Eigenvalues below `PSI_GRAM_PINV_TOL * max_eigenvalue` are treated as
 /// zero when computing the pseudoinverse G⁺. This prevents amplification
 /// of noise in near-singular directions of the ψ-ψ Gram matrix.
 pub(crate) const PSI_GRAM_PINV_TOL: f64 = 1e-8;
-
 
 /// Initial step-size damping factor for the preconditioned gradient on ψ.
 ///
@@ -240,12 +235,10 @@ pub(crate) const PSI_GRAM_PINV_TOL: f64 = 1e-8;
 /// early iterations when the quadratic model may be inaccurate.
 pub(crate) const PSI_INITIAL_ALPHA: f64 = 1.0;
 
-
 /// Minimum number of scalar ρ/τ EFS candidates before `compute_hybrid_efs_update`
 /// fans out with rayon.  Smaller blocks are common (1-4 smoothing parameters),
 /// where task scheduling costs dominate the independent arithmetic.
 pub(crate) const HYBRID_EFS_SCALAR_PAR_THRESHOLD: usize = 8;
-
 
 /// Minimum number of independent ψ-ψ Gram entries before exact trace assembly
 /// fans out with rayon.  This is expressed in upper-triangle pair count rather
@@ -253,11 +246,9 @@ pub(crate) const HYBRID_EFS_SCALAR_PAR_THRESHOLD: usize = 8;
 /// anisotropic/design-moving blocks parallelize.
 pub(crate) const HYBRID_EFS_GRAM_PAIR_PAR_THRESHOLD: usize = 24;
 
-
 /// Minimum number of ψ drifts before materialization/projection is done in
 /// parallel during exact Gram assembly.
 pub(crate) const HYBRID_EFS_PSI_DRIFT_PAR_THRESHOLD: usize = 8;
-
 
 /// Result of the hybrid EFS update, containing both the step vector and
 /// metadata needed for backtracking on the ψ block.
@@ -271,7 +262,6 @@ pub struct HybridEfsResult {
     /// Length matches `psi_indices.len()`.
     pub psi_gradient: Vec<f64>,
 }
-
 
 /// Hybrid EFS + preconditioned gradient update.
 ///
@@ -722,7 +712,6 @@ pub fn compute_hybrid_efs_update(
     }
 }
 
-
 /// Compute G⁺ v where G⁺ is the pseudoinverse of symmetric matrix G.
 ///
 /// Uses eigendecomposition with truncation: eigenvalues below
@@ -782,7 +771,6 @@ pub(crate) fn pseudoinverse_times_vec(
     }
     result
 }
-
 
 /// Symmetric eigendecomposition via classical Jacobi iteration.
 ///

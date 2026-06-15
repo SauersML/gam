@@ -219,8 +219,7 @@ fn backtransform_penalized_hessian_is_inverse_of_covariance_backtransform() {
     // each, and confirm they are mutual inverses to working precision.
     let sigma_int = {
         // 3×3 inverse via cofactors — small enough to hand-roll.
-        let det = h_int[[0, 0]]
-            * (h_int[[1, 1]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 1]])
+        let det = h_int[[0, 0]] * (h_int[[1, 1]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 1]])
             - h_int[[0, 1]] * (h_int[[1, 0]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 0]])
             + h_int[[0, 2]] * (h_int[[1, 0]] * h_int[[2, 1]] - h_int[[1, 1]] * h_int[[2, 0]]);
         let mut inv = Array2::<f64>::zeros((3, 3));
@@ -397,13 +396,10 @@ fn prefit_rank_check_detects_unpenalized_duplicate_column() {
     ];
     let w = Array1::ones(x.nrows());
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
-    let diagnostic = detect_prefit_unpenalized_rank_deficiency_in_design(
-        w.view(),
-        &design,
-        &[true, true, true],
-    )
-    .expect("rank check should stream dense design")
-    .expect("duplicate unpenalized columns are rank deficient");
+    let diagnostic =
+        detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
+            .expect("rank check should stream dense design")
+            .expect("duplicate unpenalized columns are rank deficient");
 
     match diagnostic {
         PrefitRegularityDiagnostic::RankDeficient {
@@ -484,13 +480,10 @@ fn prefit_rank_check_detects_near_degenerate_unpenalized_design() {
     ];
     let w = Array1::ones(x.nrows());
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
-    let diagnostic = detect_prefit_unpenalized_rank_deficiency_in_design(
-        w.view(),
-        &design,
-        &[true, true, true],
-    )
-    .expect("rank check should stream dense design")
-    .expect("near-collinear unpenalized columns are near-degenerate");
+    let diagnostic =
+        detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
+            .expect("rank check should stream dense design")
+            .expect("near-collinear unpenalized columns are near-degenerate");
 
     match diagnostic {
         PrefitRegularityDiagnostic::NearDegenerate {
@@ -531,12 +524,9 @@ fn prefit_rank_check_accepts_well_conditioned_unpenalized_design() {
     ];
     let w = Array1::ones(x.nrows());
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
-    let diagnostic = detect_prefit_unpenalized_rank_deficiency_in_design(
-        w.view(),
-        &design,
-        &[true, true, true],
-    )
-    .expect("rank check should stream dense design");
+    let diagnostic =
+        detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
+            .expect("rank check should stream dense design");
     assert_eq!(
         diagnostic, None,
         "a well-conditioned full-rank unpenalized design must not be pre-fit rejected"
@@ -713,8 +703,8 @@ fn unified_fit_decode_validation_rejects_beta_drift_from_blocks() {
     // `Array1<f64>` uses ndarray's own (versioned-sequence) serde format,
     // not a bare JSON array, so round-trip the drifted value through
     // serde_json to honour that schema while still corrupting the data.
-    payload["beta"] = serde_json::to_value(Array1::from(vec![9.0_f64, 8.0_f64]))
-        .expect("serialize drifted beta");
+    payload["beta"] =
+        serde_json::to_value(Array1::from(vec![9.0_f64, 8.0_f64])).expect("serialize drifted beta");
     let decoded: UnifiedFitResult =
         serde_json::from_value(payload).expect("deserialize corrupted fit");
     let err = decoded

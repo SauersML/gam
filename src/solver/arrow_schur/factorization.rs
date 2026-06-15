@@ -10,7 +10,6 @@ pub(crate) struct ArrowRowFactorResult {
     pub(crate) gauge_deflated_directions: usize,
 }
 
-
 /// Attempt the per-row block factorization as one device batch spread across
 /// every usable GPU.
 ///
@@ -83,14 +82,12 @@ pub(crate) fn try_factor_blocks_batched(
     Some(ArrowFactorSlab::from_blocks(blocks))
 }
 
-
 pub(crate) fn row_block_diag_scale(row: &ArrowRowBlock, d: usize) -> f64 {
     (0..d)
         .map(|a| row.htt[[a, a]].abs())
         .fold(0.0_f64, f64::max)
         .max(1.0)
 }
-
 
 /// Diagonal-ratio condition-number proxy for an SPD matrix from its lower
 /// Cholesky factor `L` (where `A = L Lᵀ`):
@@ -122,7 +119,6 @@ pub(crate) fn cholesky_factor_kappa_estimate(factor: &Array2<f64>) -> f64 {
     }
 }
 
-
 /// Smallest Cholesky pivot estimate for `A = L Lᵀ`, using `L_ii²`.
 ///
 /// The diagonal-ratio κ proxy is blind for scalar blocks: every positive
@@ -147,11 +143,9 @@ pub(crate) fn cholesky_factor_min_pivot_estimate(factor: &Array2<f64>) -> f64 {
     min_pivot
 }
 
-
 pub(crate) fn safe_spd_pivot_min(diag_scale: f64) -> f64 {
     f64::EPSILON.sqrt() * diag_scale.max(1.0)
 }
-
 
 pub(crate) fn cholesky_factor_passes_safe_inversion(
     factor: &Array2<f64>,
@@ -164,7 +158,6 @@ pub(crate) fn cholesky_factor_passes_safe_inversion(
         && cholesky_factor_min_pivot_estimate(factor) >= safe_spd_pivot_min(diag_scale)
 }
 
-
 /// Near-singularity condition-number ceiling for double precision at dimension
 /// `dim`: κ_max = 1 / (sqrt(DBL_EPS) · max(dim, 1)).
 ///
@@ -175,7 +168,6 @@ pub(crate) fn safe_spd_kappa_max(dim: usize) -> f64 {
     let d_scale = (dim as f64).max(1.0);
     1.0 / (f64::EPSILON.sqrt() * d_scale)
 }
-
 
 pub(crate) fn factor_row_block_cholesky(
     row: &ArrowRowBlock,
@@ -191,7 +183,6 @@ pub(crate) fn factor_row_block_cholesky(
     }
 }
 
-
 pub(crate) fn factor_row_block_cholesky_dynamic(
     row: &ArrowRowBlock,
     ridge_eff: f64,
@@ -203,7 +194,6 @@ pub(crate) fn factor_row_block_cholesky_dynamic(
     }
     cholesky_lower(&block)
 }
-
 
 pub(crate) fn factor_row_block_cholesky_fixed<const D: usize>(
     row: &ArrowRowBlock,
@@ -258,8 +248,11 @@ pub(crate) fn factor_row_block_cholesky_fixed<const D: usize>(
     Ok(out)
 }
 
-
-pub(crate) fn row_gauge_curvature(row: &ArrowRowBlock, d: usize, gauge: &Array1<f64>) -> Option<f64> {
+pub(crate) fn row_gauge_curvature(
+    row: &ArrowRowBlock,
+    d: usize,
+    gauge: &Array1<f64>,
+) -> Option<f64> {
     if gauge.len() != d {
         return None;
     }
@@ -272,7 +265,6 @@ pub(crate) fn row_gauge_curvature(row: &ArrowRowBlock, d: usize, gauge: &Array1<
     }
     if acc.is_finite() { Some(acc) } else { None }
 }
-
 
 pub(crate) fn factor_gauge_deflated_evidence_row(
     row: &ArrowRowBlock,
@@ -363,14 +355,12 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
     })
 }
 
-
 /// Relative spectral floor (vs the block's largest-magnitude eigenvalue) below
 /// which a per-row `H_tt` eigen-direction is treated as non-identified and
 /// unit-stiffness deflated rather than ridge-damped. Matches the magnitude of
 /// the gauge Rayleigh qualifier and the `SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF`
 /// data-null detection so the three deflation paths agree on what "flat" means.
 pub(crate) const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
-
 
 /// Hysteresis half-width (as a fraction of `SPECTRAL_DEFLATION_REL_FLOOR`)
 /// applied to the spectral-deflation decision for *positive* near-floor
@@ -396,7 +386,6 @@ pub(crate) const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 /// exactly as before — the converged result is unchanged wherever the old path
 /// already deflated a clearly-flat or indefinite direction.
 pub(crate) const SPECTRAL_DEFLATION_HYSTERESIS_FRACTION: f64 = 1.0e-2;
-
 
 /// Unit-stiffness **spectral** Faddeev-Popov conditioning of a per-row evidence
 /// block `H_tt` that the undamped Cholesky refused because it is genuinely
@@ -449,9 +438,10 @@ pub(crate) fn factor_spectral_deflated_evidence_row(
         }
     }
     let (evals, evecs) = sym.eigh(Side::Lower).ok()?;
-    let max_abs = evals
-        .iter()
-        .fold(0.0_f64, |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc });
+    let max_abs = evals.iter().fold(
+        0.0_f64,
+        |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc },
+    );
     if !(max_abs.is_finite() && max_abs > 0.0) {
         return None;
     }
@@ -547,7 +537,6 @@ pub(crate) fn factor_spectral_deflated_evidence_row(
     })
 }
 
-
 /// Unit-stiffness **spectral** Faddeev-Popov conditioning of the dense REDUCED
 /// SCHUR complement `S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`
 /// for an evidence/log-det-only solve whose plain Cholesky refused `S` because
@@ -593,13 +582,12 @@ pub(crate) fn factor_spectral_deflated_evidence_dense(schur: &Array2<f64>) -> Op
         }
     }
     let (evals, evecs) = sym.eigh(Side::Lower).ok()?;
-    let max_abs = evals.iter().fold(0.0_f64, |acc, &v| {
-        if v.is_finite() {
-            acc.max(v.abs())
-        } else {
-            acc
-        }
-    });
+    let max_abs = evals.iter().fold(
+        0.0_f64,
+        |acc, &v| {
+            if v.is_finite() { acc.max(v.abs()) } else { acc }
+        },
+    );
     if !(max_abs.is_finite() && max_abs > 0.0) {
         return None;
     }
@@ -625,7 +613,6 @@ pub(crate) fn factor_spectral_deflated_evidence_dense(schur: &Array2<f64>) -> Op
     }
     cholesky_lower(&conditioned).ok()
 }
-
 
 pub(crate) fn cholesky_solve_vector_fixed<const D: usize>(
     l: ArrayView2<'_, f64>,
@@ -669,7 +656,6 @@ pub(crate) fn cholesky_solve_vector_fixed<const D: usize>(
     out
 }
 
-
 pub(crate) fn factor_one_row(
     row: &ArrowRowBlock,
     ridge_t: f64,
@@ -680,7 +666,6 @@ pub(crate) fn factor_one_row(
     factor_one_row_result(row, ridge_t, d, row_idx, tolerate_ill_conditioning, &[])
         .map(|result| result.factor)
 }
-
 
 pub(crate) fn factor_one_row_result(
     row: &ArrowRowBlock,
@@ -864,7 +849,6 @@ pub(crate) fn factor_one_row_result(
     Ok(factor)
 }
 
-
 pub(crate) fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
     let manifold = latent.manifold();
     if manifold.is_euclidean() {
@@ -884,7 +868,6 @@ pub(crate) fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
     }
     hasher.finish_u64()
 }
-
 
 pub(crate) fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
     let mut hasher = Fingerprinter::new();
@@ -945,7 +928,6 @@ pub(crate) fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 
     hasher.finish_u64()
 }
 
-
 pub(crate) fn combine_row_and_registry_fingerprints(row: u64, registry: u64) -> u64 {
     if registry == 0 {
         return row;
@@ -956,7 +938,6 @@ pub(crate) fn combine_row_and_registry_fingerprints(row: u64, registry: u64) -> 
     hasher.write_u64(registry);
     hasher.finish_u64()
 }
-
 
 pub(crate) fn analytic_penalty_row_hessian_fingerprint(
     penalty: &AnalyticPenaltyKind,
@@ -1049,7 +1030,6 @@ pub(crate) fn analytic_penalty_row_hessian_fingerprint(
     Some(hasher.finish_u64())
 }
 
-
 /// Structural/value fingerprint for a cross-row (non-row-block-diagonal)
 /// Psi-tier analytic penalty.
 ///
@@ -1082,7 +1062,6 @@ pub(crate) fn cross_row_penalty_fingerprint(
     }
     hasher.finish_u64()
 }
-
 
 pub(crate) fn write_latent_manifold(hasher: &mut Fingerprinter, manifold: &LatentManifold) {
     match manifold {
@@ -1122,7 +1101,6 @@ pub(crate) fn write_latent_manifold(hasher: &mut Fingerprinter, manifold: &Laten
         }
     }
 }
-
 
 pub(crate) fn append_latent_metric_weights(out: &mut Vec<f64>, manifold: &LatentManifold) {
     match manifold {

@@ -87,12 +87,10 @@ pub(crate) struct SurvivalMarginalSlopeFamily {
     pub(crate) auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
 }
 
-
 /// Number of outer evaluations the survival auto-subsample schedule
 /// spends in Phase 1 before reverting to full data. Mirrors the BMS
 /// budget so the two families share an empirical noise-floor schedule.
 pub(crate) const SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET: usize = 12;
-
 
 /// Discriminates the two intercept slots per row: the entry-time intercept
 /// (solved against `q0`) and the exit-time intercept (solved against `q1`).
@@ -101,7 +99,6 @@ pub(crate) enum SurvivalInterceptSlotKind {
     Entry = 0,
     Exit = 1,
 }
-
 
 /// Per-row warm-start storage for the survival calibration root solver.
 ///
@@ -131,7 +128,6 @@ pub(crate) struct SurvivalInterceptWarmStartCache {
     pub(crate) exit_tag: Vec<std::sync::atomic::AtomicU64>,
 }
 
-
 impl SurvivalInterceptWarmStartCache {
     #[inline]
     pub(crate) fn slots_for(
@@ -151,7 +147,12 @@ impl SurvivalInterceptWarmStartCache {
     /// the caller's `beta_tag` and the stored value is finite. Otherwise
     /// returns `None` (cache miss — caller falls back to closed-form seed).
     #[inline]
-    pub(crate) fn load(&self, row: usize, kind: SurvivalInterceptSlotKind, beta_tag: u64) -> Option<f64> {
+    pub(crate) fn load(
+        &self,
+        row: usize,
+        kind: SurvivalInterceptSlotKind,
+        beta_tag: u64,
+    ) -> Option<f64> {
         let (values, tags) = self.slots_for(kind);
         let value_slot = values.get(row)?;
         let tag_slot = tags.get(row)?;
@@ -184,7 +185,6 @@ impl SurvivalInterceptWarmStartCache {
     }
 }
 
-
 pub(crate) fn new_intercept_warm_start_cache(n: usize) -> Arc<SurvivalInterceptWarmStartCache> {
     Arc::new(SurvivalInterceptWarmStartCache {
         entry_value: (0..n)
@@ -202,7 +202,6 @@ pub(crate) fn new_intercept_warm_start_cache(n: usize) -> Arc<SurvivalInterceptW
     })
 }
 
-
 /// FNV-1a 64-bit hash of the joint coefficient slices `(beta_h, beta_w)`.
 /// Returned tag is guaranteed non-zero (zero is remapped to one) so that
 /// the cache's "never written" sentinel cannot collide with a real key.
@@ -218,7 +217,6 @@ pub(crate) fn hash_intercept_warm_start_key(
     hash.mix_opt_beta(0xa2, beta_w);
     hash.finish_nonzero()
 }
-
 
 #[derive(Clone, Default)]
 pub(crate) struct ThetaHints {
@@ -248,7 +246,10 @@ impl SurvivalMarginalSlopeFamily {
         self.score_warp.is_some() || self.link_dev.is_some() || self.influence_absorber.is_some()
     }
 
-    pub(crate) fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
+    pub(crate) fn effective_flex_active(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<bool, String> {
         if self.score_warp.is_some() && self.flex_score_beta(block_states)?.is_none() {
             return Err(SurvivalMarginalSlopeError::InvalidInput {
                 reason: "missing survival score-warp block state".to_string(),
@@ -337,6 +338,4 @@ impl SurvivalMarginalSlopeFamily {
         }
         Ok(z_tilde.row(row).dot(gamma))
     }
-
 }
-

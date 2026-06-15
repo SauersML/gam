@@ -5,8 +5,6 @@
 
 use super::*;
 
-
-
 /// Overwrite the timewiggle tail columns of the dense time-channel
 /// primary-Jacobian slots with their analytic value at the β=0 pilot primary
 /// state, in place.
@@ -70,7 +68,6 @@ pub(crate) fn overwrite_timewiggle_time_slots_at_pilot(
     Ok(())
 }
 
-
 // ── Building block specs ──────────────────────────────────────────────
 
 pub(crate) fn build_time_blockspec(
@@ -122,7 +119,6 @@ pub(crate) fn build_time_blockspec(
     }
 }
 
-
 pub(crate) fn build_logslope_blockspec(
     design: &TermCollectionDesign,
     baseline: f64,
@@ -157,7 +153,6 @@ pub(crate) fn build_logslope_blockspec(
     }
 }
 
-
 pub(crate) fn build_marginal_blockspec(
     design: &TermCollectionDesign,
     offset: &Array1<f64>,
@@ -188,7 +183,6 @@ pub(crate) fn build_marginal_blockspec(
     }
 }
 
-
 pub(crate) fn inner_fit(
     family: &SurvivalMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
@@ -196,7 +190,6 @@ pub(crate) fn inner_fit(
 ) -> Result<UnifiedFitResult, String> {
     fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
 }
-
 
 /// Marginal-slope guard policy: the guard is required to be strictly positive
 /// (`q'(t) ≥ guard > 0`), because the row-wise representation here is the *only*
@@ -207,7 +200,6 @@ pub(crate) const MARGINAL_SLOPE_GUARD_POLICY: GuardConstraintPolicy = GuardConst
     guard_policy: GuardPolicy::Positive,
     feasibility: FeasibilityTolerance::EpsilonScaled,
 };
-
 
 pub(crate) fn time_derivative_guard_constraints(
     design_derivative_exit: &DesignMatrix,
@@ -222,7 +214,6 @@ pub(crate) fn time_derivative_guard_constraints(
     )
     .map_err(map_guard_constraint_failure)
 }
-
 
 /// Render a shared guard-constraint failure into the marginal-slope error
 /// vocabulary, preserving the family's historical wording.
@@ -280,7 +271,6 @@ pub(crate) fn map_guard_constraint_failure(failure: GuardConstraintFailure) -> S
     }
 }
 
-
 pub(crate) fn append_timewiggle_tail_nonnegative_constraints(
     base: Option<LinearInequalityConstraints>,
     p_total: usize,
@@ -329,7 +319,6 @@ pub(crate) fn append_timewiggle_tail_nonnegative_constraints(
     Ok(Some(LinearInequalityConstraints { a, b }))
 }
 
-
 pub(crate) fn mean_abs(values: impl IntoIterator<Item = f64>) -> f64 {
     let mut sum = 0.0;
     let mut count = 0usize;
@@ -339,7 +328,6 @@ pub(crate) fn mean_abs(values: impl IntoIterator<Item = f64>) -> f64 {
     }
     if count == 0 { 0.0 } else { sum / count as f64 }
 }
-
 
 pub(crate) fn block_log_lambda_seeds<'a, I>(design: &DesignMatrix, penalty_locals: I) -> Vec<f64>
 where
@@ -358,7 +346,6 @@ where
         })
         .collect()
 }
-
 
 pub(crate) fn joint_setup(
     data: ArrayView2<'_, f64>,
@@ -491,10 +478,6 @@ pub(crate) fn joint_setup(
     }
 }
 
-
-
-
-
 pub(crate) fn install_time_nullspace_shrinkage_penalty(
     time_block: &mut TimeBlockInput,
 ) -> Result<bool, String> {
@@ -557,7 +540,6 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
     Ok(true)
 }
 
-
 pub(crate) fn concatenate_term_specs(specs: &[TermCollectionSpec]) -> TermCollectionSpec {
     let mut out = TermCollectionSpec {
         linear_terms: Vec::new(),
@@ -573,12 +555,10 @@ pub(crate) fn concatenate_term_specs(specs: &[TermCollectionSpec]) -> TermCollec
     out
 }
 
-
 pub(crate) fn shift_penalty(mut penalty: BlockwisePenalty, offset: usize) -> BlockwisePenalty {
     penalty.col_range = (penalty.col_range.start + offset)..(penalty.col_range.end + offset);
     penalty
 }
-
 
 pub(crate) fn combine_logslope_surface_designs(
     mut designs: Vec<TermCollectionDesign>,
@@ -683,7 +663,6 @@ pub(crate) fn combine_logslope_surface_designs(
     combined.random_effect_levels = random_effect_levels;
     Ok((combined, concatenate_term_specs(specs), ranges))
 }
-
 
 /// Compute a baseline slope from the actual survival marginal-slope likelihood,
 /// using the baseline offsets alone as a time-only pilot q(t).
@@ -842,7 +821,6 @@ pub(crate) fn pooled_survival_baseline(
     if best.0.is_finite() { best_slope } else { 0.0 }
 }
 
-
 // ── Public fitting function ───────────────────────────────────────────
 
 /// Whether the optional score-warp / link-deviation flex blocks participate in
@@ -854,7 +832,6 @@ pub(crate) enum FlexActivation {
     OffForRigidPilot,
     On,
 }
-
 
 /// Which coordinate system the `marginal`/`logslope` designs handed to
 /// `build_blocks` live in — and therefore whether the side-bound V+M-exact
@@ -892,7 +869,6 @@ pub(crate) enum BlockDesignCoords {
     RematerializedRaw,
 }
 
-
 /// One block in the joint training-row design layout consumed by
 /// [`joint_training_design_preflight`]. Holds a dense `(n x p_block)`
 /// slice and the block tag used in the failure diagnostic.
@@ -900,7 +876,6 @@ pub(crate) struct JointPreflightSegment {
     pub block: JointPreflightBlock,
     pub columns: DesignMatrix,
 }
-
 
 /// W-metric joint training-row design preflight.
 ///
@@ -1096,4 +1071,3 @@ pub(crate) fn joint_training_design_preflight(
     );
     Ok(())
 }
-

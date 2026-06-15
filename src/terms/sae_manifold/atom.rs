@@ -167,7 +167,10 @@ pub(crate) fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<
     Some(grid)
 }
 
-pub(crate) fn torus_projection_seed_grid(latent_dim: usize, resolution: usize) -> Option<Array2<f64>> {
+pub(crate) fn torus_projection_seed_grid(
+    latent_dim: usize,
+    resolution: usize,
+) -> Option<Array2<f64>> {
     if latent_dim == 0 || latent_dim >= usize::BITS as usize {
         return None;
     }

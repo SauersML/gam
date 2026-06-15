@@ -256,4 +256,3 @@ impl SurvivalMarginalSlopeFamily {
         Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
     }
 }
-

@@ -2349,10 +2349,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         )
     }
 
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -2458,10 +2455,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         })
     }
 
-    fn log_likelihood_only(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<f64, String> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 2 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -2921,10 +2915,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Representation support means the realized two-block designs can be
         // applied as β-space operators. It does not imply that exact
         // second-order outer θ work is cheap.

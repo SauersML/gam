@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Shared N-D Duchon radial-jet matrices: the per-`(row, center)` scalar
 /// radial derivatives `φ'(r)`, `φ''(r)`, `φ'''(r)` of the Duchon kernel.
 ///
@@ -23,13 +22,15 @@ pub(crate) struct DuchonRadialJetsNd {
     pub(crate) phi_rrr: Array2<f64>,
 }
 
-
 /// Effective length scale used by [`duchon_radial_jets`]'s near-origin guards
 /// (`r_floor`, collision-Taylor radius) when the caller selects the scale-free
 /// pure-Duchon spectrum via `length_scale = None`. This only sets the
 /// numerical guards near `r = 0` and does not change the analytic kernel; we
 /// pick the typical inter-center distance (or `1.0` as a last resort).
-pub(crate) fn duchon_effective_length_scale(length_scale: Option<f64>, centers: ArrayView2<'_, f64>) -> f64 {
+pub(crate) fn duchon_effective_length_scale(
+    length_scale: Option<f64>,
+    centers: ArrayView2<'_, f64>,
+) -> f64 {
     length_scale.unwrap_or_else(|| {
         let n_centers = centers.nrows();
         let dim = centers.ncols();
@@ -53,7 +54,6 @@ pub(crate) fn duchon_effective_length_scale(length_scale: Option<f64>, centers: 
         }
     })
 }
-
 
 /// Evaluate the shared N-D Duchon radial jets up to `max_order` (`1..=3`).
 ///
@@ -149,7 +149,6 @@ pub(crate) fn duchon_radial_jets_nd(
         phi_rrr,
     })
 }
-
 
 /// Map shared N-D Duchon radial jets into the Cartesian input-location
 /// derivative tensor of `order` (2 or 3), contracted against per-center
@@ -274,7 +273,6 @@ pub(crate) fn radial_basis_cartesian_derivative(
     Ok(out)
 }
 
-
 /// N-D Duchon radial first-derivative `φ'(r)` evaluated for every
 /// `(row, center)` pair.
 ///
@@ -310,7 +308,6 @@ pub fn duchon_radial_first_derivative_nd(
     )?
     .phi_r)
 }
-
 
 /// N-D Duchon radial second derivative `φ''(r)` evaluated for every
 /// `(row, center)` pair.
@@ -352,7 +349,6 @@ pub fn duchon_radial_second_derivative_nd(
     .phi_rr)
 }
 
-
 /// N-D Duchon radial third derivative `φ'''(r)` evaluated for every
 /// `(row, center)` pair.
 ///
@@ -379,7 +375,6 @@ pub fn duchon_radial_third_derivative_nd(
     )?
     .phi_rrr)
 }
-
 
 pub(crate) fn fill_duchon_1d_polynomial_derivative(
     basis: &mut Array2<f64>,
@@ -412,7 +407,6 @@ pub(crate) fn fill_duchon_1d_polynomial_derivative(
         }
     }
 }
-
 
 /// N-D Duchon polynomial-nullspace first derivative `∂P/∂t` per row.
 ///
@@ -468,7 +462,6 @@ pub fn duchon_polynomial_first_derivative_nd(
     out
 }
 
-
 /// Per-`(row, center)` input-location jet of a radial kernel from its scalar
 /// first derivative `φ'(r)`.
 ///
@@ -521,7 +514,6 @@ pub fn radial_input_location_jet_nd(
     }
     Ok(out)
 }
-
 
 /// Forward design and input-location first jet of the scale-free Duchon atom
 /// used by the SAE-manifold path, recomputed self-consistently at arbitrary
@@ -626,7 +618,6 @@ pub fn duchon_sae_atom_basis_with_jet(
 
     Ok((phi, jet))
 }
-
 
 /// Second input-location jet of the scale-free Duchon SAE atom (the analytic
 /// Hessian `∂²Φ / ∂t_a ∂t_c`), consistent with
@@ -761,7 +752,6 @@ pub fn duchon_sae_atom_second_jet(
 
     Ok(out)
 }
-
 
 /// Third input-location jet of the scale-free Duchon SAE atom (the analytic
 /// `∂³Φ / ∂t_a ∂t_c ∂t_e`), consistent with
@@ -913,7 +903,6 @@ pub fn duchon_sae_atom_third_jet(
 
     Ok(out)
 }
-
 
 /// Forward design, input-location first jet, and input-location second jet
 /// (Hessian) of the **general** Duchon basis — the same matrix
@@ -1291,7 +1280,6 @@ pub fn build_duchon_basis_design_and_jets(
     Ok((phi_design, jet, hess))
 }
 
-
 /// N-D Matérn radial first-derivative `φ'(r)` evaluated for every
 /// `(row, center)` pair.
 ///
@@ -1346,7 +1334,6 @@ pub fn matern_radial_first_derivative_nd(
     Ok(out)
 }
 
-
 /// N-D Matérn radial second derivative `φ''(r)` evaluated for every
 /// `(row, center)` pair.
 ///
@@ -1396,7 +1383,6 @@ pub fn matern_radial_second_derivative_nd(
     Ok(out)
 }
 
-
 /// Resolve the per-axis metric weights `w_a = exp(2·ψ_a)` that the Matérn
 /// forward design (`build_matern_basis` → `StreamingMaternEvaluator` /
 /// `ChunkedKernelDesignOperator`) applies, **bit-for-bit**.
@@ -1417,7 +1403,6 @@ pub(crate) fn matern_metric_weights(dim: usize, aniso: Option<&[f64]>) -> Vec<f6
         None => vec![1.0; dim],
     }
 }
-
 
 /// N-D Matérn input-location **jet** `∂Φ/∂t` under the anisotropic metric.
 ///
@@ -1491,7 +1476,6 @@ pub fn matern_input_location_jet_nd(
     }
     Ok(out)
 }
-
 
 /// N-D Matérn input-location **Hessian** `∂²Φ/∂t∂tᵀ` under the anisotropic
 /// metric.
@@ -1581,7 +1565,6 @@ pub fn matern_input_location_hessian_nd(
     Ok(out)
 }
 
-
 /// N-D Sobolev-sphere first-derivative jet `∂Φ/∂t` per row, on the unit
 /// sphere `S^{dim−1}`.
 ///
@@ -1657,7 +1640,6 @@ pub fn sphere_first_derivative_nd(
     }
     Ok(out)
 }
-
 
 /// Raw (pre-identifiability) Wahba sphere DESIGN jet `∂Φ_raw/∂(lat, lon)`.
 ///
@@ -1743,7 +1725,6 @@ pub(crate) fn spherical_wahba_kernel_jet_with_kind(
     Ok(out)
 }
 
-
 /// Apply the `(K × K')` identifiability transform `z` to a raw Wahba jet
 /// `(N, K, 2)`, producing the realized-design jet `(N, K', 2)` whose column
 /// `c` aligns with column `c` of `raw_design.dot(z)`. The transform is linear
@@ -1768,7 +1749,6 @@ pub(crate) fn apply_identifiability_to_jet(raw_jet: &Array3<f64>, z: &Array2<f64
     }
     out
 }
-
 
 /// Real-spherical-harmonic DESIGN jet `∂Φ/∂(lat, lon)`, shape `(N, p, 2)` with
 /// `p = L(L+2)` and column order matching [`fill_real_spherical_harmonics_row`].
@@ -1902,7 +1882,6 @@ pub(crate) fn spherical_harmonic_jet(
     Ok(out)
 }
 
-
 /// Realized-design DESIGN jet `∂Φ/∂(lat, lon)` for the spherical-spline basis,
 /// matching the column layout of [`build_spherical_spline_basis`] with the
 /// given `spec`. Returns `(N, K, 2)` where `K` equals the forward design's
@@ -1968,4 +1947,3 @@ pub fn spherical_spline_design_jet(
     )?;
     Ok(apply_identifiability_to_jet(&raw_jet, &z))
 }
-

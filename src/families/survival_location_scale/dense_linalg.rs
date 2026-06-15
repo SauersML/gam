@@ -34,7 +34,11 @@ pub(crate) fn mxtwx(
 }
 
 #[inline]
-pub(crate) fn mxtwxd(x: &Array2<f64>, weights: &Array1<f64>, mask: Option<&Array1<f64>>) -> Array2<f64> {
+pub(crate) fn mxtwxd(
+    x: &Array2<f64>,
+    weights: &Array1<f64>,
+    mask: Option<&Array1<f64>>,
+) -> Array2<f64> {
     match mask {
         Some(m) => safe_fast_xt_diag_x(x, &(weights * m)),
         None => safe_fast_xt_diag_x(x, weights),
@@ -417,7 +421,12 @@ pub(crate) fn embed_tail_columns(
     Ok(out)
 }
 
-pub(crate) fn assign_block(target: &mut Array2<f64>, row_start: usize, col_start: usize, block: &Array2<f64>) {
+pub(crate) fn assign_block(
+    target: &mut Array2<f64>,
+    row_start: usize,
+    col_start: usize,
+    block: &Array2<f64>,
+) {
     let row_end = row_start + block.nrows();
     let col_end = col_start + block.ncols();
     target

@@ -40,7 +40,6 @@ pub struct PirlsWorkspace {
     pub matvec_buf: Array1<f64>,
 }
 
-
 impl PirlsWorkspace {
     pub fn new(n: usize, p: usize, idx: usize, idx2: usize) -> Self {
         assert!(idx < usize::MAX);
@@ -139,7 +138,6 @@ impl PirlsWorkspace {
     }
 }
 
-
 #[derive(Clone, Debug)]
 pub struct WorkingModelPirlsOptions {
     pub max_iterations: usize,
@@ -198,7 +196,6 @@ pub struct WorkingModelPirlsOptions {
     /// **not** handled here.
     pub arrow_schur: Option<ArrowSchurInnerConfig>,
 }
-
 
 /// Per-iteration arrow-Schur builder hook.
 ///
@@ -262,7 +259,6 @@ pub struct ArrowSchurInnerConfig {
     pub restore_t: std::sync::Arc<dyn Fn(&Array1<f64>) + Send + Sync>,
 }
 
-
 impl std::fmt::Debug for ArrowSchurInnerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrowSchurInnerConfig")
@@ -280,7 +276,6 @@ impl std::fmt::Debug for ArrowSchurInnerConfig {
     }
 }
 
-
 pub(crate) fn restore_arrow_latent_if_needed(
     options: &WorkingModelPirlsOptions,
     snapshot: Option<Array1<f64>>,
@@ -290,14 +285,12 @@ pub(crate) fn restore_arrow_latent_if_needed(
     }
 }
 
-
 pub(super) fn restore_pending_arrow_latent_if_needed(
     options: &WorkingModelPirlsOptions,
     pending_snapshot: &mut Option<Array1<f64>>,
 ) {
     restore_arrow_latent_if_needed(options, pending_snapshot.take());
 }
-
 
 pub(super) fn commit_pending_arrow_latent(pending_snapshot: &mut Option<Array1<f64>>) {
     drop(pending_snapshot.take());

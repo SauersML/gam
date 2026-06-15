@@ -132,18 +132,19 @@ fn transformation_survival_library_path_does_not_abort_on_outer_trial() {
     };
 
     // The crux of #1123: this MUST NOT return Err (the IntegrationError abort).
-    let result = fit_from_formula("Surv(entry, exit, event) ~ x", &data, &cfg).unwrap_or_else(
-        |err| {
+    let result =
+        fit_from_formula("Surv(entry, exit, event) ~ x", &data, &cfg).unwrap_or_else(|err| {
             panic!(
                 "gam#1123: transformation survival fit aborted on ordinary right-censored data \
                  (seed 0, ~ x) — the outer λ-selector escalated an inner trial non-convergence to \
                  a fatal error instead of stepping away / falling back to the convergent seed λ \
                  that the CLI fits. err = {err}"
             )
-        },
-    );
+        });
     let FitResult::SurvivalTransformation(fit) = result else {
-        panic!("expected a SurvivalTransformation fit result for survival_likelihood=transformation");
+        panic!(
+            "expected a SurvivalTransformation fit result for survival_likelihood=transformation"
+        );
     };
 
     // The fit must be finite and the covariate effect must be ordered/recovered:

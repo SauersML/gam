@@ -110,4 +110,3 @@ impl SurvivalMarginalSlopeFamily {
         Ok((f, f_a, f_aa))
     }
 }
-

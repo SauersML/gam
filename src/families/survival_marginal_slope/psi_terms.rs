@@ -1434,6 +1434,4 @@ impl SurvivalMarginalSlopeFamily {
             )?
             .map(|(acc, slices)| Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>))
     }
-
 }
-

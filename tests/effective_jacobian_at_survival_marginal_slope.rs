@@ -198,7 +198,8 @@ fn logslope_jacobian_fd_at_nonzero_beta() {
         g_i: g.clone(),
         c_i: c.clone(),
         s,
-        z_i: z.clone(),    });
+        z_i: z.clone(),
+    });
 
     let cb = LogslopeBlockJacobian::new(design.clone(), z.clone(), s);
     let state = FamilyLinearizationState {
@@ -251,7 +252,8 @@ fn marginal_jacobian_fd_at_zero_beta() {
         g_i: vec![0.0f64; N],
         c_i: c_one.clone(),
         s: 0.5,
-        z_i: vec![1.0f64; N],    });
+        z_i: vec![1.0f64; N],
+    });
 
     let cb = MarginalBlockJacobian::new(design.clone());
     let beta = vec![0.0f64; P];
@@ -286,7 +288,8 @@ fn marginal_jacobian_fd_at_nonzero_beta() {
         g_i: vec![0.0f64; N],
         c_i: c.clone(),
         s: 0.5,
-        z_i: vec![1.0f64; N],    });
+        z_i: vec![1.0f64; N],
+    });
 
     let cb = MarginalBlockJacobian::new(design.clone());
     let state = FamilyLinearizationState {
@@ -343,7 +346,8 @@ fn time_jacobian_fd_at_zero_beta() {
         g_i: vec![0.0f64; N],
         c_i: c_one.clone(),
         s: 0.5,
-        z_i: vec![0.0f64; N],    });
+        z_i: vec![0.0f64; N],
+    });
 
     let cb = TimeBlockJacobian::new(d_entry.clone(), d_exit.clone(), d_deriv.clone());
     let beta = vec![0.0f64; P];
@@ -381,7 +385,8 @@ fn time_jacobian_fd_at_nonzero_beta() {
         g_i: vec![0.0f64; N],
         c_i: c.clone(),
         s: 0.5,
-        z_i: vec![0.0f64; N],    });
+        z_i: vec![0.0f64; N],
+    });
 
     let cb = TimeBlockJacobian::new(d_entry.clone(), d_exit.clone(), d_deriv.clone());
     let state = FamilyLinearizationState {

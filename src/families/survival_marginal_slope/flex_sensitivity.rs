@@ -367,6 +367,4 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok((row_nll, grad, hess))
     }
-
 }
-

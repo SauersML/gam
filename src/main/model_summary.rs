@@ -283,11 +283,9 @@ pub(crate) fn build_model_summary(
     }
 }
 
-
 pub(crate) fn array2_to_nestedvec(a: &Array2<f64>) -> Vec<Vec<f64>> {
     a.axis_iter(Axis(0)).map(|row| row.to_vec()).collect()
 }
-
 
 pub(crate) fn covariance_from_model(
     model: &SavedModel,
@@ -324,7 +322,6 @@ pub(crate) fn covariance_from_model(
     )
 }
 
-
 pub(crate) fn prediction_backend_from_model<'a>(
     model: &'a SavedModel,
     mode: CovarianceModeArg,
@@ -357,8 +354,9 @@ pub(crate) fn prediction_backend_from_model<'a>(
     )
 }
 
-
-pub(crate) fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::InferenceCovarianceMode {
+pub(crate) fn infer_covariance_mode(
+    mode: CovarianceModeArg,
+) -> gam::estimate::InferenceCovarianceMode {
     match mode {
         CovarianceModeArg::Conditional => gam::estimate::InferenceCovarianceMode::Conditional,
         CovarianceModeArg::Corrected => {
@@ -366,7 +364,6 @@ pub(crate) fn infer_covariance_mode(mode: CovarianceModeArg) -> gam::estimate::I
         }
     }
 }
-
 
 pub(crate) fn response_interval_from_mean_sd(
     mean: ArrayView1<'_, f64>,
@@ -387,7 +384,6 @@ pub(crate) fn response_interval_from_mean_sd(
     );
     (lower, upper)
 }
-
 
 pub(crate) fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, CliError> {
     if a.nrows() != a.ncols() {
@@ -423,7 +419,6 @@ pub(crate) fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, Cl
     }
     Ok(out)
 }
-
 
 pub(crate) fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
     let log_lambdas = ext.lambdas.mapv(|v| v.max(1e-300).ln());

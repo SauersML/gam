@@ -11,7 +11,6 @@ pub enum EvalMode {
     ValueGradientHessian,
 }
 
-
 /// Result of the unified REML/LAML evaluation.
 #[derive(Debug)]
 pub struct RemlLamlResult {
@@ -56,7 +55,6 @@ pub struct RemlLamlResult {
     pub ext_mode_response_cols: Option<Array2<f64>>,
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Soft floor for penalized deviance (Gaussian profiled scale)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -64,20 +62,24 @@ pub struct RemlLamlResult {
 // Canonical definitions live in estimate.rs; re-use them here.
 use crate::solver::estimate::smooth_floor_dp;
 
-
 /// Ridge floor for denominator safety.
 pub(crate) const DENOM_RIDGE: f64 = 1e-8;
 
-
-pub(crate) fn penalty_a_k_beta(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: f64) -> Array1<f64> {
+pub(crate) fn penalty_a_k_beta(
+    coord: &PenaltyCoordinate,
+    beta: &Array1<f64>,
+    lambda: f64,
+) -> Array1<f64> {
     coord.apply_shifted_penalty(beta, lambda)
 }
 
-
-pub(crate) fn penalty_a_k_quadratic(coord: &PenaltyCoordinate, beta: &Array1<f64>, lambda: f64) -> f64 {
+pub(crate) fn penalty_a_k_quadratic(
+    coord: &PenaltyCoordinate,
+    beta: &Array1<f64>,
+    lambda: f64,
+) -> f64 {
     coord.shifted_quadratic(beta, lambda)
 }
-
 
 /// Apply the curvature-conditioning scale `s = rho_curvature_scale` to a
 /// raw ρ-coordinate `λ_k = exp(ρ_k)`.
@@ -100,8 +102,10 @@ pub(crate) fn rho_curvature_lambda(solution: &InnerSolution<'_>, lambda: f64) ->
     solution.rho_curvature_scale * lambda
 }
 
-
-pub(crate) fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) -> Arc<dyn HyperOperator> {
+pub(crate) fn penalty_coord_to_operator(
+    coord: PenaltyCoordinate,
+    scale: f64,
+) -> Arc<dyn HyperOperator> {
     struct OwnedPenaltyHyperOperator {
         pub(crate) coord: PenaltyCoordinate,
         pub(crate) scale: f64,
@@ -153,7 +157,6 @@ pub(crate) fn penalty_coord_to_operator(coord: PenaltyCoordinate, scale: f64) ->
     Arc::new(OwnedPenaltyHyperOperator { coord, scale })
 }
 
-
 pub(crate) fn penalty_total_drift_result(
     coord: &PenaltyCoordinate,
     scale: f64,
@@ -204,7 +207,6 @@ pub(crate) fn penalty_total_drift_result(
     }
 }
 
-
 pub(crate) fn hyper_coord_drift_operators(drift: &HyperCoordDrift) -> Vec<Arc<dyn HyperOperator>> {
     let mut operators: Vec<Arc<dyn HyperOperator>> = Vec::new();
     if let Some(block_local) = drift.block_local.as_ref() {
@@ -215,7 +217,6 @@ pub(crate) fn hyper_coord_drift_operators(drift: &HyperCoordDrift) -> Vec<Arc<dy
     }
     operators
 }
-
 
 pub(crate) fn hyper_coord_drift_operator_arc(
     drift: &HyperCoordDrift,
@@ -237,7 +238,6 @@ pub(crate) fn hyper_coord_drift_operator_arc(
     }))
 }
 
-
 pub(crate) fn drift_parts_into_result(
     dense: Option<Array2<f64>>,
     mut operators: Vec<Arc<dyn HyperOperator>>,
@@ -255,7 +255,6 @@ pub(crate) fn drift_parts_into_result(
         }))
     }
 }
-
 
 pub(crate) fn hyper_coord_total_drift_parts(
     drift: &HyperCoordDrift,
@@ -278,7 +277,6 @@ pub(crate) fn hyper_coord_total_drift_parts(
     (dense, operators)
 }
 
-
 pub(crate) fn hyper_coord_total_drift_result(
     drift: &HyperCoordDrift,
     correction: Option<&DriftDerivResult>,
@@ -287,7 +285,6 @@ pub(crate) fn hyper_coord_total_drift_result(
     let (dense, operators) = hyper_coord_total_drift_parts(drift, correction);
     drift_parts_into_result(dense, operators, dim_hint)
 }
-
 
 // ─── EFS multiplicative-update helpers ───────────────────────────────────
 //
@@ -340,8 +337,10 @@ pub(crate) fn efs_q_eff(a_i: f64, dispersion: &DispersionHandling, dp_cgrad: f64
     }
 }
 
-
-pub(crate) fn gamma_precision_rate_for_rho(prior: &crate::types::RhoPrior, idx: usize) -> Option<f64> {
+pub(crate) fn gamma_precision_rate_for_rho(
+    prior: &crate::types::RhoPrior,
+    idx: usize,
+) -> Option<f64> {
     match prior {
         crate::types::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
         crate::types::RhoPrior::Independent(priors) => {
@@ -353,7 +352,6 @@ pub(crate) fn gamma_precision_rate_for_rho(prior: &crate::types::RhoPrior, idx: 
         _ => None,
     }
 }
-
 
 #[inline]
 pub(crate) fn efs_q_eff_with_gamma_rate(
@@ -367,7 +365,6 @@ pub(crate) fn efs_q_eff_with_gamma_rate(
         _ => base_q_eff,
     }
 }
-
 
 /// EFS step expressed in terms of the *full* outer gradient
 /// `g_full = ∂V_total/∂ρ_i` and the penalty-quadratic curvature scale
@@ -410,7 +407,6 @@ pub(crate) fn efs_log_step_from_grad(q_eff: f64, g_full: f64) -> Option<f64> {
     }
 }
 
-
 /// EFS profiling factors (`profiled_scale`, `dp_cgrad`) matched to the
 /// gradient assembly. For Fixed dispersion both are unused; we return
 /// `(phi, 0.0)` so that `efs_q_eff` simply uses `2·a_i`.
@@ -426,7 +422,6 @@ pub(crate) fn efs_profiling(solution: &InnerSolution<'_>) -> (f64, f64) {
         DispersionHandling::Fixed { phi, .. } => (*phi, 0.0),
     }
 }
-
 
 pub(crate) fn trace_hinv_cached_drift_cross(
     hop: &dyn HessianOperator,
@@ -451,7 +446,6 @@ pub(crate) fn trace_hinv_cached_drift_cross(
         ),
     }
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Shared outer-derivative formulas
@@ -502,7 +496,6 @@ pub(crate) fn outer_gradient_entry(
     let det_term = if incl_logdet_s { 0.5 * ld_s_i } else { 0.0 };
     penalty_term + trace_term - det_term
 }
-
 
 /// Compute one entry of the outer Hessian.
 ///
@@ -561,7 +554,6 @@ pub(crate) fn outer_hessian_entry(
     q + l + p
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Constraint-tangent-space projection
 // ═══════════════════════════════════════════════════════════════════════════
@@ -618,7 +610,6 @@ pub(crate) fn compute_active_constraint_tangent_basis(a_act: &Array2<f64>) -> Op
     Some(evecs.slice(ndarray::s![.., 0..null_count]).to_owned())
 }
 
-
 /// Dense `p × p` materialization of a penalty coordinate via canonical
 /// basis vectors. `S_k e_j` is the `j`-th column of `S_k`; assembled into
 /// a p × p matrix. Cost O(p² · matvec).
@@ -637,7 +628,6 @@ pub(crate) fn materialize_penalty_coord_dense(coord: &PenaltyCoordinate, p: usiz
     assert_eq!(out.ncols(), p, "penalty coord dim mismatch");
     out
 }
-
 
 /// Reconstruct the *raw* Hessian `H = V · diag(σ) · Vᵀ` (pre-regularization)
 /// from a `DenseSpectralOperator`. The operator stores
@@ -688,7 +678,6 @@ pub(crate) fn assemble_h_raw_dense(op: &DenseSpectralOperator) -> Array2<f64> {
     crate::faer_ndarray::fast_abt(&vs, &op.eigenvectors)
 }
 
-
 /// Tangent-projected `HessianOperator` adapter. Wraps an `m × m`
 /// `H_T = ZᵀHZ` operator and exposes the `p × p` interface needed by the
 /// existing evaluator pipeline. All p-space inputs are projected via `Z`
@@ -702,7 +691,6 @@ pub(crate) struct TangentProjectedHessianOperator {
     /// `H_T = ZᵀHZ`, re-eigendecomposed with its own `r_ε` regularization.
     pub(crate) h_t_op: DenseSpectralOperator,
 }
-
 
 impl HessianOperator for TangentProjectedHessianOperator {
     fn active_rank(&self) -> usize {
@@ -749,7 +737,6 @@ impl HessianOperator for TangentProjectedHessianOperator {
     // Surfacing the tangent operator there would silently let downstream
     // code mix p- and m-dim eigenvectors.
 }
-
 
 /// Build `PenaltyLogdetDerivs` for `log|ZᵀS(λ)Z|_+`, its first
 /// derivatives, and its second derivatives. The identities are the same
@@ -825,7 +812,6 @@ pub(crate) fn tangent_penalty_logdet(
     })
 }
 
-
 /// Borrowing adapter that lets a tangent-projected `InnerSolution` reuse
 /// the original `HessianDerivativeProvider` without taking ownership.
 /// The provider returns p-space drift matrices (`D_β H[v]`) which the
@@ -833,7 +819,6 @@ pub(crate) fn tangent_penalty_logdet(
 /// its `trace_logdet_gradient` / `trace_hinv_product` methods. So no
 /// per-method projection is needed here — pure delegation suffices.
 pub(crate) struct BorrowedDerivProvider<'a>(&'a dyn HessianDerivativeProvider);
-
 
 impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
     fn hessian_derivative_correction(
@@ -898,7 +883,6 @@ impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
         self.0.scalar_glm_ingredients()
     }
 }
-
 
 /// If the inner solution carries a non-empty active inequality-constraint
 /// set, build a tangent-projected solution and dispatch the outer

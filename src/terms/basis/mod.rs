@@ -15,8 +15,8 @@ include!("imports.rs");
 // ---- Manifold / geometric smooth specifications and kernels ----
 mod constant_curvature_smooth;
 mod cyclic;
-mod sphere_spec;
 mod sphere_kernels;
+mod sphere_spec;
 mod sphere_spectral;
 
 // ---- Measure-jet smooth (V0 / V∞) ----
@@ -28,22 +28,22 @@ mod measure_jet_smooth;
 mod polylog;
 
 // ---- Core types, evaluation, planning, and the (ψ) derivative engine ----
-mod types;
-mod internal;
-mod bspline_eval;
-mod spline_eval_scalar;
 mod bspline_build;
+mod bspline_eval;
 mod center_selection;
-mod streaming_design;
-mod workspace_cache;
-mod implicit_psi_derivative;
-mod matern_kernel;
 mod duchon_kernel_math;
 mod duchon_psi_derivatives;
 mod duchon_thinplate;
+mod implicit_psi_derivative;
+mod internal;
+mod matern_kernel;
 mod periodic_duchon;
-mod sphere_basis;
 mod radial_jets_nd;
+mod sphere_basis;
+mod spline_eval_scalar;
+mod streaming_design;
+mod types;
+mod workspace_cache;
 
 /// Closed-form scalar building blocks for Riesz, Matérn, and isotropic
 /// hybrid Duchon kernels.
@@ -70,7 +70,9 @@ pub use measure_jet_moments::{
     merge_moment_tables, recenter_moment_table,
 };
 
-pub use measure_jet_predict::{MeasureJetExtrapolationSpectrum, measure_jet_extrapolation_variance};
+pub use measure_jet_predict::{
+    MeasureJetExtrapolationSpectrum, measure_jet_extrapolation_variance,
+};
 
 pub use measure_jet_smooth::{
     MeasureJetBand, MeasureJetBasisSpec, MeasureJetEnergyJets, MeasureJetFrozenQuadrature,

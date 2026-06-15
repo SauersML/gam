@@ -147,14 +147,22 @@ pub(crate) fn validate_cov_block_kind(
 
 /// Build row-wise Kronecker product: each row of the result is
 /// kron(cov_row[i,:], time_row[i,:]).
-pub(crate) fn assert_rowwise_kronecker_dimensions(n: usize, p_resp: usize, p_cov: usize, context: &str) {
+pub(crate) fn assert_rowwise_kronecker_dimensions(
+    n: usize,
+    p_resp: usize,
+    p_cov: usize,
+    context: &str,
+) {
     assert!(
         p_resp > 0 && p_cov > 0,
         "{context} rowwise Kronecker dimensions must be non-empty: n={n}, p_resp={p_resp}, p_cov={p_cov}"
     );
 }
 
-pub(crate) fn rowwise_kronecker(cov_design: &DesignMatrix, time_basis: &Array2<f64>) -> DesignMatrix {
+pub(crate) fn rowwise_kronecker(
+    cov_design: &DesignMatrix,
+    time_basis: &Array2<f64>,
+) -> DesignMatrix {
     let n = cov_design.nrows();
     let p_cov = cov_design.ncols();
     let p_time = time_basis.ncols();
@@ -677,6 +685,9 @@ pub(crate) fn build_survival_two_block_exact_joint_setup(
     )
 }
 
-pub(crate) fn filtered_initial_beta(hint: Option<&Array1<f64>>, expected: usize) -> Option<Array1<f64>> {
+pub(crate) fn filtered_initial_beta(
+    hint: Option<&Array1<f64>>,
+    expected: usize,
+) -> Option<Array1<f64>> {
     hint.filter(|beta| beta.len() == expected).cloned()
 }

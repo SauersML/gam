@@ -612,6 +612,4 @@ impl SurvivalMarginalSlopeFamily {
             psi_row: psi_row.clone(),
         })
     }
-
 }
-

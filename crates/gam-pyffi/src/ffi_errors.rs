@@ -40,7 +40,6 @@ create_exception!(
      the historical `except ValueError` contract."
 );
 
-
 create_exception!(
     _rust,
     FormulaError,
@@ -48,7 +47,6 @@ create_exception!(
     "The Wilkinson-style formula could not be parsed or references columns \
      missing from the input table."
 );
-
 
 create_exception!(
     _rust,
@@ -68,7 +66,6 @@ create_exception!(
      catches it."
 );
 
-
 create_exception!(
     _rust,
     SchemaMismatchError,
@@ -76,14 +73,12 @@ create_exception!(
     "Prediction input does not match the training schema."
 );
 
-
 create_exception!(
     _rust,
     PredictionError,
     GamError,
     "Prediction failed for a reason that is not a pure schema mismatch."
 );
-
 
 // EstimationError variant subclasses.
 //
@@ -100,14 +95,12 @@ create_exception!(
     "Underlying basis function generation failed."
 );
 
-
 create_exception!(
     _rust,
     LinearSystemSolveError,
     GamError,
     "A linear system solve failed; the penalized Hessian may be singular."
 );
-
 
 create_exception!(
     _rust,
@@ -116,14 +109,12 @@ create_exception!(
     "Eigendecomposition failed."
 );
 
-
 create_exception!(
     _rust,
     PenaltySpectrumError,
     GamError,
     "Penalty spectrum check failed (non-finite or indefinite eigenvalue)."
 );
-
 
 create_exception!(
     _rust,
@@ -132,14 +123,12 @@ create_exception!(
     "Parameter constraint violation."
 );
 
-
 create_exception!(
     _rust,
     PirlsConvergenceError,
     GamError,
     "The P-IRLS inner loop did not converge within its iteration budget."
 );
-
 
 create_exception!(
     _rust,
@@ -148,14 +137,12 @@ create_exception!(
     "Perfect or quasi-perfect separation detected during model fitting."
 );
 
-
 create_exception!(
     _rust,
     HessianNotPositiveDefiniteError,
     GamError,
     "Hessian matrix is not positive definite at the converged iterate."
 );
-
 
 create_exception!(
     _rust,
@@ -164,14 +151,12 @@ create_exception!(
     "REML smoothing optimization failed to converge."
 );
 
-
 create_exception!(
     _rust,
     GradientUnavailableError,
     GamError,
     "The unified evaluator returned no gradient in the requested mode."
 );
-
 
 create_exception!(
     _rust,
@@ -180,14 +165,12 @@ create_exception!(
     "An internal error occurred during model layout or coefficient mapping."
 );
 
-
 create_exception!(
     _rust,
     ModelOverparameterizedError,
     GamError,
     "Model is over-parameterized: more coefficients than samples."
 );
-
 
 create_exception!(
     _rust,
@@ -196,14 +179,12 @@ create_exception!(
     "Model is ill-conditioned (large condition number)."
 );
 
-
 create_exception!(
     _rust,
     InvalidInputError,
     GamError,
     "Invalid input to the engine (shape/dtype/range violation)."
 );
-
 
 create_exception!(
     _rust,
@@ -212,7 +193,6 @@ create_exception!(
     "Monotone-root solve failed."
 );
 
-
 create_exception!(
     _rust,
     CalibratorError,
@@ -220,14 +200,12 @@ create_exception!(
     "Calibrator training failed."
 );
 
-
 create_exception!(
     _rust,
     InvalidSpecificationError,
     GamError,
     "Invalid specification supplied to the engine."
 );
-
 
 // -------------------------------------------------------------------------
 // Remaining engine error enum subclasses (issue #343 follow-up).
@@ -249,7 +227,6 @@ create_exception!(
      (dimension mismatch, invalid point, singular tangent space)."
 );
 
-
 create_exception!(
     _rust,
     MatrixMaterializationError,
@@ -257,7 +234,6 @@ create_exception!(
     "Lazy design-matrix materialization failed (size cap exceeded, \
      forbidden by policy, or row-block evaluation failure)."
 );
-
 
 create_exception!(
     _rust,
@@ -267,7 +243,6 @@ create_exception!(
      calibration failure, or feature not yet implemented on this device)."
 );
 
-
 create_exception!(
     _rust,
     LinearAlgebraError,
@@ -275,7 +250,6 @@ create_exception!(
     "Dense linear-algebra primitive failed (factorization, SVD, or \
      eigendecomposition reported non-convergence or non-finite input)."
 );
-
 
 create_exception!(
     _rust,
@@ -285,14 +259,12 @@ create_exception!(
      densification, or related shape contract failure)."
 );
 
-
 create_exception!(
     _rust,
     CacheStoreError,
     GamError,
     "Persistent on-disk model cache I/O or serialization failure."
 );
-
 
 create_exception!(
     _rust,
@@ -302,7 +274,6 @@ create_exception!(
      requested basis or penalty)."
 );
 
-
 create_exception!(
     _rust,
     ArrowSchurError,
@@ -311,7 +282,6 @@ create_exception!(
      conditioning, PCG non-convergence, or adaptive-correction failure)."
 );
 
-
 create_exception!(
     _rust,
     OuterStrategyError,
@@ -319,7 +289,6 @@ create_exception!(
     "Outer smoothing-strategy contract violated (operator-shape \
      mismatch, non-finite Hessian, or rho-block shape error)."
 );
-
 
 create_exception!(
     _rust,
@@ -331,7 +300,6 @@ create_exception!(
      handlers still catch it."
 );
 
-
 create_exception!(
     _rust,
     CorrectedCovarianceError,
@@ -340,7 +308,6 @@ create_exception!(
      (shape mismatch, eigendecomposition failure, or indefinite outer \
      Hessian)."
 );
-
 
 create_exception!(
     _rust,
@@ -351,7 +318,6 @@ create_exception!(
      Subclass of `PredictionError`."
 );
 
-
 create_exception!(
     _rust,
     HmcError,
@@ -359,7 +325,6 @@ create_exception!(
     "Hamiltonian Monte Carlo sampler failed (non-finite state, invalid \
      configuration, unsupported family / link, or sampling divergence)."
 );
-
 
 create_exception!(
     _rust,
@@ -369,7 +334,6 @@ create_exception!(
      degenerate design, or influence-matrix factorization failure)."
 );
 
-
 create_exception!(
     _rust,
     SurvivalError,
@@ -377,7 +341,6 @@ create_exception!(
     "Survival kernel invariant violated (dimension mismatch, non-finite \
      input, invalid time grid, non-monotone cumulative hazard, etc.)."
 );
-
 
 create_exception!(
     _rust,
@@ -388,7 +351,6 @@ create_exception!(
      bivariate-normal evaluation)."
 );
 
-
 create_exception!(
     _rust,
     SurvivalConstructionError,
@@ -396,7 +358,6 @@ create_exception!(
     "Survival model construction failed (invalid config, missing column, \
      dimension mismatch, data validation, or unsupported distribution)."
 );
-
 
 create_exception!(
     _rust,
@@ -406,7 +367,6 @@ create_exception!(
      (degenerate design, non-finite input, or monotonicity violation)."
 );
 
-
 create_exception!(
     _rust,
     CustomFamilyError,
@@ -414,7 +374,6 @@ create_exception!(
     "Custom family contract violated (invalid input, optimization \
      failure, numerical failure, or identifiability violation)."
 );
-
 
 create_exception!(
     _rust,
@@ -425,7 +384,6 @@ create_exception!(
      violation)."
 );
 
-
 create_exception!(
     _rust,
     SurvivalMarginalSlopeError,
@@ -435,7 +393,6 @@ create_exception!(
      configuration)."
 );
 
-
 create_exception!(
     _rust,
     LatentSurvivalError,
@@ -443,7 +400,6 @@ create_exception!(
     "Latent-survival family rejected the dataset (invalid frailty, \
      invalid dataset, block mismatch, or numerical failure)."
 );
-
 
 create_exception!(
     _rust,
@@ -454,7 +410,6 @@ create_exception!(
      `PredictionError`."
 );
 
-
 create_exception!(
     _rust,
     DeviationRuntimeError,
@@ -462,7 +417,6 @@ create_exception!(
     "Marginal-slope deviation runtime rejected the input (invalid \
      input, dimension mismatch, or numerical failure)."
 );
-
 
 create_exception!(
     _rust,
@@ -472,7 +426,6 @@ create_exception!(
      empty input, invalid value, missing column)."
 );
 
-
 create_exception!(
     _rust,
     FittedModelError,
@@ -481,14 +434,12 @@ create_exception!(
      corrupt payload, missing field, or incompatible config)."
 );
 
-
 create_exception!(
     _rust,
     LognormalKernelError,
     GamError,
     "Lognormal kernel configuration is invalid."
 );
-
 
 create_exception!(
     _rust,
@@ -498,7 +449,6 @@ create_exception!(
      mismatch, non-finite input, degenerate design, or SVD failure)."
 );
 
-
 create_exception!(
     _rust,
     IdentifiabilityCompilerError,
@@ -507,7 +457,6 @@ create_exception!(
      mismatch, fully aliased block, or linear-algebra failure)."
 );
 
-
 create_exception!(
     _rust,
     JointPenaltyError,
@@ -515,7 +464,6 @@ create_exception!(
     "Joint penalty matrix rejected (not square, not symmetric, \
      non-finite entry, or nullspace too large)."
 );
-
 
 create_exception!(
     _rust,
@@ -526,7 +474,6 @@ create_exception!(
      numerical failure)."
 );
 
-
 create_exception!(
     _rust,
     MapUniquenessError,
@@ -534,7 +481,6 @@ create_exception!(
     "MAP-uniqueness identifiability audit detected duplicate or \
      overlapping posterior modes."
 );
-
 
 create_exception!(
     _rust,
@@ -544,7 +490,6 @@ create_exception!(
      does not support for the chosen family. Subclass of \
      `InvalidSpecificationError`."
 );
-
 
 create_exception!(
     _rust,
@@ -556,7 +501,6 @@ create_exception!(
      out-of-range hyperpriors). Subclass of `InvalidSpecificationError`."
 );
 
-
 create_exception!(
     _rust,
     MissingDependencyError,
@@ -564,7 +508,6 @@ create_exception!(
     "A required input column, frailty parameter, baseline target, or \
      cause count is missing for the requested fit mode."
 );
-
 
 create_exception!(
     _rust,
@@ -574,7 +517,6 @@ create_exception!(
      optimizer / profile-cost evaluation) failed to converge or \
      produced a non-finite value."
 );
-
 
 // -------------------------------------------------------------------------
 // (Removed) Legacy message-regex classifier — issue #343.

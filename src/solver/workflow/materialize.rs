@@ -3350,7 +3350,8 @@ pub(crate) fn materialize_survival<'a>(
                         None,
                         Some(loading),
                     )?;
-                    if prepared_right.time_design_exit.ncols() != prepared.time_design_exit.ncols() {
+                    if prepared_right.time_design_exit.ncols() != prepared.time_design_exit.ncols()
+                    {
                         return Err(format!(
                             "interval-censored right time design has {} columns but the left/exit design has {}; the right boundary basis must share the exit basis columns",
                             prepared_right.time_design_exit.ncols(),

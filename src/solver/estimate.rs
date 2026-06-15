@@ -3112,10 +3112,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// Hessian curvature `B_j` always stays the exact n-dependent slab. Passing
     /// `None` clears any previously staged pair so a stale previous-ψ
     /// derivative is never consumed.
-    pub(crate) fn stage_glm_psi_gram_deriv(
-        &mut self,
-        deriv: Option<(Array2<f64>, Array1<f64>)>,
-    ) {
+    pub(crate) fn stage_glm_psi_gram_deriv(&mut self, deriv: Option<(Array2<f64>, Array1<f64>)>) {
         self.pending_glm_psi_gram_deriv = deriv.map(std::sync::Arc::new);
     }
 
@@ -8276,9 +8273,9 @@ pub(crate) mod reml;
 pub use reml::unified::PenaltyCoordinate;
 
 #[cfg(test)]
-mod estimate_policy_tests;
-#[cfg(test)]
 mod continuous_order_tests;
+#[cfg(test)]
+mod estimate_policy_tests;
 #[cfg(test)]
 mod invert_regularized_rho_hessian_tests;
 #[cfg(test)]

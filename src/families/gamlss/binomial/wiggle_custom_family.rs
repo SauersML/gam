@@ -70,10 +70,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(beta)
     }
 
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -173,10 +170,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         })
     }
 
-    fn log_likelihood_only(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<f64, String> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 3 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -1193,10 +1187,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl: matrix-free path is available
         // when both threshold and log-σ block designs are present (the
         // wiggle block is folded into the per-row pieces inside
@@ -1209,4 +1200,3 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             )
     }
 }
-

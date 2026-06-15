@@ -1,6 +1,5 @@
 use super::*;
 
-
 pub(crate) fn duchon_coeff_exponents(p_order: usize, s_order: usize, m_or_n: usize) -> f64 {
     // In the partial fractions
     //   1 / (z^p (z + kappa^2)^s)
@@ -13,12 +12,10 @@ pub(crate) fn duchon_coeff_exponents(p_order: usize, s_order: usize, m_or_n: usi
     -2.0 * (p_order + s_order - m_or_n) as f64
 }
 
-
 #[inline(always)]
 pub(crate) fn duchon_scaling_exponent(p_order: usize, s_order: usize, k_dim: usize) -> f64 {
     k_dim as f64 - 2.0 * (p_order + s_order) as f64
 }
-
 
 #[derive(Clone, Copy)]
 pub(crate) struct DuchonMaternDerivativeTerm {
@@ -28,7 +25,6 @@ pub(crate) struct DuchonMaternDerivativeTerm {
     pub(crate) bessel_order: f64,
 }
 
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PsiTriplet {
     pub(crate) value: f64,
@@ -36,12 +32,10 @@ pub(crate) struct PsiTriplet {
     pub(crate) psi_psi: f64,
 }
 
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DuchonRadialCore {
     pub(crate) phi: PsiTriplet,
 }
-
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DuchonRadialJets {
@@ -72,7 +66,6 @@ pub(crate) struct DuchonRadialJets {
     pub(crate) t_rr: f64,
 }
 
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DuchonRegularizedOperatorCore {
     pub(crate) q: f64,
@@ -80,7 +73,6 @@ pub(crate) struct DuchonRegularizedOperatorCore {
     pub(crate) t_r: f64,
     pub(crate) t_rr: f64,
 }
-
 
 #[inline(always)]
 pub(crate) fn duchon_operator_jets_from_primary_core(
@@ -134,7 +126,6 @@ pub(crate) fn duchon_operator_jets_from_primary_core(
     out
 }
 
-
 #[inline(always)]
 pub(crate) fn scaled_log_kappa_derivatives(
     value: f64,
@@ -172,7 +163,6 @@ pub(crate) fn scaled_log_kappa_derivatives(
     (first, second)
 }
 
-
 #[inline(always)]
 pub(crate) fn duchon_q_psi_triplet_from_jets(
     jets: &DuchonRadialJets,
@@ -190,9 +180,12 @@ pub(crate) fn duchon_q_psi_triplet_from_jets(
     )
 }
 
-
 #[inline(always)]
-pub(crate) fn duchon_operator_scaling_exponent(p_order: usize, s_order: usize, k_dim: usize) -> f64 {
+pub(crate) fn duchon_operator_scaling_exponent(
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+) -> f64 {
     // For the hybrid Duchon spectrum
     //   1 / (|w|^(2p) (kappa^2 + |w|^2)^s),
     // the spatial kernel scales as
@@ -210,7 +203,6 @@ pub(crate) fn duchon_operator_scaling_exponent(p_order: usize, s_order: usize, k
     // Thus both Duchon operator scalars use exponent delta + 2.
     duchon_scaling_exponent(p_order, s_order, k_dim) + 2.0
 }
-
 
 pub(crate) fn duchon_regularized_operator_core(
     r_eval: f64,
@@ -271,7 +263,6 @@ pub(crate) fn duchon_regularized_operator_core(
     })
 }
 
-
 #[inline(always)]
 pub(crate) fn duchon_collision_taylor_operator_core(
     r: f64,
@@ -288,7 +279,6 @@ pub(crate) fn duchon_collision_taylor_operator_core(
         t_rr: t_rr_collision,
     }
 }
-
 
 pub(crate) fn duchon_radial_jets(
     r: f64,
@@ -410,7 +400,6 @@ pub(crate) fn duchon_radial_jets(
     Ok(out)
 }
 
-
 pub(crate) fn duchon_radial_core_psi_triplet(
     r: f64,
     length_scale: f64,
@@ -497,7 +486,6 @@ pub(crate) fn duchon_radial_core_psi_triplet(
     })
 }
 
-
 pub(crate) fn duchonphi_rr_collision_psi_triplet(
     length_scale: f64,
     p_order: usize,
@@ -526,10 +514,8 @@ pub(crate) fn duchonphi_rr_collision_psi_triplet(
     )
 }
 
-
 /// Euler-Mascheroni constant γ ≈ 0.5772.
 pub(crate) const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
-
 
 /// Digamma function ψ(n) for positive integer n.
 ///
@@ -543,7 +529,6 @@ pub(crate) fn digamma_pos_int(n: usize) -> f64 {
     }
     -EULER_MASCHERONI + h
 }
-
 
 /// Extract the coefficient of r^{2j} (pure and log-r parts) from a single
 /// Matérn partial-fraction block g_n(r) = c · r^ν · K_{|ν|}(κr), where
@@ -581,15 +566,17 @@ pub(crate) fn duchon_matern_block_taylor_r2j(
     }
 }
 
-
 #[inline(always)]
 pub(crate) fn psi_power_triplet(value: f64, exponent: f64) -> (f64, f64, f64) {
     (value, exponent * value, exponent * exponent * value)
 }
 
-
 #[inline(always)]
-pub(crate) fn psi_power_log_triplet(base: f64, exponent: f64, log_kappa_half: f64) -> (f64, f64, f64) {
+pub(crate) fn psi_power_log_triplet(
+    base: f64,
+    exponent: f64,
+    log_kappa_half: f64,
+) -> (f64, f64, f64) {
     (
         base * log_kappa_half,
         base * (exponent * log_kappa_half + 1.0),
@@ -597,14 +584,12 @@ pub(crate) fn psi_power_log_triplet(base: f64, exponent: f64, log_kappa_half: f6
     )
 }
 
-
 #[inline(always)]
 pub(crate) fn add_triplet(dst: &mut (f64, f64, f64), inc: (f64, f64, f64)) {
     dst.0 += inc.0;
     dst.1 += inc.1;
     dst.2 += inc.2;
 }
-
 
 /// Like [`duchon_matern_block_taylor_r2j`], but also returns exact
 /// derivatives of the pure/log Taylor coefficients with respect to
@@ -715,7 +700,6 @@ pub(crate) fn duchon_matern_block_taylor_r2j_triplet(
     (pure, log_part)
 }
 
-
 /// Taylor r^{2j} coefficients for integer-ν Matérn block.
 ///
 /// Uses the K_μ(z) expansion for integer μ = |ν| ≥ 0 (A&S 9.6.11 / DLMF 10.31.1):
@@ -799,7 +783,6 @@ pub(crate) fn duchon_matern_block_taylor_r2j_integer_nu(
     }
 }
 
-
 /// Taylor r^{2j} coefficients for half-integer-ν Matérn block.
 ///
 /// For half-integer |ν| = l + ½, K_{l+½}(z) is elementary:
@@ -860,7 +843,6 @@ pub(crate) fn duchon_matern_block_taylor_r2j_half_integer_nu(
     (c * prefactor * pure, 0.0) // No log contribution for half-integer ν.
 }
 
-
 /// Extract the r^{2j} Taylor coefficient from a polyharmonic block Φ_m(r).
 ///
 /// Non-log case (d odd, or d even with m < d/2): Φ_m = c · r^α with α = 2m − d.
@@ -894,7 +876,6 @@ pub(crate) fn duchon_polyharmonic_block_taylor_r2j(m: usize, k_dim: usize, j: us
         (c, 0.0)
     }
 }
-
 
 /// Compute the even-order radial derivative φ^{(2j)}(0) from analytic Taylor
 /// coefficients of the partial-fraction blocks.
@@ -985,7 +966,6 @@ pub(crate) fn duchon_phi_even_derivative_collision(
     let factorial_2j = gamma_lanczos((2 * j + 1) as f64);
     Ok(factorial_2j * total_pure)
 }
-
 
 pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
     length_scale: f64,
@@ -1087,7 +1067,6 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
     ))
 }
 
-
 /// Assemble φ''''(0) from the partial-fraction blocks using analytic Taylor
 /// coefficients.
 ///
@@ -1109,7 +1088,6 @@ pub(crate) fn duchon_phi_rrrr_collision(
     duchon_phi_even_derivative_collision(length_scale, p_order, s_order, k_dim, coeffs, 2)
 }
 
-
 /// Assemble φ⁽⁶⁾(0) from the partial-fraction blocks using analytic Taylor
 /// coefficients.
 ///
@@ -1130,7 +1108,6 @@ pub(crate) fn duchon_phi_rrrrrr_collision(
 ) -> Result<f64, BasisError> {
     duchon_phi_even_derivative_collision(length_scale, p_order, s_order, k_dim, coeffs, 3)
 }
-
 
 pub(crate) fn build_duchon_design_psi_derivativeswithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1190,7 +1167,6 @@ pub(crate) fn build_duchon_design_psi_derivativeswithworkspace(
     )
 }
 
-
 pub fn build_duchon_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -1198,7 +1174,6 @@ pub fn build_duchon_basis_log_kappa_derivative(
     let mut workspace = BasisWorkspace::default();
     build_duchon_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1210,7 +1185,6 @@ pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
     Ok(bundle.first)
 }
 
-
 pub fn build_duchon_basis_log_kappa_derivatives(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -1219,13 +1193,11 @@ pub fn build_duchon_basis_log_kappa_derivatives(
     build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, &mut workspace)
 }
 
-
 pub(crate) fn duchon_operator_penalties_requested(spec: &DuchonOperatorPenaltySpec) -> bool {
     matches!(spec.mass, OperatorPenaltySpec::Active { .. })
         || matches!(spec.tension, OperatorPenaltySpec::Active { .. })
         || matches!(spec.stiffness, OperatorPenaltySpec::Active { .. })
 }
-
 
 pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1257,7 +1229,6 @@ pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
         workspace,
     )
 }
-
 
 pub(crate) fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1329,7 +1300,6 @@ pub(crate) fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworksp
     })
 }
 
-
 pub fn build_duchon_basis_log_kappasecond_derivative(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -1337,7 +1307,6 @@ pub fn build_duchon_basis_log_kappasecond_derivative(
     let mut workspace = BasisWorkspace::default();
     build_duchon_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1348,7 +1317,6 @@ pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
     bundle.second.implicit_operator = bundle.implicit_operator;
     Ok(bundle.second)
 }
-
 
 /// Multiplicative amplification factor that lifts an underflowing Duchon
 /// kernel back into a representable range. Probes max|K_CC| (the kernel at
@@ -1420,7 +1388,6 @@ pub(crate) fn duchon_kernel_amplification(
     }
 }
 
-
 /// Scalar kernel amplification `α` that [`build_duchon_basis`] applies to the
 /// pure scale-free polyharmonic Duchon kernel block (`length_scale = None`,
 /// `power = 0`, no anisotropy) for the given requested null-space `order`.
@@ -1462,7 +1429,6 @@ pub fn duchon_pure_kernel_amplification(
         Some(&pure_poly_coeff),
     )
 }
-
 
 pub(crate) fn build_duchon_basis_designwithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1697,7 +1663,6 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
     Ok(DuchonBasisDesign { basis })
 }
 
-
 pub(crate) fn build_cyclic_duchon_basis_1dwithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -1833,7 +1798,6 @@ pub(crate) fn build_cyclic_duchon_basis_1dwithworkspace(
     })
 }
 
-
 /// Generic Duchon builder returning design + penalty list.
 pub fn build_duchon_basis(
     data: ArrayView2<'_, f64>,
@@ -1842,7 +1806,6 @@ pub fn build_duchon_basis(
     let mut workspace = BasisWorkspace::default();
     build_duchon_basiswithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn create_duchon_basis_1d_derivative_dense(
     t: ArrayView1<'_, f64>,
@@ -2002,4 +1965,3 @@ pub fn create_duchon_basis_1d_derivative_dense(
     fill_duchon_1d_polynomial_derivative(&mut basis, kernel_cols, t, effective_order, order);
     Ok(basis)
 }
-

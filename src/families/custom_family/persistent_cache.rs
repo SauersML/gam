@@ -41,7 +41,10 @@ pub(crate) fn hash_cf_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     }
 }
 
-pub(crate) fn hash_cf_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
+pub(crate) fn hash_cf_design_matrix(
+    hasher: &mut Fingerprinter,
+    design: &DesignMatrix,
+) -> Result<(), String> {
     let n = design.nrows();
     let p = design.ncols();
     hasher.write_usize(n);
@@ -141,7 +144,9 @@ pub(crate) fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     Some(format!("cf-{}", hasher.finish_hex()))
 }
 
-pub(crate) fn custom_family_cache_shape(specs: &[ParameterBlockSpec]) -> (usize, Vec<String>, Vec<usize>) {
+pub(crate) fn custom_family_cache_shape(
+    specs: &[ParameterBlockSpec],
+) -> (usize, Vec<String>, Vec<usize>) {
     let n_rows = specs.first().map(|spec| spec.design.nrows()).unwrap_or(0);
     let block_names = specs.iter().map(|spec| spec.name.clone()).collect();
     let block_dims = specs.iter().map(|spec| spec.design.ncols()).collect();

@@ -24,7 +24,6 @@
 //! required because the I-spline response basis saturates at finite support
 //! values rather than mapping onto the full real line.
 
-
 mod endpoint_normalizer;
 
 // Shared imports re-exported so every concern submodule pulls them through

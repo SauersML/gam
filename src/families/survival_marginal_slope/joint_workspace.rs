@@ -17,7 +17,6 @@ pub(crate) struct SurvivalMarginalSlopePsiWorkspace {
     pub(crate) options: BlockwiseFitOptions,
 }
 
-
 pub(crate) struct SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     pub(crate) family: SurvivalMarginalSlopeFamily,
     pub(crate) block_states: Vec<ParameterBlockState>,
@@ -44,7 +43,6 @@ pub(crate) struct SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     pub(crate) options: BlockwiseFitOptions,
 }
 
-
 impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     pub(crate) fn new(
         family: SurvivalMarginalSlopeFamily,
@@ -70,7 +68,6 @@ impl SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
         })
     }
 }
-
 
 impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointHessianWorkspace {
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
@@ -268,7 +265,6 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
     }
 }
 
-
 impl SurvivalMarginalSlopePsiWorkspace {
     pub(crate) fn new(
         family: SurvivalMarginalSlopeFamily,
@@ -292,7 +288,6 @@ impl SurvivalMarginalSlopePsiWorkspace {
         })
     }
 }
-
 
 impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
     for SurvivalMarginalSlopePsiWorkspace
@@ -397,4 +392,3 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
             )
     }
 }
-

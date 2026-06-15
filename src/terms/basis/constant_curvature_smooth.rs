@@ -1042,7 +1042,11 @@ mod tests {
     /// dense design `b` (n×p) and symmetric psd penalty `s` (p×p). Returns
     /// `min_λ D(λ)`. Self-contained so the oracle does not depend on the outer
     /// solver wiring — it tests the CRITERION SHAPE the wiring profiles.
-    pub(crate) fn profiled_gaussian_reml_deviance(b: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64>) -> f64 {
+    pub(crate) fn profiled_gaussian_reml_deviance(
+        b: &Array2<f64>,
+        y: &Array1<f64>,
+        s: &Array2<f64>,
+    ) -> f64 {
         let n = b.nrows();
         let p = b.ncols();
         let btb = symmetrize(&b.t().dot(b));
@@ -1213,8 +1217,7 @@ mod tests {
         let (data, centers) = oracle_disk_design_centers();
         let ell_ref = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
         // Reference fill at κ = 0 (the target L(κ) is pinned to).
-        let fill_star =
-            data_center_reference_fill(data.view(), centers.view(), ell_ref).unwrap();
+        let fill_star = data_center_reference_fill(data.view(), centers.view(), ell_ref).unwrap();
         // Solve-only helper: the converged Newton root L(κ) for FD of the jet.
         let solve_l = |kappa: f64| -> f64 {
             constant_curvature_effective_length_jet(data.view(), centers.view(), ell_ref, kappa)
@@ -1223,12 +1226,15 @@ mod tests {
         };
         let h = 1e-5_f64;
         for &kappa in &[-1.5_f64, -0.5, -1e-7, 0.0, 1e-7, 0.8, 1.7] {
-            let (l, l1, l2) =
-                constant_curvature_effective_length_jet(data.view(), centers.view(), ell_ref, kappa)
-                    .unwrap();
+            let (l, l1, l2) = constant_curvature_effective_length_jet(
+                data.view(),
+                centers.view(),
+                ell_ref,
+                kappa,
+            )
+            .unwrap();
             // L solves the fill target: g(L, κ) = fill⋆.
-            let (g, ..) =
-                data_center_fill_partials(data.view(), centers.view(), kappa, l).unwrap();
+            let (g, ..) = data_center_fill_partials(data.view(), centers.view(), kappa, l).unwrap();
             assert!(
                 (g - fill_star).abs() <= 1e-10 * (1.0 + fill_star.abs()),
                 "κ={kappa}: fill not held invariant: g(L,κ)={g} vs fill⋆={fill_star}"

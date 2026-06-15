@@ -205,7 +205,11 @@ pub(crate) fn classify_action(failure: &InnerFailure) -> FailureAction {
     }
 }
 
-pub(crate) fn build_rho_zero(target: &Array1<f64>, upper: &Array1<f64>, offset: f64) -> Array1<f64> {
+pub(crate) fn build_rho_zero(
+    target: &Array1<f64>,
+    upper: &Array1<f64>,
+    offset: f64,
+) -> Array1<f64> {
     assert_eq!(target.len(), upper.len());
     let mut rho0 = target.clone();
     for i in 0..rho0.len() {

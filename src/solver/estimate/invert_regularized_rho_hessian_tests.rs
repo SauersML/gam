@@ -130,8 +130,7 @@ fn flat_direction_dropped() {
     let (a, q) = build_with_spectrum(&evals);
     let inv = invert_regularized_rho_hessian(&a).expect("invert");
     assert_eq!(inv.active_rank, 3, "expected three identified directions");
-    let dropped =
-        inv.dropped_small_positive + inv.dropped_numerical_zero + inv.dropped_negative;
+    let dropped = inv.dropped_small_positive + inv.dropped_numerical_zero + inv.dropped_negative;
     assert_eq!(dropped, 1, "expected exactly one direction dropped");
     assert!(inv.repaired_hessian);
 

@@ -52,7 +52,6 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub latent_z_policy: LatentZPolicy,
 }
 
-
 pub const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
 
 pub(crate) const SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL: f64 = 1e-12;
@@ -60,7 +59,6 @@ pub(crate) const SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL: f64 = 1e-12;
 pub(crate) const SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL: f64 = 1e-8;
 
 pub(crate) const SURVIVAL_INTERCEPT_LOG_TAIL_THRESHOLD: f64 = 1e-8;
-
 
 #[inline]
 pub(crate) fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f64) -> f64 {
@@ -80,14 +78,12 @@ pub(crate) fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f6
     solver_band.max(eps_floor)
 }
 
-
 #[inline]
 pub(crate) fn survival_derivative_guard_violated(qd1: f64, derivative_guard: f64) -> bool {
     !qd1.is_finite()
         | !derivative_guard.is_finite()
         | (qd1 + survival_derivative_guard_tolerance(qd1, derivative_guard) < derivative_guard)
 }
-
 
 pub struct SurvivalMarginalSlopeFitResult {
     pub fit: UnifiedFitResult,
@@ -111,7 +107,6 @@ pub struct SurvivalMarginalSlopeFitResult {
     /// and slice `γ` out of the joint covariance.
     pub influence_absorber_width: Option<usize>,
 }
-
 
 pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     let n = spec.age_entry.len();
@@ -409,4 +404,3 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
     }
     Ok(())
 }
-

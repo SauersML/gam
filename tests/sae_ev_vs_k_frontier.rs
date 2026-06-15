@@ -138,7 +138,10 @@ fn planted_basis(cols: usize, p: usize) -> Array2<f64> {
             }
         }
         let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        assert!(nrm > 1.0e-9, "planted ambient basis rank-deficient at col {j}");
+        assert!(
+            nrm > 1.0e-9,
+            "planted ambient basis rank-deficient at col {j}"
+        );
         for i in 0..p {
             q[[i, j]] = v[i] / nrm;
         }
@@ -201,9 +204,8 @@ impl Corpus {
             let mut active = vec![false; n];
             let base = (c * n) / self.k_curved.max(1);
             for t in 0..n_active {
-                let jit =
-                    (idx_uniform(salt.wrapping_add((c as u64) * 131 + (t as u64) * 17 + 3)) * 5.0)
-                        as usize;
+                let jit = (idx_uniform(salt.wrapping_add((c as u64) * 131 + (t as u64) * 17 + 3))
+                    * 5.0) as usize;
                 active[(base + t * 3 + jit) % n] = true;
             }
             for i in 0..n {
@@ -254,8 +256,7 @@ impl Corpus {
             for col in 0..self.p {
                 let u = idx_uniform(salt.wrapping_add(((i * self.p + col) as u64) * 7 + 3));
                 let u2 = idx_uniform(salt.wrapping_add(((i * self.p + col) as u64) * 7 + 5));
-                let g =
-                    (-2.0 * (u.max(1.0e-12)).ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let g = (-2.0 * (u.max(1.0e-12)).ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
                 z[[i, col]] += sigma * g;
             }
         }
@@ -415,7 +416,12 @@ fn seed_slot_geometry(
     theta: &[Vec<f64>],
     z: ArrayView2<'_, f64>,
     n: usize,
-) -> (Vec<Array2<f64>>, Vec<Array2<f64>>, Vec<Array3<f64>>, Array3<f64>) {
+) -> (
+    Vec<Array2<f64>>,
+    Vec<Array2<f64>>,
+    Vec<Array3<f64>>,
+    Array3<f64>,
+) {
     let k_atoms = slots.len();
     let basis_sizes: Vec<usize> = slots.iter().map(|s| s.kind.basis_size()).collect();
     let m_max = basis_sizes.iter().copied().max().unwrap();
@@ -473,8 +479,7 @@ fn build_cold_term(
 ) -> SaeManifoldTerm {
     let k_atoms = slots.len();
     let basis_sizes: Vec<usize> = slots.iter().map(|s| s.kind.basis_size()).collect();
-    let (coords_k, phi_k, jet_k, basis_values) =
-        seed_slot_geometry(slots, corpus, theta, z, n);
+    let (coords_k, phi_k, jet_k, basis_values) = seed_slot_geometry(slots, corpus, theta, z, n);
 
     let logits = residual_seed_logits(basis_values.view(), &basis_sizes, z, RESIDUAL_SEED_GAIN);
     let decoder = decoder_lsq_init(basis_values.view(), &basis_sizes, z, logits.view(), TAU);
@@ -613,8 +618,12 @@ fn held_out_ev(
 
     // Seed the test-row assignment from the residual energy of the FROZEN
     // decoded curves (cold routing only — no decoder re-fit).
-    let logits =
-        residual_seed_logits(basis_values.view(), &basis_sizes, z_test.view(), RESIDUAL_SEED_GAIN);
+    let logits = residual_seed_logits(
+        basis_values.view(),
+        &basis_sizes,
+        z_test.view(),
+        RESIDUAL_SEED_GAIN,
+    );
     let manifolds: Vec<LatentManifold> = slots.iter().map(|s| s.kind.manifold()).collect();
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
@@ -748,14 +757,26 @@ fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
 
     for &k in &ks {
         let hslots = hybrid_slots(k, &corpus);
-        let (hfit, _hrho) =
-            run_production_fit(&hslots, &corpus, &theta_train, &z_train, n_train, &format!("frontier-hybrid-K{k}"));
+        let (hfit, _hrho) = run_production_fit(
+            &hslots,
+            &corpus,
+            &theta_train,
+            &z_train,
+            n_train,
+            &format!("frontier-hybrid-K{k}"),
+        );
         let h_ev = held_out_ev(&hfit, &hslots, &corpus, &theta_test, &z_test, n_test);
         hybrid_ev.push((k, h_ev));
 
         let lslots = linear_slots(k, &corpus);
-        let (lfit, _lrho) =
-            run_production_fit(&lslots, &corpus, &theta_train, &z_train, n_train, &format!("frontier-linear-K{k}"));
+        let (lfit, _lrho) = run_production_fit(
+            &lslots,
+            &corpus,
+            &theta_train,
+            &z_train,
+            n_train,
+            &format!("frontier-linear-K{k}"),
+        );
         let l_ev = held_out_ev(&lfit, &lslots, &corpus, &theta_test, &z_test, n_test);
         linear_ev.push((k, l_ev));
     }
@@ -883,8 +904,16 @@ fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
     let lin_climb_gain = lin_kc - lin_k1;
     println!(
         "discrimination: hybrid tail/climb = {:.4} (flattens), linear tail/climb = {:.4} (still shattering)",
-        if climb_gain.abs() > 1e-9 { tail_gain / climb_gain } else { f64::NAN },
-        if lin_climb_gain.abs() > 1e-9 { lin_tail_gain / lin_climb_gain } else { f64::NAN }
+        if climb_gain.abs() > 1e-9 {
+            tail_gain / climb_gain
+        } else {
+            f64::NAN
+        },
+        if lin_climb_gain.abs() > 1e-9 {
+            lin_tail_gain / lin_climb_gain
+        } else {
+            f64::NAN
+        }
     );
     // The pure-linear arm is still meaningfully refining over the tail doubling: a
     // single secant per circle leaves the largest secant error, and doubling the

@@ -316,11 +316,7 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
         out
     }
 
-    fn mul_basis_columns_into(
-        &self,
-        start: usize,
-        mut out: ndarray::ArrayViewMut2<'_, f64>,
-    ) {
+    fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
         let cols = out.ncols();
         assert!(start + cols <= self.dim);
         let mut basis = Array1::<f64>::zeros(self.dim);
@@ -403,11 +399,7 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
         out
     }
 
-    fn mul_basis_columns_into(
-        &self,
-        start: usize,
-        mut out: ndarray::ArrayViewMut2<'_, f64>,
-    ) {
+    fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
         let cols = out.ncols();
         assert!(start + cols <= self.dim);
         let mut basis = Array1::<f64>::zeros(self.dim);
@@ -931,4 +923,3 @@ pub(crate) fn make_two_block_design_row_coeff_operator(
         pa,
     })
 }
-

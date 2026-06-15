@@ -105,14 +105,8 @@ fn survival_marginal_slope_w_changes_with_beta() {
     let qd1_b = vec![1.0_f64; n];
     let z_b = vec![1.0, -1.0, 0.5, -0.5];
     let s_b = 1.0_f64;
-    let scalars_b = SurvivalMarginalSlopeFamilyScalars::new(
-        q0_b,
-        q1_b,
-        qd1_b,
-        g_b.clone(),
-        s_b,
-        z_b.clone(),
-    );
+    let scalars_b =
+        SurvivalMarginalSlopeFamilyScalars::new(q0_b, q1_b, qd1_b, g_b.clone(), s_b, z_b.clone());
     let scalars_arc: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars_b);
 
     // Build a hessian from the pilot primary state (same as hess_a but we

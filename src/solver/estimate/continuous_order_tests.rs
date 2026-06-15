@@ -117,8 +117,7 @@ fn continuous_order_intrinsic_limitwhen_lambda0_collapses() {
 
 #[test]
 fn continuous_order_is_only_defined_for_three_penalties_per_term() {
-    let ok =
-        try_compute_continuous_smoothness_order(&[2.0, 10.0, 3.0], &[1.0, 1.0, 1.0], 1e-12);
+    let ok = try_compute_continuous_smoothness_order(&[2.0, 10.0, 3.0], &[1.0, 1.0, 1.0], 1e-12);
     let two = try_compute_continuous_smoothness_order(&[2.0, 10.0], &[1.0, 1.0], 1e-12);
     let four = try_compute_continuous_smoothness_order(
         &[2.0, 10.0, 3.0, 7.0],

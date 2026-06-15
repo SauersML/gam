@@ -13,7 +13,6 @@ pub struct SaeManifoldRho {
     pub log_ard: Vec<Array1<f64>>,
 }
 
-
 impl SaeManifoldRho {
     #[must_use]
     pub fn new(log_lambda_sparse: f64, log_lambda_smooth: f64, log_ard: Vec<Array1<f64>>) -> Self {

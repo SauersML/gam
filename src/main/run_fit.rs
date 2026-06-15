@@ -6,7 +6,6 @@ pub(crate) fn blockwise_options_from_fit_args()
     Ok(options)
 }
 
-
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     if let Some(inf) = fit.inference.as_mut() {
         // Keep working_weights/response on inference too — `diagnose --alo`
@@ -22,7 +21,6 @@ pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
         ..Default::default()
     };
 }
-
 
 pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
     gam::config_resolve::resolve_cli_fit_config(gam::config_resolve::CliFitConfigInput {
@@ -64,7 +62,6 @@ pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, Stri
     })
 }
 
-
 pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitConfig, String> {
     gam::config_resolve::resolve_cli_fit_config(gam::config_resolve::CliFitConfigInput {
         family: None,
@@ -104,7 +101,6 @@ pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitCo
         hazard_loading: cli_hazard_loading(args.hazard_loading),
     })
 }
-
 
 pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = choose_formula(&args)?;
@@ -804,9 +800,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                         .iter()
                         .map(|&c| {
                             ds.headers.get(c).cloned().ok_or_else(|| {
-                                format!(
-                                    "internal error: cascade feature column {c} has no header"
-                                )
+                                format!("internal error: cascade feature column {c} has no header")
                             })
                         })
                         .collect::<Result<Vec<_>, _>>()?
@@ -1034,7 +1028,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     progress.finish_progress("fit complete");
     Ok(())
 }
-
 
 pub(crate) fn run_fit_bernoulli_marginal_slope(
     args: &FitArgs,
@@ -1314,7 +1307,6 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
     Ok(())
 }
 
-
 pub(crate) fn run_fit_transformation_normal(
     args: &FitArgs,
     progress: &mut gam::visualizer::VisualizerSession,
@@ -1444,7 +1436,6 @@ pub(crate) fn run_fit_transformation_normal(
     progress.finish_progress("transformation-normal fit complete");
     Ok(())
 }
-
 
 pub(crate) fn run_fitwith_predict_noise(
     progress: &mut gam::visualizer::VisualizerSession,
@@ -1966,7 +1957,6 @@ pub(crate) fn run_fitwith_predict_noise(
     Ok(())
 }
 
-
 /// Map a [`ResponseFamily`] to the dispersion-GAM kind whose log-precision
 /// channel can carry a `noise_formula` in the CLI `--predict-noise` path
 /// (#913). Mirrors `workflow::dispersion_location_scale_kind`.
@@ -1983,8 +1973,6 @@ pub(crate) fn dispersion_location_scale_kind_for_cli(
     }
 }
 
-
-
 pub(crate) fn block_role_label(role: &gam::estimate::BlockRole) -> &'static str {
     match role {
         gam::estimate::BlockRole::Mean => "mean",
@@ -1996,8 +1984,10 @@ pub(crate) fn block_role_label(role: &gam::estimate::BlockRole) -> &'static str 
     }
 }
 
-
-pub(crate) fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result<(), String> {
+pub(crate) fn validate_fit_args_preflight(
+    args: &FitArgs,
+    parsed: &ParsedFormula,
+) -> Result<(), String> {
     if args.out.is_none() {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),
@@ -2149,7 +2139,6 @@ pub(crate) fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula
     Ok(())
 }
 
-
 pub(crate) fn family_arg_name(arg: FamilyArg) -> &'static str {
     match arg {
         FamilyArg::Auto => "auto",
@@ -2168,8 +2157,11 @@ pub(crate) fn family_arg_name(arg: FamilyArg) -> &'static str {
     }
 }
 
-
-pub(crate) fn validate_time_margin_args(flag: &str, k: Option<usize>, degree: usize) -> Result<(), String> {
+pub(crate) fn validate_time_margin_args(
+    flag: &str,
+    k: Option<usize>,
+    degree: usize,
+) -> Result<(), String> {
     if let Some(k) = k {
         let min_k = degree + 1;
         if k < min_k {
@@ -2179,14 +2171,15 @@ pub(crate) fn validate_time_margin_args(flag: &str, k: Option<usize>, degree: us
     Ok(())
 }
 
-
-pub(crate) fn validate_positive_optional_usize(flag: &str, value: Option<usize>) -> Result<(), String> {
+pub(crate) fn validate_positive_optional_usize(
+    flag: &str,
+    value: Option<usize>,
+) -> Result<(), String> {
     if matches!(value, Some(0)) {
         return Err(format!("{flag} must be > 0"));
     }
     Ok::<(), _>(())
 }
-
 
 pub(crate) fn choose_formula(args: &FitArgs) -> Result<String, CliError> {
     let v = args.formula_positional.trim();
@@ -2197,7 +2190,6 @@ pub(crate) fn choose_formula(args: &FitArgs) -> Result<String, CliError> {
     }
     Ok(v.to_string())
 }
-
 
 pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
     match &term.basis {
@@ -2241,7 +2233,6 @@ pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize>
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WiggleDomainDiagnostics {
     pub(crate) domain_min: f64,
@@ -2249,7 +2240,6 @@ pub(crate) struct WiggleDomainDiagnostics {
     pub(crate) outside_count: usize,
     pub(crate) outside_fraction: f64,
 }
-
 
 pub(crate) fn compute_probit_q0_from_eta(
     eta_t: ArrayView1<'_, f64>,
@@ -2269,7 +2259,6 @@ pub(crate) fn compute_probit_q0_from_eta(
     Ok(q0)
 }
 
-
 pub(crate) fn compute_probit_q0_from_fit(
     fit: &gam::estimate::UnifiedFitResult,
 ) -> Result<Array1<f64>, String> {
@@ -2287,7 +2276,6 @@ pub(crate) fn compute_probit_q0_from_fit(
         .view();
     compute_probit_q0_from_eta(eta_t, eta_ls)
 }
-
 
 pub(crate) fn summarizewiggle_domain(
     q0: ArrayView1<'_, f64>,

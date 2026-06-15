@@ -403,6 +403,4 @@ impl SurvivalMarginalSlopeFamily {
                 + di * d1.ln()
                 - di * qd1.ln()))
     }
-
 }
-

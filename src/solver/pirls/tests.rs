@@ -420,7 +420,10 @@ mod tests {
 
     /// Run a unified log-link writer through both its derivative and
     /// no-derivative branches and collect the buffers.
-    pub(crate) fn run_unified<F>(n: usize, write: F) -> (LogLinkWorkingOutputs, LogLinkWorkingOutputs)
+    pub(crate) fn run_unified<F>(
+        n: usize,
+        write: F,
+    ) -> (LogLinkWorkingOutputs, LogLinkWorkingOutputs)
     where
         F: Fn(
             &mut Array1<f64>,
@@ -1674,7 +1677,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod root_cause_tests {
     use super::*;
@@ -1715,7 +1717,10 @@ mod root_cause_tests {
         }
     }
 
-    pub(crate) fn test_working_state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+    pub(crate) fn test_working_state(
+        beta: &Coefficients,
+        curvature: HessianCurvatureKind,
+    ) -> WorkingState {
         scalar_working_state(beta, curvature, 1.0, 1.0)
     }
 
@@ -1966,7 +1971,11 @@ mod root_cause_tests {
     }
 
     impl LinearObjectivePlateauModel {
-        pub(crate) fn state(&self, beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+        pub(crate) fn state(
+            &self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> WorkingState {
             let deviance = 1.0 + self.gradient * beta[0];
             scalar_working_state(beta, curvature, self.gradient, deviance)
         }
@@ -2520,7 +2529,8 @@ mod root_cause_tests {
     }
 
     #[test]
-    pub(crate) fn plateaued_accepted_step_does_not_report_converged_with_large_projected_gradient() {
+    pub(crate) fn plateaued_accepted_step_does_not_report_converged_with_large_projected_gradient()
+    {
         let mut model = PlateauStatusModel {
             gradient: 5e-5,
             current_deviance: 1.0,

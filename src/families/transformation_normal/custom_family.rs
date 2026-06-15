@@ -5,10 +5,7 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 impl CustomFamily for TransformationNormalFamily {
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         crate::util::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
             1,
@@ -65,10 +62,7 @@ impl CustomFamily for TransformationNormalFamily {
         })
     }
 
-    fn log_likelihood_only(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<f64, String> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 1 {
             return Err(TransformationNormalError::InvalidInput {
                 reason: "expected 1 block".to_string(),
@@ -686,10 +680,7 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // CTN's SCOP coefficient-space joint Hessian is supplied as a
         // row-streaming matrix-free Hv operator.
         matches!(specs, [spec] if spec.design.ncols()

@@ -7,13 +7,11 @@ use super::*;
 
 pub(crate) const DENSE_OUTER_MAX_P: usize = 1024;
 
-
 // Estimated FLOP threshold below which spawning rayon workers for the dense
 // outer-product path costs more than the work itself. Calibrated to cover
 // rayon's per-task overhead (microseconds) plus the cost of zeroing one dense
 // buffer per worker; below this, everything stays on the calling thread.
 pub(crate) const DENSE_OUTER_PARALLEL_FLOP_THRESHOLD: u64 = 100_000;
-
 
 /// Backend selection for sparse-design XᵀWX assembly.
 ///
@@ -32,7 +30,6 @@ pub(crate) enum XtWxBackend {
     Sparse(SparseSpGemmState),
 }
 
-
 /// State for the dense outer-product backend.
 ///
 /// `xtwx_dense` is row-major p×p; the inner loop fills only the upper triangle
@@ -48,7 +45,6 @@ pub(crate) struct DenseOuterState {
     pub(crate) xtwx_dense: Array2<f64>,
     pub(crate) thread_buffers: Vec<Array2<f64>>,
 }
-
 
 /// State for the sparse-SpGEMM backend (faer numeric matmul scratch and the
 /// pre-scaled (√W)·X factors that feed it).
@@ -74,7 +70,6 @@ pub(crate) struct SparseSpGemmState {
     pub(crate) par: Par,
 }
 
-
 pub(crate) struct SparseXtWxCache {
     pub(crate) xtwx_symbolic: SymbolicSparseColMat<usize>,
     pub(crate) xtwxvalues: Vec<f64>,
@@ -89,7 +84,6 @@ pub(crate) struct SparseXtWxCache {
     pub(crate) x_t_csc: SparseColMat<usize, f64>,
     pub(crate) backend: XtWxBackend,
 }
-
 
 impl SparseXtWxCache {
     pub(crate) fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
@@ -203,7 +197,6 @@ impl SparseXtWxCache {
     }
 }
 
-
 impl DenseOuterState {
     /// Compute the upper triangle of XᵀWX = Σᵢ wᵢ · xᵢ xᵢᵀ into
     /// `self.xtwx_dense`.
@@ -288,7 +281,6 @@ impl DenseOuterState {
     }
 }
 
-
 impl SparseSpGemmState {
     /// Compute XᵀWX into the symbolic-pattern array `xtwxvalues` via faer's
     /// sparse-sparse matmul: XᵀWX = (√W·X)ᵀ · (√W·X).
@@ -359,7 +351,6 @@ impl SparseSpGemmState {
     }
 }
 
-
 /// Accumulate the upper triangle of Σᵢ wᵢ · xᵢ xᵢᵀ over `rows` into `acc`.
 ///
 /// `x_t` is Xᵀ in CSC: column i lists the nonzero columns of row i of X.
@@ -409,7 +400,6 @@ pub(crate) fn accumulate_outer_upper(
     }
 }
 
-
 pub(super) fn compute_jeffreys_pirls_diagnostics_sparse(
     link: &InverseLink,
     x_design_csr: &SparseRowMat<usize, f64>,
@@ -434,7 +424,6 @@ pub(super) fn compute_jeffreys_pirls_diagnostics_sparse(
     }
     compute_jeffreys_pirls_diagnostics(link, x_dense.view(), eta, observation_weights)
 }
-
 
 pub(super) fn compute_jeffreys_pirls_diagnostics(
     link: &InverseLink,
@@ -463,7 +452,6 @@ pub(super) fn compute_jeffreys_pirls_diagnostics(
         op.pirls_firth_score_shift(),
     ))
 }
-
 
 pub(crate) fn ensure_positive_definitewithridge(
     hess: &mut Array2<f64>,
@@ -501,7 +489,6 @@ pub(crate) fn ensure_positive_definitewithridge(
     })
 }
 
-
 pub(super) fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -509,7 +496,6 @@ pub(super) fn solve_newton_direction_dense(
 ) -> Result<(), EstimationError> {
     solve_newton_direction_dense_with_factor(hessian, gradient, direction_out).map(|_| ())
 }
-
 
 pub(super) fn solve_direction_with_dense_factor(
     factor: &FaerSymmetricFactor,
@@ -524,7 +510,6 @@ pub(super) fn solve_direction_with_dense_factor(
     factor.solve_in_place(rhsview.as_mut());
     direction_out.mapv_inplace(|v| -v);
 }
-
 
 /// Fixes the audit-revised geodesic-acceleration note: expose the dense
 /// factor so the optional second-order correction can reuse it instead of
@@ -621,7 +606,6 @@ pub(super) fn solve_newton_direction_dense_with_factor(
         },
     ))
 }
-
 
 /// Solve the Newton direction implicitly via PCG against an operator-form
 /// Hessian. Bypasses materialization of the `p × p` Hessian when at least one
@@ -763,7 +747,6 @@ where
     Ok(())
 }
 
-
 pub(super) fn project_coefficients_to_lower_bounds(
     beta: &mut Array1<f64>,
     lower_bounds: &Array1<f64>,
@@ -775,7 +758,6 @@ pub(super) fn project_coefficients_to_lower_bounds(
         }
     }
 }
-
 
 /// Compute the projected gradient norm for bound-constrained optimization.
 ///
@@ -793,7 +775,6 @@ pub(super) fn project_coefficients_to_lower_bounds(
 pub(crate) const ACTIVE_BOUND_REL_TOL: f64 = 1e-6;
 
 pub(crate) const ACTIVE_BOUND_ABS_TOL: f64 = 1e-10;
-
 
 pub(super) fn projected_gradient_norm(
     gradient: &Array1<f64>,
@@ -822,7 +803,6 @@ pub(super) fn projected_gradient_norm(
     }
     sum_sq.sqrt()
 }
-
 
 /// "Soft" P-IRLS acceptance reasons — fits that did not certify strict KKT
 /// stationarity but that the post-loop rescue would still classify as
@@ -855,7 +835,6 @@ pub(super) enum PirlsSoftAccept {
     /// when a step was actually taken.
     RelativeBandPlateau,
 }
-
 
 /// Source of the "is the fit still moving?" signal handed to
 /// [`pirls_soft_acceptance`]. There are two contexts in which we need to
@@ -890,7 +869,6 @@ pub(super) enum SoftAcceptProgress {
         current_penalized: f64,
     },
 }
-
 
 /// Evaluate every "soft" acceptance criterion that the post-loop rescue
 /// applies to a fit which has hit `MaxIterations`. Returns the first
@@ -978,7 +956,6 @@ pub(super) fn pirls_soft_acceptance(
     None
 }
 
-
 pub(super) fn constrained_stationarity_norm(
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
@@ -1001,7 +978,6 @@ pub(super) fn constrained_stationarity_norm(
     projected_gradient_norm(gradient, beta, lower_bounds)
 }
 
-
 pub(crate) fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
     let p = matrix.nrows().min(matrix.ncols());
     let mut nnz = 0usize;
@@ -1014,7 +990,6 @@ pub(crate) fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
     }
     nnz
 }
-
 
 pub(crate) fn estimate_sparse_native_decision(
     workspace: &mut PirlsWorkspace,
@@ -1105,7 +1080,6 @@ pub(crate) fn estimate_sparse_native_decision(
     }
 }
 
-
 pub(super) fn should_use_sparse_native_pirls(
     workspace: &mut PirlsWorkspace,
     x_original: &DesignMatrix,
@@ -1122,7 +1096,6 @@ pub(super) fn should_use_sparse_native_pirls(
     )
 }
 
-
 pub(crate) fn sparse_reml_penalized_hessian(
     workspace: &mut PirlsWorkspace,
     x: &SparseColMat<usize, f64>,
@@ -1133,7 +1106,6 @@ pub(crate) fn sparse_reml_penalized_hessian(
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
     workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge, precomputed_xtwx)
 }
-
 
 /// Assemble a sparse SPD Hessian with adaptive diagonal ridge, returning the
 /// matrix, its successful Cholesky factor, and the ridge that was needed.
@@ -1262,7 +1234,6 @@ pub(crate) fn gershgorin_min_eig_lower_bound(h: &SparseColMat<usize, f64>) -> (f
     (min_bound, diag_scale)
 }
 
-
 pub(crate) fn solve_subsystem_direction(
     h_sub: ndarray::ArrayView2<f64>,
     g_sub: ndarray::ArrayView1<f64>,
@@ -1321,13 +1292,11 @@ pub(crate) fn solve_subsystem_direction(
     Ok(())
 }
 
-
 pub(super) fn linear_constraints_from_lower_bounds(
     lower_bounds: &Array1<f64>,
 ) -> Option<LinearInequalityConstraints> {
     LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
-
 
 pub(super) fn compute_constraint_kkt_diagnostics(
     beta: &Array1<f64>,
@@ -1336,7 +1305,6 @@ pub(super) fn compute_constraint_kkt_diagnostics(
 ) -> ConstraintKktDiagnostics {
     active_set::compute_constraint_kkt_diagnostics(beta, gradient, constraints)
 }
-
 
 /// Select which active bound-constraint to release in the primal active-set
 /// QP loop, or `None` when KKT is satisfied (no negative multiplier).
@@ -1383,7 +1351,6 @@ pub(super) fn select_active_set_release(
         idx
     }
 }
-
 
 pub(crate) fn solve_newton_directionwith_lower_bounds(
     hessian: &Array2<f64>,
@@ -1597,7 +1564,6 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
     }
     Ok(())
 }
-
 
 /// Reduce a constraint matrix to full row rank using column-pivoted QR on A^T.
 ///

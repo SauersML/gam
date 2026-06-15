@@ -35,14 +35,19 @@ pub(crate) struct BlockHessianAccumulator {
     pub(crate) h_wi: Array2<f64>,
 }
 
-
 pub(crate) const PULLBACK_PARALLEL_MIN_CELLS: usize = 16_384;
 
 pub(crate) const PULLBACK_PARALLEL_TARGET_CELLS: usize = 65_536;
 
-
 impl BlockHessianAccumulator {
-    pub(crate) fn new(p_t: usize, p_m: usize, p_g: usize, p_h: usize, p_w: usize, p_i: usize) -> Self {
+    pub(crate) fn new(
+        p_t: usize,
+        p_m: usize,
+        p_g: usize,
+        p_h: usize,
+        p_w: usize,
+        p_i: usize,
+    ) -> Self {
         Self {
             h_tt: Array2::zeros((p_t, p_t)),
             h_mm: Array2::zeros((p_m, p_m)),
@@ -79,7 +84,10 @@ impl BlockHessianAccumulator {
         )
     }
 
-    pub(crate) fn deterministic_lhs_chunks(lhs_len: usize, rhs_len: usize) -> Vec<std::ops::Range<usize>> {
+    pub(crate) fn deterministic_lhs_chunks(
+        lhs_len: usize,
+        rhs_len: usize,
+    ) -> Vec<std::ops::Range<usize>> {
         let cells = lhs_len.saturating_mul(rhs_len);
         if cells < PULLBACK_PARALLEL_MIN_CELLS || lhs_len <= 1 || rayon::current_num_threads() <= 1
         {
@@ -852,13 +860,11 @@ impl BlockHessianAccumulator {
     }
 }
 
-
 impl std::ops::AddAssign<&BlockHessianAccumulator> for BlockHessianAccumulator {
     fn add_assign(&mut self, other: &BlockHessianAccumulator) {
         self.add(other);
     }
 }
-
 
 impl BlockHessianAccumulator {
     /// Lifted pullback: J^T H J + Σ_a f_a K_a using actual Jacobians
@@ -1472,7 +1478,6 @@ impl BlockHessianAccumulator {
     }
 }
 
-
 /// Block-structured HyperOperator for survival marginal-slope psi Hessians.
 /// Stores the full 5-block exact joint Hessian layout and performs matvec
 /// blockwise instead of materializing dense p×p structure in the outer path.
@@ -1487,7 +1492,6 @@ pub(crate) struct BlockHessianOperator {
     pub(crate) blocks: BlockHessianAccumulator,
     pub(crate) slices: BlockSlices,
 }
-
 
 impl HyperOperator for BlockHessianOperator {
     fn dim(&self) -> usize {

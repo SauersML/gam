@@ -33,7 +33,11 @@ impl<'a> RemlState<'a> {
     }
 
     #[inline]
-    pub(crate) fn dense_product_likely_uses_inner_parallelism(m: usize, n: usize, k: usize) -> bool {
+    pub(crate) fn dense_product_likely_uses_inner_parallelism(
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
         // Keep this in sync with faer_ndarray::matmul_parallelism.  When a
         // dense product is large enough for faer/BLAS-style internal
         // parallelism, do not also wrap sibling products in rayon::join: that
@@ -46,7 +50,9 @@ impl<'a> RemlState<'a> {
     }
 
     #[inline]
-    pub(crate) fn should_join_independent_dense_products(products: &[(usize, usize, usize)]) -> bool {
+    pub(crate) fn should_join_independent_dense_products(
+        products: &[(usize, usize, usize)],
+    ) -> bool {
         const JOIN_MIN_TOTAL_FLOP_SCALE: usize = 128 * 1024;
         if rayon::current_num_threads() <= 1 {
             return false;
@@ -794,7 +800,11 @@ impl FirthDenseOperator {
     }
 
     #[inline]
-    pub(crate) fn apply_p_u_to_matrix(&self, a_u_reduced: &Array2<f64>, mat: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn apply_p_u_to_matrix(
+        &self,
+        a_u_reduced: &Array2<f64>,
+        mat: &Array2<f64>,
+    ) -> Array2<f64> {
         let mut out = RemlState::apply_hadamard_gram_to_matrix(
             &self.x_reduced,
             &self.k_reduced,
@@ -2904,7 +2914,11 @@ mod tests {
         build_link_firth_op(link, x, beta).jeffreys_logdet()
     }
 
-    pub(crate) fn link_firth_grad(link: StandardLink, x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn link_firth_grad(
+        link: StandardLink,
+        x: &Array2<f64>,
+        beta: &Array1<f64>,
+    ) -> Array1<f64> {
         build_link_firth_op(link, x, beta).jeffreys_beta_gradient()
     }
 

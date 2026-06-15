@@ -113,7 +113,6 @@ pub(crate) use std::sync::atomic::AtomicUsize;
 
 pub(crate) use std::sync::{Arc, Mutex};
 
-
 /// Inline-stored polynomial coefficient vector for survival marginal-slope
 /// integrand assembly. `poly_*` helpers in this module routinely build
 /// degree ≤ ~28 polynomials (max product of four affine cell coefficient
@@ -122,54 +121,54 @@ pub(crate) use std::sync::{Arc, Mutex};
 /// fits. Thirty-two inline slots cover every observed shape.
 pub(crate) type PolyVec = SmallVec<[f64; 32]>;
 
-mod poly_arith;
-mod error;
-mod spec;
-mod family;
-mod block_layout;
-mod row_math;
-mod primary_geometry;
-mod hessian;
-mod eval_score;
-mod eval_rigid;
-mod eval_sigma;
-mod timewiggle_geometry;
-mod calibration;
-mod intercept;
-mod feasibility;
-mod denested_cells;
-mod timepoint_exact;
-mod flex_sensitivity;
-mod contraction;
 mod accumulate;
-mod pullback;
-mod psi_terms;
-mod newton_operators;
-mod joint_workspace;
-mod row_kernel;
-mod joint_eval;
-mod custom_family_impl;
 mod block_jacobians;
-mod fit_setup;
+mod block_layout;
+mod calibration;
+mod contraction;
+mod custom_family_impl;
+mod denested_cells;
+mod error;
+mod eval_rigid;
+mod eval_score;
+mod eval_sigma;
+mod family;
+mod feasibility;
 mod fit_entry;
+mod fit_setup;
+mod flex_sensitivity;
+mod hessian;
+mod intercept;
+mod joint_eval;
+mod joint_workspace;
+mod newton_operators;
+mod poly_arith;
+mod primary_geometry;
+mod psi_terms;
+mod pullback;
+mod row_kernel;
+mod row_math;
+mod spec;
+mod timepoint_exact;
+mod timewiggle_geometry;
 
-pub(crate) use poly_arith::{
-    poly_add, poly_add_jets, poly_coeff_mask, poly_mul, poly_mul_jets, poly_scale,
-    poly_scale_jets, poly_sub,
-};
-pub use error::*;
-pub use spec::*;
-pub(crate) use family::*;
-pub(crate) use block_layout::*;
-pub use row_math::*;
-pub(crate) use primary_geometry::*;
-pub(crate) use hessian::*;
-pub(crate) use joint_workspace::*;
-pub(crate) use row_kernel::*;
-pub(crate) use joint_eval::*;
 pub use block_jacobians::*;
-pub(crate) use fit_setup::*;
+pub(crate) use block_layout::*;
+pub use error::*;
+pub(crate) use family::*;
 pub use fit_entry::*;
+pub(crate) use fit_setup::*;
+pub(crate) use hessian::*;
+pub(crate) use joint_eval::*;
+pub(crate) use joint_workspace::*;
+pub(crate) use poly_arith::{
+    poly_add, poly_add_jets, poly_coeff_mask, poly_mul, poly_mul_jets, poly_scale, poly_scale_jets,
+    poly_sub,
+};
+pub(crate) use primary_geometry::*;
+pub(crate) use row_kernel::*;
+pub use row_math::*;
+pub use spec::*;
 
 #[cfg(test)]
 mod tests;

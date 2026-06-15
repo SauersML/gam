@@ -1069,10 +1069,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
     /// blocks by hand (without `build_location_scale_block`'s callbacks), so a
     /// shared μ/log-σ covariate basis is recognised as block-diagonal rather
     /// than mistaken for cross-block intercept aliases (#558).
-    fn output_channel_assignment(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> Option<Vec<usize>> {
+    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
         // Two-channel families: `[mu, log_sigma]`. The optional trailing
         // zero-channel wiggle block (when present) also drives channel 0.
         Some(
@@ -1096,10 +1093,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         )
     }
 
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -1235,10 +1229,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         })
     }
 
-    fn log_likelihood_only(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<f64, String> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 2 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -1699,10 +1690,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn inner_coefficient_hessian_hvp_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // The Gaussian location-scale workspace is returned by
         // `exact_newton_joint_hessian_workspace` whenever
         // `exact_joint_dense_block_designs` succeeds, which itself depends on

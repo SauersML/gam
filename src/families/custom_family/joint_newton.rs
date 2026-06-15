@@ -2678,12 +2678,6 @@ impl KktRefusalDiagnosis {
 /// penalty-rank machinery uses for "structurally zero".
 pub(crate) const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
 
-/// Joint width above which the pairwise Jeffreys second-order endgame
-/// completion fallback (`p(p+1)/2` exact second-directional joint-Hessian
-/// calls per endgame cycle, gam#979) is not attempted. Wide systems may still
-/// get the exact completion from a family-provided contracted trace hook.
-pub(crate) const JEFFREYS_COMPLETION_MAX_P: usize = 64;
-
 /// Residual band (as a multiple of the KKT residual tolerance) inside which
 /// the inner joint Newton is considered to be in its convergence ENDGAME and
 /// the exact Jeffreys second-order completion is added to the step model
@@ -4207,7 +4201,6 @@ pub(crate) fn projected_residual_range_space_per_block_inf(
             .collect(),
     )
 }
-
 
 pub(crate) fn projected_residual_range_space_inf(
     projected_residual: &Array1<f64>,

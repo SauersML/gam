@@ -305,6 +305,4 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     // ── Pullback through design matrices ──────────────────────────────
-
 }
-

@@ -20,7 +20,6 @@ pub struct SparseCholeskyOperator {
     pub(crate) n_dim: usize,
 }
 
-
 impl SparseCholeskyOperator {
     /// Create from an existing sparse factorization and its precomputed logdet.
     pub fn new(
@@ -579,7 +578,6 @@ impl SparseCholeskyOperator {
     }
 }
 
-
 impl HessianOperator for SparseCholeskyOperator {
     fn logdet(&self) -> f64 {
         self.cached_logdet
@@ -775,7 +773,6 @@ impl HessianOperator for SparseCholeskyOperator {
     }
 }
 
-
 // BlockCoupledDerivativeProvider was removed — its functionality is now handled
 // by the `deriv_provider` trait (HessianDerivativeProvider), with concrete
 // implementations like JointModelDerivProvider and SurvivalDerivProvider
@@ -813,7 +810,6 @@ pub struct DenseCholeskyValueOnlyOperator {
     pub(crate) n_dim: usize,
 }
 
-
 impl DenseCholeskyValueOnlyOperator {
     /// Factorize `h` (assumed SPD) via LLT and cache the log-determinant.
     ///
@@ -845,7 +841,6 @@ impl DenseCholeskyValueOnlyOperator {
     }
 }
 
-
 impl HessianOperator for DenseCholeskyValueOnlyOperator {
     fn logdet(&self) -> f64 {
         self.cached_logdet
@@ -876,7 +871,6 @@ impl HessianOperator for DenseCholeskyValueOnlyOperator {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Block-coupled HessianOperator for joint multi-block models
 // ═══════════════════════════════════════════════════════════════════════════
@@ -902,7 +896,6 @@ pub struct BlockCoupledOperator {
     pub(crate) inner: DenseSpectralOperator,
 }
 
-
 impl BlockCoupledOperator {
     /// Construct from an assembled joint Hessian using the supplied
     /// [`PseudoLogdetMode`].  Internally performs a single
@@ -917,7 +910,6 @@ impl BlockCoupledOperator {
         Ok(Self { inner })
     }
 }
-
 
 impl HessianOperator for BlockCoupledOperator {
     fn logdet(&self) -> f64 {
@@ -1036,7 +1028,6 @@ impl HessianOperator for BlockCoupledOperator {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Matrix-free SPD HessianOperator implementation
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1073,7 +1064,6 @@ pub struct MatrixFreeSpdOperator {
     // gradients are inflated by `1/σ_j` over numerical null directions.
     pub(crate) mode: PseudoLogdetMode,
 }
-
 
 impl MatrixFreeSpdOperator {
     pub(crate) const EXACT_DENSE_SPECTRAL_MAX_BYTES: usize = 512 * 1024 * 1024;
@@ -1239,7 +1229,6 @@ impl MatrixFreeSpdOperator {
     }
 }
 
-
 pub(crate) fn conjugate_gradient_trace_solve<F>(
     rhs: &Array1<f64>,
     rel_tol: f64,
@@ -1323,7 +1312,6 @@ where
 
     Some((x, iters, residual_norm))
 }
-
 
 impl HessianOperator for MatrixFreeSpdOperator {
     fn logdet(&self) -> f64 {
@@ -1497,7 +1485,6 @@ impl HessianOperator for MatrixFreeSpdOperator {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helpers for custom family → InnerSolution conversion
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1547,7 +1534,6 @@ pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
     }
     Ok(r)
 }
-
 
 /// Compute the exact pseudo-logdet log|S|₊ and its ρ-derivatives for a
 /// blockwise penalty structure.
@@ -1659,7 +1645,6 @@ pub fn compute_block_penalty_logdet_derivs(
     })
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Stochastic trace estimation via Rademacher probes
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1685,4 +1670,3 @@ pub fn compute_block_penalty_logdet_derivs(
 // Key efficiency: ONE H⁻¹ solve per probe, shared across ALL k
 // coordinates.  For each probe z we compute w = H⁻¹z once, then for each k
 // we get q_k = zᵀ(A_k w) with a cheap matrix–vector multiply.
-

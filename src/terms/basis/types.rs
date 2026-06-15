@@ -16,7 +16,6 @@ unsafe impl Send for SendPtr {}
 // accessed through the wrapper without the call-site disjoint-offset proof.
 unsafe impl Sync for SendPtr {}
 
-
 impl SendPtr {
     #[inline(always)]
     pub(crate) fn add(self, offset: usize) -> *mut f64 {
@@ -26,7 +25,6 @@ impl SendPtr {
         unsafe { self.0.add(offset) }
     }
 }
-
 
 /// A comprehensive error type for all operations within the basis module.
 #[derive(Error, Debug)]
@@ -166,7 +164,6 @@ pub enum BasisError {
     Other(String),
 }
 
-
 // ============================================================================
 // Unified Basis Generation API
 // ============================================================================
@@ -179,7 +176,6 @@ pub struct BasisOptions {
     /// Basis family to evaluate.
     pub basis_family: BasisFamily,
 }
-
 
 impl BasisOptions {
     /// Create options for evaluating basis functions (no derivative).
@@ -223,7 +219,6 @@ impl BasisOptions {
     }
 }
 
-
 /// Basis-family selector for 1D spline evaluation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BasisFamily {
@@ -236,7 +231,6 @@ pub enum BasisFamily {
     /// sums of B-splines at degree k+1.
     ISpline,
 }
-
 
 /// Specifies the source of knots for basis generation.
 #[derive(Clone, Debug)]
@@ -282,7 +276,6 @@ pub struct ThinPlateSplineBasis {
     pub radial_reparam: Array2<f64>,
 }
 
-
 /// Matérn smoothness parameter `nu` (half-integer variants with closed forms).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum MaternNu {
@@ -292,7 +285,6 @@ pub enum MaternNu {
     SevenHalves,
     NineHalves,
 }
-
 
 impl MaternNu {
     /// The half-integer smoothness value ν as an `f64` (0.5, 1.5, …).
@@ -307,7 +299,6 @@ impl MaternNu {
     }
 }
 
-
 /// Matérn radial basis and penalties.
 #[derive(Debug, Clone)]
 pub struct MaternSplineBasis {
@@ -319,12 +310,10 @@ pub struct MaternSplineBasis {
     pub dimension: usize,
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct DuchonBasisDesign {
     pub(crate) basis: Array2<f64>,
 }
-
 
 /// Boundary-condition policy for one-dimensional smooth bases.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -339,7 +328,6 @@ pub enum OneDimensionalBoundary {
     Cyclic { start: f64, end: f64 },
 }
 
-
 impl OneDimensionalBoundary {
     pub(crate) fn period(&self) -> Option<(f64, f64, f64)> {
         match *self {
@@ -351,7 +339,6 @@ impl OneDimensionalBoundary {
         }
     }
 }
-
 
 /// Which knot strategy to use for 1D B-spline bases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,14 +364,12 @@ pub enum BSplineKnotSpec {
     Provided(Array1<f64>),
 }
 
-
 /// Internal-knot placement strategy when knots are automatically inferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BSplineKnotPlacement {
     Uniform,
     Quantile,
 }
-
 
 /// 1D B-spline basis configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,7 +388,6 @@ pub struct BSplineBasisSpec {
     pub boundary_conditions: BSplineBoundaryConditions,
 }
 
-
 /// Per-endpoint boundary constraint policy for B-spline 1D bases.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum BSplineEndpointBoundaryCondition {
@@ -417,7 +401,6 @@ pub enum BSplineEndpointBoundaryCondition {
     Anchored { value: f64 },
 }
 
-
 /// Left/right pair of B-spline endpoint constraints.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct BSplineBoundaryConditions {
@@ -427,14 +410,12 @@ pub struct BSplineBoundaryConditions {
     pub right: BSplineEndpointBoundaryCondition,
 }
 
-
 impl BSplineBoundaryConditions {
     pub const fn is_free(&self) -> bool {
         matches!(self.left, BSplineEndpointBoundaryCondition::Free)
             && matches!(self.right, BSplineEndpointBoundaryCondition::Free)
     }
 }
-
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
 ///
@@ -465,13 +446,11 @@ pub enum BSplineIdentifiability {
     FrozenTransform { transform: Array2<f64> },
 }
 
-
 impl Default for BSplineIdentifiability {
     fn default() -> Self {
         BSplineIdentifiability::WeightedSumToZero { weights: None }
     }
 }
-
 
 /// Spatial center selection strategy.
 ///
@@ -502,7 +481,6 @@ pub enum CenterStrategy {
     },
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CenterStrategyKind {
     UserProvided,
@@ -512,7 +490,6 @@ pub enum CenterStrategyKind {
     KMeans,
     UniformGrid,
 }
-
 
 /// Adaptive default center count for spatial smooths (TPS, Duchon, Matérn).
 ///
@@ -576,7 +553,6 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
     k.min(n).min(n / COND_N_DIVISOR)
 }
 
-
 /// Conservative center count for a *secondary* (distributional) predictor's
 /// spatial smooth — e.g. the log-σ scale model in a Gaussian location-scale
 /// fit.
@@ -596,7 +572,6 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d).min(modest).max(1)
 }
 
-
 /// Resource-aware plan for a spatial smooth (Duchon / Matérn / TPS).
 ///
 /// Returned by [`plan_spatial_basis`]. Captures the resolved center count,
@@ -615,7 +590,6 @@ pub struct SpatialBasisPlan {
     pub recommended_storage: SpatialStorageMode,
 }
 
-
 /// Storage mode recommended by [`plan_spatial_basis`].
 ///
 /// * `DenseValueDenseDerivatives` — both the value design and its derivative
@@ -631,7 +605,6 @@ pub enum SpatialStorageMode {
     OperatorOnly,
 }
 
-
 /// How [`plan_spatial_basis`] should pick the spatial center count.
 #[derive(Clone, Copy, Debug)]
 pub enum CenterCountRequest {
@@ -642,7 +615,6 @@ pub enum CenterCountRequest {
     /// Use [`default_num_centers`] but cap at `cap` to bound dense cost.
     HeuristicCapped { cap: usize },
 }
-
 
 /// Build a resource-aware plan for a spatial smooth basis.
 ///
@@ -739,7 +711,6 @@ pub fn plan_spatial_basis(
     })
 }
 
-
 pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
     if d >= 4 {
         CenterStrategy::EqualMassCovarRepresentative { num_centers }
@@ -747,7 +718,6 @@ pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> Ce
         CenterStrategy::EqualMass { num_centers }
     }
 }
-
 
 pub fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
     let strategy = if d == 1 {
@@ -765,11 +735,9 @@ pub fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrat
     CenterStrategy::Auto(Box::new(strategy))
 }
 
-
 pub const fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {
     matches!(strategy, CenterStrategy::Auto(_))
 }
-
 
 pub(crate) fn realized_center_strategy(strategy: &CenterStrategy) -> &CenterStrategy {
     match strategy {
@@ -777,7 +745,6 @@ pub(crate) fn realized_center_strategy(strategy: &CenterStrategy) -> &CenterStra
         other => other,
     }
 }
-
 
 pub fn center_strategy_kind(strategy: &CenterStrategy) -> CenterStrategyKind {
     match strategy {
@@ -793,7 +760,6 @@ pub fn center_strategy_kind(strategy: &CenterStrategy) -> CenterStrategyKind {
     }
 }
 
-
 pub fn center_strategy_num_centers(strategy: &CenterStrategy) -> Option<usize> {
     match strategy {
         CenterStrategy::Auto(inner) => center_strategy_num_centers(inner.as_ref()),
@@ -805,7 +771,6 @@ pub fn center_strategy_num_centers(strategy: &CenterStrategy) -> Option<usize> {
         CenterStrategy::UniformGrid { .. } => None,
     }
 }
-
 
 pub fn center_strategy_with_num_centers(
     strategy: &CenterStrategy,
@@ -844,7 +809,6 @@ pub fn center_strategy_with_num_centers(
     })
 }
 
-
 /// Thin-plate basis configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinPlateBasisSpec {
@@ -863,7 +827,6 @@ pub struct ThinPlateBasisSpec {
     #[serde(default)]
     pub radial_reparam: Option<Array2<f64>>,
 }
-
 
 /// Per-smooth identifiability policy for spatial (TPS / Duchon) bases.
 ///
@@ -889,7 +852,6 @@ pub enum SpatialIdentifiability {
     FrozenTransform { transform: Array2<f64> },
 }
 
-
 pub(crate) use sphere_kernels::{
     wahba_sphere_kernel_derivative_dcos_kind, wahba_sphere_kernel_from_cos_kind,
     wahba_sphere_kernel_from_cos_simd_kind, wahba_sphere_kernel_sobolev_derivative_dcos,
@@ -899,7 +861,6 @@ pub use sphere_spectral::{
     pseudo_s2_truncated_coefficients, sobolev_s2_truncated_coefficients,
     sphere_truncated_spectral_eval,
 };
-
 
 /// Matérn basis configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -941,7 +902,6 @@ pub struct MaternBasisSpec {
     pub nullspace_shrinkage_survived: Option<bool>,
 }
 
-
 /// Per-smooth identifiability policy for Matérn kernel coefficients.
 ///
 /// These constraints are geometric (center-based), so they are stable across
@@ -981,7 +941,6 @@ pub enum MaternIdentifiability {
         nullspace_shrinkage_survived: Option<bool>,
     },
 }
-
 
 /// Duchon null-space polynomial degree.
 ///
@@ -1028,7 +987,6 @@ pub enum DuchonNullspaceOrder {
     Linear,
     Degree(usize),
 }
-
 
 /// Duchon-like basis configuration with explicit low-frequency null-space
 /// control and explicit spectral power.
@@ -1078,7 +1036,6 @@ pub struct DuchonBasisSpec {
     pub boundary: OneDimensionalBoundary,
 }
 
-
 impl DuchonBasisSpec {
     /// Integer view of `power` for the existing integer-only downstream chain.
     /// Non-finite or non-integer values fall back to `0` (the integer-only
@@ -1087,7 +1044,6 @@ impl DuchonBasisSpec {
         duchon_power_to_usize(self.power)
     }
 }
-
 
 /// Convert a Duchon spectral-power `f64` into the integer view used by the
 /// closed-form code paths. Non-finite, negative, or fractional values clamp to
@@ -1103,14 +1059,12 @@ pub fn duchon_power_to_usize(power: f64) -> usize {
     rounded as usize
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DuchonOperatorPenaltySpec {
     pub mass: OperatorPenaltySpec,
     pub tension: OperatorPenaltySpec,
     pub stiffness: OperatorPenaltySpec,
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OperatorPenaltySpec {
@@ -1120,7 +1074,6 @@ pub enum OperatorPenaltySpec {
     },
     Disabled,
 }
-
 
 impl Default for DuchonOperatorPenaltySpec {
     fn default() -> Self {
@@ -1146,7 +1099,6 @@ impl Default for DuchonOperatorPenaltySpec {
         }
     }
 }
-
 
 impl DuchonOperatorPenaltySpec {
     pub fn all_disabled() -> Self {
@@ -1218,7 +1170,6 @@ impl DuchonOperatorPenaltySpec {
     }
 }
 
-
 pub fn minimum_duchon_power_for_operator_penalties(
     dim: usize,
     nullspace_order: DuchonNullspaceOrder,
@@ -1231,7 +1182,6 @@ pub fn minimum_duchon_power_for_operator_penalties(
     }
     s
 }
-
 
 /// Resolve a fully admissible Duchon `(nullspace_order, power)` pair.
 ///
@@ -1289,7 +1239,6 @@ pub fn resolve_duchon_orders(
     (nullspace, 0)
 }
 
-
 #[inline]
 pub(crate) fn duchon_next_nullspace_order(order: DuchonNullspaceOrder) -> DuchonNullspaceOrder {
     match order {
@@ -1299,7 +1248,6 @@ pub(crate) fn duchon_next_nullspace_order(order: DuchonNullspaceOrder) -> Duchon
     }
 }
 
-
 pub(crate) fn duchon_previous_nullspace_order(order: DuchonNullspaceOrder) -> DuchonNullspaceOrder {
     match order {
         DuchonNullspaceOrder::Zero => DuchonNullspaceOrder::Zero,
@@ -1308,7 +1256,6 @@ pub(crate) fn duchon_previous_nullspace_order(order: DuchonNullspaceOrder) -> Du
         DuchonNullspaceOrder::Degree(k) => DuchonNullspaceOrder::Degree(k - 1),
     }
 }
-
 
 /// Returns the maximum derivative order required by the *active* operator
 /// penalties: 2 if stiffness is Active, else 1 if tension is Active, else 0.
@@ -1332,7 +1279,6 @@ pub fn duchon_max_active_operator_derivative_order(
         0
     }
 }
-
 
 /// Metadata returned by generic basis builders.
 #[derive(Debug, Clone)]
@@ -1491,7 +1437,6 @@ pub enum BasisMetadata {
     },
 }
 
-
 /// Standardized basis build result for engine-level composition.
 #[derive(Clone)]
 pub struct BasisBuildResult {
@@ -1545,7 +1490,6 @@ pub struct BasisBuildResult {
     pub joint_null_rotation: Option<JointNullRotation>,
 }
 
-
 /// Joint-null absorption rotation, attached to a smooth's basis when the
 /// basis's joint penalty `Σ_k S_k` has a non-trivial null space.
 ///
@@ -1569,7 +1513,6 @@ pub struct JointNullRotation {
     pub joint_nullity: usize,
 }
 
-
 impl std::fmt::Debug for JointNullRotation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JointNullRotation")
@@ -1581,7 +1524,6 @@ impl std::fmt::Debug for JointNullRotation {
             .finish()
     }
 }
-
 
 impl std::fmt::Debug for BasisBuildResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1622,7 +1564,6 @@ impl std::fmt::Debug for BasisBuildResult {
     }
 }
 
-
 /// Factored tensor-product basis metadata for operator-backed downstream use.
 #[derive(Debug, Clone)]
 pub struct KroneckerFactoredBasis {
@@ -1635,7 +1576,6 @@ pub struct KroneckerFactoredBasis {
     /// Whether the system includes a global ridge (double) penalty.
     pub has_double_penalty: bool,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PenaltySource {
@@ -1659,13 +1599,11 @@ pub enum PenaltySource {
     Other(String),
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PenaltyDropReason {
     ZeroMatrix,
     NumericalRankZero,
 }
-
 
 fn default_normalization_scale() -> f64 {
     1.0
@@ -1687,7 +1625,6 @@ pub struct PenaltyInfo {
     pub kronecker_factors: Option<Vec<Array2<f64>>>,
 }
 
-
 #[derive(Clone)]
 pub struct PenaltyCandidate {
     pub matrix: Array2<f64>,
@@ -1705,7 +1642,6 @@ pub struct PenaltyCandidate {
     /// `matrix` path is available.
     pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
 }
-
 
 impl std::fmt::Debug for PenaltyCandidate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1726,7 +1662,6 @@ impl std::fmt::Debug for PenaltyCandidate {
     }
 }
 
-
 #[derive(Clone)]
 pub struct CanonicalPenaltyBlock {
     pub sym_penalty: Array2<f64>,
@@ -1743,7 +1678,6 @@ pub struct CanonicalPenaltyBlock {
     /// consumers can use matvec without rebuilding the dense Gram.
     pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
 }
-
 
 impl std::fmt::Debug for CanonicalPenaltyBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1770,7 +1704,6 @@ impl std::fmt::Debug for CanonicalPenaltyBlock {
     }
 }
 
-
 #[derive(Debug)]
 pub struct BasisPsiDerivativeResult {
     pub design_derivative: Array2<f64>,
@@ -1780,7 +1713,6 @@ pub struct BasisPsiDerivativeResult {
     /// `BasisPsiDerivativeBundle` instead.
     pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
-
 
 #[derive(Debug)]
 pub struct BasisPsiSecondDerivativeResult {
@@ -1792,7 +1724,6 @@ pub struct BasisPsiSecondDerivativeResult {
     pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
-
 #[derive(Debug)]
 pub struct BasisPsiDerivativeBundle {
     pub first: BasisPsiDerivativeResult,
@@ -1802,7 +1733,6 @@ pub struct BasisPsiDerivativeBundle {
     /// duplicate materialized/streaming operators in both derivative payloads.
     pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
-
 
 /// Per-axis psi_a derivative package for anisotropic spatial terms.
 ///
@@ -1843,14 +1773,12 @@ pub struct AnisoBasisPsiDerivatives {
     pub implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
 
-
 #[derive(Clone)]
 pub struct AnisoPenaltyCrossProvider(
     std::sync::Arc<
         dyn Fn(usize, usize) -> Result<Vec<Array2<f64>>, BasisError> + Send + Sync + 'static,
     >,
 );
-
 
 impl AnisoPenaltyCrossProvider {
     pub(crate) fn new<F>(f: F) -> Self
@@ -1865,14 +1793,12 @@ impl AnisoPenaltyCrossProvider {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Implicit derivative operator for scalable anisotropic REML gradients
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub(crate) const SPATIAL_CENTER_CENTER_MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 pub(crate) const DESIGN_CROSS_CHUNK_SIZE: usize = 1024;
-
 
 /// Determine whether implicit operators should be used based on problem size
 /// and the supplied [`ResourcePolicy`].
@@ -1902,13 +1828,11 @@ pub fn should_use_implicit_operators_with_policy(
     dense_bytes > policy.max_single_materialization_bytes
 }
 
-
 pub(crate) fn implicit_radial_cache_bytes(n: usize, k: usize, n_axes: usize) -> usize {
     n.saturating_mul(k)
         .saturating_mul(n_axes.saturating_add(3))
         .saturating_mul(8)
 }
-
 
 pub(crate) fn should_cache_implicit_radial_components(
     n: usize,
@@ -1918,7 +1842,6 @@ pub(crate) fn should_cache_implicit_radial_components(
 ) -> bool {
     implicit_radial_cache_bytes(n, k, n_axes) <= policy.max_operator_cache_bytes
 }
-
 
 pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usize) {
     let first = dense_design_bytes(n, p).saturating_mul(d_pc);
@@ -1961,7 +1884,6 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
     }
 }
 
-
 pub fn assert_spatial_centers_below_large_scale_cap(
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
@@ -1992,12 +1914,10 @@ pub fn assert_spatial_centers_below_large_scale_cap(
     Ok(())
 }
 
-
 pub(crate) fn dense_design_bytes(n: usize, p: usize) -> usize {
     n.saturating_mul(p)
         .saturating_mul(std::mem::size_of::<f64>())
 }
-
 
 pub(crate) fn should_use_lazy_spatial_design(
     n: usize,
@@ -2006,7 +1926,6 @@ pub(crate) fn should_use_lazy_spatial_design(
 ) -> bool {
     dense_design_bytes(n, p) > policy.max_single_materialization_bytes
 }
-
 
 pub(crate) fn wrap_dense_design_with_transform(
     design: DesignMatrix,
@@ -2027,7 +1946,6 @@ pub(crate) fn wrap_dense_design_with_transform(
         ))),
     }
 }
-
 
 /// Single-pass `(Bᵀ(W·C), BᵀB)` accumulation over the streamed design.
 ///
@@ -2083,8 +2001,9 @@ pub(crate) fn design_cross_and_gram(
     Ok((cross, gram))
 }
 
-
-pub(crate) fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn positive_spectral_whitener_from_gram(
+    gram: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
     // Inverse-square-root for the positive part of `gram`. Eigenvalues at or
     // below the relative rank tolerance `α·ε·n·max_eval` are *dropped*: the
     // returned whitener has shape `(n × keep)` where `keep` counts strictly
@@ -2134,7 +2053,6 @@ pub(crate) fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result
     Ok(fast_ab(&kept_vectors, &inv_sqrt))
 }
 
-
 pub(crate) fn stabilized_orthogonality_transform_from_gram(
     gram: &Array2<f64>,
     transform: &Array2<f64>,
@@ -2146,7 +2064,6 @@ pub(crate) fn stabilized_orthogonality_transform_from_gram(
     let whitening = positive_spectral_whitener_from_gram(&constrained_gram)?;
     Ok(fast_ab(transform, &whitening))
 }
-
 
 pub(crate) fn orthogonality_transform_from_cross_and_gram(
     constraint_cross: &Array2<f64>,
@@ -2186,7 +2103,6 @@ pub(crate) fn orthogonality_transform_from_cross_and_gram(
     // to B's column space and shouldn't appear in the reparameterized basis.
     stabilized_orthogonality_transform_from_gram(gram, &transform_raw)
 }
-
 
 pub(crate) fn orthogonality_transform_for_design(
     design: &DesignMatrix,

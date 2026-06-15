@@ -52,7 +52,6 @@ pub trait SaeKroneckerRow {
     fn apply_l_t(&self, row: usize, v: &[f64], u_out: &mut [f64]);
 }
 
-
 /// Per-row Kronecker data for the SAE-manifold beta Jacobian.
 ///
 /// Each row `i` stores:
@@ -78,7 +77,6 @@ pub struct SaeKroneckerRows {
     pub(crate) local_jac: Vec<Vec<f64>>,
 }
 
-
 impl SaeKroneckerRows {
     /// Build from per-row data collected during `assemble_arrow_schur`. The
     /// row count is implicit in `a_phi.len()` and `local_jac.len()`; the
@@ -98,7 +96,6 @@ impl SaeKroneckerRows {
         }
     }
 }
-
 
 impl SaeKroneckerRow for SaeKroneckerRows {
     fn apply_jbeta(&self, row: usize, x_beta: &[f64], u_out: &mut [f64]) {

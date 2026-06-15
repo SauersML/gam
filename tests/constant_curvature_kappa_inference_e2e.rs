@@ -264,7 +264,10 @@ fn vp_grid_identifies_planted_kappa_sign() {
             v_max = v_max.max(v);
         }
         let argmin = best.1;
-        log::debug!("  argmin_κ V_p = {argmin:+.2}  (V_p range {:.4})", v_max - v_min);
+        log::debug!(
+            "  argmin_κ V_p = {argmin:+.2}  (V_p range {:.4})",
+            v_max - v_min
+        );
         // Identification: for a CURVED truth the criterion's minimiser must have
         // the same sign as the planted curvature, NOT rail to the chart bound.
         // For a FLAT truth there is no curvature signal, so V_p is essentially

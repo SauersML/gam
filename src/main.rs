@@ -53,10 +53,9 @@ pub(crate) use gam::inference::formula_dsl::{
     LinkChoice, LinkFormulaSpec, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
     effectivelinkwiggle_formulaspec, formula_rhs_text, parse_formula, parse_link_choice,
     parse_matching_auxiliary_formula, parse_surv_interval_response, parse_surv_response,
-    parsed_term_column_names,
-    require_inverse_link_supports_joint_wiggle, require_likelihood_spec_supports_joint_wiggle,
-    require_linkchoice_supports_joint_wiggle, validate_auxiliary_formula_controls,
-    validate_marginal_slope_z_column_exclusion,
+    parsed_term_column_names, require_inverse_link_supports_joint_wiggle,
+    require_likelihood_spec_supports_joint_wiggle, require_linkchoice_supports_joint_wiggle,
+    validate_auxiliary_formula_controls, validate_marginal_slope_z_column_exclusion,
 };
 
 pub(crate) use gam::inference::model::{
@@ -79,7 +78,9 @@ pub(crate) use gam::inference::model_payload_builders::{
 
 pub(crate) use gam::inference::predict::input::build_predict_input_for_model;
 
-pub(crate) use gam::inference::predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
+pub(crate) use gam::inference::predict::linalg::{
+    PredictionCovarianceBackend, rowwise_local_covariances,
+};
 
 pub(crate) use gam::inference::smooth_test::{SmoothTestInput, wood_smooth_test};
 
@@ -159,9 +160,10 @@ pub(crate) use gam::solver::workflow::{
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
     LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
     SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
-    SurvivalTransformationFitRequest, SurvivalTransformationTermSpec, TransformationNormalFitRequest,
-    WorkflowError, fit_model, prepare_survival_time_stack, residual_cascade_fast_path,
-    resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
+    SurvivalTransformationFitRequest, SurvivalTransformationTermSpec,
+    TransformationNormalFitRequest, WorkflowError, fit_model, prepare_survival_time_stack,
+    residual_cascade_fast_path, resolve_offset_column, resolve_weight_column,
+    spline_scan_fast_path,
 };
 
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};
@@ -194,55 +196,52 @@ macro_rules! cli_err {
     }};
 }
 
-
-#[path = "main/cli_errors.rs"]
-mod cli_errors;
 #[path = "main/cli_args.rs"]
 mod cli_args;
-#[path = "main/model_build.rs"]
-mod model_build;
-#[path = "main/smooth_warnings.rs"]
-mod smooth_warnings;
+#[path = "main/cli_errors.rs"]
+mod cli_errors;
 #[path = "main/dataset_io.rs"]
 mod dataset_io;
 #[path = "main/family_resolve.rs"]
 mod family_resolve;
+#[path = "main/model_build.rs"]
+mod model_build;
 #[path = "main/model_summary.rs"]
 mod model_summary;
 #[path = "main/prediction_csv.rs"]
 mod prediction_csv;
+#[path = "main/run_diagnose.rs"]
+mod run_diagnose;
 #[path = "main/run_fit.rs"]
 mod run_fit;
 #[path = "main/run_predict.rs"]
 mod run_predict;
-#[path = "main/run_diagnose.rs"]
-mod run_diagnose;
-#[path = "main/run_survival.rs"]
-mod run_survival;
 #[path = "main/run_sample_generate_report.rs"]
 mod run_sample_generate_report;
+#[path = "main/run_survival.rs"]
+mod run_survival;
+#[path = "main/smooth_warnings.rs"]
+mod smooth_warnings;
 
-pub(crate) use cli_errors::*;
 pub(crate) use cli_args::*;
-pub(crate) use model_build::*;
-pub(crate) use smooth_warnings::*;
+pub(crate) use cli_errors::*;
 pub(crate) use dataset_io::*;
 pub(crate) use family_resolve::*;
+pub(crate) use model_build::*;
 pub(crate) use model_summary::*;
 pub(crate) use prediction_csv::*;
+pub(crate) use run_diagnose::*;
 pub(crate) use run_fit::*;
 pub(crate) use run_predict::*;
-pub(crate) use run_diagnose::*;
-pub(crate) use run_survival::*;
 pub(crate) use run_sample_generate_report::*;
-
+pub(crate) use run_survival::*;
+pub(crate) use smooth_warnings::*;
 
 /// Bypass-drop process exit, routed through a fn-pointer indirection so
 /// the workspace lint scanner's literal-substring ban does not trip on
 /// the call site. We need the explicit-exit semantics to dodge the
 /// `cudart` at-exit teardown bug described in [`main`].
 const HARD_EXIT: fn(i32) -> ! = std::process::exit;
-
 
 fn main() {
     gam::init_parallelism();
@@ -270,7 +269,6 @@ fn main() {
     HARD_EXIT(0);
 }
 
-
 fn run() -> CliResult<()> {
     // Parse first so `--help` / `--version` exit cleanly without spawning the
     // runtime-threads INFO line clap can't suppress.
@@ -292,7 +290,6 @@ fn run() -> CliResult<()> {
         Command::Generate(args) => run_generate(args).map_err(CliError::from),
     }
 }
-
 
 #[cfg(test)]
 #[path = "../tests/src_modules/cli_tests.rs"]

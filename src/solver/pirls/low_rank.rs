@@ -15,7 +15,6 @@ use super::*;
 
 use crate::linalg::low_rank_weight::LowRankWeight;
 
-
 /// `Xᵀ W X` for a low-rank-corrected weight, where the diagonal part is
 /// assembled by the **existing** signed-Gram kernels and the rank-r
 /// correction is added in place via [`LowRankWeight::add_low_rank_xtwx_correction`].
@@ -43,7 +42,6 @@ pub fn compute_xtwx_low_rank(
     Ok(xtwx)
 }
 
-
 /// `Xᵀ W y` for a low-rank-corrected weight. Used in the right-hand side
 /// of the weighted-LS normal equation `(XᵀWX + S) β = XᵀWz`. Rank-0 fast
 /// path coincides with `design.compute_xtwy(&d, &y)`.
@@ -56,7 +54,6 @@ pub fn compute_xtwy_low_rank(
         .xtw_y(design, y.view())
         .map_err(EstimationError::InvalidInput)
 }
-
 
 /// Dense multi-output block Fisher assembly for latent / coupled GLM fits.
 ///
@@ -168,7 +165,6 @@ pub fn dense_block_xtwx(
     Ok(out)
 }
 
-
 /// Dense multi-output block right-hand side `X^T W Y`, using the same
 /// output-major coefficient ordering as [`dense_block_xtwx`].
 pub fn dense_block_xtwy(
@@ -223,7 +219,6 @@ pub fn dense_block_xtwy(
     Ok(out)
 }
 
-
 /// Build the small `r × r` capacitance for the parameter-space Woodbury
 /// solve `(A + Û V̂ᵀ)⁻¹ b`, where `A = XᵀDX + S` has already been factored
 /// by the caller and `a_inv_uhat = A⁻¹ Û` came out of `r` back-solves
@@ -236,7 +231,6 @@ pub fn woodbury_gram_capacitance(
 ) -> Result<Array2<f64>, EstimationError> {
     LowRankWeight::gram_capacitance(a_inv_uhat, vhat).map_err(EstimationError::InvalidInput)
 }
-
 
 #[cfg(test)]
 mod low_rank_weight_pirls_tests {

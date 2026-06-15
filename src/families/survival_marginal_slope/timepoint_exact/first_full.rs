@@ -572,6 +572,4 @@ impl SurvivalMarginalSlopeFamily {
             d_uv,
         })
     }
-
 }
-

@@ -2665,7 +2665,6 @@ impl SurvivalMarginalSlopeFamily {
     }
 }
 
-
 // ── CustomFamily impl ─────────────────────────────────────────────────
 
 pub(crate) fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, String> {
@@ -2679,7 +2678,6 @@ pub(crate) fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Res
     let h0 = Array1::from_vec(vec![probe]);
     Ok(monotone_wiggle_basis_with_derivative_order(h0.view(), knots, degree, 0)?.ncols())
 }
-
 
 pub(crate) fn smgs_deleted_required_channel_reason(
     p_time: usize,
@@ -2699,6 +2697,3 @@ pub(crate) fn smgs_deleted_required_channel_reason(
         None
     }
 }
-
-
-

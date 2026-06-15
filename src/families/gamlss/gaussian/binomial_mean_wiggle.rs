@@ -707,10 +707,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         Ok(beta)
     }
 
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -843,10 +840,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn inner_coefficient_hessian_hvp_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         self.dense_eta_design_fromspecs(specs).is_ok()
     }
 

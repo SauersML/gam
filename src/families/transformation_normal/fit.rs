@@ -10,13 +10,11 @@ pub(crate) struct TransformationExactGeometryCache {
     pub(crate) derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
 }
 
-
 #[derive(Clone)]
 pub(crate) struct TransformationExactWarmStart {
     pub(crate) theta: Array1<f64>,
     pub(crate) warm_start: CustomFamilyWarmStart,
 }
-
 
 impl TransformationExactWarmStart {
     pub(crate) fn is_compatible_with(&self, theta: &Array1<f64>, rho: &Array1<f64>) -> bool {
@@ -32,9 +30,11 @@ impl TransformationExactWarmStart {
     }
 }
 
-
 impl TransformationExactGeometryCache {
-    pub(crate) fn update_initial_log_lambdas(&mut self, log_lambdas: &Array1<f64>) -> Result<(), String> {
+    pub(crate) fn update_initial_log_lambdas(
+        &mut self,
+        log_lambdas: &Array1<f64>,
+    ) -> Result<(), String> {
         let spec = self
             .blocks
             .first_mut()
@@ -53,7 +53,6 @@ impl TransformationExactGeometryCache {
         Ok(())
     }
 }
-
 
 pub(crate) fn transformation_spatial_geometry_key(
     spec: &TermCollectionSpec,
@@ -92,7 +91,6 @@ pub(crate) fn transformation_spatial_geometry_key(
     Ok(key)
 }
 
-
 // ---------------------------------------------------------------------------
 // Top-level fit function
 // ---------------------------------------------------------------------------
@@ -106,7 +104,6 @@ pub struct TransformationNormalFitResult {
     pub covariate_design: TermCollectionDesign,
     pub score_calibration: TransformationScoreCalibration,
 }
-
 
 /// Fit a conditional transformation model with N-block spatial length-scale
 /// optimization over the covariate side.

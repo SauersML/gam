@@ -20,7 +20,6 @@ pub struct ArrowRowBlock {
     pub gt: Array1<f64>,
 }
 
-
 impl ArrowRowBlock {
     /// Allocate one BA point-block row: local latent Hessian, point-camera
     /// cross block, and point gradient.
@@ -40,7 +39,6 @@ impl ArrowRowBlock {
         }
     }
 }
-
 
 /// Bordered (t, β) Newton system with arrow structure.
 ///
@@ -197,7 +195,6 @@ pub struct ArrowSchurSystem {
     pub ibp_cross_row: Option<IbpCrossRowSource>,
 }
 
-
 impl Clone for ArrowSchurSystem {
     fn clone(&self) -> Self {
         Self {
@@ -226,7 +223,6 @@ impl Clone for ArrowSchurSystem {
     }
 }
 
-
 /// A captured cross-row Psi-tier analytic penalty: the penalty kind plus the
 /// global-ρ slice (`rho_local`) it was registered with.
 ///
@@ -250,7 +246,6 @@ pub struct CrossRowLatentPenalty {
     /// current iterate.
     pub target_t: Array1<f64>,
 }
-
 
 /// Exact cross-row low-rank IBP source (#1038): the per-column rank-one Hessian
 /// terms `H_(i,k),(j,k) = d_k·z'_ik·z'_jk` (for ALL `i,j`, including the `i=j`
@@ -289,7 +284,6 @@ pub struct IbpCrossRowSource {
     pub entries: Vec<(usize, usize, f64)>,
 }
 
-
 impl IbpCrossRowSource {
     /// Build the dense `delta_t_len × R` factor `U` (each column supported on
     /// its atom's per-row logit slots) from the sparse entry list.
@@ -313,7 +307,6 @@ impl IbpCrossRowSource {
         down
     }
 }
-
 
 impl ArrowSchurSystem {
     /// Allocate an empty BA reduced-camera-system instance sized
@@ -1254,7 +1247,6 @@ impl ArrowSchurSystem {
     }
 }
 
-
 /// Chunked Schur assembler that never retains all row cross-blocks.
 pub struct StreamingArrowSchur {
     pub n_rows: usize,
@@ -1304,7 +1296,6 @@ pub struct StreamingArrowSchur {
     pub(crate) ibp_cross_row_active: bool,
 }
 
-
 impl std::fmt::Debug for StreamingArrowSchur {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamingArrowSchur")
@@ -1315,7 +1306,6 @@ impl std::fmt::Debug for StreamingArrowSchur {
             .finish_non_exhaustive()
     }
 }
-
 
 impl StreamingArrowSchur {
     #[must_use]
@@ -1719,7 +1709,11 @@ impl StreamingArrowSchur {
         Ok(delta_t)
     }
 
-    pub(crate) fn validate_row(&self, row_idx: usize, row: &ArrowRowBlock) -> Result<(), ArrowSchurError> {
+    pub(crate) fn validate_row(
+        &self,
+        row_idx: usize,
+        row: &ArrowRowBlock,
+    ) -> Result<(), ArrowSchurError> {
         let expected_di = if row_idx < self.row_dims.len() {
             self.row_dims[row_idx]
         } else {
@@ -1756,7 +1750,6 @@ impl StreamingArrowSchur {
         Ok::<(), _>(())
     }
 }
-
 
 pub(crate) fn apply_analytic_penalty<S, G, D, P, H>(
     penalty: &AnalyticPenaltyKind,
@@ -1808,11 +1801,9 @@ pub(crate) fn apply_analytic_penalty<S, G, D, P, H>(
     }
 }
 
-
 pub(crate) fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool {
     penalty.is_row_block_diagonal()
 }
-
 
 /// Per-row + Schur Cholesky factor cache produced by
 /// [`solve_arrow_newton_step_with_options`]. Consumed downstream by the IFT warm-start
@@ -1826,7 +1817,6 @@ pub struct ArrowFactorSlab {
     pub(crate) offsets: Arc<[usize]>,
     pub(crate) dims: Arc<[usize]>,
 }
-
 
 impl ArrowFactorSlab {
     pub fn from_blocks(blocks: Vec<Array2<f64>>) -> Self {
@@ -1868,7 +1858,6 @@ impl ArrowFactorSlab {
     }
 }
 
-
 impl std::fmt::Debug for ArrowFactorSlab {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrowFactorSlab")
@@ -1878,13 +1867,11 @@ impl std::fmt::Debug for ArrowFactorSlab {
     }
 }
 
-
 #[derive(Clone)]
 pub enum ArrowUndampedFactors {
     SameAsDamped,
     Owned(ArrowFactorSlab),
 }
-
 
 impl std::fmt::Debug for ArrowUndampedFactors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1894,7 +1881,6 @@ impl std::fmt::Debug for ArrowUndampedFactors {
         }
     }
 }
-
 
 /// Apply `H_tβ^(row) · x` for one row, writing into `out` (length `d`).
 ///
@@ -1925,7 +1911,6 @@ pub(crate) fn sys_htbeta_apply_row(
         }
     }
 }
-
 
 /// Accumulate `H_βt^(row) · v` into `out` (length `k`).
 ///
@@ -1958,7 +1943,6 @@ pub(crate) fn sys_htbeta_accumulate_transpose(
         }
     }
 }
-
 
 /// Materialize the dense `(di, k)` cross-block for one row.
 ///
@@ -2000,7 +1984,6 @@ pub(crate) fn sys_htbeta_materialize_row(
     Ok(mat)
 }
 
-
 /// Probe each column of `H_tβ^(row)` by applying the operator to `e_a` and
 /// dotting the result with `v`.  Accumulates into `out[a]` for all `a in 0..k`.
 ///
@@ -2028,7 +2011,6 @@ pub(crate) fn htbeta_probe_transpose(
     }
 }
 
-
 #[derive(Clone)]
 pub enum ArrowHtbetaCache {
     Dense {
@@ -2043,7 +2025,6 @@ pub enum ArrowHtbetaCache {
         estimated_bytes: usize,
     },
 }
-
 
 impl std::fmt::Debug for ArrowHtbetaCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2069,7 +2050,6 @@ impl std::fmt::Debug for ArrowHtbetaCache {
         }
     }
 }
-
 
 impl ArrowHtbetaCache {
     pub(crate) fn is_available(&self) -> bool {
@@ -2162,7 +2142,6 @@ impl ArrowHtbetaCache {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct ArrowFactorCache {
     /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
@@ -2238,7 +2217,6 @@ pub struct ArrowFactorCache {
     pub cross_row_woodbury: Option<CrossRowWoodbury>,
 }
 
-
 /// Materialized exact cross-row IBP Woodbury correction (#1038), built against
 /// an [`ArrowFactorCache`] whose per-row factors are the NO-SELF base `H₀'`.
 ///
@@ -2275,7 +2253,6 @@ pub struct CrossRowWoodbury {
     pub entries: Vec<(usize, usize, f64)>,
 }
 
-
 /// Dense partial-pivot LU of a small square matrix. Used for the cross-row IBP
 /// capacitance `C = I_R + D·M`, which is generally non-symmetric and possibly
 /// indefinite (`d_k = w·s'_k` is not sign-definite), so a Cholesky/LDLᵀ is
@@ -2290,7 +2267,6 @@ pub struct SmallLu {
     /// Sign of the permutation (`±1`), folded into the determinant.
     pub(crate) perm_sign: f64,
 }
-
 
 /// Partial-pivot LU factorization of a small dense square matrix `a` (`R × R`).
 /// Returns `None` only when a pivot is exactly zero (singular `C`).
@@ -2350,7 +2326,6 @@ pub(crate) fn small_lu_factor(a: &Array2<f64>) -> Option<SmallLu> {
     }
     Some(SmallLu { lu, piv, perm_sign })
 }
-
 
 impl SmallLu {
     pub(crate) fn dim(&self) -> usize {
@@ -2415,7 +2390,6 @@ impl SmallLu {
         }
     }
 }
-
 
 impl CrossRowWoodbury {
     /// Build the exact rank-`R` cross-row Woodbury carrier from the IBP source
@@ -2530,14 +2504,14 @@ impl CrossRowWoodbury {
         diag: &mut Array1<f64>,
     ) -> Result<(), ArrowSchurError> {
         let r = self.d.len();
-        let cinv_d = self.capacitance_inv_times_d().ok_or_else(|| {
-            ArrowSchurError::SchurFactorFailed {
-                reason: "cross-row Woodbury capacitance solve produced a non-finite \
+        let cinv_d =
+            self.capacitance_inv_times_d()
+                .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                    reason: "cross-row Woodbury capacitance solve produced a non-finite \
                          C⁻¹D for the inverse-diagonal correction (#1038): \
                          singular/ill-conditioned cross-row capacitance"
-                    .to_string(),
-            }
-        })?;
+                        .to_string(),
+                })?;
         let total_len = self.h0inv_u.nrows();
         for g in 0..total_len {
             let mut acc = 0.0_f64;
@@ -2600,14 +2574,15 @@ impl CrossRowWoodbury {
         // q = C⁻¹ p. A non-finite solve is a singular/ill-conditioned cross-row
         // capacitance (#1038): fail loudly rather than write `NaN` into the
         // Newton step / adjoint solve.
-        let q = self.capacitance_lu.solve(&p).ok_or_else(|| {
-            ArrowSchurError::SchurFactorFailed {
-                reason: "cross-row Woodbury capacitance solve produced a non-finite \
+        let q =
+            self.capacitance_lu
+                .solve(&p)
+                .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                    reason: "cross-row Woodbury capacitance solve produced a non-finite \
                          C⁻¹p for the inverse correction (#1038): \
                          singular/ill-conditioned cross-row capacitance"
-                    .to_string(),
-            }
-        })?;
+                        .to_string(),
+                })?;
         // u_t -= (H₀'⁻¹U)_t · q.
         for g in 0..u_t.len() {
             let mut acc = 0.0_f64;
@@ -2628,14 +2603,12 @@ impl CrossRowWoodbury {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ArrowFactorMinPivot {
     pub min_row_pivot: Option<f64>,
     pub min_schur_pivot: Option<f64>,
     pub min_pivot: Option<f64>,
 }
-
 
 impl ArrowFactorMinPivot {
     pub(crate) fn combine(row: Option<f64>, schur: Option<f64>) -> Self {
@@ -2653,7 +2626,6 @@ impl ArrowFactorMinPivot {
     }
 }
 
-
 pub(crate) fn lower_cholesky_min_pivot(factor: ArrayView2<'_, f64>) -> Option<f64> {
     let width = factor.nrows().min(factor.ncols());
     let mut out = None;
@@ -2667,7 +2639,6 @@ pub(crate) fn lower_cholesky_min_pivot(factor: ArrayView2<'_, f64>) -> Option<f6
     out
 }
 
-
 pub(crate) fn lower_cholesky_max_pivot(factor: ArrayView2<'_, f64>) -> Option<f64> {
     let width = factor.nrows().min(factor.ncols());
     let mut out = None;
@@ -2680,7 +2651,6 @@ pub(crate) fn lower_cholesky_max_pivot(factor: ArrayView2<'_, f64>) -> Option<f6
     }
     out
 }
-
 
 /// Smallest cached Cholesky pivot for row blocks and the dense Schur factor.
 ///
@@ -2703,7 +2673,6 @@ pub fn arrow_factor_min_pivot(cache: &ArrowFactorCache) -> ArrowFactorMinPivot {
         .and_then(|factor| lower_cholesky_min_pivot(factor.view()));
     ArrowFactorMinPivot::combine(min_row_pivot, min_schur_pivot)
 }
-
 
 /// Largest cached Cholesky pivot across the row blocks and the dense Schur
 /// factor (Hessian scale, i.e. squared lower-factor diagonal). This is the
@@ -2731,7 +2700,6 @@ pub fn arrow_factor_max_pivot(cache: &ArrowFactorCache) -> Option<f64> {
     }
     max_pivot
 }
-
 
 impl ArrowFactorCache {
     pub fn n_rows(&self) -> usize {

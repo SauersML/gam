@@ -1,6 +1,5 @@
 use super::*;
 
-
 pub fn build_duchon_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -293,7 +292,6 @@ pub fn build_duchon_basiswithworkspace(
     })
 }
 
-
 /// Materialise the polynomial null-space block for a Duchon basis.
 ///
 /// Returns an `(n, C(d+r, r))` matrix whose columns are all monomials of total
@@ -332,7 +330,6 @@ pub(crate) fn polynomial_block_from_order(
     }
 }
 
-
 pub fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
     fn recurse(
         axis: usize,
@@ -363,13 +360,14 @@ pub fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<
     out
 }
 
-
 pub fn duchon_nullspace_dimension(dimension: usize, max_total_degree: usize) -> usize {
     monomial_exponents(dimension, max_total_degree).len()
 }
 
-
-pub(crate) fn monomial_basis_block(points: ArrayView2<'_, f64>, max_total_degree: usize) -> Array2<f64> {
+pub(crate) fn monomial_basis_block(
+    points: ArrayView2<'_, f64>,
+    max_total_degree: usize,
+) -> Array2<f64> {
     let n = points.nrows();
     let exponents = monomial_exponents(points.ncols(), max_total_degree);
     let mut block = Array2::<f64>::zeros((n, exponents.len()));
@@ -388,22 +386,18 @@ pub(crate) fn monomial_basis_block(points: ArrayView2<'_, f64>, max_total_degree
     block
 }
 
-
 #[inline(always)]
 pub(crate) fn thin_plate_polynomial_degree(dimension: usize) -> usize {
     thin_plate_penalty_order(dimension).saturating_sub(1)
 }
 
-
 pub(crate) fn thin_plate_polynomial_block(points: ArrayView2<'_, f64>) -> Array2<f64> {
     monomial_basis_block(points, thin_plate_polynomial_degree(points.ncols()))
 }
 
-
 pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
     monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
 }
-
 
 pub(crate) fn kernel_constraint_nullspace_from_matrix(
     constraint_matrix: ArrayView2<'_, f64>,
@@ -419,7 +413,6 @@ pub(crate) fn kernel_constraint_nullspace_from_matrix(
         .map_err(BasisError::LinalgError)?;
     Ok(z)
 }
-
 
 /// Deterministically selects thin-plate knots via farthest-point sampling.
 ///
@@ -530,9 +523,11 @@ pub fn select_thin_plate_knots(
     Ok(knots)
 }
 
-
 #[inline(always)]
-pub(crate) fn thin_plate_kernel_from_dist2(dist2: f64, dimension: usize) -> Result<f64, BasisError> {
+pub(crate) fn thin_plate_kernel_from_dist2(
+    dist2: f64,
+    dimension: usize,
+) -> Result<f64, BasisError> {
     if !dist2.is_finite() || dist2 < 0.0 {
         crate::bail_invalid_basis!("thin-plate kernel distance must be finite and non-negative");
     }
@@ -559,7 +554,6 @@ pub(crate) fn thin_plate_kernel_from_dist2(dist2: f64, dimension: usize) -> Resu
     }
 }
 
-
 #[inline(always)]
 pub(crate) fn thin_plate_penalty_order(dimension: usize) -> usize {
     match dimension {
@@ -568,7 +562,6 @@ pub(crate) fn thin_plate_penalty_order(dimension: usize) -> usize {
     }
 }
 
-
 /// True when canonical TPS is mathematically infeasible at this (d, k) — the
 /// polynomial nullspace P(C) has more columns than centers, so the side
 /// constraint `P(C)^T α = 0` is overdetermined and the basis collapses.
@@ -576,7 +569,6 @@ pub(crate) fn thin_plate_penalty_order(dimension: usize) -> usize {
 pub(crate) fn d_canonical_tps_infeasible(dimension: usize, num_centers: usize) -> bool {
     num_centers < thin_plate_polynomial_basis_dimension(dimension)
 }
-
 
 /// Pick Duchon parameters for the TPS auto-promotion at infeasible (d, k).
 /// Returns `Some((nullspace_order, power))` when a hybrid-Duchon spec exists
@@ -614,7 +606,6 @@ pub(crate) fn duchon_thin_plate_fallback_params(
     None
 }
 
-
 /// Length scale at which the auto-promoted hybrid-Duchon kernel is well
 /// conditioned: the typical separation between centers.
 ///
@@ -646,7 +637,6 @@ pub(crate) fn hybrid_duchon_promotion_length_scale(
         }
     }
 }
-
 
 #[inline(always)]
 pub(crate) fn thin_plate_kernel_triplet_from_scaled_distance(
@@ -682,7 +672,6 @@ pub(crate) fn thin_plate_kernel_triplet_from_scaled_distance(
         ),
     }
 }
-
 
 #[inline(always)]
 pub(crate) fn thin_plate_kernel_psi_triplet_from_distance(
@@ -720,7 +709,6 @@ pub(crate) fn thin_plate_kernel_psi_triplet_from_distance(
     Ok((value, psi, psi_psi))
 }
 
-
 /// Creates a thin-plate regression spline basis from data and knot locations.
 ///
 /// # Arguments
@@ -741,7 +729,6 @@ pub fn create_thin_plate_spline_basis(
     create_thin_plate_spline_basiswithworkspace(data, knots, &mut workspace)
 }
 
-
 pub fn create_thin_plate_spline_basiswithworkspace(
     data: ArrayView2<f64>,
     knots: ArrayView2<f64>,
@@ -749,7 +736,6 @@ pub fn create_thin_plate_spline_basiswithworkspace(
 ) -> Result<ThinPlateSplineBasis, BasisError> {
     create_thin_plate_spline_basis_scaledwithworkspace(data, knots, 1.0, None, workspace)
 }
-
 
 pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
     data: ArrayView2<f64>,
@@ -924,7 +910,6 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
     })
 }
 
-
 pub(crate) fn active_thin_plate_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     primary_derivative: &Array2<f64>,
@@ -943,7 +928,6 @@ pub(crate) fn active_thin_plate_penalty_derivatives(
         })
         .collect()
 }
-
 
 // The dense per-pair ThinPlate ψ-derivative builder used to live here. It has
 // been replaced by `build_thin_plate_scalar_design_psi_derivatives`, which
@@ -1168,7 +1152,6 @@ pub(crate) fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     Ok((s_psi_out, s_psi_psi_out))
 }
 
-
 /// Build the design ψ-derivatives for a Thin-Plate Spline term via the shared
 /// scalar streaming infrastructure that Duchon already uses at large scale.
 ///
@@ -1220,7 +1203,6 @@ pub(crate) fn build_thin_plate_scalar_design_psi_derivatives(
     )
 }
 
-
 pub fn build_thin_plate_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
@@ -1228,7 +1210,6 @@ pub fn build_thin_plate_basis_log_kappa_derivative(
     let mut workspace = BasisWorkspace::default();
     build_thin_plate_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1241,7 +1222,6 @@ pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
     Ok(bundle.first)
 }
 
-
 pub fn build_thin_plate_basis_log_kappa_derivatives(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
@@ -1249,7 +1229,6 @@ pub fn build_thin_plate_basis_log_kappa_derivatives(
     let mut workspace = BasisWorkspace::default();
     build_thin_plate_basis_log_kappa_derivativeswithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1311,7 +1290,6 @@ pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
     })
 }
 
-
 pub fn build_thin_plate_basis_log_kappasecond_derivative(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
@@ -1319,7 +1297,6 @@ pub fn build_thin_plate_basis_log_kappasecond_derivative(
     let mut workspace = BasisWorkspace::default();
     build_thin_plate_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
@@ -1332,7 +1309,6 @@ pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
     Ok(bundle.second)
 }
 
-
 /// High-level TPS constructor: selects knots from data, then builds basis+penalty.
 pub fn create_thin_plate_spline_basis_with_knot_count(
     data: ArrayView2<f64>,
@@ -1341,7 +1317,6 @@ pub fn create_thin_plate_spline_basis_with_knot_count(
     let mut workspace = BasisWorkspace::default();
     create_thin_plate_spline_basis_with_knot_count_andworkspace(data, num_knots, &mut workspace)
 }
-
 
 pub fn create_thin_plate_spline_basis_with_knot_count_andworkspace(
     data: ArrayView2<f64>,
@@ -1352,7 +1327,6 @@ pub fn create_thin_plate_spline_basis_with_knot_count_andworkspace(
     let basis = create_thin_plate_spline_basiswithworkspace(data, knots.view(), workspace)?;
     Ok((basis, knots))
 }
-
 
 /// Applies a sum-to-zero constraint to a basis matrix for model identifiability.
 ///
@@ -1419,7 +1393,6 @@ pub fn apply_sum_to_zero_constraint(
     let constrained = fast_ab(&basis_matrix, &z);
     Ok((constrained, z))
 }
-
 
 /// Build a sum-to-zero reparametrization for a sparse basis.
 ///
@@ -1529,7 +1502,6 @@ pub fn apply_sum_to_zero_constraint_sparse(
     Ok((constrained, z))
 }
 
-
 /// Reparameterizes a basis matrix so its columns are orthogonal (with optional weights)
 /// to a supplied constraint matrix.
 ///
@@ -1594,7 +1566,6 @@ pub fn applyweighted_orthogonality_constraint(
     let basis_orthonormal = fast_ab(&basis_matrix, &transform);
     Ok((basis_orthonormal, transform))
 }
-
 
 /// Compute Greville abscissae for a B-spline basis.
 ///
@@ -1663,7 +1634,6 @@ pub fn compute_greville_abscissae(
 
     Ok(g)
 }
-
 
 /// Compute the constraint transform Z using Greville abscissae (geometric constraints).
 ///
@@ -1756,7 +1726,6 @@ pub fn compute_geometric_constraint_transform(
     Ok((z, s_constrained))
 }
 
-
 /// Result of auto-deriving a clamped B-spline knot vector from 1-D data.
 ///
 /// The `degree` / `num_internal_knots` fields report the **effective** values
@@ -1775,7 +1744,6 @@ pub struct AutoBSplineKnots {
     pub num_internal_knots: usize,
     pub shrunk: bool,
 }
-
 
 /// Build a clamped B-spline full knot vector from 1-D data.
 ///
@@ -1814,7 +1782,6 @@ pub fn auto_knot_vector_1d_quantile(
         shrunk,
     })
 }
-
 
 /// Build a clamped full B-spline knot vector from explicit *internal* knot
 /// positions (mgcv `knots=` semantics).
@@ -1883,7 +1850,6 @@ pub fn clamped_knot_vector_from_internal_positions(
     }
     Ok(Array::from_vec(knots))
 }
-
 
 /// Place `num_centers` Duchon centers on 1-D data via the equal-mass strategy.
 ///

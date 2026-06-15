@@ -84,7 +84,6 @@ use crate::types::{
     ResponseColumnKind, ResponseFamily, SasLinkSpec, StandardLink, WigglePenaltyConfig,
 };
 
-
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
 use serde_json::Value as JsonValue;
@@ -142,14 +141,14 @@ use crate::term_builder::{
 /// identical for every caller.
 pub mod descriptors;
 
-mod error;
-mod request;
-mod fit;
 mod entry;
+mod error;
+mod fit;
 mod materialize;
+mod request;
 
-pub use error::*;
-pub use request::*;
-pub(crate) use fit::*;
 pub use entry::*;
+pub use error::*;
+pub(crate) use fit::*;
 pub use materialize::*;
+pub use request::*;

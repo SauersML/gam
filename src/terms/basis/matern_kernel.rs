@@ -9,7 +9,6 @@ pub fn build_thin_plate_basis(
     build_thin_plate_basiswithworkspace(data, spec, &mut workspace)
 }
 
-
 pub fn build_thin_plate_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
@@ -242,7 +241,6 @@ pub fn build_thin_plate_basiswithworkspace(
     })
 }
 
-
 /// Canonical domain guard for Matérn kernel evaluations: distance `r` must be
 /// finite and non-negative, length scale must be finite and positive. Single
 /// source of truth for the `(r, length_scale)` validity check shared by every
@@ -255,7 +253,6 @@ pub(crate) fn validate_matern_inputs(r: f64, length_scale: f64) -> Result<(), Ba
     validate_matern_length_scale(length_scale)
 }
 
-
 /// Canonical guard for the length-scale-only Matérn sites: length scale must be
 /// finite and positive. Shared by `validate_matern_inputs` and by callers that
 /// validate the distance separately (or have no distance argument).
@@ -267,9 +264,12 @@ pub(crate) fn validate_matern_length_scale(length_scale: f64) -> Result<(), Basi
     Ok(())
 }
 
-
 #[inline(always)]
-pub(crate) fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Result<f64, BasisError> {
+pub(crate) fn matern_kernel_from_distance(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<f64, BasisError> {
     validate_matern_inputs(r, length_scale)?;
 
     // Parameterization used here:
@@ -305,7 +305,6 @@ pub(crate) fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternN
     };
     Ok(k)
 }
-
 
 #[inline(always)]
 pub(crate) fn matern_kernel_log_kappa_derivative_from_distance(
@@ -343,7 +342,6 @@ pub(crate) fn matern_kernel_log_kappa_derivative_from_distance(
     };
     Ok(deriv)
 }
-
 
 #[inline(always)]
 pub(crate) fn matern_kernel_log_kappasecond_derivative_from_distance(
@@ -389,7 +387,6 @@ pub(crate) fn matern_kernel_log_kappasecond_derivative_from_distance(
     };
     Ok(second)
 }
-
 
 #[inline(always)]
 pub(crate) fn matern_kernel_radial_tripletwith_safe_ratio(
@@ -495,7 +492,6 @@ pub(crate) fn matern_kernel_radial_tripletwith_safe_ratio(
     }
     Ok((phi, phi_r, phi_rr, phi_r_over_r))
 }
-
 
 /// Extended radial scalars for exact per-axis eta_a derivatives of the Matérn
 /// operator collocation matrices D1 (gradient) and D2 (full Hessian).
@@ -663,7 +659,6 @@ pub(crate) fn matern_aniso_extended_radial_scalars(
     }
 }
 
-
 #[inline(always)]
 pub(crate) fn hessian_operator_entry(
     q: f64,
@@ -678,7 +673,6 @@ pub(crate) fn hessian_operator_entry(
     let diagonal = if axis_b == axis_c { w_b * q } else { 0.0 };
     diagonal + (w_b * h_b) * (w_c * h_c) * t
 }
-
 
 #[inline(always)]
 pub(crate) fn hessian_operator_eta_entry(
@@ -707,7 +701,6 @@ pub(crate) fn hessian_operator_eta_entry(
     let mixed_multiplier = 2.0 * a_is_b + 2.0 * a_is_c;
     diagonal + (w_b * h_b) * (w_c * h_c) * (mixed_multiplier * t + t_a)
 }
-
 
 #[inline(always)]
 pub(crate) fn hessian_operator_eta2_entry(
@@ -751,7 +744,6 @@ pub(crate) fn hessian_operator_eta2_entry(
             * (mixed_multiplier * mixed_multiplier * t + 2.0 * mixed_multiplier * t_a + t_aa)
 }
 
-
 #[inline(always)]
 pub(crate) fn hessian_operator_eta_cross_entry(
     t: f64,
@@ -793,7 +785,6 @@ pub(crate) fn hessian_operator_eta_cross_entry(
     let m_j = 2.0 * j_is_b + 2.0 * j_is_c;
     diagonal + (w_b * h_b) * (w_c * h_c) * (m_i * m_j * t + m_i * t_j + m_j * t_i + t_ij)
 }
-
 
 /// Build exact per-axis η_a derivatives of operator penalty matrices for
 /// anisotropic Matérn terms.
@@ -844,7 +835,6 @@ pub(crate) struct MaternCrossPenaltyContext {
     pub(crate) op2_s_first_raw: Vec<Array2<f64>>,
 }
 
-
 impl MaternCrossPenaltyContext {
     pub(crate) fn project_operator(&self, mat: &Array2<f64>, row_dim: usize) -> Array2<f64> {
         let kernel = if let Some(z) = self.z_transform.as_ref() {
@@ -857,7 +847,11 @@ impl MaternCrossPenaltyContext {
         padded
     }
 
-    pub(crate) fn compute_pair(&self, axis_a: usize, axis_b: usize) -> Result<Vec<Array2<f64>>, BasisError> {
+    pub(crate) fn compute_pair(
+        &self,
+        axis_a: usize,
+        axis_b: usize,
+    ) -> Result<Vec<Array2<f64>>, BasisError> {
         let p = self.centers.nrows();
         let d = self.centers.ncols();
         let mut d0_cross_raw = Array2::<f64>::zeros((p, p));
@@ -961,7 +955,6 @@ impl MaternCrossPenaltyContext {
         )
     }
 }
-
 
 pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     centers: ArrayView2<'_, f64>,
@@ -1359,7 +1352,6 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     Ok((per_axis_results, cross_pairs, cross_provider))
 }
 
-
 /// Build exact per-axis η_a derivatives of operator penalty matrices for
 /// anisotropic hybrid Duchon terms.
 ///
@@ -1435,7 +1427,6 @@ pub(crate) fn duchon_kernel_radial_triplet(
     Ok(triplet)
 }
 
-
 #[inline(always)]
 pub(crate) fn lower_triangular_offset(row: usize) -> usize {
     if row & 1 == 0 {
@@ -1448,7 +1439,6 @@ pub(crate) fn lower_triangular_offset(row: usize) -> usize {
     }
 }
 
-
 pub(crate) fn lower_triangular_len(k: usize) -> usize {
     if k & 1 == 0 {
         (k / 2)
@@ -1459,7 +1449,6 @@ pub(crate) fn lower_triangular_len(k: usize) -> usize {
             .expect("lower-triangular length overflow")
     }
 }
-
 
 pub(crate) fn symmetric_matrix_from_lower_values(k: usize, values: &[f64]) -> Array2<f64> {
     assert_eq!(values.len(), lower_triangular_len(k));
@@ -1477,7 +1466,6 @@ pub(crate) fn symmetric_matrix_from_lower_values(k: usize, values: &[f64]) -> Ar
     }
     g
 }
-
 
 pub(crate) fn transform_closed_form_raw_block(
     raw: &Array2<f64>,
@@ -1511,11 +1499,9 @@ pub(crate) fn transform_closed_form_raw_block(
     symmetrize(&total)
 }
 
-
 pub(crate) fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {
     (matrix + &matrix.t().to_owned()) * 0.5
 }
-
 
 /// Centered design Gram: `(D − 1 μ')^T (D − 1 μ')` where `μ_j` is the
 /// column mean of `D` across rows. The constant direction (intercept basis
@@ -1548,7 +1534,6 @@ pub(crate) fn centered_design_gram(d: &Array2<f64>) -> Array2<f64> {
     out
 }
 
-
 pub(crate) fn centered_operator_gram_and_psi_derivatives(
     d: &Array2<f64>,
     d_psi: &Array2<f64>,
@@ -1572,12 +1557,10 @@ pub(crate) fn centered_operator_gram_and_psi_derivatives(
     gram_and_psi_derivatives_from_operator(&d_centered, &d_psi_centered, &d_psi_psi_centered)
 }
 
-
 pub(crate) fn normalize_penalty(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
     let norm = matrix.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12);
     (matrix.mapv(|v| v / norm), norm)
 }
-
 
 pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
     q: usize,
@@ -1622,7 +1605,6 @@ pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
             q, m, s as f64, kappa, eta_raw, powers, r,
         )
 }
-
 
 pub fn closed_form_anisotropic_pair_block(
     centers: ArrayView2<'_, f64>,
@@ -1685,7 +1667,6 @@ pub fn closed_form_anisotropic_pair_block(
 
     symmetric_matrix_from_lower_values(k, &values)
 }
-
 
 /// Pure-Duchon (κ=0) variant of [`closed_form_anisotropic_pair_block`].
 ///
@@ -1791,7 +1772,6 @@ pub fn closed_form_anisotropic_pair_block_pure(
 
     symmetric_matrix_from_lower_values(k, &values)
 }
-
 
 /// Closed-form pair-block penalty for the pure Matérn basis at operator order
 /// `q ∈ {0, 1, 2}`.
@@ -1921,7 +1901,6 @@ pub fn closed_form_matern_pair_block(
     Some(symmetric_matrix_from_lower_values(k, &values))
 }
 
-
 /// Median off-diagonal anisotropic lag scaled by 1e-6, used for
 /// regularizing self-pair R=0 evaluations in pure-Duchon (κ=0) closed-form
 /// penalties. Matches the magnitude used by hybrid κ>0 collocation builders
@@ -1957,7 +1936,6 @@ pub(crate) fn pure_duchon_diagonal_epsilon(
     let median = lags[lags.len() / 2];
     (median * 1e-6).max(1e-12)
 }
-
 
 pub fn closed_form_operator_penalty_in_total_basis(
     centers: ArrayView2<'_, f64>,
@@ -2001,7 +1979,6 @@ pub fn closed_form_operator_penalty_in_total_basis(
     };
     symmetrize(&g_total)
 }
-
 
 /// Closed-form penalty value `S_q` and its log-κ derivatives `S_q_psi`,
 /// `S_q_psi_psi` in the final (post-transform) basis space, computed via
@@ -2115,7 +2092,6 @@ pub fn closed_form_psi_derivatives_in_total_basis(
         ),
     )
 }
-
 
 /// Closed-form anisotropic penalty `S_q` and its raw-η derivatives — full
 /// d×d Hessian materialized — in the final (post-transform) basis space.
@@ -2311,7 +2287,6 @@ pub fn closed_form_aniso_psi_derivatives_in_total_basis(
     (s, s_first, s_second_diag, s_second_cross)
 }
 
-
 #[inline(always)]
 pub(crate) fn duchon_closed_form_operator_penalty_converges(
     q: usize,
@@ -2327,7 +2302,6 @@ pub(crate) fn duchon_closed_form_operator_penalty_converges(
     let four_m = (4 * p_order) as f64;
     four_ms > dp2q && dp2q > four_m && 2 * p_order >= q + 1
 }
-
 
 /// CPD-adequacy gate for the *scale-free* (`length_scale = None`) Duchon
 /// closed-form pair block. The pure-polyharmonic pair block is
@@ -2379,7 +2353,6 @@ pub(crate) fn duchon_pure_closed_form_pair_block_cpd_adequate(
     };
     p_order >= cpd_required
 }
-
 
 pub fn operator_penalty_candidates_closed_form(
     centers: ArrayView2<'_, f64>,
@@ -2523,7 +2496,6 @@ pub fn operator_penalty_candidates_closed_form(
     out
 }
 
-
 /// Threshold above which the closed-form factory emits an operator-form `op`
 /// handle alongside the dense matrix. Above 1500 raw kernel rows, downstream
 /// consumers (PCG-against-implicit-H, Hutchinson EDF) reuse the operator's
@@ -2533,7 +2505,6 @@ pub fn operator_penalty_candidates_closed_form(
 /// `bench_hessian_solve_dense_vs_implicit` in `benches/closed_form_criterion.rs`
 /// against the synthetic SPD-with-coupled-penalty fixture there.
 pub(crate) const CLOSED_FORM_OPERATOR_THRESHOLD: usize = 1500;
-
 
 /// Pure-Duchon (κ=0 / `length_scale = None`) counterpart of
 /// [`closed_form_operator_penalty_in_total_basis`]. Uses
@@ -2590,7 +2561,6 @@ pub fn closed_form_operator_penalty_in_total_basis_pure(
     };
     symmetrize(&g_total)
 }
-
 
 /// Pure-Duchon (κ=0 / `length_scale = None`) counterpart of
 /// [`operator_penalty_candidates_closed_form`].
@@ -2723,7 +2693,6 @@ pub fn operator_penalty_candidates_closed_form_pure(
     out
 }
 
-
 pub(crate) fn operator_penalty_candidates_from_collocation(
     d0: &Array2<f64>,
     d1: &Array2<f64>,
@@ -2768,7 +2737,6 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     out
 }
 
-
 pub(crate) fn active_operator_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     operator_derivatives: &[Array2<f64>],
@@ -2795,7 +2763,6 @@ pub(crate) fn active_operator_penalty_derivatives(
         .collect()
 }
 
-
 pub(crate) fn frozen_spatial_identifiability_transform(
     identifiability: &SpatialIdentifiability,
     expectedrows: usize,
@@ -2814,7 +2781,6 @@ pub(crate) fn frozen_spatial_identifiability_transform(
         }
     }
 }
-
 
 /// Returns the parametric-constraint columns used by the standalone
 /// `OrthogonalToParametric` spatial identifiability transform.
@@ -2848,7 +2814,6 @@ pub(crate) fn spatial_parametric_constraint_block(data: ArrayView2<'_, f64>) -> 
     let n = data.nrows();
     Array2::<f64>::ones((n, 1))
 }
-
 
 pub(crate) fn build_thin_plate_penalty_matrices(
     centers: ArrayView2<'_, f64>,
@@ -2890,7 +2855,6 @@ pub(crate) fn build_thin_plate_penalty_matrices(
     };
     Ok((penalty_bending, penalty_ridge))
 }
-
 
 /// Drop redundant Matérn centers when an over-specified `centers=K` exceeds the
 /// kernel's numerical rank on the data cloud (#755).
@@ -2981,7 +2945,6 @@ pub(crate) fn matern_rank_reduce_centers(
     Ok(reduced)
 }
 
-
 pub(crate) fn build_matern_kernel_penalty(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
@@ -3007,7 +2970,6 @@ pub(crate) fn build_matern_kernel_penalty(
         .assign(&center_kernel);
     Ok(penalty_kernel)
 }
-
 
 /// Compute the spatial identifiability transform for a dense design matrix.
 ///
@@ -3039,7 +3001,6 @@ pub(crate) fn spatial_identifiability_transform_from_design(
     }
 }
 
-
 pub(crate) fn spatial_identifiability_transform_from_design_matrix(
     data: ArrayView2<'_, f64>,
     design: &DesignMatrix,
@@ -3058,7 +3019,6 @@ pub(crate) fn spatial_identifiability_transform_from_design_matrix(
         }
     }
 }
-
 
 pub(crate) fn thin_plate_intercept_transform_from_column_means(
     column_means: &Array1<f64>,
@@ -3093,7 +3053,6 @@ pub(crate) fn thin_plate_intercept_transform_from_column_means(
     Ok(transform)
 }
 
-
 pub(crate) fn thin_plate_identifiability_transform_from_design(
     design: ArrayView2<'_, f64>,
     kernel_cols: usize,
@@ -3119,7 +3078,6 @@ pub(crate) fn thin_plate_identifiability_transform_from_design(
         }
     }
 }
-
 
 pub(crate) fn thin_plate_identifiability_transform_from_design_matrix(
     design: &DesignMatrix,
@@ -3148,7 +3106,6 @@ pub(crate) fn thin_plate_identifiability_transform_from_design_matrix(
     }
 }
 
-
 pub(crate) fn append_intercept_to_transform(transform: &Array2<f64>) -> Array2<f64> {
     let mut out = Array2::<f64>::zeros((transform.nrows() + 1, transform.ncols() + 1));
     out.slice_mut(s![0..transform.nrows(), 0..transform.ncols()])
@@ -3157,8 +3114,10 @@ pub(crate) fn append_intercept_to_transform(transform: &Array2<f64>) -> Array2<f
     out
 }
 
-
-pub(crate) fn project_penalty_matrix(matrix: &Array2<f64>, transform: Option<&Array2<f64>>) -> Array2<f64> {
+pub(crate) fn project_penalty_matrix(
+    matrix: &Array2<f64>,
+    transform: Option<&Array2<f64>>,
+) -> Array2<f64> {
     let projected = if let Some(z) = transform {
         let zt_s = z.t().dot(matrix);
         zt_s.dot(z)
@@ -3167,7 +3126,6 @@ pub(crate) fn project_penalty_matrix(matrix: &Array2<f64>, transform: Option<&Ar
     };
     symmetrize(&projected)
 }
-
 
 pub(crate) fn normalize_penalty_candidate(
     matrix: Array2<f64>,
@@ -3188,7 +3146,6 @@ pub(crate) fn normalize_penalty_candidate(
         op: None,
     }
 }
-
 
 pub fn build_matern_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
@@ -3396,4 +3353,3 @@ pub fn build_matern_collocation_operator_matrices(
         polynomial_block_cols: usize::from(include_intercept),
     })
 }
-

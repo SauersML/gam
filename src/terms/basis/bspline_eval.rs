@@ -8,12 +8,10 @@ use super::*;
 /// rounding noise, yet far below any meaningful covariate-scale knot spacing.
 pub(crate) const KNOT_SPAN_DEGENERACY_FLOOR: f64 = 1e-12;
 
-
 /// Absolute distance by which a covariate value must lie outside the clamped
 /// B-spline domain before the linear extrapolation correction is applied; below
 /// this the point is treated as on-boundary and no extrapolation term is added.
 pub(crate) const BSPLINE_EXTRAPOLATION_THRESHOLD: f64 = 1e-12;
-
 
 /// Default number of rows in each block the streaming design evaluators
 /// materialize at a time when the caller does not supply an explicit chunk
@@ -23,26 +21,21 @@ pub(crate) const DEFAULT_STREAMING_CHUNK_ROWS: usize = 2048;
 /// Marker type for dense basis matrix output.
 pub struct Dense;
 
-
 /// Marker type for sparse basis matrix output.
 pub struct Sparse;
-
 
 /// Trait for selecting basis storage format at compile time.
 pub trait BasisOutput {
     type Output;
 }
 
-
 impl BasisOutput for Dense {
     type Output = Arc<Array2<f64>>;
 }
 
-
 impl BasisOutput for Sparse {
     type Output = SparseColMat<usize, f64>;
 }
-
 
 /// Unified B-spline basis generation with configurable storage, knot source, and options.
 ///
@@ -132,7 +125,6 @@ pub fn create_basis<O: BasisOutputFormat>(
     }
 }
 
-
 /// Applies first-order linear extension outside a knot-domain interval to a basis matrix
 /// that was evaluated at clamped coordinates.
 ///
@@ -187,7 +179,6 @@ pub fn apply_linear_extension_from_first_derivative(
     Ok(())
 }
 
-
 /// Storage layout discriminant for [`BasisOutputFormat`] impls. Encoded as an
 /// enum rather than a bool so the type-level distinction reads as
 /// "Dense vs Sparse" at call sites instead of a polarity-sensitive flag.
@@ -197,14 +188,12 @@ pub enum BasisStorageLayout {
     Sparse,
 }
 
-
 impl BasisStorageLayout {
     #[inline]
     pub const fn is_sparse(self) -> bool {
         matches!(self, Self::Sparse)
     }
 }
-
 
 /// Trait for building basis matrices with different storage formats.
 /// This is an implementation detail for the unified `create_basis` function.
@@ -222,7 +211,6 @@ pub trait BasisOutputFormat {
     fn from_dense(dense: Array2<f64>) -> Result<Self::Output, BasisError>;
     fn from_sparse(sparse: SparseColMat<usize, f64>) -> Result<Self::Output, BasisError>;
 }
-
 
 impl BasisOutputFormat for Dense {
     type Output = Arc<Array2<f64>>;
@@ -287,7 +275,6 @@ impl BasisOutputFormat for Dense {
     }
 }
 
-
 pub(crate) fn apply_dense_bspline_extrapolation(
     data: ArrayView1<f64>,
     knotview: ArrayView1<f64>,
@@ -349,9 +336,12 @@ pub(crate) fn apply_dense_bspline_extrapolation(
     Ok(())
 }
 
-
 #[inline]
-pub(crate) fn one_sided_derivative_eval_point(x: f64, knotview: ArrayView1<f64>, degree: usize) -> f64 {
+pub(crate) fn one_sided_derivative_eval_point(
+    x: f64,
+    knotview: ArrayView1<f64>,
+    degree: usize,
+) -> f64 {
     let num_basis = knotview.len().saturating_sub(degree + 1);
     if num_basis == 0 {
         return x;
@@ -379,7 +369,6 @@ pub(crate) fn one_sided_derivative_eval_point(x: f64, knotview: ArrayView1<f64>,
         x
     }
 }
-
 
 impl BasisOutputFormat for Sparse {
     type Output = SparseColMat<usize, f64>;
@@ -418,7 +407,6 @@ impl BasisOutputFormat for Sparse {
     }
 }
 
-
 pub(crate) fn validate_knots_for_degree(
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -455,7 +443,6 @@ pub(crate) fn validate_knots_for_degree(
     Ok(())
 }
 
-
 /// Rejects knot vectors whose effective basis functions have zero support
 /// (i.e. `t[i+degree+1] == t[i]` for any `i`). This is stricter than the
 /// structural `validate_knots_for_degree` and is only appropriate at the
@@ -484,14 +471,12 @@ pub(crate) fn validate_knot_spans_nondegenerate(
     Ok(())
 }
 
-
 #[derive(Clone, Copy, Debug)]
 pub enum BasisEvalKind {
     Basis,
     FirstDerivative,
     SecondDerivative,
 }
-
 
 pub(crate) struct BasisEvalScratch {
     pub(crate) basis: internal::BsplineScratch,
@@ -500,7 +485,6 @@ pub(crate) struct BasisEvalScratch {
     pub(crate) lower_lower_basis: Vec<f64>,
     pub(crate) lower_lower_scratch: internal::BsplineScratch,
 }
-
 
 impl BasisEvalScratch {
     pub(crate) fn new(degree: usize) -> Self {
@@ -515,7 +499,6 @@ impl BasisEvalScratch {
         }
     }
 }
-
 
 pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
     x: f64,
@@ -591,7 +574,6 @@ pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
     start_col
 }
 
-
 #[inline]
 pub(crate) fn evaluate_splines_derivative_sparse_into(
     x: f64,
@@ -616,7 +598,6 @@ pub(crate) fn evaluate_splines_derivative_sparse_into(
         &mut scratch.lower_scratch,
     )
 }
-
 
 pub(crate) fn evaluate_splinessecond_derivative_sparse_into(
     x: f64,
@@ -709,7 +690,6 @@ pub(crate) fn evaluate_splinessecond_derivative_sparse_into(
     start_col
 }
 
-
 #[inline]
 pub(crate) fn evaluate_splines_sparsewith_kind(
     x: f64,
@@ -731,7 +711,6 @@ pub(crate) fn evaluate_splines_sparsewith_kind(
         }
     }
 }
-
 
 #[inline]
 pub(crate) fn evaluate_bsplinerow_entries<F>(
@@ -759,7 +738,6 @@ pub(crate) fn evaluate_bsplinerow_entries<F>(
     }
 }
 
-
 pub(crate) trait BasisStorage {
     type Output;
 
@@ -774,9 +752,7 @@ pub(crate) trait BasisStorage {
     ) -> Result<Self::Output, BasisError>;
 }
 
-
 pub(crate) struct DenseStorage;
-
 
 impl BasisStorage for DenseStorage {
     type Output = Array2<f64>;
@@ -841,9 +817,7 @@ impl BasisStorage for DenseStorage {
     }
 }
 
-
 pub(crate) struct SparseStorage;
-
 
 impl BasisStorage for SparseStorage {
     type Output = SparseColMat<usize, f64>;
@@ -934,7 +908,6 @@ impl BasisStorage for SparseStorage {
     }
 }
 
-
 pub(crate) fn generate_basis_internal<S: BasisStorage>(
     data: ArrayView1<f64>,
     knotview: ArrayView1<f64>,
@@ -964,7 +937,6 @@ pub(crate) fn generate_basis_internal<S: BasisStorage>(
     )
 }
 
-
 /// Returns true if the B-spline basis should be built in sparse form based on density.
 pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize) -> bool {
     if num_basis_cols == 0 {
@@ -976,7 +948,6 @@ pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize)
 
     density < 0.20 && num_basis_cols > 32
 }
-
 
 /// Creates a penalty matrix `S` for a B-spline basis from a difference matrix `D`.
 /// The penalty is of the form `S = D' * D`, penalizing the squared `order`-th
@@ -1051,7 +1022,6 @@ pub fn create_difference_penalty_matrix(
     Ok(s)
 }
 
-
 pub(crate) fn bspline_raw_column_count(
     knots: &Array1<f64>,
     degree: usize,
@@ -1077,7 +1047,6 @@ pub(crate) fn bspline_raw_column_count(
             )
         })
 }
-
 
 pub(crate) fn bspline_raw_row_chunk(
     data: ArrayView1<'_, f64>,
@@ -1123,7 +1092,6 @@ pub(crate) fn bspline_raw_row_chunk(
     }
 }
 
-
 /// Selects Greville abscissae for difference-penalty scaling.
 ///
 /// The classical P-spline integer-difference penalty `D'D` penalizes the squared
@@ -1167,7 +1135,6 @@ pub fn penalty_greville_abscissae_for_knots(
         Ok(Some(greville))
     }
 }
-
 
 /// True when the entries of `values` are (numerically) evenly spaced. Used to
 /// decide whether classical integer-difference penalties coincide with the

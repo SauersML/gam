@@ -1,6 +1,5 @@
 use super::*;
 
-
 pub(crate) const EXPENSIVE_PREWARM_COEFF_DIM: usize = 24;
 pub(crate) const EXPENSIVE_PREWARM_RHO_DIM: usize = 4;
 pub(crate) const MULTI_SEED_PREWARM_BUDGET: usize = 8;
@@ -1181,12 +1180,8 @@ pub(crate) fn run_outer_with_plan(
                     // `grad_tol` here means no new/widened tolerance is
                     // introduced — a flat-valley stall whose residual gradient
                     // exceeds this is surfaced as non-converged.
-                    let seed_grad_norm = seed_eval
-                        .gradient
-                        .iter()
-                        .map(|g| g * g)
-                        .sum::<f64>()
-                        .sqrt();
+                    let seed_grad_norm =
+                        seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                     let cost_stall_grad_threshold =
                         grad_tol.threshold(seed_eval.cost, seed_grad_norm);
                     let objective = OuterFirstOrderBridge {
@@ -1327,10 +1322,7 @@ pub(crate) fn run_outer_with_plan(
                             // reporting as MaxIterations / line-search-failed
                             // (best-so-far returned, `converged = false`), not a
                             // panic and not a silently-relabeled optimum.
-                            let exit = cost_stall_exit
-                                .lock()
-                                .ok()
-                                .and_then(|mut slot| slot.take());
+                            let exit = cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
                             match exit {
                                 Some(exit) => Ok(outer_result_with_gradient_norm(
                                     exit.rho,
@@ -1627,9 +1619,6 @@ pub(crate) fn run_outer_with_plan(
         }
     })
 }
-
-
-
 
 #[cfg(test)]
 #[path = "run_plan_tests.rs"]

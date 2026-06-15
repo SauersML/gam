@@ -651,7 +651,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 }
 
-
 // ── β-dependent Jacobian callbacks for the three primary blocks ──────────
 //
 // Three n_outputs=3 stacked Jacobians (one per primary output: η0, η1, ad1).
@@ -661,5 +660,3 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
 // family has evaluated β and needs the β-dependent per-row values.
 // At initialization (β=0, family_scalars=None) callbacks fall back to the
 // β=0 linearization: c=1, g=0, q0=0, q1=0, qd1=0.
-
-

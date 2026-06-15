@@ -72,7 +72,9 @@ pub(crate) fn survival_constant_scale(spec: &SurvivalLocationScaleSpec) -> bool 
     }
 }
 
-pub(crate) fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> BlockwiseFitOptions {
+pub(crate) fn survival_blockwise_fit_options(
+    spec: &SurvivalLocationScaleSpec,
+) -> BlockwiseFitOptions {
     BlockwiseFitOptions {
         inner_max_cycles: spec.max_iter,
         inner_tol: spec.tol,

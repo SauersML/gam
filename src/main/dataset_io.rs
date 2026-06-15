@@ -8,7 +8,6 @@ pub(crate) fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet
     parsed_term_column_names(terms, out);
 }
 
-
 pub(crate) fn required_columns_for_formula(parsed: &ParsedFormula) -> Result<Vec<String>, String> {
     let mut out = BTreeSet::<String>::new();
     if let Some((entry, exit, event)) = parse_surv_response(&parsed.response)? {
@@ -17,9 +16,7 @@ pub(crate) fn required_columns_for_formula(parsed: &ParsedFormula) -> Result<Vec
         }
         out.insert(exit);
         out.insert(event);
-    } else if let Some((left, right, event)) =
-        parse_surv_interval_response(&parsed.response)?
-    {
+    } else if let Some((left, right, event)) = parse_surv_interval_response(&parsed.response)? {
         out.insert(left);
         out.insert(right);
         out.insert(event);
@@ -34,13 +31,14 @@ pub(crate) fn required_columns_for_formula(parsed: &ParsedFormula) -> Result<Vec
     Ok(out.into_iter().collect())
 }
 
-
 pub(crate) fn merge_required_columns(target: &mut BTreeSet<String>, cols: Vec<String>) {
     target.extend(cols);
 }
 
-
-pub(crate) fn required_columns_for_fit(args: &FitArgs, parsed: &ParsedFormula) -> Result<Vec<String>, String> {
+pub(crate) fn required_columns_for_fit(
+    args: &FitArgs,
+    parsed: &ParsedFormula,
+) -> Result<Vec<String>, String> {
     let mut required = BTreeSet::<String>::new();
     merge_required_columns(&mut required, required_columns_for_formula(parsed)?);
 
@@ -80,7 +78,6 @@ pub(crate) fn required_columns_for_fit(args: &FitArgs, parsed: &ParsedFormula) -
     Ok(required.into_iter().collect())
 }
 
-
 /// Format a `Surv(...)` response expression, omitting the entry argument
 /// when the right-censored shorthand `Surv(time, event)` is in use.
 pub(crate) fn surv_response_expr(entry: Option<&str>, exit: &str, event: &str) -> String {
@@ -89,7 +86,6 @@ pub(crate) fn surv_response_expr(entry: Option<&str>, exit: &str, event: &str) -
         None => format!("Surv({exit}, {event})"),
     }
 }
-
 
 pub(crate) fn required_columns_for_survival(
     args: &SurvivalArgs,
@@ -125,7 +121,6 @@ pub(crate) fn required_columns_for_survival(
     Ok(required.into_iter().collect())
 }
 
-
 pub(crate) fn load_dataset_projected(
     path: &Path,
     requested_columns: &[String],
@@ -133,11 +128,12 @@ pub(crate) fn load_dataset_projected(
     load_dataset_auto_projected(path, requested_columns)
 }
 
-
-pub(crate) fn load_datasetwith_model_schema(path: &Path, model: &SavedModel) -> Result<Dataset, String> {
+pub(crate) fn load_datasetwith_model_schema(
+    path: &Path,
+    model: &SavedModel,
+) -> Result<Dataset, String> {
     load_datasetwith_model_schema_extra(path, model, &[])
 }
-
 
 /// Load a dataset for a *post-fit diagnostic* command (diagnose / sample /
 /// report) against a fitted model's schema.
@@ -157,7 +153,6 @@ pub(crate) fn load_datasetwith_model_schema_for_diagnostics(
     let extras = model.diagnostic_extra_columns()?;
     load_datasetwith_model_schema_extra(path, model, &extras)
 }
-
 
 /// Load a new-data file against a fitted model's schema, keeping only the
 /// columns the model references (plus any `extra_required` ones a caller knows

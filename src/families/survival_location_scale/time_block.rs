@@ -195,7 +195,9 @@ pub(crate) struct TimeBlockPrepared {
     pub(crate) location_log_time_offset: bool,
 }
 
-pub(crate) fn lower_bound_constraints(lower_bounds: &Array1<f64>) -> Option<LinearInequalityConstraints> {
+pub(crate) fn lower_bound_constraints(
+    lower_bounds: &Array1<f64>,
+) -> Option<LinearInequalityConstraints> {
     LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
 
@@ -506,9 +508,10 @@ pub fn project_onto_linear_constraints(
         (worst, worst_row)
     };
 
-    if let Some(interior) =
-        crate::solver::active_set::project_point_strictly_into_feasible_cone(&beta0_vec, constraints)
-        && worst_raw_violation(&interior).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
+    if let Some(interior) = crate::solver::active_set::project_point_strictly_into_feasible_cone(
+        &beta0_vec,
+        constraints,
+    ) && worst_raw_violation(&interior).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
     {
         return Ok(interior);
     }
@@ -654,7 +657,10 @@ pub(crate) fn validate_linear_constraints(
 /// eigenvalue gap with the same relative threshold the I-spline builder uses to
 /// report `nullspace_dims`, so this is the structural null-space dimension
 /// rather than a hard-coded `2`.
-pub(crate) fn time_parametric_null_space_basis(penalties: &[Array2<f64>], p: usize) -> Option<Array2<f64>> {
+pub(crate) fn time_parametric_null_space_basis(
+    penalties: &[Array2<f64>],
+    p: usize,
+) -> Option<Array2<f64>> {
     if p == 0 || penalties.is_empty() {
         return None;
     }
@@ -803,7 +809,10 @@ pub(crate) fn survival_reduced_parametric_aft_regime(
 /// penalties trivially passes. When the `nullspace_dims` metadata is absent or
 /// length-mismatched the null space cannot be certified, so this conservatively
 /// returns `false` (treat as potentially smoothing).
-pub(crate) fn block_penalties_all_parametric_ridges(nullspace_dims: &[usize], npenalties: usize) -> bool {
+pub(crate) fn block_penalties_all_parametric_ridges(
+    nullspace_dims: &[usize],
+    npenalties: usize,
+) -> bool {
     if npenalties == 0 {
         return true;
     }

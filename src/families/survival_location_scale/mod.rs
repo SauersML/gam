@@ -47,7 +47,6 @@ use crate::custom_family::{
 
 use crate::solver::estimate::reml::unified::{DenseMatrixHyperOperator, HyperOperator};
 
-
 use crate::faer_ndarray::{
     FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,
     fast_xt_diag_x_with_parallelism,

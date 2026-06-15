@@ -1,5 +1,3 @@
-
-
 // ---------------------------------------------------------------------------
 // Typed errors
 // ---------------------------------------------------------------------------
@@ -42,7 +40,6 @@ pub enum TransformationNormalError {
     NumericalFailure { reason: String },
 }
 
-
 impl std::fmt::Display for TransformationNormalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -55,9 +52,7 @@ impl std::fmt::Display for TransformationNormalError {
     }
 }
 
-
 impl std::error::Error for TransformationNormalError {}
-
 
 impl From<TransformationNormalError> for String {
     /// Shim for the many `Result<_, String>` signatures the module exposes
@@ -68,7 +63,6 @@ impl From<TransformationNormalError> for String {
         err.to_string()
     }
 }
-
 
 impl From<crate::util::block_count::BlockCountMismatch> for TransformationNormalError {
     fn from(err: crate::util::block_count::BlockCountMismatch) -> TransformationNormalError {

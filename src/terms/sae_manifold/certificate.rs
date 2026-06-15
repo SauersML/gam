@@ -23,7 +23,6 @@ pub enum GlobalOptimalityVerdict {
     Uncertified { margin: f64 },
 }
 
-
 impl GlobalOptimalityVerdict {
     /// The signed margin `budget − μ̂` (positive ⇒ certified). A precondition
     /// failure reports `f64::NEG_INFINITY`.
@@ -39,7 +38,6 @@ impl GlobalOptimalityVerdict {
     }
 }
 
-
 /// Conservative tangent-graph curvature budget: the atom image is a graph over
 /// its tangent frame only while `C_KAPPA · κ̂` stays below 1 — i.e. the relative
 /// second-fundamental-form curvature `κ̂` (perp curvature per unit tangent
@@ -51,13 +49,11 @@ impl GlobalOptimalityVerdict {
 /// the certified region (withholds certification), never grants a wrong one.
 pub const SAE_CERT_CURVATURE_CONSTANT: f64 = 1.0;
 
-
 /// Conservative incoherence-budget constant `c0` in the sufficient condition
 /// `μ̂ ≤ c0 · a_floor² · (1 − 1/SNR) · (1 − C_κ κ̂) / K`. Small (conservative):
 /// shrinking the budget can only withhold certification, never grant a wrong
 /// one.
 pub const SAE_CERT_INCOHERENCE_BUDGET: f64 = 0.125;
-
 
 /// The conservative curved-dictionary global-optimality threshold (#1008).
 ///
@@ -133,7 +129,6 @@ pub fn curved_dictionary_global_optimality_verdict(
     }
 }
 
-
 /// Empirical quantities that feed the curved-dictionary incoherence theorem,
 /// plus the conservative global-optimality verdict (#1008).
 #[derive(Clone, Debug)]
@@ -166,7 +161,6 @@ pub struct CertificateInputs {
     pub note: String,
 }
 
-
 /// The additive post-fit diagnostics for a fitted [`SaeManifoldTerm`]: the
 /// two-score per-atom lens, residual-gauge certificate, and empirical
 /// incoherence/curvature certificate inputs.
@@ -197,7 +191,6 @@ pub struct SaeManifoldFitDiagnostics {
     pub atom_inference: Vec<crate::sae_identifiability::AtomInferenceReport>,
 }
 
-
 /// Honest trust-diagnostics payload for the Python `diagnostics` block (#1005).
 ///
 /// This deliberately contains only quantities with exact fitted-state producers:
@@ -209,7 +202,6 @@ pub struct SaeTrustDiagnostics {
     pub atom_trust: Vec<f64>,
     pub atoms: Vec<SaeAtomTrustDiagnostics>,
 }
-
 
 #[derive(Clone, Debug)]
 pub struct SaeAtomTrustDiagnostics {
@@ -223,7 +215,6 @@ pub struct SaeAtomTrustDiagnostics {
     pub active_token_count: usize,
 }
 
-
 /// Build the empirical curved-dictionary certificate quantities from a fitted
 /// term and its Gaussian reconstruction dispersion.
 ///
@@ -236,7 +227,6 @@ pub fn dictionary_incoherence_report(term: &SaeManifoldTerm) -> Result<Certifica
     })?;
     dictionary_incoherence_report_with_dispersion(term, dispersion)
 }
-
 
 /// Build the empirical curved-dictionary certificate quantities from a fitted
 /// term and an explicit Gaussian reconstruction dispersion.
@@ -336,7 +326,6 @@ pub fn dictionary_incoherence_report_with_dispersion(
     })
 }
 
-
 pub(crate) fn dictionary_frame_incoherence(term: &SaeManifoldTerm) -> Result<f64, String> {
     let frames = (0..term.k_atoms())
         .map(|atom_idx| certificate_output_frame(term, atom_idx))
@@ -357,7 +346,6 @@ pub(crate) fn dictionary_frame_incoherence(term: &SaeManifoldTerm) -> Result<f64
     }
     Ok(mu)
 }
-
 
 pub(crate) fn certificate_output_frame(
     term: &SaeManifoldTerm,
@@ -390,7 +378,6 @@ pub(crate) fn certificate_output_frame(
     }
     Ok(frame)
 }
-
 
 pub(crate) fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> Result<f64, String> {
     let atom = &term.atoms[atom_idx];
@@ -485,7 +472,9 @@ pub(crate) fn atom_curvature_bound_with_decoder(
     Ok(max_kappa)
 }
 
-pub(crate) fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, Array2<f64>), String> {
+pub(crate) fn tangent_frame_rank(
+    tangent: ArrayView2<'_, f64>,
+) -> Result<(f64, Array2<f64>), String> {
     let p = tangent.nrows();
     let d = tangent.ncols();
     if p == 0 || d == 0 {
@@ -516,7 +505,6 @@ pub(crate) fn tangent_frame_rank(tangent: ArrayView2<'_, f64>) -> Result<(f64, A
     }
     Ok((min_positive * min_positive, q))
 }
-
 
 pub(crate) fn projected_perp_norm(vector: &[f64], tangent_frame: ArrayView2<'_, f64>) -> f64 {
     let mut residual = vector.to_vec();

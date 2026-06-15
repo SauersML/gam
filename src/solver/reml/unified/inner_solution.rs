@@ -23,7 +23,6 @@ pub enum DispersionHandling {
     },
 }
 
-
 /// The unified inner solution produced by any inner solver.
 ///
 /// Contains everything the outer REML/LAML evaluator needs. Produced by:
@@ -236,7 +235,6 @@ pub struct InnerSolution<'dp> {
     pub stochastic_trace_state: Arc<Mutex<StochasticTraceState>>,
 }
 
-
 /// Active row block of the joint linear inequality constraint matrix at the
 /// converged inner iterate. Carries the dense rows needed for the
 /// constraint-aware pseudo-inverse `K_T` in
@@ -248,7 +246,6 @@ pub struct ActiveLinearConstraintBlock {
     /// `k_active × p` matrix of active constraint rows.
     pub a: Array2<f64>,
 }
-
 
 /// Builder for `InnerSolution` that provides sensible defaults and
 /// auto-computes derived quantities (nullspace_dim).
@@ -283,7 +280,6 @@ pub struct InnerSolutionBuilder<'dp> {
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
     pub(crate) gaussian_weight_log_sum_half: f64,
 }
-
 
 impl<'dp> InnerSolutionBuilder<'dp> {
     /// Create a builder with the required core fields.
@@ -567,5 +563,3 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         }
     }
 }
-
-

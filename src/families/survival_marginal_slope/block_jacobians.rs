@@ -24,7 +24,6 @@ pub struct SurvivalMarginalSlopeFamilyScalars {
     pub z_i: Vec<f64>,
 }
 
-
 impl SurvivalMarginalSlopeFamilyScalars {
     /// Construct with c_i computed from g_i and s.
     pub fn new(
@@ -50,7 +49,6 @@ impl SurvivalMarginalSlopeFamilyScalars {
         }
     }
 }
-
 
 /// n_outputs=3 stacked Jacobian for the logslope block.
 ///
@@ -81,7 +79,6 @@ pub struct LogslopeBlockJacobian {
     pub(crate) s: f64,
 }
 
-
 impl LogslopeBlockJacobian {
     pub fn new(design: impl Into<Arc<Array2<f64>>>, z: Vec<f64>, s: f64) -> Self {
         Self {
@@ -91,7 +88,6 @@ impl LogslopeBlockJacobian {
         }
     }
 }
-
 
 impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
     fn effective_jacobian_rows(
@@ -185,7 +181,6 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
     }
 }
 
-
 /// n_outputs=3 stacked Jacobian for the marginal block.
 ///
 /// The marginal block contributes identically to q0 and q1 (both entry and
@@ -204,7 +199,6 @@ pub struct MarginalBlockJacobian {
     pub(crate) design: Arc<Array2<f64>>,
 }
 
-
 impl MarginalBlockJacobian {
     pub fn new(design: impl Into<Arc<Array2<f64>>>) -> Self {
         Self {
@@ -212,7 +206,6 @@ impl MarginalBlockJacobian {
         }
     }
 }
-
 
 impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
     fn effective_jacobian_rows(
@@ -269,7 +262,6 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
     }
 }
 
-
 /// n_outputs=3 stacked Jacobian for the time block.
 ///
 /// The time block contributes separately to η0 (entry), η1 (exit), and ad1
@@ -289,7 +281,6 @@ pub struct TimeBlockJacobian {
     pub(crate) design_deriv: Arc<Array2<f64>>,
 }
 
-
 impl TimeBlockJacobian {
     pub fn new(
         design_entry: impl Into<Arc<Array2<f64>>>,
@@ -303,7 +294,6 @@ impl TimeBlockJacobian {
         }
     }
 }
-
 
 impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
     fn effective_jacobian_rows(
@@ -437,7 +427,6 @@ pub struct SmsTimewiggleTimeJacobian {
     pub(crate) probit_scale: f64,
 }
 
-
 impl SmsTimewiggleTimeJacobian {
     /// Construct.
     #[allow(clippy::too_many_arguments)]
@@ -479,7 +468,6 @@ impl SmsTimewiggleTimeJacobian {
         }
     }
 }
-
 
 impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian {
     fn effective_jacobian_rows(
@@ -628,7 +616,6 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
     }
 }
 
-
 /// n_outputs = 3 stacked Jacobian for the **marginal** block when timewiggle
 /// is active.
 pub struct SmsTimewiggleMarginalJacobian {
@@ -650,7 +637,6 @@ pub struct SmsTimewiggleMarginalJacobian {
     pub(crate) p_g: usize,
     pub(crate) probit_scale: f64,
 }
-
 
 impl SmsTimewiggleMarginalJacobian {
     /// Construct.
@@ -691,7 +677,6 @@ impl SmsTimewiggleMarginalJacobian {
         }
     }
 }
-
 
 impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacobian {
     fn effective_jacobian_rows(
@@ -805,7 +790,6 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
     }
 }
 
-
 /// Compute timewiggle first-order geometry at a single evaluation point `h0`.
 ///
 /// Returns `Ok(None)` when `beta_tw` is empty (no active wiggle columns).
@@ -847,4 +831,3 @@ pub(crate) fn sms_tw_first_order_geom(
         d2q_dq02,
     }))
 }
-

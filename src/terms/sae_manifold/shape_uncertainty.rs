@@ -6,14 +6,12 @@ use super::*;
 /// evaluated at an evenly-strided subset of the atom's own on-atom coordinates.
 pub const SHAPE_BAND_MAX_POINTS: usize = 512;
 
-
 /// Entry budget for materializing one atom's dense `(M_k·p)²` decoder
 /// covariance in the fit payload. Above it (LLM-scale ambient `p`) the band
 /// quantities are computed exactly from the factored frame covariance and the
 /// dense export is omitted (`decoder_covariance: None`) — the python reader
 /// treats it as optional. 2^24 f64 entries = 128 MiB per atom.
 pub const SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES: usize = 1 << 24;
-
 
 /// Posterior uncertainty of one fitted atom's manifold shape.
 ///
@@ -45,7 +43,6 @@ pub struct SaeAtomShapeUncertainty {
     /// `(G, p)`.
     pub band_sd: Array2<f64>,
 }
-
 
 /// Posterior shape uncertainty for a whole SAE-manifold fit: one band per atom
 /// plus the shared Gaussian reconstruction dispersion `φ̂` used to scale every

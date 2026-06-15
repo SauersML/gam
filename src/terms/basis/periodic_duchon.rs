@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ̃/∂t` per row.
 ///
 /// One-dimensional periodic B-spline basis (one latent axis). `t` is the
@@ -72,7 +71,6 @@ pub fn periodic_bspline_first_derivative_nd(
     }
     Ok(out)
 }
-
 
 /// Tensor-product 1-D-B-spline first-derivative jet `∂Φ/∂t` per row.
 ///
@@ -210,13 +208,11 @@ pub fn bspline_tensor_first_derivative(
     Ok(out)
 }
 
-
 #[inline]
 pub(crate) fn periodic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
     let dx = (x - c).rem_euclid(period).abs();
     dx.min(period - dx).abs()
 }
-
 
 /// 2m-th Bernoulli polynomial ``B_{2m}(t)``, evaluated on ``t ∈ [0, 1]``.
 ///
@@ -253,7 +249,6 @@ pub(crate) fn even_bernoulli_polynomial(degree: usize, t: f64) -> Result<f64, Ba
     }
 }
 
-
 /// Periodic Green's function of the iterated 1D Laplacian ``(d²/dx²)^m`` on
 /// the circle of circumference ``period``, modulo the constant nullspace.
 ///
@@ -280,7 +275,11 @@ pub(crate) fn even_bernoulli_polynomial(degree: usize, t: f64) -> Result<f64, Ba
 /// the kernel matrix loses ``K/2 − 1`` singular values. The Bernoulli
 /// kernel is the actual Green's function the operator demands and does not
 /// suffer that lattice-parity degeneracy.
-pub(crate) fn periodic_duchon_kernel_bernoulli(r: f64, m: usize, period: f64) -> Result<f64, BasisError> {
+pub(crate) fn periodic_duchon_kernel_bernoulli(
+    r: f64,
+    m: usize,
+    period: f64,
+) -> Result<f64, BasisError> {
     if !period.is_finite() || period <= 0.0 {
         crate::bail_invalid_basis!(
             "periodic Duchon kernel requires positive finite period; got {period}"
@@ -294,7 +293,6 @@ pub(crate) fn periodic_duchon_kernel_bernoulli(r: f64, m: usize, period: f64) ->
     Ok(sign * even_bernoulli_polynomial(2 * m, t)?)
 }
 
-
 /// First and second derivatives ``(B'_{2m}(s), B''_{2m}(s))`` of the even
 /// Bernoulli polynomial w.r.t. its argument ``s``, for the orders the Duchon
 /// stack uses (``m ∈ {1, 2, 3, 4}``).
@@ -303,7 +301,10 @@ pub(crate) fn periodic_duchon_kernel_bernoulli(r: f64, m: usize, period: f64) ->
 /// (each is a plain polynomial in ``s``), so they are the EXACT derivatives of
 /// the forward kernel value — the analytic backward of the periodic Bernoulli
 /// Green's-function design (gam#580).
-pub(crate) fn even_bernoulli_polynomial_derivatives(degree: usize, s: f64) -> Result<(f64, f64), BasisError> {
+pub(crate) fn even_bernoulli_polynomial_derivatives(
+    degree: usize,
+    s: f64,
+) -> Result<(f64, f64), BasisError> {
     let s2 = s * s;
     match degree {
         2 => Ok((2.0 * s - 1.0, 2.0)),
@@ -335,7 +336,6 @@ pub(crate) fn even_bernoulli_polynomial_derivatives(degree: usize, s: f64) -> Re
         ))),
     }
 }
-
 
 /// Radial jet ``(φ, dφ/dr, d²φ/dr²)`` of the periodic Bernoulli Green's-function
 /// kernel ``φ(r) = (−1)^{m+1} · B_{2m}(r / period)``.
@@ -370,7 +370,6 @@ pub(crate) fn periodic_duchon_kernel_bernoulli_triplet(
     Ok((phi, dphi_dr, d2phi_dr2))
 }
 
-
 /// Drop centers that periodically identify with the leftmost anchor.
 ///
 /// When the user describes a closed periodic lattice by including BOTH
@@ -379,7 +378,11 @@ pub(crate) fn periodic_duchon_kernel_bernoulli_triplet(
 /// remove every such duplicate (tested under the periodic metric with a
 /// tolerance scaled to ``period``); the remaining centers correspond to
 /// geometrically distinct points on the circle.
-pub(crate) fn collapse_periodic_endpoint(centers: Array2<f64>, left: f64, period: f64) -> Array2<f64> {
+pub(crate) fn collapse_periodic_endpoint(
+    centers: Array2<f64>,
+    left: f64,
+    period: f64,
+) -> Array2<f64> {
     if period <= 0.0 || !period.is_finite() {
         return centers;
     }
@@ -419,7 +422,6 @@ pub(crate) fn collapse_periodic_endpoint(centers: Array2<f64>, left: f64, period
     }
     trimmed
 }
-
 
 pub(crate) fn build_periodic_duchon_basis_1d(
     data: ArrayView2<'_, f64>,
@@ -652,7 +654,6 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     })
 }
 
-
 /// Per-pair generalized distance for the mixed-periodicity Duchon basis.
 ///
 /// For each axis ``j``:
@@ -691,7 +692,6 @@ pub(crate) fn duchon_mixed_periodicity_distance(
     }
     acc.sqrt()
 }
-
 
 /// Build a multi-dimensional Duchon basis with per-axis periodicity.
 ///
@@ -907,7 +907,6 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     })
 }
 
-
 /// Public driver for the mixed-periodicity Duchon basis: derives per-axis
 /// ``(left_j, period_j)`` from the supplied centers (mirroring how the 1D
 /// periodic path infers the period from min/max), then dispatches into
@@ -983,7 +982,6 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
     )
 }
 
-
 /// The magic *request-layer* default `(nullspace_order, power)` for a
 /// non-periodic Euclidean Duchon basis of dimension `d`: the cubic polyharmonic
 /// kernel in every dimension.
@@ -1003,7 +1001,6 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
 pub fn duchon_cubic_default(dim: usize) -> (DuchonNullspaceOrder, f64) {
     (DuchonNullspaceOrder::Linear, (dim as f64 - 1.0) / 2.0)
 }
-
 
 /// Build the **analytic** Duchon penalty for a non-periodic Euclidean Duchon
 /// basis: the native reproducing-norm Gram `ω = α²·Zᵀ K_CC Z` (the kernel
@@ -1122,14 +1119,12 @@ pub(crate) fn duchon_native_penalty_candidates(
     Ok(out)
 }
 
-
 /// Farthest-point collocation points per basis center for the lower-order
 /// (mass / tension) operator penalties. The sample is space-filling over the
 /// data SUPPORT (density-blind — sparse and dense regions weighted alike, which
 /// is the regularization you want), `m = OVERSAMPLE·k` capped at `n`: dense
 /// enough to resolve the `k`-bump basis, independent of `n`.
 pub(crate) const DUCHON_COLLOCATION_OVERSAMPLE: usize = 3;
-
 
 /// The lower two rungs of the Hilbert scale for a Duchon smooth, as FUNCTION
 /// penalties collocated on a density-blind `O(k)` farthest-point sample of the

@@ -25,7 +25,6 @@ pub(crate) struct DynamicQBlockwiseAccumulator {
     pub(crate) hess_influence: Option<Array2<f64>>,
 }
 
-
 impl DynamicQBlockwiseAccumulator {
     pub(crate) fn new(slices: &BlockSlices) -> Self {
         Self {
@@ -119,7 +118,6 @@ impl DynamicQBlockwiseAccumulator {
     }
 }
 
-
 pub(crate) struct DenestedCellPrimaryFixedPartials {
     pub(crate) dc_da: [f64; 4],
     pub(crate) dc_daa: [f64; 4],
@@ -135,7 +133,6 @@ pub(crate) struct DenestedCellPrimaryFixedPartials {
     pub(crate) coeff_abbu: Vec<[f64; 4]>,
     pub(crate) coeff_bbbu: Vec<[f64; 4]>,
 }
-
 
 impl DenestedCellPrimaryFixedPartials {
     /// Reconstruct the struct from the device-flat layout emitted by
@@ -215,7 +212,6 @@ impl DenestedCellPrimaryFixedPartials {
     }
 }
 
-
 pub(crate) const COEFF_SUPPORT_GHW: CoeffSupport = CoeffSupport {
     include_primary: true,
     include_h: true,
@@ -228,7 +224,6 @@ pub(crate) const COEFF_SUPPORT_GW: CoeffSupport = CoeffSupport {
     include_w: true,
 };
 
-
 /// Pre-computed partition cell data for a single timepoint evaluation.
 /// Built once per (a, b, β_h, β_w) and reused across the three passes
 /// (F, D, D_uv) that previously each rebuilt partition cells independently.
@@ -236,14 +231,12 @@ pub(crate) struct CachedPartitionCells {
     pub(crate) cells: Vec<CachedCellEntry>,
 }
 
-
 pub(crate) struct CachedCellEntry {
     pub(crate) partition_cell: exact_kernel::DenestedPartitionCell,
     pub(crate) neg_cell: exact_kernel::DenestedCubicCell,
     pub(crate) state: exact_kernel::CellMomentState,
     pub(crate) fixed: DenestedCellPrimaryFixedPartials,
 }
-
 
 pub(crate) struct SurvivalFlexTimepointExact {
     pub(crate) eta: f64,
@@ -257,7 +250,6 @@ pub(crate) struct SurvivalFlexTimepointExact {
     pub(crate) d_uv: Array2<f64>,
 }
 
-
 pub(crate) struct SurvivalFlexTimepointFirstOrderExact {
     pub(crate) eta: f64,
     pub(crate) chi: f64,
@@ -266,7 +258,6 @@ pub(crate) struct SurvivalFlexTimepointFirstOrderExact {
     pub(crate) chi_u: Array1<f64>,
     pub(crate) d_u: Array1<f64>,
 }
-
 
 /// Directional extensions of a timepoint's exact quantities, contracted with
 /// a single direction.  These are the pieces needed to compose the third-order
@@ -278,13 +269,11 @@ pub(crate) struct SurvivalFlexTimepointDirectionalExact {
     pub(crate) d_uv_dir: Array2<f64>,
 }
 
-
 pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {
     pub(crate) eta_uv_uv: Array2<f64>,
     pub(crate) chi_uv_uv: Array2<f64>,
     pub(crate) d_uv_uv: Array2<f64>,
 }
-
 
 #[derive(Clone)]
 pub(crate) struct SurvivalTimeWiggleGeometry {
@@ -300,7 +289,6 @@ pub(crate) struct SurvivalTimeWiggleGeometry {
     pub(crate) d5q_dq05: Array1<f64>,
 }
 
-
 #[derive(Clone)]
 pub(crate) struct SurvivalTimeWiggleFirstOrderGeometry {
     pub(crate) basis: Array2<f64>,
@@ -310,14 +298,12 @@ pub(crate) struct SurvivalTimeWiggleFirstOrderGeometry {
     pub(crate) d2q_dq02: Array1<f64>,
 }
 
-
 #[derive(Clone)]
 pub(crate) struct SurvivalMarginalSlopeDynamicRowValues {
     pub(crate) q0: f64,
     pub(crate) q1: f64,
     pub(crate) qd1: f64,
 }
-
 
 #[derive(Clone)]
 pub(crate) struct SurvivalMarginalSlopeDynamicRowGradient {
@@ -331,7 +317,6 @@ pub(crate) struct SurvivalMarginalSlopeDynamicRowGradient {
     pub(crate) dq1_marginal: Array1<f64>,
     pub(crate) dqd1_marginal: Array1<f64>,
 }
-
 
 #[derive(Clone)]
 pub(crate) struct SurvivalMarginalSlopeDynamicRow {
@@ -354,7 +339,6 @@ pub(crate) struct SurvivalMarginalSlopeDynamicRow {
     pub(crate) d2q1_marginal_marginal: Array2<f64>,
     pub(crate) d2qd1_marginal_marginal: Array2<f64>,
 }
-
 
 impl SurvivalMarginalSlopeDynamicRow {
     /// Construct a zero-sized workspace. Sizes are filled in lazily by
@@ -408,7 +392,6 @@ impl SurvivalMarginalSlopeDynamicRow {
     }
 }
 
-
 #[inline]
 pub(crate) fn reset_array1(arr: &mut Array1<f64>, len: usize) {
     if arr.len() == len {
@@ -418,7 +401,6 @@ pub(crate) fn reset_array1(arr: &mut Array1<f64>, len: usize) {
     }
 }
 
-
 #[inline]
 pub(crate) fn reset_array2(arr: &mut Array2<f64>, rows: usize, cols: usize) {
     if arr.shape() == [rows, cols] {
@@ -427,7 +409,6 @@ pub(crate) fn reset_array2(arr: &mut Array2<f64>, rows: usize, cols: usize) {
         *arr = Array2::zeros((rows, cols));
     }
 }
-
 
 pub(crate) struct TimewiggleMarginalPsiRowLift {
     pub(crate) dir: Array1<f64>,
@@ -456,13 +437,11 @@ pub(crate) struct TimewiggleMarginalPsiRowLift {
     pub(crate) psi_row: Array1<f64>,
 }
 
-
 pub(crate) fn unit_primary_direction(idx: usize) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(N_PRIMARY);
     out[idx] = 1.0;
     out
 }
-
 
 /// Returns a reference to the static unit-direction table (one Array1<f64>
 /// per primary axis). Reusing these references avoids per-row heap
@@ -482,12 +461,10 @@ pub(crate) fn unit_primary_direction_table() -> &'static [Array1<f64>; N_PRIMARY
     })
 }
 
-
 #[inline]
 pub(crate) fn unit_primary_direction_ref(idx: usize) -> &'static Array1<f64> {
     &unit_primary_direction_table()[idx]
 }
-
 
 /// Returns a reference to the static zero direction in primary space
 /// (an `Array1::zeros(N_PRIMARY)`). Used by sigma-jet contractions to
@@ -501,7 +478,6 @@ pub(crate) fn zero_primary_direction_ref() -> &'static Array1<f64> {
     ZERO.get_or_init(|| Array1::<f64>::zeros(N_PRIMARY))
 }
 
-
 pub(crate) fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String> {
     match block_idx {
         1 => Ok(Array1::from_vec(vec![1.0, 1.0, 0.0, 0.0])),
@@ -514,7 +490,6 @@ pub(crate) fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f
         .into()),
     }
 }
-
 
 pub(crate) fn scalar_composite_bilinear(
     base: f64,
@@ -537,7 +512,6 @@ pub(crate) fn scalar_composite_bilinear(
     )
 }
 
-
 pub(crate) fn coeff4_fixed_bilinear(
     base: &[f64; 4],
     d1: &[f64; 4],
@@ -548,7 +522,6 @@ pub(crate) fn coeff4_fixed_bilinear(
         .map(|k| MultiDirJet::bilinear(base[k], d1[k], d2[k], d12[k]))
         .collect()
 }
-
 
 pub(crate) fn coeff4_composite_bilinear(
     base: &[f64; 4],
@@ -582,7 +555,6 @@ pub(crate) fn coeff4_composite_bilinear(
         .collect()
 }
 
-
 /// Derive a primary-space direction from a precomputed psi design row and beta,
 /// avoiding a redundant psi design row build inside `row_primary_psi_direction`.
 pub(crate) fn primary_direction_from_psi_row(
@@ -604,7 +576,6 @@ pub(crate) fn primary_direction_from_psi_row(
     }
     out
 }
-
 
 pub(crate) fn spatial_block_primary_loading_flex(
     primary: &FlexPrimarySlices,
@@ -630,7 +601,6 @@ pub(crate) fn spatial_block_primary_loading_flex(
     }
 }
 
-
 pub(crate) fn primary_direction_from_psi_row_flex(
     primary: &FlexPrimarySlices,
     block_idx: usize,
@@ -651,7 +621,6 @@ pub(crate) fn primary_direction_from_psi_row_flex(
     }
     out
 }
-
 
 /// Derive a primary-space psi action on a direction from a precomputed psi design row.
 pub(crate) fn primary_psi_action_from_psi_row(
@@ -674,7 +643,6 @@ pub(crate) fn primary_psi_action_from_psi_row(
     out
 }
 
-
 pub(crate) fn primary_psi_action_from_psi_row_flex(
     primary: &FlexPrimarySlices,
     block_idx: usize,
@@ -696,7 +664,6 @@ pub(crate) fn primary_psi_action_from_psi_row_flex(
     out
 }
 
-
 /// Derive a primary-space second-order direction from a precomputed second psi design row.
 pub(crate) fn primary_second_direction_from_psi_row(
     block_idx: usize,
@@ -705,7 +672,6 @@ pub(crate) fn primary_second_direction_from_psi_row(
 ) -> Array1<f64> {
     primary_direction_from_psi_row(block_idx, psi_second_row, beta_block)
 }
-
 
 pub(crate) fn primary_second_direction_from_psi_row_flex(
     primary: &FlexPrimarySlices,
@@ -716,12 +682,9 @@ pub(crate) fn primary_second_direction_from_psi_row_flex(
     primary_direction_from_psi_row_flex(primary, block_idx, psi_second_row, beta_block)
 }
 
-
 // ── Block-local Hessian accumulator ────────────────────────────────────
 //
 // Avoids O(n p²) per-row allocation of full p×p matrices by accumulating
 // the 6 independent block matrices (3 diagonal + 3 off-diagonal) directly.
 // Assembly to a dense p×p matrix or an implicit operator is a single O(p²)
 // pass at the end, after the n-loop.
-
-

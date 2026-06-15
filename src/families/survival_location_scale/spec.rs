@@ -265,7 +265,12 @@ pub(crate) struct SurvivalLambdaLayout {
 }
 
 impl SurvivalLambdaLayout {
-    pub(crate) fn new(k_time: usize, k_threshold: usize, k_log_sigma: usize, k_wiggle: usize) -> Self {
+    pub(crate) fn new(
+        k_time: usize,
+        k_threshold: usize,
+        k_log_sigma: usize,
+        k_wiggle: usize,
+    ) -> Self {
         Self {
             k_time,
             k_threshold,

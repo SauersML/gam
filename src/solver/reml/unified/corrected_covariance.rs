@@ -34,7 +34,6 @@ pub struct OuterHessianIndefinite {
     pub suggested_action: &'static str,
 }
 
-
 /// Errors that can arise while building the corrected covariance.
 #[derive(Debug, Clone)]
 pub enum CorrectedCovarianceError {
@@ -51,7 +50,6 @@ pub enum CorrectedCovarianceError {
     /// The projected outer Hessian is indefinite — see diagnostic.
     Indefinite(OuterHessianIndefinite),
 }
-
 
 impl core::fmt::Display for CorrectedCovarianceError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -77,9 +75,7 @@ impl core::fmt::Display for CorrectedCovarianceError {
     }
 }
 
-
 impl std::error::Error for CorrectedCovarianceError {}
-
 
 /// Result describing the corrected covariance plus structural diagnostics.
 #[derive(Debug, Clone)]
@@ -93,18 +89,15 @@ pub struct CorrectedCovariance {
     pub rank_deficient_directions: Vec<usize>,
 }
 
-
 impl CorrectedCovariance {
     pub(crate) fn has_structural_diagnostics(&self) -> bool {
         !self.active_constraints.is_empty() || !self.rank_deficient_directions.is_empty()
     }
 }
 
-
 /// Suggested action text returned with `OuterHessianIndefinite`.
 pub(crate) const INDEFINITE_SUGGESTED_ACTION: &str = "refit with a tighter outer tolerance, verify the inspected objective is the true \
      REML/LAML cost rather than a surrogate, and audit recent active-set transitions";
-
 
 /// Detect θ-coordinates that are sitting on the [-RHO_BOUND, RHO_BOUND] bound.
 ///
@@ -128,7 +121,6 @@ pub(crate) fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec
         .collect()
 }
 
-
 /// Decide which θ-coordinates are bounded (ρ-style) vs unbounded (ψ-style).
 ///
 /// We treat the LAST `ext_len` coordinates as ψ (unbounded extended
@@ -146,7 +138,6 @@ pub(crate) fn active_bound_indices_for_theta(
     active.retain(|&i| i < rho_len);
     active
 }
-
 
 /// Inertia gate + projected-inverse on the free subspace of θ.
 ///
@@ -240,7 +231,6 @@ pub(crate) fn projected_inverse_with_inertia_gate(
     Ok((v_theta_full, rank_deficient_directions))
 }
 
-
 /// Corrected covariance of the coefficient vector, accounting for uncertainty
 /// in the smoothing/hyperparameters θ = (ρ, ψ).
 ///
@@ -288,7 +278,6 @@ pub fn compute_corrected_covariance(
             cov.matrix
         })
 }
-
 
 /// Constraint- and inertia-aware version of [`compute_corrected_covariance`].
 ///
@@ -367,7 +356,6 @@ pub fn compute_corrected_covariance_with_constraints(
     })
 }
 
-
 /// Compute only the diagonal of the corrected covariance V*_alpha.
 ///
 /// This is much cheaper than the full p x p matrix: O(p q) instead of O(p^2 q).
@@ -414,7 +402,6 @@ pub fn compute_corrected_covariance_diagonal(
     })
 }
 
-
 /// Diagonal of the corrected covariance plus active-set / rank-deficiency
 /// diagnostics. See [`compute_corrected_covariance_with_constraints`] for the
 /// full version (the inertia gate logic is identical).
@@ -425,13 +412,11 @@ pub struct CorrectedCovarianceDiagonal {
     pub rank_deficient_directions: Vec<usize>,
 }
 
-
 impl CorrectedCovarianceDiagonal {
     pub(crate) fn has_structural_diagnostics(&self) -> bool {
         !self.active_constraints.is_empty() || !self.rank_deficient_directions.is_empty()
     }
 }
-
 
 pub fn compute_corrected_covariance_diagonal_with_constraints(
     v_ks: &[Array1<f64>],
@@ -528,7 +513,6 @@ pub fn compute_corrected_covariance_diagonal_with_constraints(
     })
 }
 
-
 /// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
 pub(crate) fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
     let n = m.nrows();
@@ -540,7 +524,6 @@ pub(crate) fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
         }
     }
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Smooth spectral regularization
@@ -581,7 +564,6 @@ pub(crate) fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
         (2.0 * epsilon * epsilon) / (disc - sigma)
     }
 }
-
 
 /// Compute the spectral regularization scale for a set of eigenvalues.
 ///

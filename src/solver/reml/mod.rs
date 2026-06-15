@@ -462,7 +462,8 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn tau_tau_hessian_policy_does_not_force_gradient_only_for_implicit_multidim_duchon() {
+    pub(crate) fn tau_tau_hessian_policy_does_not_force_gradient_only_for_implicit_multidim_duchon()
+    {
         // Multi-dim Duchon implicit storage used to force gradient-only,
         // because the τ-cache materialization plan was infeasible.  The
         // unified evaluator now elects the matrix-free
@@ -503,7 +504,8 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn tau_tau_hessian_policy_does_not_force_gradient_only_when_cache_budget_is_exceeded() {
+    pub(crate) fn tau_tau_hessian_policy_does_not_force_gradient_only_when_cache_budget_is_exceeded()
+     {
         // The dense τ-cache plan exceeds the budget, but cost is no longer a
         // capability gate: the eval-side selects the matrix-free operator
         // representation in exactly this regime, and the planner routes
@@ -1406,7 +1408,8 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn firth_logit_directional_hypergradient_accepts_penalty_only_with_full_tk_gradient() {
+    pub(crate) fn firth_logit_directional_hypergradient_accepts_penalty_only_with_full_tk_gradient()
+    {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1463,7 +1466,8 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn firth_logit_directional_hypergradient_accepts_design_moving_with_full_tk_gradient() {
+    pub(crate) fn firth_logit_directional_hypergradient_accepts_design_moving_with_full_tk_gradient()
+     {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -4283,14 +4287,21 @@ impl PenaltySubspaceCache {
         Self { entry: None }
     }
 
-    pub(crate) fn get(&self, key: &PenaltySubspaceCacheKey) -> Option<Arc<runtime::PenaltySubspace>> {
+    pub(crate) fn get(
+        &self,
+        key: &PenaltySubspaceCacheKey,
+    ) -> Option<Arc<runtime::PenaltySubspace>> {
         self.entry
             .as_ref()
             .filter(|(cached_key, _)| cached_key == key)
             .map(|(_, value)| value.clone())
     }
 
-    pub(crate) fn insert(&mut self, key: PenaltySubspaceCacheKey, value: Arc<runtime::PenaltySubspace>) {
+    pub(crate) fn insert(
+        &mut self,
+        key: PenaltySubspaceCacheKey,
+        value: Arc<runtime::PenaltySubspace>,
+    ) {
         self.entry = Some((key, value));
     }
 

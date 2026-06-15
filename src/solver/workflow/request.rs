@@ -8,7 +8,6 @@ pub struct LinkWiggleConfig {
     pub double_penalty: bool,
 }
 
-
 /// Configuration for the second-stage binomial-mean wiggle fit appended to a
 /// standard pilot. The blockwise refit options live inside this struct so the
 /// pilot config (`link_kind` + `wiggle`) and its required `refit_options` can
@@ -22,7 +21,6 @@ pub struct StandardBinomialWiggleConfig {
     pub wiggle: LinkWiggleConfig,
     pub refit_options: BlockwiseFitOptions,
 }
-
 
 pub struct StandardFitRequest<'a> {
     pub data: Array2<f64>,
@@ -41,7 +39,6 @@ pub struct StandardFitRequest<'a> {
     pub _marker: std::marker::PhantomData<&'a ()>,
 }
 
-
 pub struct GaussianLocationScaleFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: GaussianLocationScaleTermSpec,
@@ -49,7 +46,6 @@ pub struct GaussianLocationScaleFitRequest<'a> {
     pub options: BlockwiseFitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
-
 
 pub struct BinomialLocationScaleFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
@@ -59,14 +55,12 @@ pub struct BinomialLocationScaleFitRequest<'a> {
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
 
-
 pub struct DispersionLocationScaleFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: DispersionGlmLocationScaleTermSpec,
     pub options: BlockwiseFitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
-
 
 pub struct SurvivalLocationScaleFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
@@ -80,7 +74,6 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
     pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
 }
 
-
 pub struct SurvivalTransformationFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: SurvivalTransformationTermSpec,
@@ -89,7 +82,6 @@ pub struct SurvivalTransformationFitRequest<'a> {
     /// `fit_survival_transformation_model`.
     pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
 }
-
 
 #[derive(Clone)]
 pub struct SurvivalTransformationTermSpec {
@@ -116,7 +108,6 @@ pub struct BernoulliMarginalSlopeFitRequest<'a> {
     pub policy: crate::resource::ResourcePolicy,
 }
 
-
 pub struct SurvivalMarginalSlopeFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: SurvivalMarginalSlopeTermSpec,
@@ -130,14 +121,12 @@ pub struct LatentSurvivalFitRequest<'a> {
     pub options: BlockwiseFitOptions,
 }
 
-
 pub struct LatentBinaryFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: LatentBinaryTermSpec,
     pub frailty: FrailtySpec,
     pub options: BlockwiseFitOptions,
 }
-
 
 pub struct TransformationNormalFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
@@ -163,7 +152,6 @@ pub enum FitRequest<'a> {
     LatentBinary(LatentBinaryFitRequest<'a>),
     TransformationNormal(TransformationNormalFitRequest<'a>),
 }
-
 
 /// Mechanical surface every `FitRequest` variant must expose. Centralising
 /// these here makes the per-variant logic live with the variant's data and
@@ -214,7 +202,6 @@ pub trait FamilyFitRequest {
     fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>);
 }
 
-
 /// Enumerates every `FitRequest` variant in **one** place. Use as
 /// `family_dispatch!(expr, r => expr_using_r)`; expands to the full
 /// 10-arm match. The compiler enforces exhaustiveness here too, so adding
@@ -237,7 +224,6 @@ macro_rules! family_dispatch {
         }
     };
 }
-
 
 impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
     const TAG: &'static str = "standard";
@@ -280,7 +266,6 @@ impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
     }
 }
 
-
 impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
     const TAG: &'static str = "gaussian-location-scale";
     fn n_obs(&self) -> usize {
@@ -320,7 +305,6 @@ impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
     }
 }
 
-
 impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
     const TAG: &'static str = "binomial-location-scale";
     fn n_obs(&self) -> usize {
@@ -353,7 +337,6 @@ impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
     }
 }
 
-
 impl<'a> FamilyFitRequest for DispersionLocationScaleFitRequest<'a> {
     const TAG: &'static str = "dispersion-location-scale";
     fn n_obs(&self) -> usize {
@@ -385,7 +368,6 @@ impl<'a> FamilyFitRequest for DispersionLocationScaleFitRequest<'a> {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
-
 
 impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
     const TAG: &'static str = "survival-location-scale";
@@ -427,7 +409,6 @@ impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
     }
 }
 
-
 impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
     const TAG: &'static str = "survival-transformation";
     fn n_obs(&self) -> usize {
@@ -468,7 +449,6 @@ impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
     }
 }
 
-
 impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
     const TAG: &'static str = "bernoulli-marginal-slope";
     fn n_obs(&self) -> usize {
@@ -500,7 +480,6 @@ impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
-
 
 impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
     const TAG: &'static str = "survival-marginal-slope";
@@ -556,7 +535,6 @@ impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
     }
 }
 
-
 impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
     const TAG: &'static str = "latent-survival";
     fn n_obs(&self) -> usize {
@@ -586,7 +564,6 @@ impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
-
 
 impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
     const TAG: &'static str = "latent-binary";
@@ -618,7 +595,6 @@ impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
     }
 }
 
-
 impl<'a> FamilyFitRequest for TransformationNormalFitRequest<'a> {
     const TAG: &'static str = "transformation-normal";
     fn n_obs(&self) -> usize {
@@ -646,7 +622,6 @@ impl<'a> FamilyFitRequest for TransformationNormalFitRequest<'a> {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
-
 
 impl<'a> FitRequest<'a> {
     /// Short stable string identifying the family variant. Used as one
@@ -733,7 +708,6 @@ impl<'a> FitRequest<'a> {
     }
 }
 
-
 pub struct StandardFitResult {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
@@ -744,14 +718,12 @@ pub struct StandardFitResult {
     pub wiggle_degree: Option<usize>,
 }
 
-
 pub struct SurvivalLocationScaleFitResult {
     pub fit: SurvivalLocationScaleTermFitResult,
     pub inverse_link: InverseLink,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
 }
-
 
 pub struct SurvivalTransformationFitResult {
     pub fit: UnifiedFitResult,
@@ -805,7 +777,6 @@ pub enum FitResult {
     ResidualCascade(crate::solver::residual_cascade::ResidualCascadeFit),
 }
 
-
 /// Result of a dispersion-channel GAMLSS location-scale fit (#913). Wraps the
 /// shared two-block [`BlockwiseTermFitResult`] (mean + log-precision designs
 /// and coefficients) plus the family kind so the save path can stamp the right
@@ -825,7 +796,6 @@ pub struct CrossFitScoreCalibration {
     pub z_oof: Array1<f64>,
     pub jac_oof: Array2<f64>,
 }
-
 
 /// Internal recipe describing the CTN Stage-1 fit that produced a Stage-2 `z`
 /// column. This is in-process plumbing — never a CLI flag, env var, or feature
@@ -866,7 +836,6 @@ pub struct CtnStage1Recipe {
     /// Optional Stage-1 offset column name.
     pub offset_column: Option<String>,
 }
-
 
 impl CtnStage1Recipe {
     /// Build a Stage-1 CTN recipe from the Stage-1 description. This is the public
@@ -1078,7 +1047,6 @@ pub struct FitConfig {
     /// `RemlState`, which then calls `enable_persistent_warm_start_disk()`.
     pub persist_warm_start_disk: bool,
 }
-
 
 impl Default for FitConfig {
     fn default() -> Self {

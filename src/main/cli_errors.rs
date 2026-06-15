@@ -4,13 +4,11 @@ pub(crate) trait CliCauseCountResult {
     fn into_cli_result(self) -> Result<usize, String>;
 }
 
-
 impl CliCauseCountResult for usize {
     fn into_cli_result(self) -> Result<usize, String> {
         Ok(self)
     }
 }
-
 
 impl<E: ToString> CliCauseCountResult for Result<usize, E> {
     fn into_cli_result(self) -> Result<usize, String> {
@@ -18,9 +16,7 @@ impl<E: ToString> CliCauseCountResult for Result<usize, E> {
     }
 }
 
-
 pub(crate) type CliResult<T> = Result<T, CliError>;
-
 
 #[derive(Debug, Error)]
 pub(crate) enum CliError {
@@ -39,7 +35,6 @@ pub(crate) enum CliError {
     Internal { reason: String },
 }
 
-
 impl CliError {
     pub(crate) fn advice(&self) -> Option<&str> {
         match self {
@@ -52,20 +47,17 @@ impl CliError {
     }
 }
 
-
 impl From<String> for CliError {
     fn from(message: String) -> Self {
         classify_cli_error(message)
     }
 }
 
-
 impl From<CliError> for String {
     fn from(err: CliError) -> Self {
         err.to_string()
     }
 }
-
 
 // Cross-module `?` cascade: typed library errors flow into `CliError` directly
 // without losing their structured payload via the legacy `.to_string()` boundary.
@@ -84,7 +76,6 @@ impl From<gam::inference::formula_dsl::FormulaDslError> for CliError {
     }
 }
 
-
 impl From<gam::inference::data::DataError> for CliError {
     fn from(err: gam::inference::data::DataError) -> Self {
         // Data-loader failures land in the user-facing argument-validation
@@ -94,7 +85,6 @@ impl From<gam::inference::data::DataError> for CliError {
         classify_cli_error(err.to_string())
     }
 }
-
 
 impl From<WorkflowError> for CliError {
     fn from(err: WorkflowError) -> Self {
@@ -106,7 +96,6 @@ impl From<WorkflowError> for CliError {
     }
 }
 
-
 impl From<gam::estimate::EstimationError> for CliError {
     fn from(err: gam::estimate::EstimationError) -> Self {
         // EstimationError is the solver's structured failure type. We route
@@ -116,7 +105,6 @@ impl From<gam::estimate::EstimationError> for CliError {
         classify_cli_error(err.to_string())
     }
 }
-
 
 pub(crate) fn extract_quoted_field(message: &str) -> Option<String> {
     let mut it = message.match_indices('\'');
@@ -129,7 +117,6 @@ pub(crate) fn extract_quoted_field(message: &str) -> Option<String> {
         None
     }
 }
-
 
 pub(crate) fn classify_invalid_tpsspec(lower: &str) -> Option<String> {
     if !lower.contains("thin-plate spline") {
@@ -151,7 +138,6 @@ pub(crate) fn classify_invalid_tpsspec(lower: &str) -> Option<String> {
     }
     None
 }
-
 
 pub(crate) fn classify_cli_error(message: String) -> CliError {
     let lower = message.to_ascii_lowercase();

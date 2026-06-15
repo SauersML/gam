@@ -32,7 +32,6 @@ pub enum SurvivalMarginalSlopeError {
     UnsupportedConfiguration { reason: String },
 }
 
-
 /// Block tag used by the joint training-row preflight diagnostic.
 /// Names a single block in the joint design layout
 /// `[time | marginal | logslope | score_warp? | link_dev?]`.
@@ -44,7 +43,6 @@ pub enum JointPreflightBlock {
     ScoreWarp,
     LinkDev,
 }
-
 
 impl std::fmt::Display for JointPreflightBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,7 +56,6 @@ impl std::fmt::Display for JointPreflightBlock {
         f.write_str(name)
     }
 }
-
 
 impl std::fmt::Display for SurvivalMarginalSlopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,16 +72,13 @@ impl std::fmt::Display for SurvivalMarginalSlopeError {
     }
 }
 
-
 impl std::error::Error for SurvivalMarginalSlopeError {}
-
 
 impl From<SurvivalMarginalSlopeError> for String {
     fn from(err: SurvivalMarginalSlopeError) -> String {
         err.to_string()
     }
 }
-
 
 impl From<String> for SurvivalMarginalSlopeError {
     /// Inbound conversion from helpers in this module (and adjacent

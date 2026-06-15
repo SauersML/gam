@@ -537,12 +537,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         ]
     }
 
-    fn jacobian_transpose_action(
-        &self,
-        row: usize,
-        v: &[f64; SLS_ROW_K],
-        out: &mut [f64],
-    ) {
+    fn jacobian_transpose_action(&self, row: usize, v: &[f64; SLS_ROW_K], out: &mut [f64]) {
         let fam = self.family;
         // Time block: channels 0,1,2 via the dense time Jacobians.
         {

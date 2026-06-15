@@ -805,7 +805,9 @@ pub(crate) fn launch_bms_flex_row_kernel(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn launch_linux(inputs: BmsFlexRowKernelInputs<'_>) -> Result<BmsFlexRowKernelOutputs, GpuError> {
+pub(crate) fn launch_linux(
+    inputs: BmsFlexRowKernelInputs<'_>,
+) -> Result<BmsFlexRowKernelOutputs, GpuError> {
     let backend = RowKernelBackend::probe()?;
     let stream = &backend.stream;
 
@@ -3216,7 +3218,9 @@ mod tests {
     /// `grad` is row-major `n × r`, `hess` is row-major `n × r × r`.
     /// Mirrors `bms_flex_row_kernel` line-for-line so kernel + oracle diverge
     /// only if one side breaks parity.
-    pub(crate) fn cpu_oracle_outputs(inputs: &BmsFlexRowKernelInputs<'_>) -> BmsFlexRowKernelOutputs {
+    pub(crate) fn cpu_oracle_outputs(
+        inputs: &BmsFlexRowKernelInputs<'_>,
+    ) -> BmsFlexRowKernelOutputs {
         let n = inputs.n_rows;
         let r = inputs.r;
         let p_h = inputs.p_h;

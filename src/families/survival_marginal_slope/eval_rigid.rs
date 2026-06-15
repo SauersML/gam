@@ -58,7 +58,10 @@ impl SurvivalMarginalSlopeFamily {
         .map_err(|err| with_row_context(err, row))
     }
 
-    pub(crate) fn ensure_scalar_flex_exact_score_geometry(&self, context: &str) -> Result<(), String> {
+    pub(crate) fn ensure_scalar_flex_exact_score_geometry(
+        &self,
+        context: &str,
+    ) -> Result<(), String> {
         if self.score_dim() == 1 {
             return Ok(());
         }
@@ -156,6 +159,4 @@ impl SurvivalMarginalSlopeFamily {
             250_000,
         )
     }
-
 }
-

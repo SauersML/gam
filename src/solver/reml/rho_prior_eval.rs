@@ -154,7 +154,11 @@ pub(crate) struct RhoPriorEval {
 /// Per-coordinate scalar contribution `(cost, grad, hess)` of one *scalar*
 /// prior at `r`, or a structured error when the scalar prior is malformed.
 /// Nested `Independent` priors are not scalar and are rejected here.
-pub(crate) fn scalar_terms(prior: &RhoPrior, r: f64, context: &str) -> Result<(f64, f64, f64), RhoPriorError> {
+pub(crate) fn scalar_terms(
+    prior: &RhoPrior,
+    r: f64,
+    context: &str,
+) -> Result<(f64, f64, f64), RhoPriorError> {
     match prior {
         RhoPrior::Flat => Ok((0.0, 0.0, 0.0)),
         RhoPrior::Normal { mean, sd } => {
@@ -234,7 +238,10 @@ pub(crate) fn evaluate(
 
 /// Strict evaluation: always errors on a malformed prior. Policy mapping lives
 /// in [`evaluate`].
-pub(crate) fn evaluate_strict(prior: &RhoPrior, rho: &Array1<f64>) -> Result<RhoPriorEval, RhoPriorError> {
+pub(crate) fn evaluate_strict(
+    prior: &RhoPrior,
+    rho: &Array1<f64>,
+) -> Result<RhoPriorEval, RhoPriorError> {
     let len = rho.len();
     match prior {
         RhoPrior::Flat => Ok(RhoPriorEval {

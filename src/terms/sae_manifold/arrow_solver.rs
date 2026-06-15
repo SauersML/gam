@@ -253,7 +253,10 @@ pub(crate) fn apply_cached_arrow_hessian(
     })
 }
 
-pub(crate) fn cholesky_factor_apply(factor: ArrayView2<'_, f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
+pub(crate) fn cholesky_factor_apply(
+    factor: ArrayView2<'_, f64>,
+    vector: ArrayView1<'_, f64>,
+) -> Array1<f64> {
     let n = factor.nrows();
     let mut lt_v = Array1::<f64>::zeros(n);
     for row in 0..n {

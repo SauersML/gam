@@ -12,14 +12,12 @@ pub(crate) fn pretty_predict_model_class(class: PredictModelClass) -> &'static s
     }
 }
 
-
 pub(crate) fn saved_offset_columns(model: &SavedModel) -> (Option<&str>, Option<&str>) {
     (
         model.offset_column.as_deref(),
         model.noise_offset_column.as_deref(),
     )
 }
-
 
 pub(crate) fn effective_predict_offset_columns<'a>(
     model: &'a SavedModel,
@@ -34,7 +32,6 @@ pub(crate) fn effective_predict_offset_columns<'a>(
             .or(model.noise_offset_column.as_deref()),
     )
 }
-
 
 /// Resolve `(mean_offset, noise_offset)` for the report path.
 ///
@@ -57,7 +54,6 @@ pub(crate) fn report_offset_for(
         saved_noise_offset_column,
     )
 }
-
 
 /// Dispersion φ to feed the geometry-based ALO path for a saved model.
 ///
@@ -89,7 +85,6 @@ pub(crate) fn geometry_alo_phi(unified: &UnifiedFitResult, link: LinkFunction) -
         | LinkFunction::BetaLogistic => 1.0,
     }
 }
-
 
 pub(crate) fn resolve_predict_offsets(
     model: &SavedModel,
@@ -137,7 +132,6 @@ pub(crate) fn resolve_predict_offsets(
     };
     Ok((offset, noise_offset))
 }
-
 
 /// Prediction + CSV output path for models that expose `PredictableModel`.
 ///
@@ -252,7 +246,6 @@ pub(crate) fn run_predict_unified(
     Ok(())
 }
 
-
 pub(crate) fn run_predict_model(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
@@ -299,14 +292,12 @@ pub(crate) fn run_predict_model(
     run_predict_unified(progress, args, model, &pred_input, &*predictor)
 }
 
-
 pub(crate) fn validate_level(level: f64) -> Result<(), String> {
     if !(level.is_finite() && level > 0.0 && level < 1.0) {
         return Err(format!("--level must be in (0,1), got {level}"));
     }
     Ok(())
 }
-
 
 /// Predict for a spline-scan saved model (#1030/#1034): replay the exact
 /// Gaussian bridge at each query abscissa — no design matrix, O(log m) per
@@ -362,7 +353,6 @@ pub(crate) fn run_predict_spline_scan(
     );
     Ok(())
 }
-
 
 pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
     validate_level(args.level)?;
@@ -434,7 +424,6 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
     result
 }
 
-
 pub(crate) struct LatentWindowPluginJet {
     survival: f64,
     score_mu: f64,
@@ -442,13 +431,11 @@ pub(crate) struct LatentWindowPluginJet {
     score_q_exit: f64,
 }
 
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SavedLatentWindowKind {
     Survival,
     EventProbability,
 }
-
 
 impl SavedLatentWindowKind {
     fn family_label(self) -> &'static str {
@@ -510,7 +497,6 @@ impl SavedLatentWindowKind {
     }
 }
 
-
 pub(crate) struct PreparedSavedLatentWindowPrediction {
     sigma: f64,
     fit: UnifiedFitResult,
@@ -518,7 +504,6 @@ pub(crate) struct PreparedSavedLatentWindowPrediction {
     q_entry: Array1<f64>,
     q_exit: Array1<f64>,
 }
-
 
 pub(crate) fn latent_window_plugin_survival(
     quadctx: &gam::quadrature::QuadratureContext,
@@ -574,8 +559,10 @@ pub(crate) fn latent_window_plugin_survival(
     })
 }
 
-
-pub(crate) fn block_range_by_role(fit: &UnifiedFitResult, role: BlockRole) -> Option<std::ops::Range<usize>> {
+pub(crate) fn block_range_by_role(
+    fit: &UnifiedFitResult,
+    role: BlockRole,
+) -> Option<std::ops::Range<usize>> {
     let mut offset = 0usize;
     for block in &fit.blocks {
         let end = offset + block.beta.len();
@@ -586,7 +573,6 @@ pub(crate) fn block_range_by_role(fit: &UnifiedFitResult, role: BlockRole) -> Op
     }
     None
 }
-
 
 pub(crate) fn saved_latent_window_local_covariances(
     cov_design: &DesignMatrix,
@@ -636,7 +622,6 @@ pub(crate) fn saved_latent_window_local_covariances(
         )
     })
 }
-
 
 pub(crate) fn prepare_saved_latent_window_prediction(
     model: &SavedModel,
@@ -689,7 +674,6 @@ pub(crate) fn prepare_saved_latent_window_prediction(
         q_exit,
     })
 }
-
 
 pub(crate) fn run_predict_saved_latent_window_impl(
     progress: &mut gam::visualizer::VisualizerSession,
@@ -885,7 +869,6 @@ pub(crate) fn run_predict_saved_latent_window_impl(
     Ok(())
 }
 
-
 pub(crate) fn run_predict_saved_latent_survival(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
@@ -905,7 +888,6 @@ pub(crate) fn run_predict_saved_latent_survival(
     )
 }
 
-
 pub(crate) fn run_predict_saved_latent_binary(
     progress: &mut gam::visualizer::VisualizerSession,
     args: &PredictArgs,
@@ -924,7 +906,6 @@ pub(crate) fn run_predict_saved_latent_binary(
         SavedLatentWindowKind::EventProbability,
     )
 }
-
 
 pub(crate) fn run_predict_survival(
     progress: &mut gam::visualizer::VisualizerSession,

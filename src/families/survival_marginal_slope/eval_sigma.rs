@@ -542,6 +542,4 @@ impl SurvivalMarginalSlopeFamily {
         )?;
         Ok(Some(acc.to_dense(&slices)))
     }
-
 }
-

@@ -1,6 +1,5 @@
 use super::*;
 
-
 pub fn build_spherical_spline_basis(
     data: ArrayView2<'_, f64>,
     spec: &SphericalSplineBasisSpec,
@@ -150,7 +149,6 @@ pub fn build_spherical_spline_basis(
     })
 }
 
-
 /// Precomputed √(2)·N(l,m) coefficients for the real spherical-harmonic
 /// real-orthonormal basis (m=0 row uses N(l,0) without the √2 factor).
 ///
@@ -172,7 +170,6 @@ pub(crate) fn precompute_harmonic_norms(max_degree: usize) -> Vec<f64> {
     }
     out
 }
-
 
 /// Fill one row of the real-spherical-harmonic design at (lat, lon) in
 /// radians. `p_buf` is a scratch buffer of length `(max_degree + 1) ^ 2`
@@ -252,7 +249,6 @@ pub(crate) fn fill_real_spherical_harmonics_row(
     }
 }
 
-
 /// Default L for the harmonic basis when the user does not set `max_degree`.
 /// Targets ~k = 50 columns (mgcv `sos` default) for sample sizes large enough
 /// to support that many parameters, scaling down toward L=2 for small n
@@ -275,7 +271,6 @@ pub fn default_spherical_harmonic_degree(n_rows: usize) -> usize {
     }
     l.max(2)
 }
-
 
 /// Build the spherical-harmonic basis (alternative `method == Harmonic`).
 pub(crate) fn build_spherical_harmonic_basis(
@@ -398,7 +393,6 @@ pub(crate) fn build_spherical_harmonic_basis(
     })
 }
 
-
 pub fn build_matern_basis(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
@@ -406,7 +400,6 @@ pub fn build_matern_basis(
     let mut workspace = BasisWorkspace::default();
     build_matern_basiswithworkspace(data, spec, &mut workspace)
 }
-
 
 /// Public forward Matérn design that honors an explicit all-zero
 /// `aniso_log_scales` **literally** as the isotropic metric, rather than the
@@ -422,7 +415,6 @@ pub fn build_matern_basis_literal_aniso(
     build_matern_basis_seeded(data, spec, &mut workspace, AnisoSeedMode::Literal)
 }
 
-
 pub fn build_matern_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
@@ -430,7 +422,6 @@ pub fn build_matern_basiswithworkspace(
 ) -> Result<BasisBuildResult, BasisError> {
     build_matern_basis_seeded(data, spec, workspace, AnisoSeedMode::AutoSeedFromGeometry)
 }
-
 
 pub(crate) fn build_matern_basis_seeded(
     data: ArrayView2<'_, f64>,
@@ -704,7 +695,6 @@ pub(crate) fn build_matern_basis_seeded(
     })
 }
 
-
 #[inline(always)]
 pub(crate) fn eval_polywith_derivatives(coeffs: &[f64], a: f64) -> (f64, f64, f64) {
     let mut p = 0.0;
@@ -721,7 +711,6 @@ pub(crate) fn eval_polywith_derivatives(coeffs: &[f64], a: f64) -> (f64, f64, f6
     }
     (p, p1, p2)
 }
-
 
 #[inline(always)]
 pub(crate) fn maternvalue_psi_triplet(
@@ -774,9 +763,13 @@ pub(crate) fn maternvalue_psi_triplet(
     Ok((value, value_psi, value_psi_psi))
 }
 
-
 #[inline(always)]
-pub(crate) fn exp_poly_scaled_s2_psi_triplet(s: f64, a: f64, coeffs: &[f64], scalar: f64) -> (f64, f64, f64) {
+pub(crate) fn exp_poly_scaled_s2_psi_triplet(
+    s: f64,
+    a: f64,
+    coeffs: &[f64],
+    scalar: f64,
+) -> (f64, f64, f64) {
     // Helper for operator terms of the form:
     //   y(psi) = scalar * s(psi)^2 * exp(-a) * P(a),
     // where
@@ -803,7 +796,6 @@ pub(crate) fn exp_poly_scaled_s2_psi_triplet(s: f64, a: f64, coeffs: &[f64], sca
     let y_psi_psi = scalar * s * s * e * (4.0 * p0 + 5.0 * a * d + a * a * (p2 - 2.0 * p1 + p0));
     (y, y_psi, y_psi_psi)
 }
-
 
 #[inline(always)]
 pub(crate) fn matern_operator_psi_triplet(
@@ -916,7 +908,6 @@ pub(crate) fn matern_operator_psi_triplet(
     ))
 }
 
-
 pub(crate) fn gram_and_psi_derivatives_from_operator(
     d: &Array2<f64>,
     d_psi: &Array2<f64>,
@@ -935,7 +926,6 @@ pub(crate) fn gram_and_psi_derivatives_from_operator(
     (s_raw, s_raw_psi, s_raw_psi_psi)
 }
 
-
 /// Cross second derivative of the Gram penalty w.r.t. two different axes a and b:
 ///   S_raw_{ab} = D_{ab}'^T D + D'^T D_b + D_a'^T D_b + D^T D_{ab}
 /// where D_a = ∂D/∂ψ_a, D_b = ∂D/∂ψ_b, D_{ab} = ∂²D/∂ψ_a∂ψ_b.
@@ -947,7 +937,6 @@ pub(crate) fn gram_cross_psi_derivative_from_operator(
 ) -> Array2<f64> {
     symmetrize(&(d_ab.t().dot(d) + d.t().dot(d_ab) + d_a.t().dot(d_b) + d_b.t().dot(d_a)))
 }
-
 
 /// Normalize a cross second derivative ∂²S~_m/∂ψ_a∂ψ_b using the Frobenius norm chain rule.
 ///
@@ -995,12 +984,10 @@ pub(crate) fn normalize_penalty_cross_psi_derivative(
         + s.mapv(|v| coeff_s * v)
 }
 
-
 #[inline(always)]
 pub(crate) fn trace_of_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     a.t().dot(b).diag().sum()
 }
-
 
 pub(crate) fn normalize_penaltywith_psi_derivatives(
     s: &Array2<f64>,
@@ -1047,7 +1034,6 @@ pub(crate) fn normalize_penaltywith_psi_derivatives(
 
     (s_tilde, s_tilde_psi, s_tilde_psi_psi, c)
 }
-
 
 pub(crate) fn build_matern_operator_penalty_psi_derivatives(
     centers: ArrayView2<'_, f64>,
@@ -1312,7 +1298,6 @@ pub(crate) fn build_matern_operator_penalty_psi_derivatives(
     Ok((penalties_derivative, penaltiessecond_derivative))
 }
 
-
 pub(crate) struct DuchonRawPenaltyPsiDerivativeBlocks {
     pub(crate) d0: Array2<f64>,
     pub(crate) d1: Array2<f64>,
@@ -1324,7 +1309,6 @@ pub(crate) struct DuchonRawPenaltyPsiDerivativeBlocks {
     pub(crate) d1_psi_psi: Array2<f64>,
     pub(crate) d2_psi_psi: Array2<f64>,
 }
-
 
 impl DuchonRawPenaltyPsiDerivativeBlocks {
     pub(crate) fn zeros(p: usize, d: usize, cols: usize) -> Self {
@@ -1353,7 +1337,6 @@ impl DuchonRawPenaltyPsiDerivativeBlocks {
         self.d2_psi_psi += &rhs.d2_psi_psi;
     }
 }
-
 
 pub(crate) fn build_duchon_operator_penalty_psi_derivatives(
     collocation_points: ArrayView2<'_, f64>,
@@ -1737,7 +1720,6 @@ pub(crate) fn build_duchon_operator_penalty_psi_derivatives(
     ))
 }
 
-
 pub(crate) fn operator_penalty_candidates_from_derivative_candidates(
     candidates: Vec<PenaltyCandidate>,
     spec: &DuchonOperatorPenaltySpec,
@@ -1756,7 +1738,6 @@ pub(crate) fn operator_penalty_candidates_from_derivative_candidates(
         })
         .collect()
 }
-
 
 pub(crate) fn build_duchon_native_penalty_psi_derivatives(
     centers: ArrayView2<'_, f64>,
@@ -1864,7 +1845,6 @@ pub(crate) fn build_duchon_native_penalty_psi_derivatives(
     Ok((sources, first, second))
 }
 
-
 pub(crate) fn prepare_duchon_derivative_contextwithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -1891,7 +1871,6 @@ pub(crate) fn prepare_duchon_derivative_contextwithworkspace(
     Ok((centers, identifiability_transform))
 }
 
-
 /// Validate a 1D periodic Duchon center matrix, compute the circular
 /// domain ``[left, left + period]``, and drop any centers that are
 /// periodically equivalent to ``left`` past the first occurrence.
@@ -1909,7 +1888,6 @@ pub(crate) fn prepare_periodic_duchon_centers_1d(
 ) -> Result<(Array2<f64>, f64, f64), BasisError> {
     prepare_periodic_duchon_centers_1d_with_period(centers, None)
 }
-
 
 /// Variant of [`prepare_periodic_duchon_centers_1d`] that honors an explicit
 /// domain-wrap `period`.
@@ -1970,7 +1948,6 @@ pub(crate) fn prepare_periodic_duchon_centers_1d_with_period(
     Ok((centers, left, period))
 }
 
-
 pub(crate) fn fill_periodic_duchon_kernel_psi_matrices(
     rows: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -2000,7 +1977,6 @@ pub(crate) fn fill_periodic_duchon_kernel_psi_matrices(
     Ok((kernel, kernel_psi, kernel_psi_psi))
 }
 
-
 pub(crate) fn periodic_duchon_identifiability_transformwithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -2019,7 +1995,6 @@ pub(crate) fn periodic_duchon_identifiability_transformwithworkspace(
         ))),
     }
 }
-
 
 pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     data: ArrayView2<'_, f64>,
@@ -2173,7 +2148,6 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     })
 }
 
-
 pub(crate) fn build_matern_design_psi_derivatives(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -2198,7 +2172,6 @@ pub(crate) fn build_matern_design_psi_derivatives(
         0.0,
     )
 }
-
 
 /// Build the Matérn double-penalty **primary** block (the projected kernel
 /// Gram `A = Zᵀ K Z`, embedded into the `total_cols` coefficient space) and its
@@ -2293,7 +2266,6 @@ pub(crate) fn build_matern_double_penalty_primarywith_psi_derivatives(
         normalize_penaltywith_psi_derivatives(&s, &s_psi, &s_psi_psi);
     Ok((s_norm, s_norm_psi, s_norm_psi_psi, c, s, s_psi, s_psi_psi))
 }
-
 
 /// Frozen-eigenbasis frame of the un-normalized projected Matérn kernel Gram
 /// `A`, plus the constant data needed to differentiate the spectral projector
@@ -2424,8 +2396,7 @@ impl ShrinkageProjectorFrame {
         let p1a_hat = self.projector_first_hat(&omega_a);
         // B̂_a'^{(b)} = Uᵀ A_ab U + B̂_a Ω_b − Ω_b B̂_a.
         let c_hat = fast_atb(&self.u, &fast_ab(&symmetrize(a_cross), &self.u));
-        let b_hat_a_prime =
-            &c_hat + &(fast_ab(&b_hat_a, &omega_b) - fast_ab(&omega_b, &b_hat_a));
+        let b_hat_a_prime = &c_hat + &(fast_ab(&b_hat_a, &omega_b) - fast_ab(&omega_b, &b_hat_a));
         // ∂_b Ω_a.
         let mut omega_a_db = Array2::<f64>::zeros((p, p));
         for m in 0..p {
@@ -2480,7 +2451,6 @@ pub(crate) fn matern_nullspace_shrinkage_psi_derivatives(
     Ok((first, second))
 }
 
-
 /// Assemble the active Matérn double-penalty ψ-derivative blocks (first or
 /// second order), index-aligned with `penaltyinfo`. The `Primary` block uses
 /// the projected-kernel-Gram derivative; the `DoublePenaltyNullspace` block
@@ -2503,7 +2473,6 @@ pub(crate) fn active_matern_double_penalty_derivatives(
         .collect()
 }
 
-
 pub fn build_matern_basis_log_kappa_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
@@ -2511,7 +2480,6 @@ pub fn build_matern_basis_log_kappa_derivative(
     let mut workspace = BasisWorkspace::default();
     build_matern_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn build_matern_basis_log_kappa_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
@@ -2523,7 +2491,6 @@ pub fn build_matern_basis_log_kappa_derivativewithworkspace(
     Ok(bundle.first)
 }
 
-
 pub fn build_matern_basis_log_kappa_derivatives(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
@@ -2531,7 +2498,6 @@ pub fn build_matern_basis_log_kappa_derivatives(
     let mut workspace = BasisWorkspace::default();
     build_matern_basis_log_kappa_derivativeswithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     data: ArrayView2<'_, f64>,
@@ -2553,22 +2519,15 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     )?;
     let (penalties_derivative, penaltiessecond_derivative) = if spec.double_penalty {
         let base = build_matern_basiswithworkspace(data, spec, workspace)?;
-        let (
-            _,
-            primary_derivative,
-            primarysecond_derivative,
-            _,
-            a_raw,
-            a_raw_psi,
-            a_raw_psi_psi,
-        ) = build_matern_double_penalty_primarywith_psi_derivatives(
-            centers.view(),
-            spec.length_scale,
-            spec.nu,
-            spec.include_intercept,
-            z_opt.as_ref(),
-            aniso,
-        )?;
+        let (_, primary_derivative, primarysecond_derivative, _, a_raw, a_raw_psi, a_raw_psi_psi) =
+            build_matern_double_penalty_primarywith_psi_derivatives(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                z_opt.as_ref(),
+                aniso,
+            )?;
         // Exact log-κ ψ-derivatives of the `DoublePenaltyNullspace` shrinkage
         // projector, driven by the UN-normalized projected-kernel ψ-derivatives
         // (#1122). Computed only when an active shrinkage block exists.
@@ -2621,7 +2580,6 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     })
 }
 
-
 pub fn build_matern_basis_log_kappasecond_derivative(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
@@ -2629,7 +2587,6 @@ pub fn build_matern_basis_log_kappasecond_derivative(
     let mut workspace = BasisWorkspace::default();
     build_matern_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
 }
-
 
 pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
@@ -2640,7 +2597,6 @@ pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(
     bundle.second.implicit_operator = bundle.implicit_operator;
     Ok(bundle.second)
 }
-
 
 /// Build per-axis ψ_a design-matrix derivatives for anisotropic Matérn terms.
 ///
@@ -2672,7 +2628,6 @@ pub(crate) fn build_matern_design_psi_aniso_derivatives(
         RadialScalarKind::Matern { length_scale, nu },
     )
 }
-
 
 pub(crate) fn build_matern_aniso_primary_raw_derivative_matrices(
     centers: ArrayView2<'_, f64>,
@@ -2723,7 +2678,6 @@ pub(crate) fn build_matern_aniso_primary_raw_derivative_matrices(
     Ok((raw_first, raw_second_diag))
 }
 
-
 pub(crate) fn build_matern_aniso_raw_cross_derivative_matrix(
     centers: ArrayView2<'_, f64>,
     eta: &[f64],
@@ -2761,7 +2715,6 @@ pub(crate) fn build_matern_aniso_raw_cross_derivative_matrix(
     }
     Ok(raw_cross)
 }
-
 
 /// Build per-axis ψ_a derivatives for anisotropic Matérn terms, including
 /// both design-matrix and penalty derivatives.
@@ -2878,9 +2831,11 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             .collect();
         let shrinkage_second_diag: Vec<Array2<f64>> = (0..dim)
             .map(|a| match &shrinkage_frame {
-                Some(frame) => {
-                    frame.second(&primary_first[a], &primary_first[a], &primary_second_diag[a])
-                }
+                Some(frame) => frame.second(
+                    &primary_first[a],
+                    &primary_first[a],
+                    &primary_second_diag[a],
+                ),
                 None => Array2::<f64>::zeros((total_cols, total_cols)),
             })
             .collect();
@@ -3001,4 +2956,3 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
 
     Ok(result)
 }
-

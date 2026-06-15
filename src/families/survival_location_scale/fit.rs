@@ -147,8 +147,7 @@ pub(crate) fn fit_survival_location_scale_with_geometry(
         }
         .into());
     }
-    let (residuals, curvatures) =
-        prepared.family.offset_channel_geometry(&fit.block_states)?;
+    let (residuals, curvatures) = prepared.family.offset_channel_geometry(&fit.block_states)?;
     let link_param_data_fit_gradient = prepared
         .family
         .link_param_data_fit_gradient(&fit.block_states)?;
@@ -523,9 +522,8 @@ pub(crate) fn fit_survival_location_scale_terms(
     // `prepare_survival_location_scale_model` + a second fit pass after the
     // optimizer returns, and (critically) avoids the post-finalize
     // `block_states` wipe that would make the geometry call error out.
-    let last_geometry: std::cell::RefCell<
-        Option<SurvivalLocationScaleConvergedGeometry>,
-    > = std::cell::RefCell::new(None);
+    let last_geometry: std::cell::RefCell<Option<SurvivalLocationScaleConvergedGeometry>> =
+        std::cell::RefCell::new(None);
 
     let build_spec = |rho: &Array1<f64>,
                       _: &TermCollectionSpec,

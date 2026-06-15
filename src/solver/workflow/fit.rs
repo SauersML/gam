@@ -8,7 +8,6 @@ pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> b
     }
 }
 
-
 /// Map a converged outer-optimizer result to its recovered inverse-link state,
 /// or surface a convergence/recovery failure as a `WorkflowError`. Used by the
 /// survival location-scale inverse-link profiling path to turn the optimized
@@ -46,7 +45,6 @@ where
 /// denormal range.
 const LOG_LAMBDA_UNDERFLOW_FLOOR: f64 = 1e-300;
 
-
 /// Inner-PIRLS controls shared by the survival-transformation baseline and
 /// smoothing-coordinate eval closures. The baseline geometry is mildly
 /// nonlinear, so the iteration budget is generous; the convergence/step floors
@@ -73,7 +71,6 @@ struct SurvivalLocationScaleProfile {
     wiggle_knots: Option<Array1<f64>>,
     wiggle_degree: Option<usize>,
 }
-
 
 impl SurvivalLocationScaleProfile {
     fn into_result(self) -> SurvivalLocationScaleFitResult {
@@ -102,7 +99,6 @@ fn resolved_wiggle_inverse_link(
     Ok(resolved)
 }
 
-
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
 ) -> DeviationBlockConfig {
@@ -117,12 +113,10 @@ fn deviation_block_config_from_formula_linkwiggle(
     }
 }
 
-
 pub(crate) struct MarginalSlopeDeviationRouting {
     pub(crate) score_warp: Option<DeviationBlockConfig>,
     pub(crate) link_dev: Option<DeviationBlockConfig>,
 }
-
 
 pub(crate) fn route_marginal_slope_deviation_blocks(
     main_linkwiggle: Option<&LinkWiggleFormulaSpec>,
@@ -133,7 +127,6 @@ pub(crate) fn route_marginal_slope_deviation_blocks(
         link_dev: main_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
     })
 }
-
 
 pub(crate) fn fixed_gaussian_shift_frailty_from_spec(
     frailty: &FrailtySpec,
@@ -156,7 +149,6 @@ pub(crate) fn fixed_gaussian_shift_frailty_from_spec(
         .into()),
     }
 }
-
 
 pub(crate) fn fit_standard_model(
     request: StandardFitRequest<'_>,
@@ -296,7 +288,6 @@ pub(crate) fn fit_standard_model(
     })
 }
 
-
 /// Broken-out pieces of a location-scale fit request, family-agnostic.
 ///
 /// Both the Gaussian and binomial location-scale requests are structurally the
@@ -312,7 +303,6 @@ struct LocationScaleWorkflowParts<'a, S> {
     options: BlockwiseFitOptions,
     kappa_options: SpatialLengthScaleOptimizationOptions,
 }
-
 
 /// Family-specific glue for the shared location-scale wiggle-pilot workflow.
 ///
@@ -382,7 +372,6 @@ trait LocationScaleWorkflowAdapter {
     ) -> Self::Result;
 }
 
-
 /// Shared wiggle-pilot workflow for Gaussian and binomial location-scale models
 /// (#430). The single source of truth for the policy; families differ only via
 /// their [`LocationScaleWorkflowAdapter`].
@@ -426,10 +415,8 @@ fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
     ))
 }
 
-
 /// Gaussian location-scale adapter for the shared wiggle-pilot workflow.
 struct GaussianLocationScaleWorkflow;
-
 
 impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
     type Spec = GaussianLocationScaleTermSpec;
@@ -537,10 +524,8 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
     }
 }
 
-
 /// Binomial location-scale adapter for the shared wiggle-pilot workflow.
 struct BinomialLocationScaleWorkflow;
-
 
 impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
     type Spec = BinomialLocationScaleTermSpec;
@@ -646,7 +631,6 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
     }
 }
 
-
 /// Population standard deviation of a response column (divide by `n`, not
 /// `n-1`).
 ///
@@ -671,7 +655,6 @@ fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
         / n.max(1.0);
     var.max(0.0).sqrt()
 }
-
 
 /// Map a Gaussian location-scale fit fitted in *standardized* response units
 /// (`y / response_scale`) back to **raw** response units, in place.
@@ -830,7 +813,6 @@ fn rescale_gaussian_location_scale_to_raw(
     result.response_scale = s;
 }
 
-
 pub(crate) fn fit_gaussian_location_scale_model(
     mut request: GaussianLocationScaleFitRequest<'_>,
 ) -> Result<GaussianLocationScaleFitResult, String> {
@@ -860,7 +842,6 @@ pub(crate) fn fit_gaussian_location_scale_model(
     Ok(result)
 }
 
-
 pub(crate) fn fit_dispersion_location_scale_model(
     request: DispersionLocationScaleFitRequest<'_>,
 ) -> Result<DispersionLocationScaleFitResult, String> {
@@ -878,18 +859,15 @@ pub(crate) fn fit_dispersion_location_scale_model(
     Ok(DispersionLocationScaleFitResult { fit, kind })
 }
 
-
 pub(crate) fn fit_binomial_location_scale_model(
     request: BinomialLocationScaleFitRequest<'_>,
 ) -> Result<BinomialLocationScaleFitResult, String> {
     fit_location_scale_with_optional_wiggle::<BinomialLocationScaleWorkflow>(request)
 }
 
-
 fn survival_working_reml_score(state: &crate::pirls::WorkingState) -> f64 {
     0.5 * (state.deviance + state.penalty_term)
 }
-
 
 /// Recover the fitted Weibull baseline config from the anchor-CENTERED linear
 /// `[1, log t]` time-basis coefficients.
@@ -930,7 +908,6 @@ fn fitted_weibull_baseline_from_linear_time_beta(
         },
     )
 }
-
 
 /// Penalized effective degrees of freedom for a survival transformation fit.
 ///
@@ -1011,7 +988,6 @@ fn survival_transformation_edf(
     }
     Ok((edf_total, edf_by_block, h_dense))
 }
-
 
 /// REML/LAML smoothing-parameter selection for the single-cause transformation
 /// survival baseline (issue #563).
@@ -1123,8 +1099,7 @@ fn optimize_survival_transformation_smoothing(
         };
         let inner_converged = matches!(
             summary.status,
-            crate::pirls::PirlsStatus::Converged
-                | crate::pirls::PirlsStatus::StalledAtValidMinimum
+            crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum
         );
         if !inner_converged {
             return bad_trial("inner PIRLS did not converge");
@@ -1233,7 +1208,6 @@ fn optimize_survival_transformation_smoothing(
     Ok(Some(lambdas))
 }
 
-
 fn survival_unified_fit_result(
     beta: Array1<f64>,
     lambdas: Array1<f64>,
@@ -1318,7 +1292,6 @@ fn survival_unified_fit_result(
     .map_err(|err| err.to_string())
 }
 
-
 /// Replicate the single pooled-baseline coefficient seed (length `p`) across
 /// every competing-risks cause.
 ///
@@ -1347,7 +1320,6 @@ pub(crate) fn replicate_pooled_baseline_seed_per_cause(
     }
     beta0_flat
 }
-
 
 fn fit_cause_specific_survival_transformation_custom(
     spec: &SurvivalTransformationTermSpec,
@@ -1567,7 +1539,6 @@ fn fit_cause_specific_survival_transformation_custom(
     })
 }
 
-
 fn cause_specific_survival_rho_prior(
     penalty_count: usize,
     penalty_block_gamma_priors: &[(String, f64, f64)],
@@ -1637,7 +1608,6 @@ fn cause_specific_survival_rho_prior(
     Ok(crate::types::RhoPrior::Independent(priors))
 }
 
-
 fn hash_workflow_array_view(hasher: &mut crate::cache::Fingerprinter, array: ArrayView1<'_, f64>) {
     hasher.write_usize(array.len());
     for &value in array {
@@ -1645,14 +1615,12 @@ fn hash_workflow_array_view(hasher: &mut crate::cache::Fingerprinter, array: Arr
     }
 }
 
-
 fn hash_workflow_u8_array(hasher: &mut crate::cache::Fingerprinter, array: ArrayView1<'_, u8>) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_usize(usize::from(value));
     }
 }
-
 
 fn hash_workflow_array2(hasher: &mut crate::cache::Fingerprinter, array: ArrayView2<'_, f64>) {
     hasher.write_usize(array.nrows());
@@ -1664,7 +1632,6 @@ fn hash_workflow_array2(hasher: &mut crate::cache::Fingerprinter, array: ArrayVi
     }
 }
 
-
 fn hash_workflow_design_matrix(
     hasher: &mut crate::cache::Fingerprinter,
     matrix: &crate::matrix::DesignMatrix,
@@ -1672,7 +1639,6 @@ fn hash_workflow_design_matrix(
     let dense = matrix.to_dense();
     hash_workflow_array2(hasher, dense.view());
 }
-
 
 fn survival_transformation_log_lambdas(
     penalty_blocks: &[crate::survival::PenaltyBlock],
@@ -1682,7 +1648,6 @@ fn survival_transformation_log_lambdas(
         .map(|block| block.lambda.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln())
         .collect()
 }
-
 
 fn persistent_survival_transformation_key(
     spec: &SurvivalTransformationTermSpec,
@@ -1783,7 +1748,6 @@ fn persistent_survival_transformation_key(
     format!("surv-transform-{}", hasher.finish_hex())
 }
 
-
 fn load_survival_transformation_persistent_warm_start(
     key: &str,
     spec: &SurvivalTransformationTermSpec,
@@ -1807,7 +1771,6 @@ fn load_survival_transformation_persistent_warm_start(
         .filter(|value| value.is_finite() && *value > 0.0);
     Some((Array1::from_vec(record.beta), lm_lambda))
 }
-
 
 fn store_survival_transformation_persistent_warm_start(
     key: &str,
@@ -1847,7 +1810,6 @@ fn store_survival_transformation_persistent_warm_start(
         );
     }
 }
-
 
 pub(crate) fn fit_survival_transformation_model(
     request: SurvivalTransformationFitRequest<'_>,
@@ -2283,7 +2245,6 @@ pub(crate) fn fit_survival_transformation_model(
     })
 }
 
-
 pub(crate) fn fit_survival_location_scale_model(
     request: SurvivalLocationScaleFitRequest<'_>,
 ) -> Result<SurvivalLocationScaleFitResult, String> {
@@ -2417,8 +2378,8 @@ pub(crate) fn fit_survival_location_scale_model(
                     wiggle_cfg.clone(),
                     kappa_options,
                 )?;
-                let cost = -profile.fit.fit.log_likelihood
-                    + 0.5 * profile.fit.fit.stable_penalty_term;
+                let cost =
+                    -profile.fit.fit.log_likelihood + 0.5 * profile.fit.fit.stable_penalty_term;
                 if !cost.is_finite() {
                     return Err(format!(
                         "survival inverse-link ({name}): non-finite profile cost \
@@ -2470,11 +2431,10 @@ pub(crate) fn fit_survival_location_scale_model(
                     fn(
                         &mut (),
                         &Array1<f64>,
-                    )
-                        -> Result<
-                            crate::solver::outer_strategy::EfsEval,
-                            crate::estimate::EstimationError,
-                        >,
+                    ) -> Result<
+                        crate::solver::outer_strategy::EfsEval,
+                        crate::estimate::EstimationError,
+                    >,
                 >,
             );
             let result = problem
@@ -2591,7 +2551,6 @@ pub(crate) fn fit_survival_location_scale_model(
     Ok(profile.into_result())
 }
 
-
 pub(crate) fn fit_bernoulli_marginal_slope_model(
     request: BernoulliMarginalSlopeFitRequest<'_>,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
@@ -2604,7 +2563,6 @@ pub(crate) fn fit_bernoulli_marginal_slope_model(
     )
 }
 
-
 pub(crate) fn fit_survival_marginal_slope_model(
     request: SurvivalMarginalSlopeFitRequest<'_>,
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
@@ -2615,7 +2573,6 @@ pub(crate) fn fit_survival_marginal_slope_model(
         &request.kappa_options,
     )
 }
-
 
 pub(crate) fn fit_latent_survival_model(
     request: LatentSurvivalFitRequest<'_>,
@@ -2628,7 +2585,6 @@ pub(crate) fn fit_latent_survival_model(
     )
 }
 
-
 pub(crate) fn fit_latent_binary_model(
     request: LatentBinaryFitRequest<'_>,
 ) -> Result<LatentBinaryTermFitResult, String> {
@@ -2639,7 +2595,6 @@ pub(crate) fn fit_latent_binary_model(
         &request.options,
     )
 }
-
 
 pub(crate) fn fit_transformation_normal_model(
     request: TransformationNormalFitRequest<'_>,
@@ -2656,7 +2611,6 @@ pub(crate) fn fit_transformation_normal_model(
         request.warm_start.as_ref(),
     )
 }
-
 
 // ---------------------------------------------------------------------------
 // Cross-fitted score calibration (Neyman-orthogonal marginal slope, #461)
@@ -2702,7 +2656,6 @@ fn crossfit_fold_count(n: usize) -> usize {
     }
 }
 
-
 /// Partition `n` rows into `k` folds of balanced, contiguous blocks.
 ///
 /// Entry `f` of the returned vector holds the ascending row indices held out in
@@ -2727,12 +2680,10 @@ fn crossfit_partition(n: usize, k: usize) -> Vec<Vec<usize>> {
     folds
 }
 
-
 /// Gather `source[idx]` for each `idx` into a fresh contiguous `Array1`.
 fn crossfit_select_rows_1d(source: &Array1<f64>, indices: &[usize]) -> Array1<f64> {
     Array1::from_iter(indices.iter().map(|&i| source[i]))
 }
-
 
 /// Cross-fitted out-of-fold `z` and score-influence Jacobian `J` for a CTN →
 /// marginal-slope chain (design §4-§5).

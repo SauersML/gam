@@ -358,7 +358,12 @@ pub(crate) fn patch_rho(chart: &ChartRegion) -> f64 {
 /// Per-column `g`-th jet sup for a monomial patch of max degree `D` in `d`
 /// coordinates over the chart: `d^g · D^g · ρ^{max(D−g,0)}` (see the
 /// [`EuclideanPatchEvaluator`] doc comment for the derivation).
-pub(crate) fn patch_jet_sup(latent_dim: usize, max_degree: usize, chart: &ChartRegion, order: u32) -> f64 {
+pub(crate) fn patch_jet_sup(
+    latent_dim: usize,
+    max_degree: usize,
+    chart: &ChartRegion,
+    order: u32,
+) -> f64 {
     let d = latent_dim as f64;
     let big_d = max_degree as f64;
     let rho = patch_rho(chart);
@@ -470,7 +475,10 @@ pub(crate) struct ReconstructionJetSups {
     pub(crate) third: f64,
 }
 
-pub(crate) fn pair_trig_decoder_sup(sin_row: ArrayView1<'_, f64>, cos_row: ArrayView1<'_, f64>) -> f64 {
+pub(crate) fn pair_trig_decoder_sup(
+    sin_row: ArrayView1<'_, f64>,
+    cos_row: ArrayView1<'_, f64>,
+) -> f64 {
     let aa = sin_row.dot(&sin_row);
     let bb = cos_row.dot(&cos_row);
     let ab = sin_row.dot(&cos_row);
@@ -479,7 +487,9 @@ pub(crate) fn pair_trig_decoder_sup(sin_row: ArrayView1<'_, f64>, cos_row: Array
     (0.5 * (trace + disc)).sqrt()
 }
 
-pub(crate) fn periodic_reconstruction_jet_sups(decoder: ArrayView2<'_, f64>) -> ReconstructionJetSups {
+pub(crate) fn periodic_reconstruction_jet_sups(
+    decoder: ArrayView2<'_, f64>,
+) -> ReconstructionJetSups {
     let mut value = 0.0;
     let mut jacobian = 0.0;
     let mut hessian = 0.0;
@@ -514,7 +524,10 @@ pub(crate) fn periodic_reconstruction_jet_sups(decoder: ArrayView2<'_, f64>) -> 
     }
 }
 
-pub(crate) fn reconstruction_jet_sups(atom: &SaeManifoldAtom, sups: JetSups) -> ReconstructionJetSups {
+pub(crate) fn reconstruction_jet_sups(
+    atom: &SaeManifoldAtom,
+    sups: JetSups,
+) -> ReconstructionJetSups {
     if matches!(
         atom.basis_kind,
         crate::terms::sae_manifold::SaeAtomBasisKind::Periodic
@@ -667,7 +680,10 @@ pub(crate) const SAE_CYLINDER_LINE_DEGREE: usize = 2;
 /// atlas needs to evaluate the jet sups, which live on the concrete evaluator
 /// types; the atom carries the evaluator as `Arc<dyn SaeBasisEvaluator>`, so we
 /// reconstruct the family bound from the atom's basis kind + width + centers.
-pub(crate) fn family_jet_sups(atom: &SaeManifoldAtom, chart: &ChartRegion) -> Result<JetSups, String> {
+pub(crate) fn family_jet_sups(
+    atom: &SaeManifoldAtom,
+    chart: &ChartRegion,
+) -> Result<JetSups, String> {
     use crate::terms::sae_manifold::SaeAtomBasisKind::*;
     let m = atom.basis_size();
     let d = atom.latent_dim;
@@ -1963,7 +1979,11 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
 
 /// Build the [`ChartRegion`] for a center, attaching the radial r_min / r_max
 /// bracket for Duchon atoms (the chart's distance range to the kernel centers).
-pub(crate) fn chart_region(atom: &SaeManifoldAtom, center: Array1<f64>, radius: f64) -> ChartRegion {
+pub(crate) fn chart_region(
+    atom: &SaeManifoldAtom,
+    center: Array1<f64>,
+    radius: f64,
+) -> ChartRegion {
     use crate::terms::sae_manifold::SaeAtomBasisKind::*;
     let region = ChartRegion::new(center.clone(), radius);
     match &atom.basis_kind {

@@ -2251,7 +2251,9 @@ mod tests {
             "the d=2 topology-race candidate set MUST include the Cylinder kind; got {:?}",
             specs.iter().map(|s| &s.basis_kind).collect::<Vec<_>>()
         );
-        let has_torus = specs.iter().any(|s| s.basis_kind == SaeAtomBasisKind::Torus);
+        let has_torus = specs
+            .iter()
+            .any(|s| s.basis_kind == SaeAtomBasisKind::Torus);
         let has_sphere = specs
             .iter()
             .any(|s| s.basis_kind == SaeAtomBasisKind::Sphere);
@@ -2337,7 +2339,11 @@ mod tests {
         // Truncate to the seed atoms to emulate a Schur factor assembled at the
         // seed K (the born atom has NO entry yet).
         unc.atoms.truncate(k_seed);
-        assert_eq!(unc.atoms.len(), k_seed, "seed-K Schur band omits the born atom");
+        assert_eq!(
+            unc.atoms.len(),
+            k_seed,
+            "seed-K Schur band omits the born atom"
+        );
 
         born.complete_born_atom_shape_bands(&mut unc)
             .expect("born-atom band completes");

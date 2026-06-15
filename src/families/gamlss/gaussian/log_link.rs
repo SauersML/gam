@@ -71,13 +71,7 @@ trait LogLinkDiagonalIrlsFamily {
 
     /// Family-specific per-row math; `m = saturated_exp_eta(eta_clamped)`
     /// is computed by the driver and handed in.
-    fn row_kernel(
-        &self,
-        yi: f64,
-        e_clamped: f64,
-        m: f64,
-        prior_w: f64,
-    ) -> DiagonalIrlsRow;
+    fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow;
 }
 
 /// Shared IRLS driver for [`LogLinkDiagonalIrlsFamily`]. Centralises the
@@ -152,13 +146,7 @@ impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
         Ok::<(), _>(())
     }
     #[inline]
-    fn row_kernel(
-        &self,
-        yi: f64,
-        e_clamped: f64,
-        m: f64,
-        prior_w: f64,
-    ) -> DiagonalIrlsRow {
+    fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
         // Drop log(y!) constant in objective.
         let log_lik_increment = prior_w * (yi * e_clamped - m);
         let dmu = m.max(MIN_DERIV);
@@ -173,10 +161,7 @@ impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
 }
 
 impl CustomFamily for PoissonLogFamily {
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
     }
 }
@@ -252,13 +237,7 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
         Ok::<(), _>(())
     }
     #[inline]
-    fn row_kernel(
-        &self,
-        yi: f64,
-        e_clamped: f64,
-        m: f64,
-        prior_w: f64,
-    ) -> DiagonalIrlsRow {
+    fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
         assert!(e_clamped.is_finite());
         assert!((e_clamped.exp() - m).abs() <= 1.0e-8 * m.abs().max(1.0));
         // Gamma(shape=k, scale=mu/k), dropping eta-independent constants.
@@ -285,10 +264,7 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
 }
 
 impl CustomFamily for GammaLogFamily {
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
     }
 

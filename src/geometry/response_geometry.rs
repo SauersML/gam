@@ -787,7 +787,11 @@ fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64, f64) {
         return (-1.0e6, 1.0e6, 0.0);
     }
     // Keep a safety margin off the singular hyperbolic boundary.
-    let kappa_min = if r2_max > 0.0 { -0.999 / r2_max } else { -1.0e6 };
+    let kappa_min = if r2_max > 0.0 {
+        -0.999 / r2_max
+    } else {
+        -1.0e6
+    };
     // Conjugate-radius cap: ρ_max = 2·max‖y_i − μ‖ is the κ=0 geodesic radius.
     let rho_max = 2.0 * s2_max.sqrt();
     let kappa_max = if s2_max > 0.0 {
@@ -1243,10 +1247,7 @@ mod tests {
     /// of scale `sigma`, exp-mapped onto `M_{k_star}`, then mean-centred in the
     /// ambient chart to mimic the real (mean-subtracted) response clouds.
     fn synth_cloud(dim: usize, k_star: f64, n: usize, sigma: f64, seed: u64) -> Array2<f64> {
-        let manifold = ResponseManifold::ConstantCurvature {
-            dim,
-            kappa: k_star,
-        };
+        let manifold = ResponseManifold::ConstantCurvature { dim, kappa: k_star };
         let center = Array1::<f64>::zeros(dim);
         let mut rng = DetNormal::new(seed);
         let mut values = Array2::<f64>::zeros((n, dim));
@@ -1345,8 +1346,7 @@ mod tests {
             // criterion (V(κ, αy) = V(α²κ, y)) up to the finite golden-section /
             // bracket discretisation.
             assert!(
-                (fit_scaled.kappa_hat - expected).abs()
-                    <= 0.05 + 0.05 * expected.abs(),
+                (fit_scaled.kappa_hat - expected).abs() <= 0.05 + 0.05 * expected.abs(),
                 "κ⋆={k_star}: rescale covariance broken: κ̂(αy)={} vs κ̂(y)/α²={}",
                 fit_scaled.kappa_hat,
                 expected
@@ -1355,11 +1355,7 @@ mod tests {
 
         // (b-monotone) κ̂ is monotone increasing in κ⋆ across the whole sweep.
         for w in k_hats.windows(2) {
-            assert!(
-                w[1] > w[0] - 0.05,
-                "κ̂ not monotone in κ⋆: {:?}",
-                k_hats
-            );
+            assert!(w[1] > w[0] - 0.05, "κ̂ not monotone in κ⋆: {:?}", k_hats);
         }
     }
 

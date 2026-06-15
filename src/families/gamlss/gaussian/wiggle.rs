@@ -2072,10 +2072,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         Ok(beta)
     }
 
-    fn evaluate(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -2175,10 +2172,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         })
     }
 
-    fn log_likelihood_only(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<f64, String> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 3 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -2630,10 +2624,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl above: matrix-free fires when
         // `exact_joint_dense_block_designs` is satisfiable, which requires
         // both location and scale block designs to be present.  The wiggle

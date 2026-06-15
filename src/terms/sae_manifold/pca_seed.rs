@@ -2,9 +2,9 @@
 //! Moved out of the (test-only) `tests` module so the production FFI seed
 //! path can call it in release builds.
 
-use ndarray::{Array1, Array2, Array3, ArrayView2};
-use crate::linalg::faer_ndarray::FaerSvd;
 use super::SaeAtomBasisKind;
+use crate::linalg::faer_ndarray::FaerSvd;
+use ndarray::{Array1, Array2, Array3, ArrayView2};
 
 /// PCA-based seed for SAE atom latent coordinates. Centers `z`, takes its SVD,
 /// and projects onto leading principal components to initialize each atom's

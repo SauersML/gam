@@ -6,7 +6,6 @@ pub enum ScheduleKind {
     ReciprocalIter,
 }
 
-
 /// Outer-state temperature annealing for SAE assignment relaxations.
 ///
 /// Annealing drives the continuous concrete/softmax assignment toward the
@@ -21,7 +20,6 @@ pub struct GumbelTemperatureSchedule {
     pub decay: ScheduleKind,
     pub iter_count: usize,
 }
-
 
 impl GumbelTemperatureSchedule {
     #[must_use = "build error must be handled"]
@@ -96,13 +94,11 @@ impl GumbelTemperatureSchedule {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchStrategy {
     Fixed,
     ExponentialSweep { values: Vec<f64> },
 }
-
 
 impl SearchStrategy {
     #[must_use]

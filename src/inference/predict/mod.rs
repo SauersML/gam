@@ -4133,9 +4133,7 @@ impl PredictableModel for DispersionLocationScalePredictor {
         // ARE the precision; Tweedie φ is its reciprocal.
         let precision = self.precision(input)?;
         let dispersion = match self.likelihood.response {
-            ResponseFamily::Tweedie { .. } => {
-                precision.mapv(|pr| 1.0 / pr.max(f64::MIN_POSITIVE))
-            }
+            ResponseFamily::Tweedie { .. } => precision.mapv(|pr| 1.0 / pr.max(f64::MIN_POSITIVE)),
             _ => precision,
         };
         Ok(Some(dispersion))

@@ -287,7 +287,6 @@ impl SaeManifoldTerm {
 }
 
 impl SaeManifoldTerm {
-
     /// Returns whether Beta-tier analytic curvature was accumulated into the
     /// dense `sys.hbb` block or deferred for exact factored-space probing.
     pub(crate) fn add_sae_analytic_penalty_contributions(
@@ -970,7 +969,6 @@ impl SaeManifoldTerm {
             }
         }
     }
-
 }
 
 pub(crate) fn sae_coord_penalty_offset(
@@ -998,7 +996,6 @@ pub(crate) fn sae_coord_penalty_offset(
     }
 }
 
-
 pub(crate) fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
     matches!(
         penalty,
@@ -1013,7 +1010,6 @@ pub(crate) fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) 
             | AnalyticPenaltyKind::Isometry(_)
     )
 }
-
 
 /// Whether a row-block coordinate penalty is an *origin-anchored, axis-separable
 /// magnitude shrinkage* — its energy is `Σ_axis Σ_row f(|t|)` with a fixed zero,
@@ -1035,10 +1031,11 @@ pub(crate) fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) 
 /// periodic axes contribute nothing. The restriction is exact only because the
 /// energy is axis-separable, so this matcher is deliberately narrow: non-separable
 /// shrinkage (e.g. the Hoyer ℓ¹/ℓ² ratio) is excluded.
-pub(crate) fn sae_coord_penalty_is_origin_anchored_magnitude(penalty: &AnalyticPenaltyKind) -> bool {
+pub(crate) fn sae_coord_penalty_is_origin_anchored_magnitude(
+    penalty: &AnalyticPenaltyKind,
+) -> bool {
     matches!(penalty, AnalyticPenaltyKind::ScadMcp(_))
 }
-
 
 /// Restrict an origin-anchored, axis-separable coordinate shrinkage penalty (see
 /// [`sae_coord_penalty_is_origin_anchored_magnitude`]) to the **Euclidean**
@@ -1078,7 +1075,6 @@ pub(crate) fn sae_coord_penalty_euclidean_restriction(
     }
     Some((euclidean_axes, compacted))
 }
-
 
 /// The JSON descriptor `kind` strings for the SAE row-block analytic penalties
 /// this build supports (i.e. those `sae_penalty_is_row_block_supported`

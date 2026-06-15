@@ -154,7 +154,6 @@ impl ResidualDistributionOps for ResidualDistribution {
         }
     }
 
-
     /// Fourth derivative of the residual-distribution PDF.
     ///
     /// # Derivations

@@ -12,7 +12,6 @@ pub struct VarianceJet {
     pub v4: f64,
 }
 
-
 impl VarianceJet {
     /// Lower floor on μ before evaluating power-law variance functions, so that
     /// `μ^(p−k)` derivatives stay finite as μ → 0 instead of producing inf/NaN.
@@ -122,11 +121,9 @@ impl VarianceJet {
     }
 }
 
-
 pub(crate) const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
 
 pub(crate) const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
-
 
 /// Returns the per-row floor `max(fisher · 1e-6, 1e-12)` used by PIRLS to
 /// stabilize the observed-information Hessian H = X' W X + S. Saturated
@@ -143,7 +140,6 @@ pub fn solver_hessian_weight_floor(fisher_weight: f64) -> f64 {
     (fisher_weight.max(0.0) * OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC)
         .max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR)
 }
-
 
 /// Build the (W, c, d) triple that matches PIRLS's stabilized H = X' W X + S.
 ///
@@ -192,12 +188,10 @@ pub fn outer_hessian_curvature_arrays(
     (w_out, c_out, d_out)
 }
 
-
 #[inline]
 pub(crate) fn fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     likelihood.fixed_phi().unwrap_or(1.0)
 }
-
 
 #[inline]
 pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> WeightFamily {
@@ -215,7 +209,6 @@ pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> Weigh
     }
 }
 
-
 #[inline]
 pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
     match inverse_link {
@@ -230,7 +223,6 @@ pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> Weight
         | InverseLink::Mixture(_) => WeightLink::Other,
     }
 }
-
 
 #[inline]
 pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
@@ -257,7 +249,6 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     )
 }
 
-
 #[inline]
 pub(crate) fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
@@ -279,7 +270,6 @@ pub(crate) fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64)
     }
 }
 
-
 /// Returns true at rows where PIRLS clamped η (so the observed-info weights
 /// were computed at the clamped value, making `∂W/∂η` zero w.r.t. the
 /// **unclamped** η).  Outer REML/LAML derivative formulas must mask `c_obs`
@@ -290,7 +280,6 @@ pub fn eta_clamp_active(inverse_link: &InverseLink, eta: f64) -> bool {
     let clamped = eta_for_observed_hessian_jet(inverse_link, eta);
     clamped != eta
 }
-
 
 /// Build solver-conditioned weights from the exact hessian weights.
 ///
@@ -314,7 +303,6 @@ pub(crate) fn solver_hessian_weights_into(
             *o = if w.is_finite() && w > floor { w } else { floor };
         });
 }
-
 
 /// Compute vectorised observed-information curvature arrays (w_obs, c_obs, d_obs)
 /// for the Hessian surface at the mode.
@@ -424,7 +412,6 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
         })
 }
 
-
 pub(crate) fn compute_observed_hessian_curvature_arrays(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
@@ -450,7 +437,6 @@ pub(crate) fn compute_observed_hessian_curvature_arrays(
     )?;
     Ok((hessian_weights, hessian_c, hessian_d))
 }
-
 
 /// Per-observation observed-information weights and their first two
 /// eta-derivatives for a general exponential-dispersion family with a
@@ -578,7 +564,6 @@ pub fn observed_weight_noncanonical(
     (pw * w_obs, pw * c_obs, pw * d_obs)
 }
 
-
 /// Per-observation third η-derivative of the observed-information weight,
 /// `e_obs := ∂³W_obs/∂η³`, for a general exponential-dispersion family with
 /// any (canonical or non-canonical) link.
@@ -660,7 +645,6 @@ pub fn e_obs_from_jets(
     pw * e_obs
 }
 
-
 // Direct (closed-form) observed-information weights for specific family-link
 // combinations.  These avoid the overhead of the generic noncanonical formula
 // when the algebra simplifies.
@@ -682,7 +666,6 @@ pub fn observed_weight_gaussian_log(y: f64, mu: f64, phi: f64, pw: f64) -> (f64,
     let d = inv_phi * mu * (8.0 * mu - y);
     (w, c, d)
 }
-
 
 /// Gaussian family with inverse link: y ~ N(μ, φ), μ = 1/η.
 ///
@@ -707,7 +690,6 @@ pub fn observed_weight_gaussian_inverse(y: f64, eta: f64, phi: f64, pw: f64) -> 
     (w, c, d)
 }
 
-
 #[inline]
 pub(crate) fn observed_weight_binomial_logit_from_jet(
     n_trials: f64,
@@ -717,7 +699,6 @@ pub(crate) fn observed_weight_binomial_logit_from_jet(
     let scale = pw * n_trials;
     (scale * jet.d1, scale * jet.d2, scale * jet.d3)
 }
-
 
 /// Family tag for the observed-information weight dispatch.
 ///
@@ -735,7 +716,6 @@ pub enum WeightFamily {
     Gamma,
 }
 
-
 /// Link tag for the observed-information weight dispatch.
 ///
 /// Identifies the link function for selecting closed-form weight
@@ -750,7 +730,6 @@ pub enum WeightLink {
     Other,
 }
 
-
 #[inline]
 pub fn variance_jet_for_weight_family(family: WeightFamily, mu: f64) -> VarianceJet {
     match family {
@@ -763,7 +742,6 @@ pub fn variance_jet_for_weight_family(family: WeightFamily, mu: f64) -> Variance
         WeightFamily::Gamma => VarianceJet::gamma(mu),
     }
 }
-
 
 /// Dispatch to closed-form observed-information weights for known family-link
 /// combinations, falling back to the generic noncanonical formula.
@@ -806,7 +784,6 @@ pub fn observed_weight_dispatch(
     }
 }
 
-
 #[derive(Clone)]
 pub enum DirectionalWorkingCurvature {
     /// Directional derivative of the PIRLS curvature when the working
@@ -814,7 +791,6 @@ pub enum DirectionalWorkingCurvature {
     ///   W_τ = diag(w_τ).
     Diagonal(Array1<f64>),
 }
-
 
 pub fn directionalworking_curvature_from_c_array(
     c_array: &Array1<f64>,

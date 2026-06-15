@@ -264,10 +264,7 @@ fn response_curvature_recovers_and_is_monotone_across_kappa_grid() {
     // (d) MONOTONICITY: κ̂ non-decreasing in κ⋆ across the whole sweep (a small
     // slack absorbs finite-sample wobble between adjacent grid points).
     for (lo, hi) in k_hats.iter().zip(k_hats.iter().skip(1)) {
-        assert!(
-            *hi > *lo - 0.10,
-            "κ̂ not monotone in κ⋆: {k_hats:?}"
-        );
+        assert!(*hi > *lo - 0.10, "κ̂ not monotone in κ⋆: {k_hats:?}");
     }
 }
 
@@ -291,7 +288,9 @@ fn response_curvature_profile_ci_covers_at_nominal_rate() {
     let replicates = 80usize;
     let n = 1500usize;
 
-    println!("\n#944 response-curvature CI coverage (dim={DIM}, n={n}, σ={SIGMA}, R={replicates}):");
+    println!(
+        "\n#944 response-curvature CI coverage (dim={DIM}, n={n}, σ={SIGMA}, R={replicates}):"
+    );
     println!("   κ⋆     covered/R    rate");
     for (ti, &k_star) in truths.iter().enumerate() {
         let mut covered = 0usize;
@@ -519,8 +518,7 @@ fn response_curvature_flags_rail_on_high_curvature_relative_to_spread() {
     assert!(
         !fit_in.railed_at_resolution_limit,
         "well-resolved interior cloud must NOT flag a rail (κ̂={}, κ̂·r²={})",
-        fit_in.kappa_hat,
-        fit_in.kappa_r2
+        fit_in.kappa_hat, fit_in.kappa_r2
     );
 }
 
@@ -554,7 +552,11 @@ fn bracket_via_criterion(values: ndarray::ArrayView2<'_, f64>) -> (f64, f64) {
             s2_max = r2;
         }
     }
-    let kappa_min = if r2_max > 0.0 { -0.999 / r2_max } else { -1.0e6 };
+    let kappa_min = if r2_max > 0.0 {
+        -0.999 / r2_max
+    } else {
+        -1.0e6
+    };
     let kappa_max = if s2_max > 0.0 {
         let rho_max = 2.0 * s2_max.sqrt();
         let edge = 0.9 * std::f64::consts::PI / rho_max;

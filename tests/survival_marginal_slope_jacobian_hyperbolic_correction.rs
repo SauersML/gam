@@ -1192,12 +1192,7 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
             let qd1_i = data.qd1_base.to_vec();
             let z_i = data.z.to_vec();
             Arc::new(SurvivalMarginalSlopeFamilyScalars::new(
-                q0_i,
-                q1_i,
-                qd1_i,
-                g_i,
-                s_f,
-                z_i,
+                q0_i, q1_i, qd1_i, g_i, s_f, z_i,
             ))
         };
 

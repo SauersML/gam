@@ -2100,8 +2100,9 @@ impl SaeBasisEvaluator for SubspaceReducedEvaluator {
                 }
                 Some(
                     remix_cols_along_basis(t3.view().into_dyn(), &self.q).and_then(|out| {
-                        out.into_dimensionality::<ndarray::Ix5>()
-                            .map_err(|err| format!("SubspaceReducedEvaluator: third jet dim: {err}"))
+                        out.into_dimensionality::<ndarray::Ix5>().map_err(|err| {
+                            format!("SubspaceReducedEvaluator: third jet dim: {err}")
+                        })
                     }),
                 )
             }

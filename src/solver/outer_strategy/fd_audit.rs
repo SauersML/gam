@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Per-θ component of an outer-gradient finite-difference audit.
 #[derive(Clone, Debug)]
 pub struct OuterGradientFdComponent {
@@ -13,7 +12,6 @@ pub struct OuterGradientFdComponent {
     /// Central finite-difference of the outer criterion in θ_i.
     pub fd: f64,
 }
-
 
 impl OuterGradientFdComponent {
     /// Absolute analytic−FD gap.
@@ -30,7 +28,6 @@ impl OuterGradientFdComponent {
         }
     }
 }
-
 
 /// Result of a component-by-component finite-difference audit of an outer
 /// REML/LAML gradient at a fixed θ, plus the outer-Hessian eigenvalues.
@@ -52,7 +49,6 @@ pub struct OuterGradientFdAudit {
     /// when no analytic/operator Hessian was available.
     pub hessian_eigenvalues: Vec<f64>,
 }
-
 
 impl OuterGradientFdAudit {
     /// Per-block L2 norm of the analytic gradient.
@@ -149,7 +145,6 @@ impl OuterGradientFdAudit {
         }
     }
 }
-
 
 /// Run a component-by-component central finite-difference audit of an outer
 /// REML/LAML gradient at a fixed θ₀.

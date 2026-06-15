@@ -27,7 +27,10 @@ impl SurvivalMarginalSlopeFamily {
             .map_or(0, DeviationRuntime::basis_dim)
     }
 
-    pub(crate) fn score_warp_coord_basis_index(&self, local_idx: usize) -> Result<(usize, usize), String> {
+    pub(crate) fn score_warp_coord_basis_index(
+        &self,
+        local_idx: usize,
+    ) -> Result<(usize, usize), String> {
         let basis_dim = self.score_warp_basis_dim();
         if basis_dim == 0 {
             return Err(
@@ -285,6 +288,4 @@ impl SurvivalMarginalSlopeFamily {
             self.shared_logslope_covariance_scale()?,
         ))
     }
-
 }
-

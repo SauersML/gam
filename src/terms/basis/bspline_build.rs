@@ -1,6 +1,5 @@
 use super::*;
 
-
 pub fn select_centers_by_strategy(
     data: ArrayView2<'_, f64>,
     strategy: &CenterStrategy,
@@ -36,7 +35,6 @@ pub fn select_centers_by_strategy(
         }
     }
 }
-
 
 /// Generic 1D B-spline builder returning design + penalty list.
 pub fn build_bspline_basis_1d(
@@ -634,7 +632,6 @@ pub fn build_bspline_basis_1d(
     })
 }
 
-
 pub(crate) fn compose_bspline_transform(
     existing: Option<Array2<f64>>,
     next: Array2<f64>,
@@ -656,8 +653,9 @@ pub(crate) fn compose_bspline_transform(
     }
 }
 
-
-pub(crate) fn bspline_sum_to_zero_transform_from_cross(c: &Array1<f64>) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn bspline_sum_to_zero_transform_from_cross(
+    c: &Array1<f64>,
+) -> Result<Array2<f64>, BasisError> {
     let k = c.len();
     if k < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint { found: k });
@@ -684,7 +682,6 @@ pub(crate) fn bspline_sum_to_zero_transform_from_cross(c: &Array1<f64>) -> Resul
     Ok(z)
 }
 
-
 pub(crate) fn streaming_bspline_current_chunk(
     data: ArrayView1<'_, f64>,
     knots: &Array1<f64>,
@@ -700,7 +697,6 @@ pub(crate) fn streaming_bspline_current_chunk(
         None => raw,
     })
 }
-
 
 pub(crate) fn streaming_bspline_sum_cross(
     data: ArrayView1<'_, f64>,
@@ -735,7 +731,6 @@ pub(crate) fn streaming_bspline_sum_cross(
     }
     Ok(out)
 }
-
 
 pub(crate) fn streaming_bspline_orthogonality_transform(
     data: ArrayView1<'_, f64>,
@@ -787,7 +782,6 @@ pub(crate) fn streaming_bspline_orthogonality_transform(
     }
     orthogonality_transform_from_cross_and_gram(&cross, &gram)
 }
-
 
 pub(crate) fn build_streaming_bspline_design_and_candidates(
     data: ArrayView1<'_, f64>,
@@ -898,7 +892,6 @@ pub(crate) fn build_streaming_bspline_design_and_candidates(
     ))
 }
 
-
 pub(crate) fn apply_bspline_identifiability_policy(
     design: Array2<f64>,
     penalties: Vec<Array2<f64>>,
@@ -953,7 +946,6 @@ pub(crate) fn apply_bspline_identifiability_policy(
     Ok((design_c, penalties_c, z_opt))
 }
 
-
 pub(crate) fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisError> {
     if penalty.nrows() != penalty.ncols() {
         crate::bail_dim_basis!("penalty matrix must be square when estimating nullspace");
@@ -967,7 +959,6 @@ pub(crate) fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, B
     Ok(evals.iter().filter(|&&ev| ev.abs() <= tol).count())
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct PsdSpectralSummary {
     pub(crate) min_eigenvalue: f64,
@@ -975,7 +966,6 @@ pub(crate) struct PsdSpectralSummary {
     pub(crate) tolerance: f64,
     pub(crate) effective_rank: usize,
 }
-
 
 pub(crate) fn symmetrize_penalty(penalty: &Array2<f64>) -> Array2<f64> {
     let mut sym = penalty.clone();
@@ -988,7 +978,6 @@ pub(crate) fn symmetrize_penalty(penalty: &Array2<f64>) -> Array2<f64> {
     }
     sym
 }
-
 
 /// Project a (nearly-)symmetric matrix to the PSD cone by clamping
 /// negative eigenvalues to zero. A PenaltyMatrix is by definition PSD;
@@ -1036,7 +1025,6 @@ pub(crate) fn project_penalty_to_psd_cone(matrix: &Array2<f64>) -> Array2<f64> {
     clamped
 }
 
-
 pub(crate) fn spectral_tolerance(sym: &Array2<f64>, evals: &Array1<f64>) -> f64 {
     let max_abs_ev = evals
         .iter()
@@ -1047,7 +1035,6 @@ pub(crate) fn spectral_tolerance(sym: &Array2<f64>, evals: &Array1<f64>) -> f64 
     (sym.nrows().max(1) as f64) * 1e-10 * max_abs_ev
 }
 
-
 pub(crate) fn spectral_summary(
     penalty: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array1<f64>, Array2<f64>), BasisError> {
@@ -1055,7 +1042,6 @@ pub(crate) fn spectral_summary(
     let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
     Ok((sym, evals, evecs))
 }
-
 
 pub(crate) fn validate_psd_penalty(
     penalty: &Array2<f64>,
@@ -1100,11 +1086,9 @@ pub(crate) fn validate_psd_penalty(
     })
 }
 
-
 pub fn analyze_penalty_block(penalty: &Array2<f64>) -> Result<CanonicalPenaltyBlock, BasisError> {
     analyze_penalty_block_with_op(penalty, None)
 }
-
 
 pub fn analyze_penalty_block_with_op(
     penalty: &Array2<f64>,
@@ -1146,7 +1130,6 @@ pub fn analyze_penalty_block_with_op(
     })
 }
 
-
 pub fn filter_active_penalty_candidates(
     candidates: Vec<PenaltyCandidate>,
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>, Vec<PenaltyInfo>), BasisError> {
@@ -1154,7 +1137,6 @@ pub fn filter_active_penalty_candidates(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok((penalties, nullspace_dims, penaltyinfo))
 }
-
 
 /// Extract the orthonormal basis of `null(S)` from a `CanonicalPenaltyBlock`.
 ///
@@ -1182,7 +1164,6 @@ pub(crate) fn nullspace_basis_from_block(block: &CanonicalPenaltyBlock) -> Optio
     }
     Some(block.eigenvectors.select(Axis(1), &null_idx))
 }
-
 
 /// Compute the joint-null absorption rotation for a smooth with one or more
 /// active penalty blocks.
@@ -1226,7 +1207,6 @@ pub fn recompute_null_eigenvectors(
         })
         .collect()
 }
-
 
 pub fn compute_joint_null_rotation(
     penalties: &[Array2<f64>],
@@ -1288,7 +1268,6 @@ pub fn compute_joint_null_rotation(
         joint_nullity,
     }))
 }
-
 
 /// Same filtering pass as [`filter_active_penalty_candidates`] but also
 /// returns the per-active-penalty operator handles and null-space bases.
@@ -1379,7 +1358,6 @@ pub fn filter_active_penalty_candidates_with_ops(
     ))
 }
 
-
 pub(crate) fn validated_kronecker_factors(
     factors: Option<Vec<Array2<f64>>>,
     matrix: &Array2<f64>,
@@ -1407,7 +1385,6 @@ pub(crate) fn validated_kronecker_factors(
         .fold(0.0_f64, |acc, (&lhs, &rhs)| acc.max((lhs - rhs).abs()));
     (max_abs_diff <= scale * 1e-10).then_some(factors)
 }
-
 
 /// Build the double-penalty ridge from the structural null space of a PSD penalty.
 pub(crate) fn build_nullspace_shrinkage_penalty(
@@ -1447,7 +1424,6 @@ pub(crate) fn build_nullspace_shrinkage_penalty(
     }))
 }
 
-
 pub(crate) fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
     if n < 8 {
         return 0;
@@ -1456,7 +1432,6 @@ pub(crate) fn default_internal_knot_count_for_data(n: usize, degree: usize) -> u
     let max_reasonable = n.saturating_sub(degree + 2);
     heuristic.min(40).min(max_reasonable)
 }
-
 
 /// Auto-shrink a requested B-spline configuration to the largest feasible
 /// `(num_internal_knots, degree)` that the available data can support.
@@ -1507,7 +1482,6 @@ pub(crate) fn auto_shrink_bspline_config(
         num_internal_knots != requested_num_internal_knots || degree != requested_degree.max(1);
     Some((num_internal_knots, degree, shrunk))
 }
-
 
 /// Apply [`auto_shrink_bspline_config`] to a [`BSplineBasisSpec`] when the
 /// caller's `knotspec` is data-driven, returning the (possibly mutated) spec.
@@ -1591,7 +1565,6 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
     }
 }
 
-
 pub(crate) fn finite_data_range(data: ArrayView1<'_, f64>) -> Result<(f64, f64), BasisError> {
     if data.is_empty() {
         crate::bail_invalid_basis!("cannot infer knot range from empty data");
@@ -1611,7 +1584,6 @@ pub(crate) fn finite_data_range(data: ArrayView1<'_, f64>) -> Result<(f64, f64),
     }
     Ok((minv, maxv))
 }
-
 
 pub(crate) fn expand_periodic_centers(
     centers: &Array2<f64>,
@@ -1666,5 +1638,3 @@ pub(crate) fn expand_periodic_centers(
     }
     Ok(out)
 }
-
-

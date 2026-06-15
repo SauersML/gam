@@ -43,7 +43,6 @@ pub trait WorkingModel {
     }
 }
 
-
 /// Result of a cheap LM-candidate screen: penalized objective + arithmetic
 /// finiteness, without the gradient/Hessian needed for an accepted step.
 #[derive(Debug, Clone)]
@@ -54,7 +53,6 @@ pub struct CandidateScreen {
     pub arithmetic_finite: bool,
 }
 
-
 /// Outcome of `WorkingModel::screen_candidate`: either a cheap screen result
 /// (LM loop must upgrade with `update_with_curvature` on acceptance) or the
 /// full state when screening was not applicable.
@@ -62,7 +60,6 @@ pub enum CandidateEvaluation {
     Screen(CandidateScreen),
     Full(WorkingState),
 }
-
 
 impl CandidateEvaluation {
     #[inline]
@@ -96,7 +93,6 @@ impl CandidateEvaluation {
     }
 }
 
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PirlsAcceptedStateCacheKey {
     curvature: HessianCurvatureKind,
@@ -104,7 +100,6 @@ pub(super) struct PirlsAcceptedStateCacheKey {
     beta_bits: Vec<u64>,
     arrow_latent_bits: Option<Vec<u64>>,
 }
-
 
 impl PirlsAcceptedStateCacheKey {
     pub(crate) fn requested(
@@ -149,7 +144,6 @@ impl PirlsAcceptedStateCacheKey {
     }
 }
 
-
 /// Uncertainty inputs for integrated (GHQ) IRLS updates.
 #[derive(Clone, Copy)]
 pub(crate) struct IntegratedWorkingInput<'a> {
@@ -159,7 +153,6 @@ pub(crate) struct IntegratedWorkingInput<'a> {
     pub sas_link_state: Option<&'a SasLinkState>,
 }
 
-
 pub struct WorkingDerivativeBuffersMut<'a> {
     pub(crate) c: &'a mut Array1<f64>,
     pub(crate) d: &'a mut Array1<f64>,
@@ -168,7 +161,6 @@ pub struct WorkingDerivativeBuffersMut<'a> {
     pub(crate) d3mu_deta3: &'a mut Array1<f64>,
 }
 
-
 /// Contiguous mutable views of the three core working buffers (`mu`, `weights`,
 /// `z`) shared by every PIRLS working-state writer.
 pub(super) struct WorkingSlices<'a> {
@@ -176,7 +168,6 @@ pub(super) struct WorkingSlices<'a> {
     pub weights: &'a mut [f64],
     pub z: &'a mut [f64],
 }
-
 
 /// Contiguous mutable views of the Newton derivative/curvature buffers
 /// (`c`, `d`, `dmu/deta` jet) shared by the full-derivative PIRLS writers.
@@ -187,7 +178,6 @@ pub(super) struct WorkingDerivSlices<'a> {
     pub d2: &'a mut [f64],
     pub d3: &'a mut [f64],
 }
-
 
 /// Canonical "contiguous-or-panic" unpacking of the three core working buffers.
 ///
@@ -205,7 +195,6 @@ pub(super) fn working_slices<'a>(
         z: z.as_slice_mut().expect("z must be contiguous"),
     }
 }
-
 
 /// Canonical "contiguous-or-panic" unpacking of the Newton derivative buffers.
 ///
@@ -234,7 +223,6 @@ pub(super) fn working_deriv_slices<'a>(
     }
 }
 
-
 #[derive(Clone, Copy)]
 pub(crate) struct WorkingBernoulliGeometry {
     pub(crate) mu: f64,
@@ -243,7 +231,6 @@ pub(crate) struct WorkingBernoulliGeometry {
     pub(crate) c: f64,
     pub(crate) d: f64,
 }
-
 
 /// Shared likelihood interface used by PIRLS working updates.
 ///
@@ -270,7 +257,6 @@ pub(crate) trait WorkingLikelihood {
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError>;
 }
-
 
 impl WorkingLikelihood for GlmLikelihoodSpec {
     fn irls_update(
@@ -434,5 +420,3 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         Ok(calculate_deviance(y, mu, self, priorweights))
     }
 }
-
-

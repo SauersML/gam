@@ -1,9 +1,10 @@
 use super::*;
 
-pub(crate) fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'static str, &[usize])> {
+pub(crate) fn spatial_basiswarning_family_and_cols(
+    term: &SmoothTermSpec,
+) -> Option<(&'static str, &[usize])> {
     spatial_basiswarning_family_and_cols_basis(&term.basis)
 }
-
 
 pub(crate) fn spatial_basiswarning_family_and_cols_basis(
     basis: &SmoothBasisSpec,
@@ -30,7 +31,6 @@ pub(crate) fn spatial_basiswarning_family_and_cols_basis(
         | SmoothBasisSpec::FactorSmooth { .. } => None,
     }
 }
-
 
 pub(crate) fn collect_spatial_smooth_usagewarnings(
     spec: &TermCollectionSpec,
@@ -100,7 +100,6 @@ pub(crate) fn collect_spatial_smooth_usagewarnings(
         .collect()
 }
 
-
 pub(crate) fn collect_linear_smooth_overlapwarnings(
     spec: &TermCollectionSpec,
     headers: &[String],
@@ -145,7 +144,6 @@ pub(crate) fn collect_linear_smooth_overlapwarnings(
     }
     warnings
 }
-
 
 pub(crate) fn collect_hierarchical_smooth_overlapwarnings(
     spec: &TermCollectionSpec,
@@ -202,7 +200,6 @@ pub(crate) fn collect_hierarchical_smooth_overlapwarnings(
     warnings
 }
 
-
 pub(crate) fn collect_smooth_structure_warnings(
     spec: &TermCollectionSpec,
     headers: &[String],
@@ -216,13 +213,11 @@ pub(crate) fn collect_smooth_structure_warnings(
     warnings
 }
 
-
 pub(crate) fn emit_smooth_structure_warnings(stage: &str, warnings: &[String]) {
     for warning in warnings {
         cli_err!("WARNING [{stage}]: {warning}");
     }
 }
-
 
 /// Build anisotropic spatial-geometry report rows from an optional resolved spec.
 pub(crate) fn build_anisotropic_scales_rows(
@@ -262,7 +257,6 @@ pub(crate) fn build_anisotropic_scales_rows(
     rows
 }
 
-
 /// Build measure-jet spectrum report rows from a saved (frozen) spec alone:
 /// realized band + spec order, no per-scale λ̂s (those need the rebuilt
 /// design's penalty layout). Used when the report runs without a dataset.
@@ -298,7 +292,6 @@ pub(crate) fn measure_jet_spectrum_rows_from_spec(
     rows
 }
 
-
 /// Implied continuous order from a measure-jet raw-form per-scale λ spectrum:
 /// ŝ = −½ · (least-squares slope of ln λ̂_ℓ on ln ε_ℓ). `None` unless at
 /// least two scales carry finite positive (ε_ℓ, λ̂_ℓ) and the band has
@@ -323,7 +316,6 @@ pub(crate) fn measure_jet_implied_order(per_scale: &[(f64, f64)]) -> Option<f64>
     let s_hat = -0.5 * (sxy / sxx);
     s_hat.is_finite().then_some(s_hat)
 }
-
 
 /// Print learned per-axis spatial anisotropy for spatial terms to stdout.
 pub(crate) fn print_spatial_aniso_scales(spec: &TermCollectionSpec) {

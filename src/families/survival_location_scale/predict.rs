@@ -449,7 +449,10 @@ pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f
     }
 }
 
-pub(crate) fn linear_predictor_se(x: ndarray::ArrayView2<'_, f64>, cov: &Array2<f64>) -> Array1<f64> {
+pub(crate) fn linear_predictor_se(
+    x: ndarray::ArrayView2<'_, f64>,
+    cov: &Array2<f64>,
+) -> Array1<f64> {
     let xc = crate::faer_ndarray::fast_ab(&x, cov);
     Array1::from_iter((0..x.nrows()).map(|i| x.row(i).dot(&xc.row(i)).max(0.0).sqrt()))
 }

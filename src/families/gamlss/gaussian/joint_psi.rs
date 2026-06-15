@@ -278,7 +278,8 @@ pub(crate) struct LocationScaleJointPsiWorkspace<F: LocationScaleJointPsiFamily>
     pub(crate) design_loc: Arc<Array2<f64>>,
     pub(crate) design_scale: Arc<Array2<f64>>,
     pub(crate) psi_directions: ExactNewtonJointPsiDirectCache<F::Direction>,
-    pub(crate) outer_score_subsample: Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
+    pub(crate) outer_score_subsample:
+        Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
 }
 
 impl<F: LocationScaleJointPsiFamily> LocationScaleJointPsiWorkspace<F> {
@@ -1274,4 +1275,3 @@ pub(crate) fn exp_sigma_derivs_up_to_fourth_array(
     }
     (sigma, d1, d2, d3, d4)
 }
-

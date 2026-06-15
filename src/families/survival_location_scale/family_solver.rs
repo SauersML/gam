@@ -2084,8 +2084,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let kernel = self.survival_ls_row_kernel(&q, &dynamic);
         let rows = crate::families::row_kernel::RowSet::All;
         let cache = crate::families::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
-        let nll_grad =
-            crate::families::row_kernel::row_kernel_gradient(&kernel, &cache, &rows);
+        let nll_grad = crate::families::row_kernel::row_kernel_gradient(&kernel, &cache, &rows);
         Ok(Some(-nll_grad))
     }
 

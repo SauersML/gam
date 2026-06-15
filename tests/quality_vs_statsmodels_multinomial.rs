@@ -746,7 +746,7 @@ fn multinomial_per_class_probability_se_intervals_are_calibrated() {
     // (η ≡ 0) to share the gauge with the fitted model. Moderate magnitudes keep
     // the classes overlapping (well-conditioned, finite MLE).
     let true_beta_rows: [[f64; 3]; 2] = [
-        [0.5, 1.1, -0.7], // class "a": intercept, x1, x2
+        [0.5, 1.1, -0.7],  // class "a": intercept, x1, x2
         [-0.4, -0.8, 0.9], // class "b"
     ];
     let mut true_coef = Array2::<f64>::zeros((3, 2));

@@ -249,7 +249,10 @@ impl SurvivalMarginalSlopeFamily {
         Ok((nll, grad, hess))
     }
 
-    pub(crate) fn build_eval_cache(&self, block_states: &[ParameterBlockState]) -> Result<EvalCache, String> {
+    pub(crate) fn build_eval_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<EvalCache, String> {
         let row_bases = (0..self.n)
             .into_par_iter()
             .map(|row| {
@@ -330,7 +333,6 @@ impl SurvivalMarginalSlopeFamily {
             OffsetChannelCurvatures { rows: curvatures },
         ))
     }
-
 }
 
 impl SurvivalMarginalSlopeFamily {
@@ -489,6 +491,4 @@ impl SurvivalMarginalSlopeFamily {
         }
         Ok(0.0)
     }
-
 }
-

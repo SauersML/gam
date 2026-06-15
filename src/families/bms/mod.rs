@@ -448,7 +448,11 @@ impl LatentMeasureKind {
     }
 }
 
-pub(crate) fn validate_empirical_z_grid(nodes: &[f64], weights: &[f64], context: &str) -> Result<(), String> {
+pub(crate) fn validate_empirical_z_grid(
+    nodes: &[f64],
+    weights: &[f64],
+    context: &str,
+) -> Result<(), String> {
     if nodes.len() != weights.len() {
         return Err(format!(
             "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
@@ -1253,7 +1257,11 @@ pub(crate) fn weighted_ridge_sandwich_cov(
 }
 
 /// Weighted mean of a slice of values.
-pub(crate) fn weighted_mean(values: &[f64], weights: ArrayView1<'_, f64>, total_weight: f64) -> f64 {
+pub(crate) fn weighted_mean(
+    values: &[f64],
+    weights: ArrayView1<'_, f64>,
+    total_weight: f64,
+) -> f64 {
     values
         .iter()
         .zip(weights.iter())

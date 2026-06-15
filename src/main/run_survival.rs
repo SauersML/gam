@@ -4,7 +4,6 @@ pub(crate) fn survival_working_reml_score(state: &gam::pirls::WorkingState) -> f
     0.5 * (state.deviance + state.penalty_term)
 }
 
-
 pub(crate) fn survival_time_initial_log_lambdas(
     time_build: &SurvivalTimeBuildOutput,
     penalties: &[Array2<f64>],
@@ -16,7 +15,6 @@ pub(crate) fn survival_time_initial_log_lambdas(
         Some(Array1::from_elem(penalties.len(), lambda0))
     }
 }
-
 
 pub(crate) fn build_survival_time_initial_beta(
     likelihood_mode: SurvivalLikelihoodMode,
@@ -60,7 +58,6 @@ pub(crate) fn build_survival_time_initial_beta(
     )
 }
 
-
 /// Recover the fitted Weibull `(scale, shape)` baseline from the anchor-CENTERED
 /// linear `[1, log t]` time-basis coefficients.
 ///
@@ -93,11 +90,9 @@ pub(crate) fn fitted_weibull_baseline_from_linear_time_beta(
     Some((scale, shape))
 }
 
-
 pub(crate) fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
     model.has_baseline_time_wiggle()
 }
-
 
 /// Inner-PIRLS options shared by both survival-baseline fit sites (the
 /// per-candidate trial fit and the final baseline fit). Centralised so the two
@@ -119,7 +114,6 @@ pub(crate) fn survival_baseline_pirls_options() -> gam::pirls::WorkingModelPirls
         arrow_schur: None,
     }
 }
-
 
 pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);

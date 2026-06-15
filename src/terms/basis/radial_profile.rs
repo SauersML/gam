@@ -83,7 +83,12 @@ impl RadialProfile {
         None
     }
 
-    pub(crate) fn build_at(kind: &RadialScalarKind, u_lo: f64, u_hi: f64, m: usize) -> Option<Self> {
+    pub(crate) fn build_at(
+        kind: &RadialScalarKind,
+        u_lo: f64,
+        u_hi: f64,
+        m: usize,
+    ) -> Option<Self> {
         // Chebyshev nodes of the first kind (no endpoints).
         let mut values: [Vec<f64>; 3] = [vec![0.0; m], vec![0.0; m], vec![0.0; m]];
         let mut nodes_x = vec![0.0_f64; m];

@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 /// Schur-eliminate the per-row latent block and solve with an explicit BA
 /// mode, returning the factor cache alongside the increments.
 ///
@@ -136,13 +135,11 @@ pub fn solve_arrow_newton_step_with_options(
     Ok((delta_t, delta_beta, cache))
 }
 
-
 pub(crate) fn estimated_htbeta_bytes(n: usize, d: usize, k: usize) -> Option<usize> {
     n.checked_mul(d)?
         .checked_mul(k)?
         .checked_mul(std::mem::size_of::<f64>())
 }
-
 
 /// Schur-eliminate the per-row latent block and solve with explicit options,
 /// returning `(Δt, Δβ, PcgDiagnostics)`.
@@ -205,7 +202,6 @@ pub fn solve_arrow_newton_step_core(
         .map(|step| (step.delta_t, step.delta_beta, step.pcg_diagnostics))
 }
 
-
 /// Build and inject the GPU reduced-Schur matvec backend for an admitted
 /// `InexactPCG` solve, returning a cloned `ArrowSolveOptions` carrying it.
 ///
@@ -253,7 +249,6 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     device_options.gpu_matvec = Some(matvec);
     Some(device_options)
 }
-
 
 /// Admission + dispatch for the device-resident Direct Arrow-Schur point solve.
 ///
@@ -334,7 +329,6 @@ pub(crate) fn try_device_arrow_direct(
     }
 }
 
-
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
 ///
 /// On `PerRowFactorFailed` / `PerRowFactorIllConditioned` /
@@ -402,7 +396,6 @@ pub fn solve_with_lm_escalation_inner(
     }
     Err(last_err.expect("escalation loop set last_err on failure"))
 }
-
 
 /// Solve a non-convex arrow-Schur step with adaptive proximal damping.
 ///
@@ -606,7 +599,6 @@ where
     })
 }
 
-
 /// Predicted reduction of the *damped* joint Arrow-Schur quadratic model.
 ///
 /// Includes the LM ridge terms in the quadratic:
@@ -667,7 +659,6 @@ pub fn arrow_damped_quadratic_model_reduction(
     Ok(-(lin + 0.5 * quad))
 }
 
-
 /// Predicted reduction of the *bare* joint Arrow-Schur quadratic model.
 ///
 /// Drops the LM ridge contributions from the quadratic so the predicted
@@ -715,7 +706,6 @@ pub fn arrow_bare_quadratic_model_reduction(
     Ok(damped + ridge_beta_contrib + ridge_t_contrib)
 }
 
-
 pub(crate) fn next_proximal_ridge(current: f64, growth: f64) -> f64 {
     if current > 0.0 {
         current * growth
@@ -723,7 +713,6 @@ pub(crate) fn next_proximal_ridge(current: f64, growth: f64) -> f64 {
         DEFAULT_PROXIMAL_INITIAL_RIDGE
     }
 }
-
 
 pub(crate) fn arrow_gradient_norm(sys: &ArrowSchurSystem) -> f64 {
     let mut sum = 0.0;
@@ -737,7 +726,6 @@ pub(crate) fn arrow_gradient_norm(sys: &ArrowSchurSystem) -> f64 {
     }
     sum.sqrt()
 }
-
 
 pub(crate) fn arrow_gradient_dot_step(
     sys: &ArrowSchurSystem,
@@ -760,7 +748,6 @@ pub(crate) fn arrow_gradient_dot_step(
     out
 }
 
-
 pub(crate) struct ArrowNewtonStepArtifacts {
     pub(crate) delta_t: Array1<f64>,
     pub(crate) delta_beta: Array1<f64>,
@@ -770,12 +757,10 @@ pub(crate) struct ArrowNewtonStepArtifacts {
     pub(crate) gauge_deflated_directions: usize,
 }
 
-
 pub(crate) struct ArrowBlockFactorization {
     pub(crate) factors: ArrowFactorSlab,
     pub(crate) gauge_deflated_directions: usize,
 }
-
 
 pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
@@ -814,7 +799,6 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
     })
 }
 
-
 pub(crate) enum MixedPrecisionAttempt {
     Certified {
         delta_t: Array1<f64>,
@@ -826,7 +810,6 @@ pub(crate) enum MixedPrecisionAttempt {
         reason: String,
     },
 }
-
 
 pub(crate) fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
@@ -914,7 +897,6 @@ pub(crate) fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
     }
     delta_t
 }
-
 
 pub(crate) fn try_mixed_precision_arrow_solve(
     sys: &ArrowSchurSystem,
@@ -1039,7 +1021,6 @@ pub(crate) fn try_mixed_precision_arrow_solve(
     }))
 }
 
-
 pub(crate) fn mixed_precision_kappa_gate_failure(
     htt_factors: &ArrowFactorSlab,
     schur_factor: &Array2<f64>,
@@ -1085,14 +1066,12 @@ pub(crate) fn mixed_precision_kappa_gate_failure(
     }
 }
 
-
 pub(crate) fn arrow_factor_slab_to_f32(htt_factors: &ArrowFactorSlab) -> Vec<Array2<f32>> {
     htt_factors
         .iter()
         .map(|factor| factor.mapv(|v| v as f32))
         .collect()
 }
-
 
 pub(crate) fn arrow_rhs(sys: &ArrowSchurSystem) -> (Array1<f64>, Array1<f64>) {
     let n = sys.rows.len();
@@ -1110,7 +1089,6 @@ pub(crate) fn arrow_rhs(sys: &ArrowSchurSystem) -> (Array1<f64>, Array1<f64>) {
     }
     (rhs_t, rhs_beta)
 }
-
 
 pub(crate) fn solve_arrow_system_f32(
     sys: &ArrowSchurSystem,
@@ -1161,7 +1139,6 @@ pub(crate) fn solve_arrow_system_f32(
     Ok((x_t, x_beta))
 }
 
-
 pub(crate) fn cholesky_solve_lower_f32(l: &Array2<f32>, b: &Array1<f32>) -> Array1<f32> {
     let n = l.nrows();
     // Precondition: positive, finite factor diagonals (see
@@ -1193,7 +1170,6 @@ pub(crate) fn cholesky_solve_lower_f32(l: &Array2<f32>, b: &Array1<f32>) -> Arra
     x
 }
 
-
 pub(crate) fn arrow_residual(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
@@ -1214,7 +1190,6 @@ pub(crate) fn arrow_residual(
     }
     (res_t, res_beta)
 }
-
 
 pub(crate) fn arrow_operator_apply(
     sys: &ArrowSchurSystem,
@@ -1256,7 +1231,6 @@ pub(crate) fn arrow_operator_apply(
     (y_t, y_beta)
 }
 
-
 pub(crate) fn arrow_backward_error_certificate(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
@@ -1280,7 +1254,6 @@ pub(crate) fn arrow_backward_error_certificate(
     }
 }
 
-
 pub(crate) fn infinity_norm_pair(lhs: ArrayView1<'_, f64>, rhs: ArrayView1<'_, f64>) -> f64 {
     let mut out = 0.0_f64;
     for &v in lhs.iter().chain(rhs.iter()) {
@@ -1288,7 +1261,6 @@ pub(crate) fn infinity_norm_pair(lhs: ArrayView1<'_, f64>, rhs: ArrayView1<'_, f
     }
     out
 }
-
 
 pub(crate) fn arrow_operator_infinity_norm(
     sys: &ArrowSchurSystem,
@@ -1330,7 +1302,6 @@ pub(crate) fn arrow_operator_infinity_norm(
     }
     Ok(out)
 }
-
 
 pub(crate) fn solve_arrow_newton_step_artifacts(
     sys: &ArrowSchurSystem,
@@ -1535,7 +1506,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     })
 }
 
-
 /// Exact inverse of the block-diagonal arrow operator `K0 + ridge`, used as
 /// the preconditioner for the cross-row full-system CG.
 ///
@@ -1550,7 +1520,6 @@ pub(crate) struct ArrowBlockDiagInverse<'a, B: BatchedBlockSolver> {
     pub(crate) htt_factors: ArrowFactorSlab,
     pub(crate) schur_factor: Array2<f64>,
 }
-
 
 impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
     pub(crate) fn build(
@@ -1632,7 +1601,6 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
     }
 }
 
-
 /// Apply the full cross-row Newton operator `A = (K0 + ridge) + P_cross` to
 /// `[x_t; x_β]`, writing `[y_t; y_β]`.
 ///
@@ -1692,7 +1660,6 @@ pub(crate) fn arrow_cross_row_matvec(
     sys.apply_cross_row_penalty_hessian(x_t, &mut y_t);
     (y_t, y_beta)
 }
-
 
 /// Solve the full bordered Newton system when one or more registered Psi
 /// penalties couple distinct latent rows.
@@ -1844,9 +1811,13 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
     })
 }
 
-
 /// `⟨[a_t; a_β], [b_t; b_β]⟩` over the stacked latent/β vector.
-pub(crate) fn dot2(a_t: &Array1<f64>, a_beta: &Array1<f64>, b_t: &Array1<f64>, b_beta: &Array1<f64>) -> f64 {
+pub(crate) fn dot2(
+    a_t: &Array1<f64>,
+    a_beta: &Array1<f64>,
+    b_t: &Array1<f64>,
+    b_beta: &Array1<f64>,
+) -> f64 {
     let mut acc = 0.0_f64;
     for i in 0..a_t.len() {
         acc += a_t[i] * b_t[i];
@@ -1856,7 +1827,6 @@ pub(crate) fn dot2(a_t: &Array1<f64>, a_beta: &Array1<f64>, b_t: &Array1<f64>, b
     }
     acc
 }
-
 
 /// Solve `L Lᵀ x = b` given the lower Cholesky factor `L`.
 pub(crate) fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
@@ -1890,7 +1860,6 @@ pub(crate) fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f
     }
     x
 }
-
 
 pub(crate) fn reduced_rhs_beta<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
@@ -1945,7 +1914,6 @@ pub(crate) fn reduced_rhs_beta<B: BatchedBlockSolver + Sync>(
     rhs_beta
 }
 
-
 /// Which Square-Root / direct factorization the per-row Schur contribution
 /// uses. `Direct` forms `H_tβᵀ (H_tt)⁻¹ H_tβ` via a full block solve; `SqrtBa`
 /// forms the equivalent `(L⁻¹ H_tβ)ᵀ (L⁻¹ H_tβ)` from the lower triangular
@@ -1955,7 +1923,6 @@ pub(crate) enum SchurReductionKind {
     Direct,
     SqrtBa,
 }
-
 
 /// Form one row block's `(left, right)` Schur contribution factors so that the
 /// contribution is `leftᵀ · right` (`k×k`). `Direct` solves the full block,
@@ -1984,7 +1951,6 @@ pub(crate) fn row_schur_contribution_factors<B: BatchedBlockSolver>(
         }
     }
 }
-
 
 /// Subtract one row block's Schur contribution from `schur` using the selected
 /// reduction kind. Identical algebra to the inline loop bodies the dense

@@ -89,8 +89,8 @@ mod persistent_cache;
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.
 pub use block_spec::*;
 pub(crate) use blockwise_solve::*;
-pub(crate) use covariance::*;
 pub use coefficient_groups::*;
+pub(crate) use covariance::*;
 pub use error::*;
 pub use family_trait::*;
 pub use fit::*;

@@ -138,7 +138,11 @@ pub(crate) fn factorize_psd_covariance(
     })
 }
 
-pub(crate) fn apply_low_rank_gaussian_factor3(mu: [f64; 3], factor: &Array2<f64>, z: &[f64]) -> [f64; 3] {
+pub(crate) fn apply_low_rank_gaussian_factor3(
+    mu: [f64; 3],
+    factor: &Array2<f64>,
+    z: &[f64],
+) -> [f64; 3] {
     let mut x = mu;
     for row in 0..3 {
         for (col, &latent) in z.iter().enumerate() {

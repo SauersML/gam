@@ -249,6 +249,4 @@ impl SurvivalMarginalSlopeFamily {
             .into()),
         }
     }
-
 }
-

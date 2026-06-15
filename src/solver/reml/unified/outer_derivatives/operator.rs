@@ -95,12 +95,7 @@ impl HyperOperator for BorrowedStoredDriftOperator<'_> {
         }
     }
 
-    fn scaled_add_mul_vec(
-        &self,
-        v: ArrayView1<'_, f64>,
-        scale: f64,
-        out: ArrayViewMut1<'_, f64>,
-    ) {
+    fn scaled_add_mul_vec(&self, v: ArrayView1<'_, f64>, scale: f64, out: ArrayViewMut1<'_, f64>) {
         if scale == 0.0 {
             return;
         }

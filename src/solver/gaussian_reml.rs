@@ -2133,8 +2133,7 @@ pub fn build_gaussian_reml_eigen_cache_batched(
                 .into_iter()
                 .enumerate()
                 .map(|(b, lower)| {
-                    let precomputed_transform =
-                        transforms.as_ref().map(|t| t[b].clone());
+                    let precomputed_transform = transforms.as_ref().map(|t| t[b].clone());
                     gaussian_reml_eigen_cache_from_lower_with_transform(
                         lower,
                         penalty,

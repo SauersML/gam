@@ -15,7 +15,6 @@ pub struct CollocationOperatorMatrices {
     pub polynomial_block_cols: usize,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct DuchonOperatorPenaltyMatrices {
     pub mass: Array2<f64>,
@@ -23,12 +22,10 @@ pub struct DuchonOperatorPenaltyMatrices {
     pub stiffness: Array2<f64>,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct ThinPlatePenaltyMatrix {
     pub penalty: Array2<f64>,
 }
-
 
 pub(crate) fn validate_center_count(num_centers: usize) -> Result<(), BasisError> {
     if num_centers == 0 {
@@ -36,7 +33,6 @@ pub(crate) fn validate_center_count(num_centers: usize) -> Result<(), BasisError
     }
     Ok(())
 }
-
 
 pub(crate) fn select_equal_mass_centers(
     data: ArrayView2<'_, f64>,
@@ -190,7 +186,6 @@ pub(crate) fn select_equal_mass_centers(
     Ok(centers)
 }
 
-
 pub(crate) fn select_equal_mass_covar_representative_centers(
     data: ArrayView2<'_, f64>,
     num_centers: usize,
@@ -247,7 +242,6 @@ pub(crate) fn select_equal_mass_covar_representative_centers(
     }
     Ok(centers)
 }
-
 
 pub(crate) fn select_kmeans_centers(
     data: ArrayView2<'_, f64>,
@@ -351,7 +345,6 @@ pub(crate) fn select_kmeans_centers(
     Ok(centers)
 }
 
-
 pub(crate) fn cartesian_grid_axes(axes: &[Array1<f64>]) -> Result<Array2<f64>, BasisError> {
     if axes.is_empty() {
         crate::bail_invalid_basis!("uniform grid requires at least one axis");
@@ -373,7 +366,6 @@ pub(crate) fn cartesian_grid_axes(axes: &[Array1<f64>]) -> Result<Array2<f64>, B
     }
     Ok(out)
 }
-
 
 pub(crate) fn select_uniform_grid_centers(
     data: ArrayView2<'_, f64>,

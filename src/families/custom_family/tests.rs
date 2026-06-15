@@ -1371,7 +1371,8 @@ pub(crate) struct BinomialLocationScaleWiggleOuterFixture {
     pub(crate) options: BlockwiseFitOptions,
 }
 
-pub(crate) fn binomial_location_scale_wiggle_outer_fixture() -> BinomialLocationScaleWiggleOuterFixture {
+pub(crate) fn binomial_location_scale_wiggle_outer_fixture()
+-> BinomialLocationScaleWiggleOuterFixture {
     let base = binomial_location_scale_base_fixture();
     let q_seed = Array1::linspace(-1.4, 1.4, base.n);
     let knots = crate::families::wiggle::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
@@ -7521,7 +7522,8 @@ pub(crate) fn shrink_active_joint_block_trust_radii_strictly_decreases_max_radiu
 }
 
 #[test]
-pub(crate) fn shrink_active_joint_block_trust_radii_decreases_max_when_max_held_by_interior_block() {
+pub(crate) fn shrink_active_joint_block_trust_radii_decreases_max_when_max_held_by_interior_block()
+{
     // Production stall (Rust CI Test job ~2-hour hang, cycles
     // 117..305+ all logging
     // `r=1.562e-2 (held) decision=shrink_reject |δ|=1.562e-2`
@@ -7903,7 +7905,8 @@ pub(crate) fn kkt_refusal_diagnosis_string_round_trip_through_bubbled_error_pars
 }
 
 #[test]
-pub(crate) fn kkt_refusal_guidance_distinguishes_marginal_slope_coupling_from_polynomial_nullspace() {
+pub(crate) fn kkt_refusal_guidance_distinguishes_marginal_slope_coupling_from_polynomial_nullspace()
+{
     let phantom = KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH.guidance();
     assert!(phantom.contains("marginal/logslope coupling"));
     assert!(phantom.contains("rather than a"));

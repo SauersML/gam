@@ -6,7 +6,6 @@ use super::*;
 
 pub(crate) const BINOMIAL_MU_EPS: f64 = 1e-12;
 
-
 /// Clamp `mu` away from 0 and 1 so `mu.ln()` and `(1 - mu).ln()` are finite.
 /// Centralized to keep deviance and log-likelihood symmetric — both must use
 /// the same floor or the log-lik / deviance identity drifts near saturation.
@@ -15,12 +14,10 @@ pub(crate) fn safe_mu_for_binomial(mu: f64) -> f64 {
     mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
 }
 
-
 #[inline]
 pub(crate) fn xlogy(x: f64, y: f64) -> f64 {
     if x == 0.0 { 0.0 } else { x * y.ln() }
 }
-
 
 #[inline]
 pub(crate) fn log_gamma_stirling_correction(x: f64) -> f64 {
@@ -29,7 +26,6 @@ pub(crate) fn log_gamma_stirling_correction(x: f64) -> f64 {
     inv / 12.0 - inv * inv2 / 360.0 + inv * inv2 * inv2 / 1260.0
 }
 
-
 #[inline]
 pub(crate) fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
     let ratio = delta / base;
@@ -37,7 +33,6 @@ pub(crate) fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
         + log_gamma_stirling_correction(base + delta)
         - log_gamma_stirling_correction(base)
 }
-
 
 #[inline]
 pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
@@ -57,19 +52,16 @@ pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
         - log_gamma_stirling_correction(b)
 }
 
-
 #[inline]
 pub(crate) fn poisson_unit_deviance(yi: f64, mui_c: f64) -> f64 {
     xlogy(yi, yi / mui_c) - (yi - mui_c)
 }
-
 
 #[inline]
 pub(crate) fn gamma_unit_deviance(yi_c: f64, mui_c: f64) -> f64 {
     let ratio = yi_c / mui_c;
     ratio - 1.0 - ratio.ln()
 }
-
 
 #[inline]
 pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
@@ -85,7 +77,6 @@ pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
     }
 }
 
-
 #[inline]
 pub(crate) fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
     if !valid_negbin_theta(theta) || !valid_count_response(yi) {
@@ -95,7 +86,6 @@ pub(crate) fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -
     let theta_term = theta * ((theta + mui_c) / (theta + yi)).ln();
     theta_term + y_term
 }
-
 
 #[inline]
 pub(crate) fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
@@ -110,7 +100,6 @@ pub(crate) fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
         - (1.0 - yi).ln()
 }
 
-
 #[inline]
 pub(crate) fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
     if !valid_beta_response(yi) {
@@ -118,7 +107,6 @@ pub(crate) fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
     }
     beta_loglikelihood_full_unit(yi, yi, phi) - beta_loglikelihood_full_unit(yi, mui, phi)
 }
-
 
 #[inline]
 pub fn calculate_deviance(
@@ -253,7 +241,6 @@ pub fn calculate_deviance(
         ResponseFamily::RoystonParmar => f64::NAN,
     }
 }
-
 
 #[inline]
 /// Per-observation log-likelihood (with the same family-specific constants
@@ -390,7 +377,6 @@ pub fn pointwise_loglikelihood_omitting_constants(
     Array1::from_vec(values)
 }
 
-
 pub(crate) fn calculate_loglikelihood_omitting_constants(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
@@ -508,7 +494,6 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
         ResponseFamily::RoystonParmar => f64::NAN,
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Piece 5: structured low-rank weight in the inner solve.

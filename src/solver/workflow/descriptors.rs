@@ -17,16 +17,17 @@ use ndarray::{Array1, Array2, Array3};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
+use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, IBPAssignmentPenalty,
-    IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
-    MechanismSparsityPenalty, MonotonicityPenalty, NestedPrefixPenalty, NuclearNormPenalty,
-    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
-    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty, TotalVariationPenalty,
+    IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
+    MonotonicityPenalty, NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
+    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
+    TotalVariationPenalty,
 };
-use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
 
 /// A latent block a penalty descriptor can target, identified either by name or
 /// by declaration index in the `latents` object.

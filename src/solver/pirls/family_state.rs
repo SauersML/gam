@@ -12,7 +12,6 @@ pub(crate) fn standard_inverse_link_jet(
     crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta)
 }
 
-
 #[inline]
 pub(crate) fn bernoulli_logit_geometry_from_jet(
     eta_raw: f64,
@@ -37,7 +36,6 @@ pub(crate) fn bernoulli_logit_geometry_from_jet(
         d,
     }
 }
-
 
 /// Compute working IRLS geometry for a single Bernoulli observation.
 ///
@@ -97,7 +95,6 @@ pub(crate) fn bernoulli_geometry_from_jet(
     }
 }
 
-
 #[inline]
 pub(crate) fn bernoulli_exact_working_response(eta: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
     // Preserve the exact IRLS score carrier W(z-eta) = y-mu whenever the link
@@ -111,7 +108,6 @@ pub(crate) fn bernoulli_exact_working_response(eta: f64, y: f64, mu: f64, dmu_de
     }
     eta
 }
-
 
 #[inline]
 pub(crate) fn write_identityworking_state(
@@ -134,7 +130,6 @@ pub(crate) fn write_identityworking_state(
         derivs.d3mu_deta3.fill(0.0);
     }
 }
-
 
 /// Working state for Poisson with a log link.
 ///
@@ -169,7 +164,6 @@ pub(crate) fn write_poisson_log_working_state(
         derivatives,
     );
 }
-
 
 /// Working state for Gamma(shape = k) with a log link.
 ///
@@ -207,9 +201,7 @@ pub(crate) fn write_gamma_log_working_state(
     );
 }
 
-
 pub const BETA_MU_EPS: f64 = 1.0e-12;
-
 
 #[inline]
 pub(crate) fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
@@ -219,18 +211,15 @@ pub(crate) fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
     mu.max(1.0e-300).powf(2.0 - p)
 }
 
-
 #[inline]
 pub(crate) fn valid_negbin_theta(theta: f64) -> bool {
     theta.is_finite() && theta > 0.0
 }
 
-
 #[inline]
 pub(crate) fn valid_count_response(y: f64) -> bool {
     y.is_finite() && y >= 0.0 && (y - y.round()).abs() <= 1e-9
 }
-
 
 pub(crate) fn validate_count_responses(
     y: &ArrayView1<'_, f64>,
@@ -247,18 +236,15 @@ pub(crate) fn validate_count_responses(
     Ok(())
 }
 
-
 #[inline]
 pub(crate) fn valid_beta_phi(phi: f64) -> bool {
     phi.is_finite() && phi > 0.0
 }
 
-
 #[inline]
 pub(crate) fn valid_beta_response(y: f64) -> bool {
     y.is_finite() && y > 0.0 && y < 1.0
 }
-
 
 pub(crate) fn validate_beta_responses(
     y: &ArrayView1<'_, f64>,
@@ -274,12 +260,10 @@ pub(crate) fn validate_beta_responses(
     Ok(())
 }
 
-
 #[inline]
 pub(crate) fn valid_tweedie_response(y: f64) -> bool {
     y.is_finite() && y >= 0.0
 }
-
 
 pub(crate) fn validate_tweedie_responses(
     y: &ArrayView1<'_, f64>,
@@ -295,12 +279,10 @@ pub(crate) fn validate_tweedie_responses(
     Ok(())
 }
 
-
 #[inline]
 pub(crate) fn safe_beta_mu(mu: f64) -> f64 {
     mu.clamp(BETA_MU_EPS, 1.0 - BETA_MU_EPS)
 }
-
 
 #[inline]
 pub(crate) fn trigamma(mut x: f64) -> f64 {
@@ -318,7 +300,6 @@ pub(crate) fn trigamma(mut x: f64) -> f64 {
         + inv2 * inv2 * inv2 * inv / 42.0
         - inv2 * inv2 * inv2 * inv2 * inv / 30.0
 }
-
 
 #[inline]
 pub(crate) fn polygamma2(mut x: f64) -> f64 {
@@ -338,7 +319,6 @@ pub(crate) fn polygamma2(mut x: f64) -> f64 {
         - 5.0 * inv2 * inv2 * inv2 * inv3 * inv3 / 6.0
 }
 
-
 #[inline]
 pub(crate) fn polygamma3(mut x: f64) -> f64 {
     if !(x.is_finite() && x > 0.0) {
@@ -357,7 +337,6 @@ pub(crate) fn polygamma3(mut x: f64) -> f64 {
         - 3.0 * inv4 * inv3 * inv4
         + 10.0 * inv4 * inv4 * inv4 * inv
 }
-
 
 #[inline]
 pub(crate) fn beta_logit_working_curvature_eta_derivatives(
@@ -383,7 +362,6 @@ pub(crate) fn beta_logit_working_curvature_eta_derivatives(
             + q_sq * (phi * q_prime * psi2_diff + phi_sq * q_sq * psi3_sum));
     (c, d)
 }
-
 
 /// Working state for Tweedie with a log link.
 ///
@@ -438,7 +416,6 @@ pub(crate) fn write_tweedie_log_working_state(
     Ok(())
 }
 
-
 /// Working state for NB(mu, theta) with a log link and fixed theta.
 ///
 /// The size parameter is treated as a fixed hyperparameter for this GLM stack;
@@ -480,7 +457,6 @@ pub(crate) fn write_negative_binomial_log_working_state(
     );
     Ok(())
 }
-
 
 /// Working state for Beta(mu * phi, (1 - mu) * phi) with a logit link.
 #[inline]

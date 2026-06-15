@@ -83,7 +83,6 @@ pub struct ImplicitDesignPsiDerivative {
     pub(crate) axis_combinations: Option<Vec<Vec<(usize, f64)>>>,
 }
 
-
 /// Streaming design derivative for one per-row latent coordinate `t[n, a]`.
 ///
 /// The operator stores the shared latent matrix plus either radial-kernel
@@ -94,7 +93,6 @@ pub struct ImplicitDesignPsiDerivative {
 pub struct LatentCoordDesignDerivative {
     pub(crate) provider: Arc<dyn LocalDesignJacobianProvider>,
 }
-
 
 #[derive(Debug, Clone)]
 pub(crate) struct RadialLatentCoordLocalDesignJacobian {
@@ -107,14 +105,12 @@ pub(crate) struct RadialLatentCoordLocalDesignJacobian {
     pub(crate) polynomial_order: Option<DuchonNullspaceOrder>,
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct JetLatentCoordLocalDesignJacobian {
     pub(crate) latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
     pub(crate) jet: Arc<Array3<f64>>,
     pub(crate) ident_transform: Option<Array2<f64>>,
 }
-
 
 impl std::fmt::Debug for LatentCoordDesignDerivative {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -128,7 +124,6 @@ impl std::fmt::Debug for LatentCoordDesignDerivative {
     }
 }
 
-
 impl Clone for LatentCoordDesignDerivative {
     fn clone(&self) -> Self {
         Self {
@@ -136,7 +131,6 @@ impl Clone for LatentCoordDesignDerivative {
         }
     }
 }
-
 
 impl RadialLatentCoordLocalDesignJacobian {
     pub(crate) fn p_constrained(&self) -> usize {
@@ -156,7 +150,6 @@ impl RadialLatentCoordLocalDesignJacobian {
     }
 }
 
-
 impl JetLatentCoordLocalDesignJacobian {
     pub(crate) fn p_out(&self) -> usize {
         self.ident_transform
@@ -164,7 +157,6 @@ impl JetLatentCoordLocalDesignJacobian {
             .map_or(self.jet.shape()[1], Array2::ncols)
     }
 }
-
 
 /// The complete contract a per-row latent / novel-manifold coordinate type must
 /// supply to participate in the REML design-derivative operator surface.
@@ -268,20 +260,16 @@ pub(crate) trait LocalDesignJacobianProvider: Send + Sync + std::fmt::Debug {
     }
 }
 
-
 /// The rayon chunk size for parallel implicit matvec operations.
 /// Each chunk processes this many data points before reducing.
 pub(crate) const IMPLICIT_MATVEC_CHUNK_SIZE: usize = 1000;
 
-
 /// Minimum data size to activate parallel iteration for implicit matvecs.
 pub(crate) const IMPLICIT_MATVEC_PAR_THRESHOLD: usize = 10_000;
-
 
 /// Number of lower-triangular center rows per tile when assembling dense
 /// ThinPlate penalty ψ-derivative kernel blocks.
 pub(crate) const THIN_PLATE_PENALTY_PSI_TILE_ROWS: usize = 32;
-
 
 impl LatentCoordDesignDerivative {
     pub(crate) fn from_local_design_jacobian_provider(
@@ -507,7 +495,6 @@ impl LatentCoordDesignDerivative {
     }
 }
 
-
 impl RadialLatentCoordLocalDesignJacobian {
     pub(crate) fn project_and_pad(
         &self,
@@ -595,7 +582,6 @@ impl RadialLatentCoordLocalDesignJacobian {
     }
 }
 
-
 impl JetLatentCoordLocalDesignJacobian {
     pub(crate) fn project_jet(&self, raw_knot: &Array1<f64>) -> Result<Array1<f64>, BasisError> {
         Ok(match &self.ident_transform {
@@ -604,7 +590,6 @@ impl JetLatentCoordLocalDesignJacobian {
         })
     }
 }
-
 
 impl LocalDesignJacobianProvider for LatentCoordDesignDerivative {
     fn n_data(&self) -> usize {
@@ -631,7 +616,6 @@ impl LocalDesignJacobianProvider for LatentCoordDesignDerivative {
         self.provider.local_design_jacobian_row(row, axis)
     }
 }
-
 
 impl LocalDesignJacobianProvider for RadialLatentCoordLocalDesignJacobian {
     fn n_data(&self) -> usize {
@@ -664,7 +648,6 @@ impl LocalDesignJacobianProvider for RadialLatentCoordLocalDesignJacobian {
     }
 }
 
-
 impl LocalDesignJacobianProvider for JetLatentCoordLocalDesignJacobian {
     fn n_data(&self) -> usize {
         self.latent.n_obs()
@@ -694,7 +677,6 @@ impl LocalDesignJacobianProvider for JetLatentCoordLocalDesignJacobian {
         self.project_jet(&raw_knot)
     }
 }
-
 
 impl ImplicitDesignPsiDerivative {
     /// Construct from pre-computed radial jet scalars.
@@ -2507,7 +2489,11 @@ impl ImplicitDesignPsiDerivative {
     }
 
     #[inline]
-    pub(crate) fn transformed_combo_axis_value_materialized(&self, idx: usize, combo: &[(usize, f64)]) -> f64 {
+    pub(crate) fn transformed_combo_axis_value_materialized(
+        &self,
+        idx: usize,
+        combo: &[(usize, f64)],
+    ) -> f64 {
         combo
             .iter()
             .map(|(raw_axis, coeff)| coeff * self.axis_components[[idx, *raw_axis]])
@@ -2578,7 +2564,6 @@ impl ImplicitDesignPsiDerivative {
             + psi_scale_share * psi_scale_share * left_sum * right_sum * phi
     }
 }
-
 
 pub(crate) fn build_aniso_design_psi_derivatives_shared(
     data: ArrayView2<'_, f64>,
@@ -2806,14 +2791,12 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
     })
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct ScalarDesignPsiDerivatives {
     pub(crate) design_first: Array2<f64>,
     pub(crate) design_second_diag: Array2<f64>,
     pub(crate) implicit_operator: Option<ImplicitDesignPsiDerivative>,
 }
-
 
 pub(crate) fn build_scalar_design_psi_derivatives_shared(
     data: ArrayView2<'_, f64>,

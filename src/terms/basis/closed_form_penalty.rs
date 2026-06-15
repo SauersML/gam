@@ -634,7 +634,13 @@ pub(crate) fn duchon_small_chi_riesz_series_radial_derivatives(
     total.iter().map(|acc| acc.sum()).collect()
 }
 
-pub(crate) fn duchon_small_chi_riesz_series_value(d: usize, a: usize, b: usize, kappa: f64, r: f64) -> f64 {
+pub(crate) fn duchon_small_chi_riesz_series_value(
+    d: usize,
+    a: usize,
+    b: usize,
+    kappa: f64,
+    r: f64,
+) -> f64 {
     duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, 0, 0)[0]
 }
 
@@ -1273,7 +1279,12 @@ pub(crate) fn compress_terms(mut terms: Vec<(f64, f64, i32)>) -> Vec<(f64, f64, 
 /// Radial derivatives `[R^{(0)}, …, R^{(max_order)}]` of a single
 /// Riesz block `R_j^d(r) = c · r^{2j-d}` (non-log) or
 /// `c · r^{2n} · ln r` (log case `2j = d + 2n`).
-pub(crate) fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order: usize) -> Vec<f64> {
+pub(crate) fn riesz_block_radial_derivatives(
+    d: usize,
+    j: f64,
+    r: f64,
+    max_order: usize,
+) -> Vec<f64> {
     assert!(d >= 1, "riesz block requires dimension >= 1: d={d}");
     assert!(
         j.is_finite() && j >= 1.0,
@@ -1739,7 +1750,12 @@ pub(crate) fn is_zero_lag(r: &[f64]) -> bool {
 }
 
 /// Δ_B f(R) with f given by its radial derivatives `[f, f', f'', …]`.
-pub(crate) fn anisotropic_laplacian_of_radial_first(big_r: f64, s1: f64, u1: f64, fr: &[f64]) -> f64 {
+pub(crate) fn anisotropic_laplacian_of_radial_first(
+    big_r: f64,
+    s1: f64,
+    u1: f64,
+    fr: &[f64],
+) -> f64 {
     // Δ_B f = f''·u_1/R² + f'·(s_1/R - u_1/R³)
     let r2 = big_r * big_r;
     let r3 = r2 * big_r;

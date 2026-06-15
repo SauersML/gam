@@ -579,9 +579,13 @@ pub fn fit_latent_survival_terms(
         .iter()
         .any(|&code| code == LATENT_SURVIVAL_EVENT_INTERVAL);
     if has_interval_rows {
-        let warm_event_target = spec
-            .event_target
-            .mapv(|code| if code == LATENT_SURVIVAL_EVENT_INTERVAL { 0u8 } else { code });
+        let warm_event_target = spec.event_target.mapv(|code| {
+            if code == LATENT_SURVIVAL_EVENT_INTERVAL {
+                0u8
+            } else {
+                code
+            }
+        });
         let mut warm_family = family.clone();
         warm_family.event_target = warm_event_target;
         // Right-censored-at-L ignores the interval upper bound `R`, so the
@@ -604,9 +608,10 @@ pub fn fit_latent_survival_terms(
                  interval kernel): {e}"
             )
         })?;
-        let warm_beta_usable = warm_fit.block_states.iter().any(|s| {
-            s.beta.iter().all(|v| v.is_finite()) && s.beta.iter().any(|&v| v != 0.0)
-        });
+        let warm_beta_usable = warm_fit
+            .block_states
+            .iter()
+            .any(|s| s.beta.iter().all(|v| v.is_finite()) && s.beta.iter().any(|&v| v != 0.0));
         if !warm_beta_usable {
             return Err(
                 "latent interval warm start: right-censored-at-L surrogate returned a \

@@ -1066,6 +1066,111 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
             None
         };
 
+        let robust_jeffreys_hphi =
+            custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
+        let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
+        let batched_gradient_contract_allows_override =
+            batched_outer_gradient_contract_allows_override(
+                robust_jeffreys_hphi
+                    .as_ref()
+                    .map(|(_phi, hphi, _completion)| hphi),
+            );
+        let mut batched_gradient_override: Option<Array1<f64>> = None;
+        if !has_configured_rho_prior
+            && batched_gradient_contract_allows_override
+            && (eval_mode == EvalMode::ValueAndGradient
+                || eval_mode == EvalMode::ValueGradientHessian)
+            && let Ok(Some(batch)) = family.batched_outer_gradient_terms(
+                synced_joint_states.as_ref(),
+                specs,
+                derivative_blocks.as_ref(),
+                rho_current,
+                options,
+                hessian_workspace.clone(),
+            )
+        {
+            let expected = rho_dim + psi_dim;
+            if batch.objective_theta.len() == expected
+                && batch.trace_h_inv_hdot.len() == expected
+                && batch.trace_s_pinv_sdot.len() == expected
+            {
+                let mut gradient = Array1::<f64>::zeros(expected);
+                for j in 0..expected {
+                    let trace_term = if include_logdet_h {
+                        0.5 * batch.trace_h_inv_hdot[j]
+                    } else {
+                        0.0
+                    };
+                    let det_term = if include_logdet_s {
+                        0.5 * batch.trace_s_pinv_sdot[j]
+                    } else {
+                        0.0
+                    };
+                    gradient[j] = batch.objective_theta[j] + trace_term - det_term;
+                }
+                if eval_mode == EvalMode::ValueGradientHessian {
+                    batched_gradient_override = Some(gradient);
+                } else {
+                    let no_dh =
+                        |_direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                            Ok(None)
+                        };
+                    let no_d2h = |_u: &Array1<f64>,
+                                  _v: &Array1<f64>|
+                     -> Result<Option<DriftDerivResult>, String> {
+                        Ok(None)
+                    };
+                    let value_only = joint_outer_evaluate(
+                        &inner,
+                        specs,
+                        &per_block,
+                        rho_current,
+                        &beta_flat,
+                        h_joint_unpen,
+                        &ranges,
+                        total,
+                        ridge,
+                        moderidge,
+                        extra_logdet_ridge,
+                        rho_curvature_scale,
+                        hessian_logdet_correction,
+                        include_logdet_h,
+                        include_logdet_s,
+                        strict_spd,
+                        // The batched BMS gradient contracts traces through the
+                        // family's smooth pseudo-logdet operator. Pair it with the
+                        // same scalar value convention; the projected-subspace
+                        // value belongs only to the generic projected-gradient path.
+                        false,
+                        EvalMode::ValueOnly,
+                        options,
+                        crate::types::RhoPrior::Flat,
+                        family.pseudo_logdet_mode(),
+                        &no_dh,
+                        None,
+                        &no_d2h,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        robust_jeffreys_hphi.clone(),
+                        None,
+                    )?;
+                    return Ok(OuterObjectiveEvalResult {
+                        objective: value_only.objective,
+                        gradient,
+                        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                        warm_start: value_only.warm_start,
+                        inner_converged: inner.converged,
+                    });
+                }
+            }
+        }
+
         // Build ψ HyperCoords, pair callbacks, and drift derivative callback.
         let hessian_beta_independent = !family.exact_newton_joint_hessian_beta_dependent();
         let psi_workspace = if eval_mode != EvalMode::ValueOnly
@@ -1232,7 +1337,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
         };
 
         // Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
-        let eval_result = joint_outer_evaluate(
+        let mut eval_result = joint_outer_evaluate(
             &inner,
             specs,
             &per_block,
@@ -1249,15 +1354,16 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
             include_logdet_h,
             include_logdet_s,
             strict_spd,
-            // ψ-bearing path (matern/duchon marginal-slope kernel length-scales):
-            // use the projected #752 generalized determinant for value AND
-            // gradient AND Hessian — all produced by this single call, so they are
-            // consistent by construction. This is the route the clustered-PC
-            // matern bernoulli/survival marginal-slope fits take, where the
-            // range(Sλ)-only determinant dropped the penalty-null trend likelihood
-            // determinant and froze the outer gradient (gam#808/#787). No batched
-            // override is possible here (it is gated to psi_dim==0).
-            family.use_projected_penalty_logdet(),
+            // ψ-bearing generic path (matern/duchon marginal-slope kernel
+            // length-scales): use the projected #752 generalized determinant when
+            // this call owns all derivatives. If a batched first-order override
+            // is pending, pair its smooth spectral gradient with the same smooth
+            // pseudo-logdet scalar/Hessian convention.
+            if batched_gradient_override.is_some() {
+                false
+            } else {
+                family.use_projected_penalty_logdet()
+            },
             eval_mode,
             options,
             rho_prior.clone(),
@@ -1281,9 +1387,12 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                 hessian_workspace.clone(),
                 eval_mode,
             )?,
-            custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?,
+            robust_jeffreys_hphi,
             custom_family_outer_jeffreys_hphi_drift(family, &inner.block_states, specs, &ranges)?,
         )?;
+        if let Some(gradient) = batched_gradient_override {
+            eval_result.gradient = gradient;
+        }
 
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
         // with ρ coordinates first and ψ coordinates appended — matching the expected
