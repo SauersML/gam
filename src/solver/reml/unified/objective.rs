@@ -1280,6 +1280,62 @@ pub fn reml_laml_evaluate(
         grad[idx] = value;
     }
 
+    // KKT-residual correction for the ψ (ext) gradient — the exact analogue of
+    // the ρ correction applied above (`kkt_rho_corrections`), which was missing
+    // for the extended coordinates.
+    //
+    // When the inner solve exits at β̂ with a nonzero KKT residual
+    // `r = ∇_β L_pen(β̂)`, the cost carries the one-step Newton profile
+    // correction `−½ rᵀ H⁻¹ r` (applied above), so the CORRECTED scalar
+    // objective is `Ṽ(θ) = V(β̂,θ) − ½ rᵀ H⁻¹ r`. Differentiating the
+    // correction w.r.t. a ψ coordinate (holding β̂ fixed, the same convention
+    // the ρ block uses) with `q = H⁻¹ r`:
+    //
+    //   ∂_ψ r = ∂_ψ(∇_β L_pen)|_β = coord.g   (= score_psi + S_ψ β̂)
+    //   ∂_ψ H = Ḣ_ψ|_β            = the FROZEN ψ Hessian drift B_i
+    //   ∂_ψ(−½ rᵀ H⁻¹ r) = −(∂_ψ r)ᵀ q + ½ qᵀ (∂_ψ H) q
+    //                     = −coord.gᵀ q + ½ qᵀ B_i q.
+    //
+    // This is `compute_kkt_residual_rho_corrections`'s `C_i = −a_iᵀq + ½ qᵀA_iq`
+    // with the ρ ingredients `(a_i = A_iβ̂, A_i = λ_iS_i)` replaced by the ψ
+    // ingredients `(coord.g, B_i)`. It vanishes identically at exact KKT
+    // (`r = 0 ⇒ q = 0`); when the logslope block is near-singular and the inner
+    // exit accepts `‖r‖ > 0`, the dropped `−coord.gᵀq` term is amplified by
+    // `‖H⁻¹‖·‖r‖` and is exactly the large component the envelope ψ-gradient
+    // was missing relative to the centered FD of the corrected objective. The
+    // FROZEN drift (no IFT correction) is used — the IFT/β-response of the
+    // logdet trace is handled separately in the trace term; the residual
+    // correction differentiates `−½rᵀH⁻¹r` at fixed β̂ exactly as the ρ block
+    // does.
+    if ext_dim > 0
+        && let Some(r) = kkt_residual_vec
+            .as_ref()
+            .filter(|_| kkt_residual_correction_active)
+            .map(|r| r.as_ref())
+    {
+        let subspace = solution.penalty_subspace_trace.as_deref();
+        let q = solve_kkt_residual_kernel(hop, subspace, r);
+        for ext_idx in 0..ext_dim {
+            let coord = &solution.ext_coords[ext_idx];
+            // FROZEN ψ Hessian drift B_i (no IFT correction); `apply` matvecs the
+            // dense or operator form against `q`.
+            let frozen_drift = hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
+            let b_i_q = frozen_drift.apply(&q);
+            let linear = coord.g.dot(&q);
+            let quadratic = q.dot(&b_i_q);
+            if !linear.is_finite() || !quadratic.is_finite() {
+                return Err(RemlError::NonFiniteValue {
+                    reason: format!(
+                        "KKT ext correction produced non-finite ingredients at ext coord \
+                         {ext_idx}: linear={linear} quadratic={quadratic}"
+                    ),
+                }
+                .into());
+            }
+            grad[k + ext_idx] += -linear + 0.5 * quadratic;
+        }
+    }
+
     // Drain the per-call EIG-DECOMP sink into the calling thread's
     // thread-local stash. The rayon worker that produced the stash may
     // live on a different thread, but `store_terms` writes to the
