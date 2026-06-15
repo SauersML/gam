@@ -536,34 +536,56 @@ pub fn reml_laml_evaluate(
             .n_observations
             .saturating_mul(hop.dim())
             .saturating_mul((k + ext_dim).max(1));
-        // Serial-when-large is deliberate, NOT a throughput bug: each
-        // `hessian_derivative_correction_result` is an `Xᵀ·diag(c⊙Xvₖ)·X`
-        // crossproduct that already saturates every core via faer's global
-        // parallelism (`streaming_blas_xt_diag_x` → `get_global_parallelism`).
-        // Wrapping the outer per-coordinate map in `par_iter` for large work
-        // would nest a rayon fan-out around already-parallel BLAS-3 kernels and
-        // oversubscribe the thread pool, regressing wall-clock. The small-work
-        // branch goes parallel only because each correction is too thin to fill
-        // the pool on its own, so the outer fan-out is free there.
-        let parallel_corrections = correction_work <= 64_000_000;
-        if parallel_corrections {
-            correction_vs
-                .par_iter()
-                .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
+        // Preferred path: families whose `D_beta H[u_k]` operators share
+        // row-local state across all smoothing coordinates (e.g. the BMS exact
+        // joint-Newton workspace) expose a batched hook that fuses the whole
+        // per-row scan over the k+ext_dim directions into a SINGLE n-row pass
+        // (amortizing the per-row cached cell-moment / third-tensor work that
+        // would otherwise be recomputed once per direction) and parallelizes
+        // that pass across rows internally. Routing through it turns the former
+        // `serial(inner-parallel)` k× n-passes — which left the machine idle
+        // (`active_threads=0`) while each thin single-direction crossproduct
+        // failed to fill the pool — into one wide, fully-occupied pass.
+        if effective_deriv.has_batched_hessian_derivative_corrections() {
             log::info!(
-                "[STAGE] reml_laml coord_corrections mode=serial(inner-parallel) k={} ext_dim={} n={} dim={} work={}",
+                "[STAGE] reml_laml coord_corrections mode=batched(row-parallel) k={} ext_dim={} n={} dim={} work={}",
                 k,
                 ext_dim,
                 solution.n_observations,
                 hop.dim(),
                 correction_work
             );
-            correction_vs
-                .iter()
-                .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
-                .collect::<Result<Vec<_>, _>>()?
+            effective_deriv.hessian_derivative_corrections_result(&correction_vs)?
+        } else {
+            // Fallback for providers without a fused hook: each
+            // `hessian_derivative_correction_result` is an `Xᵀ·diag(c⊙Xvₖ)·X`
+            // crossproduct that, when large, already saturates every core via
+            // faer's global parallelism (`streaming_blas_xt_diag_x` →
+            // `get_global_parallelism`). Wrapping the outer per-coordinate map
+            // in `par_iter` for large work would nest a rayon fan-out around
+            // already-parallel BLAS-3 kernels and oversubscribe the pool. The
+            // small-work branch goes parallel only because each correction is
+            // too thin to fill the pool on its own, so the fan-out is free.
+            let parallel_corrections = correction_work <= 64_000_000;
+            if parallel_corrections {
+                correction_vs
+                    .par_iter()
+                    .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                log::info!(
+                    "[STAGE] reml_laml coord_corrections mode=serial(inner-parallel) k={} ext_dim={} n={} dim={} work={}",
+                    k,
+                    ext_dim,
+                    solution.n_observations,
+                    hop.dim(),
+                    correction_work
+                );
+                correction_vs
+                    .iter()
+                    .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
         }
     } else {
         (0..(k + ext_dim)).map(|_| None).collect()
