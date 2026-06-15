@@ -119,11 +119,11 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        platform:
-          - { runner: ubuntu-24.04,     target: x86_64 }
-          # Native ARM host — drops the QEMU emulation that dominated
-          # this matrix entry's wall time.
-          - { runner: ubuntu-24.04-arm, target: aarch64 }
+        # Fast on-demand path (linux_only=true) builds ONLY manylinux x86_64 —
+        # the glibc target consumed on the biobank box — so the upload job is
+        # not gated on the slower-to-schedule native-ARM runner. Full releases
+        # (push with a version bump, or a v* tag) build x86_64 + aarch64.
+        platform: ${{ (github.event.inputs.linux_only == 'true') && fromJSON('[{"runner":"ubuntu-24.04","target":"x86_64"}]') || fromJSON('[{"runner":"ubuntu-24.04","target":"x86_64"},{"runner":"ubuntu-24.04-arm","target":"aarch64"}]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -155,7 +155,9 @@ jobs:
 
   musllinux:
     needs: gate
-    if: needs.gate.outputs.should_run == 'true'
+    # Skipped on the fast linux_only path: musllinux + native-ARM wheels are
+    # the long pole, and the biobank box is glibc x86_64. Full releases build them.
+    if: needs.gate.outputs.should_run == 'true' && github.event.inputs.linux_only != 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: true
@@ -291,7 +293,7 @@ jobs:
     # actual results instead: require the Linux set to succeed, allow macos/
     # windows to be skipped (just not failed). The gate's `should_run=false`
     # path skips the wheel jobs, so their result is `skipped` and this stays off.
-    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.musllinux.result == 'success' && needs.sdist.result == 'success' && needs.macos.result != 'failure' && needs.windows.result != 'failure' }}
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.sdist.result == 'success' && needs.musllinux.result != 'failure' && needs.macos.result != 'failure' && needs.windows.result != 'failure' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/setup-python@v5
