@@ -35,9 +35,7 @@
 use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
 use gam::generative::NoiseModel;
-use gam::inference::predict::{
-    DispersionLocationScalePredictor, PredictInput, PredictableModel,
-};
+use gam::inference::predict::{DispersionLocationScalePredictor, PredictInput, PredictableModel};
 use gam::smooth::build_term_collection_design;
 use gam::types::LikelihoodSpec;
 use gam::{
@@ -294,8 +292,9 @@ fn run_scenario(s: &Scenario) {
         .predict_dispersion_scale(&input)
         .unwrap_or_else(|e| panic!("[{}] predict_dispersion_scale: {e}", s.name))
         .unwrap_or_else(|| panic!("[{}] predict_dispersion_scale returned None", s.name));
-    let noise = NoiseModel::from_likelihood_with_per_row_dispersion(&s.likelihood, dispersion.clone())
-        .unwrap_or_else(|e| panic!("[{}] build per-row NoiseModel: {e}", s.name));
+    let noise =
+        NoiseModel::from_likelihood_with_per_row_dispersion(&s.likelihood, dispersion.clone())
+            .unwrap_or_else(|e| panic!("[{}] build per-row NoiseModel: {e}", s.name));
 
     let mean = predictor
         .predict_plugin_response(&input)
