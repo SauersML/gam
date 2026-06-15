@@ -7620,7 +7620,7 @@ pub(crate) fn binomial_location_scale_expected_hphi_drift_matches_finite_differe
         .expect("expected info")
         .expect("expected info present");
     let analytic =
-        crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_directional_derivative(
+        crate::estimate::reml::jeffreys_subspace::hphi_directional_oracle_tests::joint_jeffreys_hphi_directional_derivative(
             info.view(),
             z.view(),
             &direction,

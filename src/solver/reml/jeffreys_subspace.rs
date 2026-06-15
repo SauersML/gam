@@ -1224,7 +1224,11 @@ where
     Ok(Some(out))
 }
 
-/// Exact directional derivative `D_β H_Φ[δ]` of the Tier-B Gauss-Newton Jeffreys
+#[cfg(test)]
+pub(crate) mod hphi_directional_oracle_tests {
+    use super::*;
+
+    /// Exact directional derivative `D_β H_Φ[δ]` of the Tier-B Gauss-Newton Jeffreys
 /// curvature surrogate along a coefficient-space direction `δ` (`delta`).
 ///
 /// CONTEXT (the outer-REML drift this exists to supply). The Tier-B outer LAML
@@ -1255,7 +1259,6 @@ where
 /// (so `H_Φ ≡ 0` in a neighborhood, hence `D_β H_Φ ≡ 0`), this returns the zero
 /// matrix — the safe value that leaves the existing `D_β H[v_k]`-only gradient
 /// unchanged rather than wrong.
-#[cfg(test)]
 pub fn joint_jeffreys_hphi_directional_derivative<DirFn, Dir2Fn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
@@ -1295,6 +1298,7 @@ where
         &pert_h,
         |axis| hessian_second_dir(delta, axis),
     )
+}
 }
 
 /// Explicit (β-frozen) derivative `∂_ρ H_Φ|_β` of the gated joint-Jeffreys
@@ -1946,7 +1950,7 @@ mod tests {
 
         let mut delta = Array1::<f64>::zeros(p);
         delta[0] = 1.0;
-        let analytic = joint_jeffreys_hphi_directional_derivative(
+        let analytic = super::hphi_directional_oracle_tests::joint_jeffreys_hphi_directional_derivative(
             h0.view(),
             z.view(),
             &delta,
