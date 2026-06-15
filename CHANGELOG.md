@@ -1,3 +1,27 @@
+## v0.3.117 — gam 0.3.117 / gamfit 0.1.203 (2026-06-15)
+
+crates.io catch-up release: publishes to the `gam` crate all the engine work
+that has already shipped to the `gamfit` wheel since gam 0.3.116 (gamfit
+0.1.199). No new code lands here — this only bumps the crate version and tags
+it so crates.io consumers of `gam` get the accumulated 0.1.200–0.1.203 work.
+Highlights of what is now on crates.io:
+
+- Batched row-parallel `coord_corrections` in the outer REML/LAML gradient
+  (gamfit 0.1.203, #979): biobank-scale gradient evals no longer idle ~80–95s
+  per outer iteration running k single-direction passes serially.
+- Phase 0+1 cross-fit warm-start foundation (gamfit 0.1.203): descriptor-indexed
+  `FitArtifact` + structural ρ-transfer that seeds related fits (LOSO folds,
+  row-population changes) from a prior converged fit's smoothing parameters.
+  The non-test lib also no longer carried unconsumed Phase-2 scaffolding (the
+  dead-code that would have failed `cargo build --lib` under the crate's
+  `warnings = "deny"`).
+- Noise-floor inner-Newton termination guard + certificate railed-coordinate
+  false-positive fix (gamfit 0.1.202).
+- BMS separation false-positive fix + parallel Jeffreys curvature + nested-BLAS
+  pin (gamfit 0.1.201).
+
+See the per-wheel entries below for the full detail of each item.
+
 ## gamfit 0.1.203 (2026-06-15)
 
 Performance: the outer REML/LAML gradient evaluation no longer recomputes the
