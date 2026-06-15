@@ -54,7 +54,15 @@ impl BernoulliRigidRowKernel {
     pub(super) fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
         self.third_full_cache
             .get_or_compute(|| {
-                (0..self.family.y.len())
+                let n = self.family.y.len();
+                // Named heartbeat scope: this per-row uncontracted third-tensor
+                // build is the rigid coord_corrections cost suspect (one n-row
+                // pass per workspace; rebuilt each outer eval since a fresh
+                // kernel is constructed per eval).
+                let _scope = crate::heartbeat::track_scope(format!(
+                    "BMS rigid third_full_cache build n={n}"
+                ));
+                (0..n)
                     .into_par_iter()
                     .map(|row| {
                         let marginal_eta = self.block_states[0].eta[row];
@@ -379,9 +387,100 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         }
         Some(self.directional_derivative_dense_blas3(d_beta))
     }
+
+    /// BLAS-3 override of the dense joint-Hessian assembly for the rigid
+    /// marginal-slope kernel (see the trait default for the cost argument).
+    /// The post-gradient-reload Jeffreys/Firth residual term first materializes
+    /// the observed joint Hessian via this path; the generic per-row
+    /// `add_pullback_hessian` scatter is `n·p²` BLAS-1. Identical pure
+    /// design-row Gram structure as the directional-derivative override and the
+    /// fused dense-H build: gather the per-row contraction weights
+    /// (`w_mm = h[0][0]`, `w_mg = h[0][1]`, `w_gg = h[1][1]`) from the cached
+    /// `K×K` row Hessians and close each chunk with `Xᵀ diag(w) X` /
+    /// `Xᵀ diag(w) G`. Bit-for-bit the same entries the scatter writes, reduced
+    /// in BLAS-3 in-row order. Claims only the full-data unit-weight
+    /// `RowSet::All` dense-design case; otherwise `None` → unchanged generic
+    /// per-row Horvitz-Thompson path.
+    fn hessian_dense_override(
+        &self,
+        rows: &crate::families::row_kernel::RowSet,
+        row_hessians: &[[[f64; 2]; 2]],
+    ) -> Option<Array2<f64>> {
+        if !matches!(rows, crate::families::row_kernel::RowSet::All) {
+            return None;
+        }
+        if row_hessians.len() != self.family.y.len() {
+            return None;
+        }
+        let x_full = self.family.marginal_design.as_dense_ref()?;
+        let g_full = self.family.logslope_design.as_dense_ref()?;
+        Some(self.hessian_dense_blas3(x_full.view(), g_full.view(), row_hessians))
+    }
 }
 
 impl BernoulliRigidRowKernel {
+    /// Chunked BLAS-3 implementation backing
+    /// [`RowKernel::hessian_dense_override`]. `row_hessians[row]` is the cached
+    /// primary `2×2` row Hessian; `RowSet::All` (unit weights) is guaranteed by
+    /// the caller, and the caller resolved both designs to dense contiguous
+    /// views, so the build is infallible.
+    fn hessian_dense_blas3(
+        &self,
+        x_full: ArrayView2<'_, f64>,
+        g_full: ArrayView2<'_, f64>,
+        row_hessians: &[[[f64; 2]; 2]],
+    ) -> Array2<f64> {
+        let slices = &self.slices;
+        let n = self.family.y.len();
+
+        const CHUNK_ROWS: usize = 8_192;
+        let chunks = (0..n)
+            .step_by(CHUNK_ROWS)
+            .map(|start| (start, (start + CHUNK_ROWS).min(n)))
+            .collect::<Vec<_>>();
+        let chunk_body = |(start, end): (usize, usize)| -> BernoulliBlockHessianAccumulator {
+            let len = end - start;
+            let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+            let mut w_mm = Array1::<f64>::zeros(len);
+            let mut w_mg = Array1::<f64>::zeros(len);
+            let mut w_gg = Array1::<f64>::zeros(len);
+            // Contiguous chunk-row views into the dense designs the override gate
+            // resolved (no fallible row-chunk copy).
+            let x_chunk = x_full.slice(s![start..end, ..]);
+            let g_chunk = g_full.slice(s![start..end, ..]);
+            for row in start..end {
+                let local = row - start;
+                let h = &row_hessians[row];
+                w_mm[local] = h[0][0];
+                w_mg[local] = h[0][1];
+                w_gg[local] = h[1][1];
+            }
+            acc.add_weighted_design_grams_from_chunks(&x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg);
+            acc
+        };
+
+        let run_serial = rayon::current_thread_index().is_some()
+            || rayon::current_num_threads() <= 1;
+        if run_serial {
+            let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+            for chunk in chunks {
+                acc.add(&chunk_body(chunk));
+            }
+            return acc.to_dense(slices);
+        }
+        let acc = chunks
+            .into_par_iter()
+            .map(chunk_body)
+            .reduce(
+                || BernoulliBlockHessianAccumulator::new(slices),
+                |mut left, right| {
+                    left.add(&right);
+                    left
+                },
+            );
+        acc.to_dense(slices)
+    }
+
     /// Chunked BLAS-3 implementation backing
     /// [`RowKernel::directional_derivative_dense_override`].
     fn directional_derivative_dense_blas3(
