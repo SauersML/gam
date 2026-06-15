@@ -88,6 +88,44 @@ fn arrow_row_chunk_count(n_rows: usize) -> usize {
     }
 }
 
+/// Row-block size for the parallel per-row **cache build** (`build_row_kernel_cache`).
+///
+/// Unlike the trace/Gram folds, the cache build writes per-row scalars into
+/// index-keyed slots and performs NO cross-row summation, so its chunk size is
+/// free of the deterministic-associativity contract that pins [`ARROW_ROW_CHUNK`]
+/// (= 256) for the reduction paths. At biobank scale the 256-row tiling fans the
+/// build into `n / 256` tasks (≈760 for n ≈ 195k) of light per-row jet work; on a
+/// wide `Par::rayon(0)` pool that many tiny tasks pays the crossbeam-epoch /
+/// rayon-scheduling overhead documented as the dominant fanning cost for this
+/// workload (issue #1045), not the per-row arithmetic itself. We instead size the
+/// build to roughly `OVERSUBSCRIBE × workers` blocks — full pool occupancy with
+/// load-balancing headroom, but two orders of magnitude fewer task entries — and
+/// clamp to a multiple of [`ARROW_ROW_CHUNK`] so the published-value scatter
+/// offsets stay chunk-aligned. Bit-identical output: each cache slot is written by
+/// its own absolute row index regardless of how the row range is partitioned.
+fn cache_build_chunk_rows(n_rows: usize) -> usize {
+    const OVERSUBSCRIBE: usize = 4;
+    if n_rows == 0 {
+        return ARROW_ROW_CHUNK;
+    }
+    let workers = rayon::current_num_threads().max(1);
+    let target_blocks = (workers * OVERSUBSCRIBE).max(1);
+    let by_target = n_rows.div_ceil(target_blocks).max(1);
+    // Round UP to a whole number of `ARROW_ROW_CHUNK` rows so each block spans an
+    // integer count of arrow tiles and the scatter offset `block_idx * chunk_rows`
+    // stays tile-aligned; floor at one tile so a tiny `n` still makes progress.
+    by_target.div_ceil(ARROW_ROW_CHUNK).max(1) * ARROW_ROW_CHUNK
+}
+
+#[inline]
+fn cache_build_block_count(n_rows: usize, chunk_rows: usize) -> usize {
+    if n_rows == 0 {
+        0
+    } else {
+        (n_rows - 1) / chunk_rows + 1
+    }
+}
+
 // ── Row selector ─────────────────────────────────────────────────────
 //
 // `RowSet` is the contract every outer-only assembly path uses to declare
@@ -623,12 +661,18 @@ pub fn build_row_kernel_cache<const K: usize>(
         (work_count >= ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS).then(LoopProgress::default_interval);
     match rows {
         RowSet::All => {
+            // Pool-aware block size (issue #1045): a few-per-worker partition of
+            // the row range instead of one task per 256-row arrow tile, so the
+            // light per-row jet build does not pay `n/256` task entries of
+            // crossbeam-epoch / rayon-scheduling overhead on a wide pool. Output
+            // is bit-identical — every slot is written by its absolute row index.
+            let block_rows = cache_build_chunk_rows(n);
             let evaluated_chunks: Vec<Vec<(f64, [f64; K], [[f64; K]; K])>> =
-                (0..arrow_row_chunk_count(n))
+                (0..cache_build_block_count(n, block_rows))
                     .into_par_iter()
-                    .map(|chunk_idx| {
-                        let start = chunk_idx * ARROW_ROW_CHUNK;
-                        let end = (start + ARROW_ROW_CHUNK).min(n);
+                    .map(|block_idx| {
+                        let start = block_idx * block_rows;
+                        let end = (start + block_rows).min(n);
                         let mut chunk = Vec::with_capacity(end - start);
                         for row in start..end {
                             let out = kern.row_kernel(row)?;
@@ -649,8 +693,8 @@ pub fn build_row_kernel_cache<const K: usize>(
                         Ok(chunk)
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-            for (chunk_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
-                let start = chunk_idx * ARROW_ROW_CHUNK;
+            for (block_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
+                let start = block_idx * block_rows;
                 for (local, (l, g, h)) in chunk.into_iter().enumerate() {
                     let i = start + local;
                     nll[i] = l;
@@ -663,8 +707,13 @@ pub fn build_row_kernel_cache<const K: usize>(
             // Evaluate only the sampled rows in parallel; scatter into
             // the n-sized cache slots keyed by their full-data index.
             let total = list.len();
+            // Pool-aware block size over the SAMPLED rows (issue #1045): same
+            // rationale as the `RowSet::All` arm — partition into a few blocks per
+            // worker, not one task per 256-row tile. Output is bit-identical; each
+            // slot is scattered by its full-data index `r.index`.
+            let block_rows = cache_build_chunk_rows(total);
             let pair_chunks: Vec<Vec<(usize, (f64, [f64; K], [[f64; K]; K]))>> = list
-                .par_chunks(ARROW_ROW_CHUNK)
+                .par_chunks(block_rows)
                 .map(|row_chunk| {
                     let mut chunk = Vec::with_capacity(row_chunk.len());
                     for r in row_chunk {
