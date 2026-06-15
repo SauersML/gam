@@ -1881,7 +1881,9 @@ where
         .max(MIN_CHUNK_COUNT);
     // Never carve chunks below `MIN_ROWS_PER_CHUNK` rows: for small `n` the
     // scheduler/partial-accumulator overhead would dominate the row arithmetic.
-    let chunk_count = target_chunk_count.min(n.div_ceil(MIN_ROWS_PER_CHUNK)).max(1);
+    let chunk_count = target_chunk_count
+        .min(n.div_ceil(MIN_ROWS_PER_CHUNK))
+        .max(1);
     let chunk_size = n.div_ceil(chunk_count).max(1);
     let n_chunks = n.div_ceil(chunk_size);
     // `(0..n_chunks).into_par_iter()` is `IndexedParallelIterator`, so the

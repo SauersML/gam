@@ -1655,8 +1655,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // already-`Dense` and PCG paths).
             let dense_snapshot_source =
                 materialized_dense_unpenalized.map(JointHessianSource::Dense);
-            let effective_hessian_source: &JointHessianSource =
-                dense_snapshot_source.as_ref().unwrap_or(&joint_hessian_source);
+            let effective_hessian_source: &JointHessianSource = dense_snapshot_source
+                .as_ref()
+                .unwrap_or(&joint_hessian_source);
 
             // Trust-region globalization for the joint Newton proposal.  The
             // previous implementation used up to eight backtracking likelihood
@@ -1828,41 +1829,40 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // Skipping its construction there removes one coupled Hessian-vector
             // product per cycle — an `O(n·p)` operator row-sweep on the matrix-free
             // DENSE_SPECTRAL path that produced no value (gam#1040).
-            let dogleg_cauchy: Option<Array1<f64>> = if search_joint_active_set.is_none()
-                && joint_spectrum.is_none()
-            {
-                let mut p_sd = Array1::<f64>::zeros(total_p);
-                for (i, (r, w)) in rhs.iter().zip(joint_trust_metric_diag.iter()).enumerate() {
-                    p_sd[i] = r / positive_joint_diagonal_entry(*w);
-                }
-                let mut h_psd = Array1::<f64>::zeros(total_p);
-                let mut cauchy_penalty_scratch = Array1::<f64>::zeros(total_p);
-                match apply_joint_penalized_hessian_into_with_workspace(
-                    effective_hessian_source,
-                    &ranges,
-                    &s_lambdas,
-                    joint_mode_diagonal_ridge,
-                    &p_sd,
-                    &mut h_psd,
-                    &mut cauchy_penalty_scratch,
-                    joint_bundle,
-                ) {
-                    Ok(()) => {
-                        if let Some((_grad_phi, hphi)) = head_jeffreys_term.as_ref() {
-                            h_psd += &hphi.dot(&p_sd);
-                        }
-                        let cauchy = joint_cauchy_step(&rhs, &p_sd, &h_psd);
-                        if cauchy.iter().all(|v| v.is_finite()) {
-                            Some(cauchy)
-                        } else {
-                            None
-                        }
+            let dogleg_cauchy: Option<Array1<f64>> =
+                if search_joint_active_set.is_none() && joint_spectrum.is_none() {
+                    let mut p_sd = Array1::<f64>::zeros(total_p);
+                    for (i, (r, w)) in rhs.iter().zip(joint_trust_metric_diag.iter()).enumerate() {
+                        p_sd[i] = r / positive_joint_diagonal_entry(*w);
                     }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
+                    let mut h_psd = Array1::<f64>::zeros(total_p);
+                    let mut cauchy_penalty_scratch = Array1::<f64>::zeros(total_p);
+                    match apply_joint_penalized_hessian_into_with_workspace(
+                        effective_hessian_source,
+                        &ranges,
+                        &s_lambdas,
+                        joint_mode_diagonal_ridge,
+                        &p_sd,
+                        &mut h_psd,
+                        &mut cauchy_penalty_scratch,
+                        joint_bundle,
+                    ) {
+                        Ok(()) => {
+                            if let Some((_grad_phi, hphi)) = head_jeffreys_term.as_ref() {
+                                h_psd += &hphi.dot(&p_sd);
+                            }
+                            let cauchy = joint_cauchy_step(&rhs, &p_sd, &h_psd);
+                            if cauchy.iter().all(|v| v.is_finite()) {
+                                Some(cauchy)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;

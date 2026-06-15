@@ -480,8 +480,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// call. Building it once here and lending a borrowed slice removes that
     /// per-eval churn; the subsampled path stays a per-call owned `Vec` (it is
     /// short — only the masked rows — and varies with the mask).
-    pub(super) full_data_outer_rows:
-        std::sync::OnceLock<std::sync::Arc<Vec<WeightedOuterRow>>>,
+    pub(super) full_data_outer_rows: std::sync::OnceLock<std::sync::Arc<Vec<WeightedOuterRow>>>,
 }
 
 impl BernoulliMarginalSlopeExactEvalCache {

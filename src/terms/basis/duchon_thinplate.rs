@@ -54,8 +54,8 @@ impl crate::resource::ResidentBytes for CachedDuchonBasis {
 /// densification ceiling used elsewhere; with ~17 diseases over one cohort the
 /// working set is a single `BasisBuildResult`, so even a modest budget retains
 /// the shared basis across the whole sweep.
-fn duchon_basis_cache() -> &'static crate::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis>
-{
+fn duchon_basis_cache()
+-> &'static crate::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis> {
     static CACHE: std::sync::OnceLock<
         crate::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis>,
     > = std::sync::OnceLock::new();

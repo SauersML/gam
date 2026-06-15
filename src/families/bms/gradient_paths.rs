@@ -656,7 +656,13 @@ pub(crate) fn signed_probit_neglog_unary_stack(signed_margin: f64, weight: f64) 
             + (7.0 * m * m - 4.0) * lambda
             + 12.0 * m * lambda * lambda
             + 6.0 * lambda * lambda * lambda);
-    [-weight * logcdf, weight * k1, weight * k2, weight * k3, weight * k4]
+    [
+        -weight * logcdf,
+        weight * k1,
+        weight * k2,
+        weight * k3,
+        weight * k4,
+    ]
 }
 
 #[inline]
@@ -1504,7 +1510,8 @@ pub(super) fn rigid_standard_normal_towers_batch<T>(
     let mut signed: Vec<Tower4<2>> = Vec::with_capacity(chunk);
     let mut margins: Vec<f64> = Vec::with_capacity(chunk);
     for i in 0..chunk {
-        let jet = rigid_standard_normal_signed_jet(marginals[i], slopes[i], zs[i], ys[i], probit_scale);
+        let jet =
+            rigid_standard_normal_signed_jet(marginals[i], slopes[i], zs[i], ys[i], probit_scale);
         margins.push(jet.v);
         signed.push(jet);
     }

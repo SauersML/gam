@@ -2396,11 +2396,17 @@ pub(crate) fn production_builder_circle_reduces_rank_and_completes_stage1_step0_
     let mut basis_jacobian = Array4::<f64>::zeros((k_atoms, n_obs, m, d));
     basis_jacobian.slice_mut(s![0, .., .., ..]).assign(&jet);
     let mut decoder = Array3::<f64>::zeros((k_atoms, m, p));
-    decoder
-        .slice_mut(s![0, .., ..])
-        .assign(&array![[0.05, -0.02], [-0.05, 0.03], [0.05, 0.01], [0.02, -0.04], [-0.02, 0.02]]);
+    decoder.slice_mut(s![0, .., ..]).assign(&array![
+        [0.05, -0.02],
+        [-0.05, 0.03],
+        [0.05, 0.01],
+        [0.02, -0.04],
+        [-0.02, 0.02]
+    ]);
     let mut penalties = Array3::<f64>::zeros((k_atoms, m, m));
-    penalties.slice_mut(s![0, .., ..]).assign(&Array2::<f64>::eye(m));
+    penalties
+        .slice_mut(s![0, .., ..])
+        .assign(&Array2::<f64>::eye(m));
     let logits = Array2::<f64>::zeros((n_obs, k_atoms));
 
     // The production builder installs the evaluator through the second-jet slot
