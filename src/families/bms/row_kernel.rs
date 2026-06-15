@@ -406,6 +406,27 @@ where
             "bernoulli marginal-slope early-exit threshold must be finite, got {threshold}"
         ));
     }
+    // Cross-path accumulation rounding band for the early-exit reject. The
+    // running `-total_ll` here is summed chunk-by-chunk over a parallel
+    // try_fold/try_reduce tree, whereas `threshold` (the current objective the
+    // caller is trying to beat) is produced by a DIFFERENT accumulation order
+    // — `log_likelihood_only_with_options` over the full row set. The two sums
+    // are mathematically equal at the SAME β but, being computed in different
+    // associativity orders over n≈3e5 rows, disagree by a handful of ULP. The
+    // observed false reject was a 3e-11 gap at NLL≈1.5e5 — exactly 1 ULP at
+    // that magnitude (ulp(1.5e5) = 2^(17-52) ≈ 2.9e-11). Summation over n rows
+    // can accumulate a few ULP of order-dependent drift, so we admit a band of
+    // a modest multiple of the per-value ULP scaled by |threshold|:
+    // `EARLY_EXIT_REJECT_ROUNDING_ULPS × ε × max(|threshold|, 1)`. This stays a
+    // valid reject certificate: it only DEFERS borderline trials whose partial
+    // NLL exceeds the threshold by less than cross-path round-off to the full
+    // exact LL return value plus the caller's objective/ρ accept test; it never
+    // early-accepts a trial whose true full-data NLL is genuinely worse than
+    // the threshold by more than this round-off band.
+    const EARLY_EXIT_REJECT_ROUNDING_ULPS: f64 = 16.0;
+    let early_exit_reject_tol =
+        EARLY_EXIT_REJECT_ROUNDING_ULPS * f64::EPSILON * threshold.abs().max(1.0);
+    let early_exit_reject_threshold = threshold + early_exit_reject_tol;
     let mut total_ll = 0.0;
     for chunk in weighted_rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
         let chunk_ll: f64 = chunk
@@ -434,10 +455,10 @@ where
         // subsample sum (inverse-inclusion weights) is an *unbiased estimator* of
         // the full-data NLL, not a lower bound, so it must never drive a reject
         // against a full-data threshold.
-        if -total_ll > threshold {
+        if -total_ll > early_exit_reject_threshold {
             return Err(format!(
-                "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                -total_ll, threshold
+                "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={} (reject band={})",
+                -total_ll, threshold, early_exit_reject_tol
             ));
         }
     }
@@ -522,6 +543,50 @@ mod early_exit_soundness_tests {
                 .is_err(),
             "HT-weighted sum 1000 spuriously exceeds the full-data threshold 500 — \
              demonstrates why an HT subsample must never certify a line-search reject"
+        );
+    }
+
+    /// A numerically-flat trial whose full-data NLL exceeds the threshold by
+    /// only cross-path accumulation round-off (≈1 ULP) must NOT be early-
+    /// rejected: the early exit defers the borderline decision to the exact
+    /// full LL return value and the caller's objective/ρ accept test. This is
+    /// the biobank gauge-flat marginal/logslope hang — the line search rejected
+    /// every trial by ~3e-11 at NLL≈1.5e5 (1 ULP) so the trust radius collapsed
+    /// and the inner solve spun to its cap. A trial that is genuinely worse by
+    /// more than the round-off band must still reject.
+    #[test]
+    pub(crate) fn flat_trial_within_rounding_band_is_not_early_rejected() {
+        // Threshold at the biobank magnitude where the false reject was seen.
+        let threshold = 155_598.382_868_126_53_f64;
+        let n = 1000usize;
+        let rows = full_data_rows(n);
+
+        // Per-row NLL chosen so the full-data NLL sits exactly 1 ULP ABOVE the
+        // threshold — a flat trial separated from the threshold only by
+        // accumulation round-off.
+        let one_ulp_above = threshold + (threshold * f64::EPSILON);
+        let per_row_ll = -(one_ulp_above / n as f64);
+        let row_ll = move |_i: usize| -> Result<f64, String> { Ok(per_row_ll) };
+        let ll = bernoulli_margslope_line_search_ll_with_early_exit(&rows, threshold, row_ll)
+            .expect(
+                "a trial whose full NLL exceeds the threshold by ~1 ULP must not be \
+                 early-rejected — the round-off band defers it to the exact LL return",
+            );
+        assert!(
+            ll.is_finite() && (-ll) >= threshold - 1.0,
+            "the returned LL must be the exact full-data sum, got {ll}"
+        );
+
+        // A trial whose NLL is clearly above the threshold (well beyond the
+        // round-off band: +1.0 NLL units at this scale is ~3.4e10 ULP) must
+        // still early-reject.
+        let high_per_row_ll = -((threshold + 1.0) / n as f64);
+        let high_row_ll = move |_i: usize| -> Result<f64, String> { Ok(high_per_row_ll) };
+        assert!(
+            bernoulli_margslope_line_search_ll_with_early_exit(&rows, threshold, high_row_ll)
+                .is_err(),
+            "a trial worse than the threshold by far more than the round-off band \
+             must still early-reject"
         );
     }
 }
