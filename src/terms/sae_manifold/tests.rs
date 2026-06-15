@@ -1470,7 +1470,7 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
     // Compute and install the real hybrid-split report (closed-form, no outer
     // fit — sidesteps #1051).
     let report = term
-        .compute_hybrid_split_report(&rho)
+        .compute_hybrid_split_report(&rho, None)
         .expect("hybrid split report computes")
         .expect("eligible d=1 atoms present a report");
     term.hybrid_split_report = Some(report);
@@ -1535,6 +1535,51 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         verdict.choice.num_parameters,
         curved_params
     );
+
+    // #1026 EV-vs-Θ frontier as STRUCTURED report data: recompute the report
+    // WITH the reconstruction target so each verdict carries the `(Θ, ΔEV)`
+    // pair the roadmap reports against (previously this lived only as a
+    // transient `log::info!` line). The target is the term's own curved
+    // reconstruction, so every atom's leave-one-atom-out drop `ΔEV_k` is the
+    // real EV it earns; the report must surface a finite `(Θ, ΔEV)` for every
+    // adjudicated d = 1 slot, and the collapsed-to-linear slot must read its
+    // straight signature `Θ ≈ 0`.
+    let report_with_ev = term
+        .compute_hybrid_split_report(&rho, Some(target.view()))
+        .expect("hybrid split report with target computes")
+        .expect("eligible d=1 atoms present a report");
+    assert!(
+        !report_with_ev.verdicts.is_empty(),
+        "the report must adjudicate at least one d=1 slot"
+    );
+    for v in &report_with_ev.verdicts {
+        let theta = v
+            .fitted_turning
+            .unwrap_or_else(|| panic!("verdict '{}' must carry a fitted turning Θ", v.atom_name));
+        let dev = v.held_out_delta_ev.unwrap_or_else(|| {
+            panic!("verdict '{}' must carry a held-out ΔEV", v.atom_name)
+        });
+        assert!(
+            theta.is_finite() && theta >= 0.0,
+            "fitted turning Θ must be a finite non-negative arc-curvature integral; \
+             got {theta} for '{}'",
+            v.atom_name
+        );
+        assert!(
+            dev.is_finite(),
+            "held-out ΔEV must be finite; got {dev} for '{}'",
+            v.atom_name
+        );
+        // The slot that collapsed to the linear tail is straight by definition:
+        // its decoded curve integrates ~zero turning.
+        if !v.kept_curved {
+            assert!(
+                theta <= 1e-3,
+                "a linear-tail slot must read Θ ≈ 0 (straight image); got {theta} for '{}'",
+                v.atom_name
+            );
+        }
+    }
 }
 
 /// #976 Layer-1 guard 2: a single Newton application cannot move a gate

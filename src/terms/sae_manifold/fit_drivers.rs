@@ -422,7 +422,7 @@ impl SaeManifoldTerm {
         // (#1051): no continuation spine, no joint Hessian. The dictionary now
         // honestly reports which atoms earn their curvature and which collapse to
         // the linear tail.
-        match self.compute_hybrid_split_report(rho) {
+        match self.compute_hybrid_split_report(rho, Some(target)) {
             Ok(report) => {
                 if let Some(report) = &report {
                     log::info!(

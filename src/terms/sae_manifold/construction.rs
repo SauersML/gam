@@ -1936,9 +1936,21 @@ impl SaeManifoldTerm {
     pub fn compute_hybrid_split_report(
         &self,
         rho: &SaeManifoldRho,
+        target: Option<ArrayView2<'_, f64>>,
     ) -> Result<Option<crate::terms::sae::hybrid_split::SaeHybridSplitReport>, String> {
         let n = self.n_obs();
         let p = self.output_dim();
+        // Per-atom held-out `ΔEV_k` (leave-one-atom-out explained-variance drop),
+        // paired with each atom's fitted turning Θ onto the verdict so the report
+        // carries the #1026 `(Θ, ΔEV)` frontier point as structured data. Absent
+        // when no reconstruction target is supplied.
+        let loao_ev: Vec<Option<f64>> = match target {
+            Some(t) => self.per_atom_loao_explained_variance(t, rho)?,
+            None => vec![None; self.k_atoms()],
+        };
+        let delta_ev_for = |atom_idx: usize| -> Option<f64> {
+            loao_ev.get(atom_idx).copied().flatten()
+        };
         // Per-row assignment masses (once), so each atom's weighted straight-line
         // fit uses the same row weighting the joint reconstruction loss does.
         let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
@@ -1986,6 +1998,7 @@ impl SaeManifoldTerm {
             weights_for,
             decoded_for,
             manifold_for,
+            delta_ev_for,
         )
     }
 
