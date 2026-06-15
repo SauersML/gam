@@ -1,3 +1,18 @@
+## gamfit 0.1.209 (2026-06-15)
+
+BMS biobank-fit perf + diagnostics bundle (no behavior change to the converged
+fit). (1) **Warm-start seeds the outer BFGS iter-0 metric** (`1/‖g₀‖`) so the
+first line-search step is accepted at α=1 instead of bracketing — kills the
+~3 redundant full-inner-solve `Value` probes per warm fit (same certified ρ).
+(2) **Skip the cold seed-screening cascade on a warm-start hit** — the validated
+warm ρ goes straight to BFGS (saves ~43s/warm fold; cold fits still screen).
+(3) **canonicalise skips the redundant post-T invariant double-RRQR when T is
+identity** (the clean rank-full case) and uses a BLAS-3 MAP Gram (~12s→~2s/fit,
+bit-identical). (4) **Heartbeat diagnostics**: the process-monitor line now
+reports a true `cpu=N/M cores` utilization signal (from /proc), the
+currently-active operation + its elapsed time, and a progress fraction — instead
+of the misleading `active_threads=0`.
+
 ## gamfit 0.1.208 (2026-06-15)
 
 BMS perf: **BLAS-3 chunked Gram for the rigid directional-Hessian drift**
