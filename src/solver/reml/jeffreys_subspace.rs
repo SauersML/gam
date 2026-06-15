@@ -1255,6 +1255,7 @@ where
 /// (so `H_Φ ≡ 0` in a neighborhood, hence `D_β H_Φ ≡ 0`), this returns the zero
 /// matrix — the safe value that leaves the existing `D_β H[v_k]`-only gradient
 /// unchanged rather than wrong.
+#[cfg(test)]
 pub fn joint_jeffreys_hphi_directional_derivative<DirFn, Dir2Fn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
