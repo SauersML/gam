@@ -1255,6 +1255,155 @@ pub(crate) fn decoder_norm_guard_reseeds_collapsed_atom_to_distinct_nonzero() {
     );
 }
 
+/// #1117 K>1 robustness — TOTAL co-collapse (every decoder ≈0 together) must
+/// reseed ALL atoms, not all-but-one. When the whole dictionary co-collapses
+/// the median-relative test finds no atom "behind" its peers, so the guard
+/// falls to the absolute EV arm. The earlier code kept the (arbitrary,
+/// already-degenerate) strongest atom as an "anchor" and reseeded only K−1
+/// atoms; that left one slot sitting in the collapsed basin and the joint LSQ
+/// refit re-attracted the reseeded atoms toward it — exactly the K=3 three-way
+/// basin a single reseed could not break (real OLMo: identical config flipped
+/// EV≈0.40 ↔ 0.00). With all K atoms reseeded onto DISTINCT residual PCs every
+/// slot leaves the basin and recovers a non-degenerate, pairwise-distinct
+/// decoder.
+#[test]
+pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
+    // Three periodic (circle) atoms, p=3 output so three distinct residual PCs
+    // exist for the disjoint-PC reseed to land each atom on its own direction.
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
+    let coords2 = array![[0.25], [0.40], [0.75], [0.05], [0.60], [0.85]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    let (phi2, jet2) = periodic_basis(&coords2);
+    // Decoders are tiny-but-NONZERO and of comparable magnitude across atoms:
+    // the dictionary co-collapsed (EV ≈ 0) yet has a usable median scale, so it
+    // reaches the absolute-EV co-collapse arm (an exactly-zero dictionary would
+    // hit the `median == 0` early return — the cold-seed case, handled by the
+    // mass guard/inner solve, not here) and no atom is *relatively* behind its
+    // peers (all norms within ~1.5×, none below `1e-3·median`).
+    let make_atom = |name: &str, phi: Array2<f64>, jet: Array3<f64>, scale: f64| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            Array2::<f64>::from_elem((3, 3), scale),
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+    };
+    let atom0 = make_atom("periodic0", phi0, jet0, 1.0e-5);
+    let atom1 = make_atom("periodic1", phi1, jet1, 1.2e-5);
+    let atom2 = make_atom("periodic2", phi2, jet2, 0.8e-5);
+    // Gates stay spread across rows/atoms — the gate-mass guard is satisfied,
+    // so only the absolute-EV co-collapse arm can catch this failure.
+    let logits = array![
+        [0.7, -0.2, 0.3],
+        [0.1, 0.4, -0.1],
+        [-0.3, 0.5, 0.2],
+        [0.6, -0.1, 0.4],
+        [0.2, 0.3, -0.2],
+        [0.4, 0.1, 0.5]
+    ];
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords0, coords1, coords2],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::softmax(0.8),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom0, atom1, atom2], assignment).unwrap();
+    // A target with genuine 3-direction structure so the residual (≈ target,
+    // since the dictionary explains ≈0) carries three distinct PCs.
+    let target = array![
+        [0.40, -0.10, 0.05],
+        [-0.20, 0.35, -0.15],
+        [0.10, 0.05, 0.30],
+        [0.25, -0.30, -0.05],
+        [-0.15, 0.20, 0.18],
+        [0.30, 0.12, -0.22]
+    ];
+    let rho = SaeManifoldRho::new(
+        (-0.3_f64).exp().ln(),
+        0.7_f64.ln(),
+        vec![array![0.9_f64.ln()], array![1.0_f64.ln()], array![1.1_f64.ln()]],
+    );
+
+    // Confirm the precondition: the dictionary is co-collapsed (EV below the
+    // floor) with NO atom relatively behind its peers (all norms ≈0).
+    let ev_before = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .expect("EV evaluates");
+    assert!(
+        ev_before < SAE_DICTIONARY_COLLAPSE_EV_FLOOR,
+        "test precondition: dictionary must start co-collapsed; EV={ev_before:.4}"
+    );
+
+    term.enforce_decoder_norm_guard(target.view(), 0, &rho)
+        .expect("co-collapse guard must recover, not error");
+
+    // EVERY atom — including the one the old code preserved as anchor — must be
+    // recorded as Reseeded. This is the regression the fix targets.
+    for atom in 0..3 {
+        let reseeded = term
+            .collapse_events()
+            .iter()
+            .any(|e| e.atom == atom && e.action == CollapseAction::Reseeded);
+        assert!(
+            reseeded,
+            "total co-collapse must reseed ALL atoms; atom {atom} was not reseeded. events: {:?}",
+            term.collapse_events()
+        );
+    }
+
+    // After the reseed + joint LSQ refit every atom carries a non-degenerate
+    // decoder again, and the three decoders are pairwise distinct (each landed
+    // on its own residual PC, so no two column-spaces are collinear).
+    let norm = |a: &SaeManifoldAtom| -> f64 {
+        a.decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+    };
+    let norms: Vec<f64> = (0..3).map(|a| norm(&term.atoms[a])).collect();
+    for (atom, &nrm) in norms.iter().enumerate() {
+        assert!(
+            nrm > 1e-9,
+            "reseeded atom {atom} decoder must be non-degenerate; ‖B‖={nrm:.3e}"
+        );
+    }
+    for a in 0..3 {
+        for b in (a + 1)..3 {
+            let ba = &term.atoms[a].decoder_coefficients;
+            let bb = &term.atoms[b].decoder_coefficients;
+            let dot: f64 = ba.iter().zip(bb.iter()).map(|(x, y)| x * y).sum();
+            let cos = dot.abs() / (norms[a] * norms[b]);
+            assert!(
+                cos < 0.999,
+                "reseeded atoms {a},{b} decoders must be distinct (|cos|={cos:.4})"
+            );
+        }
+    }
+
+    // The dictionary is no longer co-collapsed: the reseed + LSQ refit explains
+    // strictly more variance than the degenerate start.
+    let ev_after = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .expect("EV evaluates post-reseed");
+    assert!(
+        ev_after > ev_before,
+        "co-collapse reseed must improve EV; before={ev_before:.4} after={ev_after:.4}"
+    );
+}
+
 /// #976 decoder arm is a strict no-op for K=1: a single atom has no peer to
 /// fall behind, so the guard must never reseed or record an event even when
 /// the lone decoder is tiny. This pins the "K=1 path unchanged" guarantee.

@@ -420,19 +420,80 @@ fn build_row_procedural_matvec(
             }
 
             // out -= Σ_i H_βt^(i) (H_tt^(i) + ρ_t·I)^{-1} H_tβ^(i)·x.
-            let mut neg = Array1::<f64>::zeros(k);
-            for i in 0..n {
-                let di = row_dims[i];
-                // v_i = H_tβ^(i)·x (sparse Kronecker gather, length d_i).
-                let mut v_i = Array1::<f64>::zeros(di);
-                forward(i, x.view(), &mut v_i);
-                // w_i = (H_tt^(i) + ρ_t·I)^{-1} v_i via L_i L_iᵀ.
-                let w_i = cholesky_solve_vector(factors[i].view(), v_i.view());
-                // neg += H_βt^(i)·w_i (sparse scatter); subtract once at the end.
-                transpose(i, w_i.view(), &mut neg);
-            }
-            for a in 0..k {
-                out[a] -= neg[a];
+            //
+            // #1017: this row-procedural reduced-Schur term is the matrix-free
+            // SAE path's matvec hot loop (`build_row_procedural_matvec` is the
+            // host backend `gpu_schur_matvec_backend` returns when the dense
+            // `H_tβ` slabs are absent — the production Qwen shape). At
+            // (n≈2000 rows) it ran SERIALLY on one core and allocated a fresh
+            // length-`K` `neg` plus per-row `v_i`/`w_i` on EVERY CG iteration —
+            // tens of thousands of tiny heap allocations across a solve. Each
+            // row contributes an independent length-`K` scatter, so the sum is
+            // embarrassingly parallel; fan it across rayon over fixed row chunks
+            // and fold the per-chunk length-`K` partials in chunk order so the
+            // f64 reduction is deterministic (bit-identical run-to-run)
+            // regardless of thread scheduling — it agrees with the serial sum up
+            // to ULP-scale chunk reassociation (the #1017 verification gate: the
+            // criterion ranking across topology candidates must not move). Stay
+            // sequential below
+            // `SCHUR_MATVEC_PARALLEL_ROW_MIN` rows and when already inside a
+            // rayon worker (the topology race fans candidates with
+            // `run_topology_race_parallel`) — the same nested-rayon guard the
+            // CPU `schur_matvec` uses. Buffers (`v_i`, `neg`) are reused across
+            // rows within a chunk, so the per-row allocation churn is gone.
+            let parallel = n >= crate::solver::arrow_schur::SCHUR_MATVEC_PARALLEL_ROW_MIN
+                && rayon::current_thread_index().is_none();
+            if parallel {
+                use rayon::prelude::*;
+                const CHUNK: usize = 64;
+                let partials: Vec<Array1<f64>> = (0..n)
+                    .into_par_iter()
+                    .chunks(CHUNK)
+                    .map(|idxs| {
+                        // One length-`K` scatter accumulator per chunk; the
+                        // per-row latent vector `v_i` (length `d_i ≲ 32`) is the
+                        // only per-row buffer, sized to the row's own `d_i`.
+                        let mut neg = Array1::<f64>::zeros(k);
+                        for i in idxs {
+                            let di = row_dims[i];
+                            // v_i = H_tβ^(i)·x (sparse Kronecker gather).
+                            let mut v_i = Array1::<f64>::zeros(di);
+                            forward(i, x.view(), &mut v_i);
+                            // w_i = (H_tt^(i) + ρ_t·I)^{-1} v_i via L_i L_iᵀ.
+                            let w_i = cholesky_solve_vector(factors[i].view(), v_i.view());
+                            // neg += H_βt^(i)·w_i (sparse scatter).
+                            transpose(i, w_i.view(), &mut neg);
+                        }
+                        neg
+                    })
+                    .collect();
+                // Deterministic ordered reduction: fold chunk partials
+                // left-to-right, then subtract once.
+                let mut neg = Array1::<f64>::zeros(k);
+                for part in &partials {
+                    for a in 0..k {
+                        neg[a] += part[a];
+                    }
+                }
+                for a in 0..k {
+                    out[a] -= neg[a];
+                }
+            } else {
+                // Serial path: reuse one `neg` and one `v_i` across rows.
+                let mut neg = Array1::<f64>::zeros(k);
+                for i in 0..n {
+                    let di = row_dims[i];
+                    // v_i = H_tβ^(i)·x (sparse Kronecker gather, length d_i).
+                    let mut v_i = Array1::<f64>::zeros(di);
+                    forward(i, x.view(), &mut v_i);
+                    // w_i = (H_tt^(i) + ρ_t·I)^{-1} v_i via L_i L_iᵀ.
+                    let w_i = cholesky_solve_vector(factors[i].view(), v_i.view());
+                    // neg += H_βt^(i)·w_i (sparse scatter); subtract once at end.
+                    transpose(i, w_i.view(), &mut neg);
+                }
+                for a in 0..k {
+                    out[a] -= neg[a];
+                }
             }
         });
 
@@ -3279,7 +3340,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
 mod tests {
     use super::*;
     use crate::solver::arrow_schur::ArrowSchurSystem;
-    use ndarray::Array2;
+    use ndarray::{Array2, ArrayView1};
 
     fn build_fixture(n: usize, d: usize, k: usize, seed: u64) -> ArrowSchurSystem {
         let mut sys = ArrowSchurSystem::new(n, d, k);
@@ -3469,6 +3530,93 @@ mod tests {
                 (solution.delta_beta[a] - expected[n * d + a]).abs()
                     < 1e-10 * (1.0 + expected[n * d + a].abs()),
                 "delta_beta[{a}] mismatch"
+            );
+        }
+    }
+
+    /// #1017: the row-procedural reduced-Schur matvec (the matrix-free SAE
+    /// host backend) auto-fans its per-row point-elimination sum across rayon
+    /// over fixed row chunks when at the top level (`n ≥
+    /// SCHUR_MATVEC_PARALLEL_ROW_MIN`), and stays serial when already inside a
+    /// rayon worker. The chunk-ordered fold makes the parallel result
+    /// **deterministic** (two parallel calls are bit-identical — scheduling
+    /// cannot change the numbers) and it agrees with the serial accumulation up
+    /// to ULP-scale chunk reassociation, so the criterion ranking across
+    /// topology candidates cannot move (the #1017 verification gate).
+    #[test]
+    fn row_procedural_matvec_parallel_deterministic_and_matches_serial() {
+        use crate::solver::arrow_schur::SCHUR_MATVEC_PARALLEL_ROW_MIN;
+        let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
+        let d = 3usize;
+        let k = 24usize;
+        let mut sys = build_fixture(n, d, k, 0xA17C_0FFE);
+        // Install a matrix-free forward/transpose pair that reads the dense
+        // `htbeta` slabs the fixture already populated, so the procedural
+        // backend has a well-defined operator to apply (and exercises exactly
+        // the sparse gather/scatter the SAE Kronecker path drives).
+        let slabs: Vec<Array2<f64>> = sys.rows.iter().map(|row| row.htbeta.clone()).collect();
+        let forward_slabs = slabs.clone();
+        let transpose_slabs = slabs;
+        sys.set_row_htbeta_operator(
+            move |row: usize, x: ArrayView1<'_, f64>, out: &mut Array1<f64>| {
+                let h = &forward_slabs[row];
+                for r in 0..h.nrows() {
+                    let mut acc = 0.0_f64;
+                    for c in 0..h.ncols() {
+                        acc += h[[r, c]] * x[c];
+                    }
+                    out[r] = acc;
+                }
+            },
+            move |row: usize, v: ArrayView1<'_, f64>, out: &mut Array1<f64>| {
+                let h = &transpose_slabs[row];
+                for r in 0..h.nrows() {
+                    for c in 0..h.ncols() {
+                        out[c] += h[[r, c]] * v[r];
+                    }
+                }
+            },
+        );
+
+        let matvec = gpu_schur_matvec_backend(&sys, 0.0, 0.0)
+            .expect("row-procedural matvec backend builds for matrix-free system");
+        let x = Array1::from_shape_fn(k, |i| ((i as f64 + 1.0) * 0.37).sin());
+
+        // Top-level call: auto-selects the parallel chunk-fold. Run twice and
+        // assert bit-identity — the chunk-ordered reduction must not depend on
+        // thread scheduling.
+        let mut out_parallel_a = Array1::<f64>::zeros(k);
+        matvec(&x, &mut out_parallel_a);
+        let mut out_parallel_b = Array1::<f64>::zeros(k);
+        matvec(&x, &mut out_parallel_b);
+        for a in 0..k {
+            assert_eq!(
+                out_parallel_a[a].to_bits(),
+                out_parallel_b[a].to_bits(),
+                "row-procedural matvec parallel reduction is non-deterministic at index {a}"
+            );
+        }
+
+        // Inside a rayon worker: auto-selects the serial path (nested-rayon
+        // guard). `install` runs the closure on a pool thread, so
+        // `current_thread_index()` is `Some`. The serial running sum and the
+        // chunk-ordered parallel fold differ only by f64 reassociation.
+        let mut out_serial = Array1::<f64>::zeros(k);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("build rayon pool")
+            .install(|| matvec(&x, &mut out_serial));
+
+        let max_abs = out_serial.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        for a in 0..k {
+            let diff = (out_parallel_a[a] - out_serial[a]).abs();
+            assert!(
+                diff <= 1e-12 * (1.0 + max_abs),
+                "row-procedural matvec parallel vs serial diverged beyond reassociation \
+                 at index {a}: {} vs {} (diff={diff:e})",
+                out_parallel_a[a],
+                out_serial[a]
             );
         }
     }

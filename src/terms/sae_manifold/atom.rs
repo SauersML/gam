@@ -644,6 +644,8 @@ impl SaeManifoldAtom {
         self.basis_jacobian = jac_red;
         self.decoder_coefficients = dec_red;
         self.smooth_penalty_raw = s_raw_red.clone();
+        // Seed the effective penalty with the reduced raw Gram so the buffer is
+        // the right `(r, r)` shape; the arc-length refresh below overwrites it.
         self.smooth_penalty = s_raw_red;
         self.smooth_penalty_order = order;
         self.basis_evaluator = Some(base);
@@ -652,6 +654,20 @@ impl SaeManifoldAtom {
         // decoder; the column count just changed, so drop it and let the joint
         // fit re-activate it for the reduced block if still profitable.
         self.decoder_frame = None;
+        // Re-derive the intrinsic (pullback-metric / arc-length) reweighted
+        // effective penalty on the REDUCED basis — exactly as the constructor
+        // does for the full-width atom. Without this the reduced atom would
+        // carry the bare `S̃ = Qᵀ S Q` while the full-width path carries the
+        // arc-length-reweighted `W^{½} S W^{½}`, so a `latent_dim == 1` atom
+        // with a genuine order-`r ≥ 1` (difference / Duchon) penalty would be
+        // smoothed under a DIFFERENT roughness metric after reduction than
+        // before — biasing exactly the rank-deficient circle #1117 targets.
+        // (For the constant-speed periodic basis and order-0 / `latent_dim != 1`
+        // atoms this is `S̃ = S̃_raw`, so the eye-penalty reductions are
+        // byte-for-byte unchanged.) All inputs the refresh reads
+        // (`basis_values`, `decoder_coefficients`, `smooth_penalty_raw`,
+        // `smooth_penalty_order`, `basis_kind`, `latent_dim`) are now set.
+        self.refresh_intrinsic_smooth_penalty();
         Ok(())
     }
 
