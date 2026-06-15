@@ -2742,6 +2742,64 @@ pub(crate) fn parallel_block_diag_inverse_apply_deterministic_and_solves() {
     }
 }
 
+/// `arrow_operator_apply` (the block-diagonal `K0` operator used by the
+/// iterative-refinement residual / backward-error certificate) parallelizes its
+/// n-row pass via the shared `cross_row_matvec_row_into` body (#1017). It must
+/// be deterministic run-to-run and equal to the sequential fold: with no
+/// cross-row penalties it equals `arrow_cross_row_matvec`, so the same
+/// `cross_row_matvec_sequential_ref` is the reference (bit-identical disjoint
+/// `y_t`, ULP-scale `y_beta` reassociation).
+#[test]
+pub(crate) fn parallel_arrow_operator_apply_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 48; // trips the parallel path
+    let d = 6usize;
+    let k = 64usize;
+    let sys = dense_arrow_system(n, d, k);
+    let total_dt = sys.row_offsets[n];
+    let ridge_t = 2e-5;
+    let ridge_beta = 3e-6;
+    let x_t = Array1::from_iter((0..total_dt).map(|i| 0.17 * (i as f64).sin() - 0.03));
+    let x_beta = Array1::from_iter((0..k).map(|a| 0.21 * (a as f64).cos() + 0.04));
+
+    let (yt_a, yb_a) = arrow_operator_apply(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    let (yt_b, yb_b) = arrow_operator_apply(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    for i in 0..total_dt {
+        assert_eq!(
+            yt_a[i].to_bits(),
+            yt_b[i].to_bits(),
+            "arrow_operator_apply y_t must be deterministic at {i}"
+        );
+    }
+    for a in 0..k {
+        assert_eq!(
+            yb_a[a].to_bits(),
+            yb_b[a].to_bits(),
+            "arrow_operator_apply y_beta must be deterministic at {a}"
+        );
+    }
+
+    let (yt_seq, yb_seq) =
+        cross_row_matvec_sequential_ref(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    for i in 0..total_dt {
+        assert_eq!(
+            yt_a[i].to_bits(),
+            yt_seq[i].to_bits(),
+            "arrow_operator_apply y_t must match the sequential fold bit-for-bit at {i}"
+        );
+    }
+    let scale = yb_seq
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    for a in 0..k {
+        let rel = (yb_a[a] - yb_seq[a]).abs() / scale;
+        assert!(
+            rel < 1e-12,
+            "arrow_operator_apply y_beta vs sequential at {a}: rel {rel:e}"
+        );
+    }
+}
+
 /// The dense `H_ββ` penalty-prologue GEMV parallelized over output rows at
 /// the wide SAE border (`k ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN`, #1017) must be
 /// **bit-identical** to the serial prologue — unlike the per-row reduction,

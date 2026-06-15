@@ -1209,24 +1209,48 @@ pub(crate) fn arrow_operator_apply(
     for beta_col in 0..sys.k {
         y_beta[beta_col] += ridge_beta * x_beta[beta_col];
     }
-    for i in 0..n {
-        let di = sys.row_dims[i];
-        let base = sys.row_offsets[i];
-        let row = &sys.rows[i];
-        for a in 0..di {
-            let mut acc = ridge_t * x_t[base + a];
-            for b in 0..di {
-                acc += row.htt[[a, b]] * x_t[base + b];
+    // Per-row block-diagonal arrow apply (the K0 operator, no cross-row penalty).
+    // Shares the per-row body with `arrow_cross_row_matvec` and parallelizes
+    // identically (#1017): disjoint `y_t` segments scatter by offset, the
+    // per-row `H_βt x_t` contributions fold into `y_beta` (already holding the
+    // penalty + ridge prologue) in chunk order — bit-identical run-to-run (the
+    // #1017 determinism gate). Used by the iterative-refinement residual /
+    // backward-error certificate, so it runs once per refinement pass.
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    if parallel {
+        use rayon::prelude::*;
+        const CHUNK: usize = 64;
+        let chunks: Vec<(usize, Vec<f64>, Array1<f64>)> = (0..n)
+            .into_par_iter()
+            .chunks(CHUNK)
+            .map(|idxs| {
+                let first = idxs[0];
+                let last = idxs[idxs.len() - 1];
+                let seg_start = sys.row_offsets[first];
+                let seg_end = sys.row_offsets[last] + sys.row_dims[last];
+                let mut seg = vec![0.0_f64; seg_end - seg_start];
+                let mut acc = Array1::<f64>::zeros(sys.k);
+                for i in idxs {
+                    cross_row_matvec_row_into(
+                        sys, ridge_t, i, x_t, x_beta, seg_start, &mut seg, &mut acc,
+                    );
+                }
+                (seg_start, seg, acc)
+            })
+            .collect();
+        for (seg_start, seg, acc) in &chunks {
+            for (o, v) in seg.iter().enumerate() {
+                y_t[seg_start + o] = *v;
             }
-            y_t[base + a] = acc;
+            for j in 0..sys.k {
+                y_beta[j] += acc[j];
+            }
         }
-        let mut htbeta_xb = Array1::<f64>::zeros(di);
-        sys_htbeta_apply_row(sys, i, row, x_beta, &mut htbeta_xb);
-        for a in 0..di {
-            y_t[base + a] += htbeta_xb[a];
+    } else {
+        let y_t_slice = y_t.as_slice_mut().expect("y_t contiguous");
+        for i in 0..n {
+            cross_row_matvec_row_into(sys, ridge_t, i, x_t, x_beta, 0, y_t_slice, &mut y_beta);
         }
-        let x_ti = x_t.slice(ndarray::s![base..base + di]).to_owned();
-        sys_htbeta_accumulate_transpose(sys, i, row, x_ti.view(), &mut y_beta);
     }
     (y_t, y_beta)
 }
