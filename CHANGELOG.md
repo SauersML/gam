@@ -1,3 +1,23 @@
+## gamfit 0.1.216 (2026-06-15)
+
+Open-issue bug fixes + inner-solve perf:
+- **#1128**: `gamfit.fit(Surv(...))` with no `survival_likelihood` now defaults to
+  `transformation` (matching the CLI) instead of the broken `location-scale` that
+  aborted the identifiability audit on right-censored data. Fixed at the single
+  `FitConfig::default()` source.
+- **#1127**: Gaussian `s(x)` REML is now scale-equivariant to `y→a·y` — the
+  singularity floor `smooth_floor_dp` is a fraction of the weighted null deviance
+  (was absolute 1e-12), so `λ̂`/EDF/smooth-shape are invariant down to a=1e-8.
+- **#1117**: the SAE production term builder now installs the analytic second jet,
+  so a rank-deficient K=1 circle decoder reparametrizes to its data-supported rank
+  and completes stage1-step0 in budget instead of stalling.
+- **#1126** (already on main): measure-jet κ non-convergence degrades to the
+  certified baseline geometry instead of fatally aborting at tol=1e-10.
+- **PERF**: the inner DENSE_SPECTRAL joint-Newton path no longer re-applies the
+  matrix-free operator ~25× per cycle (trust-region model + Cauchy leg) — those
+  route through the already-materialized dense Hessian (O(n·p)→O(p²)).
+- Removed a second per-outer-eval `log::debug!` spam site (gated to once/process).
+
 ## gamfit 0.1.215 (2026-06-15)
 
 - Remove per-call `[STAGE] BMS rigid ... BLAS-3 ... path TAKEN/NOT-taken` log
