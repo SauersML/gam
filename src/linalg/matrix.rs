@@ -6901,6 +6901,15 @@ impl DesignMatrix {
         }
     }
 
+    /// Whether this design is backed by a sparse (CSR/COO) representation
+    /// rather than a dense or dense-operator backing. Used to gate the
+    /// row-chunked `Xᵀ diag(w) X` BLAS-3 Gram path, which is structurally
+    /// applicable only to dense / dense-operator designs (a sparse block must
+    /// keep the generic sparse-aware per-row pullback).
+    pub const fn is_sparse(&self) -> bool {
+        matches!(self, Self::Sparse(_))
+    }
+
     /// Zero-copy borrow when `Dense`, materialized conversion when `Sparse`.
     ///
     /// This avoids the unconditional clone that `to_dense()` performs on dense

@@ -550,14 +550,39 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         d_beta: &[f64],
     ) -> Option<Result<Array2<f64>, String>> {
         if !matches!(rows, crate::families::row_kernel::RowSet::All) {
+            log::info!(
+                "[STAGE] BMS rigid directional_derivative BLAS-3 path NOT taken: RowSet is a \
+                 subsample (generic per-row Horvitz-Thompson scatter)"
+            );
             return None;
         }
-        // The chunked Gram needs contiguous dense design rows to slice.
-        if self.family.marginal_design.as_dense_ref().is_none()
-            || self.family.logslope_design.as_dense_ref().is_none()
-        {
+        // The chunked `Xᵀ diag(w) X` Gram slices contiguous design rows via
+        // `try_row_chunk` inside `directional_derivative_dense_blas3` (which
+        // already handles operator-backed / residualised designs row-chunk by
+        // row-chunk), so the only structurally-inapplicable case is a sparse
+        // design block — gate on that, not on the presence of a pre-materialised
+        // `as_dense_ref`. Without this, a biobank rigid fit whose marginal /
+        // logslope design is operator-backed (residualised absorber, overlap-Z)
+        // fell through to the generic per-row third-tensor scatter — the ~8s
+        // per-cycle `gradient_reload` / Jeffreys-column floor.
+        let marginal_sparse = self.family.marginal_design.is_sparse();
+        let logslope_sparse = self.family.logslope_design.is_sparse();
+        if marginal_sparse || logslope_sparse {
+            log::info!(
+                "[STAGE] BMS rigid directional_derivative BLAS-3 path NOT taken: sparse design \
+                 (marginal_sparse={marginal_sparse} logslope_sparse={logslope_sparse}) \
+                 -> generic per-row scatter"
+            );
             return None;
         }
+        log::info!(
+            "[STAGE] BMS rigid directional_derivative BLAS-3 chunked Xᵀdiag(w)X path TAKEN n={} p={} \
+             marginal_dense_view={} logslope_dense_view={}",
+            self.family.y.len(),
+            self.slices.total,
+            self.family.marginal_design.as_dense_ref().is_some(),
+            self.family.logslope_design.as_dense_ref().is_some(),
+        );
         Some(self.directional_derivative_dense_blas3(d_beta))
     }
 
@@ -579,15 +604,49 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         rows: &crate::families::row_kernel::RowSet,
         row_hessians: &[[[f64; 2]; 2]],
     ) -> Option<Array2<f64>> {
+        // Only the full-data unit-weight measure is BLAS-3 accelerated; a
+        // Horvitz-Thompson subsample keeps the generic per-row HT path.
         if !matches!(rows, crate::families::row_kernel::RowSet::All) {
+            log::info!(
+                "[STAGE] BMS rigid hessian_dense BLAS-3 path NOT taken: RowSet is a subsample \
+                 (generic per-row Horvitz-Thompson scatter)"
+            );
             return None;
         }
         if row_hessians.len() != self.family.y.len() {
+            log::info!(
+                "[STAGE] BMS rigid hessian_dense BLAS-3 path NOT taken: row_hessians.len()={} != n={}",
+                row_hessians.len(),
+                self.family.y.len(),
+            );
             return None;
         }
-        let x_full = self.family.marginal_design.as_dense_ref()?;
-        let g_full = self.family.logslope_design.as_dense_ref()?;
-        Some(self.hessian_dense_blas3(x_full.view(), g_full.view(), row_hessians))
+        // The chunked `Xᵀ diag(w) X` build slices contiguous design rows via
+        // `try_row_chunk`, which every dense-backed design (materialised OR
+        // operator-backed / residualised) supports — so the BLAS-3 path fires
+        // for the biobank rigid fit regardless of whether the marginal/logslope
+        // designs expose a pre-materialised `as_dense_ref`. Sparse designs are
+        // the only structurally-inapplicable case; route those to the generic
+        // per-row scatter so the design-row Gram never densifies a sparse block.
+        let marginal_sparse = self.family.marginal_design.is_sparse();
+        let logslope_sparse = self.family.logslope_design.is_sparse();
+        if marginal_sparse || logslope_sparse {
+            log::info!(
+                "[STAGE] BMS rigid hessian_dense BLAS-3 path NOT taken: sparse design \
+                 (marginal_sparse={marginal_sparse} logslope_sparse={logslope_sparse}) \
+                 -> generic per-row scatter"
+            );
+            return None;
+        }
+        log::info!(
+            "[STAGE] BMS rigid hessian_dense BLAS-3 chunked Xᵀdiag(w)X path TAKEN n={} p={} \
+             marginal_dense_view={} logslope_dense_view={}",
+            self.family.y.len(),
+            self.slices.total,
+            self.family.marginal_design.as_dense_ref().is_some(),
+            self.family.logslope_design.as_dense_ref().is_some(),
+        );
+        Some(self.hessian_dense_blas3(row_hessians))
     }
 }
 
@@ -599,8 +658,6 @@ impl BernoulliRigidRowKernel {
     /// views, so the build is infallible.
     fn hessian_dense_blas3(
         &self,
-        x_full: ArrayView2<'_, f64>,
-        g_full: ArrayView2<'_, f64>,
         row_hessians: &[[[f64; 2]; 2]],
     ) -> Array2<f64> {
         let slices = &self.slices;
@@ -611,16 +668,54 @@ impl BernoulliRigidRowKernel {
             .step_by(CHUNK_ROWS)
             .map(|start| (start, (start + CHUNK_ROWS).min(n)))
             .collect::<Vec<_>>();
+        // Each chunk slices a contiguous block of design rows. For a
+        // materialised-dense design that is a zero-copy `ArrayView2`; for an
+        // operator-backed / residualised design it is one `try_row_chunk`
+        // materialisation of just `CHUNK_ROWS` rows — the same mechanism the
+        // directional-derivative BLAS-3 override and `add_weighted_hw_cross_terms`
+        // already use, so the gate fires for the biobank rigid fit regardless of
+        // whether the designs expose a pre-materialised `as_dense_ref`. The gate
+        // in `hessian_dense_override` excludes sparse designs, so `try_row_chunk`
+        // here never densifies a sparse block. A failed chunk materialisation at
+        // the converged β snapshot is a hard numerical-contract violation — the
+        // design row buffer is fixed and finite for the whole fit — so it
+        // surfaces by panic, mirroring every other kernel-level contract here.
         let chunk_body = |(start, end): (usize, usize)| -> BernoulliBlockHessianAccumulator {
             let len = end - start;
             let mut acc = BernoulliBlockHessianAccumulator::new(slices);
             let mut w_mm = Array1::<f64>::zeros(len);
             let mut w_mg = Array1::<f64>::zeros(len);
             let mut w_gg = Array1::<f64>::zeros(len);
-            // Contiguous chunk-row views into the dense designs the override gate
-            // resolved (no fallible row-chunk copy).
-            let x_chunk = x_full.slice(s![start..end, ..]);
-            let g_chunk = g_full.slice(s![start..end, ..]);
+            let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                match self.family.marginal_design.as_dense_ref() {
+                    Some(x_full) => x_full.slice(s![start..end, ..]).into(),
+                    None => self
+                        .family
+                        .marginal_design
+                        .try_row_chunk(start..end)
+                        .map(Into::into)
+                        .unwrap_or_else(|e| {
+                            std::panic::panic_any(format!(
+                                "bernoulli rigid hessian_dense_blas3 marginal_design \
+                                 try_row_chunk({start}..{end}): {e}"
+                            ))
+                        }),
+                };
+            let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                match self.family.logslope_design.as_dense_ref() {
+                    Some(g_full) => g_full.slice(s![start..end, ..]).into(),
+                    None => self
+                        .family
+                        .logslope_design
+                        .try_row_chunk(start..end)
+                        .map(Into::into)
+                        .unwrap_or_else(|e| {
+                            std::panic::panic_any(format!(
+                                "bernoulli rigid hessian_dense_blas3 logslope_design \
+                                 try_row_chunk({start}..{end}): {e}"
+                            ))
+                        }),
+                };
             for row in start..end {
                 let local = row - start;
                 let h = &row_hessians[row];
