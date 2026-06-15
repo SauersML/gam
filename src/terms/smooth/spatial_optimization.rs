@@ -5252,7 +5252,9 @@ where
         &[TermCollectionSpec],
         &[TermCollectionDesign],
     ) -> Result<crate::solver::outer_strategy::EfsEval, String>,
-    SeedFn: FnMut(&Array1<f64>) -> Result<(), EstimationError>,
+    SeedFn: FnMut(
+        &Array1<f64>,
+    ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>,
 {
     let n_blocks = block_specs.len();
     if block_term_indices.len() != n_blocks {

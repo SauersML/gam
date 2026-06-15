@@ -5999,17 +5999,26 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
     }
 }
 
-/// Drift closure producing the Tier-B Jeffreys-curvature drift
-/// `D_β H_Φ[δβ]` for a mode-response direction `δβ = dβ̂/dρ_k`.
+/// BATCHED Jeffreys-`H_Φ` mode-response drift over MANY directions at once.
 ///
-/// The closure already expects the actual perturbation direction `δβ` (NOT the
-/// raw `v_k` the trait hands the provider); the wrapper negates `v_k → δβ = −v_k`
-/// before calling, exactly mirroring `BorrowedJointDerivProvider`'s sign
-/// convention and the inner `compute_dh` it composes with. Returns `None` when
-/// the Jeffreys term is gated out or the family lacks the exact derivatives, so
-/// the wrapper falls back to the inner provider's drift unchanged.
-pub(crate) type JeffreysHphiDriftFn =
-    Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>;
+/// PERF (the biobank #979 outer-gradient black hole). The β-fixed base of the
+/// drift — the reduced-information eigendecomposition AND the `p` per-axis first
+/// directional derivatives `Hdot[e_a]` (each an `O(n)` n≈348k row-stream) — is
+/// IDENTICAL across every mode-response direction `δβ = −v_k` at fixed `β̂(ρ)`.
+/// A per-direction drift that rebuilt the base on every call would re-stream the
+/// whole dataset `k·p` extra times per outer gradient eval. This batched form
+/// prepares the base ONCE (via [`JeffreysHphiDriftBase`]) and then applies it to
+/// every direction, so the only per-direction cost is that direction's own
+/// `Hdot[δ]` and `p` second-directional `H²dot[δ,e_a]` passes. The per-direction
+/// result is byte-identical to the divided-difference drift it amortizes.
+///
+/// The closure expects the actual perturbation directions `δβ` (NOT the raw `v_k`
+/// the trait hands the provider); the [`JeffreysHphiAwareJointDerivatives`]
+/// wrapper negates `v_k → δβ = −v_k` before calling. A `None` entry (gated-out
+/// term / missing exact derivative on some axis) leaves the inner likelihood
+/// drift unchanged for that direction.
+pub(crate) type JeffreysHphiDriftBatchFn =
+    Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<Array2<f64>>>, String> + Send + Sync>;
 
 /// Jeffreys-`H_Φ`-aware joint derivative provider.
 ///
@@ -6028,23 +6037,43 @@ pub(crate) type JeffreysHphiDriftFn =
 /// added on top of the inner provider's already-correct likelihood drift.
 pub(crate) struct JeffreysHphiAwareJointDerivatives<'a> {
     pub(crate) inner: Box<dyn HessianDerivativeProvider + 'a>,
-    pub(crate) drift: JeffreysHphiDriftFn,
+    pub(crate) drift: JeffreysHphiDriftBatchFn,
     pub(crate) p: usize,
 }
 
 impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
     pub(crate) fn new(
         inner: Box<dyn HessianDerivativeProvider + 'a>,
-        drift: JeffreysHphiDriftFn,
+        drift: JeffreysHphiDriftBatchFn,
         p: usize,
     ) -> Self {
         Self { inner, drift, p }
     }
 
-    /// `D_β H_Φ[δβ]` with the trait's `v_k → δβ = −v_k` mode-response convention.
+    /// `D_β H_Φ[δβ]` for MANY mode-response directions at once, with the trait's
+    /// `v_k → δβ = −v_k` convention. The batched drift prepares the β-fixed base
+    /// (reduced-information eigendecomposition + the `p` per-axis first directional
+    /// derivatives `Hdot[e_a]`, each an `O(n)` row-stream) ONCE and reuses it for
+    /// every direction — collapsing the released `k·p` redundant full-data passes
+    /// (the biobank #979 outer-gradient black hole) to a single `p`-axis sweep plus
+    /// the genuinely per-direction `Hdot[δ]` / `H²dot[δ,e_a]` work. Per-direction
+    /// output is byte-identical to the singular hook.
+    pub(crate) fn hphi_drifts(
+        &self,
+        v_ks: &[Array1<f64>],
+    ) -> Result<Vec<Option<Array2<f64>>>, String> {
+        let deltas: Vec<Array1<f64>> = v_ks.iter().map(|v| v.mapv(|value| -value)).collect();
+        (self.drift)(&deltas)
+    }
+
+    /// `D_β H_Φ[δβ]` for a SINGLE mode-response direction. Routes through the
+    /// batched closure with a one-element slice so the singular trait methods reuse
+    /// the identical arithmetic; the dominant outer-gradient path goes through
+    /// [`Self::hphi_drifts`] where the base is amortized across all `k` directions.
     pub(crate) fn hphi_drift(&self, v_k: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
         let delta = v_k.mapv(|value| -value);
-        (self.drift)(&delta)
+        let mut out = (self.drift)(std::slice::from_ref(&delta))?;
+        Ok(out.pop().flatten())
     }
 }
 
@@ -6098,13 +6127,24 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
     ) -> Result<Vec<Option<DriftDerivResult>>, String> {
         // Delegate the (possibly batched) inner walk, then fold the per-direction
         // H_Φ drift into each result so the batched path stays consistent with the
-        // singular one.
+        // singular one. The H_Φ drift is computed for ALL `k` directions in ONE
+        // batched call so the β-fixed base (reduced eigendecomposition + the `p`
+        // per-axis first directional derivatives, each an `O(n)` row-stream) is
+        // prepared ONCE rather than recomputed `k` times — the biobank #979
+        // outer-gradient black hole. Per-direction values are byte-identical.
         let inner = self.inner.hessian_derivative_corrections_result(v_ks)?;
+        let drifts = self.hphi_drifts(v_ks)?;
+        if drifts.len() != inner.len() {
+            return Err(format!(
+                "JeffreysHphiAwareJointDerivatives: batched H_Φ drift returned {} results for {} directions",
+                drifts.len(),
+                inner.len()
+            ));
+        }
         inner
             .into_iter()
-            .zip(v_ks.iter())
-            .map(|(inner_result, v_k)| {
-                let drift = self.hphi_drift(v_k)?;
+            .zip(drifts.into_iter())
+            .map(|(inner_result, drift)| {
                 Ok(match (inner_result, drift) {
                     (Some(DriftDerivResult::Dense(mut dense)), Some(d)) => {
                         dense += &d;
@@ -7187,7 +7227,7 @@ pub(crate) fn joint_outer_evaluate(
     // first-order trace gains the `½ tr[(H+S_λ+H_Φ)⁻¹ D_β H_Φ[v_k]]` term that
     // makes the analytic gradient match the augmented objective. `None` ⇒ the
     // provider is used unwrapped.
-    jeffreys_hphi_drift: Option<JeffreysHphiDriftFn>,
+    jeffreys_hphi_drift: Option<JeffreysHphiDriftBatchFn>,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
@@ -9255,12 +9295,27 @@ impl CustomOuterState {
         rho_dim: usize,
         specs: &[ParameterBlockSpec],
         beta: &Array1<f64>,
-    ) -> Result<(), EstimationError> {
+    ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError> {
+        // A seed β whose length disagrees with this fit's per-block
+        // coefficient widths is NOT an error: the outer warm-start cache
+        // looks up a *row-relaxed* prefix (`cache_seed_key`), so two folds
+        // of the same model share an ρ-dim and transfer ρ, but their
+        // realized basis ranks — hence the flattened inner β length — are
+        // row-population dependent and legitimately differ across folds
+        // (the LOSO p=37-vs-p=85 case). Cross-length β transfer is the job
+        // of the gauge-projected `FitArtifact` channel, which re-expresses
+        // the parent's raw β into this fold's reduced subspace. Here we
+        // simply decline the incompatible β and let the (already-installed)
+        // ρ seed stand — a ρ-only resume, never a full cold start.
+        let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        if beta.len() != expected {
+            return Ok(crate::solver::outer_strategy::SeedOutcome::Incompatible);
+        }
         let warm_start = constrained_warm_start_from_cached_beta(rho_dim, specs, beta)?;
         self.reset_warm_cache = Some(warm_start.clone());
         self.warm_cache = Some(warm_start);
         self.last_error = None;
-        Ok(())
+        Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
     }
 }
 

@@ -3848,10 +3848,21 @@ fn reml_inner_progress_feedback(
 fn with_reml_beta_seed_hook<'state, 'data>() -> impl FnMut(
     &mut &'state mut crate::solver::estimate::reml::RemlState<'data>,
     &Array1<f64>,
-) -> Result<(), EstimationError> {
+)
+    -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>
+{
     |state, beta| {
+        // The REML state stores β as a starting-iterate HINT and validates
+        // its width against the design (`self.p`) at store time, silently
+        // dropping a mismatched or non-finite hint rather than faulting
+        // (see `setwarm_start_original_beta`). A wrong-length seed is
+        // therefore never an error: a row-relaxed cross-fold prefix seed
+        // degrades to a ρ-only resume, exactly the desired warm-start
+        // behaviour. The slot's post-call state (the supplied β if it fit,
+        // else the prior state) is what the next eval warm-starts from, so
+        // `Installed` is the correct contract reply.
         state.setwarm_start_original_beta(Some(beta.view()));
-        Ok(())
+        Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
     }
 }
 

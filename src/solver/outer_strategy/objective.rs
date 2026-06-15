@@ -318,6 +318,22 @@ pub enum SeedOutcome {
     Installed,
     /// The objective has no inner-β slot; the β was discarded.
     NoSlot,
+    /// The objective owns an inner-β slot, but the provided β is
+    /// structurally incompatible with this fit's inner block layout
+    /// (its length does not match the per-block coefficient widths). The
+    /// β was discarded and the fit resumes ρ-only.
+    ///
+    /// This is the load-time reply for a *row-relaxed* cross-fit seed
+    /// (the `cache_seed_key` prefix channel): two folds of the same model
+    /// share an ρ-dim, so the cached ρ transfers, but the realized basis
+    /// rank — hence the inner β length — is row-population dependent and
+    /// legitimately differs across folds (the LOSO p=37-vs-p=85 case).
+    /// A length-mismatched seed β is therefore NOT an error: cross-length
+    /// β transfer is delegated to the gauge-projected `FitArtifact`
+    /// channel, which least-squares re-expresses the parent's raw β into
+    /// this fold's reduced subspace. Reporting `Incompatible` here keeps
+    /// the (correct) ρ seed and avoids a spurious full cold-start.
+    Incompatible,
 }
 
 /// Common interface for outer smoothing-parameter objectives.
@@ -887,7 +903,7 @@ pub struct ClosureObjective<
     Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo = fn(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
     Fsp = fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
-    Fseed = fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>,
+    Fseed = fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
 > {
     pub(crate) state: S,
     pub(crate) cap: OuterCapability,
@@ -923,7 +939,7 @@ where
     Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
     Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
-    Fseed: FnMut(&mut S, &Array1<f64>) -> Result<(), EstimationError>,
+    Fseed: FnMut(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
 {
     fn capability(&self) -> OuterCapability {
         self.cap.clone()
@@ -979,7 +995,7 @@ where
             return Ok(SeedOutcome::Installed);
         }
         match self.seed_fn.as_mut() {
-            Some(f) => f(&mut self.state, beta).map(|()| SeedOutcome::Installed),
+            Some(f) => f(&mut self.state, beta),
             // No hook installed — the objective owns no inner-β slot.
             // The caller decides whether this is a loud cache-provenance
             // event or a silent continuation-walk degradation.
@@ -1012,7 +1028,7 @@ where
         seed_fn: Fseed,
     ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
     where
-        Fseed: FnMut(&mut S, &Array1<f64>) -> Result<(), EstimationError>,
+        Fseed: FnMut(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
     {
         ClosureObjective {
             state: self.state,

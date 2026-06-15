@@ -1429,7 +1429,12 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                 eval_mode,
             )?,
             robust_jeffreys_hphi,
-            custom_family_outer_jeffreys_hphi_drift(family, &inner.block_states, specs, &ranges)?,
+            custom_family_outer_jeffreys_hphi_drift_batched(
+                family,
+                &inner.block_states,
+                specs,
+                &ranges,
+            )?,
         )?;
         if let Some(gradient) = batched_gradient_override {
             eval_result.gradient = gradient;
@@ -1686,7 +1691,12 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                 eval_mode,
             )?,
             custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?,
-            custom_family_outer_jeffreys_hphi_drift(family, &inner.block_states, specs, &ranges)?,
+            custom_family_outer_jeffreys_hphi_drift_batched(
+                family,
+                &inner.block_states,
+                specs,
+                &ranges,
+            )?,
         )?;
 
         let mut eval_result = eval_result;
@@ -1998,7 +2008,12 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
             eval_mode,
         )?,
         robust_jeffreys_hphi,
-        custom_family_outer_jeffreys_hphi_drift(family, &inner.block_states, specs, &ranges)?,
+        custom_family_outer_jeffreys_hphi_drift_batched(
+            family,
+            &inner.block_states,
+            specs,
+            &ranges,
+        )?,
     )?;
 
     Ok(eval_result)

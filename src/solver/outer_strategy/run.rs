@@ -499,7 +499,7 @@ impl OuterProblem {
             reset_fn,
             efs_fn,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
-            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
+            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             continuation_prewarm: self.continuation_prewarm,
         }
     }
@@ -535,7 +535,7 @@ impl OuterProblem {
             reset_fn,
             efs_fn,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
-            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
+            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             continuation_prewarm: self.continuation_prewarm,
         }
     }
@@ -573,7 +573,7 @@ impl OuterProblem {
             reset_fn,
             efs_fn,
             screening_proxy_fn: Some(screening_proxy_fn),
-            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<(), EstimationError>>,
+            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             continuation_prewarm: self.continuation_prewarm,
         }
     }
@@ -724,6 +724,20 @@ impl OuterProblem {
                 Ok(SeedOutcome::NoSlot) => log::warn!(
                     "[CACHE] beta-warm key={}.. context={} beta_dim={} action=skip \
                      reason=objective_has_no_inner_beta_slot",
+                    short_key,
+                    context,
+                    beta.len(),
+                ),
+                Ok(SeedOutcome::Incompatible) => log::info!(
+                    // Not a warning: a row-relaxed cross-fit prefix seed
+                    // (`cache_seed_key`) legitimately carries a β whose length
+                    // reflects the PARENT fold's realized basis rank, which
+                    // differs from this fold's per-block widths. The ρ seed is
+                    // kept (already installed above); cross-length β transfer is
+                    // the gauge-projected FitArtifact channel's job. This is a
+                    // clean ρ-only resume, NOT a regression to full cold start.
+                    "[CACHE] beta-warm key={}.. context={} beta_dim={} action=rho-only \
+                     reason=seed_beta_length_incompatible_with_inner_blocks",
                     short_key,
                     context,
                     beta.len(),

@@ -52,11 +52,19 @@ use std::sync::Arc;
 /// `bail_invalid_estim!`).
 pub fn make_beta_seed_validator(
     pending: &std::cell::RefCell<Option<Array1<f64>>>,
-) -> impl FnMut(&Array1<f64>) -> Result<(), crate::solver::estimate::EstimationError> + '_ {
+) -> impl FnMut(
+    &Array1<f64>,
+) -> Result<crate::solver::outer_strategy::SeedOutcome, crate::solver::estimate::EstimationError>
++ '_ {
     move |beta: &Array1<f64>| {
         bail_if_cached_beta_non_finite(beta)?;
+        // Stage the seed for promotion at the next eval, where the freshly
+        // built per-block widths are known. A width mismatch is reconciled
+        // there (the eval's `from_cached_beta` logs and falls back to a cold
+        // β for that step) — never an error that aborts the fit. Staging a
+        // finite β always succeeds, so the contract reply is `Installed`.
         pending.replace(Some(beta.clone()));
-        Ok(())
+        Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
     }
 }
 
