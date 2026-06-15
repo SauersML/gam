@@ -309,11 +309,26 @@ pub(crate) fn compute_outer_hessian(
     };
     let mut ext_h_drifts: Vec<DriftDerivResult> = Vec::with_capacity(ext_dim);
 
-    for (coord, v_i) in solution.ext_coords.iter().zip(ext_v.iter()) {
-        let correction = if effective_deriv.has_corrections() {
-            effective_deriv.hessian_derivative_correction_result(v_i)?
-        } else {
-            None
+    for (ext_idx, (coord, v_i)) in solution.ext_coords.iter().zip(ext_v.iter()).enumerate() {
+        // Reuse the fixed-β first-order drift correction `C[v_i]` computed
+        // ONCE in `reml_laml_evaluate`'s gradient stage (carried through the
+        // workspace as `coord_corrections[k + ext_idx]`). Each correction is a
+        // `Xᵀ diag(c ⊙ X v_i) X` crossproduct — an O(n·p²) n-row pass — and at a
+        // fixed β̂ the ext mode response `v_i` here is bit-identical to the one
+        // the gradient stage used (both come from the same shared
+        // `ThetaModeResponseKernel`), so re-deriving it would re-stream all n
+        // rows for a value already in hand. The standalone fallback (no
+        // workspace) still pays the n-row build to form the sufficient
+        // statistic the first time.
+        let correction: Option<DriftDerivResult> = match workspace {
+            Some(ws) => ws.coord_corrections[k + ext_idx].clone(),
+            None => {
+                if effective_deriv.has_corrections() {
+                    effective_deriv.hessian_derivative_correction_result(v_i)?
+                } else {
+                    None
+                }
+            }
         };
         let h_i = hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim());
 
