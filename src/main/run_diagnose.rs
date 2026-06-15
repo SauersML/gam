@@ -42,6 +42,21 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // A residual-cascade model (#1032) is the multi-resolution analogue: the
+    // scattered low-d smooth is routed through the multilevel Wendland
+    // posterior past the dense-kernel cliff, so it likewise retains no dense
+    // design/Gram (only the nested ε-net geometry + factored precision). ALO
+    // leverage is undefined off that — surface the precise error rather than
+    // the downstream missing-resolved_termspec one.
+    if model.residual_cascade.is_some() {
+        return Err(
+            "diagnose --alo needs the dense leave-one-out leverage, which a \
+             residual-cascade model does not retain (it stores only the \
+             multilevel Wendland posterior of the exact O(n log n) cascade). \
+             Use `gam report <model>` for its fitted quantities."
+                .to_string(),
+        );
+    }
     progress.set_stage("diagnose", "loading diagnostic dataset");
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;

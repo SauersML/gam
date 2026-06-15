@@ -272,6 +272,9 @@ pub(crate) fn run_predict_model(
     if model.spline_scan.is_some() {
         return run_predict_spline_scan(progress, args, model, data, col_map);
     }
+    if model.residual_cascade.is_some() {
+        return run_predict_residual_cascade(progress, args, model, data, col_map);
+    }
 
     let predictor = model.predictor().ok_or_else(|| {
         format!(
@@ -324,6 +327,73 @@ pub(crate) fn run_predict_spline_scan(
         let (m, v) = fit
             .predict(x)
             .map_err(|e| format!("spline-scan predict failed at row {i}: {e}"))?;
+        mean[i] = m;
+        se[i] = v.max(0.0).sqrt();
+    }
+    progress.advance_workflow(3);
+    progress.advance_workflow(4);
+    progress.set_stage("predict", "writing predictions");
+    let (se_opt, mean_lo, mean_hi) = if args.uncertainty {
+        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+        let lo = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m - z * s));
+        let hi = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m + z * s));
+        (Some(se.clone()), Some(lo), Some(hi))
+    } else {
+        (None, None, None)
+    };
+    write_prediction_csv(
+        &args.out,
+        mean.view(),
+        mean.view(),
+        se_opt.as_ref().map(|a| a.view()),
+        mean_lo.as_ref().map(|a| a.view()),
+        mean_hi.as_ref().map(|a| a.view()),
+    )?;
+    cli_out!(
+        "wrote predictions: {} (rows={})",
+        args.out.display(),
+        mean.len()
+    );
+    Ok(())
+}
+
+/// Predict for a residual-cascade saved model (#1032): replay the exact
+/// multilevel Wendland posterior at each query point. The cascade lives over
+/// `d ∈ {2,3}` scattered coordinates with a Gaussian-identity likelihood, so
+/// η == mean; the mean reads `basis_row_scaled · coeff` (the nested ε-net bump
+/// hierarchy, O(log m) lookups per level), and the posterior variance of the
+/// mean replays through the persisted factored precision `predict_chol` — no
+/// training design matrix is retained or rebuilt.
+pub(crate) fn run_predict_residual_cascade(
+    progress: &mut gam::visualizer::VisualizerSession,
+    args: &PredictArgs,
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+) -> Result<(), String> {
+    let (columns, fit) = model
+        .saved_residual_cascade()
+        .map_err(String::from)?
+        .ok_or_else(|| "internal error: residual-cascade predict on a dense model".to_string())?;
+    let cols: Vec<usize> = columns
+        .iter()
+        .map(|name| {
+            col_map.get(name).copied().ok_or_else(|| {
+                format!("prediction data is missing the model's feature column '{name}'")
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let n = data.nrows();
+    let mut mean = Array1::<f64>::zeros(n);
+    let mut se = Array1::<f64>::zeros(n);
+    let mut point = vec![0.0_f64; cols.len()];
+    for i in 0..n {
+        for (slot, &c) in point.iter_mut().zip(cols.iter()) {
+            *slot = data[(i, c)];
+        }
+        let (m, v) = fit
+            .predict(&point)
+            .map_err(|e| format!("residual-cascade predict failed at row {i}: {e}"))?;
         mean[i] = m;
         se[i] = v.max(0.0).sqrt();
     }

@@ -422,6 +422,79 @@ pub(crate) fn run_report_spline_scan(
     Ok(())
 }
 
+pub(crate) fn run_report_residual_cascade(
+    mut progress: gam::visualizer::VisualizerSession,
+    args: &ReportArgs,
+    model: &SavedModel,
+    feature_columns: &[String],
+    fit: &gam::solver::residual_cascade::ResidualCascadeFit,
+) -> Result<(), String> {
+    progress.advance_workflow(1);
+    progress.set_stage("report", "generating html");
+    let lambda = fit.log_lambda.exp();
+    let mut notes = vec![format!(
+        "Exact O(n log n) multiresolution residual cascade for s({features}): \
+         λ={lambda:.4e}, σ²={sigma2:.4e}, levels={levels}, centers={centers}, \
+         coeffs={coeffs}. CG backward error={cg_resid:.2e} over {cg_iters} \
+         iterations. The cascade retains the multilevel Wendland posterior, not \
+         a dense design/Gram, so no coefficient table is shown.",
+        features = feature_columns.join(", "),
+        sigma2 = fit.sigma2,
+        levels = fit.num_levels(),
+        centers = fit.num_centers(),
+        coeffs = fit.num_coeffs(),
+        cg_resid = fit.certificate.solve_rel_residual,
+        cg_iters = fit.certificate.solve_iters,
+    )];
+    if let Some(refinement) = fit.refinement.as_ref() {
+        notes.push(format!(
+            "Refinement loop ran past the initial levels; the level-(L+1) \
+             discretization certificate bounds the remaining penalized-objective \
+             gain at {:.2e}.",
+            refinement.next_level_gain_bound,
+        ));
+    }
+    if args.data.is_some() {
+        notes.push(
+            "Data provided, but held-out diagnostics for residual-cascade models \
+             are served through the predict() path; the CLI report shows the \
+             fitted scalar quantities only."
+                .to_string(),
+        );
+    }
+    let input = report::ReportInput {
+        model_path: args.model.display().to_string(),
+        family_name: model.likelihood().pretty_name().to_string(),
+        model_class: format!("{:?}", model.predict_model_class()),
+        formula: model.formula.clone(),
+        n_obs: None,
+        // Gaussian-identity deviance ≡ the penalized residual quadratic
+        // `y'Wy − ĉ'X'Wy` the fit profiles σ² from.
+        deviance: fit.rss_pen,
+        reml_score: -fit.restricted_loglik,
+        iterations: 0,
+        convergence_status: "exact (multiresolution residual cascade)".to_string(),
+        converged: true,
+        outer_gradient_norm: None,
+        criterion_certificate: None,
+        edf_total: 0.0,
+        r_squared: None,
+        coefficients: Vec::new(),
+        edf_blocks: Vec::new(),
+        continuous_order: Vec::new(),
+        anisotropic_scales: Vec::new(),
+        measure_jet_spectra: Vec::new(),
+        diagnostics: None,
+        smooth_plots: Vec::new(),
+        alo: None,
+        notes,
+    };
+    let out = report::write_report(&input, args.out.as_deref(), &args.model)?;
+    progress.finish_progress("report complete");
+    cli_out!("wrote report: {}", out.display());
+    Ok(())
+}
+
 pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
     use gam::probability::standard_normal_quantile;
 
@@ -440,6 +513,17 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         .map(|(c, f)| (c.to_string(), f))
     {
         return run_report_spline_scan(progress, &args, &model, &feature_column, &scan);
+    }
+    // Residual-cascade model (#1032): the multi-resolution analogue of the
+    // spline scan. The exact O(n log n) multilevel Wendland smoother keeps only
+    // the nested ε-net posterior (no dense fit_result), so render the report
+    // from its reconstructed scalar quantities and return.
+    if let Some((feature_columns, fit)) = model
+        .saved_residual_cascade()
+        .map_err(|e| e.to_string())?
+        .map(|(c, f)| (c.to_vec(), f))
+    {
+        return run_report_residual_cascade(progress, &args, &model, &feature_columns, &fit);
     }
     let family = model.likelihood();
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
