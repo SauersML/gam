@@ -190,11 +190,7 @@ impl BernoulliRigidRowKernel {
     /// likelihood is non-finite at the converged β snapshot — propagate via
     /// panic, mirroring how every other kernel-level numerical contract in
     /// this module surfaces post-PIRLS invariant violations.
-    pub(super) fn third_full_cache(&self) -> &[[[f64; 2]; 2]; 2] as_marker {
-        unreachable!()
-    }
-
-    pub(super) fn third_full_cache_slice(&self) -> &[[[[f64; 2]; 2]; 2]] {
+    pub(super) fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
         self.third_full_cache
             .get_or_compute(|| {
                 let fp = self.rigid_tensor_fingerprint(0xa3);
@@ -246,7 +242,19 @@ impl BernoulliRigidRowKernel {
     pub(super) fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
         self.fourth_full_cache
             .get_or_compute(|| {
-                (0..self.family.y.len())
+                let fp = self.rigid_tensor_fingerprint(0xa4);
+                if let Some(hit) = shared_rigid_tensor_store()
+                    .lock()
+                    .expect("BMS rigid tensor store mutex poisoned on fourth read")
+                    .get_fourth(fp)
+                {
+                    return hit;
+                }
+                let n = self.family.y.len();
+                let _scope = crate::heartbeat::track_scope(format!(
+                    "BMS rigid fourth_full_cache build n={n}"
+                ));
+                let built: RigidFourthFull = (0..n)
                     .into_par_iter()
                     .map(|row| {
                         let marginal_eta = self.block_states[0].eta[row];
@@ -258,7 +266,13 @@ impl BernoulliRigidRowKernel {
                     .expect(
                         "BernoulliRigidRowKernel fourth-full cache build failed; \
                          per-row jet should not error at the converged β snapshot",
-                    )
+                    );
+                let shared = Arc::new(built);
+                shared_rigid_tensor_store()
+                    .lock()
+                    .expect("BMS rigid tensor store mutex poisoned on fourth write")
+                    .insert_fourth(fp, Arc::clone(&shared));
+                shared
             })
             .as_slice()
     }
