@@ -1261,12 +1261,25 @@ pub(crate) fn run_outer_with_plan(
                     // optimum: BFGS converges to the same stationary point
                     // `∇_ρ V(ρ*) = 0` under any symmetric-positive-definite initial
                     // metric, and the gradient/KKT convergence tests are unchanged.
-                    // Gated on `warm_start_cache_hit` so cold multistart seeds keep
-                    // the optimizer's historical internal scaling. The scale is
-                    // clamped to the same `[1e-3, 1e3]` band the optimizer applies
-                    // to its own BB estimate so a pathological seed gradient cannot
-                    // produce a degenerate metric.
-                    if config.warm_start_cache_hit {
+                    // Gated on "this seed is the pinned warm start" so cold
+                    // multistart seeds keep the optimizer's historical internal
+                    // scaling. Two warm-start mechanisms both pin `initial_rho`:
+                    // the in-process / disk persistent cache (which also flips
+                    // `warm_start_cache_hit`) AND the biobank cross-fit β
+                    // projection (`consume_fit_artifact`, logged `[CACHE]
+                    // beta-warm action=projected source=cross-fit`), which sets
+                    // `initial_rho` to the transferred ρ but leaves
+                    // `warm_start_cache_hit` false. Cover both by testing seed
+                    // identity against `initial_rho`. The scale is clamped to the
+                    // same `[1e-3, 1e3]` band the optimizer applies to its own BB
+                    // estimate so a pathological seed gradient cannot produce a
+                    // degenerate metric.
+                    let is_warm_seed = config.warm_start_cache_hit
+                        || config
+                            .initial_rho
+                            .as_ref()
+                            .is_some_and(|initial| initial == seed);
+                    if is_warm_seed {
                         let g0_norm =
                             seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                         if g0_norm.is_finite() && g0_norm > 0.0 {
