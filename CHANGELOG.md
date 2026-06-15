@@ -1,3 +1,23 @@
+## gamfit 0.1.203 (2026-06-15)
+
+Performance: the outer REML/LAML gradient evaluation no longer recomputes the
+per-coordinate log-det drift corrections one direction at a time. At biobank
+scale (n≈3e5, k=8 smoothing coordinates) that per-coordinate loop ran k full
+n-row passes serially — leaving the machine idle (~80–95s per gradient eval,
+repeated every outer iteration) because each thin single-direction crossproduct
+could not fill the thread pool. The site now routes through the family's batched
+`hessian_derivative_corrections_result` hook whenever it is advertised (the BMS
+exact joint-Newton workspace fuses all k directions into ONE row-parallel pass
+that amortizes the per-row cached cell-moment / third-tensor work), turning the
+former `coord_corrections mode=serial(inner-parallel)` into
+`mode=batched(row-parallel)`. Other families keep the existing
+parallel/serial single-direction fallback unchanged; results are identical
+(same negation/sign semantics, solver still runs to its KKT/REML certificate).
+
+Also lands the Phase 0+1 cross-fit warm-start foundation (descriptor-indexed
+FitArtifact + structural ρ-transfer) used to seed related fits (LOSO folds,
+row-population changes) from a prior converged fit's smoothing parameters.
+
 ## gamfit 0.1.202 (2026-06-15)
 
 Robustness: bernoulli marginal-slope LOSO/biobank fits no longer spin to the
