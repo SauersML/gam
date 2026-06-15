@@ -902,7 +902,39 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // custom-family caller defaults `screen_initial_rho = true` and keeps
     // full screening; genuinely flexible scale/spatial survival fits carry
     // log-sigma penalties, never set the flag false, and screen normally.
-    let problem = if options.screen_initial_rho {
+    //
+    // WARM-START SHORT-CIRCUIT (biobank LOSO perf): the seed-screening cascade
+    // exists only to discover a good COLD starting seed when none is supplied —
+    // it runs a full inner solve (the ~8s/seed per-row cell-moment exact-cache
+    // build) for each of the 5..N cold seeds, ~43s total, purely to RANK them
+    // and pick a starting ρ. When a validated warm (ρ, β) is already present —
+    // either the exact response-keyed persistent loader hit, or the cross-fit
+    // FitArtifact projection fired above (`persistent_warm_start.is_some()`,
+    // with `rho0` already replaced by the warm ρ) — that warm ρ IS the
+    // near-optimal starting seed the screen would otherwise spend ~43s
+    // rediscovering. So we treat a present warm start exactly like a pinned
+    // `initial_rho`: leave the screening cap `None`, and the warm ρ flows
+    // straight into the BFGS/Newton outer solver.
+    //
+    // No-result-change: the screen only SELECTS a starting seed; it never
+    // alters the converged ρ. The outer optimizer still runs from the warm ρ
+    // and must reach its KKT/REML box-constraint stationarity certificate
+    // (the iter-0-metric fix `0eeb2d17b` makes a near-optimal warm seed
+    // converge in ~1 step), so the certified ρ is unchanged — we only remove
+    // the redundant cold-seed exploration the warm start already supersedes.
+    //
+    // Cold-fit safety: on a cold fit (no persistent hit AND the cross-fit
+    // `consume_fit_artifact` returned `None`), `persistent_warm_start` is
+    // `None`, so `warm_start_present` is `false` and the FULL multi-seed
+    // screen runs unchanged — cold fits keep their multi-seed robustness.
+    let warm_start_present = persistent_warm_start.is_some();
+    if warm_start_present {
+        log::info!(
+            "[OUTER] custom family: warm-start present (ρ/β seed already near-optimal); \
+             skipping cold seed-screening cascade, proceeding straight to BFGS/Newton certificate"
+        );
+    }
+    let problem = if options.screen_initial_rho && !warm_start_present {
         problem.with_screening_cap(Arc::clone(&screening_cap))
     } else {
         problem
