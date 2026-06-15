@@ -3997,6 +3997,77 @@ fn gaussian_identity_response_center(
     (m.is_finite() && m != 0.0).then_some(m)
 }
 
+/// The multiplicative scale an identity-link Gaussian outer REML λ-search should
+/// divide the (already centered) response by so its magnitude is `O(1)` for the
+/// duration of the search (issue #1127).
+///
+/// Replacing the response `y` by `a·y` (`a > 0`) for an identity-link Gaussian
+/// fit must rescale the entire fit by `a` and leave `λ̂` / EDF unchanged: the
+/// penalized normal equations are exactly linear in `y`, so `β̂(a·y)=a·β̂(y)`
+/// at any fixed `λ`, and the profiled REML criterion is `a`-invariant up to the
+/// additive constant `−(n−p)·ln a` (the dispersion `σ̂²` absorbs the `a²`).
+/// Numerically, though, the outer λ-selection's convergence band is keyed to an
+/// *absolute* objective scale (the inner-solve `objective_scale.max(1.0)` floor
+/// and the outer `1e-6` gradient floor): when the whole Gaussian objective is
+/// `O(a²) ≪ 1` those floors swamp the real signal and the optimizer declares
+/// premature convergence at an over-smoothed `λ` — silently over-smoothing
+/// small-magnitude responses (strains, volts, mole fractions, returns;
+/// `a ≈ 1e-6`). Normalizing the working response to `O(1)` makes the absolute
+/// floors track the true signal, restoring scale equivariance.
+///
+/// Returns `Some(s)` with `s = √(Σ wᵢ (yᵢ − mean)² / Σ wᵢ)` — the weighted RMS
+/// of the centered response — so the caller can divide by it and keep the outer
+/// working response `O(1)` regardless of magnitude. The same gate as
+/// [`gaussian_identity_response_center`] applies (identity-link Gaussian with an
+/// unpenalized intercept and no linear constraints); a non-finite, zero, or
+/// already-`O(1)` RMS returns `None` (do not scale, exact previous behaviour) —
+/// scaling near unity buys nothing and only risks a needless allocation.
+fn gaussian_identity_response_scale(
+    cfg: &RemlConfig,
+    conditioning: &ParametricColumnConditioning,
+    has_linear_constraints: bool,
+    center: f64,
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+) -> Option<f64> {
+    if has_linear_constraints
+        || conditioning.intercept_idx.is_none()
+        || !matches!(cfg.likelihood.spec.response, ResponseFamily::Gaussian)
+        || !matches!(cfg.link_function(), LinkFunction::Identity)
+    {
+        return None;
+    }
+    // A multiplicative response rescale `y → y/s` must be matched by `η → η/s`
+    // for the residual to scale cleanly. The intercept and smooth coefficients
+    // scale freely, but a *fixed* offset column does not — scaling the working
+    // response while leaving the offset on its original scale would change the
+    // residual geometry, not just its magnitude. The offset is shared verbatim
+    // into the outer state and reused by the accept-fit, so rather than thread a
+    // separately scaled copy everywhere, restrict the (rare) offset case to the
+    // exact previous path: only normalize when there is no nonzero offset.
+    if offset.iter().any(|&o| o != 0.0) {
+        return None;
+    }
+    let mut weight_sum = 0.0_f64;
+    let mut weighted_sq = KahanSum::default();
+    for ((&yi, &wi), &oi) in y.iter().zip(w.iter()).zip(offset.iter()) {
+        if wi > 0.0 {
+            weight_sum += wi;
+            let centered = (yi - oi) - center;
+            weighted_sq.add(wi * centered * centered);
+        }
+    }
+    if weight_sum <= 0.0 {
+        return None;
+    }
+    let rms = (weighted_sq.sum() / weight_sum).sqrt();
+    // Only normalize when the magnitude is far enough from `O(1)` to matter; a
+    // factor within ~one order of magnitude of unity cannot push the objective
+    // through the absolute floors, so leave the exact previous path untouched.
+    (rms.is_finite() && rms > 0.0 && !(0.1..=10.0).contains(&rms)).then_some(rms)
+}
+
 fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -4088,15 +4159,47 @@ where
         w_o.view(),
         offset_o.view(),
     );
+    // Issue #1127 (down-scale sibling of #1000): replacing the response `y` by
+    // `a·y` must rescale the whole fit by `a` and leave `λ̂`/EDF unchanged (the
+    // normal equations are exactly linear in `y`; the profiled REML criterion is
+    // `a`-invariant up to the additive `−(n−p)·ln a` the dispersion absorbs).
+    // But the outer λ-selection's convergence band is keyed to an *absolute*
+    // objective scale (an inner `objective_scale.max(1.0)` floor and a `1e-6`
+    // outer gradient floor); when the Gaussian objective is `O(a²) ≪ 1` those
+    // floors swamp the signal and the optimizer stops early at an over-smoothed
+    // `λ`. Normalize the (centered) working response to `O(1)` for the outer
+    // λ-search only, mirroring the #1000 centering: the final accept-fit below
+    // re-fits the *original* response at the REML-selected λ̂, so β, μ̂, σ̂² and
+    // every reported quantity stay exactly on the user's scale. `center` here is
+    // the constant the intercept already absorbs (so the scale is measured on the
+    // residual signal, not on the offset).
+    let response_scale = gaussian_identity_response_scale(
+        &cfg,
+        &conditioning,
+        opts.linear_constraints.is_some(),
+        response_center.unwrap_or(0.0),
+        y_o.view(),
+        w_o.view(),
+        offset_o.view(),
+    );
     // The outer loop borrows the response for the lifetime of `reml_state`;
-    // the centered copy (when any) is owned at function scope so the borrow
-    // outlives the state. Off the Gaussian-identity path `response_center` is
-    // `None` and the outer loop borrows the original response verbatim — no
-    // allocation, no behavioural change.
-    let reml_y_centered: Option<Array1<f64>> = response_center.map(|m| &y_o - m);
-    let reml_y_view = reml_y_centered
+    // the conditioned copy (when any) is owned at function scope so the borrow
+    // outlives the state. Off the Gaussian-identity path both `response_center`
+    // and `response_scale` are `None` and the outer loop borrows the original
+    // response verbatim — no allocation, no behavioural change. When only one is
+    // active we still apply just that transform. Both are exactly invertible by
+    // the accept-fit, which re-fits the original `y_o` at the selected λ̂.
+    let reml_y_conditioned: Option<Array1<f64>> = match (response_center, response_scale) {
+        (None, None) => None,
+        (center, scale) => {
+            let c = center.unwrap_or(0.0);
+            let s = scale.unwrap_or(1.0);
+            Some((&y_o - c) / s)
+        }
+    };
+    let reml_y_view = reml_y_conditioned
         .as_ref()
-        .map_or_else(|| y_o.view(), |centered| centered.view());
+        .map_or_else(|| y_o.view(), |conditioned| conditioned.view());
 
     let mut reml_state = RemlState::newwith_offset_shared(
         reml_y_view,
@@ -4801,14 +4904,15 @@ where
     // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
     // so the final accept-fit skips the streaming GEMM as well.
     //
-    // When the outer loop centered the response (issue #1000), that cache holds
-    // `XᵀW(centered_y − offset)`; the accept-fit runs on the *original*
-    // (uncentered) response `y_o`, so reusing the centered `XᵀWy` would solve
-    // for the centered intercept and report every fitted value, residual and
-    // scale on the shifted scale. Rebuild the cross-product from the original
-    // response in that case — the constant `XᵀWX` block is the only part the
-    // cache would have saved, a one-off cost paid only on large-mean responses.
-    let final_cache_handle = if response_center.is_some() {
+    // When the outer loop conditioned the response (centering for #1000, scaling
+    // for #1127), that cache holds `XᵀW((y−center)/scale)`; the accept-fit runs
+    // on the *original* response `y_o`, so reusing the conditioned `XᵀWy` would
+    // solve on the shifted/rescaled scale and report every fitted value, residual
+    // and dispersion off the user's scale. Rebuild the cross-product from the
+    // original response in that case — the constant `XᵀWX` block is the only part
+    // the cache would have saved, a one-off cost paid only on the rare
+    // large-mean / small-magnitude responses that trigger conditioning.
+    let final_cache_handle = if response_center.is_some() || response_scale.is_some() {
         None
     } else {
         reml_state.gaussian_fixed_cache_if_eligible()
