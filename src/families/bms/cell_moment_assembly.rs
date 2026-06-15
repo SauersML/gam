@@ -381,17 +381,24 @@ impl BernoulliMarginalSlopeFamily {
         let sign = 2.0 * self.y[row] - 1.0;
         let observed_eta = a + observed_slope * z;
         let m_signed = sign * observed_eta;
-        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m_signed);
-        if !logcdf.is_finite() {
+        // ONE transcendental per row: fused logΦ + k1..k2 from a single
+        // Mills-ratio evaluation (bit-identical to the prior two-call form;
+        // the weight `w` is already folded into stack[1..] as before).
+        if !(m_signed.is_finite() || m_signed == f64::INFINITY) {
+            return Err(format!(
+                "empirical rigid closed-form: non-finite signed margin {m_signed} at row {row}"
+            ));
+        }
+        let stack = signed_probit_neglog_unary_stack(m_signed, w);
+        if !stack[0].is_finite() {
             return Err(format!(
                 "empirical rigid closed-form: non-finite log Φ at row {row}"
             ));
         }
-        let (k1, k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(m_signed, w)?;
-        let u1 = sign * k1;
-        let u2 = k2;
+        let u1 = sign * stack[1];
+        let u2 = stack[2];
 
-        let neglog = -w * logcdf;
+        let neglog = stack[0];
         let grad = [u1 * eta_m, u1 * eta_g];
         let h_mm = u2 * eta_m * eta_m + u1 * a_mm;
         let h_mg = u2 * eta_m * eta_g + u1 * a_mg;
@@ -1767,13 +1774,17 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
-        let row_weights =
-            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n);
         // Per-row HT weighting: each row's (obj, grad, hess) is multiplied by
         // its inverse-inclusion weight `w_i` *before* accumulation, so the
         // final operator is the unbiased Horvitz-Thompson estimator. A single
         // post-sum scalar is biased under stratified subsampling because
-        // per-stratum sampling fractions differ.
+        // per-stratum sampling fractions differ. In the full-data path every
+        // `w_i == 1.0`, so we skip the dense O(n) weight vector entirely (it
+        // is otherwise re-allocated and zero-filled on every outer eval over
+        // n≈3e5 rows) and the per-row scaling becomes a no-op.
+        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
+            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n)
+        });
         let (objective_psi, score_psi, acc) = chunked_row_reduction(
             row_iter.as_slice(),
             || {
@@ -1786,11 +1797,13 @@ impl BernoulliMarginalSlopeFamily {
             |row, acc| -> Result<(), String> {
                 let (mut obj, mut grad, mut hess) =
                     self.row_sigma_primary_terms(row, block_states, false)?;
-                let w = row_weights[row];
-                if w != 1.0 {
-                    obj *= w;
-                    grad.mapv_inplace(|v| v * w);
-                    hess.mapv_inplace(|v| v * w);
+                if let Some(ref weights) = row_weights {
+                    let w = weights[row];
+                    if w != 1.0 {
+                        obj *= w;
+                        grad.mapv_inplace(|v| v * w);
+                        hess.mapv_inplace(|v| v * w);
+                    }
                 }
                 acc.0 += obj;
                 self.accumulate_rigid_sigma_pullback(
@@ -1840,8 +1853,11 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
-        let row_weights =
-            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n);
+        // Full-data path carries `w_i == 1.0` for every row, so skip the dense
+        // O(n) HT-weight vector (see `sigma_exact_joint_psi_terms_with_options`).
+        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
+            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n)
+        });
         let (objective_psi_psi, score_psi_psi, acc) = chunked_row_reduction(
             row_iter.as_slice(),
             || {
@@ -1854,11 +1870,13 @@ impl BernoulliMarginalSlopeFamily {
             |row, acc| -> Result<(), String> {
                 let (mut obj, mut grad, mut hess) =
                     self.row_sigma_primary_terms(row, block_states, true)?;
-                let w = row_weights[row];
-                if w != 1.0 {
-                    obj *= w;
-                    grad.mapv_inplace(|v| v * w);
-                    hess.mapv_inplace(|v| v * w);
+                if let Some(ref weights) = row_weights {
+                    let w = weights[row];
+                    if w != 1.0 {
+                        obj *= w;
+                        grad.mapv_inplace(|v| v * w);
+                        hess.mapv_inplace(|v| v * w);
+                    }
                 }
                 acc.0 += obj;
                 self.accumulate_rigid_sigma_pullback(
@@ -1920,8 +1938,11 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = primary_slices(&slices);
         let row_iter = outer_row_indices(options, n).to_vec();
-        let row_weights =
-            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n);
+        // Full-data path carries `w_i == 1.0` for every row, so skip the dense
+        // O(n) HT-weight vector (see `sigma_exact_joint_psi_terms_with_options`).
+        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
+            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n)
+        });
         // Sigma scale jets and the zero primary direction are constant across
         // rows; resolve once outside the fold. The shared
         // `directional_obj_grad_hess` sweep differentiates *through* the fixed
@@ -1952,9 +1973,11 @@ impl BernoulliMarginalSlopeFamily {
                     },
                 )?;
                 let mut hess = terms.hess;
-                let w = row_weights[row];
-                if w != 1.0 {
-                    hess.mapv_inplace(|v| v * w);
+                if let Some(ref weights) = row_weights {
+                    let w = weights[row];
+                    if w != 1.0 {
+                        hess.mapv_inplace(|v| v * w);
+                    }
                 }
                 acc.add_pullback(self, row, &slices, &primary, &hess);
                 Ok(())
