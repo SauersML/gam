@@ -2609,7 +2609,30 @@ impl<'d> SpatialJointContext<'d> {
                     .sqrt()
             })
             .unwrap_or(f64::NAN);
-        if self.cache.ensure_theta(theta).is_err() {
+        // #1033: a VALUE-only line-search probe needs only the certified ψ-Gram
+        // tensor's value lane (`XᵀWX(ψ)/XᵀW(y−offset)(ψ)`), which the inner
+        // Gaussian PLS reads n-free from the ψ-keyed `GaussianFixedCache`. So when
+        // the single design-moving ψ is covered for the VALUE lane and the
+        // evaluator's design-revision fast path is armed at the current realizer
+        // revision, skip the n×k design re-realization: the realizer revision
+        // stays pinned, `evaluate_cost_only` takes its `prepare_eval_state_cost_only`
+        // fast path (which skips `reset_surface` + the n×k `apply_to_design` and
+        // re-keys the cache to this probe's ψ), and the probe cost comes from
+        // k-space statistics only. Line-search probes are the bulk of the κ-loop
+        // per-trial work, so this is the dominant n-flat lever. Unlike the
+        // gradient path the value lane spans the FULL certified window, so only
+        // `psi_gram_tensor_covers` (not the narrower gradient sub-window) is
+        // required. Any miss (non-Gaussian, off-window, fast path not yet armed)
+        // realizes the design and runs the exact streamed probe unchanged.
+        let skip_value_realization = theta.len() == self.rho_dim + 1
+            && {
+                let psi = theta[self.rho_dim];
+                self.evaluator.psi_gram_tensor_covers(psi)
+                    && self
+                        .evaluator
+                        .design_revision_fast_path_armed(self.cache.design_revision())
+            };
+        if !skip_value_realization && self.cache.ensure_theta(theta).is_err() {
             return f64::INFINITY;
         }
         let design_revision = Some(self.cache.design_revision());
