@@ -1,3 +1,14 @@
+## gamfit 0.1.215 (2026-06-15)
+
+- Remove per-call `[STAGE] BMS rigid ... BLAS-3 ... path TAKEN/NOT-taken` log
+  lines from the rigid row-kernel dispatch (added in 0.1.213 for one-shot gate
+  diagnostics). They fired on every `directional_derivative`/`hessian_dense`
+  call — thousands of lines per fit — flooding the run log. The gate logic is
+  unchanged; only the logging is removed.
+- Cross-fit warm-start descriptor now encodes the realized per-block reduced
+  β-width, so a p=37 fit no longer matches a p=85 artifact (no misleading
+  length-mismatch skip) while same-width LOSO folds still transfer β.
+
 ## gamfit 0.1.214 (2026-06-15)
 
 Biobank BMS speed sweep — attacks every recurring cost in the outer REML/LAML

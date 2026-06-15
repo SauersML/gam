@@ -568,21 +568,8 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         let marginal_sparse = self.family.marginal_design.is_sparse();
         let logslope_sparse = self.family.logslope_design.is_sparse();
         if marginal_sparse || logslope_sparse {
-            log::info!(
-                "[STAGE] BMS rigid directional_derivative BLAS-3 path NOT taken: sparse design \
-                 (marginal_sparse={marginal_sparse} logslope_sparse={logslope_sparse}) \
-                 -> generic per-row scatter"
-            );
             return None;
         }
-        log::info!(
-            "[STAGE] BMS rigid directional_derivative BLAS-3 chunked Xᵀdiag(w)X path TAKEN n={} p={} \
-             marginal_dense_view={} logslope_dense_view={}",
-            self.family.y.len(),
-            self.slices.total,
-            self.family.marginal_design.as_dense_ref().is_some(),
-            self.family.logslope_design.as_dense_ref().is_some(),
-        );
         Some(self.directional_derivative_dense_blas3(d_beta))
     }
 
@@ -607,18 +594,9 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // Only the full-data unit-weight measure is BLAS-3 accelerated; a
         // Horvitz-Thompson subsample keeps the generic per-row HT path.
         if !matches!(rows, crate::families::row_kernel::RowSet::All) {
-            log::info!(
-                "[STAGE] BMS rigid hessian_dense BLAS-3 path NOT taken: RowSet is a subsample \
-                 (generic per-row Horvitz-Thompson scatter)"
-            );
             return None;
         }
         if row_hessians.len() != self.family.y.len() {
-            log::info!(
-                "[STAGE] BMS rigid hessian_dense BLAS-3 path NOT taken: row_hessians.len()={} != n={}",
-                row_hessians.len(),
-                self.family.y.len(),
-            );
             return None;
         }
         // The chunked `Xᵀ diag(w) X` build slices contiguous design rows via
@@ -638,14 +616,6 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             );
             return None;
         }
-        log::info!(
-            "[STAGE] BMS rigid hessian_dense BLAS-3 chunked Xᵀdiag(w)X path TAKEN n={} p={} \
-             marginal_dense_view={} logslope_dense_view={}",
-            self.family.y.len(),
-            self.slices.total,
-            self.family.marginal_design.as_dense_ref().is_some(),
-            self.family.logslope_design.as_dense_ref().is_some(),
-        );
         Some(self.hessian_dense_blas3(row_hessians))
     }
 }
