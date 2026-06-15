@@ -75,6 +75,18 @@ pub(crate) struct OuterConfig {
     pub(crate) cache_mirror_sessions: Vec<Arc<CacheSession>>,
     pub(crate) rho_uncertainty_problem_size:
         crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
+    /// Set by the persistent-cache resume path (`run`) when the outer seed
+    /// originates from a warm-start cache *hit* — i.e. `config.initial_rho`
+    /// (and, since 0.1.204, the inner β) was populated from a prior fit's
+    /// persisted near-optimal iterate (`CacheSeedDecision::Seed`). On a hit
+    /// the continuation pre-warm — which exists to anneal a COLD seed toward
+    /// the optimum — is redundant work (the seed is already near-optimal), so
+    /// the pre-warm step budget is dropped to zero and the run proceeds
+    /// straight to the BFGS/Newton certificate from the cached iterate. The
+    /// converged optimum is unchanged: warm start only sets the STARTING
+    /// point. Defaulted `false`, so every cold-start / no-cache path keeps its
+    /// existing continuation pre-warm budget byte-for-byte.
+    pub(crate) warm_start_cache_hit: bool,
 }
 
 impl Default for OuterConfig {
@@ -101,6 +113,7 @@ impl Default for OuterConfig {
             cache_mirror_sessions: Vec::new(),
             rho_uncertainty_problem_size:
                 crate::inference::rho_uncertainty::RhoUncertaintyProblemSize::default(),
+            warm_start_cache_hit: false,
         }
     }
 }
@@ -444,6 +457,11 @@ impl OuterProblem {
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
             rho_uncertainty_problem_size: self.rho_uncertainty_problem_size,
+            // Cold by construction. The persistent-cache resume path in `run`
+            // flips this to `true` only after a warm-start cache *hit* installs
+            // a near-optimal seed; every other entry point keeps the cold-start
+            // continuation pre-warm budget byte-for-byte.
+            warm_start_cache_hit: false,
         }
     }
 
@@ -676,6 +694,13 @@ impl OuterProblem {
                 self.n_params,
             );
         }
+        // Propagate the warm-start cache-hit signal into the config the runner
+        // sees. On a hit the installed seed (ρ, and since 0.1.204 the inner β)
+        // is already near-optimal, so the continuation pre-warm — which exists
+        // purely to anneal a COLD seed — is redundant and is skipped downstream
+        // (`run_plan::continuation_prewarm_step_budget`). The outer BFGS/Newton
+        // still runs to its REML/KKT certificate, so the optimum is identical.
+        config.warm_start_cache_hit = had_hit;
         let mut checkpointing = CheckpointingObjective::new(
             obj,
             Arc::clone(&session),

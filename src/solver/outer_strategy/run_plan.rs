@@ -11,6 +11,16 @@ pub(crate) fn continuation_prewarm_step_budget(
     seed_count: usize,
     seed_budget: usize,
 ) -> usize {
+    // Warm-start cache hit: the seed (ρ, and since 0.1.204 the inner β) was
+    // populated from a prior fit's persisted near-optimal iterate, so the
+    // continuation pre-warm — which only exists to anneal a COLD seed toward the
+    // optimum — has nothing to anneal. Skip it entirely; the outer BFGS/Newton
+    // still runs to its REML/KKT certificate from the cached iterate, so the
+    // converged optimum is identical. Cold-start fits (no hit) fall through to
+    // the existing shape-based budget byte-for-byte.
+    if config.warm_start_cache_hit {
+        return 0;
+    }
     let default_budget = crate::solver::estimate::reml::continuation::PATH_BUDGET;
     let p_coefficients = config
         .rho_uncertainty_problem_size
@@ -146,7 +156,13 @@ pub(crate) fn run_outer_with_plan(
     let mut unsuccessful_expensive_seeds = 0usize;
     let continuation_prewarm_budget =
         continuation_prewarm_step_budget(config, cap, seeds.len(), seed_budget);
-    if continuation_prewarm_budget < crate::solver::estimate::reml::continuation::PATH_BUDGET {
+    if config.warm_start_cache_hit {
+        log::info!(
+            "[OUTER] {context}: continuation pre-warm skipped: warm-start cache hit \
+             (seed already near-optimal); proceeding straight to BFGS/Newton certificate"
+        );
+    } else if continuation_prewarm_budget < crate::solver::estimate::reml::continuation::PATH_BUDGET
+    {
         let p_coefficients = config
             .rho_uncertainty_problem_size
             .p_coefficients
@@ -555,7 +571,8 @@ pub(crate) fn run_outer_with_plan(
                 );
             }
         }
-        if continuation_path.is_none() && enter_via_continuation_path {
+        if continuation_path.is_none() && enter_via_continuation_path && continuation_prewarm_budget > 0
+        {
             if let Some(reason) = continuation_prewarm_suppressed_after.as_ref() {
                 log::info!(
                     "[OUTER] {context}: skipping continuation pre-warm for seed {seed_idx} \

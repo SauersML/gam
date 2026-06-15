@@ -3693,3 +3693,64 @@ fn exact_final_cache_hit_skips_outer_validation() {
         "exact final hit should not evaluate the outer objective"
     );
 }
+
+// ─── continuation pre-warm budget on a warm-start cache hit ──────────
+
+/// An expensive-shape outer problem with no cache hit keeps its
+/// shape-derived continuation pre-warm budget. This pins the cold-start
+/// contract so the hit-path skip below is provably the only behavior change.
+#[test]
+fn prewarm_budget_cold_start_keeps_shape_budget() {
+    let cap = OuterCapability {
+        gradient: Derivative::Analytic,
+        hessian: DeclaredHessianForm::Unavailable,
+        // n_params >= EXPENSIVE_PREWARM_RHO_DIM makes this an "expensive" shape.
+        n_params: EXPENSIVE_PREWARM_RHO_DIM,
+        psi_dim: 0,
+        fixed_point_available: false,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: false,
+    };
+    let config = OuterConfig {
+        warm_start_cache_hit: false,
+        ..OuterConfig::default()
+    };
+    // Single-seed expensive shape => SINGLE_EXPENSIVE_PREWARM_BUDGET (capped at
+    // PATH_BUDGET). The exact value is the existing cold-start contract; the
+    // load-bearing assertion is that it is strictly positive (pre-warm runs).
+    let budget = continuation_prewarm_step_budget(&config, &cap, 1, 1);
+    assert_eq!(
+        budget,
+        SINGLE_EXPENSIVE_PREWARM_BUDGET
+            .min(crate::solver::estimate::reml::continuation::PATH_BUDGET),
+        "cold-start expensive single-seed shape must keep its shape-derived budget"
+    );
+    assert!(budget > 0, "cold start must still run the continuation pre-warm");
+}
+
+/// On a warm-start cache hit the seed is already near-optimal, so the
+/// continuation pre-warm budget collapses to zero regardless of problem
+/// shape — the only difference vs the cold-start case above is the flag.
+#[test]
+fn prewarm_budget_warm_start_cache_hit_is_zero() {
+    let cap = OuterCapability {
+        gradient: Derivative::Analytic,
+        hessian: DeclaredHessianForm::Unavailable,
+        n_params: EXPENSIVE_PREWARM_RHO_DIM,
+        psi_dim: 0,
+        fixed_point_available: false,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: false,
+    };
+    let config = OuterConfig {
+        warm_start_cache_hit: true,
+        ..OuterConfig::default()
+    };
+    let budget = continuation_prewarm_step_budget(&config, &cap, 1, 1);
+    assert_eq!(
+        budget, 0,
+        "a warm-start cache hit must skip the redundant continuation pre-warm"
+    );
+}
