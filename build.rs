@@ -3066,42 +3066,94 @@ fn scan_for_vendor_directories(
 
 const MAX_TRACKED_FILE_LINES: usize = 10_000;
 
-fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("safe.directory=*")
-        .arg("-C")
-        .arg(root)
-        .arg("ls-files")
-        .arg("-z")
-        .output()
-        .expect("failed to list Git-tracked files for line-count audit");
-    assert!(
-        output.status.success(),
-        "git ls-files failed during line-count audit"
-    );
+/// Cached result of [`collect_repo_files`].
+static REPO_FILES: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
-    for raw in output.stdout.split(|b| *b == 0) {
-        if raw.is_empty() {
+/// Walk every repo file once, skipping build artifacts and toolchain caches.
+/// Replaces a `git ls-files` shell-out that hard-panicked the build inside
+/// maturin's manylinux / musllinux Docker images — the bind-mounted source tree
+/// trips `safe.directory` checks there and git returns non-zero. Reading the
+/// filesystem makes the audit hermetic and also catches oversized /
+/// mechanically-split files before commit rather than only after.
+fn collect_repo_files(root: &Path) -> &'static [PathBuf] {
+    REPO_FILES
+        .get_or_init(|| {
+            let mut out = Vec::new();
+            collect_repo_files_into(root, root, &mut out);
+            out
+        })
+        .as_slice()
+}
+
+fn collect_repo_files_into(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
+        // Skip exactly the same housekeeping noise the other tree walkers
+        // (`collect_scannable_files`, `scan_for_vendor_directories`) skip, so
+        // the three audits agree on what counts as a repo file.
+        if (name.starts_with('.') && name != ".github")
+            || name == "target"
+            || name.starts_with("target-")
+            || name == "node_modules"
+            || name == "__pycache__"
+            || name == "pydeps"
+            || name == "site-packages"
+            || name == "venv"
+            || name == "dist"
+            || name == "build"
+            || name == "site"
+        {
             continue;
         }
-        let rel_text = String::from_utf8(raw.to_vec())
-            .expect("git ls-files emitted a non-UTF-8 path; repository paths must be UTF-8");
-        let rel = PathBuf::from(&rel_text);
-        let path = root.join(&rel);
+        if path
+            .strip_prefix(root)
+            .ok()
+            .is_some_and(|rel| rel.starts_with("bench/runtime/pydeps"))
+        {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            collect_repo_files_into(root, &path, out);
+            continue;
+        }
+        // Treat symlinks like regular files: count their target as a tracked
+        // entity. A broken-symlink `fs::read_to_string` later turns into an
+        // ignored NotFound at the size-audit site, matching the previous
+        // git-driven behaviour for files that disappeared between listing and
+        // reading.
+        if file_type.is_file() || file_type.is_symlink() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+}
+
+fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
+    for rel in collect_repo_files(root) {
+        let path = root.join(rel);
         let line_count = match count_file_lines(&path) {
             Ok(line_count) => line_count,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
                 panic!(
-                    "failed to read tracked file for line-count audit: {}: {err}",
+                    "failed to read repo file for line-count audit: {}: {err}",
                     rel.display()
                 )
             }
         };
         if line_count > MAX_TRACKED_FILE_LINES {
             offenders.push((
-                rel,
+                rel.clone(),
                 line_count,
                 format!("{line_count} lines; limit is {MAX_TRACKED_FILE_LINES}"),
             ));
@@ -3150,40 +3202,20 @@ fn is_mechanical_part_path(rel: &Path) -> bool {
 /// Ban mechanical file-splitting (`part_<NNN>.rs`, `*_parts/`, `split_parts/`).
 /// HARD ban with NO grandfathering: every such path fails the build. Split each
 /// module by cohesive concern into descriptively-named modules instead. Scans
-/// every `.rs` file tracked anywhere in the repo (src/, tests/, crates/, …), so
-/// no future mechanical split can slip in outside src/. Non-code dataset shards
+/// every `.rs` file anywhere in the repo (src/, tests/, crates/, …), so no
+/// future mechanical split can slip in outside src/. Non-code dataset shards
 /// such as `bench/datasets/*_parts/part_00N.csv` are skipped because the audit
 /// only considers `.rs` files.
 fn scan_for_mechanical_part_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("safe.directory=*")
-        .arg("-C")
-        .arg(root)
-        .arg("ls-files")
-        .arg("-z")
-        .output()
-        .expect("failed to list Git-tracked files for mechanical-part audit");
-    assert!(
-        output.status.success(),
-        "git ls-files failed during mechanical-part audit"
-    );
-
-    for raw in output.stdout.split(|b| *b == 0) {
-        if raw.is_empty() {
+    for rel in collect_repo_files(root) {
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
             continue;
         }
-        let rel_text = String::from_utf8(raw.to_vec())
-            .expect("git ls-files emitted a non-UTF-8 path; repository paths must be UTF-8");
-        if !rel_text.ends_with(".rs") {
-            continue;
-        }
-        let rel = PathBuf::from(&rel_text);
-        if !is_mechanical_part_path(&rel) {
+        if !is_mechanical_part_path(rel) {
             continue;
         }
         offenders.push((
-            rel,
+            rel.clone(),
             0,
             "mechanical line-count split; decompose by cohesive concern into descriptively-named \
              modules — this is a HARD ban, no grandfathering"
