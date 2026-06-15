@@ -2059,6 +2059,37 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             (Some(a), Some(hp), Some(hs)) => Some(a + hp - hs),
             _ => None,
         };
+
+        // Probes (a) + (b): per-component FD of the outer VALUE at ψ±eps (β̂
+        // re-solved each side), using the same `eps` as the failing gradient
+        // check. Hold the SAME CaptureGuard so each eval populates the stash;
+        // `take_terms` drains it after each. Then attribute the FD total:
+        //   FD(log_det_h)            ↔ production_tr  (probe b: frozen ∂W/∂ψ logdet-H drift)
+        //   FD(cost − ½ldh + ½lds)   ↔ coord_a        (probe a: cost/`a` term completeness)
+        //   FD(log_det_s)            ↔ coord_ld_s
+        let (_, _, _) = outer_at(eps, 0.0, EvalMode::ValueGradientHessian);
+        let stash_plus = debug_stash::take_terms();
+        let (_, _, _) = outer_at(-eps, 0.0, EvalMode::ValueGradientHessian);
+        let stash_minus = debug_stash::take_terms();
+        let central = |plus: Option<f64>, minus: Option<f64>| -> Option<f64> {
+            match (plus, minus) {
+                (Some(p), Some(m)) => Some((p - m) / (2.0 * eps)),
+                _ => None,
+            }
+        };
+        let fd_log_det_h = central(stash_plus.coord_log_det_h, stash_minus.coord_log_det_h);
+        let fd_log_det_s = central(stash_plus.coord_log_det_s, stash_minus.coord_log_det_s);
+        // Logdet-EXCLUDED cost piece at each side: cost − ½log_det_h + ½log_det_s.
+        let cost_ex = |s: &debug_stash::TermStash| -> Option<f64> {
+            match (s.coord_cost, s.coord_log_det_h, s.coord_log_det_s) {
+                (Some(c), Some(ldh), Some(lds)) => Some(c - 0.5 * ldh + 0.5 * lds),
+                _ => None,
+            }
+        };
+        let fd_cost_excl_logdet = central(cost_ex(&stash_plus), cost_ex(&stash_minus));
+        // Full cost FD (sanity: must reproduce the public-API fd_psi_gradient).
+        let fd_cost_total = central(stash_plus.coord_cost, stash_minus.coord_cost);
+
         println!(
             "[HVP-attr] analytic_psi_grad={analytic_psi_gradient:.8e} fd_psi_grad={fd_psi_gradient:.8e} \
              coord_a={:?} production_tr={:?} half_production_tr={:?} coord_ld_s={:?} \
@@ -2075,6 +2106,23 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             stash.correction_tr_proj,
             stash.projection_active,
             stash.unprojected_tr,
+        );
+        println!(
+            "[HVP-attr-fd] PROBE_a coord_a={:?} fd_cost_excl_logdet={:?} (these should match) | \
+             PROBE_b production_tr={:?} fd_log_det_h={:?} (these should match) | \
+             coord_ld_s={:?} fd_log_det_s={:?} (should match) | \
+             fd_cost_total={:?} fd_psi_grad_public={fd_psi_gradient:.8e} (cross-check) | \
+             base_log_det_h={:?} base_log_det_s={:?} base_cost={:?}",
+            stash.coord_a,
+            fd_cost_excl_logdet,
+            stash.production_tr,
+            fd_log_det_h,
+            stash.coord_ld_s,
+            fd_log_det_s,
+            fd_cost_total,
+            stash.coord_log_det_h,
+            stash.coord_log_det_s,
+            stash.coord_cost,
         );
     }
     let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());

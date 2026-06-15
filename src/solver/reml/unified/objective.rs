@@ -1168,6 +1168,14 @@ pub fn reml_laml_evaluate(
                 // matched against each analytic term independently.
                 stash.coord_a = Some(coord.a);
                 stash.coord_ld_s = Some(coord.ld_s);
+                // Outer VALUE components, so a per-component FD of the objective
+                // (β̂ re-solved at each ψ) can be matched against each analytic
+                // gradient piece: FD(log_det_h) ↔ production_tr (probe b),
+                // FD(cost − ½log_det_h + ½log_det_s) ↔ coord_a (probe a),
+                // FD(log_det_s) ↔ coord_ld_s.
+                stash.coord_log_det_h = Some(log_det_h);
+                stash.coord_log_det_s = Some(log_det_s);
+                stash.coord_cost = Some(cost);
                 let correction = ext_corrections[ext_idx].as_ref();
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
                 let unprojected = match &drift {

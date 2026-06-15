@@ -320,6 +320,20 @@ pub mod debug_stash {
         /// HVP ψ-gradient attribution (#740): the `∂log|Sλ|₊/∂ψ` penalty-logdet
         /// derivative `ld_s` for this coordinate (see [`Self::coord_a`]).
         pub coord_ld_s: Option<f64>,
+        /// HVP ψ-gradient attribution (#740): the VALUE component `log|H+Sλ|₊`
+        /// (the `½` factor lives in the outer cost). FD of this across ψ±eps (β̂
+        /// re-solved each side) is the TOTAL logdet-H ψ-derivative (frozen B_i +
+        /// IFT) and is matched against `production_tr` to test probe (b) — is the
+        /// frozen `∂W/∂ψ` logdet-H drift the true frozen-β logdet derivative.
+        pub coord_log_det_h: Option<f64>,
+        /// HVP ψ-gradient attribution (#740): the VALUE component `log|Sλ|₊`.
+        pub coord_log_det_s: Option<f64>,
+        /// HVP ψ-gradient attribution (#740): the TOTAL outer cost (objective)
+        /// `[−ℓ(β̂)+½β̂ᵀSλβ̂] + ½log|H+Sλ|₊ − ½log|Sλ|₊`. FD of
+        /// `cost − ½·log_det_h + ½·log_det_s` (the logdet-EXCLUDED cost piece)
+        /// across ψ±eps is matched against `coord_a` to test probe (a) — does the
+        /// `a` term carry the full likelihood/penalty-vs-ψ derivative at β̂.
+        pub coord_cost: Option<f64>,
     }
 
     thread_local! {
@@ -334,6 +348,9 @@ pub mod debug_stash {
             correction_tr_proj: None,
             coord_a: None,
             coord_ld_s: None,
+            coord_log_det_h: None,
+            coord_log_det_s: None,
+            coord_cost: None,
         }) };
     }
 
