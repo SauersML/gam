@@ -593,49 +593,47 @@ fn audit_identifiability_impl(
     let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
     col_offsets.push(0);
     let block_phase_started = std::time::Instant::now();
-    let block_progress_ticker = (n.saturating_mul(specs.len())
-        >= AUDIT_PROGRESS_TICKER_WORK_THRESHOLD)
-        .then(crate::util::loop_progress::LoopProgress::default_interval);
+    // Per-block penalty-aware RRQR ranks. Each block's rank is a fully
+    // INDEPENDENT factorisation of `[J_block; S_block]` ((n+p_block) × p_block);
+    // nothing in one block's RRQR reads another block's result, and the joint
+    // assembly below consumes only the scalar rank plus the (already-known)
+    // column counts. Computing them with a parallel map over blocks is therefore
+    // BIT-IDENTICAL to the previous serial loop — `block_penalty_aware_rank` is
+    // pure and called with the same `(dense, structural_penalty)` arguments — but
+    // overlaps the n-scale per-block factorisations (the ~0.8s biobank
+    // per-block-QR phase) across the rayon pool instead of running them serially.
+    // A single faer col-piv QR on a tall-thin matrix is mostly BLAS-2 over the
+    // tiny p_block trailing panel, so fanning the blocks out wins where one block
+    // alone cannot saturate the pool.
+    let block_ranks: Vec<usize> = {
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+        let results: Result<Vec<usize>, EstimationError> = dense_blocks
+            .par_iter()
+            .zip(block_penalties.par_iter())
+            .map(|(dense, penalty)| block_penalty_aware_rank(dense, penalty.as_ref()))
+            .collect();
+        results?
+    };
     for (idx, spec) in specs.iter().enumerate() {
-        // Effective Jacobians were pre-materialised above so the row-count
-        // invariant could be checked against the audit-visible rows.
-        let dense = &dense_blocks[idx];
-        let p_block = dense.ncols();
+        let p_block = dense_blocks[idx].ncols();
         // Penalty-aware, rank-revealing: rank of `[J; S]`, so penalty-covered
         // (design-null but regularized) directions count as identified. RRQR is
         // rank-revealing (the prior plain-QR diagonal was not), so the reported
         // range_rank is now an honest numerical rank.
-        let block_rank = block_penalty_aware_rank(dense, block_penalties[idx].as_ref())?;
         blocks.push(BlockIdentity {
             block_name: spec.name.clone(),
             original_dim: p_block,
             effective_dim: p_block,
-            design_range_rank: block_rank,
+            design_range_rank: block_ranks[idx],
         });
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
-        if let Some(ticker) = block_progress_ticker.as_ref() {
-            ticker.tick(1, |progress, elapsed| {
-                log::info!(
-                    "[STAGE] identifiability audit: per-block QR progress={}/{} elapsed={:.1}s (overall={:.1}s)",
-                    progress.min(specs.len()),
-                    specs.len(),
-                    elapsed,
-                    block_phase_started.elapsed().as_secs_f64(),
-                );
-            });
-        }
-        // Per-block summary on the last iteration so the user always
-        // sees one waypoint between "audit start" and the dense joint
-        // assembly even if no progress tick fires.
-        if idx + 1 == specs.len() {
-            log::info!(
-                "[STAGE] identifiability audit: per-block QR complete blocks={} elapsed={:.3}s",
-                specs.len(),
-                block_phase_started.elapsed().as_secs_f64(),
-            );
-        }
     }
+    log::info!(
+        "[STAGE] identifiability audit: per-block QR complete blocks={} elapsed={:.3}s",
+        specs.len(),
+        block_phase_started.elapsed().as_secs_f64(),
+    );
     let p_total = *col_offsets.last().expect("col_offsets non-empty");
 
     // Permanent layout diagnostic: name every block with its gauge priority,
@@ -902,16 +900,31 @@ fn audit_identifiability_impl(
         p_total,
         specs.len(),
     );
-    let mut col_norms = Array1::<f64>::zeros(p_total);
-    // S2_k for each joint column; computed once and reused for both
-    // report and halt threshold decisions below.
-    let mut col_s2 = Array1::<f64>::zeros(p_total);
-    for j in 0..p_total {
-        let col = x_joint.column(j);
-        let nrm = col.iter().map(|v| v * v).sum::<f64>().sqrt();
-        col_norms[j] = nrm;
-        col_s2[j] = compute_leverage_s2(&col);
-    }
+    // Per-column norm and leverage concentration S2_k = Σ_i φ_i⁴ / (Σ_i φ_i²)².
+    // Each column is independent, so the p_total O(n) passes run as a parallel
+    // map over columns. The per-column arithmetic (sequential `Σ φ²` for the
+    // norm, `compute_leverage_s2` for S2) is UNCHANGED from the prior serial
+    // loop, so the result is BIT-IDENTICAL — only the iteration over columns is
+    // parallelised.
+    let (col_norms, col_s2): (Array1<f64>, Array1<f64>) = {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let pairs: Vec<(f64, f64)> = (0..p_total)
+            .into_par_iter()
+            .map(|j| {
+                let col = x_joint.column(j);
+                let nrm = col.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let s2 = compute_leverage_s2(&col);
+                (nrm, s2)
+            })
+            .collect();
+        let mut norms = Array1::<f64>::zeros(p_total);
+        let mut s2s = Array1::<f64>::zeros(p_total);
+        for (j, (nrm, s2)) in pairs.into_iter().enumerate() {
+            norms[j] = nrm;
+            s2s[j] = s2;
+        }
+        (norms, s2s)
+    };
     // Total number of cross-block column pairs for Bonferroni correction.
     let total_cross_pairs: usize = {
         let mut cnt = 0usize;
