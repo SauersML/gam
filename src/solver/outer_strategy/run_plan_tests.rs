@@ -249,6 +249,187 @@ fn certificate_rail_detection_uses_outer_box() {
     assert_eq!(certificate_railed_lambdas(&pinned, 3, &bounded), vec![0, 1]);
 }
 
+/// Helper: build an objective whose VALUE path (the one the certificate
+/// probes via `eval_cost`) is `0.5·ρ₀² + slope_railed·ρ₁`, and run the audit
+/// directly at a constructed optimum where ρ₁ is railed at the upper box
+/// bound. The analytic gradient is supplied separately so we control the
+/// railed-vs-free desync structure exactly.
+fn audit_at_railed_optimum(
+    config: &OuterConfig,
+    theta_hat: Array1<f64>,
+    analytic_gradient: Array1<f64>,
+    value_slope_railed: f64,
+) -> Option<CriterionCertificate> {
+    let slope = value_slope_railed;
+    let mut obj = OuterProblem::new(2)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                // True criterion VALUE: free coord 0 is a consistent
+                // quadratic; railed coord 1 has slope `slope`.
+                Ok(0.5 * rho[0] * rho[0] + slope * rho[1])
+            },
+            move |_: &mut (), rho: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.5 * rho[0] * rho[0] + slope * rho[1],
+                    gradient: array![rho[0], slope],
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+    let mut result = OuterResult::new(
+        theta_hat,
+        0.0,
+        1,
+        true,
+        OuterPlan {
+            solver: Solver::Bfgs,
+            hessian_source: HessianSource::BfgsApprox,
+        },
+    );
+    result.final_gradient = Some(analytic_gradient);
+    audit_first_order_optimality(&mut obj, config, "railed-audit-unit", &result)
+}
+
+/// TASK 1+2+3: at an optimum where the ONLY disagreement lives on a railed
+/// box-bound coordinate, the certificate must NOT report a gradient-objective
+/// desync. The full-direction FD-vs-analytic check would flag it (the value
+/// slope along the railed coord disagrees with the analytic gradient there,
+/// as it legitimately can under KKT), but the audit restricts the comparison
+/// to the free (box-interior) subspace, where the two paths agree.
+#[test]
+fn certificate_does_not_false_flag_when_only_railed_coordinate_disagrees() {
+    let bounded = OuterConfig {
+        bounds: Some((array![-5.0, -5.0], array![5.0, 5.0])),
+        ..OuterConfig::default()
+    };
+    // ρ₁ railed at the upper bound (5.0); ρ₀ interior at its quadratic min.
+    let theta_hat = array![0.0, 5.0];
+    // Analytic gradient: free coord 0 consistent (∂=ρ₀=0); railed coord 1
+    // reports a small KKT-balanced slope (−0.5) that DISAGREES with the
+    // value path's slope of +7.0 along ρ₁.
+    let analytic_gradient = array![0.0, -0.5];
+    let value_slope_railed = 7.0;
+
+    // First, confirm the FULL-direction comparison WOULD flag this, so the
+    // test actually exercises the artifact (not a no-op). Reconstruct the
+    // full audit direction and the full-space directional derivatives.
+    let full_dir = certificate_audit_direction(&theta_hat, "railed-audit-unit");
+    assert!(
+        full_dir[1].abs() > 1e-3,
+        "audit direction must have a non-trivial railed component to make \
+         the full-space check meaningful: {full_dir:?}",
+    );
+    let analytic_full = analytic_gradient.dot(&full_dir);
+    // Value-path directional slope along the full direction:
+    //   ∂/∂s [0.5(s·d₀)² + 7·(5 + s·d₁)] at s=0 = 7·d₁  (the ρ₀ term is O(s)).
+    let fd_full_slope = value_slope_railed * full_dir[1];
+    assert!(
+        (analytic_full - fd_full_slope).abs() > 1e-2,
+        "full-direction analytic and value-path slopes should disagree \
+         (artifact precondition): analytic={analytic_full} fd≈{fd_full_slope}",
+    );
+
+    let cert = audit_at_railed_optimum(
+        &bounded,
+        theta_hat,
+        analytic_gradient,
+        value_slope_railed,
+    )
+    .expect("railed audit must still produce a certificate");
+
+    assert_eq!(
+        cert.lambdas_railed,
+        vec![1],
+        "coord 1 must be detected as railed: {}",
+        cert.summary(),
+    );
+    // The free subspace is coord 0 only, where value (½ρ₀²) and gradient (ρ₀)
+    // agree exactly at ρ₀=0 → directional derivatives ≈ 0 and consistent.
+    assert!(
+        cert.first_order_consistent(),
+        "railed-coordinate disagreement was FALSE-FLAGGED as a desync; the \
+         free subspace agrees, so this must be reported consistent: {}",
+        cert.summary(),
+    );
+    assert!(
+        cert.agreement_z < CERTIFICATE_Z_GATE,
+        "projected-onto-free z must be small: {}",
+        cert.summary(),
+    );
+}
+
+/// TASK 3 guard: the projection must NOT blunt the certificate's real job.
+/// A genuine desync on a FREE (interior) coordinate must still fire even when
+/// a different coordinate is railed.
+#[test]
+fn certificate_still_fires_on_genuine_interior_gradient_desync() {
+    let bounded = OuterConfig {
+        bounds: Some((array![-5.0, -5.0], array![5.0, 5.0])),
+        ..OuterConfig::default()
+    };
+    // ρ₁ railed at the upper bound; ρ₀ interior but the analytic gradient on
+    // the FREE coord 0 is wrong: it claims ∂=0 while the value path slopes by
+    // ρ₀ (here ρ₀=2.5 → true slope 2.5). This is the #748/#752/#808 genus on
+    // a free coordinate and MUST be caught.
+    let theta_hat = array![2.5, 5.0];
+    let analytic_gradient = array![0.0, -0.5]; // coord 0 wrong (should be 2.5)
+    let value_slope_railed = 7.0;
+
+    let cert = audit_at_railed_optimum(
+        &bounded,
+        theta_hat,
+        analytic_gradient,
+        value_slope_railed,
+    )
+    .expect("railed audit must still produce a certificate");
+
+    assert_eq!(cert.lambdas_railed, vec![1], "coord 1 railed: {}", cert.summary());
+    assert!(
+        !cert.first_order_consistent(),
+        "genuine interior (free-coordinate) desync was masked by the railed \
+         projection — the certificate failed its core job: {}",
+        cert.summary(),
+    );
+    assert!(
+        cert.agreement_z > CERTIFICATE_Z_GATE,
+        "interior desync must exceed the z gate: {}",
+        cert.summary(),
+    );
+}
+
+/// TASK 3 invariance: with nothing railed, the projection is identity and the
+/// audit is byte-identical to the full-space path. A consistent interior
+/// optimum stays clean; the railed list is empty.
+#[test]
+fn certificate_full_space_unchanged_when_nothing_railed() {
+    let bounded = OuterConfig {
+        bounds: Some((array![-30.0, -30.0], array![30.0, 30.0])),
+        ..OuterConfig::default()
+    };
+    // Interior optimum, far from both bounds; gradient matches the value
+    // path's slope on BOTH coords (value 0.5ρ₀² + 7ρ₁ ⇒ ∂₁=7).
+    let theta_hat = array![0.0, 1.0];
+    let analytic_gradient = array![0.0, 7.0];
+    let cert = audit_at_railed_optimum(&bounded, theta_hat, analytic_gradient, 7.0)
+        .expect("interior audit must produce a certificate");
+    assert!(
+        cert.lambdas_railed.is_empty(),
+        "no coordinate is near a bound: {}",
+        cert.summary(),
+    );
+    assert!(
+        cert.first_order_consistent(),
+        "consistent interior optimum flagged: {}",
+        cert.summary(),
+    );
+}
+
 // The two `outer_scaled_tolerance_*` tests that lived here have
 // been removed: the helper is gone in favor of opt 0.5.0's
 // `GradientTolerance::relative_to_cost(τ)`. Equivalent threshold

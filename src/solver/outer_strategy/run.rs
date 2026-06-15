@@ -1089,7 +1089,46 @@ pub(crate) fn audit_first_order_optimality(
     }
 
     let theta = &result.rho;
-    let direction = certificate_audit_direction(theta, context);
+    let rho_dim = obj.capability().theta_layout().rho_dim();
+    let railed = certificate_railed_lambdas(theta, rho_dim, config);
+
+    // The full-space audit direction is unit-norm over all θ coordinates.
+    let full_direction = certificate_audit_direction(theta, context);
+    // At an active box bound the constrained first-order optimality condition
+    // is KKT: ∇F·e_k need NOT vanish along a railed coordinate k (the bound
+    // multiplier balances it), AND the central FD steps ρ_k across the bound
+    // into the infeasible/clamped region, corrupting the value path. An
+    // unconstrained FD-vs-analytic directional check that spans a railed
+    // coordinate is therefore ill-posed and produces a spurious disagreement
+    // (the railed-coordinate audit artifact). Restrict the comparison to the
+    // free (non-railed, box-interior) subspace: zero the railed components of
+    // the audit direction and re-normalize. When nothing is railed this is the
+    // exact original unit direction (byte-identical), so the interior desync
+    // check the certificate exists for (#748/#752/#808) is unchanged.
+    let direction = if railed.is_empty() {
+        full_direction
+    } else {
+        let mut projected = full_direction;
+        for &k in &railed {
+            if k < projected.len() {
+                projected[k] = 0.0;
+            }
+        }
+        let norm = projected.dot(&projected).sqrt();
+        if norm.is_finite() && norm > f64::EPSILON {
+            projected.mapv_inplace(|v| v / norm);
+            projected
+        } else {
+            // Every audited coordinate is railed (free subspace empty): there
+            // is no interior direction to audit, so the directional check is
+            // vacuous. Skip the certificate rather than divide by ~0.
+            log::debug!(
+                "[CERTIFICATE] {context}: every audited coordinate railed \
+                 (railed={railed:?}); no free direction to audit, certificate skipped"
+            );
+            return None;
+        }
+    };
     // Central-difference step on the optimal ε^(1/3) scale, sized to the
     // iterate so saturated ρ (|ρ| up to rho_bound) keeps θ̂±2hv resolvable.
     let theta_scale = theta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -1138,7 +1177,6 @@ pub(crate) fn audit_first_order_optimality(
     let grad_norm = gradient.dot(gradient).sqrt();
     let agreement_z = (analytic_directional - fd_directional).abs() / fd_error;
 
-    let rho_dim = obj.capability().theta_layout().rho_dim();
     let certificate = CriterionCertificate {
         grad_norm,
         analytic_directional,
@@ -1150,7 +1188,7 @@ pub(crate) fn audit_first_order_optimality(
             .final_hessian
             .as_ref()
             .and_then(certificate_hessian_is_pd),
-        lambdas_railed: certificate_railed_lambdas(theta, rho_dim, config),
+        lambdas_railed: railed,
     };
     if certificate.is_clean() {
         log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
