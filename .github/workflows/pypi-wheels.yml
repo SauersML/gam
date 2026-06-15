@@ -27,19 +27,17 @@ on:
       - 'v*'        # builds + publishes
   workflow_dispatch:
     inputs:
-      linux_only:
-        # On-demand fast release path: skip the macOS + Windows matrices and
-        # publish a Linux-only wheel set (manylinux x86_64 + aarch64, musllinux
-        # x86_64 + aarch64, sdist). Trims a full PyPI run from ~13 min wall to
-        # ~4 min by dropping the macos-15-intel job (the slowest by ~3×).
-        # Off-PyPI consumers on macOS / Windows fall back to the sdist build,
-        # so this is only appropriate when you need to ship a Linux-side fix
-        # quickly and a follow-up full release can come later. Tag pushes
-        # (the normal release path) ignore this input and always run the
-        # full matrix.
-        description: 'Build only Linux wheels (skip macOS + Windows for fast on-demand releases)'
-        type: boolean
-        default: false
+      scope:
+        # On-demand wheel scope. Branch-push and tag releases always build the
+        # FULL matrix (this input only applies to a manual run):
+        #   full  — every platform (manylinux + musllinux x86_64/aarch64, macOS, Windows)
+        #   linux — all Linux wheels (manylinux + musllinux, x86_64 + aarch64); skip macOS/Windows
+        #   x86   — manylinux x86_64 ONLY (the biobank target); fastest, no native-ARM wait
+        # Non-built platforms fall back to the sdist on PyPI until a full run.
+        description: 'Wheel scope for a manual run'
+        type: choice
+        options: [full, linux, x86]
+        default: full
 
 permissions:
   contents: read
@@ -119,11 +117,11 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        # Fast on-demand path (linux_only=true) builds ONLY manylinux x86_64 —
-        # the glibc target consumed on the biobank box — so the upload job is
-        # not gated on the slower-to-schedule native-ARM runner. Full releases
-        # (push with a version bump, or a v* tag) build x86_64 + aarch64.
-        platform: ${{ (github.event.inputs.linux_only == 'true') && fromJSON('[{"runner":"ubuntu-24.04","target":"x86_64"}]') || fromJSON('[{"runner":"ubuntu-24.04","target":"x86_64"},{"runner":"ubuntu-24.04-arm","target":"aarch64"}]') }}
+        # manylinux x86_64 (the glibc target the biobank box consumes) plus
+        # native-ARM aarch64 — EXCEPT a manual `scope=x86` run, which builds
+        # x86_64 only (fastest, no native-ARM-runner wait). Branch-push and tag
+        # releases leave `scope` empty → both arches.
+        platform: ${{ github.event.inputs.scope == 'x86' && fromJSON('[{"runner":"ubuntu-24.04","target":"x86_64"}]') || fromJSON('[{"runner":"ubuntu-24.04","target":"x86_64"},{"runner":"ubuntu-24.04-arm","target":"aarch64"}]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -155,9 +153,9 @@ jobs:
 
   musllinux:
     needs: gate
-    # Skipped on the fast linux_only path: musllinux + native-ARM wheels are
-    # the long pole, and the biobank box is glibc x86_64. Full releases build them.
-    if: needs.gate.outputs.should_run == 'true' && github.event.inputs.linux_only != 'true'
+    # Built on every release EXCEPT a manual `scope=x86` run (musllinux is part
+    # of the Linux set). Branch-push/tag leave scope empty → runs.
+    if: needs.gate.outputs.should_run == 'true' && github.event.inputs.scope != 'x86'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: true
@@ -192,10 +190,9 @@ jobs:
 
   macos:
     needs: gate
-    # Skipped on the on-demand `linux_only=true` workflow_dispatch path.
-    # Default workflow_dispatch and all push events leave this input empty
-    # or set to 'false', so the matrix runs normally.
-    if: needs.gate.outputs.should_run == 'true' && github.event.inputs.linux_only != 'true'
+    # Full only: skipped on a manual `scope=linux` or `scope=x86` run. Branch-push
+    # and tag releases leave scope empty → runs.
+    if: needs.gate.outputs.should_run == 'true' && github.event.inputs.scope != 'linux' && github.event.inputs.scope != 'x86'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: true
@@ -227,9 +224,8 @@ jobs:
 
   windows:
     needs: gate
-    # Same gating as the macos job — skipped only when the on-demand
-    # `linux_only=true` input is set on a workflow_dispatch run.
-    if: needs.gate.outputs.should_run == 'true' && github.event.inputs.linux_only != 'true'
+    # Full only: skipped on a manual `scope=linux` or `scope=x86` run (same as macos).
+    if: needs.gate.outputs.should_run == 'true' && github.event.inputs.scope != 'linux' && github.event.inputs.scope != 'x86'
     runs-on: windows-latest
     strategy:
       fail-fast: true
@@ -286,13 +282,13 @@ jobs:
       - macos
       - windows
       - sdist
-    # Publish whenever the Linux + musllinux + sdist artifacts succeeded. Under
-    # `linux_only=true` the macos/windows jobs are SKIPPED — a default `needs`
-    # would skip this upload job too (a job whose needs are skipped is skipped),
-    # so the fast Linux-only path built wheels but never published. Gate on the
-    # actual results instead: require the Linux set to succeed, allow macos/
-    # windows to be skipped (just not failed). The gate's `should_run=false`
-    # path skips the wheel jobs, so their result is `skipped` and this stays off.
+    # Publish whenever the manylinux x86_64 wheel + sdist succeed. On a manual
+    # `scope=linux`/`scope=x86` run the musllinux/macOS/Windows jobs are SKIPPED
+    # — a default `needs` would skip this upload too (a job whose needs are
+    # skipped is skipped), so the scoped path would build but never publish. Gate
+    # on actual results instead: require linux+sdist success, allow the extras to
+    # be skipped (just not failed). The gate's `should_run=false` path skips the
+    # wheel jobs, so their result is `skipped` and this stays off.
     if: ${{ !cancelled() && needs.linux.result == 'success' && needs.sdist.result == 'success' && needs.musllinux.result != 'failure' && needs.macos.result != 'failure' && needs.windows.result != 'failure' }}
     runs-on: ubuntu-22.04
     steps:
