@@ -650,6 +650,31 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     }
 }
 
+/// Row-block size for the parallel `Xᵀdiag(w)X` Gram reduction.
+///
+/// The Gram assembly fans contiguous row blocks across the Rayon pool and pins
+/// each block's faer GEMM to `Par::Seq` (see the `with_nested_parallel` guard in
+/// the chunk bodies). For that fan-out to fill the pool without leaving cores
+/// idle on the tail block, the chunk COUNT must comfortably exceed the worker
+/// count; for each chunk's GEMM to stay an efficient BLAS-3 tile (not setup-
+/// bound), the chunk must stay reasonably tall. We therefore target roughly
+/// `OVERSUBSCRIBE × workers` chunks and clamp the per-chunk row span to a band
+/// that keeps the `(rows × p)` weighted-design tile a healthy GEMM without
+/// blowing the `stream_weighted_crossprod_into` working set. At the biobank
+/// rigid scale (n ≈ 1.9e5, ~52 workers) this lands ~208 chunks of ~3.7k rows —
+/// full pool occupancy with load-balancing headroom — versus the prior fixed
+/// 8 192-row split that produced only ~24 chunks (under half a 52-core pool,
+/// with a lopsided tail).
+fn blas3_gram_chunk_rows(n: usize) -> usize {
+    const OVERSUBSCRIBE: usize = 4;
+    const MIN_CHUNK_ROWS: usize = 2_048;
+    const MAX_CHUNK_ROWS: usize = 16_384;
+    let workers = rayon::current_num_threads().max(1);
+    let target_chunks = (workers * OVERSUBSCRIBE).max(1);
+    let by_target = n.div_ceil(target_chunks);
+    by_target.clamp(MIN_CHUNK_ROWS, MAX_CHUNK_ROWS).max(1)
+}
+
 impl BernoulliRigidRowKernel {
     /// Chunked BLAS-3 implementation backing
     /// [`RowKernel::hessian_dense_override`]. `row_hessians[row]` is the cached
@@ -663,10 +688,10 @@ impl BernoulliRigidRowKernel {
         let slices = &self.slices;
         let n = self.family.y.len();
 
-        const CHUNK_ROWS: usize = 8_192;
+        let chunk_rows = blas3_gram_chunk_rows(n);
         let chunks = (0..n)
-            .step_by(CHUNK_ROWS)
-            .map(|start| (start, (start + CHUNK_ROWS).min(n)))
+            .step_by(chunk_rows)
+            .map(|start| (start, (start + chunk_rows).min(n)))
             .collect::<Vec<_>>();
         // Each chunk slices a contiguous block of design rows. For a
         // materialised-dense design that is a zero-copy `ArrayView2`; for an
@@ -681,50 +706,66 @@ impl BernoulliRigidRowKernel {
         // design row buffer is fixed and finite for the whole fit — so it
         // surfaces by panic, mirroring every other kernel-level contract here.
         let chunk_body = |(start, end): (usize, usize)| -> BernoulliBlockHessianAccumulator {
-            let len = end - start;
-            let mut acc = BernoulliBlockHessianAccumulator::new(slices);
-            let mut w_mm = Array1::<f64>::zeros(len);
-            let mut w_mg = Array1::<f64>::zeros(len);
-            let mut w_gg = Array1::<f64>::zeros(len);
-            let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                match self.family.marginal_design.as_dense_ref() {
-                    Some(x_full) => x_full.slice(s![start..end, ..]).into(),
-                    None => self
-                        .family
-                        .marginal_design
-                        .try_row_chunk(start..end)
-                        .map(Into::into)
-                        .unwrap_or_else(|e| {
-                            std::panic::panic_any(format!(
-                                "bernoulli rigid hessian_dense_blas3 marginal_design \
-                                 try_row_chunk({start}..{end}): {e}"
-                            ))
-                        }),
-                };
-            let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                match self.family.logslope_design.as_dense_ref() {
-                    Some(g_full) => g_full.slice(s![start..end, ..]).into(),
-                    None => self
-                        .family
-                        .logslope_design
-                        .try_row_chunk(start..end)
-                        .map(Into::into)
-                        .unwrap_or_else(|e| {
-                            std::panic::panic_any(format!(
-                                "bernoulli rigid hessian_dense_blas3 logslope_design \
-                                 try_row_chunk({start}..{end}): {e}"
-                            ))
-                        }),
-                };
-            for row in start..end {
-                let local = row - start;
-                let h = &row_hessians[row];
-                w_mm[local] = h[0][0];
-                w_mg[local] = h[0][1];
-                w_gg[local] = h[1][1];
-            }
-            acc.add_weighted_design_grams_from_chunks(&x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg);
-            acc
+            // Pin the per-chunk faer Gram GEMMs to `Par::Seq` for the duration of
+            // this chunk body. The outer `chunks.into_par_iter()` already fans the
+            // row-blocks (sized by `blas3_gram_chunk_rows` to fill the pool)
+            // across the full Rayon pool, so each chunk runs on its own worker;
+            // without the nested-parallel marker the `Xᵀdiag(w)X` GEMM
+            // inside `add_weighted_design_grams_from_chunks` re-consults
+            // `effective_global_parallelism()` with no marker active and gets
+            // `Par::rayon(0)` = "fan across every worker" — multiplying the live
+            // thread count (chunks × pool) into the documented
+            // Rayon-pool × faer-pool oversubscription (304 threads on a 52-core
+            // box) that stalls this otherwise BLAS-3-bound cycle-0 assembly.
+            // Exactness-preserving: faer partitions the GEMM *output*, never the
+            // contracted row axis, so `Par::Seq` and `Par::rayon` produce
+            // bit-identical Grams.
+            crate::faer_ndarray::with_nested_parallel(|| {
+                let len = end - start;
+                let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                let mut w_mm = Array1::<f64>::zeros(len);
+                let mut w_mg = Array1::<f64>::zeros(len);
+                let mut w_gg = Array1::<f64>::zeros(len);
+                let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                    match self.family.marginal_design.as_dense_ref() {
+                        Some(x_full) => x_full.slice(s![start..end, ..]).into(),
+                        None => self
+                            .family
+                            .marginal_design
+                            .try_row_chunk(start..end)
+                            .map(Into::into)
+                            .unwrap_or_else(|e| {
+                                std::panic::panic_any(format!(
+                                    "bernoulli rigid hessian_dense_blas3 marginal_design \
+                                     try_row_chunk({start}..{end}): {e}"
+                                ))
+                            }),
+                    };
+                let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                    match self.family.logslope_design.as_dense_ref() {
+                        Some(g_full) => g_full.slice(s![start..end, ..]).into(),
+                        None => self
+                            .family
+                            .logslope_design
+                            .try_row_chunk(start..end)
+                            .map(Into::into)
+                            .unwrap_or_else(|e| {
+                                std::panic::panic_any(format!(
+                                    "bernoulli rigid hessian_dense_blas3 logslope_design \
+                                     try_row_chunk({start}..{end}): {e}"
+                                ))
+                            }),
+                    };
+                for row in start..end {
+                    let local = row - start;
+                    let h = &row_hessians[row];
+                    w_mm[local] = h[0][0];
+                    w_mg[local] = h[0][1];
+                    w_gg[local] = h[1][1];
+                }
+                acc.add_weighted_design_grams_from_chunks(&x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg);
+                acc
+            })
         };
 
         let run_serial = rayon::current_thread_index().is_some()
@@ -774,53 +815,66 @@ impl BernoulliRigidRowKernel {
         // lookup instead of triggering the build nested in a worker.
         let third_full = self.third_full_cache();
 
-        const CHUNK_ROWS: usize = 8_192;
+        let chunk_rows = blas3_gram_chunk_rows(n);
         let chunks = (0..n)
-            .step_by(CHUNK_ROWS)
-            .map(|start| (start, (start + CHUNK_ROWS).min(n)))
+            .step_by(chunk_rows)
+            .map(|start| (start, (start + chunk_rows).min(n)))
             .collect::<Vec<_>>();
         let chunk_body =
             |(start, end): (usize, usize)| -> Result<BernoulliBlockHessianAccumulator, String> {
-                let len = end - start;
-                let mut acc = BernoulliBlockHessianAccumulator::new(slices);
-                let mut w_mm = Array1::<f64>::zeros(len);
-                let mut w_mg = Array1::<f64>::zeros(len);
-                let mut w_gg = Array1::<f64>::zeros(len);
-                let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                    match self.family.marginal_design.as_dense_ref() {
-                        Some(x_full) => x_full.slice(s![start..end, ..]).into(),
-                        None => self
-                            .family
-                            .marginal_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?
-                            .into(),
-                    };
-                let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                    match self.family.logslope_design.as_dense_ref() {
-                        Some(g_full) => g_full.slice(s![start..end, ..]).into(),
-                        None => self
-                            .family
-                            .logslope_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?
-                            .into(),
-                    };
-                let marginal_projected =
-                    crate::faer_ndarray::fast_ab(&x_chunk, &marginal_dir_mat);
-                let logslope_projected =
-                    crate::faer_ndarray::fast_ab(&g_chunk, &logslope_dir_mat);
-                for row in start..end {
-                    let local = row - start;
-                    let dq = marginal_projected[[local, 0]];
-                    let dg = logslope_projected[[local, 0]];
-                    let t = contract_third_full(&third_full[row], dq, dg);
-                    w_mm[local] = t[0][0];
-                    w_mg[local] = t[0][1];
-                    w_gg[local] = t[1][1];
-                }
-                acc.add_weighted_design_grams_from_chunks(&x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg);
-                Ok(acc)
+                // Same nested-parallel pin as `hessian_dense_blas3`: the per-chunk
+                // projection (`fast_ab`) and `Xᵀdiag(w)X` Grams run on the owning
+                // Rayon worker at `Par::Seq` so they do not re-fan the global pool
+                // against the outer `chunks.into_par_iter()`. Exactness-preserving:
+                // faer partitions the GEMM output, not the contracted row axis.
+                crate::faer_ndarray::with_nested_parallel(|| {
+                    let len = end - start;
+                    let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                    let mut w_mm = Array1::<f64>::zeros(len);
+                    let mut w_mg = Array1::<f64>::zeros(len);
+                    let mut w_gg = Array1::<f64>::zeros(len);
+                    let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                        match self.family.marginal_design.as_dense_ref() {
+                            Some(x_full) => x_full.slice(s![start..end, ..]).into(),
+                            None => self
+                                .family
+                                .marginal_design
+                                .try_row_chunk(start..end)
+                                .map_err(|e| {
+                                    format!("bernoulli marginal_design try_row_chunk: {e}")
+                                })?
+                                .into(),
+                        };
+                    let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                        match self.family.logslope_design.as_dense_ref() {
+                            Some(g_full) => g_full.slice(s![start..end, ..]).into(),
+                            None => self
+                                .family
+                                .logslope_design
+                                .try_row_chunk(start..end)
+                                .map_err(|e| {
+                                    format!("bernoulli logslope_design try_row_chunk: {e}")
+                                })?
+                                .into(),
+                        };
+                    let marginal_projected =
+                        crate::faer_ndarray::fast_ab(&x_chunk, &marginal_dir_mat);
+                    let logslope_projected =
+                        crate::faer_ndarray::fast_ab(&g_chunk, &logslope_dir_mat);
+                    for row in start..end {
+                        let local = row - start;
+                        let dq = marginal_projected[[local, 0]];
+                        let dg = logslope_projected[[local, 0]];
+                        let t = contract_third_full(&third_full[row], dq, dg);
+                        w_mm[local] = t[0][0];
+                        w_mg[local] = t[0][1];
+                        w_gg[local] = t[1][1];
+                    }
+                    acc.add_weighted_design_grams_from_chunks(
+                        &x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg,
+                    );
+                    Ok(acc)
+                })
             };
 
         // Parallel over chunks: each chunk body is an independent BLAS-3 GEMM
