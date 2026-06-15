@@ -231,6 +231,7 @@ fn absorb_basis_structure(fp: &mut Fingerprinter, basis: &BasisMetadata) {
         BasisMetadata::FactorSmooth {
             continuous_cols,
             group_col,
+            knots,
             degree,
             periodic,
             group_levels,
@@ -239,6 +240,7 @@ fn absorb_basis_structure(fp: &mut Fingerprinter, basis: &BasisMetadata) {
             fp.absorb_str(b"basis-kind", "factor_smooth");
             fp.absorb_u64(b"n_continuous", continuous_cols.len() as u64);
             fp.absorb_u64(b"group_col", *group_col as u64);
+            fp.absorb_u64(b"num_knots", knots.len() as u64);
             fp.absorb_u64(b"degree", *degree as u64);
             fp.absorb_u64(b"periodic", u64::from(periodic.is_some()));
             fp.absorb_u64(b"n_groups", group_levels.len() as u64);
