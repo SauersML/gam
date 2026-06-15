@@ -157,7 +157,18 @@ const CG_MAX_ITERS: usize = 4000;
 /// solve); [`MIN_COARSE_LEVELS`] always deflates the two coarsest scales, which
 /// are near-collinear with the polynomial layer at every λ.
 const COARSE_DOMINANCE: f64 = 4.0;
-const COARSE_SPACE_MAX: usize = 1024;
+/// Safety ceiling on the exact-coarse column count. It must NOT bind at the n
+/// the primitive serves: the n-independent iteration count rests on the coarse
+/// block containing the WHOLE data-dominated prefix (`O(√(n/λ))` columns), so a
+/// cap that truncates that prefix is exactly what makes the iteration count
+/// climb with n (a finer data-dominated level demoted to Jacobi cannot be
+/// decoupled from the coarse scales it is collinear with). At the n-scales the
+/// iterative route engages (tens of thousands of rows → a ≈1.4k-column
+/// prefix) this is non-binding headroom; it only triggers in the genuinely
+/// degenerate case the quasi-uniformity guard is meant to catch first. The
+/// realized coarse factorization runs at the actual prefix length, not the cap,
+/// so the ceiling costs nothing until it fires.
+const COARSE_SPACE_MAX: usize = 4096;
 const MIN_COARSE_LEVELS: usize = 2;
 
 /// Quasi-uniformity guard (issue #1032, caveat 2). The BPX n-independent CG
@@ -669,7 +680,31 @@ impl Core {
         // Keep at least one fine column so the split is well-defined; if every
         // level is coarse the iterative route is degenerate anyway and the dense
         // route would have been taken, but guard regardless.
-        ncoarse.min(self.m)
+        let ncoarse = ncoarse.min(self.m);
+        {
+            let mut s = String::new();
+            for (li, level) in self.levels.iter().enumerate() {
+                let a = level.col_offset;
+                let b = a + level.centers.len();
+                let mut buf: Vec<f64> = self.gram_diag[a..b].to_vec();
+                buf.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap());
+                let med = if buf.is_empty() { 0.0 } else { buf[buf.len() / 2] };
+                let coarse = b <= ncoarse;
+                s.push_str(&format!(
+                    " L{li}[{}c off{a} w={:.2e} λw={:.2e} med={:.2e} {}]",
+                    level.centers.len(),
+                    level.weight,
+                    lambda * level.weight,
+                    med,
+                    if coarse { "C" } else { "F" }
+                ));
+            }
+            eprintln!(
+                "[1032-COARSE] λ={lambda:.3e} m={} ncoarse={ncoarse} cap={COARSE_SPACE_MAX}{s}",
+                self.m
+            );
+        }
+        ncoarse
     }
 
     /// Build the coarse-space additive-Schwarz preconditioner at `λ`: assemble
@@ -1104,17 +1139,41 @@ fn symmetric_tridiagonal_eigen(d: &[f64], e: &[f64]) -> Result<(Vec<f64>, Vec<f6
 
 // ───────────────────────────── net construction ─────────────────────────────
 
-/// Extend a nested net to covering radius `h`: every point further than `h`
-/// from the (seeded) net, scanned in data order against a hash grid of cell
-/// width `h`, becomes a new center. O(n·3^d). Returns the new centers.
-fn extend_net(net: &mut Vec<[f64; 3]>, points: &[[f64; 3]], dim: usize, h: f64) -> Vec<[f64; 3]> {
+/// Extend a nested net to covering radius `h` over the DOMAIN: first every data
+/// point further than `h` from the (seeded) net becomes a new center, then every
+/// cell of the `h`-grid over the bounding box `[0, box_hi]` whose centre is not
+/// yet within `h` of the net is filled with a synthetic center. O((n + box
+/// cells)·3^d). Returns the new centers.
+///
+/// Covering the box, not merely the data cloud, is what the multilevel Wendland
+/// norm-equivalence (Narcowich–Ward inverse estimates + Le Gia–Wendland
+/// multilevel stability) actually requires: the nested centres must be
+/// quasi-uniform over the domain Ω. In data-dense regions every cell is already
+/// covered by a data center, so the fill is a no-op there; in a data void it
+/// plants the fine centres whose coefficients carry no data and revert to the
+/// prior — the mechanism by which the posterior mean bridges a gap (coarse
+/// data-pinned bumps) while the posterior variance GROWS into it (fine void
+/// bumps the data cannot pin). The synthetic centres carry (almost) no data
+/// rows, so their Gram diagonal is ~0 and they land in the penalty-dominated
+/// fine block where the Jacobi preconditioner is exact — they neither perturb
+/// the coarse factorization nor the n-independent iteration count.
+fn extend_net(
+    net: &mut Vec<[f64; 3]>,
+    points: &[[f64; 3]],
+    dim: usize,
+    h: f64,
+    box_hi: &[f64; 3],
+) -> Vec<[f64; 3]> {
     let mut grid = HashGrid::new(h, dim);
     for (idx, c) in net.iter().enumerate() {
         grid.insert(idx as u32, c);
     }
     let h2 = h * h;
     let mut new_centers = Vec::new();
-    for p in points {
+    let mut try_add = |net: &mut Vec<[f64; 3]>,
+                       grid: &mut HashGrid,
+                       new_centers: &mut Vec<[f64; 3]>,
+                       p: &[f64; 3]| {
         let mut covered = false;
         grid.for_neighbors(p, |j| {
             if !covered && dist2(p, &net[j as usize], dim) <= h2 {
@@ -1126,6 +1185,29 @@ fn extend_net(net: &mut Vec<[f64; 3]>, points: &[[f64; 3]], dim: usize, h: f64) 
             net.push(*p);
             grid.insert(idx, p);
             new_centers.push(*p);
+        }
+    };
+    for p in points {
+        try_add(net, &mut grid, &mut new_centers, p);
+    }
+    // Fill the bounding box so the net covers the domain, not just the data.
+    let mut cells = [1_i64; 3];
+    for a in 0..dim {
+        cells[a] = (box_hi[a] / h).ceil() as i64 + 1;
+    }
+    let mut c = [0.0_f64; 3];
+    for i0 in 0..cells[0] {
+        c[0] = (i0 as f64 + 0.5) * h;
+        for i1 in 0..cells[1] {
+            if dim > 1 {
+                c[1] = (i1 as f64 + 0.5) * h;
+            }
+            for i2 in 0..cells[2] {
+                if dim > 2 {
+                    c[2] = (i2 as f64 + 0.5) * h;
+                }
+                try_add(net, &mut grid, &mut new_centers, &c);
+            }
         }
     }
     new_centers
@@ -1240,7 +1322,7 @@ impl ResidualCascadeDesign {
         let mut pen_logdet_const = 0.0;
         for l in 0..levels {
             let h = h0 * 0.5_f64.powi(l as i32);
-            let new_centers = extend_net(&mut net, &z, dim, h);
+            let new_centers = extend_net(&mut net, &z, dim, h, &z_range);
             if net.len() > MAX_CENTERS {
                 return Err(format!(
                     "residual cascade: center cap {MAX_CENTERS} exceeded at level {l}"
@@ -1668,7 +1750,7 @@ impl ResidualCascadeDesign {
         }
         let h = core.levels[next_l - 1].h * 0.5;
         let mut net = core.net.clone();
-        let candidates = extend_net(&mut net, &core.z, core.dim, h);
+        let candidates = extend_net(&mut net, &core.z, core.dim, h, &core.z_range);
         if candidates.is_empty() || net.len() > MAX_CENTERS {
             return Ok(None);
         }
