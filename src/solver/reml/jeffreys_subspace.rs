@@ -1259,12 +1259,12 @@ pub fn joint_jeffreys_hphi_directional_derivative<DirFn, Dir2Fn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
     delta: &Array1<f64>,
-    mut hessian_dir: DirFn,
-    mut hessian_second_dir: Dir2Fn,
+    hessian_dir: DirFn,
+    hessian_second_dir: Dir2Fn,
 ) -> Result<Array2<f64>, String>
 where
-    DirFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-    Dir2Fn: FnMut(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    DirFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+    Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
     let p = h_joint.nrows();
     if delta.len() != p {
@@ -1327,8 +1327,8 @@ pub fn joint_jeffreys_hphi_explicit_param_derivative<BaseFn, PertFn>(
     pert_hessian_dir: PertFn,
 ) -> Result<Array2<f64>, String>
 where
-    BaseFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-    PertFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    BaseFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+    PertFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
     joint_jeffreys_hphi_perturbation_derivative(
         h_joint,
@@ -1384,10 +1384,10 @@ impl JeffreysHphiDriftBase {
     pub(crate) fn prepare<BaseFn>(
         h_joint: ArrayView2<'_, f64>,
         z_j: ArrayView2<'_, f64>,
-        mut base_hessian_dir: BaseFn,
+        base_hessian_dir: BaseFn,
     ) -> Result<Option<JeffreysHphiDriftBase>, String>
     where
-        BaseFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+        BaseFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
     {
         let p = h_joint.nrows();
         if h_joint.ncols() != p {
@@ -1444,24 +1444,51 @@ impl JeffreysHphiDriftBase {
         // The β-FIXED per-axis base: `Ṽ_a = Vᵀ D_a V` and `Ψ ∘ Ṽ_a`, formed from
         // the `p` first directional derivatives `Hdot[e_a]` (the dominant `O(n·p)`
         // cost — done ONCE here, reused for every drift direction).
+        //
+        // PARALLEL AXIS SWEEP. Each axis `e_a` requires one FULL-DATA
+        // directional-derivative row-stream `Hdot[e_a]` (n≈348k biobank rows) — the
+        // dominant cost of the whole outer-gradient eval. The `p` passes are
+        // independent pure evaluations of `(family, β̂, e_a)`, so we fan them across
+        // the Rayon pool exactly as the value-path `joint_jeffreys_term` does; the
+        // `Sync` bound on `BaseFn` makes the evaluator safe to call concurrently and
+        // the nested-BLAS guard pins each pass's faer GEMM to `Par::Seq` so the
+        // axes fan across cores without rayon×BLAS oversubscription. The cheap
+        // per-axis reduction (`Ṽ_a` rotation + row writes) stays serial over the
+        // index-ordered results, so the prepared base is bit-identical to the
+        // original serial loop. First-anomaly semantics preserved: any `Err`
+        // propagates and the first `None` (family lacks the exact derivative on
+        // some axis) collapses the whole base to `None` (zero drift everywhere).
         let z_owned = z_j.to_owned();
+        let hdots: Vec<Array2<f64>> = {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+                .into_par_iter()
+                .map(|a| {
+                    let mut axis = Array1::<f64>::zeros(p);
+                    axis[a] = 1.0;
+                    crate::linalg::faer_ndarray::with_nested_parallel(|| base_hessian_dir(&axis))
+                })
+                .collect();
+            let mut hdots = Vec::with_capacity(p);
+            for result in results {
+                let hdot = match result? {
+                    Some(hd) => hd,
+                    None => return Ok(None),
+                };
+                if hdot.nrows() != p || hdot.ncols() != p {
+                    return Err(format!(
+                        "JeffreysHphiDriftBase::prepare: Hdot[e_a] shape {}x{} != {p}x{p}",
+                        hdot.nrows(),
+                        hdot.ncols()
+                    ));
+                }
+                hdots.push(hdot);
+            }
+            hdots
+        };
         let mut a_rows = Array2::<f64>::zeros((p, m * m));
         let mut aw_rows = Array2::<f64>::zeros((p, m * m));
-        let mut axis = Array1::<f64>::zeros(p);
-        for a in 0..p {
-            axis.fill(0.0);
-            axis[a] = 1.0;
-            let hdot_a = match base_hessian_dir(&axis)? {
-                Some(hd) => hd,
-                None => return Ok(None),
-            };
-            if hdot_a.nrows() != p || hdot_a.ncols() != p {
-                return Err(format!(
-                    "JeffreysHphiDriftBase::prepare: Hdot[e_a] shape {}x{} != {p}x{p}",
-                    hdot_a.nrows(),
-                    hdot_a.ncols()
-                ));
-            }
+        for (a, hdot_a) in hdots.into_iter().enumerate() {
             let d_a_raw = z_j.t().dot(&hdot_a.dot(&z_j));
             let mut d_a = Array2::<f64>::zeros((m, m));
             for i in 0..m {
@@ -1505,10 +1532,10 @@ impl JeffreysHphiDriftBase {
     pub(crate) fn perturbation_derivative<PertFn>(
         &self,
         pert_h: &Array2<f64>,
-        mut pert_hessian_dir: PertFn,
+        pert_hessian_dir: PertFn,
     ) -> Result<Array2<f64>, String>
     where
-        PertFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+        PertFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
     {
         let p = self.p;
         if pert_h.nrows() != p || pert_h.ncols() != p {
@@ -1619,12 +1646,48 @@ impl JeffreysHphiDriftBase {
     let aw_rows = &self.aw_rows; // vec(Ψ ∘ Ṽ_a)
     let mut da_rows = Array2::<f64>::zeros((p, m * m)); // vec(δṼ_a)
     let mut dw_rows = Array2::<f64>::zeros((p, m * m)); // vec(δΨ ∘ Ṽ_a + Ψ ∘ δṼ_a)
-    let mut axis = Array1::<f64>::zeros(p);
+
+    // PARALLEL SECOND-DIRECTIONAL SWEEP. Each axis `e_a` needs one FULL-DATA
+    // mixed second-directional row-stream `∂Hdot[e_a] = H²dot[δ, e_a]` (n≈348k
+    // biobank rows) — the genuinely δ-dependent dominant cost of this per-direction
+    // call. The `p` passes are independent pure evaluations of `(family, β̂, δ, e_a)`,
+    // so we fan them across the Rayon pool (the `Sync` bound on `PertFn`) with the
+    // nested-BLAS guard pinning each pass's faer GEMM to `Par::Seq`. The cheap
+    // per-axis reduction (`δṼ_a` rotation + row writes) stays serial over the
+    // index-ordered results, so the output is bit-identical to the original serial
+    // loop. First-anomaly semantics preserved: any `Err` propagates, and the first
+    // `None` (family lacks the exact second derivative on some axis) collapses the
+    // whole drift to the zero matrix exactly as before.
+    let pert_hdots: Vec<Array2<f64>> = {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+            .into_par_iter()
+            .map(|a| {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[a] = 1.0;
+                crate::linalg::faer_ndarray::with_nested_parallel(|| pert_hessian_dir(&axis))
+            })
+            .collect();
+        let mut pert_hdots = Vec::with_capacity(p);
+        for result in results {
+            let pert_hdot_a = match result? {
+                Some(h2) => h2,
+                None => return Ok(Array2::zeros((p, p))),
+            };
+            if pert_hdot_a.nrows() != p || pert_hdot_a.ncols() != p {
+                return Err(format!(
+                    "JeffreysHphiDriftBase::perturbation_derivative: ∂Hdot[e_a] shape {}x{} != {p}x{p}",
+                    pert_hdot_a.nrows(),
+                    pert_hdot_a.ncols()
+                ));
+            }
+            pert_hdots.push(pert_hdot_a);
+        }
+        pert_hdots
+    };
     // Reconstruct Ṽ_a (m × m) from the flattened base row for the rotation terms.
     let mut a_a = Array2::<f64>::zeros((m, m));
-    for a in 0..p {
-        axis.fill(0.0);
-        axis[a] = 1.0;
+    for (a, pert_hdot_a) in pert_hdots.into_iter().enumerate() {
         {
             let mut col = 0usize;
             for i in 0..m {
@@ -1635,17 +1698,6 @@ impl JeffreysHphiDriftBase {
             }
         }
 
-        let pert_hdot_a = match pert_hessian_dir(&axis)? {
-            Some(h2) => h2,
-            None => return Ok(Array2::zeros((p, p))),
-        };
-        if pert_hdot_a.nrows() != p || pert_hdot_a.ncols() != p {
-            return Err(format!(
-                "JeffreysHphiDriftBase::perturbation_derivative: ∂Hdot[e_a] shape {}x{} != {p}x{p}",
-                pert_hdot_a.nrows(),
-                pert_hdot_a.ncols()
-            ));
-        }
         let d_a_pert_raw = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
         let mut d_a_pert = Array2::<f64>::zeros((m, m));
         for i in 0..m {
@@ -1728,7 +1780,7 @@ impl JeffreysHphiDriftBase {
 /// This is the single-perturbation entry point used by the explicit-ρ-derivative
 /// path; it prepares a [`JeffreysHphiDriftBase`] and applies one perturbation.
 /// The batched mode-response drift instead prepares the base ONCE and applies it
-/// across every direction (see `custom_family_outer_jeffreys_hphi_drift`).
+/// across every direction (see `custom_family_outer_jeffreys_hphi_drift_batched`).
 pub(crate) fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
@@ -1737,8 +1789,8 @@ pub(crate) fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
     pert_hessian_dir: PertFn,
 ) -> Result<Array2<f64>, String>
 where
-    BaseFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
-    PertFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    BaseFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+    PertFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
     let p = h_joint.nrows();
     match JeffreysHphiDriftBase::prepare(h_joint, z_j, base_hessian_dir)? {
