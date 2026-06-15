@@ -1174,10 +1174,10 @@ fn extend_net(
     }
     let h2 = h * h;
     let mut new_centers = Vec::new();
-    let mut try_add = |net: &mut Vec<[f64; 3]>,
-                       grid: &mut HashGrid,
-                       new_centers: &mut Vec<[f64; 3]>,
-                       p: &[f64; 3]| {
+    let try_add = |net: &mut Vec<[f64; 3]>,
+                   grid: &mut HashGrid,
+                   new_centers: &mut Vec<[f64; 3]>,
+                   p: &[f64; 3]| {
         let mut covered = false;
         grid.for_neighbors(p, |j| {
             if !covered && dist2(p, &net[j as usize], dim) <= h2 {
