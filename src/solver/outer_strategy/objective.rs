@@ -612,6 +612,22 @@ pub(crate) struct IteratePayload {
     /// an inner-β hint at write time (still useful as a ρ-only seed).
     #[serde(default)]
     pub(crate) beta: Vec<f64>,
+    /// Converged exact outer curvature `H(θ̂)` (full θ×θ, row-major flatten),
+    /// captured alongside the (ρ, β) iterate. A gradient-based BFGS solve does
+    /// not surface its accumulated inverse-Hessian, so the next
+    /// structurally-matching fit (e.g. the next LOSO fold) otherwise restarts
+    /// BFGS from an unscaled identity metric and rediscovers curvature through
+    /// line-search bracketing — multiple full inner-solve value probes per
+    /// accepted outer step. Persisting the converged curvature lets the resume
+    /// seed `InitialMetric::DenseInverseHessian(H⁻¹)` for a quasi-Newton first
+    /// step. Empty when no exact outer Hessian was available at write time
+    /// (still a valid ρ/β seed). `hessian_dim²` must equal `hessian.len()`.
+    #[serde(default)]
+    pub(crate) hessian: Vec<f64>,
+    /// Side length of the square `hessian` matrix (`hessian.len() == dim²`).
+    /// Zero when no Hessian was persisted.
+    #[serde(default)]
+    pub(crate) hessian_dim: usize,
     pub(crate) cost: f64,
     eval_id: u64,
 }
@@ -624,13 +640,25 @@ pub(crate) const ITERATE_PAYLOAD_SCHEMA: u32 = 2;
 pub(crate) fn encode_iterate(
     rho: &Array1<f64>,
     beta: Option<&Array1<f64>>,
+    hessian: Option<&Array2<f64>>,
     cost: f64,
     eval_id: u64,
 ) -> Option<Vec<u8>> {
+    // Persist the converged outer curvature only when it is square and finite;
+    // a non-finite or non-square Hessian is dropped (the resume falls back to a
+    // ρ/β-only seed) so a malformed curvature can never corrupt a warm start.
+    let (hessian_flat, hessian_dim) = match hessian {
+        Some(h) if h.nrows() == h.ncols() && h.iter().all(|v| v.is_finite()) => {
+            (h.iter().copied().collect::<Vec<f64>>(), h.nrows())
+        }
+        _ => (Vec::new(), 0),
+    };
     let p = IteratePayload {
         schema: ITERATE_PAYLOAD_SCHEMA,
         rho: rho.to_vec(),
         beta: beta.map(|b| b.to_vec()).unwrap_or_default(),
+        hessian: hessian_flat,
+        hessian_dim,
         cost,
         eval_id,
     };
@@ -638,7 +666,7 @@ pub(crate) fn encode_iterate(
 }
 
 pub(crate) fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayload> {
-    let p: IteratePayload = serde_json::from_slice(bytes).ok()?;
+    let mut p: IteratePayload = serde_json::from_slice(bytes).ok()?;
     if p.schema != ITERATE_PAYLOAD_SCHEMA {
         return None;
     }
@@ -650,6 +678,16 @@ pub(crate) fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<It
     }
     if !p.beta.iter().all(|x| x.is_finite()) {
         return None;
+    }
+    // A persisted Hessian must be square (`dim²` entries) and finite to be
+    // usable as a warm-start metric; an inconsistent or non-finite curvature is
+    // scrubbed to "no Hessian" rather than rejecting the whole iterate, so the
+    // ρ/β seed still warms the resume.
+    if p.hessian_dim.saturating_mul(p.hessian_dim) != p.hessian.len()
+        || !p.hessian.iter().all(|x| x.is_finite())
+    {
+        p.hessian = Vec::new();
+        p.hessian_dim = 0;
     }
     Some(p)
 }
@@ -696,6 +734,11 @@ pub(crate) enum CacheSeedDecision {
         /// PIRLS opens at zero-gradient regardless of where ρ sits in
         /// the box.
         beta: Vec<f64>,
+        /// Optional converged outer Hessian `H(θ̂)` from the prior fit, as a
+        /// `(dim, row-major flatten)` pair. `None` when the payload carried no
+        /// curvature (legacy ρ/β-only writes). Seeds the BFGS iter-0 metric on
+        /// the resume so the first outer step is quasi-Newton.
+        hessian: Option<(usize, Vec<f64>)>,
         prior_obj_display: f64,
         iteration: u64,
     },
@@ -746,9 +789,17 @@ pub(crate) fn classify_cache_entry_for_outer(
             prior_obj_display,
         };
     }
+    let hessian = if payload.hessian_dim > 0
+        && payload.hessian.len() == payload.hessian_dim * payload.hessian_dim
+    {
+        Some((payload.hessian_dim, payload.hessian))
+    } else {
+        None
+    };
     CacheSeedDecision::Seed {
         rho: cached_rho,
         beta: payload.beta,
+        hessian,
         prior_obj_display,
         iteration: entry.iteration.unwrap_or(payload.eval_id),
     }
@@ -811,7 +862,10 @@ impl<'a> CheckpointingObjective<'a> {
             }
         }
         let i = self.eval_counter.fetch_add(1, Ordering::Relaxed);
-        if let Some(bytes) = encode_iterate(rho, beta, cost, i) {
+        // Per-eval checkpoints carry no converged outer Hessian (curvature is
+        // only meaningful at the final optimum); the finalize write is where the
+        // converged `H(θ̂)` is persisted for cross-fit warm starts.
+        if let Some(bytes) = encode_iterate(rho, beta, None, cost, i) {
             self.session.checkpoint(&bytes, Some(cost), Some(i));
             for mirror in &self.mirror_sessions {
                 mirror.checkpoint(&bytes, Some(cost), Some(i));

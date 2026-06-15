@@ -87,6 +87,19 @@ pub(crate) struct OuterConfig {
     /// point. Defaulted `false`, so every cold-start / no-cache path keeps its
     /// existing continuation pre-warm budget byte-for-byte.
     pub(crate) warm_start_cache_hit: bool,
+    /// Converged exact outer Hessian `H(θ̂)` transferred from a prior
+    /// structurally-matching fit via the persistent cache (a warm-start *hit*),
+    /// in the full θ layout. When present and SPD, the BFGS host path seeds its
+    /// iter-0 metric with `InitialMetric::DenseInverseHessian(H⁻¹)` so the first
+    /// outer step is quasi-Newton instead of unscaled steepest descent — the
+    /// dominant LOSO line-search-bracketing cost (each bracketing probe is a
+    /// full inner joint-Newton re-solve). Strictly stronger than the scalar
+    /// `1/‖g₀‖` metric: it carries the full anisotropic curvature, which across
+    /// folds (one held-out point) is nearly identical to this fold's. Never
+    /// changes the converged optimum — BFGS reaches `∇V=0` under any SPD initial
+    /// metric. `None` on every cold-start / no-cache / pre-Hessian-schema path,
+    /// which falls back to the scalar warm metric byte-for-byte.
+    pub(crate) warm_start_outer_hessian: Option<Array2<f64>>,
 }
 
 impl Default for OuterConfig {
@@ -114,6 +127,7 @@ impl Default for OuterConfig {
             rho_uncertainty_problem_size:
                 crate::inference::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             warm_start_cache_hit: false,
+            warm_start_outer_hessian: None,
         }
     }
 }
@@ -462,6 +476,10 @@ impl OuterProblem {
             // a near-optimal seed; every other entry point keeps the cold-start
             // continuation pre-warm budget byte-for-byte.
             warm_start_cache_hit: false,
+            // Populated only by the persistent-cache resume path in `run` after
+            // a warm-start hit decodes a converged outer Hessian; cold by
+            // construction here, like `warm_start_cache_hit`.
+            warm_start_outer_hessian: None,
         }
     }
 
@@ -614,13 +632,17 @@ impl OuterProblem {
                     let mut result =
                         OuterResult::new(rho, final_value, iterations, true, plan_used);
                     result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
-                        obj, &config, context, &result,
+                        obj,
+                        &config,
+                        context,
+                        &mut result,
                     ));
                     return Ok(result);
                 }
                 CacheSeedDecision::Seed {
                     rho,
                     beta,
+                    hessian,
                     prior_obj_display,
                     iteration,
                 } => {
@@ -630,6 +652,17 @@ impl OuterProblem {
                     } else {
                         Some(Array1::from_vec(beta))
                     };
+                    // Adopt the transferred converged outer Hessian only when it
+                    // matches this fit's full-θ dimension; a dimension drift
+                    // (structural change the cache key did not capture) falls
+                    // back to the scalar warm metric in run_plan.
+                    config.warm_start_outer_hessian = hessian.and_then(|(dim, flat)| {
+                        if dim == self.n_params && flat.len() == dim * dim {
+                            Array2::from_shape_vec((dim, dim), flat).ok()
+                        } else {
+                            None
+                        }
+                    });
                     if config
                         .initial_rho
                         .as_ref()
@@ -762,6 +795,7 @@ impl OuterProblem {
             && let Some(bytes) = encode_iterate(
                 &result.rho,
                 final_beta.as_ref(),
+                result.final_hessian.as_ref(),
                 result.final_value,
                 result.iterations as u64,
             )
@@ -1245,7 +1279,7 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
-    result: &OuterResult,
+    result: &mut OuterResult,
 ) -> crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic {
     let cap = obj.capability();
     let layout = cap.theta_layout();
@@ -1302,6 +1336,23 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
             ),
             1,
         );
+    }
+    // Persist the exact outer curvature at θ̂ when the solver did not already
+    // track one. A gradient-based BFGS solve keeps its inverse-Hessian
+    // internally and `opt` does not surface it, so `result.final_hessian` is
+    // `None` on the BFGS path — yet the exact analytic `H(θ̂)` was just
+    // materialized here for the rho-uncertainty diagnostic and is otherwise
+    // discarded. Stashing it lets the persistent-cache finalize write carry the
+    // converged curvature, so the NEXT structurally-matching fit (e.g. the next
+    // LOSO fold, whose θ̂ and curvature are nearly identical) can seed BFGS with
+    // `InitialMetric::DenseInverseHessian` and take a quasi-Newton first step
+    // instead of rediscovering curvature through line-search bracketing. This
+    // never changes a converged optimum (BFGS converges to ∇V=0 under any SPD
+    // initial metric); it only reshapes the starting line-search path. Guarded
+    // on finiteness and on the solver not already owning a Hessian, so the
+    // exact-Newton / ARC paths (which DO populate `final_hessian`) are untouched.
+    if result.final_hessian.is_none() && hessian.iter().all(|v| v.is_finite()) {
+        result.final_hessian = Some(hessian.clone());
     }
     let mut hessian_rho = Array2::<f64>::zeros((rho_dim, rho_dim));
     for row in 0..rho_dim {
@@ -1415,7 +1466,10 @@ pub(crate) fn run_outer(
     // its fitted state from `result.rho`, not from last-eval residue.
     result.criterion_certificate = audit_first_order_optimality(obj, config, context, &result);
     result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
-        obj, config, context, &result,
+        obj,
+        config,
+        context,
+        &mut result,
     ));
     Ok(result)
 }
