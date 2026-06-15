@@ -1,3 +1,20 @@
+## gamfit 0.1.212 (2026-06-15)
+
+First publishable build since 0.1.209 — the 0.1.210/0.1.211 wheels failed the
+build.rs ban gate (agent-collision leftovers) and never reached PyPI. This
+ships everything since 0.1.209 with the gate cleared (USE-or-DELETE, no `_`
+silencers): the row-kernel dense/directional override defaults now run the
+extracted generic per-row path (genuinely consuming their args) while the rigid
+kernel overrides with the BLAS-3 fast path; heartbeat scope guards bound + dropped
+explicitly; dead `is_ext` removed. Folds in the real BMS perf work:
+**BLAS-3 Jeffreys hessian_qp** floor, **BLAS-3 gradient_reload** floor, the
+**same-β rigid third/fourth-tensor cache** (the genuine coord_corrections
+collapse — the rigid path was rebuilding the per-row tensor every outer eval),
+canonicalise fast-path, seed-screen skip on warm hits, warm-start BFGS metric,
+and heartbeat CPU/active-scope diagnostics. Correctness: #740 ψ outer-gradient
+KKT correction + the outer-HVP cross-ρψ second-order sign and full-H⁻¹ β̈ solve
+(audit-confirmed), Murphy-Topel oracle fixture redesign.
+
 ## gamfit 0.1.211 (2026-06-15)
 
 BMS biobank-fit perf + diagnostics. (1) **BLAS-3 rigid dense joint-Hessian**
