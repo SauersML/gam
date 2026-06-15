@@ -1,3 +1,16 @@
+## gamfit 0.1.208 (2026-06-15)
+
+BMS perf: **BLAS-3 chunked Gram for the rigid directional-Hessian drift**
+(`coord_corrections`, the per-ρ REML logdet-gradient drift). The rigid
+(`flex=false`, biobank) path previously folded each of n rows × k directions
+with per-row rank-1 SYRs (BLAS-1, memory-bandwidth-bound); it now routes through
+the same chunked `Xᵀdiag(w)X` GEMM structure the flex path uses — k GEMMs per
+chunk instead of n·k rank-1 updates. Bit-identical drift (the rigid accumulator
+has no h/w blocks; non-contiguous/subsample rows keep the per-row fallback). On
+the biobank LOSO fold (n≈326k, k=8) this collapses the dominant `coord_corrections`
+step from ~3.5 min to seconds. Also lands the redesigned Murphy-Topel oracle
+fixture (#1028) and HVP ψ-gradient FD-attribution instrumentation.
+
 ## gamfit 0.1.207 (2026-06-15)
 
 Generative-dispersion cluster (#1124 / #1125), finishing and shipping a fix the
