@@ -133,6 +133,13 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
+          # Cross-run compilation cache (GitHub Actions cache backend),
+          # configured INSIDE the manylinux container by maturin-action.
+          # CI runners are ephemeral, so without this every wheel recompiles
+          # the whole dependency graph (faer, ndarray, pyo3, …) cold in
+          # release mode — the dominant ~10 min cost. With sccache warm, only
+          # the changed gam crate recompiles on subsequent releases.
+          sccache: true
           target: ${{ matrix.platform.target }}
           args: >-
             --release
@@ -167,6 +174,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
+          sccache: true
           target: ${{ matrix.target }}
           args: >-
             --release
@@ -202,6 +210,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
+          sccache: true
           target: ${{ matrix.platform.target }}
           args: >-
             --release
@@ -234,6 +243,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
+          sccache: true
           target: ${{ matrix.target }}
           args: >-
             --release
