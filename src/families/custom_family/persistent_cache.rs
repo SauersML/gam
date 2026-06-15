@@ -34,9 +34,12 @@ use crate::solver::warm_start_artifact::{
 use crate::solver::warm_start_transfer::{TermBuildContext, TransferConfig, build_warm_start};
 
 /// Build the structural identity of each block at the fit-spec layer. The
-/// returned `TermIdentityKey` is fold-invariant (keyed on block name +
-/// penalty structure, never on row-dependent values), which is exactly what
-/// lets an LOSO fold match a prior full-data artifact.
+/// returned `TermIdentityKey` is fold-invariant (keyed on block name + penalty
+/// structure + realized reduced β-width, never on row-dependent values), which
+/// is exactly what lets an LOSO fold match a prior full-data artifact while
+/// splitting two diseases whose spatial basis collapses to a different
+/// effective support (different `design.ncols()` ⇒ different per-block β
+/// dimension ⇒ distinct identity, so a p=37 fit never matches a p=85 artifact).
 fn block_term_identity(spec: &ParameterBlockSpec) -> TermIdentityKey {
     let role = TermRole::from_block_name(&spec.name);
     let labels: Vec<Option<String>> = spec
@@ -44,7 +47,13 @@ fn block_term_identity(spec: &ParameterBlockSpec) -> TermIdentityKey {
         .iter()
         .map(|p| p.precision_label().map(str::to_owned))
         .collect();
-    term_identity_from_block(role, &spec.name, &labels, &spec.nullspace_dims)
+    term_identity_from_block(
+        role,
+        &spec.name,
+        &labels,
+        &spec.nullspace_dims,
+        spec.design.ncols(),
+    )
 }
 
 /// Map each block to the set of OUTER ρ indices its penalties occupy, using
