@@ -3095,16 +3095,19 @@ fn collect_repo_files(root: &Path) -> &'static [PathBuf] {
 /// is a file (`gitdir: <path>`) rather than a directory.
 fn locate_git_index(root: &Path) -> PathBuf {
     let git = root.join(".git");
-    let meta = fs::metadata(&git)
-        .unwrap_or_else(|err| panic!("failed to stat {} for tracked-file audit: {err}", git.display()));
+    let meta = fs::metadata(&git).unwrap_or_else(|err| {
+        panic!(
+            "failed to stat {} for tracked-file audit: {err}",
+            git.display()
+        )
+    });
     if meta.is_dir() {
         return git.join("index");
     }
     // `.git` is a file in linked worktrees / submodules; first line is
     // `gitdir: <absolute or relative path to the real gitdir>`.
-    let pointer = fs::read_to_string(&git).unwrap_or_else(|err| {
-        panic!("failed to read worktree pointer {}: {err}", git.display())
-    });
+    let pointer = fs::read_to_string(&git)
+        .unwrap_or_else(|err| panic!("failed to read worktree pointer {}: {err}", git.display()));
     let gitdir = pointer
         .lines()
         .next()
@@ -3160,11 +3163,7 @@ fn parse_git_index(bytes: &[u8]) -> Result<Vec<PathBuf>, String> {
         if bytes.len() < pos + 62 {
             return Err(format!("truncated entry {entry_idx} fixed header"));
         }
-        let flags = u16::from_be_bytes(
-            bytes[pos + 60..pos + 62]
-                .try_into()
-                .expect("2-byte slice"),
-        );
+        let flags = u16::from_be_bytes(bytes[pos + 60..pos + 62].try_into().expect("2-byte slice"));
         pos += 62;
         let extended = (flags & 0x4000) != 0;
         if extended {
@@ -3186,13 +3185,12 @@ fn parse_git_index(bytes: &[u8]) -> Result<Vec<PathBuf>, String> {
             let (chop, consumed) = decode_index_varint(&bytes[pos..])
                 .map_err(|e| format!("entry {entry_idx} varint: {e}"))?;
             pos += consumed;
-            let keep = prev_path
-                .len()
-                .checked_sub(chop)
-                .ok_or_else(|| format!(
+            let keep = prev_path.len().checked_sub(chop).ok_or_else(|| {
+                format!(
                     "entry {entry_idx} v4 underflow: prev={} chop={chop}",
                     prev_path.len()
-                ))?;
+                )
+            })?;
             let nul_offset = bytes[pos..]
                 .iter()
                 .position(|b| *b == 0)
