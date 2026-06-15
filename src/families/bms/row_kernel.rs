@@ -629,6 +629,26 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             });
             return None;
         }
+        // When a CUDA device is present, route the WHOLE `Xᵀ diag(w) X` joint
+        // Hessian through one device dispatch (the embarrassingly-parallel
+        // whole-n GEMM the device wants) rather than per-chunk launches. The
+        // GPU-presence probe is checked first so CPU boxes never pay the three
+        // length-n contracted-weight allocations: `rigid_joint_hessian_on_gpu`
+        // would return `None` there anyway, so the build below is the CPU path.
+        if crate::gpu::runtime::GpuRuntime::global().is_some() {
+            let w_mm: Array1<f64> = row_hessians.iter().map(|h| h[0][0]).collect();
+            let w_mg: Array1<f64> = row_hessians.iter().map(|h| h[0][1]).collect();
+            let w_gg: Array1<f64> = row_hessians.iter().map(|h| h[1][1]).collect();
+            if let Some(joint) = rigid_joint_hessian_on_gpu(
+                &self.family.marginal_design,
+                &self.family.logslope_design,
+                &w_mm,
+                &w_mg,
+                &w_gg,
+            ) {
+                return Some(joint);
+            }
+        }
         Some(self.hessian_dense_blas3(row_hessians))
     }
 

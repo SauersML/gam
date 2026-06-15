@@ -1824,12 +1824,13 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
 
 /// Deterministic-order parallel reduction over a row-index slice.
 ///
-/// Splits `rows` into a fixed number of contiguous chunks
-/// (`TARGET_CHUNK_COUNT`), processes each chunk sequentially in parallel
-/// via `process_row`, and combines the per-chunk accumulators in
-/// chunk-index order via `combine` on the calling thread. The chunk size
-/// is a pure function of `rows.len()`, so the reduction tree is fixed
-/// across calls regardless of rayon's thread-pool size or work-stealing
+/// Splits `rows` into contiguous chunks sized to saturate the rayon pool
+/// (several chunks per worker, floored so small `n` stays coarse), processes
+/// each chunk sequentially in parallel via `process_row`, and combines the
+/// per-chunk accumulators in chunk-index order via `combine` on the calling
+/// thread. The chunk count is a pure function of `(rows.len(), worker_count)`;
+/// the worker count is fixed for the process (one global pool), so the
+/// reduction tree is fixed across calls regardless of rayon's work-stealing
 /// decisions.
 ///
 /// `try_fold/try_reduce` over `rows.into_par_iter()` does **not** have
@@ -1856,12 +1857,32 @@ where
     Combine: FnMut(&mut Acc, Acc),
 {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    const TARGET_CHUNK_COUNT: usize = 32;
     let n = rows.len();
     if n == 0 {
         return Ok(init());
     }
-    let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
+    // The chunk count is sized so the heavy reduction phases actually saturate
+    // the rayon pool: a fixed `32` left half of a 64-core box idle whenever the
+    // pool had more than 32 workers, capping utilization at ~50% on the biobank
+    // coord-corrections / row-stream phases. Targeting several chunks per worker
+    // keeps load balanced across an uneven row-cost tail (work-stealing still
+    // moves whole chunks, never partial sums) without flooding the sequential
+    // `combine` with tiny partials. The count is a pure function of
+    // `(rows.len(), worker_count)`; the worker count is fixed for the process
+    // (one global pool, gam owns its threads), so chunk boundaries are stable
+    // across calls and the ordered `Vec` collect + sequential `combine` keep the
+    // reduction bit-for-bit deterministic regardless of work-stealing.
+    const CHUNKS_PER_WORKER: usize = 4;
+    const MIN_CHUNK_COUNT: usize = 32;
+    const MIN_ROWS_PER_CHUNK: usize = 64;
+    let workers = rayon::current_num_threads().max(1);
+    let target_chunk_count = workers
+        .saturating_mul(CHUNKS_PER_WORKER)
+        .max(MIN_CHUNK_COUNT);
+    // Never carve chunks below `MIN_ROWS_PER_CHUNK` rows: for small `n` the
+    // scheduler/partial-accumulator overhead would dominate the row arithmetic.
+    let chunk_count = target_chunk_count.min(n.div_ceil(MIN_ROWS_PER_CHUNK)).max(1);
+    let chunk_size = n.div_ceil(chunk_count).max(1);
     let n_chunks = n.div_ceil(chunk_size);
     // `(0..n_chunks).into_par_iter()` is `IndexedParallelIterator`, so the
     // `.collect::<Vec<_>>()` below preserves chunk-index order regardless

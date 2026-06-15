@@ -1107,6 +1107,21 @@ where
 }
 
 impl DenseDesignMatrix {
+    /// Stable identity for cache keying.
+    ///
+    /// Returns the address of the inner shared `Arc`, which `Clone` shares by
+    /// reference. Two `DenseDesignMatrix` values produced by cloning the same
+    /// origin (e.g. the `k` per-coordinate `GlmCurvatureCorrectionOperator`s all
+    /// built from one converged design) report the same identity, so a `X·F`
+    /// projection memoized under this id is reused across them within a single
+    /// outer REML evaluation instead of being re-streamed once per coordinate.
+    pub fn cache_identity(&self) -> usize {
+        match self {
+            Self::Materialized(matrix) => Arc::as_ptr(matrix) as *const () as usize,
+            Self::Lazy(op) => Arc::as_ptr(op) as *const () as usize,
+        }
+    }
+
     pub fn nrows(&self) -> usize {
         match self {
             Self::Materialized(matrix) => matrix.nrows(),

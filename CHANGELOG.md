@@ -1,3 +1,14 @@
+## gamfit 0.1.218 (2026-06-15)
+
+- **Build fix**: wire the whole-`Xᵀdiag(w)X` GPU joint-Hessian path
+  (`rigid_joint_hessian_on_gpu`) into the rigid `hessian_dense_override`, guarded
+  by a GPU-presence probe (CPU boxes skip the weight-vector alloc and take the
+  chunked-BLAS3 path unchanged). Clears the dead-code ban that failed 0.1.217.
+- Saturate the rayon pool in `chunked_row_reduction` (4×workers chunks, was a
+  fixed 32 that idled half a 64-core box) — completes the CPU-utilization fix.
+- `DenseDesignMatrix::cache_identity` for memoizing the `X·F` projection across
+  the k per-coordinate correction operators within one outer eval.
+
 ## gamfit 0.1.217 (2026-06-15)
 
 - **Build fix**: re-export `SaeBasisEvaluator` in the pyffi prelude. The #1117 SAE
