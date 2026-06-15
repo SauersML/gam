@@ -3910,6 +3910,62 @@ pub(crate) fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + 
         .map(|log_likelihood| (log_likelihood, None))
 }
 
+/// Fused accept-trial likelihood: build the joint-Newton Hessian workspace at
+/// the trial β and read its log-likelihood, returning the workspace so the
+/// post-accept `gradient_reload` reuses it instead of re-streaming all `n` rows.
+///
+/// Why this exists (gam#979 inner-loop `gradient_reload` cost). The trust-region
+/// accept/reject decision needs only the scalar log-likelihood, and
+/// [`joint_line_search_log_likelihood`] supplies it via the family's cheap
+/// early-exit row sweep — the right tool for a *rejected* backtracking trial,
+/// which short-circuits before the sweep finishes. But on the *accepted* trial
+/// that sweep runs to completion (≈ one full row stream) and is then immediately
+/// discarded: `gradient_reload` re-streams every row to build the gradient
+/// workspace at the same β. At biobank scale (n≈194k, BMS flex) each stream
+/// re-runs the per-row intercept Newton + cell-moment math, so the accepted
+/// cycle pays the row stream *twice* (~5s of redundant `gradient_reload` work
+/// per accepted cycle, the dominant inner cost once the operator-reused Hessian
+/// drops to ~0.05s).
+///
+/// When the workspace can report a joint log-likelihood
+/// ([`inner_joint_workspace_log_likelihood_available`]), building the workspace
+/// once and reading `joint_log_likelihood_evaluation()` yields the SAME scalar
+/// (both evaluate `Σ wᵢ log Φ` at the trial β) while leaving the per-row
+/// gradient cache materialised. Threaded forward as the accepted workspace, the
+/// reload then short-circuits through `joint_gradient_evaluation()` without a
+/// second stream — collapsing the accepted cycle from two row passes to one.
+///
+/// The early-exit threshold is intentionally NOT applied here: this path is
+/// taken only for a trial expected to accept (the caller gates on the first
+/// attempt of a cycle), where the full sweep happens regardless, and the
+/// workspace build has no monotone-lower-bound short-circuit to exploit. A
+/// rejected first attempt simply discards the workspace, costing one full sweep
+/// instead of an early-exited one — paid back many-fold on the common
+/// accept-on-first-attempt path.
+pub(crate) fn joint_line_search_log_likelihood_with_workspace<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    options: &BlockwiseFitOptions,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
+    if !family.inner_joint_workspace_log_likelihood_available(specs) {
+        return Ok(None);
+    }
+    let Some(workspace) =
+        family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+    else {
+        return Ok(None);
+    };
+    match workspace.joint_log_likelihood_evaluation()? {
+        Some(log_likelihood) => Ok(Some((log_likelihood, workspace))),
+        // The workspace advertised a log-likelihood but did not produce one;
+        // fall back to the cheap scalar sweep rather than fabricating a value.
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn coefficient_line_search_options(
     options: &BlockwiseFitOptions,
     early_exit_threshold: f64,

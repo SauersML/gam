@@ -79,6 +79,7 @@ mod joint_newton;
 mod options;
 mod outer_objective;
 mod penalty;
+mod penalty_labels;
 mod psi_design;
 mod psi_hyper;
 
@@ -99,6 +100,7 @@ pub use joint_newton::*;
 pub use options::*;
 pub use outer_objective::*;
 pub use penalty::*;
+pub(crate) use penalty_labels::*;
 pub use psi_design::*;
 pub use psi_hyper::*;
 
