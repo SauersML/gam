@@ -557,7 +557,7 @@ pub fn reml_laml_evaluate(
             );
             // Named heartbeat scope so the active-scope line attributes the
             // coord_corrections wall time (the biobank's dominant REML stage).
-            let coord_corr_scope = crate::heartbeat::track_scope(format!(
+            let coord_corr_scope = crate::process_monitor::track_scope(format!(
                 "reml_laml coord_corrections batched k={k} ext_dim={ext_dim} n={} dim={}",
                 solution.n_observations,
                 hop.dim()
