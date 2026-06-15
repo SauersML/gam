@@ -1,6 +1,125 @@
 use super::*;
 
+/// Cross-disease Duchon basis cache.
+///
+/// The biobank workload fits many models (e.g. 17 diseases) over the SAME base
+/// cohort: identical individuals, identical predictor columns (PC1..PC15, sex,
+/// ages, geography); only the response/PRS column changes per fit. The Duchon
+/// spatial basis — center/knot selection, the thin-plate kernel evaluation, the
+/// kernel-constraint nullspace reparameterisation, the identifiability
+/// transform, and the penalty Grams — is a PURE FUNCTION of `(data, spec)`: it
+/// never reads the response. So the whole [`BasisBuildResult`] is identical
+/// across diseases sharing those exact predictor columns, yet the per-disease
+/// log shows it rebuilt + re-audited from scratch each time (~0.4–2.5 s each).
+///
+/// This is a content-addressed, size-bounded, recomputable memo mirroring the
+/// FFI cross-disease column-encode cache (`encoded_column_cache` in
+/// `crates/gam-pyffi/src/manifold_and_posterior_ffi.rs`): the key is a 128-bit
+/// fingerprint of the data matrix CONTENT (shape + every element bit-pattern)
+/// plus the basis spec, so a different cohort / subsample (different rows) MISSES
+/// — preserving correctness — while the same columns across diseases HIT. A hit
+/// clones the cached `BasisBuildResult` (cheap `Arc`/ndarray clones vs. the
+/// kernel build + RRQR audit), so results are bit-identical to the miss path.
+/// Eviction (LRU under a byte budget) only ever forfeits the perf benefit, never
+/// correctness, since every value is exactly recomputable from its key.
+type DuchonBasisCacheKey = (u64, u64);
+
+#[derive(Clone)]
+struct CachedDuchonBasis(BasisBuildResult);
+
+impl crate::resource::ResidentBytes for CachedDuchonBasis {
+    fn resident_bytes(&self) -> usize {
+        // Coarse charge: the dominant resident cost is the dense design columns
+        // and the penalty Grams. An estimate suffices — the byte budget only
+        // bounds the cache, it never affects correctness.
+        let design_bytes = self
+            .0
+            .design
+            .nrows()
+            .saturating_mul(self.0.design.ncols())
+            .saturating_mul(std::mem::size_of::<f64>());
+        let penalty_bytes: usize = self
+            .0
+            .penalties
+            .iter()
+            .map(|s| s.len().saturating_mul(std::mem::size_of::<f64>()))
+            .sum();
+        design_bytes
+            .saturating_add(penalty_bytes)
+            .saturating_add(4096)
+    }
+}
+
+/// Process-wide Duchon basis memo. 1 GiB matches the established large-scale
+/// densification ceiling used elsewhere; with ~17 diseases over one cohort the
+/// working set is a single `BasisBuildResult`, so even a modest budget retains
+/// the shared basis across the whole sweep.
+fn duchon_basis_cache() -> &'static crate::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis>
+{
+    static CACHE: std::sync::OnceLock<
+        crate::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| crate::resource::ByteLruCache::new(1 << 30))
+}
+
+/// 128-bit content fingerprint of `(data, spec)`. Two independent hashers (one
+/// unseeded, one seeded with a fixed golden-ratio constant) widen the key to
+/// 128 bits so accidental collisions across a batch are negligible. The data
+/// contribution hashes the shape plus EVERY element's IEEE-754 bit pattern, so
+/// any change of rows, columns, or values — i.e. a different cohort / subsample
+/// — produces a different key and misses. The spec is hashed via its serialized
+/// form (the spec carries `serde` derives), capturing center strategy, power,
+/// length scale, nullspace order, anisotropy, identifiability, and operator
+/// penalty dials — every input the builder reads.
+fn duchon_basis_fingerprint(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+) -> Option<DuchonBasisCacheKey> {
+    let spec_bytes = serde_json::to_vec(spec).ok()?;
+    let mut lo = DefaultHasher::new();
+    let mut hi = DefaultHasher::new();
+    // Seed `hi` so its stream is statistically independent of `lo`.
+    0x9E37_79B9_7F4A_7C15u64.hash(&mut hi);
+
+    let (nrows, ncols) = data.dim();
+    for h in [&mut lo, &mut hi] {
+        nrows.hash(h);
+        ncols.hash(h);
+    }
+    // Hash element bit-patterns in a fixed (row-major) order, independent of the
+    // view's underlying memory layout, so two views over the same logical matrix
+    // fingerprint identically.
+    for row in data.rows() {
+        for &v in row {
+            let bits = v.to_bits();
+            bits.hash(&mut lo);
+            bits.hash(&mut hi);
+        }
+    }
+    for h in [&mut lo, &mut hi] {
+        spec_bytes.len().hash(h);
+        spec_bytes.hash(h);
+    }
+    Some((lo.finish(), hi.finish()))
+}
+
 pub fn build_duchon_basiswithworkspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisBuildResult, BasisError> {
+    if let Some(key) = duchon_basis_fingerprint(data, spec) {
+        if let Some(hit) = duchon_basis_cache().get(&key) {
+            return Ok(hit.0);
+        }
+        let result = build_duchon_basis_uncached(data, spec, workspace)?;
+        duchon_basis_cache().insert(key, CachedDuchonBasis(result.clone()));
+        return Ok(result);
+    }
+    build_duchon_basis_uncached(data, spec, workspace)
+}
+
+fn build_duchon_basis_uncached(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
