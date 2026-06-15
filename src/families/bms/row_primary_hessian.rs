@@ -678,6 +678,7 @@ impl BernoulliMarginalSlopeFamily {
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
             flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
             flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
+            full_data_outer_rows: std::sync::OnceLock::new(),
         })
     }
 

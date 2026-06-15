@@ -1505,7 +1505,7 @@ impl BernoulliMarginalSlopeFamily {
         // Block-local accumulator path for second-order psi terms
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let (objective_psi_psi, score_psi_psi, block_acc) = weighted_rows
-            .into_par_iter()
+            .par_iter()
             .try_fold(
                 || {
                     (
@@ -1908,7 +1908,7 @@ impl BernoulliMarginalSlopeFamily {
         // same per-row primary grad/Hess and the same cached third/fourth jets.
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let per_row = weighted_rows
-            .into_par_iter()
+            .par_iter()
             .try_fold(
                 || {
                     (
@@ -2278,7 +2278,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let block_acc = weighted_rows
-            .into_par_iter()
+            .par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, wr| -> Result<_, String> {
@@ -2420,7 +2420,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let block_acc = weighted_rows
-            .into_par_iter()
+            .par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, wr| -> Result<_, String> {
@@ -2535,7 +2535,7 @@ impl BernoulliMarginalSlopeFamily {
         // ── Rigid closed-form: 3rd-order scalar kernel ───────────────
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
-                .into_par_iter()
+                .par_iter()
                 .try_fold(
                     || BernoulliBlockHessianAccumulator::new(slices),
                     |mut acc, wr| -> Result<_, String> {
@@ -2571,7 +2571,7 @@ impl BernoulliMarginalSlopeFamily {
         self.prewarm_flex_cell_bundle(block_states, cache, 15)?;
 
         let block_acc = weighted_rows
-            .into_par_iter()
+            .par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, wr| -> Result<_, String> {
@@ -2624,7 +2624,7 @@ impl BernoulliMarginalSlopeFamily {
 
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
-                .into_par_iter()
+                .par_iter()
                 .try_fold(
                     || BernoulliBlockHessianAccumulator::new(slices),
                     |mut acc, wr| -> Result<_, String> {
@@ -2662,7 +2662,7 @@ impl BernoulliMarginalSlopeFamily {
         self.prewarm_flex_cell_bundle(block_states, cache, 15)?;
 
         let block_acc = weighted_rows
-            .into_par_iter()
+            .par_iter()
             .try_fold(
                 || BernoulliBlockHessianAccumulator::new(slices),
                 |mut acc, wr| -> Result<_, String> {
@@ -2976,8 +2976,7 @@ impl BernoulliMarginalSlopeFamily {
                 accs
             } else {
                 weighted_rows
-                    .clone()
-                    .into_par_iter()
+                    .par_iter()
                     .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
                         let row = wr.index;
                         let w = wr.weight;
@@ -3173,9 +3172,9 @@ impl BernoulliMarginalSlopeFamily {
                 accs
             } else {
                 weighted_rows
-                    .into_par_iter()
+                    .par_iter()
                     .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
-                        row_body(wr, &mut accs)?;
+                        row_body(*wr, &mut accs)?;
                         Ok(accs)
                     })
                     .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
@@ -3263,7 +3262,7 @@ impl BernoulliMarginalSlopeFamily {
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
-                .into_par_iter()
+                .par_iter()
                 .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
                     let row = wr.index;
                     let w = wr.weight;
@@ -3296,7 +3295,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let block_acc = weighted_rows
-            .into_par_iter()
+            .par_iter()
             .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
                 let row = wr.index;
                 let w = wr.weight;
@@ -3364,7 +3363,7 @@ impl BernoulliMarginalSlopeFamily {
 
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
-                .into_par_iter()
+                .par_iter()
                 .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
                     let row = wr.index;
                     let w = wr.weight;
@@ -3399,7 +3398,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let block_acc = weighted_rows
-            .into_par_iter()
+            .par_iter()
             .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
                 let row = wr.index;
                 let w = wr.weight;
@@ -3547,8 +3546,7 @@ impl BernoulliMarginalSlopeFamily {
                 accs
             } else {
                 weighted_rows
-                    .clone()
-                    .into_par_iter()
+                    .par_iter()
                     .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
                         let row = wr.index;
                         let w = wr.weight;
@@ -3618,8 +3616,7 @@ impl BernoulliMarginalSlopeFamily {
             accs
         } else {
             weighted_rows
-                .clone()
-                .into_par_iter()
+                .par_iter()
                 .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
                     let row = wr.index;
                     let w = wr.weight;
