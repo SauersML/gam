@@ -1866,23 +1866,34 @@ impl SaeManifoldTerm {
             if ev >= SAE_DICTIONARY_COLLAPSE_EV_FLOOR {
                 return Ok(());
             }
-            // Co-collapsed. Reseed all atoms EXCEPT the strongest (kept as an
-            // anchor so the reseed targets a non-degenerate residual and the set
-            // does not re-symmetrise into the same basin) onto DISTINCT residual
-            // PCs below.
-            let anchor = (0..k)
-                .max_by(|&a, &b| {
-                    norms[a]
-                        .partial_cmp(&norms[b])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap_or(0);
-            breached = (0..k).filter(|&a| a != anchor).collect();
+            // Co-collapsed. Reseed ALL atoms onto DISTINCT residual PCs below.
+            //
+            // The earlier all-but-the-strongest reseed kept one atom as an
+            // "anchor". But in a TRUE co-collapse (EV < floor) every decoder is
+            // ≈0, so the "strongest" atom is itself degenerate — there is no
+            // healthy atom worth anchoring. Preserving it leaves one slot sitting
+            // in the collapsed basin while only K−1 atoms get fresh distinct
+            // directions; the joint LSQ refit then re-attracts the reseeded atoms
+            // toward the un-moved basin atom, which is exactly why a single
+            // reseed could not break a K=3 three-way co-collapse (#1117 K>1
+            // robustness item: identical config flipped EV≈0.40 ↔ 0.00). The two
+            // properties the anchor was meant to provide are already supplied by
+            // the residual seeding itself: (1) the residual is computed from the
+            // current (degenerate) fit, so with EV≈0 it is ≈ the target and
+            // therefore non-degenerate without any preserved anchor; (2)
+            // `reseed_atoms_onto_distinct_residual_pcs` assigns each atom slot its
+            // OWN disjoint residual-PC pair (the #671 rule), so the set cannot
+            // re-symmetrise into one basin. Reseeding all K onto K distinct PC
+            // pairs is the maximal-diversity multi-start — the strongest basin
+            // break available — and subsumes the verified K=2 recovery (both
+            // atoms now get clean distinct seeds rather than one seed + one
+            // revived-by-LSQ collapsed atom).
+            breached = (0..k).collect();
             log::warn!(
                 "SaeManifoldTerm: dictionary co-collapse (reconstruction EV={ev:.4} < \
                  {SAE_DICTIONARY_COLLAPSE_EV_FLOOR}) with no relative-norm breach; reseeding \
-                 {} of {k} atoms onto distinct residual PCs (anchor atom {anchor})",
-                breached.len()
+                 all {k} atoms onto distinct residual PCs (total co-collapse: no atom carries \
+                 material signal to anchor)"
             );
         }
         // Decide which breached atoms still have reseed budget (recording a
