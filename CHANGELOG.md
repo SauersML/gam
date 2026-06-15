@@ -1,3 +1,19 @@
+## gamfit 0.1.205 (2026-06-15)
+
+Performance bundle for the BMS biobank fit, no behavior change (all paths stay
+bit-exact / KKT- and REML-certified). (1) **Skip redundant continuation
+pre-warm on a warm-start cache hit** — when a fit seeds ρ/β from a structurally
+matching parent (LOSO folds, multi-disease runs), the cold continuation
+pre-warm seed (~160s/fit in the biobank log) is no longer recomputed. (2)
+**Reuse the exact-Newton workspace across rejected inner trust-region cycles**
+instead of rebuilding it. (3) **Parallelize the HVP host-pin per-row direction
+fill** that previously ran serial. (4) **Parallelize the flat identifiability
+audit** (per-block QR + per-column geometry). (5) **Cache the same-ρ assembled
+outer Hessian operator** so the ~14-19s spectral factorization is not rebuilt
+on the Value→ValueAndGradient pair (and line-search re-probes) the outer BFGS
+issues at identical ρ. RAM headroom on the biobank box (~10 GB of 87 GB used)
+makes the operator cache a safe memory-for-speed trade.
+
 ## gamfit 0.1.204 (2026-06-15)
 
 Warm-start: cross-fit **β** transfer (Phase 2). A related later fit (notably an
