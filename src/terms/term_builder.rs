@@ -2700,13 +2700,33 @@ pub fn build_smooth_basis(
                 let c = cols[axis];
                 let (data_min, data_max) = col_minmax(ds.values.column(c))?;
                 let k_axis = k_list[axis];
-                let min_k = degree + 1;
-                if k_axis < min_k {
+                // Per-axis effective spline degree. The B-spline basis with `k`
+                // functions is well-defined for any `degree <= k - 1`; mgcv's
+                // `te(...)` exploits this so a binary tensor margin
+                // (`k=2` → linear basis) or a ternary margin (`k=3` → quadratic)
+                // can coexist with a smoother continuous margin under one
+                // shared `degree=` request. We mirror that: if the caller
+                // explicitly asks for `k < degree + 1`, drop the degree on
+                // THAT axis only to the largest feasible spline, and track the
+                // penalty order so the marginal difference penalty stays
+                // well-defined (`order < num_basis_functions` is required by
+                // `create_difference_penalty_matrix`). Periodic axes still
+                // need enough basis functions to wrap; reject k there.
+                if k_axis < 2 {
                     return Err(TermBuilderError::invalid_option(format!(
-                        "tensor smooth: k[{axis}]={k_axis} too small for degree {degree}; expected k >= {min_k}"
+                        "tensor smooth: k[{axis}]={k_axis} too small; tensor margins require k >= 2"
                     ))
                     .to_string());
                 }
+                if periodic_axes[axis] && k_axis < degree + 1 {
+                    return Err(TermBuilderError::invalid_option(format!(
+                        "tensor smooth: periodic axis {axis} requires k >= {} for degree {degree}, got k={k_axis}",
+                        degree + 1
+                    ))
+                    .to_string());
+                }
+                let effective_degree = degree.min(k_axis - 1).max(1);
+                let effective_penalty_order = penalty_order.min(effective_degree);
                 let (knotspec, boundary, axis_period) = if periodic_axes[axis] {
                     let period_value = periods_opt[axis].ok_or_else(|| {
                         format!(
@@ -2733,7 +2753,17 @@ pub fn build_smooth_basis(
                         Some(period_value),
                     )
                 } else {
-                    let num_internal_knots = k_axis.saturating_sub(degree + 1).max(1);
+                    // `num_internal_knots = k - degree - 1` reproduces the
+                    // requested basis size exactly when degree was reduced for
+                    // a low-cardinality margin; keep the legacy `.max(1)`
+                    // floor on the un-reduced path so the existing knot
+                    // geometry is unchanged whenever the user already passed
+                    // k >= degree + 1.
+                    let num_internal_knots = if effective_degree < degree {
+                        k_axis.saturating_sub(effective_degree + 1)
+                    } else {
+                        k_axis.saturating_sub(degree + 1).max(1)
+                    };
                     let knotspec = match parse_knot_placement(options)? {
                         crate::basis::BSplineKnotPlacement::Uniform => BSplineKnotSpec::Generate {
                             data_range: (data_min, data_max),
@@ -2743,7 +2773,7 @@ pub fn build_smooth_basis(
                             crate::basis::auto_knot_vector_1d_quantile(
                                 ds.values.column(c),
                                 num_internal_knots,
-                                degree,
+                                effective_degree,
                             )
                             .map_err(|e| e.to_string())?;
                             BSplineKnotSpec::Automatic {
@@ -2755,8 +2785,8 @@ pub fn build_smooth_basis(
                     (knotspec, OneDimensionalBoundary::Open, None)
                 };
                 margins.push(BSplineBasisSpec {
-                    degree,
-                    penalty_order,
+                    degree: effective_degree,
+                    penalty_order: effective_penalty_order,
                     knotspec,
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::None,
@@ -4165,6 +4195,66 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(dims, vec![9, 5]);
+    }
+
+    #[test]
+    fn tensor_smooth_low_cardinality_axis_falls_back_to_lower_degree_basis() {
+        // mgcv-style: `te(x, b, k=c(5, 2))` with a BINARY second margin (only
+        // values {0, 1}) is a legitimate request — the binary axis can hold at
+        // most a 2-function linear basis. We must NOT reject k=2 with a
+        // "k too small for degree 3" config error; instead, drop the spline
+        // degree on the binary axis to k_axis - 1 (here 1, linear) while
+        // keeping the continuous margin at the requested degree=3, k=5.
+        let ds = continuous_dataset(
+            &["y", "x", "b"],
+            (0..40)
+                .map(|i| {
+                    let x = i as f64 / 39.0;
+                    let b = (i % 2) as f64;
+                    vec![x.sin() + 0.5 * b, x, b]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ te(x, b, k=[5, 2])").expect("parse tensor with k=[5,2]");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build tensor with binary margin");
+        let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected tensor B-spline for te(x, b)");
+        };
+        // Continuous margin keeps requested degree=3 and k=5; binary margin
+        // drops to degree=1 (linear) so the requested k=2 yields exactly two
+        // basis functions before tensor-product identifiability is applied.
+        let continuous = &spec.marginalspecs[0];
+        let binary = &spec.marginalspecs[1];
+        assert_eq!(continuous.degree, 3);
+        assert_eq!(binary.degree, 1);
+        assert!(
+            binary.penalty_order >= 1 && binary.penalty_order <= binary.degree,
+            "binary margin penalty_order {} must satisfy 1 <= order <= degree={}",
+            binary.penalty_order,
+            binary.degree
+        );
+        let basis_size = |m: &BSplineBasisSpec| match m.knotspec {
+            BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
+            BSplineKnotSpec::Generate {
+                num_internal_knots, ..
+            } => num_internal_knots + m.degree + 1,
+            BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(n),
+                ..
+            } => n + m.degree + 1,
+            _ => panic!("unexpected tensor marginal knotspec"),
+        };
+        assert_eq!(basis_size(continuous), 5);
+        assert_eq!(basis_size(binary), 2);
     }
 
     #[test]
