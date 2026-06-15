@@ -358,6 +358,28 @@ pub mod debug_stash {
         TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
     }
 
+    /// HVP ψ-gradient attribution (#740): global sink for the `a`-channel split
+    /// `(a_likelihood, a_penalty_quadratic)` of the FIRST ψ (ext) coordinate.
+    /// Written from `build_psi_hyper_coords` (which may run on a different thread
+    /// than the gradient par_iter that fills [`TermStash`], so a process-global
+    /// `Mutex` is used rather than the per-thread `TERMS` slot) and read by the
+    /// diagnostic test. Only set while a [`CaptureGuard`] is live.
+    static A_SPLIT_SINK: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
+
+    /// Record the first ψ-coordinate's `a = a_likelihood + a_penalty_quadratic`
+    /// split. Overwrites; the assembly visits coordinates in θ order, so the
+    /// caller gates this to the first ext coordinate.
+    pub fn store_a_split(a_likelihood: f64, a_penalty_quadratic: f64) {
+        if let Ok(mut slot) = A_SPLIT_SINK.lock() {
+            *slot = Some((a_likelihood, a_penalty_quadratic));
+        }
+    }
+
+    /// Drain the recorded `a`-channel split.
+    pub fn take_a_split() -> Option<(f64, f64)> {
+        A_SPLIT_SINK.lock().ok().and_then(|mut slot| slot.take())
+    }
+
     /// Replace the calling thread's `TermStash` with `stash`. Called by
     /// `reml_laml_evaluate` from the calling thread AFTER its ext-coord
     /// par_iter has produced the stash on a rayon worker and returned

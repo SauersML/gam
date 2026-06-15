@@ -2053,6 +2053,10 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             "stash-capture base eval must reproduce a finite outer objective"
         );
         let stash = debug_stash::take_terms();
+        // `a`-channel split of the first ψ coordinate: (a_likelihood = objective_psi,
+        // a_penalty_quadratic = ½β̂ᵀ(∂S_λ/∂ψ)β̂). Drained from the global sink
+        // recorded by build_psi_hyper_coords for the base eval.
+        let a_split = debug_stash::take_a_split();
         let half_prod = stash.production_tr.map(|t| 0.5 * t);
         let half_ld_s = stash.coord_ld_s.map(|t| 0.5 * t);
         let recon = match (stash.coord_a, half_prod, half_ld_s) {
@@ -2069,8 +2073,10 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         //   FD(log_det_s)            ↔ coord_ld_s
         let (_, _, _) = outer_at(eps, 0.0, EvalMode::ValueGradientHessian);
         let stash_plus = debug_stash::take_terms();
+        let a_split_plus = debug_stash::take_a_split();
         let (_, _, _) = outer_at(-eps, 0.0, EvalMode::ValueGradientHessian);
         let stash_minus = debug_stash::take_terms();
+        let a_split_minus = debug_stash::take_a_split();
         let central = |plus: Option<f64>, minus: Option<f64>| -> Option<f64> {
             match (plus, minus) {
                 (Some(p), Some(m)) => Some((p - m) / (2.0 * eps)),
@@ -2089,6 +2095,18 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         let fd_cost_excl_logdet = central(cost_ex(&stash_plus), cost_ex(&stash_minus));
         // Full cost FD (sanity: must reproduce the public-API fd_psi_gradient).
         let fd_cost_total = central(stash_plus.coord_cost, stash_minus.coord_cost);
+        // FD of each `a`-channel separately, so a coord_a mismatch is attributed
+        // to the likelihood channel (objective_psi) vs the penalty-quadratic
+        // channel ½β̂ᵀS_ψβ̂. (a_likelihood is itself the analytic ψ-deriv of −ℓ at
+        // fixed β; its FD counterpart is FD of the −ℓ value, which equals
+        // fd_cost_excl_logdet − FD(½βᵀSλβ). We expose the raw channels so the
+        // coordinator sees which of the two analytic channels is the small one.)
+        let a_like = a_split.map(|(l, _)| l);
+        let a_penq = a_split.map(|(_, q)| q);
+        let a_like_plus = a_split_plus.map(|(l, _)| l);
+        let a_like_minus = a_split_minus.map(|(l, _)| l);
+        let a_penq_plus = a_split_plus.map(|(_, q)| q);
+        let a_penq_minus = a_split_minus.map(|(_, q)| q);
 
         println!(
             "[HVP-attr] analytic_psi_grad={analytic_psi_gradient:.8e} fd_psi_grad={fd_psi_gradient:.8e} \
@@ -2123,6 +2141,12 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             stash.coord_log_det_h,
             stash.coord_log_det_s,
             stash.coord_cost,
+        );
+        println!(
+            "[HVP-attr-asplit] a_likelihood(objective_psi)={a_like:?} a_penalty_quadratic={a_penq:?} \
+             (sum should == coord_a) | base_a_like_plus={a_like_plus:?} a_like_minus={a_like_minus:?} \
+             base_a_penq_plus={a_penq_plus:?} a_penq_minus={a_penq_minus:?} | \
+             implied_missing=coord_a - fd_cost_excl_logdet"
         );
     }
     let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());

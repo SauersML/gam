@@ -115,7 +115,19 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             // 3. Build HyperCoord using block-local S_ψ (avoids full p×p materialization).
             let beta_block = beta_flat.slice(ndarray::s![start..end]);
             let s_psi_beta_local = s_psi_local.dot(&beta_block);
-            let a = psi_terms.objective_psi + 0.5 * beta_block.dot(&s_psi_beta_local);
+            let a_penalty_quadratic = 0.5 * beta_block.dot(&s_psi_beta_local);
+            let a = psi_terms.objective_psi + a_penalty_quadratic;
+            // HVP ψ-gradient attribution (#740): record the first ψ coordinate's
+            // `a = a_likelihood + a_penalty_quadratic` split so a failing
+            // `coord_a` FD can be attributed to the per-row likelihood channel
+            // (`objective_psi`) vs the penalty-quadratic channel. Diagnostic
+            // only; gated to a live capture guard so production never pays.
+            if psi_global == 0 && crate::test_support::debug_stash::capture_requested() {
+                crate::test_support::debug_stash::store_a_split(
+                    psi_terms.objective_psi,
+                    a_penalty_quadratic,
+                );
+            }
             // Embed s_psi_beta into full p-vector for the score.
             let mut s_psi_beta = Array1::zeros(total);
             s_psi_beta
