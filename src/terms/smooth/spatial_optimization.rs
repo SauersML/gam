@@ -1898,7 +1898,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     } else {
         SpatialHyperKind::Isotropic
     };
-    let (theta_star, joint_final_value) = run_exact_joint_spatial_optimization(
+    let outcome = run_exact_joint_spatial_optimization(
         kind,
         data,
         y,
@@ -1918,6 +1918,48 @@ fn try_exact_joint_spatial_length_scale_optimization(
     )?;
 
     let baseline_score = fit_score(&best.fit);
+
+    // The joint κ optimizer is a refinement on top of the frozen baseline
+    // geometry, never a precondition for a fit. There are two ways its candidate
+    // is not adopted, and both keep the baseline rather than aborting:
+    //   1. it ran to a finite cost but did not certify a stationary point
+    //      (`NonConverged`) — the formula/FFI path's tight outer tolerance can
+    //      leave the optimizer mid-descent at the iteration cap where the CLI's
+    //      looser tolerance converges (#1126); and
+    //   2. it converged to a candidate whose certified cost worsens the profiled
+    //      score (the gate below).
+    let (theta_star, joint_final_value) = match outcome {
+        SpatialJointOutcome::Optimized {
+            theta_star,
+            final_value,
+        } => (theta_star, final_value),
+        SpatialJointOutcome::NonConverged {
+            iterations,
+            final_value,
+            final_grad_norm,
+        } => {
+            log::info!(
+                "[spatial-kappa] joint spatial optimization did not converge \
+                 (iterations={}, final_objective={:.6e}, final_grad_norm={}); \
+                 keeping the frozen baseline geometry",
+                iterations,
+                final_value,
+                final_grad_norm.map_or_else(|| "n/a".to_string(), |g| format!("{g:.3e}")),
+            );
+            return Ok(Some(fit_frozen_baseline_geometry(
+                data,
+                y,
+                weights,
+                offset,
+                resolvedspec,
+                best,
+                family,
+                options,
+                baseline_score,
+            )?));
+        }
+    };
+
     // Compare the joint optimizer's certified cost (final_value at theta*)
     // against the baseline. Tolerance ≥ options.tol because both endpoints
     // are outer-BFGS approximations accurate to options.tol; a tighter
@@ -1930,41 +1972,17 @@ fn try_exact_joint_spatial_length_scale_optimization(
             baseline_score,
             accept_tol,
         );
-        let baseline = fit_term_collection_forspecwith_heuristic_lambdas(
+        return Ok(Some(fit_frozen_baseline_geometry(
             data,
             y,
             weights,
             offset,
             resolvedspec,
-            best.fit.lambdas.as_slice(),
+            best,
             family,
             options,
-        )?;
-        // Stamp reml_score with the certified baseline score, exactly as the
-        // optimized branch stamps `joint_final_value` below. This refit is a
-        // β/inference harvester at the frozen baseline geometry (`best`'s
-        // lambdas + the frozen resolvedspec); the score that geometry was
-        // certified at is `baseline_score = fit_score(&best.fit)`. Its own
-        // re-derived `reml_score` drifts from that certified value because the
-        // harvest runs the full-inference option set (and re-runs the adaptive
-        // spatial overlay) rather than the superseded baseline path that
-        // produced `best`. The spatial-κ result gate
-        // (`require_successful_spatial_optimization_result`) compares the
-        // returned fit's `fit_score` against `fit_score(&best.fit)`; without
-        // this stamp a downward drift of a few REML units on the SAME geometry
-        // spuriously reads as "the optimizer made the score worse" and aborts
-        // an otherwise-valid fit. Stamping the certified score keeps the
-        // returned score consistent with the gate decision that selected this
-        // geometry, identical to the optimized branch.
-        let mut fit = baseline.fit;
-        fit.reml_score = baseline_score;
-        let baseline_result = FittedTermCollectionWithSpec {
-            fit,
-            design: baseline.design,
-            resolvedspec: resolvedspec.clone(),
-            adaptive_diagnostics: baseline.adaptive_diagnostics,
-        };
-        return Ok(Some(baseline_result));
+            baseline_score,
+        )?));
     }
 
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
@@ -1995,6 +2013,62 @@ fn try_exact_joint_spatial_length_scale_optimization(
     };
 
     Ok(Some(optimized_result))
+}
+
+
+/// Re-fit at the frozen baseline geometry — the REML-seeded length scales and
+/// heuristic λ already certified in `best` — and stamp the certified baseline
+/// REML score onto the result.
+///
+/// This is the graceful-degradation target for the joint spatial-κ optimizer. It
+/// is reached whenever the joint refinement is not adopted: when the optimizer
+/// converges to a candidate that worsens the profiled score, *and* when it fails
+/// to converge at all (#1126). The geometry is the same baseline the parent fit
+/// started from, so it is always valid — the joint step can only ever improve on
+/// it, never block it.
+///
+/// The refit is a β/inference harvester at `best`'s lambdas and the frozen
+/// `resolvedspec`; the score that geometry was certified at is
+/// `baseline_score = fit_score(&best.fit)`. We stamp that certified value rather
+/// than the harvest's own re-derived `reml_score`, which drifts because the
+/// harvest runs the full-inference option set (and re-runs the adaptive spatial
+/// overlay) instead of the superseded baseline path that produced `best`. The
+/// spatial-κ result gate (`require_successful_spatial_optimization_result`)
+/// compares the returned fit's `fit_score` against `fit_score(&best.fit)`;
+/// without this stamp a downward drift of a few REML units on the *same*
+/// geometry spuriously reads as "the optimizer made the score worse" and aborts
+/// an otherwise-valid fit. Stamping keeps the returned score consistent with the
+/// gate decision that selected this geometry, identical to the optimized branch.
+#[allow(clippy::too_many_arguments)]
+fn fit_frozen_baseline_geometry(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    best: &FittedTermCollection,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+    baseline_score: f64,
+) -> Result<FittedTermCollectionWithSpec, EstimationError> {
+    let baseline = fit_term_collection_forspecwith_heuristic_lambdas(
+        data,
+        y,
+        weights,
+        offset,
+        resolvedspec,
+        best.fit.lambdas.as_slice(),
+        family,
+        options,
+    )?;
+    let mut fit = baseline.fit;
+    fit.reml_score = baseline_score;
+    Ok(FittedTermCollectionWithSpec {
+        fit,
+        design: baseline.design,
+        resolvedspec: resolvedspec.clone(),
+        adaptive_diagnostics: baseline.adaptive_diagnostics,
+    })
 }
 
 
@@ -2498,6 +2572,34 @@ impl<'d> SpatialJointContext<'d> {
 /// NOT a gauge direction — it controls the identifiable isotropic scale
 /// κ = exp(ψ̄). The isotropic kind carries one log-κ coordinate per term. In
 /// neither case is a sum-to-zero constraint enforced during optimization.
+/// Outcome of the joint spatial hyperparameter `(ρ, ψ/κ)` optimization.
+///
+/// The joint κ optimizer refines an *already-valid* frozen baseline geometry
+/// (the REML-seeded length scales in `best`); it is therefore best-effort. A run
+/// that does not certify a stationary point must degrade to the baseline rather
+/// than abort the parent fit (#1126), so this enum lets the caller distinguish a
+/// usable iterate from a non-convergence that should fall back to the baseline.
+/// Genuine numerical blowups (a non-finite terminal cost) still surface as
+/// `Err` from [`run_exact_joint_spatial_optimization`] and never reach here.
+enum SpatialJointOutcome {
+    /// The optimizer produced a usable iterate: it either converged to a
+    /// stationary point or its terminal iterate cleared the mgcv-style
+    /// relative-to-cost REML acceptance gate. Carries `(θ*, final_value)`.
+    Optimized {
+        theta_star: Array1<f64>,
+        final_value: f64,
+    },
+    /// The optimizer ran to a finite terminal cost but neither converged nor
+    /// cleared the relative-to-cost gate. The caller keeps the frozen baseline
+    /// geometry; the fields are diagnostics only.
+    NonConverged {
+        iterations: usize,
+        final_value: f64,
+        final_grad_norm: Option<f64>,
+    },
+}
+
+
 fn run_exact_joint_spatial_optimization(
     kind: SpatialHyperKind,
     data: ArrayView2<'_, f64>,
@@ -2515,7 +2617,7 @@ fn run_exact_joint_spatial_optimization(
     upper: &Array1<f64>,
     rho_dim: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<(Array1<f64>, f64), EstimationError> {
+) -> Result<SpatialJointOutcome, EstimationError> {
     let label = kind.label();
     // Use bounds and design metadata for validation.
     assert!(
@@ -2855,9 +2957,43 @@ fn run_exact_joint_spatial_optimization(
                 options.tol,
                 result.final_value.abs(),
             );
+        } else if result.final_value.is_finite() {
+            // The joint κ optimizer is a *refinement* layered on top of an
+            // always-valid frozen baseline geometry (the REML-seeded length
+            // scales in `best`); a run that hits the iteration cap without
+            // certifying a stationary point — and without clearing the
+            // relative-to-cost gate above — must degrade to that baseline, not
+            // abort the parent fit. The `gam` CLI fits this exact data (#1126):
+            // its looser outer tolerance (`tol=1e-6`) lets this same optimizer
+            // converge in ≤80 iters, whereas the formula/FFI path's tightened
+            // `tol=1e-10` (the #893 replication-invariance tolerance) leaves it
+            // mid-descent at the cap. Loosening the tolerance would weaken that
+            // invariant for every fit; instead we report the non-convergence and
+            // let the caller keep the baseline. The terminal cost is finite, so
+            // the iterate is well-defined — this is ordinary slow convergence,
+            // not a numerical blowup.
+            log::warn!(
+                "[{}] {} did not converge after {} iterations \
+                 (final_objective={:.6e}, final_grad_norm={}); keeping the \
+                 frozen baseline geometry instead of aborting the fit.",
+                label,
+                kind.adjective(),
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm_report(),
+            );
+            return Ok(SpatialJointOutcome::NonConverged {
+                iterations: result.iterations,
+                final_value: result.final_value,
+                final_grad_norm: result.final_grad_norm,
+            });
         } else {
+            // A non-finite terminal cost is a genuine numerical blowup (NaN/inf
+            // propagating through the gradient/Hessian wiring), not the ordinary
+            // slow convergence handled above — surface it rather than masking a
+            // real defect behind the baseline fallback.
             crate::bail_invalid_estim!(
-                "{} analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                "{} analytic optimization diverged after {} iterations (final_objective={:.6e}, final_grad_norm={})",
                 kind.adjective(),
                 result.iterations,
                 result.final_value,
@@ -2876,7 +3012,10 @@ fn run_exact_joint_spatial_optimization(
     // optimization. For the anisotropic kind the decomposition into (ψ̄, η)
     // happens later in apply_tospec.
     let theta_star = result.rho;
-    Ok((theta_star, result.final_value))
+    Ok(SpatialJointOutcome::Optimized {
+        theta_star,
+        final_value: result.final_value,
+    })
 }
 
 
