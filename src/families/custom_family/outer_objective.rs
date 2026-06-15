@@ -683,8 +683,18 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             }
             let workspace_build_started = std::time::Instant::now();
             // Get joint Hessian and block gradients from the current evaluation.
-            let hessian_workspace_for_cycle: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
-                None;
+            // Hold the cycle's exact-Newton workspace (cache of per-row kernel
+            // evaluations at the current β) so a REJECTED cycle can hand it back
+            // to `cached_joint_workspace` for the next cycle. After a reject the
+            // line search restores β to `old_beta` — exactly the β this workspace
+            // was built at — so reusing the cache is bit-identical and skips the
+            // O(n) row-kernel re-evaluation (`build_row_kernel_cache`) that
+            // otherwise reruns the full data through the per-row CDF/derivative
+            // math on every rejected cycle. The converged-exit paths below null
+            // this (no carry-forward needed once the inner solve returns).
+            let mut hessian_workspace_for_cycle: Option<
+                Arc<dyn ExactNewtonJointHessianWorkspace>,
+            > = None;
             let joint_hessian_source = if joint_workspace_requested {
                 let cached_hit = cached_joint_workspace.is_some();
                 let workspace = match cached_joint_workspace.take() {
@@ -702,6 +712,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         total_p,
                     );
                 }
+                hessian_workspace_for_cycle = workspace.clone();
                 workspace
                     .as_ref()
                     .map(|workspace| {
@@ -1741,7 +1752,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     current_stationarity_residual,
                     residual_tol,
                 );
-                cached_joint_workspace = hessian_workspace_for_cycle;
+                // Pre-line-search convergence: β did not move this cycle (the
+                // proposal was at the step-tolerance floor), so the cycle
+                // workspace is still at the converged β and the post-loop
+                // covariance/IFT assembly can reuse it instead of rebuilding the
+                // full per-row kernel cache at the same β.
+                cached_joint_workspace = hessian_workspace_for_cycle.take();
                 cycles_done = cycle;
                 converged = true;
                 break;
@@ -2470,7 +2486,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     first_likelihood_reject.as_deref().unwrap_or("none"),
                     cycle_started.elapsed().as_secs_f64(),
                 );
-                cached_joint_workspace = hessian_workspace_for_cycle;
+                // Accepted step moved β; the cycle workspace is at the OLD
+                // (pre-step) β, so it must NOT be carried into the post-loop
+                // covariance/IFT assembly (which needs the converged β). Drop it.
+                cached_joint_workspace = None;
                 cycles_done = cycle + 1;
                 break;
             }
@@ -2500,6 +2519,19 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     states[b].beta.assign(old);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
+                // β is now back at `old_beta`, the exact β this cycle's
+                // exact-Newton workspace was built at. A rejected cycle does NOT
+                // run the post-accept gradient reload (which is what otherwise
+                // re-stashes a workspace), so without this the next cycle's
+                // `cached_joint_workspace.take()` is `None` and re-streams all n
+                // rows through the per-row kernel cache build — pure redundancy
+                // at the identical β. Hand the still-valid workspace back so the
+                // next cycle hits the cache. Bit-identical: same family, same β,
+                // so the rebuilt cache would be byte-for-byte this one; the inner
+                // solve still re-derives the Newton step and runs to its KKT
+                // certificate unchanged. On the loop-exit `break`s below this is
+                // a harmless assignment to a value that is then dropped.
+                cached_joint_workspace = hessian_workspace_for_cycle.take();
                 // If the previous cycle's bookkeeping certified KKT
                 // stationarity (residual ≤ tol and objective change ≤
                 // tol), the line-search failure here is round-off on a
