@@ -867,58 +867,93 @@ fn canonicalize_for_identifiability_inner(
             col_off += p_b;
         }
 
-        // Build J_can = J_pre · T_full where T_full = blockdiag(T_i).
-        let mut j_can = Array2::<f64>::zeros((nk, p_total_red));
-        let mut raw_col_off = 0usize;
-        let mut red_col_off = 0usize;
-        for t_i in per_block_transform.iter() {
-            let p_i = t_i.nrows();
-            let r_i = t_i.ncols();
-            if p_i > 0 && r_i > 0 {
-                // J_can[:, red_col_off .. red_col_off+r_i]
-                //   = J_pre[:, raw_col_off .. raw_col_off+p_i] · T_i
-                for row in 0..nk {
-                    for out_col in 0..r_i {
-                        let mut acc = 0.0_f64;
-                        for in_col in 0..p_i {
-                            acc += j_pre[[row, raw_col_off + in_col]] * t_i[[in_col, out_col]];
+        // ── Identity-T fast path (exact, data-independent) ──────────────────
+        //
+        // Each `T_i` is a column-SELECTION matrix built from the surviving
+        // columns `kept`: when no column was dropped from block `i`, `kept`
+        // is `0..p_i` and `T_i` is the `p_i × p_i` identity. When *every*
+        // block kept all its columns AND no orthogonalisation ran, the joint
+        // `T_full = blockdiag(T_i)` is the `p_total_raw × p_total_raw`
+        // identity, hence `J_can = J_pre · I = J_pre` IDENTICALLY for any
+        // data. The post-T rank invariant `rank(J_can) == rank(J_pre)` is then
+        // satisfied by construction — `I` preserves rank for every matrix — so
+        // the two ~O(nk·p²) RRQRs and the J_can materialisation are pure
+        // redundant work. This is the biobank common case (clean full-rank
+        // design, no aliases): at n=326k, p=85 the skipped J_can build + double
+        // RRQR is the ~10s that dominated the canonicalise stage (#1110 perf).
+        //
+        // Correctness is INDEPENDENT of the row data: the skip is gated only on
+        // the structural shape of T (every block square). When ANY block
+        // dropped a column the transform genuinely reduces width and we fall
+        // through to the full materialise-and-RRQR verification below.
+        let t_is_identity = per_block_transform.iter().all(|t| t.nrows() == t.ncols());
+
+        // On the identity path `J_can ≡ J_pre`, so the MAP uniqueness check
+        // (which consumes the reduced-coordinate Jacobian) reads `j_pre`
+        // directly; on the reducing path it reads the materialised `j_can`.
+        let mut j_can_reduced: Option<Array2<f64>> = None;
+
+        if t_is_identity {
+            log::info!(
+                "[CANON] post-T invariant: T=identity (all blocks full-width) — \
+                 J_can≡J_pre, rank preserved by construction; skipping J_can \
+                 materialise + double RRQR (p_raw={p_total_raw} p_red={p_total_red} k={k})",
+            );
+        } else {
+            // Build J_can = J_pre · T_full where T_full = blockdiag(T_i).
+            let mut j_can = Array2::<f64>::zeros((nk, p_total_red));
+            let mut raw_col_off = 0usize;
+            let mut red_col_off = 0usize;
+            for t_i in per_block_transform.iter() {
+                let p_i = t_i.nrows();
+                let r_i = t_i.ncols();
+                if p_i > 0 && r_i > 0 {
+                    // J_can[:, red_col_off .. red_col_off+r_i]
+                    //   = J_pre[:, raw_col_off .. raw_col_off+p_i] · T_i
+                    for row in 0..nk {
+                        for out_col in 0..r_i {
+                            let mut acc = 0.0_f64;
+                            for in_col in 0..p_i {
+                                acc += j_pre[[row, raw_col_off + in_col]] * t_i[[in_col, out_col]];
+                            }
+                            j_can[[row, red_col_off + out_col]] = acc;
                         }
-                        j_can[[row, red_col_off + out_col]] = acc;
                     }
                 }
+                raw_col_off += p_i;
+                red_col_off += r_i;
             }
-            raw_col_off += p_i;
-            red_col_off += r_i;
-        }
 
-        // RRQR rank on J_pre and J_can.
-        let rank_j_pre = rrqr_with_permutation(&j_pre, default_rrqr_rank_alpha())
-            .map(|r| r.rank)
-            .unwrap_or(0);
-        let rank_j_can = rrqr_with_permutation(&j_can, default_rrqr_rank_alpha())
-            .map(|r| r.rank)
-            .unwrap_or(0);
+            // RRQR rank on J_pre and J_can.
+            let rank_j_pre = rrqr_with_permutation(&j_pre, default_rrqr_rank_alpha())
+                .map(|r| r.rank)
+                .unwrap_or(0);
+            let rank_j_can = rrqr_with_permutation(&j_can, default_rrqr_rank_alpha())
+                .map(|r| r.rank)
+                .unwrap_or(0);
 
-        log::info!(
-            "[CANON] post-T invariant: rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
-             (p_raw={p_total_raw} p_red={p_total_red} k={k})",
-        );
+            log::info!(
+                "[CANON] post-T invariant: rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
+                 (p_raw={p_total_raw} p_red={p_total_red} k={k})",
+            );
 
-        if rank_j_pre != rank_j_can {
-            let block_shapes: Vec<String> = per_block_transform
-                .iter()
-                .zip(specs.iter())
-                .map(|(t, s)| format!("{}:({},{})", s.name, t.nrows(), t.ncols()))
-                .collect();
-            return Err(CustomFamilyError::DimensionMismatch {
-                reason: format!(
-                    "canonicalize_for_identifiability: post-T rank invariant violated — \
-                     rank(J)={rank_j_pre} but rank(J_can)={rank_j_can} \
-                     (p_raw={p_total_raw} p_red={p_total_red} k={k}); \
-                     this is a bug in T construction; per-block T shapes: [{}]",
-                    block_shapes.join(", "),
-                ),
-            });
+            if rank_j_pre != rank_j_can {
+                let block_shapes: Vec<String> = per_block_transform
+                    .iter()
+                    .zip(specs.iter())
+                    .map(|(t, s)| format!("{}:({},{})", s.name, t.nrows(), t.ncols()))
+                    .collect();
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "canonicalize_for_identifiability: post-T rank invariant violated — \
+                         rank(J)={rank_j_pre} but rank(J_can)={rank_j_can} \
+                         (p_raw={p_total_raw} p_red={p_total_red} k={k}); \
+                         this is a bug in T construction; per-block T shapes: [{}]",
+                        block_shapes.join(", "),
+                    ),
+                });
+            }
+            j_can_reduced = Some(j_can);
         }
 
         // ── MAP uniqueness check ──────────────────────────────────────────
@@ -965,8 +1000,12 @@ fn canonicalize_for_identifiability_inner(
             // null space, those extra rows could only shrink it relative to the
             // flat view.  Using the full J_can gives the tightest (most
             // conservative) null-space detection.
+            // When `T = identity` (the fast path above did not materialise
+            // `j_can`) the reduced Jacobian equals `j_pre` exactly, so the
+            // check reads `j_pre`; otherwise it reads the reduced `j_can`.
+            let j_for_map = j_can_reduced.as_ref().unwrap_or(&j_pre);
             crate::solver::identifiability_audit::check_map_uniqueness(
-                &j_can,
+                j_for_map,
                 &[],
                 &s_joint,
                 &reduced_specs,
