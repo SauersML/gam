@@ -463,6 +463,30 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     ) -> Option<Result<Array2<f64>, String>> {
         None
     }
+
+    /// Optional BLAS-3 fast path for the dense joint Hessian assembly
+    /// `H = Σ_i w_i · Jᵢᵀ Hᵢ Jᵢ` from the cached per-row `K×K` Hessians.
+    ///
+    /// The generic [`row_kernel_hessian_dense`] scatters every row's `K×K`
+    /// block through `add_pullback_hessian` — a per-row rank-`K` BLAS-1 update
+    /// into the dense `p×p` accumulator. For the rigid marginal-slope kernel
+    /// that is `n·p²` scalar work that never reaches a BLAS-3 kernel; it is the
+    /// base-Hessian leg of the post-gradient-reload Jeffreys/Firth residual
+    /// term (`custom_family_joint_jeffreys_term` first materializes the
+    /// observed joint Hessian, then its directional derivatives). A kernel whose
+    /// pullback is a pure design-row Gram can instead gather the per-row
+    /// contraction weights and close each row chunk with `Xᵀ diag(w) X`
+    /// BLAS-3 products. The default returns `None`, preserving the exact generic
+    /// per-row path for every other kernel bit-for-bit. Overrides should claim
+    /// only the full-data unit-weight `RowSet::All` case; under a subsample /
+    /// non-unit-weight `RowSet` return `None` so the generic HT path runs.
+    fn hessian_dense_override(
+        &self,
+        _rows: &RowSet,
+        _row_hessians: &[[[f64; K]; K]],
+    ) -> Option<Array2<f64>> {
+        None
+    }
 }
 
 fn row_kernel_jacobian_action_matrix_generic<const K: usize>(
@@ -815,6 +839,9 @@ pub fn row_kernel_hessian_dense<const K: usize>(
     cache: &RowKernelCache<K>,
     rows: &RowSet,
 ) -> Array2<f64> {
+    if let Some(dense) = kern.hessian_dense_override(rows, &cache.hessians) {
+        return dense;
+    }
     let p = cache.p;
     rows.par_reduce_fold(
         cache.n,

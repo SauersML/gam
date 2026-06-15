@@ -3,6 +3,81 @@ use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::*;
+use crate::util::fnv::Fnv1a;
+use std::sync::{Mutex, OnceLock};
+
+// ── Same-β rigid third/fourth-tensor cache ───────────────────────────
+//
+// The rigid coord_corrections (IFT Hessian-drift) path builds a per-row
+// uncontracted third-derivative tensor over ALL n rows, and the outer-Hessian
+// path builds the per-row fourth tensor likewise. A FRESH `BernoulliRigidRowKernel`
+// (empty `RayonSafeOnce` slots) is constructed on every outer eval
+// (`exact_newton_joint_hessian_workspace*`), so at biobank scale (n≈3e5) the
+// closed-form per-row jet re-runs over every row each eval — the dominant REML
+// `coord_corrections` cost. The tensors are a pure function of the family/data
+// identity and the coefficient state (block β + η), exactly like the same-β
+// exact-cache (`SharedExactCacheStore`); mirror it with a module-level FIFO-2
+// store so the immediate Value→ValueAndGradient pair at one β̂, and any
+// line-search ρ that maps back to a seen β̂, reuse a single n-row build instead
+// of rebuilding. Reuse is gated on exact byte-equality of a content
+// fingerprint over the data-buffer Arc identities, the frailty/latent/deviation
+// discriminants, and every block's β + η, so a hit returns an `Arc` to a
+// bit-identical tensor (or misses).
+type RigidThirdFull = Vec<[[[f64; 2]; 2]; 2]>;
+type RigidFourthFull = Vec<[[[[f64; 2]; 2]; 2]; 2]>;
+
+struct SharedRigidTensorStore {
+    third: Vec<(u64, Arc<RigidThirdFull>)>,
+    fourth: Vec<(u64, Arc<RigidFourthFull>)>,
+}
+
+impl SharedRigidTensorStore {
+    const CAPACITY: usize = 2;
+
+    fn get_third(&self, fp: u64) -> Option<Arc<RigidThirdFull>> {
+        self.third
+            .iter()
+            .find(|(key, _)| *key == fp)
+            .map(|(_, v)| Arc::clone(v))
+    }
+
+    fn insert_third(&mut self, fp: u64, value: Arc<RigidThirdFull>) {
+        if self.third.iter().any(|(key, _)| *key == fp) {
+            return;
+        }
+        if self.third.len() >= Self::CAPACITY {
+            self.third.remove(0);
+        }
+        self.third.push((fp, value));
+    }
+
+    fn get_fourth(&self, fp: u64) -> Option<Arc<RigidFourthFull>> {
+        self.fourth
+            .iter()
+            .find(|(key, _)| *key == fp)
+            .map(|(_, v)| Arc::clone(v))
+    }
+
+    fn insert_fourth(&mut self, fp: u64, value: Arc<RigidFourthFull>) {
+        if self.fourth.iter().any(|(key, _)| *key == fp) {
+            return;
+        }
+        if self.fourth.len() >= Self::CAPACITY {
+            self.fourth.remove(0);
+        }
+        self.fourth.push((fp, value));
+    }
+}
+
+fn shared_rigid_tensor_store() -> &'static Mutex<SharedRigidTensorStore> {
+    static STORE: OnceLock<Mutex<SharedRigidTensorStore>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        Mutex::new(SharedRigidTensorStore {
+            third: Vec::with_capacity(SharedRigidTensorStore::CAPACITY),
+            fourth: Vec::with_capacity(SharedRigidTensorStore::CAPACITY),
+        })
+    })
+}
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
 
@@ -18,14 +93,17 @@ pub(super) struct BernoulliRigidRowKernel {
     /// across the full ext-dim sweep, instead of once per (row, ψ-axis) pair.
     /// Per-axis `row_third_contracted` becomes
     /// a 2×2 bilinear contraction against the cached tensor.
-    pub(super) third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
+    /// Holds an `Arc` to the (possibly globally-shared, same-β) tensor so a
+    /// cross-eval hit in [`shared_rigid_tensor_store`] is stored here once and
+    /// then served `O(1)` to every ψ-axis operator that consults this kernel.
+    pub(super) third_full_cache: crate::resource::RayonSafeOnce<Arc<RigidThirdFull>>,
     /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian
     /// analogue of `third_full_cache`. The second-directional-derivative
     /// operator's trace path touches every row × (u, v) pair; with this
     /// cache the heavy 8-direction empirical jet (or closed-form 5-component
     /// build) runs at most once per row, leaving each pair with a cheap
     /// [`contract_fourth_full`] bilinear.
-    pub(super) fourth_full_cache: crate::resource::RayonSafeOnce<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
+    pub(super) fourth_full_cache: crate::resource::RayonSafeOnce<Arc<RigidFourthFull>>,
 }
 
 impl BernoulliRigidRowKernel {
