@@ -162,7 +162,8 @@ pub(crate) use gam::terms::linear_dictionary::{
 pub(crate) use gam::terms::sae_manifold::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SPHERE_CHART_PENALTY_DIAGONAL,
-    SaeAtomBasisKind, SaeBasisSecondJet, SaeManifoldRho, ScheduleKind, SphereChartEvaluator,
+    SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldRho, ScheduleKind,
+    SphereChartEvaluator,
     TorusHarmonicEvaluator, sphere_chart_basis_jet, term_from_padded_blocks_with_mode,
 };
 

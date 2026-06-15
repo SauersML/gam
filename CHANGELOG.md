@@ -1,3 +1,15 @@
+## gamfit 0.1.217 (2026-06-15)
+
+- **Build fix**: re-export `SaeBasisEvaluator` in the pyffi prelude. The #1117 SAE
+  fix retyped evaluators to `dyn SaeBasisSecondJet`; calling its supertrait
+  `.evaluate()` needs `SaeBasisEvaluator` in scope, which broke the 0.1.216 wheel.
+- Perf sweep continues: n-independent outer loop (eliminate redundant ext-coord
+  n-row drift re-streams), SIMD-batched rigid per-row jet, GPU-routed rigid
+  `XᵀWX` Gram when CUDA present (CPU fallback otherwise), cross-disease duchon
+  basis+identifiability cache (build once for the shared cohort, not 17×), and
+  the BLAS-3 batched all-axes second-directional override (~p× on the dominant
+  coord_corrections term).
+
 ## gamfit 0.1.216 (2026-06-15)
 
 Open-issue bug fixes + inner-solve perf:
