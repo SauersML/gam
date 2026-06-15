@@ -557,12 +557,15 @@ pub fn reml_laml_evaluate(
             );
             // Named heartbeat scope so the active-scope line attributes the
             // coord_corrections wall time (the biobank's dominant REML stage).
-            let _coord_corr_scope = crate::heartbeat::track_scope(format!(
+            let coord_corr_scope = crate::heartbeat::track_scope(format!(
                 "reml_laml coord_corrections batched k={k} ext_dim={ext_dim} n={} dim={}",
                 solution.n_observations,
                 hop.dim()
             ));
-            effective_deriv.hessian_derivative_corrections_result(&correction_vs)?
+            let coord_corrections_result =
+                effective_deriv.hessian_derivative_corrections_result(&correction_vs);
+            drop(coord_corr_scope);
+            coord_corrections_result?
         } else {
             // Fallback for providers without a fused hook: each
             // `hessian_derivative_correction_result` is an `Xᵀ·diag(c⊙Xvₖ)·X`

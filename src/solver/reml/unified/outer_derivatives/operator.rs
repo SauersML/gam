@@ -321,12 +321,6 @@ pub(crate) struct OuterHessianCoord {
     pub(crate) b_depends_on_beta: bool,
 }
 
-impl OuterHessianCoord {
-    pub(crate) fn is_ext(&self) -> bool {
-        self.ext_index.is_some()
-    }
-}
-
 pub(crate) struct UnifiedOuterHessianOperator {
     pub(crate) hop: Arc<dyn HessianOperator>,
     pub(crate) coords: Vec<OuterHessianCoord>,

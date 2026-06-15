@@ -206,7 +206,7 @@ impl BernoulliRigidRowKernel {
                 // build is the rigid coord_corrections cost suspect (one n-row
                 // pass per distinct β̂; reused across the Value/Gradient pair and
                 // line-search re-probes via the same-β store).
-                let _scope = crate::heartbeat::track_scope(format!(
+                let scope_guard = crate::heartbeat::track_scope(format!(
                     "BMS rigid third_full_cache build n={n}"
                 ));
                 let built: RigidThirdFull = (0..n)
@@ -227,6 +227,7 @@ impl BernoulliRigidRowKernel {
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on third write")
                     .insert_third(fp, Arc::clone(&shared));
+                drop(scope_guard);
                 shared
             })
             .as_slice()
@@ -251,7 +252,7 @@ impl BernoulliRigidRowKernel {
                     return hit;
                 }
                 let n = self.family.y.len();
-                let _scope = crate::heartbeat::track_scope(format!(
+                let scope_guard = crate::heartbeat::track_scope(format!(
                     "BMS rigid fourth_full_cache build n={n}"
                 ));
                 let built: RigidFourthFull = (0..n)
@@ -272,6 +273,7 @@ impl BernoulliRigidRowKernel {
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on fourth write")
                     .insert_fourth(fp, Arc::clone(&shared));
+                drop(scope_guard);
                 shared
             })
             .as_slice()

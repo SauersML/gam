@@ -458,10 +458,15 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// the generic Horvitz-Thompson per-row path runs.
     fn directional_derivative_dense_override(
         &self,
-        _rows: &RowSet,
-        _d_beta: &[f64],
+        rows: &RowSet,
+        d_beta: &[f64],
     ) -> Option<Result<Array2<f64>, String>> {
-        None
+        // Default = the exact generic per-row path, which consumes `rows`/`d_beta`.
+        // A kernel with a BLAS-3 fast path overrides this (see the rigid impl);
+        // returning `Some` here keeps the dispatcher's fall-through reserved for
+        // an override that explicitly declines (returns `None`) on a row-set it
+        // cannot accelerate.
+        Some(row_kernel_directional_derivative_generic(self, rows, d_beta))
     }
 
     /// Optional BLAS-3 fast path for the dense joint Hessian assembly
@@ -482,10 +487,14 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// non-unit-weight `RowSet` return `None` so the generic HT path runs.
     fn hessian_dense_override(
         &self,
-        _rows: &RowSet,
-        _row_hessians: &[[[f64; K]; K]],
+        rows: &RowSet,
+        row_hessians: &[[[f64; K]; K]],
     ) -> Option<Array2<f64>> {
-        None
+        // Default = the exact generic per-row pullback, which consumes
+        // `rows`/`row_hessians`. A kernel with a BLAS-3 fast path overrides this;
+        // returning `Some` keeps the dispatcher fall-through reserved for an
+        // override that declines (`None`) on a row-set it cannot accelerate.
+        Some(row_kernel_hessian_dense_generic(self, rows, row_hessians))
     }
 }
 
@@ -842,15 +851,28 @@ pub fn row_kernel_hessian_dense<const K: usize>(
     if let Some(dense) = kern.hessian_dense_override(rows, &cache.hessians) {
         return dense;
     }
-    let p = cache.p;
+    row_kernel_hessian_dense_generic(kern, rows, &cache.hessians)
+}
+
+/// Generic per-row dense joint-Hessian pullback `H = Σ_i w_i · Jᵢᵀ Hᵢ Jᵢ`.
+/// This is the default body of [`RowKernel::hessian_dense_override`] and the
+/// dispatcher fall-through; a kernel with a BLAS-3 fast path overrides the hook
+/// and may still call this for row-sets it does not accelerate.
+pub fn row_kernel_hessian_dense_generic<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    rows: &RowSet,
+    row_hessians: &[[[f64; K]; K]],
+) -> Array2<f64> {
+    let p = kern.n_coefficients();
+    let n = row_hessians.len();
     rows.par_reduce_fold(
-        cache.n,
+        n,
         || Array2::<f64>::zeros((p, p)),
         |mut acc, row, w| {
             if w == 1.0 {
-                kern.add_pullback_hessian(row, &cache.hessians[row], &mut acc);
+                kern.add_pullback_hessian(row, &row_hessians[row], &mut acc);
             } else {
-                let h = &cache.hessians[row];
+                let h = &row_hessians[row];
                 let mut scaled = [[0.0_f64; K]; K];
                 for a in 0..K {
                     for b in 0..K {
@@ -879,6 +901,18 @@ pub fn row_kernel_directional_derivative<const K: usize>(
     if let Some(result) = kern.directional_derivative_dense_override(rows, d_beta) {
         return result;
     }
+    row_kernel_directional_derivative_generic(kern, rows, d_beta)
+}
+
+/// Generic per-row first directional derivative of the Hessian ∂H/∂β[d_beta].
+/// Default body of [`RowKernel::directional_derivative_dense_override`] and the
+/// dispatcher fall-through; a kernel with a BLAS-3 fast path overrides the hook
+/// and may still call this for row-sets it does not accelerate.
+pub fn row_kernel_directional_derivative_generic<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    rows: &RowSet,
+    d_beta: &[f64],
+) -> Result<Array2<f64>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
     kern.warm_up_directional_caches()?;
