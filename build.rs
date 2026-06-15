@@ -3069,73 +3069,198 @@ const MAX_TRACKED_FILE_LINES: usize = 10_000;
 /// Cached result of [`collect_repo_files`].
 static REPO_FILES: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
-/// Walk every repo file once, skipping build artifacts and toolchain caches.
-/// Replaces a `git ls-files` shell-out that hard-panicked the build inside
-/// maturin's manylinux / musllinux Docker images — the bind-mounted source tree
-/// trips `safe.directory` checks there and git returns non-zero. Reading the
-/// filesystem makes the audit hermetic and also catches oversized /
-/// mechanically-split files before commit rather than only after.
+/// Tracked-file list for the line-count and mechanical-part-name audits, read
+/// directly from `.git/index`.
+///
+/// History: the audits originally shelled out to `git ls-files`, but that
+/// panicked inside maturin's manylinux / musllinux Docker images (the
+/// bind-mounted source tree trips git's `safe.directory` check and the
+/// command returns non-zero). A naive replacement that walked the filesystem
+/// then broke the wheel build a different way: GitHub Actions steps install
+/// CUDA into the workspace at `<root>/cuda_installer-*`, and that 16M-line
+/// installer blob is neither a build artifact nor in `.gitignore`, so the
+/// line-count audit flagged it and failed the build.
+///
+/// Parsing `.git/index` directly avoids both failure modes: no dependency on
+/// the `git` binary or its `safe.directory` config, and the canonical
+/// definition of "what belongs to this repo" — the index, i.e. the staged
+/// tree — naturally excludes anything CI dropped into the workspace.
 fn collect_repo_files(root: &Path) -> &'static [PathBuf] {
     REPO_FILES
-        .get_or_init(|| {
-            let mut out = Vec::new();
-            collect_repo_files_into(root, root, &mut out);
-            out
-        })
+        .get_or_init(|| read_git_index_tracked_files(root))
         .as_slice()
 }
 
-fn collect_repo_files_into(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
-    let read = match fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
-        // Skip exactly the same housekeeping noise the other tree walkers
-        // (`collect_scannable_files`, `scan_for_vendor_directories`) skip, so
-        // the three audits agree on what counts as a repo file.
-        if (name.starts_with('.') && name != ".github")
-            || name == "target"
-            || name.starts_with("target-")
-            || name == "node_modules"
-            || name == "__pycache__"
-            || name == "pydeps"
-            || name == "site-packages"
-            || name == "venv"
-            || name == "dist"
-            || name == "build"
-            || name == "site"
-        {
-            continue;
-        }
-        if path
-            .strip_prefix(root)
-            .ok()
-            .is_some_and(|rel| rel.starts_with("bench/runtime/pydeps"))
-        {
-            continue;
-        }
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if file_type.is_dir() {
-            collect_repo_files_into(root, &path, out);
-            continue;
-        }
-        // Treat symlinks like regular files: count their target as a tracked
-        // entity. A broken-symlink `fs::read_to_string` later turns into an
-        // ignored NotFound at the size-audit site, matching the previous
-        // git-driven behaviour for files that disappeared between listing and
-        // reading.
-        if file_type.is_file() || file_type.is_symlink() {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_path_buf());
-            }
-        }
+/// Resolve the path of `.git/index`, following the worktree pointer if `.git`
+/// is a file (`gitdir: <path>`) rather than a directory.
+fn locate_git_index(root: &Path) -> PathBuf {
+    let git = root.join(".git");
+    let meta = fs::metadata(&git)
+        .unwrap_or_else(|err| panic!("failed to stat {} for tracked-file audit: {err}", git.display()));
+    if meta.is_dir() {
+        return git.join("index");
     }
+    // `.git` is a file in linked worktrees / submodules; first line is
+    // `gitdir: <absolute or relative path to the real gitdir>`.
+    let pointer = fs::read_to_string(&git).unwrap_or_else(|err| {
+        panic!("failed to read worktree pointer {}: {err}", git.display())
+    });
+    let gitdir = pointer
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir:"))
+        .map(|rest| rest.trim())
+        .unwrap_or_else(|| panic!("worktree pointer at {} missing gitdir line", git.display()));
+    let gitdir_path = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        root.join(gitdir)
+    };
+    gitdir_path.join("index")
+}
+
+fn read_git_index_tracked_files(root: &Path) -> Vec<PathBuf> {
+    let index_path = locate_git_index(root);
+    let bytes = fs::read(&index_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read git index for tracked-file audit ({}): {err}",
+            index_path.display()
+        )
+    });
+    parse_git_index(&bytes).unwrap_or_else(|err| {
+        panic!(
+            "failed to parse git index at {}: {err}",
+            index_path.display()
+        )
+    })
+}
+
+/// Parse the on-disk git index (v2, v3, v4) and return one repo-relative
+/// `PathBuf` per stage-0 entry. Index format reference:
+/// `Documentation/gitformat-index.txt` in the git source tree.
+fn parse_git_index(bytes: &[u8]) -> Result<Vec<PathBuf>, String> {
+    if bytes.len() < 12 {
+        return Err(format!("index too short for header: {} bytes", bytes.len()));
+    }
+    if &bytes[0..4] != b"DIRC" {
+        return Err(format!("bad signature {:?}", &bytes[0..4]));
+    }
+    let version = u32::from_be_bytes(bytes[4..8].try_into().expect("4-byte slice"));
+    if !matches!(version, 2 | 3 | 4) {
+        return Err(format!("unsupported index version {version}"));
+    }
+    let count = u32::from_be_bytes(bytes[8..12].try_into().expect("4-byte slice")) as usize;
+    let mut out: Vec<PathBuf> = Vec::with_capacity(count);
+    let mut pos = 12usize;
+    let mut prev_path: Vec<u8> = Vec::new();
+    for entry_idx in 0..count {
+        let entry_start = pos;
+        // 62-byte fixed prefix: ctime/mtime (16) + dev/ino/mode/uid/gid/size (24) +
+        // sha1 (20) + flags (2).
+        if bytes.len() < pos + 62 {
+            return Err(format!("truncated entry {entry_idx} fixed header"));
+        }
+        let flags = u16::from_be_bytes(
+            bytes[pos + 60..pos + 62]
+                .try_into()
+                .expect("2-byte slice"),
+        );
+        pos += 62;
+        let extended = (flags & 0x4000) != 0;
+        if extended {
+            if version < 3 {
+                return Err(format!("entry {entry_idx} has extended flag in v{version}"));
+            }
+            if bytes.len() < pos + 2 {
+                return Err(format!("truncated entry {entry_idx} extended flags"));
+            }
+            pos += 2;
+        }
+        let stage = ((flags >> 12) & 0x3) as u8;
+        let name_len_hint = (flags & 0x0FFF) as usize;
+
+        let path_bytes: Vec<u8>;
+        if version == 4 {
+            // v4 path compression: chop N bytes off the previous path, then
+            // append a NUL-terminated suffix. No trailing padding.
+            let (chop, consumed) = decode_index_varint(&bytes[pos..])
+                .map_err(|e| format!("entry {entry_idx} varint: {e}"))?;
+            pos += consumed;
+            let keep = prev_path
+                .len()
+                .checked_sub(chop)
+                .ok_or_else(|| format!(
+                    "entry {entry_idx} v4 underflow: prev={} chop={chop}",
+                    prev_path.len()
+                ))?;
+            let nul_offset = bytes[pos..]
+                .iter()
+                .position(|b| *b == 0)
+                .ok_or_else(|| format!("entry {entry_idx} missing NUL after v4 suffix"))?;
+            let mut p = Vec::with_capacity(keep + nul_offset);
+            p.extend_from_slice(&prev_path[..keep]);
+            p.extend_from_slice(&bytes[pos..pos + nul_offset]);
+            pos += nul_offset + 1;
+            path_bytes = p;
+        } else {
+            // v2/v3: name is name_len_hint bytes (or longer if the hint is
+            // saturated at 0xFFF), followed by 1-8 NUL bytes padding the
+            // entry to a multiple of 8 from `entry_start`.
+            let name_end = if name_len_hint < 0x0FFF
+                && bytes.len() >= pos + name_len_hint + 1
+                && bytes[pos + name_len_hint] == 0
+            {
+                pos + name_len_hint
+            } else {
+                pos + bytes[pos..]
+                    .iter()
+                    .position(|b| *b == 0)
+                    .ok_or_else(|| format!("entry {entry_idx} missing NUL terminator"))?
+            };
+            path_bytes = bytes[pos..name_end].to_vec();
+            pos = name_end;
+            // Skip 1-8 padding NULs so the entry length is a multiple of 8.
+            let raw = pos - entry_start;
+            let pad = if raw % 8 == 0 { 8 } else { 8 - (raw % 8) };
+            pos += pad;
+        }
+
+        prev_path = path_bytes.clone();
+
+        // Stage 0 = ordinary tracked file; stages 1/2/3 are conflict variants
+        // of the same path. Take stage 0 only so the audit sees each path once.
+        if stage != 0 {
+            continue;
+        }
+        let path_str = std::str::from_utf8(&path_bytes)
+            .map_err(|_| format!("entry {entry_idx} path is not UTF-8"))?;
+        out.push(PathBuf::from(path_str));
+    }
+    Ok(out)
+}
+
+/// Decode the offset-style variable-length integer used by index v4 to encode
+/// the number of bytes to chop off the previous path. Mirrors
+/// `decode_varint` in git's `read-cache.c`. Returns (value, bytes_consumed).
+fn decode_index_varint(buf: &[u8]) -> Result<(usize, usize), String> {
+    let mut consumed = 0usize;
+    if consumed >= buf.len() {
+        return Err("empty buffer".to_string());
+    }
+    let mut c = buf[consumed];
+    consumed += 1;
+    let mut value = (c & 0x7F) as usize;
+    while c & 0x80 != 0 {
+        if consumed >= buf.len() {
+            return Err("truncated varint".to_string());
+        }
+        value += 1;
+        value <<= 7;
+        c = buf[consumed];
+        consumed += 1;
+        value |= (c & 0x7F) as usize;
+    }
+    Ok((value, consumed))
 }
 
 fn scan_for_oversized_tracked_files(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
