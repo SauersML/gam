@@ -106,7 +106,7 @@ pub(crate) fn capture_fit_artifact<F: CustomFamily + ?Sized>(
     converged: bool,
 ) {
     let family_kind = type_name::<F>();
-    let (n_rows, _names, _dims) = custom_family_cache_shape(specs);
+    let (n_rows, ..) = custom_family_cache_shape(specs);
     if reduced_block_beta.len() != specs.len() || gauge.n_blocks() != specs.len() {
         return;
     }
@@ -213,7 +213,7 @@ pub(crate) fn consume_fit_artifact<F: CustomFamily + ?Sized>(
     rho_default: &Array1<f64>,
 ) -> Option<ConstrainedWarmStart> {
     let family_kind = type_name::<F>();
-    let (n_rows, _names, _dims) = custom_family_cache_shape(specs);
+    let (n_rows, ..) = custom_family_cache_shape(specs);
     let descriptor = descriptor_for(specs, family_kind, n_rows);
     let key_hex = descriptor.descriptor_key().to_hex();
     let parent = crate::solver::persistent_warm_start::load_fit_artifact_by_descriptor(&key_hex)?;
