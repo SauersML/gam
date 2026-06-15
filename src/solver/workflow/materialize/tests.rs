@@ -1608,3 +1608,78 @@ fn binomial_location_scale_engine_matches_reference_flow() {
         "a wiggle refit must populate beta_link_wiggle (block 2 present)"
     );
 }
+
+#[test]
+fn resolve_family_accepts_mgcv_parenthesized_family_link_syntax() {
+    // mgcv writes GLM families in R as `family(link)` — `binomial(logit)`,
+    // `gaussian(identity)`, `Binomial(Probit)`. Three tests in-repo pass
+    // `family: Some("binomial(logit)".to_string())` straight through to the
+    // resolver (`sphere_logit_predict_finite_at_pole`, `sphere_binomial_*`),
+    // and would otherwise be rejected as `unknown family`.
+    use crate::solver::workflow::resolve_family;
+    use crate::types::{
+        InverseLink, LinkFunction, ResponseColumnKind, ResponseFamily, StandardLink,
+    };
+    let y = ndarray::array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+    for raw in [
+        "binomial(logit)",
+        "Binomial(Logit)",
+        "binomial(LOGIT)",
+        "binomial( logit )",
+        "binomial_logit",
+        "binomial-logit",
+    ] {
+        let spec = resolve_family(
+            Some(raw),
+            None,
+            None,
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .unwrap_or_else(|err| panic!("resolve_family({raw:?}) failed: {err}"));
+        assert!(
+            matches!(spec.response, ResponseFamily::Binomial),
+            "{raw}: expected Binomial response"
+        );
+        assert_eq!(
+            spec.link.link_function(),
+            LinkFunction::Logit,
+            "{raw}: expected logit link"
+        );
+    }
+    let probit = resolve_family(
+        Some("binomial(probit)"),
+        None,
+        None,
+        y.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect("binomial(probit) resolves");
+    assert_eq!(probit.link.link_function(), LinkFunction::Probit);
+    let cloglog = resolve_family(
+        Some("Binomial(CLogLog)"),
+        None,
+        None,
+        y.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect("binomial(cloglog) resolves");
+    assert_eq!(cloglog.link.link_function(), LinkFunction::CLogLog);
+    let nb = resolve_family(
+        Some("negative_binomial(log)"),
+        None,
+        None,
+        ndarray::array![0.0, 1.0, 2.0, 3.0].view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect("negative_binomial(log) resolves");
+    assert!(matches!(
+        nb.response,
+        ResponseFamily::NegativeBinomial { .. }
+    ));
+    assert!(matches!(nb.link, InverseLink::Standard(StandardLink::Log)));
+}

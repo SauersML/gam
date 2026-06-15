@@ -232,8 +232,24 @@ pub fn resolve_family(
     let explicit: Option<(LikelihoodSpec, bool)> = match family {
         Some(name) => {
             // Accept both '-' and '_' as separators so e.g. "binomial_logit" and
-            // "negative-binomial" resolve identically. Canonicalize to '-'.
-            let canonical = name.to_ascii_lowercase().replace('_', "-");
+            // "negative-binomial" resolve identically. Also accept mgcv's
+            // parenthesized form `family(link)` (e.g. "binomial(logit)",
+            // "Binomial(Probit)") which is how mgcv writes a GLM family with an
+            // explicit link in R. Canonicalize all forms to `family-link`.
+            let lowered = name.to_ascii_lowercase().replace('_', "-");
+            let canonical = if let Some(open) = lowered.find('(')
+                && lowered.ends_with(')')
+            {
+                let head = lowered[..open].trim_end_matches('-').trim();
+                let inner = lowered[open + 1..lowered.len() - 1].trim();
+                if head.is_empty() || inner.is_empty() {
+                    lowered.clone()
+                } else {
+                    format!("{head}-{inner}")
+                }
+            } else {
+                lowered
+            };
             let resolved = match canonical.as_str() {
                 "gaussian" => (
                     LikelihoodSpec::new(
