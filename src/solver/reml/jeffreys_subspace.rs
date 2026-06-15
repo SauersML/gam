@@ -1224,83 +1224,6 @@ where
     Ok(Some(out))
 }
 
-#[cfg(test)]
-mod hphi_directional_oracle_tests {
-    use super::*;
-
-    /// Exact directional derivative `D_β H_Φ[δ]` of the Tier-B Gauss-Newton Jeffreys
-/// curvature surrogate along a coefficient-space direction `δ` (`delta`).
-///
-/// CONTEXT (the outer-REML drift this exists to supply). The Tier-B outer LAML
-/// score folds the joint Jeffreys curvature `H_Φ` into the joint Hessian logdet:
-/// `½ log|H + S_λ + H_Φ|`. Its exact ρ-gradient is
-///   `½ tr[(H+S_λ+H_Φ)⁻¹ (∂_ρ S_λ + D_β H[v_k] + D_β H_Φ[v_k])]`,
-/// where `v_k = dβ̂/dρ_k` is the mode response and `D_β·[v_k]` is the total
-/// (through β̂) derivative of the curvature along the mode response. The
-/// likelihood-Hessian drift `D_β H[v_k]` is already supplied by the family's
-/// joint directional-derivative provider; `H_Φ` ALSO moves with β̂ (it is built
-/// from `H_id = Z_Jᵀ H Z_J` and `D_a = Z_Jᵀ ∂_a H Z_J`, both β-dependent), so its
-/// drift `D_β H_Φ[δ]` is a real, non-zero term whenever the Jeffreys term is
-/// active (near-separation). This function returns exactly that `p×p` term so the
-/// outer gradient matches the objective the inner Newton converged on.
-///
-/// DERIVATION. With `K = H_id⁻¹` (the floored symmetric pseudo-inverse used as
-/// the analytic inverse on the floored spectrum), `M_a = K D_a`,
-/// `H_Φ[a,b] = ½⟨vec(M_a), vec(M_b)⟩`, and `δ` the direction:
-///   * `δ_δ H_id = Ḋ := Z_Jᵀ Hdot[δ] Z_J`,   so `δ_δ K = −K Ḋ K`.
-///   * `δ_δ D_a = Z_Jᵀ H²dot[δ, e_a] Z_J =: D_a^δ` (the second directional
-///     derivative of the joint Hessian along `(δ, e_a)`).
-///   * `δ_δ M_a = (δ_δ K) D_a + K (δ_δ D_a) = −K Ḋ M_a + K D_a^δ`.
-///   * `δ_δ H_Φ[a,b] = ½[⟨vec(δ_δ M_a), vec(M_b)⟩ + ⟨vec(M_a), vec(δ_δ M_b)⟩]`.
-///
-/// `hessian_dir` returns `Hdot[d] = ∂_d H` and `hessian_second_dir` returns
-/// `H²dot[u, v] = ∂_u ∂_v H`. When EITHER is unavailable (the family does not
-/// expose the needed exact derivatives) or the conditioning gate skips the term
-/// (so `H_Φ ≡ 0` in a neighborhood, hence `D_β H_Φ ≡ 0`), this returns the zero
-/// matrix — the safe value that leaves the existing `D_β H[v_k]`-only gradient
-/// unchanged rather than wrong.
-pub fn joint_jeffreys_hphi_directional_derivative<DirFn, Dir2Fn>(
-    h_joint: ArrayView2<'_, f64>,
-    z_j: ArrayView2<'_, f64>,
-    delta: &Array1<f64>,
-    hessian_dir: DirFn,
-    hessian_second_dir: Dir2Fn,
-) -> Result<Array2<f64>, String>
-where
-    DirFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
-    Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
-{
-    let p = h_joint.nrows();
-    if delta.len() != p {
-        return Err(format!(
-            "joint_jeffreys_hphi_directional_derivative: delta has {} entries, expected {p}",
-            delta.len()
-        ));
-    }
-    // The mode-response perturbation acts on `H_joint` through `Hdot[δ] = D_β H[δ]`
-    // and on each axis derivative `D_a` through `H²dot[δ, e_a] = D²_β H[δ, e_a]`.
-    let pert_h = match hessian_dir(delta)? {
-        Some(hd) => hd,
-        // No exact first directional derivative ⇒ drift undefined ⇒ safe zero.
-        None => return Ok(Array2::zeros((p, p))),
-    };
-    if pert_h.nrows() != p || pert_h.ncols() != p {
-        return Err(format!(
-            "joint_jeffreys_hphi_directional_derivative: Hdot[δ] shape {}x{} != {p}x{p}",
-            pert_h.nrows(),
-            pert_h.ncols()
-        ));
-    }
-    joint_jeffreys_hphi_perturbation_derivative(
-        h_joint,
-        z_j,
-        |axis| hessian_dir(axis),
-        &pert_h,
-        |axis| hessian_second_dir(delta, axis),
-    )
-}
-}
-
 /// Explicit (β-frozen) derivative `∂_ρ H_Φ|_β` of the gated joint-Jeffreys
 /// curvature along an OUTER hyperparameter `ρ` (e.g. a log-penalty `log λ_m` or a
 /// family log-scale `log ε_m`), for the augmented-LAML hypergradient.
@@ -1811,6 +1734,49 @@ mod tests {
     use super::*;
     use ndarray::array;
 
+    /// Test-only analytic oracle: the per-direction mode-response drift
+    /// `D_β H_Φ[δ]` of the Tier-B Jeffreys curvature surrogate. Production now
+    /// computes this via the batched H_Φ drift path; this standalone reference
+    /// (one `Hdot[δ]` then the perturbation core) backs the FD-vs-analytic check
+    /// below. Lives inside `mod tests` because it has no production caller.
+    fn joint_jeffreys_hphi_directional_derivative<DirFn, Dir2Fn>(
+        h_joint: ArrayView2<'_, f64>,
+        z_j: ArrayView2<'_, f64>,
+        delta: &Array1<f64>,
+        hessian_dir: DirFn,
+        hessian_second_dir: Dir2Fn,
+    ) -> Result<Array2<f64>, String>
+    where
+        DirFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+        Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+    {
+        let p = h_joint.nrows();
+        if delta.len() != p {
+            return Err(format!(
+                "joint_jeffreys_hphi_directional_derivative: delta has {} entries, expected {p}",
+                delta.len()
+            ));
+        }
+        let pert_h = match hessian_dir(delta)? {
+            Some(hd) => hd,
+            None => return Ok(Array2::zeros((p, p))),
+        };
+        if pert_h.nrows() != p || pert_h.ncols() != p {
+            return Err(format!(
+                "joint_jeffreys_hphi_directional_derivative: Hdot[δ] shape {}x{} != {p}x{p}",
+                pert_h.nrows(),
+                pert_h.ncols()
+            ));
+        }
+        joint_jeffreys_hphi_perturbation_derivative(
+            h_joint,
+            z_j,
+            |axis| hessian_dir(axis),
+            &pert_h,
+            |axis| hessian_second_dir(delta, axis),
+        )
+    }
+
     /// `joint_jeffreys_hphi_explicit_param_derivative` must equal the central
     /// finite difference of the value-path gated curvature `H_Φ` w.r.t. a scalar
     /// outer parameter `s`, on a synthetic β-frozen family where
@@ -1950,7 +1916,7 @@ mod tests {
 
         let mut delta = Array1::<f64>::zeros(p);
         delta[0] = 1.0;
-        let analytic = super::hphi_directional_oracle_tests::joint_jeffreys_hphi_directional_derivative(
+        let analytic = joint_jeffreys_hphi_directional_derivative(
             h0.view(),
             z.view(),
             &delta,
