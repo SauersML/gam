@@ -2584,7 +2584,22 @@ pub fn build_smooth_basis(
                 && !options.contains_key("penalty_order")
                 && !options.contains_key("knot_placement")
                 && !options.contains_key("knot-placement")
-                && !options.contains_key("knotplacement");
+                && !options.contains_key("knotplacement")
+                // mgcv's `k=c(k1, k2, ...)` is a per-margin marginal-basis-size
+                // request — semantically a B-spline (or other margin) tensor with
+                // each axis carrying its own basis dim — NOT a single multi-D
+                // thin-plate radial budget. The fast path here aggregates the
+                // budget into one `centers` count, so honoring a list-valued `k`
+                // would silently fold the per-margin sizes into one number and
+                // change what the user asked for. Worse, the multi-D thin-plate
+                // path routes `k`/`basis_dim` through `parse_countwith_basis_alias`
+                // which is strict-scalar and would reject `c(5,5)` with a
+                // misleading "not a non-negative integer" diagnostic before the
+                // tensor builder ever sees it (the `quality_vs_lifelines_smooth_
+                // tensor_baseline` failure mode). When `k`/`basis_dim` is a list
+                // literal, fall through to the B-spline tensor arm below so
+                // `parse_tensor_k_list` handles the per-margin sizes correctly.
+                && !k_option_is_list(options);
             if all_thin_plate_margins {
                 // mgcv's `te(tp,tp)` leaves the tensor null space unpenalized
                 // (`select = FALSE`); the multi-D thin-plate's bending penalty
@@ -3226,6 +3241,26 @@ fn knots_option_is_list(options: &BTreeMap<String, String>) -> bool {
             t.starts_with('[') || t.starts_with("c(") || t.starts_with("C(") || t.starts_with('(')
         })
         .unwrap_or(false)
+}
+
+/// True when any of the `k=`/`basis_dim=` aliases carries a *list* literal
+/// (`[k0, k1, ...]`, `c(k0, k1, ...)`, or `(k0, k1, ...)`) rather than a scalar.
+///
+/// mgcv's tensor smooths take `k=c(k1, k2, ...)` as per-margin basis dims.
+/// Dispatch sites that aggregate `k` into a single integer (e.g. the multi-D
+/// thin-plate radial fast path) must NOT consume a list value — they would
+/// either reject it with a misleading scalar-integer error, or silently fold
+/// the per-margin sizes into one budget and change the smoothing geometry.
+/// The tensor builder's `parse_tensor_k_list` is the correct consumer for the
+/// list form.
+fn k_option_is_list(options: &BTreeMap<String, String>) -> bool {
+    ["k", "basis_dim", "basis-dim", "basisdim"]
+        .iter()
+        .filter_map(|key| options.get(*key))
+        .any(|raw| {
+            let t = raw.trim();
+            t.starts_with('[') || t.starts_with("c(") || t.starts_with("C(") || t.starts_with('(')
+        })
 }
 
 /// Parse `knots=[k0, k1, ...]` (or `c(...)` / `(...)`) into explicit internal
@@ -4130,6 +4165,97 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(dims, vec![9, 5]);
+    }
+
+    #[test]
+    fn tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor() {
+        // `te(x1, x2, bs=c('tp','tp'), k=c(5,5))` is mgcv's per-margin tp tensor
+        // with per-margin basis sizes — a tensor product of two 1-D bases, each
+        // of dimension 5. The all-thin-plate fast path that swaps the tensor for
+        // a multi-D thin-plate radial basis aggregates the budget into a single
+        // `centers` count via `parse_countwith_basis_alias`, which is strict-
+        // scalar over `k`/`basis_dim`. Routing `k=c(5,5)` through it would
+        // reject the formula with a "not a non-negative integer" diagnostic
+        // (the `quality_vs_lifelines_smooth_tensor_baseline` failure mode).
+        // With a list-valued `k`, the fast path must defer to the B-spline
+        // tensor arm so `parse_tensor_k_list` honors the per-margin sizes.
+        let ds = continuous_dataset(
+            &["y", "x1", "x2"],
+            (0..32)
+                .map(|i| {
+                    let t = i as f64 / 31.0;
+                    vec![t.sin(), t, 1.0 - t]
+                })
+                .collect(),
+        );
+        let parsed =
+            parse_formula("y ~ te(x1, x2, bs=c('tp','tp'), k=c(5,5))").expect("parse tensor");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build tensor terms with per-margin k");
+        let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!(
+                "expected B-spline tensor when k=c(5,5) is supplied with bs=c('tp','tp'), got {:?}",
+                terms.smooth_terms[0].basis
+            );
+        };
+        let dims = spec
+            .marginalspecs
+            .iter()
+            .map(|m| match m.knotspec {
+                BSplineKnotSpec::Generate {
+                    num_internal_knots, ..
+                } => num_internal_knots + m.degree + 1,
+                _ => panic!("unexpected tensor marginal knotspec"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dims, vec![5, 5]);
+    }
+
+    #[test]
+    fn tensor_all_tp_margins_without_per_margin_k_keeps_thin_plate_fast_path() {
+        // The companion to `tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor`:
+        // when the user passes `bs=c('tp','tp')` WITHOUT a list-valued `k`, the
+        // all-thin-plate fast path swaps the per-margin tp tensor for gam's
+        // multi-D thin-plate radial basis (the only test currently exercising
+        // this is `quality_vs_mgcv_gaulss_tensor`). The k-is-list gate must
+        // not regress this routing — only the explicit per-margin-sizes case
+        // should drop through to the B-spline tensor arm.
+        let ds = continuous_dataset(
+            &["y", "x1", "x2"],
+            (0..32)
+                .map(|i| {
+                    let t = i as f64 / 31.0;
+                    vec![t.sin(), t, 1.0 - t]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ te(x1, x2, bs=c('tp','tp'))").expect("parse tensor");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build tensor terms without per-margin k");
+        assert!(
+            matches!(
+                terms.smooth_terms[0].basis,
+                SmoothBasisSpec::ThinPlate { .. }
+            ),
+            "te(...,bs=c('tp','tp')) without k=c(...) should route to multi-D thin-plate; got {:?}",
+            terms.smooth_terms[0].basis
+        );
     }
 
     #[test]
