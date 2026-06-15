@@ -31,10 +31,11 @@ pub(crate) fn compute_adjoint_z_c(
     //     mode response u = H⁻¹ rhs, and the cheap shortcut reads
     //     `rhs · z_c` with z_c = H⁻¹ · X'(c⊙h^G).
     //   * Projected-subspace regime (rank-deficient LAML fix): Kernel = K,
-    //     leverage = h^{G,proj} = diag(X K Xᵀ), mode response u = K · rhs
-    //     (see `compute_ift_correction_trace`'s slow path and the standalone
-    //     coord-v computation above). For the same shortcut to hold the
-    //     adjoint must satisfy `rhs · z_c = (K rhs)ᵀ X'(c⊙h^{G,proj})
+    //     leverage = h^{G,proj} = diag(X K Xᵀ). This adjoint `z_c` is a
+    //     TRACE-side quantity, so it carries the projected `K`; it is NOT the
+    //     β̈ mode response (which is solved with the full `H⁻¹` even here — see
+    //     `compute_ift_correction_trace`'s slow path). For the shortcut to hold
+    //     the adjoint must satisfy `rhs · z_c = (K rhs)ᵀ X'(c⊙h^{G,proj})
     //                                     = rhsᵀ K · X'(c⊙h^{G,proj})`,
     //     i.e. z_c^{proj} = K · X'(c ⊙ h^{G,proj}). Routing through
     //     `hop.solve` here produces H⁻¹ · X'(c ⊙ h^{G,proj}) instead and
@@ -193,12 +194,17 @@ pub(crate) fn compute_ift_correction_trace(
         };
         Ok(c_trace + d_trace)
     } else {
-        // WS1a fallback: projected kernel for rank-deficient LAML path.
-        let u = if let Some(kernel) = subspace {
-            kernel.apply_pseudo_inverse(rhs)
-        } else {
-            hop.solve(rhs)
-        };
+        // The second mode response `u = β̈ = H⁻¹ · rhs` is an IFT stationarity
+        // derivative living in the FULL β-space, so it is solved with the full
+        // inner inverse `hop.solve` even on the rank-deficient LAML path — the
+        // same `ThetaModeResponseKernel` principle the FIRST mode response and
+        // `dense.rs` follow (`penalty_coordinate.rs` doc: the IFT solve is full
+        // H⁻¹ even when the logdet uses the projected trace). The
+        // penalty-subspace projection acts ONLY on the trace contraction below
+        // (`trace_projected_logdet`/`trace_operator`), never on the β̈ solve;
+        // routing β̈ through the projected pseudo-inverse drops the `null(S₊)`
+        // curvature component the projector discards.
+        let u = hop.solve(rhs);
         if let Some(correction) =
             effective_deriv.hessian_second_derivative_correction_result(v_i, v_j, &u)?
         {
