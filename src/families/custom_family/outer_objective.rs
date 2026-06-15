@@ -2201,11 +2201,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // treat an `Err`/`None` here as "fast path unavailable" and fall
                 // through to the cheap sweep, which owns the reject bookkeeping.
                 let fused_first_attempt = if trust_attempt == 0 && joint_workspace_requested {
-                    joint_line_search_log_likelihood_with_workspace(
-                        family, options, specs, &states,
-                    )
-                    .ok()
-                    .flatten()
+                    joint_line_search_log_likelihood_with_workspace(family, options, specs, &states)
+                        .ok()
+                        .flatten()
                 } else {
                     None
                 };
@@ -7427,7 +7425,9 @@ pub(crate) fn joint_outer_evaluate(
                         ))
                     }
                     JointHessianSource::Operator {
-                        apply, dense_forced, ..
+                        apply,
+                        dense_forced,
+                        ..
                     } => {
                         let apply_h = Arc::clone(apply);
                         let apply_ranges = ranges_vec.clone();
@@ -7450,34 +7450,33 @@ pub(crate) fn joint_outer_evaluate(
                         let dense_ranges = ranges_vec.clone();
                         let dense_s = Arc::clone(&s_lambdas);
                         let dense_hphi = robust_jeffreys_hphi_for_operator.clone();
-                        let dense_assemble: Arc<
-                            dyn Fn() -> Option<Array2<f64>> + Send + Sync,
-                        > = Arc::new(move || {
-                            let mut matrix = match dense_forced() {
-                                Ok(Some(matrix)) => matrix,
-                                Ok(None) => return None,
-                                Err(error) => {
-                                    log::warn!(
-                                        "joint exact-newton dense_forced failed during outer logdet materialization: {error}"
-                                    );
+                        let dense_assemble: Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync> =
+                            Arc::new(move || {
+                                let mut matrix = match dense_forced() {
+                                    Ok(Some(matrix)) => matrix,
+                                    Ok(None) => return None,
+                                    Err(error) => {
+                                        log::warn!(
+                                            "joint exact-newton dense_forced failed during outer logdet materialization: {error}"
+                                        );
+                                        return None;
+                                    }
+                                };
+                                if matrix.nrows() != total || matrix.ncols() != total {
                                     return None;
                                 }
-                            };
-                            if matrix.nrows() != total || matrix.ncols() != total {
-                                return None;
-                            }
-                            add_joint_penalty_to_matrix(
-                                &mut matrix,
-                                &dense_ranges,
-                                dense_s.as_ref(),
-                                trace_diagonal_ridge,
-                                None,
-                            );
-                            if let Some(hphi) = dense_hphi.as_ref() {
-                                matrix.scaled_add(hphi_scale, hphi);
-                            }
-                            Some(matrix)
-                        });
+                                add_joint_penalty_to_matrix(
+                                    &mut matrix,
+                                    &dense_ranges,
+                                    dense_s.as_ref(),
+                                    trace_diagonal_ridge,
+                                    None,
+                                );
+                                if let Some(hphi) = dense_hphi.as_ref() {
+                                    matrix.scaled_add(hphi_scale, hphi);
+                                }
+                                Some(matrix)
+                            });
                         Arc::new(MatrixFreeSpdOperator::new_with_mode_and_dense_assemble(
                             total,
                             move |v| {
@@ -7816,7 +7815,9 @@ pub(crate) fn joint_outer_evaluate_efs(
                     ))
                 }
                 JointHessianSource::Operator {
-                    apply, dense_forced, ..
+                    apply,
+                    dense_forced,
+                    ..
                 } => {
                     let apply_h = Arc::clone(apply);
                     let apply_ranges = ranges_vec.clone();

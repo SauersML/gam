@@ -2832,8 +2832,10 @@ impl BernoulliMarginalSlopeFamily {
             // GEMMs per chunk instead of `n·k` rank-1 updates. `dense_contiguous_rows`
             // guarantees `weight ≡ 1.0` and `wr.index == row`, so the chunk
             // borrows the contiguous design rows directly.
-            let marginal_dirs = Self::stacked_direction_block(d_beta_flats, slices.marginal.clone());
-            let logslope_dirs = Self::stacked_direction_block(d_beta_flats, slices.logslope.clone());
+            let marginal_dirs =
+                Self::stacked_direction_block(d_beta_flats, slices.marginal.clone());
+            let logslope_dirs =
+                Self::stacked_direction_block(d_beta_flats, slices.logslope.clone());
             let (chunk_rows, _gpu_sized_chunks) =
                 Self::batched_directional_derivative_chunk_rows(n, d_beta_flats.len());
             let chunks = (0..n)

@@ -1974,23 +1974,22 @@ pub fn rrqr_from_gram_with_permutation<S: Data<Elem = f64>>(
     let pivots: Vec<f64> = (0..diag_len).map(|i| r[(i, i)].abs()).collect();
     let leading_diag = pivots.first().copied().unwrap_or(0.0);
     let (forward, _inverse) = qr.P().arrays();
-    let column_permutation: Vec<usize> =
-        forward.iter().copied().map(|idx| idx.unbound()).collect();
+    let column_permutation: Vec<usize> = forward.iter().copied().map(|idx| idx.unbound()).collect();
     // Re-scale the tolerance from F's `max(p, p)=p` row dimension to the
     // original tall design's `max(m_rows, p)`, keeping the rank cut bit-
     // identical to what the tall [`rrqr_with_permutation`] would have produced.
-    let tol =
-        rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag.max(1.0);
+    let tol = rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag.max(1.0);
     let rank = pivots.iter().filter(|&&v| v > tol).count();
     let min_kept = pivots[..rank].iter().copied().fold(f64::INFINITY, f64::min);
-    let max_dropped = pivots[rank..]
-        .iter()
-        .copied()
-        .fold(0.0f64, f64::max);
+    let max_dropped = pivots[rank..].iter().copied().fold(0.0f64, f64::max);
     // Margin: how far the verdict is from the cliff. Use the smaller of
     // (min_kept / tol) and (tol / max_dropped) so a near-tol dropped pivot also
     // shrinks the margin. A margin ≫ 1 means no rank decision could flip.
-    let kept_margin = if rank == 0 { f64::INFINITY } else { min_kept / tol };
+    let kept_margin = if rank == 0 {
+        f64::INFINITY
+    } else {
+        min_kept / tol
+    };
     let dropped_margin = if rank == diag_len {
         f64::INFINITY
     } else {

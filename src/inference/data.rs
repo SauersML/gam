@@ -1663,7 +1663,9 @@ pub fn encode_recordswith_schema(
     let mut values = Array2::<f64>::zeros((n, p));
     for (j, (kind, column)) in encoded_columns.into_iter().enumerate() {
         column_kinds.push(kind);
-        values.column_mut(j).assign(&ndarray::ArrayView1::from(&column));
+        values
+            .column_mut(j)
+            .assign(&ndarray::ArrayView1::from(&column));
     }
 
     Ok(EncodedDataset {

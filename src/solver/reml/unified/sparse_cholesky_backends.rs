@@ -1053,8 +1053,7 @@ pub struct MatrixFreeSpdOperator {
     // a matrix numerically identical (up to symmetrization) to the matvec
     // reconstruction `H·I`; `None` means no direct build is available and the
     // matvec path is used (the result is bit-for-bit the prior behavior).
-    pub(crate) dense_assemble:
-        Option<Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync>>,
+    pub(crate) dense_assemble: Option<Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync>>,
     pub(crate) cached_logdet: crate::resource::RayonSafeOnce<f64>,
     pub(crate) n_dim: usize,
     // `RayonSafeOnce`, not `OnceLock`: `materialize_dense_operator` invokes
@@ -1154,50 +1153,47 @@ impl MatrixFreeSpdOperator {
         // row pass replaces `n_dim` canonical-basis matvecs, each a full n-row
         // pass through the matrix-free operator. The matvec fallback below is the
         // exact same algebra column-for-column, so the spectrum/logdet match.
-        let (matrix, matvec_count) = match self
-            .dense_assemble
-            .as_ref()
-            .and_then(|assemble| assemble())
-        {
-            Some(mut direct)
-                if direct.nrows() == self.n_dim
-                    && direct.ncols() == self.n_dim
-                    && direct.iter().all(|v| v.is_finite()) =>
-            {
-                // Symmetrize defensively; the direct build is structurally
-                // symmetric but reduction-order f.p. noise can desync mirror
-                // entries, exactly as the matvec path symmetrizes below.
-                for i in 0..self.n_dim {
-                    for j in (i + 1)..self.n_dim {
-                        let avg = 0.5 * (direct[[i, j]] + direct[[j, i]]);
-                        direct[[i, j]] = avg;
-                        direct[[j, i]] = avg;
+        let (matrix, matvec_count) =
+            match self.dense_assemble.as_ref().and_then(|assemble| assemble()) {
+                Some(mut direct)
+                    if direct.nrows() == self.n_dim
+                        && direct.ncols() == self.n_dim
+                        && direct.iter().all(|v| v.is_finite()) =>
+                {
+                    // Symmetrize defensively; the direct build is structurally
+                    // symmetric but reduction-order f.p. noise can desync mirror
+                    // entries, exactly as the matvec path symmetrizes below.
+                    for i in 0..self.n_dim {
+                        for j in (i + 1)..self.n_dim {
+                            let avg = 0.5 * (direct[[i, j]] + direct[[j, i]]);
+                            direct[[i, j]] = avg;
+                            direct[[j, i]] = avg;
+                        }
                     }
+                    (direct, 0usize)
                 }
-                (direct, 0usize)
-            }
-            _ => {
-                let mut matrix = Array2::<f64>::zeros((self.n_dim, self.n_dim));
-                let mut basis = Array1::<f64>::zeros(self.n_dim);
-                for j in 0..self.n_dim {
-                    basis[j] = 1.0;
-                    let col = (self.apply)(&basis);
-                    basis[j] = 0.0;
-                    if col.len() != self.n_dim || !col.iter().all(|v| v.is_finite()) {
-                        return None;
+                _ => {
+                    let mut matrix = Array2::<f64>::zeros((self.n_dim, self.n_dim));
+                    let mut basis = Array1::<f64>::zeros(self.n_dim);
+                    for j in 0..self.n_dim {
+                        basis[j] = 1.0;
+                        let col = (self.apply)(&basis);
+                        basis[j] = 0.0;
+                        if col.len() != self.n_dim || !col.iter().all(|v| v.is_finite()) {
+                            return None;
+                        }
+                        matrix.column_mut(j).assign(&col);
                     }
-                    matrix.column_mut(j).assign(&col);
-                }
-                for i in 0..self.n_dim {
-                    for j in (i + 1)..self.n_dim {
-                        let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
-                        matrix[[i, j]] = avg;
-                        matrix[[j, i]] = avg;
+                    for i in 0..self.n_dim {
+                        for j in (i + 1)..self.n_dim {
+                            let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
+                            matrix[[i, j]] = avg;
+                            matrix[[j, i]] = avg;
+                        }
                     }
+                    (matrix, self.n_dim)
                 }
-                (matrix, self.n_dim)
-            }
-        };
+            };
         let result = DenseSpectralOperator::from_symmetric_with_mode(&matrix, self.mode).ok();
         log::info!(
             "[STAGE] matrix_free_spd materialize n_dim={} matvec_count={} elapsed={:.3}s",

@@ -3492,8 +3492,7 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
                 let weight = gl_weights[i + lane];
                 let z_ref = center + half_width * node;
                 let eta_ref = c0 + c1 * z_ref + c2 * z_ref * z_ref + c3 * z_ref * z_ref * z_ref;
-                value_integral +=
-                    weight * (-0.5 * z_ref * z_ref).exp() * normal_cdf(eta_ref);
+                value_integral += weight * (-0.5 * z_ref * z_ref).exp() * normal_cdf(eta_ref);
             }
         } else {
             for lane in 0..4 {

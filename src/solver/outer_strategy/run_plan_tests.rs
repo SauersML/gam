@@ -3325,9 +3325,14 @@ fn run_calls_seed_inner_state_with_cached_beta() {
     }
 
     let (_d, session) = tmp_cache_session("seed-inner-state-call");
-    let bytes =
-        encode_iterate(&array![1.0, 2.0], Some(&array![7.5, 8.5, 9.5]), None, 5.0, 3)
-            .expect("encode");
+    let bytes = encode_iterate(
+        &array![1.0, 2.0],
+        Some(&array![7.5, 8.5, 9.5]),
+        None,
+        5.0,
+        3,
+    )
+    .expect("encode");
     session.checkpoint(&bytes, Some(5.0), Some(3));
 
     let seeded: Arc<Mutex<Option<Array1<f64>>>> = Arc::new(Mutex::new(None));

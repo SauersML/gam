@@ -287,7 +287,10 @@ fn apply_paren_link(
         // its error is surfaced (not panicked) to keep this seam total.
         standard => InverseLink::Standard(StandardLink::try_from(standard).map_err(|err| {
             let reason: String = WorkflowError::InvalidConfig {
-                reason: format!("link '{}' has no state-less representation: {err}", standard.name()),
+                reason: format!(
+                    "link '{}' has no state-less representation: {err}",
+                    standard.name()
+                ),
             }
             .into();
             reason
@@ -348,7 +351,8 @@ pub fn resolve_family(
             // rejects illegal ones with a precise message. Non-parenthesized
             // names — bare (`poisson`) and the historical hyphen spellings
             // (`binomial-probit`) — match the table directly as before.
-            let (head_name, paren_link): (&str, Option<&str>) = if let Some(open) = lowered.find('(')
+            let (head_name, paren_link): (&str, Option<&str>) = if let Some(open) =
+                lowered.find('(')
                 && lowered.ends_with(')')
             {
                 let head = lowered[..open].trim_end_matches('-').trim();

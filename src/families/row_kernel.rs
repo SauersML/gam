@@ -504,7 +504,9 @@ pub trait RowKernel<const K: usize>: Send + Sync {
         // returning `Some` here keeps the dispatcher's fall-through reserved for
         // an override that explicitly declines (returns `None`) on a row-set it
         // cannot accelerate.
-        Some(row_kernel_directional_derivative_generic(self, rows, d_beta))
+        Some(row_kernel_directional_derivative_generic(
+            self, rows, d_beta,
+        ))
     }
 
     /// Optional BLAS-3 fast path for the dense joint Hessian assembly

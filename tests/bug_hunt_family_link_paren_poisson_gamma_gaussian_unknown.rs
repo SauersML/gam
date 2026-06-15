@@ -62,8 +62,8 @@ fn mgcv_default_link_parenthesized_spellings_resolve() {
     assert_eq!(gamma.response, ResponseFamily::Gamma);
     assert_eq!(gamma.link, InverseLink::Standard(StandardLink::Log));
 
-    let gaussian =
-        resolve("gaussian(identity)").expect("gaussian(identity) must resolve, not 'unknown family'");
+    let gaussian = resolve("gaussian(identity)")
+        .expect("gaussian(identity) must resolve, not 'unknown family'");
     assert_eq!(gaussian.response, ResponseFamily::Gaussian);
     assert_eq!(gaussian.link, InverseLink::Standard(StandardLink::Identity));
 }

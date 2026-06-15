@@ -1486,203 +1486,205 @@ impl JeffreysHphiDriftBase {
         let lambda_min = evals[idx_min];
         let lambda_max = evals[idx_max];
         // Ḋ = Z_Jᵀ (∂H_joint) Z_J, the reduced perturbation of the reduced information.
-    let dbar_raw = z_j.t().dot(&pert_h.dot(&z_j)); // m x m
-    let mut dbar = Array2::<f64>::zeros((m, m));
-    for i in 0..m {
-        for j in 0..m {
-            dbar[[i, j]] = 0.5 * (dbar_raw[[i, j]] + dbar_raw[[j, i]]);
-        }
-    }
-
-    // EXACT DERIVATIVE OF THE DIVIDED-DIFFERENCE CURVATURE (value↔drift
-    // consistency, gam#979). The value path builds
-    //   `H_Φ_raw[a,b] = −½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij`,
-    // with `Ṽ_k = Vᵀ D_k V` the eigenbasis-rotated reduced derivatives and `Ψ`
-    // the Daleckii–Krein divided differences of the floored signed inverse
-    // (see `joint_jeffreys_term`). Under a perturbation that moves `H_id` by
-    // `Ḋ` and each `D_a` by `∂D_a`, the exact first-order pieces are:
-    //   * eigenvalue motion       λ̇_i = (Ḋ̃)_ii,            Ḋ̃ = Vᵀ Ḋ V,
-    //   * eigenvector rotation    δV = V C,   C_ij = (Ḋ̃)_ij/(λ_j − λ_i) (i≠j),
-    //   * rotated derivatives     δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a,
-    //   * kernel motion           δΨ_ij from the chain rule on the divided
-    //     difference `Ψ(λ_i, λ_j; floor)` — for separated pairs
-    //       δΨ_ij = [(d'(λ_i) − Ψ_ij)·λ̇_i + (Ψ_ij − d'(λ_j))·λ̇_j]/(λ_i − λ_j)
-    //               + (∂d_i/∂floor − ∂d_j/∂floor)/(λ_i − λ_j) · δfloor,
-    //     and for confluent/diagonal entries `δΨ_ii = d''(λ_i)·λ̇_i` (the floor
-    //     branch has `d'' = 0`, and `d'` is floor-independent in both branches
-    //     so no diagonal floor-motion arises). The floor-motion term fires only
-    //     in the active RELATIVE regime, mirroring the value path's
-    //     floor-response: `δfloor = REL · λ̇_{idx_max}`, `∂d_i/∂floor = −1/floor²`
-    //     on below-floor entries (0 otherwise).
-    // Then
-    //   δH_Φ_raw[a,b] = −½ Σ_ij [δΨ_ij (Ṽ_a)_ij (Ṽ_b)_ij
-    //                            + Ψ_ij ((δṼ_a)_ij (Ṽ_b)_ij + (Ṽ_a)_ij (δṼ_b)_ij)].
-    let dbar_red = evecs.t().dot(&dbar).dot(evecs); // Vᵀ Ḋ V (m × m)
-    let dfloor = if floor_in_relative_regime {
-        REDUCED_INFO_RELATIVE_FLOOR * dbar_red[[idx_max, idx_max]]
-    } else {
-        0.0
-    };
-    // Eigenvector-rotation generator C (skew: C_ij = (Ḋ̃)_ij/(λ_j − λ_i), 0 on
-    // the diagonal and on confluent pairs, where first-order rotation within
-    // the degenerate subspace cancels out of the symmetric contraction).
-    let mut rotation = Array2::<f64>::zeros((m, m));
-    // Kernel motion δΨ.
-    let mut dpsi = Array2::<f64>::zeros((m, m));
-    for i in 0..m {
-        for j in 0..m {
-            let denom = evals[j] - evals[i];
-            if denom.abs() > REDUCED_INFO_ABSOLUTE_FLOOR {
-                rotation[[i, j]] = dbar_red[[i, j]] / denom;
+        let dbar_raw = z_j.t().dot(&pert_h.dot(&z_j)); // m x m
+        let mut dbar = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                dbar[[i, j]] = 0.5 * (dbar_raw[[i, j]] + dbar_raw[[j, i]]);
             }
-            let gap = evals[i] - evals[j];
-            if gap.abs() > REDUCED_INFO_ABSOLUTE_FLOOR {
-                let dp_i = floored_inverse_prime(evals[i], floor);
-                let dp_j = floored_inverse_prime(evals[j], floor);
-                let lam_dot_i = dbar_red[[i, i]];
-                let lam_dot_j = dbar_red[[j, j]];
-                dpsi[[i, j]] =
-                    ((dp_i - psi[[i, j]]) * lam_dot_i + (psi[[i, j]] - dp_j) * lam_dot_j) / gap;
-                if dfloor != 0.0 {
-                    dpsi[[i, j]] += (floored_inverse_floor_sensitivity(evals[i], floor)
-                        - floored_inverse_floor_sensitivity(evals[j], floor))
-                        / gap
-                        * dfloor;
+        }
+
+        // EXACT DERIVATIVE OF THE DIVIDED-DIFFERENCE CURVATURE (value↔drift
+        // consistency, gam#979). The value path builds
+        //   `H_Φ_raw[a,b] = −½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij`,
+        // with `Ṽ_k = Vᵀ D_k V` the eigenbasis-rotated reduced derivatives and `Ψ`
+        // the Daleckii–Krein divided differences of the floored signed inverse
+        // (see `joint_jeffreys_term`). Under a perturbation that moves `H_id` by
+        // `Ḋ` and each `D_a` by `∂D_a`, the exact first-order pieces are:
+        //   * eigenvalue motion       λ̇_i = (Ḋ̃)_ii,            Ḋ̃ = Vᵀ Ḋ V,
+        //   * eigenvector rotation    δV = V C,   C_ij = (Ḋ̃)_ij/(λ_j − λ_i) (i≠j),
+        //   * rotated derivatives     δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a,
+        //   * kernel motion           δΨ_ij from the chain rule on the divided
+        //     difference `Ψ(λ_i, λ_j; floor)` — for separated pairs
+        //       δΨ_ij = [(d'(λ_i) − Ψ_ij)·λ̇_i + (Ψ_ij − d'(λ_j))·λ̇_j]/(λ_i − λ_j)
+        //               + (∂d_i/∂floor − ∂d_j/∂floor)/(λ_i − λ_j) · δfloor,
+        //     and for confluent/diagonal entries `δΨ_ii = d''(λ_i)·λ̇_i` (the floor
+        //     branch has `d'' = 0`, and `d'` is floor-independent in both branches
+        //     so no diagonal floor-motion arises). The floor-motion term fires only
+        //     in the active RELATIVE regime, mirroring the value path's
+        //     floor-response: `δfloor = REL · λ̇_{idx_max}`, `∂d_i/∂floor = −1/floor²`
+        //     on below-floor entries (0 otherwise).
+        // Then
+        //   δH_Φ_raw[a,b] = −½ Σ_ij [δΨ_ij (Ṽ_a)_ij (Ṽ_b)_ij
+        //                            + Ψ_ij ((δṼ_a)_ij (Ṽ_b)_ij + (Ṽ_a)_ij (δṼ_b)_ij)].
+        let dbar_red = evecs.t().dot(&dbar).dot(evecs); // Vᵀ Ḋ V (m × m)
+        let dfloor = if floor_in_relative_regime {
+            REDUCED_INFO_RELATIVE_FLOOR * dbar_red[[idx_max, idx_max]]
+        } else {
+            0.0
+        };
+        // Eigenvector-rotation generator C (skew: C_ij = (Ḋ̃)_ij/(λ_j − λ_i), 0 on
+        // the diagonal and on confluent pairs, where first-order rotation within
+        // the degenerate subspace cancels out of the symmetric contraction).
+        let mut rotation = Array2::<f64>::zeros((m, m));
+        // Kernel motion δΨ.
+        let mut dpsi = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                let denom = evals[j] - evals[i];
+                if denom.abs() > REDUCED_INFO_ABSOLUTE_FLOOR {
+                    rotation[[i, j]] = dbar_red[[i, j]] / denom;
                 }
-            } else {
-                // Confluent/diagonal: Ψ = d'(λ), so δΨ = d''(λ)·λ̇ with the
-                // averaged eigenvalue motion of the (near-)tied pair, plus the
-                // floor motion of d' (nonzero only on the saturating branches).
-                dpsi[[i, j]] = floored_inverse_second(evals[i], floor)
-                    * 0.5
-                    * (dbar_red[[i, i]] + dbar_red[[j, j]]);
-                if dfloor != 0.0 {
-                    dpsi[[i, j]] +=
-                        floored_inverse_prime_floor_sensitivity(evals[i], floor) * dfloor;
+                let gap = evals[i] - evals[j];
+                if gap.abs() > REDUCED_INFO_ABSOLUTE_FLOOR {
+                    let dp_i = floored_inverse_prime(evals[i], floor);
+                    let dp_j = floored_inverse_prime(evals[j], floor);
+                    let lam_dot_i = dbar_red[[i, i]];
+                    let lam_dot_j = dbar_red[[j, j]];
+                    dpsi[[i, j]] =
+                        ((dp_i - psi[[i, j]]) * lam_dot_i + (psi[[i, j]] - dp_j) * lam_dot_j) / gap;
+                    if dfloor != 0.0 {
+                        dpsi[[i, j]] += (floored_inverse_floor_sensitivity(evals[i], floor)
+                            - floored_inverse_floor_sensitivity(evals[j], floor))
+                            / gap
+                            * dfloor;
+                    }
+                } else {
+                    // Confluent/diagonal: Ψ = d'(λ), so δΨ = d''(λ)·λ̇ with the
+                    // averaged eigenvalue motion of the (near-)tied pair, plus the
+                    // floor motion of d' (nonzero only on the saturating branches).
+                    dpsi[[i, j]] = floored_inverse_second(evals[i], floor)
+                        * 0.5
+                        * (dbar_red[[i, i]] + dbar_red[[j, j]]);
+                    if dfloor != 0.0 {
+                        dpsi[[i, j]] +=
+                            floored_inverse_prime_floor_sensitivity(evals[i], floor) * dfloor;
+                    }
                 }
             }
         }
-    }
 
-    // Per canonical axis e_a: the rotated base Ṽ_a (REUSED from the prepared
-    // base — its `Hdot[e_a]` row-stream is NOT recomputed per direction) and its
-    // Ψ-weighted partner, plus the perturbed rotation δṼ_a and the δΨ/Ψ-weighted
-    // derivative rows, flattened so the final contraction is a pair of m·m inner
-    // products per (a,b). `a_rows`/`aw_rows` come from the base; only `da_rows`
-    // (vec(δṼ_a)) and `dw_rows` (vec(δΨ∘Ṽ_a + Ψ∘δṼ_a)) are direction-dependent.
-    let a_rows = &self.a_rows; // vec(Ṽ_a)
-    let aw_rows = &self.aw_rows; // vec(Ψ ∘ Ṽ_a)
-    let mut da_rows = Array2::<f64>::zeros((p, m * m)); // vec(δṼ_a)
-    let mut dw_rows = Array2::<f64>::zeros((p, m * m)); // vec(δΨ ∘ Ṽ_a + Ψ ∘ δṼ_a)
+        // Per canonical axis e_a: the rotated base Ṽ_a (REUSED from the prepared
+        // base — its `Hdot[e_a]` row-stream is NOT recomputed per direction) and its
+        // Ψ-weighted partner, plus the perturbed rotation δṼ_a and the δΨ/Ψ-weighted
+        // derivative rows, flattened so the final contraction is a pair of m·m inner
+        // products per (a,b). `a_rows`/`aw_rows` come from the base; only `da_rows`
+        // (vec(δṼ_a)) and `dw_rows` (vec(δΨ∘Ṽ_a + Ψ∘δṼ_a)) are direction-dependent.
+        let a_rows = &self.a_rows; // vec(Ṽ_a)
+        let aw_rows = &self.aw_rows; // vec(Ψ ∘ Ṽ_a)
+        let mut da_rows = Array2::<f64>::zeros((p, m * m)); // vec(δṼ_a)
+        let mut dw_rows = Array2::<f64>::zeros((p, m * m)); // vec(δΨ ∘ Ṽ_a + Ψ ∘ δṼ_a)
 
-    // PARALLEL SECOND-DIRECTIONAL SWEEP. Each axis `e_a` needs one FULL-DATA
-    // mixed second-directional row-stream `∂Hdot[e_a] = H²dot[δ, e_a]` (n≈348k
-    // biobank rows) — the genuinely δ-dependent dominant cost of this per-direction
-    // call. The `p` passes are independent pure evaluations of `(family, β̂, δ, e_a)`,
-    // so we fan them across the Rayon pool (the `Sync` bound on `PertFn`) with the
-    // nested-BLAS guard pinning each pass's faer GEMM to `Par::Seq`. The cheap
-    // per-axis reduction (`δṼ_a` rotation + row writes) stays serial over the
-    // index-ordered results, so the output is bit-identical to the original serial
-    // loop. First-anomaly semantics preserved: any `Err` propagates, and the first
-    // `None` (family lacks the exact second derivative on some axis) collapses the
-    // whole drift to the zero matrix exactly as before.
-    let pert_hdots: Vec<Array2<f64>> = {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
-            .into_par_iter()
-            .map(|a| {
-                let mut axis = Array1::<f64>::zeros(p);
-                axis[a] = 1.0;
-                crate::linalg::faer_ndarray::with_nested_parallel(|| pert_hessian_dir(&axis))
-            })
-            .collect();
-        let mut pert_hdots = Vec::with_capacity(p);
-        for result in results {
-            let pert_hdot_a = match result? {
-                Some(h2) => h2,
-                None => return Ok(Array2::zeros((p, p))),
-            };
-            if pert_hdot_a.nrows() != p || pert_hdot_a.ncols() != p {
-                return Err(format!(
-                    "JeffreysHphiDriftBase::perturbation_derivative: ∂Hdot[e_a] shape {}x{} != {p}x{p}",
-                    pert_hdot_a.nrows(),
-                    pert_hdot_a.ncols()
-                ));
+        // PARALLEL SECOND-DIRECTIONAL SWEEP. Each axis `e_a` needs one FULL-DATA
+        // mixed second-directional row-stream `∂Hdot[e_a] = H²dot[δ, e_a]` (n≈348k
+        // biobank rows) — the genuinely δ-dependent dominant cost of this per-direction
+        // call. The `p` passes are independent pure evaluations of `(family, β̂, δ, e_a)`,
+        // so we fan them across the Rayon pool (the `Sync` bound on `PertFn`) with the
+        // nested-BLAS guard pinning each pass's faer GEMM to `Par::Seq`. The cheap
+        // per-axis reduction (`δṼ_a` rotation + row writes) stays serial over the
+        // index-ordered results, so the output is bit-identical to the original serial
+        // loop. First-anomaly semantics preserved: any `Err` propagates, and the first
+        // `None` (family lacks the exact second derivative on some axis) collapses the
+        // whole drift to the zero matrix exactly as before.
+        let pert_hdots: Vec<Array2<f64>> = {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+                .into_par_iter()
+                .map(|a| {
+                    let mut axis = Array1::<f64>::zeros(p);
+                    axis[a] = 1.0;
+                    crate::linalg::faer_ndarray::with_nested_parallel(|| pert_hessian_dir(&axis))
+                })
+                .collect();
+            let mut pert_hdots = Vec::with_capacity(p);
+            for result in results {
+                let pert_hdot_a = match result? {
+                    Some(h2) => h2,
+                    None => return Ok(Array2::zeros((p, p))),
+                };
+                if pert_hdot_a.nrows() != p || pert_hdot_a.ncols() != p {
+                    return Err(format!(
+                        "JeffreysHphiDriftBase::perturbation_derivative: ∂Hdot[e_a] shape {}x{} != {p}x{p}",
+                        pert_hdot_a.nrows(),
+                        pert_hdot_a.ncols()
+                    ));
+                }
+                pert_hdots.push(pert_hdot_a);
             }
-            pert_hdots.push(pert_hdot_a);
-        }
-        pert_hdots
-    };
-    // Reconstruct Ṽ_a (m × m) from the flattened base row for the rotation terms.
-    let mut a_a = Array2::<f64>::zeros((m, m));
-    for (a, pert_hdot_a) in pert_hdots.into_iter().enumerate() {
-        {
+            pert_hdots
+        };
+        // Reconstruct Ṽ_a (m × m) from the flattened base row for the rotation terms.
+        let mut a_a = Array2::<f64>::zeros((m, m));
+        for (a, pert_hdot_a) in pert_hdots.into_iter().enumerate() {
+            {
+                let mut col = 0usize;
+                for i in 0..m {
+                    for j in 0..m {
+                        a_a[[i, j]] = a_rows[[a, col]];
+                        col += 1;
+                    }
+                }
+            }
+
+            let d_a_pert_raw = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
+            let mut d_a_pert = Array2::<f64>::zeros((m, m));
+            for i in 0..m {
+                for j in 0..m {
+                    d_a_pert[[i, j]] = 0.5 * (d_a_pert_raw[[i, j]] + d_a_pert_raw[[j, i]]);
+                }
+            }
+
+            // δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a.
+            let da_a =
+                evecs.t().dot(&d_a_pert).dot(evecs) + &a_a.dot(&rotation) - &rotation.dot(&a_a);
+
             let mut col = 0usize;
             for i in 0..m {
                 for j in 0..m {
-                    a_a[[i, j]] = a_rows[[a, col]];
+                    da_rows[[a, col]] = da_a[[i, j]];
+                    dw_rows[[a, col]] = dpsi[[i, j]] * a_a[[i, j]] + psi[[i, j]] * da_a[[i, j]];
                     col += 1;
                 }
             }
         }
 
-        let d_a_pert_raw = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
-        let mut d_a_pert = Array2::<f64>::zeros((m, m));
-        for i in 0..m {
-            for j in 0..m {
-                d_a_pert[[i, j]] = 0.5 * (d_a_pert_raw[[i, j]] + d_a_pert_raw[[j, i]]);
+        // δH_Φ_raw[a,b] = −½ (⟨vec(δΨ∘Ṽ_a + Ψ∘δṼ_a), vec(Ṽ_b)⟩ + ⟨vec(Ψ∘Ṽ_a), vec(δṼ_b)⟩).
+        // Mathematically symmetric in (a, b); assembled symmetrically for exactness.
+        let mut out = Array2::<f64>::zeros((p, p));
+        for a in 0..p {
+            for b in a..p {
+                let mut acc = 0.0;
+                for col in 0..(m * m) {
+                    acc += dw_rows[[a, col]] * a_rows[[b, col]]
+                        + aw_rows[[a, col]] * da_rows[[b, col]];
+                }
+                let value = -0.5 * acc;
+                out[[a, b]] = value;
+                out[[b, a]] = value;
             }
         }
 
-        // δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a.
-        let da_a = evecs.t().dot(&d_a_pert).dot(evecs) + &a_a.dot(&rotation) - &rotation.dot(&a_a);
-
-        let mut col = 0usize;
-        for i in 0..m {
-            for j in 0..m {
-                da_rows[[a, col]] = da_a[[i, j]];
-                dw_rows[[a, col]] = dpsi[[i, j]] * a_a[[i, j]] + psi[[i, j]] * da_a[[i, j]];
-                col += 1;
+        // GATE DERIVATIVE (value↔gradient consistency, gam#854). `H_Φ = G(λ_min,λ_max)·H_Φ_raw`,
+        // and the gate moves with the perturbation through the reduced eigenvalues, so
+        //   `D[G·H_Φ_raw] = (D G)·H_Φ_raw + G·(D H_Φ_raw)`,
+        // `D G = G_λmin·δλ_min + G_λmax·δλ_max`, `δλ = vᵀ Ḋ v`. Identically zero on a
+        // saturated gate, so fully-active / well-conditioned fits are byte-unchanged.
+        let mut result = out * gate_weight;
+        let (g_dlmin, g_dlmax) = conditioning_gate_weight_grad(lambda_min, lambda_max);
+        if g_dlmin != 0.0 || g_dlmax != 0.0 {
+            let extreme_perturbation = |idx: usize| -> f64 {
+                let v = evecs.column(idx);
+                v.dot(&dbar.dot(&v))
+            };
+            let d_gate =
+                g_dlmin * extreme_perturbation(idx_min) + g_dlmax * extreme_perturbation(idx_max);
+            if d_gate != 0.0 {
+                // H_Φ_raw = −½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij, matching the value path.
+                let hphi_raw = aw_rows.dot(&a_rows.t()).mapv(|x| -0.5 * x);
+                result.scaled_add(d_gate, &hphi_raw);
             }
         }
-    }
-
-    // δH_Φ_raw[a,b] = −½ (⟨vec(δΨ∘Ṽ_a + Ψ∘δṼ_a), vec(Ṽ_b)⟩ + ⟨vec(Ψ∘Ṽ_a), vec(δṼ_b)⟩).
-    // Mathematically symmetric in (a, b); assembled symmetrically for exactness.
-    let mut out = Array2::<f64>::zeros((p, p));
-    for a in 0..p {
-        for b in a..p {
-            let mut acc = 0.0;
-            for col in 0..(m * m) {
-                acc += dw_rows[[a, col]] * a_rows[[b, col]] + aw_rows[[a, col]] * da_rows[[b, col]];
-            }
-            let value = -0.5 * acc;
-            out[[a, b]] = value;
-            out[[b, a]] = value;
-        }
-    }
-
-    // GATE DERIVATIVE (value↔gradient consistency, gam#854). `H_Φ = G(λ_min,λ_max)·H_Φ_raw`,
-    // and the gate moves with the perturbation through the reduced eigenvalues, so
-    //   `D[G·H_Φ_raw] = (D G)·H_Φ_raw + G·(D H_Φ_raw)`,
-    // `D G = G_λmin·δλ_min + G_λmax·δλ_max`, `δλ = vᵀ Ḋ v`. Identically zero on a
-    // saturated gate, so fully-active / well-conditioned fits are byte-unchanged.
-    let mut result = out * gate_weight;
-    let (g_dlmin, g_dlmax) = conditioning_gate_weight_grad(lambda_min, lambda_max);
-    if g_dlmin != 0.0 || g_dlmax != 0.0 {
-        let extreme_perturbation = |idx: usize| -> f64 {
-            let v = evecs.column(idx);
-            v.dot(&dbar.dot(&v))
-        };
-        let d_gate =
-            g_dlmin * extreme_perturbation(idx_min) + g_dlmax * extreme_perturbation(idx_max);
-        if d_gate != 0.0 {
-            // H_Φ_raw = −½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij, matching the value path.
-            let hphi_raw = aw_rows.dot(&a_rows.t()).mapv(|x| -0.5 * x);
-            result.scaled_add(d_gate, &hphi_raw);
-        }
-    }
-    Ok(result)
+        Ok(result)
     }
 }
 

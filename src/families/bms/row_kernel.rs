@@ -681,10 +681,7 @@ impl BernoulliRigidRowKernel {
     /// primary `2×2` row Hessian; `RowSet::All` (unit weights) is guaranteed by
     /// the caller, and the caller resolved both designs to dense contiguous
     /// views, so the build is infallible.
-    fn hessian_dense_blas3(
-        &self,
-        row_hessians: &[[[f64; 2]; 2]],
-    ) -> Array2<f64> {
+    fn hessian_dense_blas3(&self, row_hessians: &[[[f64; 2]; 2]]) -> Array2<f64> {
         let slices = &self.slices;
         let n = self.family.y.len();
 
@@ -768,8 +765,8 @@ impl BernoulliRigidRowKernel {
             })
         };
 
-        let run_serial = rayon::current_thread_index().is_some()
-            || rayon::current_num_threads() <= 1;
+        let run_serial =
+            rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1;
         if run_serial {
             let mut acc = BernoulliBlockHessianAccumulator::new(slices);
             for chunk in chunks {
@@ -777,25 +774,19 @@ impl BernoulliRigidRowKernel {
             }
             return acc.to_dense(slices);
         }
-        let acc = chunks
-            .into_par_iter()
-            .map(chunk_body)
-            .reduce(
-                || BernoulliBlockHessianAccumulator::new(slices),
-                |mut left, right| {
-                    left.add(&right);
-                    left
-                },
-            );
+        let acc = chunks.into_par_iter().map(chunk_body).reduce(
+            || BernoulliBlockHessianAccumulator::new(slices),
+            |mut left, right| {
+                left.add(&right);
+                left
+            },
+        );
         acc.to_dense(slices)
     }
 
     /// Chunked BLAS-3 implementation backing
     /// [`RowKernel::directional_derivative_dense_override`].
-    fn directional_derivative_dense_blas3(
-        &self,
-        d_beta: &[f64],
-    ) -> Result<Array2<f64>, String> {
+    fn directional_derivative_dense_blas3(&self, d_beta: &[f64]) -> Result<Array2<f64>, String> {
         let slices = &self.slices;
         let n = self.family.y.len();
         let d_beta = ndarray::ArrayView1::from(d_beta);
@@ -884,8 +875,8 @@ impl BernoulliRigidRowKernel {
         // joint-Newton / ψ-sweep par_iter holds the pool) so a nested
         // `into_par_iter` does not starve the pool — the same guard the batched
         // builder uses.
-        let run_serial = rayon::current_thread_index().is_some()
-            || rayon::current_num_threads() <= 1;
+        let run_serial =
+            rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1;
         if run_serial {
             let mut acc = BernoulliBlockHessianAccumulator::new(slices);
             for chunk in chunks {
@@ -894,16 +885,13 @@ impl BernoulliRigidRowKernel {
             }
             return Ok(acc.to_dense(slices));
         }
-        let acc = chunks
-            .into_par_iter()
-            .map(chunk_body)
-            .try_reduce(
-                || BernoulliBlockHessianAccumulator::new(slices),
-                |mut left, right| {
-                    left.add(&right);
-                    Ok(left)
-                },
-            )?;
+        let acc = chunks.into_par_iter().map(chunk_body).try_reduce(
+            || BernoulliBlockHessianAccumulator::new(slices),
+            |mut left, right| {
+                left.add(&right);
+                Ok(left)
+            },
+        )?;
         Ok(acc.to_dense(slices))
     }
 }

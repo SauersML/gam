@@ -3848,9 +3848,10 @@ fn reml_inner_progress_feedback(
 fn with_reml_beta_seed_hook<'state, 'data>() -> impl FnMut(
     &mut &'state mut crate::solver::estimate::reml::RemlState<'data>,
     &Array1<f64>,
-)
-    -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>
-{
+) -> Result<
+    crate::solver::outer_strategy::SeedOutcome,
+    EstimationError,
+> {
     |state, beta| {
         // The REML state stores β as a starting-iterate HINT and validates
         // its width against the design (`self.p`) at store time, silently

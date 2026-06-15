@@ -54,8 +54,10 @@ pub fn make_beta_seed_validator(
     pending: &std::cell::RefCell<Option<Array1<f64>>>,
 ) -> impl FnMut(
     &Array1<f64>,
-) -> Result<crate::solver::outer_strategy::SeedOutcome, crate::solver::estimate::EstimationError>
-+ '_ {
+) -> Result<
+    crate::solver::outer_strategy::SeedOutcome,
+    crate::solver::estimate::EstimationError,
+> + '_ {
     move |beta: &Array1<f64>| {
         bail_if_cached_beta_non_finite(beta)?;
         // Stage the seed for promotion at the next eval, where the freshly
