@@ -6948,6 +6948,157 @@ pub(crate) fn unified_joint_efs_eval(
     }
 }
 
+/// Same-ρ assembled-operator reuse for the custom-family outer driver.
+///
+/// The outer Hessian operator the cost-side `hop.logdet()` and the gradient
+/// traces consume is `H(β̂, ρ) + S_λ(ρ) + H_Φ(β̂, ρ)`. Its expensive part is the
+/// dense spectral factorization (`g_factor` / `projected_factor_cache`), built
+/// lazily inside `MatrixFreeSpdOperator` / `BlockCoupledOperator` the first time
+/// a logdet/trace method is touched (≈14–19 s at biobank scale). BFGS issues a
+/// `Value` eval immediately followed by a `ValueAndGradient` eval at the SAME ρ
+/// (and the line search re-probes ρ), so the released path rebuilt + refactorized
+/// that operator 2–4× per fit at identical ρ.
+///
+/// The operator is a deterministic function of `(β̂, ρ)` for a fixed
+/// family/data plus the scalar assembly knobs (ridges, curvature scale, logdet
+/// flags, pseudo-logdet mode, Jeffreys curvature). We therefore cache the
+/// assembled `Arc<dyn HessianOperator>` keyed by a content fingerprint of ALL of
+/// those inputs and reuse it on a bit-identical hit. Because the reuse condition
+/// is exact byte-equality of the build inputs, the reused operator — and so the
+/// LAML cost and its analytic gradient — is bit-identical to a fresh build.
+/// On a miss we build + store, evicting the older of the (at most) two retained
+/// entries, which bounds memory to the last two distinct ρ assemblies.
+struct AssembledOperatorCache {
+    /// `(fingerprint, operator)` for at most the last two distinct assemblies.
+    entries: Vec<(u64, Arc<dyn HessianOperator>)>,
+}
+
+impl AssembledOperatorCache {
+    const CAPACITY: usize = 2;
+
+    fn get(&self, fingerprint: u64) -> Option<Arc<dyn HessianOperator>> {
+        self.entries
+            .iter()
+            .find(|(key, _)| *key == fingerprint)
+            .map(|(_, op)| Arc::clone(op))
+    }
+
+    fn insert(&mut self, fingerprint: u64, op: Arc<dyn HessianOperator>) {
+        if self.entries.iter().any(|(key, _)| *key == fingerprint) {
+            return;
+        }
+        if self.entries.len() >= Self::CAPACITY {
+            // Evict the oldest entry (front); newest assemblies stay resident so
+            // the immediate Value→ValueAndGradient pair at one ρ always hits.
+            self.entries.remove(0);
+        }
+        self.entries.push((fingerprint, op));
+    }
+}
+
+fn assembled_operator_cache() -> &'static Mutex<AssembledOperatorCache> {
+    static CACHE: OnceLock<Mutex<AssembledOperatorCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(AssembledOperatorCache {
+            entries: Vec::with_capacity(AssembledOperatorCache::CAPACITY),
+        })
+    })
+}
+
+/// Fold a finite `f64`'s canonical bit pattern into a hasher (±0.0 → +0.0,
+/// mirroring `solver::reml::cache::sanitized_rhokey`). Non-finite values poison
+/// the fingerprint with a distinguished sentinel so a NaN/∞ assembly never
+/// aliases a finite one (it will simply never hit, which is the safe outcome).
+fn hash_f64<H: std::hash::Hasher>(value: f64, hasher: &mut H) {
+    use std::hash::Hash;
+    let bits = if value == 0.0 {
+        0.0f64.to_bits()
+    } else if value.is_finite() {
+        value.to_bits()
+    } else {
+        // Distinct sentinel for any non-finite component.
+        0xFFFF_FFFF_FFFF_FFFFu64
+    };
+    bits.hash(hasher);
+}
+
+/// Content fingerprint of every input that determines the assembled outer
+/// Hessian operator. Reuse is gated on exact equality of this fingerprint, so a
+/// hit means a bit-identical operator. `None` (here: never) would disable
+/// caching; we always produce a fingerprint and let mismatches simply miss.
+fn assembled_operator_fingerprint(
+    rho: &Array1<f64>,
+    beta_flat: &Array1<f64>,
+    h_joint_unpen: &JointHessianSource,
+    scaled_s_lambdas: &[Array2<f64>],
+    robust_jeffreys_hphi_for_operator: Option<&Array2<f64>>,
+    ranges: &[(usize, usize)],
+    total: usize,
+    scaled_joint_trace_diagonal_ridge: f64,
+    rho_curvature_scale: f64,
+    pseudo_logdet_mode: PseudoLogdetMode,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Structural discriminants.
+    total.hash(&mut hasher);
+    ranges.hash(&mut hasher);
+    (pseudo_logdet_mode == PseudoLogdetMode::Smooth).hash(&mut hasher);
+    hash_f64(scaled_joint_trace_diagonal_ridge, &mut hasher);
+    hash_f64(rho_curvature_scale, &mut hasher);
+    // ρ and β̂ together pin the family/data state at this evaluation: for a fixed
+    // family/data the operator is `H(β̂, ρ) + S_λ(ρ) + H_Φ(β̂, ρ)`, so identical
+    // (ρ, β̂) ⇒ identical operator, and distinct fits at the same ρ differ in β̂.
+    rho.len().hash(&mut hasher);
+    for &v in rho {
+        hash_f64(v, &mut hasher);
+    }
+    beta_flat.len().hash(&mut hasher);
+    for &v in beta_flat {
+        hash_f64(v, &mut hasher);
+    }
+    // Scaled penalty blocks (O(Σ p_b²); cheap vs the O(total³) factorization).
+    scaled_s_lambdas.len().hash(&mut hasher);
+    for matrix in scaled_s_lambdas {
+        matrix.dim().hash(&mut hasher);
+        for &v in matrix.iter() {
+            hash_f64(v, &mut hasher);
+        }
+    }
+    // Jeffreys curvature: presence + content.
+    match robust_jeffreys_hphi_for_operator {
+        Some(hphi) => {
+            1u8.hash(&mut hasher);
+            hphi.dim().hash(&mut hasher);
+            for &v in hphi.iter() {
+                hash_f64(v, &mut hasher);
+            }
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    // Dense joint Hessian content is part of the operator only on the dense
+    // path; the operator (matrix-free) path's curvature is pinned by (ρ, β̂)
+    // through the family workspace and is fingerprinted above. Including the
+    // dense source closes the only remaining content channel.
+    match h_joint_unpen {
+        JointHessianSource::Dense(matrix) => {
+            2u8.hash(&mut hasher);
+            matrix.dim().hash(&mut hasher);
+            for &v in matrix.iter() {
+                hash_f64(v, &mut hasher);
+            }
+        }
+        JointHessianSource::Operator { diagonal, .. } => {
+            3u8.hash(&mut hasher);
+            diagonal.len().hash(&mut hasher);
+            for &v in diagonal.iter() {
+                hash_f64(v, &mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
 /// Shared implementation for the joint exact-Newton and surrogate outer paths.
 ///
 /// Both paths differ only in:
@@ -7125,100 +7276,135 @@ pub(crate) fn joint_outer_evaluate(
         })
         .collect();
 
+    // Reuse the assembled outer Hessian operator (and its lazily-built spectral
+    // factorization) when an immediately-prior eval at the SAME ρ/β̂/curvature
+    // assembled the bit-identical operator (the BFGS Value→ValueAndGradient
+    // pair and repeated line-search probes). The fingerprint pins every operator
+    // input, so a hit is bit-identical to a fresh build — cost and analytic
+    // gradient are unchanged. See `AssembledOperatorCache`.
+    let operator_fingerprint = assembled_operator_fingerprint(
+        rho,
+        beta_flat,
+        &h_joint_unpen,
+        &scaled_s_lambdas,
+        robust_jeffreys_hphi_for_operator.as_ref(),
+        ranges,
+        total,
+        scaled_joint_trace_diagonal_ridge,
+        rho_curvature_scale,
+        pseudo_logdet_mode,
+    );
+    let cached_operator = assembled_operator_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(operator_fingerprint));
+
     let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
-        if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
-            let ranges_vec = ranges.to_vec();
-            let s_lambdas = Arc::new(scaled_s_lambdas.clone());
-            let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
-                + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
-            match &h_joint_unpen {
-                JointHessianSource::Dense(h_joint) => {
-                    let h_joint = Arc::new(h_joint.clone());
-                    let apply_h = Arc::clone(&h_joint);
-                    let apply_ranges = ranges_vec.clone();
-                    let apply_s = Arc::clone(&s_lambdas);
-                    let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
-                    let hphi_scale = rho_curvature_scale;
-                    Arc::new(MatrixFreeSpdOperator::new_with_mode(
-                        total,
-                        move |v| {
-                            let mut out = apply_h.dot(v);
-                            let penalty = apply_joint_block_penalty(
-                                &apply_ranges,
-                                apply_s.as_ref(),
-                                v,
-                                trace_diagonal_ridge,
-                                None,
-                            );
-                            out += &penalty;
-                            if let Some(hphi) = apply_hphi.as_ref() {
-                                let jeffreys = hphi.dot(v);
-                                out.scaled_add(hphi_scale, &jeffreys);
-                            }
-                            out
-                        },
-                        pseudo_logdet_mode,
-                    ))
-                }
-                JointHessianSource::Operator { apply, .. } => {
-                    let apply_h = Arc::clone(apply);
-                    let apply_ranges = ranges_vec.clone();
-                    let apply_s = Arc::clone(&s_lambdas);
-                    let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
-                    let hphi_scale = rho_curvature_scale;
-                    Arc::new(MatrixFreeSpdOperator::new_with_mode(
-                        total,
-                        move |v| {
-                            let mut out = match apply_h(v) {
-                                Ok(out) => out,
-                                Err(error) => {
-                                    log::warn!(
-                                        "joint exact-newton operator matvec failed during outer trace construction: {error}"
-                                    );
-                                    Array1::<f64>::from_elem(total, f64::NAN)
-                                }
-                            };
-                            let penalty = apply_joint_block_penalty(
-                                &apply_ranges,
-                                apply_s.as_ref(),
-                                v,
-                                trace_diagonal_ridge,
-                                None,
-                            );
-                            out += &penalty;
-                            if let Some(hphi) = apply_hphi.as_ref() {
-                                let jeffreys = hphi.dot(v);
-                                out.scaled_add(hphi_scale, &jeffreys);
-                            }
-                            out
-                        },
-                        pseudo_logdet_mode,
-                    ))
-                }
-            }
-        } else {
-            let mut j_for_traces = materialize_joint_hessian_source(
-                &h_joint_unpen,
-                total,
-                "joint exact-newton Hessian materialization",
-            )?;
-            add_joint_penalty_to_matrix(
-                &mut j_for_traces,
-                ranges,
-                &scaled_s_lambdas,
-                scaled_joint_trace_diagonal_ridge,
-                None,
+        if let Some(cached) = cached_operator {
+            log::debug!(
+                "[OUTER hessian-route] reusing cached same-ρ assembled operator (fingerprint hit)"
             );
-            if let Some(hphi) = robust_jeffreys_hphi_for_operator.as_ref() {
-                j_for_traces.scaled_add(rho_curvature_scale, hphi);
+            cached
+        } else {
+            let built: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+                if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
+                    let ranges_vec = ranges.to_vec();
+                    let s_lambdas = Arc::new(scaled_s_lambdas.clone());
+                    let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
+                        + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
+                    match &h_joint_unpen {
+                        JointHessianSource::Dense(h_joint) => {
+                            let h_joint = Arc::new(h_joint.clone());
+                            let apply_h = Arc::clone(&h_joint);
+                            let apply_ranges = ranges_vec.clone();
+                            let apply_s = Arc::clone(&s_lambdas);
+                            let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
+                            let hphi_scale = rho_curvature_scale;
+                            Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                                total,
+                                move |v| {
+                                    let mut out = apply_h.dot(v);
+                                    let penalty = apply_joint_block_penalty(
+                                        &apply_ranges,
+                                        apply_s.as_ref(),
+                                        v,
+                                        trace_diagonal_ridge,
+                                        None,
+                                    );
+                                    out += &penalty;
+                                    if let Some(hphi) = apply_hphi.as_ref() {
+                                        let jeffreys = hphi.dot(v);
+                                        out.scaled_add(hphi_scale, &jeffreys);
+                                    }
+                                    out
+                                },
+                                pseudo_logdet_mode,
+                            ))
+                        }
+                        JointHessianSource::Operator { apply, .. } => {
+                            let apply_h = Arc::clone(apply);
+                            let apply_ranges = ranges_vec.clone();
+                            let apply_s = Arc::clone(&s_lambdas);
+                            let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
+                            let hphi_scale = rho_curvature_scale;
+                            Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                                total,
+                                move |v| {
+                                    let mut out = match apply_h(v) {
+                                        Ok(out) => out,
+                                        Err(error) => {
+                                            log::warn!(
+                                                "joint exact-newton operator matvec failed during outer trace construction: {error}"
+                                            );
+                                            Array1::<f64>::from_elem(total, f64::NAN)
+                                        }
+                                    };
+                                    let penalty = apply_joint_block_penalty(
+                                        &apply_ranges,
+                                        apply_s.as_ref(),
+                                        v,
+                                        trace_diagonal_ridge,
+                                        None,
+                                    );
+                                    out += &penalty;
+                                    if let Some(hphi) = apply_hphi.as_ref() {
+                                        let jeffreys = hphi.dot(v);
+                                        out.scaled_add(hphi_scale, &jeffreys);
+                                    }
+                                    out
+                                },
+                                pseudo_logdet_mode,
+                            ))
+                        }
+                    }
+                } else {
+                    let mut j_for_traces = materialize_joint_hessian_source(
+                        &h_joint_unpen,
+                        total,
+                        "joint exact-newton Hessian materialization",
+                    )?;
+                    add_joint_penalty_to_matrix(
+                        &mut j_for_traces,
+                        ranges,
+                        &scaled_s_lambdas,
+                        scaled_joint_trace_diagonal_ridge,
+                        None,
+                    );
+                    if let Some(hphi) = robust_jeffreys_hphi_for_operator.as_ref() {
+                        j_for_traces.scaled_add(rho_curvature_scale, hphi);
+                    }
+                    Arc::new(
+                        BlockCoupledOperator::from_joint_hessian_with_mode(
+                            &j_for_traces,
+                            pseudo_logdet_mode,
+                        )
+                        .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
+                    )
+                };
+            if let Ok(mut cache) = assembled_operator_cache().lock() {
+                cache.insert(operator_fingerprint, Arc::clone(&built));
             }
-            Arc::new(
-                BlockCoupledOperator::from_joint_hessian_with_mode(
-                    &j_for_traces,
-                    pseudo_logdet_mode,
-                )
-                .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
-            )
+            built
         };
 
     let (projected_logdet_correction, penalty_subspace_trace) = if project_hessian_logdet
