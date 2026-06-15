@@ -1898,8 +1898,64 @@ pub(super) const BMS_DERIV_TOL: f64 = 1e-8;
 /// remainder (relative to that pair's weight), so a pair/bin that is filled to
 /// within a few ulps advances the cursor instead of spinning on round-off.
 pub(super) const EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL: f64 = 1e-14;
-/// Chunk size for parallel row accumulation (rows per task).
+/// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
+/// row-accumulation phases.
+///
+/// This is also a hard *ceiling* the pool-aware [`bms_row_chunk_size`] must
+/// respect: several per-chunk fast paths (block-Hessian / block-gradient
+/// assembly) allocate fixed `[0.0f64; ROW_CHUNK_SIZE]` stack buffers and index
+/// them by the chunk's local row position, so a chunk may never carry more than
+/// `ROW_CHUNK_SIZE` rows.
 pub(super) const ROW_CHUNK_SIZE: usize = 1024;
+/// Floor for rows-per-chunk: below it the per-chunk scratch allocation +
+/// scheduler hand-off cost dominates the row arithmetic. Small enough that a
+/// moderate `n` on a many-core box still carves several chunks per worker.
+pub(super) const ROW_CHUNK_MIN: usize = 64;
+/// Target number of row-chunks per rayon worker for the BMS exact-Newton
+/// row-fan-out phases (gradient / HVP / diagonal directional-derivative sweeps).
+///
+/// Several chunks per worker keeps the pool load-balanced across the uneven
+/// per-row cost tail (work-stealing moves whole chunks, never partial sums) so
+/// the heavy coord-corrections / row-stream phases saturate the cores instead
+/// of stranding the tail on one worker.
+pub(super) const ROW_CHUNKS_PER_WORKER: usize = 4;
+
+/// Pool-aware rows-per-chunk for the BMS exact-Newton row fan-outs.
+///
+/// A *fixed* `ROW_CHUNK_SIZE` divisor makes the chunk **count** scale with `n`,
+/// so at moderate `n` (e.g. `n = 10·ROW_CHUNK_SIZE` on a 64-core box) the
+/// `into_par_iter` over `⌈n/ROW_CHUNK_SIZE⌉` chunks has far fewer tasks than
+/// workers and most cores idle — the measured ~30-90% core utilization on the
+/// biobank coord-corrections / row-stream phases. This sizes the chunk so the
+/// chunk count targets `ROW_CHUNKS_PER_WORKER × worker_count` (the same policy
+/// `chunked_row_reduction` uses), clamped to `[ROW_CHUNK_MIN, ROW_CHUNK_SIZE]`:
+///
+/// * the `ROW_CHUNK_SIZE` ceiling is mandatory — the block-assembly fast paths
+///   index fixed `[…; ROW_CHUNK_SIZE]` stack buffers by local row, so a chunk
+///   can never exceed it. At large `n` the per-1024-row count already exceeds
+///   the worker count, so the clamp costs nothing there;
+/// * the `ROW_CHUNK_MIN` floor stops sub-floor fan-out at tiny `n`.
+///
+/// The worker count is fixed for the process (one global pool; gam owns its
+/// threads), so for a given `n` the returned chunk size — and therefore the
+/// chunk boundaries `chunk_idx·chunk → (chunk_idx+1)·chunk` — is stable across
+/// calls regardless of rayon work-stealing. The `try_fold`/`try_reduce` callers
+/// already round-trip through these fixed boundaries, so swapping the divisor
+/// changes only the chunk *count*, never how a chunk's rows are summed; any
+/// bit-for-bit reduction-order property they had (same `n` ⇒ same boundaries ⇒
+/// same tree) is preserved.
+#[inline]
+pub(super) fn bms_row_chunk_size(n: usize) -> usize {
+    if n == 0 {
+        return ROW_CHUNK_SIZE;
+    }
+    let workers = rayon::current_num_threads().max(1);
+    let target_chunks = workers.saturating_mul(ROW_CHUNKS_PER_WORKER).max(1);
+    // Rows per chunk that yields ≈ `target_chunks` chunks, clamped into
+    // `[ROW_CHUNK_MIN, ROW_CHUNK_SIZE]`.
+    n.div_ceil(target_chunks)
+        .clamp(ROW_CHUNK_MIN, ROW_CHUNK_SIZE)
+}
 pub(super) const EXACT_WORK_LOG_MIN_ROWS: usize = 50_000;
 pub(super) const BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES: usize = 3;
 pub(super) const BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES: usize = 2;
