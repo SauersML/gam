@@ -1056,8 +1056,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         // reuse store additionally elides the whole O(n·cells) build when the
         // outer loop revisits an already-evaluated β̂ (Value→ValueAndGradient at
         // one ρ, or a line-search ρ that maps back to a seen β̂).
-        let cache =
-            family.build_or_reuse_shared_exact_cache(&block_states, &options, true)?;
+        let cache = family.build_or_reuse_shared_exact_cache(&block_states, &options, true)?;
         if log_exact_work(family.y.len()) {
             log::info!(
                 "[BMS Hessian-workspace] build done n={} p={} primary_hessian_cache={} elapsed={:.3}s",
@@ -2426,8 +2425,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         // `RayonSafeOnce` interior fields of the (possibly shared) cache; that
         // is idempotent and yields the same values across a shared `Arc`.
         if !family.effective_flex_active(&block_states)? {
-            let warmed_third =
-                family.rigid_third_full_cached(&block_states, cache.as_ref(), 0)?;
+            let warmed_third = family.rigid_third_full_cached(&block_states, cache.as_ref(), 0)?;
             ensure_finite_third_full_cache_row(
                 warmed_third,
                 "BernoulliMarginalSlopeExactNewtonJointPsiWorkspace third-cache warm-up",

@@ -3861,7 +3861,10 @@ mod tests {
             )
             .unwrap_or_else(|err| panic!("bs='{selector}' must build a 1-D smooth, got: {err:?}"));
             let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
-                panic!("bs='{selector}' must lower to a BSpline1D; got {:?}", terms.smooth_terms[0].basis);
+                panic!(
+                    "bs='{selector}' must lower to a BSpline1D; got {:?}",
+                    terms.smooth_terms[0].basis
+                );
             };
             assert_eq!(
                 spec.double_penalty, expect_double_penalty,

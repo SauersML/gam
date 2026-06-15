@@ -251,7 +251,10 @@ pub(crate) fn consume_fit_artifact<F: CustomFamily + ?Sized>(
                 .provenance
                 .iter()
                 .filter(|p| {
-                    matches!(p, TransferProvenance::RhoOnly | TransferProvenance::Projected)
+                    matches!(
+                        p,
+                        TransferProvenance::RhoOnly | TransferProvenance::Projected
+                    )
                 })
                 .count();
             let n_beta = result

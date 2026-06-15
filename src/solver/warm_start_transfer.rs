@@ -220,11 +220,8 @@ pub fn build_warm_start(
         // term whose penalty count drifted can still transfer β.
         let mut beta_projected = false;
         if let Some(t_block) = new_term.gauge_t_block.as_ref()
-            && let Some(theta) = project_raw_beta_to_reduced(
-                t_block,
-                &parent_term.raw_beta,
-                new_term.reduced_width,
-            )
+            && let Some(theta) =
+                project_raw_beta_to_reduced(t_block, &parent_term.raw_beta, new_term.reduced_width)
         {
             block_beta[term_idx] = theta;
             beta_projected = true;

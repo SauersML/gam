@@ -3726,7 +3726,10 @@ fn prewarm_budget_cold_start_keeps_shape_budget() {
             .min(crate::solver::estimate::reml::continuation::PATH_BUDGET),
         "cold-start expensive single-seed shape must keep its shape-derived budget"
     );
-    assert!(budget > 0, "cold start must still run the continuation pre-warm");
+    assert!(
+        budget > 0,
+        "cold start must still run the continuation pre-warm"
+    );
 }
 
 /// On a warm-start cache hit the seed is already near-optimal, so the

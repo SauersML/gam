@@ -571,7 +571,9 @@ pub(crate) fn run_outer_with_plan(
                 );
             }
         }
-        if continuation_path.is_none() && enter_via_continuation_path && continuation_prewarm_budget > 0
+        if continuation_path.is_none()
+            && enter_via_continuation_path
+            && continuation_prewarm_budget > 0
         {
             if let Some(reason) = continuation_prewarm_suppressed_after.as_ref() {
                 log::info!(
