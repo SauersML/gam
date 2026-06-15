@@ -996,9 +996,17 @@ use thiserror::Error;
 /// local `V_rho` inverse (it touches no saved coefficient, objective, or
 /// user-visible summary).
 const LAML_RIDGE: f64 = 1e-8;
-/// Minimum penalized deviance floor.
+/// Minimum penalized-deviance floor, expressed as a fraction of the
+/// problem's own deviance scale (the weighted null deviance `D₀`, see
+/// [`smooth_floor_dp`]). The floor exists only to keep the profiled
+/// dispersion `φ̂ = D_p/(n−M_p)` strictly positive when a smooth fits the
+/// data essentially perfectly (`D_p ↓ 0`), so it must trigger on the
+/// *relative* smallness `D_p/D₀`, never on an absolute magnitude — an
+/// absolute floor silently breaks the exact scale-equivariance of the
+/// Gaussian REML fit under a response rescale `y → a·y` (#1127).
 pub(crate) const DP_FLOOR: f64 = 1e-12;
-/// Width of the smooth transition region for the deviance floor.
+/// Width of the smooth transition region for the deviance floor, also as a
+/// fraction of the deviance scale `D₀`.
 const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
 
 // Unified rho bound corresponding to lambda in [exp(-RHO_BOUND), exp(RHO_BOUND)].
@@ -1014,13 +1022,42 @@ const AUTO_CUBATURE_TARGET_VAR_FRAC: f64 = 0.95;
 const AUTO_CUBATURE_MAX_BETA_DIM: usize = 1600;
 const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
 
-/// Smooth approximation of `max(dp, DP_FLOOR)` that is differentiable.
+/// Smooth, differentiable approximation of `max(dp, floor)` where the floor
+/// and the width of the smoothing band are taken **relative to the supplied
+/// deviance `scale`** (the weighted null deviance `D₀` of the response).
 ///
 /// Returns the smoothed value, first derivative, and second derivative with
 /// respect to `dp`.
-pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64, f64) {
-    let tau = DP_FLOOR_SMOOTH_WIDTH.max(f64::EPSILON);
-    let scaled = (dp - DP_FLOOR) / tau;
+///
+/// # Why the floor must be relative (issue #1127)
+///
+/// The penalized deviance `D_p = Σ wᵢ(yᵢ−μ̂ᵢ)² + β̂ᵀSβ̂` is exactly quadratic
+/// in the response, so under a multiplicative rescale `y → a·y` it scales as
+/// `D_p → a²·D_p`. The profiled Gaussian REML criterion depends on `D_p` only
+/// through `log D_p` (the `(ν/2)·log(2πφ̂)` term, `φ̂ = D_p/ν`), so the rescale
+/// shifts the cost by the *additive constant* `ν·log a` and leaves the
+/// ρ-gradient — hence the selected `λ̂`, the EDF, and `ŝ(x)/a` — exactly
+/// invariant. An **absolute** floor destroys this: when `a` is small enough
+/// that `D_p` enters the fixed band (e.g. `D_p ≈ 3.6e-11` at `a = 1e-6` with
+/// a band of width `1e-8`), `dp_c` is spuriously inflated toward the absolute
+/// floor, `log dp_c` stops tracking `2·log a + const`, and the optimizer
+/// converges at an over-smoothed `λ̂` — reshaping, not merely rescaling, the
+/// smooth. Scaling both the floor and its width by `D₀ ∝ a²` makes the band a
+/// fixed *fraction* of the deviance, so `smooth_floor_dp(a²·dp, a²·D₀) =
+/// a²·smooth_floor_dp(dp, D₀)` exactly and equivariance is restored.
+///
+/// `scale = 1.0` recovers the historical absolute floor byte-for-byte, which
+/// is the correct default for callers without a Gaussian response scale in
+/// hand (the floor is consumed only on the profiled-Gaussian path).
+pub(crate) fn smooth_floor_dp(dp: f64, scale: f64) -> (f64, f64, f64) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let floor = DP_FLOOR * scale;
+    let tau = (DP_FLOOR_SMOOTH_WIDTH * scale).max(f64::MIN_POSITIVE);
+    let scaled = (dp - floor) / tau;
 
     let softplus = if scaled > 20.0 {
         scaled + (-scaled).exp()
@@ -1038,7 +1075,7 @@ pub(crate) fn smooth_floor_dp(dp: f64) -> (f64, f64, f64) {
         exp_pos / (1.0 + exp_pos)
     };
 
-    let dp_c = DP_FLOOR + tau * softplus;
+    let dp_c = floor + tau * softplus;
     let dp_cgrad2 = sigma * (1.0 - sigma) / tau;
     (dp_c, sigma, dp_cgrad2)
 }

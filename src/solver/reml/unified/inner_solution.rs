@@ -172,6 +172,21 @@ pub struct InnerSolution<'dp> {
     /// affected.
     pub gaussian_weight_log_sum_half: f64,
 
+    /// Deviance scale `D₀` used as the *relative* reference for the smooth
+    /// penalized-deviance floor (see [`crate::solver::estimate::smooth_floor_dp`]).
+    ///
+    /// Set to the weighted null deviance of the Gaussian response,
+    /// `D₀ = Σ wᵢ(yᵢ − ȳ_w)²`, which is the natural upper reference for
+    /// `D_p` and — crucially — transforms as `D₀ → a²·D₀` under a response
+    /// rescale `y → a·y`, exactly as `D_p` does. Flooring `D_p` at a fixed
+    /// fraction of `D₀` therefore keeps the profiled Gaussian REML criterion
+    /// exactly scale-equivariant (issue #1127); an absolute floor does not.
+    ///
+    /// Only consumed by the `ProfiledGaussian` arm. Defaults to `1.0`, which
+    /// reproduces the historical absolute floor byte-for-byte for every caller
+    /// that does not supply a response scale.
+    pub dp_floor_scale: f64,
+
     /// How the dispersion parameter is handled.
     pub dispersion: DispersionHandling,
 
@@ -279,6 +294,7 @@ pub struct InnerSolutionBuilder<'dp> {
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
     pub(crate) gaussian_weight_log_sum_half: f64,
+    pub(crate) dp_floor_scale: f64,
 }
 
 impl<'dp> InnerSolutionBuilder<'dp> {
@@ -320,6 +336,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             kkt_residual: None,
             active_constraints: None,
             gaussian_weight_log_sum_half: 0.0,
+            dp_floor_scale: 1.0,
         }
     }
 
@@ -550,6 +567,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             n_observations: self.n_observations,
             nullspace_dim,
             gaussian_weight_log_sum_half: self.gaussian_weight_log_sum_half,
+            dp_floor_scale: self.dp_floor_scale,
             dispersion: self.dispersion,
             ext_coords: self.ext_coords,
             ext_coord_pair_fn: self.ext_coord_pair_fn,

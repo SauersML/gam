@@ -3330,6 +3330,49 @@ impl<'a> RemlState<'a> {
             .sum::<f64>()
     }
 
+    /// Weighted null deviance `D₀ = Σ wᵢ(yᵢ − ȳ_w)²` of the Gaussian response,
+    /// used as the *relative* reference scale for the smooth penalized-deviance
+    /// floor (`InnerSolution::dp_floor_scale`, see
+    /// [`crate::solver::estimate::smooth_floor_dp`]).
+    ///
+    /// `D₀` is the deviance of the intercept-only model — the natural upper
+    /// bound for the penalized deviance `D_p` — and is the right scale at which
+    /// to judge "is `D_p` essentially zero?". It is computed once per fit from
+    /// the data alone (no ρ dependence), so flooring `D_p` at a fixed fraction
+    /// of it cannot perturb the ρ-gradient, only guard the `log φ̂` singularity
+    /// at a perfect fit. Crucially it is exactly quadratic in the response, so
+    /// under a rescale `y → a·y` it transforms as `D₀ → a²·D₀` in lockstep with
+    /// `D_p`, which is what makes the profiled Gaussian REML criterion — and
+    /// hence the selected `λ̂`, the EDF, and `ŝ(x)/a` — exactly scale-equivariant
+    /// (issue #1127).
+    ///
+    /// Falls back to `1.0` (the historical absolute floor) when the weighted
+    /// null deviance is not a usable positive scale — a degenerate constant
+    /// response, where `D_p` is genuinely ~0 and equivariance is vacuous
+    /// (`a·const` is still constant).
+    pub(crate) fn gaussian_dp_floor_scale(&self) -> f64 {
+        let mut sw = 0.0_f64;
+        let mut swy = 0.0_f64;
+        for (&yi, &wi) in self.y.iter().zip(self.weights.iter()) {
+            if wi > 0.0 && yi.is_finite() {
+                sw += wi;
+                swy += wi * yi;
+            }
+        }
+        if sw <= 0.0 {
+            return 1.0;
+        }
+        let ybar = swy / sw;
+        let mut d0 = 0.0_f64;
+        for (&yi, &wi) in self.y.iter().zip(self.weights.iter()) {
+            if wi > 0.0 && yi.is_finite() {
+                let r = yi - ybar;
+                d0 += wi * r * r;
+            }
+        }
+        if d0.is_finite() && d0 > 0.0 { d0 } else { 1.0 }
+    }
+
     /// Geometric-mean log-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ` over the
     /// positive-weight rows — **but only for a profiled-dispersion family**
     /// (Gaussian-identity). Fixed-dispersion families return exactly `0`.

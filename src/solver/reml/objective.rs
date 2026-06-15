@@ -2005,6 +2005,7 @@ impl<'a> RemlState<'a> {
         let mut inner_solution = assembly.build();
         inner_solution.stochastic_trace_state = trace_state;
         inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
+        inner_solution.dp_floor_scale = self.gaussian_dp_floor_scale();
         let solution_beta = inner_solution.beta.clone();
         let result = super::assembly::evaluate_solution(
             &inner_solution,
@@ -2054,6 +2055,7 @@ impl<'a> RemlState<'a> {
         let assembly_ext_len = assembly.ext_coords.len();
         let mut inner_solution = assembly.build();
         inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
+        inner_solution.dp_floor_scale = self.gaussian_dp_floor_scale();
         let inner_hessian_scale =
             super::unified::hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
 

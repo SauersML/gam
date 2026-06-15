@@ -415,7 +415,7 @@ pub(crate) fn efs_profiling(solution: &InnerSolution<'_>) -> (f64, f64) {
     match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
-            let (dp_c, dp_cgrad, _) = smooth_floor_dp(dp_raw);
+            let (dp_c, dp_cgrad, _) = smooth_floor_dp(dp_raw, solution.dp_floor_scale);
             let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
             (dp_c / denom, dp_cgrad)
         }
@@ -1052,6 +1052,7 @@ pub(crate) fn try_tangent_projected_evaluate(
         n_observations: solution.n_observations,
         nullspace_dim: solution.nullspace_dim,
         gaussian_weight_log_sum_half: solution.gaussian_weight_log_sum_half,
+        dp_floor_scale: solution.dp_floor_scale,
         dispersion: solution.dispersion.clone(),
         // ext_coord g/drift pass-through: projection is applied by the
         // tangent hessian wrapper's trace and solve methods.

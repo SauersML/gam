@@ -1223,6 +1223,7 @@ pub(crate) fn build_sentinel_tripwire_solution(
         n_observations: 2,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion,
         ext_coords: Vec::new(),
         ext_coord_pair_fn: None,
@@ -1306,6 +1307,7 @@ pub(crate) fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
         n_observations: 2,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         // Profiled Gaussian does not satisfy the fixed-dispersion IFT
         // identity used by the projected KKT residual correction, so an
         // inconsistent envelope gradient remains a soft "unavailable
@@ -2019,6 +2021,7 @@ pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_g
         n_observations: 3,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
@@ -2183,6 +2186,7 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
             n_observations: 3,
             nullspace_dim: 0.0,
             gaussian_weight_log_sum_half: 0.0,
+            dp_floor_scale: 1.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -2641,6 +2645,7 @@ pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alp
         n_observations: 4,
         nullspace_dim: 2.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
@@ -2738,6 +2743,7 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
         n_observations: 4,
         nullspace_dim: 1.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
@@ -2884,6 +2890,7 @@ pub(crate) fn subspace_trace_large_k_routes_to_projected_operator() {
         n_observations: 4,
         nullspace_dim: 1.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
@@ -2951,19 +2958,69 @@ pub(crate) fn test_spectral_regularize_stays_finite_in_extreme_tails() {
 
 #[test]
 pub(crate) fn test_smooth_floor_dp() {
+    // `scale = 1.0` reproduces the historical absolute floor byte-for-byte.
     // Well above floor: should be approximately identity
-    let (val, grad, _) = smooth_floor_dp(1.0);
+    let (val, grad, _) = smooth_floor_dp(1.0, 1.0);
     assert!((val - 1.0).abs() < 1e-6);
     assert!((grad - 1.0).abs() < 1e-6);
 
     // At floor: should be approximately DP_FLOOR + tau*ln(2)
-    let (val, grad, _) = smooth_floor_dp(DP_FLOOR);
+    let (val, grad, _) = smooth_floor_dp(DP_FLOOR, 1.0);
     assert!(val > DP_FLOOR);
     assert!((grad - 0.5).abs() < 0.1); // sigmoid at 0 ≈ 0.5
 
     // Well below floor: value should stay above DP_FLOOR
-    let (val, _, _) = smooth_floor_dp(0.0);
+    let (val, _, _) = smooth_floor_dp(0.0, 1.0);
     assert!(val >= DP_FLOOR);
+
+    // Exact scale-equivariance (issue #1127): with the floor reference scaled
+    // by the same factor as the deviance, the floored value, its first
+    // derivative w.r.t. dp, and its second derivative all transform as pure
+    // powers of `a` — so `log φ̂` keeps tracking `2 log a + const` and the REML
+    // λ̂ is unchanged. We sweep `dp` across (and through) the smoothing band so
+    // the equivariance is exercised exactly where the absolute floor used to
+    // break it. `dp_c → a²·dp_c`, `dp_cgrad → dp_cgrad` (dimensionless), and
+    // `dp_cgrad2 → a⁻²·dp_cgrad2`.
+    for &a in &[1.0e-9_f64, 1.0e-6, 1.0e-3, 1.0, 1.0e3, 1.0e6] {
+        let a2 = a * a;
+        let scale0 = 37.0; // a stand-in null deviance D₀ at unit response scale
+        for &dp0 in &[
+            0.0,
+            DP_FLOOR * scale0,
+            1.0e-9 * scale0,
+            1.0e-8 * scale0,
+            3.0e-8 * scale0,
+            1.0e-3 * scale0,
+            scale0,
+        ] {
+            let (v0, g0, h0) = smooth_floor_dp(dp0, scale0);
+            let (va, ga, ha) = smooth_floor_dp(a2 * dp0, a2 * scale0);
+            let tol_v = (a2 * v0).abs() * 1e-12 + 1e-300;
+            assert!(
+                (va - a2 * v0).abs() <= tol_v,
+                "value not equivariant at a={a:e}, dp0={dp0:e}: {va:e} vs {:e}",
+                a2 * v0
+            );
+            // First derivative is dimensionless (d dp_c / d dp), so invariant.
+            assert!(
+                (ga - g0).abs() <= g0.abs() * 1e-12 + 1e-15,
+                "grad not equivariant at a={a:e}, dp0={dp0:e}: {ga:e} vs {g0:e}"
+            );
+            // Second derivative carries dimension a⁻².
+            let tol_h = (h0 / a2).abs() * 1e-10 + 1e-300;
+            assert!(
+                (ha - h0 / a2).abs() <= tol_h,
+                "curv not equivariant at a={a:e}, dp0={dp0:e}: {ha:e} vs {:e}",
+                h0 / a2
+            );
+        }
+    }
+
+    // A non-finite or non-positive scale falls back to the absolute floor.
+    let (vf, _, _) = smooth_floor_dp(0.0, f64::NAN);
+    assert!(vf >= DP_FLOOR);
+    let (vz, _, _) = smooth_floor_dp(0.0, 0.0);
+    assert!(vz >= DP_FLOOR);
 }
 
 #[test]
@@ -3065,6 +3122,7 @@ pub(crate) fn gaussian_outer_hessian_operator_matches_dense_assembly() {
         n_observations: 320_000,
         nullspace_dim: 1.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::ProfiledGaussian,
         ext_coords: Vec::new(),
         ext_coord_pair_fn: None,
@@ -3136,6 +3194,7 @@ pub(crate) fn efs_step_is_zero_at_scalar_optimum() {
         n_observations: 10,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         // Use Fixed dispersion so the gradient is exactly the
         // Laplace/REML form `½(λβ̂²S β̂ + tr(H⁻¹λS) − tr(S⁺λS))`
         // without the smooth-floor / profiling factors the test
@@ -3310,6 +3369,7 @@ pub(crate) fn test_reml_laml_evaluate_gaussian_basic() {
         n_observations: 100,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::ProfiledGaussian,
         ext_coords: Vec::new(),
         ext_coord_pair_fn: None,
@@ -3376,6 +3436,7 @@ pub(crate) fn fixed_dispersion_firth_cost_subtracts_jeffreys_term() {
         n_observations: x.nrows(),
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
@@ -3489,6 +3550,7 @@ pub(crate) fn family_outer_hessian_operator_short_circuits_dense_pairwise_assemb
         n_observations: 1,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
@@ -3571,6 +3633,7 @@ pub(crate) fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'
         n_observations: 10,
         nullspace_dim: 1.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
@@ -3794,6 +3857,7 @@ pub(crate) fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution<'_> {
         n_observations: n,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::ProfiledGaussian,
         ext_coords: Vec::new(),
         ext_coord_pair_fn: None,
@@ -3850,6 +3914,7 @@ pub(crate) fn build_large_dense_spectral_gaussian_solution(rho: f64) -> InnerSol
         n_observations: n,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::ProfiledGaussian,
         ext_coords: Vec::new(),
         ext_coord_pair_fn: None,
@@ -5636,6 +5701,7 @@ pub(crate) fn build_leak_proof_solution(
         n_observations: n,
         nullspace_dim: (p - r_rank) as f64,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
@@ -5895,6 +5961,7 @@ pub(crate) fn build_gaussian_solution_at_beta(
         n_observations: n,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         dispersion: DispersionHandling::ProfiledGaussian,
         ext_coords: Vec::new(),
         ext_coord_pair_fn: None,
@@ -6457,6 +6524,7 @@ pub(crate) fn build_scaled_curvature_solution(rho: &[f64], s: f64) -> InnerSolut
         n_observations: 10,
         nullspace_dim: 0.0,
         gaussian_weight_log_sum_half: 0.0,
+        dp_floor_scale: 1.0,
         // Fixed-dispersion with logdet_h on, logdet_s off makes the
         // cost reduce to `0.5 · (hop.logdet() + correction)` plus
         // ρ-independent constants.  Pure log|H| derivative test.
