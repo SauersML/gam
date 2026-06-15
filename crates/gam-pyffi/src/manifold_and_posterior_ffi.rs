@@ -3318,26 +3318,158 @@ fn parse_predict_options(options_json: Option<&str>) -> Result<PyPredictOptions,
     Ok(options)
 }
 
+/// Process-wide cache of inferred-schema-encoded columns, keyed by a 128-bit
+/// content fingerprint of the column's raw string fields + its header name.
+///
+/// A batch run fits many models against the SAME base cohort (e.g. 17 diseases
+/// sharing identical PCs / sex / ages / geography columns; only the event
+/// column + PRS-z differ between fits). Without this cache every invariant
+/// column is re-inferred and re-encoded once per fit — the encode pass parses
+/// `n_rows` strings to `f64` per column, so 16/17 of that work is pure
+/// redundancy. The fingerprint is content-addressed: two columns share a cache
+/// entry iff their header name and every field byte agree, so a hit returns the
+/// byte-identical `(SchemaColumn, Vec<f64>)` the miss path would have produced.
+/// The `Arc<Vec<f64>>` payload is shared, so a hit copies the values once into
+/// the output `Array2` (unavoidable — the dataset owns a dense matrix) but skips
+/// all parsing and level-map construction.
+type ColumnCacheKey = (u64, u64);
+type ColumnCacheValue = Arc<(SchemaColumn, Vec<f64>)>;
+
+fn encoded_column_cache() -> &'static Mutex<HashMap<ColumnCacheKey, ColumnCacheValue>> {
+    static CACHE: OnceLock<Mutex<HashMap<ColumnCacheKey, ColumnCacheValue>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 128-bit content fingerprint of a column: the header name plus every raw
+/// field, each prefixed by its byte length so distinct field splits can never
+/// alias (e.g. `["ab","c"]` vs `["a","bc"]`). Two independent seeds widen the
+/// key to 128 bits, making accidental collisions across a batch negligible.
+fn column_fingerprint(name: &str, column: &[&str]) -> ColumnCacheKey {
+    use std::hash::{Hash, Hasher};
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    let mut hi = seeded_hasher();
+    name.len().hash(&mut lo);
+    name.hash(&mut lo);
+    name.len().hash(&mut hi);
+    name.hash(&mut hi);
+    column.len().hash(&mut lo);
+    column.len().hash(&mut hi);
+    for field in column {
+        field.len().hash(&mut lo);
+        field.hash(&mut lo);
+        field.len().hash(&mut hi);
+        field.hash(&mut hi);
+    }
+    (lo.finish(), hi.finish())
+}
+
+/// Second hasher pre-seeded with a fixed constant so its 64-bit output is
+/// statistically independent of the unseeded `DefaultHasher`, widening the
+/// content key to 128 bits.
+fn seeded_hasher() -> std::collections::hash_map::DefaultHasher {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    0x9E37_79B9_7F4A_7C15u64.hash(&mut h);
+    h
+}
+
 fn dataset_with_inferred_schema(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
 ) -> Result<EncodedDataset, String> {
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
     let n_rows = rows.len();
     let n_cols = headers.len();
-    let t_records = std::time::Instant::now();
-    let records = string_records_from_rows(&headers, &rows)?;
-    let records_ms = t_records.elapsed().as_secs_f64() * 1000.0;
-    if records_ms > 100.0 {
-        log::info!(
-            "[DATA-LOAD] ffi_string_records | n_rows={} | n_cols={} | {:.1}ms",
-            n_rows,
-            n_cols,
-            records_ms
-        );
+    if headers.is_empty() {
+        return Err("table must have at least one column".to_string());
     }
-    drop(rows);
+    if headers.iter().any(|header| header.trim().is_empty()) {
+        return Err("table headers must be non-empty strings".to_string());
+    }
+    {
+        let mut unique = BTreeSet::<&str>::new();
+        for header in &headers {
+            if !unique.insert(header.as_str()) {
+                return Err(format!("duplicate column name '{header}'"));
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Err("table data cannot be empty".to_string());
+    }
+    for (index, row) in rows.iter().enumerate() {
+        if row.len() != n_cols {
+            return Err(format!(
+                "row {} has width {} but expected {}",
+                index + 1,
+                row.len(),
+                n_cols
+            ));
+        }
+    }
+
+    // Column-major view over the row-major Python frame. Borrowing `&str` here
+    // avoids the per-cell `String` clone the old `StringRecord` path paid
+    // (n_rows * n_cols allocations) before any encoding even began.
     let t_encode = std::time::Instant::now();
-    let result = encode_recordswith_inferred_schema(headers, records)?;
+    let columns: Vec<Vec<&str>> = (0..n_cols)
+        .map(|j| rows.iter().map(|row| row[j].as_str()).collect::<Vec<&str>>())
+        .collect();
+
+    // Encode each column independently and in parallel. A column whose content
+    // fingerprint is already cached (an invariant cohort column reused across
+    // fits) skips inference + encode entirely and reuses the shared payload.
+    let encoded: Vec<ColumnCacheValue> = headers
+        .par_iter()
+        .zip(columns.par_iter())
+        .map(|(name, column)| {
+            let key = column_fingerprint(name, column);
+            if let Ok(cache) = encoded_column_cache().lock() {
+                if let Some(hit) = cache.get(&key) {
+                    return Ok(Arc::clone(hit));
+                }
+            }
+            let (schema_col, values) = infer_and_encode_column_major(name, column, 0)?;
+            let entry: ColumnCacheValue = Arc::new((schema_col, values));
+            if let Ok(mut cache) = encoded_column_cache().lock() {
+                // Bound resident memory: a long-lived process fitting many
+                // distinct cohorts would otherwise accumulate every column ever
+                // encoded. Clearing (rather than evicting one entry) only ever
+                // forfeits the perf benefit — never correctness, since every
+                // entry is content-addressed and recomputable on demand. The
+                // cap counts cached entries, not cells; one base cohort's worth
+                // of columns is tens of entries, far under the ceiling.
+                const MAX_CACHED_COLUMNS: usize = 4096;
+                if cache.len() >= MAX_CACHED_COLUMNS && !cache.contains_key(&key) {
+                    cache.clear();
+                }
+                cache.entry(key).or_insert_with(|| Arc::clone(&entry));
+            }
+            Ok::<ColumnCacheValue, String>(entry)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut schema_cols = Vec::<SchemaColumn>::with_capacity(n_cols);
+    let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(n_cols);
+    let mut values = Array2::<f64>::zeros((n_rows, n_cols));
+    for (j, entry) in encoded.iter().enumerate() {
+        let (schema_col, column) = entry.as_ref();
+        schema_cols.push(schema_col.clone());
+        column_kinds.push(schema_col.kind);
+        values
+            .column_mut(j)
+            .assign(&ndarray::ArrayView1::from(&column[..]));
+    }
+    let result = EncodedDataset {
+        headers,
+        values,
+        schema: DataSchema {
+            columns: schema_cols,
+        },
+        column_kinds,
+    };
+
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
     if encode_ms > 100.0 {
         log::info!(

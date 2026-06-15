@@ -75,7 +75,7 @@ pub(crate) use gam::hmc::{NutsConfig, NutsResult};
 
 pub(crate) use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
-    encode_recordswith_schema,
+    encode_recordswith_schema, infer_and_encode_column_major,
 };
 
 pub(crate) use gam::inference::formula_dsl::{parse_formula, parse_surv_response};
@@ -221,3 +221,5 @@ pub(crate) use std::fmt;
 pub(crate) use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub(crate) use std::sync::Arc;
+
+pub(crate) use std::sync::{Mutex, OnceLock};

@@ -1576,10 +1576,16 @@ pub fn encode_recordswith_inferred_schema(
         }
         .into());
     }
-    let mut schema_cols = Vec::<SchemaColumn>::with_capacity(headers.len());
-    for (j, name) in headers.iter().enumerate() {
-        schema_cols.push(infer_schema_column(name, &records, j).map_err(String::from)?);
-    }
+    // Schema inference is column-independent: each column scans only its own
+    // field across all rows. With wide frames (e.g. biobank: 22 cols × 194k
+    // rows) the serial outer loop dominated ingest time, so fan the per-column
+    // inference passes out over rayon. Order is preserved because `map` over an
+    // indexed parallel iterator collects back in column order.
+    let schema_cols = headers
+        .par_iter()
+        .enumerate()
+        .map(|(j, name)| infer_schema_column(name, &records, j).map_err(String::from))
+        .collect::<Result<Vec<SchemaColumn>, String>>()?;
     let schema = DataSchema {
         columns: schema_cols,
     };
@@ -1625,121 +1631,39 @@ pub fn encode_recordswith_schema(
             .into());
         }
     }
-    let mut values = Array2::<f64>::zeros((n, p));
     let schema_byname: HashMap<&str, &SchemaColumn> = schema
         .columns
         .iter()
         .map(|c| (c.name.as_str(), c))
         .collect();
-    let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);
 
-    for (j, name) in headers.iter().enumerate() {
-        let inferred_for_extra;
-        let col_schema = if let Some(s) = schema_byname.get(name.as_str()) {
-            *s
-        } else {
-            inferred_for_extra = infer_schema_column(name, &records, j).map_err(String::from)?;
-            &inferred_for_extra
-        };
-        column_kinds.push(col_schema.kind);
-
-        let level_map = if matches!(col_schema.kind, ColumnKindTag::Categorical) {
-            Some(
-                col_schema
-                    .levels
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, v)| (v.as_str(), idx as f64))
-                    .collect::<HashMap<_, _>>(),
-            )
-        } else {
-            None
-        };
-
-        for (i, rec) in records.iter().enumerate() {
-            let raw = rec
-                .get(j)
-                .ok_or_else(|| {
-                    String::from(DataError::SchemaMismatch {
-                        reason: format!("missing field at row {}, col {}", i + 1, j + 1),
-                    })
-                })?
-                .trim();
-            if raw.is_empty() {
-                return Err(DataError::EmptyInput {
-                    reason: format!("empty field at row {}, column '{}'", i + 1, name),
-                }
-                .into());
-            }
-            let val = match col_schema.kind {
-                ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|err| {
-                    String::from(DataError::SchemaMismatch {
-                        reason: format!(
-                            "column '{}' is continuous in schema but row {} has non-numeric value '{}': {}",
-                            name,
-                            i + 1,
-                            raw,
-                            err
-                        ),
-                    })
-                })?,
-                ColumnKindTag::Binary => {
-                    let v = raw.parse::<f64>().map_err(|err| {
-                        String::from(DataError::SchemaMismatch {
-                            reason: format!(
-                                "column '{}' is binary in schema but row {} has non-numeric value '{}': {}",
-                                name,
-                                i + 1,
-                                raw,
-                                err
-                            ),
-                        })
-                    })?;
-                    if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
-                        return Err(DataError::SchemaMismatch {
-                            reason: format!(
-                                "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",
-                                name,
-                                i + 1,
-                                v
-                            ),
-                        }
-                        .into());
-                    }
-                    v
-                }
-                ColumnKindTag::Categorical => {
-                    let map = level_map.as_ref().ok_or_else(|| {
-                        String::from(DataError::EncodingFailure {
-                            reason: "internal categorical schema map missing".to_string(),
-                        })
-                    })?;
-                    match map.get(raw) {
-                        Some(v) => *v,
-                        None => unseen_policy
-                            .unseen_code_for(name, col_schema.levels.len())
-                            .ok_or_else(|| {
-                                String::from(DataError::SchemaMismatch {
-                                    reason: format!(
-                                        "unseen level '{}' in categorical column '{}' at row {}; allowed levels: {}",
-                                        raw,
-                                        name,
-                                        i + 1,
-                                        col_schema.levels.join(",")
-                                    ),
-                                })
-                            })?,
-                    }
-                }
+    // Each column is encoded independently from the same row-major records, so
+    // fan the per-column passes out over rayon (columns, not rows, so threads
+    // never contend on a shared output cell). Each task returns its dense
+    // `(kind, Vec<f64>)`; we then assemble the row-major `Array2` from the
+    // collected columns. For wide frames this is the dominant ingest cost.
+    let encoded_columns = headers
+        .par_iter()
+        .enumerate()
+        .map(|(j, name)| {
+            let inferred_for_extra;
+            let col_schema = if let Some(s) = schema_byname.get(name.as_str()) {
+                *s
+            } else {
+                inferred_for_extra =
+                    infer_schema_column(name, &records, j).map_err(String::from)?;
+                &inferred_for_extra
             };
-            if !val.is_finite() {
-                return Err(DataError::InvalidValue {
-                    reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
-                }
-                .into());
-            }
-            values[[i, j]] = val;
-        }
+            let column = encode_one_column(name, &records, j, col_schema, &unseen_policy)?;
+            Ok::<(ColumnKindTag, Vec<f64>), String>((col_schema.kind, column))
+        })
+        .collect::<Result<Vec<(ColumnKindTag, Vec<f64>)>, String>>()?;
+
+    let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);
+    let mut values = Array2::<f64>::zeros((n, p));
+    for (j, (kind, column)) in encoded_columns.into_iter().enumerate() {
+        column_kinds.push(kind);
+        values.column_mut(j).assign(&ndarray::ArrayView1::from(&column));
     }
 
     Ok(EncodedDataset {
@@ -1748,6 +1672,120 @@ pub fn encode_recordswith_schema(
         schema: schema.clone(),
         column_kinds,
     })
+}
+
+/// Encode a single column `j` of `records` to its dense `f64` representation
+/// under `col_schema`. Continuous/binary values are parsed; categorical values
+/// are mapped to their level index (or the unseen code under `unseen_policy`).
+/// This is the per-column work unit fanned out across columns in
+/// [`encode_recordswith_schema`]; it scans only field `j` of each record so
+/// distinct columns never touch shared state.
+fn encode_one_column(
+    name: &str,
+    records: &[StringRecord],
+    j: usize,
+    col_schema: &SchemaColumn,
+    unseen_policy: &UnseenCategoryPolicy,
+) -> Result<Vec<f64>, String> {
+    let level_map = if matches!(col_schema.kind, ColumnKindTag::Categorical) {
+        Some(
+            col_schema
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(idx, v)| (v.as_str(), idx as f64))
+                .collect::<HashMap<_, _>>(),
+        )
+    } else {
+        None
+    };
+
+    let mut column = Vec::<f64>::with_capacity(records.len());
+    for (i, rec) in records.iter().enumerate() {
+        let raw = rec
+            .get(j)
+            .ok_or_else(|| {
+                String::from(DataError::SchemaMismatch {
+                    reason: format!("missing field at row {}, col {}", i + 1, j + 1),
+                })
+            })?
+            .trim();
+        if raw.is_empty() {
+            return Err(DataError::EmptyInput {
+                reason: format!("empty field at row {}, column '{}'", i + 1, name),
+            }
+            .into());
+        }
+        let val = match col_schema.kind {
+            ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|err| {
+                String::from(DataError::SchemaMismatch {
+                    reason: format!(
+                        "column '{}' is continuous in schema but row {} has non-numeric value '{}': {}",
+                        name,
+                        i + 1,
+                        raw,
+                        err
+                    ),
+                })
+            })?,
+            ColumnKindTag::Binary => {
+                let v = raw.parse::<f64>().map_err(|err| {
+                    String::from(DataError::SchemaMismatch {
+                        reason: format!(
+                            "column '{}' is binary in schema but row {} has non-numeric value '{}': {}",
+                            name,
+                            i + 1,
+                            raw,
+                            err
+                        ),
+                    })
+                })?;
+                if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
+                    return Err(DataError::SchemaMismatch {
+                        reason: format!(
+                            "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",
+                            name,
+                            i + 1,
+                            v
+                        ),
+                    }
+                    .into());
+                }
+                v
+            }
+            ColumnKindTag::Categorical => {
+                let map = level_map.as_ref().ok_or_else(|| {
+                    String::from(DataError::EncodingFailure {
+                        reason: "internal categorical schema map missing".to_string(),
+                    })
+                })?;
+                match map.get(raw) {
+                    Some(v) => *v,
+                    None => unseen_policy
+                        .unseen_code_for(name, col_schema.levels.len())
+                        .ok_or_else(|| {
+                            String::from(DataError::SchemaMismatch {
+                                reason: format!(
+                                    "unseen level '{}' in categorical column '{}' at row {}; allowed levels: {}",
+                                    raw,
+                                    name,
+                                    i + 1,
+                                    col_schema.levels.join(",")
+                                ),
+                            })
+                        })?,
+                }
+            }
+        };
+        if !val.is_finite() {
+            return Err(DataError::InvalidValue {
+                reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
+            }
+            .into());
+        }
+        column.push(val);
+    }
+    Ok(column)
 }
 
 fn infer_schema_column(
@@ -1810,6 +1848,172 @@ fn infer_schema_column(
     })
 }
 
+/// Infer the schema of, and densely encode, a single column presented in
+/// column-major form (`name` + its raw string field for every row).
+///
+/// This is the column-major sibling of the record-driven path: it produces the
+/// byte-identical `(SchemaColumn, Vec<f64>)` that `encode_recordswith_inferred_schema`
+/// would produce for the same column, but it reads from a `&[&str]` column
+/// slice instead of indexing field `col_idx` of every `StringRecord`. It exists
+/// so callers holding column-major data (e.g. the Python FFI, which can
+/// fingerprint and cache invariant columns shared across many fits of the same
+/// base cohort) can encode one column at a time without first materializing the
+/// full row-major record table. `col_index` is 1-based only for error text and
+/// matches the record-driven messages.
+pub fn infer_and_encode_column_major(
+    name: &str,
+    column: &[&str],
+    col_index: usize,
+) -> Result<(SchemaColumn, Vec<f64>), String> {
+    if column.is_empty() {
+        return Err(DataError::EmptyInput {
+            reason: "table data cannot be empty".to_string(),
+        }
+        .into());
+    }
+    let mut all_numeric = true;
+    let mut all_binary = true;
+    let mut levels = Vec::<String>::new();
+    let mut level_index = HashMap::<String, usize>::new();
+    let mut trimmed = Vec::<&str>::with_capacity(column.len());
+    // Capture the parsed numeric value alongside each trimmed field during the
+    // single inference scan, so the encode pass below never re-parses a numeric
+    // string. For wide biobank frames the f64 parse dominated ingest, and the
+    // record-driven path used to parse every continuous/binary field twice
+    // (once to infer the schema, once to encode). `parsed[i]` is `Some(v)` iff
+    // field `i` parsed as a finite f64; categorical columns ignore it.
+    let mut parsed = Vec::<Option<f64>>::with_capacity(column.len());
+    for (i, raw_field) in column.iter().enumerate() {
+        let raw = raw_field.trim();
+        if raw.is_empty() {
+            return Err(DataError::EmptyInput {
+                reason: format!("empty field at row {}, column '{}'", i + 1, name),
+            }
+            .into());
+        }
+        if let Ok(v) = raw.parse::<f64>() {
+            if !v.is_finite() {
+                return Err(DataError::InvalidValue {
+                    reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
+                }
+                .into());
+            }
+            if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
+                all_binary = false;
+            }
+            parsed.push(Some(v));
+        } else {
+            all_numeric = false;
+            all_binary = false;
+            level_index.entry(raw.to_string()).or_insert_with(|| {
+                let idx = levels.len();
+                levels.push(raw.to_string());
+                idx
+            });
+            parsed.push(None);
+        }
+        trimmed.push(raw);
+    }
+    let kind = if all_numeric {
+        if all_binary {
+            ColumnKindTag::Binary
+        } else {
+            ColumnKindTag::Continuous
+        }
+    } else {
+        ColumnKindTag::Categorical
+    };
+    let schema = SchemaColumn {
+        name: name.to_string(),
+        kind,
+        levels: if matches!(kind, ColumnKindTag::Categorical) {
+            levels
+        } else {
+            Vec::new()
+        },
+    };
+
+    let level_map = if matches!(kind, ColumnKindTag::Categorical) {
+        Some(
+            schema
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(idx, v)| (v.as_str(), idx as f64))
+                .collect::<HashMap<_, _>>(),
+        )
+    } else {
+        None
+    };
+
+    let mut values = Vec::<f64>::with_capacity(trimmed.len());
+    for (i, raw) in trimmed.iter().enumerate() {
+        let raw = *raw;
+        let val = match kind {
+            // Continuous/Binary kinds are only selected when every field parsed
+            // as a finite f64 during inference, so `parsed[i]` is always `Some`
+            // here — reuse it instead of re-parsing the string.
+            ColumnKindTag::Continuous => parsed[i].ok_or_else(|| {
+                String::from(DataError::EncodingFailure {
+                    reason: format!(
+                        "internal: continuous column '{}' lost its parsed value at row {} (col {})",
+                        name,
+                        i + 1,
+                        col_index
+                    ),
+                })
+            })?,
+            ColumnKindTag::Binary => {
+                let v = parsed[i].ok_or_else(|| {
+                    String::from(DataError::EncodingFailure {
+                        reason: format!(
+                            "internal: binary column '{}' lost its parsed value at row {} (col {})",
+                            name,
+                            i + 1,
+                            col_index
+                        ),
+                    })
+                })?;
+                if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
+                    return Err(DataError::SchemaMismatch {
+                        reason: format!(
+                            "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",
+                            name,
+                            i + 1,
+                            v
+                        ),
+                    }
+                    .into());
+                }
+                v
+            }
+            ColumnKindTag::Categorical => {
+                let map = level_map.as_ref().ok_or_else(|| {
+                    String::from(DataError::EncodingFailure {
+                        reason: "internal categorical schema map missing".to_string(),
+                    })
+                })?;
+                *map.get(raw).ok_or_else(|| {
+                    String::from(DataError::EncodingFailure {
+                        reason: format!(
+                            "internal: level '{}' missing from freshly built map for column '{}' (col {})",
+                            raw, name, col_index
+                        ),
+                    })
+                })?
+            }
+        };
+        if !val.is_finite() {
+            return Err(DataError::InvalidValue {
+                reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
+            }
+            .into());
+        }
+        values.push(val);
+    }
+    Ok((schema, values))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1833,6 +2037,38 @@ mod tests {
             encode_recordswith_schema(headers, Vec::new(), &schema, UnseenCategoryPolicy::Error)
                 .expect_err("empty schema-guided records should error");
         assert_eq!(err, "table data cannot be empty");
+    }
+
+    #[test]
+    fn column_major_matches_record_driven_inferred_encode() {
+        // The FFI ingest path encodes column-by-column via
+        // `infer_and_encode_column_major`; it must produce byte-identical
+        // schema + values to the record-driven `encode_recordswith_inferred_schema`
+        // for the same frame across all three inferred kinds.
+        let headers = vec!["cont".to_string(), "bin".to_string(), "cat".to_string()];
+        let raw_rows = vec![
+            vec!["1.5", "0", "a"],
+            vec!["2.0", "1", "b"],
+            vec!["-3.25", "1", "a"],
+            vec!["0.0", "0", "c"],
+        ];
+        let records: Vec<StringRecord> = raw_rows
+            .iter()
+            .map(|r| StringRecord::from(r.clone()))
+            .collect();
+        let record_ds = encode_recordswith_inferred_schema(headers.clone(), records)
+            .expect("record-driven encode");
+
+        for (j, name) in headers.iter().enumerate() {
+            let column: Vec<&str> = raw_rows.iter().map(|r| r[j]).collect();
+            let (schema_col, values) =
+                infer_and_encode_column_major(name, &column, j + 1).expect("column-major encode");
+            assert_eq!(schema_col.kind, record_ds.schema.columns[j].kind);
+            assert_eq!(schema_col.levels, record_ds.schema.columns[j].levels);
+            for (i, v) in values.iter().enumerate() {
+                assert_eq!(*v, record_ds.values[[i, j]], "row {i} col {name}");
+            }
+        }
     }
 
     #[test]
