@@ -2809,7 +2809,137 @@ impl BernoulliMarginalSlopeFamily {
         let run_rows_serial = rayon::current_thread_index().is_some()
             || rayon::current_num_threads() <= 1
             || n_rows < ROW_PAR_MIN_ROWS;
-        let mut accs = if !flex_active {
+        let mut accs = if !flex_active && dense_contiguous_rows {
+            // RIGID BLAS-3 chunked Gram path. The rigid directional Hessian
+            // drift for direction `idx` is exactly
+            //   `H_drift[idx] = Σ_row X_rᵀ · contract_third_full(T3_row, dq, dg) · X_r`,
+            // a 2×2-weighted pullback through the STATIC primary designs (no
+            // h/w blocks in the rigid accumulator: `dense_correction = None`).
+            // The per-row `add_pullback_rigid_2x2` form issues, for every one of
+            // the 326k+ rows × `n_dirs` directions, two `syr_row_into` rank-1
+            // SYRs plus a rank-1 `row_outer_into_view` straight into the dense
+            // p×p blocks — O(n·n_dirs·p²) of memory-bandwidth-bound BLAS-1 that
+            // never reaches a BLAS-3 kernel and dominates the large-scale fit.
+            //
+            // Mirror the FLEX `dense_contiguous_rows` path: accumulate the 2×2
+            // contraction weights `(w_mm, w_mg, w_gg)` per chunk row, then close
+            // each chunk with ONE pair of `Xᵀ diag(w) X` / `Xᵀ diag(w) G` BLAS-3
+            // Gram products (`add_weighted_design_grams_from_chunks` →
+            // `fast_xt_diag_x` / `fast_xt_diag_y`). Identical arithmetic
+            // (`w_mm = t[0][0]`, `w_mg = t[0][1]`, `w_gg = t[1][1]`, the same
+            // entries `add_pullback_rigid_2x2` writes), just batched and
+            // vectorized — bit-for-bit the same Hessian drift, computed in `k`
+            // GEMMs per chunk instead of `n·k` rank-1 updates. `dense_contiguous_rows`
+            // guarantees `weight ≡ 1.0` and `wr.index == row`, so the chunk
+            // borrows the contiguous design rows directly.
+            let marginal_dirs = Self::stacked_direction_block(d_beta_flats, slices.marginal.clone());
+            let logslope_dirs = Self::stacked_direction_block(d_beta_flats, slices.logslope.clone());
+            let (chunk_rows, _gpu_sized_chunks) =
+                Self::batched_directional_derivative_chunk_rows(n, d_beta_flats.len());
+            let chunks = (0..n)
+                .step_by(chunk_rows)
+                .map(|start| (start, (start + chunk_rows).min(n)))
+                .collect::<Vec<_>>();
+            log::info!(
+                "[BMS batched dH chunks] mode=rigid-blas3 rows_per_chunk={} chunks={}",
+                chunk_rows,
+                chunks.len(),
+            );
+            let chunk_body =
+                |(start, end): (usize, usize)| -> Result<Vec<BernoulliBlockHessianAccumulator>, String> {
+                    let n_dirs = d_beta_flats.len();
+                    let len = end - start;
+                    let mut accs = make_accs();
+                    let mut w_mm = (0..n_dirs)
+                        .map(|_| Array1::<f64>::zeros(len))
+                        .collect::<Vec<_>>();
+                    let mut w_mg = (0..n_dirs)
+                        .map(|_| Array1::<f64>::zeros(len))
+                        .collect::<Vec<_>>();
+                    let mut w_gg = (0..n_dirs)
+                        .map(|_| Array1::<f64>::zeros(len))
+                        .collect::<Vec<_>>();
+                    // Zero-copy borrow of the contiguous chunk rows (mirrors the
+                    // FLEX chunked path); falls back to a chunk copy only for a
+                    // non-dense design representation.
+                    let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                        match self.marginal_design.as_dense_ref() {
+                            Some(x_full) => x_full.slice(s![start..end, ..]).into(),
+                            None => self
+                                .marginal_design
+                                .try_row_chunk(start..end)
+                                .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?
+                                .into(),
+                        };
+                    let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
+                        match self.logslope_design.as_dense_ref() {
+                            Some(g_full) => g_full.slice(s![start..end, ..]).into(),
+                            None => self
+                                .logslope_design
+                                .try_row_chunk(start..end)
+                                .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?
+                                .into(),
+                        };
+                    // Per-direction projected primary perturbations `(dq, dg)` for
+                    // every chunk row: `dq = X_chunk · marginal_dir`,
+                    // `dg = G_chunk · logslope_dir` (BLAS-3 GEMM, all directions
+                    // at once), matching the per-row `dot_row_view` the scalar
+                    // path used.
+                    let marginal_projected = crate::faer_ndarray::fast_ab(&x_chunk, &marginal_dirs);
+                    let logslope_projected = crate::faer_ndarray::fast_ab(&g_chunk, &logslope_dirs);
+                    for row in start..end {
+                        let local = row - start;
+                        let full = self.rigid_third_full_cached(block_states, cache, row)?;
+                        for idx in 0..n_dirs {
+                            let dq = marginal_projected[[local, idx]];
+                            let dg = logslope_projected[[local, idx]];
+                            let t = contract_third_full(full, dq, dg);
+                            w_mm[idx][local] = t[0][0];
+                            w_mg[idx][local] = t[0][1];
+                            w_gg[idx][local] = t[1][1];
+                        }
+                        bump_progress(&progress);
+                    }
+                    for idx in 0..n_dirs {
+                        accs[idx].add_weighted_design_grams_from_chunks(
+                            &x_chunk,
+                            &g_chunk,
+                            &w_mm[idx],
+                            &w_mg[idx],
+                            &w_gg[idx],
+                        );
+                    }
+                    Ok(accs)
+                };
+            if run_rows_serial {
+                let mut accs = make_accs();
+                for chunk in chunks {
+                    let partial = chunk_body(chunk)?;
+                    for (l, r) in accs.iter_mut().zip(partial.iter()) {
+                        l.add(r);
+                    }
+                }
+                accs
+            } else {
+                chunks
+                    .into_par_iter()
+                    // Pin faer's per-chunk GEMM parallelism to `Par::Seq` so the
+                    // chunk fan-out (this `into_par_iter`) owns the global Rayon
+                    // pool and the inner `fast_ab` / weighted-Gram GEMMs do not
+                    // re-fan it and oversubscribe — same discipline as the FLEX
+                    // chunked path.
+                    .map(|chunk| crate::faer_ndarray::with_nested_parallel(|| chunk_body(chunk)))
+                    .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
+                        for (l, r) in left.iter_mut().zip(right.iter()) {
+                            l.add(r);
+                        }
+                        Ok(left)
+                    })?
+            }
+        } else if !flex_active {
+            // Non-contiguous rigid rows (e.g. an outer-score subsample mask): the
+            // chunked zero-copy Gram borrow above assumes contiguous unit-weight
+            // rows, so fall back to the per-row pullback for the sampled subset.
             if run_rows_serial {
                 let mut accs = make_accs();
                 for wr in weighted_rows.iter() {
