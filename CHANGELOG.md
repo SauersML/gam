@@ -1,3 +1,15 @@
+## gamfit 0.1.206 (2026-06-15)
+
+BMS perf: **same-β reuse of the per-row cell-moment exact-cache**. Repeated
+evaluations at a bit-identical coefficient vector β — the outer BFGS
+`Value`→`ValueAndGradient` pair at one ρ, line-search re-probes, warm-start
+replay — now reuse a fingerprinted, bounded (capacity-2, FIFO) exact-cache
+instead of rebuilding the O(n·cells) quadrature from scratch. Reuse is gated on
+exact byte-equality of every build input, so a hit is bit-identical to a rebuild
+(gradient, Hessian, LAML cost unchanged). Also includes a scale-relative
+penalized-deviance floor restoring small-response REML equivariance (#1127) and
+a hermetic `.git/index`-based build audit (no `git` shell-out in maturin Docker).
+
 ## gamfit 0.1.205 (2026-06-15)
 
 Performance bundle for the BMS biobank fit, no behavior change (all paths stay
