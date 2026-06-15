@@ -200,6 +200,102 @@ fn link_legal_for_family(response: &ResponseFamily, link: LinkFunction) -> bool 
     }
 }
 
+/// Apply an explicit mgcv-style `family(link)` link argument to an
+/// already-resolved family spec.
+///
+/// `base` is the `(spec, link_pinned)` pair the bare family head resolved to
+/// (e.g. `poisson` → `(Poisson/Log, false)`); `link_str` is the parenthesized
+/// link argument (e.g. `"log"`, `"probit"`); `name` is the original
+/// user-supplied family string, used only for error messages.
+///
+/// The link is parsed with the shared [`parse_linkname`] vocabulary, validated
+/// against the family with [`link_legal_for_family`], and applied to the
+/// family's response variant (preserving e.g. NB θ, Tweedie p, Beta φ). The
+/// result is pinned (`link_pinned = true`): an explicit link spelled into the
+/// family name pins it exactly as the hyphen spelling `binomial-probit` does,
+/// so a later contradictory `link(type=...)` is rejected downstream.
+///
+/// This is the single seam that makes *every* legal `family(link)` pairing —
+/// the canonical default-link spellings `poisson(log)` / `gamma(log)` /
+/// `gaussian(identity)` as much as the link-changing `binomial(probit)` —
+/// resolve uniformly, and rejects illegal links (`gaussian(logit)`) and unknown
+/// link names (`poisson(banana)`) with a precise message (#1129).
+fn apply_paren_link(
+    base: (LikelihoodSpec, bool),
+    link_str: &str,
+    name: &str,
+) -> Result<(LikelihoodSpec, bool), String> {
+    let (base_spec, base_pinned) = base;
+    let link = crate::inference::formula_dsl::parse_linkname(link_str).map_err(|_| {
+        let reason: String = WorkflowError::InvalidConfig {
+            reason: format!(
+                "family '{name}' names an unknown link '{link_str}'; \
+                 use one of identity|log|logit|probit|cloglog|sas|beta-logistic"
+            ),
+        }
+        .into();
+        reason
+    })?;
+    if !link_legal_for_family(&base_spec.response, link) {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "link '{}' is not supported for family '{}'",
+                link.name(),
+                base_spec.response.name()
+            ),
+        }
+        .into());
+    }
+    // A head that already pinned its own link (only reachable via the malformed
+    // double-spec `binomial-logit(probit)`) may not be re-pointed at a different
+    // link — mirror the `link(type=...)` pin-conflict guard.
+    if base_pinned && base_spec.link.link_function() != link {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "family '{}' pins link '{}', which conflicts with requested link '{}'",
+                base_spec.name(),
+                base_spec.link.link_function().name(),
+                link.name(),
+            ),
+        }
+        .into());
+    }
+    // Build the inverse link. State-less links narrow into `StandardLink`; the
+    // state-bearing `Sas` / `BetaLogistic` links (legal only for Binomial, which
+    // `link_legal_for_family` already enforced) carry the canonical zero seed,
+    // exactly as the `link(type=...)` path constructs them — their effective
+    // state is rebuilt later from `FitOptions`.
+    let inverse_link = match link {
+        LinkFunction::Sas => {
+            let state = state_from_sasspec(SasLinkSpec {
+                initial_epsilon: 0.0,
+                initial_log_delta: 0.0,
+            })
+            .map_err(|err| format!("SAS link initial state: {err}"))?;
+            InverseLink::Sas(state)
+        }
+        LinkFunction::BetaLogistic => {
+            let state = state_from_beta_logisticspec(SasLinkSpec {
+                initial_epsilon: 0.0,
+                initial_log_delta: 0.0,
+            })
+            .map_err(|err| format!("Beta-Logistic link initial state: {err}"))?;
+            InverseLink::BetaLogistic(state)
+        }
+        // The remaining links are state-less and narrow into `StandardLink`;
+        // `try_from` only rejects the two state-bearing links handled above, so
+        // its error is surfaced (not panicked) to keep this seam total.
+        standard => InverseLink::Standard(StandardLink::try_from(standard).map_err(|err| {
+            let reason: String = WorkflowError::InvalidConfig {
+                reason: format!("link '{}' has no state-less representation: {err}", standard.name()),
+            }
+            .into();
+            reason
+        })?),
+    };
+    Ok((LikelihoodSpec::new(base_spec.response, inverse_link), true))
+}
+
 /// Resolve a family from an optional name, optional link choice, and response data.
 ///
 /// `y_kind` describes the *source* representation of the response column
@@ -237,20 +333,38 @@ pub fn resolve_family(
             // "Binomial(Probit)") which is how mgcv writes a GLM family with an
             // explicit link in R. Canonicalize all forms to `family-link`.
             let lowered = name.to_ascii_lowercase().replace('_', "-");
-            let canonical = if let Some(open) = lowered.find('(')
+            // mgcv writes a GLM family carrying an explicit link as
+            // `family(link)` (e.g. "poisson(log)", "Gamma(log)",
+            // "gaussian(identity)", "binomial(probit)"). Parse that form
+            // *structurally* — separate the family head from the link argument —
+            // rather than flattening it to a `family-link` string and depending
+            // on a hand-written match arm existing for that exact pair.
+            // Flattening is why the canonical default-link spellings
+            // `poisson(log)` / `gamma(log)` / `gaussian(identity)` were rejected
+            // as "unknown family": those families only ever had a bare arm, never
+            // a `poisson-log` / `gamma-log` / `gaussian-identity` arm (#1129).
+            // Resolving the head as a family and validating the link against it
+            // (`apply_paren_link`) makes every legal pairing accept uniformly and
+            // rejects illegal ones with a precise message. Non-parenthesized
+            // names — bare (`poisson`) and the historical hyphen spellings
+            // (`binomial-probit`) — match the table directly as before.
+            let (head_name, paren_link): (&str, Option<&str>) = if let Some(open) = lowered.find('(')
                 && lowered.ends_with(')')
             {
                 let head = lowered[..open].trim_end_matches('-').trim();
                 let inner = lowered[open + 1..lowered.len() - 1].trim();
                 if head.is_empty() || inner.is_empty() {
-                    lowered.clone()
+                    // Malformed parens ("()", "poisson()", "(log)") — match the
+                    // whole lowered string, which falls through to the standard
+                    // "unknown family" error below.
+                    (lowered.as_str(), None)
                 } else {
-                    format!("{head}-{inner}")
+                    (head, Some(inner))
                 }
             } else {
-                lowered
+                (lowered.as_str(), None)
             };
-            let resolved = match canonical.as_str() {
+            let resolved = match head_name {
                 "gaussian" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Gaussian,
@@ -421,6 +535,13 @@ pub fn resolve_family(
                     }
                     .into());
                 }
+            };
+            // Apply an explicit mgcv-style `(link)` argument to the resolved
+            // family, validating legality. A bare family name leaves the
+            // family's default link untouched.
+            let resolved = match paren_link {
+                Some(link_str) => apply_paren_link(resolved, link_str, name)?,
+                None => resolved,
             };
             Some(resolved)
         }
