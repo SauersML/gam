@@ -1237,6 +1237,44 @@ pub(crate) fn run_outer_with_plan(
                         .with_bounds(bounds)
                         .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter);
+                    // Warm-start first-step scaling. `opt::Bfgs` begins with an
+                    // UNSCALED identity inverse-Hessian (`B_inv = I`) on iter 0:
+                    // the search direction is the raw `d = -g`, so the unit
+                    // line-search step (`α = 1`) is `-g` in ρ-space. The
+                    // optimizer's Barzilai-Borwein self-scaling (`γ = sᵀy/yᵀy`)
+                    // only fires AFTER the first line search completes, so when a
+                    // warm start lands a near-optimal seed whose residual gradient
+                    // still has a large component along a weakly-curved (heavily
+                    // penalized) log-λ direction, the raw `-g` step overshoots and
+                    // the StrongWolfe search has to bracket/zoom — each bracketing
+                    // probe is a full inner joint-Newton re-solve. On the biobank
+                    // LOSO fold that is the observed three ~65 s `outer eval Value`
+                    // probes before the single accepted step.
+                    //
+                    // Seed the iter-0 metric with the one-point magnitude estimate
+                    // the `InitialMetric::Scalar` API is designed for ("a previous
+                    // run's gradient norm"): `H₀⁻¹ = (1/‖g₀‖)·I` makes the first
+                    // direction `d = -g₀/‖g₀‖` a unit-ℓ²-norm ρ step — bounded,
+                    // still exactly steepest-descent (so still a descent
+                    // direction), and almost always Wolfe-acceptable at `α = 1`.
+                    // This changes only the LINE-SEARCH PATH, never the accepted
+                    // optimum: BFGS converges to the same stationary point
+                    // `∇_ρ V(ρ*) = 0` under any symmetric-positive-definite initial
+                    // metric, and the gradient/KKT convergence tests are unchanged.
+                    // Gated on `warm_start_cache_hit` so cold multistart seeds keep
+                    // the optimizer's historical internal scaling. The scale is
+                    // clamped to the same `[1e-3, 1e3]` band the optimizer applies
+                    // to its own BB estimate so a pathological seed gradient cannot
+                    // produce a degenerate metric.
+                    if config.warm_start_cache_hit {
+                        let g0_norm =
+                            seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                        if g0_norm.is_finite() && g0_norm > 0.0 {
+                            let scale = (1.0 / g0_norm).clamp(1.0e-3, 1.0e3);
+                            optimizer =
+                                optimizer.with_initial_metric(InitialMetric::Scalar(scale));
+                        }
+                    }
                     if let Some(caps) = bfgs_axis_step_caps(config, layout) {
                         optimizer = optimizer.with_axis_step_caps(caps);
                     }
