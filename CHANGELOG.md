@@ -1,3 +1,20 @@
+## gamfit 0.1.210 (2026-06-15)
+
+BMS biobank-fit perf: **BLAS-3 rigid joint-Hessian directional derivative**
+(the Jeffreys/Firth head term that dominated the inner `hessian_qp` floor). The
+rigid (`flex=false`) path previously scattered the per-row contracted third
+tensor into the dense p×p Hessian via per-row rank-1 SYRs — O(k·n·p²) BLAS-1
+that never reached a BLAS-3 kernel (the same root cause as the historical
+"55s Jeffreys spike"). It now projects each row-chunk with GEMMs and closes with
+`Xᵀdiag(w)X` per chunk (k·n/chunk BLAS-3 calls), reading the per-row third tensor
+from the shared cache once instead of per Jeffreys column. Bit-for-bit (only
+summation order changes); claims only the full-data unit-weight dense-design
+case, subsample/HT-weighted paths fall through unchanged. The ~8s-per-Newton-cycle
+`hessian_qp` contribution drops to well under 1s — and it recurs on every inner
+cycle of every inner solve, so it compounds across the whole fit. Also includes
+the #740 KKT-residual correction for the ψ (ext) outer gradient (gradient side;
+vanishes at exact KKT so converged fits are byte-unchanged).
+
 ## gamfit 0.1.209 (2026-06-15)
 
 BMS biobank-fit perf + diagnostics bundle (no behavior change to the converged
