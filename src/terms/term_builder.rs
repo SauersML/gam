@@ -1229,10 +1229,13 @@ fn bspline_boundary_declares_periodic_axis(options: &BTreeMap<String, String>) -
 ///
 /// Aliases listed here MUST be true semantic equivalents of the canonical
 /// target, not approximations. mgcv names whose semantics differ from any
-/// gamfit smooth (e.g. `bs="cs"` shrinkage thin-plate, `bs="ad"` adaptive)
+/// gamfit smooth (e.g. `bs="ts"` shrinkage thin-plate, `bs="ad"` adaptive)
 /// are intentionally NOT mapped here — they should reach the unsupported-type
 /// path so users get a real diagnostic instead of a silent semantic
-/// substitution.
+/// substitution. mgcv's `bs="cr"`/`"cs"` (cubic regression and its shrinkage
+/// twin) are handled directly in the [`build_smooth_basis`] dispatch — they
+/// are not aliased here because the `cr`/`cs` distinction controls a default
+/// (`double_penalty`) that the canonical-name layer cannot see.
 ///
 /// Unrecognised inputs pass through unchanged so the dispatch can produce its
 /// usual "unsupported smooth type" error, preserving the existing diagnostic
@@ -1713,9 +1716,27 @@ pub fn build_smooth_basis(
                 },
             })
         }
-        "bspline" | "ps" | "p-spline" => {
+        "bspline" | "ps" | "p-spline" | "cr" | "cs" => {
+            // mgcv's `bs="cr"` (cubic regression spline) and `bs="cs"` (its
+            // shrinkage twin) are penalized cubic-regression smooths that span
+            // the same per-axis function space as gamfit's `bspline` (cubic
+            // B-spline, second-derivative penalty). Route both through the
+            // 1-D B-spline arm; the only semantic difference is whether the
+            // null space is shrunk: `cr` is the no-shrinkage form (mgcv's
+            // default) and `cs` is the shrinkage form (mgcv's `cs`/gamfit's
+            // double_penalty). Without this route, a stand-alone
+            // `s(x, bs='cr')` (which is otherwise a routine 1-D smooth in
+            // mgcv-compatible formulae) reached the dispatch's default arm
+            // and aborted the whole fit with `unsupported smooth type 'cr'`,
+            // even though the same name was already recognized as a tensor
+            // margin (`tensor_margin_bs_is_supported`).
+            let validation_name = match type_opt.as_str() {
+                "cr" => "cr",
+                "cs" => "cs",
+                _ => "bspline",
+            };
             validate_known_options(
-                "bspline",
+                validation_name,
                 options,
                 &[
                     "type",
@@ -1836,6 +1857,14 @@ pub fn build_smooth_basis(
                     parse_cyclic_boundary(options, minv, maxv)?,
                 )
             };
+            // mgcv `bs="cr"` does not shrink the linear null space; only `cs`
+            // (and the gamfit-flavoured `bspline`/`ps`) do. Honour an explicit
+            // `double_penalty=` either way.
+            let double_penalty = if type_opt == "cr" {
+                option_bool(options, "double_penalty").unwrap_or(false)
+            } else {
+                smooth_double_penalty
+            };
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
@@ -1843,7 +1872,7 @@ pub fn build_smooth_basis(
                     penalty_order: option_usize(options, "penalty_order")
                         .unwrap_or(DEFAULT_PENALTY_ORDER),
                     knotspec,
-                    double_penalty: smooth_double_penalty,
+                    double_penalty,
                     identifiability: BSplineIdentifiability::default(),
                     boundary,
                     boundary_conditions,
@@ -3804,6 +3833,43 @@ mod tests {
                 num_basis: 8
             } if *data_range == (0.0, std::f64::consts::TAU)
         ));
+    }
+
+    #[test]
+    fn univariate_smooth_accepts_mgcv_cubic_regression_aliases() {
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..32)
+                .map(|i| {
+                    let x = i as f64 / 31.0;
+                    vec![x * x, x]
+                })
+                .collect(),
+        );
+        let col_map = ds.column_map();
+
+        for (selector, expect_double_penalty) in [("cr", false), ("cs", true)] {
+            let formula = format!("y ~ s(x, bs='{selector}')");
+            let parsed = parse_formula(&formula).expect("parse cr/cs smooth");
+            let mut notes = Vec::new();
+            let terms = build_termspec(
+                &parsed.terms,
+                &ds,
+                &col_map,
+                &mut notes,
+                &crate::resource::ResourcePolicy::default_library(),
+            )
+            .unwrap_or_else(|err| panic!("bs='{selector}' must build a 1-D smooth, got: {err:?}"));
+            let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+                panic!("bs='{selector}' must lower to a BSpline1D; got {:?}", terms.smooth_terms[0].basis);
+            };
+            assert_eq!(
+                spec.double_penalty, expect_double_penalty,
+                "bs='{selector}' must default double_penalty to mgcv's convention \
+                 (cr=no-shrinkage, cs=shrinkage); got double_penalty={}",
+                spec.double_penalty
+            );
+        }
     }
 
     #[test]
