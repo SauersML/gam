@@ -1,3 +1,20 @@
+## gamfit 0.1.202 (2026-06-15)
+
+Robustness: bernoulli marginal-slope LOSO/biobank fits no longer spin to the
+inner-Newton cycle cap, and a post-fit certificate false alarm is silenced.
+- Noise-floor inner-Newton termination guard: when the trust region collapses
+  and every line-search step is rejected at the ~1-ULP floor (the objective is
+  flat along the gauge-flat coupled direction), the solve now TERMINATES and
+  judges convergence on the identified (range) subspace instead of spinning to
+  the 1200-cycle cap. The line-search early-exit reject also gained a rounding
+  tolerance so a numerically-flat trial is not rejected on 1 ULP.
+- Certificate (first-order optimality self-audit) railed-coordinate fix: the
+  audit now projects its gradient-vs-value directional check onto the FREE
+  (non-bound-active) coordinates, so a legitimate KKT optimum with a smoothing
+  parameter at a box bound no longer reports a spurious GRADIENT-OBJECTIVE
+  DESYNC. Diagnostic-only; no fitted result changes; still fires on genuine
+  interior desyncs.
+
 ## gamfit 0.1.201 (2026-06-14)
 
 Performance: biobank marginal-slope fits no longer stall on the per-coefficient
