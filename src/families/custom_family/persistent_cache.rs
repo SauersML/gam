@@ -29,11 +29,9 @@ use std::sync::atomic::Ordering;
 use crate::solver::warm_start_artifact::{
     FIT_ARTIFACT_SCHEMA, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
     RowPopulationTag, SerializableBasisMeta, TermArtifact, TermIdentityKey, TermRole,
-    term_identity_from_block,
+    TransferProvenance, term_identity_from_block,
 };
-use crate::solver::warm_start_transfer::{
-    TermBuildContext, TransferConfig, TransferProvenance, build_warm_start,
-};
+use crate::solver::warm_start_transfer::{TermBuildContext, TransferConfig, build_warm_start};
 
 /// Build the structural identity of each block at the fit-spec layer. The
 /// returned `TermIdentityKey` is fold-invariant (keyed on block name +

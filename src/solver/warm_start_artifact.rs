@@ -20,7 +20,7 @@
 //! finite-guarded at consume time; any anomaly falls back to cold.
 
 use crate::cache::key::{Fingerprint, Fingerprinter};
-use crate::terms::basis::types::{BasisMetadata, DuchonNullspaceOrder, MaternNu};
+use crate::terms::basis::{BasisMetadata, DuchonNullspaceOrder, MaternNu};
 use serde::{Deserialize, Serialize};
 
 /// On-disk schema version for [`FitArtifact`]. Bump when the serialized
