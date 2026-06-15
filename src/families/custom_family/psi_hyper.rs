@@ -1087,9 +1087,38 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     .as_ref()
                     .map(|(_phi, hphi, _completion)| hphi),
             );
+        // The batched outer-gradient override produces the ENVELOPE gradient
+        // `objective_θ + ½tr[..] − ½ld_s` only — it omits the KKT-residual
+        // (one-step Newton profile) correction `−coord.gᵀq + ½qᵀ Ḣ q` that the
+        // unified evaluator applies (cost-side `−½rᵀH⁻¹r`, ρ AND ψ gradient
+        // derivatives) whenever the inner solve exits at β̂ with a nonzero KKT
+        // residual `r = ∇_β L_pen(β̂)`. At exact KKT (`r ≈ 0`) the correction is
+        // identically zero and the batched envelope gradient equals the unified
+        // gradient, so the fast path is used. When the inner exit accepts a
+        // non-negligible residual (near-singular blocks), the omitted term is
+        // amplified by `‖H⁻¹‖·‖r‖` and the envelope gradient diverges from the
+        // true derivative of the corrected objective — so fall back to the
+        // unified evaluator (which carries the correction for every coordinate).
+        let inner_kkt_residual_is_negligible = match inner.kkt_residual.as_ref() {
+            None => true,
+            Some(residual) => {
+                let r = residual.as_array();
+                let r_inf = r.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                // The KKT correction's leading term `−coord.gᵀ(H⁻¹r)` is bounded
+                // by `‖H⁻¹‖·‖coord.g‖·‖r‖`; treat the residual as exact only when
+                // its inf-norm is at the inner solve's own KKT tolerance floor
+                // (defaulting to a tight `1e-8` when the producer attached none),
+                // so the fast batched path is taken on well-converged fits and
+                // the unified correction path is taken whenever `r` is materially
+                // nonzero.
+                let tol = residual.residual_tol().unwrap_or(1.0e-8).max(1.0e-12);
+                r_inf <= tol
+            }
+        };
         let mut batched_gradient_override: Option<Array1<f64>> = None;
         if !has_configured_rho_prior
             && batched_gradient_contract_allows_override
+            && inner_kkt_residual_is_negligible
             && (eval_mode == EvalMode::ValueAndGradient
                 || eval_mode == EvalMode::ValueGradientHessian)
             && let Ok(Some(batch)) = family.batched_outer_gradient_terms(
