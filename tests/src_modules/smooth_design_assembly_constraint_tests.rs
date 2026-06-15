@@ -5969,7 +5969,7 @@
                 theta0.len(),
             )),
         );
-        cache.store_eval(eval.clone());
+        cache.store_eval_at(&theta0, eval.clone());
         let cached_eval = cache.memoized_eval(&theta0).expect("cached eval");
         assert!((cached_eval.0 - eval.0).abs() <= 1e-12);
         assert_eq!(cached_eval.1, eval.1);
