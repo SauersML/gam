@@ -1,3 +1,18 @@
+## gamfit 0.1.211 (2026-06-15)
+
+BMS biobank-fit perf + diagnostics. (1) **BLAS-3 rigid dense joint-Hessian**
+for the post-step Jeffreys/Firth KKT-residual term (the `gradient_reload`
+~8s/cycle floor) — same BLAS-1→BLAS-3 chunked-Gram treatment as the hessian_qp
+fix, bit-for-bit, full-data dense-design gated (subsample/HT fall through).
+(2) **Named heartbeat scopes for rigid coord_corrections** so the process
+monitor localizes where that step's time goes. (3) ψ outer gradient routed
+through the unified KKT-residual correction when the inner residual r≠0 (#740),
+vanishing at exact KKT. NOTE: the BLAS-3 inner-kernel fixes (this + 0.1.210's
+hessian_qp + 0.1.208's coord_corrections) all gate on the full-data
+unit-weight dense-design path; a run is the truth test for whether the biobank
+fit hits that gate (0.1.208's coord_corrections fix did not visibly land, under
+investigation).
+
 ## gamfit 0.1.210 (2026-06-15)
 
 BMS biobank-fit perf: **BLAS-3 rigid joint-Hessian directional derivative**
