@@ -1731,7 +1731,7 @@ fn build_sae_basis_evaluators(
     atom_dim: &[usize],
     coord_blocks: &[Array2<f64>],
     atom_centers: &[Option<Array2<f64>>],
-) -> Result<Vec<Option<Arc<dyn SaeBasisEvaluator>>>, String> {
+) -> Result<Vec<Option<Arc<dyn SaeBasisSecondJet>>>, String> {
     let k_atoms = basis_kinds.len();
     if atom_dim.len() != k_atoms
         || basis_sizes.len() != k_atoms
@@ -1746,11 +1746,16 @@ fn build_sae_basis_evaluators(
             atom_centers.len()
         ));
     }
-    let mut out: Vec<Option<Arc<dyn SaeBasisEvaluator>>> = Vec::with_capacity(k_atoms);
+    let mut out: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::with_capacity(k_atoms);
     for k in 0..k_atoms {
         let m = basis_sizes[k];
         let d = atom_dim[k];
-        let evaluator: Arc<dyn SaeBasisEvaluator> = match &basis_kinds[k] {
+        // Every production atom evaluator implements `SaeBasisSecondJet` (it
+        // exposes the analytic basis Hessian). Returning the second-jet trait
+        // object lets the term builder install it through
+        // `with_basis_second_jet`, which is the slot the #1117 rank-revealing
+        // reduction reads to reparametrize a rank-deficient decoder.
+        let evaluator: Arc<dyn SaeBasisSecondJet> = match &basis_kinds[k] {
             SaeAtomBasisKind::Periodic if d == 1 && m % 2 == 1 => {
                 Arc::new(PeriodicHarmonicEvaluator::new(m)?)
             }
@@ -1874,7 +1879,7 @@ fn metric_provenance_label(
 
 /// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
 /// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
-/// the per-atom [`SaeBasisEvaluator`] (analytic harmonic for `Periodic`
+/// the per-atom [`SaeBasisSecondJet`] (analytic harmonic for `Periodic`
 /// `latent_dim == 1`, chart for `Sphere`, tensor harmonic for `Torus`; the
 /// radial+polynomial Duchon and monomial Euclidean evaluators refresh from the
 /// auto path that threads their metadata). This precomputed-basis entry point

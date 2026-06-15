@@ -2362,6 +2362,121 @@ pub(crate) fn subspace_reduced_evaluator_composes_all_jets_by_q() {
     }
 }
 
+/// #1117 production-path regression: the periodic-circle atom built through the
+/// production term builder ([`term_from_padded_blocks_with_mode`], the exact
+/// route the `sae_manifold_fit*` FFI takes) must carry an analytic second-jet
+/// evaluator so the rank-revealing reduction can fire. The original #1113 split
+/// found that the builder installed the evaluator through the base-trait slot
+/// only (`basis_second_jet == None`), so `reduce_atoms_to_data_supported_rank`
+/// SKIPPED the rank-deficient circle, the `[SAE-AUDIT]` rank-3/5 warning kept
+/// firing, and the outer BFGS crawled the flat decoder valley past the 2-minute
+/// budget. After the fix the builder installs through the second-jet slot, the
+/// reduction reparametrizes the `M = 5` circle onto its `r = 3` data-supported
+/// subspace at fit entry, and `run_joint_fit_arrow_schur` terminates with a
+/// finite, non-increasing loss inside a tight iteration budget instead of
+/// stalling.
+#[test]
+pub(crate) fn production_builder_circle_reduces_rank_and_completes_stage1_step0_in_budget() {
+    // Three distinct phases repeated → the first-harmonic columns
+    // `[1, sin2πt, cos2πt]` span a rank-3 data subspace and the second-harmonic
+    // pair adds no new data direction: the bare data Gram is `rank 3/5`, the
+    // minimal reproducer of the OLMo `stage1-step0` PCA-32 circle deficiency.
+    let n_obs = 6usize;
+    let m = 5usize;
+    let d = 1usize;
+    let p = 2usize;
+    let k_atoms = 1usize;
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+    let coords = array![[0.1], [0.45], [0.8], [0.1], [0.45], [0.8]];
+    let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+
+    // Pad into the `(K, ...)`-leading storage the production builder consumes.
+    let mut basis_values = Array3::<f64>::zeros((k_atoms, n_obs, m));
+    basis_values.slice_mut(s![0, .., ..]).assign(&phi);
+    let mut basis_jacobian = Array4::<f64>::zeros((k_atoms, n_obs, m, d));
+    basis_jacobian.slice_mut(s![0, .., .., ..]).assign(&jet);
+    let mut decoder = Array3::<f64>::zeros((k_atoms, m, p));
+    decoder
+        .slice_mut(s![0, .., ..])
+        .assign(&array![[0.05, -0.02], [-0.05, 0.03], [0.05, 0.01], [0.02, -0.04], [-0.02, 0.02]]);
+    let mut penalties = Array3::<f64>::zeros((k_atoms, m, m));
+    penalties.slice_mut(s![0, .., ..]).assign(&Array2::<f64>::eye(m));
+    let logits = Array2::<f64>::zeros((n_obs, k_atoms));
+
+    // The production builder installs the evaluator through the second-jet slot
+    // (the fix). `SaeBasisSecondJet` is the supertrait of `SaeBasisEvaluator`.
+    let evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = vec![Some(evaluator)];
+    let mut term = term_from_padded_blocks_with_mode(
+        n_obs,
+        p,
+        &[SaeAtomBasisKind::Periodic],
+        basis_values.view(),
+        basis_jacobian.view(),
+        &[m],
+        &[d],
+        decoder.view(),
+        penalties.view(),
+        logits.view(),
+        std::slice::from_ref(&coords),
+        AssignmentMode::ibp_map(1.0, 1.0, false),
+        &evaluators,
+    )
+    .unwrap();
+
+    // The builder must populate the analytic-Hessian slot — without it the
+    // #1117 reduction silently skips the atom (the regression this guards).
+    assert!(
+        term.atoms[0].basis_second_jet.is_some(),
+        "production builder must install the analytic second-jet evaluator so the \
+         #1117 rank-revealing reduction can fire",
+    );
+
+    let target = array![
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [-1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [-1.0, 0.0]
+    ];
+    let mut rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    let loss0 = term.loss(target.view(), &rho).unwrap().total();
+
+    // Run with a TIGHT iteration budget. If the rank-deficient circle stalled in
+    // the flat decoder valley (the bug) it would burn its whole budget making
+    // cosmetic progress; here the fit-entry reduction makes the design full-rank
+    // so the inner Newton walk reaches a quotient-stationary point and the call
+    // returns a finite, non-increasing loss well inside the budget.
+    let loss = term
+        .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 8, 0.05, 1.0e-3, 1.0e-3)
+        .unwrap();
+
+    // The fit-entry reduction collapsed the unexcited harmonic: M = 5 → r = 3.
+    assert_eq!(
+        term.atoms[0].basis_size(),
+        3,
+        "the rank-deficient circle must be reparametrized onto its r = 3 \
+         data-supported subspace at fit entry",
+    );
+    assert!(
+        loss.total().is_finite(),
+        "rank-deficient circle fit must return a finite loss, not stall: {}",
+        loss.total(),
+    );
+    assert!(
+        loss.total() <= loss0 + 1.0e-8,
+        "the joint fit must not increase the loss (loss0={loss0}, loss={})",
+        loss.total(),
+    );
+    assert!(
+        term.assignment.coords[0]
+            .as_flat()
+            .iter()
+            .all(|v| v.is_finite()),
+        "fitted coordinates must stay finite",
+    );
+}
+
 /// #1117 idempotence: once an atom is reduced to a full-rank subspace, a
 /// second `reduce_atoms_to_data_supported_rank` pass is a NO-OP — the reduced
 /// data Gram is full rank (`r == m`), so the fit-entry installer skips it and

@@ -7394,9 +7394,16 @@ impl SaeManifoldTerm {
 /// selecting each atom's active prefix.
 ///
 /// `evaluators`, when non-empty, must have length `K`. Each entry attaches an
-/// optional [`SaeBasisEvaluator`] to the matching atom so the Rust Newton
+/// optional [`SaeBasisSecondJet`] to the matching atom so the Rust Newton
 /// loop can refresh `Phi`/`dPhi/dt` between iterations without rebuilding the
-/// term from Python. An empty slice leaves every atom in snapshot-only mode.
+/// term from Python. The evaluator is installed through
+/// [`SaeManifoldAtom::with_basis_second_jet`], so its closed-form Hessian slot
+/// is populated too — this is what lets the #1117 rank-revealing reduction
+/// (`reduce_atoms_to_data_supported_rank`) reparametrize a rank-deficient
+/// fixed-width decoder (e.g. the periodic circle's 5-column basis whose data
+/// Gram comes out rank 3/5 on a near-degenerate checkpoint) onto its
+/// data-supported subspace instead of stalling on the flat REML valley. An
+/// empty slice leaves every atom in snapshot-only mode.
 #[must_use = "build error must be handled"]
 pub fn term_from_padded_blocks_with_mode(
     n_obs: usize,
@@ -7411,7 +7418,7 @@ pub fn term_from_padded_blocks_with_mode(
     logits: ArrayView2<'_, f64>,
     coords: &[Array2<f64>],
     mode: AssignmentMode,
-    evaluators: &[Option<Arc<dyn SaeBasisEvaluator>>],
+    evaluators: &[Option<Arc<dyn SaeBasisSecondJet>>],
 ) -> Result<SaeManifoldTerm, String> {
     let k_atoms = basis_sizes.len();
     if latent_dims.len() != k_atoms || basis_kinds.len() != k_atoms || coords.len() != k_atoms {
@@ -7447,7 +7454,13 @@ pub fn term_from_padded_blocks_with_mode(
             s,
         )?;
         let atom = match evaluators.get(k).and_then(|slot| slot.clone()) {
-            Some(evaluator) => atom.with_basis_evaluator(evaluator),
+            // Install through the second-jet slot so the analytic Hessian is
+            // available: the #1117 rank-revealing reduction needs it to compose
+            // the reduced jets when it reparametrizes a rank-deficient atom onto
+            // its data-supported subspace. All production SAE evaluators
+            // (periodic/sphere/torus/cylinder/Duchon/Euclidean-patch) implement
+            // `SaeBasisSecondJet`, so this is the standard install path.
+            Some(evaluator) => atom.with_basis_second_jet(evaluator),
             None => atom,
         };
         atoms.push(atom);
