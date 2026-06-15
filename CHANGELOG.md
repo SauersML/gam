@@ -1,3 +1,29 @@
+## gamfit 0.1.207 (2026-06-15)
+
+Generative-dispersion cluster (#1124 / #1125), finishing and shipping a fix the
+prior run landed on main but never released or verified:
+
+- **#1124 (Python path):** `Model.sample_replicates` /
+  `posterior_predictive_check` drew Negative-Binomial replicate counts at the
+  construction **seed** `theta = 1.0` instead of the estimated `theta_hat`, so
+  replicate counts carried `Var = mu + mu^2` rather than `mu + mu^2/theta_hat`
+  (far too overdispersed; wrong posterior-predictive p-values). The CLI
+  `gam generate` path had been unified onto the canonical dispersion picker, but
+  `gam-pyffi`'s `generative_replicates_impl` kept a *separate inline copy* whose
+  NB arm read the seed. Routed it through the single
+  `gam::generative::family_noise_parameter`, so the CLI and Python front-ends can
+  never diverge on dispersion handling again.
+- **#1125:** verified the per-row precision channel `exp(eta_d(x))` is threaded
+  into `gam generate` for every dispersion location-scale family
+  (Gamma/NB/Beta/Tweedie) and restored the missing regression coverage.
+
+Verification: new deterministic cross-family `predict↔generate` per-row variance
+agreement test (max rel dev ~2e-16 across all four families, including the
+Tweedie φ = 1/precision reciprocal); restored Gamma-LS end-to-end CV test
+(impliedK 9.5→0.9 across x); new Python `sample_replicates` NB regression
+(recovers theta_hat, not the seed); all existing generative + #1057 replicate
+suites green.
+
 ## gamfit 0.1.206 (2026-06-15)
 
 BMS perf: **same-β reuse of the per-row cell-moment exact-cache**. Repeated
