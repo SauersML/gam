@@ -1,3 +1,19 @@
+## gamfit 0.1.213 (2026-06-15)
+
+Continues the biobank BMS perf attack on the outer REML/LAML derivative path —
+the real wall-clock black hole (coord_corrections, not Newton/PIRLS):
+- **BLAS-3 rigid Hessian fires for operator-backed designs.** The cycle-0
+  `hessian_qp` (~8s) and directional `gradient_reload` (~8s) floors were the
+  BLAS-3 override bailing to the per-row BLAS-1 SYR scatter whenever the
+  marginal/logslope design is operator-backed (always, at biobank scale, via the
+  #461 influence absorber / #978 overlap-Z). The override now chunks via
+  `try_row_chunk` and fires for any non-sparse design (sparse still routes to the
+  sparse-aware scatter); a `[STAGE]` line logs why the fast path was/wasn't taken.
+- **Jeffreys H_phi drift base hoisted** out of the per-direction loop — the
+  β-fixed part of the coord_corrections H_phi correction is computed once instead
+  of re-streamed per smoothing direction (full batched single-pass contraction
+  landing on top).
+
 ## gamfit 0.1.212 (2026-06-15)
 
 First publishable build since 0.1.209 — the 0.1.210/0.1.211 wheels failed the
