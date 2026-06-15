@@ -197,7 +197,6 @@ pub(crate) fn consume_fit_artifact_rho<F: CustomFamily + ?Sized>(
         .zip(slots.into_iter())
         .map(|(spec, rho_slots)| TermBuildContext {
             identity: block_term_identity(spec),
-            reduced_block_width: spec.design.ncols(),
             rho_slots,
         })
         .collect();

@@ -1,19 +1,19 @@
-//! Cross-fit warm-start *transfer*: build a starting iterate (block β and ρ)
-//! for a new fit from a structurally-matching parent [`FitArtifact`].
+//! Cross-fit warm-start *transfer*: build a starting ρ iterate for a new fit
+//! from a structurally-matching parent [`FitArtifact`].
 //!
-//! Phase 1 implements the **ρ half** of the transfer (the marquee LOSO win):
-//! for each new term, if a parent term shares its [`TermIdentityKey`], copy
-//! the parent's converged log-smoothing parameters into the new ρ layout —
-//! clamped out of the saturated box. Unmatched / brand-new terms fall back to
-//! the new fit's penalty-label default. β stays cold (zeros) in Phase 1; the
-//! function-space β projection is Phase 2.
+//! This is the **ρ half** of the transfer (the marquee LOSO win): for each new
+//! term, if a parent term shares its [`TermIdentityKey`], copy the parent's
+//! converged log-smoothing parameters into the new ρ layout — clamped out of
+//! the saturated box. Unmatched / brand-new terms fall back to the new fit's
+//! penalty-label default. β always stays cold (zeros at the new reduced block
+//! widths, seeded by the caller); only ρ transfers.
 //!
 //! Every path is exactness-preserving: a warm ρ only changes where the outer
 //! optimizer *starts*; it still runs to its KKT/REML certificate, so the
 //! converged optimum is identical to a cold start within tolerance. On any
-//! anomaly — missing parent, length mismatch, non-finite payload — the build
-//! returns an all-cold result (never an error), so a misfired transfer can
-//! never fail a fit.
+//! anomaly — missing parent, descriptor mismatch, non-finite payload — the
+//! build returns an error and the caller cold-starts, so a misfired transfer
+//! can never fail a fit.
 
 use crate::solver::warm_start_artifact::{
     FitArtifact, FitDescriptor, RHO_SATURATION, TermIdentityKey, TransferProvenance,
@@ -21,25 +21,22 @@ use crate::solver::warm_start_artifact::{
 use ndarray::Array1;
 
 /// Per-term context for the new (about-to-run) fit. Carries everything the
-/// transfer needs to lay β and ρ out in the new fit's coordinate system
-/// without reaching back into the solver internals.
+/// transfer needs to lay ρ out in the new fit's coordinate system without
+/// reaching back into the solver internals.
 #[derive(Clone, Debug)]
 pub struct TermBuildContext {
     /// Structural identity of this new-fit term.
     pub identity: TermIdentityKey,
-    /// Reduced (post-identifiability) block width — the length of the cold β
-    /// vector this term contributes to the inner solve.
-    pub reduced_block_width: usize,
     /// Indices into the new fit's outer ρ vector that this term's penalties
     /// occupy (after label de-duplication). Empty for an unpenalized term.
     pub rho_slots: Vec<usize>,
 }
 
-/// Result of a warm-start build: one cold-or-warm β per new block, the new ρ
-/// vector, and a per-term provenance trace for logging / tests.
+/// Result of a warm-start build: the new ρ vector and a per-term provenance
+/// trace for logging / tests. β stays cold (the new fit's reduced block
+/// widths, all zeros) and is not materialized here — only ρ transfers.
 #[derive(Clone, Debug)]
 pub struct TransferResult {
-    pub block_beta: Vec<Array1<f64>>,
     pub rho: Array1<f64>,
     pub provenance: Vec<TransferProvenance>,
 }
@@ -79,19 +76,6 @@ pub enum TransferError {
     DescriptorMismatch,
 }
 
-/// Build an all-cold result for the given new-fit layout: zero β at each
-/// reduced block width, ρ set to the new fit's label-layout default.
-pub fn cold_result(new_terms: &[TermBuildContext], rho_default: &Array1<f64>) -> TransferResult {
-    TransferResult {
-        block_beta: new_terms
-            .iter()
-            .map(|t| Array1::<f64>::zeros(t.reduced_block_width))
-            .collect(),
-        rho: rho_default.clone(),
-        provenance: vec![TransferProvenance::Cold; new_terms.len()],
-    }
-}
-
 /// Build a warm-start iterate for `new_descriptor` from `parent`.
 ///
 /// Phase 1 contract:
@@ -101,9 +85,8 @@ pub fn cold_result(new_terms: &[TermBuildContext], rho_default: &Array1<f64>) ->
 ///     into the interior and skipping any saturated parent coordinate;
 ///     otherwise leave the new fit's default in those slots.
 ///
-/// On any anomaly the all-cold result is returned (with a `TransferError`
-/// so callers can log which guard fired); the caller still gets a usable
-/// behavior-neutral iterate.
+/// On any anomaly a `TransferError` is returned so callers can log which
+/// guard fired and cold-start; a misfired transfer can never fail a fit.
 pub fn build_warm_start(
     new_descriptor: &FitDescriptor,
     new_terms: &[TermBuildContext],
@@ -120,12 +103,8 @@ pub fn build_warm_start(
         return Err(TransferError::DescriptorMismatch);
     }
 
-    // β stays cold in Phase 1.
-    let block_beta: Vec<Array1<f64>> = new_terms
-        .iter()
-        .map(|t| Array1::<f64>::zeros(t.reduced_block_width))
-        .collect();
-
+    // β stays cold in Phase 1: only ρ transfers, so β is never materialized
+    // here — the caller seeds zeros at the new reduced block widths.
     let mut rho = rho_default.clone();
     let mut provenance = vec![TransferProvenance::Cold; new_terms.len()];
 
@@ -178,11 +157,7 @@ pub fn build_warm_start(
         };
     }
 
-    Ok(TransferResult {
-        block_beta,
-        rho,
-        provenance,
-    })
+    Ok(TransferResult { rho, provenance })
 }
 
 #[cfg(test)]
@@ -190,30 +165,31 @@ mod tests {
     use super::*;
     use crate::solver::warm_start_artifact::{
         FIT_ARTIFACT_SCHEMA, GlobalFitSummary, ResponseSig, SerializableBasisMeta, TermArtifact,
-        TermRole, term_identity,
+        TermRole, term_identity_from_block,
     };
-    use crate::terms::basis::{BasisMetadata, DuchonNullspaceOrder};
-    use ndarray::{Array1, Array2};
+    use ndarray::Array1;
 
-    fn duchon_meta(n_centers: usize) -> BasisMetadata {
-        BasisMetadata::Duchon {
-            centers: Array2::<f64>::zeros((n_centers, 2)),
-            length_scale: None,
-            periodic: None,
-            power: 1.0,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability_transform: None,
-            input_scales: None,
-            aniso_log_scales: None,
-            operator_collocation_points: None,
+    /// Block-layer term identity (the surviving, fold-invariant identity API),
+    /// one unlabeled penalty over a 1-dim nullspace.
+    fn block_id(block_name: &str) -> TermIdentityKey {
+        term_identity_from_block(TermRole::Mean, block_name, &[None], &[1])
+    }
+
+    /// Minimal serializable basis-meta stub, as produced at the block-spec
+    /// capture layer.
+    fn basis_meta_stub() -> SerializableBasisMeta {
+        SerializableBasisMeta {
+            kind: "block-spec".to_string(),
+            degree: None,
+            num_knots: None,
+            n_centers: Some(5),
+            nullspace_order: None,
+            matern_nu: None,
+            periodic: false,
         }
     }
 
-    fn parent_with(
-        identity: TermIdentityKey,
-        meta: &BasisMetadata,
-        rho_for_term: Vec<f64>,
-    ) -> FitArtifact {
+    fn parent_with(identity: TermIdentityKey, rho_for_term: Vec<f64>) -> FitArtifact {
         FitArtifact {
             schema: FIT_ARTIFACT_SCHEMA,
             created_unix_secs: 0,
@@ -229,7 +205,7 @@ mod tests {
             terms: vec![TermArtifact {
                 identity,
                 role: TermRole::Mean,
-                basis_meta: SerializableBasisMeta::from_metadata(meta),
+                basis_meta: basis_meta_stub(),
                 joint_null_rotation: None,
                 raw_beta: vec![0.0; 5],
                 rho_for_term,
@@ -256,12 +232,10 @@ mod tests {
 
     #[test]
     fn matched_term_copies_parent_rho() {
-        let meta = duchon_meta(10);
-        let id = term_identity(TermRole::Mean, &["x".to_string()], &meta);
-        let parent = parent_with(id, &meta, vec![2.5]);
+        let id = block_id("s(x)");
+        let parent = parent_with(id, vec![2.5]);
         let new_terms = vec![TermBuildContext {
             identity: id,
-            reduced_block_width: 9, // a different (fold) reduced width — still matches
             rho_slots: vec![0],
         }];
         let rho_default = Array1::from_vec(vec![0.0]);
@@ -275,29 +249,24 @@ mod tests {
         .expect("transfer builds");
         assert_eq!(res.rho[0], 2.5, "matched term must inherit parent ρ");
         assert_eq!(res.provenance[0], TransferProvenance::RhoOnly);
-        // β stays cold at the NEW reduced width.
-        assert_eq!(res.block_beta[0].len(), 9);
-        assert!(res.block_beta[0].iter().all(|&v| v == 0.0));
     }
 
     #[test]
     fn unmatched_term_keeps_default() {
-        let meta = duchon_meta(10);
-        let parent_id = term_identity(TermRole::Mean, &["x".to_string()], &meta);
-        // The new term has a DIFFERENT identity (different variable), so even
+        let parent_id = block_id("s(x)");
+        // The new term has a DIFFERENT identity (different block), so even
         // though the descriptor keys are forced to agree, the per-term match
         // fails and the new default ρ is retained.
-        let new_id = term_identity(TermRole::Mean, &["z".to_string()], &meta);
+        let new_id = block_id("s(z)");
         let new_terms = vec![TermBuildContext {
             identity: new_id,
-            reduced_block_width: 9,
             rho_slots: vec![0],
         }];
         let rho_default = Array1::from_vec(vec![-1.3]);
         // Parent whose descriptor key matches the new fit (so the build is not
         // rejected up front) but whose single term carries `parent_id`, which
         // does not match `new_id` — isolating the per-term unmatched path.
-        let mut parent = parent_with(new_id, &meta, vec![2.5]);
+        let mut parent = parent_with(new_id, vec![2.5]);
         parent.terms[0].identity = parent_id;
         let res = build_warm_start(
             &new_descriptor(new_id),
@@ -313,13 +282,11 @@ mod tests {
 
     #[test]
     fn saturated_parent_rho_not_copied() {
-        let meta = duchon_meta(10);
-        let id = term_identity(TermRole::Mean, &["x".to_string()], &meta);
+        let id = block_id("s(x)");
         // Parent ρ at the box: must NOT be copied.
-        let parent = parent_with(id, &meta, vec![12.0]);
+        let parent = parent_with(id, vec![12.0]);
         let new_terms = vec![TermBuildContext {
             identity: id,
-            reduced_block_width: 9,
             rho_slots: vec![0],
         }];
         let rho_default = Array1::from_vec(vec![0.7]);
@@ -337,13 +304,11 @@ mod tests {
 
     #[test]
     fn near_box_parent_rho_is_interior_clamped() {
-        let meta = duchon_meta(10);
-        let id = term_identity(TermRole::Mean, &["x".to_string()], &meta);
+        let id = block_id("s(x)");
         // Finite but near the box (below saturation): copied, then clamped.
-        let parent = parent_with(id, &meta, vec![8.7]);
+        let parent = parent_with(id, vec![8.7]);
         let new_terms = vec![TermBuildContext {
             identity: id,
-            reduced_block_width: 9,
             rho_slots: vec![0],
         }];
         let rho_default = Array1::from_vec(vec![0.0]);
@@ -356,14 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn nonfinite_parent_falls_back_cold() {
-        let meta = duchon_meta(10);
-        let id = term_identity(TermRole::Mean, &["x".to_string()], &meta);
-        let mut parent = parent_with(id, &meta, vec![2.0]);
+    fn nonfinite_parent_is_rejected() {
+        let id = block_id("s(x)");
+        let mut parent = parent_with(id, vec![2.0]);
         parent.terms[0].raw_beta[0] = f64::NAN; // corrupt the parent
         let new_terms = vec![TermBuildContext {
             identity: id,
-            reduced_block_width: 9,
             rho_slots: vec![0],
         }];
         let rho_default = Array1::from_vec(vec![0.42]);
@@ -376,29 +339,22 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, TransferError::ParentUnusable);
-        // The caller's cold fallback yields the default ρ untouched.
-        let cold = cold_result(&new_terms, &rho_default);
-        assert_eq!(cold.rho[0], 0.42);
-        assert!(cold.block_beta[0].iter().all(|&v| v == 0.0));
-        assert_eq!(cold.provenance, vec![TransferProvenance::Cold]);
     }
 
     #[test]
-    fn beta_is_always_cold_in_phase1() {
-        // Exactness/no-op guard: regardless of what ρ transfers, β must remain
-        // exactly zeros at the NEW reduced widths — a warm ρ only moves the
-        // outer optimizer's starting iterate, it never seeds β, so it cannot
-        // change the converged optimum (which still runs to the KKT/REML
-        // certificate). This is the behavior-neutrality contract.
-        let meta = duchon_meta(10);
-        let id = term_identity(TermRole::Mean, &["x".to_string()], &meta);
-        let parent = parent_with(id, &meta, vec![3.3]);
+    fn rho_only_transfer_leaves_unrelated_slots_at_default() {
+        // Behavior-neutrality contract: only matched ρ slots move; everything
+        // else keeps the new fit's default. A warm ρ merely shifts the outer
+        // optimizer's starting iterate; it still runs to the KKT/REML
+        // certificate, so the converged optimum is unchanged.
+        let id = block_id("s(x)");
+        let parent = parent_with(id, vec![3.3]);
         let new_terms = vec![TermBuildContext {
             identity: id,
-            reduced_block_width: 12,
             rho_slots: vec![0],
         }];
-        let rho_default = Array1::from_vec(vec![0.0]);
+        // Slot 1 belongs to no transferred term and must stay at its default.
+        let rho_default = Array1::from_vec(vec![0.0, -2.0]);
         let res = build_warm_start(
             &new_descriptor(id),
             &new_terms,
@@ -407,33 +363,17 @@ mod tests {
             TransferConfig::default(),
         )
         .expect("transfer builds");
-        // β identical to the all-cold result.
-        let cold = cold_result(&new_terms, &rho_default);
-        assert_eq!(res.block_beta.len(), cold.block_beta.len());
-        for (w, c) in res.block_beta.iter().zip(cold.block_beta.iter()) {
-            assert_eq!(w, c, "β must equal the cold-start β");
-        }
-        // ρ DID warm-start (that's the win), but β did not move.
-        assert_eq!(res.rho[0], 3.3);
-    }
-
-    #[test]
-    fn empty_terms_yields_empty_cold() {
-        let res = cold_result(&[], &Array1::from_vec(vec![]));
-        assert!(res.block_beta.is_empty());
-        assert!(res.rho.is_empty());
-        assert!(res.provenance.is_empty());
+        assert_eq!(res.rho[0], 3.3, "matched slot warm-starts");
+        assert_eq!(res.rho[1], -2.0, "unrelated slot keeps the default");
     }
 
     #[test]
     fn descriptor_mismatch_rejected() {
-        let meta = duchon_meta(10);
-        let id_a = term_identity(TermRole::Mean, &["x".to_string()], &meta);
-        let id_b = term_identity(TermRole::Mean, &["z".to_string()], &meta);
-        let parent = parent_with(id_a, &meta, vec![2.0]);
+        let id_a = block_id("s(x)");
+        let id_b = block_id("s(z)");
+        let parent = parent_with(id_a, vec![2.0]);
         let new_terms = vec![TermBuildContext {
             identity: id_b,
-            reduced_block_width: 9,
             rho_slots: vec![0],
         }];
         let rho_default = Array1::from_vec(vec![0.0]);

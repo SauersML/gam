@@ -371,28 +371,14 @@ mod warm_start_artifact_tests {
     use super::*;
     use crate::solver::warm_start_artifact::{
         FIT_ARTIFACT_SCHEMA, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
-        SerializableBasisMeta, TermArtifact, TermRole, term_identity,
+        SerializableBasisMeta, TermArtifact, TermRole, term_identity_from_block,
     };
-    use crate::terms::basis::{BasisMetadata, DuchonNullspaceOrder};
-    use ndarray::Array2;
-
-    fn duchon_meta(n_centers: usize) -> BasisMetadata {
-        BasisMetadata::Duchon {
-            centers: Array2::<f64>::zeros((n_centers, 2)),
-            length_scale: None,
-            periodic: None,
-            power: 1.0,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability_transform: None,
-            input_scales: None,
-            aniso_log_scales: None,
-            operator_collocation_points: None,
-        }
-    }
 
     fn sample_artifact(family: &str, var: &str, rho: Vec<f64>) -> FitArtifact {
-        let meta = duchon_meta(8);
-        let id = term_identity(TermRole::Mean, &[var.to_string()], &meta);
+        // Block-layer identity (the surviving, fold-invariant identity API):
+        // the block name carries the variable, with one unlabeled penalty.
+        let block_name = format!("s({var})");
+        let id = term_identity_from_block(TermRole::Mean, &block_name, &[None], &[1]);
         FitArtifact {
             schema: FIT_ARTIFACT_SCHEMA,
             created_unix_secs: unix_secs_now(),
@@ -408,7 +394,15 @@ mod warm_start_artifact_tests {
             terms: vec![TermArtifact {
                 identity: id,
                 role: TermRole::Mean,
-                basis_meta: SerializableBasisMeta::from_metadata(&meta),
+                basis_meta: SerializableBasisMeta {
+                    kind: "block-spec".to_string(),
+                    degree: None,
+                    num_knots: None,
+                    n_centers: Some(8),
+                    nullspace_order: None,
+                    matern_nu: None,
+                    periodic: false,
+                },
                 joint_null_rotation: None,
                 raw_beta: vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.6, -0.7, 0.8],
                 rho_for_term: rho,
