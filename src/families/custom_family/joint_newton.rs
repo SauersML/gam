@@ -2836,14 +2836,42 @@ pub(crate) mod whitened_spectrum {
                     .iter()
                     .map(|w| 1.0 / positive_joint_diagonal_entry(*w).sqrt()),
             );
-            // A = D^{-1/2} H D^{-1/2}; symmetric since H is symmetric and D diagonal.
+            // A = D^{-1/2} H D^{-1/2}; symmetric since H is symmetric and D
+            // diagonal. This runs once per joint-Newton cycle on a ~p²-element
+            // matrix (p up to ~382 on the coupled multinomial / survival
+            // marginal-slope inner, gam#1082), so it is on the per-cycle hot
+            // path alongside the O(p³) eigh below. The prior code was a serial
+            // `for i,j in 0..p` double loop followed by a full
+            // `symmetrize_dense_in_place` sweep. Two math-identical wins:
+            //   1. `A` is exactly symmetric because `H` is symmetric and `D`
+            //      diagonal, so row `i` of `A` equals `d_inv_sqrt[i] · (h_pen
+            //      row i) ⊙ d_inv_sqrt`. Filling each row from that closed form
+            //      yields a fully symmetric matrix with NO separate
+            //      `symmetrize_dense_in_place` pass (drops a whole O(p²) sweep
+            //      while keeping both triangles consistent, which the rare
+            //      `FaerEigh::eigh` repair branch — it averages `[i,j]`/`[j,i]`
+            //      — relies on).
+            //   2. Rows are independent and own disjoint output slices, so we
+            //      fan the fill across the Rayon pool (the same pool faer's eigh
+            //      uses) via `outer_iter_mut().into_par_iter()`. No unsafe, no
+            //      cross-row writes. The eigh dominates, but this assembly was
+            //      otherwise a purely serial bounds-checked scalar loop.
             let mut a = Array2::<f64>::zeros((p, p));
-            for i in 0..p {
-                for j in 0..p {
-                    a[[i, j]] = h_pen[[i, j]] * d_inv_sqrt[i] * d_inv_sqrt[j];
-                }
+            {
+                use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+                let d = d_inv_sqrt.as_slice().expect("contiguous d_inv_sqrt");
+                a.outer_iter_mut()
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(i, mut a_row)| {
+                        let di = d[i];
+                        let h_row = h_pen.row(i);
+                        let out = a_row.as_slice_mut().expect("contiguous A row");
+                        for (j, out_j) in out.iter_mut().enumerate() {
+                            *out_j = h_row[j] * di * d[j];
+                        }
+                    });
             }
-            symmetrize_dense_in_place(&mut a);
             let (gamma, evecs) = FaerEigh::eigh(&a, Side::Lower)
                 .map_err(|e| format!("whitened trust-region eigendecomposition failed: {e}"))?;
             // c = Vᵀ (D^{-1/2} rhs).
