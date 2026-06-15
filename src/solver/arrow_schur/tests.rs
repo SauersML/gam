@@ -2570,6 +2570,121 @@ pub(crate) fn parallel_schur_matvec_deterministic_and_matches_sequential() {
     }
 }
 
+/// Sequential reference for the cross-row matvec: the row-order fold of the
+/// same per-row contributions `arrow_cross_row_matvec` accumulates, followed by
+/// the post-loop `H_ββ + ridge` prologue and cross-row penalty Hessian. Used to
+/// pin the parallelized n-row loop against an independent serial computation.
+pub(crate) fn cross_row_matvec_sequential_ref(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x_t: ArrayView1<'_, f64>,
+    x_beta: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    let n = sys.rows.len();
+    let k = sys.k;
+    let total_dt = sys.row_offsets[n];
+    let mut y_t = Array1::<f64>::zeros(total_dt);
+    let mut y_beta = Array1::<f64>::zeros(k);
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let base = sys.row_offsets[i];
+        let row = &sys.rows[i];
+        for a in 0..di {
+            let mut acc = ridge_t * x_t[base + a];
+            for b in 0..di {
+                acc += row.htt[[a, b]] * x_t[base + b];
+            }
+            y_t[base + a] = acc;
+        }
+        let mut slab = Array1::<f64>::zeros(di);
+        sys_htbeta_apply_row(sys, i, row, x_beta, &mut slab);
+        for c in 0..di {
+            y_t[base + c] += slab[c];
+        }
+        let x_ti = x_t.slice(ndarray::s![base..base + di]).to_owned();
+        sys_htbeta_accumulate_transpose(sys, i, row, x_ti.view(), &mut y_beta);
+    }
+    {
+        let x_beta_slice = x_beta.as_slice().expect("x_beta contiguous");
+        let y_beta_slice = y_beta.as_slice_mut().expect("y_beta contiguous");
+        sys.penalty_matvec_add(x_beta_slice, y_beta_slice);
+    }
+    for a in 0..k {
+        y_beta[a] += ridge_beta * x_beta[a];
+    }
+    sys.apply_cross_row_penalty_hessian(x_t, &mut y_t);
+    (y_t, y_beta)
+}
+
+/// The parallel cross-row matvec (`arrow_cross_row_matvec`, the per-CG-iteration
+/// operator of the cross-row coupled Newton solve) must, like its `schur_matvec`
+/// twin, be (a) DETERMINISTIC run-to-run — bit-identical across repeated
+/// invocations regardless of thread scheduling (the #1017 gate: the criterion
+/// ranking across candidates cannot move); and (b) equal to the sequential
+/// row-order fold — bit-identical on the disjoint `y_t` writes and within
+/// ULP-scale reassociation on the cross-row `y_beta` sum.
+#[test]
+pub(crate) fn parallel_cross_row_matvec_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
+    let d = 5usize;
+    let k = 80usize;
+    let sys = dense_arrow_system(n, d, k);
+    let total_dt = sys.row_offsets[n];
+    let ridge_t = 1e-5;
+    let ridge_beta = 1e-6;
+    let x_t = Array1::from_iter((0..total_dt).map(|i| 0.2 * (i as f64).cos() + 0.05));
+    let x_beta = Array1::from_iter((0..k).map(|a| 0.3 * (a as f64).sin() - 0.1));
+
+    // (a) Determinism: two independent invocations of the live (parallel) path
+    // must be bit-identical in both output blocks.
+    let (yt_a, yb_a) =
+        arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    let (yt_b, yb_b) =
+        arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    for i in 0..total_dt {
+        assert_eq!(
+            yt_a[i].to_bits(),
+            yt_b[i].to_bits(),
+            "parallel cross-row matvec y_t must be deterministic at {i}"
+        );
+    }
+    for a in 0..k {
+        assert_eq!(
+            yb_a[a].to_bits(),
+            yb_b[a].to_bits(),
+            "parallel cross-row matvec y_beta must be deterministic at {a}"
+        );
+    }
+
+    // (b) Equivalence with the sequential row-order fold.
+    let (yt_seq, yb_seq) =
+        cross_row_matvec_sequential_ref(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    // y_t writes are disjoint per row → bit-identical to the serial fold.
+    for i in 0..total_dt {
+        assert_eq!(
+            yt_a[i].to_bits(),
+            yt_seq[i].to_bits(),
+            "parallel cross-row matvec y_t must match the sequential fold bit-for-bit at {i}"
+        );
+    }
+    // y_beta is a cross-row accumulation → equal within reassociation error.
+    let scale = yb_seq
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    for a in 0..k {
+        let rel = (yb_a[a] - yb_seq[a]).abs() / scale;
+        assert!(
+            rel < 1e-12,
+            "parallel vs sequential cross-row matvec y_beta must agree to reassociation \
+                 error at {a}: {} vs {} (rel {rel:e})",
+            yb_a[a],
+            yb_seq[a]
+        );
+    }
+}
+
 /// The dense `H_ββ` penalty-prologue GEMV parallelized over output rows at
 /// the wide SAE border (`k ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN`, #1017) must be
 /// **bit-identical** to the serial prologue — unlike the per-row reduction,

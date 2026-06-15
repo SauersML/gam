@@ -1609,6 +1609,48 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
 /// `y_β = Σ_i H_βt^(i) x_t,i + (H_ββ + ridge_β·I) x_β`. `P_cross` adds the
 /// captured cross-row penalty Hessian to the latent block only:
 /// `y_t += P_cross · x_t`.
+/// One row block's contribution to the cross-row matvec.
+///
+/// Writes the disjoint `y_t` segment for row `i` into `seg` at offset
+/// `sys.row_offsets[i] - seg_start` (length `di`) and accumulates the row's
+/// `H_βt^(i) x_t,i` transpose contribution into the shared length-`k`
+/// `y_beta_acc`. Shared by the serial and parallel paths so the per-row
+/// arithmetic — and thus the converged step — is identical; only the `y_beta`
+/// reduction grouping differs between them.
+#[inline]
+fn cross_row_matvec_row_into(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    i: usize,
+    x_t: ArrayView1<'_, f64>,
+    x_beta: ArrayView1<'_, f64>,
+    seg_start: usize,
+    seg: &mut [f64],
+    y_beta_acc: &mut Array1<f64>,
+) {
+    let di = sys.row_dims[i];
+    let base = sys.row_offsets[i];
+    let row = &sys.rows[i];
+    let local = base - seg_start;
+    // H_tt^(i) x_t,i + ridge_t x_t,i.
+    for a in 0..di {
+        let mut acc = ridge_t * x_t[base + a];
+        for b in 0..di {
+            acc += row.htt[[a, b]] * x_t[base + b];
+        }
+        seg[local + a] = acc;
+    }
+    // + H_tβ^(i) x_β.
+    let mut slab = Array1::<f64>::zeros(di);
+    sys_htbeta_apply_row(sys, i, row, x_beta, &mut slab);
+    for c in 0..di {
+        seg[local + c] += slab[c];
+    }
+    // y_β += H_βt^(i) x_t,i.
+    let x_ti = x_t.slice(ndarray::s![base..base + di]).to_owned();
+    sys_htbeta_accumulate_transpose(sys, i, row, x_ti.view(), y_beta_acc);
+}
+
 pub(crate) fn arrow_cross_row_matvec(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
@@ -1621,31 +1663,57 @@ pub(crate) fn arrow_cross_row_matvec(
     let total_dt = sys.row_offsets[n];
     let mut y_t = Array1::<f64>::zeros(total_dt);
     let mut y_beta = Array1::<f64>::zeros(k);
-    let mut htbeta_xb = Array1::<f64>::zeros(sys.d);
-    for i in 0..n {
-        let di = sys.row_dims[i];
-        let base = sys.row_offsets[i];
-        let row = &sys.rows[i];
-        // H_tt^(i) x_t,i + ridge_t x_t,i.
-        for a in 0..di {
-            let mut acc = ridge_t * x_t[base + a];
-            for b in 0..di {
-                acc += row.htt[[a, b]] * x_t[base + b];
+    // Per-CG-iteration matvec of the cross-row coupled Newton system. The `n`
+    // per-row contributions write disjoint `y_t` segments and accumulate into
+    // the shared length-`k` `y_beta`; for the SAE LLM shape (#1017) this n-row
+    // pass is the matvec's whole cost — the exact twin of `schur_matvec`, which
+    // was already fanned out, but this cross-row path ran it on one core. Fan it
+    // over rayon row chunks, folding the `y_beta` partials in chunk order so the
+    // f64 reduction is bit-identical run-to-run regardless of thread scheduling
+    // (the #1017 determinism gate: the criterion ranking across topology
+    // candidates must not move). The `y_t` writes are disjoint per row, so no
+    // reduction is needed there. Stay sequential below the floor and when
+    // already inside a rayon worker (the topology race fans candidates with
+    // `run_topology_race_parallel`) — the same nesting guard `schur_matvec` uses.
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    if parallel {
+        use rayon::prelude::*;
+        const CHUNK: usize = 64;
+        // Each chunk owns a contiguous run of rows: it produces its `y_t`
+        // segment (placed by absolute offset) and a length-`k` `y_beta` partial.
+        let chunks: Vec<(usize, Vec<f64>, Array1<f64>)> = (0..n)
+            .into_par_iter()
+            .chunks(CHUNK)
+            .map(|idxs| {
+                let first = idxs[0];
+                let last = idxs[idxs.len() - 1];
+                let seg_start = sys.row_offsets[first];
+                let seg_end = sys.row_offsets[last] + sys.row_dims[last];
+                let mut seg = vec![0.0_f64; seg_end - seg_start];
+                let mut acc = Array1::<f64>::zeros(k);
+                for i in idxs {
+                    cross_row_matvec_row_into(
+                        sys, ridge_t, i, x_t, x_beta, seg_start, &mut seg, &mut acc,
+                    );
+                }
+                (seg_start, seg, acc)
+            })
+            .collect();
+        // Deterministic ordered assembly: scatter each chunk's disjoint `y_t`
+        // segment, fold the `y_beta` partials left-to-right (chunk order).
+        for (seg_start, seg, acc) in &chunks {
+            for (o, v) in seg.iter().enumerate() {
+                y_t[seg_start + o] = *v;
             }
-            y_t[base + a] = acc;
+            for j in 0..k {
+                y_beta[j] += acc[j];
+            }
         }
-        // + H_tβ^(i) x_β.
-        for c in 0..di {
-            htbeta_xb[c] = 0.0;
+    } else {
+        let y_t_slice = y_t.as_slice_mut().expect("y_t contiguous");
+        for i in 0..n {
+            cross_row_matvec_row_into(sys, ridge_t, i, x_t, x_beta, 0, y_t_slice, &mut y_beta);
         }
-        let mut slab = htbeta_xb.slice_mut(ndarray::s![..di]).to_owned();
-        sys_htbeta_apply_row(sys, i, row, x_beta, &mut slab);
-        for c in 0..di {
-            y_t[base + c] += slab[c];
-        }
-        // y_β += H_βt^(i) x_t,i.
-        let x_ti = x_t.slice(ndarray::s![base..base + di]).to_owned();
-        sys_htbeta_accumulate_transpose(sys, i, row, x_ti.view(), &mut y_beta);
     }
     // y_β += (H_ββ + ridge_β·I) x_β.
     {
