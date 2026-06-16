@@ -17,6 +17,13 @@
 //! 3. pack moments into the GPU-shaped output buffer with the agreed stride,
 //! 4. record one status code per cell so the caller can react to per-cell
 //!    failures without having to re-run the CPU classifier.
+//!
+//! The production substrate's host path returns only the per-cell status
+//! codes (see [`build_host_cell_status`]); production consumers (BMS
+//! row-primary Hessian, survival-flex row evaluator) read the verdict but
+//! never the moments themselves. The moment-emitting reference path
+//! (`build_host_moments` + `HostMomentBatch`) lives in the test module below
+//! as a comparison oracle for the device kernel's row-major moment buffer.
 
 use crate::families::cubic_cell_kernel::{
     DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
@@ -26,47 +33,38 @@ use crate::gpu::kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellMomentStatus, GpuCellBranchTag,
 };
 
-/// Output of [`build_host_moments`]: row-major moments, per-cell status
-/// codes, and the stride used to index `moments`. The row for cell `i` is
-/// `moments[i * stride ..][..stride]`; rows for non-OK cells are zeroed.
-pub(crate) struct HostMomentBatch {
-    pub moments: Vec<f64>,
-    pub status: Vec<u8>,
-    pub stride: usize,
-}
-
-/// CPU implementation of the GPU substrate. Returns row-major derivative
-/// moments + per-cell status. Mirrors the shape the device kernel will write
-/// so a future GPU landing is a drop-in substitute.
-pub(crate) fn build_host_moments(
+/// Classify each cell with the host classifier and return the per-cell
+/// status vector — the only payload production callers (the substrate's
+/// `Host` residency output, and the survival-flex row evaluator) consume on
+/// the CPU path.
+pub(crate) fn build_host_cell_status(
     view: &CubicCellDerivativeMomentHostView<'_>,
-) -> Result<HostMomentBatch, String> {
+) -> Result<Vec<u8>, String> {
     let n_cells = view.cells.len();
-    let stride = view.max_degree + 1;
-    let mut moments = vec![0.0_f64; n_cells.saturating_mul(stride)];
     let mut status = vec![CubicCellMomentStatus::Ok as u8; n_cells];
 
     for (i, &gpu_cell) in view.cells.iter().enumerate() {
-        let row = &mut moments[i * stride..(i + 1) * stride];
-
         let host_tag = match classify_cell_for_gpu(gpu_cell) {
             Ok(tag) => tag,
             Err(code) => {
                 status[i] = code as u8;
-                // Row already initialized to zero.
                 continue;
             }
         };
         let caller_tag = view.branches[i];
         if host_tag != caller_tag {
-            // Caller's classifier disagreed with ours — refuse rather than
-            // silently produce a different cell's moments. The substrate
-            // does not arbitrate; it routes the per-cell failure back to
-            // the caller so they can re-classify or fall back.
+            // Caller's classifier disagreed with ours — refuse the cell
+            // rather than silently producing a different cell's status.
             status[i] = CubicCellMomentStatus::InvalidInterval as u8;
             continue;
         }
 
+        // The production substrate path does not need the moments
+        // themselves; it consumes only the per-cell classifier verdict.
+        // We still simulate the evaluator's failure modes here so the
+        // status vector mirrors what `build_host_moments` would have
+        // recorded (NonFiniteEvaluation, etc.) for parity with the
+        // moment-emitting path.
         let cpu_cell = DenestedCubicCell {
             left: gpu_cell.left,
             right: gpu_cell.right,
@@ -77,21 +75,11 @@ pub(crate) fn build_host_moments(
         };
         match evaluate_cell_derivative_moments_uncached(cpu_cell, view.max_degree) {
             Ok(state) => {
-                // The CPU evaluator returns `max_degree + 1` moments by
-                // construction; copying the prefix matches the row.
-                let copy_len = state.moments.len().min(stride);
-                row[..copy_len].copy_from_slice(&state.moments[..copy_len]);
-                // Guard against an evaluator that produced a non-finite
-                // moment — happens when q overflows for pathological cells.
-                if row.iter().any(|x| !x.is_finite()) {
-                    for slot in row.iter_mut() {
-                        *slot = 0.0;
-                    }
+                if state.moments.iter().any(|x| !x.is_finite()) {
                     status[i] = CubicCellMomentStatus::NonFiniteEvaluation as u8;
                 }
             }
             Err(_) => {
-                // Row stays zeroed.
                 status[i] = match host_tag {
                     GpuCellBranchTag::AffineTail => {
                         CubicCellMomentStatus::NonAffineInfiniteInterval as u8
@@ -102,11 +90,7 @@ pub(crate) fn build_host_moments(
         }
     }
 
-    Ok(HostMomentBatch {
-        moments,
-        status,
-        stride,
-    })
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -119,6 +103,81 @@ mod tests {
         CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuCellBranchTag,
         GpuDenestedCubicCell,
     };
+
+    /// Row-major moments + per-cell status, the same layout the device
+    /// kernel writes. Production callers consume only the status (see
+    /// [`build_host_cell_status`]); this batch shape is the parity oracle
+    /// the moment-emitting unit tests compare to the CPU evaluator.
+    pub(super) struct HostMomentBatch {
+        pub moments: Vec<f64>,
+        pub status: Vec<u8>,
+        pub stride: usize,
+    }
+
+    /// Moment-emitting analog of [`super::build_host_cell_status`] — runs
+    /// the CPU evaluator on every Ok cell so the test suite can check
+    /// substrate moments against the CPU reference without the production
+    /// substrate having to materialize a Vec<f64> nobody reads.
+    pub(super) fn build_host_moments(
+        view: &CubicCellDerivativeMomentHostView<'_>,
+    ) -> Result<HostMomentBatch, String> {
+        let n_cells = view.cells.len();
+        let stride = view.max_degree + 1;
+        let mut moments = vec![0.0_f64; n_cells.saturating_mul(stride)];
+        let mut status = vec![CubicCellMomentStatus::Ok as u8; n_cells];
+
+        for (i, &gpu_cell) in view.cells.iter().enumerate() {
+            let row = &mut moments[i * stride..(i + 1) * stride];
+
+            let host_tag = match classify_cell_for_gpu(gpu_cell) {
+                Ok(tag) => tag,
+                Err(code) => {
+                    status[i] = code as u8;
+                    continue;
+                }
+            };
+            let caller_tag = view.branches[i];
+            if host_tag != caller_tag {
+                status[i] = CubicCellMomentStatus::InvalidInterval as u8;
+                continue;
+            }
+
+            let cpu_cell = DenestedCubicCell {
+                left: gpu_cell.left,
+                right: gpu_cell.right,
+                c0: gpu_cell.c0,
+                c1: gpu_cell.c1,
+                c2: gpu_cell.c2,
+                c3: gpu_cell.c3,
+            };
+            match evaluate_cell_derivative_moments_uncached(cpu_cell, view.max_degree) {
+                Ok(state) => {
+                    let copy_len = state.moments.len().min(stride);
+                    row[..copy_len].copy_from_slice(&state.moments[..copy_len]);
+                    if row.iter().any(|x| !x.is_finite()) {
+                        for slot in row.iter_mut() {
+                            *slot = 0.0;
+                        }
+                        status[i] = CubicCellMomentStatus::NonFiniteEvaluation as u8;
+                    }
+                }
+                Err(_) => {
+                    status[i] = match host_tag {
+                        GpuCellBranchTag::AffineTail => {
+                            CubicCellMomentStatus::NonAffineInfiniteInterval as u8
+                        }
+                        _ => CubicCellMomentStatus::InvalidInterval as u8,
+                    };
+                }
+            }
+        }
+
+        Ok(HostMomentBatch {
+            moments,
+            status,
+            stride,
+        })
+    }
 
     fn gpu_from_cpu(cpu: DenestedCubicCell) -> GpuDenestedCubicCell {
         GpuDenestedCubicCell {

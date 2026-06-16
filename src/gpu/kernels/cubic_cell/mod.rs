@@ -42,7 +42,7 @@ pub(crate) mod kernel_src;
 
 use crate::gpu::gpu_error::GpuError;
 
-pub(crate) use host_substrate::{HostMomentBatch, build_host_moments};
+pub(crate) use host_substrate::build_host_cell_status;
 
 /// Maximum derivative-moment degree the substrate is built to evaluate.
 ///
@@ -129,14 +129,13 @@ pub(crate) struct CubicCellDerivativeMomentHostView<'a> {
 /// Output of `try_build_cubic_cell_derivative_moments`.
 #[derive(Debug)]
 pub(crate) enum CubicCellDerivativeMomentOutput {
-    /// Row-major `[n_cells, max_degree + 1]` host buffer + per-cell status
-    /// codes. Row `i` is `moments[i * stride ..][..stride]` where
-    /// `stride = max_degree + 1`. Rows for non-OK cells are zeroed.
-    Host {
-        moments: Vec<f64>,
-        status: Vec<u8>,
-        stride: usize,
-    },
+    /// Per-cell substrate status codes from the host (CPU) path. Production
+    /// callers only consume the per-cell classifier verdicts here; the actual
+    /// moments stay on the upstream `HostMomentBatch` and are accessed via
+    /// `build_host_moments` directly when needed (e.g. parity tests). The
+    /// Device variant below carries the moments because the device kernel
+    /// hands them back as a residency-bound buffer.
+    Host { status: Vec<u8> },
     /// Device-resident moments on the cubic-cell backend's shared CUDA
     /// context. Linux-only — non-Linux callers see the `Host` variant even
     /// when they request `Device` residency. Layout matches `Host` so
@@ -155,15 +154,20 @@ pub(crate) enum CubicCellDerivativeMomentOutput {
 
 /// Try to build derivative moments via the substrate.
 ///
-/// * `Host` residency: routes through the CPU evaluator (parity reference
-///   for the device kernel) and returns real moments + per-cell status on
-///   every platform.
+/// * `Host` residency: routes through the CPU classifier and returns
+///   per-cell status only. Production consumers read the verdict and feed
+///   moments from their own evaluator (LRU cache for BMS row-primary
+///   Hessian, dedicated host buffer for survival-flex). The full moment
+///   matrix used to be returned here as well, but no production caller
+///   ever read it — the parity reference path that compares CPU moments to
+///   the device kernel now lives next to the host substrate's own unit
+///   tests.
 /// * `Device` residency: on Linux+CUDA with a probed runtime, the device
 ///   dispatcher launches the NVRTC kernel for the NonAffineFinite bucket
 ///   and CPU-evaluates the Affine/AffineTail buckets, packing both back
-///   into a `Host { … }` output for the caller. When the runtime is
-///   unavailable the caller receives the same `Host { … }` shape via the
-///   CPU evaluator — no silent device claim.
+///   into a `Device { … }` output for the caller. When the runtime is
+///   unavailable the caller receives a `Host { status }` output instead —
+///   no silent device claim.
 ///
 /// Returns `Ok(None)` only when the workload is empty.
 ///
@@ -190,9 +194,9 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
 
     match input.residency {
         CubicCellMomentResidency::Host => {
-            let batch = build_host_moments(&input)
+            let status = build_host_cell_status(&input)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
-            Ok(Some(into_host_output(batch)))
+            Ok(Some(CubicCellDerivativeMomentOutput::Host { status }))
         }
         #[cfg(target_os = "linux")]
         CubicCellMomentResidency::Device => {
@@ -202,19 +206,10 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
             // Non-Linux, or no usable runtime: fall back to the host shape so
             // the caller has a parity-shaped result instead of a phantom
             // device claim.
-            let batch = build_host_moments(&input)
+            let status = build_host_cell_status(&input)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
-            Ok(Some(into_host_output(batch)))
+            Ok(Some(CubicCellDerivativeMomentOutput::Host { status }))
         }
-    }
-}
-
-#[inline]
-fn into_host_output(batch: HostMomentBatch) -> CubicCellDerivativeMomentOutput {
-    CubicCellDerivativeMomentOutput::Host {
-        moments: batch.moments,
-        status: batch.status,
-        stride: batch.stride,
     }
 }
 
@@ -247,35 +242,27 @@ mod tests {
     }
 
     #[test]
-    fn host_residency_returns_real_moments() {
+    fn host_residency_returns_ok_status_for_valid_cell() {
+        // The public substrate's host residency returns only the per-cell
+        // status codes — production callers (the BMS row-primary Hessian
+        // assembler and the survival-flex row evaluator) consume the
+        // classifier verdict, not the moments. The moment-emitting parity
+        // path lives next to the host substrate's own unit tests; here we
+        // only assert the public entry surface delivers an Ok status for a
+        // valid cell, the contract production callers depend on.
         let cells = [affine_cell()];
         let branches = [GpuCellBranchTag::Affine];
         let out = try_build_cubic_cell_derivative_moments(host_view(&cells, &branches, 9))
             .expect("host substrate succeeds on a valid cell")
             .expect("non-empty input produces output");
-        let (moments, status, stride) = match out {
-            CubicCellDerivativeMomentOutput::Host {
-                moments,
-                status,
-                stride,
-            } => (moments, status, stride),
+        let status = match out {
+            CubicCellDerivativeMomentOutput::Host { status } => status,
             #[cfg(target_os = "linux")]
             CubicCellDerivativeMomentOutput::Device { .. } => {
                 panic!("host residency request must not yield Device output")
             }
         };
-        assert_eq!(stride, 10);
         assert_eq!(status, vec![CubicCellMomentStatus::Ok as u8]);
-        // M_0(η ≡ 0, [-1, 1]) = ∫_{-1}^{1} exp(-z²/2) dz
-        //                     = √(2π) · (Φ(1) − Φ(−1))
-        //                     = √(2π) · erf(1/√2)
-        //                     ≈ 2.5066282746310002 · 0.6826894921370859
-        //                     ≈ 1.7112487837842974
-        assert!(
-            (moments[0] - 1.711_248_783_784_297_4).abs() < 1e-13,
-            "M_0 should match the closed-form √(2π)·erf(1/√2): got {}",
-            moments[0]
-        );
     }
 
     #[test]
