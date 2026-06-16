@@ -11,5 +11,6 @@ pub mod encode;
 pub mod frames;
 pub mod hybrid_split;
 pub mod identifiability;
+pub mod k_selection;
 pub mod manifold;
 pub mod row_jet_program;
