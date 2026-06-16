@@ -1,7 +1,7 @@
 use super::inner_strategy::GeometryBackendKind;
 use super::penalty_logdet::PenaltyPseudologdet;
 use super::*;
-use crate::linalg::utils::enforce_symmetry;
+use crate::matrix::symmetrize_in_place;
 use std::sync::atomic::Ordering;
 
 // Relative scale of the diagonal ridge added to the ρ-Hessian before
@@ -772,7 +772,7 @@ impl<'a> RemlState<'a> {
                 }
             }
         };
-        enforce_symmetry(&mut hessian_rho);
+        symmetrize_in_place(&mut hessian_rho);
         let ridge = AUTO_CUBATURE_HESSIAN_RIDGE_REL
             * hessian_rho
                 .diag()
@@ -951,7 +951,7 @@ impl<'a> RemlState<'a> {
                 "assembled total covariance contains non-finite entries",
             ));
         }
-        enforce_symmetry(&mut total_cov);
+        symmetrize_in_place(&mut total_cov);
 
         // `total_cov = φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂]`. The consumer adds this
         // correction onto the SCALED conditional covariance `Vb = φ̂·H_opt⁻¹`
@@ -963,7 +963,7 @@ impl<'a> RemlState<'a> {
         //      = φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂],
         // which scales by exactly c², consistent with Vb (#582).
         let mut corr = total_cov - base_cov.mapv(|v| dispersion_phi * v);
-        enforce_symmetry(&mut corr);
+        symmetrize_in_place(&mut corr);
 
         self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Cubature {
             correction: corr,

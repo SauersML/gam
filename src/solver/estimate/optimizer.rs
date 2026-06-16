@@ -1509,10 +1509,10 @@ where
                 }
             }
             let mut s_mat = qs.dot(&s_t).dot(&qs.t());
-            enforce_symmetry(&mut s_mat);
+            crate::matrix::symmetrize_in_place(&mut s_mat);
             // Influence matrix F = I − H⁻¹·S(λ) = H⁻¹·X'WX. This is a product
             // of two symmetric matrices and is therefore generally NOT
-            // symmetric; it must not be symmetrized — `enforce_symmetry(F)`
+            // symmetric; it must not be symmetrized — `crate::matrix::symmetrize_in_place(F)`
             // both breaks the H·F = X'WX consistency identity (so any
             // downstream code that reconstructs X'WX from H·F lands on an
             // asymmetric/indefinite matrix) AND corrupts the frequentist
@@ -1524,14 +1524,14 @@ where
             f_mat -= &h_inv.dot(&s_mat);
             let mut ve = f_mat.dot(h_inv);
             ve *= cov_scale;
-            enforce_symmetry(&mut ve);
+            crate::matrix::symmetrize_in_place(&mut ve);
             // X'WX = H − S(λ) in the original basis — the genuine PSD weighted
             // Gram, reconstructed from the same `penalized_hessian` and `s_mat`
             // that define `F = H⁻¹X'WX` (issue #1027). Stored directly so the
             // WPS corrected-EDF correction never has to recover it from an
             // inconsistent `H·F` product.
             let mut xwx = &penalized_hessian - &s_mat;
-            enforce_symmetry(&mut xwx);
+            crate::matrix::symmetrize_in_place(&mut xwx);
             weighted_gram = Some(xwx);
             coefficient_influence = Some(f_mat);
             beta_covariance_frequentist = Some(ve);
@@ -1652,7 +1652,7 @@ where
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
                 let mut corrected = base_cov.as_array().clone();
                 corrected += corr;
-                enforce_symmetry(&mut corrected);
+                crate::matrix::symmetrize_in_place(&mut corrected);
                 Some(corrected)
             }
             (Some(_), Some(corr)) => {

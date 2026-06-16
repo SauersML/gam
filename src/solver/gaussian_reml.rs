@@ -4463,7 +4463,7 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
         // `outer_h` is the Jacobian of the negative profiled REML estimating
         // equation. Preserve signed curvature directions while flooring
         // near-zero modes; flipping negative eigenvalues would change the VJP.
-        crate::linalg::utils::enforce_symmetry(&mut outer_h);
+        crate::matrix::symmetrize_in_place(&mut outer_h);
         if let Some(((row, col), value)) =
             outer_h.indexed_iter().find(|(_, value)| !value.is_finite())
         {
@@ -4556,7 +4556,7 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
         }
         local += &j_blocks[block];
         local *= lambdas[block];
-        crate::linalg::utils::enforce_symmetry(&mut local);
+        crate::matrix::symmetrize_in_place(&mut local);
         grad_penalties.push(local);
     }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::linalg::utils::enforce_symmetry;
+use crate::matrix::symmetrize_in_place;
 use crate::mixture_link::fisher_weight_jet5_for_inverse_link;
 use crate::types::InverseLink;
 
@@ -722,7 +722,7 @@ impl FirthDenseOperator {
         };
         // J_T = (X̃ Z)ᵀ W (X̃ Z), symmetric m × m PSD.
         let mut j_t = fast_xt_diag_x(&xtz, &self.w);
-        enforce_symmetry(&mut j_t);
+        symmetrize_in_place(&mut j_t);
         let (evals, _) = match j_t.eigh(Side::Lower) {
             Ok(pair) => pair,
             Err(_) => return f64::NEG_INFINITY,
@@ -875,7 +875,7 @@ impl FirthDenseOperator {
         //   Bᵀ P B      via apply_hadamard_gram_to_matrix(Z, K_r, K_r, B)
         //   Bᵀ P_u B    via apply_hadamard_gram_to_matrix(Z, K_r, A_u, B), then *(-2)
         // where P = M⊙M and P_u = -2(M⊙N_u), but M/N_u are never formed explicitly.
-        enforce_symmetry(&mut out);
+        symmetrize_in_place(&mut out);
         out
     }
 

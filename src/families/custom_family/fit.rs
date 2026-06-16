@@ -59,6 +59,47 @@ pub(crate) fn lift_fit_geometry_to_raw(
     (lifted_cov, lifted_geom)
 }
 
+fn gauge_is_identity(gauge: &crate::solver::gauge::Gauge) -> bool {
+    if gauge.raw_total() != gauge.reduced_total() {
+        return false;
+    }
+    let (nrows, ncols) = gauge.t_full.dim();
+    if nrows != ncols {
+        return false;
+    }
+    for i in 0..nrows {
+        for j in 0..ncols {
+            let expected = if i == j { 1.0 } else { 0.0 };
+            if (gauge.t_full[[i, j]] - expected).abs() > 1e-12 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn fixed_lambda_warm_start_for_reduced_specs<'a>(
+    warm_start: Option<&'a CustomFamilyWarmStart>,
+    canonical: &crate::identifiability::canonical::CanonicalSpecs,
+) -> Option<&'a ConstrainedWarmStart> {
+    let warm = warm_start?;
+    if !gauge_is_identity(&canonical.gauge) {
+        return None;
+    }
+    if warm.inner.block_beta.len() != canonical.reduced_specs.len()
+        || warm.inner.active_sets.len() != canonical.reduced_specs.len()
+    {
+        return None;
+    }
+    let widths_match = warm
+        .inner
+        .block_beta
+        .iter()
+        .zip(canonical.reduced_specs.iter())
+        .all(|(beta, spec)| beta.len() == spec.design.ncols());
+    widths_match.then_some(&warm.inner)
+}
+
 pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) rho_physical: Array1<f64>,
     pub(crate) covariance_conditional: Option<Array2<f64>>,
@@ -1714,22 +1755,26 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,
-    specs: &[ParameterBlockSpec],
+    raw_specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     warm_start: Option<&CustomFamilyWarmStart>,
     outer_iterations: usize,
     outer_gradient_norm: Option<f64>,
     outer_converged: bool,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
+    let canonical =
+        crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
+    let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
+    let reduced_warm_start = fixed_lambda_warm_start_for_reduced_specs(warm_start, &canonical);
     let mut inner = inner_blockwise_fit(
         family,
         specs,
         &per_block,
         options,
-        warm_start.map(|warm| &warm.inner),
+        reduced_warm_start,
     )?;
     if !inner.converged {
         return Err(CustomFamilyError::Optimization {
@@ -1765,8 +1810,8 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
             rho_physical: rho,
             covariance_conditional,
             geometry,
-            canonical: None,
-            result_specs: specs,
+            canonical: Some(&canonical),
+            result_specs: raw_specs,
             penalized_objective,
             outer_iterations,
             outer_gradient_norm,
@@ -1781,58 +1826,22 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,
-    specs: &[ParameterBlockSpec],
+    raw_specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<(Vec<Array1<f64>>, bool, usize), CustomFamilyError> {
-    // Pre-fit identifiability gate. Mirrors the outer-fit gate so
-    // warm-start callers (e.g. the survival marginal-slope rigid pilot
-    // at survival_marginal_slope.rs ~18078) fail in milliseconds on
-    // rank-deficient joint designs instead of spending minutes inside
-    // a singular penalised Newton inner system.
-    //
-    // We deliberately do NOT call `canonicalize_for_identifiability`
-    // here: blockwise families capture their per-block designs at
-    // construction time (e.g. SurvivalMarginalSlopeFamily holds
-    // `self.marginal_design` and `self.logslope_design` at raw width)
-    // and their `evaluate*` paths assert on those raw widths when
-    // assembling per-row Hessian contributions. Substituting a
-    // column-reduced spec under that family would produce a runtime
-    // shape mismatch in the family's syr_row_into / row_outer_into
-    // calls, masking the audit's diagnostic with a panic later in the
-    // pipeline.
-    //
-    // The principled construction-time orthogonalisation lives in
-    // `crate::identifiability::families::compiler` (and the per-family
-    // `*_identifiability.rs` modules). Once Phase 4b threads those
-    // compiled operators through the family construction sites, the
-    // raw joint design will already be rank-clean on entry and this
-    // gate becomes a defensive check.
-    let audit =
-        crate::identifiability::audit::audit_identifiability(specs).map_err(|reason| {
-            CustomFamilyError::DimensionMismatch {
-                reason: format!(
-                    "fit_custom_family_fixed_log_lambda_warm_start identifiability audit failed: {reason}"
-                ),
-            }
-        })?;
-    if audit.fatal {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambda_warm_start identifiability audit",
-            reason: format!(
-                "fatal pre-fit identifiability audit: {summary}",
-                summary = audit.summary
-            ),
-        });
-    }
+    let canonical =
+        crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
+    let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
     let inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
-    let block_beta: Vec<Array1<f64>> = inner
+    let theta_blocks: Vec<Array1<f64>> = inner
         .block_states
         .iter()
         .map(|state| state.beta.clone())
         .collect();
+    let block_beta = canonical.gauge.lift_block_betas(&theta_blocks);
     if !block_beta
         .iter()
         .flat_map(|beta| beta.iter())

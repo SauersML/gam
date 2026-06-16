@@ -337,7 +337,7 @@ mod tests {
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::FaerCholesky;
-    use crate::linalg::utils::enforce_symmetry;
+    use crate::matrix::symmetrize_in_place;
     use crate::pirls::PirlsCoordinateFrame;
     use crate::solver::rho_optimizer::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
@@ -892,7 +892,7 @@ mod tests {
                 h_ttfd[[i, j]] = (g_plus - g_minus) / (2.0 * h);
             }
         }
-        enforce_symmetry(&mut h_ttfd);
+        symmetrize_in_place(&mut h_ttfd);
         h_ttfd
     }
 

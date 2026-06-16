@@ -1372,7 +1372,7 @@ fn matvec(a: ArrayView2<'_, f64>, x: ArrayView1<'_, f64>) -> Array1<f64> {
 fn symmetrize(a: &mut Array2<f64>) {
     // Callers in this module always pass square (d, d) matrices; delegate to
     // the canonical helper in `linalg::utils`.
-    crate::linalg::utils::enforce_symmetry(a)
+    crate::matrix::symmetrize_in_place(a)
 }
 
 /// Auxiliary-prior penalty contribution: returns the per-row reference

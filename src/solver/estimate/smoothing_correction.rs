@@ -819,7 +819,7 @@ pub(crate) fn compute_smoothing_correction(
     };
 
     // Symmetrize the Hessian
-    enforce_symmetry(&mut hessian_rho);
+    crate::matrix::symmetrize_in_place(&mut hessian_rho);
 
     // Step 3: Invert Hessian to get V_rho.
     // Add a small ridge before factorization to regularize weakly identified ρ directions.

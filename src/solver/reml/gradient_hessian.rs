@@ -1303,7 +1303,7 @@ impl<'a> RemlState<'a> {
             let sol = h_inv_solve(&rhs)?;
             k_mat.column_mut(col).assign(&sol);
         }
-        enforce_symmetry(&mut k_mat);
+        crate::matrix::symmetrize_in_place(&mut k_mat);
 
         let mut a_mats = Vec::with_capacity(k);
         let mut v = Vec::with_capacity(k);
@@ -1327,7 +1327,7 @@ impl<'a> RemlState<'a> {
                 let dir = op.direction_from_deta(eta_i[idx].clone());
                 h -= &op.hphi_direction(&dir);
             }
-            enforce_symmetry(&mut h);
+            crate::matrix::symmetrize_in_place(&mut h);
             h_i.push(h);
         }
 
@@ -1365,7 +1365,7 @@ impl<'a> RemlState<'a> {
                     let eye = Array2::<f64>::eye(p);
                     h -= &op.hphisecond_direction_apply(&dir_i, &dir_j, &eye);
                 }
-                enforce_symmetry(&mut h);
+                crate::matrix::symmetrize_in_place(&mut h);
                 h_ij[i][j] = h.clone();
                 h_ij[j][i] = h;
             }
@@ -4251,7 +4251,7 @@ impl<'a> RemlState<'a> {
         // Symmetrize before eigh: H_pen is symmetric in exact arithmetic and
         // faer rejects visibly asymmetric input.
         let mut h_sym = h_total.clone();
-        enforce_symmetry(&mut h_sym);
+        crate::matrix::symmetrize_in_place(&mut h_sym);
         let (h_evals, h_evecs) = h_sym
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
@@ -5644,7 +5644,7 @@ impl<'a> RemlState<'a> {
                 let bpb = crate::faer_ndarray::fast_atb(&firth_op.b_base, &firth_op.p_b_base);
                 let mut hphi = 0.5 * (diag_term - bpb);
                 // Numerical symmetry guard.
-                enforce_symmetry(&mut hphi);
+                crate::matrix::symmetrize_in_place(&mut hphi);
                 // Keep tiny numerical noise from making the solve surface less stable.
                 if hphi.iter().all(|v| v.is_finite()) {
                     h_total -= &hphi;
