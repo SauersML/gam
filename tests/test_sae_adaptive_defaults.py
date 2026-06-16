@@ -54,6 +54,7 @@ OLMO_L25_HILLCLIMB_OPTIMUM: dict | None = None
 # Path the battery writes; the OLMo arm reads the measured fixture statistics +
 # optimum from it so the calibration is against real data, not a hand value.
 BATTERY_JSON = Path(__file__).resolve().parents[1] / "olmo_battery_results.json"
+OLMO_FIXTURE = Path(__file__).resolve().parent / "data" / "olmo_l25_pca64_768.npy"
 
 
 def _clean_ring(seed: int = 0, n: int = 400, p: int = 64) -> np.ndarray:
@@ -102,6 +103,21 @@ def test_statistics_are_finite_and_scale_free():
     for key in ("effective_rank", "spectral_decay"):
         assert np.isfinite(a[key]) and np.isfinite(b[key])
         assert abs(a[key] - b[key]) / max(abs(a[key]), 1e-9) < 1e-6, (key, a, b)
+
+
+def test_olmo_fixture_drives_adaptive_default_statistics():
+    """Bounded real-data arm: the committed OLMo PCA slice must keep exercising
+    the adaptive map even when the full battery artefact is absent."""
+    z = np.load(OLMO_FIXTURE).astype(np.float64)
+    stats = stats_of(z)
+    assert stats["effective_rank"] == pytest.approx(21.2293555888, abs=1e-9)
+    assert stats["spectral_decay"] == pytest.approx(4.6371078717, abs=1e-9)
+    assert stats["snr"] == pytest.approx(0.8102620779, abs=1e-9)
+
+    rec = recommend(z)
+    assert rec["intrinsic_rank"] == 2
+    assert rec["n_harmonics"] == 2
+    assert rec["tau"] == 0.7
 
 
 @pytest.mark.skipif(

@@ -12,6 +12,67 @@ fn poincare_distance<'py>(
     })
 }
 
+#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+fn sae_select_k(
+    py: Python<'_>,
+    points: Vec<(usize, f64)>,
+    mode: &str,
+    knee_slope_fraction: f64,
+    complexity_penalty: f64,
+    flat_span_tol: f64,
+) -> PyResult<PyObject> {
+    let curve = gam::terms::sae::k_selection::curve_from_pairs(&points).map_err(py_value_error)?;
+    let config = gam::terms::sae::k_selection::KSelectionConfig {
+        mode: gam::terms::sae::k_selection::KSelectionMode::parse(mode).map_err(py_value_error)?,
+        knee_slope_fraction,
+        complexity_penalty,
+        flat_span_tol,
+    };
+    let selected = gam::terms::sae::k_selection::select_k(&curve, &config);
+    let out = PyDict::new(py);
+    out.set_item("k", selected.k)?;
+    out.set_item("ev", selected.ev)?;
+    out.set_item("flag", selected.flag.as_str())?;
+    out.set_item("is_knee", selected.flag.is_knee())?;
+    out.set_item("score", selected.score)?;
+    Ok(out.into())
+}
+
+#[pyfunction(signature = (manifold_points, linear_points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+fn sae_auto_k_recommendation(
+    py: Python<'_>,
+    manifold_points: Vec<(usize, f64)>,
+    linear_points: Vec<(usize, f64)>,
+    mode: &str,
+    knee_slope_fraction: f64,
+    complexity_penalty: f64,
+    flat_span_tol: f64,
+) -> PyResult<PyObject> {
+    let manifold =
+        gam::terms::sae::k_selection::curve_from_pairs(&manifold_points).map_err(py_value_error)?;
+    let linear =
+        gam::terms::sae::k_selection::curve_from_pairs(&linear_points).map_err(py_value_error)?;
+    let config = gam::terms::sae::k_selection::KSelectionConfig {
+        mode: gam::terms::sae::k_selection::KSelectionMode::parse(mode).map_err(py_value_error)?,
+        knee_slope_fraction,
+        complexity_penalty,
+        flat_span_tol,
+    };
+    let rec = gam::terms::sae::k_selection::recommend_auto_k(&manifold, &linear, &config);
+    let out = PyDict::new(py);
+    out.set_item("k", rec.selection.k)?;
+    out.set_item("ev", rec.selection.ev)?;
+    out.set_item("flag", rec.selection.flag.as_str())?;
+    out.set_item("is_knee", rec.selection.flag.is_knee())?;
+    out.set_item("score", rec.selection.score)?;
+    out.set_item("target_ev", rec.advantage.target_ev)?;
+    out.set_item("manifold_k", rec.advantage.k_manifold)?;
+    out.set_item("linear_k", rec.advantage.k_linear)?;
+    out.set_item("efficiency_ratio", rec.advantage.compression_ratio)?;
+    out.set_item("confirmed", rec.advantage.manifold_dominates())?;
+    Ok(out.into())
+}
+
 #[pyfunction]
 fn poincare_project_into_ball<'py>(
     py: Python<'py>,
@@ -4096,6 +4157,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_rho_so3, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_rho_so3_jvp, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_minimal, module)?)?;

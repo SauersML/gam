@@ -16,6 +16,7 @@ import json
 import re
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 _SRC = (Path(__file__).resolve().parents[1] / "gamfit" / "_sae_manifold.py").read_text()
@@ -35,17 +36,22 @@ ev_knee_k = H["ev_knee_k"]
 wager_verdict = H["wager_verdict"]
 
 BATTERY_JSON = Path(__file__).resolve().parents[1] / "olmo_battery_results.json"
+OLMO_FIXTURE = Path(__file__).resolve().parent / "data" / "olmo_l25_pca64_768.npy"
 
 
 def test_knee_stops_at_saturation():
     # EV jumps to 0.8 at K=2 then crawls: knee at K=2.
     frontier = {1: 0.50, 2: 0.80, 3: 0.805, 4: 0.806}
-    assert ev_knee_k(frontier, min_marginal_gain=0.01) == 2
+    selection = ev_knee_k(frontier, return_details=True)
+    assert selection["k"] == 2
+    assert selection["flag"] == "knee"
 
 
 def test_knee_keeps_climbing_while_gain_is_real():
     frontier = {1: 0.30, 2: 0.50, 3: 0.70, 4: 0.90}
-    assert ev_knee_k(frontier, min_marginal_gain=0.01) == 4
+    selection = ev_knee_k(frontier, return_details=True)
+    assert selection["k"] == 4
+    assert selection["flag"] == "linear"
 
 
 def test_knee_single_point():
@@ -55,7 +61,7 @@ def test_knee_single_point():
 def test_wager_confirmed_when_manifold_ties_linear_at_lower_k():
     # Linear ceiling 0.80 at K=8; manifold reaches 0.80 already at K=2.
     manifold = {1: 0.60, 2: 0.82, 3: 0.83}
-    linear = {2: 0.50, 4: 0.70, 8: 0.80}
+    linear = {2: 0.50, 4: 0.70, 8: 0.82}
     v = wager_verdict(manifold, linear)
     assert v["confirmed"] is True
     assert v["manifold_k"] == 2
@@ -71,6 +77,36 @@ def test_wager_refuted_honestly_when_manifold_never_reaches_linear():
     assert v["confirmed"] is False
     assert v["manifold_k"] is None
     assert v["ev_gap"] == pytest.approx(0.85 - 0.58)
+
+
+def _ev(x: np.ndarray, fitted: np.ndarray) -> float:
+    ss_res = float(np.sum((x - fitted) ** 2))
+    ss_tot = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
+    return 1.0 - ss_res / max(ss_tot, 1.0e-12)
+
+
+def _olmo_linear_frontier() -> dict[int, float]:
+    z = np.load(OLMO_FIXTURE).astype(np.float64)
+    assert z.shape == (768, 64)
+    train = z[:384]
+    test = z[384:512]
+    mu = train.mean(axis=0, keepdims=True)
+    _u, _s, vt = np.linalg.svd(train - mu, full_matrices=False)
+    frontier: dict[int, float] = {}
+    for k in (1, 2, 4, 8, 16, 32):
+        proj = vt[:k].T @ vt[:k]
+        frontier[k] = _ev(test, (test - mu) @ proj)
+    return frontier
+
+
+def test_olmo_fixture_linear_frontier_is_real_and_bounded():
+    frontier = _olmo_linear_frontier()
+    assert frontier[1] == pytest.approx(0.2961278177, abs=1e-9)
+    assert frontier[8] == pytest.approx(0.5497310414, abs=1e-9)
+    assert frontier[32] == pytest.approx(0.7669424107, abs=1e-9)
+    selection = ev_knee_k(frontier, return_details=True)
+    assert selection["k"] in frontier
+    assert selection["flag"] in {"knee", "no_knee", "linear"}
 
 
 @pytest.mark.skipif(not BATTERY_JSON.exists(), reason="OLMo battery artefact not present yet")
