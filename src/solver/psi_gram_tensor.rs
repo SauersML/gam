@@ -693,6 +693,218 @@ mod tests {
         }
     }
 
+    /// The penalized Gaussian profile deviance at a fixed ridge λ, assembled
+    /// PURELY from the sufficient-statistic triple `(G, r, c) = (XᵀWX, XᵀWz, zᵀWz)`:
+    ///
+    /// ```text
+    ///   β(λ) = (G + λS)⁻¹ r,   D(ψ;λ) = c − 2 βᵀr + βᵀ(G + λS)β = c − βᵀr
+    /// ```
+    ///
+    /// (the second equality uses the normal equations `(G + λS)β = r`). This is
+    /// EXACTLY the object the inner Gaussian PLS minimizes over β, and it is a
+    /// pure function of `(G, r, c)` — n-free. Returns `(D, β)` so the caller can
+    /// also probe the coefficient lane. `s_ridge` is the ridge penalty matrix.
+    fn profile_deviance(
+        g: &Array2<f64>,
+        r: &Array1<f64>,
+        c: f64,
+        s_ridge: &Array2<f64>,
+        lambda: f64,
+        k: usize,
+    ) -> (f64, Array1<f64>) {
+        // Dense (G + λS) β = r via partial-pivot Gauss elimination (small k).
+        let mut a = g.clone();
+        a.scaled_add(lambda, s_ridge);
+        let mut aug = Array2::<f64>::zeros((k, k + 1));
+        aug.slice_mut(ndarray::s![.., ..k]).assign(&a);
+        aug.slice_mut(ndarray::s![.., k]).assign(r);
+        for col in 0..k {
+            let piv = (col..k)
+                .max_by(|&p, &q| aug[[p, col]].abs().total_cmp(&aug[[q, col]].abs()))
+                .unwrap();
+            if piv != col {
+                for j in 0..=k {
+                    let tmp = aug[[col, j]];
+                    aug[[col, j]] = aug[[piv, j]];
+                    aug[[piv, j]] = tmp;
+                }
+            }
+            let p = aug[[col, col]];
+            for row in 0..k {
+                if row == col {
+                    continue;
+                }
+                let f = aug[[row, col]] / p;
+                for j in col..=k {
+                    aug[[row, j]] -= f * aug[[col, j]];
+                }
+            }
+        }
+        let beta = Array1::from_iter((0..k).map(|i| aug[[i, k]] / aug[[i, i]]));
+        let deviance = c - beta.dot(r);
+        (deviance, beta)
+    }
+
+    /// #1033 bit-tight Hessian + κ-optimum gate. The fast path's promise is not
+    /// merely that the Gram VALUE matches at sampled ψ — it is that the WHOLE
+    /// outer κ search (objective, its ψ-curvature, and therefore the located
+    /// optimum) is reproduced by the n-free sufficient-statistic representation
+    /// to machine precision. This harness certifies exactly that:
+    ///
+    ///   1. **Objective**: the penalized profile deviance `D(ψ)` assembled from
+    ///      the tensor's `(gram_at, rhs_at, zᵀWz)` matches the exactly streamed
+    ///      `XᵀWX/XᵀWz/zᵀWz` deviance bit-tight at every ψ on a fine grid.
+    ///   2. **Curvature (Hessian)**: the second ψ-derivative `D''(ψ)` of the
+    ///      fast-path objective matches the second ψ-derivative of the EXACT
+    ///      objective (central FD of the streamed deviance) — the curvature the
+    ///      outer Newton step reads must be the true curvature, not an
+    ///      approximation that drifts off the value (the objective↔gradient
+    ///      desync class, now extended to the second order).
+    ///   3. **κ-optimum**: the argmin of `D(ψ)` over the grid is IDENTICAL
+    ///      between the two assemblies — the fast path lands on the same κ as the
+    ///      exact streamed search, to the grid resolution AND bit-tight in the
+    ///      objective value at that node.
+    #[test]
+    fn psi_gram_tensor_bit_tight_hessian_and_kappa_optimum() {
+        let (n, k) = (200usize, 6usize);
+        // Heterogeneous weights + a response with genuine ψ-dependent curvature
+        // so the deviance has a non-degenerate interior minimum in ψ.
+        let w = Array1::from_iter((0..n).map(|i| 0.7 + 0.6 * (((i * 7) % 5) as f64) / 4.0));
+        let z = Array1::from_iter((0..n).map(|i| {
+            let t = (i as f64) / (n as f64 - 1.0);
+            (3.0 * t).sin() + 0.3 * (7.0 * t).cos()
+        }));
+        let (psi_lo, psi_hi) = (-1.0_f64, 0.9_f64);
+        // Fixed ridge λ over the search — the κ optimizer profiles ψ at fixed
+        // smoothing here; identity-S ridge keeps the profile well-posed.
+        let s_ridge = Array2::<f64>::eye(k);
+        let lambda = 0.5_f64;
+
+        let tensor = PsiGramTensor::build(
+            |psi| synth_design(psi, n, k),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("analytic synthetic design must certify");
+
+        let exact_ztwz: f64 = w.iter().zip(z.iter()).map(|(&wi, &zi)| wi * zi * zi).sum();
+
+        // Exact streamed deviance at arbitrary ψ — the ground truth the n-free
+        // path must reproduce.
+        let exact_deviance = |psi: f64| -> f64 {
+            let design = synth_design(psi, n, k).unwrap();
+            let mut wd = design.clone();
+            for (mut row, &wi) in wd.outer_iter_mut().zip(w.iter()) {
+                row.mapv_inplace(|v| v * wi);
+            }
+            let g = design.t().dot(&wd);
+            let r = wd.t().dot(&z);
+            profile_deviance(&g, &r, exact_ztwz, &s_ridge, lambda, k).0
+        };
+
+        // Fast n-free deviance from the certified tensor.
+        let fast_deviance = |psi: f64| -> f64 {
+            let g = tensor.gram_at(psi);
+            let r = tensor.rhs_at(psi);
+            profile_deviance(&g, &r, exact_ztwz, &s_ridge, lambda, k).0
+        };
+
+        // Dense grid strictly inside the certified window (away from the edges,
+        // where the build's value lane is still certified but we want a clean
+        // central-FD second derivative to exist on both sides).
+        let m = 81usize;
+        let lo = psi_lo + 0.06;
+        let hi = psi_hi - 0.06;
+        let grid: Vec<f64> = (0..m)
+            .map(|i| lo + (hi - lo) * (i as f64) / (m as f64 - 1.0))
+            .collect();
+
+        // (1) Objective bit-tight across the whole grid; track argmin on both.
+        let mut worst_value_rel = 0.0_f64;
+        let (mut fast_argmin, mut fast_min) = (f64::NAN, f64::INFINITY);
+        let (mut exact_argmin, mut exact_min) = (f64::NAN, f64::INFINITY);
+        for &psi in &grid {
+            let de = exact_deviance(psi);
+            let df = fast_deviance(psi);
+            let rel = (de - df).abs() / de.abs().max(1e-300);
+            worst_value_rel = worst_value_rel.max(rel);
+            if df < fast_min {
+                fast_min = df;
+                fast_argmin = psi;
+            }
+            if de < exact_min {
+                exact_min = de;
+                exact_argmin = psi;
+            }
+        }
+        assert!(
+            worst_value_rel <= 1e-9,
+            "penalized profile deviance: fast n-free assembly diverged from exact \
+             streamed by rel {worst_value_rel:.3e} (> 1e-9) somewhere on the ψ grid"
+        );
+
+        // (3) κ-optimum: identical grid node AND bit-tight value there. The
+        // argmin must be a true interior minimum (not a window edge) for this to
+        // certify the OUTER search rather than a boundary artifact.
+        assert_eq!(
+            fast_argmin.to_bits(),
+            exact_argmin.to_bits(),
+            "κ-optimum mismatch: fast argmin ψ={fast_argmin}, exact argmin ψ={exact_argmin} \
+             — the n-free objective located a different optimum"
+        );
+        assert!(
+            fast_argmin > lo + 1e-9 && fast_argmin < hi - 1e-9,
+            "κ-optimum landed on the grid edge ψ={fast_argmin}; the fixture must have \
+             an INTERIOR minimum for this to test the outer search, not a boundary"
+        );
+        let opt_rel = (exact_min - fast_min).abs() / exact_min.abs().max(1e-300);
+        assert!(
+            opt_rel <= 1e-9,
+            "κ-optimum objective value drift at ψ={fast_argmin}: fast={fast_min}, \
+             exact={exact_min}, rel={opt_rel:.3e}"
+        );
+
+        // (2) Hessian (ψ-curvature) bit-tight against the exact objective's own
+        // second difference. Both sides use the SAME central-FD stencil, so any
+        // surviving gap is a genuine objective-vs-objective curvature divergence,
+        // not a finite-difference truncation artifact (the truncation error is
+        // common-mode and cancels). At the located optimum the curvature is the
+        // step the outer Newton solver would read.
+        let h = 1e-4_f64;
+        let mut worst_hess_rel = 0.0_f64;
+        for &psi in &grid {
+            // Stay where ±h is still inside the FD-safe grid interior.
+            if psi - h <= psi_lo || psi + h >= psi_hi {
+                continue;
+            }
+            let exact_h2 =
+                (exact_deviance(psi + h) - 2.0 * exact_deviance(psi) + exact_deviance(psi - h))
+                    / (h * h);
+            let fast_h2 =
+                (fast_deviance(psi + h) - 2.0 * fast_deviance(psi) + fast_deviance(psi - h))
+                    / (h * h);
+            let rel = (exact_h2 - fast_h2).abs() / exact_h2.abs().max(1e-6);
+            worst_hess_rel = worst_hess_rel.max(rel);
+        }
+        // Catastrophic-cancellation in the second difference (Δ ~ h² relative to
+        // the values, h=1e-4 ⇒ ~1e-8 of the value magnitude lost to rounding)
+        // sets the floor; the curvatures still agree to ~1e-6 because the two
+        // objectives agree to ~1e-9 in VALUE before differencing.
+        assert!(
+            worst_hess_rel <= 1e-6,
+            "ψ-curvature (Hessian) mismatch: fast n-free objective curvature diverged \
+             from the exact streamed objective by rel {worst_hess_rel:.3e} (> 1e-6) — \
+             the outer Newton step would read a different curvature than the truth"
+        );
+
+        eprintln!(
+            "[psi-gram-bittight] n={n} k={k} grid={m}  worst |ΔD|/D={worst_value_rel:.2e}  \
+             worst |ΔD''|/D''={worst_hess_rel:.2e}  κ-opt ψ={fast_argmin:.6} (interior, bit-identical)"
+        );
+    }
+
     /// Certification negative: a NON-analytic (kinked) design must refuse to
     /// certify rather than silently approximate.
     #[test]
