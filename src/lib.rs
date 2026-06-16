@@ -43,6 +43,12 @@
 
 include!(concat!(env!("OUT_DIR"), "/lint_errors.rs"));
 
+// `config_resolve` was extracted from `src/main/` so the CLI driver and the
+// Python FFI (gam-pyffi) can share the same JSON → FitConfig resolver; pull
+// the current crate in under the `gam` alias so the file can keep using
+// `gam::…` paths and stay drop-in for both compilation units.
+extern crate self as gam;
+
 #[macro_use]
 mod macros;
 
@@ -62,6 +68,8 @@ pub fn init_parallelism() {
     });
 }
 
+#[path = "main/config_resolve.rs"]
+pub mod config_resolve;
 pub mod families;
 pub mod geometry;
 pub mod gpu;

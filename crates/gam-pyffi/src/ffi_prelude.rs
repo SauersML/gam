@@ -74,8 +74,7 @@ pub(crate) use gam::geometry::simplex::{closure as simplex_closure, simplex_frec
 pub(crate) use gam::hmc::{NutsConfig, NutsResult};
 
 pub(crate) use gam::inference::data::{
-    EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
-    encode_recordswith_schema, infer_and_encode_column_major,
+    EncodedDataset, UnseenCategoryPolicy, encode_recordswith_schema, infer_and_encode_column_major,
 };
 
 pub(crate) use gam::inference::formula_dsl::{parse_formula, parse_surv_response};

@@ -3373,7 +3373,7 @@ fn column_fingerprint(name: &str, column: &[&str]) -> ColumnCacheKey {
 /// statistically independent of the unseeded `DefaultHasher`, widening the
 /// content key to 128 bits.
 fn seeded_hasher() -> std::collections::hash_map::DefaultHasher {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hash;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     0x9E37_79B9_7F4A_7C15u64.hash(&mut h);
     h
