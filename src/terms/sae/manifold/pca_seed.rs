@@ -20,6 +20,30 @@ pub fn sae_pca_seed_initial_coords(
     basis_kinds: &[SaeAtomBasisKind],
     atom_dim: &[usize],
 ) -> Result<Array3<f64>, String> {
+    sae_pca_seed_initial_coords_with_pc_offset(z, basis_kinds, atom_dim, 0)
+}
+
+/// PCA seed with a deterministic principal-component-pair ROTATION offset.
+///
+/// Identical to [`sae_pca_seed_initial_coords`] (which is this with
+/// `pc_pair_offset = 0`) except every atom reads its chart off a PC subspace
+/// shifted by `pc_pair_offset` pairs. This is the lever the #976 simultaneous
+/// co-collapse multi-start uses to make successive reseeds explore GENUINELY
+/// DIFFERENT basins: the residual a co-collapsed dictionary leaves is ≈ the
+/// target on every retry, so a fixed-offset reseed re-reads the SAME leading
+/// PCs and the joint LSQ relaxes back into the SAME degenerate basin — the
+/// budget-N multi-start would then be N identical attempts. Shifting the PC
+/// pairs by the retry index lands the atoms on a disjoint principal subspace
+/// each attempt (top pairs on retry 0, next pairs on retry 1, …), so the basins
+/// are distinct by construction. The offset is a pure deterministic function of
+/// the retry count (no RNG), so the seed stays bit-reproducible run-to-run and
+/// across thread/device counts.
+pub fn sae_pca_seed_initial_coords_with_pc_offset(
+    z: ArrayView2<'_, f64>,
+    basis_kinds: &[SaeAtomBasisKind],
+    atom_dim: &[usize],
+    pc_pair_offset: usize,
+) -> Result<Array3<f64>, String> {
     let k_atoms = basis_kinds.len();
     let (n_obs, _p_out) = z.dim();
     let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
@@ -98,7 +122,10 @@ pub fn sae_pca_seed_initial_coords(
                     // well-conditioned and the cross-atom Gram starts small.
                     let pc_pairs = vt_rows / 2;
                     let (pc1_row, pc2_row) = if pc_pairs >= 1 {
-                        let pair = if pc_pairs > 0 { atom_idx % pc_pairs } else { 0 };
+                        // Rotate the per-atom PC pair by the multi-start offset so
+                        // a co-collapse reseed retry reads a DISJOINT principal
+                        // subspace (the #976 distinct-basin lever).
+                        let pair = (atom_idx + pc_pair_offset) % pc_pairs;
                         (2 * pair, 2 * pair + 1)
                     } else {
                         (0, 1)
@@ -151,7 +178,15 @@ pub fn sae_pca_seed_initial_coords(
                 if n_pc == 0 {
                     continue;
                 }
-                let pcs: Vec<_> = (0..n_pc).map(|i| vt.row(i)).collect();
+                // Rotate the sphere's leading-PC window by the multi-start offset
+                // (in PC-pair units, mod the available PCs) so a reseed retry
+                // reads a distinct 3-PC subspace (the #976 distinct-basin lever).
+                let base = if vt_rows > 0 {
+                    (2 * pc_pair_offset) % vt_rows
+                } else {
+                    0
+                };
+                let pcs: Vec<_> = (0..n_pc).map(|i| vt.row((base + i) % vt_rows)).collect();
                 for row in 0..n_obs {
                     let mut amb = [0.0_f64; 3];
                     for (i, pc) in pcs.iter().enumerate() {
@@ -181,9 +216,17 @@ pub fn sae_pca_seed_initial_coords(
                 // Seed each torus axis from a disjoint pair of PCs: axis `a`
                 // uses (pc_{2a}, pc_{2a+1}) projected onto the centred
                 // response and read off as `atan2`, normalised to `[0, 1)`.
+                let pc_pairs = vt_rows / 2;
                 for axis in 0..d {
-                    let pc_a_idx = 2 * axis;
-                    let pc_b_idx = 2 * axis + 1;
+                    // Rotate each torus axis's PC pair by the multi-start offset
+                    // (same #976 distinct-basin lever as the periodic arm).
+                    let pair = if pc_pairs > 0 {
+                        (axis + pc_pair_offset) % pc_pairs
+                    } else {
+                        axis
+                    };
+                    let pc_a_idx = 2 * pair;
+                    let pc_b_idx = 2 * pair + 1;
                     if pc_b_idx >= vt_rows {
                         break;
                     }
@@ -204,12 +247,22 @@ pub fn sae_pca_seed_initial_coords(
                 }
             }
             _ => {
-                let k_cols = d.min(u_cols).min(s_vals.len());
+                let avail = u_cols.min(s_vals.len());
+                let k_cols = d.min(avail);
+                // Rotate the score-column window by the multi-start offset (in
+                // PC-pair units, mod the available components) so a reseed retry
+                // reads distinct principal scores (the #976 distinct-basin lever).
+                let base = if avail > 0 {
+                    (2 * pc_pair_offset) % avail
+                } else {
+                    0
+                };
                 let mut tmp = Array2::<f64>::zeros((n_obs, d));
                 for col in 0..k_cols {
-                    let s_col = s_vals[col];
+                    let src = if avail > 0 { (base + col) % avail } else { col };
+                    let s_col = s_vals[src];
                     for row in 0..n_obs {
-                        tmp[[row, col]] = u[[row, col]] * s_col;
+                        tmp[[row, col]] = u[[row, src]] * s_col;
                     }
                 }
                 for col in 0..d {

@@ -1926,7 +1926,17 @@ impl SaeManifoldTerm {
                 self.dictionary_cocollapse_reseeds
             );
             let all: Vec<usize> = (0..k).collect();
-            self.reseed_atoms_onto_distinct_residual_pcs(&all, target, rho)?;
+            // Each multi-start RETRY reads a DISJOINT principal subspace: attempt
+            // 1 (the first reseed) uses the top PC pairs (offset 0), attempt 2 the
+            // next pairs (offset 1), etc. Without this rotation every retry re-reads
+            // the same leading residual PCs — the residual is ≈ the target on every
+            // co-collapsed attempt — so the joint LSQ relaxes back into the SAME
+            // degenerate basin and the budget-N multi-start is N IDENTICAL attempts
+            // (the K=3 coin-flip). `dictionary_cocollapse_reseeds` was just
+            // incremented to this attempt's 1-based count, so the 0-based offset is
+            // `… − 1`.
+            let pc_pair_offset = self.dictionary_cocollapse_reseeds.saturating_sub(1);
+            self.reseed_atoms_onto_distinct_residual_pcs(&all, target, rho, pc_pair_offset)?;
             for atom in 0..k {
                 self.reseed_collapsed_atom_logits(atom);
                 self.collapse_events.push(CollapseEvent {
@@ -1983,7 +1993,9 @@ impl SaeManifoldTerm {
             }
         }
         if !to_reseed.is_empty() {
-            self.reseed_atoms_onto_distinct_residual_pcs(&to_reseed, target, rho)?;
+            // Per-atom breach arm: a single budgeted reseed onto the top distinct
+            // residual PCs — no multi-start rotation (offset 0).
+            self.reseed_atoms_onto_distinct_residual_pcs(&to_reseed, target, rho, 0)?;
             for &atom in &to_reseed {
                 self.reseed_collapsed_atom_logits(atom);
             }
@@ -2050,6 +2062,7 @@ impl SaeManifoldTerm {
         atoms: &[usize],
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
+        pc_pair_offset: usize,
     ) -> Result<(), String> {
         if atoms.is_empty() {
             return Ok(());
@@ -2060,7 +2073,16 @@ impl SaeManifoldTerm {
             .map(|&a| self.atoms[a].basis_kind.clone())
             .collect();
         let dims: Vec<usize> = atoms.iter().map(|&a| self.atoms[a].latent_dim).collect();
-        let seeded = sae_pca_seed_initial_coords(residual.view(), &basis_kinds, &dims)?;
+        // `pc_pair_offset` rotates the residual-PC assignment so a co-collapse
+        // multi-start RETRY (offset = retry index) reads a disjoint principal
+        // subspace from the previous attempt; the per-atom breach arm passes 0
+        // (its single reseed needs no rotation).
+        let seeded = sae_pca_seed_initial_coords_with_pc_offset(
+            residual.view(),
+            &basis_kinds,
+            &dims,
+            pc_pair_offset,
+        )?;
         let n = self.n_obs();
         for (slot, &atom) in atoms.iter().enumerate() {
             let d = dims[slot];
