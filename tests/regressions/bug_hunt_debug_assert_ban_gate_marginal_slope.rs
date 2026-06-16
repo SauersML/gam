@@ -10,7 +10,7 @@
 //! converted to release-active `assert_eq!`.
 //!
 //! Why this test exists in addition to the build-script gate: `build.rs` only
-//! re-runs its scan when `build.rs` or `src/terms/penalties` change
+//! re-runs its scan when `build.rs` or `src/terms/analytic_penalties/manifest.rs` change
 //! (`cargo:rerun-if-changed`), so its verdict *caches* — a `debug_assert*`
 //! added elsewhere in `src/` on a warm `target/` would not re-trip the gate
 //! until something it watches changes. This `#[test]` re-scans the whole `src/`
