@@ -1440,6 +1440,30 @@ impl CustomFamily for MultinomialFamily {
         ))
     }
 
+    fn joint_jeffreys_information_second_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        // BATCHED all-axes SECOND-directional fast path for the Tier-B Jeffreys
+        // outer drift (#1082 / #979). The generic trait default queries
+        // `H²dot[δ, e_a]` `p = (M·P)` separate times, each rebuilding the full
+        // `O(n·M²·P²)` coupled Gram through `dense_block_xtwx` — the profile-pinned
+        // outer hot spot (≈half the smooth-by-factor wall-clock; the drift batch
+        // calls this once per mode-response direction). Multinomial assembles the
+        // WHOLE second-axis set in ONE row-parallel softmax pass via the
+        // X[row,i0]-factored per-row second jet (see
+        // `assemble_all_axis_second_directional_derivatives`), bit-faithful to the
+        // per-axis `second_directional_fisher_jet → dense_block_xtwx` route up to
+        // row-sum associativity, for a single Gram-assembly cost instead of `p`.
+        let eta = self.collect_eta_matrix(block_states)?;
+        Ok(Some(self.assemble_all_axis_second_directional_derivatives(
+            eta.view(),
+            d_beta_u_flat,
+        )?))
+    }
+
     fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -1820,6 +1844,70 @@ mod tests {
         let dense_diag = dense.diag();
         for (a, b) in mf_diag.iter().zip(dense_diag.iter()) {
             assert!((a - b).abs() < 1.0e-9, "matrix-free diag {a} != dense {b}");
+        }
+    }
+
+    #[test]
+    fn batched_second_directional_all_axes_matches_per_axis() {
+        // The #1082 fix: `assemble_all_axis_second_directional_derivatives`
+        // (one Gram-assembly pass for all p axes) must equal the per-axis route
+        // `exact_newton_joint_hessiansecond_directional_derivative(e_a)` the
+        // generic trait default loops, axis-by-axis, to bit-tight tolerance.
+        let family = toy_family(9, 3, 4);
+        let p = family.design.ncols();
+        let m = family.active_classes();
+        let n = family.weights.len();
+        let design = family.design.view();
+        let block_states: Vec<ParameterBlockState> = (0..m)
+            .map(|a| {
+                let beta =
+                    Array1::<f64>::from_shape_fn(p, |i| 0.25 * ((a + 1) as f64) - 0.13 * (i as f64));
+                let eta = Array1::<f64>::from_shape_fn(n, |row| {
+                    (0..p).map(|i| design[[row, i]] * beta[i]).sum()
+                });
+                ParameterBlockState { beta, eta }
+            })
+            .collect();
+        let specs = family.build_block_specs();
+        let dim = m * p;
+
+        // A non-trivial first direction δ (not a canonical axis).
+        let delta = Array1::<f64>::from_shape_fn(dim, |i| 0.4 - 0.07 * (i as f64) + 0.03 * ((i * i) as f64).cos());
+
+        // Batched: all axes in one pass.
+        let batched = family
+            .joint_jeffreys_information_second_directional_all_axes_with_specs(
+                &block_states,
+                &specs,
+                &delta,
+            )
+            .expect("batched second-directional must succeed")
+            .expect("batched second-directional must be present");
+        assert_eq!(batched.len(), dim, "one matrix per canonical axis");
+
+        // Per-axis reference: the route the generic trait default takes.
+        for axis in 0..dim {
+            let mut e_a = Array1::<f64>::zeros(dim);
+            e_a[axis] = 1.0;
+            let per_axis = family
+                .exact_newton_joint_hessiansecond_directional_derivative(
+                    &block_states,
+                    &delta,
+                    &e_a,
+                )
+                .expect("per-axis second-directional must succeed")
+                .expect("per-axis second-directional must be present");
+            assert_eq!(batched[axis].dim(), (dim, dim));
+            for r in 0..dim {
+                for c in 0..dim {
+                    let a = batched[axis][[r, c]];
+                    let b = per_axis[[r, c]];
+                    assert!(
+                        (a - b).abs() <= 1e-10 * (1.0 + b.abs()),
+                        "axis {axis} entry ({r},{c}): batched {a} != per-axis {b}"
+                    );
+                }
+            }
         }
     }
 
