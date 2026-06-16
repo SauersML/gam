@@ -72,7 +72,6 @@ pub mod kernels;
 pub mod linalg;
 pub(crate) mod parallel_strategy;
 pub mod report;
-pub mod resource;
 pub mod sae_identifiability;
 pub mod solver;
 pub mod sparkline;
@@ -115,7 +114,7 @@ pub use solver::estimate::reml::unified::PenaltySubspaceTrace;
 // arrow-border overlap drive `run_per_atom_efs` directly with an explicit
 // `SharedBorderTopology` (`new` for a named border set, `disjoint` /
 // `fully_coupled` for the two extremes).
-pub use resource::{
+pub use solver::resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
 };
@@ -130,7 +129,6 @@ pub use terms::{basis, construction, hull, smooth, term_builder};
 pub use families::custom_family;
 pub use families::gamlss;
 pub use families::survival;
-pub use families::survival_construction;
 pub use families::survival_location_scale;
 pub use families::survival_marginal_slope;
 pub use families::survival_predict;

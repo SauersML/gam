@@ -27,6 +27,7 @@ pub(crate) mod priority_selection;
 pub mod protocol;
 pub mod psi_gram_tensor;
 pub mod residual_cascade;
+pub mod resource;
 pub(crate) mod riemannian_retraction;
 pub mod row_measure;
 pub mod seeding;
