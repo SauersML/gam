@@ -296,6 +296,8 @@ mod latent_cache_inner_bug_hunt;
 mod measure_jet_aniso_isotropic_fallback_regression;
 #[path = "regressions/new_smooths_misc_regressions.rs"]
 mod new_smooths_misc_regressions;
+#[path = "regressions/perf_1082_outer_loop_repro.rs"]
+mod perf_1082_outer_loop_repro;
 #[path = "regressions/regression_affine_anchor_moment_both_tails.rs"]
 mod regression_affine_anchor_moment_both_tails;
 #[path = "regressions/regression_apply_inverse_link_probit_independent_reference.rs"]

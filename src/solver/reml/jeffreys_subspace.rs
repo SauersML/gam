@@ -115,6 +115,37 @@ pub(crate) fn floored_inverse(lam: f64, floor: f64) -> f64 {
     }
 }
 
+/// The Jeffreys eigenvalue antiderivative `g(λ; floor)` whose derivative is
+/// exactly [`floored_inverse`] — i.e. `d/dλ g = floored_inverse(λ, floor)`.
+///
+/// This is the SINGLE source of the per-eigenvalue value branches the
+/// `Φ = ½ Σ_i g(λ_i)` accumulation in [`joint_jeffreys_term`] computes inline;
+/// it is factored out so the `½ log|H_id|₊`-style **criterion atom**
+/// (`JeffreysLogdetAtom`) can emit its VALUE (`½ Σ g`) and its frozen
+/// directional DERIVATIVE (`½ Σ floored_inverse(λ) · Ṽ_ii`, the `tr(H_id⁺ Ḣ)`
+/// trace) as projections of one spectrum — value and gradient cannot desync
+/// because `g` and `g' = floored_inverse` are pinned here (the gam#787/#785
+/// value↔gradient-consistency invariant, now structural). The four branches
+/// mirror the documentation on [`floored_inverse`] exactly:
+///
+///   * `λ ≥ Λ`:           `g = ln Λ + 1 − Λ/λ`        (TOP saturation);
+///   * `floor ≤ λ < Λ`:   `g = ln λ`                  (exact Jeffreys log-volume);
+///   * `0 ≤ λ < floor`:   `g = λ/floor + ln(floor) − 1` (#787 linear continuation);
+///   * `λ < 0`:           `g = ln(floor) − 1 + λ/(floor − λ)` (BOTTOM saturation).
+#[inline]
+pub(crate) fn jeffreys_antiderivative(lam: f64, floor: f64) -> f64 {
+    let cap = jeffreys_cap(floor);
+    if lam >= cap {
+        cap.ln() + 1.0 - cap / lam
+    } else if lam >= floor {
+        lam.ln()
+    } else if lam >= 0.0 {
+        lam / floor + floor.ln() - 1.0
+    } else {
+        floor.ln() - 1.0 + lam / (floor - lam)
+    }
+}
+
 /// `d'(λ)` with the floor held fixed: `−2Λ/λ³` on the top saturation,
 /// `−1/λ²` in the log window, `0` inside the band (the linear continuation
 /// has no curvature in `λ`), `2·floor/(floor − λ)³` on the bottom saturation.

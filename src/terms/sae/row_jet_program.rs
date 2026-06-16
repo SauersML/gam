@@ -447,6 +447,226 @@ mod tests {
         (prog, inv_tau)
     }
 
+    /// INDEPENDENT scalar witness for the reconstruction column `ẑ_c(δ)` as a
+    /// function of the primary-increment vector `δ` (the displacement of each
+    /// tower primary from its seed value: a coord primary seeds at value 0, a
+    /// logit primary at its current logit, so `δ` is the same offset the tower's
+    /// seeded variables carry). This evaluator touches NONE of the `Tower4`
+    /// arithmetic — no Leibniz product, no Faà di Bruno compose, no
+    /// `basis_tower`/`decoded_tower`/`gate_tower` — it re-derives the closed-form
+    /// reconstruction from the raw jet tensors and the softmax definition. It is
+    /// the witness the t3/t4 FD oracle differences below.
+    ///
+    /// `ẑ_c(δ) = Σ_k softmax_k((ℓ + δ_logit)·inv_tau) · Σ_b Φ̃_{k,b}(δ_coord)·B_{k,b,c}`
+    /// with the SAME local quadratic basis model the program consumes:
+    /// `Φ̃_b(u) = phi[b] + Σ_a d_phi[b][a]·u_a + ½ Σ_{a,a'} d2_phi[b][a][a']·u_a·u_{a'}`.
+    fn recon_scalar_softmax(
+        prog: &SaeReconstructionRowProgram,
+        out_col: usize,
+        inv_tau: f64,
+        delta: &[f64],
+    ) -> f64 {
+        let k = prog.atoms.len();
+        // Softmax over (logit + δ_logit) for atoms with a free logit primary;
+        // atoms without one keep their base logit (no δ).
+        let exps: Vec<f64> = (0..k)
+            .map(|kk| {
+                let dl = match prog.logit_slot[kk] {
+                    Some(slot) => delta[slot],
+                    None => 0.0,
+                };
+                ((prog.logits[kk] + dl) * inv_tau).exp()
+            })
+            .collect();
+        let denom: f64 = exps.iter().sum();
+        let mut acc = 0.0;
+        for kk in 0..k {
+            let gate = exps[kk] / denom;
+            let atom = &prog.atoms[kk];
+            // decoded_{kk,c}(δ_coord) via the local quadratic basis model.
+            let mut decoded = 0.0;
+            for b in 0..atom.n_basis() {
+                let mut phi = atom.phi[b];
+                for a in 0..atom.latent_dim {
+                    let ua = delta[prog.coord_slot[kk][a]];
+                    phi += atom.d_phi[b][a] * ua;
+                }
+                for a in 0..atom.latent_dim {
+                    let ua = delta[prog.coord_slot[kk][a]];
+                    for a2 in 0..atom.latent_dim {
+                        let ub = delta[prog.coord_slot[kk][a2]];
+                        phi += 0.5 * atom.d2_phi[b][a][a2] * ua * ub;
+                    }
+                }
+                decoded += phi * atom.decoder[b][out_col];
+            }
+            acc += gate * decoded;
+        }
+        acc
+    }
+
+    /// Fourth-order central FD of `recon_scalar_softmax` along axes (a,b,c,d) at
+    /// the origin (δ = 0, the tower seed point). Uses the standard mixed
+    /// fourth-difference stencil with sign vector ±h on each of the four axes
+    /// (axes may coincide). 2⁴ = 16 evaluations.
+    fn fd_fourth(
+        prog: &SaeReconstructionRowProgram,
+        out_col: usize,
+        inv_tau: f64,
+        axes: [usize; 4],
+        h: f64,
+    ) -> f64 {
+        let n = prog.n_primaries;
+        let mut acc = 0.0;
+        for mask in 0..16u32 {
+            let mut delta = vec![0.0_f64; n];
+            let mut sign = 1.0;
+            for (slot, &ax) in axes.iter().enumerate() {
+                if (mask >> slot) & 1 == 1 {
+                    delta[ax] += h;
+                } else {
+                    delta[ax] -= h;
+                    sign = -sign;
+                }
+            }
+            acc += sign * recon_scalar_softmax(prog, out_col, inv_tau, &delta);
+        }
+        acc / (16.0 * h * h * h * h)
+    }
+
+    /// Third-order central FD of `recon_scalar_softmax` along axes (a,b,c) at the
+    /// origin: 2³ = 8 evaluations with the mixed third-difference stencil.
+    fn fd_third(
+        prog: &SaeReconstructionRowProgram,
+        out_col: usize,
+        inv_tau: f64,
+        axes: [usize; 3],
+        h: f64,
+    ) -> f64 {
+        let n = prog.n_primaries;
+        let mut acc = 0.0;
+        for mask in 0..8u32 {
+            let mut delta = vec![0.0_f64; n];
+            let mut sign = 1.0;
+            for (slot, &ax) in axes.iter().enumerate() {
+                if (mask >> slot) & 1 == 1 {
+                    delta[ax] += h;
+                } else {
+                    delta[ax] -= h;
+                    sign = -sign;
+                }
+            }
+            acc += sign * recon_scalar_softmax(prog, out_col, inv_tau, &delta);
+        }
+        acc / (8.0 * h * h * h)
+    }
+
+    /// The #932 follow-up the issue flagged as missing: the SAE reconstruction
+    /// program's THIRD- and FOURTH-order channels (`t3`/`t4`) validated against an
+    /// INDEPENDENT witness (`recon_scalar_softmax`, finite-differenced), not just
+    /// the value/first/second channels the hand-path oracle covers. Both the
+    /// witness and the differencing are independent of the `Tower4` Leibniz /
+    /// Faà-di-Bruno arithmetic that produces `t3`/`t4`, so agreement is a real
+    /// cross-check of those higher-order channels — the analog of the survival
+    /// kernel's `row_third_contracted` oracle, extended to fourth order.
+    #[test]
+    fn softmax_reconstruction_t3_t4_match_independent_fd_witness() {
+        let (prog, inv_tau) = softmax_fixture(1.1);
+        // Mixed fifth-derivative magnitude bounds the central-FD truncation; a
+        // moderate step keeps both truncation and roundoff well under tol.
+        let h3 = 2e-3;
+        let h4 = 1e-2;
+        for out_col in 0..prog.out_dim() {
+            let tower = prog.reconstruction_column::<6>(out_col);
+
+            let t3_floor = tower
+                .t3
+                .iter()
+                .flatten()
+                .flatten()
+                .fold(0.0_f64, |m, x| m.max(x.abs()))
+                .max(1e-9);
+            let t4_floor = tower
+                .t4
+                .iter()
+                .flatten()
+                .flatten()
+                .flatten()
+                .fold(0.0_f64, |m, x| m.max(x.abs()))
+                .max(1e-9);
+
+            for a in 0..6 {
+                for b in 0..6 {
+                    for c in 0..6 {
+                        let fd = fd_third(&prog, out_col, inv_tau, [a, b, c], h3);
+                        assert!(
+                            (tower.t3[a][b][c] - fd).abs() <= 5e-5 * t3_floor,
+                            "col {out_col} t3[{a}][{b}][{c}]: tower {:+.10e} vs fd {:+.10e}",
+                            tower.t3[a][b][c],
+                            fd
+                        );
+                        for d in 0..6 {
+                            let fd4 = fd_fourth(&prog, out_col, inv_tau, [a, b, c, d], h4);
+                            assert!(
+                                (tower.t4[a][b][c][d] - fd4).abs() <= 5e-4 * t4_floor,
+                                "col {out_col} t4[{a}][{b}][{c}][{d}]: tower {:+.10e} vs fd {:+.10e}",
+                                tower.t4[a][b][c][d],
+                                fd4
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A planted #736-style corruption in a t3 OR t4 channel is caught by the
+    /// independent FD witness (loud at introduction). We perturb a copy of the
+    /// tower's higher-order channel and assert the witness disagrees.
+    #[test]
+    fn planted_t3_t4_corruption_is_caught_by_fd_witness() {
+        let (prog, inv_tau) = softmax_fixture(1.1);
+        let out_col = 2;
+        let tower = prog.reconstruction_column::<6>(out_col);
+        // A real logit×coord×coord third block (atom-0 logit slot 0, atom-0
+        // coords 2,3): the witness's third FD must match it...
+        let axes3 = [0usize, 2, 3];
+        let fd3 = fd_third(&prog, out_col, inv_tau, axes3, 2e-3);
+        let t3_floor = tower
+            .t3
+            .iter()
+            .flatten()
+            .flatten()
+            .fold(0.0_f64, |m, x| m.max(x.abs()))
+            .max(1e-9);
+        assert!(
+            (tower.t3[0][2][3] - fd3).abs() <= 5e-5 * t3_floor,
+            "honest t3 must match witness"
+        );
+        // ...and a sign-flipped copy must NOT.
+        let corrupt = -tower.t3[0][2][3];
+        assert!(
+            (corrupt - fd3).abs() > 5e-5 * t3_floor,
+            "a sign-flipped t3 block must disagree with the FD witness"
+        );
+
+        let axes4 = [0usize, 0, 2, 3];
+        let fd4 = fd_fourth(&prog, out_col, inv_tau, axes4, 1e-2);
+        let t4_floor = tower
+            .t4
+            .iter()
+            .flatten()
+            .flatten()
+            .flatten()
+            .fold(0.0_f64, |m, x| m.max(x.abs()))
+            .max(1e-9);
+        let corrupt4 = tower.t4[0][0][2][3] + 10.0 * t4_floor;
+        assert!(
+            (corrupt4 - fd4).abs() > 5e-4 * t4_floor,
+            "a corrupted t4 block must disagree with the FD witness"
+        );
+    }
+
     #[test]
     fn softmax_reconstruction_tower_matches_hand_channels_all_columns() {
         let (prog, inv_tau) = softmax_fixture(1.3);

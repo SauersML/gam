@@ -126,6 +126,7 @@
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
+use super::jeffreys_subspace::{floored_inverse, jeffreys_antiderivative};
 use super::reml_outer_engine::PenaltySubspaceTrace;
 
 /// An outer-coordinate direction with its induced inner motion, built ONCE
@@ -507,6 +508,109 @@ impl CriterionAtom for PenaltyQuadAtom {
     }
 }
 
+/// Atom 5 (ledger item "TK/Jeffreys/prior atoms"): the universal Jeffreys /
+/// Firth term `Φ_J = G · ½ Σ_i g(λ_i)` on the under-identified reduced
+/// information `H_id = Z_Jᵀ H Z_J` — the spectral-logdet sibling of
+/// [`HessianLogdetAtom`], but over the floored/saturated Jeffreys
+/// antiderivative `g` (gam#979) instead of the bare `log σ`, and scaled by the
+/// C¹ conditioning gate `G ∈ [0, 1]`.
+///
+/// Internal state = the ONE reduced-information eigendecomposition
+/// `(λ_i, V)` that `joint_jeffreys_term` already produces. Both channels are
+/// projections of it, and — the gam#787/#785 value↔gradient-consistency
+/// invariant made structural — they are pinned through one pair of functions:
+///
+/// - `value`      = `G · ½ Σ_i g(λ_i)` with `g = jeffreys_antiderivative`
+///   (the exact same four-branch `g` whose derivative is `floored_inverse`);
+/// - `frozen_d1`  = `G · ½ tr(H_id⁺ Ḣ_id[dir])` = `G · ½ Σ_i d_i (Ṽ_dir)_ii`
+///   with `d_i = floored_inverse(λ_i) = g'(λ_i)` and `Ṽ_dir = Vᵀ Ḣ_id V` the
+///   reduced drift rotated into the eigenbasis. Because `d = g'` is the SAME
+///   function `value` antidifferentiates, the directional derivative is the
+///   exact derivative of the value on the constant-rank/constant-gate stratum —
+///   no second formula to drift (the bug this term stalled on, gam#787);
+/// - `beta_channel` = NONE, exactly as [`HessianLogdetAtom`]: the β̂-motion of
+///   `H_id` (and the gate's own mode-response, gam#854) enters through the
+///   direction's shared `h_dot_total`, leaving no second site to misassemble;
+/// - `stratum`    = the reduced spectrum's smallest relative eigengap (the
+///   Daleckii–Krein kernel divides by `λ_i − λ_j`) AND the gate band state
+///   (a gate flip is a declared boundary, not a desync). `kept_rank` is the
+///   reduced dimension `m`.
+///
+/// The drift is supplied already rotated into the eigenbasis as the reduced
+/// matrix `Ṽ_dir = Vᵀ Z_Jᵀ Ḣ Z_J V` (an `m × m` object — the same reduced
+/// derivative `joint_jeffreys_term`'s gradient builds), so the atom holds only
+/// `(λ, d=floored_inverse(λ), G)` and contracts `tr(diag(d) · Ṽ_dir)`.
+pub struct JeffreysLogdetAtom {
+    /// Reduced-information eigenvalues `λ_i` (signed; may be < floor or < 0 in
+    /// the saturating branches). The one spectrum both channels project.
+    pub eigvals: Array1<f64>,
+    /// The floor passed to `jeffreys_antiderivative` / `floored_inverse` — the
+    /// single knot pinning `g` and `g'`.
+    pub floor: f64,
+    /// Conditioning-gate weight `G ∈ [0, 1]` scaling the whole term (the
+    /// `conditioning_gate_weight` value computed once for this spectrum).
+    pub gate_weight: f64,
+    /// Per-direction reduced drift `Ṽ_dir = Vᵀ Z_Jᵀ Ḣ[dir] Z_J V`, keyed by the
+    /// packed-θ coordinate index — the eigenbasis-rotated derivative the
+    /// gradient builder already forms. Looked up by `dir.index`; an absent
+    /// index has no frozen channel (its motion, if any, is zero in this term).
+    pub reduced_drift: std::collections::HashMap<usize, Arc<Array2<f64>>>,
+    /// Declared smoothness stratum (reduced rank + min relative eigengap).
+    pub stratum: StratumFingerprint,
+}
+
+impl JeffreysLogdetAtom {
+    /// `d_i = floored_inverse(λ_i) = g'(λ_i)` — the floored-inverse diagonal
+    /// (`inv_diag` in `joint_jeffreys_term`), the SAME slope the value
+    /// antidifferentiates and the frozen trace weights against.
+    fn floored_inv_diag(&self) -> Array1<f64> {
+        self.eigvals.mapv(|lam| floored_inverse(lam, self.floor))
+    }
+}
+
+impl CriterionAtom for JeffreysLogdetAtom {
+    fn name(&self) -> &'static str {
+        "jeffreys_logdet"
+    }
+    fn value(&self) -> f64 {
+        // G · ½ Σ_i g(λ_i): the gate-scaled bounded Jeffreys log-volume.
+        self.gate_weight
+            * 0.5
+            * self
+                .eigvals
+                .iter()
+                .map(|&lam| jeffreys_antiderivative(lam, self.floor))
+                .sum::<f64>()
+    }
+    fn frozen_d1(&self, dir: &ThetaDirection) -> f64 {
+        let idx = match dir.index {
+            Some(idx) => idx,
+            None => return 0.0,
+        };
+        let reduced = match self.reduced_drift.get(&idx) {
+            Some(r) => r,
+            None => return 0.0,
+        };
+        // G · ½ tr(H_id⁺ Ḣ_id) = G · ½ Σ_i d_i (Ṽ_dir)_ii, with d = g'.
+        let d = self.floored_inv_diag();
+        let m = d.len();
+        let mut trace = 0.0;
+        for i in 0..m {
+            trace += d[i] * reduced[[i, i]];
+        }
+        self.gate_weight * 0.5 * trace
+    }
+    fn beta_channel(&self) -> Option<BetaChannel> {
+        None
+    }
+    fn stratum(&self) -> Option<StratumFingerprint> {
+        Some(StratumFingerprint {
+            kept_rank: self.stratum.kept_rank,
+            min_relative_eigengap: self.stratum.min_relative_eigengap,
+        })
+    }
+}
+
 // Atom 2 in the migration order is `penalty_logdet.rs` itself — it already
 // satisfies the contract (one factorization → value + ρ/ψ/cross
 // derivatives) and needs only the trait impl plus the deletion of its
@@ -744,5 +848,114 @@ mod tests {
         };
         assert!((sum.value() - 13.0).abs() < 1e-12);
         assert!((sum.d1(&dir0) - 3.5).abs() < 1e-12);
+    }
+
+    /// Per-atom isolation + value↔gradient consistency check for the Jeffreys
+    /// anchor (`JeffreysLogdetAtom`, ledger item "TK/Jeffreys/prior atoms").
+    ///
+    /// Two properties, matching the `HessianLogdetAtom` discipline:
+    ///
+    /// 1. **Closed-form bit-identity.** `value = G·½ Σ g(λ_i)` and
+    ///    `frozen_d1 = G·½ Σ d_i Ṽ_ii` are reproduced by hand from a chosen
+    ///    spectrum, with `g = jeffreys_antiderivative` and `d = floored_inverse`.
+    /// 2. **The structural desync-killer (gam#787):** the slope the frozen
+    ///    trace weights against, `d_i = floored_inverse(λ_i)`, is the EXACT
+    ///    derivative of the function `value` antidifferentiates,
+    ///    `g = jeffreys_antiderivative`. An FD oracle confirms
+    ///    `g'(λ) ≈ floored_inverse(λ)` across all four branches (top/log/band/
+    ///    bottom-saturation), so the atom's value and directional derivative
+    ///    cannot drift — exactly the consistency the term stalled on.
+    #[test]
+    pub(crate) fn jeffreys_logdet_atom_emits_consistent_value_and_directional_derivative() {
+        use super::super::jeffreys_subspace::{floored_inverse, jeffreys_antiderivative};
+
+        let floor = 1e-3_f64;
+
+        // FD oracle: g' == floored_inverse on a sample from each branch. The cap
+        // here is the gate-clear scale (floor < that), so: top (λ ≥ cap),
+        // log-window (floor ≤ λ < cap), below-floor band (0 ≤ λ < floor), and
+        // bottom-saturation (λ < 0). Use a central difference with a per-point
+        // step (relative away from kinks) and a loose tolerance — the branches
+        // are only C¹, so straddling a knot is excluded by construction.
+        let cap = super::super::jeffreys_subspace::jeffreys_cap(floor);
+        for &lam in &[cap * 4.0, (floor + cap) * 0.5, floor * 0.5, -0.7_f64] {
+            let h = 1e-7 * lam.abs().max(1e-3);
+            let fd = (jeffreys_antiderivative(lam + h, floor)
+                - jeffreys_antiderivative(lam - h, floor))
+                / (2.0 * h);
+            let analytic = floored_inverse(lam, floor);
+            assert!(
+                (fd - analytic).abs() <= 1e-4 * analytic.abs().max(1.0),
+                "g'(λ) desync at λ={lam}: fd={fd} analytic={analytic}"
+            );
+        }
+
+        // Spectrum λ = (2.0, 0.5) — both in the exact log-window (floor < λ < cap):
+        //   g(λ) = ln λ ⇒ value = G·½(ln 2 + ln 0.5) = G·½·ln 1 = 0  (for any G!),
+        //   d(λ) = 1/λ ⇒ d = (0.5, 2.0).
+        // Use a richer spectrum so the value is nonzero and hand-checkable:
+        //   λ = (4.0, 0.25): g = ln 4 + ln 0.25 = 0 again — pick (4.0, 0.5):
+        //   value = G·½(ln 4 + ln 0.5) = G·½·ln 2.
+        let eigvals = array![4.0_f64, 0.5_f64];
+        let gate = 0.75_f64;
+        let stratum = StratumFingerprint {
+            kept_rank: 2,
+            min_relative_eigengap: (4.0 - 0.5) / 4.0,
+        };
+
+        // Reduced drift for direction 0: Ṽ_dir = [[1.0, 0.2], [0.2, 3.0]].
+        // d = (1/4, 1/0.5) = (0.25, 2.0). tr(diag(d)·Ṽ) = 0.25·1.0 + 2.0·3.0 = 6.25.
+        // frozen_d1 = G·½·6.25 = 0.75·0.5·6.25 = 2.34375.
+        let mut reduced_drift = std::collections::HashMap::new();
+        reduced_drift.insert(0_usize, Arc::new(array![[1.0, 0.2], [0.2, 3.0]]));
+
+        let atom = JeffreysLogdetAtom {
+            eigvals: eigvals.clone(),
+            floor,
+            gate_weight: gate,
+            reduced_drift,
+            stratum,
+        };
+
+        assert_eq!(atom.name(), "jeffreys_logdet");
+        let expected_value = gate * 0.5 * (4.0_f64.ln() + 0.5_f64.ln());
+        assert!(
+            (atom.value() - expected_value).abs() < 1e-12,
+            "value {} vs {}",
+            atom.value(),
+            expected_value
+        );
+        assert!(
+            atom.beta_channel().is_none(),
+            "Jeffreys logdet rides the shared drift; no β-channel (like HessianLogdetAtom)"
+        );
+        assert_eq!(atom.stratum().expect("declared stratum").kept_rank, 2);
+
+        let dir0 = ThetaDirection {
+            index: Some(0),
+            beta_dot: Some(Arc::new(array![0.0, 0.0])),
+            h_dot_total: None,
+        };
+        assert!(
+            (atom.frozen_d1(&dir0) - 2.34375).abs() < 1e-12,
+            "frozen_d1 {} vs 2.34375",
+            atom.frozen_d1(&dir0)
+        );
+
+        // A direction with no reduced drift entry has no frozen channel here.
+        let dir_absent = ThetaDirection {
+            index: Some(9),
+            beta_dot: None,
+            h_dot_total: None,
+        };
+        assert!(atom.frozen_d1(&dir_absent).abs() < 1e-12);
+
+        // CriterionSum fold: with no β-channel the profiled d1 is just the
+        // frozen sum (β̇ unused), so it equals the standalone frozen_d1.
+        let sum = CriterionSum {
+            atoms: vec![Box::new(atom)],
+        };
+        assert!((sum.value() - expected_value).abs() < 1e-12);
+        assert!((sum.d1(&dir0) - 2.34375).abs() < 1e-12);
     }
 }

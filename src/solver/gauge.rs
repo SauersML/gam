@@ -165,6 +165,37 @@ impl Gauge {
         }
     }
 
+    /// The sum-to-zero (centering) section as a first-class single-block
+    /// gauge. `z` is the `(k × (k−1))` reparametrisation matrix returned by
+    /// [`crate::terms::basis::duchon_thinplate::apply_sum_to_zero_constraint`]
+    /// (an orthonormal basis for `null(cᵀ)`, `c = Bᵀw` the weighted column
+    /// sums): the constrained design is `B_c = B · z`, so on the model
+    /// `η = B · β_raw = B_c · θ = B · z · θ` the raw coefficients lift back
+    /// from the reduced (centred) coefficients by exactly `β_raw = z · θ`.
+    ///
+    /// That is the one Gauge convention with `T = z` over a single block, so
+    /// the centring constraint stops being a special-cased outside-the-object
+    /// transform and becomes a `Gauge` section like every other reduction:
+    /// the covariance / penalised-Hessian of the centred fit pushes forward to
+    /// the raw basis through the SAME `z` via [`Gauge::lift_covariance`].
+    ///
+    /// `z` is taken as the section itself (rather than recomputed from a basis)
+    /// because the constraint matrix is the only gauge-relevant artifact — the
+    /// basis the column sums were taken over is irrelevant to the lift. The
+    /// only requirement is the structural one of a centring section:
+    /// `z.ncols() < z.nrows()` (at least one direction is removed); an identity
+    /// `z` would be `Gauge::identity` and is rejected so callers do not silently
+    /// treat an unconstrained block as centred.
+    pub fn sum_to_zero(z: Array2<f64>) -> Self {
+        let (k, r) = z.dim();
+        assert!(
+            k > 0 && r < k,
+            "Gauge::sum_to_zero: z must be a tall reparametrisation ({k}×{r}); \
+             a centring section removes at least one direction (r < k)",
+        );
+        Self::from_block_transforms(&[z])
+    }
+
     /// Wrap an already-assembled global `T` given the per-block raw and
     /// reduced width partitions.
     pub fn from_t(t_full: Array2<f64>, raw_widths: &[usize], reduced_widths: &[usize]) -> Self {
@@ -487,6 +518,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `Gauge::sum_to_zero(z)` must lift exactly as `β_raw = z · θ`, and the
+    /// lift must preserve the linear predictor: for any centred design
+    /// `B_c = B · z` and any reduced coefficient `θ`, the raw prediction
+    /// `B · (z · θ)` equals the reduced prediction `B_c · θ`. This is the
+    /// invariant that makes `z` the correct section — a wrong gauge would
+    /// preserve coefficients but break η.
+    #[test]
+    fn sum_to_zero_gauge_lifts_via_z_and_preserves_eta() {
+        // A concrete orthonormal centring section: null space of c = [1,1,1]ᵀ
+        // (the unweighted sum-to-zero constraint on a width-3 block), built as
+        // two orthonormal columns each summing to zero.
+        let s = 1.0 / 2.0_f64.sqrt();
+        let s6 = 1.0 / 6.0_f64.sqrt();
+        let mut z = Array2::<f64>::zeros((3, 2));
+        z[[0, 0]] = s;
+        z[[1, 0]] = -s;
+        z[[2, 0]] = 0.0;
+        z[[0, 1]] = s6;
+        z[[1, 1]] = s6;
+        z[[2, 1]] = -2.0 * s6;
+        // The columns are orthonormal and sum to zero (cᵀz = 0).
+        for j in 0..2 {
+            assert!((z.column(j).sum()).abs() < 1e-14, "column {j} must sum to 0");
+            assert!(
+                (z.column(j).dot(&z.column(j)) - 1.0).abs() < 1e-14,
+                "column {j} must be unit norm"
+            );
+        }
+
+        let gauge = Gauge::sum_to_zero(z.clone());
+        assert_eq!(gauge.n_blocks(), 1);
+        assert_eq!(gauge.raw_widths(), vec![3]);
+        assert_eq!(gauge.reduced_widths(), vec![2]);
+        assert_eq!(gauge.block_transform(0), z);
+
+        // Lift β_raw = z · θ exactly.
+        let theta = Array1::from(vec![1.3, -0.7]);
+        let raw = gauge.lift_block_betas(&[theta.clone()]);
+        let expected_raw = z.dot(&theta);
+        for i in 0..3 {
+            assert!((raw[0][i] - expected_raw[i]).abs() < 1e-14);
+        }
+        // Centring is satisfied: the raw coefficients sum to zero.
+        assert!(raw[0].sum().abs() < 1e-14, "lifted β must be centred");
+
+        // η preservation: B · (z · θ) == (B · z) · θ for an arbitrary B.
+        let b = Array2::from_shape_vec(
+            (4, 3),
+            vec![
+                1.0, 2.0, -1.0, 0.5, -0.5, 3.0, 2.0, 1.0, 1.0, -1.0, 0.0, 4.0,
+            ],
+        )
+        .unwrap();
+        let b_c = fast_ab(&b, &z); // the constrained design B_c
+        let eta_reduced = b_c.dot(&theta);
+        let eta_raw = b.dot(&expected_raw);
+        for i in 0..4 {
+            assert!(
+                (eta_reduced[i] - eta_raw[i]).abs() < 1e-13,
+                "η must be invariant under the centring lift at row {i}",
+            );
+        }
+
+        // Covariance pushforward through the SAME z (rank-1 consistency).
+        let cov_rank1 = Array2::from_shape_fn((2, 2), |(i, j)| theta[i] * theta[j]);
+        let lifted = gauge.lift_covariance(&cov_rank1);
+        assert_eq!(lifted.dim(), (3, 3));
+        for i in 0..3 {
+            for j in 0..3 {
+                let expect = expected_raw[i] * expected_raw[j];
+                assert!(
+                    (lifted[[i, j]] - expect).abs() < 1e-13,
+                    "centring covariance lift must equal (zθ)(zθ)ᵀ at ({i},{j})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "removes at least one direction")]
+    fn sum_to_zero_rejects_identity_section() {
+        // A square z removes no direction — that is not a centring section.
+        let _ = Gauge::sum_to_zero(Array2::<f64>::eye(3));
     }
 
     #[test]
