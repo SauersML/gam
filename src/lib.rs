@@ -66,7 +66,6 @@ pub mod config_resolve;
 pub mod families;
 pub mod geometry;
 pub mod gpu;
-pub mod identifiability_diagnostics;
 pub mod inference;
 pub mod linalg;
 pub mod report;

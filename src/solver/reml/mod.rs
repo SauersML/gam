@@ -2,7 +2,7 @@ use self::inner_strategy::GeometryBackendKind;
 use super::*;
 use crate::linalg::sparse_exact::{SparseExactFactor, SparsePenaltyBlock};
 use crate::solver::pirls::assemble_and_factor_sparse_penalized_system;
-use crate::solver::outer_strategy::OuterEval;
+use crate::solver::rho_optimizer::OuterEval;
 use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::terms::basis::LocalDesignJacobianProvider;
 use crate::types::SasLinkState;
@@ -334,7 +334,7 @@ mod tests {
     use crate::faer_ndarray::FaerCholesky;
     use crate::linalg::utils::enforce_symmetry;
     use crate::pirls::PirlsCoordinateFrame;
-    use crate::solver::outer_strategy::{HessianResult, OuterEval};
+    use crate::solver::rho_optimizer::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
     use crate::types::{
         GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,

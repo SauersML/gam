@@ -4263,7 +4263,7 @@ fn mechanism_sparsity_jacobian<'py>(
     epsilon: f64,
     w: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<(f64, Py<PyArray2<f64>>)> {
-    let pen = gam::sae_identifiability::MechanismSparsityJacobian::new(weight, epsilon)
+    let pen = gam::terms::sae::identifiability::MechanismSparsityJacobian::new(weight, epsilon)
         .map_err(py_value_error)?;
     let (value, grad) = pen.value_and_grad(w.as_array());
     Ok((value, grad.into_pyarray(py).unbind()))

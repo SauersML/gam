@@ -1134,7 +1134,7 @@ impl<'a> RemlState<'a> {
                 if requested_hessian && !downgrade_exact_tau_tau {
                     result.hessian
                 } else {
-                    crate::solver::outer_strategy::HessianResult::Unavailable
+                    crate::solver::rho_optimizer::HessianResult::Unavailable
                 },
             ))
         } else {

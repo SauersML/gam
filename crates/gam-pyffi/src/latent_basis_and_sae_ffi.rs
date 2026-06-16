@@ -3183,7 +3183,7 @@ fn sae_riesz_report_dict<'py>(
 /// `smooth_significance` (any-n-valid e-value) for an honest structure test.
 fn sae_atom_functional_estimate_dict<'py>(
     py: Python<'py>,
-    estimate: &gam::sae_identifiability::AtomFunctionalEstimate,
+    estimate: &gam::terms::sae::identifiability::AtomFunctionalEstimate,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("theta_plugin", estimate.theta_plugin)?;
@@ -3199,7 +3199,7 @@ fn sae_atom_functional_estimate_dict<'py>(
 /// inner-decoder smooth was not harvestable.
 fn sae_atom_inference_list<'py>(
     py: Python<'py>,
-    reports: &[gam::sae_identifiability::AtomInferenceReport],
+    reports: &[gam::terms::sae::identifiability::AtomInferenceReport],
 ) -> PyResult<Bound<'py, PyList>> {
     let list = PyList::empty(py);
     for report in reports {
@@ -3251,12 +3251,12 @@ fn sae_atom_inference_list<'py>(
 }
 
 /// Build the result-dict entry for the residual-gauge certificate
-/// ([`gam::sae_identifiability::ResidualGaugeReport`]). Group signature +
+/// ([`gam::terms::sae::identifiability::ResidualGaugeReport`]). Group signature +
 /// per-generator pinned/unpinned verdicts + the metric provenance the
 /// certificate was computed in.
 fn sae_residual_gauge_dict<'py>(
     py: Python<'py>,
-    report: &gam::sae_identifiability::ResidualGaugeReport,
+    report: &gam::terms::sae::identifiability::ResidualGaugeReport,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("group_signature", report.group_signature())?;

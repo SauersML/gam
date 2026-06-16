@@ -6319,7 +6319,7 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
 
     fn family_outer_hessian_operator(
         &self,
-    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
         self.inner.family_outer_hessian_operator()
     }
 }
@@ -6906,7 +6906,7 @@ pub(crate) fn unified_joint_cost_gradient(
     (
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     ),
     String,
 > {
@@ -6974,7 +6974,7 @@ pub(crate) fn unified_joint_efs_eval(
     rho_prior: crate::types::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     ext_bundle: Option<ExtCoordBundle>,
-) -> Result<crate::solver::outer_strategy::EfsEval, String> {
+) -> Result<crate::solver::rho_optimizer::EfsEval, String> {
     let (assembly, _) = build_custom_family_inner_assembly(
         inner,
         specs,
@@ -7037,7 +7037,7 @@ pub(crate) fn unified_joint_efs_eval(
             rho_slice,
             gradient_slice,
         );
-        Ok(crate::solver::outer_strategy::EfsEval {
+        Ok(crate::solver::rho_optimizer::EfsEval {
             cost: result.cost,
             steps: hybrid.steps,
             beta: Some(inner_solution.beta.clone()),
@@ -7058,7 +7058,7 @@ pub(crate) fn unified_joint_efs_eval(
         let inner_hessian_scale = crate::estimate::reml::unified::hessian_operator_geometric_scale(
             inner_solution.hessian_op.as_ref(),
         );
-        Ok(crate::solver::outer_strategy::EfsEval {
+        Ok(crate::solver::rho_optimizer::EfsEval {
             cost: result.cost,
             steps: crate::estimate::reml::unified::compute_efs_update(
                 &inner_solution,
@@ -7285,7 +7285,7 @@ pub(crate) fn joint_outer_evaluate(
     ext_bundle: Option<ExtCoordBundle>,
     first_order_trace_skip: Option<Array1<f64>>,
     batched_outer_hessian_operator: Option<
-        Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+        Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>,
     >,
     // Universal under-identification robustness (always armed when the family can
     // expose an exact joint Hessian). The
@@ -7698,7 +7698,7 @@ pub(crate) fn joint_outer_evaluate(
         .into());
     }
     match &outer_hessian {
-        crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => {
             if hessian.iter().any(|value| !value.is_finite()) {
                 return Err(CustomFamilyError::NumericalFailure {
                     reason: "joint outer evaluation produced a non-finite Hessian".to_string(),
@@ -7718,7 +7718,7 @@ pub(crate) fn joint_outer_evaluate(
                 .into());
             }
         }
-        crate::solver::outer_strategy::HessianResult::Operator(op) => {
+        crate::solver::rho_optimizer::HessianResult::Operator(op) => {
             if op.dim() != expected_theta_dim {
                 return Err(format!(
                     "joint outer evaluation returned operator Hessian dim {}, expected {}",
@@ -7727,7 +7727,7 @@ pub(crate) fn joint_outer_evaluate(
                 ));
             }
         }
-        crate::solver::outer_strategy::HessianResult::Unavailable => {}
+        crate::solver::rho_optimizer::HessianResult::Unavailable => {}
     }
 
     let warm = ConstrainedWarmStart {
@@ -7796,7 +7796,7 @@ pub(crate) fn joint_outer_evaluate_efs(
         >,
     >,
     ext_bundle: Option<ExtCoordBundle>,
-) -> Result<crate::solver::outer_strategy::EfsEval, String> {
+) -> Result<crate::solver::rho_optimizer::EfsEval, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
 

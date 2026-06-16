@@ -779,7 +779,7 @@ impl SaeManifoldTerm {
         ),
         String,
     > {
-        use crate::sae_identifiability::{AtomTopology, FittedAtom, FittedSaeManifold};
+        use crate::terms::sae::identifiability::{AtomTopology, FittedAtom, FittedSaeManifold};
 
         let n = self.n_obs();
         let p = self.output_dim();
