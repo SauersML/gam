@@ -29,7 +29,12 @@ pub mod posterior_bands;
 pub mod predict;
 pub mod probability;
 pub mod probe_runner;
-pub mod psis;
+/// Back-compat re-export: the self-contained Pareto-smoothed importance-sampling
+/// primitive moved DOWN to the crate-root `crate::psis` lower layer (#1135) so
+/// `solver` (and a relocated `rho_uncertainty`) can depend on it without
+/// importing *up* into `inference`. Existing `crate::inference::psis::*` paths
+/// keep resolving.
+pub use crate::psis;
 pub mod quadrature;
 pub mod residual_factor;
 pub mod rho_posterior;

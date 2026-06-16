@@ -1674,7 +1674,7 @@ impl<'a> RemlState<'a> {
             .copied()
             .map(|h| h.max(0.0) / (1.0 - h).max(1e-12))
             .collect();
-        let psis = crate::inference::psis::pareto_smooth_weights(&raw_influence);
+        let psis = crate::psis::pareto_smooth_weights(&raw_influence);
         let smoothed_influence = psis
             .as_ref()
             .map(|p| p.smoothed.as_slice())

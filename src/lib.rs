@@ -77,6 +77,11 @@ pub mod identifiability;
 pub mod inference;
 pub mod linalg;
 pub mod model_types;
+/// Lower-layer Pareto-smoothed importance-sampling primitive. Self-contained
+/// (no solver/inference deps); hosted at the crate root so `solver` and a
+/// relocated `rho_uncertainty` can depend on it downward (#1135).
+/// `crate::inference::psis` remains a back-compat re-export.
+pub mod psis;
 pub mod reml_contracts;
 pub mod report;
 /// Lower-layer resource-policy/materialization-budget types. Hosted at the
@@ -114,7 +119,7 @@ pub use geometry::{
 pub use gpu::GpuPolicy;
 pub use inference::{
     alo, conformal, data, generative, higher_order, hmc, model_comparison, polya_gamma, predict,
-    probability, psis, quadrature, rho_posterior, rho_uncertainty, sample, smooth_test,
+    probability, quadrature, rho_posterior, rho_uncertainty, sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
 // #931-#935 criterion calculus: the profiled-criterion abstraction
