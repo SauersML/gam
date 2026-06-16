@@ -2598,7 +2598,7 @@ fn sae_manifold_fit_inner<'py>(
     // (design, derivative design, penalized inner Hessian, per-row Gaussian
     // scores, roughness Gram, peak/mode design rows) at the settled state, so
     // the diagnostics report can produce per-atom Riesz-debiased functionals and
-    // Bartlett smooth significance. Needs the reconstruction target `Z` (dropped
+    // the split-LRT smooth-structure e-value. Needs the reconstruction target `Z` (dropped
     // from the objective at fit end) and the fitted dispersion, both available
     // here. A degenerate atom (no active rows / non-SPD inner Hessian) yields a
     // `None` slot inside; a structural shape inconsistency surfaces loudly.

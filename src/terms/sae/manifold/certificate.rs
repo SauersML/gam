@@ -182,8 +182,9 @@ pub struct SaeManifoldFitDiagnostics {
     /// caller supplies the fitted reconstruction dispersion needed for the SNR
     /// proxy; absent for legacy callers that only need the existing diagnostics.
     pub incoherence_report: Option<CertificateInputs>,
-    /// Per-atom Riesz-debiased smooth-functional inference and Bartlett smooth
-    /// significance (#1097 / #1103), one entry per fitted atom in atom order.
+    /// Per-atom Riesz-debiased smooth-functional inference and the any-n-valid
+    /// split-LRT smooth-structure e-value (#1097 / #1103), one entry per fitted
+    /// atom in atom order.
     /// Each entry's `functionals` / `smooth_significance` are `Some` only when
     /// the atom's inner-decoder smooth was harvested at fit time (the caller ran
     /// [`SaeManifoldTerm::set_atom_inner_fits`] and the inner penalized Hessian

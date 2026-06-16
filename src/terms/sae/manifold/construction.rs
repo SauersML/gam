@@ -122,7 +122,7 @@ impl SaeManifoldTerm {
     /// `e_{i} = z_i − fitted_i + a_{ik} g_k(t_i)` on channel `j`, holding all
     /// other atoms and the assignment fixed at the fitted optimum — exactly the
     /// fixed snapshot ([`crate::terms::sae::identifiability::AtomInnerFit`]) the Riesz
-    /// debiasing and Bartlett correction read.
+    /// debiasing and split-LRT smooth-structure e-value read.
     ///
     /// A pure read of the fitted state: it mutates only the diagnostic
     /// `atom_inner_fits` field, never a loss / criterion / penalty / optimizer
@@ -570,8 +570,9 @@ impl SaeManifoldTerm {
             )?
         };
 
-        // #1097 / #1103: per-atom Riesz-debiased functionals and Bartlett smooth
-        // significance, read straight off the certificate model — which carries
+        // #1097 / #1103: per-atom Riesz-debiased functionals and the any-n-valid
+        // split-LRT smooth-structure e-value (non-constant vs constant inner
+        // decoder), read straight off the certificate model — which carries
         // each atom's `inner_fit` snapshot when the caller harvested it via
         // [`Self::set_atom_inner_fits`] before this report. Atoms without a
         // harvested inner fit degrade their inference fields to `None` inside
