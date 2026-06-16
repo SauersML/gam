@@ -917,8 +917,6 @@ impl<'a> RemlState<'a> {
             hessian_logdet_correction,
             penalty_subspace_trace,
             deriv_provider: Some(ctx.deriv_provider),
-            tk_correction: 0.0,
-            tk_gradient: None,
             firth: ctx
                 .firth_op
                 .map(crate::estimate::reml::reml_outer_engine::ExactJeffreysTerm::new),
@@ -3023,7 +3021,6 @@ impl<'a> RemlState<'a> {
     ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         let mut assembly =
             self.build_auto_assembly(rho, bundle, super::reml_outer_engine::EvalMode::ValueOnly)?;
-        assembly.tk_gradient = None;
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }

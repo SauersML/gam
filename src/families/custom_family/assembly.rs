@@ -105,8 +105,6 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
         hessian_logdet_correction,
         penalty_subspace_trace,
         deriv_provider: Some(deriv_provider),
-        tk_correction: 0.0,
-        tk_gradient: None,
         // Tier-B Firth fold (gam#979): the inner mode minimizes
         // `−ℓ + ½βᵀSβ − Φ`, so the LAML cost must subtract the same gated
         // `Φ(β̂)` or the envelope-based analytic outer gradient and the value

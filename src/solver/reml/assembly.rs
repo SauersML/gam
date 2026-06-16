@@ -332,8 +332,6 @@ pub struct InnerAssembly<'dp> {
 
     // === Optional decorations (sensible defaults when None/zero) ===
     pub deriv_provider: Option<Box<dyn HessianDerivativeProvider + 'dp>>,
-    pub tk_correction: f64,
-    pub tk_gradient: Option<Array1<f64>>,
     /// Jeffreys/Firth scalar contribution to the LAML cost. Tier-A GLM callers
     /// construct it from the dense operator (`ExactJeffreysTerm::new`); the
     /// Tier-B coupled joint path installs the value-only carrier
@@ -381,7 +379,6 @@ impl<'dp> InnerAssembly<'dp> {
         if let Some(dp) = self.deriv_provider {
             builder = builder.deriv_provider(dp);
         }
-        builder = builder.tk(self.tk_correction, self.tk_gradient);
         builder = builder.firth_term(self.firth);
         if let Some(nd) = self.nullspace_dim {
             builder = builder.nullspace_dim_override(nd);

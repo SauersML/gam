@@ -76,15 +76,6 @@ pub struct InnerSolution<'dp> {
     pub deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
 
     // === Corrections ===
-    /// Firth-only frozen-curvature Tierney-Kadane surrogate correction.
-    /// Standard non-Firth LAML leaves this at zero so the production objective
-    /// stays paired with the exact analytic unified derivatives.
-    pub tk_correction: f64,
-
-    /// Gradient of the Firth-only frozen-curvature TK surrogate with respect
-    /// to active outer coordinates.
-    pub tk_gradient: Option<Array1<f64>>,
-
     /// Optional exact Jeffreys/Firth term in the active coefficient basis.
     pub firth: Option<ExactJeffreysTerm>,
 
@@ -264,8 +255,6 @@ pub struct InnerSolutionBuilder<'dp> {
     pub(crate) dispersion: DispersionHandling,
     // Optional fields with defaults
     pub(crate) deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
-    pub(crate) tk_correction: f64,
-    pub(crate) tk_gradient: Option<Array1<f64>>,
     pub(crate) firth: Option<ExactJeffreysTerm>,
     pub(crate) hessian_logdet_correction: f64,
     pub(crate) penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
@@ -307,8 +296,6 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             n_observations,
             dispersion,
             deriv_provider: Box::new(GaussianDerivatives),
-            tk_correction: 0.0,
-            tk_gradient: None,
             firth: None,
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
@@ -330,12 +317,6 @@ impl<'dp> InnerSolutionBuilder<'dp> {
 
     pub fn deriv_provider(mut self, p: Box<dyn HessianDerivativeProvider + 'dp>) -> Self {
         self.deriv_provider = p;
-        self
-    }
-
-    pub fn tk(mut self, correction: f64, gradient: Option<Array1<f64>>) -> Self {
-        self.tk_correction = correction;
-        self.tk_gradient = gradient;
         self
     }
 
@@ -470,15 +451,6 @@ impl<'dp> InnerSolutionBuilder<'dp> {
                 penalty_dim
             );
         }
-        if let Some(tk_gradient) = self.tk_gradient.as_ref() {
-            assert_eq!(
-                tk_gradient.len(),
-                penalty_dim,
-                "InnerSolutionBuilder: TK gradient length {} does not match penalty coordinate count {}",
-                tk_gradient.len(),
-                penalty_dim
-            );
-        }
         if let Some(barrier_config) = self.barrier_config.as_ref() {
             assert_eq!(
                 barrier_config.constrained_indices.len(),
@@ -545,8 +517,6 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             penalty_coords: self.penalty_coords,
             penalty_logdet: self.penalty_logdet,
             deriv_provider: self.deriv_provider,
-            tk_correction: self.tk_correction,
-            tk_gradient: self.tk_gradient,
             firth: self.firth,
             hessian_logdet_correction: self.hessian_logdet_correction,
             penalty_subspace_trace: self.penalty_subspace_trace,

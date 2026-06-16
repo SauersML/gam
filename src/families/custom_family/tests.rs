@@ -4629,6 +4629,89 @@ pub(crate) fn cone_projection_preserves_step_where_alpha_crush_collapses_it() {
     );
 }
 
+/// gam#979 gated QP-feasibility reroute discriminator. The constrained
+/// joint-Newton path only bypasses the global α-crush when the α it WOULD apply
+/// falls below `JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD`. This test pins that
+/// discriminator on `compute_joint_feasibility_alpha`:
+///   * a HEALTHY step (α = 1.0, no binding constraint) is at/above the threshold
+///     ⇒ the legacy truncate + α path runs UNCHANGED (byte-identical numerics —
+///     the guarantee for every currently-converging arm, e.g. binary BMS), and
+///   * a PATHOLOGICAL step (α far below the threshold, a binding row crushing the
+///     whole step) is detected as the crush case ⇒ the magnitude-preserving cone
+///     projection is used instead.
+#[test]
+pub(crate) fn joint_feasibility_alpha_gate_discriminates_healthy_from_crush() {
+    // Minimal family supplying a controllable per-block feasibility α via
+    // `max_feasible_step_size`. α is the configured value (or `None` ⇒ no limit).
+    #[derive(Clone)]
+    struct AlphaFamily {
+        alpha: Option<f64>,
+    }
+    impl CustomFamily for AlphaFamily {
+        fn evaluate(
+            &self,
+            _block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![0.0],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                }],
+            })
+        }
+        fn max_feasible_step_size(
+            &self,
+            _block_states: &[ParameterBlockState],
+            _idx: usize,
+            _arr: &Array1<f64>,
+        ) -> Result<Option<f64>, String> {
+            Ok(self.alpha)
+        }
+    }
+
+    let states = vec![ParameterBlockState {
+        beta: array![0.0],
+        eta: array![0.0],
+    }];
+    let ranges = vec![(0usize, 1usize)];
+    let step = array![1.0_f64];
+
+    // No feasibility limit ⇒ α = 1.0 (fully feasible). At/above the threshold:
+    // the legacy path runs unchanged.
+    let healthy = AlphaFamily { alpha: None };
+    let (alpha_healthy, _) =
+        compute_joint_feasibility_alpha(&healthy, &states, &ranges, &step).unwrap();
+    assert_eq!(alpha_healthy, 1.0, "no constraint ⇒ α = 1.0");
+    assert!(
+        alpha_healthy >= JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD,
+        "healthy α must NOT trip the crush bypass (legacy path stays byte-identical)"
+    );
+
+    // A moderate limit just above the threshold is still NOT a crush: legacy
+    // α-scaling applies, no reroute.
+    let moderate = AlphaFamily {
+        alpha: Some(2.0 * JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD),
+    };
+    let (alpha_moderate, _) =
+        compute_joint_feasibility_alpha(&moderate, &states, &ranges, &step).unwrap();
+    assert!(
+        alpha_moderate >= JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD,
+        "moderate α (2× threshold) must stay on the legacy path"
+    );
+
+    // The survival pathology: α ≈ 1e-4 on a binding monotone row. Below the
+    // threshold ⇒ the bypass fires and the cone projection takes over.
+    let crush = AlphaFamily { alpha: Some(1e-4) };
+    let (alpha_crush, limiting) =
+        compute_joint_feasibility_alpha(&crush, &states, &ranges, &step).unwrap();
+    assert!(
+        alpha_crush < JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD,
+        "the survival pathology (α≈1e-4) must trip the crush bypass; got α={alpha_crush:.3e}"
+    );
+    assert_eq!(limiting, Some(0), "the binding block must be reported");
+}
+
 /// gam#979 (per-block exact-Newton arm; the bernoulli marginal-slope binary
 /// path). The per-block left-hand side is `lhs = H_data + S` with `S ⪰ 0` an
 /// over-smoothed block penalty. The plain

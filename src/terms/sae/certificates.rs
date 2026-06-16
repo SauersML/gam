@@ -31,8 +31,9 @@
 //! layer for the criterion-atom architecture (#931): atoms make desync
 //! structurally hard to write; this certificate makes any residue observable
 //! in production, where the real data shapes that trigger #901-class desyncs
-//! actually occur. It is the same relationship `GuardedCorrection` has to its
-//! invariant — the invariant is enforced structurally and audited at runtime.
+//! actually occur. It is the same relationship theta-correction atoms have to
+//! their invariants — the invariant is enforced structurally and audited at
+//! runtime.
 //!
 //! # Cost
 //!

@@ -603,67 +603,6 @@ impl ExactJeffreysTerm {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Guarded scalar correction (value + ρ-gradient under ONE include flag)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// A scalar objective correction whose VALUE and analytic ρ-GRADIENT are
-/// carried together and applied through a SINGLE site under a SINGLE guard.
-///
-/// This is the structural cure for the recurring objective↔gradient desync
-/// bug class (issues #752/#748/#808 and the latent Tierney–Kadane desync):
-/// when a correction's value and its derivative are added to the cost and the
-/// ρ-gradient in physically separate statements — each with its own
-/// hand-written `if include_logdet_h { … }` guard — the two drift apart. Here
-/// the `include` flag is read ONCE and gates BOTH contributions in
-/// [`GuardedCorrection::apply`], so a future edit cannot re-introduce the
-/// half-applied/half-omitted state by construction.
-///
-/// Mirrors the already-paired `PenaltyLogdetDerivs` / `joint_jeffreys_term`
-/// objects, which return value+derivative together for exactly this reason.
-pub(crate) struct GuardedCorrection {
-    /// Scalar contribution to the outer REML/LAML cost.
-    pub(crate) value: f64,
-    /// Contribution to the ρ-gradient (one entry per active ρ coordinate),
-    /// `None` when the correction is value-only (derivative-free regime).
-    pub(crate) gradient: Option<Array1<f64>>,
-    /// The SINGLE guard. When `false`, NEITHER the value nor the gradient is
-    /// applied; when `true`, BOTH are.
-    pub(crate) include: bool,
-}
-
-impl GuardedCorrection {
-    /// Construct a guarded correction from a loose `(value, gradient)` pair and
-    /// the include flag that must gate both.
-    pub(crate) fn new(value: f64, gradient: Option<Array1<f64>>, include: bool) -> Self {
-        Self {
-            value,
-            gradient,
-            include,
-        }
-    }
-
-    /// Apply the VALUE contribution to `cost` under the single `include` guard.
-    pub(crate) fn apply_value(&self, cost: &mut f64) {
-        if self.include {
-            *cost += self.value;
-        }
-    }
-
-    /// Apply the ρ-GRADIENT contribution to the leading entries of `rho_grad`
-    /// under the SAME single `include` guard read from `self`.
-    pub(crate) fn apply_gradient(&self, rho_grad: &mut Array1<f64>) {
-        if !self.include {
-            return;
-        }
-        if let Some(grad) = self.gradient.as_ref() {
-            let k = grad.len();
-            let mut sl = rho_grad.slice_mut(ndarray::s![..k]);
-            sl += grad;
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 //  Log-barrier support for constrained coefficients
 // ═══════════════════════════════════════════════════════════════════════════
 

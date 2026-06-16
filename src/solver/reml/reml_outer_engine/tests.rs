@@ -269,60 +269,6 @@ pub(crate) fn batched_penalty_subspace_traces_match_exact_kernel_on_ill_conditio
     );
 }
 
-// ─── Can't-desync invariant for GuardedCorrection ────────────────────
-//
-// A `GuardedCorrection` carries a scalar VALUE and its analytic ρ-GRADIENT
-// under ONE `include` flag. The invariant this pins: the SAME flag gates
-// BOTH contributions, so the value and the gradient can never be
-// half-applied (the objective↔gradient desync class behind #752/#748/#808
-// and the latent Tierney–Kadane correction desync). With `include = false`
-// NEITHER the cost nor the ρ-gradient moves; with `include = true` BOTH do —
-// and because `apply_value` + `apply_gradient` (the split the evaluator
-// uses across the value-only early return) read the SAME guard from the
-// SAME object, the two sides cannot drift.
-#[test]
-pub(crate) fn guarded_correction_include_false_applies_neither() {
-    let value = 3.5_f64;
-    let gradient = array![0.25, -0.75, 1.5];
-    let correction =
-        GuardedCorrection::new(value, Some(gradient.clone()), /* include = */ false);
-
-    // Split apply (the value-only-early-return path): no-op guarantee on
-    // both sides under the single `include = false` guard.
-    let mut cost_split = 10.0;
-    let mut grad_split = array![0.0, 0.0, 0.0];
-    correction.apply_value(&mut cost_split);
-    correction.apply_gradient(&mut grad_split);
-    assert_eq!(cost_split, 10.0, "apply_value must respect include=false");
-    assert_eq!(
-        grad_split,
-        array![0.0, 0.0, 0.0],
-        "apply_gradient must respect include=false"
-    );
-}
-
-#[test]
-pub(crate) fn guarded_correction_include_true_applies_both() {
-    let value = 3.5_f64;
-    let gradient = array![0.25, -0.75, 1.5];
-    let correction =
-        GuardedCorrection::new(value, Some(gradient.clone()), /* include = */ true);
-
-    // Split apply: both sides must move under the single `include = true`
-    // guard, and the gradient is added only to the LEADING entries (extra
-    // ρ-coordinates untouched).
-    let mut cost_split = 10.0;
-    let mut grad_split = array![0.0, 0.0, 0.0, 42.0];
-    correction.apply_value(&mut cost_split);
-    correction.apply_gradient(&mut grad_split);
-    assert_eq!(cost_split, 13.5);
-    assert_eq!(
-        grad_split,
-        array![0.25, -0.75, 1.5, 42.0],
-        "gradient applies to leading entries; trailing ext coords untouched"
-    );
-}
-
 // ─── Regression for #376 ─────────────────────────────────────────────
 //
 // When a linear-inequality active set (from a `monotone_decreasing` /
@@ -1214,8 +1160,6 @@ pub(crate) fn build_sentinel_tripwire_solution(
             second: Some(array![[0.0]]),
         },
         deriv_provider: Box::new(deriv_provider),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -1298,8 +1242,6 @@ pub(crate) fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
             second: Some(array![[0.0]]),
         },
         deriv_provider: Box::new(deriv_provider),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -2133,8 +2075,6 @@ pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_g
             second: Some(array![[0.13]]),
         },
         deriv_provider: Box::new(deriv_provider),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -2298,8 +2238,6 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
                 second: Some(array![[0.13]]),
             },
             deriv_provider: Box::new(deriv_provider),
-            tk_correction: 0.0,
-            tk_gradient: None,
             firth: None,
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
@@ -2793,8 +2731,6 @@ pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alp
             second: Some(array![[0.13, 0.02], [0.02, 0.09]]),
         },
         deriv_provider: Box::new(deriv_provider),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: logdet_h_proj - hop.logdet(),
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
@@ -2891,8 +2827,6 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
             second: Some(array![[0.13]]),
         },
         deriv_provider: Box::new(deriv_provider),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: h_proj.ln() - hop.logdet(),
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
@@ -3038,8 +2972,6 @@ pub(crate) fn subspace_trace_large_k_routes_to_projected_operator() {
             second: Some(Array2::zeros((k, k))),
         },
         deriv_provider: Box::new(deriv_provider),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: h_proj.ln() - hop.logdet(),
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
@@ -3273,8 +3205,6 @@ pub(crate) fn gaussian_outer_hessian_operator_matches_dense_assembly() {
             second: Some(array![[0.11, 0.03], [0.03, 0.17]]),
         },
         deriv_provider: Box::new(GaussianDerivatives),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -3345,8 +3275,6 @@ pub(crate) fn efs_step_is_zero_at_scalar_optimum() {
             second: None,
         },
         deriv_provider: Box::new(GaussianDerivatives),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -3520,8 +3448,6 @@ pub(crate) fn test_reml_laml_evaluate_gaussian_basic() {
             second: None,
         },
         deriv_provider: Box::new(GaussianDerivatives),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -3587,8 +3513,6 @@ pub(crate) fn fixed_dispersion_firth_cost_subtracts_jeffreys_term() {
             second: None,
         },
         deriv_provider: Box::new(GaussianDerivatives),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: Some(ExactJeffreysTerm::new(firth_op)),
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -3701,8 +3625,6 @@ pub(crate) fn family_outer_hessian_operator_short_circuits_dense_pairwise_assemb
             second: Some(array![[0.0]]),
         },
         deriv_provider: Box::new(FamilyOperatorDerivatives { op: provider_op }),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -3781,8 +3703,6 @@ pub(crate) fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'
         deriv_provider: Box::new(FixedCorrectionDerivatives {
             correction: array![[4.0, 0.0], [0.0, 0.0]],
         }),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: projected_logdet - full_logdet,
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
@@ -4008,8 +3928,6 @@ pub(crate) fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution<'_> {
         ],
         penalty_logdet,
         deriv_provider: Box::new(GaussianDerivatives),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -4065,8 +3983,6 @@ pub(crate) fn build_large_dense_spectral_gaussian_solution(rho: f64) -> InnerSol
             second: None,
         },
         deriv_provider: Box::new(GaussianDerivatives),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -5852,8 +5768,6 @@ pub(crate) fn build_leak_proof_solution(
             second: None,
         },
         deriv_provider: Box::new(deriv_provider),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction,
         penalty_subspace_trace,
@@ -6112,8 +6026,6 @@ pub(crate) fn build_gaussian_solution_at_beta(
         ],
         penalty_logdet,
         deriv_provider: Box::new(GaussianDerivatives),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction: 0.0,
         penalty_subspace_trace: None,
@@ -6687,8 +6599,6 @@ pub(crate) fn build_scaled_curvature_solution(rho: &[f64], s: f64) -> InnerSolut
             second: Some(array![[0.0]]),
         },
         deriv_provider: Box::new(GaussianDerivatives),
-        tk_correction: 0.0,
-        tk_gradient: None,
         firth: None,
         hessian_logdet_correction,
         penalty_subspace_trace: None,

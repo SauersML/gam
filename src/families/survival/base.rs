@@ -2320,8 +2320,9 @@ impl WorkingModelSurvival {
         use crate::estimate::reml::assembly::{
             InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
         };
+        use crate::reml_contracts::EvalMode;
         use crate::estimate::reml::reml_outer_engine::{
-            DenseSpectralOperator, DispersionHandling, EvalMode, PenaltyLogdetDerivs,
+            DenseSpectralOperator, DispersionHandling, PenaltyLogdetDerivs,
             compute_block_penalty_logdet_derivs,
         };
 
@@ -2405,8 +2406,6 @@ impl WorkingModelSurvival {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             deriv_provider: Some(Box::new(provider)),
-            tk_correction: 0.0,
-            tk_gradient: None,
             firth: None,
             nullspace_dim: None,
             barrier_config: None,
