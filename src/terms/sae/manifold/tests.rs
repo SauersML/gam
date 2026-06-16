@@ -9215,4 +9215,171 @@ mod inner_contract_probe_tests {
              cold_ev={cold_ev}"
         );
     }
+
+    /// #1154 item 3 — the JOINTLY co-trained encoder recovers the planted
+    /// manifold structure on held-out rows AT LEAST AS WELL as the sequential
+    /// REML-then-distill path. Both paths search the SAME ρ grid over the SAME
+    /// planted periodic dictionary; they differ only in HOW ρ is ranked and how
+    /// the inner solve is seeded:
+    ///
+    ///   * sequential — rank ρ by the BARE REML criterion, fit cold (chart-center
+    ///     inner solve), then distill the amortized encoder once from the frozen
+    ///     fitted dictionary (the #357 / #1026-ladder post-hoc path);
+    ///   * co-trained (Design A) — rank ρ by the co-trained criterion (REML + the
+    ///     amortized-encoder consistency fold) and warm-start the inner latent
+    ///     coords from the amortized encoder built on the running dictionary at
+    ///     each ρ, refining to the same stationary point.
+    ///
+    /// On held-out planted rows the co-trained encoder's recovered circle phase
+    /// must match the planted truth at least as well as the sequential encoder's
+    /// — co-adapting the dictionary + λ toward a faithfully-invertible encode can
+    /// only help recovery, never regress it.
+    #[test]
+    fn cotrained_encoder_recovers_planted_manifold_at_least_as_well_as_sequential() {
+        let n = 32usize;
+        let p = 4usize;
+        let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+        let (phi, jet) = periodic_basis(&coords);
+        let m = phi.ncols();
+        // A smooth low-order periodic decoder: a genuine 1D periodic manifold the
+        // amortized IFT predictor can faithfully model to first order.
+        let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+            let scale = 1.0 / (1.0 + b as f64);
+            scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+        });
+        let target = phi.dot(&decoder);
+
+        // A small shared ρ grid (log-sparsity, log-smoothness) over the same
+        // dictionary; both paths search it identically so only the ranking +
+        // seeding differ. ARD held at 1.0 (single d=1 atom).
+        let rho_grid: Vec<SaeManifoldRho> = [(-0.5_f64, 0.4_f64), (0.0, 0.8), (0.3, 1.2)]
+            .iter()
+            .map(|&(ls, lsm)| SaeManifoldRho::new(ls, lsm.ln(), vec![array![1.0_f64.ln()]]))
+            .collect();
+
+        let build_term = || {
+            let atom = SaeManifoldAtom::new(
+                "periodic_truth",
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi.clone(),
+                jet.clone(),
+                decoder.clone(),
+                Array2::<f64>::eye(p),
+            )
+            .unwrap()
+            .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+            let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+                Array2::<f64>::zeros((n, 1)),
+                vec![coords.clone()],
+                vec![LatentManifold::Circle { period: 1.0 }],
+                AssignmentMode::softmax(1.0),
+            )
+            .unwrap();
+            SaeManifoldTerm::new(vec![atom], assignment).unwrap()
+        };
+
+        // Held-out planted rows interleaved between the training coords (not an
+        // in-sample replay): the encoder must recover their circle phase.
+        let n_holdout = 16usize;
+        let heldout_truth =
+            Array2::from_shape_fn((n_holdout, 1), |(row, _)| (row as f64 + 0.25) / n_holdout as f64);
+        let (heldout_phi, _hjet) = periodic_basis(&heldout_truth);
+
+        // Encode the held-out rows with the amortized encoder distilled from a
+        // fitted `term`, returning the max circle-phase gap to the planted truth.
+        let heldout_recovery_gap = |term: &SaeManifoldTerm| -> (f64, usize) {
+            let atom0 = &term.atoms[0];
+            let heldout = heldout_phi.dot(&atom0.decoder_coefficients);
+            let amps = Array1::<f64>::ones(n_holdout);
+            let mut norm_bound = 0.0_f64;
+            for row in 0..n_holdout {
+                norm_bound = norm_bound.max(heldout.row(row).dot(&heldout.row(row)).sqrt());
+            }
+            let atlas = crate::terms::sae::encode::EncodeAtlas::build(
+                &term.atoms,
+                &[1.0],
+                norm_bound,
+                crate::terms::sae::encode::AtlasConfig::default(),
+            )
+            .expect("held-out encode atlas builds");
+            let encoded = atlas
+                .amortized_encode_batch(atom0, 0, heldout.view(), amps.view())
+                .expect("held-out amortized encode runs");
+            let mut max_gap = 0.0_f64;
+            let mut certified = 0usize;
+            for row in 0..n_holdout {
+                if !encoded.certified[row] {
+                    continue;
+                }
+                certified += 1;
+                let gap = circle_phase_gap(encoded.coords[[row, 0]], heldout_truth[[row, 0]]);
+                max_gap = max_gap.max(gap);
+            }
+            (max_gap, certified)
+        };
+
+        // --- Sequential: rank ρ by BARE REML, fit cold, distill post-hoc. ---
+        let mut seq_term = build_term();
+        let mut best_seq_rho = rho_grid[0].clone();
+        let mut best_seq_cost = f64::INFINITY;
+        for rho in &rho_grid {
+            let (reml, _loss) = seq_term
+                .reml_criterion(target.view(), rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+                .expect("bare REML criterion evaluates on the planted manifold");
+            if reml < best_seq_cost {
+                best_seq_cost = reml;
+                best_seq_rho = rho.clone();
+            }
+        }
+        // Cold re-fit at the bare-REML-selected ρ, then distill the encoder.
+        let mut seq_rho = best_seq_rho.clone();
+        seq_term
+            .run_joint_fit_arrow_schur(target.view(), &mut seq_rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .expect("sequential cold inner solve converges");
+        let (seq_gap, seq_certified) = heldout_recovery_gap(&seq_term);
+
+        // --- Co-trained: rank ρ by the co-trained criterion with the amortized
+        // warm-start applied each step (Design A). ---
+        let mut cot_term = build_term();
+        let mut best_cot_rho = rho_grid[0].clone();
+        let mut best_cot_cost = f64::INFINITY;
+        for rho in &rho_grid {
+            // Warm-start the inner latents from the amortized encoder built on the
+            // running dictionary, then rank by the co-trained criterion.
+            cot_term
+                .warm_start_latents_from_amortized_encoder(target.view(), rho)
+                .ok();
+            let (cotrained, _loss, _consistency) = cot_term
+                .reml_criterion_cotrained(target.view(), rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+                .expect("co-trained criterion evaluates on the planted manifold");
+            if cotrained < best_cot_cost {
+                best_cot_cost = cotrained;
+                best_cot_rho = rho.clone();
+            }
+        }
+        let mut cot_rho = best_cot_rho.clone();
+        cot_term
+            .warm_start_latents_from_amortized_encoder(target.view(), &cot_rho)
+            .ok();
+        cot_term
+            .run_joint_fit_arrow_schur(target.view(), &mut cot_rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .expect("co-trained warm-started inner solve converges");
+        let (cot_gap, cot_certified) = heldout_recovery_gap(&cot_term);
+
+        assert!(
+            seq_certified > 0 && cot_certified > 0,
+            "both paths must certify held-out rows on the planted manifold: \
+             sequential={seq_certified}, co-trained={cot_certified}"
+        );
+        // The co-trained encoder recovers the planted held-out structure at least
+        // as well as the sequential REML-then-distill encoder (within a tight
+        // tolerance — co-adaptation can only help, never regress recovery).
+        assert!(
+            cot_gap <= seq_gap + 1.0e-3,
+            "co-trained encoder must recover the planted held-out manifold at \
+             least as well as the sequential REML-then-distill path: \
+             co-trained max phase gap={cot_gap}, sequential={seq_gap}"
+        );
+    }
 }

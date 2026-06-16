@@ -1294,15 +1294,12 @@ impl EncodeAtlas {
             return Ok(uncertified());
         };
         let chart = &atom_atlas.charts[chart_idx];
-        // A chart whose Gauss–Newton block was singular carries no distilled
-        // Jacobian — the amortized predictor cannot fire, so flag for the exact
-        // fallback (never a silent wrong encode).
-        if chart.amortized_jacobian.is_none() {
-            return Ok(uncertified());
-        }
-        // Closed-form predicted start t̂ = t_c + (1/z)·A₁·(x − z·m₁). With z ≈ 0
-        // the amplitude-divided map is undefined (a near-inactive atom); the
-        // certificate at the chart center handles those rows, so flag here.
+        // Closed-form predicted start t̂ = t_c + (1/z)·A₁·(x − z·m₁). `None` when
+        // the chart's Gauss–Newton block was singular (no distilled Jacobian, so
+        // the amortized predictor cannot fire) or the amplitude is not strictly
+        // positive and finite (a near-inactive atom, where the amplitude-divided
+        // map is undefined) — either way flag for the exact fallback, never a
+        // silent wrong encode.
         let Some(mut t_hat) = amortized_warm_start(chart, x, amplitude) else {
             return Ok(uncertified());
         };
