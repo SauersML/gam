@@ -589,34 +589,6 @@ pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64, alpha: f64) ->
     out
 }
 
-/// IBP-MAP concrete relaxation activations together with the diagonal Jacobian
-/// `∂z_k/∂l_k`, for the torch autograd `Function` to consume so that torch's
-/// IBP-Gumbel forward applies the same stick-breaking prior `π_k` and
-/// temperature scaling as the Rust closed-form path
-/// (`SaeAssignment::try_assignments_row` → [`ibp_map_row`]).
-///
-/// With `z_k = σ(l_k/τ) · π_k` the per-atom derivative is
-/// `∂z_k/∂l_k = σ(l_k/τ) (1 − σ(l_k/τ)) · π_k / τ`. The map is diagonal in `k`
-/// (each activation depends only on its own logit), so the Jacobian is returned
-/// as the per-atom diagonal vector.
-#[must_use]
-pub fn ibp_map_row_value_grad(
-    logits: ArrayView1<'_, f64>,
-    temperature: f64,
-    alpha: f64,
-) -> (Array1<f64>, Array1<f64>) {
-    let prior = ibp_stick_breaking_prior(logits.len(), alpha);
-    let inv_tau = 1.0 / temperature;
-    let mut value = Array1::<f64>::zeros(logits.len());
-    let mut grad = Array1::<f64>::zeros(logits.len());
-    for i in 0..logits.len() {
-        let sig = crate::linalg::utils::stable_logistic(logits[i] * inv_tau);
-        value[i] = sig * prior[i];
-        grad[i] = sig * (1.0 - sig) * inv_tau * prior[i];
-    }
-    (value, grad)
-}
-
 pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {

@@ -340,15 +340,6 @@ impl EntropicSoftmax {
         }
     }
 
-    pub fn with_mask_threshold(mut self, thr: f64) -> Self {
-        assert!(
-            thr.is_finite(),
-            "EntropicSoftmax mask threshold must be finite, got {thr}"
-        );
-        self.mask_threshold = Some(thr);
-        self
-    }
-
     /// Numerically stable softmax with temperature.
     fn softmax(&self, logits: ArrayView1<'_, f64>) -> Array1<f64> {
         let k = logits.len();
@@ -617,12 +608,6 @@ impl L1Relaxed {
     pub fn new() -> Self {
         Self {
             active_threshold: 0.0,
-        }
-    }
-
-    pub fn with_threshold(thr: f64) -> Self {
-        Self {
-            active_threshold: thr,
         }
     }
 }
