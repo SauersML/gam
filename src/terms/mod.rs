@@ -16,7 +16,6 @@ pub mod latent_coord;
 pub mod linear_dictionary;
 pub mod penalty_op;
 pub mod sae;
-pub mod sae_corpus;
 pub mod sae_encode_atlas;
 pub mod sae_manifold;
 pub mod sheaf;

@@ -1493,7 +1493,7 @@ pub fn reml_laml_evaluate(
                 .into());
             }
             let assembly_start = std::time::Instant::now();
-            let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(family_op);
+            let mut hessian = crate::solver::rho_optimizer::HessianResult::Operator(family_op);
             if let Some(kkt_hessian) = kkt_rho_corrections
                 .as_ref()
                 .and_then(|corrections| corrections.hessian.as_ref())
@@ -1587,7 +1587,7 @@ pub fn reml_laml_evaluate(
             ) {
                 Ok(op) => {
                     let mut hessian =
-                        crate::solver::outer_strategy::HessianResult::Operator(Arc::new(op));
+                        crate::solver::rho_optimizer::HessianResult::Operator(Arc::new(op));
                     if let Some(kkt_hessian) = kkt_rho_corrections
                         .as_ref()
                         .and_then(|corrections| corrections.hessian.as_ref())
@@ -1601,7 +1601,7 @@ pub fn reml_laml_evaluate(
                 }
                 Err(err) if is_hessian_unavailable(&err) => {
                     log::warn!("{err}");
-                    crate::solver::outer_strategy::HessianResult::Unavailable
+                    crate::solver::rho_optimizer::HessianResult::Unavailable
                 }
                 Err(err) => return Err(err),
             }
@@ -1635,11 +1635,11 @@ pub fn reml_laml_evaluate(
                         let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
                         sl += ph;
                     }
-                    crate::solver::outer_strategy::HessianResult::Analytic(h)
+                    crate::solver::rho_optimizer::HessianResult::Analytic(h)
                 }
                 Err(err) if is_hessian_unavailable(&err) => {
                     log::warn!("{err}");
-                    crate::solver::outer_strategy::HessianResult::Unavailable
+                    crate::solver::rho_optimizer::HessianResult::Unavailable
                 }
                 Err(err) => return Err(err),
             }
@@ -1651,7 +1651,7 @@ pub fn reml_laml_evaluate(
         );
         result
     } else {
-        crate::solver::outer_strategy::HessianResult::Unavailable
+        crate::solver::rho_optimizer::HessianResult::Unavailable
     };
 
     // Envelope-gradient sanity tripwire — last line of defense.

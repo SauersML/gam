@@ -2,6 +2,7 @@ pub mod assignment;
 pub mod basis;
 pub mod candidate_index;
 pub mod chart_canonicalization;
+pub mod corpus;
 pub mod criterion_atoms;
 pub mod frames;
 pub mod hybrid_split;

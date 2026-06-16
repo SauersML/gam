@@ -149,12 +149,11 @@ pub fn deterministic_probe_direction(rho_hat: ArrayView1<'_, f64>) -> Vec<f64> {
 }
 
 /// SplitMix64 — a tiny, well-distributed integer mixer used only to make the
-/// probe direction a deterministic function of the fit fingerprint.
+/// probe direction a deterministic function of the fit fingerprint. Thin
+/// wrapper over the canonical implementation in
+/// [`crate::linalg::utils::splitmix64_hash`].
 fn splitmix64(state: u64) -> u64 {
-    let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    crate::linalg::utils::splitmix64_hash(state)
 }
 
 /// The probe step `h` scaled to the magnitude of the optimum: log-ρ
