@@ -37,6 +37,7 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma, Poisson, Uniform};
 use std::f64::consts::PI;
 use std::path::Path;
+use std::time::Instant;
 
 const BADHEALTH_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/badhealth.csv");
 
@@ -120,7 +121,9 @@ fn gam_tensor_te_2d_negbin_matches_mgcv() {
     };
     // k=5 (25 tensor knots): sufficient to recover the smooth sin·cos truth and
     // keeps mgcv's negbin te() R fit within the 360s CI wall-clock budget.
+    let gam_t0 = Instant::now();
     let result = fit_from_formula("y ~ te(x, z, k=5)", &ds, &cfg).expect("gam negbin te fit");
+    let gam_elapsed = gam_t0.elapsed();
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for NB te(x, z)");
     };
@@ -138,6 +141,7 @@ fn gam_tensor_te_2d_negbin_matches_mgcv() {
 
     // ---- fit the SAME model with mgcv (the mature reference) ---------------
     // family = negbin(theta = 3) fixes the overdispersion to match gam.
+    let r_t0 = Instant::now();
     let r = run_r(
         &[
             Column::new("x", &x),
@@ -152,6 +156,7 @@ fn gam_tensor_te_2d_negbin_matches_mgcv() {
         emit("edf", sum(m$edf))
         "#,
     );
+    let r_elapsed = r_t0.elapsed();
     let mgcv_eta = r.vector("eta");
     let mgcv_edf = r.scalar("edf");
     assert_eq!(mgcv_eta.len(), N, "mgcv linear-predictor length mismatch");
@@ -177,10 +182,13 @@ fn gam_tensor_te_2d_negbin_matches_mgcv() {
     let corr_to_mgcv = pearson(&gam_eta, mgcv_eta);
 
     eprintln!(
-        "te(x,z) NB/log theta={THETA}: n={N} mgcv_edf={mgcv_edf:.3} \
+        "te(x,z) NB/log theta={THETA}: n={N} gam_wall={:.2}s r_mgcv_wall={:.2}s \
+         mgcv_edf={mgcv_edf:.3} \
          rmse_to_truth(gam)={gam_err:.4} rmse_to_truth(mgcv)={mgcv_err:.4} \
          chi2/n(NB-var)={chi2_over_n:.3} \
-         [context] rel_l2(gam,mgcv)={rel_to_mgcv:.4} pearson(gam,mgcv)={corr_to_mgcv:.5}"
+         [context] rel_l2(gam,mgcv)={rel_to_mgcv:.4} pearson(gam,mgcv)={corr_to_mgcv:.5}",
+        gam_elapsed.as_secs_f64(),
+        r_elapsed.as_secs_f64(),
     );
 
     // PRIMARY: gam recovers the true log-mean interaction surface. The wiggly part
@@ -284,8 +292,10 @@ fn gam_tensor_te_2d_negbin_matches_mgcv_on_real_data() {
         negative_binomial_theta: Some(theta),
         ..FitConfig::default()
     };
+    let gam_t0 = Instant::now();
     let result = fit_from_formula("numvisit ~ te(age, badh, k=5)", &train_ds, &cfg)
         .expect("gam negbin te fit on badhealth train");
+    let gam_elapsed = gam_t0.elapsed();
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for NB te(age, badh)");
     };
@@ -304,6 +314,7 @@ fn gam_tensor_te_2d_negbin_matches_mgcv_on_real_data() {
 
     // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST ------
     let tr_len = train_age.len();
+    let r_t0 = Instant::now();
     let r = run_r(
         &[
             Column::new("age", &train_age),
@@ -333,6 +344,7 @@ fn gam_tensor_te_2d_negbin_matches_mgcv_on_real_data() {
         emit("edf", sum(m$edf))
         "#,
     );
+    let r_elapsed = r_t0.elapsed();
     let mgcv_test_mu = r.vector("test_mu");
     let mgcv_edf = r.scalar("edf");
     assert_eq!(
@@ -353,11 +365,14 @@ fn gam_tensor_te_2d_negbin_matches_mgcv_on_real_data() {
 
     eprintln!(
         "badhealth te(age,badh) NB held-out: n_train={} n_test={} theta(MoM)={theta:.4} \
+         gam_wall={:.2}s r_mgcv_wall={:.2}s \
          gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          dev_gam={gam_dev:.4} dev_mgcv={mgcv_dev:.4} dev_null={null_dev:.4} \
          [context] rel_l2(gam,mgcv)={rel_to_mgcv:.4} pearson(gam,mgcv)={corr_to_mgcv:.5}",
         train_rows.len(),
         test_rows.len(),
+        gam_elapsed.as_secs_f64(),
+        r_elapsed.as_secs_f64(),
     );
 
     // PRIMARY accuracy: the te(age,badh) structure must explain held-out visits

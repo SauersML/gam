@@ -301,16 +301,20 @@ impl SymmetricMatrix {
 /// argument types: `xt_diag_x_signed` takes a `SignedWeightsView<'_>` (free
 /// construction), and `xt_diag_x_psd` takes a `PsdWeightsView<'_>` (one-time
 /// `try_new` scan at the call site).
+pub fn xt_diag_x_signed(
+    design: &DesignMatrix,
+    diag: SignedWeightsView<'_>,
+) -> Result<SymmetricMatrix, String> {
+    xt_diag_x_symmetric(design, &diag.view().to_owned())
+}
+
 /// In-place symmetrization of a square dense matrix: replace each
 /// off-diagonal pair `(m[i,j], m[j,i])` with their average so the result is
 /// exactly symmetric (the diagonal is untouched).
 ///
 /// Canonical single source of truth for the "average the transpose" cleanup
 /// that every Hessian/penalty assembly applies to kill the small asymmetry
-/// left by floating-point accumulation order. ndarray callers across the
-/// crate (custom-family Hessian/pinv assembly, the pyffi penalty intake)
-/// route here; the faer-typed equivalent lives next to the faer bridge in
-/// `terms::construction::symmetrize_faer_matrix_in_place`.
+/// left by floating-point accumulation order.
 pub fn symmetrize_in_place(matrix: &mut Array2<f64>) {
     let p = matrix.nrows();
     for i in 0..p {
@@ -320,13 +324,6 @@ pub fn symmetrize_in_place(matrix: &mut Array2<f64>) {
             matrix[[j, i]] = v;
         }
     }
-}
-
-pub fn xt_diag_x_signed(
-    design: &DesignMatrix,
-    diag: SignedWeightsView<'_>,
-) -> Result<SymmetricMatrix, String> {
-    xt_diag_x_symmetric(design, &diag.view().to_owned())
 }
 
 /// PSD-precondition Gram: `XᵀWX` with `w ≥ 0`.

@@ -628,6 +628,61 @@ pub fn lawley_lr_mean_shift_with_rho_variation(
     Ok(total)
 }
 
+/// The Lawley LR Bartlett factor `c = E[W]/d = 1 + Δε(ρ̂)/d` for an **estimated**
+/// smoothing parameter — the ρ̂-variation analogue of [`lawley_lr_bartlett_factor`].
+///
+/// [`lawley_lr_bartlett_factor`] folds the penalty in at a *fixed* `λ`, giving the
+/// conditional factor `1 + Δε(ρ₀)/d`. When `λ` is estimated, ρ̂ = log λ̂ carries
+/// its own sampling variation and `E[W]` picks up the extra delta-method term
+/// (#939 deliverable 2, the genuinely-new penalized piece);
+/// [`lawley_lr_mean_shift_with_rho_variation`] assembles the resulting **total**
+/// mean shift `Δε(ρ̂)` from the conditional shift's ρ-curvature and the inverse
+/// REML outer Hessian `Cov(ρ̂)` (the #740 quantity). This function is the
+/// single-call factor entry point a live consumer wires symmetrically with the
+/// fixed-λ factor: it performs the same `c = E[W]/d` reduction and the same
+/// degeneracy guards, so the call site never re-derives `1 + Δε/d` (and never
+/// re-implements the positivity / finiteness checks) by hand.
+///
+/// Returns the factor against a `d = ref_df` reference; `penalty` is the total
+/// fitted `S_λ`, `components`/`rho_cov` are the per-smoothing-parameter penalty
+/// blocks and their sampling covariance, exactly as
+/// [`lawley_lr_mean_shift_with_rho_variation`] takes them. Errors on a degenerate
+/// reference df, a non-finite/degenerate mean, or any error from the underlying
+/// shift assembly.
+pub fn lawley_lr_bartlett_factor_with_rho_variation(
+    x: ArrayView2<'_, f64>,
+    kappas: &[RowKappas],
+    penalty: ArrayView2<'_, f64>,
+    tested: std::ops::Range<usize>,
+    components: &[RhoPenaltyComponent],
+    rho_cov: ArrayView2<'_, f64>,
+    ref_df: f64,
+) -> Result<f64, String> {
+    if !(ref_df.is_finite() && ref_df > 0.0) {
+        return Err(format!(
+            "lawley_lr_bartlett_factor_with_rho_variation: reference df must be finite and positive; got {ref_df}"
+        ));
+    }
+    let shift = lawley_lr_mean_shift_with_rho_variation(
+        x, kappas, penalty, tested, components, rho_cov,
+    )?;
+    let mean_w = ref_df + shift;
+    let factor = crate::inference::higher_order::bartlett_factor_from_mean(mean_w, ref_df)
+        .ok_or_else(|| {
+            format!(
+                "lawley_lr_bartlett_factor_with_rho_variation: degenerate mean {mean_w} \
+                 (Δε(ρ̂) = {shift}, d = {ref_df})"
+            )
+        })?;
+    if !(factor.is_finite() && factor > 0.0) {
+        return Err(format!(
+            "lawley_lr_bartlett_factor_with_rho_variation: degenerate factor {factor} \
+             (Δε(ρ̂) = {shift}, d = {ref_df})"
+        ));
+    }
+    Ok(factor)
+}
+
 /// Expected jets for a known-scale GLM family/link pair at linear predictor
 /// `eta`, when the pair has an exact closed-form jet constructor. Returns
 /// `None` for pairs whose cumulant jets are not derived yet — the consumer
