@@ -54,6 +54,7 @@ pub mod kernel_src {
     /// spans, mirroring the CPU `build_denested_partition_cells_with_tails`
     /// empty-split-points branch followed by the
     /// `SurvivalMarginalSlopeFamily::denested_partition_cells` post-scale.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub const DENESTED_PARTITION_CELLS_KERNEL_SRC: &str = r#"
 // f64 throughout (no --use_fast_math).
 
@@ -123,6 +124,7 @@ __global__ void denested_partition_cells_kernel(
     ///   `[0, 1, 0, 0] · scale`, `[0, 0, 0, 0]`, ... per the
     ///   `denested_cell_*_partials` formulas with `score_span=zero`,
     ///   `link_span=zero`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub const DENESTED_CELL_PRIMARY_FIXED_PARTIALS_KERNEL_SRC: &str = r#"
 // f64 throughout (no --use_fast_math).
 
@@ -167,7 +169,9 @@ __global__ void denested_cell_primary_fixed_partials_kernel(
 /// Per-row inputs for [`try_device_partition_cells`].
 #[derive(Clone, Copy, Debug)]
 pub struct PartitionCellsRowInputs<'a> {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub a: f64,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub b: f64,
     pub beta_h: Option<&'a [f64]>,
     pub beta_w: Option<&'a [f64]>,
@@ -210,8 +214,6 @@ pub fn try_device_partition_cells(
 pub struct CellPrimaryFixedPartialsCellInputs {
     pub score_span: LocalSpanCubic,
     pub link_span: LocalSpanCubic,
-    pub z_basis: f64,
-    pub u_basis: f64,
 }
 
 /// Per-row inputs for [`try_device_cell_primary_fixed_partials`]: shared
@@ -220,8 +222,6 @@ pub struct CellPrimaryFixedPartialsCellInputs {
 /// primary.g`).
 #[derive(Clone, Copy, Debug)]
 pub struct CellPrimaryFixedPartialsRowInputs<'a> {
-    pub a: f64,
-    pub b: f64,
     pub cells: &'a [CellPrimaryFixedPartialsCellInputs],
     pub layout: FlexPrimaryLayout,
 }
@@ -322,6 +322,7 @@ fn span_is_zero(span: LocalSpanCubic) -> bool {
 /// Construct the trivial no-runtime partition cell for `(a, b, scale)`.
 /// Used as the byte-equivalent host shape for the kernel's per-row output
 /// (and as the reference the kernel reproduces).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn trivial_partition_cell(a: f64, b: f64, scale: f64) -> DenestedPartitionCell {
     DenestedPartitionCell {
         cell: DenestedCubicCell {
@@ -614,8 +615,6 @@ mod tests {
     #[test]
     fn empty_cells_per_row_returns_empty_partials() {
         let inputs = [CellPrimaryFixedPartialsRowInputs {
-            a: 0.0,
-            b: 1.0,
             cells: &[],
             layout: FlexPrimaryLayout { r: 4, g_slot: 3 },
         }];

@@ -77,8 +77,6 @@ impl SurvivalMarginalSlopeFamily {
                 crate::families::survival::marginal_slope::gpu_prep::CellPrimaryFixedPartialsCellInputs {
                     score_span: partition_cell.score_span,
                     link_span: partition_cell.link_span,
-                    z_basis: z_mid,
-                    u_basis: u_mid,
                 },
             );
         }
@@ -100,8 +98,6 @@ impl SurvivalMarginalSlopeFamily {
         };
         let row_fp_input =
             crate::families::survival::marginal_slope::gpu_prep::CellPrimaryFixedPartialsRowInputs {
-                a,
-                b,
                 cells: &fp_inputs,
                 layout,
             };

@@ -1,40 +1,20 @@
-//! Opt-in REML diagnostic capture for finite-difference investigation tests.
+//! Opt-in REML diagnostic capture for finite-difference investigations.
 //!
-//! Production evaluations only check the capture guard and skip every expensive
-//! stash path unless a test explicitly requests diagnostics.
+//! Production evaluations only check the capture request counter and skip every
+//! expensive stash path unless diagnostics are explicitly requested.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Number of live [`CaptureGuard`]s. The ext-gradient path only assembles the
+/// Number of live capture requests. The ext-gradient path only assembles the
 /// EIG-DECOMP diagnostic stash while this is non-zero. Filling the stash is not
 /// free: it recomputes the psi drift, runs additional spectral traces, and
 /// repeats the cubic IFT-correction pass for the captured coordinate.
 static CAPTURE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
-/// True while at least one [`CaptureGuard`] is alive.
+/// True while at least one capture request is alive.
 pub(crate) fn capture_requested() -> bool {
     CAPTURE_REQUESTS.load(Ordering::Relaxed) > 0
-}
-
-/// RAII opt-in to EIG-DECOMP stash capture; see [`capture_requested`].
-///
-/// Counted instead of boolean so concurrently-running tests cannot disable
-/// each other's capture. Stash delivery itself stays per-thread.
-#[must_use = "capture stops when the guard is dropped"]
-pub(crate) struct CaptureGuard(());
-
-impl CaptureGuard {
-    pub(crate) fn request() -> Self {
-        CAPTURE_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        Self(())
-    }
-}
-
-impl Drop for CaptureGuard {
-    fn drop(&mut self) {
-        CAPTURE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,10 +45,6 @@ pub(crate) struct TermStash {
     pub(crate) coord_log_det_s: Option<f64>,
     /// Total outer objective at the captured coordinate.
     pub(crate) coord_cost: Option<f64>,
-    /// Inner KKT residual infinity norm.
-    pub(crate) inner_kkt_residual_inf: Option<f64>,
-    /// Whether the batched envelope-only outer-gradient fast path fired.
-    pub(crate) batched_envelope_override_fired: Option<bool>,
 }
 
 thread_local! {
@@ -86,8 +62,6 @@ thread_local! {
         coord_log_det_h: None,
         coord_log_det_s: None,
         coord_cost: None,
-        inner_kkt_residual_inf: None,
-        batched_envelope_override_fired: None,
     }) };
 }
 
@@ -114,23 +88,4 @@ pub(crate) fn store_kkt_probe(residual_inf: f64, batched_override_fired: bool) {
 /// Replace the calling thread's [`TermStash`].
 pub(crate) fn store_terms(stash: TermStash) {
     TERMS.with(|cell| *cell.borrow_mut() = stash);
-}
-
-#[cfg(test)]
-mod debug_stash_tests {
-    use super::*;
-
-    impl CaptureGuard {
-        pub(crate) fn take_terms(&self) -> TermStash {
-            TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
-        }
-
-        pub(crate) fn take_a_split(&self) -> Option<(f64, f64)> {
-            A_SPLIT_SINK.lock().ok().and_then(|mut slot| slot.take())
-        }
-
-        pub(crate) fn take_kkt_probe(&self) -> Option<(f64, bool)> {
-            KKT_PROBE_SINK.lock().ok().and_then(|mut slot| slot.take())
-        }
-    }
 }
