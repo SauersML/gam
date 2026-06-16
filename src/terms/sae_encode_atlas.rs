@@ -61,7 +61,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::linalg::faer_ndarray::FaerEigh;
-use crate::terms::sae_candidate_index::{
+use crate::terms::sae::candidate_index::{
     AtomFrameSketch, SaeCandidateIndex, auto_candidate_budget,
 };
 use crate::terms::sae_manifold::{
