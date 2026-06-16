@@ -50,15 +50,18 @@ pub struct ImplicitDesignPsiDerivative {
     pub(crate) streaming: Option<StreamingRadialState>,
 
     /// Identifiability/constraint transform Z: (n_knots x p_constrained).
-    /// Converts raw knot-space vectors to the identifiability-constrained
-    /// basis. For Duchon this is the kernel-constraint nullspace Z_kernel;
-    /// for Matern with identifiability constraints, it is the corresponding Z.
-    /// `None` means the identity (no constraint).
+    /// Gauge ownership is upstream; the implicit operator stores this frozen
+    /// section only so forward/transpose matvecs can apply the already-gauged
+    /// chart without materializing derivative matrices. For Duchon this is the
+    /// kernel-constraint nullspace Z_kernel; for Matern with identifiability
+    /// constraints, it is the corresponding Z. `None` means the identity.
     pub(crate) ident_transform: Option<Array2<f64>>,
 
     /// Optional full identifiability transform applied after Z_kernel + padding.
-    /// For Duchon terms that have an additional global identifiability transform,
-    /// this is applied after the kernel constraint and polynomial padding.
+    /// This is likewise replay/application metadata for the matrix-free
+    /// operator, not a second coefficient-coordinate owner. For Duchon terms
+    /// that have an additional global identifiability transform, this is applied
+    /// after the kernel constraint and polynomial padding.
     /// Shape: (p_constrained + n_poly, p_final).
     pub(crate) full_ident_transform: Option<Array2<f64>>,
 

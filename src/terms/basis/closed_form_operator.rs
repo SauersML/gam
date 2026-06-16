@@ -21,8 +21,10 @@ use crate::terms::basis::{
 /// Matrix-free closed-form anisotropic Duchon penalty operator.
 ///
 /// Stores the parameters of the closed-form pair-block (`q, m, s, κ, η`, knot
-/// centers, and optional constraint factors). The hot `matvec` path stays
-/// matrix-free; `cached_dense` is populated only by `dense_form()`.
+/// centers, and optional constraint factors). Gauge ownership is upstream: this
+/// operator only applies the already selected section in matrix-free matvecs.
+/// The hot `matvec` path stays matrix-free; `cached_dense` is populated only by
+/// `dense_form()`.
 pub struct ClosedFormPenaltyOperator {
     /// Derivative order (0 = mass, 1 = tension, 2 = stiffness).
     q: usize,

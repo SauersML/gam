@@ -171,10 +171,13 @@ pub fn build_thin_plate_basiswithworkspace(
             tps.num_polynomial_basis,
             &spec.identifiability,
         )?;
-        let design = if let Some(z) = identifiability_transform.as_ref() {
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(fast_ab(
-                &tps.basis, z,
-            )))
+        let design = if let Some(gauge) = identifiability_transform
+            .as_ref()
+            .map(|z| crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]))
+        {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                gauge.restrict_design(&tps.basis),
+            ))
         } else {
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(tps.basis.clone()))
         };
@@ -206,12 +209,14 @@ pub fn build_thin_plate_basiswithworkspace(
             radial_reparam_meta,
         )
     };
-    if let Some(z) = identifiability_transform.as_ref() {
+    if let Some(gauge) = identifiability_transform
+        .as_ref()
+        .map(|z| crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]))
+    {
         candidates = candidates
             .into_iter()
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                let zt_s = z.t().dot(&candidate.matrix);
-                let matrix = zt_s.dot(z);
+                let matrix = gauge.restrict_penalty(&candidate.matrix);
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: candidate.nullspace_dim_hint,
                     matrix,
@@ -820,7 +825,7 @@ pub(crate) struct MaternCrossPenaltyContext {
     pub(crate) aniso_log_scales: Vec<f64>,
     pub(crate) length_scale: f64,
     pub(crate) nu: MaternNu,
-    pub(crate) z_transform: Option<Array2<f64>>,
+    pub(crate) coefficient_gauge: Option<crate::solver::gauge::Gauge>,
     pub(crate) penaltyinfo: Vec<PenaltyInfo>,
     pub(crate) d0: Array2<f64>,
     pub(crate) d1: Array2<f64>,
@@ -841,8 +846,8 @@ pub(crate) struct MaternCrossPenaltyContext {
 
 impl MaternCrossPenaltyContext {
     pub(crate) fn project_operator(&self, mat: &Array2<f64>, row_dim: usize) -> Array2<f64> {
-        let kernel = if let Some(z) = self.z_transform.as_ref() {
-            fast_ab(mat, z)
+        let kernel = if let Some(gauge) = self.coefficient_gauge.as_ref() {
+            gauge.restrict_design(mat)
         } else {
             mat.clone()
         };
@@ -1148,10 +1153,14 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         }
     }
 
-    // Project through identifiability transform Z (ψ-independent).
+    // Project through the ψ-independent coefficient section. Gauge owns the
+    // coordinate restriction; these raw operator derivatives are kernel math
+    // evaluated before the same section is applied.
+    let coefficient_gauge =
+        z_opt.map(|z| crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]));
     let project = |mat: Array2<f64>| -> Array2<f64> {
-        if let Some(z) = z_opt {
-            fast_ab(&mat, z)
+        if let Some(gauge) = coefficient_gauge.as_ref() {
+            gauge.restrict_design(&mat)
         } else {
             mat
         }
@@ -1327,7 +1336,8 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         aniso_log_scales: eta.to_vec(),
         length_scale,
         nu,
-        z_transform: z_opt.cloned(),
+        coefficient_gauge: z_opt
+            .map(|z| crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()])),
         penaltyinfo,
         d0,
         d1,
@@ -1478,8 +1488,7 @@ pub(crate) fn transform_closed_form_raw_block(
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Array2<f64> {
     let kernel_block = if let Some(z) = kernel_nullspace {
-        let zt = fast_atb(z, raw);
-        fast_ab(&zt, z)
+        crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]).restrict_penalty(raw)
     } else {
         raw.clone()
     };
@@ -1495,8 +1504,7 @@ pub(crate) fn transform_closed_form_raw_block(
         padded
     };
     let total = if let Some(t) = outer_identifiability {
-        let tt = fast_atb(t, &padded);
-        fast_ab(&tt, t)
+        crate::solver::gauge::Gauge::from_block_transforms(&[t.clone()]).restrict_penalty(&padded)
     } else {
         padded
     };
@@ -1957,8 +1965,7 @@ pub fn closed_form_operator_penalty_in_total_basis(
         closed_form_anisotropic_pair_block(centers, q, p_order, s_order, kappa, aniso_log_scales);
     // 2. Apply kernel-constraint nullspace transform Z (K×kernel_cols).
     let g_kernel = if let Some(z) = kernel_nullspace {
-        let zt_g = fast_atb(z, &g_raw);
-        fast_ab(&zt_g, z)
+        crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]).restrict_penalty(&g_raw)
     } else {
         g_raw
     };
@@ -1976,8 +1983,7 @@ pub fn closed_form_operator_penalty_in_total_basis(
     };
     // 4. Apply outer spatial identifiability transform if any.
     let g_total = if let Some(t) = outer_identifiability {
-        let tt_g = fast_atb(t, &g_padded);
-        fast_ab(&tt_g, t)
+        crate::solver::gauge::Gauge::from_block_transforms(&[t.clone()]).restrict_penalty(&g_padded)
     } else {
         g_padded
     };
@@ -2540,8 +2546,7 @@ pub fn closed_form_operator_penalty_in_total_basis_pure(
     let g_raw =
         closed_form_anisotropic_pair_block_pure(centers, q, p_order, s_order, aniso_log_scales);
     let g_kernel = if let Some(z) = kernel_nullspace {
-        let zt_g = fast_atb(z, &g_raw);
-        fast_ab(&zt_g, z)
+        crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]).restrict_penalty(&g_raw)
     } else {
         g_raw
     };
@@ -2557,8 +2562,7 @@ pub fn closed_form_operator_penalty_in_total_basis_pure(
         padded
     };
     let g_total = if let Some(t) = outer_identifiability {
-        let tt_g = fast_atb(t, &g_padded);
-        fast_ab(&tt_g, t)
+        crate::solver::gauge::Gauge::from_block_transforms(&[t.clone()]).restrict_penalty(&g_padded)
     } else {
         g_padded
     };
@@ -2840,12 +2844,13 @@ pub(crate) fn build_thin_plate_penalty_matrices(
         thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
     })?;
     let omega_constrained = {
-        let zt_o = fast_atb(kernel_transform, &omega);
+        let kernel_gauge =
+            crate::solver::gauge::Gauge::from_block_transforms(&[kernel_transform.clone()]);
         // `kernel_transform` spans the side-constraint nullspace, so the
         // congruence transform preserves the thin-plate PSD construction.
         // Symmetrize to remove roundoff asymmetry without paying for a full EVD
         // on the large lazy-path penalty.
-        symmetrize_penalty(&fast_ab(&zt_o, kernel_transform))
+        symmetrize_penalty(&kernel_gauge.restrict_penalty(&omega))
     };
     let mut penalty_bending = Array2::<f64>::zeros((total_cols, total_cols));
     penalty_bending
@@ -3122,8 +3127,7 @@ pub(crate) fn project_penalty_matrix(
     transform: Option<&Array2<f64>>,
 ) -> Array2<f64> {
     let projected = if let Some(z) = transform {
-        let zt_s = z.t().dot(matrix);
-        zt_s.dot(z)
+        crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]).restrict_penalty(matrix)
     } else {
         matrix.clone()
     };
