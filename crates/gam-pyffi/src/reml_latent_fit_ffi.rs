@@ -422,8 +422,16 @@ fn latent_glm_family_from_str(
             InverseLink::Standard(StandardLink::Log),
         )),
         "tweedie" | "tweedie-log" => {
-            if !tweedie_p.is_finite() {
-                return Err(format!("tweedie_p must be finite; got {tweedie_p}"));
+            // The compound-Poisson-Gamma Tweedie variance power must lie
+            // strictly in (1, 2); outside that range the unit-deviance and
+            // working-response formulas are undefined and the downstream
+            // solver bails with a NaN deviance. Validate eagerly here (mirror
+            // of the negbin/beta nuisance-parameter checks below) so the user
+            // sees an actionable error instead of an opaque fit failure.
+            if !gam::types::is_valid_tweedie_power(tweedie_p) {
+                return Err(format!(
+                    "tweedie_p must be finite and strictly between 1 and 2; got {tweedie_p}"
+                ));
             }
             Ok(LikelihoodSpec::new(
                 ResponseFamily::Tweedie { p: tweedie_p },
@@ -6244,4 +6252,47 @@ fn poincare_mobius_add<'py>(
         poincare_mobius_add_impl(u_owned.view(), v_owned.view(), curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
+}
+
+#[cfg(test)]
+mod latent_glm_family_validation_tests {
+    use super::latent_glm_family_from_str;
+    use gam::types::ResponseFamily;
+
+    /// The Tweedie compound-Poisson-Gamma variance power must lie strictly in
+    /// (1, 2). Previously `latent_glm_family_from_str` only rejected non-finite
+    /// `tweedie_p`, so an out-of-range power (e.g. 2.5, 1.0, 0.5) constructed a
+    /// `ResponseFamily::Tweedie { p }` whose deviance/working-response formulas
+    /// are undefined — surfacing only later as an opaque NaN-deviance fit
+    /// failure. This now mirrors the eager negbin/beta nuisance-parameter
+    /// checks and rejects the bad power up front with an actionable message.
+    #[test]
+    fn tweedie_rejects_out_of_range_variance_power() {
+        for &bad in &[0.5_f64, 1.0, 2.0, 2.5, -1.0, f64::INFINITY, f64::NAN] {
+            let result = latent_glm_family_from_str("tweedie", bad, 1.0, 1.0);
+            assert!(
+                result.is_err(),
+                "tweedie_p={bad} is outside (1, 2) and must be rejected"
+            );
+            let msg = result.err().unwrap();
+            assert!(
+                msg.contains("between 1 and 2"),
+                "error message must explain the (1, 2) constraint; got {msg:?}"
+            );
+        }
+    }
+
+    /// A valid in-range Tweedie power is still accepted and yields the expected
+    /// `ResponseFamily::Tweedie { p }` (the validation does not over-reject).
+    #[test]
+    fn tweedie_accepts_canonical_variance_power() {
+        for &good in &[1.1_f64, 1.5, 1.9] {
+            let spec = latent_glm_family_from_str("tweedie", good, 1.0, 1.0)
+                .expect("in-range Tweedie power must be accepted");
+            match spec.response {
+                ResponseFamily::Tweedie { p } => assert_eq!(p, good),
+                other => panic!("expected Tweedie family, got {other:?}"),
+            }
+        }
+    }
 }

@@ -134,7 +134,7 @@ pub(crate) use crate::terms::sae::manifold::{GumbelTemperatureSchedule, Schedule
 pub(crate) use crate::terms::smooth::BlockwisePenalty;
 
 #[macro_use]
-mod common;
+mod penalty_trait;
 
 mod ard;
 mod block_sparsity;
@@ -155,7 +155,7 @@ mod total_variation;
 
 pub use ard::*;
 pub use block_sparsity::*;
-pub use common::*;
+pub use penalty_trait::*;
 pub use ibp::*;
 pub use isometry::*;
 pub use nested_prefix::*;

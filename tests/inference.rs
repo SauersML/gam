@@ -2,6 +2,8 @@
 //!
 //! Former top-level crates included as modules so they link as ONE binary.
 
+#[path = "inference/alo_tests.rs"]
+mod alo_tests;
 #[path = "inference/bms_audit_nonzero_logslope_baseline_370.rs"]
 mod bms_audit_nonzero_logslope_baseline_370;
 #[path = "inference/bms_probit_confound_orthogonalization_cure.rs"]

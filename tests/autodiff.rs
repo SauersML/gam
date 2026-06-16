@@ -36,6 +36,8 @@ mod contract_gradient_gates;
 mod cubic_cell_kernel_transformed_link_jet_fd_mismatch;
 #[path = "autodiff/derivative_consistency_fd.rs"]
 mod derivative_consistency_fd;
+#[path = "autodiff/exact_oracle_tests.rs"]
+mod exact_oracle_tests;
 #[path = "autodiff/external_gradient_trend.rs"]
 mod external_gradient_trend;
 #[path = "autodiff/gradient_decompose_test.rs"]
