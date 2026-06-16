@@ -92,14 +92,18 @@ pub struct WarmStartStore {
     /// Per-store metadata index. It is populated lazily and shared by clones so
     /// checkpoint-heavy sessions do not repeatedly open every metadata JSON.
     index: Arc<Mutex<MetadataIndex>>,
-    /// Approximate sum of bytes written under `root` by this `WarmStartStore`
-    /// instance. Used to throttle the full directory-scanning eviction in
-    /// [`Self::save_overwrite`] — see `EVICT_EVERY_N_SAVES`. The counter
-    /// resyncs to ground truth after every triggered sweep.
-    byte_total: AtomicU64,
-    /// Monotonically increasing per-instance save counter. Used together
-    /// with `byte_total` to throttle the eviction directory walk.
-    save_counter: AtomicU64,
+    /// Approximate sum of bytes written under `root`. Used to throttle the
+    /// full directory-scanning eviction in [`Self::save_overwrite`] — see
+    /// `EVICT_EVERY_N_SAVES`. The counter resyncs to ground truth after every
+    /// triggered sweep. Shared across clones (`Arc`) so the eviction throttle
+    /// survives the per-operation store reuse in
+    /// `solver::persistent_warm_start::persistent_store` — otherwise every
+    /// fit reset the counter and ran a full eviction walk on its first save
+    /// (gam#1114).
+    byte_total: Arc<AtomicU64>,
+    /// Monotonically increasing save counter, shared across clones. Used
+    /// together with `byte_total` to throttle the eviction directory walk.
+    save_counter: Arc<AtomicU64>,
     /// Per-store test-only monotonic time offset (nanoseconds) added to every
     /// `*_now` reading. Always zero in production. Tests mutate it through
     /// [`Self::test_advance_time`] to simulate elapsed time without
@@ -117,10 +121,12 @@ impl Clone for WarmStartStore {
             root: self.root.clone(),
             opts: self.opts.clone(),
             index: Arc::clone(&self.index),
-            // Independent throttle counters per clone are fine: each clone
-            // will sweep once on its first save and resync from disk.
-            byte_total: AtomicU64::new(self.byte_total.load(Ordering::Relaxed)),
-            save_counter: AtomicU64::new(0),
+            // Throttle counters are shared across clones so the eviction
+            // directory walk stays throttled to every Nth save across the
+            // whole process, even though `persistent_store` hands out a fresh
+            // clone per save/lookup.
+            byte_total: Arc::clone(&self.byte_total),
+            save_counter: Arc::clone(&self.save_counter),
             test_time_offset_ns: AtomicU64::new(self.test_time_offset_ns.load(Ordering::Relaxed)),
         }
     }
@@ -134,8 +140,8 @@ impl WarmStartStore {
             root,
             opts,
             index: Arc::new(Mutex::new(MetadataIndex::default())),
-            byte_total: AtomicU64::new(0),
-            save_counter: AtomicU64::new(0),
+            byte_total: Arc::new(AtomicU64::new(0)),
+            save_counter: Arc::new(AtomicU64::new(0)),
             test_time_offset_ns: AtomicU64::new(0),
         })
     }

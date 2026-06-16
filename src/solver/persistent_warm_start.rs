@@ -1,5 +1,6 @@
 use crate::warm_start::{EntryKind, Fingerprinter, StoreOptions, WarmStartStore};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -256,15 +257,29 @@ fn load_json_record<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
 /// processes within a single boot, and `WarmStartStore::open` falls back
 /// to `None` if the path is unwritable.
 fn persistent_store() -> Option<WarmStartStore> {
-    let root = std::env::temp_dir().join("gam").join("warm").join("v1");
-    WarmStartStore::open(
-        root,
-        StoreOptions {
-            size_budget_bytes: MAX_TOTAL_BYTES,
-            ttl: Duration::from_secs(CACHE_TTL_SECS),
-        },
-    )
-    .ok()
+    // Memoize the store process-wide. The root (`temp_dir()/gam/warm/v1`) is
+    // constant within a process, so a single instance suffices — and reusing
+    // it is essential, not just an optimization: `WarmStartStore` carries the
+    // per-store directory-scan / metadata cache and the eviction-throttle
+    // counters that #1114 added. Reconstructing the store on every save/lookup
+    // (as this used to) handed each fit an empty cache and a zeroed throttle,
+    // so every operation re-walked the cache root and re-read every metadata
+    // JSON from disk — the syscall storm that made several quality tests look
+    // hung. Clones returned here share the cache and throttle via `Arc`.
+    static STORE: OnceLock<Option<WarmStartStore>> = OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let root = std::env::temp_dir().join("gam").join("warm").join("v1");
+            WarmStartStore::open(
+                root,
+                StoreOptions {
+                    size_budget_bytes: MAX_TOTAL_BYTES,
+                    ttl: Duration::from_secs(CACHE_TTL_SECS),
+                },
+            )
+            .ok()
+        })
+        .clone()
 }
 
 /// Open a [`crate::warm_start::Session`] for outer-iterate (rho-axis) checkpoints.

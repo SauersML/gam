@@ -1564,7 +1564,7 @@ pub fn build_smooth_basis(
             capped.min(fs_default_internal)
         };
         let (n_knots, _, effective_degree) =
-            parse_ps_internal_knots_allowing_degree_reduction(options, degree, default_internal)?;
+            parse_ps_internal_knots(options, degree, default_internal)?;
         let penalty_order = option_usize(options, "penalty_order")
             .unwrap_or(if effective_degree > 1 { 2 } else { 1 })
             .min(effective_degree);
@@ -1795,11 +1795,7 @@ pub fn build_smooth_basis(
             let degree = option_usize(options, "degree").unwrap_or(DEFAULT_BSPLINE_DEGREE);
             let default_internal = heuristic_knots_for_column(ds.values.column(c));
             let (mut n_knots, inferred, effective_degree) =
-                parse_ps_internal_knots_allowing_degree_reduction(
-                    options,
-                    degree,
-                    default_internal,
-                )?;
+                parse_ps_internal_knots(options, degree, default_internal)?;
             let periodic_axes = parse_periodic_axes(options, 1).map_err(|e| e.to_string())?;
             // Periodic margins still need enough basis functions to wrap, so
             // surface the per-axis degree reduction as a config error when the
@@ -3236,27 +3232,9 @@ fn reject_nonzero_anchor(side: &str, cond: BSplineEndpointBoundaryCondition) -> 
     Ok(())
 }
 
-pub fn parse_ps_internal_knots(
-    options: &BTreeMap<String, String>,
-    degree: usize,
-    default_internal_knots: usize,
-) -> Result<(usize, bool), String> {
-    let (num_internal_knots, inferred, effective_degree) =
-        parse_ps_internal_knots_allowing_degree_reduction(options, degree, default_internal_knots)?;
-    if effective_degree != degree {
-        return Err(TermBuilderError::invalid_option(format!(
-            "ps/bspline smooth: k={} too small for degree {}; expected k >= {}",
-            effective_degree + 1,
-            degree,
-            degree + 1
-        ))
-        .to_string());
-    }
-    Ok((num_internal_knots, inferred))
-}
-
-/// Variant of [`parse_ps_internal_knots`] that mirrors the tensor-margin
-/// per-axis degree-reduction policy: a 1-D B-spline basis with `k` functions
+/// Resolve the requested internal-knot count and effective spline degree for
+/// a 1-D penalized B-spline smooth. This mirrors the tensor-margin per-axis
+/// degree-reduction policy: a 1-D B-spline basis with `k` functions
 /// is well-defined for any `degree <= k - 1`, so an explicit
 /// `s(x, bs="ps", k=3)` with default `degree=3` is interpreted as the
 /// largest representable spline (`effective_degree = k - 1 = 2`, quadratic)
@@ -3266,8 +3244,8 @@ pub fn parse_ps_internal_knots(
 ///
 /// Mirrors the tensor margin treatment in the `te(...)` builder so a
 /// standalone smooth, a factor smooth, and a tensor margin all interpret
-/// "small k" the same way mgcv does (see `mgcv:::smooth.construct.ps`).
-pub fn parse_ps_internal_knots_allowing_degree_reduction(
+/// "small k" the same way.
+fn parse_ps_internal_knots(
     options: &BTreeMap<String, String>,
     degree: usize,
     default_internal_knots: usize,
@@ -4231,31 +4209,33 @@ mod tests {
     fn parse_ps_k_promotes_underexpressive_cubic_basis() {
         let mut opts = BTreeMap::new();
         opts.insert("k".to_string(), "4".to_string());
-        let (internal, inferred) = parse_ps_internal_knots(&opts, 3, 20).expect("k=4");
+        let (internal, inferred, eff_degree) = parse_ps_internal_knots(&opts, 3, 20).expect("k=4");
         assert_eq!(internal, 2);
+        assert_eq!(eff_degree, 3);
         assert!(!inferred);
 
         opts.insert("k".to_string(), "6".to_string());
-        let (internal, inferred) = parse_ps_internal_knots(&opts, 3, 20).expect("k=6");
+        let (internal, inferred, eff_degree) = parse_ps_internal_knots(&opts, 3, 20).expect("k=6");
         assert_eq!(internal, 2);
+        assert_eq!(eff_degree, 3);
         assert!(!inferred);
 
         opts.insert("k".to_string(), "10".to_string());
-        let (internal, inferred) = parse_ps_internal_knots(&opts, 3, 20).expect("k=10");
+        let (internal, inferred, eff_degree) = parse_ps_internal_knots(&opts, 3, 20).expect("k=10");
         assert_eq!(internal, 6);
+        assert_eq!(eff_degree, 3);
         assert!(!inferred);
     }
 
     #[test]
-    fn parse_ps_allowing_degree_reduction_drops_degree_for_small_k() {
+    fn parse_ps_internal_knots_drops_degree_for_small_k() {
         // mgcv's `s(x, bs="ps", k=3)` with the default cubic basis silently
-        // reduces to a quadratic (`degree=2`) marginal; the per-axis allowance
-        // helper must mirror that. `k=3, degree=3` should yield a quadratic
-        // basis with zero internal knots (`num_basis = k = 3`).
+        // reduces to a quadratic (`degree=2`) marginal. `k=3, degree=3`
+        // should yield a quadratic basis with zero internal knots
+        // (`num_basis = k = 3`).
         let mut opts = BTreeMap::new();
         opts.insert("k".to_string(), "3".to_string());
-        let (internal, inferred, eff_degree) =
-            parse_ps_internal_knots_allowing_degree_reduction(&opts, 3, 20).expect("k=3");
+        let (internal, inferred, eff_degree) = parse_ps_internal_knots(&opts, 3, 20).expect("k=3");
         assert_eq!(eff_degree, 2);
         assert_eq!(internal, 0);
         assert!(!inferred);
@@ -4263,8 +4243,7 @@ mod tests {
         // `k=2` reduces to a linear (`degree=1`) marginal — the smallest
         // non-trivial spline basis.
         opts.insert("k".to_string(), "2".to_string());
-        let (internal, inferred, eff_degree) =
-            parse_ps_internal_knots_allowing_degree_reduction(&opts, 3, 20).expect("k=2");
+        let (internal, inferred, eff_degree) = parse_ps_internal_knots(&opts, 3, 20).expect("k=2");
         assert_eq!(eff_degree, 1);
         assert_eq!(internal, 0);
         assert!(!inferred);
@@ -4273,16 +4252,14 @@ mod tests {
         // by the degree-reducing variant: no B-spline basis has fewer than
         // two functions.
         opts.insert("k".to_string(), "1".to_string());
-        let err = parse_ps_internal_knots_allowing_degree_reduction(&opts, 3, 20)
+        let err = parse_ps_internal_knots(&opts, 3, 20)
             .expect_err("k=1 is below the irreducible spline floor");
         assert!(err.contains("requires k >= 2"), "unexpected error: {err}");
 
         // When the user already passed `k >= degree+1`, the helper must
-        // preserve the existing knot geometry exactly — same internal-knot
-        // counts as the strict `parse_ps_internal_knots`.
+        // preserve the existing knot geometry exactly.
         opts.insert("k".to_string(), "4".to_string());
-        let (internal, inferred, eff_degree) =
-            parse_ps_internal_knots_allowing_degree_reduction(&opts, 3, 20).expect("k=4");
+        let (internal, inferred, eff_degree) = parse_ps_internal_knots(&opts, 3, 20).expect("k=4");
         assert_eq!(eff_degree, 3);
         assert_eq!(internal, 2);
         assert!(!inferred);
