@@ -2585,6 +2585,94 @@ pub(crate) fn parallel_schur_matvec_deterministic_and_matches_sequential() {
     }
 }
 
+/// #1017 dense-Schur assembly parallelism: `reduce_row_schur_contributions`
+/// (consumed by `build_dense_schur_direct` / `build_dense_schur_sqrt_ba`) folds
+/// the per-row `-Σ_i leftᵀ·right` contributions into the `k×k` reduced Schur
+/// matrix. On a CPU-only host (the `None`-tiles branch, the live path here) this
+/// O(n·d·k²) reduction was the last serial step of the dense reduced-solve build;
+/// at the SAE Direct-solve shape (`n` in the thousands, wide border `k`) it is
+/// the dense assembly's whole cost. It now fans across rayon over fixed CHUNK=64
+/// row chunks (each chunk reduces in row order into a private partial; partials
+/// folded into `schur` in chunk order).
+///
+/// Assert (a) DETERMINISM — two independent parallel builds are bit-for-bit
+/// identical regardless of thread scheduling (the #1017 verification gate: the
+/// criterion ranking across topology candidates cannot move); and (b)
+/// EQUIVALENCE with the in-place serial per-row reduction up to ULP-scale
+/// chunk-boundary reassociation of an otherwise-identical sum (the same bar the
+/// streaming `accumulate_chunk` and per-row matvec parity tests hold).
+#[test]
+pub(crate) fn parallel_dense_schur_reduction_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // > MIN → trips the parallel CPU fold
+    let d = 5usize;
+    let k = 48usize;
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+
+    for kind in [SchurReductionKind::Direct, SchurReductionKind::SqrtBa] {
+        // Seed `H_ββ + ridge·I` exactly as the dense builders do.
+        let seed = || {
+            let mut s = sys.effective_penalty_op().to_dense();
+            for j in 0..k {
+                s[[j, j]] += ridge_beta;
+            }
+            s
+        };
+
+        // (a) Determinism: two independent parallel reductions are bit-identical.
+        let mut s_a = seed();
+        reduce_row_schur_contributions(&sys, &htt_factors, &backend, kind, &mut s_a)
+            .expect("parallel reduction a");
+        let mut s_b = seed();
+        reduce_row_schur_contributions(&sys, &htt_factors, &backend, kind, &mut s_b)
+            .expect("parallel reduction b");
+        for a in 0..k {
+            for b in 0..k {
+                assert_eq!(
+                    s_a[[a, b]].to_bits(),
+                    s_b[[a, b]].to_bits(),
+                    "{kind:?}: parallel dense-Schur reduction must be deterministic \
+                     run-to-run at ({a},{b})"
+                );
+            }
+        }
+
+        // (b) Equivalence with the in-place serial per-row reduction.
+        let mut s_ser = seed();
+        for (i, row) in sys.rows.iter().enumerate() {
+            subtract_row_schur_contribution(
+                &sys,
+                i,
+                row,
+                htt_factors.factor(i),
+                &backend,
+                kind,
+                &mut s_ser,
+            )
+            .expect("serial per-row reduction");
+        }
+        let scale = s_ser
+            .iter()
+            .fold(0.0_f64, |m, &v| m.max(v.abs()))
+            .max(1.0);
+        let mut max_rel = 0.0_f64;
+        for a in 0..k {
+            for b in 0..k {
+                max_rel = max_rel.max((s_a[[a, b]] - s_ser[[a, b]]).abs() / scale);
+            }
+        }
+        assert!(
+            max_rel < 1e-15,
+            "{kind:?}: parallel vs serial dense-Schur reduction must agree to \
+             reassociation error (rel {max_rel:e})"
+        );
+    }
+}
+
 /// Sequential reference for the cross-row matvec: the row-order fold of the
 /// same per-row contributions `arrow_cross_row_matvec` accumulates, followed by
 /// the post-loop `H_ββ + ridge` prologue and cross-row penalty Hessian. Used to

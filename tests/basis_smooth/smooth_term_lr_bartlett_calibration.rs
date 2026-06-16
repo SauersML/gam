@@ -31,11 +31,17 @@ use gam::{
     FitConfig, FitRequest, encode_recordswith_inferred_schema, init_parallelism, materialize,
 };
 
+use gam::inference::lawley::{
+    RhoPenaltyComponent, RowExpectedJets, lawley_lr_mean_shift,
+    lawley_lr_mean_shift_with_rho_variation,
+};
+use ndarray::Array2;
+
 use csv::StringRecord;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand_distr::{Distribution, Poisson};
+use rand_distr::{Distribution, Normal, Poisson};
 
 /// One null-DGP replicate: `y ~ Poisson(exp(0.3 + 0.8 x))`, with an independent
 /// covariate `z ~ U(0,1)` that has NO effect on the mean. The smooth `s(z)` is
