@@ -8883,11 +8883,14 @@ mod inner_contract_probe_tests {
     fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
         let n = 24usize;
         let p = 4usize;
-        let m = 5usize; // periodic harmonic basis width (1, then 2 harmonics)
         // A true circle coordinate per row, and a smooth periodic decoder, so the
         // target lies on a genuine 1D periodic manifold (known structure).
         let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
         let (phi, jet) = periodic_basis(&coords);
+        // Basis width comes from the shared `periodic_basis` helper (1, sin, cos),
+        // so derive `m` from it rather than hardcoding — the decoder row count and
+        // the (m, m) smooth penalty must both track the actual harmonic width.
+        let m = phi.ncols();
         // A smooth decoder B (M × p): low-order harmonics dominate so the encode
         // map is well-conditioned and the IFT predictor is a faithful first-order
         // model of it (the regime the amortized encoder is built for).
@@ -8902,7 +8905,7 @@ mod inner_contract_probe_tests {
             phi.clone(),
             jet,
             decoder.clone(),
-            Array2::<f64>::eye(p),
+            Array2::<f64>::eye(m),
         )
         .unwrap()
         .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
@@ -9211,7 +9214,7 @@ mod inner_contract_probe_tests {
             phi.clone(),
             jet,
             decoder.clone(),
-            Array2::<f64>::eye(p),
+            Array2::<f64>::eye(m),
         )
         .unwrap()
         .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
@@ -9318,7 +9321,7 @@ mod inner_contract_probe_tests {
                 phi.clone(),
                 jet.clone(),
                 decoder.clone(),
-                Array2::<f64>::eye(p),
+                Array2::<f64>::eye(m),
             )
             .unwrap()
             .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
