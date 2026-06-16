@@ -44,7 +44,7 @@ pub(crate) trait LocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
     /// message so the originating family stays visible after unification.
     const LABEL: &'static str;
 
-    fn ws_policy(&self) -> &crate::resource::ResourcePolicy;
+    fn ws_policy(&self) -> &crate::solver::resource::ResourcePolicy;
 
     fn ws_exact_joint_dense_block_designs<'a>(
         &'a self,
@@ -58,7 +58,7 @@ pub(crate) trait LocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
         psi_index: usize,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
+        policy: &crate::solver::resource::ResourcePolicy,
     ) -> Result<Option<Self::Direction>, String>;
 
     fn ws_psi_second_order_terms_from_parts(
@@ -87,7 +87,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
     type Direction = LocationScaleJointPsiDirection;
     const LABEL: &'static str = "GaussianLocationScaleFamily";
 
-    fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
+    fn ws_policy(&self) -> &crate::solver::resource::ResourcePolicy {
         &self.policy
     }
 
@@ -105,7 +105,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
         psi_index: usize,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
+        policy: &crate::solver::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         self.exact_newton_joint_psi_direction(
             block_states,
@@ -162,7 +162,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
     type Direction = LocationScaleJointPsiDirection;
     const LABEL: &'static str = "GaussianLocationScaleWiggleFamily";
 
-    fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
+    fn ws_policy(&self) -> &crate::solver::resource::ResourcePolicy {
         &self.policy
     }
 
@@ -180,7 +180,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         psi_index: usize,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
+        policy: &crate::solver::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         self.exact_newton_joint_psi_direction(
             block_states,

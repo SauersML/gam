@@ -15,7 +15,7 @@ pub struct BinomialLocationScaleFamily {
     /// per-call materialization decision) made during exact-Newton joint psi
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
-    pub policy: crate::resource::ResourcePolicy,
+    pub policy: crate::solver::resource::ResourcePolicy,
 }
 
 /// Both Binomial location-scale families plug into the unified
@@ -30,7 +30,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
             type Direction = LocationScaleJointPsiDirection;
             const LABEL: &'static str = $label;
 
-            fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
+            fn ws_policy(&self) -> &crate::solver::resource::ResourcePolicy {
                 &self.policy
             }
 
@@ -48,7 +48,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
                 psi_index: usize,
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
-                policy: &crate::resource::ResourcePolicy,
+                policy: &crate::solver::resource::ResourcePolicy,
             ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
                 self.exact_newton_joint_psi_direction(
                     block_states,

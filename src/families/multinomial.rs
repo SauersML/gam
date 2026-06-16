@@ -70,7 +70,7 @@ use crate::families::vector_response::{MultinomialLogitLikelihood, validate_mult
 use crate::inference::data::EncodedDataset;
 use crate::inference::formula_dsl::parse_formula;
 use crate::inference::model::ColumnKindTag;
-use crate::resource::ProblemHints;
+use crate::solver::resource::ProblemHints;
 use crate::solver::estimate::EstimationError;
 use crate::solver::workflow::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,

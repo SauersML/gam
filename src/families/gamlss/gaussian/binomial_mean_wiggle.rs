@@ -15,7 +15,7 @@ pub struct BinomialMeanWiggleFamily {
     /// exact-Newton joint psi evaluation. Defaults to
     /// `ResourcePolicy::default_library()` when the family is built without
     /// an explicit policy.
-    pub policy: crate::resource::ResourcePolicy,
+    pub policy: crate::solver::resource::ResourcePolicy,
 }
 
 pub(crate) struct BinomialMeanWiggleGeometry {

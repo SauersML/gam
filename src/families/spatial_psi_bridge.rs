@@ -247,7 +247,7 @@ mod tests {
     use super::*;
     use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::families::custom_family::resolve_custom_family_x_psi_psi_map;
-    use crate::resource::ResourcePolicy;
+    use crate::solver::resource::ResourcePolicy;
     use crate::terms::smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
         freeze_term_collection_from_design,
