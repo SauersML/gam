@@ -2153,13 +2153,11 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(), String> {
         let expected_blocks =
             2usize + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
-        if block_states.len() != expected_blocks {
-            return Err(format!(
-                "bernoulli marginal-slope block count mismatch: got {}, expected {}",
-                block_states.len(),
-                expected_blocks
-            ));
-        }
+        crate::families::block_layout::block_count::validate_block_count::<String>(
+            "BernoulliMarginalSlopeFamily",
+            expected_blocks,
+            block_states.len(),
+        )?;
 
         let n_rows = self.y.len();
         let marginal = &block_states[0];

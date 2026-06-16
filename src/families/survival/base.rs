@@ -55,6 +55,16 @@ impl From<SurvivalError> for String {
     }
 }
 
+impl From<crate::families::block_layout::block_count::BlockCountMismatch> for SurvivalError {
+    fn from(
+        err: crate::families::block_layout::block_count::BlockCountMismatch,
+    ) -> SurvivalError {
+        SurvivalError::CauseSpecificDimensionMismatch {
+            reason: err.message(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SurvivalSpec {
     #[default]
@@ -374,16 +384,11 @@ fn evaluate_cause_specific_block(
 
 impl CustomFamily for CauseSpecificRoystonParmarFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != self.blocks.len() {
-            return Err(SurvivalError::CauseSpecificDimensionMismatch {
-                reason: format!(
-                    "cause-specific survival expected {} endpoint blocks, got {}",
-                    self.blocks.len(),
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        crate::families::block_layout::block_count::validate_block_count::<SurvivalError>(
+            "cause-specific survival",
+            self.blocks.len(),
+            block_states.len(),
+        )?;
         let mut log_likelihood = 0.0;
         let mut blockworking_sets = Vec::with_capacity(self.blocks.len());
         for (block, state) in self.blocks.iter().zip(block_states.iter()) {
@@ -401,16 +406,11 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        if block_states.len() != self.blocks.len() {
-            return Err(SurvivalError::CauseSpecificDimensionMismatch {
-                reason: format!(
-                    "cause-specific survival expected {} endpoint blocks, got {}",
-                    self.blocks.len(),
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        crate::families::block_layout::block_count::validate_block_count::<SurvivalError>(
+            "cause-specific survival",
+            self.blocks.len(),
+            block_states.len(),
+        )?;
         let mut log_likelihood = 0.0;
         for (block, state) in self.blocks.iter().zip(block_states.iter()) {
             let (ll, _, _) = evaluate_cause_specific_block(block, &state.beta)?;

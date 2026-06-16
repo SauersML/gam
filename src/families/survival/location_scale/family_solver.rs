@@ -2312,16 +2312,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != self.expected_blocks() {
-            return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: format!(
-                    "SurvivalLocationScaleFamily joint Hessian second directional derivative expects {} states, got {}",
-                    self.expected_blocks(),
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        crate::families::block_layout::block_count::validate_block_count::<
+            SurvivalLocationScaleError,
+        >(
+            "SurvivalLocationScaleFamily joint Hessian second directional derivative",
+            self.expected_blocks(),
+            block_states.len(),
+        )?;
         let p_total = *self
             .joint_block_offsets()
             .last()

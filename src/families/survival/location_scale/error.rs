@@ -37,6 +37,18 @@ crate::impl_reason_error_boilerplate! {
     }
 }
 
+impl From<crate::families::block_layout::block_count::BlockCountMismatch>
+    for SurvivalLocationScaleError
+{
+    fn from(
+        err: crate::families::block_layout::block_count::BlockCountMismatch,
+    ) -> SurvivalLocationScaleError {
+        SurvivalLocationScaleError::DimensionMismatch {
+            reason: err.message(),
+        }
+    }
+}
+
 impl From<String> for SurvivalLocationScaleError {
     /// Inbound conversion from the many `Result<_, String>` helpers this
     /// module still calls into. The text is preserved verbatim; we only

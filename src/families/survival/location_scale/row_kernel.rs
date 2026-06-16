@@ -1040,16 +1040,13 @@ impl SurvivalLocationScaleFamily {
         ),
         String,
     > {
-        if block_states.len() != self.expected_blocks() {
-            return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: format!(
-                    "SurvivalLocationScaleFamily expects {} blocks, got {}",
-                    self.expected_blocks(),
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        crate::families::block_layout::block_count::validate_block_count::<
+            SurvivalLocationScaleError,
+        >(
+            "SurvivalLocationScaleFamily",
+            self.expected_blocks(),
+            block_states.len(),
+        )?;
         let n = self.n;
         let eta_time = &block_states[Self::BLOCK_TIME].eta;
         let eta_t_raw = &block_states[Self::BLOCK_THRESHOLD].eta;

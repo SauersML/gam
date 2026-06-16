@@ -61,12 +61,9 @@ impl CustomFamily for TransformationNormalFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        if block_states.len() != 1 {
-            return Err(TransformationNormalError::InvalidInput {
-                reason: "expected 1 block".to_string(),
-            }
-            .into());
-        }
+        crate::families::block_layout::block_count::validate_block_count::<
+            TransformationNormalError,
+        >("TransformationNormalFamily", 1, block_states.len())?;
         // The line search uses NEG_INFINITY as the barrier-violation signal,
         // so we can't propagate the row_quantities Err here. Translate any
         // h' validation failure back into the NEG_INFINITY rejection contract.
