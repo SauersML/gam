@@ -2858,7 +2858,9 @@ pub(crate) mod whitened_spectrum {
             //      otherwise a purely serial bounds-checked scalar loop.
             let mut a = Array2::<f64>::zeros((p, p));
             {
-                use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+                use rayon::iter::{
+                    IndexedParallelIterator, IntoParallelIterator, ParallelIterator,
+                };
                 let d = d_inv_sqrt.as_slice().expect("contiguous d_inv_sqrt");
                 a.outer_iter_mut()
                     .into_par_iter()

@@ -1757,8 +1757,8 @@ impl StreamingArrowSchur {
         // when already inside a rayon worker (the topology race fans candidates
         // with `run_topology_race_parallel`), stay sequential to avoid
         // nested-rayon oversubscription — the same guard `schur_matvec` uses.
-        let parallel = self.n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN
-            && rayon::current_thread_index().is_none();
+        let parallel =
+            self.n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         if parallel {
             use rayon::prelude::*;
             const CHUNK: usize = 64;

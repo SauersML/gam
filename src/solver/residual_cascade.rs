@@ -692,7 +692,11 @@ impl Core {
                 let b = a + level.centers.len();
                 let mut buf: Vec<f64> = self.gram_diag[a..b].to_vec();
                 buf.sort_unstable_by(|x, y| x.partial_cmp(y).unwrap());
-                let med = if buf.is_empty() { 0.0 } else { buf[buf.len() / 2] };
+                let med = if buf.is_empty() {
+                    0.0
+                } else {
+                    buf[buf.len() / 2]
+                };
                 let coarse = b <= ncoarse;
                 s.push_str(&format!(
                     " L{li}[{}c off{a} w={:.2e} λw={:.2e} med={:.2e} {}]",

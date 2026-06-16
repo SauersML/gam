@@ -1333,7 +1333,11 @@ pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
     let rho = SaeManifoldRho::new(
         (-0.3_f64).exp().ln(),
         0.7_f64.ln(),
-        vec![array![0.9_f64.ln()], array![1.0_f64.ln()], array![1.1_f64.ln()]],
+        vec![
+            array![0.9_f64.ln()],
+            array![1.0_f64.ln()],
+            array![1.1_f64.ln()],
+        ],
     );
 
     // Confirm the precondition: the dictionary is co-collapsed (EV below the
@@ -1556,9 +1560,9 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         let theta = v
             .fitted_turning
             .unwrap_or_else(|| panic!("verdict '{}' must carry a fitted turning Θ", v.atom_name));
-        let dev = v.held_out_delta_ev.unwrap_or_else(|| {
-            panic!("verdict '{}' must carry a held-out ΔEV", v.atom_name)
-        });
+        let dev = v
+            .held_out_delta_ev
+            .unwrap_or_else(|| panic!("verdict '{}' must carry a held-out ΔEV", v.atom_name));
         assert!(
             theta.is_finite() && theta >= 0.0,
             "fitted turning Θ must be a finite non-negative arc-curvature integral; \

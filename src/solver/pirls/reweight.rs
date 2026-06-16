@@ -1666,8 +1666,8 @@ where
                         // micro-unit response and accepted a non-converged
                         // constrained iterate. Well-scaled fits (`|obj| ≳ 1`)
                         // are unchanged.
-                        let objective_scale = final_state_ref.deviance.abs()
-                            + final_state_ref.penalty_term.abs();
+                        let objective_scale =
+                            final_state_ref.deviance.abs() + final_state_ref.penalty_term.abs();
                         let plateau_band = options.convergence_tolerance * objective_scale * 0.1;
                         let model_progress_exhausted = predicted_reduction.is_finite()
                             && predicted_reduction.abs() <= plateau_band;

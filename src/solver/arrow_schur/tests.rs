@@ -2638,10 +2638,8 @@ pub(crate) fn parallel_cross_row_matvec_deterministic_and_matches_sequential() {
 
     // (a) Determinism: two independent invocations of the live (parallel) path
     // must be bit-identical in both output blocks.
-    let (yt_a, yb_a) =
-        arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
-    let (yt_b, yb_b) =
-        arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    let (yt_a, yb_a) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    let (yt_b, yb_b) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
     for i in 0..total_dt {
         assert_eq!(
             yt_a[i].to_bits(),
@@ -2669,10 +2667,7 @@ pub(crate) fn parallel_cross_row_matvec_deterministic_and_matches_sequential() {
         );
     }
     // y_beta is a cross-row accumulation → equal within reassociation error.
-    let scale = yb_seq
-        .iter()
-        .fold(0.0_f64, |m, &v| m.max(v.abs()))
-        .max(1.0);
+    let scale = yb_seq.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
     for a in 0..k {
         let rel = (yb_a[a] - yb_seq[a]).abs() / scale;
         assert!(
@@ -2725,12 +2720,14 @@ pub(crate) fn parallel_block_diag_inverse_apply_deterministic_and_solves() {
     }
 
     // (b) Exact inverse: the round trip recovers the RHS.
-    let (yt, yb) =
-        arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, xt_a.view(), xb_a.view());
+    let (yt, yb) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, xt_a.view(), xb_a.view());
     let scale_t = r_t.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
     for i in 0..total_dt {
         let rel = (yt[i] - r_t[i]).abs() / scale_t;
-        assert!(rel < 1e-9, "preconditioner round-trip y_t at {i}: rel {rel:e}");
+        assert!(
+            rel < 1e-9,
+            "preconditioner round-trip y_t at {i}: rel {rel:e}"
+        );
     }
     let scale_b = r_beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
     for a in 0..k {
@@ -2787,10 +2784,7 @@ pub(crate) fn parallel_arrow_operator_apply_deterministic_and_matches_sequential
             "arrow_operator_apply y_t must match the sequential fold bit-for-bit at {i}"
         );
     }
-    let scale = yb_seq
-        .iter()
-        .fold(0.0_f64, |m, &v| m.max(v.abs()))
-        .max(1.0);
+    let scale = yb_seq.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
     for a in 0..k {
         let rel = (yb_a[a] - yb_seq[a]).abs() / scale;
         assert!(
@@ -3424,7 +3418,10 @@ pub(crate) fn parallel_streaming_assembly_deterministic_and_matches_sequential()
         "parallel vs serial reduced-Schur block diverges by rel {:e}",
         s_max / s_scale
     );
-    let r_scale = rhs_ser.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    let r_scale = rhs_ser
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
     let mut r_max = 0.0_f64;
     for (a, b) in rhs_par.iter().zip(rhs_ser.iter()) {
         r_max = r_max.max((a - b).abs());

@@ -1948,9 +1948,8 @@ impl SaeManifoldTerm {
             Some(t) => self.per_atom_loao_explained_variance(t, rho)?,
             None => vec![None; self.k_atoms()],
         };
-        let delta_ev_for = |atom_idx: usize| -> Option<f64> {
-            loao_ev.get(atom_idx).copied().flatten()
-        };
+        let delta_ev_for =
+            |atom_idx: usize| -> Option<f64> { loao_ev.get(atom_idx).copied().flatten() };
         // Per-row assignment masses (once), so each atom's weighted straight-line
         // fit uses the same row weighting the joint reconstruction loss does.
         let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
