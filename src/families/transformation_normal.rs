@@ -60,7 +60,7 @@ pub(crate) use crate::matrix::{
 };
 pub(crate) use crate::pirls::LinearInequalityConstraints;
 pub(crate) use crate::probability::standard_normal_quantile;
-pub(crate) use crate::resource::{MatrixMaterializationError, ResourcePolicy};
+pub(crate) use crate::solver::resource::{MatrixMaterializationError, ResourcePolicy};
 pub(crate) use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,

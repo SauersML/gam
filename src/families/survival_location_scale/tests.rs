@@ -455,7 +455,7 @@ fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: crate::solver::resource::ResourcePolicy::default_library(),
     }
 }
 
@@ -769,7 +769,7 @@ fn survival_ls_exact_row_kernel(
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: crate::solver::resource::ResourcePolicy::default_library(),
     };
     let inv_sigma = (-row.eta_logscale).exp();
     let state = family.row_predictor_state(
@@ -1052,7 +1052,7 @@ fn survival_ls_joint_oracle_family(
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: crate::solver::resource::ResourcePolicy::default_library(),
     }
 }
 
@@ -4843,7 +4843,7 @@ fn heart_failure_structural_time_small() {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: crate::solver::resource::ResourcePolicy::default_library(),
     };
 
     // Build initial states with beta=0 and a feasible positive derivative offset.
@@ -4972,7 +4972,7 @@ fn evaluate_survival_location_scale_rejects_non_finite_d_eta_dt() {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: crate::solver::resource::ResourcePolicy::default_library(),
     };
 
     let mut eta_time = Array1::<f64>::zeros(3 * n);
