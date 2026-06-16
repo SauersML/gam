@@ -6941,9 +6941,22 @@ pub struct SmoothTermLrInference {
     /// Corrected p-value `P(χ²_d > W*)`; equals the uncorrected value when no
     /// correction was applied.
     pub p_value_corrected: f64,
+    /// Whether the second-order correction is **material** (#939 deliverable 4):
+    /// the per-test diagnostic "is `n` too small for first-order inference
+    /// *here*?". `true` when a correction was applied and it moves the result by
+    /// more than [`SMOOTH_LR_MATERIAL_THRESHOLD`] — measured as the larger of the
+    /// relative Bartlett-factor distance from one `|c − 1|` and the relative
+    /// p-value change `|p* − p| / max(p, p*, ε)`. `false` when `correction` is
+    /// [`SmoothLrCorrection::None`] (no correction was applied).
+    pub material: bool,
     /// Which statistic the corrected p-value is built from.
     pub correction: SmoothLrCorrection,
 }
+
+/// The materiality threshold for [`SmoothTermLrInference::material`] (#939
+/// deliverable 4): a correction is flagged material when it changes the result
+/// by more than 10%.
+pub const SMOOTH_LR_MATERIAL_THRESHOLD: f64 = 0.10;
 
 
 /// The end-to-end per-term likelihood-ratio significance report for every
@@ -7135,6 +7148,26 @@ pub fn smooth_term_lr_inference_forspec(
             }
         }
 
+        // Materiality (#939 deliverable 4): only when a correction was actually
+        // applied, flagged when it moves the result by more than the 10%
+        // threshold — by the Bartlett factor's distance from one OR the relative
+        // p-value shift, whichever is larger (a factor near one can still flip a
+        // p-value sitting on the α boundary, and vice versa).
+        let material = match correction {
+            SmoothLrCorrection::LawleyLr => {
+                let factor_move = (bartlett_factor - 1.0).abs();
+                let p_denom = p_uncorrected.max(p_corrected).max(f64::MIN_POSITIVE);
+                let p_move = if p_uncorrected.is_finite() && p_corrected.is_finite() {
+                    (p_corrected - p_uncorrected).abs() / p_denom
+                } else {
+                    0.0
+                };
+                factor_move > SMOOTH_LR_MATERIAL_THRESHOLD
+                    || p_move > SMOOTH_LR_MATERIAL_THRESHOLD
+            }
+            SmoothLrCorrection::None => false,
+        };
+
         out.push(SmoothTermLrInference {
             name: design_term.name.clone(),
             term_idx,
@@ -7144,6 +7177,7 @@ pub fn smooth_term_lr_inference_forspec(
             statistic_corrected,
             p_value_uncorrected: p_uncorrected,
             p_value_corrected: p_corrected,
+            material,
             correction,
         });
     }

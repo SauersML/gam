@@ -2172,6 +2172,11 @@ struct SmoothTermLrRow {
     p_value_uncorrected: f64,
     /// Corrected p-value `P(χ²_d > W*)` — the magic-by-default reported value.
     p_value_corrected: f64,
+    /// `true` when the correction is **material** (#939 deliverable 4): it moves
+    /// the Bartlett factor or the p-value by more than 10% — the diagnostic that
+    /// `n` is too small for first-order inference on this term. `false` when no
+    /// correction was applied.
+    material: bool,
     /// `"lawley_lr"` when the Bartlett correction was applied, else `"none"`.
     correction_provenance: &'static str,
 }
@@ -2362,6 +2367,7 @@ fn smooth_term_lr_inference_json_impl(
             statistic_corrected: r.statistic_corrected,
             p_value_uncorrected: r.p_value_uncorrected,
             p_value_corrected: r.p_value_corrected,
+            material: r.material,
             correction_provenance: r.correction.label(),
         })
         .collect::<Vec<_>>();
