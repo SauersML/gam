@@ -97,17 +97,6 @@ pub fn reml_laml_evaluate(
         .copied()
         .map(|lambda| rho_curvature_lambda(solution, lambda))
         .collect();
-    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-        &lambdas,
-        &solution.penalty_coords,
-        &solution.beta,
-    )?;
-    let curvature_penalty_quad_atom =
-        crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-            &curvature_lambdas,
-            &solution.penalty_coords,
-            &solution.beta,
-        )?;
     let hop = &*solution.hessian_op;
     let upper_active_rho = active_upper_rho_mask(rho);
 
@@ -429,8 +418,18 @@ pub fn reml_laml_evaluate(
     // Keep the dependency-ordered BFGS/line-search loops serial, but use rayon
     // here so each accepted outer iterate evaluates its objective derivatives
     // by farming out the per-coordinate Hessian/gradient work.
-    let rho_penalty_a_k_betas: Vec<Array1<f64>> =
-        penalty_quad_atom.block_penalty_scores().to_vec();
+    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+        &lambdas,
+        &solution.penalty_coords,
+        &solution.beta,
+    )?;
+    let curvature_penalty_quad_atom =
+        crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            &curvature_lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )?;
+    let rho_penalty_a_k_betas: Vec<Array1<f64>> = penalty_quad_atom.block_penalty_scores().to_vec();
     let rho_curvature_a_k_betas: Vec<Array1<f64>> =
         curvature_penalty_quad_atom.block_penalty_scores().to_vec();
     let need_family_corrections = effective_deriv.has_corrections();
@@ -1255,7 +1254,7 @@ pub fn reml_laml_evaluate(
             }
         });
     // Principled rule: `envelope_inconsistent` is evaluated on the
-    // *post-correction* gradient (the `kkt_rho_corrections.gradient`
+    // *post-correction* gradient (the `kkt_theta_corrections.gradient`
     // additive block above has already been folded into `grad`). If the
     // predicted √ε-step cost change still exceeds 4·|cost| after that
     // fold, the gradient is invalid as a descent direction. A previous
@@ -1513,7 +1512,7 @@ pub fn reml_laml_evaluate(
     // Envelope-gradient sanity tripwire — last line of defense.
     //
     // The post-IFT-correction gradient is what `envelope_inconsistent` is
-    // computed on (the `kkt_rho_corrections.gradient` block was folded in
+    // computed on (the `kkt_theta_corrections.gradient` block was folded in
     // earlier in this function). If the predicted √ε-step cost change
     // still exceeds 4·|cost| after that fold, the gradient is invalid as
     // a descent direction. Suppress so the outer optimizer rejects the

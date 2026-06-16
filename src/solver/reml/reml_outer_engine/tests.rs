@@ -1451,6 +1451,127 @@ pub(crate) fn ift_rho_upper_bound_masks_residual_correction_direction() {
     }
 }
 
+/// #740: the FULL-θ KKT-residual correction's gradient AND Hessian (the
+/// cross-ρψ and ψψ blocks, not just ρρ) match a finite difference of the
+/// corrected objective `C(θ) = −½ r(θ)ᵀ H(θ)⁻¹ r(θ)`.
+///
+/// This pins the gap the issue reopened on: the ψ outer gradient was patched
+/// but the cross-ρψ/ψψ Hessian blocks were dropped. We build an explicit
+/// `r(θ) = r0 + Σ θ_i s_i`, `H(θ) = H0 + Σ θ_i A_i` (so `∂r/∂θ_i = s_i =
+/// score_derivs[i]`, `∂H/∂θ_i = A_i = drift_apply matrix`) over a MIXED
+/// coordinate set (2 "ρ-like" + 1 "ψ-like", all unmasked), evaluate the
+/// analytic correction at θ=0, and confirm:
+///   * `correction.gradient[i] == ∂C/∂θ_i` (central FD), and
+///   * `profile_hessian[i,j] + correction.hessian[i,j] == ∂²C/∂θ_i∂θ_j`,
+/// where `profile_hessian[i,j] = −s_iᵀ H0⁻¹ s_j` is the `r=0` envelope term the
+/// production outer Hessian already carries (so the correction is exactly what
+/// turns the envelope Hessian into the corrected one). The cross-block entries
+/// are nonzero here, so the test fails if the ψψ/cross-ρψ correction is dropped.
+#[test]
+pub(crate) fn kkt_theta_correction_cross_and_psi_hessian_matches_finite_difference() {
+    let m = 3usize; // 3 mixed θ coords (2 ρ-like + 1 ψ-like); β dimension = 3.
+
+    // Base curvature H0 (SPD) and per-coordinate frozen drifts A_i (symmetric).
+    let h0 = array![[4.0_f64, 0.5, 0.2], [0.5, 3.0, -0.3], [0.2, -0.3, 2.5]];
+    let drift_mats = [
+        array![[1.0_f64, 0.1, 0.0], [0.1, 0.5, 0.0], [0.0, 0.0, 0.3]],
+        array![[0.2_f64, 0.0, 0.4], [0.0, 0.7, 0.1], [0.4, 0.1, 0.6]],
+        array![[0.0_f64, 0.3, 0.0], [0.3, 0.0, 0.2], [0.0, 0.2, 0.9]],
+    ];
+    // Score derivatives s_i = ∂r/∂θ_i and base residual r0 (nonzero ⇒ q≠0).
+    let score_derivs = [
+        array![0.6_f64, -0.2, 0.1],
+        array![-0.3_f64, 0.5, 0.4],
+        array![0.2_f64, 0.1, -0.5],
+    ];
+    let r0 = array![0.30_f64, -0.20, 0.15];
+
+    // C(θ) = −½ r(θ)ᵀ H(θ)⁻¹ r(θ) for an explicit θ perturbation.
+    let c_of = |theta: &[f64]| -> f64 {
+        let mut h = h0.clone();
+        let mut r = r0.clone();
+        for i in 0..m {
+            h = &h + &(&drift_mats[i] * theta[i]);
+            r = &r + &(&score_derivs[i] * theta[i]);
+        }
+        let hinv = crate::faer_ndarray::FaerCholesky::cholesky(&h)
+            .and_then(|c| c.inverse())
+            .expect("H(θ) SPD");
+        -0.5 * r.dot(&hinv.dot(&r))
+    };
+
+    // Analytic correction at θ = 0.
+    let hop = DenseSpectralOperator::from_symmetric(&h0).unwrap();
+    let drift_apply = |idx: usize, v: &Array1<f64>| -> Array1<f64> { drift_mats[idx].dot(v) };
+    let corrections = compute_kkt_residual_theta_corrections(
+        &hop,
+        None,
+        &score_derivs,
+        drift_apply,
+        &r0,
+        true,
+        &[false, false, false],
+    )
+    .expect("theta correction must succeed");
+
+    // Gradient: central FD of C(θ) must equal correction.gradient (the
+    // envelope gradient of the profile term is zero, so the correction IS
+    // ∂C/∂θ).
+    let step = 1e-6;
+    for i in 0..m {
+        let mut tp = vec![0.0; m];
+        let mut tm = vec![0.0; m];
+        tp[i] = step;
+        tm[i] = -step;
+        let fd = (c_of(&tp) - c_of(&tm)) / (2.0 * step);
+        assert!(
+            (fd - corrections.gradient[i]).abs() < 1e-6,
+            "θ-correction gradient[{i}] {} vs FD {}",
+            corrections.gradient[i],
+            fd
+        );
+    }
+
+    // Profile (envelope, r=0) Hessian: profile[i,j] = −s_iᵀ H0⁻¹ s_j — the term
+    // the production outer Hessian already carries. profile + correction must
+    // equal the FD Hessian of the FULL corrected objective, on EVERY block.
+    // H0⁻¹s_j via the operator solve (no separate inverse dependency).
+    let hinv0_s: Vec<Array1<f64>> = (0..m).map(|j| hop.solve(&score_derivs[j])).collect();
+    let correction_h = corrections.hessian.expect("hessian requested");
+    for i in 0..m {
+        for j in 0..m {
+            let mut tpp = vec![0.0; m];
+            let mut tpm = vec![0.0; m];
+            let mut tmp = vec![0.0; m];
+            let mut tmm = vec![0.0; m];
+            tpp[i] += step;
+            tpp[j] += step;
+            tpm[i] += step;
+            tpm[j] -= step;
+            tmp[i] -= step;
+            tmp[j] += step;
+            tmm[i] -= step;
+            tmm[j] -= step;
+            let fd_hess = (c_of(&tpp) - c_of(&tpm) - c_of(&tmp) + c_of(&tmm)) / (4.0 * step * step);
+            let profile = -score_derivs[i].dot(&hinv0_s[j]);
+            let analytic = profile + correction_h[[i, j]];
+            assert!(
+                (fd_hess - analytic).abs() < 1e-4,
+                "θ-correction Hessian[{i},{j}]: profile {profile} + correction {} = {analytic} \
+                 vs FD {fd_hess} (cross/ψψ blocks must be present)",
+                correction_h[[i, j]]
+            );
+        }
+    }
+
+    // Sanity: at least one off-diagonal (cross) correction entry is nonzero,
+    // so the test genuinely exercises the cross-block algebra.
+    assert!(
+        correction_h[[0, 2]].abs() + correction_h[[1, 2]].abs() > 1e-9,
+        "cross-block correction must be nonzero in this fixture"
+    );
+}
+
 /// BUG-2 regression: cert exit with r_proj = 0 must not pass an inflated
 /// `|g|∞ = 1e20` gradient through the envelope tripwire. Contract under
 /// test: either suppress (gradient=None) or produce a numerically honest
@@ -1523,7 +1644,7 @@ pub(crate) fn cert_zero_residual_must_not_emit_unbounded_gradient_through_gate()
 /// this test bit-for-bit, which is the point.
 #[test]
 pub(crate) fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
-    use crate::solver::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock;
+    use crate::model_types::ActiveLinearConstraintBlock;
 
     let h = array![[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 1.0]];
     let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -1616,7 +1737,7 @@ pub(crate) fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
 /// projected trace `½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z)` is O(1).
 #[test]
 pub(crate) fn envelope_gradient_uses_constraint_tangent_projection() {
-    use crate::solver::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock;
+    use crate::model_types::ActiveLinearConstraintBlock;
 
     // Three-parameter Gaussian REML. Choose data so the optimum places
     // β₂ at its lower bound β₂ ≥ 0.5 — the active constraint
@@ -6405,17 +6526,16 @@ pub(crate) fn ift_correction_recovers_fd_hessian_at_perturbed_beta() {
         };
 
     let sol_ift = to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat, true));
-    let hessian_ift =
-        match reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueGradientHessian, None)
-            .unwrap()
-            .hessian
-        {
-            crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => hessian,
-            crate::solver::rho_optimizer::HessianResult::Operator(_)
-            | crate::solver::rho_optimizer::HessianResult::Unavailable => {
-                panic!("expected dense analytic Hessian")
-            }
-        };
+    let hessian_ift = match reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueGradientHessian, None)
+        .unwrap()
+        .hessian
+    {
+        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => hessian,
+        crate::solver::rho_optimizer::HessianResult::Operator(_)
+        | crate::solver::rho_optimizer::HessianResult::Unavailable => {
+            panic!("expected dense analytic Hessian")
+        }
+    };
 
     let mut envelope_was_wrong = false;
     for i in 0..rho.len() {

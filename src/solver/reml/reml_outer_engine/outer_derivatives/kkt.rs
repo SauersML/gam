@@ -10,7 +10,8 @@ use crate::estimate::reml::outer_eval;
 
 /// Shared precomputed REML derivative intermediates threaded from the
 /// gradient pass into the dense Hessian assembler so the per-coordinate
-/// `penalty_a_k_beta` / `hop.solve` / drift-correction work is not repeated.
+/// beta-Gaussian prior atom emission / `hop.solve` / drift-correction work is
+/// not repeated.
 pub(crate) struct RemlDerivativeWorkspace<'a> {
     pub curvature_lambdas: &'a [f64],
     pub rho_penalty_a_k_betas: &'a [Array1<f64>],
@@ -163,9 +164,7 @@ where
             }
             let delta = if i == j { 1.0 } else { 0.0 };
             let cancel_exact_kkt_profile_term = score_derivs[i].dot(&a_solutions[j]);
-            cancel_exact_kkt_profile_term
-                - delta * r_i_dot_q[i]
-                - score_derivs[i].dot(&q_derivs[j])
+            cancel_exact_kkt_profile_term - delta * r_i_dot_q[i] - score_derivs[i].dot(&q_derivs[j])
                 + q_derivs[j].dot(&a_i_qs[i])
                 + 0.5 * delta * q_a_i_q[i]
         };
