@@ -437,13 +437,7 @@ impl DispersionGlmLocationScaleFamily {
 
 impl CustomFamily for DispersionGlmLocationScaleFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 2 {
-            return Err(format!(
-                "{} expects 2 blocks (mean, log-precision), got {}",
-                self.kind.family_tag(),
-                block_states.len()
-            ));
-        }
+        validate_block_count::<GamlssError>(self.kind.family_tag(), 2, block_states.len())?;
         let eta_mu = &block_states[Self::BLOCK_MEAN].eta;
         let eta_d = &block_states[Self::BLOCK_DISP].eta;
         let n = self.y.len();
@@ -482,13 +476,7 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        if block_states.len() != 2 {
-            return Err(format!(
-                "{} expects 2 blocks for log-likelihood, got {}",
-                self.kind.family_tag(),
-                block_states.len()
-            ));
-        }
+        validate_block_count::<GamlssError>(self.kind.family_tag(), 2, block_states.len())?;
         let eta_mu = &block_states[Self::BLOCK_MEAN].eta;
         let eta_d = &block_states[Self::BLOCK_DISP].eta;
         let mut ll = 0.0;
@@ -532,11 +520,11 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 2 || specs.len() != 2 {
+        validate_block_count::<GamlssError>(self.kind.family_tag(), 2, block_states.len())?;
+        if specs.len() != 2 {
             return Err(format!(
-                "{} exact joint Hessian expects 2 blocks/specs, got states={} specs={}",
+                "{} exact joint Hessian expects 2 specs, got {}",
                 self.kind.family_tag(),
-                block_states.len(),
                 specs.len()
             ));
         }

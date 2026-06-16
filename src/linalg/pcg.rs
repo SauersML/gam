@@ -108,7 +108,7 @@ fn serial_dot(a: &ArrayView1<f64>, b: &ArrayView1<f64>) -> f64 {
 /// The shared preconditioned conjugate-gradient recurrence.
 ///
 /// Solves `A x = rhs` for SPD `A`, accessed only through `apply(v, out)` which
-/// must set `out ← A v`. The initial guess is `x = 0`. Convergence target is
+/// must set `out <- A v`. The initial guess is `x = 0`. Convergence target is
 /// `‖r‖ ≤ max(rel_tol, FLOOR) · max(‖rhs‖, 1)`.
 ///
 /// * `precond_diag` — diagonal Jacobi preconditioner `M`; pass all-ones for an
@@ -137,13 +137,14 @@ pub(crate) fn pcg_core<F>(
     solution: &mut ArrayViewMut1<f64>,
 ) -> PcgCoreResult
 where
-    F: FnMut(&ArrayView1<f64>, &mut ArrayViewMut1<f64>),
+    F: FnMut(&Array1<f64>, &mut Array1<f64>),
 {
     let p = rhs.len();
     debug_assert_eq!(precond_diag.len(), p);
     debug_assert_eq!(solution.len(), p);
 
     solution.fill(0.0);
+    let mut x = Array1::<f64>::zeros(p);
 
     let rhs_norm = serial_dot(rhs, rhs).sqrt();
     let mut diagnostics = record_diagnostics.then(|| PcgDiagnostics::new(rhs_norm));
@@ -215,11 +216,7 @@ where
     let mut last_r_norm = rhs_norm;
 
     for iter in 0..max_iters {
-        {
-            let p_view = p_dir.view();
-            let mut ap_view = ap.view_mut();
-            apply(&p_view, &mut ap_view);
-        }
+        apply(&p_dir, &mut ap);
         if ap.len() != p {
             return PcgCoreResult {
                 stop: PcgStop::Breakdown,
@@ -249,16 +246,13 @@ where
                 diagnostics,
             };
         }
-        solution.scaled_add(alpha, &p_dir);
+        x.scaled_add(alpha, &p_dir);
+        solution.assign(&x);
         r.scaled_add(-alpha, &ap);
         if refresh_period != 0 && (iter + 1) % refresh_period == 0 {
             // Periodic residual refresh: r <- rhs - A x. Reuse `ap` as scratch
             // for A x to avoid an extra allocation.
-            {
-                let x_view = solution.view();
-                let mut ap_view = ap.view_mut();
-                apply(&x_view, &mut ap_view);
-            }
+            apply(&x, &mut ap);
             if ap.len() != p {
                 return PcgCoreResult {
                     stop: PcgStop::Breakdown,
@@ -345,7 +339,7 @@ mod tests {
         let precond = array![4.0, 3.0];
         let mut x = Array1::<f64>::zeros(2);
         let result = pcg_core(
-            |v: &ArrayView1<f64>, out: &mut ArrayViewMut1<f64>| {
+            |v: &Array1<f64>, out: &mut Array1<f64>| {
                 let prod = a.dot(v);
                 out.assign(&prod);
             },
@@ -376,7 +370,7 @@ mod tests {
         let diag_clone = diag.clone();
         let mut w = Array1::<f64>::zeros(p);
         let result = pcg_core(
-            |v: &ArrayView1<f64>, out: &mut ArrayViewMut1<f64>| {
+            |v: &Array1<f64>, out: &mut Array1<f64>| {
                 for i in 0..p {
                     out[i] = diag_clone[i] * v[i];
                 }
@@ -404,7 +398,7 @@ mod tests {
         let precond = array![-4.0, 3.0];
         let mut x = Array1::<f64>::zeros(2);
         let result = pcg_core(
-            |v: &ArrayView1<f64>, out: &mut ArrayViewMut1<f64>| {
+            |v: &Array1<f64>, out: &mut Array1<f64>| {
                 out.assign(&a.dot(v));
             },
             &b.view(),

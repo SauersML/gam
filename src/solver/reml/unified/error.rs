@@ -39,21 +39,11 @@ pub enum RemlError {
     ContractViolation { reason: String },
 }
 
-impl std::fmt::Display for RemlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RemlError::DimensionMismatch { reason }
-            | RemlError::NonFiniteValue { reason }
-            | RemlError::InvalidKernelMode { reason }
-            | RemlError::ContractViolation { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for RemlError {}
-
-impl From<RemlError> for String {
-    fn from(err: RemlError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    RemlError {
+        DimensionMismatch,
+        NonFiniteValue,
+        InvalidKernelMode,
+        ContractViolation,
     }
 }

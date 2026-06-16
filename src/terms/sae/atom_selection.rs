@@ -1,15 +1,15 @@
 //! # Atom selection for multi-manifold / overlapping atoms (Piece 6).
 //!
-//! This module is the structural sibling of [`crate::terms::latent_coord`] for
+//! This module is the structural sibling of [`crate::terms::latent`] for
 //! the **multi-atom** regime.
 //! Where the single-atom case stores one per-row latent `t_n ∈ ℝ^d`, here we
 //! maintain:
 //!
 //! 1. an [`AtomLibrary`] of `K` candidate manifold-atoms (each with its own
 //!    on-atom basis, its own intrinsic dimension `d_k`, and its own
-//!    [`crate::terms::latent_coord::LatentCoordValues`] block of per-row
+//!    [`crate::terms::latent::LatentCoordValues`] block of per-row
 //!    on-atom coordinates `t_{·, k} ∈ ℝ^{N × d_k}`),
-//! 2. per-observation [`crate::terms::atom_codes::SparseAtomCode`]s recording
+//! 2. per-observation [`crate::terms::sae::atom_codes::SparseAtomCode`]s recording
 //!    a *soft assignment* `a_n ∈ ℝ^K` with active support `S_n ⊆ {1..K}`,
 //! 3. a pluggable [`AtomSelectionStrategy`] governing how the assignment is
 //!    parameterised and how its discrete active-set is differentiated through.
@@ -136,8 +136,8 @@
 use ndarray::{Array1, ArrayView1};
 
 use crate::terms::analytic_penalties::{AnalyticPenalty, SparsityPenalty};
-use crate::terms::atom_codes::{BitVec, SparseAtomCode};
-use crate::terms::latent_coord::LatentCoordValues;
+use crate::terms::sae::atom_codes::{BitVec, SparseAtomCode};
+use crate::terms::latent::LatentCoordValues;
 
 // ---------------------------------------------------------------------------
 // Atom shape (decoder reference) — kept as an opaque token here.
@@ -700,7 +700,7 @@ impl AssignmentSparsityCoupling for L1Relaxed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode};
+    use crate::terms::latent::{LatentCoordValues, LatentIdMode};
     use ndarray::array;
 
     fn lib() -> AtomLibrary {

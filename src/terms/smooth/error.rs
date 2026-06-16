@@ -28,21 +28,11 @@ pub enum SmoothError {
     InvalidIndex { reason: String },
 }
 
-impl std::fmt::Display for SmoothError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SmoothError::InvalidConfig { reason }
-            | SmoothError::DimensionMismatch { reason }
-            | SmoothError::InvalidIndex { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for SmoothError {}
-
-impl From<SmoothError> for String {
-    fn from(err: SmoothError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    SmoothError {
+        InvalidConfig,
+        DimensionMismatch,
+        InvalidIndex,
     }
 }
 

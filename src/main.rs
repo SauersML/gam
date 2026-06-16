@@ -106,7 +106,8 @@ pub(crate) use gam::smooth::{
 pub(crate) use gam::smooth_test::SmoothTestScale;
 
 pub(crate) use gam::survival::{
-    MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec, survival_event_code_from_value,
+    PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec,
+    survival_event_code_from_value,
 };
 
 pub(crate) use gam::survival::{

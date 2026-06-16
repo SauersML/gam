@@ -1998,10 +1998,10 @@ pub(crate) fn streaming_mixed_precision_matches_f64_and_keeps_logdet_f64() {
     let f64_options = ArrowSolveOptions::direct().with_streaming_chunk_size(Some(8));
     let mp_options = f64_options
         .clone()
-        .with_mixed_precision_policy(MixedPrecisionPolicy::certified());
+        .with_mixed_precision_policy(ArrowMixedPrecisionPolicy::certified());
     assert!(matches!(
         f64_options.mixed_precision,
-        MixedPrecisionPolicy::Off
+        ArrowMixedPrecisionPolicy::Off
     ));
 
     let mut s_f64 = StreamingArrowSchur::from_system(&sys, 8);
@@ -2046,29 +2046,34 @@ pub(crate) fn streaming_mixed_precision_default_upgrades_only_off() {
     let off = ArrowSolveOptions::direct();
     assert!(matches!(
         off.with_streaming_mixed_precision_default().mixed_precision,
-        MixedPrecisionPolicy::Certified { .. }
+        ArrowMixedPrecisionPolicy::Certified { .. }
     ));
-    let pinned = ArrowSolveOptions::direct().with_mixed_precision_policy(MixedPrecisionPolicy::Off);
+    let pinned =
+        ArrowSolveOptions::direct().with_mixed_precision_policy(ArrowMixedPrecisionPolicy::Off);
     // An explicit Off is still upgraded (it is the inherited default), but a
     // caller that pinned Certified keeps its own parameters.
-    let custom =
-        ArrowSolveOptions::direct().with_mixed_precision_policy(MixedPrecisionPolicy::Certified {
+    let custom = ArrowSolveOptions::direct().with_mixed_precision_policy(
+        ArrowMixedPrecisionPolicy::Certified {
             max_refinement_steps: 1,
             residual_relative_tolerance: 1e-6,
             kappa_unit_roundoff_margin: 0.25,
-        });
+        },
+    );
     match custom
         .with_streaming_mixed_precision_default()
         .mixed_precision
     {
-        MixedPrecisionPolicy::Certified {
+        ArrowMixedPrecisionPolicy::Certified {
             max_refinement_steps,
             ..
         } => assert_eq!(max_refinement_steps, 1, "explicit policy preserved"),
-        MixedPrecisionPolicy::Off => panic!("explicit Certified must not be downgraded"),
+        ArrowMixedPrecisionPolicy::Off => panic!("explicit Certified must not be downgraded"),
     }
     // `pinned` documents that Off is the upgrade trigger.
-    assert!(matches!(pinned.mixed_precision, MixedPrecisionPolicy::Off));
+    assert!(matches!(
+        pinned.mixed_precision,
+        ArrowMixedPrecisionPolicy::Off
+    ));
 }
 
 // ----------------------------------------------------------------------
@@ -3649,7 +3654,10 @@ pub(crate) fn parallel_block_jacobi_deterministic_and_matches_sequential() {
             ref_out[range.start + bi] = solved[(bi, 0)];
         }
     }
-    let scale = ref_out.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    let scale = ref_out
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
     let mut max_abs = 0.0_f64;
     for a in 0..k {
         max_abs = max_abs.max((out_a[a] - ref_out[a]).abs());

@@ -1,6 +1,6 @@
 use gam::solver::arrow_schur::ArrowSchurSystem;
 use gam::solver::latent_inner::{ArrowSystemAssembler, LatentInnerOptions, LatentInnerSolver};
-use gam::terms::latent_coord::{LatentCoordValues, LatentIdMode};
+use gam::terms::latent::{LatentCoordValues, LatentIdMode};
 use ndarray::{Array1, Array2, ArrayView1, array};
 
 struct QuadraticAssembler {

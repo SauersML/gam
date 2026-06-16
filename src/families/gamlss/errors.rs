@@ -34,32 +34,22 @@ pub enum GamlssError {
     NumericalFailure { reason: String },
 }
 
-impl std::fmt::Display for GamlssError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GamlssError::DimensionMismatch { reason }
-            | GamlssError::InvalidInput { reason }
-            | GamlssError::NonFinite { reason }
-            | GamlssError::UnsupportedConfiguration { reason }
-            | GamlssError::ConstraintViolation { reason }
-            | GamlssError::NumericalFailure { reason } => f.write_str(reason),
-        }
+crate::impl_reason_error_boilerplate! {
+    GamlssError {
+        DimensionMismatch,
+        InvalidInput,
+        NonFinite,
+        UnsupportedConfiguration,
+        ConstraintViolation,
+        NumericalFailure,
     }
 }
-
-impl std::error::Error for GamlssError {}
 
 impl From<crate::families::block_layout::block_count::BlockCountMismatch> for GamlssError {
     fn from(err: crate::families::block_layout::block_count::BlockCountMismatch) -> GamlssError {
         GamlssError::DimensionMismatch {
             reason: err.message(),
         }
-    }
-}
-
-impl From<GamlssError> for String {
-    fn from(err: GamlssError) -> Self {
-        err.to_string()
     }
 }
 

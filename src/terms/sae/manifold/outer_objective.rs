@@ -285,7 +285,7 @@ impl SaeManifoldOuterObjective {
             &cache,
             &solver,
         )?;
-        let grad = components.gradient_with_available_correction();
+        let grad = components.gradient();
         let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
         let analytic_directional: f64 = grad.iter().zip(dir.iter()).map(|(g, d)| g * d).sum();
 
@@ -1060,7 +1060,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 &solver,
             )
             .map_err(EstimationError::RemlOptimizationFailed)?;
-        let gradient = components.gradient_with_available_correction();
+        let gradient = components.gradient();
         let beta_hat = self.term.flatten_beta();
         let cost = self
             .add_fit_data_collapse_penalty(cost, &rho_state)

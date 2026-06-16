@@ -1,9 +1,12 @@
 pub mod assignment;
+pub mod atom_codes;
+pub mod atom_selection;
 pub mod basis;
 pub mod candidate_index;
 pub mod chart_canonicalization;
 pub mod corpus;
 pub mod criterion_atoms;
+pub mod encode_atlas;
 pub mod frames;
 pub mod hybrid_split;
 pub mod manifold;

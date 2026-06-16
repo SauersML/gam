@@ -1,6 +1,6 @@
 use gam::solver::outer_strategy::OuterObjective;
-use gam::terms::gated_decoder::GatedSAEDecoder;
-use gam::terms::latent_coord::{LatentCoordValues, LatentIdMode};
+use gam::terms::decoders::gated_decoder::GatedSAEDecoder;
+use gam::terms::latent::{LatentCoordValues, LatentIdMode};
 use gam::terms::sae::manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeManifoldAtom,
     SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,

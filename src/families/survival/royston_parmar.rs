@@ -1,5 +1,5 @@
 use crate::survival::{
-    MonotonicityPenalty, PenaltyBlocks, SurvivalBaselineOffsets, SurvivalEngineInputs,
+    PenaltyBlocks, SurvivalBaselineOffsets, SurvivalEngineInputs, SurvivalMonotonicityPenalty,
     SurvivalSpec, SurvivalTimeCovarInputs, WorkingModelSurvival,
 };
 use ndarray::{ArrayView1, ArrayView2};
@@ -69,7 +69,7 @@ fn survival_baseline_offsets<'a>(
 /// Build an engine survival working model from flattened arrays.
 pub fn working_model_from_flattened(
     penalties: PenaltyBlocks,
-    monotonicity: MonotonicityPenalty,
+    monotonicity: SurvivalMonotonicityPenalty,
     spec: SurvivalSpec,
     inputs: RoystonParmarInputs<'_>,
 ) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
@@ -109,7 +109,7 @@ pub fn working_model_from_flattened(
 /// (`DimensionMismatch` if the offset views are partially present).
 pub fn working_model_from_time_covariateshared(
     penalties: PenaltyBlocks,
-    monotonicity: MonotonicityPenalty,
+    monotonicity: SurvivalMonotonicityPenalty,
     spec: SurvivalSpec,
     inputs: RoystonParmarSharedTimeCovariateInputs<'_>,
 ) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {

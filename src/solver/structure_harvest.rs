@@ -2,7 +2,7 @@
 //! evidence-guarded move engine of [`crate::solver::structure_search`].
 //!
 //! #976 closed with the move engine (`search`) and its triggers
-//! ([`crate::terms::atom_codes::SparseAtomCodes::coactivation`], ARD precisions,
+//! ([`crate::terms::sae::atom_codes::SparseAtomCodes::coactivation`], ARD precisions,
 //! terminal [`CollapseEvent`]s) on main but deliberately unwired: nothing
 //! harvested move proposals from a fitted dictionary or drove `search` around
 //! the production fit. This module is that seam. It owns three things:
@@ -55,8 +55,8 @@ use crate::solver::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, TopologyScoreScale,
     select_topology_with_fit,
 };
-use crate::terms::atom_codes::SparseAtomCodes;
-use crate::terms::latent_coord::{LatentIdMode, LatentManifold};
+use crate::terms::sae::atom_codes::SparseAtomCodes;
+use crate::terms::latent::{LatentIdMode, LatentManifold};
 use crate::terms::sae::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
@@ -1267,7 +1267,7 @@ fn born_atom(
             // carrying the winning chart manifold so the joint refit retracts on
             // the right geometry.
             let coord_block =
-                crate::terms::latent_coord::LatentCoordValues::from_matrix_with_manifold(
+                crate::terms::latent::LatentCoordValues::from_matrix_with_manifold(
                     fit.coords.view(),
                     LatentIdMode::None,
                     fit.manifold.clone(),
@@ -1711,7 +1711,7 @@ pub fn rounds_to_json(rounds: &[SearchLedger]) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::solver::structure_search::{CollapseAction, CollapseEvent};
-    use crate::terms::latent_coord::LatentManifold;
+    use crate::terms::latent::LatentManifold;
     use crate::terms::sae::manifold::{
         AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
         SaeBasisEvaluator, SaeManifoldAtom,

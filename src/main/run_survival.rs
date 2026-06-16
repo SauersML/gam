@@ -1732,7 +1732,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             });
         }
         let penalties = PenaltyBlocks::new(penalty_blocks.clone());
-        let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
+        let monotonicity = SurvivalMonotonicityPenalty { tolerance: 0.0 };
         let dense_time_entry = prepared.time_design_entry.to_dense();
         let dense_time_exit = prepared.time_design_exit.to_dense();
         let dense_time_derivative = prepared.time_design_derivative_exit.to_dense();

@@ -21,11 +21,11 @@
 //! actually POPULATED (not the `None` stub) with finite point summaries and
 //! positive non-constant evidence for a curved atom.
 
-use gam::inference::row_metric::RowMetric;
-use gam::inference::structure_evidence::StructureLedger;
 use gam::identifiability::sae::{
     AtomInnerFit, AtomTopology, FittedAtom, FittedSaeManifold, dictionary_report,
 };
+use gam::inference::row_metric::RowMetric;
+use gam::inference::structure_evidence::StructureLedger;
 use ndarray::{Array1, Array2};
 
 /// Build a self-consistent `AtomInnerFit` for a 1-D inner smooth with basis

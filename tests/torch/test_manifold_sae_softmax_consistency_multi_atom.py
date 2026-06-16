@@ -61,9 +61,11 @@ def test_softmax_fit_matches_closed_form_k3() -> None:
 
     sae = gt.ManifoldSAE(cfg).double()
     torch_x = torch.as_tensor(X, dtype=torch.float64)
+    initializers = sae._closed_form_initializers(torch_x)
     torch_fit = sae.fit(torch_x, n_iter=10, random_state=42)
 
-    # Equivalent closed-form call: same Rust kernel, same (constant) schedule.
+    # Equivalent closed-form call: same Rust kernel, same amortized warm starts
+    # and same (constant) schedule.
     cf_fit = gamfit.sae_manifold_fit(
         X=X,
         K=cfg.n_atoms,
@@ -74,6 +76,7 @@ def test_softmax_fit_matches_closed_form_k3() -> None:
         schedule=cfg.sparsity.gumbel_schedule(),
         n_iter=10,
         random_state=42,
+        **initializers,
     )
 
     np.testing.assert_allclose(

@@ -2,7 +2,85 @@ use ndarray::{Array1, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-pub use crate::hull::PeeledHull;
+pub use crate::terms::geometry::hull::PeeledHull;
+
+/// Hyperprior placed on a coefficient group's precision / log-precision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CoefficientGroupPrior {
+    Flat,
+    NormalLogPrecision {
+        mean: f64,
+        sd: f64,
+    },
+    GammaPrecision {
+        shape: f64,
+        rate: f64,
+    },
+    /// Penalized-complexity prior calibrated by `P(exp(-rho/2) > upper) =
+    /// tail_prob`; see [`RhoPrior::PenalizedComplexity`].
+    PenalizedComplexity {
+        upper: f64,
+        tail_prob: f64,
+    },
+}
+
+impl CoefficientGroupPrior {
+    pub fn to_rho_prior(&self) -> RhoPrior {
+        match *self {
+            Self::Flat => RhoPrior::Flat,
+            Self::NormalLogPrecision { mean, sd } => RhoPrior::Normal { mean, sd },
+            Self::GammaPrecision { shape, rate } => RhoPrior::GammaPrecision { shape, rate },
+            Self::PenalizedComplexity { upper, tail_prob } => {
+                RhoPrior::PenalizedComplexity { upper, tail_prob }
+            }
+        }
+    }
+
+    pub fn validate(&self, context: &str) -> Result<(), String> {
+        match *self {
+            Self::Flat => Ok(()),
+            Self::NormalLogPrecision { mean, sd } => {
+                if !mean.is_finite() {
+                    return Err(format!(
+                        "{context} Normal log-precision prior requires finite mean, got {mean}"
+                    ));
+                }
+                if !sd.is_finite() || sd <= 0.0 {
+                    return Err(format!(
+                        "{context} Normal log-precision prior requires sd > 0, got {sd}"
+                    ));
+                }
+                Ok(())
+            }
+            Self::GammaPrecision { shape, rate } => {
+                if !shape.is_finite() || shape <= 0.0 {
+                    return Err(format!(
+                        "{context} Gamma precision prior requires shape > 0, got {shape}"
+                    ));
+                }
+                if !rate.is_finite() || rate < 0.0 {
+                    return Err(format!(
+                        "{context} Gamma precision prior requires rate >= 0, got {rate}"
+                    ));
+                }
+                Ok(())
+            }
+            Self::PenalizedComplexity { upper, tail_prob } => {
+                if !upper.is_finite() || upper <= 0.0 {
+                    return Err(format!(
+                        "{context} penalized-complexity prior requires upper > 0, got {upper}"
+                    ));
+                }
+                if !tail_prob.is_finite() || tail_prob <= 0.0 || tail_prob >= 1.0 {
+                    return Err(format!(
+                        "{context} penalized-complexity prior requires tail probability in (0, 1), got {tail_prob}"
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Shared default for monotone wiggle/deviation blocks. Formula DSL defaults,
 /// workflow configs, and runtime deviation blocks should all derive from this

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum MixedPrecisionPolicy {
+pub enum GpuMixedPrecisionPolicy {
     /// Always use fp64 factorization; no refinement attempted.
     Off,
     /// Attempt fp32 Cholesky factorization followed by up to
@@ -31,7 +31,7 @@ pub struct GpuDispatchPolicy {
     pub keep_design_resident_min_bytes: usize,
     pub prefer_gpu_factorization_min_p: usize,
     pub row_kernel_min_n: usize,
-    pub mixed_precision: MixedPrecisionPolicy,
+    pub mixed_precision: GpuMixedPrecisionPolicy,
 }
 
 impl Default for GpuDispatchPolicy {
@@ -58,7 +58,7 @@ impl Default for GpuDispatchPolicy {
             keep_design_resident_min_bytes: 32 * 1024 * 1024,
             prefer_gpu_factorization_min_p: 512,
             row_kernel_min_n: 50_000,
-            mixed_precision: MixedPrecisionPolicy::Refinement,
+            mixed_precision: GpuMixedPrecisionPolicy::Refinement,
         }
     }
 }
@@ -94,7 +94,7 @@ impl GpuDispatchPolicy {
     /// attempting fp32 factorization + iterative refinement will be profitable.
     ///
     /// The predicate is conservative:
-    ///   * `MixedPrecisionPolicy::Off` or `Never` → always `false`.
+    ///   * `GpuMixedPrecisionPolicy::Off` or `Never` → always `false`.
     ///   * `Refinement` with `p < REFINEMENT_MIN_P` → `false` (GEMV overhead
     ///     not amortised by fp32 POTRF savings below this threshold).
     ///   * Otherwise `true`; the caller still falls back to fp64 factorization
@@ -103,8 +103,8 @@ impl GpuDispatchPolicy {
     #[inline]
     pub const fn iterative_refinement_should_attempt(&self, p: usize) -> bool {
         match self.mixed_precision {
-            MixedPrecisionPolicy::Off | MixedPrecisionPolicy::Never => false,
-            MixedPrecisionPolicy::Refinement => p >= Self::REFINEMENT_MIN_P,
+            GpuMixedPrecisionPolicy::Off | GpuMixedPrecisionPolicy::Never => false,
+            GpuMixedPrecisionPolicy::Refinement => p >= Self::REFINEMENT_MIN_P,
         }
     }
 
@@ -438,7 +438,7 @@ mod refinement_policy_tests {
     #[test]
     fn off_policy_never_attempts_refinement() {
         let pol = GpuDispatchPolicy {
-            mixed_precision: MixedPrecisionPolicy::Off,
+            mixed_precision: GpuMixedPrecisionPolicy::Off,
             ..Default::default()
         };
         assert!(!pol.iterative_refinement_should_attempt(1024));
@@ -447,7 +447,7 @@ mod refinement_policy_tests {
     #[test]
     fn never_policy_never_attempts_refinement() {
         let pol = GpuDispatchPolicy {
-            mixed_precision: MixedPrecisionPolicy::Never,
+            mixed_precision: GpuMixedPrecisionPolicy::Never,
             ..Default::default()
         };
         assert!(!pol.iterative_refinement_should_attempt(1024));

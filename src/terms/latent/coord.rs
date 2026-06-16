@@ -150,7 +150,7 @@ pub enum LatentIdMode {
     /// isometry pin rather than replacing them; the validator requires that
     /// composition and rejects a head with no labels.
     AuxOutcome {
-        head: crate::terms::behavioral_head::BehavioralHead,
+        head: crate::terms::decoders::behavioral_head::BehavioralHead,
         /// ARD seed composed with the head, one log-precision per latent axis
         /// (length `d`). `AuxOutcome` always carries the ARD axis-selection
         /// alongside the behavioral anchor, since the label alone under-pins
@@ -1293,7 +1293,7 @@ impl LatentCoordValues {
 /// support they measure how much explanatory mass the row still carries. When
 /// the cap-limited step nonetheless drives that sum below this floor the row has
 /// effectively gone dark — the active set collapsed — and the
-/// [`crate::terms::atom_selection`] hardening hook routes the breach to a
+/// [`crate::terms::sae::atom_selection`] hardening hook routes the breach to a
 /// re-seed-from-scaffold (recorded on the [`crate::solver::continuation_path`]
 /// path, never fatal). The floor is deliberately small: it fires only on a true
 /// collapse, not on a legitimately diffuse soft assignment.

@@ -16,7 +16,7 @@ use crate::terms::sae::identifiability::ResidualGaugeReport;
 use crate::solver::logdet_bounds::{LogdetEnclosure, MarginVerdict};
 use crate::solver::rho_optimizer::CriterionCertificate;
 use crate::solver::structure_search::{CollapseAction, CollapseEvent};
-use crate::terms::sae_encode_atlas::EncodeResult;
+use crate::terms::sae::encode_atlas::EncodeResult;
 use crate::terms::sae::manifold::{CertificateInputs, GlobalOptimalityVerdict};
 
 /// Helper: insert a scalar only when finite, else record it as text "n/a" so the

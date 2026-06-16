@@ -11,7 +11,7 @@
 //! These assert OBJECTIVE quality (truth recovery / calibration), not
 //! reproduction of any reference tool's fitted output.
 
-use gam::terms::behavioral_head::{
+use gam::terms::decoders::behavioral_head::{
     AuxOutcomeFamily, BehavioralHead, LeakageAbsorber, head_feature_significance,
 };
 use ndarray::{Array1, Array2};

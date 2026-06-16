@@ -875,7 +875,7 @@ fn compress_positive_collinear_constraints(
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct MonotonicityPenalty {
+pub struct SurvivalMonotonicityPenalty {
     pub tolerance: f64,
 }
 
@@ -1041,7 +1041,7 @@ pub struct WorkingModelSurvival {
     offset_eta_exit: Array1<f64>,
     offset_derivative_exit: Array1<f64>,
     penalties: PenaltyBlocks,
-    monotonicity: MonotonicityPenalty,
+    monotonicity: SurvivalMonotonicityPenalty,
     structurally_monotonic: bool,
     structural_time_columns: usize,
     monotonicity_constraint_rows: Option<Array2<f64>>,
@@ -1445,7 +1445,7 @@ impl WorkingModelSurvival {
     pub fn from_engine_inputs(
         inputs: SurvivalEngineInputs<'_>,
         penalties: PenaltyBlocks,
-        monotonicity: MonotonicityPenalty,
+        monotonicity: SurvivalMonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<Self, SurvivalError> {
         Self::from_engine_inputswith_offsets(inputs, None, penalties, monotonicity, spec)
@@ -1573,7 +1573,7 @@ impl WorkingModelSurvival {
         offset_eta_exit: Array1<f64>,
         offset_derivative_exit: Array1<f64>,
         penalties: PenaltyBlocks,
-        monotonicity: MonotonicityPenalty,
+        monotonicity: SurvivalMonotonicityPenalty,
         monotonicity_constraint_rows: Option<Array2<f64>>,
         monotonicity_constraint_offsets: Option<Array1<f64>>,
     ) -> Self {
@@ -1602,7 +1602,7 @@ impl WorkingModelSurvival {
         inputs: SurvivalEngineInputs<'_>,
         offsets: Option<SurvivalBaselineOffsets<'_>>,
         penalties: PenaltyBlocks,
-        monotonicity: MonotonicityPenalty,
+        monotonicity: SurvivalMonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<Self, SurvivalError> {
         if spec == SurvivalSpec::Crude {
@@ -1669,7 +1669,7 @@ impl WorkingModelSurvival {
         inputs: SurvivalTimeCovarInputs<'_>,
         offsets: Option<SurvivalBaselineOffsets<'_>>,
         penalties: PenaltyBlocks,
-        monotonicity: MonotonicityPenalty,
+        monotonicity: SurvivalMonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<Self, SurvivalError> {
         if spec == SurvivalSpec::Crude {
@@ -3134,7 +3134,7 @@ mod tests {
     fn survival_model(
         inputs: SurvivalEngineInputs<'_>,
         penalties: PenaltyBlocks,
-        monotonicity: MonotonicityPenalty,
+        monotonicity: SurvivalMonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<WorkingModelSurvival, SurvivalError> {
         WorkingModelSurvival::from_engine_inputs(inputs, penalties, monotonicity, spec)
@@ -3144,7 +3144,7 @@ mod tests {
         inputs: SurvivalEngineInputs<'_>,
         offsets: Option<SurvivalBaselineOffsets<'_>>,
         penalties: PenaltyBlocks,
-        monotonicity: MonotonicityPenalty,
+        monotonicity: SurvivalMonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<WorkingModelSurvival, SurvivalError> {
         WorkingModelSurvival::from_engine_inputswith_offsets(
@@ -3212,7 +3212,7 @@ mod tests {
         let x_exit = array![[1.0, age_exit[0].ln()], [1.0, age_exit[1].ln()]];
         let x_derivative = array![[0.0, 1.0 / age_exit[0]], [0.0, 1.0 / age_exit[1]]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.0, 0.8];
 
         let base = survival_model(
@@ -3306,7 +3306,7 @@ mod tests {
             [0.0, 1.0 / age_exit[3]],
         ];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
 
         // Raw cause labels {0,1,2} violate the single-hazard binary contract and
         // must be rejected -- but as an *actionable* `EventCodeInvalid`, NOT the
@@ -3409,7 +3409,7 @@ mod tests {
         let o_exit = array![0.4_f64, 0.5, 0.7];
         let o_deriv = array![0.3_f64, 0.8, 0.5];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-0.7_f64, 0.6];
 
         let build = |o_e: &Array1<f64>, o_x: &Array1<f64>, o_d: &Array1<f64>| {
@@ -3520,7 +3520,7 @@ mod tests {
         let x_exit = array![[1.0, age_exit[0].ln()], [1.0, age_exit[1].ln()]];
         let x_derivative = array![[0.0, 1.0 / age_exit[0]], [0.0, 1.0 / age_exit[1]]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.0_f64, 0.8];
 
         let model = survival_model_with_offsets(
@@ -3564,7 +3564,7 @@ mod tests {
         let x_exit = array![[1.0, 0.7]];
         let x_derivative = array![[0.0, 0.5]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let model = survival_model(
             survival_inputs(
                 &age_entry,
@@ -3604,7 +3604,7 @@ mod tests {
         let x_exit = array![[0.4]];
         let x_derivative = array![[1.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
 
         let err = survival_model(
             survival_inputs(
@@ -3648,7 +3648,7 @@ mod tests {
                 &x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct censored survival model");
@@ -3682,7 +3682,7 @@ mod tests {
                 &x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct censored survival model");
@@ -3762,7 +3762,7 @@ mod tests {
             range: 1..2,
             nullspace_dim: 0,
         }]);
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.2, 0.4];
 
         let model = survival_model(
@@ -3821,7 +3821,7 @@ mod tests {
                 &x_derivative,
             ),
             penalties,
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect_err("negative lambda must be rejected");
@@ -3858,7 +3858,7 @@ mod tests {
                 &x_derivative,
             ),
             penalties,
-            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalMonotonicityPenalty { tolerance: 1e-8 },
             SurvivalSpec::Net,
         )
         .expect_err("penalty block geometry must match coefficient support");
@@ -3889,7 +3889,7 @@ mod tests {
             [0.0, 1.0 / age_exit[2]]
         ];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-1.0, 3.0];
 
         let model = survival_model(
@@ -4000,7 +4000,7 @@ mod tests {
                 &x_derivative,
             ),
             penalties,
-            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalMonotonicityPenalty { tolerance: 1e-8 },
             SurvivalSpec::Net,
         )
         .expect("construct LAML FD survival model")
@@ -4111,7 +4111,7 @@ mod tests {
             [0.0, 0.6, 1.32, 0.0]
         ];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let mut model = survival_model(
             survival_inputs(
                 &age_entry,
@@ -4178,7 +4178,7 @@ mod tests {
         let x_exit = array![[1.0, 0.5, -0.5], [1.0, 0.8, 0.2]];
         let x_derivative = array![[0.0, 0.9, 0.0], [0.0, 0.7, 0.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let mut model = survival_model(
             survival_inputs(
                 &age_entry,
@@ -4235,7 +4235,7 @@ mod tests {
         let x_derivative = array![[1.0]];
 
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let mut model = survival_model(
             survival_inputs(
                 &age_entry,
@@ -4287,7 +4287,7 @@ mod tests {
         let x_exit = array![[1.0, 0.0]];
         let x_derivative = array![[0.0, 0.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let monotonicity = SurvivalMonotonicityPenalty { tolerance: 3.0 };
         let eta_entry_offset = array![0.0];
         let eta_exit_offset = array![0.0];
         let derivative_offset_below_guard = array![2.0];
@@ -4342,7 +4342,7 @@ mod tests {
             ),
             Some(offsets_above_guard),
             penalties,
-            MonotonicityPenalty { tolerance: 3.0 },
+            SurvivalMonotonicityPenalty { tolerance: 3.0 },
             SurvivalSpec::Net,
         )
         .expect("construct model with derivative offset above guard");
@@ -4384,7 +4384,7 @@ mod tests {
             ),
             Some(offsets),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct structural survival model");
@@ -4421,7 +4421,7 @@ mod tests {
                 &x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct structural survival model");
@@ -4463,7 +4463,7 @@ mod tests {
                 &x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct structural survival model");
@@ -4509,7 +4509,7 @@ mod tests {
                 &x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct structural survival model");
@@ -4537,7 +4537,7 @@ mod tests {
         let x_exit = array![[0.0]];
         let x_derivative = array![[-1.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let model = survival_model(
             survival_inputs(
                 &age_entry,
@@ -4625,7 +4625,7 @@ mod tests {
             [0.0, 0.02, 0.001]
         ];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
         let beta = array![-2.0, 0.7, 0.2];
 
         let model = survival_model(
@@ -4789,7 +4789,7 @@ mod tests {
         ];
         let x_derivative = array![[0.0, 0.5], [0.0, 0.25], [0.0, 0.125]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+        let mono = SurvivalMonotonicityPenalty { tolerance: 1e-8 };
 
         let collocation_offsets = Array1::zeros(x_derivative.nrows());
         let mut inputs = survival_inputs(
@@ -4844,7 +4844,7 @@ mod tests {
         let model = survival_model(
             inputs,
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct survival model");
@@ -4880,7 +4880,7 @@ mod tests {
                 &x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct censored survival model");
@@ -4919,7 +4919,7 @@ mod tests {
         let model = survival_model(
             inputs,
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalMonotonicityPenalty { tolerance: 1e-8 },
             SurvivalSpec::Net,
         )
         .expect("construct mixed survival model");
@@ -4954,7 +4954,7 @@ mod tests {
                 &x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalMonotonicityPenalty { tolerance: 1e-8 },
             SurvivalSpec::Net,
         )
         .expect("construct survival model");
@@ -5024,7 +5024,7 @@ mod tests {
                 &x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct base survival model");
@@ -5048,7 +5048,7 @@ mod tests {
                 &scaled_x_derivative,
             ),
             PenaltyBlocks::new(Vec::new()),
-            MonotonicityPenalty { tolerance: 0.0 },
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
             SurvivalSpec::Net,
         )
         .expect("construct scaled survival model");

@@ -38,10 +38,10 @@
 //!   the frontier predicate
 //!   [`object_store::designed_sampling_mandatory`]: above 10⁸ rows the fit
 //!   must see a designed, honesty-weighted subsample
-//!   ([`crate::inference::row_measure::RowMeasure::designed_subsample`]), not
+//!   ([`crate::inference::row_measure::EnrichmentRowMeasure::designed_subsample`]), not
 //!   a full exact pass.
 //! * [`designed_target`] (#991) — the consumer bridge: design a row sample
-//!   from a [`crate::inference::row_measure::RowMeasure`] (uniform cold start,
+//!   from a [`crate::inference::row_measure::EnrichmentRowMeasure`] (uniform cold start,
 //!   or a previous harvest's lifted Fisher measure), stream-collect exactly
 //!   those rows into the `budget × p` fit target, and hand the `1/π` honesty
 //!   weights to `SaeManifoldTerm::set_row_loss_weights`. Full budget ⇒ the

@@ -1,7 +1,7 @@
 """Distributed Alignment Search (DAS) interchange swap decoder.
 
 This module is the PyTorch-facing thin wrapper for the Rust primitive
-``gam::terms::interchange_decoder``. The decoder is *not* gamfit-specific
+``gam::terms::decoders::interchange_decoder``. The decoder is *not* gamfit-specific
 — the same Rust primitive is callable from the CLI and the Rust library.
 This file exists only because PyTorch needs a custom
 :class:`torch.autograd.Function` to register the Rust forward and the
@@ -175,7 +175,7 @@ class InterchangeSwapDecoder(nn.Module):
     """Decoder with a per-feature scalar gate decoupled from reconstruction.
 
     Thin owner of the trainable parameters. All math is dispatched to the
-    shared Rust primitive ``gam::terms::interchange_decoder`` via a
+    shared Rust primitive ``gam::terms::decoders::interchange_decoder`` via a
     :class:`torch.autograd.Function` that registers Rust-computed
     gradients with PyTorch's autograd tape.
 

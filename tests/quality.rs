@@ -38,12 +38,12 @@ mod quality_vs_gamlss_custom_family_location_scale_gaussian;
 mod quality_vs_gamlss_gagurine_location_scale;
 #[path = "quality/quality_vs_gamlss_gamma_dispersion_location_scale_1060.rs"]
 mod quality_vs_gamlss_gamma_dispersion_location_scale_1060;
+#[path = "quality/quality_vs_gamlss_gaussian_location_scale.rs"]
+mod quality_vs_gamlss_gaussian_location_scale;
 #[path = "quality/quality_vs_gamlss_gaussian_location_scale_by_group.rs"]
 mod quality_vs_gamlss_gaussian_location_scale_by_group;
 #[path = "quality/quality_vs_gamlss_gaussian_location_scale_cyclic.rs"]
 mod quality_vs_gamlss_gaussian_location_scale_cyclic;
-#[path = "quality/quality_vs_gamlss_gaussian_location_scale.rs"]
-mod quality_vs_gamlss_gaussian_location_scale;
 #[path = "quality/quality_vs_gamlss_gaussian_multi_smooth.rs"]
 mod quality_vs_gamlss_gaussian_multi_smooth;
 #[path = "quality/quality_vs_gamlss_gaussian_survival_ls.rs"]
@@ -78,12 +78,12 @@ mod quality_vs_inla_smooth_posterior_sd_credible_interval;
 mod quality_vs_inla_survival_random_intercept_baseline;
 #[path = "quality/quality_vs_inla_tensor_product_spde.rs"]
 mod quality_vs_inla_tensor_product_spde;
+#[path = "quality/quality_vs_interpretML_pygam_binomial_logit_comparative.rs"]
+mod quality_vs_interpretML_pygam_binomial_logit_comparative;
 #[path = "quality/quality_vs_interpretml_ebm_binomial_logit.rs"]
 mod quality_vs_interpretml_ebm_binomial_logit;
 #[path = "quality/quality_vs_interpretml_ebm_poisson_log.rs"]
 mod quality_vs_interpretml_ebm_poisson_log;
-#[path = "quality/quality_vs_interpretML_pygam_binomial_logit_comparative.rs"]
-mod quality_vs_interpretML_pygam_binomial_logit_comparative;
 #[path = "quality/quality_vs_lifelines_competing_risks_cif.rs"]
 mod quality_vs_lifelines_competing_risks_cif;
 #[path = "quality/quality_vs_lifelines_cox_like_marginal.rs"]
@@ -272,16 +272,16 @@ mod quality_vs_statsmodels_binomial_probit;
 mod quality_vs_statsmodels_custom_family_poisson_loglink;
 #[path = "quality/quality_vs_statsmodels_gam_additive.rs"]
 mod quality_vs_statsmodels_gam_additive;
-#[path = "quality/quality_vs_statsmodels_gamma_log_coefficient_se.rs"]
-mod quality_vs_statsmodels_gamma_log_coefficient_se;
 #[path = "quality/quality_vs_statsmodels_gamma_log.rs"]
 mod quality_vs_statsmodels_gamma_log;
+#[path = "quality/quality_vs_statsmodels_gamma_log_coefficient_se.rs"]
+mod quality_vs_statsmodels_gamma_log_coefficient_se;
 #[path = "quality/quality_vs_statsmodels_multinomial.rs"]
 mod quality_vs_statsmodels_multinomial;
-#[path = "quality/quality_vs_statsmodels_negbin_coefficient_se.rs"]
-mod quality_vs_statsmodels_negbin_coefficient_se;
 #[path = "quality/quality_vs_statsmodels_negbin.rs"]
 mod quality_vs_statsmodels_negbin;
+#[path = "quality/quality_vs_statsmodels_negbin_coefficient_se.rs"]
+mod quality_vs_statsmodels_negbin_coefficient_se;
 #[path = "quality/quality_vs_statsmodels_ordinal_mnlogit.rs"]
 mod quality_vs_statsmodels_ordinal_mnlogit;
 #[path = "quality/quality_vs_statsmodels_transformation_survival.rs"]

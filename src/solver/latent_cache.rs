@@ -23,7 +23,7 @@ use crate::warm_start::{Fingerprint, Fingerprinter};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
 use crate::solver::riemannian_retraction::{Retraction, RetractionKind};
-use crate::terms::latent_coord::{
+use crate::terms::latent::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 use crate::terms::smooth::{TermCollectionDesign, TermCollectionSpec};
@@ -461,10 +461,10 @@ fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut Fingerprinter) {
 }
 
 fn hash_behavioral_head(
-    head: &crate::terms::behavioral_head::BehavioralHead,
+    head: &crate::terms::decoders::behavioral_head::BehavioralHead,
     hasher: &mut Fingerprinter,
 ) {
-    use crate::terms::behavioral_head::AuxOutcomeFamily;
+    use crate::terms::decoders::behavioral_head::AuxOutcomeFamily;
     match head.family() {
         AuxOutcomeFamily::Binomial => hasher.write_usize(0),
         AuxOutcomeFamily::Multinomial { n_classes } => {

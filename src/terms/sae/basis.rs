@@ -465,7 +465,7 @@ pub const SPHERE_CHART_PENALTY_DIAGONAL: [f64; 7] = [1e-8, 1.0, 1.0, 1.0, 4.0, 4
 ///
 /// The physical `lat ∈ [-π/2, π/2]` box that pins a canonical latitude range is
 /// enforced where it belongs — in the latent retraction / tangent projection
-/// ([`crate::terms::latent_coord::LatentManifold::Interval`]), which clamps the
+/// ([`crate::terms::latent::LatentManifold::Interval`]), which clamps the
 /// coordinate after each step and zeroes only the *outward-normal* component of
 /// the tangent velocity at an active bound (a correct KKT projection). The old
 /// binary `chain_lat` gate instead zeroed the *entire* latitude jet at the

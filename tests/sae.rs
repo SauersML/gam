@@ -39,10 +39,10 @@ mod sae_manifold_euclidean_line_fit;
 mod sae_manifold_gauge_deflated_evidence;
 #[path = "sae/sae_manifold_joint_two_circle_recovery.rs"]
 mod sae_manifold_joint_two_circle_recovery;
-#[path = "sae/sae_manifold_k_ladder_recovery.rs"]
-mod sae_manifold_k_ladder_recovery;
 #[path = "sae/sae_manifold_k1_circle_radial_bias.rs"]
 mod sae_manifold_k1_circle_radial_bias;
+#[path = "sae/sae_manifold_k_ladder_recovery.rs"]
+mod sae_manifold_k_ladder_recovery;
 #[path = "sae/sae_manifold_p_greater_than_d.rs"]
 mod sae_manifold_p_greater_than_d;
 #[path = "sae/sae_manifold_planted_bifurcation.rs"]

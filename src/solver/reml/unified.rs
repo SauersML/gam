@@ -150,17 +150,12 @@ pub(crate) use crate::linalg::matrix::{
     DesignMatrix, LinearOperator, SignedWeightsView, upper_triangle_pair_from_index,
 };
 
-// Thread-local capture of (op_total, U) from the ext-grad path, used by the
-// iso-κ Duchon FD investigation test. The stash type and its per-thread TLS
-// live in `crate::test_support::debug_stash` so the test reader and the
-// production writer share a single source of truth.
-pub use crate::test_support::debug_stash;
-
 // ─────────────────────────────────────────────────────────────────────────
 // Leaf, state-free linear-algebra kernels (already real modules).
 // ─────────────────────────────────────────────────────────────────────────
 mod dense_linalg;
 mod dense_projection;
+pub(crate) mod debug_stash;
 mod pseudo_logdet;
 
 pub(crate) use dense_linalg::{

@@ -70,9 +70,10 @@
 //!   CPU path projects through the IFT kernel — that route is required
 //!   for marginal-slope ρ-saturated rows)
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 
 use crate::gpu::error::GpuError;
+use crate::linalg::pcg::pcg_core;
 
 // ────────────────────────────────────────────────────────────────────────
 // Public types
@@ -758,8 +759,8 @@ where
     let mut solution = ArrayViewMut1::from(w);
 
     pcg_core(
-        |v: &ArrayView1<f64>, out: &mut ArrayViewMut1<f64>| {
-            // The core hands contiguous views; `hvp` speaks raw slices.
+        |v: &Array1<f64>, out: &mut Array1<f64>| {
+            // The core hands contiguous vectors; `hvp` speaks raw slices.
             let v_slice = v.as_slice().expect("contiguous CG direction view");
             let out_slice = out.as_slice_mut().expect("contiguous CG matvec view");
             hvp(v_slice, out_slice);

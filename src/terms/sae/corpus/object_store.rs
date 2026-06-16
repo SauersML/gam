@@ -44,7 +44,7 @@
 //! contract is that the fit sees a **designed sample** whose inclusion weights
 //! are carried into the likelihood so the criterion stays unbiased (the #973
 //! subsample-honesty contract, mechanized by
-//! [`crate::inference::row_measure::RowMeasure::designed_subsample`]).
+//! [`crate::inference::row_measure::EnrichmentRowMeasure::designed_subsample`]).
 //! [`designed_sampling_mandatory`] is the auto-derived predicate drivers
 //! consult: above the threshold a full-corpus pass is refused as a default and
 //! the designed-sample path is the only sanctioned one — selectivity is a
@@ -73,7 +73,7 @@ pub const PREFETCH_SHARDS_AHEAD: usize = 2;
 /// Corpus row count at and above which designed (importance-weighted)
 /// subsampling is **mandatory** rather than optional: a fit driver seeing at
 /// least this many rows must route through
-/// [`crate::inference::row_measure::RowMeasure::designed_subsample`] and carry
+/// [`crate::inference::row_measure::EnrichmentRowMeasure::designed_subsample`] and carry
 /// the inclusion weights into the likelihood, instead of attempting a
 /// full-corpus exact pass. Auto-derived threshold: 10⁸ rows is where even a
 /// single linear pass per outer iteration dominates the entire fit budget and

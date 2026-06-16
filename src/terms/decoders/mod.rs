@@ -9,5 +9,7 @@
 //! * [`skip_transcoder`] — closed-form Gaussian REML/Laplace score of a
 //!   trained skip-transcoder.
 
+pub mod behavioral_head;
+pub mod gated_decoder;
 pub mod interchange_decoder;
 pub mod skip_transcoder;

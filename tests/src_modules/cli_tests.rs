@@ -6224,7 +6224,7 @@ fn structural_survival_fit_is_time_unit_invariant() {
             let tb_deriv_d = time_build.x_derivative_time.to_dense();
             let mut model = gam::families::royston_parmar::working_model_from_flattened(
                 penalties,
-                gam::survival::MonotonicityPenalty { tolerance: 0.0 },
+                gam::survival::SurvivalMonotonicityPenalty { tolerance: 0.0 },
                 gam::survival::SurvivalSpec::Net,
                 gam::families::royston_parmar::RoystonParmarInputs {
                     age_entry: age_entry.view(),
@@ -6734,7 +6734,7 @@ fn survival_initial_time_coefficient_targets_safe_interior_derivative() {
             monotonicity_constraint_offsets: None,
         },
         gam::survival::PenaltyBlocks::new(Vec::new()),
-        gam::survival::MonotonicityPenalty { tolerance: 0.0 },
+        gam::survival::SurvivalMonotonicityPenalty { tolerance: 0.0 },
         gam::survival::SurvivalSpec::Net,
     )
     .expect("construct survival model");

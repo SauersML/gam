@@ -13,6 +13,7 @@
 use super::{PenaltyBlockInfo, TermCollectionDesign};
 use crate::basis::BasisError;
 use crate::estimate::PenaltySpec;
+pub use crate::types::CoefficientGroupPrior;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,66 +35,6 @@ pub enum CoefficientSelector {
         term: String,
         columns: Vec<usize>,
     },
-}
-
-/// Hyperprior placed on a coefficient group's precision / log-precision.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CoefficientGroupPrior {
-    Flat,
-    NormalLogPrecision {
-        mean: f64,
-        sd: f64,
-    },
-    GammaPrecision {
-        shape: f64,
-        rate: f64,
-    },
-    /// Penalized-complexity prior calibrated by `P(exp(-ρ/2) > upper) =
-    /// tail_prob`; see [`crate::types::RhoPrior::PenalizedComplexity`].
-    PenalizedComplexity {
-        upper: f64,
-        tail_prob: f64,
-    },
-}
-
-impl CoefficientGroupPrior {
-    fn to_rho_prior(&self) -> crate::types::RhoPrior {
-        match *self {
-            Self::Flat => crate::types::RhoPrior::Flat,
-            Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
-            Self::GammaPrecision { shape, rate } => {
-                crate::types::RhoPrior::GammaPrecision { shape, rate }
-            }
-            Self::PenalizedComplexity { upper, tail_prob } => {
-                crate::types::RhoPrior::PenalizedComplexity { upper, tail_prob }
-            }
-        }
-    }
-
-    fn validate(&self, context: &str) -> Result<(), BasisError> {
-        match *self {
-            Self::Flat => Ok(()),
-            Self::NormalLogPrecision { mean, sd } => {
-                if !mean.is_finite() {
-                    crate::bail_invalid_basis!(
-                        "{context} Normal log-precision prior requires finite mean, got {mean}"
-                    );
-                }
-                if !sd.is_finite() || sd <= 0.0 {
-                    crate::bail_invalid_basis!(
-                        "{context} Normal log-precision prior requires sd > 0, got {sd}"
-                    );
-                }
-                Ok(())
-            }
-            Self::GammaPrecision { shape, rate } => {
-                validate_gamma_precision_prior(context, shape, rate)
-            }
-            Self::PenalizedComplexity { upper, tail_prob } => {
-                validate_penalized_complexity_prior(context, upper, tail_prob)
-            }
-        }
-    }
 }
 
 /// A declared coefficient group: a named selector set plus optional parent and
@@ -335,7 +276,7 @@ fn combine_group_rho_prior(
         let context = format!("coefficient group '{}'", group.name);
         let prior = match group.prior.as_ref() {
             Some(prior) => {
-                prior.validate(&context)?;
+                prior.validate(&context).map_err(BasisError::InvalidInput)?;
                 prior.to_rho_prior()
             }
             None => {
@@ -489,7 +430,9 @@ pub(super) fn realize_coefficient_groups(
             crate::bail_invalid_basis!("coefficient group '{}' contains no selectors", group.name);
         }
         if let Some(prior) = group.prior.as_ref() {
-            prior.validate(&format!("coefficient group '{}'", group.name))?;
+            prior
+                .validate(&format!("coefficient group '{}'", group.name))
+                .map_err(BasisError::InvalidInput)?;
         }
     }
 

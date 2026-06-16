@@ -6,18 +6,11 @@
 
 use ndarray::{Array2, ArrayView2};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendStatus {
-    CpuFallback,
-    CudaUnavailable,
-    CudaReady,
-}
-
-pub fn backend_status() -> BackendStatus {
+pub fn backend_status() -> super::BackendStatus {
     if super::runtime::GpuRuntime::global().is_some() {
-        BackendStatus::CudaReady
+        super::BackendStatus::CudaReady
     } else {
-        BackendStatus::CudaUnavailable
+        super::BackendStatus::CudaUnavailable
     }
 }
 

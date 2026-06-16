@@ -7,7 +7,7 @@
 //!   * [`IsometryPenalty`] — pulls the decoder pullback metric
 //!     `J(t)^T W J(t)` toward a reference metric on the latent manifold. Lives
 //!     on the extension-coordinate tier (specifically on a
-//!     [`crate::terms::latent_coord::LatentCoordValues`] slice). Breaks the
+//!     [`crate::terms::latent::LatentCoordValues`] slice). Breaks the
 //!     diffeomorphism gauge so the inner Hessian on `t` is full-rank and the
 //!     IFT is well-defined.
 //!   * [`SparsityPenalty`] — smoothed L¹ (`sqrt(x² + ε²)`), Hoyer, or Log
@@ -130,7 +130,7 @@ pub(crate) use crate::terms::basis::{
 pub(crate) use self::manifest::PenaltyManifest;
 pub(crate) use crate::terms::penalty_op::PenaltyOp;
 pub(crate) use crate::terms::sae::manifold::{GumbelTemperatureSchedule, ScheduleKind};
-pub(crate) use crate::terms::sheaf::SheafConsistencyPenalty;
+pub(crate) use crate::terms::penalties::sheaf::SheafConsistencyPenalty;
 pub(crate) use crate::terms::smooth::BlockwisePenalty;
 
 #[macro_use]

@@ -40,32 +40,22 @@ pub enum TransformationNormalError {
     NumericalFailure { reason: String },
 }
 
-impl std::fmt::Display for TransformationNormalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransformationNormalError::InvalidInput { reason }
-            | TransformationNormalError::DesignDegenerate { reason }
-            | TransformationNormalError::NonFinite { reason }
-            | TransformationNormalError::MonotonicityViolated { reason }
-            | TransformationNormalError::NumericalFailure { reason } => f.write_str(reason),
-        }
+crate::impl_reason_error_boilerplate! {
+    TransformationNormalError {
+        InvalidInput,
+        DesignDegenerate,
+        NonFinite,
+        MonotonicityViolated,
+        NumericalFailure,
     }
 }
 
-impl std::error::Error for TransformationNormalError {}
-
-impl From<TransformationNormalError> for String {
-    /// Shim for the many `Result<_, String>` signatures the module exposes
-    /// (notably the `CustomFamily` and joint-Hessian / psi-workspace
-    /// trait surfaces). Lets a typed `Err(TransformationNormalError::…)`
-    /// flow through `?` or `.into()` without per-callsite stringification.
-    fn from(err: TransformationNormalError) -> String {
-        err.to_string()
-    }
-}
-
-impl From<crate::families::block_layout::block_count::BlockCountMismatch> for TransformationNormalError {
-    fn from(err: crate::families::block_layout::block_count::BlockCountMismatch) -> TransformationNormalError {
+impl From<crate::families::block_layout::block_count::BlockCountMismatch>
+    for TransformationNormalError
+{
+    fn from(
+        err: crate::families::block_layout::block_count::BlockCountMismatch,
+    ) -> TransformationNormalError {
         TransformationNormalError::InvalidInput {
             reason: err.message(),
         }

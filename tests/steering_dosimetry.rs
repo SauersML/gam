@@ -41,7 +41,7 @@ use ndarray::Array2;
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::inference::steering::steer_delta;
-use gam::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
+use gam::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use gam::terms::{
     PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldTerm,
 };

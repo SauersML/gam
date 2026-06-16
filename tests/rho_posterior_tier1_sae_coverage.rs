@@ -14,7 +14,7 @@ use gam::solver::outer_strategy::{
     DeclaredHessianForm, Derivative, HessianResult, OuterCapability, OuterEval, OuterObjective,
     OuterProblem, SeedOutcome,
 };
-use gam::terms::latent_coord::LatentManifold;
+use gam::terms::latent::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,

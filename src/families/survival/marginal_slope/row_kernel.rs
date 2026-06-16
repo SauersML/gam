@@ -78,7 +78,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         // (`fast_ab` on dense, one operator `dot` per column on operator-backed
         // designs).
         Some(self.assemble_jf(factor, n_rows, |design, factor_block| {
-            survival_axis_jf_via_design(design, factor_block, n_rows)
+            crate::families::row_kernel::row_kernel_design_jf(design, factor_block, n_rows)
         }))
     }
 
@@ -102,7 +102,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         // tile while keeping BLAS-3 on the materialized designs.
         let b = end.saturating_sub(start);
         self.assemble_jf(factor, b, |design, factor_block| {
-            survival_axis_jf_via_design_rows(design, factor_block, start, end)
+            crate::families::row_kernel::row_kernel_design_jf_rows(design, factor_block, start, end)
         })
     }
 
@@ -260,64 +260,5 @@ impl SurvivalMarginalSlopeRowKernel {
         jf.slice_mut(s![.., 3 * rank..4 * rank])
             .assign(&axis(&self.family.logslope_design, f_logslope));
         jf
-    }
-}
-
-pub(crate) fn survival_axis_jf_via_design(
-    design: &DesignMatrix,
-    factor_block: ArrayView2<'_, f64>,
-    n_rows: usize,
-) -> Array2<f64> {
-    let rank = factor_block.ncols();
-    if rank == 0 {
-        return Array2::<f64>::zeros((n_rows, 0));
-    }
-    let factor = factor_block.as_standard_layout().into_owned();
-    match design.as_dense_ref() {
-        Some(dense) => fast_ab(dense, &factor),
-        None => {
-            let mut out = Array2::<f64>::zeros((n_rows, rank));
-            for c in 0..rank {
-                let result = design.dot(&factor.column(c).to_owned());
-                out.column_mut(c).assign(&result);
-            }
-            out
-        }
-    }
-}
-
-/// Row-range analogue of [`survival_axis_jf_via_design`]: one design's
-/// `(end-start) × rank` Jacobian-action block over rows `[start, end)`. Dense
-/// designs slice to a contiguous row block and GEMM via `fast_ab` (BLAS-3,
-/// zero-copy slice); sparse/operator designs fall to a row-local
-/// `dot_row_view` over the range (each entry touches only its own row, so
-/// tiling never re-walks the full operator). Used by the block-tiled trace to
-/// hold one row-tile at a time instead of the whole `n × rank` projection.
-pub(crate) fn survival_axis_jf_via_design_rows(
-    design: &DesignMatrix,
-    factor_block: ArrayView2<'_, f64>,
-    start: usize,
-    end: usize,
-) -> Array2<f64> {
-    let b = end.saturating_sub(start);
-    let rank = factor_block.ncols();
-    if rank == 0 {
-        return Array2::<f64>::zeros((b, 0));
-    }
-    let factor = factor_block.as_standard_layout().into_owned();
-    match design.as_dense_ref() {
-        Some(dense) => {
-            let block = dense.slice(s![start..end, ..]);
-            fast_ab(&block, &factor)
-        }
-        None => {
-            let mut out = Array2::<f64>::zeros((b, rank));
-            for (i, row) in (start..end).enumerate() {
-                for c in 0..rank {
-                    out[[i, c]] = design.dot_row_view(row, factor.column(c));
-                }
-            }
-            out
-        }
     }
 }

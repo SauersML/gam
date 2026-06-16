@@ -38,24 +38,13 @@ pub enum GpuError {
     NotYetImplemented { reason: String },
 }
 
-impl std::fmt::Display for GpuError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GpuError::DriverLibraryUnavailable { reason }
-            | GpuError::DriverSymbolMissing { reason }
-            | GpuError::DriverCallFailed { reason }
-            | GpuError::CalibrationFailed { reason }
-            | GpuError::NotYetImplemented { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for GpuError {}
-
-impl From<GpuError> for String {
-    #[inline]
-    fn from(err: GpuError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    GpuError {
+        DriverLibraryUnavailable,
+        DriverSymbolMissing,
+        DriverCallFailed,
+        CalibrationFailed,
+        NotYetImplemented,
     }
 }
 

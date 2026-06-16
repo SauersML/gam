@@ -96,7 +96,7 @@ pub struct LatentCoordDesignDerivative {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RadialLatentCoordLocalDesignJacobian {
-    pub(crate) latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+    pub(crate) latent: Arc<crate::terms::latent::LatentCoordValues>,
     pub(crate) centers: Arc<Array2<f64>>,
     pub(crate) radial_kind: RadialScalarKind,
     pub(crate) ident_transform: Option<Array2<f64>>,
@@ -107,7 +107,7 @@ pub(crate) struct RadialLatentCoordLocalDesignJacobian {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JetLatentCoordLocalDesignJacobian {
-    pub(crate) latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+    pub(crate) latent: Arc<crate::terms::latent::LatentCoordValues>,
     pub(crate) jet: Arc<Array3<f64>>,
     pub(crate) ident_transform: Option<Array2<f64>>,
 }
@@ -279,7 +279,7 @@ impl LatentCoordDesignDerivative {
     }
 
     pub(crate) fn new_matern(
-        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        latent: Arc<crate::terms::latent::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
         length_scale: f64,
         nu: MaternNu,
@@ -307,7 +307,7 @@ impl LatentCoordDesignDerivative {
     }
 
     pub(crate) fn new_duchon(
-        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        latent: Arc<crate::terms::latent::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
         length_scale: Option<f64>,
         power: f64,
@@ -362,7 +362,7 @@ impl LatentCoordDesignDerivative {
     }
 
     pub(crate) fn new_sphere(
-        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        latent: Arc<crate::terms::latent::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
         penalty_order: usize,
         ident_transform: Option<Array2<f64>>,
@@ -381,13 +381,13 @@ impl LatentCoordDesignDerivative {
             true,
         )?;
         let jet = latent.design_gradient_wrt_t_dispatch(
-            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+            crate::terms::latent::InputLocationDerivative::Jet(raw_jet.view()),
         )?;
         Self::from_jet(latent, jet, ident_transform)
     }
 
     pub(crate) fn new_periodic_bspline(
-        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        latent: Arc<crate::terms::latent::LatentCoordValues>,
         data_range: (f64, f64),
         degree: usize,
         num_basis: usize,
@@ -400,13 +400,13 @@ impl LatentCoordDesignDerivative {
             num_basis,
         )?;
         let jet = latent.design_gradient_wrt_t_dispatch(
-            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+            crate::terms::latent::InputLocationDerivative::Jet(raw_jet.view()),
         )?;
         Self::from_jet(latent, jet, ident_transform)
     }
 
     pub(crate) fn new_tensor_bspline(
-        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        latent: Arc<crate::terms::latent::LatentCoordValues>,
         knots_per_axis: Vec<Array1<f64>>,
         degrees: Vec<usize>,
         ident_transform: Option<Array2<f64>>,
@@ -418,13 +418,13 @@ impl LatentCoordDesignDerivative {
         let raw_jet =
             bspline_tensor_first_derivative(latent.as_matrix().view(), &knot_views, &degrees)?;
         let jet = latent.design_gradient_wrt_t_dispatch(
-            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+            crate::terms::latent::InputLocationDerivative::Jet(raw_jet.view()),
         )?;
         Self::from_jet(latent, jet, ident_transform)
     }
 
     pub(crate) fn new_pca(
-        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        latent: Arc<crate::terms::latent::LatentCoordValues>,
         basis_matrix: Arc<Array2<f64>>,
     ) -> Result<Self, BasisError> {
         if latent.latent_dim() != basis_matrix.nrows() {
@@ -447,7 +447,7 @@ impl LatentCoordDesignDerivative {
     }
 
     pub(crate) fn from_jet(
-        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        latent: Arc<crate::terms::latent::LatentCoordValues>,
         jet: Array3<f64>,
         ident_transform: Option<Array2<f64>>,
     ) -> Result<Self, BasisError> {

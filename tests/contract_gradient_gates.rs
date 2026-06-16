@@ -12,7 +12,7 @@ use gam::families::custom_family::{
 };
 use gam::families::gamlss::GaussianLocationScaleFamily;
 use gam::families::survival::{
-    MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec,
+    PenaltyBlock, PenaltyBlocks, SurvivalEngineInputs, SurvivalMonotonicityPenalty, SurvivalSpec,
     WorkingModelSurvival,
 };
 use gam::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
@@ -654,7 +654,7 @@ fn survival_single_block_model(active_lambda: f64) -> WorkingModelSurvival {
             monotonicity_constraint_offsets: None,
         },
         penalties,
-        MonotonicityPenalty { tolerance: 1e-8 },
+        SurvivalMonotonicityPenalty { tolerance: 1e-8 },
         SurvivalSpec::Net,
     )
     .expect("construct single-block survival LAML FD model")

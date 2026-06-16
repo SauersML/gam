@@ -75,7 +75,7 @@ use crate::solver::riemannian_retraction::{ProductRetraction, RetractionKind};
 
 use crate::survival::PenaltyBlock;
 
-use crate::terms::latent_coord::{
+use crate::terms::latent::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 

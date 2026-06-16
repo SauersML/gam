@@ -8,7 +8,7 @@ use crate::terms::analytic_penalties::{
     AnalyticPenalty, IBPAssignmentPenalty, IbpHessianDiagThirdChannels,
     SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
-use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
+use crate::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use crate::terms::sae::manifold::SaeManifoldRho;
 
 /// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit

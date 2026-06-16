@@ -34,11 +34,11 @@
 //! call that a surviving freedom (under-claiming identification); the
 //! relative-curvature rule must call it pinned and report the fraction.
 
-use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::identifiability::sae::{
     AtomTopology, FittedAtom, FittedSaeManifold, GENERATOR_FLAT_ENERGY_TOL, GeneratorFamily,
     residual_gauge,
 };
+use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use ndarray::Array2;
 use std::sync::Arc;
 

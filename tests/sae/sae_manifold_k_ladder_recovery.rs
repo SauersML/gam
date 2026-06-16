@@ -38,7 +38,7 @@
 
 use gam::linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
 use gam::solver::outer_strategy::OuterProblem;
-use gam::terms::latent_coord::LatentManifold;
+use gam::terms::latent::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,

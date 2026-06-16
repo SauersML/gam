@@ -4,6 +4,8 @@
 
 use super::*;
 
+pub use crate::types::CoefficientGroupPrior;
+
 /// Per-subject channel Hessian provider for multi-output families.
 ///
 /// The Fisher information decomposition for multi-output families is
@@ -563,78 +565,6 @@ impl CoefficientLabel {
 
 pub fn coefficient_label(block: impl Into<String>, column: usize) -> CoefficientLabel {
     CoefficientLabel::by_block_name(block, column)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum CoefficientGroupPrior {
-    Flat,
-    NormalLogPrecision {
-        mean: f64,
-        sd: f64,
-    },
-    GammaPrecision {
-        shape: f64,
-        rate: f64,
-    },
-    /// Penalized-complexity prior calibrated by `P(exp(-ρ/2) > upper) =
-    /// tail_prob`; see [`crate::types::RhoPrior::PenalizedComplexity`].
-    PenalizedComplexity {
-        upper: f64,
-        tail_prob: f64,
-    },
-}
-
-impl CoefficientGroupPrior {
-    pub fn to_rho_prior(&self) -> crate::types::RhoPrior {
-        match *self {
-            Self::Flat => crate::types::RhoPrior::Flat,
-            Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
-            Self::GammaPrecision { shape, rate } => {
-                crate::types::RhoPrior::GammaPrecision { shape, rate }
-            }
-            Self::PenalizedComplexity { upper, tail_prob } => {
-                crate::types::RhoPrior::PenalizedComplexity { upper, tail_prob }
-            }
-        }
-    }
-
-    pub(crate) fn validate(&self, context: &str) -> Result<(), String> {
-        match *self {
-            Self::Flat => Ok(()),
-            Self::NormalLogPrecision { mean, sd } => {
-                if !mean.is_finite() {
-                    return Err(format!(
-                        "{context} Normal log-precision prior requires finite mean, got {mean}"
-                    ));
-                }
-                if !sd.is_finite() || sd <= 0.0 {
-                    return Err(format!(
-                        "{context} Normal log-precision prior requires sd > 0, got {sd}"
-                    ));
-                }
-                Ok(())
-            }
-            Self::PenalizedComplexity { upper, tail_prob } => {
-                validate_penalized_complexity_prior(context, upper, tail_prob)
-            }
-            Self::GammaPrecision { shape, rate } => {
-                if !shape.is_finite() || shape <= 0.0 {
-                    return Err(CustomFamilyError::DimensionMismatch {
-                        reason: format!(
-                            "{context} Gamma precision prior requires shape > 0, got {shape}"
-                        ),
-                    }
-                    .into());
-                }
-                if !rate.is_finite() || rate < 0.0 {
-                    return Err(format!(
-                        "{context} Gamma precision prior requires rate >= 0, got {rate}"
-                    ));
-                }
-                Ok(())
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

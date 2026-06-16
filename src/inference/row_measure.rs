@@ -1,8 +1,8 @@
-//! `RowMeasure` — the Fisher-mass **enrichment** producer (role (c) of #980).
+//! `EnrichmentRowMeasure` — the Fisher-mass **enrichment** producer (role (c) of #980).
 //!
 //! # What this is, and what it must never be
 //!
-//! A [`RowMeasure`] turns a [`RowMetric`] into a per-row **sampling measure**:
+//! An [`EnrichmentRowMeasure`] turns a [`RowMetric`] into a per-row **sampling measure**:
 //! a normalized non-negative weight per row, proportional to that row's
 //! behavioral *liveness* (its output-Fisher mass). It exists for **discovery /
 //! seeding only** — to OVERSAMPLE the behaviorally-live rows so that a rare but
@@ -62,7 +62,7 @@ use crate::linalg::utils::splitmix64_hash;
 use faer::Side;
 use ndarray::{Array2, ArrayView2};
 
-/// Where a [`RowMeasure`] came from — the honest record of whether the
+/// Where an [`EnrichmentRowMeasure`] came from — the honest record of whether the
 /// enrichment is real (Fisher-mass driven) or the graceful uniform fallback.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MeasureProvenance {
@@ -80,12 +80,12 @@ pub enum MeasureProvenance {
 
 /// A per-row **sampling measure** over `n` rows, normalized to sum to 1.
 ///
-/// Built from a [`RowMetric`] via [`RowMeasure::from_metric`]. The weights are a
+/// Built from a [`RowMetric`] via [`EnrichmentRowMeasure::from_metric`]. The weights are a
 /// proper probability measure (non-negative, finite, summing to 1) used for
 /// **discovery/seeding oversampling only** — see the module docs for the
 /// invariant that it touches no loss / gradient / criterion.
 #[derive(Clone, Debug)]
-pub struct RowMeasure {
+pub struct EnrichmentRowMeasure {
     provenance: MeasureProvenance,
     /// Normalized per-row sampling weights; `weights.len() == n_rows` and
     /// `Σ weights == 1` (exactly uniform `1/n` in the fallback).
@@ -440,7 +440,7 @@ pub fn greedy_sensitivity_coreset(
     })
 }
 
-impl RowMeasure {
+impl EnrichmentRowMeasure {
     /// Build the enrichment measure from a [`RowMetric`].
     ///
     /// The per-row liveness is the Fisher mass `tr(M_n)` read from the metric's
@@ -846,7 +846,7 @@ impl RowMeasure {
 
 /// A designed importance subsample with honest Horvitz–Thompson likelihood
 /// weights — what a frontier fit sums over instead of the full corpus
-/// (#987 / #973). Produced by [`RowMeasure::designed_subsample`].
+/// (#987 / #973). Produced by [`EnrichmentRowMeasure::designed_subsample`].
 #[derive(Clone, Debug)]
 pub struct DesignedRowSample {
     /// Provenance of the measure that shaped the design (uniform fallback or
@@ -885,7 +885,7 @@ impl DesignedRowSample {
 /// evidence halves within the target `eps`, their deterministic BSS /
 /// sensitivity weights, and the [`CoresetCertificate`] a race consumer gates
 /// the verdict transfer against. Produced by
-/// [`RowMeasure::designed_subsample_certified`].
+/// [`EnrichmentRowMeasure::designed_subsample_certified`].
 #[derive(Clone, Debug)]
 pub struct CertifiedRowSample {
     /// Provenance of the measure that shaped the design.
@@ -919,7 +919,7 @@ impl CertifiedRowSample {
     }
 }
 
-/// Defensive uniform mixture fraction for [`RowMeasure::designed_subsample`]:
+/// Defensive uniform mixture fraction for [`EnrichmentRowMeasure::designed_subsample`]:
 /// the design samples from `(1 − ε)·measure + ε·uniform`. Guarantees every
 /// row's inclusion probability is positive (unbiasedness needs `π_i > 0`
 /// wherever `ℓ_i ≠ 0`) and caps the worst-case `1/π` weight at
@@ -1151,7 +1151,7 @@ mod tests {
     #[test]
     fn euclidean_degrades_to_uniform() {
         let metric = RowMetric::euclidean(5, 3).expect("euclidean");
-        let measure = RowMeasure::from_metric(&metric);
+        let measure = EnrichmentRowMeasure::from_metric(&metric);
         assert_eq!(measure.provenance(), MeasureProvenance::Uniform);
         assert!(!measure.is_enriched());
         for &w in measure.weights() {
@@ -1165,7 +1165,7 @@ mod tests {
         let rows = vec![vec![1.0], vec![1.0], vec![3.0], vec![1.0]];
         let u = factors_from_rows(&rows, 1, 1);
         let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
-        let measure = RowMeasure::from_metric(&metric);
+        let measure = EnrichmentRowMeasure::from_metric(&metric);
         assert!(measure.is_enriched());
         let w = measure.weights();
         let sum: f64 = w.iter().sum();
@@ -1181,7 +1181,7 @@ mod tests {
         let rows = vec![vec![0.0], vec![0.0], vec![0.0]];
         let u = factors_from_rows(&rows, 1, 1);
         let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
-        let measure = RowMeasure::from_metric(&metric);
+        let measure = EnrichmentRowMeasure::from_metric(&metric);
         assert_eq!(measure.provenance(), MeasureProvenance::Uniform);
         for &w in measure.weights() {
             assert!((w - 1.0 / 3.0).abs() < 1e-12);
@@ -1193,7 +1193,7 @@ mod tests {
         let rows = vec![vec![1.0], vec![3.0], vec![1.0]];
         let u = factors_from_rows(&rows, 1, 1);
         let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
-        let measure = RowMeasure::from_metric(&metric);
+        let measure = EnrichmentRowMeasure::from_metric(&metric);
         let a = measure.enrichment_order(20, 7);
         let b = measure.enrichment_order(20, 7);
         assert_eq!(a, b, "same seed must give identical ordering");
@@ -1208,7 +1208,7 @@ mod tests {
         let rows = vec![vec![1.0], vec![3.0], vec![1.0]];
         let u = factors_from_rows(&rows, 1, 1);
         let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
-        let measure = RowMeasure::from_metric(&metric);
+        let measure = EnrichmentRowMeasure::from_metric(&metric);
         let count = 110;
         let order = measure.enrichment_order(count, 1);
         let loud = order.iter().filter(|&&r| r == 1).count();
@@ -1225,7 +1225,7 @@ mod tests {
         let rows = vec![vec![1.0], vec![3.0]];
         let u = factors_from_rows(&rows, 1, 1);
         let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
-        let measure = RowMeasure::from_metric(&metric);
+        let measure = EnrichmentRowMeasure::from_metric(&metric);
         let rep = measure.expected_representation(10);
         // masses 1, 9 ⇒ weights 0.1, 0.9 ⇒ reps 1.0, 9.0.
         assert!((rep[0] - 1.0).abs() < 1e-12);
@@ -1243,7 +1243,7 @@ mod tests {
             .collect();
         let u = factors_from_rows(&rows, 1, 1);
         let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
-        let measure = RowMeasure::from_metric(&metric);
+        let measure = EnrichmentRowMeasure::from_metric(&metric);
 
         let budget = 40usize;
         let a = measure.designed_subsample(budget, 17);
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn designed_subsample_full_budget_is_the_exact_pass() {
-        let measure = RowMeasure::uniform(7);
+        let measure = EnrichmentRowMeasure::uniform(7);
         let s = measure.designed_subsample(7, 3);
         assert_eq!(s.rows, (0..7).collect::<Vec<_>>());
         assert!(s.likelihood_weights.iter().all(|&w| w == 1.0));
@@ -1289,7 +1289,7 @@ mod tests {
         // row carries the same n/budget weight — plain HT scale-up.
         let n = 120usize;
         let budget = 30usize;
-        let measure = RowMeasure::uniform(n);
+        let measure = EnrichmentRowMeasure::uniform(n);
         let s = measure.designed_subsample(budget, 5);
         assert_eq!(s.provenance, MeasureProvenance::Uniform);
         let expect = n as f64 / budget as f64;
@@ -1312,7 +1312,7 @@ mod tests {
             .collect();
         let u = factors_from_rows(&rows, 1, 1);
         let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
-        let measure = RowMeasure::from_metric(&metric);
+        let measure = EnrichmentRowMeasure::from_metric(&metric);
         let s = measure.designed_subsample(10, 99);
         let pos = s.rows.iter().position(|&r| r == 7);
         assert!(pos.is_some(), "the dominant-mass row must be in the design");
@@ -1470,7 +1470,7 @@ mod tests {
             array![[0.0, 5.0]],
         ];
         let leverage = vec![0.05, 0.05, 0.05, 0.05, 0.9];
-        let measure = RowMeasure::uniform(5);
+        let measure = EnrichmentRowMeasure::uniform(5);
         let certified = measure
             .designed_subsample_certified(
                 row_factors.iter().map(|r| r.view()),

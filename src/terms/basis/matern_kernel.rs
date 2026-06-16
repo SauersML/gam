@@ -2398,7 +2398,7 @@ pub fn operator_penalty_candidates_closed_form(
             return None;
         }
         let raw_op = std::sync::Arc::new(
-            crate::terms::closed_form_operator::ClosedFormPenaltyOperator::new(
+            crate::terms::basis::closed_form_operator::ClosedFormPenaltyOperator::new(
                 centers,
                 q,
                 p_order,

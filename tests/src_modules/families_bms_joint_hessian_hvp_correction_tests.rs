@@ -2062,7 +2062,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     // the FD total. The coordinator reads these MSI numbers to localize the
     // disagreement to a single analytic term.
     {
-        use crate::test_support::debug_stash;
+        use crate::solver::estimate::reml::unified::debug_stash;
         let _capture = debug_stash::CaptureGuard::request();
         let (base_obj, _, _) = outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
         assert!(

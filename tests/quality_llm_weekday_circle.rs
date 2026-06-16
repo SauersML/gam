@@ -49,7 +49,7 @@ use gam::solver::topology_selector::{
     MIXTURE_K_LADDER, STACKING_CV_FOLDS, adjudicate_cross_class_race, fit_mixture_rung,
     mixture_density_provider,
 };
-use gam::terms::anova_atom::{BindingNotion, CarveInput, carve, fit_tensor_surface};
+use gam::terms::structure::anova_atom::{BindingNotion, CarveInput, carve, fit_tensor_surface};
 use ndarray::{Array1, Array2, ArrayView2};
 
 // ---------------------------------------------------------------------------

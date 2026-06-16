@@ -38,13 +38,13 @@
 //!   an error and never a fabricated identity block.
 //!
 //! The designed subsample itself comes from
-//! [`RowMeasure::designed_subsample`] (uniform on the first harvest; measure-
+//! [`EnrichmentRowMeasure::designed_subsample`] (uniform on the first harvest; measure-
 //! driven re-designs once a previous tier exists), so tier membership carries
 //! honest inclusion weights wherever an *estimate over the corpus* is lifted
 //! from the tier — the same #973 honesty discipline, applied to the metric's
 //! estimation roles instead of the likelihood.
 
-use crate::inference::row_measure::{RowMeasure, per_row_fisher_mass};
+use crate::inference::row_measure::{EnrichmentRowMeasure, per_row_fisher_mass};
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 
 /// The Fisher-bearing tier: which corpus rows carry factors, and the metric
@@ -218,17 +218,17 @@ impl TieredHarvest {
     ///   (which would starve un-harvested rows of all future attention,
     ///   freezing the design) nor boosted. When tier masses are flat this
     ///   collapses the whole measure to uniform, exactly the no-signal
-    ///   degeneracy [`RowMeasure`] already normalizes to.
-    /// * No tier ⇒ exactly [`RowMeasure::uniform`].
+    ///   degeneracy [`EnrichmentRowMeasure`] already normalizes to.
+    /// * No tier ⇒ exactly [`EnrichmentRowMeasure::uniform`].
     ///
-    /// The result obeys every [`RowMeasure`] invariant — discovery/seeding
+    /// The result obeys every [`EnrichmentRowMeasure`] invariant — discovery/seeding
     /// attention only, never a loss weight.
-    pub fn corpus_measure(&self) -> RowMeasure {
+    pub fn corpus_measure(&self) -> EnrichmentRowMeasure {
         let Some(tier) = self.fisher.as_ref() else {
-            return RowMeasure::uniform(self.n_rows);
+            return EnrichmentRowMeasure::uniform(self.n_rows);
         };
         if self.n_rows == 0 {
-            return RowMeasure::uniform(0);
+            return EnrichmentRowMeasure::uniform(0);
         }
         let tier_mass = per_row_fisher_mass(&tier.metric);
         let mut corrected = vec![0.0_f64; tier.rows.len()];
@@ -244,14 +244,14 @@ impl TieredHarvest {
             total += v;
         }
         if !usable || !(total > 0.0) {
-            return RowMeasure::uniform(self.n_rows);
+            return EnrichmentRowMeasure::uniform(self.n_rows);
         }
         let mean = total / tier.rows.len() as f64;
         let mut masses = vec![mean; self.n_rows];
         for (t, &r) in tier.rows.iter().enumerate() {
             masses[r] = corrected[t];
         }
-        RowMeasure::from_masses(tier.metric.provenance(), masses)
+        EnrichmentRowMeasure::from_masses(tier.metric.provenance(), masses)
     }
 
     /// Plan the **next** harvest's Fisher tier: a designed subsample of

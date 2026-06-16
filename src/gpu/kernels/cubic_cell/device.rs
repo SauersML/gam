@@ -20,14 +20,14 @@
 //! substrate.
 
 #[cfg(target_os = "linux")]
+use crate::gpu::error::GpuError;
+#[cfg(target_os = "linux")]
+use crate::gpu::error::GpuResultExt;
+#[cfg(target_os = "linux")]
 use crate::gpu::kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
     GpuCellBranchTag, branch::classify_cell_for_gpu,
 };
-#[cfg(target_os = "linux")]
-use crate::gpu::error::GpuError;
-#[cfg(target_os = "linux")]
-use crate::gpu::error::GpuResultExt;
 #[cfg(target_os = "linux")]
 use crate::gpu_err;
 
@@ -118,7 +118,9 @@ impl CubicCellGpuBackend {
             }
         }
         let source =
-            crate::gpu::kernels::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source(max_degree);
+            crate::gpu::kernels::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source(
+                max_degree,
+            );
         let ptx = cudarc::nvrtc::compile_ptx(&source).gpu_ctx_with(|err| {
             format!("cubic_cell NVRTC compile (degree={max_degree}) failed: {err}")
         })?;
@@ -313,13 +315,13 @@ impl CubicCellGpuBackend {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::gpu::error::GpuError;
+    use crate::gpu::error::GpuResultExt;
     use crate::gpu::kernels::cubic_cell::{
         CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
         CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
         try_build_cubic_cell_derivative_moments,
     };
-    use crate::gpu::error::GpuError;
-    use crate::gpu::error::GpuResultExt;
     use crate::gpu::runtime::GpuRuntime;
 
     /// Test-only DtoH helper for cubic-cell device residency parity tests.

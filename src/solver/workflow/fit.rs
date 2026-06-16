@@ -1608,14 +1608,20 @@ fn cause_specific_survival_rho_prior(
     Ok(crate::types::RhoPrior::Independent(priors))
 }
 
-fn hash_workflow_array_view(hasher: &mut crate::warm_start::Fingerprinter, array: ArrayView1<'_, f64>) {
+fn hash_workflow_array_view(
+    hasher: &mut crate::warm_start::Fingerprinter,
+    array: ArrayView1<'_, f64>,
+) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_f64(value);
     }
 }
 
-fn hash_workflow_u8_array(hasher: &mut crate::warm_start::Fingerprinter, array: ArrayView1<'_, u8>) {
+fn hash_workflow_u8_array(
+    hasher: &mut crate::warm_start::Fingerprinter,
+    array: ArrayView1<'_, u8>,
+) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_usize(usize::from(value));
@@ -1814,7 +1820,7 @@ fn store_survival_transformation_persistent_warm_start(
 pub(crate) fn fit_survival_transformation_model(
     request: SurvivalTransformationFitRequest<'_>,
 ) -> Result<SurvivalTransformationFitResult, String> {
-    use crate::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
+    use crate::survival::{PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
 
     let SurvivalTransformationFitRequest {
         data,
@@ -1937,7 +1943,7 @@ pub(crate) fn fit_survival_transformation_model(
             let mut model =
                 crate::families::royston_parmar::working_model_from_time_covariateshared(
                     PenaltyBlocks::new(penalty_blocks.clone()),
-                    MonotonicityPenalty { tolerance: 0.0 },
+                    SurvivalMonotonicityPenalty { tolerance: 0.0 },
                     SurvivalSpec::Net,
                     crate::families::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
                         age_entry: spec.age_entry.view(),

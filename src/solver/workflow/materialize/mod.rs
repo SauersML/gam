@@ -1234,7 +1234,7 @@ struct LatentDimSelectionSpec {
 
 #[derive(Clone)]
 struct LatentAuxOutcomeSpec {
-    family: crate::terms::behavioral_head::AuxOutcomeFamily,
+    family: crate::terms::decoders::behavioral_head::AuxOutcomeFamily,
     /// Behavioral labels, length `n`. Binomial: 0/1; Multinomial: class index.
     y: Array1<f64>,
     /// Optional per-row head weight (semi-supervised); `None` ⇒ all rows
@@ -1675,7 +1675,7 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
         let aux_outcome = match obj.get("aux_outcome").filter(|value| !value.is_null()) {
             None => None,
             Some(value) => {
-                use crate::terms::behavioral_head::AuxOutcomeFamily;
+                use crate::terms::decoders::behavioral_head::AuxOutcomeFamily;
                 let ao = value
                     .as_object()
                     .ok_or_else(|| format!("latents['{key}'].aux_outcome must be an object"))?;
@@ -1847,7 +1847,7 @@ fn initial_latent_matrix(spec: &LatentSpec, y: ArrayView1<'_, f64>) -> Result<Ar
 
 fn latent_id_mode(spec: &LatentSpec) -> Result<LatentIdMode, String> {
     if let Some(ao) = spec.aux_outcome.as_ref() {
-        use crate::terms::behavioral_head::BehavioralHead;
+        use crate::terms::decoders::behavioral_head::BehavioralHead;
         if let Some(init) = ao.init_log_precision.as_ref()
             && init.len() != spec.d
         {

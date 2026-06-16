@@ -38,7 +38,7 @@ use super::*;
 ///   strided in memory; [`Self::as_blockwise`] expands it into scalar
 ///   `BlockwisePenalty` entries rather than pretending each axis is contiguous.
 ///
-/// When to use: any [`crate::terms::latent_coord::LatentCoordValues`] block
+/// When to use: any [`crate::terms::latent::LatentCoordValues`] block
 /// where the intrinsic dimension is unknown. Compose with `IsometryPenalty`
 /// for full gauge fixing.
 #[derive(Debug, Clone)]

@@ -13,6 +13,27 @@
 //!   custom  → CustomFamilyError
 
 #[macro_export]
+macro_rules! impl_reason_error_boilerplate {
+    ($type:ident { $($variant:ident),+ $(,)? }) => {
+        impl ::std::fmt::Display for $type {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                match self {
+                    $(Self::$variant { reason })|+ => f.write_str(reason),
+                }
+            }
+        }
+
+        impl ::std::error::Error for $type {}
+
+        impl From<$type> for String {
+            fn from(err: $type) -> String {
+                err.to_string()
+            }
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! bail_invalid_estim {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::solver::estimate::EstimationError::InvalidInput(format!($fmt $(, $($arg)*)?)))

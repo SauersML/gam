@@ -8757,8 +8757,7 @@ mod inner_contract_probe_tests {
         let m = 5usize; // periodic harmonic basis width (1, then 2 harmonics)
         // A true circle coordinate per row, and a smooth periodic decoder, so the
         // target lies on a genuine 1D periodic manifold (known structure).
-        let coords =
-            Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+        let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
         let (phi, jet) = periodic_basis(&coords);
         // A smooth decoder B (M × p): low-order harmonics dominate so the encode
         // map is well-conditioned and the IFT predictor is a faithful first-order
@@ -8824,8 +8823,7 @@ mod inner_contract_probe_tests {
              cotrained={cotrained} < reml={reml}"
         );
         assert!(
-            consistency.recon_consistency >= 0.0
-                && consistency.recon_consistency.is_finite(),
+            consistency.recon_consistency >= 0.0 && consistency.recon_consistency.is_finite(),
             "recon consistency must be a finite non-negative gap, got {}",
             consistency.recon_consistency
         );
@@ -8886,5 +8884,80 @@ mod inner_contract_probe_tests {
             "amortized encode must reconstruct certified rows within the encode \
              tolerance of the exact encode-by-inner-solve; max gap={max_certified_gap}"
         );
+
+        // Held-out recovery: compare the fast #1010 amortized row encode against
+        // the exact certified row encode a sequential REML-then-distill path
+        // would use as its teacher. The held-out phases are interleaved between
+        // training phases, so this is not an in-sample replay.
+        let n_holdout = 12usize;
+        let heldout_coords = Array2::from_shape_fn((n_holdout, 1), |(row, _)| {
+            (row as f64 + 0.25) / n_holdout as f64
+        });
+        let (heldout_phi, _heldout_jet) = periodic_basis(&heldout_coords);
+        let heldout = heldout_phi.dot(&atom0.decoder_coefficients);
+        let heldout_amplitudes = Array1::<f64>::ones(n_holdout);
+        let mut target_norm_bound = 0.0_f64;
+        for row in 0..n_holdout {
+            target_norm_bound =
+                target_norm_bound.max(heldout.row(row).dot(&heldout.row(row)).sqrt());
+        }
+        let atlas = crate::terms::sae::encode_atlas::EncodeAtlas::build(
+            &term.atoms,
+            &[1.0],
+            target_norm_bound,
+            crate::terms::sae::encode_atlas::AtlasConfig::default(),
+        )
+        .expect("held-out encode atlas builds");
+        let fast_heldout = atlas
+            .amortized_encode_batch(atom0, 0, heldout.view(), heldout_amplitudes.view())
+            .expect("held-out amortized encode runs");
+
+        let mut max_fast_vs_exact = 0.0_f64;
+        let mut max_fast_truth = 0.0_f64;
+        let mut max_exact_truth = 0.0_f64;
+        let mut heldout_certified = 0usize;
+        for row in 0..n_holdout {
+            if !fast_heldout.certified[row] {
+                continue;
+            }
+            heldout_certified += 1;
+            let (exact_t, exact_cert) = atlas
+                .certified_encode_row(atom0, 0, heldout.row(row), 1.0)
+                .expect("held-out exact certified row encode runs");
+            assert!(
+                exact_cert.certified(),
+                "sequential exact #1010 teacher must certify held-out row {row}"
+            );
+            let truth = heldout_coords[[row, 0]];
+            let fast = fast_heldout.coords[[row, 0]];
+            let exact = exact_t[0];
+            let fast_vs_exact = circle_phase_gap(fast, exact);
+            let fast_truth = circle_phase_gap(fast, truth);
+            let exact_truth = circle_phase_gap(exact, truth);
+            max_fast_vs_exact = max_fast_vs_exact.max(fast_vs_exact);
+            max_fast_truth = max_fast_truth.max(fast_truth);
+            max_exact_truth = max_exact_truth.max(exact_truth);
+        }
+        assert!(
+            heldout_certified > 0,
+            "fast amortized encode must certify held-out rows on the known manifold"
+        );
+        assert!(
+            max_fast_vs_exact < 1.0e-2,
+            "fast amortized held-out encode must match exact #1010 encode within \
+             certified tolerance; max phase gap={max_fast_vs_exact}"
+        );
+        assert!(
+            max_fast_truth <= max_exact_truth + 1.0e-2,
+            "co-trained fast encoder must recover the known held-out manifold at \
+             least as well as the sequential exact-teacher path within tolerance; \
+             fast={max_fast_truth}, sequential={max_exact_truth}"
+        );
+    }
+
+    fn circle_phase_gap(a: f64, b: f64) -> f64 {
+        let raw = (a - b).abs();
+        raw.min((raw - raw.floor()).abs())
+            .min((1.0 - raw.fract()).abs())
     }
 }

@@ -6,12 +6,13 @@
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, BlockOrthogonalityPenalty, BlockSparsityPenalty,
     DecoderIncoherencePenalty, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
-    JumpReLUPenalty, MechanismSparsityPenalty, MonotonicityPenalty, NestedPrefixPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyTier,
-    RowPrecisionPriorPenalty, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
-    TopKActivationPenalty, TotalVariationPenalty,
+    JumpReLUPenalty, MechanismSparsityPenalty, NestedPrefixPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyTier,
+    RowPrecisionPriorPenalty, ScadMcpPenalty, ShapeMonotonicityPenalty,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
+    TotalVariationPenalty,
 };
-use crate::terms::sheaf::SheafConsistencyPenalty;
+use crate::terms::penalties::sheaf::SheafConsistencyPenalty;
 
 pub trait PenaltyManifest: AnalyticPenalty {
     const KIND_TAG: &'static str;
@@ -77,7 +78,7 @@ impl PenaltyManifest for MechanismSparsityPenalty {
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
 
-impl PenaltyManifest for MonotonicityPenalty {
+impl PenaltyManifest for ShapeMonotonicityPenalty {
     const KIND_TAG: &'static str = "monotonicity";
     const PYTHON_WRAPPER: &'static str = "MonotonicityPenalty";
     const ROW_BLOCK_DIAGONAL: bool = false;
@@ -164,7 +165,7 @@ macro_rules! analytic_penalty_registry {
             register!(NuclearNorm, NuclearNormPenalty);
             register!(BlockSparsity, BlockSparsityPenalty);
             register!(MechanismSparsity, MechanismSparsityPenalty);
-            register!(Monotonicity, MonotonicityPenalty);
+            register!(Monotonicity, ShapeMonotonicityPenalty);
             register!(NestedPrefix, NestedPrefixPenalty);
             register!(RowPrecisionPrior, RowPrecisionPriorPenalty);
             register!(IvaeRidgeMeanGauge, IvaeRidgeMeanGauge);

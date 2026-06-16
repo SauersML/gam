@@ -2159,10 +2159,10 @@ pub struct FittedTermCollectionWithSpec {
 
 #[derive(Clone)]
 pub struct StandardLatentCoordConfig {
-    pub values: std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>,
+    pub values: std::sync::Arc<crate::terms::latent::LatentCoordValues>,
     pub term_index: crate::types::SmoothTermIdx,
     pub feature_cols: Vec<usize>,
-    pub manifold: crate::terms::latent_coord::LatentManifold,
+    pub manifold: crate::terms::latent::LatentManifold,
     pub manifold_auto: bool,
     pub retraction_registry: crate::solver::latent_cache::LatentRetractionRegistry,
     pub analytic_penalties: Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>>,

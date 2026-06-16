@@ -28,7 +28,7 @@
 //! The benchmark PRINTS the measured rows/sec per K verbatim; the assertion is
 //! the gate, the print is the datum.
 
-use gam::terms::latent_coord::LatentManifold;
+use gam::terms::latent::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,

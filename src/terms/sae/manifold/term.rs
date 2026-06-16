@@ -207,7 +207,7 @@ pub struct SaeManifoldTerm {
     pub(crate) collapse_events: Vec<CollapseEvent>,
     /// Per-row **design honesty weights** (#991): Horvitz–Thompson inclusion
     /// corrections from a designed corpus subsample
-    /// ([`crate::inference::row_measure::RowMeasure::designed_subsample`] /
+    /// ([`crate::inference::row_measure::EnrichmentRowMeasure::designed_subsample`] /
     /// [`crate::terms::sae::corpus::designed_target`]), self-normalized to
     /// mean `1.0` over the term's rows so dispersion, dof, and the
     /// data-vs-penalty balance stay consistent at the fitted sample size while

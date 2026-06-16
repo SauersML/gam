@@ -25,7 +25,7 @@
 //!
 //! ## What this module does
 //!
-//! When a [`crate::terms::latent_coord::LatentCoordValues`] block is
+//! When a [`crate::terms::latent::LatentCoordValues`] block is
 //! registered with the design, each inner Gauss–Newton iteration must
 //! solve the same normal equations that bundle adjustment solves:
 //! per-3D-point blocks are our per-row latent coordinates `t_i`, and

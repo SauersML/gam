@@ -78,7 +78,7 @@ pub(crate) use crate::terms::analytic_penalties::{
     PenaltyTier, PsiSlice, WeightField, resolve_learnable_weight,
 };
 
-pub(crate) use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
+pub(crate) use crate::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 
 pub(crate) use crate::terms::sae::criterion_atoms::SaeCriterion;
 

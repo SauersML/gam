@@ -18,6 +18,8 @@
 //! derivatives — is then generic over any `RowKernel<K>`.
 
 use crate::custom_family::{ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace};
+use crate::faer_ndarray::fast_ab;
+use crate::matrix::DesignMatrix;
 use crate::solver::estimate::reml::unified::{
     HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
@@ -665,6 +667,74 @@ pub(crate) fn row_kernel_jacobian_action_matrix_generic_rows<const K: usize>(
             }
         });
     jf
+}
+
+/// One design's whole-row Jacobian-action block `design · factor_block`.
+///
+/// Dense designs use a BLAS-3 matrix multiply. Sparse/operator-backed designs
+/// use one design matvec per factor column, matching the row-kernel generic
+/// reference arithmetic while avoiding per-row dispatch.
+pub(crate) fn row_kernel_design_jf(
+    design: &DesignMatrix,
+    factor_block: ArrayView2<'_, f64>,
+    n_rows: usize,
+) -> Array2<f64> {
+    let rank = factor_block.ncols();
+    if rank == 0 {
+        return Array2::<f64>::zeros((n_rows, 0));
+    }
+    let factor = factor_block.as_standard_layout().into_owned();
+    match design.as_dense_ref() {
+        Some(dense) => fast_ab(dense, &factor),
+        None => row_kernel_design_jf_column_dot(design, &factor, n_rows),
+    }
+}
+
+/// Row-range analogue of [`row_kernel_design_jf`]: one design's
+/// `(end-start) × rank` Jacobian-action block over rows `[start, end)`.
+pub(crate) fn row_kernel_design_jf_rows(
+    design: &DesignMatrix,
+    factor_block: ArrayView2<'_, f64>,
+    start: usize,
+    end: usize,
+) -> Array2<f64> {
+    let b = end.saturating_sub(start);
+    let rank = factor_block.ncols();
+    if rank == 0 {
+        return Array2::<f64>::zeros((b, 0));
+    }
+    let factor = factor_block.as_standard_layout().into_owned();
+    match design.as_dense_ref() {
+        Some(dense) => {
+            let block = dense.slice(s![start..end, ..]);
+            fast_ab(&block, &factor)
+        }
+        None => {
+            let mut out = Array2::<f64>::zeros((b, rank));
+            for (i, row) in (start..end).enumerate() {
+                for c in 0..rank {
+                    out[[i, c]] = design.dot_row_view(row, factor.column(c));
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Per-column matrix-vector dispatch for `design · factor_block` when no
+/// contiguous dense backing is available.
+pub(crate) fn row_kernel_design_jf_column_dot(
+    design: &DesignMatrix,
+    factor_block: &Array2<f64>,
+    n_rows: usize,
+) -> Array2<f64> {
+    let rank = factor_block.ncols();
+    let mut out = Array2::<f64>::zeros((n_rows, rank));
+    for c in 0..rank {
+        let result = design.dot(&factor_block.column(c).to_owned());
+        out.column_mut(c).assign(&result);
+    }
+    out
 }
 
 // ── Cache ────────────────────────────────────────────────────────────

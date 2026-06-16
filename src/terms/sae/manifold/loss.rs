@@ -26,9 +26,8 @@ impl SaeManifoldLoss {
 /// Componentized analytic derivative of the SAE REML criterion with respect to
 /// the flat [`SaeManifoldRho`] layout.
 ///
-/// This is intentionally only a value object for tests and derivation gates. It
-/// is not wired into [`SaeManifoldOuterObjective`] capability planning until the
-/// third-order logdet correction is available behind its own oracle.
+/// Production objective and certificate paths consume this value object so the
+/// criterion value and gradient are assembled from the same converged cache.
 #[derive(Debug, Clone)]
 pub struct SaeOuterRhoGradientComponents {
     /// Direct derivative of `loss.total() + extra_penalty_energy` with respect to
@@ -38,31 +37,13 @@ pub struct SaeOuterRhoGradientComponents {
     pub logdet_trace: Array1<f64>,
     /// Derivative contribution of `-occam`.
     pub occam: Array1<f64>,
-    /// Reserved channel for `0.5 * tr(H^{-1} (dH/dtheta * dtheta_hat/d rho_j))`.
+    /// `0.5 * tr(H^{-1} (dH/dtheta * dtheta_hat/d rho_j))`.
     pub third_order_correction: Array1<f64>,
-    /// Whether `third_order_correction` is populated from analytic channels.
-    pub third_order_correction_available: bool,
 }
 
 impl SaeOuterRhoGradientComponents {
     #[must_use]
-    pub fn gradient_excluding_unavailable_correction(&self) -> Array1<f64> {
-        &(&self.explicit + &self.logdet_trace) + &self.occam
-    }
-
-    #[must_use]
-    pub fn gradient_with_available_correction(&self) -> Array1<f64> {
-        // The name is a contract: callers asking for the corrected gradient
-        // must not silently receive the uncorrected one. Zeros-by-omission in
-        // the correction channel are exactly the objective↔gradient desync
-        // class; fail loudly instead.
-        assert!(
-            self.third_order_correction_available,
-            "gradient_with_available_correction: third-order correction channel \
-             is not populated for this fit; use \
-             gradient_excluding_unavailable_correction() and account for the \
-             missing term explicitly"
-        );
-        &self.gradient_excluding_unavailable_correction() + &self.third_order_correction
+    pub fn gradient(&self) -> Array1<f64> {
+        &(&(&self.explicit + &self.logdet_trace) + &self.occam) + &self.third_order_correction
     }
 }

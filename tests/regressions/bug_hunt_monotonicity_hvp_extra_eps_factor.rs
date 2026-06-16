@@ -1,4 +1,4 @@
-//! Bug hunt: `MonotonicityPenalty::hvp` returns a Hessian-vector product that is
+//! Bug hunt: `ShapeMonotonicityPenalty::hvp` returns a Hessian-vector product that is
 //! too large by a factor of `1 / smoothing_eps`.
 //!
 //! The penalty contribution for an adjacent pair `(a, b=a+1)` and column `j` is
@@ -46,7 +46,7 @@
 //! against a central finite-difference of the (correct) gradient. Both currently
 //! fail; both pass once the `(eps * eps)` is corrected to `eps`.
 
-use gam::terms::analytic_penalties::{AnalyticPenalty, MonotonicityPenalty};
+use gam::terms::analytic_penalties::{AnalyticPenalty, ShapeMonotonicityPenalty};
 use ndarray::Array1;
 
 fn sigmoid(z: f64) -> f64 {
@@ -68,7 +68,7 @@ fn monotonicity_hvp_matches_exact_hessian() {
     let t0 = 0.0_f64;
     let t1 = 0.3_f64;
 
-    let p = MonotonicityPenalty::new(weight, 2, direction, eps, false)
+    let p = ShapeMonotonicityPenalty::new(weight, 2, direction, eps, false)
         .expect("construct monotonicity penalty");
     let target = Array1::from(vec![t0, t1]);
     let rho: Array1<f64> = Array1::from(vec![]);
@@ -103,7 +103,7 @@ fn monotonicity_hvp_matches_finite_difference_of_gradient() {
     // the hvp must therefore match a finite-difference of the gradient along v.
     let weight = 0.9_f64;
     let eps = 0.25_f64;
-    let p = MonotonicityPenalty::new(weight, 3, 1.0, eps, true)
+    let p = ShapeMonotonicityPenalty::new(weight, 3, 1.0, eps, true)
         .expect("construct monotonicity penalty");
 
     // (n_eff = 3, d = 2) row-major latent block, generic smooth point.

@@ -78,13 +78,12 @@ impl SweepCase {
             .iter()
             .enumerate()
             .map(|(i, &x)| {
-                let noise = 2.0
-                    * hashed_unit(
+                let noise =
+                    2.0 * hashed_unit(
                         (i as u64)
                             .wrapping_mul(2_654_435_761)
                             .wrapping_add(self.seed.wrapping_mul(0x9E37_79B9)),
-                    )
-                    - 1.0;
+                    ) - 1.0;
                 let y = self.signal(x) + self.noise * noise;
                 StringRecord::from(vec![format!("{x:.17e}"), format!("{y:.17e}")])
             })
@@ -168,14 +167,70 @@ fn measure_jet_formula_fit_succeeds_across_random_datasets() {
     // span under- to fully-resolved sines; phases, noise scales, sample sizes,
     // and grid regularity all move. Every one must fit.
     let cases = [
-        SweepCase { seed: 1, n: 200, freq: 1.0, phase: 0.0, noise: 0.10, jitter: false },
-        SweepCase { seed: 2, n: 200, freq: 1.0, phase: 1.3, noise: 0.05, jitter: true },
-        SweepCase { seed: 3, n: 240, freq: 1.5, phase: 0.7, noise: 0.08, jitter: false },
-        SweepCase { seed: 4, n: 180, freq: 2.0, phase: 2.1, noise: 0.10, jitter: true },
-        SweepCase { seed: 5, n: 300, freq: 1.0, phase: 3.0, noise: 0.15, jitter: false },
-        SweepCase { seed: 6, n: 220, freq: 1.25, phase: 0.4, noise: 0.06, jitter: true },
-        SweepCase { seed: 7, n: 260, freq: 1.75, phase: 1.9, noise: 0.12, jitter: false },
-        SweepCase { seed: 8, n: 160, freq: 1.0, phase: 2.6, noise: 0.04, jitter: true },
+        SweepCase {
+            seed: 1,
+            n: 200,
+            freq: 1.0,
+            phase: 0.0,
+            noise: 0.10,
+            jitter: false,
+        },
+        SweepCase {
+            seed: 2,
+            n: 200,
+            freq: 1.0,
+            phase: 1.3,
+            noise: 0.05,
+            jitter: true,
+        },
+        SweepCase {
+            seed: 3,
+            n: 240,
+            freq: 1.5,
+            phase: 0.7,
+            noise: 0.08,
+            jitter: false,
+        },
+        SweepCase {
+            seed: 4,
+            n: 180,
+            freq: 2.0,
+            phase: 2.1,
+            noise: 0.10,
+            jitter: true,
+        },
+        SweepCase {
+            seed: 5,
+            n: 300,
+            freq: 1.0,
+            phase: 3.0,
+            noise: 0.15,
+            jitter: false,
+        },
+        SweepCase {
+            seed: 6,
+            n: 220,
+            freq: 1.25,
+            phase: 0.4,
+            noise: 0.06,
+            jitter: true,
+        },
+        SweepCase {
+            seed: 7,
+            n: 260,
+            freq: 1.75,
+            phase: 1.9,
+            noise: 0.12,
+            jitter: false,
+        },
+        SweepCase {
+            seed: 8,
+            n: 160,
+            freq: 1.0,
+            phase: 2.6,
+            noise: 0.04,
+            jitter: true,
+        },
     ];
 
     for case in &cases {

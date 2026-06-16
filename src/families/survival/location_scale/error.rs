@@ -27,23 +27,13 @@ pub enum SurvivalLocationScaleError {
     InternalInvariant { reason: String },
 }
 
-impl std::fmt::Display for SurvivalLocationScaleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SurvivalLocationScaleError::DimensionMismatch { reason }
-            | SurvivalLocationScaleError::InvalidConfiguration { reason }
-            | SurvivalLocationScaleError::ConstraintViolation { reason }
-            | SurvivalLocationScaleError::NumericalFailure { reason }
-            | SurvivalLocationScaleError::InternalInvariant { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for SurvivalLocationScaleError {}
-
-impl From<SurvivalLocationScaleError> for String {
-    fn from(err: SurvivalLocationScaleError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    SurvivalLocationScaleError {
+        DimensionMismatch,
+        InvalidConfiguration,
+        ConstraintViolation,
+        NumericalFailure,
+        InternalInvariant,
     }
 }
 

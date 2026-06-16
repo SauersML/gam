@@ -824,10 +824,14 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if block_states.len() != 3 || derivative_blocks.len() != 3 {
+        validate_block_count::<GamlssError>(
+            "BinomialLocationScaleWiggleFamily",
+            3,
+            block_states.len(),
+        )?;
+        if derivative_blocks.len() != 3 {
             return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily joint psi second-order terms expect 3 blocks and 3 derivative block lists, got {} and {}",
-                block_states.len(),
+                "BinomialLocationScaleWiggleFamily joint psi second-order terms expect 3 derivative block lists, got {}",
                 derivative_blocks.len()
             ) }.into());
         }

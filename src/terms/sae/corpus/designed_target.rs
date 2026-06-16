@@ -9,10 +9,10 @@
 //! stays unbiased (#987 / #973). That makes "fit the corpus" a two-step
 //! pipeline with a bounded memory footprint by construction:
 //!
-//! 1. **Design** — a [`RowMeasure`] over the corpus (uniform on a first
+//! 1. **Design** — a [`EnrichmentRowMeasure`] over the corpus (uniform on a first
 //!    harvest; [`TieredHarvest::corpus_measure`]-driven once Fisher factors
 //!    exist) picks `budget` rows via
-//!    [`RowMeasure::designed_subsample`] (deterministic, seeded, honest `1/π`
+//!    [`EnrichmentRowMeasure::designed_subsample`] (deterministic, seeded, honest `1/π`
 //!    weights).
 //! 2. **Collect** — one deterministic streaming pass over the source
 //!    materializes exactly those rows (the only dense `f64` block the fit ever
@@ -37,7 +37,7 @@ use ndarray::Array2;
 use super::object_store::designed_sampling_mandatory;
 use super::shard_reader::CorpusRowSource;
 use crate::inference::harvest::TieredHarvest;
-use crate::inference::row_measure::{MeasureProvenance, RowMeasure};
+use crate::inference::row_measure::{EnrichmentRowMeasure, MeasureProvenance};
 
 /// Default designed-sample budget once [`designed_sampling_mandatory`] fires.
 /// Auto-derived policy, not a knob: 2·10⁶ rows is comfortably in-memory at any
@@ -102,12 +102,12 @@ impl DesignedCorpusTarget {
 ///
 /// `measure` is the design measure over the corpus rows (`None` ⇒ uniform —
 /// the first-harvest cold start). `budget` rows are selected via
-/// [`RowMeasure::designed_subsample`] (deterministic in `(measure, budget,
+/// [`EnrichmentRowMeasure::designed_subsample`] (deterministic in `(measure, budget,
 /// seed)`), then materialized in one deterministic pass. The source is
 /// `reset()` before reading, so the call is idempotent across ρ passes.
 pub fn collect_designed_target(
     source: &mut dyn CorpusRowSource,
-    measure: Option<&RowMeasure>,
+    measure: Option<&EnrichmentRowMeasure>,
     budget: usize,
     seed: u64,
 ) -> Result<DesignedCorpusTarget, String> {
@@ -127,7 +127,7 @@ pub fn collect_designed_target(
             m
         }
         None => {
-            uniform = RowMeasure::uniform(n);
+            uniform = EnrichmentRowMeasure::uniform(n);
             &uniform
         }
     };
@@ -270,7 +270,7 @@ mod tests {
 
         // The selection must be the measure's own design, row for row,
         // weight for weight.
-        let sample = RowMeasure::uniform(n).designed_subsample(budget, seed);
+        let sample = EnrichmentRowMeasure::uniform(n).designed_subsample(budget, seed);
         assert_eq!(
             collected.row_ids,
             sample.rows.iter().map(|&r| r as u64).collect::<Vec<_>>()
@@ -303,7 +303,7 @@ mod tests {
         let rows = planted_rows(20, 2);
         let dir = temp_shard_dir("mismatch", &rows, 10);
         let mut src = MmapShardSource::open_dir(&dir).expect("open");
-        let wrong = RowMeasure::uniform(7);
+        let wrong = EnrichmentRowMeasure::uniform(7);
         let err = collect_designed_target(&mut src, Some(&wrong), 5, 1)
             .expect_err("mismatched measure must be rejected");
         assert!(err.contains("covers 7 rows"), "got: {err}");

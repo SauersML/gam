@@ -1,3 +1,4 @@
+use gam::families::family_runtime::{FamilyStrategy, strategy_for_spec};
 use gam::families::latent_survival::fixed_latent_hazard_frailty;
 use gam::families::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam::families::marginal_slope_shared::{
@@ -6,7 +7,6 @@ use gam::families::marginal_slope_shared::{
 use gam::families::scale_design::{
     apply_scale_deviation_transform, build_scale_deviation_transform,
 };
-use gam::families::family_runtime::{FamilyStrategy, strategy_for_spec};
 use gam::families::vector_response::{GaussianVectorLikelihood, VectorNoise, VectorResponseTarget};
 use gam::types::inverse_link_to_binomial_spec;
 use gam::types::{InverseLink, LatentCLogLogState, LikelihoodSpec, ResponseFamily, StandardLink};

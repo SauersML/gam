@@ -12,23 +12,22 @@ fn backend_status_and_policy_dispatch_are_consistent() {
     if runtime_available {
         assert_eq!(
             blas_status,
-            Some(gam::gpu::blas::BackendStatus::CudaReady),
+            Some(gam::gpu::BackendStatus::CudaReady),
             "BLAS backend status should report CUDA ready when runtime probe succeeds."
         );
         assert_eq!(
             solver_status,
-            Some(gam::gpu::solver::BackendStatus::CudaReady),
+            Some(gam::gpu::BackendStatus::CudaReady),
             "Solver backend status should report CUDA ready when runtime probe succeeds."
         );
     } else {
         assert!(
-            blas_status.is_none()
-                || blas_status == Some(gam::gpu::blas::BackendStatus::CudaUnavailable),
+            blas_status.is_none() || blas_status == Some(gam::gpu::BackendStatus::CudaUnavailable),
             "BLAS backend status should report CUDA unavailable or panic-cleanly when CUDA runtime cannot be loaded."
         );
         assert!(
             solver_status.is_none()
-                || solver_status == Some(gam::gpu::solver::BackendStatus::CudaUnavailable),
+                || solver_status == Some(gam::gpu::BackendStatus::CudaUnavailable),
             "Solver backend status should report CUDA unavailable or panic-cleanly when CUDA runtime cannot be loaded."
         );
     }

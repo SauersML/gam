@@ -83,7 +83,7 @@ use gam::families::custom_family::{
     CustomFamilyBlockPsiDerivative, EvalMode, evaluate_custom_family_joint_hyper,
 };
 use gam::families::survival::{
-    MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec,
+    PenaltyBlock, PenaltyBlocks, SurvivalEngineInputs, SurvivalMonotonicityPenalty, SurvivalSpec,
     WorkingModelSurvival,
 };
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
@@ -1081,7 +1081,7 @@ fn survival_single_block_model(active_lambda: f64) -> WorkingModelSurvival {
             monotonicity_constraint_offsets: None,
         },
         penalties,
-        MonotonicityPenalty { tolerance: 1e-8 },
+        SurvivalMonotonicityPenalty { tolerance: 1e-8 },
         SurvivalSpec::Net,
     )
     .expect("construct single-block survival LAML FD model")
@@ -1168,7 +1168,7 @@ fn survival_near_degenerate_two_block_model() -> WorkingModelSurvival {
             monotonicity_constraint_offsets: None,
         },
         penalties,
-        MonotonicityPenalty { tolerance: 1e-8 },
+        SurvivalMonotonicityPenalty { tolerance: 1e-8 },
         SurvivalSpec::Net,
     )
     .expect("construct near-degenerate two-block survival LAML FD model")

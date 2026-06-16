@@ -243,7 +243,7 @@ fn try_build_spatial_log_kappa_hyper_dirs(
 
 
 pub(crate) fn try_build_latent_coord_hyper_dirs(
-    latent: std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>,
+    latent: std::sync::Arc<crate::terms::latent::LatentCoordValues>,
     resolvedspec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     latent_terms: &[crate::types::SmoothTermIdx],
@@ -444,10 +444,10 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
 
 
 fn latent_coord_direct_hyper_count(
-    id_mode: &crate::terms::latent_coord::LatentIdMode,
+    id_mode: &crate::terms::latent::LatentIdMode,
     latent_dim: usize,
 ) -> usize {
-    use crate::terms::latent_coord::{AuxPriorStrength, LatentIdMode};
+    use crate::terms::latent::{AuxPriorStrength, LatentIdMode};
     match id_mode {
         LatentIdMode::AuxPrior { strength, .. } => match strength {
             AuxPriorStrength::Auto => 1,
@@ -470,10 +470,10 @@ fn latent_coord_direct_hyper_count(
 
 
 fn latent_coord_initial_direct_hypers(
-    id_mode: &crate::terms::latent_coord::LatentIdMode,
+    id_mode: &crate::terms::latent::LatentIdMode,
     latent_dim: usize,
 ) -> Result<Array1<f64>, EstimationError> {
-    use crate::terms::latent_coord::{AuxPriorStrength, LatentIdMode};
+    use crate::terms::latent::{AuxPriorStrength, LatentIdMode};
     let mut values = Vec::with_capacity(latent_coord_direct_hyper_count(id_mode, latent_dim));
     match id_mode {
         LatentIdMode::AuxPrior { strength, .. } => {
@@ -541,9 +541,9 @@ fn latent_id_objective_contribution(
     theta: &Array1<f64>,
     rho_dim: usize,
     analytic_rho_count: usize,
-    latent: &crate::terms::latent_coord::LatentCoordValues,
+    latent: &crate::terms::latent::LatentCoordValues,
 ) -> Result<LatentIdObjectiveContribution, EstimationError> {
-    use crate::terms::latent_coord::{AuxPriorStrength, LatentIdMode, aux_prior_targets};
+    use crate::terms::latent::{AuxPriorStrength, LatentIdMode, aux_prior_targets};
     let n_obs = latent.n_obs();
     let latent_dim = latent.latent_dim();
     let flat_len = latent.len();
@@ -665,7 +665,7 @@ fn add_latent_id_objective_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
     analytic_rho_count: usize,
-    latent: &crate::terms::latent_coord::LatentCoordValues,
+    latent: &crate::terms::latent::LatentCoordValues,
     eval: &mut (
         f64,
         Array1<f64>,
@@ -693,7 +693,7 @@ fn add_latent_id_objective_to_eval(
 fn analytic_penalty_objective_contribution(
     theta: &Array1<f64>,
     rho_dim: usize,
-    latent: &crate::terms::latent_coord::LatentCoordValues,
+    latent: &crate::terms::latent::LatentCoordValues,
     registry: &crate::terms::AnalyticPenaltyRegistry,
 ) -> Result<LatentIdObjectiveContribution, EstimationError> {
     let flat_len = latent.len();
@@ -751,7 +751,7 @@ fn analytic_penalty_objective_contribution(
 fn add_analytic_penalty_hessian_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
-    latent: &crate::terms::latent_coord::LatentCoordValues,
+    latent: &crate::terms::latent::LatentCoordValues,
     registry: &crate::terms::AnalyticPenaltyRegistry,
     eval: &mut (
         f64,
@@ -831,7 +831,7 @@ fn add_analytic_penalty_hessian_to_eval(
 fn add_analytic_penalty_objective_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
-    latent: &crate::terms::latent_coord::LatentCoordValues,
+    latent: &crate::terms::latent::LatentCoordValues,
     registry: &crate::terms::AnalyticPenaltyRegistry,
     eval: &mut (
         f64,
@@ -1417,7 +1417,7 @@ struct SingleBlockLatentCoordDesignCache {
     spec: TermCollectionSpec,
     design: TermCollectionDesign,
     current_theta: Option<Array1<f64>>,
-    current_latent: Option<std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>>,
+    current_latent: Option<std::sync::Arc<crate::terms::latent::LatentCoordValues>>,
     current_hyper_dirs: Option<Vec<crate::estimate::reml::DirectionalHyperParam>>,
     current_design_cache_id: Option<u64>,
     latent_design_cache: crate::solver::latent_cache::LatentDesignCache,
@@ -1432,8 +1432,8 @@ struct SingleBlockLatentCoordDesignCache {
     rho_dim: usize,
     n_obs: usize,
     latent_dim: usize,
-    id_mode: crate::terms::latent_coord::LatentIdMode,
-    manifold: crate::terms::latent_coord::LatentManifold,
+    id_mode: crate::terms::latent::LatentIdMode,
+    manifold: crate::terms::latent::LatentManifold,
     retraction_registry: crate::solver::latent_cache::LatentRetractionRegistry,
     latent_id: u64,
     analytic_penalties: Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>>,
@@ -1519,7 +1519,7 @@ impl SingleBlockLatentCoordDesignCache {
 
     fn latent(
         &self,
-    ) -> Result<std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>, String> {
+    ) -> Result<std::sync::Arc<crate::terms::latent::LatentCoordValues>, String> {
         self.current_latent
             .as_ref()
             .cloned()
@@ -1741,7 +1741,7 @@ impl SingleBlockLatentCoordDesignCache {
             .slice(s![self.rho_dim..self.rho_dim + latent_flat_len])
             .to_owned();
         let latent = std::sync::Arc::new(
-            crate::terms::latent_coord::LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
+            crate::terms::latent::LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
                 flat,
                 self.n_obs,
                 self.latent_dim,

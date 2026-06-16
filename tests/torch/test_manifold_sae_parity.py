@@ -50,9 +50,10 @@ def test_fit_matches_closed_form_reml_score_and_blocks():
 
     sae = gt.ManifoldSAE(cfg)
     torch_x = torch.as_tensor(X, dtype=torch.float64)
+    initializers = sae._closed_form_initializers(torch_x)
     torch_fit = sae.fit(torch_x, n_iter=10, random_state=42)
 
-    # Equivalent closed-form call (same Rust kernel, same args).
+    # Equivalent closed-form call (same Rust kernel, same amortized warm starts).
     cf_fit = gamfit.sae_manifold_fit(
         X=X,
         K=cfg.n_atoms,
@@ -63,6 +64,7 @@ def test_fit_matches_closed_form_reml_score_and_blocks():
         schedule=cfg.sparsity.gumbel_schedule(),
         n_iter=10,
         random_state=42,
+        **initializers,
     )
 
     # The two fits are produced by the same Rust call with the same args.

@@ -12,10 +12,10 @@
 //! analytic: one with a genuine residual rotation freedom (isometry pin
 //! inactive) and one where the isometry pin removes that same rotation.
 
-use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::identifiability::sae::{
     AtomTopology, FittedAtom, FittedSaeManifold, GeneratorFamily, residual_gauge,
 };
+use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 

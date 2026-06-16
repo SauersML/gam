@@ -14,7 +14,7 @@ pub(crate) use crate::linalg::triangular::{
 pub(crate) use crate::terms::analytic_penalties::{
     AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier,
 };
-pub(crate) use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
+pub(crate) use crate::terms::latent::{LatentCoordValues, LatentManifold};
 pub(crate) use faer::Side;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 pub(crate) use std::ops::Range;

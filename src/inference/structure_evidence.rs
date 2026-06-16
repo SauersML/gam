@@ -630,7 +630,7 @@ impl StructureCertificate {
 /// any valid p — superuniformity only, no other conditions).
 ///
 /// This is the bridge from p-value-shaped instruments into the ledger —
-/// e.g. the feature-binding Wald test (`terms::anova_atom::carve`'s
+/// e.g. the feature-binding Wald test (`terms::structure::anova_atom::carve`'s
 /// `edge_p_value` → a [`ClaimKind::BindingEdge`] entry). It spends
 /// calibration slack (a p of 0.01 becomes e = 5, not 100), which is the
 /// honest price of converting a fixed-sample test into anytime-valid

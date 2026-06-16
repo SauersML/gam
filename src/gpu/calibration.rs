@@ -1,8 +1,8 @@
-use crate::warm_start::{Fingerprint, Fingerprinter};
 use crate::gpu::device::GpuDeviceInfo;
 use crate::gpu::error::GpuError;
 use crate::gpu::policy::GpuDispatchPolicy;
 use crate::linalg::faer_ndarray::FaerCholesky;
+use crate::warm_start::{Fingerprint, Fingerprinter};
 use faer::Side;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};

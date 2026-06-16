@@ -284,7 +284,7 @@ pub(crate) fn radial_basis_cartesian_derivative(
 /// against its *first* kernel argument (i.e. per-row latent coordinates
 /// `t_n`); the full per-row gradient is reconstructed at the call site as
 /// `∂Φ_{n,k}/∂t_n = φ'(r_{n,k}) · (t_n − c_k) / r_{n,k}` (see
-/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`]).
+/// [`crate::terms::latent::LatentCoordValues::design_gradient_wrt_t`]).
 ///
 /// `length_scale = None` selects the scale-free pure-Duchon spectrum
 /// (matches `gam_pyffi::position_basis_derivative` for the 1-D case).
@@ -1291,7 +1291,7 @@ pub fn build_duchon_basis_design_and_jets(
 /// The full per-row gradient is reconstructed at the call site as
 /// `∂Φ_{n,k}/∂t_n = φ'(r_{n,k}) · (t_n − c_k) / r_{n,k}` (chain rule of the
 /// radial kernel w.r.t. its first argument), reusing
-/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`].
+/// [`crate::terms::latent::LatentCoordValues::design_gradient_wrt_t`].
 ///
 /// All radial derivatives are obtained in closed form from the half-integer
 /// Matérn polynomial-times-exponential representation; the underlying scalar
@@ -1580,7 +1580,7 @@ pub fn matern_input_location_hessian_nd(
 /// [`wahba_sphere_kernel_sobolev_derivative_dcos`].
 ///
 /// When `project_to_tangent` is `true`, each per-row gradient is projected
-/// through [`crate::terms::latent_coord::LatentManifold::Sphere`] onto
+/// through [`crate::terms::latent::LatentManifold::Sphere`] onto
 /// `T_{t_n} S^{dim-1}` as `g − (g · t_n) t_n`, which is the correct
 /// Riemannian input-location derivative for embedded-sphere latent updates.
 /// Passing `false` returns the un-projected ambient jet.
@@ -1613,7 +1613,7 @@ pub fn sphere_first_derivative_nd(
         );
     }
     let tangent_projector =
-        project_to_tangent.then_some(crate::terms::latent_coord::LatentManifold::Sphere { dim });
+        project_to_tangent.then_some(crate::terms::latent::LatentManifold::Sphere { dim });
     let mut out = Array3::<f64>::zeros((n_rows, n_centers, dim));
     let mut ambient = Array1::<f64>::zeros(dim);
     for n in 0..n_rows {

@@ -979,9 +979,9 @@ pub(crate) fn hash_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
 
 pub(crate) fn hash_aux_prior_strength(
     hasher: &mut Fingerprinter,
-    strength: crate::terms::latent_coord::AuxPriorStrength,
+    strength: crate::terms::latent::AuxPriorStrength,
 ) {
-    use crate::terms::latent_coord::AuxPriorStrength;
+    use crate::terms::latent::AuxPriorStrength;
     match strength {
         AuxPriorStrength::Auto => hasher.write_str("auto"),
         AuxPriorStrength::Fixed(value) => {
@@ -992,9 +992,9 @@ pub(crate) fn hash_aux_prior_strength(
 }
 
 pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
-    id_mode: &crate::terms::latent_coord::LatentIdMode,
+    id_mode: &crate::terms::latent::LatentIdMode,
 ) -> u64 {
-    use crate::terms::latent_coord::{AuxPriorFamily, LatentIdMode};
+    use crate::terms::latent::{AuxPriorFamily, LatentIdMode};
     let mut hasher = Fingerprinter::new();
     hasher.write_str("latent-id-mode-cache-v1");
     match id_mode {
@@ -1027,7 +1027,7 @@ pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
         }
         LatentIdMode::DimSelection { .. } => hasher.write_str("dim-selection"),
         LatentIdMode::AuxOutcome { head, .. } => {
-            use crate::terms::behavioral_head::AuxOutcomeFamily;
+            use crate::terms::decoders::behavioral_head::AuxOutcomeFamily;
             hasher.write_str("aux-outcome");
             match head.family() {
                 AuxOutcomeFamily::Binomial => hasher.write_str("binomial"),

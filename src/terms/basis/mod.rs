@@ -31,6 +31,7 @@ mod polylog;
 mod bspline_build;
 mod bspline_eval;
 mod center_selection;
+pub mod closed_form_operator;
 mod duchon_kernel_math;
 mod duchon_psi_derivatives;
 mod duchon_thinplate;
@@ -102,6 +103,7 @@ pub(crate) use cyclic::{
 pub use bspline_build::*;
 pub use bspline_eval::*;
 pub use center_selection::*;
+pub use closed_form_operator::ClosedFormPenaltyOperator;
 pub use duchon_kernel_math::*;
 pub use duchon_psi_derivatives::*;
 pub use duchon_thinplate::*;

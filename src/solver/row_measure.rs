@@ -1,6 +1,6 @@
 //! Row-measure handle for trust-region invariant enforcement.
 //!
-//! A `RowMeasure` is the explicit identity of the set of rows + per-row
+//! A `TrustRegionRowMeasure` is the explicit identity of the set of rows + per-row
 //! weights used to evaluate any one of {Hessian, gradient, objective}
 //! during a single inner trust-region iteration. The trust-region
 //! globalization computes
@@ -14,10 +14,10 @@
 //! different objectives and ρ can take any sign, producing the observed
 //! ρ = -0.05 with predicted_reduction = +7.378e6 sign flip.
 //!
-//! `RowMeasure::id` is a stable 64-bit content hash: equal masks
+//! `TrustRegionRowMeasure::id` is a stable 64-bit content hash: equal masks
 //! (`Arc<OuterScoreSubsample>` pointer equality OR identical mask
 //! contents) ⇒ equal ids; differing masks ⇒ differing ids with high
-//! probability. The TR loop captures one `RowMeasure` at the top of an
+//! probability. The TR loop captures one `TrustRegionRowMeasure` at the top of an
 //! iteration and hard-asserts that the id observed by each of the four
 //! quantities matches before computing ρ.
 
@@ -31,7 +31,7 @@ use crate::solver::outer_subsample::OuterScoreSubsample;
 /// The handle is `Clone` and cheap to copy; the `Arc` is shared, not
 /// duplicated.
 #[derive(Clone, Debug)]
-pub struct RowMeasure {
+pub struct TrustRegionRowMeasure {
     /// Stable 64-bit content hash. Same `mask` (by Arc pointer OR by
     /// row content) ⇒ same id; different `mask` ⇒ different id.
     pub id: u64,
@@ -40,7 +40,7 @@ pub struct RowMeasure {
     pub mask: Option<Arc<OuterScoreSubsample>>,
 }
 
-impl RowMeasure {
+impl TrustRegionRowMeasure {
     /// Full-data measure: walk `0..n` with weight 1.0 per row.
     pub fn full_data(n: usize) -> Self {
         Self {
@@ -60,7 +60,7 @@ impl RowMeasure {
         }
     }
 
-    /// Build a `RowMeasure` from blockwise-fit options. The outer
+    /// Build a `TrustRegionRowMeasure` from blockwise-fit options. The outer
     /// optimizer is the sole source of `outer_score_subsample`; inner
     /// paths read this once at the top of each TR iteration and freeze
     /// it for every quantity in that iteration.
@@ -80,7 +80,7 @@ impl RowMeasure {
             Some(m) => {
                 assert_eq!(
                     m.n_full, n,
-                    "RowMeasure n_full ({}) must match caller n ({})",
+                    "TrustRegionRowMeasure n_full ({}) must match caller n ({})",
                     m.n_full, n
                 );
                 let indices: Vec<usize> = m.mask.as_ref().clone();
@@ -133,9 +133,9 @@ mod tests {
 
     #[test]
     fn full_data_id_is_stable_per_n() {
-        let a = RowMeasure::full_data(100);
-        let b = RowMeasure::full_data(100);
-        let c = RowMeasure::full_data(101);
+        let a = TrustRegionRowMeasure::full_data(100);
+        let b = TrustRegionRowMeasure::full_data(100);
+        let c = TrustRegionRowMeasure::full_data(101);
         assert_eq!(a.id, b.id);
         assert_ne!(a.id, c.id);
         assert!(a.mask.is_none());
@@ -144,8 +144,8 @@ mod tests {
     #[test]
     fn subsample_id_matches_for_same_arc() {
         let s = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
-        let a = RowMeasure::subsample(Arc::clone(&s));
-        let b = RowMeasure::subsample(Arc::clone(&s));
+        let a = TrustRegionRowMeasure::subsample(Arc::clone(&s));
+        let b = TrustRegionRowMeasure::subsample(Arc::clone(&s));
         assert_eq!(a.id, b.id);
     }
 
@@ -153,8 +153,8 @@ mod tests {
     fn subsample_id_differs_for_different_arcs() {
         let s1 = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
         let s2 = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
-        let a = RowMeasure::subsample(s1);
-        let b = RowMeasure::subsample(s2);
+        let a = TrustRegionRowMeasure::subsample(s1);
+        let b = TrustRegionRowMeasure::subsample(s2);
         // Different Arc allocations ⇒ different ids; this is intentional
         // so the TR invariant catches mid-iteration mask rebuilds even
         // when the resulting mask happens to be content-equal.
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn indices_and_weights_full_data() {
-        let rm = RowMeasure::full_data(4);
+        let rm = TrustRegionRowMeasure::full_data(4);
         let (idx, w) = rm.indices_and_weights(4);
         assert_eq!(idx, vec![0, 1, 2, 3]);
         assert_eq!(w, vec![1.0, 1.0, 1.0, 1.0]);
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn indices_and_weights_subsample() {
         let s = Arc::new(OuterScoreSubsample::new(vec![0, 2], 4, 7));
-        let rm = RowMeasure::subsample(s);
+        let rm = TrustRegionRowMeasure::subsample(s);
         let (idx, w) = rm.indices_and_weights(4);
         assert_eq!(idx, vec![0, 2]);
         assert_eq!(w.len(), 4);

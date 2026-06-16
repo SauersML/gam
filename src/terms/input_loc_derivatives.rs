@@ -38,7 +38,7 @@
 //! The functions in this module are written in the style of the existing
 //! basis evaluators (caller-supplied output buffers, `BasisError` results)
 //! so they slot directly into the `LatentCoordValues::design_gradient_wrt_t`
-//! call site in `crate::terms::latent_coord` without an additional
+//! call site in `crate::terms::latent` without an additional
 //! materialization layer.
 
 use ndarray::{Array1, Array3, ArrayView2};
@@ -112,7 +112,7 @@ impl RadialInputKernel {
 ///
 /// This is the closed-form chain-rule reduction used by both the inner
 /// Newton step and the backward pyffi entrypoint. See
-/// [`crate::terms::latent_coord::LatentCoordValues::contract_gradient`] for
+/// [`crate::terms::latent::LatentCoordValues::contract_gradient`] for
 /// the canonical signature.
 pub fn contract_input_loc_gradient(
     grad_phi: ArrayView2<'_, f64>,

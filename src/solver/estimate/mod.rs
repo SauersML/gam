@@ -3168,7 +3168,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
 
     pub(crate) fn set_persistent_latent_values_fingerprint(
         &mut self,
-        id_mode: &crate::terms::latent_coord::LatentIdMode,
+        id_mode: &crate::terms::latent::LatentIdMode,
     ) {
         let fingerprint =
             crate::solver::estimate::reml::runtime::latent_id_mode_cache_fingerprint(id_mode);

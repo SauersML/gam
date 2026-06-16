@@ -7,7 +7,7 @@
 //! back to a non-strict comparison (e.g. `logit != 0.0`), which would wrongly
 //! activate the gate for negative or exactly-zero logits.
 
-use gam::terms::gated_decoder::GatedSAEDecoder;
+use gam::terms::decoders::gated_decoder::GatedSAEDecoder;
 use ndarray::{Array1, Array2, array};
 
 #[test]

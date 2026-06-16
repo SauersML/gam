@@ -440,7 +440,7 @@ impl AnalyticPenalty for TotalVariationPenalty {
 /// remaining `target.len() / n_eff` columns are penalized independently and
 /// summed.
 #[derive(Debug, Clone)]
-pub struct MonotonicityPenalty {
+pub struct ShapeMonotonicityPenalty {
     pub weight: f64,
     pub n_eff: usize,
     /// `+1.0` for non-decreasing, `-1.0` for non-increasing along the leading axis.
@@ -451,7 +451,7 @@ pub struct MonotonicityPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-impl MonotonicityPenalty {
+impl ShapeMonotonicityPenalty {
     #[must_use = "build error must be handled"]
     pub fn new(
         weight: f64,
@@ -462,20 +462,20 @@ impl MonotonicityPenalty {
     ) -> Result<Self, String> {
         if !(weight.is_finite() && weight > 0.0) {
             return Err(format!(
-                "MonotonicityPenalty::new requires finite weight > 0, got {weight}"
+                "ShapeMonotonicityPenalty::new requires finite weight > 0, got {weight}"
             ));
         }
         if n_eff == 0 {
-            return Err("MonotonicityPenalty::new requires n_eff > 0".to_string());
+            return Err("ShapeMonotonicityPenalty::new requires n_eff > 0".to_string());
         }
         if !(direction.is_finite() && direction.abs() > 0.0) {
             return Err(format!(
-                "MonotonicityPenalty::new requires finite non-zero direction (+1 or -1), got {direction}"
+                "ShapeMonotonicityPenalty::new requires finite non-zero direction (+1 or -1), got {direction}"
             ));
         }
         if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
             return Err(format!(
-                "MonotonicityPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
+                "ShapeMonotonicityPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
             ));
         }
         Ok(Self {
@@ -552,7 +552,7 @@ impl MonotonicityPenalty {
     }
 }
 
-impl AnalyticPenalty for MonotonicityPenalty {
+impl AnalyticPenalty for ShapeMonotonicityPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
     }

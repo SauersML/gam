@@ -166,8 +166,8 @@ impl Default for ArrowTrustRegionOptions {
 
 /// Opt-in Carson--Higham mixed-precision refinement for dense arrow solves.
 ///
-/// Default is [`MixedPrecisionPolicy::Off`]: exact f64 solves remain the default.
-/// [`MixedPrecisionPolicy::Certified`] stores f32 copies of the per-row Cholesky
+/// Default is [`ArrowMixedPrecisionPolicy::Off`]: exact f64 solves remain the default.
+/// [`ArrowMixedPrecisionPolicy::Certified`] stores f32 copies of the per-row Cholesky
 /// factors and dense Schur factor, solves corrections in f32, and recomputes the
 /// residual in f64 against the original arrow blocks. The standard refinement
 /// certificate is the normwise backward error
@@ -178,7 +178,7 @@ impl Default for ArrowTrustRegionOptions {
 /// when it fails, the solve reports [`MixedPrecisionStatus::F64Fallback`] and
 /// logs the reason before using the f64 path.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MixedPrecisionPolicy {
+pub enum ArrowMixedPrecisionPolicy {
     Off,
     Certified {
         max_refinement_steps: usize,
@@ -187,13 +187,13 @@ pub enum MixedPrecisionPolicy {
     },
 }
 
-impl Default for MixedPrecisionPolicy {
+impl Default for ArrowMixedPrecisionPolicy {
     fn default() -> Self {
         Self::Off
     }
 }
 
-impl MixedPrecisionPolicy {
+impl ArrowMixedPrecisionPolicy {
     pub fn certified() -> Self {
         Self::Certified {
             max_refinement_steps: DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS,
@@ -203,7 +203,7 @@ impl MixedPrecisionPolicy {
     }
 
     pub(crate) fn is_enabled(self) -> bool {
-        matches!(self, MixedPrecisionPolicy::Certified { .. })
+        matches!(self, ArrowMixedPrecisionPolicy::Certified { .. })
     }
 }
 
@@ -248,7 +248,7 @@ pub struct ArrowSolveOptions {
     /// Default `false`: ordinary solves keep the full guard.
     pub tolerate_ill_conditioning: bool,
     /// Opt-in certified mixed-precision direct solve. Default is off.
-    pub mixed_precision: MixedPrecisionPolicy,
+    pub mixed_precision: ArrowMixedPrecisionPolicy,
 }
 
 impl std::fmt::Debug for ArrowSolveOptions {
@@ -336,7 +336,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
-            mixed_precision: MixedPrecisionPolicy::Off,
+            mixed_precision: ArrowMixedPrecisionPolicy::Off,
         }
     }
 
@@ -351,7 +351,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
-            mixed_precision: MixedPrecisionPolicy::Off,
+            mixed_precision: ArrowMixedPrecisionPolicy::Off,
         }
     }
 
@@ -365,7 +365,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
-            mixed_precision: MixedPrecisionPolicy::Off,
+            mixed_precision: ArrowMixedPrecisionPolicy::Off,
         }
     }
 
@@ -379,7 +379,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
-            mixed_precision: MixedPrecisionPolicy::Off,
+            mixed_precision: ArrowMixedPrecisionPolicy::Off,
         }
     }
 
@@ -400,7 +400,7 @@ impl ArrowSolveOptions {
         self
     }
 
-    pub fn with_mixed_precision_policy(mut self, policy: MixedPrecisionPolicy) -> Self {
+    pub fn with_mixed_precision_policy(mut self, policy: ArrowMixedPrecisionPolicy) -> Self {
         self.mixed_precision = policy;
         self
     }
@@ -415,8 +415,8 @@ impl ArrowSolveOptions {
     #[must_use]
     pub fn with_streaming_mixed_precision_default(&self) -> Self {
         let mut out = self.clone();
-        if matches!(out.mixed_precision, MixedPrecisionPolicy::Off) {
-            out.mixed_precision = MixedPrecisionPolicy::certified();
+        if matches!(out.mixed_precision, ArrowMixedPrecisionPolicy::Off) {
+            out.mixed_precision = ArrowMixedPrecisionPolicy::certified();
         }
         out
     }

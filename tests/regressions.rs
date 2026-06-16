@@ -1,9 +1,13 @@
 //! Grouped integration-test crate root for regression / bug-hunt tests (issue #1146).
 //!
-//! The formerly-top-level `tests/bug_hunt_*.rs` crates are included here as modules
-//! so they link as ONE binary instead of one linker invocation each. Add new
-//! bug_hunt_* regression tests as a module here.
+//! The formerly-top-level regression, repro, issue, and bug-hunt crates are
+//! included here as modules so they link as ONE binary instead of one linker
+//! invocation each. Add new regression-family tests as a module here.
 
+#[path = "regressions/arrow_schur_bug_hunt.rs"]
+mod arrow_schur_bug_hunt;
+#[path = "regressions/bernoulli_marginal_slope_bug_hunt_1.rs"]
+mod bernoulli_marginal_slope_bug_hunt_1;
 #[path = "regressions/bug_hunt_1089_small_n_gaussian_double_penalty_terminates.rs"]
 mod bug_hunt_1089_small_n_gaussian_double_penalty_terminates;
 #[path = "regressions/bug_hunt_874_cyclic_bs_cc_outer_loop_terminates.rs"]
@@ -246,3 +250,77 @@ mod bug_hunt_wps_corrected_edf_below_conditional;
 mod bug_hunt_wps_weighted_gram_invariants;
 #[path = "regressions/bug_hunt_zero_weight_rows_not_equivalent_to_absent_rows.rs"]
 mod bug_hunt_zero_weight_rows_not_equivalent_to_absent_rows;
+#[path = "regressions/cache_bug_hunt_regressions.rs"]
+mod cache_bug_hunt_regressions;
+#[path = "regressions/cubic_cell_kernel_bug_hunt.rs"]
+mod cubic_cell_kernel_bug_hunt;
+#[path = "regressions/duchon_collocation_symmetry_psd_regression.rs"]
+mod duchon_collocation_symmetry_psd_regression;
+#[path = "regressions/faer_ndarray_bug_hunt.rs"]
+mod faer_ndarray_bug_hunt;
+#[path = "regressions/gamlss_binomial_location_scale_bug_hunt_3_of_3.rs"]
+mod gamlss_binomial_location_scale_bug_hunt_3_of_3;
+#[path = "regressions/gamlss_joint_derivatives_fd_bug_hunt.rs"]
+mod gamlss_joint_derivatives_fd_bug_hunt;
+#[path = "regressions/geometry_bug_hunt.rs"]
+mod geometry_bug_hunt;
+#[path = "regressions/gpu_bug_hunt_runtime_driver_diagnostics_memory.rs"]
+mod gpu_bug_hunt_runtime_driver_diagnostics_memory;
+#[path = "regressions/inference_bug_hunt.rs"]
+mod inference_bug_hunt;
+#[path = "regressions/issue_225_periodic_kernel.rs"]
+mod issue_225_periodic_kernel;
+#[path = "regressions/issue_239_poincare_self_distance.rs"]
+mod issue_239_poincare_self_distance;
+#[path = "regressions/issue_531_pure_duchon_probit_repro.rs"]
+mod issue_531_pure_duchon_probit_repro;
+#[path = "regressions/issue_532_wahba_sphere_intercept_collision.rs"]
+mod issue_532_wahba_sphere_intercept_collision;
+#[path = "regressions/issue_700_sz_factor_smooth_fits_and_predicts.rs"]
+mod issue_700_sz_factor_smooth_fits_and_predicts;
+#[path = "regressions/issue_704_by_factor_spatial_freeze_replay.rs"]
+mod issue_704_by_factor_spatial_freeze_replay;
+#[path = "regressions/issue_750_duchon_hybrid_length_scale_default.rs"]
+mod issue_750_duchon_hybrid_length_scale_default;
+#[path = "regressions/large_scale_convergence_regression.rs"]
+mod large_scale_convergence_regression;
+#[path = "regressions/large_scale_dense_regression_guard.rs"]
+mod large_scale_dense_regression_guard;
+#[path = "regressions/latent_cache_inner_bug_hunt.rs"]
+mod latent_cache_inner_bug_hunt;
+#[path = "regressions/measure_jet_aniso_isotropic_fallback_regression.rs"]
+mod measure_jet_aniso_isotropic_fallback_regression;
+#[path = "regressions/new_smooths_misc_regressions.rs"]
+mod new_smooths_misc_regressions;
+#[path = "regressions/regression_affine_anchor_moment_both_tails.rs"]
+mod regression_affine_anchor_moment_both_tails;
+#[path = "regressions/regression_apply_inverse_link_probit_independent_reference.rs"]
+mod regression_apply_inverse_link_probit_independent_reference;
+#[path = "regressions/regression_decoder_incoherence_majorizer_is_psd_gauss_newton.rs"]
+mod regression_decoder_incoherence_majorizer_is_psd_gauss_newton;
+#[path = "regressions/regression_ibp_assignment_hvp_block_structure.rs"]
+mod regression_ibp_assignment_hvp_block_structure;
+#[path = "regressions/regression_scale_basis_parsimony_501.rs"]
+mod regression_scale_basis_parsimony_501;
+#[path = "regressions/reml_laml_rho_derivatives_fd_bug_hunt.rs"]
+mod reml_laml_rho_derivatives_fd_bug_hunt;
+#[path = "regressions/reml_runtime_bug_hunt_ift_dispatch.rs"]
+mod reml_runtime_bug_hunt_ift_dispatch;
+#[path = "regressions/repro_1066_iso_kappa_2d_binomial.rs"]
+mod repro_1066_iso_kappa_2d_binomial;
+#[path = "regressions/repro_gamlss_linesearch_failure.rs"]
+mod repro_gamlss_linesearch_failure;
+#[path = "regressions/smooth_fit_term_collection_bug_hunt_2_3.rs"]
+mod smooth_fit_term_collection_bug_hunt_2_3;
+#[path = "regressions/solver_gpu_pirls_bug_hunt.rs"]
+mod solver_gpu_pirls_bug_hunt;
+#[path = "regressions/sparse_exact_bug_hunt.rs"]
+mod sparse_exact_bug_hunt;
+#[path = "regressions/thin_plate_workspace_equivalence_regression.rs"]
+mod thin_plate_workspace_equivalence_regression;
+#[path = "regressions/tps_smallk_basis_regression.rs"]
+mod tps_smallk_basis_regression;
+#[path = "regressions/warm_start_quality_regression.rs"]
+mod warm_start_quality_regression;
+#[path = "regressions/workflow_bug_hunt.rs"]
+mod workflow_bug_hunt;

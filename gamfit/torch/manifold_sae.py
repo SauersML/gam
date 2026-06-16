@@ -23,8 +23,11 @@ registration, shape plumbing, and torch-side glue.
 Parity contract
 ---------------
 :meth:`ManifoldSAE.fit` delegates to :func:`gamfit.sae_manifold_fit`, which
-shells out to ``sae_manifold_fit_minimal`` in Rust. Identical numerics to the
-closed-form path are structural.
+shells out to ``sae_manifold_fit_minimal`` in Rust. The module's current
+amortized encoder supplies the real ``t_init`` / ``a_init`` warm-start slots,
+and the Rust certified inner solve refines those seeds to stationarity. Direct
+closed-form parity is therefore obtained by passing the same initializers to
+``gamfit.sae_manifold_fit``.
 
 """
 
@@ -868,6 +871,28 @@ class ManifoldSAE(nn.Module):
         amp_logits = raw[..., F * d :]
         return raw_positions, amp_logits
 
+    @torch.no_grad()
+    def _closed_form_initializers(self, x: torch.Tensor) -> dict[str, np.ndarray]:
+        """Amortized encoder seeds for the Rust closed-form joint solve.
+
+        ``gamfit.sae_manifold_fit`` already owns the production warm-start
+        contract: ``t_init`` is ``(K, N, D_max)`` per-atom coordinates and
+        ``a_init`` is ``(N, K)`` raw assignment logits. This helper is the torch
+        cotrain bridge for #1154 Design A: predict those seeds with the current
+        encoder, then let the certified Rust inner solve refine to stationarity.
+        """
+        raw_positions, amp_logits = self._encode(x)
+        raw_with_anchor = raw_positions + self.atom_raw_anchor.unsqueeze(0)
+        positions = _project_to_manifold(
+            raw_with_anchor, self.cfg.atom_manifold, self.cfg.intrinsic_rank
+        )
+        t_init = positions.detach().cpu().numpy().transpose(1, 0, 2)
+        a_init = amp_logits.detach().cpu().numpy()
+        return {
+            "t_init": np.ascontiguousarray(t_init, dtype=np.float64),
+            "a_init": np.ascontiguousarray(a_init, dtype=np.float64),
+        }
+
     def forward(self, x: torch.Tensor) -> ManifoldSAEOutput:
         if not isinstance(x, torch.Tensor):
             raise TypeError("ManifoldSAE forward expects a torch.Tensor")
@@ -929,10 +954,9 @@ class ManifoldSAE(nn.Module):
         # and otherwise runs the frozen-decoder out-of-sample Newton solve
         # (``sae_manifold_predict_oos``) — the SAME per-row latent inner problem
         # the joint fit solved — holding the fitted decoder blocks / basis /
-        # anchors fixed, then applies the decoder to get x_hat. The random
-        # encoder/anchors play no role because the closed-form solver carries
-        # its own decoder; OOS reconstruction is the transductive encode-by-
-        # inner-solve, not an amortized encoder pass.
+        # anchors fixed, then applies the decoder to get x_hat. The encoder did
+        # participate in .fit() by providing the warm-start seeds; after the
+        # certified solve, the fitted Rust state is authoritative.
         fit = self._last_fit
         assert fit is not None
         F = int(self.cfg.n_atoms)
@@ -991,13 +1015,13 @@ class ManifoldSAE(nn.Module):
         returned fit (also cached as ``self._last_fit``) is the source of truth.
         :meth:`forward` is rerouted through :meth:`_forward_from_closed_form`,
         which reconstructs ``x_hat`` / ``positions`` / ``assignments`` /
-        ``reml_score`` from the fit and ignores the module's ``encoder`` /
-        ``atom_raw_anchor`` parameters: the closed-form solver carries its own
-        decoder and per-atom anchors, so there is no amortized encoder to copy
-        back. The solved ``decoder_blocks`` and (when the solve used a common
-        Duchon center set) the ``duchon_centers`` buffer are folded into the
-        module, and the full solved state is captured in the ``_fit_blob``
-        buffer for serialization.
+        ``reml_score`` from the fit. Before the solve, the module's encoder
+        supplies ``t_init`` / ``a_init`` to warm-start the Rust certified inner
+        solve; after stationarity, the closed-form solver carries its own
+        decoder and per-atom anchors. The solved ``decoder_blocks`` and (when
+        the solve used a common Duchon center set) the ``duchon_centers`` buffer
+        are folded into the module, and the full solved state is captured in the
+        ``_fit_blob`` buffer for serialization.
 
         A solved module is genuinely usable:
 
@@ -1016,9 +1040,10 @@ class ManifoldSAE(nn.Module):
           to persist the fit object directly.)
 
         A solved module must still NOT be used for gradient training /
-        fine-tuning: the encoder and anchor are stale relative to the
-        closed-form decoder, so their gradients are meaningless and would
-        corrupt the fit. Build a fresh, unfitted module for gradient training.
+        fine-tuning: the encoder and anchor were warm-start predictors, not the
+        post-refinement fitted state, so their gradients are stale relative to
+        the closed-form decoder. Build a fresh, unfitted module for gradient
+        training.
         """
         if not isinstance(x, torch.Tensor):
             raise TypeError("ManifoldSAE.fit expects a torch.Tensor")
@@ -1064,6 +1089,7 @@ class ManifoldSAE(nn.Module):
         # threshold is meaningless and is not forwarded.
         if cfg.closed_form_assignment() == "jumprelu":
             kwargs["jumprelu_threshold"] = float(cfg.sparsity.jumprelu_threshold)
+        kwargs.update(self._closed_form_initializers(x))
         fit = _closed_form_sae_manifold_fit(
             X=to_numpy_f64(x),
             K=int(cfg.n_atoms),

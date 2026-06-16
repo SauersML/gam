@@ -11,13 +11,14 @@
 //!   distinct seeded directions, with the same two rules written as general
 //!   submask / set-partition loops.
 //!
-//! The DATA layouts are legitimately different (a complete small-`K` tower
+//! The data layouts are legitimately different (a complete small-`K` tower
 //! vs. a handful of directions of a large-`K` expression) and stay separate.
 //! What is identical is the *combinatorics*: for a group of differentiation
 //! slots, the Leibniz rule sums over subsets of those slots and the Faà di
 //! Bruno rule sums over their set-partitions. This module owns that
-//! combinatorics ONCE, as layout-agnostic walkers parameterised by closures
-//! that read each representation's own derivative for a slot-group. Both
+//! combinatorics once, as a layout-agnostic [`JetAlgebra`] trait plus walkers
+//! parameterised by closures that read each representation's own derivative
+//! for a slot-group. Both
 //! `Tower4` and `MultiDirJet` route their `mul` / `compose_unary` through
 //! these walkers, so a fix to the rule is a fix to both — and a bit-exact
 //! equivalence test (see `tests`) proves the two layouts agree.
@@ -49,7 +50,10 @@ where
     R: FnMut(&[usize]) -> f64,
 {
     let m = positions.len();
-    debug_assert!(m <= usize::BITS as usize);
+    assert!(
+        m <= usize::BITS as usize,
+        "too many differentiation slots for subset enumeration"
+    );
     let mut subset = SlotBuf::new();
     let mut complement = SlotBuf::new();
     let mut total = 0.0;
@@ -102,6 +106,37 @@ where
         total += prod;
     });
     total
+}
+
+/// Layout hook for jets that share the Faà di Bruno unary-composition kernel.
+///
+/// `DERIVS` is the length of the unary derivative stack: `5` for fourth-order
+/// jets (`[f, f′, f″, f‴, f⁗]`) and `3` for second-order jets. Implementors own
+/// how slot lists map to their storage; the kernel owns the set-partition rule.
+pub(crate) trait JetAlgebra<const DERIVS: usize>: Sized {
+    /// Read the derivative for a slot list. An empty list is the value channel.
+    fn derivative(&self, positions: &[usize]) -> f64;
+
+    /// Build a jet with every stored derivative filled by `f(positions)`.
+    fn map_derivatives<F>(&self, f: F) -> Self
+    where
+        F: FnMut(&[usize]) -> f64;
+
+    /// Exact multivariate Faà di Bruno composition.
+    fn compose_unary(&self, derivs: [f64; DERIVS]) -> Self {
+        compose_unary_kernel(self, derivs)
+    }
+}
+
+/// The single unary-composition kernel shared by tower and bitmask jets.
+#[inline]
+pub(crate) fn compose_unary_kernel<J, const DERIVS: usize>(inner: &J, derivs: [f64; DERIVS]) -> J
+where
+    J: JetAlgebra<DERIVS>,
+{
+    inner.map_derivatives(|positions| {
+        faa_di_bruno(positions, &derivs, |block| inner.derivative(block))
+    })
 }
 
 /// A tiny inline stack of slot indices — no heap traffic on the hot per-row

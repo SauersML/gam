@@ -268,7 +268,7 @@ pub(crate) fn mixed_precision_reduced_beta(
     rhs: &Array1<f64>,
     options: &ArrowSolveOptions,
 ) -> Option<Array1<f64>> {
-    let MixedPrecisionPolicy::Certified {
+    let ArrowMixedPrecisionPolicy::Certified {
         max_refinement_steps,
         residual_relative_tolerance,
         kappa_unit_roundoff_margin,
@@ -1286,8 +1286,7 @@ impl JacobiPreconditioner {
             use rayon::prelude::*;
             const CHUNK: usize = 64;
             let n_blocks = block_offsets.len();
-            let block_dims: Vec<usize> =
-                block_offsets.iter().map(|r| r.end - r.start).collect();
+            let block_dims: Vec<usize> = block_offsets.iter().map(|r| r.end - r.start).collect();
             let partials: Vec<Vec<Array2<f64>>> = (0..n)
                 .into_par_iter()
                 .chunks(CHUNK)

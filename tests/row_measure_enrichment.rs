@@ -1,5 +1,5 @@
 //! Discovery-recall control for the Fisher-mass enrichment producer
-//! (`RowMeasure`, role (c) of #980).
+//! (`EnrichmentRowMeasure`, role (c) of #980).
 //!
 //! # The scenario this guards
 //!
@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use gam::inference::row_measure::{MeasureProvenance, RowMeasure};
+use gam::inference::row_measure::{EnrichmentRowMeasure, MeasureProvenance};
 use gam::inference::row_metric::RowMetric;
 use ndarray::{Array1, Array2};
 
@@ -71,7 +71,7 @@ fn enrichment_oversamples_rare_loud_feature_without_touching_loss() {
     let (metric, rare_rows) = plant_dataset(n_common, n_rare, quiet_amp, loud_amp);
 
     // ---- Baseline: uniform sampling under-represents the rare feature -------
-    let uniform = RowMeasure::uniform(n);
+    let uniform = EnrichmentRowMeasure::uniform(n);
     assert_eq!(uniform.provenance(), MeasureProvenance::Uniform);
     let batch = 200usize;
     let uniform_rep: f64 = uniform
@@ -89,7 +89,7 @@ fn enrichment_oversamples_rare_loud_feature_without_touching_loss() {
     );
 
     // ---- Enrichment: Fisher-mass measure oversamples the rare-loud rows -----
-    let enriched = RowMeasure::from_metric(&metric);
+    let enriched = EnrichmentRowMeasure::from_metric(&metric);
     assert!(
         enriched.is_enriched(),
         "factored metric must produce a real Fisher-mass measure"
@@ -144,7 +144,7 @@ fn enrichment_oversamples_rare_loud_feature_without_touching_loss() {
 
     // ---- INVARIANT: the enrichment touches NO per-row loss -----------------
     // The criterion-facing residual square `quad_form(row, r)` must be exactly
-    // what the metric reports independent of whether any RowMeasure was built.
+    // what the metric reports independent of whether any EnrichmentRowMeasure was built.
     // We compute it from a fresh metric (no measure) and from the same metric
     // after a measure was produced, and require bit-for-bit equality.
     let (metric_no_measure, _) = plant_dataset(n_common, n_rare, quiet_amp, loud_amp);
@@ -154,7 +154,7 @@ fn enrichment_oversamples_rare_loud_feature_without_touching_loss() {
         let without_measure = metric_no_measure.quad_form(row, probe.view());
         assert_eq!(
             with_measure, without_measure,
-            "row {row}: producing a RowMeasure must not change any per-row loss"
+            "row {row}: producing an EnrichmentRowMeasure must not change any per-row loss"
         );
         // And the measure weight is NOT a factor in that loss: the weight is a
         // sampling probability, categorically separate from the residual square.
@@ -172,7 +172,7 @@ fn no_harvest_is_todays_uniform_behavior() {
     // uniform: every row equal, no enrichment. This is the graceful-degradation
     // guarantee — absent harvest reproduces today's "look at every row equally".
     let metric = RowMetric::euclidean(64, 4).expect("euclidean metric");
-    let measure = RowMeasure::from_metric(&metric);
+    let measure = EnrichmentRowMeasure::from_metric(&metric);
     assert_eq!(measure.provenance(), MeasureProvenance::Uniform);
     assert!(!measure.is_enriched());
     let expect = 1.0 / 64.0;

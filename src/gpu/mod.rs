@@ -31,7 +31,7 @@ pub use cpu_traits::{ExecutionTarget, MatrixLocation};
 pub use device::GpuDeviceInfo;
 pub use gpu_error::GpuError;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
-pub use policy::{GpuDispatchPolicy, MixedPrecisionPolicy};
+pub use policy::{GpuDispatchPolicy, GpuMixedPrecisionPolicy};
 pub use pool::{balanced_partition, scatter_batched};
 pub use profile::{KernelStat, KernelStatsSnapshot};
 pub use runtime::GpuRuntime;
@@ -51,6 +51,12 @@ pub use runtime::GpuRuntime;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::OnceLock;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendStatus {
+    CudaUnavailable,
+    CudaReady,
+}
 
 /// User-facing GPU backend policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

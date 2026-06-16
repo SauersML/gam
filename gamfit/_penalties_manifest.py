@@ -68,7 +68,7 @@ PENALTY_MANIFEST = (
     },
     {
         "kind": "monotonicity",
-        "rust": "Monotonicity:MonotonicityPenalty",
+        "rust": "Monotonicity:ShapeMonotonicityPenalty",
         "python": "MonotonicityPenalty",
         "row_block_diagonal": False,
     },

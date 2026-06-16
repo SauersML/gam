@@ -273,8 +273,7 @@ fn cliff_scale_duchon_auto_routes_to_cascade_and_recovers_truth() {
     // count n-independent (tens, not thousands); staying far below the
     // `CG_MAX_ITERS = 4000` blow-up cap is the structural O(n·polylog) tell.
     assert!(
-        fit.certificate.solve_rel_residual.is_finite()
-            && fit.certificate.solve_rel_residual < 1e-3,
+        fit.certificate.solve_rel_residual.is_finite() && fit.certificate.solve_rel_residual < 1e-3,
         "cascade solve did not converge: backward error {}",
         fit.certificate.solve_rel_residual
     );

@@ -19,7 +19,7 @@
 //! choice" failure mode the certificate exists to prevent.
 
 use gam::terms::CurvatureWalkReport;
-use gam::terms::latent_coord::LatentManifold;
+use gam::terms::latent::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,

@@ -23,7 +23,6 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when general-mcmc clones the target.
 
-use super::polya_gamma::PolyaGamma;
 use crate::construction::CanonicalPenalty;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::estimate::reml::penalty_logdet::PenaltyPseudologdet;
@@ -32,6 +31,7 @@ use crate::estimate::{
 };
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
 use crate::families::wiggle::monotone_wiggle_basis_with_derivative_order;
+use crate::gpu::kernels::polya_gamma::{PgSeed, PolyaGammaBatchInput};
 use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
@@ -1728,7 +1728,7 @@ mod tests {
         UnifiedFitResultParts,
     };
     use crate::matrix::DesignMatrix;
-    use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
+    use crate::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
     use crate::types::{
         InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
         ResponseFamily, RhoPrior, StandardLink,
@@ -3535,7 +3535,7 @@ mod tests {
         let x_exit = array![[1.0, 0.6]];
         let x_derivative = array![[0.0, 1.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let monotonicity = SurvivalMonotonicityPenalty { tolerance: 3.0 };
         let mode = array![0.0, 0.0];
         let hessian = Array2::<f64>::eye(2);
 
@@ -3578,7 +3578,7 @@ mod tests {
         let x_entry = array![[0.2, 0.1]];
         let x_exit = array![[0.6, 0.3]];
         let x_derivative = array![[1.0, 0.0]];
-        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let monotonicity = SurvivalMonotonicityPenalty { tolerance: 3.0 };
         let mode = array![0.0, 0.0];
         let hessian = Array2::<f64>::eye(2);
         let z = array![std::f64::consts::LN_2, 0.0];
@@ -3651,7 +3651,7 @@ mod tests {
         // Zero derivative design so derivative_offset_exit drives d_eta/dt.
         let x_derivative = array![[0.0, 0.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let monotonicity = SurvivalMonotonicityPenalty { tolerance: 3.0 };
         let mode = array![0.0, 0.0];
         let hessian = Array2::<f64>::eye(2);
         let z = array![0.0, 0.0];
@@ -3723,7 +3723,7 @@ mod tests {
         let x_exit = array![[1.0, 0.0]];
         let x_derivative = array![[0.0, 0.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
-        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let monotonicity = SurvivalMonotonicityPenalty { tolerance: 3.0 };
         let mode = array![0.0, 0.0];
         let hessian = Array2::<f64>::eye(2);
         let z = array![0.0, 0.0];
@@ -3795,7 +3795,7 @@ mod tests {
         let x_exit = array![[0.4, 0.2, 0.3], [0.6, 0.1, 0.3]];
         // First row constrains only column 0, second row constrains columns 0 and 1.
         let x_derivative = array![[1.0, 0.0, 0.0], [0.5, 1.0, 0.0]];
-        let monotonicity = MonotonicityPenalty { tolerance: 3.0 };
+        let monotonicity = SurvivalMonotonicityPenalty { tolerance: 3.0 };
         let mode = array![4.0, 2.0, 0.0];
         let hessian = Array2::<f64>::eye(3);
         let z = array![0.05, -0.1, 0.15];
@@ -3941,6 +3941,37 @@ fn chain_stream_seed(seed: u64, chain: usize, stream: u64) -> u64 {
 #[inline]
 fn nuts_transition_seed(seed: u64, stream: u64) -> u64 {
     splitmix64(seed ^ stream ^ 0xA24B_AED4_963E_E407)
+}
+
+#[inline]
+fn gibbs_pg_seed(seed: u64, chain: usize, stream: u64, iter: usize) -> u64 {
+    chain_stream_seed(
+        seed,
+        chain,
+        stream ^ ((iter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    )
+}
+
+fn draw_logit_pg1_omega(
+    shapes: ArrayView1<'_, u32>,
+    tilts: ArrayView1<'_, f64>,
+    seed: u64,
+    out: &mut Array1<f64>,
+) -> Result<(), String> {
+    if out.len() != tilts.len() {
+        return Err(HmcError::DimensionMismatch {
+            reason: "draw_logit_pg1_omega: output length mismatch".to_string(),
+        }
+        .into());
+    }
+    let draws = crate::gpu::kernels::polya_gamma::draw_batch(PolyaGammaBatchInput {
+        shapes,
+        tilts,
+        seed: PgSeed(seed),
+    })?;
+    out.assign(&draws);
+    out.mapv_inplace(|v| v.max(1.0e-12));
+    Ok(())
 }
 
 /// Parameter dimension above which the posterior is treated as "high-dimensional"
@@ -4345,6 +4376,7 @@ pub fn run_logit_polya_gamma_gibbs(
     let mut samples_array = Array3::<f64>::zeros((config.n_chains, config.n_samples, p));
     let mut eta = Array1::<f64>::zeros(n);
     let mut omega = Array1::<f64>::ones(n);
+    let pg_shapes = Array1::<u32>::from_elem(n, 1);
     let mut xw = x.to_owned();
     let mut xt_omega_x = Array2::<f64>::zeros((p, p));
     let penalty = penalty_matrix.to_owned();
@@ -4361,13 +4393,10 @@ pub fn run_logit_polya_gamma_gibbs(
 
     for chain in 0..config.n_chains {
         progress.begin_chain(chain, "polya-gamma gibbs");
-        let mut pg_rng =
-            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x4D94_DF4E_5D72_81AB));
         let mut init_rng =
             StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0xB3C4_5A1F_8E9D_7632));
         let mut draw_rng =
             StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x17A9_26D5_4C1B_E083));
-        let pg = PolyaGamma::new();
         let mut beta = mode.to_owned();
         // Small jitter so chains are not perfectly coupled.
         for j in 0..p {
@@ -4376,9 +4405,12 @@ pub fn run_logit_polya_gamma_gibbs(
 
         for iter in 0..n_iter {
             eta.assign(&crate::faer_ndarray::fast_av(&x, &beta));
-            for i in 0..n {
-                omega[i] = pg.draw(&mut pg_rng, eta[i]).max(1e-12);
-            }
+            draw_logit_pg1_omega(
+                pg_shapes.view(),
+                eta.view(),
+                gibbs_pg_seed(config.seed, chain, 0x4D94_DF4E_5D72_81AB, iter),
+                &mut omega,
+            )?;
 
             // Build Xweighted = diag(sqrt(ω)) X and compute X^T Ω X via faer GEMM.
             // Per-row scaling is fully independent across rows.
@@ -4521,6 +4553,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     let penalty = penalty_matrix.to_owned();
     let mut eta = Array1::<f64>::zeros(n);
     let mut omega = Array1::<f64>::ones(n);
+    let pg_shapes = Array1::<u32>::from_elem(n, 1);
     let mut xw = x.to_owned();
     let mut xt_omega_x = Array2::<f64>::zeros((p, p));
     let mut q = Array2::<f64>::zeros((p, p));
@@ -4531,13 +4564,10 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 
     let mut kept = 0usize;
     for chain in 0..config.n_chains {
-        let mut pg_rng =
-            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x83F1_56C9_A7E0_2D4B));
         let mut init_rng =
             StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x28F0_7B65_1A4D_C93E));
         let mut draw_rng =
             StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0xC642_6E35_B5A9_1D80));
-        let pg = PolyaGamma::new();
         let mut beta = mode.to_owned();
         for j in 0..p {
             beta[j] += 0.05 * sample_standard_normal(&mut init_rng);
@@ -4545,9 +4575,12 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 
         for iter in 0..n_iter {
             eta.assign(&crate::faer_ndarray::fast_av(&x, &beta));
-            for i in 0..n {
-                omega[i] = pg.draw(&mut pg_rng, eta[i]).max(1e-12);
-            }
+            draw_logit_pg1_omega(
+                pg_shapes.view(),
+                eta.view(),
+                gibbs_pg_seed(config.seed, chain, 0x83F1_56C9_A7E0_2D4B, iter),
+                &mut omega,
+            )?;
 
             ndarray::Zip::from(xw.rows_mut())
                 .and(x.rows())
@@ -5082,7 +5115,7 @@ pub struct SurvivalFlatInputs<'a> {
 pub struct SurvivalNutsInputs<'a> {
     pub flat: SurvivalFlatInputs<'a>,
     pub penalties: crate::survival::PenaltyBlocks,
-    pub monotonicity: crate::survival::MonotonicityPenalty,
+    pub monotonicity: crate::survival::SurvivalMonotonicityPenalty,
     pub spec: crate::survival::SurvivalSpec,
     pub structurally_monotonic: bool,
     pub structural_time_columns: usize,
@@ -7528,7 +7561,7 @@ pub fn run_joint_beta_rho_sampling(
 mod survival_hmc {
     use super::*;
     use crate::survival::{
-        MonotonicityPenalty, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec,
+        PenaltyBlocks, SurvivalEngineInputs, SurvivalMonotonicityPenalty, SurvivalSpec,
         WorkingModelSurvival,
     };
 
@@ -7567,7 +7600,7 @@ mod survival_hmc {
             offset_eta_exit: Option<ArrayView1<'_, f64>>,
             offset_derivative_exit: Option<ArrayView1<'_, f64>>,
             penalties: PenaltyBlocks,
-            monotonicity: MonotonicityPenalty,
+            monotonicity: SurvivalMonotonicityPenalty,
             spec: SurvivalSpec,
             structurally_monotonic: bool,
             structural_time_columns: usize,
@@ -7691,7 +7724,7 @@ mod survival_hmc {
         eta_offset_exit: Option<ArrayView1<'_, f64>>,
         derivative_offset_exit: Option<ArrayView1<'_, f64>>,
         penalties: PenaltyBlocks,
-        monotonicity: MonotonicityPenalty,
+        monotonicity: SurvivalMonotonicityPenalty,
         spec: SurvivalSpec,
         structurally_monotonic: bool,
         structural_time_columns: usize,
@@ -7757,7 +7790,7 @@ mod survival_hmc {
 pub fn run_survival_nuts_sampling_flattened<'a>(
     flat: SurvivalFlatInputs<'a>,
     penalties: crate::survival::PenaltyBlocks,
-    monotonicity: crate::survival::MonotonicityPenalty,
+    monotonicity: crate::survival::SurvivalMonotonicityPenalty,
     spec: crate::survival::SurvivalSpec,
     structurally_monotonic: bool,
     structural_time_columns: usize,

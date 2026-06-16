@@ -500,11 +500,19 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // dense fast path is structurally inapplicable.
         let jf_marg = match self.family.marginal_design.as_dense_ref() {
             Some(dense) => dense.dot(&f_marg),
-            None => self::axis_jf_via_column_dot(&self.family.marginal_design, &f_marg, n_rows),
+            None => crate::families::row_kernel::row_kernel_design_jf_column_dot(
+                &self.family.marginal_design,
+                &f_marg,
+                n_rows,
+            ),
         };
         let jf_logs = match self.family.logslope_design.as_dense_ref() {
             Some(dense) => dense.dot(&f_logs),
-            None => self::axis_jf_via_column_dot(&self.family.logslope_design, &f_logs, n_rows),
+            None => crate::families::row_kernel::row_kernel_design_jf_column_dot(
+                &self.family.logslope_design,
+                &f_logs,
+                n_rows,
+            ),
         };
 
         assert_eq!(jf_marg.dim(), (n_rows, rank));
@@ -1185,26 +1193,6 @@ impl BernoulliRigidRowKernel {
                 .collect::<Result<Vec<_>, _>>()
         }
     }
-}
-
-/// Per-column matrix-vector dispatch for `DesignMatrix · F_block` when
-/// no contiguous dense backing is available (sparse or operator-backed
-/// designs). Mirrors what the per-row reference path does row-by-row,
-/// but as `rank` batched mat-vec products so the underlying operator
-/// can amortise per-call dispatch.
-pub(crate) fn axis_jf_via_column_dot(
-    design: &crate::linalg::matrix::DesignMatrix,
-    f_block: &Array2<f64>,
-    n_rows: usize,
-) -> Array2<f64> {
-    let rank = f_block.ncols();
-    let mut out = Array2::<f64>::zeros((n_rows, rank));
-    for c in 0..rank {
-        let col_owned = f_block.column(c).to_owned();
-        let result = design.dot(&col_owned);
-        out.column_mut(c).assign(&result);
-    }
-    out
 }
 
 pub(super) struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {

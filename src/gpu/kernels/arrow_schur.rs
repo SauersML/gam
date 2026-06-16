@@ -239,7 +239,9 @@ pub fn solve_arrow_newton_step_fused_force(
             reason: "ridge is NaN".to_string(),
         });
     }
-    if crate::gpu::kernels::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k).is_none() {
+    if crate::gpu::kernels::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k)
+        .is_none()
+    {
         return Err(ArrowSchurGpuFailure::Unavailable);
     }
     #[cfg(not(target_os = "linux"))]
@@ -1558,8 +1560,9 @@ mod cuda {
     /// `(p_max, r_template)` pair selects the shared-memory layout baked into
     /// the kernel source.
     struct FusedModuleCache {
-        modules:
-            Mutex<HashMap<crate::gpu::kernels::arrow_schur_nvrtc::FusedModuleCacheKey, Arc<CudaModule>>>,
+        modules: Mutex<
+            HashMap<crate::gpu::kernels::arrow_schur_nvrtc::FusedModuleCacheKey, Arc<CudaModule>>,
+        >,
     }
 
     fn fused_module_cache() -> &'static FusedModuleCache {

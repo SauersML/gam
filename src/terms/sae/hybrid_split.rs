@@ -33,7 +33,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::solver::evidence::{
     HybridAtomCandidate, HybridAtomChoice, HybridSplitSelection, select_hybrid_split,
 };
-use crate::terms::latent_coord::LatentManifold;
+use crate::terms::latent::LatentManifold;
 use crate::terms::sae::chart_canonicalization::d1_atom_fitted_turning;
 use crate::terms::sae::manifold::SaeManifoldAtom;
 

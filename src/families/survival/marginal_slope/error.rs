@@ -57,26 +57,14 @@ impl std::fmt::Display for JointPreflightBlock {
     }
 }
 
-impl std::fmt::Display for SurvivalMarginalSlopeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SurvivalMarginalSlopeError::InvalidInput { reason }
-            | SurvivalMarginalSlopeError::IncompatibleDimensions { reason }
-            | SurvivalMarginalSlopeError::MonotonicityViolation { reason }
-            | SurvivalMarginalSlopeError::NumericalFailure { reason }
-            | SurvivalMarginalSlopeError::IntegrationFailed { reason }
-            | SurvivalMarginalSlopeError::UnsupportedConfiguration { reason } => {
-                f.write_str(reason)
-            }
-        }
-    }
-}
-
-impl std::error::Error for SurvivalMarginalSlopeError {}
-
-impl From<SurvivalMarginalSlopeError> for String {
-    fn from(err: SurvivalMarginalSlopeError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    SurvivalMarginalSlopeError {
+        InvalidInput,
+        IncompatibleDimensions,
+        MonotonicityViolation,
+        NumericalFailure,
+        IntegrationFailed,
+        UnsupportedConfiguration,
     }
 }
 

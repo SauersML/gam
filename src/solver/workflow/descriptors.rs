@@ -22,9 +22,9 @@ use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, IBPAssignmentPenalty,
     IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
-    MonotonicityPenalty, NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
-    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ShapeMonotonicityPenalty,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
     TotalVariationPenalty,
 };
@@ -978,9 +978,14 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty =
-                    MonotonicityPenalty::new(weight, n_eff, direction, smoothing_eps, learnable)
-                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = ShapeMonotonicityPenalty::new(
+                    weight,
+                    n_eff,
+                    direction,
+                    smoothing_eps,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,

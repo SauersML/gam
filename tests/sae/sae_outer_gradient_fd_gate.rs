@@ -177,11 +177,7 @@ fn assert_full_gradient_matches_fd(label: &str, f: &Fixture) {
     let components = converged
         .analytic_outer_rho_gradient_at_converged(f.target.view(), &f.rho, &loss, &cache)
         .expect("analytic components");
-    assert!(
-        components.third_order_correction_available,
-        "[{label}] the SAE arrow Hessian must expose the #1006 third-order correction"
-    );
-    let analytic = components.gradient_with_available_correction();
+    let analytic = components.gradient();
     let n_params = f.rho.to_flat().len();
 
     for coord in 0..n_params {

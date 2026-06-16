@@ -906,7 +906,7 @@ pub(crate) fn try_mixed_precision_arrow_solve(
     schur: &Array2<f64>,
     options: &ArrowSolveOptions,
 ) -> Result<Option<MixedPrecisionAttempt>, ArrowSchurError> {
-    let MixedPrecisionPolicy::Certified {
+    let ArrowMixedPrecisionPolicy::Certified {
         max_refinement_steps,
         residual_relative_tolerance,
         kappa_unit_roundoff_margin,
