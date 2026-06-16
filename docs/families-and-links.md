@@ -157,10 +157,12 @@ See [formulas.md](formulas.md#linkwiggle-flexible-link-offset) for
 
 ## Firth bias reduction
 
-`firth=True` activates Firth's bias-reduced estimator. The shared
-implementation is available only for the standard logit binomial family
-(`LikelihoodSpec::binomial_logit()`, i.e. binomial response with standard
-logit inverse link); other families reject `firth=True`.
+`firth=True` activates Firth's bias-reduced estimator. It is available for
+any binomial family — i.e. a binomial response with any binomial inverse
+link that carries a Fisher-weight jet (`logit`, `probit`, `cloglog`,
+`latent-cloglog`, `sas`, `beta-logistic`, and blended/mixture links). The
+eligibility gate is `LikelihoodSpec::supports_firth()`; non-binomial
+families reject `firth=True` with an error.
 Firth is not compatible with survival models, location-scale fitting, or
 the Bernoulli marginal-slope family.
 
