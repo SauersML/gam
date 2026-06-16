@@ -7,29 +7,90 @@ from `ValueError`; the Rust extension unavailable case remains an
 
 ## Hierarchy
 
+The classes are defined in Rust (`crates/gam-pyffi/src/ffi_errors.rs`,
+via `pyo3::create_exception!`) and re-exported from `gamfit` by
+`gamfit/_exceptions.py`. `GamError` is the umbrella base for every
+engine error and itself inherits from `ValueError`; the only exception
+outside that tree is `RustExtensionUnavailableError`, which inherits
+from `ImportError`.
+
+The tree below is exhaustive — it lists every exception class the
+package exposes. The four classes that have their own children
+(`FormulaError`, `PredictionError`, `InvalidSpecificationError`, and the
+`GamError` root) show those children indented beneath them; every other
+class is a direct `GamError` subclass.
+
 ```
 Exception
-└── ValueError
-    └── GamError
-        ├── FormulaError
-        │   ├── ColumnNotFoundError
-        │   └── TermBuilderError
-        ├── SchemaMismatchError
-        └── PredictionError
-            ├── PredictInputError
-            └── SurvivalPredictError
-
-ImportError
-└── RustExtensionUnavailableError
+├── ValueError
+│   └── GamError
+│       ├── FormulaError
+│       │   ├── ColumnNotFoundError
+│       │   └── TermBuilderError
+│       ├── SchemaMismatchError
+│       ├── PredictionError
+│       │   ├── PredictInputError
+│       │   └── SurvivalPredictError
+│       ├── InvalidSpecificationError
+│       │   ├── UnsupportedLinkError
+│       │   └── InvalidConfigurationError
+│       ├── BasisError
+│       ├── LinearSystemSolveError
+│       ├── EigendecompositionError
+│       ├── PenaltySpectrumError
+│       ├── ParameterConstraintError
+│       ├── PirlsConvergenceError
+│       ├── PerfectSeparationError
+│       ├── HessianNotPositiveDefiniteError
+│       ├── RemlConvergenceError
+│       ├── GradientUnavailableError
+│       ├── LayoutError
+│       ├── ModelOverparameterizedError
+│       ├── IllConditionedError
+│       ├── InvalidInputError
+│       ├── MonotoneRootError
+│       ├── CalibratorError
+│       ├── GeometryError
+│       ├── MatrixMaterializationError
+│       ├── GpuError
+│       ├── LinearAlgebraError
+│       ├── MatrixError
+│       ├── CacheStoreError
+│       ├── SmoothError
+│       ├── ArrowSchurError
+│       ├── OuterStrategyError
+│       ├── CorrectedCovarianceError
+│       ├── HmcError
+│       ├── AloError
+│       ├── SurvivalError
+│       ├── CubicCellKernelError
+│       ├── SurvivalConstructionError
+│       ├── TransformationNormalError
+│       ├── CustomFamilyError
+│       ├── GamlssError
+│       ├── SurvivalMarginalSlopeError
+│       ├── LatentSurvivalError
+│       ├── DeviationRuntimeError
+│       ├── DataError
+│       ├── FittedModelError
+│       ├── LognormalKernelError
+│       ├── ScaleDesignError
+│       ├── IdentifiabilityCompilerError
+│       ├── JointPenaltyError
+│       ├── SurvivalLocationScaleError
+│       ├── MapUniquenessError
+│       ├── MissingDependencyError
+│       └── IntegrationError
+└── ImportError
+    └── RustExtensionUnavailableError
 ```
 
-Most engine errors have more specific subclasses under `GamError`, such
-as `InvalidInputError`, `RemlConvergenceError`,
-`HessianNotPositiveDefiniteError`, `IllConditionedError`,
-`InvalidSpecificationError`, `DataError`, `SmoothError`, `GamlssError`,
-`SurvivalError`, and location-scale/custom-family errors. Catch `GamError` for a
-stable package-level umbrella, or catch a specific subclass when recovery
-depends on the failure mode.
+Catch `GamError` for a stable package-level umbrella, or catch a
+specific subclass when recovery depends on the failure mode (for
+example, retry with looser tolerances on `RemlConvergenceError`, or
+suggest more data on `ModelOverparameterizedError`). Each subclass maps
+one-to-one to a Rust engine-error variant, selected at the FFI boundary
+by variant dispatch rather than by message parsing.
 
 `map_exception` (in `gamfit._exceptions`) preserves typed Rust
 `GamError` subclasses unchanged. `RustExtensionUnavailableError` is also
