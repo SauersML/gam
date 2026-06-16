@@ -1985,14 +1985,32 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // consistent.
                 if let Some(constraints) = joint_constraints.as_ref() {
                     let trial_beta = &beta_joint + &trial_delta;
-                    if check_linear_feasibility(&trial_beta, constraints, 1e-8).is_err()
-                        && let Some(projected) =
-                            crate::solver::active_set::project_point_strictly_into_feasible_cone(
-                                &trial_beta,
-                                constraints,
-                            )
-                    {
-                        trial_delta = &projected - &beta_joint;
+                    if check_linear_feasibility(&trial_beta, constraints, 1e-8).is_err() {
+                        match crate::solver::active_set::project_point_strictly_into_feasible_cone(
+                            &trial_beta,
+                            constraints,
+                        ) {
+                            Some(projected) => {
+                                trial_delta = &projected - &beta_joint;
+                            }
+                            None => {
+                                // Projection failed to find a strictly-interior
+                                // point (degenerate / empty-interior cone at this
+                                // trial). Since the global α-crush is gated off on
+                                // the constrained path, preserve the old safety
+                                // net here: shrink the active block trust radii and
+                                // retry, exactly as the α-crush `Err` branch did
+                                // (gam#979). Without this an infeasible trial would
+                                // reach the next cycle's `check_linear_feasibility`
+                                // QP gate and hard-error.
+                                joint_trust_radius = shrink_active_joint_block_trust_radii(
+                                    &mut joint_block_trust_radii,
+                                    &block_step_norms,
+                                    0.25,
+                                );
+                                continue;
+                            }
+                        }
                     }
                 }
                 block_step_norms = joint_trust_region_block_metric_norms(
