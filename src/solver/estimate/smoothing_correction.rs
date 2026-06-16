@@ -931,20 +931,29 @@ pub(crate) fn compute_smoothing_correction(
 
     // Ensure positive semi-definiteness without hiding a failed rho-space
     // optimum. The smoothing correction V_corr = J·V_ρ·Jᵀ is an SE *inflation*
-    // (Var(β̂|ρ̂) + uncertainty-in-ρ̂); a valid contribution must be PSD. Any
-    // negative eigenvalue means a direction along which this "inflation" would
-    // *shrink* the reported variance — that is never an honest correction,
-    // regardless of magnitude. We do NOT clamp negative directions to zero and
-    // hand back a matrix relabelled as PSD: that silently understates SEs in
-    // exactly the directions where the ρ-Hessian geometry is most suspect
-    // (near-saddle / pinv-corrupted). Instead we skip the entire correction
-    // loudly and let the caller fall back to the (un-inflated, honest) base
-    // covariance. The tolerance only governs how loud we are: a sub-tolerance
-    // negative is consistent with eigensolver roundoff (info-level), a material
-    // one warrants a warning.
+    // (Var(β̂|ρ̂) + uncertainty-in-ρ̂). It is PSD *by construction*: V_ρ is the
+    // (active-subspace) inverse of the SPD ρ-Hessian, so the congruence
+    // J·V_ρ·Jᵀ cannot have genuine negative curvature. Crucially it is also
+    // rank-deficient — its rank is at most `n_rho`, while it lives in the
+    // `n_coeffs_orig`-dimensional coefficient space — so for every model with
+    // fewer smoothing parameters than coefficients (i.e. essentially all of
+    // them) it has exact-zero eigenvalues. A symmetric eigensolver renders
+    // those exact zeros as ±O(ε·‖V_corr‖), so the smallest eigenvalue is
+    // routinely a *sub-tolerance negative* that is pure floating-point
+    // roundoff, not curvature. Rejecting the whole correction on such a
+    // roundoff zero silently dropped Vp for the entire #smooth < #coef regime
+    // (every predict() interval lost its smoothing-parameter inflation).
+    //
+    // So we only treat a *material* negative (below the eigensolver roundoff
+    // floor `neg_tol`) as a real failure — that signals a corrupted V_ρ
+    // (near-saddle / pinv-imputed direction) and we skip loudly, letting the
+    // caller fall back to the honest base covariance. Sub-tolerance negatives
+    // are accepted as-is: the matrix is PSD to roundoff, and it is added to the
+    // (dominant) base covariance Vb, which keeps Vp PSD without any relabelling
+    // or clamping.
     match v_corr_orig.eigh(faer::Side::Lower) {
-        // Eigenvectors are unused: any negative curvature triggers a full skip
-        // of the correction rather than per-direction reconstruction.
+        // Eigenvectors are unused: only the smallest eigenvalue's magnitude
+        // distinguishes roundoff from genuine indefiniteness.
         Ok((eigenvalues, _)) => {
             let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
             let spectral_scale = eigenvalues
@@ -958,21 +967,6 @@ pub(crate) fn compute_smoothing_correction(
                 log::warn!(
                     "Smoothing correction has material negative eigenvalue {:.3e} \
                      below tolerance {:.3e}; skipping correction.",
-                    min_eig,
-                    neg_tol
-                );
-                return SmoothingCorrectionComputation {
-                    correction: None,
-                    hessian_rho: Some(hessian_rho),
-                    rho_covariance: Some(rho_covariance),
-                    active_rank: Some(active_rank_used),
-                };
-            }
-            if min_eig < 0.0 {
-                log::debug!(
-                    "Smoothing correction has sub-tolerance negative eigenvalue {:.3e} \
-                     within tolerance {:.3e}; skipping correction rather than clamping \
-                     to a relabelled-PSD matrix.",
                     min_eig,
                     neg_tol
                 );
