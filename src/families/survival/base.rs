@@ -2306,7 +2306,7 @@ impl WorkingModelSurvival {
         })
     }
 
-    /// Build an [`InnerSolution`](crate::estimate::reml::unified::InnerSolution) from
+    /// Build an [`InnerSolution`](crate::estimate::reml::reml_outer_engine::InnerSolution) from
     /// the survival working state, suitable for the unified REML/LAML evaluator.
     ///
     /// Evaluate the survival outer objective and gradient via the unified REML/LAML
@@ -2320,7 +2320,7 @@ impl WorkingModelSurvival {
         use crate::estimate::reml::assembly::{
             InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
         };
-        use crate::estimate::reml::unified::{
+        use crate::estimate::reml::reml_outer_engine::{
             DenseSpectralOperator, DispersionHandling, EvalMode, PenaltyLogdetDerivs,
             compute_block_penalty_logdet_derivs,
         };
@@ -2534,7 +2534,7 @@ impl WorkingModelSurvival {
 }
 
 /// Derivative provider that adapts survival third-derivative Hessian corrections
-/// to the unified [`HessianDerivativeProvider`](crate::estimate::reml::unified::HessianDerivativeProvider)
+/// to the unified [`HessianDerivativeProvider`](crate::estimate::reml::reml_outer_engine::HessianDerivativeProvider)
 /// trait.
 ///
 /// The unified trait supplies `v_k = H^{-1}(A_k beta_hat)` (positive sign),
@@ -2552,7 +2552,7 @@ impl SurvivalDerivProvider {
     }
 }
 
-impl crate::estimate::reml::unified::HessianDerivativeProvider for SurvivalDerivProvider {
+impl crate::estimate::reml::reml_outer_engine::HessianDerivativeProvider for SurvivalDerivProvider {
     fn hessian_derivative_correction(
         &self,
         v_k: &Array1<f64>,
@@ -4005,7 +4005,7 @@ mod tests {
     }
 
     fn laml_test_logdet_h(state: &WorkingState) -> f64 {
-        use crate::estimate::reml::unified::{spectral_epsilon, spectral_regularize};
+        use crate::estimate::reml::reml_outer_engine::{spectral_epsilon, spectral_regularize};
         use crate::faer_ndarray::FaerEigh;
 
         let h_dense = state.hessian.to_dense();
@@ -4658,7 +4658,7 @@ mod tests {
 
         let h_dense = state.hessian.to_dense();
         let logdet_h: f64 = {
-            use crate::estimate::reml::unified::{spectral_epsilon, spectral_regularize};
+            use crate::estimate::reml::reml_outer_engine::{spectral_epsilon, spectral_regularize};
             use crate::faer_ndarray::FaerEigh;
             let (evals, _) = h_dense.eigh(faer::Side::Lower).expect("eigh");
             let eps = spectral_epsilon(evals.as_slice().unwrap());

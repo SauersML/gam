@@ -2,7 +2,7 @@
 //!
 //! Centering is implemented in two related surfaces:
 //!
-//!   * `gam::solver::estimate::reml::unified::PenaltyCoordinate::{DenseRootCentered,
+//!   * `gam::solver::estimate::reml::reml_outer_engine::PenaltyCoordinate::{DenseRootCentered,
 //!     BlockRootCentered}` with constructors `from_dense_root_with_mean` /
 //!     `from_block_root_with_mean` and quadratics `shifted_quadratic` /
 //!     `apply_shifted_penalty` (src/solver/reml/unified.rs lines 4297-4378, 4606-4656,

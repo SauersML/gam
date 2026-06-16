@@ -710,7 +710,7 @@ impl HyperGradientBudget {
 pub(crate) struct HyperGradientRuntimeState {
     pub(crate) budget: HyperGradientBudget,
     pub(crate) adaptive_kkt_override: Option<f64>,
-    pub(crate) trace_state: Arc<Mutex<super::unified::StochasticTraceState>>,
+    pub(crate) trace_state: Arc<Mutex<super::reml_outer_engine::StochasticTraceState>>,
 }
 
 impl HyperGradientRuntimeState {
@@ -718,7 +718,7 @@ impl HyperGradientRuntimeState {
         Self {
             budget: HyperGradientBudget::new(),
             adaptive_kkt_override: None,
-            trace_state: Arc::new(Mutex::new(super::unified::StochasticTraceState::default())),
+            trace_state: Arc::new(Mutex::new(super::reml_outer_engine::StochasticTraceState::default())),
         }
     }
 }
@@ -882,8 +882,8 @@ pub(crate) static EFS_SINGLE_LOOP_BIAS_GUARD: LazyLock<Mutex<EfsSingleLoopBiasGu
     LazyLock::new(|| Mutex::new(EfsSingleLoopBiasGuardState::default()));
 
 #[inline]
-pub(crate) fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
-    mode != super::unified::EvalMode::ValueOnly
+pub(crate) fn compute_gradient_for_tk(mode: super::reml_outer_engine::EvalMode) -> bool {
+    mode != super::reml_outer_engine::EvalMode::ValueOnly
 }
 
 #[inline]
@@ -1628,11 +1628,11 @@ pub(crate) struct TkActiveBlock {
 /// return this, eliminating the tuple-order mismatch that previously existed
 /// between the two paths.
 pub(crate) struct DerivativeContext {
-    pub(crate) deriv_provider: Box<dyn super::unified::HessianDerivativeProvider>,
-    pub(crate) dispersion: super::unified::DispersionHandling,
+    pub(crate) deriv_provider: Box<dyn super::reml_outer_engine::HessianDerivativeProvider>,
+    pub(crate) dispersion: super::reml_outer_engine::DispersionHandling,
     pub(crate) log_likelihood: f64,
     pub(crate) firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
-    pub(crate) barrier_config: Option<super::unified::BarrierConfig>,
+    pub(crate) barrier_config: Option<super::reml_outer_engine::BarrierConfig>,
 }
 
 /// Project a `GlmLikelihoodSpec` onto a `LikelihoodSpec` for pattern matching

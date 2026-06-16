@@ -7,7 +7,7 @@
 //! All families and runtime paths provide ingredients and call
 //! [`InnerAssembly::evaluate`] or [`InnerAssembly::build`].
 
-use super::unified::{
+use super::reml_outer_engine::{
     BarrierConfig, ContractedPsiSecondOrderFn, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordPair, InnerSolution,
     InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace,
@@ -338,7 +338,7 @@ pub struct InnerAssembly<'dp> {
     /// Tier-B coupled joint path installs the value-only carrier
     /// (`ExactJeffreysTerm::value_only`) so the cost subtracts the same gated
     /// `Φ(β̂)` its inner Newton optimized (gam#979).
-    pub firth: Option<crate::estimate::reml::unified::ExactJeffreysTerm>,
+    pub firth: Option<crate::estimate::reml::reml_outer_engine::ExactJeffreysTerm>,
     pub nullspace_dim: Option<f64>,
     pub barrier_config: Option<BarrierConfig>,
     pub kkt_residual: Option<ProjectedKktResidual>,
@@ -347,7 +347,7 @@ pub struct InnerAssembly<'dp> {
     /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
     /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
     pub active_constraints:
-        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+        Option<Arc<crate::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock>>,
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,

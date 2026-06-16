@@ -353,7 +353,7 @@ pub(crate) fn build_contracted_psi_hook(
             // hessian[i] += S_{ψi ψ(α)} as a block-local drift (matches the
             // ext_ext `b_operator` BlockLocalDrift composite).
             let block_drift: Arc<dyn HyperOperator> =
-                Arc::new(crate::solver::estimate::reml::unified::BlockLocalDrift {
+                Arc::new(crate::solver::estimate::reml::reml_outer_engine::BlockLocalDrift {
                     local: s_psi_psi_alpha.clone(),
                     start: axis_i.start,
                     end: axis_i.end,
@@ -364,14 +364,14 @@ pub(crate) fn build_contracted_psi_hook(
                 DriftDerivResult::Operator(Arc::clone(&block_drift)),
             ) {
                 DriftDerivResult::Operator(existing) => DriftDerivResult::Operator(Arc::new(
-                    crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                    crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
                         dense: None,
                         operators: vec![existing, block_drift],
                         dim_hint: total,
                     },
                 )),
                 DriftDerivResult::Dense(dense) => DriftDerivResult::Operator(Arc::new(
-                    crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                    crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
                         dense: Some(dense),
                         operators: vec![block_drift],
                         dim_hint: total,
@@ -613,7 +613,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     b_local += &s_local;
                 } else {
                     let block_drift: Arc<dyn HyperOperator> =
-                        Arc::new(crate::solver::estimate::reml::unified::BlockLocalDrift {
+                        Arc::new(crate::solver::estimate::reml::reml_outer_engine::BlockLocalDrift {
                             local: s_local.clone(),
                             start: cache_i.start,
                             end: cache_i.end,
@@ -623,14 +623,14 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                         Some(existing) => {
                             let existing_arc: Arc<dyn HyperOperator> = Arc::from(existing);
                             Box::new(
-                                crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                                crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
                                     dense: None,
                                     operators: vec![existing_arc, block_drift],
                                     dim_hint: total,
                                 },
                             ) as Box<dyn HyperOperator>
                         }
-                        None => Box::new(crate::solver::estimate::reml::unified::BlockLocalDrift {
+                        None => Box::new(crate::solver::estimate::reml::reml_outer_engine::BlockLocalDrift {
                             local: s_local.clone(),
                             start: cache_i.start,
                             end: cache_i.end,

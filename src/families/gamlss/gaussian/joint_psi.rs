@@ -379,12 +379,12 @@ where
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult>, String> {
         let Some(dir) = self.psi_direction(psi_index)? else {
             return Ok(None);
         };
         Ok(Some(
-            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
+            crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Dense(
                 self.family.ws_psi_hessian_directional_from_parts(
                     &self.block_states,
                     dir.as_ref(),
@@ -1060,7 +1060,7 @@ pub(crate) fn build_two_block_custom_family_joint_psi_operator_from_actions(
     left_drift_weights: &Array1<f64>,
     cross_drift_weights: &Array1<f64>,
     right_drift_weights: &Array1<f64>,
-) -> Result<Option<std::sync::Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+) -> Result<Option<std::sync::Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
 {
     if left_action.is_none() && right_action.is_none() {
         return Ok(None);

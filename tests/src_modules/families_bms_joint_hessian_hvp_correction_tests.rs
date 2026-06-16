@@ -1223,8 +1223,8 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
         );
 
         let hess_dense = match &contracted.hessian[i] {
-            crate::solver::estimate::reml::unified::DriftDerivResult::Operator(op) => op.to_dense(),
-            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(m) => m.clone(),
+            crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator(op) => op.to_dense(),
+            crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Dense(m) => m.clone(),
         };
         let hess_err = rel_diff_array2(&hess_dense, &ref_hess);
         assert!(
@@ -1253,7 +1253,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
     use crate::custom_family::CustomFamilyBlockPsiDerivative;
     use crate::families::custom_family::{build_contracted_psi_hook, build_psi_pair_callbacks};
     use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-    use crate::solver::estimate::reml::unified::DriftDerivResult;
+    use crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult;
 
     let n = 40usize;
     let y: Array1<f64> =
@@ -1528,7 +1528,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
 fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
     use crate::families::custom_family::build_psi_hyper_coords;
     use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-    use crate::solver::estimate::reml::unified::{DenseSpectralOperator, HessianOperator};
+    use crate::solver::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
 
     let n = 32usize;
     let y: Array1<f64> =
@@ -1816,7 +1816,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     use crate::custom_family::PenaltyMatrix;
     use crate::families::custom_family::evaluate_custom_family_joint_hyper;
     use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
-    use crate::solver::estimate::reml::unified::EvalMode;
+    use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
     use crate::terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu};
     use crate::terms::smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,

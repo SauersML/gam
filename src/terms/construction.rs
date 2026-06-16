@@ -998,8 +998,8 @@ impl CanonicalPenalty {
     /// Convert to a PenaltyCoordinate for the unified REML evaluator.
     pub fn to_penalty_coordinate(
         &self,
-    ) -> crate::solver::estimate::reml::unified::PenaltyCoordinate {
-        use crate::solver::estimate::reml::unified::PenaltyCoordinate;
+    ) -> crate::solver::estimate::reml::reml_outer_engine::PenaltyCoordinate {
+        use crate::solver::estimate::reml::reml_outer_engine::PenaltyCoordinate;
         if self.is_block_local() {
             PenaltyCoordinate::from_block_root_with_mean(
                 self.root.clone(),

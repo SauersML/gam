@@ -162,7 +162,7 @@ impl<'a> RemlState<'a> {
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             let t_assemble = std::time::Instant::now();
             let result = if synthetic_ext_count == 0 {
-                self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?
+                self.evaluate_unified_sparse(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
             } else {
                 self.evaluate_unified_value_only_with_synthetic_ext_count(
                     p,
@@ -248,7 +248,7 @@ impl<'a> RemlState<'a> {
         // This ensures cost and gradient share the exact same formula.
         let t_assemble = std::time::Instant::now();
         let result = if synthetic_ext_count == 0 {
-            self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?
+            self.evaluate_unified(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
         } else {
             self.evaluate_unified_value_only_with_synthetic_ext_count(
                 p,
@@ -605,7 +605,7 @@ impl<'a> RemlState<'a> {
         free_basis_opt: &Option<Array2<f64>>,
         include_firth_derivs: bool,
     ) -> Result<DerivativeContext, EstimationError> {
-        use super::unified::{
+        use super::reml_outer_engine::{
             DispersionHandling, GaussianDerivatives, SinglePredictorGlmDerivatives,
         };
 
@@ -615,7 +615,7 @@ impl<'a> RemlState<'a> {
 
         // Derivative provider.
         let firth_active_for_derivs = include_firth_derivs && firth_op.is_some();
-        let deriv_provider: Box<dyn super::unified::HessianDerivativeProvider> =
+        let deriv_provider: Box<dyn super::reml_outer_engine::HessianDerivativeProvider> =
             if is_gaussian_identity || pirls_result.derivatives_unsupported {
                 Box::new(GaussianDerivatives)
             } else {
@@ -638,7 +638,7 @@ impl<'a> RemlState<'a> {
                 };
                 if firth_active_for_derivs {
                     if let Some(firth_op) = firth_op.clone() {
-                        Box::new(super::unified::FirthAwareGlmDerivatives { base, firth_op })
+                        Box::new(super::reml_outer_engine::FirthAwareGlmDerivatives { base, firth_op })
                     } else {
                         Box::new(base)
                     }
@@ -698,7 +698,7 @@ impl<'a> RemlState<'a> {
         pirls_result: &PirlsResult,
         bundle: &EvalShared,
     ) -> Result<DerivativeContext, EstimationError> {
-        use super::unified::{
+        use super::reml_outer_engine::{
             DispersionHandling, FirthAwareGlmDerivatives, GaussianDerivatives,
             SinglePredictorGlmDerivatives,
         };
@@ -731,7 +731,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Dispersion and derivative provider depend on family.
-        let (dispersion, deriv_provider): (_, Box<dyn super::unified::HessianDerivativeProvider>) =
+        let (dispersion, deriv_provider): (_, Box<dyn super::reml_outer_engine::HessianDerivativeProvider>) =
             if is_gaussian_identity {
                 (
                     DispersionHandling::ProfiledGaussian,
@@ -805,7 +805,7 @@ impl<'a> RemlState<'a> {
 
     /// Build penalty coordinates from canonical penalties, with Kronecker
     /// fast-path when available and active.
-    pub(crate) fn build_penalty_coords(&self) -> Vec<super::unified::PenaltyCoordinate> {
+    pub(crate) fn build_penalty_coords(&self) -> Vec<super::reml_outer_engine::PenaltyCoordinate> {
         if let Some(ref kron) = self.kronecker_penalty_system
             && self.kronecker_factored.is_some()
         {
@@ -818,7 +818,7 @@ impl<'a> RemlState<'a> {
                 .collect();
             let mut coords = Vec::with_capacity(kron.num_penalties());
             for k in 0..d {
-                coords.push(super::unified::PenaltyCoordinate::KroneckerMarginal {
+                coords.push(super::reml_outer_engine::PenaltyCoordinate::KroneckerMarginal {
                     eigenvalues: eigenvalues.clone(),
                     dim_index: k,
                     marginal_dims: kron.marginal_dims.clone(),
@@ -827,7 +827,7 @@ impl<'a> RemlState<'a> {
             }
             if kron.has_double_penalty {
                 let identity_root = ndarray::Array2::<f64>::eye(total_dim);
-                coords.push(super::unified::PenaltyCoordinate::from_dense_root(
+                coords.push(super::reml_outer_engine::PenaltyCoordinate::from_dense_root(
                     identity_root,
                 ));
             }
@@ -847,12 +847,12 @@ impl<'a> RemlState<'a> {
         &self,
         pirls_result: &PirlsResult,
         ctx: DerivativeContext,
-        hessian_op: std::sync::Arc<dyn super::unified::HessianOperator>,
+        hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianOperator>,
         beta: Array1<f64>,
-        penalty_logdet: super::unified::PenaltyLogdetDerivs,
+        penalty_logdet: super::reml_outer_engine::PenaltyLogdetDerivs,
         nullspace_dim: f64,
         hessian_logdet_correction: f64,
-        penalty_subspace_trace: Option<std::sync::Arc<super::unified::PenaltySubspaceTrace>>,
+        penalty_subspace_trace: Option<std::sync::Arc<super::reml_outer_engine::PenaltySubspaceTrace>>,
         free_basis: Option<&Array2<f64>>,
     ) -> super::assembly::InnerAssembly<'static> {
         // When a linear-inequality active set reduces the inner solve to the
@@ -895,7 +895,7 @@ impl<'a> RemlState<'a> {
             rho_curvature_scale: 1.0,
             // The InnerSolution-carried prior must be the *effective* prior
             // (firth-general PC default substituted for unset coordinates), so
-            // the unified EFS/LAML evaluation in `super::unified` shapes the λ
+            // the unified EFS/LAML evaluation in `super::reml_outer_engine` shapes the λ
             // update with the same hyperprior the outer cost/gradient use. Using
             // the raw `self.rho_prior` here would leave the firth-general PC
             // default out of the inner update entirely.
@@ -907,7 +907,7 @@ impl<'a> RemlState<'a> {
             tk_gradient: None,
             firth: ctx
                 .firth_op
-                .map(crate::estimate::reml::unified::ExactJeffreysTerm::new),
+                .map(crate::estimate::reml::reml_outer_engine::ExactJeffreysTerm::new),
             nullspace_dim: Some(nullspace_dim),
             barrier_config: ctx.barrier_config,
             ext_coords: Vec::new(),
@@ -930,9 +930,9 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
+        mode: super::reml_outer_engine::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use super::unified::{
+        use super::reml_outer_engine::{
             DenseCholeskyValueOnlyOperator, DenseSpectralOperator, PseudoLogdetMode,
         };
         use std::borrow::Cow;
@@ -993,8 +993,8 @@ impl<'a> RemlState<'a> {
         //
         // If LLT fails (near-singular Hessian), fall through to the spectral
         // operator so the soft-floor regularization can handle it.
-        let hessian_op: std::sync::Arc<dyn super::unified::HessianOperator> = if mode
-            == super::unified::EvalMode::ValueOnly
+        let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianOperator> = if mode
+            == super::reml_outer_engine::EvalMode::ValueOnly
             && matches!(hessian_mode, PseudoLogdetMode::Smooth)
             && free_basis_opt.is_none()
             && !c_nontrivial
@@ -1125,9 +1125,9 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
+        mode: super::reml_outer_engine::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use super::unified::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
+        use super::reml_outer_engine::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
         })?;
@@ -1150,7 +1150,7 @@ impl<'a> RemlState<'a> {
         );
 
         let nullspace_dim = p_dim.saturating_sub(sparse.penalty_rank) as f64;
-        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
+        let det2 = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
             let lambdas = rho.mapv(f64::exp);
             let (_, det2) =
                 self.structural_penalty_logdet_derivatives_block_local(&lambdas, bundle)?;
@@ -1220,9 +1220,9 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
+        mode: super::reml_outer_engine::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use super::unified::{DenseSpectralOperator, PseudoLogdetMode};
+        use super::reml_outer_engine::{DenseSpectralOperator, PseudoLogdetMode};
 
         let pirls_result = bundle.pirls_result.as_ref();
         let ridge_passport = pirls_result.ridge_passport;
@@ -1336,9 +1336,9 @@ impl<'a> RemlState<'a> {
         // `build_dense_original_assembly` is only called when there is no
         // active constraint free-basis, so the no-hard-constraints condition
         // is always satisfied here.
-        let hessian_op: std::sync::Arc<dyn super::unified::HessianOperator> = {
-            use super::unified::DenseCholeskyValueOnlyOperator;
-            if mode == super::unified::EvalMode::ValueOnly
+        let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianOperator> = {
+            use super::reml_outer_engine::DenseCholeskyValueOnlyOperator;
+            if mode == super::reml_outer_engine::EvalMode::ValueOnly
                 && matches!(hessian_mode, PseudoLogdetMode::Smooth)
                 && !c_nontrivial
             {
@@ -1470,7 +1470,7 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
+        mode: super::reml_outer_engine::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.build_sparse_assembly(rho, bundle, mode)
@@ -1498,10 +1498,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        mut result: super::unified::RemlLamlResult,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
-        let want_gradient = mode != super::unified::EvalMode::ValueOnly;
+        mode: super::reml_outer_engine::EvalMode,
+        mut result: super::reml_outer_engine::RemlLamlResult,
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
+        let want_gradient = mode != super::reml_outer_engine::EvalMode::ValueOnly;
         let Some(alo_eval) = self.alo_stabilization_eval(rho, bundle, want_gradient)? else {
             return Ok(result);
         };
@@ -1983,7 +1983,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn build_prior(
         &self,
         rho: &Array1<f64>,
-        mode: super::unified::EvalMode,
+        mode: super::reml_outer_engine::EvalMode,
     ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
         super::assembly::soft_prior_for_mode(
             rho,
@@ -2014,9 +2014,9 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
+        mode: super::reml_outer_engine::EvalMode,
         assembly: super::assembly::InnerAssembly<'static>,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         let prior = self.build_prior(rho, mode);
         self.validate_tk_ext_coords(mode, &assembly.ext_coords)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, &assembly.ext_coords)?;
@@ -2058,7 +2058,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         assembly: super::assembly::InnerAssembly<'static>,
     ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
-        use super::unified::{compute_efs_update, compute_hybrid_efs_update};
+        use super::reml_outer_engine::{compute_efs_update, compute_hybrid_efs_update};
 
         let beta_for_barrier = assembly.beta.clone();
         let has_psi = assembly.ext_coords.iter().any(|c| !c.is_penalty_like);
@@ -2070,7 +2070,7 @@ impl<'a> RemlState<'a> {
         // target through their gradient channel. Without the gradient
         // the EFS step targets the wrong stationarity equation whenever
         // any of those terms are active.
-        let eval_mode = super::unified::EvalMode::ValueAndGradient;
+        let eval_mode = super::reml_outer_engine::EvalMode::ValueAndGradient;
         self.validate_tk_ext_coords(eval_mode, &assembly.ext_coords)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode, &assembly.ext_coords)?;
         let assembly_ext_len = assembly.ext_coords.len();
@@ -2078,7 +2078,7 @@ impl<'a> RemlState<'a> {
         inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
         inner_solution.dp_floor_scale = self.gaussian_dp_floor_scale();
         let inner_hessian_scale =
-            super::unified::hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
+            super::reml_outer_engine::hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
 
         let prior = self.build_prior(rho, eval_mode);
         let cost_result = super::assembly::evaluate_solution(
@@ -2137,7 +2137,7 @@ impl<'a> RemlState<'a> {
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
             );
-            let diagnostics = super::unified::efs_single_loop_diagnostics(
+            let diagnostics = super::reml_outer_engine::efs_single_loop_diagnostics(
                 &inner_solution,
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
@@ -2170,7 +2170,7 @@ impl<'a> RemlState<'a> {
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
             );
-            let diagnostics = super::unified::efs_single_loop_diagnostics(
+            let diagnostics = super::reml_outer_engine::efs_single_loop_diagnostics(
                 &inner_solution,
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
@@ -2203,8 +2203,8 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        mode: super::reml_outer_engine::EvalMode,
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         // Dispatch through `build_auto_assembly` rather than hard-wiring
         // `build_dense_assembly`.
         //
@@ -2230,8 +2230,8 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        mode: super::reml_outer_engine::EvalMode,
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         let assembly = self.build_sparse_assembly(rho, bundle, mode)?;
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
@@ -2242,9 +2242,9 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         synthetic_ext_count: usize,
         force_sparse: bool,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         assert!(synthetic_ext_count > 0);
-        let mode = super::unified::EvalMode::ValueOnly;
+        let mode = super::reml_outer_engine::EvalMode::ValueOnly;
         let mut assembly = if force_sparse {
             self.build_sparse_assembly(rho, bundle, mode)?
         } else {
@@ -2252,10 +2252,10 @@ impl<'a> RemlState<'a> {
         };
         let p_dim = assembly.beta.len();
         assembly.ext_coords = (0..synthetic_ext_count)
-            .map(|_| super::unified::HyperCoord {
+            .map(|_| super::reml_outer_engine::HyperCoord {
                 a: 0.0,
                 g: Array1::zeros(p_dim),
-                drift: super::unified::HyperCoordDrift::none(),
+                drift: super::reml_outer_engine::HyperCoordDrift::none(),
                 ld_s: 0.0,
                 b_depends_on_beta: false,
                 is_penalty_like: false,
@@ -2288,9 +2288,9 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         cache_theta: Option<&Array1<f64>>,
-        mode: super::unified::EvalMode,
+        mode: super::reml_outer_engine::EvalMode,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         let t0 = std::time::Instant::now();
         let bundle = if let Some(theta) = cache_theta {
             self.obtain_eval_bundle_for_outer_theta(rho, theta)?
@@ -2303,7 +2303,7 @@ impl<'a> RemlState<'a> {
         let (ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) = if !hyper_dirs
             .is_empty()
         {
-            if mode == super::unified::EvalMode::ValueGradientHessian {
+            if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
                 let (coords, epf, repf, fixed_drift_deriv) =
                     self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)?;
                 (coords, Some(epf), Some(repf), fixed_drift_deriv)
@@ -2512,7 +2512,7 @@ impl<'a> RemlState<'a> {
             let result = self.evaluate_unified_sparse(
                 p,
                 &bundle,
-                super::unified::EvalMode::ValueAndGradient,
+                super::reml_outer_engine::EvalMode::ValueAndGradient,
             )?;
             let ift_residual_energy = result.ift_residual_energy;
             store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
@@ -2533,7 +2533,7 @@ impl<'a> RemlState<'a> {
             return Ok(grad);
         }
         let result =
-            self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
+            self.evaluate_unified(p, &bundle, super::reml_outer_engine::EvalMode::ValueAndGradient)?;
         let ift_residual_energy = result.ift_residual_energy;
         store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
         let grad = result
@@ -2635,9 +2635,9 @@ impl<'a> RemlState<'a> {
         if matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::Value) {
             let t_assemble = std::time::Instant::now();
             let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-                self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?
+                self.evaluate_unified_sparse(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
             } else {
-                self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueOnly)?
+                self.evaluate_unified(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
             };
             store_ift_residual_energy_for_outer_theta(p, result.ift_residual_energy);
             // SINGLE SOURCE OF TRUTH for the outer objective VALUE: apply the
@@ -2684,9 +2684,9 @@ impl<'a> RemlState<'a> {
         };
         let eval_mode = match decision.as_ref().map(|decision| decision.strategy) {
             Some(HessianEvalStrategyKind::SpectralExact) => {
-                super::unified::EvalMode::ValueGradientHessian
+                super::reml_outer_engine::EvalMode::ValueGradientHessian
             }
-            _ => super::unified::EvalMode::ValueAndGradient,
+            _ => super::reml_outer_engine::EvalMode::ValueAndGradient,
         };
 
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
@@ -2784,7 +2784,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn build_link_ext_coords(
         &self,
         bundle: &EvalShared,
-    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+    ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         if let Some(sas_state) = &self.runtime_sas_link_state {
             let is_beta_logistic = matches!(
                 self.config.link_function(),
@@ -2846,7 +2846,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn rotate_link_ext_coords_to_original(
         &self,
         bundle: &EvalShared,
-        coords: &mut [super::unified::HyperCoord],
+        coords: &mut [super::reml_outer_engine::HyperCoord],
     ) -> Result<(), EstimationError> {
         if coords.is_empty() {
             return Ok(());
@@ -2909,8 +2909,8 @@ impl<'a> RemlState<'a> {
     pub fn evaluate_unified_with_link_ext(
         &self,
         rho: &Array1<f64>,
-        mode: super::unified::EvalMode,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        mode: super::reml_outer_engine::EvalMode,
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         self.reject_firth_link_ext()?;
         let bundle = self.obtain_eval_bundle(rho)?;
         let mut ext_coords = self.build_link_ext_coords(&bundle)?;
@@ -2928,13 +2928,13 @@ impl<'a> RemlState<'a> {
         let ext_dim = ext_coords.len();
         let p_dim = ext_coords.first().map(|coord| coord.g.len()).unwrap_or(0);
         assembly.ext_coords = ext_coords;
-        if mode == super::unified::EvalMode::ValueGradientHessian {
+        if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
             // Link-shape parameters do not directly differentiate the penalty
             // matrices, so their explicit rho-link second partials are zero.
             // Installing this callback is still required: the unified Hessian
             // builder then evaluates the nonzero profiled cross terms from the
             // first-order link drifts and IFT mode responses.
-            assembly.rho_ext_pair_fn = Some(Box::new(move |_, _| super::unified::HyperCoordPair {
+            assembly.rho_ext_pair_fn = Some(Box::new(move |_, _| super::reml_outer_engine::HyperCoordPair {
                 a: 0.0,
                 g: Array1::zeros(p_dim),
                 b_mat: Array2::zeros((p_dim, p_dim)),
@@ -2942,7 +2942,7 @@ impl<'a> RemlState<'a> {
                 ld_s: 0.0,
             }));
             assembly.ext_coord_pair_fn =
-                Some(Box::new(move |_, _| super::unified::HyperCoordPair {
+                Some(Box::new(move |_, _| super::reml_outer_engine::HyperCoordPair {
                     a: 0.0,
                     g: Array1::zeros(p_dim),
                     b_mat: Array2::zeros((p_dim, p_dim)),
@@ -2982,10 +2982,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        ext_coords: Vec<super::unified::HyperCoord>,
+        ext_coords: Vec<super::reml_outer_engine::HyperCoord>,
     ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         let mut assembly =
-            self.build_auto_assembly(rho, bundle, super::unified::EvalMode::ValueOnly)?;
+            self.build_auto_assembly(rho, bundle, super::reml_outer_engine::EvalMode::ValueOnly)?;
         assembly.tk_gradient = None;
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
@@ -2993,9 +2993,9 @@ impl<'a> RemlState<'a> {
 }
 
 pub(crate) fn positive_penalty_rank_and_logdet(eigenvalues: &[f64]) -> (usize, f64) {
-    let threshold = super::unified::positive_eigenvalue_threshold(eigenvalues);
+    let threshold = super::reml_outer_engine::positive_eigenvalue_threshold(eigenvalues);
     let rank = eigenvalues.iter().filter(|&&ev| ev > threshold).count();
-    let log_det = super::unified::exact_pseudo_logdet(eigenvalues, threshold);
+    let log_det = super::reml_outer_engine::exact_pseudo_logdet(eigenvalues, threshold);
     (rank, log_det)
 }
 

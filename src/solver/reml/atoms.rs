@@ -126,7 +126,7 @@
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
-use super::unified::PenaltySubspaceTrace;
+use super::reml_outer_engine::PenaltySubspaceTrace;
 
 /// An outer-coordinate direction with its induced inner motion, built ONCE
 /// per direction by the calculus and shared by every atom.

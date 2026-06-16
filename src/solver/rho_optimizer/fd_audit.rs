@@ -166,10 +166,10 @@ pub fn outer_gradient_fd_audit<EvalF>(
 where
     EvalF: FnMut(
         &Array1<f64>,
-        crate::solver::estimate::reml::unified::EvalMode,
+        crate::solver::estimate::reml::reml_outer_engine::EvalMode,
     ) -> Result<(f64, Array1<f64>, HessianResult), String>,
 {
-    use crate::solver::estimate::reml::unified::EvalMode;
+    use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
     let (value, analytic_grad, hess) = eval(theta0, EvalMode::ValueGradientHessian)?;
     if analytic_grad.len() != theta0.len() {
         return Err(format!(

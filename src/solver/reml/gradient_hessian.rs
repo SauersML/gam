@@ -67,7 +67,7 @@ impl<'a> RemlState<'a> {
 
     pub(crate) fn hypergradient_trace_state(
         &self,
-    ) -> Arc<Mutex<super::unified::StochasticTraceState>> {
+    ) -> Arc<Mutex<super::reml_outer_engine::StochasticTraceState>> {
         let mut budgets = hypergradient_budgets().lock().unwrap();
         let state = budgets
             .entry(self.hypergradient_owner_key())
@@ -76,7 +76,7 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn reset_hypergradient_trace_telemetry(
-        trace_state: &Arc<Mutex<super::unified::StochasticTraceState>>,
+        trace_state: &Arc<Mutex<super::reml_outer_engine::StochasticTraceState>>,
     ) {
         let mut trace = match trace_state.lock() {
             Ok(guard) => guard,
@@ -339,7 +339,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn record_efs_single_loop_bias(
         &self,
         rho: &Array1<f64>,
-        diagnostics: super::unified::EfsSingleLoopDiagnostics,
+        diagnostics: super::reml_outer_engine::EfsSingleLoopDiagnostics,
     ) -> Result<(), EstimationError> {
         if !self.efs_single_loop_cap_active() {
             return Ok(());
@@ -421,7 +421,7 @@ impl<'a> RemlState<'a> {
         let p_dim = self.x.ncols();
         let k_outer = self.canonical_penalties.len();
         let operator_path_available =
-            super::unified::prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
+            super::reml_outer_engine::prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
         if n_obs > 50_000 && !operator_path_available {
             log::info!(
                 "[standard-GAM] declining analytic outer Hessian for \
@@ -503,8 +503,8 @@ impl<'a> RemlState<'a> {
         ridge_passport: RidgePassport,
         penalty_subspace: Option<&PenaltySubspace>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-    ) -> Result<(usize, super::unified::PenaltyLogdetDerivs), EstimationError> {
+        mode: super::reml_outer_engine::EvalMode,
+    ) -> Result<(usize, super::reml_outer_engine::PenaltyLogdetDerivs), EstimationError> {
         let logdet_s_start = std::time::Instant::now();
         let lambdas = rho.mapv(f64::exp);
         let ridge = ridge_passport.penalty_logdet_ridge();
@@ -604,14 +604,14 @@ impl<'a> RemlState<'a> {
             logdet_s_start.elapsed().as_secs_f64(),
         );
 
-        let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
+        let det2 = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
             Some(det2_full)
         } else {
             None
         };
         Ok((
             penalty_rank,
-            super::unified::PenaltyLogdetDerivs {
+            super::reml_outer_engine::PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
                 second: det2,
@@ -1539,7 +1539,7 @@ impl<'a> RemlState<'a> {
         f_array: &Array1<f64>,
         tk_penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
-        ext_coords: &[super::unified::HyperCoord],
+        ext_coords: &[super::reml_outer_engine::HyperCoord],
         beta: &Array1<f64>,
         firth_op: Option<&super::FirthDenseOperator>,
         compute_gradient: bool,
@@ -1661,8 +1661,8 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        mode: super::unified::EvalMode,
-        ext_coords: &[super::unified::HyperCoord],
+        mode: super::reml_outer_engine::EvalMode,
+        ext_coords: &[super::reml_outer_engine::HyperCoord],
     ) -> Result<TkCorrectionTerms, EstimationError> {
         if reml_is_gaussian_identity(&self.config.likelihood) {
             return Ok(TkCorrectionTerms {
@@ -1702,7 +1702,7 @@ impl<'a> RemlState<'a> {
             } else {
                 None
             },
-            hessian: if mode == super::unified::EvalMode::ValueGradientHessian {
+            hessian: if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
                 Some(Array2::zeros((
                     rho.len() + ext_coords.len(),
                     rho.len() + ext_coords.len(),
@@ -1797,7 +1797,7 @@ impl<'a> RemlState<'a> {
                 &beta,
                 firth_op.as_deref(),
                 compute_gradient,
-                mode == super::unified::EvalMode::ValueGradientHessian,
+                mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
                 &h_inv_solve,
             );
         }
@@ -1951,15 +1951,15 @@ impl<'a> RemlState<'a> {
             &beta,
             firth_op.as_deref(),
             compute_gradient,
-            mode == super::unified::EvalMode::ValueGradientHessian,
+            mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
             &h_inv_solve,
         )
     }
 
     pub(crate) fn validate_tk_ext_coords(
         &self,
-        mode: super::unified::EvalMode,
-        ext_coords: &[super::unified::HyperCoord],
+        mode: super::reml_outer_engine::EvalMode,
+        ext_coords: &[super::reml_outer_engine::HyperCoord],
     ) -> Result<(), EstimationError> {
         if reml_is_gaussian_identity(&self.config.likelihood)
             || reml_robust_jeffreys_link(&self.config).is_none()
@@ -1979,9 +1979,9 @@ impl<'a> RemlState<'a> {
 
     pub(crate) fn apply_tk_to_result(
         &self,
-        mut result: super::unified::RemlLamlResult,
+        mut result: super::reml_outer_engine::RemlLamlResult,
         tk_terms: TkCorrectionTerms,
-    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         result.cost += tk_terms.value;
         if let Some(tk_hess) = tk_terms.hessian.as_ref() {
             result
@@ -2582,7 +2582,7 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-        result: &super::unified::RemlLamlResult,
+        result: &super::reml_outer_engine::RemlLamlResult,
     ) {
         let rho_cols = result
             .rho_mode_response_cols
@@ -3975,8 +3975,8 @@ impl<'a> RemlState<'a> {
     /// barrier-curvature check at a test point near the bounds.
     pub(crate) fn barrier_config_from_constraints(
         constraints: &crate::pirls::LinearInequalityConstraints,
-    ) -> Option<super::unified::BarrierConfig> {
-        let config = super::unified::BarrierConfig::from_constraints(Some(constraints))?;
+    ) -> Option<super::reml_outer_engine::BarrierConfig> {
+        let config = super::reml_outer_engine::BarrierConfig::from_constraints(Some(constraints))?;
         // Diagnostic: check curvature significance at a test point near bounds.
         {
             // Place the diagnostic test point a small slack inside the feasible
@@ -4236,7 +4236,7 @@ impl<'a> RemlState<'a> {
     /// of constant-rank strata and FD probes are only meaningful within one.
     pub(super) fn intrinsic_hessian_pseudo_logdet_parts(
         h_total: &Array2<f64>,
-    ) -> Result<(f64, Option<super::unified::PenaltySubspaceTrace>), EstimationError> {
+    ) -> Result<(f64, Option<super::reml_outer_engine::PenaltySubspaceTrace>), EstimationError> {
         let p = h_total.ncols();
         if p == 0 {
             return Ok((0.0, None));
@@ -4256,8 +4256,8 @@ impl<'a> RemlState<'a> {
         let (h_evals, h_evecs) = h_sym
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let h_thr = super::unified::positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
-        let log_det = super::unified::exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_thr);
+        let h_thr = super::reml_outer_engine::positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
+        let log_det = super::reml_outer_engine::exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_thr);
         let kept: Vec<usize> = (0..p).filter(|&j| h_evals[j] > h_thr).collect();
         if kept.is_empty() {
             // No positive curvature anywhere: nothing identified, nothing to
@@ -4284,7 +4284,7 @@ impl<'a> RemlState<'a> {
 
         Ok((
             log_det,
-            Some(super::unified::PenaltySubspaceTrace {
+            Some(super::reml_outer_engine::PenaltySubspaceTrace {
                 u_s,
                 h_proj_inverse,
             }),

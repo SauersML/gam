@@ -714,7 +714,7 @@ impl GaussianLocationScaleWiggleFamily {
         xmu_arc: Arc<Array2<f64>>,
         x_ls_arc: Arc<Array2<f64>>,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
     {
         validate_block_count::<GamlssError>(
             "GaussianLocationScaleWiggleFamily",
@@ -834,7 +834,7 @@ impl GaussianLocationScaleWiggleFamily {
         x_ls_arc: Arc<Array2<f64>>,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
     {
         validate_block_count::<GamlssError>(
             "GaussianLocationScaleWiggleFamily",
@@ -2819,7 +2819,7 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
     fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
     {
         self.family.gls_wiggle_directional_operator(
             &self.block_states,
@@ -2848,7 +2848,7 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         &self,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
     {
         self.family.gls_wiggle_second_directional_operator(
             &self.block_states,

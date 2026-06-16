@@ -9,7 +9,7 @@ use crate::custom_family::{
     joint_hyper_options_for_outer_tolerance,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::estimate::reml::unified::{DenseSpectralOperator, HessianOperator, HyperOperator};
+use crate::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator, HyperOperator};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::jet_partitions::MultiDirJet;
 use crate::families::marginal_slope_shared::{

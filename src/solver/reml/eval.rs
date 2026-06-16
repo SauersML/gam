@@ -496,7 +496,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> Result<Array2<f64>, EstimationError> {
-        let mode = super::unified::EvalMode::ValueGradientHessian;
+        let mode = super::reml_outer_engine::EvalMode::ValueGradientHessian;
         let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.evaluate_unified_sparse(rho, bundle, mode)?
         } else {
@@ -648,11 +648,11 @@ impl<'a> RemlState<'a> {
             // No hyperparameters: the unified corrected covariance equals H^{-1}.
             // Validate the unified path using the spectral operator.
             if let Some(base_cov) = base_covariance
-                && let Ok(hop) = super::unified::DenseSpectralOperator::from_symmetric(base_cov)
+                && let Ok(hop) = super::reml_outer_engine::DenseSpectralOperator::from_symmetric(base_cov)
             {
                 let outer = Array2::<f64>::zeros((0, 0));
                 let unified_diag =
-                    super::unified::compute_corrected_covariance_diagonal(&[], &[], &outer, &hop);
+                    super::reml_outer_engine::compute_corrected_covariance_diagonal(&[], &[], &outer, &hop);
                 if let Ok(diag) = unified_diag {
                     let p = base_cov.nrows();
                     let max_dev = (0..p)
@@ -664,7 +664,7 @@ impl<'a> RemlState<'a> {
                     );
                 }
                 let unified_full =
-                    super::unified::compute_corrected_covariance(&[], &[], &outer, &hop);
+                    super::reml_outer_engine::compute_corrected_covariance(&[], &[], &outer, &hop);
                 if let Ok(full) = unified_full {
                     log::trace!(
                         "[corrected-cov] unified full norm: {:.4e}",

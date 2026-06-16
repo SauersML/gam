@@ -1523,7 +1523,7 @@ pub(crate) fn cert_zero_residual_must_not_emit_unbounded_gradient_through_gate()
 /// this test bit-for-bit, which is the point.
 #[test]
 pub(crate) fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
-    use crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock;
+    use crate::solver::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock;
 
     let h = array![[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 1.0]];
     let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
@@ -1616,7 +1616,7 @@ pub(crate) fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
 /// projected trace `½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z)` is O(1).
 #[test]
 pub(crate) fn envelope_gradient_uses_constraint_tangent_projection() {
-    use crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock;
+    use crate::solver::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock;
 
     // Three-parameter Gaussian REML. Choose data so the optimum places
     // β₂ at its lower bound β₂ ≥ 0.5 — the active constraint

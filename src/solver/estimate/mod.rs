@@ -68,7 +68,7 @@ use std::sync::Arc;
 #[path = "../reml/mod.rs"]
 pub(crate) mod reml;
 
-pub use reml::unified::PenaltyCoordinate;
+pub use reml::reml_outer_engine::PenaltyCoordinate;
 
 mod error;
 mod evaluation;

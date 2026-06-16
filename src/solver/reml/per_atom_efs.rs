@@ -9,7 +9,7 @@
 //! frontier scale that is `10^4`–`10^5` coordinates. A dense outer
 //! quasi-Newton (ARC/BFGS) over that ρ-vector is impossible: it materializes an
 //! O(K²) outer Hessian and factorizes it every accepted step. The standard
-//! [`crate::solver::estimate::reml::unified::compute_efs_update`] is already
+//! [`crate::solver::estimate::reml::reml_outer_engine::compute_efs_update`] is already
 //! *per-coordinate decoupled* in its arithmetic — each ρ_i step is
 //! `log(1 − 2·g_full[i]/q_eff_i)`, a function of that atom's own gradient entry
 //! and penalty-quadratic curvature scale only — so EFS is the natural frontier

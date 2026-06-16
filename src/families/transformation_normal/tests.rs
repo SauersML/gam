@@ -1680,9 +1680,9 @@ pub(crate) fn ctn_large_n_outer_hvp_capability_selects_operator_path() {
     // a future regression that broke the cost crossover (e.g. flipped
     // a `>=` to `>`) would still be caught here.
     assert!(
-        crate::solver::estimate::reml::unified::outer_hessian_route_plan(
-            crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
-            crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
+        crate::solver::estimate::reml::reml_outer_engine::outer_hessian_route_plan(
+            crate::solver::estimate::reml::reml_outer_engine::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
+            crate::solver::estimate::reml::reml_outer_engine::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
             k_outer,
             true,
             false,

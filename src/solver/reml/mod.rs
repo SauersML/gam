@@ -27,7 +27,7 @@ mod rho_key;
 pub(crate) mod rho_prior_eval;
 mod sparse_exact_penalty;
 mod trace;
-pub(crate) mod unified;
+pub(crate) mod reml_outer_engine;
 
 pub(crate) use sparse_exact_penalty::{
     SparsePenaltyBlock, build_sparse_penalty_blocks_from_canonical,
@@ -1540,7 +1540,7 @@ mod tests {
             .evaluate_unified_with_psi_ext(
                 &rho,
                 None,
-                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
                 &hyper_dirs,
             )
             .expect("full Firth psi gradient should use analytic TK propagation");

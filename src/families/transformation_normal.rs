@@ -67,7 +67,7 @@ pub(crate) use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 pub(crate) use crate::solver::estimate::UnifiedFitResult;
-pub(crate) use crate::solver::estimate::reml::unified::{
+pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
     DriftDerivResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
 pub(crate) use crate::solver::resource::{MatrixMaterializationError, ResourcePolicy};

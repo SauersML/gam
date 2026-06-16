@@ -2874,7 +2874,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_t_arc: Arc<Array2<f64>>,
         x_ls_arc: Arc<Array2<f64>>,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
     {
         validate_block_count::<GamlssError>(
             "BinomialLocationScaleWiggleFamily",
@@ -3037,7 +3037,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_ls_arc: Arc<Array2<f64>>,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
     {
         validate_block_count::<GamlssError>(
             "BinomialLocationScaleWiggleFamily",

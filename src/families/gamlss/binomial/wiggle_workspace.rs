@@ -194,7 +194,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
     fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
     {
         self.family.bls_wiggle_directional_operator(
             &self.block_states,
@@ -221,7 +221,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         &self,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>
     {
         self.family.bls_wiggle_second_directional_operator(
             &self.block_states,

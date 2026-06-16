@@ -2052,7 +2052,7 @@ pub fn fit_survival_marginal_slope_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
-            use crate::solver::estimate::reml::unified::EvalMode;
+            use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
             let row_set_rows = match row_set {
                 crate::families::row_kernel::RowSet::All => outer_row_indices(options, n).len(),
                 crate::families::row_kernel::RowSet::Subsample { rows, .. } => rows.len(),

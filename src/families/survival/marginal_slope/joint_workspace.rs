@@ -185,7 +185,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
                 )
                 .map(|matrix| {
                     Some(Arc::new(
-                        crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix },
+                        crate::solver::estimate::reml::reml_outer_engine::DenseMatrixHyperOperator { matrix },
                     ) as Arc<dyn HyperOperator>)
                 });
         }
@@ -194,7 +194,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
             .map(|result| {
                 result.map(|matrix| {
                     Arc::new(
-                        crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix },
+                        crate::solver::estimate::reml::reml_outer_engine::DenseMatrixHyperOperator { matrix },
                     ) as Arc<dyn HyperOperator>
                 })
             })
@@ -245,7 +245,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
             .map(|result| {
                 result.map(|matrix| {
                     Arc::new(
-                        crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix },
+                        crate::solver::estimate::reml::reml_outer_engine::DenseMatrixHyperOperator { matrix },
                     ) as Arc<dyn HyperOperator>
                 })
             })

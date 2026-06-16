@@ -475,7 +475,7 @@ impl PenaltyPseudologdet {
         //                  eigendecomposition introduces at most O(p · ε · ‖S‖)
         //                  perturbation, so any eigenvalue ≤ r + delta is
         //                  indistinguishable from ridge-only within FP noise.
-        let noise_band = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let noise_band = super::reml_outer_engine::positive_eigenvalue_threshold(evals.as_slice().unwrap());
         let boundary = match ridge {
             Some(r) if r > 0.0 => r + noise_band,
             _ => noise_band,
@@ -1306,7 +1306,7 @@ mod tests {
             + 2.0 * r_psi.dot(&d).dot(&r_psi.t())
             + r.dot(&d).dot(&r_psi_psi.t());
 
-        let root = crate::estimate::reml::unified::penalty_matrix_root(&s_mat).unwrap();
+        let root = crate::estimate::reml::reml_outer_engine::penalty_matrix_root(&s_mat).unwrap();
         let penalty = crate::construction::CanonicalPenalty::from_dense_root(root, 3);
         let block_factored = PenaltyPseudologdet::from_penalties(&[penalty], &[1.0], 0.0, 3)
             .expect("block-factored pseudo-logdet");
@@ -1331,7 +1331,7 @@ mod tests {
         let s = array![[4.0, 2.0], [2.0, 1.0]];
         let ridge = 1e-4_f64;
 
-        let root = crate::estimate::reml::unified::penalty_matrix_root(&s).unwrap();
+        let root = crate::estimate::reml::reml_outer_engine::penalty_matrix_root(&s).unwrap();
         let penalty = crate::construction::CanonicalPenalty::from_dense_root(root, 2);
         let block_factored = PenaltyPseudologdet::from_penalties(&[penalty], &[1.0], ridge, 2)
             .expect("block-factored pseudo-logdet");

@@ -3145,7 +3145,7 @@ fn run_two_block_exact_joint_optimize(
                 Array1::zeros(theta_dim),
                 if matches!(
                     eval_mode,
-                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                    crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
                 ) {
                     crate::solver::rho_optimizer::HessianResult::Analytic(Array2::zeros((
                         theta_dim, theta_dim,
@@ -5265,7 +5265,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
                 Array1::zeros(theta_dim),
                 if matches!(
                     eval_mode,
-                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                    crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
                 ) {
                     crate::solver::rho_optimizer::HessianResult::Analytic(Array2::zeros((
                         theta_dim, theta_dim,

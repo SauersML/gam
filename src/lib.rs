@@ -110,7 +110,7 @@ pub use solver::estimate::reml::atoms::{
     BetaChannel, CriterionAtom, CriterionSum, HessianLogdetAtom, SampledBlockAtom, Sensitivity,
     StratumFingerprint, ThetaDirection,
 };
-pub use solver::estimate::reml::unified::PenaltySubspaceTrace;
+pub use solver::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
 // #986 frontier ρ-scaling: the per-atom decoupled EFS outer engine. `run_outer`
 // auto-routes to it at frontier rho dimension; callers with a known
 // arrow-border overlap drive `run_per_atom_efs` directly with an explicit

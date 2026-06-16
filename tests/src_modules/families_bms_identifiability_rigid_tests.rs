@@ -2160,7 +2160,7 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
     let evals_slice = evals
         .as_slice()
         .expect("contiguous transformed-basis penalty eigenvalues");
-    let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals_slice);
+    let threshold = crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
     let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
         smallest > threshold,
@@ -2207,7 +2207,7 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
     let evals_slice = evals
         .as_slice()
         .expect("contiguous transformed-basis penalty eigenvalues");
-    let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals_slice);
+    let threshold = crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
     let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
         smallest > threshold,

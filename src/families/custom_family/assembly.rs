@@ -12,7 +12,7 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     specs: &[ParameterBlockSpec],
     per_block: &[Array1<f64>],
     beta_flat: &Array1<f64>,
-    hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator>,
+    hessian_op: Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HessianOperator>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -111,7 +111,7 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
         // `−ℓ + ½βᵀSβ − Φ`, so the LAML cost must subtract the same gated
         // `Φ(β̂)` or the envelope-based analytic outer gradient and the value
         // describe different criteria at every Firth-active mode.
-        firth: firth_value.map(crate::estimate::reml::unified::ExactJeffreysTerm::value_only),
+        firth: firth_value.map(crate::estimate::reml::reml_outer_engine::ExactJeffreysTerm::value_only),
         nullspace_dim: None,
         barrier_config: None,
         ext_coords,
@@ -397,7 +397,7 @@ pub(crate) fn unified_joint_cost_gradient(
     per_block: &[Array1<f64>],
     rho: &Array1<f64>,
     beta_flat: &Array1<f64>,
-    hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator>,
+    hessian_op: Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HessianOperator>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -475,7 +475,7 @@ pub(crate) fn unified_joint_efs_eval(
     per_block: &[Array1<f64>],
     rho: &Array1<f64>,
     beta_flat: &Array1<f64>,
-    hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator>,
+    hessian_op: Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HessianOperator>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -543,10 +543,10 @@ pub(crate) fn unified_joint_efs_eval(
         .ok_or_else(|| "outer gradient must be contiguous for EFS".to_string())?;
 
     if has_psi {
-        let inner_hessian_scale = crate::estimate::reml::unified::hessian_operator_geometric_scale(
+        let inner_hessian_scale = crate::estimate::reml::reml_outer_engine::hessian_operator_geometric_scale(
             inner_solution.hessian_op.as_ref(),
         );
-        let hybrid = crate::estimate::reml::unified::compute_hybrid_efs_update(
+        let hybrid = crate::estimate::reml::reml_outer_engine::compute_hybrid_efs_update(
             &inner_solution,
             rho_slice,
             gradient_slice,
@@ -569,12 +569,12 @@ pub(crate) fn unified_joint_efs_eval(
             logdet_enclosure_gap: None,
         })
     } else {
-        let inner_hessian_scale = crate::estimate::reml::unified::hessian_operator_geometric_scale(
+        let inner_hessian_scale = crate::estimate::reml::reml_outer_engine::hessian_operator_geometric_scale(
             inner_solution.hessian_op.as_ref(),
         );
         Ok(crate::solver::rho_optimizer::EfsEval {
             cost: result.cost,
-            steps: crate::estimate::reml::unified::compute_efs_update(
+            steps: crate::estimate::reml::reml_outer_engine::compute_efs_update(
                 &inner_solution,
                 rho_slice,
                 gradient_slice,
@@ -939,7 +939,7 @@ pub(crate) fn joint_outer_evaluate(
         .ok()
         .and_then(|cache| cache.get(operator_fingerprint));
 
-    let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> = if let Some(
+    let hessian_op: Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HessianOperator> = if let Some(
         cached,
     ) =
         cached_operator
@@ -949,7 +949,7 @@ pub(crate) fn joint_outer_evaluate(
         );
         cached
     } else {
-        let built: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+        let built: Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HessianOperator> =
             if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
                 let ranges_vec = ranges.to_vec();
                 let s_lambdas = Arc::new(scaled_s_lambdas.clone());
@@ -1345,7 +1345,7 @@ pub(crate) fn joint_outer_evaluate_efs(
         })
         .collect();
 
-    let hessian_op: Arc<dyn crate::solver::estimate::reml::unified::HessianOperator> =
+    let hessian_op: Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HessianOperator> =
         if use_joint_matrix_free_path(total, joint_observation_count(&inner.block_states)) {
             let ranges_vec = ranges.to_vec();
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
@@ -2146,13 +2146,13 @@ pub struct BlockwiseInnerResult {
     /// the unified evaluator's `InnerAssembly::kkt_residual` for the
     /// outer REML/LAML scoring path. `None` when the solver path doesn't
     /// produce a typed KKT diagnostic (blockwise NR fallback, eager-stop).
-    pub kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
+    pub kkt_residual: Option<crate::estimate::reml::reml_outer_engine::ProjectedKktResidual>,
     /// Active linear-inequality constraint rows at the converged inner
     /// iterate. When `Some`, the unified evaluator builds the
     /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
     /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
     pub active_constraints:
-        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+        Option<Arc<crate::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock>>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
@@ -2192,7 +2192,7 @@ pub(crate) struct CachedInnerMode {
     pub(crate) block_logdet_h: f64,
     pub(crate) block_logdet_s: f64,
     pub(crate) joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-    pub(crate) kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
+    pub(crate) kkt_residual: Option<crate::estimate::reml::reml_outer_engine::ProjectedKktResidual>,
     pub(crate) active_constraints:
-        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+        Option<Arc<crate::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock>>,
 }

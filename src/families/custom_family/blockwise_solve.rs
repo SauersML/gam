@@ -752,7 +752,7 @@ pub(crate) fn assemble_active_constraint_block(
     block_active_sets: &[Option<Vec<usize>>],
     ranges: &[(usize, usize)],
     total_p: usize,
-) -> Option<crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock> {
+) -> Option<crate::solver::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock> {
     if block_constraints.len() != ranges.len() || block_active_sets.len() != ranges.len() {
         return None;
     }
@@ -796,7 +796,7 @@ pub(crate) fn assemble_active_constraint_block(
             out_row += 1;
         }
     }
-    Some(crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock { a })
+    Some(crate::solver::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock { a })
 }
 
 pub(crate) struct SimpleLowerBounds {

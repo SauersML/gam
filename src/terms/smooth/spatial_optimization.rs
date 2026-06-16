@@ -2962,7 +2962,7 @@ fn run_exact_joint_spatial_optimization(
     if outer_fd_audit_eligible {
         let audit = (|| -> Result<crate::solver::rho_optimizer::OuterGradientFdAudit, String> {
             let mut eval_at = |theta: &Array1<f64>,
-                               mode: crate::solver::estimate::reml::unified::EvalMode|
+                               mode: crate::solver::estimate::reml::reml_outer_engine::EvalMode|
              -> Result<
                 (
                     f64,
@@ -2971,7 +2971,7 @@ fn run_exact_joint_spatial_optimization(
                 ),
                 String,
             > {
-                use crate::solver::estimate::reml::unified::EvalMode;
+                use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
                 let order = if matches!(mode, EvalMode::ValueGradientHessian) {
                     OuterEvalOrder::ValueGradientHessian
                 } else {
@@ -5392,7 +5392,7 @@ where
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
-        crate::solver::estimate::reml::unified::EvalMode,
+        crate::solver::estimate::reml::reml_outer_engine::EvalMode,
         &crate::families::row_kernel::RowSet,
     ) -> Result<
         (
@@ -5738,7 +5738,7 @@ where
     if outer_fd_audit_eligible {
         let audit = (|| -> Result<crate::solver::rho_optimizer::OuterGradientFdAudit, String> {
             let mut eval_at = |theta: &Array1<f64>,
-                               mode: crate::solver::estimate::reml::unified::EvalMode|
+                               mode: crate::solver::estimate::reml::reml_outer_engine::EvalMode|
              -> Result<
                 (
                     f64,
@@ -5832,9 +5832,9 @@ where
             let need_hessian = matches!(clamped, OuterEvalOrder::ValueGradientHessian)
                 && analytic_outer_hessian_available;
             let eval_mode = if need_hessian {
-                crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
             } else {
-                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
             };
             let t0 = std::time::Instant::now();
             let result = {
@@ -5909,7 +5909,7 @@ where
                         theta,
                         &specs,
                         &designs,
-                        crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
+                        crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
                         &row_set_borrow,
                     )
                 };
@@ -6115,7 +6115,7 @@ where
                 &theta_star,
                 &specs,
                 &designs,
-                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
                 &row_set_borrow,
             )?
         };

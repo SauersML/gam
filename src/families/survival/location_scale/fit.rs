@@ -713,7 +713,7 @@ pub(crate) fn fit_survival_location_scale_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
-            use crate::solver::estimate::reml::unified::EvalMode;
+            use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
             if !analytic_joint_gradient_available {
                 return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "analytic spatial psi derivatives are unavailable for survival exact two-block path"
                         .to_string(), }.into());

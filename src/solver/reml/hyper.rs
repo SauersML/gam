@@ -116,7 +116,7 @@ pub(crate) fn build_active_design_matrix(
     }
 }
 
-impl super::unified::HyperOperator for TauTauPairHyperOperator {
+impl super::reml_outer_engine::HyperOperator for TauTauPairHyperOperator {
     fn dim(&self) -> usize {
         self.p
     }
@@ -256,7 +256,7 @@ pub(crate) struct TauBetaDriftDerivOperator {
     pub(crate) p: usize,
 }
 
-impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
+impl super::reml_outer_engine::HyperOperator for TauBetaDriftDerivOperator {
     fn dim(&self) -> usize {
         self.p
     }
@@ -282,17 +282,17 @@ impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
 
 pub(crate) fn drift_deriv_result_from_parts(
     dense: Option<Array2<f64>>,
-    mut operators: Vec<std::sync::Arc<dyn super::unified::HyperOperator>>,
+    mut operators: Vec<std::sync::Arc<dyn super::reml_outer_engine::HyperOperator>>,
     dim_hint: usize,
-) -> Option<super::unified::DriftDerivResult> {
+) -> Option<super::reml_outer_engine::DriftDerivResult> {
     match (dense, operators.len()) {
         (None, 0) => None,
-        (Some(matrix), 0) => Some(super::unified::DriftDerivResult::Dense(matrix)),
-        (None, 1) => Some(super::unified::DriftDerivResult::Operator(
+        (Some(matrix), 0) => Some(super::reml_outer_engine::DriftDerivResult::Dense(matrix)),
+        (None, 1) => Some(super::reml_outer_engine::DriftDerivResult::Operator(
             operators.pop().expect("single operator drift derivative"),
         )),
-        (dense, _) => Some(super::unified::DriftDerivResult::Operator(
-            std::sync::Arc::new(super::unified::CompositeHyperOperator {
+        (dense, _) => Some(super::reml_outer_engine::DriftDerivResult::Operator(
+            std::sync::Arc::new(super::reml_outer_engine::CompositeHyperOperator {
                 dense,
                 operators,
                 dim_hint,
@@ -317,14 +317,14 @@ pub(crate) fn drift_deriv_result_from_parts(
 /// base operator, the dense `x_tau`, the prepared single-coordinate kernel,
 /// and an `Arc` to the Firth operator.
 pub(crate) struct FirthAugmentedSingleHyperOperator {
-    pub(crate) base: std::sync::Arc<dyn super::unified::HyperOperator>,
+    pub(crate) base: std::sync::Arc<dyn super::reml_outer_engine::HyperOperator>,
     pub(crate) firth_op: std::sync::Arc<super::FirthDenseOperator>,
     pub(crate) tau_kernel: super::FirthTauPartialKernel,
     pub(crate) x_tau_dense: Array2<f64>,
     pub(crate) p: usize,
 }
 
-impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
+impl super::reml_outer_engine::HyperOperator for FirthAugmentedSingleHyperOperator {
     fn dim(&self) -> usize {
         self.p
     }
@@ -346,7 +346,7 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
     }
 
     /// Bypass the default per-column trace path so the inner
-    /// [`super::unified::ImplicitHyperOperator`]'s shared-X chunked
+    /// [`super::reml_outer_engine::ImplicitHyperOperator`]'s shared-X chunked
     /// GEMM trace fires through this Firth wrapper instead of being
     /// undone by the wrapper's per-column `mul_vec` (which would reload
     /// the lazy design `rank` times).
@@ -382,7 +382,7 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
 /// single-τ wiring at `build_tau_hyper_coords` (B_j += −Hφ_τ_j|β for the
 /// diagonal; here we apply the same sign to the pair drift).
 pub(crate) struct FirthAugmentedPairHyperOperator {
-    pub(crate) base: Box<dyn super::unified::HyperOperator>,
+    pub(crate) base: Box<dyn super::reml_outer_engine::HyperOperator>,
     pub(crate) firth_op: std::sync::Arc<super::FirthDenseOperator>,
     pub(crate) pair_kernel: super::FirthTauTauPartialKernel,
     pub(crate) x_tau_i_dense: Array2<f64>,
@@ -390,7 +390,7 @@ pub(crate) struct FirthAugmentedPairHyperOperator {
     pub(crate) p: usize,
 }
 
-impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
+impl super::reml_outer_engine::HyperOperator for FirthAugmentedPairHyperOperator {
     fn dim(&self) -> usize {
         self.p
     }
@@ -852,9 +852,9 @@ impl<'a> RemlState<'a> {
         firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
         x_tau_dense_list: std::sync::Arc<Vec<Option<Array2<f64>>>>,
         x_tau_tau_dense: std::sync::Arc<Vec<Vec<Option<Array2<f64>>>>>,
-    ) -> Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync> {
+    ) -> Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync> {
         Box::new(
-            move |i: usize, j: usize| -> super::unified::HyperCoordPair {
+            move |i: usize, j: usize| -> super::reml_outer_engine::HyperCoordPair {
                 let ld_s_ij = pld.tau_hessian_component(
                     &s_tau_list[i],
                     &s_tau_list[j],
@@ -924,7 +924,7 @@ impl<'a> RemlState<'a> {
                 } else {
                     None
                 };
-                let base_b_operator: Box<dyn super::unified::HyperOperator> =
+                let base_b_operator: Box<dyn super::reml_outer_engine::HyperOperator> =
                     Box::new(TauTauPairHyperOperator {
                         x_tau_i: x_tau_i.clone(),
                         x_tau_j: x_tau_j.clone(),
@@ -972,7 +972,7 @@ impl<'a> RemlState<'a> {
                             true,
                         );
                         let kernel_opt = bundle.tau_tau_kernel;
-                        let wrapped: Box<dyn super::unified::HyperOperator> = match kernel_opt {
+                        let wrapped: Box<dyn super::reml_outer_engine::HyperOperator> = match kernel_opt {
                             Some(kernel) => Box::new(FirthAugmentedPairHyperOperator {
                                 base: base_b_operator,
                                 firth_op: std::sync::Arc::clone(op),
@@ -989,7 +989,7 @@ impl<'a> RemlState<'a> {
                     }
                 };
 
-                super::unified::HyperCoordPair {
+                super::reml_outer_engine::HyperCoordPair {
                     a: a_ij + a_firth,
                     g: &g_firth - &g_ij,
                     b_mat: Array2::<f64>::zeros((0, 0)),
@@ -1009,9 +1009,9 @@ impl<'a> RemlState<'a> {
         a_k_tau_j_mats: std::sync::Arc<Vec<Vec<Option<Array2<f64>>>>>,
         beta_eval: std::sync::Arc<Array1<f64>>,
         p_dim: usize,
-    ) -> Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync> {
+    ) -> Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync> {
         Box::new(
-            move |k: usize, j: usize| -> super::unified::HyperCoordPair {
+            move |k: usize, j: usize| -> super::reml_outer_engine::HyperCoordPair {
                 let s_tau_j = s_tau_list.get(j);
                 let a_k_tau_j = a_k_tau_j_mats
                     .get(j)
@@ -1038,7 +1038,7 @@ impl<'a> RemlState<'a> {
                     .cloned()
                     .unwrap_or_else(|| Array2::<f64>::zeros((p_dim, p_dim)));
 
-                super::unified::HyperCoordPair {
+                super::reml_outer_engine::HyperCoordPair {
                     a: a_kj,
                     g: g_kj,
                     b_mat: b_kj,
@@ -1106,13 +1106,13 @@ impl<'a> RemlState<'a> {
                 order
             } {
                 crate::solver::rho_optimizer::OuterEvalOrder::Value => {
-                    super::unified::EvalMode::ValueOnly
+                    super::reml_outer_engine::EvalMode::ValueOnly
                 }
                 crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => {
-                    super::unified::EvalMode::ValueAndGradient
+                    super::reml_outer_engine::EvalMode::ValueAndGradient
                 }
                 crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian => {
-                    super::unified::EvalMode::ValueGradientHessian
+                    super::reml_outer_engine::EvalMode::ValueGradientHessian
                 }
             };
             let result =
@@ -1164,10 +1164,10 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<
         (
-            Vec<super::unified::HyperCoord>,
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-            Option<super::unified::FixedDriftDerivFn>,
+            Vec<super::reml_outer_engine::HyperCoord>,
+            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Option<super::reml_outer_engine::FixedDriftDerivFn>,
         ),
         EstimationError,
     > {
@@ -1185,11 +1185,11 @@ impl<'a> RemlState<'a> {
                  dense design materialization too large; falling back to rho-only REML"
             );
             let identity_pair: Box<
-                dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync,
-            > = Box::new(|_, _| super::unified::HyperCoordPair::zero());
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync,
+            > = Box::new(|_, _| super::reml_outer_engine::HyperCoordPair::zero());
             let identity_pair2: Box<
-                dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync,
-            > = Box::new(|_, _| super::unified::HyperCoordPair::zero());
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync,
+            > = Box::new(|_, _| super::reml_outer_engine::HyperCoordPair::zero());
             return Ok((Vec::new(), identity_pair, identity_pair2, None));
         }
         let backend_label;
@@ -1278,7 +1278,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
         for_hessian: bool,
-    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+    ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         let psi_dim = hyper_dirs.len();
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -1294,10 +1294,10 @@ impl<'a> RemlState<'a> {
         let p_dim = beta_eval.len();
         if p_dim == 0 {
             return Ok((0..psi_dim)
-                .map(|j| super::unified::HyperCoord {
+                .map(|j| super::reml_outer_engine::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
-                    drift: super::unified::HyperCoordDrift::none(),
+                    drift: super::reml_outer_engine::HyperCoordDrift::none(),
                     ld_s: 0.0,
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
@@ -1591,10 +1591,10 @@ impl<'a> RemlState<'a> {
                 let mut b_j = dgram_t.clone();
                 b_j += &s_tau_j;
                 let ld_s_j = penalty_logdet.tau_gradient_component(&s_tau_j);
-                coords.push(super::unified::HyperCoord {
+                coords.push(super::reml_outer_engine::HyperCoord {
                     a: a_j,
                     g: -g_j,
-                    drift: super::unified::HyperCoordDrift::from_parts(Some(b_j), None),
+                    drift: super::reml_outer_engine::HyperCoordDrift::from_parts(Some(b_j), None),
                     ld_s: ld_s_j,
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
@@ -1722,7 +1722,7 @@ impl<'a> RemlState<'a> {
             // `−Hφ_{τ_j}|β · v` is applied matrix-free via
             // `firth_hphi_tau_partial_apply`, matching the dense fallback at
             // the bottom of this loop.
-            let b_operator: Option<std::sync::Arc<dyn super::unified::HyperOperator>> =
+            let b_operator: Option<std::sync::Arc<dyn super::reml_outer_engine::HyperOperator>> =
                 if use_implicit {
                     if let Some((implicit_deriv, axis)) = implicit_first {
                         // Non-Gaussian: c ⊙ (X_{ψ_d} β̂), length n. `x_tau_beta_j`
@@ -1736,8 +1736,8 @@ impl<'a> RemlState<'a> {
                         } else {
                             None
                         };
-                        let core: std::sync::Arc<dyn super::unified::HyperOperator> =
-                            std::sync::Arc::new(super::unified::ImplicitHyperOperator {
+                        let core: std::sync::Arc<dyn super::reml_outer_engine::HyperOperator> =
+                            std::sync::Arc::new(super::reml_outer_engine::ImplicitHyperOperator {
                                 implicit_deriv,
                                 axis,
                                 x_design: x_design_shared.clone().unwrap(),
@@ -1852,10 +1852,10 @@ impl<'a> RemlState<'a> {
                 -g_j
             };
 
-            coords.push(super::unified::HyperCoord {
+            coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
                 g: stored_g_j,
-                drift: super::unified::HyperCoordDrift::from_parts(dense_b, b_operator),
+                drift: super::reml_outer_engine::HyperCoordDrift::from_parts(dense_b, b_operator),
                 ld_s: ld_s_j,
                 b_depends_on_beta,
                 is_penalty_like: hyper_dirs[j].is_penalty_like,
@@ -1875,7 +1875,7 @@ impl<'a> RemlState<'a> {
         c_array: Array1<f64>,
         d_array: Array1<f64>,
         firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
-    ) -> super::unified::FixedDriftDerivFn {
+    ) -> super::reml_outer_engine::FixedDriftDerivFn {
         let x_design = std::sync::Arc::new(x_design);
         let beta_eval = std::sync::Arc::new(beta_eval);
         let x_tau_beta_list: Vec<Array1<f64>> = x_tau_dense_list
@@ -1890,7 +1890,7 @@ impl<'a> RemlState<'a> {
         Box::new(
             move |ext_idx: usize,
                   direction: &Array1<f64>|
-                  -> Option<super::unified::DriftDerivResult> {
+                  -> Option<super::reml_outer_engine::DriftDerivResult> {
                 let x_tau = x_tau_dense_list.get(ext_idx)?;
                 let x_tau_beta = x_tau_beta_list.get(ext_idx)?;
                 if x_tau.ncols() != direction.len() || x_tau_beta.len() != x_tau.nrows() {
@@ -1924,7 +1924,7 @@ impl<'a> RemlState<'a> {
                         })
                 });
 
-                let mut operators: Vec<std::sync::Arc<dyn super::unified::HyperOperator>> =
+                let mut operators: Vec<std::sync::Arc<dyn super::reml_outer_engine::HyperOperator>> =
                     Vec::new();
                 if c_x_u.iter().any(|value| value.abs() > 0.0)
                     || c_x_tau_u_plus_d_cross.iter().any(|value| value.abs() > 0.0)
@@ -1947,7 +1947,7 @@ impl<'a> RemlState<'a> {
         &self,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
-    ) -> Result<super::unified::FixedDriftDerivFn, EstimationError> {
+    ) -> Result<super::reml_outer_engine::FixedDriftDerivFn, EstimationError> {
         let pirls_result = bundle.pirls_result.as_ref();
         let reparam_result = &pirls_result.reparam_result;
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
@@ -2027,7 +2027,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
         for_hessian: bool,
-    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+    ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         let psi_dim = hyper_dirs.len();
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -2036,10 +2036,10 @@ impl<'a> RemlState<'a> {
         let n_obs = self.y.len();
         if p_dim == 0 {
             return Ok((0..psi_dim)
-                .map(|j| super::unified::HyperCoord {
+                .map(|j| super::reml_outer_engine::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
-                    drift: super::unified::HyperCoordDrift::none(),
+                    drift: super::reml_outer_engine::HyperCoordDrift::none(),
                     ld_s: 0.0,
                     b_depends_on_beta: false,
                     is_penalty_like: hyper_dirs[j].is_penalty_like,
@@ -2171,10 +2171,10 @@ impl<'a> RemlState<'a> {
                 let mut b_j = dgram_t.clone();
                 b_j += &s_tau_j;
                 let ld_s_j = pld.tau_gradient_component(&s_tau_j);
-                coords.push(super::unified::HyperCoord {
+                coords.push(super::reml_outer_engine::HyperCoord {
                     a: a_j,
                     g: -g_j,
-                    drift: super::unified::HyperCoordDrift::from_parts(Some(b_j), None),
+                    drift: super::reml_outer_engine::HyperCoordDrift::from_parts(Some(b_j), None),
                     ld_s: ld_s_j,
                     b_depends_on_beta: false,
                     is_penalty_like: dir.is_penalty_like,
@@ -2269,11 +2269,11 @@ impl<'a> RemlState<'a> {
                 -g_j
             };
 
-            coords.push(super::unified::HyperCoord {
+            coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
                 g: stored_g_j,
-                drift: super::unified::HyperCoordDrift::from_operator(std::sync::Arc::new(
-                    super::unified::SparseDirectionalHyperOperator {
+                drift: super::reml_outer_engine::HyperCoordDrift::from_operator(std::sync::Arc::new(
+                    super::reml_outer_engine::SparseDirectionalHyperOperator {
                         x_tau: dir.x_tau_original.clone(),
                         x_design: x_design.clone(),
                         w_diag: w_diag.clone(),
@@ -2299,7 +2299,7 @@ impl<'a> RemlState<'a> {
         &self,
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
-    ) -> Result<super::unified::FixedDriftDerivFn, EstimationError> {
+    ) -> Result<super::reml_outer_engine::FixedDriftDerivFn, EstimationError> {
         let pirls_result = bundle.pirls_result.as_ref();
         let beta_eval = self.sparse_exact_beta_original(pirls_result);
         let x_tau_dense_list: Vec<Array2<f64>> = hyper_dirs
@@ -2346,7 +2346,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         hyper_dirs: &[DirectionalHyperParam],
         for_hessian: bool,
-    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+    ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         if bundle.sparse_exact.is_none() {
             crate::bail_invalid_estim!("missing sparse exact evaluation payload");
         }
@@ -2365,8 +2365,8 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<
         (
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
         ),
         EstimationError,
     > {
@@ -2376,14 +2376,14 @@ impl<'a> RemlState<'a> {
         let lambdas = rho.mapv(f64::exp);
 
         if p_dim == 0 {
-            let tau_tau_pair_fn = move |_: usize, _: usize| super::unified::HyperCoordPair {
+            let tau_tau_pair_fn = move |_: usize, _: usize| super::reml_outer_engine::HyperCoordPair {
                 a: 0.0,
                 g: Array1::zeros(p_dim),
                 b_mat: Array2::zeros((p_dim, p_dim)),
                 b_operator: None,
                 ld_s: 0.0,
             };
-            let rho_tau_pair_fn = move |_: usize, _: usize| super::unified::HyperCoordPair {
+            let rho_tau_pair_fn = move |_: usize, _: usize| super::reml_outer_engine::HyperCoordPair {
                 a: 0.0,
                 g: Array1::zeros(p_dim),
                 b_mat: Array2::zeros((p_dim, p_dim)),
@@ -2539,8 +2539,8 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<
         (
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
         ),
         EstimationError,
     > {
@@ -2582,8 +2582,8 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<
         (
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::unified::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
         ),
         EstimationError,
     > {
@@ -2802,7 +2802,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         sas_state: &crate::types::SasLinkState,
         is_beta_logistic: bool,
-    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+    ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         use crate::mixture_link::{
             beta_logistic_inverse_link_jetwith_param_partials,
             sas_inverse_link_jetwith_param_partials,
@@ -2843,10 +2843,10 @@ impl<'a> RemlState<'a> {
 
         if p_dim == 0 {
             return Ok((0..aux_dim)
-                .map(|_| super::unified::HyperCoord {
+                .map(|_| super::reml_outer_engine::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
-                    drift: super::unified::HyperCoordDrift::none(),
+                    drift: super::reml_outer_engine::HyperCoordDrift::none(),
                     ld_s: 0.0,
                     b_depends_on_beta: true,
                     is_penalty_like: false,
@@ -2954,10 +2954,10 @@ impl<'a> RemlState<'a> {
             let b_j =
                 Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
 
-            coords.push(super::unified::HyperCoord {
+            coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
                 g: g_j,
-                drift: super::unified::HyperCoordDrift::from_dense(b_j),
+                drift: super::reml_outer_engine::HyperCoordDrift::from_dense(b_j),
                 ld_s: 0.0,
                 // Link parameters affect working weights through the link,
                 // and the working weights depend on β through η = Xβ,
@@ -2990,7 +2990,7 @@ impl<'a> RemlState<'a> {
         &self,
         bundle: &EvalShared,
         mix_state: &crate::types::MixtureLinkState,
-    ) -> Result<Vec<super::unified::HyperCoord>, EstimationError> {
+    ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         use crate::mixture_link::mixture_inverse_link_jetwith_rho_partials_into;
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -3031,10 +3031,10 @@ impl<'a> RemlState<'a> {
 
         if p_dim == 0 {
             return Ok((0..aux_dim)
-                .map(|_| super::unified::HyperCoord {
+                .map(|_| super::reml_outer_engine::HyperCoord {
                     a: 0.0,
                     g: Array1::zeros(0),
-                    drift: super::unified::HyperCoordDrift::none(),
+                    drift: super::reml_outer_engine::HyperCoordDrift::none(),
                     ld_s: 0.0,
                     b_depends_on_beta: true,
                     is_penalty_like: false,
@@ -3132,10 +3132,10 @@ impl<'a> RemlState<'a> {
             let b_j =
                 Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
 
-            coords.push(super::unified::HyperCoord {
+            coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
                 g: g_j,
-                drift: super::unified::HyperCoordDrift::from_dense(b_j),
+                drift: super::reml_outer_engine::HyperCoordDrift::from_dense(b_j),
                 ld_s: 0.0,
                 b_depends_on_beta: true,
                 is_penalty_like: false,
@@ -3151,7 +3151,7 @@ impl<'a> RemlState<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::unified::HyperOperator;
+    use super::super::reml_outer_engine::HyperOperator;
     use super::*;
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
@@ -3160,9 +3160,9 @@ mod tests {
     /// a known dense matrix; we use it as a deterministic stand-in for the
     /// base operator (e.g. `ImplicitHyperOperator`) when wiring an
     /// augmentation test. `super::*` brings the unified types in via
-    /// `super::unified::DenseMatrixHyperOperator`.
-    pub(crate) fn dense_op(matrix: Array2<f64>) -> Arc<dyn super::super::unified::HyperOperator> {
-        Arc::new(super::super::unified::DenseMatrixHyperOperator { matrix })
+    /// `super::reml_outer_engine::DenseMatrixHyperOperator`.
+    pub(crate) fn dense_op(matrix: Array2<f64>) -> Arc<dyn super::super::reml_outer_engine::HyperOperator> {
+        Arc::new(super::super::reml_outer_engine::DenseMatrixHyperOperator { matrix })
     }
 
     /// Contract: `FirthAugmentedSingleHyperOperator::mul_vec(v)` reproduces

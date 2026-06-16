@@ -3177,7 +3177,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult>, String> {
         let p_total = *self
             .family
             .joint_block_offsets()
@@ -3205,7 +3205,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
                 psi_index,
                 d_beta_flat,
             )?
-            .map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense))
+            .map(crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Dense))
     }
 }
 

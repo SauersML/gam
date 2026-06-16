@@ -1704,9 +1704,9 @@
                 &derivative_blocks,
                 None,
                 if need_hessian {
-                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                    crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
                 } else {
-                    crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+                    crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
                 },
             )
             .expect("joint hyper eval")
@@ -1869,7 +1869,7 @@
                 &Array1::zeros(0),
                 &derivative_blocks,
                 None,
-                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
             )
             .expect("joint hyper eval")
         };

@@ -37,7 +37,7 @@ pub(crate) use crate::solver::active_set::{
     project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
 pub(crate) use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-pub(crate) use crate::solver::estimate::reml::unified::{
+pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
     BlockCoupledOperator, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
     DenseSpectralOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
     HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift, HyperCoordPair,
@@ -65,7 +65,7 @@ pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub(crate) use thiserror::Error;
 
-pub use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
+pub use crate::solver::estimate::reml::reml_outer_engine::{EvalMode, PseudoLogdetMode};
 
 mod assembly;
 mod block_spec;

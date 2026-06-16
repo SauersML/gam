@@ -17,7 +17,7 @@
 //!   ([`UnifiedOuterHessianOperator`] and `build_outer_hessian_operator`).
 //!
 //! Every submodule reaches its cross-concern dependencies (and the parent
-//! `unified` namespace) through `use super::*;`; each item keeps the exact
+//! `reml_outer_engine` namespace) through `use super::*;`; each item keeps the exact
 //! visibility it carried before the split, and the globs below re-flatten the
 //! submodules back into this module so external `…::outer_derivatives::<Name>`
 //! paths and the parent's `pub use outer_derivatives::*;` are unchanged.

@@ -3540,9 +3540,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             &derivative_blocks,
             st.warm_cache.as_ref(),
             if need_hessian {
-                crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
             } else {
-                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
             },
         )
         .map_err(|e| {
@@ -3618,7 +3618,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &rho,
                 &derivative_blocks,
                 st.warm_cache.as_ref(),
-                crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
             )
             .map_err(|e| {
                 EstimationError::RemlOptimizationFailed(format!(
@@ -3704,7 +3704,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &rho,
                 &derivative_blocks,
                 st.warm_cache.as_ref(),
-                crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
+                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
             )
             .map_err(|e| {
                 EstimationError::RemlOptimizationFailed(format!(

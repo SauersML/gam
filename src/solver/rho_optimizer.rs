@@ -17,7 +17,7 @@ use crate::warm_start::{LoadSource, Session as CacheSession};
 
 use crate::estimate::EstimationError;
 
-use crate::solver::estimate::reml::unified::BarrierConfig;
+use crate::solver::estimate::reml::reml_outer_engine::BarrierConfig;
 
 use crate::solver::priority_selection::{
     PriorityBudgetStage, PriorityStageSummary, rank_indices_with_budget_cascade,

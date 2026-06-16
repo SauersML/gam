@@ -1,7 +1,7 @@
 //! Exact pseudo-logdet eigenspectrum kernels for the REML/LAML criteria:
 //! the relative positive-eigenvalue threshold and the exact pseudo-logdet on
 //! the positive eigenspace. Both are pure `&[f64] -> f64` scalar kernels with
-//! no dependency on the rest of `unified.rs`; relocated here verbatim to shrink
+//! no dependency on the rest of `reml_outer_engine.rs`; relocated here verbatim to shrink
 //! the parent module, which re-imports them so every call site is unchanged.
 
 /// Positive-eigenvalue threshold for a given eigenspectrum.

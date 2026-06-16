@@ -299,7 +299,7 @@ pub(crate) fn smoothness_nullspace_orthogonal_complement(
     let evals = eigenvalues
         .as_slice()
         .ok_or_else(|| "raw smoothness penalty eigenvalues are not contiguous".to_string())?;
-    let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals);
+    let threshold = crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals);
     let kept: Vec<usize> = evals
         .iter()
         .enumerate()
@@ -991,7 +991,7 @@ impl DeviationRuntime {
                 reason: format!("deviation integrated penalty eigendecomposition failed: {e}"),
             })
         })?;
-        let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(
+        let threshold = crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
             evals.as_slice().ok_or_else(|| {
                 String::from(DeviationRuntimeError::NumericalFailure {
                     reason: "deviation penalty eigenvalues are not contiguous".to_string(),

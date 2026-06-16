@@ -532,7 +532,7 @@ where
             .with_prefer_gradient_only(prefer_gradient_only)
             .with_continuation_prewarm(continuation_prewarm)
             .with_barrier(
-                crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
+                crate::solver::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),
             )
@@ -815,7 +815,7 @@ where
             .with_continuation_prewarm(continuation_prewarm)
             .with_psi_dim(mixture_dim + sas_dim)
             .with_barrier(
-                crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
+                crate::solver::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
                     fit_linear_constraints.as_ref(),
                 ),
             )
@@ -929,7 +929,7 @@ where
                 // This computes ρ gradient AND link parameter gradient jointly
                 // through the same HyperCoord infrastructure used for aniso ψ.
                 let eval_mode =
-                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian;
+                    crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian;
                 let result = state.evaluate_unified_with_link_ext(&rho, eval_mode)?;
 
                 let cost = result.cost + sas_ridge_cost(theta);

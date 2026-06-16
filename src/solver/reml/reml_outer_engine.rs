@@ -187,7 +187,8 @@ mod stochastic_trace;
 
 // Flatten every concern submodule's items back into this module's namespace so
 // that (a) sibling submodules resolve cross-concern names through `use super::*;`
-// and (b) external callers keep their existing `…::reml::unified::<Name>` paths.
+// and (b) external callers reach every item through the flat
+// `…::reml::reml_outer_engine::<Name>` namespace.
 // Each `*` glob re-exports exactly the visibility the moved item already carried
 // (`pub` stays `pub`, `pub(crate)` stays `pub(crate)`); private items stay
 // private to their submodule.

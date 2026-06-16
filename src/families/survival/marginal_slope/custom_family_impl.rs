@@ -102,7 +102,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             // Rigid survival marginal-slope evaluates outer rho/psi
             // coordinate corrections and projected logdet traces through
             // row-kernel/HVP paths.  The projected subspace trace reductions
-            // are batched in `reml::unified`, so the shared X·U_S work is
+            // are batched in `reml::reml_outer_engine`, so the shared X·U_S work is
             // paid once per derivative group rather than once per coordinate.
             // Model the work that actually executes: one row-kernel pass per
             // outer coordinate and coefficient axis, plus the fixed four

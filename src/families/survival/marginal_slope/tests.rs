@@ -1783,7 +1783,7 @@ fn survival_marginal_slope_advertises_outer_hvp_at_large_psi_dim() {
         family.exact_outer_derivative_order(&specs, &options),
         ExactOuterDerivativeOrder::Second
     );
-    assert!(crate::solver::estimate::reml::unified::prefer_outer_hessian_operator(50_001, 2, 32,));
+    assert!(crate::solver::estimate::reml::reml_outer_engine::prefer_outer_hessian_operator(50_001, 2, 32,));
     assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
@@ -5256,7 +5256,7 @@ fn survival_psi_workspace_hessian_directional_derivative_is_operator_and_matches
         .expect("workspace drift")
         .expect("workspace drift available");
 
-    let crate::solver::estimate::reml::unified::DriftDerivResult::Operator(op) = result else {
+    let crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator(op) = result else {
         panic!("survival psi drift should use operator representation");
     };
     assert_eq!(op.dim(), dense.nrows());

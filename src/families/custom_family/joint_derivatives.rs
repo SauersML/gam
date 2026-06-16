@@ -25,7 +25,7 @@ pub(crate) fn joint_second_derivative_correction_result(
     let Some(term2) = compute_d2h(&neg_v_l, &neg_v_k)? else {
         return Ok(None);
     };
-    let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+    let op = crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
         dense: None,
         operators: vec![term1.into_operator(), term2.into_operator()],
         dim_hint: u_kl.len(),
@@ -112,7 +112,7 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
                 .enumerate()
                 .map(|(idx, (_, _, u_kl))| match (&term1s[idx], &term2s[idx]) {
                     (Some(t1), Some(t2)) => {
-                        let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                        let op = crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
                             dense: None,
                             operators: vec![t1.clone().into_operator(), t2.clone().into_operator()],
                             dim_hint: u_kl.len(),
@@ -251,7 +251,7 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
                 .enumerate()
                 .map(|(idx, (_, _, u_kl))| match (&term1s[idx], &term2s[idx]) {
                     (Some(t1), Some(t2)) => {
-                        let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                        let op = crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
                             dense: None,
                             operators: vec![t1.clone().into_operator(), t2.clone().into_operator()],
                             dim_hint: u_kl.len(),
@@ -281,9 +281,9 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 
     fn outer_hessian_derivative_kernel(
         &self,
-    ) -> Option<crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel> {
+    ) -> Option<crate::solver::estimate::reml::reml_outer_engine::OuterHessianDerivativeKernel> {
         Some(
-            crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel::Callback {
+            crate::solver::estimate::reml::reml_outer_engine::OuterHessianDerivativeKernel::Callback {
                 first: Arc::clone(&self.compute_dh),
                 second: Arc::clone(&self.compute_d2h),
             },
@@ -406,7 +406,7 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
             }
             (Some(DriftDerivResult::Operator(operator)), Some(d)) => {
                 Some(DriftDerivResult::Operator(Arc::new(
-                    crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                    crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
                         dense: Some(d),
                         operators: vec![operator],
                         dim_hint: self.p,
@@ -450,7 +450,7 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
                     }
                     (Some(DriftDerivResult::Operator(operator)), Some(d)) => {
                         Some(DriftDerivResult::Operator(Arc::new(
-                            crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                            crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
                                 dense: Some(d),
                                 operators: vec![operator],
                                 dim_hint: self.p,
@@ -517,7 +517,7 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
 
     fn outer_hessian_derivative_kernel(
         &self,
-    ) -> Option<crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel> {
+    ) -> Option<crate::solver::estimate::reml::reml_outer_engine::OuterHessianDerivativeKernel> {
         // Delegate to the inner provider so the matrix-free outer-HESSIAN route
         // (the `Callback { first, second }` kernel) is preserved. This kernel
         // feeds ONLY the outer Hessian, never the gradient (the gradient's

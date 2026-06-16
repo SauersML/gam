@@ -2019,7 +2019,7 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
             assert!(arr.iter().all(|v| !v.is_nan()));
             assert_eq!(psi_index, 0);
             Ok(Some(DriftDerivResult::Operator(Arc::new(
-                crate::solver::estimate::reml::unified::BlockLocalDrift {
+                crate::solver::estimate::reml::reml_outer_engine::BlockLocalDrift {
                     local: array![[3.0, 1.0], [1.0, 2.0]],
                     start: 1,
                     end: 3,

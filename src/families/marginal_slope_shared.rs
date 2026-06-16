@@ -23,7 +23,7 @@
 //! rather than chasing the stochastic noise floor.
 //!
 //! This subsampling is **complementary** to the trace-estimator tier
-//! system documented at the top of `solver::reml::unified` (exact /
+//! system documented at the top of `solver::reml::reml_outer_engine` (exact /
 //! Hutchinson multi-target / Hutch++ single-target). They operate on
 //! orthogonal axes — the trace estimators reduce work *within* the
 //! Hessian structure for a fixed row set; subsampling reduces the row
@@ -1580,7 +1580,7 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
 
     /// Hessian directional derivative for the σ-auxiliary parameter, returned
     /// as a dense matrix (the generic wraps it into
-    /// [`DriftDerivResult::Dense`](crate::solver::estimate::reml::unified::DriftDerivResult::Dense)).
+    /// [`DriftDerivResult::Dense`](crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Dense)).
     fn sigma_hessian_directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
@@ -1588,12 +1588,12 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
 
     /// Hessian directional derivative for a non-σ derivative axis, returned as
     /// a hyper-operator (the generic wraps it into
-    /// [`DriftDerivResult::Operator`](crate::solver::estimate::reml::unified::DriftDerivResult::Operator)).
+    /// [`DriftDerivResult::Operator`](crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator)).
     fn psi_hessian_directional_derivative(
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>;
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>;
 }
 
 /// Generic exact-Newton joint-ψ workspace shared by the marginal-slope
@@ -1667,19 +1667,19 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult>, String> {
         if self.family.is_sigma_aux(psi_index) {
             return self
                 .family
                 .sigma_hessian_directional_derivative(d_beta_flat)
                 .map(|result| {
-                    result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense)
+                    result.map(crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Dense)
                 });
         }
         self.family
             .psi_hessian_directional_derivative(psi_index, d_beta_flat)
             .map(|result| {
-                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator)
+                result.map(crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator)
             })
     }
 }
