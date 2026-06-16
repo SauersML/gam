@@ -20,7 +20,7 @@ def main():
     ap.add_argument("--seq_len", type=int, default=512)
     ap.add_argument("--max_tokens", type=int, default=300000)  # cap collected token-rows per layer
     ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--dataset", default="wikitext")
+    ap.add_argument("--dataset", default="Salesforce/wikitext")
     ap.add_argument("--dataset_config", default="wikitext-103-raw-v1")
     args = ap.parse_args()
 
@@ -55,17 +55,41 @@ def main():
     # ---- corpus ----
     log("loading corpus", args.dataset, args.dataset_config)
     from datasets import load_dataset
-    ds = load_dataset(args.dataset, args.dataset_config, split="train", streaming=True)
-    texts, it = [], iter(ds)
-    while len(texts) < args.n_docs:
+    candidates = [
+        (args.dataset, args.dataset_config),
+        ("Salesforce/wikitext", "wikitext-103-raw-v1"),
+        ("Salesforce/wikitext", "wikitext-2-raw-v1"),
+        ("stas/openwebtext-10k", None),
+        ("wikimedia/wikipedia", "20231101.en"),
+    ]
+    texts = []
+    manifest_dataset = f"{args.dataset}/{args.dataset_config}"
+    for name, cfg in candidates:
         try:
-            row = next(it)
-        except StopIteration:
-            break
-        t = row.get("text", "")
-        if t and len(t.strip()) > 200:
-            texts.append(t.strip())
-    log("collected", len(texts), "docs")
+            if cfg:
+                ds = load_dataset(name, cfg, split="train", streaming=True)
+            else:
+                ds = load_dataset(name, split="train", streaming=True)
+            it = iter(ds)
+            while len(texts) < args.n_docs:
+                try:
+                    row = next(it)
+                except StopIteration:
+                    break
+                t = row.get("text", "") or row.get("content", "")
+                if t and len(t.strip()) > 200:
+                    texts.append(t.strip())
+            log("corpus", name, cfg, "-> collected", len(texts), "docs")
+            if len(texts) >= max(200, args.n_docs // 4):
+                manifest_dataset = f"{name}/{cfg}" if cfg else name
+                break
+        except Exception as e:
+            log("corpus", name, cfg, "FAILED:", repr(e)[:200])
+            texts = []
+            continue
+    else:
+        raise RuntimeError("no corpus loaded")
+    log("collected", len(texts), "docs total")
 
     banks = {L: [] for L in layers}
     counts = {L: 0 for L in layers}
@@ -98,7 +122,7 @@ def main():
 
     # ---- save banks ----
     manifest = {"model": args.model, "n_layers": n_layers, "hidden": hidden,
-                "seq_len": args.seq_len, "dataset": f"{args.dataset}/{args.dataset_config}",
+                "seq_len": args.seq_len, "dataset": manifest_dataset,
                 "n_docs": len(texts), "layers": {}, "ts": time.time()}
     for L in layers:
         arr = np.concatenate(banks[L], axis=0)
