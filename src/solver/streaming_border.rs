@@ -498,7 +498,7 @@ impl StreamingBorderGram {
 
 /// Bridges arbitrary-length row batches onto the fixed chunk partition.
 ///
-/// A streaming row source ([`crate::terms::sae_corpus`]) yields batches whose
+/// A streaming row source ([`crate::terms::sae::corpus`]) yields batches whose
 /// lengths are set by I/O policy (batch size, shard boundaries) — they do
 /// **not** align with the deterministic chunk partition the accumulation tree
 /// is keyed on. This assembler buffers incoming rows and submits exact chunks

@@ -67,7 +67,7 @@ struct FisherTier {
 ///
 /// This object owns the corpus↔tier index mapping and the graceful-absence
 /// semantics; it deliberately does **not** own activations (those stream
-/// through [`crate::terms::sae_corpus`]) — it is the metric side of the
+/// through [`crate::terms::sae::corpus`]) — it is the metric side of the
 /// harvest, keyed by the same stable row ids.
 pub struct TieredHarvest {
     /// Total corpus rows (tier 1).
