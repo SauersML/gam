@@ -4545,6 +4545,90 @@ pub(crate) fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction()
     }
 }
 
+/// gam#979 survival marginal-slope flex non-convergence (the constrained
+/// joint-Newton feasibility reroute). When a trust-region trial step crosses a
+/// BINDING monotonicity row — the current iterate sits on the cone face
+/// (slack≈0) and the step has negative drift on that row — the two feasibility
+/// mechanisms behave very differently:
+///
+///   * the global fraction-to-boundary scalar `α = slack / −drift` (what
+///     `apply_joint_feasibility_limit` applied to the WHOLE joint step) is ~0 on
+///     a binding row, so it crushes the ENTIRE step — including its components
+///     orthogonal to the binding row — to a microscopic fraction. β then crawls
+///     ~α·‖δ‖ per cycle and the inner joint-Newton grinds its budget without
+///     converging (the survival hang);
+///   * the strict-interior cone projection keeps the step's components in the
+///     unconstrained directions and only corrects the binding direction, so the
+///     realized step retains O(1) magnitude.
+///
+/// This pins that contrast on a one-row binding cone: the projection's step is
+/// orders of magnitude larger than the α-crushed step, which is the whole reason
+/// the constrained path now routes feasibility through the projection.
+#[test]
+pub(crate) fn cone_projection_preserves_step_where_alpha_crush_collapses_it() {
+    use crate::solver::active_set::{
+        LinearInequalityConstraints, project_point_strictly_into_feasible_cone,
+    };
+    // One monotonicity row `a·β ≥ 0` with a = [1, 0]; the current iterate
+    // β = [0, 0] sits exactly on it (slack = 0). The Newton trial step wants to
+    // move DOWN on the binding coordinate (δ_0 = −1, would violate) and freely on
+    // the orthogonal coordinate (δ_1 = +5, unconstrained).
+    let a = array![[1.0_f64, 0.0]];
+    let b = Array1::<f64>::zeros(1);
+    let constraints = LinearInequalityConstraints::from_paired(a, b);
+
+    let beta = array![0.0_f64, 0.0];
+    let trial_step = array![-1.0_f64, 5.0];
+    let trial_point = &beta + &trial_step;
+
+    // ── Old mechanism: global fraction-to-boundary α ────────────────────────
+    // slack = a·β − b = 0; drift = a·δ = −1 (< 0) ⇒ α = slack/−drift = 0. The
+    // whole joint step is scaled by α, so BOTH components collapse.
+    let slack = constraints.a.row(0).dot(&beta) - constraints.b[0];
+    let drift = constraints.a.row(0).dot(&trial_step);
+    assert!(drift < 0.0, "binding-row drift must be negative");
+    let alpha = (slack / -drift).clamp(0.0, 1.0);
+    let alpha_step_norm = {
+        let s = &trial_step * alpha;
+        s.dot(&s).sqrt()
+    };
+    assert!(
+        alpha_step_norm < 1e-6,
+        "α-crush must collapse the whole step on a binding row; got |step|={alpha_step_norm:.3e}"
+    );
+
+    // ── New mechanism: strict-interior cone projection ──────────────────────
+    // Projects the trial point onto `β_0 ≥ 0`; the orthogonal component
+    // (β_1 = 5) is preserved, the binding component is clipped to ~0.
+    let projected = project_point_strictly_into_feasible_cone(&trial_point, &constraints)
+        .expect("cone projection of the trial point must succeed");
+    let projected_step = &projected - &beta;
+    let projected_step_norm = projected_step.dot(&projected_step).sqrt();
+
+    // The unconstrained coordinate's full motion survives the projection.
+    assert!(
+        (projected[1] - 5.0).abs() < 1e-9,
+        "unconstrained coordinate must keep its full motion; got {:.6}",
+        projected[1]
+    );
+    // The realized step magnitude is O(1) — orders of magnitude above the
+    // α-crushed step (which would have frozen the solve).
+    assert!(
+        projected_step_norm > 4.9,
+        "cone projection must preserve the unconstrained step magnitude; got |step|={projected_step_norm:.3e}"
+    );
+    assert!(
+        projected_step_norm > 1e6 * alpha_step_norm,
+        "projection step ({projected_step_norm:.3e}) must dwarf the α-crushed step ({alpha_step_norm:.3e})"
+    );
+    // The projected point is feasible (binding coordinate ≥ 0).
+    assert!(
+        projected[0] >= -1e-9,
+        "projected binding coordinate must be feasible; got {:.3e}",
+        projected[0]
+    );
+}
+
 /// gam#979 (per-block exact-Newton arm; the bernoulli marginal-slope binary
 /// path). The per-block left-hand side is `lhs = H_data + S` with `S ⪰ 0` an
 /// over-smoothed block penalty. The plain
