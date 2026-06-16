@@ -61,7 +61,7 @@ use crate::terms::sae::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
-use crate::terms::sae_manifold::{
+use crate::terms::sae::manifold::{
     SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
 

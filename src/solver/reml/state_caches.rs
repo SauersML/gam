@@ -1073,7 +1073,7 @@ pub(crate) fn hash_scalar_weight_schedule(
     hasher: &mut Fingerprinter,
     schedule: &crate::terms::analytic_penalties::ScalarWeightSchedule,
 ) {
-    use crate::terms::sae_manifold::ScheduleKind;
+    use crate::terms::sae::manifold::ScheduleKind;
 
     hasher.write_f64(schedule.w_start);
     hasher.write_f64(schedule.w_end);

@@ -1706,13 +1706,13 @@ impl<'a> SurvivalFlexRowCellsBatch<'a> {
                 });
             }
         }
-        if self.max_degree > crate::gpu::cubic_cell::MAX_SUPPORTED_DEGREE {
+        if self.max_degree > crate::gpu::kernels::cubic_cell::MAX_SUPPORTED_DEGREE {
             return Err(GpuError::DriverCallFailed {
                 reason: format!(
                     "survival_flex row-cells batch: max_degree={} exceeds substrate \
                      MAX_SUPPORTED_DEGREE={}",
                     self.max_degree,
-                    crate::gpu::cubic_cell::MAX_SUPPORTED_DEGREE
+                    crate::gpu::kernels::cubic_cell::MAX_SUPPORTED_DEGREE
                 ),
             });
         }
@@ -1750,7 +1750,7 @@ pub fn try_row_batched_cell_moments(
     let mut branches = Vec::with_capacity(batch.n_cells);
     let mut prelim_status = Vec::with_capacity(batch.n_cells);
     for k in 0..batch.n_cells {
-        let cell = crate::gpu::cubic_cell::GpuDenestedCubicCell {
+        let cell = crate::gpu::kernels::cubic_cell::GpuDenestedCubicCell {
             left: batch.left[k],
             right: batch.right[k],
             c0: batch.c0[k],
@@ -1758,11 +1758,11 @@ pub fn try_row_batched_cell_moments(
             c2: batch.c2[k],
             c3: batch.c3[k],
         };
-        match crate::gpu::cubic_cell::branch::classify_cell_for_gpu(cell) {
+        match crate::gpu::kernels::cubic_cell::branch::classify_cell_for_gpu(cell) {
             Ok(tag) => {
                 cells.push(cell);
                 branches.push(tag);
-                prelim_status.push(crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8);
+                prelim_status.push(crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8);
             }
             Err(code) => {
                 // Substrate would also reject this cell.  Keep a placeholder
@@ -1774,19 +1774,19 @@ pub fn try_row_batched_cell_moments(
                 // substrate's "host_tag != caller_tag" path also routes to
                 // an error code, and the substrate's *own* classification
                 // is the one that wins.  Use the cheapest stable tag.
-                branches.push(crate::gpu::cubic_cell::GpuCellBranchTag::Affine);
+                branches.push(crate::gpu::kernels::cubic_cell::GpuCellBranchTag::Affine);
                 prelim_status.push(code as u8);
             }
         }
     }
 
-    let view = crate::gpu::cubic_cell::CubicCellDerivativeMomentHostView {
+    let view = crate::gpu::kernels::cubic_cell::CubicCellDerivativeMomentHostView {
         cells: &cells,
         branches: &branches,
         max_degree: batch.max_degree,
-        residency: crate::gpu::cubic_cell::CubicCellMomentResidency::Host,
+        residency: crate::gpu::kernels::cubic_cell::CubicCellMomentResidency::Host,
     };
-    let out = crate::gpu::cubic_cell::try_build_cubic_cell_derivative_moments(view)?.ok_or_else(
+    let out = crate::gpu::kernels::cubic_cell::try_build_cubic_cell_derivative_moments(view)?.ok_or_else(
         || GpuError::DriverCallFailed {
             reason: format!(
                 "survival_flex row-cells batch: substrate returned None for n_cells={} > 0 \
@@ -1797,13 +1797,13 @@ pub fn try_row_batched_cell_moments(
     )?;
 
     let (moments, mut status, stride) = match out {
-        crate::gpu::cubic_cell::CubicCellDerivativeMomentOutput::Host {
+        crate::gpu::kernels::cubic_cell::CubicCellDerivativeMomentOutput::Host {
             moments,
             status,
             stride,
         } => (moments, status, stride),
         #[cfg(target_os = "linux")]
-        crate::gpu::cubic_cell::CubicCellDerivativeMomentOutput::Device { .. } => {
+        crate::gpu::kernels::cubic_cell::CubicCellDerivativeMomentOutput::Device { .. } => {
             return Err(GpuError::DriverCallFailed {
                 reason: "survival_flex row-cells batch: substrate returned device-resident output \
                          but the survival-flex host pipeline consumes Host residency only"
@@ -1817,8 +1817,8 @@ pub fn try_row_batched_cell_moments(
     // re-runs the classifier — but keeping this explicit guards against
     // a future substrate that trusts caller tags).
     for k in 0..batch.n_cells {
-        if prelim_status[k] != crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8
-            && status[k] == crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8
+        if prelim_status[k] != crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
+            && status[k] == crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
         {
             status[k] = prelim_status[k];
         }
@@ -2711,7 +2711,7 @@ pub fn try_device_evaluate_calibration(
             ),
         });
     }
-    let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    let ok_byte = crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8;
     if mom.status.iter().any(|&s| s != ok_byte) {
         return Ok(None);
     }
@@ -3053,7 +3053,7 @@ pub fn try_device_layer_b_jet(
             reason: format!("layer_b: substrate returned stride={stride} < 10"),
         });
     }
-    let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    let ok_byte = crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8;
     if mom.status.iter().any(|&s| s != ok_byte) {
         return Ok(None);
     }
@@ -3470,7 +3470,7 @@ pub fn try_device_layer_c_jet(
             reason: format!("layer_c: substrate returned stride={stride} < 10"),
         });
     }
-    let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    let ok_byte = crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8;
     if mom.status.iter().any(|&s| s != ok_byte) {
         return Ok(None);
     }
@@ -3964,7 +3964,7 @@ pub fn try_device_layer_c_beta_d_uv(
             reason: format!("layer_c_beta: substrate returned stride={stride} < 17"),
         });
     }
-    let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    let ok_byte = crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8;
     if mom.status.iter().any(|&s| s != ok_byte) {
         return Ok(None);
     }
@@ -4502,7 +4502,7 @@ pub fn try_survival_flex_dense_hessian(
             Some(out) => out,
             None => return Ok(None),
         };
-        let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
+        let ok_byte = crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8;
         if out.status.iter().any(|&b| b != ok_byte) {
             // Any cell that failed the substrate classifier or kernel
             // is a CPU fallback for this fit — Step 4/5/6 assembly is
@@ -5937,7 +5937,7 @@ mod survival_flex_gpu_tests {
         for k in 0..4 {
             assert_eq!(
                 out.status[k],
-                crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8,
+                crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8,
                 "cell {k}: non-OK status 0x{:02x}",
                 out.status[k]
             );

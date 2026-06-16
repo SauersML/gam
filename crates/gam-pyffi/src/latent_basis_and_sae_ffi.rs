@@ -2985,7 +2985,7 @@ fn sae_manifold_fit_inner<'py>(
 /// Build the result-dict entry for the honest SAE trust diagnostics (#1005).
 fn sae_trust_diagnostics_dict<'py>(
     py: Python<'py>,
-    report: &gam::terms::sae_manifold::SaeTrustDiagnostics,
+    report: &gam::terms::sae::manifold::SaeTrustDiagnostics,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     let atoms = PyList::empty(py);
@@ -3299,7 +3299,7 @@ fn sae_residual_gauge_dict<'py>(
 /// schema therefore carries the point bound only — no SE/CI/flatness fields.
 fn sae_curvature_report_dict<'py>(
     py: Python<'py>,
-    report: &gam::terms::sae_manifold::CertificateInputs,
+    report: &gam::terms::sae::manifold::CertificateInputs,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item(
@@ -3325,7 +3325,7 @@ fn sae_curvature_report_dict<'py>(
 /// does not include a certified/uncertified verdict.
 fn sae_incoherence_report_dict<'py>(
     py: Python<'py>,
-    report: &gam::terms::sae_manifold::CertificateInputs,
+    report: &gam::terms::sae::manifold::CertificateInputs,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("mu_hat", report.mu_hat)?;
@@ -3348,10 +3348,10 @@ fn sae_incoherence_report_dict<'py>(
     // The #1008 global-optimality verdict: a string label + signed margin so a
     // consumer can read both the decision and how far it is from the threshold.
     let (verdict_label, margin) = match report.global_optimality {
-        gam::terms::sae_manifold::GlobalOptimalityVerdict::CertifiedGlobal { margin } => {
+        gam::terms::sae::manifold::GlobalOptimalityVerdict::CertifiedGlobal { margin } => {
             ("certified_global", margin)
         }
-        gam::terms::sae_manifold::GlobalOptimalityVerdict::Uncertified { margin } => {
+        gam::terms::sae::manifold::GlobalOptimalityVerdict::Uncertified { margin } => {
             ("uncertified", margin)
         }
     };
@@ -3514,7 +3514,7 @@ fn sae_streaming_plan(
     border_dim: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let border_dim = border_dim.unwrap_or(total_basis);
-    let plan = gam::terms::sae_manifold::sae_streaming_plan_for_shape(
+    let plan = gam::terms::sae::manifold::sae_streaming_plan_for_shape(
         n_obs,
         total_basis,
         k_atoms,

@@ -857,12 +857,8 @@ impl SaeManifoldOuterObjective {
             .amortized_encoder_consistency(self.target.view(), &rho)?;
         let reml_scale = reml_cost.abs().max(1.0);
         let cost = reml_cost
-            + crate::terms::sae::manifold::construction::COTRAIN_RECON_WEIGHT
-                * reml_scale
-                * consistency.recon_consistency
-            + crate::terms::sae::manifold::construction::COTRAIN_CERT_WEIGHT
-                * reml_scale
-                * consistency.uncertified_fraction;
+            + super::COTRAIN_RECON_WEIGHT * reml_scale * consistency.recon_consistency
+            + super::COTRAIN_CERT_WEIGHT * reml_scale * consistency.uncertified_fraction;
         let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         self.current_rho = rho;
         self.last_loss = Some(loss);
