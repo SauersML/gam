@@ -108,12 +108,12 @@ mod quality_vs_inla_smooth_posterior_sd_credible_interval;
 mod quality_vs_inla_survival_random_intercept_baseline;
 #[path = "quality/quality_vs_inla_tensor_product_spde.rs"]
 mod quality_vs_inla_tensor_product_spde;
-#[path = "quality/quality_vs_interpretML_pygam_binomial_logit_comparative.rs"]
-mod quality_vs_interpretml_pygam_binomial_logit_comparative;
 #[path = "quality/quality_vs_interpretml_ebm_binomial_logit.rs"]
 mod quality_vs_interpretml_ebm_binomial_logit;
 #[path = "quality/quality_vs_interpretml_ebm_poisson_log.rs"]
 mod quality_vs_interpretml_ebm_poisson_log;
+#[path = "quality/quality_vs_interpretML_pygam_binomial_logit_comparative.rs"]
+mod quality_vs_interpretml_pygam_binomial_logit_comparative;
 #[path = "quality/quality_vs_lifelines_competing_risks_cif.rs"]
 mod quality_vs_lifelines_competing_risks_cif;
 #[path = "quality/quality_vs_lifelines_cox_like_marginal.rs"]

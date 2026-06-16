@@ -388,8 +388,9 @@ mod linux_impl {
         // at the dispatch boundary rather than silently passing a corrupt
         // iterate to the outer REML loop.
         {
-            const FORBIDDEN_ROW: u32 = crate::gpu::kernels::pirls_row::status_flags::INVALID_RESPONSE
-                | crate::gpu::kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+            const FORBIDDEN_ROW: u32 =
+                crate::gpu::kernels::pirls_row::status_flags::INVALID_RESPONSE
+                    | crate::gpu::kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
             if (per_row_status_or & FORBIDDEN_ROW) != 0 && !matches!(status, PirlsStatus::Unstable)
             {
                 return Err(format!(

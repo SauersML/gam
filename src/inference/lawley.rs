@@ -656,7 +656,10 @@ mod tests {
                 "λ={lambda}: penalty did not move ε ({eps_pen} vs {eps_unpen}) — S is being dropped"
             );
             // As λ → ∞ the penalized column is frozen out; ε must stay finite.
-            assert!(eps_pen.is_finite(), "λ={lambda}: ε must be finite, got {eps_pen}");
+            assert!(
+                eps_pen.is_finite(),
+                "λ={lambda}: ε must be finite, got {eps_pen}"
+            );
             distinct.insert((eps_pen * 1e9) as i64);
         }
         // Different λ give genuinely different ε (S enters the information, not a

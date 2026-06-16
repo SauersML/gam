@@ -1677,8 +1677,8 @@ pub(crate) fn co_collapse_reseed_rotation_explores_distinct_subspaces() {
     );
     // Offset 0 must be byte-identical to the no-offset entry point (the K=1 and
     // initial-fit seed paths must be untouched).
-    let seed_plain = sae_pca_seed_initial_coords(residual.view(), &kinds, &dims)
-        .expect("plain seed");
+    let seed_plain =
+        sae_pca_seed_initial_coords(residual.view(), &kinds, &dims).expect("plain seed");
     assert_eq!(
         seed0, seed_plain,
         "offset-0 seed must equal the no-offset seed bit-for-bit"
@@ -1706,10 +1706,8 @@ pub(crate) fn pca_seed_is_run_to_run_reproducible() {
     ];
     let kinds = vec![SaeAtomBasisKind::Periodic, SaeAtomBasisKind::Periodic];
     let dims = vec![1usize, 1];
-    let seed_a = sae_pca_seed_initial_coords(residual.view(), &kinds, &dims)
-        .expect("seed #1");
-    let seed_b = sae_pca_seed_initial_coords(residual.view(), &kinds, &dims)
-        .expect("seed #2");
+    let seed_a = sae_pca_seed_initial_coords(residual.view(), &kinds, &dims).expect("seed #1");
+    let seed_b = sae_pca_seed_initial_coords(residual.view(), &kinds, &dims).expect("seed #2");
     assert_eq!(
         seed_a, seed_b,
         "PCA seed must be bit-identical run-to-run (the issue's determinism \

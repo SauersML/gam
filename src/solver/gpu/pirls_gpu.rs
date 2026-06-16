@@ -2039,8 +2039,10 @@ extern "C" __global__ void status_or(
                 eta_dev: alloc_f64("eta", n)?,
                 row_solve: crate::gpu::kernels::pirls_row::SolveRowBuffers::allocate(stream, n)
                     .map_err(|e| format!("pirls loop alloc row_solve: {e}"))?,
-                alpha_ladder: crate::gpu::kernels::pirls_row::AlphaLadderDevBuffers::allocate(stream)
-                    .map_err(|e| format!("pirls loop alloc alpha_ladder: {e}"))?,
+                alpha_ladder: crate::gpu::kernels::pirls_row::AlphaLadderDevBuffers::allocate(
+                    stream,
+                )
+                .map_err(|e| format!("pirls loop alloc alpha_ladder: {e}"))?,
                 row_final: crate::gpu::kernels::pirls_row::RowOutputDevBuffers::allocate(stream, n)
                     .map_err(|e| format!("pirls loop alloc row_final: {e}"))?,
                 direction_dev: alloc_f64("direction", p)?,
@@ -2539,8 +2541,9 @@ extern "C" __global__ void status_or(
             let penalty_beta =
                 beta_host.dot(&s_beta) - 2.0 * beta_host.dot(&linear_shift) + constant_shift;
 
-            const FORBIDDEN_LINESEARCH: u32 = crate::gpu::kernels::pirls_row::status_flags::INVALID_RESPONSE
-                | crate::gpu::kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+            const FORBIDDEN_LINESEARCH: u32 =
+                crate::gpu::kernels::pirls_row::status_flags::INVALID_RESPONSE
+                    | crate::gpu::kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
             let mut alpha = 0.0_f64;
             let mut accepted_dev = prev_deviance;
             let mut accepted_objective = prev_objective;
@@ -4277,7 +4280,9 @@ mod stream_device_parity_tests {
     /// 13k-line state machine.
     #[test]
     fn hill_climb_loop_beats_cpu_10x_on_large_scale_logit() {
-        use crate::gpu::kernels::pirls_row::{CurvatureMode, PirlsRowFamily, RowInput, row_reweight_cpu};
+        use crate::gpu::kernels::pirls_row::{
+            CurvatureMode, PirlsRowFamily, RowInput, row_reweight_cpu,
+        };
         use std::time::Instant;
         if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!("[hill_climb] no CUDA runtime — skipping");

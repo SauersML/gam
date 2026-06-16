@@ -254,10 +254,10 @@ mod bug_hunt_zero_weight_rows_not_equivalent_to_absent_rows;
 mod cubic_cell_kernel_bug_hunt;
 #[path = "regressions/duchon_collocation_symmetry_psd_regression.rs"]
 mod duchon_collocation_symmetry_psd_regression;
-#[path = "regressions/faer_ndarray_bug_hunt.rs"]
-mod faer_ndarray_bug_hunt;
 #[path = "regressions/factor_intercept_issue_157.rs"]
 mod factor_intercept_issue_157;
+#[path = "regressions/faer_ndarray_bug_hunt.rs"]
+mod faer_ndarray_bug_hunt;
 #[path = "regressions/formula_dsl_operator_family_issue_219.rs"]
 mod formula_dsl_operator_family_issue_219;
 #[path = "regressions/gamlss_binomial_location_scale_bug_hunt_3_of_3.rs"]

@@ -56,9 +56,7 @@ impl From<SurvivalError> for String {
 }
 
 impl From<crate::families::block_layout::block_count::BlockCountMismatch> for SurvivalError {
-    fn from(
-        err: crate::families::block_layout::block_count::BlockCountMismatch,
-    ) -> SurvivalError {
+    fn from(err: crate::families::block_layout::block_count::BlockCountMismatch) -> SurvivalError {
         SurvivalError::CauseSpecificDimensionMismatch {
             reason: err.message(),
         }

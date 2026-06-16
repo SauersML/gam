@@ -1767,9 +1767,7 @@ impl<'a> GlmHomotopyFullConformal<'a> {
         }
         let score = self.x.t().dot(&resid);
         let r_star = self.family.mean(self.x_star.dot(beta)) - z;
-        vec_norm(&score)
-            + vec_norm(&self.s_lambda.dot(beta))
-            + self.star_norm * r_star.abs()
+        vec_norm(&score) + vec_norm(&self.s_lambda.dot(beta)) + self.star_norm * r_star.abs()
     }
 
     /// Dimension-based scale `√(n+1) · √p` for the structural KKT bound, with

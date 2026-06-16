@@ -402,7 +402,10 @@ mod tests {
             res.p_value_corrected < res.p_value_first_order,
             "larger root ⇒ smaller two-sided p"
         );
-        assert!(res.material, "44% information discrepancy must flag material");
+        assert!(
+            res.material,
+            "44% information discrepancy must flag material"
+        );
     }
 
     /// CONJUGATE FIXTURE (Exponential rate, scalar): every Skovgaard ingredient
@@ -466,7 +469,7 @@ mod tests {
 
     #[test]
     fn matrix_assembler_reduces_diagonal_case() {
-        use ndarray::{array, Array2};
+        use ndarray::{Array2, array};
         // p = 1 (a scalar coefficient β with contrast c = [1]). Penalized
         // Hessian = [[50]], Fisher = [[40]], two score rows summing to a known
         // outer product. β̂ = [0.25], θ₀ = 0.
