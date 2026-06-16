@@ -40,14 +40,14 @@
 //! exact same `(t, d, age)` table is handed to gam and to lifelines.
 
 use csv::StringRecord;
-use gam::families::survival_construction::{
+use gam::families::survival::construction::{
     SURVIVAL_TIME_FLOOR, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, evaluate_survival_time_basis_row,
     resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
     survival_derivative_guard_for_likelihood,
 };
-use gam::families::survival_location_scale::{
+use gam::families::survival::location_scale::{
     SurvivalLocationScalePredictInput, predict_survival_location_scale,
 };
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};

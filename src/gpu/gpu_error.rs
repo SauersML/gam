@@ -59,7 +59,7 @@ crate::impl_reason_error_boilerplate! {
 #[macro_export]
 macro_rules! gpu_err {
     ($($arg:tt)*) => {
-        $crate::gpu::error::GpuError::DriverCallFailed { reason: ::std::format!($($arg)*) }
+        $crate::gpu::gpu_error::GpuError::DriverCallFailed { reason: ::std::format!($($arg)*) }
     };
 }
 
@@ -94,7 +94,7 @@ macro_rules! gpu_bail {
 /// cuSOLVER calls; on non-Linux those blocks are erased and the trait
 /// would have no users. Cfg-gating the definition means a warning-fix
 /// sweep running on non-Linux cannot see "unused" callsites because the
-/// trait itself is absent — the consuming `use super::error::GpuResultExt;`
+/// trait itself is absent — the consuming `use super::gpu_error::GpuResultExt;`
 /// imports must therefore be `#[cfg(target_os = "linux")]` to match, and
 /// that cfg-symmetry is the architectural contract that prevents the
 /// drop-the-import regression that broke the Linux build in #302.

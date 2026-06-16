@@ -76,7 +76,6 @@ pub mod types;
 pub mod util;
 pub mod warm_start;
 
-#[path = "heartbeat.rs"]
 pub mod process_monitor;
 
 pub use data::{encode_recordswith_inferred_schema, load_csvwith_inferred_schema};
@@ -123,10 +122,6 @@ pub use terms::{basis, construction, geometry, smooth, term_builder};
 
 pub use families::custom_family;
 pub use families::gamlss;
-pub use families::survival;
-pub use families::survival_location_scale;
-pub use families::survival_marginal_slope;
-pub use families::survival_predict;
 pub use families::transformation_normal;
 pub use gpu::GpuDeviceInfo;
 pub use solver::protocol::{

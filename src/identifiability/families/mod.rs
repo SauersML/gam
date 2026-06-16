@@ -5,8 +5,8 @@
 //! See issue #1140 — this consolidates the previously scattered
 //! `identifiability_*` modules under one coherent home.
 
+pub mod bernoulli;
 pub mod compiler;
 pub(crate) mod gpu;
 #[cfg(target_os = "linux")]
 pub(crate) mod gpu_kernel;
-pub mod bernoulli;

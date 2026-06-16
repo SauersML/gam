@@ -343,7 +343,7 @@ pub(crate) fn prepare_survival_location_scale_model(
         // anchors the whole location-scale parameterisation), and any aliased
         // column is dropped from the lower-priority `threshold` / `log_sigma`
         // / `linkwiggle` blocks. This is the exact gauge-ownership contract
-        // documented by `identifiability_canonical::
+        // documented by `identifiability::canonical::
         // canonical_five_block_gauge_ownership_succeeds_with_attribution` and
         // already used by survival marginal-slope (time=200 highest).
         gauge_priority: 200,

@@ -119,6 +119,7 @@ def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
         [np.ascontiguousarray(block) for block in decoder],
         [None, None],
         [1, 1],
+        [3, 3],
         alpha=1.0,
         tau=0.25,
         assignment_kind="softmax",

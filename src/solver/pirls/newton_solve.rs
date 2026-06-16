@@ -629,7 +629,7 @@ pub fn solve_newton_direction_implicit<F>(
     apply_xtwx: F,
     xtwx_diag: ArrayView1<'_, f64>,
     dense_penalties: &[(f64, &Array2<f64>)],
-    op_penalties: &[(f64, &dyn crate::terms::penalties::op::PenaltyOp)],
+    op_penalties: &[(f64, &dyn crate::terms::analytic_penalties::PenaltyOp)],
     gradient: &Array1<f64>,
     direction_out: &mut Array1<f64>,
     ridge: f64,
@@ -1129,17 +1129,6 @@ pub(super) fn should_use_sparse_native_pirls(
         coefficient_lower_bounds,
         linear_constraints_original,
     )
-}
-
-pub(crate) fn sparse_reml_penalized_hessian(
-    workspace: &mut PirlsWorkspace,
-    x: &SparseColMat<usize, f64>,
-    weights: &Array1<f64>,
-    s_lambda: &Array2<f64>,
-    ridge: f64,
-    precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
-) -> Result<SparseColMat<usize, f64>, EstimationError> {
-    workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge, precomputed_xtwx)
 }
 
 /// Assemble a sparse SPD Hessian with adaptive diagonal ridge, returning the

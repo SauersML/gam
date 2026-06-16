@@ -33,9 +33,9 @@
 use gam::custom_family::{
     BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian,
 };
-use gam::families::survival_marginal_slope::LogslopeBlockJacobian;
+use gam::families::survival::marginal_slope::LogslopeBlockJacobian;
+use gam::identifiability::audit::audit_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::audit_identifiability;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 

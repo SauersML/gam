@@ -1323,7 +1323,7 @@ fn survival_objective_gradient_consistent_near_degenerate_eigenpair() {
 
 /// The reconstruction data-fit the SAE value path sums for a single residual
 /// matrix, faithfully reproducing the `metric.whitens_likelihood()` gate at
-/// `src/terms/sae_manifold.rs`. With no installed metric, or one that does not
+/// `src/terms/sae/manifold/mod.rs`. With no installed metric, or one that does not
 /// whiten the likelihood, the data-fit is the isotropic `Σ ½ r²`; only a
 /// likelihood-whitening metric replaces it with `Σ ½ (Uᵀr)²`.
 fn sae_value_path_data_fit(metric: Option<&RowMetric>, residuals: &Array2<f64>) -> f64 {

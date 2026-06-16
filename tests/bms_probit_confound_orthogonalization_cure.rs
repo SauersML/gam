@@ -26,7 +26,7 @@
 use gam::ResourcePolicy;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::solver::orthogonal_reparam::OrthogonalReparam;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary,

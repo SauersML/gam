@@ -2,7 +2,7 @@
 //! the entire off-diagonal block of its Hessian — so the value it returns is
 //! **not** the Hessian-vector product `H v` the trait contract promises.
 //!
-//! The `AnalyticPenalty::hvp` doc (src/terms/analytic_penalties.rs:370-380)
+//! The `AnalyticPenalty::hvp` doc (src/terms/analytic_penalties/mod.rs:370-380)
 //! is explicit:
 //!
 //!     "Hessian-vector product `H v = (∂²P/∂target²) v`, in closed form.
@@ -14,15 +14,15 @@
 //! `IBPAssignmentPenalty` violates that contract. Its penalty value couples
 //! **every row within a column** through the per-column aggregate
 //! `active_mass[k] = Σ_row z[row, k]` that drives `pi_map`
-//! (src/terms/analytic_penalties.rs:2177-2192, used in `value` at 2200-2219).
+//! (src/terms/analytic_penalties/mod.rs:2177-2192, used in `value` at 2200-2219).
 //! Because `pi[k]` is a function of all rows in column `k`, the cross-row second
 //! derivatives `∂²P / ∂target[i,k] ∂target[j,k]` (i ≠ j) are nonzero — the
 //! Hessian is block-diagonal *per column* but **dense within each column**.
 //!
 //! Yet `IBPAssignmentPenalty` implements `hessian_diag` (returns `Some`,
-//! src/terms/analytic_penalties.rs:2265-2321) and supplies **no** `hvp`
+//! src/terms/analytic_penalties/mod.rs:2265-2321) and supplies **no** `hvp`
 //! override. So `hvp` falls through to the trait default
-//! (src/terms/analytic_penalties.rs:381-407), which forms `diag(H) ⊙ v` and
+//! (src/terms/analytic_penalties/mod.rs:381-407), which forms `diag(H) ⊙ v` and
 //! silently discards the within-column coupling. Empirically that coupling is
 //! the *dominant* part of the operator (≈85% of the Hessian's Frobenius norm),
 //! so the returned vector is far from `H v`.

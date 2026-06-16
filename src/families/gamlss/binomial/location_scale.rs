@@ -129,11 +129,7 @@ impl BinomialLocationScaleFamily {
         x_t: &DesignMatrix,
         x_ls: &DesignMatrix,
     ) -> Result<ExactNewtonJointGradientEvaluation, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -254,11 +250,7 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -325,11 +317,7 @@ impl BinomialLocationScaleFamily {
         x_ls: &Array2<f64>,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -413,11 +401,7 @@ impl BinomialLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -510,11 +494,7 @@ impl BinomialLocationScaleFamily {
         x_ls: &Array2<f64>,
         trace_weight: &Array2<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -748,11 +728,7 @@ impl BinomialLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -1002,11 +978,7 @@ impl BinomialLocationScaleFamily {
         //   = 0.5 beta^T A_k beta
         //     + 0.5 tr(H^{-1} dot H_k)
         //     - 0.5 tr(S^+ A_k).
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -1113,11 +1085,7 @@ impl BinomialLocationScaleFamily {
         // yields the rowwise formulas below. Those formulas are exactly the
         // fourth-order beta-curvature contraction needed to make the joint
         // rho-Hessian path consistent with the first-order joint solve.
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -1252,11 +1220,7 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         if specs.len() != 2 || derivative_blocks.len() != 2 {
             return Err(GamlssError::DimensionMismatch { reason: format!(
                 "BinomialLocationScaleFamily joint psi terms expect 2 specs and 2 derivative blocks, got {} and {}",
@@ -2314,11 +2278,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -2416,11 +2376,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -2459,11 +2415,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let Some(subsample) = options.outer_score_subsample.as_ref() else {
             return self.log_likelihood_only(block_states);
         };
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -2884,11 +2836,7 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleFamily",
-            2,
-            block_states.len(),
-        )?;
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() {

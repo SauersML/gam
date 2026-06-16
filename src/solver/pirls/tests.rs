@@ -9,7 +9,7 @@ pub(crate) use super::*;
 
 #[cfg(test)]
 mod tests {
-    use super::log_link_working_state::{ETA_CLAMP, MIN_MU, MIN_WEIGHT};
+    use super::log_link_working_state::{ETA_CLAMP, MIN_MU};
     use super::loop_driver::default_beta_guess_external;
     use super::reweight::madsen_lm_accept_factor;
     use super::{
@@ -29,7 +29,7 @@ mod tests {
     use crate::solver::active_set;
     use crate::types::{
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkComponent, LinkFunction,
-        LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily, StandardLink,
+        LogSmoothingParamsView, MIN_WEIGHT, MixtureLinkSpec, ResponseFamily, StandardLink,
     };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
@@ -2956,8 +2956,8 @@ mod root_cause_tests {
         // operator form via `ClosedFormPenaltyOperator`. This pins the
         // contract that future refactors of `solve_newton_direction_implicit`
         // cannot silently drift from the dense path.
+        use crate::terms::analytic_penalties::PenaltyOp;
         use crate::terms::basis::closed_form_operator::ClosedFormPenaltyOperator;
-        use crate::terms::penalties::op::PenaltyOp;
 
         const K: usize = 500;
         const D: usize = 4;

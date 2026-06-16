@@ -390,7 +390,7 @@ fn posterior_predict_table_impl(
     drop(headers);
     let col_map = dataset.column_map();
     let training_headers = model.training_headers.as_ref();
-    let spec = gam::survival_predict::resolve_termspec_for_prediction(
+    let spec = gam::families::survival::predict::resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
         &col_map,
@@ -3270,13 +3270,13 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
             // cause_count is Result<usize, SurvivalError>; on error fall through
             // to the non-competing-risks branches (display-only path).
             let cause_count =
-                gam::survival::cause_count_from_event_codes(request.spec.event_target.view())
+                gam::families::survival::cause_count_from_event_codes(request.spec.event_target.view())
                     .unwrap_or(1);
             if cause_count > 1 {
                 ("Cause-specific survival", "competing risks survival", true)
             } else {
                 match request.spec.likelihood_mode {
-                    gam::families::survival_construction::SurvivalLikelihoodMode::Weibull => {
+                    gam::families::survival::construction::SurvivalLikelihoodMode::Weibull => {
                         ("Survival Weibull", "survival", true)
                     }
                     _ => ("Survival", "survival", true),
@@ -5238,7 +5238,7 @@ fn build_bernoulli_marginal_slope_ffi_payload(
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
     base_link: InverseLink,
-    frailty: gam::families::lognormal_kernel::FrailtySpec,
+    frailty: gam::families::survival::lognormal_kernel::FrailtySpec,
     ms_result: BernoulliMarginalSlopeFitResult,
 ) -> Result<FittedModelPayload, String> {
     let frozen_marginal = freeze_term_collection_from_design(
@@ -5304,10 +5304,10 @@ fn build_survival_marginal_slope_ffi_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
-    frailty: gam::families::lognormal_kernel::FrailtySpec,
+    frailty: gam::families::survival::lognormal_kernel::FrailtySpec,
     ms_result: SurvivalMarginalSlopeFitResult,
 ) -> Result<FittedModelPayload, String> {
-    use gam::families::survival_construction::{
+    use gam::families::survival::construction::{
         build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
         parse_survival_time_basis_config, resolve_survival_time_anchor_value,
     };
@@ -5360,7 +5360,7 @@ fn build_survival_marginal_slope_ffi_payload(
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
         let entry_val = entry_idx.map_or(0.0, |idx| dataset.values[[i, idx]]);
-        let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
+        let (t0, t1) = gam::families::survival::construction::normalize_survival_time_pair(
             entry_val,
             dataset.values[[i, exit_idx]],
             i,
@@ -5377,7 +5377,7 @@ fn build_survival_marginal_slope_ffi_payload(
     )?;
     let likelihood_mode = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
     let time_cfg = if parsed.timewiggle.is_some() {
-        gam::families::survival_construction::SurvivalTimeBasisConfig::None
+        gam::families::survival::construction::SurvivalTimeBasisConfig::None
     } else {
         parse_survival_time_basis_config(
             &fit_config.time_basis,
@@ -5444,7 +5444,7 @@ fn build_survival_transformation_ffi_payload(
     fit_config: &FitConfig,
     rp_result: gam::SurvivalTransformationFitResult,
 ) -> Result<FittedModelPayload, String> {
-    use gam::families::survival_construction::survival_likelihood_modename;
+    use gam::families::survival::construction::survival_likelihood_modename;
     use ndarray::s;
 
     let parsed = parse_formula(&formula)
@@ -5759,7 +5759,7 @@ fn build_survival_location_scale_ffi_payload(
     weights: &Array1<f64>,
     ls_result: gam::SurvivalLocationScaleFitResult,
 ) -> Result<FittedModelPayload, String> {
-    use gam::families::survival_construction::{
+    use gam::families::survival::construction::{
         build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
         parse_survival_time_basis_config, resolve_survival_time_anchor_value,
     };
@@ -5794,7 +5794,7 @@ fn build_survival_location_scale_ffi_payload(
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
         let entry_val = entry_idx.map_or(0.0, |idx| dataset.values[[i, idx]]);
-        let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
+        let (t0, t1) = gam::families::survival::construction::normalize_survival_time_pair(
             entry_val,
             dataset.values[[i, exit_idx]],
             i,
@@ -5811,7 +5811,7 @@ fn build_survival_location_scale_ffi_payload(
     )?;
     let likelihood_mode = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
     let time_cfg = if parsed.timewiggle.is_some() {
-        gam::families::survival_construction::SurvivalTimeBasisConfig::None
+        gam::families::survival::construction::SurvivalTimeBasisConfig::None
     } else {
         parse_survival_time_basis_config(
             &fit_config.time_basis,
@@ -5831,18 +5831,18 @@ fn build_survival_location_scale_ffi_payload(
         )),
     )?;
     let resolved_time_cfg =
-        gam::families::survival_construction::resolved_survival_time_basis_config_from_build(
+        gam::families::survival::construction::resolved_survival_time_basis_config_from_build(
             &time_build.basisname,
             time_build.degree,
             time_build.knots.as_ref(),
             time_build.keep_cols.as_ref(),
             time_build.smooth_lambda,
         )?;
-    let time_anchor_row = gam::families::survival_construction::evaluate_survival_time_basis_row(
+    let time_anchor_row = gam::families::survival::construction::evaluate_survival_time_basis_row(
         time_anchor,
         &resolved_time_cfg,
     )?;
-    gam::families::survival_construction::center_survival_time_designs_at_anchor(
+    gam::families::survival::construction::center_survival_time_designs_at_anchor(
         &mut time_build.x_entry_time,
         &mut time_build.x_exit_time,
         &time_anchor_row,
@@ -5950,8 +5950,8 @@ fn build_latent_survival_ffi_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
-    request_frailty: gam::families::lognormal_kernel::FrailtySpec,
-    lat_result: gam::families::latent_survival::LatentSurvivalTermFitResult,
+    request_frailty: gam::families::survival::lognormal_kernel::FrailtySpec,
+    lat_result: gam::families::survival::latent::LatentSurvivalTermFitResult,
 ) -> Result<FittedModelPayload, String> {
     build_latent_window_ffi_payload(
         formula,
@@ -5970,8 +5970,8 @@ fn build_latent_binary_ffi_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
-    request_frailty: gam::families::lognormal_kernel::FrailtySpec,
-    lat_result: gam::families::latent_survival::LatentBinaryTermFitResult,
+    request_frailty: gam::families::survival::lognormal_kernel::FrailtySpec,
+    lat_result: gam::families::survival::latent::LatentBinaryTermFitResult,
 ) -> Result<FittedModelPayload, String> {
     build_latent_window_ffi_payload(
         formula,
@@ -5990,14 +5990,14 @@ fn build_latent_window_ffi_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
-    request_frailty: gam::families::lognormal_kernel::FrailtySpec,
+    request_frailty: gam::families::survival::lognormal_kernel::FrailtySpec,
     fit: gam::estimate::UnifiedFitResult,
     resolvedspec: gam::smooth::TermCollectionSpec,
     cov_design: gam::smooth::TermCollectionDesign,
     learned_latent_sd: Option<f64>,
     is_survival: bool,
 ) -> Result<FittedModelPayload, String> {
-    use gam::families::survival_construction::{
+    use gam::families::survival::construction::{
         build_survival_time_basis, parse_survival_baseline_config,
         parse_survival_time_basis_config, resolve_survival_time_anchor_value,
     };
@@ -6030,7 +6030,7 @@ fn build_latent_window_ffi_payload(
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
         let entry_val = entry_idx.map_or(0.0, |idx| dataset.values[[i, idx]]);
-        let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
+        let (t0, t1) = gam::families::survival::construction::normalize_survival_time_pair(
             entry_val,
             dataset.values[[i, exit_idx]],
             i,
@@ -6067,12 +6067,12 @@ fn build_latent_window_ffi_payload(
     let saved_family = if is_survival {
         let frailty = match (&request_frailty, learned_latent_sd) {
             (
-                gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+                gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
                     sigma_fixed: None,
                     loading,
                 },
                 Some(sigma),
-            ) => gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            ) => gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(sigma),
                 loading: *loading,
             },
@@ -6146,8 +6146,8 @@ fn predict_competing_risks_survival_result(
     model: &FittedModel,
     dataset: &EncodedDataset,
     options: &PyPredictOptions,
-) -> Result<gam::survival_predict::CompetingRisksPredictResult, String> {
-    use gam::survival_predict::{SurvivalPredictRequest, predict_competing_risks_survival};
+) -> Result<gam::families::survival::predict::CompetingRisksPredictResult, String> {
+    use gam::families::survival::predict::{SurvivalPredictRequest, predict_competing_risks_survival};
 
     let col_map = dataset.column_map();
     let payload = model.payload();
@@ -6176,8 +6176,8 @@ fn predict_survival_result(
     model: &FittedModel,
     dataset: &EncodedDataset,
     options: &PyPredictOptions,
-) -> Result<gam::survival_predict::SurvivalPredictResult, String> {
-    use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+) -> Result<gam::families::survival::predict::SurvivalPredictResult, String> {
+    use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
 
     let col_map = dataset.column_map();
     let payload = model.payload();
@@ -6185,9 +6185,9 @@ fn predict_survival_result(
     let primary_offset =
         resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
     let supports_noise_offset = matches!(
-        gam::survival_predict::require_saved_survival_likelihood_mode(model)?,
-        gam::survival_construction::SurvivalLikelihoodMode::LocationScale
-            | gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope
+        gam::families::survival::predict::require_saved_survival_likelihood_mode(model)?,
+        gam::families::survival::construction::SurvivalLikelihoodMode::LocationScale
+            | gam::families::survival::construction::SurvivalLikelihoodMode::MarginalSlope
     );
     let noise_offset = if supports_noise_offset {
         resolve_offset_column(dataset, &col_map, payload.noise_offset_column.as_deref())?
@@ -6213,7 +6213,7 @@ fn predict_survival_result(
 
 fn serialize_survival_prediction_payload(
     model: &FittedModel,
-    result: gam::survival_predict::SurvivalPredictResult,
+    result: gam::families::survival::predict::SurvivalPredictResult,
 ) -> Result<String, String> {
     // Rowwise flatten for JSON transport.
     let n = result.hazard.nrows();
@@ -6266,24 +6266,24 @@ fn serialize_survival_prediction_payload(
     columns.insert("failure_prob".to_string(), failure_col);
 
     let likelihood_mode_str = match result.likelihood_mode {
-        gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
-        gam::survival_construction::SurvivalLikelihoodMode::LocationScale => "location-scale",
-        gam::survival_construction::SurvivalLikelihoodMode::Transformation => "transformation",
-        gam::survival_construction::SurvivalLikelihoodMode::Weibull => "weibull",
-        gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent",
-        gam::survival_construction::SurvivalLikelihoodMode::LatentBinary => "latent-binary",
+        gam::families::survival::construction::SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
+        gam::families::survival::construction::SurvivalLikelihoodMode::LocationScale => "location-scale",
+        gam::families::survival::construction::SurvivalLikelihoodMode::Transformation => "transformation",
+        gam::families::survival::construction::SurvivalLikelihoodMode::Weibull => "weibull",
+        gam::families::survival::construction::SurvivalLikelihoodMode::Latent => "latent",
+        gam::families::survival::construction::SurvivalLikelihoodMode::LatentBinary => "latent-binary",
     };
     let model_class_label = match result.likelihood_mode {
-        gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope => {
+        gam::families::survival::construction::SurvivalLikelihoodMode::MarginalSlope => {
             "survival marginal-slope".to_string()
         }
-        gam::survival_construction::SurvivalLikelihoodMode::LocationScale => {
+        gam::families::survival::construction::SurvivalLikelihoodMode::LocationScale => {
             "survival location-scale".to_string()
         }
-        gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent survival".to_string(),
-        gam::survival_construction::SurvivalLikelihoodMode::Transformation
-        | gam::survival_construction::SurvivalLikelihoodMode::Weibull
-        | gam::survival_construction::SurvivalLikelihoodMode::LatentBinary => {
+        gam::families::survival::construction::SurvivalLikelihoodMode::Latent => "latent survival".to_string(),
+        gam::families::survival::construction::SurvivalLikelihoodMode::Transformation
+        | gam::families::survival::construction::SurvivalLikelihoodMode::Weibull
+        | gam::families::survival::construction::SurvivalLikelihoodMode::LatentBinary => {
             model.predict_model_class().name().to_string()
         }
     };
@@ -6305,7 +6305,7 @@ fn serialize_survival_prediction_payload(
 }
 
 fn serialize_competing_risks_prediction_payload(
-    result: gam::survival_predict::CompetingRisksPredictResult,
+    result: gam::families::survival::predict::CompetingRisksPredictResult,
 ) -> Result<String, String> {
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
     for (endpoint_idx, name) in result.endpoint_names.iter().enumerate() {
@@ -6330,12 +6330,12 @@ fn serialize_competing_risks_prediction_payload(
             .collect(),
     );
     let likelihood_mode_str = match result.likelihood_mode {
-        gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
-        gam::survival_construction::SurvivalLikelihoodMode::LocationScale => "location-scale",
-        gam::survival_construction::SurvivalLikelihoodMode::Transformation => "transformation",
-        gam::survival_construction::SurvivalLikelihoodMode::Weibull => "weibull",
-        gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent",
-        gam::survival_construction::SurvivalLikelihoodMode::LatentBinary => "latent-binary",
+        gam::families::survival::construction::SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
+        gam::families::survival::construction::SurvivalLikelihoodMode::LocationScale => "location-scale",
+        gam::families::survival::construction::SurvivalLikelihoodMode::Transformation => "transformation",
+        gam::families::survival::construction::SurvivalLikelihoodMode::Weibull => "weibull",
+        gam::families::survival::construction::SurvivalLikelihoodMode::Latent => "latent",
+        gam::families::survival::construction::SurvivalLikelihoodMode::LatentBinary => "latent-binary",
     };
     let payload = serde_json::json!({
         "class": "competing_risks_prediction",

@@ -32,12 +32,12 @@
 //! larger `β·x` ⇒ larger log-cumulative-hazard at every time ⇒ smaller survival,
 //! so concordance on `β·x` equals concordance on the survival surface. We
 //! reconstruct gam's covariate risk score from first principles from the
-//! converged fit exactly as `gam::families::survival_predict::evaluate_rp_row`
+//! converged fit exactly as `gam::families::survival::predict::evaluate_rp_row`
 //! assembles the covariate block (`c(Age)·β_cov`), and flexsurv's from its fitted
 //! `Age` coefficient — each scored on the *same* held-out rows.
 
 use csv::StringRecord;
-use gam::families::survival_construction::{
+use gam::families::survival::construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
 };

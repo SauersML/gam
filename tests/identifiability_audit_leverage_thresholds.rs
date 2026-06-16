@@ -20,8 +20,8 @@
 //!    Same cosine with n_eff = 10000 → way outside the null → SHOULD halt.
 
 use gam::families::custom_family::ParameterBlockSpec;
+use gam::identifiability::audit::audit_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::audit_identifiability;
 use ndarray::{Array1, Array2};
 
 fn spec_from_dense(name: &str, design: Array2<f64>) -> ParameterBlockSpec {

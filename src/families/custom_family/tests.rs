@@ -2105,10 +2105,7 @@ pub(crate) fn custom_family_outer_derivatives_respects_missing_second_order_capa
         &specs,
         &BlockwiseFitOptions::default(),
     );
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Unavailable
@@ -2370,10 +2367,7 @@ pub(crate) fn custom_family_outer_derivatives_exposes_surrogate_second_order_geo
         ..BlockwiseFitOptions::default()
     };
     let (gradient, hessian) = custom_family_outer_derivatives(&SurrogateFamily, &specs, &options);
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Either
@@ -2424,10 +2418,7 @@ pub(crate) fn custom_family_outer_derivatives_keeps_strict_second_order_geometry
         ..BlockwiseFitOptions::default()
     };
     let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Either
@@ -2926,10 +2917,7 @@ pub(crate) fn custom_family_outer_derivatives_keeps_second_order_for_large_inner
     };
 
     let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Either

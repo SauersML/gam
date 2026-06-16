@@ -805,10 +805,12 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             .saturating_mul(2)
             .saturating_add(p_resp.saturating_mul(rank).saturating_mul(2))
             .max(1);
-        let rows_per_chunk =
-            crate::solver::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, live_cols)
-                .max(1)
-                .min(n.max(1));
+        let rows_per_chunk = crate::solver::resource::rows_for_target_bytes(
+            policy.row_chunk_target_bytes,
+            live_cols,
+        )
+        .max(1)
+        .min(n.max(1));
         for start in (0..n).step_by(rows_per_chunk) {
             let end = (start + rows_per_chunk).min(n);
             let rows = start..end;
@@ -853,10 +855,12 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
         let op = self.tensor_op();
         let policy = ResourcePolicy::default_library();
         let live_cols = p_cov.saturating_mul(2).max(1);
-        let rows_per_chunk =
-            crate::solver::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, live_cols)
-                .max(1)
-                .min(n.max(1));
+        let rows_per_chunk = crate::solver::resource::rows_for_target_bytes(
+            policy.row_chunk_target_bytes,
+            live_cols,
+        )
+        .max(1)
+        .min(n.max(1));
         let mut total = 0.0;
         for start in (0..n).step_by(rows_per_chunk) {
             let end = (start + rows_per_chunk).min(n);
@@ -901,10 +905,12 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             .saturating_mul(2)
             .saturating_add(p_resp.saturating_mul(rank).saturating_mul(2))
             .max(1);
-        let rows_per_chunk =
-            crate::solver::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, live_cols)
-                .max(1)
-                .min(n.max(1));
+        let rows_per_chunk = crate::solver::resource::rows_for_target_bytes(
+            policy.row_chunk_target_bytes,
+            live_cols,
+        )
+        .max(1)
+        .min(n.max(1));
         let op = self.tensor_op();
         let mut total = 0.0;
         for start in (0..n).step_by(rows_per_chunk) {

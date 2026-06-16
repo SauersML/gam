@@ -15,7 +15,7 @@
 //! Jacobian contract (not just the linearization at the origin).
 
 use gam::families::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState};
-use gam::families::survival_marginal_slope::{
+use gam::families::survival::marginal_slope::{
     LogslopeBlockJacobian, MarginalBlockJacobian, SurvivalMarginalSlopeFamilyScalars,
     TimeBlockJacobian,
 };

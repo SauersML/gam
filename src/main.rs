@@ -28,7 +28,7 @@ pub(crate) use gam::families::bms::{
     LatentZPolicy,
 };
 
-pub(crate) use gam::families::latent_survival::latent_hazard_loading;
+pub(crate) use gam::families::survival::latent::latent_hazard_loading;
 
 pub(crate) use gam::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
@@ -105,12 +105,12 @@ pub(crate) use gam::smooth::{
 
 pub(crate) use gam::smooth_test::SmoothTestScale;
 
-pub(crate) use gam::survival::{
+pub(crate) use gam::families::survival::{
     PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec,
     survival_event_code_from_value,
 };
 
-pub(crate) use gam::survival::{
+pub(crate) use gam::families::survival::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
     baseline_chain_rule_gradient, build_survival_time_basis,
@@ -127,15 +127,15 @@ pub(crate) use gam::survival::{
     survival_likelihood_modename,
 };
 
-pub(crate) use gam::survival_location_scale::{
+pub(crate) use gam::families::survival::location_scale::{
     SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
     SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
     project_onto_linear_constraints,
 };
 
-pub(crate) use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
+pub(crate) use gam::families::survival::marginal_slope::SurvivalMarginalSlopeTermSpec;
 
-pub(crate) use gam::survival_predict::{
+pub(crate) use gam::families::survival::predict::{
     apply_inverse_link_state_to_fit_result, build_saved_survival_marginal_slope_predictor,
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
     resolve_saved_survival_time_columns, resolve_survival_inverse_link_from_saved,

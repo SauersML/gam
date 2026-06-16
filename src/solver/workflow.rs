@@ -30,21 +30,21 @@ use crate::families::gamlss::{
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
 
-use crate::families::latent_survival::{
+use crate::families::survival::latent::{
     LatentBinaryTermFitResult, LatentBinaryTermSpec, LatentSurvivalTermFitResult,
     LatentSurvivalTermSpec, fit_latent_binary_terms, fit_latent_survival_terms,
     latent_hazard_loading,
 };
 
-use crate::families::lognormal_kernel::FrailtySpec;
+use crate::families::survival::lognormal_kernel::FrailtySpec;
 
-use crate::families::survival_location_scale::{
+use crate::families::survival::location_scale::{
     SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
     fit_survival_location_scale_terms, fit_survival_location_scale_terms_with_selected_wiggle,
     select_survival_link_wiggle_basis_from_pilot,
 };
 
-use crate::families::survival_marginal_slope::{
+use crate::families::survival::marginal_slope::{
     SurvivalMarginalSlopeFitResult, SurvivalMarginalSlopeTermSpec,
     fit_survival_marginal_slope_terms,
 };
@@ -73,7 +73,7 @@ use crate::solver::latent_cache::LatentRetractionRegistry;
 
 use crate::solver::riemannian_retraction::{ProductRetraction, RetractionKind};
 
-use crate::survival::PenaltyBlock;
+use crate::families::survival::PenaltyBlock;
 
 use crate::terms::latent::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
@@ -114,7 +114,7 @@ use crate::families::survival::construction::{
     survival_derivative_guard_for_likelihood,
 };
 
-use crate::families::survival_location_scale::{
+use crate::families::survival::location_scale::{
     SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER, SurvivalCovariateTermBlockTemplate,
     TimeBlockInput, TimeWiggleBlockInput, residual_distribution_inverse_link,
 };

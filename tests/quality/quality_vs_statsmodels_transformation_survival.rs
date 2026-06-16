@@ -53,7 +53,7 @@
 //! `β_time[1]`. We never weaken the bars and never edit gam to pass.
 
 use csv::StringRecord;
-use gam::families::survival_construction::{
+use gam::families::survival::construction::{
     SurvivalBaselineTarget, SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
 };

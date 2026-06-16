@@ -670,7 +670,7 @@ impl DeviationRuntime {
     }
 
     /// Single-step install of a compiled flex block from
-    /// `identifiability_compiler::compile`.
+    /// `identifiability::families::compiler::compile`.
     ///
     /// Semantics:
     /// - `compiled.t_lw` is the right-selector `V` applied to `span_c{0..3}`,

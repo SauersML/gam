@@ -26,7 +26,7 @@ def _baseline(**overrides):
     Uses ``K=1, d_atom=2``: the SAE arrow-Schur driver supports
     multi-axis analytic penalties (ARD, Isometry, BlockOrthogonality) only
     when ``k_atoms == 1`` — see
-    ``src/terms/sae_manifold.rs::add_sae_analytic_penalty_contributions``.
+    ``src/terms/sae/manifold/mod.rs::add_sae_analytic_penalty_contributions``.
     Holding ``d_atom=2`` gives enough latent axes for
     ``block_orthogonality_weight`` to find a non-trivial 2-group partition,
     and for ``decoder_feature_sparsity_groups=[[0,1],[2,3]]`` to partition

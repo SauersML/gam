@@ -58,7 +58,7 @@
 
 use csv::StringRecord;
 use gam::smooth::build_term_collection_design;
-use gam::survival_construction::evaluate_survival_baseline;
+use gam::families::survival::construction::evaluate_survival_baseline;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,

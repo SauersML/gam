@@ -22,9 +22,9 @@
 //! unit-interval span, exact image invariance.
 
 use faer::Side as FaerSide;
-use gam::identifiability::sae::{GeneratorFamily, VerdictProvenance};
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::terms::latent::LatentManifold;
+use gam::terms::sae::identifiability::{GeneratorFamily, VerdictProvenance};
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,

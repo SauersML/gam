@@ -352,7 +352,7 @@ pub(crate) fn block_slices(
 }
 
 /// Owned scratch buffers backing a
-/// [`crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs`] descriptor.
+/// [`crate::families::survival::marginal_slope::gpu::SurvivalFlexGpuRowInputs`] descriptor.
 ///
 /// Built per-call by
 /// [`SurvivalMarginalSlopeFamily::build_survival_flex_gpu_row_batch`];
@@ -373,12 +373,12 @@ pub(crate) struct SurvivalFlexGpuRowBatch {
 
 impl SurvivalFlexGpuRowBatch {
     /// Borrow the buffers as a
-    /// [`crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs`] descriptor.
+    /// [`crate::families::survival::marginal_slope::gpu::SurvivalFlexGpuRowInputs`] descriptor.
     pub(crate) fn as_inputs<'a>(
         &'a self,
         family: &SurvivalMarginalSlopeFamily,
-    ) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs<'a> {
-        crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs {
+    ) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexGpuRowInputs<'a> {
+        crate::families::survival::marginal_slope::gpu::SurvivalFlexGpuRowInputs {
             n: self.n,
             r: N_PRIMARY,
             p: self.p,
@@ -421,12 +421,12 @@ pub(crate) struct FlexPrimarySlices {
 
 /// Pack a private `SurvivalFlexTimepointExact` into the Block 10
 /// pub-substrate input type so the shared CPU/GPU pure assembler in
-/// `crate::families::survival_marginal_slope_gpu` can consume it without taking a
+/// `crate::families::survival::marginal_slope::gpu` can consume it without taking a
 /// dependency on the family's private jet structs.
 pub(crate) fn block10_pack_base(
     base: &SurvivalFlexTimepointExact,
-) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBase {
-    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBase {
+) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
+    crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
         eta: base.eta,
         chi: base.chi,
         d: base.d,
@@ -441,8 +441,8 @@ pub(crate) fn block10_pack_base(
 
 pub(crate) fn block10_pack_dir(
     ext: &SurvivalFlexTimepointDirectionalExact,
-) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
-    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
+) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
+    crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
         eta_uv_dir: ext.eta_uv_dir.iter().copied().collect(),
         chi_uv_dir: ext.chi_uv_dir.iter().copied().collect(),
         d_u_dir: ext.d_u_dir.to_vec(),
@@ -452,8 +452,8 @@ pub(crate) fn block10_pack_dir(
 
 pub(crate) fn block10_pack_bi(
     bi: &SurvivalFlexTimepointBiDirectionalExact,
-) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional {
-    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional {
+) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional {
+    crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional {
         eta_uv_uv: bi.eta_uv_uv.iter().copied().collect(),
         chi_uv_uv: bi.chi_uv_uv.iter().copied().collect(),
         d_uv_uv: bi.d_uv_uv.iter().copied().collect(),

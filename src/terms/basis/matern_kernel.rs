@@ -2388,37 +2388,36 @@ pub fn operator_penalty_candidates_closed_form(
     // (Cholesky on the small materialized H is faster).
     let emit_operator = centers.nrows() > CLOSED_FORM_OPERATOR_THRESHOLD;
 
-    let make_op =
-        |q: usize, c: f64| -> Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>> {
-            if !emit_operator {
-                return None;
-            }
-            if !duchon_closed_form_operator_penalty_converges(q, p_order, s_order as f64, d) {
-                return None;
-            }
-            let raw_op = std::sync::Arc::new(
-                crate::terms::basis::closed_form_operator::ClosedFormPenaltyOperator::new(
-                    centers,
-                    q,
-                    p_order,
-                    s_order,
-                    kappa,
-                    aniso_log_scales,
-                    kernel_nullspace,
-                    polynomial_block_cols,
-                    outer_identifiability,
-                ),
-            );
-            // The candidate's `matrix` is the closed-form Gram divided by its
-            // Frobenius norm `c`. Wrap in `ScaledPenaltyOp` with factor `1/c`
-            // so `op.as_dense()` matches the candidate's dense matrix.
-            let scale = if c > 1e-12 { 1.0 / c } else { 1.0 };
-            let scaled: std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp> =
-                std::sync::Arc::new(crate::terms::penalties::op::ScaledPenaltyOp::new(
-                    raw_op, scale,
-                ));
-            Some(scaled)
-        };
+    use crate::terms::analytic_penalties::{PenaltyOp, ScaledPenaltyOp};
+
+    let make_op = |q: usize, c: f64| -> Option<std::sync::Arc<dyn PenaltyOp>> {
+        if !emit_operator {
+            return None;
+        }
+        if !duchon_closed_form_operator_penalty_converges(q, p_order, s_order as f64, d) {
+            return None;
+        }
+        let raw_op = std::sync::Arc::new(
+            crate::terms::basis::closed_form_operator::ClosedFormPenaltyOperator::new(
+                centers,
+                q,
+                p_order,
+                s_order,
+                kappa,
+                aniso_log_scales,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            ),
+        );
+        // The candidate's `matrix` is the closed-form Gram divided by its
+        // Frobenius norm `c`. Wrap in `ScaledPenaltyOp` with factor `1/c`
+        // so `op.as_dense()` matches the candidate's dense matrix.
+        let scale = if c > 1e-12 { 1.0 / c } else { 1.0 };
+        let scaled: std::sync::Arc<dyn PenaltyOp> =
+            std::sync::Arc::new(ScaledPenaltyOp::new(raw_op, scale));
+        Some(scaled)
+    };
 
     // Each order is materialized ONLY when its spec is active, so a disabled
     // order never touches its `d_q` operand (lets the caller build `D_q` with

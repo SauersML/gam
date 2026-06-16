@@ -56,7 +56,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::survival::assemble_competing_risks_cif;
+use gam::families::survival::assemble_competing_risks_cif;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,

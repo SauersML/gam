@@ -22,7 +22,7 @@
 use gam::ResourcePolicy;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
 use gam::terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,

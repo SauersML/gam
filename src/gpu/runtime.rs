@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use super::device::GpuDeviceInfo;
-use super::error::GpuError;
+use super::gpu_error::GpuError;
 use super::policy::GpuDispatchPolicy;
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, result, sys};
@@ -353,7 +353,7 @@ mod tests {
         let v = Array1::<f64>::zeros(3);
         let w = Array1::<f64>::ones(4);
 
-        // gpu::linalg dispatchers
+        // gpu::linalg_dispatch dispatchers
         crate::gpu::try_fast_ab(a.view(), b.view());
         crate::gpu::try_fast_av(a.view(), v.view());
         crate::gpu::try_fast_atv(a.view(), w.view());

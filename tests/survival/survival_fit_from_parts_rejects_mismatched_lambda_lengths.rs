@@ -1,4 +1,4 @@
-use gam::survival_location_scale::{SurvivalLocationScaleFitResultParts, survival_fit_from_parts};
+use gam::families::survival::location_scale::{SurvivalLocationScaleFitResultParts, survival_fit_from_parts};
 use ndarray::{Array2, array};
 
 #[test]

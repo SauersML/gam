@@ -34,7 +34,7 @@ use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
-use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
 use gam::test_support::cli_harness::run_or_panic;
 use ndarray::Array1;
 

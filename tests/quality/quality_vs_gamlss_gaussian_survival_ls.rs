@@ -22,7 +22,7 @@
 //! Why gamlss (family = NO) is the right baseline. gam's survival
 //! location-scale model with a Gaussian residual is, structurally, an
 //! accelerated-failure-time (AFT) model: reading the predictor assembly in
-//! `families::survival_location_scale` (see `survival_location_scale_response_
+//! `families::survival::location_scale` (see `survival_location_scale_response_
 //! from_predictors`), the standardized survival index is
 //!     z(t, x) = h(t) - eta_t(x) * exp(-eta_ls(x)),   S(t|x) = 1 - Phi(z),
 //! i.e. a *location* channel `eta_t(x)` (role `BlockRole::Threshold`) and a

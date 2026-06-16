@@ -33,7 +33,7 @@ use gam::basis::{
 use gam::estimate::FitOptions;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TermCollectionSpec,

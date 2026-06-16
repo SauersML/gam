@@ -1018,10 +1018,7 @@ pub(crate) fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
     let options = BlockwiseFitOptions::default();
     let (gradient, hessian) =
         crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Either,
@@ -1034,17 +1031,16 @@ pub(crate) fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
         "the large-n work model should select the scalable explicit Hessian-operator representation"
     );
 
-    let plan =
-        crate::solver::rho_optimizer::plan(&crate::solver::rho_optimizer::OuterCapability {
-            gradient,
-            hessian,
-            n_params: 2,
-            psi_dim: 0,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: true,
-        });
+    let plan = crate::solver::rho_optimizer::plan(&crate::solver::rho_optimizer::OuterCapability {
+        gradient,
+        hessian,
+        n_params: 2,
+        psi_dim: 0,
+        fixed_point_available: false,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: true,
+    });
     assert_eq!(plan.solver, crate::solver::rho_optimizer::Solver::Arc);
     assert_eq!(
         plan.hessian_source,

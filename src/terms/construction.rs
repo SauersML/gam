@@ -837,7 +837,7 @@ pub struct CanonicalPenalty {
     /// Optional operator-form handle bit-equivalent to `local`. Propagated
     /// from `PenaltySpec::Block.op`. Downstream PIRLS and REML exact operator
     /// algebra route through this for dense-Gram-free matvec when present.
-    pub op: Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>,
+    pub op: Option<std::sync::Arc<dyn crate::terms::analytic_penalties::PenaltyOp>>,
 }
 
 impl std::fmt::Debug for CanonicalPenalty {

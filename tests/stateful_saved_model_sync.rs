@@ -1,8 +1,8 @@
 use gam::estimate::{
     BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
 };
-use gam::families::lognormal_kernel::FrailtySpec;
-use gam::families::survival_location_scale::ResidualDistribution;
+use gam::families::survival::lognormal_kernel::FrailtySpec;
+use gam::families::survival::location_scale::ResidualDistribution;
 use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     PredictModelClass,

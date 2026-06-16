@@ -244,7 +244,8 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
         return None;
     }
     let matvec =
-        crate::gpu::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta).ok()?;
+        crate::gpu::kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta)
+            .ok()?;
     let mut device_options = options.clone();
     device_options.gpu_matvec = Some(matvec);
     Some(device_options)
@@ -296,7 +297,7 @@ pub(crate) fn try_device_arrow_direct(
     if !admitted {
         return None;
     }
-    match crate::gpu::arrow_schur::solve_arrow_newton_step(sys, ridge_t, ridge_beta) {
+    match crate::gpu::kernels::arrow_schur::solve_arrow_newton_step(sys, ridge_t, ridge_beta) {
         Ok(solution) => {
             let diagnostics = PcgDiagnostics {
                 used_device_arrow: true,
@@ -309,19 +310,20 @@ pub(crate) fn try_device_arrow_direct(
         // matching CPU error variant so `solve_with_lm_escalation_inner` bumps
         // the ridge and retries (it re-enters here and may route to device again
         // at the larger ridge, or fall to CPU if the device keeps declining).
-        Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }) => {
-            Some(Err(ArrowSchurError::PerRowFactorFailed {
-                row,
-                reason: format!("device per-row block non-PD; suggested ridge bump {bump:e}"),
-            }))
-        }
+        Err(crate::gpu::kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired {
+            row,
+            bump,
+        }) => Some(Err(ArrowSchurError::PerRowFactorFailed {
+            row,
+            reason: format!("device per-row block non-PD; suggested ridge bump {bump:e}"),
+        })),
         // A non-PD reduced Schur is a real numerical condition the LM escalation
         // must respond to (bump the β-ridge and retry); surface it as the
         // matching CPU error rather than re-running the same factorisation on
         // the CPU only to fail identically.
-        Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed { reason }) => {
-            Some(Err(ArrowSchurError::SchurFactorFailed { reason }))
-        }
+        Err(crate::gpu::kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
+            reason,
+        }) => Some(Err(ArrowSchurError::SchurFactorFailed { reason })),
         // Unavailable (transient / below device policy) and
         // GpuRequiresDenseSystem (matrix-free, already filtered above) both mean
         // "device declined" — fall back to CPU transparently.
@@ -1478,7 +1480,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                         .relative_tolerance
                         .max(options.trust_region.steihaug_relative_tolerance);
                     if let Ok((delta, mut diag)) =
-                        crate::gpu::arrow_schur::solve_sae_matrix_free_pcg(
+                        crate::gpu::kernels::arrow_schur::solve_sae_matrix_free_pcg(
                             sys,
                             device_data.as_ref(),
                             ridge_t,

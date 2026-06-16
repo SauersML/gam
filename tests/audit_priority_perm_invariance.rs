@@ -19,8 +19,8 @@
 //! (`mid` and `low`), never to `high`.
 
 use gam::families::custom_family::ParameterBlockSpec;
+use gam::identifiability::audit::audit_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::audit_identifiability;
 use ndarray::{Array1, Array2};
 
 const N: usize = 80;

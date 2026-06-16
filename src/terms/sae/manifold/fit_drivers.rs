@@ -3138,7 +3138,7 @@ impl SaeManifoldTerm {
                     for &atom_idx in slice.iter() {
                         let phi = atoms_ref[atom_idx].basis_values.view();
                         let w = weights_ref[atom_idx].view();
-                        match crate::gpu::linalg::try_fast_xt_diag_x(phi, w) {
+                        match crate::gpu::linalg_dispatch::try_fast_xt_diag_x(phi, w) {
                             Some(g) => device_grams
                                 .lock()
                                 .expect("device_grams mutex poisoned")
@@ -3188,15 +3188,14 @@ impl SaeManifoldTerm {
             if m == 0 {
                 continue;
             }
-            let rank =
-                crate::solver::identifiability_audit::rank_of_gram(&grams[atom_idx], n_total)
-                    .map_err(|e| {
-                        format!(
-                            "SaeManifoldTerm: pre-fit decoder audit (atom '{}'): \
+            let rank = crate::identifiability::audit::rank_of_gram(&grams[atom_idx], n_total)
+                .map_err(|e| {
+                    format!(
+                        "SaeManifoldTerm: pre-fit decoder audit (atom '{}'): \
                          Gram eigendecomposition failed: {e}",
-                            atom.name,
-                        )
-                    })?;
+                        atom.name,
+                    )
+                })?;
             if rank < m {
                 let dropped = m - rank;
                 if rank == 0 {

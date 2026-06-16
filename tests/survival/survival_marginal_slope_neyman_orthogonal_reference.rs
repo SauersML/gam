@@ -42,7 +42,7 @@
 //! truth-recovery), never `gam ≈ reference output`; no tolerance is weakened to
 //! make code pass.
 
-use gam::families::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
+use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::smooth::build_term_collection_design;
 use gam::test_support::reference::rmse;
 use gam::transformation_normal::TransformationNormalConfig;

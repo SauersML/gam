@@ -3,11 +3,11 @@ use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::bms::{
     LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
 };
-use crate::families::lognormal_kernel::FrailtySpec;
+use crate::families::survival::lognormal_kernel::FrailtySpec;
 use crate::families::survival::construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
-use crate::families::survival_location_scale::ResidualDistribution;
+use crate::families::survival::location_scale::ResidualDistribution;
 use crate::families::wiggle::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
@@ -158,9 +158,9 @@ impl From<FittedModelError> for crate::solver::estimate::EstimationError {
     }
 }
 
-impl From<FittedModelError> for crate::families::survival_predict::SurvivalPredictError {
+impl From<FittedModelError> for crate::families::survival::predict::SurvivalPredictError {
     fn from(err: FittedModelError) -> Self {
-        crate::families::survival_predict::SurvivalPredictError::ModelPayload {
+        crate::families::survival::predict::SurvivalPredictError::ModelPayload {
             context: "saved-model survival prediction payload",
             source: err,
         }
@@ -790,7 +790,7 @@ impl FittedModelPayload {
     /// missed `survival_time_basis`.
     pub fn apply_survival_time_basis(
         &mut self,
-        snapshot: &crate::families::survival_construction::SavedSurvivalTimeBasis,
+        snapshot: &crate::families::survival::construction::SavedSurvivalTimeBasis,
     ) {
         self.survival_time_basis = Some(snapshot.basisname.clone());
         self.survival_time_degree = snapshot.degree;
@@ -3479,7 +3479,7 @@ impl FittedModel {
                     fit_result payload; refit"
                     .to_string(),
             })?;
-        let spec = crate::families::survival_predict::resolve_termspec_for_prediction(
+        let spec = crate::families::survival::predict::resolve_termspec_for_prediction(
             &self.resolved_termspec,
             self.training_headers.as_ref(),
             col_map,
@@ -4650,7 +4650,7 @@ pub fn load_survival_time_basis_config_from_model(
 mod tests {
     use super::*;
     use crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
-    use crate::families::lognormal_kernel::FrailtySpec;
+    use crate::families::survival::lognormal_kernel::FrailtySpec;
     use crate::pirls::PirlsStatus;
     use crate::solver::estimate::{FitArtifacts, FittedBlock, FittedLinkState};
     use crate::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
@@ -5121,7 +5121,7 @@ mod tests {
 
     #[test]
     fn apply_survival_time_basis_writes_all_required_fields() {
-        use crate::families::survival_construction::SavedSurvivalTimeBasis;
+        use crate::families::survival::construction::SavedSurvivalTimeBasis;
 
         let fit = saved_fit(vec![
             FittedBlock {

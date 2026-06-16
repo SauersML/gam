@@ -13,29 +13,30 @@
 //! parameter and structural nullspace dimension. It lives *alongside*, not
 //! *inside*, the per-block specs.
 //!
-//! ## Inner-solve integration point (NOT wired here)
+//! ## Inner-solve integration
 //!
-//! `inner_blockwise_fit` and the joint-Newton kernels in
-//! `custom_family.rs` consume penalties as a `&[Array2<f64>]` paired with
+//! `inner_blockwise_fit` and the joint-Newton kernels in `custom_family`
+//! consume ordinary block-local penalties as a `&[Array2<f64>]` paired with
 //! per-block `(start, end)` ranges:
 //!
 //! * `apply_joint_block_penalty_into(ranges, s_lambdas, …)` (≈ line 19960)
 //! * `joint_penalty_preconditioner_diag(…)` (≈ line 20067)
 //! * `add_joint_penalty_to_matrix(matrix, ranges, s_lambdas, …)` (≈ line 20132)
 //!
-//! All three iterate `s_lambdas[b]` and write into the slice
-//! `matrix[ranges[b].0..ranges[b].1, ranges[b].0..ranges[b].1]`. A
-//! cross-block dense `S` has no such single range, so wiring a
-//! `JointPenaltySpec` requires an additional "full-width" path that:
+//! A cross-block dense `S` has no single owning block range, so the solver also
+//! threads a `JointPenaltyBundle` through those helpers as a full-width path
+//! that:
 //!
 //! 1. computes `S · v` as a full `total × total` mat-vec (cf. `fast_av`),
 //! 2. accumulates `diag(S)` into the Jacobi preconditioner over the full
 //!    parameter vector, and
 //! 3. adds `λ · S` to the dense joint Hessian without slicing.
 //!
-//! That wiring is intentionally out of scope for this module: the type is
-//! published first so other agents can build the construction-site, REML
-//! pseudo-logdet, and inner-solve hookup against a stable target.
+//! The remaining construction-site work is to produce the correct
+//! `JointPenaltySpec` instances for each coupled-family compile path; once a
+//! bundle is supplied through `BlockwiseFitOptions::joint_penalties`, the inner
+//! solve consumes its objective, mat-vec, preconditioner, and dense-Hessian
+//! contributions.
 
 use ndarray::{Array2, ArrayView1};
 

@@ -1,4 +1,4 @@
-use gam::survival::calculate_crude_risk_quadrature;
+use gam::families::survival::calculate_crude_risk_quadrature;
 use ndarray::array;
 
 fn crude_risk_constant_hazard(lambda_d: f64, lambda_m: f64, t0: f64, t1: f64) -> f64 {

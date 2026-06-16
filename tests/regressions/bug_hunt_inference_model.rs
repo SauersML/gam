@@ -1,4 +1,4 @@
-use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
 };

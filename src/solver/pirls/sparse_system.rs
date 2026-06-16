@@ -359,6 +359,17 @@ pub struct SparsePenalizedSystem {
     pub logdet_h: f64,
 }
 
+pub(crate) fn sparse_reml_penalized_hessian(
+    workspace: &mut PirlsWorkspace,
+    x: &SparseColMat<usize, f64>,
+    weights: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    ridge: f64,
+    precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
+) -> Result<SparseColMat<usize, f64>, EstimationError> {
+    workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge, precomputed_xtwx)
+}
+
 pub fn assemble_and_factor_sparse_penalized_system(
     workspace: &mut PirlsWorkspace,
     x: &SparseColMat<usize, f64>,

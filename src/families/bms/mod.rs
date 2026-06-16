@@ -12,7 +12,6 @@ use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::{DenseSpectralOperator, HessianOperator, HyperOperator};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::jet_partitions::MultiDirJet;
-use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
     WeightedOuterRow, add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
@@ -28,6 +27,7 @@ use crate::families::row_kernel::{
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
 use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+use crate::families::survival::lognormal_kernel::FrailtySpec;
 use crate::families::wiggle::initializewiggle_knots_from_seed;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -1150,23 +1150,6 @@ impl LatentZConditionalCalibration {
             }
         }
         j_mat
-    }
-
-    /// Test-facing wrapper exposing the SIGNED sensitivity `∂β̂/∂θ₁ = Vb·G`
-    /// (`p_β × dim θ₁`) the Murphy–Topel correction is built from, assembled
-    /// through the same `G = Sᵀ·J` chain as [`Self::generated_regressor_correction`]
-    /// but returning the signed `Vb·G` instead of the sign-invariant PSD term.
-    /// Used by the #1131 signed FD oracle to lock the sign convention.
-    #[cfg(test)]
-    pub(crate) fn beta_theta1_sensitivity_for_test(
-        &self,
-        score_zeta_sensitivity: ArrayView2<'_, f64>,
-        z: ArrayView1<'_, f64>,
-        a_block: ArrayView2<'_, f64>,
-        vb: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let j_mat = self.build_zeta_theta1_jacobian(z, a_block);
-        self.beta_theta1_sensitivity(score_zeta_sensitivity, j_mat.view(), vb)
     }
 
     /// Signed first-order sensitivity `∂β̂/∂θ₁ = Vb·G` (`p_β × dim θ₁`) of the

@@ -2,9 +2,9 @@
 
 use std::sync::OnceLock;
 
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
-use crate::gpu::error::GpuResultExt;
+use crate::gpu::gpu_error::GpuResultExt;
 use crate::gpu::{GpuDecision, GpuKernel, decide};
 
 #[cfg(target_os = "linux")]

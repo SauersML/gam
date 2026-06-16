@@ -4,17 +4,17 @@
 //!
 //! The `AnalyticPenalty` trait draws a sharp line between two operators:
 //!
-//!   * `hvp` (src/terms/analytic_penalties.rs:370-380) — "Hessian-vector
+//!   * `hvp` (src/terms/analytic_penalties/mod.rs:370-380) — "Hessian-vector
 //!     product `H v = (∂²P/∂target²) v`, in closed form." The **exact**
 //!     Hessian.
-//!   * `psd_majorizer_hvp` (src/terms/analytic_penalties.rs:427-447) — the
+//!   * `psd_majorizer_hvp` (src/terms/analytic_penalties/mod.rs:427-447) — the
 //!     **PSD surrogate** `B v` with `B ⪰ ∂²P`; nonconvex penalties override
 //!     this to return a positive-definite stand-in instead of the indefinite
 //!     true Hessian.
 //!
 //! `DecoderIncoherencePenalty`'s objective is
 //!     P = ½ · w · Σ_{j<k} w_{jk} ‖C_{jk}‖²_F ,   C_{jk}[a,b] = Σ_o B_j[a,o] B_k[b,o]
-//! (src/terms/analytic_penalties.rs:7227-7256). This is *biquadratic* (quartic)
+//! (src/terms/analytic_penalties/mod.rs:7227-7256). This is *biquadratic* (quartic)
 //! in the decoder blocks `B`, hence **nonconvex**. Its exact gradient is
 //!     ∂P/∂B_j[a,o] = w Σ_b C[a,b] B_k[b,o]            (grad_target, :7258-7300)
 //! and the exact Hessian-vector product, differentiating that gradient along a
@@ -23,7 +23,7 @@
 //! with `dC[a,b] = Σ_o (V_j[a,o] B_k[b,o] + B_j[a,o] V_k[b,o])` (and the
 //! symmetric `_k` block).
 //!
-//! The implementation's `hvp` (src/terms/analytic_penalties.rs:7302-7363)
+//! The implementation's `hvp` (src/terms/analytic_penalties/mod.rs:7302-7363)
 //! computes only the **first** term — the Gauss-Newton / "directional Gram
 //! derivative" piece `Σ_b dC[a,b] B_k[b,o]` — and drops the second term
 //! `Σ_b C[a,b] V_k[b,o]` entirely (the inline comment at :7326 confirms it is
@@ -34,7 +34,7 @@
 //! `psd_majorizer_hvp`; but `DecoderIncoherencePenalty` leaves
 //! `psd_majorizer_hvp` at the trait default, which (since `hessian_diag`
 //! returns `None`) simply delegates back to `hvp`
-//! (src/terms/analytic_penalties.rs:432-446). The net result is that both the
+//! (src/terms/analytic_penalties/mod.rs:432-446). The net result is that both the
 //! exact-Hessian path and the surrogate path return GN: a consumer that asks
 //! `hvp` for the genuine penalized Hessian — an exact Newton step, or the
 //! penalized-Hessian log-det that feeds the REML/Laplace marginal likelihood —

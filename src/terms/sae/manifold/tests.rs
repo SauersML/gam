@@ -8892,11 +8892,11 @@ mod inner_contract_probe_tests {
             target_norm_bound =
                 target_norm_bound.max(heldout.row(row).dot(&heldout.row(row)).sqrt());
         }
-        let atlas = crate::terms::sae::encode_atlas::EncodeAtlas::build(
+        let atlas = crate::terms::sae::encode::EncodeAtlas::build(
             &term.atoms,
             &[1.0],
             target_norm_bound,
-            crate::terms::sae::encode_atlas::AtlasConfig::default(),
+            crate::terms::sae::encode::AtlasConfig::default(),
         )
         .expect("held-out encode atlas builds");
         let fast_heldout = atlas

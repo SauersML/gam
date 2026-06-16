@@ -2,7 +2,7 @@ use gam::custom_family::{
     AdditiveBlockJacobian, BlockwiseFitOptions, ParameterBlockSpec, fit_custom_family,
 };
 use gam::matrix::DesignMatrix;
-use gam::survival::{
+use gam::families::survival::{
     CauseSpecificRoystonParmarBlock, CauseSpecificRoystonParmarFamily,
     assemble_competing_risks_cif, survival_event_code_from_value,
 };

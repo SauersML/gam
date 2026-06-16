@@ -4679,7 +4679,7 @@ fn iso_kappa_duchon_penalty_subspace_projection_pins_trace() {
     .expect("hyper dirs present");
     // EIG-DECOMP stash capture is opt-in (production gradient evals skip
     // the diagnostic's extra traces); hold the guard across the eval.
-    let _capture = crate::solver::estimate::reml::unified::debug_stash::CaptureGuard::request();
+    let capture = crate::solver::estimate::reml::unified::debug_stash::CaptureGuard::request();
     let (cost_at_zero, grad_at_zero, _hess) = evaluate_joint_reml_outer_eval_at_theta(
         &mut evaluator,
         cache.design(),
@@ -4691,7 +4691,7 @@ fn iso_kappa_duchon_penalty_subspace_projection_pins_trace() {
         None,
     )
     .expect("analytic outer eval");
-    let stash = crate::solver::estimate::reml::unified::debug_stash::test_support::take_terms();
+    let stash = capture.take_terms();
 
     let unprojected_tr = stash
         .unprojected_tr
@@ -4953,7 +4953,7 @@ fn duchon_probit_per_row_dnu_dpsi_fd_vs_analytic() {
     .expect("hyper dirs present");
     // Opt in to EIG-DECOMP stash capture for this eval (production
     // gradient evals skip the diagnostic's extra traces entirely).
-    let _capture = crate::solver::estimate::reml::unified::debug_stash::CaptureGuard::request();
+    let capture = crate::solver::estimate::reml::unified::debug_stash::CaptureGuard::request();
     let (analytic_cost, analytic_gradient, _) = evaluate_joint_reml_outer_eval_at_theta(
         &mut evaluator,
         cache.design(),
@@ -4967,7 +4967,7 @@ fn duchon_probit_per_row_dnu_dpsi_fd_vs_analytic() {
     .expect("analytic outer eval");
     assert!(analytic_cost.is_finite());
     assert!(analytic_gradient.iter().all(|value| value.is_finite()));
-    let stash = crate::solver::estimate::reml::unified::debug_stash::test_support::take_terms();
+    let stash = capture.take_terms();
     let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
     let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
     assert_eq!(c_x_tau_beta.len(), n);

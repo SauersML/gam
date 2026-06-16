@@ -136,7 +136,7 @@ pub(crate) struct DenestedCellPrimaryFixedPartials {
 
 impl DenestedCellPrimaryFixedPartials {
     /// Reconstruct the struct from the device-flat layout emitted by
-    /// `crate::families::survival_marginal_slope_gpu_prep::DENESTED_CELL_PRIMARY_FIXED_PARTIALS_KERNEL_SRC`.
+    /// `crate::families::survival::marginal_slope::gpu_prep::DENESTED_CELL_PRIMARY_FIXED_PARTIALS_KERNEL_SRC`.
     ///
     /// Layout (per cell):
     ///

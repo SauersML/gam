@@ -45,7 +45,7 @@
 //! (scale_k, shape_k) are the fitted Weibull baseline returned in
 //! `baseline_cfg`. The two cause-specific cumulative hazards are then combined
 //! into per-subject cumulative incidence by gam's own competing-risks
-//! integrator `gam::survival::assemble_competing_risks_cif`, which applies the
+//! integrator `gam::families::survival::assemble_competing_risks_cif`, which applies the
 //! standard crude-risk quadrature
 //!     F_k(t) = sum over intervals of  S(t_left) * (1 - e^{-dH_total}) * dH_k/dH_total,
 //! with overall survival  S(t) = exp(-sum_j H_j(t)). Because gam produces a
@@ -63,7 +63,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::survival::assemble_competing_risks_cif;
+use gam::families::survival::assemble_competing_risks_cif;
 use gam::test_support::reference::{Column, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,

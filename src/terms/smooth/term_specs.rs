@@ -1,4 +1,3 @@
-
 use bspline_boundary::bspline_boundary_linear_constraints;
 
 use coefficient_transforms::{
@@ -20,7 +19,6 @@ use shape_constraints::{
     shape_uses_box_reparameterization,
 };
 
-
 fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
     match strategy {
         CenterStrategy::Auto(inner) => describe_thin_plate_center_request(inner),
@@ -34,7 +32,6 @@ fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
         }
     }
 }
-
 
 fn rewrite_thin_plate_knots_error(
     err: BasisError,
@@ -72,7 +69,6 @@ fn rewrite_thin_plate_knots_error(
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeConstraint {
     None,
@@ -81,7 +77,6 @@ pub enum ShapeConstraint {
     Convex,
     Concave,
 }
-
 
 /// Parse a shape-constraint string into a [`ShapeConstraint`].
 ///
@@ -113,7 +108,6 @@ pub fn parse_shape_constraint(raw: &str) -> Result<ShapeConstraint, String> {
     }
 }
 
-
 impl ShapeConstraint {
     /// Canonical formula-DSL spelling, i.e. the text emitted into
     /// `s(x, shape=...)`. Round-trips through [`parse_shape_constraint`].
@@ -127,7 +121,6 @@ impl ShapeConstraint {
         }
     }
 }
-
 
 /// Smooth-term head keywords recognised by the formula DSL. A `shape=` option
 /// may be attached to any term whose head is one of these.
@@ -144,7 +137,6 @@ const SMOOTH_HEAD_KEYWORDS: [&str; 11] = [
     "bs",
     "bspline",
 ];
-
 
 /// Rewrite smooth-term calls in `formula` so each named smooth carries a
 /// `shape=<kind>` option understood by the formula DSL.
@@ -262,7 +254,6 @@ pub fn apply_shape_constraints_to_formula(
             break;
         }
 
-
         let term_text: String = chars[head_start..=j].iter().collect();
 
         let key_norm = strip_ws(&term_text);
@@ -283,9 +274,7 @@ pub fn apply_shape_constraints_to_formula(
         }
 
         i = j + 1;
-
     }
-
 
     let mut missing: Vec<String> = wanted
         .keys()
@@ -304,13 +293,11 @@ pub fn apply_shape_constraints_to_formula(
     Ok(out)
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BySmoothKind {
     Numeric,
     Level { level_bits: u64 },
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SmoothBasisSpec {
@@ -429,7 +416,6 @@ pub enum SmoothBasisSpec {
         spec: TensorBSplineSpec,
     },
 }
-
 
 impl SmoothBasisSpec {
     /// Conservative lower bound on the number of sample rows needed for this
@@ -587,7 +573,6 @@ impl SmoothBasisSpec {
     }
 }
 
-
 /// Lower bound on the number of sample rows a 1D B-spline smooth needs for a
 /// well-posed *penalized* REML fit. Used as the per-smooth row floor in
 /// [`SmoothBasisSpec::min_sample_rows`].
@@ -646,13 +631,11 @@ fn bspline_basis_min_rows(spec: &crate::terms::basis::BSplineBasisSpec) -> usize
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ByVariableSpec {
     Numeric,
     Level { value_bits: u64, label: String },
 }
-
 
 /// Tensor-product B-spline smooth specification.
 ///
@@ -670,7 +653,6 @@ pub enum TensorMarginalSpec {
     },
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ByVarKind {
     Numeric {
@@ -682,7 +664,6 @@ pub enum ByVarKind {
         frozen_levels: Option<Vec<u64>>,
     },
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FactorSmoothSpec {
@@ -700,14 +681,12 @@ pub struct FactorSmoothSpec {
     pub frozen_global_orthogonality: Option<Array2<f64>>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FactorSmoothFlavour {
     Fs { m_null_penalty_orders: Vec<usize> },
     Sz,
     Re,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorBSplineSpec {
@@ -718,7 +697,6 @@ pub struct TensorBSplineSpec {
     #[serde(default)]
     pub identifiability: TensorBSplineIdentifiability,
 }
-
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum TensorBSplineIdentifiability {
@@ -740,7 +718,6 @@ pub enum TensorBSplineIdentifiability {
     },
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmoothTermSpec {
     pub name: String,
@@ -757,7 +734,6 @@ pub struct SmoothTermSpec {
     #[serde(default)]
     pub joint_null_rotation: Option<crate::terms::basis::JointNullRotation>,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct SmoothTerm {
@@ -812,7 +788,6 @@ pub struct SmoothTerm {
     pub unabsorbed_global_orthogonality: Option<Array2<f64>>,
 }
 
-
 impl SmoothTerm {
     /// Apply the joint-null absorption rotation to a raw new-data design
     /// matrix, returning `X_new_raw · Q` when this term was rotated at
@@ -854,7 +829,6 @@ impl SmoothTerm {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PenaltyBlockInfo {
     pub global_index: usize,
@@ -862,13 +836,11 @@ pub struct PenaltyBlockInfo {
     pub penalty: PenaltyInfo,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DroppedPenaltyBlockInfo {
     pub termname: Option<String>,
     pub penalty: PenaltyInfo,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct SmoothDesign {
@@ -888,7 +860,6 @@ pub struct SmoothDesign {
     pub linear_constraints: Option<LinearInequalityConstraints>,
 }
 
-
 impl SmoothDesign {
     pub fn total_smooth_cols(&self) -> usize {
         self.term_designs.iter().map(DesignMatrix::ncols).sum()
@@ -897,7 +868,6 @@ impl SmoothDesign {
         self.term_designs.first().map_or(0, DesignMatrix::nrows)
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct RawSmoothDesign {
@@ -913,7 +883,6 @@ pub struct RawSmoothDesign {
     pub linear_constraints: Option<LinearInequalityConstraints>,
 }
 
-
 impl RawSmoothDesign {
     pub fn total_smooth_cols(&self) -> usize {
         self.term_designs.iter().map(DesignMatrix::ncols).sum()
@@ -922,7 +891,6 @@ impl RawSmoothDesign {
         self.term_designs.first().map_or(0, DesignMatrix::nrows)
     }
 }
-
 
 impl From<RawSmoothDesign> for SmoothDesign {
     fn from(value: RawSmoothDesign) -> Self {
@@ -939,7 +907,6 @@ impl From<RawSmoothDesign> for SmoothDesign {
     }
 }
 
-
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
     #[default]
@@ -950,7 +917,6 @@ pub enum BoundedCoefficientPriorSpec {
         b: f64,
     },
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum LinearCoefficientGeometry {
@@ -963,7 +929,6 @@ pub enum LinearCoefficientGeometry {
         prior: BoundedCoefficientPriorSpec,
     },
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearTermSpec {
@@ -994,7 +959,6 @@ pub struct LinearTermSpec {
     pub coefficient_max: Option<f64>,
 }
 
-
 impl LinearTermSpec {
     /// Return the effective list of feature columns. Backfills from
     /// `feature_col` for legacy specs that predate the multi-column field.
@@ -1012,7 +976,6 @@ impl LinearTermSpec {
     }
 }
 
-
 const fn default_linear_term_double_penalty() -> bool {
     // Parametric/linear terms are unpenalized by default — a single linear
     // coefficient has no roughness for a smoothing penalty to control, so the
@@ -1024,16 +987,13 @@ const fn default_linear_term_double_penalty() -> bool {
     false
 }
 
-
 const fn default_pca_smooth_penalty() -> f64 {
     1.0
 }
 
-
 const fn default_pca_chunk_size() -> usize {
     4096
 }
-
 
 /// Random-effects term specification.
 ///
@@ -1058,11 +1018,9 @@ pub struct RandomEffectTermSpec {
     pub frozen_levels: Option<Vec<u64>>,
 }
 
-
 fn default_random_effect_penalized() -> bool {
     true
 }
-
 
 fn validate_measure_jet_positive_vec_len(
     label: &str,
@@ -1090,14 +1048,12 @@ fn validate_measure_jet_positive_vec_len(
     Ok(())
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TermCollectionSpec {
     pub linear_terms: Vec<LinearTermSpec>,
     pub random_effect_terms: Vec<RandomEffectTermSpec>,
     pub smooth_terms: Vec<SmoothTermSpec>,
 }
-
 
 fn validate_smooth_basis_frozen(
     basis: &SmoothBasisSpec,
@@ -1139,7 +1095,6 @@ fn validate_smooth_basis_frozen(
         _ => Ok(()),
     }
 }
-
 
 impl TermCollectionSpec {
     /// Write this collection's topology identity into a warm-start cache
@@ -1637,7 +1592,6 @@ impl TermCollectionSpec {
     }
 }
 
-
 /// Walk a `SmoothBasisSpec` tree, re-resolving every column index through
 /// `remap`. Shared by all predict-time column realignment (see
 /// [`TermCollectionSpec::remap_feature_columns`]); kept exhaustive so a newly
@@ -1689,13 +1643,11 @@ where
     Ok(())
 }
 
-
 #[derive(Debug, Clone)]
 pub enum PenaltyStructureHint {
     Ridge(f64),
     Kronecker(Vec<Array2<f64>>),
 }
-
 
 /// A penalty matrix stored at its natural block size together with the
 /// column range it occupies in the global coefficient vector.
@@ -1719,9 +1671,8 @@ pub struct BlockwisePenalty {
     /// the originating closed-form factory emitted an op-form penalty so exact
     /// operator algebra can use matvec instead of materializing the dense
     /// `block_p × block_p` Gram. `None` for ordinary dense penalties.
-    pub op: Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>,
+    pub op: Option<std::sync::Arc<dyn crate::terms::analytic_penalties::PenaltyOp>>,
 }
-
 
 impl std::fmt::Debug for BlockwisePenalty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1737,7 +1688,6 @@ impl std::fmt::Debug for BlockwisePenalty {
             .finish()
     }
 }
-
 
 impl BlockwisePenalty {
     /// Create a new blockwise penalty.
@@ -1764,7 +1714,7 @@ impl BlockwisePenalty {
     /// Attach an op-form penalty handle bit-equivalent to `local`.
     pub fn with_op(
         mut self,
-        op: Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>,
+        op: Option<std::sync::Arc<dyn crate::terms::analytic_penalties::PenaltyOp>>,
     ) -> Self {
         self.op = op;
         self
@@ -1842,7 +1792,6 @@ impl BlockwisePenalty {
     }
 }
 
-
 /// Compute `Σ_k λ_k S_k` directly from blockwise penalties, accumulating
 /// into a pre-allocated `p_total × p_total` output without ever materializing
 /// individual global matrices.
@@ -1884,7 +1833,6 @@ pub fn weighted_blockwise_penalty_sum(
     out
 }
 
-
 // ---------------------------------------------------------------------------
 // KroneckerPenaltySystem — factored tensor-product penalty representation
 // ---------------------------------------------------------------------------
@@ -1902,7 +1850,6 @@ pub struct KroneckerPenaltySystem {
     /// Whether a global ridge (double) penalty is present.
     pub has_double_penalty: bool,
 }
-
 
 impl KroneckerPenaltySystem {
     pub fn new(
@@ -2046,7 +1993,6 @@ impl KroneckerPenaltySystem {
     }
 }
 
-
 #[derive(Clone, Debug)]
 pub struct TermCollectionDesign {
     /// The full design matrix.
@@ -2074,7 +2020,6 @@ pub struct TermCollectionDesign {
     pub random_effect_levels: Vec<(String, Vec<u64>)>,
     pub smooth: SmoothDesign,
 }
-
 
 impl TermCollectionDesign {
     /// Convert blockwise penalties to `PenaltyMatrix::Blockwise` without
@@ -2139,14 +2084,12 @@ impl TermCollectionDesign {
     }
 }
 
-
 #[derive(Clone)]
 pub struct FittedTermCollection {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
-
 
 #[derive(Clone)]
 pub struct FittedTermCollectionWithSpec {
@@ -2155,7 +2098,6 @@ pub struct FittedTermCollectionWithSpec {
     pub resolvedspec: TermCollectionSpec,
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
-
 
 #[derive(Clone)]
 pub struct StandardLatentCoordConfig {
@@ -2168,7 +2110,6 @@ pub struct StandardLatentCoordConfig {
     pub analytic_penalties: Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>>,
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdaptiveSpatialMap {
     pub termname: String,
@@ -2178,7 +2119,6 @@ pub struct AdaptiveSpatialMap {
     pub invgradweight: Array1<f64>,
     pub inv_lapweight: Array1<f64>,
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdaptiveRegularizationDiagnostics {
@@ -2191,7 +2131,6 @@ pub struct AdaptiveRegularizationDiagnostics {
     pub maps: Vec<AdaptiveSpatialMap>,
 }
 
-
 #[derive(Debug, Clone)]
 struct LinearColumnConditioning {
     col_idx: usize,
@@ -2199,13 +2138,11 @@ struct LinearColumnConditioning {
     scale: f64,
 }
 
-
 #[derive(Debug, Clone, Default)]
 struct LinearFitConditioning {
     intercept_idx: usize,
     columns: Vec<LinearColumnConditioning>,
 }
-
 
 #[derive(Clone)]
 pub(crate) struct SpatialPsiDerivative {
@@ -2239,7 +2176,6 @@ pub(crate) struct SpatialPsiDerivative {
     pub implicit_axis: usize,
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct SpatialLogKappaCoords {
     /// Flattened ψ values. For isotropic terms, one entry per term.
@@ -2248,7 +2184,6 @@ pub(crate) struct SpatialLogKappaCoords {
     /// Dimensionality of each term: 1 for isotropic, d for anisotropic.
     dims_per_term: Vec<usize>,
 }
-
 
 /// Which end of the ψ bound the shared `aniso_bounds_from_data` helper is
 /// computing. The lower end uses `-max_length_scale.ln()` as the pure-Duchon
@@ -2259,7 +2194,6 @@ enum AnisoBoundEnd {
     Lower,
     Upper,
 }
-
 
 impl SpatialLogKappaCoords {
     /// Construct from an explicit dims layout plus values.
@@ -2744,7 +2678,6 @@ impl SpatialLogKappaCoords {
     }
 }
 
-
 pub(crate) fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
     if eta.len() <= 1 {
         return eta.to_vec();
@@ -2761,7 +2694,6 @@ pub(crate) fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
         })
         .collect()
 }
-
 
 fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
     // Ordinary penalized thin-plate regression splines do not have an
@@ -2824,7 +2756,6 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
     get_spatial_length_scale(spec, term_idx).is_some()
 }
 
-
 /// The measure-jet term's spec, when `term_idx` is a measure-jet smooth.
 /// Single accessor for every dial-plumbing dispatch below.
 fn measure_jet_term_spec(
@@ -2838,7 +2769,6 @@ fn measure_jet_term_spec(
             _ => None,
         })
 }
-
 
 /// Single source for measure-jet outer-ψ enrollment: the lnτ dial is
 /// undefined in the τ = 0 pseudo-inverse oracle mode (see
@@ -2856,7 +2786,8 @@ fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
     //     channel additionally needs a positive ridge (τ = 0 is the
     //     pseudo-inverse oracle mode where lnτ is undefined).
     // A term enrolls if EITHER source is active.
-    measure_jet_learns_length_scale(mj) || (mj.tau0 > 0.0 && crate::basis::measure_jet_multiscale_mode(mj))
+    measure_jet_learns_length_scale(mj)
+        || (mj.tau0 > 0.0 && crate::basis::measure_jet_multiscale_mode(mj))
 }
 
 /// Whether the design-moving ℓ dial is enrolled for this term. ℓ is learnable
@@ -2884,9 +2815,7 @@ const MEASURE_JET_PSI_LN_TAU_BOUNDS: (f64, f64) = (-18.420680743952367, 4.605170
 /// surfaces, while keeping the Gaussian kernel numerically well-scaled. Absolute
 /// (not seed-relative) so the bound producer needs no data view, matching the
 /// other dial boxes. `ln(1e-3) = -6.9077…`, `ln(1e2) = 4.6051…`.
-const MEASURE_JET_PSI_LN_LENGTH_SCALE_BOUNDS: (f64, f64) =
-    (-6.907755278982137, 4.605170185988092);
-
+const MEASURE_JET_PSI_LN_LENGTH_SCALE_BOUNDS: (f64, f64) = (-6.907755278982137, 4.605170185988092);
 
 /// Number of multiscale PENALTY dials (excluding the design-moving ℓ):
 /// multiscale (per-scale spectral) mode carries (α, lnτ) = 2 — the order is
@@ -2909,7 +2838,6 @@ fn measure_jet_penalty_psi_dim(mj: &crate::basis::MeasureJetBasisSpec) -> usize 
 fn measure_jet_psi_dim(mj: &crate::basis::MeasureJetBasisSpec) -> usize {
     usize::from(measure_jet_learns_length_scale(mj)) + measure_jet_penalty_psi_dim(mj)
 }
-
 
 /// Seed ψ from the term's realized dials, in producer coordinate order: ℓ first
 /// (when enrolled), then the multiscale penalty dials. The ℓ seed is the
@@ -2936,7 +2864,6 @@ fn measure_jet_psi_seed(mj: &crate::basis::MeasureJetBasisSpec) -> Vec<f64> {
     seed
 }
 
-
 /// One end of the per-coordinate dial boxes, in producer coordinate order
 /// (ℓ first when enrolled, then the multiscale penalty dials).
 fn measure_jet_psi_bound_values(mj: &crate::basis::MeasureJetBasisSpec, upper: bool) -> Vec<f64> {
@@ -2952,7 +2879,6 @@ fn measure_jet_psi_bound_values(mj: &crate::basis::MeasureJetBasisSpec, upper: b
     }
     bounds
 }
-
 
 /// Write optimized ψ dials back into a measure-jet spec. Returns `true` when
 /// any dial actually moved. The geometry (centers, masses, band, ℓ, z) is
@@ -3009,7 +2935,6 @@ fn apply_measure_jet_psi(
     Ok(changed)
 }
 
-
 /// Collection-level measure-jet dial write-back (the `apply_tospec` /
 /// realizer-side entry). Returns whether anything moved.
 fn set_measure_jet_psi_dials(
@@ -3022,7 +2947,6 @@ fn set_measure_jet_psi_dials(
     };
     set_single_term_measure_jet_psi_dials(term, psi)
 }
-
 
 /// Single-term dial write-back: the shared match+apply core, also used
 /// directly on the cached per-trial build spec (whose caller has already
@@ -3038,7 +2962,6 @@ fn set_single_term_measure_jet_psi_dials(
     apply_measure_jet_psi(mj, psi)
 }
 
-
 /// The constant-curvature smooth's spec, when `term_idx` is one. Single
 /// accessor for every κ-ψ dispatch below, mirroring `measure_jet_term_spec`.
 fn constant_curvature_term_spec(
@@ -3053,7 +2976,6 @@ fn constant_curvature_term_spec(
         })
 }
 
-
 /// Hard positive cap on |κ| relative to the data's inverse squared chart
 /// radius. The κ-stereographic chart is valid for `1 + κ‖x‖² > 0`; at
 /// `|κ| = 1/R²` (R² = max squared chart radius) the gauge `1 + κ‖x‖²` reaches
@@ -3067,7 +2989,6 @@ const CONSTANT_CURVATURE_KAPPA_CHART_FRACTION: f64 = 0.5;
 /// degenerate (near-origin) point cloud still yields a finite, usable bracket
 /// rather than an unbounded one.
 const CONSTANT_CURVATURE_MIN_CHART_RADIUS2: f64 = 1e-8;
-
 
 /// `(κ_min, κ_max)` outer-optimization window for a constant-curvature term,
 /// derived from the data's maximum squared chart radius `R²` so the κ-jets
@@ -3100,7 +3021,6 @@ fn constant_curvature_kappa_bounds(
     (-half, half)
 }
 
-
 /// Write the optimized κ back into a constant-curvature term spec. Returns
 /// `true` when κ moved. Centers, ℓ, and the constraint transform `z` are
 /// κ-FIXED by the basis κ-contract, so only `kappa` changes.
@@ -3116,7 +3036,6 @@ fn set_constant_curvature_kappa(
     };
     set_single_term_constant_curvature_kappa(term, psi)
 }
-
 
 /// Single-term κ write-back: the shared validate+apply core, also used directly
 /// on the cached per-trial build spec in the incremental realizer (whose caller
@@ -3151,7 +3070,6 @@ fn set_single_term_constant_curvature_kappa(
     }
 }
 
-
 /// Returns `true` when a spatial term has NO outer optimization axes — i.e.
 /// the user provided an explicit `length_scale` and the term does not enroll
 /// REML-side per-axis ψ contrasts, so both the scalar κ and any fixed geometry
@@ -3166,7 +3084,6 @@ pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize)
     get_spatial_length_scale(spec, term_idx).is_some()
         && !spatial_term_uses_per_axis_psi(spec, term_idx)
 }
-
 
 /// Per-term data-derived ψ = log κ bounds.
 ///
@@ -3186,7 +3103,6 @@ const KERNEL_RANGE_MIN_DIAMETER_FRACTION: f64 = 2.0;
 /// nearly collinear with the polynomial nullspace, so the kernel range is
 /// capped here to keep the basis geometry well-conditioned.
 const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
-
 
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
@@ -3270,7 +3186,6 @@ fn spatial_term_psi_bounds(
     (psi_lo, psi_hi)
 }
 
-
 /// Data-derived ψ seed for a spatial term when the user has not set an
 /// explicit length_scale on its basis spec. Uses the geometric mean of the
 /// data-informed kappa range (i.e., the midpoint of the ψ window).
@@ -3287,7 +3202,6 @@ fn spatial_term_psi_seed(
     Some(0.5 * (psi_lo + psi_hi))
 }
 
-
 fn spatial_term_psi_to_length_scale_and_aniso(psi: &[f64]) -> (Option<f64>, Option<Vec<f64>>) {
     if psi.len() <= 1 {
         (Some((-psi.first().copied().unwrap_or(0.0)).exp()), None)
@@ -3299,7 +3213,6 @@ fn spatial_term_psi_to_length_scale_and_aniso(psi: &[f64]) -> (Option<f64>, Opti
         )
     }
 }
-
 
 /// Get the `aniso_log_scales` from a spatial term, if present.
 pub fn get_spatial_aniso_log_scales(
@@ -3315,7 +3228,6 @@ pub fn get_spatial_aniso_log_scales(
         })
 }
 
-
 /// Get the number of feature columns (spatial dimensionality) for a spatial term.
 fn get_spatial_feature_dim(spec: &TermCollectionSpec, term_idx: usize) -> Option<usize> {
     spec.smooth_terms
@@ -3327,7 +3239,6 @@ fn get_spatial_feature_dim(spec: &TermCollectionSpec, term_idx: usize) -> Option
             _ => None,
         })
 }
-
 
 /// Log the learned per-axis spatial anisotropy for all spatial terms that
 /// have `aniso_log_scales` set after optimization.
@@ -3376,7 +3287,6 @@ pub fn log_spatial_aniso_scales(spec: &TermCollectionSpec) {
     }
 }
 
-
 /// Set `aniso_log_scales` on a spatial term's basis spec.
 fn set_spatial_aniso_log_scales(
     spec: &mut TermCollectionSpec,
@@ -3402,7 +3312,6 @@ fn set_spatial_aniso_log_scales(
         ))),
     }
 }
-
 
 /// Sync knot-cloud-derived anisotropy contrasts from basis metadata back into
 /// the mutable spec so the optimizer starts from the correct eta values.
@@ -3431,7 +3340,6 @@ pub(crate) fn sync_aniso_contrasts_from_metadata(
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct SpatialLengthScaleOptimizationOptions {
@@ -3464,7 +3372,6 @@ pub struct SpatialLengthScaleOptimizationOptions {
     pub pilot_subsample_threshold: usize,
 }
 
-
 impl Default for SpatialLengthScaleOptimizationOptions {
     fn default() -> Self {
         Self {
@@ -3478,7 +3385,6 @@ impl Default for SpatialLengthScaleOptimizationOptions {
         }
     }
 }
-
 
 impl SpatialLengthScaleOptimizationOptions {
     /// Validate the struct's invariants. Callers that construct these options
@@ -3538,7 +3444,6 @@ impl SpatialLengthScaleOptimizationOptions {
     }
 }
 
-
 #[derive(Debug, Clone)]
 struct RandomEffectBlock {
     name: String,
@@ -3549,18 +3454,15 @@ struct RandomEffectBlock {
     kept_levels: Vec<u64>,
 }
 
-
 const BLOCK_SPARSE_ZERO_EPS: f64 = 1e-12;
 
 const BLOCK_SPARSE_MAX_DENSITY: f64 = 0.20;
-
 
 fn blocks_have_intrinsic_sparse_structure(blocks: &[DesignBlock]) -> bool {
     blocks
         .iter()
         .any(|block| matches!(block, DesignBlock::Sparse(_) | DesignBlock::RandomEffect(_)))
 }
-
 
 fn sparse_compatible_block_nnz(block: &DesignBlock) -> Option<usize> {
     match block {
@@ -3577,7 +3479,6 @@ fn sparse_compatible_block_nnz(block: &DesignBlock) -> Option<usize> {
         }),
     }
 }
-
 
 fn try_build_sparse_design_from_blocks(
     blocks: &[DesignBlock],
@@ -3668,7 +3569,6 @@ fn try_build_sparse_design_from_blocks(
     )))
 }
 
-
 fn assemble_term_collection_design_matrix(
     blocks: Vec<DesignBlock>,
 ) -> Result<DesignMatrix, BasisError> {
@@ -3682,7 +3582,6 @@ fn assemble_term_collection_design_matrix(
         Arc::new(block_op),
     )))
 }
-
 
 fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
@@ -3699,7 +3598,6 @@ fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f6
     Ok(out)
 }
 
-
 fn nonfinite_value_label(value: f64) -> &'static str {
     if value.is_nan() {
         "NaN"
@@ -3709,7 +3607,6 @@ fn nonfinite_value_label(value: f64) -> &'static str {
         "-Inf"
     }
 }
-
 
 fn validate_term_feature_column_finite(
     data: ArrayView2<'_, f64>,
@@ -3734,7 +3631,6 @@ fn validate_term_feature_column_finite(
     Ok(())
 }
 
-
 fn validate_smooth_terms_finite_inputs(
     data: ArrayView2<'_, f64>,
     terms: &[SmoothTermSpec],
@@ -3746,7 +3642,6 @@ fn validate_smooth_terms_finite_inputs(
     }
     Ok(())
 }
-
 
 fn validate_term_collection_finite_inputs(
     data: ArrayView2<'_, f64>,
@@ -3761,7 +3656,6 @@ fn validate_term_collection_finite_inputs(
     validate_smooth_terms_finite_inputs(data, &spec.smooth_terms)
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct JointSpatialCenterGroupKey {
     feature_cols: Vec<usize>,
@@ -3770,7 +3664,6 @@ struct JointSpatialCenterGroupKey {
     requested_num_centers: usize,
     input_scale_bits: Option<Vec<u64>>,
 }
-
 
 fn spatial_term_min_center_count(term: &SmoothTermSpec) -> usize {
     match &term.basis {
@@ -3788,7 +3681,6 @@ fn spatial_term_min_center_count(term: &SmoothTermSpec) -> usize {
         _ => 1,
     }
 }
-
 
 fn spatial_term_group_key(term: &SmoothTermSpec) -> Option<JointSpatialCenterGroupKey> {
     let (feature_cols, strategy, input_scales) = match &term.basis {
@@ -3830,7 +3722,6 @@ fn spatial_term_group_key(term: &SmoothTermSpec) -> Option<JointSpatialCenterGro
     })
 }
 
-
 fn spatial_term_center_strategy(term: &SmoothTermSpec) -> Option<&CenterStrategy> {
     match &term.basis {
         SmoothBasisSpec::ThinPlate { spec, .. } => Some(&spec.center_strategy),
@@ -3839,7 +3730,6 @@ fn spatial_term_center_strategy(term: &SmoothTermSpec) -> Option<&CenterStrategy
         _ => None,
     }
 }
-
 
 fn set_spatial_term_centers(
     term: &mut SmoothTermSpec,
@@ -3864,7 +3754,6 @@ fn set_spatial_term_centers(
         ))),
     }
 }
-
 
 fn standardized_spatial_term_data(
     data: ArrayView2<'_, f64>,
@@ -3898,7 +3787,6 @@ fn standardized_spatial_term_data(
     }
     Ok(x)
 }
-
 
 fn plan_joint_spatial_centers_for_term_blocks(
     data: ArrayView2<'_, f64>,
@@ -3994,7 +3882,6 @@ fn plan_joint_spatial_centers_for_term_blocks(
     Ok(planned_blocks)
 }
 
-
 /// Compute a data-driven initial length scale from the per-axis range of the
 /// feature columns. The heuristic `max_range / sqrt(n)` puts the kernel on
 /// the wiggly side of REML's basin so the optimizer can grow it back if the
@@ -4041,14 +3928,12 @@ fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) 
     init.max(LENGTH_SCALE_FLOOR).min(max_range)
 }
 
-
 /// Walk a term and, if it is a Matern or thin-plate smooth whose length_scale
 /// was left at the auto sentinel (`0.0`), overwrite it with
 /// [`auto_initial_length_scale`].
 fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothTermSpec) {
     auto_init_length_scale_in_basis(data, &mut term.basis);
 }
-
 
 /// Replace the `0.0` auto-init length-scale sentinel with a data-derived value
 /// for any Matern / thin-plate kernel reachable from this basis — including the
@@ -4088,7 +3973,6 @@ fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: &mut Smooth
         _ => {}
     }
 }
-
 
 impl LinearFitConditioning {
     fn from_columns(design: &TermCollectionDesign, selected_cols: &[usize]) -> Self {
@@ -4302,7 +4186,6 @@ impl LinearFitConditioning {
     }
 }
 
-
 fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> BasisMetadata {
     match metadata {
         BasisMetadata::ThinPlate {
@@ -4344,7 +4227,6 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
         other => other,
     }
 }
-
 
 fn matern_operator_penalty_triplet_from_metadata(
     metadata: &BasisMetadata,
@@ -4425,7 +4307,6 @@ fn matern_operator_penalty_triplet_from_metadata(
     filter_active_penalty_candidates(candidates)
 }
 
-
 fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
     // Constrained-space normalization:
     //   c = ||S_con||_F,  S_tilde = S_con / c.
@@ -4441,7 +4322,6 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
         (matrix, 1.0)
     }
 }
-
 
 fn build_periodic_fourier_margin(
     x: ArrayView1<'_, f64>,
@@ -4506,7 +4386,6 @@ fn build_periodic_fourier_margin(
     let knots = Array1::linspace(0.0, period, q);
     Ok((basis, penalty, knots))
 }
-
 
 fn tensor_product_design_from_sparse_marginals(
     marginal_sparse: &[&SparseColMat<usize, f64>],
@@ -4614,7 +4493,6 @@ fn tensor_product_design_from_sparse_marginals(
         ))
     })
 }
-
 
 fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
@@ -5025,7 +4903,6 @@ fn build_tensor_bspline_basis(
     })
 }
 
-
 fn tensor_product_design_from_marginals(
     marginal_designs: &[Array2<f64>],
 ) -> Result<Array2<f64>, BasisError> {
@@ -5098,7 +4975,6 @@ fn tensor_product_design_from_marginals(
         });
     Ok(design)
 }
-
 
 fn build_random_effect_block(
     data: ArrayView2<'_, f64>,
@@ -5179,7 +5055,6 @@ fn build_random_effect_block(
     })
 }
 
-
 impl SmoothDesign {
     /// Map an unconstrained term coefficient vector to its constrained shape space.
     /// This is useful for nonlinear fits that optimize unconstrained parameters.
@@ -5201,12 +5076,11 @@ impl SmoothDesign {
     }
 }
 
-
 struct LocalSmoothTermBuild {
     dim: usize,
     design: DesignMatrix,
     penalties: Vec<Array2<f64>>,
-    ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>>,
+    ops: Vec<Option<std::sync::Arc<dyn crate::terms::analytic_penalties::PenaltyOp>>>,
     nullspaces: Vec<usize>,
     /// Per-active-penalty null-space eigenvector matrices, parallel to
     /// `penalties` / `ops` / `nullspaces`. `Some(U_null)` when
@@ -5231,7 +5105,6 @@ struct LocalSmoothTermBuild {
     kronecker_factored: Option<KroneckerFactoredBasis>,
 }
 
-
 #[derive(Clone)]
 struct PcaScoresMemmapDesignOperator {
     mmap: Arc<memmap2::Mmap>,
@@ -5240,7 +5113,6 @@ struct PcaScoresMemmapDesignOperator {
     ncols: usize,
     chunk_size: usize,
 }
-
 
 impl PcaScoresMemmapDesignOperator {
     fn open(path: PathBuf, chunk_size: usize) -> Result<Self, BasisError> {
@@ -5300,7 +5172,6 @@ impl PcaScoresMemmapDesignOperator {
         self.chunk_size.min(self.nrows.max(1))
     }
 }
-
 
 impl LinearOperator for PcaScoresMemmapDesignOperator {
     fn nrows(&self) -> usize {
@@ -5436,7 +5307,6 @@ impl LinearOperator for PcaScoresMemmapDesignOperator {
     }
 }
 
-
 impl DenseDesignOperator for PcaScoresMemmapDesignOperator {
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.nrows || y.len() != self.nrows {
@@ -5493,7 +5363,6 @@ impl DenseDesignOperator for PcaScoresMemmapDesignOperator {
         out
     }
 }
-
 
 fn parse_f64_2d_npy_header(
     bytes: &[u8],
@@ -5592,7 +5461,6 @@ fn parse_f64_2d_npy_header(
     Ok((data_offset, dims[0], dims[1]))
 }
 
-
 fn pca_center_mean(x: ArrayView2<'_, f64>) -> Result<Array1<f64>, BasisError> {
     if x.nrows() == 0 {
         crate::bail_invalid_basis!("Pca basis requires at least one row to compute center mean");
@@ -5604,7 +5472,6 @@ fn pca_center_mean(x: ArrayView2<'_, f64>) -> Result<Array1<f64>, BasisError> {
     mean.mapv_inplace(|v| v / x.nrows() as f64);
     Ok(mean)
 }
-
 
 fn build_pca_smooth_basis(
     data: ArrayView2<'_, f64>,
@@ -5712,7 +5579,6 @@ fn build_pca_smooth_basis(
     })
 }
 
-
 fn apply_by_variable_to_local_build(
     mut built: LocalSmoothTermBuild,
     data: ArrayView2<'_, f64>,
@@ -5754,7 +5620,6 @@ fn apply_by_variable_to_local_build(
     Ok(built)
 }
 
-
 fn ensure_by_variable_specs_match(
     kind: &BySmoothKind,
     by: &ByVariableSpec,
@@ -5772,7 +5637,6 @@ fn ensure_by_variable_specs_match(
         ))),
     }
 }
-
 
 /// Build a factor-smooth interaction basis (`bs="fs"`/`"sz"`/`"re"`).
 ///
@@ -6108,7 +5972,6 @@ fn build_factor_smooth(
     })
 }
 
-
 /// Resolve the grouping levels for a factor smooth: replay the frozen level
 /// list when present (predict path), otherwise discover the sorted unique bit
 /// patterns of the factor column (fit path).
@@ -6137,7 +6000,6 @@ fn resolve_factor_smooth_levels(
     Ok(bits)
 }
 
-
 /// Marginal B-spline spec for a factor-smooth block. The marginal always builds
 /// without an identifiability constraint (the per-level replication, not a
 /// sum-to-zero side constraint, provides identifiability against the parametric
@@ -6149,7 +6011,6 @@ fn factor_smooth_marginal_for_replay(marginal: &BSplineBasisSpec) -> BSplineBasi
     m.identifiability = BSplineIdentifiability::None;
     m
 }
-
 
 fn build_single_local_smooth_term(
     data: ArrayView2<'_, f64>,
@@ -6676,7 +6537,8 @@ fn build_single_local_smooth_term(
     // identity path; nulled element-wise when `T^T S T` reparametrization
     // is applied (operator no longer bit-equivalent to the transformed
     // matrix); wrapped in `ScaledPenaltyOp` after Frobenius normalization.
-    let mut ops_t: Vec<Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>> = built.ops;
+    let mut ops_t: Vec<Option<std::sync::Arc<dyn crate::terms::analytic_penalties::PenaltyOp>>> =
+        built.ops;
     if matches!(
         spatial_identifiability_policy(term),
         Some(SpatialIdentifiability::OrthogonalToParametric)
@@ -6852,10 +6714,10 @@ fn build_single_local_smooth_term(
                 // so `op.as_dense() == matrix` post-normalization.
                 let scaled_op = if op_scale > 0.0 && op_scale.is_finite() {
                     op_in.map(|op| {
-                        std::sync::Arc::new(crate::terms::penalties::op::ScaledPenaltyOp::new(
+                        std::sync::Arc::new(crate::terms::analytic_penalties::ScaledPenaltyOp::new(
                             op, op_scale,
                         ))
-                            as std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>
+                            as std::sync::Arc<dyn crate::terms::analytic_penalties::PenaltyOp>
                     })
                 } else {
                     None
@@ -6950,7 +6812,6 @@ fn build_single_local_smooth_term(
     })
 }
 
-
 pub fn build_smooth_design(
     data: ArrayView2<'_, f64>,
     terms: &[SmoothTermSpec],
@@ -6958,7 +6819,6 @@ pub fn build_smooth_design(
     let mut ws = crate::basis::BasisWorkspace::new();
     build_smooth_design_withworkspace(data, terms, &mut ws)
 }
-
 
 /// Like `build_smooth_design`, but honors the caller workspace policy while
 /// building each planned smooth term with an independent per-term workspace.
@@ -6974,7 +6834,6 @@ pub fn build_smooth_design_withworkspace(
     validate_smooth_terms_finite_inputs(data, terms)?;
     build_smooth_design_withworkspace_unvalidated(data, terms, workspace)
 }
-
 
 fn build_smooth_design_withworkspace_unvalidated(
     data: ArrayView2<'_, f64>,

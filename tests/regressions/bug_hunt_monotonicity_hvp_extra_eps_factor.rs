@@ -2,7 +2,7 @@
 //! too large by a factor of `1 / smoothing_eps`.
 //!
 //! The penalty contribution for an adjacent pair `(a, b=a+1)` and column `j` is
-//! (src/terms/analytic_penalties.rs:3729 `edge_value`)
+//! (src/terms/analytic_penalties/mod.rs:3729 `edge_value`)
 //!
 //!     P = weight * softplus(z) * eps,    z = -direction * (t_b - t_a) / eps.
 //!
@@ -22,7 +22,7 @@
 //!               = weight * sigma(z)(1 - sigma(z)) / eps.
 //!
 //! The outer `eps` cancels **one** of the two `1/eps²` factors, leaving `1/eps`.
-//! But `hvp` (src/terms/analytic_penalties.rs:3835) computes
+//! But `hvp` (src/terms/analytic_penalties/mod.rs:3835) computes
 //!
 //!     let h = weight * sigma * (1.0 - sigma) / (eps * eps);
 //!
@@ -38,7 +38,7 @@
 //!
 //! The struct doc claims "The Hessian is positive semidefinite (softplus is
 //! convex) so the penalty composes cleanly with PIRLS/REML"
-//! (src/terms/analytic_penalties.rs:3654) — PSD is preserved by a positive
+//! (src/terms/analytic_penalties/mod.rs:3654) — PSD is preserved by a positive
 //! scalar, but the *magnitude* is wrong, which is what curvature consumers rely
 //! on.
 //!

@@ -166,7 +166,7 @@ pub enum PenaltySpec {
         /// Optional structural hint for fast-path spectral decomposition.
         structure_hint: Option<crate::terms::smooth::PenaltyStructureHint>,
         /// Optional operator-form handle bit-equivalent to `local`.
-        op: Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>,
+        op: Option<std::sync::Arc<dyn crate::terms::analytic_penalties::PenaltyOp>>,
     },
     /// Full dense penalty matrix (`p x p`).
     Dense(Array2<f64>),
@@ -232,7 +232,7 @@ impl PenaltySpec {
     }
 
     /// Op-form handle when present (only for `Block`; `Dense` always returns `None`).
-    pub fn op(&self) -> Option<&std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>> {
+    pub fn op(&self) -> Option<&std::sync::Arc<dyn crate::terms::analytic_penalties::PenaltyOp>> {
         match self {
             PenaltySpec::Block { op, .. } => op.as_ref(),
             PenaltySpec::Dense(_) | PenaltySpec::DenseWithMean { .. } => None,

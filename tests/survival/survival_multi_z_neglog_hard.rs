@@ -1,5 +1,5 @@
 //! Heavy correctness battery for
-//! `gam::survival_marginal_slope::survival_marginal_slope_vector_neglog`.
+//! `gam::families::survival::marginal_slope::survival_marginal_slope_vector_neglog`.
 //!
 //! All expected values are recomputed from primitive building blocks
 //! (`survival_marginal_slope_vector_scale`, `quadratic_form`,
@@ -7,7 +7,7 @@
 
 use gam::families::bms::MarginalSlopeCovariance;
 use gam::probability::normal_cdf;
-use gam::survival_marginal_slope::{
+use gam::families::survival::marginal_slope::{
     survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
 };
 use ndarray::{Array1, Array2};

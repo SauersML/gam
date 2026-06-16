@@ -100,7 +100,7 @@ _IVAE_AUX_SCALE_LOG_AMPLITUDE = 0.4
 # transform iff the conditional prior `p(t | u)` spans a 2k-dimensional set
 # of natural parameters. For the diagonal Gaussian iVAE prior the natural
 # parameters are `(η_1, η_2) = (μ(u) / σ(u)², −1 / (2 σ(u)²))`, which the
-# constructor in ``src/sae_identifiability.rs`` checks via the column rank of the
+# constructor in ``src/identifiability/sae.rs`` checks via the column rank of the
 # stacked signature ``[μ(u) ‖ log σ(u)]`` (an invertible reparameterisation).
 # A *constant* scale collapses the ``log σ`` half of that signature to zero,
 # leaving rank ≤ k < 2k — that is exactly the supervised-path failure mode of
@@ -220,7 +220,7 @@ def _gather_fit_summary(
 
     The only operation here is ``np.ndarray.tolist()`` reshaping — every
     statistic (std, rank, zero-fraction, variance) is computed in
-    ``src/inference/identifiability_diagnostics.rs``. This function is therefore a
+    ``src/identifiability/precondition.rs``. This function is therefore a
     pure marshalling layer per Principle (f).
     """
 
@@ -328,7 +328,7 @@ def check(
 
     All numerical work — min-std, faer-SVD column-rank, decoder
     zero-fraction, latent variance bounds — happens in
-    ``gam::inference::identifiability_diagnostics``. This function is the Python
+    ``gam::identifiability::precondition``. This function is the Python
     marshalling layer: it gathers the relevant tensors off the fit, ships
     them as JSON to Rust, and rehydrates the resulting
     :class:`IdentifiabilityReport`.
@@ -849,7 +849,7 @@ def identifiable_factor_fit(
     )
     # Route the single-pair evidence through the Rust primitive used by
     # Rust-side weight-selection tests so the Laplace evidence formula has a
-    # single source of truth in ``src/sae_identifiability.rs``.
+    # single source of truth in ``src/identifiability/sae.rs``.
     selection = rust_module().identifiable_factor_select_weights_array(
         np.ascontiguousarray(np.array([[rss_val]], dtype=np.float64)),
         np.ascontiguousarray(np.array([[pen_val]], dtype=np.float64)),

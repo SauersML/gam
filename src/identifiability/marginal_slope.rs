@@ -101,7 +101,7 @@ impl SurvivalRowHessian {
         let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
         for i in 0..n {
             let (_, _grad, hess) =
-                crate::families::survival_marginal_slope::row_primary_for_compiler(
+                crate::families::survival::marginal_slope::row_primary_for_compiler(
                     q0[i],
                     q1[i],
                     qd1[i],
@@ -220,7 +220,7 @@ impl FamilyChannelHessian for SurvivalRowHessian {
         beta: &[f64],
         family_scalars: Option<&Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Arc<dyn FamilyChannelHessian>, String> {
-        use crate::families::survival_marginal_slope::SurvivalMarginalSlopeFamilyScalars;
+        use crate::families::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
 
         let scalars_opt =
             family_scalars.and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
@@ -291,10 +291,10 @@ impl FamilyChannelHessian for SurvivalRowHessian {
                     let z = sc.z_i[i];
                     // Use unit weight and d=1 (event indicator 1) for the audit path.
                     // The derivative_guard is the family default (small but non-zero).
-                    match crate::families::survival_marginal_slope::row_primary_for_compiler(
+                    match crate::families::survival::marginal_slope::row_primary_for_compiler(
                         q0, q1, qd1, g, z, 1.0,  // w = unit weight
                         1.0,  // d = event
-                        crate::families::survival_marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+                        crate::families::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                         sc.s, // probit_scale from scalars
                     ) {
                         Ok((_nll, _grad, hess)) => {
@@ -377,7 +377,7 @@ pub fn survival_row_nll_grad_hess(
     derivative_guard: f64,
     probit_scale: f64,
 ) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
-    crate::families::survival_marginal_slope::row_primary_for_compiler(
+    crate::families::survival::marginal_slope::row_primary_for_compiler(
         q0,
         q1,
         qd1,
@@ -768,8 +768,9 @@ pub fn compile_survival_parametric_designs_per_term(
         ordering.push(BlockOrder::Logslope);
     }
 
-    let compiled = compile(&operators, row_hess, &ordering)
-        .map_err(|e| format!("identifiability_compiler::compile (per-term) failed: {e}"))?;
+    let compiled = compile(&operators, row_hess, &ordering).map_err(|e| {
+        format!("identifiability::families::compiler::compile (per-term) failed: {e}")
+    })?;
     let blocks = compiled.blocks;
     let n_time = time_partition.len();
     let n_marg = marginal_partition.len();
@@ -1539,7 +1540,7 @@ pub fn compile_survival_parametric_designs(
         ));
     }
     let compiled = compile(&inputs.operators, row_hess, &inputs.ordering)
-        .map_err(|e| format!("identifiability_compiler::compile failed: {e}"))?;
+        .map_err(|e| format!("identifiability::families::compiler::compile failed: {e}"))?;
     if compiled.blocks.len() != 3 {
         return Err(format!(
             "compile_survival_parametric_designs: compiler emitted {} blocks; expected 3",

@@ -56,7 +56,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::linalg::triangular::{back_substitution_lower_transpose, cholesky_solve_vector};
 
 #[cfg(target_os = "linux")]
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 
 // ────────────────────────────────────────────────────────────────────────
 // Public types
@@ -635,7 +635,7 @@ mod linux_cuda {
         PG1_MAX_B, PgSeed, PolyaGammaBatchInput, SADDLE_MAX_B, SADDLE_MIN_B, XorwowState,
         pg_convolution_cpu_oracle, pg_normal_cpu_oracle,
     };
-    use crate::gpu::error::{GpuError, GpuResultExt};
+    use crate::gpu::gpu_error::{GpuError, GpuResultExt};
     use crate::gpu::solver::context_and_stream;
     use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use ndarray::Array1;
@@ -983,8 +983,8 @@ extern "C" __global__ void normal_kernel(
     }
 
     fn module(ctx: &Arc<CudaContext>) -> Result<&'static Arc<CudaModule>, GpuError> {
-        static CACHE: crate::gpu::common::PtxModuleCache =
-            crate::gpu::common::PtxModuleCache::new();
+        static CACHE: crate::gpu::device_cache::PtxModuleCache =
+            crate::gpu::device_cache::PtxModuleCache::new();
         CACHE.get_or_compile(ctx, "polya_gamma", &ptx_source())
     }
 

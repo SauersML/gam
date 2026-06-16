@@ -18,7 +18,7 @@
 //!
 //! This test fits lognormal-AFT data through the real `gam fit` location-scale
 //! path, SAVES + LOADS the model, drives the library predict surface
-//! (`gam::survival_predict::predict_survival`) on a time grid at two covariate
+//! (`gam::families::survival::predict::predict_survival`) on a time grid at two covariate
 //! values, and asserts the surface is finite, monotone non-increasing in `t`,
 //! varies with `x`, and tracks the analytic lognormal survival truth. Without the
 //! `−log t` mirror the surface is flat in `t` and fails every check.
@@ -31,7 +31,7 @@ use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
-use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
 use ndarray::Array1;
 
 const N: usize = 400;

@@ -1,7 +1,7 @@
 //! CPU/GPU parity for the spectral leverage diagonal `h[i] = ‖(X G)_{i,:}‖²`
 //! offloaded to the device pool in issue #922.
 //!
-//! The GPU path (`gpu::linalg::try_fast_spectral_leverage_diagonal`) only
+//! The GPU path (`gpu::linalg_dispatch::try_fast_spectral_leverage_diagonal`) only
 //! engages when a device was probed AND the workload clears the `XtDiagX`
 //! dispatch floor (n ≥ `xtwx_n_min`, 2·n·p² ≥ `xtwx_flops_min`); the shape
 //! below is sized to clear it. On a machine without a usable GPU the function
@@ -28,7 +28,9 @@ fn gpu_spectral_leverage_diagonal_matches_cpu_when_available() {
     let g = Array2::from_shape_fn((p, rank), |(i, j)| (((i + 2 * j + 1) as f64) * 0.013).cos());
     let design = DesignMatrix::Dense(DenseDesignMatrix::from(x.clone()));
 
-    let Some(gpu_lev) = gpu::linalg::try_fast_spectral_leverage_diagonal(&design, g.view()) else {
+    let Some(gpu_lev) =
+        gpu::linalg_dispatch::try_fast_spectral_leverage_diagonal(&design, g.view())
+    else {
         // No usable GPU (or below the dispatch floor): the CPU faer stream in
         // `DenseSpectralOperator::xt_logdet_kernel_x_diagonal` is the only path.
         return;

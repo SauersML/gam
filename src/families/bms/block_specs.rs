@@ -1950,7 +1950,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         use super::deviation_runtime::ParametricAnchorBlock;
         let mut prepared = build_score_warp_deviation_block_from_seed(z_train, cfg)?;
         // `install_compiled_flex_block_into_runtime` now delegates
-        // its math body to `identifiability_compiler::compile` (commit
+        // its math body to `identifiability::families::compiler::compile` (commit
         // 4e20b8dc8); the prior Phase-4a shadow compile here was a
         // duplicate of that internal call and has been removed.
         let outcome = install_compiled_flex_block_into_runtime(

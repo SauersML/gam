@@ -40,7 +40,7 @@ pub(crate) mod device;
 pub(crate) mod host_substrate;
 pub(crate) mod kernel_src;
 
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 
 pub(crate) use host_substrate::{HostMomentBatch, build_host_moments};
 

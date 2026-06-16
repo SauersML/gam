@@ -72,7 +72,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 use crate::linalg::pcg::pcg_core;
 
 // ────────────────────────────────────────────────────────────────────────
@@ -821,7 +821,7 @@ mod linux_cuda {
         reduce_mean_stderr,
     };
     use crate::gpu::driver::to_col_major;
-    use crate::gpu::error::{GpuError, GpuResultExt};
+    use crate::gpu::gpu_error::{GpuError, GpuResultExt};
     use crate::gpu::solver::{
         cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place,
         potrs_in_place,
@@ -947,8 +947,8 @@ extern "C" __global__ void reduce_q_weighted_gram(
     const THREADS_PER_BLOCK: u32 = 256;
 
     fn module(ctx: &Arc<CudaContext>) -> Result<&'static Arc<CudaModule>, GpuError> {
-        static CACHE: crate::gpu::common::PtxModuleCache =
-            crate::gpu::common::PtxModuleCache::new();
+        static CACHE: crate::gpu::device_cache::PtxModuleCache =
+            crate::gpu::device_cache::PtxModuleCache::new();
         CACHE.get_or_compile(ctx, "reml_trace", PTX_SOURCE)
     }
 

@@ -584,17 +584,17 @@ pub(crate) fn latent_window_plugin_survival(
     mu: f64,
     sigma: f64,
 ) -> Result<LatentWindowPluginJet, String> {
-    let row = gam::families::lognormal_kernel::LatentSurvivalRow::right_censored(
+    let row = gam::families::survival::lognormal_kernel::LatentSurvivalRow::right_censored(
         q_entry.exp(),
         q_exit.exp(),
         unloaded_mass_entry,
         unloaded_mass_exit,
     );
     let jet =
-        gam::families::lognormal_kernel::LatentSurvivalRowJet::evaluate(quadctx, &row, mu, sigma)
+        gam::families::survival::lognormal_kernel::LatentSurvivalRowJet::evaluate(quadctx, &row, mu, sigma)
             .map_err(|e| format!("latent hazard-window prediction failed: {e}"))?;
     let score_q_entry = if row.mass_entry > 0.0 {
-        let bundle = gam::families::lognormal_kernel::log_kernel_bundle(
+        let bundle = gam::families::survival::lognormal_kernel::log_kernel_bundle(
             quadctx,
             row.mass_entry,
             mu,
@@ -608,7 +608,7 @@ pub(crate) fn latent_window_plugin_survival(
         0.0
     };
     let score_q_exit = if row.mass_exit > 0.0 {
-        let bundle = gam::families::lognormal_kernel::log_kernel_bundle(
+        let bundle = gam::families::survival::lognormal_kernel::log_kernel_bundle(
             quadctx,
             row.mass_exit,
             mu,
@@ -1228,7 +1228,7 @@ pub(crate) fn run_predict_survival(
         let posterior_or_uncertainty = if include_survival_location_scale_intervals {
             let cov_mat = covariance_from_model(model, args.covariance_mode)?;
             Some(
-                gam::survival_location_scale::predict_survival_location_scalewith_uncertainty(
+                gam::families::survival::location_scale::predict_survival_location_scalewith_uncertainty(
                     &pred_input,
                     &saved_fit,
                     &cov_mat,

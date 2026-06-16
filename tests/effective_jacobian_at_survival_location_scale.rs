@@ -12,7 +12,7 @@
 ///
 /// where eta_r[i] = X_r[i,:] · β_r + offset_r.  Tolerance: 1e-7 relative.
 use gam::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
-use gam::families::survival_location_scale::survival_location_scale_block_effective_jacobian;
+use gam::families::survival::location_scale::survival_location_scale_block_effective_jacobian;
 use gam::matrix::DesignMatrix;
 use ndarray::{Array1, Array2};
 

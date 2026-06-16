@@ -1489,7 +1489,7 @@ fn competing_risks_cif_impl(
         ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
     // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
-    let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
+    let result = gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
         .map_err(survival_error_to_pyerr)?;
     let cif_views = result.cif.iter().map(|m| m.view()).collect::<Vec<_>>();
     let cif_stacked = ndarray::stack(Axis(0), &cif_views).map_err(shape_error_to_pyerr)?;
@@ -1572,7 +1572,7 @@ fn competing_risks_cif_from_predictions_impl(
     // Typed engine path: `SurvivalError` → `gamfit.SurvivalError` (issue
     // #343), no string flattening.
     let result =
-        gam::survival::assemble_competing_risks_cif_from_endpoints(times, cumulative_hazards)
+        gam::families::survival::assemble_competing_risks_cif_from_endpoints(times, cumulative_hazards)
             .map_err(survival_error_to_pyerr)?;
     let cif = result.cif;
     Ok((cif, result.overall_survival))

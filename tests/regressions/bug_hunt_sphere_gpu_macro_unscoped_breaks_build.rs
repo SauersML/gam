@@ -29,7 +29,7 @@
 //!
 //!  * Every other off-`gpu`-module caller qualifies the macro — e.g.
 //!    `src/solver/reml/eval.rs:245` and
-//!    `src/families/survival_marginal_slope_gpu_prep.rs:374` use
+//!    `src/families/survival/marginal_slope/gpu_prep.rs:374` use
 //!    `crate::gpu_err!(...)`; the in-`gpu`-module callers that use it bare add
 //!    `use crate::gpu_err;` (e.g. `src/gpu/driver.rs:25`,
 //!    `src/gpu/cubic_bspline_moments.rs:77`). `sphere_gpu.rs` does neither.

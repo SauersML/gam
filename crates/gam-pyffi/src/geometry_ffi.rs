@@ -6190,7 +6190,7 @@ fn predict_table_jackknife_plus_impl(
     // computed from.
     let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
     let col_map = dataset.column_map();
-    let spec = gam::survival_predict::resolve_termspec_for_prediction(
+    let spec = gam::families::survival::predict::resolve_termspec_for_prediction(
         &model.resolved_termspec,
         model.training_headers.as_ref(),
         &col_map,
@@ -6308,7 +6308,7 @@ fn predict_table_full_conformal_impl(
     }
     let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
     let col_map = dataset.column_map();
-    let spec = gam::survival_predict::resolve_termspec_for_prediction(
+    let spec = gam::families::survival::predict::resolve_termspec_for_prediction(
         &model.resolved_termspec,
         model.training_headers.as_ref(),
         &col_map,
@@ -6745,7 +6745,7 @@ fn design_matrix_dense(
     }
     let col_map = dataset.column_map();
     let training_headers = model.training_headers.as_ref();
-    let spec = gam::survival_predict::resolve_termspec_for_prediction(
+    let spec = gam::families::survival::predict::resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
         &col_map,

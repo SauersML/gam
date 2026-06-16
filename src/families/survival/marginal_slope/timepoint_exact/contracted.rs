@@ -90,7 +90,7 @@ impl SurvivalMarginalSlopeFamily {
         )?;
 
         // Delegate the per-(u, v) assembly to the Block 10 GPU-substrate
-        // pure assembler in `crate::families::survival_marginal_slope_gpu`.  This is the
+        // pure assembler in `crate::families::survival::marginal_slope::gpu`.  This is the
         // single source of truth for the third-contraction inner loop —
         // shared with the GPU dispatch path so CPU/GPU cannot drift.
         let entry_b = block10_pack_base(&entry);
@@ -98,20 +98,21 @@ impl SurvivalMarginalSlopeFamily {
         let entry_d = block10_pack_dir(&entry_ext);
         let exit_d = block10_pack_dir(&exit_ext);
         let dir_vec: Vec<f64> = dir.to_vec();
-        let inputs = crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10ThirdInputs {
-            p,
-            qd1_index: primary.qd1,
-            qd1,
-            w: self.weights[row],
-            d: self.event[row],
-            dir: &dir_vec,
-            entry_base: &entry_b,
-            exit_base: &exit_b,
-            entry_ext: &entry_d,
-            exit_ext: &exit_d,
-        };
+        let inputs =
+            crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10ThirdInputs {
+                p,
+                qd1_index: primary.qd1,
+                qd1,
+                w: self.weights[row],
+                d: self.event[row],
+                dir: &dir_vec,
+                entry_base: &entry_b,
+                exit_base: &exit_b,
+                entry_ext: &entry_d,
+                exit_ext: &exit_d,
+            };
         let flat =
-            crate::families::survival_marginal_slope_gpu::cpu_oracle_third_contraction(&inputs)?;
+            crate::families::survival::marginal_slope::gpu::cpu_oracle_third_contraction(&inputs)?;
         Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
     }
 
@@ -230,7 +231,7 @@ impl SurvivalMarginalSlopeFamily {
         let dir_u_vec: Vec<f64> = dir_u.to_vec();
         let dir_v_vec: Vec<f64> = dir_v.to_vec();
         let inputs =
-            crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10FourthInputs {
+            crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10FourthInputs {
                 p,
                 qd1_index: primary.qd1,
                 qd1,
@@ -248,7 +249,7 @@ impl SurvivalMarginalSlopeFamily {
                 exit_bi: &exit_bi_p,
             };
         let flat =
-            crate::families::survival_marginal_slope_gpu::cpu_oracle_fourth_contraction(&inputs)
+            crate::families::survival::marginal_slope::gpu::cpu_oracle_fourth_contraction(&inputs)
                 .map_err(|e| format!("block10 fourth contraction: {e}"))?;
         let mut out = Array2::<f64>::zeros((p, p));
         for u in 0..p {

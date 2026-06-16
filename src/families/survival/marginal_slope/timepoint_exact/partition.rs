@@ -15,7 +15,7 @@ impl SurvivalMarginalSlopeFamily {
     ///
     /// The cell-table assembly and the per-cell primary-fixed-partials
     /// assembly route through the GPU-shaped `try_device_*` seams in
-    /// [`crate::families::survival_marginal_slope_gpu_prep`].  Until the matching NVRTC kernels
+    /// [`crate::families::survival::marginal_slope::gpu_prep`].  Until the matching NVRTC kernels
     /// land, both seams return `Ok(None)` and the call site falls back to
     /// the existing CPU implementation, so behavior is preserved.
     pub(crate) fn build_cached_partition_with_moment_order(
@@ -30,14 +30,14 @@ impl SurvivalMarginalSlopeFamily {
         // ── 1. partition cells via the device seam, CPU fallback on decline ──
         let raw_cells = {
             let row_input =
-                crate::families::survival_marginal_slope_gpu_prep::PartitionCellsRowInputs {
+                crate::families::survival::marginal_slope::gpu_prep::PartitionCellsRowInputs {
                     a,
                     b,
                     beta_h: beta_h.and_then(|b| b.as_slice()),
                     beta_w: beta_w.and_then(|b| b.as_slice()),
                 };
             let dev =
-                crate::families::survival_marginal_slope_gpu_prep::try_device_partition_cells(
+                crate::families::survival::marginal_slope::gpu_prep::try_device_partition_cells(
                     std::slice::from_ref(&row_input),
                 )
                 .map_err(|e| e.to_string())?;
@@ -54,7 +54,7 @@ impl SurvivalMarginalSlopeFamily {
         let mut u_mids = Vec::with_capacity(n);
         let mut states = Vec::with_capacity(n);
         let mut fp_inputs = Vec::<
-            crate::families::survival_marginal_slope_gpu_prep::CellPrimaryFixedPartialsCellInputs,
+            crate::families::survival::marginal_slope::gpu_prep::CellPrimaryFixedPartialsCellInputs,
         >::with_capacity(n);
         for partition_cell in &raw_cells {
             let cell = partition_cell.cell;
@@ -74,7 +74,7 @@ impl SurvivalMarginalSlopeFamily {
             u_mids.push(u_mid);
             states.push(state);
             fp_inputs.push(
-                crate::families::survival_marginal_slope_gpu_prep::CellPrimaryFixedPartialsCellInputs {
+                crate::families::survival::marginal_slope::gpu_prep::CellPrimaryFixedPartialsCellInputs {
                     score_span: partition_cell.score_span,
                     link_span: partition_cell.link_span,
                     z_basis: z_mid,
@@ -84,7 +84,7 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         // ── 3. per-cell fixed partials via the device seam, CPU fallback ──
-        let layout = crate::families::survival_marginal_slope_gpu_prep::FlexPrimaryLayout {
+        let layout = crate::families::survival::marginal_slope::gpu_prep::FlexPrimaryLayout {
             r: u32::try_from(primary.total).map_err(|_| {
                 format!(
                     "build_cached_partition_with_moment_order: primary.total={} exceeds u32",
@@ -99,13 +99,13 @@ impl SurvivalMarginalSlopeFamily {
             })?,
         };
         let row_fp_input =
-            crate::families::survival_marginal_slope_gpu_prep::CellPrimaryFixedPartialsRowInputs {
+            crate::families::survival::marginal_slope::gpu_prep::CellPrimaryFixedPartialsRowInputs {
                 a,
                 b,
                 cells: &fp_inputs,
                 layout,
             };
-        let dev_fixed = crate::families::survival_marginal_slope_gpu_prep::try_device_cell_primary_fixed_partials(
+        let dev_fixed = crate::families::survival::marginal_slope::gpu_prep::try_device_cell_primary_fixed_partials(
             std::slice::from_ref(&row_fp_input),
         )
         .map_err(|e| e.to_string())?;

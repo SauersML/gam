@@ -34,7 +34,7 @@
 //! or the threshold raised so a higher-accuracy branch handles this band), the
 //! library value matches the reference and the test passes unchanged.
 
-use gam::families::lognormal_kernel::log_kernel_term;
+use gam::families::survival::lognormal_kernel::log_kernel_term;
 use gam::inference::probability::normal_cdf;
 use gam::quadrature::QuadratureContext;
 

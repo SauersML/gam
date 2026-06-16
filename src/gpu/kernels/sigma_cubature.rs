@@ -8,7 +8,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1};
 
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 
 /// Per-sigma-point GPU PIRLS input: penalty, reparameterisation transform,
 /// and prior-mean shifts for one ρ / σ point.

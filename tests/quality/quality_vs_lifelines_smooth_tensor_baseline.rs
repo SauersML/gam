@@ -55,7 +55,7 @@
 //!     a real signal, not a reason to loosen the bound.
 
 use csv::StringRecord;
-use gam::families::survival_construction::{
+use gam::families::survival::construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
 };
@@ -273,7 +273,7 @@ fn gam_tensor_baseline_stratified_heldout_concordance() {
     };
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
-    // Reconstruct log Λ(t | x) exactly as survival_predict::evaluate_rp_row does:
+    // Reconstruct log Λ(t | x) exactly as survival::predict::evaluate_rp_row does:
     // η = [b(t) − b(anchor)]·β_time + c(age, ef, sex)·β_cov. β = [β_time | β_cov];
     // the time block is a strict prefix.
     let beta = &fit.fit.beta;

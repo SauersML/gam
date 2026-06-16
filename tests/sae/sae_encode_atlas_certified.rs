@@ -25,9 +25,7 @@ use ndarray::{Array1, Array2};
 use gam::terms::sae::candidate_index::{
     IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex,
 };
-use gam::terms::sae::encode_atlas::{
-    AtlasConfig, EncodeAtlas, KANTOROVICH_THRESHOLD, row_certificate,
-};
+use gam::terms::sae::encode::{AtlasConfig, EncodeAtlas, KANTOROVICH_THRESHOLD, row_certificate};
 use gam::terms::sae::manifold::{
     PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
 };

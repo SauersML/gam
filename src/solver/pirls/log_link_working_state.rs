@@ -19,17 +19,13 @@ use super::{
     working_deriv_slices, working_slices,
 };
 use crate::estimate::EstimationError;
-use crate::types::InverseLink;
+use crate::types::{InverseLink, MIN_WEIGHT};
 use ndarray::{Array1, ArrayView1};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 /// Lower floor on `mu = exp(eta)`, shared by every log-link family so the
 /// working response `(y - mu) / mu` and any fractional `mu` power stay finite.
 pub(crate) const MIN_MU: f64 = 1e-10;
-
-/// Lower floor on positive working weights, used by the floored families so the
-/// weighted normal equations stay numerically well posed.
-pub(crate) const MIN_WEIGHT: f64 = 1e-12;
 
 /// Clamp bound on `eta` so `exp(eta)` cannot overflow (`exp` overflows near
 /// `709`). Shared by every PIRLS row that exponentiates a linear predictor.

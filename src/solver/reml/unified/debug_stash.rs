@@ -116,20 +116,21 @@ pub(crate) fn store_terms(stash: TermStash) {
     TERMS.with(|cell| *cell.borrow_mut() = stash);
 }
 
-pub(crate) mod test_support {
+#[cfg(test)]
+mod debug_stash_tests {
     use super::*;
 
-    pub(crate) fn take_terms() -> TermStash {
-        TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
-    }
+    impl CaptureGuard {
+        pub(crate) fn take_terms(&self) -> TermStash {
+            TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+        }
 
-    /// Drain the recorded `a`-channel split.
-    pub(crate) fn take_a_split() -> Option<(f64, f64)> {
-        A_SPLIT_SINK.lock().ok().and_then(|mut slot| slot.take())
-    }
+        pub(crate) fn take_a_split(&self) -> Option<(f64, f64)> {
+            A_SPLIT_SINK.lock().ok().and_then(|mut slot| slot.take())
+        }
 
-    /// Drain the recorded KKT-residual probe.
-    pub(crate) fn take_kkt_probe() -> Option<(f64, bool)> {
-        KKT_PROBE_SINK.lock().ok().and_then(|mut slot| slot.take())
+        pub(crate) fn take_kkt_probe(&self) -> Option<(f64, bool)> {
+            KKT_PROBE_SINK.lock().ok().and_then(|mut slot| slot.take())
+        }
     }
 }

@@ -38,7 +38,7 @@
 //! When fixed, `d1` becomes positive and matches the finite-difference slope, so
 //! this test passes without edits.
 
-use gam::families::lognormal_kernel::latent_cloglog_jet5;
+use gam::families::survival::lognormal_kernel::latent_cloglog_jet5;
 use gam::quadrature::QuadratureContext;
 
 #[test]

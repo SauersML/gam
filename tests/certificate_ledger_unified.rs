@@ -8,7 +8,7 @@ use gam::inference::row_measure::CoresetCertificate;
 use gam::solver::logdet_bounds::LogdetEnclosure;
 use gam::solver::outer_strategy::CriterionCertificate;
 use gam::solver::structure_search::{CollapseAction, CollapseEvent};
-use gam::terms::sae::encode_atlas::EncodeResult;
+use gam::terms::sae::encode::EncodeResult;
 
 fn clean_criterion() -> CriterionCertificate {
     CriterionCertificate {

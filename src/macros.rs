@@ -106,10 +106,10 @@ macro_rules! bail_invalid_surv {
 #[macro_export]
 macro_rules! bail_dim_sls {
     ($fmt:literal $(, $($arg:tt)*)?) => {
-        return Err($crate::families::survival_location_scale::SurvivalLocationScaleError::DimensionMismatch { reason: format!($fmt $(, $($arg)*)?) })
+        return Err($crate::families::survival::location_scale::SurvivalLocationScaleError::DimensionMismatch { reason: format!($fmt $(, $($arg)*)?) })
     };
     ($msg:expr $(,)?) => {
-        return Err($crate::families::survival_location_scale::SurvivalLocationScaleError::DimensionMismatch { reason: $msg })
+        return Err($crate::families::survival::location_scale::SurvivalLocationScaleError::DimensionMismatch { reason: $msg })
     };
 }
 

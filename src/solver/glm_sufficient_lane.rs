@@ -64,12 +64,13 @@
 //! representation whose data-fit operator is ψ-free, paying the n-dependence
 //! once for the CONVERGED objective) is documented in [`endgame_path`] below.
 //!
-//! ### The wiring seam (documented, not yet wired — teammate owns smooth.rs)
+//! ### Current wiring
 //!
-//! The per-trial n-pass for the GLM design-moving lane lives at
-//! `SpatialJointContext::eval_full` (terms/smooth.rs), the same seam the
-//! Gaussian tensor plugs into: each θ=[ρ,ψ] trial re-realizes the n×k design at
-//! the new κ and runs PIRLS. For a GLM family the install is:
+//! The per-trial n-pass for the GLM design-moving lane lives in
+//! `SpatialJointContext::eval_full`
+//! (`crate::terms::smooth::spatial_optimization`), the same seam the Gaussian
+//! tensor plugs into: each θ=[ρ,ψ] trial re-realizes the n×k design at the new κ
+//! and runs PIRLS. For eligible GLM families the installed path is:
 //!
 //!   1. After the outer loop's warm β is available, snapshot the working weight
 //!      `w = w(η_warm)` and working response `z = z(η_warm)`.
@@ -77,8 +78,9 @@
 //!      existing exact realizer as `eval_design` (the SAME closure the Gaussian
 //!      lane uses), pre-scaling by `√w` and folding `√w·z` as the response.
 //!   3. In `eval_full`, when `tensor.contains(ψ)` AND `weight_drift_within(...)`
-//!      holds for the trial's converged predictor, serve the first Fisher step's
-//!      `(XᵀWX, XᵀWz)` from the tensor n-free; otherwise keep the exact rebuild.
+//!      holds for the trial's converged predictor, stage the first Fisher step's
+//!      `XᵀWX` on the external evaluator so the inner PIRLS solve can consume it
+//!      n-free; otherwise clear the slot and keep the exact rebuild.
 //!
 //! ### The GLM outer-GRADIENT n-free provider (#1033 (c), gradient channel)
 //!
@@ -108,14 +110,14 @@
 //! the irreducibly-n-dependent third-derivative curvature `Xᵀdiag(c⊙X_τβ̂)X`
 //! that the frozen tensor does not hold, so the drift stays on the exact path.
 //!
-//! The seam itself is owned by the teammate editing `src/terms/smooth.rs` and
-//! the evaluator (`src/solver/estimate.rs`): they snapshot the converged
-//! working weight, call `gradient_pair_if_sound`, and install the resulting
-//! conditioned-frame pair onto the inner REML surface (a GLM analogue of the
-//! Gaussian `install_gaussian_psi_gram_deriv` install). This module is the
-//! n-free provider they consume, with both guards ([`weight_drift_within`] for
-//! the value lane, [`FrozenWeightGramTensor::GRADIENT_WEIGHT_DRIFT_RTOL`] for
-//! the gradient lane) that keep the approximation honest.
+//! The integration lives in the spatial optimizer and external evaluator: they
+//! snapshot the warm working weight, call `gradient_pair_if_sound`, and install
+//! the resulting conditioned-frame pair onto the inner REML surface (a GLM
+//! analogue of the Gaussian `install_gaussian_psi_gram_deriv` install). This
+//! module is the n-free provider they consume, with both guards
+//! ([`weight_drift_within`] for the value lane,
+//! [`FrozenWeightGramTensor::GRADIENT_WEIGHT_DRIFT_RTOL`] for the gradient lane)
+//! that keep the approximation honest.
 
 use crate::solver::psi_gram_tensor::PsiGramTensor;
 use ndarray::{Array1, Array2, ArrayView1};

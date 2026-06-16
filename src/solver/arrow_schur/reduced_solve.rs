@@ -466,14 +466,14 @@ pub fn solve_streaming_reduced_beta(
         // ridge escalation. A genuine device PD failure is non-recoverable for
         // this attempt's `schur`, so we let the CPU path re-confirm and escalate.
         if crate::gpu::runtime::GpuRuntime::is_available() {
-            match crate::gpu::arrow_schur::solve_reduced_beta_pcg(
+            match crate::gpu::kernels::arrow_schur::solve_reduced_beta_pcg(
                 &schur,
                 rhs_beta,
                 options.trust_region.max_iterations,
                 options.trust_region.steihaug_relative_tolerance,
             ) {
                 Ok(delta_beta) => return Ok(delta_beta),
-                Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {}
+                Err(crate::gpu::kernels::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {}
                 Err(_) => {
                     // Device declined this `schur` (e.g. non-PD Jacobi diag);
                     // let the CPU path confirm and escalate the proximal ridge.

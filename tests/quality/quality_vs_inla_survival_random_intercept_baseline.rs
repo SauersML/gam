@@ -54,7 +54,7 @@
 //! loosening a bound or editing gam.
 
 use csv::StringRecord;
-use gam::families::survival_construction::SurvivalLikelihoodMode;
+use gam::families::survival::construction::SurvivalLikelihoodMode;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, r_package_available, rmse, run_r};
@@ -976,7 +976,7 @@ fn baseline_cumulative_hazard(
     fit: &gam::SurvivalTransformationFitResult,
     t_grid: &[f64],
 ) -> Vec<f64> {
-    use gam::families::survival_construction::{
+    use gam::families::survival::construction::{
         SurvivalTimeBasisConfig, build_survival_time_basis, evaluate_survival_time_basis_row,
     };
     use ndarray::Array1;

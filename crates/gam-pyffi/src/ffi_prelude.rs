@@ -33,11 +33,11 @@ pub(crate) use gam::families::scale_design::{
     build_scale_deviation_transform, infer_non_intercept_start,
 };
 
-pub(crate) use gam::families::survival_construction::{
+pub(crate) use gam::families::survival::construction::{
     SavedSurvivalTimeBasis, survival_likelihood_modename,
 };
 
-pub(crate) use gam::families::survival_predict::{
+pub(crate) use gam::families::survival::predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
 
@@ -121,7 +121,7 @@ pub(crate) use gam::solver::evidence::{
     RemlCandidate, compare_reml_fits as compare_reml_fits_core, log_bayes_factor,
 };
 
-pub(crate) use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
+pub(crate) use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFitResult;
 
 pub(crate) use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,

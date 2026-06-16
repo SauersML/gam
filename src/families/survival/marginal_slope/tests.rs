@@ -141,7 +141,7 @@ fn base_time_block() -> TimeBlockInput {
             DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
         ),
         time_monotonicity:
-            crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint,
+            crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint,
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
         initial_log_lambdas: None,
@@ -654,7 +654,7 @@ fn validate_spec_rejects_nonstructural_time_block() {
                 offset_entry: Array1::zeros(2),
                 offset_exit: Array1::zeros(2),
                 derivative_offset_exit: Array1::zeros(2),
-                time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 ..base_time_block()
             },
             timewiggle_block: None,
@@ -5731,7 +5731,7 @@ fn survival_auto_subsample_phase_counter_field_initializes_to_zero() {
 
 // ────────────────────────────────────────────────────────────────────
 // Block 10 parity — third T_uv[r] and fourth Q_uv[r,s] contractions:
-// crate::families::survival_marginal_slope_gpu::cpu_oracle_third_contraction /
+// crate::families::survival::marginal_slope::gpu::cpu_oracle_third_contraction /
 // cpu_oracle_fourth_contraction must match the family CPU paths
 // (row_flex_primary_third_contracted_exact / _fourth_contracted_exact)
 // to within 5e-8 absolute / 5e-7 relative.
@@ -5894,8 +5894,8 @@ fn b10_direction_set(p: usize) -> Vec<(&'static str, Array1<f64>)> {
 
 fn b10_pack_base(
     base: &SurvivalFlexTimepointExact,
-) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBase {
-    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBase {
+) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
+    crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
         eta: base.eta,
         chi: base.chi,
         d: base.d,
@@ -5910,8 +5910,8 @@ fn b10_pack_base(
 
 fn b10_pack_dir(
     ext: &SurvivalFlexTimepointDirectionalExact,
-) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
-    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
+) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
+    crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
         eta_uv_dir: ext.eta_uv_dir.iter().copied().collect(),
         chi_uv_dir: ext.chi_uv_dir.iter().copied().collect(),
         d_u_dir: ext.d_u_dir.to_vec(),
@@ -5921,8 +5921,8 @@ fn b10_pack_dir(
 
 fn b10_pack_bi(
     bi: &SurvivalFlexTimepointBiDirectionalExact,
-) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional {
-    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional {
+) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional {
+    crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional {
         eta_uv_uv: bi.eta_uv_uv.iter().copied().collect(),
         chi_uv_uv: bi.chi_uv_uv.iter().copied().collect(),
         d_uv_uv: bi.d_uv_uv.iter().copied().collect(),
@@ -6073,7 +6073,7 @@ fn b10_third_oracle_from_family(
     let entry_d = b10_pack_dir(&entry_ext);
     let exit_d = b10_pack_dir(&exit_ext);
     let dir_vec: Vec<f64> = dir.to_vec();
-    let inputs = crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10ThirdInputs {
+    let inputs = crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10ThirdInputs {
         p: p_total,
         qd1_index: qd1_idx,
         qd1,
@@ -6085,7 +6085,7 @@ fn b10_third_oracle_from_family(
         entry_ext: &entry_d,
         exit_ext: &exit_d,
     };
-    crate::families::survival_marginal_slope_gpu::cpu_oracle_third_contraction(&inputs)
+    crate::families::survival::marginal_slope::gpu::cpu_oracle_third_contraction(&inputs)
         .expect("oracle third")
 }
 
@@ -6124,7 +6124,7 @@ fn b10_fourth_oracle_from_family(
     let exit_bi_p = b10_pack_bi(&exit_bi);
     let dir_u_v: Vec<f64> = dir_u.to_vec();
     let dir_v_v: Vec<f64> = dir_v.to_vec();
-    let inputs = crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10FourthInputs {
+    let inputs = crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10FourthInputs {
         p: p_total,
         qd1_index: qd1_idx,
         qd1,
@@ -6141,7 +6141,7 @@ fn b10_fourth_oracle_from_family(
         entry_bi: &entry_bi_p,
         exit_bi: &exit_bi_p,
     };
-    crate::families::survival_marginal_slope_gpu::cpu_oracle_fourth_contraction(&inputs)
+    crate::families::survival::marginal_slope::gpu::cpu_oracle_fourth_contraction(&inputs)
         .expect("oracle fourth")
 }
 

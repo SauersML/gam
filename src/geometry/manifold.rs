@@ -322,7 +322,7 @@ pub(crate) fn dot(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
 ///
 /// Choosing the tiling: we target as many equal tiles as there are output rows
 /// can support while keeping each tile a non-trivial GEMM, so the batch axis is
-/// long enough to cross `crate::gpu::linalg`'s multi-GPU batch floor and spread
+/// long enough to cross `crate::gpu::linalg_dispatch`'s multi-GPU batch floor and spread
 /// across every device.
 pub(crate) fn fast_ab_rows_multi_gpu(
     a: ArrayView2<'_, f64>,

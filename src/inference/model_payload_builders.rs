@@ -25,7 +25,7 @@ use crate::families::scale_design::ScaleDeviationTransform;
 use crate::families::survival::construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, survival_baseline_targetname,
 };
-use crate::families::survival_location_scale::{
+use crate::families::survival::location_scale::{
     ResidualDistribution, residual_distribution_from_inverse_link,
 };
 use crate::families::transformation_normal::TransformationNormalFamily;
@@ -174,7 +174,7 @@ pub struct BernoulliMarginalSlopeInputs<'a> {
     pub score_warp_runtime: Option<&'a DeviationRuntime>,
     pub link_dev_runtime: Option<&'a DeviationRuntime>,
     pub base_link: InverseLink,
-    pub frailty: crate::families::lognormal_kernel::FrailtySpec,
+    pub frailty: crate::families::survival::lognormal_kernel::FrailtySpec,
 }
 
 /// Drop the #461 training-only influence-absorber coefficients `γ` from a fitted
@@ -684,7 +684,7 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     pub formula: String,
     pub data_schema: DataSchema,
     pub fit_result: UnifiedFitResult,
-    pub frailty: crate::families::lognormal_kernel::FrailtySpec,
+    pub frailty: crate::families::survival::lognormal_kernel::FrailtySpec,
     pub survival_entry: Option<String>,
     pub survival_exit: String,
     pub survival_event: String,
@@ -825,7 +825,7 @@ pub fn assemble_survival_transformation_payload(
             ),
             survival_likelihood: Some(inputs.survival_likelihood_label.clone()),
             survival_distribution: None,
-            frailty: crate::families::lognormal_kernel::FrailtySpec::None,
+            frailty: crate::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         ResponseFamily::RoystonParmar.name().to_string(),
     );
@@ -926,7 +926,7 @@ pub fn assemble_survival_location_scale_payload(
             ),
             survival_likelihood: Some(inputs.survival_likelihood_label.clone()),
             survival_distribution,
-            frailty: crate::families::lognormal_kernel::FrailtySpec::None,
+            frailty: crate::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         ResponseFamily::RoystonParmar.name().to_string(),
     );

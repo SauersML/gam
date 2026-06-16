@@ -1728,7 +1728,7 @@ mod tests {
         UnifiedFitResultParts,
     };
     use crate::matrix::DesignMatrix;
-    use crate::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
+    use crate::families::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
     use crate::types::{
         InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
         ResponseFamily, RhoPrior, StandardLink,
@@ -5114,9 +5114,9 @@ pub struct SurvivalFlatInputs<'a> {
 /// Flattened numeric inputs for Royston-Parmar NUTS sampling.
 pub struct SurvivalNutsInputs<'a> {
     pub flat: SurvivalFlatInputs<'a>,
-    pub penalties: crate::survival::PenaltyBlocks,
-    pub monotonicity: crate::survival::SurvivalMonotonicityPenalty,
-    pub spec: crate::survival::SurvivalSpec,
+    pub penalties: crate::families::survival::PenaltyBlocks,
+    pub monotonicity: crate::families::survival::SurvivalMonotonicityPenalty,
+    pub spec: crate::families::survival::SurvivalSpec,
     pub structurally_monotonic: bool,
     pub structural_time_columns: usize,
     pub mode: ArrayView1<'a, f64>,
@@ -7560,7 +7560,7 @@ pub fn run_joint_beta_rho_sampling(
 
 mod survival_hmc {
     use super::*;
-    use crate::survival::{
+    use crate::families::survival::{
         PenaltyBlocks, SurvivalEngineInputs, SurvivalMonotonicityPenalty, SurvivalSpec,
         WorkingModelSurvival,
     };
@@ -7631,7 +7631,7 @@ mod survival_hmc {
                     monotonicity_constraint_rows: None,
                     monotonicity_constraint_offsets: None,
                 },
-                Some(crate::survival::SurvivalBaselineOffsets {
+                Some(crate::families::survival::SurvivalBaselineOffsets {
                     eta_entry: off_eta_entry.view(),
                     eta_exit: off_eta_exit.view(),
                     derivative_exit: off_deriv_exit.view(),
@@ -7789,9 +7789,9 @@ mod survival_hmc {
 /// Engine-facing flattened survival NUTS entrypoint.
 pub fn run_survival_nuts_sampling_flattened<'a>(
     flat: SurvivalFlatInputs<'a>,
-    penalties: crate::survival::PenaltyBlocks,
-    monotonicity: crate::survival::SurvivalMonotonicityPenalty,
-    spec: crate::survival::SurvivalSpec,
+    penalties: crate::families::survival::PenaltyBlocks,
+    monotonicity: crate::families::survival::SurvivalMonotonicityPenalty,
+    spec: crate::families::survival::SurvivalSpec,
     structurally_monotonic: bool,
     structural_time_columns: usize,
     mode: ArrayView1<'a, f64>,

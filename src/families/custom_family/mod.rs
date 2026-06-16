@@ -33,7 +33,6 @@ pub(crate) use crate::matrix::{
 pub(crate) use crate::pirls::{
     LinearInequalityConstraints, solve_newton_directionwith_lower_bounds,
 };
-pub(crate) use crate::solver::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use crate::solver::active_set::{
     project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
@@ -49,6 +48,7 @@ pub(crate) use crate::solver::estimate::reml::unified::{
 pub(crate) use crate::solver::estimate::{
     EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
+pub(crate) use crate::solver::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use crate::types::{RidgeDeterminantMode, RidgePolicy};
 pub(crate) use coefficient_groups::validate_penalized_complexity_prior;
 pub(crate) use faer::Side;
@@ -68,30 +68,31 @@ pub(crate) use thiserror::Error;
 
 pub use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
 
+mod assembly;
 mod block_spec;
 mod blockwise_solve;
 mod covariance;
 mod error;
 mod family_trait;
 mod fit;
+mod inner_blockwise_fit;
 mod jeffreys;
+mod joint_derivatives;
 mod joint_newton;
 mod options;
-mod assembly;
-mod inner_blockwise_fit;
-mod joint_derivatives;
 mod outer_objective;
-mod warm_start;
 mod penalty;
 mod penalty_labels;
 mod psi_design;
 mod psi_hyper;
+mod warm_start;
 
 mod coefficient_groups;
 mod persistent_warm_start;
 
 // `pub use ...::*` preserves each item's own visibility (pub stays pub,
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.
+pub use assembly::*;
 pub use block_spec::*;
 pub(crate) use blockwise_solve::*;
 pub use coefficient_groups::*;
@@ -99,18 +100,17 @@ pub(crate) use covariance::*;
 pub use error::*;
 pub use family_trait::*;
 pub use fit::*;
+pub use inner_blockwise_fit::*;
 pub(crate) use jeffreys::*;
+pub use joint_derivatives::*;
 pub use joint_newton::*;
 pub use options::*;
-pub use assembly::*;
-pub use inner_blockwise_fit::*;
-pub use joint_derivatives::*;
 pub use outer_objective::*;
-pub use warm_start::*;
 pub use penalty::*;
 pub(crate) use penalty_labels::*;
 pub use psi_design::*;
 pub use psi_hyper::*;
+pub use warm_start::*;
 
 #[cfg(test)]
 mod test_support;

@@ -20,9 +20,9 @@
 //! substrate.
 
 #[cfg(target_os = "linux")]
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
-use crate::gpu::error::GpuResultExt;
+use crate::gpu::gpu_error::GpuResultExt;
 #[cfg(target_os = "linux")]
 use crate::gpu::kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
@@ -315,8 +315,8 @@ impl CubicCellGpuBackend {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use crate::gpu::error::GpuError;
-    use crate::gpu::error::GpuResultExt;
+    use crate::gpu::gpu_error::GpuError;
+    use crate::gpu::gpu_error::GpuResultExt;
     use crate::gpu::kernels::cubic_cell::{
         CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
         CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,

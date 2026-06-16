@@ -59,11 +59,11 @@ use gam::probability::normal_cdf;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
 };
-use gam::survival_construction::build_survival_baseline_offsets;
-use gam::survival_construction::build_survival_timewiggle_from_baseline;
-use gam::survival_construction::parse_survival_baseline_config;
-use gam::survival_construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
-use gam::survival_location_scale::{ResidualDistribution, project_onto_linear_constraints};
+use gam::families::survival::construction::build_survival_baseline_offsets;
+use gam::families::survival::construction::build_survival_timewiggle_from_baseline;
+use gam::families::survival::construction::parse_survival_baseline_config;
+use gam::families::survival::construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
+use gam::families::survival::location_scale::{ResidualDistribution, project_onto_linear_constraints};
 use gam::term_builder::{
     heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
 };
@@ -1337,7 +1337,7 @@ fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
             ),
             survival_likelihood: Some("location-scale".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -1640,7 +1640,7 @@ fn saved_bernoulli_marginal_slope_replays_main_and_logslope_deviation_runtimes()
                 InverseLink::Standard(StandardLink::Probit),
             ),
             base_link: Some(InverseLink::Standard(StandardLink::Probit)),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "bernoulli-marginal-slope".to_string(),
     );
@@ -3310,7 +3310,7 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
         None,
         None,
         InverseLink::Standard(StandardLink::Probit),
-        gam::families::lognormal_kernel::FrailtySpec::None,
+        gam::families::survival::lognormal_kernel::FrailtySpec::None,
     )
     .expect("build bernoulli marginal-slope saved model");
     assert_eq!(
@@ -3378,7 +3378,7 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
         score_warp_runtime: None,
         link_dev_runtime: None,
         base_link: InverseLink::Standard(StandardLink::Probit),
-        frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+        frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
     };
 
     // CLI source metadata: headers + per-feature ranges, no offset columns.
@@ -3529,7 +3529,7 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         None,
         None,
         InverseLink::Standard(StandardLink::Probit),
-        gam::families::lognormal_kernel::FrailtySpec::None,
+        gam::families::survival::lognormal_kernel::FrailtySpec::None,
     )
     .expect("build bernoulli marginal-slope saved model");
     write_model_json(&model_path, &model).expect("write saved marginal-slope model");
@@ -3589,7 +3589,7 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
         None,
         None,
         InverseLink::Standard(StandardLink::Probit),
-        gam::families::lognormal_kernel::FrailtySpec::None,
+        gam::families::survival::lognormal_kernel::FrailtySpec::None,
     )
     .expect("build bernoulli marginal-slope saved model")
     .payload()
@@ -3610,7 +3610,7 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
             ),
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -4428,11 +4428,11 @@ fn structural_survival_basis_error_explainswhy_bspline_is_rejected() {
 
 #[test]
 fn structural_survival_basis_detection_is_ispline_only() {
-    assert!(gam::survival_construction::survival_basis_supports_structural_monotonicity("ispline"));
-    assert!(gam::survival_construction::survival_basis_supports_structural_monotonicity("ISPLINE"));
-    assert!(!gam::survival_construction::survival_basis_supports_structural_monotonicity("linear"));
+    assert!(gam::families::survival::construction::survival_basis_supports_structural_monotonicity("ispline"));
+    assert!(gam::families::survival::construction::survival_basis_supports_structural_monotonicity("ISPLINE"));
+    assert!(!gam::families::survival::construction::survival_basis_supports_structural_monotonicity("linear"));
     assert!(
-        !gam::survival_construction::survival_basis_supports_structural_monotonicity("bspline")
+        !gam::families::survival::construction::survival_basis_supports_structural_monotonicity("bspline")
     );
 }
 
@@ -4459,7 +4459,7 @@ fn saved_survival_model_requires_time_basis_metadata() {
             ),
             survival_likelihood: Some("transformation".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -4520,7 +4520,7 @@ fn saved_prediction_runtime_validates_survival_anchored_deviation_runtime() {
             ),
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -4689,7 +4689,7 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
     let time_deriv_dense = array![[1.0], [1.0]];
     let cov_dense = array![[1.0, -0.5], [0.3, 0.8]];
     let logslope_dense = array![[0.7], [-0.2]];
-    let time_build = gam::survival_construction::SurvivalTimeBuildOutput {
+    let time_build = gam::families::survival::construction::SurvivalTimeBuildOutput {
         x_entry_time: nondensify_design(time_entry_dense.clone()),
         x_exit_time: nondensify_design(time_exit_dense.clone()),
         x_derivative_time: nondensify_design(time_deriv_dense.clone()),
@@ -4740,7 +4740,7 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
             ),
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -4886,7 +4886,7 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
             ),
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -4951,7 +4951,7 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
         .validate_for_persistence()
         .expect("saved survival marginal-slope payload should validate");
 
-    let time_build = gam::survival_construction::SurvivalTimeBuildOutput {
+    let time_build = gam::families::survival::construction::SurvivalTimeBuildOutput {
         x_entry_time: DesignMatrix::from(array![[1.0]]),
         x_exit_time: DesignMatrix::from(array![[1.0]]),
         x_derivative_time: DesignMatrix::from(array![[1.0]]),
@@ -5022,7 +5022,7 @@ fn saved_baseline_timewiggle_components_return_none_without_metadata() {
             ),
             survival_likelihood: Some("transformation".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -5095,7 +5095,7 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
             ),
             survival_likelihood: Some("transformation".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -5212,13 +5212,13 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
     let data = array![[10.0, 20.0], [12.0, 24.0]];
     let age_entry = data.column(0).to_owned();
     let age_exit = data.column(1).to_owned();
-    let time_cfg = gam::survival_construction::SurvivalTimeBasisConfig::ISpline {
+    let time_cfg = gam::families::survival::construction::SurvivalTimeBasisConfig::ISpline {
         degree: 2,
         knots: Array1::zeros(0),
         keep_cols: Vec::new(),
         smooth_lambda: 1e-4,
     };
-    let time_build = gam::survival_construction::build_survival_time_basis(
+    let time_build = gam::families::survival::construction::build_survival_time_basis(
         &age_entry,
         &age_exit,
         time_cfg,
@@ -5227,7 +5227,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
     .expect("build latent survival test time basis");
     let p_time = time_build.x_exit_time.ncols();
     let time_anchor =
-        gam::survival_construction::resolve_survival_time_anchor_value(&age_entry, None)
+        gam::families::survival::construction::resolve_survival_time_anchor_value(&age_entry, None)
             .expect("resolve latent survival test time anchor");
     let blocks = vec![
         gam::estimate::FittedBlock {
@@ -5256,9 +5256,9 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         "Surv(entry, exit, event) ~ 1",
         ModelKind::Survival,
         FittedFamily::LatentSurvival {
-            frailty: gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(0.3),
-                loading: gam::families::lognormal_kernel::HazardLoading::Full,
+                loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
             },
         },
         "latent-survival",
@@ -5329,9 +5329,9 @@ fn explicit_latent_binary_family_requires_matching_saved_likelihood_metadata() {
         "Surv(entry, exit, event) ~ 1",
         ModelKind::Survival,
         FittedFamily::LatentBinary {
-            frailty: gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(0.3),
-                loading: gam::families::lognormal_kernel::HazardLoading::Full,
+                loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
             },
         },
         "latent-binary",
@@ -5348,9 +5348,9 @@ fn explicit_latent_survival_family_requires_matching_saved_likelihood_metadata()
         "Surv(entry, exit, event) ~ 1",
         ModelKind::Survival,
         FittedFamily::LatentSurvival {
-            frailty: gam::families::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(0.3),
-                loading: gam::families::lognormal_kernel::HazardLoading::Full,
+                loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
             },
         },
         "latent-survival",
@@ -5400,7 +5400,7 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
             ),
             survival_likelihood: Some("transformation".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+            frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "survival",
     );
@@ -6200,13 +6200,13 @@ fn structural_survival_fit_is_time_unit_invariant() {
             )
             .expect("build structural survival time basis");
             let p_time = time_build.x_exit_time.ncols();
-            let penalties = gam::survival::PenaltyBlocks::new(
+            let penalties = gam::families::survival::PenaltyBlocks::new(
                 time_build
                     .penalties
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| s.nrows() == p_time && s.ncols() == p_time)
-                    .map(|(idx, s)| gam::survival::PenaltyBlock {
+                    .map(|(idx, s)| gam::families::survival::PenaltyBlock {
                         matrix: s.clone(),
                         lambda: 5e-1,
                         range: 0..p_time,
@@ -6222,11 +6222,11 @@ fn structural_survival_fit_is_time_unit_invariant() {
             let tb_entry_d = time_build.x_entry_time.to_dense();
             let tb_exit_d = time_build.x_exit_time.to_dense();
             let tb_deriv_d = time_build.x_derivative_time.to_dense();
-            let mut model = gam::families::royston_parmar::working_model_from_flattened(
+            let mut model = gam::families::survival::royston_parmar::working_model_from_flattened(
                 penalties,
-                gam::survival::SurvivalMonotonicityPenalty { tolerance: 0.0 },
-                gam::survival::SurvivalSpec::Net,
-                gam::families::royston_parmar::RoystonParmarInputs {
+                gam::families::survival::SurvivalMonotonicityPenalty { tolerance: 0.0 },
+                gam::families::survival::SurvivalSpec::Net,
+                gam::families::survival::royston_parmar::RoystonParmarInputs {
                     age_entry: age_entry.view(),
                     age_exit: age_exit.view(),
                     event_target: event_target.view(),
@@ -6720,8 +6720,8 @@ fn survival_initial_time_coefficient_targets_safe_interior_derivative() {
         Array2::from_shape_vec((2, 3), vec![0.2, 0.4, 1.0, 0.3, 0.5, 1.0]).expect("exit design");
     let x_derivative = Array2::from_shape_vec((2, 3), vec![3e-5, 2e-5, 0.0, 4e-5, 1e-5, 0.0])
         .expect("derivative design");
-    let mut model = gam::survival::WorkingModelSurvival::from_engine_inputs(
-        gam::survival::SurvivalEngineInputs {
+    let mut model = gam::families::survival::WorkingModelSurvival::from_engine_inputs(
+        gam::families::survival::SurvivalEngineInputs {
             age_entry: age_entry.view(),
             age_exit: age_exit.view(),
             event_target: event_target.view(),
@@ -6733,9 +6733,9 @@ fn survival_initial_time_coefficient_targets_safe_interior_derivative() {
             monotonicity_constraint_rows: None,
             monotonicity_constraint_offsets: None,
         },
-        gam::survival::PenaltyBlocks::new(Vec::new()),
-        gam::survival::SurvivalMonotonicityPenalty { tolerance: 0.0 },
-        gam::survival::SurvivalSpec::Net,
+        gam::families::survival::PenaltyBlocks::new(Vec::new()),
+        gam::families::survival::SurvivalMonotonicityPenalty { tolerance: 0.0 },
+        gam::families::survival::SurvivalSpec::Net,
     )
     .expect("construct survival model");
     model

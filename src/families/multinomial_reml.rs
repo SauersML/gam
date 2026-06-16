@@ -1272,7 +1272,7 @@ impl CustomFamily for MultinomialFamily {
 /// views of the joint penalized Hessian.
 ///
 /// Equivalent in spirit to `LatentHessianWorkspace` in
-/// [`crate::families::latent_survival`]; the multinomial case keeps a
+/// [`crate::families::survival::latent`]; the multinomial case keeps a
 /// single workspace type because the family has no per-block
 /// configuration to specialise on.
 struct MultinomialHessianWorkspace {

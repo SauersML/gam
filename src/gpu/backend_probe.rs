@@ -35,9 +35,9 @@ pub(crate) use linux::{CudaBackendContext, probe_backend_with_compile, probe_cud
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use crate::gpu::common::{DeviceArena, PtxModuleCache};
     use crate::gpu::device::GpuCapability;
-    use crate::gpu::error::GpuError;
+    use crate::gpu::device_cache::{DeviceArena, PtxModuleCache};
+    use crate::gpu::gpu_error::GpuError;
     use crate::gpu::runtime::{GpuRuntime, cuda_context_for};
     use crate::gpu_err;
     use cudarc::driver::{CudaContext, CudaStream};
@@ -138,7 +138,7 @@ mod linux {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::probe_cuda_backend;
-    use crate::gpu::error::GpuError;
+    use crate::gpu::gpu_error::GpuError;
     use crate::gpu::runtime::GpuRuntime;
 
     /// Parity: every backend's probe must agree with the shared contract on

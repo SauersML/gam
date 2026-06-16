@@ -6,7 +6,7 @@
 //!
 //! The pre-fit identifiability audit builds each block's effective Jacobian once
 //! at `beta = &[]` with `family_scalars = None` (see
-//! `src/solver/identifiability_canonical.rs::BlockJacobianAsRowOp::from_callback`).
+//! `src/identifiability/canonical.rs::BlockJacobianAsRowOp::from_callback`).
 //! The BMS observed predictor is
 //!
 //! ```text
@@ -40,7 +40,7 @@
 use gam::ResourcePolicy;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary,
 };

@@ -675,7 +675,7 @@ pub fn solve_arrow_newton_step_dense_reference(
 mod cuda {
     use super::{ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_block, pack_host};
     use crate::gpu::driver::to_i32;
-    use crate::gpu::linalg::{DispatchOp, route_through_gpu};
+    use crate::gpu::linalg_dispatch::{DispatchOp, route_through_gpu};
     use crate::solver::arrow_schur::{
         ArrowSchurSystem, DeviceSaePcgData, PcgDiagnostics, PcgStopReason,
     };
@@ -1845,8 +1845,8 @@ extern "C" __global__ void arrow_sae_diag_sub(
     fn pcg_vector_module(
         ctx: &Arc<CudaContext>,
     ) -> Result<&'static Arc<CudaModule>, ArrowSchurGpuFailure> {
-        static CACHE: crate::gpu::common::PtxModuleCache =
-            crate::gpu::common::PtxModuleCache::new();
+        static CACHE: crate::gpu::device_cache::PtxModuleCache =
+            crate::gpu::device_cache::PtxModuleCache::new();
         CACHE
             .get_or_compile(ctx, "arrow_pcg_vector", PCG_VECTOR_KERNEL_SOURCE)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)
@@ -2507,8 +2507,8 @@ extern "C" __global__ void arrow_sae_diag_sub(
         let p_max = plan.p_max;
         let r_template = plan.r_template;
 
-        let runtime = crate::gpu::linalg::route_through_gpu(
-            crate::gpu::linalg::DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n },
+        let runtime = crate::gpu::linalg_dispatch::route_through_gpu(
+            crate::gpu::linalg_dispatch::DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n },
         )
         .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
@@ -2762,8 +2762,8 @@ extern "C" __global__ void arrow_sae_diag_sub(
         let p_max = plan.p_max;
         let r_template = plan.r_template;
 
-        let runtime = crate::gpu::linalg::route_through_gpu(
-            crate::gpu::linalg::DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n },
+        let runtime = crate::gpu::linalg_dispatch::route_through_gpu(
+            crate::gpu::linalg_dispatch::DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n },
         )
         .ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
         let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
@@ -3075,9 +3075,10 @@ extern "C" __global__ void arrow_sae_diag_sub(
         relative_tolerance: f64,
     ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
         let k = rhs_beta.len();
-        let runtime =
-            crate::gpu::linalg::route_through_gpu(crate::gpu::linalg::DispatchOp::Gemv { m: k, k })
-                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let runtime = crate::gpu::linalg_dispatch::route_through_gpu(
+            crate::gpu::linalg_dispatch::DispatchOp::Gemv { m: k, k },
+        )
+        .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let stream = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
             .and_then(|ctx| ctx.new_stream().ok())
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;

@@ -21,7 +21,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use super::error::GpuError;
+use super::gpu_error::GpuError;
 use crate::gpu_err;
 
 pub type CuResult = i32;

@@ -542,9 +542,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // `∂X/∂ψ` slab below is provably DEAD (the `j==0` gradient branch
             // reads the k-space derivatives, never the slab), so we skip the
             // per-trial slab conditioning — the LAST O(n·k²) pass in the κ loop.
-            let gradient_is_n_free = self.install_psi_gram_statistics(theta, rho_dim);
-            self.install_pending_glm_first_step_gram();
-            if !gradient_is_n_free {
+            let gaussian_gradient_is_n_free = self.install_psi_gram_statistics(theta, rho_dim);
+            let glm_gradient_is_n_free = self.install_pending_glm_trial_statistics();
+            if !(gaussian_gradient_is_n_free || glm_gradient_is_n_free) {
                 // The slab gradient lane is live for this trial (off the certified
                 // gradient sub-window, non-Gaussian, multi-ψ, …) — condition the
                 // n×k `∂X/∂ψ` slab into the inner solver's frame as before.
@@ -615,7 +615,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // (`reset_surface` above just cleared the slot for the new design). Same
         // installer the fast path uses, so both branches key the Gram to ψ.
         self.install_psi_gram_statistics(theta, rho_dim);
-        self.install_pending_glm_first_step_gram();
+        self.install_pending_glm_trial_statistics();
         Ok(hyper_dirs)
     }
 
@@ -625,7 +625,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// path) and on the design-revision fast path, mirroring
     /// `install_psi_gram_statistics`: the Gram is ψ-keyed, so it must be
     /// (re)installed per trial and never carried over from the previous ψ.
-    fn install_pending_glm_first_step_gram(&mut self) {
+    fn install_pending_glm_trial_statistics(&mut self) -> bool {
+        let mut gradient_is_n_free = false;
         match self.pending_glm_first_step_gram.take() {
             Some(gram) => {
                 if !self.reml_state.install_glm_first_step_gram(gram) {
@@ -642,7 +643,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // `a_j` / `g_j` n-free; `B_j` stays the exact slab.
         match self.pending_glm_psi_gram_deriv.take() {
             Some(deriv) => {
-                if !self.reml_state.install_glm_psi_gram_deriv(deriv) {
+                if self.reml_state.install_glm_psi_gram_deriv(deriv) {
+                    gradient_is_n_free = true;
+                } else {
                     // Shape mismatch against the current surface — fall back to
                     // the exact streamed ∂X/∂ψ slab gradient.
                     self.reml_state.clear_glm_psi_gram_deriv();
@@ -650,6 +653,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             }
             None => self.reml_state.clear_glm_psi_gram_deriv(),
         }
+        gradient_is_n_free
     }
 
     pub(crate) fn evaluate_with_order(

@@ -522,8 +522,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         canonical_n_rows,
         canonical_n_cols_raw,
     );
-    let canonical =
-        crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
+    let canonical = crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
     let canonical_n_cols_red: usize = canonical
         .reduced_specs
         .iter()

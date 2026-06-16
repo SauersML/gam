@@ -1,6 +1,6 @@
 use gam::families::family_runtime::{FamilyStrategy, strategy_for_spec};
-use gam::families::latent_survival::fixed_latent_hazard_frailty;
-use gam::families::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam::families::survival::latent::fixed_latent_hazard_frailty;
+use gam::families::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam::families::marginal_slope_shared::{
     OuterScoreSubsample, WeightedOuterRow, outer_row_weights_by_index, outer_weighted_rows,
 };

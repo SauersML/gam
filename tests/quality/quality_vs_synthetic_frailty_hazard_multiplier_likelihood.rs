@@ -37,7 +37,7 @@
 //! the two MLEs should in fact agree to quadrature precision; the comparison is a
 //! baseline, never the pass criterion.
 
-use gam::families::lognormal_kernel::{LatentSurvivalRow, LatentSurvivalRowJet};
+use gam::families::survival::lognormal_kernel::{LatentSurvivalRow, LatentSurvivalRowJet};
 use gam::quadrature::QuadratureContext;
 use gam::test_support::reference::{Column, run_r};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};

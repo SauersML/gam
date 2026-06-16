@@ -924,7 +924,7 @@ where
                                     && solve_options.mode
                                         == crate::solver::arrow_schur::ArrowSolverMode::InexactPCG
                                 {
-                                    match crate::gpu::arrow_schur::gpu_schur_matvec_backend(
+                                    match crate::gpu::kernels::arrow_schur::gpu_schur_matvec_backend(
                                         &arrow_system,
                                         0.0,
                                         loop_lambda,
@@ -934,7 +934,7 @@ where
                                             arrow_system
                                                 .solve_with_options(0.0, loop_lambda, &solve_options)
                                         }
-                                        Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired { row, bump: _ }) => {
+                                        Err(crate::gpu::kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired { row, bump: _ }) => {
                                             Err(crate::solver::arrow_schur::ArrowSchurError::PerRowFactorFailed {
                                                 row,
                                                 reason: "GPU forward kernel Cholesky failed during matvec setup".to_string(),

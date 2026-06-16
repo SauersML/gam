@@ -40,7 +40,7 @@
 //! row → test) so gam and pstpm2 see identical train/test partitions.
 
 use csv::StringRecord;
-use gam::families::survival_construction::{
+use gam::families::survival::construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
 };

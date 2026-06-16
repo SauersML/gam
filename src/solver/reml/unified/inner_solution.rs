@@ -128,7 +128,7 @@ pub struct InnerSolution<'dp> {
     /// curvature-conditioning trick survival families use to keep the
     /// outer eigendecomposition numerically stable.
     ///
-    /// See `survival_location_scale::exact_newton_outer_curvature` for the
+    /// See `survival::location_scale::exact_newton_outer_curvature` for the
     /// canonical example: `rho_curvature_scale = exp(-log_scale)` paired with
     /// `hessian_logdet_correction = p · log_scale = −p · log(scale)`.
     ///

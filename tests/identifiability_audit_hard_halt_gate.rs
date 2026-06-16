@@ -22,9 +22,9 @@
 //!    "audit refused the fit" terminal print.
 //!
 //! These tests will turn GREEN after the gate edit in
-//! `src/solver/identifiability_audit.rs`.
+//! `src/identifiability/audit.rs`.
 
-use gam::solver::identifiability_audit::audit_identifiability;
+use gam::identifiability::audit::audit_identifiability;
 use ndarray::Array2;
 
 mod common {

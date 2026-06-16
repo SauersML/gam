@@ -84,7 +84,7 @@
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 
 #[cfg(target_os = "linux")]
 use std::sync::Arc;

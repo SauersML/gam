@@ -163,7 +163,7 @@ pub(crate) mod cuda {
         PirlsGpuInput, PirlsGpuSharedData, PirlsGpuStep, PirlsStepStreamDeviceInput,
         PirlsStepStreamInput, SigmaPirlsGpuWorkspace,
     };
-    use crate::gpu::common::PtxModuleCache;
+    use crate::gpu::device_cache::PtxModuleCache;
     use crate::gpu::driver::{from_col_major, to_col_major};
     use crate::gpu::solver::{
         check_deferred_potrf_info, check_deferred_potrs_info, context_and_stream, pinned_htod,

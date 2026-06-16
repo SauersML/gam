@@ -3,7 +3,7 @@
 //! the `AnalyticPenalty::psd_majorizer_diag` contract.
 //!
 //! The trait documents the majorizer as a PSD *upper bound* on the exact
-//! curvature (src/terms/analytic_penalties.rs:410-418):
+//! curvature (src/terms/analytic_penalties/mod.rs:410-418):
 //!
 //!     "Diagonal of a **PSD majorizer** of the Hessian — the positive
 //!      re-weighted-ℓ₂ / MM surrogate `diag(B)` with `B ⪰ ∂²P/∂target²`
@@ -14,7 +14,7 @@
 //! dominates the true Hessian, which is what guarantees the monotone-decrease
 //! of majorization-minimization.
 //!
-//! For JumpReLU the two diagonal entries are (src/terms/analytic_penalties.rs:
+//! For JumpReLU the two diagonal entries are (src/terms/analytic_penalties/mod.rs:
 //! 3060-3068), with `g = sigmoid((x - tau)/eps)` and `C = weight*tau/eps² > 0`:
 //!
 //!     exact Hessian   h(g) = C · g(1-g)(1-2g)        (`true_hessian_diag_entry`)
@@ -41,7 +41,7 @@
 //! pass once `psd_majorizer_diag` returns a genuine upper bound on `h(g)` over
 //! the convex region.
 //!
-//! Root cause: `psd_hessian_diag_entry` (src/terms/analytic_penalties.rs:3065)
+//! Root cause: `psd_hessian_diag_entry` (src/terms/analytic_penalties/mod.rs:3065)
 //! only guarantees non-negativity, not domination of the exact Hessian.
 //! Related: #794 (sibling SAE-penalty curvature defect: MonotonicityPenalty::hvp
 //! magnitude), #793.

@@ -30,9 +30,9 @@
 //! set itself for the family-specific row-trace path.
 
 use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
-use crate::solver::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::families::jet_partitions::MultiDirJet;
+use crate::solver::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 use ndarray::{Array1, Array2, Axis};
 use std::ops::Range;
 use std::sync::Arc;
@@ -128,7 +128,10 @@ pub fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
     if sigma <= 0.0 {
         1.0
     } else {
-        crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln()).s
+        crate::families::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(
+            sigma.ln(),
+        )
+        .s
     }
 }
 
@@ -140,7 +143,9 @@ pub(crate) fn probit_frailty_scale_multi_dir_jet(
     second_masks: &[usize],
 ) -> Result<MultiDirJet, String> {
     let sigma = gaussian_frailty_sd.ok_or_else(|| missing_sigma_message.to_string())?;
-    let jet = crate::families::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
+    let jet = crate::families::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(
+        sigma.ln(),
+    );
     let mut coeffs = Vec::with_capacity(1 + first_masks.len() + second_masks.len());
     coeffs.push((0usize, jet.s));
     coeffs.extend(first_masks.iter().copied().map(|mask| (mask, jet.ds)));

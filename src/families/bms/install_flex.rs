@@ -42,8 +42,7 @@ pub(crate) struct BmsFlexBlockContext {
     /// Block-order tags parallel to `operators`.
     pub(super) ordering: Vec<crate::identifiability::families::compiler::BlockOrder>,
     /// W-metric row Hessian built from the validated `training_row_weights`.
-    pub(super) row_hess:
-        crate::identifiability::families::bernoulli::BernoulliRowHessian,
+    pub(super) row_hess: crate::identifiability::families::bernoulli::BernoulliRowHessian,
     /// Dense candidate basis at training rows (n × p_candidate), cached to
     /// avoid a second `design()` call after context construction.
     pub(super) candidate_design_dense: Array2<f64>,
@@ -309,8 +308,8 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     flex_anchors: &[&Array2<f64>],
     training_row_weights: &Array1<f64>,
 ) -> Result<FlexCompileOutcome, String> {
-    use crate::identifiability::families::compiler::compile;
     use crate::identifiability::audit::audit_identifiability_channel_aware;
+    use crate::identifiability::families::compiler::compile;
 
     // Fast path: zero-column candidate carries nothing to residualise.
     let p_check = candidate

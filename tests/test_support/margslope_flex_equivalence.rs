@@ -14,7 +14,7 @@ use gam::families::bms::{
     LatentZPolicy,
 };
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec,

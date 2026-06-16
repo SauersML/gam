@@ -32,7 +32,7 @@ use gam::terms::{
 
 /// Build a tiny periodic-atom evaluator on a 3-row coordinate grid. The
 /// returned (Φ, jet) layout matches the fixture used by the unit tests in
-/// `src/terms/sae_manifold.rs` so the integration test reproduces the exact
+/// `src/terms/sae/manifold/mod.rs` so the integration test reproduces the exact
 /// degeneracy seen on the OOS predict path: zero assignment mass + zero
 /// smoothness penalty on the decoder means `H_tt` collapses to ridge·I.
 fn periodic_basis_tiny(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {

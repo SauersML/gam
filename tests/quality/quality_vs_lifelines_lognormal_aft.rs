@@ -29,7 +29,7 @@
 //!
 //! gam-side mapping (verified against the source). gam's Gaussian-residual
 //! survival location-scale family IS a normal AFT: reading the predictor
-//! assembly in `families::survival_location_scale`
+//! assembly in `families::survival::location_scale`
 //! (`survival_location_scale_response_from_predictors`), the standardized
 //! survival index is
 //!   z(t, x) = h(t) - eta_t(x) * exp(-eta_ls(x)),   S(t|x) = 1 - Phi(z),

@@ -20,8 +20,8 @@ pub use linux::{DeviceArena, PtxModuleCache};
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::super::error::GpuError;
-    use crate::gpu::error::GpuResultExt;
+    use super::super::gpu_error::GpuError;
+    use crate::gpu::gpu_error::GpuResultExt;
     use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream};
     use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     use std::collections::HashMap;

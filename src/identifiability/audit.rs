@@ -558,7 +558,7 @@ fn audit_identifiability_impl(
     let mut dense_blocks: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
     for spec in specs.iter() {
         let dense = spec
-            .effective_jacobian_at("identifiability_audit::audit_identifiability", state)
+            .effective_jacobian_at("identifiability::audit::audit_identifiability", state)
             .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
         dense_blocks.push(dense);
     }
@@ -2608,7 +2608,7 @@ fn locate_block_column(
         }
     }
     Err(EstimationError::LayoutError(format!(
-        "identifiability_audit::locate_block_column: joint_col {joint_col} \
+        "identifiability::audit::locate_block_column: joint_col {joint_col} \
          outside col_offsets range (max = {})",
         col_offsets.last().copied().unwrap_or(0),
     )))

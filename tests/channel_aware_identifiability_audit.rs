@@ -1,7 +1,7 @@
 //! Channel-aware identifiability audit regression test.
 //!
 //! Demonstrates that
-//! `gam::solver::identifiability_audit::audit_identifiability_channel_aware`
+//! `gam::identifiability::audit::audit_identifiability_channel_aware`
 //! correctly handles the multi-channel survival scenario where two
 //! blocks share IDENTICAL raw-X column vectors at the training rows
 //! but contribute to ORTHOGONAL `K`-channels of the row Jacobian. The
@@ -15,11 +15,9 @@
 //! `[1, 2, ..., n]`.
 
 use gam::families::custom_family::ParameterBlockSpec;
-use gam::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
+use gam::identifiability::audit::{audit_identifiability, audit_identifiability_channel_aware};
+use gam::identifiability::families::compiler::{IdentityRowHessian, RowJacobianOperator};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::{
-    audit_identifiability, audit_identifiability_channel_aware,
-};
 use ndarray::{Array1, Array2, Array3};
 use std::sync::Arc;
 

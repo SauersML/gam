@@ -60,7 +60,6 @@ pub(crate) use crate::matrix::{
 };
 pub(crate) use crate::pirls::LinearInequalityConstraints;
 pub(crate) use crate::probability::standard_normal_quantile;
-pub(crate) use crate::solver::resource::{MatrixMaterializationError, ResourcePolicy};
 pub(crate) use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -71,6 +70,7 @@ pub(crate) use crate::solver::estimate::UnifiedFitResult;
 pub(crate) use crate::solver::estimate::reml::unified::{
     DriftDerivResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
+pub(crate) use crate::solver::resource::{MatrixMaterializationError, ResourcePolicy};
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::sync::{Arc, Mutex, OnceLock};

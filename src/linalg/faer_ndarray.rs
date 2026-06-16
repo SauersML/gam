@@ -358,7 +358,7 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_atb(a.view(), b.view()) {
+    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_atb(a.view(), b.view()) {
         return out;
     }
     let (n_a, p) = a.dim();
@@ -450,7 +450,7 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_ab(a.view(), b.view()) {
+    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_ab(a.view(), b.view()) {
         return out;
     }
     let n = a.nrows();
@@ -467,7 +467,7 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_av(a.view(), v.view()) {
+    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_av(a.view(), v.view()) {
         return out;
     }
     fast_av_impl(a, v)
@@ -608,7 +608,7 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_atv(a.view(), v.view()) {
+    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_atv(a.view(), v.view()) {
         return out;
     }
     fast_atv_impl(a, v)
@@ -709,7 +709,7 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         w.len(),
         "fast_xt_diag_x row/weight length mismatch"
     );
-    if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_x(x.view(), w.view()) {
+    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_xt_diag_x(x.view(), w.view()) {
         return out;
     }
     let p = x.ncols();
@@ -950,7 +950,8 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
         w.len(),
         "fast_xt_diag_y row/weight length mismatch"
     );
-    if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_y(x.view(), w.view(), y.view()) {
+    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_xt_diag_y(x.view(), w.view(), y.view())
+    {
         return out;
     }
     fast_xt_diag_y_impl(x, w, y)
@@ -1066,7 +1067,7 @@ pub fn fast_joint_hessian_2x2<
     w_ab: &ArrayBase<S4, Ix1>,
     w_bb: &ArrayBase<S5, Ix1>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_joint_hessian_2x2(
+    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_joint_hessian_2x2(
         x_a.view(),
         x_b.view(),
         w_aa.view(),
@@ -1821,7 +1822,7 @@ pub const fn default_rrqr_rank_alpha() -> f64 {
 /// `column_permutation[j]` of `A`. With rank `r < min(m, n)`, the trailing
 /// `min(m, n) - r` entries of `column_permutation` name the columns that the
 /// pivoted QR demoted past the rank threshold — i.e., the columns identified
-/// as redundant. Identifiability auditors (`solver/identifiability_audit.rs`)
+/// as redundant. Identifiability auditors (`crate::identifiability::audit`)
 /// use that suffix to attribute `DroppedColumn` entries to specific original
 /// columns.
 pub struct RrqrWithPermutation {

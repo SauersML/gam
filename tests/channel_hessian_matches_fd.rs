@@ -15,9 +15,7 @@
 use gam::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian;
 use gam::families::custom_family::FamilyChannelHessian;
 use gam::families::gamlss::GaussianLocationScaleChannelHessian;
-use gam::families::survival_marginal_slope_identifiability::{
-    SurvivalRowHessian, survival_row_nll_grad_hess,
-};
+use gam::identifiability::marginal_slope::{SurvivalRowHessian, survival_row_nll_grad_hess};
 use ndarray::Array1;
 
 const FD_H: f64 = 1e-4;
@@ -253,7 +251,7 @@ fn explicit_fisher_gram(
 
 #[test]
 fn survival_marginal_slope_channel_stacked_fisher_gram_matches_closed_form() {
-    use gam::families::identifiability_compiler::{
+    use gam::identifiability::families::compiler::{
         PrimaryChannelBlocks, build_raw_grams_from_channel_blocks,
     };
 

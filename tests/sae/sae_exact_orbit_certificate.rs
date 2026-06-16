@@ -20,11 +20,11 @@
 //!    viewed atoms (no double reporting), while unviewed atoms keep the
 //!    calibrated frame path.
 
-use gam::identifiability::sae::{
+use gam::inference::row_metric::RowMetric;
+use gam::terms::sae::identifiability::{
     AtomParameterView, AtomTopology, FittedAtom, FittedSaeManifold, GENERATOR_FLAT_ENERGY_TOL,
     GeneratorFamily, OrbitPenaltyOperator, isometry_orbit_penalty_operator, residual_gauge_exact,
 };
-use gam::inference::row_metric::RowMetric;
 use ndarray::{Array1, Array2, Array3};
 
 const N: usize = 48;
@@ -156,8 +156,8 @@ fn single_atom_model(atom: FittedAtom) -> FittedSaeManifold {
 }
 
 fn exact_isom_verdict(
-    report: &gam::identifiability::sae::ResidualGaugeReport,
-) -> &gam::identifiability::sae::GeneratorVerdict {
+    report: &gam::terms::sae::identifiability::ResidualGaugeReport,
+) -> &gam::terms::sae::identifiability::GeneratorVerdict {
     report
         .generators
         .iter()

@@ -10,7 +10,7 @@
 //! placeholder `exit` shrank the grid and the asymptotic extrapolation past the
 //! grid's right edge then forced in-range times to `S = 0`.
 //!
-//! The library evaluator `gam::survival_predict::predict_survival` — the path
+//! The library evaluator `gam::families::survival::predict::predict_survival` — the path
 //! every FFI surface query ultimately drives — is the contract the grid fix
 //! relies on: when handed an explicit `time_grid` it must evaluate the model at
 //! exactly those times, reusing the SAVED training-time basis (knots / anchor),
@@ -42,7 +42,7 @@ use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
-use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
 use gam::test_support::cli_harness::run_or_panic;
 use ndarray::Array1;
 

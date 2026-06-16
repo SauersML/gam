@@ -34,7 +34,7 @@
 //! an intercept/slope.
 //!
 //! The gauge. gam learns `h(t)` flexibly (a penalized monotone B-spline on
-//! `log t`, see `families::survival_location_scale`). Because the location
+//! `log t`, see `families::survival::location_scale`). Because the location
 //! channel is *linear in its coefficients*, the only part of the fitted location
 //! predictor `mu(x, z)` that is NOT identifiable against the truth is a single
 //! additive *gauge offset* (the absolute location anchor on the warped clock).

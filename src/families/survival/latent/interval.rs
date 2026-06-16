@@ -18,8 +18,8 @@
 //! survival and binary validators are thin adapters that differ only in the
 //! descriptor they hand it.
 
-use crate::families::lognormal_kernel::{FrailtySpec, HazardLoading};
-use crate::families::survival_location_scale::TimeBlockInput;
+use crate::families::survival::location_scale::TimeBlockInput;
+use crate::families::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
 use ndarray::{Array1, ArrayView2};
 
 /// Outcome of resolving a [`FrailtySpec`] for a latent-interval model: the
@@ -66,7 +66,7 @@ pub trait LatentIntervalModel {
     /// policy requires a finite fixed sigma.
     fn frailty_policy(
         frailty: &FrailtySpec,
-    ) -> Result<LatentFrailtyResolution, crate::families::latent_survival::LatentSurvivalError>;
+    ) -> Result<LatentFrailtyResolution, crate::families::survival::latent::LatentSurvivalError>;
 
     /// Whether this model accepts interval-censored rows (the reserved
     /// `LATENT_SURVIVAL_EVENT_INTERVAL` event code). Survival does; binary never
@@ -87,8 +87,8 @@ pub trait LatentIntervalModel {
 pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
     data: ArrayView2<'_, f64>,
     row: &LatentIntervalRowView<'_>,
-) -> Result<Option<f64>, crate::families::latent_survival::LatentSurvivalError> {
-    use crate::families::latent_survival::{
+) -> Result<Option<f64>, crate::families::survival::latent::LatentSurvivalError> {
+    use crate::families::survival::latent::{
         LatentSurvivalError, validate_unloaded_components_for_loading,
     };
 
@@ -154,7 +154,8 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
                 ),
             });
         }
-        let is_interval = event == crate::families::latent_survival::LATENT_SURVIVAL_EVENT_INTERVAL;
+        let is_interval =
+            event == crate::families::survival::latent::LATENT_SURVIVAL_EVENT_INTERVAL;
         if is_interval && !M::allows_interval() {
             return Err(LatentSurvivalError::InvalidDataset {
                 reason: format!(
@@ -275,8 +276,8 @@ fn validate_latent_interval_time_block(
     context: &str,
     n: usize,
     time_block: &TimeBlockInput,
-) -> Result<(), crate::families::latent_survival::LatentSurvivalError> {
-    use crate::families::latent_survival::LatentSurvivalError;
+) -> Result<(), crate::families::survival::latent::LatentSurvivalError> {
+    use crate::families::survival::latent::LatentSurvivalError;
     let p_time = time_block.design_exit.ncols();
     if time_block.design_entry.nrows() != n
         || time_block.design_exit.nrows() != n

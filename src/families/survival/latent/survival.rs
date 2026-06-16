@@ -24,17 +24,17 @@ use crate::families::custom_family::{
     PenaltyMatrix, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
-use crate::families::latent_interval::{
+use crate::families::sigma_link::{exp_sigma_eta_for_sigma_scalar, exp_sigma_from_eta_scalar};
+use crate::families::survival::latent::interval::{
     LatentFrailtyResolution, LatentIntervalModel, LatentIntervalRowView,
     validate_latent_interval_inputs,
 };
-use crate::families::lognormal_kernel::{
+use crate::families::survival::location_scale::{
+    TimeBlockInput, project_onto_linear_constraints, structural_time_coefficient_constraints,
+};
+use crate::families::survival::lognormal_kernel::{
     FrailtySpec, HazardLoading, LatentSurvivalEventType, LatentSurvivalRow, LatentSurvivalRowJet,
     log_kernel_bundle,
-};
-use crate::families::sigma_link::{exp_sigma_eta_for_sigma_scalar, exp_sigma_from_eta_scalar};
-use crate::families::survival_location_scale::{
-    TimeBlockInput, project_onto_linear_constraints, structural_time_coefficient_constraints,
 };
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -44,7 +44,7 @@ use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design,
 };
-use crate::solver::pirls::MIN_WEIGHT;
+use crate::types::MIN_WEIGHT;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -97,7 +97,9 @@ impl From<LatentSurvivalError> for String {
 }
 
 impl From<crate::families::block_layout::block_count::BlockCountMismatch> for LatentSurvivalError {
-    fn from(err: crate::families::block_layout::block_count::BlockCountMismatch) -> LatentSurvivalError {
+    fn from(
+        err: crate::families::block_layout::block_count::BlockCountMismatch,
+    ) -> LatentSurvivalError {
         LatentSurvivalError::BlockMismatch {
             reason: err.message(),
         }
@@ -2802,7 +2804,7 @@ impl LatentSurvivalFamily {
 }
 
 fn log_kernel_ratio(
-    bundle: &crate::families::lognormal_kernel::LogLognormalKernelBundle,
+    bundle: &crate::families::survival::lognormal_kernel::LogLognormalKernelBundle,
     num: usize,
     den: usize,
 ) -> f64 {
@@ -4743,7 +4745,7 @@ mod tests {
 
     // --- shared latent-interval validation engine: parity / contract tests ---
 
-    use crate::families::survival_location_scale::{TimeBlockInput, TimeBlockMonotonicity};
+    use crate::families::survival::location_scale::{TimeBlockInput, TimeBlockMonotonicity};
 
     /// Minimal, structurally valid `TimeBlockInput` for `n` rows and `p_time`
     /// columns, used to exercise the shared validation driver without standing

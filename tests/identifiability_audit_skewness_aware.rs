@@ -37,10 +37,10 @@
 //!    produces the correct sign and rough magnitude for a known skewed distribution.
 
 use gam::families::custom_family::{ParameterBlockSpec, RowScaledJacobian};
-use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::{
+use gam::identifiability::audit::{
     audit_identifiability, bias_shift_for_pair, compute_skewness_mu3,
 };
+use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 

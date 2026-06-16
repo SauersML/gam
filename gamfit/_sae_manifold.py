@@ -291,9 +291,7 @@ def _functional_basis_params(plan: Mapping[str, Any]) -> dict[str, Any] | None:
         if n_harmonics <= 0:
             basis_size = int(plan.get("basis_size", 0))
             n_harmonics = (basis_size - 1) // 2
-        if n_harmonics <= 0:
-            return None
-        return {"n_harmonics": n_harmonics}
+        return {"n_harmonics": max(1, n_harmonics)}
     if kind in {"duchon", "euclidean", "euclidean_patch"}:
         centers = plan.get("duchon_centers")
         if centers is None:
@@ -1374,6 +1372,7 @@ class ManifoldSAE:
             [np.ascontiguousarray(b) for b in self.decoder_blocks],
             [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
             [(int(h) if k in {"periodic", "torus"} else None) for k, h in zip(self._basis_kinds, self._n_harmonics)],
+            [int(s) for s in self._basis_sizes],
             alpha=float(self.alpha), tau=float(self.tau), assignment_kind=str(kind),
             sparsity_strength=float(self.sparsity_strength), smoothness=float(self.smoothness),
             max_iter=int(self.max_iter), learning_rate=float(self.learning_rate),
@@ -1568,6 +1567,7 @@ class ManifoldSAE:
                 (int(h) if bk in {"periodic", "torus"} else None)
                 for bk, h in zip(self._basis_kinds, self._n_harmonics)
             ],
+            [int(s) for s in self._basis_sizes],
             [np.ascontiguousarray(c) for c in self.coords],
             np.ascontiguousarray(np.asarray(self.low_level_logits, dtype=np.float64)),
             str(kind),

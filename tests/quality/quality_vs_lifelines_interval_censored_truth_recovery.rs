@@ -45,7 +45,7 @@
 //! There is no skip path: a missing `lifelines` is a real failure.
 
 use csv::StringRecord;
-use gam::families::lognormal_kernel::{
+use gam::families::survival::lognormal_kernel::{
     FrailtySpec, HazardLoading, LatentSurvivalRow, LatentSurvivalRowJet,
 };
 use gam::quadrature::QuadratureContext;

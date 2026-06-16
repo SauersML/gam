@@ -6,7 +6,7 @@ AISTATS 2020. arXiv:1907.04809; see also arXiv:2107.10098.
 
 All numeric work (constant-column detection, discreteness check, joint
 distinct-level counting, empirical Jacobian rank) lives in the Rust
-``gam::identifiability_diagnostics`` module. This Python file is a thin wrapper that
+``gam::identifiability::kernel`` module. This Python file is a thin wrapper that
 turns the metrics dict into an :class:`IdentifiabilityReport` with
 concrete violations and recommendations.
 """

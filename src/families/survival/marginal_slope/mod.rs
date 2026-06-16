@@ -47,7 +47,7 @@ pub(crate) use crate::families::cubic_cell_kernel as exact_kernel;
 
 pub(crate) use crate::families::jet_partitions::MultiDirJet;
 
-pub(crate) use crate::families::lognormal_kernel::FrailtySpec;
+pub(crate) use crate::families::survival::lognormal_kernel::FrailtySpec;
 
 pub(crate) use crate::families::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
@@ -71,11 +71,11 @@ pub(crate) use crate::families::spatial_psi_bridge::build_block_spatial_psi_deri
 
 pub(crate) use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 
-pub(crate) use crate::families::survival_location_scale::{
+pub(crate) use crate::families::survival::location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
 };
 
-pub(crate) use crate::families::survival_time_constraints::{
+pub(crate) use crate::families::survival::time_constraints::{
     FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
     build_time_derivative_guard_constraints,
 };
@@ -137,6 +137,8 @@ mod feasibility;
 mod fit_entry;
 mod fit_setup;
 mod flex_sensitivity;
+pub(crate) mod gpu;
+pub(crate) mod gpu_prep;
 mod hessian;
 mod intercept;
 mod joint_eval;

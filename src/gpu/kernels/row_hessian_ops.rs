@@ -34,9 +34,9 @@ use std::sync::OnceLock;
 use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
 #[cfg(target_os = "linux")]
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
-use crate::gpu::error::GpuResultExt;
+use crate::gpu::gpu_error::GpuResultExt;
 
 /// Hard ceiling on `r` (primary local dimension). Matches the BMS-FLEX row
 /// kernel's [`crate::families::bms::gpu::row::MAX_R`] so the same cached Hessian

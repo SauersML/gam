@@ -17,14 +17,14 @@ use rand::{RngExt, SeedableRng};
 use crate::basis::create_difference_penalty_matrix;
 use crate::estimate::{BlockRole, UnifiedFitResult, validate_all_finite};
 use crate::faer_ndarray::FaerCholesky;
-use crate::families::royston_parmar::{self, RoystonParmarInputs};
+use crate::families::survival::royston_parmar::{self, RoystonParmarInputs};
 use crate::families::survival::construction::{
     SurvivalLikelihoodMode, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, normalize_survival_time_pair,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
-use crate::families::survival_predict::{
+use crate::families::survival::predict::{
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
     resolve_saved_survival_time_columns, resolve_termspec_for_prediction,
     saved_baseline_timewiggle_components, saved_survival_runtime_baseline_config,
@@ -46,7 +46,7 @@ use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::smooth::{
     LinearCoefficientGeometry, build_term_collection_design, weighted_blockwise_penalty_sum,
 };
-use crate::survival::{PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
+use crate::families::survival::{PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
 use crate::term_builder::resolve_role_col;
 use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 

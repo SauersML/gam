@@ -118,7 +118,7 @@ impl SurvivalMarginalSlopeFamily {
     /// Step-6 dispatcher for the joint-β gradient.  Builds the
     /// `SurvivalFlexGpuRowInputs` descriptor, runs the GPU policy
     /// `decide`, and routes through
-    /// [`crate::families::survival_marginal_slope_gpu::try_survival_flex_gradient`].
+    /// [`crate::families::survival::marginal_slope::gpu::try_survival_flex_gradient`].
     ///
     /// Returns:
     ///
@@ -133,7 +133,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
     ) -> Result<Option<(f64, Array1<f64>)>, String> {
-        let decision = crate::families::survival_marginal_slope_gpu::row_primary_hessian_decision(
+        let decision = crate::families::survival::marginal_slope::gpu::row_primary_hessian_decision(
             self.n, N_PRIMARY,
         );
         decision.clone().log();
@@ -149,8 +149,10 @@ impl SurvivalMarginalSlopeFamily {
             }
         };
         let inputs = batch.as_inputs(self);
-        match crate::families::survival_marginal_slope_gpu::try_survival_flex_gradient(inputs, None)
-            .map_err(|e| e.to_string())?
+        match crate::families::survival::marginal_slope::gpu::try_survival_flex_gradient(
+            inputs, None,
+        )
+        .map_err(|e| e.to_string())?
         {
             Some((nll, grad)) => {
                 if grad.len() != slices.total {
@@ -178,7 +180,7 @@ impl SurvivalMarginalSlopeFamily {
         slices: &BlockSlices,
         v: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        let decision = crate::families::survival_marginal_slope_gpu::row_primary_hessian_decision(
+        let decision = crate::families::survival::marginal_slope::gpu::row_primary_hessian_decision(
             self.n, N_PRIMARY,
         );
         decision.clone().log();
@@ -200,7 +202,7 @@ impl SurvivalMarginalSlopeFamily {
         let v_slice = v
             .as_slice()
             .ok_or_else(|| "survival-flex GPU HVP requires contiguous v".to_string())?;
-        match crate::families::survival_marginal_slope_gpu::try_survival_flex_hvp(inputs, v_slice)
+        match crate::families::survival::marginal_slope::gpu::try_survival_flex_hvp(inputs, v_slice)
             .map_err(|e| e.to_string())?
         {
             Some(hv) => {
@@ -228,7 +230,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
     ) -> Result<Option<Array2<f64>>, String> {
-        let decision = crate::families::survival_marginal_slope_gpu::row_primary_hessian_decision(
+        let decision = crate::families::survival::marginal_slope::gpu::row_primary_hessian_decision(
             self.n, N_PRIMARY,
         );
         decision.clone().log();
@@ -244,7 +246,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         };
         let inputs = batch.as_inputs(self);
-        match crate::families::survival_marginal_slope_gpu::try_survival_flex_dense_hessian(
+        match crate::families::survival::marginal_slope::gpu::try_survival_flex_dense_hessian(
             inputs, None,
         )
         .map_err(|e| e.to_string())?
@@ -280,8 +282,8 @@ impl SurvivalMarginalSlopeFamily {
         //
         // The two `try_survival_flex_joint_dispatch_*` entries route the
         // joint-β work through
-        // [`crate::families::survival_marginal_slope_gpu::try_survival_flex_dense_hessian`]
-        // and [`crate::families::survival_marginal_slope_gpu::try_survival_flex_gradient`]
+        // [`crate::families::survival::marginal_slope::gpu::try_survival_flex_dense_hessian`]
+        // and [`crate::families::survival::marginal_slope::gpu::try_survival_flex_gradient`]
         // respectively, with the standard `gpu::decide` policy.  Both
         // currently return `Ok(None)` until the NVRTC joint-β assembly
         // lands (Steps 4 + 5 sibling commits), so the CPU per-row sweep
@@ -397,7 +399,7 @@ impl SurvivalMarginalSlopeFamily {
         // ── Step-6 dispatcher: try GPU joint-β gradient first ────────────
         //
         // Routes through
-        // [`crate::families::survival_marginal_slope_gpu::try_survival_flex_gradient`] via
+        // [`crate::families::survival::marginal_slope::gpu::try_survival_flex_gradient`] via
         // the `gpu::decide` policy.  Returns `Ok(None)` until the joint-β
         // device assembly lands (Steps 4 + 5 sibling commits), at which
         // point this site becomes the hot dispatch with no further

@@ -724,7 +724,7 @@ fn upload_resident_buffers(
     gate_activations: &[f64],
     slabs: &DeviceResidentArrowSlabs,
 ) -> Option<DeviceResidentArrowBuffers> {
-    use crate::gpu::linalg::{DispatchOp, route_through_gpu};
+    use crate::gpu::linalg_dispatch::{DispatchOp, route_through_gpu};
 
     let runtime = route_through_gpu(DispatchOp::SmallDenseBatchedPotrf {
         p: shape.d,

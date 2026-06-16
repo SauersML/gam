@@ -1630,10 +1630,7 @@ pub(crate) fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
         ..BlockwiseFitOptions::default()
     };
     let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Either
@@ -1652,10 +1649,7 @@ pub(crate) fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
             prefer_gradient_only: false,
             disable_fixed_point: true,
         });
-    assert_eq!(
-        outer_plan.solver,
-        crate::solver::rho_optimizer::Solver::Arc
-    );
+    assert_eq!(outer_plan.solver, crate::solver::rho_optimizer::Solver::Arc);
     assert_eq!(
         outer_plan.hessian_source,
         crate::solver::rho_optimizer::HessianSource::Analytic
@@ -1703,10 +1697,7 @@ pub(crate) fn ctn_large_n_outer_hvp_capability_selects_operator_path() {
         ..BlockwiseFitOptions::default()
     };
     let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Either

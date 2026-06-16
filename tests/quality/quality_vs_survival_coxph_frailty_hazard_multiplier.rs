@@ -67,7 +67,7 @@
 //! source.
 
 use csv::StringRecord;
-use gam::families::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam::families::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, run_r};

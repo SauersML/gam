@@ -1295,7 +1295,7 @@ pub fn fit_survival_marginal_slope_terms(
     // We emit a single `p_total × p_total` identity-cone instead so the
     // existing active-set machinery treats the whole time block uniformly.
     let time_linear_constraints = match spec.time_block.time_monotonicity {
-        crate::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline => {
+        crate::families::survival::location_scale::TimeBlockMonotonicity::StructuralISpline => {
             let p_total = design_exit.ncols();
             LinearInequalityConstraints::from_per_coordinate_lower_bounds(&Array1::<f64>::zeros(
                 p_total,

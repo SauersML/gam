@@ -19,7 +19,7 @@
 //! `bug_hunt_parametric_survival_predict_design_columns.rs` and
 //! `bug_hunt_reduced_aft_location_scale_predict_surface.rs` cover the `weibull`
 //! and `location-scale` modes). It fits `Surv(t, d) ~ x`, SAVES + LOADS the
-//! model, drives the library predict surface (`gam::survival_predict::predict_survival`,
+//! model, drives the library predict surface (`gam::families::survival::predict::predict_survival`,
 //! the exact entry point the Python `model.predict` FFI uses) on a time grid at
 //! two covariate values, and asserts predict SUCCEEDS and returns a valid
 //! survival surface in `[0, 1]` that is monotone non-increasing in `t` and
@@ -32,7 +32,7 @@ use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
-use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
 use gam::test_support::cli_harness::run_or_panic;
 use ndarray::Array1;
 

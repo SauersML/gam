@@ -203,7 +203,7 @@ impl SurvivalMarginalSlopeFamily {
         // jets via `compute_survival_timepoint_exact` →
         // `build_cached_partition_with_moment_order`, so the only remaining
         // family-side hop is the Step-5 G/H pullback in
-        // [`crate::families::survival_marginal_slope_gpu::try_device_step5_primary_assembly`].
+        // [`crate::families::survival::marginal_slope::gpu::try_device_step5_primary_assembly`].
         //
         // The GPU entry takes flat `&[f64]` views; both `Array1` and `Array2`
         // returned by the timepoint-exact pass live in standard contiguous
@@ -244,29 +244,31 @@ impl SurvivalMarginalSlopeFamily {
             && exit.d > 0.0
         {
             let row_inputs = [
-                crate::families::survival_marginal_slope_gpu::SurvivalFlexStep5RowInputs {
-                    entry: crate::families::survival_marginal_slope_gpu::SurvivalFlexTimepointJet {
-                        eta: entry.eta,
-                        chi: entry.chi,
-                        d: entry.d,
-                        eta_u: entry_eta_u.unwrap(),
-                        eta_uv: entry_eta_uv.unwrap(),
-                        chi_u: entry_chi_u.unwrap(),
-                        chi_uv: entry_chi_uv.unwrap(),
-                        d_u: entry_d_u.unwrap(),
-                        d_uv: entry_d_uv.unwrap(),
-                    },
-                    exit: crate::families::survival_marginal_slope_gpu::SurvivalFlexTimepointJet {
-                        eta: exit.eta,
-                        chi: exit.chi,
-                        d: exit.d,
-                        eta_u: exit_eta_u.unwrap(),
-                        eta_uv: exit_eta_uv.unwrap(),
-                        chi_u: exit_chi_u.unwrap(),
-                        chi_uv: exit_chi_uv.unwrap(),
-                        d_u: exit_d_u.unwrap(),
-                        d_uv: exit_d_uv.unwrap(),
-                    },
+                crate::families::survival::marginal_slope::gpu::SurvivalFlexStep5RowInputs {
+                    entry:
+                        crate::families::survival::marginal_slope::gpu::SurvivalFlexTimepointJet {
+                            eta: entry.eta,
+                            chi: entry.chi,
+                            d: entry.d,
+                            eta_u: entry_eta_u.unwrap(),
+                            eta_uv: entry_eta_uv.unwrap(),
+                            chi_u: entry_chi_u.unwrap(),
+                            chi_uv: entry_chi_uv.unwrap(),
+                            d_u: entry_d_u.unwrap(),
+                            d_uv: entry_d_uv.unwrap(),
+                        },
+                    exit:
+                        crate::families::survival::marginal_slope::gpu::SurvivalFlexTimepointJet {
+                            eta: exit.eta,
+                            chi: exit.chi,
+                            d: exit.d,
+                            eta_u: exit_eta_u.unwrap(),
+                            eta_uv: exit_eta_uv.unwrap(),
+                            chi_u: exit_chi_u.unwrap(),
+                            chi_uv: exit_chi_uv.unwrap(),
+                            d_u: exit_d_u.unwrap(),
+                            d_uv: exit_d_uv.unwrap(),
+                        },
                     wi,
                     di,
                     q1,
@@ -282,7 +284,7 @@ impl SurvivalMarginalSlopeFamily {
                 },
             ];
             // `try_device_step5_primary_assembly` is the device-shape Step-5
-            // pullback (`survival_marginal_slope_gpu`). Its current body
+            // pullback (`survival::marginal_slope::gpu`). Its current body
             // is CPU-resident scalar algebra producing the same `(row_nll,
             // grad, hess)` the inline CPU loop below builds; when the NVRTC
             // kernel lands, this call site becomes the device-dispatch seam
@@ -291,7 +293,7 @@ impl SurvivalMarginalSlopeFamily {
             // surfaces as a row-level CPU re-evaluation rather than a hard
             // panic.
             if let Ok(mut out) =
-                crate::families::survival_marginal_slope_gpu::try_device_step5_primary_assembly(
+                crate::families::survival::marginal_slope::gpu::try_device_step5_primary_assembly(
                     &row_inputs,
                 )
                 && out.len() == 1

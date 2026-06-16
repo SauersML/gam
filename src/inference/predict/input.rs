@@ -9,8 +9,8 @@ use crate::basis::{
 use crate::estimate::{BlockRole, PredictInput};
 use crate::families::bms::LatentMeasureKind;
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
-use crate::families::survival_predict::SurvivalPredictError;
-use crate::families::survival_predict::{
+use crate::families::survival::predict::SurvivalPredictError;
+use crate::families::survival::predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
 use crate::families::transformation_normal::{

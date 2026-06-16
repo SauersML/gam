@@ -30,9 +30,9 @@
 use std::sync::Arc;
 
 use gam::families::custom_family::{AdditiveBlockJacobian, ParameterBlockSpec};
+use gam::identifiability::audit::audit_identifiability;
+use gam::identifiability::canonical::canonicalize_for_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::audit_identifiability;
-use gam::solver::identifiability_canonical::canonicalize_for_identifiability;
 use ndarray::{Array1, Array2};
 
 const N: usize = 500;

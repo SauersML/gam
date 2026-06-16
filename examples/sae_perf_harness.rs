@@ -13,7 +13,7 @@ use gam::solver::estimate::EstimationError;
 use gam::solver::outer_strategy::{
     EfsEval, OuterCapability, OuterEval, OuterObjective, OuterProblem, SeedOutcome,
 };
-use gam::terms::sae_manifold::EuclideanPatchEvaluator;
+use gam::terms::sae::manifold::EuclideanPatchEvaluator;
 use gam::terms::{
     AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
     SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,

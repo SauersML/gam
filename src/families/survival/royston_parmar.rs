@@ -1,4 +1,4 @@
-use crate::survival::{
+use crate::families::survival::{
     PenaltyBlocks, SurvivalBaselineOffsets, SurvivalEngineInputs, SurvivalMonotonicityPenalty,
     SurvivalSpec, SurvivalTimeCovarInputs, WorkingModelSurvival,
 };
@@ -52,7 +52,7 @@ fn survival_baseline_offsets<'a>(
     eta_offset_entry: Option<ArrayView1<'a, f64>>,
     eta_offset_exit: Option<ArrayView1<'a, f64>>,
     derivative_offset_exit: Option<ArrayView1<'a, f64>>,
-) -> Result<Option<SurvivalBaselineOffsets<'a>>, crate::survival::SurvivalError> {
+) -> Result<Option<SurvivalBaselineOffsets<'a>>, crate::families::survival::SurvivalError> {
     match (eta_offset_entry, eta_offset_exit, derivative_offset_exit) {
         (Some(eta_entry), Some(eta_exit), Some(derivative_exit)) => {
             Ok(Some(SurvivalBaselineOffsets {
@@ -62,7 +62,7 @@ fn survival_baseline_offsets<'a>(
             }))
         }
         (None, None, None) => Ok(None),
-        _ => Err(crate::survival::SurvivalError::DimensionMismatch),
+        _ => Err(crate::families::survival::SurvivalError::DimensionMismatch),
     }
 }
 
@@ -72,7 +72,7 @@ pub fn working_model_from_flattened(
     monotonicity: SurvivalMonotonicityPenalty,
     spec: SurvivalSpec,
     inputs: RoystonParmarInputs<'_>,
-) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
+) -> Result<WorkingModelSurvival, crate::families::survival::SurvivalError> {
     let offsets = survival_baseline_offsets(
         inputs.eta_offset_entry,
         inputs.eta_offset_exit,
@@ -112,7 +112,7 @@ pub fn working_model_from_time_covariateshared(
     monotonicity: SurvivalMonotonicityPenalty,
     spec: SurvivalSpec,
     inputs: RoystonParmarSharedTimeCovariateInputs<'_>,
-) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
+) -> Result<WorkingModelSurvival, crate::families::survival::SurvivalError> {
     let offsets = survival_baseline_offsets(
         inputs.eta_offset_entry,
         inputs.eta_offset_exit,

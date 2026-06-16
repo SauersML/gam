@@ -3,6 +3,7 @@
 //! `\eta`.
 
 use super::*;
+use crate::types::MIN_WEIGHT;
 
 pub fn update_glmvectors(
     y: ArrayView1<f64>,
@@ -397,7 +398,7 @@ pub fn update_glmvectors_integrated_for_link(
                 |(i, (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o))|
                  -> Result<(), EstimationError> {
                     let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
-                        crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet(
+                        crate::families::survival::lognormal_kernel::latent_cloglog_inverse_link_jet(
                             quadctx,
                             eta[i],
                             se[i].hypot(state.latent_sd),
@@ -453,7 +454,7 @@ pub fn update_glmvectors_integrated_for_link(
             .enumerate()
             .try_for_each(|(i, ((mu_o, w_o), z_o))| -> Result<(), EstimationError> {
                 let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
-                    crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet(
+                    crate::families::survival::lognormal_kernel::latent_cloglog_inverse_link_jet(
                         quadctx,
                         eta[i],
                         se[i].hypot(state.latent_sd),

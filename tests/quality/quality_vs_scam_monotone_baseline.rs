@@ -57,7 +57,7 @@
 //! `(t, event, x)` rows feed gam and the scam reference.
 
 use csv::StringRecord;
-use gam::families::survival_construction::{
+use gam::families::survival::construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
 };

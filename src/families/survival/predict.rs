@@ -11,7 +11,6 @@ use std::collections::HashMap;
 
 use ndarray::{Array1, Array2, ArrayView2, s};
 
-use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::scale_design::scale_transform_from_payload;
 use crate::families::survival::assemble_competing_risks_cif_from_endpoints;
 use crate::families::survival::construction::{
@@ -23,6 +22,7 @@ use crate::families::survival::construction::{
     require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
     survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
+use crate::families::survival::lognormal_kernel::FrailtySpec;
 use crate::families::wiggle::buildwiggle_block_input_from_knots;
 use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
@@ -1807,7 +1807,7 @@ fn predict_survival_location_scale_batch(
 ) -> Result<SurvivalPredictResult, String> {
     use crate::families::scale_design::build_scale_deviation_operator;
     use crate::families::survival::construction::evaluate_survival_time_basis_row;
-    use crate::families::survival_location_scale::{
+    use crate::families::survival::location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
         predict_survival_location_scale_from_linear_components,
         predict_survival_location_scalewith_uncertainty,
@@ -2295,7 +2295,7 @@ fn predict_survival_location_scale_batch(
 /// without consuming it.  Used so the mean-only fast path can reuse the
 /// log-sigma design without an extra clone.
 fn prepared_sigma_design_view(
-    input: &crate::families::survival_location_scale::SurvivalLocationScalePredictInput,
+    input: &crate::families::survival::location_scale::SurvivalLocationScalePredictInput,
 ) -> &crate::matrix::DesignMatrix {
     &input.x_log_sigma
 }
@@ -2391,7 +2391,7 @@ pub(crate) fn location_scale_time_warp_components(
         h = &h_base + &time_basis.dot(&beta_w);
         time_jac = Array2::<f64>::zeros((n, p_time_total));
         if p_base > 0 {
-            let scaled_base = crate::families::survival_location_scale::scale_dense_rows(
+            let scaled_base = crate::families::survival::location_scale::scale_dense_rows(
                 &x_time_exit.slice(s![.., ..p_base]).to_owned(),
                 &dq,
             )?;

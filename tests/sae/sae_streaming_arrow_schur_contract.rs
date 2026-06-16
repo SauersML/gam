@@ -32,7 +32,7 @@
 
 use ndarray::{Array1, Array2, Array3, s};
 
-use gam::gpu::arrow_schur::{ArrowSchurGpuFailure, solve_reduced_beta_pcg};
+use gam::gpu::kernels::arrow_schur::{ArrowSchurGpuFailure, solve_reduced_beta_pcg};
 use gam::solver::arrow_schur::{
     ArrowSchurSystem, ArrowSolveOptions, StreamingArrowSchur, solve_streaming_reduced_beta,
 };

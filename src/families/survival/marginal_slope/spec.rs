@@ -282,7 +282,7 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
     if !spec.time_block.time_monotonicity.requires_row_constraints()
         && !matches!(
             spec.time_block.time_monotonicity,
-            crate::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline
+            crate::families::survival::location_scale::TimeBlockMonotonicity::StructuralISpline
         )
     {
         return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
@@ -295,7 +295,7 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
     }
     if let Some(beta0) = &spec.time_block.initial_beta {
         match spec.time_block.time_monotonicity {
-            crate::families::survival_location_scale::TimeBlockMonotonicity::StructuralISpline => {
+            crate::families::survival::location_scale::TimeBlockMonotonicity::StructuralISpline => {
                 // Under the I-spline base, the only feasibility constraint on
                 // `initial_beta` is the γ ≥ 0 coordinate cone — the row-wise
                 // `D γ + o ≥ guard` constraints are vacuous (I-spline derivatives

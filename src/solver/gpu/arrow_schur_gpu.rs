@@ -1,4 +1,4 @@
-//! Caller-facing thin wrapper around `crate::gpu::arrow_schur`.
+//! Caller-facing thin wrapper around `crate::gpu::kernels::arrow_schur`.
 //!
 //! The entire dense per-row factor + Schur reduce + back-sub pipeline lives
 //! device-side; this module only translates the device failure enum into the

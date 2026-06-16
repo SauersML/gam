@@ -5,7 +5,7 @@ pub mod linalg;
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::bms::{EmpiricalZGrid, LatentMeasureKind};
 use crate::families::bms::{bernoulli_marginal_link_map, empirical_intercept_from_marginal};
-use crate::families::lognormal_kernel::FrailtySpec;
+use crate::families::survival::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,

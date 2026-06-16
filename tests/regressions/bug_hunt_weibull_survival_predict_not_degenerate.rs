@@ -16,7 +16,7 @@
 //!
 //! This test fits high-mortality data through the real `gam fit` Weibull path,
 //! loads the saved model, and drives the library predict surface
-//! (`gam::survival_predict::predict_survival`) on an explicit time grid — the
+//! (`gam::families::survival::predict::predict_survival`) on an explicit time grid — the
 //! exact code path the Python `model.predict(...).survival_at(grid)` FFI uses.
 //! It asserts the predicted survival is finite, non-degenerate (`min S < 0.85`),
 //! and monotone non-increasing in `t`. With the double-counting removed the
@@ -29,7 +29,7 @@ use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
-use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
 use gam::test_support::cli_harness::run_or_panic;
 use ndarray::Array1;
 

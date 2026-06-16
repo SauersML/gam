@@ -65,11 +65,11 @@ use crate::families::sigma_link::{EXP_NEG_STABLE_MAX_ARG, exp_sigma_inverse_from
 
 use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 
-use crate::families::survival_predict::{
+use crate::families::survival::predict::{
     LocationScaleEtaComponents, location_scale_eta_components, location_scale_time_warp_components,
 };
 
-use crate::families::survival_time_constraints::{
+use crate::families::survival::time_constraints::{
     FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
     build_time_derivative_guard_constraints,
 };
@@ -128,7 +128,7 @@ mod numeric_guards;
 // Re-export the overflow-safe arithmetic primitives so the concern submodules
 // can reach them through `use super::*` exactly as the pre-split single
 // namespace did. The primitives themselves are `pub(super)` in `numeric_guards`.
-pub(in crate::families::survival_location_scale) use numeric_guards::{
+pub(in crate::families::survival::location_scale) use numeric_guards::{
     compensated_difference, safe_hadamard_product, safe_linear_combo2_arrays, safe_product,
     safe_product3, safe_sum2, safe_sum3, sanitize_survival_weight_vector, softplus,
 };
@@ -153,7 +153,7 @@ mod wiggle_geometry;
 mod tests;
 
 // Flatten every concern submodule back into the module root so the historical
-// `crate::families::survival_location_scale::Name` paths (and the `gam::`
+// `crate::families::survival::location_scale::Name` paths (and the `gam::`
 // library re-export) resolve unchanged. Only `pub` / `pub(crate)` items are
 // re-exported; private helpers stay encapsulated in their concern module.
 pub(crate) use constants::*;
@@ -173,7 +173,7 @@ pub(crate) use wiggle_geometry::*;
 // `family_solver` carries the public effective-jacobian entry point
 // (`survival_location_scale_block_effective_jacobian`,
 // `SurvivalLocationScaleChannelHessian`) consumed via the
-// `gam::families::survival_location_scale::...` path, plus crate-internal
+// `gam::families::survival::location_scale::...` path, plus crate-internal
 // joint-Newton workspaces. `pub use` flattens each item back to the module
 // root at its own declared visibility (`pub` stays public, `pub(crate)`
 // stays crate-internal), exactly as the pre-split monolith exposed them.

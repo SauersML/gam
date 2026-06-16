@@ -202,7 +202,7 @@ fn survival_uncertainty_bounds_stay_in_unit_interval() {
 
 #[test]
 fn competing_risks_cif_bounds_are_probabilities_and_total_mass_is_valid() {
-    use gam::survival::assemble_competing_risks_cif_from_endpoints;
+    use gam::families::survival::assemble_competing_risks_cif_from_endpoints;
     let times = array![0.0, 1.0, 2.0, 3.0];
     let endpoint_hazards = vec![
         array![[0.02, 0.03, 0.03, 0.04]],

@@ -1,5 +1,5 @@
 use gam::solver::pirls::LinearInequalityConstraints;
-use gam::survival_location_scale::project_onto_linear_constraints;
+use gam::families::survival::location_scale::project_onto_linear_constraints;
 use ndarray::{Array1, array};
 
 #[test]

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use ndarray::{Array1, Array2};
 
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 use crate::gpu::{GpuDecision, GpuKernel, decide};
 
 #[cfg(target_os = "linux")]
@@ -1577,7 +1577,7 @@ pub fn cpu_oracle_flex_primary_rows(
 // correction `η(z) = c_0 + c_1·z + c_2·z² + c_3·z³` integrated against
 // `exp(-q(z))` over each cell of the row's partition.  The CPU side
 // builds these partitions via
-// `survival_marginal_slope::denested_partition_cells` and then loops
+// `survival::marginal_slope::denested_partition_cells` and then loops
 // `evaluate_cell_moments` / `evaluate_cell_derivative_moments_uncached`
 // per cell.
 //
@@ -1606,7 +1606,7 @@ pub fn cpu_oracle_flex_primary_rows(
 /// row `i`'s cells live at indices `row_offsets[i] .. row_offsets[i+1]`.
 ///
 /// The survival-flex CPU path produces this layout naturally — see
-/// `survival_marginal_slope::denested_partition_cells`.  Callers can
+/// `survival::marginal_slope::denested_partition_cells`.  Callers can
 /// flatten the per-row `Vec<DenestedPartitionCell>` lists into this
 /// shape with a single pass.
 #[derive(Clone, Debug)]
@@ -1762,7 +1762,8 @@ pub fn try_row_batched_cell_moments(
             Ok(tag) => {
                 cells.push(cell);
                 branches.push(tag);
-                prelim_status.push(crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8);
+                prelim_status
+                    .push(crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8);
             }
             Err(code) => {
                 // Substrate would also reject this cell.  Keep a placeholder
@@ -1786,15 +1787,14 @@ pub fn try_row_batched_cell_moments(
         max_degree: batch.max_degree,
         residency: crate::gpu::kernels::cubic_cell::CubicCellMomentResidency::Host,
     };
-    let out = crate::gpu::kernels::cubic_cell::try_build_cubic_cell_derivative_moments(view)?.ok_or_else(
-        || GpuError::DriverCallFailed {
+    let out = crate::gpu::kernels::cubic_cell::try_build_cubic_cell_derivative_moments(view)?
+        .ok_or_else(|| GpuError::DriverCallFailed {
             reason: format!(
                 "survival_flex row-cells batch: substrate returned None for n_cells={} > 0 \
                  (unexpected)",
                 batch.n_cells
             ),
-        },
-    )?;
+        })?;
 
     let (moments, mut status, stride) = match out {
         crate::gpu::kernels::cubic_cell::CubicCellDerivativeMomentOutput::Host {
@@ -1837,7 +1837,7 @@ pub fn try_row_batched_cell_moments(
 //
 // The flex calibration step solves `F(a) = ⟨Φ(-η(z;a))⟩ - Φ(-q) = 0`
 // once per row.  The CPU side runs `monotone_root::solve_monotone_root_detailed`
-// (`families::survival_marginal_slope.rs:5363`).  Step 3 ports the
+// (`families::survival::marginal_slope.rs:5363`).  Step 3 ports the
 // control flow (Newton probe → bracket expansion → bisection +
 // safeguarded Halley/Newton refinement) into an NVRTC kernel so every
 // row solves in parallel.
@@ -2421,7 +2421,7 @@ impl SurvivalFlexGpuBackend {
 // Step 3 ships against an analytic evaluator `F(a) = α·exp(β·a) + γ`.  The
 // production survival-flex calibration evaluator is the de-nested cubic
 // integrand `F(a) = -Φ(-q) + Σ_cells ∫_{cell} φ̂_cell(z; a)·exp(-q(z)) dz`
-// from `families::survival_marginal_slope::evaluate_denested_survival_calibration`
+// from `families::survival::marginal_slope::evaluate_denested_survival_calibration`
 // (lines 5772-5821 of `src/families/survival_marginal_slope.rs`).
 //
 // This CPU oracle takes per-row partition cells *already built by the
@@ -2483,7 +2483,7 @@ pub struct SurvivalFlexCalibrationFAndDerivs {
 /// intercept-solver's eventual real F-evaluator (Layer A NVRTC follow-up).
 ///
 /// Term-for-term port of
-/// [`crate::families::survival_marginal_slope::SurvivalMarginalSlopeFamily::evaluate_denested_survival_calibration`]:
+/// [`crate::families::survival::marginal_slope::SurvivalMarginalSlopeFamily::evaluate_denested_survival_calibration`]:
 ///
 /// ```text
 /// f          = -Φ(-q)
@@ -2514,7 +2514,7 @@ pub fn cpu_oracle_evaluate_calibration(
 
     // `scale_coeff4(coef, scale) = [coef[0]*scale, coef[1]*scale, coef[2]*scale, coef[3]*scale]`.
     // Inlined here so the oracle has no `pub(crate)` dependency on
-    // `survival_marginal_slope::scale_coeff4`.
+    // `survival::marginal_slope::scale_coeff4`.
     #[inline]
     fn scale_coeff4(coef: [f64; 4], scale: f64) -> [f64; 4] {
         [
@@ -6145,7 +6145,7 @@ mod survival_flex_gpu_tests {
     /// The cell's cubic coefficients are NOT frozen: they are recomputed from
     /// the fixed score/link spans via `denested_cell_coefficients(score_span,
     /// link_span, a, slope)` — exactly the `a → cell` map production uses
-    /// (`survival_marginal_slope::denested_partition_cells` →
+    /// (`survival::marginal_slope::denested_partition_cells` →
     /// `build_denested_partition_cells_with_tails`). This is what makes the
     /// oracle's value-integral seed `F(a)` genuinely vary with `a`, so a
     /// finite difference of `F` reproduces the analytic `F'` (= the oracle's

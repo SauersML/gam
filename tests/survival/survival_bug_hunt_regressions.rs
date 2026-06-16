@@ -1,5 +1,5 @@
 use gam::families::survival::assemble_competing_risks_cif_from_endpoints;
-use gam::families::survival_construction::{
+use gam::families::survival::construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     build_survival_time_offsets_for_likelihood,
 };

@@ -1,12 +1,12 @@
-use gam::families::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam::families::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam::families::survival::{SurvivalLikelihoodMode, parse_survival_likelihood_mode};
 use gam::inference::formula_dsl::parse_link_choice;
 use gam::inference::model::GroupMetadata;
 use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use gam::solver::build_analytic_penalty_registry_from_descriptors;
 use gam::solver::workflow::{CtnStage1Recipe, FitConfig};
-use gam::survival::parse_survival_distribution;
-use gam::survival_location_scale::residual_distribution_inverse_link;
+use gam::families::survival::parse_survival_distribution;
+use gam::families::survival::location_scale::residual_distribution_inverse_link;
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};
 use ndarray::Array1;
@@ -935,7 +935,7 @@ fn survival_link_usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam::families::lognormal_kernel::FrailtySpec;
+    use gam::families::survival::lognormal_kernel::FrailtySpec;
     use serde_json::{Value, json};
 
     struct ParityCase {

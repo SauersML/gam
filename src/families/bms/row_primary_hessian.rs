@@ -1780,7 +1780,7 @@ impl BernoulliMarginalSlopeFamily {
                         );
                     }
                 }
-                Err(crate::gpu::error::GpuError::NotYetImplemented { reason }) => {
+                Err(crate::gpu::gpu_error::GpuError::NotYetImplemented { reason }) => {
                     log::info!(
                         "[BMS row-primary-hessian-cache] gpu_backend_pending: {reason}; \
                          falling back to CPU rows"

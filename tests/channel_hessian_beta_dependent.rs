@@ -16,9 +16,9 @@
 //! no cargo --release, no parallel cargo.
 
 use gam::families::custom_family::{FamilyChannelHessian, ParameterBlockSpec};
-use gam::families::survival_marginal_slope_identifiability::SurvivalRowHessian;
+use gam::identifiability::audit::{IdentifiabilityAudit, maybe_log_audit_drift};
+use gam::identifiability::marginal_slope::SurvivalRowHessian;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::{IdentifiabilityAudit, maybe_log_audit_drift};
 use ndarray::{Array1, Array2};
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ fn make_survival_row_hessian(
 /// least one entry differs by more than 1e-6.
 #[test]
 fn survival_marginal_slope_w_changes_with_beta() {
-    use gam::families::survival_marginal_slope::SurvivalMarginalSlopeFamilyScalars;
+    use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
     use std::sync::Arc;
 
     let n = 4;
@@ -144,7 +144,7 @@ fn survival_marginal_slope_w_changes_with_beta() {
 
 /// Build a minimal audit result with a given set of dropped columns.
 fn fake_audit(effective_dims: &[usize], original_dims: &[usize]) -> IdentifiabilityAudit {
-    use gam::solver::identifiability_audit::{BlockIdentity, DroppedColumn};
+    use gam::identifiability::audit::{BlockIdentity, DroppedColumn};
     let blocks: Vec<BlockIdentity> = original_dims
         .iter()
         .zip(effective_dims.iter())

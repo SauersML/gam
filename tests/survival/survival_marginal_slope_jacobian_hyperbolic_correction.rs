@@ -52,7 +52,7 @@
 use gam::custom_family::{
     BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian,
 };
-use gam::families::survival_marginal_slope::{
+use gam::families::survival::marginal_slope::{
     LogslopeBlockJacobian, SurvivalMarginalSlopeFamilyScalars,
 };
 use gam::identifiability::audit::audit_identifiability_channel_aware;

@@ -1920,11 +1920,11 @@ pub(crate) const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 /// exact zero. Used as the default `minweight` in `CustomFamilyOptions` and
 /// mirrored in tests that override it.
 ///
-/// Sourced from the canonical PIRLS positive-weight floor
-/// ([`crate::solver::pirls::MIN_WEIGHT`] = `1e-12`) so every floored family
-/// shares one definition; this alias keeps the descriptive local name at the
-/// `minweight` defaults.
-pub(crate) const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = crate::solver::pirls::MIN_WEIGHT;
+/// Sourced from the canonical positive-weight floor
+/// ([`crate::types::MIN_WEIGHT`] = `1e-12`) so every floored family shares one
+/// definition; this alias keeps the descriptive local name at the `minweight`
+/// defaults.
+pub(crate) const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = crate::types::MIN_WEIGHT;
 
 /// Default initial ridge δ for the explicit-stabilization Cholesky escalation
 /// schedule. Enters the quadratic term, the Laplace Hessian, and the penalty

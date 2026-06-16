@@ -428,7 +428,7 @@ def test_steer_dosimetry_against_analytic_kl(
 #
 #   * their ``residual_gauge["group_signature"]`` strings must be identical
 #     (the order-independent signature of the unpinned generator families —
-#     `group_signature_of` in src/sae_identifiability.rs guarantees two
+#     `group_signature_of` in src/identifiability/sae.rs guarantees two
 #     replicates agree on their residual gauge iff these strings are equal);
 #   * the recovered parameters (decoder / coords) must agree only up to that
 #     named symmetry — e.g. under a diffeomorphism-unpinned gauge the per-token

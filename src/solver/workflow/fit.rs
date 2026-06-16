@@ -886,7 +886,7 @@ fn survival_working_reml_score(state: &crate::pirls::WorkingState) -> f64 {
 fn fitted_weibull_baseline_from_linear_time_beta(
     beta: &Array1<f64>,
     anchor: f64,
-) -> Option<crate::families::survival_construction::SurvivalBaselineConfig> {
+) -> Option<crate::families::survival::construction::SurvivalBaselineConfig> {
     if beta.len() < 2 {
         return None;
     }
@@ -899,7 +899,7 @@ fn fitted_weibull_baseline_from_linear_time_beta(
     }
     let scale = anchor;
     Some(
-        crate::families::survival_construction::SurvivalBaselineConfig {
+        crate::families::survival::construction::SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::Weibull,
             scale: Some(scale),
             shape: Some(shape),
@@ -1324,7 +1324,7 @@ pub(crate) fn replicate_pooled_baseline_seed_per_cause(
 fn fit_cause_specific_survival_transformation_custom(
     spec: &SurvivalTransformationTermSpec,
     resolvedspec: TermCollectionSpec,
-    baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
+    baseline_cfg: crate::families::survival::construction::SurvivalBaselineConfig,
     prepared: PreparedSurvivalTimeStack,
     dense_cov_design: &Array2<f64>,
     penalty_blocks: Vec<PenaltyBlock>,
@@ -1332,7 +1332,7 @@ fn fit_cause_specific_survival_transformation_custom(
     derivative_floor: f64,
     penalty_block_gamma_priors: &[(String, f64, f64)],
 ) -> Result<SurvivalTransformationFitResult, String> {
-    let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view())
+    let cause_count = crate::families::survival::cause_count_from_event_codes(spec.event_target.view())
         .into_workflow_result()?;
     if cause_count == 0 {
         return Err(WorkflowError::MissingDependency {
@@ -1388,7 +1388,7 @@ fn fit_cause_specific_survival_transformation_custom(
         let event_target = spec
             .event_target
             .mapv(|observed| u8::from(observed == cause_code));
-        family_blocks.push(crate::survival::CauseSpecificRoystonParmarBlock {
+        family_blocks.push(crate::families::survival::CauseSpecificRoystonParmarBlock {
             age_entry: spec.age_entry.clone(),
             age_exit: spec.age_exit.clone(),
             event_target,
@@ -1482,7 +1482,7 @@ fn fit_cause_specific_survival_transformation_custom(
         });
     }
 
-    let family = crate::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)?;
+    let family = crate::families::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)?;
     let fit_options = BlockwiseFitOptions {
         compute_covariance: false,
         ..Default::default()
@@ -1492,7 +1492,7 @@ fn fit_cause_specific_survival_transformation_custom(
     let mut fit = fit_custom_family_with_rho_prior(&family, &block_specs, &fit_options, rho_prior)
         .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
     fit.likelihood_family = Some(LikelihoodSpec::royston_parmar());
-    let time_basis = crate::families::survival_construction::SavedSurvivalTimeBasis::from_build(
+    let time_basis = crate::families::survival::construction::SavedSurvivalTimeBasis::from_build(
         &spec.time_build,
         spec.time_anchor,
     );
@@ -1647,7 +1647,7 @@ fn hash_workflow_design_matrix(
 }
 
 fn survival_transformation_log_lambdas(
-    penalty_blocks: &[crate::survival::PenaltyBlock],
+    penalty_blocks: &[crate::families::survival::PenaltyBlock],
 ) -> Vec<f64> {
     penalty_blocks
         .iter()
@@ -1657,10 +1657,10 @@ fn survival_transformation_log_lambdas(
 
 fn persistent_survival_transformation_key(
     spec: &SurvivalTransformationTermSpec,
-    baseline_cfg: &crate::families::survival_construction::SurvivalBaselineConfig,
+    baseline_cfg: &crate::families::survival::construction::SurvivalBaselineConfig,
     dense_cov_design: ArrayView2<'_, f64>,
     prepared: &PreparedSurvivalTimeStack,
-    penalty_blocks: &[crate::survival::PenaltyBlock],
+    penalty_blocks: &[crate::families::survival::PenaltyBlock],
     opts: &crate::pirls::WorkingModelPirlsOptions,
     n_cols: usize,
 ) -> String {
@@ -1820,7 +1820,7 @@ fn store_survival_transformation_persistent_warm_start(
 pub(crate) fn fit_survival_transformation_model(
     request: SurvivalTransformationFitRequest<'_>,
 ) -> Result<SurvivalTransformationFitResult, String> {
-    use crate::survival::{PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
+    use crate::families::survival::{PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
 
     let SurvivalTransformationFitRequest {
         data,
@@ -1835,12 +1835,12 @@ pub(crate) fn fit_survival_transformation_model(
             .map_err(|err| err.to_string())?;
     let dense_cov_design = covariate_design.design.to_dense();
     let p_cov = dense_cov_design.ncols();
-    let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view())
+    let cause_count = crate::families::survival::cause_count_from_event_codes(spec.event_target.view())
         .into_workflow_result()?;
     let exact_derivative_guard = survival_derivative_guard_for_likelihood(spec.likelihood_mode);
 
     let build_working_model =
-        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
             let prepared = prepare_survival_time_stack(
                 &spec.age_entry,
                 &spec.age_exit,
@@ -1941,11 +1941,11 @@ pub(crate) fn fit_survival_transformation_model(
             // cause-specific blocks are built.
             let baseline_event_indicator = spec.event_target.mapv(|label| u8::from(label > 0));
             let mut model =
-                crate::families::royston_parmar::working_model_from_time_covariateshared(
+                crate::families::survival::royston_parmar::working_model_from_time_covariateshared(
                     PenaltyBlocks::new(penalty_blocks.clone()),
                     SurvivalMonotonicityPenalty { tolerance: 0.0 },
                     SurvivalSpec::Net,
-                    crate::families::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
+                    crate::families::survival::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
                         age_entry: spec.age_entry.view(),
                         age_exit: spec.age_exit.view(),
                         event_target: baseline_event_indicator.view(),
@@ -2236,7 +2236,7 @@ pub(crate) fn fit_survival_transformation_model(
     let fit = survival_unified_fit_result(beta, lambdas, &summary, &state, &penalty_blocks)?;
 
     let time_base_ncols = spec.time_build.x_exit_time.ncols();
-    let time_basis = crate::families::survival_construction::SavedSurvivalTimeBasis::from_build(
+    let time_basis = crate::families::survival::construction::SavedSurvivalTimeBasis::from_build(
         &spec.time_build,
         spec.time_anchor,
     );

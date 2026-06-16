@@ -2039,17 +2039,17 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     // disagreement to a single analytic term.
     {
         use crate::solver::estimate::reml::unified::debug_stash;
-        let _capture = debug_stash::CaptureGuard::request();
+        let capture = debug_stash::CaptureGuard::request();
         let (base_obj, _, _) = outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
         assert!(
             base_obj.is_finite(),
             "stash-capture base eval must reproduce a finite outer objective"
         );
-        let stash = debug_stash::test_support::take_terms();
+        let stash = capture.take_terms();
         // `a`-channel split of the first ψ coordinate: (a_likelihood = objective_psi,
         // a_penalty_quadratic = ½β̂ᵀ(∂S_λ/∂ψ)β̂). Drained from the global sink
         // recorded by build_psi_hyper_coords for the base eval.
-        let a_split = debug_stash::test_support::take_a_split();
+        let a_split = capture.take_a_split();
         let half_prod = stash.production_tr.map(|t| 0.5 * t);
         let half_ld_s = stash.coord_ld_s.map(|t| 0.5 * t);
         let recon = match (stash.coord_a, half_prod, half_ld_s) {
@@ -2065,11 +2065,11 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         //   FD(cost − ½ldh + ½lds)   ↔ coord_a        (probe a: cost/`a` term completeness)
         //   FD(log_det_s)            ↔ coord_ld_s
         let (_, _, _) = outer_at(eps, 0.0, EvalMode::ValueGradientHessian);
-        let stash_plus = debug_stash::test_support::take_terms();
-        let a_split_plus = debug_stash::test_support::take_a_split();
+        let stash_plus = capture.take_terms();
+        let a_split_plus = capture.take_a_split();
         let (_, _, _) = outer_at(-eps, 0.0, EvalMode::ValueGradientHessian);
-        let stash_minus = debug_stash::test_support::take_terms();
-        let a_split_minus = debug_stash::test_support::take_a_split();
+        let stash_minus = capture.take_terms();
+        let a_split_minus = capture.take_a_split();
         let central = |plus: Option<f64>, minus: Option<f64>| -> Option<f64> {
             match (plus, minus) {
                 (Some(p), Some(m)) => Some((p - m) / (2.0 * eps)),
@@ -2147,7 +2147,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         // ⇒ the analytic ψ-gradient is missing the KKT-residual β-response (the
         // gap). residual≈0 yet coord_a ≠ fd_cost_excl_logdet ⇒ objective_psi
         // assembly bug (the kernel ∂X/∂ψ is FD-verified-correct standalone).
-        let kkt_probe = debug_stash::test_support::take_kkt_probe();
+        let kkt_probe = capture.take_kkt_probe();
         println!(
             "[740-KKT-PROBE] inner_kkt_residual_inf={:?} batched_envelope_override_fired={:?}",
             kkt_probe.map(|(r, _)| r),
@@ -2644,10 +2644,12 @@ fn generated_regressor_correction_matches_explicit_g_accumulation() {
 #[test]
 fn rigid_standard_normal_mixed_z_sensitivity_matches_central_difference_of_gradient() {
     // #1028 engine quantity oracle: the per-row mixed (primary, z) partial
-    // `[∂²ℓ/∂q∂z, ∂²ℓ/∂g∂z]` read off the z-augmented row jet must equal the
-    // central finite-difference of the production row GRADIENT `[∂ℓ/∂q, ∂ℓ/∂g]`
-    // (`rigid_standard_normal_row_kernel`) in z. This pins the new jet channel
-    // against the same kernel value/gradient the fit consumes.
+    // `[∂²log L/∂q∂z, ∂²log L/∂g∂z]` read off the z-augmented row jet must equal
+    // the NEGATIVE central finite-difference of the production NLL row GRADIENT
+    // `[∂ℓ/∂q, ∂ℓ/∂g]` (`rigid_standard_normal_row_kernel`) in z. This pins both
+    // the new jet channel and the #1131 sign convention: production row kernels
+    // optimize NLL, while the generated-regressor chain consumes log-likelihood
+    // score sensitivity.
     let link = bernoulli_marginal_slope_probit_link();
     let probit_scale = 0.7;
     let h = 1e-6;
@@ -2673,22 +2675,24 @@ fn rigid_standard_normal_mixed_z_sensitivity_matches_central_difference_of_gradi
         };
         let plus = grad_at(z + h);
         let minus = grad_at(z - h);
-        let fd_q = (plus[0] - minus[0]) / (2.0 * h);
-        let fd_g = (plus[1] - minus[1]) / (2.0 * h);
+        let fd_nll_q = (plus[0] - minus[0]) / (2.0 * h);
+        let fd_nll_g = (plus[1] - minus[1]) / (2.0 * h);
+        let fd_score_q = -fd_nll_q;
+        let fd_score_g = -fd_nll_g;
 
         assert!(
-            (analytic[0] - fd_q).abs() < 1e-5,
-            "∂²ℓ/∂q∂z mismatch at (q={marginal_eta}, g={g}, z={z}, y={y}): \
+            (analytic[0] - fd_score_q).abs() < 1e-5,
+            "∂²logL/∂q∂z mismatch at (q={marginal_eta}, g={g}, z={z}, y={y}): \
              analytic={:.6e} fd={:.6e}",
             analytic[0],
-            fd_q
+            fd_score_q
         );
         assert!(
-            (analytic[1] - fd_g).abs() < 1e-5,
-            "∂²ℓ/∂g∂z mismatch at (q={marginal_eta}, g={g}, z={z}, y={y}): \
+            (analytic[1] - fd_score_g).abs() < 1e-5,
+            "∂²logL/∂g∂z mismatch at (q={marginal_eta}, g={g}, z={z}, y={y}): \
              analytic={:.6e} fd={:.6e}",
             analytic[1],
-            fd_g
+            fd_score_g
         );
     }
 }
@@ -2696,9 +2700,10 @@ fn rigid_standard_normal_mixed_z_sensitivity_matches_central_difference_of_gradi
 #[test]
 fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
     // The assembled `score_zeta_sensitivity` row `s_i` must be exactly the block
-    // Jacobian transpose `J_iᵀ` applied to the primary mixed-z 2-vector:
-    //   s_i[marginal_range] = (∂²ℓ/∂q∂z) · M_i,
-    //   s_i[logslope_range] = (∂²ℓ/∂g∂z) · G_i.
+    // Jacobian transpose `J_iᵀ` applied to the primary log-likelihood-score
+    // mixed-z 2-vector:
+    //   s_i[marginal_range] = (∂²logL/∂q∂z) · M_i,
+    //   s_i[logslope_range] = (∂²logL/∂g∂z) · G_i.
     // This pins the reduced-frame contraction the seam feeds to
     // `generated_regressor_correction`.
     let link = bernoulli_marginal_slope_probit_link();
@@ -3005,13 +3010,16 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
             (y[i] - 2.0 * beta_hat * zeta[i]) / (sigma * sigma)
         });
         let vb_mat = ndarray::array![[vb_scalar]];
+        let mut j_zeta = Array2::<f64>::zeros((n, dim_theta1));
+        for i in 0..n {
+            let j_row = cal.zeta_theta1_jacobian_row(z[i], a_block.row(i));
+            assert_eq!(j_row.len(), dim_theta1);
+            for k in 0..dim_theta1 {
+                j_zeta[[i, k]] = j_row[k];
+            }
+        }
         let vbg_prod = cal
-            .beta_theta1_sensitivity_for_test(
-                s_prod.view(),
-                z.view(),
-                a_block.view(),
-                vb_mat.view(),
-            )
+            .beta_theta1_sensitivity(s_prod.view(), j_zeta.view(), vb_mat.view())
             .expect("production signed sensitivity assembles");
         assert_eq!(vbg_prod.dim(), (1, dim_theta1));
         for k in 0..dim_theta1 {

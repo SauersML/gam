@@ -4717,17 +4717,29 @@ fn sae_build_duchon_atom(
 /// `centers` is accepted for API symmetry with the Duchon path; its row count
 /// determines the random-state matching seam (issue #246), but it is not
 /// otherwise used: a polynomial atom has no center-based locality.
-fn sae_build_euclidean_atom(
+fn sae_euclidean_degree_for_basis_size(dim: usize, basis_size: usize) -> Result<usize, String> {
+    for degree in 0..=SAE_EUCLIDEAN_PATCH_MAX_DEGREE {
+        if monomial_exponents(dim, degree).len() == basis_size {
+            return Ok(degree);
+        }
+    }
+    Err(format!(
+        "euclidean patch basis size {basis_size} is not a valid monomial width for latent_dim={dim} with max_degree<={SAE_EUCLIDEAN_PATCH_MAX_DEGREE}"
+    ))
+}
+
+fn sae_build_euclidean_atom_with_degree(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
+    max_degree: usize,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
     let dim = centers.ncols();
-    let exponents = monomial_exponents(dim, SAE_EUCLIDEAN_PATCH_MAX_DEGREE);
+    let exponents = monomial_exponents(dim, max_degree);
     let n_basis = exponents.len();
     // The design `Phi` and its jet come from the same evaluator the inner
     // Newton loop refreshes against, so the seed atom and every refresh share
     // one monomial layout.
-    let evaluator = EuclideanPatchEvaluator::new(dim, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?;
+    let evaluator = EuclideanPatchEvaluator::new(dim, max_degree)?;
     let (phi, jet) = if pts.nrows() == 0 {
         (
             Array2::<f64>::zeros((0, n_basis)),
@@ -4753,6 +4765,13 @@ fn sae_build_euclidean_atom(
         }
     }
     Ok((phi, jet, penalty))
+}
+
+fn sae_build_euclidean_atom(
+    pts: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
+    sae_build_euclidean_atom_with_degree(pts, centers, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)
 }
 
 /// Deterministically pick Duchon centers from the PCA-seeded coordinates.
@@ -4934,7 +4953,8 @@ fn sae_build_padded_basis_stacks(
                 }
                 let (phi, jet, penalty) = match plan.kind {
                     SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
-                        sae_build_euclidean_atom(coords.view(), centers.view())?
+                        let degree = sae_euclidean_degree_for_basis_size(d, basis_sizes[atom_idx])?;
+                        sae_build_euclidean_atom_with_degree(coords.view(), centers.view(), degree)?
                     }
                     _ => sae_build_duchon_atom(coords.view(), centers.view())?,
                 };
@@ -5559,6 +5579,7 @@ fn sae_manifold_fit_minimal<'py>(
     decoder_blocks,
     duchon_centers,
     n_harmonics_list,
+    basis_size_list,
     alpha,
     tau,
     assignment_kind,
@@ -5581,6 +5602,7 @@ fn sae_manifold_predict_oos<'py>(
     decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
     duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
     n_harmonics_list: Vec<Option<usize>>,
+    basis_size_list: Vec<usize>,
     alpha: f64,
     tau: f64,
     assignment_kind: String,
@@ -5617,6 +5639,7 @@ fn sae_manifold_predict_oos<'py>(
         || decoder_blocks.len() != k_atoms
         || duchon_centers.len() != k_atoms
         || n_harmonics_list.len() != k_atoms
+        || basis_size_list.len() != k_atoms
     {
         return Err(py_value_error(format!(
             "sae_manifold_predict_oos: per-atom metadata lengths must equal K={k_atoms}"
@@ -5690,7 +5713,9 @@ fn sae_manifold_predict_oos<'py>(
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
                     SaeAtomBasisKind::EuclideanPatch => {
-                        sae_build_euclidean_atom(probe_pts.view(), centers.view())
+                        let degree = sae_euclidean_degree_for_basis_size(d, basis_size_list[atom_idx])
+                            .map_err(py_value_error)?;
+                        sae_build_euclidean_atom_with_degree(probe_pts.view(), centers.view(), degree)
                             .map_err(py_value_error)?
                     }
                     _ => sae_build_duchon_atom(probe_pts.view(), centers.view())
@@ -6060,6 +6085,7 @@ fn sae_manifold_predict_oos<'py>(
     decoder_blocks,
     duchon_centers,
     n_harmonics_list,
+    basis_size_list,
     coords,
     logits,
     assignment_kind,
@@ -6082,6 +6108,7 @@ fn sae_steer_delta<'py>(
     decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
     duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
     n_harmonics_list: Vec<Option<usize>>,
+    basis_size_list: Vec<usize>,
     coords: Vec<PyReadonlyArray2<'py, f64>>,
     logits: PyReadonlyArray2<'py, f64>,
     assignment_kind: String,
@@ -6114,6 +6141,7 @@ fn sae_steer_delta<'py>(
         || decoder_blocks.len() != k_atoms
         || duchon_centers.len() != k_atoms
         || n_harmonics_list.len() != k_atoms
+        || basis_size_list.len() != k_atoms
         || coords.len() != k_atoms
     {
         return Err(py_value_error(format!(
@@ -6183,7 +6211,9 @@ fn sae_steer_delta<'py>(
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
                     SaeAtomBasisKind::EuclideanPatch => {
-                        sae_build_euclidean_atom(probe_pts.view(), centers.view())
+                        let degree = sae_euclidean_degree_for_basis_size(d, basis_size_list[atom_idx])
+                            .map_err(py_value_error)?;
+                        sae_build_euclidean_atom_with_degree(probe_pts.view(), centers.view(), degree)
                             .map_err(py_value_error)?
                     }
                     _ => sae_build_duchon_atom(probe_pts.view(), centers.view())

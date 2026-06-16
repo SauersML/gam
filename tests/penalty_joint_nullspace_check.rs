@@ -36,9 +36,9 @@
 //! blocks passes canonicalize without triggering any failure.
 
 use gam::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
+use gam::identifiability::audit::{MapUniquenessError, check_map_uniqueness};
+use gam::identifiability::canonical::canonicalize_for_identifiability;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::{MapUniquenessError, check_map_uniqueness};
-use gam::solver::identifiability_canonical::canonicalize_for_identifiability;
 use ndarray::{Array1, Array2};
 
 const N: usize = 32;

@@ -861,4 +861,3 @@ pub(crate) fn outer_eval_result_to_joint_hyper_result(
 pub(crate) struct OwnedDenseOuterHessianOperator {
     pub(crate) matrix: Array2<f64>,
 }
-

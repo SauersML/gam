@@ -115,7 +115,7 @@ pub(crate) fn stable_softplus(x: f64) -> f64 {
 ///
 /// Canonical home for the routine previously duplicated as `logistic` in
 /// `terms/analytic_penalties.rs`, `sigmoid_stable` in `inference/hmc.rs`, and
-/// `sigmoid_scalar` in `terms/sae_manifold.rs` — all three were bit-identical.
+/// `sigmoid_scalar` in `terms/sae/manifold/mod.rs` — all three were bit-identical.
 #[inline]
 pub(crate) fn stable_logistic(x: f64) -> f64 {
     if x >= 0.0 {

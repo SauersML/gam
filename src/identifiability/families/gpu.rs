@@ -93,8 +93,8 @@ mod cuda_impl {
     /// Process-wide PTX cache for the fused primary-state Gram kernel.
     /// NVRTC-compiled on the first `compute_grams_fused` call that
     /// reaches a CUDA context; reused on every subsequent call.
-    pub(super) static FUSED_GRAM_PTX_CACHE: crate::gpu::common::PtxModuleCache =
-        crate::gpu::common::PtxModuleCache::new();
+    pub(super) static FUSED_GRAM_PTX_CACHE: crate::gpu::device_cache::PtxModuleCache =
+        crate::gpu::device_cache::PtxModuleCache::new();
 
     /// Device-resident cache of channel-block designs plus a reusable
     /// row-scale scratch buffer. Built once per identifiability compile;

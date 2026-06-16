@@ -1492,10 +1492,7 @@ fn survival_location_scale_planner_keeps_analytic_hessian_at_large_scale_dimensi
 
     let (gradient, hessian) =
         crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Either,

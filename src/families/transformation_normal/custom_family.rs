@@ -6,11 +6,9 @@ use super::*;
 
 impl CustomFamily for TransformationNormalFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
-            "TransformationNormalFamily",
-            1,
-            block_states.len(),
-        )?;
+        crate::families::block_layout::block_count::validate_block_count::<
+            TransformationNormalError,
+        >("TransformationNormalFamily", 1, block_states.len())?;
         let evaluate_start = std::time::Instant::now();
         let beta = &block_states[0].beta;
         let row_q_start = std::time::Instant::now();
@@ -118,11 +116,9 @@ impl CustomFamily for TransformationNormalFamily {
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         assert!(block_specs.len() <= isize::MAX as usize);
-        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
-            "TransformationNormalFamily",
-            1,
-            block_states.len(),
-        )?;
+        crate::families::block_layout::block_count::validate_block_count::<
+            TransformationNormalError,
+        >("TransformationNormalFamily", 1, block_states.len())?;
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
         let log_likelihood = row_quantities.log_likelihood;
@@ -294,11 +290,9 @@ impl CustomFamily for TransformationNormalFamily {
         if block_index != 0 {
             return Ok(None);
         }
-        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
-            "TransformationNormalFamily",
-            1,
-            block_states.len(),
-        )?;
+        crate::families::block_layout::block_count::validate_block_count::<
+            TransformationNormalError,
+        >("TransformationNormalFamily", 1, block_states.len())?;
         if delta.len() != block_states[0].beta.len() {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
@@ -568,11 +562,9 @@ impl CustomFamily for TransformationNormalFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
-            "TransformationNormalFamily",
-            1,
-            block_states.len(),
-        )?;
+        crate::families::block_layout::block_count::validate_block_count::<
+            TransformationNormalError,
+        >("TransformationNormalFamily", 1, block_states.len())?;
         if !self.inner_coefficient_hessian_hvp_available(specs) {
             return Err(TransformationNormalError::InvalidInput {
                 reason: "TransformationNormalFamily joint Hessian workspace received incompatible block specs"

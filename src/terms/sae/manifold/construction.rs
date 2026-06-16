@@ -2192,7 +2192,7 @@ impl SaeManifoldTerm {
         &self,
         targets: ArrayView2<'_, f64>,
         amplitudes: ArrayView2<'_, f64>,
-    ) -> Result<Vec<crate::terms::sae::encode_atlas::EncodeResult>, String> {
+    ) -> Result<Vec<crate::terms::sae::encode::EncodeResult>, String> {
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
         let n = targets.nrows();
@@ -2236,11 +2236,11 @@ impl SaeManifoldTerm {
             amplitude_bound[atom_idx] = bound.max(1.0);
         }
 
-        let atlas = crate::terms::sae::encode_atlas::EncodeAtlas::build(
+        let atlas = crate::terms::sae::encode::EncodeAtlas::build(
             &self.atoms,
             &amplitude_bound,
             target_norm_bound,
-            crate::terms::sae::encode_atlas::AtlasConfig::default(),
+            crate::terms::sae::encode::AtlasConfig::default(),
         )?;
 
         // Per-atom amortized encode with a certificate-gated exact-solve fallback:
@@ -2268,7 +2268,7 @@ impl SaeManifoldTerm {
                     certified[row] = true;
                 }
             }
-            results.push(crate::terms::sae::encode_atlas::EncodeResult::from_rows(
+            results.push(crate::terms::sae::encode::EncodeResult::from_rows(
                 coords, certified,
             ));
         }
@@ -2306,7 +2306,7 @@ impl SaeManifoldTerm {
         &self,
         targets: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
-    ) -> Result<Vec<crate::terms::sae::encode_atlas::EncodeResult>, String> {
+    ) -> Result<Vec<crate::terms::sae::encode::EncodeResult>, String> {
         let amplitudes = self.fitted_assignment_amplitudes(rho)?;
         self.amortized_encode_target(targets, amplitudes.view())
     }

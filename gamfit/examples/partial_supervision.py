@@ -1,5 +1,5 @@
 """Partial-supervision gauge-fix example — thin Python wrapper around the
-Rust ``gam::sae_identifiability::partial_supervision_solve`` primitive.
+Rust ``gam::identifiability::sae::partial_supervision_solve`` primitive.
 
 All numerical linear algebra (Procrustes / anchor / soft-L2 ridge / QR
 orthogonalization) lives in Rust; this module only handles argument
@@ -320,7 +320,7 @@ def partial_supervision(
 
     See module docstring and :class:`PartialSupervisionFit` for the
     semantics. All numerical work happens in Rust via
-    ``gam::sae_identifiability::partial_supervision_solve``; this Python
+    ``gam::identifiability::sae::partial_supervision_solve``; this Python
     layer is a marshal-only wrapper.
 
     Examples

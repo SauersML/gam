@@ -934,21 +934,21 @@ pub struct PreparedSurvivalTimeStack {
     pub time_design_derivative_exit: crate::matrix::DesignMatrix,
     pub time_penalties: Vec<Array2<f64>>,
     pub time_nullspace_dims: Vec<usize>,
-    pub timewiggle_build: Option<crate::families::survival_construction::SurvivalTimeWiggleBuild>,
+    pub timewiggle_build: Option<crate::families::survival::construction::SurvivalTimeWiggleBuild>,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
 }
 
 pub fn prepare_survival_time_stack(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
-    baseline_cfg: &crate::families::survival_construction::SurvivalBaselineConfig,
+    baseline_cfg: &crate::families::survival::construction::SurvivalBaselineConfig,
     likelihood_mode: SurvivalLikelihoodMode,
     inverse_link: Option<&InverseLink>,
     time_anchor: f64,
     derivative_guard: f64,
-    time_build: &crate::families::survival_construction::SurvivalTimeBuildOutput,
+    time_build: &crate::families::survival::construction::SurvivalTimeBuildOutput,
     effective_timewiggle: Option<&LinkWiggleFormulaSpec>,
-    latent_loading: Option<crate::families::lognormal_kernel::HazardLoading>,
+    latent_loading: Option<crate::families::survival::lognormal_kernel::HazardLoading>,
 ) -> Result<PreparedSurvivalTimeStack, String> {
     let (
         mut eta_offset_entry,
@@ -1001,8 +1001,8 @@ pub fn prepare_survival_time_stack(
             && baseline_cfg.target == SurvivalBaselineTarget::Linear
         {
             let scale =
-                crate::families::survival_construction::positive_survival_time_seed(age_exit);
-            conditioning_cfg = crate::families::survival_construction::SurvivalBaselineConfig {
+                crate::families::survival::construction::positive_survival_time_seed(age_exit);
+            conditioning_cfg = crate::families::survival::construction::SurvivalBaselineConfig {
                 target: SurvivalBaselineTarget::Weibull,
                 scale: Some(scale),
                 shape: Some(1.0),
@@ -2242,7 +2242,7 @@ pub(crate) fn materialize_standard<'a>(
         let sigma = match config.frailty.clone().unwrap_or(FrailtySpec::None) {
             FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(sigma),
-                loading: crate::families::lognormal_kernel::HazardLoading::Full,
+                loading: crate::families::survival::lognormal_kernel::HazardLoading::Full,
             } => sigma,
             FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(_),
@@ -2604,7 +2604,7 @@ pub(crate) fn materialize_survival<'a>(
             .iter()
             .copied()
             .enumerate()
-            .map(|(i, value)| crate::survival::survival_event_code_from_value(value, i))
+            .map(|(i, value)| crate::families::survival::survival_event_code_from_value(value, i))
             .collect::<Result<Vec<_>, _>>()?,
     );
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
@@ -2693,7 +2693,7 @@ pub(crate) fn materialize_survival<'a>(
         });
     }
     let cause_count =
-        crate::survival::cause_count_from_event_codes(event_codes.view()).into_workflow_result()?;
+        crate::families::survival::cause_count_from_event_codes(event_codes.view()).into_workflow_result()?;
     if cause_count > 1
         && !matches!(
             survival_mode,
@@ -3304,7 +3304,7 @@ pub(crate) fn materialize_survival<'a>(
     };
 
     let build_time_block =
-        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
             let prepared = prepare_survival_time_stack(
                 &age_entry,
                 &age_exit,
@@ -3339,7 +3339,7 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -3356,7 +3356,7 @@ pub(crate) fn materialize_survival<'a>(
     let location_scale_smoothing_warm_start: RefCell<Option<(Array1<f64>, Array1<f64>)>> =
         RefCell::new(None);
     let build_location_scale_request =
-        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig,
+        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig,
          allow_inverse_link_optimization: bool| {
             let (prepared, time_block) = build_time_block(candidate)?;
             let (initial_threshold_log_lambdas, initial_log_sigma_log_lambdas) =
@@ -3407,10 +3407,10 @@ pub(crate) fn materialize_survival<'a>(
         };
 
     let build_marginal_slope_request =
-        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
             let (prepared, mut time_block) = build_time_block(candidate)?;
             time_block.time_monotonicity =
-                crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint;
+                crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint;
             Ok::<_, String>(SurvivalMarginalSlopeFitRequest {
                 data: data.values.view(),
                 spec: SurvivalMarginalSlopeTermSpec {
@@ -3453,7 +3453,7 @@ pub(crate) fn materialize_survival<'a>(
         };
 
     let build_latent_survival_request =
-        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
             let loading = latent_loading.ok_or_else(|| {
                 "internal error: latent survival loading missing after frailty validation"
                     .to_string()
@@ -3504,7 +3504,7 @@ pub(crate) fn materialize_survival<'a>(
                     }
                     let event_target = event.mapv(|v| {
                         if v >= 0.5 {
-                            crate::families::latent_survival::LATENT_SURVIVAL_EVENT_INTERVAL
+                            crate::families::survival::latent::LATENT_SURVIVAL_EVENT_INTERVAL
                         } else {
                             0
                         }
@@ -3539,7 +3539,7 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -3569,7 +3569,7 @@ pub(crate) fn materialize_survival<'a>(
         };
 
     let build_latent_binary_request =
-        |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
+        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
             let loading = latent_loading.ok_or_else(|| {
                 "internal error: latent binary loading missing after frailty validation".to_string()
             })?;
@@ -3601,7 +3601,7 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity: crate::families::survival_location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,

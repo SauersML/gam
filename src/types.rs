@@ -4,6 +4,10 @@ use std::ops::{Deref, DerefMut};
 
 pub use crate::terms::geometry::hull::PeeledHull;
 
+/// Lower floor on positive working weights shared by likelihood families and
+/// PIRLS row assembly so weighted normal equations stay numerically well posed.
+pub(crate) const MIN_WEIGHT: f64 = 1e-12;
+
 /// Hyperprior placed on a coefficient group's precision / log-precision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CoefficientGroupPrior {

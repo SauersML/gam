@@ -42,7 +42,7 @@
 use crate::families::cubic_cell_kernel::{
     DenestedCubicCell, DenestedPartitionCell, LocalSpanCubic,
 };
-use crate::gpu::error::GpuError;
+use crate::gpu::gpu_error::GpuError;
 
 /// CUDA C++ kernel source strings for the two NVRTC kernels.  Both bodies are
 /// the literal translation of the CPU implementations cited above.
@@ -357,8 +357,8 @@ pub fn trivial_partition_cell(a: f64, b: f64, scale: f64) -> DenestedPartitionCe
 mod device_dispatch {
     use super::kernel_src::DENESTED_PARTITION_CELLS_KERNEL_SRC;
     use super::{PartitionCellsOutput, PartitionCellsRowInputs, trivial_partition_cell};
-    use crate::gpu::common::PtxModuleCache;
-    use crate::gpu::error::{GpuError, GpuResultExt};
+    use crate::gpu::device_cache::PtxModuleCache;
+    use crate::gpu::gpu_error::{GpuError, GpuResultExt};
     use crate::gpu::solver::context_and_stream;
     use cudarc::driver::{LaunchConfig, PushKernelArg};
 
@@ -491,7 +491,7 @@ mod device_dispatch {
             )
         })?;
         let (ctx, stream) = context_and_stream()
-            .map_err(|reason| crate::gpu::error::GpuError::DriverCallFailed { reason })?;
+            .map_err(|reason| crate::gpu::gpu_error::GpuError::DriverCallFailed { reason })?;
         let module = FP_PTX_CACHE.get_or_compile(
             &ctx,
             "survival_flex_prep::cell_primary_fixed_partials",
@@ -548,7 +548,7 @@ mod device_dispatch {
 #[cfg(not(target_os = "linux"))]
 mod device_dispatch {
     use super::{PartitionCellsOutput, PartitionCellsRowInputs};
-    use crate::gpu::error::GpuError;
+    use crate::gpu::gpu_error::GpuError;
 
     pub(super) fn partition_cells_baseline(
         rows: &[PartitionCellsRowInputs<'_>],

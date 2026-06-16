@@ -16,12 +16,12 @@ use super::{
     BlockwiseFitOptions, CachedInnerMode, ConstrainedWarmStart, CustomFamily, ParameterBlockSpec,
     PenaltyMatrix, normalize_active_sets,
 };
-use crate::warm_start::Fingerprinter;
 use crate::matrix::DesignMatrix;
 use crate::solver::persistent_warm_start::{
     PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, load_block_record,
     store_block_record,
 };
+use crate::warm_start::Fingerprinter;
 use ndarray::{Array1, Array2};
 use std::any::type_name;
 use std::sync::atomic::Ordering;

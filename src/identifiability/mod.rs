@@ -9,7 +9,6 @@
 //! - [`precondition`] — cheap pre-fit precondition checks.
 //! - [`audit`] — the joint cross-block identifiability audit.
 //! - [`canonical`] — canonicalization of specs for identifiability.
-//! - [`sae`] — sparse-autoencoder gauge / identifiability machinery.
 //! - [`families`] — the family-agnostic block compiler, its GPU paths, and the
 //!   per-family row-Hessian implementations.
 //! - [`marginal_slope`] — survival marginal-slope identifiability.
@@ -20,4 +19,3 @@ pub mod families;
 pub mod kernel;
 pub mod marginal_slope;
 pub mod precondition;
-pub mod sae;

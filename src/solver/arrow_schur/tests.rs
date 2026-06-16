@@ -3000,7 +3000,7 @@ pub(crate) fn sae_structured_system(
     sys.gb = Array1::<f64>::zeros(k);
     // Install the matrix-free Kronecker operator (H_tβ = L_i · P_i): forward
     // gathers active atoms into a length-p vector then applies L_i; transpose
-    // is the exact adjoint. Mirrors src/terms/sae_manifold.rs:6028.
+    // is the exact adjoint. Mirrors src/terms/sae/manifold/mod.rs:6028.
     let a_phi_f = a_phi.clone();
     let jac_f = local_jac.clone();
     let a_phi_t = a_phi.clone();

@@ -3517,7 +3517,7 @@ fn model_debiased_functional_json_impl(
 
     // Recover fitted beta, H, and X'WX from the saved model.
     let saved_fit =
-        gam::families::survival_predict::fit_result_from_saved_model_for_prediction(&model)
+        gam::families::survival::predict::fit_result_from_saved_model_for_prediction(&model)
             .map_err(|e| format!("debiased_functional: {e}"))?;
     let h = saved_fit.penalized_hessian().ok_or_else(|| {
         "debiased_functional: model does not carry a dense penalized Hessian; \

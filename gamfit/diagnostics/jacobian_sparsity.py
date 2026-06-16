@@ -6,7 +6,7 @@ Lachapelle et al. (2024) "Disentanglement via mechanism sparsity"
 arXiv:2401.04890.
 
 The numeric kernel — sparsity fraction and per-sample column rank — lives
-in the Rust ``gam::identifiability_diagnostics::jacobian_sparsity_metrics`` function. This
+in the Rust ``gam::identifiability::kernel::jacobian_sparsity_metrics`` function. This
 Python file is a thin extraction-and-reporting wrapper.
 """
 

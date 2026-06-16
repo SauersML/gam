@@ -1,6 +1,6 @@
 // Cross-block identifiability canonicalisation.
 //
-// The pre-fit `audit_identifiability` (see `identifiability_audit.rs`)
+// The pre-fit `audit_identifiability` (see `crate::identifiability::audit`)
 // runs a joint RRQR on `[X_block_0 | X_block_1 | ...]` and reports per-
 // block (block_idx, local_col) drops attributing each demoted joint
 // column back to its origin. This module **previously** converted that
@@ -41,15 +41,15 @@ use crate::families::custom_family::{
     BlockEffectiveJacobian, CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec,
     PenaltyMatrix,
 };
+use crate::identifiability::audit::{
+    IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
+};
 use crate::identifiability::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::gauge::Gauge;
-use crate::identifiability::audit::{
-    IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
-};
 
 enum BlockJacobianSource {
     Callback(Arc<dyn BlockEffectiveJacobian>),

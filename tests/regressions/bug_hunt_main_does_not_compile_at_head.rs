@@ -24,7 +24,7 @@
 //!         `fully_coupled` never used;
 //!       * `src/terms/sae_candidate_index.rs:271` — field `bits_per_table`
 //!         never read;
-//!       * `src/terms/sae_corpus/shard_reader.rs:170` — field `path` never read.
+//!       * `src/terms/sae/corpus/shard_reader.rs:170` — field `path` never read.
 //!     `cargo build` → "could not compile `gam` (lib) due to 4 previous errors".
 //!
 //! The published wheel / prebuilt CLI predate the breaks, but the source tree at

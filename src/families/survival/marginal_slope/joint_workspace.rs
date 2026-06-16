@@ -129,7 +129,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         // ── Step-6 dispatcher: try GPU joint-Hessian × v first ───────────
         //
         // Routes through
-        // [`crate::families::survival_marginal_slope_gpu::try_survival_flex_hvp`] via the
+        // [`crate::families::survival::marginal_slope::gpu::try_survival_flex_hvp`] via the
         // `gpu::decide` policy.  Returns `Ok(None)` until the joint-β
         // device HVP assembly lands; on `Ok(Some(hv))` we write straight
         // into the caller-owned `out` buffer and skip the prebuilt

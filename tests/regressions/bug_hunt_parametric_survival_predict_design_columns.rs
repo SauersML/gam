@@ -8,7 +8,7 @@
 //! `feature_cols` (not just the singular `feature_col`) at predict time.
 //!
 //! This test exercises the end-to-end fit -> save -> library predict path
-//! (`gam::survival_predict::predict_survival`, the same entry point the Python
+//! (`gam::families::survival::predict::predict_survival`, the same entry point the Python
 //! `model.predict` FFI uses) and asserts the predict SUCCEEDS, returns a valid
 //! survival surface in `[0, 1]` that is monotone non-increasing in `t`, and
 //! genuinely varies with the parametric covariate `x`.
@@ -20,7 +20,7 @@ use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
-use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
 use gam::test_support::cli_harness::run_or_panic;
 use ndarray::Array1;
 

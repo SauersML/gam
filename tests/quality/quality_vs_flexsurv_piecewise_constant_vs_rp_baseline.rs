@@ -34,7 +34,7 @@
 //! else is right-censored.
 //!
 //! gam's `log Λ(t | Age)` is reconstructed from first principles from the
-//! converged fit, exactly as `survival_predict::evaluate_rp_row` assembles it:
+//! converged fit, exactly as `survival::predict::evaluate_rp_row` assembles it:
 //!
 //!     η(t, Age) = [b(t) − b(anchor)]·β_time + c(Age)·β_cov ,   log Λ = η,
 //!
@@ -53,7 +53,7 @@
 //!      survival curve S(t | Age) lies in [0, 1] and is non-increasing in t.
 
 use csv::StringRecord;
-use gam::families::survival_construction::{
+use gam::families::survival::construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
 };

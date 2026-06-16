@@ -3,6 +3,7 @@
 //! Add a primitive by implementing [`PenaltyManifest`] for its concrete
 //! penalty type here and registering it in [`analytic_penalty_registry`].
 
+use crate::terms::analytic_penalties::SheafConsistencyPenalty;
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, BlockOrthogonalityPenalty, BlockSparsityPenalty,
     DecoderIncoherencePenalty, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
@@ -12,7 +13,6 @@ use crate::terms::analytic_penalties::{
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
     TotalVariationPenalty,
 };
-use crate::terms::penalties::sheaf::SheafConsistencyPenalty;
 
 pub trait PenaltyManifest: AnalyticPenalty {
     const KIND_TAG: &'static str;

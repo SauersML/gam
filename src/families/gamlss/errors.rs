@@ -82,10 +82,10 @@ pub(crate) const MIN_DERIV: f64 = 1e-8;
 /// `1e-12 · max|x|² · n` stays comfortably above `f64::MIN_POSITIVE`
 /// at large scale.
 ///
-/// This is the canonical PIRLS positive-weight floor (`1e-12`); the value is
-/// owned by [`crate::solver::pirls::MIN_WEIGHT`] so every floored family shares
-/// one definition rather than re-declaring it per module.
-use crate::solver::pirls::MIN_WEIGHT;
+/// This is the canonical positive-weight floor (`1e-12`); the value is owned by
+/// [`crate::types::MIN_WEIGHT`] so every floored family shares one definition
+/// rather than re-declaring it per module.
+use crate::types::MIN_WEIGHT;
 
 /// Hard symmetric clamp on η used by the Poisson / Gaussian / Gamma working-
 /// model log-likelihood loops to keep `exp(η)` and `log(σ)` finite under the

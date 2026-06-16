@@ -749,7 +749,7 @@ fn blas3_gram_chunk_rows(n: usize) -> usize {
 
 /// Whole-design GPU dispatch for the rigid `Xᵀ diag(w) X` joint Hessian.
 /// Routes the full-n contracted weights `(w_mm, w_mg, w_gg)` and the two
-/// dense design views through [`crate::gpu::linalg::try_fast_joint_hessian_2x2`],
+/// dense design views through [`crate::gpu::linalg_dispatch::try_fast_joint_hessian_2x2`],
 /// the same auto-dispatch entry the manifold / Arrow-Schur paths use. The
 /// auto-dispatch gates on `GpuRuntime::global()` and the dense-reduction flop
 /// floor, returning `None` whenever the workload is below gate or the backend
@@ -768,7 +768,7 @@ fn rigid_joint_hessian_on_gpu(
 ) -> Option<Array2<f64>> {
     let x_full = marginal_design.as_dense_ref()?;
     let g_full = logslope_design.as_dense_ref()?;
-    crate::gpu::linalg::try_fast_joint_hessian_2x2(
+    crate::gpu::linalg_dispatch::try_fast_joint_hessian_2x2(
         x_full.view(),
         g_full.view(),
         w_mm.view(),

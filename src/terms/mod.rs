@@ -6,7 +6,6 @@ pub mod decoders;
 pub mod dictionary;
 pub mod geometry;
 pub mod latent;
-pub mod penalties;
 pub mod sae;
 pub mod smooth;
 pub mod smooth_overrides;
@@ -17,13 +16,13 @@ pub mod torch_dispatch;
 pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp, AnalyticPenaltyRegistry,
     BlockOrthogonalityPenalty, BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind,
-    FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryDuchonRadialSource, IsometryPenalty,
-    IsometryReference, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
-    NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    EdgeRestriction, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryDuchonRadialSource,
+    IsometryPenalty, IsometryReference, IvaeRidgeMeanGauge, JumpReLUPenalty,
+    MechanismSparsityPenalty, NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ShapeMonotonicityPenalty,
-    SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TopKActivationPenalty,
-    TotalVariationPenalty, WeightField,
+    SheafConsistencyPenalty, SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty,
+    TopKActivationPenalty, TotalVariationPenalty, WeightField,
 };
 pub use basis::matern_gradient::{
     MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator,
@@ -41,13 +40,16 @@ pub use latent::{
     AuxPriorFamily, AuxPriorStrength, InputLocationDerivative, LatentCoordValues, LatentIdMode,
     LatentManifold,
 };
-pub use penalties::sheaf::{EdgeRestriction, SheafConsistencyPenalty};
 pub use sae::atom_selection::{
     AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
     L1Relaxed, ShapeRef, TopK,
 };
+pub use sae::certificates::{
+    CriterionCertificate, DirectionalSamples, certificate_from_samples,
+    deterministic_probe_direction, probe_step,
+};
 pub use sae::criterion_atoms::{SaeCriterion, SaeCriterionAtom};
-pub use sae::encode_atlas::{
+pub use sae::encode::{
     AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
     EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
 };
@@ -58,9 +60,5 @@ pub use sae::manifold::{
     SaeManifoldTerm, SaeOuterRhoGradientComponents, ScheduleKind, SphereChartEvaluator,
     TorusHarmonicEvaluator, dictionary_incoherence_report,
     dictionary_incoherence_report_with_dispersion,
-};
-pub use sae::optimality_certificate::{
-    CriterionCertificate, DirectionalSamples, certificate_from_samples,
-    deterministic_probe_direction, probe_step,
 };
 pub use sae::row_jet_program::{AtomRowBasisJet, RowGate, SaeReconstructionRowProgram};

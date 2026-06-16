@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::families::lognormal_kernel::latent_cloglog_jet5;
+use crate::families::survival::lognormal_kernel::latent_cloglog_jet5;
 use crate::probability::{
     normal_cdf, normal_pdf,
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,

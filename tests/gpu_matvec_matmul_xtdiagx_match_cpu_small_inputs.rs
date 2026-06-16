@@ -35,7 +35,7 @@ fn gpu_paths_match_cpu_to_1e8_when_available_for_small_matrices() {
         }
     }
 
-    if let Some(xtwx_gpu) = gam::gpu::linalg::try_fast_xt_diag_x(x.view(), w.view()) {
+    if let Some(xtwx_gpu) = gam::gpu::linalg_dispatch::try_fast_xt_diag_x(x.view(), w.view()) {
         let mut xtwx_cpu = Array2::<f64>::zeros((x.ncols(), x.ncols()));
         for i in 0..x.nrows() {
             for c1 in 0..x.ncols() {
