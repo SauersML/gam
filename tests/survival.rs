@@ -2,6 +2,9 @@
 //!
 //! Former top-level crates included as modules so they link as ONE binary.
 
+#[path = "common/fixtures.rs"]
+mod fixtures;
+
 #[path = "survival/competing_risks_survival.rs"]
 mod competing_risks_survival;
 #[path = "survival/frailty_scale_audit_plumbing.rs"]

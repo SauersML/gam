@@ -16,8 +16,7 @@
 //! If a test fails because the underlying GPU PIRLS fix has not yet landed,
 //! leave it as-is — it documents the gating contract.
 
-#[path = "../common/gpu_gate.rs"]
-mod gpu_gate;
+use crate::gpu_gate::{GpuGate, gpu_gate};
 use faer::Side;
 use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
@@ -27,7 +26,6 @@ use gam::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LogSmoothingParamsView, ResponseFamily,
     StandardLink,
 };
-use gpu_gate::{GpuGate, gpu_gate};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;

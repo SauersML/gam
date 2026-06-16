@@ -4553,49 +4553,6 @@ mod ift_warm_start_tests {
 }
 
 #[cfg(test)]
-mod tests_diagnostics {
-    //! Diagnostic inherent-method extensions on `RemlState`.
-    use super::*;
-
-    impl<'a> RemlState<'a> {
-        /// Debug-only: return the Hessian log-determinant term exactly as the
-        /// production REML/LAML cost sees it — `hop.logdet() +
-        /// hessian_logdet_correction`, i.e. the intrinsic `log|H_pen|₊` over
-        /// `range(H_pen)` when the rank-deficient LAML fix is active (#901) —
-        /// evaluated at the PIRLS state driven to convergence at this `rho`.
-        /// Centered-differencing across nearby `theta` therefore reproduces
-        /// whatever trace kernel production installs, with no separately
-        /// maintained debug formula to drift out of sync.
-        pub(crate) fn objective_logdet_h_proj(
-            &self,
-            rho: &Array1<f64>,
-        ) -> Result<f64, EstimationError> {
-            let bundle = self.obtain_eval_bundle(rho)?;
-            let assembly =
-                self.build_auto_assembly(rho, &bundle, super::unified::EvalMode::ValueOnly)?;
-            let logdet = super::unified::HessianOperator::logdet(assembly.hessian_op.as_ref())
-                + assembly.hessian_logdet_correction;
-            Ok(logdet)
-        }
-
-        /// Debug-only: return `(final_eta, finalweights, solve_c_array)` at
-        /// the PIRLS state produced by driving the solver to convergence at
-        /// this `rho`. Used by the iso-κ Duchon FD probe.
-        pub(crate) fn debug_eta_w_c(
-            &self,
-            rho: &Array1<f64>,
-        ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-            let pr = self.execute_pirls_if_needed(rho)?;
-            Ok((
-                pr.final_eta.clone(),
-                pr.finalweights.clone(),
-                pr.solve_c_array.clone(),
-            ))
-        }
-    }
-}
-
-#[cfg(test)]
 mod warm_start_key_stability_tests {
     use super::analytic_penalty_registry_fingerprint;
     use crate::terms::analytic_penalties::{

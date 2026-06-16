@@ -20,7 +20,7 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use gam::gpu::arrow_schur::{
+use gam::gpu::kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
     solve_arrow_newton_step_fused_force,
 };
@@ -122,9 +122,7 @@ fn main() -> ExitCode {
     let sys = build_fixture(N, D, K, 0xB10B_A11C_5CA1_E5DE);
 
     let cpu = time_path("cpu_host_loop", ITERS, || {
-        solve_arrow_newton_step_dense_reference(&sys, RIDGE_T, RIDGE_BETA)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        solve_arrow_newton_step_dense_reference(&sys, RIDGE_T, RIDGE_BETA).map(|_| ())
     });
     let abc = time_path("layer_abc", ITERS, || {
         match solve_arrow_newton_step(&sys, RIDGE_T, RIDGE_BETA) {

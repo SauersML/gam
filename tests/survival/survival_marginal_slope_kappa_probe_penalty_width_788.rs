@@ -32,9 +32,7 @@ use gam::{
 };
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
-#[path = "../common/fixtures.rs"]
-mod fixtures;
-use fixtures::Splitmix64;
+use crate::fixtures::Splitmix64;
 
 const N: usize = 360;
 

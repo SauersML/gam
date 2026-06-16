@@ -79,7 +79,7 @@ mod optimizer;
 mod penalty;
 mod prefit;
 mod result_types;
-mod smoothing_correction;
+pub(crate) mod smoothing_correction;
 mod summary;
 
 pub use crate::inference::predict::{

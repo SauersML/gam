@@ -20,7 +20,7 @@
 //! Run with: `cargo bench --bench cubic_hex_tensor_gpu_parity`
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use gam::gpu::cubic_bspline_moments::{
+use gam::gpu::kernels::cubic_bspline_moments::{
     AxisCubicMomentTables, CubicMomentBackend, CubicMomentSpec, HexCellTable, MomentLayout,
     build_hex_tensor_moments_device, tensor_hex_moment_cpu,
 };

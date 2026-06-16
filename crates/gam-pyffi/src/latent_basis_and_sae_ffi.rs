@@ -318,7 +318,7 @@ fn latent_aux_prior_stats(
     // log_mu optimum at fixed t + the prior score) live in core; this packs
     // them into the FFI latent-fit plumbing struct.
     let stats =
-        gam::terms::latent_coord::aux_prior_reml_stats(t_mat, targets.view(), aux_strength)?;
+        gam::terms::latent::coord::aux_prior_reml_stats(t_mat, targets.view(), aux_strength)?;
     Ok(LatentAuxPriorStats {
         targets,
         residual_sq: stats.residual_sq,

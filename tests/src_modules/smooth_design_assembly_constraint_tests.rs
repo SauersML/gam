@@ -4699,13 +4699,13 @@ fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
     theta_m[psi_idx] -= h;
     let (cost_p, _, _) = eval_at(
         &theta_p,
-        crate::solver::rho_optimizer::OuterEvalOrder::ValueOnly,
+        crate::solver::rho_optimizer::OuterEvalOrder::Value,
         &mut cache,
         &mut evaluator,
     );
     let (cost_m, _, _) = eval_at(
         &theta_m,
-        crate::solver::rho_optimizer::OuterEvalOrder::ValueOnly,
+        crate::solver::rho_optimizer::OuterEvalOrder::Value,
         &mut cache,
         &mut evaluator,
     );

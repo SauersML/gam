@@ -1,11 +1,8 @@
-// Pull in only the GPU gate from the shared test helpers via #[path],
-// avoiding the `common::fixtures` module entirely: this binary uses none
-// of those synthetic-data fixtures, so including them would surface
-// per-binary `dead_code` warnings under the workspace's
-// `warnings = "deny"` lint policy.
-#[path = "../common/gpu_gate.rs"]
-mod gpu_gate;
-use gpu_gate::{GpuGate, gpu_gate};
+// The GPU-skip gate is declared once at the crate root (tests/arrow_gpu.rs);
+// per-binary mod inclusions would trip clippy::duplicate_mod, and the
+// `common::fixtures` helpers are intentionally not pulled in here so this
+// binary stays clear of `dead_code` warnings under `warnings = "deny"`.
+use crate::gpu_gate::{GpuGate, gpu_gate};
 use ndarray::{Array1, Array2};
 
 fn close(a: f64, b: f64, tol: f64) -> bool {

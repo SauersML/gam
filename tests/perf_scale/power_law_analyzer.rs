@@ -9,9 +9,7 @@
 //! computation) silently lets bad data drive large-scale-budget verdicts.
 //! Pin the policy down with these tests.
 
-mod power_law_common;
-
-use power_law_common::{PowerLawFit, fit_power_law, report_power_law_full};
+use crate::power_law_common::{PowerLawFit, fit_power_law, report_power_law_full};
 
 /// Fit a clean `y = 2 · x^1.5` line and verify recovery to ~10 significant
 /// figures (log-log OLS on noiseless data is exact up to roundoff).

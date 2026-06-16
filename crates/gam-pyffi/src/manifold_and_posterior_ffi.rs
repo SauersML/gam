@@ -2672,7 +2672,7 @@ fn sae_ibp_map_value_grad<'py>(
         }
     }
     let (value, grad) =
-        gam::terms::sae::manifold::ibp_map_row_value_grad(logits_view.view(), temperature, alpha);
+        gam::terms::sae::assignment::ibp_map_row_value_grad(logits_view.view(), temperature, alpha);
     Ok((
         value.into_pyarray(py).unbind(),
         grad.into_pyarray(py).unbind(),

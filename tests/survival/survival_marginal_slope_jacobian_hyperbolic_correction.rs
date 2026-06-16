@@ -62,9 +62,7 @@ use ndarray::{Array1, Array2, Array3};
 use std::any::Any;
 use std::sync::Arc;
 
-#[path = "../common/fixtures.rs"]
-mod fixtures;
-use fixtures::Splitmix64;
+use crate::fixtures::Splitmix64;
 
 /// Numerically differentiate `eta_fn: R^p → R^m` at `beta` using central
 /// differences with step size `eps`. Returns the `(m, p)` Jacobian matrix

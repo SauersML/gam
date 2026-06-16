@@ -2,6 +2,10 @@
 //!
 //! Former top-level crates included as modules so they link as ONE binary.
 
+#[macro_use]
+#[path = "common/mod.rs"]
+mod common;
+
 #[path = "autodiff/analytic_ard_penalty_logdet_derivatives_match_finite_difference.rs"]
 mod analytic_ard_penalty_logdet_derivatives_match_finite_difference;
 #[path = "autodiff/analytic_penalty_nested_prefix_dispatch_missing.rs"]

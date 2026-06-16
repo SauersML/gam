@@ -6043,7 +6043,7 @@ fn equivariant_penalty_value<'py>(
     log_bandwidth: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<f64> {
     let log_bandwidth = log_bandwidth.as_ref().map(|values| values.as_array());
-    gam::terms::equivariant_penalty::equivariant_penalty_value(
+    gam::terms::analytic_penalties::equivariant_penalty::equivariant_penalty_value(
         group.as_str(),
         w.as_array(),
         g.as_array(),

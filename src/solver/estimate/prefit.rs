@@ -12,10 +12,10 @@ pub(crate) fn validate_penalty_specs(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct PrefitSeparationDiagnostic {
-    column_index: usize,
-    threshold: f64,
-    positive_above_threshold: bool,
+pub(crate) struct PrefitSeparationDiagnostic {
+    pub(crate) column_index: usize,
+    pub(crate) threshold: f64,
+    pub(crate) positive_above_threshold: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,7 +26,7 @@ struct PrefitLinearSeparationDiagnostic {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum PrefitRegularityDiagnostic {
+pub(crate) enum PrefitRegularityDiagnostic {
     RankDeficient {
         rank: usize,
         num_unpenalized_columns: usize,
@@ -105,7 +105,7 @@ fn unpenalized_column_indices(unpenalized_columns: &[bool]) -> Vec<usize> {
         .collect()
 }
 
-fn detect_prefit_unpenalized_rank_deficiency_in_design(
+pub(crate) fn detect_prefit_unpenalized_rank_deficiency_in_design(
     w: ArrayView1<'_, f64>,
     x: &DesignMatrix,
     unpenalized_columns: &[bool],
@@ -306,7 +306,7 @@ fn separator_from_column_extrema(
     None
 }
 
-fn detect_prefit_binomial_single_column_separation_in_design(
+pub(crate) fn detect_prefit_binomial_single_column_separation_in_design(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: &DesignMatrix,

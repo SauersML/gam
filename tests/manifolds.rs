@@ -49,7 +49,7 @@ mod sphere_exp_map_vjp_matches_finite_difference;
 #[path = "manifolds/sphere_harmonic_default_degree.rs"]
 mod sphere_harmonic_default_degree;
 #[path = "manifolds/sphere_harmonic_large_L_stability.rs"]
-mod sphere_harmonic_large_L_stability;
+mod sphere_harmonic_large_l_stability;
 #[path = "manifolds/sphere_high_freq_truth_robust.rs"]
 mod sphere_high_freq_truth_robust;
 #[path = "manifolds/sphere_integration.rs"]

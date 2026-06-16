@@ -1,5 +1,6 @@
 use super::*;
-use crate::solver::estimate::{DP_FLOOR, smooth_floor_dp};
+use crate::solver::estimate::smooth_floor_dp;
+use crate::solver::estimate::smoothing_correction::DP_FLOOR;
 use approx::assert_relative_eq;
 use ndarray::array;
 

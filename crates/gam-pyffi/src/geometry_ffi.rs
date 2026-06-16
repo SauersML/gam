@@ -705,7 +705,7 @@ fn equivariant_gauge_companion_loss<'py>(
     let aux_owned = aux_values.as_array().to_owned();
     let theta_owned = theta.as_array().to_owned();
     detach_py_result(py, "equivariant_gauge_companion_loss", move || {
-        gam::terms::equivariant_penalty::gauge_companion_loss(
+        gam::terms::analytic_penalties::equivariant_penalty::gauge_companion_loss(
             aux_owned.view(),
             theta_owned.view(),
             d_aux,
@@ -3607,7 +3607,7 @@ impl NuclearNormPenalty {
 /// all consume this same FFI.
 #[pyfunction]
 fn identifiability_check_json(input: &str) -> PyResult<String> {
-    gam::inference::identifiability_precondition_checks::identifiability_check_json(input)
+    gam::identifiability::precondition::identifiability_check_json(input)
         .map_err(py_value_error)
 }
 
@@ -4304,7 +4304,7 @@ fn diagnostics_aux_richness<'py>(
     latents: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<Py<PyDict>> {
     let m =
-        gam::inference::identifiability_kernels::aux_richness_metrics(aux.as_array(), latents.as_array());
+        gam::identifiability::kernel::aux_richness_metrics(aux.as_array(), latents.as_array());
     let dict = PyDict::new(py);
     dict.set_item("aux_observed", m.aux_observed)?;
     dict.set_item("n_nonfinite_aux", m.n_nonfinite_aux)?;
@@ -4348,7 +4348,7 @@ fn diagnostics_jacobian_sparsity<'py>(
             rows, n_samples
         )));
     }
-    let m = gam::inference::identifiability_kernels::jacobian_sparsity_metrics(
+    let m = gam::identifiability::kernel::jacobian_sparsity_metrics(
         jacobians_flat.as_array(),
         n_samples,
         zero_threshold,
@@ -4379,7 +4379,7 @@ fn diagnostics_anchor_consistency<'py>(
             anchor_dominance
         )));
     }
-    let m = gam::inference::identifiability_kernels::anchor_consistency_metrics(
+    let m = gam::identifiability::kernel::anchor_consistency_metrics(
         assignments.as_array(),
         anchor_dominance,
     );
@@ -4401,7 +4401,7 @@ fn diagnostics_concat_decoder_blocks<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let views: Vec<_> = blocks.iter().map(|b| b.as_array()).collect();
     let out =
-        gam::inference::identifiability_kernels::concat_decoder_blocks(&views).map_err(py_value_error)?;
+        gam::identifiability::kernel::concat_decoder_blocks(&views).map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
 }
 

@@ -3904,33 +3904,6 @@ impl<'a> RemlState<'a> {
         (norm.is_finite() && norm >= 0.0).then_some(norm)
     }
 
-    // The test diagnostic `objective_logdet_h_proj` lives below in
-    // the `tests_diagnostics` impl block. It returns the *projected*
-    // Hessian log-determinant `log|U_Sᵀ H U_S|_+` on the identified
-    // `range(S_+)` subspace evaluated at the PIRLS state driven to
-    // convergence at this `rho`. Production REML/LAML cost reads the
-    // same sum via `hop.logdet() + hessian_logdet_correction` (the
-    // latter carries the `log|H_proj| − hop.logdet()` correction
-    // from the dense_assembly rank-deficiency fix), so centered
-    // finite-differencing the projected logdet across nearby `theta`
-    // gives the analytic `d/dψ log|H_proj|` that the production
-    // trace formula computes — *not* the full-space
-    // `d/dψ log|H_full|`, which differs by the `null(S)` directions'
-    // contribution and is the wrong FD reference for the projected
-    // LAML cost identity. Used by
-    // `iso_kappa_duchon_penalty_subspace_projection_pins_trace`'s
-    // INVARIANT 2. The `cfg(test)`-gated method lives in the child
-    // mod so production builds carry no test-only inherent methods
-    // on this type.
-
-    // Test diagnostic `debug_eta_w_c` (returning
-    // `(final_eta, finalweights, solve_c_array)` at the PIRLS state
-    // produced by driving the solver to convergence at this `rho`)
-    // lives in the `tests_diagnostics` impl block below. Used by
-    // the iso-κ Duchon FD probe to test whether the analytic
-    // `c · dη/dψ_total` per-row diagonal matches FD
-    // `c · (η_+ − η_−) / 2h`.
-
     pub(crate) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
         let beta_t = pr.beta_transformed.as_ref();

@@ -2,6 +2,9 @@
 //!
 //! Former top-level crates included as modules so they link as ONE binary.
 
+#[path = "common/gpu_gate.rs"]
+mod gpu_gate;
+
 #[path = "arrow_gpu/arrow_schur_block_solve_matches_dense_identity.rs"]
 mod arrow_schur_block_solve_matches_dense_identity;
 #[path = "arrow_gpu/arrow_schur_complement_matches_dense_reference.rs"]

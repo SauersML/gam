@@ -296,7 +296,7 @@ impl BernoulliMarginalSlopePredictor {
         Ok(eta.mapv(normal_pdf))
     }
 
-    fn probit_frailty_scale(&self) -> f64 {
+    pub(crate) fn probit_frailty_scale(&self) -> f64 {
         marginal_slope_probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
@@ -1025,7 +1025,7 @@ impl BernoulliMarginalSlopePredictor {
         })
     }
 
-    fn theta(&self) -> Array1<f64> {
+    pub(crate) fn theta(&self) -> Array1<f64> {
         let total = self.beta_marginal.len()
             + self.beta_logslope.len()
             + self.beta_score_warp.as_ref().map_or(0, |b| b.len())
@@ -1161,7 +1161,7 @@ impl BernoulliMarginalSlopePredictor {
         Ok(root)
     }
 
-    fn final_eta_and_gradient_from_theta(
+    pub(crate) fn final_eta_and_gradient_from_theta(
         &self,
         input: &PredictInput,
         theta: &Array1<f64>,

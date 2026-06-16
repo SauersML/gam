@@ -1,3 +1,9 @@
+use super::external_options::resolve_external_family;
+use super::optimizer::external_reml_seed_config;
+use super::prefit::{
+    PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
+    detect_prefit_unpenalized_rank_deficiency_in_design,
+};
 use super::reml::hyper::link_binomial_aux;
 use super::*;
 use crate::linalg::utils::{StableSolver, max_abs_diag};

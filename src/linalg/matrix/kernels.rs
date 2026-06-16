@@ -317,7 +317,7 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
 impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
     /// Combined row chunk: [kernel_chunk | poly_chunk]. Reuses the cached
     /// materialization when available to avoid recomputing kernel evaluations.
-    fn row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
+    pub(crate) fn row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
         if let Some(combined) = self.materialized_combined() {
             return combined.slice(s![rows, ..]).to_owned();
         }

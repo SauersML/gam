@@ -142,7 +142,7 @@ pub(crate) use gam::terms::basis::{
     spherical_spline_design_jet,
 };
 
-pub(crate) use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
+pub(crate) use gam::terms::basis::input_loc_derivatives::contract_input_loc_gradient;
 
 pub(crate) use gam::terms::decoders::interchange_decoder::{
     InterchangeDecodeForward as CoreInterchangeDecodeForward,
@@ -153,9 +153,9 @@ pub(crate) use gam::terms::decoders::interchange_decoder::{
     interchange_swap_forward as core_interchange_swap_forward,
 };
 
-pub(crate) use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
+pub(crate) use gam::terms::latent::coord::{AuxPriorFamily, aux_prior_targets};
 
-pub(crate) use gam::terms::linear_dictionary::{
+pub(crate) use gam::terms::dictionary::linear::{
     LinearDictionaryAssignment, LinearDictionaryConfig, fit_linear_dictionary,
 };
 

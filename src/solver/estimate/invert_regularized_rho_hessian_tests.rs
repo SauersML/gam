@@ -1,4 +1,4 @@
-use super::{EigenClassification, invert_regularized_rho_hessian};
+use super::smoothing_correction::{EigenClassification, invert_regularized_rho_hessian};
 use ndarray::Array2;
 
 /// Build a real symmetric n×n matrix with a specified eigenvalue spectrum

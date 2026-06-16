@@ -46,6 +46,8 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ndarray::{Array1, Array2};
 use std::hint::black_box;
 
+use gam::terms::analytic_penalties::PenaltyOp;
+use gam::terms::basis::ClosedFormPenaltyOperator;
 use gam::terms::basis::{
     MaternNu, closed_form_aniso_psi_derivatives_in_total_basis, closed_form_anisotropic_pair_block,
     closed_form_matern_pair_block,
@@ -55,8 +57,6 @@ use gam::terms::basis::{
     },
     closed_form_psi_derivatives_in_total_basis,
 };
-use gam::terms::closed_form_operator::ClosedFormPenaltyOperator;
-use gam::terms::penalty_op::PenaltyOp;
 
 // Production-ish parameters: m=2 polyharmonic, s=8 Matérn order, κ=1, d=8.
 // η is zeroed (isotropic limit b_k=1 across axes); this still exercises the
@@ -383,14 +383,15 @@ fn bench_hessian_solve_dense_vs_implicit(c: &mut Criterion) {
         });
 
         // Implicit path: PCG with operator-form penalty.
-        let op_dyn: std::sync::Arc<dyn gam::terms::penalty_op::PenaltyOp> = op_inner.clone();
+        let op_dyn: std::sync::Arc<dyn gam::terms::analytic_penalties::PenaltyOp> =
+            op_inner.clone();
         let xtwx_for_closure = xtwx.clone();
         group.bench_with_input(BenchmarkId::new("implicit_pcg", k), &k, |b, _| {
             b.iter(|| {
                 let mut dir = Array1::<f64>::zeros(p);
                 let xt = xtwx_for_closure.clone();
                 let apply_xtwx = move |v: &Array1<f64>| -> Array1<f64> { xt.dot(v) };
-                let op_pen: &dyn gam::terms::penalty_op::PenaltyOp = op_dyn.as_ref();
+                let op_pen: &dyn gam::terms::analytic_penalties::PenaltyOp = op_dyn.as_ref();
                 let _ = gam::solver::pirls::solve_newton_direction_implicit(
                     apply_xtwx,
                     xtwx_diag.view(),

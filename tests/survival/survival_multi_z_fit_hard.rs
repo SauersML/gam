@@ -37,9 +37,7 @@ use gam::families::survival::marginal_slope::{
 use gam::probability::{normal_cdf, normal_pdf};
 use ndarray::{Array1, Array2};
 
-#[path = "../common/fixtures.rs"]
-mod fixtures;
-use fixtures::Splitmix64;
+use crate::fixtures::Splitmix64;
 
 /// Draw two independent standard normals. Each call to `Splitmix64::next_gauss`
 /// performs one Box-Muller step and discards the second sample; the pair form
