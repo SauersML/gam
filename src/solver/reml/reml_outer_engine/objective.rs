@@ -104,6 +104,17 @@ pub fn reml_laml_evaluate(
 
     let log_det_h = hop.logdet() + solution.hessian_logdet_correction;
     let log_det_s = solution.penalty_logdet.value;
+    // The penalty-quadratic term `½ β̂ᵀSβ̂` enters the cost ONLY through this
+    // atom (#931): its `value()` carries the production stable-basis scalar
+    // `½ · stable_penalty_term`, the SAME `value()` the full gradient-bearing
+    // `PenaltyQuadAtom` (built downstream for `rho_frozen_d1`) exposes. The cost
+    // can no longer read a raw `solution.penalty_quadratic` that the gradient
+    // atom does not own — value and ρ-derivative are projections of one atom.
+    let penalty_quad_value_atom =
+        crate::solver::reml::atoms::PenaltyQuadAtom::stable_value_only(
+            0.5 * solution.penalty_quadratic,
+        );
+    let penalty_quad_value = penalty_quad_value_atom.value();
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             // Gaussian REML with profiled scale:
@@ -124,7 +135,10 @@ pub fn reml_laml_evaluate(
             // rescale) cancels the inflation, so the ProfiledGaussian cost
             // VALUE — not just its argmin — is exactly invariant, matching mgcv
             // (the profiled σ̂² absorbs the c factor).
-            let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
+            // `dp_raw = deviance + penalty = −2ℓ + βᵀSβ`. The atom carries the
+            // ½-scaled penalty energy, so the deviance-scale (un-halved) penalty
+            // is `2 · penalty_quad_value`.
+            let dp_raw = -2.0 * solution.log_likelihood + 2.0 * penalty_quad_value;
             let (dp_c, dp_cgrad, dp_cgrad2) = smooth_floor_dp(dp_raw, solution.dp_floor_scale);
             let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
             let phi = dp_c / denom;
@@ -164,17 +178,14 @@ pub fn reml_laml_evaluate(
             let logdet_pair_h = if *include_logdet_h { log_det_h } else { 0.0 };
             let logdet_pair_s = if *include_logdet_s { log_det_s } else { 0.0 };
             let cost_logdet_diff = 0.5 * (logdet_pair_h - logdet_pair_s);
-            let mut cost =
-                cost_logdet_diff + (-solution.log_likelihood) + 0.5 * solution.penalty_quadratic;
+            let mut cost = cost_logdet_diff + (-solution.log_likelihood) + penalty_quad_value;
             if *include_logdet_h {
                 // Firth `−½ log|J|`: VALUE here, ρ-DERIVATIVE folded into the
-                // per-coordinate LAML trace (`a_i`) below — already paired by
-                // construction, so it is NOT routed through `GuardedCorrection`.
-                // The Tierney–Kadane correction, by contrast, is a genuinely
-                // loose `(tk_correction, tk_gradient)` pair; it flows through a
-                // single `GuardedCorrection` object (built below) whose one
-                // `include` guard gates BOTH its value and its ρ-gradient, so
-                // the two can never desync.
+                // per-coordinate LAML trace (`a_i`) below — paired by
+                // construction through the Jeffreys operator. Tierney-Kadane
+                // is applied by `RemlState::apply_theta_correction_atom_to_result`
+                // after the unified evaluator returns, so this core evaluator
+                // no longer carries a loose TK value/gradient pair.
                 cost -= solution
                     .firth
                     .as_ref()
@@ -339,23 +350,6 @@ pub fn reml_laml_evaluate(
         } => (*include_logdet_h, *include_logdet_s),
     };
 
-    // Build the Tierney–Kadane frozen-curvature correction as ONE object that
-    // owns the single `include` guard. Its VALUE must land on the cost before
-    // the `EvalMode::ValueOnly` early return below, and its ρ-GRADIENT lands on
-    // `grad` further down — but BOTH read `include` from this same object, so
-    // the two contributions cannot desync (the structural cure for the
-    // objective↔gradient drift class behind #752/#748/#808). Historically the
-    // value was added inside the dispersion match and the gradient added at the
-    // gradient site, each under an independently hand-written
-    // `if include_logdet_h { … }` guard — exactly the divergence shape this
-    // type makes impossible.
-    let tk_correction = GuardedCorrection::new(
-        solution.tk_correction,
-        solution.tk_gradient.clone(),
-        incl_logdet_h,
-    );
-    tk_correction.apply_value(&mut cost);
-
     if !cost.is_finite() {
         return Err(RemlError::NonFiniteValue {
             reason: format!(
@@ -418,11 +412,16 @@ pub fn reml_laml_evaluate(
     // Keep the dependency-ordered BFGS/line-search loops serial, but use rayon
     // here so each accepted outer iterate evaluates its objective derivatives
     // by farming out the per-coordinate Hessian/gradient work.
+    // The full gradient-bearing penalty atom. It carries the SAME stable-basis
+    // value the cost above consumed, so `value()` and `rho_frozen_d1` are
+    // projections of one object (and any `CriterionSum` built from this atom
+    // reports the numerically-sound stable energy, not the original-basis sum).
     let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
         &lambdas,
         &solution.penalty_coords,
         &solution.beta,
-    )?;
+    )?
+    .with_stable_value(0.5 * solution.penalty_quadratic);
     let curvature_penalty_quad_atom =
         crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
             &curvature_lambdas,
@@ -705,7 +704,7 @@ pub fn reml_laml_evaluate(
         let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
         let generic_ops: Vec<&dyn HyperOperator> = operators.iter().map(|op| op.as_ref()).collect();
         let implicit_ops: Vec<&ImplicitHyperOperator> =
-            operators.iter().filter_map(|op| op.as_implicit()).collect();
+            operators.iter().filter_map(|op| as_implicit(op.as_ref())).collect();
 
         // ── Block 2.5: GPU-adaptive Hutchinson bypass.
         //
@@ -1202,16 +1201,6 @@ pub fn reml_laml_evaluate(
     // (The ψ/ext gradient KKT-residual correction is now part of the unified
     // `kkt_theta_corrections.gradient` folded into `grad` above — see the
     // full-θ correction block before the ext-gradient assembly.)
-
-    // Apply the ρ-GRADIENT half of the guarded Tierney–Kadane correction built
-    // above (its VALUE half was applied to `cost` before the value-only early
-    // return). Both halves read the SAME `include` guard from the SAME
-    // `tk_correction` object, so the value and derivative cannot desync — a
-    // `MaxPenalizedLikelihood`-style assembly (`include_logdet_h = false`)
-    // carrying a nonzero `tk_correction` omits BOTH, never one without the
-    // other. (The runtime `apply_tk_to_result` path is independently paired —
-    // it always applies value+gradient+hessian together.)
-    tk_correction.apply_gradient(&mut grad);
 
     // Add prior gradient (ρ-only).
     if let Some((_, ref pg, _)) = prior_cost_gradient {

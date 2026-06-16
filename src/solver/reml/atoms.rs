@@ -563,6 +563,24 @@ pub struct PenaltyQuadAtom {
     /// and EFS assembly read these instead of reassembling centered
     /// beta-Gaussian prior matvecs at each consumer.
     pub block_penalty_scores: Vec<Array1<f64>>,
+    /// The penalty-quadratic VALUE in the STABLE reparameterized basis,
+    /// `½ · stable_penalty_term` (the PIRLS-emitted
+    /// `penalty_active.shifted_quadratic(β̂_transformed) + ridge‖β̂_transformed‖²`,
+    /// halved to the criterion's `½βᵀSβ` convention). `Some` when the atom is
+    /// built from the converged inner solve (the live LAML cost path);
+    /// `value()` then returns THIS stable scalar rather than the original-basis
+    /// `½ Σ λ_k q_k`, which cancels catastrophically at large λ.
+    ///
+    /// Why value and gradient stay coherent across the two bases: the
+    /// reparameterization is a FIXED linear map at frozen β̂, so
+    /// `½ Σ_j λ_j q_j` is basis-invariant as a function value — only its
+    /// floating-point evaluation differs — and `∂/∂ρ_k = ½ λ_k q_k` (the
+    /// `rho_frozen_d1` emission) is the exact derivative of EITHER spelling.
+    /// Carrying the stable scalar here makes `value()` and `frozen_d1()`
+    /// projections of one object that owns the numerically-sound spelling, so
+    /// the cost can no longer read a raw penalty scalar the gradient atom does
+    /// not own (the #931 structural kill, without the large-λ cancellation).
+    pub stable_value: Option<f64>,
 }
 
 impl PenaltyQuadAtom {
@@ -622,7 +640,44 @@ impl PenaltyQuadAtom {
             block_quadratics,
             penalty_score,
             block_penalty_scores,
+            stable_value: None,
         })
+    }
+
+    /// Value-only carrier: a `PenaltyQuadAtom` holding ONLY the stable-basis
+    /// penalty energy `½ · stable_penalty_term`, with empty block/score state.
+    ///
+    /// The live LAML cost is assembled (and may early-return for `ValueOnly`)
+    /// before the full gradient-bearing atom is built, so the cost reads the
+    /// penalty scalar through this lightweight carrier — making `value()` the
+    /// SINGLE source of the penalty term in the cost, the same `value()` the
+    /// full gradient atom exposes. `frozen_d1`/`beta_channel` are inert here (no
+    /// blocks), which is correct: a value-only carrier contributes no
+    /// derivative; the gradient flows through the full atom built downstream.
+    pub(crate) fn stable_value_only(half_stable_penalty_term: f64) -> Self {
+        Self {
+            lambdas: Array1::zeros(0),
+            block_quadratics: Array1::zeros(0),
+            penalty_score: Array1::zeros(0),
+            block_penalty_scores: Vec::new(),
+            stable_value: Some(half_stable_penalty_term),
+        }
+    }
+
+    /// Attach the production STABLE-basis penalty value (`½ · stable_penalty_term`).
+    ///
+    /// The inner solve already evaluated the penalty energy in the stable
+    /// reparameterized basis (where `βᵀSβ` does not cancel at large λ); this
+    /// records `½ · stable_penalty_term` as the atom's authoritative
+    /// [`value`](CriterionAtom::value), so the live LAML cost reads the penalty
+    /// scalar FROM the same atom whose `frozen_d1` supplies its ρ-derivative.
+    /// The original-basis `block_quadratics` are retained: they feed
+    /// `rho_frozen_d1` (the `½ λ_k q_k` per-block derivative, basis-invariant at
+    /// frozen β̂) and remain the closed-form `value()` fallback when no stable
+    /// scalar is supplied (the standalone-atom test path).
+    pub(crate) fn with_stable_value(mut self, half_stable_penalty_term: f64) -> Self {
+        self.stable_value = Some(half_stable_penalty_term);
+        self
     }
 
     /// Fixed-β derivative with respect to `ρ_idx = log λ_idx`.
@@ -644,13 +699,19 @@ impl CriterionAtom for PenaltyQuadAtom {
         "penalty_quadratic"
     }
     fn value(&self) -> f64 {
-        // ½ Σ_k λ_k q_k.
-        0.5 * self
-            .lambdas
-            .iter()
-            .zip(self.block_quadratics.iter())
-            .map(|(&lam, &q)| lam * q)
-            .sum::<f64>()
+        // The stable-basis scalar when the atom was built from the converged
+        // inner solve (the live LAML cost); otherwise the original-basis
+        // closed form ½ Σ_k λ_k q_k (standalone-atom path). Both are the same
+        // mathematical penalty energy; the stable spelling avoids large-λ
+        // cancellation.
+        self.stable_value.unwrap_or_else(|| {
+            0.5 * self
+                .lambdas
+                .iter()
+                .zip(self.block_quadratics.iter())
+                .map(|(&lam, &q)| lam * q)
+                .sum::<f64>()
+        })
     }
     fn frozen_d1(&self, dir: &ThetaDirection) -> f64 {
         // ∂/∂ρ_k of ½ λ_k q_k at fixed β̂ is ½ λ_k q_k (since ∂λ_k/∂ρ_k = λ_k).
@@ -1440,6 +1501,7 @@ mod tests {
             block_quadratics: array![2.0, 4.0],
             penalty_score: array![1.5, -0.5],
             block_penalty_scores: vec![array![1.0, 0.0], array![0.5, -0.5]],
+            stable_value: None,
         };
         assert_eq!(atom.name(), "penalty_quadratic");
         assert!((atom.value() - 13.0).abs() < 1e-12);
@@ -1506,6 +1568,96 @@ mod tests {
             .expect("centered penalty atom declares beta channel");
         assert_eq!(centered_channel.grad_beta, array![4.0, 8.0]);
         assert_eq!(centered_atom.block_penalty_scores()[0], array![4.0, 8.0]);
+    }
+
+    /// #931 production routing: the penalty-quadratic VALUE the live LAML cost
+    /// consumes is the atom's stable-basis `value()`, and the SAME atom's
+    /// `rho_frozen_d1` is the exact ρ-derivative of that value.
+    ///
+    /// 1. `stable_value_only(s).value() == s` — the lightweight cost-side
+    ///    carrier returns exactly the stable scalar the cost reads (no
+    ///    original-basis recomputation that could cancel at large λ).
+    /// 2. A full atom built from real penalty coords, given `with_stable_value(s)`,
+    ///    returns `s` from `value()` (stable spelling) WHILE its `rho_frozen_d1`
+    ///    stays the original-basis `½ λ_k q_k` — and that derivative equals the
+    ///    centered FD of `½ Σ_j λ_j(ρ) q_j` in ρ (so value and gradient are the
+    ///    same energy: the gradient IS d/dρ of the value, basis-invariant).
+    /// 3. With no stable value attached, `value()` falls back to the
+    ///    original-basis closed form — the standalone-atom path is unchanged.
+    #[test]
+    pub(crate) fn penalty_quad_atom_stable_value_matches_production_and_gradient_is_rho_derivative()
+    {
+        // (1) Value-only carrier returns the stable scalar verbatim.
+        let carrier = PenaltyQuadAtom::stable_value_only(7.25);
+        assert!((carrier.value() - 7.25).abs() < 1e-12);
+        assert_eq!(carrier.name(), "penalty_quadratic");
+        // Inert derivative/channel for the value-only carrier (no blocks).
+        let dir0 = ThetaDirection {
+            index: Some(0),
+            beta_dot: Some(Arc::new(array![0.0, 0.0])),
+            h_dot_total: None,
+        };
+        assert_eq!(carrier.frozen_d1(&dir0), 0.0);
+        assert!(carrier.beta_channel().is_some()); // empty score, but present
+        assert_eq!(
+            carrier.beta_channel().unwrap().grad_beta.len(),
+            0,
+            "value-only carrier has no β-channel mass"
+        );
+
+        // (2) Full atom: two blocks, β = (2, 3), μ = 0, R = I ⇒ q = (β₀², β₁²)
+        // per block selecting one coordinate. Build λ-dependent value and check
+        // rho_frozen_d1 == d/dρ_k of ½ Σ λ_j q_j.
+        let beta = array![2.0_f64, 3.0];
+        // Block 0 penalizes coordinate 0 (root e₀ᵀ), block 1 coordinate 1.
+        let coord0 = PenaltyCoordinate::from_dense_root_with_mean(
+            array![[1.0, 0.0], [0.0, 0.0]],
+            array![0.0, 0.0],
+        );
+        let coord1 = PenaltyCoordinate::from_dense_root_with_mean(
+            array![[0.0, 0.0], [0.0, 1.0]],
+            array![0.0, 0.0],
+        );
+        let lambdas = [0.7_f64, 1.3];
+        let coords = vec![coord0.clone(), coord1.clone()];
+        let build = |lams: &[f64]| {
+            PenaltyQuadAtom::from_penalty_coords(lams, &coords, &beta).expect("penalty atom")
+        };
+        // q_0 = β₀² = 4, q_1 = β₁² = 9. Stable value (production scalar) =
+        // ½(0.7·4 + 1.3·9) = ½·14.5 = 7.25 — attach it and assert value() uses it.
+        let stable = 0.5 * (lambdas[0] * 4.0 + lambdas[1] * 9.0);
+        let atom = build(&lambdas).with_stable_value(stable);
+        assert!((atom.value() - 7.25).abs() < 1e-12);
+        // rho_frozen_d1(k) = ½ λ_k q_k, the original-basis closed form, retained.
+        assert!((atom.rho_frozen_d1(0) - 0.5 * 0.7 * 4.0).abs() < 1e-12);
+        assert!((atom.rho_frozen_d1(1) - 0.5 * 1.3 * 9.0).abs() < 1e-12);
+
+        // FD: the ρ-derivative is d/dρ_k of the ENERGY value ½ Σ λ_j(ρ) q_j
+        // (λ_j = e^{ρ_j}). Use the original-basis value() of a fresh atom (no
+        // stable override) as the energy-of-ρ oracle and centrally difference.
+        let energy_at = |rho: [f64; 2]| -> f64 {
+            let lams = [rho[0].exp(), rho[1].exp()];
+            build(&lams).value() // no stable override ⇒ ½ Σ λ_j q_j
+        };
+        let rho0 = [lambdas[0].ln(), lambdas[1].ln()];
+        let h = 1e-6;
+        for k in 0..2 {
+            let mut rp = rho0;
+            let mut rm = rho0;
+            rp[k] += h;
+            rm[k] -= h;
+            let fd = (energy_at(rp) - energy_at(rm)) / (2.0 * h);
+            assert!(
+                (fd - atom.rho_frozen_d1(k)).abs() < 1e-6,
+                "rho_frozen_d1[{k}] {} vs FD-of-value {}",
+                atom.rho_frozen_d1(k),
+                fd
+            );
+        }
+
+        // (3) No stable value ⇒ value() is the original-basis closed form 7.25.
+        let plain = build(&lambdas);
+        assert!((plain.value() - 7.25).abs() < 1e-12);
     }
 
     /// Per-atom isolation + value↔gradient consistency check for the Jeffreys
@@ -1941,6 +2093,7 @@ mod tests {
             block_quadratics: array![2.0, 4.0],
             penalty_score: array![2.0, 1.0],
             block_penalty_scores: vec![array![2.0, 0.0], array![0.0, 1.0]],
+            stable_value: None,
         };
         // hess.frozen_d1 = ½ tr(H⁺ Ḣ) = ½(0.5·0.5 + 0.25·1.5) = 0.3125.
         assert!((hess.frozen_d1(&dir) - 0.3125).abs() < 1e-12);

@@ -893,12 +893,11 @@ pub(crate) fn try_tangent_projected_evaluate(
         ));
     }
     // Principled pass-through / projection of optional `InnerSolution`
-    // features.  The cost-side scalars (`tk_correction`, barrier cost at β̂)
-    // are not in β-space and require no projection.  `tk_gradient` is a
-    // ρ-vector and also passes through unchanged.  `hessian_logdet_correction`
-    // encodes a p-space uniform rescale `−p·log α`; under projection the
-    // equivalent correction is `−m·log α`, recovered by the scalar factor
-    // `m/p`.  `barrier_config` propagates to the projected solution so the
+    // features.  Cost-side scalars such as barrier cost at β̂ are not in
+    // β-space and require no projection.  `hessian_logdet_correction` encodes
+    // a p-space uniform rescale `−p·log α`; under projection the equivalent
+    // correction is `−m·log α`, recovered by the scalar factor `m/p`.
+    // `barrier_config` propagates to the projected solution so the
     // barrier-derivative wrapper still augments dH/dρ; the tangent operator
     // applies `ZᵀMZ` correctly in its trace methods.
     //
@@ -1024,8 +1023,6 @@ pub(crate) fn try_tangent_projected_evaluate(
         penalty_coords: solution.penalty_coords.clone(),
         penalty_logdet: projected_logdet,
         deriv_provider: Box::new(BorrowedDerivProvider(solution.deriv_provider.as_ref())),
-        tk_correction: solution.tk_correction,
-        tk_gradient: solution.tk_gradient.clone(),
         // Same operator, projection-aware scalar contribution.
         firth: projected_firth,
         hessian_logdet_correction: projected_hlogdet_correction,
