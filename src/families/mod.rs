@@ -1,10 +1,12 @@
 pub mod bernoulli_marginal_slope_identifiability;
 pub mod binomial_multi;
 pub mod bms;
+pub mod block_layout;
 pub mod cell_moment_family;
 pub(crate) mod coefficient_cost;
 pub mod cubic_cell_kernel;
 pub mod custom_family;
+pub mod fnv;
 pub mod gamlss;
 pub mod identifiability_compiler;
 pub(crate) mod identifiability_gpu;
