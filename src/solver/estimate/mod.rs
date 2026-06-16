@@ -8492,7 +8492,7 @@ where
     Ok((cost, ridge))
 }
 
-#[path = "reml/mod.rs"]
+#[path = "../reml/mod.rs"]
 pub(crate) mod reml;
 
 pub use reml::unified::PenaltyCoordinate;
