@@ -538,7 +538,9 @@ impl SaeManifoldTerm {
                     .iter()
                     .map(|view| {
                         view.as_ref().and_then(|v| {
-                            crate::terms::sae::identifiability::isometry_orbit_penalty_operator(v, 1.0)
+                            crate::terms::sae::identifiability::isometry_orbit_penalty_operator(
+                                v, 1.0,
+                            )
                         })
                     })
                     .collect()
@@ -549,7 +551,11 @@ impl SaeManifoldTerm {
             // The pin-active path consumes the per-row Jacobian curvature
             // directly (the certificate_model retains it under a pin), so route
             // through the non-streamed exact entry point.
-            crate::terms::sae::identifiability::residual_gauge_exact(&certificate_model, &views, &ops)?
+            crate::terms::sae::identifiability::residual_gauge_exact(
+                &certificate_model,
+                &views,
+                &ops,
+            )?
         } else {
             let (curvature_gram, root_rows) = streamed_curvature.ok_or_else(|| {
                 "fit_diagnostics_report: missing streamed residual-gauge curvature for unpinned exact path"
@@ -571,7 +577,8 @@ impl SaeManifoldTerm {
         // harvested inner fit degrade their inference fields to `None` inside
         // `atom_inference_reports`, so this is always populated (one entry per
         // atom) and never gated by a flag.
-        let atom_inference = crate::terms::sae::identifiability::atom_inference_reports(&certificate_model);
+        let atom_inference =
+            crate::terms::sae::identifiability::atom_inference_reports(&certificate_model);
 
         Ok(SaeManifoldFitDiagnostics {
             atom_two_lens,
@@ -3164,49 +3171,49 @@ impl SaeManifoldTerm {
         let row_layout: Option<SaeRowLayout> = match forced_layout {
             Some(layout) => layout,
             None => match self.assignment.mode {
-            AssignmentMode::JumpReLU {
-                threshold,
-                temperature,
-            } => Some(SaeRowLayout::from_jumprelu(
-                n,
-                k_atoms,
-                threshold,
-                temperature,
-                &self.assignment.logits,
-                coord_dims.clone(),
-                self.assignment.coord_offsets(),
-            )),
-            AssignmentMode::Softmax { .. } => None,
-            AssignmentMode::IBPMap { .. } => {
-                match self.sparse_active_plan() {
-                    Some((k_active_cap, relative_cutoff)) => {
-                        // Build per-row dense assignments once to derive the
-                        // active set; the row loop re-derives `assignments`
-                        // (cheap gate map at the same rho) and reuses these
-                        // active sets.
-                        let mut assignments_all = Vec::with_capacity(n);
-                        for row in 0..n {
-                            assignments_all
-                                .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+                AssignmentMode::JumpReLU {
+                    threshold,
+                    temperature,
+                } => Some(SaeRowLayout::from_jumprelu(
+                    n,
+                    k_atoms,
+                    threshold,
+                    temperature,
+                    &self.assignment.logits,
+                    coord_dims.clone(),
+                    self.assignment.coord_offsets(),
+                )),
+                AssignmentMode::Softmax { .. } => None,
+                AssignmentMode::IBPMap { .. } => {
+                    match self.sparse_active_plan() {
+                        Some((k_active_cap, relative_cutoff)) => {
+                            // Build per-row dense assignments once to derive the
+                            // active set; the row loop re-derives `assignments`
+                            // (cheap gate map at the same rho) and reuses these
+                            // active sets.
+                            let mut assignments_all = Vec::with_capacity(n);
+                            for row in 0..n {
+                                assignments_all
+                                    .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+                            }
+                            // Absolute cutoff = relative_cutoff · max row peak, so a
+                            // single threshold drops sub-1e-3 mass across all rows.
+                            let peak = assignments_all
+                                .iter()
+                                .flat_map(|a| a.iter())
+                                .fold(0.0_f64, |m, &v| m.max(v.abs()));
+                            let cutoff = relative_cutoff * peak;
+                            Some(SaeRowLayout::from_dense_weights(
+                                &assignments_all,
+                                k_active_cap,
+                                cutoff,
+                                coord_dims.clone(),
+                                self.assignment.coord_offsets(),
+                            ))
                         }
-                        // Absolute cutoff = relative_cutoff · max row peak, so a
-                        // single threshold drops sub-1e-3 mass across all rows.
-                        let peak = assignments_all
-                            .iter()
-                            .flat_map(|a| a.iter())
-                            .fold(0.0_f64, |m, &v| m.max(v.abs()));
-                        let cutoff = relative_cutoff * peak;
-                        Some(SaeRowLayout::from_dense_weights(
-                            &assignments_all,
-                            k_active_cap,
-                            cutoff,
-                            coord_dims.clone(),
-                            self.assignment.coord_offsets(),
-                        ))
+                        None => None,
                     }
-                    None => None,
                 }
-            }
             },
         };
         // #974 likelihood-whitening seam. The single per-row decision: when the

@@ -1,4 +1,3 @@
-
 // ── Phase 7: joint-Hessian directional-derivative subsample tests ──
 
 #[test]
@@ -39,7 +38,6 @@ fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_full_equal
     let rel = rel_diff_array2(&with_full, &baseline);
     assert!(rel < 1e-12, "joint Hessian dH drift rel {}", rel);
 }
-
 
 #[test]
 fn bernoulli_jointhessian_batched_directional_operators_match_single_direction_path() {
@@ -93,7 +91,6 @@ fn bernoulli_jointhessian_batched_directional_operators_match_single_direction_p
         assert!(rel < 1e-12, "batched operator {idx} drift rel {rel}");
     }
 }
-
 
 fn make_flex_hvp_cache_test_family(
     n: usize,
@@ -179,7 +176,6 @@ fn make_flex_hvp_cache_test_family(
     ];
     (family, states)
 }
-
 
 /// gam#683: the axis-projected fast path inside
 /// `row_primary_{third,fourth}_contracted_recompute` must reproduce the
@@ -303,7 +299,6 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
     );
 }
 
-
 #[test]
 fn bernoulli_row_cell_moment_upgrade_reuses_base_partitions_without_lru() {
     let (family, states) = make_flex_hvp_cache_test_family(12);
@@ -358,7 +353,6 @@ fn bernoulli_row_cell_moment_upgrade_reuses_base_partitions_without_lru() {
     assert_eq!(d21.max_degree, 21);
     assert!(d21.covers_all_rows());
 }
-
 
 #[test]
 fn bernoulli_value_cell_moments_use_shared_lru() {
@@ -415,7 +409,6 @@ fn bernoulli_value_cell_moments_use_shared_lru() {
     );
 }
 
-
 #[test]
 fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
     use crate::families::marginal_slope_shared::OuterScoreSubsample;
@@ -462,7 +455,6 @@ fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
     );
 }
 
-
 #[test]
 fn bernoulli_flex_row_primary_hessian_cache_policy_materializes_aou_shape() {
     // large-scale-shaped cache (~629 MiB) under a 16 GiB available-RAM budget:
@@ -487,7 +479,6 @@ fn bernoulli_flex_row_primary_hessian_cache_policy_materializes_aou_shape() {
     );
 }
 
-
 #[test]
 fn bernoulli_flex_row_primary_hessian_cache_policy_streams_when_single_cache_exceeds_ram() {
     // 626 MiB cache vs. only 2 GiB available RAM → single-cache budget is
@@ -506,7 +497,6 @@ fn bernoulli_flex_row_primary_hessian_cache_policy_streams_when_single_cache_exc
         RowPrimaryHessianCacheReason::SingleCacheExceedsRamFraction
     );
 }
-
 
 #[test]
 fn bernoulli_flex_row_primary_hessian_cache_policy_streams_when_global_pin_exhausted() {
@@ -527,7 +517,6 @@ fn bernoulli_flex_row_primary_hessian_cache_policy_streams_when_global_pin_exhau
     );
 }
 
-
 #[test]
 fn bernoulli_flex_row_primary_hessian_cache_policy_streams_low_reuse() {
     let plan = decide_row_primary_hessian_cache(
@@ -541,7 +530,6 @@ fn bernoulli_flex_row_primary_hessian_cache_policy_streams_low_reuse() {
     assert!(!plan.materialize);
     assert_eq!(plan.reason, RowPrimaryHessianCacheReason::ReuseTooLow);
 }
-
 
 #[test]
 fn bernoulli_flex_row_primary_hessian_cache_policy_no_flip_under_memory_pressure() {
@@ -611,7 +599,6 @@ fn bernoulli_flex_row_primary_hessian_cache_policy_no_flip_under_memory_pressure
     );
 }
 
-
 #[test]
 fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
     let (family, states) = make_flex_hvp_cache_test_family(12);
@@ -668,7 +655,6 @@ fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
     let rel_diag = rel_diff_array1(&diag_cached, &diag_uncached);
     assert!(rel_diag < 5e-11, "cached diag drift rel {rel_diag}");
 }
-
 
 #[test]
 fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
@@ -770,7 +756,6 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
     }
 }
 
-
 #[test]
 fn bernoulli_flex_hvp_cache_timing_large_scale_shape_pattern() {
     // Wall-clock micro-benchmark for the per-row primary-Hessian cache
@@ -829,7 +814,6 @@ fn bernoulli_flex_hvp_cache_timing_large_scale_shape_pattern() {
     );
 }
 
-
 #[test]
 fn bernoulli_jointhessian_directional_operator_matches_dense_small_case() {
     let n = 17usize;
@@ -865,7 +849,6 @@ fn bernoulli_jointhessian_directional_operator_matches_dense_small_case() {
     let rel = rel_diff_array2(&operator.to_dense(), &dense);
     assert!(rel < 1e-12, "operator dH rel {}", rel);
 }
-
 
 #[test]
 fn bernoulli_jointhessian_second_directional_operator_matches_dense_small_case() {
@@ -908,7 +891,6 @@ fn bernoulli_jointhessian_second_directional_operator_matches_dense_small_case()
     assert!(rel < 1e-12, "operator d2H rel {}", rel);
 }
 
-
 #[test]
 fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
     let n = 50_001usize;
@@ -928,7 +910,6 @@ fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
         crate::solver::outer_strategy::DeclaredHessianForm::Either
     );
 }
-
 
 #[test]
 fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_half_scales_correctly() {
@@ -982,7 +963,6 @@ fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_half_scale
     let rel = rel_diff_array2(&scaled, &exp);
     assert!(rel < 1e-12, "joint Hessian dH HT rel {}", rel);
 }
-
 
 #[test]
 fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
@@ -1091,7 +1071,6 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
         "with auto_outer_subsample=false the counter must stay at 0"
     );
 }
-
 
 /// #740: the direction-contracted ψψ second-order kernel must reproduce the
 /// exact α-contraction of the per-pair `second_order_terms(i, j)`.
@@ -1257,7 +1236,6 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
         );
     }
 }
-
 
 /// #740: the GENERIC ψψ penalty fold inside `build_contracted_psi_hook` must
 /// reproduce the per-pair `ext_ext` penalty contraction exactly, ON A FIXTURE
@@ -1549,7 +1527,6 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
     );
 }
 
-
 #[test]
 fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
     use crate::families::custom_family::build_psi_hyper_coords;
@@ -1820,7 +1797,6 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         );
     }
 }
-
 
 /// #740 (option B): the INDEPENDENT ground-truth gate — the analytic outer
 /// Hessian over θ=(ρ,ψ) must equal a CENTERED FINITE DIFFERENCE of the outer
@@ -2228,7 +2204,6 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     check(mixed, "mixed-ρψ");
 }
 
-
 /// The single-expression Taylor-jet tower (#932) of the rigid standard-normal
 /// Bernoulli marginal-slope row NLL, written ONCE over `Tower4<2>` primaries
 /// `(η_m, g)`:
@@ -2255,7 +2230,6 @@ struct BernoulliRigidNllProgram {
     family: BernoulliMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
 }
-
 
 impl crate::families::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
     fn n_rows(&self) -> usize {
@@ -2293,7 +2267,6 @@ impl crate::families::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
         Ok(m.compose_unary(unary_derivatives_neglog_phi(m.v, w)))
     }
 }
-
 
 /// #932 universal oracle on the SECOND (and final) production `RowKernel`
 /// impl: `BernoulliRigidRowKernel`.
@@ -2385,7 +2358,6 @@ fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
     }
 }
 
-
 /// The rigid BLAS-3 batched all-axes second-directional override
 /// (`second_directional_derivative_all_axes_dense_override`, the #979 biobank
 /// `coord_corrections` perf lever) must reproduce, for EVERY canonical axis
@@ -2467,13 +2439,9 @@ fn bernoulli_rigid_batched_all_axes_second_directional_matches_per_axis_scatter(
             axis[a] = 1.0;
 
             // (2) Generic per-row BLAS-1 scatter reference.
-            let scatter = row_kernel_second_directional_derivative(
-                &kernel,
-                &RowSet::All,
-                &delta,
-                &axis,
-            )
-            .expect("generic per-axis scatter second directional");
+            let scatter =
+                row_kernel_second_directional_derivative(&kernel, &RowSet::All, &delta, &axis)
+                    .expect("generic per-axis scatter second directional");
 
             let mut max_abs = 0.0_f64;
             let mut max_rel = 0.0_f64;
@@ -2502,7 +2470,6 @@ fn bernoulli_rigid_batched_all_axes_second_directional_matches_per_axis_scatter(
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // #1028 / #905 — Murphy–Topel generated-regressor correction assembly.
 // These pin the engine-agnostic assembly that turns the ONE outstanding
@@ -2527,7 +2494,6 @@ fn murphy_topel_test_calibration() -> LatentZConditionalCalibration {
         var_cov: ndarray::array![[0.03, 0.0], [0.0, 0.01]],
     }
 }
-
 
 #[test]
 fn generated_regressor_correction_is_psd_and_inflates_slope_se_when_gate_fires() {
@@ -2591,7 +2557,6 @@ fn generated_regressor_correction_is_psd_and_inflates_slope_se_when_gate_fires()
     }
 }
 
-
 #[test]
 fn generated_regressor_correction_vanishes_when_all_rows_floored() {
     // When the conditional variance is on the floor for EVERY row, ∂ζ/∂v = 0,
@@ -2621,7 +2586,6 @@ fn generated_regressor_correction_vanishes_when_all_rows_floored() {
          ζ (G = 0); got max |term| = {max_abs:.3e}"
     );
 }
-
 
 #[test]
 fn generated_regressor_correction_matches_explicit_g_accumulation() {
@@ -2677,7 +2641,6 @@ fn generated_regressor_correction_matches_explicit_g_accumulation() {
     }
 }
 
-
 #[test]
 fn rigid_standard_normal_mixed_z_sensitivity_matches_central_difference_of_gradient() {
     // #1028 engine quantity oracle: the per-row mixed (primary, z) partial
@@ -2729,7 +2692,6 @@ fn rigid_standard_normal_mixed_z_sensitivity_matches_central_difference_of_gradi
         );
     }
 }
-
 
 #[test]
 fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
@@ -2837,7 +2799,6 @@ fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
     );
 }
 
-
 // Calibration whose basis conditions on the slope covariate a(C) = marginal
 // design column 1 (basis_ncols = 1), matching the `score_zeta` test's
 // single-covariate conditioning span.
@@ -2855,14 +2816,12 @@ fn murphy_topel_test_calibration_basis2() -> LatentZConditionalCalibration {
     }
 }
 
-
 /// Deterministic splitmix64 → standard-normal sampler for the Monte-Carlo
 /// oracle below (self-contained so the test carries no RNG dev-dependency and
 /// is bit-reproducible across machines).
 struct SplitMix64 {
     state: u64,
 }
-
 
 impl SplitMix64 {
     fn new(seed: u64) -> Self {
@@ -2890,7 +2849,6 @@ impl SplitMix64 {
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
 }
-
 
 /// #1028 acceptance — Murphy–Topel generated-regressor SE correction oracle.
 ///
@@ -3048,7 +3006,12 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
         });
         let vb_mat = ndarray::array![[vb_scalar]];
         let vbg_prod = cal
-            .beta_theta1_sensitivity_for_test(s_prod.view(), z.view(), a_block.view(), vb_mat.view())
+            .beta_theta1_sensitivity_for_test(
+                s_prod.view(),
+                z.view(),
+                a_block.view(),
+                vb_mat.view(),
+            )
             .expect("production signed sensitivity assembles");
         assert_eq!(vbg_prod.dim(), (1, dim_theta1));
         for k in 0..dim_theta1 {

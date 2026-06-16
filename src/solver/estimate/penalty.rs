@@ -1,0 +1,840 @@
+use super::*;
+
+const REML_SECOND_ORDER_RHO_CAP: usize = 4;
+/// Continuation prewarm is a seed-polishing pass, not part of the REML
+/// objective. It can be useful for tiny rho spaces where one or two warm
+/// solves amortize, but it scales with the number of starts and runs full
+/// inner solves before the real optimizer even begins. Moderate/high-rho
+/// smooths (measure-jet spectral candidates are the motivating profile) start
+/// directly from the seed lattice; the optimizer's own line search owns
+/// globalization.
+const REML_CONTINUATION_PREWARM_RHO_CAP: usize = 4;
+/// Above this rho dimension, startup work must be linear in "one real solve",
+/// not "rank a seed lattice with capped PIRLS solves". The heuristic seed is
+/// deterministic and already centered on the current penalty scale; BFGS/ARC
+/// globalizes from there. Low-dimensional classic smooths keep screening
+/// because the extra probes are cheap and sometimes useful.
+const REML_SEED_SCREENING_RHO_CAP: usize = 4;
+
+/// Programmatic prior mean for a coefficient penalty block.
+///
+/// The mean is evaluated once during penalty canonicalization and then enters
+/// the solver as the centering vector in `(beta - mean)' S (beta - mean)`.
+#[derive(Clone, Default)]
+pub enum CoefficientPriorMean {
+    #[default]
+    Zero,
+    Scalar(f64),
+    Constant(Array1<f64>),
+    Functional {
+        metadata: Array1<f64>,
+        evaluator: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    },
+    /// Covariate-functional mean `mu(a) = amplitude * K(a)` for a coefficient block.
+    ///
+    /// Formula-level coefficient groups pass their row/covariate metadata as
+    /// `covariates`; the user-supplied kernel returns the block-sized basis
+    /// vector `K(a)` and the scalar amplitude supplies `alpha`.
+    KernelBasis {
+        covariates: Array1<f64>,
+        amplitude: f64,
+        kernel: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    },
+}
+
+impl std::fmt::Debug for CoefficientPriorMean {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => f.write_str("Zero"),
+            Self::Scalar(value) => f.debug_tuple("Scalar").field(value).finish(),
+            Self::Constant(values) => f
+                .debug_tuple("Constant")
+                .field(&format_args!("len={}", values.len()))
+                .finish(),
+            Self::Functional { metadata, .. } => f
+                .debug_struct("Functional")
+                .field("metadata_len", &metadata.len())
+                .finish_non_exhaustive(),
+            Self::KernelBasis {
+                covariates,
+                amplitude,
+                ..
+            } => f
+                .debug_struct("KernelBasis")
+                .field("covariate_len", &covariates.len())
+                .field("amplitude", amplitude)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl CoefficientPriorMean {
+    pub const fn scalar(value: f64) -> Self {
+        Self::Scalar(value)
+    }
+
+    pub fn constant(values: Array1<f64>) -> Self {
+        Self::Constant(values)
+    }
+
+    pub fn functional(
+        metadata: Array1<f64>,
+        evaluator: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    ) -> Self {
+        Self::Functional {
+            metadata,
+            evaluator,
+        }
+    }
+
+    pub fn kernel_basis(
+        covariates: Array1<f64>,
+        amplitude: f64,
+        kernel: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    ) -> Self {
+        Self::KernelBasis {
+            covariates,
+            amplitude,
+            kernel,
+        }
+    }
+
+    pub(crate) fn evaluate(
+        &self,
+        block_dim: usize,
+        context: &str,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let values = match self {
+            Self::Zero => Array1::zeros(block_dim),
+            Self::Scalar(value) => {
+                if !value.is_finite() {
+                    crate::bail_invalid_estim!(
+                        "{context}: coefficient prior mean scalar must be finite, got {value}"
+                    );
+                }
+                Array1::from_elem(block_dim, *value)
+            }
+            Self::Constant(values) => values.clone(),
+            Self::Functional {
+                metadata,
+                evaluator,
+            } => evaluator(metadata),
+            Self::KernelBasis {
+                covariates,
+                amplitude,
+                kernel,
+            } => {
+                if !amplitude.is_finite() {
+                    crate::bail_invalid_estim!(
+                        "{context}: coefficient prior mean amplitude must be finite, got {amplitude}"
+                    );
+                }
+                let mut values = kernel(covariates);
+                values *= *amplitude;
+                values
+            }
+        };
+        if values.len() != block_dim {
+            crate::bail_invalid_estim!(
+                "{context}: coefficient prior mean length must be {block_dim}, got {}",
+                values.len()
+            );
+        }
+        if values.iter().any(|&value| !value.is_finite()) {
+            crate::bail_invalid_estim!(
+                "{context}: coefficient prior mean contains non-finite values"
+            );
+        }
+        Ok(values)
+    }
+}
+
+/// A penalty specification for the public estimate API.
+///
+/// `Block` stores only the active sub-block and its column range, avoiding
+/// the O(p^2) cost of embedding into a full penalty matrix.
+/// `Dense` stores a full `p x p` penalty matrix for callers that already
+/// have one.
+#[derive(Clone)]
+pub enum PenaltySpec {
+    /// Block-local penalty: `local` is `block_dim x block_dim`,
+    /// applied to columns `col_range` of the coefficient vector.
+    Block {
+        local: Array2<f64>,
+        col_range: Range<usize>,
+        prior_mean: CoefficientPriorMean,
+        /// Optional structural hint for fast-path spectral decomposition.
+        structure_hint: Option<crate::terms::smooth::PenaltyStructureHint>,
+        /// Optional operator-form handle bit-equivalent to `local`.
+        op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+    },
+    /// Full dense penalty matrix (`p x p`).
+    Dense(Array2<f64>),
+    /// Full dense penalty matrix with a programmatic prior mean in the same
+    /// global coefficient basis.
+    DenseWithMean {
+        matrix: Array2<f64>,
+        prior_mean: CoefficientPriorMean,
+    },
+}
+
+impl std::fmt::Debug for PenaltySpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PenaltySpec::Block {
+                local,
+                col_range,
+                prior_mean,
+                structure_hint,
+                op,
+            } => f
+                .debug_struct("Block")
+                .field(
+                    "local",
+                    &format_args!("{}×{}", local.nrows(), local.ncols()),
+                )
+                .field("col_range", col_range)
+                .field("prior_mean", prior_mean)
+                .field("structure_hint", structure_hint)
+                .field("op", &op.as_ref().map(|o| o.dim()))
+                .finish(),
+            PenaltySpec::Dense(m) => f
+                .debug_tuple("Dense")
+                .field(&format_args!("{}×{}", m.nrows(), m.ncols()))
+                .finish(),
+            PenaltySpec::DenseWithMean { matrix, prior_mean } => f
+                .debug_struct("DenseWithMean")
+                .field(
+                    "matrix",
+                    &format_args!("{}×{}", matrix.nrows(), matrix.ncols()),
+                )
+                .field("prior_mean", prior_mean)
+                .finish(),
+        }
+    }
+}
+
+impl PenaltySpec {
+    /// The column range this penalty covers.
+    /// For `Dense`, this is `0..p` where `p = m.ncols()`.
+    pub fn col_range(&self, p: usize) -> Range<usize> {
+        match self {
+            PenaltySpec::Block { col_range, .. } => col_range.clone(),
+            PenaltySpec::Dense(m) => {
+                assert_eq!(m.ncols(), p);
+                0..p
+            }
+            PenaltySpec::DenseWithMean { matrix, .. } => {
+                assert_eq!(matrix.ncols(), p);
+                0..p
+            }
+        }
+    }
+
+    /// Op-form handle when present (only for `Block`; `Dense` always returns `None`).
+    pub fn op(&self) -> Option<&std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>> {
+        match self {
+            PenaltySpec::Block { op, .. } => op.as_ref(),
+            PenaltySpec::Dense(_) | PenaltySpec::DenseWithMean { .. } => None,
+        }
+    }
+
+    /// Convert from a `BlockwisePenalty`, preserving the structure hint and op.
+    pub fn from_blockwise(bp: crate::terms::smooth::BlockwisePenalty) -> Self {
+        PenaltySpec::Block {
+            local: bp.local,
+            col_range: bp.col_range,
+            prior_mean: bp.prior_mean,
+            structure_hint: bp.structure_hint,
+            op: bp.op,
+        }
+    }
+
+    pub fn from_blockwise_ref(bp: &crate::terms::smooth::BlockwisePenalty) -> Self {
+        PenaltySpec::Block {
+            local: bp.local.clone(),
+            col_range: bp.col_range.clone(),
+            prior_mean: bp.prior_mean.clone(),
+            structure_hint: bp.structure_hint.clone(),
+            op: bp.op.clone(),
+        }
+    }
+
+    /// Materialize the full `p x p` dense penalty matrix.
+    /// For `Dense`, this is a clone.  For `Block`, this embeds `local` into a
+    /// zero matrix at the given `col_range`.
+    pub fn to_dense(&self) -> Array2<f64> {
+        match self {
+            PenaltySpec::Dense(m) => m.clone(),
+            PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
+            PenaltySpec::Block {
+                local, col_range, ..
+            } => {
+                let p = col_range.end.max(local.nrows());
+                // Caller should supply p externally when the total dim is larger;
+                // this is the best we can do without it.
+                let mut out = Array2::zeros((p, p));
+                out.slice_mut(s![col_range.clone(), col_range.clone()])
+                    .assign(local);
+                out
+            }
+        }
+    }
+
+    /// Materialize the full `p_total x p_total` dense penalty matrix.
+    /// For `Dense`, this is a clone (asserts that it matches `p_total`).
+    /// For `Block`, this embeds `local` into a `p_total x p_total` zero matrix.
+    pub fn to_global(&self, p_total: usize) -> Array2<f64> {
+        match self {
+            PenaltySpec::Dense(m) => {
+                assert_eq!(m.nrows(), p_total);
+                m.clone()
+            }
+            PenaltySpec::DenseWithMean { matrix, .. } => {
+                assert_eq!(matrix.nrows(), p_total);
+                matrix.clone()
+            }
+            PenaltySpec::Block {
+                local, col_range, ..
+            } => {
+                let mut out = Array2::zeros((p_total, p_total));
+                out.slice_mut(s![col_range.clone(), col_range.clone()])
+                    .assign(local);
+                out
+            }
+        }
+    }
+}
+
+const KAHAN_SWITCH_ELEMS: usize = 10_000;
+
+fn faer_frob_inner(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> f64 {
+    let (m, n) = (a.nrows(), a.ncols());
+    let elem_count = m.saturating_mul(n);
+    if elem_count < KAHAN_SWITCH_ELEMS {
+        let mut sum = 0.0_f64;
+        for j in 0..n {
+            for i in 0..m {
+                sum += a[(i, j)] * b[(i, j)];
+            }
+        }
+        sum
+    } else {
+        let mut sum = KahanSum::default();
+        for j in 0..n {
+            for i in 0..m {
+                sum.add(a[(i, j)] * b[(i, j)]);
+            }
+        }
+        sum.sum()
+    }
+}
+
+fn kahan_sum<I>(iter: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut acc = KahanSum::default();
+    for value in iter {
+        acc.add(value);
+    }
+    acc.sum()
+}
+
+#[derive(Clone, Debug)]
+struct ParametricColumnConditioning {
+    intercept_idx: Option<usize>,
+    columns: Vec<(usize, f64, f64)>,
+}
+
+impl ParametricColumnConditioning {
+    /// Build conditioning from explicit unpenalized column indices.
+    ///
+    /// Reads only the specified columns from `x` (via `extract_column`) to
+    /// compute per-column mean/variance — no full-design densification.
+    fn from_column_indices(x: &DesignMatrix, unpenalized_cols: &[usize]) -> Self {
+        const SCALE_EPS: f64 = 1e-12;
+        let n = x.nrows();
+        if n == 0 {
+            return Self {
+                intercept_idx: None,
+                columns: Vec::new(),
+            };
+        }
+        let mut intercept_idx = None;
+        let mut columns = Vec::new();
+        // Batched extract avoids per-column unit-vector dispatch when `x` is a
+        // lazy operator (e.g. ReparamOperator): one GEMM versus
+        // `unpenalized_cols.len()` separate matvecs.
+        let block = x.extract_columns(unpenalized_cols);
+        for (k, &j) in unpenalized_cols.iter().enumerate() {
+            let col = block.column(k);
+            let first = col[0];
+            let is_constant = col.iter().all(|&v| (v - first).abs() <= 1e-12);
+            if is_constant {
+                if (first - 1.0).abs() <= 1e-12 && intercept_idx.is_none() {
+                    intercept_idx = Some(j);
+                }
+                continue;
+            }
+            let mean = col.iter().copied().sum::<f64>() / n as f64;
+            let var = col
+                .iter()
+                .map(|&v| {
+                    let d = v - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / n as f64;
+            if !var.is_finite() || var <= SCALE_EPS * SCALE_EPS {
+                continue;
+            }
+            columns.push((j, mean, var.sqrt()));
+        }
+        if intercept_idx.is_none() {
+            for (_, mean, _) in &mut columns {
+                *mean = 0.0;
+            }
+        }
+        Self {
+            intercept_idx,
+            columns,
+        }
+    }
+
+    /// Infer unpenalized columns from `PenaltySpec` slices.
+    fn infer_from_penalty_specs(x: &DesignMatrix, specs: &[PenaltySpec]) -> Self {
+        let p = x.ncols();
+        let mut penalized = vec![false; p];
+        for spec in specs {
+            let range = spec.col_range(p);
+            for j in range {
+                penalized[j] = true;
+            }
+        }
+        let unpenalized: Vec<usize> = (0..p).filter(|&j| !penalized[j]).collect();
+        Self::from_column_indices(x, &unpenalized)
+    }
+
+    fn is_active(&self) -> bool {
+        !self.columns.is_empty()
+    }
+
+    /// Return a lazily-conditioned design matrix (no materialization).
+    ///
+    /// Wraps `x` in a `ConditionedDesign` operator that applies per-column
+    /// centering and scaling through matvec algebra, avoiding densification.
+    fn apply_to_design(&self, x: &DesignMatrix) -> DesignMatrix {
+        if !self.is_active() {
+            return x.clone();
+        }
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(
+            crate::matrix::ConditionedDesign::new(x.clone(), self.columns.clone()),
+        )))
+    }
+
+    /// Map a constraint matrix from original (user-scale) coefficients to the
+    /// internally-conditioned coordinates the solver actually optimizes.
+    ///
+    /// Constraints are authored on the *original* design-column coefficients:
+    /// `A_orig · β_orig {≥,≤} b` (e.g. a `linear(x, min, max)` box pushes rows
+    /// `β_col ≥ min` and `β_col ≤ max`). The inner solve works with the
+    /// conditioned coefficients `β_int`, where the back-transform `β_orig = M·β_int`
+    /// is exactly the one implemented by [`Self::backtransform_beta`]:
+    ///
+    /// ```text
+    ///   β_orig[j]         = β_int[j] / scale_j                         (conditioned col j)
+    ///   β_orig[intercept] = β_int[intercept] − Σ_j (mean_j / scale_j) · β_int[j]
+    /// ```
+    ///
+    /// so `M[j][j] = 1/scale_j`, `M[intercept][j] = −mean_j/scale_j`, and `M` is
+    /// the identity elsewhere. Substituting into `A_orig · β_orig` gives the
+    /// equivalent internal constraint `A_int · β_int {≥,≤} b` with `A_int = A_orig·M`.
+    /// Only the conditioned columns of `A_int` differ from `A_orig`:
+    ///
+    /// ```text
+    ///   A_int[:, j] = (A_orig[:, j] − mean_j · A_orig[:, intercept]) / scale_j
+    /// ```
+    ///
+    /// The RHS `b` is unchanged, so [`Self::transform_linear_constraints_to_internal`]
+    /// carries it through verbatim. `A_orig · M` is precisely `M` applied to the
+    /// columns of `A_orig`, which is the canonical column-conditioning primitive
+    /// [`Self::transform_matrix_columnswith_a`] — so delegate to it rather than
+    /// carry a second copy of the per-column algebra.
+    fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
+        self.transform_matrix_columnswith_a(a_original)
+    }
+
+    fn transform_linear_constraints_to_internal(
+        &self,
+        constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    ) -> Option<crate::pirls::LinearInequalityConstraints> {
+        constraints.map(|constraints| crate::pirls::LinearInequalityConstraints {
+            a: self.transform_constraint_matrix_to_internal(&constraints.a),
+            b: constraints.b,
+        })
+    }
+
+    fn backtransform_beta(&self, beta_internal: &Array1<f64>) -> Array1<f64> {
+        let mut beta = beta_internal.clone();
+        for &(j, mean, scale) in &self.columns {
+            if let Some(intercept_idx) = self.intercept_idx {
+                beta[intercept_idx] -= beta_internal[j] * mean / scale;
+            }
+            beta[j] = beta_internal[j] / scale;
+        }
+        beta
+    }
+
+    fn transform_matrix_columnswith_a(&self, mat: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat.clone();
+        self.transform_matrix_columnswith_a_inplace(&mut out);
+        out
+    }
+
+    fn transform_matrix_columnswith_a_inplace(&self, mat: &mut Array2<f64>) {
+        if !self.is_active() {
+            return;
+        }
+        let intercept_col = self.intercept_idx.map(|idx| mat.column(idx).to_owned());
+        for &(j, mean, scale) in &self.columns {
+            let mut target = mat.column_mut(j);
+            if mean != 0.0
+                && let Some(intercept_col) = intercept_col.as_ref()
+            {
+                target -= &(intercept_col * mean);
+            }
+            if scale != 1.0 {
+                target.mapv_inplace(|v| v / scale);
+            }
+        }
+    }
+
+    /// Left-multiply `mat_internal` by `M`, where `M` is the coefficient
+    /// back-transform: `β_orig = M · β_int` (the same map
+    /// [`Self::backtransform_beta`] applies to a single vector).
+    ///
+    /// `M` has the structure
+    /// ```text
+    ///   M[intercept, intercept] = 1
+    ///   M[intercept, j]        = −mean_j / scale_j     (conditioned column j)
+    ///   M[j, j]                = 1 / scale_j           (conditioned column j)
+    /// ```
+    /// and is the identity elsewhere. Acts on each column of `mat_internal`
+    /// the same way `backtransform_beta` acts on a single vector.
+    fn left_multiply_by_m(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
+        if !self.is_active() {
+            return out;
+        }
+        if let Some(intercept_idx) = self.intercept_idx {
+            // (M·X)[intercept, :] = X[intercept, :] − Σ_j (mean_j/scale_j) · X[j, :]
+            // Each conditioned column reads from the ORIGINAL `mat_internal`
+            // row j (snapshot), so the contributions accumulate independently
+            // — identical semantics to `backtransform_beta`'s use of
+            // `beta_internal[j]` rather than the running `beta[j]`.
+            for &(j, mean, scale) in &self.columns {
+                if mean != 0.0 {
+                    let factor = mean / scale;
+                    let row_j_snapshot = mat_internal.row(j).to_owned();
+                    let mut interceptrow = out.row_mut(intercept_idx);
+                    interceptrow -= &(&row_j_snapshot * factor);
+                }
+            }
+        }
+        // (M·X)[j, :] = X[j, :] / scale_j
+        for &(j, _mean, scale) in &self.columns {
+            if scale != 1.0 {
+                out.row_mut(j).mapv_inplace(|v| v / scale);
+            }
+        }
+        out
+    }
+
+    /// Right-multiply `mat_internal` by `Mᵀ` (the transpose of the
+    /// coefficient back-transform). Mirror of [`Self::left_multiply_by_m`]
+    /// on columns.
+    fn right_multiply_by_m_transpose(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
+        if !self.is_active() {
+            return out;
+        }
+        if let Some(intercept_idx) = self.intercept_idx {
+            // (X·Mᵀ)[:, intercept] = X[:, intercept] − Σ_j (mean_j/scale_j) · X[:, j]
+            for &(j, mean, scale) in &self.columns {
+                if mean != 0.0 {
+                    let factor = mean / scale;
+                    let col_j_snapshot = mat_internal.column(j).to_owned();
+                    let mut intercept_col = out.column_mut(intercept_idx);
+                    intercept_col -= &(&col_j_snapshot * factor);
+                }
+            }
+        }
+        // (X·Mᵀ)[:, j] = X[:, j] / scale_j
+        for &(j, _mean, scale) in &self.columns {
+            if scale != 1.0 {
+                out.column_mut(j).mapv_inplace(|v| v / scale);
+            }
+        }
+        out
+    }
+
+    /// Left-multiply `mat_internal` by `M⁻ᵀ`. The inverse basis map is
+    /// ```text
+    ///   M⁻¹[intercept, intercept] = 1
+    ///   M⁻¹[intercept, j]         = mean_j     (conditioned column j)
+    ///   M⁻¹[j, j]                 = scale_j    (conditioned column j)
+    /// ```
+    /// so `(M⁻ᵀ · X)[j, :] = scale_j · X[j, :] + mean_j · X[intercept, :]`
+    /// and `(M⁻ᵀ · X)[intercept, :] = X[intercept, :]`.
+    fn left_multiply_by_m_inv_transpose(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
+        if !self.is_active() {
+            return out;
+        }
+        if let Some(intercept_idx) = self.intercept_idx {
+            let interceptrow_snapshot = mat_internal.row(intercept_idx).to_owned();
+            for &(j, mean, scale) in &self.columns {
+                if scale != 1.0 {
+                    out.row_mut(j).mapv_inplace(|v| v * scale);
+                }
+                if mean != 0.0 {
+                    let mut row_j = out.row_mut(j);
+                    row_j += &(&interceptrow_snapshot * mean);
+                }
+            }
+        } else {
+            for &(j, _mean, scale) in &self.columns {
+                if scale != 1.0 {
+                    out.row_mut(j).mapv_inplace(|v| v * scale);
+                }
+            }
+        }
+        out
+    }
+
+    /// Right-multiply `mat_internal` by `M⁻¹`. Mirror of
+    /// [`Self::left_multiply_by_m_inv_transpose`] on columns.
+    fn right_multiply_by_m_inv(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
+        if !self.is_active() {
+            return out;
+        }
+        if let Some(intercept_idx) = self.intercept_idx {
+            let intercept_col_snapshot = mat_internal.column(intercept_idx).to_owned();
+            for &(j, mean, scale) in &self.columns {
+                if scale != 1.0 {
+                    out.column_mut(j).mapv_inplace(|v| v * scale);
+                }
+                if mean != 0.0 {
+                    let mut col_j = out.column_mut(j);
+                    col_j += &(&intercept_col_snapshot * mean);
+                }
+            }
+        } else {
+            for &(j, _mean, scale) in &self.columns {
+                if scale != 1.0 {
+                    out.column_mut(j).mapv_inplace(|v| v * scale);
+                }
+            }
+        }
+        out
+    }
+
+    /// `Cov(β_orig) = M · Cov(β_int) · Mᵀ`.
+    ///
+    /// Since `β_orig = M · β_int`, the covariance back-transform is the
+    /// congruence `M · Σ · Mᵀ`, NOT `Mᵀ · Σ · M`. The latter (the prior
+    /// implementation) silently swapped the variance of every conditioned
+    /// parametric column with the variance of the intercept, off by exactly
+    /// the basis change the intercept absorbs when columns are centered.
+    fn backtransform_covariance(&self, cov_internal: &Array2<f64>) -> Array2<f64> {
+        let right = self.right_multiply_by_m_transpose(cov_internal);
+        self.left_multiply_by_m(&right)
+    }
+
+    /// `H_orig = M⁻ᵀ · H_int · M⁻¹`.
+    ///
+    /// Derived from `L_int(β_int) = L_orig(M · β_int)`: the chain rule gives
+    /// `H_int = Mᵀ · H_orig · M`, so `H_orig = M⁻ᵀ · H_int · M⁻¹`. The prior
+    /// implementation multiplied the intercept entry of `M⁻¹` by `scale_j`,
+    /// silently scaling the Hessian by `scale_j²` along every conditioned
+    /// column whenever scaling (not just centering) was active.
+    fn backtransform_penalized_hessian(&self, h_internal: &Array2<f64>) -> Array2<f64> {
+        let right = self.right_multiply_by_m_inv(h_internal);
+        self.left_multiply_by_m_inv_transpose(&right)
+    }
+
+    fn backtransform_external_result(
+        &self,
+        mut result: ExternalOptimResult,
+    ) -> ExternalOptimResult {
+        if !self.is_active() {
+            return result;
+        }
+        result.beta = self.backtransform_beta(&result.beta);
+        if let Some(inf) = result.inference.as_mut() {
+            inf.penalized_hessian = self
+                .backtransform_penalized_hessian(inf.penalized_hessian.as_array())
+                .into();
+            inf.beta_covariance = inf
+                .beta_covariance
+                .take()
+                .map(|cov| self.backtransform_covariance(cov.as_array()).into());
+            inf.beta_standard_errors = inf
+                .beta_covariance
+                .as_ref()
+                .map(|c| se_from_covariance(c.as_array()));
+            inf.beta_covariance_corrected = inf
+                .beta_covariance_corrected
+                .take()
+                .map(|cov| self.backtransform_covariance(&cov));
+            inf.beta_standard_errors_corrected = inf
+                .beta_covariance_corrected
+                .as_ref()
+                .map(se_from_covariance);
+            inf.beta_covariance_frequentist = inf
+                .beta_covariance_frequentist
+                .take()
+                .map(|cov| self.backtransform_covariance(&cov));
+            // The influence matrix is a mixed linear operator, not a covariance
+            // or Hessian. Drop it across column-conditioning transforms rather
+            // than applying the wrong congruence map.
+            inf.coefficient_influence = None;
+            // X'WX is a congruence object under column-conditioning transforms;
+            // its companion `F` is dropped here, so drop the stored Gram too and
+            // let the WPS correction fall back to the conditional EDF rather than
+            // applying a mismatched congruence map.
+            inf.weighted_gram = None;
+            inf.bias_correction_beta = inf
+                .bias_correction_beta
+                .take()
+                .map(|b| self.backtransform_beta(&b));
+            inf.smoothing_correction = inf
+                .smoothing_correction
+                .take()
+                .map(|cov| self.backtransform_covariance(&cov));
+            inf.reparam_qs = None;
+        }
+        result.constraint_kkt = None;
+        // `result.artifacts.pirls` is a self-consistent geometric bundle in the
+        // PIRLS internal basis (`x_transformed`, `beta_transformed`,
+        // `penalized_hessian_transformed`, and the per-observation
+        // `final_eta`/`finalmu`/`solveworking_response`/weights, all paired in
+        // that one frame). Observation-space quantities derived from it
+        // — η̂_i, leverages a_ii, sandwich SEs — are invariant under the
+        // invertible coefficient-space reparameterization that conditioning
+        // introduces, so the bundle stays correct in its own coordinates and
+        // we keep it instead of wiping `pirls: None`.
+        result
+    }
+}
+
+fn map_hessian_to_original_basis(
+    pirls: &crate::pirls::PirlsResult,
+) -> Result<Array2<f64>, EstimationError> {
+    let qs = &pirls.reparam_result.qs;
+    let h_t = &pirls.penalized_hessian_transformed;
+    // H_original = Qs * H_transformed * Qs'
+    // left_dot_matrix avoids densification for sparse Hessians.
+    let tmp = h_t.left_dot_matrix(qs);
+    let mut h = tmp.dot(&qs.t());
+    // Two non-self-adjoint matmuls accumulate ~p · ε rounding noise that
+    // breaks bitwise symmetry even though the analytic result `Q H Qᵀ` is
+    // symmetric whenever `H_transformed` is.  Average opposite entries
+    // explicitly so downstream `validate_dense_hessian_export` doesn't
+    // reject otherwise-valid fits over rounding-noise asymmetry.
+    crate::families::custom_family::symmetrize_dense_in_place(&mut h);
+    Ok(h)
+}
+
+/// Strictly-positive floor on a reported dispersion / scale parameter `φ`.
+/// Every GLM family resolves `φ` to a non-negative quantity, but downstream
+/// consumers (covariance scaling, deviance ratios) divide by it, so it is
+/// clamped to the smallest positive normal `f64` to keep those quotients
+/// finite without perturbing any `φ` above the denormal range.
+const DISPERSION_POSITIVE_FLOOR: f64 = 1e-300;
+
+fn dispersion_from_likelihood(
+    likelihood: &GlmLikelihoodSpec,
+    standard_deviation: f64,
+) -> Dispersion {
+    match &likelihood.spec.response {
+        ResponseFamily::Gaussian => Dispersion::Estimated(
+            (standard_deviation * standard_deviation).max(DISPERSION_POSITIVE_FLOOR),
+        ),
+        ResponseFamily::Gamma => {
+            let phi = likelihood.scale.fixed_phi().unwrap_or_else(|| {
+                let shape = likelihood
+                    .gamma_shape()
+                    .unwrap_or(standard_deviation.max(DISPERSION_POSITIVE_FLOOR));
+                1.0 / shape.max(DISPERSION_POSITIVE_FLOOR)
+            });
+            if likelihood.scale.gamma_shape_is_estimated() {
+                Dispersion::Estimated(phi.max(DISPERSION_POSITIVE_FLOOR))
+            } else {
+                Dispersion::Known(phi.max(DISPERSION_POSITIVE_FLOOR))
+            }
+        }
+        ResponseFamily::Tweedie { .. } => {
+            // `Var(y) = phi · mu^p`, so the response-level dispersion is `phi`
+            // itself, read from the scale metadata (now the converged-η Pearson
+            // estimate, issue #771). Reported as `Estimated` when the default
+            // estimate-phi metadata is in force so downstream consumers know the
+            // scale came from the data, not a frozen seed.
+            let phi = likelihood
+                .fixed_phi()
+                .unwrap_or(1.0)
+                .max(DISPERSION_POSITIVE_FLOOR);
+            if likelihood.scale.tweedie_phi_is_estimated() {
+                Dispersion::Estimated(phi)
+            } else {
+                Dispersion::Known(phi)
+            }
+        }
+        ResponseFamily::NegativeBinomial { theta, .. } => Dispersion::Known(
+            likelihood
+                .fixed_phi()
+                .unwrap_or(*theta)
+                .max(DISPERSION_POSITIVE_FLOOR),
+        ),
+        ResponseFamily::Beta { phi } => {
+            Dispersion::Known((1.0 / (1.0 + phi.max(1e-12))).max(DISPERSION_POSITIVE_FLOOR))
+        }
+        ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::RoystonParmar => {
+            Dispersion::Known(1.0)
+        }
+    }
+}
+
+/// Scale a posterior covariance `H^{-1}` by the coefficient-covariance scale.
+///
+/// `Vb = H^{-1} * scale`. The multiplier is supplied by
+/// `GlmLikelihoodSpec::coefficient_covariance_scale`: it is the profiled
+/// residual variance `sigma^2` for the scale-free profiled Gaussian, and `1.0`
+/// for every family whose IRLS working weight already carries the dispersion /
+/// full Fisher information (Gamma, Tweedie, Beta, Negative-Binomial, and the
+/// fixed-scale Poisson/Binomial). For the latter the stored `H = X'WX + S_λ`
+/// is already the true penalized Hessian, so no further dispersion multiply is
+/// applied — multiplying again would double-count the dispersion (#679).
+/// Centralizing the scaling here keeps the contract visible at every covariance
+/// construction site instead of being inlined as a bare `cov * scale`.
+#[inline]
+pub(crate) fn scaled_covariance(cov: Array2<f64>, phi: f64) -> Array2<f64> {
+    if (phi - 1.0).abs() <= f64::EPSILON {
+        cov
+    } else {
+        cov * phi
+    }
+}
+
+/// Default inner P-IRLS tolerance floor.
+///
+/// The inner Newton iteration certifies the coefficient mode against this
+/// (scale-aware) tolerance independently of the outer REML tolerance. Coupling
+/// the two collapses two unrelated convergence concepts: when a user dials the
+/// outer tolerance up to e.g. 1e-3 to make the smoothing-parameter search
+/// coarser, the inner solve becomes coarse too, returning betas whose
+/// stationarity residual is ~1e-3·scale rather than the floating-point noise
+/// floor. Outer derivatives then read those imprecise betas as if they were
+/// the true mode and accumulate error. Keeping the inner floor at 1e-6 lets

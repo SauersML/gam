@@ -1065,7 +1065,8 @@ pub struct MatrixFreeSpdOperator {
     // for workers. `RayonSafeOnce` keeps init lock-free — racers may
     // duplicate the dim²-matvec build, but the first to publish wins and
     // steady-state matches `OnceLock`.
-    pub(crate) dense_spectral: crate::solver::resource::RayonSafeOnce<Option<DenseSpectralOperator>>,
+    pub(crate) dense_spectral:
+        crate::solver::resource::RayonSafeOnce<Option<DenseSpectralOperator>>,
     // Pseudo-logdet convention threaded from the family. The dense outer path
     // already plumbs `PseudoLogdetMode` into `BlockCoupledOperator`; the
     // matrix-free path materializes a `DenseSpectralOperator` lazily and must
