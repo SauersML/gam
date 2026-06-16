@@ -3273,8 +3273,11 @@ mod empirical_flex_jet_oracle {
         // kernel reads at `self.{z,y,weights}[row]`.
         let n = 1usize;
         let policy = crate::solver::resource::ResourcePolicy::default_library();
-        let dummy =
-            || DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((n, 1))));
+        let dummy = || {
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                n, 1,
+            ))))
+        };
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(Array1::from_vec(vec![1.0])),
             weights: Arc::new(Array1::from_vec(vec![1.0])),
@@ -3305,8 +3308,16 @@ mod empirical_flex_jet_oracle {
         let primary = PrimarySlices {
             q: 0,
             logslope: 1,
-            h: if is_score_warp { Some(2..2 + basis_dim) } else { None },
-            w: if is_score_warp { None } else { Some(2..2 + basis_dim) },
+            h: if is_score_warp {
+                Some(2..2 + basis_dim)
+            } else {
+                None
+            },
+            w: if is_score_warp {
+                None
+            } else {
+                Some(2..2 + basis_dim)
+            },
             total: 2 + basis_dim,
         };
         // Small, distinct deviation coefficients so every basis column carries
@@ -3436,7 +3447,6 @@ mod empirical_flex_jet_oracle {
         // Enumerate the product by recursion over axes.
         fn walk(
             fx: &FlexFixture,
-            base: &[f64],
             stencils: &[(usize, &'static [(i64, f64)])],
             h: f64,
             coeff_acc: f64,
@@ -3449,7 +3459,7 @@ mod empirical_flex_jet_oracle {
                     let saved = point[idx];
                     for &(off, c) in st {
                         point[idx] = saved + (off as f64) * h;
-                        acc += walk(fx, base, rest, h, coeff_acc * c, point);
+                        acc += walk(fx, rest, h, coeff_acc * c, point);
                     }
                     point[idx] = saved;
                     acc
@@ -3457,7 +3467,7 @@ mod empirical_flex_jet_oracle {
             }
         }
         let mut point = p0.to_vec();
-        let raw = walk(fx, p0, &stencils, h, 1.0, &mut point);
+        let raw = walk(fx, &stencils, h, 1.0, &mut point);
         raw / h.powi(total_order as i32)
     }
 
@@ -3555,7 +3565,11 @@ mod empirical_flex_jet_oracle {
         assert!(
             (v_prod - v_wit).abs() <= 1e-9 * v_wit.abs().max(1.0),
             "{} value: production {v_prod:+.12e} != witness {v_wit:+.12e}",
-            if is_score_warp { "score-warp" } else { "link-dev" }
+            if is_score_warp {
+                "score-warp"
+            } else {
+                "link-dev"
+            }
         );
 
         // First derivatives along q, b, β0.
@@ -3569,14 +3583,8 @@ mod empirical_flex_jet_oracle {
         }
 
         // Second derivatives: diagonal and the q×b / b×β / q×β cross blocks.
-        let pairs: [(usize, usize); 6] = [
-            (q, q),
-            (b, b),
-            (dev0, dev0),
-            (q, b),
-            (b, dev0),
-            (q, dev0),
-        ];
+        let pairs: [(usize, usize); 6] =
+            [(q, q), (b, b), (dev0, dev0), (q, b), (b, dev0), (q, dev0)];
         for &(i, j) in &pairs {
             let prod = prod_flex_coeff(&fx, &p0, &[i, j]);
             let wit = if i == j {
@@ -3614,11 +3622,7 @@ mod empirical_flex_jet_oracle {
 
         // Fourth derivatives: distinct-axis quadruples + mixed, the highest
         // channel the production exposes (#736/#833 genus surface).
-        let quads: [[usize; 4]; 3] = [
-            [q, b, dev0, dev0],
-            [b, b, dev0, dev0],
-            [q, q, b, dev0],
-        ];
+        let quads: [[usize; 4]; 3] = [[q, b, dev0, dev0], [b, b, dev0, dev0], [q, q, b, dev0]];
         for quad in &quads {
             let prod = prod_flex_coeff(&fx, &p0, quad);
             let mut axes: Vec<(usize, usize)> = Vec::new();
