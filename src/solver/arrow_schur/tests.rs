@@ -2570,6 +2570,230 @@ pub(crate) fn parallel_schur_matvec_deterministic_and_matches_sequential() {
     }
 }
 
+/// Sequential reference for the cross-row matvec: the row-order fold of the
+/// same per-row contributions `arrow_cross_row_matvec` accumulates, followed by
+/// the post-loop `H_ββ + ridge` prologue and cross-row penalty Hessian. Used to
+/// pin the parallelized n-row loop against an independent serial computation.
+pub(crate) fn cross_row_matvec_sequential_ref(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x_t: ArrayView1<'_, f64>,
+    x_beta: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    let n = sys.rows.len();
+    let k = sys.k;
+    let total_dt = sys.row_offsets[n];
+    let mut y_t = Array1::<f64>::zeros(total_dt);
+    let mut y_beta = Array1::<f64>::zeros(k);
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let base = sys.row_offsets[i];
+        let row = &sys.rows[i];
+        for a in 0..di {
+            let mut acc = ridge_t * x_t[base + a];
+            for b in 0..di {
+                acc += row.htt[[a, b]] * x_t[base + b];
+            }
+            y_t[base + a] = acc;
+        }
+        let mut slab = Array1::<f64>::zeros(di);
+        sys_htbeta_apply_row(sys, i, row, x_beta, &mut slab);
+        for c in 0..di {
+            y_t[base + c] += slab[c];
+        }
+        let x_ti = x_t.slice(ndarray::s![base..base + di]).to_owned();
+        sys_htbeta_accumulate_transpose(sys, i, row, x_ti.view(), &mut y_beta);
+    }
+    {
+        let x_beta_slice = x_beta.as_slice().expect("x_beta contiguous");
+        let y_beta_slice = y_beta.as_slice_mut().expect("y_beta contiguous");
+        sys.penalty_matvec_add(x_beta_slice, y_beta_slice);
+    }
+    for a in 0..k {
+        y_beta[a] += ridge_beta * x_beta[a];
+    }
+    sys.apply_cross_row_penalty_hessian(x_t, &mut y_t);
+    (y_t, y_beta)
+}
+
+/// The parallel cross-row matvec (`arrow_cross_row_matvec`, the per-CG-iteration
+/// operator of the cross-row coupled Newton solve) must, like its `schur_matvec`
+/// twin, be (a) DETERMINISTIC run-to-run — bit-identical across repeated
+/// invocations regardless of thread scheduling (the #1017 gate: the criterion
+/// ranking across candidates cannot move); and (b) equal to the sequential
+/// row-order fold — bit-identical on the disjoint `y_t` writes and within
+/// ULP-scale reassociation on the cross-row `y_beta` sum.
+#[test]
+pub(crate) fn parallel_cross_row_matvec_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
+    let d = 5usize;
+    let k = 80usize;
+    let sys = dense_arrow_system(n, d, k);
+    let total_dt = sys.row_offsets[n];
+    let ridge_t = 1e-5;
+    let ridge_beta = 1e-6;
+    let x_t = Array1::from_iter((0..total_dt).map(|i| 0.2 * (i as f64).cos() + 0.05));
+    let x_beta = Array1::from_iter((0..k).map(|a| 0.3 * (a as f64).sin() - 0.1));
+
+    // (a) Determinism: two independent invocations of the live (parallel) path
+    // must be bit-identical in both output blocks.
+    let (yt_a, yb_a) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    let (yt_b, yb_b) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    for i in 0..total_dt {
+        assert_eq!(
+            yt_a[i].to_bits(),
+            yt_b[i].to_bits(),
+            "parallel cross-row matvec y_t must be deterministic at {i}"
+        );
+    }
+    for a in 0..k {
+        assert_eq!(
+            yb_a[a].to_bits(),
+            yb_b[a].to_bits(),
+            "parallel cross-row matvec y_beta must be deterministic at {a}"
+        );
+    }
+
+    // (b) Equivalence with the sequential row-order fold.
+    let (yt_seq, yb_seq) =
+        cross_row_matvec_sequential_ref(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    // y_t writes are disjoint per row → bit-identical to the serial fold.
+    for i in 0..total_dt {
+        assert_eq!(
+            yt_a[i].to_bits(),
+            yt_seq[i].to_bits(),
+            "parallel cross-row matvec y_t must match the sequential fold bit-for-bit at {i}"
+        );
+    }
+    // y_beta is a cross-row accumulation → equal within reassociation error.
+    let scale = yb_seq.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    for a in 0..k {
+        let rel = (yb_a[a] - yb_seq[a]).abs() / scale;
+        assert!(
+            rel < 1e-12,
+            "parallel vs sequential cross-row matvec y_beta must agree to reassociation \
+                 error at {a}: {} vs {} (rel {rel:e})",
+            yb_a[a],
+            yb_seq[a]
+        );
+    }
+}
+
+/// The cross-row preconditioner solve `ArrowBlockDiagInverse::apply` (run once
+/// per cross-row CG iteration) parallelizes both its n-row passes (#1017). It
+/// must be (a) DETERMINISTIC run-to-run and (b) the exact inverse of the
+/// block-diagonal arrow operator `K0 + ridge`. With no cross-row penalties
+/// `P_cross = 0`, so `arrow_cross_row_matvec` IS `K0 + ridge`; the round trip
+/// `(K0+ridge)·apply(r)` must recover `r`.
+#[test]
+pub(crate) fn parallel_block_diag_inverse_apply_deterministic_and_solves() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
+    let d = 4usize;
+    let k = 72usize;
+    let sys = dense_arrow_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_t = 1e-4;
+    let ridge_beta = 1e-5;
+    let precond = ArrowBlockDiagInverse::build(&sys, ridge_t, ridge_beta, false, &backend)
+        .expect("block-diagonal inverse must build");
+    let total_dt = sys.row_offsets[n];
+    let r_t = Array1::from_iter((0..total_dt).map(|i| 0.15 * (i as f64).sin() + 0.02));
+    let r_beta = Array1::from_iter((0..k).map(|a| 0.25 * (a as f64).cos() - 0.05));
+
+    // (a) Determinism run-to-run on the parallel path.
+    let (xt_a, xb_a) = precond.apply(r_t.view(), r_beta.view());
+    let (xt_b, xb_b) = precond.apply(r_t.view(), r_beta.view());
+    for i in 0..total_dt {
+        assert_eq!(
+            xt_a[i].to_bits(),
+            xt_b[i].to_bits(),
+            "preconditioner x_t must be deterministic at {i}"
+        );
+    }
+    for a in 0..k {
+        assert_eq!(
+            xb_a[a].to_bits(),
+            xb_b[a].to_bits(),
+            "preconditioner x_beta must be deterministic at {a}"
+        );
+    }
+
+    // (b) Exact inverse: the round trip recovers the RHS.
+    let (yt, yb) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, xt_a.view(), xb_a.view());
+    let scale_t = r_t.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    for i in 0..total_dt {
+        let rel = (yt[i] - r_t[i]).abs() / scale_t;
+        assert!(
+            rel < 1e-9,
+            "preconditioner round-trip y_t at {i}: rel {rel:e}"
+        );
+    }
+    let scale_b = r_beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    for a in 0..k {
+        let rel = (yb[a] - r_beta[a]).abs() / scale_b;
+        assert!(
+            rel < 1e-9,
+            "preconditioner round-trip y_beta at {a}: rel {rel:e}"
+        );
+    }
+}
+
+/// `arrow_operator_apply` (the block-diagonal `K0` operator used by the
+/// iterative-refinement residual / backward-error certificate) parallelizes its
+/// n-row pass via the shared `cross_row_matvec_row_into` body (#1017). It must
+/// be deterministic run-to-run and equal to the sequential fold: with no
+/// cross-row penalties it equals `arrow_cross_row_matvec`, so the same
+/// `cross_row_matvec_sequential_ref` is the reference (bit-identical disjoint
+/// `y_t`, ULP-scale `y_beta` reassociation).
+#[test]
+pub(crate) fn parallel_arrow_operator_apply_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 48; // trips the parallel path
+    let d = 6usize;
+    let k = 64usize;
+    let sys = dense_arrow_system(n, d, k);
+    let total_dt = sys.row_offsets[n];
+    let ridge_t = 2e-5;
+    let ridge_beta = 3e-6;
+    let x_t = Array1::from_iter((0..total_dt).map(|i| 0.17 * (i as f64).sin() - 0.03));
+    let x_beta = Array1::from_iter((0..k).map(|a| 0.21 * (a as f64).cos() + 0.04));
+
+    let (yt_a, yb_a) = arrow_operator_apply(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    let (yt_b, yb_b) = arrow_operator_apply(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    for i in 0..total_dt {
+        assert_eq!(
+            yt_a[i].to_bits(),
+            yt_b[i].to_bits(),
+            "arrow_operator_apply y_t must be deterministic at {i}"
+        );
+    }
+    for a in 0..k {
+        assert_eq!(
+            yb_a[a].to_bits(),
+            yb_b[a].to_bits(),
+            "arrow_operator_apply y_beta must be deterministic at {a}"
+        );
+    }
+
+    let (yt_seq, yb_seq) =
+        cross_row_matvec_sequential_ref(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
+    for i in 0..total_dt {
+        assert_eq!(
+            yt_a[i].to_bits(),
+            yt_seq[i].to_bits(),
+            "arrow_operator_apply y_t must match the sequential fold bit-for-bit at {i}"
+        );
+    }
+    let scale = yb_seq.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    for a in 0..k {
+        let rel = (yb_a[a] - yb_seq[a]).abs() / scale;
+        assert!(
+            rel < 1e-12,
+            "arrow_operator_apply y_beta vs sequential at {a}: rel {rel:e}"
+        );
+    }
+}
+
 /// The dense `H_ββ` penalty-prologue GEMV parallelized over output rows at
 /// the wide SAE border (`k ≥ SCHUR_PROLOGUE_PARALLEL_K_MIN`, #1017) must be
 /// **bit-identical** to the serial prologue — unlike the per-row reduction,
@@ -3123,5 +3347,549 @@ pub(crate) fn bench_resident_sae_matvec_speedup() {
     assert!(
         gen_total > 0.0 && res_total > 0.0,
         "timings must be positive"
+    );
+}
+
+/// #1017 streaming-assembly parallelism: `accumulate_chunk` (reduced-Schur +
+/// reduced-RHS assembly) and `back_substitute` (per-row `Δt_i`) fan over rows
+/// with rayon above `SCHUR_MATVEC_PARALLEL_ROW_MIN`. Both must be
+/// (a) DETERMINISTIC run-to-run — bit-identical regardless of thread
+/// scheduling, the #1017 verification gate that the criterion ranking cannot
+/// move; and (b) numerically equal to the sequential per-row computation up to
+/// ULP-level reassociation (the chunk-partial fold reassociates the SAME row
+/// contributions). For `back_substitute` the per-row writes are DISJOINT, so it
+/// must match the sequential scatter bit-for-bit.
+#[test]
+pub(crate) fn parallel_streaming_assembly_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
+    let d = 4usize;
+    let k = 24usize;
+    let sys = dense_direct_system(n, d, k);
+    let options = ArrowSolveOptions::direct();
+
+    // (a) Determinism: two independent full solves at the parallel shape must
+    // be bit-identical (Δt, Δβ, and the reduced Schur factor diagonal).
+    let mut s_a = StreamingArrowSchur::from_system(&sys, n); // one big chunk → parallel accumulate
+    let (dt_a, db_a, _) = s_a.solve(0.0, 0.0, &options).expect("parallel solve a");
+    let mut s_b = StreamingArrowSchur::from_system(&sys, n);
+    let (dt_b, db_b, _) = s_b.solve(0.0, 0.0, &options).expect("parallel solve b");
+    for j in 0..k {
+        assert_eq!(
+            db_a[j].to_bits(),
+            db_b[j].to_bits(),
+            "streaming Δβ must be deterministic run-to-run at {j}"
+        );
+    }
+    for i in 0..dt_a.len() {
+        assert_eq!(
+            dt_a[i].to_bits(),
+            dt_b[i].to_bits(),
+            "streaming Δt must be deterministic run-to-run at {i}"
+        );
+    }
+
+    // (b) accumulate_chunk parallel-vs-serial equivalence. A single big chunk
+    // (>= MIN) takes the rayon fold; many tiny chunks (each < MIN) take the
+    // in-place serial path. Same row contributions, so the reduced Schur block
+    // and reduced RHS agree to ULP-scale reassociation error.
+    let mut par = StreamingArrowSchur::from_system(&sys, n);
+    par.reset_accumulator(0.0).expect("reset par");
+    par.accumulate_chunk(0, n, 0.0, ArrowSolverMode::Direct)
+        .expect("parallel accumulate");
+    let (s_par, rhs_par) = par.take_accumulators();
+
+    let mut ser = StreamingArrowSchur::from_system(&sys, 8);
+    ser.reset_accumulator(0.0).expect("reset ser");
+    for start in (0..n).step_by(8) {
+        let end = (start + 8).min(n);
+        assert!(end - start < SCHUR_MATVEC_PARALLEL_ROW_MIN); // serial per chunk
+        ser.accumulate_chunk(start, end, 0.0, ArrowSolverMode::Direct)
+            .expect("serial accumulate");
+    }
+    let (s_ser, rhs_ser) = ser.take_accumulators();
+
+    let s_scale = s_ser.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    let mut s_max = 0.0_f64;
+    for (a, b) in s_par.iter().zip(s_ser.iter()) {
+        s_max = s_max.max((a - b).abs());
+    }
+    assert!(
+        s_max / s_scale < 1e-12,
+        "parallel vs serial reduced-Schur block diverges by rel {:e}",
+        s_max / s_scale
+    );
+    let r_scale = rhs_ser
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    let mut r_max = 0.0_f64;
+    for (a, b) in rhs_par.iter().zip(rhs_ser.iter()) {
+        r_max = r_max.max((a - b).abs());
+    }
+    assert!(
+        r_max / r_scale < 1e-12,
+        "parallel vs serial reduced-RHS diverges by rel {:e}",
+        r_max / r_scale
+    );
+
+    // (c) back_substitute parallel-vs-sequential: per-row writes are disjoint,
+    // so the parallel scatter must match the hand-rolled sequential back-solve
+    // BIT-FOR-BIT (no reassociation — each segment is computed identically).
+    let s_bs = StreamingArrowSchur::from_system(&sys, n);
+    // Use the already-solved Δβ as the back-substitution input.
+    let delta_t = s_bs
+        .back_substitute(0.0, db_a.view())
+        .expect("parallel back_substitute");
+    // Sequential reference: replicate the per-row formula directly.
+    let backend = CpuBatchedBlockSolver;
+    let total_len: usize = (0..n).map(|i| sys.rows[i].htt.nrows()).sum();
+    let mut ref_dt = Array1::<f64>::zeros(total_len);
+    let mut base = 0usize;
+    for i in 0..n {
+        let row = &sys.rows[i];
+        let di = row.htt.nrows();
+        let factor = factor_one_row(row, 0.0, di, i, false).expect("factor row");
+        let mut rhs = Array1::<f64>::zeros(di);
+        for c in 0..di {
+            let mut acc = 0.0_f64;
+            for a in 0..k {
+                acc += row.htbeta[[c, a]] * db_a[a];
+            }
+            rhs[c] = row.gt[c] + acc;
+        }
+        let dt_i = backend.solve_block_vector(factor.view(), rhs.view());
+        for c in 0..di {
+            ref_dt[base + c] = -dt_i[c];
+        }
+        base += di;
+    }
+    for i in 0..total_len {
+        assert_eq!(
+            delta_t[i].to_bits(),
+            ref_dt[i].to_bits(),
+            "parallel back_substitute must match sequential bit-for-bit at {i}"
+        );
+    }
+}
+
+/// #1017 streaming-assembly speedup bench. Times the reduced-Schur + reduced-RHS
+/// assembly (`accumulate_chunk`) at the SAE-arm shape, serial (tiny sub-MIN
+/// chunks) vs parallel (one big chunk over rayon). Run with `--release
+/// --nocapture` on a quiet multicore box to read the wall-clock and speedup;
+/// the assembly is paid once per outer evaluation in the streaming joint fit.
+///
+/// ```text
+/// cargo test --lib --release \
+///   solver::arrow_schur::tests::bench_streaming_assembly_parallel_speedup \
+///   -- --nocapture
+/// ```
+#[test]
+pub(crate) fn bench_streaming_assembly_parallel_speedup() {
+    let n = 1500usize;
+    let d = 6usize;
+    let k = 512usize;
+    let sys = dense_direct_system(n, d, k);
+    let calls = 10usize;
+    let mut sink = 0.0_f64;
+
+    // Serial: tiny chunks (each < SCHUR_MATVEC_PARALLEL_ROW_MIN) take the
+    // in-place per-row path. Warm once before timing.
+    let serial_assemble = || -> f64 {
+        let mut s = StreamingArrowSchur::from_system(&sys, 8);
+        s.reset_accumulator(0.0).expect("reset");
+        for start in (0..n).step_by(8) {
+            let end = (start + 8).min(n);
+            s.accumulate_chunk(start, end, 0.0, ArrowSolverMode::Direct)
+                .expect("serial accumulate");
+        }
+        let (s_acc, _) = s.take_accumulators();
+        s_acc[[0, 0]]
+    };
+    sink += serial_assemble();
+    let t_seq = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += serial_assemble();
+    }
+    let seq_per = t_seq.elapsed().as_secs_f64() / calls as f64;
+
+    // Parallel: one big chunk (>= MIN) fans over rayon. Warm once.
+    let par_assemble = || -> f64 {
+        let mut s = StreamingArrowSchur::from_system(&sys, n);
+        s.reset_accumulator(0.0).expect("reset");
+        s.accumulate_chunk(0, n, 0.0, ArrowSolverMode::Direct)
+            .expect("parallel accumulate");
+        let (s_acc, _) = s.take_accumulators();
+        s_acc[[0, 0]]
+    };
+    sink += par_assemble();
+    let t_par = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += par_assemble();
+    }
+    let par_per = t_par.elapsed().as_secs_f64() / calls as f64;
+
+    println!(
+        "[#1017 streaming assembly, n={n} d={d} k={k}, {calls} calls, \
+             {} rayon threads]\n  serial:   {:.3} ms/call\n  parallel: {:.3} ms/call\n  \
+             speedup:  {:.2}x  (sink {:.3e})",
+        rayon::current_num_threads(),
+        seq_per * 1e3,
+        par_per * 1e3,
+        seq_per / par_per,
+        sink,
+    );
+    assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
+}
+
+/// #1017 preconditioner-build parallelism: `JacobiPreconditioner::build_block_jacobi`
+/// — the term-block-Jacobi PCG preconditioner built once per inexact-PCG solve
+/// (so O(inner-Newton-iters) times per fit) — fans its per-row reduced-Schur
+/// sub-block sweep over rayon above `SCHUR_MATVEC_PARALLEL_ROW_MIN`. It must be
+/// (a) DETERMINISTIC run-to-run — bit-identical regardless of thread scheduling
+/// (the preconditioner, hence the criterion ranking, cannot move); and
+/// (b) numerically equal to the sequential per-row fold up to ULP-level
+/// reassociation. Asserted through the applied output `P⁻¹ r` (the factored
+/// block apply), which is what the PCG iterate actually consumes.
+#[test]
+pub(crate) fn parallel_block_jacobi_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
+    let d = 4usize;
+    let k = 24usize;
+    let mut sys = dense_direct_system(n, d, k);
+    // Partition the border into 4 blocks of 6 (each < BLOCK_JACOBI_MAX_BLOCK),
+    // so `build_block_jacobi` is the path taken.
+    let offsets: Vec<std::ops::Range<usize>> = (0..k).step_by(6).map(|s| s..(s + 6)).collect();
+    sys.set_block_offsets(offsets.into());
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let r = Array1::from_iter((0..k).map(|a| 0.4 * ((a as f64) * 0.019).cos() - 0.05));
+
+    // (a) Determinism: two independent builds of the live (parallel) path must
+    // apply bit-identically.
+    let p_a = JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("block Jacobi build a");
+    let p_b = JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("block Jacobi build b");
+    let out_a = p_a.apply(&r);
+    let out_b = p_b.apply(&r);
+    for a in 0..k {
+        assert_eq!(
+            out_a[a].to_bits(),
+            out_b[a].to_bits(),
+            "parallel block Jacobi must apply deterministically at {a}"
+        );
+    }
+
+    // (b) Equivalence with a hand-rolled sequential per-row reduced-Schur build.
+    // Seed each block with H_ββ block-diag + ridge (here hbb is diagonal 6.0),
+    // then subtract Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i) row by row.
+    let mut ref_blocks: Vec<Array2<f64>> = Vec::new();
+    for range in sys.block_offsets.iter() {
+        let b = range.end - range.start;
+        let mut blk = Array2::<f64>::zeros((b, b));
+        for bi in 0..b {
+            blk[[bi, bi]] = sys.hbb[[range.start + bi, range.start + bi]] + ridge_beta;
+        }
+        ref_blocks.push(blk);
+    }
+    for i in 0..n {
+        let row = &sys.rows[i];
+        let di = row.htt.nrows();
+        let factor = factor_one_row(row, 0.0, di, i, false).expect("factor row");
+        for (bidx, range) in sys.block_offsets.iter().enumerate() {
+            let b = range.end - range.start;
+            let mut solved_cols = Array2::<f64>::zeros((di, b));
+            for bj in 0..b {
+                let gj = range.start + bj;
+                let rhs = row.htbeta.column(gj).to_owned();
+                let solved = backend.solve_block_vector(factor.view(), rhs.view());
+                for c in 0..di {
+                    solved_cols[[c, bj]] = solved[c];
+                }
+            }
+            for bi in 0..b {
+                let gi = range.start + bi;
+                for bj in 0..b {
+                    let mut acc = 0.0;
+                    for c in 0..di {
+                        acc += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                    }
+                    ref_blocks[bidx][[bi, bj]] -= acc;
+                }
+            }
+        }
+    }
+    // Apply the reference block-diagonal inverse to r by Cholesky-solving each
+    // assembled block (the same factor+solve `build_block_jacobi.apply` uses).
+    let mut ref_out = Array1::<f64>::zeros(k);
+    for (bidx, range) in sys.block_offsets.iter().enumerate() {
+        let b = range.end - range.start;
+        let llt = {
+            use faer::Side;
+            let view = crate::linalg::faer_ndarray::FaerArrayView::new(&ref_blocks[bidx]);
+            crate::linalg::faer_ndarray::FaerLlt::new(view.as_ref(), Side::Lower)
+                .expect("ref block must be PD")
+        };
+        let rhs = Array1::from_iter((0..b).map(|bi| r[range.start + bi]));
+        use faer::linalg::solvers::Solve;
+        let stride = rhs.strides()[0];
+        let len = rhs.len();
+        // SAFETY: `rhs` is a live `Array1<f64>` that outlives `rhs_mat` (both
+        // dropped at the end of this loop iteration); `rhs.as_ptr()` is valid for
+        // `len = rhs.len()` contiguous f64 reads, and the `(len, 1)` shape with
+        // row stride `rhs.strides()[0]` and col stride 0 exactly describes that
+        // single-column layout. No aliasing: the view is read-only and `rhs` is
+        // not mutated while `rhs_mat` is borrowed.
+        let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
+        let solved = llt.solve(rhs_mat);
+        for bi in 0..b {
+            ref_out[range.start + bi] = solved[(bi, 0)];
+        }
+    }
+    let scale = ref_out.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    let mut max_abs = 0.0_f64;
+    for a in 0..k {
+        max_abs = max_abs.max((out_a[a] - ref_out[a]).abs());
+    }
+    assert!(
+        max_abs / scale < 1e-10,
+        "parallel block Jacobi apply diverges from sequential by rel {:e}",
+        max_abs / scale
+    );
+}
+
+/// #1017 block-Jacobi preconditioner-build speedup bench. Times
+/// `build_block_jacobi` at the SAE-arm shape, sequential (forced via an inside-
+/// worker call so the gate stays serial) vs the live parallel build. Run with
+/// `--release --nocapture` on a quiet multicore box; the preconditioner is built
+/// once per inexact-PCG solve in the streaming joint fit.
+///
+/// ```text
+/// cargo test --lib --release \
+///   solver::arrow_schur::tests::bench_block_jacobi_parallel_speedup -- --nocapture
+/// ```
+#[test]
+pub(crate) fn bench_block_jacobi_parallel_speedup() {
+    let n = 1500usize;
+    let d = 6usize;
+    let k = 480usize;
+    let mut sys = dense_direct_system(n, d, k);
+    // 80 blocks of 6 (< BLOCK_JACOBI_MAX_BLOCK) → the block-Jacobi path.
+    let offsets: Vec<std::ops::Range<usize>> = (0..k).step_by(6).map(|s| s..(s + 6)).collect();
+    sys.set_block_offsets(offsets.into());
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let calls = 10usize;
+    let mut sink = 0.0_f64;
+
+    // Sequential baseline: force the serial gate by running the build INSIDE a
+    // rayon worker (`current_thread_index()` is then `Some`, so the per-row
+    // sweep stays sequential). A single-thread pool keeps it genuinely serial —
+    // `std::iter::once` on the test thread would take the PARALLEL path (the
+    // top-level thread has no rayon index) and measure parallel-vs-parallel.
+    let one_thread = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("one-thread pool");
+    let seq_build = || -> f64 {
+        one_thread.install(|| {
+            let p =
+                JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+                    .expect("serial block Jacobi");
+            p.apply(&Array1::<f64>::ones(k))[0]
+        })
+    };
+    sink += seq_build();
+    let t_seq = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += seq_build();
+    }
+    let seq_per = t_seq.elapsed().as_secs_f64() / calls as f64;
+
+    // Parallel: top-level call (not nested) trips the rayon path.
+    let par_build = || -> f64 {
+        let p = JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+            .expect("parallel block Jacobi");
+        p.apply(&Array1::<f64>::ones(k))[0]
+    };
+    sink += par_build();
+    let t_par = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += par_build();
+    }
+    let par_per = t_par.elapsed().as_secs_f64() / calls as f64;
+
+    println!(
+        "[#1017 block-Jacobi build, n={n} d={d} k={k} ({} blocks), {calls} calls, \
+             {} rayon threads]\n  serial:   {:.3} ms/call\n  parallel: {:.3} ms/call\n  \
+             speedup:  {:.2}x  (sink {:.3e})",
+        sys.block_offsets.len(),
+        rayon::current_num_threads(),
+        seq_per * 1e3,
+        par_per * 1e3,
+        seq_per / par_per,
+        sink,
+    );
+    assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
+}
+
+/// #1017 scalar-Jacobi build parallelism: `build_scalar_jacobi` (the scalar-
+/// diagonal PCG preconditioner taken for wide/absent block structure with no
+/// SAE residency) fans its per-row diagonal sweep over rayon above
+/// `SCHUR_MATVEC_PARALLEL_ROW_MIN`. Must be DETERMINISTIC run-to-run (bit-
+/// identical apply). Numeric equivalence vs the resident path is already covered
+/// by `resident_scalar_jacobi_matches_generic`; this pins run-to-run stability.
+#[test]
+pub(crate) fn parallel_scalar_jacobi_deterministic() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
+    let d = 4usize;
+    let k = 24usize;
+    let sys = dense_direct_system(n, d, k); // no block_offsets, no resident → scalar path
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let r = Array1::from_iter((0..k).map(|a| 0.3 * ((a as f64) * 0.023).sin() + 0.11));
+
+    let p_a = JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("scalar Jacobi a");
+    let p_b = JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("scalar Jacobi b");
+    let out_a = p_a.apply(&r);
+    let out_b = p_b.apply(&r);
+    for a in 0..k {
+        assert_eq!(
+            out_a[a].to_bits(),
+            out_b[a].to_bits(),
+            "parallel scalar Jacobi must apply deterministically at {a}"
+        );
+    }
+}
+
+/// #1017 scalar-Jacobi build speedup bench (serial via nested-worker gate vs the
+/// live parallel build). Run with `--release --nocapture`.
+#[test]
+pub(crate) fn bench_scalar_jacobi_parallel_speedup() {
+    let n = 1500usize;
+    let d = 6usize;
+    let k = 480usize;
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let calls = 10usize;
+    let mut sink = 0.0_f64;
+
+    // Force the serial gate by building inside a single-thread rayon worker
+    // (`current_thread_index()` is `Some` ⇒ the per-row sweep stays sequential).
+    let one_thread = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("one-thread pool");
+    let seq_build = || -> f64 {
+        one_thread.install(|| {
+            JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+                .expect("serial scalar Jacobi")
+                .apply(&Array1::<f64>::ones(k))[0]
+        })
+    };
+    sink += seq_build();
+    let t_seq = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += seq_build();
+    }
+    let seq_per = t_seq.elapsed().as_secs_f64() / calls as f64;
+
+    let par_build = || -> f64 {
+        JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+            .expect("parallel scalar Jacobi")
+            .apply(&Array1::<f64>::ones(k))[0]
+    };
+    sink += par_build();
+    let t_par = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += par_build();
+    }
+    let par_per = t_par.elapsed().as_secs_f64() / calls as f64;
+
+    println!(
+        "[#1017 scalar-Jacobi build, n={n} d={d} k={k}, {calls} calls, \
+             {} rayon threads]\n  serial:   {:.3} ms/call\n  parallel: {:.3} ms/call\n  \
+             speedup:  {:.2}x  (sink {:.3e})",
+        rayon::current_num_threads(),
+        seq_per * 1e3,
+        par_per * 1e3,
+        seq_per / par_per,
+        sink,
+    );
+    assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
+}
+
+/// #1017 `arrow_operator_infinity_norm` must equal the brute-force inf-norm of
+/// the fully-assembled arrow operator `[[H_tt+ρ_t I, H_tβ],[H_βt, H_ββ+ρ_β I]]`.
+/// The optimized single-pass form (materialize each row's cross-block ONCE,
+/// fold its column-abs into a length-K vector) replaced an `O(K·n·K²)`
+/// re-materialization; it computes the SAME absolute row sums, so it must match
+/// a dense assembly bit-for-bit (same terms, same per-column accumulation order).
+#[test]
+pub(crate) fn arrow_operator_infinity_norm_matches_dense_assembly() {
+    let n = 12usize;
+    let d = 3usize;
+    let k = 7usize;
+    let sys = dense_direct_system(n, d, k);
+    let ridge_t = 0.3_f64;
+    let ridge_beta = 0.2_f64;
+
+    let got = arrow_operator_infinity_norm(&sys, ridge_t, ridge_beta).expect("inf-norm");
+
+    // Brute-force dense assembly: total dim = n*d (t) + k (beta).
+    let total = n * d + k;
+    let mut full = Array2::<f64>::zeros((total, total));
+    let hbb = sys.effective_penalty_op().to_dense();
+    // t-blocks on the diagonal + cross-blocks H_tβ / H_βt.
+    for i in 0..n {
+        let base = i * d;
+        let row = &sys.rows[i];
+        let htbeta = sys_htbeta_materialize_row(&sys, i, row).expect("materialize");
+        for a in 0..d {
+            for b in 0..d {
+                full[[base + a, base + b]] = row.htt[[a, b]];
+            }
+            full[[base + a, base + a]] += ridge_t;
+            for bc in 0..k {
+                let v = htbeta[[a, bc]];
+                full[[base + a, n * d + bc]] = v; // H_tβ
+                full[[n * d + bc, base + a]] = v; // H_βt (symmetric)
+            }
+        }
+    }
+    for br in 0..k {
+        for bc in 0..k {
+            full[[n * d + br, n * d + bc]] += hbb[[br, bc]];
+        }
+        full[[n * d + br, n * d + br]] += ridge_beta;
+    }
+    let mut want = 0.0_f64;
+    for r in 0..total {
+        let mut s = 0.0_f64;
+        for c in 0..total {
+            s += full[[r, c]].abs();
+        }
+        want = want.max(s);
+    }
+    let scale = want.max(1.0);
+    assert!(
+        (got - want).abs() / scale < 1e-12,
+        "arrow inf-norm {got} != dense assembly {want} (rel {:e})",
+        (got - want).abs() / scale
     );
 }
