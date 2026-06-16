@@ -1166,7 +1166,20 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         // numerical ridge to stabilize an indefinite exact-Newton Hessian.
         let rhs_step = self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta);
         let mut lhs_dense = lhs.to_dense();
-        stabilize_exact_newton_lhs_in_place(ctx.family, &mut lhs_dense, ctx.options.ridge_floor);
+        // `lhs_dense = H_data + S` is penalized by the PSD block penalty `S`.
+        // Bound the stabilizing ridge by the DATA Hessian's curvature, not the
+        // penalized matrix's Gershgorin disc (gam#979): an over-smoothed `S`
+        // has large balanced off-diagonals that make `diag − radius` read a
+        // spurious huge-negative `λ_min`, which would otherwise add a giant
+        // ridge and collapse every per-block Newton step. `self.hessian` is the
+        // data Hessian; use it as the Gershgorin source.
+        let data_hessian_dense = self.hessian.to_dense();
+        stabilize_exact_newton_penalized_lhs_in_place(
+            ctx.family,
+            &mut lhs_dense,
+            &data_hessian_dense,
+            ctx.options.ridge_floor,
+        );
 
         if let Some(constraints) = ctx.linear_constraints {
             check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
