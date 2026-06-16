@@ -851,8 +851,9 @@ pub struct FactoredFrameKroneckerOp {
 /// Frame output Gram `U_iᵀ U_j` (`r_i × r_j`) between two per-atom output
 /// frames (each `p × r`). This is the dense principal-angle cosine matrix that
 /// becomes the `w` factor of a [`FactoredFrameGBlock`]; for `i == j` with an
-/// orthonormal frame it is `I_{r_i}`. Shared with `sae_manifold.rs`, which
-/// builds the same factors when profiling decoders onto Grassmann frames.
+/// orthonormal frame it is `I_{r_i}`. Shared with
+/// [`crate::terms::sae::manifold`], which builds the same factors when
+/// profiling decoders onto Grassmann frames.
 pub fn frame_output_gram(u_i: ArrayView2<f64>, u_j: ArrayView2<f64>) -> Array2<f64> {
     let (p_i, r_i) = u_i.dim();
     let (p_j, r_j) = u_j.dim();

@@ -22,7 +22,7 @@
 //!         `run_per_atom_efs_if_frontier``;
 //!       * `src/solver/reml/per_atom_efs.rs:188` — assoc fns `new` /
 //!         `fully_coupled` never used;
-//!       * `src/terms/sae_candidate_index.rs:271` — field `bits_per_table`
+//!       * `src/terms/sae/candidate_index.rs:271` — field `bits_per_table`
 //!         never read;
 //!       * `src/terms/sae/corpus/shard_reader.rs:170` — field `path` never read.
 //!     `cargo build` → "could not compile `gam` (lib) due to 4 previous errors".
