@@ -2662,6 +2662,123 @@ mod step6_tests {
         assert_eq!(hess, expected_hess);
     }
 
+    /// Build a deterministic, varied Step-6 batch (mixed r per row, sparse
+    /// zeros in g_p / H_p / J so the kernel's zero-skip branches are exercised)
+    /// for the GPU-vs-CPU parity test.
+    fn varied_step6_rows(
+        n_rows: usize,
+        p: usize,
+    ) -> (Vec<SurvivalFlexStep5RowOutputs>, Vec<Vec<f64>>) {
+        let mut outs = Vec::with_capacity(n_rows);
+        let mut jacs = Vec::with_capacity(n_rows);
+        for row in 0..n_rows {
+            // r alternates in {2,3,4} but never exceeds p.
+            let r = (2 + (row % 3)).min(p);
+            let mut g = vec![0.0_f64; r];
+            let mut h = vec![0.0_f64; r * r];
+            let mut jac = vec![0.0_f64; r * p];
+            for a in 0..r {
+                // Sparse-ish primary gradient.
+                g[a] = if (a + row) % 4 == 0 {
+                    0.0
+                } else {
+                    0.3 * (a as f64 + 1.0) - 0.17 * (row as f64) + 0.05 * (a * row) as f64
+                };
+                for b in a..r {
+                    let v = if (a + b + row) % 5 == 0 {
+                        0.0
+                    } else {
+                        0.11 * ((a + 1) * (b + 1)) as f64 - 0.07 * (row as f64)
+                            + 0.9 * (a == b) as i32 as f64
+                    };
+                    h[a * r + b] = v;
+                    h[b * r + a] = v;
+                }
+                for j in 0..p {
+                    jac[a * p + j] = if (a + j + 2 * row) % 3 == 0 {
+                        0.0
+                    } else {
+                        0.5 - 0.13 * (j as f64) + 0.21 * (a as f64) - 0.04 * (row as f64)
+                    };
+                }
+            }
+            outs.push(SurvivalFlexStep5RowOutputs {
+                row_nll: 0.37 * (row as f64) - 1.1,
+                grad: g,
+                hess: h,
+            });
+            jacs.push(jac);
+        }
+        (outs, jacs)
+    }
+
+    /// GPU-vs-CPU parity for the on-device Step-6 joint-β contraction.
+    ///
+    /// On a CUDA host this launches `survival_flex_step6_rows` and asserts the
+    /// device `(nll, grad, H)` matches the host reference
+    /// `pullback_step6_joint_beta` bit-tight.  Off CUDA the device entry returns
+    /// `Ok(None)` and we assert the host fallback is finite (no false green on
+    /// CPU — we never pretend a device ran).
+    #[test]
+    fn step6_device_contraction_matches_cpu_reference() {
+        let n_rows = 37usize;
+        let p = 6usize;
+        let (outs, jacs) = varied_step6_rows(n_rows, p);
+        let rows: Vec<SurvivalFlexStep6RowPullback<'_>> = outs
+            .iter()
+            .zip(jacs.iter())
+            .map(|(o, j)| SurvivalFlexStep6RowPullback {
+                primary: o,
+                jacobian: j.as_slice(),
+            })
+            .collect();
+
+        let (cpu_nll, cpu_grad, cpu_hess) =
+            pullback_step6_joint_beta(&rows, p).expect("cpu reference");
+
+        match try_device_step6_joint_beta(&rows, p).expect("device step6") {
+            Some((gpu_nll, gpu_grad, gpu_hess)) => {
+                // Bit-tight: the per-row contraction uses the same blocked
+                // M=H_pJ order and rows are summed in order, so the only slack is
+                // FP non-associativity inside each output's per-element reduction.
+                let tol = 1e-12;
+                assert!(
+                    (gpu_nll - cpu_nll).abs() <= tol * (1.0 + cpu_nll.abs()),
+                    "nll: gpu {gpu_nll} vs cpu {cpu_nll}"
+                );
+                for j in 0..p {
+                    assert!(
+                        (gpu_grad[j] - cpu_grad[j]).abs() <= tol * (1.0 + cpu_grad[j].abs()),
+                        "grad[{j}]: gpu {} vs cpu {}",
+                        gpu_grad[j],
+                        cpu_grad[j]
+                    );
+                }
+                for a in 0..p {
+                    for b in 0..p {
+                        assert!(
+                            (gpu_hess[[a, b]] - cpu_hess[[a, b]]).abs()
+                                <= tol * (1.0 + cpu_hess[[a, b]].abs()),
+                            "hess[{a},{b}]: gpu {} vs cpu {}",
+                            gpu_hess[[a, b]],
+                            cpu_hess[[a, b]]
+                        );
+                        assert_eq!(
+                            gpu_hess[[a, b]],
+                            gpu_hess[[b, a]],
+                            "device H not symmetric at ({a},{b})"
+                        );
+                    }
+                }
+            }
+            None => {
+                assert!(cpu_nll.is_finite());
+                assert!(cpu_grad.iter().all(|v| v.is_finite()));
+                assert!(cpu_hess.iter().all(|v| v.is_finite()));
+            }
+        }
+    }
+
     #[test]
     fn step6_rejects_jacobian_shape_mismatch() {
         let out = SurvivalFlexStep5RowOutputs {
