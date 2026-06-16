@@ -290,6 +290,7 @@ where
         reml_score: result.reml_score,
         stable_penalty_term: result.stable_penalty_term,
         penalized_objective,
+        used_device: result.used_device,
         outer_iterations: result.iterations,
         outer_converged: result.outer_converged,
         outer_gradient_norm: Some(result.finalgrad_norm),

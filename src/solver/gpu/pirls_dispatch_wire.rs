@@ -676,6 +676,7 @@ mod linux_impl {
             reparam_result: input.reparam_result,
             x_transformed: input.x_transformed_design,
             coordinate_frame: input.coordinate_frame,
+            used_device: true,
             cache_compacted: false,
             min_penalized_deviance,
         };
@@ -973,6 +974,7 @@ mod linux_impl {
             reparam_result: input.reparam_result,
             x_transformed: input.x_transformed_design,
             coordinate_frame: input.coordinate_frame,
+            used_device: true,
             cache_compacted: false,
             min_penalized_deviance: working_summary.min_penalized_deviance,
         };

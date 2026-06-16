@@ -833,6 +833,12 @@ class Model:
         return self.summary().family_name
 
     @property
+    def used_device(self) -> bool:
+        return rust_module().required_saved_model_payload_string(
+            self._model_bytes, "used_device"
+        ) == "true"
+
+    @property
     def model_class(self) -> str:
         return self._model_class_from_payload()
 

@@ -344,6 +344,7 @@ pub(super) fn assemble_pirls_result(
         reparam_result,
         x_transformed,
         coordinate_frame,
+        used_device: false,
         cache_compacted: false,
         min_penalized_deviance: working_summary.min_penalized_deviance,
     }
@@ -1235,6 +1236,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             reparam_result,
             x_transformed: make_reparam_operator(&x_original, &qs_arc_final, use_sparse_native),
             coordinate_frame,
+            used_device: false,
             cache_compacted: false,
             min_penalized_deviance: working_summary.min_penalized_deviance,
         };

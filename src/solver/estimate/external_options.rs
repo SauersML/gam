@@ -27,6 +27,7 @@ pub struct ExternalOptimResult {
     pub deviance: f64,
     /// Stable quadratic penalty term βᵀSβ, including any solver ridge quadratic.
     pub stable_penalty_term: f64,
+    pub used_device: bool,
     pub max_abs_eta: f64,
     pub constraint_kkt: Option<crate::pirls::ConstraintKktDiagnostics>,
     pub artifacts: FitArtifacts,

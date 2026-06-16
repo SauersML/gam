@@ -558,6 +558,7 @@ pub struct UnifiedFitResultParts {
     pub reml_score: f64,
     pub stable_penalty_term: f64,
     pub penalized_objective: f64,
+    pub used_device: bool,
     pub outer_iterations: usize,
     pub outer_converged: bool,
     pub outer_gradient_norm: Option<f64>,
@@ -611,6 +612,9 @@ pub struct UnifiedFitResult {
     /// Public objective value reported for the fit. For REML/LAML fits this is
     /// the same complete objective as `reml_score`, not `-ℓ + penalty + reml_score`.
     pub penalized_objective: f64,
+    /// Whether the converged fit used a GPU execution path for its final inner solve.
+    #[serde(default)]
+    pub used_device: bool,
     /// Number of outer (smoothing parameter) iterations.
     pub outer_iterations: usize,
     /// Whether the outer optimization converged.
@@ -975,6 +979,7 @@ impl UnifiedFitResult {
             reml_score,
             stable_penalty_term,
             penalized_objective,
+            used_device,
             outer_iterations,
             outer_converged,
             outer_gradient_norm,
@@ -1279,6 +1284,7 @@ impl UnifiedFitResult {
             reml_score,
             stable_penalty_term,
             penalized_objective,
+            used_device,
             outer_iterations,
             outer_converged,
             outer_gradient_norm,
@@ -1315,6 +1321,7 @@ impl UnifiedFitResult {
             reml_score: self.reml_score,
             stable_penalty_term: self.stable_penalty_term,
             penalized_objective: self.penalized_objective,
+            used_device: self.used_device,
             outer_iterations: self.outer_iterations,
             outer_converged: self.outer_converged,
             outer_gradient_norm: self.outer_gradient_norm,
@@ -1350,6 +1357,7 @@ impl UnifiedFitResult {
             reml_score: parts.reml_score,
             stable_penalty_term: parts.stable_penalty_term,
             penalized_objective: parts.penalized_objective,
+            used_device: parts.used_device,
             outer_iterations: parts.outer_iterations,
             outer_converged: parts.outer_converged,
             outer_gradient_norm: parts.outer_gradient_norm,

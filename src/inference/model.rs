@@ -256,6 +256,8 @@ pub struct FittedModelPayload {
     pub family_state: FittedFamily,
     pub family: String,
     #[serde(default)]
+    pub used_device: bool,
+    #[serde(default)]
     pub fit_result: Option<UnifiedFitResult>,
     /// Unified (family-agnostic) representation of the fit result.
     #[serde(default)]
@@ -672,6 +674,7 @@ impl FittedModelPayload {
             model_kind,
             family_state,
             family,
+            used_device: false,
             fit_result: None,
             unified: None,
             spline_scan: None,

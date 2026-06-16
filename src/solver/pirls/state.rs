@@ -446,6 +446,8 @@ pub struct PirlsResult {
     // Cached X·Qs for this PIRLS result (transformed design matrix)
     pub x_transformed: DesignMatrix,
     pub coordinate_frame: PirlsCoordinateFrame,
+    /// True when this fixed-rho inner solve completed on a GPU path.
+    pub used_device: bool,
     /// True when this result was compacted for REML LRU storage and needs
     /// cold artifacts (for example `x_transformed`) rehydrated before exact
     /// bundle construction.
@@ -561,6 +563,7 @@ impl PirlsResult {
                 Array2::zeros((0, 0)),
             )),
             coordinate_frame: self.coordinate_frame,
+            used_device: self.used_device,
             cache_compacted: true,
             min_penalized_deviance: self.min_penalized_deviance,
         }

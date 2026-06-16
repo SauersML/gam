@@ -1732,6 +1732,7 @@ where
         pirls_status,
         deviance: pirls_res.deviance,
         stable_penalty_term: pirls_res.stable_penalty_term,
+        used_device: pirls_res.used_device,
         max_abs_eta: pirls_res.max_abs_eta,
         constraint_kkt: pirls_res.constraint_kkt.clone(),
         artifacts: FitArtifacts {

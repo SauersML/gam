@@ -5203,6 +5203,7 @@ fn build_standard_payload(
         },
         family_name,
     );
+    payload.used_device = saved_fit.used_device;
     payload.unified = Some(saved_fit.clone());
     payload.fit_result = Some(saved_fit);
     payload.data_schema = Some(dataset.schema.clone());
