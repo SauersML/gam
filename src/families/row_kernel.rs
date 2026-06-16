@@ -179,9 +179,8 @@ impl RowSet {
     /// returns `RowSet::All` with the caller-supplied `n_total`.
     ///
     /// `n_total` is the full data row count; it is recorded as `n_full`
-    /// on the `Subsample` variant so the Horvitz–Thompson weights can be
-    /// validated downstream against the population size, and is returned
-    /// directly inside `All` callers via `n_effective`.
+    /// on the `Subsample` variant so downstream row-set consumers can validate
+    /// Horvitz-Thompson weights against the population size.
     pub fn from_options(
         opts: &crate::families::custom_family::BlockwiseFitOptions,
         n_total: usize,
@@ -192,58 +191,6 @@ impl RowSet {
                 rows: Arc::clone(&s.rows),
                 n_full: n_total,
             },
-        }
-    }
-
-    /// Effective row count: `n_total` for `All`, mask length for
-    /// `Subsample`. Used to size workspaces and estimate per-eval cost.
-    pub fn n_effective(&self) -> f64 {
-        match self {
-            Self::All => f64::NAN,
-            Self::Subsample { rows, .. } => rows.len() as f64,
-        }
-    }
-
-    /// Number of contributing rows. For `All` this is `n_total`; for
-    /// `Subsample` this is the mask length. Used by callers that need to
-    /// size workspaces without consulting `n_effective` (which returns
-    /// NaN for `All`).
-    #[inline]
-    pub fn len(&self, n_total: usize) -> usize {
-        match self {
-            Self::All => n_total,
-            Self::Subsample { rows, .. } => rows.len(),
-        }
-    }
-
-    /// Parallel `for_each` over the row set with no per-call allocation.
-    ///
-    /// `body(row_index, ht_weight)` is invoked for each contributing row.
-    /// `All` calls with `weight = 1.0` and `row_index ∈ 0..n_total`;
-    /// `Subsample` calls with each `WeightedOuterRow`'s `(index, weight)`.
-    #[inline]
-    pub fn par_for_each<F>(&self, n_total: usize, body: F)
-    where
-        F: Fn(usize, f64) + Send + Sync,
-    {
-        match self {
-            Self::All => {
-                let chunks = arrow_row_chunk_count(n_total);
-                (0..chunks).into_par_iter().for_each(|chunk_idx| {
-                    let start = chunk_idx * ARROW_ROW_CHUNK;
-                    let end = (start + ARROW_ROW_CHUNK).min(n_total);
-                    for i in start..end {
-                        body(i, 1.0);
-                    }
-                });
-            }
-            Self::Subsample { rows, .. } => {
-                rows.par_chunks(ARROW_ROW_CHUNK).for_each(|chunk| {
-                    for r in chunk {
-                        body(r.index, r.weight);
-                    }
-                });
-            }
         }
     }
 
