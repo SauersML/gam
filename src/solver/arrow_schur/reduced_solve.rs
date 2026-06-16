@@ -970,7 +970,7 @@ impl JacobiPreconditioner {
     /// When `sys.block_offsets` is non-empty and `max(block_size) ≤ 256`,
     /// each block gets a dense `b×b` Schur sub-matrix formed, factored, and
     /// stored.  Otherwise every column gets its own scalar entry.
-    pub(crate) fn from_arrow_schur<B: BatchedBlockSolver>(
+    pub(crate) fn from_arrow_schur<B: BatchedBlockSolver + Sync>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -1161,7 +1161,7 @@ impl JacobiPreconditioner {
 
     /// Build term-block Jacobi: one dense `b×b` Schur block per term in
     /// `sys.block_offsets`.
-    pub(crate) fn build_block_jacobi<B: BatchedBlockSolver>(
+    pub(crate) fn build_block_jacobi<B: BatchedBlockSolver + Sync>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -1202,7 +1202,18 @@ impl JacobiPreconditioner {
         // preconditioner build quadratically more expensive than the direct
         // dense Schur it preconditions. sys_htbeta_materialize_row handles the
         // Kronecker / htbeta_matvec path transparently.
-        for (i, row) in sys.rows.iter().enumerate() {
+        // Per-row body: materialize the row's `(d_i × K)` cross-block once and
+        // subtract its `H_βt_k^(i)(H_tt^(i))⁻¹H_tβ_k^(i)` contribution into EACH
+        // block-diagonal sub-block. Writes INTO a caller-provided `blocks`
+        // accumulator (`-=`) so a rayon worker can subtract a chunk's rows into
+        // a worker-private zero-seeded `Vec<Array2>` and the caller folds the
+        // chunk partials back in chunk order — bit-identical run-to-run
+        // regardless of thread scheduling (the #1017 verification gate: the
+        // preconditioner, hence the criterion ranking, must not move).
+        let row_into = |i: usize,
+                        row: &ArrowRowBlock,
+                        blocks: &mut [Array2<f64>]|
+         -> Result<(), ArrowSchurError> {
             let di = sys.row_dims[i];
             let htbeta_full = sys_htbeta_materialize_row(sys, i, row)?;
             for (block_idx, range) in block_offsets.iter().enumerate() {
@@ -1216,7 +1227,7 @@ impl JacobiPreconditioner {
                         solved_cols[[c, bj]] = solved[c];
                     }
                 }
-                let schur_block = &mut schur_blocks[block_idx];
+                let schur_block = &mut blocks[block_idx];
                 for bi in 0..b {
                     let gi = range.start + bi;
                     for bj in 0..b {
@@ -1227,6 +1238,47 @@ impl JacobiPreconditioner {
                         schur_block[[bi, bj]] -= acc;
                     }
                 }
+            }
+            Ok(())
+        };
+        // Each row materializes an `O(K²)` cross-block (Kronecker) plus `Σ_k b_k`
+        // triangular solves — the preconditioner build's whole per-row cost at
+        // the SAE LLM shape (#1017), and the rows are independent. Fan over fixed
+        // row chunks above the threshold, staying serial for the handful-of-rows
+        // non-SAE callers and inside a rayon worker (topology-race nesting guard)
+        // — the same gate `schur_matvec` uses.
+        let n = sys.rows.len();
+        let parallel =
+            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            let n_blocks = block_offsets.len();
+            let block_dims: Vec<usize> =
+                block_offsets.iter().map(|r| r.end - r.start).collect();
+            let partials: Vec<Vec<Array2<f64>>> = (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let mut local: Vec<Array2<f64>> = block_dims
+                        .iter()
+                        .map(|&b| Array2::<f64>::zeros((b, b)))
+                        .collect();
+                    for i in idxs {
+                        row_into(i, &sys.rows[i], &mut local)?;
+                    }
+                    Ok::<_, ArrowSchurError>(local)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Deterministic ordered reduction: fold chunk partials left-to-right.
+            for local in &partials {
+                for bidx in 0..n_blocks {
+                    schur_blocks[bidx] += &local[bidx];
+                }
+            }
+        } else {
+            for (i, row) in sys.rows.iter().enumerate() {
+                row_into(i, row, &mut schur_blocks)?;
             }
         }
 

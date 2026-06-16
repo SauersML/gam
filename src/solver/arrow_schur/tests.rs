@@ -3540,3 +3540,117 @@ pub(crate) fn bench_streaming_assembly_parallel_speedup() {
     );
     assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
 }
+
+/// #1017 preconditioner-build parallelism: `JacobiPreconditioner::build_block_jacobi`
+/// — the term-block-Jacobi PCG preconditioner built once per inexact-PCG solve
+/// (so O(inner-Newton-iters) times per fit) — fans its per-row reduced-Schur
+/// sub-block sweep over rayon above `SCHUR_MATVEC_PARALLEL_ROW_MIN`. It must be
+/// (a) DETERMINISTIC run-to-run — bit-identical regardless of thread scheduling
+/// (the preconditioner, hence the criterion ranking, cannot move); and
+/// (b) numerically equal to the sequential per-row fold up to ULP-level
+/// reassociation. Asserted through the applied output `P⁻¹ r` (the factored
+/// block apply), which is what the PCG iterate actually consumes.
+#[test]
+pub(crate) fn parallel_block_jacobi_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
+    let d = 4usize;
+    let k = 24usize;
+    let mut sys = dense_direct_system(n, d, k);
+    // Partition the border into 4 blocks of 6 (each < BLOCK_JACOBI_MAX_BLOCK),
+    // so `build_block_jacobi` is the path taken.
+    let offsets: Vec<std::ops::Range<usize>> = (0..k).step_by(6).map(|s| s..(s + 6)).collect();
+    sys.set_block_offsets(offsets.into());
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let r = Array1::from_iter((0..k).map(|a| 0.4 * ((a as f64) * 0.019).cos() - 0.05));
+
+    // (a) Determinism: two independent builds of the live (parallel) path must
+    // apply bit-identically.
+    let p_a = JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("block Jacobi build a");
+    let p_b = JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("block Jacobi build b");
+    let out_a = p_a.apply(&r);
+    let out_b = p_b.apply(&r);
+    for a in 0..k {
+        assert_eq!(
+            out_a[a].to_bits(),
+            out_b[a].to_bits(),
+            "parallel block Jacobi must apply deterministically at {a}"
+        );
+    }
+
+    // (b) Equivalence with a hand-rolled sequential per-row reduced-Schur build.
+    // Seed each block with H_ββ block-diag + ridge (here hbb is diagonal 6.0),
+    // then subtract Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i) row by row.
+    let mut ref_blocks: Vec<Array2<f64>> = Vec::new();
+    for range in sys.block_offsets.iter() {
+        let b = range.end - range.start;
+        let mut blk = Array2::<f64>::zeros((b, b));
+        for bi in 0..b {
+            blk[[bi, bi]] = sys.hbb[[range.start + bi, range.start + bi]] + ridge_beta;
+        }
+        ref_blocks.push(blk);
+    }
+    for i in 0..n {
+        let row = &sys.rows[i];
+        let di = row.htt.nrows();
+        let factor = factor_one_row(row, 0.0, di, i, false).expect("factor row");
+        for (bidx, range) in sys.block_offsets.iter().enumerate() {
+            let b = range.end - range.start;
+            let mut solved_cols = Array2::<f64>::zeros((di, b));
+            for bj in 0..b {
+                let gj = range.start + bj;
+                let rhs = row.htbeta.column(gj).to_owned();
+                let solved = backend.solve_block_vector(factor.view(), rhs.view());
+                for c in 0..di {
+                    solved_cols[[c, bj]] = solved[c];
+                }
+            }
+            for bi in 0..b {
+                let gi = range.start + bi;
+                for bj in 0..b {
+                    let mut acc = 0.0;
+                    for c in 0..di {
+                        acc += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                    }
+                    ref_blocks[bidx][[bi, bj]] -= acc;
+                }
+            }
+        }
+    }
+    // Apply the reference block-diagonal inverse to r by Cholesky-solving each
+    // assembled block (the same factor+solve `build_block_jacobi.apply` uses).
+    let mut ref_out = Array1::<f64>::zeros(k);
+    for (bidx, range) in sys.block_offsets.iter().enumerate() {
+        let b = range.end - range.start;
+        let llt = {
+            use faer::Side;
+            let view = crate::linalg::faer_ndarray::FaerArrayView::new(&ref_blocks[bidx]);
+            crate::linalg::faer_ndarray::FaerLlt::new(view.as_ref(), Side::Lower)
+                .expect("ref block must be PD")
+        };
+        let rhs = Array1::from_iter((0..b).map(|bi| r[range.start + bi]));
+        use faer::linalg::solvers::Solve;
+        let stride = rhs.strides()[0];
+        let len = rhs.len();
+        let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
+        let solved = llt.solve(rhs_mat);
+        for bi in 0..b {
+            ref_out[range.start + bi] = solved[(bi, 0)];
+        }
+    }
+    let scale = ref_out.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    let mut max_abs = 0.0_f64;
+    for a in 0..k {
+        max_abs = max_abs.max((out_a[a] - ref_out[a]).abs());
+    }
+    assert!(
+        max_abs / scale < 1e-10,
+        "parallel block Jacobi apply diverges from sequential by rel {:e}",
+        max_abs / scale
+    );
+}
