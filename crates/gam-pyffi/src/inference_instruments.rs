@@ -1506,6 +1506,67 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     Ok(out)
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// #1017 / #1026 — cross-fit GPU multiplex throughput on the OLMo battery's real
+// color-arm variant matrix. Quotes the measured `cross_fit_speedup`
+// (multiplexed fits/sec ÷ sequential fits/sec) for the K{1..4}×topology{4}×
+// basis{periodic,linear} sweep at the color-arm shape (n=180, p=5120), with a
+// bit-for-bit parity assertion against the sequential baseline. This is the
+// "throughput-quote" seam (path b): it runs the variant matrix over the resident
+// kernel's deterministic frames so the speedup is measured on the REAL shape
+// matrix before the per-cell real-slab fits are wired through the production
+// inner solve. Concurrency is automatic (per-fit CUDA streams off the shared
+// context on a CUDA build; CPU concurrency otherwise) — no flag.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Measure the GPU cross-fit multiplex throughput on the OLMo battery's real
+/// color-arm variant matrix (issue #1017): dispatch the full
+/// `K{1..4}×topology{4}×basis{periodic,linear}` sweep (32 cells, shape n=180,
+/// p=5120) concurrently on one device, assert bit-for-bit parity against the
+/// sequential baseline, and return the measured throughputs and speedup. Returns
+/// a dict with `cells`, `succeeded`, `multiplexed_fits_per_second`,
+/// `sequential_fits_per_second`, `cross_fit_speedup`, `multiplexed_wall_seconds`,
+/// `sequential_wall_seconds`, and `used_device` (whether the device path engaged
+/// on this build/host). The frames are the resident kernel's deterministic
+/// fixture; the SHAPE matrix is the battery's real one, so the quoted speedup is
+/// the cross-fit concurrency gain at the battery's true cell shapes.
+#[pyfunction]
+pub(crate) fn sweep_color_arm_throughput<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    use gam::gpu::kernels::sae_resident::{
+        DeviceResidentInnerOptions, assert_sweep_parity_vs_sequential, color_arm_variant_matrix,
+        run_variant_sweep_multiplexed,
+    };
+
+    let variants = color_arm_variant_matrix();
+    let opts = DeviceResidentInnerOptions::default();
+    let (results, mux) =
+        run_variant_sweep_multiplexed(&variants, opts).map_err(py_value_error)?;
+    // Parity assertion (bit-for-bit vs sequential) doubles as the sequential
+    // throughput measurement.
+    let seq = assert_sweep_parity_vs_sequential(&variants, &opts, &results)
+        .map_err(py_value_error)?;
+
+    let used_device = results
+        .iter()
+        .any(|r| r.as_ref().map(|f| f.outcome.used_device).unwrap_or(false));
+    let speedup = if seq.fits_per_second > 0.0 {
+        mux.fits_per_second / seq.fits_per_second
+    } else {
+        f64::NAN
+    };
+
+    let out = PyDict::new(py);
+    out.set_item("cells", mux.fits)?;
+    out.set_item("succeeded", mux.succeeded)?;
+    out.set_item("multiplexed_fits_per_second", mux.fits_per_second)?;
+    out.set_item("sequential_fits_per_second", seq.fits_per_second)?;
+    out.set_item("cross_fit_speedup", speedup)?;
+    out.set_item("multiplexed_wall_seconds", mux.wall_seconds)?;
+    out.set_item("sequential_wall_seconds", seq.wall_seconds)?;
+    out.set_item("used_device", used_device)?;
+    Ok(out)
+}
+
 /// Register the inference-instrument `#[pyfunction]`s and classes on the
 /// extension module. Kept here (rather than inline in `lib.rs`) so the wiring
 /// is one line at the call site.
@@ -1526,5 +1587,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
     module.add_function(wrap_pyfunction!(glm_full_conformal, module)?)?;
     module.add_function(wrap_pyfunction!(adjudicate_atom_shape, module)?)?;
+    module.add_function(wrap_pyfunction!(sweep_color_arm_throughput, module)?)?;
     Ok(())
 }

@@ -355,6 +355,23 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
     results["hillclimb"] = {"best": best, "trace": trace}
     print(f"  hillclimb best: {best['config']} heldout_ev={best['ev']:.4f}")
 
+    # --- experiment 6: GPU cross-fit multiplex throughput (#1017/#1026) ------
+    # Measured cross_fit_speedup on the REAL color-arm variant matrix
+    # (K{1..4}×topology{4}×basis{periodic,linear}, n=180, p=5120), bit-parity
+    # asserted vs sequential. Quoted over the resident kernel's deterministic
+    # frames (real shapes) until the per-cell real-slab fits are wired through.
+    if hasattr(gamfit, "sweep_color_arm_throughput"):
+        try:
+            tp = gamfit.sweep_color_arm_throughput()
+            results["gpu_multiplex_throughput"] = tp
+            print(f"  gpu multiplex: cells={tp['cells']} speedup={tp['cross_fit_speedup']:.2f}x "
+                  f"(mux={tp['multiplexed_fits_per_second']:.1f} fits/s, "
+                  f"seq={tp['sequential_fits_per_second']:.1f} fits/s, used_device={tp['used_device']})")
+        except Exception as exc:  # noqa: BLE001
+            results["gpu_multiplex_throughput"] = {"error": f"{type(exc).__name__}: {exc}"}
+    else:
+        results["gpu_multiplex_throughput"] = {"note": "sweep_color_arm_throughput not in this wheel"}
+
     out_path.write_text(json.dumps(results, indent=2, default=float))
     print(f"\nwrote {out_path}")
     return results
