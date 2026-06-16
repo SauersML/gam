@@ -1144,7 +1144,7 @@ pub(crate) struct SentinelOuterHessianOperator {
     pub(crate) matrix: Array2<f64>,
 }
 
-impl crate::solver::outer_strategy::OuterHessianOperator for SentinelOuterHessianOperator {
+impl crate::solver::rho_optimizer::OuterHessianOperator for SentinelOuterHessianOperator {
     fn dim(&self) -> usize {
         self.matrix.nrows()
     }

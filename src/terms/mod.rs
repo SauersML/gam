@@ -17,7 +17,6 @@ pub mod linear_dictionary;
 pub mod penalty_op;
 pub mod sae;
 pub mod sae_encode_atlas;
-pub mod sae_manifold;
 pub mod sheaf;
 pub mod smooth;
 pub mod smooth_overrides;
