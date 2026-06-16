@@ -182,7 +182,9 @@ pub fn scalar_skovgaard_r_star(input: &ScalarSkovgaardInput) -> Option<ScalarSko
     //   u   = q · ĵ / ( î · √Î / √Î )  =  q · ĵ / î    — but expressed via the
     // three-information identity so that the Exponential closed form checks out:
     //   u   = (θ̂ − θ₀) · ĵ / √Î.
-    let q = (theta_hat - theta_null) * score_cov.sqrt();
+    // `q = (θ̂−θ₀)·√Î` is retained in the documentation above for symmetry; the
+    // assembled `u` is what the third-order formula consumes, so `q` is not
+    // materialized as a binding.
     let u = (theta_hat - theta_null) * observed_info / score_cov.sqrt();
     // Guard the log-domain: u and r must share a sign and u/r > 0.
     let ratio = u / r;
@@ -215,10 +217,6 @@ pub fn scalar_skovgaard_r_star(input: &ScalarSkovgaardInput) -> Option<ScalarSko
     let p_move = (p_corr - p_first).abs() / p_denom;
     let r_move = (r_star - r).abs() / r.abs().max(f64::MIN_POSITIVE);
     let material = p_move > SKOVGAARD_MATERIAL_THRESHOLD || r_move > SKOVGAARD_MATERIAL_THRESHOLD;
-
-    // `q` is retained for documentation symmetry; the assembled `u` is what the
-    // third-order formula consumes.
-    let _ = q;
 
     Some(ScalarSkovgaardResult {
         r,
