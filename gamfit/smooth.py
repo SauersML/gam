@@ -169,6 +169,17 @@ class Smooth(_BasisDescriptor):
             out["shape_constraint"] = str(self.shape_constraint)
         if self.double_penalty:
             out["double_penalty"] = True
+        if self.by is not None:
+            # `by` is the per-row multiplier `by · s(x)`. On the formula
+            # `smooths={}` descriptor path the data frame is available to the
+            # Rust merge, so `by` travels as the *column name* of the gating
+            # variable — exactly what the formula `s(x, by=g)` syntax resolves
+            # to a `by_col`. The merge in `smooth_overrides.rs` resolves the
+            # name against the data headers and wraps the inner basis in the
+            # `SmoothBasisSpec::ByVariable` envelope. (Raw per-row `by` arrays
+            # are the contract of the primitive numpy API, not this path; they
+            # are rejected with a pointer in `_normalize_smooths`.)
+            out["by"] = str(self.by)
         return out
 
 
