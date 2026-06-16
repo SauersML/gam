@@ -8037,7 +8037,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     rho_prior: crate::types::RhoPrior,
 ) -> Result<
     (
-        crate::solver::outer_strategy::EfsEval,
+        crate::solver::rho_optimizer::EfsEval,
         ConstrainedWarmStart,
         bool,
     ),
@@ -8805,14 +8805,14 @@ pub(crate) fn nonconverged_outer_efs_result(
     context: &str,
 ) -> Result<
     (
-        crate::solver::outer_strategy::EfsEval,
+        crate::solver::rho_optimizer::EfsEval,
         ConstrainedWarmStart,
         bool,
     ),
     String,
 > {
     Ok((
-        crate::solver::outer_strategy::EfsEval {
+        crate::solver::rho_optimizer::EfsEval {
             cost: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
             steps: vec![0.0; theta_dim],
             beta: None,
@@ -8856,7 +8856,7 @@ pub struct BlockwiseFitResultParts {
     /// First-order optimality certificate from the outer smoothing solve
     /// (#934); `None` when no outer ran (fixed-λ, one-cycle probe) or the
     /// audit could not evaluate.
-    pub criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
+    pub criterion_certificate: Option<crate::solver::rho_optimizer::CriterionCertificate>,
     pub inner_cycles: usize,
     pub outer_converged: bool,
     pub geometry: Option<FitGeometry>,

@@ -775,7 +775,7 @@ mod tests {
             theta,
             rho_dim,
             hyper_dirs,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
         )?;
         Ok((
             cost,
@@ -814,7 +814,7 @@ mod tests {
             &theta,
             rho.len(),
             &[hyper],
-            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
         )?;
         Ok(gradient[rho.len()])
     }
@@ -946,7 +946,7 @@ mod tests {
         state
             .compute_outer_eval_with_order(
                 &rho,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
             )
             .expect("outer eval should succeed");
 
@@ -1270,7 +1270,7 @@ mod tests {
         let outer = state
             .compute_outer_eval_with_order(
                 &rho,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
             )
             .expect("outer Hessian eval should succeed");
         assert!(
@@ -1331,7 +1331,7 @@ mod tests {
         let eval = state
             .compute_outer_eval_with_order(
                 &rho,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
             )
             .expect("analytic Hessian eval");
         let h = eval.hessian.unwrap_analytic();
@@ -1344,7 +1344,7 @@ mod tests {
             let gp = state
                 .compute_outer_eval_with_order(
                     &rp,
-                    crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+                    crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
                 )
                 .expect("plus grad")
                 .gradient;
