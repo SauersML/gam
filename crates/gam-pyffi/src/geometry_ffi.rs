@@ -4280,7 +4280,7 @@ fn conditional_prior_ivae<'py>(
     mean: PyReadonlyArray2<'py, f64>,
     scale: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<(f64, Py<PyArray2<f64>>)> {
-    let pen = gam::sae_identifiability::ConditionalPriorIvae::new(
+    let pen = gam::terms::sae::identifiability::ConditionalPriorIvae::new(
         mean.as_array().to_owned(),
         scale.as_array().to_owned(),
         weight,
@@ -4304,7 +4304,7 @@ fn diagnostics_aux_richness<'py>(
     latents: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<Py<PyDict>> {
     let m =
-        gam::identifiability_diagnostics::aux_richness_metrics(aux.as_array(), latents.as_array());
+        gam::inference::identifiability_kernels::aux_richness_metrics(aux.as_array(), latents.as_array());
     let dict = PyDict::new(py);
     dict.set_item("aux_observed", m.aux_observed)?;
     dict.set_item("n_nonfinite_aux", m.n_nonfinite_aux)?;
@@ -4348,7 +4348,7 @@ fn diagnostics_jacobian_sparsity<'py>(
             rows, n_samples
         )));
     }
-    let m = gam::identifiability_diagnostics::jacobian_sparsity_metrics(
+    let m = gam::inference::identifiability_kernels::jacobian_sparsity_metrics(
         jacobians_flat.as_array(),
         n_samples,
         zero_threshold,
@@ -4379,7 +4379,7 @@ fn diagnostics_anchor_consistency<'py>(
             anchor_dominance
         )));
     }
-    let m = gam::identifiability_diagnostics::anchor_consistency_metrics(
+    let m = gam::inference::identifiability_kernels::anchor_consistency_metrics(
         assignments.as_array(),
         anchor_dominance,
     );
@@ -4401,7 +4401,7 @@ fn diagnostics_concat_decoder_blocks<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let views: Vec<_> = blocks.iter().map(|b| b.as_array()).collect();
     let out =
-        gam::identifiability_diagnostics::concat_decoder_blocks(&views).map_err(py_value_error)?;
+        gam::inference::identifiability_kernels::concat_decoder_blocks(&views).map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
 }
 
