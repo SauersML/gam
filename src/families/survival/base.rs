@@ -1527,7 +1527,7 @@ impl WorkingModelSurvival {
         // all-censored inputs, and unit tests legitimately exercise those
         // structural paths on censored fixtures.  Move the fittability check
         // out of construction; production fit dispatchers (e.g.
-        // `solver::workflow::materialize_survival`) enforce it on the
+        // `solver::fit_orchestration::materialize_survival`) enforce it on the
         // single chokepoint that actually starts an optimization, where
         // the failure mode it guards against is reachable.
         if age_entry

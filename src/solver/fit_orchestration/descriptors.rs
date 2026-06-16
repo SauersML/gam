@@ -3,7 +3,7 @@
 //! A single source of truth for the analytic-penalty descriptor schema:
 //! weight schedules, temperature schedules, dense flattened arrays, the
 //! per-kind descriptor fields, and the final [`AnalyticPenaltyRegistry`]
-//! construction. Both entry points — the in-process `solver::workflow`
+//! construction. Both entry points — the in-process `solver::fit_orchestration`
 //! pipeline and the Python FFI (`gam-pyffi`) — parse descriptors here, so
 //! workflow and Python users see the same accepted JSON, the same defaults,
 //! the same shape checks, and byte-identical error messages for the same
@@ -498,7 +498,7 @@ fn descriptor_array2_flat(
 
 /// Build the analytic-penalty registry from `(latents, penalties)` descriptor
 /// JSON. This is the single shared parser invoked by both the in-process
-/// `solver::workflow` pipeline and the Python FFI.
+/// `solver::fit_orchestration` pipeline and the Python FFI.
 ///
 /// `latents` is the JSON object keyed by formula symbol that declares the
 /// penalty targets (`n`, `d`, optional `name`); `penalties` is the JSON array of
@@ -1375,7 +1375,7 @@ fn descriptor_axis_groups(
 mod tests {
     //! Parity / schema-lock tests for the single shared descriptor parser.
     //!
-    //! Both the in-process workflow pipeline (`solver::workflow`) and the Python
+    //! Both the in-process orchestration pipeline (`solver::fit_orchestration`) and the Python
     //! FFI (`gam-pyffi`) call
     //! [`build_analytic_penalty_registry_from_descriptors`] directly — no entry
     //! point owns its own copy of the schema. Exercising the shared parser here

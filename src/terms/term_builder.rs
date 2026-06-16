@@ -3668,7 +3668,7 @@ pub fn validate_known_options(
 
 /// Private (engine-injected) option that caps the *default* spatial center
 /// count for a secondary (distributional) predictor's smooth — see
-/// `solver::workflow::apply_secondary_predictor_basis_parsimony` and #501.
+/// `solver::fit_orchestration::apply_secondary_predictor_basis_parsimony` and #501.
 ///
 /// It is deliberately NOT one of the user-facing count aliases recognised by
 /// [`has_explicit_countwith_basis_alias`], so it never flips the spatial basis

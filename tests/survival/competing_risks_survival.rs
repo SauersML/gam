@@ -69,7 +69,7 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
         // likelihood routes each cause to disjoint risk sets so each
         // per-cause baseline is independently identifiable, but the
         // identifiability audit only sees the unweighted joint design. Mirror
-        // the production cause-specific path (`solver::workflow`) and the
+        // the production cause-specific path (`solver::fit_orchestration`) and the
         // multinomial-class convention: use descending gauge priorities so
         // the audit's cross-block pair filter resolves the shared direction
         // by priority, and attach an `AdditiveBlockJacobian` with

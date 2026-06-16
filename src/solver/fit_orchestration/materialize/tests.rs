@@ -1617,7 +1617,7 @@ fn resolve_family_accepts_mgcv_parenthesized_family_link_syntax() {
     // `family: Some("binomial(logit)".to_string())` straight through to the
     // resolver (`sphere_logit_predict_finite_at_pole`, `sphere_binomial_*`),
     // and would otherwise be rejected as `unknown family`.
-    use crate::solver::workflow::resolve_family;
+    use crate::solver::fit_orchestration::resolve_family;
     use crate::types::{
         InverseLink, LinkFunction, ResponseColumnKind, ResponseFamily, StandardLink,
     };

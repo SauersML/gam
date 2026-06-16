@@ -42,7 +42,7 @@ pub mod topology_selector;
 pub mod visualizer;
 pub(crate) mod warm_start_artifact;
 pub(crate) mod warm_start_transfer;
-pub mod workflow;
+pub mod fit_orchestration;
 
 pub use evidence::{
     EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,
@@ -85,4 +85,4 @@ pub use estimate::reml::unified::CorrectedCovarianceError;
 /// analytic-penalty registry through the single shared descriptor parser that
 /// also serves the in-process workflow pipeline. Exposed here so PyFFI can name
 /// it without the (crate-private) `workflow` module being publicly reachable.
-pub use workflow::descriptors::build_analytic_penalty_registry_from_descriptors;
+pub use fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;

@@ -72,7 +72,7 @@ use crate::inference::formula_dsl::parse_formula;
 use crate::inference::model::ColumnKindTag;
 use crate::solver::estimate::EstimationError;
 use crate::solver::resource::ProblemHints;
-use crate::solver::workflow::{
+use crate::solver::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
 };
 use crate::terms::smooth::{
@@ -190,7 +190,7 @@ const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 
 /// Calibrated convergence tolerance for the OUTER REML/LAML smoothing-parameter
 /// search on the formula multinomial path. Matches the primary GLM REML outer
-/// (`solver::workflow::materialize` uses `tol = 1e-7`, mirrored by the
+/// (`solver::fit_orchestration::materialize` uses `tol = 1e-7`, mirrored by the
 /// `LOG_LAMBDA_TOL` / `KKT_TOL_*` constants across the REML stack): tight enough
 /// that the selected λ reaches the genuine REML optimum (the recovered
 /// probability surface matches the mature reference), loose enough that the
@@ -907,7 +907,7 @@ fn build_formula_design_for_multinomial(
     let col_map = data.column_map();
     let y_col = resolve_role_col(&col_map, &parsed.response, "response")
         .map_err(|err| EstimationError::InvalidInput(format!("multinomial fit: {err}")))?;
-    let y_kind = crate::solver::workflow::response_column_kind(data, y_col);
+    let y_kind = crate::solver::fit_orchestration::response_column_kind(data, y_col);
     let policy = resolved_resource_policy(config, data, ProblemHints::default());
     let mut inference_notes: Vec<String> = Vec::new();
     let spec = build_termspec_with_geometry_and_overrides(
@@ -1197,7 +1197,7 @@ pub fn fit_penalized_multinomial_formula(
     //
     // The right target is the framework's CALIBRATED REML convergence tolerance,
     // `MULTINOMIAL_OUTER_REML_TOL = 1e-7` — the same value the primary GLM REML
-    // outer uses (`solver::workflow::materialize` `tol: 1e-7`, mirrored by the
+    // outer uses (`solver::fit_orchestration::materialize` `tol: 1e-7`, mirrored by the
     // `LOG_LAMBDA_TOL`/`KKT_TOL_*` constants across the REML stack). At 1e-7 the
     // λ-search reaches the genuine REML optimum (so the recovered probability
     // surface matches the mature reference), but it does NOT chase the last

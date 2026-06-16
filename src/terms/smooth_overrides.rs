@@ -2,7 +2,7 @@
 //! override registry onto a freshly-built `TermCollectionSpec`.
 //!
 //! This is the second half of the symmetric lowering described in
-//! `solver::workflow::build_termspec_with_geometry_and_overrides`:
+//! `solver::fit_orchestration::build_termspec_with_geometry_and_overrides`:
 //! the formula DSL builds the initial `SmoothBasisSpec`, then this module
 //! patches per-term tunables (explicit center matrices, knot vectors, kernel
 //! hyperparameters) into the spec in place. The output is bit-identical to

@@ -1961,7 +1961,7 @@ pub(crate) fn run_fitwith_predict_noise(
 
 /// Map a [`ResponseFamily`] to the dispersion-GAM kind whose log-precision
 /// channel can carry a `noise_formula` in the CLI `--predict-noise` path
-/// (#913). Mirrors `workflow::dispersion_location_scale_kind`.
+/// (#913). Mirrors `fit_orchestration::dispersion_location_scale_kind`.
 pub(crate) fn dispersion_location_scale_kind_for_cli(
     response: &ResponseFamily,
 ) -> Option<gam::gamlss::DispersionFamilyKind> {

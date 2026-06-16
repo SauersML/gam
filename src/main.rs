@@ -155,7 +155,7 @@ pub(crate) use gam::types::{
     WigglePenaltyConfig,
 };
 
-pub(crate) use gam::solver::workflow::{
+pub(crate) use gam::solver::fit_orchestration::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
     DispersionLocationScaleFitRequest, FitConfig, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,

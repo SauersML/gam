@@ -202,7 +202,7 @@ pub fn exp_sigma_derivs_up_to_fourth(
 ///
 /// This 0.01 looks absolute but is *operationally* scale-relative: the single
 /// Gaussian location-scale model entry point
-/// (`fit_gaussian_location_scale_model` in `solver::workflow`) first computes
+/// (`fit_gaussian_location_scale_model` in `solver::fit_orchestration`) first computes
 /// `response_scale = sample_std(y).max(1e-6)` and fits on `y → y / response_scale`,
 /// then maps the fitted coefficients back to raw response units (the
 /// Location/Mean block scaled by `response_scale`, the log-σ block intercept

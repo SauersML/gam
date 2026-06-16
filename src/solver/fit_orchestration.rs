@@ -1,7 +1,7 @@
 // Concern-organized submodules of the solver workflow pipeline. The shared
 // imports and the typed-error / request-type / family-fit / orchestration-entry
 // / materialization concerns each own a real module; the parent re-exports every
-// module's items so callers keep the flat `solver::workflow::Foo` namespace.
+// module's items so callers keep the flat `solver::fit_orchestration::Foo` namespace.
 
 use crate::custom_family::{
     AdditiveBlockJacobian, BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix,

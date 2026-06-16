@@ -495,7 +495,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // location-scale, survival, BMS, transformation-normal, custom
     // families) reaches this entry point with a finalised
     // `ParameterBlockSpec` list, so wiring the canonicalisation here
-    // covers all four `solver::workflow.rs` entry points plus every
+    // covers all four `solver::fit_orchestration.rs` entry points plus every
     // direct caller of `fit_custom_family` without each family needing
     // its own canonicalisation hook.
     //

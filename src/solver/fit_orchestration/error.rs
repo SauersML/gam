@@ -14,7 +14,7 @@ impl<E: ToString> WorkflowCauseCountResult for Result<usize, E> {
     }
 }
 
-/// Typed error category for the `solver::workflow` materialization and
+/// Typed error category for the `solver::fit_orchestration` materialization and
 /// fitting pipeline.
 ///
 /// Every variant's `Display` impl is byte-equivalent to the original
