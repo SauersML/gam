@@ -188,8 +188,6 @@ pub struct SmoothStructureAnalysis {
     /// feature set is a subset of term `idx`'s feature set, i.e. candidate owners of `idx`.
     /// The list is given in ownership-processing order.
     pub term_owners: Vec<Vec<usize>>,
-    /// `basis_family_ranks[idx]` is the basis-family ordering rank of smooth term `idx`.
-    pub basis_family_ranks: Vec<u8>,
 }
 
 /// Compute the static hierarchical smooth-ownership decomposition from the smooth-term specs.
@@ -198,7 +196,6 @@ pub struct SmoothStructureAnalysis {
 pub fn analyze_smooth_ownership(smoothspecs: &[SmoothTermSpec]) -> SmoothStructureAnalysis {
     let term_feature_cols: Vec<Vec<usize>> =
         smoothspecs.iter().map(smooth_term_feature_cols).collect();
-    let basis_family_ranks: Vec<u8> = smoothspecs.iter().map(smooth_basis_family_rank).collect();
 
     let mut ownership_order: Vec<usize> = (0..smoothspecs.len()).collect();
     ownership_order.sort_by(|&lhs, &rhs| {
@@ -219,6 +216,5 @@ pub fn analyze_smooth_ownership(smoothspecs: &[SmoothTermSpec]) -> SmoothStructu
         ownership_order,
         term_feature_cols,
         term_owners,
-        basis_family_ranks,
     }
 }
