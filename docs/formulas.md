@@ -274,6 +274,25 @@ the poles.
 | `units` | `degrees` | Set `units=radians` as an alias for `radians=true`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the curvature penalty. |
 
+### Specialized smooths (`mjs`, `curv`, `pca`)
+
+Three further radial/geometry smooths share the `s(...)` materialization
+path through a distinct `type=`:
+
+- `mjs(...)` (aliases `measurejet`, `measure_jet`, `web`) — measure-jet
+  spline for a response varying along an unknown low-dimensional set
+  inside a higher-dimensional ambient space. See
+  [measure_jet_frame.md](measure_jet_frame.md).
+- `curv(...)` (aliases `curvature`, `constant_curvature`, `mkappa`) —
+  constant-curvature `M_κ` geodesic-kernel smooth, the κ-generic sibling
+  of `sphere()` that interpolates `Sᵈ → ℝᵈ → Hᵈ` via `kappa=` (default
+  `0`, flat). See [response-geometry.md](response-geometry.md).
+- `pca(...)` — PCA-subspace smooth.
+
+Each requires at least one variable and accepts radial-smooth options
+(`centers`/`k`, `length_scale`, plus their own keys such as `kappa=` for
+`curv`).
+
 ### Tensor product (`te`, `tensor`, `interaction`, `ti`) {#periodic-cyclic-smooths}
 
 `te(...)`, `tensor(...)`, and `interaction(...)` build penalized
