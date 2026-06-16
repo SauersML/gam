@@ -58,6 +58,7 @@ pub(crate) use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
     dense_rowwise_kronecker,
 };
+pub(crate) use crate::model_types::UnifiedFitResult;
 pub(crate) use crate::pirls::LinearInequalityConstraints;
 pub(crate) use crate::probability::standard_normal_quantile;
 pub(crate) use crate::smooth::{
@@ -66,7 +67,6 @@ pub(crate) use crate::smooth::{
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-pub(crate) use crate::solver::estimate::UnifiedFitResult;
 pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
     DriftDerivResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };

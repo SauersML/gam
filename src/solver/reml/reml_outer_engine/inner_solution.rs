@@ -250,18 +250,6 @@ pub struct InnerSolution<'dp> {
     pub stochastic_trace_state: Arc<Mutex<StochasticTraceState>>,
 }
 
-/// Active row block of the joint linear inequality constraint matrix at the
-/// converged inner iterate. Carries the dense rows needed for the
-/// constraint-aware pseudo-inverse `K_T` in
-/// [`PenaltySubspaceTrace::with_active_constraints`]. Only the `A` rows are
-/// needed by the kernel itself; if a future audit needs the RHS values, add
-/// them back as a typed field then.
-#[derive(Clone, Debug)]
-pub struct ActiveLinearConstraintBlock {
-    /// `k_active × p` matrix of active constraint rows.
-    pub a: Array2<f64>,
-}
-
 /// Builder for `InnerSolution` that provides sensible defaults and
 /// auto-computes derived quantities (nullspace_dim).
 pub struct InnerSolutionBuilder<'dp> {

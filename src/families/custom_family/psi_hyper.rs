@@ -384,32 +384,30 @@ pub(crate) fn build_contracted_psi_hook(
             }
             // hessian[i] += S_{ψi ψ(α)} as a block-local drift (matches the
             // ext_ext `b_operator` BlockLocalDrift composite).
-            let block_drift: Arc<dyn HyperOperator> = Arc::new(
-                crate::solver::estimate::reml::reml_outer_engine::BlockLocalDrift {
-                    local: s_psi_psi_alpha.clone(),
-                    start: axis_i.start,
-                    end: axis_i.end,
-                    total_dim: total,
-                },
-            );
+            let block_drift: Arc<dyn HyperOperator> = Arc::new(BlockLocalDrift {
+                local: s_psi_psi_alpha.clone(),
+                start: axis_i.start,
+                end: axis_i.end,
+                total_dim: total,
+            });
             let combined = match std::mem::replace(
                 &mut hessian[i],
                 DriftDerivResult::Operator(Arc::clone(&block_drift)),
             ) {
-                DriftDerivResult::Operator(existing) => DriftDerivResult::Operator(Arc::new(
-                    crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
+                DriftDerivResult::Operator(existing) => {
+                    DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
                         dense: None,
                         operators: vec![existing, block_drift],
                         dim_hint: total,
-                    },
-                )),
-                DriftDerivResult::Dense(dense) => DriftDerivResult::Operator(Arc::new(
-                    crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
+                    }))
+                }
+                DriftDerivResult::Dense(dense) => {
+                    DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
                         dense: Some(dense),
                         operators: vec![block_drift],
                         dim_hint: total,
-                    },
-                )),
+                    }))
+                }
             };
             hessian[i] = combined;
 
@@ -645,33 +643,27 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                         b_mat.slice_mut(s![cache_i.start..cache_i.end, cache_i.start..cache_i.end]);
                     b_local += &s_local;
                 } else {
-                    let block_drift: Arc<dyn HyperOperator> = Arc::new(
-                        crate::solver::estimate::reml::reml_outer_engine::BlockLocalDrift {
+                    let block_drift: Arc<dyn HyperOperator> = Arc::new(BlockLocalDrift {
+                        local: s_local.clone(),
+                        start: cache_i.start,
+                        end: cache_i.end,
+                        total_dim: total,
+                    });
+                    b_operator = Some(match b_operator.take() {
+                        Some(existing) => {
+                            let existing_arc: Arc<dyn HyperOperator> = Arc::from(existing);
+                            Box::new(CompositeHyperOperator {
+                                dense: None,
+                                operators: vec![existing_arc, block_drift],
+                                dim_hint: total,
+                            }) as Box<dyn HyperOperator>
+                        }
+                        None => Box::new(BlockLocalDrift {
                             local: s_local.clone(),
                             start: cache_i.start,
                             end: cache_i.end,
                             total_dim: total,
-                        },
-                    );
-                    b_operator = Some(match b_operator.take() {
-                        Some(existing) => {
-                            let existing_arc: Arc<dyn HyperOperator> = Arc::from(existing);
-                            Box::new(
-                                crate::solver::estimate::reml::reml_outer_engine::CompositeHyperOperator {
-                                    dense: None,
-                                    operators: vec![existing_arc, block_drift],
-                                    dim_hint: total,
-                                },
-                            ) as Box<dyn HyperOperator>
-                        }
-                        None => Box::new(
-                            crate::solver::estimate::reml::reml_outer_engine::BlockLocalDrift {
-                                local: s_local.clone(),
-                                start: cache_i.start,
-                                end: cache_i.end,
-                                total_dim: total,
-                            },
-                        ) as Box<dyn HyperOperator>,
+                        }) as Box<dyn HyperOperator>,
                     });
                 }
 

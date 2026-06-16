@@ -34,7 +34,7 @@ pub(crate) fn aggregate_labeled_hessian(
     Ok(out)
 }
 
-/// Adapter over the shared [`rho_prior_eval`](crate::solver::estimate::reml::rho_prior_eval)
+/// Adapter over the shared [`rho_prior_eval`](crate::rho_prior_eval)
 /// engine using the custom-family invalid-prior policy
 /// (`HardError`): the prior math is shared with the REML/LAML runtime, and a
 /// malformed prior surfaces as a structured [`CustomFamilyError`] rather than
@@ -43,12 +43,8 @@ pub(crate) fn rho_prior_cost_gradient_hessian(
     prior: &crate::types::RhoPrior,
     rho: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-    use crate::solver::estimate::reml::rho_prior_eval::{InvalidPriorPolicy, RhoPriorError};
-    match crate::solver::estimate::reml::rho_prior_eval::evaluate(
-        prior,
-        rho,
-        InvalidPriorPolicy::HardError,
-    ) {
+    use crate::rho_prior_eval::{InvalidPriorPolicy, RhoPriorError};
+    match crate::rho_prior_eval::evaluate(prior, rho, InvalidPriorPolicy::HardError) {
         Ok(eval) => Ok((eval.cost, eval.gradient, eval.hessian)),
         Err(RhoPriorError::DimensionMismatch { reason }) => {
             Err(CustomFamilyError::DimensionMismatch { reason }.into())
@@ -787,7 +783,7 @@ pub(crate) fn assemble_active_constraint_block(
     block_active_sets: &[Option<Vec<usize>>],
     ranges: &[(usize, usize)],
     total_p: usize,
-) -> Option<crate::solver::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock> {
+) -> Option<ActiveLinearConstraintBlock> {
     if block_constraints.len() != ranges.len() || block_active_sets.len() != ranges.len() {
         return None;
     }
@@ -831,7 +827,7 @@ pub(crate) fn assemble_active_constraint_block(
             out_row += 1;
         }
     }
-    Some(crate::solver::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock { a })
+    Some(ActiveLinearConstraintBlock { a })
 }
 
 pub(crate) struct SimpleLowerBounds {

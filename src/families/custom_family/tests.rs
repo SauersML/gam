@@ -2019,7 +2019,7 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
             assert!(arr.iter().all(|v| !v.is_nan()));
             assert_eq!(psi_index, 0);
             Ok(Some(DriftDerivResult::Operator(Arc::new(
-                crate::solver::estimate::reml::reml_outer_engine::BlockLocalDrift {
+                BlockLocalDrift {
                     local: array![[3.0, 1.0], [1.0, 2.0]],
                     start: 1,
                     end: 3,
@@ -4560,11 +4560,7 @@ pub(crate) fn per_block_penalized_shift_stays_data_scaled_under_oversmoothed_pen
     // Data Hessian: well-conditioned, modest curvature (the bernoulli IRLS
     // block Hessian X'WX is PSD; perturb the diagonal so the 0-shift Cholesky
     // path still needs a tiny lift, forcing the shift branch to fire).
-    let h_data = array![
-        [1.0_f64, 0.05, 0.0],
-        [0.05, 1.0, 0.05],
-        [0.0, 0.05, 1.0],
-    ];
+    let h_data = array![[1.0_f64, 0.05, 0.0], [0.05, 1.0, 0.05], [0.0, 0.05, 1.0],];
 
     // Heavily over-smoothed PSD penalty: a large smoothness penalty
     // `λ · (D'D)` with `λ ≈ 1e7`. Its first/second-difference structure has
@@ -4573,11 +4569,7 @@ pub(crate) fn per_block_penalized_shift_stays_data_scaled_under_oversmoothed_pen
     // negative. This is the exact shape that fooled plain Gershgorin.
     let lam = 1.0e7_f64;
     // D'D for a first-difference operator on 3 nodes: tridiagonal [1,-1;-1,2,-1;-1,1].
-    let s = &array![
-        [1.0_f64, -1.0, 0.0],
-        [-1.0, 2.0, -1.0],
-        [0.0, -1.0, 1.0],
-    ] * lam;
+    let s = &array![[1.0_f64, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0],] * lam;
 
     let lhs = &h_data + &s;
 
@@ -4588,8 +4580,8 @@ pub(crate) fn per_block_penalized_shift_stays_data_scaled_under_oversmoothed_pen
         exact_newton_stabilizing_shift(&lhs, ridge_floor).expect("penalized lhs needs a shift");
 
     // PSD-penalized shift: Gershgorin bounded by the data Hessian.
-    let psd_shift = exact_newton_stabilizing_shift_psd_penalized(&lhs, &h_data, ridge_floor)
-        .unwrap_or(0.0);
+    let psd_shift =
+        exact_newton_stabilizing_shift_psd_penalized(&lhs, &h_data, ridge_floor).unwrap_or(0.0);
 
     // The over-smoothed penalty drives the PLAIN shift to ~λ scale (~1e7);
     // the PSD-penalized shift must stay O(data scale) (~O(1)).

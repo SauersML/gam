@@ -423,8 +423,7 @@ impl SurvivalLsRowKernel<'_> {
         let inv_sigma_exit = self.dynamic.inv_sigma_exit[row];
         let eta_t_exit = -self.dynamic.q_exit[row] / inv_sigma_exit;
         let eta_ls_deriv = self.q.dqdot_t[row] / inv_sigma_exit;
-        let eta_t_deriv =
-            eta_t_exit * eta_ls_deriv - self.dynamic.qdot_exit[row] / inv_sigma_exit;
+        let eta_t_deriv = eta_t_exit * eta_ls_deriv - self.dynamic.qdot_exit[row] / inv_sigma_exit;
         [
             self.dynamic.h_entry[row],
             self.dynamic.h_exit[row],
@@ -466,7 +465,13 @@ impl SurvivalLsRowKernel<'_> {
             .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))?;
 
         let mut nll = u0
-            .compose_unary([kernel.log_s0, -kernel.r0, -kernel.dr0, -kernel.ddr0, -kernel.dddr0])
+            .compose_unary([
+                kernel.log_s0,
+                -kernel.r0,
+                -kernel.dr0,
+                -kernel.ddr0,
+                -kernel.dddr0,
+            ])
             .scale(kernel.w);
         let censored_weight = kernel.w * (1.0 - kernel.d);
         if censored_weight != 0.0 {

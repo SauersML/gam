@@ -288,6 +288,87 @@ impl Default for Dispersion {
 }
 
 // ===========================================================================
+// Constraint/KKT carriers
+// ===========================================================================
+
+/// Active row block of the joint linear inequality constraint matrix at the
+/// converged inner iterate.
+#[derive(Clone, Debug)]
+pub struct ActiveLinearConstraintBlock {
+    /// `k_active x p` matrix of active constraint rows.
+    pub a: Array2<f64>,
+}
+
+/// Subspace represented by a stored KKT residual.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KktResidualSubspace {
+    /// Residual after active-constraint normal components have been stripped:
+    /// `r_A = P_T(Sbeta + Gamma beta - grad ell)`.
+    ActiveProjected,
+    /// Residual additionally projected into the retained identifiable range:
+    /// `r_R = R R^T r_A`.
+    ReducedRange,
+}
+
+/// KKT residual `r = grad_beta L_pen(beta_hat)` at the converged inner
+/// iterate, tagged with the exact represented subspace.
+#[derive(Clone, Debug)]
+pub struct ProjectedKktResidual {
+    /// The residual vector in the full coefficient coordinates. Active and
+    /// reduced-range projection zero out excluded directions rather than
+    /// shortening the vector, so its length remains `p`.
+    pub(crate) residual: Array1<f64>,
+    pub(crate) subspace: KktResidualSubspace,
+    /// The KKT-stationarity tolerance the inner solver compared the residual
+    /// against when the certificate fired.
+    pub(crate) residual_tol: Option<f64>,
+    /// `total_p - active_set_size` at the producing iterate.
+    pub(crate) free_rank: Option<usize>,
+}
+
+impl ProjectedKktResidual {
+    /// Construct from `r_A = P_T(Sbeta + Gamma beta - grad ell)`, with active
+    /// constraint multipliers removed but before any reduced-range projection.
+    pub(crate) fn from_active_projected(residual: Array1<f64>) -> Self {
+        Self {
+            residual,
+            subspace: KktResidualSubspace::ActiveProjected,
+            residual_tol: None,
+            free_rank: None,
+        }
+    }
+
+    /// Construct from `r_R = R R^T r_A`, where `R` is the actual reduced
+    /// identifiable basis used by the projected inverse kernel.
+    pub(crate) fn from_reduced_range(residual: Array1<f64>) -> Self {
+        Self {
+            residual,
+            subspace: KktResidualSubspace::ReducedRange,
+            residual_tol: None,
+            free_rank: None,
+        }
+    }
+
+    /// Attach the KKT tolerance and free-subspace rank to a previously
+    /// constructed residual.
+    pub(crate) fn with_metadata(mut self, residual_tol: f64, free_rank: usize) -> Self {
+        self.residual_tol = Some(residual_tol);
+        self.free_rank = Some(free_rank);
+        self
+    }
+
+    /// Borrow the underlying free-space residual for the H^-1*r solve and its
+    /// rho-derivatives.
+    pub fn as_array(&self) -> &Array1<f64> {
+        &self.residual
+    }
+
+    pub fn subspace(&self) -> KktResidualSubspace {
+        self.subspace
+    }
+}
+
+// ===========================================================================
 // CoefficientPriorMean + PenaltySpec
 // ===========================================================================
 
@@ -580,3 +661,17 @@ impl PenaltySpec {
         }
     }
 }
+
+mod result_types;
+
+pub use result_types::{
+    AdaptiveRegularizationOptions, BlockRole, CriterionCertificate, FitArtifacts, FitGeometry,
+    FitInference, FitOptions, FittedBlock, FittedLinkState, UnifiedFitResult,
+    UnifiedFitResultParts, ensure_finite_scalar, saved_latent_cloglog_state_from_fit,
+    saved_mixture_state_from_fit, saved_sas_state_from_fit, validate_all_finite,
+    validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
+};
+pub(crate) use result_types::{
+    CERTIFICATE_RAIL_MARGIN, CERTIFICATE_RELATIVE_GATE, CERTIFICATE_Z_GATE,
+};
+pub(crate) use result_types::{ensure_finite_scalar_estimation, validate_all_finite_estimation};

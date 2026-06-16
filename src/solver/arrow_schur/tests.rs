@@ -2804,8 +2804,7 @@ pub(crate) fn cluster_jacobi_build_deterministic_and_matches_serial() {
         let mut rhs = r.clone();
         let stride = rhs.strides()[0];
         let len = rhs.len();
-        let rhs_mat =
-            unsafe { faer::MatRef::from_raw_parts(rhs.as_mut_ptr(), len, 1, stride, 0) };
+        let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_mut_ptr(), len, 1, stride, 0) };
         let s = llt.solve(rhs_mat);
         Array1::from_iter((0..b).map(|i| s[(i, 0)]))
     };

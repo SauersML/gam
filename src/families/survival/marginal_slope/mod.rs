@@ -23,7 +23,7 @@ pub(crate) use crate::custom_family::{
     fit_custom_family_fixed_log_lambda_warm_start, joint_hyper_options_for_outer_tolerance,
 };
 
-pub(crate) use crate::estimate::UnifiedFitResult;
+pub(crate) use crate::model_types::UnifiedFitResult;
 
 pub(crate) use crate::faer_ndarray::{FaerCholesky, fast_atv, fast_av, fast_xt_diag_x};
 

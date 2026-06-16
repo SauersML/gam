@@ -870,7 +870,11 @@ mod tests {
         // Claim 0 has e = 45 ≥ 20 (rejected); claim 1 is NaN (no evidence).
         let log_e = [45.0f64.ln(), f64::NAN];
         let rejected = e_benjamini_hochberg(&log_e, 0.1);
-        assert_eq!(rejected, vec![0], "strong claim survives; NaN claim never rejected");
+        assert_eq!(
+            rejected,
+            vec![0],
+            "strong claim survives; NaN claim never rejected"
+        );
 
         // An all-NaN ledger yields an empty (no-rejection) certificate, not a
         // panic.

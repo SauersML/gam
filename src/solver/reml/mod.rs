@@ -25,7 +25,6 @@ pub(crate) mod penalty_logdet;
 pub(crate) mod per_atom_efs;
 pub(crate) mod reml_outer_engine;
 mod rho_key;
-pub(crate) mod rho_prior_eval;
 mod sparse_exact_penalty;
 mod trace;
 

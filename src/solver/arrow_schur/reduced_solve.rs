@@ -1633,9 +1633,7 @@ impl ClusterJacobiPreconditioner {
             // already row-parallel `build_block_jacobi` body (#1017): at the SAE
             // LLM shape the `Σ_i di·b` triangular solves plus the `b²·di` cross
             // product are the cluster build's whole per-row cost.
-            let cluster_row_into = |row_idx: usize,
-                                    row: &ArrowRowBlock,
-                                    acc: &mut Array2<f64>| {
+            let cluster_row_into = |row_idx: usize, row: &ArrowRowBlock, acc: &mut Array2<f64>| {
                 let mut col_vec = Array1::<f64>::zeros(d);
                 let mut solved_cols = Array2::<f64>::zeros((d, b));
                 for bj in 0..b {

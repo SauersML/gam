@@ -103,13 +103,11 @@ use crate::smooth::{
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 
-use crate::solver::estimate::UnifiedFitResult;
+use crate::model_types::UnifiedFitResult;
 
-use crate::solver::estimate::{
+use crate::model_types::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
-
-use crate::solver::gauge::Gauge;
 
 use crate::terms::construction::kronecker_product;
 

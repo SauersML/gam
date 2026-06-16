@@ -83,6 +83,7 @@ pub mod report;
 /// without importing *up* into `solver` (#1135). `crate::solver::resource`
 /// remains a back-compat re-export.
 pub mod resource;
+pub(crate) mod rho_prior_eval;
 pub mod solver;
 pub mod terms;
 pub mod test_support;

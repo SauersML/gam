@@ -840,14 +840,14 @@ impl CriterionAtom for JeffreysLogdetAtom {
 ///
 /// This is a θ-only atom: it has no dependence on the inner mode `β̂`, so its
 /// β-channel is `None` and it declares no smoothness stratum. Its internal state
-/// is the single [`RhoPriorEval`](super::rho_prior_eval::RhoPriorEval) emitted by
+/// is the single [`RhoPriorEval`](crate::rho_prior_eval::RhoPriorEval) emitted by
 /// the shared prior evaluator after all REML/LAML policies have been applied
 /// (weight anchoring, Saturate invalid-prior handling, and the Firth-default
 /// self-gated barrier). The objective assembly reads value, first derivative,
 /// and diagonal Hessian from this same object, so configured-prior cost and
 /// gradient can no longer come from separate wrapper calls.
 pub struct ConfiguredRhoPriorAtom {
-    pub eval: super::rho_prior_eval::RhoPriorEval,
+    pub eval: crate::rho_prior_eval::RhoPriorEval,
 }
 
 impl ConfiguredRhoPriorAtom {
@@ -1583,7 +1583,7 @@ mod tests {
     #[test]
     pub(crate) fn configured_rho_prior_atom_projects_one_eval() {
         let atom = ConfiguredRhoPriorAtom {
-            eval: super::super::rho_prior_eval::RhoPriorEval {
+            eval: crate::rho_prior_eval::RhoPriorEval {
                 cost: 1.25,
                 gradient: array![0.5, -1.5, 2.0],
                 hessian: Some(array![[3.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 5.0]]),

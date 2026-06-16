@@ -533,7 +533,7 @@ pub fn survival_fit_from_parts(
     }
 
     // Build blocks for the unified representation.
-    use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts};
+    use crate::model_types::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts};
     let mut blocks = vec![
         FittedBlock {
             beta: beta_time.clone(),
@@ -575,7 +575,7 @@ pub fn survival_fit_from_parts(
             .collect(),
     );
     let deviance = -2.0 * log_likelihood;
-    crate::solver::estimate::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+    crate::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks,
         log_lambdas,
         lambdas: Array1::from_vec(all_lambdas),
@@ -600,7 +600,7 @@ pub fn survival_fit_from_parts(
         pirls_status: crate::pirls::PirlsStatus::Converged,
         max_abs_eta: 0.0,
         constraint_kkt: None,
-        artifacts: crate::solver::estimate::FitArtifacts {
+        artifacts: crate::model_types::FitArtifacts {
             pirls: None,
             null_space_logdet: None,
             null_space_dim: None,

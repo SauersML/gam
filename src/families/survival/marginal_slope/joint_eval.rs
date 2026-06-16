@@ -286,13 +286,22 @@ impl SurvivalMarginalSlopeFamily {
         // joint-β work through
         // [`crate::families::survival::marginal_slope::gpu::try_survival_flex_dense_hessian`]
         // and [`crate::families::survival::marginal_slope::gpu::try_survival_flex_gradient`]
-        // respectively, with the standard `gpu::decide` policy.  Both
-        // currently return `Ok(None)` until the NVRTC joint-β assembly
-        // lands (Steps 4 + 5 sibling commits), so the CPU per-row sweep
-        // below remains the production path; the wiring exists so the
-        // device dispatch becomes hot the moment the GPU side composes
-        // the prep cells (`try_device_partition_cells` +
-        // `try_device_cell_primary_fixed_partials`) into a joint pullback.
+        // respectively, with the standard `gpu::decide` policy.
+        //
+        // State of the seam (#1133): the host-side Step-5 primary G/H
+        // assembly (`try_device_step5_primary_assembly`) and the Step-6
+        // joint-β pullback (`pullback_step6_joint_beta`) are both LANDED as
+        // pure host algebra and CPU-verified — Step 5 is already the hot
+        // per-row path in `compute_row_flex_primary_gradient_hessian_from_parts`
+        // (the CPU sweep below routes every row through it). What remains is
+        // ONLY the device substrate: an NVRTC/CUDA kernel that produces the
+        // per-row jets + folds the Step-6 contraction on-device. Until that
+        // kernel exists these batch entry points are called with `step6 =
+        // None` and return `Ok(None)`, so the CPU per-row sweep below is the
+        // production path. Threading assembled Step-5/Step-6 rows through the
+        // batch entry points here would only duplicate the already-complete
+        // per-block pullback in `accumulate_dynamic_q_joint_row` on the host,
+        // so it is deliberately deferred to the device-kernel work.
         if flex_active && !self.flex_timewiggle_active() {
             if let Some(h) =
                 self.try_survival_flex_joint_dispatch_dense_hessian(block_states, &slices)?
@@ -402,10 +411,12 @@ impl SurvivalMarginalSlopeFamily {
         //
         // Routes through
         // [`crate::families::survival::marginal_slope::gpu::try_survival_flex_gradient`] via
-        // the `gpu::decide` policy.  Returns `Ok(None)` until the joint-β
-        // device assembly lands (Steps 4 + 5 sibling commits), at which
-        // point this site becomes the hot dispatch with no further
-        // family-side rework.
+        // the `gpu::decide` policy.  Returns `Ok(None)` until the device
+        // CUDA kernel lands: the host-side Step-5 assembly + Step-6 joint-β
+        // pullback are already LANDED + CPU-verified (Step 5 is the hot
+        // per-row path), so only the on-device jet/contraction substrate is
+        // outstanding (#1133). Until then the CPU per-row sweep below is the
+        // production path and this dispatch is a no-op fast-fail.
         if flex_active && !self.flex_timewiggle_active() {
             if let Some(pair) =
                 self.try_survival_flex_joint_dispatch_gradient(block_states, &slices)?

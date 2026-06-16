@@ -1701,7 +1701,7 @@ pub(crate) const FIRTH_DEFAULT_PC_TAIL_PROB: f64 = 0.01;
 /// well-defined prior family. Its *outer-objective contribution*, however, is NOT
 /// the plain PC term: the REML/LAML runtime evaluates firth-default coordinates
 /// through the SELF-GATED, one-sided barrier
-/// [`rho_prior_eval::firth_default_barrier_terms`], which is byte-identically
+/// [`crate::rho_prior_eval::firth_default_barrier_terms`], which is byte-identically
 /// flat (cost/grad/hess = 0) on the identified side `ρ ≥ −2 ln(upper)` and only a
 /// convex wall against the `λ → 0` / `ρ → −∞` under-smoothing degeneracy below
 /// it. This restores STRICT zero-downside (a clean / well-conditioned fit is

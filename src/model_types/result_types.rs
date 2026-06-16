@@ -1,4 +1,161 @@
-use super::*;
+use faer::Side;
+use ndarray::{Array1, Array2};
+use serde::{Deserialize, Serialize};
+
+use crate::faer_ndarray::FaerCholesky;
+use crate::linalg::utils::stack_offsets;
+use crate::model_types::{Dispersion, EstimationError};
+use crate::types::{
+    GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec,
+    LogLikelihoodNormalization, MixtureLinkSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
+    SasLinkState, StandardLink,
+};
+
+/// Strictly-positive floor on a reported dispersion / scale parameter `φ`.
+/// Every GLM family resolves `φ` to a non-negative quantity, but downstream
+/// consumers (covariance scaling, deviance ratios) divide by it, so it is
+/// clamped to the smallest positive normal `f64` to keep those quotients
+/// finite without perturbing any `φ` above the denormal range.
+const DISPERSION_POSITIVE_FLOOR: f64 = 1e-300;
+
+pub(crate) fn dispersion_from_likelihood(
+    likelihood: &GlmLikelihoodSpec,
+    standard_deviation: f64,
+) -> Dispersion {
+    match &likelihood.spec.response {
+        ResponseFamily::Gaussian => Dispersion::Estimated(
+            (standard_deviation * standard_deviation).max(DISPERSION_POSITIVE_FLOOR),
+        ),
+        ResponseFamily::Gamma => {
+            let phi = likelihood.scale.fixed_phi().unwrap_or_else(|| {
+                let shape = likelihood
+                    .gamma_shape()
+                    .unwrap_or(standard_deviation.max(DISPERSION_POSITIVE_FLOOR));
+                1.0 / shape.max(DISPERSION_POSITIVE_FLOOR)
+            });
+            if likelihood.scale.gamma_shape_is_estimated() {
+                Dispersion::Estimated(phi.max(DISPERSION_POSITIVE_FLOOR))
+            } else {
+                Dispersion::Known(phi.max(DISPERSION_POSITIVE_FLOOR))
+            }
+        }
+        ResponseFamily::Tweedie { .. } => {
+            let phi = likelihood
+                .fixed_phi()
+                .unwrap_or(1.0)
+                .max(DISPERSION_POSITIVE_FLOOR);
+            if likelihood.scale.tweedie_phi_is_estimated() {
+                Dispersion::Estimated(phi)
+            } else {
+                Dispersion::Known(phi)
+            }
+        }
+        ResponseFamily::NegativeBinomial { theta, .. } => Dispersion::Known(
+            likelihood
+                .fixed_phi()
+                .unwrap_or(*theta)
+                .max(DISPERSION_POSITIVE_FLOOR),
+        ),
+        ResponseFamily::Beta { phi } => {
+            Dispersion::Known((1.0 / (1.0 + phi.max(1e-12))).max(DISPERSION_POSITIVE_FLOOR))
+        }
+        ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::RoystonParmar => {
+            Dispersion::Known(1.0)
+        }
+    }
+}
+
+/// Standardized-disagreement gate: the audit flags inconsistency when the
+/// analytic and FD directional derivatives differ by more than this many FD
+/// error bars (and also fail the relative gate).
+pub(crate) const CERTIFICATE_Z_GATE: f64 = 4.0;
+
+/// Relative agreement gate: differences below this fraction of the larger
+/// directional derivative are consistent regardless of the (possibly
+/// underestimated) FD error bar.
+pub(crate) const CERTIFICATE_RELATIVE_GATE: f64 = 1e-3;
+
+/// ρ margin (in log-λ units) within which an outer smoothing coordinate
+/// counts as railed against its box bound.
+pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
+
+/// First-order optimality certificate: gradient-vs-objective FD audit at the
+/// returned optimum (#934).
+///
+/// Answers, machine-checkably, the three questions every objective↔gradient
+/// desync postmortem asks: does the analytic gradient match the actual
+/// criterion value HERE ([`Self::first_order_consistent`]); is the outer
+/// curvature positive definite HERE (`hessian_pd`); did any smoothing
+/// coordinate rail to a box bound (`lambdas_railed`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CriterionCertificate {
+    /// ‖∇F(θ̂)‖₂ from the analytic gradient path at the returned point.
+    pub grad_norm: f64,
+    /// Analytic directional derivative ∇F(θ̂)·v along the audit direction.
+    pub analytic_directional: f64,
+    /// Richardson-extrapolated central difference of the criterion VALUE
+    /// path along the same direction: (4·D_h − D_2h)/3 from the h and 2h
+    /// central-difference pairs.
+    pub fd_directional: f64,
+    /// Error bar on `fd_directional`: the Richardson residual |D_h − D_2h|
+    /// (which absorbs both truncation and inner-solve value noise) floored
+    /// by the central-difference roundoff bound ε·|F|/h.
+    pub fd_error: f64,
+    /// |analytic − fd| / fd_error — standardized disagreement.
+    pub agreement_z: f64,
+    /// Base central-difference step h along the unit direction.
+    pub fd_step: f64,
+    /// Whether the final outer Hessian is positive definite at θ̂, when the
+    /// solver tracked one (`None` when no final Hessian was available).
+    pub hessian_pd: Option<bool>,
+    /// Leading smoothing coordinates (ρ block) pinned within
+    /// [`CERTIFICATE_RAIL_MARGIN`] of either box bound at the optimum.
+    pub lambdas_railed: Vec<usize>,
+}
+
+impl CriterionCertificate {
+    /// Whether the analytic directional derivative agrees with the finite
+    /// difference of the actual criterion value at the optimum.
+    pub fn first_order_consistent(&self) -> bool {
+        let diff = (self.analytic_directional - self.fd_directional).abs();
+        let scale = self
+            .analytic_directional
+            .abs()
+            .max(self.fd_directional.abs());
+        diff <= (CERTIFICATE_Z_GATE * self.fd_error).max(CERTIFICATE_RELATIVE_GATE * scale)
+    }
+
+    /// Whether every audited fact is clean: gradient matches objective, no
+    /// definiteness failure, no railed smoothing coordinate.
+    pub fn is_clean(&self) -> bool {
+        self.first_order_consistent()
+            && self.hessian_pd != Some(false)
+            && self.lambdas_railed.is_empty()
+    }
+
+    /// One-line human-readable rendering for logs and reports.
+    pub fn summary(&self) -> String {
+        format!(
+            "grad·v={:.6e} fd·v={:.6e}±{:.1e} z={:.2} |g|={:.3e} hessian_pd={} railed={:?} → {}",
+            self.analytic_directional,
+            self.fd_directional,
+            self.fd_error,
+            self.agreement_z,
+            self.grad_norm,
+            match self.hessian_pd {
+                Some(true) => "yes",
+                Some(false) => "NO",
+                None => "n/a",
+            },
+            self.lambdas_railed,
+            if self.first_order_consistent() {
+                "consistent"
+            } else {
+                "GRADIENT-OBJECTIVE DESYNC"
+            },
+        )
+    }
+}
 
 #[derive(Clone)]
 pub struct FitOptions {
@@ -131,7 +288,7 @@ pub struct FitArtifacts {
     /// optimum, Hessian-PD probe, λ-rail flags. `None` when the outer ran
     /// gradient-free or an audit probe could not evaluate.
     #[serde(default)]
-    pub criterion_certificate: Option<crate::solver::rho_optimizer::CriterionCertificate>,
+    pub criterion_certificate: Option<CriterionCertificate>,
     /// Tier-0 marginal-smoothing (`ρ`-uncertainty) PSIS certificate (#938):
     /// the Pareto-`k̂` diagnostic that says whether the plug-in + first-order
     /// `V_ρ` correction is adequate or `ρ`-uncertainty needs a heavier
@@ -177,7 +334,10 @@ impl std::fmt::Debug for FitArtifacts {
             .field("criterion_certificate", &self.criterion_certificate)
             .field("rho_posterior_certificate", &self.rho_posterior_certificate)
             .field("rho_posterior_escalation", &self.rho_posterior_escalation)
-            .field("rho_covariance", &self.rho_covariance.as_ref().map(|m| m.dim()))
+            .field(
+                "rho_covariance",
+                &self.rho_covariance.as_ref().map(|m| m.dim()),
+            )
             .finish()
     }
 }

@@ -149,6 +149,7 @@ pub(crate) use crate::faer_ndarray::FaerEigh;
 pub(crate) use crate::linalg::matrix::{
     DesignMatrix, LinearOperator, SignedWeightsView, upper_triangle_pair_from_index,
 };
+use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, ProjectedKktResidual};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Leaf, state-free linear-algebra kernels (already real modules).

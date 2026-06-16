@@ -17,7 +17,6 @@
 //! 3-way event dispatch is [`latent_survival_event_type_for`]. Reached from the
 //! formula DSL via `SurvInterval(L, R, event) ~ ...`.
 
-use crate::estimate::UnifiedFitResult;
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
@@ -37,6 +36,7 @@ use crate::families::survival::lognormal_kernel::{
     log_kernel_bundle,
 };
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
+use crate::model_types::UnifiedFitResult;
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::signed_log_sum_exp;
 use crate::quadrature::{IntegratedExpectationMode, QuadratureContext};

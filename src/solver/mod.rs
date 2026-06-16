@@ -31,6 +31,7 @@ pub mod residual_cascade;
 /// `crate::resource` lower layer to break the `families → solver::resource`
 /// back-edge (#1135). Existing `crate::solver::resource::*` paths keep working.
 pub use crate::resource;
+pub mod fit_orchestration;
 pub mod rho_optimizer;
 pub(crate) mod riemannian_retraction;
 pub mod row_measure;
@@ -46,7 +47,6 @@ pub mod topology_selector;
 pub mod visualizer;
 pub(crate) mod warm_start_artifact;
 pub(crate) mod warm_start_transfer;
-pub mod fit_orchestration;
 
 pub use evidence::{
     EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,

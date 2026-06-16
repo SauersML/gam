@@ -30,7 +30,9 @@ pub(crate) use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, LinearOperator, SignedWeightsView, SymmetricMatrix,
     dense_rowwise_kronecker,
 };
-pub(crate) use crate::model_types::EstimationError;
+pub(crate) use crate::model_types::{
+    ActiveLinearConstraintBlock, EstimationError, ProjectedKktResidual,
+};
 pub(crate) use crate::pirls::{
     LinearInequalityConstraints, solve_newton_directionwith_lower_bounds,
 };
@@ -39,11 +41,13 @@ pub(crate) use crate::solver::active_set::{
 };
 pub(crate) use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
-    BlockCoupledOperator, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
-    DenseSpectralOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
+    BlockCoupledOperator, BlockLocalDrift, CompositeHyperOperator, ContractedPsiSecondOrder,
+    ContractedPsiSecondOrderFn, DenseMatrixHyperOperator, DenseSpectralOperator,
+    DispersionHandling, DriftDerivResult, ExactJeffreysTerm, FixedDriftDerivFn,
     HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift, HyperCoordPair,
-    HyperOperator, MatrixFreeSpdOperator, PenaltySubspaceTrace, ProjectedKktResidual,
-    StochasticTraceState, compute_block_penalty_logdet_derivs, exact_pseudo_logdet,
+    HyperOperator, MatrixFreeSpdOperator, OuterHessianDerivativeKernel, PenaltySubspaceTrace,
+    StochasticTraceState, compute_block_penalty_logdet_derivs, compute_efs_update,
+    compute_hybrid_efs_update, exact_pseudo_logdet, hessian_operator_geometric_scale,
     positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
 };
 pub(crate) use crate::solver::estimate::{

@@ -1762,20 +1762,13 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
     outer_gradient_norm: Option<f64>,
     outer_converged: bool,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
-    let canonical =
-        crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
+    let canonical = crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
     let reduced_warm_start = fixed_lambda_warm_start_for_reduced_specs(warm_start, &canonical);
-    let mut inner = inner_blockwise_fit(
-        family,
-        specs,
-        &per_block,
-        options,
-        reduced_warm_start,
-    )?;
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, reduced_warm_start)?;
     if !inner.converged {
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family_fixed_log_lambdas inner solve",
@@ -1829,8 +1822,7 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
     raw_specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<(Vec<Array1<f64>>, bool, usize), CustomFamilyError> {
-    let canonical =
-        crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
+    let canonical = crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);

@@ -663,9 +663,8 @@ pub fn lawley_lr_bartlett_factor_with_rho_variation(
             "lawley_lr_bartlett_factor_with_rho_variation: reference df must be finite and positive; got {ref_df}"
         ));
     }
-    let shift = lawley_lr_mean_shift_with_rho_variation(
-        x, kappas, penalty, tested, components, rho_cov,
-    )?;
+    let shift =
+        lawley_lr_mean_shift_with_rho_variation(x, kappas, penalty, tested, components, rho_cov)?;
     let mean_w = ref_df + shift;
     let factor = crate::inference::higher_order::bartlett_factor_from_mean(mean_w, ref_df)
         .ok_or_else(|| {

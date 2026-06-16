@@ -254,6 +254,81 @@ pub fn solve_arrow_newton_step_fused_force(
     }
 }
 
+/// #1017 Phase 3: a device-resident Arrow-Schur frame whose constant Hessian
+/// blocks (`D = H_tt`, `B = H_tβ`, border `H_ββ`) and their factors stay on the
+/// device across the inner Newton loop. Construct once per frozen gate/basis
+/// frame, then call [`ResidentArrowFrameHandle::solve_gradient`] once per
+/// iterate with the fresh residual gradient — only the `O(n·d + p)` gradient
+/// crosses to the device and only `δ` crosses back, in contrast to
+/// [`solve_arrow_newton_step`] which re-uploads and re-factors the full system
+/// every call. On a non-CUDA host construction returns
+/// `ArrowSchurGpuFailure::Unavailable`.
+pub struct ResidentArrowFrameHandle {
+    #[cfg(target_os = "linux")]
+    inner: cuda::ResidentArrowFrame,
+    #[cfg(not(target_os = "linux"))]
+    _never: std::convert::Infallible,
+}
+
+impl ResidentArrowFrameHandle {
+    /// Upload the constant Hessian blocks and perform the one-time factor work.
+    pub fn new(
+        sys: &ArrowSchurSystem,
+        ridge_t: f64,
+        ridge_beta: f64,
+    ) -> Result<Self, ArrowSchurGpuFailure> {
+        // The dense device path requires materialised blocks, same admission as
+        // `solve_arrow_newton_step`.
+        if sys.hbb_matvec.is_some() || sys.htbeta_matvec.is_some() {
+            return Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
+                had_hbb_matvec: sys.hbb_matvec.is_some(),
+                had_htbeta_matvec: sys.htbeta_matvec.is_some(),
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (sys, ridge_t, ridge_beta);
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                inner: cuda::ResidentArrowFrame::new(sys, ridge_t, ridge_beta)?,
+            })
+        }
+    }
+
+    /// Solve `H δ = −gradient` for a fresh gradient reusing the resident factors.
+    pub fn solve_gradient(
+        &self,
+        g_t: &[f64],
+        g_beta: &[f64],
+    ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (g_t, g_beta);
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.solve_gradient(g_t, g_beta)
+        }
+    }
+
+    /// `log|H|` for the frame (constant; depends only on the factored Hessian).
+    #[must_use]
+    pub fn log_det_hessian(&self) -> f64 {
+        #[cfg(not(target_os = "linux"))]
+        {
+            unreachable!("ResidentArrowFrameHandle cannot be constructed off CUDA")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.log_det_hessian()
+        }
+    }
+}
+
 /// Build a GPU-backed Schur matvec closure for CPU-driven PCG at K ≥ 5000.
 ///
 /// Runs the fused NVRTC forward kernel once on the dense per-row `H_tβ` slabs
@@ -2498,6 +2573,304 @@ extern "C" __global__ void arrow_sae_diag_sub(
             }
         }
         (d_buf, b_buf, g_buf)
+    }
+
+    // -----------------------------------------------------------------------
+    // #1017 Phase 3: across-iteration device residency.
+    //
+    // `solve()` re-packs and re-uploads `D` (`H_tt`), `B` (`H_tβ`) and `g`,
+    // then re-runs the per-row POTRF and the border Schur factorization on
+    // EVERY call. For the SAE joint inner Newton at a frozen gate/basis frame
+    // the Hessian blocks `D`, `B`, `H_ββ` are CONSTANT across the inner loop —
+    // only the gradient `g = r(z) = H z − g₀` changes per iterate. So the
+    // factor work (`O(n·d³ + p³)`) and the dominant `O(n·d·p)` cross-block
+    // upload are pure waste when repeated per iterate.
+    //
+    // `ResidentArrowFrame` performs that constant work ONCE at construction:
+    // upload+ridge+POTRF of `D` (keeping `L_i` resident in `l_dev`), the
+    // forward solve `Y_i = L_i^{-1} B_i` (kept resident in `y_dev`), and the
+    // Schur assembly + border POTRF (keeping `L_S` resident in `schur_dev`).
+    // Each subsequent `solve_gradient(g)` uploads only the `n·d` row gradient,
+    // runs the cheap residual path — `u_i = L_i^{-1} g_i` (one batched TRSM),
+    // Schur RHS `−g_β + Σ Y_iᵀ u_i`, `δβ = L_S^{-T} L_S^{-1} rhs` (two TRSM,
+    // NO POTRF), back-sub `δt_i = −L_i^{-T}(u_i + Y_i δβ)` — and reads back only
+    // `δ` and the cached log|H|. The heavy buffers never leave the device
+    // across iterations; the per-iterate host transfer is `O(n·d + p)`, not
+    // `O(n·d·p)`. Numerics are bit-identical to a `solve()` at the same
+    // `(D, B, H_ββ, g, ridge_t, ridge_beta)` because the factor buffers and the
+    // helper kernels are the same; the resident path merely SKIPS re-deriving
+    // the parts that do not depend on `g`. The CPU dense reference
+    // (`solve_arrow_newton_step_dense_reference`) is the parity oracle.
+    pub(super) struct ResidentArrowFrame {
+        n: usize,
+        d: usize,
+        k: usize,
+        ridge_beta: f64,
+        stream: Arc<CudaStream>,
+        blas: CudaBlas,
+        /// Per-row lower Cholesky factors `L_i` of `H_tt + ρ_t I`, stacked
+        /// column-major (`n` tiles of `d×d`). Resident across iterations.
+        l_dev: CudaSlice<f64>,
+        /// Whitened cross blocks `Y_i = L_i^{-1} H_tβ^(i)`, stacked column-major
+        /// (`n` tiles of `d×k`). Resident across iterations.
+        y_dev: CudaSlice<f64>,
+        /// Lower Cholesky factor `L_S` of the reduced Schur complement
+        /// `S_β = H_ββ + ρ_β I − Σ_i Y_iᵀ Y_i`. Resident across iterations.
+        schur_dev: CudaSlice<f64>,
+        /// `log|H| = 2 Σ log L_{i,jj} + 2 Σ log L_{S,aa}`, constant for the
+        /// frame (depends only on the factored Hessian, not on `g`).
+        log_det_hessian: f64,
+    }
+
+    impl ResidentArrowFrame {
+        /// Upload the constant Hessian blocks and perform the one-time factor
+        /// work (`POTRF(D)`, `Y_i = L_i^{-1} B_i`, Schur assembly + border
+        /// `POTRF`). The frame then serves cheap per-gradient solves.
+        pub(super) fn new(
+            sys: &ArrowSchurSystem,
+            ridge_t: f64,
+            ridge_beta: f64,
+        ) -> Result<Self, ArrowSchurGpuFailure> {
+            if ridge_t.is_nan() || ridge_beta.is_nan() {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: "ridge is NaN".to_string(),
+                });
+            }
+            let n = sys.rows.len();
+            let d = sys.d;
+            let k = sys.k;
+            let runtime = route_through_gpu(DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n })
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let stream = crate::gpu::device_runtime::cuda_context_for(runtime.device.ordinal)
+                .and_then(|ctx| ctx.new_stream().ok())
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let solver =
+                DnHandle::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let blas =
+                CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            // Upload the constant blocks. `g` is uploaded per-gradient, not here.
+            let (d_host, b_host, _g_host) = pack_host(sys, ridge_t);
+            let mut l_dev = stream
+                .clone_htod(&d_host)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let mut y_dev = stream
+                .clone_htod(&b_host)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            // POTRF(D) → L_i, kept resident in l_dev.
+            let info_host = potrf_batched(&solver, &stream, d, n, &mut l_dev)?;
+            if let Some(idx) = info_host.iter().position(|info| *info != 0) {
+                let pivot = info_host[idx];
+                let scale = sys.rows[idx]
+                    .htt
+                    .diag()
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f64, f64::max)
+                    .max(1.0);
+                return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
+                    row: idx,
+                    bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+                });
+            }
+
+            // Y_i = L_i^{-1} B_i, in place over y_dev. Kept resident.
+            trsm_batched_lower_inplace(&blas, &stream, d, n, k, &l_dev, &mut y_dev)?;
+
+            // Schur assembly S_β = (H_ββ + ρ_β I) − Σ Y_iᵀ Y_i, then POTRF → L_S.
+            // The RHS accumulation is folded into the gradient path; here we
+            // only need the (gradient-independent) Schur factor, so accumulate
+            // into a throwaway rhs buffer.
+            let schur_init: Vec<f64> = {
+                let mut tmp = Vec::with_capacity(k * k);
+                for col in 0..k {
+                    for row in 0..k {
+                        let mut v = sys.hbb[[row, col]];
+                        if row == col {
+                            v += ridge_beta;
+                        }
+                        tmp.push(v);
+                    }
+                }
+                tmp
+            };
+            let mut schur_dev = stream
+                .clone_htod(&schur_init)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            // A zero u-stack makes `Σ Y_iᵀ u_i = 0`, so only the `−Σ Y_iᵀ Y_i`
+            // Schur term is accumulated (the rhs is rebuilt per gradient).
+            let zero_u = stream
+                .clone_htod(&vec![0.0_f64; n * d])
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let mut throwaway_rhs = stream
+                .clone_htod(&vec![0.0_f64; k])
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            accumulate_schur(
+                &blas,
+                d,
+                k,
+                n,
+                &y_dev,
+                &zero_u,
+                &mut schur_dev,
+                &mut throwaway_rhs,
+            )?;
+            let info = potrf_single(&solver, &stream, k, &mut schur_dev)?;
+            if info != 0 {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!("Schur Cholesky failed at pivot {info}"),
+                });
+            }
+
+            // log|H| from the resident factors (constant for the frame).
+            let l_local_host = stream
+                .clone_dtoh(&l_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let l_schur_host = stream
+                .clone_dtoh(&schur_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let mut log_det = 0.0_f64;
+            for i in 0..n {
+                let base = i * d * d;
+                for j in 0..d {
+                    log_det += l_local_host[base + j * d + j].ln();
+                }
+            }
+            for j in 0..k {
+                log_det += l_schur_host[j * k + j].ln();
+            }
+            log_det *= 2.0;
+
+            Ok(Self {
+                n,
+                d,
+                k,
+                ridge_beta,
+                stream,
+                blas,
+                l_dev,
+                y_dev,
+                schur_dev,
+                log_det_hessian: log_det,
+            })
+        }
+
+        #[inline]
+        pub(super) fn log_det_hessian(&self) -> f64 {
+            self.log_det_hessian
+        }
+
+        /// Solve `H δ = −gradient` for a fresh gradient `(g_t, g_β)` reusing the
+        /// resident factors. Uploads only `g_t` (`n·d` scalars); reads back only
+        /// `δ`. No POTRF runs here — all factorization is amortized into `new`.
+        pub(super) fn solve_gradient(
+            &self,
+            g_t: &[f64],
+            g_beta: &[f64],
+        ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
+            let n = self.n;
+            let d = self.d;
+            let k = self.k;
+            if g_t.len() != n * d || g_beta.len() != k {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!(
+                        "resident gradient shape mismatch: g_t={} (want {}), g_beta={} (want {})",
+                        g_t.len(),
+                        n * d,
+                        g_beta.len(),
+                        k
+                    ),
+                });
+            }
+            // Upload the per-iterate row gradient → u_i = L_i^{-1} g_i in place.
+            let mut u_dev = self
+                .stream
+                .clone_htod(&g_t.to_vec())
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            trsm_batched_lower_inplace(&self.blas, &self.stream, d, n, 1, &self.l_dev, &mut u_dev)?;
+
+            // Schur RHS = −g_β + Σ_i Y_iᵀ u_i. Reuse the resident Schur factor
+            // (no POTRF). `accumulate_schur` adds `Σ Y_iᵀ u_i` into rhs and
+            // `−Σ Y_iᵀ Y_i` into a throwaway schur copy we discard.
+            let rhs_init: Vec<f64> = g_beta.iter().map(|v| -v).collect();
+            let mut rhs_dev = self
+                .stream
+                .clone_htod(&rhs_init)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            // accumulate_schur mutates its `schur` arg; we only want its rhs
+            // accumulation, so pass a scratch copy of the resident factor's
+            // shape (the schur term is unused on the gradient path).
+            let mut schur_scratch = self
+                .stream
+                .clone_htod(&vec![0.0_f64; k * k])
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            accumulate_schur(
+                &self.blas,
+                d,
+                k,
+                n,
+                &self.y_dev,
+                &u_dev,
+                &mut schur_scratch,
+                &mut rhs_dev,
+            )?;
+
+            // δβ ← L_S^{-T} L_S^{-1} rhs using the resident border factor.
+            trsm_single(
+                &self.blas,
+                &self.stream,
+                k,
+                &self.schur_dev,
+                &mut rhs_dev,
+                false,
+                false,
+            )?;
+            trsm_single(
+                &self.blas,
+                &self.stream,
+                k,
+                &self.schur_dev,
+                &mut rhs_dev,
+                false,
+                true,
+            )?;
+            let delta_beta_host = self
+                .stream
+                .clone_dtoh(&rhs_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let delta_beta = Array1::from_vec(delta_beta_host);
+
+            // Back-sub δt_i = −L_i^{-T}(u_i + Y_i δβ).
+            accumulate_back_sub_rhs(&self.blas, d, k, n, &self.y_dev, &rhs_dev, &mut u_dev)?;
+            trsm_batched_lower_inplace_transposed(
+                &self.blas,
+                &self.stream,
+                d,
+                n,
+                1,
+                &self.l_dev,
+                &mut u_dev,
+            )?;
+            let x_host = self
+                .stream
+                .clone_dtoh(&u_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let mut delta_t = Array1::<f64>::zeros(n * d);
+            for (i, v) in x_host.iter().enumerate() {
+                delta_t[i] = -*v;
+            }
+
+            // Silence unused-field lint on non-accumulating builds: ridge_beta is
+            // baked into the resident Schur factor, surfaced here for diagnostics.
+            let _ = self.ridge_beta;
+
+            Ok(ArrowSchurGpuSolution {
+                delta_t,
+                delta_beta,
+                log_det_hessian: self.log_det_hessian,
+            })
+        }
     }
 
     pub(super) fn solve_fused(

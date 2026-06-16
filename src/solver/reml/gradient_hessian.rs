@@ -3190,16 +3190,16 @@ impl<'a> RemlState<'a> {
     //     / (b + (beta-mu_p)' S_p (beta-mu_p)/2), reducing to the existing
     // MacKay/Tipping fixed point when (a, b) = (1, 0).
     /// Evaluate the configured ρ prior through the shared
-    /// [`rho_prior_eval`](super::rho_prior_eval) engine under the REML/LAML
+    /// [`rho_prior_eval`](crate::rho_prior_eval) engine under the REML/LAML
     /// invalid-prior policy
-    /// ([`Saturate`](super::rho_prior_eval::InvalidPriorPolicy::Saturate)): a
+    /// ([`Saturate`](crate::rho_prior_eval::InvalidPriorPolicy::Saturate)): a
     /// malformed prior folds into the objective as `+inf` cost (and `NaN`
     /// gradient/Hessian) so the outer optimizer steps away from it. The math
     /// itself is shared with custom-family handling.
     pub(crate) fn evaluate_configured_rho_prior(
         &self,
         rho: &Array1<f64>,
-    ) -> super::rho_prior_eval::RhoPriorEval {
+    ) -> crate::rho_prior_eval::RhoPriorEval {
         let effective = self.effective_rho_prior();
         // Evaluate the prior at the weight-anchored coordinate `ρ̃ = ρ − log g(w)`
         // (see [`rho_weight_anchor`](Self::rho_weight_anchor)) so the selected λ̂
@@ -3210,10 +3210,10 @@ impl<'a> RemlState<'a> {
         let anchor = self.rho_weight_anchor();
         let rho_anchored = (anchor != 0.0).then(|| rho.mapv(|r| r - anchor));
         let rho_eff: &Array1<f64> = rho_anchored.as_ref().unwrap_or(rho);
-        let mut eval = super::rho_prior_eval::evaluate(
+        let mut eval = crate::rho_prior_eval::evaluate(
             effective.as_ref(),
             rho_eff,
-            super::rho_prior_eval::InvalidPriorPolicy::Saturate,
+            crate::rho_prior_eval::InvalidPriorPolicy::Saturate,
         )
         .expect("Saturate policy never errors");
         // FIRTH-DEFAULT SELF-GATE (strict zero-downside). The shared engine
@@ -3231,7 +3231,7 @@ impl<'a> RemlState<'a> {
         if eval.cost.is_finite() {
             let mask = firth_default_coord_mask(&self.rho_prior, rho.len());
             if mask.iter().any(|&d| d) {
-                let theta = super::rho_prior_eval::pc_prior_rate(
+                let theta = crate::rho_prior_eval::pc_prior_rate(
                     FIRTH_DEFAULT_PC_UPPER,
                     FIRTH_DEFAULT_PC_TAIL_PROB,
                 );
@@ -3246,8 +3246,8 @@ impl<'a> RemlState<'a> {
                     let r = rho_eff[idx];
                     // Remove the plain PC contribution the engine added for this
                     // defaulted coordinate, then add the self-gated barrier.
-                    let (pc_c, pc_g, pc_h) = super::rho_prior_eval::pc_prior_terms(theta, r);
-                    let (b_c, b_g, b_h) = super::rho_prior_eval::firth_default_barrier_terms(
+                    let (pc_c, pc_g, pc_h) = crate::rho_prior_eval::pc_prior_terms(theta, r);
+                    let (b_c, b_g, b_h) = crate::rho_prior_eval::firth_default_barrier_terms(
                         theta,
                         FIRTH_DEFAULT_PC_UPPER,
                         r,

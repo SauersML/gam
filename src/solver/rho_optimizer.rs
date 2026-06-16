@@ -54,6 +54,10 @@ mod run;
 mod run_plan;
 mod seed_screening;
 
+pub use crate::model_types::CriterionCertificate;
+pub(crate) use crate::model_types::{
+    CERTIFICATE_RAIL_MARGIN, CERTIFICATE_RELATIVE_GATE, CERTIFICATE_Z_GATE,
+};
 pub use crate::solver::objective_base::{HessianResult, OuterEval};
 pub(crate) use bridges::*;
 pub use capability::*;
@@ -63,7 +67,6 @@ pub use objective::*;
 pub(crate) use run::*;
 // Re-export the outer-problem driver at `pub` (not just `pub(crate)`) so the
 // gam-pyffi crate can construct it directly for the SAE joint-fit FFI path.
-pub use run::CriterionCertificate;
 pub use run::OuterProblem;
 pub(crate) use run_plan::*;
 pub(crate) use seed_screening::*;

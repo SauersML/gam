@@ -78,7 +78,6 @@ mod joint_hyper;
 mod optimizer;
 mod penalty;
 mod prefit;
-mod result_types;
 pub(crate) mod smoothing_correction;
 mod summary;
 
@@ -89,6 +88,16 @@ pub use crate::inference::predict::{
     coefficient_uncertaintywith_mode, enrich_posterior_mean_bounds, predict_gam,
     predict_gam_posterior_mean, predict_gam_posterior_meanwith_backend,
     predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
+};
+pub use crate::model_types::{
+    AdaptiveRegularizationOptions, BlockRole, FitArtifacts, FitGeometry, FitInference, FitOptions,
+    FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts, ensure_finite_scalar,
+    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
+    validate_all_finite, validate_dense_hessian_export,
+    validate_explicit_dense_hessian_for_whitening,
+};
+pub(crate) use crate::model_types::{
+    ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 pub use evaluation::{
     evaluate_external_ift_residual_at_perturbed_rho, evaluate_externalcost_andridge,
@@ -116,14 +125,6 @@ pub(crate) use prefit::{
     reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
     validate_penalty_specs,
 };
-pub use result_types::{
-    AdaptiveRegularizationOptions, BlockRole, FitArtifacts, FitGeometry, FitInference, FitOptions,
-    FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts, ensure_finite_scalar,
-    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
-    validate_all_finite, validate_dense_hessian_export,
-    validate_explicit_dense_hessian_for_whitening,
-};
-pub(crate) use result_types::{ensure_finite_scalar_estimation, validate_all_finite_estimation};
 pub(crate) use smoothing_correction::{
     AUTO_CUBATURE_BOUNDARY_MARGIN, AUTO_CUBATURE_MAX_BETA_DIM, AUTO_CUBATURE_MAX_EIGENVECTORS,
     AUTO_CUBATURE_MAX_RHO_DIM, AUTO_CUBATURE_TARGET_VAR_FRAC, MAX_FACTORIZATION_ATTEMPTS,

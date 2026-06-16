@@ -1227,16 +1227,20 @@ fn survival_ls_joint_jet_tower_oracle_body() {
                     (*dir, claim)
                 })
                 .collect();
-            let fourth: Vec<([f64; SLS_ROW_K], [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K])> =
-                dirs.iter()
-                    .enumerate()
-                    .map(|(idx, u)| {
-                        let v = dirs[(idx + 1) % dirs.len()];
-                        let claim = RowKernel::row_fourth_contracted(&kernel, row, u, &v)
-                            .expect("hand kernel fourth");
-                        (*u, v, claim)
-                    })
-                    .collect();
+            let fourth: Vec<(
+                [f64; SLS_ROW_K],
+                [f64; SLS_ROW_K],
+                [[f64; SLS_ROW_K]; SLS_ROW_K],
+            )> = dirs
+                .iter()
+                .enumerate()
+                .map(|(idx, u)| {
+                    let v = dirs[(idx + 1) % dirs.len()];
+                    let claim = RowKernel::row_fourth_contracted(&kernel, row, u, &v)
+                        .expect("hand kernel fourth");
+                    (*u, v, claim)
+                })
+                .collect();
 
             let claims = KernelChannels {
                 value,

@@ -11,9 +11,10 @@ use super::reml_outer_engine::{
     BarrierConfig, ContractedPsiSecondOrderFn, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordPair, InnerSolution,
     InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace,
-    ProjectedKktResidual, RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
+    RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::faer_ndarray::fast_xt_diag_y;
+use crate::model_types::ProjectedKktResidual;
 use ndarray::{Array1, Array2};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
@@ -346,8 +347,7 @@ pub struct InnerAssembly<'dp> {
     /// iterate. When `Some`, the unified evaluator builds the
     /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
     /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
-    pub active_constraints:
-        Option<Arc<crate::estimate::reml::reml_outer_engine::ActiveLinearConstraintBlock>>,
+    pub active_constraints: Option<Arc<crate::model_types::ActiveLinearConstraintBlock>>,
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,

@@ -6870,7 +6870,9 @@ impl SaeManifoldTerm {
                 let d = atom.latent_dim;
                 let second = &second_jets[atom_idx];
                 AtomRowBasisJet {
-                    phi: (0..m).map(|basis_col| atom.basis_values[[row, basis_col]]).collect(),
+                    phi: (0..m)
+                        .map(|basis_col| atom.basis_values[[row, basis_col]])
+                        .collect(),
                     d_phi: (0..m)
                         .map(|basis_col| {
                             (0..d)
@@ -6883,9 +6885,7 @@ impl SaeManifoldTerm {
                             (0..d)
                                 .map(|axis_a| {
                                     (0..d)
-                                        .map(|axis_b| {
-                                            second[[row, basis_col, axis_a, axis_b]]
-                                        })
+                                        .map(|axis_b| second[[row, basis_col, axis_a, axis_b]])
                                         .collect()
                                 })
                                 .collect()

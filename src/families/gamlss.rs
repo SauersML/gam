@@ -47,7 +47,7 @@ use crate::custom_family::{
     shared_dense_arc, weighted_crossprod_psi_maps,
 };
 
-use crate::estimate::UnifiedFitResult;
+use crate::model_types::UnifiedFitResult;
 
 use crate::faer_ndarray::{fast_ab, fast_atv, fast_av, fast_joint_hessian_2x2};
 
@@ -103,7 +103,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 
-use crate::solver::estimate::validate_all_finite_estimation;
+use crate::model_types::validate_all_finite_estimation;
 
 use crate::types::{InverseLink, RidgePolicy, StandardLink};
 
