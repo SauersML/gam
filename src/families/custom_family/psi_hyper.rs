@@ -1115,6 +1115,26 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                 r_inf <= tol
             }
         };
+        // #740 gate-4 root-cause probe: expose the inner KKT residual inf-norm
+        // and whether the batched envelope-only override is eligible to fire, so
+        // the gate can attribute a ψ-gradient ≠ FD gap to a dropped β-response.
+        // Diagnostic only; gated to a live capture guard so production never pays.
+        if crate::test_support::debug_stash::capture_requested() {
+            let r_inf = match inner.kkt_residual.as_ref() {
+                None => 0.0,
+                Some(residual) => residual
+                    .as_array()
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f64, f64::max),
+            };
+            crate::test_support::debug_stash::store_kkt_probe(
+                r_inf,
+                !has_configured_rho_prior
+                    && batched_gradient_contract_allows_override
+                    && inner_kkt_residual_is_negligible,
+            );
+        }
         let mut batched_gradient_override: Option<Array1<f64>> = None;
         if !has_configured_rho_prior
             && batched_gradient_contract_allows_override
