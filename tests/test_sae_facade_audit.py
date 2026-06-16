@@ -423,7 +423,7 @@ def test_small_sae_fit_trust_diagnostics_round_trip_new_schema():
 
 
 def test_research_trust_scores_are_assignment_weighted():
-    fit = _make_fit("softmax", K=2)
+    fit = _make_fit("softmax", n_atoms=2)
     fit.training_data = np.zeros((3, 1))
     fit.assignments = np.asarray(
         [
@@ -442,8 +442,8 @@ def test_research_trust_scores_are_assignment_weighted():
 
 
 def test_alignment_public_api_uses_rich_result():
-    fit_a = _make_fit("softmax", K=2)
-    fit_b = _make_fit("softmax", K=2)
+    fit_a = _make_fit("softmax", n_atoms=2)
+    fit_b = _make_fit("softmax", n_atoms=2)
     fit_a.decoder_blocks = [np.eye(2), np.fliplr(np.eye(2))]
     fit_b.decoder_blocks = [np.fliplr(np.eye(2)), np.eye(2)]
     for atom, block in zip(fit_a.atoms, fit_a.decoder_blocks):
@@ -469,7 +469,7 @@ def test_alignment_public_api_uses_rich_result():
 def test_summary_threshold_mode_specific(monkeypatch, kind, expected_threshold):
     stub = _StubModule()
     monkeypatch.setattr(sae, "rust_module", lambda: stub)
-    fit = _make_fit(kind, K=4)
+    fit = _make_fit(kind, n_atoms=4)
     fit.summary()
     assert stub.threshold == pytest.approx(expected_threshold)
 

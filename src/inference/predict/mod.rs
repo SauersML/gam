@@ -391,9 +391,10 @@ impl UncertaintyCovarianceSource for PredictionCovarianceWithScale<'_> {
         }
         match mode {
             InferenceCovarianceMode::Conditional
-            | InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
-                Ok((PredictionCovarianceBackend::from_dense(self.covariance), false))
-            }
+            | InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => Ok((
+                PredictionCovarianceBackend::from_dense(self.covariance),
+                false,
+            )),
             InferenceCovarianceMode::ConditionalPlusSmoothingRequired => {
                 Err(EstimationError::InvalidInput(format!(
                     "{label}: raw covariance source cannot provide smoothing-corrected covariance"
@@ -1685,10 +1686,7 @@ where
             Some(Array1::from_elem(mean.len(), obsvar))
         }
         ResponseFamily::Poisson => Some(mean.mapv(|mu| mu.max(0.0))),
-        ResponseFamily::NegativeBinomial {
-            theta,
-            theta_fixed,
-        } => {
+        ResponseFamily::NegativeBinomial { theta, theta_fixed } => {
             let theta = if *theta_fixed {
                 Some(*theta)
             } else {
@@ -1830,10 +1828,7 @@ where
             let response_var = mean.mapv(|mu| mu.max(0.0));
             response_observation_bounds(response_var)
         }
-        ResponseFamily::NegativeBinomial {
-            theta,
-            theta_fixed,
-        } => {
+        ResponseFamily::NegativeBinomial { theta, theta_fixed } => {
             // `theta` is estimated jointly with the mean (#802) and recorded
             // in `likelihood_scale` (`EstimatedNegBinTheta`). Read the fitted
             // value via `observation_theta()`. For fixed-theta NB, the family

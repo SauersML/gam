@@ -198,4 +198,3 @@ fn dispersion_location_scale_kind(response: &ResponseFamily) -> Option<Dispersio
         _ => None,
     }
 }
-

@@ -4,6 +4,7 @@ pub mod continuation_path;
 pub mod cross_node;
 pub mod estimate;
 pub mod evidence;
+pub mod fit_orchestration;
 pub mod gauge;
 pub mod gaussian_reml;
 pub mod glm_sufficient_lane;
@@ -43,7 +44,6 @@ pub mod topology_selector;
 pub mod visualizer;
 pub(crate) mod warm_start_artifact;
 pub(crate) mod warm_start_transfer;
-pub mod fit_orchestration;
 
 pub use evidence::{
     EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,

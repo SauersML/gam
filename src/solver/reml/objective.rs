@@ -162,7 +162,11 @@ impl<'a> RemlState<'a> {
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             let t_assemble = std::time::Instant::now();
             let result = if synthetic_ext_count == 0 {
-                self.evaluate_unified_sparse(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
+                self.evaluate_unified_sparse(
+                    p,
+                    &bundle,
+                    super::reml_outer_engine::EvalMode::ValueOnly,
+                )?
             } else {
                 self.evaluate_unified_value_only_with_synthetic_ext_count(
                     p,
@@ -638,7 +642,10 @@ impl<'a> RemlState<'a> {
                 };
                 if firth_active_for_derivs {
                     if let Some(firth_op) = firth_op.clone() {
-                        Box::new(super::reml_outer_engine::FirthAwareGlmDerivatives { base, firth_op })
+                        Box::new(super::reml_outer_engine::FirthAwareGlmDerivatives {
+                            base,
+                            firth_op,
+                        })
                     } else {
                         Box::new(base)
                     }
@@ -731,49 +738,50 @@ impl<'a> RemlState<'a> {
         };
 
         // Dispersion and derivative provider depend on family.
-        let (dispersion, deriv_provider): (_, Box<dyn super::reml_outer_engine::HessianDerivativeProvider>) =
-            if is_gaussian_identity {
-                (
-                    DispersionHandling::ProfiledGaussian,
-                    Box::new(GaussianDerivatives),
-                )
-            } else if pirls_result.derivatives_unsupported {
-                (
-                    DispersionHandling::Fixed {
-                        phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
-                        include_logdet_h: true,
-                        include_logdet_s: true,
-                    },
-                    Box::new(GaussianDerivatives),
-                )
-            } else {
-                let (hessian_weights, c_array, d_array) =
-                    self.hessian_surface_arrays(pirls_result)?;
-                (
-                    DispersionHandling::Fixed {
-                        phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
-                        include_logdet_h: true,
-                        include_logdet_s: true,
-                    },
-                    {
-                        let base = SinglePredictorGlmDerivatives {
-                            c_array,
-                            d_array: Some(d_array),
-                            hessian_weights,
-                            x_transformed: self.x().clone(),
-                        };
-                        // Match the dense exact path: when Firth-logit is
-                        // active, the directional log|H_total| drift includes
-                        // -D(H_phi)[B_k]. The sparse backend differs only in how
-                        // B_k = H^{-1} rhs is solved.
-                        if let Some(firth_op) = firth_op.clone() {
-                            Box::new(FirthAwareGlmDerivatives { base, firth_op })
-                        } else {
-                            Box::new(base)
-                        }
-                    },
-                )
-            };
+        let (dispersion, deriv_provider): (
+            _,
+            Box<dyn super::reml_outer_engine::HessianDerivativeProvider>,
+        ) = if is_gaussian_identity {
+            (
+                DispersionHandling::ProfiledGaussian,
+                Box::new(GaussianDerivatives),
+            )
+        } else if pirls_result.derivatives_unsupported {
+            (
+                DispersionHandling::Fixed {
+                    phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
+                    include_logdet_h: true,
+                    include_logdet_s: true,
+                },
+                Box::new(GaussianDerivatives),
+            )
+        } else {
+            let (hessian_weights, c_array, d_array) = self.hessian_surface_arrays(pirls_result)?;
+            (
+                DispersionHandling::Fixed {
+                    phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
+                    include_logdet_h: true,
+                    include_logdet_s: true,
+                },
+                {
+                    let base = SinglePredictorGlmDerivatives {
+                        c_array,
+                        d_array: Some(d_array),
+                        hessian_weights,
+                        x_transformed: self.x().clone(),
+                    };
+                    // Match the dense exact path: when Firth-logit is
+                    // active, the directional log|H_total| drift includes
+                    // -D(H_phi)[B_k]. The sparse backend differs only in how
+                    // B_k = H^{-1} rhs is solved.
+                    if let Some(firth_op) = firth_op.clone() {
+                        Box::new(FirthAwareGlmDerivatives { base, firth_op })
+                    } else {
+                        Box::new(base)
+                    }
+                },
+            )
+        };
 
         let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
             self.y,
@@ -818,18 +826,20 @@ impl<'a> RemlState<'a> {
                 .collect();
             let mut coords = Vec::with_capacity(kron.num_penalties());
             for k in 0..d {
-                coords.push(super::reml_outer_engine::PenaltyCoordinate::KroneckerMarginal {
-                    eigenvalues: eigenvalues.clone(),
-                    dim_index: k,
-                    marginal_dims: kron.marginal_dims.clone(),
-                    total_dim,
-                });
+                coords.push(
+                    super::reml_outer_engine::PenaltyCoordinate::KroneckerMarginal {
+                        eigenvalues: eigenvalues.clone(),
+                        dim_index: k,
+                        marginal_dims: kron.marginal_dims.clone(),
+                        total_dim,
+                    },
+                );
             }
             if kron.has_double_penalty {
                 let identity_root = ndarray::Array2::<f64>::eye(total_dim);
-                coords.push(super::reml_outer_engine::PenaltyCoordinate::from_dense_root(
-                    identity_root,
-                ));
+                coords.push(
+                    super::reml_outer_engine::PenaltyCoordinate::from_dense_root(identity_root),
+                );
             }
             return coords;
         }
@@ -852,7 +862,9 @@ impl<'a> RemlState<'a> {
         penalty_logdet: super::reml_outer_engine::PenaltyLogdetDerivs,
         nullspace_dim: f64,
         hessian_logdet_correction: f64,
-        penalty_subspace_trace: Option<std::sync::Arc<super::reml_outer_engine::PenaltySubspaceTrace>>,
+        penalty_subspace_trace: Option<
+            std::sync::Arc<super::reml_outer_engine::PenaltySubspaceTrace>,
+        >,
         free_basis: Option<&Array2<f64>>,
     ) -> super::assembly::InnerAssembly<'static> {
         // When a linear-inequality active set reduces the inner solve to the
@@ -1127,7 +1139,9 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use super::reml_outer_engine::{HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator};
+        use super::reml_outer_engine::{
+            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator,
+        };
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
         })?;
@@ -2077,8 +2091,9 @@ impl<'a> RemlState<'a> {
         let mut inner_solution = assembly.build();
         inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
         inner_solution.dp_floor_scale = self.gaussian_dp_floor_scale();
-        let inner_hessian_scale =
-            super::reml_outer_engine::hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
+        let inner_hessian_scale = super::reml_outer_engine::hessian_operator_geometric_scale(
+            inner_solution.hessian_op.as_ref(),
+        );
 
         let prior = self.build_prior(rho, eval_mode);
         let cost_result = super::assembly::evaluate_solution(
@@ -2532,8 +2547,11 @@ impl<'a> RemlState<'a> {
             self.update_hypergradient_budget_after_outer_eval(p, &grad, ift_residual_energy);
             return Ok(grad);
         }
-        let result =
-            self.evaluate_unified(p, &bundle, super::reml_outer_engine::EvalMode::ValueAndGradient)?;
+        let result = self.evaluate_unified(
+            p,
+            &bundle,
+            super::reml_outer_engine::EvalMode::ValueAndGradient,
+        )?;
         let ift_residual_energy = result.ift_residual_energy;
         store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
         let grad = result
@@ -2635,7 +2653,11 @@ impl<'a> RemlState<'a> {
         if matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::Value) {
             let t_assemble = std::time::Instant::now();
             let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-                self.evaluate_unified_sparse(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
+                self.evaluate_unified_sparse(
+                    p,
+                    &bundle,
+                    super::reml_outer_engine::EvalMode::ValueOnly,
+                )?
             } else {
                 self.evaluate_unified(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
             };
@@ -2933,21 +2955,24 @@ impl<'a> RemlState<'a> {
             // Installing this callback is still required: the unified Hessian
             // builder then evaluates the nonzero profiled cross terms from the
             // first-order link drifts and IFT mode responses.
-            assembly.rho_ext_pair_fn = Some(Box::new(move |_, _| super::reml_outer_engine::HyperCoordPair {
-                a: 0.0,
-                g: Array1::zeros(p_dim),
-                b_mat: Array2::zeros((p_dim, p_dim)),
-                b_operator: None,
-                ld_s: 0.0,
-            }));
-            assembly.ext_coord_pair_fn =
-                Some(Box::new(move |_, _| super::reml_outer_engine::HyperCoordPair {
+            assembly.rho_ext_pair_fn = Some(Box::new(move |_, _| {
+                super::reml_outer_engine::HyperCoordPair {
                     a: 0.0,
                     g: Array1::zeros(p_dim),
                     b_mat: Array2::zeros((p_dim, p_dim)),
                     b_operator: None,
                     ld_s: 0.0,
-                }));
+                }
+            }));
+            assembly.ext_coord_pair_fn = Some(Box::new(move |_, _| {
+                super::reml_outer_engine::HyperCoordPair {
+                    a: 0.0,
+                    g: Array1::zeros(p_dim),
+                    b_mat: Array2::zeros((p_dim, p_dim)),
+                    b_operator: None,
+                    ld_s: 0.0,
+                }
+            }));
             assert!(ext_dim > 0);
         }
         self.assemble_and_evaluate(rho, &bundle, mode, assembly)

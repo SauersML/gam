@@ -236,4 +236,3 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         inference_notes,
     })
 }
-

@@ -912,4 +912,3 @@ pub(super) fn natural_latent_manifold_for_basis(
         | crate::smooth::SmoothBasisSpec::FactorSmooth { .. } => LatentManifold::Euclidean,
     }
 }
-

@@ -276,4 +276,3 @@ pub(crate) fn materialize_standard<'a>(
         inference_notes,
     })
 }
-

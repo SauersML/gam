@@ -30,6 +30,7 @@ pub(crate) use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, LinearOperator, SignedWeightsView, SymmetricMatrix,
     dense_rowwise_kronecker,
 };
+pub(crate) use crate::model_types::EstimationError;
 pub(crate) use crate::pirls::{
     LinearInequalityConstraints, solve_newton_directionwith_lower_bounds,
 };
@@ -45,7 +46,6 @@ pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
     StochasticTraceState, compute_block_penalty_logdet_derivs, exact_pseudo_logdet,
     positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
 };
-pub(crate) use crate::model_types::EstimationError;
 pub(crate) use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };

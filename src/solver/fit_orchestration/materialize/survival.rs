@@ -1369,4 +1369,3 @@ pub(crate) fn materialize_survival<'a>(
         inference_notes,
     })
 }
-

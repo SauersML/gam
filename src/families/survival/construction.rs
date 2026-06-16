@@ -726,8 +726,10 @@ where
     Fe: FnMut(
         &mut (),
         &Array1<f64>,
-    )
-        -> Result<crate::solver::rho_optimizer::OuterEval, crate::model_types::EstimationError>,
+    ) -> Result<
+        crate::solver::rho_optimizer::OuterEval,
+        crate::model_types::EstimationError,
+    >,
 {
     use crate::solver::rho_optimizer::OuterProblem;
     let Some(seed) = survival_baseline_theta_from_config(initial)? else {
@@ -756,8 +758,10 @@ where
             fn(
                 &mut (),
                 &Array1<f64>,
-            )
-                -> Result<crate::solver::rho_optimizer::EfsEval, crate::model_types::EstimationError>,
+            ) -> Result<
+                crate::solver::rho_optimizer::EfsEval,
+                crate::model_types::EstimationError,
+            >,
         >,
     );
     let result = problem
@@ -810,9 +814,9 @@ where
         let cfg = survival_baseline_config_from_theta(target, theta)
             .map_err(crate::model_types::EstimationError::InvalidInput)?;
         let eval =
-            obj.borrow_mut().map_err(crate::model_types::EstimationError::InvalidInput)?;
+            obj.borrow_mut()(&cfg).map_err(crate::model_types::EstimationError::InvalidInput)?;
         if eval.gradient.len() != theta.len() {
-            return Err(crate::estimate::EstimationError::InvalidInput(format!(
+            return Err(crate::model_types::EstimationError::InvalidInput(format!(
                 "{engine_context}: baseline gradient dimension mismatch: got {}, expected {}",
                 eval.gradient.len(),
                 theta.len()
@@ -820,7 +824,7 @@ where
         }
         if let crate::solver::rho_optimizer::HessianResult::Analytic(ref h) = eval.hessian {
             if h.nrows() != theta.len() || h.ncols() != theta.len() {
-                return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                return Err(crate::model_types::EstimationError::InvalidInput(format!(
                     "{engine_context}: baseline Hessian dimension mismatch: got {}x{}, expected {}x{}",
                     h.nrows(),
                     h.ncols(),
@@ -3576,10 +3580,10 @@ mod tests {
         baseline_chain_rule_gradient, baseline_offset_theta_partials,
         build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
         build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
-        gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative,
-        gompertz_hazard_components,
-        evaluate_survival_marginal_slope_baseline, marginal_slope_baseline_chain_rule_gradient,
-        marginal_slope_baseline_chain_rule_hessian, marginal_slope_baseline_offset_theta_partials,
+        evaluate_survival_marginal_slope_baseline, gompertz_cumulative_shape_derivative,
+        gompertz_cumulative_shape_second_derivative, gompertz_hazard_components,
+        marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
+        marginal_slope_baseline_offset_theta_partials,
         optimize_survival_baseline_config_with_gradient,
         optimize_survival_baseline_config_with_gradient_only,
         resolve_survival_marginal_slope_time_anchor_value, survival_baseline_config_from_theta,
@@ -4755,8 +4759,7 @@ mod tests {
             );
 
             // Second shape derivative vs central diff of the first derivative.
-            let (d2_cum, d2_inst) =
-                gompertz_cumulative_shape_second_derivative(age, rate, shape);
+            let (d2_cum, d2_inst) = gompertz_cumulative_shape_second_derivative(age, rate, shape);
             let (dcum_p, dinst_p) = gompertz_cumulative_shape_derivative(age, rate, shape + h);
             let (dcum_m, dinst_m) = gompertz_cumulative_shape_derivative(age, rate, shape - h);
             assert_close(
@@ -4790,7 +4793,7 @@ mod tests {
         // cancelling exact branch and returned a wildly wrong curvature.
         let cases = [
             (25.0_f64, 0.4_f64, 1e-9_f64),
-            (100.0, 0.4, 1e-6),  // x = 1e-4
+            (100.0, 0.4, 1e-6),   // x = 1e-4
             (100.0, 0.012, 1e-5), // x = 1e-3, the old-pivot failure point
             (50.0, 1.2, 1e-8),
         ];
@@ -4810,8 +4813,7 @@ mod tests {
                 &format!("∂h_G/∂shape limit (age={age}, shape={shape})"),
             );
 
-            let (d2_cum, d2_inst) =
-                gompertz_cumulative_shape_second_derivative(age, rate, shape);
+            let (d2_cum, d2_inst) = gompertz_cumulative_shape_second_derivative(age, rate, shape);
             assert_close(
                 d2_cum,
                 rate * t * t * t / 3.0,

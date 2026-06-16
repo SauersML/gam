@@ -51,4 +51,3 @@ pub fn resolve_weight_column(
     }
     Ok(values)
 }
-
