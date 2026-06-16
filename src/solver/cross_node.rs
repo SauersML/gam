@@ -29,7 +29,7 @@
 //!    straight-through holds at the bit level on both sides because both
 //!    cursors are positions in deterministic sequences.
 //! 3. **Partials, never rows, cross the wire.** A worker streams its shard rows
-//!    locally (object store / mmap — [`crate::terms::sae_corpus`]) and ships
+//!    locally (object store / mmap — [`crate::terms::sae::corpus`]) and ships
 //!    only `k·k` f64 partials. The coordinator's ingest seam is
 //!    [`StreamingBorderGram::submit_chunk_gram`]; both producers route through
 //!    the one [`chunk_gram_flat`] free function, so a shipped partial is

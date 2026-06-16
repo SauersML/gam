@@ -45,7 +45,7 @@ pub struct RemlLamlResult {
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,
     /// Outer Hessian ∂²V/∂ρ² (present if mode = ValueGradientHessian).
-    pub hessian: crate::solver::outer_strategy::HessianResult,
+    pub hessian: crate::solver::rho_optimizer::HessianResult,
     /// Rho-coordinate mode responses, one `K · g_j` vector per column, when
     /// they were already built for derivative corrections. Consumed by the
     /// runtime IFT mode-response cache for joint-IFT warm starts.
@@ -876,7 +876,7 @@ impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
     }
     fn family_outer_hessian_operator(
         &self,
-    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
         self.0.family_outer_hessian_operator()
     }
     fn scalar_glm_ingredients(&self) -> Option<ScalarGlmIngredients<'_>> {
