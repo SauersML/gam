@@ -15,8 +15,8 @@ print(posterior)
 #                  rhat=1.0040, ess=..., converged=True)
 
 bands = posterior.predict(test_df, level=0.95)
-# {"eta_mean", "eta_lower", "eta_upper",
-#  "mean",     "mean_lower", "mean_upper"}
+# {"linear_predictor", "linear_predictor_lower", "linear_predictor_upper",
+#  "mean",             "mean_lower",             "mean_upper"}
 ```
 
 ## Model.sample
@@ -39,7 +39,7 @@ model.sample(
 | `samples` | derived from coefficient count | Post-warmup draws per chain. |
 | `warmup` | matches `samples` | Warmup iterations per chain (discarded). |
 | `chains` | `2` if `p <= 50`, else `4` | Independent chains. |
-| `target_accept` | `0.9` | NUTS step-size adaptation target acceptance; NUTS paths require it to lie in `(0, 1)`. Ignored by the Laplace and Polya-Gamma Gibbs paths. |
+| `target_accept` | `0.9` | NUTS step-size adaptation target acceptance; NUTS paths require it to lie in `(0, 1)`. The sampler floors it to `0.90` (dim ≤ 50) or `0.92` (dim > 50) and caps it at `0.95` via `robust_target_accept`, so a requested value outside that band is clamped. Ignored by the Laplace and Polya-Gamma Gibbs paths. |
 | `seed` | `42` | RNG seed consumed by the sampler. |
 
 Total returned draws are `chains * samples`.
@@ -73,14 +73,17 @@ The dispatch is in `src/inference/sample.rs::sample_saved_model`:
 
 | Model class | Sampler |
 | --- | --- |
-| Standard GLM (Gaussian, binomial probit/cloglog/latent-cloglog, Poisson, Tweedie, negative-binomial, Gamma) | NUTS |
-| Bernoulli-logit standard GLM | Polya-Gamma Gibbs |
+| Gaussian-identity standard GLM | Laplace (closed form; see note below) |
+| Standard GLM (binomial probit/cloglog/latent-cloglog, Poisson, Tweedie, negative-binomial, Gamma) | NUTS |
+| Bernoulli-logit standard GLM (no Firth, no offset, unit weights) | Polya-Gamma Gibbs |
+| Bounded-coefficient standard GLM | Laplace (latent logit scale) |
 | Standard GLM with beta regression or binomial SAS / beta-logistic / blended links | Not implemented; raises |
 | Standard GLM with link-wiggle | NUTS (joint link-wiggle path) |
 | Survival: Royston-Parmar, Weibull, marginal-slope | NUTS |
 | Survival: latent, latent-binary, location-scale | Laplace |
 | Gaussian location-scale | Laplace |
 | Binomial location-scale | Laplace |
+| Dispersion location-scale | Laplace |
 | Bernoulli marginal-slope | Laplace |
 | Transformation-normal | Laplace |
 
@@ -89,12 +92,19 @@ likelihood; it is unrelated to the transformation-normal class.
 
 The Laplace path draws iid samples from `N(beta_hat, phi * H_penalized^{-1})`
 using the saved penalized Hessian's Cholesky factor and the saved dispersion
-scale. The Python/FFI wrapper sets `method == "laplace"` on these
-results; the underlying Rust `NutsResult` reports `rhat == 1.0`,
-`ess == chains * samples`, and
-`converged == True` by construction. The `PosteriorSamples` API is
-identical either way. The Polya-Gamma Gibbs path also surfaces under
-`method == "nuts"` in the current build.
+scale. Regardless of which sampler actually ran, every Laplace draw set
+reports `rhat == 1.0`, `ess == chains * samples`, and `converged == True`
+by construction. The `PosteriorSamples` API is identical either way.
+
+The exposed `method` string is derived from the saved-model **class**, not
+from the sampler that ran (`nuts_method_label`): only the dedicated
+location-scale / survival-Laplace / transformation-normal / marginal-slope
+classes report `method == "laplace"`. The `Standard` class always reports
+`method == "nuts"`, so a **Gaussian-identity standard GLM** and a
+**bounded-coefficient standard GLM** are drawn from the closed-form Laplace
+posterior above yet still surface as `method == "nuts"` (and therefore
+`is_exact == True`). The Polya-Gamma Gibbs path likewise surfaces under
+`method == "nuts"`.
 
 ## SamplingConfig
 
@@ -164,13 +174,14 @@ posterior.to_pandas()         # DataFrame with coefficient_names columns
 
 ```python
 bands = posterior.predict(test_df, level=0.95)
-# {"eta_mean", "eta_lower", "eta_upper",
-#  "mean",     "mean_lower", "mean_upper"}
+# {"linear_predictor", "linear_predictor_lower", "linear_predictor_upper",
+#  "mean",             "mean_lower",             "mean_upper"}
 ```
 
 `predict` builds the saved model's standard design matrix, computes
 `samples @ X.T`, and collapses the resulting link-scale draws to per-row
-mean and quantiles inside Rust.
+mean and quantiles inside Rust. The link-scale columns are keyed
+`linear_predictor*`; no engine-internal `eta` key is exposed.
 
 `predict` raises `RuntimeError` if the `PosteriorSamples` was loaded
 from disk without bundled model bytes. Model classes lacking a
