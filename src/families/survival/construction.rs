@@ -2364,7 +2364,15 @@ fn gompertz_hazard_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {
 fn gompertz_cumulative_shape_derivative(age: f64, rate: f64, shape: f64) -> (f64, f64) {
     let x = shape * age;
     let dinstg_dshape = rate * age * x.exp();
-    let dhg_dshape = if shape.abs() < 1e-10 {
+    // The exact form rate·[t·E·shape − (E−1)]/shape² is a difference of two
+    // O(1/shape) quantities whose leading terms cancel, so its accuracy is
+    // governed by the dimensionless product x = shape·age, NOT by `shape`
+    // alone. Pivoting on `shape < 1e-10` ignored `age`: for large ages a small
+    // shape still yields a small x where the catastrophic cancellation has
+    // already corrupted the difference. Pivot on x instead; the 3-term Taylor
+    // (through O(x²)) is accurate to <1e-9 for |x| < 1e-4, and the exact branch
+    // is clean above it.
+    let dhg_dshape = if x.abs() < 1e-4 {
         let t = age;
         // Truncated to O(x³): t²/2 + x·t²/3 + x²·t²/8
         rate * t * t * (0.5 + x / 3.0 + x * x / 8.0)
@@ -2985,7 +2993,18 @@ fn survival_hazard_theta_first_second(
 #[inline]
 fn gompertz_cumulative_shape_second_derivative(age: f64, rate: f64, shape: f64) -> (f64, f64) {
     let x = shape * age;
-    if shape.abs() < 1e-10 {
+    // ∂²H_G/∂shape² = rate·[t²·E/shape − 2·(shape·t·E − (E−1))/shape³]. This is
+    // a difference of O(1/shape³) terms whose leading parts cancel, so its
+    // floating-point accuracy is governed by x = shape·age — and the
+    // cancellation is FAR worse than the first derivative's 1/shape² form.
+    // Empirically the exact branch is already garbage for |x| < ~1e-4 (e.g.
+    // x=1e-9 gives a ~98% relative error; x=1e-10 a ~9700% error). The old
+    // `shape < 1e-10` pivot ignored `age` and so routed those small-x cases
+    // through the cancelling exact form, corrupting the marginal-slope baseline
+    // Hessian near small shape. Pivot on x with a wider threshold than the
+    // first derivative: the 3-term Taylor (through O(x²)) holds to <1e-8 for
+    // |x| < 1e-3, and the exact branch is clean above it.
+    if x.abs() < 1e-3 {
         let t = age;
         (
             rate * t * t * t * (1.0 / 3.0 + x / 4.0 + x * x / 10.0),
@@ -4758,47 +4777,86 @@ mod tests {
     }
 
     #[test]
-    fn gompertz_hazard_shape_derivatives_small_shape_taylor_agrees_with_direct_branch() {
+    fn gompertz_hazard_shape_derivatives_small_shape_match_analytic_limit() {
         assert!(file!().ends_with(".rs"));
-        // The `|shape| < 1e-10` Taylor branches must be continuous with the
-        // exact closed-form branch across the cutoff: evaluate the Taylor side
-        // just below 1e-10 and the direct side just above, and confirm both
-        // collapse to the analytic shape->0 limits.
+        // At small x = shape·age the shape derivatives collapse to closed-form
+        // limits. These MUST hold even for large ages with tiny shapes, which
+        // is precisely the regime where the (cancelling) exact branch loses all
+        // precision and the x-based pivot routes to the Taylor branch.
         //   ∂H_G/∂shape   -> rate·t²/2
         //   ∂h_G/∂shape   -> rate·t
         //   ∂²H_G/∂shape² -> rate·t³/3
         //   ∂²h_G/∂shape² -> rate·t²
-        let age = 25.0;
+        // The bug this guards: the second derivative's old `shape < 1e-10`
+        // pivot ignored `age`, so e.g. (age=100, shape=1e-5 -> x=1e-3) took the
+        // cancelling exact branch and returned a wildly wrong curvature.
+        let cases = [
+            (25.0_f64, 0.4_f64, 1e-9_f64),
+            (100.0, 0.4, 1e-6),  // x = 1e-4
+            (100.0, 0.012, 1e-5), // x = 1e-3, the old-pivot failure point
+            (50.0, 1.2, 1e-8),
+        ];
+        for &(age, rate, shape) in &cases {
+            let t = age;
+            let (d_cum, d_inst) = gompertz_cumulative_shape_derivative(age, rate, shape);
+            assert_close(
+                d_cum,
+                rate * t * t / 2.0,
+                1e-3,
+                &format!("∂H_G/∂shape limit (age={age}, shape={shape})"),
+            );
+            assert_close(
+                d_inst,
+                rate * t,
+                1e-3,
+                &format!("∂h_G/∂shape limit (age={age}, shape={shape})"),
+            );
+
+            let (d2_cum, d2_inst) =
+                gompertz_cumulative_shape_second_derivative(age, rate, shape);
+            assert_close(
+                d2_cum,
+                rate * t * t * t / 3.0,
+                1e-3,
+                &format!("∂²H_G/∂shape² limit (age={age}, shape={shape})"),
+            );
+            assert_close(
+                d2_inst,
+                rate * t * t,
+                1e-3,
+                &format!("∂²h_G/∂shape² limit (age={age}, shape={shape})"),
+            );
+        }
+    }
+
+    #[test]
+    fn gompertz_second_shape_derivative_is_accurate_in_old_pivot_gap() {
+        assert!(file!().ends_with(".rs"));
+        // Regression: in the band shape ∈ [1e-10, ~1e-4] with a realistic age,
+        // the OLD `shape < 1e-10` pivot sent ∂²H_G/∂shape² through the
+        // catastrophically-cancelling exact branch. With age=100, shape=1e-9
+        // (x=1e-7) the exact branch returned ~+5e1 vs the true ~rate·t³/3.
+        // Assert the implementation now matches the closed-form limit to high
+        // precision throughout that band, across several decades of shape.
+        let age = 100.0;
         let rate = 0.4;
         let t = age;
-        let shape_taylor = 0.5e-10; // forces the Taylor branch
-        let shape_direct = 2.0e-10; // forces the exact branch
-
-        let (dt_cum, dt_inst) = gompertz_cumulative_shape_derivative(age, rate, shape_taylor);
-        let (dd_cum, dd_inst) = gompertz_cumulative_shape_derivative(age, rate, shape_direct);
-        assert_close(dt_cum, rate * t * t / 2.0, 1e-8, "taylor ∂H_G/∂shape near 0");
-        assert_close(dd_cum, rate * t * t / 2.0, 1e-8, "direct ∂H_G/∂shape near 0");
-        assert_close(dt_inst, rate * t, 1e-8, "taylor ∂h_G/∂shape near 0");
-        assert_close(dd_inst, rate * t, 1e-8, "direct ∂h_G/∂shape near 0");
-
-        let (st_cum, st_inst) =
-            gompertz_cumulative_shape_second_derivative(age, rate, shape_taylor);
-        let (sd_cum, sd_inst) =
-            gompertz_cumulative_shape_second_derivative(age, rate, shape_direct);
-        assert_close(
-            st_cum,
-            rate * t * t * t / 3.0,
-            1e-8,
-            "taylor ∂²H_G/∂shape² near 0",
-        );
-        assert_close(
-            sd_cum,
-            rate * t * t * t / 3.0,
-            1e-8,
-            "direct ∂²H_G/∂shape² near 0",
-        );
-        assert_close(st_inst, rate * t * t, 1e-8, "taylor ∂²h_G/∂shape² near 0");
-        assert_close(sd_inst, rate * t * t, 1e-8, "direct ∂²h_G/∂shape² near 0");
+        let truth = rate * t * t * t / 3.0; // 1.333e5
+        // Start at shape=1e-5 (x=1e-3): below this the second derivative is,
+        // to better than 1e-3 relative, equal to its shape->0 limit, so the
+        // limit is a valid oracle. (At x=1e-2 the true value legitimately
+        // departs from the limit by ~7e-3, which is a real O(x) correction,
+        // not an error — so we do not extend the band up to shape=1e-4.)
+        for k in 5..=12 {
+            let shape = 10f64.powi(-(k as i32)); // 1e-5 .. 1e-12
+            let (d2_cum, _) = gompertz_cumulative_shape_second_derivative(age, rate, shape);
+            assert_close(
+                d2_cum,
+                truth,
+                1e-3,
+                &format!("∂²H_G/∂shape² in old-pivot gap (age={age}, shape=1e-{k})"),
+            );
+        }
     }
 
     #[test]
