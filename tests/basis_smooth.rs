@@ -178,6 +178,8 @@ mod ridge_ledger_invariants;
 mod smooth_rejects_constant_input;
 #[path = "basis_smooth/smooth_term_lr_bartlett_calibration.rs"]
 mod smooth_term_lr_bartlett_calibration;
+#[path = "basis_smooth/smooth_term_lr_size_calibration.rs"]
+mod smooth_term_lr_size_calibration;
 #[path = "basis_smooth/spline_k_sweep_easy_truth.rs"]
 mod spline_k_sweep_easy_truth;
 #[path = "basis_smooth/spline_scan_exact_oracle.rs"]
