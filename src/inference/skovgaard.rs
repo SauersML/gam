@@ -405,7 +405,11 @@ mod tests {
         assert!((res.u - 3.0).abs() < 1e-12, "u = {}", res.u);
         assert!((res.r_star - res.r).abs() < 1e-12, "r* = {}", res.r_star);
         // The empirical companion uses the same î = ĵ = Î ⇒ identical to u.
-        assert!((res.u_empirical - res.u).abs() < 1e-12, "u_emp = {}", res.u_empirical);
+        assert!(
+            (res.u_empirical - res.u).abs() < 1e-12,
+            "u_emp = {}",
+            res.u_empirical
+        );
         assert!((res.r_star_empirical - res.r_star).abs() < 1e-12);
         assert!(!res.material, "regular case must not be material");
     }
@@ -434,13 +438,20 @@ mod tests {
         // u = 0.2·196/√100 = 3.92, ratio = 1.96, r* = 2 + ln(1.96)/2.
         let expected_u = dtheta * expected / observed.sqrt();
         assert!((res.u - expected_u).abs() < 1e-12, "u = {}", res.u);
-        assert!((res.r_star - 2.336_472_236_6).abs() < 1e-9, "r* = {}", res.r_star);
+        assert!(
+            (res.r_star - 2.336_472_236_6).abs() < 1e-9,
+            "r* = {}",
+            res.r_star
+        );
         assert!(res.r_star > res.r, "î > ĵ must lift r*");
         assert!(
             res.p_value_corrected < res.p_value_first_order,
             "larger root ⇒ smaller two-sided p"
         );
-        assert!(res.material, "96% information discrepancy must flag material");
+        assert!(
+            res.material,
+            "96% information discrepancy must flag material"
+        );
         // Empirical companion: u_emp = 0.2·121/10 = 2.42, independent of î.
         assert!((res.u_empirical - dtheta * score_cov / observed.sqrt()).abs() < 1e-12);
         assert!((res.r_star_empirical - 2.095_310_179_8).abs() < 1e-9);
@@ -488,7 +499,11 @@ mod tests {
         let u_expected = (theta_hat - theta0) * expected / observed.sqrt();
         assert!((res.u - u_expected).abs() < 1e-12, "u = {}", res.u);
         // Canonical family ⇒ the empirical companion coincides with the model u.
-        assert!((res.u_empirical - res.u).abs() < 1e-12, "u_emp = {}", res.u_empirical);
+        assert!(
+            (res.u_empirical - res.u).abs() < 1e-12,
+            "u_emp = {}",
+            res.u_empirical
+        );
         // r* finite and on the same side as r.
         assert!(res.r_star.is_finite());
         assert!(res.r_star.signum() == res.r.signum());
@@ -497,7 +512,11 @@ mod tests {
         // Wald root, and the higher-order r* lies strictly between the Wald root
         // and r — the refinement that pulls the skewed first-order root back.
         let q = (theta_hat - theta0) * observed.sqrt();
-        assert!((res.u - q).abs() < 1e-12, "u = {} should equal Wald root q = {q}", res.u);
+        assert!(
+            (res.u - q).abs() < 1e-12,
+            "u = {} should equal Wald root q = {q}",
+            res.u
+        );
         assert!(
             q < res.r_star && res.r_star < r_expected,
             "need q < r* < r: q={q} r*={} r={r_expected}",
@@ -539,11 +558,19 @@ mod tests {
         assert!((res.r - 2.0).abs() < 1e-12, "r = {}", res.r);
         // u = (θ̂−θ₀)·î/√ĵ = 0.25·40/√50 = 1.41421356.
         assert!((res.u - 1.414_213_562_4).abs() < 1e-9, "u = {}", res.u);
-        assert!((res.r_star - 1.826_713_204_9).abs() < 1e-9, "r* = {}", res.r_star);
+        assert!(
+            (res.r_star - 1.826_713_204_9).abs() < 1e-9,
+            "r* = {}",
+            res.r_star
+        );
         // u < r here ⇒ r* < r ⇒ larger two-sided p than first-order.
         assert!(res.p_value_corrected > res.p_value_first_order);
         // Empirical companion: u_emp = (θ̂−θ₀)·Î/√ĵ = 0.25·100/√50 = 3.53553391.
-        assert!((res.u_empirical - 3.535_533_905_9).abs() < 1e-9, "u_emp = {}", res.u_empirical);
+        assert!(
+            (res.u_empirical - 3.535_533_905_9).abs() < 1e-9,
+            "u_emp = {}",
+            res.u_empirical
+        );
         assert!((res.r_star_empirical - 2.284_858_570_8).abs() < 1e-9);
         // Dimension mismatch is rejected.
         let bad_c = array![1.0_f64, 0.0];
@@ -605,10 +632,14 @@ mod tests {
         // with c = 1, a = Ĥ⁻¹c = 1/ĵ): Î = ĵ² / Σ sᵢ².
         let meat = y.iter().map(|&yi| gp(yi - theta_hat).powi(2)).sum::<f64>();
         let score_cov = observed * observed / meat;
-        let lr = (2.0 * (y.iter().map(|&yi| g(yi - theta_hat)).sum::<f64>()
-            - y.iter().map(|&yi| g(yi - theta0)).sum::<f64>()))
+        let lr = (2.0
+            * (y.iter().map(|&yi| g(yi - theta_hat)).sum::<f64>()
+                - y.iter().map(|&yi| g(yi - theta0)).sum::<f64>()))
         .max(0.0);
-        assert!(expected > observed, "fixture must have î > ĵ: î={expected} ĵ={observed}");
+        assert!(
+            expected > observed,
+            "fixture must have î > ĵ: î={expected} ĵ={observed}"
+        );
 
         let input = ScalarSkovgaardInput {
             theta_hat,
@@ -622,7 +653,11 @@ mod tests {
 
         // u uses the EXPECTED information: u = (θ̂−θ₀)·î/√ĵ.
         let u_expected = (theta_hat - theta0) * expected / observed.sqrt();
-        assert!((res.u - u_expected).abs() < 1e-12, "u = {} expected {u_expected}", res.u);
+        assert!(
+            (res.u - u_expected).abs() < 1e-12,
+            "u = {} expected {u_expected}",
+            res.u
+        );
 
         // The load-bearing guard: forcing î := ĵ (canonical) changes u. Under the
         // pre-fix u = (θ̂−θ₀)·ĵ/√Î this substitution would leave u unchanged.

@@ -3288,7 +3288,10 @@ mod tests {
         let log_det = arrow_log_det_from_cache(&cache)
             .expect("k==0 Direct cache must yield Some(per-row sum), not None (#1132)");
         // Single latent block H_tt = [[3.0]]; no Schur term for k == 0.
-        assert!((log_det - 3.0_f64.ln()).abs() < 1e-12, "log_det = {log_det}");
+        assert!(
+            (log_det - 3.0_f64.ln()).abs() < 1e-12,
+            "log_det = {log_det}"
+        );
         // The cache's own computation must agree bit-for-bit.
         let cached = cache
             .compute_undamped_arrow_log_det()
