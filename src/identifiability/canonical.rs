@@ -1806,6 +1806,105 @@ mod tests {
         }
     }
 
+    /// #933 assembly-safety isolation: the η round-trip above proves the reduced
+    /// callback emits the right Jacobian, but the panic the gauge cutover was
+    /// meant to retire is a *shape* panic during per-row Hessian assembly —
+    /// `DesignMatrix::syr_row_into shape mismatch` / `row_outer_into shape
+    /// mismatch` — which fires when the family's captured reduced `design` and
+    /// its effective Jacobian disagree on column count (the family was fed a
+    /// column-reduced spec but still asserts the raw width). This test pins the
+    /// precondition that makes that panic impossible by construction: after the
+    /// canonical reduction, the reduced callback block's `design.ncols()` equals
+    /// the wrapped callback's emitted reduced width, and an actual `syr_row_into`
+    /// / `row_outer_into` against an assembly target sized from the reduced
+    /// design SUCCEEDS (returns `Ok`, no shape-mismatch error) for every row.
+    #[test]
+    fn callback_owned_reduced_block_assembles_row_hessian_without_shape_panic() {
+        use crate::families::custom_family::FamilyLinearizationState;
+
+        let n = 48;
+        let x = linspace(n);
+        let mut anchor = Array2::<f64>::zeros((n, 2));
+        let mut callback_owned = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            anchor[[i, 0]] = 1.0;
+            anchor[[i, 1]] = x[i];
+            // Column 0 aliases anchor's x; column 1 (x²) is genuinely new.
+            callback_owned[[i, 0]] = x[i];
+            callback_owned[[i, 1]] = x[i] * x[i];
+        }
+
+        let anchor_spec = spec_from_dense_with_priority("marginal_surface", anchor, 150);
+        let mut callback_spec =
+            spec_from_dense_with_priority("logslope_surface", callback_owned.clone(), 120);
+        let raw_callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(AdditiveBlockJacobian {
+            design: callback_owned.clone(),
+            own_output: 0,
+            n_family_outputs: 1,
+        });
+        callback_spec.jacobian_callback = Some(Arc::clone(&raw_callback));
+
+        let canon = canonicalize_for_identifiability(&[anchor_spec, callback_spec])
+            .expect("callback-only overlap must reduce safely (#933)");
+
+        let reduced_block = &canon.reduced_specs[1];
+        let reduced_design = &reduced_block.design;
+        let reduced_cb = reduced_block
+            .jacobian_callback
+            .as_ref()
+            .expect("reduced callback-only block must still carry a callback");
+
+        // The width the family's row-Hessian assembly asserts on is exactly the
+        // reduced `design`'s column count. The wrapped callback must emit that
+        // SAME width — the equality that retires the shape panic.
+        let zeros_red = vec![0.0_f64; reduced_design.ncols()];
+        let state_red = FamilyLinearizationState {
+            beta: &zeros_red,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: 1.0,
+        };
+        let j_reduced = reduced_cb
+            .effective_jacobian_at(&state_red)
+            .expect("reduced callback Jacobian");
+        assert_eq!(
+            reduced_design.ncols(),
+            j_reduced.ncols(),
+            "reduced design width {} must match the wrapped callback's emitted width {} \
+             — the precondition that makes syr_row_into / row_outer_into shape-match",
+            reduced_design.ncols(),
+            j_reduced.ncols(),
+        );
+
+        // Drive the real assembly primitives. A Hessian-assembly target is sized
+        // from the family's reduced design (`p × p` for the symmetric per-block
+        // block, `p × p` for the self cross-block). Every row's update must
+        // return Ok — a raw/reduced width desync would surface here as the named
+        // `syr_row_into shape mismatch` / `row_outer_into shape mismatch` Err.
+        let p = reduced_design.ncols();
+        let mut syr_target = Array2::<f64>::zeros((p, p));
+        let mut outer_target = Array2::<f64>::zeros((p, p));
+        for row in 0..n {
+            reduced_design
+                .syr_row_into(row, 1.0, &mut syr_target)
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: reduced design must syr_row_into without shape panic: {e}")
+                });
+            reduced_design
+                .row_outer_into(row, reduced_design, 1.0, &mut outer_target)
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: reduced design must row_outer_into without shape panic: {e}")
+                });
+        }
+        // syr accumulates Σ_row xxᵀ; the (0,0) entry is Σ_row x_row² > 0 for a
+        // non-degenerate surviving column, confirming the assembly ran (not a
+        // silent no-op on a zero-width target).
+        assert!(
+            syr_target[[0, 0]] > 0.0,
+            "syr assembly must accumulate a positive diagonal on the surviving column",
+        );
+    }
+
     /// Two single-channel blocks with an exact shared column (anchor block
     /// `a` has column [1, x]; block `b` has [x, x²]). The `x` direction is
     /// shared. Orthogonalisation is unconditional, so block `b` (lower priority)

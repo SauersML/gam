@@ -3140,91 +3140,31 @@ impl<'a> RemlState<'a> {
     /// barrier's view ρ̃ — hence its cost, gradient and curvature — is identical
     /// at the rescaled optimum. With all weights 1 the anchor is exactly 0, so
     /// unweighted fits stay byte-identical.
-    pub(super) fn compute_soft_priorcost(&self, rho: &Array1<f64>) -> f64 {
-        let len = rho.len();
-        if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
-            return 0.0;
-        }
-
-        let anchor = self.rho_weight_anchor();
-        let inv_bound = 1.0 / RHO_BOUND;
-        let sharp = RHO_SOFT_PRIOR_SHARPNESS;
-        let mut cost = 0.0;
-        for &ri in rho.iter() {
-            let scaled = sharp * (ri - anchor) * inv_bound;
-            cost += scaled.cosh().ln();
-        }
-
-        cost * RHO_SOFT_PRIOR_WEIGHT
-    }
-
-    /// Compute soft prior gradient without workspace mutation.
-    pub(super) fn compute_soft_priorgrad(&self, rho: &Array1<f64>) -> Array1<f64> {
-        let len = rho.len();
-        let mut grad = Array1::<f64>::zeros(len);
-        if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
-            return grad;
-        }
-        // Anchored at `ρ̃ = ρ − log g(w)` for weight-scale invariance (issue
-        // #877); the anchor is ρ-independent so `d/dρ = d/dρ̃` and the gradient
-        // form is unchanged — only the argument shifts.
-        let anchor = self.rho_weight_anchor();
-        let inv_bound = 1.0 / RHO_BOUND;
-        let sharp = RHO_SOFT_PRIOR_SHARPNESS;
-        for (g, &ri) in grad.iter_mut().zip(rho.iter()) {
-            let scaled = sharp * (ri - anchor) * inv_bound;
-            *g = sharp * inv_bound * scaled.tanh() * RHO_SOFT_PRIOR_WEIGHT;
-        }
-        grad
-    }
-
-    /// Add the exact Hessian of the soft rho prior in place.
+    /// Build the soft numerical-guard ρ prior as a single atom (#931).
     ///
-    /// Prior definition per coordinate:
-    ///   C_i(rho_i) = w * log(cosh(a * rho_i)),
-    ///   a = rho_soft_prior_sharpness / rho_bound,
-    ///   w = rho_soft_prior_weight.
+    /// The `log cosh` barrier's value, gradient, and diagonal Hessian were
+    /// previously three separate `compute_soft_prior{cost,grad,hess}` functions
+    /// that each independently re-derived the anchor, the `a = sharpness/bound`
+    /// scale, and the `tanh` argument — the canonical objective↔gradient desync
+    /// surface. [`SoftRhoGuardPriorAtom::evaluate_anchored`] evaluates the
+    /// antiderivative chain (`log cosh → tanh → 1 − tanh²`) ONCE per coordinate,
+    /// so cost, gradient, and curvature are projections of one computation and
+    /// cannot drift.
     ///
-    /// Then:
-    ///   dC_i/drho_i   = w * a * tanh(a * rho_i),
-    ///   d²C_i/drho_i² = w * a² * sech²(a * rho_i)
-    ///                = w * a² * (1 - tanh²(a * rho_i)).
-    ///
-    /// The prior is separable across coordinates, so off-diagonals are zero.
-    ///
-    /// Evaluated at the weight-anchored coordinate `ρ̃ = ρ − log g(w)` for
-    /// weight-scale invariance (issue #877); the anchor is ρ-independent so the
-    /// curvature form is unchanged — only the argument shifts.
-    pub(super) fn add_soft_priorhessian_in_place(&self, rho: &Array1<f64>, hess: &mut Array2<f64>) {
-        let len = rho.len();
-        if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
-            return;
-        }
-        let anchor = self.rho_weight_anchor();
-        let a = RHO_SOFT_PRIOR_SHARPNESS / RHO_BOUND;
-        let prefactor = RHO_SOFT_PRIOR_WEIGHT * a * a;
-        for i in 0..len {
-            let t = (a * (rho[i] - anchor)).tanh();
-            hess[[i, i]] += prefactor * (1.0 - t * t);
-        }
-    }
-
-    /// Compute the soft prior Hessian as a standalone matrix.
-    ///
-    /// This is the diagonal matrix of second derivatives of the soft prior penalty.
-    /// Returns `None` when the prior contributes zero curvature (empty ρ or zero weight).
-    pub(super) fn compute_soft_priorhess(&self, rho: &Array1<f64>) -> Option<Array2<f64>> {
-        let len = rho.len();
-        if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
-            return None;
-        }
-        let mut hess = Array2::<f64>::zeros((len, len));
-        self.add_soft_priorhessian_in_place(rho, &mut hess);
-        if hess.iter().any(|&v| v != 0.0) {
-            Some(hess)
-        } else {
-            None
-        }
+    /// Evaluated at the weight-anchored coordinate `ρ̃ = ρ − rho_weight_anchor`
+    /// (issue #877): the anchor is ρ-independent, so `d/dρ = d/dρ̃` and only the
+    /// argument shifts.
+    pub(crate) fn soft_rho_guard_prior_atom(
+        &self,
+        rho: &Array1<f64>,
+    ) -> super::atoms::SoftRhoGuardPriorAtom {
+        super::atoms::SoftRhoGuardPriorAtom::evaluate_anchored(
+            rho,
+            RHO_SOFT_PRIOR_WEIGHT,
+            RHO_SOFT_PRIOR_SHARPNESS,
+            RHO_BOUND,
+            self.rho_weight_anchor(),
+        )
     }
 
     // Gamma(a, b) precision hyperprior identity.

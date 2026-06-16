@@ -347,7 +347,7 @@ pub fn compute_corrected_covariance_with_constraints(
     let mut h_inv = hop.solve_multi(&eye);
     h_inv += &correction;
 
-    enforce_symmetry_inplace(&mut h_inv);
+    crate::matrix::symmetrize_in_place(&mut h_inv);
 
     Ok(CorrectedCovariance {
         matrix: h_inv,
@@ -511,18 +511,6 @@ pub fn compute_corrected_covariance_diagonal_with_constraints(
         active_constraints: active,
         rank_deficient_directions,
     })
-}
-
-/// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
-pub(crate) fn enforce_symmetry_inplace(m: &mut Array2<f64>) {
-    let n = m.nrows();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let avg = 0.5 * (m[[i, j]] + m[[j, i]]);
-            m[[i, j]] = avg;
-            m[[j, i]] = avg;
-        }
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
