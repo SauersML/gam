@@ -3169,6 +3169,15 @@ fn sae_hybrid_split_dict<'py>(
             Some(theta) => a.set_item("fitted_turning", theta)?,
             None => a.set_item("fitted_turning", py.None())?,
         }
+        // Per-atom held-out leave-one-atom-out explained-variance contribution
+        // `ΔEV_k = EV(full) − EV(full∖{k})` — the EV axis of the #1026 (Θ, ΔEV)
+        // frontier. Computed during fit (target supplied) but previously not
+        // surfaced to Python; exposing it makes the discriminating measurement
+        // queryable as structured data rather than a transient log line.
+        match verdict.held_out_delta_ev {
+            Some(dev) => a.set_item("held_out_delta_ev", dev)?,
+            None => a.set_item("held_out_delta_ev", py.None())?,
+        }
         atoms.append(a)?;
     }
     d.set_item("atoms", atoms)?;
