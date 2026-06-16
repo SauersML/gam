@@ -301,17 +301,6 @@ fn whitening_factor_from_outer_hessian(outer_hessian: &Array2<f64>) -> Option<Ar
     Some(l_inv)
 }
 
-fn symmetrize_in_place(a: &mut Array2<f64>) {
-    let n = a.nrows();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
-            a[[i, j]] = v;
-            a[[j, i]] = v;
-        }
-    }
-}
-
 /// Estimate the local outer Hessian by central differencing the profiled-exact
 /// `OuterObjective::eval` gradient.
 ///
@@ -347,7 +336,7 @@ pub fn rho_hessian_from_profiled_exact_gradient(
             hessian[[i, j]] = (gp[i] - gm[i]) / (2.0 * step);
         }
     }
-    symmetrize_in_place(&mut hessian);
+    crate::matrix::symmetrize_in_place(&mut hessian);
     Ok(hessian)
 }
 

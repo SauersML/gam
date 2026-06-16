@@ -762,6 +762,144 @@ impl CriterionAtom for ConfiguredRhoPriorAtom {
     }
 }
 
+/// Atom 6b (ledger item "TK/Jeffreys/prior atoms"): the soft numerical-guard
+/// ρ prior — a weak, separable `log cosh` barrier that keeps the outer search
+/// off the `ρ → ±RHO_BOUND` walls.
+///
+/// Per coordinate, evaluated at the weight-anchored coordinate
+/// `ρ̃ = ρ − rho_weight_anchor` (issue #877; the anchor is ρ-independent so
+/// `d/dρ = d/dρ̃`):
+///
+/// ```text
+///   C_i(ρ_i) = w · log cosh( a (ρ_i − anchor) ),   a = sharpness / bound
+///   dC_i/dρ_i   = w · a · tanh( a (ρ_i − anchor) )
+///   d²C_i/dρ_i² = w · a² · (1 − tanh²( a (ρ_i − anchor) ))
+/// ```
+///
+/// The value, gradient, and Hessian were previously three separate
+/// `compute_soft_prior{cost,grad,hess}` functions, each re-deriving `anchor`,
+/// `a`, and the `tanh` argument independently. That is exactly the
+/// objective↔gradient desync surface this module exists to remove: the three
+/// emissions are the antiderivative chain `∫ tanh = log cosh`,
+/// `d tanh = 1 − tanh²`, so a single edit to the sharpness/anchor/bound in one
+/// formula and not the others silently biases λ-selection. This atom evaluates
+/// the chain ONCE — one `tanh` per coordinate feeds value (`log cosh`), gradient
+/// (`tanh`), and curvature (`1 − tanh²`) together — so they cannot disagree.
+///
+/// It is θ-only and separable: `beta_channel` is `None` (no inner-mode
+/// dependence) and the gradient/Hessian are diagonal in ρ. `frozen_d1` reads
+/// the per-coordinate gradient the same emission produced, so the profiled
+/// total derivative through [`CriterionSum`] is consistent by construction.
+pub struct SoftRhoGuardPriorAtom {
+    /// Scalar cost `Σ_i w · log cosh(a (ρ_i − anchor))`.
+    pub value: f64,
+    /// Per-coordinate gradient `w · a · tanh(a (ρ_i − anchor))`.
+    pub gradient: Array1<f64>,
+    /// Diagonal of the per-coordinate curvature
+    /// `w · a² · (1 − tanh²(a (ρ_i − anchor)))`, `None` when the prior
+    /// contributes zero curvature (empty ρ or zero weight).
+    pub hessian_diag: Option<Array1<f64>>,
+}
+
+impl SoftRhoGuardPriorAtom {
+    /// Evaluate the soft guard prior from one pass over the weight-anchored ρ.
+    ///
+    /// `weight`, `sharpness`, and `bound` are the `RHO_SOFT_PRIOR_WEIGHT`,
+    /// `RHO_SOFT_PRIOR_SHARPNESS`, and `RHO_BOUND` policy constants (passed in
+    /// so this module needs no cross-crate const import); `anchor` is the
+    /// `rho_weight_anchor` shift. A single `tanh` per coordinate feeds all three
+    /// emissions, so value/gradient/Hessian are projections of one computation.
+    pub fn evaluate(
+        rho: &Array1<f64>,
+        weight: f64,
+        sharpness: f64,
+        bound: f64,
+    ) -> Self {
+        Self::evaluate_anchored(rho, weight, sharpness, bound, 0.0)
+    }
+
+    /// As [`evaluate`](Self::evaluate) but with an explicit weight anchor
+    /// (issue #877): the prior is evaluated at `ρ_i − anchor`.
+    pub fn evaluate_anchored(
+        rho: &Array1<f64>,
+        weight: f64,
+        sharpness: f64,
+        bound: f64,
+        anchor: f64,
+    ) -> Self {
+        let len = rho.len();
+        let mut gradient = Array1::<f64>::zeros(len);
+        if len == 0 || weight == 0.0 {
+            return Self {
+                value: 0.0,
+                gradient,
+                hessian_diag: None,
+            };
+        }
+        let a = sharpness / bound;
+        let grad_prefactor = weight * a;
+        let hess_prefactor = weight * a * a;
+        let mut value = 0.0;
+        let mut hess = Array1::<f64>::zeros(len);
+        for (i, &ri) in rho.iter().enumerate() {
+            let scaled = a * (ri - anchor);
+            let t = scaled.tanh();
+            // One evaluation of the chain: log cosh → tanh → 1 − tanh².
+            value += weight * scaled.cosh().ln();
+            gradient[i] = grad_prefactor * t;
+            hess[i] = hess_prefactor * (1.0 - t * t);
+        }
+        let hessian_diag = hess.iter().any(|&v| v != 0.0).then_some(hess);
+        Self {
+            value,
+            gradient,
+            hessian_diag,
+        }
+    }
+
+    pub fn cost(&self) -> f64 {
+        self.value
+    }
+
+    pub fn gradient(&self) -> &Array1<f64> {
+        &self.gradient
+    }
+
+    /// The diagonal curvature materialized as a dense matrix, matching the
+    /// `Option<Array2>` shape the prior assembly consumes. `None` when the prior
+    /// contributes no curvature.
+    pub fn hessian(&self) -> Option<Array2<f64>> {
+        let diag = self.hessian_diag.as_ref()?;
+        let len = diag.len();
+        let mut hess = Array2::<f64>::zeros((len, len));
+        for (i, &d) in diag.iter().enumerate() {
+            hess[[i, i]] = d;
+        }
+        Some(hess)
+    }
+}
+
+impl CriterionAtom for SoftRhoGuardPriorAtom {
+    fn name(&self) -> &'static str {
+        "soft_rho_guard_prior"
+    }
+    fn value(&self) -> f64 {
+        self.value
+    }
+    fn frozen_d1(&self, dir: &ThetaDirection) -> f64 {
+        match dir.index {
+            Some(idx) if idx < self.gradient.len() => self.gradient[idx],
+            _ => 0.0,
+        }
+    }
+    fn beta_channel(&self) -> Option<BetaChannel> {
+        None
+    }
+    fn stratum(&self) -> Option<StratumFingerprint> {
+        None
+    }
+}
+
 /// Atom 7 (TK / sampled-correction application layer): a θ-only scalar
 /// correction emitted as one value + derivative bundle.
 ///

@@ -4545,6 +4545,81 @@ pub(crate) fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction()
     }
 }
 
+/// gam#979 (per-block exact-Newton arm; the bernoulli marginal-slope binary
+/// path). The per-block left-hand side is `lhs = H_data + S` with `S ⪰ 0` an
+/// over-smoothed block penalty. The plain
+/// [`exact_newton_stabilizing_shift`] Gershgorins the *penalized* matrix and,
+/// because `S`'s large off-diagonals are balanced by equally large diagonals,
+/// reads a spurious huge-negative `λ_min` → adds a giant ridge → collapses
+/// every per-block Newton step (the survival-hang fingerprint). The
+/// PSD-penalized variant
+/// [`stabilize_exact_newton_penalized_lhs_in_place`] must bound the shift by
+/// the DATA Hessian's curvature instead, leaving the step well-scaled.
+#[test]
+pub(crate) fn per_block_penalized_shift_stays_data_scaled_under_oversmoothed_penalty() {
+    // Data Hessian: well-conditioned, modest curvature (the bernoulli IRLS
+    // block Hessian X'WX is PSD; perturb the diagonal so the 0-shift Cholesky
+    // path still needs a tiny lift, forcing the shift branch to fire).
+    let h_data = array![
+        [1.0_f64, 0.05, 0.0],
+        [0.05, 1.0, 0.05],
+        [0.0, 0.05, 1.0],
+    ];
+
+    // Heavily over-smoothed PSD penalty: a large smoothness penalty
+    // `λ · (D'D)` with `λ ≈ 1e7`. Its first/second-difference structure has
+    // large off-diagonals that are exactly balanced by the diagonal — the
+    // assembled matrix is PSD (λ_min = 0) but per-row `diag − radius` is hugely
+    // negative. This is the exact shape that fooled plain Gershgorin.
+    let lam = 1.0e7_f64;
+    // D'D for a first-difference operator on 3 nodes: tridiagonal [1,-1;-1,2,-1;-1,1].
+    let s = &array![
+        [1.0_f64, -1.0, 0.0],
+        [-1.0, 2.0, -1.0],
+        [0.0, -1.0, 1.0],
+    ] * lam;
+
+    let lhs = &h_data + &s;
+
+    let ridge_floor = 1.0e-12_f64;
+
+    // Plain (buggy) shift: Gershgorin on the penalized matrix.
+    let plain_shift =
+        exact_newton_stabilizing_shift(&lhs, ridge_floor).expect("penalized lhs needs a shift");
+
+    // PSD-penalized shift: Gershgorin bounded by the data Hessian.
+    let psd_shift = exact_newton_stabilizing_shift_psd_penalized(&lhs, &h_data, ridge_floor)
+        .unwrap_or(0.0);
+
+    // The over-smoothed penalty drives the PLAIN shift to ~λ scale (~1e7);
+    // the PSD-penalized shift must stay O(data scale) (~O(1)).
+    assert!(
+        plain_shift > 1.0e6,
+        "plain Gershgorin on the penalized matrix should read the spurious ~λ ridge; got {plain_shift:.3e}",
+    );
+    assert!(
+        psd_shift < 10.0,
+        "PSD-penalized shift must stay O(data scale), NOT the ~{lam:.0e} penalty scale; got {psd_shift:.3e}",
+    );
+    // Concretely: the data-bounded shift is at least 5 orders of magnitude
+    // smaller than the spurious one.
+    assert!(
+        psd_shift * 1.0e5 < plain_shift,
+        "PSD-penalized shift ({psd_shift:.3e}) must be ≥1e5× smaller than the spurious plain shift ({plain_shift:.3e})",
+    );
+
+    // And the resulting `lhs + psd_shift·I` is positive definite (the PD
+    // certificate the downstream block solve requires).
+    let mut stabilized = lhs.clone();
+    for d in 0..stabilized.nrows() {
+        stabilized[[d, d]] += psd_shift;
+    }
+    assert!(
+        stabilized.cholesky(Side::Lower).is_ok(),
+        "stabilized penalized lhs must be PD after the PSD-penalized shift",
+    );
+}
+
 #[test]
 pub(crate) fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
     let family = TwoBlockJointConstrainedFamily { coupling: 2.0 };
