@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 
-use gam::terms::sae_candidate_index::{
+use gam::terms::sae::candidate_index::{
     IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex,
 };
 use gam::terms::sae_encode_atlas::{
