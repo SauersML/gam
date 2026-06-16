@@ -230,6 +230,119 @@ pub fn scalar_skovgaard_r_star(input: &ScalarSkovgaardInput) -> Option<ScalarSko
     })
 }
 
+/// Assemble [`ScalarSkovgaardInput`] for a scalar functional `ψ = cᵀβ` from the
+/// matrix-level ingredients a fitted penalized GLM exposes, then compute `r*`.
+///
+/// * `contrast` (`c`) — the functional gradient `∂ψ/∂β`: a design row for a
+///   point-on-curve `m(x₀)`, the difference of two rows for a contrast, or any
+///   linear functional gradient.
+/// * `beta` — fitted coefficients `β̂`.
+/// * `penalized_hessian` (`Ĥ = X'WX + S_λ`) — the **observed** information in
+///   coefficient space (the engine's penalized Hessian / true second
+///   derivative).
+/// * `fisher_information` (`Iₑ = X'WX`) — the **expected** (Fisher) information
+///   in coefficient space (the PIRLS Fisher weights; pass `None` to reuse the
+///   penalized Hessian when the family is canonical and the distinction
+///   vanishes).
+/// * `row_scores` (`sᵢ = ∂ℓᵢ/∂β`, `n × p`) — per-row score contributions for the
+///   score (outer-product) covariance `Σᵢ sᵢsᵢᵀ`.
+/// * `lr_statistic` (`W = 2[ℓ(β̂) − ℓ(β̂₀)]`) — the profile likelihood-ratio
+///   statistic from a constrained refit at `cᵀβ = θ₀` (caller-supplied; the
+///   constrained-fit machinery lives in the KKT path).
+/// * `theta_null` (`θ₀`) — the tested value (commonly `0`).
+///
+/// The scalar reductions are the standard profile/marginal identities:
+/// `observed_info = (cᵀ Ĥ⁻¹ c)⁻¹`, `expected_info = (cᵀ Iₑ⁻¹ c)⁻¹`, and
+/// `score_cov = (cᵀ Ĥ⁻¹ (Σ sᵢsᵢᵀ) Ĥ⁻¹ c)⁻¹` — the inverse of the sandwich
+/// (robust) variance of `ψ̂`. Returns `None` on any degenerate reduction.
+#[allow(clippy::too_many_arguments)]
+pub fn scalar_skovgaard_from_matrices(
+    contrast: ndarray::ArrayView1<'_, f64>,
+    beta: ndarray::ArrayView1<'_, f64>,
+    penalized_hessian: ndarray::ArrayView2<'_, f64>,
+    fisher_information: Option<ndarray::ArrayView2<'_, f64>>,
+    row_scores: ndarray::ArrayView2<'_, f64>,
+    lr_statistic: f64,
+    theta_null: f64,
+) -> Option<ScalarSkovgaardResult> {
+    use crate::faer_ndarray::FaerCholesky;
+    use faer::Side;
+
+    let p = beta.len();
+    if p == 0
+        || contrast.len() != p
+        || penalized_hessian.nrows() != p
+        || penalized_hessian.ncols() != p
+        || row_scores.ncols() != p
+    {
+        return None;
+    }
+    if contrast.iter().any(|v| !v.is_finite()) || beta.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+
+    let theta_hat = contrast.dot(&beta);
+
+    // Ĥ⁻¹ c via the penalized-Hessian Cholesky.
+    let h_obs = penalized_hessian.to_owned();
+    let chol_obs = h_obs.cholesky(Side::Lower).ok()?;
+    let c_owned = contrast.to_owned();
+    let hinv_c = chol_obs.solvevec(&c_owned);
+    if hinv_c.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    // Profile variance of ψ̂ under the penalized fit: cᵀ Ĥ⁻¹ c. Observed info is
+    // its inverse.
+    let var_obs = contrast.dot(&hinv_c);
+    if !(var_obs.is_finite() && var_obs > 0.0) {
+        return None;
+    }
+    let observed_info = 1.0 / var_obs;
+
+    // Expected info: same reduction with the Fisher information; default to the
+    // penalized Hessian when the family/link is canonical (no distinction).
+    let expected_info = match fisher_information {
+        Some(fisher) => {
+            if fisher.nrows() != p || fisher.ncols() != p {
+                return None;
+            }
+            let f_owned = fisher.to_owned();
+            let chol_f = f_owned.cholesky(Side::Lower).ok()?;
+            let finv_c = chol_f.solvevec(&c_owned);
+            let var_exp = contrast.dot(&finv_c);
+            if !(var_exp.is_finite() && var_exp > 0.0) {
+                return None;
+            }
+            1.0 / var_exp
+        }
+        None => observed_info,
+    };
+
+    // Score (outer-product) covariance in parameter space: the sandwich variance
+    // cᵀ Ĥ⁻¹ (Σ sᵢsᵢᵀ) Ĥ⁻¹ c, inverted. With a = Ĥ⁻¹ c this is Σᵢ (sᵢᵀ a)².
+    let mut sandwich = 0.0;
+    for srow in row_scores.rows() {
+        if srow.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let proj = srow.dot(&hinv_c);
+        sandwich += proj * proj;
+    }
+    if !(sandwich.is_finite() && sandwich > 0.0) {
+        return None;
+    }
+    let score_cov = 1.0 / sandwich;
+
+    scalar_skovgaard_r_star(&ScalarSkovgaardInput {
+        theta_hat,
+        theta_null,
+        lr_statistic,
+        observed_info,
+        expected_info,
+        score_cov,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +464,62 @@ mod tests {
         // Both p-values are valid probabilities, the corrected one finite.
         assert!((0.0..=1.0).contains(&res.p_value_first_order));
         assert!((0.0..=1.0).contains(&res.p_value_corrected));
+    }
+
+    #[test]
+    fn matrix_assembler_reduces_diagonal_case() {
+        use ndarray::{array, Array2};
+        // p = 1 (a scalar coefficient β with contrast c = [1]). Penalized
+        // Hessian = [[50]], Fisher = [[40]], two score rows summing to a known
+        // outer product. β̂ = [0.25], θ₀ = 0.
+        let contrast = array![1.0_f64];
+        let beta = array![0.25_f64];
+        let h = Array2::from_shape_vec((1, 1), vec![50.0]).unwrap();
+        let fisher = Array2::from_shape_vec((1, 1), vec![40.0]).unwrap();
+        // Two rows with scores 3.0 and 4.0 ⇒ Σ sᵢ² = 25; a = Ĥ⁻¹c = 1/50.
+        // sandwich = Σ (sᵢ·a)² = 25/2500 = 0.01 ⇒ score_cov = 100.
+        let row_scores = Array2::from_shape_vec((2, 1), vec![3.0, 4.0]).unwrap();
+        let lr = 4.0;
+        let res = scalar_skovgaard_from_matrices(
+            contrast.view(),
+            beta.view(),
+            h.view(),
+            Some(fisher.view()),
+            row_scores.view(),
+            lr,
+            0.0,
+        )
+        .expect("assembled r*");
+        // observed_info = 1/(cᵀĤ⁻¹c) = 1/(1/50) = 50.
+        // expected_info = 1/(1/40) = 40.
+        // score_cov = 1/0.01 = 100.
+        // θ̂ = 0.25, r = +√4 = 2.
+        assert!((res.r - 2.0).abs() < 1e-12, "r = {}", res.r);
+        // u = (θ̂−θ₀)·observed/√score_cov = 0.25·50/10 = 1.25.
+        assert!((res.u - 1.25).abs() < 1e-12, "u = {}", res.u);
+        let expected_rstar = 2.0 + (1.25 / 2.0).ln() / 2.0;
+        assert!(
+            (res.r_star - expected_rstar).abs() < 1e-12,
+            "r* = {} expected {}",
+            res.r_star,
+            expected_rstar
+        );
+        // u < r here ⇒ r* < r ⇒ larger two-sided p than first-order.
+        assert!(res.p_value_corrected > res.p_value_first_order);
+        // Dimension mismatch is rejected.
+        let bad_c = array![1.0_f64, 0.0];
+        assert!(
+            scalar_skovgaard_from_matrices(
+                bad_c.view(),
+                beta.view(),
+                h.view(),
+                None,
+                row_scores.view(),
+                lr,
+                0.0,
+            )
+            .is_none()
+        );
     }
 
     #[test]
