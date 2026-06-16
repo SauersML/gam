@@ -1,5 +1,19 @@
 use super::*;
 
+/// Active-set layout selector for [`SaeManifoldTerm::assemble_arrow_schur_inner`].
+///
+/// Production assembly always passes [`ForcedRowLayout::Computed`] (the layout is
+/// derived from the assignment mode and `sparse_active_plan`). The
+/// [`ForcedRowLayout::Forced`] variant lets a caller pin a specific layout —
+/// dense (`Forced(None)`) or a chosen compact `SaeRowLayout`
+/// (`Forced(Some(..))`) — so the compact-vs-dense Riemannian-geometry equality
+/// regression can drive both code paths on identical data without depending on
+/// the host/device memory budget that gates the compact path in production.
+pub(crate) enum ForcedRowLayout {
+    Computed,
+    Forced(Option<SaeRowLayout>),
+}
+
 impl SaeManifoldTerm {
     #[must_use = "build error must be handled"]
     pub fn new(atoms: Vec<SaeManifoldAtom>, assignment: SaeAssignment) -> Result<Self, String> {
@@ -2767,6 +2781,31 @@ impl SaeManifoldTerm {
         penalty_scale: f64,
         dense_beta_penalty_probe_max_dim: usize,
     ) -> Result<ArrowSchurSystem, String> {
+        self.assemble_arrow_schur_inner(
+            target,
+            rho,
+            analytic_penalties,
+            penalty_scale,
+            dense_beta_penalty_probe_max_dim,
+            ForcedRowLayout::Computed,
+        )
+    }
+
+    /// Innermost assembly entry. `forced_layout` overrides the budget-derived
+    /// active-set layout so a caller can pin the dense (`Forced(None)`) or a
+    /// specific compact (`Forced(Some(layout))`) path — used by the
+    /// compact-vs-dense Riemannian-geometry equality regression test to drive
+    /// both layouts on identical data. `Computed` is the production path:
+    /// the layout is derived from the assignment mode + `sparse_active_plan`.
+    pub(crate) fn assemble_arrow_schur_inner(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        penalty_scale: f64,
+        dense_beta_penalty_probe_max_dim: usize,
+        forced_layout: ForcedRowLayout,
+    ) -> Result<ArrowSchurSystem, String> {
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
@@ -2936,7 +2975,9 @@ impl SaeManifoldTerm {
             .iter()
             .map(|c| c.latent_dim())
             .collect();
-        let row_layout: Option<SaeRowLayout> = match self.assignment.mode {
+        let row_layout: Option<SaeRowLayout> = match forced_layout {
+            ForcedRowLayout::Forced(layout) => layout,
+            ForcedRowLayout::Computed => match self.assignment.mode {
             AssignmentMode::JumpReLU {
                 threshold,
                 temperature,
@@ -2980,6 +3021,7 @@ impl SaeManifoldTerm {
                     None => None,
                 }
             }
+            },
         };
         // #974 likelihood-whitening seam. The single per-row decision: when the
         // installed `RowMetric` is a genuinely estimated noise model
