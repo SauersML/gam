@@ -2877,7 +2877,20 @@ impl ArrowFactorCache {
         if self.ridge_t != 0.0 || self.ridge_beta != 0.0 {
             return None;
         }
-        let schur = self.schur_factor.as_ref()?;
+        // When the shared β block is empty (`k == 0`) the joint Hessian is
+        // exactly the block diagonal of the per-row latent blocks: there is no
+        // reduced Schur complement to form, so the dense Direct path leaves
+        // `schur_factor = None` legitimately (not the InexactPCG "never formed
+        // the dense K×K factor" case, which has `k > 0`). The log-det is then
+        // the per-row sum with a zero (empty `0×0`) Schur contribution. Without
+        // this the `schur_factor.as_ref()?` below would return `None` for a
+        // β-profiled atom (#1132 euclidean K=4) and starve the REML Laplace
+        // normaliser of the joint Hessian log-det it requires.
+        let schur = match self.schur_factor.as_ref() {
+            Some(schur) => Some(schur),
+            None if self.k == 0 => None,
+            None => return None,
+        };
 
         let mut acc = 0.0_f64;
         for l in self.undamped_factors_iter() {
@@ -2889,12 +2902,14 @@ impl ArrowFactorCache {
                 acc += 2.0 * d.ln();
             }
         }
-        for i in 0..schur.nrows() {
-            let d = schur[[i, i]];
-            if d <= 0.0 || !d.is_finite() {
-                return None;
+        if let Some(schur) = schur {
+            for i in 0..schur.nrows() {
+                let d = schur[[i, i]];
+                if d <= 0.0 || !d.is_finite() {
+                    return None;
+                }
+                acc += 2.0 * d.ln();
             }
-            acc += 2.0 * d.ln();
         }
         let woodbury_correction = self.cross_row_woodbury_log_det();
         if !woodbury_correction.is_finite() {

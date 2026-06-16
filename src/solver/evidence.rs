@@ -1974,15 +1974,27 @@ pub fn arrow_log_det_from_cache(cache: &ArrowFactorCache) -> Option<f64> {
     if let Some(log_det) = cache.joint_hessian_log_det {
         return log_det.is_finite().then_some(log_det);
     }
-    let schur = cache.schur_factor.as_ref()?;
+    // A `k == 0` cache has no shared β block, so the dense Direct path forms no
+    // reduced Schur complement and `schur_factor` is legitimately `None` (the
+    // joint Hessian is block-diagonal in the latent rows). Its log-det is the
+    // per-row sum with no Schur term. Only reject when `k > 0` and the factor
+    // is absent — the InexactPCG case that never built the dense `K×K` factor.
+    // (#1132 euclidean K=4: a β-profiled atom reaches here with `k == 0`.)
+    let schur = match cache.schur_factor.as_ref() {
+        Some(schur) => Some(schur),
+        None if cache.k == 0 => None,
+        None => return None,
+    };
 
     let mut acc = 0.0_f64;
     // Per-row arrow blocks: log|H_uu_i| = 2 Σ log diag(L_i).
     for l in cache.undamped_factors_iter() {
         acc += 2.0 * log_det_from_chol_lower(l);
     }
-    // Schur block: log|A| = 2 Σ log diag(L_schur).
-    acc += 2.0 * log_det_from_chol_lower(schur.view());
+    // Schur block: log|A| = 2 Σ log diag(L_schur). Empty for the `k == 0` case.
+    if let Some(schur) = schur {
+        acc += 2.0 * log_det_from_chol_lower(schur.view());
+    }
     // #1038 cross-row IBP: when the cache carries an exact rank-`R` Woodbury,
     // the per-row + Schur factors above are of the NO-SELF base `H₀'`, so the
     // exact `log det H_full = log det H₀' + log det(I_R + D Uᵀ H₀'⁻¹ U)`. The
@@ -3237,6 +3249,62 @@ mod tests {
         let expected =
             0.5 * (2.0_f64.ln() + 1.875_f64.ln()) - 0.5 * (2.0 * std::f64::consts::PI).ln();
         assert!((v - expected).abs() < 1e-12);
+    }
+
+    /// #1132 bug 2: a β-profiled atom (no shared `β` block, `k == 0`) reaches
+    /// `arrow_log_det_from_cache` in the dense Direct path with
+    /// `schur_factor = None` — there is no reduced Schur complement to form. The
+    /// joint Hessian is then block-diagonal in the latent rows, so its log-det
+    /// is exactly the per-row sum with NO Schur term. Before the fix this
+    /// returned `None` (the `schur_factor.as_ref()?` bail), starving the REML
+    /// Laplace normaliser and erroring "arrow_log_det_from_cache returned None
+    /// at ridge=0 Direct mode". Now it returns `Some(Σ_i log|H_tt^(i)|)`.
+    fn k0_direct_cache_no_schur(latent_diag: f64) -> ArrowFactorCache {
+        let l_huu = Array2::from_shape_vec((1, 1), vec![latent_diag.sqrt()]).unwrap();
+        ArrowFactorCache {
+            htt_factors: ArrowFactorSlab::from_blocks(vec![l_huu]),
+            htt_factors_undamped: crate::solver::arrow_schur::ArrowUndampedFactors::SameAsDamped,
+            schur_factor: None,
+            joint_hessian_log_det: None,
+            solver_mode: crate::solver::arrow_schur::ArrowSolverMode::Direct,
+            ridge_t: 0.0,
+            ridge_beta: 0.0,
+            htbeta: crate::solver::arrow_schur::ArrowHtbetaCache::Disabled { estimated_bytes: 0 },
+            d: 1,
+            row_dims: std::sync::Arc::from(vec![1usize]),
+            row_offsets: std::sync::Arc::from(vec![0usize, 1usize]),
+            k: 0,
+            manifold_mode_fingerprint: 0,
+            row_hessian_fingerprint: 0,
+            pcg_diagnostics: crate::solver::arrow_schur::PcgDiagnostics::default(),
+            gauge_deflated_directions: 0,
+            cross_row_woodbury: None,
+        }
+    }
+
+    #[test]
+    fn arrow_log_det_some_for_k0_direct_cache_without_schur() {
+        let cache = k0_direct_cache_no_schur(3.0);
+        let log_det = arrow_log_det_from_cache(&cache)
+            .expect("k==0 Direct cache must yield Some(per-row sum), not None (#1132)");
+        // Single latent block H_tt = [[3.0]]; no Schur term for k == 0.
+        assert!((log_det - 3.0_f64.ln()).abs() < 1e-12, "log_det = {log_det}");
+        // The cache's own computation must agree bit-for-bit.
+        let cached = cache
+            .compute_undamped_arrow_log_det()
+            .expect("compute_undamped_arrow_log_det must be Some for k==0");
+        assert!((cached - 3.0_f64.ln()).abs() < 1e-12, "cached = {cached}");
+    }
+
+    #[test]
+    fn arrow_log_det_none_for_kpos_cache_without_schur() {
+        // k > 0 but no dense Schur factor is the genuine InexactPCG case and
+        // must still reject (the guard must not over-broaden to all `None`).
+        let mut cache = k0_direct_cache_no_schur(3.0);
+        cache.k = 1;
+        cache.solver_mode = crate::solver::arrow_schur::ArrowSolverMode::InexactPCG;
+        assert!(arrow_log_det_from_cache(&cache).is_none());
+        assert!(cache.compute_undamped_arrow_log_det().is_none());
     }
 
     #[test]
