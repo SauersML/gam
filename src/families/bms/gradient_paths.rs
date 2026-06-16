@@ -1974,7 +1974,7 @@ pub(crate) fn unary_derivatives_log_normal_pdf(x: f64) -> [f64; 5] {
 }
 
 #[cfg(test)]
-mod jet_tower_oracle {
+mod jet_tower_oracle_tests {
     //! #932 deployment step 2 for the BMS rigid Bernoulli `RowKernel<2>`.
     //!
     //! The production rigid standard-normal row kernel

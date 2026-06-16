@@ -1042,7 +1042,7 @@ fn refine_certified_start(
     initial_cert: RowCertificate,
     mut delta: Array1<f64>,
 ) -> Result<Option<CertifiedEncodeProbe>, String> {
-    debug_assert!(initial_cert.certified());
+    assert!(initial_cert.certified());
     let mut final_cert = initial_cert;
     for _ in 0..newton_steps {
         t = &t + &delta;

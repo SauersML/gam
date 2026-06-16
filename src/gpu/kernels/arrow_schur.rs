@@ -328,7 +328,10 @@ impl ResidentArrowFrameHandle {
     pub fn log_det_hessian(&self) -> f64 {
         #[cfg(not(target_os = "linux"))]
         {
-            unreachable!("ResidentArrowFrameHandle cannot be constructed off CUDA")
+            // SAFETY: off-CUDA, `ResidentArrowFrameHandle::new` always returns
+            // `Err(Unavailable)`, so no handle of this type is ever constructed and
+            // this method is statically unreachable on non-Linux targets.
+            panic!("ResidentArrowFrameHandle cannot be constructed off CUDA")
         }
         #[cfg(target_os = "linux")]
         {

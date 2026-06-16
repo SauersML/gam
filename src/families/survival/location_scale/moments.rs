@@ -583,7 +583,7 @@ pub(crate) fn lift_conditional_covariance(
         fixed_tail_transform(p_log_sigma_full, log_sigma_fixed_cols, p_log_sigma_reduced),
         Array2::<f64>::eye(p_linkwiggle),
     ]);
-    debug_assert_eq!(joint_gauge.raw_total(), p_full);
-    debug_assert_eq!(joint_gauge.reduced_total(), p_reduced);
+    assert_eq!(joint_gauge.raw_total(), p_full);
+    assert_eq!(joint_gauge.reduced_total(), p_reduced);
     Ok(joint_gauge.lift_covariance(cov_reduced))
 }

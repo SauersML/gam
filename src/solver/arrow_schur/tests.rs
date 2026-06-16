@@ -2804,6 +2804,12 @@ pub(crate) fn cluster_jacobi_build_deterministic_and_matches_serial() {
         let mut rhs = r.clone();
         let stride = rhs.strides()[0];
         let len = rhs.len();
+        // SAFETY: `rhs` is a contiguous owned `Array1<f64>` of `len` elements that
+        // outlives this borrow; `as_mut_ptr()` is valid and aligned for `len`
+        // reads. We view it as a `len × 1` column-major matrix whose row stride is
+        // the array's element stride; with a single column the column stride is
+        // never dereferenced, so `0` is sound. `rhs` is not aliased while the view
+        // is live (it is only read through `llt.solve`).
         let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_mut_ptr(), len, 1, stride, 0) };
         let s = llt.solve(rhs_mat);
         Array1::from_iter((0..b).map(|i| s[(i, 0)]))
