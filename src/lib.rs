@@ -84,6 +84,11 @@ pub mod report;
 /// without importing *up* into `solver` (#1135). `crate::solver::resource`
 /// remains a back-compat re-export.
 pub mod resource;
+/// Lower-layer outer-iteration row-subsampling/chunking primitives (RowSet,
+/// ARROW_ROW_CHUNK). Hosted at the crate root so `families` can name them
+/// without importing up into `solver`; `crate::solver::outer_subsample` is a
+/// back-compat re-export.
+pub mod outer_subsample;
 pub(crate) mod rho_prior_eval;
 pub mod solver;
 /// Lower-layer outer-objective contract (the `OuterHessianOperator` trait,
