@@ -5501,6 +5501,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
             Ok(matrix) => matrix,
             Err(_) => break,
         };
+        let h_unpenalized_dense = h_dense.clone();
         add_joint_penalty_to_matrix(
             &mut h_dense,
             &ranges_joint,
@@ -5508,6 +5509,20 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
             trace_diagonal_ridge,
             joint_bundle,
         );
+        let joint_polish_diagonal_ridge = stabilized_joint_solver_diagonal_ridge(
+            family,
+            &JointHessianSource::Dense(h_unpenalized_dense),
+            &ranges_joint,
+            s_lambdas,
+            trace_diagonal_ridge,
+            options.ridge_floor,
+            joint_bundle,
+        );
+        if joint_polish_diagonal_ridge != trace_diagonal_ridge {
+            for d in 0..h_dense.nrows() {
+                h_dense[[d, d]] += joint_polish_diagonal_ridge - trace_diagonal_ridge;
+            }
+        }
 
         let mut beta_joint = Array1::<f64>::zeros(total_p_joint);
         for b in 0..specs.len() {
