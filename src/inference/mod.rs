@@ -38,6 +38,7 @@ pub mod riesz;
 pub mod row_measure;
 pub mod row_metric;
 pub mod sample;
+pub mod skovgaard;
 pub mod smooth_test;
 pub mod steering;
 pub mod structure_evidence;
