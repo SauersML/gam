@@ -1783,6 +1783,321 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
     }
 }
 
+/// gam#932/#979: INDEPENDENT finite-difference witness for the survival
+/// marginal-slope FLEX higher-order tower with NON-ZERO deviation coefficients —
+/// the part Arm A (`flex_contracted_tower_matches_independent_rigid_tower_*`)
+/// cannot reach, and the part most likely to harbor a shared-input bug.
+///
+/// The witness re-derives the scalar survival flex row NLL FROM SCRATCH over the
+/// primary vector `p = [q0, q1, qd1, g, β_h..., β_w...]`:
+///   * the deviation index `index(a, g, z) = a + g·warp(z) + linkdev(a + g·z)`
+///     is reconstructed from the RAW basis matrices (`DeviationRuntime::design`),
+///     dotted with the coefficients — no production jet / cell-moment code;
+///   * the per-timepoint intercept `a(q)` is the calibration root
+///     `∫ Φ(−index(a,g,z))·φ(z) dz = Φ(−q)`, solved by an independent secant on
+///     a fine composite-Simpson quadrature of the latent normal, with the density
+///     normalization `D = |∂F/∂a|` from the same quadrature;
+///   * the NLL is assembled from the closed-form survival pieces
+///     `w·[logΦ(−η0) − (1−d)logΦ(−η1) − d·logφ(η1) − d·log χ1 − d·logφ(q1)
+///        + d·log D1 − d·log qd1]`.
+///
+/// To DE-RISK the witness (a witness-side re-derivation error would masquerade as
+/// a production disagreement), the witness scalar NLL is first self-validated
+/// against the production `row_neglog_flex_value` at the SAME non-zero β; only
+/// then is it finite-differenced (Richardson O(h⁴)) and compared to the
+/// production `row_flex_primary_{third,fourth}_contracted_exact`. A planted sign
+/// flip on a deviation-touching cross block must leave the band.
+#[test]
+fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
+    use crate::probability::{normal_cdf, normal_pdf};
+
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+
+    // No frailty ⇒ probit scale = 1 ⇒ the calibration measure is the standard
+    // normal latent and the index is unscaled — the regime the witness derives.
+    let z_row = 0.3_f64;
+    let q0v = -0.25_f64;
+    let q1v = 0.7_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let weight = 0.85_f64;
+    let event = 1.0_f64;
+
+    let family = SurvivalMarginalSlopeFamily {
+        n: 1,
+        event: Arc::new(array![event]),
+        weights: Arc::new(array![weight]),
+        z: Arc::new(array![z_row].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![q1v]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+    let primary = flex_primary_slices(&family);
+    let p = primary.total;
+    let h_range = primary.h.clone().expect("score-warp primary range");
+    let w_range = primary.w.clone().expect("link-dev primary range");
+
+    // Small, distinct non-zero deviation coefficients so every basis column
+    // carries signal into the derivative chain.
+    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
+    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+
+    // ── Independent basis evaluations (raw design rows · β) ──────────────────
+    let warp_eval = |beta_h: &[f64], z: f64| -> f64 {
+        let row = score_runtime
+            .design(&array![z])
+            .expect("score-warp basis row");
+        row.row(0).iter().zip(beta_h).map(|(b, c)| b * c).sum()
+    };
+    let linkdev_eval = |beta_w: &[f64], u: f64| -> f64 {
+        let row = link_runtime.design(&array![u]).expect("link-dev basis row");
+        row.row(0).iter().zip(beta_w).map(|(b, c)| b * c).sum()
+    };
+    // Survival deviation index inside Φ: a + g·warp(z) + linkdev(a + g·z).
+    let index = |a: f64, g: f64, beta_h: &[f64], beta_w: &[f64], z: f64| -> f64 {
+        a + g * warp_eval(beta_h, z) + linkdev_eval(beta_w, a + g * z)
+    };
+    // Calibration F(a) = ∫ Φ(−index(a,g,z)) φ(z) dz − Φ(−q), by composite Simpson
+    // on a wide latent grid (the integrand decays with φ(z)).
+    let calibration = |a: f64, q: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> f64 {
+        let lo = -8.0_f64;
+        let hi = 8.0_f64;
+        let m = 4000usize; // even
+        let h = (hi - lo) / m as f64;
+        let mut acc = 0.0_f64;
+        for k in 0..=m {
+            let z = lo + h * k as f64;
+            let f = normal_cdf(-index(a, g, beta_h, beta_w, z)) * normal_pdf(z);
+            let coef = if k == 0 || k == m {
+                1.0
+            } else if k % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            acc += coef * f;
+        }
+        acc * h / 3.0 - normal_cdf(-q)
+    };
+    // Intercept root + density normalization D = |∂F/∂a| (FD of the integral).
+    let solve_intercept = |q: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> (f64, f64) {
+        let f = |a: f64| calibration(a, q, g, beta_h, beta_w);
+        // Monotone in a; secant from two seeds around the rigid closed form.
+        let c = (1.0 + g * g).sqrt();
+        let mut a0 = q * c - 0.5;
+        let mut a1 = q * c + 0.5;
+        let mut f0 = f(a0);
+        for _ in 0..200 {
+            let f1 = f(a1);
+            if (f1 - f0).abs() <= f64::MIN_POSITIVE {
+                break;
+            }
+            let a2 = a1 - f1 * (a1 - a0) / (f1 - f0);
+            a0 = a1;
+            f0 = f1;
+            a1 = a2;
+            if (a1 - a0).abs() <= 1e-13 {
+                break;
+            }
+        }
+        let a = a1;
+        let eps = 1e-6;
+        let d = (f(a + eps) - f(a - eps)) / (2.0 * eps);
+        (a, d.abs())
+    };
+    // χ1 = ∂η1/∂a at the observed node (FD of the observed index in a).
+    let observed_eta_chi = |a: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> (f64, f64) {
+        let eta = index(a, g, beta_h, beta_w, z_row);
+        let eps = 1e-6;
+        let chi = (index(a + eps, g, beta_h, beta_w, z_row)
+            - index(a - eps, g, beta_h, beta_w, z_row))
+            / (2.0 * eps);
+        (eta, chi)
+    };
+    // Independent scalar survival flex row NLL over the primary vector.
+    let witness_nll = |pv: &[f64]| -> f64 {
+        let q0 = pv[primary.q0];
+        let q1 = pv[primary.q1];
+        let qd1 = pv[primary.qd1];
+        let g = pv[primary.g];
+        let beta_h: Vec<f64> = h_range.clone().map(|i| pv[i]).collect();
+        let beta_w: Vec<f64> = w_range.clone().map(|i| pv[i]).collect();
+        let (a0, _) = solve_intercept(q0, g, &beta_h, &beta_w);
+        let (a1, d1) = solve_intercept(q1, g, &beta_h, &beta_w);
+        let (eta0, _) = observed_eta_chi(a0, g, &beta_h, &beta_w);
+        let (eta1, chi1) = observed_eta_chi(a1, g, &beta_h, &beta_w);
+        let log_surv0 = normal_cdf(-eta0).ln();
+        let log_surv1 = normal_cdf(-eta1).ln();
+        let tau_ln = std::f64::consts::TAU.ln();
+        let log_phi_eta1 = -0.5 * (eta1 * eta1 + tau_ln);
+        let log_phi_q1 = -0.5 * (q1 * q1 + tau_ln);
+        weight
+            * (log_surv0 - (1.0 - event) * log_surv1 - event * log_phi_eta1 - event * chi1.ln()
+                - event * log_phi_q1
+                + event * d1.ln()
+                - event * qd1.ln())
+    };
+
+    // Base primary point with NON-ZERO deviation coefficients.
+    let mut p0 = vec![0.0_f64; p];
+    p0[primary.q0] = q0v;
+    p0[primary.q1] = q1v;
+    p0[primary.qd1] = qd1v;
+    p0[primary.g] = gv;
+    for (k, i) in h_range.clone().enumerate() {
+        p0[i] = beta_h0[k];
+    }
+    for (k, i) in w_range.clone().enumerate() {
+        p0[i] = beta_w0[k];
+    }
+
+    // ── De-risk: witness scalar NLL must match the production scalar value ───
+    let block_states = vec![
+        ParameterBlockState { beta: Array1::zeros(1), eta: array![0.0] },
+        ParameterBlockState { beta: Array1::zeros(0), eta: array![0.0] },
+        ParameterBlockState { beta: Array1::zeros(0), eta: array![gv] },
+        ParameterBlockState { beta: Array1::from(beta_h0.clone()), eta: array![0.0] },
+        ParameterBlockState { beta: Array1::from(beta_w0.clone()), eta: array![0.0] },
+    ];
+    let prod_value = family
+        .row_neglog_flex_value(0, &block_states)
+        .expect("production flex row value");
+    let wit_value = witness_nll(&p0);
+    assert!(
+        (prod_value - wit_value).abs() <= 1e-7 * prod_value.abs().max(1.0),
+        "witness re-derivation disagrees with production scalar NLL: witness {wit_value:+.10e} vs production {prod_value:+.10e} \
+         (this is a witness-side error to fix BEFORE trusting the FD jets, NOT a production bug)"
+    );
+
+    // ── Richardson central differences of the witness scalar NLL ────────────
+    let central = |axes: &[(usize, usize)], h: f64| -> f64 {
+        fn stencil(order: usize) -> &'static [(i64, f64)] {
+            match order {
+                1 => &[(-1, -0.5), (1, 0.5)],
+                2 => &[(-1, 1.0), (0, -2.0), (1, 1.0)],
+                3 => &[(-2, -0.5), (-1, 1.0), (1, -1.0), (2, 0.5)],
+                4 => &[(-2, 1.0), (-1, -4.0), (0, 6.0), (1, -4.0), (2, 1.0)],
+                _ => &[(0, 1.0)],
+            }
+        }
+        fn walk(
+            stencils: &[(usize, &'static [(i64, f64)])],
+            h: f64,
+            coeff_acc: f64,
+            point: &mut Vec<f64>,
+            f: &dyn Fn(&[f64]) -> f64,
+        ) -> f64 {
+            match stencils.split_first() {
+                None => coeff_acc * f(point),
+                Some((&(idx, st), rest)) => {
+                    let mut acc = 0.0;
+                    let saved = point[idx];
+                    for &(off, c) in st {
+                        point[idx] = saved + (off as f64) * h;
+                        acc += walk(rest, h, coeff_acc * c, point, f);
+                    }
+                    point[idx] = saved;
+                    acc
+                }
+            }
+        }
+        let mut total_order = 0usize;
+        let stencils: Vec<(usize, &'static [(i64, f64)])> = axes
+            .iter()
+            .map(|&(idx, ord)| {
+                total_order += ord;
+                (idx, stencil(ord))
+            })
+            .collect();
+        let mut point = p0.clone();
+        let raw = walk(&stencils, h, 1.0, &mut point, &witness_nll);
+        raw / h.powi(total_order as i32)
+    };
+    let central_rich = |axes: &[(usize, usize)], h: f64| -> f64 {
+        let coarse = central(axes, h);
+        let fine = central(axes, h * 0.5);
+        (4.0 * fine - coarse) / 3.0
+    };
+
+    // The deviation axes the witness must witness (q, g, and a β_h / β_w coord).
+    let q0i = primary.q0;
+    let gi = primary.g;
+    let hi0 = h_range.start;
+    let wi0 = w_range.start;
+
+    // Embed a unit direction along a single primary axis.
+    let unit = |idx: usize| -> Array1<f64> {
+        let mut d = Array1::zeros(p);
+        d[idx] = 1.0;
+        d
+    };
+
+    // ── Third order: production D_dir H[u,v] vs witness ∂³ along (u,v,dir) ───
+    // Contract along the logslope axis g; check cross blocks touching the
+    // deviation coordinates (the channels Arm A cannot reach).
+    let third = family
+        .row_flex_primary_third_contracted_exact(0, &block_states, &unit(gi))
+        .expect("production third contracted (nonzero deviation)");
+    let third_checks = [(q0i, hi0), (gi, wi0), (hi0, wi0), (q0i, wi0)];
+    for &(u, v) in &third_checks {
+        let want = central_rich(&[(u, 1), (v, 1), (gi, 1)], 6e-3);
+        let got = third[[u, v]];
+        let scale = want.abs().max(1.0);
+        assert!(
+            (got - want).abs() <= 5e-3 * scale + 1e-6,
+            "third[{u},{v}] (contract g) production {got:+.6e} != independent FD witness {want:+.6e}"
+        );
+    }
+    // Planted sign-flip tripwire on a deviation-touching cross block.
+    {
+        let want = central_rich(&[(q0i, 1), (wi0, 1), (gi, 1)], 6e-3);
+        if want.abs() > 1e-5 {
+            let flipped = -third[[q0i, wi0]];
+            assert!(
+                (flipped - want).abs() > 5e-3 * want.abs().max(1.0) + 1e-6,
+                "independent FD witness failed to reject a planted (q0, β_w) sign flip: flipped {flipped:+.6e} vs witness {want:+.6e}"
+            );
+        }
+    }
+
+    // ── Fourth order: production D_u D_v H[p,q] vs witness ∂⁴ ────────────────
+    let fourth = family
+        .row_flex_primary_fourth_contracted_exact(0, &block_states, &unit(gi), &unit(wi0))
+        .expect("production fourth contracted (nonzero deviation)");
+    let fourth_checks = [(q0i, gi), (q0i, hi0), (gi, hi0)];
+    for &(u, v) in &fourth_checks {
+        let want = central_rich(&[(u, 1), (v, 1), (gi, 1), (wi0, 1)], 9e-3);
+        let got = fourth[[u, v]];
+        let scale = want.abs().max(1.0);
+        assert!(
+            (got - want).abs() <= 2e-2 * scale + 1e-5,
+            "fourth[{u},{v}] (contract g,β_w) production {got:+.6e} != independent FD witness {want:+.6e}"
+        );
+    }
+}
+
 #[test]
 fn link_flex_family_supports_second_order_exact_outer_path() {
     let score_runtime = test_deviation_runtime();
