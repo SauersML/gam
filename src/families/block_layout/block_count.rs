@@ -76,3 +76,53 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_count_is_ok() {
+        // Exact match returns Ok(()) and produces no error.
+        let result: Result<(), String> = validate_block_count("FooFamily", 2, 2);
+        assert!(result.is_ok());
+
+        let zero: Result<(), String> = validate_block_count("EmptyFamily", 0, 0);
+        assert!(zero.is_ok());
+    }
+
+    #[test]
+    fn wrong_count_is_rejected_with_canonical_message() {
+        // Plural form when expected != 1.
+        let err: String =
+            validate_block_count::<String>("FooFamily", 2, 1).unwrap_err();
+        assert_eq!(err, "FooFamily expects 2 blocks, got 1");
+
+        // Too many blocks is rejected just the same.
+        let too_many: String =
+            validate_block_count::<String>("FooFamily", 2, 3).unwrap_err();
+        assert_eq!(too_many, "FooFamily expects 2 blocks, got 3");
+    }
+
+    #[test]
+    fn singular_block_wording_when_expected_is_one() {
+        // The message switches to the singular "block" when expected == 1.
+        let err: String =
+            validate_block_count::<String>("BarFamily", 1, 0).unwrap_err();
+        assert_eq!(err, "BarFamily expects 1 block, got 0");
+    }
+
+    #[test]
+    fn mismatch_carrier_message_matches_helper() {
+        // The carrier's message is the single source of truth for the wording.
+        let carrier = BlockCountMismatch {
+            family: "BazFamily".to_string(),
+            expected: 3,
+            got: 5,
+        };
+        assert_eq!(carrier.message(), "BazFamily expects 3 blocks, got 5");
+        // And the String conversion forwards to it.
+        let converted: String = carrier.into();
+        assert_eq!(converted, "BazFamily expects 3 blocks, got 5");
+    }
+}

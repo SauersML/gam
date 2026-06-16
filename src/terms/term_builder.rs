@@ -4189,6 +4189,74 @@ mod tests {
     }
 
     #[test]
+    fn univariate_ps_small_k_degree_reduces_through_build(/* gam#1130 */) {
+        // mgcv accepts `s(x, bs="ps", k=3)` (and the default cubic-regression
+        // `s(x, k=3)`) by silently reducing the cubic basis to a quadratic.
+        // The univariate ps/bspline build path used to reject this with
+        // "k too small for degree 3"; it must now lower to a degree-2 basis
+        // with zero internal knots (num_basis = k = 3), matching the te(...)
+        // margin behaviour fixed in b75f55a91. Verified across the ps alias
+        // and the default (cr) selector that both route through
+        // parse_ps_internal_knots.
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..32)
+                .map(|i| {
+                    let x = i as f64 / 31.0;
+                    vec![x * x, x]
+                })
+                .collect(),
+        );
+        let col_map = ds.column_map();
+
+        for formula in ["y ~ s(x, bs='ps', k=3)", "y ~ s(x, k=3)"] {
+            let parsed = parse_formula(formula).expect("parse small-k ps/cr smooth");
+            let mut notes = Vec::new();
+            let terms = build_termspec(
+                &parsed.terms,
+                &ds,
+                &col_map,
+                &mut notes,
+                &crate::solver::resource::ResourcePolicy::default_library(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("`{formula}` must degree-reduce, not error; got: {err:?}")
+            });
+            let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+                panic!(
+                    "`{formula}` must lower to a BSpline1D; got {:?}",
+                    terms.smooth_terms[0].basis
+                );
+            };
+            assert_eq!(
+                spec.degree, 2,
+                "`{formula}` must drop the cubic default to a quadratic basis"
+            );
+            let num_internal = match &spec.knotspec {
+                BSplineKnotSpec::Generate {
+                    num_internal_knots, ..
+                } => *num_internal_knots,
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots: Some(n),
+                    ..
+                } => *n,
+                other => panic!("`{formula}` unexpected knotspec: {other:?}"),
+            };
+            assert_eq!(
+                num_internal, 0,
+                "`{formula}` must have zero internal knots (num_basis = k = 3)"
+            );
+            // Resulting basis dimension is num_internal + degree + 1 = 3 = k.
+            assert!(
+                spec.penalty_order >= 1 && spec.penalty_order <= spec.degree,
+                "`{formula}` penalty_order {} must satisfy 1 <= order <= degree={}",
+                spec.penalty_order,
+                spec.degree
+            );
+        }
+    }
+
+    #[test]
     fn formula_shape_constraint_round_trips_and_rejects_bogus() {
         let ds = continuous_dataset(
             &["y", "x"],
