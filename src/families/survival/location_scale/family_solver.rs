@@ -2333,7 +2333,24 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             }
             .into());
         }
-        Ok(None)
+        if !self.row_kernel_directional_supported() {
+            return Ok(None);
+        }
+        let log_rescale = self.hessian_deriv_log_rescale(block_states);
+        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
+        crate::families::row_kernel::row_kernel_second_directional_derivative(
+            &kernel,
+            &crate::families::row_kernel::RowSet::All,
+            d_beta_u_flat.as_slice().ok_or_else(|| {
+                "joint Hessian second directional u must be contiguous".to_string()
+            })?,
+            d_beta_v_flat.as_slice().ok_or_else(|| {
+                "joint Hessian second directional v must be contiguous".to_string()
+            })?,
+        )
+        .map(Some)
     }
 
     fn block_linear_constraints(
@@ -2404,14 +2421,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         self.validate_joint_specs(specs, "SurvivalLocationScaleFamily joint Hessian workspace")?;
-        // #921 remaining boundary: do not replace this wrapper with
-        // `RowKernelHessianWorkspace` wholesale until the RowKernel adapter
-        // stores the fourth index derivatives and the time-varying qdot
-        // third-order map tensor. The wrapper routes supported non-wiggle
-        // dense Hessian / first directional derivative calls through the
-        // generic engine, while unsupported wiggle and time-varying-qdot
-        // cases stay on the existing complete algebra instead of pretending the generic
-        // fourth-order hook is complete.
+        // The wrapper owns the precomputed survival quantities/dynamic geometry
+        // and routes non-wiggle Hessian derivative calls through the RowKernel
+        // engine. Link-wiggle still stays on the existing family algebra because
+        // its row design depends on beta and is outside the fixed-Jacobian
+        // RowKernel contract.
         Ok(Some(Arc::new(
             SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
                 self.clone(),
@@ -2430,9 +2444,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             specs,
             "SurvivalLocationScaleFamily joint Hessian workspace with options",
         )?;
-        // See the non-options workspace constructor above. The same boundary
-        // applies here; the HT row mask is threaded into the supported
-        // RowKernel first-derivative path by `row_set_from_survival_mask`.
+        // See the non-options workspace constructor above. The HT row mask is
+        // threaded into the supported RowKernel derivative paths by
+        // `row_set_from_survival_mask`.
         let mut workspace = SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),

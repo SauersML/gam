@@ -97,6 +97,17 @@ pub fn reml_laml_evaluate(
         .copied()
         .map(|lambda| rho_curvature_lambda(solution, lambda))
         .collect();
+    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+        &lambdas,
+        &solution.penalty_coords,
+        &solution.beta,
+    )?;
+    let curvature_penalty_quad_atom =
+        crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            &curvature_lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )?;
     let hop = &*solution.hessian_op;
     let upper_active_rho = active_upper_rho_mask(rho);
 
@@ -418,20 +429,10 @@ pub fn reml_laml_evaluate(
     // Keep the dependency-ordered BFGS/line-search loops serial, but use rayon
     // here so each accepted outer iterate evaluates its objective derivatives
     // by farming out the per-coordinate Hessian/gradient work.
-    let rho_penalty_a_k_betas: Vec<Array1<f64>> = (0..k)
-        .into_par_iter()
-        .map(|idx| penalty_a_k_beta(&solution.penalty_coords[idx], &solution.beta, lambdas[idx]))
-        .collect();
-    let rho_curvature_a_k_betas: Vec<Array1<f64>> = (0..k)
-        .into_par_iter()
-        .map(|idx| {
-            penalty_a_k_beta(
-                &solution.penalty_coords[idx],
-                &solution.beta,
-                curvature_lambdas[idx],
-            )
-        })
-        .collect();
+    let rho_penalty_a_k_betas: Vec<Array1<f64>> =
+        penalty_quad_atom.block_penalty_scores().to_vec();
+    let rho_curvature_a_k_betas: Vec<Array1<f64>> =
+        curvature_penalty_quad_atom.block_penalty_scores().to_vec();
     let need_family_corrections = effective_deriv.has_corrections();
     let need_rho_mode_responses = need_family_corrections || mode == EvalMode::ValueGradientHessian;
     // Stack the K curvature-penalty RHS whenever a later stage will need
@@ -931,14 +932,14 @@ pub fn reml_laml_evaluate(
                 return (idx, 0.0);
             }
 
-            let coord = &solution.penalty_coords[idx];
-
             // Cost derivative for the shifted penalty:
             // a_i = ½ λₖ (β̂ - μₖ)' Sₖ (β̂ - μₖ).
             //
             // The β-gradient derivative is λₖSₖ(β̂-μₖ); dotting it with β̂
             // would drop the μₖ'λₖSₖμₖ half of the chain rule.
-            let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambdas[idx]);
+            let a_i = penalty_quad_atom.rho_frozen_d1(idx);
+
+            let coord = &solution.penalty_coords[idx];
 
             // Trace term: tr(K · Ḣₖ) where Ḣₖ = Aₖ + C[vₖ].
             //
@@ -1056,26 +1057,57 @@ pub fn reml_laml_evaluate(
     // computation may use `curvature_lambdas = rho_curvature_scale · lambdas`):
     // the residual correction is in the actual S(λ) basis, and the curvature
     // scale only applies to the H-dependent trace terms.
-    let kkt_rho_corrections = if let Some(r) = kkt_residual_vec
+    // KKT-residual correction over the FULL θ = (ρ ‖ ψ) coordinate set.
+    //
+    // The corrected scalar objective is `Ṽ(θ) = V(β̂,θ) − ½ rᵀ H⁻¹ r`. Its
+    // gradient AND Hessian were previously corrected on the ρ block only (the
+    // ψ/ext gradient was patched inline, but the cross-ρψ and ψψ Hessian blocks
+    // were dropped — silently biasing the LAML curvature, hence smoothing
+    // selection and SEs, on any near-singular fit that exits with ‖r‖>0). The
+    // generalized `compute_kkt_residual_theta_corrections` emits all blocks from
+    // ONE factorization with one algebra: ρ coordinates feed `r_i = λ_iS_iβ̂`,
+    // `A_i[v] = λ_iS_i v`; ψ/ext coordinates feed `r_i = coord.g`, `A_i[v] =
+    // B_i v` (the frozen ψ Hessian drift). It vanishes identically at exact KKT.
+    let ext_frozen_drifts: Vec<DriftDerivResult> = (0..ext_dim)
+        .map(|ext_idx| {
+            hyper_coord_total_drift_result(&solution.ext_coords[ext_idx].drift, None, hop.dim())
+        })
+        .collect();
+    let kkt_theta_corrections = if let Some(r) = kkt_residual_vec
         .as_ref()
-        .filter(|_| kkt_residual_correction_active && k > 0)
+        .filter(|_| kkt_residual_correction_active && (k + ext_dim) > 0)
         .map(|r| r.as_ref())
     {
-        Some(compute_kkt_residual_rho_corrections(
-            solution,
+        // Per-coordinate score derivatives r_i in packed θ = (ρ ‖ ψ) order.
+        let mut score_derivs: Vec<Array1<f64>> = Vec::with_capacity(k + ext_dim);
+        score_derivs.extend(rho_penalty_a_k_betas.iter().cloned());
+        score_derivs.extend((0..ext_dim).map(|ext_idx| solution.ext_coords[ext_idx].g.clone()));
+        // Frozen drift matvec A_i[v]: ρ uses λ_iS_i, ψ uses the frozen B_i.
+        let drift_apply = |idx: usize, v: &Array1<f64>| -> Array1<f64> {
+            if idx < k {
+                solution.penalty_coords[idx].scaled_matvec(v, lambdas[idx])
+            } else {
+                ext_frozen_drifts[idx - k].apply(v)
+            }
+        };
+        // Only ρ coordinates carry an upper box bound; ψ/ext never freeze here.
+        let mut active = upper_active_rho.clone();
+        active.extend(std::iter::repeat_n(false, ext_dim));
+        let subspace = solution.penalty_subspace_trace.as_deref();
+        Some(compute_kkt_residual_theta_corrections(
             hop,
-            &lambdas,
-            &rho_penalty_a_k_betas,
+            subspace,
+            &score_derivs,
+            drift_apply,
             r,
             mode == EvalMode::ValueGradientHessian,
-            &upper_active_rho,
+            &active,
         )?)
     } else {
         None
     };
-    if let Some(corrections) = kkt_rho_corrections.as_ref() {
-        let mut sl = grad.slice_mut(ndarray::s![..k]);
-        sl += &corrections.gradient;
+    if let Some(corrections) = kkt_theta_corrections.as_ref() {
+        grad += &corrections.gradient;
     }
 
     // Extended hyperparameter gradient (ψ/τ coordinates).
@@ -1168,61 +1200,9 @@ pub fn reml_laml_evaluate(
         grad[idx] = value;
     }
 
-    // KKT-residual correction for the ψ (ext) gradient — the exact analogue of
-    // the ρ correction applied above (`kkt_rho_corrections`), which was missing
-    // for the extended coordinates.
-    //
-    // When the inner solve exits at β̂ with a nonzero KKT residual
-    // `r = ∇_β L_pen(β̂)`, the cost carries the one-step Newton profile
-    // correction `−½ rᵀ H⁻¹ r` (applied above), so the CORRECTED scalar
-    // objective is `Ṽ(θ) = V(β̂,θ) − ½ rᵀ H⁻¹ r`. Differentiating the
-    // correction w.r.t. a ψ coordinate (holding β̂ fixed, the same convention
-    // the ρ block uses) with `q = H⁻¹ r`:
-    //
-    //   ∂_ψ r = ∂_ψ(∇_β L_pen)|_β = coord.g   (= score_psi + S_ψ β̂)
-    //   ∂_ψ H = Ḣ_ψ|_β            = the FROZEN ψ Hessian drift B_i
-    //   ∂_ψ(−½ rᵀ H⁻¹ r) = −(∂_ψ r)ᵀ q + ½ qᵀ (∂_ψ H) q
-    //                     = −coord.gᵀ q + ½ qᵀ B_i q.
-    //
-    // This is `compute_kkt_residual_rho_corrections`'s `C_i = −a_iᵀq + ½ qᵀA_iq`
-    // with the ρ ingredients `(a_i = A_iβ̂, A_i = λ_iS_i)` replaced by the ψ
-    // ingredients `(coord.g, B_i)`. It vanishes identically at exact KKT
-    // (`r = 0 ⇒ q = 0`); when the logslope block is near-singular and the inner
-    // exit accepts `‖r‖ > 0`, the dropped `−coord.gᵀq` term is amplified by
-    // `‖H⁻¹‖·‖r‖` and is exactly the large component the envelope ψ-gradient
-    // was missing relative to the centered FD of the corrected objective. The
-    // FROZEN drift (no IFT correction) is used — the IFT/β-response of the
-    // logdet trace is handled separately in the trace term; the residual
-    // correction differentiates `−½rᵀH⁻¹r` at fixed β̂ exactly as the ρ block
-    // does.
-    if ext_dim > 0
-        && let Some(r) = kkt_residual_vec
-            .as_ref()
-            .filter(|_| kkt_residual_correction_active)
-            .map(|r| r.as_ref())
-    {
-        let subspace = solution.penalty_subspace_trace.as_deref();
-        let q = solve_kkt_residual_kernel(hop, subspace, r);
-        for ext_idx in 0..ext_dim {
-            let coord = &solution.ext_coords[ext_idx];
-            // FROZEN ψ Hessian drift B_i (no IFT correction); `apply` matvecs the
-            // dense or operator form against `q`.
-            let frozen_drift = hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
-            let b_i_q = frozen_drift.apply(&q);
-            let linear = coord.g.dot(&q);
-            let quadratic = q.dot(&b_i_q);
-            if !linear.is_finite() || !quadratic.is_finite() {
-                return Err(RemlError::NonFiniteValue {
-                    reason: format!(
-                        "KKT ext correction produced non-finite ingredients at ext coord \
-                         {ext_idx}: linear={linear} quadratic={quadratic}"
-                    ),
-                }
-                .into());
-            }
-            grad[k + ext_idx] += -linear + 0.5 * quadratic;
-        }
-    }
+    // (The ψ/ext gradient KKT-residual correction is now part of the unified
+    // `kkt_theta_corrections.gradient` folded into `grad` above — see the
+    // full-θ correction block before the ext-gradient assembly.)
 
     // Apply the ρ-GRADIENT half of the guarded Tierney–Kadane correction built
     // above (its VALUE half was applied to `cost` before the value-only early
@@ -1348,7 +1328,9 @@ pub fn reml_laml_evaluate(
             }
             let assembly_start = std::time::Instant::now();
             let mut hessian = crate::solver::rho_optimizer::HessianResult::Operator(family_op);
-            if let Some(kkt_hessian) = kkt_rho_corrections
+            // Full-θ correction: the matrix spans (ρ ‖ ψ) = the operator's whole
+            // dimension, so this folds the cross-ρψ and ψψ blocks too, not just ρρ.
+            if let Some(kkt_hessian) = kkt_theta_corrections
                 .as_ref()
                 .and_then(|corrections| corrections.hessian.as_ref())
             {
@@ -1442,7 +1424,9 @@ pub fn reml_laml_evaluate(
                 Ok(op) => {
                     let mut hessian =
                         crate::solver::rho_optimizer::HessianResult::Operator(Arc::new(op));
-                    if let Some(kkt_hessian) = kkt_rho_corrections
+                    // Full-θ correction (ρρ + cross-ρψ + ψψ); the matrix is the
+                    // operator's whole dimension.
+                    if let Some(kkt_hessian) = kkt_theta_corrections
                         .as_ref()
                         .and_then(|corrections| corrections.hessian.as_ref())
                     {
@@ -1477,12 +1461,30 @@ pub fn reml_laml_evaluate(
                 Some(&reml_workspace),
             ) {
                 Ok(mut h) => {
-                    if let Some(kkt_hessian) = kkt_rho_corrections
+                    // KKT-residual Hessian correction. The correction adds back
+                    // `r_iᵀKr_j + C_ij`, valid only where the base outer Hessian
+                    // already carries the exact-KKT profile term `−r_iᵀKr_j`.
+                    // The dense path computes that profile term for the cross-ρψ
+                    // and ψψ blocks ONLY when the family supplies the pair
+                    // callbacks (`rho_ext_pair_fn` / `ext_coord_pair_fn`); absent
+                    // them those blocks are left at zero, so applying the full-θ
+                    // correction there would inject an uncancelled profile term.
+                    // Apply the full k_outer × k_outer correction when the cross/
+                    // ψψ blocks exist (or there are no ext coords); otherwise add
+                    // only the ρρ sub-block, exactly as before.
+                    if let Some(kkt_hessian) = kkt_theta_corrections
                         .as_ref()
                         .and_then(|corrections| corrections.hessian.as_ref())
                     {
-                        let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
-                        sl += kkt_hessian;
+                        let dense_has_ext_blocks = ext_dim == 0
+                            || (solution.rho_ext_pair_fn.is_some()
+                                && solution.ext_coord_pair_fn.is_some());
+                        if dense_has_ext_blocks {
+                            h += kkt_hessian;
+                        } else {
+                            let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
+                            sl += &kkt_hessian.slice(ndarray::s![..k, ..k]);
+                        }
                     }
                     // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
                     if let Some((_, _, Some(ref ph))) = prior_cost_gradient {

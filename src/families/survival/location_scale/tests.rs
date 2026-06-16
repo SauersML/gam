@@ -1100,10 +1100,9 @@ fn survival_ls_joint_oracle_states(primaries: &[[f64; SLS_ROW_K]]) -> Vec<Parame
 /// entry/exit/qdot cross blocks — the channels #736's sign flip class
 /// corrupts — are contracted explicitly through dense 9-dim directions.
 ///
-/// `row_fourth_contracted` is a documented gap on this kernel (the family
-/// stores only third-order index derivatives; its REML outer Hessian uses
-/// the third-order directional operator), so the oracle asserts the gap
-/// is an explicit error rather than a silently wrong tensor.
+/// `row_fourth_contracted` is tower-derived from the same row program so the
+/// generic RowKernel second-directional Hessian path can consume survival LS
+/// without a family-specific refusal.
 #[test]
 fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels() {
     // Tower4<9> carries 9⁴ fourth-order entries (≈59 KiB per scalar by
@@ -1174,6 +1173,7 @@ fn survival_ls_joint_jet_tower_oracle_body() {
             family: &family,
             q: &q,
             dynamic: &dynamic,
+            deriv_log_scale: 0.0,
             offsets: family.joint_block_offsets(),
         };
         let program = SurvivalLsJointNllProgram {
@@ -1226,16 +1226,23 @@ fn survival_ls_joint_jet_tower_oracle_body() {
                     (*dir, claim)
                 })
                 .collect();
+            let fourth: Vec<([f64; SLS_ROW_K], [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K])> =
+                dirs.iter()
+                    .enumerate()
+                    .map(|(idx, u)| {
+                        let v = dirs[(idx + 1) % dirs.len()];
+                        let claim = RowKernel::row_fourth_contracted(&kernel, row, u, &v)
+                            .expect("hand kernel fourth");
+                        (*u, v, claim)
+                    })
+                    .collect();
 
             let claims = KernelChannels {
                 value,
                 gradient,
                 hessian,
                 third,
-                // The survival LS kernel stores only third-order index
-                // derivatives; fourth-order contraction is a refusal by
-                // design (asserted below), not a comparable channel.
-                fourth: vec![],
+                fourth,
             };
 
             verify_kernel_channels(&tower, &claims, 1e-9).unwrap_or_else(|e| {
@@ -1244,13 +1251,6 @@ fn survival_ls_joint_jet_tower_oracle_body() {
                          #932 jet-tower truth: {e}"
                 )
             });
-
-            let fourth_err = RowKernel::row_fourth_contracted(&kernel, row, &dirs[0], &dirs[1])
-                .expect_err("fourth-order contraction must refuse, not fabricate");
-            assert!(
-                fourth_err.contains("fourth-order"),
-                "fourth-order refusal must say why: {fourth_err}"
-            );
         }
     }
 }
@@ -1288,6 +1288,7 @@ fn survival_ls_row_kernel_matches_bespoke_assembly() {
         family: &family,
         q: &q,
         dynamic: &dynamic,
+        deriv_log_scale: 0.0,
         offsets: family.joint_block_offsets(),
     };
 

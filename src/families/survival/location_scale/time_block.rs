@@ -143,13 +143,9 @@ pub(crate) fn structural_time_initial_beta_guess(
 #[derive(Clone, Debug)]
 pub(crate) struct TimeIdentifiabilityTransform {
     /// Maps the inner solver's reduced (active) time coefficients back to the
-    /// raw I-spline layout: `β_time_raw = z · β_time_reduced + affine_shift`.
-    pub(crate) z: Array2<f64>,
-    /// Fixed raw-coefficient contribution folded out of the free design when the
-    /// reduced parametric-AFT warp slope is pinned to the canonical unit-log-t
-    /// gauge (issue #892). For the non-pin/identity paths this is the zero
-    /// vector (length `z.nrows()`), so the lift is the plain linear `z · β`.
-    pub(crate) affine_shift: Array1<f64>,
+    /// raw I-spline layout through the canonical Gauge-owned affine section:
+    /// `β_time_raw = T · θ + a`.
+    pub(crate) gauge: Gauge,
 }
 
 #[derive(Clone, Debug)]
@@ -897,15 +893,11 @@ pub(crate) fn rank1_reduced_time_warp_applies(
 
 /// Result of pinning the reduced parametric-AFT time-warp slope to the canonical
 /// unit-log-t gauge (issue #892). `z_c` (p×1) is the kept-free row-constant
-/// direction; `z_t` (p-vector) is the pinned unit-log-t direction folded into
-/// the geometry offsets; the three `reduced_*` matrices (n×1) are the free design
-/// `X · z_c` for entry / exit / derivative-exit.
+/// direction; `z_t` (p-vector) is the pinned unit-log-t direction owned by the
+/// Gauge affine shift and folded into offsets by `Gauge::restrict_design_and_offset`.
 pub(crate) struct PinnedTimeWarp {
     pub(crate) z_c: Array2<f64>,
     pub(crate) z_t: Array1<f64>,
-    pub(crate) reduced_entry: Array2<f64>,
-    pub(crate) reduced_exit: Array2<f64>,
-    pub(crate) reduced_derivative_exit: Array2<f64>,
 }
 
 /// Split the 2-D affine null-space basis `z` (p×2, orthonormal columns) into the
@@ -918,9 +910,7 @@ pub(crate) struct PinnedTimeWarp {
 /// regressing the non-pin case.
 pub(crate) fn pin_reduced_time_warp_slope(
     z: &Array2<f64>,
-    design_entry: &Array2<f64>,
     design_exit: &Array2<f64>,
-    design_derivative_exit: &Array2<f64>,
     log_time_exit: ndarray::ArrayView1<f64>,
 ) -> Option<PinnedTimeWarp> {
     let p = z.nrows();
@@ -969,16 +959,7 @@ pub(crate) fn pin_reduced_time_warp_slope(
     let z_t = &z_t_raw / slope;
     // p×1 free design columns and the kept-free basis matrix.
     let z_c = z_c_vec.insert_axis(ndarray::Axis(1));
-    let reduced_entry = design_entry.dot(&z_c);
-    let reduced_exit = design_exit.dot(&z_c);
-    let reduced_derivative_exit = design_derivative_exit.dot(&z_c);
-    Some(PinnedTimeWarp {
-        z_c,
-        z_t,
-        reduced_entry,
-        reduced_exit,
-        reduced_derivative_exit,
-    })
+    Some(PinnedTimeWarp { z_c, z_t })
 }
 
 /// Build the reduced time block for the canonical σ-scaled log-t AFT gauge
@@ -1010,8 +991,7 @@ pub(crate) fn location_logt_offset_time_block(
         nullspace_dims: Vec::new(),
         initial_beta: Some(Array1::<f64>::zeros(0)),
         transform: TimeIdentifiabilityTransform {
-            z: Array2::<f64>::zeros((p, 0)),
-            affine_shift: Array1::zeros(p),
+            gauge: Gauge::from_block_transforms(&[Array2::<f64>::zeros((p, 0))]),
         },
         offset_entry: Array1::zeros(design_entry.nrows()),
         offset_exit: Array1::zeros(design_exit.nrows()),
@@ -1173,26 +1153,24 @@ pub(crate) fn prepare_identified_time_block(
             && z.nrows() == p
             && let Some(pinned) = pin_reduced_time_warp_slope(
                 &z,
-                &design_entry,
                 &design_exit,
-                &design_derivative_exit,
                 log_time_exit,
             )
         {
-            let PinnedTimeWarp {
-                z_c,
-                z_t,
-                reduced_entry,
-                reduced_exit,
-                reduced_derivative_exit,
-            } = pinned;
-            // Augmented offsets carry the pinned unit-log-t warp out of the free
-            // design. `design_* · z_t` is the fixed value/derivative
-            // contribution of the unit-slope `log t` direction.
-            let offset_entry = &input.offset_entry + &design_entry.dot(&z_t);
-            let offset_exit = &input.offset_exit + &design_exit.dot(&z_t);
-            let derivative_offset_exit =
-                &input.derivative_offset_exit + &design_derivative_exit.dot(&z_t);
+            let PinnedTimeWarp { z_c, z_t } = pinned;
+            let gauge = Gauge::from_block_transform_with_shift(z_c.clone(), z_t);
+            // Augmented offsets carry the Gauge-owned pinned unit-log-t warp out
+            // of the free design. `Gauge::restrict_design_and_offset` applies
+            // `X · a` using the same affine shift that final beta lifting uses.
+            let (reduced_entry, offset_entry) =
+                gauge.restrict_design_and_offset(&design_entry, &input.offset_entry);
+            let (reduced_exit, offset_exit) =
+                gauge.restrict_design_and_offset(&design_exit, &input.offset_exit);
+            let (reduced_derivative_exit, derivative_offset_exit) = gauge
+                .restrict_design_and_offset(
+                    &design_derivative_exit,
+                    &input.derivative_offset_exit,
+                );
             let reduced_derivative_design =
                 DesignMatrix::Dense(DenseDesignMatrix::from(reduced_derivative_exit.clone()));
             // Pointwise monotonicity uses the AUGMENTED derivative offset so the
@@ -1225,8 +1203,7 @@ pub(crate) fn prepare_identified_time_block(
                 nullspace_dims: Vec::new(),
                 initial_beta,
                 transform: TimeIdentifiabilityTransform {
-                    z: z_c,
-                    affine_shift: z_t,
+                    gauge,
                 },
                 offset_entry,
                 offset_exit,
@@ -1315,8 +1292,7 @@ pub(crate) fn prepare_identified_time_block(
             // Non-clean split (r != 2 or degenerate constant/time split): keep
             // both affine columns free with no pinned warp, offsets passthrough.
             transform: TimeIdentifiabilityTransform {
-                z,
-                affine_shift: Array1::zeros(p),
+                gauge: Gauge::from_block_transforms(&[z]),
             },
             offset_entry: input.offset_entry.clone(),
             offset_exit: input.offset_exit.clone(),
@@ -1370,8 +1346,7 @@ pub(crate) fn prepare_identified_time_block(
         // Identity (non-reduce) path: the raw time block passes through
         // unchanged, so the lift is `z = I`, no pinned warp, offsets verbatim.
         transform: TimeIdentifiabilityTransform {
-            z: Array2::eye(p),
-            affine_shift: Array1::zeros(p),
+            gauge: Gauge::identity(&[p]),
         },
         offset_entry: input.offset_entry.clone(),
         offset_exit: input.offset_exit.clone(),

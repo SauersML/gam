@@ -238,6 +238,7 @@ pub(crate) struct SurvivalLsRowKernel<'a> {
     pub(crate) family: &'a SurvivalLocationScaleFamily,
     pub(crate) q: &'a SurvivalJointQuantities,
     pub(crate) dynamic: &'a SurvivalDynamicGeometry,
+    pub(crate) deriv_log_scale: f64,
     /// Joint block offsets `[0, p_time, p_time+p_thr, p_total]` (3 blocks).
     pub(crate) offsets: Vec<usize>,
 }
@@ -416,6 +417,90 @@ impl SurvivalLsRowKernel<'_> {
                 .map(|d| design_dense_row(d, row)),
             _ => None,
         }
+    }
+
+    pub(crate) fn row_primary_values(&self, row: usize) -> [f64; SLS_ROW_K] {
+        let inv_sigma_exit = self.dynamic.inv_sigma_exit[row];
+        let eta_t_exit = -self.dynamic.q_exit[row] / inv_sigma_exit;
+        let eta_ls_deriv = self.q.dqdot_t[row] / inv_sigma_exit;
+        let eta_t_deriv =
+            eta_t_exit * eta_ls_deriv - self.dynamic.qdot_exit[row] / inv_sigma_exit;
+        [
+            self.dynamic.h_entry[row],
+            self.dynamic.h_exit[row],
+            self.dynamic.hdot_exit[row],
+            eta_t_exit,
+            -self.dynamic.q_entry[row] / self.dynamic.inv_sigma_entry[row],
+            eta_t_deriv,
+            self.dynamic.eta_ls_exit[row],
+            self.dynamic.eta_ls_entry[row],
+            eta_ls_deriv,
+        ]
+    }
+
+    pub(crate) fn row_nll_tower(
+        &self,
+        row: usize,
+    ) -> Result<crate::families::jet_tower::Tower4<SLS_ROW_K>, String> {
+        use crate::families::jet_tower::Tower4;
+
+        let p = self.row_primary_values(row);
+        let vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Tower4::variable(p[a], a));
+        let inv_sigma_entry = (-vars[7]).exp();
+        let u0 = vars[0] - vars[4] * inv_sigma_entry;
+        let inv_sigma_exit = (-vars[6]).exp();
+        let u1 = vars[1] - vars[3] * inv_sigma_exit;
+        let g = vars[2] + inv_sigma_exit * (vars[3] * vars[8] - vars[5]);
+        let state = self.family.row_predictor_state(
+            self.dynamic.h_entry[row],
+            self.dynamic.h_exit[row],
+            self.dynamic.hdot_exit[row],
+            self.dynamic.q_entry[row],
+            self.dynamic.q_exit[row],
+            self.dynamic.qdot_exit[row],
+        );
+        let kernel = self
+            .family
+            .exact_row_kernel_rescaled(row, state, self.deriv_log_scale)?
+            .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))?;
+
+        let mut nll = u0
+            .compose_unary([kernel.log_s0, -kernel.r0, -kernel.dr0, -kernel.ddr0, -kernel.dddr0])
+            .scale(kernel.w);
+        let censored_weight = kernel.w * (1.0 - kernel.d);
+        if censored_weight != 0.0 {
+            nll = nll
+                + u1.compose_unary([
+                    kernel.log_s1,
+                    -kernel.r1,
+                    -kernel.dr1,
+                    -kernel.ddr1,
+                    -kernel.dddr1,
+                ])
+                .scale(-censored_weight);
+        }
+        let event_weight = kernel.w * kernel.d;
+        if event_weight != 0.0 {
+            nll = nll
+                + u1.compose_unary([
+                    kernel.logphi1,
+                    kernel.dlogphi1,
+                    kernel.d2logphi1,
+                    kernel.d3logphi1,
+                    kernel.d4logphi1,
+                ])
+                .scale(-event_weight)
+                + g.compose_unary([
+                    kernel.log_g,
+                    kernel.d_log_g,
+                    kernel.d2_log_g,
+                    kernel.d3_log_g,
+                    kernel.d4_log_g,
+                ])
+                .scale(-event_weight);
+        }
+        Ok(nll)
     }
 }
 
@@ -710,23 +795,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         dir_u: &[f64; SLS_ROW_K],
         dir_v: &[f64; SLS_ROW_K],
     ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        // The survival location-scale family carries derivative quantities only
-        // up to third order (`d_h_*` are third index derivatives; the fourth
-        // index derivatives `dddr0` / `d4logphi1` are computed in
-        // `exact_*_derivatives_fourth_rescaled` but deliberately not stored).
-        // Its REML outer Hessian is assembled from the **third-order**
-        // directional-derivative operator, never an explicit fourth-order
-        // tensor, so this entry point is not on the location-scale path. Routing
-        // through the generic `row_kernel_second_directional_derivative` would
-        // require persisting the fourth index derivatives first.
-        let u_norm = dir_u.iter().map(|value| value * value).sum::<f64>().sqrt();
-        let v_norm = dir_v.iter().map(|value| value * value).sum::<f64>().sqrt();
-        Err(format!(
-            "survival location-scale RowKernel does not provide a fourth-order \
-             contracted derivative at row {row} (u_norm={u_norm:.6e}, \
-             v_norm={v_norm:.6e}): the family's REML uses the third-order \
-             directional operator (no fourth-order tensor is computed)"
-        ))
+        Ok(self.row_nll_tower(row)?.fourth_contracted(dir_u, dir_v))
     }
 }
 
@@ -762,10 +831,20 @@ impl SurvivalLocationScaleFamily {
         q: &'a SurvivalJointQuantities,
         dynamic: &'a SurvivalDynamicGeometry,
     ) -> SurvivalLsRowKernel<'a> {
+        self.survival_ls_row_kernel_rescaled(q, dynamic, 0.0)
+    }
+
+    pub(crate) fn survival_ls_row_kernel_rescaled<'a>(
+        &'a self,
+        q: &'a SurvivalJointQuantities,
+        dynamic: &'a SurvivalDynamicGeometry,
+        deriv_log_scale: f64,
+    ) -> SurvivalLsRowKernel<'a> {
         SurvivalLsRowKernel {
             family: self,
             q,
             dynamic,
+            deriv_log_scale,
             offsets: self.joint_block_offsets(),
         }
     }

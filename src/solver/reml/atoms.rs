@@ -130,7 +130,7 @@ use super::jeffreys_subspace::{
     floored_inverse, floored_inverse_divided_differences, jeffreys_antiderivative,
     jeffreys_antiderivative_floor_sensitivity,
 };
-use super::reml_outer_engine::PenaltySubspaceTrace;
+use super::reml_outer_engine::{PenaltyCoordinate, PenaltySubspaceTrace};
 
 /// An outer-coordinate direction with its induced inner motion, built ONCE
 /// per direction by the calculus and shared by every atom.
@@ -558,6 +558,90 @@ pub struct PenaltyQuadAtom {
     /// `Σ_k λ_k S_k (β̂ − μ_k)` — the penalty half of the KKT residual, the
     /// atom's exact `∂A/∂β̂`. Built once alongside `block_quadratics`.
     pub penalty_score: Array1<f64>,
+    /// Per-block beta score emissions `λ_k S_k(β̂ − μ_k)`, aligned with
+    /// `lambdas` / `block_quadratics`. Live gradient, Hessian, KKT-residual,
+    /// and EFS assembly read these instead of reassembling centered
+    /// beta-Gaussian prior matvecs at each consumer.
+    pub block_penalty_scores: Vec<Array1<f64>>,
+}
+
+impl PenaltyQuadAtom {
+    /// Build the beta-Gaussian prior / penalty-quadratic atom from the live
+    /// REML penalty-coordinate representation.
+    ///
+    /// Each coordinate owns its prior-mean convention (`β` vs `β − μ`) and
+    /// sparse/block/root application. This constructor is the single emission
+    /// point for the centered quadratic `q_k`, the per-block score
+    /// `λ_k S_k(β̂ − μ_k)`, and their total beta channel.
+    pub(crate) fn from_penalty_coords(
+        lambdas: &[f64],
+        coords: &[PenaltyCoordinate],
+        beta: &Array1<f64>,
+    ) -> Result<Self, String> {
+        if lambdas.len() != coords.len() {
+            return Err(format!(
+                "penalty quadratic atom dimension mismatch: lambdas={}, coords={}",
+                lambdas.len(),
+                coords.len()
+            ));
+        }
+        let mut block_quadratics = Array1::<f64>::zeros(coords.len());
+        let mut penalty_score = Array1::<f64>::zeros(beta.len());
+        let mut block_penalty_scores = Vec::with_capacity(coords.len());
+        for (idx, (coord, &lambda)) in coords.iter().zip(lambdas.iter()).enumerate() {
+            if !lambda.is_finite() {
+                return Err(format!(
+                    "penalty quadratic atom received non-finite lambda at coord {idx}: {lambda}"
+                ));
+            }
+            let q_k = coord.shifted_quadratic(beta, 1.0);
+            if !q_k.is_finite() {
+                return Err(format!(
+                    "penalty quadratic atom produced non-finite shifted quadratic at coord {idx}: {q_k}"
+                ));
+            }
+            let score_k = coord.apply_shifted_penalty(beta, lambda);
+            if score_k.len() != beta.len() {
+                return Err(format!(
+                    "penalty quadratic atom score length mismatch at coord {idx}: got {}, expected {}",
+                    score_k.len(),
+                    beta.len()
+                ));
+            }
+            if score_k.iter().any(|v| !v.is_finite()) {
+                return Err(format!(
+                    "penalty quadratic atom produced a non-finite beta score at coord {idx}"
+                ));
+            }
+            block_quadratics[idx] = q_k;
+            penalty_score += &score_k;
+            block_penalty_scores.push(score_k);
+        }
+        Ok(Self {
+            lambdas: Array1::from_vec(lambdas.to_vec()),
+            block_quadratics,
+            penalty_score,
+            block_penalty_scores,
+        })
+    }
+
+    /// Fixed-β derivative with respect to `ρ_idx = log λ_idx`.
+    pub(crate) fn rho_frozen_d1(&self, idx: usize) -> f64 {
+        if idx < self.lambdas.len() {
+            0.5 * self.lambdas[idx] * self.block_quadratics[idx]
+        } else {
+            0.0
+        }
+    }
+
+    /// Per-coordinate beta score `λ_idx S_idx(β̂ − μ_idx)`.
+    pub(crate) fn block_penalty_score(&self, idx: usize) -> &Array1<f64> {
+        &self.block_penalty_scores[idx]
+    }
+
+    pub(crate) fn block_penalty_scores(&self) -> &[Array1<f64>] {
+        &self.block_penalty_scores
+    }
 }
 
 impl CriterionAtom for PenaltyQuadAtom {
@@ -578,7 +662,7 @@ impl CriterionAtom for PenaltyQuadAtom {
         // Only the ρ-block coordinate matching `dir.index` has an explicit
         // channel; ψ-motion of S_k's entries rides the shared drift.
         match dir.index {
-            Some(k) if k < self.lambdas.len() => 0.5 * self.lambdas[k] * self.block_quadratics[k],
+            Some(k) => self.rho_frozen_d1(k),
             _ => 0.0,
         }
     }
@@ -1265,6 +1349,7 @@ mod tests {
             lambdas: array![3.0, 5.0],
             block_quadratics: array![2.0, 4.0],
             penalty_score: array![1.5, -0.5],
+            block_penalty_scores: vec![array![1.0, 0.0], array![0.5, -0.5]],
         };
         assert_eq!(atom.name(), "penalty_quadratic");
         assert!((atom.value() - 13.0).abs() < 1e-12);
@@ -1731,6 +1816,7 @@ mod tests {
             lambdas: array![3.0, 5.0],
             block_quadratics: array![2.0, 4.0],
             penalty_score: array![2.0, 1.0],
+            block_penalty_scores: vec![array![2.0, 0.0], array![0.0, 1.0]],
         };
         // hess.frozen_d1 = ½ tr(H⁺ Ḣ) = ½(0.5·0.5 + 0.25·1.5) = 0.3125.
         assert!((hess.frozen_d1(&dir) - 0.3125).abs() < 1e-12);

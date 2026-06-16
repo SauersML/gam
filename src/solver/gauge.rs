@@ -151,8 +151,35 @@ impl Gauge {
     /// `T_b : reduced_b → raw_b` (selection matrices from the canonical
     /// audit, orthogonalisation `V_b`s, or their compositions).
     pub fn from_block_transforms(transforms: &[Array2<f64>]) -> Self {
+        let raw_total: usize = transforms.iter().map(|t| t.nrows()).sum();
+        Self::from_block_transforms_with_shift(transforms, Array1::zeros(raw_total))
+    }
+
+    /// Block-diagonal affine section from independent per-block lifts
+    /// plus one concatenated raw-coordinate shift.
+    pub fn from_block_transforms_with_shift(
+        transforms: &[Array2<f64>],
+        affine_shift: Array1<f64>,
+    ) -> Self {
         let r_none: Vec<Option<Array2<f64>>> = transforms.iter().map(|_| None).collect();
-        Self::from_v_and_r(transforms, &r_none)
+        let mut gauge = Self::from_v_and_r(transforms, &r_none);
+        assert_eq!(
+            affine_shift.len(),
+            gauge.raw_total(),
+            "Gauge::from_block_transforms_with_shift: affine shift len {} != raw width {}",
+            affine_shift.len(),
+            gauge.raw_total(),
+        );
+        gauge.affine_shift = affine_shift;
+        gauge
+    }
+
+    /// Single-block affine section.
+    pub fn from_block_transform_with_shift(
+        transform: Array2<f64>,
+        affine_shift: Array1<f64>,
+    ) -> Self {
+        Self::from_block_transforms_with_shift(&[transform], affine_shift)
     }
 
     /// Block-upper-triangular section from per-block `V_b` plus
@@ -163,6 +190,7 @@ impl Gauge {
         let reduced_widths: Vec<usize> = v_per_term.iter().map(|v| v.ncols()).collect();
         Self {
             t_full: assemble_block_triangular_t(v_per_term, r_per_term),
+            affine_shift: Array1::zeros(raw_widths.iter().sum()),
             block_starts_raw: starts_from_widths(&raw_widths),
             block_starts_reduced: starts_from_widths(&reduced_widths),
         }
@@ -202,6 +230,23 @@ impl Gauge {
     /// Wrap an already-assembled global `T` given the per-block raw and
     /// reduced width partitions.
     pub fn from_t(t_full: Array2<f64>, raw_widths: &[usize], reduced_widths: &[usize]) -> Self {
+        let total_raw: usize = raw_widths.iter().sum();
+        Self::from_t_with_shift(
+            t_full,
+            raw_widths,
+            reduced_widths,
+            Array1::zeros(total_raw),
+        )
+    }
+
+    /// Wrap an already-assembled global affine section `β = Tθ + a` given the
+    /// per-block raw and reduced width partitions.
+    pub fn from_t_with_shift(
+        t_full: Array2<f64>,
+        raw_widths: &[usize],
+        reduced_widths: &[usize],
+        affine_shift: Array1<f64>,
+    ) -> Self {
         assert_eq!(
             raw_widths.len(),
             reduced_widths.len(),
@@ -217,8 +262,15 @@ impl Gauge {
             "Gauge::from_t: T has shape {:?}, expected ({total_raw}, {total_reduced})",
             t_full.dim(),
         );
+        assert_eq!(
+            affine_shift.len(),
+            total_raw,
+            "Gauge::from_t_with_shift: affine shift len {} != raw width {total_raw}",
+            affine_shift.len(),
+        );
         Self {
             t_full,
+            affine_shift,
             block_starts_raw: starts_from_widths(raw_widths),
             block_starts_reduced: starts_from_widths(reduced_widths),
         }
@@ -262,6 +314,7 @@ impl Gauge {
         }
         Self {
             t_full: map.raw_from_compiled.clone(),
+            affine_shift: Array1::zeros(block_starts_raw.last().copied().unwrap_or(0)),
             block_starts_raw,
             block_starts_reduced,
         }
@@ -330,6 +383,25 @@ impl Gauge {
         fast_ab(raw_design, &self.t_full)
     }
 
+    /// Compose a raw design and offset with the affine section:
+    /// `X_raw · (Tθ + a) + o_raw = (X_raw · T)θ + (o_raw + X_raw · a)`.
+    pub fn restrict_design_and_offset<S: Data<Elem = f64>>(
+        &self,
+        raw_design: &ArrayBase<S, Ix2>,
+        raw_offset: &Array1<f64>,
+    ) -> (Array2<f64>, Array1<f64>) {
+        assert_eq!(
+            raw_design.nrows(),
+            raw_offset.len(),
+            "Gauge::restrict_design_and_offset: design rows {} != offset len {}",
+            raw_design.nrows(),
+            raw_offset.len(),
+        );
+        let reduced_design = self.restrict_design(raw_design);
+        let reduced_offset = raw_offset + &raw_design.dot(&self.affine_shift);
+        (reduced_design, reduced_offset)
+    }
+
     /// Pull a raw-coordinate quadratic form back to reduced coordinates:
     /// `S_reduced = Tᵀ · S_raw · T`.
     pub fn restrict_penalty<S: Data<Elem = f64>>(
@@ -367,8 +439,13 @@ impl Gauge {
             block_starts_raw.push(block_starts_raw.last().copied().unwrap() + w);
             block_starts_reduced.push(block_starts_reduced.last().copied().unwrap() + w);
         }
+        let mut affine_shift = Array1::<f64>::zeros(raw_total + extra_total);
+        affine_shift
+            .slice_mut(ndarray::s![0..raw_total])
+            .assign(&self.affine_shift);
         Self {
             t_full: t,
+            affine_shift,
             block_starts_raw,
             block_starts_reduced,
         }
@@ -402,7 +479,7 @@ impl Gauge {
             let c1 = self.block_starts_reduced[b + 1];
             theta_full.slice_mut(ndarray::s![c0..c1]).assign(beta);
         }
-        let beta_full = self.t_full.dot(&theta_full);
+        let beta_full = self.t_full.dot(&theta_full) + &self.affine_shift;
         let mut out = Vec::with_capacity(n_blocks);
         for b in 0..n_blocks {
             let r0 = self.block_starts_raw[b];

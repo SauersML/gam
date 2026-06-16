@@ -2410,38 +2410,27 @@ impl KroneckerReparamResult {
         let p: usize = self.marginal_dims.iter().copied().product();
         let mut s = Array2::<f64>::zeros((p, p));
 
+        // Delegate the per-cell tensor-penalty accumulation to the shared
+        // `kronecker_cell_sigma` (#1172/#1185 single source of truth). Fold the
+        // `lambdas.len() > d` guard into `has_double` to preserve exact gating.
+        let eigenvalue_views: Vec<ArrayView1<'_, f64>> =
+            self.marginal_eigenvalues.iter().map(|m| m.view()).collect();
+        let has_double = self.has_double_penalty && lambdas.len() > d;
         let mut multi_idx = vec![0usize; d];
         let mut flat = 0usize;
         loop {
-            let mut sigma = 0.0;
-            let mut structural_sigma = 0.0;
-            for k in 0..d {
-                let marginal_eigenvalue = self.marginal_eigenvalues[k][multi_idx[k]];
-                structural_sigma += marginal_eigenvalue;
-                sigma += lambdas[k] * marginal_eigenvalue;
-            }
-            let joint_null = structural_sigma <= KRONECKER_STRUCTURAL_ZERO_TOL;
-            if self.has_double_penalty && lambdas.len() > d && joint_null {
-                sigma += lambdas[d];
-            }
-            if structural_sigma > KRONECKER_STRUCTURAL_ZERO_TOL {
-                sigma += self.penalty_shrinkage_ridge;
-            }
+            let (sigma, _structural_sigma, _joint_null) = kronecker_cell_sigma(
+                &eigenvalue_views,
+                &multi_idx,
+                lambdas,
+                d,
+                has_double,
+                self.penalty_shrinkage_ridge,
+            );
             s[[flat, flat]] = sigma;
             flat += 1;
 
-            let mut carry = true;
-            for dim in (0..d).rev() {
-                if carry {
-                    multi_idx[dim] += 1;
-                    if multi_idx[dim] < self.marginal_dims[dim] {
-                        carry = false;
-                    } else {
-                        multi_idx[dim] = 0;
-                    }
-                }
-            }
-            if carry {
+            if kronecker_multi_index_advance(&mut multi_idx, &self.marginal_dims) {
                 break;
             }
         }
@@ -2487,38 +2476,30 @@ impl KroneckerReparamResult {
         // For Kronecker structure, the penalty is diagonal in the eigenbasis.
         // e_transformed rows are the nonzero rows of sqrt(Σ_k λ_k S_k)^{1/2}.
         let d = self.marginal_dims.len();
+        // Delegate the per-cell tensor-penalty accumulation to the shared
+        // `kronecker_cell_sigma` (the #1172/#1185 single source of truth). The
+        // double-penalty term is only valid when `lambdas` actually carries the
+        // λ_d entry, so fold the original `lambdas.len() > d` guard into the
+        // `has_double_penalty` flag passed to the helper — preserving the exact
+        // gating behavior.
+        let eigenvalue_views: Vec<ArrayView1<'_, f64>> =
+            self.marginal_eigenvalues.iter().map(|m| m.view()).collect();
+        let has_double = self.has_double_penalty && lambdas.len() > d;
         let diag_vals: Vec<f64> = {
             let mut vals = Vec::with_capacity(p);
             let mut multi_idx = vec![0usize; d];
             loop {
-                let mut sigma = 0.0;
-                let mut structural_sigma = 0.0;
-                for k in 0..d {
-                    let marginal_eigenvalue = self.marginal_eigenvalues[k][multi_idx[k]];
-                    structural_sigma += marginal_eigenvalue;
-                    sigma += lambdas[k] * marginal_eigenvalue;
-                }
-                let joint_null = structural_sigma <= KRONECKER_STRUCTURAL_ZERO_TOL;
-                if self.has_double_penalty && lambdas.len() > d && joint_null {
-                    sigma += lambdas[d];
-                }
-                if structural_sigma > KRONECKER_STRUCTURAL_ZERO_TOL {
-                    sigma += self.penalty_shrinkage_ridge;
-                }
+                let (sigma, _structural_sigma, _joint_null) = kronecker_cell_sigma(
+                    &eigenvalue_views,
+                    &multi_idx,
+                    lambdas,
+                    d,
+                    has_double,
+                    self.penalty_shrinkage_ridge,
+                );
                 vals.push(if sigma > 0.0 { sigma.sqrt() } else { 0.0 });
 
-                let mut carry = true;
-                for dim in (0..d).rev() {
-                    if carry {
-                        multi_idx[dim] += 1;
-                        if multi_idx[dim] < self.marginal_dims[dim] {
-                            carry = false;
-                        } else {
-                            multi_idx[dim] = 0;
-                        }
-                    }
-                }
-                if carry {
+                if kronecker_multi_index_advance(&mut multi_idx, &self.marginal_dims) {
                     break;
                 }
             }
@@ -2570,6 +2551,63 @@ impl KroneckerReparamResult {
 /// multi-index grid in O(d · ∏q_j) time with no O(p²) storage.
 const KRONECKER_STRUCTURAL_ZERO_TOL: f64 = 1e-12;
 
+/// Per-cell Kronecker eigenvalue accumulation — the single source of truth for
+/// the #1172/#1185 tensor-penalty math.
+///
+/// For the multi-index cell `multi_idx`, accumulates:
+///   - `sigma`            = Σ_k λ_k · μ_k  (+ joint-null double-penalty term + ridge)
+///   - `structural_sigma` = Σ_k μ_k        (unweighted; classifies joint-null cells)
+///   - `joint_null`       = whether the cell lies in the joint null space
+///
+/// `marginal_eigenvalues[k][multi_idx[k]]` is the k-th marginal eigenvalue μ_k.
+/// The double-penalty (global ridge) term `λ_d` is added only on joint-null
+/// cells; the structural shrinkage `ridge` is added only on structurally
+/// penalized cells. This mirrors the gated logic fixed in #1172/#1185 and MUST
+/// be kept identical across every caller.
+#[inline]
+fn kronecker_cell_sigma(
+    marginal_eigenvalues: &[ArrayView1<'_, f64>],
+    multi_idx: &[usize],
+    lambdas: &[f64],
+    d: usize,
+    has_double_penalty: bool,
+    ridge: f64,
+) -> (f64, f64, bool) {
+    let mut sigma = 0.0;
+    let mut structural_sigma = 0.0;
+    for k in 0..d {
+        let marginal_eigenvalue = marginal_eigenvalues[k][multi_idx[k]];
+        structural_sigma += marginal_eigenvalue;
+        sigma += lambdas[k] * marginal_eigenvalue;
+    }
+    let joint_null = structural_sigma <= KRONECKER_STRUCTURAL_ZERO_TOL;
+    if has_double_penalty && joint_null {
+        sigma += lambdas[d];
+    }
+    if structural_sigma > KRONECKER_STRUCTURAL_ZERO_TOL {
+        sigma += ridge;
+    }
+    (sigma, structural_sigma, joint_null)
+}
+
+/// Advance a row-major multi-index over the `dims` grid in place.
+/// Returns `true` when the grid is exhausted (the index wrapped back to all-zero).
+#[inline]
+fn kronecker_multi_index_advance(multi_idx: &mut [usize], dims: &[usize]) -> bool {
+    let mut carry = true;
+    for dim in (0..dims.len()).rev() {
+        if carry {
+            multi_idx[dim] += 1;
+            if multi_idx[dim] < dims[dim] {
+                carry = false;
+            } else {
+                multi_idx[dim] = 0;
+            }
+        }
+    }
+    carry
+}
+
 pub fn kronecker_logdet_and_derivatives(
     marginal_eigenvalues: &[ArrayView1<'_, f64>],
     marginal_dims: &[usize],
@@ -2587,20 +2625,14 @@ pub fn kronecker_logdet_and_derivatives(
 
     let mut multi_idx = vec![0usize; d];
     loop {
-        let mut sigma = 0.0;
-        let mut structural_sigma = 0.0;
-        for k in 0..d {
-            let marginal_eigenvalue = marginal_eigenvalues[k][multi_idx[k]];
-            structural_sigma += marginal_eigenvalue;
-            sigma += lambdas[k] * marginal_eigenvalue;
-        }
-        let joint_null = structural_sigma <= KRONECKER_STRUCTURAL_ZERO_TOL;
-        if has_double_penalty && joint_null {
-            sigma += lambdas[d];
-        }
-        if structural_sigma > KRONECKER_STRUCTURAL_ZERO_TOL {
-            sigma += ridge;
-        }
+        let (sigma, _structural_sigma, joint_null) = kronecker_cell_sigma(
+            marginal_eigenvalues,
+            &multi_idx,
+            lambdas,
+            d,
+            has_double_penalty,
+            ridge,
+        );
 
         if sigma > tol {
             logdet += sigma.ln();
@@ -2639,18 +2671,7 @@ pub fn kronecker_logdet_and_derivatives(
             }
         }
 
-        let mut carry = true;
-        for dim in (0..d).rev() {
-            if carry {
-                multi_idx[dim] += 1;
-                if multi_idx[dim] < marginal_dims[dim] {
-                    carry = false;
-                } else {
-                    multi_idx[dim] = 0;
-                }
-            }
-        }
-        if carry {
+        if kronecker_multi_index_advance(&mut multi_idx, marginal_dims) {
             break;
         }
     }
@@ -2717,18 +2738,7 @@ pub fn kronecker_reparameterization_engine(
             }
             max_bal = max_bal.max(sigma);
 
-            let mut carry = true;
-            for dim in (0..d).rev() {
-                if carry {
-                    multi_idx[dim] += 1;
-                    if multi_idx[dim] < marginal_dims[dim] {
-                        carry = false;
-                    } else {
-                        multi_idx[dim] = 0;
-                    }
-                }
-            }
-            if carry {
+            if kronecker_multi_index_advance(&mut multi_idx, marginal_dims) {
                 break;
             }
         }

@@ -109,6 +109,8 @@ use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 
+use crate::solver::gauge::Gauge;
+
 use crate::terms::construction::kronecker_product;
 
 use crate::types::{InverseLink, StandardLink};

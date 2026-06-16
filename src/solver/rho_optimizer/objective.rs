@@ -895,11 +895,17 @@ pub(crate) fn finite_cost_or_error(context: &str, cost: f64) -> Result<f64, Obje
     }
 }
 
-pub(crate) fn finite_outer_eval_or_error(
+/// Shared first-order validation: gradient length, finite cost, finite gradient.
+///
+/// Extracted so the cost+gradient checks live in exactly one place — both the
+/// full (`finite_outer_eval_or_error`) and first-order
+/// (`finite_outer_first_order_eval_or_error`) validators delegate here, keeping
+/// their error messages and check order bit-for-bit identical.
+fn validate_outer_first_order(
     context: &str,
     layout: OuterThetaLayout,
-    eval: OuterEval,
-) -> Result<OuterEval, ObjectiveEvalError> {
+    eval: &OuterEval,
+) -> Result<(), ObjectiveEvalError> {
     layout.validate_gradient_len(&eval.gradient, context)?;
     if !eval.cost.is_finite() {
         return Err(ObjectiveEvalError::recoverable(format!(
@@ -911,6 +917,15 @@ pub(crate) fn finite_outer_eval_or_error(
             "{context}: objective returned a non-finite gradient"
         )));
     }
+    Ok(())
+}
+
+pub(crate) fn finite_outer_eval_or_error(
+    context: &str,
+    layout: OuterThetaLayout,
+    eval: OuterEval,
+) -> Result<OuterEval, ObjectiveEvalError> {
+    validate_outer_first_order(context, layout, &eval)?;
     match &eval.hessian {
         HessianResult::Analytic(hessian) => {
             layout.validate_hessian_shape(hessian, context)?;
@@ -941,17 +956,7 @@ pub(crate) fn finite_outer_first_order_eval_or_error(
     layout: OuterThetaLayout,
     eval: OuterEval,
 ) -> Result<OuterEval, ObjectiveEvalError> {
-    layout.validate_gradient_len(&eval.gradient, context)?;
-    if !eval.cost.is_finite() {
-        return Err(ObjectiveEvalError::recoverable(format!(
-            "{context}: objective returned a non-finite cost"
-        )));
-    }
-    if !eval.gradient.iter().all(|v| v.is_finite()) {
-        return Err(ObjectiveEvalError::recoverable(format!(
-            "{context}: objective returned a non-finite gradient"
-        )));
-    }
+    validate_outer_first_order(context, layout, &eval)?;
     Ok(eval)
 }
 
