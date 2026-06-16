@@ -1223,6 +1223,7 @@ where
     let mut edf_by_block = vec![0.0; k];
     let mut edf_total = 0.0;
     let mut smoothing_correction = None;
+    let mut rho_covariance = None;
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
     let mut beta_standard_errors = None;
@@ -1553,6 +1554,7 @@ where
             cov_scale,
             finalgrad_norm,
         );
+        rho_covariance = smoothing_outcome.rho_covariance().cloned();
         smoothing_correction = smoothing_outcome.into_correction();
 
         // Tier-0 marginal-smoothing certificate (#938): while the REML objective
@@ -1737,6 +1739,7 @@ where
             criterion_certificate: outer_result.criterion_certificate.clone(),
             rho_posterior_certificate,
             rho_posterior_escalation,
+            rho_covariance,
             ..Default::default()
         },
         inference,

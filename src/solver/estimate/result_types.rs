@@ -148,6 +148,13 @@ pub struct FitArtifacts {
     /// live-objective seam as the certificate; re-derivable, not serialized.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub rho_posterior_escalation: Option<crate::inference::rho_posterior::RhoPosteriorEscalation>,
+    /// Regularized inverse REML/LAML outer Hessian over `rho = log(lambda)`,
+    /// aligned with [`UnifiedFitResult::lambdas`]. This is the narrow #740
+    /// handoff consumed by estimated-lambda Lawley LR corrections; it is
+    /// computed from the same path as smoothing-parameter uncertainty and is
+    /// re-derivable, so it is not serialized.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub rho_covariance: Option<Array2<f64>>,
 }
 
 impl std::fmt::Debug for FitArtifacts {
@@ -170,6 +177,7 @@ impl std::fmt::Debug for FitArtifacts {
             .field("criterion_certificate", &self.criterion_certificate)
             .field("rho_posterior_certificate", &self.rho_posterior_certificate)
             .field("rho_posterior_escalation", &self.rho_posterior_escalation)
+            .field("rho_covariance", &self.rho_covariance.as_ref().map(|m| m.dim()))
             .finish()
     }
 }

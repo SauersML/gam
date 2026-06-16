@@ -6393,16 +6393,29 @@ pub(crate) fn ift_correction_recovers_fd_hessian_at_perturbed_beta() {
         false,
     ));
     let hessian_envelope =
-        reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueGradientHessian, None)
+        match reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueGradientHessian, None)
             .unwrap()
             .hessian
-            .unwrap_analytic();
+        {
+            crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => hessian,
+            crate::solver::rho_optimizer::HessianResult::Operator(_)
+            | crate::solver::rho_optimizer::HessianResult::Unavailable => {
+                panic!("expected dense analytic Hessian")
+            }
+        };
 
     let sol_ift = to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat, true));
-    let hessian_ift = reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueGradientHessian, None)
-        .unwrap()
-        .hessian
-        .unwrap_analytic();
+    let hessian_ift =
+        match reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueGradientHessian, None)
+            .unwrap()
+            .hessian
+        {
+            crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => hessian,
+            crate::solver::rho_optimizer::HessianResult::Operator(_)
+            | crate::solver::rho_optimizer::HessianResult::Unavailable => {
+                panic!("expected dense analytic Hessian")
+            }
+        };
 
     let mut envelope_was_wrong = false;
     for i in 0..rho.len() {

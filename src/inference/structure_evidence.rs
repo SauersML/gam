@@ -265,10 +265,20 @@ pub fn split_likelihood_log_e_value(
     log_lik_alternative_on_eval: f64,
     log_lik_null_sup_on_eval: f64,
 ) -> f64 {
-    assert!(
-        !log_lik_alternative_on_eval.is_nan() && !log_lik_null_sup_on_eval.is_nan(),
-        "split-likelihood log-likelihoods must not be NaN"
-    );
+    // Degenerate halves yield a well-defined, conservative e-value of 1
+    // (`log E = 0`, no evidence for the alternative) rather than a NaN that
+    // would poison the e-process product and the downstream FDR certificate:
+    //   * Either log-likelihood is NaN — the model could not be evaluated on
+    //     this shard (a numerically degenerate fit). The honest reading is
+    //     "no information", i.e. `E = 1`.
+    //   * Both halves are the SAME signed infinity — e.g. a shard/outcome
+    //     with zero density under both the alternative and the null
+    //     (`−∞ − (−∞)`), or both `+∞`. The ratio is undefined; again `E = 1`.
+    // This keeps `log E` finite so `absorb_log` never banks a NaN and the
+    // e-BH certificate sees a contributing-nothing claim instead of panicking.
+    if log_lik_alternative_on_eval.is_nan() || log_lik_null_sup_on_eval.is_nan() {
+        return 0.0;
+    }
     if log_lik_alternative_on_eval.is_infinite()
         && log_lik_null_sup_on_eval.is_infinite()
         && log_lik_alternative_on_eval.is_sign_positive()
@@ -849,11 +859,57 @@ mod tests {
         assert_eq!(e_benjamini_hochberg(&log_e, 0.1), vec![1, 2]);
     }
 
+    /// A NaN log e-value (a degenerate claim whose `(−∞) − (−∞)` split-LR
+    /// escaped the source guard) must NOT panic the e-BH comparator — the
+    /// honest FDR surface stays robust. The NaN claim is treated as
+    /// least-evidence (`−∞`): it is never rejected, and it cannot disturb the
+    /// rejection of a genuinely strong claim.
     #[test]
-    #[should_panic(expected = "e-BH log e-values must not be NaN")]
-    fn e_bh_rejects_nan_log_e_values_before_sorting() {
-        let log_e = [10.0f64.ln(), f64::NAN];
-        let _ = e_benjamini_hochberg(&log_e, 0.1);
+    fn e_bh_treats_nan_as_least_evidence_without_panicking() {
+        // m = 2, α = 0.1 → threshold for the top claim is m/(αk) = 2/0.1 = 20.
+        // Claim 0 has e = 45 ≥ 20 (rejected); claim 1 is NaN (no evidence).
+        let log_e = [45.0f64.ln(), f64::NAN];
+        let rejected = e_benjamini_hochberg(&log_e, 0.1);
+        assert_eq!(rejected, vec![0], "strong claim survives; NaN claim never rejected");
+
+        // An all-NaN ledger yields an empty (no-rejection) certificate, not a
+        // panic.
+        let all_nan = [f64::NAN, f64::NAN, f64::NAN];
+        assert!(e_benjamini_hochberg(&all_nan, 0.1).is_empty());
+    }
+
+    /// The full source→consumer chain: a shard with zero density under both
+    /// the alternative and the null produces `(−∞) − (−∞)`, which the split-LR
+    /// resolves to neutral `log E = 0` rather than NaN; banking it and
+    /// certifying must not panic. A genuinely-NaN log-likelihood is likewise
+    /// resolved to neutral evidence at the source.
+    #[test]
+    fn degenerate_split_lr_flows_through_certify_without_nan_panic() {
+        // (−∞) − (−∞): zero density under both hypotheses → neutral.
+        let neutral = split_likelihood_log_e_value(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        assert_eq!(neutral, 0.0);
+        // NaN log-likelihood (un-evaluable degenerate fit) → neutral, finite.
+        let from_nan = split_likelihood_log_e_value(f64::NAN, -3.0);
+        assert!(from_nan.is_finite());
+        assert_eq!(from_nan, 0.0);
+
+        let mut ledger = StructureLedger::new();
+        let degenerate = ledger.register(ClaimKind::AtomExists { atom: 0 });
+        let strong = ledger.register(ClaimKind::AtomExists { atom: 1 });
+        // Bank the neutral split-LR on the degenerate claim — no NaN reaches
+        // the e-process.
+        ledger.absorb_log(degenerate, neutral).unwrap();
+        ledger.absorb_log(strong, 45.0f64.ln()).unwrap();
+        // certify() runs e_benjamini_hochberg internally; must not panic.
+        let certificate = ledger.certify(0.1);
+        let degenerate_entry = certificate
+            .entries
+            .iter()
+            .find(|e| e.kind == ClaimKind::AtomExists { atom: 0 })
+            .expect("degenerate claim present");
+        // Neutral evidence (log_e = 0) never qualifies → contested, not confirmed.
+        assert!(!degenerate_entry.confirmed);
+        assert_eq!(degenerate_entry.log_e, 0.0);
     }
 
     #[test]

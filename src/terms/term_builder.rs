@@ -3002,9 +3002,21 @@ pub fn build_smooth_basis(
                     periods: periods_vec,
                     double_penalty: tensor_double_penalty,
                     identifiability: parse_tensor_identifiability(options, kind)?,
-                    penalty_decomposition: match kind {
-                        SmoothKind::T2 => TensorBSplinePenaltyDecomposition::Separable,
-                        _ => TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+                    // `t2` selects mgcv's separable (Wood, Scheipl & Faraway
+                    // 2013) decomposition. It can arrive either as the `t2(...)`
+                    // function form (`SmoothKind::T2`) or as a `type="t2"` /
+                    // `bs="t2"` option on an `s(...)`/`te(...)` term, in which
+                    // case `kind` is *not* `T2` but the resolved type string is
+                    // "t2". Keying only off `kind` silently aliased the option
+                    // form to `te`'s Kronecker-sum penalty (gam#1185); key off
+                    // the resolved type string as well so both routes build the
+                    // separable penalty.
+                    penalty_decomposition: if matches!(kind, SmoothKind::T2)
+                        || type_opt.as_str() == "t2"
+                    {
+                        TensorBSplinePenaltyDecomposition::Separable
+                    } else {
+                        TensorBSplinePenaltyDecomposition::MarginalKroneckerSum
                     },
                 },
             })

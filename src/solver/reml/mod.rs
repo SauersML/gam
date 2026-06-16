@@ -1339,7 +1339,12 @@ mod tests {
                 crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
             )
             .expect("analytic Hessian eval");
-        let h = eval.hessian.unwrap_analytic();
+        let h = match eval.hessian {
+            HessianResult::Analytic(hessian) => hessian,
+            HessianResult::Operator(_) | HessianResult::Unavailable => {
+                panic!("expected dense analytic Hessian")
+            }
+        };
         let delta = 2.0e-5;
         for col in 0..rho.len() {
             let mut rp = rho.clone();
