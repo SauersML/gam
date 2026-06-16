@@ -431,24 +431,34 @@ def _basis_rust(
         return apply(t, "periodic", json.dumps({"n_harmonics": int(n_harm)}))
     if cfg.atom_manifold == "sphere":
         return apply(t, "sphere", json.dumps({}))
-    # Cylinder / product: the B-spline and Duchon arms are genuinely 1-D — the
-    # Rust `basis_with_jet` "bspline"/"duchon" kernels take a single intrinsic
-    # coordinate. Feeding them only `t[:, :1]` would make every remaining
-    # intrinsic coordinate dead (∂x̂/∂t_j ≡ 0 for j >= 1): a configured 2-D
-    # product/cylinder would silently collapse to a 1-D model. There is no
-    # tensor-product `basis_with_jet` kind to compose the per-axis bases here,
-    # so rather than silently fit a lower-dimensional model we refuse when more
-    # than one intrinsic coordinate is configured.
-    if int(cfg.intrinsic_rank) > 1:
-        raise NotImplementedError(
-            f"atom_manifold={cfg.atom_manifold!r} with intrinsic_rank="
-            f"{cfg.intrinsic_rank} and atom_basis={cfg.atom_basis!r} has no "
-            "full-dimensional torch basis: the 'bspline'/'duchon' basis_with_jet "
-            "kernels are 1-D, so the second and later intrinsic coordinates "
-            "would be silently dead. Use intrinsic_rank=1, or a manifold whose "
-            "basis is intrinsically multi-dimensional (sphere)."
-        )
+    # Cylinder / product (intrinsic_rank > 1):
+    #
+    # The B-spline `basis_with_jet` kernel IS genuinely 1-D — the Rust FFI
+    # rejects any `t` with more than one column — so a B-spline product/cylinder
+    # has no full-dimensional torch basis and the later intrinsic coordinates
+    # would be silently dead. That combination is refused.
+    #
+    # The Duchon `basis_with_jet` kernel, by contrast, is fully `d`-dimensional:
+    # it accepts `(N, d)` points and `(K, d)` centers and returns a `(N, M, d)`
+    # jet — an honest per-axis Jacobian for every intrinsic coordinate (see
+    # `duchon_basis_with_jet` in `crates/gam-pyffi/src/model_ffi.rs`). So a
+    # multi-dimensional flat `product` patch is genuinely supported: we pass the
+    # full `t` and a deterministic `(K, d)` center cloud (the 1-D centers lifted
+    # to the `d`-cube by the low-discrepancy `_duchon_centers_nd` Kronecker
+    # sequence) instead of collapsing to `t[:, :1]`. The `cylinder` case is
+    # refused below: its periodic axis has no topology-faithful torch kernel.
     if cfg.atom_basis == "bspline":
+        if int(cfg.intrinsic_rank) > 1:
+            raise NotImplementedError(
+                f"atom_manifold={cfg.atom_manifold!r} with intrinsic_rank="
+                f"{cfg.intrinsic_rank} and atom_basis='bspline' has no "
+                "full-dimensional torch basis: the 'bspline' basis_with_jet "
+                "kernel is intrinsically 1-D, so the second and later intrinsic "
+                "coordinates would be silently dead. Use intrinsic_rank=1, "
+                "atom_basis='duchon' (its basis_with_jet kernel is full "
+                "d-dimensional), or a manifold whose basis is intrinsically "
+                "multi-dimensional (sphere)."
+            )
         params = {
             "n_basis": int(cfg.n_basis_per_atom),
             "degree": 3,
@@ -458,9 +468,71 @@ def _basis_rust(
         return apply(t[:, :1], "bspline", json.dumps(params))
     if centers is None:
         raise ValueError("Duchon-style manifold requires centers")
+    d = int(cfg.intrinsic_rank)
+    if d > 1:
+        # The multi-d Duchon `basis_with_jet` kernel is a *flat* Euclidean patch
+        # (its radial kernel is the plain Euclidean chord; there is no periodic
+        # chord embedding in the jet helper `duchon_sae_atom_basis_with_jet`).
+        # That is exactly right for a `product` patch (genuinely R^d). A
+        # `cylinder` (S¹ × ℝ), however, needs the leading axis wrapped — fitting
+        # it on a flat patch would silently drop the S¹ topology (the very
+        # "torus would silently change the topology" hazard the closed-form
+        # cylinder refusal names). The topology-faithful CylinderHarmonicEvaluator
+        # exists in the Rust core but is reachable only through the closed-form /
+        # structure-search birth path, NOT through `basis_with_jet`. So a
+        # multi-d `cylinder` forward is refused (accurately), while `product`
+        # is wired to the genuine flat multi-d Duchon basis.
+        if cfg.atom_manifold == "cylinder":
+            raise NotImplementedError(
+                "atom_manifold='cylinder' has no topology-faithful torch "
+                "basis: the multi-d 'duchon' basis_with_jet kernel is a flat "
+                "Euclidean patch, so the periodic S¹ axis would be silently "
+                "treated as a line (the topology-change hazard). The genuine "
+                "CylinderHarmonicEvaluator is reachable only through the "
+                "closed-form structure-search birth path, not basis_with_jet. "
+                "Use atom_manifold='product' for a flat patch, atom_manifold="
+                "'circle' (intrinsic_rank=1) for a pure periodic axis, or let "
+                "the closed-form structure search grow a cylinder by evidence."
+            )
+        centers_nd = _duchon_centers_nd(centers, d)
+        centers_list = to_numpy_f64(centers_nd).tolist()
+        params = {"centers": centers_list, "m": int(cfg.basis_order)}
+        return apply(t[:, :d], "duchon", json.dumps(params))
     centers_list = to_numpy_f64(centers.reshape(-1, 1)).tolist()
     params = {"centers": centers_list, "m": int(cfg.basis_order)}
     return apply(t[:, :1], "duchon", json.dumps(params))
+
+
+def _duchon_centers_nd(centers_1d: torch.Tensor, d: int) -> torch.Tensor:
+    """Lift the ``(K,)`` 1-D Duchon centers to a ``(K, d)`` cloud in ``[0, 1]^d``.
+
+    Axis 0 keeps the caller's 1-D centers (so the periodic/leading coordinate of
+    a cylinder or product patch is seeded exactly as in the 1-D case). The
+    remaining ``d - 1`` axes are filled by an additive-recurrence (Kronecker /
+    generalized-golden-ratio) low-discrepancy sequence keyed only to ``(K, d)``:
+    deterministic, buffer-free, and non-degenerate (the centers do not collapse
+    onto a diagonal, so the multi-axis Duchon kernel is well-conditioned). The
+    centers are a *fixed* design the decoder learns against, so any deterministic
+    well-spread placement is admissible; this one is reproducible and stable
+    across forward calls without enlarging the serialized state.
+    """
+    base = centers_1d.reshape(-1, 1)
+    k = int(base.shape[0])
+    dtype = base.dtype
+    device = base.device
+    if d <= 1 or k == 0:
+        return base
+    # Generalized golden ratio phi_d: the real root of x^{d} = x + 1; its
+    # reciprocal powers give the canonical R_d low-discrepancy generators.
+    phi = 2.0
+    for _ in range(32):
+        phi = (1.0 + phi) ** (1.0 / float(d))
+    alphas = [((1.0 / phi) ** (j + 1)) % 1.0 for j in range(d - 1)]
+    idx = torch.arange(1, k + 1, dtype=dtype, device=device).reshape(-1, 1)
+    extra = torch.empty((k, d - 1), dtype=dtype, device=device)
+    for j, a in enumerate(alphas):
+        extra[:, j] = torch.remainder(idx[:, 0] * float(a) + 0.5, 1.0)
+    return torch.cat([base, extra], dim=-1)
 
 
 def _eval_basis_on_manifold(
@@ -683,7 +755,18 @@ class ManifoldSAE(nn.Module):
         self.atom_raw_anchor = nn.Parameter(torch.zeros(F, d, dtype=dt))
         self.decoder_blocks = nn.Parameter(torch.empty(F, K, D, dtype=dt))
 
-        if cfg.atom_basis == "duchon":
+        # The forward path evaluates a Duchon kernel both for an explicit
+        # `atom_basis='duchon'` AND for every `product`/`cylinder` patch (whose
+        # multi-axis torch basis is the full d-dimensional Duchon kernel — there
+        # is no separate tensor-product `basis_with_jet` kind). Seed real
+        # linspace centers for both so the multi-d center lift has a
+        # non-degenerate axis-0 seed; only the genuinely center-free manifolds
+        # (circle/sphere with a built-in chart) keep the zero placeholder.
+        _duchon_backed = cfg.atom_basis == "duchon" or cfg.atom_manifold in (
+            "product",
+            "cylinder",
+        )
+        if _duchon_backed:
             self.register_buffer(
                 "duchon_centers", torch.linspace(0.0, 1.0, K, dtype=dt), persistent=True
             )
@@ -760,6 +843,23 @@ class ManifoldSAE(nn.Module):
         nn.init.normal_(self.decoder_blocks, mean=0.0, std=s)
         nn.init.zeros_(self.log_lambda)
 
+    @property
+    def _forward_centers(self) -> torch.Tensor | None:
+        """Duchon centers the forward path feeds to ``basis_with_jet``.
+
+        The forward Duchon kernel is used for an explicit ``atom_basis='duchon'``
+        AND for every ``product``/``cylinder`` patch (whose multi-axis torch
+        basis is the full d-dimensional Duchon kernel). Both seed real centers
+        in the constructor, so return them whenever the forward is Duchon-backed;
+        circle/sphere carry a built-in chart and need no centers.
+        """
+        if self.cfg.atom_basis == "duchon" or self.cfg.atom_manifold in (
+            "product",
+            "cylinder",
+        ):
+            return self.duchon_centers
+        return None
+
     def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         F = int(self.cfg.n_atoms)
         d = int(self.cfg.intrinsic_rank)
@@ -791,7 +891,7 @@ class ManifoldSAE(nn.Module):
         curves = _eval_basis_on_manifold(
             positions,
             self.cfg,
-            self.duchon_centers if self.cfg.atom_basis == "duchon" else None,
+            self._forward_centers,
         )
         amp = F_torch.softplus(amp_logits)
         assignments, gate_pre = self.sparsity(amp_logits)
@@ -853,7 +953,7 @@ class ManifoldSAE(nn.Module):
         curves = _eval_basis_on_manifold(
             positions,
             self.cfg,
-            self.duchon_centers if self.cfg.atom_basis == "duchon" else None,
+            self._forward_centers,
         )
         z = assignments
         gate = assignments
@@ -1134,7 +1234,7 @@ class ManifoldSAE(nn.Module):
                 curves = _eval_basis_on_manifold(
                     probe,
                     self.cfg,
-                    self.duchon_centers if self.cfg.atom_basis == "duchon" else None,
+                    self._forward_centers,
                 )
                 out[i] = curves @ self.decoder_blocks[i]
         elif self.cfg.atom_manifold == "sphere":
@@ -1153,7 +1253,7 @@ class ManifoldSAE(nn.Module):
                 curves = _eval_basis_on_manifold(
                     probe,
                     self.cfg,
-                    self.duchon_centers if self.cfg.atom_basis == "duchon" else None,
+                    self._forward_centers,
                 )
                 out[i] = curves @ self.decoder_blocks[i]
         return out

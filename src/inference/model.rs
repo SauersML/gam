@@ -2918,7 +2918,7 @@ impl FittedModel {
     /// exact and taken instead) only for the effectively-linear identity-link
     /// Gaussian. Any model carrying a link wiggle or baseline-time wiggle is
     /// curved regardless of family. This curvature partition mirrors
-    /// `families::strategy::posterior_mean`, the compute path that produces the
+    /// `families::family_runtime::posterior_mean`, the compute path that produces the
     /// corrected mean for each of these families.
     ///
     /// This is the single source of truth shared by the CLI (`gam predict`)

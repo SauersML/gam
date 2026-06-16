@@ -335,7 +335,7 @@ pub fn alo_elpd_from_family(
     spec: &LikelihoodSpec,
     scale: crate::types::LikelihoodScaleMetadata,
 ) -> Option<AloElpd> {
-    use crate::families::strategy::{FamilyStrategy, strategy_for_spec};
+    use crate::families::family_runtime::{FamilyStrategy, strategy_for_spec};
     use crate::pirls::pointwise_loglikelihood_omitting_constants;
 
     let n = y.len();

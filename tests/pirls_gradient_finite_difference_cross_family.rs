@@ -1,4 +1,4 @@
-use gam::families::strategy::{FamilyStrategy, strategy_for_spec};
+use gam::families::family_runtime::{FamilyStrategy, strategy_for_spec};
 use gam::solver::pirls::update_glmvectors_by_family;
 use gam::types::{GlmLikelihoodSpec, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, array};

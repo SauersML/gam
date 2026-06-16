@@ -99,8 +99,8 @@
 //! the coverage proof does not need.
 
 use crate::estimate::{EstimationError, UnifiedFitResult};
-use crate::families::strategy::FamilyStrategy;
-use crate::families::strategy::strategy_for_spec;
+use crate::families::family_runtime::FamilyStrategy;
+use crate::families::family_runtime::strategy_for_spec;
 use crate::inference::alo::compute_alo_diagnostics_from_unified;
 use crate::inference::predict::PredictUncertaintyResult;
 use crate::inference::predict::interval_policy::ResponseBounds;

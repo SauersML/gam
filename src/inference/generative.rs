@@ -541,7 +541,7 @@ pub trait CustomFamilyGenerative: CustomFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::strategy::{FamilyStrategy, strategy_for_spec};
+    use crate::families::family_runtime::{FamilyStrategy, strategy_for_spec};
 
     /// The canonical dispersion picker must read the *fitted* dispersion off the
     /// scale metadata, never the construction seed embedded in the response
