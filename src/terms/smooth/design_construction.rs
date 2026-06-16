@@ -671,8 +671,11 @@ fn apply_global_smooth_identifiability(
                 Err(err) => return Err(err),
             }
         };
-        let design_constrained = if let Some(z) = z_opt.as_ref() {
-            apply_smooth_transform_to_design(design_local, z, &term.name)?
+        let coefficient_gauge = z_opt
+            .as_ref()
+            .map(|z| crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]));
+        let design_constrained = if let Some(gauge) = coefficient_gauge.as_ref() {
+            apply_smooth_transform_to_design(design_local, &gauge.block_transform(0), &term.name)?
         } else {
             design_local
         };
@@ -712,9 +715,8 @@ fn apply_global_smooth_identifiability(
             .penalties_local
             .par_iter()
             .map(|s_local| {
-                if let Some(z) = z_opt.as_ref() {
-                    let zt_s = fast_atb(z, s_local);
-                    fast_ab(&zt_s, z)
+                if let Some(gauge) = coefficient_gauge.as_ref() {
+                    gauge.restrict_penalty(s_local)
                 } else {
                     s_local.clone()
                 }
@@ -739,9 +741,9 @@ fn apply_global_smooth_identifiability(
             filter_active_penalty_candidates(penalty_candidates)?;
         let linear_constraints_constrained =
             if let Some(lin_local) = term.linear_constraints_local.as_ref() {
-                if let Some(z) = z_opt.as_ref() {
+                if let Some(gauge) = coefficient_gauge.as_ref() {
                     Some(LinearInequalityConstraints {
-                        a: lin_local.a.dot(z),
+                        a: lin_local.a.dot(&gauge.block_transform(0)),
                         b: lin_local.b.clone(),
                     })
                 } else {
