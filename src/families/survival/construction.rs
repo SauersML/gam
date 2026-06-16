@@ -3559,6 +3559,8 @@ mod tests {
         baseline_chain_rule_gradient, baseline_offset_theta_partials,
         build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
         build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
+        gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative,
+        gompertz_hazard_components,
         evaluate_survival_marginal_slope_baseline, marginal_slope_baseline_chain_rule_gradient,
         marginal_slope_baseline_chain_rule_hessian, marginal_slope_baseline_offset_theta_partials,
         optimize_survival_baseline_config_with_gradient,
