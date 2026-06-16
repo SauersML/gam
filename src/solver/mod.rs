@@ -19,7 +19,10 @@ pub mod measure_jet_gram_cache;
 pub mod mixture_link;
 pub(crate) mod objective_base;
 pub mod orthogonal_reparam;
-pub mod outer_subsample;
+/// Back-compat re-export: the outer-loop row subsample + `RowSet` moved DOWN to
+/// the crate-root `crate::outer_subsample` lower layer (#1135). Existing
+/// `crate::solver::outer_subsample::*` paths keep resolving.
+pub use crate::outer_subsample;
 pub(crate) mod parallel_strategy;
 pub(crate) mod persistent_warm_start;
 pub mod pirls;
@@ -59,7 +62,8 @@ pub use evidence::{
     union_responsibility_split,
 };
 pub use topology_selector::{
-    AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, Headline, HeldOutDensityProvider,
+    AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, EvidenceCertification, Headline,
+    HeldOutDensityProvider,
     MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, STACKING_CV_FOLDS,
     TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
     TopologyAutoSelectorResult, TopologyRaceParallelCandidate, UnionRungFit, UnionRungResult,
