@@ -2701,7 +2701,8 @@ impl<'a> RemlState<'a> {
         let ds_k_dtau_j_mats = Arc::new(ds_k_dtau_j_mats);
 
         //  Firth-pair wiring — mirrors the original-basis builder.
-        let firth_logit_active = super::outer_eval::reml_robust_jeffreys_link(&self.config).is_some();
+        let firth_logit_active =
+            super::outer_eval::reml_robust_jeffreys_link(&self.config).is_some();
         let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if firth_logit_active {
             let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = bundle
                 .firth_dense_operator

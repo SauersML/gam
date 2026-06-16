@@ -17,6 +17,7 @@ pub mod device_cache;
 pub mod driver;
 #[macro_use]
 pub mod gpu_error;
+pub mod device_runtime;
 pub mod linalg_dispatch;
 pub mod memory;
 pub mod numerics_device;
@@ -24,7 +25,6 @@ pub mod numerics_host;
 pub mod policy;
 pub mod pool;
 pub mod profile;
-pub mod device_runtime;
 pub mod solver;
 
 // Domain-specific GPU kernels are isolated from the infrastructure modules.
@@ -32,12 +32,12 @@ pub mod kernels;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
 pub use device::GpuDeviceInfo;
+pub use device_runtime::GpuRuntime;
 pub use gpu_error::GpuError;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, GpuMixedPrecisionPolicy};
 pub use pool::{balanced_partition, scatter_batched};
 pub use profile::{KernelStat, KernelStatsSnapshot};
-pub use device_runtime::GpuRuntime;
 
 // ---------------------------------------------------------------------------
 // User-facing policy and instrumentation hooks (formerly src/gpu.rs).

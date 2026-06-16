@@ -94,32 +94,33 @@ pub fn sae_streaming_plan_for_shape(
     d_max: usize,
     border_dim: usize,
 ) -> SaeStreamingPlan {
-    let (budget, chunk_window, host_available) = match crate::gpu::device_runtime::GpuRuntime::global() {
-        Some(rt) => {
-            let aggregate_budget: usize = rt
-                .device_ordinals()
-                .iter()
-                .map(|&ord| rt.memory_budget_for(ord))
-                .sum();
-            let per_device_budget = aggregate_budget / rt.device_count().max(1);
-            let window =
-                (per_device_budget / 16).max(SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE);
-            let host_available = sae_host_available_memory_bytes();
-            (
-                (aggregate_budget / 4).min(host_available),
-                window,
-                host_available,
-            )
-        }
-        None => {
-            let (budget, host_available) = sae_host_in_core_budget_bytes();
-            (
-                budget,
-                SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,
-                host_available,
-            )
-        }
-    };
+    let (budget, chunk_window, host_available) =
+        match crate::gpu::device_runtime::GpuRuntime::global() {
+            Some(rt) => {
+                let aggregate_budget: usize = rt
+                    .device_ordinals()
+                    .iter()
+                    .map(|&ord| rt.memory_budget_for(ord))
+                    .sum();
+                let per_device_budget = aggregate_budget / rt.device_count().max(1);
+                let window =
+                    (per_device_budget / 16).max(SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE);
+                let host_available = sae_host_available_memory_bytes();
+                (
+                    (aggregate_budget / 4).min(host_available),
+                    window,
+                    host_available,
+                )
+            }
+            None => {
+                let (budget, host_available) = sae_host_in_core_budget_bytes();
+                (
+                    budget,
+                    SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,
+                    host_available,
+                )
+            }
+        };
     sae_streaming_plan_from_budget(
         n_obs,
         total_basis,

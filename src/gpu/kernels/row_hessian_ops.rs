@@ -258,18 +258,22 @@ impl RowOpsBackend {
         static BACKEND: OnceLock<Result<RowOpsBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
-                let runtime = crate::gpu::device_runtime::GpuRuntime::global().ok_or_else(|| {
-                    GpuError::DriverLibraryUnavailable {
-                        reason: "row_hessian_ops backend: no CUDA runtime available".to_string(),
-                    }
-                })?;
-                let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
-                    .ok_or_else(|| {
-                        gpu_err!(
-                            "row_hessian_ops backend: failed to create CUDA context for device {}",
-                            runtime.selected_device().ordinal
-                        )
+                let runtime =
+                    crate::gpu::device_runtime::GpuRuntime::global().ok_or_else(|| {
+                        GpuError::DriverLibraryUnavailable {
+                            reason: "row_hessian_ops backend: no CUDA runtime available"
+                                .to_string(),
+                        }
                     })?;
+                let ctx = crate::gpu::device_runtime::cuda_context_for(
+                    runtime.selected_device().ordinal,
+                )
+                .ok_or_else(|| {
+                    gpu_err!(
+                        "row_hessian_ops backend: failed to create CUDA context for device {}",
+                        runtime.selected_device().ordinal
+                    )
+                })?;
                 let stream = ctx.default_stream();
                 let ptx = cudarc::nvrtc::compile_ptx(ROW_KERNEL_SOURCE)
                     .map_err(|err| gpu_err!("row_hessian_ops NVRTC compile failed: {err}"))?;

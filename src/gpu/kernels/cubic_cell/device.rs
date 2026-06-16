@@ -313,6 +313,7 @@ impl CubicCellGpuBackend {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::gpu::device_runtime::GpuRuntime;
     use crate::gpu::gpu_error::GpuError;
     use crate::gpu::gpu_error::GpuResultExt;
     use crate::gpu::kernels::cubic_cell::{
@@ -320,7 +321,6 @@ mod tests {
         CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
         try_build_cubic_cell_derivative_moments,
     };
-    use crate::gpu::device_runtime::GpuRuntime;
 
     /// Test-only DtoH helper for cubic-cell device residency parity tests.
     fn download_moments(

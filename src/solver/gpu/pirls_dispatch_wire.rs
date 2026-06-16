@@ -99,9 +99,9 @@ mod linux_impl {
 
     use crate::construction::ReparamResult;
     use crate::gpu::cuda_selected;
+    use crate::gpu::device_runtime::GpuRuntime;
     use crate::gpu::kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
     use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-    use crate::gpu::device_runtime::GpuRuntime;
     use crate::linalg::matrix::SymmetricMatrix;
     use crate::matrix::DesignMatrix;
     use crate::solver::active_set::{

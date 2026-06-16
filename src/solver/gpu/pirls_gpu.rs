@@ -3585,14 +3585,15 @@ mod pcg_device {
                 .get_or_init(|| {
                     let runtime = crate::gpu::device_runtime::GpuRuntime::global()
                         .ok_or_else(|| "pcg backend: no CUDA runtime available".to_string())?;
-                    let ctx =
-                        crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
-                            .ok_or_else(|| {
-                                format!(
-                                    "pcg backend: failed to create CUDA context for device {}",
-                                    runtime.selected_device().ordinal
-                                )
-                            })?;
+                    let ctx = crate::gpu::device_runtime::cuda_context_for(
+                        runtime.selected_device().ordinal,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "pcg backend: failed to create CUDA context for device {}",
+                            runtime.selected_device().ordinal
+                        )
+                    })?;
                     let stream = ctx.default_stream();
                     let ptx = cudarc::nvrtc::compile_ptx(PCG_KERNEL_SOURCE)
                         .map_err(|err| format!("pcg NVRTC compile failed: {err}"))?;
@@ -4688,13 +4689,14 @@ mod pcg_device_parity_tests {
         // test independent of any private kernel-backend symbols.
         let runtime = crate::gpu::device_runtime::GpuRuntime::global()
             .expect("runtime must exist when probe succeeded above");
-        let ctx = match crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal) {
-            Some(c) => c,
-            None => {
-                eprintln!("[pcg_device parity] cuda_context_for failed; skipping");
-                return;
-            }
-        };
+        let ctx =
+            match crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal) {
+                Some(c) => c,
+                None => {
+                    eprintln!("[pcg_device parity] cuda_context_for failed; skipping");
+                    return;
+                }
+            };
         let stream = ctx.default_stream();
         let d_h = match stream.clone_htod(&row_hessians) {
             Ok(s) => s,

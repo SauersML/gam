@@ -73,8 +73,7 @@ mod module_path_lock_tests {
         // Bind the accessor through the canonical `outer_eval` module path as
         // a `fn() -> u64`; this fails to compile if the module is renamed or
         // the accessor's signature drifts.
-        let accessor: fn() -> u64 =
-            crate::solver::estimate::reml::outer_eval::current_outer_iter;
+        let accessor: fn() -> u64 = crate::solver::estimate::reml::outer_eval::current_outer_iter;
         // The fully-qualified type name of the accessor carries the module
         // path, so asserting it contains `outer_eval` locks the honest name as
         // an invariant (a future rename must update this test deliberately).

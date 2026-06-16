@@ -754,8 +754,8 @@ mod cuda {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
 
-        let runtime =
-            crate::gpu::device_runtime::GpuRuntime::global().ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let runtime = crate::gpu::device_runtime::GpuRuntime::global()
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         if runtime.device_count() < 2 {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
@@ -932,8 +932,8 @@ mod cuda {
         }
         // `scatter_batched` has already bound this ordinal's context on this
         // worker thread; the stream below targets that same device.
-        let stream =
-            crate::gpu::device_runtime::cuda_context_for(ordinal).and_then(|ctx| ctx.new_stream().ok())?;
+        let stream = crate::gpu::device_runtime::cuda_context_for(ordinal)
+            .and_then(|ctx| ctx.new_stream().ok())?;
         let solver = DnHandle::new(stream.clone()).ok()?;
         let blas = CudaBlas::new(stream.clone()).ok()?;
         let m = tile.len();
@@ -1014,8 +1014,8 @@ mod cuda {
         }
         // `scatter_batched` has already bound this ordinal's context on this
         // worker thread; the stream below targets that same device.
-        let stream =
-            crate::gpu::device_runtime::cuda_context_for(ordinal).and_then(|ctx| ctx.new_stream().ok())?;
+        let stream = crate::gpu::device_runtime::cuda_context_for(ordinal)
+            .and_then(|ctx| ctx.new_stream().ok())?;
         let blas = CudaBlas::new(stream.clone()).ok()?;
         let m = tile.len();
 
