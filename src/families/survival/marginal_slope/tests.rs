@@ -1594,6 +1594,195 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
     assert!((hess_exact[[primary.g, primary.g]] - hess_rigid[3][3]).abs() < 1e-7);
 }
 
+/// gam#932/#979: INDEPENDENT witness for the survival marginal-slope FLEX
+/// higher-order tower (`row_flex_primary_{third,fourth}_contracted_exact`).
+///
+/// The production CPU↔GPU parity tests
+/// (`block10_cpu_oracle_{third,fourth}_contraction_matches_family_shared_fixtures`)
+/// feed BOTH sides the SAME `flex_primary_timepoint_jets_for_test` inputs the
+/// family produces, so a shared-input bug in the flex calculus passes both — they
+/// are not an independent witness. The rigid K=1 path is independently guarded by
+/// `SurvivalMarginalSlopeRigidNllProgram` (a single-expression `Tower4` algebra
+/// re-derivation, no shared jet code); the flex path was not.
+///
+/// This closes that gap on the `(q0, q1, qd1, g)` primary block: at ZERO
+/// deviation coefficients the flex de-nested calibration / cell-moment / intercept
+/// machinery is fully exercised (it does NOT short-circuit to the rigid kernel —
+/// it runs the partition with zero-coefficient cubics), and its third/fourth
+/// directional contractions over `(q0, q1, qd1, g)` MUST equal the independent
+/// rigid `Tower4` truth. A planted cross-block sign flip must leave the band,
+/// proving resolving power (the #736 genus the shared-input parity cannot catch).
+#[test]
+fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip() {
+    use crate::families::jet_tower::{derived_fourth_contracted, derived_third_contracted};
+
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    // Several fixture rows: events + censored, distinct q-geometry, frailty off
+    // (probit scale = 1; the rigid program and the flex path share the closed
+    // form there) and a non-zero logslope g so the c(g) coupling is live.
+    struct Fix {
+        event: f64,
+        weight: f64,
+        z: f64,
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        g: f64,
+    }
+    let fixtures = [
+        Fix { event: 1.0, weight: 0.75, z: -0.2, q0: -0.4, q1: 0.6, qd1: 0.85, g: 0.32 },
+        Fix { event: 0.0, weight: 1.35, z: -1.15, q0: -1.35, q1: -0.9, qd1: 0.42, g: -0.55 },
+        Fix { event: 1.0, weight: 0.9, z: 0.7, q0: 0.15, q1: 1.05, qd1: 0.6, g: 0.45 },
+    ];
+
+    for fix in &fixtures {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![fix.event]),
+            weights: Arc::new(array![fix.weight]),
+            z: Arc::new(array![fix.z].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            offset_entry: Arc::new(array![fix.q0]),
+            offset_exit: Arc::new(array![fix.q1]),
+            derivative_offset_exit: Arc::new(array![fix.qd1]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        // ZERO deviation coefficients: the flex calculus runs in full, but the
+        // primary NLL reduces to the rigid closed form so the rigid Tower4 is the
+        // exact independent truth on the (q0,q1,qd1,g) block.
+        let block_states = vec![
+            ParameterBlockState { beta: Array1::zeros(1), eta: Array1::zeros(1) },
+            ParameterBlockState { beta: Array1::zeros(0), eta: Array1::zeros(1) },
+            ParameterBlockState { beta: Array1::zeros(0), eta: array![fix.g] },
+            ParameterBlockState {
+                beta: Array1::zeros(score_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(link_runtime.basis_dim()),
+                eta: Array1::zeros(1),
+            },
+        ];
+
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        // The four time/marginal/logslope primaries occupy the leading slots.
+        let block_idx = [primary.q0, primary.q1, primary.qd1, primary.g];
+
+        // Independent rigid Tower4 program at the SAME primaries.
+        let program = SurvivalMarginalSlopeRigidNllProgram {
+            primaries: vec![[fix.q0, fix.q1, fix.qd1, fix.g]],
+            z: vec![fix.z],
+            w: vec![fix.weight],
+            d: vec![fix.event],
+            probit_scale: family.probit_frailty_scale(),
+        };
+
+        // Distinct 4-vector directions confined to (q0,q1,qd1,g); embed each into
+        // the full p-vector at the leading slots for the flex call.
+        let dirs4: [[f64; 4]; 3] = [
+            [0.7, -1.3, 0.5, 0.9],
+            [-0.4, 0.6, -1.1, 0.3],
+            [1.2, 0.2, -0.7, -0.5],
+        ];
+        let embed = |d4: &[f64; 4]| -> Array1<f64> {
+            let mut full = Array1::zeros(p);
+            for (k, &slot) in block_idx.iter().enumerate() {
+                full[slot] = d4[k];
+            }
+            full
+        };
+
+        // ── Third-order: D_dir H over the (q0,q1,qd1,g) block ───────────────
+        for d4 in &dirs4 {
+            let flex_full = family
+                .row_flex_primary_third_contracted_exact(0, &block_states, &embed(d4))
+                .expect("flex third contracted at zero deviation");
+            let rigid = derived_third_contracted(&program, 0, d4).expect("rigid third");
+            let scale = rigid
+                .iter()
+                .flatten()
+                .fold(0.0_f64, |m, v| m.max(v.abs()))
+                .max(1.0);
+            for (u, &bu) in block_idx.iter().enumerate() {
+                for (v, &bv) in block_idx.iter().enumerate() {
+                    let got = flex_full[[bu, bv]];
+                    let want = rigid[u][v];
+                    assert!(
+                        (got - want).abs() <= 1e-7 * scale,
+                        "third[{u},{v}] flex {got:+.9e} != independent rigid tower {want:+.9e} (z={}, event={})",
+                        fix.z, fix.event
+                    );
+                }
+            }
+        }
+
+        // Planted sign-flip tripwire on a representative third-order cross block.
+        {
+            let d4 = &dirs4[0];
+            let flex_full = family
+                .row_flex_primary_third_contracted_exact(0, &block_states, &embed(d4))
+                .expect("flex third contracted (tripwire)");
+            let rigid = derived_third_contracted(&program, 0, d4).expect("rigid third (tripwire)");
+            // (q0, g) cross block — the marginal↔logslope coupling.
+            let want = rigid[0][3];
+            let scale = want.abs().max(1.0);
+            if want.abs() > 1e-6 {
+                let flipped = -flex_full[[primary.q0, primary.g]];
+                assert!(
+                    (flipped - want).abs() > 1e-7 * scale,
+                    "independent rigid tower failed to reject a planted (q0,g) sign flip: flipped {flipped:+.9e} vs truth {want:+.9e}"
+                );
+            }
+        }
+
+        // ── Fourth-order: D_u D_v H over the (q0,q1,qd1,g) block ─────────────
+        let quad_pairs = [(0usize, 1usize), (1, 2), (2, 0)];
+        for &(iu, iv) in &quad_pairs {
+            let du = &dirs4[iu];
+            let dv = &dirs4[iv];
+            let flex_full = family
+                .row_flex_primary_fourth_contracted_exact(0, &block_states, &embed(du), &embed(dv))
+                .expect("flex fourth contracted at zero deviation");
+            let rigid = derived_fourth_contracted(&program, 0, du, dv).expect("rigid fourth");
+            let scale = rigid
+                .iter()
+                .flatten()
+                .fold(0.0_f64, |m, v| m.max(v.abs()))
+                .max(1.0);
+            for (u, &bu) in block_idx.iter().enumerate() {
+                for (v, &bv) in block_idx.iter().enumerate() {
+                    let got = flex_full[[bu, bv]];
+                    let want = rigid[u][v];
+                    assert!(
+                        (got - want).abs() <= 1e-6 * scale,
+                        "fourth[{u},{v}] flex {got:+.9e} != independent rigid tower {want:+.9e} (z={}, event={})",
+                        fix.z, fix.event
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn link_flex_family_supports_second_order_exact_outer_path() {
     let score_runtime = test_deviation_runtime();
