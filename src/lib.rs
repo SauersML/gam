@@ -72,7 +72,6 @@ pub mod kernels;
 pub mod linalg;
 pub(crate) mod parallel_strategy;
 pub mod report;
-pub mod sae_identifiability;
 pub mod solver;
 pub mod sparkline;
 pub mod terms;

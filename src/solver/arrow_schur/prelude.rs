@@ -6,7 +6,7 @@
 
 pub(crate) use super::reduced_solve::ArrowSchurError;
 pub(crate) use super::system::ArrowRowBlock;
-pub(crate) use crate::cache::Fingerprinter;
+pub(crate) use crate::warm_start::Fingerprinter;
 pub(crate) use crate::linalg::faer_ndarray::{FaerArrayView, FaerEigh, FaerLlt};
 pub(crate) use crate::linalg::triangular::{
     cholesky_solve_matrix, cholesky_solve_vector, forward_substitution_lower_matrix,

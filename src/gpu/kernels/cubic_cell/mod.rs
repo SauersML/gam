@@ -318,6 +318,6 @@ mod tests {
     }
 
     // Phase 4 device-residency parity test lives next to the device backend
-    // at `crate::gpu::cubic_cell::device::tests::cubic_cell_device_residency_matches_cpu_all_branches`
+    // at `crate::gpu::kernels::cubic_cell::device::tests::cubic_cell_device_residency_matches_cpu_all_branches`
     // so it can use the in-mod `download_moments` helper directly.
 }

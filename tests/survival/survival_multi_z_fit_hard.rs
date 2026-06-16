@@ -37,7 +37,7 @@ use gam::survival_marginal_slope::{
 };
 use ndarray::{Array1, Array2};
 
-#[path = "common/fixtures.rs"]
+#[path = "../common/fixtures.rs"]
 mod fixtures;
 use fixtures::Splitmix64;
 

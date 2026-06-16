@@ -20,7 +20,7 @@
 //! substrate.
 
 #[cfg(target_os = "linux")]
-use crate::gpu::cubic_cell::{
+use crate::gpu::kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
     GpuCellBranchTag, branch::classify_cell_for_gpu,
 };
@@ -118,7 +118,7 @@ impl CubicCellGpuBackend {
             }
         }
         let source =
-            crate::gpu::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source(max_degree);
+            crate::gpu::kernels::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source(max_degree);
         let ptx = cudarc::nvrtc::compile_ptx(&source).gpu_ctx_with(|err| {
             format!("cubic_cell NVRTC compile (degree={max_degree}) failed: {err}")
         })?;
@@ -313,7 +313,7 @@ impl CubicCellGpuBackend {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use crate::gpu::cubic_cell::{
+    use crate::gpu::kernels::cubic_cell::{
         CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
         CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
         try_build_cubic_cell_derivative_moments,

@@ -1,4 +1,4 @@
-use crate::cache::{EntryKind, Fingerprinter, StoreOptions, WarmStartStore};
+use crate::warm_start::{EntryKind, Fingerprinter, StoreOptions, WarmStartStore};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -271,11 +271,11 @@ fn persistent_store() -> Option<WarmStartStore> {
 /// a long-lived session.
 ///
 /// Used by the workflow dispatcher to fetch a *seed* from a near-match
-/// (data-independent) key. The session's own [`crate::cache::Session::preload`]
-/// stashes the returned entry so the next [`crate::cache::Session::try_load`]
+/// (data-independent) key. The session's own [`crate::warm_start::Session::preload`]
+/// stashes the returned entry so the next [`crate::warm_start::Session::try_load`]
 /// returns it ahead of the (empty) exact-key store lookup. Save writes
 /// always go to the session's own key — the prefix lookup is read-only.
-pub(crate) fn lookup_outer_iterate_payload(seed_key: &str) -> Option<crate::cache::CachedEntry> {
+pub(crate) fn lookup_outer_iterate_payload(seed_key: &str) -> Option<crate::warm_start::CachedEntry> {
     let store = persistent_store()?;
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"outer-iterate-key", seed_key);
@@ -287,18 +287,18 @@ pub(crate) fn lookup_outer_iterate_payload(seed_key: &str) -> Option<crate::cach
     store.lookup_latest(&fp.finalize()).ok().flatten()
 }
 
-/// Open a [`crate::cache::Session`] for outer-iterate (rho-axis) checkpoints.
+/// Open a [`crate::warm_start::Session`] for outer-iterate (rho-axis) checkpoints.
 ///
 /// Uses a different fingerprint tag than the inner `warm-start-key`
 /// absorption (see [`load_json_record`]) so the outer-iterate keyspace
 /// is disjoint from the inner beta-record keyspace —
 /// the two layers persist different payload shapes and must not alias.
-pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::cache::Session>> {
+pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::warm_start::Session>> {
     let store = persistent_store()?;
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"outer-iterate-key", key);
     let fp = fp.finalize();
-    Some(std::sync::Arc::new(crate::cache::Session::open(store, fp)))
+    Some(std::sync::Arc::new(crate::warm_start::Session::open(store, fp)))
 }
 
 /// Persist a descriptor-indexed cross-fit [`FitArtifact`] under the

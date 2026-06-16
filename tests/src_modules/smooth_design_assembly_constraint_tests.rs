@@ -50,7 +50,7 @@
     }
 
     fn structural_shape_hex(spec: &TermCollectionSpec) -> String {
-        let mut h = crate::cache::Fingerprinter::new();
+        let mut h = crate::warm_start::Fingerprinter::new();
         spec.write_structural_shape_hash(&mut h);
         h.finish_hex()
     }

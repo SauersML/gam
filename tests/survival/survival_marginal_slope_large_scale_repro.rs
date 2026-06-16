@@ -27,7 +27,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 
-#[path = "common/fixtures.rs"]
+#[path = "../common/fixtures.rs"]
 mod fixtures;
 use fixtures::Splitmix64;
 use std::sync::{Arc, Mutex, Once, OnceLock};

@@ -71,7 +71,7 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
     /// See [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
     /// Threaded into the internally constructed `BlockwiseFitOptions` by
     /// `fit_survival_location_scale_model`.
-    pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
+    pub cache_session: Option<std::sync::Arc<crate::warm_start::Session>>,
 }
 
 pub struct SurvivalTransformationFitRequest<'a> {
@@ -80,7 +80,7 @@ pub struct SurvivalTransformationFitRequest<'a> {
     /// See [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
     /// Threaded into the internally constructed `BlockwiseFitOptions` by
     /// `fit_survival_transformation_model`.
-    pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
+    pub cache_session: Option<std::sync::Arc<crate::warm_start::Session>>,
 }
 
 #[derive(Clone)]
@@ -91,10 +91,10 @@ pub struct SurvivalTransformationTermSpec {
     pub weights: Array1<f64>,
     pub covariate_spec: TermCollectionSpec,
     pub covariate_offset: Array1<f64>,
-    pub baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
-    pub likelihood_mode: crate::families::survival_construction::SurvivalLikelihoodMode,
+    pub baseline_cfg: crate::families::survival::SurvivalBaselineConfig,
+    pub likelihood_mode: crate::families::survival::SurvivalLikelihoodMode,
     pub time_anchor: f64,
-    pub time_build: crate::families::survival_construction::SurvivalTimeBuildOutput,
+    pub time_build: crate::families::survival::SurvivalTimeBuildOutput,
     pub timewiggle: Option<LinkWiggleFormulaSpec>,
     pub weibull_seed: Option<(f64, f64)>,
     pub ridge_lambda: f64,
@@ -183,23 +183,23 @@ pub trait FamilyFitRequest {
     /// Family-shape hash inputs (link kind, baseline, frailty, etc.) —
     /// everything that changes the coefficient layout. Feeds the exact
     /// cache key.
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter);
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter);
 
     /// Data-independent seed-key hash inputs. Same structural identifiers
     /// as `write_shape_hash` but with the row count deliberately *excluded*
     /// so cross-validation folds / hyperparameter sweeps share a prefix.
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter);
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter);
 
     /// Attach the primary persistent warm-start session. Variants like
     /// `Standard` that open their own session inside the outer optimizer
     /// (see `solver/estimate.rs:2701`) implement this as a `drop(session)`
     /// no-op to avoid double-checkpointing on the same fingerprint.
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>);
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>);
 
     /// Attach a mirror session that receives a broadcast copy of the final
     /// `finalize` write under the seed-prefix keyspace. Variants without
     /// a mirror channel implement this as a `drop(mirror)` no-op.
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>);
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>);
 }
 
 /// Enumerates every `FitRequest` variant in **one** place. Use as
@@ -233,7 +233,7 @@ impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("standard");
         h.write_str(&format!("{:?}", self.family));
         h.write_usize(self.y.len());
@@ -245,7 +245,7 @@ impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
         // each candidate keys distinctly while same-topology refits still hit.
         self.spec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("standard-seed");
         h.write_str(&format!("{:?}", self.family));
         h.write_usize(self.data.ncols());
@@ -253,14 +253,14 @@ impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
         // sphere candidate must not seed a torus candidate across folds.
         self.spec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         // The standard REML path opens its own session inside the outer
         // optimizer via `reml_state.outer_cache_session()` (see
         // `solver/estimate.rs:2701`). Accepting another one here would
         // double-checkpoint the same fingerprint — drop the redundant arc.
         drop(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         // Same reasoning: the outer optimizer handles its own finalize.
         drop(mirror);
     }
@@ -274,7 +274,7 @@ impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("gauss-ls");
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
@@ -291,16 +291,16 @@ impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
         self.spec.meanspec.write_structural_shape_hash(h);
         self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("gauss-ls-seed");
         h.write_usize(self.data.ncols());
         self.spec.meanspec.write_structural_shape_hash(h);
         self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
@@ -313,7 +313,7 @@ impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("binom-ls");
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
@@ -322,17 +322,17 @@ impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
         self.spec.thresholdspec.write_structural_shape_hash(h);
         self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("binom-ls-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.link_kind));
         self.spec.thresholdspec.write_structural_shape_hash(h);
         self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
@@ -345,7 +345,7 @@ impl<'a> FamilyFitRequest for DispersionLocationScaleFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("disp-ls");
         h.write_str(self.spec.kind.family_tag());
         h.write_usize(self.spec.y.len());
@@ -354,17 +354,17 @@ impl<'a> FamilyFitRequest for DispersionLocationScaleFitRequest<'a> {
         self.spec.meanspec.write_structural_shape_hash(h);
         self.spec.log_dispspec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("disp-ls-seed");
         h.write_str(self.spec.kind.family_tag());
         h.write_usize(self.data.ncols());
         self.spec.meanspec.write_structural_shape_hash(h);
         self.spec.log_dispspec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
@@ -377,7 +377,7 @@ impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("surv-ls");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
@@ -386,14 +386,14 @@ impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
         self.spec.thresholdspec.write_structural_shape_hash(h);
         self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("surv-ls-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.inverse_link));
         self.spec.thresholdspec.write_structural_shape_hash(h);
         self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         // Request-level slot is mirrored into the spec slot so the family
         // fit fn sees the session when it constructs its internal
         // BlockwiseFitOptions.
@@ -404,7 +404,7 @@ impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
             self.spec.cache_session = Some(session);
         }
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.spec.cache_mirror_sessions.push(mirror);
     }
 }
@@ -417,7 +417,7 @@ impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("surv-tn");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
@@ -426,14 +426,14 @@ impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
         // Topology identity (#869, extended): see GaussianLocationScale.
         self.spec.covariate_spec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("surv-tn-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.likelihood_mode));
         h.write_str(&self.spec.time_build.basisname);
         self.spec.covariate_spec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         // SurvivalTransformation uses WorkingModelPirlsOptions (different
         // mechanism) for its inner solve; the cache session is parked at
         // the request level so future wiring through
@@ -441,7 +441,7 @@ impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
         // that path's own exact-match warm-start fires independently.
         self.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         // The path's own `persistent_survival_transformation_key`
         // mechanism handles exact-match warm-start; mirror finalize would
         // be a duplicate — drop the unused arc.
@@ -457,7 +457,7 @@ impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("bern-ms");
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
@@ -466,17 +466,17 @@ impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
         self.spec.marginalspec.write_structural_shape_hash(h);
         self.spec.logslopespec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("bern-ms-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
         self.spec.marginalspec.write_structural_shape_hash(h);
         self.spec.logslopespec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
@@ -489,7 +489,7 @@ impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("surv-ms");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
@@ -509,7 +509,7 @@ impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
             None => h.write_bool(false),
         }
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("surv-ms-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
@@ -527,10 +527,10 @@ impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
             None => h.write_bool(false),
         }
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
@@ -543,7 +543,7 @@ impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("lat-surv");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
@@ -551,16 +551,16 @@ impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
         // Topology identity (#869, extended): see GaussianLocationScale.
         self.spec.meanspec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("lat-surv-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
         self.spec.meanspec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
@@ -573,7 +573,7 @@ impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("lat-bin");
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
@@ -581,16 +581,16 @@ impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
         // Topology identity (#869, extended): see GaussianLocationScale.
         self.spec.meanspec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("lat-bin-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
         self.spec.meanspec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
@@ -603,22 +603,22 @@ impl<'a> FamilyFitRequest for TransformationNormalFitRequest<'a> {
     fn n_cols(&self) -> usize {
         self.data.ncols()
     }
-    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_shape_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("tn");
         h.write_usize(self.response.len());
         h.write_usize(self.data.ncols());
         // Topology identity (#869, extended): see GaussianLocationScale.
         self.covariate_spec.write_structural_shape_hash(h);
     }
-    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+    fn write_seed_hash(&self, h: &mut crate::warm_start::Fingerprinter) {
         h.write_str("tn-seed");
         h.write_usize(self.data.ncols());
         self.covariate_spec.write_structural_shape_hash(h);
     }
-    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_session.get_or_insert(session);
     }
-    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         self.options.cache_mirror_sessions.push(mirror);
     }
 }
@@ -652,7 +652,7 @@ impl<'a> FitRequest<'a> {
         // captures dimensions / formula structure unique to this family
         // variant. Two fits with identical family-shape hashes have
         // compatible θ shapes and can warm-start from each other.
-        let mut shape = crate::cache::Fingerprinter::new();
+        let mut shape = crate::warm_start::Fingerprinter::new();
         family_dispatch!(self, r => r.write_shape_hash(&mut shape));
         let shape_hash = shape.finish_hex();
         let (nrows, ncols) = family_dispatch!(self, r => (r.n_obs(), r.n_cols()));
@@ -676,7 +676,7 @@ impl<'a> FitRequest<'a> {
     /// looks up this prefix only when the exact key has no entry — so a
     /// near-match never silently overrides a perfect match.
     pub fn cache_seed_key(&self) -> String {
-        let mut shape = crate::cache::Fingerprinter::new();
+        let mut shape = crate::warm_start::Fingerprinter::new();
         family_dispatch!(self, r => r.write_seed_hash(&mut shape));
         format!(
             "{}/family={}/seed/{}",
@@ -693,7 +693,7 @@ impl<'a> FitRequest<'a> {
     /// from this run. Checkpoints are mirrored through the same rate-limited
     /// session path as the primary cache, so interrupted runs can still seed
     /// later related fits instead of waiting for a successful final result.
-    pub fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+    pub fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::warm_start::Session>) {
         family_dispatch!(self, r => <_ as FamilyFitRequest>::attach_cache_mirror(r, mirror))
     }
 
@@ -703,7 +703,7 @@ impl<'a> FitRequest<'a> {
     /// (`request.options.cache_session`) or top-level `cache_session`
     /// field, whichever is the variant's natural slot. Idempotent —
     /// existing sessions are not overwritten so callers can pre-attach.
-    pub fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+    pub fn attach_cache_session(&mut self, session: std::sync::Arc<crate::warm_start::Session>) {
         family_dispatch!(self, r => <_ as FamilyFitRequest>::attach_cache_session(r, session))
     }
 }
@@ -728,13 +728,13 @@ pub struct SurvivalLocationScaleFitResult {
 pub struct SurvivalTransformationFitResult {
     pub fit: UnifiedFitResult,
     pub resolvedspec: TermCollectionSpec,
-    pub baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
-    pub likelihood_mode: crate::families::survival_construction::SurvivalLikelihoodMode,
+    pub baseline_cfg: crate::families::survival::SurvivalBaselineConfig,
+    pub likelihood_mode: crate::families::survival::SurvivalLikelihoodMode,
     /// Persistable snapshot of the time basis used during the fit. Replaces
     /// six previously flat fields (basisname / degree / knots / keep_cols /
     /// smooth_lambda / anchor) so the FFI save path consumes a single
     /// source-of-truth value rather than threading siblings independently.
-    pub time_basis: crate::families::survival_construction::SavedSurvivalTimeBasis,
+    pub time_basis: crate::families::survival::SavedSurvivalTimeBasis,
     pub time_base_ncols: usize,
     pub baseline_timewiggle: Option<TimeWiggleBlockInput>,
 }

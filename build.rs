@@ -15,7 +15,7 @@ fn main() {
         .as_secs();
     println!("cargo:rustc-env=GAM_BUILD_TIMESTAMP={timestamp}");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/terms/penalties");
+    println!("cargo:rerun-if-changed=src/terms/analytic_penalties/manifest.rs");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
@@ -689,8 +689,11 @@ struct PenaltyWrapperManifest {
 }
 
 fn emit_python_penalty_manifest(manifest_dir: &Path) -> std::io::Result<()> {
-    let penalties_dir = manifest_dir.join("src").join("terms").join("penalties");
-    let registry = fs::read_to_string(penalties_dir.join("mod.rs"))?;
+    let penalties_dir = manifest_dir
+        .join("src")
+        .join("terms")
+        .join("analytic_penalties");
+    let registry = fs::read_to_string(penalties_dir.join("manifest.rs"))?;
     let mut wrappers = Vec::new();
     for line in registry.lines() {
         let trimmed = line.trim();

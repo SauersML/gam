@@ -9,7 +9,7 @@
 
 use ndarray::Array1;
 
-use crate::gpu::arrow_schur::{
+use crate::gpu::kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
 };
 use crate::solver::arrow_schur::{ArrowSchurError, ArrowSchurSystem};
@@ -271,7 +271,7 @@ impl DeviceResidentArrowWorkspace {
 
     fn finish_step(
         &self,
-        solution: crate::gpu::arrow_schur::ArrowSchurGpuSolution,
+        solution: crate::gpu::kernels::arrow_schur::ArrowSchurGpuSolution,
         used_device: bool,
     ) -> DeviceResidentArrowStep {
         DeviceResidentArrowStep {

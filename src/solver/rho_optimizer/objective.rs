@@ -590,7 +590,7 @@ pub trait OuterObjective {
 //
 // `CheckpointingObjective` wraps any `OuterObjective` to write a copy of
 // `(rho, cost, eval_id)` to disk on each finite evaluation. The on-disk
-// [`crate::cache::Session`] rate-limits writes (≥2 s gap unless this iterate
+// [`crate::warm_start::Session`] rate-limits writes (≥2 s gap unless this iterate
 // strictly improves on the best-so-far) so a tight inner loop never thrashes
 // the filesystem. The same checkpoint is also broadcast to optional mirror
 // sessions, which lets interrupted exact-key runs seed later related fits via
@@ -750,7 +750,7 @@ pub(crate) enum CacheSeedDecision {
 }
 
 pub(crate) fn classify_cache_entry_for_outer(
-    loaded: &crate::cache::LoadedEntry,
+    loaded: &crate::warm_start::LoadedEntry,
     expected_rho_dim: usize,
 ) -> CacheSeedDecision {
     let entry = &loaded.entry;
@@ -777,7 +777,7 @@ pub(crate) fn classify_cache_entry_for_outer(
             all_rho_finite: Some(false),
         };
     }
-    if loaded.source == LoadSource::Exact && entry.kind == crate::cache::EntryKind::Final {
+    if loaded.source == LoadSource::Exact && entry.kind == crate::warm_start::EntryKind::Final {
         return CacheSeedDecision::ExactFinal {
             rho: cached_rho,
             beta: payload.beta,
@@ -806,7 +806,7 @@ pub(crate) fn classify_cache_entry_for_outer(
 }
 
 pub(crate) fn cache_entry_would_help_outer(
-    loaded: &crate::cache::LoadedEntry,
+    loaded: &crate::warm_start::LoadedEntry,
     expected_rho_dim: usize,
 ) -> bool {
     matches!(

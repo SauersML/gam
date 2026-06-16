@@ -28,7 +28,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         {
             return None;
         }
-        let mut hasher = crate::cache::Fingerprinter::new();
+        let mut hasher = crate::warm_start::Fingerprinter::new();
         hasher.write_str("survival-marginal-slope-family");
         hasher.write_usize(self.n);
         hasher.write_usize(self.event.len());

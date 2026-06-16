@@ -147,10 +147,10 @@ pub(crate) struct SurvivalLocationScaleSpec {
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
     /// Persistent warm-start cache session threaded from the workflow
     /// dispatcher. See [`BlockwiseFitOptions::cache_session`].
-    pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
+    pub cache_session: Option<std::sync::Arc<crate::warm_start::Session>>,
     /// Persistent warm-start mirror sessions; see
     /// [`BlockwiseFitOptions::cache_mirror_sessions`].
-    pub cache_mirror_sessions: Vec<std::sync::Arc<crate::cache::Session>>,
+    pub cache_mirror_sessions: Vec<std::sync::Arc<crate::warm_start::Session>>,
 }
 
 #[derive(Clone)]
@@ -197,11 +197,11 @@ pub struct SurvivalLocationScaleTermSpec {
     /// Persistent warm-start cache session, threaded from the workflow
     /// dispatcher. See
     /// [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
-    pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
+    pub cache_session: Option<std::sync::Arc<crate::warm_start::Session>>,
     /// Persistent warm-start mirror sessions, threaded from the workflow
     /// dispatcher. See
     /// [`crate::families::custom_family::BlockwiseFitOptions::cache_mirror_sessions`].
-    pub cache_mirror_sessions: Vec<std::sync::Arc<crate::cache::Session>>,
+    pub cache_mirror_sessions: Vec<std::sync::Arc<crate::warm_start::Session>>,
 }
 
 pub const DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD: f64 = 1e-6;

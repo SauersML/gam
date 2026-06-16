@@ -1608,21 +1608,21 @@ fn cause_specific_survival_rho_prior(
     Ok(crate::types::RhoPrior::Independent(priors))
 }
 
-fn hash_workflow_array_view(hasher: &mut crate::cache::Fingerprinter, array: ArrayView1<'_, f64>) {
+fn hash_workflow_array_view(hasher: &mut crate::warm_start::Fingerprinter, array: ArrayView1<'_, f64>) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_f64(value);
     }
 }
 
-fn hash_workflow_u8_array(hasher: &mut crate::cache::Fingerprinter, array: ArrayView1<'_, u8>) {
+fn hash_workflow_u8_array(hasher: &mut crate::warm_start::Fingerprinter, array: ArrayView1<'_, u8>) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_usize(usize::from(value));
     }
 }
 
-fn hash_workflow_array2(hasher: &mut crate::cache::Fingerprinter, array: ArrayView2<'_, f64>) {
+fn hash_workflow_array2(hasher: &mut crate::warm_start::Fingerprinter, array: ArrayView2<'_, f64>) {
     hasher.write_usize(array.nrows());
     hasher.write_usize(array.ncols());
     for row in array.rows() {
@@ -1633,7 +1633,7 @@ fn hash_workflow_array2(hasher: &mut crate::cache::Fingerprinter, array: ArrayVi
 }
 
 fn hash_workflow_design_matrix(
-    hasher: &mut crate::cache::Fingerprinter,
+    hasher: &mut crate::warm_start::Fingerprinter,
     matrix: &crate::matrix::DesignMatrix,
 ) {
     let dense = matrix.to_dense();
@@ -1658,7 +1658,7 @@ fn persistent_survival_transformation_key(
     opts: &crate::pirls::WorkingModelPirlsOptions,
     n_cols: usize,
 ) -> String {
-    let mut hasher = crate::cache::Fingerprinter::new();
+    let mut hasher = crate::warm_start::Fingerprinter::new();
     hasher.write_str("gamfit-persistent-survival-transformation-working-pirls");
     // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
     // library version bumps don't invalidate users' on-disk warm-start

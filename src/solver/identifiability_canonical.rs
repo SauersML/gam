@@ -41,7 +41,7 @@ use crate::families::custom_family::{
     BlockEffectiveJacobian, CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec,
     PenaltyMatrix,
 };
-use crate::families::identifiability_compiler::{
+use crate::families::identifiability::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
@@ -1822,7 +1822,7 @@ mod tests {
     /// directions, and a non-overlapping configuration must keep full width.
     #[test]
     fn orthogonalize_design_blocks_drops_only_overlap() {
-        use crate::families::identifiability_compiler::orthogonalize_design_blocks;
+        use crate::families::identifiability::compiler::orthogonalize_design_blocks;
         let n = 40;
         let x = linspace(n);
         let mut anchor = Array2::<f64>::zeros((n, 2));

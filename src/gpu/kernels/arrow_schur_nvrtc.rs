@@ -1,7 +1,7 @@
 //! Layer D + E NVRTC kernels for the device-resident Arrow-Schur Newton solve.
 //!
 //! Layer D — `arrow_schur_forward_pgroup` — replaces the three separate
-//! cuSOLVER + cuBLAS launches in [`crate::gpu::arrow_schur`] (batched POTRF,
+//! cuSOLVER + cuBLAS launches in [`crate::gpu::kernels::arrow_schur`] (batched POTRF,
 //! batched TRSM on `g`, batched TRSM on `B`, sequential GEMM/GEMV Schur
 //! accumulation) with a single NVRTC launch per p-group. Each CUDA block owns
 //! one row block `i`:
@@ -369,7 +369,7 @@ pub fn forward_kernel_source(p_max: usize, r_template: usize) -> String {
 }
 
 /// Whether the caller-provided system can route through the Layer D + E
-/// NVRTC fused path. Centralised so [`crate::gpu::arrow_schur::solve`] and
+/// NVRTC fused path. Centralised so [`crate::gpu::kernels::arrow_schur::solve`] and
 /// future bench harnesses share the same admission rule.
 #[inline]
 #[must_use]

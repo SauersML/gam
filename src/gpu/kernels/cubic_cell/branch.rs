@@ -10,7 +10,7 @@
 //! decide cell branch, so a future kernel landing cannot drift on tolerance.
 
 use crate::families::cubic_cell_kernel::{DenestedCubicCell, ExactCellBranch, branch_cell};
-use crate::gpu::cubic_cell::{CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell};
+use crate::gpu::kernels::cubic_cell::{CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell};
 
 /// Result of classifying a single cell for GPU dispatch.
 ///

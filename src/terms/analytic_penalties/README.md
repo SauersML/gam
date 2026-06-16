@@ -1,9 +1,10 @@
 # Analytic Penalty Manifests
 
-This directory is the registry layer for analytic penalties implemented in
-`src/terms/analytic_penalties.rs` and `src/terms/sheaf.rs`.
+This directory holds the analytic penalty primitives plus their registry layer
+(`registry.rs`) and the manifest layer (`manifest.rs`); penalties are also drawn
+from `src/terms/sheaf.rs`.
 
-`mod.rs` defines `PenaltyManifest` metadata for every registered penalty:
+`manifest.rs` defines `PenaltyManifest` metadata for every registered penalty:
 
 - `KIND_TAG`: serialized descriptor kind.
 - `PYTHON_WRAPPER`: Python wrapper class exposed through `gamfit`.

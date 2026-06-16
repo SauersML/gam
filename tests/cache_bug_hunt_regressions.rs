@@ -1,4 +1,4 @@
-use gam::cache::{EntryKind, Fingerprint, Fingerprinter, StoreOptions, WarmStartStore};
+use gam::warm_start::{EntryKind, Fingerprint, Fingerprinter, StoreOptions, WarmStartStore};
 use std::fs;
 use std::sync::{Arc, Barrier};
 use std::thread;

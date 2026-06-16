@@ -109,7 +109,7 @@ pub(crate) use gam::survival::{
     MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec, survival_event_code_from_value,
 };
 
-pub(crate) use gam::survival_construction::{
+pub(crate) use gam::survival::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
     baseline_chain_rule_gradient, build_survival_time_basis,

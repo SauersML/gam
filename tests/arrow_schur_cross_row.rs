@@ -183,7 +183,7 @@ fn cross_row_total_variation_solve_satisfies_full_newton_equations() {
     )
     .expect("TV penalty constructs");
     assert!(
-        !<TotalVariationPenalty as gam::terms::penalties::PenaltyManifest>::ROW_BLOCK_DIAGONAL,
+        !<TotalVariationPenalty as gam::terms::analytic_penalties::PenaltyManifest>::ROW_BLOCK_DIAGONAL,
         "TV must be classified cross-row for this test to exercise the new path"
     );
 

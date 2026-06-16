@@ -632,7 +632,7 @@ fn bernoulli_z(eta_used: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
 /// `erfc(-x/√2)/2 = Φ(x)` used by libstd. Keeps mass at the tails accurate.
 #[inline]
 fn standard_normal_cdf(x: f64) -> f64 {
-    0.5 * super::numerics_host::erfc(-x * std::f64::consts::FRAC_1_SQRT_2)
+    0.5 * crate::gpu::numerics_host::erfc(-x * std::f64::consts::FRAC_1_SQRT_2)
 }
 
 #[inline]
@@ -715,7 +715,7 @@ impl PirlsRowBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let parts = super::backend_probe::probe_cuda_backend("pirls_row")?;
+        let parts = crate::gpu::backend_probe::probe_cuda_backend("pirls_row")?;
         Ok(Self {
             inner: PirlsRowBackendLinux {
                 ctx: parts.ctx,
@@ -2149,7 +2149,7 @@ mod pirls_row_gpu_tests {
         // and must agree with the `cfg(target_os = "linux")` selector that
         // gates the rest of the module-cache code path.
         assert_eq!(PirlsRowBackend::compiled(), cfg!(target_os = "linux"));
-        if super::super::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!("[pirls_row_gpu test] no CUDA runtime — skipping device compile test");
             return;
         }
@@ -2179,7 +2179,7 @@ mod pirls_row_gpu_tests {
     /// the Stage 1 cached built-in path.
     #[test]
     fn jit_glm_kernel_matches_builtin_byte_identical() {
-        if super::super::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!("[stage_6_jit] no CUDA runtime — skipping");
             return;
         }
@@ -2192,7 +2192,7 @@ mod pirls_row_gpu_tests {
             let family = PirlsRowFamily::BernoulliLogit;
             let curvature = CurvatureMode::Fisher;
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+            let stream = crate::gpu::backend_probe::probe_cuda_backend("pirls_row")
                 .expect("shared backend probe")
                 .stream;
 
@@ -2274,7 +2274,7 @@ mod pirls_row_gpu_tests {
     /// must match the built-in kernel exactly.
     #[test]
     fn jit_raw_body_kernel_matches_builtin_gaussian_byte_identical() {
-        if super::super::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!("[stage_6_jit_raw] no CUDA runtime — skipping");
             return;
         }
@@ -2302,7 +2302,7 @@ mod pirls_row_gpu_tests {
             let family = PirlsRowFamily::GaussianIdentity;
             let curvature = CurvatureMode::Fisher;
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+            let stream = crate::gpu::backend_probe::probe_cuda_backend("pirls_row")
                 .expect("shared backend probe")
                 .stream;
 
@@ -2571,7 +2571,7 @@ mod pirls_row_gpu_tests {
     /// per the dead-pub-scanner rule.
     #[test]
     fn launch_row_reweight_matches_cpu_reference_on_device() {
-        if super::super::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!("[pirls_row_gpu test] no CUDA runtime — skipping launcher parity test");
             return;
         }
@@ -2584,7 +2584,7 @@ mod pirls_row_gpu_tests {
             let etas = [-3.0_f64, -0.5, 0.0, 0.5, 3.0, 10.0, -10.0, 1.5];
             let n = etas.len();
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+            let stream = crate::gpu::backend_probe::probe_cuda_backend("pirls_row")
                 .expect("shared backend probe")
                 .stream;
 
@@ -2718,7 +2718,7 @@ mod pirls_row_gpu_tests {
     ///    information ≡ Fisher information by construction.
     #[test]
     fn gpu_observed_parity() {
-        if super::super::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!("[gpu_observed_parity] no CUDA runtime — skipping");
             return;
         }
@@ -2733,7 +2733,7 @@ mod pirls_row_gpu_tests {
                 .collect();
 
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+            let stream = crate::gpu::backend_probe::probe_cuda_backend("pirls_row")
                 .expect("shared backend probe")
                 .stream;
 
@@ -2841,7 +2841,7 @@ mod pirls_row_gpu_tests {
     /// the v100-bench-runner explicitly opts in via `--ignored`.
     #[test]
     fn gpu_observed_parity_end_to_end_n1000() {
-        if super::super::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!("[gpu_observed_parity_end_to_end_n1000] no CUDA runtime — skipping");
             return;
         }
@@ -2859,7 +2859,7 @@ mod pirls_row_gpu_tests {
                 .collect();
 
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+            let stream = crate::gpu::backend_probe::probe_cuda_backend("pirls_row")
                 .expect("shared backend probe")
                 .stream;
 
@@ -2993,7 +2993,7 @@ mod pirls_row_gpu_tests {
     /// `#[ignore]` so v100-bench-runner picks it up via `--ignored`.
     #[test]
     fn gpu_jit_level_b_raw_body_end_to_end_all_families_n1000() {
-        if super::super::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
             eprintln!(
                 "[gpu_jit_level_b_raw_body_end_to_end_all_families_n1000] no CUDA runtime — skipping"
             );
@@ -3006,7 +3006,7 @@ mod pirls_row_gpu_tests {
             let curvature = CurvatureMode::Fisher;
 
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+            let stream = crate::gpu::backend_probe::probe_cuda_backend("pirls_row")
                 .expect("shared backend probe")
                 .stream;
 

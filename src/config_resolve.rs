@@ -1,5 +1,5 @@
 use crate::families::lognormal_kernel::{FrailtySpec, HazardLoading};
-use crate::families::survival_construction::{
+use crate::families::survival::{
     SurvivalLikelihoodMode, parse_survival_likelihood_mode,
 };
 use crate::inference::formula_dsl::parse_link_choice;
@@ -7,7 +7,7 @@ use crate::inference::model::GroupMetadata;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::solver::build_analytic_penalty_registry_from_descriptors;
 use crate::solver::workflow::{CtnStage1Recipe, FitConfig};
-use crate::survival_construction::parse_survival_distribution;
+use crate::survival::parse_survival_distribution;
 use crate::survival_location_scale::residual_distribution_inverse_link;
 use crate::transformation_normal::TransformationNormalConfig;
 use crate::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};

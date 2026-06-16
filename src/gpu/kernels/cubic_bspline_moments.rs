@@ -829,7 +829,7 @@ impl CubicMomentBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let parts = super::backend_probe::probe_cuda_backend("cubic_bspline_moments")?;
+        let parts = crate::gpu::backend_probe::probe_cuda_backend("cubic_bspline_moments")?;
         Ok(CubicMomentBackend {
             inner: CubicMomentBackendInner {
                 ctx: parts.ctx,

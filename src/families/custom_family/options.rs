@@ -572,14 +572,14 @@ pub struct BlockwiseFitOptions {
     /// dispatcher so every family flows through one chokepoint; family
     /// code never has to remember to wire it. This mirrors the standard
     /// REML cache wiring in `solver/estimate.rs:2701`.
-    pub cache_session: Option<Arc<crate::cache::Session>>,
+    pub cache_session: Option<Arc<crate::warm_start::Session>>,
     /// Optional mirror sessions that receive a copy of the final-result
     /// finalize() write. Used by the workflow dispatcher to broadcast a
     /// converged ρ to additional keyspace(s) — notably the data-
     /// independent seed prefix — so future fits with related structure
     /// can warm-start from this run. Writes still pass through the session
     /// rate limiter, so mirroring checkpoints does not add unbounded I/O.
-    pub cache_mirror_sessions: Vec<Arc<crate::cache::Session>>,
+    pub cache_mirror_sessions: Vec<Arc<crate::warm_start::Session>>,
     /// Optional bundle of cross-block (full-width) penalties, paired with
     /// their current `log λ` values from the outer ρ vector. When `Some`,
     /// the inner joint-Newton primitives add the contributions

@@ -21,8 +21,8 @@
 use crate::families::cubic_cell_kernel::{
     DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
 };
-use crate::gpu::cubic_cell::branch::classify_cell_for_gpu;
-use crate::gpu::cubic_cell::{
+use crate::gpu::kernels::cubic_cell::branch::classify_cell_for_gpu;
+use crate::gpu::kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellMomentStatus, GpuCellBranchTag,
 };
 
@@ -115,7 +115,7 @@ mod tests {
     use crate::families::cubic_cell_kernel::{
         DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
     };
-    use crate::gpu::cubic_cell::{
+    use crate::gpu::kernels::cubic_cell::{
         CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuCellBranchTag,
         GpuDenestedCubicCell,
     };

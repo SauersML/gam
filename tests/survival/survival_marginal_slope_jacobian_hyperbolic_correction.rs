@@ -62,7 +62,7 @@ use ndarray::{Array1, Array2, Array3};
 use std::any::Any;
 use std::sync::Arc;
 
-#[path = "common/fixtures.rs"]
+#[path = "../common/fixtures.rs"]
 mod fixtures;
 use fixtures::Splitmix64;
 

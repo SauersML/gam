@@ -7,12 +7,12 @@ use super::*;
 //      needed for both the audit gate and the compile step.
 //   2. `audit_identifiability_channel_aware` — structural rank gate using
 //      the BMS K=1 row Jacobian; catches full aliasing before any install.
-//   3. `identifiability_compiler::compile` — W-metric Gram + eigendecomp,
+//   3. `identifiability::compiler::compile` — W-metric Gram + eigendecomp,
 //      produces the V selector and anchor-correction M.
 //   4. Install V/M into the `DeviationRuntime` via `install_compiled_flex_block`,
 //      rebuild the block's design + penalties, and return `FlexCompileOutcome`.
 //
-// The K=1 row-Jacobian math still runs through `identifiability_compiler::compile`,
+// The K=1 row-Jacobian math still runs through `identifiability::compiler::compile`,
 // so there is exactly one cross-block residualisation math implementation in
 // the codebase.
 
@@ -38,12 +38,12 @@ pub(crate) struct BmsFlexBlockContext {
     /// `BernoulliDenseDesignOperator` per anchor, then one for the candidate
     /// (trailing). Indices align with `ordering`.
     pub(super) operators:
-        Vec<std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>>,
+        Vec<std::sync::Arc<dyn crate::families::identifiability::compiler::RowJacobianOperator>>,
     /// Block-order tags parallel to `operators`.
-    pub(super) ordering: Vec<crate::families::identifiability_compiler::BlockOrder>,
+    pub(super) ordering: Vec<crate::families::identifiability::compiler::BlockOrder>,
     /// W-metric row Hessian built from the validated `training_row_weights`.
     pub(super) row_hess:
-        crate::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian,
+        crate::families::identifiability::bernoulli::BernoulliRowHessian,
     /// Dense candidate basis at training rows (n × p_candidate), cached to
     /// avoid a second `design()` call after context construction.
     pub(super) candidate_design_dense: Array2<f64>,
@@ -58,7 +58,7 @@ pub(crate) struct BmsFlexBlockContext {
 /// Validate inputs, densify anchors, stack N_train, and assemble the
 /// `BernoulliDenseDesignOperator` / `BlockOrder` / `BernoulliRowHessian`
 /// vectors needed by both [`audit_identifiability_channel_aware`] and
-/// [`identifiability_compiler::compile`].
+/// [`identifiability::compiler::compile`].
 ///
 /// Returns `Ok(None)` when the anchor union is empty (no-anchor fast path).
 pub(crate) fn build_bms_flex_block_context(
@@ -72,10 +72,10 @@ pub(crate) fn build_bms_flex_block_context(
     training_row_weights: &Array1<f64>,
 ) -> Result<Option<BmsFlexBlockContext>, String> {
     use super::deviation_runtime::AnchorComponentTag;
-    use crate::families::bernoulli_marginal_slope_identifiability::{
+    use crate::families::identifiability::bernoulli::{
         BernoulliDenseDesignOperator, BernoulliRowHessian,
     };
-    use crate::families::identifiability_compiler::{BlockOrder, RowJacobianOperator};
+    use crate::families::identifiability::compiler::{BlockOrder, RowJacobianOperator};
 
     let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
     let n = candidate_design.nrows();
@@ -309,7 +309,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     flex_anchors: &[&Array2<f64>],
     training_row_weights: &Array1<f64>,
 ) -> Result<FlexCompileOutcome, String> {
-    use crate::families::identifiability_compiler::compile;
+    use crate::families::identifiability::compiler::compile;
     use crate::solver::identifiability_audit::audit_identifiability_channel_aware;
 
     // Fast path: zero-column candidate carries nothing to residualise.

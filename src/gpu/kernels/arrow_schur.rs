@@ -156,7 +156,7 @@ pub fn solve_arrow_newton_step(
         // NVRTC kernel replaces the cuSOLVER/cuBLAS Layer A+B+C path with a
         // single per-row block. Layer C↔D parity (math block 3 §16 test 6)
         // requires both paths to agree to 1e-10 on identical inputs.
-        if crate::gpu::arrow_schur_nvrtc::system_admits_fused_path(sys) {
+        if crate::gpu::kernels::arrow_schur_nvrtc::system_admits_fused_path(sys) {
             match cuda::solve_fused(sys, ridge_t, ridge_beta) {
                 Ok(sol) => return Ok(sol),
                 // RidgeBumpRequired must surface to the outer escalation loop —
@@ -239,7 +239,7 @@ pub fn solve_arrow_newton_step_fused_force(
             reason: "ridge is NaN".to_string(),
         });
     }
-    if crate::gpu::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k).is_none() {
+    if crate::gpu::kernels::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k).is_none() {
         return Err(ArrowSchurGpuFailure::Unavailable);
     }
     #[cfg(not(target_os = "linux"))]
@@ -1559,7 +1559,7 @@ mod cuda {
     /// the kernel source.
     struct FusedModuleCache {
         modules:
-            Mutex<HashMap<crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey, Arc<CudaModule>>>,
+            Mutex<HashMap<crate::gpu::kernels::arrow_schur_nvrtc::FusedModuleCacheKey, Arc<CudaModule>>>,
     }
 
     fn fused_module_cache() -> &'static FusedModuleCache {
@@ -1571,7 +1571,7 @@ mod cuda {
 
     fn fused_module_for(
         ctx: &Arc<CudaContext>,
-        key: crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey,
+        key: crate::gpu::kernels::arrow_schur_nvrtc::FusedModuleCacheKey,
     ) -> Result<Arc<CudaModule>, ArrowSchurGpuFailure> {
         let cache = fused_module_cache();
         if let Ok(guard) = cache.modules.lock() {
@@ -1579,7 +1579,7 @@ mod cuda {
                 return Ok(existing.clone());
             }
         }
-        let src = crate::gpu::arrow_schur_nvrtc::forward_kernel_source(
+        let src = crate::gpu::kernels::arrow_schur_nvrtc::forward_kernel_source(
             key.p_max as usize,
             key.r_template as usize,
         );
@@ -2499,7 +2499,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
         let n = sys.rows.len();
         let d = sys.d;
         let k = sys.k;
-        let plan = crate::gpu::arrow_schur_nvrtc::plan_fused_launch(n, d, k)
+        let plan = crate::gpu::kernels::arrow_schur_nvrtc::plan_fused_launch(n, d, k)
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let p_max = plan.p_max;
         let r_template = plan.r_template;
@@ -2514,7 +2514,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
             .new_stream()
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         let cap = &runtime.device.capability;
-        let key = crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey {
+        let key = crate::gpu::kernels::arrow_schur_nvrtc::FusedModuleCacheKey {
             cc_major: cap.compute_major,
             cc_minor: cap.compute_minor,
             p_max: p_max as u32,
@@ -2754,7 +2754,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
         let n = sys.rows.len();
         let d = sys.d;
         let k = sys.k;
-        let plan = crate::gpu::arrow_schur_nvrtc::plan_fused_launch(n, d, k)
+        let plan = crate::gpu::kernels::arrow_schur_nvrtc::plan_fused_launch(n, d, k)
             .ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
         let p_max = plan.p_max;
         let r_template = plan.r_template;
@@ -2769,7 +2769,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
             .new_stream()
             .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
         let cap = &runtime.device.capability;
-        let key = crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey {
+        let key = crate::gpu::kernels::arrow_schur_nvrtc::FusedModuleCacheKey {
             cc_major: cap.compute_major,
             cc_minor: cap.compute_minor,
             p_max: p_max as u32,

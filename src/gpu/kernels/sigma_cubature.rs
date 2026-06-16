@@ -182,9 +182,9 @@ fn validate_sigma_point_inputs(p: usize, per_sigma: &[SigmaPointGpuInput]) -> Re
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use crate::gpu::pirls_row::{CurvatureMode, PirlsRowFamily};
+    use crate::gpu::kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
     use crate::gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-    use crate::gpu::sigma_cubature::SigmaPointGpuInput;
+    use crate::gpu::kernels::sigma_cubature::SigmaPointGpuInput;
     use crate::linalg::utils::matrix_inversewith_regularization;
     use ndarray::{Array1, Array2, ArrayView1};
     type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
@@ -232,7 +232,7 @@ mod linux_impl {
         convergence_tol: f64,
         max_iter: usize,
     ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
-        use crate::gpu::sigma_cubature::pool_size;
+        use crate::gpu::kernels::sigma_cubature::pool_size;
         use crate::solver::gpu::pirls_gpu;
 
         let m = per_sigma.len();

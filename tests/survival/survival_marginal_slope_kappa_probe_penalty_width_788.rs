@@ -32,7 +32,7 @@ use gam::{
 };
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
-#[path = "common/fixtures.rs"]
+#[path = "../common/fixtures.rs"]
 mod fixtures;
 use fixtures::Splitmix64;
 
