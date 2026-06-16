@@ -19,7 +19,7 @@
 
 use faer::Side as FaerSide;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
-use gam::terms::sae::identifiability::{GeneratorFamily, VerdictProvenance};
+use gam::identifiability::sae::{GeneratorFamily, VerdictProvenance};
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,

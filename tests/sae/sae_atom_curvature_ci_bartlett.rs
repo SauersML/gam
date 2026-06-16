@@ -23,7 +23,7 @@
 
 use gam::inference::row_metric::RowMetric;
 use gam::inference::structure_evidence::StructureLedger;
-use gam::terms::sae::identifiability::{
+use gam::identifiability::sae::{
     AtomInnerFit, AtomTopology, FittedAtom, FittedSaeManifold, dictionary_report,
 };
 use ndarray::{Array1, Array2};

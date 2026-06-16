@@ -52,12 +52,12 @@
 use gam::custom_family::{
     BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian,
 };
-use gam::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
+use gam::identifiability::families::compiler::{IdentityRowHessian, RowJacobianOperator};
 use gam::families::survival_marginal_slope::{
     LogslopeBlockJacobian, SurvivalMarginalSlopeFamilyScalars,
 };
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::audit_identifiability_channel_aware;
+use gam::identifiability::audit::audit_identifiability_channel_aware;
 use ndarray::{Array1, Array2, Array3};
 use std::any::Any;
 use std::sync::Arc;

@@ -25,7 +25,7 @@ use gam::families::marginal_slope_shared::{
     AUTO_OUTER_MIN_K_FLOOR, AUTO_OUTER_WORK_BUDGET, AutoOuterCapReason, AutoOuterSubsampleOptions,
     auto_outer_score_subsample, maybe_install_auto_outer_subsample,
 };
-use gam::solver::identifiability_audit::audit_identifiability;
+use gam::identifiability::audit::audit_identifiability;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -381,7 +381,7 @@ fn h2b_release_log_string_absent_from_current_source() {
 #[test]
 fn h2c_canonicalize_returns_identifiability_failure_on_large_scale_shape() {
     use gam::families::custom_family::CustomFamilyError;
-    use gam::solver::identifiability_canonical::canonicalize_for_identifiability;
+    use gam::identifiability::canonical::canonicalize_for_identifiability;
     let specs = build_large_scale_like_aliased_specs();
     let outcome = canonicalize_for_identifiability(&specs);
     match outcome {
