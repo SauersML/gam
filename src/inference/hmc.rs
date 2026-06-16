@@ -3014,12 +3014,14 @@ mod tests {
             &h,
             &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
             &c,
+            true,
         )
         .expect("base diagnostic");
         let (rot_max, rot_vals) = laplace_directional_cubic_diagnostic(
             &h_rot,
             &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x_rot)),
             &c,
+            true,
         )
         .expect("rotated diagnostic");
 
@@ -3247,6 +3249,7 @@ mod tests {
             &h,
             &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
             &c,
+            true,
         )
         .expect("diagnostic");
 
@@ -5929,10 +5932,23 @@ pub fn run_link_wiggle_nuts_sampling(
 /// and reports `max_r |gamma_r|`. This is invariant to arbitrary coordinate
 /// relabeling and uses the full directional cubic contraction rather than only
 /// diagonal tensor entries.
+/// `refine_supremum` controls Phase 2, the cubic power-iteration that sharpens
+/// the returned scalar `max_abs` toward the true supremum of `|γ(u)|` over the
+/// H-unit sphere (which can exceed the per-eigenvector maximum). That scalar is
+/// the ONLY thing Phase 2 affects — the per-direction `directional` vector,
+/// which drives [`laplace_trustworthiness_from_skewness`]'s direction selection
+/// AND its own internally-recomputed `max_abs_skewness`, comes entirely from
+/// Phase 1. The #784 block-local REML correction
+/// (`block_local_sampled_correction`) consumes `directional` and uses `max_abs`
+/// only for a `> 0` finiteness guard that Phase 1 already satisfies, so it
+/// passes `false` and skips Phase 2's multi-probe O(probes·iters·np) refinement
+/// on every inner evaluation. Diagnostic callers that report the true supremum
+/// pass `true`.
 pub fn laplace_directional_cubic_diagnostic(
     hessian: &Array2<f64>,
     design: &DesignMatrix,
     c_weights: &Array1<f64>,
+    refine_supremum: bool,
 ) -> Result<(f64, Array1<f64>), String> {
     let p = hessian.nrows();
     if p == 0 || hessian.ncols() != p {
@@ -5977,7 +5993,7 @@ pub fn laplace_directional_cubic_diagnostic(
     //
     // We seed from the eigenvector with largest |gamma_r| and also from a
     // few random probe directions.
-    if p >= 2 {
+    if refine_supremum && p >= 2 {
         // Build H^{-1/2} columns for whitening: H^{-1/2} = V diag(1/sqrt(lam)) V^T
         // We need it to map whitened u -> original v = H^{-1/2} u, and
         // H^{1/2} to project back: H^{1/2} v = V diag(sqrt(lam)) V^T v.
@@ -6392,6 +6408,26 @@ pub trait BlockExcessTarget {
     fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64>;
     /// The same per-row score channel at the undisplaced mode `η̂`.
     fn base_neg_score(&self) -> Array1<f64>;
+
+    /// Fused `(excess(t), displaced_neg_score(t))` for a single `t`.
+    ///
+    /// The importance sampler needs BOTH the excess (for the weight) and the
+    /// displaced per-row score (for the (b)–(d) moment channels) at every
+    /// feasible draw. Both are functions of the SAME displacement `s = X_t·δ`
+    /// and the SAME per-row inverse-link jet at `η̂ + s`; computing them
+    /// separately repeats the O(n·p) design matvec and the O(n) jet sweep. The
+    /// returned score is `None` exactly when the excess is non-finite (an
+    /// infeasible draw the sampler discards before reading the score). The
+    /// default impl preserves the two-call behavior; implementors override to
+    /// share the displacement + jet across both channels.
+    fn excess_with_displaced_neg_score(&self, t: &Array1<f64>) -> (f64, Option<Array1<f64>>) {
+        let excess = self.excess(t);
+        if excess.is_finite() {
+            (excess, Some(self.displaced_neg_score(t)))
+        } else {
+            (excess, None)
+        }
+    }
 }
 
 /// Self-normalized importance-weighted moments of the per-draw gradient
@@ -6652,10 +6688,16 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
             let z = sample_standard_normal(&mut rng);
             t[r] = z * inv_sqrt_lambda[r];
         }
-        let excess = target.excess(&t);
+        // Fused: one design matvec + one inverse-link jet sweep yields both the
+        // excess (weight) and the displaced per-row score (moment channels).
+        let (excess, displaced_ngs) = target.excess_with_displaced_neg_score(&t);
         if !excess.is_finite() {
             continue;
         }
+        let Some(ngs) = displaced_ngs else {
+            // A finite excess always carries a score; absence means infeasible.
+            continue;
+        };
         let lw = -excess;
         if lw > max_lw {
             // exp(−∞ − lw) = 0 zeroes the (empty) accumulators on the first
@@ -6675,8 +6717,7 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
         sum_w2 += w * w;
         // Explicit channel: −∂ΔF/∂ρ.
         grad_acc.scaled_add(-w, &target.excess_rho_gradient(&t));
-        // Moment channels.
-        let ngs = target.displaced_neg_score(&t);
+        // Moment channels (score already computed in the fused call above).
         if ngs.len() != n_obs {
             return Err(format!(
                 "block_sampled_marginal_correction: displaced_neg_score len {} != {n_obs}",

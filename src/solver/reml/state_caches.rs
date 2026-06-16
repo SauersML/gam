@@ -1602,6 +1602,7 @@ pub(crate) fn finite_nonnegative_bits_or_no_signal(value: Option<f64>) -> u64 {
         .unwrap_or(IFT_RESIDUAL_NO_SIGNAL_BITS)
 }
 
+#[derive(Clone)]
 pub(crate) struct TkCorrectionTerms {
     pub(crate) value: f64,
     pub(crate) gradient: Option<Array1<f64>>,
@@ -1963,7 +1964,10 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
-        let (delta, _s) = self.displacement(t);
+        // Only the coefficient displacement `δ = V_b t` (O(pm)) is needed here;
+        // the per-row score `s = X_t δ` (the O(np) design matvec) that
+        // `displacement` also computes is unused, so skip it.
+        let delta = self.block_vecs.dot(t);
         let mut grad = Array1::<f64>::zeros(self.lambdas.len());
         for (k, (score, &lam)) in self
             .penalty_scores
@@ -1984,5 +1988,83 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
 
     fn base_neg_score(&self) -> Array1<f64> {
         self.neg_score_at(&self.eta_hat)
+    }
+
+    /// Fused excess + displaced score sharing ONE design matvec `s = X_t δ` and
+    /// ONE inverse-link jet sweep at `η̂ + s`. The jet yields both `μ` (the
+    /// deviance/excess channel) and `d1 = dμ/dη` (the score channel), so the
+    /// per-draw O(n·p) matvec and O(n) jet evaluation — previously paid twice
+    /// (once in `excess`, once in `displaced_neg_score`) — are paid once. The
+    /// summed value is bit-identical to the separate calls: `excess` reads
+    /// `jet.mu` and `displaced_neg_score` reads the SAME jet's `d1`/`mu` floors,
+    /// which this method reproduces exactly (#784, #1082).
+    fn excess_with_displaced_neg_score(&self, t: &Array1<f64>) -> (f64, Option<Array1<f64>>) {
+        let (delta, s) = self.displacement(t);
+        let n = self.eta_hat.len();
+
+        // Family constants mirrored from `neg_score_at` / `calculate_deviance`.
+        let spec_response = reml_spec(&self.likelihood).response.clone();
+        let family = pirls::weight_family_for_glm_likelihood(&self.likelihood);
+        let fam_scale = match &spec_response {
+            ResponseFamily::Gaussian | ResponseFamily::Tweedie { .. } => {
+                1.0 / self.likelihood.fixed_phi().unwrap_or(1.0)
+            }
+            _ => 1.0,
+        };
+        const BINOMIAL_MU_EPS: f64 = 1e-12;
+        const MU_FLOOR: f64 = 1e-10;
+        let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
+
+        // One jet sweep: collect μ (unclamped, for the deviance — matching
+        // `excess`) and the per-row score (clamped μ, for `displaced_neg_score`).
+        let mut mu_disp = Array1::<f64>::zeros(n);
+        let mut ngs = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let eta_i = self.eta_hat[i] + s[i];
+            let jet = match crate::mixture_link::inverse_link_jet_for_inverse_link(
+                &self.inverse_link,
+                eta_i,
+            ) {
+                Ok(jet) => jet,
+                // `excess` returns +∞ on an infeasible inverse-link jet.
+                Err(_) => return (f64::INFINITY, None),
+            };
+            mu_disp[i] = jet.mu;
+            let mu_c = if is_binomial {
+                jet.mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
+            } else {
+                jet.mu.max(MU_FLOOR)
+            };
+            let v = pirls::variance_jet_for_weight_family(family, mu_c).v;
+            if v.is_finite() && v > 0.0 {
+                let d_dev_d_mu = -2.0 * self.prior_weights[i] * (self.y[i] - mu_c) / v * fam_scale;
+                ngs[i] = d_dev_d_mu * jet.d1 / (2.0 * self.phi);
+            }
+        }
+
+        let dev_disp = crate::pirls::calculate_deviance(
+            self.y.view(),
+            &mu_disp,
+            &self.likelihood,
+            self.prior_weights.view(),
+        );
+        if !dev_disp.is_finite() {
+            return (f64::INFINITY, None);
+        }
+        let neg_loglik_diff = (dev_disp - self.base_deviance) / (2.0 * self.phi);
+        let mut penalty_term = 0.0_f64;
+        for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
+            penalty_term += lam * score.dot(&delta);
+        }
+        let mut curv = 0.0_f64;
+        for i in 0..s.len() {
+            curv += self.weights_obs[i] * s[i] * s[i];
+        }
+        let excess = neg_loglik_diff + penalty_term - 0.5 * curv;
+        if excess.is_finite() {
+            (excess, Some(ngs))
+        } else {
+            (excess, None)
+        }
     }
 }

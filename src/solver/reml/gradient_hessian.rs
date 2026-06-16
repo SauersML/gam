@@ -2072,7 +2072,44 @@ impl<'a> RemlState<'a> {
     /// band. The correction value therefore vanishes continuously as a
     /// direction approaches the threshold, so the spliced objective is
     /// continuous to leading order and does not bias ρ selection.
+    /// Per-bundle-cached wrapper around [`Self::block_local_sampled_correction_compute`].
+    ///
+    /// The block-local correction is a deterministic function of this bundle's
+    /// converged inner state and ρ alone (mode-invariant, Hessian-free), but the
+    /// outer loop evaluates the objective at one ρ up to three times (value,
+    /// value+gradient, value+gradient+Hessian) sharing the SAME `bundle`. The
+    /// expensive engaged path (dense O(p³) eigendecomposition plus the
+    /// fixed-seed O(draws·n·m) importance sampler) therefore reran 2–3× per
+    /// outer iteration. Hoist it onto `bundle.block_local_correction` so it is
+    /// computed exactly once per inner solution and every consumer at that ρ
+    /// reads the identical value+gradient (exact hoist — #784, #1082). Keyed on
+    /// `n_ext`, which is fixed for a fit, so one cell suffices.
     pub(crate) fn block_local_sampled_correction(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        n_ext: usize,
+    ) -> Result<TkCorrectionTerms, EstimationError> {
+        if let Some((cached_ext, terms)) = bundle.block_local_correction.get()
+            && *cached_ext == n_ext
+        {
+            return Ok((**terms).clone());
+        }
+        let terms = self.block_local_sampled_correction_compute(rho, bundle, n_ext)?;
+        // First writer wins; a racing writer built from identical inputs, so
+        // either stored object is correct. A `set` that loses the race (cell
+        // already filled) is fine — both terms are equal — so the `Err` is
+        // discarded by returning the freshly computed `terms` either way.
+        match bundle
+            .block_local_correction
+            .set((n_ext, std::sync::Arc::new(terms.clone())))
+        {
+            Ok(()) => Ok(terms),
+            Err(_) => Ok(terms),
+        }
+    }
+
+    fn block_local_sampled_correction_compute(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2128,7 +2165,7 @@ impl<'a> RemlState<'a> {
 
         // Step 1: per-direction skewness diagnostic γ_r.
         let (max_abs, directional) =
-            laplace_directional_cubic_diagnostic(h_total, x_design, c_weights)
+            laplace_directional_cubic_diagnostic(h_total, x_design, c_weights, false)
                 .map_err(EstimationError::InvalidInput)?;
         if !max_abs.is_finite() || max_abs == 0.0 {
             return Ok(zero());
@@ -5655,6 +5692,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
+            block_local_correction: std::sync::OnceLock::new(),
         })
     }
 
@@ -5788,6 +5826,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
+            block_local_correction: std::sync::OnceLock::new(),
         })
     }
 

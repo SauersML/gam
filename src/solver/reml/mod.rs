@@ -4122,6 +4122,25 @@ pub(crate) struct EvalShared {
     /// plain ndarray matvecs (no rayon inside the `OnceLock` closure — the
     /// `get_or_init`+`into_par_iter` deadlock trap does not apply).
     pub(crate) penalty_scores_at_mode: std::sync::OnceLock<Arc<Vec<Array1<f64>>>>,
+    /// Per-evaluation-point cache of the #784 block-local Laplace-to-sampling
+    /// correction `TkCorrectionTerms { value, gradient }`. The correction is a
+    /// deterministic function of ONLY this bundle's converged inner state
+    /// (`pirls_result`, `h_total`), the `RemlState`'s fixed
+    /// `canonical_penalties`, and the bundle's ρ — never of the eval `mode`:
+    /// the diagnostic eigendecomposition, the fixed-seed importance sampler,
+    /// and the (b)–(d) gradient channels all read mode-invariant fields, and
+    /// the term carries no Hessian, so the value+gradient are identical for the
+    /// value-only, value+gradient, and value+gradient+Hessian assemble calls
+    /// that share this bundle at a single ρ. The expensive path (eigendecomp +
+    /// O(draws·n·m) sampler) previously reran on every one of those 2–3 calls
+    /// per outer iteration; hoisting it onto the bundle computes it exactly
+    /// once per inner solution (exact hoist, identical values — #784, #1082).
+    /// Keyed only on the external-coordinate count `n_ext`: with no ψ
+    /// coordinates (`n_ext == 0`) the correction engages; with ψ present the
+    /// seam declines (returns the cheap zero), and n_ext is fixed for a fit, so
+    /// a single cell suffices.
+    pub(crate) block_local_correction:
+        std::sync::OnceLock<(usize, Arc<runtime::TkCorrectionTerms>)>,
 }
 
 impl EvalShared {
