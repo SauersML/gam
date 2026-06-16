@@ -3471,3 +3471,72 @@ pub(crate) fn parallel_streaming_assembly_deterministic_and_matches_sequential()
         );
     }
 }
+
+/// #1017 streaming-assembly speedup bench. Times the reduced-Schur + reduced-RHS
+/// assembly (`accumulate_chunk`) at the SAE-arm shape, serial (tiny sub-MIN
+/// chunks) vs parallel (one big chunk over rayon). Run with `--release
+/// --nocapture` on a quiet multicore box to read the wall-clock and speedup;
+/// the assembly is paid once per outer evaluation in the streaming joint fit.
+///
+/// ```text
+/// cargo test --lib --release \
+///   solver::arrow_schur::tests::bench_streaming_assembly_parallel_speedup \
+///   -- --nocapture
+/// ```
+#[test]
+pub(crate) fn bench_streaming_assembly_parallel_speedup() {
+    let n = 1500usize;
+    let d = 6usize;
+    let k = 512usize;
+    let sys = dense_direct_system(n, d, k);
+    let calls = 10usize;
+    let mut sink = 0.0_f64;
+
+    // Serial: tiny chunks (each < SCHUR_MATVEC_PARALLEL_ROW_MIN) take the
+    // in-place per-row path. Warm once before timing.
+    let serial_assemble = || -> f64 {
+        let mut s = StreamingArrowSchur::from_system(&sys, 8);
+        s.reset_accumulator(0.0).expect("reset");
+        for start in (0..n).step_by(8) {
+            let end = (start + 8).min(n);
+            s.accumulate_chunk(start, end, 0.0, ArrowSolverMode::Direct)
+                .expect("serial accumulate");
+        }
+        let (s_acc, _) = s.take_accumulators();
+        s_acc[[0, 0]]
+    };
+    sink += serial_assemble();
+    let t_seq = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += serial_assemble();
+    }
+    let seq_per = t_seq.elapsed().as_secs_f64() / calls as f64;
+
+    // Parallel: one big chunk (>= MIN) fans over rayon. Warm once.
+    let par_assemble = || -> f64 {
+        let mut s = StreamingArrowSchur::from_system(&sys, n);
+        s.reset_accumulator(0.0).expect("reset");
+        s.accumulate_chunk(0, n, 0.0, ArrowSolverMode::Direct)
+            .expect("parallel accumulate");
+        let (s_acc, _) = s.take_accumulators();
+        s_acc[[0, 0]]
+    };
+    sink += par_assemble();
+    let t_par = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += par_assemble();
+    }
+    let par_per = t_par.elapsed().as_secs_f64() / calls as f64;
+
+    println!(
+        "[#1017 streaming assembly, n={n} d={d} k={k}, {calls} calls, \
+             {} rayon threads]\n  serial:   {:.3} ms/call\n  parallel: {:.3} ms/call\n  \
+             speedup:  {:.2}x  (sink {:.3e})",
+        rayon::current_num_threads(),
+        seq_per * 1e3,
+        par_per * 1e3,
+        seq_per / par_per,
+        sink,
+    );
+    assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
+}
