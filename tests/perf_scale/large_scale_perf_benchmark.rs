@@ -361,6 +361,7 @@ fn te_xh_design_spec(
                     periods: vec![None, None],
                     double_penalty: false,
                     identifiability,
+                    penalty_decomposition: Default::default(),
                 },
             },
             shape: ShapeConstraint::None,

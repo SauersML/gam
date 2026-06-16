@@ -669,6 +669,13 @@ impl RowCertificate {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CertifiedEncodeProbe {
+    coord: Array1<f64>,
+    initial_cert: RowCertificate,
+    final_cert: RowCertificate,
+}
+
 /// Canonical flat-axis polynomial degree of a cylinder `S¹ × ℝ` atom — the
 /// degree the topology-race builder ([`crate::solver::structure_harvest`]) uses
 /// for the line axis (`CylinderHarmonicEvaluator::new(_, 2)`). The encode atlas
@@ -1014,6 +1021,109 @@ pub fn row_certificate(
     }
 }
 
+fn uncertified_certificate(lipschitz: f64) -> RowCertificate {
+    RowCertificate {
+        beta: f64::INFINITY,
+        eta: f64::INFINITY,
+        lipschitz,
+        h: f64::INFINITY,
+    }
+}
+
+fn refine_certified_start(
+    atom: &SaeManifoldAtom,
+    evaluator: &dyn SaeBasisEvaluator,
+    mut t: Array1<f64>,
+    x: ArrayView1<'_, f64>,
+    amplitude: f64,
+    lipschitz: f64,
+    ridge: f64,
+    newton_steps: usize,
+    initial_cert: RowCertificate,
+    mut delta: Array1<f64>,
+) -> Result<Option<CertifiedEncodeProbe>, String> {
+    debug_assert!(initial_cert.certified());
+    let mut final_cert = initial_cert;
+    for _ in 0..newton_steps {
+        t = &t + &delta;
+        let (cert, next_delta) =
+            row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
+        if !cert.certified() {
+            return Ok(None);
+        }
+        final_cert = cert;
+        delta = next_delta;
+    }
+    Ok(Some(CertifiedEncodeProbe {
+        coord: t,
+        initial_cert,
+        final_cert,
+    }))
+}
+
+fn kantorovich_root_radius(cert: RowCertificate) -> f64 {
+    if !cert.certified() || !(cert.eta.is_finite() && cert.eta >= 0.0) {
+        return f64::INFINITY;
+    }
+    if cert.eta == 0.0 {
+        return 0.0;
+    }
+    if !(cert.h.is_finite() && cert.h >= 0.0) {
+        return f64::INFINITY;
+    }
+    let h = cert.h.min(KANTOROVICH_THRESHOLD);
+    let discriminant = (1.0 - 2.0 * h).max(0.0).sqrt();
+    let radius = 2.0 * cert.eta / (1.0 + discriminant);
+    if radius.is_finite() {
+        radius
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn distilled_probe_tolerance(
+    amortized: &CertifiedEncodeProbe,
+    cold: &CertifiedEncodeProbe,
+    amplitude: f64,
+    x: ArrayView1<'_, f64>,
+) -> f64 {
+    let certified_radius =
+        kantorovich_root_radius(amortized.final_cert) + kantorovich_root_radius(cold.final_cert);
+    let coord_scale = amortized.coord.dot(&amortized.coord).sqrt()
+        + cold.coord.dot(&cold.coord).sqrt()
+        + x.dot(&x).sqrt()
+        + amplitude.abs()
+        + 1.0;
+    certified_radius + 1024.0 * f64::EPSILON * coord_scale
+}
+
+fn latent_coordinate_distance(
+    atom: &SaeManifoldAtom,
+    lhs: ArrayView1<'_, f64>,
+    rhs: ArrayView1<'_, f64>,
+) -> f64 {
+    let mut acc = 0.0;
+    for axis in 0..lhs.len().min(rhs.len()) {
+        let mut diff = (lhs[axis] - rhs[axis]).abs();
+        if let Some(period) = latent_axis_period(atom, axis) {
+            let wrapped = diff.rem_euclid(period);
+            diff = wrapped.min(period - wrapped);
+        }
+        acc += diff * diff;
+    }
+    acc.sqrt()
+}
+
+fn latent_axis_period(atom: &SaeManifoldAtom, axis: usize) -> Option<f64> {
+    use crate::terms::sae::manifold::SaeAtomBasisKind::*;
+    match &atom.basis_kind {
+        Periodic | Torus => Some(1.0),
+        Cylinder if axis == 0 => Some(1.0),
+        Sphere if axis == 1 => Some(std::f64::consts::TAU),
+        _ => None,
+    }
+}
+
 /// Configuration for [`EncodeAtlas`] construction and online encode. All fields
 /// are explicit; the atlas never reads global state and adds no CLI flags.
 #[derive(Debug, Clone, Copy)]
@@ -1156,10 +1266,10 @@ impl EncodeAtlas {
     }
 
     /// Online certified encode of one target row `x` against one atom `k` with
-    /// fixed amplitude `z`. Routes to the nearest chart, runs `config.newton_steps`
-    /// Newton steps, and returns the encoded coordinate with its certificate.
-    /// An uncertified start (no chart, `h > ½`) flags the row for the exact
-    /// multi-start fallback.
+    /// fixed amplitude `z`. Routes to the nearest chart, starts from the chart
+    /// center, runs `config.newton_steps` Newton steps, and returns the encoded
+    /// coordinate with its certificate. An uncertified start (no chart, `h > ½`)
+    /// flags the row for the exact multi-start fallback.
     pub fn certified_encode_row(
         &self,
         atom: &SaeManifoldAtom,
@@ -1193,22 +1303,12 @@ impl EncodeAtlas {
             ));
         };
         let chart = &atom_atlas.charts[chart_idx];
-        // #1154 Design A — warm-start the exact inner Newton from the amortized
-        // encoder's prediction `t̂ = t_c + (1/z)·A₁·(x − z·m₁)` when this chart
-        // carries a distilled IFT Jacobian and the amplitude is usable, then
-        // REFINE to stationarity below. A good warm-start lands the row inside
-        // the certified Kantorovich ball more often (strictly easier than the
-        // cold chart-center start), so the exact encode that REML's inner solve
-        // consumes is seeded by the co-trained encoder yet still converges the
-        // SAME `(t, β)` stationary point — the λ-gradient stays exact. The chart
-        // center remains the start when no Jacobian / near-inactive amplitude.
-        let mut t = amortized_warm_start(chart, x, amplitude)
-            .unwrap_or_else(|| chart.region.center.clone());
-
-        // The per-row certificate is evaluated AT the start point (the amortized
-        // warm-start, or the chart center), using the chart's closed-form L. This
-        // is the exactness gate.
-        let (cert, mut delta) = row_certificate(
+        // This path is the independent cold certified probe. It deliberately
+        // starts from the chart center rather than the distilled encoder's
+        // prediction; otherwise the "exact" probe would share the approximation
+        // being audited and could not bound amortized encode error.
+        let t = chart.region.center.clone();
+        let (cert, delta) = row_certificate(
             atom,
             evaluator.as_ref(),
             t.view(),
@@ -1220,23 +1320,25 @@ impl EncodeAtlas {
         if !cert.certified() {
             return Ok((t, cert));
         }
-        // Certified: 1–2 Newton steps converge quadratically into the root.
-        for step in 0..self.config.newton_steps {
-            t = &t + &delta;
-            if step + 1 < self.config.newton_steps {
-                let (_c, next_delta) = row_certificate(
-                    atom,
-                    evaluator.as_ref(),
-                    t.view(),
-                    x,
-                    amplitude,
-                    chart.lipschitz,
-                    self.config.ridge,
-                )?;
-                delta = next_delta;
-            }
-        }
-        Ok((t, cert))
+        let Some(probe) = refine_certified_start(
+            atom,
+            evaluator.as_ref(),
+            t,
+            x,
+            amplitude,
+            chart.lipschitz,
+            self.config.ridge,
+            self.config.newton_steps,
+            cert,
+            delta,
+        )?
+        else {
+            return Ok((
+                Array1::<f64>::zeros(d),
+                uncertified_certificate(chart.lipschitz),
+            ));
+        };
+        Ok((probe.coord, probe.initial_cert))
     }
 
     /// Amortized (distilled) encode of one target row `x` against one atom `k`
@@ -1300,12 +1402,16 @@ impl EncodeAtlas {
         // positive and finite (a near-inactive atom, where the amplitude-divided
         // map is undefined) — either way flag for the exact fallback, never a
         // silent wrong encode.
-        let Some(mut t_hat) = amortized_warm_start(chart, x, amplitude) else {
+        let Some(t_hat) = amortized_warm_start(chart, x, amplitude) else {
             return Ok(uncertified());
         };
         // Evaluate the SAME Kantorovich certificate at the predicted start. The
-        // amortized prediction is trusted iff the certificate holds there.
-        let (cert, mut delta) = row_certificate(
+        // amortized prediction is trusted only if this certificate holds AND an
+        // independent cold chart-center probe certifies and agrees below the
+        // two probes' final Kantorovich root-radius bounds. This avoids the
+        // self-referential gate where the "exact" probe is warm-started by the
+        // same distilled prediction it is supposed to audit.
+        let (cert, delta) = row_certificate(
             atom,
             evaluator.as_ref(),
             t_hat.view(),
@@ -1317,23 +1423,70 @@ impl EncodeAtlas {
         if !cert.certified() {
             return Ok((t_hat, cert));
         }
-        // Certified: optional quadratic refinement from the amortized start.
-        for step in 0..self.config.newton_steps {
-            t_hat = &t_hat + &delta;
-            if step + 1 < self.config.newton_steps {
-                let (_c, next_delta) = row_certificate(
-                    atom,
-                    evaluator.as_ref(),
-                    t_hat.view(),
-                    x,
-                    amplitude,
-                    chart.lipschitz,
-                    self.config.ridge,
-                )?;
-                delta = next_delta;
-            }
+        let Some(amortized_probe) = refine_certified_start(
+            atom,
+            evaluator.as_ref(),
+            t_hat,
+            x,
+            amplitude,
+            chart.lipschitz,
+            self.config.ridge,
+            self.config.newton_steps,
+            cert,
+            delta,
+        )?
+        else {
+            return Ok((
+                Array1::<f64>::zeros(d),
+                uncertified_certificate(chart.lipschitz),
+            ));
+        };
+
+        let cold_start = chart.region.center.clone();
+        let (cold_cert, cold_delta) = row_certificate(
+            atom,
+            evaluator.as_ref(),
+            cold_start.view(),
+            x,
+            amplitude,
+            chart.lipschitz,
+            self.config.ridge,
+        )?;
+        if !cold_cert.certified() {
+            return Ok((
+                amortized_probe.coord,
+                uncertified_certificate(chart.lipschitz),
+            ));
         }
-        Ok((t_hat, cert))
+        let Some(cold_probe) = refine_certified_start(
+            atom,
+            evaluator.as_ref(),
+            cold_start,
+            x,
+            amplitude,
+            chart.lipschitz,
+            self.config.ridge,
+            self.config.newton_steps,
+            cold_cert,
+            cold_delta,
+        )?
+        else {
+            return Ok((
+                amortized_probe.coord,
+                uncertified_certificate(chart.lipschitz),
+            ));
+        };
+
+        let gap =
+            latent_coordinate_distance(atom, amortized_probe.coord.view(), cold_probe.coord.view());
+        let tolerance = distilled_probe_tolerance(&amortized_probe, &cold_probe, amplitude, x);
+        if !(gap.is_finite() && gap <= tolerance) {
+            return Ok((
+                amortized_probe.coord,
+                uncertified_certificate(chart.lipschitz),
+            ));
+        }
+        Ok((amortized_probe.coord, amortized_probe.initial_cert))
     }
 
     /// Batched amortized (distilled) encode over many rows against one atom

@@ -2823,9 +2823,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                         .iter()
                         .map(|spec| match spec {
                             crate::model_types::PenaltySpec::Block {
-                                local,
-                                col_range,
-                                ..
+                                local, col_range, ..
                             } => PenaltyMatrix::Blockwise {
                                 local: local.clone(),
                                 col_range: col_range.clone(),
@@ -2833,8 +2831,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                             },
                             crate::model_types::PenaltySpec::Dense(m)
                             | crate::model_types::PenaltySpec::DenseWithMean {
-                                matrix: m,
-                                ..
+                                matrix: m, ..
                             } => PenaltyMatrix::Dense(m.clone()),
                         })
                         .collect()
@@ -2894,7 +2891,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .map_err(|e| e.to_string())
     };
 
-    use crate::estimate::EstimationError;
+    use crate::model_types::EstimationError;
     use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
     };

@@ -16,6 +16,23 @@ use crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::types::{InverseLink, StandardLink};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BinomialClosedFormLink {
+    Probit,
+    Logit,
+    CLogLog,
+}
+
+#[inline]
+fn binomial_closed_form_link(link_kind: &InverseLink) -> Option<BinomialClosedFormLink> {
+    match link_kind {
+        InverseLink::Standard(StandardLink::Probit) => Some(BinomialClosedFormLink::Probit),
+        InverseLink::Standard(StandardLink::Logit) => Some(BinomialClosedFormLink::Logit),
+        InverseLink::Standard(StandardLink::CLogLog) => Some(BinomialClosedFormLink::CLogLog),
+        _ => None,
+    }
+}
+
 /// The generic-link binomial NLL `F(q) = −ℓ(μ(q))` as ONE `Tower4<1>` jet in
 /// the latent coordinate `q` (issue #932 migration of the hand-written
 /// composition tower).
@@ -534,8 +551,8 @@ pub(super) fn binomial_neglog_q_derivatives_dispatch(
     d3: f64,
     link_kind: &InverseLink,
 ) -> (f64, f64, f64) {
-    if binomial_link_has_closed_form(link_kind) {
-        return binomial_neglog_q_derivatives_closed_form_dispatch(y, weight, q, link_kind);
+    if let Some(closed_form) = binomial_closed_form_link(link_kind) {
+        return binomial_neglog_q_derivatives_closed_form_dispatch(y, weight, q, closed_form);
     }
     binomial_neglog_q_derivatives_from_jet(y, weight, mu, d1, d2, d3)
 }
@@ -551,9 +568,12 @@ pub(super) fn binomial_neglog_q_fourth_derivative_dispatch(
     d3: f64,
     link_kind: &InverseLink,
 ) -> Result<f64, String> {
-    if binomial_link_has_closed_form(link_kind) {
+    if let Some(closed_form) = binomial_closed_form_link(link_kind) {
         return Ok(binomial_neglog_q_fourth_derivative_closed_form_dispatch(
-            y, weight, q, link_kind,
+            y,
+            weight,
+            q,
+            closed_form,
         ));
     }
     // `binomial_neglog_q_fourth_derivative_from_jet` consumes `d4 = μ''''(q)`,
@@ -569,61 +589,43 @@ pub(super) fn binomial_neglog_q_fourth_derivative_dispatch(
 }
 
 #[inline]
-pub(super) fn binomial_neglog_q_derivatives_closed_form_dispatch(
+fn binomial_neglog_q_derivatives_closed_form_dispatch(
     y: f64,
     weight: f64,
     q: f64,
-    link_kind: &InverseLink,
+    link_kind: BinomialClosedFormLink,
 ) -> (f64, f64, f64) {
     match link_kind {
-        InverseLink::Standard(StandardLink::Probit) => {
+        BinomialClosedFormLink::Probit => {
             binomial_neglog_q_derivatives_probit_closed_form(y, weight, q)
         }
-        InverseLink::Standard(StandardLink::Logit) => {
+        BinomialClosedFormLink::Logit => {
             binomial_neglog_q_derivatives_logit_closed_form(y, weight, q)
         }
-        InverseLink::Standard(StandardLink::CLogLog) => {
+        BinomialClosedFormLink::CLogLog => {
             binomial_neglog_q_derivatives_cloglog_closed_form(y, weight, q)
-        }
-        _ => {
-            // Should not be called for unsupported links; caller should use jet path.
-            // This is a safety fallback.
-            (0.0, 0.0, 0.0)
         }
     }
 }
 
 #[inline]
-pub(super) fn binomial_neglog_q_fourth_derivative_closed_form_dispatch(
+fn binomial_neglog_q_fourth_derivative_closed_form_dispatch(
     y: f64,
     weight: f64,
     q: f64,
-    link_kind: &InverseLink,
+    link_kind: BinomialClosedFormLink,
 ) -> f64 {
     match link_kind {
-        InverseLink::Standard(StandardLink::Probit) => {
+        BinomialClosedFormLink::Probit => {
             binomial_neglog_q_fourth_derivative_probit_closed_form(y, weight, q)
         }
-        InverseLink::Standard(StandardLink::Logit) => {
+        BinomialClosedFormLink::Logit => {
             binomial_neglog_q_fourth_derivative_logit_closed_form(y, weight, q)
         }
-        InverseLink::Standard(StandardLink::CLogLog) => {
+        BinomialClosedFormLink::CLogLog => {
             binomial_neglog_q_fourth_derivative_cloglog_closed_form(y, weight, q)
         }
-        _ => 0.0,
     }
-}
-
-/// Returns true if the given link supports closed-form m1–m4 derivatives for
-/// the binomial location-scale family, enabling the exact joint Newton path.
-#[inline]
-pub(super) fn binomial_link_has_closed_form(link_kind: &InverseLink) -> bool {
-    matches!(
-        link_kind,
-        InverseLink::Standard(StandardLink::Probit)
-            | InverseLink::Standard(StandardLink::Logit)
-            | InverseLink::Standard(StandardLink::CLogLog)
-    )
 }
 
 #[cfg(test)]
@@ -703,10 +705,8 @@ mod tests {
             for &q in &[-1.3_f64, -0.4, 0.0, 0.5, 0.7, 1.3, 2.0] {
                 for &(mu, d1, d2, d3, d4) in &[cauchit_jet(q), logit_jet(q)] {
                     let (s, c, t) = binomial_score_curvaturethird_from_jet(y, w, mu, d1, d2, d3);
-                    let m4 =
-                        binomial_neglog_q_fourth_derivative_from_jet(y, w, mu, d1, d2, d3, d4);
-                    let (ls, lc, lt, lm4) =
-                        legacy_hand_q_derivatives(y, w, mu, d1, d2, d3, d4);
+                    let m4 = binomial_neglog_q_fourth_derivative_from_jet(y, w, mu, d1, d2, d3, d4);
+                    let (ls, lc, lt, lm4) = legacy_hand_q_derivatives(y, w, mu, d1, d2, d3, d4);
                     let tol = 1e-12;
                     let close = |label: &str, got: f64, want: f64| {
                         assert!(

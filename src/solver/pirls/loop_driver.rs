@@ -551,8 +551,8 @@ pub(super) fn build_diagonal_penalty_from_kronecker(
             structural_sigma += marginal_eigenvalue;
             sigma += lambdas[k] * marginal_eigenvalue;
         }
-        if kron_result.has_double_penalty && lambdas.len() > d {
-            structural_sigma += 1.0;
+        let joint_null = structural_sigma <= KRONECKER_STRUCTURAL_ZERO_TOL;
+        if kron_result.has_double_penalty && lambdas.len() > d && joint_null {
             sigma += lambdas[d];
         }
         if structural_sigma > KRONECKER_STRUCTURAL_ZERO_TOL {
@@ -2155,4 +2155,45 @@ pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> 
     SparseColMat::try_new_from_triplets(nrows, ncols, &triplets)
         .ok()
         .map(DesignMatrix::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PirlsPenalty, build_diagonal_penalty_from_kronecker};
+    use crate::construction::KroneckerReparamResult;
+    use ndarray::{Array1, Array2, array};
+
+    #[test]
+    fn kronecker_diagonal_double_penalty_hits_only_joint_null_space() {
+        let kron_result = KroneckerReparamResult {
+            reparameterized_marginals: Vec::new(),
+            marginal_eigenvalues: vec![array![0.0, 2.0], array![0.0, 3.0]],
+            marginal_qs: Vec::new(),
+            log_det: 0.0,
+            det1: Array1::zeros(3),
+            det2: Array2::zeros((3, 3)),
+            penalty_shrinkage_ridge: 0.5,
+            has_double_penalty: true,
+            marginal_dims: vec![2usize, 2usize],
+        };
+        let penalty = build_diagonal_penalty_from_kronecker(&kron_result, &[5.0, 7.0, 11.0]);
+
+        let PirlsPenalty::Diagonal {
+            diag,
+            positive_indices,
+            ..
+        } = penalty
+        else {
+            panic!("expected diagonal Kronecker PIRLS penalty");
+        };
+        let expected = [11.0, 21.5, 10.5, 31.5];
+        for (idx, expected_diag) in expected.iter().copied().enumerate() {
+            assert!(
+                (diag[idx] - expected_diag).abs() <= 1e-12,
+                "diagonal {idx} got {}, expected {expected_diag}",
+                diag[idx]
+            );
+        }
+        assert_eq!(positive_indices, vec![0, 1, 2, 3]);
+    }
 }

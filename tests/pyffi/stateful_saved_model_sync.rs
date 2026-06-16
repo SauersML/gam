@@ -1,13 +1,13 @@
-use gam::estimate::{
-    BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
-};
 use gam::families::survival::location_scale::ResidualDistribution;
 use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     PredictModelClass,
 };
-use gam::pirls::PirlsStatus;
+use gam::solver::estimate::{
+    BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
+};
+use gam::solver::pirls::PirlsStatus;
 use gam::types::{
     InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec,
     LogLikelihoodNormalization, ResponseFamily, SasLinkState, StandardLink,
@@ -266,7 +266,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     }));
     payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
     payload.set_training_feature_metadata(vec!["x".to_string()], vec![(-1.5f64, 2.25f64)]);
-    payload.resolved_termspec = Some(gam::smooth::TermCollectionSpec {
+    payload.resolved_termspec = Some(gam::terms::smooth::TermCollectionSpec {
         linear_terms: vec![],
         smooth_terms: vec![],
         random_effect_terms: vec![],
@@ -367,7 +367,7 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
         vec!["x".to_string(), "z".to_string()],
         vec![(0.0f64, 1.0f64), (-3.5f64, 4.0f64)],
     );
-    payload.resolved_termspec = Some(gam::smooth::TermCollectionSpec {
+    payload.resolved_termspec = Some(gam::terms::smooth::TermCollectionSpec {
         linear_terms: vec![],
         smooth_terms: vec![],
         random_effect_terms: vec![],

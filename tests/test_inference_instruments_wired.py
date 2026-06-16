@@ -10,7 +10,8 @@ Covers the three previously-unwired instruments now exposed through the
   ``log_e_from_p_value``),
 * #1109 KL-optimal steering-probe design (``plan_probe_for_contested_claim`` /
   ``select_probe_by_expected_evidence`` / ``expected_resolution_budget``),
-* #939 Lawley likelihood-ratio Bartlett correction (``lawley_bartlett_factor``).
+* #939 Lawley likelihood-ratio Bartlett correction (``lawley_bartlett_factor`` /
+  ``lawley_bartlett_factor_estimated_lambda``).
 """
 
 from __future__ import annotations
@@ -116,6 +117,66 @@ def test_lawley_bartlett_factor_exponential_fixture():
     # Corrected statistic divides by the factor; corrected p-value is larger.
     assert out["corrected_statistic"] == pytest.approx(5.0 / out["bartlett_factor"])
     assert out["p_value_corrected"] >= out["p_value_uncorrected"]
+
+
+def test_lawley_bartlett_factor_estimated_lambda_reaches_python():
+    n = 50
+    z = np.linspace(-0.5, 0.5, n)
+    design = np.column_stack([np.ones(n), z])
+    eta = 0.3 + 0.6 * z
+    penalty = np.diag([0.0, 3.0])
+    rho_cov = np.array([[0.8]])
+
+    conditional = gamfit.lawley_bartlett_factor(
+        design,
+        "poisson",
+        eta,
+        1,
+        2,
+        1.0,
+        penalty=penalty,
+        lr_statistic=4.0,
+    )
+    estimated = gamfit.lawley_bartlett_factor_estimated_lambda(
+        design,
+        "poisson",
+        eta,
+        1,
+        2,
+        1.0,
+        penalty=penalty,
+        components=[penalty],
+        rho_cov=rho_cov,
+        lr_statistic=4.0,
+    )
+
+    assert estimated["bartlett_factor_conditional"] == pytest.approx(
+        conditional["bartlett_factor"]
+    )
+    assert estimated["rho_variation_shift"] != pytest.approx(0.0, abs=1e-10)
+    assert estimated["mean_shift"] == pytest.approx(
+        estimated["mean_shift_conditional"] + estimated["rho_variation_shift"]
+    )
+    assert estimated["bartlett_factor"] == pytest.approx(
+        1.0 + estimated["mean_shift"]
+    )
+    assert estimated["corrected_statistic"] == pytest.approx(
+        4.0 / estimated["bartlett_factor"]
+    )
+    assert estimated["p_value_corrected"] >= 0.0
+
+    with pytest.raises(ValueError, match="rho_cov must be symmetric"):
+        gamfit.lawley_bartlett_factor_estimated_lambda(
+            design,
+            "poisson",
+            eta,
+            1,
+            2,
+            1.0,
+            penalty=penalty,
+            components=[penalty, penalty],
+            rho_cov=np.array([[1.0, 0.25], [0.20, 1.0]]),
+        )
 
 
 def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():

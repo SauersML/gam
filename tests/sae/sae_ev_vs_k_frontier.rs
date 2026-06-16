@@ -998,7 +998,10 @@ fn ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus() {
             n_train,
             &format!("flat-circle-K{k}"),
         );
-        circle_ev.push((k, held_out_ev(&cfit, &cslots, &corpus, &theta_test, &z_test, n_test)));
+        circle_ev.push((
+            k,
+            held_out_ev(&cfit, &cslots, &corpus, &theta_test, &z_test, n_test),
+        ));
 
         let lslots = bulk_slots(k, &corpus, Kind::Linear);
         let (lfit, _) = run_production_fit(
@@ -1009,7 +1012,10 @@ fn ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus() {
             n_train,
             &format!("flat-linear-K{k}"),
         );
-        linear_ev.push((k, held_out_ev(&lfit, &lslots, &corpus, &theta_test, &z_test, n_test)));
+        linear_ev.push((
+            k,
+            held_out_ev(&lfit, &lslots, &corpus, &theta_test, &z_test, n_test),
+        ));
     }
 
     println!("=== #1026 EV-vs-K H_flat NEGATIVE CONTROL (held-out, production engine) ===");
@@ -1043,10 +1049,26 @@ fn ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus() {
     // On H_flat both arms capture the same low-rank bulk and flatten together. The
     // H_curved test fires when the linear tail gain exceeds the curved tail gain by
     // >= 0.02 AND clears a 0.03 floor; the control must NOT meet that signature.
-    let c_kc = circle_ev.iter().find(|(k, _)| *k == 4).map(|(_, v)| *v).unwrap();
-    let c_k2c = circle_ev.iter().find(|(k, _)| *k == 8).map(|(_, v)| *v).unwrap();
-    let l_kc = linear_ev.iter().find(|(k, _)| *k == 4).map(|(_, v)| *v).unwrap();
-    let l_k2c = linear_ev.iter().find(|(k, _)| *k == 8).map(|(_, v)| *v).unwrap();
+    let c_kc = circle_ev
+        .iter()
+        .find(|(k, _)| *k == 4)
+        .map(|(_, v)| *v)
+        .unwrap();
+    let c_k2c = circle_ev
+        .iter()
+        .find(|(k, _)| *k == 8)
+        .map(|(_, v)| *v)
+        .unwrap();
+    let l_kc = linear_ev
+        .iter()
+        .find(|(k, _)| *k == 4)
+        .map(|(_, v)| *v)
+        .unwrap();
+    let l_k2c = linear_ev
+        .iter()
+        .find(|(k, _)| *k == 8)
+        .map(|(_, v)| *v)
+        .unwrap();
     let circle_tail = c_k2c - c_kc;
     let linear_tail = l_k2c - l_kc;
     println!(

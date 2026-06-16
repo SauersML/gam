@@ -494,11 +494,34 @@ fn expand_expr(pair: Pair<'_, Rule>, raw: &str) -> Result<Vec<WrAtomList>, Strin
                 }
                 .into());
             }
+            if let Some(extra_op) = iter.next() {
+                let extra = extra_op.as_str().trim();
+                return Err(FormulaDslError::ParseError {
+                    reason: format!(
+                        "invalid term syntax in `{raw}`: chained `^` operators are not supported; \
+                         use one positive integer exponent, got another `{extra}`"
+                    ),
+                }
+                .into());
+            }
             Ok(wr_power(base, n))
         }
         Rule::unary => {
+            let unary_start = pair.as_span().start();
             for inner in pair.into_inner() {
                 if inner.as_rule() == Rule::primary {
+                    let prefix_len = inner.as_span().start().saturating_sub(unary_start);
+                    if prefix_len > 0 {
+                        let prefix = &raw[unary_start..inner.as_span().start()];
+                        if prefix.chars().any(|ch| matches!(ch, '+' | '-')) {
+                            return Err(FormulaDslError::IncompatibleTerm {
+                                reason: format!(
+                                    "unary `+`/`-` is not supported inside a formula term in `{raw}`"
+                                ),
+                            }
+                            .into());
+                        }
+                    }
                     return expand_expr(inner, raw);
                 }
             }
@@ -967,6 +990,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_formula_rejects_unary_signs_inside_wr_expansion() {
+        for formula in ["y ~ x:-z", "y ~ a*-b", "y ~ x/-z", "y ~ x:+z"] {
+            let err = parse_formula(formula)
+                .expect_err("WR expansion must not silently drop unary signs");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unary `+`/`-` is not supported"),
+                "unexpected error for {formula}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_formula_supports_wr_power_crossing() {
+        let parsed = parse_formula("y ~ (x + z)^2").expect("`^` is supported as WR power");
+        assert_eq!(parsed.response, "y");
+        assert_eq!(parsed.terms.len(), 3);
+        let names: Vec<String> = parsed
+            .terms
+            .iter()
+            .map(|t| match t {
+                ParsedTerm::Linear { name, .. } => format!("Linear({name})"),
+                ParsedTerm::Interaction { vars } => format!("Interaction({})", vars.join(":")),
+                other => format!("Other({other:?})"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "Linear(x)".to_string(),
+                "Linear(z)".to_string(),
+                "Interaction(x:z)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_formula_rejects_chained_wr_power() {
+        let err = parse_formula("y ~ (x + z)^2^3")
+            .expect_err("chained WR powers must not silently drop later exponents");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chained `^` operators are not supported"),
+            "error should explain that chained powers are rejected, got: {msg}"
+        );
+    }
+
+    #[test]
     fn parsed_terms_reference_column_sees_the_by_smooth_variable() {
         // Regression for #807: the by= grouping variable lives in
         // options["by"], not the smooth's positional vars. The reference
@@ -1282,6 +1353,10 @@ pub fn validate_marginal_slope_z_column_exclusion(
 pub enum SmoothKind {
     S,
     Te,
+    /// Tensor smooth (`t2(...)`) using mgcv's separable penalty decomposition:
+    /// the tensor coefficient space is split into marginal penalized/null-space
+    /// tensor subspaces, with one smoothing parameter per non-null subspace.
+    T2,
     /// Tensor *interaction* smooth (`ti(...)`): a tensor-product smooth whose
     /// marginal main effects are excluded, so the term captures only the pure
     /// interaction between its variables. Materializes through the same tensor
@@ -2448,6 +2523,20 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
+            "t2" => {
+                if vars.len() < 2 {
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("t2() requires at least two variables: {raw}"),
+                    }
+                    .into());
+                }
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::T2,
+                    options,
+                });
+            }
             "ti" => {
                 // Tensor interaction smooth (mgcv `ti`): structurally a
                 // tensor-product smooth, but the marginal main effects are
@@ -2754,7 +2843,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), ti(), fs(), sz(), group()/re()/factor(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), logslope()/log_slope(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), t2(), ti(), fs(), sz(), group()/re()/factor(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), logslope()/log_slope(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }

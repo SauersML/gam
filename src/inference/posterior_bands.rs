@@ -45,8 +45,11 @@ pub struct PosteriorPredictBandsPayload {
 
 /// Posterior eta matrix (n_draws x n_rows) -> per-row bands.
 ///
-/// Requires at least one posterior draw and uses link-scale quantiles for the
-/// response-scale credible bounds (monotone inverse link preserves quantiles).
+/// Requires at least one posterior draw. Link-scale credible bounds are
+/// quantiles of eta draws; response-scale credible bounds are quantiles of the
+/// inverse-link-transformed draws. Direct response quantiles intentionally do
+/// not reuse transformed eta quantiles: finite-sample interpolated quantiles do
+/// not commute with nonlinear inverse links.
 /// The response-scale **point estimate** is the posterior mean of the
 /// response-scale draws — i.e. `E[g^{-1}(eta)]`, **not** `g^{-1}(E[eta])`.
 /// For nonlinear inverse links (logit, log, probit, cloglog) the two differ
@@ -85,6 +88,8 @@ pub fn eta_bands_from_matrix_link(
     let mut eta_lower = vec![0.0_f64; n_rows];
     let mut eta_upper = vec![0.0_f64; n_rows];
     let mut response_mean = vec![0.0_f64; n_rows];
+    let mut response_lower = vec![0.0_f64; n_rows];
+    let mut response_upper = vec![0.0_f64; n_rows];
     let mut column = vec![0.0_f64; n_draws];
     let inv_n = 1.0 / n_draws as f64;
     for j in 0..n_rows {
@@ -104,19 +109,21 @@ pub fn eta_bands_from_matrix_link(
             rsum += *v;
         }
         response_mean[j] = rsum * inv_n;
+        let mut response_column = response_draws;
+        response_column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        response_lower[j] = quantile_from_sorted(&response_column, alpha);
+        response_upper[j] = quantile_from_sorted(&response_column, 1.0 - alpha);
         column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         eta_lower[j] = quantile_from_sorted(&column, alpha);
         eta_upper[j] = quantile_from_sorted(&column, 1.0 - alpha);
     }
-    let mean_lower = link.apply(&eta_lower)?;
-    let mean_upper = link.apply(&eta_upper)?;
     Ok((
         eta_mean,
         eta_lower,
         eta_upper,
         response_mean,
-        mean_lower,
-        mean_upper,
+        response_lower,
+        response_upper,
     ))
 }
 
@@ -127,7 +134,13 @@ pub fn posterior_eta_bands(
     family_kind: &str,
     level: f64,
 ) -> Result<PosteriorPredictBandsPayload, String> {
-    posterior_eta_bands_link(eta_flat, n_draws, n_rows, LinkSelector::Tag(family_kind), level)
+    posterior_eta_bands_link(
+        eta_flat,
+        n_draws,
+        n_rows,
+        LinkSelector::Tag(family_kind),
+        level,
+    )
 }
 
 /// Spec-aware sibling of [`posterior_eta_bands`]. When `link` is a
@@ -189,6 +202,8 @@ mod tests {
     ///      inverse-link draws), *not* `g^{-1}(E[eta])`. Under a strictly
     ///      convex inverse link the two differ by Jensen's inequality, and
     ///      this asymmetric column makes that difference observable.
+    ///   3. The response-scale bounds are direct quantiles of the inverse-link
+    ///      draws, not inverse-link transforms of the eta quantiles.
     #[test]
     fn eta_bands_match_shared_quantile_and_response_mean_semantics() {
         // Column 0: symmetric draws. Column 1: deliberately skewed so the
@@ -225,6 +240,18 @@ mod tests {
                 (mean[j] - resp_mean).abs() < 1e-12,
                 "response mean must be E[g^-1(eta)] for col {j}"
             );
+            let mut resp_col: Vec<f64> = col.iter().map(|e| e.exp()).collect();
+            resp_col.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            let resp_lo = quantile_from_sorted(&resp_col, alpha);
+            let resp_hi = quantile_from_sorted(&resp_col, 1.0 - alpha);
+            assert!(
+                (mean_lower[j] - resp_lo).abs() < 1e-12,
+                "response lower band must be response-draw quantile col {j}"
+            );
+            assert!(
+                (mean_upper[j] - resp_hi).abs() < 1e-12,
+                "response upper band must be response-draw quantile col {j}"
+            );
 
             col.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
             let lo = quantile_from_sorted(&col, alpha);
@@ -241,10 +268,6 @@ mod tests {
                 eta_lower[j] <= eta_mean[j] && eta_mean[j] <= eta_upper[j],
                 "eta mean must sit inside nonzero interval col {j}"
             );
-            assert!(
-                mean_lower[j] <= mean[j] && mean[j] <= mean_upper[j],
-                "response mean must sit inside nonzero interval col {j}"
-            );
         }
 
         // Jensen gap is real and oriented: for the skewed column the
@@ -253,6 +276,11 @@ mod tests {
         assert!(
             mean[1] > mean_eta_col1.exp() + 1e-9,
             "E[exp(eta)] must exceed exp(E[eta]) for the convex link"
+        );
+        let transformed_eta_lower = eta_lower[1].exp();
+        assert!(
+            (mean_lower[1] - transformed_eta_lower).abs() > 1e-3,
+            "nonlinear response lower bound must not be transform-of-eta-quantile"
         );
     }
 
@@ -320,14 +348,11 @@ mod tests {
     ///      `E[g⁻¹]` (not `g⁻¹(E[η])`) contract the `Tag` path honors — verified
     ///      against an independent hand computation through the canonical solver
     ///      evaluator `inverse_link_mu_d1_for_inverse_link`;
-    ///   3. the band edges are the SAS inverse link applied to the link-scale
-    ///      quantiles, and bracket the point mean (monotone link preserves the
-    ///      ordering).
+    ///   3. the response band edges are direct quantiles of SAS inverse-link
+    ///      draws, not SAS inverse-link transforms of eta quantiles.
     #[test]
     fn spec_path_produces_finite_response_bands_for_parameterized_sas_link() {
-        use crate::solver::mixture_link::{
-            inverse_link_mu_d1_for_inverse_link, SasLinkState,
-        };
+        use crate::solver::mixture_link::{SasLinkState, inverse_link_mu_d1_for_inverse_link};
         use crate::types::InverseLink;
 
         let state = SasLinkState::new(0.7, -0.4).expect("valid SAS link state");
@@ -350,11 +375,7 @@ mod tests {
         let alpha = (1.0 - level) / 2.0;
 
         // The bare string tag has no SAS state and refuses outright.
-        assert!(crate::families::inverse_link::apply_inverse_link_vec(
-            &[0.0_f64],
-            "sas"
-        )
-        .is_err());
+        assert!(crate::families::inverse_link::apply_inverse_link_vec(&[0.0_f64], "sas").is_err());
 
         let selector = LinkSelector::Spec(&link);
         let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
@@ -393,7 +414,7 @@ mod tests {
                 resp_mean
             );
 
-            // Band edges are the SAS inverse link applied to the η quantiles.
+            // Link-scale band edges are eta quantiles.
             let mut sorted = col.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
             let lo_eta = quantile_from_sorted(&sorted, alpha);
@@ -402,19 +423,20 @@ mod tests {
                 (eta_lower[j] - lo_eta).abs() < 1e-12 && (eta_upper[j] - hi_eta).abs() < 1e-12,
                 "link-scale band edges must be the shared quantiles for col {j}"
             );
-            let (lo_mu, _) =
-                inverse_link_mu_d1_for_inverse_link(&link, lo_eta).expect("solver jet eval");
-            let (hi_mu, _) =
-                inverse_link_mu_d1_for_inverse_link(&link, hi_eta).expect("solver jet eval");
+            let mut response_sorted: Vec<f64> = col
+                .iter()
+                .map(|&e| {
+                    inverse_link_mu_d1_for_inverse_link(&link, e)
+                        .expect("solver jet eval")
+                        .0
+                })
+                .collect();
+            response_sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            let lo_mu = quantile_from_sorted(&response_sorted, alpha);
+            let hi_mu = quantile_from_sorted(&response_sorted, 1.0 - alpha);
             assert!(
                 (mean_lower[j] - lo_mu).abs() < 1e-12 && (mean_upper[j] - hi_mu).abs() < 1e-12,
-                "response band edges must be the SAS inverse link of the eta quantiles col {j}"
-            );
-
-            // Monotone link: the response mean sits inside the response band.
-            assert!(
-                mean_lower[j] <= mean[j] && mean[j] <= mean_upper[j],
-                "response mean must sit inside the SAS response band col {j}"
+                "response band edges must be SAS response-draw quantiles col {j}"
             );
             // Link-scale mean is the plain average of the draws.
             let mean_eta: f64 = col.iter().sum::<f64>() / 5.0;
@@ -428,6 +450,11 @@ mod tests {
             .expect("payload");
         assert_eq!(payload.n_rows, 2);
         assert_eq!(payload.family_kind, link.link_function().name());
-        assert!(payload.mean.iter().all(|v| v.is_finite() && *v > 0.0 && *v < 1.0));
+        assert!(
+            payload
+                .mean
+                .iter()
+                .all(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
+        );
     }
 }

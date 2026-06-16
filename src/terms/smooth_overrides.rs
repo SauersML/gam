@@ -85,7 +85,14 @@ pub fn apply_smooth_overrides(
                 format!("smooths[{symbol:?}] descriptor missing required \"kind\" field")
             })?;
         apply_one_override(term, kind, descriptor_obj, symbol, inference_notes)?;
-        apply_by_variable(term, descriptor_obj, symbol, data, &column_index, inference_notes)?;
+        apply_by_variable(
+            term,
+            descriptor_obj,
+            symbol,
+            data,
+            &column_index,
+            inference_notes,
+        )?;
     }
     Ok(())
 }
@@ -1236,7 +1243,10 @@ mod tests {
     #[test]
     fn by_column_name_wraps_in_by_variable_envelope() {
         // Columns: x (the smooth), g (the numeric gating multiplier at col 1).
-        let data = dataset_with(&[("x", ColumnKindTag::Continuous), ("g", ColumnKindTag::Continuous)]);
+        let data = dataset_with(&[
+            ("x", ColumnKindTag::Continuous),
+            ("g", ColumnKindTag::Continuous),
+        ]);
         let mut spec = collection_with(bspline_term()); // s(x) on feature_col 0
         let overrides = json!({"x": {"kind": "bspline", "by": "g"}});
         let mut notes = Vec::new();
@@ -1267,7 +1277,10 @@ mod tests {
     /// formula by-smooth syntax (per-level replication isn't an in-place merge).
     #[test]
     fn by_categorical_column_is_rejected_with_pointer() {
-        let data = dataset_with(&[("x", ColumnKindTag::Continuous), ("g", ColumnKindTag::Categorical)]);
+        let data = dataset_with(&[
+            ("x", ColumnKindTag::Continuous),
+            ("g", ColumnKindTag::Categorical),
+        ]);
         let mut spec = collection_with(bspline_term());
         let overrides = json!({"x": {"kind": "bspline", "by": "g"}});
         let mut notes = Vec::new();

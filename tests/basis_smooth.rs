@@ -46,10 +46,10 @@ mod bc_minimum_k_stability;
 mod bc_periodic_combination_rejected;
 #[path = "basis_smooth/bc_predict_dimension_invariants.rs"]
 mod bc_predict_dimension_invariants;
-#[path = "basis_smooth/bspline_derivative_identity_bug.rs"]
-mod bspline_derivative_identity_bug;
 #[path = "basis_smooth/bspline_derivative_fd_oracle.rs"]
 mod bspline_derivative_fd_oracle;
+#[path = "basis_smooth/bspline_derivative_identity_bug.rs"]
+mod bspline_derivative_identity_bug;
 #[path = "basis_smooth/bspline_knot_options_formula.rs"]
 mod bspline_knot_options_formula;
 #[path = "basis_smooth/bspline_partition_unity_degree_1.rs"]
@@ -184,6 +184,8 @@ mod spline_k_sweep_easy_truth;
 mod spline_scan_exact_oracle;
 #[path = "basis_smooth/spline_scan_workflow_equivalence.rs"]
 mod spline_scan_workflow_equivalence;
+#[path = "basis_smooth/t2_tensor_penalty_decomposition.rs"]
+mod t2_tensor_penalty_decomposition;
 #[path = "basis_smooth/te_k_consistency_easy_truth.rs"]
 mod te_k_consistency_easy_truth;
 #[path = "basis_smooth/te_tensor_2d_hifreq_quality.rs"]

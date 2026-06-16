@@ -23,11 +23,11 @@ pub(crate) mod jeffreys_subspace;
 pub(crate) mod outer_eval;
 pub(crate) mod penalty_logdet;
 pub(crate) mod per_atom_efs;
+pub(crate) mod reml_outer_engine;
 mod rho_key;
 pub(crate) mod rho_prior_eval;
 mod sparse_exact_penalty;
 mod trace;
-pub(crate) mod reml_outer_engine;
 
 pub(crate) use sparse_exact_penalty::{
     SparsePenaltyBlock, build_sparse_penalty_blocks_from_canonical,

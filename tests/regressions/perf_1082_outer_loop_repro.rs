@@ -136,7 +136,10 @@ fn poisson_te_2d_outer_loop_converges_in_budget_1082() {
         fit.fit.outer_iterations, fit.fit.outer_converged,
     );
 
-    assert!(fit.fit.outer_converged, "Poisson te outer loop did not converge");
+    assert!(
+        fit.fit.outer_converged,
+        "Poisson te outer loop did not converge"
+    );
     assert!(
         fit.fit.outer_iterations <= 30,
         "Poisson te outer loop took {} iterations (expected ~5)",

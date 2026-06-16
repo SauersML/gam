@@ -1248,6 +1248,33 @@ impl CustomFamily for MultinomialFamily {
         Ok(Some(dh))
     }
 
+    fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        // BATCHED all-axes fast path for the Tier-B Jeffreys/Firth loop
+        // (#979). The generic trait default queries `Hdot[e_a]` `p = (K−1)·P`
+        // separate times through the per-axis hook; each call takes the
+        // axis-derivative cache Mutex and CLONES a full `dim×dim` matrix out
+        // of the memo, and the default sweep runs SERIALLY. Multinomial
+        // already assembles the WHOLE axis set in ONE row-parallel softmax pass
+        // (`assemble_all_axis_directional_derivatives`, fanned over the n rows
+        // with a per-thread fold/reduce). Wire that directly here: a single
+        // parallel build, returned by move with no per-axis Mutex traffic or
+        // dim×dim clones. Bit-identical to the per-axis route by construction —
+        // it is the very function `cached_axis_directional_derivative` fills its
+        // memo from, so each returned axis matrix equals the cached clone the
+        // serial loop would have produced. `specs` only steer the trait-default
+        // routing (coupled multinomial always serves from its own coupled joint
+        // derivative); the β-fixed `η` comes from `block_states` exactly as the
+        // per-axis `exact_newton_joint_hessian_directional_derivative` does.
+        let eta = self.collect_eta_matrix(block_states)?;
+        Ok(Some(
+            self.assemble_all_axis_directional_derivatives(eta.view()),
+        ))
+    }
+
     fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],

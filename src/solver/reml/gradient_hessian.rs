@@ -4236,7 +4236,8 @@ impl<'a> RemlState<'a> {
     /// of constant-rank strata and FD probes are only meaningful within one.
     pub(super) fn intrinsic_hessian_pseudo_logdet_parts(
         h_total: &Array2<f64>,
-    ) -> Result<(f64, Option<super::reml_outer_engine::PenaltySubspaceTrace>), EstimationError> {
+    ) -> Result<(f64, Option<super::reml_outer_engine::PenaltySubspaceTrace>), EstimationError>
+    {
         let p = h_total.ncols();
         if p == 0 {
             return Ok((0.0, None));
@@ -4256,8 +4257,10 @@ impl<'a> RemlState<'a> {
         let (h_evals, h_evecs) = h_sym
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let h_thr = super::reml_outer_engine::positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
-        let log_det = super::reml_outer_engine::exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_thr);
+        let h_thr =
+            super::reml_outer_engine::positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
+        let log_det =
+            super::reml_outer_engine::exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_thr);
         let kept: Vec<usize> = (0..p).filter(|&j| h_evals[j] > h_thr).collect();
         if kept.is_empty() {
             // No positive curvature anywhere: nothing identified, nothing to

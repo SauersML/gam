@@ -1595,6 +1595,9 @@ pub enum PenaltySource {
     TensorMarginal {
         dim: usize,
     },
+    TensorSeparable {
+        penalized_margins: Vec<usize>,
+    },
     TensorGlobalRidge,
     Other(String),
 }

@@ -329,7 +329,7 @@ pub(crate) fn default_inner_cycle_budget_covers_large_scale_joint_newton_tail() 
 
 #[test]
 pub(crate) fn startup_validation_failure_routes_to_never_fail_escalation() {
-    use crate::estimate::EstimationError;
+    use crate::model_types::EstimationError;
 
     let all_seeds_rejected = EstimationError::RemlOptimizationFailed(
         "no candidate seeds passed outer startup validation (custom family):\n  generated=4"

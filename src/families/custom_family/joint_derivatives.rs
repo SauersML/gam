@@ -281,7 +281,8 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 
     fn outer_hessian_derivative_kernel(
         &self,
-    ) -> Option<crate::solver::estimate::reml::reml_outer_engine::OuterHessianDerivativeKernel> {
+    ) -> Option<crate::solver::estimate::reml::reml_outer_engine::OuterHessianDerivativeKernel>
+    {
         Some(
             crate::solver::estimate::reml::reml_outer_engine::OuterHessianDerivativeKernel::Callback {
                 first: Arc::clone(&self.compute_dh),
@@ -517,7 +518,8 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
 
     fn outer_hessian_derivative_kernel(
         &self,
-    ) -> Option<crate::solver::estimate::reml::reml_outer_engine::OuterHessianDerivativeKernel> {
+    ) -> Option<crate::solver::estimate::reml::reml_outer_engine::OuterHessianDerivativeKernel>
+    {
         // Delegate to the inner provider so the matrix-free outer-HESSIAN route
         // (the `Callback { first, second }` kernel) is preserved. This kernel
         // feeds ONLY the outer Hessian, never the gradient (the gradient's

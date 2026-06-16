@@ -11,6 +11,7 @@
 //! These assert OBJECTIVE quality (truth recovery / calibration), not
 //! reproduction of any reference tool's fitted output.
 
+use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use gam::terms::decoders::behavioral_head::{
     AuxOutcomeFamily, BehavioralHead, LeakageAbsorber, head_feature_significance,
 };
@@ -314,6 +315,42 @@ fn behavioral_loading_on_null_atoms_is_fdr_controlled() {
         false_rejections,
         sig.fdr_rejected
     );
+}
+
+#[test]
+fn multinomial_head_feature_p_values_are_channel_bonferroni_adjusted() {
+    let coeffs = Array1::from_vec(vec![0.0, 2.0, 0.0, 0.1]);
+    let covariance = Array2::eye(coeffs.len());
+    let p0 = wood_smooth_test(SmoothTestInput {
+        beta: coeffs.view(),
+        covariance: &covariance,
+        influence_matrix: None,
+        coeff_range: 1..2,
+        edf: 1.0,
+        nullspace_dim: 1,
+        residual_df: 200.0,
+        scale: SmoothTestScale::Estimated,
+    })
+    .expect("channel 0 smooth test")
+    .p_value;
+    let p1 = wood_smooth_test(SmoothTestInput {
+        beta: coeffs.view(),
+        covariance: &covariance,
+        influence_matrix: None,
+        coeff_range: 3..4,
+        edf: 1.0,
+        nullspace_dim: 1,
+        residual_df: 200.0,
+        scale: SmoothTestScale::Estimated,
+    })
+    .expect("channel 1 smooth test")
+    .p_value;
+
+    let sig = head_feature_significance(coeffs.view(), &covariance, 1, 2, 200.0, 0.1)
+        .expect("significance");
+
+    let expected = (p0.min(p1) * 2.0).min(1.0);
+    assert!((sig.p_value[0] - expected).abs() < 1e-12);
 }
 
 #[test]

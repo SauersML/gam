@@ -659,8 +659,9 @@ fn compute_gauss_hermite() -> GaussHermiteRule {
     let mut weights = [0.0f64; N_POINTS];
 
     // Weights: wᵢ = μ₀ * (first component of eigenvector)².
-    // `symmetric_tridiagonal_eigen` accumulates left rotations and returns Z = Q^T,
-    // so q_{0i} is stored at eigenvectors[i][0].
+    // `symmetric_tridiagonal_eigen` applies the QL rotations to rows of the
+    // accumulator and returns Q^T, so the first component of eigenvector i is
+    // stored at eigenvectors[i][0], not eigenvectors[0][i].
     // For physicist's Hermite: μ₀ = ∫exp(-x²)dx = sqrt(π)
     let mu0 = std::f64::consts::PI.sqrt();
     for i in 0..N_POINTS {
@@ -4701,8 +4702,11 @@ mod tests {
     }
 
     #[test]
-    fn test_matches_known_7_point_constants() {
+    fn test_matches_abramowitz_stegun_7_point_gauss_hermite_constants() {
         assert!(file!().ends_with(".rs"));
+        // Abramowitz & Stegun 25.4, 7-point Gauss-Hermite rule for the
+        // physicist's weight exp(-x^2). This pins both the Jacobi matrix and
+        // the eigenvector orientation used for Golub-Welsch weights.
         let known_nodes = [
             -2.651_961_356_835_233_4,
             -1.673_551_628_767_471_4,
@@ -4728,6 +4732,48 @@ mod tests {
             assert_relative_eq!(gh.nodes[i], known_nodes[i], epsilon = 1e-12);
             assert_relative_eq!(gh.weights[i], knownweights[i], epsilon = 1e-12);
         }
+    }
+
+    #[test]
+    fn test_gauss_hermite_weight_assembly_uses_eigenvector_rows() {
+        let mut diag = [0.0_f64; N_POINTS];
+        let mut off_diag = [0.0_f64; N_POINTS - 1];
+        for (i, od) in off_diag.iter_mut().enumerate() {
+            *od = (((i + 1) as f64) / 2.0).sqrt();
+        }
+        let (nodes, eigenvectors) = symmetric_tridiagonal_eigen(&mut diag, &mut off_diag);
+        let mu0 = std::f64::consts::PI.sqrt();
+        let mut row_pairs: Vec<(f64, f64)> = (0..N_POINTS)
+            .map(|i| (nodes[i], mu0 * eigenvectors[i][0] * eigenvectors[i][0]))
+            .collect();
+        let mut column_pairs: Vec<(f64, f64)> = (0..N_POINTS)
+            .map(|i| (nodes[i], mu0 * eigenvectors[0][i] * eigenvectors[0][i]))
+            .collect();
+        row_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        column_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let knownweights = [
+            0.000_971_781_245_099_519_1,
+            0.054_515_582_819_127_03,
+            0.425_607_252_610_127_8,
+            0.810_264_617_556_807_3,
+            0.425_607_252_610_127_8,
+            0.054_515_582_819_127_03,
+            0.000_971_781_245_099_519_1,
+        ];
+
+        for i in 0..N_POINTS {
+            assert_relative_eq!(row_pairs[i].1, knownweights[i], epsilon = 1e-12);
+        }
+        let column_error: f64 = column_pairs
+            .iter()
+            .zip(knownweights.iter())
+            .map(|(actual, expected)| (actual.1 - expected).abs())
+            .sum();
+        assert!(
+            column_error > 1.0,
+            "column-oriented eigenvector indexing unexpectedly matched A&S weights"
+        );
     }
 
     #[test]

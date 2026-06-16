@@ -766,7 +766,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
     }
 
-    use crate::estimate::EstimationError;
+    use crate::model_types::EstimationError;
     use crate::solver::rho_optimizer::{FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem};
 
     let screening_cap = Arc::new(AtomicUsize::new(0));

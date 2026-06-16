@@ -1783,7 +1783,11 @@ fn survival_marginal_slope_advertises_outer_hvp_at_large_psi_dim() {
         family.exact_outer_derivative_order(&specs, &options),
         ExactOuterDerivativeOrder::Second
     );
-    assert!(crate::solver::estimate::reml::reml_outer_engine::prefer_outer_hessian_operator(50_001, 2, 32,));
+    assert!(
+        crate::solver::estimate::reml::reml_outer_engine::prefer_outer_hessian_operator(
+            50_001, 2, 32,
+        )
+    );
     assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
@@ -5256,7 +5260,8 @@ fn survival_psi_workspace_hessian_directional_derivative_is_operator_and_matches
         .expect("workspace drift")
         .expect("workspace drift available");
 
-    let crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator(op) = result else {
+    let crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator(op) = result
+    else {
         panic!("survival psi drift should use operator representation");
     };
     assert_eq!(op.dim(), dense.nrows());
@@ -5486,7 +5491,7 @@ fn flex_no_wiggle_test_block_states(
 #[test]
 fn step6_joint_beta_pullback_matches_cpu_dense_assembly_flex_no_wiggle() {
     use crate::families::survival::marginal_slope::gpu::{
-        pullback_step6_joint_beta, SurvivalFlexStep5RowOutputs, SurvivalFlexStep6RowPullback,
+        SurvivalFlexStep5RowOutputs, SurvivalFlexStep6RowPullback, pullback_step6_joint_beta,
     };
 
     let n = 24usize;
@@ -5573,9 +5578,7 @@ fn step6_joint_beta_pullback_matches_cpu_dense_assembly_flex_no_wiggle() {
         }
         // Influence absorber primary `o_infl` (single scalar): maps to its γ
         // coefficients through the residualized design row `Z̃[row,:]`.
-        if let (Some(infl_primary), Some(infl_joint)) =
-            (primary.infl, slices.influence.as_ref())
-        {
+        if let (Some(infl_primary), Some(infl_joint)) = (primary.infl, slices.influence.as_ref()) {
             let z_tilde = family
                 .influence_absorber
                 .as_ref()

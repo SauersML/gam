@@ -803,12 +803,13 @@ fn canonicalize_for_identifiability_inner(
         // unchanged. (`stacked_design` blocks never reach this width-reducing
         // branch — they are vetoed above.)
         let reduced_jacobian_callback = match spec.jacobian_callback.as_ref() {
-            Some(cb) if !dropped_sorted.is_empty() => {
-                Some(Arc::new(crate::families::custom_family::GaugeComposedJacobian::new(
+            Some(cb) if !dropped_sorted.is_empty() => Some(Arc::new(
+                crate::families::custom_family::GaugeComposedJacobian::new(
                     Arc::clone(cb),
                     Arc::new(t_i.clone()),
-                )) as Arc<dyn BlockEffectiveJacobian>)
-            }
+                ),
+            )
+                as Arc<dyn BlockEffectiveJacobian>),
             other => other.cloned(),
         };
 

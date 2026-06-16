@@ -155,12 +155,12 @@ mod total_variation;
 
 pub use ard::*;
 pub use block_sparsity::*;
-pub use penalty_trait::*;
 pub use ibp::*;
 pub use isometry::*;
 pub use nested_prefix::*;
 pub use nuclear_norm::*;
 pub use orthogonality::*;
+pub use penalty_trait::*;
 pub use registry::*;
 pub use row_precision::*;
 pub use scad_mcp::*;

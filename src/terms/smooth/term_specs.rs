@@ -696,6 +696,8 @@ pub struct TensorBSplineSpec {
     pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: TensorBSplineIdentifiability,
+    #[serde(default)]
+    pub penalty_decomposition: TensorBSplinePenaltyDecomposition,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -716,6 +718,18 @@ pub enum TensorBSplineIdentifiability {
     FrozenTransform {
         transform: Array2<f64>,
     },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TensorBSplinePenaltyDecomposition {
+    /// mgcv `te(...)`: one overlapping Kronecker-product penalty per margin,
+    /// `S_j` embedded against identities in the other tensor factors.
+    #[default]
+    MarginalKroneckerSum,
+    /// mgcv `t2(...)`: split every marginal coefficient space into penalized
+    /// range and penalty-null subspaces, then emit one disjoint tensor-subspace
+    /// penalty for every non-empty penalized/null combination.
+    Separable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -998,10 +1012,7 @@ impl LinearTermSpec {
     /// `feature_cols`, non-empty `categorical_levels`) reduces to the cell
     /// indicator. Bounds are validated here; the returned column has length
     /// `data.nrows()`.
-    pub fn realized_design_column(
-        &self,
-        data: ArrayView2<'_, f64>,
-    ) -> Result<Array1<f64>, String> {
+    pub fn realized_design_column(&self, data: ArrayView2<'_, f64>) -> Result<Array1<f64>, String> {
         let n = data.nrows();
         let p = data.ncols();
         let bounds = |col: usize| -> Result<(), String> {
@@ -2023,8 +2034,8 @@ impl KroneckerPenaltySystem {
                 structural_sigma += marginal_eigenvalue;
                 sigma += lambdas[k] * marginal_eigenvalue;
             }
-            if self.has_double_penalty {
-                structural_sigma += 1.0;
+            let joint_null = structural_sigma <= STRUCTURAL_ZERO_FLOOR;
+            if self.has_double_penalty && joint_null {
                 sigma += lambdas[d];
             }
             if structural_sigma > STRUCTURAL_ZERO_FLOOR {
@@ -2039,16 +2050,20 @@ impl KroneckerPenaltySystem {
                 for k in 0..n_pen {
                     let ck = if k < d {
                         lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]]
-                    } else {
+                    } else if joint_null {
                         lambdas[d]
+                    } else {
+                        0.0
                     };
                     grad[k] += ck * inv_sigma;
                     hess[[k, k]] += ck * inv_sigma - ck * ck * inv_sigma2;
                     for l in (k + 1)..n_pen {
                         let cl = if l < d {
                             lambdas[l] * self.marginal_eigensystems[l].0[multi_idx[l]]
-                        } else {
+                        } else if joint_null {
                             lambdas[d]
+                        } else {
+                            0.0
                         };
                         let off = -ck * cl * inv_sigma2;
                         hess[[k, l]] += off;
@@ -2073,6 +2088,35 @@ impl KroneckerPenaltySystem {
             }
         }
         (logdet, rank, grad, hess)
+    }
+}
+
+#[cfg(test)]
+mod kronecker_penalty_system_tests {
+    use super::KroneckerPenaltySystem;
+    use ndarray::array;
+
+    #[test]
+    fn double_penalty_rank_derivatives_use_only_joint_null_space() {
+        let penalties = vec![
+            array![[0.0, 0.0], [0.0, 2.0]],
+            array![[0.0, 0.0], [0.0, 3.0]],
+        ];
+        let system = KroneckerPenaltySystem::new(penalties, vec![2usize, 2usize], true).unwrap();
+        let lambdas = vec![5.0, 7.0, 11.0];
+
+        let (logdet, rank, grad, hess) = system.logdet_rank_and_derivatives(&lambdas, 0.0);
+
+        let expected_diag = [11.0_f64, 21.0, 10.0, 31.0];
+        let expected_logdet: f64 = expected_diag.iter().map(|v| v.ln()).sum();
+        assert_eq!(rank, 4);
+        assert!((logdet - expected_logdet).abs() <= 1e-12);
+        assert!(
+            (grad[2] - 1.0).abs() <= 1e-12,
+            "double-penalty rank derivative must count only the joint null mode, got {}",
+            grad[2]
+        );
+        assert!(hess[[2, 2]].abs() <= 1e-12);
     }
 }
 
@@ -4577,6 +4621,50 @@ fn tensor_product_design_from_sparse_marginals(
     })
 }
 
+struct TensorMarginRangeNullProjectors {
+    range: Array2<f64>,
+    null: Array2<f64>,
+}
+
+fn projector_from_columns(columns: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
+    if indices.is_empty() {
+        return Array2::<f64>::zeros((columns.nrows(), columns.nrows()));
+    }
+    let basis = columns.select(Axis(1), indices);
+    basis.dot(&basis.t())
+}
+
+fn tensor_margin_range_null_projectors(
+    normalized_marginal_penalties: &[(Array2<f64>, f64)],
+) -> Result<Vec<TensorMarginRangeNullProjectors>, BasisError> {
+    normalized_marginal_penalties
+        .iter()
+        .enumerate()
+        .map(|(dim, (penalty, _))| {
+            let analysis = crate::terms::basis::analyze_penalty_block(penalty)?;
+            if analysis.rank == 0 {
+                crate::bail_invalid_basis!(
+                    "t2 separable tensor penalty margin {dim} has rank-zero penalty; \
+                     cannot split penalized and null subspaces"
+                );
+            }
+            let mut range_idx = Vec::<usize>::new();
+            let mut null_idx = Vec::<usize>::new();
+            for (idx, &ev) in analysis.eigenvalues.iter().enumerate() {
+                if ev > analysis.tol {
+                    range_idx.push(idx);
+                } else {
+                    null_idx.push(idx);
+                }
+            }
+            Ok(TensorMarginRangeNullProjectors {
+                range: projector_from_columns(&analysis.eigenvectors, &range_idx),
+                null: projector_from_columns(&analysis.eigenvectors, &null_idx),
+            })
+        })
+        .collect()
+}
+
 fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
@@ -4742,7 +4830,10 @@ fn build_tensor_bspline_basis(
         .then(|| tensor_product_design_from_marginals(&marginal_designs))
         .transpose()?;
     let mut candidates = Vec::<PenaltyCandidate>::with_capacity(
-        marginal_penalties.len() + if spec.double_penalty { 1 } else { 0 },
+        match spec.penalty_decomposition {
+            TensorBSplinePenaltyDecomposition::MarginalKroneckerSum => marginal_penalties.len(),
+            TensorBSplinePenaltyDecomposition::Separable => marginal_penalties.len() * 2,
+        } + if spec.double_penalty { 1 } else { 0 },
     );
 
     // Tensor-product smoothing parameters are one-per-margin.  Therefore the
@@ -4759,65 +4850,110 @@ fn build_tensor_bspline_basis(
     let mut kronecker_marginal_penalties =
         Vec::<Array2<f64>>::with_capacity(normalized_marginal_penalties.len());
 
-    // Accumulate the Kronecker-sum of the per-margin penalties, `Σ_dim S_dim`,
-    // whose null space is exactly the *joint* null space of all marginal
-    // penalties — the tensor of the marginal polynomial null spaces, i.e. the
-    // bilinear (low-order) directions that no marginal roughness operator
-    // touches. The tensor double penalty (below) shrinks only this joint null,
-    // never the already-penalized interaction range.
-    let mut marginal_kron_sum = Array2::<f64>::zeros((total_cols, total_cols));
+    match spec.penalty_decomposition {
+        TensorBSplinePenaltyDecomposition::MarginalKroneckerSum => {
+            // Accumulate the Kronecker-sum of the per-margin penalties,
+            // `Σ_dim S_dim`, whose null space is exactly the *joint* null space
+            // of all marginal penalties — the tensor of marginal polynomial
+            // null spaces. The tensor double penalty (below) shrinks only this
+            // joint null, never the already-penalized interaction range.
+            let mut marginal_kron_sum = Array2::<f64>::zeros((total_cols, total_cols));
 
-    for dim in 0..normalized_marginal_penalties.len() {
-        let mut s_dim = Array2::<f64>::eye(1);
-        let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
-        for (j, &qj) in marginalnum_basis.iter().enumerate() {
-            let factor = if j == dim {
-                normalized_marginal_penalties[j].0.clone()
-            } else {
-                Array2::<f64>::eye(qj)
-            };
-            factors.push(factor.clone());
-            s_dim = kronecker_product(&s_dim, &factor);
+            for dim in 0..normalized_marginal_penalties.len() {
+                let mut s_dim = Array2::<f64>::eye(1);
+                let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
+                for (j, &qj) in marginalnum_basis.iter().enumerate() {
+                    let factor = if j == dim {
+                        normalized_marginal_penalties[j].0.clone()
+                    } else {
+                        Array2::<f64>::eye(qj)
+                    };
+                    factors.push(factor.clone());
+                    s_dim = kronecker_product(&s_dim, &factor);
+                }
+                if dim == kronecker_marginal_penalties.len() {
+                    kronecker_marginal_penalties.push(normalized_marginal_penalties[dim].0.clone());
+                }
+                marginal_kron_sum += &s_dim;
+
+                candidates.push(PenaltyCandidate {
+                    matrix: s_dim,
+                    nullspace_dim_hint: 0,
+                    source: PenaltySource::TensorMarginal { dim },
+                    normalization_scale: normalized_marginal_penalties[dim].1,
+                    kronecker_factors: Some(factors),
+                    op: None,
+                });
+            }
+
+            if spec.double_penalty
+                && let Some(shrink) =
+                    crate::terms::basis::build_nullspace_shrinkage_penalty(&marginal_kron_sum)?
+            {
+                let (matrix, normalization_scale) =
+                    normalize_penalty_in_constrained_space(&shrink.sym_penalty);
+                candidates.push(PenaltyCandidate {
+                    matrix,
+                    nullspace_dim_hint: 0,
+                    source: PenaltySource::TensorGlobalRidge,
+                    normalization_scale,
+                    kronecker_factors: None,
+                    op: None,
+                });
+            }
         }
-        if dim == kronecker_marginal_penalties.len() {
-            kronecker_marginal_penalties.push(normalized_marginal_penalties[dim].0.clone());
-        }
-        marginal_kron_sum += &s_dim;
+        TensorBSplinePenaltyDecomposition::Separable => {
+            let projectors = tensor_margin_range_null_projectors(&normalized_marginal_penalties)?;
+            let n_masks = 1usize.checked_shl(projectors.len() as u32).ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "t2 separable tensor penalty supports at most {} margins, got {}",
+                    usize::BITS - 1,
+                    projectors.len()
+                ))
+            })?;
+            for mask in 1..n_masks {
+                let mut matrix = Array2::<f64>::eye(1);
+                let mut factors = Vec::<Array2<f64>>::with_capacity(projectors.len());
+                let mut penalized_margins = Vec::<usize>::new();
+                for (dim, projector) in projectors.iter().enumerate() {
+                    let use_range = ((mask >> dim) & 1) == 1;
+                    let factor = if use_range {
+                        penalized_margins.push(dim);
+                        projector.range.clone()
+                    } else {
+                        projector.null.clone()
+                    };
+                    matrix = kronecker_product(&matrix, &factor);
+                    factors.push(factor);
+                }
+                let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&matrix);
+                candidates.push(PenaltyCandidate {
+                    matrix,
+                    nullspace_dim_hint: 0,
+                    source: PenaltySource::TensorSeparable { penalized_margins },
+                    normalization_scale,
+                    kronecker_factors: Some(factors),
+                    op: None,
+                });
+            }
 
-        candidates.push(PenaltyCandidate {
-            matrix: s_dim,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::TensorMarginal { dim },
-            normalization_scale: normalized_marginal_penalties[dim].1,
-            kronecker_factors: Some(factors),
-            op: None,
-        });
-    }
-
-    if spec.double_penalty {
-        // mgcv `select=TRUE` semantics, mirrored from the 1D double penalty:
-        // the extra penalty shrinks ONLY the directions left unpenalized by the
-        // primary (marginal) penalties — here the joint null space of the
-        // Kronecker-sum `Σ_dim S_dim` (the bilinear tensor null `Z₀ ⊗ Z₁`).
-        // A full identity ridge `I` over *all* tensor coefficients (the prior
-        // behavior) instead penalizes the already-penalized interaction range
-        // as well, and REML/LAML then places positive weight on it and
-        // systematically over-smooths the recovered surface; mgcv's `te`/`ti`
-        // carry no such global ridge. Penalizing the null subspace alone keeps
-        // the interaction range governed solely by the per-margin λ's.
-        if let Some(shrink) =
-            crate::terms::basis::build_nullspace_shrinkage_penalty(&marginal_kron_sum)?
-        {
-            let (matrix, normalization_scale) =
-                normalize_penalty_in_constrained_space(&shrink.sym_penalty);
-            candidates.push(PenaltyCandidate {
-                matrix,
-                nullspace_dim_hint: 0,
-                source: PenaltySource::TensorGlobalRidge,
-                normalization_scale,
-                kronecker_factors: None,
-                op: None,
-            });
+            if spec.double_penalty {
+                let mut matrix = Array2::<f64>::eye(1);
+                let mut factors = Vec::<Array2<f64>>::with_capacity(projectors.len());
+                for projector in &projectors {
+                    matrix = kronecker_product(&matrix, &projector.null);
+                    factors.push(projector.null.clone());
+                }
+                let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&matrix);
+                candidates.push(PenaltyCandidate {
+                    matrix,
+                    nullspace_dim_hint: 0,
+                    source: PenaltySource::TensorGlobalRidge,
+                    normalization_scale,
+                    kronecker_factors: Some(factors),
+                    op: None,
+                });
+            }
         }
     }
 
@@ -4973,7 +5109,11 @@ fn build_tensor_bspline_basis(
             periods: marginal_effective_periods,
             identifiability_transform: z_opt,
         },
-        kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
+        kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None)
+            && matches!(
+                spec.penalty_decomposition,
+                TensorBSplinePenaltyDecomposition::MarginalKroneckerSum
+            ) {
             Some(KroneckerFactoredBasis {
                 marginal_designs,
                 marginal_penalties: kronecker_marginal_penalties,

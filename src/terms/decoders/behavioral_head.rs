@@ -52,7 +52,7 @@
 //!    ones.
 
 use crate::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
-use crate::inference::structure_evidence::e_benjamini_hochberg;
+use crate::inference::structure_evidence::{e_benjamini_hochberg, log_e_from_p_calibrator};
 use crate::linalg::faer_ndarray::FaerSvd;
 use crate::solver::row_measure::RowSubsampleMask;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -564,10 +564,11 @@ pub struct HeadFeatureSignificance {
 /// coefficient `w_{c,k}` across η-channels. We test the null `w_{·,k} = 0`
 /// (the atom carries no behavioral signal) with [`wood_smooth_test`] on the
 /// coefficient block for that axis, using the head's posterior covariance.
-/// Raw p-values are converted to e-values (`e = 1/p`, the calibrated
-/// p-to-e transform) and fed to [`e_benjamini_hochberg`] for an FDR-controlled
-/// rejection set that needs no independence assumption across atoms — exactly
-/// the case BH cannot legally handle when atoms share tokens.
+/// Raw p-values are first Bonferroni-combined across η-channels for each axis,
+/// then converted to calibrated e-values with
+/// [`log_e_from_p_calibrator`] and fed to [`e_benjamini_hochberg`] for an
+/// FDR-controlled rejection set that needs no independence assumption across
+/// atoms — exactly the case BH cannot legally handle when atoms share tokens.
 ///
 /// `coeffs` is the fitted head coefficient vector (`n_eta · (1 + d)`),
 /// `covariance` its posterior covariance of the same size, `latent_dim` is `d`,
@@ -605,9 +606,10 @@ pub fn head_feature_significance(
         // for channel c the loading is at `c·block + 1 + axis`. wood_smooth_test
         // tests a contiguous range, so for the common Binomial (n_eta = 1) case
         // the range is a single coefficient; for multinomial we test each
-        // channel's loading and combine by the strongest evidence (min p).
+        // channel's loading and combine the minimum p-value with Bonferroni.
         let mut best_p = 1.0_f64;
         let mut best_stat = 0.0_f64;
+        let mut tested_channels = 0_usize;
         for c in 0..n_eta {
             let idx = c * block + 1 + axis;
             let input = SmoothTestInput {
@@ -621,18 +623,23 @@ pub fn head_feature_significance(
                 scale: SmoothTestScale::Estimated,
             };
             if let Some(res) = wood_smooth_test(input) {
+                tested_channels += 1;
                 if res.p_value < best_p {
                     best_p = res.p_value;
                     best_stat = res.statistic;
                 }
             }
         }
+        let axis_p = if tested_channels > 0 {
+            (best_p * tested_channels as f64).min(1.0)
+        } else {
+            1.0
+        };
         statistic.push(best_stat);
-        p_value.push(best_p);
-        // p-to-e calibration: e = 1/p is a valid (conservative) e-value for a
-        // p-value uniform under the null. Clamp to avoid log(0)/∞ on p = 0.
-        let p_clamped = best_p.clamp(1e-300, 1.0);
-        log_e_values.push(-p_clamped.ln());
+        p_value.push(axis_p);
+        log_e_values.push(log_e_from_p_calibrator(axis_p).map_err(|err| {
+            format!("head_feature_significance: invalid calibrated axis p-value: {err}")
+        })?);
     }
     let fdr_rejected = e_benjamini_hochberg(&log_e_values, alpha);
     Ok(HeadFeatureSignificance {

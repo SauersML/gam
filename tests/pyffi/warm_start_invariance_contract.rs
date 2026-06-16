@@ -35,7 +35,9 @@
 //! (#873's was ~30% of the curve's range). When a future cache key goes
 //! stale-blind again, this fails in CI instead of in a user's pipeline.
 
-use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
+use gam::inference::data::load_csvwith_inferred_schema;
+use gam::init_parallelism;
+use gam::solver::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use std::io::Write;
 
 struct InvarianceCase {

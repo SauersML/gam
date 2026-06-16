@@ -17,6 +17,7 @@ pub mod loop_guard;
 pub mod measure_jet_glm_sufficient;
 pub mod measure_jet_gram_cache;
 pub mod mixture_link;
+pub(crate) mod objective_base;
 pub mod orthogonal_reparam;
 pub mod outer_subsample;
 pub(crate) mod parallel_strategy;

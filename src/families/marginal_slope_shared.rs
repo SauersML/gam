@@ -55,10 +55,9 @@ pub fn make_beta_seed_validator(
     pending: &std::cell::RefCell<Option<Array1<f64>>>,
 ) -> impl FnMut(
     &Array1<f64>,
-) -> Result<
-    crate::solver::rho_optimizer::SeedOutcome,
-    crate::model_types::EstimationError,
-> + '_ {
+)
+    -> Result<crate::solver::rho_optimizer::SeedOutcome, crate::model_types::EstimationError>
++ '_ {
     move |beta: &Array1<f64>| {
         bail_if_cached_beta_non_finite(beta)?;
         // Stage the seed for promotion at the next eval, where the freshly
@@ -1593,7 +1592,10 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>, String>;
+    ) -> Result<
+        Option<Arc<dyn crate::solver::estimate::reml::reml_outer_engine::HyperOperator>>,
+        String,
+    >;
 }
 
 /// Generic exact-Newton joint-ψ workspace shared by the marginal-slope
@@ -1667,19 +1669,24 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult>, String> {
+    ) -> Result<Option<crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult>, String>
+    {
         if self.family.is_sigma_aux(psi_index) {
             return self
                 .family
                 .sigma_hessian_directional_derivative(d_beta_flat)
                 .map(|result| {
-                    result.map(crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Dense)
+                    result.map(
+                        crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Dense,
+                    )
                 });
         }
         self.family
             .psi_hessian_directional_derivative(psi_index, d_beta_flat)
             .map(|result| {
-                result.map(crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator)
+                result.map(
+                    crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator,
+                )
             })
     }
 }

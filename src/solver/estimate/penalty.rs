@@ -16,12 +16,6 @@ pub(crate) const REML_CONTINUATION_PREWARM_RHO_CAP: usize = 4;
 /// because the extra probes are cheap and sometimes useful.
 pub(crate) const REML_SEED_SCREENING_RHO_CAP: usize = 4;
 
-// `CoefficientPriorMean` and `PenaltySpec` moved to the lower-layer
-// `crate::model_types` module (issue #1135) so the `families` layer can name
-// the penalty contract without importing *up* into `solver::estimate`.
-// Re-exported here for source compatibility.
-pub use crate::model_types::{CoefficientPriorMean, PenaltySpec};
-
 const KAHAN_SWITCH_ELEMS: usize = 10_000;
 
 pub(crate) fn faer_frob_inner(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> f64 {

@@ -475,7 +475,8 @@ impl PenaltyPseudologdet {
         //                  eigendecomposition introduces at most O(p · ε · ‖S‖)
         //                  perturbation, so any eigenvalue ≤ r + delta is
         //                  indistinguishable from ridge-only within FP noise.
-        let noise_band = super::reml_outer_engine::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let noise_band =
+            super::reml_outer_engine::positive_eigenvalue_threshold(evals.as_slice().unwrap());
         let boundary = match ridge {
             Some(r) if r > 0.0 => r + noise_band,
             _ => noise_band,

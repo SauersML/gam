@@ -648,11 +648,16 @@ impl<'a> RemlState<'a> {
             // No hyperparameters: the unified corrected covariance equals H^{-1}.
             // Validate the unified path using the spectral operator.
             if let Some(base_cov) = base_covariance
-                && let Ok(hop) = super::reml_outer_engine::DenseSpectralOperator::from_symmetric(base_cov)
+                && let Ok(hop) =
+                    super::reml_outer_engine::DenseSpectralOperator::from_symmetric(base_cov)
             {
                 let outer = Array2::<f64>::zeros((0, 0));
-                let unified_diag =
-                    super::reml_outer_engine::compute_corrected_covariance_diagonal(&[], &[], &outer, &hop);
+                let unified_diag = super::reml_outer_engine::compute_corrected_covariance_diagonal(
+                    &[],
+                    &[],
+                    &outer,
+                    &hop,
+                );
                 if let Ok(diag) = unified_diag {
                     let p = base_cov.nrows();
                     let max_dev = (0..p)

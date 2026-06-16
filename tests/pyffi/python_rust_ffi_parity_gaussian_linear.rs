@@ -1,5 +1,6 @@
 use csv::StringRecord;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_model, materialize};
+use gam::inference::data::encode_recordswith_inferred_schema;
+use gam::solver::fit_orchestration::{FitConfig, FitResult, fit_model, materialize};
 use serde_json::Value;
 use std::process::Command;
 

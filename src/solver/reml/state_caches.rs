@@ -718,7 +718,9 @@ impl HyperGradientRuntimeState {
         Self {
             budget: HyperGradientBudget::new(),
             adaptive_kkt_override: None,
-            trace_state: Arc::new(Mutex::new(super::reml_outer_engine::StochasticTraceState::default())),
+            trace_state: Arc::new(Mutex::new(
+                super::reml_outer_engine::StochasticTraceState::default(),
+            )),
         }
     }
 }
@@ -951,15 +953,11 @@ pub(crate) fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
 /// Add the wrap to any future outer-cost emission as well.
 #[inline]
 pub(crate) fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
-    if !cost.is_finite() || !pr.status.is_failed_max_iterations() {
-        return cost;
-    }
-    let r_g = pr.relative_gradient_norm();
-    if r_g.is_finite() {
-        cost + 0.5 * r_g * r_g
-    } else {
-        f64::INFINITY
-    }
+    crate::solver::objective_base::failed_inner_residual_barrier_cost(
+        cost,
+        pr.status.is_failed_max_iterations(),
+        pr.relative_gradient_norm(),
+    )
 }
 
 pub(crate) fn hash_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {

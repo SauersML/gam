@@ -54,6 +54,7 @@ mod run;
 mod run_plan;
 mod seed_screening;
 
+pub use crate::solver::objective_base::{HessianResult, OuterEval};
 pub(crate) use bridges::*;
 pub use capability::*;
 pub(crate) use fd_audit::*;

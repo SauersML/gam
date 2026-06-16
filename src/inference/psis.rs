@@ -129,9 +129,13 @@ pub fn fit_gpd_moments(excesses: &[f64]) -> Option<(f64, f64)> {
         let b =
             (1.0 - (m_est as f64 / (j as f64 - 0.5)).sqrt()) / (PRIOR_BS * x_star) + 1.0 / x_max;
         let k = profile_shape(b, &x);
-        let arg = -(b / k);
-        let ls = if arg.is_finite() && arg > 0.0 && k.is_finite() {
-            nf * (arg.ln() - k - 1.0)
+        let arg = k.map(|k| -(b / k));
+        let ls = if let (Some(k), Some(arg)) = (k, arg) {
+            if arg.is_finite() && arg > 0.0 {
+                nf * (arg.ln() - k - 1.0)
+            } else {
+                f64::NEG_INFINITY
+            }
         } else {
             f64::NEG_INFINITY
         };
@@ -165,7 +169,7 @@ pub fn fit_gpd_moments(excesses: &[f64]) -> Option<(f64, f64)> {
         return None;
     }
 
-    let k_raw = profile_shape(b_post, &x);
+    let k_raw = profile_shape(b_post, &x)?;
     // Shrink toward 0.5 by `PRIOR_K` pseudo-observations.
     let k = (nf * k_raw + PRIOR_K * 0.5) / (nf + PRIOR_K);
     let sigma = -k / b_post;
@@ -176,10 +180,24 @@ pub fn fit_gpd_moments(excesses: &[f64]) -> Option<(f64, f64)> {
 }
 
 /// Closed-form profile shape `k(b) = mean_i log(1 − b·xᵢ)` for fixed `b`.
+///
+/// A candidate is admissible only when every `1 - b*x_i` is finite and strictly
+/// positive. Boundary or out-of-domain candidates are rejected before any log is
+/// evaluated, so they cannot leak NaN/Inf through the profile likelihood.
 #[inline]
-fn profile_shape(b: f64, x: &[f64]) -> f64 {
-    let acc: f64 = x.iter().map(|&xi| (-b * xi).ln_1p()).sum();
-    acc / x.len() as f64
+fn profile_shape(b: f64, x: &[f64]) -> Option<f64> {
+    if !b.is_finite() || x.is_empty() {
+        return None;
+    }
+    let mut acc = 0.0_f64;
+    for &xi in x {
+        let arg = 1.0 - b * xi;
+        if !(arg.is_finite() && arg > 0.0) {
+            return None;
+        }
+        acc += arg.ln();
+    }
+    Some(acc / x.len() as f64)
 }
 
 #[inline]
@@ -295,5 +313,22 @@ mod tests {
                 "degenerate equal excesses must not be flagged heavy; got k_hat={k_hat}"
             );
         }
+    }
+
+    #[test]
+    fn psis_profile_shape_rejects_inadmissible_candidates() {
+        let x = [0.25, 1.0, 2.0];
+        assert!(
+            profile_shape(0.49, &x).is_some(),
+            "b below 1/x_max is admissible for all excesses"
+        );
+        assert!(
+            profile_shape(0.5, &x).is_none(),
+            "b at 1/x_max puts the largest excess on the log boundary"
+        );
+        assert!(
+            profile_shape(0.75, &x).is_none(),
+            "b above 1/x_max makes at least one log argument negative"
+        );
     }
 }

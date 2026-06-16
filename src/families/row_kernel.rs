@@ -719,6 +719,33 @@ pub(crate) fn row_kernel_design_jf_rows(
     }
 }
 
+/// Pack per-primary-axis `J_axis · F_axis` blocks into the row-kernel standard
+/// row-major layout: `[axis0 rank cols | axis1 rank cols | ...]`.
+pub(crate) fn row_kernel_pack_jf_axes<const K: usize>(
+    n_rows: usize,
+    rank: usize,
+    axes: impl IntoIterator<Item = (usize, Array2<f64>)>,
+) -> Array2<f64> {
+    let mut jf = Array2::<f64>::zeros((n_rows, K * rank));
+    if rank == 0 {
+        return jf;
+    }
+    for (axis, block) in axes {
+        assert!(
+            axis < K,
+            "row-kernel JF axis index {axis} out of range for K={K}"
+        );
+        assert_eq!(
+            block.dim(),
+            (n_rows, rank),
+            "row-kernel JF axis {axis} block shape must be ({n_rows}, {rank})"
+        );
+        jf.slice_mut(s![.., axis * rank..(axis + 1) * rank])
+            .assign(&block);
+    }
+    jf
+}
+
 /// Per-column matrix-vector dispatch for `design · factor_block` when no
 /// contiguous dense backing is available.
 pub(crate) fn row_kernel_design_jf_column_dot(
@@ -733,6 +760,28 @@ pub(crate) fn row_kernel_design_jf_column_dot(
         out.column_mut(c).assign(&result);
     }
     out
+}
+
+/// Validate that shared row-kernel caches have one entry per observation.
+pub(crate) fn validate_row_kernel_cache_lengths(
+    context: &str,
+    expected_len: usize,
+    caches: &[(&str, usize)],
+) -> Result<(), String> {
+    let mismatches = caches
+        .iter()
+        .filter_map(|(name, actual)| {
+            (*actual != expected_len).then_some(format!("{name}={actual}"))
+        })
+        .collect::<Vec<_>>();
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} row-kernel cache length mismatch: {} expected={expected_len}",
+            mismatches.join(" ")
+        ))
+    }
 }
 
 // ── Cache ────────────────────────────────────────────────────────────
@@ -2146,6 +2195,38 @@ mod gram_inner_contraction_tests {
     };
     use crate::solver::estimate::reml::reml_outer_engine::ProjectedFactorCache;
     use ndarray::Array2;
+
+    #[test]
+    fn pack_jf_axes_places_blocks_in_primary_axis_order() {
+        let axis0 = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let axis2 = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0]).unwrap();
+
+        let packed = row_kernel_pack_jf_axes::<3>(2, 2, [(2, axis2), (0, axis0)]);
+
+        assert_eq!(packed.dim(), (2, 6));
+        assert_eq!(
+            packed,
+            Array2::from_shape_vec(
+                (2, 6),
+                vec![1.0, 2.0, 0.0, 0.0, 5.0, 6.0, 3.0, 4.0, 0.0, 0.0, 7.0, 8.0,],
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_row_kernel_cache_lengths_reports_all_mismatches() {
+        validate_row_kernel_cache_lengths("ctx", 3, &[("third", 3), ("fourth", 3)])
+            .expect("matching lengths pass");
+
+        let err = validate_row_kernel_cache_lengths("ctx", 3, &[("third", 2), ("fourth", 4)])
+            .expect_err("mismatches fail");
+
+        assert_eq!(
+            err,
+            "ctx row-kernel cache length mismatch: third=2 fourth=4 expected=3"
+        );
+    }
 
     /// Synthetic K=4 row kernel: dense `(n × p)` design `X` per primary scalar
     /// (so each row's Jacobian is a sparse-style stack of K row vectors), with

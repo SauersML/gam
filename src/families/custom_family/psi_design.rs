@@ -2566,8 +2566,11 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         Ok(self.directional_derivative(d_beta_flat)?.map(|matrix| {
-            Arc::new(crate::solver::estimate::reml::reml_outer_engine::DenseMatrixHyperOperator { matrix })
-                as Arc<dyn HyperOperator>
+            Arc::new(
+                crate::solver::estimate::reml::reml_outer_engine::DenseMatrixHyperOperator {
+                    matrix,
+                },
+            ) as Arc<dyn HyperOperator>
         }))
     }
 
@@ -2600,7 +2603,9 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
             .second_directional_derivative(d_beta_u, d_beta_v)?
             .map(|matrix| {
                 Arc::new(
-                    crate::solver::estimate::reml::reml_outer_engine::DenseMatrixHyperOperator { matrix },
+                    crate::solver::estimate::reml::reml_outer_engine::DenseMatrixHyperOperator {
+                        matrix,
+                    },
                 ) as Arc<dyn HyperOperator>
             }))
     }

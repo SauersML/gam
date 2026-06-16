@@ -691,9 +691,9 @@ pub(crate) fn prepare_survival_location_scale_model(
                             total_dim: p_wiggle,
                         },
                         crate::model_types::PenaltySpec::Dense(m)
-                        | crate::model_types::PenaltySpec::DenseWithMean {
-                            matrix: m, ..
-                        } => PenaltyMatrix::Dense(m.clone()),
+                        | crate::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                            PenaltyMatrix::Dense(m.clone())
+                        }
                     })
                     .collect()
             },

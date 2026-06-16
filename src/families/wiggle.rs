@@ -80,9 +80,9 @@ pub fn buildwiggle_block_input_from_knots(
     let mut penalties: Vec<crate::model_types::PenaltySpec> = Vec::new();
     let mut nullspace_dims = Vec::new();
     if p == 1 {
-        penalties.push(crate::model_types::PenaltySpec::Dense(
-            Array2::<f64>::eye(1),
-        ));
+        penalties.push(crate::model_types::PenaltySpec::Dense(Array2::<f64>::eye(
+            1,
+        )));
         nullspace_dims.push(0);
     } else {
         let effective_order = penalty_order.max(1).min(p - 1);
@@ -92,9 +92,9 @@ pub fn buildwiggle_block_input_from_knots(
         nullspace_dims.push(effective_order);
     }
     if double_penalty {
-        penalties.push(crate::model_types::PenaltySpec::Dense(
-            Array2::<f64>::eye(p),
-        ));
+        penalties.push(crate::model_types::PenaltySpec::Dense(Array2::<f64>::eye(
+            p,
+        )));
         nullspace_dims.push(0);
     }
     Ok(ParameterBlockInput {

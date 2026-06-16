@@ -3095,6 +3095,44 @@ fn exact_log_pdf_derivatives_rescaled_scale_cloglog_uniformly() {
 }
 
 #[test]
+fn exact_survival_neglog_derivatives_rescaled_do_not_scale_cloglog_ratio() {
+    let eta = 2.25_f64;
+    let log_scale = 1.5_f64;
+    let expected = eta.exp();
+
+    let (log_s, r, dr, ddr, dddr) =
+        SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
+            &InverseLink::Standard(StandardLink::CLogLog),
+            eta,
+            log_scale,
+        )
+        .expect("rescaled cloglog survival derivatives");
+
+    assert!((log_s + expected).abs() <= 1e-15 * expected);
+    for (label, actual) in [("r", r), ("dr", dr), ("ddr", ddr), ("dddr", dddr)] {
+        assert!(
+            (actual - expected).abs() <= 1e-15 * expected,
+            "CLogLog survival ratio derivative {label} must ignore deriv_log_scale: actual={actual} expected={expected}"
+        );
+    }
+
+    let ((pair_log_s, pair_r, pair_dr, pair_ddr, pair_dddr), _) =
+        SurvivalLocationScaleFamily::clglog_exit_pair(eta, log_scale);
+    assert!((pair_log_s + expected).abs() <= 1e-15 * expected);
+    for (label, actual) in [
+        ("pair r", pair_r),
+        ("pair dr", pair_dr),
+        ("pair ddr", pair_ddr),
+        ("pair dddr", pair_dddr),
+    ] {
+        assert!(
+            (actual - expected).abs() <= 1e-15 * expected,
+            "fused CLogLog survival ratio derivative {label} must ignore deriv_log_scale: actual={actual} expected={expected}"
+        );
+    }
+}
+
+#[test]
 fn exact_survival_neglog_derivatives_match_identity_closed_form() {
     let eta = 0.25;
     let s = 1.0 - eta;

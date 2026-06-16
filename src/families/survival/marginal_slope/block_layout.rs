@@ -130,9 +130,7 @@ pub(crate) fn stripe_score_warp_across_z_coords(
         for (penalty_idx, penalty) in base_penalties.iter().enumerate() {
             let local = match penalty {
                 crate::model_types::PenaltySpec::Dense(matrix)
-                | crate::model_types::PenaltySpec::DenseWithMean { matrix, .. } => {
-                    matrix.clone()
-                }
+                | crate::model_types::PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
                 crate::model_types::PenaltySpec::Block { local, .. } => local.clone(),
             };
             block

@@ -2686,10 +2686,7 @@ pub(crate) fn parallel_dense_schur_reduction_deterministic_and_matches_sequentia
             )
             .expect("serial per-row reduction");
         }
-        let scale = s_ser
-            .iter()
-            .fold(0.0_f64, |m, &v| m.max(v.abs()))
-            .max(1.0);
+        let scale = s_ser.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
         let mut max_rel = 0.0_f64;
         for a in 0..k {
             for b in 0..k {

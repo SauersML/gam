@@ -34,7 +34,8 @@ fn base_design(psi: f64, base_rows: usize, k: usize) -> Array2<f64> {
     let mut x = Array2::<f64>::zeros((base_rows, k));
     for i in 0..base_rows {
         for j in 0..k {
-            let r = 0.05 + (i as f64 + 1.0) * (j as f64 + 1.0) / (base_rows as f64 * k as f64) * 3.0;
+            let r =
+                0.05 + (i as f64 + 1.0) * (j as f64 + 1.0) / (base_rows as f64 * k as f64) * 3.0;
             if j == k - 1 {
                 x[[i, j]] = r * r * r;
             } else {
@@ -102,7 +103,10 @@ fn build_replicated(
 }
 
 fn rel_err_mat(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-    let scale = b.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1e-300);
+    let scale = b
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1e-300);
     a.iter()
         .zip(b.iter())
         .fold(0.0_f64, |acc, (&x, &y)| acc.max((x - y).abs()))
@@ -110,7 +114,10 @@ fn rel_err_mat(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 }
 
 fn rel_err_vec(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    let scale = b.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1e-300);
+    let scale = b
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1e-300);
     a.iter()
         .zip(b.iter())
         .fold(0.0_f64, |acc, (&x, &y)| acc.max((x - y).abs()))
@@ -165,7 +172,10 @@ fn glm_frozen_w_outer_objects_are_n_independent() {
             let r_big = big.rhs_at(psi);
             let r_ref = base.rhs_at(psi).mapv(|v| v * m);
             let e = rel_err_vec(&r_big, &r_ref);
-            assert!(e <= REL, "RHS XᵀWz(ψ={psi}) not n-independent: reps={reps} rel-dev {e:.3e}");
+            assert!(
+                e <= REL,
+                "RHS XᵀWz(ψ={psi}) not n-independent: reps={reps} rel-dev {e:.3e}"
+            );
 
             // Gradient channel: ∂G/∂ψ, ∂b/∂ψ.
             let dg_big = big.dgram_dpsi(psi);

@@ -469,8 +469,14 @@ fn build_row_procedural_matvec(
                         neg
                     })
                     .collect();
-                // Deterministic ordered reduction: fold chunk partials
-                // left-to-right, then subtract once.
+                // #1017/#1175 floating-point parity contract: each chunk's row
+                // sum is formed locally, then chunk partials are folded
+                // left-to-right. That makes the parallel row-procedural Schur
+                // term deterministic for a fixed input and chunking, but it is
+                // not required to be bit-identical to the serial path because
+                // the additions are reassociated at chunk boundaries. CPU/GPU
+                // validation should therefore allow ULP-scale drift while
+                // expecting stable run-to-run results.
                 let mut neg = Array1::<f64>::zeros(k);
                 for part in &partials {
                     for a in 0..k {

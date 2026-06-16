@@ -1152,13 +1152,12 @@ fn decode_parquet_batch_column(
     let decoded_col;
     let col: &dyn arrow::array::Array = if let DataType::Dictionary(_, value_type) = col.data_type()
     {
-        decoded_col =
-            arrow::compute::cast(col, value_type).map_err(|e| DataError::ParseError {
-                reason: format!(
-                    "failed to decode dictionary-encoded numeric column '{}': {e}",
-                    header
-                ),
-            })?;
+        decoded_col = arrow::compute::cast(col, value_type).map_err(|e| DataError::ParseError {
+            reason: format!(
+                "failed to decode dictionary-encoded numeric column '{}': {e}",
+                header
+            ),
+        })?;
         decoded_col.as_ref()
     } else {
         col
@@ -2156,23 +2155,18 @@ mod tests {
         // Logical column values: 5, 7, 5, 7, 5 (low-cardinality integers).
         let keys = Int8Array::from(vec![0i8, 1, 0, 1, 0]);
         let dict_values: ArrayRef = Arc::new(Int64Array::from(vec![5i64, 7]));
-        let dict: DictionaryArray<Int8Type> =
-            DictionaryArray::new(keys, dict_values);
+        let dict: DictionaryArray<Int8Type> = DictionaryArray::new(keys, dict_values);
 
         // The dictionary's *value* type is numeric, so the column must NOT be
         // classified as string/categorical.
-        assert!(matches!(
-            dict.data_type(),
-            DataType::Dictionary(_, _)
-        ));
+        assert!(matches!(dict.data_type(), DataType::Dictionary(_, _)));
         assert!(
             !parquet_field_is_string(dict.data_type()),
             "Dictionary(Int8, Int64) must not be treated as a string column"
         );
 
         // A genuine string-valued dictionary still classifies as string.
-        let str_dict: DictionaryArray<Int8Type> =
-            vec!["a", "b", "a"].into_iter().collect();
+        let str_dict: DictionaryArray<Int8Type> = vec!["a", "b", "a"].into_iter().collect();
         assert!(
             parquet_field_is_string(str_dict.data_type()),
             "Dictionary(Int8, Utf8) must remain a string column"
@@ -2212,8 +2206,8 @@ mod tests {
         let path = dir.path().join("dict_numeric.parquet");
         {
             let file = std::fs::File::create(&path).expect("create parquet");
-            let mut writer = ArrowWriter::try_new(file, arrow_schema, None)
-                .expect("arrow parquet writer");
+            let mut writer =
+                ArrowWriter::try_new(file, arrow_schema, None).expect("arrow parquet writer");
             writer.write(&batch).expect("write batch");
             writer.close().expect("close writer");
         }

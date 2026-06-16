@@ -18,8 +18,8 @@
 
 use gam::terms::basis::{
     SplineScratch, evaluate_bspline_basis_scalar, evaluate_bspline_derivative_scalar,
-    evaluate_bsplinesecond_derivative_scalar, evaluate_bsplinethird_derivative_scalar,
-    evaluate_bspline_fourth_derivative_scalar,
+    evaluate_bspline_fourth_derivative_scalar, evaluate_bsplinesecond_derivative_scalar,
+    evaluate_bsplinethird_derivative_scalar,
 };
 use ndarray::{Array1, ArrayView1};
 
@@ -45,9 +45,7 @@ fn fd_col(x: f64, knots: ArrayView1<f64>, degree: usize, i: usize, order: usize,
         1 => (v(h) - v(-h)) / (2.0 * h),
         2 => (v(h) - 2.0 * v(0.0) + v(-h)) / (h * h),
         3 => (v(2.0 * h) - 2.0 * v(h) + 2.0 * v(-h) - v(-2.0 * h)) / (2.0 * h * h * h),
-        4 => {
-            (v(2.0 * h) - 4.0 * v(h) + 6.0 * v(0.0) - 4.0 * v(-h) + v(-2.0 * h)) / (h * h * h * h)
-        }
+        4 => (v(2.0 * h) - 4.0 * v(h) + 6.0 * v(0.0) - 4.0 * v(-h) + v(-2.0 * h)) / (h * h * h * h),
         _ => unreachable!("order out of range"),
     }
 }

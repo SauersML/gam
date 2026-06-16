@@ -484,7 +484,9 @@ impl WarmStartStore {
         // `lookup_with` and on the next root-changing save, so the gate cannot
         // surface a stale entry.) This trims the residual #1114 walk in long
         // refit-heavy CI runs where thousands of fingerprint dirs accumulate.
-        let current_root_mtime = fs::metadata(&self.root).ok().and_then(|m| m.modified().ok());
+        let current_root_mtime = fs::metadata(&self.root)
+            .ok()
+            .and_then(|m| m.modified().ok());
         if self.byte_total.load(Ordering::Relaxed) <= self.opts.size_budget_bytes
             && let Some(now_mtime) = current_root_mtime
             && let Ok(last) = self.last_evict_root_mtime.lock()
@@ -553,7 +555,9 @@ impl WarmStartStore {
             // genuinely-changed root on the next call.
             if let (Ok(mut last), Some(m)) = (
                 self.last_evict_root_mtime.lock(),
-                fs::metadata(&self.root).ok().and_then(|m| m.modified().ok()),
+                fs::metadata(&self.root)
+                    .ok()
+                    .and_then(|m| m.modified().ok()),
             ) {
                 *last = Some(m);
             }
@@ -1082,6 +1086,10 @@ impl WarmStartStore {
                 }
             };
             if meta.schema_version != SCHEMA_VERSION {
+                fs::remove_file(&path).ok();
+                fs::remove_file(&bin).ok();
+                self.metadata_index_remove(&path);
+                mutated = true;
                 continue;
             }
             if meta_expired(
@@ -1318,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_mismatch_is_ignored() {
+    fn schema_mismatched_entry_is_cleaned_up() {
         let (_d, store) = temp_store();
         let key = key_for("schema");
         store
@@ -1335,6 +1343,90 @@ mod tests {
             }
         }
         assert!(store.lookup(&key).unwrap().is_none());
+        let remaining: Vec<_> = fs::read_dir(&dir).unwrap().collect();
+        assert!(
+            remaining.is_empty(),
+            "schema-mismatched entry should be removed"
+        );
+    }
+
+    #[test]
+    fn schema_mismatched_entry_is_removed_during_save_eviction_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WarmStartStore::open(
+            dir.path().to_path_buf(),
+            StoreOptions {
+                size_budget_bytes: 6 * 1024,
+                ttl: Duration::from_secs(3600),
+            },
+        )
+        .unwrap();
+        let stale_key = key_for("schema-size-stale");
+        store
+            .save(
+                &stale_key,
+                &vec![0u8; 4 * 1024],
+                None,
+                None,
+                EntryKind::Checkpoint,
+            )
+            .unwrap();
+
+        let stale_dir = store.key_dir(&stale_key);
+        let mut stale_meta = None;
+        let mut stale_bin = None;
+        for entry in fs::read_dir(&stale_dir).unwrap() {
+            let p = entry.unwrap().path();
+            match p.extension().and_then(|s| s.to_str()) {
+                Some("json") => {
+                    let raw = fs::read(&p).unwrap();
+                    let mut parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                    parsed["schema_version"] = serde_json::json!(SCHEMA_VERSION + 99);
+                    fs::write(&p, serde_json::to_vec_pretty(&parsed).unwrap()).unwrap();
+                    stale_meta = Some(p);
+                }
+                Some("bin") => stale_bin = Some(p),
+                _ => {}
+            }
+        }
+        let stale_meta = stale_meta.expect("saved entry should have metadata");
+        let stale_bin = stale_bin.expect("saved entry should have payload");
+
+        let fresh_key = key_for("schema-size-fresh");
+        store
+            .save(
+                &fresh_key,
+                &vec![1u8; 2 * 1024],
+                None,
+                None,
+                EntryKind::Checkpoint,
+            )
+            .unwrap();
+
+        assert!(
+            !stale_meta.exists(),
+            "schema-mismatched metadata should be removed during eviction scan"
+        );
+        assert!(
+            !stale_bin.exists(),
+            "schema-mismatched payload should be removed during eviction scan"
+        );
+
+        let mut total = 0u64;
+        for key_dir in fs::read_dir(store.root()).unwrap() {
+            let key_dir = key_dir.unwrap().path();
+            if key_dir.is_dir() {
+                for entry in fs::read_dir(key_dir).unwrap() {
+                    total += fs::metadata(entry.unwrap().path()).unwrap().len();
+                }
+            }
+        }
+        assert!(
+            total <= store.options().size_budget_bytes,
+            "schema-mismatched bytes must not leak past size accounting (got {total})"
+        );
+        assert!(store.lookup(&stale_key).unwrap().is_none());
+        assert!(store.lookup(&fresh_key).unwrap().is_some());
     }
 
     #[test]

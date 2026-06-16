@@ -521,8 +521,10 @@ pub fn lawley_lr_mean_shift_with_rho_variation(
     let k = x.ncols();
     let m = components.len();
     if m == 0 {
-        return Err("lawley_lr_mean_shift_with_rho_variation: no smoothing-parameter components"
-            .to_string());
+        return Err(
+            "lawley_lr_mean_shift_with_rho_variation: no smoothing-parameter components"
+                .to_string(),
+        );
     }
     if rho_cov.nrows() != m || rho_cov.ncols() != m {
         return Err(format!(
@@ -530,6 +532,24 @@ pub fn lawley_lr_mean_shift_with_rho_variation(
             rho_cov.nrows(),
             rho_cov.ncols()
         ));
+    }
+    for b in 0..m {
+        for c in 0..m {
+            let v_bc = rho_cov[[b, c]];
+            if !v_bc.is_finite() {
+                return Err(format!(
+                    "lawley_lr_mean_shift_with_rho_variation: rho_cov[{b},{c}] is not finite"
+                ));
+            }
+            let v_cb = rho_cov[[c, b]];
+            let tol = 1e-10 * (1.0 + v_bc.abs().max(v_cb.abs()));
+            if (v_bc - v_cb).abs() > tol {
+                return Err(format!(
+                    "lawley_lr_mean_shift_with_rho_variation: rho_cov must be symmetric; \
+                     entries [{b},{c}]={v_bc} and [{c},{b}]={v_cb} differ"
+                ));
+            }
+        }
     }
     if penalty.nrows() != k || penalty.ncols() != k {
         return Err(format!(
@@ -1367,12 +1387,10 @@ mod tests {
         let h = 0.05_f64;
         let h00 = (de(h, 0.0) - 2.0 * conditional + de(-h, 0.0)) / (h * h);
         let h11 = (de(0.0, h) - 2.0 * conditional + de(0.0, -h)) / (h * h);
-        let h01 =
-            (de(h, h) - de(h, -h) - de(-h, h) + de(-h, -h)) / (4.0 * h * h);
+        let h01 = (de(h, h) - de(h, -h) - de(-h, h) + de(-h, -h)) / (4.0 * h * h);
 
         // A full (non-diagonal) ρ-covariance.
-        let rho_cov =
-            Array2::from_shape_vec((2, 2), vec![0.7, 0.2, 0.2, 0.5]).unwrap();
+        let rho_cov = Array2::from_shape_vec((2, 2), vec![0.7, 0.2, 0.2, 0.5]).unwrap();
         let total = lawley_lr_mean_shift_with_rho_variation(
             x.view(),
             &kappas,
@@ -1393,8 +1411,7 @@ mod tests {
              (H00={h00}, H11={h11}, H01={h01})"
         );
         // The cross term is non-trivial — a diagonal-only assembly would differ.
-        let diag_only = conditional
-            + 0.5 * (h00 * rho_cov[[0, 0]] + h11 * rho_cov[[1, 1]]);
+        let diag_only = conditional + 0.5 * (h00 * rho_cov[[0, 0]] + h11 * rho_cov[[1, 1]]);
         assert!(
             (total - diag_only).abs() > 1e-9,
             "cross term H01·Cov01 must be included (off-diagonal non-zero): \
@@ -1455,6 +1472,41 @@ mod tests {
                 1..2,
                 &wrong,
                 cov1.view(),
+            )
+            .is_err()
+        );
+        // The #740 handoff is a covariance matrix; accepting a non-symmetric
+        // matrix would silently use only the upper triangle and misstate the
+        // ρ̂-variation contribution.
+        let nonsymmetric_cov = Array2::from_shape_vec((1, 1), vec![1.0]).unwrap();
+        assert!(
+            lawley_lr_mean_shift_with_rho_variation(
+                x.view(),
+                &kappas,
+                s.view(),
+                1..2,
+                &components,
+                nonsymmetric_cov.view(),
+            )
+            .is_ok()
+        );
+        let components2 = vec![
+            RhoPenaltyComponent {
+                s_component: s.clone(),
+            },
+            RhoPenaltyComponent {
+                s_component: s.clone(),
+            },
+        ];
+        let bad_sym = Array2::from_shape_vec((2, 2), vec![1.0, 0.25, 0.20, 1.0]).unwrap();
+        assert!(
+            lawley_lr_mean_shift_with_rho_variation(
+                x.view(),
+                &kappas,
+                s.view(),
+                1..2,
+                &components2,
+                bad_sym.view(),
             )
             .is_err()
         );

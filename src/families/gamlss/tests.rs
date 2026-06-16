@@ -474,11 +474,41 @@ pub(crate) fn dispersion_row_towers_match_hand_witnesses() {
         // Tweedie #932: the previously-unmechanized arm. Both density branches
         // (y = 0 exact point mass, y > 0 saddlepoint), two powers, and the
         // η-clamp boundary so the clamped natural parameters are exercised.
-        (DispersionFamilyKind::Tweedie { p: 1.5 }, 0.0, -0.7, 0.4, 0.9),
-        (DispersionFamilyKind::Tweedie { p: 1.5 }, 3.2, 0.6, -0.3, 1.2),
-        (DispersionFamilyKind::Tweedie { p: 1.2 }, 0.0, 1.1, -0.8, 0.6),
-        (DispersionFamilyKind::Tweedie { p: 1.8 }, 7.5, -0.4, 1.0, 1.3),
-        (DispersionFamilyKind::Tweedie { p: 1.5 }, 2.0, -25.0, 25.0, 1.0),
+        (
+            DispersionFamilyKind::Tweedie { p: 1.5 },
+            0.0,
+            -0.7,
+            0.4,
+            0.9,
+        ),
+        (
+            DispersionFamilyKind::Tweedie { p: 1.5 },
+            3.2,
+            0.6,
+            -0.3,
+            1.2,
+        ),
+        (
+            DispersionFamilyKind::Tweedie { p: 1.2 },
+            0.0,
+            1.1,
+            -0.8,
+            0.6,
+        ),
+        (
+            DispersionFamilyKind::Tweedie { p: 1.8 },
+            7.5,
+            -0.4,
+            1.0,
+            1.3,
+        ),
+        (
+            DispersionFamilyKind::Tweedie { p: 1.5 },
+            2.0,
+            -25.0,
+            25.0,
+            1.0,
+        ),
     ];
     for (kind, y, eta_mu, eta_d, weight) in cases {
         let actual = dispersion_row_kernel(kind, y, eta_mu, eta_d, weight);
@@ -583,10 +613,7 @@ pub(crate) fn tweedie_nll_tower_is_finite_difference_consistent() {
         let t = dispersion_tweedie_nll_tower(y, em, ed, p, w);
         let h = 1e-5;
         // value → gradient and gradient → Hessian, one direction at a time.
-        for (axis, perturb) in [
-            (0usize, [h, 0.0]),
-            (1usize, [0.0, h]),
-        ] {
+        for (axis, perturb) in [(0usize, [h, 0.0]), (1usize, [0.0, h])] {
             let vp = eval(p, y, em + perturb[0], ed + perturb[1], w);
             let vm = eval(p, y, em - perturb[0], ed - perturb[1], w);
             let fd_g = (vp - vm) / (2.0 * h);
@@ -597,20 +624,8 @@ pub(crate) fn tweedie_nll_tower_is_finite_difference_consistent() {
                 1e-5,
             );
             // Diagonal Hessian via the gradient of a perturbed tower.
-            let tp = dispersion_tweedie_nll_tower(
-                y,
-                em + perturb[0],
-                ed + perturb[1],
-                p,
-                w,
-            );
-            let tm = dispersion_tweedie_nll_tower(
-                y,
-                em - perturb[0],
-                ed - perturb[1],
-                p,
-                w,
-            );
+            let tp = dispersion_tweedie_nll_tower(y, em + perturb[0], ed + perturb[1], p, w);
+            let tm = dispersion_tweedie_nll_tower(y, em - perturb[0], ed - perturb[1], p, w);
             let fd_h = (tp.g[axis] - tm.g[axis]) / (2.0 * h);
             assert_rel_close(
                 "tweedie tower diagonal Hessian vs finite difference",
@@ -1207,7 +1222,9 @@ pub(crate) fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
 
     let p_total = p_mu + p_log_sigma;
     assert!(
-        crate::solver::estimate::reml::reml_outer_engine::prefer_outer_hessian_operator(n, p_total, 2),
+        crate::solver::estimate::reml::reml_outer_engine::prefer_outer_hessian_operator(
+            n, p_total, 2
+        ),
         "the large-n work model should select the scalable explicit Hessian-operator representation"
     );
 

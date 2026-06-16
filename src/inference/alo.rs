@@ -151,40 +151,112 @@ const ALO_EXACT_SCALAR_TOL: f64 = 1e-12;
 /// likelihoods such as binomial logistic regression near separation).
 ///
 /// `score_curvature(eta)` returns `(ℓ_i'(eta), ℓ_i''(eta))`. The returned value
-/// is the corrected linear predictor `η̃_i`. Falls back to the supplied
-/// `one_step` value if the Newton denominator degenerates.
+/// is the corrected linear predictor `η̃_i`. Failure to reach the residual
+/// tolerance is reported to the caller; no one-step approximation is substituted
+/// for a failed exact solve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AloExactScalarError {
+    NonFiniteScoreCurvature {
+        eta: f64,
+        ell_prime: f64,
+        ell_double: f64,
+    },
+    DegenerateJacobian {
+        eta: f64,
+        jacobian: f64,
+    },
+    NonFiniteStep {
+        eta: f64,
+        residual: f64,
+        jacobian: f64,
+        next: f64,
+    },
+    MaxIterations {
+        iterations: usize,
+        residual: f64,
+        eta: f64,
+    },
+}
+
+impl fmt::Display for AloExactScalarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            AloExactScalarError::NonFiniteScoreCurvature {
+                eta,
+                ell_prime,
+                ell_double,
+            } => write!(
+                f,
+                "non-finite score/curvature at eta={eta:.6e}: ell_prime={ell_prime:.6e}, ell_double={ell_double:.6e}"
+            ),
+            AloExactScalarError::DegenerateJacobian { eta, jacobian } => write!(
+                f,
+                "degenerate Newton Jacobian at eta={eta:.6e}: jacobian={jacobian:.6e}, min={ALO_DENOMINATOR_MIN:.1e}"
+            ),
+            AloExactScalarError::NonFiniteStep {
+                eta,
+                residual,
+                jacobian,
+                next,
+            } => write!(
+                f,
+                "non-finite Newton step from eta={eta:.6e}: residual={residual:.6e}, jacobian={jacobian:.6e}, next={next:.6e}"
+            ),
+            AloExactScalarError::MaxIterations {
+                iterations,
+                residual,
+                eta,
+            } => write!(
+                f,
+                "did not converge within {iterations} iterations: residual={residual:.6e}, eta={eta:.6e}, tol={ALO_EXACT_SCALAR_TOL:.1e}"
+            ),
+        }
+    }
+}
+
 #[inline]
 fn alo_eta_exact_frozen_curvature(
     eta_hat: f64,
     a_ii: f64,
     one_step: f64,
     score_curvature: &dyn Fn(f64) -> (f64, f64),
-) -> f64 {
+) -> Result<f64, AloExactScalarError> {
     let mut eta = one_step;
+    let mut last_residual = f64::NAN;
     for _ in 0..ALO_EXACT_SCALAR_MAX_ITERS {
         let (ell_prime, ell_double) = score_curvature(eta);
         if !ell_prime.is_finite() || !ell_double.is_finite() {
-            return one_step;
+            return Err(AloExactScalarError::NonFiniteScoreCurvature {
+                eta,
+                ell_prime,
+                ell_double,
+            });
         }
         let residual = eta - eta_hat - a_ii * ell_prime;
+        last_residual = residual;
         if residual.abs() <= ALO_EXACT_SCALAR_TOL {
-            return eta;
+            return Ok(eta);
         }
         let jac = 1.0 - a_ii * ell_double;
         if jac.abs() <= ALO_DENOMINATOR_MIN || !jac.is_finite() {
-            return one_step;
+            return Err(AloExactScalarError::DegenerateJacobian { eta, jacobian: jac });
         }
         let next = eta - residual / jac;
         if !next.is_finite() {
-            return one_step;
+            return Err(AloExactScalarError::NonFiniteStep {
+                eta,
+                residual,
+                jacobian: jac,
+                next,
+            });
         }
         eta = next;
     }
-    // Did not reach the residual tolerance within the iteration cap (rare
-    // high-leverage / near-separation rows where frozen-curvature Newton
-    // oscillates). Fall back to the classical one-step ALO so the exact path
-    // can never regress below the first-order baseline.
-    one_step
+    Err(AloExactScalarError::MaxIterations {
+        iterations: ALO_EXACT_SCALAR_MAX_ITERS,
+        residual: last_residual,
+        eta,
+    })
 }
 
 #[inline]
@@ -384,9 +456,9 @@ fn compute_alo_diagnostics_from_pirls_inner(
     // curvature carried by the frozen Hessian (W_H) coincide with c_i μ'(η) for
     // every trial η; non-canonical links retain the classical one-step ALO.
     // Per-row scale c_i = W_H[i]/μ'(η̂_i). Rows whose μ'(η̂_i) is negligible
-    // (saturated / near-separation) get c_i = NaN, which makes the closure
-    // return a non-finite score so the exact solver falls back to the classical
-    // one-step ALO for that row only — the rest of the fit still benefits.
+    // (saturated / near-separation) get c_i = NaN, which makes the exact solver
+    // reject that row explicitly rather than substituting the classical one-step
+    // ALO.
     let canonical_scale: Option<Array1<f64>> = if alo_link_is_canonical(&base.likelihood) {
         let mut c = Array1::<f64>::zeros(n);
         for i in 0..n {
@@ -588,7 +660,8 @@ pub struct AloInput<'a> {
     /// convergence (see [`alo_eta_exact_frozen_curvature`]) instead of taking a
     /// single Newton step. This eliminates the first-order linearization error
     /// that the one-step ALO incurs on small-`n`, strongly curved likelihoods
-    /// (e.g. binomial logistic regression). When `None`, the classical
+    /// (e.g. binomial logistic regression). Non-convergence or invalid scalar
+    /// Newton geometry is returned as an ALO error. When `None`, the classical
     /// single-Newton-step ALO formula is used. The evaluator must be consistent
     /// with `hessian_weights` at convergence: `ℓ_i''(η̂_i) = W_H[i]` and
     /// `ℓ_i'(η̂_i) = W_S[i]·((η̂_i−o_i) − (z_i−o_i))`.
@@ -823,6 +896,11 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                     one_step,
                     &|eta| score_curvature(i, eta),
                 )
+                .map_err(|err| AloError::LooComputationFailed {
+                    reason: format!(
+                        "ALO exact frozen-curvature solve failed at row {i}: {err}"
+                    ),
+                })?
             } else {
                 one_step
             };
@@ -1794,9 +1872,12 @@ pub fn compute_multiblock_alo_leverages(
 #[cfg(test)]
 mod tests {
     use super::{
-        alo_eta_updatewith_offset, bayesvar_eta, percentile_from_sorted, percentile_index,
+        AloExactScalarError, AloInput, alo_eta_exact_frozen_curvature, alo_eta_updatewith_offset,
+        bayesvar_eta, compute_alo_from_input_inner, percentile_from_sorted, percentile_index,
         sandwichvar_eta,
     };
+    use crate::matrix::{PsdWeightsView, SignedWeightsView};
+    use crate::types::LinkFunction;
 
     #[test]
     fn alo_offset_update_matches_centered_algebra() {
@@ -1871,6 +1952,67 @@ mod tests {
             1.0 - hessian_weight * x_hinv_x,
         );
         assert!((got - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn alo_exact_frozen_curvature_converges_to_fixed_point() {
+        let eta_hat = 1.0;
+        let a_ii = 0.4;
+        let got =
+            alo_eta_exact_frozen_curvature(eta_hat, a_ii, eta_hat, &|eta| (0.5 * (eta - 2.0), 0.5))
+                .expect("linear scalar fixed point should converge in one Newton step");
+        assert!((got - 0.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn alo_exact_frozen_curvature_reports_nonconvergence() {
+        let err = alo_eta_exact_frozen_curvature(0.0, 1.0, 0.0, &|eta| (eta + 1.0, 0.0))
+            .expect_err("constant residual should exhaust the scalar iteration budget");
+        assert!(matches!(
+            err,
+            AloExactScalarError::MaxIterations {
+                iterations: ALO_EXACT_SCALAR_MAX_ITERS,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn alo_input_reports_exact_scalar_nonconvergence_with_row_context() {
+        let design = Array2::from_elem((1, 1), 1.0);
+        let penalized_hessian = Array2::from_elem((1, 1), 1.0);
+        let hessian_weights = Array1::from_vec(vec![0.0]);
+        let score_weights = Array1::from_vec(vec![0.0]);
+        let working_response = Array1::from_vec(vec![0.0]);
+        let eta = Array1::from_vec(vec![0.0]);
+        let offset = Array1::from_vec(vec![0.0]);
+        let score_curvature = |_: usize, eta: f64| (eta + 1.0, 0.0);
+        let input = AloInput {
+            design: &design,
+            penalized_hessian: &penalized_hessian,
+            hessian_weights: SignedWeightsView::from_array(&hessian_weights),
+            score_weights: PsdWeightsView::try_from_array(&score_weights).expect("psd weights"),
+            working_response: &working_response,
+            eta: &eta,
+            offset: &offset,
+            link: LinkFunction::Logit,
+            phi: 1.0,
+            penalty_root: None,
+            ridge: 0.0,
+            score_curvature: Some(&score_curvature),
+        };
+
+        let err =
+            compute_alo_from_input_inner(&input).expect_err("non-converged exact ALO must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ALO exact frozen-curvature solve failed at row 0"),
+            "missing row context in exact ALO error: {msg}"
+        );
+        assert!(
+            msg.contains("did not converge within"),
+            "missing non-convergence cause in exact ALO error: {msg}"
+        );
     }
 
     #[test]

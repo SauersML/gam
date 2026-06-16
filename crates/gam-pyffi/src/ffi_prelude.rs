@@ -10,17 +10,17 @@ pub(crate) use csv::StringRecord;
 
 pub(crate) use faer::Side;
 
-pub(crate) use gam::DispersionLocationScaleFitResult;
+pub(crate) use gam::solver::fit_orchestration::DispersionLocationScaleFitResult;
 
-pub(crate) use gam::basis::create_duchon_basis_1d_derivative_dense;
+pub(crate) use gam::terms::basis::create_duchon_basis_1d_derivative_dense;
 
-pub(crate) use gam::estimate::{
+pub(crate) use gam::solver::estimate::{
     BlockRole, EstimationError, ExternalOptimOptions,
     optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
     saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 
-pub(crate) use gam::faer_ndarray::{
+pub(crate) use gam::linalg::faer_ndarray::{
     FaerCholesky, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata, fast_atb,
     fast_xt_diag_x,
 };
@@ -41,11 +41,11 @@ pub(crate) use gam::families::survival::predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
 
-pub(crate) use gam::gamlss::{
+pub(crate) use gam::families::gamlss::{
     BinomialLocationScaleFitResult, DispersionFamilyKind, GaussianLocationScaleFitResult,
 };
 
-pub(crate) use gam::gaussian_reml::{
+pub(crate) use gam::solver::gaussian_reml::{
     GaussianRemlMultiBackwardProblem, build_gaussian_reml_eigen_cache_batched,
     gaussian_reml_blocks_orthogonal_shared_scale, gaussian_reml_free_b_score,
     gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_backward_batch,
@@ -71,7 +71,7 @@ pub(crate) use gam::geometry::poincare::{
 
 pub(crate) use gam::geometry::simplex::{closure as simplex_closure, simplex_frechet_mean};
 
-pub(crate) use gam::hmc::{NutsConfig, NutsResult};
+pub(crate) use gam::inference::hmc::{NutsConfig, NutsResult};
 
 pub(crate) use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_schema, infer_and_encode_column_major,
@@ -109,7 +109,7 @@ pub(crate) use gam::geometry::sinkhorn_barycenter::{
 
 pub(crate) use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 
-pub(crate) use gam::smooth::{
+pub(crate) use gam::terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design, smooth_term_feature_cols,
 };
@@ -152,9 +152,9 @@ pub(crate) use gam::terms::decoders::interchange_decoder::{
     interchange_swap_forward as core_interchange_swap_forward,
 };
 
-pub(crate) use gam::terms::latent::coord::{AuxPriorFamily, aux_prior_targets};
+pub(crate) use gam::terms::latent::{AuxPriorFamily, aux_prior_targets};
 
-pub(crate) use gam::terms::dictionary::linear::{
+pub(crate) use gam::terms::dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, fit_linear_dictionary,
 };
 
@@ -181,11 +181,11 @@ pub(crate) use gam::terms::{
     SheafConsistencyPenalty as CoreSheafConsistencyPenalty, StreamingMaternBasisGradientEvaluator,
 };
 
-pub(crate) use gam::transformation_normal::TransformationNormalFitResult;
+pub(crate) use gam::families::transformation_normal::TransformationNormalFitResult;
 
 pub(crate) use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
 
-pub(crate) use gam::{
+pub(crate) use gam::solver::fit_orchestration::{
     FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
 };
 

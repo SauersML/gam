@@ -185,6 +185,7 @@ fn build_non_periodic_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                     double_penalty: false,
                     // Identifiability=None gates the new sparse path on.
                     identifiability: TensorBSplineIdentifiability::None,
+                    penalty_decomposition: Default::default(),
                 },
             },
             shape: ShapeConstraint::None,
@@ -263,6 +264,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                     // independent of the periodic-theta marginal also being
                     // dense.
                     identifiability: TensorBSplineIdentifiability::SumToZero,
+                    penalty_decomposition: Default::default(),
                 },
             },
             shape: ShapeConstraint::None,

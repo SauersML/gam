@@ -33,9 +33,10 @@ pub use decoders::interchange_decoder::{
     InterchangeSwapForward, interchange_decode_backward, interchange_decode_forward,
     interchange_swap_backward, interchange_swap_forward,
 };
-pub use dictionary::linear::{
+pub use dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryFit, fit_linear_dictionary,
 };
+pub use geometry::PeeledHull;
 pub use latent::{
     AuxPriorFamily, AuxPriorStrength, InputLocationDerivative, LatentCoordValues, LatentIdMode,
     LatentManifold,

@@ -45,8 +45,9 @@ pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
     StochasticTraceState, compute_block_penalty_logdet_derivs, exact_pseudo_logdet,
     positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
 };
+pub(crate) use crate::model_types::EstimationError;
 pub(crate) use crate::solver::estimate::{
-    EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
+    FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 pub(crate) use crate::solver::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use crate::types::{RidgeDeterminantMode, RidgePolicy};

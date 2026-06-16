@@ -1,4 +1,3 @@
-
 #[pyfunction(signature = (
     t,
     y,
@@ -489,7 +488,7 @@ fn glm_reml_fit_latent_impl(
     analytic_penalties: Option<&AnalyticPenaltyRegistry>,
 ) -> Result<
     (
-        gam::estimate::ExternalOptimResult,
+        gam::solver::estimate::ExternalOptimResult,
         Array2<f64>,
         Array2<f64>,
         Option<LatentAuxStrengthState>,
@@ -594,7 +593,7 @@ fn glm_reml_fit_latent_impl(
 fn set_ok_glm_latent_items<'py>(
     py: Python<'py>,
     out: &Bound<'py, PyDict>,
-    fit: gam::estimate::ExternalOptimResult,
+    fit: gam::solver::estimate::ExternalOptimResult,
     n_obs: usize,
     p: usize,
     aux_strength_state: Option<LatentAuxStrengthState>,
@@ -904,7 +903,7 @@ fn glm_reml_fit_latent_backward<'py>(
         .dense_stabilizedhessian_transformed("latent GLM backward")
         .map_err(|err| py_value_error(err.to_string()))?;
     let factor = factorize_symmetricwith_fallback(
-        gam::faer_ndarray::FaerArrayView::new(&h).as_ref(),
+        gam::linalg::faer_ndarray::FaerArrayView::new(&h).as_ref(),
         Side::Lower,
     )
     .map_err(|err| py_value_error(format!("latent GLM Hessian factorization failed: {err}")))?;
@@ -1032,7 +1031,7 @@ fn glm_reml_fit_latent_backward<'py>(
 fn set_ok_gaussian_reml_items<'py>(
     py: Python<'py>,
     out: &Bound<'py, PyDict>,
-    fit: gam::gaussian_reml::GaussianRemlMultiResult,
+    fit: gam::solver::gaussian_reml::GaussianRemlMultiResult,
 ) -> PyResult<()> {
     let status = if fit.lambda.is_finite() && fit.reml_score.is_finite() {
         "ok"
@@ -1077,7 +1076,7 @@ fn set_ok_gaussian_reml_items<'py>(
 
 fn gaussian_reml_fit_state_from_pydict(
     state: &Bound<'_, PyDict>,
-) -> Result<gam::gaussian_reml::GaussianRemlMultiResult, String> {
+) -> Result<gam::solver::gaussian_reml::GaussianRemlMultiResult, String> {
     fn get<'py>(state: &'py Bound<'py, PyDict>, key: &str) -> Result<Bound<'py, PyAny>, String> {
         state
             .get_item(key)
@@ -1116,7 +1115,7 @@ fn gaussian_reml_fit_state_from_pydict(
         .as_array()
         .to_owned();
 
-    Ok(gam::gaussian_reml::GaussianRemlMultiResult {
+    Ok(gam::solver::gaussian_reml::GaussianRemlMultiResult {
         lambda: get(state, "lambda")?
             .extract::<f64>()
             .map_err(|err| err.to_string())?,
@@ -1144,7 +1143,7 @@ fn gaussian_reml_fit_state_from_pydict(
             .extract::<f64>()
             .map_err(|err| err.to_string())?,
         sigma2,
-        cache: gam::gaussian_reml::GaussianRemlEigenCache {
+        cache: gam::solver::gaussian_reml::GaussianRemlEigenCache {
             penalty_eigenvalues,
             eigenvectors,
             coefficient_basis,
@@ -1173,7 +1172,7 @@ fn gaussian_reml_fit_state_from_pydict(
 fn batched_gaussian_reml_fits_from_pydict(
     state: &Bound<'_, PyDict>,
     row_offsets: ArrayView1<'_, usize>,
-) -> Result<Vec<Option<gam::gaussian_reml::GaussianRemlMultiResult>>, String> {
+) -> Result<Vec<Option<gam::solver::gaussian_reml::GaussianRemlMultiResult>>, String> {
     fn get<'py>(state: &'py Bound<'py, PyDict>, key: &str) -> Result<Bound<'py, PyAny>, String> {
         state
             .get_item(key)
@@ -1297,7 +1296,7 @@ fn batched_gaussian_reml_fits_from_pydict(
                 fitted.nrows()
             ));
         }
-        fits.push(Some(gam::gaussian_reml::GaussianRemlMultiResult {
+        fits.push(Some(gam::solver::gaussian_reml::GaussianRemlMultiResult {
             lambda: lambdas[b],
             rho: rhos[b],
             coefficients: coefficients.slice(s![b, .., ..]).to_owned(),
@@ -1309,7 +1308,7 @@ fn batched_gaussian_reml_fits_from_pydict(
             reml_hess_rho: reml_hess_rhos[b],
             edf: edf[b],
             sigma2: sigma2.slice(s![b, ..]).to_owned(),
-            cache: gam::gaussian_reml::GaussianRemlEigenCache {
+            cache: gam::solver::gaussian_reml::GaussianRemlEigenCache {
                 penalty_eigenvalues: cache_penalty_eigenvalues.slice(s![b, ..]).to_owned(),
                 eigenvectors: cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
                 coefficient_basis: cache_coefficient_basis.slice(s![b, .., ..]).to_owned(),
@@ -1472,8 +1471,9 @@ fn gaussian_reml_fit_formula_table_impl(
     if standard.offset.iter().any(|value| value.abs() > 0.0) {
         return Err("shared-tangent Gaussian REML fitting does not support offsets".to_string());
     }
-    let design = gam::smooth::build_term_collection_design(standard.data.view(), &standard.spec)
-        .map_err(|err| format!("failed to build formula design matrix: {err}"))?;
+    let design =
+        gam::terms::smooth::build_term_collection_design(standard.data.view(), &standard.spec)
+            .map_err(|err| format!("failed to build formula design matrix: {err}"))?;
     let x = design
         .design
         .try_to_dense_by_chunks("shared_tangent_gaussian_reml design")?;
@@ -1594,7 +1594,7 @@ fn gaussian_reml_fit_formula_table_impl(
     // emitting `M` blocks — not `M*D` — is exactly what ties the smoothing across
     // tangent coordinates and yields the output-isotropic, frame-equivariant fit.
     let m = design.penalties.len();
-    let mut s_list: Vec<gam::smooth::BlockwisePenalty> = Vec::with_capacity(m);
+    let mut s_list: Vec<gam::terms::smooth::BlockwisePenalty> = Vec::with_capacity(m);
     for penalty in &design.penalties {
         if penalty.col_range.start > penalty.col_range.end
             || penalty.col_range.end > k
@@ -1624,7 +1624,7 @@ fn gaussian_reml_fit_formula_table_impl(
             }
         }
         let shifted = (penalty.col_range.start * d)..(penalty.col_range.end * d);
-        s_list.push(gam::smooth::BlockwisePenalty::new(shifted, kron));
+        s_list.push(gam::terms::smooth::BlockwisePenalty::new(shifted, kron));
     }
     if s_list.is_empty() {
         return Err(
@@ -1636,7 +1636,7 @@ fn gaussian_reml_fit_formula_table_impl(
 
     let offset_zero = Array1::<f64>::zeros(n * d);
     let joint_weights = Array1::<f64>::ones(n * d);
-    let opts = gam::estimate::FitOptions {
+    let opts = gam::solver::estimate::FitOptions {
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
@@ -1656,7 +1656,7 @@ fn gaussian_reml_fit_formula_table_impl(
         kronecker_penalty_system: None,
         kronecker_factored: None,
     };
-    let fit = gam::estimate::fit_gamwith_heuristic_lambdas(
+    let fit = gam::solver::estimate::fit_gamwith_heuristic_lambdas(
         joint_x,
         joint_y.view(),
         joint_weights.view(),
@@ -1692,13 +1692,13 @@ fn gaussian_reml_fit_formula_table_impl(
     // (its shared `Sᵇ ⊗ I_D` block). We record, for each surviving canonical
     // position, its origin block and the block's penalty rank (`rank(Sᵇ)·D` —
     // the full rank across all `D` outputs), needed for the residual-df total.
-    let specs: Vec<gam::estimate::PenaltySpec> = s_list
+    let specs: Vec<gam::solver::estimate::PenaltySpec> = s_list
         .iter()
-        .map(gam::estimate::PenaltySpec::from_blockwise_ref)
+        .map(gam::solver::estimate::PenaltySpec::from_blockwise_ref)
         .collect();
     let mut survivor_block: Vec<(usize, f64)> = Vec::with_capacity(s_list.len());
     for (b, spec) in specs.iter().enumerate() {
-        if let Some(canonical) = gam::construction::canonicalize_penalty_spec(
+        if let Some(canonical) = gam::terms::construction::canonicalize_penalty_spec(
             spec,
             p_total,
             b,
@@ -1883,7 +1883,10 @@ fn gaussian_reml_fit_batched_impl(
                 Some(w) => w.slice(s![start..end]).to_owned(),
                 None => Array1::ones(end - start),
             };
-            Some(gam::faer_ndarray::fast_xt_diag_x(&x_slice, &owned_weight))
+            Some(gam::linalg::faer_ndarray::fast_xt_diag_x(
+                &x_slice,
+                &owned_weight,
+            ))
         })
         .collect();
 
@@ -1901,7 +1904,7 @@ fn gaussian_reml_fit_batched_impl(
         }
     }
     let batched_caches = build_gaussian_reml_eigen_cache_batched(live_xtwx, penalty, None);
-    let mut prebuilt_caches: Vec<Option<gam::gaussian_reml::GaussianRemlEigenCache>> =
+    let mut prebuilt_caches: Vec<Option<gam::solver::gaussian_reml::GaussianRemlEigenCache>> =
         (0..batch).map(|_| None).collect();
     for (i, cache_result) in batched_caches.into_iter().enumerate() {
         if let Ok(cache) = cache_result {
@@ -1913,7 +1916,13 @@ fn gaussian_reml_fit_batched_impl(
     // (skipping its chol + eigh in `prepare_gaussian_reml`) or falls through
     // to a fresh build when the batched cache build dropped that element.
     let fit_results: Vec<
-        Result<(usize, Option<gam::gaussian_reml::GaussianRemlMultiResult>), String>,
+        Result<
+            (
+                usize,
+                Option<gam::solver::gaussian_reml::GaussianRemlMultiResult>,
+            ),
+            String,
+        >,
     > = (0..batch)
         .into_par_iter()
         .map(|b| {
@@ -2039,7 +2048,7 @@ fn gaussian_reml_fit_batched_backward_impl(
     grad_fitted: Option<ArrayView2<'_, f64>>,
     grad_reml_score: Option<ArrayView1<'_, f64>>,
     grad_edf: Option<ArrayView1<'_, f64>>,
-    forward_fits: Option<&[Option<gam::gaussian_reml::GaussianRemlMultiResult>]>,
+    forward_fits: Option<&[Option<gam::solver::gaussian_reml::GaussianRemlMultiResult>]>,
 ) -> Result<BatchedGaussianRemlBackwardResult, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -2077,7 +2086,7 @@ fn gaussian_reml_fit_batched_backward_impl(
         Result<
             (
                 usize,
-                Option<gam::gaussian_reml::GaussianRemlBackwardResult>,
+                Option<gam::solver::gaussian_reml::GaussianRemlBackwardResult>,
             ),
             String,
         >,
@@ -2357,7 +2366,7 @@ fn gaussian_reml_fit_positions_backward_impl(
     grad_edf: f64,
     by: Option<ArrayView1<'_, f64>>,
     by_start_col: usize,
-    forward_fit: Option<&gam::gaussian_reml::GaussianRemlMultiResult>,
+    forward_fit: Option<&gam::solver::gaussian_reml::GaussianRemlMultiResult>,
 ) -> Result<PositionGaussianRemlBackwardResult, String> {
     let x = position_basis_design(
         t,
@@ -2635,7 +2644,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 Some(w) => w.slice(s![start..end]).to_owned(),
                 None => Array1::ones(end - start),
             };
-            Ok(Some(gam::faer_ndarray::fast_xt_diag_x(
+            Ok(Some(gam::linalg::faer_ndarray::fast_xt_diag_x(
                 &x.view(),
                 &owned_weight,
             )))
@@ -2651,7 +2660,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
         }
     }
     let batched_caches = build_gaussian_reml_eigen_cache_batched(live_xtwx, penalty, None);
-    let mut prebuilt_caches: Vec<Option<gam::gaussian_reml::GaussianRemlEigenCache>> =
+    let mut prebuilt_caches: Vec<Option<gam::solver::gaussian_reml::GaussianRemlEigenCache>> =
         (0..batch).map(|_| None).collect();
     for (i, cache_result) in batched_caches.into_iter().enumerate() {
         if let Ok(cache) = cache_result {
@@ -2660,7 +2669,13 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
     }
 
     let fit_results: Vec<
-        Result<(usize, Option<gam::gaussian_reml::GaussianRemlMultiResult>), String>,
+        Result<
+            (
+                usize,
+                Option<gam::solver::gaussian_reml::GaussianRemlMultiResult>,
+            ),
+            String,
+        >,
     > = (0..batch)
         .into_par_iter()
         .map(|b| {
@@ -2807,7 +2822,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
     grad_edf: Option<ArrayView1<'_, f64>>,
     by: Option<ArrayView1<'_, f64>>,
     by_start_col: usize,
-    forward_fits: Option<&[Option<gam::gaussian_reml::GaussianRemlMultiResult>]>,
+    forward_fits: Option<&[Option<gam::solver::gaussian_reml::GaussianRemlMultiResult>]>,
 ) -> Result<BatchedPositionGaussianRemlBackwardResult, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -3533,8 +3548,7 @@ fn model_debiased_functional_json_impl(
 
     let dataset = dataset_with_inferred_schema(headers, rows)?;
     let (fit_config, _) = parse_fit_config(None)?;
-    let materialized =
-        materialize(&formula, &dataset, &fit_config).map_err(|e| format!("{e}"))?;
+    let materialized = materialize(&formula, &dataset, &fit_config).map_err(|e| format!("{e}"))?;
     let standard = match materialized.request {
         FitRequest::Standard(req) => req,
         _ => {
@@ -3614,7 +3628,9 @@ fn model_debiased_functional_json_impl(
     let target = spec_val
         .get("target")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "debiased_functional: target_spec_json must contain \"target\"".to_string())?;
+        .ok_or_else(|| {
+            "debiased_functional: target_spec_json must contain \"target\"".to_string()
+        })?;
 
     // Build the functional gradient g = dθ/dβ from the spec.
     let gradient: ndarray::Array1<f64> = match target {
@@ -3780,16 +3796,12 @@ fn resolve_average_derivative_column(
     spec_val: &serde_json::Value,
 ) -> Result<usize, String> {
     if let Some(name) = spec_val.get("deriv_var").and_then(|v| v.as_str()) {
-        return dataset
-            .column_map()
-            .get(name)
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "debiased_functional: average_derivative \"deriv_var\" '{name}' \
+        return dataset.column_map().get(name).copied().ok_or_else(|| {
+            format!(
+                "debiased_functional: average_derivative \"deriv_var\" '{name}' \
                      is not a column of the training data"
-                )
-            });
+            )
+        });
     }
     let mut cols: Vec<usize> = spec
         .smooth_terms

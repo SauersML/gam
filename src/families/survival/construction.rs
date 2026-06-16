@@ -25,7 +25,7 @@ use crate::families::wiggle::{
     monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
 };
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
-use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
+use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix, symmetrize_in_place};
 use crate::probability::{normal_pdf, standard_normal_quantile};
 use crate::types::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, array, s};
@@ -722,12 +722,12 @@ fn run_baseline_theta_optimizer<Fc, Fe>(
     eval_fn: Fe,
 ) -> Result<SurvivalBaselineConfig, String>
 where
-    Fc: FnMut(&mut (), &Array1<f64>) -> Result<f64, crate::estimate::EstimationError>,
+    Fc: FnMut(&mut (), &Array1<f64>) -> Result<f64, crate::model_types::EstimationError>,
     Fe: FnMut(
         &mut (),
         &Array1<f64>,
     )
-        -> Result<crate::solver::rho_optimizer::OuterEval, crate::estimate::EstimationError>,
+        -> Result<crate::solver::rho_optimizer::OuterEval, crate::model_types::EstimationError>,
 {
     use crate::solver::rho_optimizer::OuterProblem;
     let Some(seed) = survival_baseline_theta_from_config(initial)? else {
@@ -757,7 +757,7 @@ where
                 &mut (),
                 &Array1<f64>,
             )
-                -> Result<crate::solver::rho_optimizer::EfsEval, crate::estimate::EstimationError>,
+                -> Result<crate::solver::rho_optimizer::EfsEval, crate::model_types::EstimationError>,
         >,
     );
     let result = problem
@@ -805,12 +805,12 @@ where
                         theta: &Array1<f64>|
           -> Result<
         crate::solver::rho_optimizer::OuterEval,
-        crate::estimate::EstimationError,
+        crate::model_types::EstimationError,
     > {
         let cfg = survival_baseline_config_from_theta(target, theta)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+            .map_err(crate::model_types::EstimationError::InvalidInput)?;
         let eval =
-            obj.borrow_mut()(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)?;
+            obj.borrow_mut().map_err(crate::model_types::EstimationError::InvalidInput)?;
         if eval.gradient.len() != theta.len() {
             return Err(crate::estimate::EstimationError::InvalidInput(format!(
                 "{engine_context}: baseline gradient dimension mismatch: got {}, expected {}",
@@ -1633,14 +1633,12 @@ pub fn build_survival_time_basis(
                         s_increment.ncols(),
                     ));
                 }
-                // Symmetrize the (already-symmetric) source to absorb any
-                // accumulated floating-point asymmetry before the congruence.
-                let mut s_full = Array2::<f64>::zeros((p_time_full, p_time_full));
-                for i in 0..p_time_full {
-                    for j in 0..p_time_full {
-                        s_full[[i, j]] = 0.5 * (s_increment[[i, j]] + s_increment[[j, i]]);
-                    }
-                }
+                // Symmetrize the (already-symmetric) source with the shared
+                // matrix utility. The survival builder's value-space
+                // congruence is domain-specific; only the low-level symmetric
+                // cleanup is common with the generic and SAE construction code.
+                let mut s_full = s_increment.to_owned();
+                symmetrize_in_place(&mut s_full);
                 // S_mid = S_B[1:,1:] · L  (right-multiply by lower-triangular
                 // cumsum): (S·L)[i,j] = Σ_k S[i,k]·L[k,j] = Σ_{k≥j} S[i,k]
                 // because L[k,j] = 1 iff j ≤ k.

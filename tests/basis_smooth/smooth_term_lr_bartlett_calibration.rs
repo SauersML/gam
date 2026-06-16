@@ -257,9 +257,8 @@ fn rho_variation_assembly_matches_simulated_expectation_over_rho_hat() {
 
     // Conditional shift Δε(ρ₀) (fixed-λ): the quantity the pre-#939-remainder
     // factor used.
-    let conditional =
-        lawley_lr_mean_shift(x.view(), &kappas, Some(penalty.view()), tested.clone())
-            .expect("conditional Δε");
+    let conditional = lawley_lr_mean_shift(x.view(), &kappas, Some(penalty.view()), tested.clone())
+        .expect("conditional Δε");
 
     // The ρ̂-variation assembly's predicted E[W]-shift.
     let assembled = lawley_lr_mean_shift_with_rho_variation(

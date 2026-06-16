@@ -174,10 +174,6 @@ impl std::fmt::Debug for FitArtifacts {
     }
 }
 
-// `Dispersion` moved to the lower-layer `crate::model_types` module (issue
-// #1135); re-exported here for source compatibility.
-pub use crate::model_types::Dispersion;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitInference {
     pub edf_by_block: Vec<f64>,

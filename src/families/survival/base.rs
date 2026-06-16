@@ -1,9 +1,9 @@
-use crate::estimate::EstimationError;
 use crate::faer_ndarray::{fast_atv, fast_av, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::custom_family::{
     BlockWorkingSet, CustomFamily, FamilyEvaluation, ParameterBlockState,
 };
 use crate::matrix::SymmetricMatrix;
+use crate::model_types::EstimationError;
 use crate::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };

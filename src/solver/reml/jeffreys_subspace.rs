@@ -34,6 +34,8 @@ use crate::linalg::faer_ndarray::{FaerEigh, fast_abt};
 use crate::linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[inline]
 pub(crate) fn norm2_slice(a: &[f64]) -> f64 {
@@ -951,42 +953,23 @@ where
     } else {
         None
     };
-    // `Σ_{i: |λ_i| < floor} ∂g(λ_i; floor)/∂floor = Σ (1/floor − λ_i/floor²)`, the
-    // sensitivity of the below-floor value contributions to the floor. Zero when no
-    // eigenvalue sits below the floor (so the floor-response term vanishes on every
-    // well-conditioned / indefinite fit), making this fix inert outside the
-    // genuinely below-floor regime it targets.
-    let mut floor_value_sensitivity = 0.0_f64;
-    let mut phi = 0.0_f64;
-    // h_id_inv = V diag(1/max(λ,floor)) Vᵀ  (floored symmetric pseudo-inverse).
-    let mut inv_diag = Array1::<f64>::zeros(m);
-    for (i, &lam) in evals.iter().enumerate() {
-        // VALUE / GRADIENT CONSISTENCY (was a stall — gam#787/#785). The gradient
-        // below is `½ tr(H_id⁻¹ D_k) = ½ Σ_i inv_diag_i ∂λ_i/∂β`, so for the
-        // value/gradient pair to be consistent (∇Φ = d/dβ Φ) the value
-        // `Φ = ½ Σ_i g(λ_i)` must use the antiderivative `g` of
-        // `λ ↦ inv_diag(λ) = floored_inverse(λ)` — the three-branch `g`
-        // documented on `floored_inverse`: exact `ln λ` on identified positive
-        // curvature, the #787 linear continuation inside the band, and the
-        // gam#979 SATURATING continuation on negative curvature (which replaced
-        // the gam#814 `ln|λ|` magnitude branch — that branch made Φ REWARD
-        // increasingly indefinite curvature, an unbounded sink the exact
-        // divided-difference H_Φ let the inner Newton descend into likelihood
-        // saturation; the saturating branch is monotone, bounded below, and
-        // keeps the gam#814 guarantee that moderate negatives carry no phantom
-        // score: `d(−0.3) = floor/(floor+0.3)² ≈ 0`).
-        // SINGLE-EMISSION (gam#931). The value `g`, its λ-slope `g' = floored_inverse`,
-        // and its floor-motion `∂g/∂floor` are ALL read from the canonical
-        // `jeffreys_*` functions in this module rather than re-spelt inline: the
-        // value and the gradient weights are now PROJECTIONS OF ONE source, so the
-        // gam#787/#826 value↔gradient/floor desyncs are impossible by construction
-        // (no second copy of the four branches to drift). The floor-sensitivity is
-        // exactly zero on the log window and on a gate-bound top cap, so summing it
-        // unconditionally reproduces the previous branch-gated accumulation.
-        phi += 0.5 * jeffreys_antiderivative(lam, floor);
-        inv_diag[i] = floored_inverse(lam, floor);
-        floor_value_sensitivity += jeffreys_antiderivative_floor_sensitivity(lam, floor);
-    }
+    // SINGLE-EMISSION (gam#931). The Jeffreys value and first derivative are
+    // emitted by the atom below from one spectrum and one floor. The live call
+    // site supplies the same reduced drifts it already needs for curvature; the
+    // atom owns the scalar projection (`g`, `g'_λ`, and `g'_floor`) so no inline
+    // value/gradient branch can drift from it.
+    let value_atom = super::atoms::JeffreysLogdetAtom {
+        eigvals: evals.clone(),
+        floor,
+        gate_weight,
+        reduced_drift: HashMap::new(),
+        floor_drift: HashMap::new(),
+        stratum: super::atoms::StratumFingerprint {
+            kept_rank: m,
+            min_relative_eigengap: 0.0,
+        },
+    };
+    let phi = super::atoms::CriterionAtom::value(&value_atom);
     // Daleckii–Krein divided-difference kernel of the floored signed inverse on
     // this spectrum — the single source of truth tying `∇Φ` (its diagonal
     // weights are `inv_diag = d(λ_i)`) to the exact curvature `H_Φ` below
@@ -1047,7 +1030,7 @@ where
                     // Jeffreys gradient/curvature degenerate to zero (objective
                     // still well-defined). This keeps the term safe rather than
                     // wrong.
-                    return Ok((gate_weight * phi, Array1::zeros(p), Array2::zeros((p, p))));
+                    return Ok((phi, Array1::zeros(p), Array2::zeros((p, p))));
                 }
             };
             if hdot.nrows() != p || hdot.ncols() != p {
@@ -1061,33 +1044,20 @@ where
         }
         hdots
     };
+    let mut reduced_drift: HashMap<usize, Arc<Array2<f64>>> = HashMap::with_capacity(p);
+    let mut floor_drift: HashMap<usize, f64> = HashMap::new();
     for (k, hdot) in hdots.into_iter().enumerate() {
         // Reduced derivative D_k = Z_J^T Hdot Z_J (m x m), rotated into the
         // eigenbasis: Ṽ_k = Vᵀ D_k V.
         let hdz = hdot.dot(&z_j);
         let d_k = z_j.t().dot(&hdz);
         let a_k = evecs.t().dot(&d_k).dot(&evecs);
-        // grad[k] = ½ Σ_i d_i (Ṽ_k)_ii (the eigenvalue term `½ Σ_i inv_diag_i ∂λ_i/∂β_k`,
-        // identical to the previous ½ tr(H_id⁻¹ D_k) — just read off in the eigenbasis).
-        let mut trace = 0.0;
-        for i in 0..m {
-            trace += inv_diag[i] * a_k[[i, i]];
-        }
-        grad[k] = 0.5 * trace;
-        // FLOOR-RESPONSE term (see the `floor` block above). For below-floor
-        // eigenvalues the floor moves with `λ_max(β)`, so `dΦ/dβ_k` carries
-        // `½ · floor_value_sensitivity · ∂floor/∂β_k`, with
-        // `∂floor/∂β_k = REL · ∂λ_max/∂β_k = REL · v_maxᵀ D_k v_max = REL · (Ṽ_k)_mm`.
-        // This is the exact antiderivative partner of the below-floor value branch;
-        // it is identically zero (and skipped) whenever no eigenvalue is below the
-        // floor or the floor is in the β-independent absolute regime, so the well-
-        // conditioned, indefinite, and above-floor paths are unchanged.
+        // FLOOR-RESPONSE term (see the `floor` block above). The atom consumes
+        // `floor_dot` beside `Ṽ_k`, so `dΦ/dβ_k` remains the derivative of its
+        // own `value()`.
         if let Some(idx_max) = lambda_max_idx {
-            if floor_value_sensitivity != 0.0 {
-                let dlambda_max = a_k[[idx_max, idx_max]]; // v_maxᵀ D_k v_max
-                let dfloor = REDUCED_INFO_RELATIVE_FLOOR * dlambda_max;
-                grad[k] += 0.5 * floor_value_sensitivity * dfloor;
-            }
+            let dlambda_max = a_k[[idx_max, idx_max]]; // v_maxᵀ D_k v_max
+            floor_drift.insert(k, REDUCED_INFO_RELATIVE_FLOOR * dlambda_max);
         }
         // Store vec(Ṽ_k) and vec(Ψ ∘ Ṽ_k) for the exact-curvature GEMM.
         let mut col = 0usize;
@@ -1098,6 +1068,26 @@ where
                 col += 1;
             }
         }
+        reduced_drift.insert(k, Arc::new(a_k));
+    }
+    let gradient_atom = super::atoms::JeffreysLogdetAtom {
+        eigvals: evals.clone(),
+        floor,
+        gate_weight,
+        reduced_drift,
+        floor_drift,
+        stratum: super::atoms::StratumFingerprint {
+            kept_rank: m,
+            min_relative_eigengap: 0.0,
+        },
+    };
+    for k in 0..p {
+        let dir = super::atoms::ThetaDirection {
+            index: Some(k),
+            beta_dot: None,
+            h_dot_total: None,
+        };
+        grad[k] = super::atoms::CriterionAtom::frozen_d1(&gradient_atom, &dir);
     }
     // EXACT Jeffreys curvature on the floored spectrum (gam#979). The penalized
     // objective is `−ℓ + ½βᵀSβ − Φ`, so the Newton system needs `−∇²Φ`. By the
@@ -1131,11 +1121,9 @@ where
     // trust-region subproblem handles that rigorously.
     let mut hphi = fast_abt(&aw_rows, &a_rows);
     hphi.mapv_inplace(|v| -0.5 * v);
-    // Scale the (value, gradient, curvature) triple by the smooth gate weight.
-    // `gate_weight == 1` in the fully-active (under-identified) regime, so this is
-    // identity there (byte-identical to the binary-gate term); it only tapers the
-    // term to 0 across the transition band, making Φ/∇Φ/H_Φ continuous in ρ.
-    Ok((gate_weight * phi, grad * gate_weight, hphi * gate_weight))
+    // Scale curvature by the smooth gate weight. The value and gradient have
+    // already been emitted by `JeffreysLogdetAtom` with that same gate.
+    Ok((phi, grad, hphi * gate_weight))
 }
 
 /// Exact second-directional-Hessian completion for the Tier-B joint Jeffreys
@@ -2502,12 +2490,12 @@ mod tests {
         //    BOTH arguments;
         //  - saturated: well inside a flat region ⇒ both partials are 0.
         let configs: [(f64, f64); 6] = [
-            (8.0, 1.0e9),                 // absolute band mid (w_rel = 0)
-            (4.0, 1.0e9),                 // absolute band lower-mid
-            (12.0, 1.0e9),                // absolute band upper-mid
-            (100.0, 100.0 / 1.0e-7),      // relative band mid (w_abs = 0, ratio = 1e-7)
-            (0.05, 1.0e9),                // saturated: w_abs = 1 (λ_min < 1), w_rel = 0
-            (1.0e3, 1.0e3 / 1.0e-9),      // saturated: ratio = 1e-9 < relative-clear ⇒ w_rel = 1
+            (8.0, 1.0e9),            // absolute band mid (w_rel = 0)
+            (4.0, 1.0e9),            // absolute band lower-mid
+            (12.0, 1.0e9),           // absolute band upper-mid
+            (100.0, 100.0 / 1.0e-7), // relative band mid (w_abs = 0, ratio = 1e-7)
+            (0.05, 1.0e9),           // saturated: w_abs = 1 (λ_min < 1), w_rel = 0
+            (1.0e3, 1.0e3 / 1.0e-9), // saturated: ratio = 1e-9 < relative-clear ⇒ w_rel = 1
         ];
         for &(lmin, lmax) in &configs {
             let (g_dlmin, g_dlmax) = conditioning_gate_weight_grad(lmin, lmax);

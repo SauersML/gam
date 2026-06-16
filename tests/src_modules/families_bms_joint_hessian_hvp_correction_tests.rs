@@ -2005,10 +2005,13 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     // The ψ-active path returns the outer Hessian as a matrix-free OPERATOR
     // (#740 forces the operator route when the contracted hook is present, and
     // it advertises Unavailable materialization for the PRODUCTION planner).
-    // `into_option()` is None for the Operator variant; `materialize_dense()`
-    // builds the dense matrix via K column matvecs — which is exactly what this
-    // FD comparison needs.
-    let hess0 = hess0
+    // #1165: assert the operator's single-vector HVP directly before dense
+    // materialization can symmetrize/probe around a row-specific ψ correction.
+    let hess0_operator = match &hess0 {
+        crate::solver::rho_optimizer::HessianResult::Operator(op) => Arc::clone(op),
+        other => panic!("ψ-active BMS outer Hessian must be an operator, got {other:?}"),
+    };
+    let hess0_dense = hess0
         .materialize_dense()
         .expect("materialize outer Hessian")
         .expect("outer Hessian over (ρ,ψ) present");
@@ -2050,20 +2053,28 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         (&gp - &gm).mapv(|v| v / (2.0 * eps))
     };
 
-    let check = |dir: Array1<f64>, label: &str| {
-        let analytic = hess0.dot(&dir);
-        let fd = fd_along(&dir);
+    let assert_matches_fd = |analytic: &Array1<f64>, fd: &Array1<f64>, label: &str, route: &str| {
         for k in 0..theta_dim {
             let scale = 1.0 + analytic[k].abs().max(fd[k].abs());
             let rel = (analytic[k] - fd[k]).abs() / scale;
             assert!(
                 rel < 2e-3,
-                "[{label}] outer Hessian·dir component {k} disagrees with centered FD of the \
-                 outer gradient: analytic={}, fd={}, rel={rel:.3e}",
+                "[{label} {route}] outer Hessian·dir component {k} disagrees with centered FD of \
+                 the outer gradient: analytic={}, fd={}, rel={rel:.3e}",
                 analytic[k],
                 fd[k]
             );
         }
+    };
+    let check = |dir: Array1<f64>, label: &str| {
+        let fd = fd_along(&dir);
+        let operator_hvp = hess0_operator
+            .matvec(&dir)
+            .expect("matrix-free outer Hessian HVP");
+        assert_matches_fd(&operator_hvp, &fd, label, "operator-HVP");
+
+        let dense_hvp = hess0_dense.dot(&dir);
+        assert_matches_fd(&dense_hvp, &fd, label, "dense-materialized");
     };
 
     // Pure-ψ: ρ block all-zero, ψ = 1.

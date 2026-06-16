@@ -452,9 +452,9 @@ pub(crate) fn prepare_cov_block_kind(
                             total_dim: p,
                         },
                         crate::model_types::PenaltySpec::Dense(m)
-                        | crate::model_types::PenaltySpec::DenseWithMean {
-                            matrix: m, ..
-                        } => PenaltyMatrix::Dense(m.clone()),
+                        | crate::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                            PenaltyMatrix::Dense(m.clone())
+                        }
                     })
                     .collect()
             },

@@ -37,7 +37,7 @@ use crate::probability::{
     gamma_moment_matched_interval, normal_cdf, normal_pdf, standard_normal_quantile,
 };
 use crate::quadrature::QuadratureContext;
-use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -264,9 +264,11 @@ pub trait UncertaintyCovarianceSource {
     fn observation_standard_deviation(&self) -> f64 {
         0.0
     }
-    /// Fixed dispersion `φ` used to widen observation intervals for
-    /// dispersion-bearing families (Tweedie, Gamma). Raw-covariance sources
-    /// return `None`, which falls back to `φ = 1.0`.
+    /// Fitted dispersion/precision hint used to widen observation intervals for
+    /// dispersion-bearing families (Tweedie, Gamma, Beta). Raw covariance alone
+    /// has no observation-scale metadata, so callers that only retain `Vb` must
+    /// wrap it in [`PredictionCovarianceWithScale`] when a fitted scale is
+    /// available.
     fn observation_phi(&self) -> Option<f64> {
         None
     }
@@ -274,7 +276,8 @@ pub trait UncertaintyCovarianceSource {
     /// observation intervals (`Var = mu + mu^2/theta`, issue #802). Read from the
     /// fitted `likelihood_scale` (`EstimatedNegBinTheta`) so the interval tracks
     /// the data's overdispersion rather than the family-enum seed. Raw-covariance
-    /// sources return `None`, which falls back to the family-variant `theta`.
+    /// sources return `None`; estimated-NB observation intervals are omitted
+    /// unless a fitted theta is available through this path.
     fn observation_theta(&self) -> Option<f64> {
         None
     }
@@ -303,6 +306,113 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     }
     fn observation_theta(&self) -> Option<f64> {
         self.likelihood_scale.negbin_theta()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObservationScaleHints {
+    observation_phi: Option<f64>,
+    observation_theta: Option<f64>,
+}
+
+impl ObservationScaleHints {
+    pub const fn none() -> Self {
+        Self {
+            observation_phi: None,
+            observation_theta: None,
+        }
+    }
+
+    pub fn from_likelihood_scale(scale: LikelihoodScaleMetadata) -> Self {
+        Self {
+            observation_phi: positive_finite(scale.fixed_phi()),
+            observation_theta: positive_finite(scale.negbin_theta()),
+        }
+    }
+
+    pub fn from_fit(fit: &UnifiedFitResult) -> Self {
+        Self::from_likelihood_scale(fit.likelihood_scale.clone())
+    }
+
+    pub fn with_phi(phi: f64) -> Self {
+        Self {
+            observation_phi: positive_finite(Some(phi)),
+            observation_theta: None,
+        }
+    }
+
+    pub fn with_theta(theta: f64) -> Self {
+        Self {
+            observation_phi: None,
+            observation_theta: positive_finite(Some(theta)),
+        }
+    }
+}
+
+fn positive_finite(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// Raw coefficient covariance plus the fitted observation-scale values needed
+/// by prediction intervals.
+///
+/// A bare covariance matrix is only `Vb`; it cannot tell whether a Gamma/Beta/
+/// Tweedie/NB fit estimated its dispersion or theta away from the construction
+/// seed. Use this source when calling [`predict_gamwith_uncertainty`] from a
+/// stored covariance and separate fitted scale metadata.
+pub struct PredictionCovarianceWithScale<'a> {
+    covariance: ArrayView2<'a, f64>,
+    scale: ObservationScaleHints,
+}
+
+impl<'a> PredictionCovarianceWithScale<'a> {
+    pub fn new(covariance: ArrayView2<'a, f64>, scale: ObservationScaleHints) -> Self {
+        Self { covariance, scale }
+    }
+
+    pub fn from_fit(covariance: ArrayView2<'a, f64>, fit: &UnifiedFitResult) -> Self {
+        Self::new(covariance, ObservationScaleHints::from_fit(fit))
+    }
+}
+
+impl UncertaintyCovarianceSource for PredictionCovarianceWithScale<'_> {
+    fn select_uncertainty_backend(
+        &self,
+        expected_dim: usize,
+        mode: InferenceCovarianceMode,
+        label: &str,
+    ) -> Result<(PredictionCovarianceBackend<'_>, bool), EstimationError> {
+        if self.covariance.nrows() != expected_dim || self.covariance.ncols() != expected_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "{label}: covariance dimension mismatch: expected {expected_dim}x{expected_dim}, got {}x{}",
+                self.covariance.nrows(),
+                self.covariance.ncols()
+            )));
+        }
+        match mode {
+            InferenceCovarianceMode::Conditional
+            | InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
+                Ok((PredictionCovarianceBackend::from_dense(self.covariance), false))
+            }
+            InferenceCovarianceMode::ConditionalPlusSmoothingRequired => {
+                Err(EstimationError::InvalidInput(format!(
+                    "{label}: raw covariance source cannot provide smoothing-corrected covariance"
+                )))
+            }
+        }
+    }
+
+    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
+        assert!(std::mem::size_of_val(family) > 0);
+        None
+    }
+
+    fn observation_phi(&self) -> Option<f64> {
+        self.scale.observation_phi
+    }
+
+    fn observation_theta(&self) -> Option<f64> {
+        self.scale.observation_theta
     }
 }
 
@@ -1575,20 +1685,27 @@ where
             Some(Array1::from_elem(mean.len(), obsvar))
         }
         ResponseFamily::Poisson => Some(mean.mapv(|mu| mu.max(0.0))),
-        ResponseFamily::NegativeBinomial { theta, .. } => {
-            let theta = source.observation_theta().unwrap_or(*theta);
+        ResponseFamily::NegativeBinomial {
+            theta,
+            theta_fixed,
+        } => {
+            let theta = if *theta_fixed {
+                Some(*theta)
+            } else {
+                source.observation_theta()
+            }?;
             Some(mean.mapv(|mu| mu + mu.powi(2) / theta))
         }
         ResponseFamily::Tweedie { p } => {
-            let phi = source.observation_phi().unwrap_or(1.0);
+            let phi = source.observation_phi()?;
             Some(mean.mapv(|mu| phi * mu.powf(*p)))
         }
         ResponseFamily::Gamma => {
-            let phi = source.observation_phi().unwrap_or(1.0);
+            let phi = source.observation_phi()?;
             Some(mean.mapv(|mu| phi * mu.powi(2)))
         }
-        ResponseFamily::Beta { phi } => {
-            let phi = source.observation_phi().unwrap_or(*phi);
+        ResponseFamily::Beta { .. } => {
+            let phi = source.observation_phi()?;
             Some(mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi)))
         }
         ResponseFamily::Binomial => Some(mean.mapv(|mu| {
@@ -1713,20 +1830,30 @@ where
             let response_var = mean.mapv(|mu| mu.max(0.0));
             response_observation_bounds(response_var)
         }
-        ResponseFamily::NegativeBinomial { theta, .. } => {
+        ResponseFamily::NegativeBinomial {
+            theta,
+            theta_fixed,
+        } => {
             // `theta` is estimated jointly with the mean (#802) and recorded
             // in `likelihood_scale` (`EstimatedNegBinTheta`). Read the fitted
-            // value via `observation_theta()` (the saved family variant also
-            // carries it post-fit); fall back to the enum seed only for
-            // raw-covariance sources that expose no fitted scale. Using the
-            // seed `theta = 1` made the predictive variance `mu + mu^2`
-            // ignore the data's overdispersion.
-            let theta = source.observation_theta().unwrap_or(*theta);
+            // value via `observation_theta()`. For fixed-theta NB, the family
+            // value is the requested model parameter; for estimated-theta NB,
+            // a raw covariance without a fitted hint has no valid observation
+            // interval rather than silently using the construction seed.
+            let Some(theta) = (if *theta_fixed {
+                Some(*theta)
+            } else {
+                source.observation_theta()
+            }) else {
+                return (None, None);
+            };
             let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
             response_observation_bounds(response_var)
         }
         ResponseFamily::Tweedie { p } => {
-            let phi = source.observation_phi().unwrap_or(1.0);
+            let Some(phi) = source.observation_phi() else {
+                return (None, None);
+            };
             let response_var = mean.mapv(|mu| phi * mu.powf(*p));
             response_observation_bounds(response_var)
         }
@@ -1735,21 +1862,23 @@ where
             // strongly right-skewed, so the band is built from equal-tailed
             // Gamma quantiles (moment-matched predictive), not a symmetric
             // `μ ± z·σ` band that mis-covers each tail (#817).
-            let phi = source.observation_phi().unwrap_or(1.0);
+            let Some(phi) = source.observation_phi() else {
+                return (None, None);
+            };
             let response_var = mean.mapv(|mu| phi * mu.powi(2));
             gamma_predictive_bounds(response_var)
         }
-        ResponseFamily::Beta { phi } => {
+        ResponseFamily::Beta { .. } => {
             // Beta's precision is estimated jointly with the mean (#567/#769)
             // and recorded in `likelihood_scale` (`EstimatedBetaPhi`), NOT on
             // this family enum (whose `phi` stays at the construction seed).
             // Read the fitted precision via `observation_phi()` like the
-            // Tweedie/Gamma arms above; fall back to the enum seed only when
-            // no fitted scale is available (raw-covariance sources). Using the
-            // seed made the response-noise term `μ(1−μ)/2` — for high-precision
-            // data the interval was `√((1+φ̂)/2)` too wide (#801, companion of
-            // the #770 generate-path fix).
-            let phi = source.observation_phi().unwrap_or(*phi);
+            // Tweedie/Gamma arms above. A raw covariance without a fitted
+            // precision hint has no valid observation interval; using the seed
+            // made the response-noise term `μ(1−μ)/2` for high-precision data.
+            let Some(phi) = source.observation_phi() else {
+                return (None, None);
+            };
             let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
             response_observation_bounds(response_var)
         }
@@ -2401,6 +2530,139 @@ mod tests {
             anchor_correction: None,
             anchor_components: Vec::new(),
         }
+    }
+
+    #[test]
+    fn raw_covariance_observation_intervals_require_fitted_scale_hints() {
+        let x = array![[1.0_f64]];
+        let beta = array![0.0_f64];
+        let offset = array![0.0_f64];
+        let covariance = Array2::<f64>::zeros((1, 1));
+        let options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::Delta,
+            includeobservation_interval: true,
+            apply_bias_correction: false,
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
+        };
+
+        let beta_seed = crate::types::LikelihoodSpec::new(
+            ResponseFamily::Beta { phi: 1.0 },
+            InverseLink::Standard(StandardLink::Logit),
+        );
+        let beta_raw = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            beta_seed,
+            &covariance,
+            &options,
+        )
+        .expect("raw beta covariance prediction");
+        assert!(
+            beta_raw.observation_lower.is_none() && beta_raw.observation_upper.is_none(),
+            "bare Vb must not build a Beta observation interval from the seed phi"
+        );
+
+        let nb_seed = crate::types::LikelihoodSpec::new(
+            ResponseFamily::NegativeBinomial {
+                theta: 1.0,
+                theta_fixed: false,
+            },
+            InverseLink::Standard(StandardLink::Log),
+        );
+        let nb_raw = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            nb_seed,
+            &covariance,
+            &options,
+        )
+        .expect("raw NB covariance prediction");
+        assert!(
+            nb_raw.observation_lower.is_none() && nb_raw.observation_upper.is_none(),
+            "bare Vb must not build an estimated-NB observation interval from the seed theta"
+        );
+    }
+
+    #[test]
+    fn raw_covariance_with_scale_hints_drives_observation_interval_width() {
+        let x = array![[1.0_f64]];
+        let beta = array![0.0_f64];
+        let offset = array![0.0_f64];
+        let covariance = Array2::<f64>::zeros((1, 1));
+        let z = standard_normal_quantile(0.975).expect("z");
+        let options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::Delta,
+            includeobservation_interval: true,
+            apply_bias_correction: false,
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
+        };
+
+        let beta_phi = 31.0;
+        let beta_source = PredictionCovarianceWithScale::new(
+            covariance.view(),
+            ObservationScaleHints::with_phi(beta_phi),
+        );
+        let beta_pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodSpec::new(
+                ResponseFamily::Beta { phi: 1.0 },
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            &beta_source,
+            &options,
+        )
+        .expect("hinted beta covariance prediction");
+        let beta_lower = beta_pred.observation_lower.expect("beta lower");
+        let beta_upper = beta_pred.observation_upper.expect("beta upper");
+        let beta_half_width = 0.5 * (beta_upper[0] - beta_lower[0]);
+        let expected_beta_half_width = z * (0.25 / (1.0 + beta_phi)).sqrt();
+        assert!(
+            (beta_half_width - expected_beta_half_width).abs() < 1e-12,
+            "Beta observation interval must use fitted phi hint"
+        );
+
+        let theta_hat = 4.0;
+        let nb_source = PredictionCovarianceWithScale::new(
+            covariance.view(),
+            ObservationScaleHints::with_theta(theta_hat),
+        );
+        let nb_pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            crate::types::LikelihoodSpec::new(
+                ResponseFamily::NegativeBinomial {
+                    theta: 1.0,
+                    theta_fixed: false,
+                },
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            &nb_source,
+            &options,
+        )
+        .expect("hinted NB covariance prediction");
+        let nb_upper = nb_pred.observation_upper.expect("nb upper");
+        let expected_nb_upper = 1.0 + z * (1.0 + 1.0 / theta_hat).sqrt();
+        assert!(
+            (nb_upper[0] - expected_nb_upper).abs() < 1e-12,
+            "NB observation interval must use fitted theta hint"
+        );
     }
 
     fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {

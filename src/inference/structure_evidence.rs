@@ -184,22 +184,19 @@ impl EProcess {
         if e_value.is_nan() || e_value < 0.0 {
             return Err(format!("e-value must be in [0, ∞], got {e_value}"));
         }
-        self.log_e += e_value.ln();
+        self.absorb_log(e_value.ln())
+    }
+
+    /// Absorb a batch e-value supplied in log space (the only numerically
+    /// honest interface for long streams).
+    pub fn absorb_log(&mut self, log_e_value: f64) -> Result<(), String> {
+        let next_log_e = checked_log_e_sum(self.log_e, log_e_value)?;
+        self.log_e = next_log_e;
         self.steps += 1;
         if self.log_e > self.log_e_max {
             self.log_e_max = self.log_e;
         }
         Ok(())
-    }
-
-    /// Absorb a batch e-value supplied in log space (the only numerically
-    /// honest interface for long streams).
-    pub fn absorb_log(&mut self, log_e_value: f64) {
-        self.log_e += log_e_value;
-        self.steps += 1;
-        if self.log_e > self.log_e_max {
-            self.log_e_max = self.log_e;
-        }
     }
 
     pub fn log_evidence(&self) -> f64 {
@@ -234,6 +231,24 @@ impl Default for EProcess {
     }
 }
 
+fn checked_log_e_sum(current: f64, increment: f64) -> Result<f64, String> {
+    if current.is_nan() {
+        return Err("EProcess invariant violation: current log evidence is NaN".to_string());
+    }
+    if increment.is_nan() {
+        return Err("log e-value must not be NaN".to_string());
+    }
+    if current.is_infinite()
+        && increment.is_infinite()
+        && current.is_sign_positive() != increment.is_sign_positive()
+    {
+        return Err(format!(
+            "cannot combine opposing infinite log e-values: current {current}, increment {increment}"
+        ));
+    }
+    Ok(current + increment)
+}
+
 /// One universal-inference (split-likelihood-ratio) e-value: finite-sample
 /// valid with NO regularity conditions — the correct instrument for atom
 /// birth (K vs K+1 components, boundary/Davies regime where χ² fails).
@@ -250,6 +265,17 @@ pub fn split_likelihood_log_e_value(
     log_lik_alternative_on_eval: f64,
     log_lik_null_sup_on_eval: f64,
 ) -> f64 {
+    assert!(
+        !log_lik_alternative_on_eval.is_nan() && !log_lik_null_sup_on_eval.is_nan(),
+        "split-likelihood log-likelihoods must not be NaN"
+    );
+    if log_lik_alternative_on_eval.is_infinite()
+        && log_lik_null_sup_on_eval.is_infinite()
+        && log_lik_alternative_on_eval.is_sign_positive()
+            == log_lik_null_sup_on_eval.is_sign_positive()
+    {
+        return 0.0;
+    }
     log_lik_alternative_on_eval - log_lik_null_sup_on_eval
 }
 
@@ -277,15 +303,24 @@ impl PredictablePluginEProcess {
     /// product a supermartingale; violating it voids the guarantee, which
     /// is why the SAE integration must hand this function the PREVIOUS
     /// shard's fitted dictionary, never the current one).
+    pub fn try_absorb_batch(
+        &mut self,
+        log_lik_alternative_prefit: f64,
+        log_lik_null_sup_on_batch: f64,
+    ) -> Result<(), String> {
+        self.process.absorb_log(split_likelihood_log_e_value(
+            log_lik_alternative_prefit,
+            log_lik_null_sup_on_batch,
+        ))
+    }
+
     pub fn absorb_batch(
         &mut self,
         log_lik_alternative_prefit: f64,
         log_lik_null_sup_on_batch: f64,
     ) {
-        self.process.absorb_log(split_likelihood_log_e_value(
-            log_lik_alternative_prefit,
-            log_lik_null_sup_on_batch,
-        ));
+        self.try_absorb_batch(log_lik_alternative_prefit, log_lik_null_sup_on_batch)
+            .expect("PredictablePluginEProcess received invalid log evidence");
     }
 }
 
@@ -356,13 +391,22 @@ impl AtomBirthGate {
     }
 
     /// Absorb one shard's split-likelihood ratio (see type-level contract).
+    pub fn try_absorb_shard(
+        &mut self,
+        log_lik_alternative_prefit: f64,
+        log_lik_null_sup_on_shard: f64,
+    ) -> Result<(), String> {
+        self.test
+            .try_absorb_batch(log_lik_alternative_prefit, log_lik_null_sup_on_shard)
+    }
+
     pub fn absorb_shard(
         &mut self,
         log_lik_alternative_prefit: f64,
         log_lik_null_sup_on_shard: f64,
     ) {
-        self.test
-            .absorb_batch(log_lik_alternative_prefit, log_lik_null_sup_on_shard);
+        self.try_absorb_shard(log_lik_alternative_prefit, log_lik_null_sup_on_shard)
+            .expect("AtomBirthGate received invalid log evidence");
     }
 
     pub fn verdict(&self) -> GateVerdict {
@@ -416,7 +460,7 @@ pub fn run_atom_birth_gate<S, A>(
         if !matches!(gate.verdict(), GateVerdict::Certified { .. }) {
             let log_lik_alt = alternative_log_lik(&alt, &shard);
             let log_lik_null = null_sup_log_lik(&shard);
-            gate.absorb_shard(log_lik_alt, log_lik_null);
+            gate.try_absorb_shard(log_lik_alt, log_lik_null)?;
         }
         alt = refit_alternative(alt, &shard);
     }
@@ -442,12 +486,12 @@ pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Vec<usize> {
     if m == 0 || !(alpha > 0.0) {
         return Vec::new();
     }
+    assert!(
+        log_e_values.iter().all(|value| !value.is_nan()),
+        "e-BH log e-values must not be NaN"
+    );
     let mut order: Vec<usize> = (0..m).collect();
-    order.sort_by(|&a, &b| {
-        log_e_values[b]
-            .partial_cmp(&log_e_values[a])
-            .expect("finite log e-values")
-    });
+    order.sort_by(|&a, &b| log_e_values[b].total_cmp(&log_e_values[a]));
     let m_f = m as f64;
     let mut k_star = 0usize;
     for (rank0, &idx) in order.iter().enumerate() {
@@ -525,8 +569,7 @@ impl StructureLedger {
         let claim = self.claims.get_mut(idx).ok_or_else(|| {
             format!("StructureLedger: claim index {idx} out of range ({n} claims)")
         })?;
-        claim.evidence.absorb_log(log_e_value);
-        Ok(())
+        claim.evidence.absorb_log(log_e_value)
     }
 
     pub fn claims(&self) -> &[StructuralClaim] {
@@ -781,6 +824,42 @@ mod tests {
         assert_eq!(e_benjamini_hochberg(&log_e2, 0.1), vec![0]);
     }
 
+    #[test]
+    fn split_likelihood_equal_impossibility_is_neutral_log_evidence() {
+        let log_e = split_likelihood_log_e_value(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        assert_eq!(log_e, 0.0);
+        assert!(log_e.is_finite());
+
+        let mut proc = EProcess::new();
+        proc.absorb_log(log_e).unwrap();
+        assert_eq!(proc.log_evidence(), 0.0);
+        assert_eq!(proc.steps(), 1);
+    }
+
+    #[test]
+    fn e_bh_orders_infinite_log_e_values_without_comparator_panic() {
+        let log_e = [f64::NEG_INFINITY, f64::INFINITY, 45.0f64.ln(), 1.0f64.ln()];
+        assert_eq!(e_benjamini_hochberg(&log_e, 0.1), vec![1, 2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "e-BH log e-values must not be NaN")]
+    fn e_bh_rejects_nan_log_e_values_before_sorting() {
+        let log_e = [10.0f64.ln(), f64::NAN];
+        let _ = e_benjamini_hochberg(&log_e, 0.1);
+    }
+
+    #[test]
+    fn e_process_absorb_log_rejects_undefined_log_products() {
+        let mut proc = EProcess::new();
+        assert!(proc.absorb_log(f64::NAN).is_err());
+
+        proc.absorb_log(f64::INFINITY).unwrap();
+        assert!(proc.absorb_log(f64::NEG_INFINITY).is_err());
+        assert_eq!(proc.log_evidence(), f64::INFINITY);
+        assert_eq!(proc.steps(), 1);
+    }
+
     /// Ville-style sanity: under H0 (simulated fair e-values from a
     /// likelihood ratio of identical Gaussians), the e-process crosses
     /// 1/α rarely; under a true alternative it crosses fast and the
@@ -796,7 +875,7 @@ mod tests {
         for t in 0..200 {
             // x_t ~ alternative-ish deterministic surrogate around μ
             let x = mu + 0.9 * ((t as f64 * 0.7321).sin());
-            proc_alt.absorb_log(mu * x - 0.5 * mu * mu);
+            proc_alt.absorb_log(mu * x - 0.5 * mu * mu).unwrap();
             if proc_alt.rejects_at(0.05) && crossed_at.is_none() {
                 crossed_at = Some(t);
             }
@@ -810,7 +889,7 @@ mod tests {
         let mut proc_null = EProcess::new();
         for t in 0..200 {
             let x = 0.9 * ((t as f64 * 0.7321).sin());
-            proc_null.absorb_log(mu * x - 0.5 * mu * mu);
+            proc_null.absorb_log(mu * x - 0.5 * mu * mu).unwrap();
         }
         assert!(
             !proc_null.rejects_at(0.05),

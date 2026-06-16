@@ -248,16 +248,22 @@ fn case_deletion_from_pirls_leverage_matches_alo_dialect() {
 
     let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Probit)
         .expect("ALO diagnostics");
-    let influence = gam::alo::compute_case_deletion_from_pirls(&fit, y.view(), LinkFunction::Probit)
-        .expect("case-deletion diagnostics must not error on a converged fit")
-        .expect("no leverage-one row in this well-conditioned fit");
+    let influence =
+        gam::alo::compute_case_deletion_from_pirls(&fit, y.view(), LinkFunction::Probit)
+            .expect("case-deletion diagnostics must not error on a converged fit")
+            .expect("no leverage-one row in this well-conditioned fit");
 
     assert_eq!(influence.leverage.len(), n);
     assert_eq!(influence.dfbeta.nrows(), n);
     assert_eq!(influence.dfbeta.ncols(), p);
     assert_eq!(influence.cooks_distance.len(), n);
     assert!(influence.dfbeta.iter().all(|v| v.is_finite()));
-    assert!(influence.cooks_distance.iter().all(|v| v.is_finite() && *v >= 0.0));
+    assert!(
+        influence
+            .cooks_distance
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0)
+    );
 
     // The leverage channel is the same hat value ALO computes; the two
     // dialects share one factored inverse, so they must agree to machine

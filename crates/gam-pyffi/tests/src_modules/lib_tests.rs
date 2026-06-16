@@ -2,6 +2,64 @@ use super::*;
 use ndarray::{array, s};
 
 #[test]
+fn pyffi_sources_use_canonical_gam_module_paths() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut source_paths = std::fs::read_dir(manifest.join("src"))
+        .expect("read gam-pyffi src directory")
+        .map(|entry| entry.expect("read gam-pyffi src entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect::<Vec<_>>();
+    source_paths.push(manifest.join("tests/src_modules/lib_tests.rs"));
+
+    let stale_paths = [
+        concat!("gam::", "gaussian_reml::"),
+        concat!("gam::", "basis::"),
+        concat!("gam::", "smooth::"),
+        concat!("gam::", "predict::"),
+        concat!("gam::", "estimate::"),
+        concat!("gam::", "pirls::"),
+        concat!("gam::", "visualizer::"),
+        concat!("gam::", "probability::"),
+        concat!("gam::", "hmc::"),
+        concat!("gam::", "gamlss::"),
+        concat!("gam::", "transformation_normal::"),
+        concat!("gam::", "faer_ndarray::"),
+        concat!("gam::", "generative::"),
+        concat!("gam::", "sample::"),
+        concat!("gam::", "construction::"),
+        concat!("gam::", "FitConfig"),
+        concat!("gam::", "FitRequest"),
+        concat!("gam::", "FitResult"),
+        concat!("gam::", "WorkflowError"),
+        concat!("gam::", "fit_model"),
+        concat!("gam::", "materialize"),
+        concat!("gam::", "resolve_offset_column"),
+        concat!("gam::", "spline_scan_fast_path"),
+        concat!("gam::", "DispersionLocationScaleFitResult"),
+        concat!("gam::", "SurvivalLocationScaleFitResult"),
+        concat!("gam::", "SurvivalTransformationFitResult"),
+        concat!("use gam::", "{"),
+    ];
+
+    let mut hits = Vec::new();
+    for path in source_paths {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        for stale in stale_paths {
+            if text.contains(stale) {
+                hits.push(format!("{} contains {stale}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "PyFFI sources must use canonical gam module paths:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
 fn symmetric_curvature_solve_preserves_negative_modes() {
     let matrix = array![[2.0, 0.0, 0.0], [0.0, -4.0, 0.0], [0.0, 0.0, -1.0e-15]];
     let rhs = array![8.0, -8.0, 1.0];
@@ -503,14 +561,14 @@ fn gaussian_reml_fit_blocks_forward_native(
         .iter()
         .enumerate()
         .map(|(block, penalty)| {
-            gam::smooth::BlockwisePenalty::new(
+            gam::terms::smooth::BlockwisePenalty::new(
                 col_offsets[block]..col_offsets[block + 1],
                 penalty.clone(),
             )
         })
         .collect::<Vec<_>>();
     let heuristic_lambdas = init_rhos.iter().map(|rho| rho.exp()).collect::<Vec<_>>();
-    let opts = gam::estimate::FitOptions {
+    let opts = gam::solver::estimate::FitOptions {
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
@@ -531,7 +589,7 @@ fn gaussian_reml_fit_blocks_forward_native(
         persist_warm_start_disk: false,
     };
     let offset = Array1::<f64>::zeros(n_rows);
-    let fit = gam::estimate::fit_gamwith_heuristic_lambdas(
+    let fit = gam::solver::estimate::fit_gamwith_heuristic_lambdas(
         joint_x.clone(),
         y,
         weights,
@@ -1152,7 +1210,7 @@ fn batched_state_round_trip_matches_refit() {
         .map(|b| {
             let start = row_offsets[b];
             let end = row_offsets[b + 1];
-            let cache = gam::gaussian_reml::GaussianRemlEigenCache {
+            let cache = gam::solver::gaussian_reml::GaussianRemlEigenCache {
                 penalty_eigenvalues: forward
                     .cache_penalty_eigenvalues
                     .slice(s![b, ..])
@@ -1169,7 +1227,7 @@ fn batched_state_round_trip_matches_refit() {
                 penalty_rank: forward.cache_penalty_ranks[b] as usize,
                 nullity: forward.cache_nullities[b] as usize,
             };
-            Some(gam::gaussian_reml::GaussianRemlMultiResult {
+            Some(gam::solver::gaussian_reml::GaussianRemlMultiResult {
                 lambda: forward.lambdas[b],
                 rho: forward.rhos[b],
                 coefficients: forward.coefficients.slice(s![b, .., ..]).to_owned(),

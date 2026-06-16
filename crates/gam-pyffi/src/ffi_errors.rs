@@ -83,7 +83,7 @@ create_exception!(
 // EstimationError variant subclasses.
 //
 // Each subclass corresponds to exactly one variant of
-// `gam::estimate::EstimationError`. Catching the specific subclass lets
+// `gam::solver::estimate::EstimationError`. Catching the specific subclass lets
 // callers branch on the exact failure mode (e.g. retry with looser
 // tolerances on `RemlConvergenceError`, suggest more data on
 // `ModelOverparameterizedError`).
@@ -810,6 +810,10 @@ error_to_pyerr!(
     gam::families::survival::SurvivalError,
     SurvivalError
 );
-error_to_pyerr!(basis_error_to_pyerr, gam::basis::BasisError, GamError);
+error_to_pyerr!(
+    basis_error_to_pyerr,
+    gam::terms::basis::BasisError,
+    GamError
+);
 error_to_pyerr!(shape_error_to_pyerr, ndarray::ShapeError, GamError);
 error_to_pyerr!(serde_json_error_to_pyerr, serde_json::Error, GamError);

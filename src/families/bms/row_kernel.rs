@@ -408,13 +408,11 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // thread would have to do each row pass alone).
         let third_cache_len = self.third_full_cache().len();
         let fourth_cache_len = self.fourth_full_cache().len();
-        let expected_len = self.family.y.len();
-        if third_cache_len != expected_len || fourth_cache_len != expected_len {
-            return Err(format!(
-                "bernoulli rigid row-kernel cache warm-up length mismatch: third={third_cache_len} fourth={fourth_cache_len} expected={expected_len}"
-            ));
-        }
-        Ok(())
+        crate::families::row_kernel::validate_row_kernel_cache_lengths(
+            "bernoulli rigid warm-up",
+            self.family.y.len(),
+            &[("third", third_cache_len), ("fourth", fourth_cache_len)],
+        )
     }
 
     fn row_fourth_contracted(
@@ -464,9 +462,6 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         }
         let n_rows = self.family.y.len();
         let rank = factor.ncols();
-        if rank == 0 {
-            return Some(Array2::<f64>::zeros((n_rows, 2 * rank)));
-        }
 
         // Slice F into the two coefficient-block factors. Standard-
         // layout owned copies let downstream `dot` paths stride
@@ -480,51 +475,25 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             .as_standard_layout()
             .into_owned();
 
-        // Compute J_block · F_block for both axes.
-        //
-        // Fast path: when the design has a materialized dense Array2
-        // backing we hit ndarray's `dot(matrix)` directly, which routes
-        // through `matrixmultiply` (BLAS-3) and reduces ~n×rank
-        // strided per-row gathers to one cache-friendly contiguous
-        // matmul per axis. At large-scale shape (n ≈ 1e4–1e5, rank ≈ 81)
-        // this turns the dominant per-trace cost from ~3 s into ~50 ms.
-        //
-        // Generic path: for operator-backed / sparse / chunked designs
-        // (Lazy with no contiguous `as_dense_ref`) we fall through to
-        // `DesignMatrix::dot` on a per-column basis. This is still the
-        // same arithmetic as the per-row reference (`jacobian_action`
-        // does a single design-row dot product per call) but with
-        // batched matrix-vector products that let the underlying
-        // operator amortise any per-call dispatch cost. Importantly,
-        // this path stays available for sparse-design fits where the
-        // dense fast path is structurally inapplicable.
-        let jf_marg = match self.family.marginal_design.as_dense_ref() {
-            Some(dense) => dense.dot(&f_marg),
-            None => crate::families::row_kernel::row_kernel_design_jf_column_dot(
-                &self.family.marginal_design,
-                &f_marg,
-                n_rows,
-            ),
-        };
-        let jf_logs = match self.family.logslope_design.as_dense_ref() {
-            Some(dense) => dense.dot(&f_logs),
-            None => crate::families::row_kernel::row_kernel_design_jf_column_dot(
-                &self.family.logslope_design,
-                &f_logs,
-                n_rows,
-            ),
-        };
+        // Compute J_block · F_block for both axes. Dense designs use BLAS-3;
+        // operator-backed/sparse designs use the shared per-column dispatcher,
+        // preserving the same arithmetic as the per-row reference.
+        let jf_marg = crate::families::row_kernel::row_kernel_design_jf(
+            &self.family.marginal_design,
+            f_marg.view(),
+            n_rows,
+        );
+        let jf_logs = crate::families::row_kernel::row_kernel_design_jf(
+            &self.family.logslope_design,
+            f_logs.view(),
+            n_rows,
+        );
 
-        assert_eq!(jf_marg.dim(), (n_rows, rank));
-        assert_eq!(jf_logs.dim(), (n_rows, rank));
-
-        // Pack into row-major (n × 2·rank): first `rank` columns are
-        // k=0 (marginal axis), next `rank` are k=1 (logslope axis). This
-        // mirrors the layout written by `compute_jf`'s strided write.
-        let mut jf = Array2::<f64>::zeros((n_rows, 2 * rank));
-        jf.slice_mut(s![.., 0..rank]).assign(&jf_marg);
-        jf.slice_mut(s![.., rank..2 * rank]).assign(&jf_logs);
-        Some(jf)
+        Some(crate::families::row_kernel::row_kernel_pack_jf_axes::<2>(
+            n_rows,
+            rank,
+            [(0, jf_marg), (1, jf_logs)],
+        ))
     }
 
     /// BLAS-3 override of the first directional derivative of the dense joint
@@ -1089,13 +1058,11 @@ impl BernoulliRigidRowKernel {
         // Force the shared per-row fourth tensor build at top-level rayon before
         // any chunk/axis fold, so the bodies do an O(1) lookup.
         let fourth_full = self.fourth_full_cache();
-        if fourth_full.len() != n {
-            return Err(format!(
-                "bernoulli rigid second_directional_derivative_all_axes_blas3: fourth cache \
-                 length {} != n {n}",
-                fourth_full.len()
-            ));
-        }
+        crate::families::row_kernel::validate_row_kernel_cache_lengths(
+            "bernoulli rigid second_directional_derivative_all_axes_blas3",
+            n,
+            &[("fourth", fourth_full.len())],
+        )?;
 
         let chunk_rows = blas3_gram_chunk_rows(n);
         let chunks = (0..n)
@@ -1272,13 +1239,11 @@ impl BernoulliRigidRowKernel {
         // Force the shared per-row third tensor build at top-level rayon before
         // any chunk/axis fold, so the bodies do an O(1) lookup.
         let third_full = self.third_full_cache();
-        if third_full.len() != n {
-            return Err(format!(
-                "bernoulli rigid directional_derivative_all_axes_blas3: third cache length {} \
-                 != n {n}",
-                third_full.len()
-            ));
-        }
+        crate::families::row_kernel::validate_row_kernel_cache_lengths(
+            "bernoulli rigid directional_derivative_all_axes_blas3",
+            n,
+            &[("third", third_full.len())],
+        )?;
 
         let chunk_rows = blas3_gram_chunk_rows(n);
         let chunks = (0..n)

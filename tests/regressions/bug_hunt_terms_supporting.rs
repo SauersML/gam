@@ -1,5 +1,5 @@
 use gam::basis::DuchonNullspaceOrder;
-use gam::terms::geometry::hull::PeeledHull;
+use gam::terms::geometry::PeeledHull;
 use gam::terms::sae::atom_codes::BitVec;
 use gam::terms::term_builder::{
     heuristic_knots_for_column, parse_duchon_order, parse_duchon_power,

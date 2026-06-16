@@ -542,7 +542,10 @@ mod tests {
         z[[2, 1]] = -2.0 * s6;
         // The columns are orthonormal and sum to zero (cᵀz = 0).
         for j in 0..2 {
-            assert!((z.column(j).sum()).abs() < 1e-14, "column {j} must sum to 0");
+            assert!(
+                (z.column(j).sum()).abs() < 1e-14,
+                "column {j} must sum to 0"
+            );
             assert!(
                 (z.column(j).dot(&z.column(j)) - 1.0).abs() < 1e-14,
                 "column {j} must be unit norm"

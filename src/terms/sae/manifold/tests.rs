@@ -9282,8 +9282,9 @@ mod inner_contract_probe_tests {
         // Held-out planted rows interleaved between the training coords (not an
         // in-sample replay): the encoder must recover their circle phase.
         let n_holdout = 16usize;
-        let heldout_truth =
-            Array2::from_shape_fn((n_holdout, 1), |(row, _)| (row as f64 + 0.25) / n_holdout as f64);
+        let heldout_truth = Array2::from_shape_fn((n_holdout, 1), |(row, _)| {
+            (row as f64 + 0.25) / n_holdout as f64
+        });
         let (heldout_phi, _hjet) = periodic_basis(&heldout_truth);
 
         // Encode the held-out rows with the amortized encoder distilled from a

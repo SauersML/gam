@@ -1156,11 +1156,9 @@ impl SurvivalLocationScaleFamily {
         self.collect_joint_quantities_rescaled(block_states, 0.0)
     }
 
-    /// Collect per-row derivative quantities with a log-scale shift applied
-    /// to the derivative magnitudes.  When `deriv_log_scale > 0`, all
-    /// derivative arrays are uniformly scaled by `exp(-deriv_log_scale)`.
-    /// The caller must account for this in the logdet:
-    ///   `logdet(H) = logdet(H_scaled) + p * deriv_log_scale`.
+    /// Collect per-row derivative quantities while passing `deriv_log_scale`
+    /// through to row primitives that use it.  The CLogLog log-PDF derivatives
+    /// use this shift; the CLogLog survival ratio derivatives do not.
     pub(crate) fn collect_joint_quantities_rescaled(
         &self,
         block_states: &[ParameterBlockState],
@@ -1910,12 +1908,12 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
-    /// Like [`Self::exact_survival_neglog_derivatives_fourth_rescaled`] but with a
-    /// log-scale shift applied to the **derivative** magnitudes (not the
-    /// function value).  For CLogLog the derivatives are `exp(eta)`, so
-    /// shifting gives `exp(eta - deriv_log_scale)` — always finite when
-    /// the shift equals the maximum `eta` across rows.  The function
-    /// value (`-exp(eta)` = `log S`) is returned unshifted.
+    /// Survival log value and ratio derivatives, with the same signature as the
+    /// rescaled PDF path.  The CLogLog survival ratio is
+    /// `r = exp(eta)`, and its derivatives are also `exp(eta)`; these are not
+    /// derivative-rescaled because they are already ratio derivatives with
+    /// respect to the unshifted predictor.  The function value
+    /// (`-exp(eta)` = `log S`) is returned unshifted.
     pub(crate) fn exact_survival_neglog_derivatives_fourth_rescaled(
         inverse_link: &InverseLink,
         eta: f64,
@@ -1942,9 +1940,9 @@ impl SurvivalLocationScaleFamily {
                 ))
             }
             InverseLink::Standard(StandardLink::CLogLog) => {
-                let t_val = eta.exp(); // for the function value (may be Inf)
-                let t_deriv = (eta - deriv_log_scale).exp(); // for derivatives (finite when shifted)
-                Ok((-t_val, t_deriv, t_deriv, t_deriv, t_deriv))
+                let _ = deriv_log_scale;
+                let t = eta.exp();
+                Ok((-t, t, t, t, t))
             }
             InverseLink::Standard(StandardLink::Identity) => {
                 let s = 1.0 - eta;
@@ -1994,7 +1992,7 @@ impl SurvivalLocationScaleFamily {
         let t_val = u1.exp();
         let t_deriv = (u1 - deriv_log_scale).exp();
         let deriv_scale = (-deriv_log_scale).exp();
-        let surv = (-t_val, t_deriv, t_deriv, t_deriv, t_deriv);
+        let surv = (-t_val, t_val, t_val, t_val, t_val);
         let logpdf = (
             u1 - t_val,
             deriv_scale - t_deriv,
@@ -2096,9 +2094,10 @@ impl SurvivalLocationScaleFamily {
                 format!("inverse-link survival evaluation failed at row {row} entry: {e}")
             })?;
 
-        // Fast path: for CLogLog the survival and log-pdf evaluators each
-        // compute `exp(u1)` and `exp(u1 - deriv_log_scale)`.  Share that work
-        // when both are called back-to-back on the exit row.
+        // Fast path: for CLogLog the survival and log-pdf evaluators both need
+        // `exp(u1)`, and the PDF derivatives also need
+        // `exp(u1 - deriv_log_scale)`. Share that work when both are called
+        // back-to-back on the exit row.
         let ((log_s1, r1, dr1, ddr1, dddr1), (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1)) =
             if matches!(
                 &self.inverse_link,

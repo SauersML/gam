@@ -33,9 +33,8 @@ PROTOCOL (matches the real-data numbers posted to #1026):
 GPU REQUIREMENT: K in {1,2} runs on CPU in minutes (the banked numbers:
 K=1 ~67s, K=2 ~350-410s on an MSI compute node). K>=4 / large-K and the full
 {8,32,128,512} ladder need the device-resident solver (#1017) + memory (#1009)
-to run at token rate; K>=4 also depends on the #1132 wrapper-bug fixes
-(n_harmonics floor is fixed in-tree; euclidean Laplace-logdet + OOS-M bugs are
-follow-ups). Until then this driver runs the K in {1,2} arm everywhere.
+to run at token rate. Until then this driver runs the K in {1,2} arm everywhere
+and fails loudly if a requested rung is not production-ready.
 
 EXAMPLE (OLMo-3-32B base, layer 25, on an MSI compute node):
   python examples/sae_ev_vs_k_olmo.py \
@@ -139,11 +138,7 @@ def main() -> None:
     print(f"{'K':>4}  {'curved_EV_out':>13}  {'linear_EV_out':>13}  {'(curved - linear)':>17}")
     for k in ladder:
         ev_c = _fit_ev(z_tr, z_te, k, "circle", args.seed, args.n_iter)
-        try:
-            ev_l = _fit_ev(z_tr, z_te, k, "euclidean", args.seed, args.n_iter)
-        except Exception as exc:  # K>=4 euclidean / OOS wrapper bugs (#1132) — report, don't crash
-            ev_l = float("nan")
-            print(f"  [linear K={k} unavailable: {exc}]")
+        ev_l = _fit_ev(z_tr, z_te, k, "euclidean", args.seed, args.n_iter)
         print(f"{k:>4}  {ev_c:>13.6f}  {ev_l:>13.6f}  {ev_c - ev_l:>17.6f}")
 
     print(

@@ -30,7 +30,10 @@ use pyo3::types::PyDict;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 
 use gam::inference::full_conformal::{CanonicalGlmFamily, GlmHomotopyFullConformal};
-use gam::inference::lawley::{RowExpectedJets, RowKappas, lawley_lr_bartlett_factor};
+use gam::inference::lawley::{
+    RhoPenaltyComponent, RowExpectedJets, RowKappas, lawley_lr_bartlett_factor,
+    lawley_lr_mean_shift_with_rho_variation,
+};
 use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use gam::inference::structure_evidence::{
     AtomBirthGate, CandidateProbe, GateVerdict, ProbePlan, e_benjamini_hochberg,
@@ -456,6 +459,173 @@ pub(crate) fn lawley_bartlett_factor<'py>(
     Ok(out)
 }
 
+/// Estimated-λ Lawley LR Bartlett correction (issue #939 deliverable 2, the
+/// genuinely-new penalized theory piece): the ρ̂-**sampling-variation**
+/// contribution to the penalized-null Bartlett factor.
+///
+/// The plain [`lawley_bartlett_factor`] folds the penalty `S_λ` into the
+/// information at the **fitted** smoothing parameter — it is the *conditional*
+/// mean shift `Δε(ρ̂) = E[W | λ]`. When λ is **estimated**, ρ̂ = log λ̂ carries
+/// its own sampling variation and the null mean of the LR statistic picks up the
+/// second-order delta-method term
+///
+/// ```text
+/// E[W(ρ̂)] = Δε(ρ₀) + ½ Σ_{b,b'} (∂²Δε/∂ρ_b ∂ρ_{b'}) · Cov(ρ̂_b, ρ̂_{b'}) + O(·),
+/// ```
+///
+/// assembled exactly by
+/// [`gam::inference::lawley::lawley_lr_mean_shift_with_rho_variation`] from the
+/// curvature of the deterministic conditional shift in the log-smoothing
+/// parameters and the inverse REML/LAML **outer Hessian** `Cov(ρ̂)` (the #740
+/// quantity). Returns the **total** estimated-λ factor `c = 1 + Δε(ρ̂)/d`
+/// alongside the conditional one, so the caller can read the size correction
+/// attributable specifically to ρ̂-variation as `c − c_conditional`.
+///
+/// Inputs mirror [`lawley_bartlett_factor`] plus:
+/// * `penalty` — the **total** fitted `S_λ = Σ_b λ_b S_b^unit` (`k × k`), the
+///   conditional anchor (required here, unlike the conditional entry point).
+/// * `components` — a list of `k × k` component penalties `S_b` at their fitted
+///   scale (`λ_b · S_b^unit`); `∂S_λ/∂ρ_b = S_b`. One per smoothing parameter.
+/// * `rho_cov` — the `m × m` sampling covariance `Cov(ρ̂)` of the `m`
+///   log-smoothing parameters (the regularized inverse REML outer Hessian).
+///
+/// Returns `{"bartlett_factor", "bartlett_factor_conditional",
+/// "rho_variation_shift", "mean_shift", "mean_shift_conditional", "ref_df",
+/// ["corrected_statistic", "p_value_corrected", "p_value_uncorrected"]}`.
+#[pyfunction]
+#[pyo3(signature = (
+    design, family, eta, tested_start, tested_end, ref_df,
+    penalty, components, rho_cov,
+    dispersion = 1.0, prior_weights = None, lr_statistic = None
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lawley_bartlett_factor_estimated_lambda<'py>(
+    py: Python<'py>,
+    design: numpy::PyReadonlyArray2<'py, f64>,
+    family: &str,
+    eta: numpy::PyReadonlyArray1<'py, f64>,
+    tested_start: usize,
+    tested_end: usize,
+    ref_df: f64,
+    penalty: numpy::PyReadonlyArray2<'py, f64>,
+    components: Vec<numpy::PyReadonlyArray2<'py, f64>>,
+    rho_cov: numpy::PyReadonlyArray2<'py, f64>,
+    dispersion: f64,
+    prior_weights: Option<numpy::PyReadonlyArray1<'py, f64>>,
+    lr_statistic: Option<f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    if !(ref_df.is_finite() && ref_df > 0.0) {
+        return Err(py_value_error(format!(
+            "lawley_bartlett_estimated: ref_df must be finite and positive; got {ref_df}"
+        )));
+    }
+    let x = design.as_array();
+    let eta_view = eta.as_array();
+    let n = x.nrows();
+    if eta_view.len() != n {
+        return Err(py_value_error(format!(
+            "lawley_bartlett_estimated: eta has {} entries for {n} design rows",
+            eta_view.len()
+        )));
+    }
+    let weights: Option<Array1<f64>> = match prior_weights {
+        Some(w) => {
+            let wv = w.as_array();
+            if wv.len() != n {
+                return Err(py_value_error(format!(
+                    "lawley_bartlett_estimated: prior_weights has {} entries for {n} design rows",
+                    wv.len()
+                )));
+            }
+            Some(wv.to_owned())
+        }
+        None => None,
+    };
+    let mut kappas: Vec<RowKappas> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut k = row_kappas_for_family(family, eta_view[i], dispersion)?;
+        if let Some(w) = weights.as_ref() {
+            k = k.weighted(w[i]);
+        }
+        kappas.push(k);
+    }
+    let penalty_owned = penalty.as_array().to_owned();
+    let comps: Vec<RhoPenaltyComponent> = components
+        .iter()
+        .map(|c| RhoPenaltyComponent {
+            s_component: c.as_array().to_owned(),
+        })
+        .collect();
+    let rho_cov_owned = rho_cov.as_array().to_owned();
+
+    // Conditional (fixed-λ) factor — the existing deterministic-penalty path.
+    let factor_conditional = lawley_lr_bartlett_factor(
+        x,
+        &kappas,
+        Some(penalty_owned.view()),
+        tested_start..tested_end,
+        ref_df,
+    )
+    .map_err(py_value_error)?;
+
+    // Total estimated-λ mean shift = conditional + ½·tr(Hᵨᵨ Cov(ρ̂)).
+    let total_shift = lawley_lr_mean_shift_with_rho_variation(
+        x,
+        &kappas,
+        penalty_owned.view(),
+        tested_start..tested_end,
+        &comps,
+        rho_cov_owned.view(),
+    )
+    .map_err(py_value_error)?;
+    let mean_w = ref_df + total_shift;
+    let factor = gam::inference::higher_order::bartlett_factor_from_mean(mean_w, ref_df)
+        .ok_or_else(|| {
+            py_value_error(format!(
+                "lawley_bartlett_estimated: degenerate mean {mean_w} (Δε(ρ̂) = {total_shift}, d = {ref_df})"
+            ))
+        })?;
+    if !(factor.is_finite() && factor > 0.0) {
+        return Err(py_value_error(format!(
+            "lawley_bartlett_estimated: degenerate factor {factor}"
+        )));
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("bartlett_factor", factor)?;
+    out.set_item("bartlett_factor_conditional", factor_conditional)?;
+    out.set_item("mean_shift", total_shift)?;
+    // Conditional shift Δε(ρ̂) = (c_cond − 1)·d; the ρ̂-variation increment is the
+    // difference the estimated-λ correction adds on top.
+    let mean_shift_conditional = (factor_conditional - 1.0) * ref_df;
+    out.set_item("mean_shift_conditional", mean_shift_conditional)?;
+    out.set_item("rho_variation_shift", total_shift - mean_shift_conditional)?;
+    out.set_item("ref_df", ref_df)?;
+    if let Some(stat) = lr_statistic {
+        if !(stat.is_finite() && stat >= 0.0) {
+            return Err(py_value_error(format!(
+                "lawley_bartlett_estimated: lr_statistic must be finite and non-negative; got {stat}"
+            )));
+        }
+        let corrected = stat / factor;
+        let dist = ChiSquared::new(ref_df).map_err(|e| {
+            py_value_error(format!(
+                "lawley_bartlett_estimated: χ²_{ref_df} invalid: {e}"
+            ))
+        })?;
+        out.set_item("corrected_statistic", corrected)?;
+        out.set_item(
+            "p_value_corrected",
+            (1.0 - dist.cdf(corrected)).clamp(0.0, 1.0),
+        )?;
+        out.set_item(
+            "p_value_uncorrected",
+            (1.0 - dist.cdf(stat)).clamp(0.0, 1.0),
+        )?;
+    }
+    Ok(out)
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // #939 deliverable 3 — Skovgaard modified directed root r* for a scalar functional
 // ───────────────────────────────────────────────────────────────────────────
@@ -572,7 +742,10 @@ pub(crate) fn skovgaard_r_star<'py>(
     out.set_item("p_value_corrected", res.p_value_corrected)?;
     out.set_item("u_empirical", res.u_empirical)?;
     out.set_item("r_star_empirical", res.r_star_empirical)?;
-    out.set_item("p_value_corrected_empirical", res.p_value_corrected_empirical)?;
+    out.set_item(
+        "p_value_corrected_empirical",
+        res.p_value_corrected_empirical,
+    )?;
     out.set_item("material", res.material)?;
     Ok(out)
 }
@@ -923,7 +1096,7 @@ mod tests {
         let rhs = x.t().dot(&y);
         // Solve H β = rhs via the engine-side Cholesky path used by the seam.
         let factor = {
-            use gam::faer_ndarray::FaerCholesky;
+            use gam::linalg::faer_ndarray::FaerCholesky;
             h.cholesky(faer::Side::Lower).expect("SPD")
         };
         let sensitivity = gam::solver::sensitivity::FitSensitivity::from_faer_cholesky(&factor, p);
@@ -1057,7 +1230,11 @@ mod tests {
         // Canonical: u = (θ̂−θ₀)·î/√ĵ = (θ̂−θ₀)√ĵ, and Î = ĵ ⇒ u_emp = u.
         let u_expected = (theta_hat - theta0) * obs.sqrt();
         assert!((res.u - u_expected).abs() < 1e-12, "u = {}", res.u);
-        assert!((res.u_empirical - res.u).abs() < 1e-12, "u_emp = {}", res.u_empirical);
+        assert!(
+            (res.u_empirical - res.u).abs() < 1e-12,
+            "u_emp = {}",
+            res.u_empirical
+        );
         // The refinement ordering q < r* < r (Wald root < modified root < directed
         // root) for the right-skewed exponential LR.
         let q = (theta_hat - theta0) * obs.sqrt();
@@ -1082,6 +1259,10 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(expected_resolution_budget, module)?)?;
     module.add_function(wrap_pyfunction!(plan_probe_for_contested_claim, module)?)?;
     module.add_function(wrap_pyfunction!(lawley_bartlett_factor, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        lawley_bartlett_factor_estimated_lambda,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(skovgaard_r_star, module)?)?;
     module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
     module.add_function(wrap_pyfunction!(glm_full_conformal, module)?)?;

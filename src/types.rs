@@ -2,7 +2,7 @@ use ndarray::{Array1, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-pub use crate::terms::geometry::hull::PeeledHull;
+pub use crate::terms::geometry::PeeledHull;
 
 /// Lower floor on positive working weights shared by likelihood families and
 /// PIRLS row assembly so weighted normal equations stay numerically well posed.

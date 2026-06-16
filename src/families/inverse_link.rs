@@ -140,11 +140,10 @@ pub fn apply_inverse_link_spec_vec(
 
     let mut out = Vec::with_capacity(eta.len());
     for &e in eta {
-        let (mu, _d1) =
-            crate::solver::mixture_link::inverse_link_mu_d1_for_inverse_link(link, e)
-                .map_err(|err| {
-                    format!("failed to evaluate parameterized inverse link at eta={e}: {err}")
-                })?;
+        let (mu, _d1) = crate::solver::mixture_link::inverse_link_mu_d1_for_inverse_link(link, e)
+            .map_err(|err| {
+            format!("failed to evaluate parameterized inverse link at eta={e}: {err}")
+        })?;
         out.push(mu);
     }
     Ok(out)
@@ -235,8 +234,7 @@ mod tests {
     /// never reach (#1133).
     #[test]
     fn spec_path_evaluates_sas_link_bit_identical_to_solver_jet() {
-        let state = crate::types::SasLinkState::new(0.7, -0.4)
-            .expect("valid SAS link state");
+        let state = crate::types::SasLinkState::new(0.7, -0.4).expect("valid SAS link state");
         let link = InverseLink::Sas(state);
         let eta = [-2.0_f64, -0.5, 0.0, 0.5, 2.0, 4.0];
 
@@ -247,8 +245,7 @@ mod tests {
         let out = apply_inverse_link_spec_vec(&eta, &link).expect("sas spec inverse link");
         assert_eq!(out.len(), eta.len());
         for (i, &e) in eta.iter().enumerate() {
-            let (mu, _d1) =
-                inverse_link_mu_d1_for_inverse_link(&link, e).expect("solver jet eval");
+            let (mu, _d1) = inverse_link_mu_d1_for_inverse_link(&link, e).expect("solver jet eval");
             assert_eq!(
                 out[i], mu,
                 "SAS spec inverse link row {i} must equal the canonical solver mean"
@@ -278,12 +275,14 @@ mod tests {
 
         let out = apply_inverse_link_spec_vec(&eta, &link).expect("mixture spec inverse link");
         for (i, &e) in eta.iter().enumerate() {
-            let (mu, _d1) =
-                inverse_link_mu_d1_for_inverse_link(&link, e).expect("solver jet eval");
+            let (mu, _d1) = inverse_link_mu_d1_for_inverse_link(&link, e).expect("solver jet eval");
             assert_eq!(out[i], mu, "mixture spec inverse link row {i} mismatch");
         }
         for w in out.windows(2) {
-            assert!(w[1] > w[0], "mixture inverse link must be strictly increasing");
+            assert!(
+                w[1] > w[0],
+                "mixture inverse link must be strictly increasing"
+            );
         }
     }
 
@@ -294,12 +293,10 @@ mod tests {
     #[test]
     fn spec_path_evaluates_latent_cloglog_with_fitted_latent_sd() {
         let eta = [-1.0_f64, 0.0, 1.0];
-        let link_a = InverseLink::LatentCLogLog(
-            LatentCLogLogState::new(0.5).expect("valid latent SD"),
-        );
-        let link_b = InverseLink::LatentCLogLog(
-            LatentCLogLogState::new(1.5).expect("valid latent SD"),
-        );
+        let link_a =
+            InverseLink::LatentCLogLog(LatentCLogLogState::new(0.5).expect("valid latent SD"));
+        let link_b =
+            InverseLink::LatentCLogLog(LatentCLogLogState::new(1.5).expect("valid latent SD"));
 
         assert!(apply_inverse_link_vec(&eta, "latent-cloglog").is_err());
 
@@ -307,7 +304,10 @@ mod tests {
         let out_b = apply_inverse_link_spec_vec(&eta, &link_b).expect("latent-cloglog b");
         for (i, &e) in eta.iter().enumerate() {
             let (mu_a, _) = inverse_link_mu_d1_for_inverse_link(&link_a, e).expect("jet a");
-            assert_eq!(out_a[i], mu_a, "latent-cloglog row {i} must match solver jet");
+            assert_eq!(
+                out_a[i], mu_a,
+                "latent-cloglog row {i} must match solver jet"
+            );
             assert!(out_a[i] > 0.0 && out_a[i] < 1.0, "mu in (0,1)");
         }
         // The fitted latent SD genuinely changes the response-scale mean.

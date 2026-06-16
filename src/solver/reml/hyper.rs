@@ -972,17 +972,18 @@ impl<'a> RemlState<'a> {
                             true,
                         );
                         let kernel_opt = bundle.tau_tau_kernel;
-                        let wrapped: Box<dyn super::reml_outer_engine::HyperOperator> = match kernel_opt {
-                            Some(kernel) => Box::new(FirthAugmentedPairHyperOperator {
-                                base: base_b_operator,
-                                firth_op: std::sync::Arc::clone(op),
-                                pair_kernel: kernel,
-                                x_tau_i_dense: x_i_dense.clone(),
-                                x_tau_j_dense: x_j_dense.clone(),
-                                p: p_dim,
-                            }),
-                            None => base_b_operator,
-                        };
+                        let wrapped: Box<dyn super::reml_outer_engine::HyperOperator> =
+                            match kernel_opt {
+                                Some(kernel) => Box::new(FirthAugmentedPairHyperOperator {
+                                    base: base_b_operator,
+                                    firth_op: std::sync::Arc::clone(op),
+                                    pair_kernel: kernel,
+                                    x_tau_i_dense: x_i_dense.clone(),
+                                    x_tau_j_dense: x_j_dense.clone(),
+                                    p: p_dim,
+                                }),
+                                None => base_b_operator,
+                            };
                         (bundle.phi_tau_tau_partial, bundle.gphi_tau_tau, wrapped)
                     } else {
                         (0.0, Array1::<f64>::zeros(p_dim), base_b_operator)
@@ -1924,8 +1925,9 @@ impl<'a> RemlState<'a> {
                         })
                 });
 
-                let mut operators: Vec<std::sync::Arc<dyn super::reml_outer_engine::HyperOperator>> =
-                    Vec::new();
+                let mut operators: Vec<
+                    std::sync::Arc<dyn super::reml_outer_engine::HyperOperator>,
+                > = Vec::new();
                 if c_x_u.iter().any(|value| value.abs() > 0.0)
                     || c_x_tau_u_plus_d_cross.iter().any(|value| value.abs() > 0.0)
                 {
@@ -2272,8 +2274,8 @@ impl<'a> RemlState<'a> {
             coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
                 g: stored_g_j,
-                drift: super::reml_outer_engine::HyperCoordDrift::from_operator(std::sync::Arc::new(
-                    super::reml_outer_engine::SparseDirectionalHyperOperator {
+                drift: super::reml_outer_engine::HyperCoordDrift::from_operator(
+                    std::sync::Arc::new(super::reml_outer_engine::SparseDirectionalHyperOperator {
                         x_tau: dir.x_tau_original.clone(),
                         x_design: x_design.clone(),
                         w_diag: w_diag.clone(),
@@ -2281,8 +2283,8 @@ impl<'a> RemlState<'a> {
                         c_x_tau_beta,
                         firth_hphi_tau_partial,
                         p: p_dim,
-                    },
-                )),
+                    }),
+                ),
                 ld_s: ld_s_j,
                 b_depends_on_beta: !is_gaussian_identity,
                 is_penalty_like: dir.is_penalty_like,
@@ -2376,20 +2378,22 @@ impl<'a> RemlState<'a> {
         let lambdas = rho.mapv(f64::exp);
 
         if p_dim == 0 {
-            let tau_tau_pair_fn = move |_: usize, _: usize| super::reml_outer_engine::HyperCoordPair {
-                a: 0.0,
-                g: Array1::zeros(p_dim),
-                b_mat: Array2::zeros((p_dim, p_dim)),
-                b_operator: None,
-                ld_s: 0.0,
-            };
-            let rho_tau_pair_fn = move |_: usize, _: usize| super::reml_outer_engine::HyperCoordPair {
-                a: 0.0,
-                g: Array1::zeros(p_dim),
-                b_mat: Array2::zeros((p_dim, p_dim)),
-                b_operator: None,
-                ld_s: 0.0,
-            };
+            let tau_tau_pair_fn =
+                move |_: usize, _: usize| super::reml_outer_engine::HyperCoordPair {
+                    a: 0.0,
+                    g: Array1::zeros(p_dim),
+                    b_mat: Array2::zeros((p_dim, p_dim)),
+                    b_operator: None,
+                    ld_s: 0.0,
+                };
+            let rho_tau_pair_fn =
+                move |_: usize, _: usize| super::reml_outer_engine::HyperCoordPair {
+                    a: 0.0,
+                    g: Array1::zeros(p_dim),
+                    b_mat: Array2::zeros((p_dim, p_dim)),
+                    b_operator: None,
+                    ld_s: 0.0,
+                };
             return Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)));
         }
 
@@ -3161,7 +3165,9 @@ mod tests {
     /// base operator (e.g. `ImplicitHyperOperator`) when wiring an
     /// augmentation test. `super::*` brings the unified types in via
     /// `super::reml_outer_engine::DenseMatrixHyperOperator`.
-    pub(crate) fn dense_op(matrix: Array2<f64>) -> Arc<dyn super::super::reml_outer_engine::HyperOperator> {
+    pub(crate) fn dense_op(
+        matrix: Array2<f64>,
+    ) -> Arc<dyn super::super::reml_outer_engine::HyperOperator> {
         Arc::new(super::super::reml_outer_engine::DenseMatrixHyperOperator { matrix })
     }
 

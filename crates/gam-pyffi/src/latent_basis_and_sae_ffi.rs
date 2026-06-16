@@ -317,8 +317,7 @@ fn latent_aux_prior_stats(
     // The closed-form auxiliary-prior REML statistics (residual norm + the
     // log_mu optimum at fixed t + the prior score) live in core; this packs
     // them into the FFI latent-fit plumbing struct.
-    let stats =
-        gam::terms::latent::coord::aux_prior_reml_stats(t_mat, targets.view(), aux_strength)?;
+    let stats = gam::terms::latent::aux_prior_reml_stats(t_mat, targets.view(), aux_strength)?;
     Ok(LatentAuxPriorStats {
         targets,
         residual_sq: stats.residual_sq,
@@ -765,7 +764,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
 /// Routes through `gam::families::multinomial::fit_penalized_multinomial`,
 /// which uses `MultinomialLogitLikelihood: VectorLikelihood` (canonical
 /// observed = Fisher per-row dense `(K-1)×(K-1)` block
-/// `p_a δ_{ab} − p_a p_b`) and `gam::pirls::dense_block_xtwx` for the
+/// `p_a δ_{ab} − p_a p_b`) and `gam::solver::pirls::dense_block_xtwx` for the
 /// stacked Newton solve.
 ///
 /// REML / LAML λ selection is a separate slice (the multinomial CustomFamily
@@ -891,7 +890,7 @@ fn fit_multinomial_formula_pyfunc<'py>(
         let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
             &dataset,
             &formula,
-            &gam::FitConfig::default(),
+            &gam::solver::fit_orchestration::FitConfig::default(),
             init_lambda,
             max_iter,
             tol,
@@ -1078,7 +1077,7 @@ fn latent_augmented_hessian_factor(
     penalty: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     lambda: f64,
-) -> Result<gam::faer_ndarray::FaerSymmetricFactor, String> {
+) -> Result<gam::linalg::faer_ndarray::FaerSymmetricFactor, String> {
     if penalty.dim() != (design.ncols(), design.ncols()) {
         return Err(format!(
             "penalty shape mismatch for latent Hessian: expected {}x{}, got {}x{}",
@@ -1096,7 +1095,7 @@ fn latent_augmented_hessian_factor(
         }
     }
     factorize_symmetricwith_fallback(
-        gam::faer_ndarray::FaerArrayView::new(&hessian).as_ref(),
+        gam::linalg::faer_ndarray::FaerArrayView::new(&hessian).as_ref(),
         Side::Lower,
     )
     .map_err(|err| format!("latent REML Hessian factorization failed: {err}"))
@@ -1132,7 +1131,7 @@ fn add_latent_outer_reml_score_gradient(
     jet: &Array3<f64>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
-    fit: &gam::gaussian_reml::GaussianRemlMultiResult,
+    fit: &gam::solver::gaussian_reml::GaussianRemlMultiResult,
     sigma_eff_mode: SigmaEffMode,
 ) -> Result<(), String> {
     if scale == 0.0 {
@@ -1269,7 +1268,7 @@ fn gaussian_reml_fit_latent_impl(
     periodic: Option<&[Option<f64>]>,
 ) -> Result<
     (
-        gam::gaussian_reml::GaussianRemlMultiResult,
+        gam::solver::gaussian_reml::GaussianRemlMultiResult,
         Array2<f64>,
         Option<LatentAuxStrengthState>,
     ),
@@ -4684,7 +4683,7 @@ fn sae_build_duchon_atom(
     let primary_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
         .ok_or_else(|| {
             format!(
                 "sae_build_duchon_atom: native (Primary) smoothness penalty was not built for \
@@ -5748,9 +5747,8 @@ fn sae_manifold_predict_oos<'py>(
                         // passes.
                         let euclidean_dim = centers.ncols();
                         let trained_m = decoder_blocks[atom_idx].as_array().nrows();
-                        let degree =
-                            sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
-                                .map_err(py_value_error)?;
+                        let degree = sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
+                            .map_err(py_value_error)?;
                         sae_build_euclidean_atom_with_degree(
                             probe_pts.view(),
                             centers.view(),
@@ -6259,9 +6257,8 @@ fn sae_steer_delta<'py>(
                         // width matched to the decoder, same as predict_oos.
                         let euclidean_dim = centers.ncols();
                         let trained_m = decoder_blocks[atom_idx].as_array().nrows();
-                        let degree =
-                            sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
-                                .map_err(py_value_error)?;
+                        let degree = sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
+                            .map_err(py_value_error)?;
                         sae_build_euclidean_atom_with_degree(
                             probe_pts.view(),
                             centers.view(),

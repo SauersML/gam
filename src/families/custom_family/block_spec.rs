@@ -400,7 +400,35 @@ impl BlockEffectiveJacobian for GaugeComposedJacobian {
         state: &FamilyLinearizationState<'_>,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, String> {
-        let j_raw = self.inner.effective_jacobian_rows(state, rows)?;
+        let raw_width = self.t_block.nrows();
+        let reduced_width = self.t_block.ncols();
+        let beta_nonzero = state.beta.iter().any(|&v| v != 0.0);
+        let lifted_beta;
+        let lifted_state;
+        let delegate_state = if state.beta.is_empty() || !beta_nonzero || state.beta.len() == raw_width {
+            state
+        } else if state.beta.len() == reduced_width {
+            lifted_beta = self.t_block.dot(&ndarray::ArrayView1::from(state.beta));
+            lifted_state = FamilyLinearizationState {
+                beta: lifted_beta
+                    .as_slice()
+                    .expect("GaugeComposedJacobian lifted beta is contiguous"),
+                family_scalars: state.family_scalars.clone(),
+                channel_hessian: state.channel_hessian.clone(),
+                probit_frailty_scale: state.probit_frailty_scale,
+            };
+            &lifted_state
+        } else {
+            return Err(format!(
+                "GaugeComposedJacobian: nonzero beta has length {}, expected raw width {} \
+                 or reduced width {}; this wrapper cannot infer a block slice from a joint \
+                 coefficient vector",
+                state.beta.len(),
+                raw_width,
+                reduced_width,
+            ));
+        };
+        let j_raw = self.inner.effective_jacobian_rows(delegate_state, rows)?;
         if j_raw.ncols() != self.t_block.nrows() {
             return Err(format!(
                 "GaugeComposedJacobian: inner Jacobian has {} columns but T_b has {} rows",

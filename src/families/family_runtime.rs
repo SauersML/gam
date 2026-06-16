@@ -1,10 +1,10 @@
 use crate::estimate::{FittedLinkState, UnifiedFitResult};
-use crate::model_types::EstimationError;
 use crate::families::survival::lognormal_kernel::latent_cloglog_inverse_link_jet;
 use crate::inference::generative::NoiseModel;
 use crate::mixture_link::{
     InverseLinkJet, inverse_link_jet_for_family_public, mixture_inverse_link_jet,
 };
+use crate::model_types::EstimationError;
 use crate::quadrature::{
     IntegratedMomentsJet, QuadratureContext, cloglog_posterior_meanvariance,
     integrated_family_moments_jet, integrated_inverse_link_jetwith_state,

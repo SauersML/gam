@@ -94,21 +94,18 @@ mod tests {
     #[test]
     fn wrong_count_is_rejected_with_canonical_message() {
         // Plural form when expected != 1.
-        let err: String =
-            validate_block_count::<String>("FooFamily", 2, 1).unwrap_err();
+        let err: String = validate_block_count::<String>("FooFamily", 2, 1).unwrap_err();
         assert_eq!(err, "FooFamily expects 2 blocks, got 1");
 
         // Too many blocks is rejected just the same.
-        let too_many: String =
-            validate_block_count::<String>("FooFamily", 2, 3).unwrap_err();
+        let too_many: String = validate_block_count::<String>("FooFamily", 2, 3).unwrap_err();
         assert_eq!(too_many, "FooFamily expects 2 blocks, got 3");
     }
 
     #[test]
     fn singular_block_wording_when_expected_is_one() {
         // The message switches to the singular "block" when expected == 1.
-        let err: String =
-            validate_block_count::<String>("BarFamily", 1, 0).unwrap_err();
+        let err: String = validate_block_count::<String>("BarFamily", 1, 0).unwrap_err();
         assert_eq!(err, "BarFamily expects 1 block, got 0");
     }
 

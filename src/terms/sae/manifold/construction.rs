@@ -4776,18 +4776,22 @@ impl SaeManifoldTerm {
     /// uses the *effective* penalty rank rather than the ambient basis size
     /// (a thin-plate / B-spline penalty has a non-trivial null space).
     pub(crate) fn symmetric_rank(s: &Array2<f64>) -> Result<usize, String> {
+        if s.nrows() != s.ncols() {
+            return Err(format!(
+                "SaeManifoldTerm::symmetric_rank: matrix must be square, got {}x{}",
+                s.nrows(),
+                s.ncols()
+            ));
+        }
         let m = s.ncols();
         if m == 0 {
             return Ok(0);
         }
-        // Symmetrise defensively — `smooth_penalty` is conceptually symmetric
-        // but may be stored with tiny asymmetry from assembly arithmetic.
-        let mut sym = Array2::<f64>::zeros((m, m));
-        for i in 0..m {
-            for j in 0..m {
-                sym[[i, j]] = 0.5 * (s[[i, j]] + s[[j, i]]);
-            }
-        }
+        // Symmetrize defensively through the shared ndarray helper. The SAE
+        // rank cutoff is intentionally local to the SAE evidence contract; only
+        // the symmetric cleanup is shared with the other construction modules.
+        let mut sym = s.clone();
+        crate::matrix::symmetrize_in_place(&mut sym);
         let (evals, _evecs) = sym
             .eigh(Side::Lower)
             .map_err(|e| format!("SaeManifoldTerm::symmetric_rank: eigh failed: {e}"))?;

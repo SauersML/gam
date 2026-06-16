@@ -17,7 +17,7 @@
 //! Diagonal/Isotropic noise this per-row block is itself diagonal — exactly
 //! what the arrow Schur elimination in `solver/arrow_schur.rs` consumes.
 
-use crate::estimate::EstimationError;
+use crate::model_types::EstimationError;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 
 /// Per-output noise model for a vector response.

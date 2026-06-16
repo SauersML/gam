@@ -129,6 +129,44 @@ def _coerce_atom_inference(raw: Any) -> list[dict[str, Any]] | None:
     return reports
 
 
+def _coerce_cotrain_report(raw: Any) -> dict[str, Any] | None:
+    """Normalize the Rust co-trained amortized-encoder report (#1154)."""
+    if raw is None:
+        return None
+    report = dict(raw)
+    required = (
+        "recon_consistency",
+        "uncertified_fraction",
+        "n_uncertified",
+        "n_encodes",
+    )
+    missing = [key for key in required if key not in report]
+    if missing:
+        raise ValueError(f"SAE cotrain report missing keys: {missing}")
+    recon = float(report["recon_consistency"])
+    uncert = float(report["uncertified_fraction"])
+    n_uncert = int(report["n_uncertified"])
+    n_encodes = int(report["n_encodes"])
+    if not np.isfinite(recon) or recon < 0.0:
+        raise ValueError(f"SAE cotrain recon_consistency must be finite >= 0, got {recon}")
+    if not np.isfinite(uncert) or uncert < 0.0 or uncert > 1.0:
+        raise ValueError(
+            "SAE cotrain uncertified_fraction must be finite in [0, 1], "
+            f"got {uncert}"
+        )
+    if n_uncert < 0 or n_encodes < 0 or n_uncert > n_encodes:
+        raise ValueError(
+            "SAE cotrain counts must satisfy 0 <= n_uncertified <= n_encodes; "
+            f"got {n_uncert} / {n_encodes}"
+        )
+    return {
+        "recon_consistency": recon,
+        "uncertified_fraction": uncert,
+        "n_uncertified": n_uncert,
+        "n_encodes": n_encodes,
+    }
+
+
 def _canonical_public_assignment(value: str) -> str:
     name = str(value).strip().lower()
     canon = _PUBLIC_ASSIGNMENT_KINDS.get(name)
@@ -681,6 +719,10 @@ class ManifoldSAE:
     # Surfaced via :meth:`structure_certificate`. ``None`` only for payloads
     # predating the certificate.
     structure_certificate_json: str | None = None
+    # Co-trained amortized-encoder diagnostics (#1154), emitted by the Rust
+    # fit payload when the Design-A REML + encoder-consistency fold is active.
+    # Keys: recon_consistency, uncertified_fraction, n_uncertified, n_encodes.
+    cotrain: dict[str, Any] | None = None
     # WP-D output-Fisher shard the fit installed (#980), retained so a follow-up
     # :meth:`steer` call can re-install ``RowMetric::OutputFisher`` and report the
     # path-integrated KL dose. The ``(n, p, r)`` factor stack ``U`` exactly as
@@ -864,6 +906,7 @@ class ManifoldSAE:
         atom_topologies = _topologies_for_bases(kinds)
         scalar_topology = _topology_for_bases(kinds) if kinds else str(topology)
         atom_inference_reports = _coerce_atom_inference(payload.get("atom_inference"))
+        cotrain = _coerce_cotrain_report(payload.get("cotrain"))
         return cls(
             atoms=atoms, atom_topology=scalar_topology,
             atom_topologies=atom_topologies,
@@ -932,6 +975,7 @@ class ManifoldSAE:
                 if payload.get("structure_certificate") is None
                 else str(payload["structure_certificate"])
             ),
+            cotrain=cotrain,
         )
 
     def structure_certificate(self, *, alpha: float | None = None) -> dict[str, Any]:
@@ -1721,6 +1765,7 @@ class ManifoldSAE:
             "avg_active_atoms": float(avg_active), "mean_assignment_mass": float(mean_mass),
             "active_dims": [a.active_dim for a in self.atoms],
             "atom_functionals": [_json_ready(a.functional_evidence) for a in self.atoms],
+            "cotrain": None if self.cotrain is None else dict(self.cotrain),
             "primitives": list(self.primitive_names),
         }
 
@@ -1815,6 +1860,7 @@ class ManifoldSAE:
                 None if self.certificates is None else _jsonable(self.certificates)
             ),
             "structure_certificate": self.structure_certificate_json,
+            "cotrain": None if self.cotrain is None else _jsonable(self.cotrain),
         }
 
     def save(self, path: str | Path) -> None:
@@ -1925,6 +1971,7 @@ class ManifoldSAE:
                 if payload.get("structure_certificate") is None
                 else str(payload["structure_certificate"])
             ),
+            cotrain=_coerce_cotrain_report(payload.get("cotrain")),
         )
 
     @classmethod

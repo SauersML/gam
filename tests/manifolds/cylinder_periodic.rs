@@ -48,6 +48,7 @@ fn tensor_periodic_margin_is_exactly_cyclic_at_period_boundary() {
                     periods: vec![Some(two_pi), None],
                     double_penalty: false,
                     identifiability: TensorBSplineIdentifiability::None,
+                    penalty_decomposition: Default::default(),
                 },
             },
             shape: ShapeConstraint::None,

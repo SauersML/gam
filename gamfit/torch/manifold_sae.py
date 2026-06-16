@@ -1238,6 +1238,13 @@ class ManifoldSAE(nn.Module):
     def is_locked(self) -> bool:
         return bool(self._snapshot_locked)
 
+    @property
+    def cotrain(self) -> dict[str, Any] | None:
+        """Co-trained REML + amortized-encoder diagnostics from the last fit."""
+        if self._last_fit is None:
+            return None
+        return None if self._last_fit.cotrain is None else dict(self._last_fit.cotrain)
+
     @torch.no_grad()
     def extract_feature_curves(self, grid_size: int = 128) -> dict[int, torch.Tensor]:
         """Per-atom reconstruction curve over a manifold grid.

@@ -7,10 +7,6 @@
 //! import these from `crate::model_types` instead of reaching *up* into
 //! `crate::solver::estimate`.
 //!
-//! `solver::estimate` re-exports every type defined here, so existing
-//! `crate::solver::estimate::{EstimationError, PenaltySpec, Dispersion, ...}`
-//! call sites keep compiling unchanged.
-//!
 //! ## Layering
 //! These types depend only on lower or sibling layers (`linalg`, `terms`,
 //! `families`' error types) — never on `solver`. `EstimationError` carries

@@ -2660,12 +2660,11 @@ impl<'a> RemlState<'a> {
             // gradient/Hessian-bearing requests, and a gradient-free entry would
             // force a re-evaluation the moment the optimiser asks for a real
             // gradient at the same ρ. A value-only probe is cheap to repeat.
-            return Ok(OuterEval {
+            return Ok(OuterEval::value_only(
                 cost,
-                gradient: Array1::zeros(p.len()),
-                hessian: HessianResult::Unavailable,
-                inner_beta_hint: self.current_original_basis_beta(),
-            });
+                p.len(),
+                self.current_original_basis_beta(),
+            ));
         }
 
         let decision = match order {

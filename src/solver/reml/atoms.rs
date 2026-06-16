@@ -126,7 +126,9 @@
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
-use super::jeffreys_subspace::{floored_inverse, jeffreys_antiderivative};
+use super::jeffreys_subspace::{
+    floored_inverse, jeffreys_antiderivative, jeffreys_antiderivative_floor_sensitivity,
+};
 use super::reml_outer_engine::PenaltySubspaceTrace;
 
 /// An outer-coordinate direction with its induced inner motion, built ONCE
@@ -617,10 +619,14 @@ impl CriterionAtom for PenaltyQuadAtom {
 ///   (a gate flip is a declared boundary, not a desync). `kept_rank` is the
 ///   reduced dimension `m`.
 ///
-/// The drift is supplied already rotated into the eigenbasis as the reduced
-/// matrix `Ṽ_dir = Vᵀ Z_Jᵀ Ḣ Z_J V` (an `m × m` object — the same reduced
-/// derivative `joint_jeffreys_term`'s gradient builds), so the atom holds only
-/// `(λ, d=floored_inverse(λ), G)` and contracts `tr(diag(d) · Ṽ_dir)`.
+/// The Hessian drift is supplied already rotated into the eigenbasis as the
+/// reduced matrix `Ṽ_dir = Vᵀ Z_Jᵀ Ḣ Z_J V` (an `m × m` object — the same
+/// reduced derivative `joint_jeffreys_term`'s gradient builds). If the
+/// relative eigenvalue floor is active, the floor drift
+/// `floor_dot(dir) = d floor / d dir` is supplied beside it. The atom then
+/// contracts the full first derivative
+/// `½ Σ_i g'_λ(λ_i) λ̇_i + ½ Σ_i g'_floor(λ_i) floor_dot`, so the value and
+/// gradient are projections of the same `g(λ; floor)`.
 pub struct JeffreysLogdetAtom {
     /// Reduced-information eigenvalues `λ_i` (signed; may be < floor or < 0 in
     /// the saturating branches). The one spectrum both channels project.
@@ -636,6 +642,9 @@ pub struct JeffreysLogdetAtom {
     /// gradient builder already forms. Looked up by `dir.index`; an absent
     /// index has no frozen channel (its motion, if any, is zero in this term).
     pub reduced_drift: std::collections::HashMap<usize, Arc<Array2<f64>>>,
+    /// Per-direction drift of the relative floor `floor = max(rel·λ_max, abs)`.
+    /// Missing entries mean the floor is fixed for that direction.
+    pub floor_drift: std::collections::HashMap<usize, f64>,
     /// Declared smoothness stratum (reduced rank + min relative eigengap).
     pub stratum: StratumFingerprint,
 }
@@ -646,6 +655,13 @@ impl JeffreysLogdetAtom {
     /// antidifferentiates and the frozen trace weights against.
     fn floored_inv_diag(&self) -> Array1<f64> {
         self.eigvals.mapv(|lam| floored_inverse(lam, self.floor))
+    }
+
+    fn floor_sensitivity_sum(&self) -> f64 {
+        self.eigvals
+            .iter()
+            .map(|&lam| jeffreys_antiderivative_floor_sensitivity(lam, self.floor))
+            .sum()
     }
 }
 
@@ -672,12 +688,16 @@ impl CriterionAtom for JeffreysLogdetAtom {
             Some(r) => r,
             None => return 0.0,
         };
-        // G · ½ tr(H_id⁺ Ḣ_id) = G · ½ Σ_i d_i (Ṽ_dir)_ii, with d = g'.
+        // G · ½ d/dθ Σ_i g(λ_i; floor): the eigenvalue drift and the
+        // relative-floor drift are both projections of the same antiderivative.
         let d = self.floored_inv_diag();
         let m = d.len();
         let mut trace = 0.0;
         for i in 0..m {
             trace += d[i] * reduced[[i, i]];
+        }
+        if let Some(floor_dot) = self.floor_drift.get(&idx) {
+            trace += self.floor_sensitivity_sum() * floor_dot;
         }
         self.gate_weight * 0.5 * trace
     }
@@ -794,14 +814,15 @@ impl CriterionAtom for JeffreysLogdetAtom {
 // exact slope `g'`) — so the gam#787/#785 value↔gradient-consistency stall is
 // structural here: `d = g'` is the function `value` antidifferentiates.
 // `beta_channel` is None (β̂-motion rides the shared drift, like the main
-// logdet); `stratum` carries the reduced min-eigengap + gate band. Isolation
-// + FD pin: `jeffreys_logdet_atom_emits_consistent_value_and_directional_derivative`
-// asserts the closed-form value/frozen_d1 AND an FD oracle `g'(λ) ≈
-// floored_inverse(λ)` across all four branches. NOTE: this is a worked
-// trait-anchor (like the `SampledBlockAtom`/`PenaltyQuadAtom` anchors);
-// folding it into the live `joint_jeffreys_term` call site (and deleting that
-// inline value/gradient pair) is the per-pass MSI-FD-verified step against
-// the iso-κ suite, not done here. TK and Gaussian-prior atoms remain unported.
+// logdet); `stratum` carries the reduced min-eigengap + gate band. The live
+// `joint_jeffreys_term` call site now builds the atom once for value and once
+// with per-axis reduced/floor drifts for gradient, so the inline value/gradient
+// projection pair is deleted; the divided-difference curvature remains in
+// `joint_jeffreys_term` until the second-order atom pass. Isolation + FD pin:
+// `jeffreys_logdet_atom_emits_consistent_value_and_directional_derivative`
+// asserts the closed-form value/frozen_d1, the relative-floor channel, and an
+// FD oracle `g'(λ) ≈ floored_inverse(λ)` across all four branches. TK and
+// Gaussian-prior atoms remain unported.
 
 #[cfg(test)]
 mod tests {
@@ -1030,6 +1051,7 @@ mod tests {
             floor,
             gate_weight: gate,
             reduced_drift,
+            floor_drift: std::collections::HashMap::new(),
             stratum,
         };
 
@@ -1073,6 +1095,38 @@ mod tests {
         };
         assert!((sum.value() - expected_value).abs() < 1e-12);
         assert!((sum.d1(&dir0) - 2.34375).abs() < 1e-12);
+
+        // Relative-floor channel: with eigenvalue drifts zero and a moving
+        // floor, frozen_d1 must still be the derivative of
+        // ½ Σ g(λ_i; floor). For λ=(0.5,0.25)·floor,
+        // ∂g/∂floor = (500, 750), so Σ ∂g/∂floor = 1250.
+        let mut reduced_drift = std::collections::HashMap::new();
+        reduced_drift.insert(1_usize, Arc::new(array![[0.0, 0.0], [0.0, 0.0]]));
+        let mut floor_drift = std::collections::HashMap::new();
+        floor_drift.insert(1_usize, 2.0e-4);
+        let floor_atom = JeffreysLogdetAtom {
+            eigvals: array![0.5 * floor, 0.25 * floor],
+            floor,
+            gate_weight: gate,
+            reduced_drift,
+            floor_drift,
+            stratum: StratumFingerprint {
+                kept_rank: 2,
+                min_relative_eigengap: 0.25,
+            },
+        };
+        let dir_floor = ThetaDirection {
+            index: Some(1),
+            beta_dot: Some(Arc::new(array![0.0, 0.0])),
+            h_dot_total: None,
+        };
+        let expected_floor_d1 = gate * 0.5 * 1250.0 * 2.0e-4;
+        assert!(
+            (floor_atom.frozen_d1(&dir_floor) - expected_floor_d1).abs() < 1e-12,
+            "floor frozen_d1 {} vs {}",
+            floor_atom.frozen_d1(&dir_floor),
+            expected_floor_d1
+        );
     }
 
     /// The #935 operator pass, end-to-end: [`Sensitivity::fill_direction`]

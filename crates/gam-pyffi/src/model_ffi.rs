@@ -27,7 +27,6 @@ use survival_surface_io::{
     survival_parameters_matrix, write_survival_csv,
 };
 
-
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PySampleOptions {
@@ -44,7 +43,6 @@ struct PySampleOptions {
     /// RNG seed for deterministic chain initialisation.
     seed: Option<u64>,
 }
-
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,7 +65,6 @@ struct PyExtendGroupRequest {
     prior: Option<serde_json::Value>,
 }
 
-
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PyExtensionPrior {
@@ -80,7 +77,6 @@ struct PyExtensionPrior {
     #[serde(default)]
     precision: Option<f64>,
 }
-
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,23 +121,24 @@ struct PyPredictOptions {
     conformal_level: Option<f64>,
 }
 
-
 /// Parse the public `covariance_mode` string into the engine enum. `None`
 /// keeps the engine default (smoothing-preferred); unknown strings are a hard
 /// error so a typo never silently degrades to the default covariance.
 fn parse_covariance_mode(
     raw: Option<&str>,
-) -> Result<Option<gam::predict::InferenceCovarianceMode>, String> {
+) -> Result<Option<gam::inference::predict::InferenceCovarianceMode>, String> {
     let Some(text) = raw else {
         return Ok(None);
     };
     match text.trim().to_ascii_lowercase().as_str() {
-        "conditional" => Ok(Some(gam::predict::InferenceCovarianceMode::Conditional)),
+        "conditional" => Ok(Some(
+            gam::inference::predict::InferenceCovarianceMode::Conditional,
+        )),
         "smoothing" => Ok(Some(
-            gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+            gam::inference::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
         )),
         "required" => Ok(Some(
-            gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingRequired,
+            gam::inference::predict::InferenceCovarianceMode::ConditionalPlusSmoothingRequired,
         )),
         other => Err(format!(
             "covariance_mode must be one of \"conditional\", \"smoothing\", or \"required\"; \
@@ -149,7 +146,6 @@ fn parse_covariance_mode(
         )),
     }
 }
-
 
 #[derive(Serialize)]
 struct PyPredictOptionsPayload {
@@ -165,7 +161,6 @@ struct PyPredictOptionsPayload {
     conformal_level: Option<f64>,
 }
 
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PySharedPrecisionRequest {
@@ -173,14 +168,12 @@ struct PySharedPrecisionRequest {
     groups: Vec<PySharedPrecisionGroup>,
 }
 
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PySharedPrecisionModel {
     key: serde_json::Value,
     state_json: String,
 }
-
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,14 +184,12 @@ struct PySharedPrecisionGroup {
     labels: Vec<String>,
 }
 
-
 #[derive(Serialize)]
 struct SummaryCoefficientRow {
     index: usize,
     estimate: f64,
     std_error: Option<f64>,
 }
-
 
 /// Per-smooth significance row for the FFI summary — the canonical mgcv
 /// `summary.gam` smooth-term table (`edf`, reference d.f., test statistic, and
@@ -225,7 +216,6 @@ struct SummarySmoothTermRow {
     p_value: Option<f64>,
 }
 
-
 /// The fitted curvature estimate for one `curv(...)` constant-curvature smooth
 /// (#944). κ̂ is read directly off the resolved (fitted) basis spec — the
 /// outer optimiser's argmin of the profiled criterion over κ — so it is an
@@ -246,7 +236,6 @@ struct SummaryCurvatureRow {
     /// from the profile-CI endpoints via `curvature_inference_json`.
     geometry: &'static str,
 }
-
 
 #[derive(Serialize)]
 struct SummaryPayload {
@@ -285,7 +274,6 @@ struct SummaryPayload {
     covariance_flat: Option<Vec<f64>>,
 }
 
-
 #[derive(Serialize)]
 struct SchemaIssue {
     kind: String,
@@ -293,13 +281,11 @@ struct SchemaIssue {
     column: Option<String>,
 }
 
-
 #[derive(Serialize)]
 struct SchemaCheckPayload {
     ok: bool,
     issues: Vec<SchemaIssue>,
 }
-
 
 #[derive(Serialize)]
 struct PredictionPayload {
@@ -324,7 +310,6 @@ struct PredictionPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     interval_method: Option<String>,
 }
-
 
 /// JSON wire format for NUTS posterior draws.
 ///
@@ -370,7 +355,6 @@ struct SamplePayload {
     method: String,
 }
 
-
 #[derive(Serialize)]
 struct SampleConfigPayload {
     n_samples: usize,
@@ -379,7 +363,6 @@ struct SampleConfigPayload {
     target_accept: f64,
     seed: u64,
 }
-
 
 #[derive(Serialize)]
 struct SurvivalPredictionPayload {
@@ -404,7 +387,6 @@ struct SurvivalPredictionPayload {
     eta_se: Option<Vec<f64>>,
 }
 
-
 #[derive(Deserialize)]
 struct SurvivalPredictionJsonPayload {
     class: String,
@@ -419,7 +401,6 @@ struct SurvivalPredictionJsonPayload {
     eta_se: Option<Vec<f64>>,
 }
 
-
 #[derive(Serialize)]
 struct ValidationPayload {
     formula: String,
@@ -431,7 +412,6 @@ struct ValidationPayload {
     n_columns: usize,
     supported_by_python: bool,
 }
-
 
 // The gamfit exception hierarchy and the typed engine→Python error
 // adaptors now live in `crate::ffi_errors`; they are re-exported at the
@@ -452,7 +432,6 @@ fn torch_from_fitted(
     module.setattr("_model", model)?;
     Ok(module.unbind())
 }
-
 
 #[pyfunction]
 fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -568,7 +547,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(info.unbind())
 }
 
-
 #[pyfunction]
 fn numeric_matrix_validate<'py>(
     py: Python<'py>,
@@ -612,7 +590,6 @@ fn numeric_matrix_validate<'py>(
     array.cast_into::<PyArray2<f64>>().map_err(PyErr::from)
 }
 
-
 #[pyfunction]
 fn numeric_matrix_f64<'py>(
     py: Python<'py>,
@@ -626,7 +603,6 @@ fn numeric_matrix_f64<'py>(
     numeric_matrix_validate(py, &array, label)
 }
 
-
 #[pyfunction]
 fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
     Ok(values
@@ -634,7 +610,6 @@ fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
         .map(|value| value.clamp(0.0, 1.0))
         .collect())
 }
-
 
 #[pyfunction]
 fn transformation_normal_z_from_columns(columns_json: &str) -> PyResult<Vec<f64>> {
@@ -647,7 +622,6 @@ fn transformation_normal_z_from_columns(columns_json: &str) -> PyResult<Vec<f64>
         "transformation-normal prediction payload is missing linear_predictor",
     ))
 }
-
 
 #[pyfunction]
 fn column_stack_f64<'py>(py: Python<'py>, columns: Vec<Vec<f64>>) -> PyResult<Py<PyArray2<f64>>> {
@@ -674,7 +648,6 @@ fn column_stack_f64<'py>(py: Python<'py>, columns: Vec<Vec<f64>>) -> PyResult<Py
     Ok(out.into_pyarray(py).unbind())
 }
 
-
 #[pyfunction]
 fn flat_to_matrix_f64<'py>(
     py: Python<'py>,
@@ -695,12 +668,10 @@ fn flat_to_matrix_f64<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
-
 #[pyfunction]
 fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyArray1<f64>>> {
     Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
-
 
 fn survival_prediction_matrix_from_rows(rows: Vec<Vec<f64>>, label: &str) -> PyResult<Array2<f64>> {
     if rows.is_empty() {
@@ -720,7 +691,6 @@ fn survival_prediction_matrix_from_rows(rows: Vec<Vec<f64>>, label: &str) -> PyR
     Array2::from_shape_vec((n_rows, n_cols), data)
         .map_err(|err| py_value_error(format!("failed to reshape {label}: {err}")))
 }
-
 
 fn survival_prediction_parameters_from_columns(
     columns: &BTreeMap<String, Vec<f64>>,
@@ -753,7 +723,6 @@ fn survival_prediction_parameters_from_columns(
     Ok(out)
 }
 
-
 fn set_survival_prediction_array1<'py>(
     py: Python<'py>,
     out: &Bound<'py, PyDict>,
@@ -766,7 +735,6 @@ fn set_survival_prediction_array1<'py>(
         out.set_item(key, Array1::from_vec(values).into_pyarray(py))
     }
 }
-
 
 fn set_survival_prediction_matrix<'py>(
     py: Python<'py>,
@@ -782,7 +750,6 @@ fn set_survival_prediction_matrix<'py>(
         None => out.set_item(key, py.None()),
     }
 }
-
 
 #[pyfunction]
 fn survival_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<PyObject> {
@@ -824,7 +791,6 @@ fn survival_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<
     )?;
     Ok(out.into_any().unbind())
 }
-
 
 #[pyfunction]
 fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<PyObject> {
@@ -901,7 +867,6 @@ fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> Py
     Ok(out.into_any().unbind())
 }
 
-
 #[pyfunction]
 fn extract_row_ids(
     headers: Vec<String>,
@@ -930,7 +895,6 @@ fn extract_row_ids(
     }
     Ok(Some(row_ids))
 }
-
 
 /// Training-time upper bound for the default survival surface grid, read from
 /// the saved model rather than the prediction frame.
@@ -988,12 +952,10 @@ fn saved_survival_training_time_upper_bound(model_bytes: &[u8]) -> Option<f64> {
     None
 }
 
-
 /// Multiplier applied to the Weibull baseline scale when no time-basis knots are
 /// available, so the default surface grid reaches into the right tail of the
 /// fitted distribution rather than stopping at the characteristic time.
 const SURVIVAL_DEFAULT_GRID_SCALE_MARGIN: f64 = 5.0;
-
 
 #[pyfunction(signature = (model_class, formula, headers, rows, model_bytes = None))]
 fn default_survival_time_grid(
@@ -1136,7 +1098,6 @@ fn default_survival_time_grid(
     ))
 }
 
-
 #[pyfunction(signature = (headers, rows, formula, config_json = None, fisher_rao_w = None))]
 fn fit_table(
     py: Python<'_>,
@@ -1162,7 +1123,6 @@ fn fit_table(
     Ok(PyBytes::new(py, &model_bytes).unbind())
 }
 
-
 #[pyfunction(signature = (x, y, formula, config_json = None, fisher_rao_w = None))]
 fn fit_array(
     py: Python<'_>,
@@ -1187,14 +1147,12 @@ fn fit_array(
     Ok(PyBytes::new(py, &model_bytes).unbind())
 }
 
-
 #[pyfunction]
 fn load_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<()> {
     detach_py_result(py, "load_model", move || {
         load_model_impl(&model_bytes).map(drop)
     })
 }
-
 
 #[pyfunction]
 fn bayes_factor_log_diff(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyResult<f64> {
@@ -1209,7 +1167,6 @@ fn bayes_factor_log_diff(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyRe
     // reporting overwhelming evidence for the worse-fitting model).
     Ok(log_bayes_factor(score_a, score_b))
 }
-
 
 #[pyfunction]
 fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Option<String>> {
@@ -1227,18 +1184,15 @@ fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Optio
     }))
 }
 
-
 fn required_saved_model_payload_string_value(model_bytes: &[u8], key: &str) -> PyResult<String> {
     saved_model_payload_string(model_bytes.to_vec(), key)?
         .ok_or_else(|| py_value_error(format!("saved model payload is missing {key}")))
 }
 
-
 #[pyfunction]
 fn required_saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<String> {
     required_saved_model_payload_string_value(&model_bytes, key)
 }
-
 
 #[pyfunction]
 fn build_extend_group_payload_json(
@@ -1267,7 +1221,6 @@ fn build_extend_group_payload_json(
         .map_err(|err| py_value_error(format!("failed to serialize extend group payload: {err}")))
 }
 
-
 #[pyfunction]
 fn extend_model_with_group(
     py: Python<'_>,
@@ -1279,7 +1232,6 @@ fn extend_model_with_group(
     })?;
     Ok(PyBytes::new(py, &out).unbind())
 }
-
 
 /// Rewrite smooth-term calls in `formula` so each named smooth carries a
 /// `shape=<kind>` DSL option, given a `constraints` mapping serialized as a list
@@ -1296,7 +1248,6 @@ fn apply_shape_constraints_to_formula(
         .map_err(py_value_error)
 }
 
-
 #[pyfunction]
 fn validate_formula_json(
     py: Python<'_>,
@@ -1310,7 +1261,6 @@ fn validate_formula_json(
     })
 }
 
-
 #[pyfunction]
 fn formula_validation_supported_by_python_json(payload_json: String) -> PyResult<bool> {
     let payload = parse_formula_validation_payload_json(&payload_json).map_err(py_value_error)?;
@@ -1319,7 +1269,6 @@ fn formula_validation_supported_by_python_json(payload_json: String) -> PyResult
         .map(json_payload_truthy)
         .unwrap_or(false))
 }
-
 
 #[pyfunction]
 fn formula_validation_repr_json(payload_json: String) -> PyResult<String> {
@@ -1336,7 +1285,6 @@ fn formula_validation_repr_json(payload_json: String) -> PyResult<String> {
         if supported_by_python { "True" } else { "False" },
     ))
 }
-
 
 #[pyfunction]
 fn formula_validation_html_json(payload_json: String) -> PyResult<String> {
@@ -1357,7 +1305,6 @@ fn formula_validation_html_json(payload_json: String) -> PyResult<String> {
 <table style='border-collapse:collapse;'>{rows}</table></div>"
     ))
 }
-
 
 #[pyfunction(signature = (interval, time_grid, covariance_mode=None, observation_interval=None))]
 fn build_predict_payload_json(
@@ -1381,7 +1328,6 @@ fn build_predict_payload_json(
         .map_err(|err| py_value_error(format!("failed to serialize predict payload: {err}")))
 }
 
-
 #[pyfunction(signature = (model_bytes, headers, rows, interval, covariance_mode=None, observation_interval=None))]
 fn build_model_predict_payload_json(
     model_bytes: Vec<u8>,
@@ -1398,7 +1344,6 @@ fn build_model_predict_payload_json(
     build_predict_payload_json(interval, time_grid, covariance_mode, observation_interval)
 }
 
-
 #[pyfunction]
 fn predict_table(
     py: Python<'_>,
@@ -1411,7 +1356,6 @@ fn predict_table(
         predict_table_impl(&model_bytes, headers, rows, options_json.as_deref())
     })
 }
-
 
 /// Distribution-free conformal prediction intervals (issue #310 family path).
 ///
@@ -1445,7 +1389,6 @@ fn predict_table_conformal(
     })
 }
 
-
 #[pyfunction]
 fn predict_array<'py>(
     py: Python<'py>,
@@ -1459,7 +1402,6 @@ fn predict_array<'py>(
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
-
 
 #[pyfunction]
 fn competing_risks_cif<'py>(
@@ -1481,7 +1423,6 @@ fn competing_risks_cif<'py>(
     ))
 }
 
-
 fn competing_risks_cif_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
@@ -1497,13 +1438,13 @@ fn competing_risks_cif_impl(
         ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
     // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
-    let result = gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
-        .map_err(survival_error_to_pyerr)?;
+    let result =
+        gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
+            .map_err(survival_error_to_pyerr)?;
     let cif_views = result.cif.iter().map(|m| m.view()).collect::<Vec<_>>();
     let cif_stacked = ndarray::stack(Axis(0), &cif_views).map_err(shape_error_to_pyerr)?;
     Ok((cif_stacked, result.overall_survival))
 }
-
 
 #[pyfunction]
 fn competing_risks_cif_from_predictions<'py>(
@@ -1572,20 +1513,20 @@ fn competing_risks_cif_from_predictions<'py>(
     ))
 }
 
-
 fn competing_risks_cif_from_predictions_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
 ) -> PyResult<(Vec<Array2<f64>>, Array2<f64>)> {
     // Typed engine path: `SurvivalError` → `gamfit.SurvivalError` (issue
     // #343), no string flattening.
-    let result =
-        gam::families::survival::assemble_competing_risks_cif_from_endpoints(times, cumulative_hazards)
-            .map_err(survival_error_to_pyerr)?;
+    let result = gam::families::survival::assemble_competing_risks_cif_from_endpoints(
+        times,
+        cumulative_hazards,
+    )
+    .map_err(survival_error_to_pyerr)?;
     let cif = result.cif;
     Ok((cif, result.overall_survival))
 }
-
 
 #[pyfunction]
 fn build_sample_payload_json(
@@ -1620,7 +1561,6 @@ fn build_sample_payload_json(
         .map_err(|err| py_value_error(format!("failed to serialize sample options json: {err}")))
 }
 
-
 #[pyfunction]
 fn sample_table(
     py: Python<'_>,
@@ -1633,7 +1573,6 @@ fn sample_table(
         sample_table_impl(&model_bytes, headers, rows, options_json.as_deref())
     })
 }
-
 
 // paired_sample_table and paired_cumulative_incidence_table pyffi wrappers
 // removed: their payload types (PairedSamplePayload, PairedCifPayload,
@@ -1652,7 +1591,6 @@ fn design_matrix_table(
     })
 }
 
-
 #[pyfunction]
 fn design_matrix_table_dense(
     py: Python<'_>,
@@ -1667,7 +1605,6 @@ fn design_matrix_table_dense(
     Ok(out.into_pyarray(py).unbind())
 }
 
-
 #[pyfunction]
 fn design_matrix_array<'py>(
     py: Python<'py>,
@@ -1681,7 +1618,6 @@ fn design_matrix_array<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
-
 #[pyfunction(signature = (t, knots, degree = 3, periodic = false))]
 fn bspline_basis<'py>(
     py: Python<'py>,
@@ -1694,7 +1630,6 @@ fn bspline_basis<'py>(
         .map_err(py_value_error)?;
     Ok(basis.into_pyarray(py).unbind())
 }
-
 
 #[pyfunction(signature = (t, knots, degree = 3, order = 1, periodic = false))]
 fn bspline_basis_derivative<'py>(
@@ -1710,7 +1645,6 @@ fn bspline_basis_derivative<'py>(
             .map_err(py_value_error)?;
     Ok(basis.into_pyarray(py).unbind())
 }
-
 
 /// Build a closed cyclic uniform B-spline basis and its cyclic difference
 /// penalty on the periodic parameter `t`.
@@ -1737,7 +1671,6 @@ fn periodic_spline_curve_basis<'py>(
         penalty.into_pyarray(py).unbind(),
     ))
 }
-
 
 fn build_wrapped_periodic_harmonic_basis_with_jet(
     t: ArrayView1<'_, f64>,
@@ -1782,7 +1715,6 @@ fn build_wrapped_periodic_harmonic_basis_with_jet(
     Ok((phi, jet, penalty))
 }
 
-
 #[pyfunction]
 fn periodic_basis_with_jet<'py>(
     py: Python<'py>,
@@ -1802,7 +1734,6 @@ fn periodic_basis_with_jet<'py>(
         penalty.into_pyarray(py).unbind(),
     ))
 }
-
 
 #[pyfunction(signature = (points, centers, m = 2))]
 fn duchon_basis_with_jet<'py>(
@@ -1862,7 +1793,7 @@ fn duchon_basis_with_jet<'py>(
     let primary_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
         .ok_or_else(|| {
             py_value_error("duchon_basis_with_jet: primary penalty was not built".to_string())
         })?;
@@ -1891,7 +1822,6 @@ fn duchon_basis_with_jet<'py>(
         penalty.into_pyarray(py).unbind(),
     ))
 }
-
 
 /// Forward Duchon design **and** its analytic input-location first and second
 /// jets, all built from the *same* resolved spec the `duchon_basis` forward
@@ -1982,7 +1912,7 @@ fn duchon_basis_with_jets<'py>(
         }
     }
 
-    let (phi, jet, hess) = gam::basis::build_duchon_basis_design_and_jets(
+    let (phi, jet, hess) = gam::terms::basis::build_duchon_basis_design_and_jets(
         pts,
         ctrs,
         cfg.length_scale,
@@ -1999,7 +1929,6 @@ fn duchon_basis_with_jets<'py>(
         hess.into_pyarray(py).unbind(),
     ))
 }
-
 
 /// Evaluate the Matérn kernel basis design matrix at `points` against `centers`.
 ///
@@ -2066,14 +1995,12 @@ fn matern_basis<'py>(
     Ok(design.into_pyarray(py).unbind())
 }
 
-
 fn required_usize_param(params: &Bound<'_, PyDict>, key: &str) -> PyResult<usize> {
     params
         .get_item(key)?
         .ok_or_else(|| py_value_error(format!("basis_with_jet params missing {key:?}")))?
         .extract::<usize>()
 }
-
 
 #[pyfunction(signature = (kind, t, params))]
 fn basis_with_jet<'py>(
@@ -2254,7 +2181,6 @@ fn basis_with_jet<'py>(
     }
 }
 
-
 /// Evaluate the Duchon m-spline basis at `points` against K `centers`,
 /// for any input dimensionality `d ≥ 1`.
 ///
@@ -2364,7 +2290,6 @@ fn duchon_basis<'py>(
     Ok(built.design.to_dense().into_pyarray(py).unbind())
 }
 
-
 #[pyfunction(signature = (t, num_internal_knots, degree = 3))]
 fn auto_knots_1d<'py>(
     py: Python<'py>,
@@ -2385,7 +2310,6 @@ fn auto_knots_1d<'py>(
     ))
 }
 
-
 #[pyfunction(signature = (t, num_centers))]
 fn auto_centers_1d<'py>(
     py: Python<'py>,
@@ -2396,7 +2320,6 @@ fn auto_centers_1d<'py>(
         auto_centers_1d_equal_mass(t.as_array(), num_centers).map_err(basis_error_to_pyerr)?;
     Ok(centers.into_pyarray(py).unbind())
 }
-
 
 #[pyfunction(signature = (knots, degree = 3, order = 2))]
 fn smoothness_penalty<'py>(
@@ -2412,7 +2335,6 @@ fn smoothness_penalty<'py>(
         null_basis.into_pyarray(py).unbind(),
     ))
 }
-
 
 #[pyfunction(signature = (centers, m = 2, periodic = false, period = None))]
 fn duchon_operator_penalties<'py>(
@@ -2451,7 +2373,6 @@ fn duchon_operator_penalties<'py>(
         matrices.stiffness.into_pyarray(py).unbind(),
     ))
 }
-
 
 #[pyfunction(signature = (
     centers,
@@ -2550,7 +2471,7 @@ fn duchon_function_norm_penalty<'py>(
         let idx = built
             .penaltyinfo
             .iter()
-            .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+            .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
             .ok_or_else(|| {
                 py_value_error(
                     "mixed-periodicity Duchon function-norm penalty was not built".to_string(),
@@ -2579,7 +2500,7 @@ fn duchon_function_norm_penalty<'py>(
     let primary_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
         .ok_or_else(|| {
             py_value_error(
                 "Duchon function-norm penalty (Primary native-norm Gram) was not built".to_string(),
@@ -2588,7 +2509,6 @@ fn duchon_function_norm_penalty<'py>(
     let penalty = built.penalties[primary_idx].clone();
     Ok(penalty.into_pyarray(py).unbind())
 }
-
 
 /// Build the spherical-spline (S²) basis and matching penalty matrix.
 ///
@@ -2651,7 +2571,7 @@ fn sphere_basis<'py>(
     let primary_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
         .ok_or_else(|| {
             py_value_error("sphere_basis: primary penalty was not built; check spec".to_string())
         })?;
@@ -2662,7 +2582,6 @@ fn sphere_basis<'py>(
         penalty.into_pyarray(py).unbind(),
     ))
 }
-
 
 /// Farthest-point center selection on S² (lat/lon).
 ///
@@ -2688,7 +2607,6 @@ fn sphere_select_farthest_point_centers<'py>(
         .map_err(basis_error_to_pyerr)?;
     Ok(centers.into_pyarray(py).unbind())
 }
-
 
 /// Spherical-spline basis evaluated against explicit (caller-supplied) centers.
 ///
@@ -2756,7 +2674,7 @@ fn sphere_basis_with_centers<'py>(
     let primary_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
         .ok_or_else(|| {
             py_value_error(
                 "sphere_basis_with_centers: primary penalty was not built; check spec".to_string(),
@@ -2769,7 +2687,6 @@ fn sphere_basis_with_centers<'py>(
         penalty.into_pyarray(py).unbind(),
     ))
 }
-
 
 /// Resolve `(method, wahba_kernel)` from the user `kernel` string, shared by
 /// the sphere basis + sphere jet entry points. Harmonic carries no Wahba
@@ -2787,7 +2704,6 @@ fn sphere_kernel_kind_from_str(
         ))),
     }
 }
-
 
 /// Analytic DESIGN jet `∂Φ/∂(lat, lon)` of the spherical-spline basis built by
 /// `sphere_basis` (auto Wahba farthest-point centers, or harmonic degree `L =
@@ -2836,7 +2752,6 @@ fn sphere_basis_jet<'py>(
     let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
 }
-
 
 /// Analytic DESIGN jet `∂Φ/∂(lat, lon)` of the spherical-spline basis built by
 /// `sphere_basis_with_centers` (explicit Wahba centers; harmonic uses
@@ -2889,7 +2804,6 @@ fn sphere_basis_jet_with_centers<'py>(
     Ok(jet.into_pyarray(py).unbind())
 }
 
-
 /// Chart-local seven-column sphere basis with analytic lat/lon jet.
 ///
 /// `t` is an `(N, 2)` array of latitude/longitude pairs in radians. The
@@ -2914,7 +2828,6 @@ fn sphere_chart_basis_with_jet<'py>(
     ))
 }
 
-
 #[pyfunction(signature = (centers, m = 2, length_scale = 1.0))]
 fn thin_plate_penalty<'py>(
     py: Python<'py>,
@@ -2931,7 +2844,6 @@ fn thin_plate_penalty<'py>(
         .map_err(basis_error_to_pyerr)?;
     Ok(matrix.penalty.into_pyarray(py).unbind())
 }
-
 
 #[pyfunction]
 fn _block_diag<'py>(
@@ -2962,7 +2874,6 @@ fn _block_diag<'py>(
     }
     Ok(out.into_pyarray(py).unbind())
 }
-
 
 #[pyfunction(signature = (x, y, coefficients, log_lambda, penalty, weights = None, by = None, by_start_col = 0))]
 fn gaussian_reml_score<'py>(
@@ -3019,7 +2930,6 @@ fn gaussian_reml_score<'py>(
     Ok(out.unbind())
 }
 
-
 fn require_finite_matrix(name: &str, matrix: &ArrayView2<'_, f64>) -> PyResult<()> {
     if matrix.iter().any(|value| !value.is_finite()) {
         return Err(py_value_error(format!(
@@ -3028,7 +2938,6 @@ fn require_finite_matrix(name: &str, matrix: &ArrayView2<'_, f64>) -> PyResult<(
     }
     Ok(())
 }
-
 
 #[pyfunction(signature = (y_out, y_hat, z, w_dec, lambda_sparse, skip_u = None, skip_proj = None))]
 fn skip_transcoder_reml_metrics<'py>(
@@ -3158,7 +3067,6 @@ fn skip_transcoder_reml_metrics<'py>(
     Ok(out.unbind())
 }
 
-
 #[pyfunction]
 fn skip_transcoder_select_reml(scores: Vec<f64>) -> PyResult<usize> {
     let mut best: Option<(usize, f64)> = None;
@@ -3174,7 +3082,6 @@ fn skip_transcoder_select_reml(scores: Vec<f64>) -> PyResult<usize> {
         py_value_error("No scored candidates; call reml_score_skip_transcoder first.".to_string())
     })
 }
-
 
 #[pyfunction]
 fn tierney_kadane_normalized_score(
@@ -3193,7 +3100,6 @@ fn tierney_kadane_normalized_score(
     .map_err(PyValueError::new_err)
 }
 
-
 /// String dispatch for the torch fit entry — translate a Python `Smooth`
 /// subclass name into the matching torch entry kind string.
 #[pyfunction]
@@ -3202,7 +3108,6 @@ fn torch_smooth_dispatch_key(spec_kind: &str) -> PyResult<String> {
         .map(|entry| entry.as_str().to_string())
         .map_err(PyValueError::new_err)
 }
-
 
 /// Replace the unique `s(..., type=AUTO)` term in `base_formula` with the
 /// candidate-specific smooth term described by `candidate_json`. The JSON
@@ -3232,7 +3137,6 @@ fn assemble_candidate_formula(
     .map_err(PyValueError::new_err)
 }
 
-
 const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "linear_predictor",
     "mean",
@@ -3250,9 +3154,7 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "noise_scale",
 ];
 
-
 struct OrderedPredictionColumnEntries(Vec<(String, serde_json::Value)>);
-
 
 impl<'de> Deserialize<'de> for OrderedPredictionColumnEntries {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -3284,7 +3186,6 @@ impl<'de> Deserialize<'de> for OrderedPredictionColumnEntries {
     }
 }
 
-
 fn ordered_json_object_string(
     entries: Vec<(String, serde_json::Value)>,
 ) -> Result<String, serde_json::Error> {
@@ -3300,7 +3201,6 @@ fn ordered_json_object_string(
     output.push('}');
     Ok(output)
 }
-
 
 #[pyfunction]
 fn ordered_prediction_columns(columns_json: &str) -> PyResult<String> {
@@ -3326,7 +3226,6 @@ fn ordered_prediction_columns(columns_json: &str) -> PyResult<String> {
         ))
     })
 }
-
 
 /// Rank a set of topology candidates by their TK-normalized REML score.
 ///
@@ -3437,7 +3336,6 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
         .map_err(|err| py_value_error(format!("rank_topology_candidates: serialise: {err}")))
 }
 
-
 /// Solve the stacking-of-predictive-distributions weight problem over retained
 /// topology candidates (#768). `names` aligns with the columns of the
 /// row-major held-out log-predictive-density table `log_density_rows` (each
@@ -3497,7 +3395,6 @@ fn stacking_weights_from_log_density(
     })
 }
 
-
 const REML_SCORE_KEYS: &[&str] = &["reml_score", "evidence", "laml", "score"];
 
 const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
@@ -3519,12 +3416,10 @@ const NULL_HESSIAN_LOGDET_KEYS: &[&str] = &[
 
 const DIM_KEYS: &[&str] = &["effective_dim", "dim_h", "dim_H", "hessian_dim"];
 
-
 enum RemlFitView<'py> {
     SavedSummary(serde_json::Value),
     PythonObject(Bound<'py, PyAny>),
 }
-
 
 #[pyfunction]
 fn extract_reml_score(py: Python<'_>, fit: Py<PyAny>) -> PyResult<f64> {
@@ -3532,13 +3427,11 @@ fn extract_reml_score(py: Python<'_>, fit: Py<PyAny>) -> PyResult<f64> {
     extract_reml_score_impl(py, fit)
 }
 
-
 #[pyfunction]
 fn extract_reml_score_raw(py: Python<'_>, fit: Py<PyAny>) -> PyResult<f64> {
     let fit = fit.bind(py);
     extract_reml_score_raw_impl(py, fit)
 }
-
 
 #[pyfunction]
 fn extract_reml_edf(py: Python<'_>, fit: Py<PyAny>) -> PyResult<Option<f64>> {
@@ -3546,7 +3439,6 @@ fn extract_reml_edf(py: Python<'_>, fit: Py<PyAny>) -> PyResult<Option<f64>> {
     let view = reml_fit_view(py, fit)?;
     extract_edf_from_view(py, &view)
 }
-
 
 #[pyfunction(signature = (fits, names = None, cv_scores = None))]
 fn compare_reml_fits(
@@ -3649,24 +3541,20 @@ fn compare_reml_fits(
     Ok(out.unbind())
 }
 
-
 fn extract_reml_score_impl(py: Python<'_>, fit: &Bound<'_, PyAny>) -> PyResult<f64> {
     let view = reml_fit_view(py, fit)?;
     extract_reml_score_from_view(py, &view)
 }
-
 
 fn extract_reml_score_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<f64> {
     let raw = extract_reml_score_raw_from_view(view)?;
     with_tierney_kadane_normalizer_from_view(py, view, raw)
 }
 
-
 fn extract_reml_score_raw_impl(py: Python<'_>, fit: &Bound<'_, PyAny>) -> PyResult<f64> {
     let view = reml_fit_view(py, fit)?;
     extract_reml_score_raw_from_view(&view)
 }
-
 
 fn extract_reml_score_raw_from_view(view: &RemlFitView<'_>) -> PyResult<f64> {
     if let Some(score) = extract_float_metadata_from_view(view, RAW_REML_SCORE_KEYS)? {
@@ -3687,7 +3575,6 @@ fn extract_reml_score_raw_from_view(view: &RemlFitView<'_>) -> PyResult<f64> {
     }
 }
 
-
 fn with_tierney_kadane_normalizer_from_view(
     py: Python<'_>,
     view: &RemlFitView<'_>,
@@ -3703,7 +3590,6 @@ fn with_tierney_kadane_normalizer_from_view(
     )
     .map_err(PyValueError::new_err)
 }
-
 
 fn comparable_reml_score(
     raw_reml_score: f64,
@@ -3723,7 +3609,6 @@ fn comparable_reml_score(
     )
 }
 
-
 fn comparable_reml_score_from_summary_payload(payload: &serde_json::Value) -> PyResult<f64> {
     let raw = json_lookup_f64(payload, RAW_REML_SCORE_KEYS)
         .or_else(|| json_lookup_f64(payload, REML_SCORE_KEYS))
@@ -3741,7 +3626,6 @@ fn comparable_reml_score_from_summary_payload(payload: &serde_json::Value) -> Py
     .map_err(PyValueError::new_err)
 }
 
-
 fn extract_null_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
     if let Some(null_dim) = extract_float_metadata_from_view(view, NULL_DIM_KEYS)? {
         return Ok(Some(null_dim));
@@ -3756,7 +3640,6 @@ fn extract_null_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResul
         _ => None,
     })
 }
-
 
 fn extract_output_dim_from_view(_py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<f64> {
     match view {
@@ -3778,7 +3661,6 @@ fn extract_output_dim_from_view(_py: Python<'_>, view: &RemlFitView<'_>) -> PyRe
     }
 }
 
-
 fn extract_edf_from_view(_py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
     match view {
         RemlFitView::SavedSummary(payload) => Ok(json_lookup_edf(payload, EDF_KEYS)),
@@ -3790,7 +3672,6 @@ fn extract_edf_from_view(_py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Op
         }
     }
 }
-
 
 fn extract_float_metadata_from_view(
     view: &RemlFitView<'_>,
@@ -3806,7 +3687,6 @@ fn extract_float_metadata_from_view(
         }
     }
 }
-
 
 fn reml_fit_view<'py>(py: Python<'py>, fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
     if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
@@ -3826,11 +3706,9 @@ fn reml_fit_view<'py>(py: Python<'py>, fit: &Bound<'py, PyAny>) -> PyResult<Reml
     Ok(RemlFitView::PythonObject(fit.clone()))
 }
 
-
 fn summary_payload_from_model_bytes(model_bytes: &[u8]) -> PyResult<serde_json::Value> {
     summary_payload_value_from_model_bytes(model_bytes).map_err(PyValueError::new_err)
 }
-
 
 fn py_summary_payload<'py>(
     _py: Python<'py>,
@@ -3849,7 +3727,6 @@ fn py_summary_payload<'py>(
     }
     Ok(Some(summary))
 }
-
 
 fn extract_py_metadata_value<'py>(
     view: &RemlFitView<'py>,
@@ -3872,7 +3749,6 @@ fn extract_py_metadata_value<'py>(
     Ok(None)
 }
 
-
 fn extract_py_get_value<'py>(
     target: &Bound<'py, PyAny>,
     keys: &[&str],
@@ -3893,7 +3769,6 @@ fn extract_py_get_value<'py>(
     Ok(None)
 }
 
-
 fn py_value_to_float_or_sum(value: &Bound<'_, PyAny>) -> PyResult<f64> {
     if let Ok(scalar) = value.extract::<f64>() {
         return Ok(scalar);
@@ -3904,7 +3779,6 @@ fn py_value_to_float_or_sum(value: &Bound<'_, PyAny>) -> PyResult<f64> {
     }
     Ok(total)
 }
-
 
 fn json_lookup_f64(payload: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     let object = payload.as_object()?;
@@ -3917,7 +3791,6 @@ fn json_lookup_f64(payload: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     }
     None
 }
-
 
 fn json_lookup_edf(payload: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     let object = payload.as_object()?;
@@ -3936,14 +3809,12 @@ fn json_lookup_edf(payload: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     None
 }
 
-
 fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_i64().map(|value| value as f64))
         .or_else(|| value.as_u64().map(|value| value as f64))
 }
-
 
 fn json_output_dim(payload: &serde_json::Value) -> f64 {
     let Some(coefficients) = payload.get("coefficients") else {
@@ -3957,7 +3828,6 @@ fn json_output_dim(payload: &serde_json::Value) -> f64 {
     };
     first.as_array().map_or(1.0, |row| row.len() as f64)
 }
-
 
 #[pyfunction(signature = (x, y, penalty, weights, ridge_lambda))]
 fn gaussian_weighted_ridge_array<'py>(
@@ -3981,7 +3851,6 @@ fn gaussian_weighted_ridge_array<'py>(
         fitted.into_pyarray(py).unbind(),
     ))
 }
-
 
 #[pyfunction(signature = (x, y, penalty, weights, ridge_lambda, row_counts = None))]
 fn gaussian_weighted_ridge_batch<'py>(
@@ -4008,7 +3877,6 @@ fn gaussian_weighted_ridge_batch<'py>(
         fitted.into_pyarray(py).unbind(),
     ))
 }
-
 
 #[pyfunction(signature = (x, y, penalty, weights = None, init_lambda = None, by = None, by_start_col = 0))]
 fn gaussian_reml_fit<'py>(
@@ -4060,7 +3928,6 @@ fn gaussian_reml_fit<'py>(
     }
     Ok(out.unbind())
 }
-
 
 #[pyfunction(signature = (
     x,
@@ -4169,7 +4036,6 @@ fn gaussian_reml_fit_backward<'py>(
     Ok(out.unbind())
 }
 
-
 #[pyfunction(signature = (headers, rows, formula, y, config_json = None, fisher_rao_w = None))]
 fn gaussian_reml_fit_formula_table<'py>(
     py: Python<'py>,
@@ -4195,7 +4061,6 @@ fn gaussian_reml_fit_formula_table<'py>(
     tangent_reml_result_to_pydict(py, result)
 }
 
-
 fn tangent_reml_result_to_pydict<'py>(
     py: Python<'py>,
     fit: TangentRemlMultiResult,
@@ -4213,7 +4078,6 @@ fn tangent_reml_result_to_pydict<'py>(
     out.set_item("edf", fit.edf.into_pyarray(py))?;
     Ok(out.unbind())
 }
-
 
 /// Multi-block Gaussian REML forward fit with per-smooth λ_k.
 ///
@@ -4294,7 +4158,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
             .assign(&d.as_array());
     }
 
-    let mut s_list: Vec<gam::smooth::BlockwisePenalty> = Vec::with_capacity(designs.len());
+    let mut s_list: Vec<gam::terms::smooth::BlockwisePenalty> = Vec::with_capacity(designs.len());
     for (i, p) in penalties.iter().enumerate() {
         let pv = p.as_array();
         let k = col_offsets[i + 1] - col_offsets[i];
@@ -4312,7 +4176,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
                 "penalties[{i}][{row},{col}] must be finite; got {value}"
             )));
         }
-        s_list.push(gam::smooth::BlockwisePenalty::new(
+        s_list.push(gam::terms::smooth::BlockwisePenalty::new(
             col_offsets[i]..col_offsets[i + 1],
             pv.to_owned(),
         ));
@@ -4395,7 +4259,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
     };
 
     let offset_zero = Array1::<f64>::zeros(n_rows);
-    let opts = gam::estimate::FitOptions {
+    let opts = gam::solver::estimate::FitOptions {
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
@@ -4418,7 +4282,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
     let joint_x_for_fit = joint_x.clone();
     let fit = detach_estimation_result(py, "gaussian_reml_fit_blocks_forward", move || {
         let heuristic_slice = heuristic_owned.as_ref().map(|values| values.as_slice());
-        gam::estimate::fit_gamwith_heuristic_lambdas(
+        gam::solver::estimate::fit_gamwith_heuristic_lambdas(
             joint_x_for_fit,
             y_col.view(),
             weights_owned.view(),
@@ -4471,7 +4335,6 @@ fn gaussian_reml_fit_blocks_forward<'py>(
     Ok(out.unbind())
 }
 
-
 #[pyfunction(signature = (designs, penalties, y, weights = None, init_rhos = None))]
 fn gaussian_reml_fit_blocks_orthogonal_forward<'py>(
     py: Python<'py>,
@@ -4520,7 +4383,6 @@ fn gaussian_reml_fit_blocks_orthogonal_forward<'py>(
     out.set_item("edf", fit.edf.into_pyarray(py))?;
     Ok(out.unbind())
 }
-
 
 /// Analytic backward for the multi-block per-smooth-λ Gaussian REML forward.
 ///
@@ -4703,7 +4565,6 @@ fn gaussian_reml_fit_blocks_backward<'py>(
     Ok(out.unbind())
 }
 
-
 /// Constrained Gaussian REML forward fit with a single penalty block and an
 /// optional linear inequality system `A·β ≤ b`.
 ///
@@ -4796,7 +4657,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
     // Build the constraint payload. An empty A (0 rows) is treated as "no
     // constraint" — same convention used internally when no shape constraint
     // is active.
-    let constraints_opt: Option<gam::pirls::LinearInequalityConstraints> =
+    let constraints_opt: Option<gam::solver::pirls::LinearInequalityConstraints> =
         match (a_inequality.as_ref(), b_inequality.as_ref()) {
             (Some(a_arr), Some(b_arr)) => {
                 let a_view = a_arr.as_array();
@@ -4818,7 +4679,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
                         )));
                     }
                     Some(
-                        gam::pirls::LinearInequalityConstraints::new(
+                        gam::solver::pirls::LinearInequalityConstraints::new(
                             a_view.to_owned(),
                             b_view.to_owned(),
                         )
@@ -4835,12 +4696,13 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
             }
         };
 
-    let s_list: Vec<gam::smooth::BlockwisePenalty> = vec![gam::smooth::BlockwisePenalty::new(
-        0..p_cols,
-        penalty_view.to_owned(),
-    )];
+    let s_list: Vec<gam::terms::smooth::BlockwisePenalty> =
+        vec![gam::terms::smooth::BlockwisePenalty::new(
+            0..p_cols,
+            penalty_view.to_owned(),
+        )];
 
-    let opts = gam::estimate::FitOptions {
+    let opts = gam::solver::estimate::FitOptions {
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
@@ -4870,7 +4732,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         "gaussian_reml_fit_with_constraints_forward",
         move || {
             let heuristic_slice = heuristic_owned.as_ref().map(|v| v.as_slice());
-            gam::estimate::fit_gamwith_heuristic_lambdas(
+            gam::solver::estimate::fit_gamwith_heuristic_lambdas(
                 x_owned,
                 y_col.view(),
                 weights_owned.view(),
@@ -4934,7 +4796,6 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
     out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
     Ok(out.unbind())
 }
-
 
 /// Analytic backward (VJP) for `gaussian_reml_fit_with_constraints_forward`.
 ///
@@ -5154,7 +5015,6 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     Ok(out.unbind())
 }
 
-
 /// Tangent-projected analytic VJP for the constrained Gaussian REML fit at a
 /// non-empty active set (active cert exit).
 ///
@@ -5209,9 +5069,9 @@ fn constrained_active_backward<'py>(
     // at any valid cert) therefore yields `null((A_actᵀ)ᵀ) = null(A_act)` as a
     // p×k orthonormal basis.
     let a_act_t = a_act.t().to_owned();
-    let z = gam::faer_ndarray::rrqr_nullspace_basis(
+    let z = gam::linalg::faer_ndarray::rrqr_nullspace_basis(
         &a_act_t,
-        gam::faer_ndarray::default_rrqr_rank_alpha(),
+        gam::linalg::faer_ndarray::default_rrqr_rank_alpha(),
     )
     .map_err(|err| py_value_error(format!("failed to build tangent null-space basis Z: {err}")))?
     .0;
@@ -5297,7 +5157,6 @@ fn constrained_active_backward<'py>(
     Ok(out.unbind())
 }
 
-
 #[pyfunction(signature = (
     x,
     y,
@@ -5345,7 +5204,6 @@ fn gaussian_reml_fit_batched<'py>(
     set_batched_gaussian_reml_dict_items(py, &out, result)?;
     Ok(out.unbind())
 }
-
 
 fn set_batched_gaussian_reml_dict_items<'py>(
     py: Python<'py>,
@@ -5405,7 +5263,6 @@ fn set_batched_gaussian_reml_dict_items<'py>(
     out.set_item("cache_nullities", result.cache_nullities.into_pyarray(py))?;
     Ok(())
 }
-
 
 #[pyfunction(signature = (
     x,
@@ -5507,7 +5364,6 @@ fn gaussian_reml_fit_batched_backward<'py>(
     Ok(out.unbind())
 }
 
-
 #[pyfunction(signature = (
     t,
     y,
@@ -5580,7 +5436,6 @@ fn gaussian_reml_fit_positions<'py>(
     }
     Ok(out.unbind())
 }
-
 
 #[pyfunction(signature = (
     t,
@@ -5671,7 +5526,6 @@ fn gaussian_reml_fit_positions_backward<'py>(
     Ok(out.unbind())
 }
 
-
 #[pyfunction(signature = (
     t,
     y,
@@ -5731,7 +5585,6 @@ fn gaussian_reml_fit_positions_batched<'py>(
     set_batched_gaussian_reml_dict_items(py, &out, result)?;
     Ok(out.unbind())
 }
-
 
 #[pyfunction(signature = (
     t,
@@ -5833,7 +5686,6 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     }
     Ok(out.unbind())
 }
-
 
 // ---------------------------------------------------------------------------
 // LatentCoord — N-D generalization of `gaussian_reml_fit_positions`
@@ -5958,7 +5810,6 @@ fn build_latent_duchon_design(
     Ok((design, t_mat))
 }
 
-
 /// Input-location jet `∂Φ/∂t` of the PERIODIC latent Duchon design, matching the
 /// per-manifold forward `build_latent_duchon_design` builds: the 1-D circle
 /// routes through the Bernoulli Green's-function design (gam#580) and the
@@ -6032,7 +5883,7 @@ fn build_latent_duchon_periodic_jet(
     }
     let periodic_flags: Vec<bool> = axes.iter().map(|p| p.is_some()).collect();
     let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
-    let (_phi, jet, _hess) = gam::basis::build_duchon_basis_design_and_jets(
+    let (_phi, jet, _hess) = gam::terms::basis::build_duchon_basis_design_and_jets(
         t_mat,
         centers,
         None,
@@ -6044,7 +5895,6 @@ fn build_latent_duchon_periodic_jet(
     .map_err(|err| format!("failed to evaluate periodic torus latent Duchon jet: {err}"))?;
     Ok(Some(jet))
 }
-
 
 fn t_matrix_from_flat(
     t_flat: ArrayView1<'_, f64>,
@@ -6066,7 +5916,6 @@ fn t_matrix_from_flat(
     }
     Ok(t_mat)
 }
-
 
 fn split_tensor_knots_owned(
     knots_concat: ArrayView1<'_, f64>,
@@ -6095,7 +5944,6 @@ fn split_tensor_knots_owned(
     }
     Ok(per_axis)
 }
-
 
 fn build_latent_tensor_bspline_design(
     t_flat: ArrayView1<'_, f64>,
@@ -6171,7 +6019,6 @@ fn build_latent_tensor_bspline_design(
     Ok((design, t_mat))
 }
 
-
 fn latent_periodic_range_from_centers(centers: ArrayView2<'_, f64>) -> Result<(f64, f64), String> {
     if centers.ncols() != 1 || centers.nrows() == 0 {
         return Err("periodic B-spline latent design requires one-column centers".to_string());
@@ -6187,7 +6034,6 @@ fn latent_periodic_range_from_centers(centers: ArrayView2<'_, f64>) -> Result<(f
     }
     Ok((lo, hi))
 }
-
 
 fn project_latent_jet_columns(
     raw_jet: &Array3<f64>,
@@ -6218,7 +6064,6 @@ fn project_latent_jet_columns(
     }
     Ok(out)
 }
-
 
 fn build_latent_forward_design(
     basis_kind: &str,
@@ -6313,7 +6158,7 @@ fn build_latent_forward_design(
             let built = build_spherical_spline_basis(t_mat.view(), &spec)
                 .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;
             let constraint_transform = match &built.metadata {
-                gam::basis::BasisMetadata::Sphere {
+                gam::terms::basis::BasisMetadata::Sphere {
                     constraint_transform,
                     ..
                 } => constraint_transform.clone(),
@@ -6393,13 +6238,11 @@ fn build_latent_forward_design(
     Ok((design, t_mat, jet))
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SigmaEffMode {
     Profiled,
     Fixed,
 }
-
 
 impl SigmaEffMode {
     fn parse(value: &str) -> Result<Self, String> {

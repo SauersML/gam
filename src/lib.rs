@@ -133,9 +133,6 @@ pub use families::custom_family;
 pub use families::gamlss;
 pub use families::transformation_normal;
 pub use gpu::GpuDeviceInfo;
-pub use solver::protocol::{
-    LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
-};
 pub use solver::fit_orchestration::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
     CtnStage1Recipe, DispersionLocationScaleFitRequest, DispersionLocationScaleFitResult,
@@ -149,4 +146,7 @@ pub use solver::fit_orchestration::{
     fit_residual_cascade_from_formula, fit_spline_scan_from_formula, is_binary_response,
     materialize, prepare_survival_time_stack, residual_cascade_fast_path, resolve_family,
     resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
+};
+pub use solver::protocol::{
+    LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
 };

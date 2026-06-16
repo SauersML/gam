@@ -1287,22 +1287,14 @@ pub fn pullback_step6_joint_beta(
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Three thin pullback entry points.  The bodies all currently return
-// `Ok(None)` (the unsupported sentinel) because the host-side flex jet
-// assembly (Steps 2–4: cubic-cell moments → intercept solve → η/χ/d
-// jets) and the FAMILY-OWNED joint-β pullback (per-block design rows in
-// `marginal_design` / `logslope_design` / `score_warp` / `link_dev`) are
-// not yet wired through these `SurvivalFlexGpuRowInputs`-shaped entry
-// points.  The native row-primary gradient/Hessian kernel they will call
-// IS now landed: `try_flex_primary_rows` (Step 5) takes the assembled
-// per-row jet and returns the per-row primary `(nll, grad[r], hess[r×r])`
-// on the GPU.  Once the host orchestration builds the jet and the family
-// supplies the design-row pullback, these three entry points fold
-// `try_flex_primary_rows` outputs into the coefficient-space
-// gradient/HVP/dense-H.  Until then they stay `Ok(None)` so the
-// dispatcher falls back to CPU.  Keeping the shape stable here
-// (option-typed, single shared input struct) lets that wiring land
-// without re-touching the call sites.
+// Three pullback entry points.  The device-side flex jet assembly (Steps 2–5:
+// cubic-cell moments → intercept solve → η/χ/d jets → primary
+// gradient/Hessian) is still gated by the CUDA backend, but once the host has
+// supplied Step-6 rows these entry points perform the coefficient-space
+// joint-β fold unconditionally after shape validation.  That keeps the
+// `SurvivalFlexGpuRowInputs` surface honest: assembled row-primary derivatives
+// are folded through the family-provided primary→coefficient Jacobian instead
+// of dying behind the backend probe.
 // ────────────────────────────────────────────────────────────────────────
 
 /// Evaluate the survival-flex negative log-likelihood and joint-β
@@ -1316,9 +1308,6 @@ pub fn try_survival_flex_gradient(
 ) -> Result<Option<(f64, Array1<f64>)>, GpuError> {
     inputs.validate()?;
     if inputs.score_dim != 1 {
-        return Ok(None);
-    }
-    if !SurvivalFlexGpuBackend::compiled() {
         return Ok(None);
     }
     // Step 3 hookup: when an intercept-solve descriptor is provided,
@@ -1355,6 +1344,9 @@ pub fn try_survival_flex_gradient(
         let (nll, grad, _hess) = pullback_step6_joint_beta(rows, inputs.p)?;
         return Ok(Some((nll, grad)));
     }
+    if !SurvivalFlexGpuBackend::compiled() {
+        return Ok(None);
+    }
     Ok(None)
 }
 
@@ -1382,12 +1374,12 @@ pub fn try_survival_flex_hvp(
     if inputs.score_dim != 1 {
         return Ok(None);
     }
-    if !SurvivalFlexGpuBackend::compiled() {
-        return Ok(None);
-    }
     if let Some(rows) = step6 {
         let (_nll, _grad, hess) = pullback_step6_joint_beta(rows, inputs.p)?;
         return Ok(Some(hess.dot(&Array1::from(v.to_vec()))));
+    }
+    if !SurvivalFlexGpuBackend::compiled() {
+        return Ok(None);
     }
     Ok(None)
 }
@@ -1414,9 +1406,6 @@ pub fn try_survival_flex_dense_hessian(
     if inputs.score_dim != 1 {
         return Ok(None);
     }
-    if !SurvivalFlexGpuBackend::compiled() {
-        return Ok(None);
-    }
     if let Some(batch) = cells {
         // Validate the moment-building stage on the substrate runtime.
         // Step 4/5/6 will plug these moments into the joint-β
@@ -1440,6 +1429,9 @@ pub fn try_survival_flex_dense_hessian(
     if let Some(rows) = step6 {
         let (_nll, _grad, hess) = pullback_step6_joint_beta(rows, inputs.p)?;
         return Ok(Some(hess));
+    }
+    if !SurvivalFlexGpuBackend::compiled() {
+        return Ok(None);
     }
     Ok(None)
 }
@@ -2144,6 +2136,116 @@ mod step6_tests {
                 assert!((hess[[j, k]] - (h0[j * p + k] + h1[j * p + k])).abs() < 1e-14);
             }
         }
+    }
+
+    fn minimal_gpu_row_inputs<'a>(
+        n: usize,
+        p: usize,
+        beta: &'a [f64],
+        q0: &'a [f64],
+        q1: &'a [f64],
+        qd1: &'a [f64],
+        z: &'a [f64],
+        g: &'a [f64],
+        weights: &'a [f64],
+        event: &'a [f64],
+    ) -> SurvivalFlexGpuRowInputs<'a> {
+        SurvivalFlexGpuRowInputs {
+            n,
+            r: 3,
+            p,
+            score_dim: 1,
+            beta,
+            q0,
+            q1,
+            qd1,
+            z,
+            g,
+            weights,
+            event,
+            derivative_guard: 1.0e-8,
+            probit_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn flex_entrypoints_fold_supplied_step6_rows_before_backend_gate() {
+        let n = 2usize;
+        let p = 4usize;
+        let beta = vec![0.0; p];
+        let q0 = vec![0.1, 0.2];
+        let q1 = vec![0.3, 0.4];
+        let qd1 = vec![1.1, 1.2];
+        let z = vec![-0.2, 0.6];
+        let g = vec![0.05, -0.03];
+        let weights = vec![1.0, 0.7];
+        let event = vec![1.0, 0.0];
+
+        let primary_rows = [
+            SurvivalFlexStep5RowOutputs {
+                row_nll: 1.5,
+                grad: vec![0.3, -0.7, 1.1],
+                hess: vec![
+                    2.0, -0.5, 0.4, //
+                    -0.5, 1.3, 0.2, //
+                    0.4, 0.2, 0.9, //
+                ],
+            },
+            SurvivalFlexStep5RowOutputs {
+                row_nll: -0.25,
+                grad: vec![-1.2, 0.4, 0.6],
+                hess: vec![
+                    1.1, 0.3, -0.2, //
+                    0.3, 0.8, 0.5, //
+                    -0.2, 0.5, 1.4, //
+                ],
+            },
+        ];
+        let jacobians = [
+            vec![
+                1.0, 0.0, 0.5, -0.2, //
+                0.0, 1.0, 0.0, 0.3, //
+                0.7, -0.1, 1.0, 0.0, //
+            ],
+            vec![
+                0.2, 1.0, 0.0, 0.0, //
+                -0.4, 0.0, 1.0, 0.6, //
+                0.0, 0.3, 0.0, 1.0, //
+            ],
+        ];
+        let step6_rows = [
+            SurvivalFlexStep6RowPullback {
+                primary: &primary_rows[0],
+                jacobian: &jacobians[0],
+            },
+            SurvivalFlexStep6RowPullback {
+                primary: &primary_rows[1],
+                jacobian: &jacobians[1],
+            },
+        ];
+
+        let (expected_nll, expected_grad, expected_hess) =
+            pullback_step6_joint_beta(&step6_rows, p).expect("reference step6");
+
+        let inputs = minimal_gpu_row_inputs(n, p, &beta, &q0, &q1, &qd1, &z, &g, &weights, &event);
+        let (nll, grad) = try_survival_flex_gradient(inputs, None, Some(&step6_rows))
+            .expect("gradient entrypoint")
+            .expect("step6 gradient should be assembled before backend gate");
+        assert_eq!(nll, expected_nll);
+        assert_eq!(grad, expected_grad);
+
+        let v = vec![0.25, -0.5, 0.75, -1.0];
+        let inputs = minimal_gpu_row_inputs(n, p, &beta, &q0, &q1, &qd1, &z, &g, &weights, &event);
+        let hv = try_survival_flex_hvp(inputs, &v, Some(&step6_rows))
+            .expect("hvp entrypoint")
+            .expect("step6 hvp should be assembled before backend gate");
+        assert_eq!(hv, expected_hess.dot(&Array1::from(v)));
+
+        let inputs = minimal_gpu_row_inputs(n, p, &beta, &q0, &q1, &qd1, &z, &g, &weights, &event);
+        let hess = try_survival_flex_dense_hessian(inputs, None, Some(&step6_rows))
+            .expect("dense hessian entrypoint")
+            .expect("step6 dense Hessian should be assembled before backend gate");
+        assert_eq!(hess, expected_hess);
     }
 
     #[test]

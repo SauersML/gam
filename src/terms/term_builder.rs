@@ -29,8 +29,8 @@ use crate::inference::model::ColumnKindTag;
 use crate::smooth::{
     BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
-    TermCollectionSpec,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
+    TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
 };
 use crate::solver::resource::ResourcePolicy;
 use crate::types::ColIdx;
@@ -3002,6 +3002,10 @@ pub fn build_smooth_basis(
                     periods: periods_vec,
                     double_penalty: tensor_double_penalty,
                     identifiability: parse_tensor_identifiability(options, kind)?,
+                    penalty_decomposition: match kind {
+                        SmoothKind::T2 => TensorBSplinePenaltyDecomposition::Separable,
+                        _ => TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+                    },
                 },
             })
         }

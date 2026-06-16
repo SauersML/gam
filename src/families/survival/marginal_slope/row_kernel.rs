@@ -241,24 +241,18 @@ impl SurvivalMarginalSlopeRowKernel {
         let f_marginal = factor.slice(s![self.slices.marginal.clone(), ..]);
         let f_logslope = factor.slice(s![self.slices.logslope.clone(), ..]);
 
-        let mut jf = Array2::<f64>::zeros((n_out, 4 * rank));
-        {
-            let jf_marginal = axis(&self.family.marginal_design, f_marginal);
-            {
-                let mut axis0 = jf.slice_mut(s![.., 0..rank]);
-                axis0.assign(&axis(&self.family.design_entry, f_time));
-                axis0 += &jf_marginal;
-            }
-            {
-                let mut axis1 = jf.slice_mut(s![.., rank..2 * rank]);
-                axis1.assign(&axis(&self.family.design_exit, f_time));
-                axis1 += &jf_marginal;
-            }
-        }
-        jf.slice_mut(s![.., 2 * rank..3 * rank])
-            .assign(&axis(&self.family.design_derivative_exit, f_time));
-        jf.slice_mut(s![.., 3 * rank..4 * rank])
-            .assign(&axis(&self.family.logslope_design, f_logslope));
-        jf
+        let jf_marginal = axis(&self.family.marginal_design, f_marginal);
+        let mut axis0 = axis(&self.family.design_entry, f_time);
+        axis0 += &jf_marginal;
+        let mut axis1 = axis(&self.family.design_exit, f_time);
+        axis1 += &jf_marginal;
+        let axis2 = axis(&self.family.design_derivative_exit, f_time);
+        let axis3 = axis(&self.family.logslope_design, f_logslope);
+
+        crate::families::row_kernel::row_kernel_pack_jf_axes::<4>(
+            n_out,
+            rank,
+            [(0, axis0), (1, axis1), (2, axis2), (3, axis3)],
+        )
     }
 }
