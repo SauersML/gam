@@ -96,7 +96,8 @@ impl<'a> RemlState<'a> {
         // the full path would return (`build_prior` projects the identical
         // configured-prior cost from `ConfiguredRhoPriorAtom` and adds the soft
         // guard prior).
-        let prior_cost = self.compute_soft_priorcost(p) + self.configured_rho_prior_atom(p).cost();
+        let prior_cost =
+            self.soft_rho_guard_prior_atom(p).cost() + self.configured_rho_prior_atom(p).cost();
         if !prior_cost.is_finite() {
             log::debug!(
                 "[REML] eval#{} prior short-circuit | prior_cost {:.6e} | rejecting step \
