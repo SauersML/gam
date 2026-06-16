@@ -158,7 +158,6 @@ pub use block_sparsity::*;
 pub use common::*;
 pub use ibp::*;
 pub use isometry::*;
-pub(crate) use manifest::*;
 pub use nested_prefix::*;
 pub use nuclear_norm::*;
 pub use orthogonality::*;

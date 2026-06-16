@@ -197,57 +197,6 @@ impl PenaltyOp for ScaledPenaltyOp {
     }
 }
 
-/// Concrete carrier of a penalty within the candidate / canonical-block
-/// pipeline. The `Dense` variant carries an owned `Array2<f64>` and is the
-/// default; the `Operator` variant carries an `Arc<dyn PenaltyOp>` so the
-/// operator may be reused across consumers (eigendecomposition, PCG matvec,
-/// log-det). Construction sites that build penalties from closed-form factory
-/// routines (`operator_penalty_candidates_closed_form{,_pure}`) may emit
-/// `Operator` form when the size threshold warrants it; below threshold the
-/// dense form is preserved.
-#[derive(Clone)]
-pub enum PenaltyForm {
-    Dense(Array2<f64>),
-    Operator(Arc<dyn PenaltyOp>),
-}
-
-impl PenaltyForm {
-    pub fn dim(&self) -> usize {
-        match self {
-            PenaltyForm::Dense(m) => {
-                assert_eq!(m.nrows(), m.ncols());
-                m.nrows()
-            }
-            PenaltyForm::Operator(op) => op.dim(),
-        }
-    }
-
-    /// Materialize the underlying matrix as `Array2<f64>`. Cheap for `Dense`
-    /// (clone), and may be expensive for `Operator` (full assembly), but is
-    /// always the same numerical result as the operator's matvec contract.
-    pub fn to_dense(&self) -> Array2<f64> {
-        match self {
-            PenaltyForm::Dense(m) => m.clone(),
-            PenaltyForm::Operator(op) => op.as_dense(),
-        }
-    }
-}
-
-impl std::fmt::Debug for PenaltyForm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PenaltyForm::Dense(m) => f
-                .debug_tuple("PenaltyForm::Dense")
-                .field(&format_args!("{}×{}", m.nrows(), m.ncols()))
-                .finish(),
-            PenaltyForm::Operator(op) => f
-                .debug_tuple("PenaltyForm::Operator")
-                .field(&format_args!("dim={}", op.dim()))
-                .finish(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,29 +255,6 @@ mod tests {
         for i in 0..p_op.nrows() {
             for j in 0..p_op.ncols() {
                 assert_abs_diff_eq!(p_op[[i, j]], p_ref[[i, j]], epsilon = 1e-12);
-            }
-        }
-    }
-
-    #[test]
-    fn penalty_form_dim_and_to_dense_round_trip() {
-        let s = psd_fixture();
-        let form = PenaltyForm::Dense(s.clone());
-        assert_eq!(form.dim(), 4);
-        let m = form.to_dense();
-        for i in 0..4 {
-            for j in 0..4 {
-                assert_abs_diff_eq!(m[[i, j]], s[[i, j]], epsilon = 0.0);
-            }
-        }
-
-        let arc: Arc<dyn PenaltyOp> = Arc::new(s.clone());
-        let op_form = PenaltyForm::Operator(arc);
-        assert_eq!(op_form.dim(), 4);
-        let m2 = op_form.to_dense();
-        for i in 0..4 {
-            for j in 0..4 {
-                assert_abs_diff_eq!(m2[[i, j]], s[[i, j]], epsilon = 0.0);
             }
         }
     }
