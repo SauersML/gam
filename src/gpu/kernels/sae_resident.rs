@@ -1061,6 +1061,136 @@ pub fn run_resident_fits_sequential(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4 variant sweep (#1017): the OLMo research battery's independent-fit
+// matrix (K × topology × basis × layer/checkpoint) dispatched concurrently on
+// one device.
+//
+// Each variant is a SEPARATE fit with its OWN resident frame: the per-fit
+// arithmetic is independent of the others, so multiplexing them onto one a100
+// changes only scheduling, never the numbers. This is the cross-fit batch where
+// the issue's 1e5–1e6× race throughput materialises — and unlike per-fit
+// across-iteration residency it needs NO fixed-quadratic inner loop, because the
+// parallelism is BETWEEN fits, not within one.
+// ---------------------------------------------------------------------------
+
+/// One independent fit in the battery's variant sweep. The battery maps each
+/// (K, topology, basis, layer, checkpoint, seed) cell of its matrix to a
+/// `SweepVariant`; `dim` carries the resident-frame shape that cell produces
+/// after the host assembles its row/border slabs. Distinct `seed`s keep the
+/// fits genuinely independent (no shared device buffer, handle, or stream).
+#[derive(Clone, Copy, Debug)]
+pub struct SweepVariant {
+    /// Resident-frame shape for this variant's frozen gate/basis frame.
+    pub dim: DeviceResidentArrowShape,
+    /// Deterministic seed for this variant's fixture/frame.
+    pub seed: u64,
+}
+
+/// Throughput summary for a multiplexed variant sweep on one device.
+#[derive(Clone, Copy, Debug)]
+pub struct SweepThroughput {
+    pub fits: usize,
+    pub succeeded: usize,
+    pub wall_seconds: f64,
+    /// Fits completed per wall-clock second on the single shared device.
+    pub fits_per_second: f64,
+}
+
+/// Build the independent resident workspaces for a variant sweep. Each variant
+/// gets its own well-conditioned `d == 2` frame (the host feeds real slabs in
+/// production; here the deterministic fixture stands in for the parity/throughput
+/// harness). Returns the workspaces in variant order.
+pub fn build_sweep_workspaces(
+    variants: &[SweepVariant],
+) -> Result<Vec<DeviceResidentArrowWorkspace>, DeviceResidentArrowError> {
+    variants
+        .iter()
+        .map(|v| fixture_for_shape_seeded(v.dim, v.seed))
+        .collect()
+}
+
+/// Dispatch a variant sweep concurrently on one device and measure cross-fit
+/// throughput. Returns the per-variant outcomes (in variant order) and the
+/// throughput summary (fits/sec on the single shared a100). Per-fit certified
+/// parity is asserted by [`assert_sweep_parity_vs_sequential`].
+pub fn run_variant_sweep_multiplexed(
+    variants: &[SweepVariant],
+    opts: DeviceResidentInnerOptions,
+) -> Result<
+    (
+        Vec<Result<MultiplexedFit, DeviceResidentArrowError>>,
+        SweepThroughput,
+    ),
+    String,
+> {
+    let workspaces = build_sweep_workspaces(variants).map_err(|e| e.to_string())?;
+    let fits = workspaces.len();
+    let start = std::time::Instant::now();
+    let results = run_resident_fits_multiplexed(workspaces, opts)?;
+    let wall_seconds = start.elapsed().as_secs_f64();
+    let succeeded = results.iter().filter(|r| r.is_ok()).count();
+    let throughput = SweepThroughput {
+        fits,
+        succeeded,
+        wall_seconds,
+        fits_per_second: (fits as f64) / wall_seconds.max(1e-9),
+    };
+    Ok((results, throughput))
+}
+
+/// Certified per-fit parity for a variant sweep: the multiplexed (concurrent)
+/// results must be bit-for-bit identical to the same fits run sequentially on
+/// the same device, because independent fits' arithmetic does not depend on
+/// scheduling. Returns the sequential throughput so the caller can report the
+/// multiplex speedup (multiplexed fits/sec ÷ sequential fits/sec). Returns an
+/// `Err` describing the first divergence so the harness fails loudly.
+pub fn assert_sweep_parity_vs_sequential(
+    variants: &[SweepVariant],
+    opts: &DeviceResidentInnerOptions,
+    multiplexed: &[Result<MultiplexedFit, DeviceResidentArrowError>],
+) -> Result<SweepThroughput, String> {
+    let workspaces = build_sweep_workspaces(variants).map_err(|e| e.to_string())?;
+    let start = std::time::Instant::now();
+    let sequential = run_resident_fits_sequential(&workspaces, opts);
+    let wall_seconds = start.elapsed().as_secs_f64();
+    if sequential.len() != multiplexed.len() {
+        return Err(format!(
+            "sweep parity: length mismatch seq={} mux={}",
+            sequential.len(),
+            multiplexed.len()
+        ));
+    }
+    for (idx, (seq, mux)) in sequential.iter().zip(multiplexed.iter()).enumerate() {
+        match (seq, mux) {
+            (Ok(s), Ok(m)) => {
+                if s.outcome.t.as_slice() != m.outcome.t.as_slice()
+                    || s.outcome.beta.as_slice() != m.outcome.beta.as_slice()
+                    || s.outcome.objective.to_bits() != m.outcome.objective.to_bits()
+                {
+                    return Err(format!(
+                        "sweep parity: fit {idx} multiplexed result differs from sequential"
+                    ));
+                }
+            }
+            (Err(_), Err(_)) => {}
+            _ => {
+                return Err(format!(
+                    "sweep parity: fit {idx} success/failure disagrees seq-vs-mux"
+                ));
+            }
+        }
+    }
+    let fits = variants.len();
+    let succeeded = sequential.iter().filter(|r| r.is_ok()).count();
+    Ok(SweepThroughput {
+        fits,
+        succeeded,
+        wall_seconds,
+        fits_per_second: (fits as f64) / wall_seconds.max(1e-9),
+    })
+}
+
 struct SplitMix64 {
     state: u64,
 }
@@ -1393,5 +1523,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1017 Phase 4 variant sweep: an OLMo-battery-shaped matrix of independent
+    /// fits (here K{1..4} × 3 basis widths = 12 color-arm variants) dispatched
+    /// concurrently on one device. This is the cross-fit throughput lever — the
+    /// fits are independent, so multiplexing changes only scheduling.
+    fn battery_variant_matrix() -> Vec<super::SweepVariant> {
+        let mut variants = Vec::new();
+        // K is the topology rank; the battery races K{1..4}. Each K × basis cell
+        // is an independent fit. Color-arm border, varied basis_cols per cell.
+        for k in 1..=4u64 {
+            for basis_cols in [4usize, 8, 12] {
+                let mut dim = DeviceResidentArrowShape::color_arm();
+                dim.basis_cols = basis_cols;
+                variants.push(super::SweepVariant {
+                    dim,
+                    seed: 0x1017_0040_0000_0000 ^ (k << 8) ^ (basis_cols as u64),
+                });
+            }
+        }
+        variants
+    }
+
+    /// Phase-4 parity: the multiplexed sweep must be bit-identical to running the
+    /// same fits sequentially (CPU reference path here so the gate runs on the
+    /// build box; the device path is exercised by the throughput bench on the a100).
+    #[test]
+    fn variant_sweep_multiplex_matches_sequential() {
+        let variants = battery_variant_matrix();
+        let opts = DeviceResidentInnerOptions::default();
+
+        // Multiplexed via the CPU-reference runner so the gate is meaningful
+        // without CUDA, exercising the exact run_topology_race_parallel plumbing.
+        let workspaces =
+            super::build_sweep_workspaces(&variants).expect("sweep workspaces must build");
+        let multiplexed =
+            super::run_resident_fits_multiplexed_with(workspaces, opts, |ws, opts| {
+                ws.cpu_reference_fit(opts)
+            })
+            .expect("multiplexed cpu sweep");
+
+        let seq_workspaces =
+            super::build_sweep_workspaces(&variants).expect("sweep workspaces must build");
+        let sequential: Vec<_> = seq_workspaces
+            .iter()
+            .map(|ws| ws.cpu_reference_fit(&opts))
+            .collect();
+
+        assert_eq!(multiplexed.len(), sequential.len());
+        for (idx, (mux, seq)) in multiplexed.iter().zip(sequential.iter()).enumerate() {
+            let mux = &mux.as_ref().unwrap().outcome;
+            let seq = seq.as_ref().unwrap();
+            assert_eq!(
+                mux.t.as_slice(),
+                seq.t.as_slice(),
+                "variant {idx}: multiplexed t differs from sequential"
+            );
+            assert_eq!(
+                mux.beta.as_slice(),
+                seq.beta.as_slice(),
+                "variant {idx}: multiplexed beta differs from sequential"
+            );
+            assert_eq!(
+                mux.objective.to_bits(),
+                seq.objective.to_bits(),
+                "variant {idx}: multiplexed objective differs from sequential"
+            );
+        }
+    }
+
+    /// #1017 Phase 4 throughput bench. On a CUDA host this dispatches the battery
+    /// variant matrix concurrently on one device, asserts per-fit certified
+    /// parity vs sequential, and prints the cross-fit throughput (multiplexed
+    /// fits/sec vs sequential fits/sec — the single-a100 race speedup). On a
+    /// CPU-only host it prints a skip line. Run with `--nocapture`.
+    #[test]
+    fn gpu_multiplex_throughput_bench() {
+        let variants = battery_variant_matrix();
+        let opts = DeviceResidentInnerOptions::default();
+
+        let probe = super::build_sweep_workspaces(&variants).expect("sweep workspaces");
+        let any_device = probe.iter().any(|w| w.device_resident());
+        if !any_device {
+            println!(
+                "[#1017 mux-bench] no CUDA device — {} variants (K1..4 x 3 basis) \
+                 skipped; run on the GPU node for cross-fit throughput",
+                variants.len()
+            );
+            return;
+        }
+
+        let (results, mux_tp) =
+            super::run_variant_sweep_multiplexed(&variants, opts).expect("multiplexed sweep");
+        let seq_tp = super::assert_sweep_parity_vs_sequential(&variants, &opts, &results)
+            .expect("sweep parity vs sequential must hold");
+        println!(
+            "[#1017 mux-bench] fits={} succeeded={} multiplexed={:.3}s ({:.1} fits/s) \
+             sequential={:.3}s ({:.1} fits/s) cross-fit-speedup={:.2}x",
+            mux_tp.fits,
+            mux_tp.succeeded,
+            mux_tp.wall_seconds,
+            mux_tp.fits_per_second,
+            seq_tp.wall_seconds,
+            seq_tp.fits_per_second,
+            mux_tp.fits_per_second / seq_tp.fits_per_second.max(1e-9),
+        );
+        assert_eq!(
+            mux_tp.succeeded, mux_tp.fits,
+            "all battery variants must fit successfully on device"
+        );
     }
 }
