@@ -397,10 +397,12 @@ pub fn try_row_batched_cell_moments(
             ),
         })?;
 
-    let mut status = match out {
+    let (moments, mut status, stride) = match out {
         crate::gpu::kernels::cubic_cell::CubicCellDerivativeMomentOutput::Host {
-            status, ..
-        } => status,
+            moments,
+            status,
+            stride,
+        } => (moments, status, stride),
         #[cfg(target_os = "linux")]
         crate::gpu::kernels::cubic_cell::CubicCellDerivativeMomentOutput::Device { .. } => {
             return Err(GpuError::DriverCallFailed {
@@ -410,6 +412,33 @@ pub fn try_row_batched_cell_moments(
             });
         }
     };
+
+    // Substrate contract: the row-major moment buffer is laid out as
+    // `[n_cells, max_degree + 1]`, i.e. `n_cells * stride` f64 entries with
+    // `stride == max_degree + 1`. Validate both invariants at the consumer
+    // boundary so any future regression in the substrate's layout surfaces
+    // here instead of corrupting downstream Step 4/5/6 moment indexing.
+    let expected_stride = batch.max_degree + 1;
+    if stride != expected_stride {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "survival_flex row-cells batch: substrate stride={stride} != max_degree+1={expected_stride}"
+            ),
+        });
+    }
+    let expected_len = batch.n_cells.saturating_mul(stride);
+    if moments.len() != expected_len {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "survival_flex row-cells batch: substrate moments.len()={} != n_cells*stride={} \
+                 (n_cells={}, stride={})",
+                moments.len(),
+                expected_len,
+                batch.n_cells,
+                stride
+            ),
+        });
+    }
 
     // Cells we pre-rejected (`prelim_status != Ok`) get a status code
     // from us if the substrate left them as Ok (it won't, because it
