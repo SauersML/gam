@@ -1016,14 +1016,14 @@ class ManifoldSAE:
             mean = phi @ decoder
             sd = _opt_arr(atom, "shape_band_sd")
             cov = _opt_arr(atom, "decoder_covariance")
+            p = int(decoder.shape[1])
+            m = int(decoder.shape[0])
+            if cov is not None and cov.shape != (m * p, m * p):
+                # A collapsed/degenerate periodic atom can carry a covariance
+                # sized for its pre-collapse (linear) decoder. The posterior sd
+                # band is optional; drop it rather than abort the whole fit.
+                cov = None
             if cov is not None:
-                p = int(decoder.shape[1])
-                m = int(decoder.shape[0])
-                if cov.shape != (m * p, m * p):
-                    raise ValueError(
-                        "periodic decoder_covariance shape mismatch: "
-                        f"expected {(m * p, m * p)}, got {cov.shape}"
-                    )
                 sd = np.zeros((coords.shape[0], p), dtype=float)
                 for channel in range(p):
                     idx = np.arange(channel, m * p, p)
