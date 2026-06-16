@@ -1856,9 +1856,9 @@ fn predict_survival_location_scale_batch(
     // σ is identified through the event Jacobian's `−log σ` term (the
     // survreg / lifelines / flexsurv AFT gauge). The saved model therefore carries
     // a time-warp β that is identically ZERO: the reduced time block has zero free
-    // columns (`z` is p×0) and a zero affine lift (`affine_shift = 0_p`), so the
-    // finalized `beta_time = z·β_reduced + affine_shift` is an all-zero length-`p`
-    // vector (exact zeros — no arithmetic noise — or empty when p==0). A genuine
+    // columns and the Gauge-owned affine shift is zero, so the finalized
+    // `beta_time = T·β_reduced + a` is an all-zero length-`p` vector (exact zeros
+    // — no arithmetic noise — or empty when p==0). A genuine
     // flexible location-scale fit always retains a non-zero unpenalized monotone
     // log-t trend in its warp (its affine null space is never shrunk away), so an
     // all-zero `beta_time` uniquely identifies the reduced regime. Predict must
