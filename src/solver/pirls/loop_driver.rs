@@ -1013,7 +1013,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         }
     };
 
-    // Stage 3.3-GI: GPU exact PLS dispatch — see gpu_dispatch::try_gaussian_pls_gpu.
+    // Stage 3.3-GI: GPU exact PLS dispatch — see pirls_host_dispatch::try_gaussian_pls_gpu.
     if let Some(result) = try_gaussian_pls_gpu(
         link_function,
         config,
@@ -1413,7 +1413,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         );
     };
 
-    // Stage 3.3 GPU PIRLS-loop dispatch — see gpu_dispatch::try_pirls_loop_gpu.
+    // Stage 3.3 GPU PIRLS-loop dispatch — see pirls_host_dispatch::try_pirls_loop_gpu.
     if let Some(result) = try_pirls_loop_gpu(
         config,
         &penalty_active,

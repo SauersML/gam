@@ -170,19 +170,18 @@ fn ibp_assignment_grad_target_matches_value_finite_difference() {
     let rho = Array1::<f64>::zeros(0);
     let g = pen.grad_target(t.view(), rho.view());
     let eps = 1.0e-6;
+    let fd = crate::test_support::fd_checker::numerical_gradient_central_diff(
+        |tv| pen.value(tv.view(), rho.view()),
+        &t,
+        eps,
+    );
     let mut max_err = 0.0_f64;
     for i in 0..t.len() {
-        let mut tp = t.clone();
-        let mut tm = t.clone();
-        tp[i] += eps;
-        tm[i] -= eps;
-        let fd =
-            (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * eps);
-        let err = (g[i] - fd).abs();
+        let err = (g[i] - fd[i]).abs();
         if err > max_err {
             max_err = err;
         }
-        assert_abs_diff_eq!(g[i], fd, epsilon = 1.0e-7);
+        assert_abs_diff_eq!(g[i], fd[i], epsilon = 1.0e-7);
     }
     assert!(
         max_err < 1.0e-7,
@@ -894,19 +893,18 @@ fn block_orthogonality_grad_matches_finite_difference() {
     let rho = array![0.0_f64];
     let g = pen.grad_target(t.view(), rho.view());
     let eps = 1e-6;
+    let fd = crate::test_support::fd_checker::numerical_gradient_central_diff(
+        |tv| pen.value(tv.view(), rho.view()),
+        &t,
+        eps,
+    );
     let mut max_err = 0.0_f64;
     for i in 0..n {
-        let mut tp = t.clone();
-        let mut tm = t.clone();
-        tp[i] += eps;
-        tm[i] -= eps;
-        let fd =
-            (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * eps);
-        let err = (g[i] - fd).abs();
+        let err = (g[i] - fd[i]).abs();
         if err > max_err {
             max_err = err;
         }
-        assert_abs_diff_eq!(g[i], fd, epsilon = 1e-6);
+        assert_abs_diff_eq!(g[i], fd[i], epsilon = 1e-6);
     }
     assert!(max_err < 1e-6, "grad-FD max abs error = {max_err:.3e}");
 }
@@ -1039,19 +1037,18 @@ fn mechanism_sparsity_grad_matches_finite_difference() {
     let rho = array![0.0_f64];
     let g = pen.grad_target(t.view(), rho.view());
     let eps = 1e-6;
+    let fd = crate::test_support::fd_checker::numerical_gradient_central_diff(
+        |tv| pen.value(tv.view(), rho.view()),
+        &t,
+        eps,
+    );
     let mut max_err = 0.0_f64;
     for i in 0..n {
-        let mut tp = t.clone();
-        let mut tm = t.clone();
-        tp[i] += eps;
-        tm[i] -= eps;
-        let fd =
-            (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * eps);
-        let err = (g[i] - fd).abs();
+        let err = (g[i] - fd[i]).abs();
         if err > max_err {
             max_err = err;
         }
-        assert_abs_diff_eq!(g[i], fd, epsilon = 1e-6);
+        assert_abs_diff_eq!(g[i], fd[i], epsilon = 1e-6);
     }
     assert!(max_err < 1e-6, "grad-FD max abs error = {max_err:.3e}");
 }

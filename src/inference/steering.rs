@@ -67,7 +67,7 @@
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
-use crate::terms::sae_manifold::SaeManifoldTerm;
+use crate::terms::sae::manifold::SaeManifoldTerm;
 
 /// Number of sub-steps the latent path `[t_from, t_to]` is integrated over for
 /// the dosimetry path integral. The decoder curve is smooth, so a modest
@@ -90,7 +90,7 @@ const ACTIVE_MASS_FLOOR: f64 = 1e-6;
 pub struct SteerPlan {
     /// Which atom was steered (index into [`SaeManifoldTerm::atoms`]).
     pub atom: usize,
-    /// The atom's name (mirrors [`crate::terms::sae_manifold::SaeManifoldAtom::name`]).
+    /// The atom's name (mirrors [`crate::terms::sae::manifold::SaeManifoldAtom::name`]).
     pub atom_name: String,
     /// The source latent coordinate `t_from` (length = atom's `latent_dim`).
     pub t_from: Vec<f64>,
@@ -137,7 +137,7 @@ pub struct SteerPlan {
 ///
 /// Errors when the atom index is out of range, the coordinate lengths do not
 /// match the atom's latent dimension, the atom has no installed
-/// [`crate::terms::sae_manifold::SaeBasisEvaluator`] (arbitrary-`t` evaluation
+/// [`crate::terms::sae::manifold::SaeBasisEvaluator`] (arbitrary-`t` evaluation
 /// requires one), or the metric dimensions do not match the term. Under a
 /// Euclidean (no-behavior) metric the geometry is still produced but
 /// `predicted_nats` / `validity_radius` degrade to `None`.
@@ -330,7 +330,7 @@ fn metric_carries_behavior(p: MetricProvenance) -> bool {
 /// Evaluate the decoder output `g_k(t) = Φ_k(t) B_k ∈ ℝ^p` at an arbitrary
 /// latent coordinate `t` (length `d`) via the atom's installed evaluator.
 fn decode_at(
-    evaluator: &dyn crate::terms::sae_manifold::SaeBasisEvaluator,
+    evaluator: &dyn crate::terms::sae::manifold::SaeBasisEvaluator,
     decoder: &Array2<f64>,
     t: &[f64],
     p: usize,
@@ -363,7 +363,7 @@ fn decode_at(
 /// axis `a ∈ 0..d`, at an arbitrary latent coordinate `t`. Returned as a
 /// `(p × d)` matrix whose column `a` is the tangent along axis `a`.
 fn decode_tangents_at(
-    evaluator: &dyn crate::terms::sae_manifold::SaeBasisEvaluator,
+    evaluator: &dyn crate::terms::sae::manifold::SaeBasisEvaluator,
     decoder: &Array2<f64>,
     t: &[f64],
     p: usize,
@@ -497,7 +497,7 @@ fn solve_spd_small(gram: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
 /// The fixed geometry of one steering query, bundled so the dose integrator and
 /// its helpers take a single context rather than a long argument list.
 struct SteerContext<'a> {
-    evaluator: &'a dyn crate::terms::sae_manifold::SaeBasisEvaluator,
+    evaluator: &'a dyn crate::terms::sae::manifold::SaeBasisEvaluator,
     decoder: &'a Array2<f64>,
     metric: &'a RowMetric,
     /// The row whose per-row metric the dose is measured through.

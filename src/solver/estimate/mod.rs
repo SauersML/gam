@@ -3615,7 +3615,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                     tau_tau_policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
                     tau_tau_policy.budget_bytes as f64 / (1024.0 * 1024.0),
                 );
-                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient
             } else {
                 order
             }
@@ -3655,7 +3655,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
         design_revision: Option<u64>,
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         let hyper_dirs = self.prepare_eval_state(
             x,
             s_list,
@@ -3906,8 +3906,8 @@ fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
 
 fn reml_inner_progress_feedback(
     state: &crate::solver::estimate::reml::RemlState<'_>,
-) -> crate::solver::outer_strategy::InnerProgressFeedback {
-    crate::solver::outer_strategy::InnerProgressFeedback {
+) -> crate::solver::rho_optimizer::InnerProgressFeedback {
+    crate::solver::rho_optimizer::InnerProgressFeedback {
         cap: Arc::clone(&state.outer_inner_cap),
         accepted_iter: Arc::new(AtomicUsize::new(0)),
         last_iters: Arc::clone(&state.last_inner_iters),
@@ -3921,7 +3921,7 @@ fn with_reml_beta_seed_hook<'state, 'data>() -> impl FnMut(
     &mut &'state mut crate::solver::estimate::reml::RemlState<'data>,
     &Array1<f64>,
 ) -> Result<
-    crate::solver::outer_strategy::SeedOutcome,
+    crate::solver::rho_optimizer::SeedOutcome,
     EstimationError,
 > {
     |state, beta| {
@@ -3935,7 +3935,7 @@ fn with_reml_beta_seed_hook<'state, 'data>() -> impl FnMut(
         // else the prior state) is what the next eval warm-starts from, so
         // `Installed` is the correct contract reply.
         state.setwarm_start_original_beta(Some(beta.view()));
-        Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
+        Ok(crate::solver::rho_optimizer::SeedOutcome::Installed)
     }
 }
 

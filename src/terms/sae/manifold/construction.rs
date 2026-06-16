@@ -2274,6 +2274,154 @@ impl SaeManifoldTerm {
         self.amortized_encode_target(targets, amplitudes.view())
     }
 
+    /// #1154 — amortized-encoder consistency of the CURRENT dictionary against
+    /// its own fit-time target. This is the co-training signal of the joint
+    /// amortized-encoder + REML loop (Design A): the amortized (one-mat-vec)
+    /// encode is built from the *current* fitted decoder, run on `targets`, and
+    /// scored on two principled axes —
+    ///
+    /// * `recon_consistency` (the bilinear part of the co-training loss): the
+    ///   mean per-element squared gap between the **amortized** reconstruction
+    ///   `Σ_k z_k · Φ_k(t̂_k) B_k` (decode the amortized coords) and the
+    ///   **exact** fitted reconstruction `Σ_k z_k · Φ_k(t_k^*) B_k` the inner
+    ///   solve converged to. A dictionary whose encode map is well-approximated
+    ///   to first order by the per-chart IFT predictor scores near zero; a
+    ///   dictionary the amortized encoder *cannot* invert faithfully (sharp
+    ///   curvature, poorly-charted regions) scores high. Minimising this jointly
+    ///   with REML steers the fit toward dictionaries that admit a fast,
+    ///   faithful amortized encode — the architectural co-adaptation #1154 adds.
+    /// * `uncertified_fraction`: the share of (row, atom) encodes whose
+    ///   Kantorovich certificate failed (`h > ½`), i.e. that fell back to the
+    ///   exact chart-center Newton. This is the encoder's *certifiable coverage*
+    ///   of the dictionary; co-training rewards dictionaries the cheap encode
+    ///   certifies, not just ones it happens to land.
+    ///
+    /// The certificate keeps every accepted amortized coord honest (uncertified
+    /// rows already ride the exact fallback inside `amortized_encode_target`), so
+    /// this metric never silently trusts a wrong encode — it MEASURES how much of
+    /// the dictionary the cheap encoder can faithfully and certifiably invert.
+    pub fn amortized_encoder_consistency(
+        &self,
+        targets: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<AmortizedEncoderConsistency, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if targets.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::amortized_encoder_consistency: targets {:?} must be (n={n}, p={p})",
+                targets.dim()
+            ));
+        }
+        let amplitudes = self.fitted_assignment_amplitudes(rho)?;
+        let encodes = self.amortized_encode_target(targets, amplitudes.view())?;
+        // The EXACT fitted reconstruction the inner solve converged to (pure
+        // curved image, rho-keyed) is the supervision target for the amortized
+        // reconstruction. Both are n×p ambient, so the comparison is layout-free.
+        let exact_recon = self.try_fitted_for_rho(rho)?;
+
+        // Build the amortized reconstruction Σ_k z_k · Φ_k(t̂_k) B_k by decoding
+        // each atom's amortized coords through that atom's own basis evaluator.
+        let mut amortized_recon = Array2::<f64>::zeros((n, p));
+        let mut uncertified = 0usize;
+        for atom_idx in 0..k_atoms {
+            let atom = &self.atoms[atom_idx];
+            let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+                format!(
+                    "SaeManifoldTerm::amortized_encoder_consistency: atom {atom_idx} has no basis evaluator"
+                )
+            })?;
+            let result = &encodes[atom_idx];
+            uncertified += result.encode_uncertified_count;
+            // Decode the amortized coords: Φ_k(t̂) is (n × M_k); B_k is (M_k × p).
+            let (phi, _jac) = evaluator.evaluate(result.coords.view())?;
+            let decoded = phi.dot(&atom.decoder_coefficients); // (n × p)
+            for row in 0..n {
+                let z = amplitudes[[row, atom_idx]];
+                if z == 0.0 {
+                    continue;
+                }
+                for col in 0..p {
+                    amortized_recon[[row, col]] += z * decoded[[row, col]];
+                }
+            }
+        }
+
+        let mut sse = 0.0_f64;
+        for row in 0..n {
+            for col in 0..p {
+                let gap = amortized_recon[[row, col]] - exact_recon[[row, col]];
+                sse += gap * gap;
+            }
+        }
+        let denom = (n.max(1) * p.max(1)) as f64;
+        let recon_consistency = sse / denom;
+        let total_encodes = (n * k_atoms).max(1) as f64;
+        let uncertified_fraction = uncertified as f64 / total_encodes;
+
+        Ok(AmortizedEncoderConsistency {
+            recon_consistency,
+            uncertified_fraction,
+            n_uncertified: uncertified,
+            n_encodes: n * k_atoms,
+        })
+    }
+
+    /// #1154 — the co-trained REML criterion: the exact REML criterion at `rho`
+    /// PLUS the amortized-encoder consistency penalty, so the outer optimizer
+    /// co-adapts the dictionary + smoothing parameters λ TOWARD a dictionary the
+    /// fast amortized encoder can faithfully and certifiably invert.
+    ///
+    /// This is Design A of #1154. The inner solve still converges the `(t, β)`
+    /// system to stationarity at the engine's current ρ (so the implicit-function
+    /// REML λ-gradient `dβ̂/dλ = −(H+S_λ)⁻¹(dS_λ/dλ)β̂` stays EXACT — the encoder
+    /// only warm-starts/co-adapts, it never replaces the stationary point). The
+    /// added term
+    ///
+    /// ```text
+    ///   J_cotrain(ρ) = REML(ρ)  +  w · ‖x̂_amortized − x̂_exact‖²/(n·p)
+    ///                            +  w_cert · uncertified_fraction
+    /// ```
+    ///
+    /// folds the post-fit amortized-encode quality into the ranked objective. The
+    /// weights are auto-scaled to the REML criterion magnitude (magic by default:
+    /// no caller knob) so the consistency term is a meaningful but non-dominant
+    /// fraction of the objective regardless of problem scale.
+    pub fn reml_criterion_cotrained(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<(f64, SaeManifoldLoss, AmortizedEncoderConsistency), String> {
+        let (reml, loss) = self.reml_criterion_with_refine_policy(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            true,
+        )?;
+        let consistency = self.amortized_encoder_consistency(target, rho)?;
+        // Auto-scale the co-training weights to the REML magnitude so the
+        // consistency penalty is a bounded, scale-free fraction of the objective
+        // (magic by default: no caller knob). `reml_scale` floors at 1 so a
+        // near-zero criterion still admits a meaningful consistency contribution.
+        let reml_scale = reml.abs().max(1.0);
+        let w_recon = COTRAIN_RECON_WEIGHT * reml_scale;
+        let w_cert = COTRAIN_CERT_WEIGHT * reml_scale;
+        let cotrained = reml
+            + w_recon * consistency.recon_consistency
+            + w_cert * consistency.uncertified_fraction;
+        Ok((cotrained, loss, consistency))
+    }
+
     pub fn loss(
         &self,
         target: ArrayView2<'_, f64>,

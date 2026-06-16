@@ -64,7 +64,7 @@ use crate::linalg::faer_ndarray::FaerEigh;
 use crate::terms::sae::candidate_index::{
     AtomFrameSketch, SaeCandidateIndex, auto_candidate_budget,
 };
-use crate::terms::sae_manifold::{
+use crate::terms::sae::manifold::{
     AffineCoordinateEvaluator, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator,
     EuclideanPatchEvaluator, PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeManifoldAtom,
     SphereChartEvaluator, TorusHarmonicEvaluator,
@@ -530,7 +530,7 @@ pub(crate) fn reconstruction_jet_sups(
 ) -> ReconstructionJetSups {
     if matches!(
         atom.basis_kind,
-        crate::terms::sae_manifold::SaeAtomBasisKind::Periodic
+        crate::terms::sae::manifold::SaeAtomBasisKind::Periodic
     ) {
         periodic_reconstruction_jet_sups(atom.decoder_coefficients.view())
     } else {
@@ -684,7 +684,7 @@ pub(crate) fn family_jet_sups(
     atom: &SaeManifoldAtom,
     chart: &ChartRegion,
 ) -> Result<JetSups, String> {
-    use crate::terms::sae_manifold::SaeAtomBasisKind::*;
+    use crate::terms::sae::manifold::SaeAtomBasisKind::*;
     let m = atom.basis_size();
     let d = atom.latent_dim;
     let sups = match &atom.basis_kind {
@@ -1855,7 +1855,7 @@ pub(crate) const SHAPE_BAND_MAX_POINTS: usize = 512;
 /// These conventions match the basis evaluators (the fraction-of-period circle
 /// harmonic and the lat/lon sphere chart).
 pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Array2<f64> {
-    use crate::terms::sae_manifold::SaeAtomBasisKind::*;
+    use crate::terms::sae::manifold::SaeAtomBasisKind::*;
     let d = atom.latent_dim;
     match &atom.basis_kind {
         Periodic | Torus => regular_product_grid(d, resolution, 0.0, 1.0, false),
@@ -1919,7 +1919,7 @@ pub(crate) fn regular_product_grid(
 }
 
 /// Lat/lon sphere chart grid: `lat ∈ [−π/2, π/2]`, `lon ∈ [−π, π)`, matching
-/// the [`crate::terms::sae_manifold::SphereChartEvaluator`] convention.
+/// the [`crate::terms::sae::manifold::SphereChartEvaluator`] convention.
 pub(crate) fn sphere_latlon_grid(resolution: usize) -> Array2<f64> {
     use std::f64::consts::PI;
     let r = resolution.max(2).min(22); // 22² = 484 ≤ SHAPE_BAND_MAX_POINTS.
@@ -1964,7 +1964,7 @@ pub(crate) fn cylinder_chart_center_grid(resolution: usize) -> Array2<f64> {
 /// the domain. For compact latents this is the grid step; for unbounded latents
 /// a unit default that the certified radius refines.
 pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) -> f64 {
-    use crate::terms::sae_manifold::SaeAtomBasisKind::*;
+    use crate::terms::sae::manifold::SaeAtomBasisKind::*;
     match &atom.basis_kind {
         Periodic | Torus => 0.5 / (resolution.max(2) as f64),
         Sphere => std::f64::consts::PI / (resolution.max(2) as f64),
@@ -1984,7 +1984,7 @@ pub(crate) fn chart_region(
     center: Array1<f64>,
     radius: f64,
 ) -> ChartRegion {
-    use crate::terms::sae_manifold::SaeAtomBasisKind::*;
+    use crate::terms::sae::manifold::SaeAtomBasisKind::*;
     let region = ChartRegion::new(center.clone(), radius);
     match &atom.basis_kind {
         Duchon => {
