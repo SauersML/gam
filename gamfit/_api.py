@@ -401,20 +401,19 @@ def _normalize_smooths(
                 f"TensorBSpline / Pca / PeriodicSplineCurve / Categorical), "
                 f"got {type(descriptor).__name__}"
             )
-        if getattr(descriptor, "by", None) is not None:
-            # `by=` is a real, supported per-row multiplier on the
-            # primitive/manifold numpy FFI paths, but the formula `smooths={}`
-            # descriptor bridge has no consumer for it (the Rust
-            # descriptor-merge in `smooth_overrides.rs` reads no `by` key and is
-            # governed by `deny_unknown_fields`). Serializing it here would
-            # silently no-op. Reject loudly and point at the formula syntax that
-            # does wire `by` (`s(x, by=g)`), mirroring how the descriptor path
-            # rejects the unsupported `double_penalty` key.
+        by = getattr(descriptor, "by", None)
+        if by is not None and not isinstance(by, str):
+            # On the formula `smooths={}` descriptor path the gating variable
+            # is named by data-frame column (resolved to a `by_col` in the Rust
+            # merge, identical to `s(x, by=g)`). A raw per-row `by` *array* is
+            # the contract of the primitive numpy API (`gamfit.duchon_basis`,
+            # ... — `crates/gam-pyffi/src/model_ffi.rs`), which has no data
+            # frame to name. Reject it loudly here rather than mis-serialize.
             raise ValueError(
-                f"smooths[{key!r}]: by= is not supported on the smooths={{}} "
-                f"descriptor path (it would be silently dropped). Use the "
-                f"formula by-smooth syntax instead, e.g. fit(df, "
-                f'"y ~ s({key}, by=g)").'
+                f"smooths[{key!r}]: by= on the smooths={{}} descriptor path must "
+                f"be the *name* of a data-frame column (the gating variable), "
+                f"e.g. Duchon(..., by='g'); got {type(by).__name__}. Raw per-row "
+                f"by arrays are supported only on the primitive numpy API."
             )
         payload = descriptor.to_rust_descriptor()
         if not isinstance(payload, Mapping):

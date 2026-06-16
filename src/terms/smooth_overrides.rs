@@ -32,13 +32,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::inference::data::EncodedDataset as Dataset;
+use crate::inference::model::ColumnKindTag;
 use crate::terms::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec, DuchonBasisSpec,
     DuchonNullspaceOrder, MaternBasisSpec, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
     SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
 use crate::terms::smooth::{
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec, parse_shape_constraint,
+    BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
+    TermCollectionSpec, parse_shape_constraint,
 };
 
 /// Apply the Python-side `smooths={...}` registry to a built term collection.
