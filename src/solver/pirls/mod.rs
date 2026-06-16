@@ -5,8 +5,8 @@
 //! reproducing the flat namespace the module historically shared, without any
 //! line-cut `include!` fragments.
 
-mod imports;
-pub use imports::*;
+mod prelude;
+pub use prelude::*;
 
 // ── Concern modules ──────────────────────────────────────────────────────────
 mod convergence;

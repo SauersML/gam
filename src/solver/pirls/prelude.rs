@@ -1,4 +1,4 @@
-//! Shared import surface for the `solver::pirls` concern modules.
+//! Shared import/prelude surface for the `solver::pirls` concern modules.
 //!
 //! Every name here is re-exported `pub(crate)` so each concern module can pull
 //! the whole set with a single `use super::*;` (glob imports are exempt from the
@@ -76,3 +76,16 @@ pub(crate) use crate::linalg::utils::{array_is_finite, inf_norm, row_chunk_for_b
 
 // `log` is used as a path (`log::debug!`), so re-export the crate itself.
 pub(crate) use log;
+
+#[cfg(test)]
+mod tests {
+    /// Locks the `solver::pirls::prelude` module path (renamed from `imports`
+    /// per #1137) and a representative re-exported symbol as an invariant.
+    #[test]
+    fn pirls_prelude_module_path_is_locked() {
+        // Resolving these paths fails to compile if the module is renamed or
+        // the key re-export is dropped.
+        use crate::solver::pirls::prelude::DesignMatrix;
+        assert!(core::any::type_name::<DesignMatrix>().contains("DesignMatrix"));
+    }
+}
