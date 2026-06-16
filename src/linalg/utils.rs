@@ -1531,9 +1531,47 @@ mod ridge_tests {
 mod tests {
     use super::{
         boundary_hit_step_fraction, solve_spd_pcg, solve_spd_pcg_with_info,
-        solve_spd_pcg_with_info_into,
+        solve_spd_pcg_with_info_into, splitmix64, splitmix64_hash,
     };
     use ndarray::{Array1, array};
+
+    /// Pin the canonical SplitMix64 stream to Vigna's reference sequence so the
+    /// unification of the ~12 former module-local copies cannot drift seeds.
+    #[test]
+    fn splitmix64_matches_reference_sequence() {
+        // Vigna's reference C `splitmix64` started from state 0.
+        let mut state = 0u64;
+        assert_eq!(splitmix64(&mut state), 0xE220A8397B1DCDAF);
+        assert_eq!(splitmix64(&mut state), 0x6E789E6AA1B965F4);
+        assert_eq!(splitmix64(&mut state), 0x06C45D188009454F);
+
+        // The pure-hash flavour equals one stateful step seeded from `x`.
+        for x in [0u64, 1, 42, 0x9E37_79B9_7F4A_7C15, u64::MAX] {
+            let mut s = x;
+            assert_eq!(splitmix64_hash(x), splitmix64(&mut s));
+        }
+    }
+
+    /// Re-derive the literal three-line finalizer that every former copy
+    /// inlined and confirm it is bit-identical to the canonical step. Guards
+    /// against any future constant typo creeping into the single source.
+    #[test]
+    fn splitmix64_step_equals_inlined_finalizer() {
+        for seed in [0u64, 7, 0xDEAD_BEEF, 0x0123_4567_89AB_CDEF, u64::MAX - 3] {
+            let mut state = seed;
+            let got = splitmix64(&mut state);
+
+            let advanced = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = advanced;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let expect = z ^ (z >> 31);
+
+            assert_eq!(got, expect);
+            // The canonical step must have advanced state by exactly one G.
+            assert_eq!(state, advanced);
+        }
+    }
 
     #[test]
     fn boundary_hit_step_fraction_ignores_near_tangential_direction() {

@@ -1120,6 +1120,22 @@ impl LatentZConditionalCalibration {
         // ~13s/disease cost of the SE correction). Floored rows yield an exact
         // all-zero `J` row, so they contribute zero to the GEMM — bit-identical
         // to skipping them, no approximation.
+        let j_mat = self.build_zeta_theta1_jacobian(z, a_block);
+        let vb_g = self.beta_theta1_sensitivity(score_zeta_sensitivity, j_mat.view(), vb)?;
+        Ok(self.generated_regressor_term(vb_g.view()))
+    }
+
+    /// Per-row ζ-Jacobian matrix `J` (`n × dim θ₁`, row `i` = `∂ζ_i/∂θ₁`) built
+    /// row-by-row from [`Self::zeta_theta1_jacobian_row`]. Floored rows yield an
+    /// exact all-zero row, so they contribute nothing to the `G = Sᵀ·J` cross
+    /// product (bit-identical to skipping them).
+    fn build_zeta_theta1_jacobian(
+        &self,
+        z: ArrayView1<'_, f64>,
+        a_block: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
+        let n = a_block.nrows();
+        let dim_theta1 = self.theta1_dim();
         let mut j_mat = Array2::<f64>::zeros((n, dim_theta1));
         for i in 0..n {
             let j_zeta_row = self.zeta_theta1_jacobian_row(z[i], a_block.row(i));
@@ -1133,8 +1149,24 @@ impl LatentZConditionalCalibration {
                 *slot = jz;
             }
         }
-        let vb_g = self.beta_theta1_sensitivity(score_zeta_sensitivity, j_mat.view(), vb)?;
-        Ok(self.generated_regressor_term(vb_g.view()))
+        j_mat
+    }
+
+    /// Test-facing wrapper exposing the SIGNED sensitivity `∂β̂/∂θ₁ = Vb·G`
+    /// (`p_β × dim θ₁`) the Murphy–Topel correction is built from, assembled
+    /// through the same `G = Sᵀ·J` chain as [`Self::generated_regressor_correction`]
+    /// but returning the signed `Vb·G` instead of the sign-invariant PSD term.
+    /// Used by the #1131 signed FD oracle to lock the sign convention.
+    #[cfg(test)]
+    pub(crate) fn beta_theta1_sensitivity_for_test(
+        &self,
+        score_zeta_sensitivity: ArrayView2<'_, f64>,
+        z: ArrayView1<'_, f64>,
+        a_block: ArrayView2<'_, f64>,
+        vb: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let j_mat = self.build_zeta_theta1_jacobian(z, a_block);
+        self.beta_theta1_sensitivity(score_zeta_sensitivity, j_mat.view(), vb)
     }
 
     /// Signed first-order sensitivity `∂β̂/∂θ₁ = Vb·G` (`p_β × dim θ₁`) of the
