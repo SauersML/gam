@@ -28,8 +28,6 @@ use crate::gpu::kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
     GpuCellBranchTag, branch::classify_cell_for_gpu,
 };
-#[cfg(target_os = "linux")]
-use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex, OnceLock};

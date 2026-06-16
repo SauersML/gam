@@ -99,7 +99,7 @@ mod linux_impl {
 
     use crate::construction::ReparamResult;
     use crate::gpu::cuda_selected;
-    use crate::gpu::pirls_row::{CurvatureMode, PirlsRowFamily};
+    use crate::gpu::kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
     use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::gpu::runtime::GpuRuntime;
     use crate::linalg::matrix::SymmetricMatrix;
@@ -388,8 +388,8 @@ mod linux_impl {
         // at the dispatch boundary rather than silently passing a corrupt
         // iterate to the outer REML loop.
         {
-            const FORBIDDEN_ROW: u32 = crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
-                | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+            const FORBIDDEN_ROW: u32 = crate::gpu::kernels::pirls_row::status_flags::INVALID_RESPONSE
+                | crate::gpu::kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
             if (per_row_status_or & FORBIDDEN_ROW) != 0 && !matches!(status, PirlsStatus::Unstable)
             {
                 return Err(format!(

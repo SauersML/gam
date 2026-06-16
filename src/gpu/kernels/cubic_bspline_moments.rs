@@ -73,8 +73,6 @@ use std::sync::OnceLock;
 use crate::gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
 use crate::gpu::gpu_error::GpuResultExt;
-#[cfg(target_os = "linux")]
-use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
