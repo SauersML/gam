@@ -296,7 +296,8 @@ fn null_simulation_size_is_calibrated_small_n() {
                             let p_move = (p_hi - p_lo) / p_hi.max(f64::MIN_POSITIVE);
                             let expected = factor_move > 0.10 || p_move > 0.10;
                             assert_eq!(
-                                r.material, expected,
+                                r.material,
+                                expected,
                                 "{} n={n} k={k}: material flag must follow the 10% rule \
                                  (c={:.4}, factor_move={:.4}, p_move={:.4})",
                                 family.label(),
