@@ -1663,16 +1663,17 @@ impl SaeManifoldTerm {
         if k_atoms <= 1 {
             return None;
         }
-        // The per-row tangent projection used for non-Euclidean atom latents
-        // requires the uniform-`q` dense layout; the compact active-set path
-        // skips it. So the effective (truncating) sparse plan only engages
-        // when the ext-coord manifold is Euclidean. JumpReLU's structural gate
-        // is exact and handled separately, so this restriction does not affect
-        // it. At huge `K` on a curved manifold the streaming driver still
-        // bounds memory; only the per-atom truncation is withheld.
-        if !self.ext_coord_manifold().is_euclidean() {
-            return None;
-        }
+        // The per-row Riemannian tangent projection for non-Euclidean atom
+        // latents is now applied directly on the compact active-set rows (see
+        // the `Some(layout)` arm in `assemble_arrow_schur`, via
+        // `compact_row_ext_manifold_and_point`), which rebuilds each row's
+        // product manifold in its compact column order and applies the SAME
+        // gt/htt/htbeta + Kronecker-Jacobian projections the dense path uses. So
+        // the sparse plan may engage on curved ext-coord manifolds (circle /
+        // torus / sphere atoms) — the affordability lever for manifold-SAE at
+        // large `K`, where the dense `K²` co-assignment Gram is the cost. (The
+        // former `is_euclidean()`-only restriction punted every curved atom to
+        // the dense layout; it is lifted.)
         let p = self.output_dim();
         let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
         // Dense data Gram footprint: (m_total · m_total) f64.
@@ -3753,42 +3754,111 @@ impl SaeManifoldTerm {
         // requires a uniform latent dimension. The sparse plan only engages on
         // Euclidean ext-coord manifolds (see `sparse_active_plan`), so skipping
         // the projector here is correct — there is nothing to project.
-        if row_layout.is_none() {
-            let raw_gt_rows: Vec<Array1<f64>> = sys.rows.iter().map(|row| row.gt.clone()).collect();
-            self.apply_sae_riemannian_geometry(&mut sys);
-            let manifold = self.ext_coord_manifold();
-            if !frames_engaged && !manifold.is_euclidean() {
-                let ext = self.ext_coord_matrix();
-                // Project the local Jacobian columns onto the tangent space at
-                // each row's ext-coord point. Each column `j` of the row's
-                // (q_row × p) Jacobian is an ambient-space vector of length
-                // `q_row`; the manifold projector acts on one such column at a
-                // time. Working directly on the row-major `jac_flat` storage via
-                // a single reusable `col_buf` avoids the two dense (q × p) copies
-                // (flatten→Array2, project, unflatten→Vec) that previously fired
-                // per row. `t_buf` still holds the row's ext-coord vector.
-                let mut t_buf = vec![0.0_f64; q];
-                let mut col_buf = Array1::<f64>::zeros(q);
-                for row_idx in 0..n {
-                    let ext_row = ext.row(row_idx);
-                    for (slot, &v) in t_buf.iter_mut().zip(ext_row.iter()) {
-                        *slot = v;
-                    }
-                    let t_i = ArrayView1::from(t_buf.as_slice());
-                    let raw_gt = raw_gt_rows[row_idx].view();
-                    let jac_flat = &mut kron_jac[row_idx];
-                    let q_row = jac_flat.len() / p;
-                    for j in 0..p {
-                        for c in 0..q_row {
-                            col_buf[c] = jac_flat[c * p + j];
+        match row_layout.as_ref() {
+            None => {
+                let raw_gt_rows: Vec<Array1<f64>> =
+                    sys.rows.iter().map(|row| row.gt.clone()).collect();
+                self.apply_sae_riemannian_geometry(&mut sys);
+                let manifold = self.ext_coord_manifold();
+                if !frames_engaged && !manifold.is_euclidean() {
+                    let ext = self.ext_coord_matrix();
+                    // Project the local Jacobian columns onto the tangent space at
+                    // each row's ext-coord point. Each column `j` of the row's
+                    // (q_row × p) Jacobian is an ambient-space vector of length
+                    // `q_row`; the manifold projector acts on one such column at a
+                    // time. Working directly on the row-major `jac_flat` storage via
+                    // a single reusable `col_buf` avoids the two dense (q × p) copies
+                    // (flatten→Array2, project, unflatten→Vec) that previously fired
+                    // per row. `t_buf` still holds the row's ext-coord vector.
+                    let mut t_buf = vec![0.0_f64; q];
+                    let mut col_buf = Array1::<f64>::zeros(q);
+                    for row_idx in 0..n {
+                        let ext_row = ext.row(row_idx);
+                        for (slot, &v) in t_buf.iter_mut().zip(ext_row.iter()) {
+                            *slot = v;
                         }
-                        let projected_col = manifold.project_vector_to_gradient_tangent(
-                            t_i,
-                            raw_gt.slice(ndarray::s![..q_row]),
-                            col_buf.slice(ndarray::s![..q_row]),
-                        );
-                        for c in 0..q_row {
-                            jac_flat[c * p + j] = projected_col[c];
+                        let t_i = ArrayView1::from(t_buf.as_slice());
+                        let raw_gt = raw_gt_rows[row_idx].view();
+                        let jac_flat = &mut kron_jac[row_idx];
+                        let q_row = jac_flat.len() / p;
+                        for j in 0..p {
+                            for c in 0..q_row {
+                                col_buf[c] = jac_flat[c * p + j];
+                            }
+                            let projected_col = manifold.project_vector_to_gradient_tangent(
+                                t_i,
+                                raw_gt.slice(ndarray::s![..q_row]),
+                                col_buf.slice(ndarray::s![..q_row]),
+                            );
+                            for c in 0..q_row {
+                                jac_flat[c * p + j] = projected_col[c];
+                            }
+                        }
+                    }
+                }
+            }
+            Some(layout) => {
+                // Compact active-set layout (#1117 follow-up): the dense
+                // `ext_coord_manifold()` is keyed to the uniform full-`q` block
+                // ordering, so it cannot be applied to the heterogeneous compact
+                // rows directly. Instead we rebuild, PER ROW, the product manifold
+                // and ext-coord point in that row's compact column order (see
+                // `compact_row_ext_manifold_and_point`) and apply the SAME three
+                // per-row Riemannian operations the dense
+                // `apply_riemannian_latent_geometry` applies — gradient tangent
+                // projection of `gt`, the Riemannian Hessian correction of `htt`,
+                // and the column tangent projection of `htbeta` — plus the
+                // identical Kronecker `kron_jac` column projection. On the shared
+                // active support this is byte-identical to slicing the dense
+                // product manifold, so engaging the sparse plan on a non-Euclidean
+                // ext manifold is now correct (the former
+                // `is_euclidean()`-only guard in `sparse_active_plan` is lifted).
+                //
+                // Euclidean ext manifolds still skip all of this (every
+                // per-row manifold is a product of Euclidean parts whose
+                // projector is the identity); we early-out so those rows stay
+                // byte-for-byte the historical compact path.
+                if !self.ext_coord_manifold().is_euclidean() {
+                    for row_idx in 0..n {
+                        let (manifold_i, point_i) =
+                            self.compact_row_ext_manifold_and_point(row_idx, layout);
+                        let t_i = point_i.view();
+                        // gt / htt / htbeta on the compact ArrowRowBlock, exactly
+                        // as `apply_riemannian_latent_geometry` does for dense
+                        // uniform-q rows.
+                        let gt_e = sys.rows[row_idx].gt.clone();
+                        let htt_e = sys.rows[row_idx].htt.clone();
+                        let htbeta_e = sys.rows[row_idx].htbeta.clone();
+                        sys.rows[row_idx].gt =
+                            manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
+                        sys.rows[row_idx].htt =
+                            manifold_i.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
+                        sys.rows[row_idx].htbeta = manifold_i
+                            .project_matrix_columns_to_gradient_tangent(
+                                t_i,
+                                gt_e.view(),
+                                htbeta_e.view(),
+                            );
+                        // Kronecker local-Jacobian column projection (full-B path
+                        // only), using the SAME pre-projection gradient `gt_e` so
+                        // the cross-block geometry matches the dense branch.
+                        if !frames_engaged {
+                            let jac_flat = &mut kron_jac[row_idx];
+                            let q_row = jac_flat.len() / p;
+                            let mut col_buf = Array1::<f64>::zeros(q_row);
+                            for j in 0..p {
+                                for c in 0..q_row {
+                                    col_buf[c] = jac_flat[c * p + j];
+                                }
+                                let projected_col = manifold_i.project_vector_to_gradient_tangent(
+                                    t_i,
+                                    gt_e.view(),
+                                    col_buf.view(),
+                                );
+                                for c in 0..q_row {
+                                    jac_flat[c * p + j] = projected_col[c];
+                                }
+                            }
                         }
                     }
                 }
@@ -4317,6 +4387,63 @@ impl SaeManifoldTerm {
         let latent =
             LatentCoordValues::from_matrix_with_manifold(ext.view(), LatentIdMode::None, manifold);
         sys.apply_riemannian_latent_geometry(&latent);
+    }
+
+    /// Build the compact-layout ext-coord product manifold and point for one row.
+    ///
+    /// The dense `ext_coord_manifold()` is keyed to the full-`q` block ordering
+    /// `[assignment parts (all Euclidean for IBP-MAP / JumpReLU), then per-atom
+    /// coord blocks in atom order]`. A compact active-set row instead lays its
+    /// `q_active` columns out as `[one Euclidean logit slot per active atom,
+    /// then each active atom's coord block in `active` order]` (see
+    /// [`SaeRowLayout::from_active_atoms`] / `coord_starts`). To reuse the exact
+    /// per-row Riemannian projector on the compact block we rebuild a product
+    /// manifold and the matching ext-coord point in that compact order: the
+    /// `active.len()` logit slots are `Euclidean` (the assignment channel is
+    /// always Euclidean for the modes that engage sparsity — `assignment_coord_dim
+    /// == k_atoms`), and each active atom contributes its own coordinate
+    /// manifold. On the shared active support this is byte-identical to slicing
+    /// the dense full-`q` product manifold, so the compact projection matches the
+    /// dense path exactly — it only drops the inactive atoms' (negligible-mass)
+    /// coordinate blocks the compact layout already excludes from curvature.
+    ///
+    /// Returns `(manifold, t_compact)` where `t_compact` has length `q_active`.
+    /// The logit-slot entries of `t_compact` are filled from the row logits (the
+    /// Euclidean projector ignores the point, so any finite value is equivalent;
+    /// using the true logits keeps the point well-defined and finite).
+    pub(crate) fn compact_row_ext_manifold_and_point(
+        &self,
+        row: usize,
+        layout: &SaeRowLayout,
+    ) -> (LatentManifold, Array1<f64>) {
+        let active = &layout.active_atoms[row];
+        let q_active = layout.row_q_active(row);
+        let mut parts: Vec<LatentManifold> = Vec::with_capacity(active.len() + active.len());
+        let mut point = Array1::<f64>::zeros(q_active);
+        // Logit slots: one Euclidean part per active atom, in `active` order.
+        let logits_row = self.assignment.logits.row(row);
+        for (j, &k) in active.iter().enumerate() {
+            parts.push(LatentManifold::Euclidean);
+            point[j] = logits_row[k];
+        }
+        // Coordinate blocks: each active atom's coordinate manifold + point, at
+        // the compact coord start the layout assigned it.
+        for (j, &k) in active.iter().enumerate() {
+            let coord = &self.assignment.coords[k];
+            let d = coord.latent_dim();
+            let coord_start = layout.coord_starts[row][j];
+            let manifold_k = coord.manifold();
+            // A `d`-dim coordinate whose manifold is a product (e.g. a torus =
+            // Circle×Circle) already carries its `d` parts; a scalar manifold is
+            // one part. Either way the manifold's ambient width must equal `d`,
+            // matching the `d` compact columns at `coord_start`.
+            parts.push(manifold_k.clone());
+            let coord_point = coord.row(row);
+            for axis in 0..d {
+                point[coord_start + axis] = coord_point[axis];
+            }
+        }
+        (LatentManifold::Product(parts), point)
     }
 
     /// Numerical rank of a symmetric matrix: the count of eigenvalues
