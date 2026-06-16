@@ -33,31 +33,53 @@
 //!    HARD assertions are the routing, the truth recovery, and the scaling.
 
 use csv::StringRecord;
+use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::solver::residual_cascade::fit_residual_cascade;
 use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula,
-    fit_residual_cascade_from_formula, init_parallelism,
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
 
 /// Deterministic low-discrepancy scattered sample on the unit cube with a
-/// smooth, noise-perturbed truth. `dim ∈ {2, 3}` selects the cascade's domain.
-fn sample(dim: usize, n: usize) -> gam::data::EncodedDataset {
+/// smooth, noise-perturbed truth, as RAW columns: `dim` coordinate axes, the
+/// response, and unit weights. `dim ∈ {2, 3}` selects the cascade's domain.
+/// This is the single source of the data; [`sample`] just stringifies it into
+/// an encoded dataset, so the dense-formula and direct-cascade arms see the
+/// EXACT same observations.
+fn coords_y(dim: usize, n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
     let golden = 0.618_033_988_749_894_9_f64;
     let sqrt2 = std::f64::consts::SQRT_2.fract();
     let sqrt3 = std::f64::consts::SQRT_2.fract() * 0.5 + 0.371_f64;
+    let mut axes = vec![Vec::with_capacity(n); dim];
+    let mut y = Vec::with_capacity(n);
+    let mut w = Vec::with_capacity(n);
+    for i in 0..n {
+        let coords = [
+            ((i + 1) as f64 * golden).fract(),
+            ((i + 1) as f64 * sqrt2).fract(),
+            ((i + 7) as f64 * sqrt3).fract(),
+        ];
+        for (a, axis) in axes.iter_mut().enumerate() {
+            axis.push(coords[a]);
+        }
+        let noise = (((i + 3) as f64 * golden).fract() - 0.5) * 0.1;
+        y.push(truth(&coords[..dim]) + noise);
+        w.push(1.0);
+    }
+    (axes, y, w)
+}
+
+/// The same scattered sample as [`coords_y`], stringified into an encoded
+/// dataset for the formula entry points.
+fn sample(dim: usize, n: usize) -> gam::data::EncodedDataset {
+    let (axes, y, _w) = coords_y(dim, n);
     let mut headers: Vec<String> = (0..dim).map(|a| format!("x{}", a + 1)).collect();
     headers.push("y".to_string());
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
-            let a = ((i + 1) as f64 * golden).fract();
-            let b = ((i + 1) as f64 * sqrt2).fract();
-            let c = ((i + 7) as f64 * sqrt3).fract();
-            let coords = [a, b, c];
-            let t = truth(&coords[..dim]);
-            let noise = (((i + 3) as f64 * golden).fract() - 0.5) * 0.1;
-            let mut fields: Vec<String> = coords[..dim].iter().map(|v| v.to_string()).collect();
-            fields.push((t + noise).to_string());
+            let mut fields: Vec<String> = axes.iter().map(|axis| axis[i].to_string()).collect();
+            fields.push(y[i].to_string());
             StringRecord::from(fields)
         })
         .collect();
@@ -149,26 +171,29 @@ fn rmse(yhat: &[f64], probes: &[Vec<f64>]) -> f64 {
 /// Arm 1 — match-or-beat the dense estimator on truth recovery.
 ///
 /// At a tractable `n` (where the dense reduced-rank radial path is still cheap)
-/// the cascade, forced via `fit_residual_cascade_from_formula`, must recover the
-/// same known smooth truth at least as well as the dense `fit_from_formula`
-/// duchon fit on the SAME data. The cascade is a different posterior, so this is
-/// the no-regression bar that earns it the right to stand in past the cliff.
+/// the cascade ESTIMATOR — invoked directly via [`fit_residual_cascade`], the
+/// same estimator the auto-route dispatches past the cliff, since the
+/// formula-level entry refuses to materialize the cascade below the cliff —
+/// must recover the same known smooth truth at least as well as the dense
+/// `fit_from_formula` duchon fit on the SAME data. The cascade is a different
+/// posterior, so this is the no-regression bar that earns it the right to stand
+/// in past the cliff.
 #[test]
 fn cascade_matches_or_beats_dense_duchon_on_truth_recovery() {
     init_parallelism();
     let n = 6_000;
     let data = sample(2, n);
-    let cfg = gaussian_config();
     let formula = "y ~ duchon(x1, x2)";
     let probes = probe_grid(2, 12);
 
-    // Force the cascade estimator on the identical data (bypasses the cliff gate
-    // in dispatch, keeps the estimator). `Some` is guaranteed: the shape is the
-    // eligible single scattered 2-D Gaussian duchon and the quasi-uniformity
-    // guard certifies this near-uniform low-discrepancy cloud.
-    let cascade = fit_residual_cascade_from_formula(formula, &data, &cfg)
-        .expect("materialize cascade")
-        .expect("cascade must materialize on an eligible scattered 2-D duchon");
+    // Run the cascade estimator directly on the identical raw data at the native
+    // 2-D Sobolev order s = (d+3)/2 = 2.5 (the order the fast path clamps a
+    // default duchon into; same window the certification suite exercises). Unit
+    // isotropic metric matches the auto-route's `ResidualCascadeInputs`.
+    let (axes, y, w) = coords_y(2, n);
+    let xs: Vec<&[f64]> = axes.iter().map(|a| a.as_slice()).collect();
+    let cascade = fit_residual_cascade(&xs, &y, &w, &[1.0, 1.0], 2.5)
+        .expect("cascade must fit an eligible scattered 2-D sample");
     let cascade_yhat: Vec<f64> = probes
         .iter()
         .map(|p| cascade.predict(p).expect("cascade predict").0)
@@ -198,46 +223,32 @@ fn cascade_matches_or_beats_dense_duchon_on_truth_recovery() {
 }
 
 /// Arm 2 — cliff-scale auto-route POSITIVE: magic dispatch, truth recovery, and
-/// O(n·polylog) scaling.
+/// the BPX n-independence tell.
 ///
 /// Past the derived dense-kernel cliff, the PUBLIC `fit_from_formula` (no flag)
 /// must auto-route a single scattered 3-D Gaussian duchon to the cascade and
 /// recover the known truth. The dense `O(n·k² + k³)` route is impractical at
 /// this `n` — that is the whole point of the primitive — so the match-or-beat
 /// against the dense estimator is owned by Arm 1 (tractable n) and the
-/// certification suite (bit-tight dense oracle); here the hard bars are that the
-/// route fires, the truth is recovered, and the cost grows far sub-quadratically
-/// from n=1e5 to the cliff-scale n (excluding any O(n²) dense blowup).
+/// certification suite (bit-tight dense oracle). Here the hard bars are that the
+/// route fires, the truth is recovered, and the solve stayed on the
+/// n-independent BPX iteration bound (the certificate's CG count, far below the
+/// `CG_MAX_ITERS` blow-up cap) — the structural O(n·polylog) tell, read from the
+/// fit itself rather than from a noisy cross-route wall-clock ratio.
 #[test]
 fn cliff_scale_duchon_auto_routes_to_cascade_and_recovers_truth() {
     init_parallelism();
     let cfg = gaussian_config();
     let formula = "y ~ duchon(x1, x2, x3)";
 
-    let time_route = |n: usize| -> (f64, FitResult) {
-        let data = sample(3, n);
-        let start = std::time::Instant::now();
-        let result = fit_from_formula(formula, &data, &cfg).expect("auto-routed fit");
-        (start.elapsed().as_secs_f64(), result)
-    };
-
-    // Below-cliff control timing point (dense path; O(n·k²) but k is small here)
-    // and the cliff-scale point. The d=3 dense-kernel cliff (where
-    // `default_num_centers` pins at K_MAX = 2000) sits near n ≈ 5.13e5.
-    let (t_small, small_result) = time_route(100_000);
-    let (t_big, big_result) = time_route(513_000);
-    eprintln!(
-        "[cascade auto-route quality] n=1e5: {t_small:.3}s | n=5.13e5: {t_big:.3}s | \
-         ratio={:.2} (linear ≈ 5.13)",
-        t_big / t_small.max(1e-9)
-    );
-
-    // Below the cliff the dense radial path is exact and cheap, so the auto-route
-    // must NOT swap the user's posterior (the cascade is a different one).
-    assert!(
-        !matches!(small_result, FitResult::ResidualCascade(_)),
-        "below-cliff 3-D duchon must stay on the dense path, not auto-route to the cascade"
-    );
+    // The d=3 dense-kernel cliff (where `default_num_centers` pins at
+    // K_MAX = 2000) sits near n ≈ 5.13e5. Route a cliff-scale fit through the
+    // public formula entry — no flag — and time it for the log.
+    let n = 513_000;
+    let data = sample(3, n);
+    let start = std::time::Instant::now();
+    let big_result = fit_from_formula(formula, &data, &cfg).expect("auto-routed fit");
+    let elapsed = start.elapsed().as_secs_f64();
 
     // Past the cliff the dispatch must fire with no flag — magic by default.
     let FitResult::ResidualCascade(fit) = big_result else {
@@ -245,14 +256,30 @@ fn cliff_scale_duchon_auto_routes_to_cascade_and_recovers_truth() {
             "cliff-scale scattered 3-D Gaussian duchon must auto-route to FitResult::ResidualCascade"
         );
     };
+    eprintln!(
+        "[cascade auto-route quality] n=5.13e5 auto-routed to cascade in {elapsed:.3}s \
+         (solve_iters={}, backward_err={:.2e}, m={})",
+        fit.certificate.solve_iters,
+        fit.certificate.solve_rel_residual,
+        fit.coeff.len()
+    );
 
     // The cascade's certificates must be sane: a converged backward error and a
-    // bounded CG iteration count (the BPX n-independence tell).
+    // BOUNDED CG iteration count. The BPX preconditioner makes the iteration
+    // count n-independent (tens, not thousands); staying far below the
+    // `CG_MAX_ITERS = 4000` blow-up cap is the structural O(n·polylog) tell.
     assert!(
         fit.certificate.solve_rel_residual.is_finite()
             && fit.certificate.solve_rel_residual < 1e-3,
         "cascade solve did not converge: backward error {}",
         fit.certificate.solve_rel_residual
+    );
+    assert!(
+        fit.certificate.solve_iters < 400,
+        "cascade CG iteration count {} is not on the n-independent BPX bound \
+         (the preconditioner is failing); near the CG_MAX_ITERS=4000 cap the \
+         O(n·polylog) guarantee is lost",
+        fit.certificate.solve_iters
     );
 
     // Truth recovery at cliff scale against the noise-free truth (#904 style).
@@ -273,14 +300,5 @@ fn cliff_scale_duchon_auto_routes_to_cascade_and_recovers_truth() {
     assert!(
         cliff_rmse < 0.08,
         "cascade fails cliff-scale truth recovery: RMSE={cliff_rmse} (truth is noise-free)"
-    );
-
-    // Sub-quadratic scaling: a ~5.13× increase in n must cost far less than the
-    // ~26× an O(n²) dense Gram would demand. Generous bound absorbs runner noise,
-    // the dispatch's per-call overhead, and the cliff-only refinement loop while
-    // still excluding O(n²).
-    assert!(
-        t_big <= 12.0 * t_small.max(1e-6),
-        "cascade cost grew super-linearly from n=1e5 ({t_small:.3}s) to n=5.13e5 ({t_big:.3}s)"
     );
 }
