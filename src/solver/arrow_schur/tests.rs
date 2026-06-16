@@ -3438,7 +3438,7 @@ pub(crate) fn parallel_streaming_assembly_deterministic_and_matches_sequential()
     // (c) back_substitute parallel-vs-sequential: per-row writes are disjoint,
     // so the parallel scatter must match the hand-rolled sequential back-solve
     // BIT-FOR-BIT (no reassociation — each segment is computed identically).
-    let mut s_bs = StreamingArrowSchur::from_system(&sys, n);
+    let s_bs = StreamingArrowSchur::from_system(&sys, n);
     // Use the already-solved Δβ as the back-substitution input.
     let delta_t = s_bs
         .back_substitute(0.0, db_a.view())
