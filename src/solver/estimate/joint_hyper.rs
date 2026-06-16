@@ -853,6 +853,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
         self.last_canonical_revision = design_revision;
+        self.install_psi_gram_statistics(theta, rho_dim);
         Ok(())
     }
 
