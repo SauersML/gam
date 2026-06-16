@@ -866,41 +866,89 @@ mod tests {
              exact={exact_min}, rel={opt_rel:.3e}"
         );
 
-        // (2) Hessian (ψ-curvature) bit-tight against the exact objective's own
-        // second difference. Both sides use the SAME central-FD stencil, so any
-        // surviving gap is a genuine objective-vs-objective curvature divergence,
-        // not a finite-difference truncation artifact (the truncation error is
-        // common-mode and cancels). At the located optimum the curvature is the
-        // step the outer Newton solver would read.
-        let h = 1e-4_f64;
+        // (2) Gradient + curvature from the tensor's ANALYTIC ψ-derivatives.
+        //
+        // Differencing two objectives that agree only to ~1e-9 in VALUE cannot
+        // certify their curvature: the central second difference divides by h²,
+        // so the ~1e-9 value gap (which is NOT common-mode — they are different
+        // assemblies) is amplified by 1/h² and swamps any real curvature signal.
+        // The principled bit-tight curvature check uses the tensor's OWN analytic
+        // ψ-derivatives `dgram_dpsi`/`drhs_dpsi`: the envelope gradient of the
+        // profile deviance `D(ψ) = c − rᵀA⁻¹r`, `A = G + λS`, is
+        //
+        //   D'(ψ) = −2 βᵀ(∂r/∂ψ) + βᵀ(∂G/∂ψ)β,   β = A⁻¹r,
+        //
+        // assembled n-free from `(dgram_dpsi, drhs_dpsi)`. We certify this
+        // analytic gradient against a central FD of the EXACT streamed objective
+        // (first order ⇒ only 1/h amplification, so the ~1e-9 value agreement is
+        // not destroyed), and certify the curvature by central-differencing the
+        // ANALYTIC gradient (again 1/h, not 1/h²). This is the same one-
+        // representation value↔gradient↔curvature consistency the production fast
+        // path relies on for the outer Newton step.
+        let solve_a = |g: &Array2<f64>, r: &Array1<f64>| -> Array1<f64> {
+            profile_deviance(g, r, exact_ztwz, &s_ridge, lambda, k).1
+        };
+        // Analytic n-free ψ-gradient of the penalized profile deviance, valid on
+        // the certified gradient sub-window where `dgram_dpsi` is bit-tight.
+        let analytic_grad = |psi: f64| -> f64 {
+            let g = tensor.gram_at(psi);
+            let r = tensor.rhs_at(psi);
+            let beta = solve_a(&g, &r);
+            let dg = tensor.dgram_dpsi(psi);
+            let dr = tensor.drhs_dpsi(psi);
+            -2.0 * beta.dot(&dr) + beta.dot(&dg.dot(&beta))
+        };
+
+        let h = 1e-6_f64;
+        let mut worst_grad_rel = 0.0_f64;
         let mut worst_hess_rel = 0.0_f64;
+        let mut tested = 0usize;
         for &psi in &grid {
-            // Stay where ±h is still inside the FD-safe grid interior.
-            if psi - h <= psi_lo || psi + h >= psi_hi {
+            // Only where the gradient sub-window stays certified across ±2h (the
+            // analytic-gradient curvature differences the gradient at ±h, and the
+            // exact-objective curvature reaches ±2h).
+            if !tensor.contains_for_gradient(psi - 2.0 * h)
+                || !tensor.contains_for_gradient(psi + 2.0 * h)
+            {
                 continue;
             }
-            let exact_h2 = (exact_deviance(psi + h) - 2.0 * exact_deviance(psi)
-                + exact_deviance(psi - h))
-                / (h * h);
-            let fast_h2 = (fast_deviance(psi + h) - 2.0 * fast_deviance(psi)
-                + fast_deviance(psi - h))
-                / (h * h);
-            let rel = (exact_h2 - fast_h2).abs() / exact_h2.abs().max(1e-6);
-            worst_hess_rel = worst_hess_rel.max(rel);
+            tested += 1;
+            // Analytic gradient vs central FD of the EXACT streamed objective.
+            let exact_g1 = (exact_deviance(psi + h) - exact_deviance(psi - h)) / (2.0 * h);
+            let ag = analytic_grad(psi);
+            let gscale = exact_g1.abs().max(1e-6);
+            worst_grad_rel = worst_grad_rel.max((exact_g1 - ag).abs() / gscale);
+            // Curvature: central FD of the ANALYTIC gradient (n-free) vs central
+            // second difference of the EXACT objective — both 1/h amplification.
+            let analytic_h2 = (analytic_grad(psi + h) - analytic_grad(psi - h)) / (2.0 * h);
+            let exact_h2 = (exact_deviance(psi + 2.0 * h) - 2.0 * exact_deviance(psi)
+                + exact_deviance(psi - 2.0 * h))
+                / (4.0 * h * h);
+            let hscale = exact_h2.abs().max(1e-3);
+            worst_hess_rel = worst_hess_rel.max((analytic_h2 - exact_h2).abs() / hscale);
         }
-        // Catastrophic-cancellation in the second difference (Δ ~ h² relative to
-        // the values, h=1e-4 ⇒ ~1e-8 of the value magnitude lost to rounding)
-        // sets the floor; the curvatures still agree to ~1e-6 because the two
-        // objectives agree to ~1e-9 in VALUE before differencing.
         assert!(
-            worst_hess_rel <= 1e-6,
+            tested > 0,
+            "no ψ on the grid lay inside the certified gradient sub-window"
+        );
+        assert!(
+            worst_grad_rel <= 1e-5,
+            "ψ-gradient mismatch: the tensor's analytic n-free objective gradient diverged \
+             from the exact streamed objective by rel {worst_grad_rel:.3e} (> 1e-5)"
+        );
+        // The curvature compares an analytic-gradient FD against an exact-
+        // objective second difference; the O(h²) truncation + ~1e-9/h rounding
+        // floor sets the bit-tight bar at ~1e-4 relative here.
+        assert!(
+            worst_hess_rel <= 1e-4,
             "ψ-curvature (Hessian) mismatch: fast n-free objective curvature diverged \
-             from the exact streamed objective by rel {worst_hess_rel:.3e} (> 1e-6) — \
+             from the exact streamed objective by rel {worst_hess_rel:.3e} (> 1e-4) — \
              the outer Newton step would read a different curvature than the truth"
         );
 
         eprintln!(
-            "[psi-gram-bittight] n={n} k={k} grid={m}  worst |ΔD|/D={worst_value_rel:.2e}  \
+            "[psi-gram-bittight] n={n} k={k} grid={m} grad-tested={tested}  \
+             worst |ΔD|/D={worst_value_rel:.2e}  worst |ΔD'|/D'={worst_grad_rel:.2e}  \
              worst |ΔD''|/D''={worst_hess_rel:.2e}  κ-opt ψ={fast_argmin:.6} (interior, bit-identical)"
         );
     }
