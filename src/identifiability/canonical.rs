@@ -7,24 +7,32 @@
 // report into a concrete coordinate transform that reduced the inner
 // solve to a (p_raw → r_reduced) subspace via selection-T.
 //
-// That reduction is unsafe under the current `CustomFamily` contract.
-// Blockwise families capture their per-block designs at construction
-// time (e.g. `SurvivalMarginalSlopeFamily::marginal_design`,
-// `::logslope_design`) and the family's `evaluate_blockwise_exact_newton`
-// row-Hessian assembly uses `DesignMatrix::syr_row_into_view` /
-// `::row_outer_into_view`, which assert that the target slice's column
-// count equals the captured design's column count. Substituting a
-// column-reduced `ParameterBlockSpec` under such a family produces
-// `DesignMatrix::syr_row_into shape mismatch` (matrix.rs:6529), which
-// blockwise inner-solve callers unwrap via `.expect(...)` — a panic
-// later in the pipeline, masking the audit's diagnostic.
+// Naively substituting a column-reduced `ParameterBlockSpec` under a family
+// that captures its design at construction time was unsafe: blockwise families
+// (e.g. `SurvivalMarginalSlopeFamily::marginal_design`, `::logslope_design`)
+// run `evaluate_blockwise_exact_newton` row-Hessian assembly through
+// `DesignMatrix::syr_row_into_view` / `::row_outer_into_view`, which assert that
+// the target slice's column count equals the captured design's column count.
+// A raw-width callback fed a reduced spec produces `DesignMatrix::syr_row_into
+// shape mismatch` (matrix.rs:6529), a panic later in the pipeline that masks the
+// audit's diagnostic.
 //
-// This module has two safe behaviors:
-//   - plain single-channel dense blocks may be exactly orthogonalized with a
+// #933 inverts that ownership so the family never sees raw coordinates: a
+// reduced callback block carries a [`GaugeComposedJacobian`] that post-multiplies
+// the family's raw-width effective Jacobian by the block's selection `T_b`, so
+// the effective Jacobian emerges at the reduced width and the column-count
+// assertions hold BY CONSTRUCTION.
+//
+// This module's safe behaviors:
+//   - plain single-channel dense blocks are exactly orthogonalized with a
 //     per-block transform, then lifted back to raw coordinates after fitting;
-//   - callback-owned blocks keep raw block widths even when the audit attributes
-//     weak columns, because their effective geometry is owned by the family
-//     callback rather than by the placeholder `ParameterBlockSpec.design`.
+//   - `jacobian_callback`-only blocks (no `stacked_design`) are column-reduced
+//     with their callback wrapped in `GaugeComposedJacobian`, so the family fits
+//     in the reduced section and the one Gauge lifts back through the same `T_b`;
+//   - `stacked_design` blocks keep raw block widths even when the audit
+//     attributes weak columns, because their `3·n`-row eta operator carries the
+//     family's hidden z-lift / monotonicity / leading-fixed-column layout
+//     (#892, #1068) that a raw-column drop would desynchronise from the reduced β.
 //
 // Fatal audit results still fail closed with an immediate
 // `CustomFamilyError::IdentifiabilityFailure`, naming the offending blocks and a

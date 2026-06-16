@@ -303,4 +303,131 @@ mod tests {
         assert!(eta_bands_from_matrix(eta.view(), "identity", 0.0).is_err());
         assert!(eta_bands_from_matrix(eta.view(), "identity", 1.0).is_err());
     }
+
+    /// Posterior fitted-mean draws on the RESPONSE scale for a *parameterized*
+    /// link (`Sas`) flow through the band engine via [`LinkSelector::Spec`] and
+    /// produce finite, correct response-scale summaries — the reachable CPU half
+    /// of issue #1133.
+    ///
+    /// The bare string-tag path cannot represent the SAS skew/tail state and
+    /// REFUSES (`apply_inverse_link_vec("sas", …)` errors); the spec path carries
+    /// the fitted state through and is exercised end-to-end here:
+    ///
+    ///   1. every response-scale summary (point mean + both band edges) is
+    ///      finite and a valid binomial probability in (0, 1);
+    ///   2. the response point estimate equals the per-row posterior MEAN of the
+    ///      SAS inverse link applied to the η draws — `E[g⁻¹(η)]`, the same
+    ///      `E[g⁻¹]` (not `g⁻¹(E[η])`) contract the `Tag` path honors — verified
+    ///      against an independent hand computation through the canonical solver
+    ///      evaluator `inverse_link_mu_d1_for_inverse_link`;
+    ///   3. the band edges are the SAS inverse link applied to the link-scale
+    ///      quantiles, and bracket the point mean (monotone link preserves the
+    ///      ordering).
+    #[test]
+    fn spec_path_produces_finite_response_bands_for_parameterized_sas_link() {
+        use crate::solver::mixture_link::{
+            inverse_link_mu_d1_for_inverse_link, SasLinkState,
+        };
+        use crate::types::InverseLink;
+
+        let state = SasLinkState::new(0.7, -0.4).expect("valid SAS link state");
+        let link = InverseLink::Sas(state);
+
+        // Two columns: symmetric draws, and a skewed column so the Jensen gap
+        // between E[g⁻¹(η)] and g⁻¹(E[η]) is observable.
+        let eta = Array2::from_shape_vec(
+            (5, 2),
+            vec![
+                -2.0, -1.0, //
+                -1.0, -0.5, //
+                0.0, 0.0, //
+                1.0, 1.5, //
+                2.0, 4.0, //
+            ],
+        )
+        .expect("shape");
+        let level = 0.80;
+        let alpha = (1.0 - level) / 2.0;
+
+        // The bare string tag has no SAS state and refuses outright.
+        assert!(crate::families::inverse_link::apply_inverse_link_vec(
+            &[0.0_f64],
+            "sas"
+        )
+        .is_err());
+
+        let selector = LinkSelector::Spec(&link);
+        let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
+            eta_bands_from_matrix_link(eta.view(), selector, level).expect("spec bands");
+
+        for j in 0..2 {
+            // Every response-scale summary is finite and a valid probability.
+            for (label, v) in [
+                ("mean", mean[j]),
+                ("mean_lower", mean_lower[j]),
+                ("mean_upper", mean_upper[j]),
+            ] {
+                assert!(v.is_finite(), "{label} must be finite for col {j}, got {v}");
+                assert!(
+                    v > 0.0 && v < 1.0,
+                    "SAS is a binomial inverse link; {label} must lie in (0, 1), got {v}"
+                );
+            }
+
+            // Response point estimate = E[g⁻¹(η)] over the column draws, computed
+            // independently through the canonical solver evaluator.
+            let col: Vec<f64> = (0..5).map(|k| eta[[k, j]]).collect();
+            let resp_mean: f64 = col
+                .iter()
+                .map(|&e| {
+                    inverse_link_mu_d1_for_inverse_link(&link, e)
+                        .expect("solver jet eval")
+                        .0
+                })
+                .sum::<f64>()
+                / 5.0;
+            assert!(
+                (mean[j] - resp_mean).abs() < 1e-12,
+                "response mean must be E[g^-1(eta)] for col {j}: got {} want {}",
+                mean[j],
+                resp_mean
+            );
+
+            // Band edges are the SAS inverse link applied to the η quantiles.
+            let mut sorted = col.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            let lo_eta = quantile_from_sorted(&sorted, alpha);
+            let hi_eta = quantile_from_sorted(&sorted, 1.0 - alpha);
+            assert!(
+                (eta_lower[j] - lo_eta).abs() < 1e-12 && (eta_upper[j] - hi_eta).abs() < 1e-12,
+                "link-scale band edges must be the shared quantiles for col {j}"
+            );
+            let (lo_mu, _) =
+                inverse_link_mu_d1_for_inverse_link(&link, lo_eta).expect("solver jet eval");
+            let (hi_mu, _) =
+                inverse_link_mu_d1_for_inverse_link(&link, hi_eta).expect("solver jet eval");
+            assert!(
+                (mean_lower[j] - lo_mu).abs() < 1e-12 && (mean_upper[j] - hi_mu).abs() < 1e-12,
+                "response band edges must be the SAS inverse link of the eta quantiles col {j}"
+            );
+
+            // Monotone link: the response mean sits inside the response band.
+            assert!(
+                mean_lower[j] <= mean[j] && mean[j] <= mean_upper[j],
+                "response mean must sit inside the SAS response band col {j}"
+            );
+            // Link-scale mean is the plain average of the draws.
+            let mean_eta: f64 = col.iter().sum::<f64>() / 5.0;
+            assert!((eta_mean[j] - mean_eta).abs() < 1e-12, "eta mean col {j}");
+        }
+
+        // The emitted family_kind on the high-level entry reflects the SAS link
+        // (`posterior_eta_bands_link` derives it from the spec's display name).
+        let eta_flat: Vec<f64> = (0..5).flat_map(|k| [eta[[k, 0]], eta[[k, 1]]]).collect();
+        let payload = posterior_eta_bands_link(eta_flat, 5, 2, LinkSelector::Spec(&link), level)
+            .expect("payload");
+        assert_eq!(payload.n_rows, 2);
+        assert_eq!(payload.family_kind, link.link_function().name());
+        assert!(payload.mean.iter().all(|v| v.is_finite() && *v > 0.0 && *v < 1.0));
+    }
 }

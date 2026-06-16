@@ -2938,10 +2938,27 @@ extern "C" __global__ void arrow_sae_diag_sub(
         if k == 0 || data.beta_dim != k || sys.k != k {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
+        // #1017 Phase-1 dispatch re-key: this is the matrix-free SAE reduced-Schur
+        // PCG — the production hot path, not a single dense factorization. The
+        // dense-Direct floor `dense_hessian_work_target_is_gpu(n, k)` keys on
+        // `2·n·k²` and is the WRONG gate here: it ignores the per-row frame depth
+        // `d` (the M dimension that multiplies the per-apply work) and the
+        // `1/cg_iters` staging amortisation, so it both undercounts the SAE batched
+        // work `n·k·d` and applies a cold single-launch breakeven to an apply that
+        // reuses device-resident frames `max_iterations` times. Key instead on the
+        // CG-amortised total batched work — the same predicate the host injection
+        // gate (`maybe_inject_gpu_schur_matvec`) consults — so few-row/wide-`k`/
+        // modest-`d` LLM shapes register the real `n × k × d × cg_iters` arithmetic.
+        // Kernels and numerics are untouched; only where the matvec runs changes,
+        // and the host falls back to the bit-identical CPU matvec when this declines.
         let runtime = crate::gpu::device_runtime::GpuRuntime::global()
             .filter(|rt| {
-                rt.policy()
-                    .dense_hessian_work_target_is_gpu(sys.rows.len(), k)
+                rt.policy().reduced_schur_matvec_should_offload(
+                    sys.rows.len(),
+                    sys.k,
+                    sys.d,
+                    max_iterations,
+                )
             })
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)

@@ -1148,14 +1148,27 @@ impl JacobiPreconditioner {
         // `(beta_base, φ)` and channel `j`, subtract `φ² · L_i[:, j]·Y_i[:, j]`
         // into `diag[beta_base + j]`. `L_i`/`Y_i` are row-major `di × p`, so the
         // `j`-th column dot is `Σ_r L_i[r·p + j]·Y_i[r·p + j]`.
-        for (row, rf) in resident.rows.iter().enumerate() {
+        //
+        // The accumulation is into a SHARED `diag` (rows scatter into overlapping
+        // `beta_base + j` columns), so — like the generic `build_scalar_jacobi`
+        // and the `schur_matvec` row loop (#1017) — parallelism uses worker-private
+        // length-`K` partials folded back in chunk order: each chunk is a
+        // contiguous ascending row range and rows within it stay ascending, so the
+        // chunk-ordered fold reproduces the serial `row = 0..n` subtraction order
+        // bit-for-bit run-to-run (the #1017 determinism gate: the preconditioner —
+        // and therefore the criterion ranking across topology candidates — must not
+        // move). This build runs once per inexact-PCG solve = O(inner-Newton-iters)
+        // per fit; at the SAE LLM shape (thousands of rows, wide border `k`) the
+        // per-row support sweep is the build's whole cost and was on one core.
+        let row_into = |row: usize, diag_part: &mut [f64]| {
+            let rf = &resident.rows[row];
             let di = rf.di;
             if di == 0 {
-                continue;
+                return;
             }
             let support = &resident.a_phi[row];
             if support.is_empty() {
-                continue;
+                return;
             }
             for &(beta_base, phi) in support {
                 if phi == 0.0 {
@@ -1168,8 +1181,41 @@ impl JacobiPreconditioner {
                         let idx = r * p + j;
                         col_dot += rf.l[idx] * rf.y[idx];
                     }
-                    diag[beta_base + j] -= phi2 * col_dot;
+                    diag_part[beta_base + j] -= phi2 * col_dot;
                 }
+            }
+        };
+        let parallel =
+            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            let partials: Vec<Array1<f64>> = (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let mut diag_part = Array1::<f64>::zeros(k);
+                    let slice = diag_part
+                        .as_slice_mut()
+                        .expect("diag_part must be contiguous");
+                    for i in idxs {
+                        row_into(i, slice);
+                    }
+                    diag_part
+                })
+                .collect();
+            // Deterministic ordered reduction: fold chunk partials left-to-right
+            // (each partial already holds the per-row terms subtracted, so add
+            // them into `diag` in chunk order to mirror the serial subtraction).
+            for part in &partials {
+                for a in 0..k {
+                    diag[a] += part[a];
+                }
+            }
+        } else {
+            let diag_slice = diag.as_slice_mut().expect("diag must be contiguous");
+            for row in 0..n {
+                row_into(row, diag_slice);
             }
         }
         let mut blocks = Vec::with_capacity(k);

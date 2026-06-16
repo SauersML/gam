@@ -2475,6 +2475,65 @@ mod tests {
         }
     }
 
+    /// Desync-guard (gam#931) for the conditioning-gate value↔gradient pair.
+    ///
+    /// `conditioning_gate_weight` (value `G`) and `conditioning_gate_weight_grad`
+    /// (its analytic partials `(∂G/∂λ_min, ∂G/∂λ_max)`) are written as two
+    /// SEPARATE functions, each independently re-spelling the cubic `ramp_down`
+    /// smoothstep and the `max(w_abs, w_rel)` branch selection. That is precisely
+    /// the split value/derivative code path #931 exists to make non-drifting:
+    /// the gradient is consumed live in the Jeffreys outer hypergradient
+    /// (`gate_weight` mode-response term, gam#854), so a drift between these two
+    /// would silently bias the analytic outer gradient against its own value
+    /// exactly where the gate sits in its transition band.
+    ///
+    /// Central-difference `G` in both arguments and assert the analytic grad
+    /// matches, sampling the absolute-active band, the relative-active band, and
+    /// the saturated (locally-constant `G`) regimes — staying inside each branch
+    /// to avoid the C¹ knots (the `max`-tie and ramp endpoints) where FD straddles
+    /// a kink.
+    #[test]
+    pub(crate) fn conditioning_gate_weight_grad_matches_finite_difference() {
+        // Each config picks (λ_min, λ_max) comfortably inside one branch:
+        //  - absolute-active: λ_min in (1, 16), λ_max huge so log10(ratio) ≤ -6
+        //    (w_rel = 0) ⇒ w_abs dominates and varies, ∂/∂λ_max = 0;
+        //  - relative-active: λ_min above the absolute-clear knot (w_abs = 0) with
+        //    log10(λ_min/λ_max) inside (-8, -6) ⇒ w_rel dominates and varies in
+        //    BOTH arguments;
+        //  - saturated: well inside a flat region ⇒ both partials are 0.
+        let configs: [(f64, f64); 6] = [
+            (8.0, 1.0e9),                 // absolute band mid (w_rel = 0)
+            (4.0, 1.0e9),                 // absolute band lower-mid
+            (12.0, 1.0e9),                // absolute band upper-mid
+            (100.0, 100.0 / 1.0e-7),      // relative band mid (w_abs = 0, ratio = 1e-7)
+            (0.05, 1.0e9),                // saturated: w_abs = 1 (λ_min < 1), w_rel = 0
+            (1.0e3, 1.0e3 / 1.0e-9),      // saturated: ratio = 1e-9 < relative-clear ⇒ w_rel = 1
+        ];
+        for &(lmin, lmax) in &configs {
+            let (g_dlmin, g_dlmax) = conditioning_gate_weight_grad(lmin, lmax);
+
+            // Central difference in λ_min (λ_max fixed), relative step away from knots.
+            let hmin = 1e-7 * lmin.abs().max(1e-3);
+            let fd_dlmin = (conditioning_gate_weight(lmin + hmin, lmax)
+                - conditioning_gate_weight(lmin - hmin, lmax))
+                / (2.0 * hmin);
+            assert!(
+                (fd_dlmin - g_dlmin).abs() <= 1e-4 * g_dlmin.abs().max(1.0),
+                "∂G/∂λ_min desync at (λ_min={lmin}, λ_max={lmax}): fd={fd_dlmin} analytic={g_dlmin}"
+            );
+
+            // Central difference in λ_max (λ_min fixed).
+            let hmax = 1e-7 * lmax.abs().max(1e-3);
+            let fd_dlmax = (conditioning_gate_weight(lmin, lmax + hmax)
+                - conditioning_gate_weight(lmin, lmax - hmax))
+                / (2.0 * hmax);
+            assert!(
+                (fd_dlmax - g_dlmax).abs() <= 1e-4 * g_dlmax.abs().max(1.0),
+                "∂G/∂λ_max desync at (λ_min={lmin}, λ_max={lmax}): fd={fd_dlmax} analytic={g_dlmax}"
+            );
+        }
+    }
+
     #[test]
     pub(crate) fn empty_span_yields_zero_term() {
         let h = Array2::<f64>::eye(3);

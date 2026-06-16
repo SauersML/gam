@@ -457,6 +457,127 @@ pub(crate) fn lawley_bartlett_factor<'py>(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// #939 deliverable 3 — Skovgaard modified directed root r* for a scalar functional
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Skovgaard's modified directed likelihood root `r*` for a **scalar** interest
+/// parameter `ψ = cᵀβ` (issue #939, deliverable 3), assembled EXACTLY from the
+/// fitted-model matrices — no approximation beyond Skovgaard's own covariance
+/// identity for the sample-space derivative.
+///
+/// This exposes [`gam::inference::skovgaard::scalar_skovgaard_from_matrices`] on
+/// the clean `gamfit` surface (the in-tree implementation was certified against
+/// the Exponential / logistic-location closed forms but was previously
+/// unreachable). Ingredients, all from the fitted penalized GLM:
+/// * `contrast` (`c`) — the functional gradient `∂ψ/∂β` (a prediction row for a
+///   point-on-curve, a row difference for a contrast, or any linear gradient).
+/// * `beta` (`β̂`) — fitted coefficients; `ψ̂ = cᵀβ̂`.
+/// * `penalized_hessian` (`Ĥ = X'WX + S_λ`) — the **observed** information.
+/// * `fisher_information` (`Iₑ = X'WX`, optional) — the **expected** (Fisher)
+///   information; omit for a canonical link, where `î = ĵ` and the curvature
+///   factor is `1`.
+/// * `row_scores` (`sᵢ = ∂ℓᵢ/∂β`, `n × p`) — per-row scores for the empirical
+///   (sandwich) covariance companion.
+/// * `lr_statistic` (`W = 2[ℓ(β̂) − ℓ(β̂₀)] ≥ 0`) — the profile LR from the
+///   constrained refit at `cᵀβ = θ₀`.
+/// * `theta_null` (`θ₀`) — the tested value (default `0`).
+///
+/// Returns `{"r", "u", "r_star", "p_value_first_order", "p_value_corrected",
+/// "u_empirical", "r_star_empirical", "p_value_corrected_empirical", "material"}`.
+#[pyfunction]
+#[pyo3(signature = (
+    contrast, beta, penalized_hessian, row_scores, lr_statistic,
+    fisher_information = None, theta_null = 0.0
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn skovgaard_r_star<'py>(
+    py: Python<'py>,
+    contrast: numpy::PyReadonlyArray1<'py, f64>,
+    beta: numpy::PyReadonlyArray1<'py, f64>,
+    penalized_hessian: numpy::PyReadonlyArray2<'py, f64>,
+    row_scores: numpy::PyReadonlyArray2<'py, f64>,
+    lr_statistic: f64,
+    fisher_information: Option<numpy::PyReadonlyArray2<'py, f64>>,
+    theta_null: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    use gam::inference::skovgaard::scalar_skovgaard_from_matrices;
+
+    let c = contrast.as_array();
+    let b = beta.as_array();
+    let h = penalized_hessian.as_array();
+    let s = row_scores.as_array();
+    let p = b.len();
+    if c.len() != p {
+        return Err(py_value_error(format!(
+            "skovgaard_r_star: contrast has {} entries for {p} coefficients",
+            c.len()
+        )));
+    }
+    if h.nrows() != p || h.ncols() != p {
+        return Err(py_value_error(format!(
+            "skovgaard_r_star: penalized_hessian is {}×{}, expected {p}×{p}",
+            h.nrows(),
+            h.ncols()
+        )));
+    }
+    if s.ncols() != p {
+        return Err(py_value_error(format!(
+            "skovgaard_r_star: row_scores has {} columns, expected {p}",
+            s.ncols()
+        )));
+    }
+    if !(lr_statistic.is_finite() && lr_statistic >= 0.0) {
+        return Err(py_value_error(format!(
+            "skovgaard_r_star: lr_statistic must be finite and non-negative; got {lr_statistic}"
+        )));
+    }
+    // Own the optional Fisher matrix so its view outlives the call.
+    let fisher_owned: Option<Array2<f64>> = match fisher_information {
+        Some(f) => {
+            let fv = f.as_array();
+            if fv.nrows() != p || fv.ncols() != p {
+                return Err(py_value_error(format!(
+                    "skovgaard_r_star: fisher_information is {}×{}, expected {p}×{p}",
+                    fv.nrows(),
+                    fv.ncols()
+                )));
+            }
+            Some(fv.to_owned())
+        }
+        None => None,
+    };
+
+    let res = scalar_skovgaard_from_matrices(
+        c,
+        b,
+        h,
+        fisher_owned.as_ref().map(|f| f.view()),
+        s,
+        lr_statistic,
+        theta_null,
+    )
+    .ok_or_else(|| {
+        py_value_error(
+            "skovgaard_r_star: degenerate inputs (non-positive LR/information, \
+             singular Hessian, or undefined r*); the first-order root stands"
+                .to_string(),
+        )
+    })?;
+
+    let out = PyDict::new(py);
+    out.set_item("r", res.r)?;
+    out.set_item("u", res.u)?;
+    out.set_item("r_star", res.r_star)?;
+    out.set_item("p_value_first_order", res.p_value_first_order)?;
+    out.set_item("p_value_corrected", res.p_value_corrected)?;
+    out.set_item("u_empirical", res.u_empirical)?;
+    out.set_item("r_star_empirical", res.r_star_empirical)?;
+    out.set_item("p_value_corrected_empirical", res.p_value_corrected_empirical)?;
+    out.set_item("material", res.material)?;
+    Ok(out)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // #1055 — Riesz-representer debiased functional
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -901,6 +1022,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(expected_resolution_budget, module)?)?;
     module.add_function(wrap_pyfunction!(plan_probe_for_contested_claim, module)?)?;
     module.add_function(wrap_pyfunction!(lawley_bartlett_factor, module)?)?;
+    module.add_function(wrap_pyfunction!(skovgaard_r_star, module)?)?;
     module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
     module.add_function(wrap_pyfunction!(glm_full_conformal, module)?)?;
     Ok(())

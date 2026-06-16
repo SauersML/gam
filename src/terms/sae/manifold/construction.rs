@@ -2451,13 +2451,30 @@ impl SaeManifoldTerm {
         // consistency penalty is a bounded, scale-free fraction of the objective
         // (magic by default: no caller knob). `reml_scale` floors at 1 so a
         // near-zero criterion still admits a meaningful consistency contribution.
-        let reml_scale = reml.abs().max(1.0);
-        let w_recon = COTRAIN_RECON_WEIGHT * reml_scale;
-        let w_cert = COTRAIN_CERT_WEIGHT * reml_scale;
-        let cotrained = reml
-            + w_recon * consistency.recon_consistency
-            + w_cert * consistency.uncertified_fraction;
+        let cotrained = Self::fold_cotrain_consistency(reml, &consistency);
         Ok((cotrained, loss, consistency))
+    }
+
+    /// #1154 — the single source of the co-training fold arithmetic: add the
+    /// auto-scaled amortized-encoder consistency penalty to an already-computed
+    /// REML criterion at the converged dictionary. Both the public
+    /// [`Self::reml_criterion_cotrained`] entry point and the outer-loop value /
+    /// gradient lanes (`SaeManifoldOuterObjective::fold_cotrain_consistency`)
+    /// route through THIS function, so the folded objective cannot drift between
+    /// the criterion and the cascade-ranked cost (the objective↔gradient desync
+    /// bug class). The weights are auto-scaled to the REML magnitude (`max(|REML|,
+    /// 1)`) so the penalty is a bounded, scale-free fraction of the objective
+    /// regardless of problem scale; the fold carries no analytic gradient (under
+    /// Design A the REML λ-gradient stays the exact implicit-function path).
+    #[must_use]
+    pub fn fold_cotrain_consistency(
+        reml_cost: f64,
+        consistency: &AmortizedEncoderConsistency,
+    ) -> f64 {
+        let reml_scale = reml_cost.abs().max(1.0);
+        reml_cost
+            + COTRAIN_RECON_WEIGHT * reml_scale * consistency.recon_consistency
+            + COTRAIN_CERT_WEIGHT * reml_scale * consistency.uncertified_fraction
     }
 
     /// #1154 item 2 — warm-start the inner latent coordinates from the amortized

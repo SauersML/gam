@@ -2856,6 +2856,27 @@ fn sae_manifold_fit_inner<'py>(
     if let Some(report) = term.hybrid_split_report() {
         out.set_item("hybrid_split", sae_hybrid_split_dict(py, report)?)?;
     }
+    // #1154 — the co-trained amortized-encoder report. The outer ρ-cascade ranked
+    // ρ by the co-trained criterion (REML + amortized-encoder consistency), and
+    // the inner solve was warm-started from the amortized encoder built on the
+    // running dictionary (Design A). Here we surface, at the settled dictionary,
+    // how faithfully and certifiably the cheap one-mat-vec encoder inverts it:
+    //   * `recon_consistency` — mean per-element squared gap between the amortized
+    //     reconstruction and the exact encode-by-inner-solve reconstruction (0 ⇒
+    //     the IFT predictor is an exact first-order model of the encode map);
+    //   * `uncertified_fraction` — share of (row, atom) amortized encodes whose
+    //     Kantorovich certificate failed and fell back to the exact Newton (the
+    //     encoder's certifiable coverage of the fitted dictionary).
+    // Best-effort: a degenerate atlas (no usable charts) yields no report rather
+    // than aborting the fit payload (the co-training fold itself is advisory).
+    if let Ok(consistency) = term.amortized_encoder_consistency(z_view.view(), &rho) {
+        let cotrain = PyDict::new(py);
+        cotrain.set_item("recon_consistency", consistency.recon_consistency)?;
+        cotrain.set_item("uncertified_fraction", consistency.uncertified_fraction)?;
+        cotrain.set_item("n_uncertified", consistency.n_uncertified)?;
+        cotrain.set_item("n_encodes", consistency.n_encodes)?;
+        out.set_item("cotrain", cotrain)?;
+    }
     if let Some(report) = &fit_diagnostics.incoherence_report {
         out.set_item("curvature_report", sae_curvature_report_dict(py, report)?)?;
         out.set_item(
