@@ -1209,7 +1209,6 @@ macro_rules! impl_exact_joint_theta_memo {
 }
 
 
-#[derive(Debug)]
 struct SingleBlockExactJointDesignCache<'d> {
     realizer: FrozenTermCollectionIncrementalRealizer<'d>,
     current_theta: Option<Array1<f64>>,
@@ -1282,7 +1281,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     fn hyper_dirs_for_current_design(
         &mut self,
         data: ArrayView2<'_, f64>,
-        kind: SpatialOptimizerKind,
+        kind: SpatialHyperKind,
     ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
         let revision = self.realizer.design_revision();
         if let Some((cached_rev, dirs)) = self.cached_hyper_dirs.as_ref()
