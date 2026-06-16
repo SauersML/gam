@@ -12,7 +12,7 @@ use super::policy::GpuDispatchPolicy;
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, result, sys};
 
-#[path = "diagnostics.rs"]
+#[path = "runtime_diagnostics.rs"]
 pub(crate) mod diagnostics;
 
 #[derive(Clone, Debug)]
