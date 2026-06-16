@@ -3124,7 +3124,7 @@ fn iterate_payload_round_trips_converged_outer_hessian() {
     // The classifier surfaces the square Hessian as a (dim, flat) pair on the
     // Seed decision so the resume path can reconstruct and invert it.
     let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::CachedEntry {
+        entry: crate::warm_start::WarmStartEntry {
             payload: bytes,
             objective: Some(1.0),
             iteration: Some(0),
@@ -3237,7 +3237,7 @@ fn classify_extracts_beta_from_v2_payload() {
     let beta = array![10.0, 20.0, 30.0];
     let payload = encode_iterate(&rho, Some(&beta), None, 1.0, 0).expect("encode");
     let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::CachedEntry {
+        entry: crate::warm_start::WarmStartEntry {
             payload,
             objective: Some(1.0),
             iteration: Some(0),
@@ -3257,7 +3257,7 @@ fn classify_extracts_beta_from_v2_payload() {
     // ρ-only payload (legacy or family-without-β) decodes to empty beta.
     let payload = encode_iterate(&rho, None, None, 1.0, 0).expect("encode");
     let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::CachedEntry {
+        entry: crate::warm_start::WarmStartEntry {
             payload,
             objective: Some(1.0),
             iteration: Some(0),
@@ -3362,7 +3362,7 @@ fn run_calls_seed_inner_state_with_cached_beta() {
 
 #[test]
 fn run_skips_seed_inner_state_when_payload_has_no_beta() {
-    // Symmetric guard: a ρ-only cache entry must NOT invoke
+    // Symmetric guard: a ρ-only warm-start entry must NOT invoke
     // seed_inner_state — calling it with an empty / zero / garbage β
     // would silently degrade a family that has a non-trivial inner
     // default into one started at zeros.
@@ -3442,7 +3442,7 @@ fn cache_entry_classifier_honors_finite_seeds_regardless_of_saturation() {
     for rho_seed in [array![9.0, 0.0], array![10.0, -10.0], array![-10.0, 10.0]] {
         let payload = encode_iterate(&rho_seed, None, None, 1.0, 0).expect("encode");
         let loaded = crate::warm_start::LoadedEntry {
-            entry: crate::warm_start::CachedEntry {
+            entry: crate::warm_start::WarmStartEntry {
                 payload,
                 objective: Some(1.0),
                 iteration: Some(0),
@@ -3468,7 +3468,7 @@ fn cache_entry_classifier_honors_finite_seeds_regardless_of_saturation() {
 fn cache_entry_classifier_rejects_only_structural_failures() {
     // Only structural failures discard: payload shape (wrong rho_dim,
     // non-finite payload internals → decode None → "payload-shape-mismatch")
-    // and non-finite cache metadata → "non-finite-payload". Saturation
+    // and non-finite warm-start metadata → "non-finite-payload". Saturation
     // and β presence are NOT discards here: saturation is honored, and
     // ρ-only payloads decode cleanly with an empty β slot.
 
@@ -3477,7 +3477,7 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
     // non-finite-payload.
     let payload = encode_iterate(&array![0.5, 0.5], None, None, 1.0, 0).expect("encode");
     let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::CachedEntry {
+        entry: crate::warm_start::WarmStartEntry {
             payload,
             objective: Some(f64::NAN),
             iteration: Some(0),
@@ -3498,7 +3498,7 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
     // rejects shape → "payload-shape-mismatch".
     let payload = encode_iterate(&array![0.5, 0.5], None, None, 1.0, 0).expect("encode");
     let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::CachedEntry {
+        entry: crate::warm_start::WarmStartEntry {
             payload,
             objective: Some(1.0),
             iteration: Some(0),
@@ -3517,10 +3517,10 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
 }
 
 #[test]
-fn exact_final_cache_hit_is_helpful_even_at_boundary() {
+fn exact_final_warm_start_hit_is_helpful_even_at_boundary() {
     let payload = encode_iterate(&array![10.0, -10.0], None, None, 1.0, 3).expect("encode");
     let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::CachedEntry {
+        entry: crate::warm_start::WarmStartEntry {
             payload,
             objective: Some(1.0),
             iteration: Some(3),
@@ -3750,7 +3750,7 @@ fn exact_final_cache_hit_skips_outer_validation() {
     );
 }
 
-// ─── continuation pre-warm budget on a warm-start cache hit ──────────
+// ─── continuation pre-warm budget on a warm-start store hit ──────────
 
 /// An expensive-shape outer problem with no cache hit keeps its
 /// shape-derived continuation pre-warm budget. This pins the cold-start
@@ -3788,7 +3788,7 @@ fn prewarm_budget_cold_start_keeps_shape_budget() {
     );
 }
 
-/// On a warm-start cache hit the seed is already near-optimal, so the
+/// On a warm-start store hit the seed is already near-optimal, so the
 /// continuation pre-warm budget collapses to zero regardless of problem
 /// shape — the only difference vs the cold-start case above is the flag.
 #[test]
@@ -3810,6 +3810,6 @@ fn prewarm_budget_warm_start_cache_hit_is_zero() {
     let budget = continuation_prewarm_step_budget(&config, &cap, 1, 1);
     assert_eq!(
         budget, 0,
-        "a warm-start cache hit must skip the redundant continuation pre-warm"
+        "a warm-start store hit must skip the redundant continuation pre-warm"
     );
 }

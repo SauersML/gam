@@ -4,7 +4,7 @@
 //! overwrite a single run-id slot so we don't accumulate one entry per write.
 
 use crate::warm_start::key::Fingerprint;
-use crate::warm_start::store::{CachedEntry, EntryKind, WarmStartStore};
+use crate::warm_start::store::{EntryKind, WarmStartEntry, WarmStartStore};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,7 +22,7 @@ pub enum LoadSource {
 
 #[derive(Debug, Clone)]
 pub struct LoadedEntry {
-    pub entry: CachedEntry,
+    pub entry: WarmStartEntry,
     pub source: LoadSource,
 }
 
@@ -39,7 +39,7 @@ pub struct Session {
     /// [`Self::try_load`] returns and clears this slot — so the session
     /// can be used as a unified "load best seed, save under exact key"
     /// abstraction regardless of where the seed came from.
-    preloaded: Mutex<Option<CachedEntry>>,
+    preloaded: Mutex<Option<WarmStartEntry>>,
 }
 
 #[derive(Debug)]
@@ -76,7 +76,7 @@ impl Session {
     /// cross-validation folds of the same model). The exact-key keyspace
     /// remains untouched by this — checkpoint and finalize writes still
     /// go to the session's own key.
-    pub fn preload(&self, entry: CachedEntry) {
+    pub fn preload(&self, entry: WarmStartEntry) {
         let mut slot = match self.preloaded.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -105,7 +105,7 @@ impl Session {
     /// consumed (so subsequent calls fall back to the store). This
     /// makes the session a unified abstraction over "exact-key hit"
     /// and "hierarchical-prefix seed."
-    pub fn try_load(&self) -> Option<CachedEntry> {
+    pub fn try_load(&self) -> Option<WarmStartEntry> {
         self.try_load_with_source().map(|loaded| loaded.entry)
     }
 
@@ -141,7 +141,7 @@ impl Session {
     /// only need to make a scheduling decision (for example, whether to run an
     /// expensive cold-start pilot) must not drain the preloaded seed that the
     /// outer optimizer is about to consume.
-    pub fn peek_load(&self) -> Option<CachedEntry> {
+    pub fn peek_load(&self) -> Option<WarmStartEntry> {
         self.peek_load_with_source().map(|loaded| loaded.entry)
     }
 
@@ -303,7 +303,7 @@ mod tests {
         let (_d, s) = temp_session("preload-empty");
         assert!(s.try_load().is_none(), "fresh key should have no entry");
 
-        let seeded = CachedEntry {
+        let seeded = WarmStartEntry {
             payload: b"from-prefix".to_vec(),
             objective: Some(7.0),
             iteration: Some(42),
@@ -326,7 +326,7 @@ mod tests {
         let (_d, s) = temp_session("preload-consume");
         s.checkpoint(b"exact", Some(2.0), Some(5));
 
-        let seeded = CachedEntry {
+        let seeded = WarmStartEntry {
             payload: b"seed".to_vec(),
             objective: Some(99.0),
             iteration: Some(1),
@@ -339,15 +339,15 @@ mod tests {
         let first = s.try_load().expect("first call should return seed");
         assert_eq!(first.payload, b"seed");
 
-        // Second try_load: store fallback (seed already consumed).
-        let second = s.try_load().expect("second call should fall back to store");
+        // Second try_load: store lookup after the seed is consumed.
+        let second = s.try_load().expect("second call should read from store");
         assert_eq!(second.payload, b"exact");
     }
 
     #[test]
     fn peek_load_does_not_consume_preloaded_seed() {
         let (_d, s) = temp_session("preload-peek");
-        let seeded = CachedEntry {
+        let seeded = WarmStartEntry {
             payload: b"seed".to_vec(),
             objective: Some(3.0),
             iteration: Some(9),

@@ -1,4 +1,4 @@
-//! On-disk warm-start cache.
+//! On-disk warm-start store.
 //!
 //! Persists periodic checkpoints of in-progress fits so a subsequent run
 //! (possibly after a SIGKILL or weeks later) auto-resumes from the
@@ -32,4 +32,4 @@ pub mod store;
 
 pub use key::{Fingerprint, Fingerprinter};
 pub use session::{LoadSource, LoadedEntry, Session};
-pub use store::{CachedEntry, EntryKind, StoreError, StoreOptions, WarmStartStore};
+pub use store::{EntryKind, StoreError, StoreOptions, WarmStartEntry, WarmStartStore};

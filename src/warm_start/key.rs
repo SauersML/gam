@@ -1,4 +1,4 @@
-//! Fingerprint keying for the warm-start cache.
+//! Fingerprint keying for the warm-start store.
 //!
 //! A [`Fingerprint`] is a SHA-256 hash; two fits whose (data, spec) byte
 //! representations agree under [`Fingerprinter`] absorption produce the same
@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-/// 256-bit cache key.
+/// 256-bit warm-start key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; 32]);
 
@@ -179,8 +179,8 @@ impl Fingerprinter {
     // hashers. Callers that use this API are responsible for their own
     // type-disambiguation (typically by writing a leading namespace string
     // via `write_str`); the `absorb_*` family above prepends per-call tags
-    // and is the safer choice for new code that does not need streaming
-    // compatibility with hand-framed inputs.
+    // and is the safer choice for new code. Callers that use the untagged API
+    // must preserve their own hand-framed input protocol.
     // ------------------------------------------------------------------
 
     pub fn write_bytes(&mut self, data: &[u8]) {
@@ -205,7 +205,7 @@ impl Fingerprinter {
 
     pub fn write_f64(&mut self, value: f64) {
         // Normalize -0.0 to +0.0 so signed-zero comparison ambiguity does
-        // not split cache buckets — matches the prior `StableHasher`
+        // not split warm-start key buckets — matches the prior `StableHasher`
         // contract that warm-start keys depended on.
         let normalized = if value == 0.0 { 0.0 } else { value };
         self.h.update(normalized.to_bits().to_le_bytes());

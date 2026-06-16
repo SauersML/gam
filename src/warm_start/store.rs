@@ -1,4 +1,4 @@
-//! Filesystem store for warm-start cache entries.
+//! Filesystem store for warm-start entries.
 //!
 //! Each entry is a `(<runid>.json, <runid>.bin)` pair inside a per-key
 //! directory. Writes go through a temp-file → fsync → rename sequence so a
@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// are then ignored at read time and evicted on the next save.
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
-/// Default disk-budget for the whole cache root (~1 GiB).
+/// Default disk-budget for the whole warm-start store root (~1 GiB).
 pub(crate) const DEFAULT_SIZE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Default TTL — entries untouched for this long are dropped.
@@ -38,7 +38,7 @@ pub enum StoreError {
 
 /// Entry returned from [`WarmStartStore::lookup`].
 #[derive(Debug, Clone)]
-pub struct CachedEntry {
+pub struct WarmStartEntry {
     pub payload: Vec<u8>,
     pub objective: Option<f64>,
     pub iteration: Option<u64>,
@@ -159,7 +159,7 @@ impl WarmStartStore {
     /// every candidate has `objective = None`, picks the latest write.
     /// Corrupt or schema-mismatched candidates are silently cleaned up and
     /// skipped.
-    pub fn lookup(&self, key: &Fingerprint) -> Result<Option<CachedEntry>, StoreError> {
+    pub fn lookup(&self, key: &Fingerprint) -> Result<Option<WarmStartEntry>, StoreError> {
         self.lookup_with(key, LookupMode::Best)
     }
 
@@ -170,7 +170,7 @@ impl WarmStartStore {
     /// Use this for near-match seed namespaces where entries may come from
     /// different folds, diseases, or row sets, and objective magnitudes are
     /// not comparable. Exact-key resume should keep using [`Self::lookup`].
-    pub fn lookup_latest(&self, key: &Fingerprint) -> Result<Option<CachedEntry>, StoreError> {
+    pub fn lookup_latest(&self, key: &Fingerprint) -> Result<Option<WarmStartEntry>, StoreError> {
         self.lookup_with(key, LookupMode::Latest)
     }
 
@@ -178,7 +178,7 @@ impl WarmStartStore {
         &self,
         key: &Fingerprint,
         mode: LookupMode,
-    ) -> Result<Option<CachedEntry>, StoreError> {
+    ) -> Result<Option<WarmStartEntry>, StoreError> {
         let dir = self.key_dir(key);
         if !dir.exists() {
             // A stale in-memory cache entry could outlive its directory if
@@ -252,7 +252,7 @@ impl WarmStartStore {
             self.metadata_index_remove(&meta_path);
             return Ok(None);
         }
-        let entry = CachedEntry {
+        let entry = WarmStartEntry {
             payload,
             objective: meta.objective,
             iteration: meta.iteration,
@@ -423,8 +423,8 @@ impl WarmStartStore {
         // full directory scan: maintain a process-wide approximate byte
         // total and only run eviction when the total may have exceeded the
         // budget, when the per-save counter wraps `EVICT_EVERY_N_SAVES` as
-        // a drift-resync fallback, or on the very first save (so a fresh
-        // process inheriting a populated cache root sweeps once). The
+        // a drift-resync trigger, or on the very first save (so a fresh
+        // process inheriting a populated store root sweeps once). The
         // counter is best-effort: it can drift relative to disk truth
         // because other processes may write/evict, but every triggered
         // sweep resyncs it to ground truth.
@@ -625,7 +625,7 @@ struct CachedLookup {
     /// kept alongside `entry.written_unix_secs` so the fast path can apply
     /// the same TTL cutoff as `evict_overflow` without re-reading the JSON.
     write_nanos: u128,
-    entry: CachedEntry,
+    entry: WarmStartEntry,
 }
 
 #[derive(Debug, Default)]
@@ -1329,7 +1329,7 @@ mod tests {
                 .save(&key, &payload, Some(i as f64), None, EntryKind::Checkpoint)
                 .unwrap();
         }
-        // Walk the cache root and confirm total bytes is bounded.
+        // Walk the store root and confirm total bytes is bounded.
         let mut total = 0u64;
         for kd in fs::read_dir(store.root()).unwrap() {
             let kd = kd.unwrap().path();
