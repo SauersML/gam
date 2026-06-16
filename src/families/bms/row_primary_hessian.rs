@@ -924,8 +924,8 @@ impl BernoulliMarginalSlopeFamily {
         // block is `cfg(debug_assertions)`-gated.
         #[cfg(debug_assertions)]
         {
-            use crate::gpu::cubic_cell::branch::classify_cell_for_gpu;
-            use crate::gpu::cubic_cell::{
+            use crate::gpu::kernels::cubic_cell::branch::classify_cell_for_gpu;
+            use crate::gpu::kernels::cubic_cell::{
                 CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuDenestedCubicCell,
                 try_build_cubic_cell_derivative_moments,
             };
@@ -967,7 +967,7 @@ impl BernoulliMarginalSlopeFamily {
                 };
                 match try_build_cubic_cell_derivative_moments(view) {
                     Ok(Some(output)) => {
-                        use crate::gpu::cubic_cell::{
+                        use crate::gpu::kernels::cubic_cell::{
                             CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
                         };
                         let (sub_moments, sub_status, stride) = match output {
@@ -1291,9 +1291,9 @@ impl BernoulliMarginalSlopeFamily {
         // used unconditionally — the substrate dispatch below only fires
         // when `build_device_moments` is true, but the small Vec push cost
         // per cell is negligible compared to the moment compute itself.
-        let mut gpu_cells: Vec<crate::gpu::cubic_cell::GpuDenestedCubicCell> =
+        let mut gpu_cells: Vec<crate::gpu::kernels::cubic_cell::GpuDenestedCubicCell> =
             Vec::with_capacity(total_cells_us);
-        let mut gpu_branches: Vec<crate::gpu::cubic_cell::GpuCellBranchTag> =
+        let mut gpu_branches: Vec<crate::gpu::kernels::cubic_cell::GpuCellBranchTag> =
             Vec::with_capacity(total_cells_us);
 
         // Reusable per-row coefficient buffers. Same layout as
@@ -1454,7 +1454,7 @@ impl BernoulliMarginalSlopeFamily {
                 // resulting `[total_cells, MOMENT_STRIDE]` device buffer
                 // is indexed identically to the host `cell_moments` vec.
                 assert_eq!(gpu_cells.len(), cell_idx);
-                gpu_cells.push(crate::gpu::cubic_cell::GpuDenestedCubicCell {
+                gpu_cells.push(crate::gpu::kernels::cubic_cell::GpuDenestedCubicCell {
                     left: cell.left,
                     right: cell.right,
                     c0: cell.c0,
@@ -1463,11 +1463,11 @@ impl BernoulliMarginalSlopeFamily {
                     c3: cell.c3,
                 });
                 let branch = if !cell.left.is_finite() || !cell.right.is_finite() {
-                    crate::gpu::cubic_cell::GpuCellBranchTag::AffineTail
+                    crate::gpu::kernels::cubic_cell::GpuCellBranchTag::AffineTail
                 } else if cell.c2 == 0.0 && cell.c3 == 0.0 {
-                    crate::gpu::cubic_cell::GpuCellBranchTag::Affine
+                    crate::gpu::kernels::cubic_cell::GpuCellBranchTag::Affine
                 } else {
-                    crate::gpu::cubic_cell::GpuCellBranchTag::NonAffineFinite
+                    crate::gpu::kernels::cubic_cell::GpuCellBranchTag::NonAffineFinite
                 };
                 gpu_branches.push(branch);
 
@@ -1589,8 +1589,8 @@ impl BernoulliMarginalSlopeFamily {
         #[cfg(target_os = "linux")]
         let cell_moments_device: Option<cudarc::driver::CudaSlice<f64>> = if build_device_moments {
             #[cfg(debug_assertions)]
-            use crate::gpu::cubic_cell::CubicCellMomentStatus;
-            use crate::gpu::cubic_cell::{
+            use crate::gpu::kernels::cubic_cell::CubicCellMomentStatus;
+            use crate::gpu::kernels::cubic_cell::{
                 CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
                 CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,
             };

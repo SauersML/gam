@@ -1567,7 +1567,7 @@ const SAE_SPHERE_BASIS_SIZE: usize = 7;
 /// adjacent grid points ≈0.004 apart, comfortably inside the basin of the
 /// analytic Newton refinement for a small harmonic order, while staying cheap
 /// (`O(K·N·256·p)` for periodic atoms). See
-/// [`gam::terms::sae_manifold::SaeManifoldTerm::seed_coords_by_decoder_projection`].
+/// [`gam::terms::sae::manifold::SaeManifoldTerm::seed_coords_by_decoder_projection`].
 const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
 
 fn seed_oos_softmax_logits_from_projection_residuals(
