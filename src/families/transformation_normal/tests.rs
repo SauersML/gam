@@ -1705,11 +1705,11 @@ pub(crate) fn ctn_large_n_outer_hvp_capability_selects_operator_path() {
     let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
     assert_eq!(
         gradient,
-        crate::solver::outer_strategy::Derivative::Analytic
+        crate::solver::rho_optimizer::Derivative::Analytic
     );
     assert_eq!(
         hessian,
-        crate::solver::outer_strategy::DeclaredHessianForm::Either
+        crate::solver::rho_optimizer::DeclaredHessianForm::Either
     );
 }
 
