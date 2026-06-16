@@ -2035,7 +2035,10 @@ mod jet_tower_oracle {
             // composed through generic Leibniz on the η primary (independent of
             // the production signed-jet, which seeds the q tensor slots directly).
             let eta_marginal = p[0];
-            let link = bernoulli_marginal_link_map(&InverseLink::Probit, eta_marginal.v)?;
+            let link = bernoulli_marginal_link_map(
+                &InverseLink::Standard(crate::types::StandardLink::Probit),
+                eta_marginal.v,
+            )?;
             let q = eta_marginal.compose_unary([link.q, link.q1, link.q2, link.q3, link.q4]);
             let g = p[1];
             // observed slope b = s·g, scale c = √(1 + b²).
@@ -2054,7 +2057,11 @@ mod jet_tower_oracle {
     /// Special-function-independent scalar row NLL `ℓ(q_eta, g)` using
     /// `normal_logcdf`, for the central-FD value-channel witness.
     fn scalar_nll(eta_marginal: f64, g: f64, z: f64, y: f64, w: f64, s: f64) -> f64 {
-        let link = bernoulli_marginal_link_map(&InverseLink::Probit, eta_marginal).unwrap();
+        let link = bernoulli_marginal_link_map(
+            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            eta_marginal,
+        )
+        .unwrap();
         let observed_slope = g * s;
         let c = (observed_slope * observed_slope + 1.0).sqrt();
         let eta = link.q * c + observed_slope * z;
@@ -2091,7 +2098,11 @@ mod jet_tower_oracle {
 
                 // Production scalar kernel channels (the hand path under audit).
                 let marginal =
-                    bernoulli_marginal_link_map(&InverseLink::Probit, eta[row]).expect("link map");
+                    bernoulli_marginal_link_map(
+                        &InverseLink::Standard(crate::types::StandardLink::Probit),
+                        eta[row],
+                    )
+                    .expect("link map");
                 let (value, gradient, hessian) = rigid_standard_normal_row_kernel(
                     marginal,
                     g[row],

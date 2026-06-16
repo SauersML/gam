@@ -1997,8 +1997,6 @@ impl<'a> RemlState<'a> {
     where
         A: super::atoms::ThetaCorrectionProjection + ?Sized,
     {
-        use super::atoms::{CriterionAtom, ThetaCorrectionProjection};
-
         result.cost += correction.cost();
         if let Some(correction_hess) = correction.hessian() {
             result

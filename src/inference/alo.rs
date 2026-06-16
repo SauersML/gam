@@ -1874,7 +1874,7 @@ mod tests {
     use super::{
         AloExactScalarError, AloInput, alo_eta_exact_frozen_curvature, alo_eta_updatewith_offset,
         bayesvar_eta, compute_alo_from_input_inner, percentile_from_sorted, percentile_index,
-        sandwichvar_eta,
+        sandwichvar_eta, ALO_EXACT_SCALAR_MAX_ITERS,
     };
     use crate::matrix::{PsdWeightsView, SignedWeightsView};
     use crate::types::LinkFunction;

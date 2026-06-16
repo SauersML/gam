@@ -29,7 +29,6 @@ pub(crate) use crate::inference::hmc::BlockExcessTarget;
 pub(crate) use crate::linalg::utils::{
     StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
 };
-pub(crate) use crate::matrix::symmetrize_in_place;
 pub(crate) use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 pub(crate) use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;

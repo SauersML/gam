@@ -23,18 +23,17 @@ pub(crate) use location_scale::materialize_location_scale;
 pub(crate) use marginal_slope::materialize_bernoulli_marginal_slope;
 pub(crate) use standard::materialize_standard;
 pub(crate) use survival::materialize_survival;
-pub(crate) use terms::prune_unidentified_linear_terms_for_marginal_slope;
+pub(crate) use terms::{
+    build_termspec_with_geometry_and_overrides, prune_unidentified_linear_terms_for_marginal_slope,
+};
 pub(crate) use transformation::materialize_transformation_normal;
 pub(crate) use validation::{
     reject_marginal_slope_controls_for_transformation_normal,
     reject_survival_only_terms_for_nonsurvival,
 };
 
-use columns::*;
-use family::*;
 use latent::*;
 use secondary::*;
-use survival_time::*;
 use terms::*;
 use validation::*;
 

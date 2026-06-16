@@ -1437,7 +1437,7 @@ pub(crate) fn kkt_theta_correction_cross_and_psi_hessian_matches_finite_differen
             r = &r + &(&score_derivs[i] * theta[i]);
         }
         let hinv = crate::faer_ndarray::FaerCholesky::cholesky(&h)
-            .and_then(|c| c.inverse())
+            .map(|c| c.solve_mat(&Array2::<f64>::eye(h.nrows())))
             .expect("H(θ) SPD");
         -0.5 * r.dot(&hinv.dot(&r))
     };

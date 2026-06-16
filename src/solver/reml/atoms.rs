@@ -1098,11 +1098,11 @@ pub(crate) trait ThetaCorrectionProjection: CriterionAtom {
 /// itself is a `CriterionAtom`, so objective, gradient, and Hessian assembly
 /// cannot route around its single owner.
 pub struct TierneyKadaneAtom {
-    terms: super::state_caches::TkCorrectionTerms,
+    terms: super::outer_eval::TkCorrectionTerms,
 }
 
 impl TierneyKadaneAtom {
-    pub(crate) fn from_terms(terms: super::state_caches::TkCorrectionTerms) -> Self {
+    pub(crate) fn from_terms(terms: super::outer_eval::TkCorrectionTerms) -> Self {
         Self { terms }
     }
 
@@ -1150,7 +1150,7 @@ impl ThetaCorrectionProjection for TierneyKadaneAtom {
 /// correction emitted as one value + derivative bundle.
 ///
 /// The #784 sampler still owns the hard math that produces
-/// [`TkCorrectionTerms`](super::state_caches::TkCorrectionTerms).
+/// [`TkCorrectionTerms`](super::outer_eval::TkCorrectionTerms).
 /// This atom owns the assembly-side invariant: once such a correction exists,
 /// cost, gradient, and Hessian are projected from one object, so the caller
 /// cannot add the scalar value while forgetting or shape-shifting its analytic
@@ -1165,7 +1165,7 @@ pub struct ThetaOnlyCorrectionAtom {
 impl ThetaOnlyCorrectionAtom {
     pub(crate) fn from_tk_terms(
         label: &'static str,
-        terms: super::state_caches::TkCorrectionTerms,
+        terms: super::outer_eval::TkCorrectionTerms,
     ) -> Self {
         Self {
             label,
@@ -1854,12 +1854,13 @@ mod tests {
     /// projection, and Hessian carrier are read from one object.
     #[test]
     pub(crate) fn theta_only_correction_atom_projects_value_gradient_and_hessian() {
-        let tk_atom =
-            TierneyKadaneAtom::from_terms(crate::solver::reml::state_caches::TkCorrectionTerms {
-                value: -0.75,
-                gradient: Some(array![0.25, -0.5]),
-                hessian: Some(array![[2.0, 0.1], [0.1, 3.0]]),
-            });
+        use crate::solver::estimate::reml::outer_eval::state_caches::TkCorrectionTerms;
+
+        let tk_atom = TierneyKadaneAtom::from_terms(TkCorrectionTerms {
+            value: -0.75,
+            gradient: Some(array![0.25, -0.5]),
+            hessian: Some(array![[2.0, 0.1], [0.1, 3.0]]),
+        });
         assert_eq!(tk_atom.name(), "tierney_kadane");
         assert!((tk_atom.value() - (-0.75)).abs() < 1e-12);
         assert!(tk_atom.beta_channel().is_none());

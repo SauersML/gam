@@ -190,7 +190,7 @@ impl Gauge {
         let reduced_widths: Vec<usize> = v_per_term.iter().map(|v| v.ncols()).collect();
         Self {
             t_full: assemble_block_triangular_t(v_per_term, r_per_term),
-            affine_shift: Array1::zeros(raw_widths.iter().sum()),
+            affine_shift: Array1::zeros(raw_widths.iter().sum::<usize>()),
             block_starts_raw: starts_from_widths(&raw_widths),
             block_starts_reduced: starts_from_widths(&reduced_widths),
         }

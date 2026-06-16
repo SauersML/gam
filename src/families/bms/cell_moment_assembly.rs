@@ -2993,7 +2993,7 @@ mod empirical_rigid_jet_oracle_tests {
             z: Arc::new(Array1::from_vec(z)),
             latent_measure: LatentMeasureKind::GlobalEmpirical { grid },
             gaussian_frailty_sd: frailty_sd,
-            base_link: InverseLink::Probit,
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             marginal_design: dummy(),
             logslope_design: dummy(),
             score_warp: None,
@@ -3039,8 +3039,11 @@ mod empirical_rigid_jet_oracle_tests {
             let s = family.probit_frailty_scale();
 
             for row in 0..n {
-                let marginal = bernoulli_marginal_link_map(&InverseLink::Probit, m[row])
-                    .expect("marginal link map");
+                let marginal = bernoulli_marginal_link_map(
+                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    m[row],
+                )
+                .expect("marginal link map");
 
                 // Production closed-form channels (the hand path under audit).
                 let (value, gradient, hessian) = family
@@ -3172,7 +3175,11 @@ mod empirical_rigid_jet_oracle_tests {
         let (z0, y0, w0) = (0.5_f64, 1.0_f64, 1.0_f64);
         let family = empirical_family(vec![y0], vec![z0], vec![w0], None, grid.clone());
         let s = family.probit_frailty_scale();
-        let marginal = bernoulli_marginal_link_map(&InverseLink::Probit, m0).expect("link map");
+        let marginal = bernoulli_marginal_link_map(
+            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            m0,
+        )
+        .expect("link map");
 
         let fourth = family
             .empirical_rigid_fourth_full_closed_form(0, marginal, g0, &grid.nodes, &grid.weights)
@@ -3284,7 +3291,7 @@ mod empirical_flex_jet_oracle_tests {
             z: Arc::new(Array1::from_vec(vec![0.45])),
             latent_measure: LatentMeasureKind::GlobalEmpirical { grid: grid.clone() },
             gaussian_frailty_sd: None,
-            base_link: InverseLink::Probit,
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             marginal_design: dummy(),
             logslope_design: dummy(),
             score_warp: if is_score_warp {
@@ -3410,8 +3417,11 @@ mod empirical_flex_jet_oracle_tests {
         };
         let beta = Array1::from_iter(dev_range.clone().map(|i| p[i]));
         let scale = fx.family.probit_frailty_scale();
-        let marginal =
-            bernoulli_marginal_link_map(&InverseLink::Probit, q).expect("witness link map");
+        let marginal = bernoulli_marginal_link_map(
+            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            q,
+        )
+        .expect("witness link map");
         let a = witness_intercept(fx, marginal.mu, b, &beta, scale);
         let z = fx.family.z[0];
         let eta = witness_eta(fx, a, b, &beta, z, scale);
@@ -3503,7 +3513,11 @@ mod empirical_flex_jet_oracle_tests {
         };
         // Converged intercept seed for the value-pinning + jet Newton.
         let scale = fx.family.probit_frailty_scale();
-        let marginal = bernoulli_marginal_link_map(&InverseLink::Probit, q).expect("link map");
+        let marginal = bernoulli_marginal_link_map(
+            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            q,
+        )
+        .expect("link map");
         let intercept = witness_intercept(fx, marginal.mu, b, &beta, scale);
         // F_a at the root for `m_a` (must be finite, > 0).
         let mut m_a = 0.0;
@@ -3669,7 +3683,11 @@ mod empirical_flex_jet_oracle_tests {
         }
         let scale = fx.family.probit_frailty_scale();
         let beta: Array1<f64> = Array1::from_iter(dev_range.clone().map(|i| p0[i]));
-        let marginal = bernoulli_marginal_link_map(&InverseLink::Probit, q0).expect("link map");
+        let marginal = bernoulli_marginal_link_map(
+            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            q0,
+        )
+        .expect("link map");
         let intercept = witness_intercept(&fx, marginal.mu, b0, &beta, scale);
         let mut m_a = 0.0;
         for (node, weight) in fx.grid.pairs() {

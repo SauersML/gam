@@ -2101,7 +2101,7 @@ pub(crate) fn reduced_rhs_beta<B: BatchedBlockSolver + Sync>(
 /// uses. `Direct` forms `H_tβᵀ (H_tt)⁻¹ H_tβ` via a full block solve; `SqrtBa`
 /// forms the equivalent `(L⁻¹ H_tβ)ᵀ (L⁻¹ H_tβ)` from the lower triangular
 /// solve only. The reduction `Σ_i contribution_i` is identical in both axes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum SchurReductionKind {
     Direct,
     SqrtBa,

@@ -86,7 +86,7 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+    let penalty_quad_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
         &lambdas,
         &solution.penalty_coords,
         &solution.beta,
@@ -166,7 +166,7 @@ pub(crate) fn efs_single_loop_diagnostics(
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+    let penalty_quad_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
         &lambdas,
         &solution.penalty_coords,
         &solution.beta,
@@ -362,7 +362,7 @@ pub fn compute_hybrid_efs_update(
     // actual update write-back serial so fallback/backtracking decisions still
     // see a deterministic step vector.
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+    let penalty_quad_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
         &lambdas,
         &solution.penalty_coords,
         &solution.beta,

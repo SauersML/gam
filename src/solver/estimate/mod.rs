@@ -32,9 +32,8 @@ use crate::inference::diagnostics::should_emit_h_min_eig_diag;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, add_relative_diag_ridge, matrix_inversewith_regularization, row_mismatch_message,
-    stack_offsets,
 };
-use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator, symmetrize_in_place};
+use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
@@ -43,7 +42,7 @@ use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
     LikelihoodSpec, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
-    MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState, StandardLink,
+    ResponseFamily, RidgePassport, StandardLink,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -51,19 +50,16 @@ use crate::types::{MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, fast_ab, fast_atb,
+    FaerArrayView, FaerCholesky, FaerEigh, fast_ab, fast_atb,
 };
 use faer::{MatRef, Side};
 use rayon::prelude::*;
-
-use serde::{Deserialize, Serialize};
 
 // Note: deflateweights_by_se was removed. We now use integrated (GHQ)
 // family-dispatched likelihood updates in PIRLS instead of weight deflation.
 // The SE is passed through to PIRLS which integrates over uncertainty
 // in the likelihood, rather than using ad-hoc weight adjustment.
 
-use std::ops::Range;
 use std::sync::Arc;
 
 #[path = "../reml/mod.rs"]

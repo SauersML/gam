@@ -352,8 +352,8 @@ mod tests {
     ///      draws, not SAS inverse-link transforms of eta quantiles.
     #[test]
     fn spec_path_produces_finite_response_bands_for_parameterized_sas_link() {
-        use crate::solver::mixture_link::{SasLinkState, inverse_link_mu_d1_for_inverse_link};
-        use crate::types::InverseLink;
+        use crate::solver::mixture_link::inverse_link_mu_d1_for_inverse_link;
+        use crate::types::{InverseLink, SasLinkState};
 
         let state = SasLinkState::new(0.7, -0.4).expect("valid SAS link state");
         let link = InverseLink::Sas(state);

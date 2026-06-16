@@ -140,9 +140,7 @@ pub(crate) use rayon::prelude::*;
 
 pub(crate) use std::collections::HashMap;
 
-pub(crate) use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-
-pub(crate) use std::sync::{Arc, Condvar, Mutex};
+pub(crate) use std::sync::{Arc, Mutex};
 
 pub(crate) use crate::faer_ndarray::FaerEigh;
 
@@ -151,7 +149,7 @@ pub(crate) use crate::linalg::matrix::{
 };
 use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, ProjectedKktResidual};
 pub use crate::reml_contracts::{
-    BlockLocalDrift, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
+    ContractedPsiSecondOrderFn,
     DenseMatrixHyperOperator, DriftDerivResult, EvalMode, FixedDriftDerivFn, HyperCoord,
     HyperCoordDrift, HyperCoordPair, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
