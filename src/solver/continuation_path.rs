@@ -16,7 +16,7 @@
 //!    a contraction.
 //! 2. **Assignment temperature τ** — diffuse softmax / IBP relaxation (high τ)
 //!    sharpened toward the near-discrete MAP active set (low τ). Owned by
-//!    [`crate::terms::sae_manifold::GumbelTemperatureSchedule`]. High τ makes
+//!    [`crate::terms::sae::manifold::GumbelTemperatureSchedule`]. High τ makes
 //!    the assignment map smooth and far from the combinatorial argmax cliff.
 //! 3. **Isometry weight** — loose analytic isometry gauge (small w) ramped to
 //!    the tight target weight. Owned by
@@ -84,7 +84,7 @@ use crate::solver::estimate::reml::continuation::{
 };
 use crate::solver::rho_optimizer::{OuterEvalOrder, OuterObjective};
 use crate::terms::analytic_penalties::ScalarWeightSchedule;
-use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
+use crate::terms::sae::manifold::{GumbelTemperatureSchedule, ScheduleKind};
 
 /// Number of lockstep waypoints the path visits as `s` walks `1 → 0`. Each
 /// waypoint advances every leg one notch and runs one ρ-anneal spine pass.

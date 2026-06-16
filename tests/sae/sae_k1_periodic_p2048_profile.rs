@@ -15,7 +15,7 @@ use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::solver::outer_strategy::OuterProblem;
 use gam::solver::seeding::SeedConfig;
 use gam::terms::latent_coord::LatentManifold;
-use gam::terms::sae_manifold::sae_pca_seed_initial_coords;
+use gam::terms::sae::manifold::sae_pca_seed_initial_coords;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,

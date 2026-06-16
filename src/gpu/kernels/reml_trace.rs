@@ -738,49 +738,40 @@ where
 /// only through `hvp(v, out) → out ← H v`. SPD `H` is required.
 /// Initial guess is `w = 0`; stops when `‖r‖ ≤ rel_tol · ‖b‖` or after
 /// `max_iters` iterations.
+///
+/// Thin wrapper over the shared [`pcg_core`] (`linalg::pcg`): unpreconditioned
+/// (all-ones Jacobi diagonal), no residual refresh (`refresh_period = 0`), and
+/// no diagnostics — exactly the serial recurrence this used to inline. On a
+/// breakdown (lost SPD near convergence, non-finite scalar) the core stops and
+/// leaves the last valid iterate in `w`, which is the historical "accept
+/// current w" behavior. The serial inner products in `pcg_core` reproduce the
+/// byte-for-byte iterates of the previous hand-rolled loop.
 fn cg_solve<F>(hvp: &mut F, b: &[f64], w: &mut [f64], rel_tol: f64, max_iters: usize)
 where
     F: FnMut(&[f64], &mut [f64]),
 {
     let n = b.len();
     assert!(w.len() == n);
-    for v in w.iter_mut() {
-        *v = 0.0;
-    }
-    // r = b - H w = b (since w=0)
-    let mut r = b.to_vec();
-    let mut p = r.clone();
-    let mut hp = vec![0.0_f64; n];
 
-    let b_norm_sq: f64 = b.iter().map(|x| x * x).sum();
-    if b_norm_sq == 0.0 {
-        return;
-    }
-    let mut r_norm_sq: f64 = r.iter().map(|x| x * x).sum();
-    let tol_sq = rel_tol * rel_tol * b_norm_sq;
+    let rhs = ArrayView1::from(b);
+    let precond = Array1::<f64>::ones(n);
+    let mut solution = ArrayViewMut1::from(w);
 
-    for _ in 0..max_iters {
-        if r_norm_sq <= tol_sq {
-            break;
-        }
-        hvp(p.as_slice(), hp.as_mut_slice());
-        let p_hp: f64 = p.iter().zip(hp.iter()).map(|(a, b)| a * b).sum();
-        if !(p_hp > 0.0) {
-            // Lost SPD (round-off near convergence) — accept current w.
-            break;
-        }
-        let alpha = r_norm_sq / p_hp;
-        for i in 0..n {
-            w[i] += alpha * p[i];
-            r[i] -= alpha * hp[i];
-        }
-        let new_r_norm_sq: f64 = r.iter().map(|x| x * x).sum();
-        let beta = new_r_norm_sq / r_norm_sq;
-        for i in 0..n {
-            p[i] = r[i] + beta * p[i];
-        }
-        r_norm_sq = new_r_norm_sq;
-    }
+    pcg_core(
+        |v: &ArrayView1<f64>, out: &mut ArrayViewMut1<f64>| {
+            // The core hands contiguous views; `hvp` speaks raw slices.
+            let v_slice = v.as_slice().expect("contiguous CG direction view");
+            let out_slice = out.as_slice_mut().expect("contiguous CG matvec view");
+            hvp(v_slice, out_slice);
+        },
+        &rhs,
+        &precond.view(),
+        rel_tol,
+        max_iters,
+        0,
+        false,
+        &mut solution,
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────

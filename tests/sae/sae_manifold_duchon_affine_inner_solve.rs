@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 
-use gam::terms::sae_manifold::EuclideanPatchEvaluator;
+use gam::terms::sae::manifold::EuclideanPatchEvaluator;
 use gam::terms::{
     AssignmentMode, LatentManifold, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,

@@ -24,7 +24,7 @@
 //! `(n·p, M_k·p)` channel-replicated block that previously broadcast-panicked
 //! when routed through the cross-block flat audit.
 
-use gam::terms::sae_manifold::{
+use gam::terms::sae::manifold::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
     SaeManifoldTerm,
 };

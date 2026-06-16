@@ -555,7 +555,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     // from the same source of truth as `sae_penalty_is_row_block_supported`.
     info.set_item(
         "sae_row_block_penalties",
-        gam::terms::sae_manifold::sae_row_block_penalty_kinds().to_vec(),
+        gam::terms::sae::manifold::sae_row_block_penalty_kinds().to_vec(),
     )?;
     Ok(info.unbind())
 }

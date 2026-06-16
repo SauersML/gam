@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use gam::inference::atom_lens::{AtomTwoLensReport, atom_two_lens};
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
-use gam::terms::sae_manifold::{
+use gam::terms::sae::manifold::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldTerm,
 };
 use ndarray::{Array2, Array3};

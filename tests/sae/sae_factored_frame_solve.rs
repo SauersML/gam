@@ -475,14 +475,14 @@ fn factored_fit_recovers_planted_low_rank_atoms() {
         border_dim < beta_dim,
         "factored border {border_dim} must be strictly below full-B border {beta_dim}"
     );
-    gam::terms::sae_manifold::grassmann_assert_border_dim_invariant(&term)
+    gam::terms::sae::manifold::grassmann_assert_border_dim_invariant(&term)
         .expect("border-dim invariant before fit");
 
     let (fitted, final_v) = fit_via_engine(term, &z, "test1 factored low-rank fit");
     println!("test1: engine final criterion = {final_v:.6}");
 
     // Frames must still be active after the fit, with each border rank below p.
-    gam::terms::sae_manifold::grassmann_assert_border_dim_invariant(&fitted)
+    gam::terms::sae::manifold::grassmann_assert_border_dim_invariant(&fitted)
         .expect("border-dim invariant after fit");
     assert!(
         fitted.factored_border_dim() < fitted.beta_dim(),
@@ -672,12 +672,12 @@ fn mixed_framed_and_full_rank_atoms() {
         border_dim < beta_dim,
         "the framed atom must shrink the mixed border below beta_dim"
     );
-    gam::terms::sae_manifold::grassmann_assert_border_dim_invariant(&term)
+    gam::terms::sae::manifold::grassmann_assert_border_dim_invariant(&term)
         .expect("mixed border-dim invariant before fit");
 
     let (fitted, final_v) = fit_via_engine(term, &z, "test3 mixed fit");
     println!("test3: engine final criterion = {final_v:.6}");
-    gam::terms::sae_manifold::grassmann_assert_border_dim_invariant(&fitted)
+    gam::terms::sae::manifold::grassmann_assert_border_dim_invariant(&fitted)
         .expect("mixed border-dim invariant after fit");
 
     // Both atoms recover their planted planes through the mixed solve.

@@ -35,7 +35,7 @@ use crate::solver::evidence::{
 };
 use crate::terms::latent_coord::LatentManifold;
 use crate::terms::sae::chart_canonicalization::d1_atom_fitted_turning;
-use crate::terms::sae_manifold::SaeManifoldAtom;
+use crate::terms::sae::manifold::SaeManifoldAtom;
 
 /// The rank-aware Laplace negative-log-evidence of a reduced per-atom Gaussian
 /// reconstruction sub-model: `residual_objective + ½ log|H|` with no smoothing

@@ -30,7 +30,7 @@
 //!    smaller constant `c0 < 1`, so its certified set must be a strict subset:
 //!    it never certifies a cell the loose boundary already rules out.
 
-use gam::terms::sae_manifold::{
+use gam::terms::sae::manifold::{
     GlobalOptimalityVerdict, SAE_CERT_CURVATURE_CONSTANT, SAE_CERT_INCOHERENCE_BUDGET,
     curved_dictionary_global_optimality_verdict,
 };

@@ -193,7 +193,7 @@ impl WeightField {
 /// `jacobian_cache_slot` and `jacobian_second_cache_slot` are interior-mutable
 /// (`RwLock<Option<Arc<…>>>`) so the SAE outer loop can refresh them in place
 /// each step without needing `&mut self` on the registry-held penalty (see
-/// `refresh_caches` and [`crate::terms::sae_manifold::refresh_isometry_caches_from_atom`]).
+/// `refresh_caches` and [`crate::terms::sae::manifold::refresh_isometry_caches_from_atom`]).
 /// Readers go through the [`Self::jacobian_cache`] / [`Self::jacobian_second_cache`]
 /// accessors, which take the read lock briefly and clone the inner `Arc`
 /// (refcount bump — no payload copy). Writers go through [`Self::refresh_caches`].

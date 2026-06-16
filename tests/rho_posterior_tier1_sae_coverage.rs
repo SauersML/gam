@@ -126,7 +126,7 @@ fn build_objective(theta: &[f64], z: &Array2<f64>) -> SaeManifoldOuterObjective 
 
 fn fixed_grid_mean_var(
     term: &SaeManifoldTerm,
-    shape: &gam::terms::sae_manifold::SaeShapeUncertainty,
+    shape: &gam::terms::sae::manifold::SaeShapeUncertainty,
 ) -> (Array2<f64>, Array2<f64>) {
     let mean = fixed_grid_mean(term);
     let coords = Array2::from_shape_fn((GRID, 1), |(i, _)| (i as f64 + 0.5) / GRID as f64);

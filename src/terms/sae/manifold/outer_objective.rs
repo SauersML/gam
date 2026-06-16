@@ -832,7 +832,7 @@ impl SaeManifoldOuterObjective {
                 self.term.set_flat_beta(beta.view())?;
             }
         }
-        let (cost, loss) = self.term.reml_criterion_with_refine_policy(
+        let (reml_cost, loss) = self.term.reml_criterion_with_refine_policy(
             self.target.view(),
             &rho,
             self.registry.as_ref(),
@@ -843,6 +843,26 @@ impl SaeManifoldOuterObjective {
             refine_progress_extension,
         )?;
         let beta_hat = self.term.flatten_beta();
+        // #1154 — co-train the amortized encoder with the dictionary + λ: rank ρ
+        // by the REML criterion PLUS the amortized-encoder consistency penalty,
+        // so the derivative-free outer cascade settles on a dictionary the cheap
+        // one-mat-vec encoder can faithfully and certifiably invert. The inner
+        // solve already converged to stationarity above, so the consistency fold
+        // is evaluated at the exact fitted dictionary and the REML λ-gradient is
+        // untouched (Design A). The EFS quadratic fixed-point lane (`efs_step`)
+        // cannot carry this non-Gaussian term; the cost lane that THIS path feeds
+        // is what the cascade ranks ρ by, so steering it here is sufficient.
+        let consistency = self
+            .term
+            .amortized_encoder_consistency(self.target.view(), &rho)?;
+        let reml_scale = reml_cost.abs().max(1.0);
+        let cost = reml_cost
+            + crate::terms::sae::manifold::construction::COTRAIN_RECON_WEIGHT
+                * reml_scale
+                * consistency.recon_consistency
+            + crate::terms::sae::manifold::construction::COTRAIN_CERT_WEIGHT
+                * reml_scale
+                * consistency.uncertified_fraction;
         let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         self.current_rho = rho;
         self.last_loss = Some(loss);

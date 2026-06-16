@@ -28,7 +28,7 @@ use gam::terms::sae::candidate_index::{
 use gam::terms::sae_encode_atlas::{
     AtlasConfig, EncodeAtlas, KANTOROVICH_THRESHOLD, row_certificate,
 };
-use gam::terms::sae_manifold::{
+use gam::terms::sae::manifold::{
     PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
 };
 

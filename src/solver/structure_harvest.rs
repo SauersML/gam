@@ -579,7 +579,7 @@ fn duplicate_atom(
     let mut coords = term.assignment.coords.clone();
     coords.push(term.assignment.coords[parent].clone());
     let assignment =
-        crate::terms::sae_manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
+        crate::terms::sae::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
     let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
@@ -1297,7 +1297,7 @@ fn born_atom(
     let mut coords = term.assignment.coords.clone();
     coords.push(born_coord_block);
     let assignment =
-        crate::terms::sae_manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
+        crate::terms::sae::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
     let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
@@ -1712,7 +1712,7 @@ mod tests {
     use super::*;
     use crate::solver::structure_search::{CollapseAction, CollapseEvent};
     use crate::terms::latent_coord::LatentManifold;
-    use crate::terms::sae_manifold::{
+    use crate::terms::sae::manifold::{
         AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
         SaeBasisEvaluator, SaeManifoldAtom,
     };

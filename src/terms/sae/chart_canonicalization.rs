@@ -78,7 +78,7 @@ use faer::Side as FaerSide;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::linalg::faer_ndarray::{FaerCholesky, fast_ab, fast_ata, fast_atb};
-use crate::terms::sae_manifold::{SaeBasisEvaluator, solve_design_least_squares};
+use crate::terms::sae::manifold::{SaeBasisEvaluator, solve_design_least_squares};
 
 /// Number of integration cells for the fitted-turning quadrature (#1026).
 const TURNING_QUADRATURE_CELLS: usize = 256;

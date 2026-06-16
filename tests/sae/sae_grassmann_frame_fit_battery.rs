@@ -26,7 +26,7 @@
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::solver::outer_strategy::OuterProblem;
 use gam::terms::latent_coord::LatentManifold;
-use gam::terms::sae_manifold::{GrassmannCrossMoment, GrassmannFrame};
+use gam::terms::sae::manifold::{GrassmannCrossMoment, GrassmannFrame};
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
@@ -373,7 +373,7 @@ fn frame_factored_evidence_matches_full_b_at_small_p() {
             "frame activation changed a fitted value"
         );
     }
-    gam::terms::sae_manifold::grassmann_assert_border_dim_invariant(&framed_state)
+    gam::terms::sae::manifold::grassmann_assert_border_dim_invariant(&framed_state)
         .expect("border-dim invariant");
     assert!(
         framed_state.factored_border_dim() < full_state.factored_border_dim(),

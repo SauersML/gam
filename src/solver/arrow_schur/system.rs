@@ -3264,7 +3264,7 @@ impl ArrowFactorCache {
     /// of `H⁻¹` is exactly `S_β⁻¹` (the inverse of the Schur complement whose
     /// Cholesky factor this cache holds). This returns the contiguous
     /// `block × block` sub-block — e.g. one SAE atom's decoder coefficients via
-    /// [`crate::terms::sae_manifold::SaeManifoldTerm::beta_block_offsets`] — by
+    /// [`crate::terms::sae::manifold::SaeManifoldTerm::beta_block_offsets`] — by
     /// solving `S_β x = e_j` for each `j ∈ block` (reusing the cached factor)
     /// and gathering the `block` rows of each solution column. `W`
     /// back-substitutions of size `K`; the result is symmetrized to clear

@@ -159,7 +159,7 @@ pub(crate) use gam::terms::linear_dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, fit_linear_dictionary,
 };
 
-pub(crate) use gam::terms::sae_manifold::{
+pub(crate) use gam::terms::sae::manifold::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SPHERE_CHART_PENALTY_DIAGONAL,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldRho, ScheduleKind,

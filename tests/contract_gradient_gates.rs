@@ -18,7 +18,7 @@ use gam::families::survival::{
 use gam::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam::resource::ResourcePolicy;
 use gam::smooth::BlockwisePenalty;
-use gam::terms::sae_manifold::EuclideanPatchEvaluator;
+use gam::terms::sae::manifold::EuclideanPatchEvaluator;
 use gam::terms::{
     AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
     SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,

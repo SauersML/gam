@@ -17,7 +17,7 @@
 //! Track 1 owns the *real* atom frames `U_k` and has not landed yet, so this
 //! module is written against a [`AtomFrameSketch`] trait. Any frame source —
 //! the eventual Grassmann frames, or the decoder column blocks `B_k` already
-//! present on [`crate::terms::sae_manifold::SaeManifoldAtom`] — can implement
+//! present on [`crate::terms::sae::manifold::SaeManifoldAtom`] — can implement
 //! it. A concrete, dependency-free default
 //! ([`RandomProjectionFrameSketch`]) is provided: a seeded random-projection /
 //! random-hyperplane signature of the atom's orthonormalized column span. The

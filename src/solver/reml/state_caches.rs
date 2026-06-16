@@ -1106,9 +1106,9 @@ pub(crate) fn hash_weight_schedule_option(
 
 pub(crate) fn hash_gumbel_temperature_schedule(
     hasher: &mut Fingerprinter,
-    schedule: &crate::terms::sae_manifold::GumbelTemperatureSchedule,
+    schedule: &crate::terms::sae::manifold::GumbelTemperatureSchedule,
 ) {
-    use crate::terms::sae_manifold::ScheduleKind;
+    use crate::terms::sae::manifold::ScheduleKind;
 
     hasher.write_f64(schedule.tau_start);
     hasher.write_f64(schedule.tau_min);
@@ -1128,7 +1128,7 @@ pub(crate) fn hash_gumbel_temperature_schedule(
 
 pub(crate) fn hash_gumbel_schedule_option(
     hasher: &mut Fingerprinter,
-    schedule: &Option<crate::terms::sae_manifold::GumbelTemperatureSchedule>,
+    schedule: &Option<crate::terms::sae::manifold::GumbelTemperatureSchedule>,
 ) {
     match schedule {
         Some(schedule) => {
