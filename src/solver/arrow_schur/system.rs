@@ -2855,6 +2855,16 @@ impl ArrowFactorCache {
         self.htbeta.is_available()
     }
 
+    /// Whether the Newton solve that produced this cache was served by the GPU
+    /// arrow-Schur path (the device-resident Direct dense solve or the injected
+    /// GPU reduced-Schur matvec). Read-only routing provenance: lets a fit
+    /// result record device-vs-CPU as ground truth instead of inferring it from
+    /// the runtime probe. Mirrors `PcgDiagnostics::used_device_arrow`.
+    #[must_use]
+    pub fn used_device(&self) -> bool {
+        self.pcg_diagnostics.used_device_arrow
+    }
+
     pub fn undamped_factor(&self, row: usize) -> ArrayView2<'_, f64> {
         match &self.htt_factors_undamped {
             ArrowUndampedFactors::SameAsDamped => self.htt_factors.factor(row),
