@@ -988,10 +988,14 @@ class ManifoldSAE:
             )
             phi = np.asarray(phi, dtype=float)
             if phi.shape[1] != decoder.shape[0]:
-                raise ValueError(
-                    "periodic shape band basis width does not match decoder: "
-                    f"Phi has {phi.shape[1]} columns, decoder has {decoder.shape[0]} rows"
-                )
+                # The posterior shape band is an OPTIONAL diagnostic, not part of
+                # reconstruction (which uses `decoder_blocks` via predict_oos). A
+                # periodic atom whose decoder collapsed to a non-`2H+1` width
+                # (e.g. the hybrid-split linear collapse replacing the curved
+                # decoder with a 1-row straight image, or a degenerate
+                # born/fissioned atom) cannot present a periodic shape band — but
+                # that must NOT abort the whole fit. Skip the band gracefully.
+                return None, None, None
             mean = phi @ decoder
             sd = _opt_arr(atom, "shape_band_sd")
             cov = _opt_arr(atom, "decoder_covariance")
