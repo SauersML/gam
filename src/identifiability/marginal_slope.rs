@@ -1,5 +1,5 @@
 //! Survival marginal-slope concrete impls for the family-agnostic
-//! identifiability compiler (`crate::families::identifiability::compiler`).
+//! identifiability compiler (`crate::identifiability::families::compiler`).
 //!
 //! Survival's row primary state is the 4-vector `u_i = (q0, q1, qd1, g)`,
 //! so `K = 4`. The row Hessian is the 4×4 second-derivative block of the
@@ -31,7 +31,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, Array3};
 
 use crate::families::custom_family::{FamilyChannelHessian, PenaltyMatrix};
-use crate::families::identifiability::compiler::{
+use crate::identifiability::families::compiler::{
     BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
@@ -733,7 +733,7 @@ pub fn compile_survival_parametric_designs_per_term(
     logslope_partition: &[std::ops::Range<usize>],
     row_hess: &dyn RowHessian,
 ) -> Result<SurvivalParametricCompiledPerTerm, String> {
-    use crate::families::identifiability::compiler::compile;
+    use crate::identifiability::families::compiler::compile;
 
     let p_time = time_dq0.ncols();
     let p_marg = marginal_dq.ncols();
@@ -1267,7 +1267,7 @@ pub fn apply_per_term_survival_parametric_compile_to_designs(
 /// into the three *block* ranges (raw = summed per-term raw widths, compiled =
 /// summed per-term kept widths). The resulting `CompiledMap` is interchangeable
 /// with one from
-/// [`crate::families::identifiability::compiler::compile_from_raw_grams`], so the
+/// [`crate::identifiability::families::compiler::compile_from_raw_grams`], so the
 /// existing [`apply_compiled_map_to_designs`] +
 /// [`Gauge::from_compiled_map`] machinery consumes it unchanged.
 ///
@@ -1280,7 +1280,7 @@ pub fn apply_per_term_survival_parametric_compile_to_designs(
 /// goes to Newton in place of the rank-deficient raw basis.
 pub fn compiled_map_from_per_term(
     compiled: &SurvivalParametricCompiledPerTerm,
-) -> crate::families::identifiability::compiler::CompiledMap {
+) -> crate::identifiability::families::compiler::CompiledMap {
     // Per-term V's and R's in global compile order: time terms, then marginal,
     // then logslope — exactly the order `r_lw_per_term` is stored in.
     let mut v_all: Vec<Array2<f64>> = Vec::new();
@@ -1311,7 +1311,7 @@ pub fn compiled_map_from_per_term(
         (kept_time + kept_marg)..(kept_time + kept_marg + kept_log),
     ];
 
-    crate::families::identifiability::compiler::CompiledMap {
+    crate::identifiability::families::compiler::CompiledMap {
         raw_from_compiled: t_full,
         compiled_block_ranges,
         raw_block_ranges,
@@ -1347,7 +1347,7 @@ pub fn compiled_map_from_per_term(
 /// compile path for the rest.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_compiled_map_to_designs(
-    map: &crate::families::identifiability::compiler::CompiledMap,
+    map: &crate::identifiability::families::compiler::CompiledMap,
     time_design_entry: DesignMatrix,
     time_design_exit: DesignMatrix,
     time_design_derivative_exit: DesignMatrix,
@@ -1515,7 +1515,7 @@ pub fn compile_survival_parametric_designs(
     logslope_dg: Array2<f64>,
     row_hess: &dyn RowHessian,
 ) -> Result<SurvivalParametricCompiled, String> {
-    use crate::families::identifiability::compiler::compile;
+    use crate::identifiability::families::compiler::compile;
 
     let p_time_raw = time_dq0.ncols();
     let p_marg_raw = marginal_dq.ncols();
@@ -2348,7 +2348,7 @@ mod tests {
     /// ordinary survival data.
     #[test]
     fn compiled_map_penalty_pullback_is_per_block_width_with_nonzero_residual() {
-        use crate::families::identifiability::compiler::CompiledMap;
+        use crate::identifiability::families::compiler::CompiledMap;
         use crate::terms::smooth::BlockwisePenalty;
 
         let n = 10;
@@ -2567,7 +2567,7 @@ mod tests {
     /// is the contract the SMGS wiring will assert against.
     #[test]
     fn compile_survival_three_block_with_shared_constant_drops_one_direction() {
-        use crate::families::identifiability::compiler::compile;
+        use crate::identifiability::families::compiler::compile;
 
         let n = 32;
         let p_time = 3;
@@ -3344,9 +3344,9 @@ mod tests {
         // The cross-block carry (-R) must sit in the strict upper triangle, so
         // the map agrees with the lift assembled directly from V and R.
         let ordering = [
-            crate::families::identifiability::compiler::BlockOrder::Time,
-            crate::families::identifiability::compiler::BlockOrder::Marginal,
-            crate::families::identifiability::compiler::BlockOrder::Logslope,
+            crate::identifiability::families::compiler::BlockOrder::Time,
+            crate::identifiability::families::compiler::BlockOrder::Marginal,
+            crate::identifiability::families::compiler::BlockOrder::Logslope,
         ];
         let lift_from_map = Gauge::from_compiled_map(&map, &ordering);
         let v_all = vec![v_time, v_marg, v_log];
