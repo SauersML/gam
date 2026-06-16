@@ -2268,16 +2268,16 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
     // if that happens.
     assert!(
         matches!(
-            crate::solver::outer_strategy::OuterHessianOperator::materialization_capability(
+            crate::solver::rho_optimizer::OuterHessianOperator::materialization_capability(
                 &operator
             ),
-            crate::solver::outer_strategy::OuterHessianMaterialization::Unavailable
+            crate::solver::rho_optimizer::OuterHessianMaterialization::Unavailable
         ),
         "#740 operator must advertise Unavailable materialization to stay matrix-free"
     );
 
     let materialized =
-        crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator).unwrap();
+        crate::solver::rho_optimizer::OuterHessianOperator::materialize_dense(&operator).unwrap();
 
     // CONTROL: the SAME operator built WITHOUT the hook (ψψ block filled from
     // the per-pair ext_coord_pair_fn tables) must already match the dense

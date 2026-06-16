@@ -17,10 +17,10 @@
 //! host-side admission logic and struct assembly.
 
 #[cfg(target_os = "linux")]
-use super::FIXED_STABILIZATION_RIDGE;
+use crate::solver::pirls::FIXED_STABILIZATION_RIDGE;
 #[cfg(target_os = "linux")]
-use super::loop_driver::make_reparam_operator;
-use super::{
+use crate::solver::pirls::loop_driver::make_reparam_operator;
+use crate::solver::pirls::{
     GaussianFixedCache, LinearInequalityConstraints, PirlsConfig, PirlsCoordinateFrame,
     PirlsPenalty, PirlsResult, WorkingModelPirlsResult,
 };
@@ -43,7 +43,7 @@ use std::sync::Arc;
 /// `materialize_reparam` is called lazily — only when every gating condition
 /// is satisfied — to produce the `ReparamResult` the GPU input needs.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-pub(super) fn try_gaussian_pls_gpu<F>(
+pub(crate) fn try_gaussian_pls_gpu<F>(
     link_function: LinkFunction,
     config: &PirlsConfig,
     penalty_coefficient_lower_bounds: Option<&Array1<f64>>,
@@ -143,7 +143,7 @@ where
 /// `materialize_reparam` is called lazily — only when the admission shim
 /// confirms the fit is eligible.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-pub(super) fn try_pirls_loop_gpu<F>(
+pub(crate) fn try_pirls_loop_gpu<F>(
     config: &PirlsConfig,
     penalty_active: &PirlsPenalty,
     kronecker_runtime_is_none: bool,
@@ -165,7 +165,7 @@ where
     F: FnOnce() -> Result<ReparamResult, EstimationError>,
 {
     #[cfg(target_os = "linux")]
-    use super::HessianCurvatureKind;
+    use crate::solver::pirls::HessianCurvatureKind;
     #[cfg(target_os = "linux")]
     {
         use crate::solver::gpu::pirls_dispatch_wire::{

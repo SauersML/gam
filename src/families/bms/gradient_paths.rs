@@ -1597,24 +1597,40 @@ pub(super) fn rigid_standard_normal_row_kernel(
 }
 
 /// Mixed `(primary, z)` second derivative of the rigid standard-normal row
-/// negative log-likelihood: the per-row 2-vector
-/// `[∂²ℓ/∂q∂z, ∂²ℓ/∂g∂z]` in the primary coordinates `(q = marginal η,
+/// LOG-LIKELIHOOD score: the per-row 2-vector
+/// `[∂²(log L)/∂q∂z, ∂²(log L)/∂g∂z]` in the primary coordinates `(q = marginal η,
 /// g = slope)`, evaluated at this row's converged `(q, g)` and calibrated
 /// latent score `z = ζ`.
 ///
+/// SIGN CONVENTION (#1131). This returns the mixed partial of the
+/// LOG-LIKELIHOOD score `score_β,i = ∂(log L_i)/∂β`, NOT of the negative
+/// log-likelihood `ℓ = −log L`. Concretely the row jet evaluates the NLL
+/// `ℓ = −w·log Φ(sign·η)` and we NEGATE its mixed `(primary, z)` Hessian entries,
+/// so the returned 2-vector is `+∂²(log L_i)/∂(q,g)∂ζ_i = −∂²ℓ_i/∂(q,g)∂ζ_i`.
+/// This is the convention under which the Murphy–Topel chain
+/// `G = Σ_i s_i·(∂ζ_i/∂θ₁)` with `s_i = ∂score_β,i/∂ζ_i` and `Vb = H_β⁻¹`
+/// (the NLL-Hessian inverse) gives the SIGNED sensitivity with the right sign:
+/// the implicit-function theorem on the stationarity `∂(log L)/∂β = 0` yields
+/// `∂β̂/∂θ₁ = −(∂²log L/∂β²)⁻¹·∂²(log L)/∂β∂θ₁ = +H_β⁻¹·G = +Vb·G`. (Had we
+/// returned the NLL mixed partial instead, `Vb·G` would equal `−∂β̂/∂θ₁` — a
+/// benign sign flip for the PSD quadratic SE `(Vb·G)V₁(Vb·G)ᵀ`, but wrong for
+/// any signed consumer of the sensitivity.)
+///
 /// This is the #1028 Murphy–Topel generated-regressor channel: `score_β,i =
-/// ∂ℓ_i/∂β = J_iᵀ·(∂ℓ_i/∂(q,g))`, so the per-row slope-score sensitivity to the
-/// calibrated score is `s_i = ∂score_β,i/∂ζ_i = J_iᵀ·(∂²ℓ_i/∂(q,g)∂ζ_i)`, and the
-/// primary 2-vector returned here is exactly `∂²ℓ_i/∂(q,g)∂ζ_i`. The block-level
+/// ∂(log L_i)/∂β = J_iᵀ·(∂(log L_i)/∂(q,g))`, so the per-row slope-score
+/// sensitivity to the calibrated score is
+/// `s_i = ∂score_β,i/∂ζ_i = J_iᵀ·(∂²(log L_i)/∂(q,g)∂ζ_i)`, and the primary
+/// 2-vector returned here is exactly `∂²(log L_i)/∂(q,g)∂ζ_i`. The block-level
 /// contraction `J_iᵀ` (marginal+logslope design rows) is applied by the caller.
 ///
 /// It is computed by seeding `z` as a THIRD jet variable (index 2) in the SAME
 /// `Tower4` the value/gradient/Hessian path uses (#932 row-jet machinery): the
 /// rigid standard-normal observed index is `η = q·c(g) + g·(s·z)` with
 /// `c(g) = √(1 + (s·g)²)`, `s = probit_scale`, and `ℓ = −w·log Φ(sign·η)`. The
-/// converged-frame mixed partials are then the off-diagonal Hessian entries
-/// `tower.h[q][z]` and `tower.h[g][z]`, read off in one composition — the only
-/// extra cost over the production `Tower4<2>` evaluation is the third jet axis.
+/// converged-frame mixed partials of the NLL are the off-diagonal Hessian
+/// entries `tower.h[q][z]` and `tower.h[g][z]`, read off in one composition and
+/// NEGATED to the log-likelihood-score convention — the only extra cost over the
+/// production `Tower4<2>` evaluation is the third jet axis.
 #[inline]
 pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
     marginal: BernoulliMarginalLinkMap,
@@ -1654,11 +1670,17 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
         ));
     }
     let tower = signed.compose_unary(stack);
-    let s_q = tower.h[0][2];
-    let s_g = tower.h[1][2];
+    // #1131: `tower` is the NLL `ℓ = −w·log Φ`, so `tower.h[·][z]` is the mixed
+    // partial of the NLL. Negate to the LOG-LIKELIHOOD-score convention
+    // `s = ∂²(log L)/∂(primary)∂z = −∂²ℓ/∂(primary)∂z`, under which the
+    // downstream Murphy–Topel chain `Vb·G = +∂β̂/∂θ₁` carries the correct sign
+    // (see the function doc). The SE is the PSD quadratic `(Vb·G)V₁(Vb·G)ᵀ` and
+    // is invariant to this sign, so the reported standard errors are unchanged.
+    let s_q = -tower.h[0][2];
+    let s_g = -tower.h[1][2];
     if !(s_q.is_finite() && s_g.is_finite()) {
         return Err(format!(
-            "rigid probit mixed-z sensitivity: non-finite ∂²ℓ/∂(q,g)∂z = [{s_q}, {s_g}] at q={}, g={g}, z={z}",
+            "rigid probit mixed-z sensitivity: non-finite ∂²(log L)/∂(q,g)∂z = [{s_q}, {s_g}] at q={}, g={g}, z={z}",
             marginal.q
         ));
     }
@@ -1670,7 +1692,9 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
 /// the rigid standard-normal BMS kernel — the kernel the conditional
 /// location-scale gate ALWAYS selects (`LatentMeasureKind::StandardNormal`).
 ///
-/// For each row `i` the primary 2-vector `∂²ℓ_i/∂(q,g)∂ζ_i` is read off the
+/// where `s_i = ∂score_β,i/∂ζ_i` is the LOG-LIKELIHOOD-score sensitivity (see
+/// the sign convention in [`rigid_standard_normal_mixed_z_sensitivity`], #1131).
+/// For each row `i` the primary 2-vector `∂²(log L_i)/∂(q,g)∂ζ_i` is read off the
 /// z-augmented row jet ([`rigid_standard_normal_mixed_z_sensitivity`]) at the
 /// converged marginal index `q_i` (`marginal_eta[i]`) and slope `g_i`
 /// (`slope_eta[i]`) and calibrated score `ζ_i` (`z[i]`), then contracted through
@@ -1678,8 +1702,8 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
 /// row kernel exposes via `jacobian_transpose_action`):
 ///
 /// ```text
-///   s_i[marginal_range]  = (∂²ℓ_i/∂q∂ζ_i) · marginal_design.row(i)
-///   s_i[logslope_range]  = (∂²ℓ_i/∂g∂ζ_i) · logslope_design.row(i)
+///   s_i[marginal_range]  = (∂²(log L_i)/∂q∂ζ_i) · marginal_design.row(i)
+///   s_i[logslope_range]  = (∂²(log L_i)/∂g∂ζ_i) · logslope_design.row(i)
 /// ```
 ///
 /// `logslope_design` MUST be the reduced-basis design `G·T` actually fitted

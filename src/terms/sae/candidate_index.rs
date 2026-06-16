@@ -691,10 +691,13 @@ impl RecallReport {
 /// on the sum). Deterministic, no clock.
 #[inline]
 fn mix_seed(base: u64, idx: u64) -> u64 {
-    let mut z = base.wrapping_add(idx.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    // Finalize `base + idx·G` with the canonical SplitMix64 step. The stateful
+    // form adds G internally, so pre-subtract one G to land on the same input
+    // and keep the output bit-identical to the previous inlined finalizer.
+    let mut state = base
+        .wrapping_add(idx.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_sub(0x9E37_79B9_7F4A_7C15);
+    crate::linalg::utils::splitmix64(&mut state)
 }
 
 /// A seeded Gaussian random matrix of shape `(rows, cols)` (rows of hyperplanes
