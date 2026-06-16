@@ -34,7 +34,7 @@ use crate::solver::evidence::{
     HybridAtomCandidate, HybridAtomChoice, HybridSplitSelection, select_hybrid_split,
 };
 use crate::terms::latent_coord::LatentManifold;
-use crate::terms::sae_chart_canonicalization::d1_atom_fitted_turning;
+use crate::terms::sae::chart_canonicalization::d1_atom_fitted_turning;
 use crate::terms::sae_manifold::SaeManifoldAtom;
 
 /// The rank-aware Laplace negative-log-evidence of a reduced per-atom Gaussian

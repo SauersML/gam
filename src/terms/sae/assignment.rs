@@ -1135,7 +1135,7 @@ pub(crate) fn ibp_assignment_third_channels(
 /// lower wins, identical to the union/mixture rungs) on the same rows — and
 /// routes them through [`select_hybrid_atom`]. The curved candidate's fitted
 /// turning `Θ` (from
-/// [`crate::terms::sae_chart_canonicalization::d1_atom_fitted_turning`]) enters
+/// [`crate::terms::sae::chart_canonicalization::d1_atom_fitted_turning`]) enters
 /// as the decision feature: a `Θ → 0` atom yields to the cheaper linear tail by
 /// construction (the dominance floor — a curved atom buys nothing on a straight
 /// feature), a high-`Θ` atom takes the curved parameterization when its

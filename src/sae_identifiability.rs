@@ -55,7 +55,7 @@ use crate::inference::structure_evidence::{StructureCertificate, StructureLedger
 use crate::linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
-use crate::terms::sae_chart_canonicalization::CanonicalChartTopology;
+use crate::terms::sae::chart_canonicalization::CanonicalChartTopology;
 use crate::terms::sae_manifold::SaeManifoldTerm;
 use faer::Side;
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};

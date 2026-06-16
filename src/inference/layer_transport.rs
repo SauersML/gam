@@ -65,7 +65,7 @@ use crate::terms::basis::{
     create_basis, create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     periodic_bspline_first_derivative_nd,
 };
-use crate::terms::sae_chart_canonicalization::CanonicalChartTopology;
+use crate::terms::sae::chart_canonicalization::CanonicalChartTopology;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, Axis};
 use statrs::distribution::{ContinuousCDF, Normal};

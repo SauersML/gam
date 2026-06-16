@@ -2710,7 +2710,7 @@ pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) ->
 // The crossover is governed by the documented shatter law: a linear SAE shatters
 // a feature of total turning Θ into `N(ε) ≈ Θ/(2√(2ε))` rank-1 directions at
 // relative reconstruction error ε, so the curved advantage scales as `Θ/√ε`. We
-// use the fitted turning Θ (`sae_chart_canonicalization::d1_atom_fitted_turning`)
+// use the fitted turning Θ (`sae::chart_canonicalization::d1_atom_fitted_turning`)
 // as the decision FEATURE: it both (a) sharpens the evidence comparison into a
 // falsifiable per-atom prediction and (b) provides the exact-zero dominance
 // guard — when an atom's fitted turning is identically zero, the curved fit has

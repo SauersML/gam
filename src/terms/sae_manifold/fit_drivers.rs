@@ -260,7 +260,7 @@ impl SaeManifoldTerm {
     /// minimum-isometry-defect flow chart for `d = 2` torus atoms (#1019
     /// stage 2) — and the decoder is recomposed by exact least squares so the
     /// decoded image is unchanged
-    /// ([`crate::terms::sae_chart_canonicalization`]). Atoms whose basis
+    /// ([`crate::terms::sae::chart_canonicalization`]). Atoms whose basis
     /// cannot absorb the reparameterized image within the recomposition
     /// tolerance are left untouched (honest fallback, recorded by the flag
     /// staying `false`).
@@ -281,7 +281,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<(), String> {
-        use crate::terms::sae_chart_canonicalization::{
+        use crate::terms::sae::chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology,
         };
         /// Which canonical-representative construction applies to an atom:
@@ -388,7 +388,7 @@ impl SaeManifoldTerm {
                 .copied()
                 .flatten()
                 .map_or_else(|| "unavailable".to_string(), |d| format!("{d:.6e}"));
-            match crate::terms::sae_chart_canonicalization::d1_atom_fitted_turning(
+            match crate::terms::sae::chart_canonicalization::d1_atom_fitted_turning(
                 evaluator.as_ref(),
                 atom.decoder_coefficients.view(),
                 row_coords,
@@ -507,9 +507,9 @@ impl SaeManifoldTerm {
     pub(crate) fn canonicalize_atom_unit_speed_chart(
         &mut self,
         atom_idx: usize,
-        topology: &crate::terms::sae_chart_canonicalization::CanonicalChartTopology,
+        topology: &crate::terms::sae::chart_canonicalization::CanonicalChartTopology,
     ) -> Result<bool, String> {
-        use crate::terms::sae_chart_canonicalization::{
+        use crate::terms::sae::chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, unit_speed_reparameterization,
         };
         let n = self.n_obs();
@@ -605,7 +605,7 @@ impl SaeManifoldTerm {
         atom_idx: usize,
         period: f64,
     ) -> Result<bool, String> {
-        use crate::terms::sae_chart_canonicalization::{
+        use crate::terms::sae::chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, torus_isometry_flow_reparameterization,
         };
         let n = self.n_obs();
@@ -692,7 +692,7 @@ impl SaeManifoldTerm {
         &mut self,
         atom_idx: usize,
     ) -> Result<bool, String> {
-        use crate::terms::sae_chart_canonicalization::{
+        use crate::terms::sae::chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, patch_isometry_flow_reparameterization,
         };
         let n = self.n_obs();
@@ -778,7 +778,7 @@ impl SaeManifoldTerm {
         &mut self,
         atom_idx: usize,
     ) -> Result<bool, String> {
-        use crate::terms::sae_chart_canonicalization::{
+        use crate::terms::sae::chart_canonicalization::{
             CHART_RECOMPOSITION_REL_TOL, sphere_isometry_flow_reparameterization,
         };
         let n = self.n_obs();

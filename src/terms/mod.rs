@@ -14,7 +14,6 @@ pub mod hull;
 pub mod input_loc_derivatives;
 pub mod latent_coord;
 pub mod linear_dictionary;
-pub mod matern_gradient;
 pub mod penalty_op;
 pub mod sae;
 pub mod sae_corpus;
@@ -55,7 +54,7 @@ pub use latent_coord::{
 pub use linear_dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryFit, fit_linear_dictionary,
 };
-pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
+pub use basis::matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
 pub use sae::criterion_atoms::{SaeCriterion, SaeCriterionAtom};
 pub use sae_encode_atlas::{
     AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
