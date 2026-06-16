@@ -187,6 +187,52 @@ gamfit.fit(df,
     "y ~ age + bounded(prop, min=0, max=1, target=0.5, strength=3)")
 ```
 
+Shape-constrained smooths. A smooth can be required to be monotone or
+convex/concave:
+
+```python
+gamfit.fit(df, "y ~ s(dose, shape=monotone_increasing)")
+gamfit.fit(df, "y ~ s(x, shape=convex)")
+```
+
+Difference smooths. `by=` factor smooths fit one curve per group, and
+`model.difference_smooth(...)` returns the covariance-aware contrast
+between two groups (with an optional simultaneous band):
+
+```python
+model = gamfit.fit(df, "y ~ s(x, by=group)")
+diff = model.difference_smooth(data=df, group="group", view="x",
+                               simultaneous=True)
+```
+
+Dispersion (location-scale) GAMLSS. A second formula models the scale /
+variance for Gamma, Beta, negative-binomial, and Tweedie:
+
+```python
+gamfit.fit(df, "y ~ s(x)", family="gamma", noise_formula="s(x)")
+```
+
+Conformal prediction intervals. `interval="conformal"` gives
+distribution-free jackknife+ bands (Gaussian-identity); other families
+use split conformal via `predict_conformal`:
+
+```python
+model.predict(test, interval="conformal", conformal_level=0.9)
+```
+
+Competing-risks survival. `competing_risks_cif(...)` and
+`CompetingRisksPrediction` evaluate cause-specific cumulative-incidence
+functions.
+
+Response geometry. `ResponseGeometryModel` fits GAMs for responses that
+live on the sphere or simplex via Fréchet-mean tangent-space maps
+(`sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`,
+`closure`).
+
+PyTorch bridge. Differentiable REML primitives, smooth-basis layers, and
+frozen fitted-model modules are available under `gamfit.torch` and
+`gamfit.kernels` when `torch` is installed.
+
 scikit-learn wrappers:
 
 ```python
