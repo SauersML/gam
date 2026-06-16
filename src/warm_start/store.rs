@@ -5,9 +5,9 @@
 //! crash mid-write never leaves a half-written entry visible to readers.
 //! Per-entry SHA-256 checksums catch any residual corruption.
 //!
-//! See [`crate::cache`] for the public API summary.
+//! See [`crate::warm_start`] for the public API summary.
 
-use crate::cache::key::Fingerprint;
+use crate::warm_start::key::Fingerprint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

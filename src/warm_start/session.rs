@@ -3,8 +3,8 @@
 //! call. One session corresponds to one in-flight fit; periodic checkpoints
 //! overwrite a single run-id slot so we don't accumulate one entry per write.
 
-use crate::cache::key::Fingerprint;
-use crate::cache::store::{CachedEntry, EntryKind, WarmStartStore};
+use crate::warm_start::key::Fingerprint;
+use crate::warm_start::store::{CachedEntry, EntryKind, WarmStartStore};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -232,8 +232,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::key::Fingerprinter;
-    use crate::cache::store::StoreOptions;
+    use crate::warm_start::key::Fingerprinter;
+    use crate::warm_start::store::StoreOptions;
 
     fn temp_session(label: &str) -> (tempfile::TempDir, Session) {
         let dir = tempfile::tempdir().unwrap();

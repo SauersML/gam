@@ -20,7 +20,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 use faer::sparse::{SparseColMat, Triplet};
-use gam::linalg::sparse_exact::assemble_and_factor_sparse_penalized_system;
+use gam::pirls::assemble_and_factor_sparse_penalized_system;
 
 const N: usize = 10_000;
 const SEED: u64 = 0xC0FFEE_5EED_1234;
