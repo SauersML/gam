@@ -711,7 +711,7 @@ impl UnifiedOuterHessianOperator {
     }
 }
 
-impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessianOperator {
+impl crate::solver::rho_optimizer::OuterHessianOperator for UnifiedOuterHessianOperator {
     fn dim(&self) -> usize {
         self.coords.len()
     }

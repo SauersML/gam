@@ -164,7 +164,7 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// other families that ship a directional outer-HVP operator.
     fn family_outer_hessian_operator(
         &self,
-    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
         None
     }
 }

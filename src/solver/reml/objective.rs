@@ -2155,7 +2155,7 @@ impl<'a> RemlState<'a> {
             } else {
                 Some(hybrid.psi_indices)
             };
-            crate::solver::outer_strategy::EfsEval {
+            crate::solver::rho_optimizer::EfsEval {
                 cost: efs_cost,
                 steps: hybrid.steps,
                 beta: Some(beta_for_barrier),
@@ -2178,7 +2178,7 @@ impl<'a> RemlState<'a> {
                 bundle.pirls_result.relative_gradient_norm(),
             );
             self.record_efs_single_loop_bias(rho, diagnostics)?;
-            crate::solver::outer_strategy::EfsEval {
+            crate::solver::rho_optimizer::EfsEval {
                 cost: efs_cost,
                 steps,
                 beta: Some(beta_for_barrier),
@@ -2367,7 +2367,7 @@ impl<'a> RemlState<'a> {
     pub fn compute_efs_steps(
         &self,
         p: &Array1<f64>,
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         if self.large_n_efs_single_loop_lane() {
             self.cache_manager.invalidate_eval_bundle();
             let previous_cap = self
@@ -2385,7 +2385,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn compute_efs_steps_inner(
         &self,
         p: &Array1<f64>,
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -2408,7 +2408,7 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         if self.large_n_efs_single_loop_lane() {
             self.cache_manager.invalidate_eval_bundle();
             let previous_cap = self
@@ -2426,7 +2426,7 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         let bundle = match self.obtain_eval_bundle(rho) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -2559,7 +2559,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<(f64, Array1<f64>), EstimationError> {
         let eval = self.compute_outer_eval_with_order(
             p,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
         )?;
         Ok((eval.cost, eval.gradient))
     }
@@ -2567,14 +2567,14 @@ impl<'a> RemlState<'a> {
     pub fn compute_outer_eval_with_order(
         &self,
         p: &Array1<f64>,
-        order: crate::solver::outer_strategy::OuterEvalOrder,
+        order: crate::solver::rho_optimizer::OuterEvalOrder,
     ) -> Result<OuterEval, EstimationError> {
         self.arena
             .lastgradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
         let allow_second_order = matches!(
             order,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
         ) && self.analytic_outer_hessian_enabled();
         let t_eval_start = std::time::Instant::now();
         {
@@ -2632,7 +2632,7 @@ impl<'a> RemlState<'a> {
         // probes / pre-warm), and surface the warmed β so the continuation walk's
         // `inner_beta_hint` forwarding is unchanged. ValueAndGradient and
         // ValueGradientHessian are byte-identical to before.
-        if matches!(order, crate::solver::outer_strategy::OuterEvalOrder::Value) {
+        if matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::Value) {
             let t_assemble = std::time::Instant::now();
             let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
                 self.evaluate_unified_sparse(p, &bundle, super::unified::EvalMode::ValueOnly)?
@@ -2672,9 +2672,9 @@ impl<'a> RemlState<'a> {
             // Value+gradient: this evaluator's assembly contract requires a
             // gradient (see the `result.gradient` demand below), so fulfil it as
             // value+gradient with the Hessian skipped.
-            crate::solver::outer_strategy::OuterEvalOrder::Value
-            | crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => None,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
+            crate::solver::rho_optimizer::OuterEvalOrder::Value
+            | crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => None,
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian => {
                 if allow_second_order {
                     Some(self.selecthessian_strategy_policy(&bundle))
                 } else {
@@ -2958,7 +2958,7 @@ impl<'a> RemlState<'a> {
     pub fn compute_efs_steps_with_link_ext(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         self.reject_firth_link_ext()?;
         let bundle = self.obtain_eval_bundle(rho)?;
         let mut ext_coords = self.build_link_ext_coords(&bundle)?;
@@ -2983,7 +2983,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         ext_coords: Vec<super::unified::HyperCoord>,
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         let mut assembly =
             self.build_auto_assembly(rho, bundle, super::unified::EvalMode::ValueOnly)?;
         assembly.tk_gradient = None;

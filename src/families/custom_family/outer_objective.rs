@@ -9775,7 +9775,7 @@ pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
 }
 
 pub(crate) fn outer_efs_result_to_joint_hyper_efs_result(
-    efs_eval: crate::solver::outer_strategy::EfsEval,
+    efs_eval: crate::solver::rho_optimizer::EfsEval,
     warm_start: ConstrainedWarmStart,
     inner_converged: bool,
 ) -> CustomFamilyJointHyperEfsResult {

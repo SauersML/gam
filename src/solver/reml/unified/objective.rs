@@ -371,7 +371,7 @@ pub fn reml_laml_evaluate(
             ift_residual_energy,
             inner_polish_step,
             gradient: None,
-            hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+            hessian: crate::solver::rho_optimizer::HessianResult::Unavailable,
             rho_mode_response_cols: None,
             ext_mode_response_cols: None,
         });

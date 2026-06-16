@@ -90,7 +90,7 @@ pub(crate) fn outer_hessian_dense_workspace_bytes(p: usize, k: usize) -> usize {
 }
 
 pub(crate) fn outer_hessian_dense_workspace_budget_bytes() -> usize {
-    crate::resource::ResourcePolicy::default_library().max_single_materialization_bytes
+    crate::solver::resource::ResourcePolicy::default_library().max_single_materialization_bytes
 }
 
 pub(crate) fn dense_outer_hessian_workspace_fits(p: usize, k: usize) -> bool {

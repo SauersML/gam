@@ -1776,7 +1776,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     }
                     Ok(eval.efs_eval)
                 },
-                |_beta: &Array1<f64>| Ok(crate::solver::outer_strategy::SeedOutcome::NoSlot),
+                |_beta: &Array1<f64>| Ok(crate::solver::rho_optimizer::SeedOutcome::NoSlot),
             )
         }};
     }
@@ -2771,7 +2771,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             Array1<f64>,
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
+            crate::solver::rho_optimizer::HessianResult,
             crate::custom_family::CustomFamilyWarmStart,
         )>,
     }
@@ -2895,7 +2895,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     };
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{
+    use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
     };
 
@@ -2914,7 +2914,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
     }
-    let problem = crate::solver::outer_strategy::OuterProblem::new(theta_dim)
+    let problem = crate::solver::rho_optimizer::OuterProblem::new(theta_dim)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
             DeclaredHessianForm::Either
@@ -2947,8 +2947,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             && (!matches!(order, OuterEvalOrder::ValueGradientHessian)
                 || matches!(
                     cached_hess,
-                    crate::solver::outer_strategy::HessianResult::Analytic(_)
-                        | crate::solver::outer_strategy::HessianResult::Operator(_)
+                    crate::solver::rho_optimizer::HessianResult::Analytic(_)
+                        | crate::solver::rho_optimizer::HessianResult::Operator(_)
                 ))
         {
             state.warm_cache = Some(cached_warm.clone());

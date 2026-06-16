@@ -228,7 +228,7 @@ pub(crate) fn exact_tau_tau_hessian_policy_with_firth(
             n_obs,
             p_coeff,
             implicit_n_axes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &crate::solver::resource::ResourcePolicy::default_library(),
         );
     let dense_first_order_count = hyper_dirs
         .iter()
@@ -2770,7 +2770,7 @@ pub(crate) struct ImplicitDerivativeOp {
     /// called concurrently from inside another rayon par_iter — racing workers
     /// would park on the OnceLock's OS condvar, leaving the leader's nested
     /// par_iter without workers. `RayonSafeOnce` runs init lock-free.
-    pub(crate) cached_dense: std::sync::Arc<crate::resource::RayonSafeOnce<Array2<f64>>>,
+    pub(crate) cached_dense: std::sync::Arc<crate::solver::resource::RayonSafeOnce<Array2<f64>>>,
 }
 
 #[derive(Clone)]
@@ -2779,7 +2779,7 @@ pub(crate) struct LatentCoordDerivativeOp {
     pub(crate) flat_axis: usize,
     pub(crate) global_range: Range<usize>,
     pub(crate) total_dim: usize,
-    pub(crate) cached_dense: std::sync::Arc<crate::resource::RayonSafeOnce<Array2<f64>>>,
+    pub(crate) cached_dense: std::sync::Arc<crate::solver::resource::RayonSafeOnce<Array2<f64>>>,
 }
 
 impl LatentCoordDerivativeOp {
@@ -3452,7 +3452,7 @@ impl HyperDesignDerivative {
                 level,
                 global_range,
                 total_dim: total_cols,
-                cached_dense: std::sync::Arc::new(crate::resource::RayonSafeOnce::new()),
+                cached_dense: std::sync::Arc::new(crate::solver::resource::RayonSafeOnce::new()),
             }),
         }
     }
@@ -3469,7 +3469,7 @@ impl HyperDesignDerivative {
                 flat_axis,
                 global_range,
                 total_dim: total_cols,
-                cached_dense: std::sync::Arc::new(crate::resource::RayonSafeOnce::new()),
+                cached_dense: std::sync::Arc::new(crate::solver::resource::RayonSafeOnce::new()),
             }),
         }
     }

@@ -1224,7 +1224,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
                         gradient,
-                        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                        outer_hessian: crate::solver::rho_optimizer::HessianResult::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
                     });
@@ -1623,7 +1623,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
                         gradient,
-                        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                        outer_hessian: crate::solver::rho_optimizer::HessianResult::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
                     });
@@ -2171,7 +2171,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<
     (
-        crate::solver::outer_strategy::EfsEval,
+        crate::solver::rho_optimizer::EfsEval,
         ConstrainedWarmStart,
         bool,
     ),
