@@ -1388,6 +1388,129 @@ mod tests {
         );
     }
 
+    /// DELIVERABLE (2) — the ρ̂-variation **factor** entry point
+    /// [`lawley_lr_bartlett_factor_with_rho_variation`] is the single-call
+    /// `c = 1 + Δε(ρ̂)/d` reduction a live consumer wires symmetrically with the
+    /// fixed-λ [`lawley_lr_bartlett_factor`]. This pins:
+    ///   (i)   it equals `1 + (total ρ̂-variation shift)/d`, i.e. it folds the
+    ///         estimated-λ correction into the factor (not just the conditional
+    ///         fixed-λ shift);
+    ///   (ii)  on a Poisson/log smooth with a non-zero curvature and a positive
+    ///         `Var(ρ̂)`, the estimated-λ factor differs from the fixed-λ factor —
+    ///         the ρ̂-variation contribution is load-bearing in the factor;
+    ///   (iii) Gaussian known-variance (Δε ≡ 0, zero ρ-curvature) gives factor 1
+    ///         at any `Cov(ρ̂)` — the closed-form anchor;
+    ///   (iv)  a degenerate reference df is rejected.
+    #[test]
+    fn rho_variation_factor_folds_estimated_lambda_into_c() {
+        // Poisson/log smooth substrate with a non-zero ε and a single smoothing
+        // parameter on the second column.
+        let n = 50usize;
+        let mut x = Array2::<f64>::ones((n, 2));
+        let mut kappas = Vec::with_capacity(n);
+        for i in 0..n {
+            let z = i as f64 / n as f64 - 0.5;
+            x[[i, 1]] = z;
+            let eta = 0.3 + 0.6 * z;
+            kappas.push(
+                RowExpectedJets::poisson_log(eta)
+                    .kappas()
+                    .expect("poisson kappas"),
+            );
+        }
+        let lambda = 3.0_f64;
+        let mut s_comp = Array2::<f64>::zeros((2, 2));
+        s_comp[[1, 1]] = lambda;
+        let penalty = s_comp.clone();
+        let components = vec![RhoPenaltyComponent {
+            s_component: s_comp,
+        }];
+        let tested = 1..2;
+        let ref_df = 1.0_f64;
+        let var_rho = 0.8_f64;
+        let rho_cov = Array2::from_shape_vec((1, 1), vec![var_rho]).unwrap();
+
+        // (i) factor = 1 + (total estimated-λ shift)/d.
+        let total = lawley_lr_mean_shift_with_rho_variation(
+            x.view(),
+            &kappas,
+            penalty.view(),
+            tested.clone(),
+            &components,
+            rho_cov.view(),
+        )
+        .expect("total shift");
+        let factor = lawley_lr_bartlett_factor_with_rho_variation(
+            x.view(),
+            &kappas,
+            penalty.view(),
+            tested.clone(),
+            &components,
+            rho_cov.view(),
+            ref_df,
+        )
+        .expect("estimated-λ factor");
+        assert!(
+            (factor - (1.0 + total / ref_df)).abs() < 1e-12,
+            "estimated-λ factor {factor} must equal 1 + Δε(ρ̂)/d = {}",
+            1.0 + total / ref_df
+        );
+
+        // (ii) it differs from the fixed-λ (conditional) factor — the
+        // ρ̂-variation term is load-bearing in c.
+        let conditional_factor = lawley_lr_bartlett_factor(
+            x.view(),
+            &kappas,
+            Some(penalty.view()),
+            tested.clone(),
+            ref_df,
+        )
+        .expect("conditional factor");
+        assert!(
+            (factor - conditional_factor).abs() > 1e-9,
+            "estimated-λ factor {factor} must differ from the fixed-λ factor \
+             {conditional_factor} (ρ̂-variation is load-bearing)"
+        );
+
+        // (iii) Gaussian anchor: Δε ≡ 0 ⇒ zero curvature ⇒ factor exactly 1 at any
+        // Cov(ρ̂).
+        let g_kappas = vec![
+            RowExpectedJets::gaussian_identity(1.3)
+                .kappas()
+                .expect("gaussian kappas");
+            n
+        ];
+        let big_cov = Array2::from_shape_vec((1, 1), vec![5.0]).unwrap();
+        let g_factor = lawley_lr_bartlett_factor_with_rho_variation(
+            x.view(),
+            &g_kappas,
+            penalty.view(),
+            tested.clone(),
+            &components,
+            big_cov.view(),
+            ref_df,
+        )
+        .expect("gaussian factor");
+        assert!(
+            (g_factor - 1.0).abs() < 1e-12,
+            "Gaussian known-variance estimated-λ factor must be exactly 1; got {g_factor}"
+        );
+
+        // (iv) degenerate reference df is rejected.
+        assert!(
+            lawley_lr_bartlett_factor_with_rho_variation(
+                x.view(),
+                &kappas,
+                penalty.view(),
+                tested.clone(),
+                &components,
+                rho_cov.view(),
+                0.0,
+            )
+            .is_err()
+        );
+    }
+
     /// DELIVERABLE (2), ρ̂-variation cross terms — for two smoothing parameters
     /// the correction is `½ Σ_{b,b'} H_{bb'} Cov_{bb'}`, and the off-diagonal
     /// (mixed-partial) stencil must match an independent product-of-steps FD.
