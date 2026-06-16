@@ -2191,6 +2191,60 @@ mod tests {
                 panic!("numeric dictionary column was decoded as strings");
             }
         }
+
+        // End-to-end: write a real parquet file whose only column is the
+        // dictionary-encoded numeric one, then load it both ways. This is the
+        // exact repro from #1162 (pyarrow's default dictionary encoding of a
+        // low-cardinality numeric column).
+        use arrow::datatypes::{Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            dict.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(dict.clone())])
+            .expect("record batch with a dictionary numeric column");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dict_numeric.parquet");
+        {
+            let file = std::fs::File::create(&path).expect("create parquet");
+            let mut writer = ArrowWriter::try_new(file, arrow_schema, None)
+                .expect("arrow parquet writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+
+        // Inferred load: the column must be Continuous (5 and 7 are not 0/1),
+        // never Categorical.
+        let inferred = load_parquet_inferred(&path, &[]).expect("inferred parquet load");
+        assert_eq!(inferred.column_kinds, vec![ColumnKindTag::Continuous]);
+        assert_eq!(
+            inferred.values.column(0).to_vec(),
+            vec![5.0, 7.0, 5.0, 7.0, 5.0]
+        );
+
+        // Schema-driven load with the column declared Continuous (as it would be
+        // after training on CSV / non-dictionary parquet) must NOT raise the
+        // SchemaMismatch that #1162 reported on valid numeric data.
+        let schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "x".to_string(),
+                kind: ColumnKindTag::Continuous,
+                levels: Vec::new(),
+            }],
+        };
+        let schema_loaded =
+            load_parquet_with_schema(&path, &schema, UnseenCategoryPolicy::Error, &[])
+                .expect("dictionary-encoded numeric parquet must load against a Continuous schema");
+        assert_eq!(schema_loaded.column_kinds, vec![ColumnKindTag::Continuous]);
+        assert_eq!(
+            schema_loaded.values.column(0).to_vec(),
+            vec![5.0, 7.0, 5.0, 7.0, 5.0]
+        );
     }
 
     #[test]
