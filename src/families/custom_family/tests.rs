@@ -4714,64 +4714,126 @@ pub(crate) fn joint_feasibility_alpha_gate_discriminates_healthy_from_crush() {
 
 /// gam#979 (per-block exact-Newton arm; the bernoulli marginal-slope binary
 /// path). The per-block left-hand side is `lhs = H_data + S` with `S ⪰ 0` an
-/// over-smoothed block penalty. The plain
-/// [`exact_newton_stabilizing_shift`] Gershgorins the *penalized* matrix and,
-/// because `S`'s large off-diagonals are balanced by equally large diagonals,
-/// reads a spurious huge-negative `λ_min` → adds a giant ridge → collapses
-/// every per-block Newton step (the survival-hang fingerprint). The
-/// PSD-penalized variant
-/// [`stabilize_exact_newton_penalized_lhs_in_place`] must bound the shift by
-/// the DATA Hessian's curvature instead, leaving the step well-scaled.
+/// over-smoothed block penalty. A naive Gershgorin bound on the *penalized*
+/// matrix `lhs` (computed inline below) reads a spurious huge-negative `λ_min`
+/// because `S`'s large off-diagonals are balanced by equally large diagonals →
+/// adds a giant ridge → collapses every per-block Newton step (the survival-hang
+/// fingerprint). The PSD-penalized variant
+/// [`stabilize_exact_newton_penalized_lhs_in_place`] must bound the shift by the
+/// DATA Hessian's curvature (`exact_newton_stabilizing_shift_psd_penalized`)
+/// instead, leaving the step well-scaled.
 #[test]
 pub(crate) fn per_block_penalized_shift_stays_data_scaled_under_oversmoothed_penalty() {
-    // Data Hessian: well-conditioned, modest curvature (the bernoulli IRLS
-    // block Hessian X'WX is PSD; perturb the diagonal so the 0-shift Cholesky
-    // path still needs a tiny lift, forcing the shift branch to fire).
-    let h_data = array![[1.0_f64, 0.05, 0.0], [0.05, 1.0, 0.05], [0.0, 0.05, 1.0],];
+    // Data Hessian with one NEGATIVE eigenvalue along (1,−1,0) (the concave
+    // entry-survival term makes the per-block data Hessian indefinite away from
+    // the optimum). Crucially that negative direction lies in `ker(S)` of the
+    // over-smoothed penalty below, so the penalty does NOT lift it — the
+    // penalized matrix `lhs` stays genuinely indefinite, the no-shift Cholesky
+    // FAILS, and the shift branch (with its Gershgorin bound) actually runs. On
+    // a PD matrix the shared fast path returns `None` before Gershgorin is ever
+    // consulted, which is exactly why the bug only bites an indefinite cycle.
+    //
+    // `h_data = I − 1.4·(1,−1,0)(1,−1,0)ᵀ/2`: eigenvalue 1 − 1.4 = −0.4 along
+    // (1,−1,0)/√2, +1.0 on the orthogonal complement (curvature scale ≈ 1).
+    let h_data = array![
+        [1.0 - 0.7, 0.7, 0.0],
+        [0.7, 1.0 - 0.7, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
 
-    // Heavily over-smoothed PSD penalty: a large smoothness penalty
-    // `λ · (D'D)` with `λ ≈ 1e7`. Its first/second-difference structure has
-    // large off-diagonals that are exactly balanced by the diagonal — the
-    // assembled matrix is PSD (λ_min = 0) but per-row `diag − radius` is hugely
-    // negative. This is the exact shape that fooled plain Gershgorin.
+    // Heavily over-smoothed PSD penalty: a rank-1 `λ·vvᵀ` with `v = (1,1,1)` and
+    // `λ ≈ 1e7`. It is PSD (single eigenvalue 3λ along (1,1,1); zero on the
+    // orthogonal complement, which CONTAINS the data's negative direction
+    // (1,−1,0)). Its large off-diagonals `λ·v_i v_j` are balanced by equally
+    // large diagonals `λ·v_i²`, so the matrix is exactly PSD — but the per-row
+    // Gershgorin `diag − radius = λ(v_i² − v_i·Σ_{j≠i}|v_j|) = λ(1 − 2) = −λ` is
+    // hugely negative. This is the exact shape that fools plain Gershgorin into
+    // reading a spurious ~−λ `λ_min` even though `S` adds NO indefiniteness.
     let lam = 1.0e7_f64;
-    // D'D for a first-difference operator on 3 nodes: tridiagonal [1,-1;-1,2,-1;-1,1].
-    let s = &array![[1.0_f64, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0],] * lam;
+    let s = &array![[1.0_f64, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0],] * lam;
 
     let lhs = &h_data + &s;
 
+    // Sanity: the penalized matrix is genuinely indefinite (Cholesky fails), so
+    // the shift branch runs rather than the PD fast path.
+    assert!(
+        lhs.cholesky(Side::Lower).is_err(),
+        "penalized lhs must stay indefinite along ker(S) ∋ (1,−1,0) so the shift branch engages"
+    );
+
     let ridge_floor = 1.0e-12_f64;
 
-    // Plain (buggy) shift: Gershgorin on the penalized matrix.
-    let plain_shift =
-        exact_newton_stabilizing_shift(&lhs, ridge_floor).expect("penalized lhs needs a shift");
+    // ── Naive penalized-Gershgorin shift (the bug) ──────────────────────────
+    // Gershgorin lower bound on the PENALIZED matrix `lhs = H_data + S`:
+    //   min_i (lhs_ii − Σ_{j≠i} |lhs_ij|).
+    // The over-smoothed `S` drives this hugely negative (~−2λ), so the lifting
+    // shift `floor − g` is ~λ-scale — the spurious ridge that froze the survival
+    // per-block Newton. We compute it directly here (rather than via the now
+    // deleted plain-Gershgorin wrapper) so the contrast is explicit and the
+    // test does not depend on the data-bounded fast path's Cholesky outcome.
+    let p = lhs.nrows();
+    let naive_gershgorin_min = (0..p)
+        .map(|i| {
+            let radius: f64 = (0..p).filter(|&j| j != i).map(|j| lhs[[i, j]].abs()).sum();
+            lhs[[i, i]] - radius
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        naive_gershgorin_min < -1.0e6,
+        "over-smoothed penalty must make the naive penalized-Gershgorin bound spuriously huge-negative; got {naive_gershgorin_min:.3e}"
+    );
+    let naive_shift = ridge_floor.max(1e-15) - naive_gershgorin_min;
+    assert!(
+        naive_shift > 1.0e6,
+        "naive penalized-Gershgorin shift should read the spurious ~λ ridge; got {naive_shift:.3e}",
+    );
 
-    // PSD-penalized shift: Gershgorin bounded by the data Hessian.
+    // ── PSD-penalized shift (the fix): Gershgorin bounded by the data Hessian.
     let psd_shift =
         exact_newton_stabilizing_shift_psd_penalized(&lhs, &h_data, ridge_floor).unwrap_or(0.0);
 
-    // The over-smoothed penalty drives the PLAIN shift to ~λ scale (~1e7);
-    // the PSD-penalized shift must stay O(data scale) (~O(1)).
-    assert!(
-        plain_shift > 1.0e6,
-        "plain Gershgorin on the penalized matrix should read the spurious ~λ ridge; got {plain_shift:.3e}",
-    );
+    // The data Hessian's most-negative eigenvalue is −0.4, so the data-bounded
+    // shift stays O(data scale) (a few units), NOT the ~1e7 penalty scale.
     assert!(
         psd_shift < 10.0,
         "PSD-penalized shift must stay O(data scale), NOT the ~{lam:.0e} penalty scale; got {psd_shift:.3e}",
     );
-    // Concretely: the data-bounded shift is at least 5 orders of magnitude
-    // smaller than the spurious one.
+    // And it must lift the genuine data indefiniteness (it is positive).
     assert!(
-        psd_shift * 1.0e5 < plain_shift,
-        "PSD-penalized shift ({psd_shift:.3e}) must be ≥1e5× smaller than the spurious plain shift ({plain_shift:.3e})",
+        psd_shift > 0.0,
+        "PSD-penalized shift must still lift the data Hessian's negative eigenvalue; got {psd_shift:.3e}"
+    );
+    // Concretely: the data-bounded shift is ≥ 5 orders of magnitude smaller than
+    // the spurious naive one.
+    assert!(
+        psd_shift * 1.0e5 < naive_shift,
+        "PSD-penalized shift ({psd_shift:.3e}) must be ≥1e5× smaller than the spurious naive shift ({naive_shift:.3e})",
     );
 
-    // And the resulting `lhs + psd_shift·I` is positive definite (the PD
-    // certificate the downstream block solve requires).
+    // And the shift restores positive (semi)definiteness: by Weyl,
+    // `λ_min(lhs + δI) ≥ λ_min(H_data) + δ ≥ λ_min(H_data) − gershgorin_min(H_data) ≥ 0`,
+    // because `λ_min(H_data) ≥ gershgorin_min(H_data)`. So the shift covers the
+    // data Hessian's most-negative eigenvalue. Verify the data-Gershgorin bound
+    // the shift is built from is at least as negative as `H_data`'s true λ_min,
+    // and that `lhs + (δ + margin)·I` is PD (the floor makes the borderline
+    // λ_min = 0 case strictly PD downstream; we add a tiny margin here so the
+    // numerical Cholesky is unambiguous).
+    let data_gershgorin_min = (0..p)
+        .map(|i| {
+            let radius: f64 = (0..p)
+                .filter(|&j| j != i)
+                .map(|j| h_data[[i, j]].abs())
+                .sum();
+            h_data[[i, i]] - radius
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        psd_shift >= -data_gershgorin_min - 1e-9,
+        "PSD-penalized shift ({psd_shift:.3e}) must cover the data-Gershgorin bound ({data_gershgorin_min:.3e})"
+    );
     let mut stabilized = lhs.clone();
     for d in 0..stabilized.nrows() {
-        stabilized[[d, d]] += psd_shift;
+        stabilized[[d, d]] += psd_shift + 1e-6;
     }
     assert!(
         stabilized.cholesky(Side::Lower).is_ok(),
