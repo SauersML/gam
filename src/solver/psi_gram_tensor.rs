@@ -879,12 +879,12 @@ mod tests {
             if psi - h <= psi_lo || psi + h >= psi_hi {
                 continue;
             }
-            let exact_h2 =
-                (exact_deviance(psi + h) - 2.0 * exact_deviance(psi) + exact_deviance(psi - h))
-                    / (h * h);
-            let fast_h2 =
-                (fast_deviance(psi + h) - 2.0 * fast_deviance(psi) + fast_deviance(psi - h))
-                    / (h * h);
+            let exact_h2 = (exact_deviance(psi + h) - 2.0 * exact_deviance(psi)
+                + exact_deviance(psi - h))
+                / (h * h);
+            let fast_h2 = (fast_deviance(psi + h) - 2.0 * fast_deviance(psi)
+                + fast_deviance(psi - h))
+                / (h * h);
             let rel = (exact_h2 - fast_h2).abs() / exact_h2.abs().max(1e-6);
             worst_hess_rel = worst_hess_rel.max(rel);
         }

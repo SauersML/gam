@@ -17,28 +17,26 @@
 //! exactly expressive enough to capture this, so a correct degree-reduced fit
 //! recovers the shape; the pre-fix path panics at term-build before fitting.
 
-use gam::smooth::build_term_collection_design;
 use gam::matrix::LinearOperator;
+use gam::smooth::build_term_collection_design;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
 
 /// Fit `formula` on (x, y) and return the predicted response on a dense grid
 /// spanning [x_min, x_max].
-fn fit_and_predict_on_grid(
-    formula: &str,
-    x: &[f64],
-    y: &[f64],
-    x_lo: f64,
-    x_hi: f64,
-) -> Vec<f64> {
+fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64], x_lo: f64, x_hi: f64) -> Vec<f64> {
     let n = x.len();
     let mut csv = String::from("x,y\n");
     for i in 0..n {
         csv.push_str(&format!("{:.17e},{:.17e}\n", x[i], y[i]));
     }
     let mut tmp = std::env::temp_dir();
-    tmp.push(format!("gam_univariate_small_k_{}_{}.csv", std::process::id(), n));
+    tmp.push(format!(
+        "gam_univariate_small_k_{}_{}.csv",
+        std::process::id(),
+        n
+    ));
     {
         let mut f = std::fs::File::create(&tmp).expect("create synthetic csv");
         f.write_all(csv.as_bytes()).expect("write synthetic csv");
@@ -49,8 +47,9 @@ fn fit_and_predict_on_grid(
     let x_idx = col["x"];
 
     let cfg = FitConfig::default(); // gaussian / identity / REML
-    let result = fit_from_formula(formula, &ds, &cfg)
-        .unwrap_or_else(|e| panic!("fit '{formula}' failed (small-k must degree-reduce, not reject): {e}"));
+    let result = fit_from_formula(formula, &ds, &cfg).unwrap_or_else(|e| {
+        panic!("fit '{formula}' failed (small-k must degree-reduce, not reject): {e}")
+    });
     let FitResult::Standard(fit) = result else {
         panic!("1-D gaussian smooth should be a Standard GAM fit");
     };
