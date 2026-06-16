@@ -1086,6 +1086,94 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     );
 }
 
+/// #1117 follow-up gate (a): the compact sparse co-assignment plan must ENGAGE
+/// on a curved (non-Euclidean) ext-coord manifold once the dense `K²` data Gram
+/// trips the in-core budget — exactly the manifold-SAE-on-OLMo regime (curved
+/// atoms + large `K`). Before the fix `sparse_active_plan` returned `None` for
+/// ANY curved atom regardless of `K`, forcing the dense `K²` coupling; the
+/// `is_euclidean()` guard is now removed and the budget is the sole gate.
+///
+/// We assert the engagement decision is identical for a curved (Circle) term and
+/// its Euclidean twin at the same `m_total`: (1) with a budget BELOW the dense
+/// Gram both engage the compact plan with the same `k_active_cap`; (2) with a
+/// huge budget both stay dense (`None`). The budget is pinned via
+/// `sparse_active_plan_for_budget` so no multi-GB Gram is allocated.
+#[test]
+pub(crate) fn sparse_plan_engages_on_curved_manifold_when_budget_tripped() {
+    // Build a `k`-atom IBP-MAP term with the given per-atom coordinate manifold.
+    // Each atom carries the width-3 periodic basis, so `m_total = 3·k`.
+    fn build_term(k: usize, curved: bool) -> SaeManifoldTerm {
+        let n = 4usize;
+        let coords: Array2<f64> = array![[0.12_f64], [0.37], [0.66], [0.91]];
+        let (phi, jet) = periodic_basis(&coords);
+        let atoms: Vec<SaeManifoldAtom> = (0..k)
+            .map(|j| {
+                SaeManifoldAtom::new(
+                    format!("atom_{j}"),
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    phi.clone(),
+                    jet.clone(),
+                    array![[0.20, -0.10], [-0.30, 0.25], [0.40, 0.15]],
+                    Array2::<f64>::eye(3),
+                )
+                .unwrap()
+                .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+            })
+            .collect();
+        let manifold = if curved {
+            LatentManifold::Circle { period: 1.0 }
+        } else {
+            LatentManifold::Euclidean
+        };
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, k)),
+            (0..k).map(|_| coords.clone()).collect(),
+            (0..k).map(|_| manifold.clone()).collect(),
+            AssignmentMode::ibp_map(0.7, 1.0, true),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(atoms, assignment).unwrap()
+    }
+
+    let k = 8usize;
+    let curved = build_term(k, true);
+    let euclidean = build_term(k, false);
+
+    // `m_total = 3·k`; dense Gram = (3k)² · 8 bytes. Pin a budget strictly below
+    // it so the plan must engage, and one far above it so it must not.
+    let m_total = 3 * k;
+    let dense_gram_bytes = m_total * m_total * std::mem::size_of::<f64>();
+    let small_budget = dense_gram_bytes / 2;
+    let huge_budget = dense_gram_bytes * 16;
+
+    let curved_engaged = curved.sparse_active_plan_for_budget(small_budget);
+    let euclid_engaged = euclidean.sparse_active_plan_for_budget(small_budget);
+    assert!(
+        curved_engaged.is_some(),
+        "curved-manifold term must engage the sparse plan once the dense K² Gram \
+         trips the budget (the #1117 follow-up lever) — got None"
+    );
+    assert_eq!(
+        curved_engaged, euclid_engaged,
+        "the sparse-plan engagement decision (k_active_cap + cutoff) must no longer \
+         depend on whether the ext-coord manifold is curved: curved={curved_engaged:?} \
+         euclidean={euclid_engaged:?}"
+    );
+
+    // Above the dense-Gram footprint, both stay on the exact dense layout.
+    assert_eq!(
+        curved.sparse_active_plan_for_budget(huge_budget),
+        None,
+        "a curved term whose dense Gram fits the budget must keep the dense layout"
+    );
+    assert_eq!(
+        euclidean.sparse_active_plan_for_budget(huge_budget),
+        None,
+        "a Euclidean term whose dense Gram fits the budget must keep the dense layout"
+    );
+}
+
 /// `snapshot_mutable_state` / `restore_mutable_state` (the in-place
 /// line-search save/restore that replaced the per-halving full
 /// `self.clone()`) must restore exactly the state an `apply_newton_step`

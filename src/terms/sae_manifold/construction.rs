@@ -1664,15 +1664,6 @@ impl SaeManifoldTerm {
     /// Returns `Some((k_active_cap, cutoff))` to engage sparsity, or `None` to
     /// keep the dense full-support layout.
     pub(crate) fn sparse_active_plan(&self) -> Option<(usize, f64)> {
-        // Relative magnitude cutoff: assignment mass below this fraction of the
-        // row's peak `|a_k|` enters the Gram only as `O(a²)` curvature and is
-        // dropped. Chosen so dropped terms are ~1e-6 of the peak self-coupling.
-        const RELATIVE_CUTOFF: f64 = 1.0e-3;
-
-        let k_atoms = self.k_atoms();
-        if k_atoms <= 1 {
-            return None;
-        }
         // The per-row Riemannian tangent projection for non-Euclidean atom
         // latents is now applied directly on the compact active-set rows (see
         // the `Some(layout)` arm in `assemble_arrow_schur`, via
@@ -1683,14 +1674,10 @@ impl SaeManifoldTerm {
         // torus / sphere atoms) — the affordability lever for manifold-SAE at
         // large `K`, where the dense `K²` co-assignment Gram is the cost. (The
         // former `is_euclidean()`-only restriction punted every curved atom to
-        // the dense layout; it is lifted.)
-        let p = self.output_dim();
-        let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
-        // Dense data Gram footprint: (m_total · m_total) f64.
-        let dense_gram_bytes = m_total
-            .saturating_mul(m_total)
-            .saturating_mul(SAE_BYTES_PER_F64);
-
+        // the dense layout; it is lifted.) The host/device in-core budget is the
+        // single gate now; it is parameterised in `sparse_active_plan_for_budget`
+        // so the engagement regression can pin a small budget without allocating
+        // a multi-GB dense Gram.
         let budget = match crate::gpu::runtime::GpuRuntime::global() {
             // Allow up to one quarter of the AGGREGATE device budget for the dense
             // Gram, matching the streaming dispatcher's in-core fraction. The
@@ -1707,6 +1694,31 @@ impl SaeManifoldTerm {
             }
             None => sae_host_in_core_budget_bytes().0,
         };
+        self.sparse_active_plan_for_budget(budget)
+    }
+
+    /// Budget-parameterised core of [`Self::sparse_active_plan`]. The dense data
+    /// Gram footprint `(m_total · m_total) f64` is compared against `budget`; a
+    /// term whose dense Gram exceeds the budget engages the compact active-set
+    /// plan (returns `Some((k_active_cap, cutoff))`), regardless of whether any
+    /// atom latent is curved. Pulled out so the curved-atom engagement
+    /// regression can pin a small budget deterministically.
+    pub(crate) fn sparse_active_plan_for_budget(&self, budget: usize) -> Option<(usize, f64)> {
+        // Relative magnitude cutoff: assignment mass below this fraction of the
+        // row's peak `|a_k|` enters the Gram only as `O(a²)` curvature and is
+        // dropped. Chosen so dropped terms are ~1e-6 of the peak self-coupling.
+        const RELATIVE_CUTOFF: f64 = 1.0e-3;
+
+        let k_atoms = self.k_atoms();
+        if k_atoms <= 1 {
+            return None;
+        }
+        let p = self.output_dim();
+        let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
+        // Dense data Gram footprint: (m_total · m_total) f64.
+        let dense_gram_bytes = m_total
+            .saturating_mul(m_total)
+            .saturating_mul(SAE_BYTES_PER_F64);
         if dense_gram_bytes <= budget {
             return None;
         }
