@@ -4803,6 +4803,7 @@ mod tests {
             reml_score: 0.0,
             stable_penalty_term: 0.0,
             penalized_objective: 0.0,
+            used_device: false,
             outer_iterations: 0,
             outer_converged: true,
             outer_gradient_norm: None,
@@ -4864,6 +4865,31 @@ mod tests {
         payload.logslope_baseline = Some(0.0);
         payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload
+    }
+
+    #[test]
+    fn from_payload_synchronizes_used_device_from_saved_fit() {
+        let mut fit = saved_fit(vec![
+            FittedBlock {
+                beta: Array1::from_vec(vec![0.25]),
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: Array1::from_vec(vec![0.5]),
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ]);
+        fit.used_device = true;
+        let mut payload = marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        payload.used_device = false;
+
+        let model = FittedModel::from_payload(payload);
+
+        assert!(model.payload().used_device);
     }
 
     fn survival_marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
