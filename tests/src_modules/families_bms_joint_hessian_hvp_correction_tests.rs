@@ -2967,6 +2967,7 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
     let mut diag_corr_var_acc = 0.0_f64;
     let mut diag_g_mean_sq_acc = 0.0_f64;
     let mut diag_g_var_sq_acc = 0.0_f64;
+    let mut diag_fd_done = false;
 
     for _ in 0..reps {
         // --- draw z with a genuine conditional mean shift on C ---
@@ -3051,6 +3052,36 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
             diag_corr_var_acc += vbg_var.dot(&v1.dot(&vbg_var));
             diag_g_mean_sq_acc += (0..dm).map(|k| g[k] * g[k]).sum::<f64>();
             diag_g_var_sq_acc += (dm..(dm + dv)).map(|k| g[k] * g[k]).sum::<f64>();
+        }
+        // FD ORACLE (first replicate only): finite-difference β̂ w.r.t. each
+        // first-stage mean coefficient by perturbing the STORED calibration
+        // coefficients, re-applying the standardization, and refitting the slope.
+        // Compare to the analytic dβ̂/dθ₁ = −(Vb·G) the MT correction uses. This
+        // settles whether the 65× correction shortfall is a wrong score-
+        // sensitivity / Jacobian (test+engine bug) or genuine higher-order slack.
+        if !diag_fd_done {
+            diag_fd_done = true;
+            let dm = cal.mean_coeffs.len();
+            let h = 1e-4_f64;
+            // analytic dβ̂/dθ₁ = −Vb·G (per mean-coeff component).
+            let analytic: Vec<f64> = (0..dm).map(|k| -vb_scalar * g[k]).collect();
+            let mut fd = vec![0.0_f64; dm];
+            for k in 0..dm {
+                let mut cal_p = cal.clone();
+                cal_p.mean_coeffs[k] += h;
+                let zeta_p = cal_p.apply(z.view(), a_block.view()).expect("apply +h");
+                let szz_p: f64 = zeta_p.iter().map(|&z| z * z).sum();
+                let szy_p: f64 = zeta_p.iter().zip(y.iter()).map(|(&z, &yy)| z * yy).sum();
+                let bp = szy_p / szz_p;
+                let mut cal_m = cal.clone();
+                cal_m.mean_coeffs[k] -= h;
+                let zeta_m = cal_m.apply(z.view(), a_block.view()).expect("apply -h");
+                let szz_m: f64 = zeta_m.iter().map(|&z| z * z).sum();
+                let szy_m: f64 = zeta_m.iter().zip(y.iter()).map(|(&z, &yy)| z * yy).sum();
+                let bm = szy_m / szz_m;
+                fd[k] = (bp - bm) / (2.0 * h);
+            }
+            println!("[MT-fd] analytic_dbeta_dtheta1={analytic:?} fd_dbeta_dtheta1={fd:?}");
         }
         assert!(
             correction >= -1e-12,
