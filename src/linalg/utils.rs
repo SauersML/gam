@@ -698,10 +698,21 @@ fn pcg_solve_info(result: &PcgCoreResult) -> PcgSolveInfo {
         .as_ref()
         .and_then(|d| d.residuals.first().copied())
         .unwrap_or(rhs_norm);
+    // Report `‖r‖ / ‖rhs‖` — the textbook relative residual the
+    // Eisenstat–Walker forcing term and the PCG stop condition both target.
+    // When `‖rhs‖` is sub-unit, dividing by `max(‖rhs‖, 1)` understates the
+    // true relative residual: e.g. `final = 5.3e-2`, `‖rhs‖ = 6.2e-2` is
+    // reported as `5.3e-2` when the actual ratio is ~0.86 (one PCG iter
+    // away from convergence, not 5% of the way). Match the stop criterion.
+    let relative_residual_norm = if rhs_norm > 0.0 {
+        final_residual_norm / rhs_norm
+    } else {
+        0.0
+    };
     PcgSolveInfo {
         iterations: result.iterations,
         converged: result.stop == PcgStop::Converged,
-        relative_residual_norm: final_residual_norm / rhs_norm.max(1.0),
+        relative_residual_norm,
         initial_residual_norm: initial,
         final_residual_norm,
         residual_reduction: if initial > 0.0 {

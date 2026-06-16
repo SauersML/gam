@@ -109,7 +109,15 @@ fn serial_dot(a: &ArrayView1<f64>, b: &ArrayView1<f64>) -> f64 {
 ///
 /// Solves `A x = rhs` for SPD `A`, accessed only through `apply(v, out)` which
 /// must set `out <- A v`. The initial guess is `x = 0`. Convergence target is
-/// `‖r‖ ≤ max(rel_tol, FLOOR) · max(‖rhs‖, 1)`.
+/// `‖r‖ ≤ max(rel_tol · ‖rhs‖, PCG_REL_TOL_FLOOR)`: a textbook RELATIVE
+/// residual criterion, floored absolutely at f64 noise scale so a near-zero
+/// rhs does not chase tolerances tighter than the machine can deliver.
+/// Inexact-Newton callers (e.g. Eisenstat–Walker forcing for the joint
+/// PIRLS solver) rely on this relative contract: the historical
+/// `max(‖rhs‖, 1)` factor silently inflated the threshold to an absolute
+/// `rel_tol` whenever `‖rhs‖ < 1`, so a request like `η = 0.1` on a
+/// sub-unit gradient produced an effective relative residual far above
+/// `η` and trapped the outer Newton loop in a fixed-point oscillation.
 ///
 /// * `precond_diag` — diagonal Jacobi preconditioner `M`; pass all-ones for an
 ///   unpreconditioned solve. Entries are floored to
@@ -175,7 +183,11 @@ where
         };
     }
 
-    let tol = rel_tol.max(PCG_REL_TOL_FLOOR) * rhs_norm.max(1.0);
+    // Textbook PCG relative-residual criterion: ‖r‖ ≤ rel_tol · ‖rhs‖. The
+    // absolute floor at `PCG_REL_TOL_FLOOR` prevents a tiny but nonzero rhs
+    // from demanding sub-f64-precision accuracy (the early-exit above handles
+    // rhs_norm == 0 separately).
+    let tol = (rel_tol.max(PCG_REL_TOL_FLOOR) * rhs_norm).max(PCG_REL_TOL_FLOOR);
 
     // Precompute reciprocal preconditioner once: z = inv_m * r per iteration.
     // SPD-PCG requires M ≻ 0; a non-positive/non-finite entry is a contract
@@ -440,5 +452,57 @@ mod tests {
         );
         assert_eq!(result.stop, PcgStop::BadPreconditioner);
         assert_eq!(x, Array1::<f64>::zeros(2));
+    }
+
+    /// Convergence target is RELATIVE for sub-unit rhs.
+    ///
+    /// With the old `tol = rel_tol · max(‖rhs‖, 1)` rule, asking for
+    /// `rel_tol = 0.1` on a rhs with `‖rhs‖ ≈ 0.06` accepted a relative
+    /// residual of ~0.86 (one PCG iteration), which is the looseness that
+    /// can trap an inexact-Newton outer loop in a fixed-point oscillation.
+    /// The textbook criterion `‖r‖ ≤ rel_tol · ‖rhs‖` must hold instead.
+    #[test]
+    fn pcg_core_relative_residual_holds_for_sub_unit_rhs() {
+        // Mildly anisotropic SPD operator, sub-unit rhs (‖b‖ ≈ 0.062).
+        let a = array![
+            [4.0, 1.0, 0.0, 0.0],
+            [1.0, 3.0, 0.25, 0.0],
+            [0.0, 0.25, 6.0, 0.5],
+            [0.0, 0.0, 0.5, 5.0]
+        ];
+        let b = array![0.03, -0.02, 0.04, 0.02];
+        let precond = array![4.0, 3.0, 6.0, 5.0];
+        let rel_tol = 0.1_f64;
+        let rhs_norm = (b.iter().map(|x| x * x).sum::<f64>()).sqrt();
+        assert!(
+            rhs_norm < 1.0,
+            "test premise: rhs must be sub-unit; got {rhs_norm}"
+        );
+
+        let mut x = Array1::<f64>::zeros(4);
+        let result = pcg_core(
+            |v: &Array1<f64>, out: &mut Array1<f64>| {
+                out.assign(&a.dot(v));
+            },
+            &b.view(),
+            &precond.view(),
+            rel_tol,
+            64,
+            32,
+            false,
+            &mut x.view_mut(),
+        );
+        assert_eq!(result.stop, PcgStop::Converged);
+
+        // Independently recompute ‖r‖ = ‖b − A x‖ on the returned iterate;
+        // the relative criterion must hold against ‖rhs‖, NOT against
+        // `max(‖rhs‖, 1)`.
+        let r: Array1<f64> = &b - &a.dot(&x);
+        let r_norm = (r.iter().map(|v| v * v).sum::<f64>()).sqrt();
+        assert!(
+            r_norm <= rel_tol * rhs_norm + 1e-12,
+            "expected ‖r‖={r_norm:.3e} ≤ rel_tol·‖rhs‖={:.3e}",
+            rel_tol * rhs_norm
+        );
     }
 }
