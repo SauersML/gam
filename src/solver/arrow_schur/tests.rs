@@ -2006,10 +2006,10 @@ pub(crate) fn streaming_mixed_precision_matches_f64_and_keeps_logdet_f64() {
     let f64_options = ArrowSolveOptions::direct().with_streaming_chunk_size(Some(8));
     let mp_options = f64_options
         .clone()
-        .with_mixed_precision_policy(ArrowMixedPrecisionPolicy::certified());
+        .with_solve_precision_policy(ArrowSolvePrecisionPolicy::certified_mixed());
     assert!(matches!(
-        f64_options.mixed_precision,
-        ArrowMixedPrecisionPolicy::Off
+        f64_options.solve_precision,
+        ArrowSolvePrecisionPolicy::F64Only
     ));
 
     let mut s_f64 = StreamingArrowSchur::from_system(&sys, 8);
@@ -2053,34 +2053,36 @@ pub(crate) fn streaming_mixed_precision_matches_f64_and_keeps_logdet_f64() {
 pub(crate) fn streaming_mixed_precision_default_upgrades_only_off() {
     let off = ArrowSolveOptions::direct();
     assert!(matches!(
-        off.with_streaming_mixed_precision_default().mixed_precision,
-        ArrowMixedPrecisionPolicy::Certified { .. }
+        off.with_streaming_solve_precision_default().solve_precision,
+        ArrowSolvePrecisionPolicy::CertifiedMixed { .. }
     ));
     let pinned =
-        ArrowSolveOptions::direct().with_mixed_precision_policy(ArrowMixedPrecisionPolicy::Off);
-    // An explicit Off is still upgraded (it is the inherited default), but a
-    // caller that pinned Certified keeps its own parameters.
-    let custom = ArrowSolveOptions::direct().with_mixed_precision_policy(
-        ArrowMixedPrecisionPolicy::Certified {
+        ArrowSolveOptions::direct().with_solve_precision_policy(ArrowSolvePrecisionPolicy::F64Only);
+    // An explicit F64Only is still upgraded (it is the inherited default), but
+    // a caller that pinned CertifiedMixed keeps its own parameters.
+    let custom = ArrowSolveOptions::direct().with_solve_precision_policy(
+        ArrowSolvePrecisionPolicy::CertifiedMixed {
             max_refinement_steps: 1,
             residual_relative_tolerance: 1e-6,
             kappa_unit_roundoff_margin: 0.25,
         },
     );
     match custom
-        .with_streaming_mixed_precision_default()
-        .mixed_precision
+        .with_streaming_solve_precision_default()
+        .solve_precision
     {
-        ArrowMixedPrecisionPolicy::Certified {
+        ArrowSolvePrecisionPolicy::CertifiedMixed {
             max_refinement_steps,
             ..
         } => assert_eq!(max_refinement_steps, 1, "explicit policy preserved"),
-        ArrowMixedPrecisionPolicy::Off => panic!("explicit Certified must not be downgraded"),
+        ArrowSolvePrecisionPolicy::F64Only => {
+            panic!("explicit CertifiedMixed must not be downgraded")
+        }
     }
-    // `pinned` documents that Off is the upgrade trigger.
+    // `pinned` documents that F64Only is the upgrade trigger.
     assert!(matches!(
-        pinned.mixed_precision,
-        ArrowMixedPrecisionPolicy::Off
+        pinned.solve_precision,
+        ArrowSolvePrecisionPolicy::F64Only
     ));
 }
 

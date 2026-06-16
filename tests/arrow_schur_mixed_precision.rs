@@ -1,10 +1,11 @@
 use gam::solver::arrow_schur::{
-    ArrowMixedPrecisionPolicy, ArrowSchurSystem, ArrowSolveOptions, MixedPrecisionStatus,
+    ArrowSchurSystem, ArrowSolveOptions, ArrowSolvePrecisionPolicy, MixedPrecisionStatus,
 };
 use ndarray::{Array1, Array2, array};
 
 fn certified_options() -> ArrowSolveOptions {
-    ArrowSolveOptions::direct().with_mixed_precision_policy(ArrowMixedPrecisionPolicy::certified())
+    ArrowSolveOptions::direct()
+        .with_solve_precision_policy(ArrowSolvePrecisionPolicy::certified_mixed())
 }
 
 fn assert_close(lhs: &Array1<f64>, rhs: &Array1<f64>, tol: f64) {

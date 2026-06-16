@@ -163,7 +163,7 @@ pub fn solve_arrow_newton_step_core(
         // fallback). The reduced-Schur f64 factor — and therefore every evidence
         // log-determinant — is unaffected: only the Δβ solve drops to f32. An
         // explicit caller policy is honored as-is.
-        let streaming_options = options.with_streaming_mixed_precision_default();
+        let streaming_options = options.with_streaming_solve_precision_default();
         let mut streaming = StreamingArrowSchur::from_system(sys, chunk_size);
         return streaming
             .solve(ridge_t, ridge_beta, &streaming_options)
@@ -910,11 +910,11 @@ pub(crate) fn try_mixed_precision_arrow_solve(
     schur: &Array2<f64>,
     options: &ArrowSolveOptions,
 ) -> Result<Option<MixedPrecisionAttempt>, ArrowSchurError> {
-    let ArrowMixedPrecisionPolicy::Certified {
+    let ArrowSolvePrecisionPolicy::CertifiedMixed {
         max_refinement_steps,
         residual_relative_tolerance,
         kappa_unit_roundoff_margin,
-    } = options.mixed_precision
+    } = options.solve_precision
     else {
         return Ok(None);
     };
@@ -1462,7 +1462,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             (db, sf, diag)
         }
         ArrowSolverMode::InexactPCG => {
-            if options.mixed_precision.is_enabled() {
+            if options.solve_precision.is_enabled() {
                 log::info!(
                     "arrow-Schur mixed precision fallback to f64: InexactPCG does not expose a dense Schur factor for certified f32 refinement"
                 );

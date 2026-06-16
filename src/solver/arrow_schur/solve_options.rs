@@ -166,8 +166,8 @@ impl Default for ArrowTrustRegionOptions {
 
 /// Opt-in Carson--Higham mixed-precision refinement for dense arrow solves.
 ///
-/// Default is [`ArrowMixedPrecisionPolicy::Off`]: exact f64 solves remain the default.
-/// [`ArrowMixedPrecisionPolicy::Certified`] stores f32 copies of the per-row Cholesky
+/// Default is [`ArrowSolvePrecisionPolicy::F64Only`]: exact f64 solves remain the default.
+/// [`ArrowSolvePrecisionPolicy::CertifiedMixed`] stores f32 copies of the per-row Cholesky
 /// factors and dense Schur factor, solves corrections in f32, and recomputes the
 /// residual in f64 against the original arrow blocks. The standard refinement
 /// certificate is the normwise backward error
@@ -178,24 +178,24 @@ impl Default for ArrowTrustRegionOptions {
 /// when it fails, the solve reports [`MixedPrecisionStatus::F64Fallback`] and
 /// logs the reason before using the f64 path.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ArrowMixedPrecisionPolicy {
-    Off,
-    Certified {
+pub enum ArrowSolvePrecisionPolicy {
+    F64Only,
+    CertifiedMixed {
         max_refinement_steps: usize,
         residual_relative_tolerance: f64,
         kappa_unit_roundoff_margin: f64,
     },
 }
 
-impl Default for ArrowMixedPrecisionPolicy {
+impl Default for ArrowSolvePrecisionPolicy {
     fn default() -> Self {
-        Self::Off
+        Self::F64Only
     }
 }
 
-impl ArrowMixedPrecisionPolicy {
-    pub fn certified() -> Self {
-        Self::Certified {
+impl ArrowSolvePrecisionPolicy {
+    pub fn certified_mixed() -> Self {
+        Self::CertifiedMixed {
             max_refinement_steps: DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS,
             residual_relative_tolerance: DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE,
             kappa_unit_roundoff_margin: DEFAULT_MIXED_PRECISION_KAPPA_MARGIN,
@@ -203,7 +203,7 @@ impl ArrowMixedPrecisionPolicy {
     }
 
     pub(crate) fn is_enabled(self) -> bool {
-        matches!(self, ArrowMixedPrecisionPolicy::Certified { .. })
+        matches!(self, ArrowSolvePrecisionPolicy::CertifiedMixed { .. })
     }
 }
 
@@ -247,8 +247,8 @@ pub struct ArrowSolveOptions {
     ///
     /// Default `false`: ordinary solves keep the full guard.
     pub tolerate_ill_conditioning: bool,
-    /// Opt-in certified mixed-precision direct solve. Default is off.
-    pub mixed_precision: ArrowMixedPrecisionPolicy,
+    /// Arrow solve precision policy. Default is f64-only.
+    pub solve_precision: ArrowSolvePrecisionPolicy,
 }
 
 impl std::fmt::Debug for ArrowSolveOptions {
@@ -261,7 +261,7 @@ impl std::fmt::Debug for ArrowSolveOptions {
             .field("riemannian_trust_region", &self.riemannian_trust_region)
             .field("gpu_matvec", &self.gpu_matvec.is_some())
             .field("tolerate_ill_conditioning", &self.tolerate_ill_conditioning)
-            .field("mixed_precision", &self.mixed_precision)
+            .field("solve_precision", &self.solve_precision)
             .finish()
     }
 }
@@ -336,7 +336,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
-            mixed_precision: ArrowMixedPrecisionPolicy::Off,
+            solve_precision: ArrowSolvePrecisionPolicy::F64Only,
         }
     }
 
@@ -351,7 +351,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
-            mixed_precision: ArrowMixedPrecisionPolicy::Off,
+            solve_precision: ArrowSolvePrecisionPolicy::F64Only,
         }
     }
 
@@ -365,7 +365,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
-            mixed_precision: ArrowMixedPrecisionPolicy::Off,
+            solve_precision: ArrowSolvePrecisionPolicy::F64Only,
         }
     }
 
@@ -379,7 +379,7 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
-            mixed_precision: ArrowMixedPrecisionPolicy::Off,
+            solve_precision: ArrowSolvePrecisionPolicy::F64Only,
         }
     }
 
@@ -400,23 +400,23 @@ impl ArrowSolveOptions {
         self
     }
 
-    pub fn with_mixed_precision_policy(mut self, policy: ArrowMixedPrecisionPolicy) -> Self {
-        self.mixed_precision = policy;
+    pub fn with_solve_precision_policy(mut self, policy: ArrowSolvePrecisionPolicy) -> Self {
+        self.solve_precision = policy;
         self
     }
 
     /// Turn certified mixed precision ON for the streaming/residency reduced
     /// solve unless the caller already pinned an explicit policy (#1014).
     ///
-    /// Only `Off` (the inherited default) is upgraded to `Certified`; a caller
-    /// that deliberately set a policy keeps it. The reduced-Schur f64 factor and
-    /// every evidence log-determinant are unaffected — see
+    /// Only `F64Only` (the inherited default) is upgraded to `CertifiedMixed`;
+    /// a caller that deliberately set a policy keeps it. The reduced-Schur f64
+    /// factor and every evidence log-determinant are unaffected — see
     /// [`mixed_precision_reduced_beta`].
     #[must_use]
-    pub fn with_streaming_mixed_precision_default(&self) -> Self {
+    pub fn with_streaming_solve_precision_default(&self) -> Self {
         let mut out = self.clone();
-        if matches!(out.mixed_precision, ArrowMixedPrecisionPolicy::Off) {
-            out.mixed_precision = ArrowMixedPrecisionPolicy::certified();
+        if matches!(out.solve_precision, ArrowSolvePrecisionPolicy::F64Only) {
+            out.solve_precision = ArrowSolvePrecisionPolicy::certified_mixed();
         }
         out
     }

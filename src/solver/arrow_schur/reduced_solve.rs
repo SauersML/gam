@@ -268,11 +268,11 @@ pub(crate) fn mixed_precision_reduced_beta(
     rhs: &Array1<f64>,
     options: &ArrowSolveOptions,
 ) -> Option<Array1<f64>> {
-    let ArrowMixedPrecisionPolicy::Certified {
+    let ArrowSolvePrecisionPolicy::CertifiedMixed {
         max_refinement_steps,
         residual_relative_tolerance,
         kappa_unit_roundoff_margin,
-    } = options.mixed_precision
+    } = options.solve_precision
     else {
         return None;
     };
