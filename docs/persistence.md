@@ -20,7 +20,9 @@ loaded = gamfit.loads(blob)
 ```
 
 The `.gam` file is the JSON serialisation of the Rust `FittedModel`
-enum (`model_type` plus `payload`; the Rust save path writes it with
+enum, which has the five variants `standard`, `location-scale`,
+`marginal-slope`, `survival`, and `transformation-normal` (`model_type`
+plus `payload`; the Rust save path writes it with
 `serde_json::to_writer`). It contains:
 
 - coefficients, smoothing parameters, basis specifications;
@@ -30,10 +32,11 @@ enum (`model_type` plus `payload`; the Rust save path writes it with
 It does not contain the training data.
 
 Saved model payloads cover the current Python-facing model classes:
-standard scalar GAMs, location-scale / dispersion fits, survival
-transformation / Weibull / location-scale / marginal-slope / latent
-models, transformation-normal models, Bernoulli marginal-slope models,
-multinomial models, and competing-risks prediction payloads. The saved
+standard scalar GAMs (the `standard` variant), Gaussian / binomial /
+dispersion location-scale fits (`location-scale`), Bernoulli
+marginal-slope models (`marginal-slope`), survival transformation /
+Weibull / location-scale / marginal-slope / latent models (`survival`),
+and transformation-normal models (`transformation-normal`). The saved
 schema also records the training table kind so a loaded model preserves
 the same default prediction container policy for ambiguous dict/list
 inputs.
