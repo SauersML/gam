@@ -679,15 +679,57 @@ pub fn build_termspec(
                 // binary) operands multiply directly; a categorical operand is
                 // a factor, so the product is expanded factor-aware: one design
                 // column per surviving cell of the factor(s), each an indicator
-                // `1[factor == level]` gating the numeric product. Levels are
-                // treatment-coded (the lexicographically first level of each
-                // factor is dropped) so the cell columns are identifiable
-                // against the intercept and the factor's own main effect —
-                // mgcv's `factor:x` convention.
+                // `1[factor == level]` gating the numeric product.
+                //
+                // Coding is MARGINALITY-AWARE (gam#1158, gam#1159). A categorical
+                // operand `g` is treatment-coded (its lexicographically first
+                // reference level dropped) ONLY when the lower-order term obtained
+                // by removing `g` from this interaction is also present in the
+                // model — that lower-order term is what makes the dropped level
+                // identifiable, exactly mgcv's marginality rule. When that parent
+                // is ABSENT (the interaction-only form), dropping the reference
+                // level instead pins a group to the reference fit (a rank-deficient
+                // design), so we keep ALL levels (full dummy coding) and rely on a
+                // single intercept cell-drop below for identifiability:
+                //   * `y ~ x:g` with no `x` main effect → "common intercept,
+                //     separate slopes": every group keeps its own x-slope.
+                //   * `y ~ g:h` with no `g`/`h` main effects → the saturated
+                //     cell-means model: full cross of all levels minus one
+                //     reference cell absorbed by the intercept.
+                // When the parents ARE present (`x + x:g`, or `g*h` = `g + h +
+                // g:h`), the historical treatment coding is preserved so those
+                // forms stay correct.
+                //
+                // A main effect for var V is a `Linear`/`BoundedLinear`/
+                // `RandomEffect` ParsedTerm whose referenced name is V (an
+                // auto-detected categorical `Linear` becomes a RandomEffect main
+                // effect; either spelling counts). We only treat such standalone
+                // main-effect terms as parents — not V appearing inside another
+                // interaction.
+                let main_effect_present = |target: &str| -> bool {
+                    terms.iter().any(|other| match other {
+                        ParsedTerm::Linear { name, .. }
+                        | ParsedTerm::BoundedLinear { name, .. }
+                        | ParsedTerm::RandomEffect { name } => name == target,
+                        _ => false,
+                    })
+                };
+                // The lower-order parent of dropping operand `drop_var` from this
+                // interaction is present iff EVERY other operand is a main effect.
+                // For the two cases we care about (`x:g`, `g:h`) the interaction
+                // has two operands, so this reduces to "is the single remaining
+                // operand a main effect"; the general form handles any arity.
+                let parent_present = |drop_var: &str| -> bool {
+                    vars.iter()
+                        .filter(|v| v.as_str() != drop_var)
+                        .all(|v| main_effect_present(v))
+                };
+
                 let mut numeric_cols = Vec::<usize>::new();
-                // Per categorical operand: (var name, col, kept levels after
-                // dropping the first for treatment coding).
-                let mut categorical_factors = Vec::<(String, usize, Vec<(u64, String)>)>::new();
+                // Per categorical operand: (var name, col, kept levels, was the
+                // reference level dropped / treatment-coded?).
+                let mut categorical_factors =
+                    Vec::<(String, usize, Vec<(u64, String)>, bool)>::new();
                 for var in vars {
                     let col = resolve_col(col_map, var)?;
                     let kind = ds.column_kinds.get(col).copied().ok_or_else(|| {
@@ -700,8 +742,11 @@ pub fn build_termspec(
                         ColumnKindTag::Continuous | ColumnKindTag::Binary => numeric_cols.push(col),
                         ColumnKindTag::Categorical => {
                             let mut levels = encoded_levels_for_column(ds, ColIdx::new(col));
-                            if levels.len() > 1 {
-                                // Drop the first (reference) level: treatment coding.
+                            // Treatment-code (drop the reference level) only when
+                            // the marginal parent that identifies it is present;
+                            // otherwise keep every level (full dummy coding).
+                            let treatment_coded = parent_present(var);
+                            if treatment_coded && levels.len() > 1 {
                                 levels.remove(0);
                             }
                             if levels.is_empty() {
@@ -710,7 +755,7 @@ pub fn build_termspec(
                                     vars.join(":")
                                 )));
                             }
-                            categorical_factors.push((var.clone(), col, levels));
+                            categorical_factors.push((var.clone(), col, levels, treatment_coded));
                         }
                     }
                 }
@@ -739,9 +784,10 @@ pub fn build_termspec(
                 } else {
                     // Factor-aware expansion: cartesian product over the kept
                     // levels of every categorical operand. Each cell yields one
-                    // treatment-coded column gating the numeric product.
+                    // column gating the numeric product (or, with no numeric
+                    // operand, a pure cell indicator).
                     let mut cells: Vec<Vec<(usize, u64, String)>> = vec![Vec::new()];
-                    for (_var, col, levels) in &categorical_factors {
+                    for (_var, col, levels, _treatment_coded) in &categorical_factors {
                         let mut next = Vec::with_capacity(cells.len() * levels.len());
                         for cell in &cells {
                             for (bits, level_label) in levels {
@@ -751,6 +797,38 @@ pub fn build_termspec(
                             }
                         }
                         cells = next;
+                    }
+
+                    // Intercept-identifiability cell drop. When the cells are PURE
+                    // INDICATORS (no numeric operand) and at least one factor was
+                    // dummy-coded (kept all its levels), the full set of cell
+                    // columns sums to the all-ones intercept and is rank-deficient
+                    // against it. Drop exactly ONE reference cell — the cell where
+                    // every factor sits at its reference (lexicographically first)
+                    // level — so the remaining saturated cells are identifiable
+                    // (rank n_g*n_h - 1 cells + intercept). With a numeric operand
+                    // the cells gate `x` and sum to `x`, not the intercept, so no
+                    // cell is dropped (the collinearity there is with the absent
+                    // `x` main effect, which is exactly why full coding is right).
+                    let any_dummy_coded = categorical_factors
+                        .iter()
+                        .any(|(_, _, _, treatment_coded)| !*treatment_coded);
+                    if numeric_cols.is_empty() && any_dummy_coded {
+                        // The reference cell pairs each factor's column with the
+                        // bits of its lexicographically-first (index 0) level.
+                        let reference_cell: Vec<(usize, u64)> = categorical_factors
+                            .iter()
+                            .map(|(_, col, _, _)| {
+                                let levels = encoded_levels_for_column(ds, ColIdx::new(*col));
+                                (*col, levels[0].0)
+                            })
+                            .collect();
+                        cells.retain(|cell| {
+                            !reference_cell.iter().all(|(rcol, rbits)| {
+                                cell.iter()
+                                    .any(|(col, bits, _)| col == rcol && bits == rbits)
+                            })
+                        });
                     }
 
                     let n_cells = cells.len();
@@ -782,10 +860,17 @@ pub fn build_termspec(
                             coefficient_max: None,
                         });
                     }
+                    let all_treatment_coded = !any_dummy_coded;
+                    let coding = if all_treatment_coded {
+                        "treatment-coded"
+                    } else {
+                        "marginality-aware (full dummy / saturated)"
+                    };
                     inference_notes.push(format!(
-                        "wired factor-aware linear interaction `{}` as {} treatment-coded cell column(s)",
+                        "wired factor-aware linear interaction `{}` as {} {} cell column(s)",
                         vars.join(":"),
-                        n_cells
+                        n_cells,
+                        coding
                     ));
                 }
             }
@@ -4808,15 +4893,18 @@ mod tests {
 
     #[test]
     fn categorical_by_numeric_interaction_expands_treatment_coded_cells() {
-        // Regression for the #1133 checklist item: a `factor:numeric` linear
-        // interaction previously bailed with `incompatible_config` ("not yet
-        // wired here"). It must now expand factor-aware into one treatment-coded
-        // cell column per surviving factor level, each equal to the indicator
-        // `1[g == level] * x`, with the reference level dropped.
+        // `y ~ x:g` is an INTERACTION-ONLY numeric-by-factor model: there is no
+        // `x` main effect, so the marginal parent that would identify a dropped
+        // reference level is ABSENT. The expansion must therefore be marginality-
+        // aware (gam#1158) and DUMMY-code `g` — keep ALL levels — yielding the
+        // "common intercept, separate slopes" design (one x-slope column per
+        // group). Treatment-coding here (dropping the reference level) would pin
+        // the reference group's slope to zero, a rank-deficient fit; that wrong
+        // behaviour is what this test now guards against. (The treatment-coded
+        // path is exercised when the `x` parent is present — see
+        // `categorical_by_numeric_interaction_keeps_treatment_coding_with_parent`.)
         let ds = factor_dataset();
         // `g` is categorical with two levels (encoded 0.0 → "a", 1.0 → "b").
-        // Treatment coding drops the reference level "a", leaving exactly one
-        // interaction column for level "b".
         let parsed = parse_formula("y ~ x:g").expect("parse `y ~ x:g`");
         let col_map = ds.column_map();
         let mut notes = Vec::new();
@@ -4831,63 +4919,106 @@ mod tests {
 
         assert_eq!(
             terms.linear_terms.len(),
-            1,
-            "two-level factor (reference dropped) yields exactly one `x:g` cell column"
-        );
-        let term = &terms.linear_terms[0];
-        assert!(
-            term.is_interaction(),
-            "the categorical-by-numeric cell is a Wilkinson-Rogers interaction"
+            2,
+            "interaction-only `x:g` keeps ALL factor levels (full dummy coding): one slope column per group"
         );
 
         let x_col = *col_map.get("x").expect("x column");
         let g_col = *col_map.get("g").expect("g column");
-        // The numeric operand `x` is carried as a product factor; the factor
-        // `g` is carried as a level gate, NOT a raw product column.
+
+        // Both level gates must appear exactly once across the two cell columns,
+        // and each cell carries `x` as a product factor (not a raw column for g).
+        let mut seen_bits = std::collections::HashSet::new();
+        for term in &terms.linear_terms {
+            assert!(
+                term.is_interaction(),
+                "the categorical-by-numeric cell is a Wilkinson-Rogers interaction"
+            );
+            assert_eq!(term.feature_cols, vec![x_col]);
+            assert_eq!(term.categorical_levels.len(), 1);
+            let (gate_col, gate_bits) = term.categorical_levels[0];
+            assert_eq!(gate_col, g_col);
+            assert!(seen_bits.insert(gate_bits), "each level appears once");
+
+            // Realize and check it equals `1[g == gate_bits] * x` row by row.
+            let column = term
+                .realized_design_column(ds.values.view())
+                .expect("realize cell column");
+            let n = ds.values.nrows();
+            assert_eq!(column.len(), n);
+            for row in 0..n {
+                let x = ds.values[[row, x_col]];
+                let g = ds.values[[row, g_col]];
+                let expected = if g.to_bits() == gate_bits { x } else { 0.0 };
+                assert!(
+                    (column[row] - expected).abs() < 1e-12,
+                    "row {row}: g={g}, x={x}, expected {expected}, got {}",
+                    column[row]
+                );
+            }
+        }
+        // Both the reference level "a" (0.0) and the non-reference "b" (1.0) are
+        // kept — the reference level is NOT dropped in the interaction-only form.
+        assert!(seen_bits.contains(&0.0_f64.to_bits()));
+        assert!(seen_bits.contains(&1.0_f64.to_bits()));
+    }
+
+    #[test]
+    fn categorical_by_numeric_interaction_keeps_treatment_coding_with_parent() {
+        // With the `x` main effect PRESENT (`y ~ x + x:g`), the marginal parent
+        // that identifies a dropped reference level exists, so `x:g` keeps its
+        // historical treatment coding: the reference level "a" is dropped and
+        // only the non-reference slope-deviation column for "b" is emitted. This
+        // guards that the marginality-aware fix (gam#1158) does NOT regress the
+        // parent-present form, which must stay column-space-identical to mgcv's
+        // `x + x:g`.
+        let ds = factor_dataset();
+        let parsed = parse_formula("y ~ x + x:g").expect("parse `y ~ x + x:g`");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+        )
+        .expect("`x + x:g` must build");
+
+        // One main-effect `x` column plus one treatment-coded interaction cell.
+        let x_col = *col_map.get("x").expect("x column");
+        let g_col = *col_map.get("g").expect("g column");
+        let interaction_cells: Vec<_> = terms
+            .linear_terms
+            .iter()
+            .filter(|t| t.is_interaction())
+            .collect();
+        assert_eq!(
+            interaction_cells.len(),
+            1,
+            "with `x` present, `x:g` is treatment-coded → one cell (reference dropped)"
+        );
+        let term = interaction_cells[0];
         assert_eq!(term.feature_cols, vec![x_col]);
         assert_eq!(term.categorical_levels.len(), 1);
         let (gate_col, gate_bits) = term.categorical_levels[0];
         assert_eq!(gate_col, g_col);
-        // The kept level is the non-reference level, encoded 1.0 ("b").
+        // The dropped reference is "a" (0.0); the kept gate is "b" (1.0).
         assert_eq!(gate_bits, 1.0_f64.to_bits());
-
-        // Realize the design column and check it equals `1[g == 1.0] * x` row by
-        // row — real numeric correctness, not merely "did not error".
-        let column = term
-            .realized_design_column(ds.values.view())
-            .expect("realize cell column");
-        let n = ds.values.nrows();
-        assert_eq!(column.len(), n);
-        let mut saw_active = false;
-        let mut saw_gated = false;
-        for row in 0..n {
-            let x = ds.values[[row, x_col]];
-            let g = ds.values[[row, g_col]];
-            let expected = if g.to_bits() == 1.0_f64.to_bits() {
-                saw_active = true;
-                x
-            } else {
-                saw_gated = true;
-                0.0
-            };
-            assert!(
-                (column[row] - expected).abs() < 1e-12,
-                "row {row}: g={g}, x={x}, expected {expected}, got {}",
-                column[row]
-            );
-        }
-        assert!(
-            saw_active && saw_gated,
-            "the test data must exercise both the active and gated branches"
-        );
     }
 
     #[test]
     fn categorical_by_categorical_interaction_expands_full_cross_cells() {
-        // A `factor:factor` interaction expands to the cartesian product of the
-        // (treatment-coded) surviving levels of each factor. With a 3-level and a
-        // 2-level factor that is (3-1) * (2-1) = 2 cell columns, each the product
-        // of the two level indicators.
+        // `y ~ f:g` is an INTERACTION-ONLY factor-by-factor model: neither `f`
+        // nor `g` appears as a main effect, so neither marginal parent is
+        // present and BOTH factors must be dummy-coded (gam#1159). The correct
+        // design is the SATURATED cell-means model: the full cross of ALL levels
+        // (3 * 2 = 6 cells) minus ONE reference cell (the lexicographically-first
+        // level of every factor, here f0:g0) absorbed by the intercept — rank
+        // 6-1 = 5 cell columns + intercept, column-space-identical to `f*g`.
+        // Treatment-coding both factors (the old behaviour) kept only
+        // (3-1)*(2-1) = 2 cells and collapsed the rest onto the intercept, a
+        // rank-deficient fit; that is the bug this test now guards against.
         let n = 30usize;
         let mut rows = Vec::with_capacity(n);
         for i in 0..n {
@@ -4944,26 +5075,38 @@ mod tests {
 
         assert_eq!(
             terms.linear_terms.len(),
-            2,
-            "(3-1)*(2-1) = 2 treatment-coded cross cells"
+            5,
+            "saturated 3*2 = 6 cross cells minus one reference cell (f0:g0) = 5"
         );
 
         let f_col = *col_map.get("f").expect("f column");
         let g_col = *col_map.get("g").expect("g column");
+        // The dropped reference cell pairs each factor's lexicographically-first
+        // level: f0 (0.0) and g0 (0.0). It must NOT appear among the emitted
+        // cells; every OTHER cross cell must.
+        let f0 = 0.0_f64.to_bits();
+        let g0 = 0.0_f64.to_bits();
+        let mut emitted = std::collections::HashSet::new();
         for term in &terms.linear_terms {
             // No numeric operand: the realized column is a pure cell indicator.
             assert!(term.feature_cols.is_empty());
             assert_eq!(term.categorical_levels.len(), 2);
-            let column = term
-                .realized_design_column(ds.values.view())
-                .expect("realize cross cell");
-            // Each gate references its own factor column.
             let mut gates = std::collections::HashMap::new();
             for &(col, bits) in &term.categorical_levels {
                 gates.insert(col, bits);
             }
             let f_bits = *gates.get(&f_col).expect("f gate present");
             let g_bits = *gates.get(&g_col).expect("g gate present");
+            // The reference cell f0:g0 must have been dropped.
+            assert!(
+                !(f_bits == f0 && g_bits == g0),
+                "the reference cell f0:g0 must be absorbed by the intercept, not emitted"
+            );
+            emitted.insert((f_bits, g_bits));
+
+            let column = term
+                .realized_design_column(ds.values.view())
+                .expect("realize cross cell");
             for row in 0..n {
                 let f = ds.values[[row, f_col]];
                 let g = ds.values[[row, g_col]];
@@ -4978,11 +5121,25 @@ mod tests {
                     column[row]
                 );
             }
-            // The cell must actually select some rows (non-empty intersection).
             assert!(
                 column.iter().any(|&v| v == 1.0),
                 "each cross cell must be observed in the data"
             );
+        }
+        // Every non-reference cross cell is present exactly once: all 6 cells
+        // except f0:g0.
+        let f_levels = [0.0_f64.to_bits(), 1.0_f64.to_bits(), 2.0_f64.to_bits()];
+        let g_levels = [0.0_f64.to_bits(), 1.0_f64.to_bits()];
+        for &fb in &f_levels {
+            for &gb in &g_levels {
+                if fb == f0 && gb == g0 {
+                    continue;
+                }
+                assert!(
+                    emitted.contains(&(fb, gb)),
+                    "saturated cross cell must be present"
+                );
+            }
         }
     }
 }
