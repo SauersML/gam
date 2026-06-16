@@ -108,6 +108,8 @@ mod bug_hunt_gaussian_smooth_high_leverage_alo_hessian_abort;
 mod bug_hunt_gaussian_smooth_not_invariant_to_small_response_rescale;
 #[path = "regressions/bug_hunt_gaussian_smooth_shape_not_response_shift_invariant.rs"]
 mod bug_hunt_gaussian_smooth_shape_not_response_shift_invariant;
+#[path = "regressions/bug_hunt_gpu_pirls_row_module_path_break.rs"]
+mod bug_hunt_gpu_pirls_row_module_path_break;
 #[path = "regressions/bug_hunt_group_random_effect_sparse_exact_smoothing_correction.rs"]
 mod bug_hunt_group_random_effect_sparse_exact_smoothing_correction;
 #[path = "regressions/bug_hunt_ibp_assignment_hvp_drops_offdiagonal_coupling.rs"]
