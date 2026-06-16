@@ -74,7 +74,7 @@ pub(crate) struct OuterConfig {
     /// from this one, even after an interrupted run.
     pub(crate) cache_mirror_sessions: Vec<Arc<CacheSession>>,
     pub(crate) rho_uncertainty_problem_size:
-        crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
+        crate::rho_uncertainty::RhoUncertaintyProblemSize,
     /// Set by the persistent-cache resume path (`run`) when the outer seed
     /// originates from a warm-start cache *hit* — i.e. `config.initial_rho`
     /// (and, since 0.1.204, the inner β) was populated from a prior fit's
@@ -125,7 +125,7 @@ impl Default for OuterConfig {
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
             rho_uncertainty_problem_size:
-                crate::inference::rho_uncertainty::RhoUncertaintyProblemSize::default(),
+                crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             warm_start_cache_hit: false,
             warm_start_outer_hessian: None,
         }
@@ -170,7 +170,7 @@ pub struct OuterProblem {
     bfgs_step_cap_psi: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
-    rho_uncertainty_problem_size: crate::inference::rho_uncertainty::RhoUncertaintyProblemSize,
+    rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
     continuation_prewarm: bool,
 }
 
@@ -204,7 +204,7 @@ impl OuterProblem {
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
             rho_uncertainty_problem_size:
-                crate::inference::rho_uncertainty::RhoUncertaintyProblemSize::default(),
+                crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             continuation_prewarm: true,
         }
     }
@@ -414,7 +414,7 @@ impl OuterProblem {
 
     pub fn with_problem_size(mut self, n_obs: usize, p_coefficients: usize) -> Self {
         self.rho_uncertainty_problem_size =
-            crate::inference::rho_uncertainty::RhoUncertaintyProblemSize {
+            crate::rho_uncertainty::RhoUncertaintyProblemSize {
                 n_obs: Some(n_obs),
                 p_coefficients: Some(p_coefficients),
             };
@@ -881,7 +881,7 @@ pub struct OuterResult {
     /// show evidence that plug-in REML/LAML intervals are unreliable. Populated
     /// once by [`run_outer`] when the exact rho Hessian is cheap enough to use.
     pub rho_uncertainty_diagnostic:
-        Option<crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic>,
+        Option<crate::rho_uncertainty::RhoUncertaintyDiagnostic>,
 }
 
 impl OuterResult {
@@ -1180,19 +1180,19 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
     config: &OuterConfig,
     context: &str,
     result: &mut OuterResult,
-) -> crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic {
+) -> crate::rho_uncertainty::RhoUncertaintyDiagnostic {
     let cap = obj.capability();
     let layout = cap.theta_layout();
     let rho_dim = layout.rho_dim();
-    let gate = crate::inference::rho_uncertainty::RhoUncertaintyCostGate {
+    let gate = crate::rho_uncertainty::RhoUncertaintyCostGate {
         sample_count: 32,
         problem_size: config.rho_uncertainty_problem_size,
     };
-    if let Err(reason) = crate::inference::rho_uncertainty::cost_gate_allows(rho_dim, gate) {
-        return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(reason, 0);
+    if let Err(reason) = crate::rho_uncertainty::cost_gate_allows(rho_dim, gate) {
+        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(reason, 0);
     }
     if result.rho.len() != layout.n_params {
-        return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
+        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
             format!(
                 "final outer point length {} does not match objective dimension {}",
                 result.rho.len(),
@@ -1205,7 +1205,7 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
     let final_eval = match obj.eval_with_order(&result.rho, OuterEvalOrder::ValueGradientHessian) {
         Ok(eval) => eval,
         Err(err) => {
-            return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
+            return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
                 format!("final exact Hessian evaluation failed: {err}"),
                 1,
             );
@@ -1214,20 +1214,20 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
     let hessian = match final_eval.hessian.materialize_dense() {
         Ok(Some(hessian)) => hessian,
         Ok(None) => {
-            return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
+            return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
                 "exact outer Hessian unavailable at fitted rho",
                 1,
             );
         }
         Err(message) => {
-            return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
+            return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
                 format!("exact outer Hessian materialization failed: {message}"),
                 1,
             );
         }
     };
     if hessian.nrows() != layout.n_params || hessian.ncols() != layout.n_params {
-        return crate::inference::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
+        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
             format!(
                 "exact outer Hessian shape {}x{} does not match objective dimension {}",
                 hessian.nrows(),
@@ -1287,7 +1287,7 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
             }
             obj.eval_cost(&theta).ok()
         };
-        crate::inference::rho_uncertainty::rho_uncertainty_diagnostic(
+        crate::rho_uncertainty::rho_uncertainty_diagnostic(
             &rho_hat,
             &hessian_rho,
             gate,
@@ -1302,21 +1302,21 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
         );
     }
     match &diagnostic.status {
-        crate::inference::rho_uncertainty::RhoUncertaintyStatus::NoEvidenceOfHeavyTails => {
+        crate::rho_uncertainty::RhoUncertaintyStatus::NoEvidenceOfHeavyTails => {
             log::info!(
                 "[RHO uncertainty] {context}: no heavy-tail evidence at sampled rho proposals k_hat={:.3} evals={}",
                 diagnostic.k_hat.unwrap_or(f64::NAN),
                 diagnostic.n_evaluations,
             );
         }
-        crate::inference::rho_uncertainty::RhoUncertaintyStatus::HeavyTailsDetected { k_hat } => {
+        crate::rho_uncertainty::RhoUncertaintyStatus::HeavyTailsDetected { k_hat } => {
             log::warn!(
                 "[RHO uncertainty] {context}: heavy rho-importance tail detected k_hat={:.3} evals={}",
                 k_hat,
                 diagnostic.n_evaluations,
             );
         }
-        crate::inference::rho_uncertainty::RhoUncertaintyStatus::Skipped { reason } => {
+        crate::rho_uncertainty::RhoUncertaintyStatus::Skipped { reason } => {
             log::info!("[RHO uncertainty] {context}: skipped ({reason})");
         }
     }

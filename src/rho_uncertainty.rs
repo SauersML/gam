@@ -9,7 +9,7 @@
 //! closure can agree with the Gaussian proposal at every deterministic draw and
 //! still have catastrophic heavier tails elsewhere.
 
-use crate::inference::psis::{MIN_TAIL_COUNT, pareto_smooth_weights};
+use crate::psis::{MIN_TAIL_COUNT, pareto_smooth_weights};
 use ndarray::{Array1, Array2};
 
 const DEFAULT_SAMPLE_COUNT: usize = 32;
