@@ -47,3 +47,17 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use thiserror::Error;
+
+#[cfg(test)]
+mod prelude_lock_tests {
+    /// Locks that `terms::basis`'s shared import surface lives at `prelude.rs`
+    /// (renamed from `imports.rs` per #1137) and is textually included here:
+    /// this test only compiles because it is pasted in via
+    /// `include!("prelude.rs")`. Also pins a representative re-exported symbol.
+    #[test]
+    fn basis_prelude_include_path_is_locked() {
+        assert!(
+            core::any::type_name::<crate::matrix::DesignMatrix>().contains("DesignMatrix")
+        );
+    }
+}

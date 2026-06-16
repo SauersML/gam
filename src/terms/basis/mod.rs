@@ -2,7 +2,7 @@
 //! hyperparameter (`ψ`) derivative machinery that the smooth terms build on.
 //!
 //! The module is decomposed into single-concern submodules. Shared crate
-//! imports live in [`imports.rs`](imports.rs) and are pulled into this module's
+//! imports live in [`prelude.rs`](prelude.rs) and are pulled into this module's
 //! namespace; every submodule re-imports them (together with the sibling
 //! re-exports below) through `use super::*`. The `pub use <module>::*`
 //! re-exports flatten each concern back onto the `basis::` path so external
@@ -10,7 +10,7 @@
 //! submodule now owns the item.
 
 // Crate-wide imports, shared by every submodule via `use super::*`.
-include!("imports.rs");
+include!("prelude.rs");
 
 // ---- Manifold / geometric smooth specifications and kernels ----
 mod constant_curvature_smooth;
