@@ -233,7 +233,7 @@ fn kappa_outer_loop_is_n_independent() {
     // the per-trial design realization were still O(n) it would grow ~256× here;
     // the PsiGramTensor sufficient-statistic lane keeps it flat (the only n-work
     // left is the single build, which lands in `t_single`, not the marginal).
-    let ns = [1_000usize, 4_000, 16_000, 64_000, 256_000];
+    let ns = [1_000usize, 4_000, 16_000, 64_000, 256_000, 320_000];
     let mut kappa_phase = Vec::with_capacity(ns.len());
 
     eprintln!(
