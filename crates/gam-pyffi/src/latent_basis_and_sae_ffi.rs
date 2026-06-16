@@ -3560,7 +3560,7 @@ fn sae_streaming_plan(
 
 fn sae_streaming_plan_to_pydict<'py>(
     py: Python<'py>,
-    plan: gam::terms::sae_manifold::SaeStreamingPlan,
+    plan: gam::terms::sae::manifold::SaeStreamingPlan,
 ) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
     out.set_item("streaming", plan.streaming)?;
@@ -4233,7 +4233,7 @@ fn sae_decoder_lsq_init(
             // coordinate starts at zero, so alpha_eff = alpha at initialization.
             for row in 0..n_obs {
                 let weights =
-                    gam::terms::sae_manifold::ibp_map_row(initial_logits.row(row), tau, alpha);
+                    gam::terms::sae::manifold::ibp_map_row(initial_logits.row(row), tau, alpha);
                 for k in 0..k_atoms {
                     a_init[[row, k]] = weights[k];
                 }
@@ -4246,7 +4246,7 @@ fn sae_decoder_lsq_init(
                 ));
             }
             for row in 0..n_obs {
-                let weights = gam::terms::sae_manifold::jumprelu_row(
+                let weights = gam::terms::sae::manifold::jumprelu_row(
                     initial_logits.row(row),
                     tau,
                     jumprelu_threshold,
@@ -4395,7 +4395,7 @@ fn sae_decoder_lsq_init(
 /// Only invoked for cold-start multi-atom softmax / IBP-MAP fits; JumpReLU keeps
 /// its margin-above-threshold gate seed and warm starts are respected verbatim.
 fn sae_em_refine_routing_seed(
-    term: &mut gam::terms::sae_manifold::SaeManifoldTerm,
+    term: &mut gam::terms::sae::manifold::SaeManifoldTerm,
     z: ArrayView2<'_, f64>,
     basis_sizes: &[usize],
     assignment_kind: &str,
@@ -5287,7 +5287,7 @@ fn sae_manifold_fit_minimal<'py>(
         .map(|kind| sae_atom_basis_kind_from_str(kind))
         .collect();
     let seed_coords =
-        gam::terms::sae_manifold::sae_pca_seed_initial_coords(z_view, &basis_kinds, &atom_dim)
+        gam::terms::sae::manifold::sae_pca_seed_initial_coords(z_view, &basis_kinds, &atom_dim)
             .map_err(py_value_error)?;
     let plans = sae_build_atom_plans(
         z_view,
@@ -5627,7 +5627,7 @@ fn sae_manifold_predict_oos<'py>(
         .map(|kind| sae_atom_basis_kind_from_str(kind))
         .collect();
     let seed_coords =
-        gam::terms::sae_manifold::sae_pca_seed_initial_coords(x_view, &basis_kinds, &atom_dim)
+        gam::terms::sae::manifold::sae_pca_seed_initial_coords(x_view, &basis_kinds, &atom_dim)
             .map_err(py_value_error)?;
     let mut plans: Vec<SaeAtomBuildPlan> = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
@@ -6030,7 +6030,7 @@ fn sae_manifold_predict_oos<'py>(
 /// ([`gam::inference::steering::steer_delta`]).
 ///
 /// This is the FFI surface for the steering primitive: it rebuilds the fitted
-/// [`gam::terms::sae_manifold::SaeManifoldTerm`] from the trained decoder blocks
+/// [`gam::terms::sae::manifold::SaeManifoldTerm`] from the trained decoder blocks
 /// + basis metadata, seeds it with the *trained* on-atom coordinates and routing
 /// logits (no re-solve — the model is fixed), optionally installs the WP-D
 /// per-row output-Fisher metric ([`gam::inference::row_metric::RowMetric::output_fisher`])
