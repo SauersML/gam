@@ -3121,24 +3121,28 @@ mod empirical_rigid_jet_oracle {
                 }
 
                 // Third tensor: every symmetric component (mmm, mmg, mgg, ggg).
-                let h3 = 3e-3;
+                // Richardson O(h⁴) witness → tolerance tight enough to resolve a
+                // single dropped IFT term.
+                let h3 = 4e-3;
                 for (lbl, om, og, prod) in [
                     ("mmm", 3, 0, third[0][0][0]),
                     ("mmg", 2, 1, third[0][0][1]),
                     ("mgg", 1, 2, third[0][1][1]),
                     ("ggg", 0, 3, third[1][1][1]),
                 ] {
-                    let fd = central_mixed(&f, m[row], g[row], om, og, h3);
+                    let fd = central_mixed_rich(&f, m[row], g[row], om, og, h3);
                     assert!(
-                        (fd - prod).abs() <= 2e-2 * prod.abs().max(1.0),
+                        (fd - prod).abs() <= 5e-3 * prod.abs().max(1.0) + 1e-7,
                         "frailty {frailty_sd:?} row {row}: T3_{lbl} witness {fd:+.6e} != production {prod:+.6e}"
                     );
                 }
 
                 // Fourth tensor: every symmetric component (mmmm..gggg). This is
-                // the #833 block — the IFT term whose prior omission slipped past
-                // every test.
-                let h4 = 8e-3;
+                // the #833 block — the IFT term whose prior omission left the
+                // mggg component ~1.8% short and slipped past every test. The
+                // Richardson witness resolves that magnitude well inside the 1%
+                // band below, so the guard would have caught #833.
+                let h4 = 6e-3;
                 for (lbl, om, og, prod) in [
                     ("mmmm", 4, 0, fourth[0][0][0][0]),
                     ("mmmg", 3, 1, fourth[0][0][0][1]),
@@ -3146,9 +3150,9 @@ mod empirical_rigid_jet_oracle {
                     ("mggg", 1, 3, fourth[0][1][1][1]),
                     ("gggg", 0, 4, fourth[1][1][1][1]),
                 ] {
-                    let fd = central_mixed(&f, m[row], g[row], om, og, h4);
+                    let fd = central_mixed_rich(&f, m[row], g[row], om, og, h4);
                     assert!(
-                        (fd - prod).abs() <= 5e-2 * prod.abs().max(1.0) + 1e-6,
+                        (fd - prod).abs() <= 1e-2 * prod.abs().max(1.0) + 1e-6,
                         "frailty {frailty_sd:?} row {row}: T4_{lbl} witness {fd:+.6e} != production {prod:+.6e}"
                     );
                 }
@@ -3183,25 +3187,25 @@ mod empirical_rigid_jet_oracle {
             .expect("production fourth");
         let prod_mggg = fourth[0][1][1][1];
 
-        // Independent FD witness of T4_mggg.
+        // Independent Richardson O(h⁴) FD witness of T4_mggg.
         let f = |mm: f64, gg: f64| {
             witness_nll(mm, gg, z0, y0, w0, s, &grid.nodes, &grid.weights)
         };
-        let fd_mggg = central_mixed(&f, m0, g0, 1, 3, 8e-3);
+        let fd_mggg = central_mixed_rich(&f, m0, g0, 1, 3, 6e-3);
 
-        // Correct production agrees with the witness…
+        // Correct production agrees with the witness inside the 1% band…
         assert!(
-            (fd_mggg - prod_mggg).abs() <= 5e-2 * prod_mggg.abs().max(1.0) + 1e-6,
+            (fd_mggg - prod_mggg).abs() <= 1e-2 * prod_mggg.abs().max(1.0) + 1e-6,
             "sanity: correct production T4_mggg {prod_mggg:+.6e} should match witness {fd_mggg:+.6e}"
         );
 
-        // …and a planted single-term omission in the same component is loud:
-        // perturb by the magnitude of a representative IFT term so the corrupted
-        // value leaves the witness tolerance band.
-        let corrupted = prod_mggg + 0.05 * prod_mggg.abs().max(1.0) + 1e-2;
+        // …and a planted omission at the historical #833 magnitude (~1.8% of the
+        // mggg component) is loud: it leaves the 1% witness band. This proves the
+        // oracle would have failed on the original #833 bug.
+        let corrupted = prod_mggg * 1.018 + 1e-3;
         assert!(
-            (fd_mggg - corrupted).abs() > 5e-2 * corrupted.abs().max(1.0) + 1e-6,
-            "witness failed to distinguish a planted #833-style omission \
+            (fd_mggg - corrupted).abs() > 1e-2 * corrupted.abs().max(1.0) + 1e-6,
+            "witness failed to distinguish a planted #833-style ~1.8% omission \
              (corrupted {corrupted:+.6e} vs witness {fd_mggg:+.6e})"
         );
     }

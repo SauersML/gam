@@ -2701,6 +2701,129 @@ pub(crate) fn parallel_dense_schur_reduction_deterministic_and_matches_sequentia
     }
 }
 
+/// #1017 cluster-Jacobi build parallelism: the per-cluster `b×b` Schur block
+/// assembly in `ClusterJacobiPreconditioner::build_from_column_groups` runs the
+/// independent rows over fixed 64-row chunks above `SCHUR_MATVEC_PARALLEL_ROW_MIN`
+/// and folds chunk partials in chunk order, exactly like `build_block_jacobi`.
+/// This pins the parallel-fold preconditioner against (a) bit-identical
+/// run-to-run determinism and (b) an independent serial row-order reference of
+/// the same Schur block — so the criterion ranking the preconditioner feeds
+/// cannot move with the thread schedule.
+#[test]
+pub(crate) fn cluster_jacobi_build_deterministic_and_matches_serial() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // > MIN → trips the parallel CPU fold
+    let d = 5usize;
+    let k = 48usize; // single cluster, b = k ≤ CLUSTER_JACOBI_MAX_CLUSTER → Chol path
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let cols: Vec<usize> = (0..k).collect();
+    let col_groups = vec![cols.clone()];
+
+    // A deterministic probe vector to drive `apply` through the assembled factor.
+    let r: Array1<f64> =
+        Array1::from_iter((0..k).map(|j| 0.1 * ((j + 1) as f64).sin() - 0.03 * j as f64));
+
+    // (a) Determinism: two independent parallel builds apply bit-identically.
+    let p_a = ClusterJacobiPreconditioner::build_from_column_groups(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        &col_groups,
+    )
+    .expect("cluster build a");
+    let p_b = ClusterJacobiPreconditioner::build_from_column_groups(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        &col_groups,
+    )
+    .expect("cluster build b");
+    let out_a = p_a.apply(&r);
+    let out_b = p_b.apply(&r);
+    for j in 0..k {
+        assert_eq!(
+            out_a[j].to_bits(),
+            out_b[j].to_bits(),
+            "cluster-Jacobi build must be deterministic run-to-run at {j}"
+        );
+    }
+
+    // (b) Serial reference: assemble the same `b×b` cluster Schur block in
+    // strict row order, factor with the same faer LLT, and solve `r` through it.
+    let b = k;
+    let mut s_ref = Array2::<f64>::zeros((b, b));
+    sys.penalty_subblock_add(&cols, &mut s_ref);
+    for bi in 0..b {
+        s_ref[[bi, bi]] += ridge_beta;
+    }
+    let mut col_vec = Array1::<f64>::zeros(d);
+    let mut solved_cols = Array2::<f64>::zeros((d, b));
+    for (row_idx, row) in sys.rows.iter().enumerate() {
+        for bj in 0..b {
+            let gj = cols[bj];
+            for c in 0..d {
+                col_vec[c] = row.htbeta[[c, gj]];
+            }
+            let solved = backend.solve_block_vector(htt_factors.factor(row_idx), col_vec.view());
+            for c in 0..d {
+                solved_cols[[c, bj]] = solved[c];
+            }
+        }
+        for bi in 0..b {
+            let gi = cols[bi];
+            for bj in 0..b {
+                let mut acc = 0.0;
+                for c in 0..d {
+                    acc += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                }
+                s_ref[[bi, bj]] -= acc;
+            }
+        }
+    }
+    // Mirror the build's symmetrize + faer LLT solve of the probe.
+    for i in 0..b {
+        for j in 0..i {
+            let v = 0.5 * (s_ref[[i, j]] + s_ref[[j, i]]);
+            s_ref[[i, j]] = v;
+            s_ref[[j, i]] = v;
+        }
+    }
+    let llt = {
+        use faer::Side;
+        let view = FaerArrayView::new(&s_ref);
+        FaerLlt::new(view.as_ref(), Side::Lower).expect("reference Schur block must be PD")
+    };
+    let solved_ref = {
+        use faer::linalg::solvers::Solve;
+        let mut rhs = r.clone();
+        let stride = rhs.strides()[0];
+        let len = rhs.len();
+        let rhs_mat =
+            unsafe { faer::MatRef::from_raw_parts(rhs.as_mut_ptr(), len, 1, stride, 0) };
+        let s = llt.solve(rhs_mat);
+        Array1::from_iter((0..b).map(|i| s[(i, 0)]))
+    };
+    let scale = solved_ref
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    let mut max_rel = 0.0_f64;
+    for j in 0..k {
+        max_rel = max_rel.max((out_a[j] - solved_ref[j]).abs() / scale);
+    }
+    assert!(
+        max_rel < 1e-12,
+        "parallel cluster-Jacobi apply must match the serial row-order reference \
+         to reassociation error (rel {max_rel:e})"
+    );
+}
+
 /// Sequential reference for the cross-row matvec: the row-order fold of the
 /// same per-row contributions `arrow_cross_row_matvec` accumulates, followed by
 /// the post-loop `H_ββ + ridge` prologue and cross-row penalty Hessian. Used to
