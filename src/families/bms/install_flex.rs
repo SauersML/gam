@@ -38,12 +38,12 @@ pub(crate) struct BmsFlexBlockContext {
     /// `BernoulliDenseDesignOperator` per anchor, then one for the candidate
     /// (trailing). Indices align with `ordering`.
     pub(super) operators:
-        Vec<std::sync::Arc<dyn crate::families::identifiability::compiler::RowJacobianOperator>>,
+        Vec<std::sync::Arc<dyn crate::identifiability::families::compiler::RowJacobianOperator>>,
     /// Block-order tags parallel to `operators`.
-    pub(super) ordering: Vec<crate::families::identifiability::compiler::BlockOrder>,
+    pub(super) ordering: Vec<crate::identifiability::families::compiler::BlockOrder>,
     /// W-metric row Hessian built from the validated `training_row_weights`.
     pub(super) row_hess:
-        crate::families::identifiability::bernoulli::BernoulliRowHessian,
+        crate::identifiability::families::bernoulli::BernoulliRowHessian,
     /// Dense candidate basis at training rows (n × p_candidate), cached to
     /// avoid a second `design()` call after context construction.
     pub(super) candidate_design_dense: Array2<f64>,
@@ -72,10 +72,10 @@ pub(crate) fn build_bms_flex_block_context(
     training_row_weights: &Array1<f64>,
 ) -> Result<Option<BmsFlexBlockContext>, String> {
     use super::deviation_runtime::AnchorComponentTag;
-    use crate::families::identifiability::bernoulli::{
+    use crate::identifiability::families::bernoulli::{
         BernoulliDenseDesignOperator, BernoulliRowHessian,
     };
-    use crate::families::identifiability::compiler::{BlockOrder, RowJacobianOperator};
+    use crate::identifiability::families::compiler::{BlockOrder, RowJacobianOperator};
 
     let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
     let n = candidate_design.nrows();
@@ -309,8 +309,8 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     flex_anchors: &[&Array2<f64>],
     training_row_weights: &Array1<f64>,
 ) -> Result<FlexCompileOutcome, String> {
-    use crate::families::identifiability::compiler::compile;
-    use crate::solver::identifiability_audit::audit_identifiability_channel_aware;
+    use crate::identifiability::families::compiler::compile;
+    use crate::identifiability::audit::audit_identifiability_channel_aware;
 
     // Fast path: zero-column candidate carries nothing to residualise.
     let p_check = candidate

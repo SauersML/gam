@@ -56,7 +56,7 @@ use crate::linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
 use crate::terms::sae::chart_canonicalization::CanonicalChartTopology;
-use crate::terms::sae_manifold::SaeManifoldTerm;
+use crate::terms::sae::manifold::SaeManifoldTerm;
 use faer::Side;
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
 use std::f64::consts::TAU;
@@ -795,7 +795,7 @@ pub fn partial_supervision_solve(
 
 /// The latent-manifold topology of one fitted atom, as far as the certificate
 /// needs it to enumerate the atom's isometry-group generators. This mirrors the
-/// user-facing [`crate::terms::sae_manifold::SaeAtomBasisKind`] choice but
+/// user-facing [`crate::terms::sae::manifold::SaeAtomBasisKind`] choice but
 /// carries only what is required to build `Isom(M_k)` tangent directions, so the
 /// certificate is decoupled from the full `SaeManifoldAtom` machinery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1044,7 +1044,7 @@ pub struct AtomSmoothSignificance {
 /// delta-method SE conditioned on the generated latent coordinates as if known.
 /// The plug-in curvature point estimate itself survives — as the per-atom
 /// `kappa_hat` entries of
-/// [`crate::terms::sae_manifold::CertificateInputs::per_atom_kappa_hat`] (the
+/// [`crate::terms::sae::manifold::CertificateInputs::per_atom_kappa_hat`] (the
 /// #1008 empirical curved-dictionary report, surfaced to Python as
 /// `ManifoldSAE.curvature_report`), the single source of truth for the bound.
 /// It is deliberately *not* duplicated onto this report: a descriptive geometry
@@ -1233,7 +1233,7 @@ pub struct GeneratorVerdict {
 /// honest certificate treatment is what this struct is: *enumerate* the
 /// group and its dimension `Σ_k r_k(r_k−1)/2`, and record how it is fixed —
 /// by the canonical orientation gauge
-/// ([`crate::terms::sae_manifold::GrassmannFrame`]'s SVD-ordered
+/// ([`crate::terms::sae::manifold::GrassmannFrame`]'s SVD-ordered
 /// representative), which picks one point per `O(r_k)` orbit for
 /// serialization/comparison stability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2673,7 +2673,7 @@ pub struct DictionaryReport {
     /// curvature CI was removed under #1115 (a curvature BOUND is not an
     /// estimand and its SE conditioned on generated regressors); the surviving
     /// plug-in curvature point estimate lives on
-    /// [`crate::terms::sae_manifold::CertificateInputs::per_atom_kappa_hat`],
+    /// [`crate::terms::sae::manifold::CertificateInputs::per_atom_kappa_hat`],
     /// not here. Each report's
     /// fields are computed when the atom carries its fit-time
     /// [`AtomInnerFit`] byproducts and the relevant numerics succeed; otherwise
@@ -2931,7 +2931,7 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
 ///   a sup-norm curvature BOUND is not an estimand with a profiled criterion,
 ///   and its delta-method SE conditioned on generated latent coordinates as if
 ///   known. The plug-in curvature point estimate survives on
-///   [`crate::terms::sae_manifold::CertificateInputs::per_atom_kappa_hat`] (the
+///   [`crate::terms::sae::manifold::CertificateInputs::per_atom_kappa_hat`] (the
 ///   #1008 empirical curved-dictionary report), not on this report.
 pub(crate) fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
     model

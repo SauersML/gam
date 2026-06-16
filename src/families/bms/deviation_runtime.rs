@@ -683,7 +683,7 @@ impl DeviationRuntime {
     ///   `design_at_training_with_residual`.
     pub(crate) fn install_compiled_flex_block(
         &mut self,
-        compiled: &crate::families::identifiability::compiler::CompiledBlock,
+        compiled: &crate::identifiability::families::compiler::CompiledBlock,
         anchor_components: Vec<AnchorComponentTag>,
         n_train_at_training: Array2<f64>,
     ) -> Result<(), String> {

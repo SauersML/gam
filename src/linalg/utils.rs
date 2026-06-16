@@ -633,114 +633,95 @@ pub struct PcgSolveInfo {
     pub condition_estimate: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
-struct PcgDiagnostics {
-    residuals: Vec<f64>,
-    alpha: Vec<f64>,
-    beta: Vec<f64>,
-}
-
-impl PcgDiagnostics {
-    fn new(initial_residual_norm: f64) -> Self {
-        Self {
-            residuals: vec![initial_residual_norm],
-            alpha: Vec::new(),
-            beta: Vec::new(),
-        }
+/// Ritz-based condition-number estimate from a PCG run's per-iteration trace.
+///
+/// Builds the CG Lanczos tridiagonal for the preconditioned operator. For SPD
+/// CG, T has diagonal `1/a_i + b_{i-1}/a_{i-1}` and off-diagonal
+/// `sqrt(b_i)/a_i`. Its eigenvalues are the Ritz estimates of the
+/// preconditioned operator's spectrum; `cond ≈ λ_max(T) / λ_min(T)`.
+///
+/// (Gershgorin disc bounds were tried previously: they are guaranteed
+/// *enclosures*, not estimates — systematically pessimistic, frequently
+/// producing a negative lower bound even for SPD T and collapsing the estimate
+/// to `None`. With `k ≤ 256` a direct symmetric eigensolve is microseconds and
+/// yields the genuine Ritz values.)
+fn pcg_condition_estimate(diagnostics: &PcgDiagnostics) -> Option<f64> {
+    let alpha = &diagnostics.alpha;
+    let beta = &diagnostics.beta;
+    let k = alpha.len();
+    if k == 0 || k > 256 {
+        return None;
     }
-
-    fn push_iteration(&mut self, alpha: f64, beta: Option<f64>, residual_norm: f64) {
-        self.alpha.push(alpha);
-        if let Some(beta) = beta {
-            self.beta.push(beta);
-        }
-        self.residuals.push(residual_norm);
-    }
-
-    fn condition_estimate(&self) -> Option<f64> {
-        // Build the CG Lanczos tridiagonal for the preconditioned operator.
-        // For SPD CG, T has diagonal 1/a_i + b_{i-1}/a_{i-1} and off-diagonal
-        // sqrt(b_i)/a_i. Its eigenvalues are the Ritz estimates of the
-        // preconditioned operator's spectrum; cond ≈ λ_max(T) / λ_min(T).
-        //
-        // Previous code substituted Gershgorin disc bounds for the Ritz
-        // values. Those bounds are guaranteed *enclosures*, not estimates:
-        // they are systematically pessimistic and frequently produce a
-        // negative lower bound even for SPD T, which then collapsed the
-        // condition estimate to `None` and lost the diagnostic. With k ≤ 256
-        // a direct symmetric eigensolve is microseconds and yields the
-        // genuine Ritz values.
-        let k = self.alpha.len();
-        if k == 0 || k > 256 {
+    let mut t = ndarray::Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        let alpha_i = alpha[i];
+        if !alpha_i.is_finite() || alpha_i <= 0.0 {
             return None;
         }
-        let mut t = ndarray::Array2::<f64>::zeros((k, k));
-        for i in 0..k {
-            let alpha_i = self.alpha[i];
-            if !alpha_i.is_finite() || alpha_i <= 0.0 {
+        let mut diag = 1.0 / alpha_i;
+        if i > 0 {
+            let beta_prev = beta.get(i - 1).copied()?;
+            if !beta_prev.is_finite() || beta_prev < 0.0 {
                 return None;
             }
-            let mut diag = 1.0 / alpha_i;
-            if i > 0 {
-                let beta_prev = self.beta.get(i - 1).copied()?;
-                if !beta_prev.is_finite() || beta_prev < 0.0 {
-                    return None;
-                }
-                diag += beta_prev / self.alpha[i - 1];
-            }
-            t[[i, i]] = diag;
-            if i + 1 < k {
-                let beta_i = self.beta.get(i).copied().unwrap_or(0.0);
-                if !beta_i.is_finite() || beta_i < 0.0 {
-                    return None;
-                }
-                let off = beta_i.sqrt() / alpha_i;
-                t[[i, i + 1]] = off;
-                t[[i + 1, i]] = off;
-            }
+            diag += beta_prev / alpha[i - 1];
         }
-        let (evals, _) = t.eigh(Side::Lower).ok()?;
-        let mut lower = f64::INFINITY;
-        let mut upper = f64::NEG_INFINITY;
-        for &v in evals.iter() {
-            if !v.is_finite() {
+        t[[i, i]] = diag;
+        if i + 1 < k {
+            let beta_i = beta.get(i).copied().unwrap_or(0.0);
+            if !beta_i.is_finite() || beta_i < 0.0 {
                 return None;
             }
-            if v < lower {
-                lower = v;
-            }
-            if v > upper {
-                upper = v;
-            }
-        }
-        if lower > 0.0 && upper > 0.0 {
-            Some(upper / lower)
-        } else {
-            None
+            let off = beta_i.sqrt() / alpha_i;
+            t[[i, i + 1]] = off;
+            t[[i + 1, i]] = off;
         }
     }
-
-    fn info(
-        &self,
-        iterations: usize,
-        converged: bool,
-        rhs_norm: f64,
-        final_residual_norm: f64,
-    ) -> PcgSolveInfo {
-        let initial = self.residuals.first().copied().unwrap_or(rhs_norm);
-        PcgSolveInfo {
-            iterations,
-            converged,
-            relative_residual_norm: final_residual_norm / rhs_norm.max(1.0),
-            initial_residual_norm: initial,
-            final_residual_norm,
-            residual_reduction: if initial > 0.0 {
-                final_residual_norm / initial
-            } else {
-                0.0
-            },
-            condition_estimate: self.condition_estimate(),
+    let (evals, _) = t.eigh(Side::Lower).ok()?;
+    let mut lower = f64::INFINITY;
+    let mut upper = f64::NEG_INFINITY;
+    for &v in evals.iter() {
+        if !v.is_finite() {
+            return None;
         }
+        if v < lower {
+            lower = v;
+        }
+        if v > upper {
+            upper = v;
+        }
+    }
+    if lower > 0.0 && upper > 0.0 {
+        Some(upper / lower)
+    } else {
+        None
+    }
+}
+
+/// Assemble the public [`PcgSolveInfo`] from a finished [`pcg_core`] run.
+fn pcg_solve_info(result: &PcgCoreResult) -> PcgSolveInfo {
+    let rhs_norm = result.rhs_norm;
+    let final_residual_norm = result.final_residual_norm;
+    let initial = result
+        .diagnostics
+        .as_ref()
+        .and_then(|d| d.residuals.first().copied())
+        .unwrap_or(rhs_norm);
+    PcgSolveInfo {
+        iterations: result.iterations,
+        converged: result.stop == PcgStop::Converged,
+        relative_residual_norm: final_residual_norm / rhs_norm.max(1.0),
+        initial_residual_norm: initial,
+        final_residual_norm,
+        residual_reduction: if initial > 0.0 {
+            final_residual_norm / initial
+        } else {
+            0.0
+        },
+        condition_estimate: result
+            .diagnostics
+            .as_ref()
+            .and_then(pcg_condition_estimate),
     }
 }
 

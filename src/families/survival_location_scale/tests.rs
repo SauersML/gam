@@ -2728,7 +2728,7 @@ fn prepare_model_joint_audit_resolves_via_gauge_ownership() {
     // via gauge ownership instead of refusing the fit. Under the old
     // uniform `gauge_priority: 100` this same joint produced
     // `fatal = true` (`IdentifiabilityFailure`).
-    use crate::solver::identifiability_canonical::canonicalize_for_identifiability;
+    use crate::identifiability::canonical::canonicalize_for_identifiability;
 
     let n = 8usize;
     // A shared constant column plus a per-block linear covariate. The

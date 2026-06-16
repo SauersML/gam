@@ -35,7 +35,7 @@ pub enum CustomFamilyError {
     /// without reparsing.
     #[error("identifiability audit refused the fit: {}", audit.summary)]
     IdentifiabilityFailure {
-        audit: crate::solver::identifiability_audit::IdentifiabilityAudit,
+        audit: crate::identifiability::audit::IdentifiabilityAudit,
     },
     /// MAP estimate uniqueness condition `ker(J^T W J) ∩ ker(S) = {0}` is
     /// violated.  A null direction of `J^T W J` carries zero penalty
@@ -45,7 +45,7 @@ pub enum CustomFamilyError {
     /// the unpenalised direction.
     #[error("MAP estimate non-unique: {}", error)]
     MapUniquenessFailure {
-        error: crate::solver::identifiability_audit::MapUniquenessError,
+        error: crate::identifiability::audit::MapUniquenessError,
     },
 }
 

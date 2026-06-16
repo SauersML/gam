@@ -135,7 +135,7 @@ pub fn fit_survival_marginal_slope_terms(
     // `make_family` to the compiled triplet — that is the one-line
     // promotion from observability-only to active reduction.
     {
-        use crate::families::survival_marginal_slope_identifiability::{
+        use crate::identifiability::marginal_slope::{
             SurvivalRowHessian, compile_survival_parametric_designs,
         };
         let n_rows = spec.time_block.design_entry.nrows();
@@ -781,7 +781,7 @@ pub fn fit_survival_marginal_slope_terms(
         logslope_penalties_vm,
         recompile_after_accept,
     ): SmgsCutoverTuple = {
-        use crate::families::survival_marginal_slope_identifiability::{
+        use crate::identifiability::marginal_slope::{
             CompiledSurvivalDesignsVMExact, apply_compiled_map_to_designs,
             extract_term_partition_from_penalty_ranges,
         };
@@ -921,12 +921,12 @@ pub fn fit_survival_marginal_slope_terms(
             // standard identifiability resolution, here at the operating-point
             // W rather than at β=0.
             {
-                use crate::families::identifiability::compiler::{
+                use crate::identifiability::families::compiler::{
                     BlockOrder as IdBlockOrder, compile_from_raw_grams,
                 };
                 let closed_form = (|| -> Result<
                     Option<(
-                        crate::families::identifiability::compiler::CompiledMap,
+                        crate::identifiability::families::compiler::CompiledMap,
                         (usize, usize, usize),
                     )>,
                     String,
@@ -1057,13 +1057,13 @@ pub fn fit_survival_marginal_slope_terms(
                         // in the correct identifiable quotient (the closed-form
                         // fast path engages). Only when the full row Hessian ALSO
                         // deletes the channel is the alias real → unreduced design.
-                        use crate::families::survival_marginal_slope_identifiability::{
+                        use crate::identifiability::marginal_slope::{
                             SurvivalRowHessian, compile_survival_parametric_designs_per_term,
                             compiled_map_from_per_term,
                         };
                         let full_row_hess = (|| -> Result<
                             Option<(
-                                crate::families::identifiability::compiler::CompiledMap,
+                                crate::identifiability::families::compiler::CompiledMap,
                                 (usize, usize, usize),
                             )>,
                             String,
@@ -2283,7 +2283,7 @@ pub fn fit_survival_marginal_slope_terms(
             solved.fit.block_states.first().map(|s| s.beta.clone())
         };
         let recompile_result = (|| -> Result<(usize, usize, usize), String> {
-            use crate::families::survival_marginal_slope_identifiability::{
+            use crate::identifiability::marginal_slope::{
                 SurvivalRowHessian, compile_survival_parametric_designs_per_term,
             };
             let beta_time = raw_time_beta

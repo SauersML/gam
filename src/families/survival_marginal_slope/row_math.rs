@@ -76,7 +76,7 @@ pub(crate) fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f
 /// large-scale fit is along the η₁ channel (time ↔ marginal ↔ logslope
 /// ↔ score_warp ↔ link_dev all share constant + low-order columns that
 /// project onto η₁). A fully chain-corrected metric is exactly what
-/// `families::identifiability_compiler` (Phase 3, family-agnostic
+/// `identifiability::families::compiler` (Phase 3, family-agnostic
 /// `RowJacobianOperator` / `RowHessian` driver)
 /// provides as the canonical home; this SMGS pre-PIRLS pilot reparam is
 /// the principled scope for *alias killing only*. Two blocks with the

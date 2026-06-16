@@ -327,7 +327,7 @@ pub(crate) fn prepare_survival_location_scale_model(
         // The three coupled blocks (`time_transform`, `threshold`,
         // `log_sigma`) each contribute a constant / intercept-like direction
         // into the flat n-row joint design the pre-fit identifiability audit
-        // RRQRs (`solver::identifiability_audit::audit_identifiability`).
+        // RRQRs (`identifiability::audit::audit_identifiability`).
         // Those constant directions are mutually aliased (e.g. for a single
         // linear covariate the `time_transform[0] ~ threshold[0]` overlap is
         // ≈ 0.98), so the joint design is genuinely rank-deficient by exactly

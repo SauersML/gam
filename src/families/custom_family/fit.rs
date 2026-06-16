@@ -19,7 +19,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// `eta = design · beta` is invariant under the transform, so the
 /// reduced-space `eta` field carries through unchanged.
 pub(crate) fn lift_block_states_to_raw(
-    canonical: &crate::solver::identifiability_canonical::CanonicalSpecs,
+    canonical: &crate::identifiability::canonical::CanonicalSpecs,
     reduced: Vec<ParameterBlockState>,
 ) -> Vec<ParameterBlockState> {
     let theta_blocks: Vec<Array1<f64>> = reduced.iter().map(|s| s.beta.clone()).collect();
@@ -42,7 +42,7 @@ pub(crate) fn lift_block_states_to_raw(
 /// rank-deficient by construction along the dropped directions
 /// (matching the inner-solve geometry the canonical step produced).
 pub(crate) fn lift_fit_geometry_to_raw(
-    canonical: &crate::solver::identifiability_canonical::CanonicalSpecs,
+    canonical: &crate::identifiability::canonical::CanonicalSpecs,
     covariance_conditional: Option<Array2<f64>>,
     geometry: Option<FitGeometry>,
 ) -> (Option<Array2<f64>>, Option<FitGeometry>) {
@@ -63,7 +63,7 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) rho_physical: Array1<f64>,
     pub(crate) covariance_conditional: Option<Array2<f64>>,
     pub(crate) geometry: Option<FitGeometry>,
-    pub(crate) canonical: Option<&'a crate::solver::identifiability_canonical::CanonicalSpecs>,
+    pub(crate) canonical: Option<&'a crate::identifiability::canonical::CanonicalSpecs>,
     pub(crate) result_specs: &'a [ParameterBlockSpec],
     pub(crate) penalized_objective: f64,
     pub(crate) outer_iterations: usize,
@@ -523,7 +523,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         canonical_n_cols_raw,
     );
     let canonical =
-        crate::solver::identifiability_canonical::canonicalize_for_identifiability(raw_specs)?;
+        crate::identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
     let canonical_n_cols_red: usize = canonical
         .reduced_specs
         .iter()
@@ -1806,13 +1806,13 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
     // pipeline.
     //
     // The principled construction-time orthogonalisation lives in
-    // `crate::families::identifiability_compiler` (and the per-family
+    // `crate::identifiability::families::compiler` (and the per-family
     // `*_identifiability.rs` modules). Once Phase 4b threads those
     // compiled operators through the family construction sites, the
     // raw joint design will already be rank-clean on entry and this
     // gate becomes a defensive check.
     let audit =
-        crate::solver::identifiability_audit::audit_identifiability(specs).map_err(|reason| {
+        crate::identifiability::audit::audit_identifiability(specs).map_err(|reason| {
             CustomFamilyError::DimensionMismatch {
                 reason: format!(
                     "fit_custom_family_fixed_log_lambda_warm_start identifiability audit failed: {reason}"

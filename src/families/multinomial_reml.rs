@@ -1371,7 +1371,7 @@ mod tests {
     //! The reference class `K − 1` carries `η ≡ 0` and is NOT represented
     //! as a parameter block — so the gauge is set entirely by the block
     //! layout. These tests pin three invariants the canonical
-    //! [`crate::solver::identifiability_canonical::canonicalize_for_identifiability`]
+    //! [`crate::identifiability::canonical::canonicalize_for_identifiability`]
     //! step must preserve:
     //!
     //! 1. Block count `= K − 1` and block names `class_0 … class_{K-2}`.

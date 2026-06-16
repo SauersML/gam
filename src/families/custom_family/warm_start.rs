@@ -396,7 +396,7 @@ pub(crate) fn custom_family_blockwise_edf(
 /// `precomputed_edf` unset (and the raw-geometry fallback applies).
 pub(crate) fn reduced_blockwise_edf(
     reduced_geometry: Option<&FitGeometry>,
-    canonical: &crate::solver::identifiability_canonical::CanonicalSpecs,
+    canonical: &crate::identifiability::canonical::CanonicalSpecs,
     lambdas: &Array1<f64>,
 ) -> Option<(f64, Vec<f64>, Vec<f64>)> {
     let geom = reduced_geometry?;
