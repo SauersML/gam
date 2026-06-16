@@ -2038,7 +2038,10 @@ impl<'a> RemlState<'a> {
             prior,
         )
         .map_err(EstimationError::InvalidInput)?;
-        let result = self.apply_tk_to_result(result, tk_terms)?;
+        let result = self.apply_theta_correction_atom_to_result(
+            result,
+            super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms("tierney_kadane", tk_terms),
+        )?;
         // Adaptive, block-local Laplace-to-sampling fallback (issue #784): where
         // a curvature direction is too non-Gaussian for the Laplace summary,
         // splice in the importance-sampled block marginal correction. Reuses
@@ -2046,7 +2049,13 @@ impl<'a> RemlState<'a> {
         // outer REML/LAML stays consistent. A no-op when every direction is
         // Laplace-trustworthy.
         let block_terms = self.block_local_sampled_correction(rho, bundle, assembly_ext_len)?;
-        let result = self.apply_tk_to_result(result, block_terms)?;
+        let result = self.apply_theta_correction_atom_to_result(
+            result,
+            super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
+                "sampled_block_marginal",
+                block_terms,
+            ),
+        )?;
         let result = self.apply_alo_stabilization_to_result(rho, bundle, mode, result)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &result);
         if let Some(polish_step) = result.inner_polish_step.as_ref() {
@@ -2091,7 +2100,10 @@ impl<'a> RemlState<'a> {
             prior,
         )
         .map_err(EstimationError::InvalidInput)?;
-        let cost_result = self.apply_tk_to_result(cost_result, tk_terms)?;
+        let cost_result = self.apply_theta_correction_atom_to_result(
+            cost_result,
+            super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms("tierney_kadane", tk_terms),
+        )?;
         // Fold the #784 adaptive block-local Laplace-to-sampling correction into
         // the EFS objective too, so the EFS fixed-point and the BFGS/Newton path
         // (`assemble_and_evaluate`) optimize the SAME marginal-likelihood
@@ -2099,7 +2111,13 @@ impl<'a> RemlState<'a> {
         // like TK, which the universal EFS step already folds in. No-op when no
         // direction is non-Gaussian.
         let block_terms = self.block_local_sampled_correction(rho, bundle, assembly_ext_len)?;
-        let cost_result = self.apply_tk_to_result(cost_result, block_terms)?;
+        let cost_result = self.apply_theta_correction_atom_to_result(
+            cost_result,
+            super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
+                "sampled_block_marginal",
+                block_terms,
+            ),
+        )?;
         // Augment with the ALO stabilization term BEFORE the gradient is read,
         // so the EFS step (which is driven by `cost_result.gradient` and
         // `cost_result.cost`) targets the same stabilized stationarity equation

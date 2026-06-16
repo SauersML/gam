@@ -58,6 +58,7 @@ pub enum SmoothingCorrectionOutcome {
     /// Cubature upgrade succeeded.
     Cubature {
         correction: Array2<f64>,
+        rho_covariance: Option<Array2<f64>>,
         rank: usize,
         n_points: usize,
         near_boundary: bool,
@@ -67,6 +68,7 @@ pub enum SmoothingCorrectionOutcome {
     /// Principled first-order linearization was returned.
     FirstOrder {
         correction: Option<Array2<f64>>,
+        rho_covariance: Option<Array2<f64>>,
         reason: &'static str,
         severity: SmoothingCorrectionFallbackSeverity,
     },
@@ -82,6 +84,18 @@ impl SmoothingCorrectionOutcome {
         match self {
             SmoothingCorrectionOutcome::Cubature { correction, .. } => Some(correction),
             SmoothingCorrectionOutcome::FirstOrder { correction, .. } => correction,
+        }
+    }
+
+    /// Read the regularized inverse outer Hessian `Cov(rho_hat)`, when the
+    /// selected path produced one. This is consumed by higher-order LR
+    /// inference and does not affect the covariance correction matrix.
+    pub fn rho_covariance(&self) -> Option<&Array2<f64>> {
+        match self {
+            SmoothingCorrectionOutcome::Cubature { rho_covariance, .. }
+            | SmoothingCorrectionOutcome::FirstOrder { rho_covariance, .. } => {
+                rho_covariance.as_ref()
+            }
         }
     }
 

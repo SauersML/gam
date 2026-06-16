@@ -840,6 +840,7 @@ pub(crate) fn compute_smoothing_correction(
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: Some(hessian_rho),
+                rho_covariance: None,
                 active_rank: None,
             };
         }
@@ -867,6 +868,7 @@ pub(crate) fn compute_smoothing_correction(
         return SmoothingCorrectionComputation {
             correction: None,
             hessian_rho: Some(hessian_rho),
+            rho_covariance: Some(inverted.inverse),
             active_rank: Some(0),
         };
     }
@@ -892,6 +894,7 @@ pub(crate) fn compute_smoothing_correction(
     let repaired_hessian = inverted.repaired_hessian;
     let active_rank_used = inverted.active_rank;
     let v_rho = inverted.inverse;
+    let rho_covariance = v_rho.clone();
     if repaired_hessian {
         log::debug!(
             "Applied rank-deficient pseudo-inverse on identified rho-Hessian subspace before smoothing correction."
@@ -921,6 +924,7 @@ pub(crate) fn compute_smoothing_correction(
         return SmoothingCorrectionComputation {
             correction: None,
             hessian_rho: Some(hessian_rho),
+            rho_covariance: Some(rho_covariance),
             active_rank: Some(active_rank_used),
         };
     }
@@ -960,6 +964,7 @@ pub(crate) fn compute_smoothing_correction(
                 return SmoothingCorrectionComputation {
                     correction: None,
                     hessian_rho: Some(hessian_rho),
+                    rho_covariance: Some(rho_covariance),
                     active_rank: Some(active_rank_used),
                 };
             }
@@ -974,6 +979,7 @@ pub(crate) fn compute_smoothing_correction(
                 return SmoothingCorrectionComputation {
                     correction: None,
                     hessian_rho: Some(hessian_rho),
+                    rho_covariance: Some(rho_covariance),
                     active_rank: Some(active_rank_used),
                 };
             }
@@ -985,6 +991,7 @@ pub(crate) fn compute_smoothing_correction(
     SmoothingCorrectionComputation {
         correction: Some(v_corr_orig),
         hessian_rho: Some(hessian_rho),
+        rho_covariance: Some(rho_covariance),
         active_rank: Some(active_rank_used),
     }
 }

@@ -78,6 +78,11 @@ pub mod inference;
 pub mod linalg;
 pub mod model_types;
 pub mod report;
+/// Lower-layer resource-policy/materialization-budget types. Hosted at the
+/// crate root (not under `solver`) so the `families` layer can name them
+/// without importing *up* into `solver` (#1135). `crate::solver::resource`
+/// remains a back-compat re-export.
+pub mod resource;
 pub mod solver;
 pub mod terms;
 pub mod test_support;

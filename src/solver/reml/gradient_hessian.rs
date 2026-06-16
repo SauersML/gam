@@ -1977,35 +1977,36 @@ impl<'a> RemlState<'a> {
         Ok(())
     }
 
-    pub(crate) fn apply_tk_to_result(
+    pub(crate) fn apply_theta_correction_atom_to_result(
         &self,
         mut result: super::reml_outer_engine::RemlLamlResult,
-        tk_terms: TkCorrectionTerms,
+        correction: super::atoms::ThetaOnlyCorrectionAtom,
     ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
-        result.cost += tk_terms.value;
-        if let Some(tk_hess) = tk_terms.hessian.as_ref() {
+        result.cost += correction.cost();
+        if let Some(correction_hess) = correction.hessian() {
             result
                 .hessian
-                .add_rho_block_dense(tk_hess)
+                .add_rho_block_dense(correction_hess)
                 .map_err(EstimationError::InvalidInput)?;
         }
-        if let (Some(ref mut grad), Some(tk_grad)) = (result.gradient.as_mut(), tk_terms.gradient) {
-            if tk_grad.len() == grad.len() {
-                **grad += &tk_grad;
+        if let (Some(ref mut grad), Some(correction_grad)) =
+            (result.gradient.as_mut(), correction.gradient())
+        {
+            if correction_grad.len() == grad.len() {
+                **grad += correction_grad;
             } else {
                 // The unified evaluator returns one gradient entry per
-                // (ρ, ext_coord) coordinate; the analytic Tierney–Kadane
-                // propagation in `tk_gradient_from_shared` produces exactly
-                // the same per-coordinate layout (`tk_penalties.len() +
-                // ext_drifts.len()`).  An arity mismatch means the two
-                // sides were assembled against different coordinate sets,
-                // which would yield a structurally inconsistent total
-                // gradient and is therefore rejected outright instead of
-                // silently zero-padding or truncating.
+                // (ρ, ext_coord) coordinate; theta-only correction atoms must
+                // emit exactly the same coordinate layout. An arity mismatch
+                // means the correction and evaluator were assembled against
+                // different coordinate sets, which would yield a structurally
+                // inconsistent total gradient and is therefore rejected
+                // outright instead of silently zero-padding or truncating.
                 crate::bail_invalid_estim!(
-                    "Tierney-Kadane gradient coordinate count mismatch: evaluator produced {} entries, analytic c/d propagation produced {}; this indicates the TK term and the unified evaluator were assembled against different coordinate sets",
+                    "{} gradient coordinate count mismatch: evaluator produced {} entries, correction atom produced {}; this indicates the correction term and the unified evaluator were assembled against different coordinate sets",
+                    correction.label,
                     grad.len(),
-                    tk_grad.len()
+                    correction_grad.len()
                 );
             }
         }

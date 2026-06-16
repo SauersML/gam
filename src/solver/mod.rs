@@ -27,7 +27,10 @@ pub(crate) mod priority_selection;
 pub mod protocol;
 pub mod psi_gram_tensor;
 pub mod residual_cascade;
-pub mod resource;
+/// Back-compat re-export: resource-policy types moved to the crate-root
+/// `crate::resource` lower layer to break the `families → solver::resource`
+/// back-edge (#1135). Existing `crate::solver::resource::*` paths keep working.
+pub use crate::resource;
 pub mod rho_optimizer;
 pub(crate) mod riemannian_retraction;
 pub mod row_measure;
