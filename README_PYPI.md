@@ -81,10 +81,21 @@ inputs are all accepted without conversion.
 - Dispersion GAMLSS for Gamma, Beta, negative-binomial, and Tweedie via
   `noise_formula=`.
 - Per-axis anisotropy inside a single joint smooth.
+- Shape-constrained smooths: `s(x, shape=monotone_increasing)`,
+  `convex`, `concave`.
+- Difference smooths: `by=` factor smooths plus covariance-aware
+  `model.difference_smooth(...)` contrasts with optional simultaneous
+  bands.
 - Marginal-slope models that separate baseline risk from a calibrated
   score's effect, for Bernoulli and survival outcomes.
+- Survival in several likelihood modes (transformation, Weibull,
+  location-scale, marginal-slope, latent-Gaussian frailty) plus
+  competing-risks cumulative-incidence functions.
+- Response geometry for spherical and compositional outcomes via
+  Fréchet-mean tangent-space GAMs.
 - Posterior sampling via NUTS where supported, Gaussian Laplace
-  otherwise, behind one API.
+  otherwise, behind one API; conformal prediction intervals via
+  `interval="conformal"`.
 
 ## API examples
 
