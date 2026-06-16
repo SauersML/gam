@@ -6807,26 +6807,6 @@ impl SaeManifoldTerm {
         Ok(dz)
     }
 
-    pub(crate) fn decoded_second_row(
-        atom: &SaeManifoldAtom,
-        second_jet: &Array4<f64>,
-        row: usize,
-        axis_a: usize,
-        axis_b: usize,
-        out: &mut [f64],
-    ) {
-        out.fill(0.0);
-        for basis_col in 0..atom.basis_size() {
-            let d2phi = second_jet[[row, basis_col, axis_a, axis_b]];
-            if d2phi == 0.0 {
-                continue;
-            }
-            for out_col in 0..atom.output_dim() {
-                out[out_col] += d2phi * atom.decoder_coefficients[[basis_col, out_col]];
-            }
-        }
-    }
-
     fn reconstruction_row_program_for_logdet(
         &self,
         rho: &SaeManifoldRho,
@@ -7033,7 +7013,6 @@ impl SaeManifoldTerm {
     ) -> Result<SaeRowJets, String> {
         let p = self.output_dim();
         let q = vars.len();
-        let k_atoms = self.k_atoms();
         let sqrt_row_w = self
             .row_loss_weights
             .as_deref()
