@@ -39,8 +39,11 @@ use std::sync::Once;
 use std::time::Instant;
 
 const SEED: u64 = 0xB10B_AA5C_A1E5_2026;
-// Large enough to enter the slow regime, small enough to eu-stack on a node.
-const PROFILE_N: usize = 150_000;
+// Small by default so the ordinary test run is fast (it asserts nothing about
+// wall-clock — only that the rigid order=0/power=9/no-linkwiggle SHAPE fits and
+// prints profile stats). Bump to ~150_000 manually to enter the slow regime and
+// eu-stack the joint-Newton phase on a compute node.
+const PROFILE_N: usize = 2_000;
 
 struct StderrInfoLogger;
 impl log::Log for StderrInfoLogger {
