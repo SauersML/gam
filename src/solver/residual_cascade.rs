@@ -813,7 +813,8 @@ impl Core {
         let mut p_dir = zv.clone();
         let mut rz: f64 = r.iter().zip(zv.iter()).map(|(&a, &c)| a * c).sum();
         let mut ap = vec![0.0; m];
-        for iter in 0..CG_MAX_ITERS {
+        let max_iters = CG_MAX_ITERS;
+        for iter in 0..max_iters {
             let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
             if r_norm <= CG_RTOL * b_norm {
                 return Ok((x, r_norm / b_norm, iter));
