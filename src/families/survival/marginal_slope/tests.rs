@@ -5531,8 +5531,8 @@ fn step6_joint_beta_pullback_matches_cpu_dense_assembly_flex_no_wiggle() {
         //                (no sign flip), so `H_p = f_pipi` with the raw J.
         let g_p: Vec<f64> = f_pi.iter().map(|&v| -v).collect();
         let h_p: Vec<f64> = f_pipi.iter().copied().collect();
-        debug_assert_eq!(g_p.len(), r);
-        debug_assert_eq!(h_p.len(), r * r);
+        assert_eq!(g_p.len(), r);
+        assert_eq!(h_p.len(), r * r);
 
         // Dense row Jacobian `J[a*p + j] = ∂ primary_a / ∂ β_j` (raw, unsigned).
         let mut jac = vec![0.0_f64; r * p];

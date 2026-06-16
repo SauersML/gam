@@ -82,7 +82,7 @@
 
 use gam::geometry::constant_curvature::ConstantCurvature;
 use gam::geometry::manifold::RiemannianManifold;
-use gam::geometry::{fit_response_curvature, response_curvature_criterion};
+use gam::geometry::{CurvatureVerdict, fit_response_curvature, response_curvature_criterion};
 use ndarray::{Array1, Array2};
 
 // ── deterministic RNG: splitmix64 → unit / standard-normal, no external deps ──
@@ -572,4 +572,194 @@ fn bracket_via_criterion(values: ndarray::ArrayView2<'_, f64>) -> (f64, f64) {
     response_curvature_criterion(values, dim, mid)
         .expect("criterion evaluable at bracket midpoint");
     (kappa_min, kappa_max)
+}
+
+/// (6) THE κ·r² RESOLUTION POWER CURVE + the honest flat-floor `sign_resolved`
+/// contract (#944 power-analysis deliverable; closes the #1059 / capstone-#977
+/// reopening defect "V_p rails to the +κ bound for hyperbolic truth").
+///
+/// ## The defect this pins, stated so it can lose
+///
+/// Curvature is resolvable only through the dimensionless product `κ·r²`, and the
+/// per-point Fisher information for κ scales like `σ⁴` (module header). At the
+/// small-spread negative-κ operating point the earlier recovery table uses
+/// (σ = 0.08, κ⋆ < 0 ⇒ `|κ·r²| ≈ 0.025`), a SINGLE cloud's profiled-criterion
+/// argmin κ̂ can land on the WRONG side of zero — empirically a coin-flip — and
+/// because the chart's spherical cap is the nearer bracket bound, that wrong
+/// landing rails toward `+κ`. That is the exact "rails to +1.9 for hyperbolic
+/// truth" behaviour the capstone reopening flags.
+///
+/// The criterion is NOT biased: averaged over clouds it minimises at κ⋆ (the
+/// estimand is sound). The failure is a RESOLUTION limit. The honest fix is to
+/// (a) establish where κ·r² is large enough that the single-cloud point estimate
+/// is reliable, and (b) make the estimator REPORT when it is below that floor so a
+/// caller never quotes a sign-confident κ̂ on noise. This test asserts both, and
+/// asserts the estimator's CI is honest at the floor (it never confidently claims
+/// the WRONG geometry) — converting a silent rail into a reported finding.
+///
+/// ## What is asserted (all against self-constructed truth)
+///
+///   * **RESOLVED band.** At a well-resolved hyperbolic operating point
+///     (`|κ·r²| ≳ 0.15`), single-cloud sign recovery is reliable across many
+///     seeds AND `sign_resolved = true` AND the CI verdict is `Hyperbolic` — the
+///     point estimate may be quoted with its sign.
+///   * **HONEST FLAT FLOOR.** At the under-resolved operating point
+///     (`|κ·r²| ≈ 0.025`, the recovery-table σ = 0.08 hyperbolic case), the
+///     estimator must FLAG `sign_resolved = false` on essentially every cloud
+///     (the point estimate's sign is noise) AND must NEVER return a CI that
+///     confidently claims the WRONG (spherical) sign. A single railed κ̂ > 0 is
+///     fine ONLY when `sign_resolved` is false — that is the rail made honest.
+///   * **MONOTONE POWER.** The fraction of clouds whose CI confidently resolves
+///     the (correct, hyperbolic) sign is monotone non-decreasing as `|κ·r²|` grows
+///     across a σ ladder — the power curve the #944 charter asks for.
+#[test]
+fn response_curvature_sign_resolution_power_curve_and_honest_flat_floor() {
+    let dim = DIM;
+    let k_star = -2.0; // genuinely hyperbolic truth
+    let n = 4000usize;
+    // A σ ladder straddling the resolution floor. σ = 0.08 is the recovery-table
+    // operating point where |κ·r²| ≈ 0.025 (the coin-flip / rail regime); σ = 0.20
+    // lifts |κ·r²| to ≈ 0.16 (reliably resolved). r ≈ 2·(spread) ≈ 2·1.4·σ on this
+    // isotropic cloud, so κ·r² ≈ k_star·(2.8σ)² grows quadratically in σ.
+    let sigmas = [0.08_f64, 0.12, 0.16, 0.20];
+    let reps = 24usize;
+
+    println!(
+        "\n#944 κ·r² sign-resolution power curve (dim={dim}, n={n}, κ⋆={k_star}, reps={reps}):"
+    );
+    println!("   σ      mean|κ·r²|   sign_resolved_rate   correct_sign_rate   wrong_confident");
+
+    let mut resolved_rates: Vec<(f64, f64)> = Vec::with_capacity(sigmas.len());
+
+    for &sigma in &sigmas {
+        let mut sum_abs_kr2 = 0.0_f64;
+        let mut n_sign_resolved = 0usize; // CI excludes 0 (verdict != Flat)
+        let mut n_correct_sign = 0usize; // κ̂ < 0 (the true side)
+        let mut n_wrong_confident = 0usize; // CI confidently claims +κ (Spherical) — the BUG
+        for r in 0..reps {
+            let seed = 0x944C_0FFE_0000_0000_u64
+                ^ ((sigma.to_bits()).rotate_left(17))
+                ^ ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) + 1);
+            let values = synth_cloud(dim, k_star, n, sigma, seed);
+            let fit = fit_response_curvature(values.view(), dim, LEVEL, FIT_TOL, FIT_ITERS)
+                .expect("response curvature fit on hyperbolic cloud");
+
+            sum_abs_kr2 += fit.kappa_r2.abs();
+            if fit.sign_resolved {
+                n_sign_resolved += 1;
+            }
+            if fit.kappa_hat < 0.0 {
+                n_correct_sign += 1;
+            }
+            // The estimand is hyperbolic; a CI that EXCLUDES 0 on the SPHERICAL side
+            // is a confident WRONG-sign claim — the defect the reopening flags. It
+            // must essentially never happen, and certainly never while the point
+            // estimate also rails positive without a `sign_resolved = false` honesty
+            // flag.
+            if matches!(fit.profile_ci.verdict, CurvatureVerdict::Spherical) {
+                n_wrong_confident += 1;
+                // The CONTRACT: a confident-spherical verdict on hyperbolic truth is
+                // already a defect, but the unforgivable one is a SILENT rail — κ̂ > 0
+                // presented as resolved. `sign_resolved` must at minimum be coupled to
+                // the verdict so the two surfaces can never disagree.
+                assert!(
+                    fit.sign_resolved,
+                    "INTERNAL CONTRACT FAIL: verdict=Spherical but sign_resolved=false \
+                     (σ={sigma}, κ̂={}, CI=[{:.4},{:.4}]) — the point-estimate honesty flag \
+                     desynced from the CI verdict",
+                    fit.kappa_hat, fit.profile_ci.ci_lo, fit.profile_ci.ci_hi
+                );
+            }
+            // The CORE honesty contract: whenever the bare point estimate rails to the
+            // WRONG (positive) sign, the estimator MUST have flagged the sign as
+            // unresolved — never a silent sign-confident κ̂ > 0 on hyperbolic data.
+            if fit.kappa_hat > 0.0 {
+                assert!(
+                    !fit.sign_resolved,
+                    "SILENT RAIL: κ̂={} railed positive on hyperbolic truth (κ⋆={k_star}, \
+                     σ={sigma}, κ·r²={:.4}) yet sign_resolved=true — the #1059/#977 defect: a \
+                     wrong-signed point estimate quoted as resolved",
+                    fit.kappa_hat, fit.kappa_r2
+                );
+            }
+        }
+        let mean_abs_kr2 = sum_abs_kr2 / reps as f64;
+        let resolved_rate = n_sign_resolved as f64 / reps as f64;
+        let correct_rate = n_correct_sign as f64 / reps as f64;
+        println!(
+            "  {sigma:4.2}   {mean_abs_kr2:9.4}   {resolved_rate:18.3}   {correct_rate:17.3}   {n_wrong_confident:>15}"
+        );
+        resolved_rates.push((mean_abs_kr2, resolved_rate));
+
+        // No cloud, at any σ, may confidently claim the WRONG (spherical) sign on
+        // hyperbolic truth more than a calibration-slack fraction of the time. The
+        // CI is a 95% region, so a confident wrong-sign verdict is a >2.5σ event per
+        // tail; with reps=24 we allow at most 1 (≈4%) before declaring the CI
+        // anticonservative on the wrong side.
+        assert!(
+            n_wrong_confident <= 1,
+            "ANTICONSERVATIVE CI: {n_wrong_confident}/{reps} clouds at σ={sigma} confidently \
+             claimed SPHERICAL on hyperbolic truth (κ⋆={k_star}) — the CI must not resolve the \
+             wrong sign"
+        );
+    }
+
+    // ── HONEST FLAT FLOOR at the recovery-table operating point σ = 0.08. ──────
+    // This is the exact "rails to +κ for hyperbolic truth" regime. Here |κ·r²| is
+    // far below the resolution floor, so the estimator must DECLINE to resolve the
+    // sign on essentially every cloud: sign_resolved=false dominates. (A handful of
+    // genuinely-resolved clouds are fine; what is forbidden is the estimator
+    // pretending it can resolve the sign when it cannot.)
+    let (floor_kr2, floor_resolved_rate) = resolved_rates[0];
+    assert!(
+        floor_kr2 < 0.06,
+        "the σ=0.08 operating point must sit BELOW the resolution floor (mean|κ·r²|={floor_kr2:.4} \
+         should be ≪ 0.1) — otherwise this is not the under-resolved regime the test pins"
+    );
+    assert!(
+        floor_resolved_rate <= 0.40,
+        "HONESTY FAIL: at the under-resolved floor (σ=0.08, |κ·r²|≈{floor_kr2:.4}) the estimator \
+         flagged sign_resolved=true on {:.0}% of clouds — it must DECLINE to resolve the sign \
+         where κ·r² is below the information floor, not quote a sign on noise",
+        100.0 * floor_resolved_rate
+    );
+
+    // ── RESOLVED band at σ = 0.20: the sign becomes reliably resolvable. ───────
+    // Above the floor the estimator must EARN its point estimate: most clouds
+    // resolve the (correct) sign, demonstrating the flag is not vacuously always
+    // false. This is the right end of the power curve.
+    let (top_kr2, top_resolved_rate) = *resolved_rates.last().unwrap();
+    assert!(
+        top_kr2 >= 0.12,
+        "the σ=0.20 operating point must clear the resolution floor (mean|κ·r²|={top_kr2:.4} \
+         should be ≳ 0.12) — otherwise the ladder does not reach the resolved band"
+    );
+    assert!(
+        top_resolved_rate >= 0.60,
+        "POWER FAIL: at the resolved operating point (σ=0.20, |κ·r²|≈{top_kr2:.4}) only {:.0}% of \
+         clouds resolved the sign — above the information floor the estimator must reliably \
+         resolve curvature, else `sign_resolved` is vacuously useless",
+        100.0 * top_resolved_rate
+    );
+
+    // ── MONOTONE POWER: resolution power rises with κ·r² across the ladder. ────
+    // The single strongest statement that `sign_resolved` tracks GENUINE resolvable
+    // information (κ·r²) and not an artefact: the resolved-rate is monotone
+    // non-decreasing along the σ ladder, within a small Monte-Carlo wobble.
+    for w in resolved_rates.windows(2) {
+        let ((kr2_lo, rate_lo), (kr2_hi, rate_hi)) = (w[0], w[1]);
+        assert!(
+            rate_hi >= rate_lo - 0.10,
+            "MONOTONE POWER FAIL: sign-resolution rate fell from {rate_lo:.3} (|κ·r²|≈{kr2_lo:.4}) \
+             to {rate_hi:.3} (|κ·r²|≈{kr2_hi:.4}) — resolution power must grow with κ·r²"
+        );
+    }
+    // And a strict net climb floor-to-top: the resolved band must be meaningfully
+    // more resolvable than the flat floor (the power curve has real lift).
+    assert!(
+        top_resolved_rate >= floor_resolved_rate + 0.30,
+        "POWER CURVE FLAT: resolution rate climbed only {:.3}→{:.3} floor→top — the κ·r² power \
+         curve must show real lift between the under-resolved and resolved operating points",
+        floor_resolved_rate, top_resolved_rate
+    );
 }

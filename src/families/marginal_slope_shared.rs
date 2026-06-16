@@ -57,7 +57,7 @@ pub fn make_beta_seed_validator(
     &Array1<f64>,
 ) -> Result<
     crate::solver::rho_optimizer::SeedOutcome,
-    crate::solver::estimate::EstimationError,
+    crate::model_types::EstimationError,
 > + '_ {
     move |beta: &Array1<f64>| {
         bail_if_cached_beta_non_finite(beta)?;
@@ -81,7 +81,7 @@ pub fn make_beta_seed_validator(
 #[inline]
 pub fn bail_if_cached_beta_non_finite(
     beta: &Array1<f64>,
-) -> Result<(), crate::solver::estimate::EstimationError> {
+) -> Result<(), crate::model_types::EstimationError> {
     if beta.iter().any(|v| !v.is_finite()) {
         crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
     }

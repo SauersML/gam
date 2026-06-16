@@ -1,4 +1,5 @@
-use crate::estimate::{EstimationError, FittedLinkState, UnifiedFitResult};
+use crate::estimate::{FittedLinkState, UnifiedFitResult};
+use crate::model_types::EstimationError;
 use crate::families::survival::lognormal_kernel::latent_cloglog_inverse_link_jet;
 use crate::inference::generative::NoiseModel;
 use crate::mixture_link::{

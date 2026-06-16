@@ -37,7 +37,7 @@ pub(crate) fn validate_cov_block(
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
-            crate::solver::estimate::PenaltySpec::Block {
+            crate::model_types::PenaltySpec::Block {
                 local, col_range, ..
             } => {
                 if col_range.end > p
@@ -53,8 +53,8 @@ pub(crate) fn validate_cov_block(
                     );
                 }
             }
-            crate::solver::estimate::PenaltySpec::Dense(m)
-            | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            crate::model_types::PenaltySpec::Dense(m)
+            | crate::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
                     crate::bail_dim_sls!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}");
@@ -444,15 +444,15 @@ pub(crate) fn prepare_cov_block_kind(
                 b.penalties
                     .iter()
                     .map(|spec| match spec {
-                        crate::solver::estimate::PenaltySpec::Block {
+                        crate::model_types::PenaltySpec::Block {
                             local, col_range, ..
                         } => PenaltyMatrix::Blockwise {
                             local: local.clone(),
                             col_range: col_range.clone(),
                             total_dim: p,
                         },
-                        crate::solver::estimate::PenaltySpec::Dense(m)
-                        | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                        crate::model_types::PenaltySpec::Dense(m)
+                        | crate::model_types::PenaltySpec::DenseWithMean {
                             matrix: m, ..
                         } => PenaltyMatrix::Dense(m.clone()),
                     })
@@ -496,7 +496,7 @@ pub(crate) fn build_survival_covariate_block_from_design(
                 penalties: cov_design
                     .penalties
                     .iter()
-                    .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
+                    .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: cov_design.nullspace_dims.clone(),
                 initial_log_lambdas,

@@ -116,7 +116,7 @@ pub struct LinkWiggleBlockInput {
     pub design: DesignMatrix,
     pub knots: Array1<f64>,
     pub degree: usize,
-    pub penalties: Vec<crate::solver::estimate::PenaltySpec>,
+    pub penalties: Vec<crate::model_types::PenaltySpec>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,

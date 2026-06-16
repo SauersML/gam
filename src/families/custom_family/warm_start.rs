@@ -627,7 +627,7 @@ pub fn blockwise_fit_from_parts(
             working_weights: geom.working_weights.clone(),
             working_response: geom.working_response.clone(),
             reparam_qs: None,
-            dispersion: crate::solver::estimate::Dispersion::Known(1.0),
+            dispersion: crate::model_types::Dispersion::Known(1.0),
             beta_covariance: None,
             beta_standard_errors: None,
             beta_covariance_corrected: None,

@@ -479,7 +479,7 @@ pub(super) fn append_deviation_function_penalty(
         runtime.integrated_derivative_penalty_with_nullity(derivative_order)?;
     block
         .penalties
-        .push(crate::solver::estimate::PenaltySpec::Dense(penalty));
+        .push(crate::model_types::PenaltySpec::Dense(penalty));
     block.nullspace_dims.push(nullity);
     Ok(())
 }

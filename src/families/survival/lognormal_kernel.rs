@@ -11,7 +11,7 @@
 //! kernel terms; [`LogKernelSumJet`] evaluates their log-derivatives from
 //! log-space kernel bundles and treats non-positive signed sums as invalid rows.
 
-use crate::estimate::EstimationError;
+use crate::model_types::EstimationError;
 use crate::probability::signed_log_sum_exp;
 use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,

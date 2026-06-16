@@ -741,15 +741,15 @@ pub(crate) fn wiggle_block_penalty_matrices(
         .penalties
         .iter()
         .map(|spec| match spec {
-            crate::solver::estimate::PenaltySpec::Block {
+            crate::model_types::PenaltySpec::Block {
                 local, col_range, ..
             } => PenaltyMatrix::Blockwise {
                 local: local.clone(),
                 col_range: col_range.clone(),
                 total_dim: p_wiggle,
             },
-            crate::solver::estimate::PenaltySpec::Dense(m)
-            | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            crate::model_types::PenaltySpec::Dense(m)
+            | crate::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 PenaltyMatrix::Dense(m.clone())
             }
         })
@@ -2621,7 +2621,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     penalties: pilot_design
                         .penalties
                         .iter()
-                        .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
+                        .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                         .collect(),
                     nullspace_dims: vec![],
                     initial_log_lambdas: Some(
@@ -2686,7 +2686,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 penalties: baseline_design
                     .penalties
                     .iter()
-                    .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
+                    .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(
@@ -2822,7 +2822,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     wiggle_penalties
                         .iter()
                         .map(|spec| match spec {
-                            crate::solver::estimate::PenaltySpec::Block {
+                            crate::model_types::PenaltySpec::Block {
                                 local,
                                 col_range,
                                 ..
@@ -2831,8 +2831,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                                 col_range: col_range.clone(),
                                 total_dim: p_wiggle,
                             },
-                            crate::solver::estimate::PenaltySpec::Dense(m)
-                            | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                            crate::model_types::PenaltySpec::Dense(m)
+                            | crate::model_types::PenaltySpec::DenseWithMean {
                                 matrix: m,
                                 ..
                             } => PenaltyMatrix::Dense(m.clone()),
@@ -3098,7 +3098,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 penalties: design
                     .penalties
                     .iter()
-                    .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
+                    .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),

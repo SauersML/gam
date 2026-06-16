@@ -1393,15 +1393,15 @@ pub(crate) fn binomial_location_scale_wiggle_outer_fixture()
             .penalties
             .iter()
             .map(|ps| match ps {
-                crate::solver::estimate::PenaltySpec::Block {
+                crate::model_types::PenaltySpec::Block {
                     local, col_range, ..
                 } => PenaltyMatrix::Blockwise {
                     local: local.clone(),
                     col_range: col_range.clone(),
                     total_dim: wiggle_block.design.ncols(),
                 },
-                crate::solver::estimate::PenaltySpec::Dense(m)
-                | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                crate::model_types::PenaltySpec::Dense(m)
+                | crate::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                     PenaltyMatrix::Dense(m.clone())
                 }
             })
