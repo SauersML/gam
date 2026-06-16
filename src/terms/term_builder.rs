@@ -3182,7 +3182,9 @@ fn parse_endpoint_side(
     context: &str,
 ) -> Result<BSplineEndpointBoundaryCondition, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "none" | "open" | "unconstrained" => Ok(BSplineEndpointBoundaryCondition::Free),
+        "" | "none" | "open" | "unconstrained" | "free" => {
+            Ok(BSplineEndpointBoundaryCondition::Free)
+        }
         "clamped" | "clamp" | "zero_derivative" | "zero-derivative" => {
             Ok(BSplineEndpointBoundaryCondition::Clamped)
         }
@@ -3190,7 +3192,7 @@ fn parse_endpoint_side(
             Ok(BSplineEndpointBoundaryCondition::Anchored { value: 0.0 })
         }
         other => Err(format!(
-            "unsupported {context} boundary condition '{other}'; expected none, clamped, or anchored"
+            "unsupported {context} boundary condition '{other}'; expected free, clamped, or anchored"
         )),
     }
 }
