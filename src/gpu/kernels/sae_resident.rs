@@ -39,6 +39,19 @@ impl DeviceResidentArrowShape {
         }
     }
 
+    /// Color-arm shape from the #1017 measured gap (n=180, p=5120, M≈9, K=1):
+    /// few rows, very wide border. The dense-Schur device path (cuSOLVER border
+    /// POTRF) handles the `p=5120` border that exceeds the fused-kernel `P_MAX`.
+    #[inline]
+    pub const fn color_arm() -> Self {
+        Self {
+            n: 180,
+            p: 5_120,
+            basis_cols: 9,
+            d: 2,
+        }
+    }
+
     #[inline]
     pub const fn target_len(self) -> usize {
         self.n * self.p
@@ -868,7 +881,33 @@ pub fn qwen_non_gating_fixture() -> Result<DeviceResidentArrowWorkspace, DeviceR
 pub fn qwen_non_gating_fixture_seeded(
     seed: u64,
 ) -> Result<DeviceResidentArrowWorkspace, DeviceResidentArrowError> {
-    let shape = DeviceResidentArrowShape::qwen_non_gating();
+    fixture_for_shape_seeded(DeviceResidentArrowShape::qwen_non_gating(), seed)
+}
+
+/// Deterministic color-arm-scale resident fixture (n=180, p=5120) for the
+/// #1017 GPU wall-clock bench: few rows, very wide border — the shape where the
+/// per-iterate re-upload + re-factor that across-iteration residency eliminates
+/// dominates.
+pub fn color_arm_fixture() -> Result<DeviceResidentArrowWorkspace, DeviceResidentArrowError> {
+    fixture_for_shape_seeded(DeviceResidentArrowShape::color_arm(), 0x1017_C010_2A12_5EED)
+}
+
+/// Build a well-conditioned resident frame for any `d == 2` shape. Both the
+/// qwen and color-arm fixtures share this body; the conditioning (strong row
+/// `H_tt` diagonals, tiny cross blocks, diagonally-dominant border) keeps the
+/// dense reference factorisation PD so the parity harness is meaningful.
+fn fixture_for_shape_seeded(
+    shape: DeviceResidentArrowShape,
+    seed: u64,
+) -> Result<DeviceResidentArrowWorkspace, DeviceResidentArrowError> {
+    if shape.d != 2 {
+        return Err(DeviceResidentArrowError::Shape {
+            reason: format!(
+                "fixture_for_shape_seeded supports d == 2 only (got d={})",
+                shape.d
+            ),
+        });
+    }
     let mut rng = SplitMix64::new(seed);
     let mut target_x = vec![0.0_f64; shape.target_len()];
     for i in 0..shape.n {
@@ -1293,6 +1332,66 @@ mod tests {
                 frame.is_err(),
                 "resident frame construction must decline on a CPU-only host"
             );
+        }
+    }
+
+    /// #1017 GPU wall-clock bench. On a CUDA host this times the device-resident
+    /// inner Newton loop against the CPU dense-reference loop at color-arm and
+    /// Qwen scale, printing per-fit ms, the residency MiB ratio (device-resident
+    /// bytes vs host shadow), and the certified-refinement parity error. On a
+    /// CPU-only host it prints a skip line and still asserts CPU convergence, so
+    /// the same `cargo test` invocation is the runnable bench on the GPU node and
+    /// a harmless no-op on the build box. Run with `--nocapture` to see numbers.
+    #[test]
+    fn gpu_residency_wallclock_bench() {
+        use std::time::Instant;
+        let opts = DeviceResidentInnerOptions::default();
+        for (label, ws) in [
+            ("color_arm", super::color_arm_fixture()),
+            ("qwen_non_gating", super::qwen_non_gating_fixture()),
+        ] {
+            let ws = ws.expect("bench fixture must validate");
+
+            let t_cpu = Instant::now();
+            let cpu = ws.cpu_reference_fit(&opts).expect("cpu reference fit");
+            let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
+            assert!(cpu.converged, "{label}: cpu reference must converge");
+
+            if ws.device_resident() {
+                let t_dev = Instant::now();
+                let dev = ws.device_fit(&opts).expect("device resident fit");
+                let dev_ms = t_dev.elapsed().as_secs_f64() * 1e3;
+
+                let t_scale = cpu.t.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
+                let b_scale = cpu.beta.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
+                let mut max_rel = 0.0_f64;
+                for (a, b) in dev.t.iter().zip(cpu.t.iter()) {
+                    max_rel = max_rel.max((a - b).abs() / t_scale);
+                }
+                for (a, b) in dev.beta.iter().zip(cpu.beta.iter()) {
+                    max_rel = max_rel.max((a - b).abs() / b_scale);
+                }
+                let resident_mib = ws.resident_device_bytes() as f64 / (1024.0 * 1024.0);
+                let host_mib = ws.host_shadow_bytes() as f64 / (1024.0 * 1024.0);
+                println!(
+                    "[#1017 bench {label}] device_fit={dev_ms:.2}ms cpu_ref={cpu_ms:.2}ms \
+                     speedup={:.1}x resident={resident_mib:.1}MiB host_shadow={host_mib:.1}MiB \
+                     ratio={:.2} iters(dev={}/cpu={}) parity_rel={max_rel:e}",
+                    cpu_ms / dev_ms.max(1e-9),
+                    resident_mib / host_mib.max(1e-9),
+                    dev.iterations,
+                    cpu.iterations,
+                );
+                assert!(
+                    max_rel < 1e-9,
+                    "{label}: resident device fit must match CPU reference (rel {max_rel:e})"
+                );
+            } else {
+                println!(
+                    "[#1017 bench {label}] no CUDA device — cpu_ref={cpu_ms:.2}ms \
+                     (device residency path skipped; run on the GPU node for wall-clock)"
+                );
+            }
         }
     }
 }

@@ -2655,7 +2655,6 @@ extern "C" __global__ void arrow_sae_diag_sub(
         n: usize,
         d: usize,
         k: usize,
-        ridge_beta: f64,
         stream: Arc<CudaStream>,
         blas: CudaBlas,
         /// Per-row lower Cholesky factors `L_i` of `H_tt + ρ_t I`, stacked
@@ -2796,7 +2795,6 @@ extern "C" __global__ void arrow_sae_diag_sub(
                 n,
                 d,
                 k,
-                ridge_beta,
                 stream,
                 blas,
                 l_dev,
@@ -2893,10 +2891,6 @@ extern "C" __global__ void arrow_sae_diag_sub(
             for (i, v) in x_host.iter().enumerate() {
                 delta_t[i] = -*v;
             }
-
-            // Silence unused-field lint on non-accumulating builds: ridge_beta is
-            // baked into the resident Schur factor, surfaced here for diagnostics.
-            let _ = self.ridge_beta;
 
             Ok(ArrowSchurGpuSolution {
                 delta_t,
