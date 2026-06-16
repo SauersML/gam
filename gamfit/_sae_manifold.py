@@ -102,6 +102,33 @@ def _canonical_assignment(value: str, label: str) -> str:
     return canon
 
 
+def _coerce_atom_inference(raw: Any) -> list[dict[str, Any]] | None:
+    """Normalize the Rust ``atom_inference`` payload list (#1097 / #1103).
+
+    Each Rust entry is a per-atom dict carrying ``atom_index`` / ``atom_name``,
+    an optional ``functionals`` block, and an optional ``smooth_significance``
+    block whose ``log_e_nonconstant`` is the #1103 any-n-valid split-LRT e-value.
+    We pass the report through as plain Python containers (a shallow copy so the
+    accessor never aliases the raw FFI object), coercing the e-value to ``float``
+    when present. ``None`` for payloads predating the report.
+    """
+    if raw is None:
+        return None
+    reports: list[dict[str, Any]] = []
+    for entry in raw:
+        report = dict(entry)
+        sig = report.get("smooth_significance")
+        if sig is not None:
+            sig = dict(sig)
+            log_e = sig.get("log_e_nonconstant")
+            sig["log_e_nonconstant"] = None if log_e is None else float(log_e)
+            report["smooth_significance"] = sig
+        if report.get("functionals") is not None:
+            report["functionals"] = dict(report["functionals"])
+        reports.append(report)
+    return reports
+
+
 def _canonical_public_assignment(value: str) -> str:
     name = str(value).strip().lower()
     canon = _PUBLIC_ASSIGNMENT_KINDS.get(name)
@@ -628,6 +655,15 @@ class ManifoldSAE:
     # geometry summary. A curvature bound is not an estimand with a profiled
     # criterion, so no SE/CI/flatness fields are carried.
     curvature_report: dict[str, Any] | None = None
+    # Per-atom smooth-functional inference (#1097 / #1103): one entry per fitted
+    # atom, ``{"atom_index": int, "atom_name": str, "functionals": {...} | None,
+    # "smooth_significance": {"log_e_nonconstant": float | None} | None}``. The
+    # #1103 ``smooth_significance.log_e_nonconstant`` is the any-n-valid split-LRT
+    # e-value for "the atom's inner decoder smooth is non-constant" (null =
+    # constant), with ``E_{H0}[E] <= 1`` — a large positive ``log_e_nonconstant``
+    # is honest evidence the atom carries structure. Surfaced via
+    # :meth:`atom_inference`. ``None`` only for payloads predating the report.
+    atom_inference_reports: list[dict[str, Any]] | None = None
     # The unified certificate ledger (#16): ONE coherent block consolidating every
     # certificate this fit produced under a shared claim+evidence+verdict shape.
     # ``{"overall": str, "overall_certified": bool, "claims": {claim_id: {"claim":
@@ -821,6 +857,7 @@ class ManifoldSAE:
         # for an empty dictionary.
         atom_topologies = _topologies_for_bases(kinds)
         scalar_topology = _topology_for_bases(kinds) if kinds else str(topology)
+        atom_inference_reports = _coerce_atom_inference(payload.get("atom_inference"))
         return cls(
             atoms=atoms, atom_topology=scalar_topology,
             atom_topologies=atom_topologies,
@@ -878,6 +915,7 @@ class ManifoldSAE:
                 if payload.get("curvature_report") is None
                 else dict(payload["curvature_report"])
             ),
+            atom_inference_reports=atom_inference_reports,
             certificates=(
                 None
                 if payload.get("certificates") is None
@@ -956,6 +994,33 @@ class ManifoldSAE:
             "n_confirmed": len(confirmed_idx),
             "claims": claims,
         }
+
+    def atom_inference(self) -> list[dict[str, Any]]:
+        """Per-atom smooth-functional inference reports (#1097 / #1103).
+
+        One entry per fitted atom, in atom order, each
+        ``{"atom_index": int, "atom_name": str, "functionals": {...} | None,
+        "smooth_significance": {"log_e_nonconstant": float | None} | None}``.
+
+        The #1103 ``smooth_significance.log_e_nonconstant`` is the any-n-valid
+        split-likelihood-ratio e-value for "the atom's inner decoder smooth is
+        non-constant" (null = constant), the same universal-inference instrument
+        the atom-birth gate uses. With ``E_{H0}[E] <= 1`` it is finite-sample
+        honest at the ``df ≈ n`` regime: a large positive ``log_e_nonconstant``
+        is real evidence the atom carries smooth structure, ``<= 0`` does not
+        favor non-constancy. An atom whose inner-decoder smooth was not harvested
+        (no active rows / non-SPD inner Hessian / constant-only design) reports
+        ``None`` fields rather than a fabricated value.
+
+        Returns
+        -------
+        list of dict
+            One report per atom. Empty list only for payloads predating the
+            report (#1097 / #1103).
+        """
+        if self.atom_inference_reports is None:
+            return []
+        return [dict(report) for report in self.atom_inference_reports]
 
     def contested_claims(self, *, alpha: float | None = None) -> list[dict[str, Any]]:
         """The structure claims the held-out data did NOT confirm (#1058).
@@ -1735,6 +1800,11 @@ class ManifoldSAE:
             "curvature_report": (
                 None if self.curvature_report is None else _jsonable(self.curvature_report)
             ),
+            "atom_inference": (
+                None
+                if self.atom_inference_reports is None
+                else _jsonable(self.atom_inference_reports)
+            ),
             "certificates": (
                 None if self.certificates is None else _jsonable(self.certificates)
             ),
@@ -1843,6 +1913,7 @@ class ManifoldSAE:
                 if payload.get("curvature_report") is None
                 else dict(payload["curvature_report"])
             ),
+            atom_inference_reports=_coerce_atom_inference(payload.get("atom_inference")),
             structure_certificate_json=(
                 None
                 if payload.get("structure_certificate") is None
