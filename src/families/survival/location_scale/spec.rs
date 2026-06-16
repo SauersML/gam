@@ -245,6 +245,10 @@ pub struct SurvivalLocationScaleFitResultParts {
     pub reml_score: f64,
     pub stable_penalty_term: f64,
     pub penalized_objective: f64,
+    /// Whether any GPU device executed part of this fit (GPU-flag propagation).
+    /// Survival location-scale runs on the CPU path, so this is `false`; it is
+    /// carried so the assembled `UnifiedFitResultParts` reports a real value.
+    pub used_device: bool,
     pub outer_iterations: usize,
     /// `None` = no gradient measured at termination; `Some(g)` = measured.
     /// `outer_converged` is the authoritative convergence signal.
@@ -355,7 +359,7 @@ pub fn survival_fit_from_parts(
         reml_score,
         stable_penalty_term,
         penalized_objective,
-        used_device: false,
+        used_device,
         outer_iterations,
         outer_gradient_norm,
         outer_converged,
@@ -588,6 +592,7 @@ pub fn survival_fit_from_parts(
         reml_score,
         stable_penalty_term,
         penalized_objective,
+        used_device,
         outer_iterations,
         outer_converged,
         outer_gradient_norm,

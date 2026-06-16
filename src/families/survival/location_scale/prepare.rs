@@ -937,6 +937,7 @@ pub(crate) fn finalize_survival_location_scale_fit(
         reml_score: fit.reml_score,
         stable_penalty_term: fit.stable_penalty_term,
         penalized_objective: fit.penalized_objective,
+        used_device: false,
         outer_iterations: fit.outer_iterations,
         outer_gradient_norm: fit.outer_gradient_norm,
         outer_converged: fit.outer_converged,

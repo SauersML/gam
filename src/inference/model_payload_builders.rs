@@ -293,6 +293,7 @@ fn truncate_marginal_slope_influence_absorber(
         reml_score,
         stable_penalty_term,
         penalized_objective,
+        used_device: false,
         outer_iterations,
         outer_converged,
         outer_gradient_norm,

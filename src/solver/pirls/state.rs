@@ -614,6 +614,7 @@ impl PirlsResult {
             stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
             ridge_passport: self.ridge_passport,
             ridge_used: self.ridge_used,
+            used_device: self.used_device,
             deviance: self.deviance,
             edf: self.edf,
             stable_penalty_term: self.stable_penalty_term,

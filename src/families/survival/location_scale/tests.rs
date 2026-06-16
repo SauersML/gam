@@ -415,6 +415,7 @@ fn test_survival_fit(
         reml_score: 0.0,
         stable_penalty_term: 0.0,
         penalized_objective: 0.0,
+        used_device: false,
         outer_iterations: 0,
         outer_gradient_norm: None,
         outer_converged: true,
