@@ -8059,7 +8059,7 @@ pub fn refresh_isometry_caches_from_term(
 
 #[cfg(test)]
 mod amortized_encoder_tests {
-    use crate::terms::sae_manifold::tests::small_two_atom_periodic_term;
+    use crate::terms::sae::manifold::tests::small_two_atom_periodic_term;
 
     /// #1026 ladder item 2/3 — the amortized encoder is reachable end-to-end
     /// from a fitted term and is certificate-honest: it encodes the dictionary's
