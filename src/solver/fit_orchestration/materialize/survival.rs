@@ -25,13 +25,6 @@ fn resolve_survival_marginal_slope_base_link(
     }
 }
 
-/// Canonical baseline-time stack shared by the workflow materializer and the
-/// CLI survival path (`crate::bin::main`-side `run_survival`). Both entry points
-/// build the survival time block identically — baseline offsets, derivative
-/// guard, optional baseline time-wiggle augmentation — so the assembly lives
-/// here once and the CLI consumes it through a thin re-export rather than
-/// reconstructing the same decision tree.
-
 pub(crate) fn materialize_survival<'a>(
     parsed: &ParsedFormula,
     data: &'a Dataset,

@@ -63,8 +63,6 @@ fn validate_bernoulli_marginal_slope_z_column_variance(
     })
 }
 
-#[derive(Clone)]
-
 pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     parsed: &ParsedFormula,
     data: &'a Dataset,
