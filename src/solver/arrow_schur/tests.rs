@@ -3654,3 +3654,73 @@ pub(crate) fn parallel_block_jacobi_deterministic_and_matches_sequential() {
         max_abs / scale
     );
 }
+
+/// #1017 block-Jacobi preconditioner-build speedup bench. Times
+/// `build_block_jacobi` at the SAE-arm shape, sequential (forced via an inside-
+/// worker call so the gate stays serial) vs the live parallel build. Run with
+/// `--release --nocapture` on a quiet multicore box; the preconditioner is built
+/// once per inexact-PCG solve in the streaming joint fit.
+///
+/// ```text
+/// cargo test --lib --release \
+///   solver::arrow_schur::tests::bench_block_jacobi_parallel_speedup -- --nocapture
+/// ```
+#[test]
+pub(crate) fn bench_block_jacobi_parallel_speedup() {
+    let n = 1500usize;
+    let d = 6usize;
+    let k = 480usize;
+    let mut sys = dense_direct_system(n, d, k);
+    // 80 blocks of 6 (< BLOCK_JACOBI_MAX_BLOCK) → the block-Jacobi path.
+    let offsets: Vec<std::ops::Range<usize>> = (0..k).step_by(6).map(|s| s..(s + 6)).collect();
+    sys.set_block_offsets(offsets.into());
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let calls = 10usize;
+    let mut sink = 0.0_f64;
+
+    // Sequential baseline: the build's row gate stays serial when called from
+    // inside a rayon worker (current_thread_index().is_some()).
+    let seq_build = || -> f64 {
+        rayon::iter::once(()).map(|_| {
+            let p = JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+                .expect("serial block Jacobi");
+            p.apply(&Array1::<f64>::ones(k))[0]
+        }).sum::<f64>()
+    };
+    sink += seq_build();
+    let t_seq = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += seq_build();
+    }
+    let seq_per = t_seq.elapsed().as_secs_f64() / calls as f64;
+
+    // Parallel: top-level call (not nested) trips the rayon path.
+    let par_build = || -> f64 {
+        let p = JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+            .expect("parallel block Jacobi");
+        p.apply(&Array1::<f64>::ones(k))[0]
+    };
+    sink += par_build();
+    let t_par = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += par_build();
+    }
+    let par_per = t_par.elapsed().as_secs_f64() / calls as f64;
+
+    println!(
+        "[#1017 block-Jacobi build, n={n} d={d} k={k} ({} blocks), {calls} calls, \
+             {} rayon threads]\n  serial:   {:.3} ms/call\n  parallel: {:.3} ms/call\n  \
+             speedup:  {:.2}x  (sink {:.3e})",
+        sys.block_offsets.len(),
+        rayon::current_num_threads(),
+        seq_per * 1e3,
+        par_per * 1e3,
+        seq_per / par_per,
+        sink,
+    );
+    assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
+}
