@@ -5712,8 +5712,23 @@ fn sae_manifold_predict_oos<'py>(
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
                     SaeAtomBasisKind::EuclideanPatch => {
+                        // #1132 bug 3: the monomial WIDTH of a Euclidean patch is
+                        // `monomial_exponents(dim, degree).len()` where `dim` is
+                        // the build dimension `sae_build_euclidean_atom_with_degree`
+                        // reads off `centers.ncols()` — NOT the user-facing
+                        // `atom_dim`. Recovering the degree from `(atom_dim,
+                        // basis_size_list)` while the build uses `centers.ncols()`
+                        // re-emits a different width when those two disagree (the
+                        // "decoder_blocks[0] has M=1 but rebuilt basis has M=3"
+                        // euclidean OOS reconstruct failure). Anchor the recovery
+                        // to the TRAINED decoder block's row count `M` against the
+                        // centers' own dimension so the rebuilt basis width matches
+                        // the decoder bit-for-bit and the M-consistency guard below
+                        // passes.
+                        let euclidean_dim = centers.ncols();
+                        let trained_m = decoder_blocks[atom_idx].as_array().nrows();
                         let degree =
-                            sae_euclidean_degree_for_basis_size(d, basis_size_list[atom_idx])
+                            sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
                                 .map_err(py_value_error)?;
                         sae_build_euclidean_atom_with_degree(
                             probe_pts.view(),
@@ -6215,8 +6230,16 @@ fn sae_steer_delta<'py>(
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
                     SaeAtomBasisKind::EuclideanPatch => {
+                        // #1132 bug 3: recover the Euclidean patch degree from the
+                        // TRAINED decoder block's `M` against the centers' own
+                        // dimension (the build dim is `centers.ncols()`), not from
+                        // `(atom_dim, basis_size_list)` which can disagree and
+                        // re-emit a wrong width. Keeps the steer rebuild's basis
+                        // width matched to the decoder, same as predict_oos.
+                        let euclidean_dim = centers.ncols();
+                        let trained_m = decoder_blocks[atom_idx].as_array().nrows();
                         let degree =
-                            sae_euclidean_degree_for_basis_size(d, basis_size_list[atom_idx])
+                            sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
                                 .map_err(py_value_error)?;
                         sae_build_euclidean_atom_with_degree(
                             probe_pts.view(),
@@ -7437,4 +7460,47 @@ fn latent_relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
         return f64::INFINITY;
     }
     grad_norm / grad0_norm.max(1.0)
+}
+
+#[cfg(test)]
+mod sae_euclidean_oos_rebuild_tests {
+    use super::{monomial_exponents, sae_euclidean_degree_for_basis_size};
+
+    /// #1132 bug 3: the OOS basis rebuild for a Euclidean (linear) atom must
+    /// re-emit a basis whose width `M` equals the TRAINED decoder block's row
+    /// count. The width is `monomial_exponents(dim, degree).len()` where `dim`
+    /// is the build dimension (`centers.ncols()`). Recovering the degree from
+    /// `(dim, trained_M)` and rebuilding against the same `dim` must therefore
+    /// reproduce `trained_M` exactly. The regression case is a 1-D linear atom
+    /// whose trained decoder has `M = 1` (degree 0): the recovery must yield
+    /// degree 0 and width 1, NOT re-expand to width 3 (degree 2) — the
+    /// "decoder_blocks[0] has M=1 but rebuilt basis has M=3" OOS failure.
+    fn rebuilt_m_for(dim: usize, trained_m: usize) -> usize {
+        let degree = sae_euclidean_degree_for_basis_size(dim, trained_m)
+            .expect("degree must be recoverable from the trained decoder width");
+        monomial_exponents(dim, degree).len()
+    }
+
+    #[test]
+    fn euclidean_oos_rebuild_m_matches_trained_decoder_m() {
+        // The exact #1132 regression: dim = 1, trained M = 1 (constant-only).
+        assert_eq!(
+            rebuilt_m_for(1, 1),
+            1,
+            "1-D linear atom with decoder M=1 must rebuild to M=1, not M=3"
+        );
+        // The recovered width must equal the trained M across the supported
+        // degrees and dimensions (self-consistency of the decoder-anchored
+        // recovery the OOS / steer paths now use).
+        for dim in 1..=2usize {
+            for degree in 0..=2usize {
+                let trained_m = monomial_exponents(dim, degree).len();
+                assert_eq!(
+                    rebuilt_m_for(dim, trained_m),
+                    trained_m,
+                    "dim={dim}, degree={degree}: rebuilt M must equal trained M"
+                );
+            }
+        }
+    }
 }
