@@ -1584,6 +1584,45 @@ mod cuda {
         Ok(())
     }
 
+    /// `#1017` resident gradient path: accumulate ONLY the Schur RHS term
+    /// `rhs += Σ_i Y_iᵀ u_i`, skipping the `−Σ_i Y_iᵀ Y_i` matrix GEMM that the
+    /// resident frame already folded into its persistent `L_S` factor. This is
+    /// the per-iterate-cheap counterpart of [`accumulate_schur`]: the GEMV here
+    /// is bit-identical to the GEMV inside `accumulate_schur` (same config, same
+    /// `beta=1` accumulation order over rows), so the resident frame's `δβ`
+    /// matches a full `solve()` at the same gradient.
+    fn accumulate_schur_rhs_only(
+        blas: &CudaBlas,
+        d: usize,
+        k: usize,
+        n: usize,
+        y_stack: &CudaSlice<f64>,
+        u_stack: &CudaSlice<f64>,
+        rhs: &mut CudaSlice<f64>,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        let y_block_elems = d * k;
+        let u_block_elems = d;
+        for i in 0..n {
+            let y_slice = y_stack.slice(i * y_block_elems..(i + 1) * y_block_elems);
+            let u_slice = u_stack.slice(i * u_block_elems..(i + 1) * u_block_elems);
+            let gemv_cfg = GemvConfig::<f64> {
+                trans: cublasOperation_t::CUBLAS_OP_T,
+                m: to_i32(d).ok_or(ArrowSchurGpuFailure::Unavailable)?,
+                n: to_i32(k).ok_or(ArrowSchurGpuFailure::Unavailable)?,
+                alpha: 1.0,
+                lda: to_i32(d).ok_or(ArrowSchurGpuFailure::Unavailable)?,
+                incx: 1,
+                beta: 1.0,
+                incy: 1,
+            };
+            // SAFETY: y_slice (d×k col-major) and u_slice (length d) are live
+            // device buffers; `rhs` is the length-k accumulator.
+            unsafe { blas.gemv(gemv_cfg, &y_slice, &u_slice, rhs) }
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        Ok(())
+    }
+
     /// Accumulate `g_dev[i] ← u_i + Y_i · δβ` per block. This is the
     /// pre-trsm RHS for the back-substitution `L_i^T x_i = w_i`.
     fn accumulate_back_sub_rhs(
@@ -2791,30 +2830,13 @@ extern "C" __global__ void arrow_sae_diag_sub(
             trsm_batched_lower_inplace(&self.blas, &self.stream, d, n, 1, &self.l_dev, &mut u_dev)?;
 
             // Schur RHS = −g_β + Σ_i Y_iᵀ u_i. Reuse the resident Schur factor
-            // (no POTRF). `accumulate_schur` adds `Σ Y_iᵀ u_i` into rhs and
-            // `−Σ Y_iᵀ Y_i` into a throwaway schur copy we discard.
+            // (no POTRF, and skip the −Σ Y_iᵀ Y_i GEMM already baked into L_S).
             let rhs_init: Vec<f64> = g_beta.iter().map(|v| -v).collect();
             let mut rhs_dev = self
                 .stream
                 .clone_htod(&rhs_init)
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-            // accumulate_schur mutates its `schur` arg; we only want its rhs
-            // accumulation, so pass a scratch copy of the resident factor's
-            // shape (the schur term is unused on the gradient path).
-            let mut schur_scratch = self
-                .stream
-                .clone_htod(&vec![0.0_f64; k * k])
-                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-            accumulate_schur(
-                &self.blas,
-                d,
-                k,
-                n,
-                &self.y_dev,
-                &u_dev,
-                &mut schur_scratch,
-                &mut rhs_dev,
-            )?;
+            accumulate_schur_rhs_only(&self.blas, d, k, n, &self.y_dev, &u_dev, &mut rhs_dev)?;
 
             // δβ ← L_S^{-T} L_S^{-1} rhs using the resident border factor.
             trsm_single(
