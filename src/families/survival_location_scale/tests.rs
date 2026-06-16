@@ -2829,7 +2829,7 @@ fn identified_time_block_degenerate_entry_preserves_full_dimension() {
 #[test]
 fn resolve_survival_time_anchor_defaults_to_earliest_entry() {
     let age_entry = array![5.0, 1.0, 3.0];
-    let anchor = crate::families::survival_construction::resolve_survival_time_anchor_value(
+    let anchor = crate::families::survival::construction::resolve_survival_time_anchor_value(
         &age_entry, None,
     )
     .expect("resolve default anchor");

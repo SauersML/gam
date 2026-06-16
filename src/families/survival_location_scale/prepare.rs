@@ -235,11 +235,11 @@ pub(crate) fn prepare_survival_location_scale_model(
     // floor matches `checked_log_survival_times` (survival_construction.rs), the
     // same map under which the I-spline time basis is built over `log t`.
     let log_time_entry = spec.age_entry.mapv(|t| {
-        t.max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
+        t.max(crate::families::survival::construction::SURVIVAL_TIME_FLOOR)
             .ln()
     });
     let log_time_exit = spec.age_exit.mapv(|t| {
-        t.max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
+        t.max(crate::families::survival::construction::SURVIVAL_TIME_FLOOR)
             .ln()
     });
     let mut time_prepared = prepare_identified_time_block(

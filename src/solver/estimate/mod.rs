@@ -4530,7 +4530,7 @@ where
         // hint forward and calls `seed_inner_state(beta)` before the
         // next eval — see src/solver/reml/continuation.rs:209-212,
         // 434-438. Without a hook here, `ClosureObjective::seed_inner_state`
-        // (src/solver/outer_strategy.rs:2097-2107) rejected any
+        // (src/solver/rho_optimizer.rs:2097-2107) rejected any
         // non-empty β fatally, dropping every seed before the inner
         // solver started (issue #236). Wire the symmetric consumer:
         // when the pre-warm forwards the cached β, install it into the

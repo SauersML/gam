@@ -34,7 +34,7 @@ use crate::inference::steering::{SteerPlan, steer_delta};
 use crate::inference::structure_evidence::{
     CandidateProbe, ClaimKind, ProbePlan, StructureLedger, plan_probe_for_contested_claim,
 };
-use crate::terms::sae_manifold::SaeManifoldTerm;
+use crate::terms::sae::manifold::SaeManifoldTerm;
 
 /// The level the contested-claim selection and budget are computed at. Fixed so
 /// a probe can never be shopped across α after seeing the evidence (mirrors

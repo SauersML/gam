@@ -9,7 +9,7 @@ use crate::terms::analytic_penalties::{
     SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
-use crate::terms::sae_manifold::SaeManifoldRho;
+use crate::terms::sae::manifold::SaeManifoldRho;
 
 /// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit
 /// update, in units of the gate temperature τ (the gate's natural length
@@ -69,7 +69,7 @@ pub(crate) const SAE_DICTIONARY_COLLAPSE_EV_FLOOR: f64 = 0.02;
 
 /// #976 / #1117 K>1 robustness: bounded DICTIONARY-level multi-start budget for
 /// the simultaneous co-collapse arm (the EV-floor branch of
-/// [`crate::terms::sae_manifold::SaeManifoldTerm::enforce_decoder_norm_guard`]).
+/// [`crate::terms::sae::manifold::SaeManifoldTerm::enforce_decoder_norm_guard`]).
 /// Distinct from the per-atom [`SAE_ATOM_COLLAPSE_RESEED_BUDGET`] (= 1): that
 /// budget governs reseeding ONE atom's gate logits against an optimizer that
 /// keeps killing it, where a loop would fight the optimizer. A co-collapse

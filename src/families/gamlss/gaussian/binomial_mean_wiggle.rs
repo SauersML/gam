@@ -321,15 +321,11 @@ impl BinomialMeanWiggleFamily {
         block_states: &[ParameterBlockState],
         x_eta_arc: Arc<Array2<f64>>,
     ) -> Result<Arc<RowCoeffOperator>, String> {
-        if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialMeanWiggleFamily",
+            2,
+            block_states.len(),
+        )?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
@@ -381,15 +377,11 @@ impl BinomialMeanWiggleFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
-        if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialMeanWiggleFamily",
+            2,
+            block_states.len(),
+        )?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
@@ -473,15 +465,11 @@ impl BinomialMeanWiggleFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
-        if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialMeanWiggleFamily",
+            2,
+            block_states.len(),
+        )?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
@@ -708,15 +696,11 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialMeanWiggleFamily",
+            2,
+            block_states.len(),
+        )?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
@@ -849,15 +833,11 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialMeanWiggleFamily",
+            2,
+            block_states.len(),
+        )?;
         let x_eta = self.dense_eta_design_fromspecs(specs)?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
@@ -903,15 +883,11 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialMeanWiggleFamily",
+            2,
+            block_states.len(),
+        )?;
         let x_eta = self.dense_eta_design_fromspecs(specs)?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
@@ -1045,15 +1021,11 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialMeanWiggleFamily",
+            2,
+            block_states.len(),
+        )?;
         let x_eta = self.dense_eta_design_fromspecs(specs)?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
@@ -1612,15 +1584,11 @@ impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
-        if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialMeanWiggleFamily",
+            2,
+            block_states.len(),
+        )?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta.len() != self.y.len() || etaw.len() != self.y.len() {
