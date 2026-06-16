@@ -155,3 +155,166 @@ pub struct WeightedOuterRow {
     /// must use `weight` for any aggregation.
     pub stratum: u32,
 }
+
+/// Deterministic row-block tiling constant for the parallel reduction paths.
+///
+/// All cross-row summations chunk the rows into `ARROW_ROW_CHUNK`-sized tiles
+/// and reduce the per-tile partials in tile-index order on the caller thread,
+/// so the floating-point reduction tree is fixed across Rayon worker counts and
+/// work-stealing decisions. Consumers that require deterministic associativity
+/// must keep their tiling a multiple of this constant.
+pub const ARROW_ROW_CHUNK: usize = 256;
+
+/// Number of `ARROW_ROW_CHUNK`-sized tiles covering `n_rows`.
+#[inline]
+pub fn arrow_row_chunk_count(n_rows: usize) -> usize {
+    if n_rows == 0 {
+        0
+    } else {
+        (n_rows - 1) / ARROW_ROW_CHUNK + 1
+    }
+}
+
+/// Row selection for an outer-loop evaluation: either the full data (`All`) or
+/// a Horvitz–Thompson [`WeightedOuterRow`] subsample.
+///
+/// `All` walks rows `0..n_total` with unit weight; `Subsample` walks the stored
+/// rows applying each row's inverse-inclusion scale `1/π_i`, so any partial sum
+/// `Σ_i w_i · f(row_i)` is an unbiased estimator of the corresponding full-data
+/// sum `Σ_{i=1..n_full} f(row_i)`. Inner-PIRLS and final-covariance passes
+/// always run with `All`; only outer score / gradient hot loops consume a
+/// non-`All` variant.
+///
+/// Lives in this lower layer (below `families`/`terms`) so the row-kernel
+/// consumers and the term hot-paths can name it without the `Subsample` field
+/// reaching up into `solver` (#1135). The family-specific constructor
+/// (`families::row_kernel::RowSet::from_options`, which reads
+/// `custom_family::BlockwiseFitOptions`) stays in `families` as an extension
+/// `impl` block.
+#[derive(Clone)]
+pub enum RowSet {
+    All,
+    Subsample {
+        rows: Arc<Vec<WeightedOuterRow>>,
+        n_full: usize,
+    },
+}
+
+impl RowSet {
+    /// Parallel fold-reduce over the row set. `init` produces a fresh
+    /// accumulator, `fold` is the per-row update, `reduce` combines two
+    /// accumulators.
+    ///
+    /// Returns the reduced result. Both branches process fixed-size row chunks
+    /// in parallel, then combine the chunk accumulators in chunk-index order on
+    /// the caller thread. The resulting floating-point reduction tree is fixed
+    /// across Rayon worker counts and work-stealing decisions.
+    #[inline]
+    pub fn par_reduce_fold<T, I, F, R>(&self, n_total: usize, init: I, fold: F, reduce: R) -> T
+    where
+        T: Send,
+        I: Fn() -> T + Send + Sync,
+        F: Fn(T, usize, f64) -> T + Send + Sync,
+        R: Fn(T, T) -> T + Send + Sync,
+    {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use rayon::slice::ParallelSlice;
+        match self {
+            Self::All => {
+                let chunk_accumulators: Vec<T> = (0..arrow_row_chunk_count(n_total))
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * ARROW_ROW_CHUNK;
+                        let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                        let mut acc = init();
+                        for i in start..end {
+                            acc = fold(acc, i, 1.0);
+                        }
+                        acc
+                    })
+                    .collect();
+                let mut total = init();
+                for acc in chunk_accumulators {
+                    total = reduce(total, acc);
+                }
+                total
+            }
+            Self::Subsample { rows, .. } => {
+                let chunk_accumulators: Vec<T> = rows
+                    .par_chunks(ARROW_ROW_CHUNK)
+                    .map(|chunk| {
+                        let mut acc = init();
+                        for r in chunk {
+                            acc = fold(acc, r.index, r.weight);
+                        }
+                        acc
+                    })
+                    .collect();
+                let mut total = init();
+                for acc in chunk_accumulators {
+                    total = reduce(total, acc);
+                }
+                total
+            }
+        }
+    }
+
+    /// Parallel try-fold over fixed-size row chunks, followed by deterministic
+    /// chunk-index-order reduction on the caller thread.
+    #[inline]
+    pub fn par_try_reduce_fold<T, E, I, F, R>(
+        &self,
+        n_total: usize,
+        init: I,
+        fold: F,
+        reduce: R,
+    ) -> Result<T, E>
+    where
+        T: Send,
+        E: Send,
+        I: Fn() -> T + Send + Sync,
+        F: Fn(T, usize, f64) -> Result<T, E> + Send + Sync,
+        R: Fn(T, T) -> Result<T, E> + Send + Sync,
+    {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use rayon::slice::ParallelSlice;
+        match self {
+            Self::All => {
+                let chunk_accumulators: Vec<Result<T, E>> = (0..arrow_row_chunk_count(n_total))
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * ARROW_ROW_CHUNK;
+                        let end = (start + ARROW_ROW_CHUNK).min(n_total);
+                        let mut acc = init();
+                        for i in start..end {
+                            acc = fold(acc, i, 1.0)?;
+                        }
+                        Ok(acc)
+                    })
+                    .collect();
+                let mut total = init();
+                for acc in chunk_accumulators {
+                    total = reduce(total, acc?)?;
+                }
+                Ok(total)
+            }
+            Self::Subsample { rows, .. } => {
+                let chunk_accumulators: Vec<Result<T, E>> = rows
+                    .par_chunks(ARROW_ROW_CHUNK)
+                    .map(|chunk| {
+                        let mut acc = init();
+                        for r in chunk {
+                            acc = fold(acc, r.index, r.weight)?;
+                        }
+                        Ok(acc)
+                    })
+                    .collect();
+                let mut total = init();
+                for acc in chunk_accumulators {
+                    total = reduce(total, acc?)?;
+                }
+                Ok(total)
+            }
+        }
+    }
+}

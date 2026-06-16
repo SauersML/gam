@@ -5393,7 +5393,7 @@ where
         &[TermCollectionSpec],
         &[TermCollectionDesign],
         crate::solver::estimate::reml::reml_outer_engine::EvalMode,
-        &crate::families::row_kernel::RowSet,
+        &crate::outer_subsample::RowSet,
     ) -> Result<
         (
             f64,
@@ -5612,15 +5612,15 @@ where
         OuterScoreSubsample::new(mask, n_total, seed)
     }
 
-    let current_row_set: std::cell::RefCell<crate::families::row_kernel::RowSet> =
+    let current_row_set: std::cell::RefCell<crate::outer_subsample::RowSet> =
         if use_staged_kappa {
             let pilot = build_uniform_pilot_subsample(n_total, KAPPA_PILOT_K, n_total as u64);
-            std::cell::RefCell::new(crate::families::row_kernel::RowSet::Subsample {
+            std::cell::RefCell::new(crate::outer_subsample::RowSet::Subsample {
                 rows: std::sync::Arc::clone(&pilot.rows),
                 n_full: n_total,
             })
         } else {
-            std::cell::RefCell::new(crate::families::row_kernel::RowSet::All)
+            std::cell::RefCell::new(crate::outer_subsample::RowSet::All)
         };
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
@@ -6095,7 +6095,7 @@ where
             KAPPA_POLISH_K,
             (n_total as u64).wrapping_add(0xA5A5A5A5),
         );
-        *current_row_set.borrow_mut() = crate::families::row_kernel::RowSet::Subsample {
+        *current_row_set.borrow_mut() = crate::outer_subsample::RowSet::Subsample {
             rows: std::sync::Arc::clone(&polish.rows),
             n_full: n_total,
         };
@@ -6126,7 +6126,7 @@ where
             );
         }
     }
-    *current_row_set.borrow_mut() = crate::families::row_kernel::RowSet::All;
+    *current_row_set.borrow_mut() = crate::outer_subsample::RowSet::All;
     if use_staged_kappa {
         log::info!(
             "[KAPPA-STAGED] rotating to full data for final coefficient fit (n={})",

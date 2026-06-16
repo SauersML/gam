@@ -35,7 +35,14 @@ use std::sync::Arc;
 /// machinery is pure noise. Above this, a silent multi-minute build is
 /// the documented failure mode this logging exists to expose.
 const ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS: usize = 100_000;
-const ARROW_ROW_CHUNK: usize = 256;
+// `ARROW_ROW_CHUNK` / `arrow_row_chunk_count` + the `RowSet` reduction type
+// moved DOWN to the `crate::outer_subsample` lower layer (#1135). Re-imported
+// here so the in-file uses keep resolving; `RowSet` is `pub use`-d so the many
+// in-family `crate::families::row_kernel::RowSet` call sites (allowed to depend
+// on `families`) keep working, while `terms` and the type definition both
+// reference the lower layer directly.
+use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
+pub use crate::outer_subsample::RowSet;
 
 /// Byte budget above which the full dense `J·F` projection (`n × K·rank` f64)
 /// is no longer materialized-and-cached whole. Aligned with `ResourcePolicy`'s
@@ -80,15 +87,6 @@ fn jf_tile_rows<const K: usize>(rank: usize) -> usize {
     let per_row = (K.saturating_mul(rank)).max(1) * std::mem::size_of::<f64>();
     let max_rows = (JF_TILE_BUDGET_BYTES / per_row).max(1);
     (max_rows / ARROW_ROW_CHUNK).max(1) * ARROW_ROW_CHUNK
-}
-
-#[inline]
-fn arrow_row_chunk_count(n_rows: usize) -> usize {
-    if n_rows == 0 {
-        0
-    } else {
-        (n_rows - 1) / ARROW_ROW_CHUNK + 1
-    }
 }
 
 /// Row-block size for the parallel per-row **cache build** (`build_row_kernel_cache`).
@@ -151,26 +149,11 @@ fn cache_build_block_count(n_rows: usize, chunk_rows: usize) -> usize {
 // Threading `RowSet` through every `row_kernel_*` function is Agent C's
 // job — this module exposes only the type definition and basic
 // constructors used by the κ-staging schedule in `smooth.rs`.
-/// Row-selection contract for outer-only assembly.
-///
-/// Identifies which observations participate in a given evaluation pass and
-/// how they are weighted. `All` iterates every row `0..n_total` with weight
-/// 1.0 (full-data behaviour). `Subsample { rows, n_full }` walks the pre-built
-/// `WeightedOuterRow` list where each row's `weight` is its Horvitz–Thompson
-/// inverse-inclusion scale `1/π_i`, so any partial sum `Σ_i w_i · f(row_i)`
-/// is an unbiased estimator of the corresponding full-data sum
-/// `Σ_{i=1..n_full} f(row_i)`. Inner-PIRLS and final-covariance passes always
-/// run with `All`; only outer score / gradient hot loops consume a non-`All`
-/// variant.
-#[derive(Clone)]
-pub enum RowSet {
-    All,
-    Subsample {
-        rows: Arc<Vec<crate::solver::outer_subsample::WeightedOuterRow>>,
-        n_full: usize,
-    },
-}
-
+// `RowSet` (and its `par_reduce_fold`/`par_try_reduce_fold` reduction methods)
+// moved DOWN to `crate::outer_subsample` (#1135) so `terms` and other consumers
+// can name it without the `Subsample` field reaching up into `solver`. The
+// family-specific `from_options` constructor below stays here because it reads
+// `custom_family::BlockwiseFitOptions`.
 impl RowSet {
     /// Build a `RowSet` directly from the outer-only subsample carried on
     /// `BlockwiseFitOptions`. When `outer_score_subsample` is `None` this
@@ -189,119 +172,6 @@ impl RowSet {
                 rows: Arc::clone(&s.rows),
                 n_full: n_total,
             },
-        }
-    }
-
-    /// Parallel fold-reduce over the row set. `init` produces a fresh
-    /// accumulator, `fold` is the per-row update, `reduce` combines two
-    /// accumulators.
-    ///
-    /// Returns the reduced result. Both branches process fixed-size row chunks
-    /// in parallel, then combine the chunk accumulators in chunk-index order on
-    /// the caller thread. The resulting floating-point reduction tree is fixed
-    /// across Rayon worker counts and work-stealing decisions.
-    #[inline]
-    pub fn par_reduce_fold<T, I, F, R>(&self, n_total: usize, init: I, fold: F, reduce: R) -> T
-    where
-        T: Send,
-        I: Fn() -> T + Send + Sync,
-        F: Fn(T, usize, f64) -> T + Send + Sync,
-        R: Fn(T, T) -> T + Send + Sync,
-    {
-        match self {
-            Self::All => {
-                let chunk_accumulators: Vec<T> = (0..arrow_row_chunk_count(n_total))
-                    .into_par_iter()
-                    .map(|chunk_idx| {
-                        let start = chunk_idx * ARROW_ROW_CHUNK;
-                        let end = (start + ARROW_ROW_CHUNK).min(n_total);
-                        let mut acc = init();
-                        for i in start..end {
-                            acc = fold(acc, i, 1.0);
-                        }
-                        acc
-                    })
-                    .collect();
-                let mut total = init();
-                for acc in chunk_accumulators {
-                    total = reduce(total, acc);
-                }
-                total
-            }
-            Self::Subsample { rows, .. } => {
-                let chunk_accumulators: Vec<T> = rows
-                    .par_chunks(ARROW_ROW_CHUNK)
-                    .map(|chunk| {
-                        let mut acc = init();
-                        for r in chunk {
-                            acc = fold(acc, r.index, r.weight);
-                        }
-                        acc
-                    })
-                    .collect();
-                let mut total = init();
-                for acc in chunk_accumulators {
-                    total = reduce(total, acc);
-                }
-                total
-            }
-        }
-    }
-
-    /// Parallel try-fold over fixed-size row chunks, followed by deterministic
-    /// chunk-index-order reduction on the caller thread.
-    #[inline]
-    pub fn par_try_reduce_fold<T, E, I, F, R>(
-        &self,
-        n_total: usize,
-        init: I,
-        fold: F,
-        reduce: R,
-    ) -> Result<T, E>
-    where
-        T: Send,
-        E: Send,
-        I: Fn() -> T + Send + Sync,
-        F: Fn(T, usize, f64) -> Result<T, E> + Send + Sync,
-        R: Fn(T, T) -> Result<T, E> + Send + Sync,
-    {
-        match self {
-            Self::All => {
-                let chunk_accumulators: Vec<Result<T, E>> = (0..arrow_row_chunk_count(n_total))
-                    .into_par_iter()
-                    .map(|chunk_idx| {
-                        let start = chunk_idx * ARROW_ROW_CHUNK;
-                        let end = (start + ARROW_ROW_CHUNK).min(n_total);
-                        let mut acc = init();
-                        for i in start..end {
-                            acc = fold(acc, i, 1.0)?;
-                        }
-                        Ok(acc)
-                    })
-                    .collect();
-                let mut total = init();
-                for acc in chunk_accumulators {
-                    total = reduce(total, acc?)?;
-                }
-                Ok(total)
-            }
-            Self::Subsample { rows, .. } => {
-                let chunk_accumulators: Vec<Result<T, E>> = rows
-                    .par_chunks(ARROW_ROW_CHUNK)
-                    .map(|chunk| {
-                        let mut acc = init();
-                        for r in chunk {
-                            acc = fold(acc, r.index, r.weight)?;
-                        }
-                        Ok(acc)
-                    })
-                    .collect();
-                let mut total = init();
-                for acc in chunk_accumulators {
-                    total = reduce(total, acc?)?;
-                }
-                Ok(total)
-            }
         }
     }
 }
