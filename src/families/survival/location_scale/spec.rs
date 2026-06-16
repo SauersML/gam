@@ -355,6 +355,7 @@ pub fn survival_fit_from_parts(
         reml_score,
         stable_penalty_term,
         penalized_objective,
+        used_device: false,
         outer_iterations,
         outer_gradient_norm,
         outer_converged,

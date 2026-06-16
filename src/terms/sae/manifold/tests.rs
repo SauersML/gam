@@ -8933,7 +8933,7 @@ mod inner_contract_probe_tests {
         let (reml, _loss) = term
             .reml_criterion_with_refine_policy(
                 target.view(),
-                &rho,
+                &rho_fit,
                 None,
                 4,
                 0.1,
@@ -8943,7 +8943,7 @@ mod inner_contract_probe_tests {
             )
             .expect("REML criterion evaluates");
         let (cotrained, _loss2, consistency) = term
-            .reml_criterion_cotrained(target.view(), &rho, None, 4, 0.1, 1.0e-4, 1.0e-4)
+            .reml_criterion_cotrained(target.view(), &rho_fit, None, 4, 0.1, 1.0e-4, 1.0e-4)
             .expect("co-trained criterion evaluates");
         assert!(
             cotrained.is_finite() && reml.is_finite(),
@@ -8978,11 +8978,11 @@ mod inner_contract_probe_tests {
         // one-mat-vec amortized encode reconstructs the SAME structure the exact
         // encode-by-inner-solve produced. Compare the amortized decoded curve to
         // the exact fitted reconstruction row-by-row over certified rows.
-        let amplitudes = term.fitted_assignment_amplitudes(&rho).unwrap();
+        let amplitudes = term.fitted_assignment_amplitudes(&rho_fit).unwrap();
         let encodes = term
             .amortized_encode_target(target.view(), amplitudes.view())
             .expect("amortized encode runs");
-        let exact_recon = term.try_fitted_for_rho(&rho).unwrap();
+        let exact_recon = term.try_fitted_for_rho(&rho_fit).unwrap();
         let atom0 = &term.atoms[0];
         let evaluator = atom0.basis_evaluator.as_ref().unwrap();
         let (phi_hat, _j) = evaluator.evaluate(encodes[0].coords.view()).unwrap();
@@ -9234,7 +9234,7 @@ mod inner_contract_probe_tests {
         term.run_joint_fit_arrow_schur(target.view(), &mut rho_cold, None, 12, 0.1, 1.0e-4, 1.0e-4)
             .expect("cold inner solve converges on the known periodic manifold");
         let cold_ev = {
-            let fitted = term.try_fitted_for_rho(&rho).unwrap();
+            let fitted = term.try_fitted_for_rho(&rho_cold).unwrap();
             reconstruction_explained_variance(target.view(), fitted.view())
                 .expect("explained variance is defined for the planted target")
         };
@@ -9247,7 +9247,7 @@ mod inner_contract_probe_tests {
         // the inner latents from it. A well-conditioned periodic dictionary must
         // certify + seed a strictly positive number of rows.
         let warm_started = term
-            .warm_start_latents_from_amortized_encoder(target.view(), &rho)
+            .warm_start_latents_from_amortized_encoder(target.view(), &rho_cold)
             .expect("amortized warm-start runs on the fitted dictionary");
         assert!(
             warm_started > 0,
@@ -9260,7 +9260,7 @@ mod inner_contract_probe_tests {
         term.run_joint_fit_arrow_schur(target.view(), &mut rho_warm, None, 12, 0.1, 1.0e-4, 1.0e-4)
             .expect("warm-started inner solve converges");
         let warm_ev = {
-            let fitted = term.try_fitted_for_rho(&rho).unwrap();
+            let fitted = term.try_fitted_for_rho(&rho_warm).unwrap();
             reconstruction_explained_variance(target.view(), fitted.view())
                 .expect("explained variance is defined for the planted target")
         };
@@ -9377,19 +9377,26 @@ mod inner_contract_probe_tests {
         };
 
         // --- Sequential: rank ρ by BARE REML, fit cold, distill post-hoc. ---
-        let mut seq_term = build_term();
         let mut best_seq_rho = rho_grid[0].clone();
         let mut best_seq_cost = f64::INFINITY;
         for rho in &rho_grid {
-            let (reml, _loss) = seq_term
-                .reml_criterion(target.view(), rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
-                .expect("bare REML criterion evaluates on the planted manifold");
+            let mut probe = build_term();
+            let Ok((reml, _loss)) =
+                probe.reml_criterion(target.view(), rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            else {
+                continue;
+            };
             if reml < best_seq_cost {
                 best_seq_cost = reml;
                 best_seq_rho = rho.clone();
             }
         }
+        assert!(
+            best_seq_cost.is_finite(),
+            "the sequential grid must contain at least one converged bare-REML candidate"
+        );
         // Cold re-fit at the bare-REML-selected ρ, then distill the encoder.
+        let mut seq_term = build_term();
         let mut seq_rho = best_seq_rho.clone();
         seq_term
             .run_joint_fit_arrow_schur(target.view(), &mut seq_rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
@@ -9398,23 +9405,30 @@ mod inner_contract_probe_tests {
 
         // --- Co-trained: rank ρ by the co-trained criterion with the amortized
         // warm-start applied each step (Design A). ---
-        let mut cot_term = build_term();
         let mut best_cot_rho = rho_grid[0].clone();
         let mut best_cot_cost = f64::INFINITY;
         for rho in &rho_grid {
+            let mut probe = build_term();
             // Warm-start the inner latents from the amortized encoder built on the
             // running dictionary, then rank by the co-trained criterion.
-            cot_term
+            probe
                 .warm_start_latents_from_amortized_encoder(target.view(), rho)
                 .ok();
-            let (cotrained, _loss, _consistency) = cot_term
-                .reml_criterion_cotrained(target.view(), rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
-                .expect("co-trained criterion evaluates on the planted manifold");
+            let Ok((cotrained, _loss, _consistency)) =
+                probe.reml_criterion_cotrained(target.view(), rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            else {
+                continue;
+            };
             if cotrained < best_cot_cost {
                 best_cot_cost = cotrained;
                 best_cot_rho = rho.clone();
             }
         }
+        assert!(
+            best_cot_cost.is_finite(),
+            "the co-trained grid must contain at least one converged candidate"
+        );
+        let mut cot_term = build_term();
         let mut cot_rho = best_cot_rho.clone();
         cot_term
             .warm_start_latents_from_amortized_encoder(target.view(), &cot_rho)

@@ -379,6 +379,7 @@ pub(crate) fn core_saved_fit_result(
             reml_score: summary.reml_score,
             stable_penalty_term: summary.stable_penalty_term,
             penalized_objective,
+            used_device: summary.used_device,
             outer_iterations: summary.iterations,
             outer_converged: matches!(summary.pirls_status, gam::pirls::PirlsStatus::Converged),
             outer_gradient_norm: Some(summary.finalgrad_norm),

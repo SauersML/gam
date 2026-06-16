@@ -464,6 +464,7 @@ pub(crate) fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitRe
         reml_score: ext.reml_score,
         stable_penalty_term: ext.stable_penalty_term,
         penalized_objective,
+        used_device: ext.used_device,
         outer_iterations: ext.iterations,
         outer_converged: ext.outer_converged,
         outer_gradient_norm: Some(ext.finalgrad_norm),

@@ -2520,6 +2520,11 @@ impl FittedModel {
 
     fn synchronize_stateful_link_metadata(&mut self) {
         let payload = self.payload_mut();
+        payload.used_device = payload
+            .fit_result
+            .as_ref()
+            .or(payload.unified.as_ref())
+            .is_some_and(|fit| fit.used_device);
         let Some(fit) = payload.fit_result.as_ref() else {
             return;
         };

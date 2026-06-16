@@ -596,6 +596,7 @@ fn decode_invariant_test_fit() -> UnifiedFitResult {
         reml_score: 0.7,
         stable_penalty_term: 0.3,
         penalized_objective: 2.2,
+        used_device: false,
         outer_iterations: 3,
         outer_converged: true,
         outer_gradient_norm: Some(0.05),

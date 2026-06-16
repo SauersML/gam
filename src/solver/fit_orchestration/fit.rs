@@ -1290,6 +1290,7 @@ fn survival_unified_fit_result(
         reml_score,
         stable_penalty_term: state.penalty_term,
         penalized_objective: reml_score,
+        used_device: false,
         outer_iterations: summary.iterations,
         outer_converged: true,
         outer_gradient_norm: Some(summary.lastgradient_norm),

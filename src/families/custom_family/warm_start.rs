@@ -652,6 +652,7 @@ pub fn blockwise_fit_from_parts(
         reml_score: penalized_objective,
         stable_penalty_term,
         penalized_objective,
+        used_device: false,
         outer_iterations,
         outer_converged,
         outer_gradient_norm,
