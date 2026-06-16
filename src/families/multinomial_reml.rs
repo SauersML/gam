@@ -1028,6 +1028,171 @@ impl MultinomialFamily {
         out
     }
 
+    /// Assemble the FULL set of second-directional joint-Hessian derivatives
+    /// `{ H²dot[δ, e_a] }` for a FIXED first direction `δ = d_beta_u` and every
+    /// canonical second axis `a = a0·P + i0`, in a SINGLE shared softmax pass and
+    /// one fused parallel row sweep — the value the Tier-B Jeffreys drift needs
+    /// (it requests every canonical second axis at the same `β` and `δ`).
+    ///
+    /// EXACTNESS / FACTORISATION. For the canonical second axis `e_{(a0,i0)}` the
+    /// design-projected v-direction is `d_η_v[row,b] = X[row,i0]·δ_{b,a0}`, so the
+    /// per-row second-directional Fisher jet from
+    /// [`Self::second_directional_fisher_jet`] factors as
+    /// `X[row,i0]·Ĵ²_{a0,δ}[row]`, where the `X[row,i0]`-free per-row `M×M` jet
+    /// `Ĵ²_{a0,δ}` is built from the SAME closed form with the `X[row,i0]` factor
+    /// pulled out of the v-side quantities:
+    /// ```text
+    ///   s_u       = Σ_c p_c d_η^u_c                           (shared, δ-only)
+    ///   dp_u[c]   = p_c (d_η^u_c − s_u)                        (shared, δ-only)
+    ///   dp̂_v[c]   = p_c (δ_{c,a0} − p_{a0})                    (a0-only, X-free)
+    ///   dŝ_u_dv   = Σ_c dp̂_v[c] d_η^u_c                        (a0,δ)
+    ///   ddp̂[c]    = dp̂_v[c] (d_η^u_c − s_u) − p_c · dŝ_u_dv     (a0,δ)
+    ///   Ĵ²[a,a]   = w ( ddp̂[a](1 − 2p_a) − 2 dp_u[a] dp̂_v[a] )
+    ///   Ĵ²[a,b]   = −w ( ddp̂[a] p_b + dp_u[a] dp̂_v[b] + dp̂_v[a] dp_u[b] + p_a ddp̂[b] )
+    /// ```
+    /// Contracting through [`dense_block_xtwx`]'s `Σ_row J[c,d] X[row,i] X[row,j]`
+    /// then gives
+    /// ```text
+    ///   H²dot[δ, e_{(a0,i0)}][(c,i),(d,j)] = Σ_row Ĵ²_{a0,δ}[row,c,d] · X[row,i0] X[row,i] X[row,j].
+    /// ```
+    /// This is BIT-FAITHFUL to the per-axis `second_directional_fisher_jet` →
+    /// `dense_block_xtwx` path the trait default runs, up to row-sum
+    /// associativity, computed once for all `p = (M·P)` axes instead of `p` times
+    /// with `p` redundant softmax passes and `p` generic `(M·P)²` Gram
+    /// allocations — the #1082 / #979 outer-Jeffreys-drift Gram rebuild the
+    /// profile pins on `dense_block_xtwx` (≈half the smooth-by-factor wall-clock).
+    fn assemble_all_axis_second_directional_derivatives(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        d_beta_u: &Array1<f64>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let dim = m * p;
+        let n_axes = m * p;
+        let probs_full = self.row_probabilities(eta);
+        let d_eta_u = self.d_eta_from_d_beta(d_beta_u)?;
+        let design = self.design.view();
+        let mut flat = (0..n)
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f64; n_axes * dim * dim],
+                |mut acc, row| {
+                    let w = self.weights[row];
+                    if w == 0.0 {
+                        return acc;
+                    }
+                    // δ-only quantities (shared across all a0 / axes this row).
+                    let mut s_u = 0.0_f64;
+                    for c in 0..m {
+                        s_u += probs_full[[row, c]] * d_eta_u[[row, c]];
+                    }
+                    let mut dp_u = vec![0.0_f64; m];
+                    for c in 0..m {
+                        dp_u[c] = probs_full[[row, c]] * (d_eta_u[[row, c]] - s_u);
+                    }
+                    for a0 in 0..m {
+                        let pa0 = probs_full[[row, a0]];
+                        // a0-specific (X-free) v-side quantities.
+                        let mut dp_v_hat = vec![0.0_f64; m];
+                        let mut ds_u_dv = 0.0_f64;
+                        for c in 0..m {
+                            let pc = probs_full[[row, c]];
+                            let v = pc * (if c == a0 { 1.0 } else { 0.0 } - pa0);
+                            dp_v_hat[c] = v;
+                            ds_u_dv += v * d_eta_u[[row, c]];
+                        }
+                        let mut ddp_hat = vec![0.0_f64; m];
+                        for c in 0..m {
+                            let pc = probs_full[[row, c]];
+                            ddp_hat[c] =
+                                dp_v_hat[c] * (d_eta_u[[row, c]] - s_u) - pc * ds_u_dv;
+                        }
+                        // Ĵ²_{a0}[c,d] (the X[row,i0]-free per-row second jet),
+                        // matching `second_directional_fisher_jet` term-for-term.
+                        let mut jhat = vec![0.0_f64; m * m];
+                        for a in 0..m {
+                            let pa = probs_full[[row, a]];
+                            jhat[a * m + a] =
+                                w * (ddp_hat[a] * (1.0 - 2.0 * pa) - 2.0 * dp_u[a] * dp_v_hat[a]);
+                            for b in (a + 1)..m {
+                                let pb = probs_full[[row, b]];
+                                let off = -w
+                                    * (ddp_hat[a] * pb
+                                        + dp_u[a] * dp_v_hat[b]
+                                        + dp_v_hat[a] * dp_u[b]
+                                        + pa * ddp_hat[b]);
+                                jhat[a * m + b] = off;
+                                jhat[b * m + a] = off;
+                            }
+                        }
+                        // Scatter `X[row,i0] · Ĵ²_{a0}[c,d] · X[row,i] X[row,j]`
+                        // into axis `(a0,i0)`'s `(dim,dim)` buffer (output-major).
+                        for i0 in 0..p {
+                            let xi0 = design[[row, i0]];
+                            if xi0 == 0.0 {
+                                continue;
+                            }
+                            let axis = a0 * p + i0;
+                            let axis_base = axis * dim * dim;
+                            for c in 0..m {
+                                let row_c = c * p;
+                                for d in 0..m {
+                                    let jcd = jhat[c * m + d];
+                                    if jcd == 0.0 {
+                                        continue;
+                                    }
+                                    let wcd = xi0 * jcd;
+                                    let col_d = d * p;
+                                    for i in 0..p {
+                                        let xi = design[[row, i]];
+                                        if xi == 0.0 {
+                                            continue;
+                                        }
+                                        let scaled = wcd * xi;
+                                        let out_row = axis_base + (row_c + i) * dim;
+                                        for j in 0..p {
+                                            acc[out_row + col_d + j] += scaled * design[[row, j]];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0_f64; n_axes * dim * dim],
+                |mut a, b| {
+                    for (av, bv) in a.iter_mut().zip(b.iter()) {
+                        *av += *bv;
+                    }
+                    a
+                },
+            );
+        let mut out = Vec::with_capacity(n_axes);
+        for axis in 0..n_axes {
+            let start = axis * dim * dim;
+            let mut mat =
+                Array2::<f64>::from_shape_vec((dim, dim), flat[start..start + dim * dim].to_vec())
+                    .expect("axis second-derivative buffer is dim·dim");
+            for i in 0..dim {
+                for j in (i + 1)..dim {
+                    let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
+                    mat[[i, j]] = avg;
+                    mat[[j, i]] = avg;
+                }
+            }
+            out.push(mat);
+        }
+        flat.clear();
+        flat.shrink_to_fit();
+        Ok(out)
+    }
+
     /// Index of the single canonical axis `k` if `d_beta_flat` is the unit
     /// vector `e_k` (the Tier-B Jeffreys loop's request shape), else `None`.
     fn canonical_axis_index(&self, d_beta_flat: &Array1<f64>) -> Option<usize> {

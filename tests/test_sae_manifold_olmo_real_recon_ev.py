@@ -84,7 +84,9 @@ def _load_fixture() -> np.ndarray:
 
 def test_olmo_real_heldout_reconstruction_ev_meets_linear_parity():
     """Production manifold-SAE held-out reconstruction EV on real OLMo-3-32B
-    activations must clear 75% of the rank-8 linear PCA ceiling (>= ~0.344).
+    activations must clear 75% of the rank-8 *linear* PCA ceiling, where that
+    ceiling is recomputed from the committed fixture itself (measured ~0.56 at
+    K=8, so the bar is ~0.42).
 
     RED: on real activations the curved-atom reconstruct path under-recovers
     relative to this bar (it clears the synthetic planted-circle bars but not
@@ -98,9 +100,15 @@ def test_olmo_real_heldout_reconstruction_ev_meets_linear_parity():
     z_test = z[512:]
     assert z_test.shape[0] == 256
 
+    # Self-grounding linear ceiling: the rank-K PCA held-out EV a TopK / linear
+    # dictionary attains for free at the SAME rank K. The manifold SAE must earn
+    # at least a clear majority of it on real data.
+    linear_ceiling = _heldout_linear_ceiling(z_train, z_test, _K)
+    ev_target = _TARGET_FRACTION * linear_ceiling
+
     fit = gamfit.sae_manifold_fit(
         X=z_train,
-        K=8,
+        K=_K,
         atom_basis="periodic",
         d_atom=2,
         assignment="ibp_map",
@@ -121,10 +129,10 @@ def test_olmo_real_heldout_reconstruction_ev_meets_linear_parity():
 
     oos_ev = _ev(z_test, oos)
 
-    assert oos_ev >= _EV_TARGET, (
+    assert oos_ev >= ev_target, (
         f"Held-out reconstruction EV on real OLMo activations = {oos_ev:.4f}, "
-        f"below the bar {_EV_TARGET:.4f} (= {_TARGET_FRACTION:.0%} of the "
-        f"rank-8 linear PCA ceiling {_LINEAR_CEILING_K8:.3f}). "
+        f"below the bar {ev_target:.4f} (= {_TARGET_FRACTION:.0%} of the "
+        f"measured rank-{_K} linear PCA ceiling {linear_ceiling:.4f}). "
         f"In-sample EV was {in_sample_ev:.4f}. "
         f"The manifold SAE does not yet earn its EV on real LLM activations "
         f"at parity with the linear dictionary — the #1026 recon-parity gap "
