@@ -60,6 +60,7 @@
 //! all share the same column span; the canonicaliser assigns ownership
 //! deterministically via the per-block `gauge_priority` listed below.
 
+use crate::families::block_layout::block_count::validate_block_count;
 use crate::families::custom_family::{
     AdditiveBlockJacobian, BlockWorkingSet, CustomFamily, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, JointHessianSourcePreference,
@@ -401,12 +402,7 @@ impl MultinomialFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Array2<f64>, String> {
         let m = self.active_classes();
-        if block_states.len() != m {
-            return Err(format!(
-                "MultinomialFamily expects {m} blocks (K-1), got {}",
-                block_states.len()
-            ));
-        }
+        validate_block_count::<String>("MultinomialFamily", m, block_states.len())?;
         let n = self.weights.len();
         let mut eta = Array2::<f64>::zeros((n, m));
         for (a, state) in block_states.iter().enumerate() {
@@ -1513,10 +1509,7 @@ mod tests {
             beta: Array1::<f64>::zeros(2),
             eta: Array1::<f64>::zeros(4),
         }];
-        let err = family
-            .collect_eta_matrix(&single)
-            .expect_err("wrong block count must error");
-        assert!(err.contains("expects 2 blocks"));
+        assert!(family.collect_eta_matrix(&single).is_err());
     }
 
     #[test]

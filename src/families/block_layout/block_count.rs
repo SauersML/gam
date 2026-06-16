@@ -43,6 +43,12 @@ impl BlockCountMismatch {
     }
 }
 
+impl From<BlockCountMismatch> for String {
+    fn from(err: BlockCountMismatch) -> String {
+        err.message()
+    }
+}
+
 /// Reject any `got` block count that does not exactly equal `expected`.
 ///
 /// On mismatch, builds a [`BlockCountMismatch`] and converts it into the
