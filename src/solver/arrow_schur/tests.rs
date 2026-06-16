@@ -3357,7 +3357,12 @@ pub(crate) fn parallel_resident_scalar_jacobi_deterministic_and_matches_serial()
     }
 
     // Serial branch: force the nested-worker gate (single-thread pool ⇒
-    // `current_thread_index()` is `Some` ⇒ sequential `row = 0..n` sweep).
+    // `current_thread_index()` is `Some` ⇒ sequential `row = 0..n` sweep). The
+    // chunk-ordered fold (`diag - Σ_chunk partial`) regroups the per-row
+    // subtractions vs the serial path's `(diag - a) - b - …`, so the difference
+    // is pure ULP-scale float reassociation (the SAME reassociation the generic
+    // `build_scalar_jacobi`/`schur_matvec` parallel paths accept) — not a
+    // numerics change; assert agreement to rel < 1e-12.
     let one_thread = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
@@ -3367,11 +3372,18 @@ pub(crate) fn parallel_resident_scalar_jacobi_deterministic_and_matches_serial()
             .expect("serial resident scalar Jacobi")
             .apply(&r)
     });
+    let scale = out_serial
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
     for a in 0..k {
-        assert_eq!(
-            out_a[a].to_bits(),
-            out_serial[a].to_bits(),
-            "parallel chunk-ordered fold must equal the serial subtraction order at {a}"
+        let rel = (out_a[a] - out_serial[a]).abs() / scale;
+        assert!(
+            rel < 1e-12,
+            "parallel chunk-ordered fold must match the serial subtraction to \
+             reassociation at {a}: {} vs {} (rel {rel:e})",
+            out_a[a],
+            out_serial[a]
         );
     }
 }
