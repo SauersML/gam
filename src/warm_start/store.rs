@@ -1096,7 +1096,7 @@ impl WarmStartStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::key::Fingerprinter;
+    use crate::warm_start::key::Fingerprinter;
 
     impl WarmStartStore {
         /// Advance this store's simulated monotonic clock by `dur`. Only

@@ -1,4 +1,3 @@
-pub mod bernoulli_marginal_slope_identifiability;
 pub mod binomial_multi;
 pub mod bms;
 pub mod block_layout;
@@ -8,10 +7,7 @@ pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod fnv;
 pub mod gamlss;
-pub mod identifiability_compiler;
-pub(crate) mod identifiability_gpu;
-#[cfg(target_os = "linux")]
-pub(crate) mod identifiability_gpu_kernel;
+pub mod identifiability;
 pub mod inverse_link;
 pub(crate) mod jet_partitions;
 pub mod jet_tower;
@@ -46,7 +42,7 @@ pub mod transformation_normal;
 pub mod vector_response;
 pub mod wiggle;
 
-pub use identifiability_compiler::{
+pub use identifiability::compiler::{
     BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian, RowJacobianOperator,
     compile,
 };

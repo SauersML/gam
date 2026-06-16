@@ -6086,7 +6086,7 @@ fn expect_single_block_state<'a>(
     block_states: &'a [ParameterBlockState],
     family_name: &str,
 ) -> Result<&'a ParameterBlockState, String> {
-    crate::util::block_count::validate_block_count::<SmoothError>(
+    crate::families::block_layout::block_count::validate_block_count::<SmoothError>(
         family_name,
         1,
         block_states.len(),

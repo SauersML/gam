@@ -2914,14 +2914,20 @@ fn sae_manifold_fit_inner<'py>(
         let kind_name = sae_atom_basis_kind_name(kind);
         // Recover the per-(axis-)harmonic order from the fitted basis width for
         // the harmonic families; 0 for the non-harmonic kinds (the python reader
-        // only consults `n_harmonics` for periodic/torus atoms).
+        // only consults `n_harmonics` for periodic/torus atoms). The harmonic
+        // order is floored at 1 for the harmonic kinds: a periodic/torus atom is
+        // by construction at least one harmonic (basis width 2H+1 with H>=1), and
+        // a degenerate collapse to a constant-only width (basis_size <= 2) would
+        // otherwise re-emit n_harmonics=0 — which the round-trip rebuild
+        // (`sae_build_periodic_atom`, `sae_build_torus_atom`) rejects as a
+        // non-positive harmonic order, breaking K>=4 reload/OOS reconstruct.
         let n_harmonics = match kind {
-            SaeAtomBasisKind::Periodic => basis_size.saturating_sub(1) / 2,
+            SaeAtomBasisKind::Periodic => (basis_size.saturating_sub(1) / 2).max(1),
             SaeAtomBasisKind::Torus => {
                 // basis_size = (2H+1)^latent_dim; recover the per-axis 2H+1, then H.
                 match sae_torus_axis_basis_size(basis_size, latent_dim.max(1)) {
-                    Ok(axis_m) => axis_m.saturating_sub(1) / 2,
-                    Err(_) => 0,
+                    Ok(axis_m) => (axis_m.saturating_sub(1) / 2).max(1),
+                    Err(_) => 1,
                 }
             }
             _ => 0,
