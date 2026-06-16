@@ -3,21 +3,22 @@
 //!
 //! Root cause (verified): with the NB overdispersion `theta` ESTIMATED, the
 //! inner solver re-derived `theta` from each outer iterate's warm-start `eta`,
-//! so the NB working response / deviance / penalty-logdet — and hence the REML
-//! criterion — drifted on every outer evaluation. The outer optimizer then
+//! so the NB working response / deviance / penalty-logdet, and hence the REML
+//! criterion, drifted on every outer evaluation. The outer optimizer then
 //! chased a moving target: the projected-gradient convergence test never tripped
 //! and the loop ground to `max_iter` (200) without converging, the #1082
-//! `gam_tensor_te_2d_negbin` wall-clock timeout. (An otherwise-identical Poisson
-//! fit, with no estimated dispersion, converges in ~5 outer iterations.)
+//! `gam_tensor_te_2d_negbin` wall-clock timeout. An otherwise-identical Poisson
+//! fit, with no estimated dispersion, converges in a handful of outer iterations.
 //!
-//! Fix: freeze `theta` for the duration of the smoothing-parameter (λ) search
+//! Fix: freeze `theta` for the duration of the smoothing-parameter lambda search
 //! (`GlmLikelihoodSpec::with_negbin_theta_frozen_for_search`, driven by the REML
-//! state's `frozen_negbin_theta`), so `F(ρ) = REML(ρ, θ_frozen)` is a stationary
-//! function of ρ and the loop converges in a handful of iterations. `theta` is
-//! still ML-refreshed at the single final, reported accept-fit.
+//! state's `frozen_negbin_theta`), so `F(rho) = REML(rho, theta_frozen)` is a
+//! stationary function of rho and the loop converges quickly. `theta` is still
+//! ML-refreshed at the single final, reported accept-fit.
 //!
-//! These reproductions are pure Rust on small synthetic grids (no R / baseline
-//! data), so they are FAST and run inside the normal test budget.
+//! This is intentionally a standalone integration test, not a module in
+//! `tests/regressions.rs`: the guard is small and pure Rust, so it should be
+//! runnable directly with `cargo test --test perf_1082_outer_loop_repro`.
 
 use csv::StringRecord;
 use gam::{
@@ -50,11 +51,9 @@ fn synthetic_count_records(n: usize, seed: u64) -> (Vec<String>, Vec<StringRecor
     (headers, rows)
 }
 
-/// The #1082 guard: an estimated-θ Negative-Binomial tensor fit must converge
-/// the outer REML loop in a small, bounded number of iterations and a tight
-/// wall-clock budget. Before the λ-search θ-freeze fix this ran the full
-/// `max_iter = 200` outer iterations with `outer_converged == false`; after the
-/// fix it converges in ~5.
+/// The #1082 guard: an estimated-theta Negative-Binomial tensor fit must
+/// converge the outer REML loop in a small, bounded number of iterations and a
+/// tight wall-clock budget.
 #[test]
 fn negbin_te_2d_outer_loop_converges_in_budget_1082() {
     init_parallelism();
@@ -81,31 +80,21 @@ fn negbin_te_2d_outer_loop_converges_in_budget_1082() {
         elapsed.as_secs_f64(),
     );
 
-    // The outer smoothing-parameter loop must actually converge — not silently
-    // exhaust its budget. This is the precise failure the bug exhibited.
     assert!(
         fit.fit.outer_converged,
         "#1082 regression: NB te outer REML loop did not converge \
          (outer_iterations={}, grad_norm={:?})",
-        fit.fit.outer_iterations, fit.fit.outer_gradient_norm,
+        fit.fit.outer_iterations,
+        fit.fit.outer_gradient_norm,
     );
 
-    // A stationary REML surface converges in a handful of outer iterations. The
-    // bug ran the full max_iter = 200; a stable θ converges in ~5. Bound well
-    // below max_iter so a future re-introduction of the per-eval θ drift fails
-    // here loudly rather than by wall-clock timeout. This is NOT a budget bump:
-    // it is an upper guard on a loop that genuinely converges in ~5.
     assert!(
         fit.fit.outer_iterations <= 30,
         "#1082 regression: NB te outer loop took {} iterations (expected ~5); \
-         the λ-search θ-freeze is not holding the REML surface stationary",
+         the lambda-search theta freeze is not holding the REML surface stationary",
         fit.fit.outer_iterations,
     );
 
-    // Wall-clock guard. The fit converges in well under 60 s even in a debug
-    // build on the small n=200 grid; the bug spent the whole 200-iteration
-    // budget. Generous enough to never flake on a slow CI box, tight enough to
-    // catch a return of the cycling.
     assert!(
         elapsed.as_secs_f64() < 60.0,
         "#1082 regression: NB te fit took {:.1}s (expected a few seconds)",
@@ -115,7 +104,7 @@ fn negbin_te_2d_outer_loop_converges_in_budget_1082() {
 
 /// Control: the otherwise-identical Poisson fit (no estimated dispersion) must
 /// also converge quickly. Guards against a regression that slows the shared
-/// standard-family outer loop while "fixing" the NB-specific path.
+/// standard-family outer loop while fixing the NB-specific path.
 #[test]
 fn poisson_te_2d_outer_loop_converges_in_budget_1082() {
     init_parallelism();
@@ -133,13 +122,11 @@ fn poisson_te_2d_outer_loop_converges_in_budget_1082() {
 
     eprintln!(
         "[#1082 control] poisson te: outer_iterations={} outer_converged={}",
-        fit.fit.outer_iterations, fit.fit.outer_converged,
+        fit.fit.outer_iterations,
+        fit.fit.outer_converged,
     );
 
-    assert!(
-        fit.fit.outer_converged,
-        "Poisson te outer loop did not converge"
-    );
+    assert!(fit.fit.outer_converged, "Poisson te outer loop did not converge");
     assert!(
         fit.fit.outer_iterations <= 30,
         "Poisson te outer loop took {} iterations (expected ~5)",
