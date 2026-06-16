@@ -23,9 +23,7 @@ use crate::custom_family::{
 };
 use crate::faer_ndarray::fast_ab;
 use crate::matrix::DesignMatrix;
-use crate::solver::estimate::reml::reml_outer_engine::{
-    HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
-};
+use crate::reml_contracts::{HyperOperator, ProjectedFactorCache, ProjectedFactorKey};
 use crate::util::loop_progress::LoopProgress;
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::prelude::*;
@@ -2196,7 +2194,7 @@ mod gram_inner_contraction_tests {
     use crate::custom_family::{
         JointHessianSource, exact_newton_joint_hessian_source_from_workspace,
     };
-    use crate::solver::estimate::reml::reml_outer_engine::ProjectedFactorCache;
+    use crate::reml_contracts::ProjectedFactorCache;
     use ndarray::Array2;
 
     #[test]

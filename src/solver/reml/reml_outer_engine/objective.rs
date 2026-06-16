@@ -110,10 +110,9 @@ pub fn reml_laml_evaluate(
     // `PenaltyQuadAtom` (built downstream for `rho_frozen_d1`) exposes. The cost
     // can no longer read a raw `solution.penalty_quadratic` that the gradient
     // atom does not own — value and ρ-derivative are projections of one atom.
-    let penalty_quad_value_atom =
-        crate::solver::reml::atoms::PenaltyQuadAtom::stable_value_only(
-            0.5 * solution.penalty_quadratic,
-        );
+    let penalty_quad_value_atom = crate::solver::reml::atoms::PenaltyQuadAtom::stable_value_only(
+        0.5 * solution.penalty_quadratic,
+    );
     let penalty_quad_value = penalty_quad_value_atom.value();
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
@@ -703,8 +702,10 @@ pub fn reml_laml_evaluate(
 
         let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
         let generic_ops: Vec<&dyn HyperOperator> = operators.iter().map(|op| op.as_ref()).collect();
-        let implicit_ops: Vec<&ImplicitHyperOperator> =
-            operators.iter().filter_map(|op| as_implicit(op.as_ref())).collect();
+        let implicit_ops: Vec<&ImplicitHyperOperator> = operators
+            .iter()
+            .filter_map(|op| as_implicit(op.as_ref()))
+            .collect();
 
         // ── Block 2.5: GPU-adaptive Hutchinson bypass.
         //

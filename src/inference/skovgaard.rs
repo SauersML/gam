@@ -731,4 +731,168 @@ mod tests {
         assert_eq!(eq.p_value_first_order, 1.0);
         assert!(!eq.material);
     }
+
+    // ── INDEPENDENT ANALYTIC FIXTURE: Poisson mean via the Lugannani–Rice
+    //    saddlepoint (#939, deliverable 3 hardening) ───────────────────────────
+    //
+    // A second, algebraically-distinct closed form for `r*`. For a one-parameter
+    // exponential family the modified root `r*` and the Lugannani–Rice (1980)
+    // saddlepoint approximation share the SAME directed root `r` and the SAME `u`,
+    // but combine them by different formulas:
+    //
+    //   * Barndorff-Nielsen:  r* = r + (1/r)·log(u/r),  tail = Φ(−r*),
+    //   * Lugannani–Rice:     tail = 1 − Φ(r) − φ(r)·(1/r − 1/u).
+    //
+    // Both are third-order-accurate approximations to the SAME exact tail
+    // probability, so they must agree to O(n⁻³ᐟ²). Reproducing the L–R tail from
+    // OUR `(r, u)` is therefore an independent check that the engine's `u` (built
+    // from observed/expected/score information) is the genuine Skovgaard `u` — a
+    // different derivation than the Exponential/canonical anchor already in the
+    // module, on a different family.
+    //
+    // Poisson model: `S ~ Poisson(nμ)`, canonical θ = log μ. For the natural
+    // sufficient statistic the canonical-family `u` equals the Wald root
+    // `q = (θ̂−θ₀)·√ĵ` with `ĵ = nμ̂ = S` (the exact observed information in θ),
+    // and the LR root is `r = sign(θ̂−θ₀)·√W`, `W = 2[S log(S/(nμ₀)) − (S−nμ₀)]`.
+
+    /// Standard normal pdf.
+    fn normal_pdf(z: f64) -> f64 {
+        (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt()
+    }
+
+    /// The right-tail `P(X ≥ x)` for the Poisson saddlepoint problem, computed two
+    /// independent ways from a single `(r, u)`: our Barndorff-Nielsen `r*` tail and
+    /// the Lugannani–Rice tail. Returns `(p_rstar, p_lr, p_first_order)`.
+    fn poisson_tails(n: f64, mu_hat: f64, mu0: f64) -> (f64, f64, f64) {
+        let theta_hat = mu_hat.ln();
+        let theta0 = mu0.ln();
+        let s = n * mu_hat; // sufficient statistic S = nμ̂
+        // LR statistic W = 2[S log(S/(nμ₀)) − (S − nμ₀)].
+        let w = 2.0 * (s * (s / (n * mu0)).ln() - (s - n * mu0));
+        // Observed/expected/score info in θ all equal nμ̂ = S for the canonical
+        // Poisson at the MLE — the canonical identity î = ĵ = Î.
+        let info = s;
+        let res = scalar_skovgaard_r_star(&ScalarSkovgaardInput {
+            theta_hat,
+            theta_null: theta0,
+            lr_statistic: w,
+            observed_info: info,
+            expected_info: info,
+            score_cov: info,
+        })
+        .expect("poisson r*");
+        let r = res.r;
+        let u = res.u; // canonical ⇒ u = (θ̂−θ₀)√ĵ, the Wald root
+        // Our r* right-tail P(X ≥ x) = Φ(−r*) = 1 − Φ(r*).
+        let p_rstar = 1.0 - normal_cdf(res.r_star);
+        // Lugannani–Rice tail from the same (r, u).
+        let p_lr = (1.0 - normal_cdf(r)) - normal_pdf(r) * (1.0 / r - 1.0 / u);
+        let p_first = 1.0 - normal_cdf(r);
+        (p_rstar, p_lr, p_first)
+    }
+
+    #[test]
+    fn poisson_r_star_tail_matches_lugannani_rice_saddlepoint() {
+        // A genuine upper-tail event: μ̂ above μ₀ so r, u > 0 and the tail is small.
+        // Several (n, μ̂, μ₀) so the agreement is not a single coincidence.
+        for &(n, mu_hat, mu0) in &[
+            (12.0_f64, 1.6_f64, 1.0_f64),
+            (20.0, 2.3, 1.7),
+            (8.0, 3.1, 2.0),
+            (30.0, 0.9, 0.6),
+        ] {
+            let (p_rstar, p_lr, p_first) = poisson_tails(n, mu_hat, mu0);
+            // Both saddlepoint tails are valid probabilities.
+            assert!(
+                (0.0..=1.0).contains(&p_rstar) && (0.0..=1.0).contains(&p_lr),
+                "n={n} μ̂={mu_hat}: tails must be probabilities (r*={p_rstar}, LR={p_lr})"
+            );
+            // INDEPENDENT AGREEMENT: r* and Lugannani–Rice must coincide to the
+            // shared O(n⁻³ᐟ²) order. Their relative gap shrinks with n; at these
+            // modest n a 5% relative band (and a tight absolute floor) holds.
+            let rel = (p_rstar - p_lr).abs() / p_lr.max(1e-12);
+            assert!(
+                (p_rstar - p_lr).abs() < 5e-3 || rel < 0.05,
+                "n={n} μ̂={mu_hat} μ₀={mu0}: r* tail {p_rstar:.6} must match \
+                 Lugannani–Rice {p_lr:.6} (|Δ|={:.2e}, rel={rel:.3})",
+                (p_rstar - p_lr).abs()
+            );
+            // And both higher-order tails must DIFFER from the raw first-order
+            // directed-root tail — otherwise the correction is a no-op and the
+            // agreement above would be vacuous.
+            assert!(
+                (p_rstar - p_first).abs() > 1e-4,
+                "n={n} μ̂={mu_hat}: r* must move the tail off the first-order value \
+                 (r*={p_rstar:.6}, first-order={p_first:.6})"
+            );
+        }
+    }
+
+    /// SMALL-n SIZE CHECK (#939, deliverable 3 hardening): under the null the
+    /// one-sided p-value from the modified root `r*` must be BETTER calibrated
+    /// (closer to Uniform / nominal size) than the raw first-order directed root
+    /// `r`. Exact null distribution: `S ~ Poisson(nμ₀)` summed over the integer
+    /// support — no Monte-Carlo noise, the size is computed exactly from the pmf.
+    #[test]
+    fn poisson_r_star_improves_small_n_size_over_first_order() {
+        let mu0 = 1.3_f64;
+        // Small n where the first-order directed root is visibly skewed.
+        for &n in &[10.0_f64, 16.0, 25.0] {
+            let rate = n * mu0; // S ~ Poisson(rate)
+            // Enumerate the pmf over a wide support and accumulate the exact size
+            // (probability of rejecting H₀: μ = μ₀ at one-sided α) for both lanes.
+            let s_max = (rate + 50.0 * rate.sqrt()).ceil() as usize;
+            let mut pmf = (-rate).exp();
+            // Exact one-sided size at α: P(p_value ≤ α) under the null.
+            let alphas = [0.05_f64, 0.10];
+            let mut size_first = [0.0_f64; 2];
+            let mut size_star = [0.0_f64; 2];
+            for s in 0..=s_max {
+                if s > 0 {
+                    pmf *= rate / s as f64;
+                }
+                if s == 0 {
+                    continue; // S = 0 ⇒ μ̂ = 0, log undefined; mass is negligible here.
+                }
+                let mu_hat = s as f64 / n;
+                // Upper-tail p-values (one-sided test μ > μ₀). For μ̂ < μ₀ the
+                // upper-tail p-value is > 0.5 and never triggers a small-α
+                // rejection, so this cleanly isolates the calibrated tail.
+                let (p_rstar, _p_lr, p_first) = poisson_tails(n, mu_hat, mu0);
+                for (j, &a) in alphas.iter().enumerate() {
+                    if p_first <= a {
+                        size_first[j] += pmf;
+                    }
+                    if p_rstar <= a {
+                        size_star[j] += pmf;
+                    }
+                }
+            }
+            for (j, &a) in alphas.iter().enumerate() {
+                let err_first = (size_first[j] - a).abs();
+                let err_star = (size_star[j] - a).abs();
+                // The modified root must be at least as well sized as first-order,
+                // and strictly better in at least the tighter α where the skew bites.
+                assert!(
+                    err_star <= err_first + 1e-9,
+                    "n={n} α={a}: r* size {:.4} (|Δ|={err_star:.4}) must be no worse than \
+                     first-order size {:.4} (|Δ|={err_first:.4})",
+                    size_star[j],
+                    size_first[j]
+                );
+            }
+            // At α = 0.05 (where the discreteness-and-skew distortion is largest)
+            // the improvement must be strict.
+            let err_first_05 = (size_first[0] - 0.05).abs();
+            let err_star_05 = (size_star[0] - 0.05).abs();
+            assert!(
+                err_star_05 < err_first_05,
+                "n={n}: r* must strictly improve the α=0.05 size over first-order: \
+                 |size_r*−0.05|={err_star_05:.4} must be < |size_r−0.05|={err_first_05:.4} \
+                 (size_r*={:.4}, size_r={:.4})",
+                size_star[0],
+                size_first[0]
+            );
+        }
+    }
 }

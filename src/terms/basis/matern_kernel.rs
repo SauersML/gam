@@ -109,7 +109,11 @@ pub fn build_thin_plate_basiswithworkspace(
             shared_data,
             Arc::new(centers.clone()),
             kernel_fn,
-            Some(Arc::new(internal_kernel_transform.clone())),
+            Some(Arc::new(
+                crate::solver::gauge::Gauge::from_block_transforms(&[
+                    internal_kernel_transform.clone()
+                ]),
+            )),
             Some(Arc::new(poly_block)),
         )
         .map_err(BasisError::InvalidInput)?;

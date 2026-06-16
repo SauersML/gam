@@ -262,11 +262,14 @@ fn build_duchon_basis_uncached(
                 };
                 raw * kernel_amp
             };
+            let kernel_gauge = Arc::new(crate::solver::gauge::Gauge::from_block_transforms(&[
+                kernel_transform.clone(),
+            ]));
             let base_op = ChunkedKernelDesignOperator::new(
                 shared_data.clone(),
                 Arc::new(centers.clone()),
                 kernel,
-                Some(Arc::new(kernel_transform.clone())),
+                Some(kernel_gauge),
                 Some(Arc::new(poly_block.clone())),
             )
             .map_err(BasisError::InvalidInput)?;
@@ -290,11 +293,14 @@ fn build_duchon_basis_uncached(
                 };
                 raw * kernel_amp
             };
+            let kernel_gauge = Arc::new(crate::solver::gauge::Gauge::from_block_transforms(&[
+                kernel_transform.clone(),
+            ]));
             let base_op = ChunkedKernelDesignOperator::new(
                 shared_data,
                 Arc::new(centers.clone()),
                 kernel,
-                Some(Arc::new(kernel_transform.clone())),
+                Some(kernel_gauge),
                 Some(Arc::new(poly_block)),
             )
             .map_err(BasisError::InvalidInput)?;

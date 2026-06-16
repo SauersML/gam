@@ -1,4 +1,5 @@
 use super::*;
+use crate::solver::gauge::Gauge;
 
 /// Which radial kernel family is being used. Stored in the streaming operator
 /// so that (q, t) scalars can be recomputed on the fly without a closure.
@@ -567,7 +568,7 @@ pub(crate) struct StreamingSphereEvaluator {
     pub(crate) penalty_order: usize,
     pub(crate) radians: bool,
     pub(crate) wahba_kernel: SphereWahbaKernel,
-    pub(crate) constraint_transform: Option<Arc<Array2<f64>>>,
+    pub(crate) coefficient_gauge: Option<Arc<Gauge>>,
     pub(crate) sin_lat_c: Arc<[f64]>,
     pub(crate) cos_lat_c: Arc<[f64]>,
     pub(crate) sin_lon_c: Arc<[f64]>,
@@ -583,7 +584,7 @@ impl StreamingSphereEvaluator {
         penalty_order: usize,
         radians: bool,
         wahba_kernel: SphereWahbaKernel,
-        constraint_transform: Option<Arc<Array2<f64>>>,
+        coefficient_gauge: Option<Arc<Gauge>>,
         chunk_size: Option<usize>,
     ) -> Result<Self, String> {
         validate_lat_lon_matrix(data.view(), "StreamingSphereEvaluator data", radians)
@@ -595,12 +596,12 @@ impl StreamingSphereEvaluator {
                 "StreamingSphereEvaluator: penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
             ));
         }
-        if let Some(z) = constraint_transform.as_ref()
-            && z.nrows() != centers.nrows()
+        if let Some(gauge) = coefficient_gauge.as_ref()
+            && gauge.raw_total() != centers.nrows()
         {
             return Err(format!(
-                "StreamingSphereEvaluator: constraint transform rows {} != centers {}",
-                z.nrows(),
+                "StreamingSphereEvaluator: coefficient gauge raw width {} != centers {}",
+                gauge.raw_total(),
                 centers.nrows()
             ));
         }
@@ -621,16 +622,16 @@ impl StreamingSphereEvaluator {
             sin_lon_c.push(s_lon);
             cos_lon_c.push(c_lon);
         }
-        let total_cols = constraint_transform
+        let total_cols = coefficient_gauge
             .as_ref()
-            .map_or(centers.nrows(), |z| z.ncols());
+            .map_or(centers.nrows(), |g| g.reduced_total());
         Ok(Self {
             data: Arc::new(data.as_standard_layout().to_owned()),
             centers: Arc::new(centers.as_standard_layout().to_owned()),
             penalty_order,
             radians,
             wahba_kernel,
-            constraint_transform,
+            coefficient_gauge,
             sin_lat_c: Arc::from(sin_lat_c),
             cos_lat_c: Arc::from(cos_lat_c),
             sin_lon_c: Arc::from(sin_lon_c),
@@ -718,8 +719,8 @@ impl StreamingSphereEvaluator {
 
     pub(crate) fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
         let raw = self.raw_kernel_chunk(start..end);
-        match self.constraint_transform.as_ref() {
-            Some(z) => fast_ab(&raw, z),
+        match self.coefficient_gauge.as_ref() {
+            Some(gauge) => gauge.restrict_design(&raw),
             None => raw,
         }
     }

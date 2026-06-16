@@ -518,30 +518,14 @@ fn stabilizing_shift_core(
     Some(floor - gershgorin_min)
 }
 
-pub(crate) fn stabilize_exact_newton_lhs_in_place<F: CustomFamily + ?Sized>(
-    family: &F,
-    lhs_dense: &mut Array2<f64>,
-    ridge_floor: f64,
-) {
-    if use_exact_newton_strict_spd(family) {
-        return;
-    }
-    if let Some(shift) = exact_newton_stabilizing_shift(lhs_dense, ridge_floor) {
-        for d in 0..lhs_dense.nrows() {
-            lhs_dense[[d, d]] += shift;
-        }
-    }
-}
-
 /// Per-block exact-Newton analogue of [`stabilized_joint_solver_diagonal_ridge`]
 /// (gam#979). The block left-hand side is `lhs_dense = H_data + S`, where the
 /// penalty `S = s_lambda (⪰ 0)` is positive-semidefinite by construction. As in
 /// the coupled joint-Newton path, Weyl's inequality gives
 /// `λ_min(H_data + S) ≥ λ_min(H_data)`, so the stabilizing ridge is bounded by
 /// the *data* Hessian's curvature — never the penalty's. Passing the penalized
-/// `lhs_dense` as its own Gershgorin source (the plain
-/// [`stabilize_exact_newton_lhs_in_place`]) reproduces the survival hang on any
-/// block whose penalty is heavily over-smoothed: the large *balanced*
+/// `lhs_dense` as its own Gershgorin source (a plain, unpenalized-source
+/// stabilizer) reproduces the survival hang on any
 /// off-diagonals of `S` make `diag − radius` read a spuriously huge negative
 /// `λ_min`, so `δ = floor − g` adds a giant ridge and every per-block Newton
 /// step collapses to `g/(H+μ) ≈ 0`. Bounding the shift by `H_data` (the

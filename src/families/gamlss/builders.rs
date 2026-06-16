@@ -1641,7 +1641,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                  designs: &[TermCollectionDesign],
                  eval_mode,
                  row_set: &crate::families::row_kernel::RowSet| {
-                    use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
+                    use crate::reml_contracts::EvalMode;
                     if !analytic_joint_derivatives_available {
                         return Err(
                             "analytic spatial psi derivatives are unavailable for this exact two-block path"
@@ -2868,9 +2868,9 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             &[eta_derivs, Vec::new()],
             warm_cache,
             if need_hessian {
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
+                crate::reml_contracts::EvalMode::ValueGradientHessian
             } else {
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
+                crate::reml_contracts::EvalMode::ValueAndGradient
             },
         )?;
         Ok((eval, resolvedspec, design))

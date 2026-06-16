@@ -1,188 +1,38 @@
 use super::*;
 
-/// Derivative provider for link-wiggle models that restores exact second-order
-/// Hessian corrections for the outer REML/LAML evaluator.
-///
-/// # Background
-///
-/// In link-wiggle models, the Gauss-Newton Hessian H = J'WJ has a coupled
-/// Jacobian J that depends on the coefficients β through the link function.
-/// Differentiating H twice with respect to the outer smoothing parameters
-/// (via the implicit function theorem) produces FIVE distinct contributions.
-/// Without these, the unified REML evaluator cannot compute the exact outer
-/// Hessian, so the outer planner must downgrade to a non-analytic-Hessian
-/// strategy (BFGS, or EFS / hybrid EFS when that fixed-point structure is
-/// available).
-///
-/// This provider stores pre-computed ingredients from the converged P-IRLS
-/// inner loop and implements both first-order (∂H/∂ρ_k) and second-order
-/// (∂²H/∂ρ_k∂ρ_l) Hessian corrections analytically, enabling the exact
-/// analytic-Hessian outer plan instead of those downgraded strategies.
-///
-/// # Mathematical framework (response.md Sections 3 and 6)
-///
-/// The link-wiggle predictor is q = g(η; θ_link) where g is a flexible
-/// link function parameterized by θ_link. The joint Jacobian J maps the
-/// combined parameter vector (β_base, β_link) to the predictor derivatives:
-///
-///   J[:,0..p_base] = diag(g'(η)) · X_base        (base block)
-///   J[:,p_base..]  = B(z) · Z                      (link block)
-///
-/// where z = (η - min)/(max - min) is the normalized base predictor, B(z)
-/// is the B-spline basis evaluated at z, and Z is the geometric constraint
-/// transform ensuring monotonicity.
-///
-/// The Gauss-Newton Hessian is H = J'WJ where W = diag(w_i) are the
-/// working weights from the negative log-likelihood second derivative.
-///
-/// Differentiating H with respect to ρ_k (via the chain rule through
-/// the implicit function theorem β̂(ρ)) requires:
-///
-///   ∂H/∂ρ_k = D_β H[-v_k]  where v_k = H⁻¹(A_k β̂)
-///
-/// and for the second derivative:
-///
-///   ∂²H/∂ρ_k∂ρ_l = D_β H[u_kl] + D²_β H[-v_k, -v_l]
-///
-/// where u_kl = H⁻¹(−g_kl + Ḣ_l v_k + Ḣ_k v_l) is the second-order
-/// IFT mode response.
-///
-/// # Relationship to Arbogast
-///
-/// The five-term decomposition arises from the Arbogast formula for the
-/// second derivative of the composed map ρ → β̂(ρ) → J(β̂) → J'WJ. Each
-/// differentiation of J'WJ produces terms from:
-/// - Differentiating J (Jacobian drift, terms 2-4)
-/// - Differentiating W (weight drift, terms 3-5)
-/// - Cross terms between the two differentiations (terms 2, 3, 4)
-/// - The curvature of W itself through w'' (term 5)
-#[derive(Clone)]
-pub struct HyperCoord {
-    /// ∂_i F|_β — fixed-β cost derivative (scalar).
-    pub a: f64,
-    /// ∂_i (∇_β F)|_β — fixed-β score (p-vector).
-    pub g: Array1<f64>,
-    /// ∂_i H|_β — fixed-β Hessian drift.
-    ///
-    /// The drift may have a materialized dense contribution, an operator
-    /// contribution, or both. This replaces the old `b_mat + optional
-    /// b_operator + zero-sized placeholder` convention.
-    pub drift: HyperCoordDrift,
-    /// ∂_i L_δ(S) — smooth penalty pseudo-logdet first derivative.
-    /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
-    pub ld_s: f64,
-    /// Whether B_i depends on β (true for ψ with non-Gaussian likelihood).
-    /// When true, M_i[u] = D_β B_i[u] contributes to the exact outer Hessian.
-    pub b_depends_on_beta: bool,
-    /// Whether this coordinate is "penalty-like" (τ) vs "design-moving" (ψ).
-    ///
-    /// Penalty-like coordinates (τ) have Hessian drifts derived from penalty
-    /// matrix derivatives (similar to ρ coordinates), so they are PSD.
-    /// Design-moving coordinates (ψ) have Hessian drifts that contain
-    /// design-motion and likelihood-curvature terms and need not be PSD or even
-    /// sign-definite.
-    ///
-    /// This flag controls eligibility for EFS (Fellner-Schall) updates.
-    /// See [`compute_efs_update`] for details.
-    pub is_penalty_like: bool,
-    /// Fixed-β Jeffreys/Firth gradient partial `(g_Φ)_i`, when the inner
-    /// objective includes the exact bias-reduction term.
-    pub firth_g: Option<Array1<f64>>,
-    /// Fixed-β linear predictor derivative used by the Tierney-Kadane
-    /// correction's direct c/d derivative terms.
-    pub tk_eta_fixed: Option<Array1<f64>>,
-    /// Fixed-β design derivative used by the Tierney-Kadane correction's
-    /// direct design-row derivative terms.
-    pub tk_x_fixed: Option<Array2<f64>>,
+pub(crate) fn as_implicit(op: &dyn HyperOperator) -> Option<&ImplicitHyperOperator> {
+    op.as_any().downcast_ref::<ImplicitHyperOperator>()
 }
 
-/// Second-order fixed-β objects for a pair of outer coordinates.
-///
-/// Used by the outer Hessian computation. For ρ-ρ diagonal pairs, these
-/// equal the first-order objects (a_kk = a_k, g_kk = g_k, B_kk = B_k).
-/// For ρ-ρ off-diagonal pairs with k≠l, these are all zero.
-pub struct HyperCoordPair {
-    /// ∂²_ij F|_β — fixed-β cost second derivative (scalar).
-    pub a: f64,
-    /// ∂²_ij (∇_β F)|_β — fixed-β score second derivative (p-vector).
-    pub g: Array1<f64>,
-    /// ∂²_ij H|_β — fixed-β Hessian second drift (p×p matrix).
-    pub b_mat: Array2<f64>,
-    /// ∂²_ij H|_β — operator-valued Hessian second drift (implicit, avoids p×p).
-    pub b_operator: Option<Box<dyn HyperOperator>>,
-    /// ∂²_ij L_δ(S) — smooth penalty pseudo-logdet second derivative.
-    /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
-    pub ld_s: f64,
+pub(crate) fn as_composite(op: &dyn HyperOperator) -> Option<&CompositeHyperOperator> {
+    op.as_any().downcast_ref::<CompositeHyperOperator>()
 }
 
-impl HyperCoordPair {
-    /// Return a zero-valued pair (used as a no-op fallback when hyper-coordinate
-    /// construction is skipped for large models).
-    pub fn zero() -> Self {
-        Self {
-            a: 0.0,
-            g: Array1::zeros(0),
-            b_mat: Array2::zeros((0, 0)),
-            b_operator: None,
-            ld_s: 0.0,
-        }
-    }
+pub(crate) fn as_weighted(op: &dyn HyperOperator) -> Option<&WeightedHyperOperator> {
+    op.as_any().downcast_ref::<WeightedHyperOperator>()
 }
 
-/// Callback for computing M_i[u] = D_β B_i[u], the directional derivative
-/// of the fixed-β Hessian drift along direction u.
-///
-/// This is needed for the exact outer Hessian when B_i depends on β
-/// (i.e., for ψ coordinates with non-Gaussian likelihoods).
-/// For ρ coordinates, B_i = A_i is β-independent, so M_i ≡ 0.
-///
-/// When unavailable, the outer Hessian is approximate (fine for BFGS/ARC,
-/// insufficient for exact Newton quadratic convergence).
-/// Result of a fixed-drift derivative evaluation: can be dense or operator-backed.
-#[derive(Clone)]
-pub enum DriftDerivResult {
-    Dense(Array2<f64>),
-    Operator(Arc<dyn HyperOperator>),
+pub(crate) fn as_sparse_directional(
+    op: &dyn HyperOperator,
+) -> Option<&SparseDirectionalHyperOperator> {
+    op.as_any().downcast_ref::<SparseDirectionalHyperOperator>()
 }
 
-impl std::fmt::Debug for DriftDerivResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Dense(matrix) => f
-                .debug_tuple("Dense")
-                .field(&format_args!("{}x{}", matrix.nrows(), matrix.ncols()))
-                .finish(),
-            Self::Operator(_) => f
-                .debug_tuple("Operator")
-                .field(&"<hyper-operator>")
-                .finish(),
-        }
-    }
+pub(crate) trait DriftDerivTraceExt {
+    fn trace_logdet(&self, hop: &dyn HessianOperator) -> f64;
+
+    fn trace_logdet_hessian_cross(&self, rhs: &Self, hop: &dyn HessianOperator) -> f64;
 }
 
-impl DriftDerivResult {
-    pub fn into_operator(self) -> Arc<dyn HyperOperator> {
-        match self {
-            Self::Dense(matrix) => Arc::new(DenseMatrixHyperOperator { matrix }),
-            Self::Operator(operator) => operator,
-        }
-    }
-
-    pub fn trace_logdet(&self, hop: &dyn HessianOperator) -> f64 {
+impl DriftDerivTraceExt for DriftDerivResult {
+    fn trace_logdet(&self, hop: &dyn HessianOperator) -> f64 {
         match self {
             Self::Dense(matrix) => hop.trace_logdet_gradient(matrix),
             Self::Operator(operator) => hop.trace_logdet_operator(operator.as_ref()),
         }
     }
 
-    pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(matrix) => matrix.dot(v),
-            Self::Operator(operator) => operator.mul_vec(v),
-        }
-    }
-
-    pub fn trace_logdet_hessian_cross(&self, rhs: &Self, hop: &dyn HessianOperator) -> f64 {
+    fn trace_logdet_hessian_cross(&self, rhs: &Self, hop: &dyn HessianOperator) -> f64 {
         match (self, rhs) {
             (Self::Dense(left), Self::Dense(right)) => hop.trace_logdet_hessian_cross(left, right),
             (Self::Dense(left), Self::Operator(right)) => {
@@ -195,645 +45,6 @@ impl DriftDerivResult {
                 hop.trace_logdet_hessian_cross_operator(left.as_ref(), right.as_ref())
             }
         }
-    }
-}
-
-pub type FixedDriftDerivFn =
-    Box<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
-
-/// Direction-contracted ψψ-block second-order terms for the profiled θ-HVP
-/// (#740).
-///
-/// The argument `alpha_psi` is the ψ slice (length `ext_dim`) of one applied
-/// outer direction. The result is the `α`-contraction over the ψ COLUMNS of
-/// every `(ψ_i, ψ_j)` second-order term against the combined ψ-direction
-/// `ψ(α) = Σ_j alpha_psi[j] ψ_j`, returned per ψ output row `i`. This covers
-/// the ψψ block ONLY — the ρρ and ρψ blocks stay in the operator's precomputed
-/// tables (they are cheap, `O(K·p²)`, and carry no family row pass), so each
-/// block is assembled in exactly one place with no overlap.
-///
-/// Indexing of every field is the ψ output row (`ext_dim` of them, in the order
-/// of `solution.ext_coords`):
-/// - `objective[i] = Σ_j α_ψ[j] V_{ψ_i ψ_j}` (likelihood + penalty
-///   `½βᵀS_{ψ_iψ_j}β`),
-/// - `score.row(i) = Σ_j α_ψ[j] g_{ψ_i ψ_j}` (likelihood + penalty
-///   `S_{ψ_iψ_j}β`), an `ext_dim × p` matrix,
-/// - `hessian[i] = Σ_j α_ψ[j] D²_ψ H_L[ψ_i, ψ_j]` (+ penalty `S_{ψ_iψ_j}`), the
-///   `base_h2` ψψ contribution as a `tr`-able drift,
-/// - `ld_s[i] = Σ_j α_ψ[j] ∂²log|S|/∂ψ_i∂ψ_j`, the `pair_ld_s` ψ-row
-///   contribution.
-///
-/// One call produces every output row in a single family row pass (the family
-/// likelihood part) plus cheap block-local penalty assembly, so densifying the
-/// operator costs `K` such passes instead of the dense path's `K²`. `None`
-/// declines the fast path (the builder keeps the exact per-pair assembly).
-pub struct ContractedPsiSecondOrder {
-    pub objective: Array1<f64>,
-    pub score: Array2<f64>,
-    pub hessian: Vec<DriftDerivResult>,
-    pub ld_s: Array1<f64>,
-}
-
-pub type ContractedPsiSecondOrderFn =
-    Arc<dyn Fn(&[f64]) -> Result<Option<ContractedPsiSecondOrder>, String> + Send + Sync>;
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Implicit Hessian-drift operators for scalable anisotropic REML
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Trait for operators that can compute B_i · v (matrix-vector product)
-/// without materializing the full (p × p) B_i matrix.
-///
-/// This is used for anisotropic ψ coordinates where the Hessian drift
-/// B_i = (∂X/∂ψ_d)^T W X + X^T W (∂X/∂ψ_d) + S_{ψ_d} involves the
-/// implicit design-derivative operator. For small problems, a dense
-/// fallback wraps an `Array2<f64>`.
-///
-/// The key integration point is the stochastic trace estimator: instead of
-/// materializing B_i as a (p × p) matrix and calling `A_k · w`, we compute
-/// `B_i · w` on the fly using implicit design-derivative matvecs.
-pub trait HyperOperator: Send + Sync {
-    /// Operator dimension `p` such that `B · v` consumes a `p`-vector and
-    /// produces a `p`-vector.  No default — every impl must answer cheaply
-    /// from a stored field or constructor argument.  Implementations must
-    /// not materialize the operator to read a shape.
-    fn dim(&self) -> usize;
-
-    /// Compute B · v (matrix-vector product). v and result are p-vectors.
-    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64>;
-
-    /// Compute B · v from a vector view.
-    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
-        self.mul_vec(&v.to_owned())
-    }
-
-    /// Compute B · v into caller-owned storage.
-    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
-        out.assign(&self.mul_vec_view(v));
-    }
-
-    /// Compute B · F where F is (p × k). Default dispatches per-column in
-    /// parallel; matrix-free Khatri–Rao operators override this to fuse
-    /// the K applies into two BLAS3 matmuls (`projected_operator` hot path).
-    ///
-    /// When invoked from inside an existing rayon worker (e.g. the parallel
-    /// cross-trace assembly in `compute_outer_hessian`), dispatch sequentially
-    /// to avoid pool oversubscription that manifested as
-    /// `LockLatch::wait_and_reset` stalls on operator-backed corrections.
-    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let p = factor.nrows();
-        let k = factor.ncols();
-        let mut out = Array2::<f64>::zeros((p, k));
-        if rayon::current_thread_index().is_some() {
-            for col in 0..k {
-                let bv = out.column_mut(col);
-                self.mul_vec_into(factor.column(col), bv);
-            }
-            return out;
-        }
-        let cols: Vec<Array1<f64>> = (0..k)
-            .into_par_iter()
-            .map(|col| {
-                let mut bv = Array1::<f64>::zeros(p);
-                self.mul_vec_into(factor.column(col), bv.view_mut());
-                bv
-            })
-            .collect();
-        for (col, bv) in cols.into_iter().enumerate() {
-            out.column_mut(col).assign(&bv);
-        }
-        out
-    }
-
-    /// Compute `trace(F^T B F)` for a `(p x k)` factor matrix `F`.
-    ///
-    /// The default uses the batched `B F` path, but structured row-coefficient
-    /// operators can override this to avoid materialising the full product when
-    /// callers only need the projected trace.
-    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        let op_factor = self.mul_mat(factor);
-        factor
-            .iter()
-            .zip(op_factor.iter())
-            .map(|(&f, &bf)| f * bf)
-            .sum()
-    }
-
-    fn trace_projected_factor_cached(
-        &self,
-        factor: &Array2<f64>,
-        factor_cache: &ProjectedFactorCache,
-    ) -> f64 {
-        assert!(std::mem::size_of_val(factor_cache) > 0);
-        self.trace_projected_factor(factor)
-    }
-
-    /// Compute the exact projected matrix `F^T B F`.
-    ///
-    /// The default uses the batched `B F` path. Structured operators can
-    /// override this when the projection itself has a cheaper analytic form
-    /// than materialising every column of `B F`. This is the quantity required
-    /// by dense spectral logdet-Hessian contractions.
-    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
-        let op_factor = self.mul_mat(factor);
-        crate::faer_ndarray::fast_atb(factor, &op_factor)
-    }
-
-    /// Compute the exact projected matrix `F^T B F`, reusing caller-owned
-    /// projection caches when the operator has a shared row/design factor.
-    fn projected_matrix_cached(
-        &self,
-        factor: &Array2<f64>,
-        factor_cache: &ProjectedFactorCache,
-    ) -> Array2<f64> {
-        assert!(std::mem::size_of_val(factor_cache) > 0);
-        self.projected_matrix(factor)
-    }
-
-    /// Fill columns `[start, start + out.ncols())` of `B` into `out`.
-    ///
-    /// Sparse exact traces build `B E` in column batches. Operators with
-    /// materialized column storage can override this to copy columns directly
-    /// instead of multiplying one basis vector at a time.
-    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
-        let cols = out.ncols();
-        let dim = out.nrows();
-        assert!(start + cols <= dim);
-        let mut basis = Array1::<f64>::zeros(dim);
-        for local_col in 0..cols {
-            let global_col = start + local_col;
-            basis[global_col] = 1.0;
-            self.mul_vec_into(basis.view(), out.column_mut(local_col));
-            basis[global_col] = 0.0;
-        }
-    }
-
-    /// Accumulate `scale * B · v` into caller-owned storage.
-    fn scaled_add_mul_vec(
-        &self,
-        v: ArrayView1<'_, f64>,
-        scale: f64,
-        mut out: ArrayViewMut1<'_, f64>,
-    ) {
-        if scale == 0.0 {
-            return;
-        }
-        let mut work = Array1::<f64>::zeros(out.len());
-        self.mul_vec_into(v, work.view_mut());
-        out.scaled_add(scale, &work);
-    }
-
-    /// Compute v^T · B · u (bilinear form).
-    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
-        let mut bv = Array1::<f64>::zeros(v.len());
-        self.mul_vec_into(v.view(), bv.view_mut());
-        u.dot(&bv)
-    }
-
-    /// Compute v^T · B · u without requiring owned vector inputs.
-    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
-        let mut bv = Array1::<f64>::zeros(v.len());
-        self.mul_vec_into(v, bv.view_mut());
-        u.dot(&bv)
-    }
-
-    /// Whether `bilinear_view` is implemented as a direct scalar contraction.
-    ///
-    /// The default `bilinear_view` materializes `Bv`; callers that already
-    /// own reusable work buffers should keep using `mul_vec_into` unless an
-    /// operator advertises a genuinely faster scalar contraction.
-    fn has_fast_bilinear_view(&self) -> bool {
-        false
-    }
-
-    /// Full dense materialization (fallback for exact trace computation).
-    ///
-    /// Callers should check `is_implicit()` first: the default implementation
-    /// recovers the dense form by `dim()` calls to `mul_vec` against successive
-    /// canonical basis vectors, which is the right shape for materialized
-    /// operators but O(dim²) work and is not the right path for genuinely
-    /// implicit ones. Implicit operators should either override `to_dense`
-    /// with their structure-aware materialization or return `is_implicit() =
-    /// true` so callers route around dense paths entirely.
-    fn to_dense(&self) -> Array2<f64> {
-        let p = self.dim();
-        let mut out = Array2::<f64>::zeros((p, p));
-        let mut basis = Array1::<f64>::zeros(p);
-        for j in 0..p {
-            basis[j] = 1.0;
-            self.mul_vec_into(basis.view(), out.column_mut(j));
-            basis[j] = 0.0;
-        }
-        out
-    }
-
-    /// Whether this operator uses implicit (non-materialized) storage.
-    fn is_implicit(&self) -> bool;
-
-    /// Downcast to `ImplicitHyperOperator` if this is one.
-    ///
-    /// Returns `Some` for implicit operators that use the weighted-Gram
-    /// structure (A_d = X^T C_d X + P_d), `None` for dense wrappers.
-    fn as_implicit(&self) -> Option<&ImplicitHyperOperator> {
-        None
-    }
-
-    /// Downcast to `CompositeHyperOperator` when this operator is a linear
-    /// bundle. Exact dense-spectral trace batching uses this to flatten
-    /// coordinate drifts across coordinates, so one shared design projection
-    /// can feed many implicit ψ/correction operators.
-    fn as_composite(&self) -> Option<&CompositeHyperOperator> {
-        None
-    }
-
-    /// Downcast to `WeightedHyperOperator` when this operator is a weighted
-    /// linear bundle.
-    fn as_weighted(&self) -> Option<&WeightedHyperOperator> {
-        None
-    }
-
-    /// If this operator is block-local (nonzero only in [start..end, start..end]),
-    /// returns the block range and local matrix. Enables O(p_block²) trace
-    /// computations instead of O(p²).
-    fn block_local_data(&self) -> Option<(&Array2<f64>, usize, usize)> {
-        None
-    }
-
-    /// Test-only downcast to `SparseDirectionalHyperOperator`, used by the
-    /// per-term operator decomposition diagnostic.
-    fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator> {
-        None
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ProjectedFactorKey {
-    pub(crate) design_id: usize,
-    pub(crate) factor_ptr: usize,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
-    pub(crate) row_stride: isize,
-    pub(crate) col_stride: isize,
-    pub(crate) value_hash: u64,
-    pub(crate) value_hash2: u64,
-}
-
-impl ProjectedFactorKey {
-    pub fn from_factor_view(design_id: usize, factor: ArrayView2<'_, f64>) -> Self {
-        let strides = factor.strides();
-        let (value_hash, value_hash2) = projected_factor_value_fingerprint(factor);
-        Self {
-            design_id,
-            factor_ptr: factor.as_ptr() as usize,
-            rows: factor.nrows(),
-            cols: factor.ncols(),
-            row_stride: strides[0],
-            col_stride: strides[1],
-            value_hash,
-            value_hash2,
-        }
-    }
-}
-
-pub(crate) fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64) {
-    let mut h1 = 0xcbf2_9ce4_8422_2325_u64;
-    let mut h2 = 0x9e37_79b1_85eb_ca87_u64;
-    for (idx, value) in factor.iter().enumerate() {
-        let bits = value.to_bits();
-        let mixed = bits.wrapping_add((idx as u64).wrapping_mul(0x517c_c1b7_2722_0a95));
-        h1 ^= mixed;
-        h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
-        h2 ^= bits.rotate_left((idx & 63) as u32);
-        h2 = h2.wrapping_mul(0x94d0_49bb_1331_11eb).rotate_left(27);
-    }
-    (h1, h2)
-}
-
-/// Memoizer for `X · F` design-projection products keyed on a
-/// `(design, factor)` fingerprint.
-///
-/// The cache trades memory for arithmetic: a 32-axis ψ-sweep that would
-/// otherwise repeat the same `O(n · p · rank)` GEMM for every axis hits
-/// the same cache slot 32 times. At large scale that is the
-/// difference between minutes and seconds of design-GEMM work (see
-/// [`ImplicitHyperOperator::trace_projected_factor_cached`] for the
-/// usage rationale).
-///
-/// The cache is bounded by a byte budget. When inserting a new entry
-/// would exceed the budget, the *least-recently-used* entries are
-/// evicted until it fits. A budget of `0` (or `usize::MAX`) disables
-/// eviction. The default is `Self::DEFAULT_BUDGET_BYTES` — large
-/// enough to hold any realistic working set for in-memory problems
-/// while still bounding worst-case peak resident memory at large-scale
-/// scale, where a single `(n, rank) = (320K, 95)` projection consumes
-/// ~243 MiB and a sweep over many distinct factors could otherwise
-/// pin tens of GiB.
-pub struct ProjectedFactorCache {
-    pub(crate) inner: Mutex<ProjectedFactorCacheInner>,
-}
-
-pub(crate) struct ProjectedFactorCacheInner {
-    pub(crate) entries: HashMap<ProjectedFactorKey, ProjectedFactorEntry>,
-    pub(crate) in_progress: HashMap<ProjectedFactorKey, Arc<ProjectedFactorInProgress>>,
-    pub(crate) next_seq: u64,
-    pub(crate) total_bytes: usize,
-    pub(crate) budget_bytes: usize,
-}
-
-pub(crate) struct ProjectedFactorInProgress {
-    pub(crate) state: Mutex<Option<ProjectedFactorInProgressState>>,
-    pub(crate) ready: Condvar,
-    /// Number of threads currently parked inside the `Wait` branch for this
-    /// in-progress slot. Producer panics-recovery tests use this to block
-    /// (via [`subscriber_arrived`]) on subscriber arrival deterministically.
-    pub(crate) waiter_count: std::sync::atomic::AtomicUsize,
-    /// Notifies once a subscriber has incremented `waiter_count`. Producer
-    /// panics-recovery tests park on this condvar so they don't have to
-    /// spin or sleep waiting for the race window to close.
-    pub(crate) subscriber_arrived: (Mutex<()>, Condvar),
-}
-
-pub(crate) enum ProjectedFactorInProgressState {
-    Ready(Arc<Array2<f64>>),
-    Failed,
-}
-
-pub(crate) struct ProjectedFactorEntry {
-    pub(crate) value: Arc<Array2<f64>>,
-    pub(crate) bytes: usize,
-    pub(crate) last_used: u64,
-}
-
-impl Default for ProjectedFactorCache {
-    fn default() -> Self {
-        Self::with_budget(Self::DEFAULT_BUDGET_BYTES)
-    }
-}
-
-impl ProjectedFactorCache {
-    /// Default byte budget for the cache. Aligned with the large-scale
-    /// `ResourcePolicy::max_single_materialization_bytes` (2 GiB) so
-    /// production REML evaluations on typical hardware stay bounded
-    /// without artificially throttling small problems whose entire
-    /// working set fits trivially.
-    pub const DEFAULT_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
-
-    /// Construct a cache with an explicit byte budget. A budget of `0`
-    /// disables eviction (legacy unbounded behavior); any non-zero
-    /// budget enables LRU eviction once total cached bytes plus the
-    /// next entry would exceed it.
-    pub fn with_budget(budget_bytes: usize) -> Self {
-        Self {
-            inner: Mutex::new(ProjectedFactorCacheInner {
-                entries: HashMap::new(),
-                in_progress: HashMap::new(),
-                next_seq: 0,
-                total_bytes: 0,
-                budget_bytes,
-            }),
-        }
-    }
-
-    pub fn get_or_insert_with(
-        &self,
-        key: ProjectedFactorKey,
-        compute: impl FnOnce() -> Array2<f64>,
-    ) -> Arc<Array2<f64>> {
-        enum CacheLookup {
-            Hit(Arc<Array2<f64>>),
-            Wait(Arc<ProjectedFactorInProgress>),
-            Compute(Arc<ProjectedFactorInProgress>),
-        }
-
-        let lookup = {
-            let mut inner = self
-                .inner
-                .lock()
-                .expect("projected factor cache lock poisoned");
-            inner.next_seq += 1;
-            let now = inner.next_seq;
-            if let Some(entry) = inner.entries.get_mut(&key) {
-                entry.last_used = now;
-                CacheLookup::Hit(entry.value.clone())
-            } else if let Some(waiter) = inner.in_progress.get(&key) {
-                CacheLookup::Wait(waiter.clone())
-            } else {
-                let marker = Arc::new(ProjectedFactorInProgress {
-                    state: Mutex::new(None),
-                    ready: Condvar::new(),
-                    waiter_count: std::sync::atomic::AtomicUsize::new(0),
-                    subscriber_arrived: (Mutex::new(()), Condvar::new()),
-                });
-                inner.in_progress.insert(key, marker.clone());
-                CacheLookup::Compute(marker)
-            }
-        };
-
-        match lookup {
-            CacheLookup::Hit(value) => value,
-            CacheLookup::Wait(marker) => {
-                marker
-                    .waiter_count
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let (lock, cv) = &marker.subscriber_arrived;
-                // release-early-on-purpose: drop the arrival mutex before notifying the producer.
-                drop(
-                    lock.lock()
-                        .expect("subscriber-arrived notification lock poisoned"),
-                );
-                cv.notify_all();
-                let mut guard = marker
-                    .state
-                    .lock()
-                    .expect("projected factor in-progress lock poisoned");
-                let result = loop {
-                    match guard.as_ref() {
-                        Some(ProjectedFactorInProgressState::Ready(value)) => {
-                            break value.clone();
-                        }
-                        Some(ProjectedFactorInProgressState::Failed) => {
-                            marker
-                                .waiter_count
-                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                            // SAFETY: a waiting consumer observed that the
-                            // producer thread for this projected-factor cache
-                            // slot panicked (state transitioned to `Failed`
-                            // via the producer's drop guard). Propagating the
-                            // panic to all waiters is the only correct
-                            // recovery — silently returning a stale or
-                            // half-initialized factor would corrupt every
-                            // downstream REML/PIRLS computation that depends
-                            // on it.
-                            // SAFETY: producer thread panicked; propagating to waiters avoids returning corrupted factor.
-                            reml_contract_panic("projected factor cache producer panicked")
-                        }
-                        None => {
-                            guard = marker
-                                .ready
-                                .wait(guard)
-                                .expect("projected factor in-progress wait poisoned");
-                        }
-                    }
-                };
-                marker
-                    .waiter_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                result
-            }
-            CacheLookup::Compute(marker) => {
-                // Compute outside the cache mutex so expensive design GEMMs do
-                // not serialize unrelated cache keys. Sibling callers for the
-                // same key wait on `marker` instead of redundantly launching the
-                // same projection, which is crucial when exact outer-gradient
-                // coordinates are evaluated in parallel.
-                let computed = match catch_unwind(AssertUnwindSafe(|| Arc::new(compute()))) {
-                    Ok(value) => value,
-                    Err(payload) => {
-                        let mut inner = self
-                            .inner
-                            .lock()
-                            .expect("projected factor cache lock poisoned");
-                        inner.in_progress.remove(&key);
-                        // release-early-on-purpose: avoid holding the cache mutex while publishing failure.
-                        drop(inner);
-
-                        let mut guard = marker
-                            .state
-                            .lock()
-                            .expect("projected factor in-progress lock poisoned");
-                        *guard = Some(ProjectedFactorInProgressState::Failed);
-                        marker.ready.notify_all();
-                        resume_unwind(payload);
-                    }
-                };
-                let bytes = computed.len().saturating_mul(std::mem::size_of::<f64>());
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .expect("projected factor cache lock poisoned");
-                inner.next_seq += 1;
-                let now = inner.next_seq;
-
-                if inner.budget_bytes > 0 && bytes <= inner.budget_bytes {
-                    while inner.total_bytes.saturating_add(bytes) > inner.budget_bytes
-                        && !inner.entries.is_empty()
-                    {
-                        let Some(oldest_key) = inner
-                            .entries
-                            .iter()
-                            .min_by_key(|(_, e)| e.last_used)
-                            .map(|(k, _)| *k)
-                        else {
-                            break;
-                        };
-                        if let Some(removed) = inner.entries.remove(&oldest_key) {
-                            inner.total_bytes = inner.total_bytes.saturating_sub(removed.bytes);
-                        }
-                    }
-                }
-
-                let value = if let Some(entry) = inner.entries.get_mut(&key) {
-                    entry.last_used = now;
-                    entry.value.clone()
-                } else {
-                    inner.entries.insert(
-                        key,
-                        ProjectedFactorEntry {
-                            value: computed.clone(),
-                            bytes,
-                            last_used: now,
-                        },
-                    );
-                    inner.total_bytes = inner.total_bytes.saturating_add(bytes);
-                    computed
-                };
-                inner.in_progress.remove(&key);
-                // release-early-on-purpose: avoid holding the cache mutex while notifying waiters.
-                drop(inner);
-
-                let mut guard = marker
-                    .state
-                    .lock()
-                    .expect("projected factor in-progress lock poisoned");
-                *guard = Some(ProjectedFactorInProgressState::Ready(value.clone()));
-                marker.ready.notify_all();
-                value
-            }
-        }
-    }
-
-    /// Number of entries currently cached. Intended for diagnostics
-    /// and tests; production code should not branch on this.
-    pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .map(|inner| inner.entries.len())
-            .unwrap_or(0)
-    }
-
-    /// Total bytes resident in the cache. Intended for diagnostics
-    /// and tests.
-    pub fn total_bytes(&self) -> usize {
-        self.inner
-            .lock()
-            .map(|inner| inner.total_bytes)
-            .unwrap_or(0)
-    }
-
-    /// `true` when the cache holds no entries.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Dense matrix wrapper implementing `HyperOperator`.
-#[derive(Clone)]
-pub struct DenseMatrixHyperOperator {
-    pub matrix: Array2<f64>,
-}
-
-impl HyperOperator for DenseMatrixHyperOperator {
-    fn dim(&self) -> usize {
-        self.matrix.nrows()
-    }
-
-    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        self.matrix.dot(v)
-    }
-
-    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
-        self.matrix.dot(&v)
-    }
-
-    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>) {
-        dense_matvec_into(&self.matrix, v, out);
-    }
-
-    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
-        let end = start + out.ncols();
-        assert!(end <= self.matrix.ncols());
-        out.assign(&self.matrix.slice(ndarray::s![.., start..end]));
-    }
-
-    fn scaled_add_mul_vec(&self, v: ArrayView1<'_, f64>, scale: f64, out: ArrayViewMut1<'_, f64>) {
-        dense_matvec_scaled_add_into(&self.matrix, v, scale, out);
-    }
-
-    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
-        dense_bilinear(&self.matrix, v.view(), u.view())
-    }
-
-    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
-        dense_bilinear(&self.matrix, v, u)
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        self.matrix.clone()
-    }
-
-    fn is_implicit(&self) -> bool {
-        false
     }
 }
 
@@ -864,7 +75,7 @@ pub(crate) fn composite_trace_implicit_batched(
         if handled[i] {
             continue;
         }
-        let Some(impl_i) = op.as_implicit() else {
+        let Some(impl_i) = as_implicit(op.as_ref()) else {
             continue;
         };
         let mut group = vec![i];
@@ -873,7 +84,7 @@ pub(crate) fn composite_trace_implicit_batched(
             if handled[j] {
                 continue;
             }
-            if let Some(impl_j) = operators[j].as_implicit()
+            if let Some(impl_j) = as_implicit(operators[j].as_ref())
                 && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
                 && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
                 && Arc::ptr_eq(impl_i.w_diag.as_arc(), impl_j.w_diag.as_arc())
@@ -888,7 +99,7 @@ pub(crate) fn composite_trace_implicit_batched(
 
     for group in &group_starts {
         if group.len() >= 2 {
-            let lead = operators[group[0]].as_implicit().unwrap();
+            let lead = as_implicit(operators[group[0]].as_ref()).unwrap();
             let xf = match cache {
                 Some(c) => lead.cached_xf(factor, c),
                 None => Arc::new(lead.compute_xf(factor)),
@@ -896,7 +107,7 @@ pub(crate) fn composite_trace_implicit_batched(
             let axes: Vec<(usize, &Array2<f64>, Option<&Array1<f64>>)> = group
                 .iter()
                 .map(|&k| {
-                    let op = operators[k].as_implicit().unwrap();
+                    let op = as_implicit(operators[k].as_ref()).unwrap();
                     (op.axis, &op.s_psi, op.c_x_psi_beta.as_deref())
                 })
                 .collect();
@@ -940,7 +151,7 @@ pub(crate) fn trace_projected_factors_batched(
         if handled[i] {
             continue;
         }
-        let Some(impl_i) = operators[i].as_implicit() else {
+        let Some(impl_i) = as_implicit(operators[i].as_ref()) else {
             out[i] = operators[i].trace_projected_factor_cached(factor, cache);
             handled[i] = true;
             continue;
@@ -952,7 +163,7 @@ pub(crate) fn trace_projected_factors_batched(
             if handled[j] {
                 continue;
             }
-            if let Some(impl_j) = operators[j].as_implicit()
+            if let Some(impl_j) = as_implicit(operators[j].as_ref())
                 && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
                 && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
                 && Arc::ptr_eq(impl_i.w_diag.as_arc(), impl_j.w_diag.as_arc())
@@ -968,7 +179,7 @@ pub(crate) fn trace_projected_factors_batched(
             let axes: Vec<(usize, &Array2<f64>, Option<&Array1<f64>>)> = group
                 .iter()
                 .map(|&idx| {
-                    let op = operators[idx].as_implicit().unwrap();
+                    let op = as_implicit(operators[idx].as_ref()).unwrap();
                     (op.axis, &op.s_psi, op.c_x_psi_beta.as_deref())
                 })
                 .collect();
@@ -995,7 +206,7 @@ pub(crate) fn collect_projected_trace_terms<'a>(
     if weight == 0.0 {
         return;
     }
-    if let Some(composite) = op.as_composite() {
+    if let Some(composite) = as_composite(op) {
         if let Some(dense) = composite.dense.as_ref() {
             dense_acc[out_idx] += weight * dense_trace_projected_factor(dense, factor);
         }
@@ -1009,7 +220,7 @@ pub(crate) fn collect_projected_trace_terms<'a>(
                 terms,
             );
         }
-    } else if let Some(weighted) = op.as_weighted() {
+    } else if let Some(weighted) = as_weighted(op) {
         for (term_weight, inner) in &weighted.terms {
             collect_projected_trace_terms(
                 out_idx,
@@ -1036,7 +247,7 @@ pub(crate) fn collect_projected_matrix_terms<'a>(
     if weight == 0.0 {
         return;
     }
-    if let Some(composite) = op.as_composite() {
+    if let Some(composite) = as_composite(op) {
         if let Some(dense) = composite.dense.as_ref() {
             dense_acc[out_idx].scaled_add(weight, &dense_projected_matrix(dense, factor));
         }
@@ -1050,7 +261,7 @@ pub(crate) fn collect_projected_matrix_terms<'a>(
                 terms,
             );
         }
-    } else if let Some(weighted) = op.as_weighted() {
+    } else if let Some(weighted) = as_weighted(op) {
         for (term_weight, inner) in &weighted.terms {
             collect_projected_matrix_terms(
                 out_idx,
@@ -1079,7 +290,7 @@ pub(crate) fn trace_projected_operator_terms_batched(
         if handled[i] {
             continue;
         }
-        let Some(impl_i) = terms[i].2.as_implicit() else {
+        let Some(impl_i) = as_implicit(terms[i].2) else {
             continue;
         };
         let mut group = vec![i];
@@ -1088,7 +299,7 @@ pub(crate) fn trace_projected_operator_terms_batched(
             if handled[j] {
                 continue;
             }
-            if let Some(impl_j) = terms[j].2.as_implicit()
+            if let Some(impl_j) = as_implicit(terms[j].2)
                 && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
                 && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
                 && Arc::ptr_eq(impl_i.w_diag.as_arc(), impl_j.w_diag.as_arc())
@@ -1099,12 +310,12 @@ pub(crate) fn trace_projected_operator_terms_batched(
             }
         }
 
-        let lead = terms[group[0]].2.as_implicit().unwrap();
+        let lead = as_implicit(terms[group[0]].2).unwrap();
         let xf = lead.cached_xf(factor, cache);
         let axes: Vec<(usize, &Array2<f64>, Option<&Array1<f64>>)> = group
             .iter()
             .map(|&term_idx| {
-                let op = terms[term_idx].2.as_implicit().unwrap();
+                let op = as_implicit(terms[term_idx].2).unwrap();
                 (op.axis, &op.s_psi, op.c_x_psi_beta.as_deref())
             })
             .collect();
@@ -1274,8 +485,8 @@ pub(crate) fn dense_spectral_trace_logdet_operators_batched(
 }
 
 impl HyperOperator for CompositeHyperOperator {
-    fn as_composite(&self) -> Option<&CompositeHyperOperator> {
-        Some(self)
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        self
     }
 
     fn dim(&self) -> usize {
@@ -1486,258 +697,6 @@ impl HyperOperator for CompositeHyperOperator {
     }
 }
 
-/// Fixed-β Hessian drift payload for a single hyper coordinate.
-///
-/// Some coordinates are naturally dense. Others are most efficient as
-/// operator-backed implicit drifts. A few workflows need to carry both a dense
-/// correction and an operator-backed main term, so this type can represent both
-/// simultaneously without relying on dummy zero-sized matrices.
-/// A block-local square matrix embedded in joint p-space. Supports O(p_block²)
-/// matvec without materializing to full p×p.
-#[derive(Clone)]
-pub struct BlockLocalDrift {
-    pub local: Array2<f64>,
-    pub start: usize,
-    pub end: usize,
-    /// Total joint dimension `p` — recorded at construction so `dim()` is
-    /// `O(1)` and `to_dense` does not need a separate hint.  Must satisfy
-    /// `total_dim >= end`.
-    pub total_dim: usize,
-}
-
-impl HyperOperator for BlockLocalDrift {
-    fn dim(&self) -> usize {
-        self.total_dim
-    }
-
-    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::zeros(v.len());
-        self.mul_vec_into(v.view(), out.view_mut());
-        out
-    }
-
-    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
-        let mut out = Array1::zeros(v.len());
-        self.mul_vec_into(v, out.view_mut());
-        out
-    }
-
-    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
-        out.fill(0.0);
-        let v_block = v.slice(ndarray::s![self.start..self.end]);
-        let out_block = out.slice_mut(ndarray::s![self.start..self.end]);
-        dense_matvec_into(&self.local, v_block, out_block);
-    }
-
-    fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
-        out.fill(0.0);
-        let global_end = start + out.ncols();
-        let col_start = start.max(self.start);
-        let col_end = global_end.min(self.end);
-        if col_start >= col_end {
-            return;
-        }
-        let local_col_start = col_start - self.start;
-        let local_col_end = col_end - self.start;
-        let out_col_start = col_start - start;
-        let out_col_end = col_end - start;
-        out.slice_mut(ndarray::s![
-            self.start..self.end,
-            out_col_start..out_col_end
-        ])
-        .assign(
-            &self
-                .local
-                .slice(ndarray::s![.., local_col_start..local_col_end]),
-        );
-    }
-
-    fn scaled_add_mul_vec(
-        &self,
-        v: ArrayView1<'_, f64>,
-        scale: f64,
-        mut out: ArrayViewMut1<'_, f64>,
-    ) {
-        if scale == 0.0 {
-            return;
-        }
-        let v_block = v.slice(ndarray::s![self.start..self.end]);
-        let out_block = out.slice_mut(ndarray::s![self.start..self.end]);
-        dense_matvec_scaled_add_into(&self.local, v_block, scale, out_block);
-    }
-
-    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
-        let v_block = v.slice(ndarray::s![self.start..self.end]);
-        let u_block = u.slice(ndarray::s![self.start..self.end]);
-        u_block.dot(&self.local.dot(&v_block))
-    }
-
-    fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
-        let v_block = v.slice(ndarray::s![self.start..self.end]);
-        let u_block = u.slice(ndarray::s![self.start..self.end]);
-        let mut total = 0.0;
-        for (row, u_value) in self.local.rows().into_iter().zip(u_block.iter().copied()) {
-            let mut row_dot = 0.0;
-            for (entry, v_value) in row.iter().copied().zip(v_block.iter().copied()) {
-                row_dot += entry * v_value;
-            }
-            total += u_value * row_dot;
-        }
-        total
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        let p = self.total_dim;
-        let mut out = Array2::zeros((p, p));
-        out.slice_mut(ndarray::s![self.start..self.end, self.start..self.end])
-            .assign(&self.local);
-        out
-    }
-
-    fn is_implicit(&self) -> bool {
-        false
-    }
-
-    fn block_local_data(&self) -> Option<(&Array2<f64>, usize, usize)> {
-        Some((&self.local, self.start, self.end))
-    }
-}
-
-#[derive(Clone)]
-pub struct HyperCoordDrift {
-    /// Full p×p dense matrix (forces dense fallback when present).
-    pub dense: Option<Array2<f64>>,
-    /// Block-local penalty contribution (does NOT force dense fallback).
-    pub block_local: Option<BlockLocalDrift>,
-    /// Implicit operator (fast path).
-    pub operator: Option<Arc<dyn HyperOperator>>,
-}
-
-impl HyperCoordDrift {
-    pub fn none() -> Self {
-        Self {
-            dense: None,
-            block_local: None,
-            operator: None,
-        }
-    }
-
-    pub fn from_dense(dense: Array2<f64>) -> Self {
-        Self {
-            dense: Some(dense),
-            block_local: None,
-            operator: None,
-        }
-    }
-
-    pub fn from_operator(operator: Arc<dyn HyperOperator>) -> Self {
-        Self {
-            dense: None,
-            block_local: None,
-            operator: Some(operator),
-        }
-    }
-
-    pub fn from_parts(
-        dense: Option<Array2<f64>>,
-        operator: Option<Arc<dyn HyperOperator>>,
-    ) -> Self {
-        let dense = dense.filter(|mat| !(operator.is_some() && mat.is_empty()));
-        Self {
-            dense,
-            block_local: None,
-            operator,
-        }
-    }
-
-    pub fn from_block_local_and_operator(
-        local: Array2<f64>,
-        start: usize,
-        end: usize,
-        total_dim: usize,
-        operator: Option<Arc<dyn HyperOperator>>,
-    ) -> Self {
-        Self {
-            dense: None,
-            block_local: Some(BlockLocalDrift {
-                local,
-                start,
-                end,
-                total_dim,
-            }),
-            operator,
-        }
-    }
-
-    pub fn has_operator(&self) -> bool {
-        self.operator.is_some()
-    }
-
-    /// Returns true when some part of the drift can stay operator-backed.
-    /// A dense correction may still be present; callers should compose it with
-    /// the operator pieces instead of materializing those pieces into dense form.
-    pub fn uses_operator_fast_path(&self) -> bool {
-        self.operator.is_some() || self.block_local.is_some()
-    }
-
-    pub fn operator_ref(&self) -> Option<&dyn HyperOperator> {
-        self.operator.as_ref().map(Arc::as_ref)
-    }
-
-    pub fn materialize(&self) -> Array2<f64> {
-        let p = self.infer_dim();
-        if p == 0 {
-            return Array2::zeros((0, 0));
-        }
-        let mut out = self.dense.clone().unwrap_or_else(|| Array2::zeros((p, p)));
-        if let Some(bl) = &self.block_local {
-            out.slice_mut(ndarray::s![bl.start..bl.end, bl.start..bl.end])
-                .scaled_add(1.0, &bl.local);
-        }
-        if let Some(op) = &self.operator {
-            out += &op.to_dense();
-        }
-        out
-    }
-
-    pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::zeros(v.len());
-        self.scaled_add_apply(v.view(), 1.0, &mut out);
-        out
-    }
-
-    pub fn scaled_add_apply(&self, v: ArrayView1<'_, f64>, scale: f64, out: &mut Array1<f64>) {
-        assert_eq!(v.len(), out.len());
-        if scale == 0.0 {
-            return;
-        }
-        if let Some(dense) = &self.dense {
-            dense_matvec_scaled_add_into(dense, v, scale, out.view_mut());
-        }
-        if let Some(bl) = &self.block_local {
-            let v_block = v.slice(ndarray::s![bl.start..bl.end]);
-            let out_block = out.slice_mut(ndarray::s![bl.start..bl.end]);
-            dense_matvec_scaled_add_into(&bl.local, v_block, scale, out_block);
-        }
-        if let Some(op) = &self.operator {
-            op.scaled_add_mul_vec(v, scale, out.view_mut());
-        }
-    }
-
-    pub(crate) fn infer_dim(&self) -> usize {
-        if let Some(d) = &self.dense {
-            return d.nrows();
-        }
-        if let Some(op) = &self.operator {
-            return op.dim();
-        }
-        if let Some(bl) = &self.block_local {
-            return bl.total_dim;
-        }
-        0
-    }
-}
-
 /// Implicit Hessian-drift operator for a single anisotropic ψ_d coordinate.
 ///
 /// Computes B_d · v on the fly:
@@ -1945,8 +904,8 @@ impl HyperOperator for ImplicitHyperOperator {
         true
     }
 
-    fn as_implicit(&self) -> Option<&ImplicitHyperOperator> {
-        Some(self)
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        self
     }
 
     /// Compute `tr(F^T B F)` directly via fused chunked BLAS3 GEMMs on the
@@ -2458,8 +1417,8 @@ impl HyperOperator for SparseDirectionalHyperOperator {
     fn is_implicit(&self) -> bool {
         false
     }
-    fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator> {
-        Some(self)
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        self
     }
 }
 
@@ -2504,6 +1463,10 @@ impl HyperOperator for GlmCurvatureCorrectionOperator {
         let x_v = self.x_design.matrixvectormultiply(v);
         let weighted = &self.neg_c_xv * &x_v;
         self.x_design.transpose_vector_multiply(&weighted)
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        self
     }
 
     fn is_implicit(&self) -> bool {

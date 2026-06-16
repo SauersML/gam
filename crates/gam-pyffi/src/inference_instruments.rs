@@ -1247,6 +1247,264 @@ mod tests {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// #977 / #907 — cross-class shape adjudication on a recovered atom's
+// intrinsic 2-D coordinates (the SAME Rust evidence code the in-tree
+// `quality_llm_weekday_circle` gate drives), exposed so the real-activation
+// driver computes the verdict with ONE evidence implementation, not a Python
+// re-implementation. Races a smooth S¹ ring against a Euclidean Gaussian and the
+// best k-cluster mixture rung; the held-out predictive-stacking headline picks
+// the winner.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Held-out log-density of the smooth-circle (ring) candidate on 2-D coords:
+/// radius ~ N(μ, σ²) fit on the training rows, angle uniform, plus the
+/// Cartesian→polar `1/r` Jacobian. Byte-identical in form to the ring provider
+/// the in-tree weekday-circle gate uses.
+fn ring_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvider<'static> {
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            if train.is_empty() {
+                return Err("ring provider got empty training set".to_string());
+            }
+            let r_of =
+                |i: usize| -> f64 { (coords[[i, 0]].powi(2) + coords[[i, 1]].powi(2)).sqrt() };
+            let n = train.len() as f64;
+            let mean: f64 = train.iter().map(|&i| r_of(i)).sum::<f64>() / n;
+            let var: f64 =
+                (train.iter().map(|&i| (r_of(i) - mean).powi(2)).sum::<f64>() / n).max(1e-9);
+            let log_norm = -0.5 * (std::f64::consts::TAU * var).ln();
+            let log_angle = -(std::f64::consts::TAU).ln();
+            let mut out = Vec::with_capacity(eval.len());
+            for &i in eval {
+                let r = r_of(i).max(1e-9);
+                out.push(log_norm - 0.5 * (r - mean).powi(2) / var + log_angle - r.ln());
+            }
+            Ok(out)
+        },
+    )
+}
+
+/// Held-out log-density of the Euclidean candidate: a full 2-D Gaussian (mean +
+/// 2×2 covariance) refit on each fold's training rows.
+fn gaussian_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvider<'static> {
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            if train.len() < 3 {
+                return Err("gaussian provider needs >=3 training rows".to_string());
+            }
+            let n = train.len() as f64;
+            let (mut mx, mut my) = (0.0_f64, 0.0_f64);
+            for &i in train {
+                mx += coords[[i, 0]];
+                my += coords[[i, 1]];
+            }
+            mx /= n;
+            my /= n;
+            let (mut sxx, mut sxy, mut syy) = (0.0_f64, 0.0_f64, 0.0_f64);
+            for &i in train {
+                let dx = coords[[i, 0]] - mx;
+                let dy = coords[[i, 1]] - my;
+                sxx += dx * dx;
+                sxy += dx * dy;
+                syy += dy * dy;
+            }
+            sxx = (sxx / n).max(1e-9);
+            syy = (syy / n).max(1e-9);
+            sxy /= n;
+            let mut det = sxx * syy - sxy * sxy;
+            if det <= 1e-12 {
+                sxy *= 0.999;
+                det = (sxx * syy - sxy * sxy).max(1e-12);
+            }
+            let inv_xx = syy / det;
+            let inv_yy = sxx / det;
+            let inv_xy = -sxy / det;
+            let log_norm = -((std::f64::consts::TAU).ln()) - 0.5 * det.ln();
+            let mut out = Vec::with_capacity(eval.len());
+            for &i in eval {
+                let dx = coords[[i, 0]] - mx;
+                let dy = coords[[i, 1]] - my;
+                let quad = inv_xx * dx * dx + 2.0 * inv_xy * dx * dy + inv_yy * dy * dy;
+                out.push(log_norm - 0.5 * quad);
+            }
+            Ok(out)
+        },
+    )
+}
+
+/// Closed-form rank-aware (BIC-form Laplace) negative-log-evidence of the ring
+/// model (2 free params: radius mean + variance). Corroborates the held-out
+/// stacking headline; lower is better.
+fn ring_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> f64 {
+    let n = coords.nrows();
+    let r: Vec<f64> = (0..n)
+        .map(|i| (coords[[i, 0]].powi(2) + coords[[i, 1]].powi(2)).sqrt())
+        .collect();
+    let mean = r.iter().sum::<f64>() / n as f64;
+    let var = (r.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64).max(1e-9);
+    let log_norm = -0.5 * (std::f64::consts::TAU * var).ln();
+    let log_angle = -(std::f64::consts::TAU).ln();
+    let mut loglik = 0.0_f64;
+    for &ri in &r {
+        let ri = ri.max(1e-9);
+        loglik += log_norm - 0.5 * (ri - mean).powi(2) / var + log_angle - ri.ln();
+    }
+    -loglik + 0.5 * 2.0 * (n as f64).ln()
+}
+
+/// Closed-form rank-aware negative-log-evidence of the full 2-D Gaussian
+/// (5 free params: mean(2) + symmetric 2×2 cov(3)).
+fn gaussian_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> f64 {
+    let n = coords.nrows();
+    let nf = n as f64;
+    let (mut mx, mut my) = (0.0, 0.0);
+    for i in 0..n {
+        mx += coords[[i, 0]];
+        my += coords[[i, 1]];
+    }
+    mx /= nf;
+    my /= nf;
+    let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+    for i in 0..n {
+        let dx = coords[[i, 0]] - mx;
+        let dy = coords[[i, 1]] - my;
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+    }
+    sxx = (sxx / nf).max(1e-9);
+    syy = (syy / nf).max(1e-9);
+    sxy /= nf;
+    let det = (sxx * syy - sxy * sxy).max(1e-12);
+    let inv_xx = syy / det;
+    let inv_yy = sxx / det;
+    let inv_xy = -sxy / det;
+    let log_norm = -((std::f64::consts::TAU).ln()) - 0.5 * det.ln();
+    let mut loglik = 0.0_f64;
+    for i in 0..n {
+        let dx = coords[[i, 0]] - mx;
+        let dy = coords[[i, 1]] - my;
+        let quad = inv_xx * dx * dx + 2.0 * inv_xy * dx * dy + inv_yy * dy * dy;
+        loglik += log_norm - 0.5 * quad;
+    }
+    -loglik + 0.5 * 5.0 * nf.ln()
+}
+
+/// Adjudicate the representational SHAPE of a recovered atom's intrinsic 2-D
+/// coordinates (issue #977 / #907): race a smooth S¹ ring against a Euclidean
+/// Gaussian and the best k-cluster mixture rung, headlined by held-out
+/// predictive stacking — the EXACT `fit_mixture_rung` + `adjudicate_cross_class_
+/// race` machinery the in-tree gates and the production fit drive. Returns a dict
+/// with the winner name, per-candidate stacking weights, rank-aware evidences,
+/// the selected mixture order, and the circle's stacking margin over the best
+/// non-circle contender.
+///
+/// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
+/// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding
+/// of the held-out density table.
+#[pyfunction]
+#[pyo3(signature = (coords, folds = 5, seed = 11, k_ladder = None))]
+pub(crate) fn adjudicate_atom_shape<'py>(
+    py: Python<'py>,
+    coords: numpy::PyReadonlyArray2<'py, f64>,
+    folds: usize,
+    seed: u64,
+    k_ladder: Option<Vec<usize>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
+    use gam::solver::{
+        AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, MIXTURE_K_LADDER,
+        adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
+    };
+
+    let coords_view = coords.as_array();
+    if coords_view.ncols() != 2 {
+        return Err(py_value_error(format!(
+            "adjudicate_atom_shape: coords must be (n, 2); got {:?}",
+            coords_view.dim()
+        )));
+    }
+    if coords_view.nrows() < 4 {
+        return Err(py_value_error(
+            "adjudicate_atom_shape: need at least 4 rows to adjudicate".to_string(),
+        ));
+    }
+    if !coords_view.iter().all(|v| v.is_finite()) {
+        return Err(py_value_error(
+            "adjudicate_atom_shape: coords must be finite".to_string(),
+        ));
+    }
+    let owned = coords_view.to_owned();
+    let n = owned.nrows();
+
+    let cfg = GaussianMixtureConfig::default();
+    let ladder: Vec<usize> = k_ladder.unwrap_or_else(|| MIXTURE_K_LADDER.to_vec());
+    let rung = fit_mixture_rung(owned.view(), &ladder, cfg).map_err(py_value_error)?;
+    let mixture_k = rung.winner().k;
+    let mixture_nle = rung.winner().negative_log_evidence;
+
+    let candidates = vec![
+        CrossClassCandidate {
+            kind: AutoTopologyKind::Circle,
+            negative_log_evidence: ring_negative_log_evidence_2d(owned.view()),
+            certification: EvidenceCertification::Exact,
+            density_provider: ring_provider_2d(owned.clone()),
+        },
+        CrossClassCandidate {
+            kind: AutoTopologyKind::Euclidean,
+            negative_log_evidence: gaussian_negative_log_evidence_2d(owned.view()),
+            certification: EvidenceCertification::Exact,
+            density_provider: gaussian_provider_2d(owned.clone()),
+        },
+        CrossClassCandidate {
+            kind: AutoTopologyKind::Mixture { k: mixture_k },
+            negative_log_evidence: mixture_nle,
+            certification: EvidenceCertification::Exact,
+            density_provider: mixture_density_provider(owned.view(), mixture_k, cfg),
+        },
+    ];
+
+    let verdict = adjudicate_cross_class_race(n, candidates, folds, StackingConfig::default())
+        .map_err(py_value_error)?;
+
+    // Per-candidate stacking weights (present because the race mixes the
+    // discrete mixture with the smooth candidates → cross-class stacking).
+    let weights: Vec<f64> = verdict
+        .stacking
+        .as_ref()
+        .map(|s| s.weights.to_vec())
+        .unwrap_or_default();
+    let winner = verdict.candidate_names[verdict.winner_index].clone();
+    // Circle margin = circle stacking weight − best non-circle stacking weight.
+    let circle_margin = if weights.len() == 3 {
+        weights[0] - weights[1].max(weights[2])
+    } else {
+        f64::NAN
+    };
+
+    let out = PyDict::new(py);
+    out.set_item("winner", &winner)?;
+    out.set_item("candidate_names", verdict.candidate_names.clone())?;
+    out.set_item("stacking_weights", weights)?;
+    out.set_item(
+        "negative_log_evidence",
+        verdict.negative_log_evidence.clone(),
+    )?;
+    out.set_item("mixture_k", mixture_k)?;
+    out.set_item("circle_margin", circle_margin)?;
+    out.set_item("circle_wins", winner.starts_with("circle"))?;
+    out.set_item("is_cross_class", verdict.is_cross_class)?;
+    out.set_item(
+        "headline",
+        match verdict.headline {
+            Headline::Stacking => "stacking",
+            Headline::Evidence => "evidence",
+        },
+    )?;
+    Ok(out)
+}
+
 /// Register the inference-instrument `#[pyfunction]`s and classes on the
 /// extension module. Kept here (rather than inline in `lib.rs`) so the wiring
 /// is one line at the call site.
@@ -1266,5 +1524,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(skovgaard_r_star, module)?)?;
     module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
     module.add_function(wrap_pyfunction!(glm_full_conformal, module)?)?;
+    module.add_function(wrap_pyfunction!(adjudicate_atom_shape, module)?)?;
     Ok(())
 }

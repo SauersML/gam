@@ -636,10 +636,11 @@ pub fn build_constant_curvature_basis(
             weighted_coefficient_sum_to_zero_transform(weights.view())?
         }
     };
-    let penalty = z.t().dot(&raw_penalty).dot(&z);
+    let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]);
+    let penalty = gauge.restrict_penalty(&raw_penalty);
     let raw_design = constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, ell_eff)?;
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-        raw_design.dot(&z),
+        gauge.restrict_design(&raw_design),
     ));
     let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
     let mut candidates = vec![PenaltyCandidate {
@@ -782,6 +783,7 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
             weighted_coefficient_sum_to_zero_transform(weights.view())?
         }
     };
+    let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]);
 
     // Effective-length κ-jet L(κ) = ℓ_ref·s(κ)/s₀ (the κ-invariant-resolution
     // fix). The kernel exponent is q = d/L with BOTH d and L moving in κ, so the
@@ -794,8 +796,8 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
     // kernel κ-jets right-multiplied by the κ-fixed `z`.
     let (_k_dc, dk_dc, dkk_dc) =
         constant_curvature_kernel_kappa_jets_scaled(data, centers.view(), spec.kappa, l_jet)?;
-    let design_first = dk_dc.dot(&z);
-    let design_second_diag = dkk_dc.dot(&z);
+    let design_first = gauge.restrict_design(&dk_dc);
+    let design_second_diag = gauge.restrict_design(&dkk_dc);
 
     // Penalty κ-jets: S_raw = symm(zᵀ K(centers,centers) z). Rebuild the value
     // penalty (and its normalization constant) from the SAME path the value
@@ -806,9 +808,9 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
         spec.kappa,
         l_jet,
     )?;
-    let s_raw = symmetrize(&z.t().dot(&k_cc).dot(&z));
-    let s_raw_first = symmetrize(&z.t().dot(&dk_cc).dot(&z));
-    let s_raw_second = symmetrize(&z.t().dot(&dkk_cc).dot(&z));
+    let s_raw = symmetrize(&gauge.restrict_penalty(&k_cc));
+    let s_raw_first = symmetrize(&gauge.restrict_penalty(&dk_cc));
+    let s_raw_second = symmetrize(&gauge.restrict_penalty(&dkk_cc));
     let (_s_norm, s_norm_first, s_norm_second, _c) =
         normalize_penaltywith_psi_derivatives(&s_raw, &s_raw_first, &s_raw_second);
 

@@ -2320,11 +2320,11 @@ impl WorkingModelSurvival {
         use crate::estimate::reml::assembly::{
             InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
         };
-        use crate::reml_contracts::EvalMode;
         use crate::estimate::reml::reml_outer_engine::{
             DenseSpectralOperator, DispersionHandling, PenaltyLogdetDerivs,
             compute_block_penalty_logdet_derivs,
         };
+        use crate::reml_contracts::EvalMode;
 
         let p = beta.len();
         let active_penalty_blocks: Vec<&PenaltyBlock> = self

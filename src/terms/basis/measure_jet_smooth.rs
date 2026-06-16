@@ -378,23 +378,6 @@ pub(crate) fn householder_sum_to_zero_z(u: &Array1<f64>) -> Array2<f64> {
     z
 }
 
-/// Structured constraint application: `X·z` for the Householder `z` above,
-/// computed as `(X − 2(Xu)uᵀ)` with the first column dropped — one matvec
-/// plus a rank-1 update, O(rows·m).
-pub(crate) fn householder_drop_first_apply(x: &Array2<f64>, u: &Array1<f64>) -> Array2<f64> {
-    let n = x.nrows();
-    let m = x.ncols();
-    let t = x.dot(u);
-    let mut out = Array2::<f64>::zeros((n, m - 1));
-    for i in 0..n {
-        let ti2 = 2.0 * t[i];
-        for j in 0..(m - 1) {
-            out[(i, j)] = x[(i, j + 1)] - ti2 * u[j + 1];
-        }
-    }
-    out
-}
-
 pub(crate) fn symmetric_pseudoinverse(
     a: &Array2<f64>,
     label: &str,
@@ -1245,11 +1228,8 @@ pub(crate) struct RealizedMeasureJetGeometry {
     /// Spectral-split mode marker (`order_s == 0.0` sentinel).
     pub(crate) per_level: bool,
     pub(crate) z: Array2<f64>,
+    pub(crate) coefficient_gauge: crate::solver::gauge::Gauge,
     pub(crate) kz: Array2<f64>,
-    /// `Some(u)` on the fit path (CenterSumToZero): `z` is the Householder
-    /// basis and constraint applications use the O(rows·m) structured form.
-    /// `None` on the frozen-replay path (arbitrary composed transform).
-    pub(crate) sum_to_zero_u: Option<Array1<f64>>,
 }
 
 pub(crate) fn realize_measure_jet_geometry(
@@ -1310,7 +1290,7 @@ pub(crate) fn realize_measure_jet_geometry(
     // Realized-design constraint transform: uniform coefficient sum-to-zero
     // at fit time; the frozen composed `z · z_parametric` at predict time
     // (#532 pattern — see MeasureJetIdentifiability).
-    let (z, sum_to_zero_u) = match &spec.identifiability {
+    let (z, coefficient_gauge) = match &spec.identifiability {
         MeasureJetIdentifiability::FrozenTransform { transform } => {
             if transform.nrows() != m {
                 crate::bail_dim_basis!(
@@ -1319,22 +1299,22 @@ pub(crate) fn realize_measure_jet_geometry(
                     transform.nrows()
                 );
             }
-            (transform.clone(), None)
+            (
+                transform.clone(),
+                crate::solver::gauge::Gauge::from_block_transforms(&[transform.clone()]),
+            )
         }
         MeasureJetIdentifiability::CenterSumToZero => {
             // Householder sum-to-zero basis: same constrained space as the
-            // generic RRQR nullspace, gauge-equivalent fit, but constraint
-            // applications become one matvec + a rank-1 update.
+            // generic RRQR nullspace. The active projection is owned by Gauge;
+            // the dense z is persisted for frozen replay metadata.
             let u = householder_sum_to_zero_u(m);
-            (householder_sum_to_zero_z(&u), Some(u))
+            let z = householder_sum_to_zero_z(&u);
+            (z.clone(), crate::solver::gauge::Gauge::sum_to_zero(z))
         }
     };
     let k_cc = measure_jet_design_matrix(centers.view(), centers.view(), length_scale)?;
-    // Penalty-side application is only m x m and is part of the frozen replay
-    // contract, so keep it in the dense operation order used by replay. The
-    // data-sized n x m design path below is where the structured Householder
-    // application matters.
-    let kz = k_cc.dot(&z);
+    let kz = coefficient_gauge.restrict_design(&k_cc);
     Ok(RealizedMeasureJetGeometry {
         centers,
         masses,
@@ -1348,8 +1328,8 @@ pub(crate) fn realize_measure_jet_geometry(
         // center-count auto-gate.
         per_level: spec.multiscale,
         z,
+        coefficient_gauge,
         kz,
-        sum_to_zero_u,
     })
 }
 
@@ -1382,21 +1362,15 @@ pub fn build_measure_jet_basis(
         order_s_eval: order_s,
         per_level,
         z,
+        coefficient_gauge,
         kz,
-        sum_to_zero_u,
     } = realize_measure_jet_geometry(data, spec)?;
     let band = MeasureJetBand {
         eps: eps_band.clone(),
         log_step,
     };
     let raw_design = measure_jet_design_matrix(data, centers.view(), length_scale)?;
-    // Fit path: O(n·m) structured constraint application (the O(n·m²) GEMM
-    // here was the dominant build cost — scale-smoke finding). Replay path:
-    // the frozen composed transform is a general matrix, dense GEMM stands.
-    let constrained_design = match &sum_to_zero_u {
-        Some(u) => householder_drop_first_apply(&raw_design, u),
-        None => raw_design.dot(&z),
-    };
+    let constrained_design = coefficient_gauge.restrict_design(&raw_design);
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
         constrained_design,
     ));
@@ -1685,15 +1659,9 @@ pub fn build_measure_jet_basis_psi_derivatives(
             *dk_v = kij * a;
             *d2k_v = kij * (a * a - 2.0 * a);
         }
-        // Apply the SAME constraint transform the design uses. Fit path:
-        // structured Householder drop-first; replay path: dense composed z.
-        let (dx_du, d2x_du2) = match &geom.sum_to_zero_u {
-            Some(u_house) => (
-                householder_drop_first_apply(&dk, u_house),
-                householder_drop_first_apply(&d2k, u_house),
-            ),
-            None => (dk.dot(&geom.z), d2k.dot(&geom.z)),
-        };
+        // Apply the SAME Gauge-owned coefficient section the design uses.
+        let dx_du = geom.coefficient_gauge.restrict_design(&dk);
+        let d2x_du2 = geom.coefficient_gauge.restrict_design(&d2k);
         Some((dx_du, d2x_du2))
     } else {
         None
@@ -2214,16 +2182,12 @@ mod tests {
         assert_eq!(*order_s, 1.3, "explicit order must persist verbatim");
     }
 
-    /// The structured Householder constraint application must agree with
-    /// the dense GEMM against the materialized basis (same matrix, two op
-    /// orders), and the basis must be orthonormal with sum-to-zero columns.
+    /// The Householder basis must be orthonormal with sum-to-zero columns.
     #[test]
-    pub(crate) fn householder_apply_matches_dense_transform() {
+    pub(crate) fn householder_sum_to_zero_basis_is_orthonormal() {
         let m = 9usize;
-        let n = 15usize;
         let u = householder_sum_to_zero_u(m);
         let z = householder_sum_to_zero_z(&u);
-        // Orthonormal columns, each summing to zero.
         for j in 0..(m - 1) {
             let col_j = z.column(j);
             assert!(col_j.sum().abs() <= 1e-12, "column {j} must sum to zero");
@@ -2235,14 +2199,6 @@ mod tests {
                     "orthonormality failure at ({j}, {j2}): {dot}"
                 );
             }
-        }
-        let x = Array2::<f64>::from_shape_fn((n, m), |(i, j)| {
-            ((i * 13 + j * 7) % 17) as f64 / 17.0 - 0.4
-        });
-        let fast = householder_drop_first_apply(&x, &u);
-        let dense = x.dot(&z);
-        for (a, b) in fast.iter().zip(dense.iter()) {
-            assert!((a - b).abs() <= 1e-12, "structured apply drift: {a} vs {b}");
         }
     }
 

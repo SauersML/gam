@@ -1963,7 +1963,7 @@ pub(crate) fn binomial_location_scale_projected_trace_cache_matches_dense() {
         .second_directional_derivative_operator(&d_beta_u, &d_beta_v)
         .expect("d2H operator call")
         .expect("d2H operator present");
-    let cache = crate::solver::estimate::reml::reml_outer_engine::ProjectedFactorCache::default();
+    let cache = crate::reml_contracts::ProjectedFactorCache::default();
 
     for (name, op) in [("dH", dh_op.clone()), ("d2H", d2h_op.clone())] {
         let dense = op.to_dense();
@@ -2024,7 +2024,7 @@ pub(crate) fn binomial_location_scale_projected_trace_rejects_wrong_factor_rows(
         .expect("dH operator call")
         .expect("dH operator present");
     let bad_factor = Array2::<f64>::zeros((p + 1, 2));
-    let cache = crate::solver::estimate::reml::reml_outer_engine::ProjectedFactorCache::default();
+    let cache = crate::reml_contracts::ProjectedFactorCache::default();
     dh_op.trace_projected_factor_cached(&bad_factor, &cache);
 }
 
@@ -4101,7 +4101,7 @@ pub(crate) fn binomial_location_scale_exact_newton_spatial_joint_hyper_returns_f
         &rho,
         &derivative_blocks,
         None,
-        crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian,
+        crate::reml_contracts::EvalMode::ValueGradientHessian,
     )
     .expect("exact spatial joint hyper eval");
     assert!(eval.objective.is_finite());
@@ -4186,7 +4186,7 @@ pub(crate) fn binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_ret
         &rho,
         &derivative_blocks,
         None,
-        crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian,
+        crate::reml_contracts::EvalMode::ValueGradientHessian,
     )
     .expect("exact wiggle spatial joint hyper eval");
     assert!(eval.objective.is_finite());
@@ -4269,7 +4269,7 @@ pub(crate) fn gaussian_location_scale_exact_newton_spatial_joint_hyper_returns_f
         &rho,
         &derivative_blocks,
         None,
-        crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian,
+        crate::reml_contracts::EvalMode::ValueGradientHessian,
     )
     .expect("exact spatial joint hyper eval");
     assert!(eval.objective.is_finite());
@@ -7312,7 +7312,7 @@ pub(crate) fn binomial_location_scale_batched_gradient_matches_finite_difference
             rho,
             &derivative_blocks,
             None,
-            crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
+            crate::reml_contracts::EvalMode::ValueAndGradient,
         )
         .expect("objective+gradient at rho");
         (result.objective, result.gradient)
@@ -7858,7 +7858,7 @@ pub(crate) fn binomial_mean_wiggle_hessian_operators_match_dense_derivatives() {
         .expect("workspace")
         .expect("workspace available");
     let h_columns = Array2::from_shape_fn((total, total), |(i, j)| if i == j { 1.0 } else { 0.0 });
-    let op_h = crate::solver::estimate::reml::reml_outer_engine::HyperOperator::mul_mat(
+    let op_h = crate::reml_contracts::HyperOperator::mul_mat(
         family
             .bmw_static_hessian_operator(&states, Arc::new(x_eta.clone()))
             .expect("static op")
@@ -7969,7 +7969,7 @@ pub(crate) fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
 /// FAILS against the pre-fix code.
 #[test]
 pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero() {
-    use crate::solver::estimate::reml::reml_outer_engine::HyperOperator;
+    use crate::reml_contracts::HyperOperator;
 
     // Materialize an `ExactNewtonJointPsiTerms` joint Hessian regardless of
     // whether the family returns it dense or operator-backed.

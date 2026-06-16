@@ -150,6 +150,11 @@ pub(crate) use crate::linalg::matrix::{
     DesignMatrix, LinearOperator, SignedWeightsView, upper_triangle_pair_from_index,
 };
 use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, ProjectedKktResidual};
+pub use crate::reml_contracts::{
+    BlockLocalDrift, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
+    DenseMatrixHyperOperator, DriftDerivResult, EvalMode, FixedDriftDerivFn, HyperCoord,
+    HyperCoordDrift, HyperCoordPair, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
+};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Leaf, state-free linear-algebra kernels (already real modules).

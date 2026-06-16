@@ -980,7 +980,7 @@ impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        cache: &crate::solver::estimate::reml::reml_outer_engine::ProjectedFactorCache,
+        cache: &crate::reml_contracts::ProjectedFactorCache,
     ) -> f64 {
         assert_eq!(factor.nrows(), self.p_total());
         if self.p_total() <= 512 || !self.projected_factor_table_fits_budget(factor) {

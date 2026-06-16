@@ -36,19 +36,22 @@ pub(crate) use crate::model_types::{
 pub(crate) use crate::pirls::{
     LinearInequalityConstraints, solve_newton_directionwith_lower_bounds,
 };
+pub(crate) use crate::reml_contracts::{
+    BlockLocalDrift, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
+    DenseMatrixHyperOperator, DriftDerivResult, FixedDriftDerivFn, HyperCoord, HyperCoordDrift,
+    HyperCoordPair, HyperOperator,
+};
 pub(crate) use crate::solver::active_set::{
     project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
 pub(crate) use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
-    BlockCoupledOperator, BlockLocalDrift, CompositeHyperOperator, ContractedPsiSecondOrder,
-    ContractedPsiSecondOrderFn, DenseMatrixHyperOperator, DenseSpectralOperator,
-    DispersionHandling, DriftDerivResult, ExactJeffreysTerm, FixedDriftDerivFn,
-    HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift, HyperCoordPair,
-    HyperOperator, MatrixFreeSpdOperator, OuterHessianDerivativeKernel, PenaltySubspaceTrace,
-    StochasticTraceState, compute_block_penalty_logdet_derivs, compute_efs_update,
-    compute_hybrid_efs_update, exact_pseudo_logdet, hessian_operator_geometric_scale,
-    positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
+    BlockCoupledOperator, CompositeHyperOperator, DenseSpectralOperator, DispersionHandling,
+    ExactJeffreysTerm, HessianDerivativeProvider, HessianOperator, MatrixFreeSpdOperator,
+    OuterHessianDerivativeKernel, PenaltySubspaceTrace, StochasticTraceState,
+    compute_block_penalty_logdet_derivs, compute_efs_update, compute_hybrid_efs_update,
+    exact_pseudo_logdet, hessian_operator_geometric_scale, positive_eigenvalue_threshold,
+    spectral_epsilon, spectral_regularize,
 };
 pub(crate) use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -70,7 +73,8 @@ pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub(crate) use thiserror::Error;
 
-pub use crate::solver::estimate::reml::reml_outer_engine::{EvalMode, PseudoLogdetMode};
+pub use crate::reml_contracts::EvalMode;
+pub use crate::solver::estimate::reml::reml_outer_engine::PseudoLogdetMode;
 
 mod assembly;
 mod block_spec;

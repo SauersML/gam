@@ -45,7 +45,7 @@ use crate::custom_family::{
     weighted_crossprod_psi_maps,
 };
 
-use crate::solver::estimate::reml::reml_outer_engine::{DenseMatrixHyperOperator, HyperOperator};
+use crate::reml_contracts::{DenseMatrixHyperOperator, HyperOperator};
 
 use crate::faer_ndarray::{
     FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,

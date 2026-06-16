@@ -3,10 +3,11 @@ name: Reference Quality Suite
 # End-to-end quality tests that benchmark gam against the MATURE, STANDARD tool
 # for each capability (mgcv, gamlss, survival, flexsurv, VGAM, scam, lme4,
 # cmprsk, mlt/tram, scikit-learn, statsmodels, pyGAM, lifelines, scikit-survival,
-# properscoring, geomstats, ...). These live in tests/quality_vs_*.rs and use the
-# Rust reference harness (src/test_support/reference.rs), which shells out to R /
-# Python. A missing reference dependency is a HARD failure (no skipping) — so
-# this job provisions the full reference stack.
+# properscoring, geomstats, ...). These live under tests/quality/** and are
+# included by the grouped tests/quality.rs integration target. They use the Rust
+# reference harness (src/test_support/reference.rs), which shells out to R /
+# Python. A missing reference dependency is a HARD failure (no skipping), so this
+# job provisions the full reference stack.
 #
 # Philosophy: a test whose assertion FAILS because gam genuinely diverges from
 # the mature reference is an honest, useful measurement. This job RUNS every
@@ -17,8 +18,8 @@ name: Reference Quality Suite
 # gated. Gating is what stops quality regressions from landing on main silently.
 
 on:
-  # Periodic dashboard rather than per-commit: building+running 139 heavy
-  # integration binaries is too expensive to do on every quality-test push, and
+  # Periodic dashboard rather than per-commit: building+running the heavy
+  # grouped quality target is too expensive to do on every quality-test push, and
   # the concurrent src/ churn would otherwise re-trigger it constantly. The
   # schedule gives a warm-cache run every few hours; dispatch is on-demand.
   schedule:
@@ -30,7 +31,7 @@ on:
       - ".github/workflows/reference-quality.yml"
 
 # Do NOT cancel an in-progress run when a new push lands: this job is a slow
-# (full R+Python stack install + ~130 test-binary builds) match-vs-diverge
+# (full R+Python stack install + grouped quality build/run) match-vs-diverge
 # DASHBOARD, not a fast gate. Cancelling on every push means it never reaches
 # the "Run quality suite" summary. Let each run finish; newer pushes queue.
 concurrency:
@@ -70,9 +71,10 @@ jobs:
         with:
           # Cache all dependency crates (not just direct deps) under a shared
           # key so consecutive runs warm-restore the full dependency build (the
-          # multi-GB faer/burn/ndarray/arrow chunk). The gam lib + the per-test
-          # binaries still rebuild when src/ changes — that is inherent and not
-          # cacheable, which is why the trigger below is periodic, not per-commit.
+          # multi-GB faer/burn/ndarray/arrow chunk). The gam lib + grouped
+          # quality binary still rebuild when src/ changes — that is inherent
+          # and not cacheable, which is why the trigger below is periodic, not
+          # per-commit.
           cache-all-crates: true
           shared-key: reference-quality
 
@@ -254,26 +256,13 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
-          echo "building ${#files[@]} quality test target(s) in ONE invocation (parallel codegen)"
-          # A single multi---test invocation links all binaries in one cargo run.
-          # The run step then EXECUTES each built binary DIRECTLY (globbed from
-          # target/debug/deps) — invoking `cargo test` per target re-did
-          # freshness/link work 141× and blew the timeout (the all-TIMEOUT bug).
-          #
-          # `cargo build --keep-going` (NOT `cargo test --no-run`, which rejects
-          # --keep-going): `--test <name>` compiles each named test target to the
-          # same target/debug/deps/<name>-<hash> binary the run step globs, so the
-          # output is identical to --no-run. `--keep-going` is the point — without
-          # it the FIRST target that fails to compile aborts the whole build, so
-          # every still-unbuilt binary is missing and the run step files it as
-          # BUILDFAIL: one real compile error masquerades as dozens (the
-          # "1 defect + 54 collateral BUILDFAILs" cascade). With it, cargo builds
-          # every target it can and only the genuinely-broken ones lack a binary,
-          # so BUILDFAIL counts the real compile defects and nothing else.
-          args=(); for t in "${files[@]}"; do args+=(--test "$t"); done
-          cargo build --keep-going "${args[@]}" 2>&1 | tail -120 \
-            || echo "build reported errors; missing binaries are flagged BUILDFAIL in the run step"
+          echo "building grouped quality integration target tests/quality.rs"
+          # tests/quality.rs includes the moved tests/quality/** modules as one
+          # integration target. Build that target once, then the run step executes
+          # its libtest cases directly. Running one unfiltered grouped binary
+          # would put the whole suite behind a single 360s cap.
+          cargo build --keep-going --test quality 2>&1 | tail -120 \
+            || echo "build reported errors; missing quality binary is flagged BUILDFAIL in the run step"
 
       - name: Run quality suite (resilient + streaming; full per-test capture)
         shell: bash
@@ -283,8 +272,6 @@ jobs:
           # the streaming loop and exit 0. Turn `-e` OFF: per-test failures are
           # the expected, tolerated outcome here; we classify and stream them.
           set +e -u -o pipefail
-          mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
-          N=${#files[@]}; i=0
           pass=0; metricoff=0; gamerr=0; referr=0; testerr=0; tmo=0; bf=0
           # EVERYTHING the run produced lands under one directory that is uploaded
           # wholesale: the full per-test stdout+stderr logs (no tail truncation),
@@ -295,6 +282,18 @@ jobs:
           rm -rf "$OUT"; mkdir -p "$OUT/logs"
           RES="$OUT/quality_results.tsv"
           JSONL="$OUT/quality_results.jsonl"
+          discovery_error=0
+          bin=$(find target/debug/deps -maxdepth 1 -type f -perm -u+x -name "quality-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+          if [ -n "$bin" ] && [ -x "$bin" ]; then
+            mapfile -t tests < <("$bin" --list 2>/dev/null | sed -n 's/: test$//p')
+            if [ "${#tests[@]}" -eq 0 ]; then
+              discovery_error=1
+              tests=(quality_discovery)
+            fi
+          else
+            tests=(quality)
+          fi
+          N=${#tests[@]}; i=0
           # Tab-separated, one header row, FULL (un-truncated) metric column so
           # every captured quality figure for every test is preserved verbatim.
           printf 'idx\toutcome\tcause\ttest\trc\tdur_s\tsub_passed\tsub_failed\tmetric\treason\n' > "$RES"
@@ -302,10 +301,10 @@ jobs:
           {
             echo "## Reference quality suite"
             echo ""
-            echo "Each row is one test BINARY — often several sub-tests (a synthetic"
-            echo "arm plus an \`_on_real_data\` arm); \`sub\` is passed/failed WITHIN the"
-            echo "binary, and a single failing sub-test keeps the whole binary out of"
-            echo "PASS. The \`outcome\` says exactly WHAT happened — it never collapses"
+            echo "Each row is one exact libtest case from the grouped \`quality\`"
+            echo "integration binary. Synthetic and \`_on_real_data\` arms are timed"
+            echo "and classified independently, so grouping does not hide the slow"
+            echo "test behind a whole-suite timeout. The \`outcome\` says exactly WHAT happened — it never collapses"
             echo "distinct situations into one vague word:"
             echo ""
             echo "- \`PASS\` — met the quality bar."
@@ -317,7 +316,7 @@ jobs:
             echo "  (R/Python package, system lib, namespace, or its script) — not gam."
             echo "- \`TEST_ERROR\` — the test/harness setup is wrong (bad data, missing"
             echo "  fixture, mismatched column lengths) — fix the test, not gam."
-            echo "- \`TIMEOUT\` — exceeded the 360s per-test wall-clock cap."
+            echo "- \`TIMEOUT\` — exceeded the per-test wall-clock cap."
             echo ""
             echo "Full per-test logs + an un-truncated metric TSV + a JSONL stream are"
             echo "in the \`quality-results\` artifact."
@@ -325,19 +324,20 @@ jobs:
             echo "| # | test | outcome | cause | sub p/f | dur | metrics | reason |"
             echo "|---|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for t in "${files[@]}"; do
+          for t in "${tests[@]}"; do
             i=$((i+1))
             outcome=""; cause=""; reason=""; rc=0; cap=360
             echo "::group::[$i/$N] $t"
             log="$OUT/logs/$t.log"
-            # Newest executable binary for this test in target/debug/deps
-            # (exclude .d/.rlib/etc.); built once by the build step above.
-            bin=$(find target/debug/deps -maxdepth 1 -type f -perm -u+x -name "${t}-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
             start=$SECONDS
-            if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+            if [ "$discovery_error" -eq 1 ]; then
+              outcome=TEST_ERROR; cause=test_discovery; rc=-1
+              reason="quality binary listed zero libtest cases"
+              echo "$reason" > "$log"
+            elif [ -z "$bin" ] || [ ! -x "$bin" ]; then
               # No binary => the build step couldn't compile this test.
               outcome=BUILDFAIL; rc=-1
-              echo "no executable binary found for $t — the build step could not compile it" > "$log"
+              echo "no executable binary found for grouped quality target — the build step could not compile it" > "$log"
             else
               # EXECUTE the pre-built binary directly — no cargo, no rebuild.
               # Per-test wall-clock cap bounds a hung fit/R/Python subprocess.
@@ -350,9 +350,9 @@ jobs:
               # papered over with a bump.
               cap=360
               case "$t" in
-                quality_vs_inla_rw2_spde_penalized_baseline|quality_vs_mgcv_quakes_spatial_smooth) cap=900 ;;
+                quality_vs_inla_rw2_spde_penalized_baseline::*|quality_vs_mgcv_quakes_spatial_smooth::*) cap=900 ;;
               esac
-              timeout --kill-after=30 "$cap" "$bin" --nocapture --test-threads=1 > "$log" 2>&1
+              timeout --kill-after=30 "$cap" "$bin" --exact "$t" --nocapture --test-threads=1 > "$log" 2>&1
               rc=$?
             fi
             dur=$((SECONDS-start))
@@ -376,7 +376,9 @@ jobs:
             # used to be matched by the broader TEST_ERROR rule below and stole
             # them; that rule is now harness-origin-only).
             gamfit_re='IntegrationFailed|InvalidConfig|IdentifiabilityFailure|LayoutError|identifiability audit|Invalid input|could not broadcast|Newton step|transformation fit failed|workflow survival baseline failed|RemlOptimizationFailed|REML smoothing optimization'
-            if [ "$outcome" = BUILDFAIL ]; then
+            if [ "$outcome" = TEST_ERROR ]; then
+              testerr=$((testerr+1))
+            elif [ "$outcome" = BUILDFAIL ]; then
               cause=build; reason=$(head -1 "$log"); bf=$((bf+1))
             elif [ "$rc" -eq 0 ]; then
               outcome=PASS; cause=ok; reason=""; pass=$((pass+1))
@@ -430,7 +432,7 @@ jobs:
             echo "| GAM_ERROR | $gamerr | gam fit crashed / refused / failed to converge |"
             echo "| REF_ERROR | $referr | reference tool failed or missing |"
             echo "| TEST_ERROR | $testerr | test/harness setup defect |"
-            echo "| TIMEOUT | $tmo | exceeded 360s |"
+            echo "| TIMEOUT | $tmo | exceeded per-test wall-clock cap |"
             echo "| BUILDFAIL | $bf | did not compile |"
             echo "| **total** | **$N** | |"
           } >> "$GITHUB_STEP_SUMMARY"

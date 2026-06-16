@@ -95,7 +95,7 @@ pub(crate) use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 
-pub(crate) use crate::solver::estimate::reml::reml_outer_engine::HyperOperator;
+pub(crate) use crate::reml_contracts::HyperOperator;
 
 pub(crate) use crate::types::{InverseLink, StandardLink};
 

@@ -2503,7 +2503,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             if let Some(err) = runaway_error.borrow().as_ref().cloned() {
                 return Err(err);
             }
-            use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
+            use crate::reml_contracts::EvalMode;
             // One-shot row-measure waypoint. This closure runs on EVERY outer
             // objective evaluation (value/gradient/Hessian probes, line-search
             // cost-only probes, EFS evals), so an unconditional per-eval line

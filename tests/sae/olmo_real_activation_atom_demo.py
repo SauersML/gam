@@ -243,16 +243,38 @@ def main() -> int:
     print(f"atom recovered: topology={topology}  reconstruction R^2={r2:.4f}  coords.shape={coords.shape}")
 
     # --- #907 shape adjudication on the REAL recovered coordinates -----------
-    winner, table, best_k = adjudicate_shape(coords, seed=args.seed + 11)
-    margin = table.get("circle", -math.inf) - max(
-        v for kk, v in table.items() if kk != "circle"
-    )
-    print("shape race (held-out predictive loglik, higher wins):")
-    for name, val in sorted(table.items(), key=lambda kv: -kv[1]):
-        print(f"    {name:14s} {val:14.3f}")
-    print(f"  VERDICT: {winner}  (circle margin over best non-circle = {margin:+.3f})")
-
-    circle_wins = winner == "circle"
+    # PRIMARY path: the Rust cross-class adjudicator through the gamfit FFI
+    # (gamfit.adjudicate_atom_shape) — the SAME evidence code the in-tree gates
+    # and the production fit drive. One evidence implementation, not two, so the
+    # real-LLM verdict is trustworthy. Falls back to the local Python replica
+    # only if an older wheel lacks the symbol (and says so loudly).
+    if hasattr(gamfit, "adjudicate_atom_shape"):
+        v = gamfit.adjudicate_atom_shape(
+            np.ascontiguousarray(coords), folds=5, seed=args.seed + 11
+        )
+        winner = v["winner"]
+        best_k = v["mixture_k"]
+        margin = v["circle_margin"]
+        circle_wins = bool(v["circle_wins"])
+        table = dict(zip(v["candidate_names"], v["stacking_weights"]))
+        print("shape race via RUST FFI (gamfit.adjudicate_atom_shape), "
+              f"headline={v['headline']}, held-out stacking weights:")
+        for name, val in sorted(table.items(), key=lambda kv: -kv[1]):
+            print(f"    {name:14s} weight={val:.4f}")
+        print(f"  VERDICT: {winner}  (circle stacking margin = {margin:+.4f})")
+    else:
+        print("WARNING: gamfit.adjudicate_atom_shape not in this wheel — "
+              "falling back to the Python evidence replica (rebuild the wheel "
+              "for the trustworthy single-implementation path).")
+        winner, table, best_k = adjudicate_shape(coords, seed=args.seed + 11)
+        margin = table.get("circle", -math.inf) - max(
+            v for kk, v in table.items() if kk != "circle"
+        )
+        print("shape race (held-out predictive loglik, higher wins):")
+        for name, val in sorted(table.items(), key=lambda kv: -kv[1]):
+            print(f"    {name:14s} {val:14.3f}")
+        print(f"  VERDICT: {winner}  (circle margin over best non-circle = {margin:+.3f})")
+        circle_wins = winner == "circle"
 
     # --- #975 attribute carve: does an attribute bind the coordinate? --------
     # Color the recovered atlas by the prompt `kind` and report whether the

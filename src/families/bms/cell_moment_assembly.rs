@@ -2824,7 +2824,7 @@ impl BernoulliInterceptSolveStats {
 }
 
 #[cfg(test)]
-mod empirical_rigid_jet_oracle {
+mod empirical_rigid_jet_oracle_tests {
     //! #932 deployment for the BMS rigid **empirical-grid** Bernoulli kernel.
     //!
     //! The standard-normal latent measure carries a jet-tower oracle
@@ -2934,7 +2934,7 @@ mod empirical_rigid_jet_oracle {
                 2 => &[(-1, 1.0), (0, -2.0), (1, 1.0)],
                 3 => &[(-2, -0.5), (-1, 1.0), (1, -1.0), (2, 0.5)],
                 4 => &[(-2, 1.0), (-1, -4.0), (0, 6.0), (1, -4.0), (2, 1.0)],
-                _ => unreachable!("central_mixed supports orders 0..=4"),
+                _ => panic!("central_mixed supports orders 0..=4, got {order}"),
             }
         }
         let sm = stencil(order_m);
@@ -3202,7 +3202,7 @@ mod empirical_rigid_jet_oracle {
 }
 
 #[cfg(test)]
-mod empirical_flex_jet_oracle {
+mod empirical_flex_jet_oracle_tests {
     //! #932 deployment for the BMS rigid **empirical-grid FLEX** Bernoulli
     //! kernel (score-warp / link-deviation deviation blocks).
     //!
@@ -3432,7 +3432,7 @@ mod empirical_flex_jet_oracle {
                 2 => &[(-1, 1.0), (0, -2.0), (1, 1.0)],
                 3 => &[(-2, -0.5), (-1, 1.0), (1, -1.0), (2, 0.5)],
                 4 => &[(-2, 1.0), (-1, -4.0), (0, 6.0), (1, -4.0), (2, 1.0)],
-                _ => unreachable!("central_along supports orders 0..=4"),
+                _ => panic!("central_along supports orders 0..=4, got {order}"),
             }
         }
         // Cartesian product of the per-axis stencils.

@@ -3115,6 +3115,105 @@ fn residual_pdffourth_derivative_matches_independent_fd_witness() {
     }
 }
 
+/// #932: independent finite-difference witness of the log-survival and
+/// log-pdf scalar derivative stacks across all residual links.
+///
+/// The survival-LS row oracle (`SurvivalLsJointNllProgram`) seeds its tower
+/// from `exact_survival_neglog_derivatives_fourth_rescaled` /
+/// `exact_log_pdf_derivatives_rescaled`, so it tests the Faà-di-Bruno
+/// composition but TRUSTS those scalar stacks as inputs. Outside the
+/// identity/probit closed-form special cases they had no general independent
+/// witness. This pins each stack's d1..d4 by differencing its OWN value
+/// channel (the value is independently anchored by the closed-form tests):
+/// a Richardson-extrapolated central stencil of `log S(eta)` / `log f(eta)`
+/// must reproduce the analytic derivative channels for logit / probit / cloglog
+/// over a range of eta, and a planted sign flip must be rejected.
+#[test]
+fn survival_log_survival_and_pdf_stacks_match_independent_fd_witness() {
+    let links = [
+        InverseLink::Standard(StandardLink::Probit),
+        InverseLink::Standard(StandardLink::Logit),
+        InverseLink::Standard(StandardLink::CLogLog),
+    ];
+    let etas = [-0.8_f64, -0.2, 0.4, 1.0];
+
+    // Richardson O(h⁴) central stencil of an arbitrary scalar f(eta) to the
+    // requested derivative order (1..=4).
+    fn stencil(order: usize) -> &'static [(i64, f64)] {
+        match order {
+            1 => &[(-1, -0.5), (1, 0.5)],
+            2 => &[(-1, 1.0), (0, -2.0), (1, 1.0)],
+            3 => &[(-2, -0.5), (-1, 1.0), (1, -1.0), (2, 0.5)],
+            4 => &[(-2, 1.0), (-1, -4.0), (0, 6.0), (1, -4.0), (2, 1.0)],
+            _ => panic!("stencil supports derivative orders 1..=4, got {order}"),
+        }
+    }
+    let central = |value: &dyn Fn(f64) -> f64, eta: f64, order: usize, h: f64| -> f64 {
+        let one = |hh: f64| {
+            stencil(order)
+                .iter()
+                .map(|&(off, c)| c * value(eta + (off as f64) * hh))
+                .sum::<f64>()
+                / hh.powi(order as i32)
+        };
+        (4.0 * one(h * 0.5) - one(h)) / 3.0
+    };
+
+    for link in &links {
+        // log S(eta): value = slot 0; analytic derivatives are -r, -dr, -ddr, -dddr.
+        let log_s_value = |eta: f64| {
+            SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
+                link, eta, 0.0,
+            )
+            .expect("log-survival stack")
+            .0
+        };
+        // log f(eta): value = slot 0; analytic derivatives are d1..d4.
+        let log_pdf_value = |eta: f64| {
+            SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(link, eta, 0.0)
+                .expect("log-pdf stack")
+                .0
+        };
+        for &eta in &etas {
+            let (_, r, dr, ddr, dddr) =
+                SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
+                    link, eta, 0.0,
+                )
+                .expect("log-survival stack");
+            let log_s_analytic = [-r, -dr, -ddr, -dddr];
+            let (_, p1, p2, p3, p4) =
+                SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(link, eta, 0.0)
+                    .expect("log-pdf stack");
+            let log_pdf_analytic = [p1, p2, p3, p4];
+
+            for (k, &analytic) in log_s_analytic.iter().enumerate() {
+                let order = k + 1;
+                let h = if order <= 2 { 1e-3 } else { 3e-3 };
+                let fd = central(&log_s_value, eta, order, h);
+                assert!(
+                    (analytic - fd).abs() <= 5e-4 * analytic.abs().max(1.0) + 1e-6,
+                    "logS d{order} mismatch for {link:?} at eta={eta}: analytic={analytic} fd={fd}"
+                );
+                if analytic.abs() > 1e-5 {
+                    assert!(
+                        (-analytic - fd).abs() > 5e-4 * analytic.abs().max(1.0) + 1e-6,
+                        "witness failed to reject logS d{order} sign flip for {link:?} at eta={eta}"
+                    );
+                }
+            }
+            for (k, &analytic) in log_pdf_analytic.iter().enumerate() {
+                let order = k + 1;
+                let h = if order <= 2 { 1e-3 } else { 3e-3 };
+                let fd = central(&log_pdf_value, eta, order, h);
+                assert!(
+                    (analytic - fd).abs() <= 5e-4 * analytic.abs().max(1.0) + 1e-6,
+                    "logpdf d{order} mismatch for {link:?} at eta={eta}: analytic={analytic} fd={fd}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn exact_log_pdf_derivatives_match_probit_closed_form() {
     let eta = 3.25;

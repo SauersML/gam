@@ -393,7 +393,7 @@ pub(crate) fn compute_outer_hessian(
             operator_arcs.iter().map(|op| op.as_ref()).collect();
         let impl_ops: Vec<&ImplicitHyperOperator> = generic_ops
             .iter()
-            .filter_map(|op| op.as_implicit())
+            .filter_map(|&op| as_implicit(op))
             .collect();
 
         Some(stochastic_trace_hinv_crosses_with_floor(

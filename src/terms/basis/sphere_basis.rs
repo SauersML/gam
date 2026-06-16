@@ -57,7 +57,8 @@ pub fn build_spherical_spline_basis(
             weighted_coefficient_sum_to_zero_transform(weights.view())?
         }
     };
-    let penalty = z.t().dot(&raw_penalty).dot(&z);
+    let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]);
+    let penalty = gauge.restrict_penalty(&raw_penalty);
     // Prefer the device truncated-spectral kernel whenever
     // `sphere_kernel_decision` reports the (n, m, lmax) workload is
     // worth GPU dispatch — this short-circuits the CPU streaming
@@ -77,7 +78,9 @@ pub fn build_spherical_spline_basis(
         auto_streaming_chunk_size_for_dense(data.nrows(), z.ncols())
     };
     let design = if let Some(raw_design) = gpu_raw_design {
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(raw_design.dot(&z)))
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            gauge.restrict_design(&raw_design),
+        ))
     } else if let Some(chunk) = sphere_auto_chunk {
         log::info!(
             "Sphere basis auto-streaming evaluator: n={} p={} chunk_size={}",
@@ -91,7 +94,7 @@ pub fn build_spherical_spline_basis(
             spec.penalty_order,
             spec.radians,
             spec.wahba_kernel,
-            Some(Arc::new(z.clone())),
+            Some(Arc::new(gauge.clone())),
             Some(chunk),
         )
         .map_err(BasisError::InvalidInput)?;
@@ -104,7 +107,9 @@ pub fn build_spherical_spline_basis(
             spec.radians,
             spec.wahba_kernel,
         )?;
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(raw_design.dot(&z)))
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            gauge.restrict_design(&raw_design),
+        ))
     };
     let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
     let mut candidates = vec![PenaltyCandidate {
@@ -571,6 +576,11 @@ pub(crate) fn build_matern_basis_seeded(
         } else {
             None
         };
+        let kernel_gauge = z_opt.as_ref().map(|z| {
+            Arc::new(crate::solver::gauge::Gauge::from_block_transforms(&[
+                z.clone()
+            ]))
+        });
         let design = if let Some(eta) = aniso.as_ref() {
             let metric_weights = eta.iter().map(|&v| (2.0 * v).exp()).collect::<Vec<_>>();
             let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
@@ -586,7 +596,7 @@ pub(crate) fn build_matern_basis_seeded(
                 shared_data.clone(),
                 Arc::new(centers.clone()),
                 kernel,
-                z_opt.as_ref().map(|z| Arc::new(z.clone())),
+                kernel_gauge.clone(),
                 poly_basis.clone(),
             )
             .map_err(BasisError::InvalidInput)?;
@@ -601,7 +611,7 @@ pub(crate) fn build_matern_basis_seeded(
                 shared_data,
                 Arc::new(centers.clone()),
                 kernel,
-                z_opt.as_ref().map(|z| Arc::new(z.clone())),
+                kernel_gauge,
                 poly_basis,
             )
             .map_err(BasisError::InvalidInput)?;

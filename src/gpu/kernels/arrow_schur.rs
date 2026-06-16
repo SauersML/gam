@@ -287,7 +287,11 @@ impl ResidentArrowFrameHandle {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (sys, ridge_t, ridge_beta);
+            if ridge_t.is_nan() || ridge_beta.is_nan() {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: "ridge is NaN".to_string(),
+                });
+            }
             Err(ArrowSchurGpuFailure::Unavailable)
         }
         #[cfg(target_os = "linux")]
@@ -306,7 +310,11 @@ impl ResidentArrowFrameHandle {
     ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (g_t, g_beta);
+            if g_t.iter().chain(g_beta).any(|v| !v.is_finite()) {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: "non-finite gradient entry".to_string(),
+                });
+            }
             Err(ArrowSchurGpuFailure::Unavailable)
         }
         #[cfg(target_os = "linux")]

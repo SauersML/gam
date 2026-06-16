@@ -6054,21 +6054,23 @@ mod tests {
         let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
         let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
         let kernel = |_: &[f64], _: &[f64]| 0.0;
-        let bad_constraint = Arc::new(Array2::<f64>::zeros((2, 1)));
+        let bad_gauge = Arc::new(crate::solver::gauge::Gauge::from_block_transforms(&[
+            Array2::<f64>::zeros((2, 1)),
+        ]));
         let bad_poly = Arc::new(Array2::<f64>::zeros((3, 1)));
 
-        let constraint_err = match ChunkedKernelDesignOperator::new(
+        let gauge_err = match ChunkedKernelDesignOperator::new(
             data.clone(),
             centers.clone(),
             kernel,
-            Some(bad_constraint),
+            Some(bad_gauge),
             None,
         ) {
-            // SAFETY: test asserting validation rejects mismatched constraint rows; Ok means the validator regressed.
-            Ok(_) => panic!("constraint rows should match centers rows"),
+            // SAFETY: test asserting validation rejects mismatched gauge raw width; Ok means the validator regressed.
+            Ok(_) => panic!("gauge raw width should match centers rows"),
             Err(err) => err,
         };
-        assert!(constraint_err.contains("constraint_transform rows 2 != centers rows 3"));
+        assert!(gauge_err.contains("kernel gauge raw width 2 != centers rows 3"));
 
         let poly_err =
             match ChunkedKernelDesignOperator::new(data, centers, kernel, None, Some(bad_poly)) {

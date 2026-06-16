@@ -405,41 +405,40 @@ impl BlockEffectiveJacobian for GaugeComposedJacobian {
         let lifted_beta;
         let lifted_state;
         let zero_raw_beta;
-        let delegate_state =
-            if state.beta.len() == raw_width {
-                state
-            } else if state.beta.len() == reduced_width {
-                lifted_beta = self.t_block.dot(&ndarray::ArrayView1::from(state.beta));
-                lifted_state = FamilyLinearizationState {
-                    beta: lifted_beta
-                        .as_slice()
-                        .expect("GaugeComposedJacobian lifted beta is contiguous"),
-                    family_scalars: state.family_scalars.clone(),
-                    channel_hessian: state.channel_hessian.clone(),
-                    probit_frailty_scale: state.probit_frailty_scale,
-                };
-                &lifted_state
-            } else if state.beta.is_empty() {
-                zero_raw_beta = ndarray::Array1::<f64>::zeros(raw_width);
-                lifted_state = FamilyLinearizationState {
-                    beta: zero_raw_beta
-                        .as_slice()
-                        .expect("GaugeComposedJacobian zero raw beta is contiguous"),
-                    family_scalars: state.family_scalars.clone(),
-                    channel_hessian: state.channel_hessian.clone(),
-                    probit_frailty_scale: state.probit_frailty_scale,
-                };
-                &lifted_state
-            } else {
-                return Err(format!(
-                    "GaugeComposedJacobian: beta has length {}, expected raw width {} \
+        let delegate_state = if state.beta.len() == raw_width {
+            state
+        } else if state.beta.len() == reduced_width {
+            lifted_beta = self.t_block.dot(&ndarray::ArrayView1::from(state.beta));
+            lifted_state = FamilyLinearizationState {
+                beta: lifted_beta
+                    .as_slice()
+                    .expect("GaugeComposedJacobian lifted beta is contiguous"),
+                family_scalars: state.family_scalars.clone(),
+                channel_hessian: state.channel_hessian.clone(),
+                probit_frailty_scale: state.probit_frailty_scale,
+            };
+            &lifted_state
+        } else if state.beta.is_empty() {
+            zero_raw_beta = ndarray::Array1::<f64>::zeros(raw_width);
+            lifted_state = FamilyLinearizationState {
+                beta: zero_raw_beta
+                    .as_slice()
+                    .expect("GaugeComposedJacobian zero raw beta is contiguous"),
+                family_scalars: state.family_scalars.clone(),
+                channel_hessian: state.channel_hessian.clone(),
+                probit_frailty_scale: state.probit_frailty_scale,
+            };
+            &lifted_state
+        } else {
+            return Err(format!(
+                "GaugeComposedJacobian: beta has length {}, expected raw width {} \
                  or reduced width {}; this wrapper cannot infer a block slice from a joint \
                  coefficient vector",
-                    state.beta.len(),
-                    raw_width,
-                    reduced_width,
-                ));
-            };
+                state.beta.len(),
+                raw_width,
+                reduced_width,
+            ));
+        };
         let j_raw = self.inner.effective_jacobian_rows(delegate_state, rows)?;
         if j_raw.ncols() != self.t_block.nrows() {
             return Err(format!(

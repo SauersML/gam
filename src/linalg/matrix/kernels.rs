@@ -4,6 +4,7 @@
 //! stay stable.
 
 use super::*;
+use crate::solver::gauge::Gauge;
 
 pub trait SpatialKernelEvaluator: Send + Sync + 'static {
     fn eval(&self, x: &[f64], c: &[f64]) -> f64;
@@ -35,8 +36,9 @@ where
 /// The optional `poly_basis` appends polynomial columns after the kernel columns
 /// (e.g., linear polynomial for TPS identifiability).
 ///
-/// The optional `constraint_transform` applies a column-space projection Z
-/// such that the effective design is [K * Z | poly] instead of [K | poly].
+/// The optional `kernel_gauge` restricts the kernel coefficient block through
+/// a Gauge section, so the effective design is [K_reduced | poly] instead of
+/// [K | poly].
 pub struct ChunkedKernelDesignOperator<K: SpatialKernelEvaluator> {
     /// Observation data points (n × d).
     data: Arc<Array2<f64>>,
@@ -44,8 +46,8 @@ pub struct ChunkedKernelDesignOperator<K: SpatialKernelEvaluator> {
     centers: Arc<Array2<f64>>,
     /// Kernel evaluator: (data_row, center_row) -> f64.
     kernel: K,
-    /// Optional constraint projection (k × k_eff) applied to kernel columns.
-    constraint_transform: Option<Arc<Array2<f64>>>,
+    /// Optional coefficient-space gauge applied to kernel columns.
+    kernel_gauge: Option<Arc<Gauge>>,
     /// Optional polynomial basis columns (n × m) appended after kernel columns.
     poly_basis: Option<Arc<Array2<f64>>>,
     n: usize,
@@ -61,7 +63,7 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
         data: Arc<Array2<f64>>,
         centers: Arc<Array2<f64>>,
         kernel: K,
-        constraint_transform: Option<Arc<Array2<f64>>>,
+        kernel_gauge: Option<Arc<Gauge>>,
         poly_basis: Option<Arc<Array2<f64>>>,
     ) -> Result<Self, String> {
         let n = data.nrows();
@@ -73,12 +75,12 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
                 centers.ncols(),
             ));
         }
-        if let Some(z) = constraint_transform.as_ref()
-            && z.nrows() != k
+        if let Some(gauge) = kernel_gauge.as_ref()
+            && gauge.raw_total() != k
         {
             return Err(format!(
-                "ChunkedKernelDesignOperator: constraint_transform rows {} != centers rows {}",
-                z.nrows(),
+                "ChunkedKernelDesignOperator: kernel gauge raw width {} != centers rows {}",
+                gauge.raw_total(),
                 k,
             ));
         }
@@ -91,13 +93,13 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
                 n,
             ));
         }
-        let k_eff = constraint_transform.as_ref().map_or(k, |z| z.ncols());
+        let k_eff = kernel_gauge.as_ref().map_or(k, |g| g.reduced_total());
         let poly_cols = poly_basis.as_ref().map_or(0, |p| p.ncols());
         Ok(Self {
             data: Arc::new(data.as_standard_layout().to_owned()),
             centers: Arc::new(centers.as_standard_layout().to_owned()),
             kernel,
-            constraint_transform,
+            kernel_gauge,
             poly_basis,
             n,
             total_cols: k_eff + poly_cols,
@@ -155,7 +157,8 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
             .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
     }
 
-    /// Evaluate kernel block for a range of rows: K[rows, :] or K[rows, :] * Z.
+    /// Evaluate kernel block for a range of rows, then restrict it through the
+    /// coefficient Gauge when present.
     ///
     /// This is not a matrix Kronecker product. The center rows are coordinate
     /// arguments to `kernel.eval(data_row, center_row)`; each output entry is a
@@ -188,8 +191,8 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
             });
         let kernel_block = Array2::from_shape_vec((chunk_n, k_raw), values)
             .expect("kernel chunk shape should match generated values");
-        if let Some(z) = self.constraint_transform.as_ref() {
-            fast_ab(&kernel_block, z)
+        if let Some(gauge) = self.kernel_gauge.as_ref() {
+            gauge.restrict_design(&kernel_block)
         } else {
             kernel_block
         }
@@ -208,9 +211,9 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
             return fast_av(combined, vector);
         }
         let k_eff = self
-            .constraint_transform
+            .kernel_gauge
             .as_ref()
-            .map_or(self.centers.nrows(), |z| z.ncols());
+            .map_or(self.centers.nrows(), |g| g.reduced_total());
         let v_kernel = vector.slice(s![..k_eff]);
         let mut result = Array1::<f64>::zeros(self.n);
         // Process in chunks to limit memory.
@@ -232,9 +235,9 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
             return fast_atv(combined, vector);
         }
         let k_eff = self
-            .constraint_transform
+            .kernel_gauge
             .as_ref()
-            .map_or(self.centers.nrows(), |z| z.ncols());
+            .map_or(self.centers.nrows(), |g| g.reduced_total());
         let mut result = Array1::<f64>::zeros(self.total_cols);
         // Kernel part: chunked accumulation of K^T v.
         for start in (0..self.n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE) {
@@ -330,9 +333,9 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
     fn build_row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k_eff = self
-            .constraint_transform
+            .kernel_gauge
             .as_ref()
-            .map_or(self.centers.nrows(), |z| z.ncols());
+            .map_or(self.centers.nrows(), |g| g.reduced_total());
         let kernel = self.kernel_chunk(rows.clone());
         let poly_cols = self.poly_basis.as_ref().map_or(0, |p| p.ncols());
         let mut combined = Array2::<f64>::zeros((chunk_n, k_eff + poly_cols));

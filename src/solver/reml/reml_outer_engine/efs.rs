@@ -548,7 +548,7 @@ pub fn compute_hybrid_efs_update(
                 operator_arcs.iter().map(|op| op.as_ref()).collect();
             let impl_ops: Vec<&ImplicitHyperOperator> = generic_ops
                 .iter()
-                .filter_map(|op| op.as_implicit())
+                .filter_map(|&op| as_implicit(op))
                 .collect();
 
             stochastic_trace_hinv_crosses(

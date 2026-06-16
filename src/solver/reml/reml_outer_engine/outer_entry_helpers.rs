@@ -1,16 +1,5 @@
 use super::*;
 
-/// Evaluation mode for the unified evaluator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EvalMode {
-    /// Compute cost only (e.g., for line search).
-    ValueOnly,
-    /// Compute cost and gradient (the common case).
-    ValueAndGradient,
-    /// Compute cost, gradient, and outer Hessian.
-    ValueGradientHessian,
-}
-
 /// Result of the unified REML/LAML evaluation.
 #[derive(Debug)]
 pub struct RemlLamlResult {
@@ -104,6 +93,10 @@ pub(crate) fn penalty_coord_to_operator(
             let mut out = Array1::<f64>::zeros(v.len());
             self.mul_vec_into(v.view(), out.view_mut());
             out
+        }
+
+        fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+            self
         }
 
         fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
