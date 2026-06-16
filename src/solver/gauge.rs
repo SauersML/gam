@@ -231,12 +231,7 @@ impl Gauge {
     /// reduced width partitions.
     pub fn from_t(t_full: Array2<f64>, raw_widths: &[usize], reduced_widths: &[usize]) -> Self {
         let total_raw: usize = raw_widths.iter().sum();
-        Self::from_t_with_shift(
-            t_full,
-            raw_widths,
-            reduced_widths,
-            Array1::zeros(total_raw),
-        )
+        Self::from_t_with_shift(t_full, raw_widths, reduced_widths, Array1::zeros(total_raw))
     }
 
     /// Wrap an already-assembled global affine section `β = Tθ + a` given the
@@ -312,9 +307,10 @@ impl Gauge {
         for r in &map.compiled_block_ranges {
             block_starts_reduced.push(r.end);
         }
+        let total_raw = block_starts_raw.last().copied().unwrap_or(0);
         Self {
             t_full: map.raw_from_compiled.clone(),
-            affine_shift: Array1::zeros(block_starts_raw.last().copied().unwrap_or(0)),
+            affine_shift: Array1::zeros(total_raw),
             block_starts_raw,
             block_starts_reduced,
         }
@@ -452,7 +448,7 @@ impl Gauge {
     }
 
     /// Lift per-block reduced coefficients to per-block raw
-    /// coefficients: concatenate into θ, apply `β = T · θ`, split at
+    /// coefficients: concatenate into θ, apply `β = T · θ + a`, split at
     /// the raw partition.
     pub fn lift_block_betas(&self, reduced_block_betas: &[Array1<f64>]) -> Vec<Array1<f64>> {
         let n_blocks = self.n_blocks();
@@ -552,6 +548,139 @@ mod tests {
     }
 
     #[test]
+    fn affine_gauge_lifts_betas_and_restricts_offsets() {
+        let t = Array2::from_shape_vec((3, 1), vec![2.0, -1.0, 0.5]).unwrap();
+        let shift = Array1::from(vec![0.25, 1.5, -0.75]);
+        let gauge = Gauge::from_block_transform_with_shift(t.clone(), shift.clone());
+        let theta = Array1::from(vec![4.0]);
+
+        let raw = gauge.lift_block_betas(&[theta.clone()]);
+        let expected_raw = t.dot(&theta) + &shift;
+        assert_eq!(raw[0], expected_raw);
+
+        let x = Array2::from_shape_vec((2, 3), vec![1.0, 0.0, 2.0, -1.0, 3.0, 0.5]).unwrap();
+        let offset = Array1::from(vec![0.1, -0.2]);
+        let (x_reduced, offset_reduced) = gauge.restrict_design_and_offset(&x, &offset);
+        assert_eq!(x_reduced, x.dot(&t));
+        assert_eq!(offset_reduced, &offset + &x.dot(&shift));
+
+        let eta_raw = x.dot(&expected_raw) + &offset;
+        let eta_reduced = x_reduced.dot(&theta) + &offset_reduced;
+        for i in 0..eta_raw.len() {
+            assert!((eta_raw[i] - eta_reduced[i]).abs() < 1e-14);
+        }
+
+        let cov_reduced = Array2::from_elem((1, 1), 3.0);
+        let lifted_cov = gauge.lift_covariance(&cov_reduced);
+        let expected_cov = t.dot(&cov_reduced).dot(&t.t());
+        assert_eq!(lifted_cov, expected_cov);
+    }
+
+    /// The covariance pushforward of an affine section `β = T·θ + a` must be
+    /// EXACTLY independent of the affine shift `a` — `Cov(T·θ + a) = T·Cov(θ)·Tᵀ`
+    /// for any constant `a`, because a deterministic offset adds no variance. The
+    /// b≡1 unit-log-t pin (#892) folds the warp into `a`; this is the property
+    /// that guarantees reporting the pinned coefficients carries the same
+    /// posterior uncertainty as the unpinned linear section. We assert it two
+    /// ways: (1) the analytic lift is bit-identical across a sweep of shift
+    /// magnitudes spanning the zero-shift linear case up to 1e7; and (2) an
+    /// empirical check — the sample covariance of `T·θ_k + a` over reduced draws
+    /// `θ_k` is unchanged when `a` is replaced by a 1e6-scale offset (the offset
+    /// cancels under centering).
+    #[test]
+    fn affine_shift_leaves_lifted_covariance_invariant() {
+        // A non-trivial 4-raw × 2-reduced section (so T mixes coordinates).
+        let t =
+            Array2::from_shape_vec((4, 2), vec![1.0, 0.0, 0.5, -1.0, 2.0, 0.3, -0.4, 1.5]).unwrap();
+        let raw_widths = [4usize];
+        let reduced_widths = [2usize];
+
+        // A non-diagonal reduced covariance.
+        let cov_reduced = Array2::from_shape_vec((2, 2), vec![2.0, -0.7, -0.7, 1.3]).unwrap();
+
+        // The reference lift is the zero-shift (purely linear) section.
+        let base =
+            Gauge::from_t_with_shift(t.clone(), &raw_widths, &reduced_widths, Array1::zeros(4));
+        let reference = base.lift_covariance(&cov_reduced);
+
+        // (1) Bit-identical across a wide sweep of shift magnitudes.
+        for &mag in &[0.0, 1e-7, 1.0, 1e3, 1e7] {
+            let shift = Array1::from(vec![mag, -mag, 0.5 * mag, -2.0 * mag]);
+            let gauge = Gauge::from_t_with_shift(t.clone(), &raw_widths, &reduced_widths, shift);
+            let lifted = gauge.lift_covariance(&cov_reduced);
+            for i in 0..4 {
+                for j in 0..4 {
+                    assert_eq!(
+                        lifted[[i, j]],
+                        reference[[i, j]],
+                        "affine shift magnitude {mag} must not perturb the lifted covariance \
+                         at ({i},{j}) — covariance is offset-invariant",
+                    );
+                }
+            }
+        }
+
+        // (2) Empirical check: draw reduced samples, push them through
+        // β = T·θ + a for two very different shifts, and confirm the sample
+        // covariance is the same for both shifts. Draws use a fixed Cholesky
+        // colouring of cov_reduced so the test is deterministic (no RNG).
+        let chol = {
+            let l00 = cov_reduced[[0, 0]].sqrt();
+            let l10 = cov_reduced[[1, 0]] / l00;
+            let l11 = (cov_reduced[[1, 1]] - l10 * l10).sqrt();
+            Array2::from_shape_vec((2, 2), vec![l00, 0.0, l10, l11]).unwrap()
+        };
+        let z_raw = [
+            [1.2, -0.4],
+            [-0.8, 0.9],
+            [0.3, 1.7],
+            [-1.5, -0.6],
+            [0.6, -1.1],
+            [-0.2, 0.3],
+            [1.9, 0.2],
+            [-1.4, -0.9],
+        ];
+        let sample_cov_for_shift = |shift: &Array1<f64>| -> Array2<f64> {
+            let n = z_raw.len();
+            let betas: Vec<Array1<f64>> = z_raw
+                .iter()
+                .map(|z| {
+                    let theta = chol.dot(&Array1::from(vec![z[0], z[1]]));
+                    t.dot(&theta) + shift
+                })
+                .collect();
+            let mut mean = Array1::<f64>::zeros(4);
+            for b in &betas {
+                mean = &mean + b;
+            }
+            mean /= n as f64;
+            let mut cov = Array2::<f64>::zeros((4, 4));
+            for b in &betas {
+                let c = b - &mean;
+                for i in 0..4 {
+                    for j in 0..4 {
+                        cov[[i, j]] += c[i] * c[j] / n as f64;
+                    }
+                }
+            }
+            cov
+        };
+        let cov_small = sample_cov_for_shift(&Array1::zeros(4));
+        let cov_big = sample_cov_for_shift(&Array1::from(vec![1e6, -1e6, 5e5, -2e6]));
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (cov_small[[i, j]] - cov_big[[i, j]]).abs() < 1e-6,
+                    "empirical sample covariance must be offset-invariant at ({i},{j}): \
+                     small-shift {} vs big-shift {}",
+                    cov_small[[i, j]],
+                    cov_big[[i, j]],
+                );
+            }
+        }
+    }
+
+    #[test]
     fn block_diagonal_gauge_matches_per_block_lift() {
         // Block 0: selection keeping raw cols {0, 2} of width 3.
         let mut t0 = Array2::<f64>::zeros((3, 2));
@@ -595,8 +724,8 @@ mod tests {
         assert!((raw[1][1] - 0.0).abs() < 1e-14);
     }
 
-    /// The covariance lift must be the exact pushforward of the SAME
-    /// `T` the β lift applies: for a rank-1 `Σ_θ = θθᵀ`, the lifted
+    /// For a zero-shift gauge, covariance lift must be the exact pushforward of
+    /// the SAME `T` the β lift applies: for a rank-1 `Σ_θ = θθᵀ`, the lifted
     /// covariance must equal `(Tθ)(Tθ)ᵀ` built from the lifted β.
     #[test]
     fn covariance_lift_is_rank1_consistent_with_beta_lift() {
