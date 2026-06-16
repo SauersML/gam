@@ -77,6 +77,7 @@ pub mod identifiability;
 pub mod inference;
 pub mod linalg;
 pub mod model_types;
+pub mod reml_contracts;
 pub mod report;
 /// Lower-layer resource-policy/materialization-budget types. Hosted at the
 /// crate root (not under `solver`) so the `families` layer can name them
@@ -85,6 +86,11 @@ pub mod report;
 pub mod resource;
 pub(crate) mod rho_prior_eval;
 pub mod solver;
+/// Lower-layer outer-objective contract (the `OuterHessianOperator` trait,
+/// `OuterEval`/`HessianResult`/`EfsEval`, and the capability enums) that the
+/// `families` layer implements and returns. Hosted below `solver` so families
+/// do not import *up* into `crate::solver::rho_optimizer` (#1135).
+pub mod solver_contract;
 pub mod terms;
 pub mod test_support;
 pub mod types;

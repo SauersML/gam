@@ -1,133 +1,20 @@
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use std::sync::Arc;
 
-use crate::solver::rho_optimizer::{
-    OuterHessianOperator, OuterStrategyError, RhoBlockAdditiveOuterHessian,
-};
+use crate::solver::rho_optimizer::{OuterStrategyError, RhoBlockAdditiveOuterHessian};
 
-pub(crate) fn outer_strategy_contract_panic(message: impl Into<String>) -> ! {
-    std::panic::panic_any(message.into())
-}
-
-/// Shared outer-objective result used by optimizer-facing objective
-/// implementations.
-pub struct OuterEval {
-    pub cost: f64,
-    pub gradient: Array1<f64>,
-    pub hessian: HessianResult,
-    /// Optional inner-solver iterate at this rho. Families whose inner solve
-    /// produces a PIRLS beta populate this so the persistent-cache layer can
-    /// store `(rho, beta)` together.
-    pub inner_beta_hint: Option<Array1<f64>>,
-}
-
-impl OuterEval {
-    /// Conventional representation of an infeasible trial point.
-    pub fn infeasible(n_params: usize) -> Self {
-        Self {
-            cost: f64::INFINITY,
-            gradient: Array1::zeros(n_params),
-            hessian: HessianResult::Unavailable,
-            inner_beta_hint: None,
-        }
-    }
-
-    pub(crate) fn value_only(
-        cost: f64,
-        n_params: usize,
-        inner_beta_hint: Option<Array1<f64>>,
-    ) -> Self {
-        Self {
-            cost,
-            gradient: Array1::zeros(n_params),
-            hessian: HessianResult::Unavailable,
-            inner_beta_hint,
-        }
-    }
-}
-
-/// Explicit Hessian result replacing `Option<Array2<f64>>`.
-pub enum HessianResult {
-    /// Analytic Hessian was computed and returned.
-    Analytic(Array2<f64>),
-    /// Analytic Hessian is available as an exact Hessian-vector product.
-    Operator(Arc<dyn OuterHessianOperator>),
-    /// No analytic Hessian available for this model path.
-    Unavailable,
-}
-
-impl Clone for OuterEval {
-    fn clone(&self) -> Self {
-        Self {
-            cost: self.cost,
-            gradient: self.gradient.clone(),
-            hessian: self.hessian.clone(),
-            inner_beta_hint: self.inner_beta_hint.clone(),
-        }
-    }
-}
-
-impl std::fmt::Debug for OuterEval {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OuterEval")
-            .field("cost", &self.cost)
-            .field("gradient", &self.gradient)
-            .field("hessian", &self.hessian)
-            .finish()
-    }
-}
-
-impl Clone for HessianResult {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Analytic(h) => Self::Analytic(h.clone()),
-            Self::Operator(op) => Self::Operator(Arc::clone(op)),
-            Self::Unavailable => Self::Unavailable,
-        }
-    }
-}
-
-impl std::fmt::Debug for HessianResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Analytic(h) => f
-                .debug_tuple("Analytic")
-                .field(&format!("{}x{}", h.nrows(), h.ncols()))
-                .finish(),
-            Self::Operator(op) => f
-                .debug_tuple("Operator")
-                .field(&format!("dim={}", op.dim()))
-                .finish(),
-            Self::Unavailable => f.write_str("Unavailable"),
-        }
-    }
-}
+// `OuterEval` and `HessianResult` moved DOWN to the `crate::solver_contract`
+// lower layer (#1135) so the `families` layer can name them without importing
+// up into `solver`. Re-exported here so existing `crate::solver::objective_base`
+// paths keep resolving. The solver-internal `add_rho_block_dense` extension
+// (which needs the solver-private `RhoBlockAdditiveOuterHessian`) stays here.
+pub use crate::solver_contract::{HessianResult, OuterEval};
 
 impl HessianResult {
-    /// Returns `true` if an analytic Hessian is present in any exact form.
-    pub fn is_analytic(&self) -> bool {
-        matches!(
-            self,
-            HessianResult::Analytic(_) | HessianResult::Operator(_)
-        )
-    }
-
-    pub fn dim(&self) -> Option<usize> {
-        match self {
-            HessianResult::Analytic(h) => Some(h.nrows()),
-            HessianResult::Operator(op) => Some(op.dim()),
-            HessianResult::Unavailable => None,
-        }
-    }
-
-    pub fn materialize_dense(&self) -> Result<Option<Array2<f64>>, String> {
-        match self {
-            HessianResult::Analytic(h) => Ok(Some(h.clone())),
-            HessianResult::Operator(op) => op.materialize_dense().map(Some),
-            HessianResult::Unavailable => Ok(None),
-        }
-    }
-
+    /// Solver-internal extension: additive rho-block update. Lives here (not in
+    /// the lower contract layer) because it constructs the solver-private
+    /// `RhoBlockAdditiveOuterHessian` wrapper. Inherent impls may live in any
+    /// module of the defining crate.
     pub fn add_rho_block_dense(&mut self, rho_block: &Array2<f64>) -> Result<(), String> {
         add_rho_block_dense_to_hessian(self, rho_block)
     }

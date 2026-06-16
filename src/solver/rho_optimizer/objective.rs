@@ -1,74 +1,9 @@
 use super::*;
 
-/// Result of an EFS (Extended Fellner-Schall) evaluation at a given rho.
-///
-/// Contains the REML/LAML cost at the current rho and the additive step
-/// vector produced by `compute_efs_update`. The caller applies the step as
-/// `rho_new[i] = rho[i] + steps[i]`.
-///
-/// For the hybrid EFS+preconditioned-gradient strategy, the steps vector
-/// contains both EFS steps (for ρ coords) and preconditioned gradient steps
-/// (for ψ coords). The `psi_gradient` field carries the raw ψ-block gradient
-/// for optional backtracking.
-#[derive(Clone, Debug)]
-pub struct EfsEval {
-    /// REML/LAML cost at the current rho (for convergence monitoring and
-    /// comparing candidates).
-    pub cost: f64,
-    /// Additive steps. Length = n_rho + n_ext_coords.
-    ///
-    /// For pure EFS: steps for non-penalty-like coordinates are 0.0.
-    /// For hybrid EFS: ρ-coords get standard EFS multiplicative steps,
-    /// ψ-coords get preconditioned gradient steps `Δψ = -α G⁺ g_ψ`.
-    pub steps: Vec<f64>,
-    /// Current coefficient vector β̂ from the inner P-IRLS solve.
-    /// Used by the EFS loop for the runtime barrier-curvature significance
-    /// check when monotonicity constraints are present.
-    pub beta: Option<Array1<f64>>,
-    /// Raw REML/LAML gradient restricted to the ψ block (design-moving coords).
-    ///
-    /// Present only when the hybrid EFS strategy is active. Used by the
-    /// outer iteration for backtracking on the ψ step: if the combined
-    /// (ρ-EFS, ψ-gradient) step does not decrease V(θ), the ψ step size
-    /// α is halved while keeping the ρ-EFS step fixed.
-    ///
-    /// This avoids re-evaluating the gradient during backtracking since
-    /// the gradient was already computed as part of the hybrid EFS eval.
-    pub psi_gradient: Option<Array1<f64>>,
-    /// Indices into the full θ vector that correspond to ψ (design-moving)
-    /// coordinates. Used by the backtracking logic to selectively scale
-    /// only the ψ portion of the step.
-    pub psi_indices: Option<Vec<usize>>,
-    /// Representative curvature scale of the inner Hessian
-    /// `H = X'W_HX + S_λ` (+ any barrier perturbation), at β̂.
-    ///
-    /// Production REML/LAML paths provide the geometric mean of the active
-    /// Hessian spectrum, `exp(log|H|_+ / rank(H))`, which is basis-invariant,
-    /// has curvature units, and is already available from the Hessian operator
-    /// used to evaluate the objective. The EFS barrier check uses it for the
-    /// dimensionally correct comparison `max_j τ/Δ_j² > threshold · scale`.
-    pub inner_hessian_scale: Option<f64>,
-    /// `Some(gap)` when the `½log|H|` term in `cost` was produced as a CERTIFIED
-    /// TWO-SIDED ENCLOSURE (the #1011 block-preconditioned border-Schur bound)
-    /// rather than an exact logdet — `gap` is the enclosure width that `cost`
-    /// inherits. The EFS engine consults the decision-margin contract against
-    /// its step tolerance: a step is only allowed to declare convergence when
-    /// the cost it converged on is resolved more tightly than that tolerance.
-    /// `None` (the default for every exact-logdet objective) preserves today's
-    /// behavior bit-for-bit.
-    pub logdet_enclosure_gap: Option<f64>,
-}
-
-impl EfsEval {
-    /// Attach a certified logdet-enclosure gap to this eval (the #1011 contract).
-    /// The EFS engine then refuses to declare convergence on a cost the
-    /// enclosure does not pin down below the step tolerance, escalating instead.
-    #[must_use]
-    pub fn with_logdet_enclosure_gap(mut self, gap: Option<f64>) -> Self {
-        self.logdet_enclosure_gap = gap;
-        self
-    }
-}
+// `EfsEval` moved DOWN to `crate::solver_contract` (#1135) so families can
+// build and return it without importing up into `crate::solver::rho_optimizer`.
+// Re-exported here so existing `rho_optimizer::EfsEval` paths keep resolving.
+pub use crate::solver_contract::EfsEval;
 
 /// Outcome of [`OuterObjective::seed_inner_state`].
 ///
