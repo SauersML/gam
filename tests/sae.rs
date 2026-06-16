@@ -5,8 +5,8 @@
 
 #[path = "sae/sae_arrow_schur_large_scale.rs"]
 mod sae_arrow_schur_large_scale;
-#[path = "sae/sae_atom_curvature_ci_bartlett.rs"]
-mod sae_atom_curvature_ci_bartlett;
+#[path = "sae/sae_atom_smooth_structure_evidence.rs"]
+mod sae_atom_smooth_structure_evidence;
 #[path = "sae/sae_audit_is_invoked.rs"]
 mod sae_audit_is_invoked;
 #[path = "sae/sae_curvature_estimand_sims.rs"]

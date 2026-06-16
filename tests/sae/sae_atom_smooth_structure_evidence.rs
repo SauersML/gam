@@ -185,6 +185,62 @@ fn curved_atom_reports_debiased_point_summaries_without_coverage_claim() {
 }
 
 #[test]
+fn constant_atom_does_not_accumulate_nonconstant_evidence() {
+    // NEGATIVE CONTROL for the #1103 instrument: a genuinely CONSTANT decoder
+    // smooth (beta = [c, 0, 0]; no linear, no quadratic energy) under the null
+    // H0 "the smooth is constant". The only departure from the constant fit is
+    // the tiny deterministic mean-zero residual field planted in `row_scores`
+    // (amplitude 1e-5) — pure non-structure. An honest any-n-valid split-LRT
+    // e-value (β̂ fit on the estimation fold, scored out-of-sample on the
+    // disjoint evaluation fold) must NOT generalize that noise into positive
+    // log-evidence for the non-constant alternative. With E_{H0}[E] ≤ 1, the
+    // expected log E is ≤ 0; here the planted field carries no fold-transferable
+    // signal, so the e-value stays effectively non-positive. This is what proves
+    // the test DISCRIMINATES curved (log_e > 0) from constant — not merely that
+    // the field is populated.
+    let fit = curved_inner_fit([0.7, 0.0, 0.0], 1e-2);
+    let model = single_atom_model(patch_atom_with_fit("constant", fit));
+    let ledger = StructureLedger::new();
+    let report = dictionary_report(&model, &ledger, 0.05).expect("dictionary report");
+
+    let atom = &report.atom_inference[0];
+    let sig = atom
+        .smooth_significance
+        .as_ref()
+        .expect("the e-value is computed for any M>1 inner design, constant or not");
+    let log_e = sig
+        .log_e_nonconstant
+        .expect("constant atom still carries a finite log-e-value");
+    assert!(log_e.is_finite(), "log-e must be finite, got {log_e}");
+    // The honest discrimination bound: a constant smooth must NOT earn the
+    // strong positive evidence the curved atom does. We use a small positive
+    // slack (0.5 nat) so the assertion is about "does not favor non-constant",
+    // not a brittle exact-zero check on the finite-sample noise transfer.
+    assert!(
+        log_e <= 0.5,
+        "a constant (no-curvature, no-slope) atom must not accumulate non-constant evidence, got log_e={log_e}"
+    );
+
+    // And it is strictly separated from the curved atom's evidence: re-fit a
+    // strongly curved atom on the SAME planted-noise field and confirm the
+    // curved log-e is well above the constant log-e. This is the discrimination
+    // claim end-to-end (curved ≫ constant), not two independent thresholds.
+    let curved_fit = curved_inner_fit([0.0, 0.5, 1.0], 1e-2);
+    let curved_model = single_atom_model(patch_atom_with_fit("curved", curved_fit));
+    let curved_report =
+        dictionary_report(&curved_model, &ledger, 0.05).expect("dictionary report");
+    let curved_log_e = curved_report.atom_inference[0]
+        .smooth_significance
+        .as_ref()
+        .and_then(|s| s.log_e_nonconstant)
+        .expect("curved atom carries a finite log-e-value");
+    assert!(
+        curved_log_e > log_e + 1.0,
+        "curved evidence ({curved_log_e}) must strictly exceed constant evidence ({log_e}) by a clear margin"
+    );
+}
+
+#[test]
 fn flat_atom_functional_debiased_value_matches_plugin() {
     // A flat decoder (no quadratic energy) still yields finite penalty-debiased
     // point summaries; with negligible penalty bias the debiased value tracks
