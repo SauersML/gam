@@ -34,7 +34,7 @@ use std::sync::OnceLock;
 use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
 #[cfg(target_os = "linux")]
-use super::error::GpuError;
+use crate::gpu::error::GpuError;
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuResultExt;
 

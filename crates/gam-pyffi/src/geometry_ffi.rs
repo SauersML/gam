@@ -3599,7 +3599,7 @@ impl NuclearNormPenalty {
 
 /// Identifiability theorem precondition checks (Principle (f)).
 ///
-/// Caller serialises a `gam::inference::identifiability_diagnostics::FitSummary` as
+/// Caller serialises a `gam::inference::identifiability_precondition_checks::FitSummary` as
 /// JSON; Rust does all numerical work (min std, faer-SVD rank, decoder
 /// zero-fraction, activation variance bounds) and returns a JSON array of
 /// per-theorem results. This is the *single source of truth* — Python's
@@ -3607,7 +3607,7 @@ impl NuclearNormPenalty {
 /// all consume this same FFI.
 #[pyfunction]
 fn identifiability_check_json(input: &str) -> PyResult<String> {
-    gam::inference::identifiability_diagnostics::identifiability_check_json(input)
+    gam::inference::identifiability_precondition_checks::identifiability_check_json(input)
         .map_err(py_value_error)
 }
 

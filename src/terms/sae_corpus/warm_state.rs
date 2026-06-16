@@ -24,13 +24,13 @@
 //! (#869), the topology-aware shape hash — so a sphere-vs-torus-vs-euclidean
 //! candidate on the same data gets a *distinct* per-row warm-start keyspace and
 //! the candidates never cross-seed each other with geometrically incompatible
-//! coords. We hash that shape into a [`crate::cache::Fingerprinter`] together
+//! coords. We hash that shape into a [`crate::warm_start::Fingerprinter`] together
 //! with the `row_id`, matching the existing warm-start key derivation byte
 //! framing.
 //!
 //! # Storage
 //!
-//! The on-disk tier reuses [`crate::cache::WarmStartStore`] (tmp-file + fsync +
+//! The on-disk tier reuses [`crate::warm_start::WarmStartStore`] (tmp-file + fsync +
 //! rename writes, per-entry checksums, bounded size + TTL eviction) so we
 //! inherit its crash-safety and disk-budget guarantees for free. In front of
 //! it sits a bounded in-process LRU keyed by the same fingerprint, so the hot
@@ -39,8 +39,8 @@
 //! `HashMap` iteration, no float formatting), so the same warm state always
 //! hashes/round-trips identically.
 
-use crate::cache::store::{EntryKind, StoreOptions, WarmStartStore};
-use crate::cache::{Fingerprint, Fingerprinter};
+use crate::warm_start::store::{EntryKind, StoreOptions, WarmStartStore};
+use crate::warm_start::{Fingerprint, Fingerprinter};
 use crate::terms::smooth::TermCollectionSpec;
 use std::collections::HashMap;
 use std::time::Duration;

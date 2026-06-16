@@ -1,5 +1,17 @@
 use super::*;
 
+/// Survival location-scale predictor: two blocks (threshold + log-sigma).
+///
+/// Predicts survival probability via:
+///   q0 = -eta_threshold * exp(-eta_log_sigma)
+///   survival_prob = 1 - inverse_link(q0)
+///
+/// The "design" in `PredictInput` is the threshold design matrix, and
+/// "design_noise" is the log-sigma design matrix. The time dimension
+/// (x_time_exit) is handled externally and is not part of this predictor.
+const SURVIVAL_EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
+
+#[inline]
 fn survival_inverse_sigma_from_eta_log_sigma(eta_log_sigma: f64) -> f64 {
     (-eta_log_sigma).min(SURVIVAL_EXP_NEG_STABLE_MAX_ARG).exp()
 }
@@ -402,8 +414,3 @@ impl PredictableModel for SurvivalPredictor {
     }
 }
 
-/// Predictor for transformation-normal (PIT) models.
-///
-/// The PIT-transformed values h(y|x) are precomputed in
-/// `build_predict_input_for_model` and stored in the PredictInput offset.
-/// This predictor passes them through as the prediction: eta = h, mean = h.

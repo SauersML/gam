@@ -30,7 +30,6 @@ pub mod sigma_link;
 pub mod spatial_psi_bridge;
 pub mod strategy;
 pub mod survival;
-pub mod survival_construction;
 pub mod survival_location_scale;
 pub mod survival_marginal_slope;
 pub mod survival_marginal_slope_gpu;

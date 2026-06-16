@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::util::fnv::Fnv1a;
+use crate::families::fnv::Fnv1a;
 
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {

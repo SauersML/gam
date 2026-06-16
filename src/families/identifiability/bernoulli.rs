@@ -1,5 +1,5 @@
 //! Bernoulli marginal-slope concrete impls for the family-agnostic
-//! identifiability compiler (`crate::families::identifiability_compiler`).
+//! identifiability compiler (`crate::families::identifiability::compiler`).
 //!
 //! Bernoulli's row primary state is the scalar linear predictor `η_i`, so
 //! `K = 1` throughout. Every block's row Jacobian is the row of its dense
@@ -15,7 +15,7 @@
 use ndarray::{Array1, Array2, Array3};
 
 use crate::families::custom_family::FamilyChannelHessian;
-use crate::families::identifiability_compiler::{
+use crate::families::identifiability::compiler::{
     RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
 

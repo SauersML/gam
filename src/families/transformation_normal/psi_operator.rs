@@ -849,7 +849,7 @@ impl TransformationNormalPsiWorkspace {
     pub(crate) fn compute_all_axes(
         &self,
     ) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
-        crate::util::block_count::validate_block_count::<TransformationNormalError>(
+        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
             1,
             self.block_states.len(),

@@ -2857,7 +2857,7 @@ impl BinomialLocationScaleWiggleFamily {
         specs: &[ParameterBlockSpec],
         block_idx: usize,
     ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        crate::util::block_jacobian::AdditiveWiggleBlockLayout {
+        crate::families::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
             family: "BinomialLocationScaleWiggleFamily",
             n_outputs: 2,
             additive_blocks: &[Self::BLOCK_T, Self::BLOCK_LOG_SIGMA],

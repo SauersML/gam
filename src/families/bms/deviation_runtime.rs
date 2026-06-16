@@ -2,7 +2,7 @@ use crate::basis::create_ispline_derivative_dense;
 use crate::faer_ndarray::{FaerEigh, fast_ab};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::pirls::LinearInequalityConstraints;
-use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
+use crate::util::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use ndarray::{Array1, Array2, ArrayView2};
 
 /// Round-off tolerance on the minimum monotonicity-derivative slack. The

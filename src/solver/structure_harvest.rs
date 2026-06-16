@@ -33,7 +33,7 @@
 //! Pure: no RNG, no clock. Proposal triggers are deterministic functions of the
 //! fitted state; the engine canonicalizes and gates them; the ledger serializes
 //! byte-identically for identical inputs. The structural hashes that dedup the
-//! proposal stream are computed with the same [`crate::cache::Fingerprinter`]
+//! proposal stream are computed with the same [`crate::warm_start::Fingerprinter`]
 //! the [`crate::terms::smooth::TermCollectionSpec`] machinery (#869) uses, fed
 //! the POST-move dictionary shape (atom count, per-atom basis kind + latent dim
 //! + the move that produced it), so two proposals that reach the same dictionary
@@ -44,7 +44,7 @@ use std::sync::Arc;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::cache::Fingerprinter;
+use crate::warm_start::Fingerprinter;
 use crate::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use crate::inference::structure_evidence::{ClaimKind, StructureLedger};
 use crate::linalg::faer_ndarray::{FaerCholesky, FaerEigh};

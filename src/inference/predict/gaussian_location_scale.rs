@@ -1,5 +1,17 @@
 use super::*;
 
+/// Gaussian location-scale predictor: two blocks (mean + log-sigma).
+///
+/// Predicts `mean = X_mu @ beta_mu` (identity link on mean) and
+/// `sigma = sigma_floor + exp(X_noise @ beta_noise + offset_noise)`.
+///
+/// `sigma_floor` is the response-scale-relative σ floor `LOGB_SIGMA_FLOOR ·
+/// response_scale`. Gaussian location-scale fits standardize the response by
+/// `response_scale` and map the log-σ coefficients back to raw units by shifting
+/// the intercept by `+ln(response_scale)`. That intercept shift only multiplies
+/// the `exp(η)` term by `response_scale`; the floor must be scaled separately for
+/// the reconstructed σ to be response-scale-equivariant (#884), so it is carried
+/// here rather than left at the raw `LOGB_SIGMA_FLOOR`.
 pub struct GaussianLocationScalePredictor {
     pub beta_mu: Array1<f64>,
     pub beta_noise: Array1<f64>,
@@ -265,21 +277,3 @@ impl PredictableModel for GaussianLocationScalePredictor {
     }
 }
 
-/// Dispersion location-scale predictor (#913): two blocks (mean + log-precision)
-/// for the genuine-dispersion mean families — NegativeBinomial, Gamma, Beta and
-/// Tweedie — fitted with a second `noise_formula` linear predictor on the
-/// overdispersion channel.
-///
-/// Unlike the binomial-LS threshold-scale predictor, the mean channel is a plain
-/// GLM mean through the family's inverse link (log for NB/Gamma/Tweedie, logit
-/// for Beta):
-///   eta_mu = X_mu @ beta_mu + offset
-///   mean   = g^{-1}(eta_mu)
-///
-/// The log-precision channel `eta_d = X_noise @ beta_noise + offset_noise`
-/// supplies `precision = exp(eta_d)` — `theta` for NB, the shape `nu` for Gamma,
-/// `phi` for Beta, and `1/phi` for Tweedie — which combines with the predicted
-/// mean to yield the observation-scale predictive standard deviation
-/// `sqrt(Var(y | mean, precision))` per the family's mean–variance law. The
-/// confidence interval on the mean is the delta-method propagation of the mean
-/// block's joint-covariance slice through the inverse link.

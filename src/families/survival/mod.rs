@@ -8,5 +8,7 @@
 //! - [`base`]              — the core survival family (formerly `survival.rs`).
 
 pub mod base;
+pub mod construction;
 
 pub use base::*;
+pub use construction::*;

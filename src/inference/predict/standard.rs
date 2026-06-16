@@ -1,5 +1,6 @@
 use super::*;
 
+/// Standard (single-block) GAM predictor.
 pub struct StandardPredictor {
     pub beta: Array1<f64>,
     pub family: crate::types::LikelihoodSpec,

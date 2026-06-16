@@ -6528,7 +6528,7 @@ fn gated_sae_decode<'py>(
 /// Returns `X̂[i, d] = Σ_f gate[f] · z[i, f] · weights[d, f] + bias[d]`.
 /// `bias` may be `None`. The forward and its analytic gradients are shared
 /// across the Rust library, the CLI, and the PyTorch bridge via the
-/// `gam::terms::interchange_decoder` primitive.
+/// `gam::terms::decoders::interchange_decoder` primitive.
 #[pyfunction(signature = (z, weights, gate, bias = None))]
 fn interchange_decode_forward<'py>(
     py: Python<'py>,

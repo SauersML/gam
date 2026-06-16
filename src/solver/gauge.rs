@@ -191,15 +191,15 @@ impl Gauge {
     }
 
     /// Build from a [`CompiledMap`] emitted by
-    /// [`crate::families::identifiability_compiler::compile_from_raw_grams`]:
+    /// [`crate::families::identifiability::compiler::compile_from_raw_grams`]:
     /// `map.raw_from_compiled` IS the global triangular `T`, and the
     /// block ranges give both partitions. `ordering` is accepted purely
     /// as a length sanity check.
     ///
-    /// [`CompiledMap`]: crate::families::identifiability_compiler::CompiledMap
+    /// [`CompiledMap`]: crate::families::identifiability::compiler::CompiledMap
     pub fn from_compiled_map(
-        map: &crate::families::identifiability_compiler::CompiledMap,
-        ordering: &[crate::families::identifiability_compiler::BlockOrder],
+        map: &crate::families::identifiability::compiler::CompiledMap,
+        ordering: &[crate::families::identifiability::compiler::BlockOrder],
     ) -> Self {
         assert_eq!(
             map.raw_block_ranges.len(),

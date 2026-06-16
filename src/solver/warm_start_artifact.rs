@@ -19,7 +19,7 @@
 //! start within tolerance. Every field that flows back into the solver is
 //! finite-guarded at consume time; any anomaly falls back to cold.
 
-use crate::cache::key::{Fingerprint, Fingerprinter};
+use crate::warm_start::key::{Fingerprint, Fingerprinter};
 use serde::{Deserialize, Serialize};
 
 /// On-disk schema version for [`FitArtifact`]. Bump when the serialized

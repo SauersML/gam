@@ -64,8 +64,8 @@ impl From<TransformationNormalError> for String {
     }
 }
 
-impl From<crate::util::block_count::BlockCountMismatch> for TransformationNormalError {
-    fn from(err: crate::util::block_count::BlockCountMismatch) -> TransformationNormalError {
+impl From<crate::families::block_layout::block_count::BlockCountMismatch> for TransformationNormalError {
+    fn from(err: crate::families::block_layout::block_count::BlockCountMismatch) -> TransformationNormalError {
         TransformationNormalError::InvalidInput {
             reason: err.message(),
         }

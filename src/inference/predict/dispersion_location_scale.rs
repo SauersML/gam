@@ -1,5 +1,23 @@
 use super::*;
 
+/// Dispersion location-scale predictor (#913): two blocks (mean + log-precision)
+/// for the genuine-dispersion mean families — NegativeBinomial, Gamma, Beta and
+/// Tweedie — fitted with a second `noise_formula` linear predictor on the
+/// overdispersion channel.
+///
+/// Unlike the binomial-LS threshold-scale predictor, the mean channel is a plain
+/// GLM mean through the family's inverse link (log for NB/Gamma/Tweedie, logit
+/// for Beta):
+///   eta_mu = X_mu @ beta_mu + offset
+///   mean   = g^{-1}(eta_mu)
+///
+/// The log-precision channel `eta_d = X_noise @ beta_noise + offset_noise`
+/// supplies `precision = exp(eta_d)` — `theta` for NB, the shape `nu` for Gamma,
+/// `phi` for Beta, and `1/phi` for Tweedie — which combines with the predicted
+/// mean to yield the observation-scale predictive standard deviation
+/// `sqrt(Var(y | mean, precision))` per the family's mean–variance law. The
+/// confidence interval on the mean is the delta-method propagation of the mean
+/// block's joint-covariance slice through the inverse link.
 pub struct DispersionLocationScalePredictor {
     pub beta_mu: Array1<f64>,
     pub beta_noise: Array1<f64>,
@@ -279,14 +297,3 @@ impl PredictableModel for DispersionLocationScalePredictor {
     }
 }
 
-/// Binomial location-scale predictor: two blocks (threshold + log-sigma).
-///
-/// Predicts probabilities through the threshold-scale parameterisation:
-///   eta_t = X_threshold @ beta_threshold + offset
-///   eta_s = X_noise @ beta_noise + offset_noise
-///   sigma = exp(eta_s)
-///   q0    = -eta_t / sigma
-///   prob  = inverse_link(q0)
-///
-/// Delta-method SEs propagate through the chain rule of q0 w.r.t. both
-/// linear predictors.

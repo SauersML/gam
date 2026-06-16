@@ -1,5 +1,10 @@
 use super::*;
 
+/// Predictor for transformation-normal (PIT) models.
+///
+/// The PIT-transformed values h(y|x) are precomputed in
+/// `build_predict_input_for_model` and stored in the PredictInput offset.
+/// This predictor passes them through as the prediction: eta = h, mean = h.
 pub struct TransformationNormalPredictor {
     pub covariance: Option<Array2<f64>>,
 }
@@ -129,5 +134,3 @@ impl PredictableModel for TransformationNormalPredictor {
         vec![BlockRole::Mean]
     }
 }
-
-/// Compute eta standard errors from a design matrix and covariance/precision backend.

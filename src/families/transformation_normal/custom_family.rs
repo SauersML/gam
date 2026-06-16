@@ -6,7 +6,7 @@ use super::*;
 
 impl CustomFamily for TransformationNormalFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        crate::util::block_count::validate_block_count::<TransformationNormalError>(
+        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
             1,
             block_states.len(),
@@ -118,7 +118,7 @@ impl CustomFamily for TransformationNormalFamily {
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         assert!(block_specs.len() <= isize::MAX as usize);
-        crate::util::block_count::validate_block_count::<TransformationNormalError>(
+        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
             1,
             block_states.len(),
@@ -294,7 +294,7 @@ impl CustomFamily for TransformationNormalFamily {
         if block_index != 0 {
             return Ok(None);
         }
-        crate::util::block_count::validate_block_count::<TransformationNormalError>(
+        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
             1,
             block_states.len(),
@@ -568,7 +568,7 @@ impl CustomFamily for TransformationNormalFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        crate::util::block_count::validate_block_count::<TransformationNormalError>(
+        crate::families::block_layout::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
             1,
             block_states.len(),

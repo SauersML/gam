@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
-use crate::cache::{Fingerprint, Fingerprinter};
+use crate::warm_start::{Fingerprint, Fingerprinter};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
 use crate::solver::riemannian_retraction::{Retraction, RetractionKind};

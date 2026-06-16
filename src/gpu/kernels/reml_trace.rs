@@ -72,7 +72,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use super::error::GpuError;
+use crate::gpu::error::GpuError;
 
 // ────────────────────────────────────────────────────────────────────────
 // Public types

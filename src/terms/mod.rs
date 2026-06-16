@@ -7,23 +7,20 @@ pub mod behavioral_head;
 pub mod closed_form_operator;
 pub(crate) mod coefficient_group_resolver;
 pub mod construction;
+pub mod decoders;
 pub mod equivariant_penalty;
 pub mod gated_decoder;
 pub mod hull;
 pub mod input_loc_derivatives;
-pub mod interchange_decoder;
 pub mod latent_coord;
 pub mod linear_dictionary;
 pub mod matern_gradient;
-pub mod penalties;
 pub mod penalty_op;
 pub mod sae;
-pub mod sae_chart_canonicalization;
 pub mod sae_corpus;
 pub mod sae_encode_atlas;
 pub mod sae_manifold;
 pub mod sheaf;
-pub mod skip_transcoder;
 pub mod smooth;
 pub mod smooth_overrides;
 pub mod sphere_gpu;
@@ -46,7 +43,7 @@ pub use atom_selection::{
     L1Relaxed, ShapeRef, TopK,
 };
 pub use gated_decoder::GatedSAEDecoder;
-pub use interchange_decoder::{
+pub use decoders::interchange_decoder::{
     InterchangeDecodeBackward, InterchangeDecodeForward, InterchangeSwapBackward,
     InterchangeSwapForward, interchange_decode_backward, interchange_decode_forward,
     interchange_swap_backward, interchange_swap_forward,

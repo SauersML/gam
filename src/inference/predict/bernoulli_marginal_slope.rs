@@ -2314,15 +2314,3 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
     }
 }
 
-/// Gaussian location-scale predictor: two blocks (mean + log-sigma).
-///
-/// Predicts `mean = X_mu @ beta_mu` (identity link on mean) and
-/// `sigma = sigma_floor + exp(X_noise @ beta_noise + offset_noise)`.
-///
-/// `sigma_floor` is the response-scale-relative σ floor `LOGB_SIGMA_FLOOR ·
-/// response_scale`. Gaussian location-scale fits standardize the response by
-/// `response_scale` and map the log-σ coefficients back to raw units by shifting
-/// the intercept by `+ln(response_scale)`. That intercept shift only multiplies
-/// the `exp(η)` term by `response_scale`; the floor must be scaled separately for
-/// the reconstructed σ to be response-scale-equivariant (#884), so it is carried
-/// here rather than left at the raw `LOGB_SIGMA_FLOOR`.

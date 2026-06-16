@@ -56,7 +56,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::linalg::triangular::{back_substitution_lower_transpose, cholesky_solve_vector};
 
 #[cfg(target_os = "linux")]
-use super::error::GpuError;
+use crate::gpu::error::GpuError;
 
 // ────────────────────────────────────────────────────────────────────────
 // Public types

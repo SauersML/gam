@@ -1,5 +1,16 @@
 use super::*;
 
+/// Binomial location-scale predictor: two blocks (threshold + log-sigma).
+///
+/// Predicts probabilities through the threshold-scale parameterisation:
+///   eta_t = X_threshold @ beta_threshold + offset
+///   eta_s = X_noise @ beta_noise + offset_noise
+///   sigma = exp(eta_s)
+///   q0    = -eta_t / sigma
+///   prob  = inverse_link(q0)
+///
+/// Delta-method SEs propagate through the chain rule of q0 w.r.t. both
+/// linear predictors.
 pub struct BinomialLocationScalePredictor {
     pub beta_threshold: Array1<f64>,
     pub beta_noise: Array1<f64>,
@@ -534,15 +545,3 @@ impl PredictableModel for BinomialLocationScalePredictor {
     }
 }
 
-/// Survival location-scale predictor: two blocks (threshold + log-sigma).
-///
-/// Predicts survival probability via:
-///   q0 = -eta_threshold * exp(-eta_log_sigma)
-///   survival_prob = 1 - inverse_link(q0)
-///
-/// The "design" in `PredictInput` is the threshold design matrix, and
-/// "design_noise" is the log-sigma design matrix. The time dimension
-/// (x_time_exit) is handled externally and is not part of this predictor.
-const SURVIVAL_EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
-
-#[inline]

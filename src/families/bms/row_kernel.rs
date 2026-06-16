@@ -3,7 +3,7 @@ use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::*;
-use crate::util::fnv::Fnv1a;
+use crate::families::fnv::Fnv1a;
 use std::sync::{Mutex, OnceLock};
 
 // ── Same-β rigid third/fourth-tensor cache ───────────────────────────

@@ -144,7 +144,7 @@ pub(crate) use gam::terms::basis::{
 
 pub(crate) use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 
-pub(crate) use gam::terms::interchange_decoder::{
+pub(crate) use gam::terms::decoders::interchange_decoder::{
     InterchangeDecodeForward as CoreInterchangeDecodeForward,
     InterchangeSwapForward as CoreInterchangeSwapForward,
     interchange_decode_backward as core_interchange_decode_backward,
@@ -167,7 +167,7 @@ pub(crate) use gam::terms::sae_manifold::{
     term_from_padded_blocks_with_mode,
 };
 
-pub(crate) use gam::terms::skip_transcoder::{
+pub(crate) use gam::terms::decoders::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
 };
 
