@@ -1632,17 +1632,17 @@ pub(crate) fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
     let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
     assert_eq!(
         gradient,
-        crate::solver::outer_strategy::Derivative::Analytic
+        crate::solver::rho_optimizer::Derivative::Analytic
     );
     assert_eq!(
         hessian,
-        crate::solver::outer_strategy::DeclaredHessianForm::Either
+        crate::solver::rho_optimizer::DeclaredHessianForm::Either
     );
 
     let rho_dim = spec.initial_log_lambdas.len();
     let psi_dim = derivative_blocks[0].len();
     let outer_plan =
-        crate::solver::outer_strategy::plan(&crate::solver::outer_strategy::OuterCapability {
+        crate::solver::rho_optimizer::plan(&crate::solver::rho_optimizer::OuterCapability {
             gradient,
             hessian,
             n_params: rho_dim + psi_dim,
@@ -1654,11 +1654,11 @@ pub(crate) fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
         });
     assert_eq!(
         outer_plan.solver,
-        crate::solver::outer_strategy::Solver::Arc
+        crate::solver::rho_optimizer::Solver::Arc
     );
     assert_eq!(
         outer_plan.hessian_source,
-        crate::solver::outer_strategy::HessianSource::Analytic
+        crate::solver::rho_optimizer::HessianSource::Analytic
     );
 }
 

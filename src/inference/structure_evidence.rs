@@ -61,7 +61,7 @@
 //! e-process per claim, serializable across #973 shards) →
 //! [`StructureLedger::certify`] (the e-BH [`StructureCertificate`],
 //! shipped beside the gauge report via
-//! `crate::sae_identifiability::dictionary_report`) →
+//! `crate::terms::sae::identifiability::dictionary_report`) →
 //! [`plan_probe_for_contested_claim`] (the design loop: contested claims
 //! get a [`ProbePlan`] whose δ runs through
 //! `crate::inference::steering::steer_delta` and whose per-hypothesis
@@ -606,7 +606,7 @@ pub struct CertificateEntry {
 
 /// The deliverable: "we found N structures at FDR ≤ α, certificate
 /// attached". Ships next to the identifiability certificate
-/// ([`crate::sae_identifiability::residual_gauge`], #981) — that one says
+/// ([`crate::terms::sae::identifiability::residual_gauge`], #981) — that one says
 /// what the GAUGE cannot distinguish, this one says what the DATA can.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StructureCertificate {

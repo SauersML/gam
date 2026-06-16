@@ -285,13 +285,13 @@ pub struct SaeManifoldTerm {
     /// #1103), one entry per atom in [`Self::atoms`] order. Each is the fixed
     /// fitted snapshot the residual-gauge certificate's three post-PIRLS atom
     /// inference reports consume
-    /// ([`crate::sae_identifiability::AtomInnerFit`]). `None` until
+    /// ([`crate::terms::sae::identifiability::AtomInnerFit`]). `None` until
     /// [`Self::set_atom_inner_fits`] runs (it needs the reconstruction target
     /// `Z`, available only at the post-fit harness seam where the dispersion is
     /// also profiled); a per-atom `None` means that atom had no active rows or a
     /// degenerate inner design. Read by [`Self::to_residual_gauge_model`], which
-    /// attaches each onto its [`crate::sae_identifiability::FittedAtom`].
-    pub(crate) atom_inner_fits: Option<Vec<Option<crate::sae_identifiability::AtomInnerFit>>>,
+    /// attaches each onto its [`crate::terms::sae::identifiability::FittedAtom`].
+    pub(crate) atom_inner_fits: Option<Vec<Option<crate::terms::sae::identifiability::AtomInnerFit>>>,
 }
 
 impl Clone for SaeManifoldTerm {

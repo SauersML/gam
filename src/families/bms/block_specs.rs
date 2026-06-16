@@ -2324,7 +2324,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
         && matches!(
             joint_gradient,
-            crate::solver::outer_strategy::Derivative::Analytic
+            crate::solver::rho_optimizer::Derivative::Analytic
         );
     // Keep the analytic outer Hessian advertised at large scale. The
     // row-tensor terms below are represented through block-local

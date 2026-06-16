@@ -1685,7 +1685,7 @@ pub fn fit_survival_marginal_slope_terms(
         .as_ref()
         .and_then(|session| session.peek_load_with_source())
         .is_some_and(|loaded| {
-            crate::solver::outer_strategy::cache_entry_would_help_outer(&loaded, setup.rho_dim())
+            crate::solver::rho_optimizer::cache_entry_would_help_outer(&loaded, setup.rho_dim())
         });
     if outer_cache_seed_available {
         log::info!(
@@ -1872,7 +1872,7 @@ pub fn fit_survival_marginal_slope_terms(
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
         && matches!(
             joint_gradient,
-            crate::solver::outer_strategy::Derivative::Analytic
+            crate::solver::rho_optimizer::Derivative::Analytic
         );
     // Survival marginal-slope now exposes exact coefficient-space and ψ-space
     // Hessian directional derivatives as HyperOperators (see the workspace

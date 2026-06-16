@@ -1786,11 +1786,11 @@ fn survival_marginal_slope_advertises_outer_hvp_at_large_psi_dim() {
     assert!(crate::solver::estimate::reml::unified::prefer_outer_hessian_operator(50_001, 2, 32,));
     assert_eq!(
         gradient,
-        crate::solver::outer_strategy::Derivative::Analytic
+        crate::solver::rho_optimizer::Derivative::Analytic
     );
     assert_eq!(
         hessian,
-        crate::solver::outer_strategy::DeclaredHessianForm::Either
+        crate::solver::rho_optimizer::DeclaredHessianForm::Either
     );
 }
 

@@ -68,7 +68,7 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) penalized_objective: f64,
     pub(crate) outer_iterations: usize,
     pub(crate) outer_gradient_norm: Option<f64>,
-    pub(crate) criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
+    pub(crate) criterion_certificate: Option<crate::solver::rho_optimizer::CriterionCertificate>,
     pub(crate) outer_converged: bool,
     pub(crate) context: &'static str,
 }
@@ -768,7 +768,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     }
 
     use crate::estimate::EstimationError;
-    use crate::solver::outer_strategy::{FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem};
+    use crate::solver::rho_optimizer::{FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem};
 
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let outer_inner_cap = options
@@ -1011,7 +1011,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     Ok(OuterEval {
                         cost: eval.objective,
                         gradient: Array1::zeros(rho.len()),
-                        hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                        hessian: crate::solver::rho_optimizer::HessianResult::Unavailable,
                         inner_beta_hint,
                     })
                 }
@@ -1059,13 +1059,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 if eval.objective.is_finite()
                     && eval.gradient.iter().all(|v| v.is_finite())
                     && match &eval.outer_hessian {
-                        crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
+                        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => {
                             hessian.iter().all(|v| v.is_finite())
                         }
-                        crate::solver::outer_strategy::HessianResult::Operator(op) => {
+                        crate::solver::rho_optimizer::HessianResult::Operator(op) => {
                             !request_hessian || op.dim() == rho.len()
                         }
-                        crate::solver::outer_strategy::HessianResult::Unavailable => {
+                        crate::solver::rho_optimizer::HessianResult::Unavailable => {
                             !request_hessian
                         }
                     } =>
@@ -1240,14 +1240,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     // Intentionally LEFT as a hard Err even when escalation is armed.
                     // Unlike the BFGS/value-only paths above, an EFS error does NOT
                     // dead-end the run: it surfaces as a recoverable objective-eval
-                    // error at the fixed-point bridge (outer_strategy.rs:2409-2410
+                    // error at the fixed-point bridge (rho_optimizer.rs:2409-2410
                     // `into_objective_error` -> `ObjectiveEvalError::recoverable`),
                     // so the EFS seed is rejected / the FixedPoint run returns Err,
-                    // and `run_outer`'s fallback cascade (outer_strategy.rs:5297) routes
+                    // and `run_outer`'s fallback cascade (rho_optimizer.rs:5297) routes
                     // to the fixed-point-disabled analytic-gradient BFGS attempt. That
                     // attempt is always present here because custom-family declares an
                     // analytic outer gradient (custom_family.rs:11826), so
-                    // `automatic_fallback_attempts` (outer_strategy.rs:1502) adds it.
+                    // `automatic_fallback_attempts` (rho_optimizer.rs:1502) adds it.
                     // BFGS then evaluates via `eval_outer` / the value-only cost
                     // closure, both of which now retreat-when-armed, so the run reaches
                     // `Ok(converged == false)` and the post-run sampling rung. No
@@ -1340,7 +1340,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 (
                     f64,
                     Array1<f64>,
-                    crate::solver::outer_strategy::HessianResult,
+                    crate::solver::rho_optimizer::HessianResult,
                 ),
                 String,
             > {
@@ -1359,7 +1359,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 }
                 Ok((e.objective, e.gradient, e.outer_hessian))
             };
-            match crate::solver::outer_strategy::outer_gradient_fd_audit(
+            match crate::solver::rho_optimizer::outer_gradient_fd_audit(
                 &rho0,
                 1e-4,
                 |i| format!("rho[{i}]"),

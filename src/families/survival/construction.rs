@@ -694,9 +694,9 @@ impl BaselineDerivativeContract {
     /// by [`run_baseline_theta_optimizer`].
     fn configure(
         self,
-        problem: crate::solver::outer_strategy::OuterProblem,
-    ) -> crate::solver::outer_strategy::OuterProblem {
-        use crate::solver::outer_strategy::{DeclaredHessianForm, Derivative};
+        problem: crate::solver::rho_optimizer::OuterProblem,
+    ) -> crate::solver::rho_optimizer::OuterProblem {
+        use crate::solver::rho_optimizer::{DeclaredHessianForm, Derivative};
         match self {
             // BFGS on a 2–3 dim problem with an exact gradient typically
             // converges in 5–10 outer evaluations.
@@ -737,9 +737,9 @@ where
         &mut (),
         &Array1<f64>,
     )
-        -> Result<crate::solver::outer_strategy::OuterEval, crate::estimate::EstimationError>,
+        -> Result<crate::solver::rho_optimizer::OuterEval, crate::estimate::EstimationError>,
 {
-    use crate::solver::outer_strategy::OuterProblem;
+    use crate::solver::rho_optimizer::OuterProblem;
     let Some(seed) = survival_baseline_theta_from_config(initial)? else {
         return Ok(initial.clone());
     };
@@ -767,7 +767,7 @@ where
                 &mut (),
                 &Array1<f64>,
             )
-                -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
+                -> Result<crate::solver::rho_optimizer::EfsEval, crate::estimate::EstimationError>,
         >,
     );
     let result = problem
@@ -790,7 +790,7 @@ where
 /// Shared engine for the two derivative-carrying baseline-config optimizers.
 ///
 /// Both `…_with_gradient_only` and `…_with_gradient` route an objective that
-/// returns a fully-populated [`OuterEval`](crate::solver::outer_strategy::OuterEval)
+/// returns a fully-populated [`OuterEval`](crate::solver::rho_optimizer::OuterEval)
 /// (cost + analytic gradient, optionally + analytic Hessian) for a given
 /// config. Everything downstream of that — the `Rc<RefCell>` sharing that lets
 /// the same user closure back both the `cost_fn` and `eval_fn`, the θ→config
@@ -806,7 +806,7 @@ fn run_baseline_theta_optimizer_with_eval<F>(
     objective: F,
 ) -> Result<SurvivalBaselineConfig, String>
 where
-    F: FnMut(&SurvivalBaselineConfig) -> Result<crate::solver::outer_strategy::OuterEval, String>,
+    F: FnMut(&SurvivalBaselineConfig) -> Result<crate::solver::rho_optimizer::OuterEval, String>,
 {
     let target = initial.target;
     let engine_context = context.to_string();
@@ -814,7 +814,7 @@ where
     let eval_at = move |obj: &std::rc::Rc<std::cell::RefCell<F>>,
                         theta: &Array1<f64>|
           -> Result<
-        crate::solver::outer_strategy::OuterEval,
+        crate::solver::rho_optimizer::OuterEval,
         crate::estimate::EstimationError,
     > {
         let cfg = survival_baseline_config_from_theta(target, theta)
@@ -828,7 +828,7 @@ where
                 theta.len()
             )));
         }
-        if let crate::solver::outer_strategy::HessianResult::Analytic(ref h) = eval.hessian {
+        if let crate::solver::rho_optimizer::HessianResult::Analytic(ref h) = eval.hessian {
             if h.nrows() != theta.len() || h.ncols() != theta.len() {
                 return Err(crate::estimate::EstimationError::InvalidInput(format!(
                     "{engine_context}: baseline Hessian dimension mismatch: got {}x{}, expected {}x{}",
@@ -868,7 +868,7 @@ pub fn optimize_survival_baseline_config_with_gradient_only<F>(
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
 {
-    use crate::solver::outer_strategy::{HessianResult, OuterEval};
+    use crate::solver::rho_optimizer::{HessianResult, OuterEval};
     run_baseline_theta_optimizer_with_eval(
         initial,
         context,
@@ -897,7 +897,7 @@ pub fn optimize_survival_baseline_config_with_gradient<F>(
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>, Array2<f64>), String>,
 {
-    use crate::solver::outer_strategy::{HessianResult, OuterEval};
+    use crate::solver::rho_optimizer::{HessianResult, OuterEval};
     run_baseline_theta_optimizer_with_eval(
         initial,
         context,

@@ -1494,11 +1494,11 @@ fn survival_location_scale_planner_keeps_analytic_hessian_at_large_scale_dimensi
         crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
     assert_eq!(
         gradient,
-        crate::solver::outer_strategy::Derivative::Analytic
+        crate::solver::rho_optimizer::Derivative::Analytic
     );
     assert_eq!(
         hessian,
-        crate::solver::outer_strategy::DeclaredHessianForm::Either,
+        crate::solver::rho_optimizer::DeclaredHessianForm::Either,
         "large survival location-scale fits must not be demoted to BFGS when the explicit HVP operator covers the dimensions"
     );
 }

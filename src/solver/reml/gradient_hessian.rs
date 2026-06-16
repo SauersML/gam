@@ -379,7 +379,7 @@ impl<'a> RemlState<'a> {
             return Err(EstimationError::RemlOptimizationFailed(format!(
                 "{} EFS single-loop bias guard fired: bias_proxy={:.3e} \
                  threshold={:.3e} consecutive_limit={} rho_dim={}",
-                crate::solver::outer_strategy::EFS_FIRST_ORDER_FALLBACK_MARKER,
+                crate::solver::rho_optimizer::EFS_FIRST_ORDER_FALLBACK_MARKER,
                 diagnostics.bias_proxy,
                 EFS_SINGLE_LOOP_BIAS_THRESHOLD,
                 EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT,
@@ -6649,7 +6649,7 @@ pub(crate) const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
 /// canonicalizes to (mantissa MSB = 1, sign = 0, exponent = all 1s).
 ///
 /// `pub(crate)` so the bridge's `InnerProgressFeedback::snapshot` (in
-/// `crate::solver::outer_strategy`) can reference the same constant —
+/// `crate::solver::rho_optimizer`) can reference the same constant —
 /// both ends of this atomic must use the same sentinel discipline,
 /// otherwise a residual-of-zero round-trips correctly through the
 /// writer but the reader treats it as "no signal" and silently

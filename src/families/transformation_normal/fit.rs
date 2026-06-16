@@ -600,7 +600,7 @@ pub fn fit_transformation_normal(
             }
             Ok(eval.efs_eval)
         },
-        |_beta: &Array1<f64>| Ok(crate::solver::outer_strategy::SeedOutcome::NoSlot),
+        |_beta: &Array1<f64>| Ok(crate::solver::rho_optimizer::SeedOutcome::NoSlot),
     )?;
 
     let mut fit = solved.fit;

@@ -635,7 +635,7 @@ mod tests {
     ///   - after one failure the key is not yet stable (min_count=2)
     ///   - after two identical failures it fires
     ///   - if the third failure deviates the key would no longer be uniform
-    /// The seed loop in `outer_strategy.rs` mirrors this exact pattern,
+    /// The seed loop in `rho_optimizer.rs` mirrors this exact pattern,
     /// so the test pins the behaviour without needing to spin up the
     /// full outer optimiser.
     #[test]

@@ -5055,7 +5055,7 @@ mod tests {
     #[test]
     fn latent_family_planner_keeps_outer_hessian_at_large_n() {
         use crate::families::custom_family::custom_family_outer_derivatives;
-        use crate::solver::outer_strategy::{DeclaredHessianForm, Derivative};
+        use crate::solver::rho_optimizer::{DeclaredHessianForm, Derivative};
 
         let options = BlockwiseFitOptions::default();
         let large_n = 50_001;

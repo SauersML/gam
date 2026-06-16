@@ -132,18 +132,18 @@ pub(crate) fn pullback_labeled_outer_eval(
     }
     if eval_mode == EvalMode::ValueGradientHessian {
         result.outer_hessian = match result.outer_hessian {
-            crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
-                crate::solver::outer_strategy::HessianResult::Analytic(aggregate_labeled_hessian(
+            crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => {
+                crate::solver::rho_optimizer::HessianResult::Analytic(aggregate_labeled_hessian(
                     &hessian, layout,
                 )?)
             }
-            crate::solver::outer_strategy::HessianResult::Operator(operator) => {
-                crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
+            crate::solver::rho_optimizer::HessianResult::Operator(operator) => {
+                crate::solver::rho_optimizer::HessianResult::Operator(Arc::new(
                     LabeledOuterHessianOperator::new(operator, layout),
                 ))
             }
-            crate::solver::outer_strategy::HessianResult::Unavailable => {
-                crate::solver::outer_strategy::HessianResult::Unavailable
+            crate::solver::rho_optimizer::HessianResult::Unavailable => {
+                crate::solver::rho_optimizer::HessianResult::Unavailable
             }
         };
     }

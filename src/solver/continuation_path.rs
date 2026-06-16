@@ -64,7 +64,7 @@
 //!   The path therefore makes "cold and warm reach the same criterion" a
 //!   structural property rather than a tolerance the caller must check.
 //! * **#976 — hardening.** Two hooks the wiring agent (editing
-//!   `outer_strategy.rs` / `atom_selection.rs`) calls per inner iteration:
+//!   `rho_optimizer.rs` / `atom_selection.rs`) calls per inner iteration:
 //!   a **trust-region cap on the assignment logits**
 //!   ([`LogitTrustRegion`]) so a single Newton step can never fling the
 //!   relaxed assignment across the argmax cliff; and an **active-mass-floor
@@ -82,7 +82,7 @@ use ndarray::{Array1, ArrayView2};
 use crate::solver::estimate::reml::continuation::{
     ContinuationFailure, ContinuationState, PATH_BUDGET, continue_path_from, fit_with_continuation,
 };
-use crate::solver::outer_strategy::{OuterEvalOrder, OuterObjective};
+use crate::solver::rho_optimizer::{OuterEvalOrder, OuterObjective};
 use crate::terms::analytic_penalties::ScalarWeightSchedule;
 use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
 
@@ -108,7 +108,7 @@ pub const CONTINUATION_WAYPOINTS: usize = 8;
 /// handed to the solver half-annealed, the routing-collapse signature.
 pub const REENTRY_BACKOFF: f64 = 1.0 / CONTINUATION_WAYPOINTS as f64;
 
-/// Total leg budget for one coupled walk (`outer_strategy.rs` drives
+/// Total leg budget for one coupled walk (`rho_optimizer.rs` drives
 /// [`ContinuationPath::step`] at most this many times per seed). Two legs per
 /// waypoint: a clean walk uses `CONTINUATION_WAYPOINTS` descents, and each
 /// homotopy-floor bounce costs ~2 extra legs at the one-notch
@@ -260,7 +260,7 @@ pub struct ScalarLegTargets {
 
 // ─────────────────────────────────────────────────────────────────────────
 //  Hardening hook interfaces (#976). Defined here; implemented at the call
-//  sites by the wiring agent (outer_strategy.rs / atom_selection.rs).
+//  sites by the wiring agent (rho_optimizer.rs / atom_selection.rs).
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Per-iteration trust-region cap on the assignment logits.
@@ -426,7 +426,7 @@ impl ReseedLedger {
 // ─────────────────────────────────────────────────────────────────────────
 //  Regime-escalation view of re-entry (#969 seed-cascade demotion).
 //
-//  The seed cascade in `outer_strategy.rs` observes the path through a coarser
+//  The seed cascade in `rho_optimizer.rs` observes the path through a coarser
 //  lens than the per-waypoint `s`: it only needs to know "which heavier regime
 //  did this seed get demoted to". `PathRegime` is that coarse view — a band of
 //  the path parameter `s` — and `PathDemotionReason` records *why* the cascade
@@ -678,7 +678,7 @@ impl ContinuationPath {
     }
 
     /// The base radius the per-iteration assignment-logit trust region is built
-    /// from (`outer_strategy.rs` / `atom_selection.rs` hardening hook). This is
+    /// from (`rho_optimizer.rs` / `atom_selection.rs` hardening hook). This is
     /// the ∞-norm logit step radius at the current waypoint; heavier regimes
     /// (after a demotion / re-entry) cool τ and so hand back a tighter radius,
     /// shrinking every atom's logit cap with no separate knob.

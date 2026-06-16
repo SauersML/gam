@@ -176,8 +176,8 @@ pub struct SaeManifoldFitDiagnostics {
     /// ([`crate::inference::atom_lens::atom_two_lens`]).
     pub atom_two_lens: crate::inference::atom_lens::AtomTwoLensReport,
     /// Residual-gauge certificate: which symmetry group the fit is identified up
-    /// to ([`crate::sae_identifiability::residual_gauge`]).
-    pub residual_gauge: crate::sae_identifiability::ResidualGaugeReport,
+    /// to ([`crate::terms::sae::identifiability::residual_gauge`]).
+    pub residual_gauge: crate::terms::sae::identifiability::ResidualGaugeReport,
     /// Empirical curved-dictionary certificate inputs (#1008). Present when the
     /// caller supplies the fitted reconstruction dispersion needed for the SNR
     /// proxy; absent for legacy callers that only need the existing diagnostics.
@@ -188,7 +188,7 @@ pub struct SaeManifoldFitDiagnostics {
     /// the atom's inner-decoder smooth was harvested at fit time (the caller ran
     /// [`SaeManifoldTerm::set_atom_inner_fits`] and the inner penalized Hessian
     /// was SPD on a non-empty active set); otherwise they degrade to `None`.
-    pub atom_inference: Vec<crate::sae_identifiability::AtomInferenceReport>,
+    pub atom_inference: Vec<crate::terms::sae::identifiability::AtomInferenceReport>,
 }
 
 /// Honest trust-diagnostics payload for the Python `diagnostics` block (#1005).

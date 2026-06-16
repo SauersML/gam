@@ -10,7 +10,7 @@
 //! `eval_with_order` runs the inner P-IRLS. Returned errors flow
 //! through `inner_status::classify_inner_error` so the rollback
 //! decision tree matches the structured `InnerFailure` enum that
-//! `outer_strategy.rs` already aggregates into `StartupStats`.
+//! `rho_optimizer.rs` already aggregates into `StartupStats`.
 //!
 //! # Failure rollback (per `InnerFailure` variant)
 //!
@@ -37,7 +37,7 @@ use ndarray::Array1;
 use crate::families::custom_family::KktRefusalDiagnosis;
 use crate::solver::estimate::EstimationError;
 use crate::solver::inner_status::{InnerFailure, classify_inner_error};
-use crate::solver::outer_strategy::{OuterEval, OuterEvalOrder, OuterObjective};
+use crate::solver::rho_optimizer::{OuterEval, OuterEvalOrder, OuterObjective};
 
 /// Hard ceiling on the number of ρ steps along a single continuation
 /// path. Past this we surface the last `InnerFailure` rather than the
@@ -779,7 +779,7 @@ mod tests {
     // queue of `Result<&'static str_or_ok, &'static str_failure>`. The
     // mock records the ρ at each call so step counting can be asserted.
 
-    use crate::solver::outer_strategy::{
+    use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, HessianResult, OuterCapability,
     };
 
@@ -866,7 +866,7 @@ mod tests {
         fn seed_inner_state(
             &mut self,
             beta: &Array1<f64>,
-        ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError> {
+        ) -> Result<crate::solver::rho_optimizer::SeedOutcome, EstimationError> {
             // Contract (see `prime_outer_seed_with_budget` / `eval_step` docstrings):
             // an empty-β seed means "no warm-start available, use your
             // own cold default" and must be accepted as a no-op. Only
@@ -876,7 +876,7 @@ mod tests {
             }
             self.seed_calls += 1;
             self.last_seeded_beta_len = Some(beta.len());
-            Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
+            Ok(crate::solver::rho_optimizer::SeedOutcome::Installed)
         }
     }
 
@@ -1145,7 +1145,7 @@ mod tests {
     //  abort the seed.
     // ─────────────────────────────────────────────────────────────────
 
-    use crate::solver::outer_strategy::ClosureObjective;
+    use crate::solver::rho_optimizer::ClosureObjective;
 
     #[test]
     pub(crate) fn closure_objective_publishing_inner_beta_hint_without_seed_hook_is_acceptable() {
@@ -1160,9 +1160,9 @@ mod tests {
         let upper = Array1::from_vec(vec![10.0]);
         let obj = ClosureObjective {
             state: (),
-            cap: crate::solver::outer_strategy::OuterCapability {
-                gradient: crate::solver::outer_strategy::Derivative::Analytic,
-                hessian: crate::solver::outer_strategy::DeclaredHessianForm::Unavailable,
+            cap: crate::solver::rho_optimizer::OuterCapability {
+                gradient: crate::solver::rho_optimizer::Derivative::Analytic,
+                hessian: crate::solver::rho_optimizer::DeclaredHessianForm::Unavailable,
                 n_params: 1,
                 psi_dim: 0,
                 fixed_point_available: false,
@@ -1183,7 +1183,7 @@ mod tests {
                 fn(
                     &mut (),
                     &Array1<f64>,
-                    crate::solver::outer_strategy::OuterEvalOrder,
+                    crate::solver::rho_optimizer::OuterEvalOrder,
                 ) -> Result<OuterEval, EstimationError>,
             >,
             reset_fn: None::<fn(&mut ())>,
@@ -1192,7 +1192,7 @@ mod tests {
                     &mut (),
                     &Array1<f64>,
                 )
-                    -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
+                    -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError>,
             >,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<
@@ -1200,7 +1200,7 @@ mod tests {
                     &mut (),
                     &Array1<f64>,
                 )
-                    -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>,
+                    -> Result<crate::solver::rho_optimizer::SeedOutcome, EstimationError>,
             >,
             continuation_prewarm: true,
         };
@@ -1233,9 +1233,9 @@ mod tests {
 
         let obj = ClosureObjective {
             state: (),
-            cap: crate::solver::outer_strategy::OuterCapability {
-                gradient: crate::solver::outer_strategy::Derivative::Analytic,
-                hessian: crate::solver::outer_strategy::DeclaredHessianForm::Unavailable,
+            cap: crate::solver::rho_optimizer::OuterCapability {
+                gradient: crate::solver::rho_optimizer::Derivative::Analytic,
+                hessian: crate::solver::rho_optimizer::DeclaredHessianForm::Unavailable,
                 n_params: 1,
                 psi_dim: 0,
                 fixed_point_available: false,
@@ -1256,7 +1256,7 @@ mod tests {
                 fn(
                     &mut (),
                     &Array1<f64>,
-                    crate::solver::outer_strategy::OuterEvalOrder,
+                    crate::solver::rho_optimizer::OuterEvalOrder,
                 ) -> Result<OuterEval, EstimationError>,
             >,
             reset_fn: None::<fn(&mut ())>,
@@ -1265,7 +1265,7 @@ mod tests {
                     &mut (),
                     &Array1<f64>,
                 )
-                    -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
+                    -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError>,
             >,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<
@@ -1273,7 +1273,7 @@ mod tests {
                     &mut (),
                     &Array1<f64>,
                 )
-                    -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>,
+                    -> Result<crate::solver::rho_optimizer::SeedOutcome, EstimationError>,
             >,
             continuation_prewarm: true,
         };

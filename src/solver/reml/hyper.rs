@@ -1054,12 +1054,12 @@ impl<'a> RemlState<'a> {
         theta: &Array1<f64>,
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
-        order: crate::solver::outer_strategy::OuterEvalOrder,
+        order: crate::solver::rho_optimizer::OuterEvalOrder,
     ) -> Result<
         (
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
+            crate::solver::rho_optimizer::HessianResult,
         ),
         EstimationError,
     > {
@@ -1069,7 +1069,7 @@ impl<'a> RemlState<'a> {
         if !hyper_dirs.is_empty() {
             let requested_hessian = matches!(
                 order,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
             );
             // Firth pair Hessian terms are now available via Primitive A
             // (hphi_tau_tau_partial_apply) and Primitive B
@@ -1101,17 +1101,17 @@ impl<'a> RemlState<'a> {
                 );
             }
             let eval_mode = match if downgrade_exact_tau_tau {
-                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient
             } else {
                 order
             } {
-                crate::solver::outer_strategy::OuterEvalOrder::Value => {
+                crate::solver::rho_optimizer::OuterEvalOrder::Value => {
                     super::unified::EvalMode::ValueOnly
                 }
-                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => {
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => {
                     super::unified::EvalMode::ValueAndGradient
                 }
-                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian => {
                     super::unified::EvalMode::ValueGradientHessian
                 }
             };

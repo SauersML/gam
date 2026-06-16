@@ -55,7 +55,7 @@ pub fn make_beta_seed_validator(
 ) -> impl FnMut(
     &Array1<f64>,
 ) -> Result<
-    crate::solver::outer_strategy::SeedOutcome,
+    crate::solver::rho_optimizer::SeedOutcome,
     crate::solver::estimate::EstimationError,
 > + '_ {
     move |beta: &Array1<f64>| {
@@ -66,7 +66,7 @@ pub fn make_beta_seed_validator(
         // β for that step) — never an error that aborts the fit. Staging a
         // finite β always succeeds, so the contract reply is `Installed`.
         pending.replace(Some(beta.clone()));
-        Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
+        Ok(crate::solver::rho_optimizer::SeedOutcome::Installed)
     }
 }
 

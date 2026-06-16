@@ -44,7 +44,7 @@ pub struct ExactNewtonJointGradientEvaluation {
 pub struct BatchedOuterHessianTerms {
     /// Exact profiled outer Hessian over θ = (ρ, ψ), assembled or exposed in
     /// operator form by the family in one amortized evaluation.
-    pub outer_hessian: crate::solver::outer_strategy::HessianResult,
+    pub outer_hessian: crate::solver::rho_optimizer::HessianResult,
 }
 
 pub struct BatchedOuterGradientTerms {
@@ -777,7 +777,7 @@ pub trait CustomFamily {
         Ok(self
             .outer_hyper_hessian_operator(specs)
             .map(|operator| BatchedOuterHessianTerms {
-                outer_hessian: crate::solver::outer_strategy::HessianResult::Operator(operator),
+                outer_hessian: crate::solver::rho_optimizer::HessianResult::Operator(operator),
             }))
     }
 
@@ -856,7 +856,7 @@ pub trait CustomFamily {
     fn outer_hyper_hessian_operator(
         &self,
         specs: &[ParameterBlockSpec],
-    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
         assert_valid_blockspecs(specs, "outer hyper-Hessian operator");
         None
     }

@@ -91,7 +91,7 @@ impl SaeManifoldTerm {
     /// (largest column 2-norm of `B_k`) against its partial residual
     /// `e_{i} = z_i − fitted_i + a_{ik} g_k(t_i)` on channel `j`, holding all
     /// other atoms and the assignment fixed at the fitted optimum — exactly the
-    /// fixed snapshot ([`crate::sae_identifiability::AtomInnerFit`]) the Riesz
+    /// fixed snapshot ([`crate::terms::sae::identifiability::AtomInnerFit`]) the Riesz
     /// debiasing and Bartlett correction read.
     ///
     /// A pure read of the fitted state: it mutates only the diagnostic
@@ -149,7 +149,7 @@ impl SaeManifoldTerm {
             }
         }
 
-        let mut inner_fits: Vec<Option<crate::sae_identifiability::AtomInnerFit>> =
+        let mut inner_fits: Vec<Option<crate::terms::sae::identifiability::AtomInnerFit>> =
             Vec::with_capacity(k_atoms);
         for atom_idx in 0..k_atoms {
             inner_fits.push(self.build_atom_inner_fit(
@@ -177,7 +177,7 @@ impl SaeManifoldTerm {
         decoded: ArrayView3<'_, f64>,
         fitted: ArrayView2<'_, f64>,
         dispersion: f64,
-    ) -> Result<Option<crate::sae_identifiability::AtomInnerFit>, String> {
+    ) -> Result<Option<crate::terms::sae::identifiability::AtomInnerFit>, String> {
         let atom = &self.atoms[atom_idx];
         let n = atom.n_obs();
         let m = atom.basis_size();
@@ -293,7 +293,7 @@ impl SaeManifoldTerm {
         let peak_design_row = design.row(peak_slot).to_owned();
         let mode_design_row = design.row(mode_slot).to_owned();
 
-        Ok(Some(crate::sae_identifiability::AtomInnerFit {
+        Ok(Some(crate::terms::sae::identifiability::AtomInnerFit {
             design,
             derivative_design,
             beta,
@@ -452,7 +452,7 @@ impl SaeManifoldTerm {
     /// Build the additive post-fit diagnostic report for this fitted term: the
     /// two-score per-atom [`AtomTwoLensReport`](crate::inference::atom_lens::AtomTwoLensReport)
     /// (presence / behavioral coupling / discrepancy) and the residual-gauge
-    /// [`ResidualGaugeReport`](crate::sae_identifiability::ResidualGaugeReport)
+    /// [`ResidualGaugeReport`](crate::terms::sae::identifiability::ResidualGaugeReport)
     /// certificate.
     ///
     /// Both reports are read through the same single metric
@@ -502,13 +502,13 @@ impl SaeManifoldTerm {
         // error. Magic-by-default either way: the choice is derived from the fit,
         // never a flag.
         let views = self.atom_parameter_views();
-        let ops: Vec<Option<crate::sae_identifiability::OrbitPenaltyOperator>> =
+        let ops: Vec<Option<crate::terms::sae::identifiability::OrbitPenaltyOperator>> =
             if isometry_pin_active {
                 views
                     .iter()
                     .map(|view| {
                         view.as_ref().and_then(|v| {
-                            crate::sae_identifiability::isometry_orbit_penalty_operator(v, 1.0)
+                            crate::terms::sae::identifiability::isometry_orbit_penalty_operator(v, 1.0)
                         })
                     })
                     .collect()
@@ -519,13 +519,13 @@ impl SaeManifoldTerm {
             // The pin-active path consumes the per-row Jacobian curvature
             // directly (the certificate_model retains it under a pin), so route
             // through the non-streamed exact entry point.
-            crate::sae_identifiability::residual_gauge_exact(&certificate_model, &views, &ops)?
+            crate::terms::sae::identifiability::residual_gauge_exact(&certificate_model, &views, &ops)?
         } else {
             let (curvature_gram, root_rows) = streamed_curvature.ok_or_else(|| {
                 "fit_diagnostics_report: missing streamed residual-gauge curvature for unpinned exact path"
                     .to_string()
             })?;
-            crate::sae_identifiability::residual_gauge_exact_from_curvature_gram(
+            crate::terms::sae::identifiability::residual_gauge_exact_from_curvature_gram(
                 &certificate_model,
                 &views,
                 &ops,
@@ -541,7 +541,7 @@ impl SaeManifoldTerm {
         // harvested inner fit degrade their inference fields to `None` inside
         // `atom_inference_reports`, so this is always populated (one entry per
         // atom) and never gated by a flag.
-        let atom_inference = crate::sae_identifiability::atom_inference_reports(&certificate_model);
+        let atom_inference = crate::terms::sae::identifiability::atom_inference_reports(&certificate_model);
 
         Ok(SaeManifoldFitDiagnostics {
             atom_two_lens,
@@ -708,7 +708,7 @@ impl SaeManifoldTerm {
     /// as exactly certified).
     pub(crate) fn atom_parameter_views(
         &self,
-    ) -> Vec<Option<crate::sae_identifiability::AtomParameterView>> {
+    ) -> Vec<Option<crate::terms::sae::identifiability::AtomParameterView>> {
         let assignments = self.assignment.assignments();
         let n = self.n_obs();
         self.atoms
@@ -737,7 +737,7 @@ impl SaeManifoldTerm {
                     .as_ref()
                     .and_then(|evaluator| evaluator.second_jet_dyn(coords.view()))
                     .and_then(|res| res.ok());
-                Some(crate::sae_identifiability::AtomParameterView {
+                Some(crate::terms::sae::identifiability::AtomParameterView {
                     basis_values: atom.basis_values.clone(),
                     basis_jacobian: atom.basis_jacobian.clone(),
                     decoder: atom.decoder_coefficients.clone(),
@@ -750,7 +750,7 @@ impl SaeManifoldTerm {
     }
 
     /// Lower this fitted term into the self-contained
-    /// [`FittedSaeManifold`](crate::sae_identifiability::FittedSaeManifold) the
+    /// [`FittedSaeManifold`](crate::terms::sae::identifiability::FittedSaeManifold) the
     /// residual-gauge certificate consumes.
     ///
     /// The certificate's parameter space is the per-atom decoder **frame** — the
@@ -774,7 +774,7 @@ impl SaeManifoldTerm {
         isometry_pin_active: bool,
     ) -> Result<
         (
-            crate::sae_identifiability::FittedSaeManifold,
+            crate::terms::sae::identifiability::FittedSaeManifold,
             Option<(Array2<f64>, usize)>,
         ),
         String,

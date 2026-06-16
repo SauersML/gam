@@ -3,7 +3,7 @@
 //! ## Why this module exists
 //!
 //! Before this driver landed, the outer REML BFGS optimiser over the smoothing
-//! parameter vector `ρ` ran on the host orchestrator (`outer_strategy::run_outer`
+//! parameter vector `ρ` ran on the host orchestrator (`rho_optimizer::run_outer`
 //! → `Solver::Bfgs`). Each outer iteration evaluated `(cost, grad)` by hopping
 //! back into the CPU REML evaluator, which in turn dispatched the inner P-IRLS
 //! loop, the Hutchinson trace estimator, the arrow-Schur batched Cholesky, and
@@ -68,7 +68,7 @@ use crate::solver::estimate::EstimationError;
 #[derive(Clone, Debug)]
 pub struct RemlOuterGpuInput {
     /// Initial ρ to start BFGS from. Same convention as the host BFGS branch
-    /// in `outer_strategy::run_outer_with_plan` — already projected onto the
+    /// in `rho_optimizer::run_outer_with_plan` — already projected onto the
     /// bounds box at the dispatch site.
     pub seed_rho: Array1<f64>,
     /// Per-axis lower / upper bounds on ρ. Same `(lo, hi)` shape the host
@@ -94,7 +94,7 @@ pub struct RemlOuterGpuInput {
 }
 
 /// Result of the device-resident outer driver. Shaped to feed
-/// `outer_strategy::solution_into_outer_result` so the host dispatch site can
+/// `rho_optimizer::solution_into_outer_result` so the host dispatch site can
 /// surface the device-resident path through the same `OuterResult` envelope as
 /// the host BFGS branch.
 #[derive(Clone, Debug)]

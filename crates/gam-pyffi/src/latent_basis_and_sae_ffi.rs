@@ -2453,7 +2453,7 @@ fn sae_manifold_fit_inner<'py>(
         ridge_beta,
     );
     let problem =
-        gam::solver::outer_strategy::OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
+        gam::solver::rho_optimizer::OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
     problem
         .run(&mut objective, "SAE manifold")
         .map_err(estimation_error_to_pyerr)?;

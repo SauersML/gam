@@ -36,7 +36,7 @@
 
 use crate::estimate::EstimationError;
 use crate::inference::psis::pareto_smooth_weights;
-use crate::solver::outer_strategy::OuterObjective;
+use crate::solver::rho_optimizer::OuterObjective;
 use ndarray::{Array1, Array2};
 
 /// Reliability tier read off the Pareto tail-shape `k̂` of the `ρ`-importance

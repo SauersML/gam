@@ -109,7 +109,11 @@ fn dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
     Ok(out)
 }
 
-fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usize, String> {
+pub(crate) fn checked_dense_nbytes(
+    nrows: usize,
+    ncols: usize,
+    context: &str,
+) -> Result<usize, String> {
     nrows
         .checked_mul(ncols)
         .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
@@ -578,7 +582,7 @@ fn sparse_csr_weighted_xtwx_rows(
     xtwx
 }
 
-fn streaming_sparse_csc_xt_diag_x(
+pub(crate) fn streaming_sparse_csc_xt_diag_x(
     col_ptr: &[usize],
     row_idx: &[usize],
     vals: &[f64],

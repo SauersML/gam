@@ -5791,7 +5791,7 @@ pub(crate) struct BorrowedJointDerivProvider<'a> {
     /// dispatch cost.
     pub(crate) compute_d2h_many: Option<&'a DriftSecondDerivManyFn<'a>>,
     pub(crate) family_outer_hessian_operator:
-        Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
+        Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>>,
 }
 
 /// Shared `(term1, term2)` second-derivative correction assembly used by both
@@ -5931,7 +5931,7 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 
     fn family_outer_hessian_operator(
         &self,
-    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
         self.family_outer_hessian_operator.clone()
     }
 }
@@ -5957,7 +5957,7 @@ pub(crate) struct OwnedJointDerivProvider {
         >,
     >,
     pub(crate) family_outer_hessian_operator:
-        Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
+        Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>>,
 }
 
 impl HessianDerivativeProvider for OwnedJointDerivProvider {
@@ -6081,7 +6081,7 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 
     fn family_outer_hessian_operator(
         &self,
-    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
         self.family_outer_hessian_operator.clone()
     }
 }

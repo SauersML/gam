@@ -28,7 +28,7 @@
 //! reference manifold: rotation + reflection (`O(2)`) for the circle,
 //! reflection + translation for the interval. The certificate records this
 //! with the `PinnedByCanonicalization` provenance
-//! ([`crate::sae_identifiability::VerdictProvenance`]).
+//! ([`crate::terms::sae::identifiability::VerdictProvenance`]).
 //!
 //! #1019 stage 2 (`d = 2`, torus): the canonical representative of the
 //! `Diff(T²)` orbit is the **minimum-isometry-defect flow** chart. The chart

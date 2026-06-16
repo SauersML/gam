@@ -539,7 +539,7 @@ pub(crate) fn store_persistent_custom_family_warm_start(
     // box (|ρ_i| ≥ 9). Those iterates are either at a legitimate active
     // bound or a non-converged intermediate; either way they make poor
     // seed material because the load-side clamp pulls them back into
-    // the interior anyway (see `outer_strategy.rs` `[CACHE] hit-clamp`).
+    // the interior anyway (see `rho_optimizer.rs` `[CACHE] hit-clamp`).
     const SATURATION_THRESHOLD: f64 = 9.0;
     if warm_start
         .rho
