@@ -1,37 +1,3 @@
-/// Require a breakpoint sequence suitable for span lookup: finite, strictly
-/// increasing, and long enough to define at least one span.
-pub(crate) fn validate_breakpoints(breakpoints: &[f64], label: &str) -> Result<(), String> {
-    if breakpoints.len() < 2 {
-        return Err(format!("{label} requires at least two breakpoints"));
-    }
-    if let Some((idx, window)) = breakpoints.windows(2).enumerate().find(|(_, window)| {
-        !window[0].is_finite() || !window[1].is_finite() || window[0] >= window[1]
-    }) {
-        return Err(format!(
-            "{label} requires strictly increasing finite breakpoints; breakpoints[{idx}]={:.6}, breakpoints[{}]={:.6}",
-            window[0],
-            idx + 1,
-            window[1]
-        ));
-    }
-    Ok::<(), _>(())
-}
-
-/// Deduplicate an ordered knot sequence into strictly increasing breakpoints.
-pub(crate) fn breakpoints_from_knots(knots: &[f64], label: &str) -> Result<Vec<f64>, String> {
-    let mut breakpoints = Vec::new();
-    for &knot in knots {
-        if breakpoints
-            .last()
-            .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
-        {
-            breakpoints.push(knot);
-        }
-    }
-    validate_breakpoints(&breakpoints, label)?;
-    Ok(breakpoints)
-}
-
 /// Select the span containing `value`, using `[left, right)` for every span
 /// except the final span, which is right-closed.
 pub(crate) fn span_index_for_breakpoints(
@@ -58,15 +24,7 @@ pub(crate) fn span_index_for_breakpoints(
 
 #[cfg(test)]
 mod tests {
-    use super::{breakpoints_from_knots, span_index_for_breakpoints};
-
-    #[test]
-    fn deduplicates_knots_into_breakpoints() {
-        assert_eq!(
-            breakpoints_from_knots(&[-2.0, -2.0, 0.0, 1.5, 1.5, 3.0], "test breakpoints").unwrap(),
-            vec![-2.0, 0.0, 1.5, 3.0]
-        );
-    }
+    use super::span_index_for_breakpoints;
 
     /// Documents the `span_index_for_breakpoints` helper convention only.
     /// Specific design evaluators may override this for endpoint convention.

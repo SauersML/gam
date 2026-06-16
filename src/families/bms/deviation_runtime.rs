@@ -2,8 +2,43 @@ use crate::basis::create_ispline_derivative_dense;
 use crate::faer_ndarray::{FaerEigh, fast_ab};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::pirls::LinearInequalityConstraints;
-use crate::util::span::{breakpoints_from_knots, span_index_for_breakpoints};
+use crate::util::span::span_index_for_breakpoints;
 use ndarray::{Array1, Array2, ArrayView2};
+
+/// Require a breakpoint sequence suitable for BMS span lookup: finite,
+/// strictly increasing, and long enough to define at least one span.
+fn validate_breakpoints(breakpoints: &[f64], label: &str) -> Result<(), String> {
+    if breakpoints.len() < 2 {
+        return Err(format!("{label} requires at least two breakpoints"));
+    }
+    if let Some((idx, window)) = breakpoints.windows(2).enumerate().find(|(_, window)| {
+        !window[0].is_finite() || !window[1].is_finite() || window[0] >= window[1]
+    }) {
+        return Err(format!(
+            "{label} requires strictly increasing finite breakpoints; breakpoints[{idx}]={:.6}, breakpoints[{}]={:.6}",
+            window[0],
+            idx + 1,
+            window[1]
+        ));
+    }
+    Ok::<(), _>(())
+}
+
+/// Deduplicate an ordered BMS knot sequence into strictly increasing
+/// breakpoints.
+fn breakpoints_from_knots(knots: &[f64], label: &str) -> Result<Vec<f64>, String> {
+    let mut breakpoints = Vec::new();
+    for &knot in knots {
+        if breakpoints
+            .last()
+            .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
+        {
+            breakpoints.push(knot);
+        }
+    }
+    validate_breakpoints(&breakpoints, label)?;
+    Ok(breakpoints)
+}
 
 /// Round-off tolerance on the minimum monotonicity-derivative slack. The
 /// constraints are constructed with a positive required margin
