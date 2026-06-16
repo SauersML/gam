@@ -52,7 +52,7 @@ use rand_distr::{Distribution, Normal, Uniform};
 use std::path::Path;
 
 /// Geographic (lat, lon) in degrees → unit vector on S², pole on +z. Mirrors
-/// `gam::terms::sphere_gpu::latlon_to_xyz_host`: x=cos(lat)cos(lon), y=cos(lat)sin(lon),
+/// `gam::terms::basis::sphere_gpu::latlon_to_xyz_host`: x=cos(lat)cos(lon), y=cos(lat)sin(lon),
 /// z=sin(lat). Equivariance depends on using the SAME map gam uses internally.
 fn latlon_to_xyz(lat_deg: f64, lon_deg: f64) -> [f64; 3] {
     let lat = lat_deg.to_radians();

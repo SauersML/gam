@@ -629,7 +629,7 @@ pub fn solve_newton_direction_implicit<F>(
     apply_xtwx: F,
     xtwx_diag: ArrayView1<'_, f64>,
     dense_penalties: &[(f64, &Array2<f64>)],
-    op_penalties: &[(f64, &dyn crate::terms::penalty_op::PenaltyOp)],
+    op_penalties: &[(f64, &dyn crate::terms::penalties::op::PenaltyOp)],
     gradient: &Array1<f64>,
     direction_out: &mut Array1<f64>,
     ridge: f64,

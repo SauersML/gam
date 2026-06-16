@@ -2390,7 +2390,7 @@ pub fn operator_penalty_candidates_closed_form(
 
     let make_op = |q: usize,
                    c: f64|
-     -> Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>> {
+     -> Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>> {
         if !emit_operator {
             return None;
         }
@@ -2414,8 +2414,8 @@ pub fn operator_penalty_candidates_closed_form(
         // Frobenius norm `c`. Wrap in `ScaledPenaltyOp` with factor `1/c`
         // so `op.as_dense()` matches the candidate's dense matrix.
         let scale = if c > 1e-12 { 1.0 / c } else { 1.0 };
-        let scaled: std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp> = std::sync::Arc::new(
-            crate::terms::penalty_op::ScaledPenaltyOp::new(raw_op, scale),
+        let scaled: std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp> = std::sync::Arc::new(
+            crate::terms::penalties::op::ScaledPenaltyOp::new(raw_op, scale),
         );
         Some(scaled)
     };

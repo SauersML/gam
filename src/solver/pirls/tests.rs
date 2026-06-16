@@ -2957,7 +2957,7 @@ mod root_cause_tests {
         // contract that future refactors of `solve_newton_direction_implicit`
         // cannot silently drift from the dense path.
         use crate::terms::basis::closed_form_operator::ClosedFormPenaltyOperator;
-        use crate::terms::penalty_op::PenaltyOp;
+        use crate::terms::penalties::op::PenaltyOp;
 
         const K: usize = 500;
         const D: usize = 4;

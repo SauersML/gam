@@ -128,7 +128,7 @@ pub(crate) use crate::terms::basis::{
     BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
 };
 pub(crate) use self::manifest::PenaltyManifest;
-pub(crate) use crate::terms::penalty_op::PenaltyOp;
+pub(crate) use crate::terms::penalties::op::PenaltyOp;
 pub(crate) use crate::terms::sae::manifold::{GumbelTemperatureSchedule, ScheduleKind};
 pub(crate) use crate::terms::penalties::sheaf::SheafConsistencyPenalty;
 pub(crate) use crate::terms::smooth::BlockwisePenalty;

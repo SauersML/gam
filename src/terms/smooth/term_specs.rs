@@ -1719,7 +1719,7 @@ pub struct BlockwisePenalty {
     /// the originating closed-form factory emitted an op-form penalty so exact
     /// operator algebra can use matvec instead of materializing the dense
     /// `block_p × block_p` Gram. `None` for ordinary dense penalties.
-    pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+    pub op: Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>,
 }
 
 
@@ -1764,7 +1764,7 @@ impl BlockwisePenalty {
     /// Attach an op-form penalty handle bit-equivalent to `local`.
     pub fn with_op(
         mut self,
-        op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+        op: Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>,
     ) -> Self {
         self.op = op;
         self
@@ -5206,7 +5206,7 @@ struct LocalSmoothTermBuild {
     dim: usize,
     design: DesignMatrix,
     penalties: Vec<Array2<f64>>,
-    ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
+    ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>>,
     nullspaces: Vec<usize>,
     /// Per-active-penalty null-space eigenvector matrices, parallel to
     /// `penalties` / `ops` / `nullspaces`. `Some(U_null)` when
@@ -6676,7 +6676,7 @@ fn build_single_local_smooth_term(
     // identity path; nulled element-wise when `T^T S T` reparametrization
     // is applied (operator no longer bit-equivalent to the transformed
     // matrix); wrapped in `ScaledPenaltyOp` after Frobenius normalization.
-    let mut ops_t: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>> = built.ops;
+    let mut ops_t: Vec<Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>> = built.ops;
     if matches!(
         spatial_identifiability_policy(term),
         Some(SpatialIdentifiability::OrthogonalToParametric)
@@ -6852,10 +6852,10 @@ fn build_single_local_smooth_term(
                 // so `op.as_dense() == matrix` post-normalization.
                 let scaled_op = if op_scale > 0.0 && op_scale.is_finite() {
                     op_in.map(|op| {
-                        std::sync::Arc::new(crate::terms::penalty_op::ScaledPenaltyOp::new(
+                        std::sync::Arc::new(crate::terms::penalties::op::ScaledPenaltyOp::new(
                             op, op_scale,
                         ))
-                            as std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>
+                            as std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>
                     })
                 } else {
                     None

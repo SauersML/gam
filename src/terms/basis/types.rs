@@ -1454,7 +1454,7 @@ pub struct BasisBuildResult {
     /// penalty bit-equivalent to the dense matrix, `None` for ordinary dense
     /// penalties. Downstream consumers route through the `Some` entries to
     /// avoid materializing dense `p x p` Grams in exact operator algebra.
-    pub ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>>,
+    pub ops: Vec<Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>>,
     /// Per-active-penalty null-space eigenvector matrices (parallel to
     /// `penalties`). Each entry is `Some(U_null)` with `U_null.ncols() ==
     /// nullspace_dims[k]` when the active block has a non-trivial null space
@@ -1640,7 +1640,7 @@ pub struct PenaltyCandidate {
     /// `CanonicalPenaltyBlock` so downstream consumers can use exact matvec
     /// algebra without rebuilding the dense Gram. When `None`, only the dense
     /// `matrix` path is available.
-    pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+    pub op: Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>,
 }
 
 impl std::fmt::Debug for PenaltyCandidate {
@@ -1676,7 +1676,7 @@ pub struct CanonicalPenaltyBlock {
     /// Optional operator-form handle that is bit-equivalent to `sym_penalty`.
     /// Propagated from `PenaltyCandidate.op` when present so downstream
     /// consumers can use matvec without rebuilding the dense Gram.
-    pub op: Option<std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>>,
+    pub op: Option<std::sync::Arc<dyn crate::terms::penalties::op::PenaltyOp>>,
 }
 
 impl std::fmt::Debug for CanonicalPenaltyBlock {

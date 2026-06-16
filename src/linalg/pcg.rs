@@ -140,14 +140,21 @@ where
     F: FnMut(&Array1<f64>, &mut Array1<f64>),
 {
     let p = rhs.len();
-    debug_assert_eq!(precond_diag.len(), p);
-    debug_assert_eq!(solution.len(), p);
+    let rhs_norm = serial_dot(rhs, rhs).sqrt();
 
     solution.fill(0.0);
-    let mut x = Array1::<f64>::zeros(p);
-
-    let rhs_norm = serial_dot(rhs, rhs).sqrt();
     let mut diagnostics = record_diagnostics.then(|| PcgDiagnostics::new(rhs_norm));
+    if precond_diag.len() != p || solution.len() != p {
+        return PcgCoreResult {
+            stop: PcgStop::Breakdown,
+            iterations: 0,
+            rhs_norm,
+            final_residual_norm: rhs_norm,
+            diagnostics,
+        };
+    }
+
+    let mut x = Array1::<f64>::zeros(p);
 
     if !rhs_norm.is_finite() {
         return PcgCoreResult {

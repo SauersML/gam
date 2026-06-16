@@ -72,7 +72,7 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
 /// Geographic (lat, lon) in degrees → unit vector on S², pole on +z. Mirrors
-/// `gam::terms::sphere_gpu::latlon_to_xyz_host`: x=cos(lat)cos(lon), y=cos(lat)sin(lon),
+/// `gam::terms::basis::sphere_gpu::latlon_to_xyz_host`: x=cos(lat)cos(lon), y=cos(lat)sin(lon),
 /// z=sin(lat). Using the SAME convention gam uses internally is what makes the
 /// geodesic-distance comparison meaningful.
 fn latlon_to_xyz(lat_deg: f64, lon_deg: f64) -> [f64; 3] {
