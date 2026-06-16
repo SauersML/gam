@@ -2956,6 +2956,17 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
     let mut mt_var_acc = 0.0_f64;
     let mut naive_var_acc = 0.0_f64;
     let mut mt_ge_naive_count = 0usize;
+    // DIAGNOSTIC accumulators (compare stored V₁ to empirical Var(θ̂₁)).
+    let mut diag_dm = 0usize;
+    let mut diag_dv = 0usize;
+    let mut diag_mean_coeff_acc = vec![0.0_f64; 16];
+    let mut diag_mean_coeff_sq_acc = vec![0.0_f64; 16];
+    let mut diag_v1_mean_tr_acc = 0.0_f64;
+    let mut diag_v1_var_tr_acc = 0.0_f64;
+    let mut diag_corr_mean_acc = 0.0_f64;
+    let mut diag_corr_var_acc = 0.0_f64;
+    let mut diag_g_mean_sq_acc = 0.0_f64;
+    let mut diag_g_var_sq_acc = 0.0_f64;
 
     for _ in 0..reps {
         // --- draw z with a genuine conditional mean shift on C ---
@@ -3013,6 +3024,34 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
         let vbg = g.mapv(|gk| vb_scalar * gk);
         // correction = (Vb·G)·V₁·(Vb·G)ᵀ (scalar).
         let correction: f64 = vbg.dot(&v1.dot(&vbg));
+        // DIAGNOSTIC: capture per-block structure and the realized first-stage
+        // coefficients so we can compare the STORED V₁ against the EMPIRICAL
+        // sampling covariance of θ̂₁ across replicates.
+        {
+            let dm = cal.mean_coeffs.len();
+            let dv = cal.var_coeffs.len();
+            diag_dm = dm;
+            diag_dv = dv;
+            for (k, &mc) in cal.mean_coeffs.iter().enumerate() {
+                diag_mean_coeff_acc[k] += mc;
+                diag_mean_coeff_sq_acc[k] += mc * mc;
+            }
+            diag_v1_mean_tr_acc += (0..dm).map(|k| v1[[k, k]]).sum::<f64>();
+            diag_v1_var_tr_acc += (0..dv).map(|k| v1[[dm + k, dm + k]]).sum::<f64>();
+            // Mean-block-only and var-block-only corrections.
+            let mut vbg_mean = vbg.clone();
+            for k in dm..(dm + dv) {
+                vbg_mean[k] = 0.0;
+            }
+            let mut vbg_var = vbg.clone();
+            for k in 0..dm {
+                vbg_var[k] = 0.0;
+            }
+            diag_corr_mean_acc += vbg_mean.dot(&v1.dot(&vbg_mean));
+            diag_corr_var_acc += vbg_var.dot(&v1.dot(&vbg_var));
+            diag_g_mean_sq_acc += (0..dm).map(|k| g[k] * g[k]).sum::<f64>();
+            diag_g_var_sq_acc += (dm..(dm + dv)).map(|k| g[k] * g[k]).sum::<f64>();
+        }
         assert!(
             correction >= -1e-12,
             "per-replicate Murphy–Topel correction must be PSD (≥0); got {correction:.3e}"
@@ -3077,6 +3116,29 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
         mt_se / naive_se,
         emp_se / naive_se,
     );
+    {
+        let r = reps as f64;
+        let emp_mean_var: Vec<f64> = (0..diag_dm)
+            .map(|k| {
+                let m = diag_mean_coeff_acc[k] / r;
+                diag_mean_coeff_sq_acc[k] / r - m * m
+            })
+            .collect();
+        println!(
+            "[MT-diag] dm={diag_dm} dv={diag_dv} \
+             v1_mean_tr={:.6e} v1_var_tr={:.6e} \
+             corr_mean={:.6e} corr_var={:.6e} \
+             g_mean_sq={:.6e} g_var_sq={:.6e} \
+             emp_var(mean_coeffs)={:?}",
+            diag_v1_mean_tr_acc / r,
+            diag_v1_var_tr_acc / r,
+            diag_corr_mean_acc / r,
+            diag_corr_var_acc / r,
+            diag_g_mean_sq_acc / r,
+            diag_g_var_sq_acc / r,
+            emp_mean_var,
+        );
+    }
     // (1) The corrected SE must DIFFER from the naive SE — the naive single-stage
     //     variance materially under-states the truth.
     assert!(
