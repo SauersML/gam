@@ -181,10 +181,14 @@ fn rmse(yhat: &[f64], probes: &[Vec<f64>]) -> f64 {
 #[test]
 fn cascade_matches_or_beats_dense_duchon_on_truth_recovery() {
     init_parallelism();
-    let n = 6_000;
+    // Kept modest: the dense `fit_from_formula` duchon REML over its ~K-center
+    // Gram is the cost here (the cascade itself is cheap), and the comparison
+    // only needs enough data to resolve the truth — the certification suite
+    // already recovers it at n = 2500.
+    let n = 2_000;
     let data = sample(2, n);
     let formula = "y ~ duchon(x1, x2)";
-    let probes = probe_grid(2, 12);
+    let probes = probe_grid(2, 10);
 
     // Run the cascade estimator directly on the identical raw data at the native
     // 2-D Sobolev order s = (d+3)/2 = 2.5 (the order the fast path clamps a
