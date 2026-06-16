@@ -1,5 +1,5 @@
 // Split from the original oversized module; keep included in order.
-include!("smooth/imports.rs");
+include!("smooth/prelude.rs");
 
 mod bspline_boundary;
 

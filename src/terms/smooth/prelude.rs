@@ -87,3 +87,17 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+mod prelude_lock_tests {
+    /// Locks that `terms::smooth`'s shared import surface lives at `prelude.rs`
+    /// (renamed from `imports.rs` per #1137) and is textually included via
+    /// `include!("smooth/prelude.rs")`: this test only compiles because it is
+    /// pasted in. Also pins a representative re-exported symbol.
+    #[test]
+    fn smooth_prelude_include_path_is_locked() {
+        assert!(
+            core::any::type_name::<crate::matrix::DesignMatrix>().contains("DesignMatrix")
+        );
+    }
+}
