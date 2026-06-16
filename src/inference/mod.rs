@@ -15,8 +15,6 @@ pub mod generative;
 pub mod harvest;
 pub mod higher_order;
 pub mod hmc;
-pub mod identifiability_kernels;
-pub mod identifiability_precondition_checks;
 pub mod lawley;
 pub mod layer_transport;
 pub mod model;
