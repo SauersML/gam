@@ -3355,3 +3355,122 @@ pub(crate) fn bench_resident_sae_matvec_speedup() {
         "timings must be positive"
     );
 }
+
+/// #1017 streaming-assembly parallelism: `accumulate_chunk` (reduced-Schur +
+/// reduced-RHS assembly) and `back_substitute` (per-row `Δt_i`) fan over rows
+/// with rayon above `SCHUR_MATVEC_PARALLEL_ROW_MIN`. Both must be
+/// (a) DETERMINISTIC run-to-run — bit-identical regardless of thread
+/// scheduling, the #1017 verification gate that the criterion ranking cannot
+/// move; and (b) numerically equal to the sequential per-row computation up to
+/// ULP-level reassociation (the chunk-partial fold reassociates the SAME row
+/// contributions). For `back_substitute` the per-row writes are DISJOINT, so it
+/// must match the sequential scatter bit-for-bit.
+#[test]
+pub(crate) fn parallel_streaming_assembly_deterministic_and_matches_sequential() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
+    let d = 4usize;
+    let k = 24usize;
+    let sys = dense_direct_system(n, d, k);
+    let options = ArrowSolveOptions::direct();
+
+    // (a) Determinism: two independent full solves at the parallel shape must
+    // be bit-identical (Δt, Δβ, and the reduced Schur factor diagonal).
+    let mut s_a = StreamingArrowSchur::from_system(&sys, n); // one big chunk → parallel accumulate
+    let (dt_a, db_a, _) = s_a.solve(0.0, 0.0, &options).expect("parallel solve a");
+    let mut s_b = StreamingArrowSchur::from_system(&sys, n);
+    let (dt_b, db_b, _) = s_b.solve(0.0, 0.0, &options).expect("parallel solve b");
+    for j in 0..k {
+        assert_eq!(
+            db_a[j].to_bits(),
+            db_b[j].to_bits(),
+            "streaming Δβ must be deterministic run-to-run at {j}"
+        );
+    }
+    for i in 0..dt_a.len() {
+        assert_eq!(
+            dt_a[i].to_bits(),
+            dt_b[i].to_bits(),
+            "streaming Δt must be deterministic run-to-run at {i}"
+        );
+    }
+
+    // (b) accumulate_chunk parallel-vs-serial equivalence. A single big chunk
+    // (>= MIN) takes the rayon fold; many tiny chunks (each < MIN) take the
+    // in-place serial path. Same row contributions, so the reduced Schur block
+    // and reduced RHS agree to ULP-scale reassociation error.
+    let mut par = StreamingArrowSchur::from_system(&sys, n);
+    par.reset_accumulator(0.0).expect("reset par");
+    par.accumulate_chunk(0, n, 0.0, ArrowSolverMode::Direct)
+        .expect("parallel accumulate");
+    let (s_par, rhs_par) = par.take_accumulators();
+
+    let mut ser = StreamingArrowSchur::from_system(&sys, 8);
+    ser.reset_accumulator(0.0).expect("reset ser");
+    for start in (0..n).step_by(8) {
+        let end = (start + 8).min(n);
+        assert!(end - start < SCHUR_MATVEC_PARALLEL_ROW_MIN); // serial per chunk
+        ser.accumulate_chunk(start, end, 0.0, ArrowSolverMode::Direct)
+            .expect("serial accumulate");
+    }
+    let (s_ser, rhs_ser) = ser.take_accumulators();
+
+    let s_scale = s_ser.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    let mut s_max = 0.0_f64;
+    for (a, b) in s_par.iter().zip(s_ser.iter()) {
+        s_max = s_max.max((a - b).abs());
+    }
+    assert!(
+        s_max / s_scale < 1e-12,
+        "parallel vs serial reduced-Schur block diverges by rel {:e}",
+        s_max / s_scale
+    );
+    let r_scale = rhs_ser.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+    let mut r_max = 0.0_f64;
+    for (a, b) in rhs_par.iter().zip(rhs_ser.iter()) {
+        r_max = r_max.max((a - b).abs());
+    }
+    assert!(
+        r_max / r_scale < 1e-12,
+        "parallel vs serial reduced-RHS diverges by rel {:e}",
+        r_max / r_scale
+    );
+
+    // (c) back_substitute parallel-vs-sequential: per-row writes are disjoint,
+    // so the parallel scatter must match the hand-rolled sequential back-solve
+    // BIT-FOR-BIT (no reassociation — each segment is computed identically).
+    let mut s_bs = StreamingArrowSchur::from_system(&sys, n);
+    // Use the already-solved Δβ as the back-substitution input.
+    let delta_t = s_bs
+        .back_substitute(0.0, db_a.view())
+        .expect("parallel back_substitute");
+    // Sequential reference: replicate the per-row formula directly.
+    let backend = CpuBatchedBlockSolver;
+    let total_len: usize = (0..n).map(|i| sys.rows[i].htt.nrows()).sum();
+    let mut ref_dt = Array1::<f64>::zeros(total_len);
+    let mut base = 0usize;
+    for i in 0..n {
+        let row = &sys.rows[i];
+        let di = row.htt.nrows();
+        let factor = factor_one_row(row, 0.0, di, i, false).expect("factor row");
+        let mut rhs = Array1::<f64>::zeros(di);
+        for c in 0..di {
+            let mut acc = 0.0_f64;
+            for a in 0..k {
+                acc += row.htbeta[[c, a]] * db_a[a];
+            }
+            rhs[c] = row.gt[c] + acc;
+        }
+        let dt_i = backend.solve_block_vector(factor.view(), rhs.view());
+        for c in 0..di {
+            ref_dt[base + c] = -dt_i[c];
+        }
+        base += di;
+    }
+    for i in 0..total_len {
+        assert_eq!(
+            delta_t[i].to_bits(),
+            ref_dt[i].to_bits(),
+            "parallel back_substitute must match sequential bit-for-bit at {i}"
+        );
+    }
+}
