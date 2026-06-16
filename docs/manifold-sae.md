@@ -3,8 +3,9 @@
 `gamfit.sae_manifold_fit(...)` fits a **sparse manifold dictionary**. The
 data matrix `Z` (shape `(N, p)`, one ambient vector per token) is
 reconstructed as a sparse mixture of `K` *atoms*. Each atom is a small,
-low-dimensional **typed shape** — a line, circle, sphere, torus, or
-Euclidean patch — carrying its own ambient embedding (a decoder block) and a
+low-dimensional **typed shape** — a line, circle, sphere, torus, cylinder,
+hyperbolic patch, or flat Euclidean patch — carrying its own ambient
+embedding (a decoder block) and a
 per-token coordinate on that shape. A token's reconstruction is the sum of
 the atoms it activates, evaluated at their per-token coordinates.
 
@@ -22,9 +23,9 @@ Z = ...  # (N, p) activations / embeddings to decompose
 fit = gamfit.sae_manifold_fit(
     X=Z,
     K=16,                       # dictionary size
-    d_atom=1,                   # intrinsic dim per atom (int, or per-atom list)
-    atom_topology="circle",     # line/circle/sphere/torus/euclidean (or per-atom atom_basis=)
-    assignment="ibp_map",       # IBP-MAP sparsity
+    d_atom=1,                   # intrinsic dim per atom (default 2; int, or per-atom list)
+    atom_topology="circle",     # default "circle"; see the topology table below
+    assignment="ibp_map",       # IBP-MAP sparsity (default)
 )
 
 print(fit)              # ManifoldSAE(K=16, d_atom=1, atom_topology='circle', ...)
@@ -40,12 +41,28 @@ recon = fit.predict(Z)  # (N, p) reconstruction; == fit.fitted on training Z
 Each atom carries a topology, set globally by `atom_topology=` or per atom by
 passing a list to `atom_basis=`:
 
-| `atom_topology` | Intrinsic dim `d_atom` | Underlying basis | Shape |
+The string is resolved by `SaeAtomBasisKind` in the Rust core. The full set
+of typed shapes:
+
+| `atom_topology` / `atom_basis` | Intrinsic dim `d_atom` | Underlying basis | Shape |
 | --- | --- | --- | --- |
-| `circle` (alias `periodic`) | 1 | periodic Fourier | closed loop, seamless at the wrap |
-| `euclidean` | any | Duchon / thin-plate patch | open Euclidean patch (a "line" at `d_atom=1`) |
-| `sphere` | 2 | intrinsic S² kernel | sphere, no pole artefacts |
-| `torus` | 2 | doubly-periodic Fourier | torus, seamless on both axes |
+| `circle` (aliases `periodic`, `periodic_spline`) | 1 (each axis if `d>1`) | periodic Fourier `cos/sin(2π·h·t)` | closed loop, seamless at the wrap |
+| `euclidean` (alias `euclidean_patch`) | any | monomial / polynomial patch | open Euclidean patch (a "line" at `d_atom=1`) |
+| `duchon` | any | Duchon thin-plate RKHS | open Euclidean patch with the thin-plate roughness Gram |
+| `sphere` | 2 | intrinsic S² (lat, lon) chart | sphere, no pole artefacts |
+| `torus` | 2 (each axis) | doubly-periodic Fourier | torus, seamless on both axes |
+| `cylinder` | 2 | periodic circle axis ⊗ flat line axis | cylinder `S¹ × ℝ`, periodic in axis 0, open in axis 1 |
+| `poincare` (aliases `hyperbolic`, `poincare_patch`) | any | monomial patch, hyperbolic roughness metric | Poincaré-ball tangent patch at curvature `c = −1` (wiggle measured in hyperbolic arc length) |
+| any other string | any | caller-supplied | `Precomputed`: a precomputed basis you attach yourself |
+
+`duchon` and `euclidean` share the same flat-`ℝᵈ` latent manifold and monomial
+decoder; they differ only in the roughness penalty (`duchon` uses the
+thin-plate RKHS Gram, `euclidean` the polynomial-patch Gram). `poincare`
+likewise reuses the Euclidean tangent chart and monomial decoder but penalizes
+roughness in hyperbolic arc length via the Poincaré conformal factor, so it
+differs from the flat patch only where feature density grows toward the ball
+boundary (tree-/hierarchy-like structure). String matching is
+case-insensitive and treats `-` and `_` interchangeably.
 
 A `d_atom=1` Euclidean atom is the **line** primitive; a `d_atom=1` circle is
 the **loop**. Mixing topologies across atoms is supported — pass an
@@ -225,10 +242,20 @@ the full surface):
 | `reconstruction_r2` / `reml_score` / `dispersion` | fit-quality / evidence / noise scale |
 
 Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
-`project(X, k)` and `per_atom_latent_for(X)` (coordinates),
-`shape_uncertainty(k)`, `coordinate_range(k)`, `typical_shape(k)`,
-`curvature()` / `atom_curvature(k)`, `summary()`, `get_decoder()` /
-`get_anchors()`, and `to_dict` / `from_dict` / `save` / `load`.
+`project(X, k)`, `per_atom_latent_for(X)` and `featurize(X)` (coordinates),
+`per_atom_active_set(X)`, `shape_uncertainty(k)`, `coordinate_range(k)`,
+`typical_shape(k)`, `curvature()` / `atom_curvature(k)`, `summary()`,
+`get_decoder()` / `get_anchors()`, and `to_dict` / `from_dict` / `save` /
+`load`.
+
+Structure-evidence and interpretability methods: `structure_certificate()`
+(anytime-valid e-BH certificate over structural claims — atom-exists,
+binding edges, geometry kind), `contested_claims()` /
+`contested_probe_report()` (the claims held-out data did not confirm),
+`atom_trust(k)` / `atom_diagnostics()` (per-atom trust and tangent-condition
+diagnostics), `steer(k, t_from, t_to)` (output-dosimetry steering plan along
+an atom's coordinate), and `distill_encoder(X, ...)` (train a post-hoc torch
+encoder from exact out-of-sample latent solves).
 
 ### Out-of-sample and encoder distillation (issue #357)
 
