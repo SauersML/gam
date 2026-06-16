@@ -913,6 +913,144 @@ impl BernoulliMarginalSlopeFamily {
                 Ok((row, moments))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        // Block-12 Stage-1 GPU-substrate parity guard. The substrate
+        // `try_build_cubic_cell_derivative_moments` is the future per-row
+        // moment producer (host path today, NVRTC kernel on V100 later);
+        // landing the call here makes it a real production consumer of the
+        // substrate's pub(crate) entry point and surfaces any divergence
+        // from the existing LRU evaluator the moment it appears. We sample
+        // a small prefix of rows (PARITY_ROW_BUDGET) so the cost stays bounded
+        // for large-scale fits. The substrate CALL and the `Host { moments,
+        // stride }` field bind run in EVERY build so those fields have a real
+        // production reader (release compiles out `debug_assertions`, so gating
+        // the whole block would leave the substrate's `Host` fields dead and
+        // trip `warnings = "deny"`). Only the expensive per-element numeric
+        // drift `assert!`s below stay behind `cfg(debug_assertions)`.
+        {
+            use crate::gpu::kernels::cubic_cell::branch::classify_cell_for_gpu;
+            use crate::gpu::kernels::cubic_cell::{
+                CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuDenestedCubicCell,
+                try_build_cubic_cell_derivative_moments,
+            };
+            const PARITY_ROW_BUDGET: usize = 4;
+            let mut sample_cells: Vec<GpuDenestedCubicCell> = Vec::new();
+            let mut sample_branches = Vec::new();
+            let mut sample_cpu_moments: Vec<Vec<f64>> = Vec::new();
+            for (_, moments) in computed_rows.iter().take(PARITY_ROW_BUDGET) {
+                for cached in moments {
+                    let cell = cached.partition_cell.cell;
+                    let gpu_cell = GpuDenestedCubicCell {
+                        left: cell.left,
+                        right: cell.right,
+                        c0: cell.c0,
+                        c1: cell.c1,
+                        c2: cell.c2,
+                        c3: cell.c3,
+                    };
+                    let branch = classify_cell_for_gpu(gpu_cell).map_err(|status| {
+                        format!(
+                            "BMS row-cell-moments parity classifier rejected CPU-evaluated cell \
+                             row_sample={} cell_sample={} status={}",
+                            sample_cpu_moments.len(),
+                            sample_cells.len(),
+                            status as u8
+                        )
+                    })?;
+                    sample_cells.push(gpu_cell);
+                    sample_branches.push(branch);
+                    sample_cpu_moments.push(cached.state.moments.to_vec());
+                }
+            }
+            if !sample_cells.is_empty() {
+                let view = CubicCellDerivativeMomentHostView {
+                    cells: &sample_cells,
+                    branches: &sample_branches,
+                    max_degree,
+                    residency: CubicCellMomentResidency::Host,
+                };
+                match try_build_cubic_cell_derivative_moments(view) {
+                    Ok(Some(output)) => {
+                        use crate::gpu::kernels::cubic_cell::{
+                            CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
+                        };
+                        let (sub_moments, sub_status, stride) = match output {
+                            CubicCellDerivativeMomentOutput::Host {
+                                moments,
+                                status,
+                                stride,
+                            } => (moments, status, stride),
+                            #[cfg(target_os = "linux")]
+                            CubicCellDerivativeMomentOutput::Device { .. } => {
+                                // The view above explicitly requested
+                                // `CubicCellMomentResidency::Host`, and the substrate's
+                                // contract (`try_build_cubic_cell_derivative_moments` in
+                                // `src/gpu/kernels/cubic_cell/mod.rs:170`) guarantees that a Host
+                                // request returns `Host(...)` even on Linux+CUDA. Reaching
+                                // this arm means the substrate's contract was violated —
+                                // a hard programming error in the GPU dispatcher, not a
+                                // runtime condition we can recover from. Panicking
+                                // surfaces it at the call site.
+                                // SAFETY: unreachable by substrate contract — Host
+                                // request must return Host residency; reaching this
+                                // arm is a programming error, not a runtime condition.
+                                panic!(
+                                    "BMS row-cell-moments parity probe requested Host residency \
+                                     but substrate returned device-resident output"
+                                )
+                            }
+                        };
+                        assert_eq!(stride, max_degree + 1);
+                        assert_eq!(sub_status.len(), sample_cells.len());
+                        for (i, cpu_row) in sample_cpu_moments.iter().enumerate() {
+                            assert_eq!(
+                                sub_status[i],
+                                CubicCellMomentStatus::Ok as u8,
+                                "BMS row-cell-moments parity: substrate refused cell {i} (status={})",
+                                sub_status[i]
+                            );
+                            let sub_row = &sub_moments[i * stride..(i + 1) * stride];
+                            let copy_len = cpu_row.len().min(stride);
+                            for k in 0..copy_len {
+                                let want = cpu_row[k];
+                                let got = sub_row[k];
+                                let denom = want.abs().max(1.0);
+                                let rel = (got - want).abs() / denom;
+                                let abs = (got - want).abs();
+                                assert!(
+                                    abs <= 1e-12 || rel <= 1e-11,
+                                    "BMS row-cell-moments parity drift cell={i} k={k} \
+                                     cpu={want:.17e} substrate={got:.17e} abs={abs:.3e} rel={rel:.3e}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // SAFETY: substrate's `Ok(None)` contract is
+                        // reserved for empty input; the surrounding
+                        // `if !sample_cells.is_empty()` guards against
+                        // that. A `None` return for a populated sample
+                        // is a contract violation that must be visible
+                        // at the first fit in debug builds, not silently
+                        // tolerated.
+                        panic!(
+                            "BMS row-cell-moments parity: substrate returned Ok(None) for a non-empty sample of {} cells",
+                            sample_cells.len()
+                        );
+                    }
+                    // SAFETY: substrate errors during the parity sample
+                    // mean the host evaluator (which we are checking
+                    // against the LRU path) disagreed on cells the LRU
+                    // already accepted. Continuing past such a divergence
+                    // hides correctness bugs the parity guard is here to
+                    // catch; abort the debug-build fit.
+                    Err(err) => panic!(
+                        "BMS row-cell-moments parity: substrate failed on {} sample cells: {}",
+                        sample_cells.len(),
+                        err
+                    ),
+                }
+            }
+        }
         let mut rows = vec![None; n];
         for (row, moments) in computed_rows {
             rows[row] = Some(moments);
@@ -1089,7 +1227,7 @@ impl BernoulliMarginalSlopeFamily {
         //    upload. The host fill stays as the fallback on hosts without
         //    a runtime (and on every non-Linux build).
         #[cfg(target_os = "linux")]
-        let build_device_moments = crate::gpu::device_runtime::GpuRuntime::global().is_some();
+        let build_device_moments = crate::gpu::runtime::GpuRuntime::global().is_some();
         #[cfg(not(target_os = "linux"))]
         let build_device_moments = false;
 
