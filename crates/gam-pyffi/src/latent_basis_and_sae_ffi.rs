@@ -1595,6 +1595,67 @@ fn seed_oos_softmax_logits_from_projection_residuals(
     term.assignment.logits.assign(&seeded_logits);
 }
 
+fn seed_oos_ibp_logits_from_projected_decoder_lsq(
+    term: &mut gam::terms::sae::manifold::SaeManifoldTerm,
+    target: ArrayView2<'_, f64>,
+    tau: f64,
+    alpha: f64,
+) {
+    let (n_obs, p_out) = target.dim();
+    let k_atoms = term.k_atoms();
+    let ratio = alpha / (alpha + 1.0);
+    let mut prior = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        prior.push(ratio.powi(atom_idx as i32).max(f64::MIN_POSITIVE));
+    }
+    let mut decoded = vec![vec![0.0_f64; p_out]; k_atoms];
+    let mut norm_sq = vec![0.0_f64; k_atoms];
+    let mut gates = vec![0.0_f64; k_atoms];
+    let mut fitted = vec![0.0_f64; p_out];
+    let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
+    const OOS_IBP_BOX_LSQ_SWEEPS: usize = 12;
+    const OOS_IBP_GATE_EPS: f64 = 1.0e-6;
+    for row in 0..n_obs {
+        for atom_idx in 0..k_atoms {
+            term.atoms[atom_idx].fill_decoded_row(row, &mut decoded[atom_idx]);
+            norm_sq[atom_idx] = decoded[atom_idx]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .max(1.0e-12);
+            gates[atom_idx] = 0.0;
+        }
+        fitted.fill(0.0);
+        for _ in 0..OOS_IBP_BOX_LSQ_SWEEPS {
+            for atom_idx in 0..k_atoms {
+                let old_gate = gates[atom_idx];
+                let g_row = &decoded[atom_idx];
+                let mut numerator = 0.0_f64;
+                for out_col in 0..p_out {
+                    let residual_without_atom =
+                        target[[row, out_col]] - fitted[out_col] + old_gate * g_row[out_col];
+                    numerator += g_row[out_col] * residual_without_atom;
+                }
+                let upper = prior[atom_idx] * (1.0 - OOS_IBP_GATE_EPS);
+                let new_gate = (numerator / norm_sq[atom_idx]).clamp(0.0, upper);
+                if new_gate != old_gate {
+                    let delta = new_gate - old_gate;
+                    for out_col in 0..p_out {
+                        fitted[out_col] += delta * g_row[out_col];
+                    }
+                    gates[atom_idx] = new_gate;
+                }
+            }
+        }
+        for atom_idx in 0..k_atoms {
+            let q =
+                (gates[atom_idx] / prior[atom_idx]).clamp(OOS_IBP_GATE_EPS, 1.0 - OOS_IBP_GATE_EPS);
+            seeded_logits[[row, atom_idx]] = tau * (q / (1.0 - q)).ln();
+        }
+    }
+    term.assignment.logits.assign(&seeded_logits);
+}
+
 /// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
 /// `dim`, sized so the native reproducing-norm Gram (`PenaltySource::Primary`)
 /// on the scale-free polyharmonic basis is well-posed in every dimension.
@@ -5967,6 +6028,8 @@ fn sae_manifold_predict_oos<'py>(
     }
     if !logits_are_warm && assignment_kind == "softmax" {
         seed_oos_softmax_logits_from_projection_residuals(&mut term, x_view, tau);
+    } else if !logits_are_warm && assignment_kind == "ibp_map" {
+        seed_oos_ibp_logits_from_projected_decoder_lsq(&mut term, x_view, tau, alpha);
     }
     let log_ard: Vec<Array1<f64>> = effective_atom_dim
         .iter()
@@ -5986,6 +6049,8 @@ fn sae_manifold_predict_oos<'py>(
 
     if !logits_are_warm && assignment_kind == "softmax" {
         seed_oos_softmax_logits_from_projection_residuals(&mut term, x_view, tau);
+    } else if !logits_are_warm && assignment_kind == "ibp_map" {
+        seed_oos_ibp_logits_from_projected_decoder_lsq(&mut term, x_view, tau, alpha);
     }
     let mut assignments = term.assignment.assignments();
     let mut fitted = term.fitted();
