@@ -361,6 +361,19 @@ impl DeviceResidentArrowWorkspace {
 
         let mut ridge_t = opts.initial_ridge_t.max(0.0);
         let mut ridge_beta = opts.initial_ridge_beta.max(0.0);
+        // #1017 Phase 3: when running on device, keep the resident Arrow frame
+        // (constant Hessian blocks + their factors) on the device across
+        // iterations. The frame bakes a fixed `(ridge_t, ridge_beta)` into the
+        // per-row and border Cholesky factors, so it is rebuilt only when the LM
+        // ridge changes (reject/shrink); every iteration that shares the cached
+        // ridge reuses the resident factors and uploads only the `O(n·d + p)`
+        // gradient. The CPU reference path keeps re-factoring per iterate so the
+        // parity harness compares residency against a fully independent solve.
+        let mut resident_frame: Option<(
+            f64,
+            f64,
+            crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle,
+        )> = None;
         let mut current_objective = self.objective_at(&base, half_target_energy, &t, &beta);
         let mut accepted_iters = 0_usize;
         let mut total_iters = 0_usize;
@@ -385,7 +398,42 @@ impl DeviceResidentArrowWorkspace {
             }
 
             let solution = if on_device {
-                solve_arrow_newton_step(&residual, ridge_t, ridge_beta).map_err(map_gpu_error)
+                // Rebuild the resident frame only when the LM ridge changed; an
+                // unchanged ridge reuses the resident factors. A build failure
+                // becomes a Solve error so the LM-escalation arm below grows the
+                // ridge and retries, identical to a per-iterate solve failure.
+                let frame_matches = resident_frame
+                    .as_ref()
+                    .is_some_and(|(rt, rb, _)| *rt == ridge_t && *rb == ridge_beta);
+                let mut frame_build_error: Option<DeviceResidentArrowError> = None;
+                if !frame_matches {
+                    resident_frame = None;
+                    match crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
+                        &residual, ridge_t, ridge_beta,
+                    ) {
+                        Ok(frame) => resident_frame = Some((ridge_t, ridge_beta, frame)),
+                        Err(err) => frame_build_error = Some(map_gpu_error(err)),
+                    }
+                }
+                match resident_frame.as_ref() {
+                    Some((_, _, frame)) => {
+                        // Per-iterate gradient r(z) = (g_t rows, g_β), extracted
+                        // from the residual system the frame was built to match.
+                        let mut g_t = Vec::with_capacity(n * d);
+                        for row in &residual.rows {
+                            for &v in row.gt.iter() {
+                                g_t.push(v);
+                            }
+                        }
+                        let g_beta: Vec<f64> = residual.gb.iter().copied().collect();
+                        frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error)
+                    }
+                    None => Err(frame_build_error.unwrap_or_else(|| {
+                        DeviceResidentArrowError::Solve {
+                            reason: "SAE resident frame build declined".to_string(),
+                        }
+                    })),
+                }
             } else {
                 solve_arrow_newton_step_dense_reference(&residual, ridge_t, ridge_beta)
                     .map_err(|reason| DeviceResidentArrowError::Solve { reason })
@@ -1142,6 +1190,104 @@ mod tests {
             assert_eq!(seq.t.as_slice(), mux.outcome.t.as_slice());
             assert_eq!(seq.beta.as_slice(), mux.outcome.beta.as_slice());
             assert_eq!(seq.objective.to_bits(), mux.outcome.objective.to_bits());
+        }
+    }
+
+    /// #1017 Phase 3 residency parity. On a CUDA host the device-resident inner
+    /// loop (`device_fit`, which keeps the Hessian factors on-device across
+    /// iterations via `ResidentArrowFrameHandle`) must reach the same minimiser
+    /// as the fully independent CPU dense-reference loop (`cpu_reference_fit`,
+    /// which re-factors per iterate). On a CPU-only host the resident path must
+    /// decline cleanly (`Unavailable`) rather than silently disagree, and the
+    /// resident-frame handle construction must likewise decline — so the gate is
+    /// meaningful on the build box and the wall-clock arm runs on the GPU node.
+    #[test]
+    fn device_resident_fit_matches_cpu_reference() {
+        let ws = small_fixture(0x5AE_1017);
+        let opts = DeviceResidentInnerOptions::default();
+
+        // CPU reference (re-factors per iterate) — always available.
+        let cpu = ws.cpu_reference_fit(&opts).expect("cpu reference fit");
+        assert!(cpu.converged, "cpu reference must converge on PD quadratic");
+
+        let base = ws.to_arrow_system();
+
+        if ws.device_resident() {
+            // Resident device loop: factors stay on-device across iterations.
+            let dev = ws.device_fit(&opts).expect("device resident fit");
+            assert!(dev.used_device, "device_fit must report device execution");
+            assert!(dev.converged, "device resident loop must converge");
+
+            // Certified-refinement parity (#1014): the resident path and the
+            // independent CPU path solve the same quadratic, so their minimisers
+            // agree to a tight relative tolerance. The resident path differs from
+            // the reference only by SKIPPING re-derivation of g-independent
+            // factor work, not by changing the arithmetic.
+            let t_scale = cpu.t.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
+            let b_scale = cpu.beta.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
+            let mut max_rel = 0.0_f64;
+            for (a, b) in dev.t.iter().zip(cpu.t.iter()) {
+                max_rel = max_rel.max((a - b).abs() / t_scale);
+            }
+            for (a, b) in dev.beta.iter().zip(cpu.beta.iter()) {
+                max_rel = max_rel.max((a - b).abs() / b_scale);
+            }
+            assert!(
+                max_rel < 1e-9,
+                "resident device fit must match CPU reference (rel {max_rel:e})"
+            );
+
+            // The resident frame's single-gradient solve must also match a full
+            // independent solve at the same gradient (the per-iterate contract).
+            let frame = crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
+                &base,
+                opts.initial_ridge_t,
+                opts.initial_ridge_beta,
+            )
+            .expect("resident frame must build on CUDA host");
+            let g_t: Vec<f64> = base.rows.iter().flat_map(|r| r.gt.iter().copied()).collect();
+            let g_beta: Vec<f64> = base.gb.iter().copied().collect();
+            let resident_sol = frame
+                .solve_gradient(&g_t, &g_beta)
+                .expect("resident single-gradient solve");
+            let full = crate::gpu::kernels::arrow_schur::solve_arrow_newton_step_dense_reference(
+                &base,
+                opts.initial_ridge_t,
+                opts.initial_ridge_beta,
+            )
+            .expect("dense reference single solve");
+            let mut max_step_rel = 0.0_f64;
+            let step_scale = full
+                .delta_t
+                .iter()
+                .chain(full.delta_beta.iter())
+                .fold(1.0_f64, |m, &v| m.max(v.abs()));
+            for (a, b) in resident_sol.delta_t.iter().zip(full.delta_t.iter()) {
+                max_step_rel = max_step_rel.max((a - b).abs() / step_scale);
+            }
+            for (a, b) in resident_sol.delta_beta.iter().zip(full.delta_beta.iter()) {
+                max_step_rel = max_step_rel.max((a - b).abs() / step_scale);
+            }
+            assert!(
+                max_step_rel < 1e-9,
+                "resident solve_gradient must match full dense reference step (rel {max_step_rel:e})"
+            );
+        } else {
+            // CPU-only host: the resident path must decline, not disagree.
+            let dev = ws.device_fit(&opts);
+            assert!(
+                matches!(dev, Err(DeviceResidentArrowError::Unavailable { .. })),
+                "device_fit must report Unavailable on a CPU-only host, got {dev:?}"
+            );
+            let frame = crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
+                &base,
+                opts.initial_ridge_t,
+                opts.initial_ridge_beta,
+            );
+            assert!(
+                frame.is_err(),
+                "resident frame construction must decline on a CPU-only host"
+            );
         }
     }
 }
