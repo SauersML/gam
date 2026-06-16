@@ -14,8 +14,6 @@ mod large_scale_accuracy_sweep;
 mod large_scale_ctn_bootstrap_repro;
 #[path = "perf_scale/large_scale_margslope_repro.rs"]
 mod large_scale_margslope_repro;
-#[path = "perf_scale/large_scale_margslope_rigid_profile.rs"]
-mod large_scale_margslope_rigid_profile;
 #[path = "perf_scale/large_scale_perf_benchmark.rs"]
 mod large_scale_perf_benchmark;
 #[path = "perf_scale/large_scale_reml_stress.rs"]

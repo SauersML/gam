@@ -12,8 +12,11 @@
 //!   * `power = 9.0`,
 //!   * NO `score_warp` / NO `link_dev` (no linkwiggle blocks).
 //!
-//! `#[ignore]` — this is a profiling/repro harness, run explicitly on a compute
-//! node (it is deliberately large). It is NOT a CI budget gate.
+//! This is a profiling/repro harness, not a CI budget gate. It lives as a
+//! Cargo example (`cargo run --release --example large_scale_margslope_rigid_profile`)
+//! so it stays compile-checked without entering the `cargo test` budget — the
+//! repo bans `#[ignore]` (build.rs gate), so an ignored test is not an option;
+//! an example is the sanctioned "run explicitly on a compute node" home.
 
 use gam::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
@@ -189,9 +192,7 @@ fn build_rigid_problem(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec
     (data, spec)
 }
 
-#[test]
-#[ignore = "large-scale profiling repro for the #979 rigid timeout arm; run explicitly on a compute node"]
-fn large_scale_margslope_rigid_profile() {
+fn main() {
     init();
     let (data, spec) = build_rigid_problem(PROFILE_N);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
