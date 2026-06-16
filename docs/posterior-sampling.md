@@ -15,8 +15,8 @@ print(posterior)
 #                  rhat=1.0040, ess=..., converged=True)
 
 bands = posterior.predict(test_df, level=0.95)
-# {"eta_mean", "eta_lower", "eta_upper",
-#  "mean",     "mean_lower", "mean_upper"}
+# {"linear_predictor", "linear_predictor_lower", "linear_predictor_upper",
+#  "mean",             "mean_lower",             "mean_upper"}
 ```
 
 ## Model.sample
@@ -39,7 +39,7 @@ model.sample(
 | `samples` | derived from coefficient count | Post-warmup draws per chain. |
 | `warmup` | matches `samples` | Warmup iterations per chain (discarded). |
 | `chains` | `2` if `p <= 50`, else `4` | Independent chains. |
-| `target_accept` | `0.9` | NUTS step-size adaptation target acceptance; NUTS paths require it to lie in `(0, 1)`. Ignored by the Laplace and Polya-Gamma Gibbs paths. |
+| `target_accept` | `0.9` | NUTS step-size adaptation target acceptance; NUTS paths require it to lie in `(0, 1)`. The sampler floors it to `0.90` (dim ≤ 50) or `0.92` (dim > 50) and caps it at `0.95` via `robust_target_accept`, so a requested value outside that band is clamped. Ignored by the Laplace and Polya-Gamma Gibbs paths. |
 | `seed` | `42` | RNG seed consumed by the sampler. |
 
 Total returned draws are `chains * samples`.
