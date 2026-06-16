@@ -235,7 +235,7 @@ fn truncate_marginal_slope_influence_absorber(
         reml_score,
         stable_penalty_term,
         penalized_objective,
-        used_device: false,
+        used_device,
         outer_iterations,
         outer_converged,
         outer_gradient_norm,
@@ -293,7 +293,10 @@ fn truncate_marginal_slope_influence_absorber(
         reml_score,
         stable_penalty_term,
         penalized_objective,
-        used_device: false,
+        // Preserve the GPU-execution flag across the absorber-column
+        // truncation: dropping the trailing γ columns does not change which
+        // device ran the solve.
+        used_device,
         outer_iterations,
         outer_converged,
         outer_gradient_norm,
