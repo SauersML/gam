@@ -153,7 +153,6 @@ pub(crate) use crate::linalg::matrix::{
 // ─────────────────────────────────────────────────────────────────────────
 // Leaf, state-free linear-algebra kernels (already real modules).
 // ─────────────────────────────────────────────────────────────────────────
-pub(crate) mod debug_stash;
 mod dense_linalg;
 mod dense_projection;
 mod pseudo_logdet;

@@ -117,19 +117,6 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             let s_psi_beta_local = s_psi_local.dot(&beta_block);
             let a_penalty_quadratic = 0.5 * beta_block.dot(&s_psi_beta_local);
             let a = psi_terms.objective_psi + a_penalty_quadratic;
-            // HVP ψ-gradient attribution (#740): record the first ψ coordinate's
-            // `a = a_likelihood + a_penalty_quadratic` split so a failing
-            // `coord_a` FD can be attributed to the per-row likelihood channel
-            // (`objective_psi`) vs the penalty-quadratic channel. Diagnostic
-            // only; gated to a live capture guard so production never pays.
-            if psi_global == 0
-                && crate::solver::estimate::reml::unified::debug_stash::capture_requested()
-            {
-                crate::solver::estimate::reml::unified::debug_stash::store_a_split(
-                    psi_terms.objective_psi,
-                    a_penalty_quadratic,
-                );
-            }
             // Embed s_psi_beta into full p-vector for the score.
             let mut s_psi_beta = Array1::zeros(total);
             s_psi_beta
@@ -1117,26 +1104,6 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                 r_inf <= tol
             }
         };
-        // #740 gate-4 root-cause probe: expose the inner KKT residual inf-norm
-        // and whether the batched envelope-only override is eligible to fire, so
-        // the gate can attribute a ψ-gradient ≠ FD gap to a dropped β-response.
-        // Diagnostic only; gated to a live capture guard so production never pays.
-        if crate::solver::estimate::reml::unified::debug_stash::capture_requested() {
-            let r_inf = match inner.kkt_residual.as_ref() {
-                None => 0.0,
-                Some(residual) => residual
-                    .as_array()
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max),
-            };
-            crate::solver::estimate::reml::unified::debug_stash::store_kkt_probe(
-                r_inf,
-                !has_configured_rho_prior
-                    && batched_gradient_contract_allows_override
-                    && inner_kkt_residual_is_negligible,
-            );
-        }
         let mut batched_gradient_override: Option<Array1<f64>> = None;
         if !has_configured_rho_prior
             && batched_gradient_contract_allows_override

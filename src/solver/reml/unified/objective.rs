@@ -1085,15 +1085,6 @@ pub fn reml_laml_evaluate(
     // All extended coordinates store canonical fixed-β stationarity
     // derivatives g_i = F_{βi}. IFT gives β_i = -H^{-1}g_i, exactly like
     // the ρ block.
-    // Per-call sink for the EIG-DECOMP diagnostic stash. Test builds populate
-    // this on the rayon worker for `ext_idx == 0`; after the par_iter completes
-    // the calling thread copies it into its own thread-local via
-    // `debug_stash::store_terms`. Building the stash inside the worker and
-    // handing it back through a per-call sink eliminates the cross-thread
-    // overwrites that a process-global sink suffered under concurrent tests.
-    let ext_stash_sink: std::sync::Arc<std::sync::Mutex<Option<debug_stash::TermStash>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let ext_stash_sink_for_closure = ext_stash_sink.clone();
     let ext_grad_entries: Result<Vec<(usize, f64)>, String> = (0..ext_dim)
         .into_par_iter()
         .map(|ext_idx| {
@@ -1126,23 +1117,6 @@ pub fn reml_laml_evaluate(
             // that cost surface within FD precision — see the `c_nontrivial`
             // gate in `build_dense_assembly` / `build_dense_original_assembly`.
             // Drops into the `None` arm below in that branch.
-            // Diagnostic stash for the iso-κ Duchon FD investigation. Filled
-            // only for the first extended coordinate (`ext_idx == 0`), only
-            // when the log|H| contribution is included, and only while a test
-            // holds a `debug_stash::CaptureGuard`. The capture is far from
-            // free — it re-derives the drift, runs three extra spectral
-            // traces (one of them the unprojected full-space trace) and a
-            // second cubic IFT-correction pass — which at large scale
-            // multiplied the dominant `ext_coord_trace` stage several-fold
-            // per outer eval. Production gradient evals therefore skip it
-            // entirely; the consuming FD tests opt in via the guard.
-            let mut diag_stash: Option<debug_stash::TermStash> =
-                if incl_logdet_h && ext_idx == 0 && debug_stash::capture_requested() {
-                    Some(debug_stash::TermStash::default())
-                } else {
-                    None
-                };
-
             let trace_logdet_i = if !incl_logdet_h {
                 0.0
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
@@ -1167,111 +1141,6 @@ pub fn reml_laml_evaluate(
                     }
                 }
             };
-
-            // For the iso-κ Duchon FD investigation, capture the production
-            // trace plus the unprojected full-space counterpart so the
-            // `_pins_trace` test can verify that the projection kernel
-            // changes the trace by an order of magnitude relative to
-            // `G_ε(H)`. The drift for `ext_idx == 0` is recomputed here
-            // regardless of which precomputed-trace branch fed
-            // `trace_logdet_i`; this is cheap (a single coord) and lets the
-            // diagnostic survive whether the gradient took the
-            // `projected_trace_values` batched path or the per-coord
-            // `else` fallback.
-            if let Some(stash) = diag_stash.as_mut() {
-                stash.projection_active = Some(solution.penalty_subspace_trace.is_some());
-                stash.production_tr = Some(trace_logdet_i);
-                // HVP ψ-gradient attribution (#740): expose the cost-derivative
-                // `a` and penalty-logdet `ld_s` pieces of this coordinate's
-                // outer gradient so a per-component FD of the outer value can be
-                // matched against each analytic term independently.
-                stash.coord_a = Some(coord.a);
-                stash.coord_ld_s = Some(coord.ld_s);
-                // Outer VALUE components, so a per-component FD of the objective
-                // (β̂ re-solved at each ψ) can be matched against each analytic
-                // gradient piece: FD(log_det_h) ↔ production_tr (probe b),
-                // FD(cost − ½log_det_h + ½log_det_s) ↔ coord_a (probe a),
-                // FD(log_det_s) ↔ coord_ld_s.
-                stash.coord_log_det_h = Some(log_det_h);
-                stash.coord_log_det_s = Some(log_det_s);
-                stash.coord_cost = Some(cost);
-                let correction = ext_corrections[ext_idx].as_ref();
-                let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
-                let unprojected = match &drift {
-                    DriftDerivResult::Dense(matrix) => hop.trace_logdet_h_k(matrix, None),
-                    DriftDerivResult::Operator(op) => hop.trace_logdet_operator(op.as_ref()),
-                };
-                stash.unprojected_tr = Some(unprojected);
-
-                // #901-layer-2 split: the same kernel K traced against the
-                // FROZEN drift B_i (no cubic correction) and against the
-                // cubic correction D_βH[−v_i] alone, so the FD reference can
-                // attribute the desync to one component.
-                let frozen_only = hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
-                let trace_with_kernel = |d: &DriftDerivResult| -> f64 {
-                    match (&solution.penalty_subspace_trace, d) {
-                        (Some(kernel), DriftDerivResult::Dense(m)) => {
-                            kernel.trace_projected_logdet(m)
-                        }
-                        (Some(kernel), DriftDerivResult::Operator(op)) => {
-                            kernel.trace_operator(op.as_ref())
-                        }
-                        (None, DriftDerivResult::Dense(m)) => hop.trace_logdet_h_k(m, None),
-                        (None, DriftDerivResult::Operator(op)) => {
-                            hop.trace_logdet_operator(op.as_ref())
-                        }
-                    }
-                };
-                let frozen_tr = trace_with_kernel(&frozen_only);
-                stash.frozen_tr = Some(frozen_tr);
-                stash.correction_tr = Some(trace_logdet_i - frozen_tr);
-
-                // #901-layer-2 candidate fix: recompute the cubic correction
-                // with the IFT direction taken from the SAME pseudo-inverse the
-                // cost uses (`v = H_pen⁺·coord.g`) instead of the full
-                // `hop.solve`. The intrinsic kernel keeps the null(S₊)
-                // curvature the old range(S₊) projection dropped AND floors the
-                // truly-unidentified `ker(H_pen)` directions the full solve
-                // over-amplifies. If this matches the FD cubic (≈ fd_total −
-                // frozen_tr), the desync is the IFT direction using a different
-                // inverse than the criterion.
-                if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-                    let v_proj = kernel.apply_pseudo_inverse(&coord.g);
-                    if let Ok(corr_proj) =
-                        effective_deriv.hessian_derivative_correction_result(&v_proj)
-                    {
-                        let total_proj = hyper_coord_total_drift_result(
-                            &coord.drift,
-                            corr_proj.as_ref(),
-                            hop.dim(),
-                        );
-                        let proj_total_tr = trace_with_kernel(&total_proj);
-                        stash.correction_tr_proj = Some(proj_total_tr - frozen_tr);
-                    }
-                }
-            }
-
-            // Per-row diagnostic stash: captures term4's `c · X_τβ̂` diagonal
-            // plus `X · v_ψ` per row, where v_ψ = ext_v_is[ext_idx] = hop⁻¹·coord.g.
-            // The diagonal entering the correction sandwich is `c · X · v_ψ`;
-            // multiplying by the test's known c recovers that diagonal.
-            if let Some(mut stash) = diag_stash.take() {
-                if let Some(op_arc) = coord.drift.operator.as_ref()
-                    && let Some(sd) = op_arc.as_sparse_directional()
-                {
-                    stash.c_x_tau_beta_diag = sd.c_x_tau_beta.clone();
-                    let v_i = &ext_v_is[ext_idx];
-                    stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
-                }
-                // Hand the stash back through the per-call sink. The
-                // calling thread copies it into its own thread-local
-                // after the par_iter completes, so concurrent tests
-                // each end up reading their OWN ext_idx==0 capture
-                // rather than racing on a shared global slot.
-                *ext_stash_sink_for_closure
-                    .lock()
-                    .expect("EIG-DECOMP stash sink mutex poisoned") = Some(stash);
-            }
 
             let value = outer_gradient_entry(
                 coord.a,
@@ -1353,21 +1222,6 @@ pub fn reml_laml_evaluate(
             }
             grad[k + ext_idx] += -linear + 0.5 * quadratic;
         }
-    }
-
-    // Drain the per-call EIG-DECOMP sink into the calling thread's
-    // thread-local stash. The rayon worker that produced the stash may
-    // live on a different thread, but `store_terms` writes to the
-    // current thread's TLS — which is also the thread the test will
-    // call `take_terms()` from, because everything between
-    // `evaluate_joint_reml_outer_eval_at_theta` and `reml_laml_evaluate`
-    // is synchronous and stays on the test thread.
-    if let Some(stash) = ext_stash_sink
-        .lock()
-        .expect("EIG-DECOMP stash sink mutex poisoned")
-        .take()
-    {
-        debug_stash::store_terms(stash);
     }
 
     // Apply the ρ-GRADIENT half of the guarded Tierney–Kadane correction built
