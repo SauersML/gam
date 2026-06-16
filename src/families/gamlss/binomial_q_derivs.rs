@@ -11,9 +11,43 @@
 //! other link falls back to the generic inverse-link jet plus the analytic
 //! fourth derivative of the inverse-link pdf. All functions here are pure.
 
+use crate::families::jet_tower::Tower4;
 use crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::types::{InverseLink, StandardLink};
+
+/// The generic-link binomial NLL `F(q) = −ℓ(μ(q))` as ONE `Tower4<1>` jet in
+/// the latent coordinate `q` (issue #932 migration of the hand-written
+/// composition tower).
+///
+/// The two halves of the calculus enter through their single sources:
+/// * the **inner** map `μ(q)` arrives as its stored jet `(μ, d1, d2, d3, d4)`,
+///   seeded as the value/first/second/third/fourth channels of a `Tower4<1>`;
+/// * the **outer** map `ℓ(μ)` enters as the hand-certified μ-space derivative
+///   stack `[·, ℓ′, ℓ″, ℓ‴, ℓ⁗]` from [`binomial_loglik_mu_derivatives`]
+///   through [`Tower4::compose_unary`] (exact multivariate Faà di Bruno).
+///
+/// The composition's Leibniz/Faà-di-Bruno coefficients — the very cross terms
+/// the old hand path (`ellmumu·μ′² + ellmu·μ″`, the 6/3/4-weighted fourth-order
+/// sum, …) wrote out by hand and that the #736/#947/#948 bugs lived in — are
+/// now produced mechanically. The returned tower's `g`/`h`/`t3`/`t4` channels
+/// are `ℓ(μ(q))`'s exact `dⁿℓ/dqⁿ`; callers negate for the NLL `F`.
+///
+/// `ℓ(μ)`'s value channel is irrelevant (only derivative channels are
+/// consumed), so the stack's slot-0 entry is left at `0.0`. Saturation /
+/// non-finite-jet short-circuits stay with the callers, exactly as before.
+#[inline]
+fn binomial_loglik_q_tower(y: f64, mu: f64, d1: f64, d2: f64, d3: f64, d4: f64) -> Tower4<1> {
+    let (ellmu, ellmumu, ellmumum, ellmumumum) = binomial_loglik_mu_derivatives(y, mu);
+    // μ(q) as the inner jet: value mu, derivatives d1..d4 in the single slot.
+    let mut mu_tower = Tower4::<1>::constant(mu);
+    mu_tower.g[0] = d1;
+    mu_tower.h[0][0] = d2;
+    mu_tower.t3[0][0][0] = d3;
+    mu_tower.t4[0][0][0][0] = d4;
+    // ℓ(μ) via Faà di Bruno; slot-0 (the value f(u)) is unused downstream.
+    mu_tower.compose_unary([0.0, ellmu, ellmumu, ellmumum, ellmumumum])
+}
 
 /// Exact derivatives of the per-row binomial log-likelihood in μ-space,
 ///   ℓ(μ) = y·ln μ + (1−y)·ln(1−μ),
@@ -108,12 +142,14 @@ pub(super) fn binomial_score_curvaturethird_from_jet(
     if weight == 0.0 || !binomial_mu_is_interior(mu) {
         return (0.0, 0.0, 0.0);
     }
-    let (ellmu, ellmumu, ellmumum, _) = binomial_loglik_mu_derivatives(y, mu);
-
-    let score_q = weight * ellmu * d1;
-    let d2ell_dq2 = weight * (ellmumu * d1 * d1 + ellmu * d2);
-    let curvature_q = -d2ell_dq2;
-    let third_q = weight * (ellmumum * d1 * d1 * d1 + 3.0 * ellmumu * d1 * d2 + ellmu * d3);
+    // The first three q-derivatives of ℓ(μ(q)) come from ONE jet composition
+    // (issue #932): the inner μ-jet (d1,d2,d3; d4 unused below third order)
+    // composed with the μ-space ℓ-derivative stack. The hand-summed chain rule
+    // `ellmumu·d1² + ellmu·d2` etc. is now the tower's `g`/`h`/`t3` channels.
+    let tower = binomial_loglik_q_tower(y, mu, d1, d2, d3, 0.0);
+    let score_q = weight * tower.g[0];
+    let curvature_q = -weight * tower.h[0][0];
+    let third_q = weight * tower.t3[0][0][0];
     (score_q, curvature_q, third_q)
 }
 
@@ -468,13 +504,12 @@ pub(super) fn binomial_neglog_q_fourth_derivative_from_jet(
     {
         return 0.0;
     }
-    let (ellmu, ellmumu, ellmumum, ellmumumum) = binomial_loglik_mu_derivatives(y, mu);
-    let fourth_q = weight
-        * (ellmumumum * d1.powi(4)
-            + 6.0 * ellmumum * d1 * d1 * d2
-            + ellmumu * (3.0 * d2 * d2 + 4.0 * d1 * d3)
-            + ellmu * d4);
-    -fourth_q
+    // m4 = −d⁴ℓ/dq⁴ from the SAME single jet composition (issue #932): the
+    // tower's fourth channel is the exact Faà-di-Bruno fourth derivative
+    // `ℓ⁗·d1⁴ + 6ℓ‴·d1²d2 + ℓ″·(3d2² + 4d1·d3) + ℓ′·d4`, mechanized rather than
+    // hand-summed (the term whose off-by-one was issue #947).
+    let tower = binomial_loglik_q_tower(y, mu, d1, d2, d3, d4);
+    -weight * tower.t4[0][0][0][0]
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +658,69 @@ mod tests {
     pub(crate) fn cauchit_m3(y: f64, weight: f64, q: f64) -> f64 {
         let (mu, d1, d2, d3, _d4) = cauchit_jet(q);
         binomial_neglog_q_derivatives_from_jet(y, weight, mu, d1, d2, d3).2
+    }
+
+    /// The PRE-MIGRATION hand-summed chain rule for the generic-link binomial
+    /// q-derivative tower, kept verbatim here as the bit-identity witness for the
+    /// #932 `Tower4`-composition migration. If the tower path ever drifts from
+    /// the hand calculus these four channels disagree.
+    fn legacy_hand_q_derivatives(
+        y: f64,
+        weight: f64,
+        mu: f64,
+        d1: f64,
+        d2: f64,
+        d3: f64,
+        d4: f64,
+    ) -> (f64, f64, f64, f64) {
+        let (ellmu, ellmumu, ellmumum, ellmumumum) = binomial_loglik_mu_derivatives(y, mu);
+        let score_q = weight * ellmu * d1;
+        let curvature_q = -weight * (ellmumu * d1 * d1 + ellmu * d2);
+        let third_q = weight * (ellmumum * d1 * d1 * d1 + 3.0 * ellmumu * d1 * d2 + ellmu * d3);
+        let fourth_q = weight
+            * (ellmumumum * d1.powi(4)
+                + 6.0 * ellmumum * d1 * d1 * d2
+                + ellmumu * (3.0 * d2 * d2 + 4.0 * d1 * d3)
+                + ellmu * d4);
+        (score_q, curvature_q, third_q, -fourth_q)
+    }
+
+    /// #932 migration bit-identity: the `Tower4<1>` composition path
+    /// (`binomial_score_curvaturethird_from_jet` /
+    /// `binomial_neglog_q_fourth_derivative_from_jet`) reproduces the legacy
+    /// hand-summed chain rule to machine precision on a dense (y, w, q)×link grid
+    /// of interior points. Exercises cauchit and logit inner jets so every
+    /// Faà-di-Bruno term participates with a nonzero coefficient.
+    #[test]
+    pub(crate) fn generic_jet_tower_matches_legacy_hand_chain_rule() {
+        for &(y, w) in &[
+            (0.3_f64, 2.0_f64),
+            (0.7, 1.0),
+            (0.0, 1.5),
+            (1.0, 0.5),
+            (0.42, 3.0),
+        ] {
+            for &q in &[-1.3_f64, -0.4, 0.0, 0.5, 0.7, 1.3, 2.0] {
+                for &(mu, d1, d2, d3, d4) in &[cauchit_jet(q), logit_jet(q)] {
+                    let (s, c, t) = binomial_score_curvaturethird_from_jet(y, w, mu, d1, d2, d3);
+                    let m4 =
+                        binomial_neglog_q_fourth_derivative_from_jet(y, w, mu, d1, d2, d3, d4);
+                    let (ls, lc, lt, lm4) =
+                        legacy_hand_q_derivatives(y, w, mu, d1, d2, d3, d4);
+                    let tol = 1e-12;
+                    let close = |label: &str, got: f64, want: f64| {
+                        assert!(
+                            (got - want).abs() <= tol * want.abs().max(1.0),
+                            "{label} (y={y}, w={w}, q={q}, mu={mu}): tower {got:+.17e} vs legacy {want:+.17e}"
+                        );
+                    };
+                    close("score_q", s, ls);
+                    close("curvature_q", c, lc);
+                    close("third_q", t, lt);
+                    close("m4", m4, lm4);
+                }
+            }
+        }
     }
 
     #[test]

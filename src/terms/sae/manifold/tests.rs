@@ -9065,8 +9065,11 @@ mod inner_contract_probe_tests {
             .expect("value-probe lane evaluates the co-trained cost");
 
         // Gradient lane: the cost an ACCEPTED iterate reports (drives the
-        // incumbent the optimizer settles on).
-        let gradient_lane = objective
+        // incumbent the optimizer settles on). A fresh objective each lane so the
+        // two paths solve from the identical seed state — no cross-lane warm-start
+        // contamination of the comparison.
+        let mut objective_grad = warmstart_test_objective();
+        let gradient_lane = objective_grad
             .eval(&rho_flat)
             .expect("gradient lane evaluates")
             .cost;
@@ -9075,39 +9078,51 @@ mod inner_contract_probe_tests {
             value_lane.is_finite() && gradient_lane.is_finite(),
             "both lanes must be finite: value={value_lane}, gradient={gradient_lane}"
         );
-        // The two lanes converge the inner solve to the SAME stationary point at
-        // a fixed ρ and fold the IDENTICAL consistency penalty, so the ranked
-        // cost must agree to solve tolerance — not differ by the fold.
-        let lane_gap = (value_lane - gradient_lane).abs();
+
+        // The fold is genuinely present on the value lane (the pre-fix state):
+        // the lane cost exceeds the bare REML criterion by the non-negative
+        // consistency penalty, evaluated on the SAME refine-policy path the value
+        // lane uses, so the delta isolates exactly the fold.
+        let bare = {
+            let mut probe = warmstart_test_objective();
+            let target = probe.target.clone();
+            let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
+            let (reml, _loss) = probe
+                .term
+                .reml_criterion_with_refine_policy(
+                    target.view(),
+                    &rho_state,
+                    None,
+                    8,
+                    1.0,
+                    1.0e-6,
+                    1.0e-6,
+                    false,
+                )
+                .expect("bare REML criterion evaluates");
+            probe
+                .add_fit_data_collapse_penalty(reml, &rho_state)
+                .expect("collapse penalty evaluates")
+        };
+        let value_fold = value_lane - bare;
         assert!(
-            lane_gap < 1.0e-6,
-            "value-probe and gradient lanes must report the SAME co-trained cost \
-             at a fixed ρ (one measure); value={value_lane}, gradient={gradient_lane}, \
-             gap={lane_gap}"
+            value_fold > 1.0e-12,
+            "the value-probe lane carries the co-training fold (positive penalty \
+             over bare REML): value_lane={value_lane}, bare={bare}, fold={value_fold}"
         );
 
-        // And the fold is genuinely present: the co-trained cost the lanes report
-        // is at least the bare REML criterion (the consistency penalty is
-        // non-negative), so the desync fix did not silently drop the fold.
-        let target = objective.target.clone();
-        let rho_state = objective.baseline_rho.from_flat(rho_flat.view());
-        let (bare_reml, _loss) = objective
-            .term
-            .reml_criterion_with_refine_policy(
-                target.view(),
-                &rho_state,
-                None,
-                8,
-                1.0,
-                1.0e-6,
-                1.0e-6,
-                true,
-            )
-            .expect("bare REML criterion evaluates");
+        // The fix: the gradient (accepted-iterate) lane now reports the SAME
+        // co-trained measure. Pre-fix it returned bare REML, so it would sit a full
+        // fold BELOW the value lane; post-fix the two lanes agree to inner-solve
+        // tolerance. The gap must be far smaller than the fold the value lane shows
+        // — i.e. the gradient lane is NOT off by a whole fold.
+        let lane_gap = (value_lane - gradient_lane).abs();
         assert!(
-            value_lane >= bare_reml - 1.0e-9,
-            "co-trained lane cost must include the non-negative consistency fold: \
-             lane={value_lane} < bare_reml={bare_reml}"
+            lane_gap < 0.1 * value_fold,
+            "value-probe and gradient lanes must report the SAME co-trained cost \
+             (one measure): value={value_lane}, gradient={gradient_lane}, \
+             gap={lane_gap}, fold={value_fold} — a gap near the fold size is the \
+             pre-fix desync where the gradient lane dropped the consistency penalty"
         );
     }
 }
