@@ -1153,7 +1153,7 @@ mod sigma_cubature_accumulation_tests {
             .collect();
 
         // Expected: V̂_p = A_0 + J · V_ρ,r · Jᵀ. Symmetric by
-        // construction, so no enforce_symmetry needed for the oracle.
+        // construction, so no symmetrize_in_place needed for the oracle.
         let jvjt = jacobian.dot(&v_rho_r).dot(&jacobian.t());
         let expected = &a0 + &jvjt;
 
@@ -2056,7 +2056,7 @@ mod sigma_cubature_accumulation_tests {
     ///     symmetric and PSD
     /// So the output should be symmetric to f64 round-off for any
     /// symmetric A_m. Pins this invariant since the production caller
-    /// passes the output to `enforce_symmetry` and any drift here is a
+    /// passes the output to `symmetrize_in_place` and any drift here is a
     /// silent bug masked by that downstream cleanup.
     #[test]
     pub(crate) fn cubature_output_is_symmetric_for_symmetric_inputs() {

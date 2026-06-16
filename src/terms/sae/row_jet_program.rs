@@ -42,6 +42,12 @@
 
 use crate::families::jet_tower::Tower4;
 
+/// Sentinel in [`SaeReconstructionRowProgram::coord_slot`] for an atom
+/// coordinate that is fixed in this row's local chart (compact active-set rows
+/// omit inactive atom coordinates, but softmax logit derivatives can still see
+/// that atom's decoded value as a constant).
+pub const SAE_FIXED_COORD_SLOT: usize = usize::MAX;
+
 /// The gate nonlinearity `ζ(ℓ)` of the SAE assignment, as the row program sees
 /// it. The production term carries the same two smooth branches (softmax over a
 /// shared partition; per-atom IBP/JumpReLU sigmoid); the program reproduces the
@@ -98,7 +104,9 @@ impl AtomRowBasisJet {
             let slot = coord_slots[axis];
             let d1 = self.d_phi[basis_col][axis];
             if d1 != 0.0 {
-                acc = acc + Tower4::<K>::variable(0.0, slot).scale(d1);
+                if slot != SAE_FIXED_COORD_SLOT {
+                    acc = acc + Tower4::<K>::variable(0.0, slot).scale(d1);
+                }
             }
         }
         // ½ Σ_ab d²Φ · δ_a δ_b, the quadratic term of the local Taylor model.
@@ -106,6 +114,11 @@ impl AtomRowBasisJet {
             for axis_b in 0..self.latent_dim {
                 let d2 = self.d2_phi[basis_col][axis_a][axis_b];
                 if d2 == 0.0 {
+                    continue;
+                }
+                if coord_slots[axis_a] == SAE_FIXED_COORD_SLOT
+                    || coord_slots[axis_b] == SAE_FIXED_COORD_SLOT
+                {
                     continue;
                 }
                 let va = Tower4::<K>::variable(0.0, coord_slots[axis_a]);
@@ -141,6 +154,11 @@ pub struct SaeReconstructionRowProgram {
     pub gate_value: Vec<f64>,
     /// Current gate logits `ℓ_k` at the row.
     pub logits: Vec<f64>,
+    /// Per-atom multiplicative scale for independent logistic gates. This is
+    /// the IBP stick-breaking prior `π_k` for IBP-MAP, `1` for active JumpReLU,
+    /// and `0` for JumpReLU rows at/below the hard threshold. Unused for
+    /// softmax.
+    pub gate_scale: Vec<f64>,
     /// Per-atom logistic shift (IBP offset / JumpReLU threshold); unused for
     /// softmax.
     pub gate_shift: Vec<f64>,
@@ -190,7 +208,7 @@ impl SaeReconstructionRowProgram {
                 // σ(x) = 1 / (1 + exp(−x)).
                 let x = (l - self.gate_shift[atom]).scale(inv_tau);
                 let one = Tower4::<K>::constant(1.0);
-                one / (one + x.scale(-1.0).exp())
+                (one / (one + x.scale(-1.0).exp())).scale(self.gate_scale[atom])
             }
         }
     }
@@ -438,6 +456,7 @@ mod tests {
             atoms: vec![mk_atom(0.0), mk_atom(1.0)],
             gate_value,
             logits,
+            gate_scale: vec![1.0, 1.0],
             gate_shift: vec![0.0, 0.0],
             gate: RowGate::Softmax { inv_tau },
             logit_slot: vec![Some(0), Some(1)],
@@ -788,6 +807,7 @@ mod tests {
             }],
             gate_value: vec![sigma],
             logits: vec![logit],
+            gate_scale: vec![1.0],
             gate_shift: vec![shift],
             gate: RowGate::PerAtomLogistic { inv_tau },
             logit_slot: vec![Some(0)],

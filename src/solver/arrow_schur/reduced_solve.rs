@@ -1566,7 +1566,7 @@ pub struct ClusterJacobiPreconditioner {
 }
 
 impl ClusterJacobiPreconditioner {
-    pub fn from_arrow_schur<B: BatchedBlockSolver>(
+    pub fn from_arrow_schur<B: BatchedBlockSolver + Sync>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -1598,7 +1598,7 @@ impl ClusterJacobiPreconditioner {
         Self::build_from_column_groups(sys, htt_factors, ridge_beta, backend, &col_groups)
     }
 
-    pub(crate) fn build_from_column_groups<B: BatchedBlockSolver>(
+    pub(crate) fn build_from_column_groups<B: BatchedBlockSolver + Sync>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -1627,9 +1627,17 @@ impl ClusterJacobiPreconditioner {
             for bi in 0..b {
                 s_block[[bi, bi]] += ridge_beta;
             }
-            let mut col_vec = Array1::<f64>::zeros(d);
-            let mut solved_cols = Array2::<f64>::zeros((d, b));
-            for (row_idx, row) in sys.rows.iter().enumerate() {
+            // Per-row Schur contribution `-= H_tβ[cols]ᵀ (H_tt)⁻¹ H_tβ[cols]`,
+            // subtracted into a (possibly thread-local) `b×b` accumulator. The
+            // rows are independent, so this is the per-cluster analogue of the
+            // already row-parallel `build_block_jacobi` body (#1017): at the SAE
+            // LLM shape the `Σ_i di·b` triangular solves plus the `b²·di` cross
+            // product are the cluster build's whole per-row cost.
+            let cluster_row_into = |row_idx: usize,
+                                    row: &ArrowRowBlock,
+                                    acc: &mut Array2<f64>| {
+                let mut col_vec = Array1::<f64>::zeros(d);
+                let mut solved_cols = Array2::<f64>::zeros((d, b));
                 for bj in 0..b {
                     let gj = cols[bj];
                     for c in 0..d {
@@ -1644,12 +1652,41 @@ impl ClusterJacobiPreconditioner {
                 for bi in 0..b {
                     let gi = cols[bi];
                     for bj in 0..b {
-                        let mut acc = 0.0;
+                        let mut dot = 0.0;
                         for c in 0..d {
-                            acc += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                            dot += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
                         }
-                        s_block[[bi, bj]] -= acc;
+                        acc[[bi, bj]] -= dot;
                     }
+                }
+            };
+            // Fan over fixed 64-row chunks above the threshold, staying serial for
+            // the handful-of-rows non-SAE callers and inside a rayon worker
+            // (topology-race nesting guard). Chunk partials are folded
+            // left-to-right so the result is bit-identical to the serial path.
+            let n = sys.rows.len();
+            let parallel =
+                n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+            if parallel {
+                use rayon::prelude::*;
+                const CHUNK: usize = 64;
+                let partials: Vec<Array2<f64>> = (0..n)
+                    .into_par_iter()
+                    .chunks(CHUNK)
+                    .map(|idxs| {
+                        let mut local = Array2::<f64>::zeros((b, b));
+                        for i in idxs {
+                            cluster_row_into(i, &sys.rows[i], &mut local);
+                        }
+                        local
+                    })
+                    .collect();
+                for local in &partials {
+                    s_block += local;
+                }
+            } else {
+                for (row_idx, row) in sys.rows.iter().enumerate() {
+                    cluster_row_into(row_idx, row, &mut s_block);
                 }
             }
             symmetrize_upper_from_lower(&mut s_block);
@@ -1692,7 +1729,7 @@ pub struct AdditiveSchwarzPreconditioner {
 }
 
 impl AdditiveSchwarzPreconditioner {
-    pub fn from_arrow_schur<B: BatchedBlockSolver>(
+    pub fn from_arrow_schur<B: BatchedBlockSolver + Sync>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,

@@ -128,6 +128,7 @@ use std::sync::Arc;
 
 use super::jeffreys_subspace::{
     floored_inverse, jeffreys_antiderivative, jeffreys_antiderivative_floor_sensitivity,
+    floored_inverse_divided_differences,
 };
 use super::reml_outer_engine::PenaltySubspaceTrace;
 
@@ -663,6 +664,49 @@ impl JeffreysLogdetAtom {
             .map(|&lam| jeffreys_antiderivative_floor_sensitivity(lam, self.floor))
             .sum()
     }
+
+    /// Exact Daleckii-Krein curvature contribution `-∇²Φ` for the same
+    /// spectrum and reduced drifts that emit [`value`](CriterionAtom::value)
+    /// and [`frozen_d1`](CriterionAtom::frozen_d1).
+    ///
+    /// This is the live second-order Jeffreys atomization pass: the rows
+    /// `vec(Ṽ_a)` and `vec(Ψ ∘ Ṽ_a)` are assembled from this atom's
+    /// `reduced_drift` map, with `Ψ` computed from the same `(eigvals, floor)`
+    /// pair as the value/gradient functions. The omitted mixed second-
+    /// directional-Hessian completion remains in
+    /// `joint_jeffreys_second_order_completion`; this method owns the
+    /// divided-difference body that `joint_jeffreys_term` consumes directly.
+    pub fn second_order_curvature(&self, axis_count: usize) -> Result<Array2<f64>, String> {
+        let m = self.eigvals.len();
+        let psi = floored_inverse_divided_differences(&self.eigvals, self.floor);
+        let mut a_rows = Array2::<f64>::zeros((axis_count, m * m));
+        let mut aw_rows = Array2::<f64>::zeros((axis_count, m * m));
+        for axis in 0..axis_count {
+            let reduced = self.reduced_drift.get(&axis).ok_or_else(|| {
+                format!(
+                    "jeffreys_logdet second-order curvature missing reduced drift for axis {axis}"
+                )
+            })?;
+            if reduced.dim() != (m, m) {
+                return Err(format!(
+                    "jeffreys_logdet reduced drift shape for axis {axis} is {:?}, expected ({m}, {m})",
+                    reduced.dim()
+                ));
+            }
+            let mut col = 0usize;
+            for i in 0..m {
+                for j in 0..m {
+                    let a_ij = reduced[[i, j]];
+                    a_rows[[axis, col]] = a_ij;
+                    aw_rows[[axis, col]] = psi[[i, j]] * a_ij;
+                    col += 1;
+                }
+            }
+        }
+        let mut hphi = crate::linalg::faer_ndarray::fast_abt(&aw_rows, &a_rows);
+        hphi.mapv_inplace(|v| -0.5 * self.gate_weight * v);
+        Ok(hphi)
+    }
 }
 
 impl CriterionAtom for JeffreysLogdetAtom {
@@ -1082,9 +1126,24 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // this atom once per prior assembly and projects configured-prior cost,
 // gradient, and diagonal Hessian from that one emission; the old
 // `compute_configured_rho_prior_{cost,grad,hess}` wrappers and the generic
-// `soft_prior_for_mode` closure helper are deleted. The soft numerical guard
-// prior remains a separate local contribution for now; TK and beta-Gaussian
+// `soft_prior_for_mode` closure helper are deleted. TK and beta-Gaussian
 // prior atoms remain unported.
+//
+// LANDED (pass 4d, soft numerical-guard prior atom): `SoftRhoGuardPriorAtom`
+// ports the separable `log cosh` ρ-barrier. The three `compute_soft_prior{cost,
+// grad,hess}` functions (and the `add_soft_priorhessian_in_place` helper) each
+// re-derived the anchor, the `a = sharpness/bound` scale, and the `tanh`
+// argument independently — the canonical desync surface, since the three
+// formulas are the antiderivative chain `∫ tanh = log cosh`,
+// `d tanh = 1 − tanh²`. `evaluate_anchored` now walks that chain ONCE per
+// coordinate (one `tanh` feeds value, gradient, and curvature), and the live
+// `build_prior` + `#778` cost-order short-circuit call sites read cost,
+// gradient, and Hessian from this one atom via `soft_rho_guard_prior_atom`. The
+// three split functions are deleted in the same commit. Isolation + FD pin:
+// `soft_rho_guard_prior_atom_value_gradient_hessian_are_one_chain` asserts the
+// closed-form value/gradient/diagonal-Hessian and an independent central-FD
+// oracle (FD of value == analytic gradient, FD of gradient == analytic
+// curvature) per coordinate. The beta-Gaussian prior atom remains unported.
 //
 // LANDED (pass 4c, TK/sampled-correction application atom): the live
 // runtime post-evaluator no longer splices `TkCorrectionTerms` into
@@ -1471,6 +1530,135 @@ mod tests {
         assert!(atom.frozen_d1(&dir_absent).abs() < 1e-12);
         assert_eq!(atom.gradient().expect("gradient"), &array![0.25, -0.5]);
         assert_eq!(atom.hessian().expect("hessian")[[1, 1]], 3.0);
+    }
+
+    /// Soft numerical-guard prior atom: the `log cosh` barrier's value,
+    /// gradient, and diagonal Hessian are ONE emission of the antiderivative
+    /// chain, so they cannot drift apart (the #931 desync-by-construction kill).
+    ///
+    /// Hand-anchored on a single coordinate with `w=2, sharpness=4, bound=8,
+    /// anchor=0.5` and `ρ = (1.5, 0.5, −1.5)` so `a = 4/8 = 0.5`:
+    ///   x_i = a(ρ_i − anchor) = (0.5, 0.0, −1.0).
+    ///   value  = w Σ log cosh(x) = 2·(log cosh 0.5 + log cosh 0 + log cosh 1).
+    ///   grad_i = w·a·tanh(x_i)   = 1.0·(tanh 0.5, 0, tanh(−1)).
+    ///   hess_i = w·a²·(1−tanh²)  = 0.5·(sech²0.5, 1, sech²1).
+    /// An independent central FD of the value reproduces the gradient and an FD
+    /// of the gradient reproduces the diagonal Hessian — the two analytic
+    /// channels are exactly the value's first and second derivatives.
+    #[test]
+    pub(crate) fn soft_rho_guard_prior_atom_value_gradient_hessian_are_one_chain() {
+        let (w, sharp, bound, anchor) = (2.0_f64, 4.0_f64, 8.0_f64, 0.5_f64);
+        let rho = array![1.5_f64, 0.5_f64, -1.5_f64];
+        let a = sharp / bound;
+
+        let atom = SoftRhoGuardPriorAtom::evaluate_anchored(&rho, w, sharp, bound, anchor);
+        assert_eq!(atom.name(), "soft_rho_guard_prior");
+        assert!(
+            atom.beta_channel().is_none(),
+            "soft guard prior is θ-only and separable"
+        );
+        assert!(atom.stratum().is_none(), "smooth everywhere");
+
+        // Closed-form value.
+        let expected_value: f64 = w
+            * rho
+                .iter()
+                .map(|&r| (a * (r - anchor)).cosh().ln())
+                .sum::<f64>();
+        assert!(
+            (atom.value() - expected_value).abs() < 1e-12,
+            "value {} vs {}",
+            atom.value(),
+            expected_value
+        );
+
+        // The scalar-cost helper used by `build_prior`/the short-circuit path
+        // is the same value, not a parallel recomputation.
+        assert!((atom.cost() - expected_value).abs() < 1e-12);
+
+        // Closed-form gradient = w·a·tanh(x), and frozen_d1 reads exactly it.
+        for (i, &r) in rho.iter().enumerate() {
+            let g = w * a * (a * (r - anchor)).tanh();
+            assert!(
+                (atom.gradient()[i] - g).abs() < 1e-12,
+                "grad[{i}] {} vs {}",
+                atom.gradient()[i],
+                g
+            );
+            let dir = ThetaDirection {
+                index: Some(i),
+                beta_dot: None,
+                h_dot_total: None,
+            };
+            assert!((atom.frozen_d1(&dir) - g).abs() < 1e-12);
+        }
+
+        // Closed-form diagonal Hessian = w·a²·(1−tanh²), off-diagonal zero.
+        let hess = atom.hessian().expect("nonzero curvature");
+        for i in 0..rho.len() {
+            let t = (a * (rho[i] - anchor)).tanh();
+            let h = w * a * a * (1.0 - t * t);
+            assert!((hess[[i, i]] - h).abs() < 1e-12, "hess[{i},{i}]");
+            for j in 0..rho.len() {
+                if i != j {
+                    assert_eq!(hess[[i, j]], 0.0, "off-diagonal must be zero");
+                }
+            }
+        }
+
+        // FD-exactness: the analytic gradient/Hessian ARE the value's
+        // derivatives (independent central differences, per coordinate).
+        let step = 1e-6;
+        for i in 0..rho.len() {
+            let mut rp = rho.clone();
+            let mut rm = rho.clone();
+            rp[i] += step;
+            rm[i] -= step;
+            let vp =
+                SoftRhoGuardPriorAtom::evaluate_anchored(&rp, w, sharp, bound, anchor).value();
+            let vm =
+                SoftRhoGuardPriorAtom::evaluate_anchored(&rm, w, sharp, bound, anchor).value();
+            let fd_grad = (vp - vm) / (2.0 * step);
+            assert!(
+                (fd_grad - atom.gradient()[i]).abs() < 1e-6,
+                "FD grad[{i}] {} vs analytic {}",
+                fd_grad,
+                atom.gradient()[i]
+            );
+
+            let gp = SoftRhoGuardPriorAtom::evaluate_anchored(&rp, w, sharp, bound, anchor)
+                .gradient()[i];
+            let gm = SoftRhoGuardPriorAtom::evaluate_anchored(&rm, w, sharp, bound, anchor)
+                .gradient()[i];
+            let fd_hess = (gp - gm) / (2.0 * step);
+            assert!(
+                (fd_hess - hess[[i, i]]).abs() < 1e-6,
+                "FD hess[{i}] {} vs analytic {}",
+                fd_hess,
+                hess[[i, i]]
+            );
+        }
+
+        // Degenerate guards: zero weight and empty ρ contribute nothing.
+        let zero_w = SoftRhoGuardPriorAtom::evaluate(&rho, 0.0, sharp, bound);
+        assert_eq!(zero_w.value(), 0.0);
+        assert!(zero_w.hessian().is_none());
+        let empty = SoftRhoGuardPriorAtom::evaluate(&Array1::<f64>::zeros(0), w, sharp, bound);
+        assert_eq!(empty.value(), 0.0);
+        assert!(empty.hessian().is_none());
+
+        // CriterionSum fold: θ-only ⇒ profiled d1 is the frozen sum (β̇ unused).
+        let dir0 = ThetaDirection {
+            index: Some(0),
+            beta_dot: Some(Arc::new(array![0.0, 0.0])),
+            h_dot_total: None,
+        };
+        let g0 = w * a * (a * (rho[0] - anchor)).tanh();
+        let sum = CriterionSum {
+            atoms: vec![Box::new(atom)],
+        };
+        assert!((sum.value() - expected_value).abs() < 1e-12);
+        assert!((sum.d1(&dir0) - g0).abs() < 1e-12);
     }
 
     /// The #935 operator pass, end-to-end: [`Sensitivity::fill_direction`]

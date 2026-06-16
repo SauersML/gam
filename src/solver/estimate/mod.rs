@@ -31,10 +31,10 @@ use crate::construction::{CanonicalPenalty, ReparamInvariant};
 use crate::inference::diagnostics::should_emit_h_min_eig_diag;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
-    KahanSum, add_relative_diag_ridge, enforce_symmetry, matrix_inversewith_regularization,
-    row_mismatch_message, stack_offsets,
+    KahanSum, add_relative_diag_ridge, matrix_inversewith_regularization, row_mismatch_message,
+    stack_offsets,
 };
-use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator};
+use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator, symmetrize_in_place};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};

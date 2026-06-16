@@ -204,7 +204,7 @@ fn penalized_hessian_times_influence_equals_weighted_gram() {
                  entrywise gap {worst:.3e} (scale {scale:.3e}, wiggle={wiggle}, \
                  seed={seed}). A non-zero gap means F was either reassembled in \
                  the wrong basis (#1027 root cause) or symmetrized after the \
-                 fact — `enforce_symmetry(F)` makes \
+                 fact — `symmetrize_in_place(F)` makes \
                  H·F_sym = (X'WX + H·X'WX·H⁻¹)/2 ≠ X'WX."
             );
         }
