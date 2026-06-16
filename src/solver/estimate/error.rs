@@ -1,6 +1,7 @@
 use super::*;
 
 /// A comprehensive error type for the model estimation process.
+#[derive(thiserror::Error)]
 pub enum EstimationError {
     #[error("Underlying basis function generation failed: {0}")]
     BasisError(#[from] crate::basis::BasisError),

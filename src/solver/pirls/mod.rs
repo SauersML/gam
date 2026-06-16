@@ -67,9 +67,9 @@ use edf::{
 
 use log_link_working_state::ETA_CLAMP;
 
+pub(crate) use penalty::PirlsPenalty;
 use penalty::{
-    KroneckerQsTransform, PirlsPenalty, WorkingCoordinateDesign, WorkingReparamTransform,
-    attach_penalty_shift,
+    KroneckerQsTransform, WorkingCoordinateDesign, WorkingReparamTransform, attach_penalty_shift,
 };
 
 use pls_solver::solve_penalized_least_squares_implicit;

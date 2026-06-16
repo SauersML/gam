@@ -9,7 +9,7 @@ use crate::types::SasLinkState;
 use ndarray::{Array1, Array2, s};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 pub(crate) mod assembly;
@@ -4474,12 +4474,9 @@ impl EvalCacheManager {
     }
 
     pub(crate) fn cached_eval_bundle(&self, key: &Option<Vec<u64>>) -> Option<EvalShared> {
-        self.current_eval_bundle
-            .read()
-            .unwrap()
-            .as_ref()
-            .filter(|bundle| bundle.matches(key))
-            .cloned()
+        let guard = self.current_eval_bundle.read().unwrap();
+        let bundle: &EvalShared = guard.as_ref()?;
+        bundle.matches(key).then(|| bundle.clone())
     }
 
     pub(crate) fn store_eval_bundle(&self, bundle: EvalShared) {
@@ -4488,12 +4485,9 @@ impl EvalCacheManager {
 
     pub(crate) fn cached_outer_eval(&self, key: &Option<Vec<u64>>) -> Option<OuterEval> {
         let key = key.as_ref()?;
-        self.current_outer_eval
-            .read()
-            .unwrap()
-            .as_ref()
-            .filter(|(cached_key, _)| cached_key == key)
-            .map(|(_, eval)| eval.clone())
+        let guard = self.current_outer_eval.read().unwrap();
+        let (cached_key, eval): &(Vec<u64>, OuterEval) = guard.as_ref()?;
+        (cached_key == key).then(|| eval.clone())
     }
 
     pub(crate) fn store_outer_eval(&self, key: &Option<Vec<u64>>, eval: &OuterEval) {

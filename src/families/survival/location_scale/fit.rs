@@ -784,7 +784,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 crate::families::row_kernel::RowSet::All => {}
                 crate::families::row_kernel::RowSet::Subsample { rows, n_full } => {
                     eval_options.outer_score_subsample = Some(Arc::new(
-                        crate::families::marginal_slope_shared::OuterScoreSubsample::from_weighted_rows(
+                        crate::solver::outer_subsample::OuterScoreSubsample::from_weighted_rows(
                             (**rows).clone(),
                             *n_full,
                             *n_full as u64,

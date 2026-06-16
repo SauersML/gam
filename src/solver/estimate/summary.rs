@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Clone, Debug)]
 pub struct ParametricTermSummary {
     pub name: String,
     pub estimate: f64,

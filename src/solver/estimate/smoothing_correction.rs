@@ -82,10 +82,7 @@ impl RemlConfig {
         }
     }
 }
-const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use thiserror::Error;
+pub(crate) const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 
 /// Small ridge added to the rho-space LAML Hessian before inversion, for
 /// numerical stability when smoothing parameters are weakly identified.
@@ -119,14 +116,14 @@ const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
 // Additional headroom reduces frequent contact with the hard box constraints.
 pub(crate) const RHO_BOUND: f64 = 30.0;
 // Soft interior prior on rho near the box boundaries.
-const RHO_SOFT_PRIOR_WEIGHT: f64 = 1e-6;
-const RHO_SOFT_PRIOR_SHARPNESS: f64 = 4.0;
+pub(crate) const RHO_SOFT_PRIOR_WEIGHT: f64 = 1e-6;
+pub(crate) const RHO_SOFT_PRIOR_SHARPNESS: f64 = 4.0;
 // Adaptive cubature guardrails for bounded correction latency.
-const AUTO_CUBATURE_MAX_RHO_DIM: usize = 12;
-const AUTO_CUBATURE_MAX_EIGENVECTORS: usize = 4;
-const AUTO_CUBATURE_TARGET_VAR_FRAC: f64 = 0.95;
-const AUTO_CUBATURE_MAX_BETA_DIM: usize = 1600;
-const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
+pub(crate) const AUTO_CUBATURE_MAX_RHO_DIM: usize = 12;
+pub(crate) const AUTO_CUBATURE_MAX_EIGENVECTORS: usize = 4;
+pub(crate) const AUTO_CUBATURE_TARGET_VAR_FRAC: f64 = 0.95;
+pub(crate) const AUTO_CUBATURE_MAX_BETA_DIM: usize = 1600;
+pub(crate) const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
 
 /// Smooth, differentiable approximation of `max(dp, floor)` where the floor
 /// and the width of the smoothing band are taken **relative to the supplied

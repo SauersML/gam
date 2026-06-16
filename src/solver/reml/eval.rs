@@ -2,6 +2,7 @@ use super::inner_strategy::GeometryBackendKind;
 use super::penalty_logdet::PenaltyPseudologdet;
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
+use std::sync::atomic::Ordering;
 
 // Relative scale of the diagonal ridge added to the ρ-Hessian before
 // inverting it for sigma-point construction. Matches the analogous IFT

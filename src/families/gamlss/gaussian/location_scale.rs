@@ -630,7 +630,7 @@ impl GaussianLocationScaleFamily {
         dir_j: &LocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        subsample: Option<&[crate::solver::outer_subsample::WeightedOuterRow]>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
@@ -779,7 +779,7 @@ impl GaussianLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        subsample: Option<&[crate::solver::outer_subsample::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;

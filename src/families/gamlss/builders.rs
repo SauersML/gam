@@ -1689,7 +1689,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                             rows,
                             n_full,
                         } => {
-                            let subsample = crate::families::marginal_slope_shared::
+                            let subsample = crate::solver::outer_subsample::
                                 OuterScoreSubsample::from_weighted_rows(
                                     (**rows).clone(),
                                     *n_full,

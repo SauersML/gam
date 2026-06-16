@@ -97,44 +97,40 @@ pub use evaluation::{
 };
 pub(crate) use evaluation::{
     materialize_link_outer_hessian, sas_effective_epsilon, sas_effective_epsilon_second,
-    sas_epsilon_bound, sas_log_delta_bound, sas_log_delta_edge_barriercostgrad,
-    sas_log_delta_edge_barriercostgradhess, sas_log_delta_edge_barrierweight,
+    sas_log_delta_edge_barriercostgrad, sas_log_delta_edge_barriercostgradhess,
     sas_log_deltaridgeweight,
 };
 pub use external_options::{ExternalOptimOptions, ExternalOptimResult};
 pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
-    validate_penalty_specs,
 };
-pub(crate) use fit::fit_gamwith_heuristic_lambdas_andwarm_start;
 pub use fit::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas};
-pub(crate) use joint_hyper::{ExternalJointHyperEvaluator, validate_joint_hyper_direction_shapes};
-pub(crate) use optimizer::{
-    external_reml_seed_config, optimize_external_designwith_heuristic_lambdas_andwarm_start,
-};
+pub(crate) use joint_hyper::ExternalJointHyperEvaluator;
+pub(crate) use optimizer::optimize_external_designwith_heuristic_lambdas_andwarm_start;
 pub use optimizer::{optimize_external_design, optimize_external_designwith_heuristic_lambdas};
 pub use penalty::{CoefficientPriorMean, PenaltySpec};
 pub(crate) use penalty::{
     ParametricColumnConditioning, REML_CONTINUATION_PREWARM_RHO_CAP, REML_SECOND_ORDER_RHO_CAP,
     REML_SEED_SCREENING_RHO_CAP, dispersion_from_likelihood, faer_frob_inner, kahan_sum,
-    map_hessian_to_original_basis,
+    map_hessian_to_original_basis, scaled_covariance,
 };
 pub(crate) use prefit::{
     reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
-};
-pub(crate) use result_types::{
-    ensure_finite_scalar_estimation, validate_all_finite_estimation,
-    validate_fitted_link_estimation,
+    validate_penalty_specs,
 };
 pub use result_types::{
     AdaptiveRegularizationOptions, BlockRole, Dispersion, FitArtifacts, FitGeometry, FitInference,
     FitOptions, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
     ensure_finite_scalar, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
-    saved_sas_state_from_fit, validate_all_finite,
+    saved_sas_state_from_fit, validate_all_finite, validate_dense_hessian_export,
+    validate_explicit_dense_hessian_for_whitening,
 };
+pub(crate) use result_types::{ensure_finite_scalar_estimation, validate_all_finite_estimation};
 pub(crate) use smoothing_correction::{
-    DP_FLOOR, EigenClassification, PIRLS_INNER_TOLERANCE_FLOOR, RHO_BOUND, RemlConfig,
-    compute_smoothing_correction, invert_regularized_rho_hessian, smooth_floor_dp,
+    AUTO_CUBATURE_BOUNDARY_MARGIN, AUTO_CUBATURE_MAX_BETA_DIM, AUTO_CUBATURE_MAX_EIGENVECTORS,
+    AUTO_CUBATURE_MAX_RHO_DIM, AUTO_CUBATURE_TARGET_VAR_FRAC, MAX_FACTORIZATION_ATTEMPTS,
+    RHO_BOUND, RHO_SOFT_PRIOR_SHARPNESS, RHO_SOFT_PRIOR_WEIGHT, RemlConfig,
+    compute_smoothing_correction, smooth_floor_dp,
 };
 pub use summary::{
     ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus, ModelSummary,

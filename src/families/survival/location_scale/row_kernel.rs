@@ -454,7 +454,7 @@ pub(crate) fn row_set_from_survival_mask(
         .iter()
         .enumerate()
         .filter_map(|(index, &weight)| {
-            (weight != 0.0).then_some(crate::families::marginal_slope_shared::WeightedOuterRow {
+            (weight != 0.0).then_some(crate::solver::outer_subsample::WeightedOuterRow {
                 index,
                 weight,
                 stratum: 0,

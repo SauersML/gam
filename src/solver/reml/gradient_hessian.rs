@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::RwLock;
 
 impl<'a> RemlState<'a> {
     pub(crate) const POLISH_NORM_RATIO: f64 = 0.25;
@@ -1760,7 +1761,10 @@ impl<'a> RemlState<'a> {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(sparse.factor.as_ref(), &xt)?;
             let factor_ref = sparse.factor.clone();
             let h_inv_solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-                crate::linalg::sparse_exact::solve_sparse_spd(&factor_ref, rhs)
+                Ok(crate::linalg::sparse_exact::solve_sparse_spd(
+                    &factor_ref,
+                    rhs,
+                )?)
             };
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
@@ -4678,7 +4682,8 @@ impl<'a> RemlState<'a> {
         let Some(beta) = self.warm_start_beta.read().unwrap().as_ref().cloned() else {
             return;
         };
-        let Some(rho) = self.warm_start_rho.read().unwrap().clone() else {
+        let rho_opt: Option<Array1<f64>> = self.warm_start_rho.read().unwrap().clone();
+        let Some(rho) = rho_opt else {
             return;
         };
         if beta.0.len() != self.p || rho.len() != self.canonical_penalties.len() {
@@ -4693,7 +4698,7 @@ impl<'a> RemlState<'a> {
             .read()
             .unwrap()
             .as_ref()
-            .map(|rho| rho.to_vec());
+            .map(|rho: &Array1<f64>| rho.to_vec());
         record.prev_beta = self
             .prev_warm_start_beta
             .read()
@@ -5007,10 +5012,11 @@ impl<'a> RemlState<'a> {
             return Some((predicted, source));
         }
         let cur_beta = self.warm_start_beta.read().unwrap().clone()?;
-        let cur_rho = self.warm_start_rho.read().unwrap().clone();
-        let prev_beta = self.prev_warm_start_beta.read().unwrap().clone();
-        let prev_rho = self.prev_warm_start_rho.read().unwrap().clone();
-        let (cur_rho, prev_beta, prev_rho) = match (cur_rho, prev_beta, prev_rho) {
+        let cur_rho: Option<Array1<f64>> = self.warm_start_rho.read().unwrap().clone();
+        let prev_beta: Option<Coefficients> = self.prev_warm_start_beta.read().unwrap().clone();
+        let prev_rho: Option<Array1<f64>> = self.prev_warm_start_rho.read().unwrap().clone();
+        let (cur_rho, prev_beta, prev_rho): (Array1<f64>, Coefficients, Array1<f64>) =
+            match (cur_rho, prev_beta, prev_rho) {
             (Some(cr), Some(pb), Some(pr)) => (cr, pb, pr),
             // No history yet — first call after a fresh successful
             // solve (only one (ρ, β) pair stashed). Silent fallback
@@ -5237,7 +5243,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn current_original_basis_beta(&self) -> Option<Array1<f64>> {
         let beta_guard = self.warm_start_beta.read().ok()?;
         let beta = beta_guard.as_ref()?;
-        if beta.0.len() == self.p && beta.0.iter().all(|v| v.is_finite()) {
+        if beta.0.len() == self.p && beta.0.iter().all(|v: &f64| v.is_finite()) {
             Some(beta.0.clone())
         } else {
             None

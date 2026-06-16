@@ -68,7 +68,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
                 psi_b: &LocationScaleJointPsiDirection,
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
-                subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+                subsample: Option<&[crate::solver::outer_subsample::WeightedOuterRow]>,
             ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
                 assert!(subsample.is_none());
                 self.exact_newton_joint_psisecond_order_terms_from_parts(
@@ -88,7 +88,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
                 d_beta_flat: &Array1<f64>,
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
-                subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+                subsample: Option<&[crate::solver::outer_subsample::WeightedOuterRow]>,
             ) -> Result<Array2<f64>, String> {
                 assert!(subsample.is_none());
                 self.exact_newton_joint_psihessian_directional_derivative_from_parts(

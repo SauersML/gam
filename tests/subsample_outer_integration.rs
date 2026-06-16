@@ -8,9 +8,9 @@
 //! to per-row score / Hessian sums.
 
 use gam::families::marginal_slope_shared::{
-    OuterScoreSubsample, WeightedOuterRow, build_outer_score_subsample, outer_row_indices,
-    outer_row_weights_by_index, outer_score_scale,
+    build_outer_score_subsample, outer_row_indices, outer_row_weights_by_index, outer_score_scale,
 };
+use gam::solver::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 
 #[test]
 fn build_outer_score_subsample_is_deterministic_per_seed() {

@@ -5598,8 +5598,8 @@ where
         n_total: usize,
         k_target: usize,
         seed: u64,
-    ) -> crate::families::marginal_slope_shared::OuterScoreSubsample {
-        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    ) -> crate::solver::outer_subsample::OuterScoreSubsample {
+        use crate::solver::outer_subsample::OuterScoreSubsample;
         let k = k_target.min(n_total);
         if k == 0 || n_total == 0 {
             return OuterScoreSubsample::new(Vec::new(), n_total, seed);

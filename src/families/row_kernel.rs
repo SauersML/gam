@@ -168,7 +168,7 @@ fn cache_build_block_count(n_rows: usize, chunk_rows: usize) -> usize {
 pub enum RowSet {
     All,
     Subsample {
-        rows: Arc<Vec<crate::families::marginal_slope_shared::WeightedOuterRow>>,
+        rows: Arc<Vec<crate::solver::outer_subsample::WeightedOuterRow>>,
         n_full: usize,
     },
 }

@@ -4,6 +4,7 @@ use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
+use crate::gpu::kernels::row_hessian_ops;
 
 impl BernoulliMarginalSlopeFamily {
     pub(super) fn exact_newton_joint_gradient_evaluation_from_cache(
@@ -265,7 +266,7 @@ impl BernoulliMarginalSlopeFamily {
         // Host-pin shortcut: when the per-row Hessian is materialised on host
         // (the legacy path before Phase 3), build the joint-β image by
         // batching the per-row primary directions and dispatching the
-        // per-row matvec helper from `gpu::row_hessian_ops`. On Linux this
+        // per-row matvec helper from `gpu::kernels::row_hessian_ops`. On Linux this
         // can be GPU-accelerated by `launch_row_hessian_matvec`; on every
         // host the CPU oracle `cpu_row_hessian_matvec` is the in-process
         // fallback so the call sites stay consistent. The design pullback
@@ -338,7 +339,7 @@ impl BernoulliMarginalSlopeFamily {
             let h_rows_slice = h_rows_arr
                 .as_slice()
                 .expect("row_primary_hessians.hess() is row-major contiguous");
-            let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+            let inputs = row_hessian_ops::RowHessianMatvecInputs {
                 n_rows: n,
                 r: r_pr,
                 h_rows: h_rows_slice,
@@ -347,8 +348,8 @@ impl BernoulliMarginalSlopeFamily {
             let y_rows = {
                 #[cfg(target_os = "linux")]
                 {
-                    match crate::gpu::row_hessian_ops::launch_row_hessian_matvec(
-                        crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                    match row_hessian_ops::launch_row_hessian_matvec(
+                        row_hessian_ops::RowHessianMatvecInputs {
                             n_rows: n,
                             r: r_pr,
                             h_rows: h_rows_slice,
@@ -361,13 +362,13 @@ impl BernoulliMarginalSlopeFamily {
                                 "[BMS exact-newton HVP] host-pin GPU matvec failed: {err}; \
                                  falling back to CPU oracle"
                             );
-                            crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                            row_hessian_ops::cpu_row_hessian_matvec(&inputs)
                         }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                    row_hessian_ops::cpu_row_hessian_matvec(&inputs)
                 }
             };
             // Pull back every row's action `y_rows[row]` through its design
@@ -471,7 +472,7 @@ impl BernoulliMarginalSlopeFamily {
                         let h_rows_slice = tile.rows.hess().as_slice().expect(
                             "tiled row_primary_hessians.hess() is row-major contiguous",
                         );
-                        let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                        let inputs = row_hessian_ops::RowHessianMatvecInputs {
                             n_rows: tile_rows,
                             r: r_pr,
                             h_rows: h_rows_slice,
@@ -480,8 +481,8 @@ impl BernoulliMarginalSlopeFamily {
                         let y_rows = {
                             #[cfg(target_os = "linux")]
                             {
-                                match crate::gpu::row_hessian_ops::launch_row_hessian_matvec(
-                                    crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                                match row_hessian_ops::launch_row_hessian_matvec(
+                                    row_hessian_ops::RowHessianMatvecInputs {
                                         n_rows: tile_rows,
                                         r: r_pr,
                                         h_rows: h_rows_slice,
@@ -494,13 +495,13 @@ impl BernoulliMarginalSlopeFamily {
                                             "[BMS exact-newton HVP] tiled GPU matvec failed: {err}; \
                                              falling back to CPU oracle"
                                         );
-                                        crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                                        row_hessian_ops::cpu_row_hessian_matvec(&inputs)
                                     }
                                 }
                             }
                             #[cfg(not(target_os = "linux"))]
                             {
-                                crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                                row_hessian_ops::cpu_row_hessian_matvec(&inputs)
                             }
                         };
                         for local in 0..tile_rows {
@@ -697,7 +698,7 @@ impl BernoulliMarginalSlopeFamily {
                                     row_dir_scratch.as_slice().expect("contiguous"),
                                 );
                             }
-                            let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                            let inputs = row_hessian_ops::RowHessianMatvecInputs {
                                 n_rows: tile_rows,
                                 r: r_pr,
                                 h_rows: h_rows_slice,
@@ -706,8 +707,8 @@ impl BernoulliMarginalSlopeFamily {
                             let y_rows = {
                                 #[cfg(target_os = "linux")]
                                 {
-                                    match crate::gpu::row_hessian_ops::launch_row_hessian_matvec(
-                                        crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                                    match row_hessian_ops::launch_row_hessian_matvec(
+                                        row_hessian_ops::RowHessianMatvecInputs {
                                             n_rows: tile_rows,
                                             r: r_pr,
                                             h_rows: h_rows_slice,
@@ -720,7 +721,7 @@ impl BernoulliMarginalSlopeFamily {
                                                 "[BMS exact-newton batched-HVP] tiled GPU matvec failed: {err}; \
                                                  falling back to CPU oracle"
                                             );
-                                            crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(
+                                            row_hessian_ops::cpu_row_hessian_matvec(
                                                 &inputs,
                                             )
                                         }
@@ -728,7 +729,7 @@ impl BernoulliMarginalSlopeFamily {
                                 }
                                 #[cfg(not(target_os = "linux"))]
                                 {
-                                    crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                                    row_hessian_ops::cpu_row_hessian_matvec(&inputs)
                                 }
                             };
                             let mut tile_out_col = tile_out.column_mut(col);
@@ -847,7 +848,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         // Host-pin shortcut: extract every row's primary diagonal via the
-        // per-row diagonal helper from `gpu::row_hessian_ops`, then perform
+        // per-row diagonal helper from `gpu::kernels::row_hessian_ops`, then perform
         // the design² accumulation on host (matches the rayon-loop algebra
         // below without rebuilding `r²` blocks per row). On Linux this uses
         // the GPU `launch_row_hessian_diag` kernel; on every host the CPU
@@ -859,7 +860,7 @@ impl BernoulliMarginalSlopeFamily {
             let h_rows_slice = h_rows_arr
                 .as_slice()
                 .expect("row_primary_hessians.hess() is row-major contiguous");
-            let inputs = crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+            let inputs = row_hessian_ops::RowHessianDiagInputs {
                 n_rows: n,
                 r: r_pr,
                 h_rows: h_rows_slice,
@@ -867,8 +868,8 @@ impl BernoulliMarginalSlopeFamily {
             let d_rows = {
                 #[cfg(target_os = "linux")]
                 {
-                    match crate::gpu::row_hessian_ops::launch_row_hessian_diag(
-                        crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                    match row_hessian_ops::launch_row_hessian_diag(
+                        row_hessian_ops::RowHessianDiagInputs {
                             n_rows: n,
                             r: r_pr,
                             h_rows: h_rows_slice,
@@ -880,13 +881,13 @@ impl BernoulliMarginalSlopeFamily {
                                 "[BMS exact-newton diag] host-pin GPU diag failed: {err}; \
                                  falling back to CPU oracle"
                             );
-                            crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                            row_hessian_ops::cpu_row_hessian_diag(&inputs)
                         }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                    row_hessian_ops::cpu_row_hessian_diag(&inputs)
                 }
             };
             // The per-row diagonals `d_rows` are already materialised; the
@@ -989,7 +990,7 @@ impl BernoulliMarginalSlopeFamily {
                             tile.rows.hess().as_slice().expect(
                                 "tiled row_primary_hessians.hess() is row-major contiguous",
                             );
-                        let inputs = crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                        let inputs = row_hessian_ops::RowHessianDiagInputs {
                             n_rows: tile_rows,
                             r: r_pr,
                             h_rows: h_rows_slice,
@@ -997,8 +998,8 @@ impl BernoulliMarginalSlopeFamily {
                         let d_rows = {
                             #[cfg(target_os = "linux")]
                             {
-                                match crate::gpu::row_hessian_ops::launch_row_hessian_diag(
-                                    crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                                match row_hessian_ops::launch_row_hessian_diag(
+                                    row_hessian_ops::RowHessianDiagInputs {
                                         n_rows: tile_rows,
                                         r: r_pr,
                                         h_rows: h_rows_slice,
@@ -1010,13 +1011,13 @@ impl BernoulliMarginalSlopeFamily {
                                             "[BMS exact-newton diag] tiled GPU diag failed: {err}; \
                                              falling back to CPU oracle"
                                         );
-                                        crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                                        row_hessian_ops::cpu_row_hessian_diag(&inputs)
                                     }
                                 }
                             }
                             #[cfg(not(target_os = "linux"))]
                             {
-                                crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                                row_hessian_ops::cpu_row_hessian_diag(&inputs)
                             }
                         };
                         for local in 0..tile_rows {

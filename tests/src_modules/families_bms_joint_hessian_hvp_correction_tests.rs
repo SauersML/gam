@@ -2,7 +2,7 @@
 
 #[test]
 fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -41,7 +41,7 @@ fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_full_equal
 
 #[test]
 fn bernoulli_jointhessian_batched_directional_operators_match_single_direction_path() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
 
     let n = 200usize;
     let family = make_block_psi_test_family(n);
@@ -411,7 +411,7 @@ fn bernoulli_value_cell_moments_use_shared_lru() {
 
 #[test]
 fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
 
     let (family, old_states) = make_flex_hvp_cache_test_family(96);
     let mut trial_states = old_states.clone();
@@ -913,7 +913,7 @@ fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
 
 #[test]
 fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);

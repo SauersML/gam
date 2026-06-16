@@ -14,7 +14,7 @@ use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::jet_partitions::MultiDirJet;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
-    WeightedOuterRow, add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
+    add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     directional_obj_grad_hess, eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
@@ -41,6 +41,7 @@ use crate::smooth::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
+use crate::solver::outer_subsample::WeightedOuterRow;
 use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -1087,7 +1088,6 @@ impl LatentZConditionalCalibration {
     ) -> Result<Array2<f64>, String> {
         let n = score_zeta_sensitivity.nrows();
         let p_beta = score_zeta_sensitivity.ncols();
-        let dim_theta1 = self.theta1_dim();
         if z.len() != n || a_block.nrows() != n {
             return Err(format!(
                 "generated_regressor_correction row mismatch: score_zeta_sensitivity rows={n}, \

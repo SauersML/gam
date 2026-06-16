@@ -1637,7 +1637,7 @@ fn rigid_block_states(
 
 #[test]
 fn bernoulli_log_likelihood_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_rigid_test_family(n);
     let states = rigid_block_states(&family, 0.3, 0.4);
@@ -1669,7 +1669,7 @@ fn bernoulli_log_likelihood_subsample_full_equals_unsampled() {
 
 #[test]
 fn bernoulli_log_likelihood_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_rigid_test_family(n);
     let states = rigid_block_states(&family, 0.3, 0.4);
@@ -1760,7 +1760,7 @@ fn rel_diff_array2(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 
 #[test]
 fn bernoulli_sigma_psi_terms_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_test_family(n);
     let states = rigid_block_states(&family, 0.3, 0.4);
@@ -1805,7 +1805,7 @@ fn bernoulli_sigma_psi_terms_subsample_full_equals_unsampled() {
 
 #[test]
 fn bernoulli_sigma_psi_terms_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_test_family(n);
     let states = rigid_block_states(&family, 0.3, 0.4);
@@ -1851,7 +1851,7 @@ fn bernoulli_sigma_psi_terms_subsample_half_scales_correctly() {
 
 #[test]
 fn bernoulli_sigma_psi_second_order_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_test_family(n);
     let states = rigid_block_states(&family, 0.3, 0.4);
@@ -1883,7 +1883,7 @@ fn bernoulli_sigma_psi_second_order_subsample_full_equals_unsampled() {
 
 #[test]
 fn bernoulli_sigma_psi_second_order_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_test_family(n);
     let states = rigid_block_states(&family, 0.3, 0.4);
@@ -1923,7 +1923,7 @@ fn bernoulli_sigma_psi_second_order_subsample_half_scales_correctly() {
 
 #[test]
 fn bernoulli_sigma_psihessian_directional_derivative_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_test_family(n);
     let states = rigid_block_states(&family, 0.3, 0.4);
@@ -1952,7 +1952,7 @@ fn bernoulli_sigma_psihessian_directional_derivative_subsample_full_equals_unsam
 
 #[test]
 fn bernoulli_sigma_psihessian_directional_derivative_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_test_family(n);
     let states = rigid_block_states(&family, 0.3, 0.4);
@@ -1991,7 +1991,7 @@ fn bernoulli_sigma_psihessian_directional_derivative_subsample_half_scales_corre
 #[test]
 fn bernoulli_psi_workspace_with_options_threads_subsample_to_first_order() {
     use crate::custom_family::CustomFamilyBlockPsiDerivative;
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
 
     // Build a sigma-aware family at n=200 with the sigma-aux derivative
     // entry on the logslope block (last block).
@@ -7668,7 +7668,7 @@ fn block_psi_test_dual_derivative_blocks(
 
 #[test]
 fn bernoulli_psi_terms_from_cache_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -7710,7 +7710,7 @@ fn bernoulli_psi_terms_from_cache_subsample_full_equals_unsampled() {
 
 #[test]
 fn bernoulli_psi_terms_from_cache_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -7766,7 +7766,7 @@ fn bernoulli_psi_terms_from_cache_subsample_half_scales_correctly() {
 
 #[test]
 fn bernoulli_psi_second_order_terms_from_cache_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -7815,7 +7815,7 @@ fn bernoulli_psi_second_order_terms_from_cache_subsample_full_equals_unsampled()
 
 #[test]
 fn bernoulli_psi_second_order_terms_from_cache_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -7873,7 +7873,7 @@ fn bernoulli_psi_second_order_terms_from_cache_subsample_half_scales_correctly()
 
 #[test]
 fn bernoulli_psihessian_directional_derivative_from_cache_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -7922,7 +7922,7 @@ fn bernoulli_psihessian_directional_derivative_from_cache_subsample_full_equals_
 
 #[test]
 fn bernoulli_psihessian_directional_derivative_from_cache_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -7981,7 +7981,7 @@ fn bernoulli_psihessian_directional_derivative_from_cache_subsample_half_scales_
 
 #[test]
 fn bernoulli_psihessian_operator_from_cache_subsample_full_equals_unsampled() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -8033,7 +8033,7 @@ fn bernoulli_psihessian_operator_from_cache_subsample_full_equals_unsampled() {
 
 #[test]
 fn bernoulli_psihessian_operator_from_cache_subsample_half_scales_correctly() {
-    use crate::families::marginal_slope_shared::OuterScoreSubsample;
+    use crate::solver::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);

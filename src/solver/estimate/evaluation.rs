@@ -350,7 +350,7 @@ where
         .read()
         .unwrap()
         .as_ref()
-        .map(|beta| beta.as_ref().clone())
+        .map(|beta| beta.0.clone())
         .ok_or_else(|| {
             EstimationError::InvalidInput(
                 "PIRLS solve did not populate the warm-start beta cache".to_string(),

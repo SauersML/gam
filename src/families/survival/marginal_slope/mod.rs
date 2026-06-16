@@ -25,7 +25,7 @@ pub(crate) use crate::custom_family::{
 
 pub(crate) use crate::estimate::UnifiedFitResult;
 
-pub(crate) use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
+pub(crate) use crate::faer_ndarray::{FaerCholesky, fast_atv, fast_av, fast_xt_diag_x};
 
 pub(crate) use crate::families::bms::{
     CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, LatentZNormalization,

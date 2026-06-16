@@ -645,7 +645,7 @@ impl GaussianLocationScaleHessianWorkspace {
     /// estimator of the full-data joint Hessian.
     pub(crate) fn apply_outer_subsample(
         &mut self,
-        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+        rows: &[crate::solver::outer_subsample::WeightedOuterRow],
     ) {
         let n = self.coeff_mm.len();
         let mut mask_mm = Array1::<f64>::zeros(n);
