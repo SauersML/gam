@@ -1000,6 +1000,95 @@ pub fn compute_alo_diagnostics_from_pirls(
     compute_alo_diagnostics_from_pirls_impl(base, y, link)
 }
 
+/// Exact (one-step) case-deletion influence from a converged PIRLS fit, via
+/// the one `FitSensitivity` operator (#935).
+///
+/// This is the diagnostic the sensitivity operator's `case_deletion` channel
+/// was built to expose but had no production entry point for: per-observation
+/// dfbetas `β̂ − β̂₍ᵢ₎`, hat-value leverage `h_ii = w_i x_iᵀ H⁻¹ x_i`, and
+/// Cook's distance. It is the same factored inverse the REML gradient (IFT),
+/// ALO, and the Riesz debias already contract — built once at the optimum,
+/// asked in the leave-one-out direction — so no call site can disagree about
+/// which `H⁻¹` is meant (the bug class #935 dismantles).
+///
+/// The penalized Hessian, design, working weights `w_i = W_H[i]` and working
+/// residual `z_i − η̂_i` are read straight from the converged geometry — the
+/// same PIRLS state [`compute_alo_diagnostics_from_pirls`] consumes — so the
+/// IRLS reduction `scale = w_i r_i / (1 − h_ii)` is exact for the Gaussian
+/// identity link and the one-step Newton deletion for canonical-link GLMs.
+/// Returns `None` (rather than emitting `∞`) for any observation whose
+/// leverage is one, or if the dense Hessian / design is unavailable.
+pub fn compute_case_deletion_from_pirls(
+    base: &pirls::PirlsResult,
+    y: ArrayView1<f64>,
+    link: LinkFunction,
+) -> Result<Option<crate::solver::sensitivity::CaseDeletionInfluence>, EstimationError> {
+    let x_dense_arc = base
+        .x_transformed
+        .try_to_dense_arc("case-deletion diagnostics require dense transformed design")
+        .map_err(|reason| EstimationError::InvalidInput(reason))?;
+    let x_dense = x_dense_arc.as_ref();
+    let n = x_dense.nrows();
+    let p = x_dense.ncols();
+    if n == 0 || p == 0 {
+        return Ok(None);
+    }
+
+    // Dispersion φ matches the ALO entry point: estimated RSS/(n−edf) for the
+    // Gaussian identity link, fixed at 1 for the single-parameter families.
+    let phi = match link {
+        LinkFunction::Identity => {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let rss: f64 = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let r = y[i] - base.finalmu[i];
+                    base.finalweights[i] * r * r
+                })
+                .sum();
+            let dof = (n as f64) - base.edf;
+            rss / dof.max(1.0)
+        }
+        _ => 1.0,
+    };
+    if !(phi.is_finite() && phi > 0.0) {
+        return Ok(None);
+    }
+
+    // The same dense stabilized penalized Hessian ALO materializes; the one
+    // factored inverse every sensitivity channel shares.
+    let h_dense = base
+        .dense_stabilizedhessian_transformed(
+            "case-deletion diagnostics require exact dense stabilized penalized Hessian",
+        )
+        .map_err(|e| match e {
+            EstimationError::InvalidInput(reason) => EstimationError::InvalidInput(reason),
+            other => EstimationError::InvalidInput(format!("{other:?}")),
+        })?;
+
+    let factor = match h_dense.cholesky(faer::Side::Lower) {
+        Ok(f) => f,
+        // A non-SPD stabilized Hessian means the optimum is rank-deficient in a
+        // way the dense Cholesky case-deletion path cannot invert; decline
+        // rather than fabricate an influence diagnostic.
+        Err(_) => return Ok(None),
+    };
+
+    // Working weights and working residual straight from the IRLS reduction:
+    // w_i = W_H[i] and r_i = z_i − η̂_i, so w_i r_i is the working score the
+    // closed-form deletion `scale = w_i r_i / (1 − h_ii)` consumes.
+    let working_weights = base.finalweights.clone();
+    let working_residual = &base.solveworking_response - &base.final_eta;
+
+    let sensitivity = crate::solver::sensitivity::FitSensitivity::from_faer_cholesky(&factor, p);
+    Ok(sensitivity.case_deletion(
+        x_dense,
+        working_weights.view(),
+        working_residual.view(),
+        phi,
+    ))
+}
+
 // Multi-block ALO for multi-predictor models (GAMLSS, survival, joint)
 
 /// Diagnostics returned by multi-block ALO.
