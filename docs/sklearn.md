@@ -97,6 +97,10 @@ the positive-class probability to `[0, 1]` and stacks
 computing AUC. Use `metrics(X, y)` for the full panel: `auc`, `pr_auc`,
 `brier`, `logloss`, `nagelkerke_r2`, and `ece`.
 
+Like `GAMRegressor`, `GAMClassifier` also inherits the pass-through helpers
+`summary()`, `check(X)`, and `report(path)` from the shared base estimator,
+delegating to the underlying `gamfit.Model` (scalar models only).
+
 ## Pipeline
 
 ```python
