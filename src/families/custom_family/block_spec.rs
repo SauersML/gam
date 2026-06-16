@@ -4,7 +4,7 @@
 
 use super::*;
 
-pub use crate::types::CoefficientGroupPrior;
+use crate::types::CoefficientGroupPrior;
 
 /// Per-subject channel Hessian provider for multi-output families.
 ///

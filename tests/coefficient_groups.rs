@@ -1,15 +1,16 @@
 use gam::custom_family::{
-    CoefficientGroupPrior as CustomCoefficientGroupPrior,
     CoefficientGroupSpec as CustomCoefficientGroupSpec, ParameterBlockSpec, coefficient_label,
     realize_coefficient_groups_for_custom_family,
 };
 use gam::estimate::{CoefficientPriorMean, FitOptions, PenaltySpec, fit_gam_with_penalty_specs};
 use gam::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::smooth::{
-    CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, LinearTermSpec,
-    TermCollectionSpec, build_term_collection_design, fit_term_collection_with_coefficient_groups,
+    CoefficientGroupSpec, CoefficientSelector, LinearTermSpec, TermCollectionSpec,
+    build_term_collection_design, fit_term_collection_with_coefficient_groups,
 };
-use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
+use gam::types::{
+    CoefficientGroupPrior, InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink,
+};
 use ndarray::{Array1, Array2, array};
 use std::sync::Arc;
 
@@ -259,7 +260,7 @@ fn custom_family_group_spanning_blocks_uses_one_precision_coordinate() {
             coefficient_label("risk_b", 1),
         ],
         parent: None,
-        prior: Some(CustomCoefficientGroupPrior::GammaPrecision {
+        prior: Some(CoefficientGroupPrior::GammaPrecision {
             shape: 3.0,
             rate: 2.0,
         }),
@@ -318,7 +319,7 @@ fn custom_family_parent_group_ties_concatenated_child_penalties() {
                 coefficient_label("risk_b", 1),
             ],
         )
-        .with_prior(CustomCoefficientGroupPrior::GammaPrecision {
+        .with_prior(CoefficientGroupPrior::GammaPrecision {
             shape: 2.0,
             rate: 0.5,
         }),

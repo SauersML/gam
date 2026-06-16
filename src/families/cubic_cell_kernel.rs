@@ -31,22 +31,12 @@ pub enum CubicCellKernelError {
     BivariateNormalDomain { reason: String },
 }
 
-impl std::fmt::Display for CubicCellKernelError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CubicCellKernelError::InvalidInterval { reason }
-            | CubicCellKernelError::InvalidCellShape { reason }
-            | CubicCellKernelError::InsufficientMoments { reason }
-            | CubicCellKernelError::BivariateNormalDomain { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for CubicCellKernelError {}
-
-impl From<CubicCellKernelError> for String {
-    fn from(err: CubicCellKernelError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    CubicCellKernelError {
+        InvalidInterval,
+        InvalidCellShape,
+        InsufficientMoments,
+        BivariateNormalDomain,
     }
 }
 

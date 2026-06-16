@@ -128,23 +128,13 @@ pub enum FittedModelError {
     InvalidInput { reason: String },
 }
 
-impl std::fmt::Display for FittedModelError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SchemaMismatch { reason }
-            | Self::PayloadCorrupt { reason }
-            | Self::MissingField { reason }
-            | Self::IncompatibleConfig { reason }
-            | Self::InvalidInput { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for FittedModelError {}
-
-impl From<FittedModelError> for String {
-    fn from(err: FittedModelError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    FittedModelError {
+        SchemaMismatch,
+        PayloadCorrupt,
+        MissingField,
+        IncompatibleConfig,
+        InvalidInput,
     }
 }
 

@@ -7,10 +7,7 @@
 //! block-index selector resolution, the per-coordinate rho-prior validation +
 //! penalized-complexity validator, the base-prior expansion, and the main
 //! `realize_coefficient_groups_for_custom_family`. No behavior change — bodies
-//! are byte-identical; the two entry points consumed elsewhere in the parent
-//! (the public realizer and `validate_penalized_complexity_prior`, reused by
-//! `CoefficientGroupPrior::validate`) are re-imported so every call site is
-//! unchanged.
+//! are byte-identical; the public realizer is re-exported by the parent.
 
 use super::{
     CoefficientBlockSelector, CoefficientGroupSpec, CustomFamilyError, ParameterBlockSpec,

@@ -131,19 +131,14 @@ pub(crate) fn fit_survival_location_scale_with_geometry(
     } else {
         fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?
     };
-    // Defensive: `fit_custom_family`'s degraded-plan path (after an ARC
-    // deterministic-replay stall) can return a fit whose `block_states`
-    // were cleared. `offset_channel_geometry` already tolerates this case
-    // (returns zero residuals), but `finalize_survival_location_scale_fit`
-    // indexes `fit.block_states[BLOCK_TIME]` directly and would panic.
-    // Surface a clear sentinel error here; the workflow-level fallback in
-    // `fit_survival_location_scale_terms` matches on the sentinel and
-    // substitutes zero offset-channel residuals so the outer baseline BFGS
-    // can terminate at the current θ instead of propagating a hard panic up
-    // to the Python wrapper.
+    // `finalize_survival_location_scale_fit` indexes the populated block
+    // states directly, so an empty result from the inner fit violates this
+    // path's contract and must fail before finalization.
     if fit.block_states.is_empty() {
         return Err(SurvivalLocationScaleError::InternalInvariant {
-            reason: SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER.to_string(),
+            reason: "fit_survival_location_scale_with_geometry: fit_custom_family returned a fit \
+                     with empty block_states"
+                .to_string(),
         }
         .into());
     }
@@ -167,14 +162,6 @@ pub(crate) type SurvivalLocationScaleConvergedGeometry = (
     OffsetChannelCurvatures,
     Option<Array1<f64>>,
 );
-
-/// Sentinel error string surfaced by `fit_survival_location_scale_with_geometry`
-/// when a degraded inner fit returns empty `block_states`. See the matching
-/// `match` arm in `fit_survival_location_scale_terms`.
-pub(crate) const SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER: &str = "fit_survival_location_scale_with_geometry: fit_custom_family \
-     returned a fit with empty block_states (likely ARC \
-     deterministic-replay stall in the inner outer solve); \
-     cannot finalize this fit";
 
 pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
     pilot: &SurvivalLocationScaleTermFitResult,
@@ -899,66 +886,6 @@ pub(crate) fn fit_survival_location_scale_terms(
                 )?;
                 match fit_survival_location_scale_with_geometry(final_assembled) {
                     Ok((_refit, geom)) => geom,
-                    // Degraded-fit fallback: when the refit's inner ARC stalled
-                    // into deterministic-replay and produced an empty
-                    // `block_states`, `fit_survival_location_scale_with_geometry`
-                    // surfaces a sentinel error rather than letting
-                    // `finalize_survival_location_scale_fit` panic on the
-                    // out-of-bounds `block_states[BLOCK_TIME]` index. Substitute
-                    // zero offset-channel residuals so the outer baseline BFGS
-                    // sees `‖g‖ = 0` at this candidate and terminates cleanly
-                    // at the current θ̂ instead of propagating a hard panic up
-                    // through the Python wrapper. Production loss is at most a
-                    // slightly suboptimal baseline θ at this BMA parent-set —
-                    // strictly better than a `SurvivalLocationScaleFamily
-                    // expects 3 blocks, got 0` exception killing the whole
-                    // gamfit.fit() call.
-                    Err(e)
-                        if e == SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER
-                            || e.contains("expects 3 blocks, got 0")
-                            || e.contains("expects 4 blocks, got 0")
-                            || (e.contains("blockwise fit requires at least one block state"))
-                            || (e.contains("block_states") && e.contains("got 0")) =>
-                    {
-                        // Broadened catch: any error indicating an empty
-                        // block_states slate maps to the same "degraded BMA
-                        // candidate" fallback. The original sentinel catches
-                        // the path I instrumented in
-                        // `fit_survival_location_scale_with_geometry`, but
-                        // `validate_joint_states` and `blockwise_fit_from_parts`
-                        // produce structurally similar errors from the ~7 other
-                        // call sites of `build_dynamic_geometry` (Hessian
-                        // operator routes, EFS fixed-point, etc.) which can also
-                        // surface when an ARC deterministic-replay stall
-                        // collapses the inner refit's block layout.
-                        // Substituting zero residuals here lets the outer
-                        // baseline-θ BFGS see `‖g‖ = 0` at the bad candidate
-                        // and terminate cleanly rather than panicking the
-                        // whole `gam.fit()` call.
-                        log::warn!(
-                            "fit_survival_location_scale_terms: refit at converged ρ̂ \
-                             produced empty block_states ({e}); substituting zero offset \
-                             residuals (degraded BMA candidate; outer θ-BFGS will \
-                             terminate at this point)"
-                        );
-                        let n = data.nrows();
-                        // Degraded candidate: zero residuals and `None` link
-                        // gradient → outer BFGS sees ‖g‖ = 0 and terminates at
-                        // the current θ̂ rather than panicking.
-                        (
-                            OffsetChannelResiduals {
-                                exit: Array1::<f64>::zeros(n),
-                                entry: Array1::<f64>::zeros(n),
-                                derivative: Array1::<f64>::zeros(n),
-                                // Location-scale has no interval upper-bound channel.
-                                right: Array1::<f64>::zeros(n),
-                            },
-                            OffsetChannelCurvatures {
-                                rows: vec![[[0.0_f64; 3]; 3]; n],
-                            },
-                            None,
-                        )
-                    }
                     Err(e) => return Err(e),
                 }
             }

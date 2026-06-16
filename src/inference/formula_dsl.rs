@@ -103,23 +103,13 @@ pub enum FormulaDslError {
     MalformedConfig { reason: String },
 }
 
-impl std::fmt::Display for FormulaDslError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ParseError { reason }
-            | Self::UnknownIdentifier { reason }
-            | Self::InvalidArgument { reason }
-            | Self::IncompatibleTerm { reason }
-            | Self::MalformedConfig { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for FormulaDslError {}
-
-impl From<FormulaDslError> for String {
-    fn from(err: FormulaDslError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    FormulaDslError {
+        ParseError,
+        UnknownIdentifier,
+        InvalidArgument,
+        IncompatibleTerm,
+        MalformedConfig,
     }
 }
 

@@ -3687,19 +3687,6 @@ pub(crate) fn materialize_survival<'a>(
         // typically converges in ≲10 outer evaluations.
         let probit_channel =
             location_scale_uses_probit_survival_baseline(Some(&survival_inverse_link));
-        // Catch errors at the optimizer-call site so a single bad θ
-        // candidate doesn't blow up the whole `gam.fit()` call. Specific
-        // failure mode: when the inner ρ-ARC stalls on a near-flat REML
-        // direction (smoothing param running to exp(20+) on an
-        // under-identified covariate at small n), the subsequent inner
-        // refit can produce a fit whose family methods see empty
-        // `block_states` and crash with "expects 3 blocks, got 0". The
-        // crash message originates from `validate_joint_states` and can
-        // bubble up from any of ~9 callers in the survival family. Rather
-        // than enumerating them all, catch the wrapper error here and
-        // fall back to the seed baseline_cfg — the gradient path made no
-        // progress, but the rest of the fit can proceed at the user's
-        // initial GM (α, λ, γ).
         let baseline_outcome = optimize_survival_baseline_config_with_gradient_only(
             &baseline_cfg,
             "workflow survival location-scale baseline",
@@ -3762,20 +3749,6 @@ pub(crate) fn materialize_survival<'a>(
         );
         match baseline_outcome {
             Ok(baseline) => baseline,
-            Err(e)
-                if e.contains("expects 3 blocks, got 0")
-                    || e.contains("expects 4 blocks, got 0")
-                    || (e.contains("block_states") && e.contains("got 0"))
-                    || e.contains("blockwise fit requires at least one block state")
-                    || e.contains(SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER) =>
-            {
-                log::warn!(
-                    "workflow survival location-scale baseline: gradient-only BFGS \
-                     failed at an empty-block_states candidate ({e}); falling back \
-                     to the seed baseline_cfg as-is"
-                );
-                baseline_cfg.clone()
-            }
             Err(e) => return Err(e.into()),
         }
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
@@ -3865,20 +3838,6 @@ pub(crate) fn materialize_survival<'a>(
         );
         match baseline_outcome {
             Ok(baseline) => baseline,
-            Err(e)
-                if e.contains("expects 3 blocks, got 0")
-                    || e.contains("expects 4 blocks, got 0")
-                    || (e.contains("block_states") && e.contains("got 0"))
-                    || e.contains("blockwise fit requires at least one block state")
-                    || e.contains(SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER) =>
-            {
-                log::warn!(
-                    "workflow latent survival baseline: gradient-only BFGS failed at an \
-                     empty-block_states candidate ({e}); falling back to the seed \
-                     baseline_cfg as-is"
-                );
-                baseline_cfg.clone()
-            }
             Err(e) => return Err(WorkflowError::InvalidConfig { reason: e }.into()),
         }
     } else {

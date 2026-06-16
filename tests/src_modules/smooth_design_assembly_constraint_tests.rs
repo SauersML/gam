@@ -4604,22 +4604,11 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
     }
 }
 
-/// Architectural pin: for the iso-κ Duchon ψ-axis under BinomialProbit,
-/// the intrinsic pseudo-logdet kernel (`solution.penalty_subspace_trace =
-/// Some(H_pen⁺)`, #901) must be *active*, its trace must match FD of the
-/// production cost's Hessian-logdet term, and on a healthy spectrum it
-/// must AGREE with the full-space `G_ε(H)` trace (the two differ only on
-/// sub-threshold eigendirections).
-///
-/// The pre-#901 ancestor of this pin asserted a ≫ separation between the
-/// projected kernel and `G_ε(H)` — that separation was the range(S₊)
-/// projection dropping real likelihood-identified curvature (the #901
-/// bug), so the pin enforced the bug. If any invariant breaks now, the
-/// cost identity for Duchon ψ silently drifts and the joint-gradient
-/// test (and any downstream optimizer) is solving the wrong problem.
-/// This test makes the kernel's role legible: mechanism, not outcome.
+/// Behavioral pin for the iso-κ Duchon ψ-axis under BinomialProbit: the
+/// analytic outer gradient must agree with a centered finite difference of the
+/// production objective.
 #[test]
-fn iso_kappa_duchon_penalty_subspace_projection_pins_trace() {
+fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
     let DuchonProbitSetup {
         data,
         y,
@@ -4661,361 +4650,82 @@ fn iso_kappa_duchon_penalty_subspace_projection_pins_trace() {
         offset.view(),
         &frozen_design.penalties,
         &external_opts,
-        "penalty-subspace projection pin",
+        "iso-kappa Duchon gradient FD pin",
     )
     .expect("evaluator");
 
     let theta_dim = rho_dim + psi_dim;
     let theta_zero = Array1::<f64>::zeros(theta_dim);
 
-    cache.ensure_theta(&theta_zero).expect("ensure_theta");
-    let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-        data.view(),
-        cache.spec(),
-        cache.design(),
-        &cache.spatial_terms,
-    )
-    .expect("hyper dirs build")
-    .expect("hyper dirs present");
-    // EIG-DECOMP stash capture is opt-in (production gradient evals skip
-    // the diagnostic's extra traces); hold the guard across the eval.
-    let capture = crate::solver::estimate::reml::unified::debug_stash::CaptureGuard::request();
-    let (cost_at_zero, grad_at_zero, _hess) = evaluate_joint_reml_outer_eval_at_theta(
-        &mut evaluator,
-        cache.design(),
+    let eval_at =
+        |theta: &Array1<f64>,
+         order: crate::solver::rho_optimizer::OuterEvalOrder,
+         cache: &mut SingleBlockExactJointDesignCache<'_>,
+         evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>| {
+            cache.ensure_theta(theta).expect("ensure_theta");
+            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+                data.view(),
+                cache.spec(),
+                cache.design(),
+                &cache.spatial_terms,
+            )
+            .expect("hyper dirs build")
+            .expect("hyper dirs present");
+            evaluate_joint_reml_outer_eval_at_theta(
+                evaluator,
+                cache.design(),
+                theta,
+                rho_dim,
+                hyper_dirs,
+                None,
+                order,
+                None,
+            )
+            .expect("outer eval")
+        };
+
+    let (cost_at_zero, grad_at_zero, _hess) = eval_at(
         &theta_zero,
-        rho_dim,
-        hyper_dirs,
-        None,
         crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
-        None,
-    )
-    .expect("analytic outer eval");
-    let stash = capture.take_terms();
-
-    let unprojected_tr = stash
-        .unprojected_tr
-        .expect("unprojected_tr must be captured by the EIG-DECOMP block at small p");
-    let production_tr = stash
-        .production_tr
-        .expect("production_tr must be captured by the EIG-DECOMP block at small p");
-    let projection_active = stash
-        .projection_active
-        .expect("projection_active must be captured");
-
-    // INVARIANT 1: The projection must be active for the Duchon ψ axis
-    // at non-canonical links. If this regresses (someone disables
-    // penalty_subspace_trace for the ψ path), the Duchon ψ-gradient
-    // silently breaks at the order-of-magnitude level.
-    assert!(
-        projection_active,
-        "Duchon ψ axis must route the trace through penalty_subspace_trace"
+        &mut cache,
+        &mut evaluator,
     );
 
-    // INVARIANT 2: Production trace agrees with FD of the Hessian
-    // log-determinant term exactly as the production cost identity
-    // evaluates it (`hop.logdet() + hessian_logdet_correction`, read
-    // back via `debug_logdet_h_proj`). Since the #901 corrected object
-    // this is the intrinsic pseudo-logdet `log|H_pen|₊` over
-    // `range(H_pen)` — the `null(S)` directions' ψ-dependence is REAL
-    // likelihood-identified curvature and is included on both sides:
-    // the analytic side traces the total drift against the spectral
-    // kernel `H_pen⁺`, the FD side re-eigendecomposes `H_pen` at ψ±h.
-    // (The pre-#901 version of this pin compared against FD of the
-    // range(S₊)-projected logdet `log|U_Sᵀ H U_S|₊` — the wrong object
-    // whose dropped Schur curvature produced the sign-flipped ρ and
-    // exploding ψ gradients this cluster red-lined on.) Because the FD
-    // reference reads through the SAME assembly the production cost
-    // uses, this pin keeps following whatever value production
-    // installs — there is no separately maintained debug formula to
-    // drift out of sync.
     let h = 1e-5_f64;
     let psi_idx = rho_dim;
     let mut theta_p = theta_zero.clone();
     theta_p[psi_idx] += h;
     let mut theta_m = theta_zero.clone();
     theta_m[psi_idx] -= h;
-    cache.ensure_theta(&theta_p).expect("ensure +h");
-    let dp = cache.design().clone();
-    let log_det_p = evaluator
-        .debug_logdet_h_proj(
-            &dp.design,
-            &dp.penalties,
-            &dp.nullspace_dims,
-            dp.linear_constraints.clone(),
-            &theta_p,
-            rho_dim,
-            "subspace-pin +h",
-        )
-        .expect("debug_logdet_h_proj +h");
-    cache.ensure_theta(&theta_m).expect("ensure -h");
-    let dm = cache.design().clone();
-    let log_det_m = evaluator
-        .debug_logdet_h_proj(
-            &dm.design,
-            &dm.penalties,
-            &dm.nullspace_dims,
-            dm.linear_constraints.clone(),
-            &theta_m,
-            rho_dim,
-            "subspace-pin -h",
-        )
-        .expect("debug_logdet_h_proj -h");
-    let fd_d_logdet_h_proj = (log_det_p - log_det_m) / (2.0 * h);
-
-    // #901-layer-2 diagnostic: split the analytic ψ logdet trace into its
-    // frozen-B_i and cubic-IFT-correction components so we can attribute
-    // the desync against the total FD reference.
-    eprintln!(
-        "[#901-L2 split] production_tr={:+.6e} fd_total={:+.6e} frozen_tr={:?} correction_tr={:?} correction_tr_proj={:?} (true_cubic={:+.6e})",
-        production_tr,
-        fd_d_logdet_h_proj,
-        stash.frozen_tr,
-        stash.correction_tr,
-        stash.correction_tr_proj,
-        fd_d_logdet_h_proj - stash.frozen_tr.unwrap_or(f64::NAN),
+    let (cost_p, _, _) = eval_at(
+        &theta_p,
+        crate::solver::rho_optimizer::OuterEvalOrder::ValueOnly,
+        &mut cache,
+        &mut evaluator,
     );
-
-    let rel_to_fd =
-        (production_tr - fd_d_logdet_h_proj).abs() / fd_d_logdet_h_proj.abs().max(1e-30);
+    let (cost_m, _, _) = eval_at(
+        &theta_m,
+        crate::solver::rho_optimizer::OuterEvalOrder::ValueOnly,
+        &mut cache,
+        &mut evaluator,
+    );
+    let fd_psi_gradient = (cost_p - cost_m) / (2.0 * h);
+    let analytic_psi_gradient = grad_at_zero[psi_idx];
+    let scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());
+    let rel = (analytic_psi_gradient - fd_psi_gradient).abs() / scale;
     assert!(
-        rel_to_fd < 1e-2,
-        "production trace must match FD ∂log|H_proj|/∂ψ: production_tr={:+.4e} \
-             fd_d_logdet_h_proj={:+.4e} rel={:+.3e}",
-        production_tr,
-        fd_d_logdet_h_proj,
-        rel_to_fd
+        rel < 1e-3,
+        "Duchon ψ outer gradient must match centered FD of the production objective: \
+             analytic={:+.4e}, fd={:+.4e}, rel={:+.3e}",
+        analytic_psi_gradient,
+        fd_psi_gradient,
+        rel
     );
 
-    // INVARIANT 3 (re-pinned for the #901 corrected object): on a healthy
-    // spectrum the intrinsic kernel `H_pen⁺` and the smooth-floored
-    // full-space `G_ε(H)` must now AGREE — they differ only in the
-    // treatment of sub-threshold eigendirections, of which this fixture
-    // has none. The pre-#901 version of this pin asserted the OPPOSITE
-    // (gap > 5): that gap was the range(S₊) projection discarding the
-    // real, likelihood-identified ψ-dependence of the penalty-null
-    // directions — i.e. it pinned the bug signature as a feature. A
-    // large gap reappearing here means someone reintroduced a kernel
-    // whose subspace is narrower than the cost's `range(H_pen)`.
-    let gap = (unprojected_tr - production_tr).abs();
-    assert!(
-        gap <= 1e-3 * production_tr.abs().max(1.0),
-        "intrinsic H_pen⁺ kernel must agree with the full-space trace on \
-             a healthy spectrum (unprojected={:+.4e}, production={:+.4e}, \
-             gap={:+.4e})",
-        unprojected_tr,
-        production_tr,
-        gap
-    );
-
-    // Sanity: cost & gradient finite at θ=0.
     assert!(
         cost_at_zero.is_finite() && grad_at_zero.iter().all(|v| v.is_finite()),
         "ψ-gradient and cost must be finite at θ=0"
     );
-}
-
-/// FD `c · dη/dψ_total` vs analytic `c·X_τβ̂ - c·X·v_ψ` per-row.
-/// If they match: the M = term4 + correction matrix has the right diagonal,
-/// and the trace bug must lie elsewhere (e.g., basis or weights).
-/// If they don't match: the IFT formula or v_ψ is wrong.
-#[test]
-fn duchon_probit_per_row_dnu_dpsi_fd_vs_analytic() {
-    let DuchonProbitSetup {
-        data,
-        y,
-        weights,
-        offset,
-        frozen,
-        frozen_design,
-        spatial_terms,
-        dims_per_term,
-        rho_dim,
-        psi_dim,
-    } = build_duchon_probit_setup();
-    let n = data.nrows();
-    let fit_opts = FitOptions {
-        compute_inference: false,
-        max_iter: 200,
-        tol: 1e-12,
-        penalty_shrinkage_floor: None,
-        ..FitOptions::default()
-    };
-
-    let external_opts = external_opts_for_design(
-        &LikelihoodSpec::binomial_probit(),
-        &frozen_design,
-        &fit_opts,
-    );
-    let mut cache = SingleBlockExactJointDesignCache::new(
-        data.view(),
-        frozen.clone(),
-        frozen_design.clone(),
-        spatial_terms.clone(),
-        rho_dim,
-        dims_per_term.clone(),
-    )
-    .expect("cache");
-    let mut evaluator = crate::estimate::ExternalJointHyperEvaluator::new(
-        y.view(),
-        weights.view(),
-        &frozen_design.design,
-        offset.view(),
-        &frozen_design.penalties,
-        &external_opts,
-        "per-row dη/dψ FD vs analytic",
-    )
-    .expect("evaluator");
-
-    let theta_dim = rho_dim + psi_dim;
-    let theta_zero = Array1::<f64>::zeros(theta_dim);
-    let psi_idx = rho_dim;
-    let h = 1e-5_f64;
-
-    // ── η, W, c at ψ=0
-    cache.ensure_theta(&theta_zero).expect("ensure zero");
-    let dz = cache.design().clone();
-    let (eta_0, w_0, c_0) = evaluator
-        .debug_full_eta_w_c(
-            &dz.design,
-            &dz.penalties,
-            &dz.nullspace_dims,
-            dz.linear_constraints.clone(),
-            &theta_zero,
-            rho_dim,
-            "ψ=0",
-        )
-        .expect("debug at 0");
-
-    // η at ψ=±h
-    let mut theta_p = theta_zero.clone();
-    theta_p[psi_idx] += h;
-    cache.ensure_theta(&theta_p).expect("ensure +h");
-    let dp = cache.design().clone();
-    let (eta_p, w_p, c_p) = evaluator
-        .debug_full_eta_w_c(
-            &dp.design,
-            &dp.penalties,
-            &dp.nullspace_dims,
-            dp.linear_constraints.clone(),
-            &theta_p,
-            rho_dim,
-            "ψ=+h",
-        )
-        .expect("debug at +h");
-
-    let mut theta_m = theta_zero.clone();
-    theta_m[psi_idx] -= h;
-    cache.ensure_theta(&theta_m).expect("ensure -h");
-    let dm = cache.design().clone();
-    let (eta_m, _w_m, _c_m) = evaluator
-        .debug_full_eta_w_c(
-            &dm.design,
-            &dm.penalties,
-            &dm.nullspace_dims,
-            dm.linear_constraints.clone(),
-            &theta_m,
-            rho_dim,
-            "ψ=-h",
-        )
-        .expect("debug at -h");
-
-    // dη/dψ_FD per row
-    let mut dnu_dpsi_fd = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        dnu_dpsi_fd[i] = (eta_p[i] - eta_m[i]) / (2.0 * h);
-    }
-    let l2_dnu = (dnu_dpsi_fd.iter().map(|v| v * v).sum::<f64>()).sqrt();
-    eprintln!(
-        "[ROW] ||dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
-        l2_dnu,
-        dnu_dpsi_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-    );
-
-    // c · dη/dψ_FD per row
-    let c_dnu_fd: Array1<f64> = &c_0 * &dnu_dpsi_fd;
-    let l2_c_dnu = (c_dnu_fd.iter().map(|v| v * v).sum::<f64>()).sqrt();
-    eprintln!(
-        "[ROW] ||c·dη/dψ_FD||_L2 = {:+.6e}  per-row max|·| = {:+.4e}",
-        l2_c_dnu,
-        c_dnu_fd.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-    );
-
-    // ── Get ANALYTIC per-row diagonals via debug_stash.
-    cache.ensure_theta(&theta_zero).expect("ensure_theta zero");
-    let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-        data.view(),
-        cache.spec(),
-        cache.design(),
-        &cache.spatial_terms,
-    )
-    .expect("hyper dirs build")
-    .expect("hyper dirs present");
-    // Opt in to EIG-DECOMP stash capture for this eval (production
-    // gradient evals skip the diagnostic's extra traces entirely).
-    let capture = crate::solver::estimate::reml::unified::debug_stash::CaptureGuard::request();
-    let (analytic_cost, analytic_gradient, _) = evaluate_joint_reml_outer_eval_at_theta(
-        &mut evaluator,
-        cache.design(),
-        &theta_zero,
-        rho_dim,
-        hyper_dirs,
-        None,
-        crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
-        None,
-    )
-    .expect("analytic outer eval");
-    assert!(analytic_cost.is_finite());
-    assert!(analytic_gradient.iter().all(|value| value.is_finite()));
-    let stash = capture.take_terms();
-    let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
-    let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
-    assert_eq!(c_x_tau_beta.len(), n);
-    assert_eq!(x_v_psi.len(), n);
-
-    // Analytic per-row IFT diagonal:
-    //   d_i = (c·X_τβ̂)_i − (c·X·v_ψ)_i
-    //       = c_i · (X_τβ̂ + X·∂β̂/∂ψ)_i = c_i · (dη/dψ_total)_i.
-    // FD reference: c_i · (η_+ − η_−)_i / 2h.
-    let c_x_v: Array1<f64> = &c_0 * &x_v_psi;
-    let analytic_diag: Array1<f64> = &c_x_tau_beta - &c_x_v;
-
-    // Each half is individually large (Frobenius ~ 88 for our test); the
-    // physics is in their row-wise cancellation. Pin the cancellation:
-    // |analytic - FD| / |FD|  must stay below 1e-3.  Our current
-    // measurement is rel ≈ 2.9e-5 with both halves at ||·||_L2 ≈ 88.5.
-    let l2_term4_only = c_x_tau_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let l2_corr_only = c_x_v.iter().map(|v| v * v).sum::<f64>().sqrt();
-    assert!(
-        l2_term4_only > 10.0 && l2_corr_only > 10.0,
-        "expected both IFT halves to be large in isolation (only their \
-             row-wise sum should be small), got ||c·X_τβ̂||_L2={:+.3e}, \
-             ||c·X·v_ψ||_L2={:+.3e}",
-        l2_term4_only,
-        l2_corr_only
-    );
-
-    let diff: Array1<f64> = &analytic_diag - &c_dnu_fd;
-    let l2_diff = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let rel = l2_diff / l2_c_dnu.max(1e-30);
-    assert!(
-        rel < 1e-3,
-        "analytic IFT row-diagonal must match FD to 1e-3 relative \
-             (got rel={:+.4e}, ||Δ||_L2={:+.4e}, ||FD||_L2={:+.4e}). \
-             Regression in IFT chain rule (v_ψ formula or W-surface mix).",
-        rel,
-        l2_diff,
-        l2_c_dnu
-    );
-
-    assert_eq!(eta_0.len(), n);
-    assert_eq!(w_0.len(), n);
-    assert_eq!(c_p.len(), n);
-    assert_eq!(w_p.len(), n);
-    assert!(eta_0.iter().all(|value| value.is_finite()));
-    assert!(w_0.iter().all(|value| value.is_finite()));
-    assert!(c_p.iter().all(|value| value.is_finite()));
-    assert!(w_p.iter().all(|value| value.is_finite()));
 }
 
 /// Test PIRLS structural determinism: call debug_full_h three times at

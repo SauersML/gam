@@ -1,11 +1,13 @@
 use gam::estimate::FitOptions;
 use gam::smooth::{
-    CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, LinearCoefficientGeometry,
-    LinearTermSpec, TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
+    CoefficientGroupSpec, CoefficientSelector, LinearCoefficientGeometry, LinearTermSpec,
+    TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
     build_term_collection_designs_joint,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
 };
-use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
+use gam::types::{
+    CoefficientGroupPrior, InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink,
+};
 use ndarray::{Array1, Array2};
 
 fn opts() -> FitOptions {

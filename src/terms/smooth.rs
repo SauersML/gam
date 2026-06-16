@@ -13,8 +13,8 @@ mod shape_constraints;
 
 mod penalty_priors;
 pub use penalty_priors::{
-    CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector,
-    PenaltyBlockGammaPriorMetadata, RealizedCoefficientGroups,
+    CoefficientGroupSpec, CoefficientSelector, PenaltyBlockGammaPriorMetadata,
+    RealizedCoefficientGroups,
 };
 
 include!("smooth/term_specs.rs");

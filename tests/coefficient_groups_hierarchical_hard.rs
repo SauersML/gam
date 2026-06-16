@@ -16,10 +16,10 @@
 
 use gam::estimate::{CoefficientPriorMean, PenaltySpec};
 use gam::smooth::{
-    CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, LinearTermSpec,
-    RandomEffectTermSpec, TermCollectionSpec, build_term_collection_design,
+    CoefficientGroupSpec, CoefficientSelector, LinearTermSpec, RandomEffectTermSpec,
+    TermCollectionSpec, build_term_collection_design,
 };
-use gam::types::RhoPrior;
+use gam::types::{CoefficientGroupPrior, RhoPrior};
 use ndarray::{Array1, Array2, array};
 
 // ---------------------------------------------------------------------------

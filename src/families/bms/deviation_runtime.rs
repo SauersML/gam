@@ -34,21 +34,11 @@ pub enum DeviationRuntimeError {
     NumericalFailure { reason: String },
 }
 
-impl std::fmt::Display for DeviationRuntimeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeviationRuntimeError::InvalidInput { reason }
-            | DeviationRuntimeError::DimensionMismatch { reason }
-            | DeviationRuntimeError::NumericalFailure { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for DeviationRuntimeError {}
-
-impl From<DeviationRuntimeError> for String {
-    fn from(err: DeviationRuntimeError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    DeviationRuntimeError {
+        InvalidInput,
+        DimensionMismatch,
+        NumericalFailure,
     }
 }
 

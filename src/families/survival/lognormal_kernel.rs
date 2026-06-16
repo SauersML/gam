@@ -35,19 +35,9 @@ pub enum LognormalKernelError {
     InvalidSpec { reason: String },
 }
 
-impl fmt::Display for LognormalKernelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LognormalKernelError::InvalidSpec { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for LognormalKernelError {}
-
-impl From<LognormalKernelError> for String {
-    fn from(err: LognormalKernelError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    LognormalKernelError {
+        InvalidSpec,
     }
 }
 

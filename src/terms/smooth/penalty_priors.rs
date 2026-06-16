@@ -13,7 +13,7 @@
 use super::{PenaltyBlockInfo, TermCollectionDesign};
 use crate::basis::BasisError;
 use crate::estimate::PenaltySpec;
-pub use crate::types::CoefficientGroupPrior;
+use crate::types::CoefficientGroupPrior;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

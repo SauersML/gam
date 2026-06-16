@@ -115,8 +115,8 @@ use crate::families::survival::construction::{
 };
 
 use crate::families::survival::location_scale::{
-    SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER, SurvivalCovariateTermBlockTemplate,
-    TimeBlockInput, TimeWiggleBlockInput, residual_distribution_inverse_link,
+    SurvivalCovariateTermBlockTemplate, TimeBlockInput, TimeWiggleBlockInput,
+    residual_distribution_inverse_link,
 };
 
 use crate::inference::data::EncodedDataset as Dataset;

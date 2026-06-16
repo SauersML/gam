@@ -71,24 +71,14 @@ pub enum SurvivalConstructionError {
     UnsupportedDistribution { reason: String },
 }
 
-impl std::fmt::Display for SurvivalConstructionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidConfig { reason }
-            | Self::MissingColumn { reason }
-            | Self::IncompatibleDimensions { reason }
-            | Self::DataValidationFailed { reason }
-            | Self::BasisConstructionFailed { reason }
-            | Self::UnsupportedDistribution { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for SurvivalConstructionError {}
-
-impl From<SurvivalConstructionError> for String {
-    fn from(err: SurvivalConstructionError) -> Self {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    SurvivalConstructionError {
+        InvalidConfig,
+        MissingColumn,
+        IncompatibleDimensions,
+        DataValidationFailed,
+        BasisConstructionFailed,
+        UnsupportedDistribution,
     }
 }
 

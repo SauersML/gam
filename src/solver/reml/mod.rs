@@ -9,8 +9,8 @@ use crate::types::SasLinkState;
 use ndarray::{Array1, Array2, s};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::{Arc, RwLock};
 
 pub(crate) mod assembly;
 pub(crate) mod atoms;

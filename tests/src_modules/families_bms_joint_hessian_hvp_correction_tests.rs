@@ -901,10 +901,7 @@ fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
     let (gradient, hessian) =
         crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
 
-    assert_eq!(
-        gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
-    );
+    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
     assert_eq!(
         hessian,
         crate::solver::rho_optimizer::DeclaredHessianForm::Either
@@ -2030,130 +2027,6 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let fd_psi_gradient = (cost_plus - cost_minus) / (2.0 * eps);
     let analytic_psi_gradient = grad0[n_rho];
 
-    // #740 HVP ψ-gradient attribution (read-only diagnostic; does NOT alter the
-    // assertion or tolerance below). Re-run the base ValueGradientHessian eval
-    // under a debug-stash CaptureGuard so the per-coordinate split of the outer
-    // ψ-gradient (`a`, `½·production_tr`, `−½·ld_s`, and the frozen-B_i vs cubic
-    // IFT-correction split of the logdet trace) is captured, and print it next to
-    // the FD total. The coordinator reads these MSI numbers to localize the
-    // disagreement to a single analytic term.
-    {
-        use crate::solver::estimate::reml::unified::debug_stash;
-        let capture = debug_stash::CaptureGuard::request();
-        let (base_obj, _, _) = outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
-        assert!(
-            base_obj.is_finite(),
-            "stash-capture base eval must reproduce a finite outer objective"
-        );
-        let stash = capture.take_terms();
-        // `a`-channel split of the first ψ coordinate: (a_likelihood = objective_psi,
-        // a_penalty_quadratic = ½β̂ᵀ(∂S_λ/∂ψ)β̂). Drained from the global sink
-        // recorded by build_psi_hyper_coords for the base eval.
-        let a_split = capture.take_a_split();
-        let half_prod = stash.production_tr.map(|t| 0.5 * t);
-        let half_ld_s = stash.coord_ld_s.map(|t| 0.5 * t);
-        let recon = match (stash.coord_a, half_prod, half_ld_s) {
-            (Some(a), Some(hp), Some(hs)) => Some(a + hp - hs),
-            _ => None,
-        };
-
-        // Probes (a) + (b): per-component FD of the outer VALUE at ψ±eps (β̂
-        // re-solved each side), using the same `eps` as the failing gradient
-        // check. Hold the SAME CaptureGuard so each eval populates the stash;
-        // `take_terms` drains it after each. Then attribute the FD total:
-        //   FD(log_det_h)            ↔ production_tr  (probe b: frozen ∂W/∂ψ logdet-H drift)
-        //   FD(cost − ½ldh + ½lds)   ↔ coord_a        (probe a: cost/`a` term completeness)
-        //   FD(log_det_s)            ↔ coord_ld_s
-        let (_, _, _) = outer_at(eps, 0.0, EvalMode::ValueGradientHessian);
-        let stash_plus = capture.take_terms();
-        let a_split_plus = capture.take_a_split();
-        let (_, _, _) = outer_at(-eps, 0.0, EvalMode::ValueGradientHessian);
-        let stash_minus = capture.take_terms();
-        let a_split_minus = capture.take_a_split();
-        let central = |plus: Option<f64>, minus: Option<f64>| -> Option<f64> {
-            match (plus, minus) {
-                (Some(p), Some(m)) => Some((p - m) / (2.0 * eps)),
-                _ => None,
-            }
-        };
-        let fd_log_det_h = central(stash_plus.coord_log_det_h, stash_minus.coord_log_det_h);
-        let fd_log_det_s = central(stash_plus.coord_log_det_s, stash_minus.coord_log_det_s);
-        // Logdet-EXCLUDED cost piece at each side: cost − ½log_det_h + ½log_det_s.
-        let cost_ex = |s: &debug_stash::TermStash| -> Option<f64> {
-            match (s.coord_cost, s.coord_log_det_h, s.coord_log_det_s) {
-                (Some(c), Some(ldh), Some(lds)) => Some(c - 0.5 * ldh + 0.5 * lds),
-                _ => None,
-            }
-        };
-        let fd_cost_excl_logdet = central(cost_ex(&stash_plus), cost_ex(&stash_minus));
-        // Full cost FD (sanity: must reproduce the public-API fd_psi_gradient).
-        let fd_cost_total = central(stash_plus.coord_cost, stash_minus.coord_cost);
-        // FD of each `a`-channel separately, so a coord_a mismatch is attributed
-        // to the likelihood channel (objective_psi) vs the penalty-quadratic
-        // channel ½β̂ᵀS_ψβ̂. (a_likelihood is itself the analytic ψ-deriv of −ℓ at
-        // fixed β; its FD counterpart is FD of the −ℓ value, which equals
-        // fd_cost_excl_logdet − FD(½βᵀSλβ). We expose the raw channels so the
-        // coordinator sees which of the two analytic channels is the small one.)
-        let a_like = a_split.map(|(l, _)| l);
-        let a_penq = a_split.map(|(_, q)| q);
-        let a_like_plus = a_split_plus.map(|(l, _)| l);
-        let a_like_minus = a_split_minus.map(|(l, _)| l);
-        let a_penq_plus = a_split_plus.map(|(_, q)| q);
-        let a_penq_minus = a_split_minus.map(|(_, q)| q);
-
-        println!(
-            "[HVP-attr] analytic_psi_grad={analytic_psi_gradient:.8e} fd_psi_grad={fd_psi_gradient:.8e} \
-             coord_a={:?} production_tr={:?} half_production_tr={:?} coord_ld_s={:?} \
-             half_ld_s={:?} recon_a+halfprod-halflds={:?} frozen_tr={:?} correction_tr={:?} \
-             correction_tr_proj={:?} projection_active={:?} unprojected_tr={:?}",
-            stash.coord_a,
-            stash.production_tr,
-            half_prod,
-            stash.coord_ld_s,
-            half_ld_s,
-            recon,
-            stash.frozen_tr,
-            stash.correction_tr,
-            stash.correction_tr_proj,
-            stash.projection_active,
-            stash.unprojected_tr,
-        );
-        println!(
-            "[HVP-attr-fd] PROBE_a coord_a={:?} fd_cost_excl_logdet={:?} (these should match) | \
-             PROBE_b production_tr={:?} fd_log_det_h={:?} (these should match) | \
-             coord_ld_s={:?} fd_log_det_s={:?} (should match) | \
-             fd_cost_total={:?} fd_psi_grad_public={fd_psi_gradient:.8e} (cross-check) | \
-             base_log_det_h={:?} base_log_det_s={:?} base_cost={:?}",
-            stash.coord_a,
-            fd_cost_excl_logdet,
-            stash.production_tr,
-            fd_log_det_h,
-            stash.coord_ld_s,
-            fd_log_det_s,
-            fd_cost_total,
-            stash.coord_log_det_h,
-            stash.coord_log_det_s,
-            stash.coord_cost,
-        );
-        println!(
-            "[HVP-attr-asplit] a_likelihood(objective_psi)={a_like:?} a_penalty_quadratic={a_penq:?} \
-             (sum should == coord_a) | base_a_like_plus={a_like_plus:?} a_like_minus={a_like_minus:?} \
-             base_a_penq_plus={a_penq_plus:?} a_penq_minus={a_penq_minus:?} | \
-             implied_missing=coord_a - fd_cost_excl_logdet"
-        );
-        // #740 gate-4 root-cause probe: the inner KKT residual inf-norm at the
-        // base β̂ and whether the batched envelope-ONLY outer-gradient override
-        // fired (dropping the β-response correction). residual≫0 + override_fired
-        // ⇒ the analytic ψ-gradient is missing the KKT-residual β-response (the
-        // gap). residual≈0 yet coord_a ≠ fd_cost_excl_logdet ⇒ objective_psi
-        // assembly bug (the kernel ∂X/∂ψ is FD-verified-correct standalone).
-        let kkt_probe = capture.take_kkt_probe();
-        println!(
-            "[740-KKT-PROBE] inner_kkt_residual_inf={:?} batched_envelope_override_fired={:?}",
-            kkt_probe.map(|(r, _)| r),
-            kkt_probe.map(|(_, f)| f),
-        );
-    }
     let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());
     let psi_gradient_rel = (analytic_psi_gradient - fd_psi_gradient).abs() / psi_gradient_scale;
     assert!(

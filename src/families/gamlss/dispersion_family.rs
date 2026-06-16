@@ -9,12 +9,12 @@ use super::{
     LocationScaleFamilyBuilder, build_location_scale_block, fit_location_scale_terms,
     identity_penalty, solve_penalizedweighted_projection,
 };
-use crate::families::block_layout::block_count::validate_block_count;
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
 };
 use crate::estimate::UnifiedFitResult;
+use crate::families::block_layout::block_count::validate_block_count;
 use crate::gamlss::GamlssError;
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,

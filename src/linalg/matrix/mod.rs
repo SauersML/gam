@@ -69,21 +69,10 @@ pub enum MatrixError {
     DensificationRefused { reason: String },
 }
 
-impl std::fmt::Display for MatrixError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MatrixError::DimensionMismatch { reason }
-            | MatrixError::DensificationRefused { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for MatrixError {}
-
-impl From<MatrixError> for String {
-    #[inline]
-    fn from(err: MatrixError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    MatrixError {
+        DimensionMismatch,
+        DensificationRefused,
     }
 }
 

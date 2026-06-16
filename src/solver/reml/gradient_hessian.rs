@@ -5017,13 +5017,13 @@ impl<'a> RemlState<'a> {
         let prev_rho: Option<Array1<f64>> = self.prev_warm_start_rho.read().unwrap().clone();
         let (cur_rho, prev_beta, prev_rho): (Array1<f64>, Coefficients, Array1<f64>) =
             match (cur_rho, prev_beta, prev_rho) {
-            (Some(cr), Some(pb), Some(pr)) => (cr, pb, pr),
-            // No history yet — first call after a fresh successful
-            // solve (only one (ρ, β) pair stashed). Silent fallback
-            // is the right behavior; emitting a marker here would
-            // just be noise on every first call.
-            _ => return Some((cur_beta, WarmStartPredictionSource::Flat)),
-        };
+                (Some(cr), Some(pb), Some(pr)) => (cr, pb, pr),
+                // No history yet — first call after a fresh successful
+                // solve (only one (ρ, β) pair stashed). Silent fallback
+                // is the right behavior; emitting a marker here would
+                // just be noise on every first call.
+                _ => return Some((cur_beta, WarmStartPredictionSource::Flat)),
+            };
         // Dimension mismatch paths below are bug signals: state-machine
         // inconsistency between (β, ρ) cache and current state. Emit
         // structured markers so the bench runner can detect non-zero

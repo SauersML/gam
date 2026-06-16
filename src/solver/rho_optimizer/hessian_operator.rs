@@ -43,21 +43,11 @@ pub enum OuterStrategyError {
     RhoBlockShape { reason: String },
 }
 
-impl std::fmt::Display for OuterStrategyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OuterStrategyError::OperatorShape { reason }
-            | OuterStrategyError::NonFiniteHessian { reason }
-            | OuterStrategyError::RhoBlockShape { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for OuterStrategyError {}
-
-impl From<OuterStrategyError> for String {
-    fn from(err: OuterStrategyError) -> String {
-        err.to_string()
+crate::impl_reason_error_boilerplate! {
+    OuterStrategyError {
+        OperatorShape,
+        NonFiniteHessian,
+        RhoBlockShape,
     }
 }
 
