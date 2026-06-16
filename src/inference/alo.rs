@@ -1066,6 +1066,7 @@ pub fn compute_case_deletion_from_pirls(
             other => EstimationError::InvalidInput(format!("{other:?}")),
         })?;
 
+    use crate::linalg::faer_ndarray::FaerCholesky;
     let factor = match h_dense.cholesky(faer::Side::Lower) {
         Ok(f) => f,
         // A non-SPD stabilized Hessian means the optimum is rank-deficient in a
