@@ -860,8 +860,8 @@ pub(crate) fn custom_family_block_role(
     name: &str,
     index: usize,
     n_blocks: usize,
-) -> crate::solver::estimate::BlockRole {
-    use crate::solver::estimate::BlockRole;
+) -> crate::model_types::BlockRole {
+    use crate::model_types::BlockRole;
 
     if n_blocks == 1 {
         return BlockRole::Mean;

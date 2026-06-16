@@ -1211,7 +1211,7 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
 
     let requires_explicit_joint_hessian = specs.iter().enumerate().any(|(idx, spec)| {
         custom_family_block_role(&spec.name, idx, specs.len())
-            == crate::solver::estimate::BlockRole::LinkWiggle
+            == crate::model_types::BlockRole::LinkWiggle
     });
     let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
     let Some(mut h) = exact_newton_joint_hessian_symmetrized(

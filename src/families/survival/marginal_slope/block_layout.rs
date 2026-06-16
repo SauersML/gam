@@ -138,7 +138,7 @@ pub(crate) fn stripe_score_warp_across_z_coords(
                 .push(crate::model_types::PenaltySpec::Block {
                     local,
                     col_range: col_range.clone(),
-                    prior_mean: crate::estimate::CoefficientPriorMean::Zero,
+                    prior_mean: crate::model_types::CoefficientPriorMean::Zero,
                     structure_hint: None,
                     op: None,
                 });

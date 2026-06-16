@@ -419,7 +419,7 @@ pub(crate) fn reduced_blockwise_edf(
 pub fn blockwise_fit_from_parts(
     parts: BlockwiseFitResultParts,
     specs: &[ParameterBlockSpec],
-) -> Result<crate::solver::estimate::UnifiedFitResult, String> {
+) -> Result<crate::model_types::UnifiedFitResult, String> {
     let BlockwiseFitResultParts {
         block_states,
         log_likelihood,
@@ -539,7 +539,7 @@ pub fn blockwise_fit_from_parts(
     }
 
     // Build unified blocks from the blockwise states.
-    use crate::solver::estimate::{FittedBlock, FittedLinkState, UnifiedFitResultParts};
+    use crate::model_types::{FittedBlock, FittedLinkState, UnifiedFitResultParts};
     let expected_rho: usize = specs.iter().map(|s| s.penalties.len()).sum();
     if lambdas.len() != expected_rho {
         return Err(CustomFamilyError::DimensionMismatch { reason: format!(
@@ -619,7 +619,7 @@ pub fn blockwise_fit_from_parts(
     // dispersion-free, and downstream covariance scaling pairs `H` with the
     // family's own dispersion where needed.
     let inference = match (edf_total_opt, geometry.as_ref()) {
-        (Some(edf_total), Some(geom)) => Some(crate::solver::estimate::FitInference {
+        (Some(edf_total), Some(geom)) => Some(crate::model_types::FitInference {
             edf_by_block: edf_by_penalty,
             edf_total,
             smoothing_correction: None,
@@ -640,7 +640,7 @@ pub fn blockwise_fit_from_parts(
         _ => None,
     };
 
-    crate::solver::estimate::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+    crate::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks,
         log_lambdas: log_lambdas.clone(),
         lambdas: lambdas.clone(),
@@ -676,7 +676,7 @@ pub fn blockwise_fit_from_parts(
         },
         max_abs_eta: 0.0,
         constraint_kkt: None,
-        artifacts: crate::solver::estimate::FitArtifacts {
+        artifacts: crate::model_types::FitArtifacts {
             pirls: None,
             criterion_certificate,
             ..Default::default()

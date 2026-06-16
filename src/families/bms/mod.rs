@@ -8,7 +8,6 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
     joint_hyper_options_for_outer_tolerance,
 };
-use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::jet_partitions::MultiDirJet;
@@ -30,6 +29,7 @@ use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::families::survival::lognormal_kernel::FrailtySpec;
 use crate::families::wiggle::initializewiggle_knots_from_seed;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
+use crate::model_types::UnifiedFitResult;
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{
     normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,

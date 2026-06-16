@@ -1287,6 +1287,408 @@ pub fn pullback_step6_joint_beta(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 6 (device) — on-CUDA per-row joint-β contraction.
+//
+// The host `pullback_step6_joint_beta` above is the bit-exact reference.  The
+// device path below folds the *same* per-row contraction on the GPU: one CUDA
+// block per row computes that row's dense contribution
+//
+//     grad_row[j]   = Σ_a J[a,j] · g_p[a]                       (∈ ℝ^p)
+//     hess_row[j,k] = Σ_a Σ_b J[a,j] · H_p[a,b] · J[b,k]        (∈ ℝ^{p×p})
+//
+// using the identical blocked `M = H_p · J` intermediate the host uses, so each
+// row's partial is bit-for-bit what the host computes for that row.  The per-row
+// partials are copied back and summed on the host **in row order** — matching the
+// host reference's sequential row accumulation — so the device total agrees with
+// `pullback_step6_joint_beta` to the last ULP (the row-NLL is summed the same
+// way).  The expensive O(r²p + r·p²) per-row contraction runs on the device; the
+// cheap O(n·p²) deterministic row reduction stays on the host to preserve the
+// exact CPU summation order.
+//
+// Concatenated SoA layout (host builds once, uploads once):
+//   * `g_p_flat`  — Σ_rows r_row  primary-gradient scalars, row-major.
+//   * `h_p_flat`  — Σ_rows r_row² primary-Hessian scalars, row-major.
+//   * `jac_flat`  — Σ_rows r_row·p Jacobian scalars, row-major (J[a*p+j]).
+//   * `r_arr`     — per-row primary dim r_row.
+//   * `g_off/h_off/j_off` — per-row start offsets into the three flats.
+// Output: `grad_rows` (n·p) and `hess_rows` (n·p·p), one dense block per row.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Flattened SoA view of the Step-6 rows, plus the per-row dims/offsets the
+/// device kernel indexes.  Built once from `&[SurvivalFlexStep6RowPullback]`.
+#[derive(Clone, Debug)]
+struct Step6DeviceBatch {
+    n_rows: usize,
+    p: usize,
+    nll: f64,
+    g_p_flat: Vec<f64>,
+    h_p_flat: Vec<f64>,
+    jac_flat: Vec<f64>,
+    r_arr: Vec<u32>,
+    g_off: Vec<u32>,
+    h_off: Vec<u32>,
+    j_off: Vec<u32>,
+}
+
+impl Step6DeviceBatch {
+    fn build(rows: &[SurvivalFlexStep6RowPullback<'_>], p: usize) -> Result<Self, GpuError> {
+        let n_rows = rows.len();
+        let mut nll = 0.0_f64;
+        let mut g_p_flat = Vec::new();
+        let mut h_p_flat = Vec::new();
+        let mut jac_flat = Vec::new();
+        let mut r_arr = Vec::with_capacity(n_rows);
+        let mut g_off = Vec::with_capacity(n_rows);
+        let mut h_off = Vec::with_capacity(n_rows);
+        let mut j_off = Vec::with_capacity(n_rows);
+        for (i, row) in rows.iter().enumerate() {
+            let r = row.primary.grad.len();
+            if row.primary.hess.len() != r * r {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "step6 device row {i}: primary.hess.len()={} expected r*r={}",
+                        row.primary.hess.len(),
+                        r * r
+                    ),
+                });
+            }
+            if row.jacobian.len() != r * p {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "step6 device row {i}: jacobian.len()={} expected r*p={}",
+                        row.jacobian.len(),
+                        r * p
+                    ),
+                });
+            }
+            nll += row.primary.row_nll;
+            g_off.push(
+                u32::try_from(g_p_flat.len()).map_err(|_| GpuError::DriverCallFailed {
+                    reason: "step6 device: g_p offset overflows u32".to_string(),
+                })?,
+            );
+            h_off.push(
+                u32::try_from(h_p_flat.len()).map_err(|_| GpuError::DriverCallFailed {
+                    reason: "step6 device: h_p offset overflows u32".to_string(),
+                })?,
+            );
+            j_off.push(
+                u32::try_from(jac_flat.len()).map_err(|_| GpuError::DriverCallFailed {
+                    reason: "step6 device: jac offset overflows u32".to_string(),
+                })?,
+            );
+            r_arr.push(u32::try_from(r).map_err(|_| GpuError::DriverCallFailed {
+                reason: "step6 device: r overflows u32".to_string(),
+            })?);
+            g_p_flat.extend_from_slice(&row.primary.grad);
+            h_p_flat.extend_from_slice(&row.primary.hess);
+            jac_flat.extend_from_slice(row.jacobian);
+        }
+        Ok(Self {
+            n_rows,
+            p,
+            nll,
+            g_p_flat,
+            h_p_flat,
+            jac_flat,
+            r_arr,
+            g_off,
+            h_off,
+            j_off,
+        })
+    }
+}
+
+/// NVRTC source for the per-row Step-6 contraction.  One block per row; threads
+/// in the block cooperatively fill the row's `grad_row[p]` and `hess_row[p*p]`.
+/// The intermediate `M = H_p · J` (r × p) is computed in registers/global per
+/// thread-tile exactly as the host does, so each row's output is bit-identical
+/// to the host per-row partial.
+#[cfg(target_os = "linux")]
+const SURVIVAL_FLEX_STEP6_SOURCE: &str = r#"
+extern "C" __global__ void survival_flex_step6_rows(
+    const double * __restrict__ g_p_flat,
+    const double * __restrict__ h_p_flat,
+    const double * __restrict__ jac_flat,
+    const unsigned int * __restrict__ r_arr,
+    const unsigned int * __restrict__ g_off,
+    const unsigned int * __restrict__ h_off,
+    const unsigned int * __restrict__ j_off,
+    int                                p,
+    int                                n_rows,
+    double * __restrict__              grad_rows,   // n_rows * p
+    double * __restrict__              hess_rows,   // n_rows * p * p
+    double * __restrict__              m_scratch    // n_rows * rmax * p (row-major per row, r*p used)
+) {
+    int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    int r   = (int) r_arr[row];
+    int goff = (int) g_off[row];
+    int hoff = (int) h_off[row];
+    int joff = (int) j_off[row];
+
+    const double * g_p = g_p_flat + goff;     // length r
+    const double * h_p = h_p_flat + hoff;     // r*r row-major
+    const double * j   = jac_flat + joff;     // r*p row-major (J[a*p+j])
+
+    double * grad_row = grad_rows + (size_t) row * (size_t) p;     // length p
+    double * hess_row = hess_rows + (size_t) row * (size_t) p * (size_t) p; // p*p
+    double * m_row    = m_scratch + (size_t) row * (size_t) r * (size_t) p; // r*p (M = H_p J)
+
+    int tid    = threadIdx.x;
+    int stride = blockDim.x;
+
+    // 1) grad_row[k] = Σ_a J[a,k] · g_p[a].  Match the host accumulation order:
+    //    outer over a, inner over k.  Per-output (k) accumulation is order-stable.
+    for (int k = tid; k < p; k += stride) {
+        double acc = 0.0;
+        for (int a = 0; a < r; ++a) {
+            double ga = g_p[a];
+            if (ga != 0.0) acc += j[a * p + k] * ga;
+        }
+        grad_row[k] = acc;
+    }
+
+    // 2) M = H_p · J  (r × p):  M[a,k] = Σ_b H_p[a,b] · J[b,k].  Host order:
+    //    outer a, inner b (skip zero hab), inner k.  We parallelise over the
+    //    (a,k) output grid; each output sums over b in the same b-order.
+    for (int idx = tid; idx < r * p; idx += stride) {
+        int a = idx / p;
+        int k = idx - a * p;
+        double acc = 0.0;
+        for (int b = 0; b < r; ++b) {
+            double hab = h_p[a * r + b];
+            if (hab != 0.0) acc += hab * j[b * p + k];
+        }
+        m_row[a * p + k] = acc;
+    }
+    __syncthreads();
+
+    // 3) hess_row[col,k] = Σ_a J[a,col] · M[a,k].  Host order: outer a, skip
+    //    zero jac, inner k.  Parallelise over (col,k); sum over a in a-order.
+    for (int idx = tid; idx < p * p; idx += stride) {
+        int col = idx / p;
+        int k   = idx - col * p;
+        double acc = 0.0;
+        for (int a = 0; a < r; ++a) {
+            double jac = j[a * p + col];
+            if (jac != 0.0) acc += jac * m_row[a * p + k];
+        }
+        hess_row[col * p + k] = acc;
+    }
+}
+"#;
+
+/// Device Step-6 joint-β contraction.  Returns `Ok(None)` on non-Linux / no-CUDA
+/// builds (caller folds on the host via [`pullback_step6_joint_beta`]); returns
+/// the bit-exact `(nll, grad, hess)` on a healthy CUDA device.
+///
+/// The per-row dense contraction (`Jᵀ g_p`, `Jᵀ H_p J`) runs on the GPU; the
+/// per-row partials are summed on the host in row order so the result matches the
+/// host reference to the last ULP.  The dense Hessian is symmetrized with the
+/// same averaging pass the host uses.
+pub fn try_device_step6_joint_beta(
+    rows: &[SurvivalFlexStep6RowPullback<'_>],
+    p: usize,
+) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, GpuError> {
+    if !SurvivalFlexGpuBackend::compiled() {
+        return Ok(None);
+    }
+    if rows.is_empty() {
+        // Empty fold is the host's zero answer; no device round-trip needed.
+        return Ok(Some((0.0, Array1::zeros(p), Array2::zeros((p, p)))));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let batch = Step6DeviceBatch::build(rows, p)?;
+        let backend = match SurvivalFlexGpuBackend::probe() {
+            Ok(b) => b,
+            Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        Some(backend.launch_step6_joint_beta_linux(&batch)).transpose()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &rows;
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SurvivalFlexGpuBackend {
+    fn compile_step6_module(&self) -> Result<Arc<CudaModule>, GpuError> {
+        static STEP6_MODULE: OnceLock<std::sync::Mutex<Option<Result<Arc<CudaModule>, GpuError>>>> =
+            OnceLock::new();
+        let cell = STEP6_MODULE.get_or_init(|| std::sync::Mutex::new(None));
+        let mut guard = cell.lock().map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("survival_flex step6 module mutex poisoned: {err}"),
+        })?;
+        if let Some(existing) = guard.as_ref() {
+            return existing.clone();
+        }
+        let result = (|| {
+            let ptx = cudarc::nvrtc::compile_ptx(SURVIVAL_FLEX_STEP6_SOURCE).map_err(|err| {
+                GpuError::DriverCallFailed {
+                    reason: format!("survival_flex step6 NVRTC compile: {err}"),
+                }
+            })?;
+            self.inner
+                .ctx
+                .load_module(ptx)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex step6 module load: {err}"),
+                })
+        })();
+        *guard = Some(result.clone());
+        result
+    }
+
+    fn launch_step6_joint_beta_linux(
+        &self,
+        batch: &Step6DeviceBatch,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), GpuError> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        let module = self.compile_step6_module()?;
+        let func = module
+            .load_function("survival_flex_step6_rows")
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex step6 load_function: {err}"),
+            })?;
+
+        let n_rows = batch.n_rows;
+        let p = batch.p;
+        let rmax = batch.r_arr.iter().copied().max().unwrap_or(0) as usize;
+        let stream = &self.inner.stream;
+
+        let mk_htod_f64 = |slice: &[f64], name: &str| -> Result<_, GpuError> {
+            stream
+                .clone_htod(slice)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex step6 htod {name}: {err}"),
+                })
+        };
+        let mk_htod_u32 = |slice: &[u32], name: &str| -> Result<_, GpuError> {
+            stream
+                .clone_htod(slice)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex step6 htod {name}: {err}"),
+                })
+        };
+
+        let d_g_p = mk_htod_f64(&batch.g_p_flat, "g_p_flat")?;
+        let d_h_p = mk_htod_f64(&batch.h_p_flat, "h_p_flat")?;
+        let d_jac = mk_htod_f64(&batch.jac_flat, "jac_flat")?;
+        let d_r = mk_htod_u32(&batch.r_arr, "r_arr")?;
+        let d_goff = mk_htod_u32(&batch.g_off, "g_off")?;
+        let d_hoff = mk_htod_u32(&batch.h_off, "h_off")?;
+        let d_joff = mk_htod_u32(&batch.j_off, "j_off")?;
+
+        let mut d_grad_rows =
+            stream
+                .alloc_zeros::<f64>(n_rows * p)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex step6 alloc grad_rows: {err}"),
+                })?;
+        let mut d_hess_rows = stream.alloc_zeros::<f64>(n_rows * p * p).map_err(|err| {
+            GpuError::DriverCallFailed {
+                reason: format!("survival_flex step6 alloc hess_rows: {err}"),
+            }
+        })?;
+        // M scratch sized to the worst-case r per row so every block has room.
+        let mut d_m_scratch = stream
+            .alloc_zeros::<f64>(n_rows * rmax.max(1) * p)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex step6 alloc m_scratch: {err}"),
+            })?;
+
+        let p_i32 = i32::try_from(p).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!("survival_flex step6 p={p} overflows i32"),
+        })?;
+        let n_i32 = i32::try_from(n_rows).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!("survival_flex step6 n_rows={n_rows} overflows i32"),
+        })?;
+
+        // One block per row; 256 threads cooperatively fill the row's p / p² grid.
+        let block: u32 = 256;
+        let grid: u32 = u32::try_from(n_rows).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!("survival_flex step6 n_rows={n_rows} overflows grid u32"),
+        })?;
+        let cfg = LaunchConfig {
+            grid_dim: (grid.max(1), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&d_g_p)
+            .arg(&d_h_p)
+            .arg(&d_jac)
+            .arg(&d_r)
+            .arg(&d_goff)
+            .arg(&d_hoff)
+            .arg(&d_joff)
+            .arg(&p_i32)
+            .arg(&n_i32)
+            .arg(&mut d_grad_rows)
+            .arg(&mut d_hess_rows)
+            .arg(&mut d_m_scratch);
+        // SAFETY: argument types/order match the kernel signature; grid covers
+        // every row; per-block output buffers are sized n_rows·p and n_rows·p².
+        unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("survival_flex step6 launch: {err}"),
+        })?;
+
+        let grad_rows =
+            stream
+                .clone_dtoh(&d_grad_rows)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex step6 dtoh grad_rows: {err}"),
+                })?;
+        let hess_rows =
+            stream
+                .clone_dtoh(&d_hess_rows)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex step6 dtoh hess_rows: {err}"),
+                })?;
+        stream
+            .synchronize()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex step6 synchronize: {err}"),
+            })?;
+
+        // Deterministic host reduction over rows (row-order) to match the host
+        // reference's sequential accumulation exactly.
+        let mut grad = Array1::<f64>::zeros(p);
+        let mut hess = Array2::<f64>::zeros((p, p));
+        for row in 0..n_rows {
+            let gbase = row * p;
+            for k in 0..p {
+                grad[k] += grad_rows[gbase + k];
+            }
+            let hbase = row * p * p;
+            for col in 0..p {
+                for k in 0..p {
+                    hess[[col, k]] += hess_rows[hbase + col * p + k];
+                }
+            }
+        }
+        // Same symmetrization pass as the host reference.
+        for col in 0..p {
+            for k in (col + 1)..p {
+                let avg = 0.5 * (hess[[col, k]] + hess[[k, col]]);
+                hess[[col, k]] = avg;
+                hess[[k, col]] = avg;
+            }
+        }
+
+        Ok((batch.nll, grad, hess))
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three pullback entry points.  The device-side flex jet assembly (Steps 2–5:
 // cubic-cell moments → intercept solve → η/χ/d jets → primary
 // gradient/Hessian) is still gated by the CUDA backend, but once the host has
@@ -1341,7 +1743,12 @@ pub fn try_survival_flex_gradient(
     // CPU-verifiable, and becomes the device contraction once the substrate
     // jet assembly lands.
     if let Some(rows) = step6 {
-        let (nll, grad, _hess) = pullback_step6_joint_beta(rows, inputs.p)?;
+        // Prefer the on-device contraction; fall back to the host fold on
+        // non-CUDA builds.  Both are bit-exact against each other.
+        let (nll, grad, _hess) = match try_device_step6_joint_beta(rows, inputs.p)? {
+            Some(triple) => triple,
+            None => pullback_step6_joint_beta(rows, inputs.p)?,
+        };
         return Ok(Some((nll, grad)));
     }
     if !SurvivalFlexGpuBackend::compiled() {
@@ -1375,7 +1782,10 @@ pub fn try_survival_flex_hvp(
         return Ok(None);
     }
     if let Some(rows) = step6 {
-        let (_nll, _grad, hess) = pullback_step6_joint_beta(rows, inputs.p)?;
+        let (_nll, _grad, hess) = match try_device_step6_joint_beta(rows, inputs.p)? {
+            Some(triple) => triple,
+            None => pullback_step6_joint_beta(rows, inputs.p)?,
+        };
         return Ok(Some(hess.dot(&Array1::from(v.to_vec()))));
     }
     if !SurvivalFlexGpuBackend::compiled() {
@@ -1425,9 +1835,13 @@ pub fn try_survival_flex_dense_hessian(
         }
     }
     // Step 6: fold the assembled per-row primary Hessians into the dense
-    // coefficient-space joint Hessian via the joint-β pullback.
+    // coefficient-space joint Hessian via the joint-β pullback (on-device when a
+    // CUDA backend is live, host fold otherwise — both bit-exact).
     if let Some(rows) = step6 {
-        let (_nll, _grad, hess) = pullback_step6_joint_beta(rows, inputs.p)?;
+        let (_nll, _grad, hess) = match try_device_step6_joint_beta(rows, inputs.p)? {
+            Some(triple) => triple,
+            None => pullback_step6_joint_beta(rows, inputs.p)?,
+        };
         return Ok(Some(hess));
     }
     if !SurvivalFlexGpuBackend::compiled() {
