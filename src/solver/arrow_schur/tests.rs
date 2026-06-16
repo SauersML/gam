@@ -3637,6 +3637,12 @@ pub(crate) fn parallel_block_jacobi_deterministic_and_matches_sequential() {
         use faer::linalg::solvers::Solve;
         let stride = rhs.strides()[0];
         let len = rhs.len();
+        // SAFETY: `rhs` is a live `Array1<f64>` that outlives `rhs_mat` (both
+        // dropped at the end of this loop iteration); `rhs.as_ptr()` is valid for
+        // `len = rhs.len()` contiguous f64 reads, and the `(len, 1)` shape with
+        // row stride `rhs.strides()[0]` and col stride 0 exactly describes that
+        // single-column layout. No aliasing: the view is read-only and `rhs` is
+        // not mutated while `rhs_mat` is borrowed.
         let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
         let solved = llt.solve(rhs_mat);
         for bi in 0..b {
