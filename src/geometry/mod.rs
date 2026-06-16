@@ -13,6 +13,7 @@ pub mod poincare;
 pub mod product;
 pub mod response_geometry;
 pub mod simplex;
+pub mod sinkhorn_barycenter;
 pub mod spd;
 pub mod sphere;
 pub mod stiefel;

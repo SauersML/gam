@@ -101,7 +101,7 @@ pub(crate) use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayl
 
 pub(crate) use gam::inference::predict::input::build_predict_input_for_model;
 
-pub(crate) use gam::kernels::sinkhorn_barycenter::{
+pub(crate) use gam::geometry::sinkhorn_barycenter::{
     circular_cost as sinkhorn_circular_cost_impl, euclidean_cost as sinkhorn_euclidean_cost_impl,
     geodesic_sphere_cost as sinkhorn_geodesic_sphere_cost_impl,
     sinkhorn_barycenter as sinkhorn_barycenter_impl,
