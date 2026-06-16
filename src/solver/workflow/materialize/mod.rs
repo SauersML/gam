@@ -721,7 +721,7 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     col_map: &HashMap<String, usize>,
     inference_notes: &mut Vec<String>,
     scale_dimensions: bool,
-    policy: &crate::resource::ResourcePolicy,
+    policy: &crate::solver::resource::ResourcePolicy,
     smooth_overrides: Option<&JsonValue>,
 ) -> Result<TermCollectionSpec, WorkflowError> {
     let mut spec = build_termspec(terms, data, col_map, inference_notes, policy)?;
@@ -2193,7 +2193,7 @@ pub(crate) fn materialize_standard<'a>(
     let term_col_map = term_data.column_map();
 
     let policy =
-        resolved_resource_policy(config, term_data, crate::resource::ProblemHints::default());
+        resolved_resource_policy(config, term_data, crate::solver::resource::ProblemHints::default());
     let spec = build_termspec_with_geometry_and_overrides(
         &term_parsed.terms,
         term_data,
@@ -2465,7 +2465,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     let policy = resolved_resource_policy(
         config,
         data,
-        crate::resource::ProblemHints {
+        crate::solver::resource::ProblemHints {
             marginal_slope_large_scale_active: true,
         },
     );
@@ -2873,7 +2873,7 @@ pub(crate) fn materialize_survival<'a>(
     let policy = resolved_resource_policy(
         config,
         data,
-        crate::resource::ProblemHints {
+        crate::solver::resource::ProblemHints {
             // Survival marginal-slope shares the operator-only invariant with
             // the Bernoulli path; flag it as such so strict mode is selected
             // even at small n.
@@ -4106,7 +4106,7 @@ pub(crate) fn materialize_location_scale<'a>(
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
-    let policy = resolved_resource_policy(config, data, crate::resource::ProblemHints::default());
+    let policy = resolved_resource_policy(config, data, crate::solver::resource::ProblemHints::default());
     let meanspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
