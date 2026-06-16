@@ -426,7 +426,7 @@ pub const fn sphere_gpu_compiled() -> bool {
 ///     `ld = ((n + 31) / 32) * 32`.
 #[must_use]
 pub fn sphere_kernel_decision(n: usize, m: usize, lmax: usize) -> GpuDecision {
-    let large_enough = if let Some(runtime) = crate::gpu::runtime::GpuRuntime::global() {
+    let large_enough = if let Some(runtime) = crate::gpu::device_runtime::GpuRuntime::global() {
         let ld = ((n + 31) / 32) * 32;
         let needed_bytes = ld
             .saturating_mul(m)
@@ -1457,7 +1457,7 @@ mod sphere_gpu_tests {
     /// a small grid. Skips cleanly on hosts with no CUDA runtime.
     #[test]
     fn sphere_gpu_raw_kernel_parity_vs_cpu_truncated() {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping raw-kernel parity");
             return;
         };
@@ -1528,7 +1528,7 @@ mod sphere_gpu_tests {
     /// ≤ 1e-9 implies fit parity at the same tolerance.
     #[test]
     fn sphere_gpu_end_to_end_dispatch_parity_vs_cpu_truncated() {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping end-to-end dispatch parity");
             return;
         };
@@ -1611,7 +1611,7 @@ mod sphere_gpu_tests {
     /// (raw kernel) · Z evaluated on host.
     #[test]
     fn sphere_gpu_householder_parity_vs_raw_dot_z() {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping householder parity");
             return;
         };
@@ -1681,7 +1681,7 @@ mod sphere_gpu_tests {
     /// Skips silently when no CUDA runtime is available.
     #[test]
     fn sphere_gpu_kernel_matrix_hill_climb_20x_vs_cpu() {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu hill-climb] no CUDA runtime — skipping");
             return;
         };
@@ -1755,7 +1755,7 @@ mod sphere_gpu_tests {
     /// kernel build dominates PIRLS.
     #[test]
     fn sphere_gpu_end_to_end_fit_hill_climb_10x_vs_cpu() {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu hill-climb fit] no CUDA runtime — skipping");
             return;
         };
@@ -1857,7 +1857,7 @@ mod sphere_gpu_tests {
         use crate::linalg::faer_ndarray::FaerCholesky;
         use faer::Side;
 
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!(
                 "[sphere gpu parity] no CUDA runtime — skipping device parity \
                  (CPU oracle exercised by sibling tests)"

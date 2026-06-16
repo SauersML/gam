@@ -225,7 +225,7 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
         return None;
     }
-    let runtime = crate::gpu::runtime::GpuRuntime::global()?;
+    let runtime = crate::gpu::device_runtime::GpuRuntime::global()?;
     // #1017 Phase-1 call-site re-key: the reduced-Schur matvec is `O(n · d · k)`
     // per apply and the PCG runs `cg_iters` applies over device-resident frames,
     // so the offload becomes profitable on the CG-AMORTISED batched work — the
@@ -292,7 +292,7 @@ pub(crate) fn try_device_arrow_direct(
     {
         return None;
     }
-    let runtime = crate::gpu::runtime::GpuRuntime::global()?;
+    let runtime = crate::gpu::device_runtime::GpuRuntime::global()?;
     let admitted = runtime
         .policy()
         .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k);

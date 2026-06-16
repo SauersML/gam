@@ -18,7 +18,7 @@ use cudarc::driver::CudaModule;
 /// process) and below the runtime row-kernel threshold.
 #[must_use]
 pub fn row_primary_hessian_decision(n: usize, r: usize) -> GpuDecision {
-    let large_enough = crate::gpu::runtime::GpuRuntime::global()
+    let large_enough = crate::gpu::device_runtime::GpuRuntime::global()
         .map(|runtime| n >= runtime.policy().row_kernel_min_n && r > 0)
         .unwrap_or(false);
     decide(
@@ -196,7 +196,7 @@ mod bms_flex_gpu_tests {
     /// usable device so the test still passes on the CI/mac builders.
     #[test]
     pub(crate) fn bms_flex_gpu_context_initialises_when_device_present() {
-        let Some(runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[bms_flex_gpu test] no CUDA runtime — skipping device-side init smoketest");
             return;
         };

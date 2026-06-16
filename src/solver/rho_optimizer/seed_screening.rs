@@ -78,7 +78,7 @@ impl InnerProgressFeedback {
     /// β_predicted_i bit-equal to β_converged_i) must NOT be confused
     /// with "no signal yet"; the NaN sentinel + `is_finite()` check
     /// distinguishes the two cleanly. Both ends of the atomic share
-    /// `crate::solver::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS`
+    /// `crate::solver::reml::outer_eval::IFT_RESIDUAL_NO_SIGNAL_BITS`
     /// implicitly via the same bit pattern.
     pub(crate) fn snapshot(&self) -> Option<InnerProgressSnapshot> {
         let iters = self.last_iters.load(Ordering::Relaxed);

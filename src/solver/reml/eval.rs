@@ -121,7 +121,7 @@ pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
 ///
 /// Returns `true` when both of the following hold:
 ///   * The global GPU policy selects CUDA (`cuda_selected()`).
-///   * A live [`crate::gpu::runtime::GpuRuntime`] is present, confirming
+///   * A live [`crate::gpu::device_runtime::GpuRuntime`] is present, confirming
 ///     that CUDA is initialised and the JIT row-kernel cache is warm.
 ///
 /// The full Stage 3.3 device-resident PIRLS loop (`pirls_loop_on_stream`)
@@ -135,7 +135,7 @@ pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
 /// properties that determine correctness.
 #[inline]
 pub(crate) fn device_pirls_stage3_ready() -> bool {
-    crate::gpu::cuda_selected() && crate::gpu::runtime::GpuRuntime::global().is_some()
+    crate::gpu::cuda_selected() && crate::gpu::device_runtime::GpuRuntime::global().is_some()
 }
 
 /// Sigma-cubature executor dispatch — the swap site between the CPU Rayon
@@ -203,7 +203,7 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
 ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
     use crate::construction::{EngineDims, stable_reparameterization_engine_canonical};
     use crate::gpu::kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval;
-    use crate::gpu::runtime::GpuRuntime;
+    use crate::gpu::device_runtime::GpuRuntime;
     use crate::solver::gpu::pirls_dispatch_wire::admission_for;
 
     if sigma_points.is_empty() {

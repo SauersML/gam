@@ -1492,7 +1492,7 @@ pub(crate) fn run_outer_uncertified(
                 }
             })?;
     }
-    crate::solver::estimate::reml::runtime::clear_outer_ift_residual_energy_for_fit();
+    crate::solver::estimate::reml::outer_eval::clear_outer_ift_residual_energy_for_fit();
 
     // Frontier ρ-scaling auto-switch (#986): at per-atom-EFS-eligible frontier
     // rho dimension the decoupled per-atom fixed point is the primary outer

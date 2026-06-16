@@ -98,7 +98,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
 
     #[cfg(target_os = "linux")]
     {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             return Ok(None);
         }
         let Some(family_kind) = admission.family else {

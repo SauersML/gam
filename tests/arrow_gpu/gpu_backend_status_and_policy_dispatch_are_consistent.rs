@@ -3,7 +3,7 @@ use gam::gpu::{self, GpuEligibility, GpuKernel, GpuPolicy};
 #[test]
 fn backend_status_and_policy_dispatch_are_consistent() {
     let runtime_available =
-        std::panic::catch_unwind(|| gam::gpu::runtime::GpuRuntime::global().is_some())
+        std::panic::catch_unwind(|| gam::gpu::device_runtime::GpuRuntime::global().is_some())
             .unwrap_or(false);
 
     let blas_status = std::panic::catch_unwind(gam::gpu::blas::blas_backend_status).ok();

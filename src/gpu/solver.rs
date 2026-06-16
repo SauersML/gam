@@ -636,7 +636,7 @@ mod cuda {
         ),
         String,
     > {
-        let ctx = super::super::runtime::cuda_context_for(ordinal)
+        let ctx = super::super::device_runtime::cuda_context_for(ordinal)
             .ok_or_else(|| format!("cuda context for ordinal {ordinal} unavailable"))?;
         ctx.bind_to_thread()
             .map_err(|e| format!("cuda context bind_to_thread: {e}"))?;
@@ -657,7 +657,7 @@ mod cuda {
         // `CudaContext::new(0)` here would fragment driver state across
         // distinct contexts, defeat memory-pool sharing, and pin work to
         // ordinal 0 even when the runtime probe chose a different device.
-        let runtime = super::super::runtime::GpuRuntime::global()
+        let runtime = super::super::device_runtime::GpuRuntime::global()
             .ok_or_else(|| "cuda runtime unavailable".to_string())?;
         context_and_stream_for(runtime.selected_device().ordinal)
     }
@@ -908,7 +908,7 @@ pub fn iterative_refinement_cholesky_solve(
 
     #[cfg(target_os = "linux")]
     {
-        let runtime = super::runtime::GpuRuntime::global().ok_or_else(|| {
+        let runtime = super::device_runtime::GpuRuntime::global().ok_or_else(|| {
             let (rows, cols) = hessian.dim();
             format!(
                 "CUDA runtime unavailable; hessian={rows}x{cols}, rhs={}x{}",
@@ -967,7 +967,7 @@ pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, S
 
     #[cfg(target_os = "linux")]
     {
-        if super::runtime::GpuRuntime::global().is_none() {
+        if super::device_runtime::GpuRuntime::global().is_none() {
             let (rows, cols) = hessian.dim();
             return Err(format!(
                 "CUDA runtime unavailable for Cholesky factorization; hessian={rows}x{cols}"

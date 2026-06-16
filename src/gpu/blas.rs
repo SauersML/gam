@@ -5,10 +5,10 @@
 //! routine, and returns the host result. The cudarc-backed implementations
 //! always compile (cudarc dynamically loads `libcuda` at runtime via the
 //! `fallback-dynamic-loading` feature), and dispatch is gated at runtime on
-//! `super::runtime::GpuRuntime::global()` — when no device is probed the
+//! `super::device_runtime::GpuRuntime::global()` — when no device is probed the
 //! status enum advertises `CudaUnavailable` and callers fall back to CPU.
 //!
-//! The implementations route through `super::runtime::cuda_context_for` and
+//! The implementations route through `super::device_runtime::cuda_context_for` and
 //! the cudarc 0.19 cuBLAS API. Any transient backend failure (OOM, launch
 //! error, …) is converted to `None` so the auto-dispatch shim in
 //! `super::linalg` falls back to the CPU fast path without disturbing
@@ -24,7 +24,7 @@ mod cuda_impl {
 
     use crate::gpu::driver::{from_col_major, to_col_major, to_i32};
 
-    use super::super::runtime::GpuRuntime;
+    use super::super::device_runtime::GpuRuntime;
     use cudarc::cublas::sys::{
         cublasDiagType_t, cublasFillMode_t, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
     };
@@ -40,7 +40,7 @@ mod cuda_impl {
     /// primary-ordinal specialization.
     #[inline]
     pub(crate) fn stream_and_blas_for(ordinal: usize) -> Option<(Arc<CudaStream>, CudaBlas)> {
-        let stream = super::super::runtime::cuda_context_for(ordinal)?
+        let stream = super::super::device_runtime::cuda_context_for(ordinal)?
             .new_stream()
             .ok()?;
         let blas = CudaBlas::new(stream.clone()).ok()?;

@@ -24,7 +24,7 @@ pub(crate) mod penalty_logdet;
 pub(crate) mod per_atom_efs;
 mod rho_key;
 pub(crate) mod rho_prior_eval;
-pub(crate) mod runtime;
+pub(crate) mod outer_eval;
 mod sparse_exact_penalty;
 mod trace;
 pub(crate) mod unified;
@@ -4143,7 +4143,7 @@ pub(crate) struct EvalShared {
     /// seam declines (returns the cheap zero), and n_ext is fixed for a fit, so
     /// a single cell suffices.
     pub(crate) block_local_correction:
-        std::sync::OnceLock<(usize, Arc<runtime::TkCorrectionTerms>)>,
+        std::sync::OnceLock<(usize, Arc<outer_eval::TkCorrectionTerms>)>,
 }
 
 impl EvalShared {
@@ -4301,7 +4301,7 @@ pub(crate) struct PenaltySubspaceCacheKey {
 }
 
 pub(crate) struct PenaltySubspaceCache {
-    pub(crate) entry: Option<(PenaltySubspaceCacheKey, Arc<runtime::PenaltySubspace>)>,
+    pub(crate) entry: Option<(PenaltySubspaceCacheKey, Arc<outer_eval::PenaltySubspace>)>,
 }
 
 impl PenaltySubspaceCache {
@@ -4312,7 +4312,7 @@ impl PenaltySubspaceCache {
     pub(crate) fn get(
         &self,
         key: &PenaltySubspaceCacheKey,
-    ) -> Option<Arc<runtime::PenaltySubspace>> {
+    ) -> Option<Arc<outer_eval::PenaltySubspace>> {
         self.entry
             .as_ref()
             .filter(|(cached_key, _)| cached_key == key)
@@ -4322,7 +4322,7 @@ impl PenaltySubspaceCache {
     pub(crate) fn insert(
         &mut self,
         key: PenaltySubspaceCacheKey,
-        value: Arc<runtime::PenaltySubspace>,
+        value: Arc<outer_eval::PenaltySubspace>,
     ) {
         self.entry = Some((key, value));
     }
@@ -4457,9 +4457,9 @@ impl EvalCacheManager {
         e_transformed: &ndarray::Array2<f64>,
         ridge_passport: &crate::types::RidgePassport,
         build: F,
-    ) -> Result<Arc<runtime::PenaltySubspace>, EstimationError>
+    ) -> Result<Arc<outer_eval::PenaltySubspace>, EstimationError>
     where
-        F: FnOnce() -> Result<runtime::PenaltySubspace, EstimationError>,
+        F: FnOnce() -> Result<outer_eval::PenaltySubspace, EstimationError>,
     {
         let key = PenaltySubspaceCacheKey::from_inputs(e_transformed, ridge_passport);
         if let Some(hit) = self.penalty_subspace_cache.read().unwrap().get(&key) {

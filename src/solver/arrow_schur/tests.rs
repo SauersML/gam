@@ -1964,7 +1964,7 @@ pub(crate) fn matvec_gate_engages_for_llm_shape_off_for_tiny() {
 /// and the result equals the direct CPU artifacts solve bit-for-bit.
 #[test]
 pub(crate) fn device_seam_declines_without_gpu_and_matches_cpu() {
-    if crate::gpu::runtime::GpuRuntime::global().is_some() {
+    if crate::gpu::device_runtime::GpuRuntime::global().is_some() {
         // On a CUDA host the device may legitimately serve the step; this
         // host-only invariant does not apply. The box harness asserts the
         // device==CPU 1e-10 parity instead.

@@ -5695,7 +5695,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
 fn single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance() {
     // Pins θ and re-evaluates after current_outer_iter() advances; the
     // scheduled penalty weight at that θ has changed, so the memo must miss.
-    use crate::solver::estimate::reml::runtime::{
+    use crate::solver::estimate::reml::outer_eval::{
         current_outer_iter, record_current_outer_iter_for_ift,
     };
     use crate::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};

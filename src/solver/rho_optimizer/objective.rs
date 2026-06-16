@@ -488,7 +488,7 @@ pub trait OuterObjective {
     /// inner bridges, screening proxies, the EFS / hybrid-EFS sub-objectives)
     /// keep the host BFGS branch unconditionally — only the concrete
     /// REML-state objectives override this to consult
-    /// [`crate::solver::estimate::reml::runtime::outer_reml_device_admission`].
+    /// [`crate::solver::estimate::reml::outer_eval::outer_reml_device_admission`].
     fn outer_device_admission(&self) -> Option<crate::gpu::policy::RemlOuterAdmission> {
         None
     }
@@ -1000,12 +1000,12 @@ where
     }
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        crate::solver::estimate::reml::runtime::record_current_outer_theta_for_ift(rho);
+        crate::solver::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
         (self.cost_fn)(&mut self.state, rho)
     }
 
     fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        crate::solver::estimate::reml::runtime::record_current_outer_theta_for_ift(rho);
+        crate::solver::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
         match self.screening_proxy_fn.as_mut() {
             Some(f) => f(&mut self.state, rho),
             None => (self.cost_fn)(&mut self.state, rho),
@@ -1013,7 +1013,7 @@ where
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
-        crate::solver::estimate::reml::runtime::record_current_outer_theta_for_ift(rho);
+        crate::solver::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
         (self.eval_fn)(&mut self.state, rho)
     }
 
@@ -1022,7 +1022,7 @@ where
         rho: &Array1<f64>,
         order: OuterEvalOrder,
     ) -> Result<OuterEval, EstimationError> {
-        crate::solver::estimate::reml::runtime::record_current_outer_theta_for_ift(rho);
+        crate::solver::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
         match self.eval_order_fn.as_mut() {
             Some(f) => f(&mut self.state, rho, order),
             None => (self.eval_fn)(&mut self.state, rho),
@@ -1030,7 +1030,7 @@ where
     }
 
     fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
-        crate::solver::estimate::reml::runtime::record_current_outer_theta_for_ift(rho);
+        crate::solver::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
         match self.efs_fn.as_mut() {
             Some(f) => f(&mut self.state, rho),
             None => Err(EstimationError::RemlOptimizationFailed(

@@ -1716,7 +1716,7 @@ impl SaeManifoldTerm {
         // single gate now; it is parameterised in `sparse_active_plan_for_budget`
         // so the engagement regression can pin a small budget without allocating
         // a multi-GB dense Gram.
-        let budget = match crate::gpu::runtime::GpuRuntime::global() {
+        let budget = match crate::gpu::device_runtime::GpuRuntime::global() {
             // Allow up to one quarter of the AGGREGATE device budget for the dense
             // Gram, matching the streaming dispatcher's in-core fraction. The
             // per-atom-pair Gram blocks fan out across the whole device pool, so

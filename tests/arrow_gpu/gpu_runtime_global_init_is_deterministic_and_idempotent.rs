@@ -1,4 +1,4 @@
-use gam::gpu::runtime::GpuRuntime;
+use gam::gpu::device_runtime::GpuRuntime;
 
 #[test]
 fn gpu_runtime_global_is_deterministic_and_idempotent() {

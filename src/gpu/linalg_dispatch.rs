@@ -21,7 +21,7 @@
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
-use super::runtime::GpuRuntime;
+use super::device_runtime::GpuRuntime;
 
 /// Discriminator used by [`route_through_gpu`] to apply the right
 /// size threshold from [`super::policy::GpuDispatchPolicy`].
@@ -712,7 +712,7 @@ pub fn try_solve_upper_triangular_matrix(
 #[cfg(test)]
 mod tests {
     use super::{DispatchOp, route_through_gpu};
-    use crate::gpu::runtime::GpuRuntime;
+    use crate::gpu::device_runtime::GpuRuntime;
 
     #[test]
     fn sae_shape_dispatch_ops_route_when_cuda_runtime_is_present() {
@@ -779,7 +779,7 @@ mod cuda_backend {
 
     use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
-    use super::super::runtime::GpuRuntime;
+    use super::super::device_runtime::GpuRuntime;
     use crate::gpu::driver::{from_col_major, to_col_major, to_i32};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{DevicePtrMut, sys as driver_sys};
@@ -884,7 +884,7 @@ mod cuda_backend {
         if p == 0 || p != p2 {
             return None;
         }
-        let stream = super::super::runtime::cuda_context_for(runtime.device.ordinal)?
+        let stream = super::super::device_runtime::cuda_context_for(runtime.device.ordinal)?
             .new_stream()
             .ok()?;
         let solver = DnHandle::new(stream.clone()).ok()?;
@@ -915,7 +915,7 @@ mod cuda_backend {
             return None;
         }
 
-        let stream = super::super::runtime::cuda_context_for(ordinal)?
+        let stream = super::super::device_runtime::cuda_context_for(ordinal)?
             .new_stream()
             .ok()?;
         let solver = DnHandle::new(stream.clone()).ok()?;

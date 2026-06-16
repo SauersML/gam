@@ -71,7 +71,7 @@ pub(crate) fn run_outer_with_plan(
     }
 
     let (lower, upper) = outer_bounds_template(config, cap.n_params);
-    crate::solver::estimate::reml::runtime::record_current_outer_rho_upper_bounds_for_ift(&upper);
+    crate::solver::estimate::reml::outer_eval::record_current_outer_rho_upper_bounds_for_ift(&upper);
     let bounds_template = (lower, upper);
     let mut projected_seeds = Vec::with_capacity(seeds.len());
     for seed in seeds {
@@ -322,7 +322,7 @@ pub(crate) fn run_outer_with_plan(
                 break;
             }
         }
-        crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(0);
+        crate::solver::estimate::reml::outer_eval::record_current_outer_iter_for_ift(0);
         obj.reset();
         // Certified curvature-homotopy entry leg (#1007). When the objective
         // has a certified anchor (the SAE-manifold `η = 0` Eckart-Young

@@ -71,7 +71,7 @@ fn predict_after_load_on_cpu_only_host_does_not_panic_with_cudarc() {
     #[cfg(target_os = "linux")]
     {
         if !gam::gpu::driver::cuda_driver_library_present() {
-            let direct_probe = gam::gpu::runtime::GpuRuntime::probe();
+            let direct_probe = gam::gpu::device_runtime::GpuRuntime::probe();
             assert!(
                 matches!(
                     direct_probe,
@@ -83,7 +83,7 @@ fn predict_after_load_on_cpu_only_host_does_not_panic_with_cudarc() {
         }
     }
 
-    let probe = std::panic::catch_unwind(gam::gpu::runtime::GpuRuntime::is_available)
+    let probe = std::panic::catch_unwind(gam::gpu::device_runtime::GpuRuntime::is_available)
         .expect("GpuRuntime::is_available must not panic on a CPU-only host");
 
     for kernel in [

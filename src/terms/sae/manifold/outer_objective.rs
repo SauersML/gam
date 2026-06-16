@@ -1273,7 +1273,7 @@ pub(crate) fn batched_smooth_sb(
     // per-tile decline.
     let cpu_one = |idx: usize| -> Array2<f64> { s_mats[idx].dot(&sb_inputs[idx].1) };
 
-    let rt = match crate::gpu::runtime::GpuRuntime::global() {
+    let rt = match crate::gpu::device_runtime::GpuRuntime::global() {
         Some(rt) => rt,
         None => return (0..n_atoms).map(cpu_one).collect(),
     };

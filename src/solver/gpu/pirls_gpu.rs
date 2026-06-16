@@ -3251,7 +3251,7 @@ pub fn weighted_crossprod_gpu(
 
     #[cfg(target_os = "linux")]
     {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             return cpu_fallback::weighted_crossprod_cpu(x, weights);
         }
         cuda::weighted_crossprod(x, weights)
@@ -3266,7 +3266,7 @@ pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, St
 
     #[cfg(target_os = "linux")]
     {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             return cpu_fallback::solve_step_cpu(input);
         }
         cuda::solve_step(input)
@@ -3285,7 +3285,7 @@ pub fn upload_shared_pirls_gpu(
     prior_w: ndarray::ArrayView1<'_, f64>,
     offset: ndarray::ArrayView1<'_, f64>,
 ) -> Result<PirlsGpuSharedData, String> {
-    if crate::gpu::runtime::GpuRuntime::global().is_none() {
+    if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
         return Err("cuda runtime unavailable; cannot upload shared GPU PIRLS data".to_string());
     }
     PirlsGpuSharedData::upload_impl(x, y, prior_w, offset)
@@ -3583,10 +3583,10 @@ mod pcg_device {
             static BACKEND: OnceLock<Result<PcgBackend, String>> = OnceLock::new();
             BACKEND
                 .get_or_init(|| {
-                    let runtime = crate::gpu::runtime::GpuRuntime::global()
+                    let runtime = crate::gpu::device_runtime::GpuRuntime::global()
                         .ok_or_else(|| "pcg backend: no CUDA runtime available".to_string())?;
                     let ctx =
-                        crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                        crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
                             .ok_or_else(|| {
                                 format!(
                                     "pcg backend: failed to create CUDA context for device {}",
@@ -4168,7 +4168,7 @@ mod stream_device_parity_tests {
 
     #[test]
     fn device_input_step_matches_host_input_step_on_v100() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[stream_device_parity] no CUDA runtime — skipping");
             return;
         }
@@ -4284,7 +4284,7 @@ mod stream_device_parity_tests {
             CurvatureMode, PirlsRowFamily, RowInput, row_reweight_cpu,
         };
         use std::time::Instant;
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[hill_climb] no CUDA runtime — skipping");
             return;
         }
@@ -4409,7 +4409,7 @@ mod stream_device_parity_tests {
     /// `(XᵀX + Sλ)⁻¹·Xᵀy` solution.
     #[test]
     fn pirls_loop_converges_to_ols_solution_on_gaussian_identity() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[stage_3_3] no CUDA runtime — skipping");
             return;
         }
@@ -4605,7 +4605,7 @@ mod pcg_device_parity_tests {
 
     #[test]
     fn pcg_device_matches_dense_oracle_at_n64_r20_p44() {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[pcg_device parity] no CUDA runtime — skipping");
             return;
         };
@@ -4686,9 +4686,9 @@ mod pcg_device_parity_tests {
         // kernels will use when `run_pcg_against_row_hessian_device` probes
         // its own backend. Going through the public runtime APIs keeps the
         // test independent of any private kernel-backend symbols.
-        let runtime = crate::gpu::runtime::GpuRuntime::global()
+        let runtime = crate::gpu::device_runtime::GpuRuntime::global()
             .expect("runtime must exist when probe succeeded above");
-        let ctx = match crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal) {
+        let ctx = match crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal) {
             Some(c) => c,
             None => {
                 eprintln!("[pcg_device parity] cuda_context_for failed; skipping");

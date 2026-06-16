@@ -38,7 +38,7 @@ mod linux {
     use crate::gpu::device::GpuCapability;
     use crate::gpu::device_cache::{DeviceArena, PtxModuleCache};
     use crate::gpu::gpu_error::GpuError;
-    use crate::gpu::runtime::{GpuRuntime, cuda_context_for};
+    use crate::gpu::device_runtime::{GpuRuntime, cuda_context_for};
     use crate::gpu_err;
     use cudarc::driver::{CudaContext, CudaStream};
     use std::sync::{Arc, Mutex};
@@ -139,7 +139,7 @@ mod linux {
 mod tests {
     use super::probe_cuda_backend;
     use crate::gpu::gpu_error::GpuError;
-    use crate::gpu::runtime::GpuRuntime;
+    use crate::gpu::device_runtime::GpuRuntime;
 
     /// Parity: every backend's probe must agree with the shared contract on
     /// the same device. On a host with no CUDA runtime, the shared probe

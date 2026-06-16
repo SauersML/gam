@@ -2149,7 +2149,7 @@ mod pirls_row_gpu_tests {
         // and must agree with the `cfg(target_os = "linux")` selector that
         // gates the rest of the module-cache code path.
         assert_eq!(PirlsRowBackend::compiled(), cfg!(target_os = "linux"));
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[pirls_row_gpu test] no CUDA runtime — skipping device compile test");
             return;
         }
@@ -2179,7 +2179,7 @@ mod pirls_row_gpu_tests {
     /// the Stage 1 cached built-in path.
     #[test]
     fn jit_glm_kernel_matches_builtin_byte_identical() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[stage_6_jit] no CUDA runtime — skipping");
             return;
         }
@@ -2274,7 +2274,7 @@ mod pirls_row_gpu_tests {
     /// must match the built-in kernel exactly.
     #[test]
     fn jit_raw_body_kernel_matches_builtin_gaussian_byte_identical() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[stage_6_jit_raw] no CUDA runtime — skipping");
             return;
         }
@@ -2571,7 +2571,7 @@ mod pirls_row_gpu_tests {
     /// per the dead-pub-scanner rule.
     #[test]
     fn launch_row_reweight_matches_cpu_reference_on_device() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[pirls_row_gpu test] no CUDA runtime — skipping launcher parity test");
             return;
         }
@@ -2718,7 +2718,7 @@ mod pirls_row_gpu_tests {
     ///    information ≡ Fisher information by construction.
     #[test]
     fn gpu_observed_parity() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[gpu_observed_parity] no CUDA runtime — skipping");
             return;
         }
@@ -2841,7 +2841,7 @@ mod pirls_row_gpu_tests {
     /// the v100-bench-runner explicitly opts in via `--ignored`.
     #[test]
     fn gpu_observed_parity_end_to_end_n1000() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[gpu_observed_parity_end_to_end_n1000] no CUDA runtime — skipping");
             return;
         }
@@ -2993,7 +2993,7 @@ mod pirls_row_gpu_tests {
     /// `#[ignore]` so v100-bench-runner picks it up via `--ignored`.
     #[test]
     fn gpu_jit_level_b_raw_body_end_to_end_all_families_n1000() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!(
                 "[gpu_jit_level_b_raw_body_end_to_end_all_families_n1000] no CUDA runtime — skipping"
             );

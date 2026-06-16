@@ -312,6 +312,26 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
     })
 }
 
+#[cfg(test)]
+mod module_path_lock_tests {
+    //! Locks the canonical module path for the GPU device runtime so a future
+    //! rename is a deliberate, reviewed change (precedent: issue #1157's
+    //! "lock module path" tests). This file was renamed from the generic,
+    //! colliding `gpu/runtime.rs` to `gpu/device_runtime.rs` under issue #1137.
+
+    #[test]
+    fn gpu_device_runtime_module_path_is_canonical() {
+        // Resolving `GpuRuntime` through the `device_runtime` module path
+        // pins the honest name; if the module is renamed this stops compiling.
+        let _ = crate::gpu::device_runtime::GpuRuntime::is_available();
+        let type_name = std::any::type_name::<crate::gpu::device_runtime::GpuRuntime>();
+        assert!(
+            type_name.contains("device_runtime"),
+            "GpuRuntime must live in the `device_runtime` module (got {type_name})"
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

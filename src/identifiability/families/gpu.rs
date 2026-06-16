@@ -81,7 +81,7 @@ pub fn try_primary_state_gram_cuda(
 mod cuda_impl {
     use super::{CHANNELS, GramBundle, PACKED_LEN, packed_index};
     use crate::gpu::driver::{to_col_major, to_i32};
-    use crate::gpu::runtime::{GpuRuntime, cuda_context_for};
+    use crate::gpu::device_runtime::{GpuRuntime, cuda_context_for};
     use cudarc::cublas::sys::{cublasOperation_t, cublasSideMode_t, cublasStatus_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
@@ -751,7 +751,7 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            if crate::gpu::runtime::GpuRuntime::global().is_none() {
+            if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
                 eprintln!("[identifiability_compile] no CUDA runtime — skipping parity check");
                 return;
             }

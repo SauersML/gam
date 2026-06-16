@@ -133,8 +133,8 @@ pub fn solve_arrow_newton_step(
         // dependent TRSM+GEMM on each tile's own stream, so no on-stream solve is
         // orphaned. On `Unavailable` (one device, shape below policy, transient)
         // fall through to the single-device fused / Layer-A paths below.
-        if crate::gpu::runtime::GpuRuntime::global()
-            .map(crate::gpu::runtime::GpuRuntime::device_count)
+        if crate::gpu::device_runtime::GpuRuntime::global()
+            .map(crate::gpu::device_runtime::GpuRuntime::device_count)
             .unwrap_or(0)
             > 1
         {
@@ -755,7 +755,7 @@ mod cuda {
         }
 
         let runtime =
-            crate::gpu::runtime::GpuRuntime::global().ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            crate::gpu::device_runtime::GpuRuntime::global().ok_or(ArrowSchurGpuFailure::Unavailable)?;
         if runtime.device_count() < 2 {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
@@ -856,7 +856,7 @@ mod cuda {
         // stream carries the primary context (same pattern as `solve()`); no
         // thread bind is needed for the cuSOLVER/cuBLAS handles created from it.
         let primary = runtime.selected_device().ordinal;
-        let stream = crate::gpu::runtime::cuda_context_for(primary)
+        let stream = crate::gpu::device_runtime::cuda_context_for(primary)
             .and_then(|ctx| ctx.new_stream().ok())
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let solver =
@@ -933,7 +933,7 @@ mod cuda {
         // `scatter_batched` has already bound this ordinal's context on this
         // worker thread; the stream below targets that same device.
         let stream =
-            crate::gpu::runtime::cuda_context_for(ordinal).and_then(|ctx| ctx.new_stream().ok())?;
+            crate::gpu::device_runtime::cuda_context_for(ordinal).and_then(|ctx| ctx.new_stream().ok())?;
         let solver = DnHandle::new(stream.clone()).ok()?;
         let blas = CudaBlas::new(stream.clone()).ok()?;
         let m = tile.len();
@@ -1015,7 +1015,7 @@ mod cuda {
         // `scatter_batched` has already bound this ordinal's context on this
         // worker thread; the stream below targets that same device.
         let stream =
-            crate::gpu::runtime::cuda_context_for(ordinal).and_then(|ctx| ctx.new_stream().ok())?;
+            crate::gpu::device_runtime::cuda_context_for(ordinal).and_then(|ctx| ctx.new_stream().ok())?;
         let blas = CudaBlas::new(stream.clone()).ok()?;
         let m = tile.len();
 
@@ -1056,7 +1056,7 @@ mod cuda {
         let runtime = route_through_gpu(DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n })
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
 
-        let stream = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+        let stream = crate::gpu::device_runtime::cuda_context_for(runtime.device.ordinal)
             .and_then(|ctx| ctx.new_stream().ok())
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let solver =
@@ -2511,7 +2511,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
             crate::gpu::linalg_dispatch::DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n },
         )
         .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+        let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.device.ordinal)
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let stream = ctx
             .new_stream()
@@ -2766,7 +2766,7 @@ extern "C" __global__ void arrow_sae_diag_sub(
             crate::gpu::linalg_dispatch::DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n },
         )
         .ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
-        let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+        let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.device.ordinal)
             .ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
         let stream = ctx
             .new_stream()
@@ -2938,13 +2938,13 @@ extern "C" __global__ void arrow_sae_diag_sub(
         if k == 0 || data.beta_dim != k || sys.k != k {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
-        let runtime = crate::gpu::runtime::GpuRuntime::global()
+        let runtime = crate::gpu::device_runtime::GpuRuntime::global()
             .filter(|rt| {
                 rt.policy()
                     .dense_hessian_work_target_is_gpu(sys.rows.len(), k)
             })
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let ctx = crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal)
+        let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let stream = ctx
             .new_stream()
@@ -3079,11 +3079,11 @@ extern "C" __global__ void arrow_sae_diag_sub(
             crate::gpu::linalg_dispatch::DispatchOp::Gemv { m: k, k },
         )
         .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let stream = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+        let stream = crate::gpu::device_runtime::cuda_context_for(runtime.device.ordinal)
             .and_then(|ctx| ctx.new_stream().ok())
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+        let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.device.ordinal)
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let vector_module = pcg_vector_module(&ctx)?;
 

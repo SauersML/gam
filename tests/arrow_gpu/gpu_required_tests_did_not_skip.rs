@@ -17,7 +17,7 @@
 
 #[test]
 fn gpu_required_tests_did_not_skip() {
-    let runtime_present = gam::gpu::runtime::GpuRuntime::global().is_some();
+    let runtime_present = gam::gpu::device_runtime::GpuRuntime::global().is_some();
     if runtime_present {
         assert!(
             gam::gpu::cuda_selected(),

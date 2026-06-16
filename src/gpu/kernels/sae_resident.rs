@@ -737,7 +737,7 @@ fn upload_resident_buffers(
             k: shape.n * shape.basis_cols,
         })
     })?;
-    let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)?;
+    let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.device.ordinal)?;
     let stream = ctx.new_stream().ok()?;
     let target_x_dev = stream.clone_htod(target_x).ok()?;
     let basis_values_dev = stream.clone_htod(basis_values).ok()?;
@@ -900,7 +900,7 @@ pub struct MultiplexedFit {
 ///
 /// Each fit calls [`DeviceResidentArrowWorkspace::device_fit`], whose per-row
 /// arrow solve (`solve_arrow_newton_step`) acquires the **process-shared**
-/// `Arc<CudaContext>` via `runtime::cuda_context_for` (a `Mutex`-guarded
+/// `Arc<CudaContext>` via `device_runtime::cuda_context_for` (a `Mutex`-guarded
 /// `OnceLock` cache) and then creates its **own** `CudaStream` with its own
 /// cuSOLVER/cuBLAS handles and its own device allocations. Distinct streams off
 /// one shared context execute concurrently on the device; the only shared

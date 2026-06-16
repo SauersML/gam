@@ -94,7 +94,7 @@ pub fn sae_streaming_plan_for_shape(
     d_max: usize,
     border_dim: usize,
 ) -> SaeStreamingPlan {
-    let (budget, chunk_window, host_available) = match crate::gpu::runtime::GpuRuntime::global() {
+    let (budget, chunk_window, host_available) = match crate::gpu::device_runtime::GpuRuntime::global() {
         Some(rt) => {
             let aggregate_budget: usize = rt
                 .device_ordinals()

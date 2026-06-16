@@ -47,7 +47,7 @@ pub(crate) fn try_factor_blocks_batched(
         return None;
     }
     // No device → let the CPU path own the work (it is the exact fallback).
-    if !crate::gpu::runtime::GpuRuntime::is_available() {
+    if !crate::gpu::device_runtime::GpuRuntime::is_available() {
         return None;
     }
 

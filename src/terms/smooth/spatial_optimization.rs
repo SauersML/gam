@@ -1844,7 +1844,7 @@ impl SingleBlockLatentCoordDesignCache {
             .as_ref()
             .is_some_and(|cached| theta_values_match(cached, theta))
             && self.last_outer_iter
-                == Some(crate::solver::estimate::reml::runtime::current_outer_iter())
+                == Some(crate::solver::estimate::reml::outer_eval::current_outer_iter())
         {
             self.last_eval
                 .as_ref()
@@ -1868,7 +1868,7 @@ impl SingleBlockLatentCoordDesignCache {
             .as_ref()
             .is_some_and(|cached| theta_values_match(cached, theta))
             && self.last_outer_iter
-                == Some(crate::solver::estimate::reml::runtime::current_outer_iter())
+                == Some(crate::solver::estimate::reml::outer_eval::current_outer_iter())
         {
             self.last_eval.clone()
         } else {
@@ -1886,12 +1886,12 @@ impl SingleBlockLatentCoordDesignCache {
     ) {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
-        self.last_outer_iter = Some(crate::solver::estimate::reml::runtime::current_outer_iter());
+        self.last_outer_iter = Some(crate::solver::estimate::reml::outer_eval::current_outer_iter());
     }
 
     fn store_cost(&mut self, cost: f64) {
         self.last_cost = Some(cost);
-        self.last_outer_iter = Some(crate::solver::estimate::reml::runtime::current_outer_iter());
+        self.last_outer_iter = Some(crate::solver::estimate::reml::outer_eval::current_outer_iter());
     }
 
     fn reset(&mut self) {
@@ -6271,7 +6271,7 @@ fn try_exact_joint_latent_coord_optimization(
             if let Some(registry) = registry_for_key {
                 let mut registry = registry.as_ref().clone();
                 registry.apply_weight_schedules(
-                    crate::solver::estimate::reml::runtime::current_outer_iter() as usize,
+                    crate::solver::estimate::reml::outer_eval::current_outer_iter() as usize,
                 );
                 add_analytic_penalty_objective_to_eval(
                     theta,
@@ -6318,7 +6318,7 @@ fn try_exact_joint_latent_coord_optimization(
             if let Some(registry) = registry_for_key {
                 let mut registry = registry.as_ref().clone();
                 registry.apply_weight_schedules(
-                    crate::solver::estimate::reml::runtime::current_outer_iter() as usize,
+                    crate::solver::estimate::reml::outer_eval::current_outer_iter() as usize,
                 );
                 let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
                 let contribution = analytic_penalty_objective_contribution(
@@ -6390,7 +6390,7 @@ fn try_exact_joint_latent_coord_optimization(
                     let cost = if let Some(registry) = registry_for_key {
                         let mut registry = registry.as_ref().clone();
                         registry.apply_weight_schedules(
-                            crate::solver::estimate::reml::runtime::current_outer_iter() as usize,
+                            crate::solver::estimate::reml::outer_eval::current_outer_iter() as usize,
                         );
                         match analytic_penalty_objective_contribution(
                             theta,

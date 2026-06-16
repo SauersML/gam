@@ -3719,7 +3719,7 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!(
                     "[bms_flex_row parity] no CUDA runtime — skipping device \
                      parity (CPU oracle exercised by sibling test)"
@@ -4092,7 +4092,7 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!(
                     "[bms_flex_row hvp parity] no CUDA runtime — skipping device \
                      parity"
@@ -4254,7 +4254,7 @@ mod tests {
 
     #[test]
     pub(crate) fn bms_flex_row_hvp_multi_kernel_matches_cpu_oracle_when_cuda_available() {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[bms_flex_row hvp_multi parity] no CUDA runtime — skipping device parity");
             return;
         };
@@ -4406,7 +4406,7 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!(
                     "[bms_flex_row hvp_into_device parity] no CUDA runtime — \
                      skipping device parity"
@@ -4578,7 +4578,7 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!(
                     "[bms_flex_row hvp parity n64_r20_p44] no CUDA runtime — \
                      skipping device parity"
@@ -4762,7 +4762,7 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!("[bms_flex_row dense_block parity] no CUDA runtime — skipping");
                 return;
             };
@@ -4969,7 +4969,7 @@ mod tests {
         {
             use rayon::prelude::*;
 
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!(
                     "[bms_flex_row hvp hill-climb] no CUDA runtime — skipping V100 perf gate"
                 );
@@ -5182,7 +5182,7 @@ mod tests {
         {
             use rayon::prelude::*;
 
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!(
                     "[bms_flex_row dense_block hill-climb] no CUDA runtime — skipping V100 perf gate"
                 );

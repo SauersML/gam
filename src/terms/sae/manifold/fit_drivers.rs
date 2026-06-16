@@ -3133,7 +3133,7 @@ impl SaeManifoldTerm {
             }
         };
 
-        let rt = crate::gpu::runtime::GpuRuntime::global();
+        let rt = crate::gpu::device_runtime::GpuRuntime::global();
         match rt {
             None => {
                 for atom_idx in 0..self.atoms.len() {

@@ -643,7 +643,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // GPU-presence probe is checked first so CPU boxes never pay the three
         // length-n contracted-weight allocations: `rigid_joint_hessian_on_gpu`
         // would return `None` there anyway, so the build below is the CPU path.
-        if crate::gpu::runtime::GpuRuntime::global().is_some() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_some() {
             let w_mm: Array1<f64> = row_hessians.iter().map(|h| h[0][0]).collect();
             let w_mg: Array1<f64> = row_hessians.iter().map(|h| h[0][1]).collect();
             let w_gg: Array1<f64> = row_hessians.iter().map(|h| h[1][1]).collect();

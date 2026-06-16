@@ -44,7 +44,7 @@ fn snap_with_residual(
 #[test]
 fn snapshot_distinguishes_zero_residual_from_no_signal() {
     use super::InnerProgressFeedback;
-    use crate::solver::estimate::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS;
+    use crate::solver::estimate::reml::outer_eval::IFT_RESIDUAL_NO_SIGNAL_BITS;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
@@ -56,7 +56,7 @@ fn snapshot_distinguishes_zero_residual_from_no_signal() {
         last_converged: Arc::new(AtomicBool::new(converged)),
         ift_residual: Arc::new(AtomicU64::new(residual_bits)),
         accept_rho: Arc::new(AtomicU64::new(
-            crate::solver::estimate::reml::runtime::IFT_RESIDUAL_NO_SIGNAL_BITS,
+            crate::solver::estimate::reml::outer_eval::IFT_RESIDUAL_NO_SIGNAL_BITS,
         )),
     };
 

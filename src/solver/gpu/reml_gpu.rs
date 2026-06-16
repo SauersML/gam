@@ -44,7 +44,7 @@ pub fn evidence_derivatives_gpu(input: RemlGpuInput<'_>) -> Result<RemlGpuEviden
 
     #[cfg(target_os = "linux")]
     {
-        if crate::gpu::runtime::GpuRuntime::global().is_some() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_some() {
             return linux_cuda::evidence_derivatives(input);
         }
     }

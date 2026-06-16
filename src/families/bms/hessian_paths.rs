@@ -1085,7 +1085,7 @@ fn try_gpu_xt_diag_x<S: ndarray::Data<Elem = f64>>(
     chunk: &ndarray::ArrayBase<S, ndarray::Ix2>,
     weights: &[f64],
 ) -> Option<Array2<f64>> {
-    let runtime = crate::gpu::runtime::GpuRuntime::global()?;
+    let runtime = crate::gpu::device_runtime::GpuRuntime::global()?;
     let (rows, cols) = chunk.dim();
     // The chunk is a materialized dense row block here (the caller already
     // resolved the design to dense views / owned chunks before calling), so
@@ -1109,7 +1109,7 @@ fn try_gpu_xt_diag_x<S: ndarray::Data<Elem = f64>>(
     // `global()` is `None` off-Linux, so this returns before touching the
     // chunk; the shape read keeps the params live and mirrors the Linux gate
     // (a mis-sized chunk is rejected identically on both platforms).
-    crate::gpu::runtime::GpuRuntime::global()?;
+    crate::gpu::device_runtime::GpuRuntime::global()?;
     let (rows, cols) = chunk.dim();
     if rows == 0 || cols == 0 || rows != weights.len() {
         return None;
@@ -1129,7 +1129,7 @@ fn try_gpu_xt_diag_y<SX: ndarray::Data<Elem = f64>, SY: ndarray::Data<Elem = f64
     weights: &[f64],
     y: &ndarray::ArrayBase<SY, ndarray::Ix2>,
 ) -> Option<Array2<f64>> {
-    let runtime = crate::gpu::runtime::GpuRuntime::global()?;
+    let runtime = crate::gpu::device_runtime::GpuRuntime::global()?;
     let (rows, p_x) = x.dim();
     let (rows_y, q) = y.dim();
     if rows != rows_y || rows != weights.len() {
@@ -1149,7 +1149,7 @@ fn try_gpu_xt_diag_y<SX: ndarray::Data<Elem = f64>, SY: ndarray::Data<Elem = f64
     weights: &[f64],
     y: &ndarray::ArrayBase<SY, ndarray::Ix2>,
 ) -> Option<Array2<f64>> {
-    crate::gpu::runtime::GpuRuntime::global()?;
+    crate::gpu::device_runtime::GpuRuntime::global()?;
     if x.nrows() != y.nrows() || x.nrows() != weights.len() {
         return None;
     }

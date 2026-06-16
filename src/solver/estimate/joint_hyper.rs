@@ -246,7 +246,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         registry: Option<&crate::terms::AnalyticPenaltyRegistry>,
     ) {
         let fingerprint = registry
-            .map(crate::solver::estimate::reml::runtime::analytic_penalty_registry_fingerprint)
+            .map(crate::solver::estimate::reml::outer_eval::analytic_penalty_registry_fingerprint)
             .unwrap_or(0);
         crate::solver::estimate::reml::RemlState::set_analytic_penalty_registry_fingerprint(
             &mut self.reml_state,
@@ -259,7 +259,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         id_mode: &crate::terms::latent::LatentIdMode,
     ) {
         let fingerprint =
-            crate::solver::estimate::reml::runtime::latent_id_mode_cache_fingerprint(id_mode);
+            crate::solver::estimate::reml::outer_eval::latent_id_mode_cache_fingerprint(id_mode);
         crate::solver::estimate::reml::RemlState::set_persistent_latent_values_fingerprint(
             &mut self.reml_state,
             fingerprint,

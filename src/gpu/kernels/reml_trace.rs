@@ -393,7 +393,7 @@ pub fn evidence_derivatives_hutchinson_gpu(
 
     #[cfg(target_os = "linux")]
     {
-        if crate::gpu::runtime::GpuRuntime::global().is_some() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_some() {
             match linux_cuda::evidence_derivatives(&input) {
                 Ok(evidence) => return Ok(evidence),
                 Err(GpuError::NotYetImplemented { .. }) => {
@@ -2055,7 +2055,7 @@ mod tests {
         // Smaller dimensions on CPU CI to keep the test under a minute;
         // V100 runs the full p=2000, d=8 specified in the charter.
         let on_v100 =
-            cfg!(target_os = "linux") && crate::gpu::runtime::GpuRuntime::global().is_some();
+            cfg!(target_os = "linux") && crate::gpu::device_runtime::GpuRuntime::global().is_some();
         let (p, d): (usize, usize) = if on_v100 { (2000, 8) } else { (256, 4) };
 
         let mut h = Array2::<f64>::zeros((p, p));

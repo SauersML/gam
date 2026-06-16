@@ -258,12 +258,12 @@ impl RowOpsBackend {
         static BACKEND: OnceLock<Result<RowOpsBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
-                let runtime = crate::gpu::runtime::GpuRuntime::global().ok_or_else(|| {
+                let runtime = crate::gpu::device_runtime::GpuRuntime::global().ok_or_else(|| {
                     GpuError::DriverLibraryUnavailable {
                         reason: "row_hessian_ops backend: no CUDA runtime available".to_string(),
                     }
                 })?;
-                let ctx = crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal)
+                let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
                     .ok_or_else(|| {
                         gpu_err!(
                             "row_hessian_ops backend: failed to create CUDA context for device {}",
@@ -570,7 +570,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn row_hessian_kernels_match_cpu_oracle_when_cuda_available() {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::device_runtime::GpuRuntime::global() else {
             eprintln!("[row_hessian_ops parity] no CUDA runtime — skipping CUDA parity");
             return;
         };

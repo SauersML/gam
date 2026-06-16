@@ -479,7 +479,7 @@ pub fn draw_batch(input: PolyaGammaBatchInput<'_>) -> Result<Array1<f64>, String
 
     #[cfg(target_os = "linux")]
     {
-        if crate::gpu::runtime::GpuRuntime::global().is_some() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_some() {
             match linux_cuda::draw_batch_gpu(&input) {
                 Ok(v) => return Ok(v),
                 Err(GpuError::NotYetImplemented { .. }) => {
@@ -1642,7 +1642,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn polya_gamma_hill_climb_pg1_50x() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[polya_gamma_hill_climb_pg1_50x] no CUDA runtime on host — skipping");
             return;
         }
@@ -1703,7 +1703,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn polya_gamma_hill_climb_mixed_nb_20x() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             eprintln!("[polya_gamma_hill_climb_mixed_nb_20x] no CUDA runtime on host — skipping");
             return;
         }
@@ -1762,7 +1762,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn pg1_gpu_matches_cpu_oracle_when_runtime_available() {
-        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
             return;
         }
         let n = 256usize;

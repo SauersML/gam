@@ -147,7 +147,7 @@ impl CubicCellGpuBackend {
     /// kernel is fed a placeholder cell whose row stays zero.
     ///
     /// The returned `CudaSlice<f64>` is allocated on the cubic-cell
-    /// backend's default stream — which (because `crate::gpu::runtime::cuda_context_for`
+    /// backend's default stream — which (because `crate::gpu::device_runtime::cuda_context_for`
     /// caches one `CudaContext` per device ordinal) is the same default
     /// stream every other gam GPU backend uses on the same device, so
     /// downstream kernels can consume the slice without any cross-context
@@ -320,7 +320,7 @@ mod tests {
         CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
         try_build_cubic_cell_derivative_moments,
     };
-    use crate::gpu::runtime::GpuRuntime;
+    use crate::gpu::device_runtime::GpuRuntime;
 
     /// Test-only DtoH helper for cubic-cell device residency parity tests.
     fn download_moments(

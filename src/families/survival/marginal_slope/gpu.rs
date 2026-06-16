@@ -21,7 +21,7 @@ use cudarc::driver::CudaModule;
 /// the runtime row-kernel threshold force CPU.
 #[must_use]
 pub fn row_primary_hessian_decision(n: usize, r: usize) -> GpuDecision {
-    let large_enough = crate::gpu::runtime::GpuRuntime::global()
+    let large_enough = crate::gpu::device_runtime::GpuRuntime::global()
         .map(|runtime| n >= runtime.policy().row_kernel_min_n && r > 0)
         .unwrap_or(false);
     decide(

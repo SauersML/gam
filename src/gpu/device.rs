@@ -52,7 +52,7 @@ impl GpuDeviceInfo {
 
     /// Per-device byte budget a dispatch may size its buffers against:
     /// `min(free_mem, total_mem / MEMORY_BUDGET_TOTAL_DIVISOR)`. Single source
-    /// of truth for both the primary-device budget (`runtime::probe`) and the
+    /// of truth for both the primary-device budget (`device_runtime::probe`) and the
     /// per-ordinal pool budget (`GpuRuntime::memory_budget_for`).
     #[must_use]
     pub const fn memory_budget_bytes(&self) -> usize {

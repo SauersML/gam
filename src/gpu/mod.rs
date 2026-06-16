@@ -24,7 +24,7 @@ pub mod numerics_host;
 pub mod policy;
 pub mod pool;
 pub mod profile;
-pub mod runtime;
+pub mod device_runtime;
 pub mod solver;
 
 // Domain-specific GPU kernels are isolated from the infrastructure modules.
@@ -37,7 +37,7 @@ pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, GpuMixedPrecisionPolicy};
 pub use pool::{balanced_partition, scatter_batched};
 pub use profile::{KernelStat, KernelStatsSnapshot};
-pub use runtime::GpuRuntime;
+pub use device_runtime::GpuRuntime;
 
 // ---------------------------------------------------------------------------
 // User-facing policy and instrumentation hooks (formerly src/gpu.rs).
@@ -63,7 +63,7 @@ pub enum CudaBackendStatus {
 
 #[inline]
 pub(crate) fn cuda_backend_status() -> CudaBackendStatus {
-    if runtime::GpuRuntime::global().is_some() {
+    if device_runtime::GpuRuntime::global().is_some() {
         CudaBackendStatus::CudaReady
     } else {
         CudaBackendStatus::CudaUnavailable
@@ -193,7 +193,7 @@ pub fn configure_global_policy(policy: GpuPolicy) {
 #[inline]
 pub fn cuda_selected() -> bool {
     match global_policy() {
-        GpuPolicy::Auto => runtime::GpuRuntime::is_available(),
+        GpuPolicy::Auto => device_runtime::GpuRuntime::is_available(),
         GpuPolicy::Off => false,
         GpuPolicy::Force => true,
     }
@@ -244,7 +244,7 @@ pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> GpuDecision {
     // GPU when the kernel is "compiled in" even though `GpuRuntime::global()`
     // observed no device — silently producing CPU work via failed dispatch
     // and hiding the cpu_reason from callers wanting to log fallback cause.
-    let runtime_available = runtime::GpuRuntime::is_available();
+    let runtime_available = device_runtime::GpuRuntime::is_available();
     let (use_gpu, reason) = match (policy, eligibility) {
         (GpuPolicy::Off, _) => (false, "cpu-gpu-policy-off"),
         (GpuPolicy::Auto, GpuEligibility::BackendNotCompiled) => {

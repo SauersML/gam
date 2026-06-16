@@ -160,7 +160,7 @@ pub struct WorkingModelPirlsOptions {
     /// versus the cold default, which is dwarfed by the savings when
     /// the hint is informative.
     ///
-    /// Used by `execute_pirls_if_needed` (in `solver::reml::runtime`)
+    /// Used by `execute_pirls_if_needed` (in `solver::reml::outer_eval`)
     /// to persist the converged λ across consecutive PIRLS calls in a
     /// single REML outer optimization, so the inner Newton does not
     /// have to rediscover problem-specific damping at every accepted

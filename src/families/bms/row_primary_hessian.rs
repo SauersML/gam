@@ -1224,7 +1224,7 @@ impl BernoulliMarginalSlopeFamily {
         //    upload. The host fill stays as the fallback on hosts without
         //    a runtime (and on every non-Linux build).
         #[cfg(target_os = "linux")]
-        let build_device_moments = crate::gpu::runtime::GpuRuntime::global().is_some();
+        let build_device_moments = crate::gpu::device_runtime::GpuRuntime::global().is_some();
         #[cfg(not(target_os = "linux"))]
         let build_device_moments = false;
 

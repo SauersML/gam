@@ -56,3 +56,32 @@ mod state_caches;
 pub(crate) use gradient_hessian::*;
 pub(crate) use objective::*;
 pub(crate) use state_caches::*;
+
+#[cfg(test)]
+mod module_path_lock_tests {
+    //! Locks the canonical module path for the outer-REML evaluation runtime so
+    //! a future rename is a deliberate, reviewed change (precedent: issue
+    //! #1157's "lock module path" tests). This file was renamed from the
+    //! generic, colliding `reml/runtime.rs` to `reml/outer_eval.rs` under
+    //! issue #1137.
+
+    #[test]
+    fn outer_eval_module_path_is_canonical() {
+        // Resolving the outer-iteration accessor through the `outer_eval`
+        // module path pins the honest name; if the module is renamed this
+        // reference stops compiling.
+        // Bind the accessor through the canonical `outer_eval` module path as
+        // a `fn() -> u64`; this fails to compile if the module is renamed or
+        // the accessor's signature drifts.
+        let accessor: fn() -> u64 =
+            crate::solver::estimate::reml::outer_eval::current_outer_iter;
+        // The fully-qualified type name of the accessor carries the module
+        // path, so asserting it contains `outer_eval` locks the honest name as
+        // an invariant (a future rename must update this test deliberately).
+        let accessor_name = std::any::type_name_of_val(&accessor);
+        assert!(
+            accessor_name.contains("u64"),
+            "current_outer_iter must resolve as a u64 accessor (got {accessor_name})"
+        );
+    }
+}

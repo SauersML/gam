@@ -107,7 +107,7 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     let n = sys.rows.len();
     let k = sys.k;
 
-    let tiles = crate::gpu::runtime::GpuRuntime::global()
+    let tiles = crate::gpu::device_runtime::GpuRuntime::global()
         .map(|rt| crate::gpu::pool::balanced_partition(rt, n))
         .filter(|tiles| tiles.len() > 1);
 
@@ -149,7 +149,7 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                     // is unreachable and the bind is omitted entirely.
                     #[cfg(target_os = "linux")]
                     {
-                        if let Some(ctx) = crate::gpu::runtime::cuda_context_for(ordinal) {
+                        if let Some(ctx) = crate::gpu::device_runtime::cuda_context_for(ordinal) {
                             if ctx.bind_to_thread().is_err() {
                                 // Fall through: this tile reduces on the CPU.
                             }
@@ -465,7 +465,7 @@ pub fn solve_streaming_reduced_beta(
         // CPU `solve_dense_reduced_system`, which then drives the same proximal
         // ridge escalation. A genuine device PD failure is non-recoverable for
         // this attempt's `schur`, so we let the CPU path re-confirm and escalate.
-        if crate::gpu::runtime::GpuRuntime::is_available() {
+        if crate::gpu::device_runtime::GpuRuntime::is_available() {
             match crate::gpu::kernels::arrow_schur::solve_reduced_beta_pcg(
                 &schur,
                 rhs_beta,
