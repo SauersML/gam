@@ -122,7 +122,18 @@ fit = gamfit.sae_manifold_fit(X=acts, K=16, d_atom=1, atom_topology="circle")
 recon = fit.predict(acts)              # (N, p) reconstruction
 band = fit.shape_uncertainty(0)        # {"coords","mean","sd","lower","upper"}
 extent = fit.coords[0].min(0), fit.coords[0].max(0)   # where atom 0 lives
+plan = fit.steer(atom_k=0, t_from=0.0, t_to=1.0)      # steering + dosimetry
 ```
+
+The dictionary supports three gating families (`assignment="ibp_map"`,
+`"softmax"`, `"jumprelu"`) and a `gamfit.torch.ManifoldSAE` autograd
+mirror with out-of-sample encoder distillation. Around it the interp
+stack adds: `e_bh_dictionary_certificate` (e-BH certified structure
+claims) and `select_topology` in `gamfit.structure_discovery` /
+`gamfit.topology`; `sae_checkpoint_dynamics` for tracking atoms across
+training checkpoints; `gamfit.crosscoder.Crosscoder` and
+`layer_transport_fit` / `layer_transport_ladder` for cross-layer
+dictionaries; and `gamfit.identifiability` factor-recovery diagnostics.
 
 Details: [docs/manifold-sae.md](docs/manifold-sae.md).
 
