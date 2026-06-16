@@ -200,3 +200,121 @@ fn poisson_smooth_lr_is_bartlett_corrected_and_better_calibrated() {
          (mean_p={mean_p_unc:.3}, mean_p*={mean_p_cor:.3})"
     );
 }
+
+/// #939 deliverable (2), the ρ̂-variation arm — VALIDATION BY SIMULATION over
+/// the sampling distribution of ρ̂.
+///
+/// The conditional Lawley shift `Δε(ρ)` is `E[W | λ]` — the LR mean with the
+/// smoothing parameter held FIXED at ρ. When λ is estimated, the relevant null
+/// mean is the expectation over the sampling distribution of ρ̂:
+///
+/// ```text
+/// E[W] = E_{ρ̂}[ Δε(ρ̂) ] = Δε(ρ₀) + ½ Δε''(ρ₀)·Var(ρ̂) + O(·)
+/// ```
+///
+/// `lawley_lr_mean_shift_with_rho_variation` assembles exactly the right-hand
+/// second-order term. This test takes the assembly's prediction as a HYPOTHESIS
+/// and falsifies the alternative (fixed-λ only) against a Monte-Carlo ground
+/// truth: it draws `ρ̂ ~ N(ρ₀, Var)` (the genuine sampling fluctuation of the
+/// log-smoothing estimate), evaluates the *conditional* shift `Δε(ρ̂)` at each
+/// draw by re-scaling the penalty, and averages. The claim is that the
+/// ρ̂-variation assembly matches this simulated `E_{ρ̂}[Δε(ρ̂)]` to second order
+/// — and matches it STRICTLY BETTER than the conditional (fixed-λ) shift, which
+/// systematically misses the curvature term. That gap IS the size correction
+/// attributable specifically to ρ̂-variation.
+#[test]
+fn rho_variation_assembly_matches_simulated_expectation_over_rho_hat() {
+    // Poisson/log smooth substrate at a fixed null linear predictor: a 2-column
+    // design (intercept + centered covariate) penalized on the second column.
+    let n = 60usize;
+    let mut x = Array2::<f64>::ones((n, 2));
+    let mut kappas = Vec::<RowKappas>::with_capacity(n);
+    for i in 0..n {
+        let z = i as f64 / n as f64 - 0.5;
+        x[[i, 1]] = z;
+        let eta = 0.3 + 0.6 * z;
+        kappas.push(
+            RowExpectedJets::poisson_log(eta)
+                .kappas()
+                .expect("poisson kappas"),
+        );
+    }
+    let tested = 1..2;
+
+    // Population smoothing parameter ρ₀ = log λ₀ and its sampling variance. (In
+    // the live engine Var(ρ̂) is the inverse REML outer Hessian; here it is a
+    // fixed scenario value so the simulation is self-contained and exact.)
+    let lambda0 = 3.0_f64;
+    let rho0 = lambda0.ln();
+    let var_rho = 0.6_f64;
+    let mut s_comp = Array2::<f64>::zeros((2, 2));
+    s_comp[[1, 1]] = lambda0;
+    let penalty = s_comp.clone();
+    let components = vec![RhoPenaltyComponent {
+        s_component: s_comp,
+    }];
+    let rho_cov = Array2::from_shape_vec((1, 1), vec![var_rho]).unwrap();
+
+    // Conditional shift Δε(ρ₀) (fixed-λ): the quantity the pre-#939-remainder
+    // factor used.
+    let conditional =
+        lawley_lr_mean_shift(x.view(), &kappas, Some(penalty.view()), tested.clone())
+            .expect("conditional Δε");
+
+    // The ρ̂-variation assembly's predicted E[W]-shift.
+    let assembled = lawley_lr_mean_shift_with_rho_variation(
+        x.view(),
+        &kappas,
+        penalty.view(),
+        tested.clone(),
+        &components,
+        rho_cov.view(),
+    )
+    .expect("assembled Δε(ρ̂)");
+
+    // MONTE-CARLO ground truth: E_{ρ̂}[Δε(ρ̂)] over ρ̂ ~ N(ρ₀, var_rho). For each
+    // draw, the conditional shift at ρ̂ scales the penalty by e^{ρ̂−ρ₀}.
+    let mut rng = StdRng::seed_from_u64(20939);
+    let normal = Normal::new(0.0, var_rho.sqrt()).expect("normal");
+    let reps = 40_000usize;
+    let mut sum = 0.0;
+    for _ in 0..reps {
+        let drho: f64 = normal.sample(&mut rng); // ρ̂ − ρ₀
+        let lambda = (rho0 + drho).exp();
+        let mut s = Array2::<f64>::zeros((2, 2));
+        s[[1, 1]] = lambda;
+        let de = lawley_lr_mean_shift(x.view(), &kappas, Some(s.view()), tested.clone())
+            .expect("Δε(ρ̂) draw");
+        sum += de;
+    }
+    let simulated = sum / reps as f64;
+
+    // The ρ̂-variation correction must be genuinely non-zero (else the test is
+    // vacuous): the simulated mean differs from the conditional shift.
+    assert!(
+        (simulated - conditional).abs() > 1e-6,
+        "fixture must exhibit a non-trivial ρ̂-variation effect: \
+         simulated E[Δε(ρ̂)]={simulated:.8}, conditional Δε(ρ₀)={conditional:.8}"
+    );
+
+    // (1) The assembly matches the simulated expectation to second order. The MC
+    // standard error is ~ sd(Δε)/√reps; the residual is dominated by the
+    // O(Var²·Δε'''') delta-method truncation plus MC noise — both small here.
+    let err_assembled = (assembled - simulated).abs();
+    let err_conditional = (conditional - simulated).abs();
+    assert!(
+        err_assembled < 0.2 * err_conditional.max(1e-12) + 1e-6,
+        "ρ̂-variation assembly must match the simulated E[Δε(ρ̂)]: \
+         |assembled−sim|={err_assembled:.3e} vs |conditional−sim|={err_conditional:.3e} \
+         (assembled={assembled:.8}, conditional={conditional:.8}, sim={simulated:.8})"
+    );
+
+    // (2) The defining property: the ρ̂-variation assembly is STRICTLY closer to
+    // the truth than the fixed-λ conditional shift. This is the size correction
+    // attributable specifically to ρ̂-variation (vs the fixed-λ factor).
+    assert!(
+        err_assembled < err_conditional,
+        "ρ̂-variation correction must improve on the fixed-λ shift: \
+         |assembled−sim|={err_assembled:.3e} must be < |conditional−sim|={err_conditional:.3e}"
+    );
+}

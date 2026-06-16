@@ -1959,6 +1959,37 @@ pub(crate) fn matvec_gate_engages_for_llm_shape_off_for_tiny() {
     assert!(!policy.reduced_schur_matvec_should_offload(300, 8, 4, cg_iters));
 }
 
+/// #1017 Phase-1 dispatch re-key (kernel side): the device matrix-free SAE
+/// reduced-Schur PCG (`gpu::kernels::arrow_schur::cuda::solve_sae_matrix_free_pcg`)
+/// previously gated on the dense-Direct floor `dense_hessian_work_target_is_gpu(n,
+/// k)`, the same floor `try_device_arrow_direct` (the single dense factorization)
+/// uses. That is the wrong gate for the amortised matvec: it keys on `2·n·k²`,
+/// dropping the per-row frame depth `d` (M) that multiplies the per-apply work and
+/// the `1/cg_iters` staging amortisation. The kernel now consults the SAME
+/// work-based predicate the host injection gate (`maybe_inject_gpu_schur_matvec`)
+/// uses — `reduced_schur_matvec_should_offload(n, k, d, max_iterations)` — so the
+/// two SAE-matvec dispatch sites cannot drift, and the gate registers the true
+/// `n × k × d × cg_iters` batched work. This asserts that policy invariant on any
+/// host (the predicates are pure; the device==CPU 1e-10 numeric parity stays the
+/// box harness's job).
+#[test]
+pub(crate) fn matrix_free_sae_gate_uses_work_predicate_not_dense_floor() {
+    let policy = crate::gpu::policy::GpuDispatchPolicy::default();
+    // SAE matrix-free shape with a SMALL CG budget. The dense `(n, k)` floor the
+    // kernel used to consult ignores both `d` and `cg_iters`, so at a thin border
+    // and few iterations it can decline a shape whose true `n·k·d·cg_iters` work
+    // clears the amortised breakeven. Pick a shape where keying on `d` matters:
+    // wide-enough border to clear the device-loop floor, modest rows, real frame
+    // depth.
+    let (n, k, d) = (1_024_usize, 1_024_usize, 8_usize);
+    let cg_iters = 8usize;
+    // The re-keyed kernel admits this on the work predicate ...
+    assert!(policy.reduced_schur_matvec_should_offload(n, k, d, cg_iters));
+    // ... and stays off below the device-loop border floor regardless of how much
+    // row/depth/iteration work piles up (launch latency per apply dominates).
+    assert!(!policy.reduced_schur_matvec_should_offload(1_000_000, 16, 64, 64));
+}
+
 /// On a host without a CUDA device the production seam must decline (return
 /// `None`), so `solve_arrow_newton_step_core` runs the unchanged CPU path
 /// and the result equals the direct CPU artifacts solve bit-for-bit.

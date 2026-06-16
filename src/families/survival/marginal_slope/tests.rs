@@ -5461,6 +5461,185 @@ fn flex_no_wiggle_test_block_states(
     ]
 }
 
+/// Joint-β assembly oracle (#1133): the Step-6 GPU joint-β pullback
+/// `pullback_step6_joint_beta` (`Σ_rows Jᵀ g_p`, `Σ_rows Jᵀ H_p J`) must
+/// reproduce the production CPU joint-β assembly
+/// (`evaluate_exact_newton_joint_dynamic_q_dense`) bit-for-bit when fed the
+/// real per-row primary jet `(g_p, H_p)` and the row's dense
+/// primary→coefficient Jacobian `J`.
+///
+/// This is the CPU correctness anchor the on-device contraction is checked
+/// against: it exercises the *exact* code path the device entry points
+/// (`gpu::try_survival_flex_{gradient,hvp,dense_hessian}`) fold their
+/// `SurvivalFlexStep6RowPullback` outputs through, so the joint-β assembly is
+/// verified end-to-end against the family math (not just the synthetic
+/// hand-built jets in `gpu::step6_tests`). The device-substrate jet builder
+/// (Steps 2–5) still needs CUDA hardware; the host-side fold (Step 6) is
+/// proven here.
+///
+/// Validity is confined to the GPU-eligible regime — `effective_flex_active`
+/// && `!flex_timewiggle_active()` — where the q0/q1/qd1 primaries are *affine*
+/// in β so the `∂²primary/∂β²` second-order design curvature (the `d2q*` terms
+/// in `accumulate_dynamic_q_core_hessian`) vanishes and the pure `Jᵀ H_p J`
+/// form is exact. This is the same gate the dispatcher applies before routing
+/// to the GPU entry points (`joint_eval.rs`).
+#[test]
+fn step6_joint_beta_pullback_matches_cpu_dense_assembly_flex_no_wiggle() {
+    use crate::families::survival::marginal_slope::gpu::{
+        pullback_step6_joint_beta, SurvivalFlexStep5RowOutputs, SurvivalFlexStep6RowPullback,
+    };
+
+    let n = 24usize;
+    let family = make_flex_no_wiggle_test_family(n);
+    let states = flex_no_wiggle_test_block_states(&family);
+    // Confirm we are in the GPU-eligible regime so the affine `Jᵀ H_p J`
+    // identity holds (no `d2q` second-order design curvature).
+    assert!(family.effective_flex_active(&states).unwrap());
+    assert!(!family.flex_timewiggle_active());
+
+    let slices = block_slices(&family, &states);
+    let p = slices.total;
+    let primary = flex_primary_slices(&family);
+    let r = primary.total;
+    let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+
+    // Production CPU joint-β assembly: the reference the Step-6 pullback must
+    // reproduce.
+    let (cpu_nll, cpu_grad, cpu_hess) = family
+        .evaluate_exact_newton_joint_dynamic_q_dense(&states)
+        .expect("cpu dense joint assembly");
+
+    // Build the per-row Step-5 primary jet + dense primary→coefficient
+    // Jacobian `J`, then fold through the Step-6 pullback.
+    let mut q_geom = SurvivalMarginalSlopeDynamicRow::empty_workspace();
+    let mut step5_rows: Vec<SurvivalFlexStep5RowOutputs> = Vec::with_capacity(n);
+    let mut jacobians: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for row in 0..n {
+        family
+            .row_dynamic_q_geometry_into(row, &states, &mut q_geom)
+            .expect("row geometry");
+        let (row_nll, f_pi, f_pipi) = family
+            .compute_row_flex_primary_gradient_hessian_exact(row, &states, &q_geom, &primary)
+            .expect("row primary jet");
+
+        // Step-5 primary outputs in the `pullback_step6_joint_beta` convention:
+        //   * nll      : the CPU sweep accumulates `-= row_nll`, so the Step-6
+        //                row nll carries the sign (`grad`/`H` fold the same J).
+        //   * grad g_p : the CPU sweep accumulates `-= primary_gradient·dq`, so
+        //                the raw-J convention requires `g_p = -f_pi`.
+        //   * hess H_p : the CPU sweep accumulates `+= primary_hessian·dq·dq`
+        //                (no sign flip), so `H_p = f_pipi` with the raw J.
+        let g_p: Vec<f64> = f_pi.iter().map(|&v| -v).collect();
+        let h_p: Vec<f64> = f_pipi.iter().copied().collect();
+        debug_assert_eq!(g_p.len(), r);
+        debug_assert_eq!(h_p.len(), r * r);
+
+        // Dense row Jacobian `J[a*p + j] = ∂ primary_a / ∂ β_j` (raw, unsigned).
+        let mut jac = vec![0.0_f64; r * p];
+
+        // Core primaries q0/q1/qd1 (indices 0,1,2): time + marginal design rows.
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+        for q_idx in 0..3 {
+            for (c, &v) in dq_time[q_idx].iter().enumerate() {
+                jac[q_idx * p + slices.time.start + c] = v;
+            }
+            for (c, &v) in dq_marginal[q_idx].iter().enumerate() {
+                jac[q_idx * p + slices.marginal.start + c] = v;
+            }
+        }
+        // logslope primary g (index 3): the logslope design row.
+        {
+            let chunk = family
+                .logslope_design
+                .try_row_chunk(row..row + 1)
+                .expect("logslope row");
+            let g_row = chunk.row(0);
+            for (c, &v) in g_row.iter().enumerate() {
+                jac[3 * p + slices.logslope.start + c] = v;
+            }
+        }
+        // Identity flex blocks (score_warp / link_dev): primary coordinate `a`
+        // maps to joint coefficient `a` with unit Jacobian.
+        for (primary_range, joint_range) in &identity_blocks {
+            for local in 0..primary_range.len() {
+                let a = primary_range.start + local;
+                jac[a * p + joint_range.start + local] = 1.0;
+            }
+        }
+        // Influence absorber primary `o_infl` (single scalar): maps to its γ
+        // coefficients through the residualized design row `Z̃[row,:]`.
+        if let (Some(infl_primary), Some(infl_joint)) =
+            (primary.infl, slices.influence.as_ref())
+        {
+            let z_tilde = family
+                .influence_absorber
+                .as_ref()
+                .expect("influence Z̃ present when infl primary present");
+            let z_row = z_tilde.row(row);
+            for (i, &z) in z_row.iter().enumerate() {
+                jac[infl_primary * p + infl_joint.start + i] = z;
+            }
+        }
+
+        step5_rows.push(SurvivalFlexStep5RowOutputs {
+            row_nll: -row_nll,
+            grad: g_p,
+            hess: h_p,
+        });
+        jacobians.push(jac);
+    }
+
+    let pullbacks: Vec<SurvivalFlexStep6RowPullback<'_>> = step5_rows
+        .iter()
+        .zip(jacobians.iter())
+        .map(|(po, jac)| SurvivalFlexStep6RowPullback {
+            primary: po,
+            jacobian: jac.as_slice(),
+        })
+        .collect();
+
+    let (step6_nll, step6_grad, step6_hess) =
+        pullback_step6_joint_beta(&pullbacks, p).expect("step6 joint-β pullback");
+
+    // nll + gradient + dense Hessian all match the production CPU assembly.
+    assert_close(step6_nll, cpu_nll, 1e-9, "joint nll");
+    assert_eq!(step6_grad.len(), cpu_grad.len());
+    for j in 0..p {
+        assert_close(step6_grad[j], cpu_grad[j], 1e-8, &format!("grad[{j}]"));
+    }
+    assert_eq!(step6_hess.shape(), &[p, p]);
+    for a in 0..p {
+        for b in 0..p {
+            assert_close(
+                step6_hess[[a, b]],
+                cpu_hess[[a, b]],
+                1e-8,
+                &format!("hess[{a},{b}]"),
+            );
+        }
+    }
+
+    // The HVP entry point uses the same pullback: H·v from Step-6 must equal
+    // the dense CPU Hessian applied to a probe direction.
+    let mut v = Array1::<f64>::zeros(p);
+    if p > 0 {
+        v[0] = 0.37;
+    }
+    if p > 1 {
+        v[p - 1] = -0.21;
+    }
+    let step6_hv = step6_hess.dot(&v);
+    let cpu_hv = cpu_hess.dot(&v);
+    for j in 0..p {
+        assert_close(step6_hv[j], cpu_hv[j], 1e-8, &format!("Hv[{j}]"));
+    }
+}
+
 #[test]
 fn survival_jointhessian_flex_no_wiggle_operator_subsample_full_equals_unsampled() {
     use crate::solver::outer_subsample::OuterScoreSubsample;

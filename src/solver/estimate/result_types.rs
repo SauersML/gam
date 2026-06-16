@@ -174,38 +174,9 @@ impl std::fmt::Debug for FitArtifacts {
     }
 }
 
-/// Dispersion contract used by inferential covariance and reference distributions.
-///
-/// `Known(phi)` is used for fixed-scale exponential-family fits such as
-/// Poisson and Binomial (`phi = 1`). `Estimated(phi)` is used when the
-/// residual/likelihood scale is estimated from the data, e.g. Gaussian
-/// (`phi = sigma^2`) and Gamma (`phi = 1 / shape`). Stored covariance
-/// matrices below are scaled by this `phi`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Dispersion {
-    Known(f64),
-    Estimated(f64),
-}
-
-impl Dispersion {
-    #[inline]
-    pub const fn phi(self) -> f64 {
-        match self {
-            Self::Known(phi) | Self::Estimated(phi) => phi,
-        }
-    }
-
-    #[inline]
-    pub const fn is_estimated(self) -> bool {
-        matches!(self, Self::Estimated(_))
-    }
-}
-
-impl Default for Dispersion {
-    fn default() -> Self {
-        Self::Known(1.0)
-    }
-}
+// `Dispersion` moved to the lower-layer `crate::model_types` module (issue
+// #1135); re-exported here for source compatibility.
+pub use crate::model_types::Dispersion;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitInference {
