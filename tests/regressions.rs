@@ -256,6 +256,10 @@ mod cubic_cell_kernel_bug_hunt;
 mod duchon_collocation_symmetry_psd_regression;
 #[path = "regressions/faer_ndarray_bug_hunt.rs"]
 mod faer_ndarray_bug_hunt;
+#[path = "regressions/factor_intercept_issue_157.rs"]
+mod factor_intercept_issue_157;
+#[path = "regressions/formula_dsl_operator_family_issue_219.rs"]
+mod formula_dsl_operator_family_issue_219;
 #[path = "regressions/gamlss_binomial_location_scale_bug_hunt_3_of_3.rs"]
 mod gamlss_binomial_location_scale_bug_hunt_3_of_3;
 #[path = "regressions/gamlss_joint_derivatives_fd_bug_hunt.rs"]
@@ -314,6 +318,8 @@ mod smooth_fit_term_collection_bug_hunt_2_3;
 mod solver_gpu_pirls_bug_hunt;
 #[path = "regressions/sparse_exact_bug_hunt.rs"]
 mod sparse_exact_bug_hunt;
+#[path = "regressions/te_formula_dispatch_issue_154.rs"]
+mod te_formula_dispatch_issue_154;
 #[path = "regressions/thin_plate_workspace_equivalence_regression.rs"]
 mod thin_plate_workspace_equivalence_regression;
 #[path = "regressions/tps_smallk_basis_regression.rs"]
@@ -322,5 +328,7 @@ mod tps_smallk_basis_regression;
 mod warm_start_quality_regression;
 #[path = "regressions/warm_start_store_regressions.rs"]
 mod warm_start_store_regressions;
+#[path = "regressions/wiggle_option_validation_issue_377_373.rs"]
+mod wiggle_option_validation_issue_377_373;
 #[path = "regressions/workflow_bug_hunt.rs"]
 mod workflow_bug_hunt;
