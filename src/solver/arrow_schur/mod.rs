@@ -92,7 +92,7 @@
 
 // Re-modularized into real concern submodules under `arrow_schur/`. The shared
 // external imports, tuning constants, and function-pointer aliases live in
-// `primitives`; every other module pulls them in through `use super::*;`. The
+// `prelude`; every other module pulls them in through `use super::*;`. The
 // parent re-exports each module's surface so the long-standing
 // `crate::solver::arrow_schur::<Item>` paths used across the crate keep
 // resolving unchanged.
@@ -100,7 +100,7 @@
 mod factorization;
 mod newton_step;
 mod penalty_ops;
-mod primitives;
+mod prelude;
 mod reduced_solve;
 mod solve_options;
 mod system;
@@ -111,7 +111,7 @@ mod tests;
 pub(crate) use factorization::*;
 pub use newton_step::*;
 pub use penalty_ops::*;
-pub use primitives::*;
+pub use prelude::*;
 pub use reduced_solve::*;
 pub use solve_options::*;
 pub use system::*;

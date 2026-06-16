@@ -1,6 +1,5 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerColView};
-use crate::solver::pirls::{PirlsWorkspace, SparseXtwxPrecomputed, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
@@ -45,13 +44,6 @@ pub struct SparsePenaltyBlock {
     pub s_k_sparse: SparseColMat<usize, f64>,
     pub s_k_block_dense: Arc<Array2<f64>>,
     pub s_k_block_upper_entries: Arc<Vec<(usize, usize, f64)>>,
-}
-
-#[derive(Clone)]
-pub struct SparsePenalizedSystem {
-    pub h_sparse: SparseColMat<usize, f64>,
-    pub factor: SparseExactFactor,
-    pub logdet_h: f64,
 }
 
 pub fn dense_to_sparse(
@@ -712,31 +704,6 @@ pub fn assemble_sparse_factor_h_dense(
     factor: &SparseExactFactor,
 ) -> Result<Array2<f64>, EstimationError> {
     factor.simplicial.assemble_h_dense_original_order()
-}
-
-pub fn assemble_and_factor_sparse_penalized_system(
-    workspace: &mut PirlsWorkspace,
-    x: &SparseColMat<usize, f64>,
-    weights: &Array1<f64>,
-    s_lambda: &Array2<f64>,
-    ridge: f64,
-    precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
-) -> Result<SparsePenalizedSystem, EstimationError> {
-    let logdet_h_start = std::time::Instant::now();
-    let h_sparse =
-        sparse_reml_penalized_hessian(workspace, x, weights, s_lambda, ridge, precomputed_xtwx)?;
-    let factor = factorize_sparse_spd(&h_sparse)?;
-    let logdet_h = logdet_from_factor(&factor)?;
-    log::info!(
-        "[STAGE] logdet H (sparse Cholesky) p={} elapsed={:.3}s",
-        h_sparse.nrows(),
-        logdet_h_start.elapsed().as_secs_f64(),
-    );
-    Ok(SparsePenalizedSystem {
-        h_sparse,
-        factor,
-        logdet_h,
-    })
 }
 
 /// Build sparse penalty blocks from canonical penalties, avoiding redundant
