@@ -32,7 +32,7 @@ use gam::{
 };
 
 use gam::inference::lawley::{
-    RhoPenaltyComponent, RowExpectedJets, lawley_lr_mean_shift,
+    RhoPenaltyComponent, RowExpectedJets, RowKappas, lawley_lr_mean_shift,
     lawley_lr_mean_shift_with_rho_variation,
 };
 use ndarray::Array2;
