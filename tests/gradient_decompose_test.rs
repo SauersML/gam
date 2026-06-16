@@ -23,6 +23,7 @@ use gam::estimate::{
 };
 use gam::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam::smooth::BlockwisePenalty;
+use gam::test_support::fd_checker::numerical_gradient_central_diff;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, Axis, array};
 
@@ -64,20 +65,6 @@ fn blockwise_penalties(s_list: Vec<Array2<f64>>) -> Vec<BlockwisePenalty> {
         .collect()
 }
 
-/// Central FD of a scalar function.
-fn fd_gradient(f: &dyn Fn(&Array1<f64>) -> f64, rho: &Array1<f64>, h: f64) -> Array1<f64> {
-    let k = rho.len();
-    let mut grad = Array1::<f64>::zeros(k);
-    for i in 0..k {
-        let mut rp = rho.clone();
-        let mut rm = rho.clone();
-        rp[i] += h;
-        rm[i] -= h;
-        grad[i] = (f(&rp) - f(&rm)) / (2.0 * h);
-    }
-    grad
-}
-
 /// Central FD of the external REML cost across rho using the public cost API.
 fn fd_gradient_from_externalcost(
     y: &Array1<f64>,
@@ -89,38 +76,23 @@ fn fd_gradient_from_externalcost(
     rho: &Array1<f64>,
     h: f64,
 ) -> Array1<f64> {
-    let k = rho.len();
-    let mut grad = Array1::<f64>::zeros(k);
-    for i in 0..k {
-        let mut rp = rho.clone();
-        let mut rm = rho.clone();
-        rp[i] += h;
-        rm[i] -= h;
-        let cp = evaluate_externalcost_andridge(
-            y.view(),
-            w.view(),
-            x.view(),
-            offset.view(),
-            s_list,
-            opts,
-            &rp,
-        )
-        .map(|(c, _)| c)
-        .expect("cost+");
-        let cm = evaluate_externalcost_andridge(
-            y.view(),
-            w.view(),
-            x.view(),
-            offset.view(),
-            s_list,
-            opts,
-            &rm,
-        )
-        .map(|(c, _)| c)
-        .expect("cost-");
-        grad[i] = (cp - cm) / (2.0 * h);
-    }
-    grad
+    numerical_gradient_central_diff(
+        |rho| {
+            evaluate_externalcost_andridge(
+                y.view(),
+                w.view(),
+                x.view(),
+                offset.view(),
+                s_list,
+                opts,
+                rho,
+            )
+            .map(|(c, _)| c)
+            .expect("cost")
+        },
+        rho,
+        h,
+    )
 }
 
 /// Relative L2 error between two vectors.
@@ -247,7 +219,7 @@ fn test_component_a_envelope_theorem() {
         -log_lik + 0.5 * beta.dot(&s_total.dot(&beta))
     };
 
-    let fd_a = fd_gradient(&cost_a, &rho, 1e-5);
+    let fd_a = numerical_gradient_central_diff(cost_a, &rho, 1e-5);
 
     // Analytic via envelope theorem
     let s_total = build_s_total(&s_list, &rho);
@@ -292,7 +264,7 @@ fn test_component_b_hessian_logdet() {
             .sum::<f64>()
     };
 
-    let fd_b = fd_gradient(&cost_b, &rho, 1e-5);
+    let fd_b = numerical_gradient_central_diff(cost_b, &rho, 1e-5);
 
     // Analytic: 0.5 * tr(H⁻¹ H_k)
     let s_total = build_s_total(&s_list, &rho);
@@ -368,7 +340,7 @@ fn test_component_b1_simple_trace() {
             .sum::<f64>()
     };
 
-    let fd_b1 = fd_gradient(&cost_b1, &rho, 1e-5);
+    let fd_b1 = numerical_gradient_central_diff(cost_b1, &rho, 1e-5);
 
     // Analytic: 0.5 * λ_k * tr(H⁻¹ S_k)
     let h_base = wx_fixed.t().dot(&x) + &s_total_base;
@@ -423,7 +395,7 @@ fn test_component_c_penalty_logdet() {
             .sum::<f64>()
     };
 
-    let fd_c = fd_gradient(&cost_c, &rho, 1e-5);
+    let fd_c = numerical_gradient_central_diff(cost_c, &rho, 1e-5);
 
     // Analytic
     let s_total = build_s_total(&s_list, &rho);
@@ -916,8 +888,8 @@ fn test_standalone_gradient_matches_own_fd() {
     let p = x.ncols();
     let n = y.len();
 
-    let standalone_fd = fd_gradient(
-        &|rho: &Array1<f64>| standalone_laml_cost(&y, &x, &s_list, rho, &[1, 0]),
+    let standalone_fd = numerical_gradient_central_diff(
+        |rho| standalone_laml_cost(&y, &x, &s_list, rho, &[1, 0]),
         &rho,
         1e-5,
     );
