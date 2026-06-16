@@ -286,7 +286,8 @@ preds = model.predict(
 ```python
 posterior = model.sample(train, seed=42)
 bands = posterior.predict(test, level=0.95)
-# columns: eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper
+# columns: linear_predictor, linear_predictor_lower, linear_predictor_upper,
+#          mean, mean_lower, mean_upper
 ```
 
 ## Posterior of a derived quantity
