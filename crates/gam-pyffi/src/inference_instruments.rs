@@ -1413,8 +1413,9 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     k_ladder: Option<Vec<usize>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
+    use gam::solver::topology_selector::EvidenceCertification;
     use gam::solver::{
-        AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, MIXTURE_K_LADDER,
+        AutoTopologyKind, CrossClassCandidate, Headline, MIXTURE_K_LADDER,
         adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
     };
 
