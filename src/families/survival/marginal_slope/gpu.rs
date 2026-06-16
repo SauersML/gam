@@ -1398,10 +1398,13 @@ pub fn try_survival_flex_hvp(
 /// When `cells` is `Some(_)` (Step 2 hookup) the entry point evaluates
 /// the per-cell derivative moments via [`try_row_batched_cell_moments`]
 /// first — this validates the moment-building stage end-to-end on the
-/// device runtime before the Step 4/5/6 joint-β assembly lands.  When
-/// every cell evaluates cleanly the entry point still returns `Ok(None)`
-/// (joint-β assembly not yet wired); on any non-OK substrate status the
-/// caller falls back to CPU.
+/// device runtime.  When `step6` rows are supplied the entry point folds
+/// them through the Step-6 joint-β pullback ([`pullback_step6_joint_beta`])
+/// into the dense coefficient Hessian — the joint-β assembly is wired and
+/// CPU-verified (see `tests::step6_joint_beta_pullback_matches_cpu_dense_assembly_flex_no_wiggle`).
+/// Without `step6` rows the cell-moment precheck runs and the entry point
+/// returns `Ok(None)` so the caller falls back to CPU; on any non-OK
+/// substrate status the caller likewise falls back to CPU.
 pub fn try_survival_flex_dense_hessian(
     inputs: SurvivalFlexGpuRowInputs<'_>,
     cells: Option<SurvivalFlexRowCellsBatch<'_>>,
