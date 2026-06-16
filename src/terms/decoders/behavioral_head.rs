@@ -637,7 +637,11 @@ pub fn head_feature_significance(
         };
         statistic.push(best_stat);
         p_value.push(axis_p);
-        log_e_values.push(log_e_from_p_calibrator(axis_p).map_err(|err| {
+        // Numerical tail routines can underflow a mathematically positive
+        // p-value to exactly zero; calibrate at the smallest positive f64 while
+        // still reporting the Bonferroni-adjusted p-value above.
+        let calibration_p = axis_p.max(f64::MIN_POSITIVE);
+        log_e_values.push(log_e_from_p_calibrator(calibration_p).map_err(|err| {
             format!("head_feature_significance: invalid calibrated axis p-value: {err}")
         })?);
     }

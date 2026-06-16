@@ -483,7 +483,7 @@ pub fn run_atom_birth_gate<S, A>(
 /// e-BH can.
 pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Vec<usize> {
     let m = log_e_values.len();
-    if m == 0 || !(alpha > 0.0) {
+    if m == 0 || !(alpha.is_finite() && alpha > 0.0) {
         return Vec::new();
     }
     assert!(

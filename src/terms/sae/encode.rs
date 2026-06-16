@@ -1354,16 +1354,13 @@ impl EncodeAtlas {
     /// a single `O(d·p)` mat-vec — no per-row Hessian factorization or
     /// eigendecomposition, which is the amortization. The Kantorovich
     /// certificate is then evaluated AT the predicted start `t̂` with the chart's
-    /// closed-form Lipschitz constant: the amortized prediction is trusted iff
-    /// `h ≤ ½`, and an uncertified row is flagged for the exact multi-start
-    /// solve. This is exactly the thread's "encoder + certificate-gated exact
-    /// fallback" deployment — the distilled map approximates inference, the
-    /// certificate keeps every accepted encode honest. A certified prediction
-    /// may take up to `config.newton_steps` quadratic refinement steps from `t̂`
-    /// (the certificate guarantees the basin), so the amortized start only has to
-    /// land the row in the certified ball — strictly easier than the chart-center
-    /// start of [`Self::certified_encode_row`]. A chart without a distilled
-    /// Jacobian (singular Gauss–Newton block) flags the row.
+    /// closed-form Lipschitz constant. A prediction is accepted only when that
+    /// certificate holds, an independent cold chart-center probe also certifies,
+    /// and the two refined coordinates agree within the two probes' final
+    /// Kantorovich root-radius bounds. This keeps the distilled path honest
+    /// without letting the exact probe reuse the distilled warm start it is
+    /// auditing. A chart without a distilled Jacobian (singular Gauss–Newton
+    /// block) flags the row.
     pub fn amortized_encode_row(
         &self,
         atom: &SaeManifoldAtom,
