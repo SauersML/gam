@@ -1357,14 +1357,19 @@ const GLM_NEWTON_MAX_ITERS: usize = 200;
 /// Maximum Armijo backtracking halvings per cold Newton iteration.
 const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
 
-/// Tight relative tolerance on the Newton-step norm declaring convergence.
+/// Strict scale-invariant KKT tolerance declaring convergence, applied to the
+/// RAW penalized gradient via [`GlmHomotopyFullConformal::kkt_converged`]
+/// (dimension-scaled OR natural-scale relative — the same certificate the main
+/// P-IRLS solver uses). NOT a tolerance on the preconditioned Newton step.
 const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
 
-/// Loose relative tolerance at which a stalled (floating-point-floor)
-/// corrector residual is still accepted; the COMPUTED error bound carried
-/// out of the step uses the actual residual, so accepting a stall is
-/// honest — the bound is simply larger and the downstream margin gate
-/// decides whether a cold refit is needed.
+/// Near-stationary acceptance tolerance: a stalled iterate sitting at the
+/// floating-point floor of the raw gradient is still accepted when it
+/// certifies KKT stationarity at this looser scale-invariant tolerance. The
+/// COMPUTED error bound carried out of the step uses the actual residual, so
+/// accepting a stall is honest — the bound is simply larger and the downstream
+/// margin gate decides whether a cold refit is needed. Mirrors the main
+/// solver's 10×-band `near_stationary_kkt`.
 const GLM_STALL_ACCEPT_RTOL: f64 = 1e-8;
 
 /// Certified contraction constant below which a predictor step is accepted:
@@ -1746,6 +1751,52 @@ impl<'a> GlmHomotopyFullConformal<'a> {
         g
     }
 
+    /// Natural magnitude of the augmented penalized gradient, mirroring the
+    /// main P-IRLS convergence certificate's `gradient_natural_scale`
+    /// (`src/solver/pirls/state.rs`): `‖Xᵀ(μ − y)‖₂ + ‖Sβ‖₂` plus the test
+    /// row's score contribution `‖x_*‖·|μ̂_* − z|`. The penalized score is a
+    /// difference of these O(√(n+1)) sums, so at the optimum the raw gradient
+    /// floor scales with this quantity, NOT with `(1 + ‖β‖)`. Dividing by
+    /// `1 + this` yields a stationarity residual that is invariant under
+    /// uniform rescaling of the objective and per-observation in meaning.
+    fn gradient_natural_scale(&self, beta: &Array1<f64>, z: f64) -> f64 {
+        let eta = fast_av(self.x, beta);
+        let mut resid = Array1::<f64>::zeros(self.n);
+        for i in 0..self.n {
+            resid[i] = self.family.mean(eta[i]) - self.y[i];
+        }
+        let score = self.x.t().dot(&resid);
+        let r_star = self.family.mean(self.x_star.dot(beta)) - z;
+        vec_norm(&score)
+            + vec_norm(&self.s_lambda.dot(beta))
+            + self.star_norm * r_star.abs()
+    }
+
+    /// Dimension-based scale `√(n+1) · √p` for the structural KKT bound, with
+    /// `n+1` counting the appended test row. Matches `kkt_dimension_scale` in
+    /// the main P-IRLS state: under standardized columns the augmented score
+    /// `Xᵀ(μ − y)` has components of order O(√(n+1)), so an absolute
+    /// `‖g‖ < τ` test becomes systematically too tight as `n` grows. This
+    /// scaling restores the advertised per-observation meaning of `τ`.
+    fn kkt_dimension_scale(&self) -> f64 {
+        (((self.n + 1) as f64).sqrt()) * ((self.p as f64).max(1.0).sqrt())
+    }
+
+    /// Scale-invariant KKT acceptance on the RAW penalized gradient, exactly
+    /// the `WorkingState::certifies_kkt` certificate the engine's main solver
+    /// uses: the iterate certifies stationarity at tolerance `tol` under
+    /// EITHER the dimension-scaled absolute bound OR the data-driven
+    /// natural-scale relative bound. The earlier predicate compared the
+    /// PRECONDITIONED Newton step `‖H⁻¹g‖` against `tol·(1 + ‖β‖)`, whose
+    /// floating-point floor is `~ε·(n+1)/λ_min(H)` — n-dependent and not
+    /// compensated by `(1 + ‖β‖)`, so genuinely-converged fits (e.g. raw
+    /// gradient floor `3.6e-8` at moderate n) were rejected as non-converged.
+    fn kkt_converged(&self, beta: &Array1<f64>, z: f64, tol: f64) -> bool {
+        let g_norm = vec_norm(&self.penalized_score(beta, z));
+        g_norm < tol * self.kkt_dimension_scale()
+            || g_norm / (1.0 + self.gradient_natural_scale(beta, z)) < tol
+    }
+
     /// Augmented penalized NLL (line-search merit function).
     fn penalized_nll(&self, beta: &Array1<f64>, z: f64) -> f64 {
         let eta = fast_av(self.x, beta);
@@ -1857,7 +1908,7 @@ impl<'a> GlmHomotopyFullConformal<'a> {
                 .map_err(|e| format!("glm homotopy: augmented Hessian not SPD at z={z}: {e:?}"))?;
             let step = chol.solvevec(&g);
             let step_norm = vec_norm(&step);
-            if step_norm <= GLM_CONVERGENCE_RTOL * (1.0 + vec_norm(&beta)) {
+            if self.kkt_converged(&beta, z, GLM_CONVERGENCE_RTOL) {
                 converged = true;
                 break;
             }
@@ -1884,17 +1935,16 @@ impl<'a> GlmHomotopyFullConformal<'a> {
             }
         }
         if !converged {
-            // The loop may exit by budget with the last step still above the
-            // tight tolerance; re-check once after the final accepted step.
-            let g = self.penalized_score(&beta, z);
-            let hess = self.penalized_hessian(&beta);
-            let chol = hess
-                .cholesky(Side::Lower)
-                .map_err(|e| format!("glm homotopy: augmented Hessian not SPD at z={z}: {e:?}"))?;
-            let step_norm = vec_norm(&chol.solvevec(&g));
-            if step_norm > GLM_STALL_ACCEPT_RTOL * (1.0 + vec_norm(&beta)) {
+            // The loop may exit by budget (or with line-search progress
+            // stalled at the floating-point floor) with the strict KKT
+            // tolerance not met; accept iff the raw penalized gradient still
+            // certifies stationarity under the looser near-stationary band.
+            if !self.kkt_converged(&beta, z, GLM_STALL_ACCEPT_RTOL) {
+                let g_norm = vec_norm(&self.penalized_score(&beta, z));
+                let residual = g_norm / (1.0 + self.gradient_natural_scale(&beta, z));
                 return Err(format!(
-                    "glm homotopy: cold fit did not converge at z={z} (residual {step_norm})"
+                    "glm homotopy: cold fit did not converge at z={z} \
+                     (relative gradient residual {residual})"
                 ));
             }
         }
@@ -1962,7 +2012,7 @@ impl<'a> GlmHomotopyFullConformal<'a> {
                     let mut step = s0;
                     let mut r = r0;
                     for _ in 0..GLM_CORRECTOR_MAX_ITERS {
-                        if r <= GLM_CONVERGENCE_RTOL * (1.0 + vec_norm(&bcur)) {
+                        if self.kkt_converged(&bcur, z_new, GLM_CONVERGENCE_RTOL) {
                             break;
                         }
                         let mut next = bcur.clone();
@@ -1978,7 +2028,7 @@ impl<'a> GlmHomotopyFullConformal<'a> {
                         step = next_step;
                         r = r_next;
                     }
-                    if r <= GLM_STALL_ACCEPT_RTOL * (1.0 + vec_norm(&bcur)) {
+                    if self.kkt_converged(&bcur, z_new, GLM_STALL_ACCEPT_RTOL) {
                         // Re-certify at the final iterate and carry the
                         // COMPUTED distance-to-root bound.
                         let mut diff = bcur.clone();
