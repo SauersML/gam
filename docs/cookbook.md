@@ -263,9 +263,13 @@ gamfit.fit(
 gamfit.fit(
     df,
     "y ~ s(x1) + s(x2)",
-    config={"noise_formula": "s(x1)"},
+    noise_formula="s(x1)",     # smooth log-scale submodel
 )
 ```
+
+`noise_formula=` is a first-class `fit` keyword. (It can also be passed via
+`config={"noise_formula": ...}`, but the dedicated keyword wins over the same
+key in `config`.)
 
 ## Pass through an identifier column
 
