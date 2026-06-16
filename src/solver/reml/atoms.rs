@@ -634,11 +634,6 @@ impl PenaltyQuadAtom {
         }
     }
 
-    /// Per-coordinate beta score `λ_idx S_idx(β̂ − μ_idx)`.
-    pub(crate) fn block_penalty_score(&self, idx: usize) -> &Array1<f64> {
-        &self.block_penalty_scores[idx]
-    }
-
     pub(crate) fn block_penalty_scores(&self) -> &[Array1<f64>] {
         &self.block_penalty_scores
     }
@@ -1092,9 +1087,10 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // remaining call-site special-casing. The penalty quadratic
 // `½ λ_k (β−μ_k)ᵀ S_k (β−μ_k)` is realized above as `PenaltyQuadAtom` (the
 // simplest β-channel atom: frozen_d1 = the explicit ½λ_k quadratic;
-// beta_channel = Sλ(β̂−μ) = the KKT residual's penalty half) and is ported
-// alongside the inner-objective atom so the envelope/noise-floor correction
-// emerges from the calculus on day one.
+// beta_channel = Sλ(β̂−μ) = the KKT residual's penalty half). Its live
+// derivative assembly now reads the atom's centered beta-Gaussian emissions;
+// the scalar cost still reads `pirls_result.stable_penalty_term` for the
+// stable-basis value invariant recorded below.
 //
 // ── Migration ledger ──────────────────────────────────────────────────────
 //
@@ -1119,9 +1115,10 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // `shifted_quadratic`. The two formulas are mathematically one atom, but the
 // stable-basis evaluation exists because `βᵀSλβ` cancels catastrophically in
 // the original basis at large λ — unifying the source text would trade a
-// certified value/gradient pair for worse numerics. That pair is covered by
-// the #934 certificate until the quadratic atom can own a stable-basis
-// emission for BOTH channels.
+// certified value/gradient pair for worse numerics. The live derivative,
+// Hessian, KKT-residual, and EFS sites now read the centered `PenaltyQuadAtom`
+// emissions; the remaining value-side work is a stable-basis value emission
+// from PIRLS, not a second shifted-quadratic formula in the outer assembly.
 //
 // LANDED (pass 2, the ThetaDirection shared-drift pass — the β̇ kernel
 // half): `ThetaModeResponseKernel` in unified.rs is now the ONE place the
@@ -1195,8 +1192,8 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // `joint_jeffreys_term` until the second-order atom pass. Isolation + FD pin:
 // `jeffreys_logdet_atom_emits_consistent_value_and_directional_derivative`
 // asserts the closed-form value/frozen_d1, the relative-floor channel, and an
-// FD oracle `g'(λ) ≈ floored_inverse(λ)` across all four branches. TK and
-// beta-Gaussian prior atoms remain unported.
+// FD oracle `g'(λ) ≈ floored_inverse(λ)` across all four branches. TK remains
+// unported as a full kernel atom.
 //
 // LANDED (pass 4b, configured-prior atom): `ConfiguredRhoPriorAtom` wraps the
 // shared `RhoPriorEval` after the REML/LAML policies are applied (configured
@@ -1205,8 +1202,8 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // this atom once per prior assembly and projects configured-prior cost,
 // gradient, and diagonal Hessian from that one emission; the old
 // `compute_configured_rho_prior_{cost,grad,hess}` wrappers and the generic
-// `soft_prior_for_mode` closure helper are deleted. TK and beta-Gaussian
-// prior atoms remain unported.
+// `soft_prior_for_mode` closure helper are deleted. TK remains unported as a
+// full kernel atom.
 //
 // LANDED (pass 4d, soft numerical-guard prior atom): `SoftRhoGuardPriorAtom`
 // ports the separable `log cosh` ρ-barrier. The three `compute_soft_prior{cost,
@@ -1222,7 +1219,7 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // `soft_rho_guard_prior_atom_value_gradient_hessian_are_one_chain` asserts the
 // closed-form value/gradient/diagonal-Hessian and an independent central-FD
 // oracle (FD of value == analytic gradient, FD of gradient == analytic
-// curvature) per coordinate. The beta-Gaussian prior atom remains unported.
+// curvature) per coordinate.
 //
 // LANDED (pass 4c, TK/sampled-correction application atom): the live
 // runtime post-evaluator no longer splices `TkCorrectionTerms` into
@@ -1232,8 +1229,19 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // `ThetaOnlyCorrectionAtom`; cost, gradient, and Hessian are then projected
 // from that atom in one application site with arity checks. This ports the
 // TK/block value+gradient splice to the atom ledger without touching #932's
-// row kernels. The TK kernel itself and beta-Gaussian prior atoms remain
-// unported.
+// row kernels. The TK kernel itself remains unported.
+//
+// LANDED (pass 4e, beta-Gaussian prior derivative atom): live ρ penalty
+// derivative assembly now builds `PenaltyQuadAtom` from `PenaltyCoordinate`s
+// once per evaluator path and projects the centered Gaussian-prior emissions
+// from it: `rho_frozen_d1` feeds the gradient/Hessian/EFS penalty-quadratic
+// scalar, and `block_penalty_scores` feeds mode-response RHSs plus the
+// KKT-residual correction. The old outer helper pair
+// `penalty_a_k_{beta,quadratic}` is deleted, so the outer derivative stack no
+// longer reassembles `(β̂ − μ_k)` matvecs and quadratics independently at each
+// consumer. The profiled cost VALUE deliberately remains the stable PIRLS
+// emission above; this pass removes the live inline derivative/Hessian beta
+// prior assembly without replacing the numerically stable scalar value path.
 
 #[cfg(test)]
 mod tests {
@@ -1397,6 +1405,25 @@ mod tests {
         };
         assert!((sum.value() - 13.0).abs() < 1e-12);
         assert!((sum.d1(&dir0) - 3.5).abs() < 1e-12);
+
+        // Live constructor path with a nonzero Gaussian prior mean:
+        // β = (2, 3), μ = (1, 1), R = I, λ = 4.
+        // q = ||β - μ||² = 1 + 4 = 5, value = 10,
+        // score = λ(β - μ) = (4, 8).
+        let centered_coord = PenaltyCoordinate::from_dense_root_with_mean(
+            array![[1.0, 0.0], [0.0, 1.0]],
+            array![1.0, 1.0],
+        );
+        let centered_atom =
+            PenaltyQuadAtom::from_penalty_coords(&[4.0], &[centered_coord], &array![2.0, 3.0])
+                .expect("centered penalty atom");
+        assert!((centered_atom.value() - 10.0).abs() < 1e-12);
+        assert!((centered_atom.rho_frozen_d1(0) - 10.0).abs() < 1e-12);
+        let centered_channel = centered_atom
+            .beta_channel()
+            .expect("centered penalty atom declares beta channel");
+        assert_eq!(centered_channel.grad_beta, array![4.0, 8.0]);
+        assert_eq!(centered_atom.block_penalty_scores()[0], array![4.0, 8.0]);
     }
 
     /// Per-atom isolation + value↔gradient consistency check for the Jeffreys
