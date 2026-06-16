@@ -51,6 +51,8 @@ use crate::estimate::UnifiedFitResult;
 
 use crate::faer_ndarray::{fast_ab, fast_atv, fast_av, fast_joint_hessian_2x2};
 
+use crate::families::block_layout::block_count::validate_block_count;
+
 use crate::families::location_scale_engine::build_location_scale_exact_joint_setup;
 
 use crate::families::parameter_block::ParameterBlockInput;
