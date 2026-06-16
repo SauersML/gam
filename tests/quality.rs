@@ -109,7 +109,7 @@ mod quality_vs_inla_survival_random_intercept_baseline;
 #[path = "quality/quality_vs_inla_tensor_product_spde.rs"]
 mod quality_vs_inla_tensor_product_spde;
 #[path = "quality/quality_vs_interpretML_pygam_binomial_logit_comparative.rs"]
-mod quality_vs_interpretML_pygam_binomial_logit_comparative;
+mod quality_vs_interpretml_pygam_binomial_logit_comparative;
 #[path = "quality/quality_vs_interpretml_ebm_binomial_logit.rs"]
 mod quality_vs_interpretml_ebm_binomial_logit;
 #[path = "quality/quality_vs_interpretml_ebm_poisson_log.rs"]
