@@ -1,5 +1,5 @@
 use crate::faer_ndarray::FaerCholesky;
-use crate::solver::estimate::EstimationError;
+use crate::model_types::EstimationError;
 use crate::solver::sensitivity::FitSensitivity;
 use faer::Side;
 use ndarray::{Array1, ArrayView1, ArrayView2};

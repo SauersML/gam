@@ -38,7 +38,7 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-pub use crate::solver::estimate::Dispersion;
+pub use crate::model_types::Dispersion;
 
 /// Posterior coefficient covariance `Vb = phi * H^{-1}` — the matrix users
 /// see as `Cov(beta_hat)`. This newtype documents that `phi` has already

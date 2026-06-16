@@ -518,7 +518,7 @@ struct SharedData {
     /// even though `φ ≠ 1`, because Gamma's dispersion already lives inside the
     /// working weight (the `shape` factor in `gamma_log_logp_and_grad`). See
     /// `inference::dispersion_cov` for the ownership invariants.
-    dispersion: crate::solver::estimate::Dispersion,
+    dispersion: crate::model_types::Dispersion,
     /// Number of samples
     n_samples: usize,
     /// Number of coefficients
@@ -694,7 +694,7 @@ impl NutsPosterior {
         hessian: ArrayView2<f64>,
         nuts_family: NutsFamily,
         gamma_shape: f64,
-        dispersion: crate::solver::estimate::Dispersion,
+        dispersion: crate::model_types::Dispersion,
         firth_enabled: bool,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
@@ -2404,7 +2404,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: non_spd_hessian.view(),
                 gamma_shape: None,
-                dispersion: crate::solver::estimate::Dispersion::Known(1.0),
+                dispersion: crate::model_types::Dispersion::Known(1.0),
                 firth_bias_reduction: false,
                 offset: None,
             }),
@@ -4680,7 +4680,7 @@ pub(crate) fn run_nuts_sampling(
     hessian: ArrayView2<f64>,
     nuts_family: NutsFamily,
     gamma_shape: f64,
-    dispersion: crate::solver::estimate::Dispersion,
+    dispersion: crate::model_types::Dispersion,
     firth_bias_reduction: bool,
     offset: Option<ArrayView1<f64>>,
     config: &NutsConfig,
@@ -5087,7 +5087,7 @@ pub struct GlmFlatInputs<'a> {
     /// for Gaussian / Gamma it carries the estimated `phi` so that the
     /// sampler targets the φ-scaled posterior covariance `Vb = φ·H⁻¹`.
     /// See `inference::dispersion_cov` for the ownership invariants.
-    pub dispersion: crate::solver::estimate::Dispersion,
+    pub dispersion: crate::model_types::Dispersion,
     pub firth_bias_reduction: bool,
     /// Fixed additive offset on the linear predictor (η = Xβ + offset), or
     /// `None` for an offset-free fit. Carried so posterior sampling targets the
@@ -7005,7 +7005,7 @@ impl JointBetaRhoPosterior {
             // dispersion enters via the per-family scale parameter, not
             // via the whitening transform here. `Known(1.0)` matches the
             // pre-refactor behaviour for this code path.
-            dispersion: crate::solver::estimate::Dispersion::Known(1.0),
+            dispersion: crate::model_types::Dispersion::Known(1.0),
             n_samples,
             dim: n_beta,
         };

@@ -142,9 +142,9 @@ crate::impl_reason_error_boilerplate! {
 // `Result<_, SurvivalPredictError>` call sites can propagate with `?`.
 // Survival prediction keeps the model-layer source so the chain identifies
 // the payload/schema failure that triggered the prediction error.
-impl From<FittedModelError> for crate::solver::estimate::EstimationError {
+impl From<FittedModelError> for crate::model_types::EstimationError {
     fn from(err: FittedModelError) -> Self {
-        crate::solver::estimate::EstimationError::InvalidInput(err.to_string())
+        crate::model_types::EstimationError::InvalidInput(err.to_string())
     }
 }
 
