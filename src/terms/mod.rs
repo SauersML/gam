@@ -1,6 +1,5 @@
 pub mod analytic_penalties;
 pub mod basis;
-pub(crate) mod coefficient_group_resolver;
 pub mod construction;
 pub mod decoders;
 pub mod dictionary;

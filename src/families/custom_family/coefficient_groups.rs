@@ -133,7 +133,9 @@ pub fn realize_coefficient_groups_for_custom_family(
     groups: &[CoefficientGroupSpec],
     base_prior: crate::types::RhoPrior,
 ) -> Result<RealizedCoefficientGroupSpecs, String> {
-    use crate::terms::coefficient_group_resolver::{ResolvedGroup, ResolvedGroupHierarchy};
+    use crate::terms::structure::coefficient_group_resolver::{
+        ResolvedGroup, ResolvedGroupHierarchy,
+    };
 
     validate_blockspecs(specs)?;
     // Carrier-specific validation. The prior and the custom-only
