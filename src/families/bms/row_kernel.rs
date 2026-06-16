@@ -496,6 +496,48 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         ))
     }
 
+    fn jacobian_action_matrix_rows(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        start: usize,
+        end: usize,
+    ) -> Array2<f64> {
+        let p_total = self.slices.total;
+        if factor.nrows() != p_total {
+            return crate::families::row_kernel::row_kernel_jacobian_action_matrix_generic_rows(
+                self, factor, start, end,
+            );
+        }
+        let b = end.saturating_sub(start);
+        let rank = factor.ncols();
+        let f_marg = factor
+            .slice(s![self.slices.marginal.clone(), ..])
+            .as_standard_layout()
+            .into_owned();
+        let f_logs = factor
+            .slice(s![self.slices.logslope.clone(), ..])
+            .as_standard_layout()
+            .into_owned();
+        let jf_marg = crate::families::row_kernel::row_kernel_design_jf_rows(
+            &self.family.marginal_design,
+            f_marg.view(),
+            start,
+            end,
+        );
+        let jf_logs = crate::families::row_kernel::row_kernel_design_jf_rows(
+            &self.family.logslope_design,
+            f_logs.view(),
+            start,
+            end,
+        );
+
+        crate::families::row_kernel::row_kernel_pack_jf_axes::<2>(
+            b,
+            rank,
+            [(0, jf_marg), (1, jf_logs)],
+        )
+    }
+
     /// BLAS-3 override of the first directional derivative of the dense joint
     /// Hessian for the rigid marginal-slope kernel (see the trait default for
     /// the cost argument). The rigid row pullback is a pure pair of design-row

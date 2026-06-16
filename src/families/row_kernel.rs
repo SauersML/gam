@@ -440,8 +440,9 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// inner joint-Newton `hessian_qp` cost). A kernel whose pullback is a pure
     /// design-row Gram (no structured cross terms) can instead accumulate the
     /// per-row contraction weights over a row chunk and close each chunk with a
-    /// `Xᵀ diag(w) X` BLAS-3 product. The default returns `None`, preserving the
-    /// exact generic per-row path for every other kernel bit-for-bit.
+    /// `Xᵀ diag(w) X` BLAS-3 product. The default returns the exact generic
+    /// per-row path; overrides return `None` only for row sets they explicitly
+    /// decline.
     ///
     /// `rows == RowSet::All` is the only case an override should claim; under a
     /// subsample / non-unit-weight `RowSet` the override must return `None` so
@@ -477,8 +478,9 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// arms (gam#979). For a kernel whose pullback is a pure design-row Gram the
     /// per-row third tensor is INDEPENDENT of the swept axis, so it is built once
     /// and each axis closed with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs. The
-    /// default returns `None`, preserving the exact generic per-axis path
-    /// bit-for-bit. Overrides should claim only the full-data unit-weight
+    /// default declines this batched optimization, so the dispatcher runs the
+    /// exact generic per-axis path bit-for-bit. Overrides should claim only the
+    /// full-data unit-weight
     /// `RowSet::All` case; under a subsample / non-unit-weight `RowSet` return
     /// `None` so the generic Horvitz-Thompson per-row path runs per axis.
     ///
@@ -521,10 +523,11 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// observed joint Hessian, then its directional derivatives). A kernel whose
     /// pullback is a pure design-row Gram can instead gather the per-row
     /// contraction weights and close each row chunk with `Xᵀ diag(w) X`
-    /// BLAS-3 products. The default returns `None`, preserving the exact generic
-    /// per-row path for every other kernel bit-for-bit. Overrides should claim
-    /// only the full-data unit-weight `RowSet::All` case; under a subsample /
-    /// non-unit-weight `RowSet` return `None` so the generic HT path runs.
+    /// BLAS-3 products. The default returns the exact generic per-row path;
+    /// overrides return `None` only for row sets they explicitly decline.
+    /// Overrides should claim only the full-data unit-weight `RowSet::All` case;
+    /// under a subsample / non-unit-weight `RowSet` return `None` so the generic
+    /// HT path runs.
     fn hessian_dense_override(
         &self,
         rows: &RowSet,

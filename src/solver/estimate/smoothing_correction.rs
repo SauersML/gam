@@ -237,6 +237,11 @@ pub(crate) fn smooth_floor_dp(dp: f64, scale: f64) -> (f64, f64, f64) {
 pub(crate) struct SmoothingCorrectionComputation {
     pub correction: Option<Array2<f64>>,
     pub hessian_rho: Option<Array2<f64>>,
+    /// Regularized inverse outer Hessian `Cov(rho_hat)` in the same rho ordering
+    /// as the fitted smoothing-parameter vector. This exposes the #740 quantity
+    /// to LR Bartlett inference without changing the production algebra that
+    /// computes it.
+    pub rho_covariance: Option<Array2<f64>>,
     /// Identified-subspace rank of the rho-Hessian inverse used to build
     /// `correction`. `Some(n)` if the matrix was SPD and fully inverted;
     /// `Some(r)` with `r < n` if the pseudo-inverse dropped non-identified
@@ -664,6 +669,7 @@ pub(crate) fn compute_smoothing_correction(
         return SmoothingCorrectionComputation {
             correction: None,
             hessian_rho: None,
+            rho_covariance: None,
             active_rank: None,
         };
     }
@@ -713,6 +719,7 @@ pub(crate) fn compute_smoothing_correction(
         return SmoothingCorrectionComputation {
             correction: None,
             hessian_rho: None,
+            rho_covariance: None,
             active_rank: None,
         };
     }
@@ -725,6 +732,7 @@ pub(crate) fn compute_smoothing_correction(
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: None,
+                rho_covariance: None,
                 active_rank: None,
             };
         }
@@ -783,6 +791,7 @@ pub(crate) fn compute_smoothing_correction(
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: None,
+                rho_covariance: None,
                 active_rank: None,
             };
         }
@@ -803,6 +812,7 @@ pub(crate) fn compute_smoothing_correction(
             return SmoothingCorrectionComputation {
                 correction: None,
                 hessian_rho: None,
+                rho_covariance: None,
                 active_rank: None,
             };
         }
