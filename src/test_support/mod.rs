@@ -334,6 +334,15 @@ pub mod debug_stash {
         /// across ψ±eps is matched against `coord_a` to test probe (a) — does the
         /// `a` term carry the full likelihood/penalty-vs-ψ derivative at β̂.
         pub coord_cost: Option<f64>,
+        /// #740 gate-4 root-cause probe: the inner KKT residual inf-norm
+        /// `‖∇_β L_pen(β̂)‖∞` at the converged inner solve, and whether the
+        /// batched ENVELOPE-ONLY outer-gradient fast path fired (which DROPS the
+        /// KKT-residual β-response correction when the residual is judged
+        /// negligible). If the residual is materially nonzero while the batched
+        /// path fired, the ψ outer gradient silently loses the β-response — the
+        /// suspected source of the gate-4 ψ-gradient ≠ FD-of-value gap.
+        pub inner_kkt_residual_inf: Option<f64>,
+        pub batched_envelope_override_fired: Option<bool>,
     }
 
     thread_local! {
@@ -351,6 +360,8 @@ pub mod debug_stash {
             coord_log_det_h: None,
             coord_log_det_s: None,
             coord_cost: None,
+            inner_kkt_residual_inf: None,
+            batched_envelope_override_fired: None,
         }) };
     }
 
@@ -378,6 +389,25 @@ pub mod debug_stash {
     /// Drain the recorded `a`-channel split.
     pub fn take_a_split() -> Option<(f64, f64)> {
         A_SPLIT_SINK.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// #740 gate-4 root-cause probe sink: `(inner_kkt_residual_inf,
+    /// batched_envelope_override_fired)`. Written from the outer-objective
+    /// evaluator (possibly off the test thread) and read by the gate. Only set
+    /// while a [`CaptureGuard`] is live.
+    static KKT_PROBE_SINK: std::sync::Mutex<Option<(f64, bool)>> = std::sync::Mutex::new(None);
+
+    /// Record the inner KKT residual inf-norm and whether the batched
+    /// envelope-only outer-gradient override fired.
+    pub fn store_kkt_probe(residual_inf: f64, batched_override_fired: bool) {
+        if let Ok(mut slot) = KKT_PROBE_SINK.lock() {
+            *slot = Some((residual_inf, batched_override_fired));
+        }
+    }
+
+    /// Drain the recorded KKT-residual probe.
+    pub fn take_kkt_probe() -> Option<(f64, bool)> {
+        KKT_PROBE_SINK.lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// Replace the calling thread's `TermStash` with `stash`. Called by

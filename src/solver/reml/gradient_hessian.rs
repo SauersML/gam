@@ -2072,7 +2072,44 @@ impl<'a> RemlState<'a> {
     /// band. The correction value therefore vanishes continuously as a
     /// direction approaches the threshold, so the spliced objective is
     /// continuous to leading order and does not bias ρ selection.
+    /// Per-bundle-cached wrapper around [`Self::block_local_sampled_correction_compute`].
+    ///
+    /// The block-local correction is a deterministic function of this bundle's
+    /// converged inner state and ρ alone (mode-invariant, Hessian-free), but the
+    /// outer loop evaluates the objective at one ρ up to three times (value,
+    /// value+gradient, value+gradient+Hessian) sharing the SAME `bundle`. The
+    /// expensive engaged path (dense O(p³) eigendecomposition plus the
+    /// fixed-seed O(draws·n·m) importance sampler) therefore reran 2–3× per
+    /// outer iteration. Hoist it onto `bundle.block_local_correction` so it is
+    /// computed exactly once per inner solution and every consumer at that ρ
+    /// reads the identical value+gradient (exact hoist — #784, #1082). Keyed on
+    /// `n_ext`, which is fixed for a fit, so one cell suffices.
     pub(crate) fn block_local_sampled_correction(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        n_ext: usize,
+    ) -> Result<TkCorrectionTerms, EstimationError> {
+        if let Some((cached_ext, terms)) = bundle.block_local_correction.get()
+            && *cached_ext == n_ext
+        {
+            return Ok((**terms).clone());
+        }
+        let terms = self.block_local_sampled_correction_compute(rho, bundle, n_ext)?;
+        // First writer wins; a racing writer built from identical inputs, so
+        // either stored object is correct. A `set` that loses the race (cell
+        // already filled) is fine — both terms are equal — so the `Err` is
+        // discarded by returning the freshly computed `terms` either way.
+        match bundle
+            .block_local_correction
+            .set((n_ext, std::sync::Arc::new(terms.clone())))
+        {
+            Ok(()) => Ok(terms),
+            Err(_) => Ok(terms),
+        }
+    }
+
+    fn block_local_sampled_correction_compute(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
@@ -2128,7 +2165,7 @@ impl<'a> RemlState<'a> {
 
         // Step 1: per-direction skewness diagnostic γ_r.
         let (max_abs, directional) =
-            laplace_directional_cubic_diagnostic(h_total, x_design, c_weights)
+            laplace_directional_cubic_diagnostic(h_total, x_design, c_weights, false)
                 .map_err(EstimationError::InvalidInput)?;
         if !max_abs.is_finite() || max_abs == 0.0 {
             return Ok(zero());
@@ -3616,6 +3653,7 @@ impl<'a> RemlState<'a> {
             analytic_penalty_registry_fingerprint: 0,
             persistent_warm_start_loaded: AtomicBool::new(false),
             persistent_warm_start_store_suppression: AtomicUsize::new(0),
+            alo_stabilization_suppression: AtomicUsize::new(0),
             persistent_warm_start_disk_enabled: AtomicBool::new(false),
         })
     }
@@ -4692,6 +4730,30 @@ impl<'a> RemlState<'a> {
         out
     }
 
+    /// Run `f` with the Gaussian-identity ALO-stabilization augmentation
+    /// disabled (#979). Used to evaluate the genuine LAML criterion during
+    /// ρ-posterior certificate / NUTS sampling, where the optimizer-stability
+    /// leverage barrier (#813/#821) is both inappropriate (it is not part of the
+    /// marginal posterior, whose Laplace proposal uses the base REML Hessian)
+    /// and ruinously expensive (its full ALO diagnostic suite would run on every
+    /// leapfrog step). Re-entrant via a counter, like
+    /// [`Self::without_persistent_warm_start_store`].
+    pub(crate) fn without_alo_stabilization<T>(&self, f: impl FnOnce() -> T) -> T {
+        struct AloSuppressionGuard<'a>(&'a AtomicUsize);
+        impl Drop for AloSuppressionGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        self.alo_stabilization_suppression
+            .fetch_add(1, Ordering::Relaxed);
+        let guard = AloSuppressionGuard(&self.alo_stabilization_suppression);
+        let out = f();
+        drop(guard);
+        out
+    }
+
     /// Predict β at `new_rho` via the implicit-function-theorem first-order
     /// expansion
     /// `β_predict = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k(β_cur-μ_k))`,
@@ -5327,6 +5389,33 @@ impl<'a> RemlState<'a> {
         true
     }
 
+    /// Clear the ψ-keyed Gaussian sufficient-statistics cache (`XᵀWX(ψ)`,
+    /// `XᵀW(y−offset)(ψ)`) and its conditioned-frame ψ-derivative pair (#1033).
+    ///
+    /// Both slots are keyed to a SPECIFIC trial ψ from the certified ψ-Gram
+    /// tensor. The slow path nulls them inside [`Self::reset_surface`], but the
+    /// design-revision fast path skips `reset_surface`, so a trial that lands
+    /// OFF the certified ψ-window (or otherwise cannot re-install) must clear
+    /// the previous in-window ψ's Gram explicitly — otherwise the inner
+    /// Gaussian PLS would read a STALE Gram keyed to the wrong ψ. With the slot
+    /// cleared the inner solver restreams the exact Gram for this trial's
+    /// design, as it does whenever no tensor is installed.
+    pub(crate) fn clear_gaussian_fixed_cache(&self) {
+        *self.gaussian_fixed_cache.write().unwrap() = None;
+        *self.gaussian_psi_gram_deriv.write().unwrap() = None;
+    }
+
+    /// Clear ONLY the conditioned-frame Gaussian ψ-derivative pair (#1033),
+    /// keeping the value-lane `gaussian_fixed_cache` intact. Used when a trial's
+    /// ψ lies inside the certified VALUE window (so the n-free Gram is sound)
+    /// but OUTSIDE the narrower certified GRADIENT sub-window: the value cache
+    /// stays, but a derivative pair keyed to a prior in-sub-window ψ must be
+    /// dropped so the gradient lane falls back to the exact ∂X/∂ψ slab for this
+    /// trial instead of reading a stale derivative on the fast path.
+    pub(crate) fn clear_gaussian_psi_gram_deriv(&self) {
+        *self.gaussian_psi_gram_deriv.write().unwrap() = None;
+    }
+
     /// Conditioned-frame exact ψ-derivative pair, when installed for the
     /// current in-window Gaussian trial (#1033b). `None` keeps the slab path.
     pub(crate) fn gaussian_psi_gram_deriv(
@@ -5603,6 +5692,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
+            block_local_correction: std::sync::OnceLock::new(),
         })
     }
 
@@ -5736,6 +5826,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
+            block_local_correction: std::sync::OnceLock::new(),
         })
     }
 

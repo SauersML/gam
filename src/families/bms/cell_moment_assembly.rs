@@ -381,17 +381,24 @@ impl BernoulliMarginalSlopeFamily {
         let sign = 2.0 * self.y[row] - 1.0;
         let observed_eta = a + observed_slope * z;
         let m_signed = sign * observed_eta;
-        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m_signed);
-        if !logcdf.is_finite() {
+        // ONE transcendental per row: fused logΦ + k1..k2 from a single
+        // Mills-ratio evaluation (bit-identical to the prior two-call form;
+        // the weight `w` is already folded into stack[1..] as before).
+        if !(m_signed.is_finite() || m_signed == f64::INFINITY) {
+            return Err(format!(
+                "empirical rigid closed-form: non-finite signed margin {m_signed} at row {row}"
+            ));
+        }
+        let stack = signed_probit_neglog_unary_stack(m_signed, w);
+        if !stack[0].is_finite() {
             return Err(format!(
                 "empirical rigid closed-form: non-finite log Φ at row {row}"
             ));
         }
-        let (k1, k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(m_signed, w)?;
-        let u1 = sign * k1;
-        let u2 = k2;
+        let u1 = sign * stack[1];
+        let u2 = stack[2];
 
-        let neglog = -w * logcdf;
+        let neglog = stack[0];
         let grad = [u1 * eta_m, u1 * eta_g];
         let h_mm = u2 * eta_m * eta_m + u1 * a_mm;
         let h_mg = u2 * eta_m * eta_g + u1 * a_mg;
@@ -1218,18 +1225,95 @@ impl BernoulliMarginalSlopeFamily {
         row: usize,
     ) -> Result<&'a [[[f64; 2]; 2]; 2], String> {
         let stored = cache.rigid_third_full.get_or_compute(|| {
-            (0..self.y.len())
-                .into_par_iter()
-                .map(|r| {
-                    let marginal_eta = block_states[0].eta[r];
-                    let marginal = self.marginal_link_map(marginal_eta)?;
-                    let slope = block_states[1].eta[r];
-                    self.rigid_row_third_full(r, marginal, slope)
-                })
-                .collect::<Result<Vec<_>, String>>()
+            self.build_rigid_full_tensor_table(
+                block_states,
+                |r, marginal, slope| self.rigid_row_third_full(r, marginal, slope),
+                |tower| tower.t3,
+            )
         });
         let table = stored.as_ref().map_err(|err| err.clone())?;
         Ok(&table[row])
+    }
+
+    /// Build the per-row rigid full-derivative tensor table over all `n` rows.
+    ///
+    /// For the `StandardNormal` latent measure (the kernel the conditional
+    /// location-scale gate always selects) every row routes through the closed
+    /// `Tower4<2>` jet, so this fast-paths the whole-`n` build through the
+    /// chunked, SIMD-friendly [`rigid_standard_normal_towers_batch`]: it isolates
+    /// the one branchy transcendental per row from the dense branch-free tensor
+    /// assembly, making the build memory-bandwidth- rather than scalar-ALU-bound.
+    /// `extract` reads the consumer's tensor (`.t3`/`.t4`) off the finished jet.
+    ///
+    /// Any empirical-grid measure keeps the exact per-row dispatch (`row_fn`),
+    /// which carries the implicit-function-theorem closed forms. Both arms are
+    /// bit-identical to the prior per-row `into_par_iter().map(row_fn)` build.
+    fn build_rigid_full_tensor_table<T, R, E>(
+        &self,
+        block_states: &[ParameterBlockState],
+        row_fn: R,
+        extract: E,
+    ) -> Result<Vec<T>, String>
+    where
+        T: Copy + Send + Default,
+        R: Fn(usize, BernoulliMarginalLinkMap, f64) -> Result<T, String> + Sync,
+        E: Fn(&crate::families::jet_tower::Tower4<2>) -> T + Sync,
+    {
+        let n = self.y.len();
+        let marginal_eta = &block_states[0].eta;
+        let slope_eta = &block_states[1].eta;
+        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
+            return (0..n)
+                .into_par_iter()
+                .map(|r| {
+                    let marginal = self.marginal_link_map(marginal_eta[r])?;
+                    row_fn(r, marginal, slope_eta[r])
+                })
+                .collect::<Result<Vec<_>, String>>();
+        }
+
+        // Standard-normal whole-`n` chunked batch build.
+        const ROW_CHUNK: usize = 256;
+        let probit_scale = self.probit_frailty_scale();
+        let n_chunks = n.div_ceil(ROW_CHUNK).max(1);
+        let chunk_results: Result<Vec<Vec<T>>, String> = (0..n_chunks)
+            .into_par_iter()
+            .map(|c| {
+                let lo = c * ROW_CHUNK;
+                let hi = (lo + ROW_CHUNK).min(n);
+                let len = hi - lo;
+                let mut marginals: Vec<BernoulliMarginalLinkMap> = Vec::with_capacity(len);
+                let mut slopes: Vec<f64> = Vec::with_capacity(len);
+                let mut zs: Vec<f64> = Vec::with_capacity(len);
+                let mut ys: Vec<f64> = Vec::with_capacity(len);
+                let mut ws: Vec<f64> = Vec::with_capacity(len);
+                for r in lo..hi {
+                    marginals.push(self.marginal_link_map(marginal_eta[r])?);
+                    slopes.push(slope_eta[r]);
+                    zs.push(self.z[r]);
+                    ys.push(self.y[r]);
+                    ws.push(self.weights[r]);
+                }
+                let mut out = vec![T::default(); len];
+                rigid_standard_normal_towers_batch(
+                    &marginals,
+                    &slopes,
+                    &zs,
+                    &ys,
+                    &ws,
+                    probit_scale,
+                    &mut out,
+                    |tower| Ok(extract(tower)),
+                )?;
+                Ok(out)
+            })
+            .collect();
+        let chunks = chunk_results?;
+        let mut table: Vec<T> = Vec::with_capacity(n);
+        for chunk in chunks {
+            table.extend(chunk);
+        }
+        Ok(table)
     }
 
     /// Look up the per-row rigid uncontracted fourth-derivative tensor.
@@ -1246,15 +1330,11 @@ impl BernoulliMarginalSlopeFamily {
         row: usize,
     ) -> Result<&'a [[[[f64; 2]; 2]; 2]; 2], String> {
         let stored = cache.rigid_fourth_full.get_or_compute(|| {
-            (0..self.y.len())
-                .into_par_iter()
-                .map(|r| {
-                    let marginal_eta = block_states[0].eta[r];
-                    let marginal = self.marginal_link_map(marginal_eta)?;
-                    let slope = block_states[1].eta[r];
-                    self.rigid_row_fourth_full(r, marginal, slope)
-                })
-                .collect::<Result<Vec<_>, String>>()
+            self.build_rigid_full_tensor_table(
+                block_states,
+                |r, marginal, slope| self.rigid_row_fourth_full(r, marginal, slope),
+                |tower| tower.t4,
+            )
         });
         let table = stored.as_ref().map_err(|err| err.clone())?;
         Ok(&table[row])
@@ -1767,13 +1847,17 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
-        let row_weights =
-            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n);
         // Per-row HT weighting: each row's (obj, grad, hess) is multiplied by
         // its inverse-inclusion weight `w_i` *before* accumulation, so the
         // final operator is the unbiased Horvitz-Thompson estimator. A single
         // post-sum scalar is biased under stratified subsampling because
-        // per-stratum sampling fractions differ.
+        // per-stratum sampling fractions differ. In the full-data path every
+        // `w_i == 1.0`, so we skip the dense O(n) weight vector entirely (it
+        // is otherwise re-allocated and zero-filled on every outer eval over
+        // n≈3e5 rows) and the per-row scaling becomes a no-op.
+        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
+            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n)
+        });
         let (objective_psi, score_psi, acc) = chunked_row_reduction(
             row_iter.as_slice(),
             || {
@@ -1786,11 +1870,13 @@ impl BernoulliMarginalSlopeFamily {
             |row, acc| -> Result<(), String> {
                 let (mut obj, mut grad, mut hess) =
                     self.row_sigma_primary_terms(row, block_states, false)?;
-                let w = row_weights[row];
-                if w != 1.0 {
-                    obj *= w;
-                    grad.mapv_inplace(|v| v * w);
-                    hess.mapv_inplace(|v| v * w);
+                if let Some(ref weights) = row_weights {
+                    let w = weights[row];
+                    if w != 1.0 {
+                        obj *= w;
+                        grad.mapv_inplace(|v| v * w);
+                        hess.mapv_inplace(|v| v * w);
+                    }
                 }
                 acc.0 += obj;
                 self.accumulate_rigid_sigma_pullback(
@@ -1840,8 +1926,11 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let n = self.y.len();
         let row_iter = outer_row_indices(options, n).to_vec();
-        let row_weights =
-            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n);
+        // Full-data path carries `w_i == 1.0` for every row, so skip the dense
+        // O(n) HT-weight vector (see `sigma_exact_joint_psi_terms_with_options`).
+        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
+            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n)
+        });
         let (objective_psi_psi, score_psi_psi, acc) = chunked_row_reduction(
             row_iter.as_slice(),
             || {
@@ -1854,11 +1943,13 @@ impl BernoulliMarginalSlopeFamily {
             |row, acc| -> Result<(), String> {
                 let (mut obj, mut grad, mut hess) =
                     self.row_sigma_primary_terms(row, block_states, true)?;
-                let w = row_weights[row];
-                if w != 1.0 {
-                    obj *= w;
-                    grad.mapv_inplace(|v| v * w);
-                    hess.mapv_inplace(|v| v * w);
+                if let Some(ref weights) = row_weights {
+                    let w = weights[row];
+                    if w != 1.0 {
+                        obj *= w;
+                        grad.mapv_inplace(|v| v * w);
+                        hess.mapv_inplace(|v| v * w);
+                    }
                 }
                 acc.0 += obj;
                 self.accumulate_rigid_sigma_pullback(
@@ -1920,8 +2011,11 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = primary_slices(&slices);
         let row_iter = outer_row_indices(options, n).to_vec();
-        let row_weights =
-            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n);
+        // Full-data path carries `w_i == 1.0` for every row, so skip the dense
+        // O(n) HT-weight vector (see `sigma_exact_joint_psi_terms_with_options`).
+        let row_weights = options.outer_score_subsample.as_ref().map(|_| {
+            crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n)
+        });
         // Sigma scale jets and the zero primary direction are constant across
         // rows; resolve once outside the fold. The shared
         // `directional_obj_grad_hess` sweep differentiates *through* the fixed
@@ -1952,9 +2046,11 @@ impl BernoulliMarginalSlopeFamily {
                     },
                 )?;
                 let mut hess = terms.hess;
-                let w = row_weights[row];
-                if w != 1.0 {
-                    hess.mapv_inplace(|v| v * w);
+                if let Some(ref weights) = row_weights {
+                    let w = weights[row];
+                    if w != 1.0 {
+                        hess.mapv_inplace(|v| v * w);
+                    }
                 }
                 acc.add_pullback(self, row, &slices, &primary, &hess);
                 Ok(())

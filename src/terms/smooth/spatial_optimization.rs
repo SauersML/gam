@@ -1209,16 +1209,34 @@ macro_rules! impl_exact_joint_theta_memo {
 }
 
 
-#[derive(Debug)]
 struct SingleBlockExactJointDesignCache<'d> {
     realizer: FrozenTermCollectionIncrementalRealizer<'d>,
     current_theta: Option<Array1<f64>>,
+    // Memo key for `last_cost`/`last_eval`. Distinct from `current_theta` (which
+    // tracks the θ the n×k design is REALIZED at): on the #1033 certified
+    // Gaussian path `eval_full` evaluates a trial ψ WITHOUT re-realizing the
+    // design (the tensor serves value+gradient n-free), so the eval θ and the
+    // realized-design θ diverge. Keying the memo on a dedicated field keeps a
+    // ψ-skip from ever mis-associating one ψ's cost/eval with another ψ's key.
+    last_eval_theta: Option<Array1<f64>>,
     last_cost: Option<f64>,
     last_eval: Option<(
         f64,
         Array1<f64>,
         crate::solver::outer_strategy::HessianResult,
     )>,
+    // #1033: ψ-invariant hyper-direction slab cache. The κ hyper_dirs (the n×k
+    // ∂X/∂ψ design-derivative slabs + their k×k penalty derivatives) are a pure
+    // function of (data, frozen spec, REALIZED column layout) — they do NOT
+    // depend on the trial ψ once the design is fixed. On the certified Gaussian
+    // n-free path `eval_full` evaluates trial ψ WITHOUT re-realizing the design,
+    // so the realized layout (and hence the hyper_dirs) is identical across an
+    // entire run of skip-path trials. Rebuilding them each trial re-runs the
+    // basis ψ-derivative over all n rows + an O(n·k²) `fast_ab` rotation — the
+    // last per-trial O(n) pass in the κ loop. Cache them keyed by the realizer
+    // `design_revision`: a skip-path trial (revision unchanged) reuses the
+    // build; a slow-path trial (revision advanced) rebuilds and re-keys.
+    cached_hyper_dirs: Option<(u64, Vec<DirectionalHyperParam>)>,
     spatial_terms: Vec<usize>,
     rho_dim: usize,
     dims_per_term: Vec<usize>,
@@ -1237,8 +1255,10 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         Ok(Self {
             realizer: FrozenTermCollectionIncrementalRealizer::new(data, spec, design)?,
             current_theta: None,
+            last_eval_theta: None,
             last_cost: None,
             last_eval: None,
+            cached_hyper_dirs: None,
             spatial_terms,
             rho_dim,
             dims_per_term,
@@ -1247,6 +1267,43 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
 
     fn design_revision(&self) -> u64 {
         self.realizer.design_revision()
+    }
+
+    /// Build the κ hyper-directions for the CURRENT realized design, reusing the
+    /// `cached_hyper_dirs` slab when the realizer revision has not advanced since
+    /// the last build (#1033). The slab is ψ-invariant at a fixed realized
+    /// layout, so a skip-path trial (which does not re-realize the design) gets a
+    /// bit-identical clone instead of re-running the per-row basis ψ-derivative +
+    /// O(n·k²) rotation. A revision change (slow-path re-realization) rebuilds and
+    /// re-keys. The clone is an O(n·k) memcpy — far cheaper than the O(n·k²)
+    /// rebuild, and the conditioning pass it feeds is itself skipped on the
+    /// certified path (see `prepare_eval_state`'s fast path).
+    fn hyper_dirs_for_current_design(
+        &mut self,
+        data: ArrayView2<'_, f64>,
+        kind: SpatialHyperKind,
+    ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
+        let revision = self.realizer.design_revision();
+        if let Some((cached_rev, dirs)) = self.cached_hyper_dirs.as_ref()
+            && *cached_rev == revision
+        {
+            return Ok(dirs.clone());
+        }
+        let dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data,
+            self.realizer.spec(),
+            self.realizer.design(),
+            &self.spatial_terms,
+        )?
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "failed to build {} hyper_dirs at current {}",
+                kind.adjective(),
+                kind.coord_name(),
+            ))
+        })?;
+        self.cached_hyper_dirs = Some((revision, dirs.clone()));
+        Ok(dirs)
     }
 
     fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
@@ -1271,15 +1328,78 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
             t_ensure.elapsed().as_secs_f64(),
         );
         self.current_theta = Some(theta.clone());
+        self.last_eval_theta = None;
         self.last_cost = None;
         self.last_eval = None;
         Ok(())
     }
 
-    impl_exact_joint_theta_memo!();
+    // Memo methods keyed on `last_eval_theta` (NOT `current_theta`): the #1033
+    // certified Gaussian path evaluates a trial ψ without re-realizing the
+    // design, so the eval θ and the realized-design θ can differ. Keying the
+    // memo on the eval θ keeps a ψ-skip from mis-associating one ψ's result
+    // with another ψ's key. The other exact-joint caches still use the shared
+    // `impl_exact_joint_theta_memo!` macro (they always realize before eval).
+    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
+        if self
+            .last_eval_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval
+                .as_ref()
+                .map(|cached| cached.0)
+                .or(self.last_cost)
+        } else {
+            None
+        }
+    }
 
-    fn store_cost(&mut self, cost: f64) {
+    fn memoized_eval(
+        &self,
+        theta: &Array1<f64>,
+    ) -> Option<(
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    )> {
+        if self
+            .last_eval_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Record an eval result keyed to the θ it was computed at. Used in place of
+    /// the macro's `store_eval` so the memo key reflects the EVAL θ even when the
+    /// design was not re-realized at that θ (#1033 certified skip).
+    fn store_eval_at(
+        &mut self,
+        theta: &Array1<f64>,
+        eval: (
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        ),
+    ) {
+        self.last_eval_theta = Some(theta.clone());
+        self.last_cost = Some(eval.0);
+        self.last_eval = Some(eval);
+    }
+
+    /// Record a cost-only result keyed to the θ it was computed at, so
+    /// `memoized_cost` keys on the EVAL θ (matching `store_eval_at`).
+    fn store_cost_at(&mut self, theta: &Array1<f64>, cost: f64) {
+        self.last_eval_theta = Some(theta.clone());
         self.last_cost = Some(cost);
+        // A cost-only probe carries no gradient/Hessian, so drop any prior
+        // full eval: `memoized_cost` prefers `last_eval.0`, and a stale
+        // `last_eval` from a different θ must never answer for this θ.
+        self.last_eval = None;
     }
 
     fn spec(&self) -> &TermCollectionSpec {
@@ -2296,36 +2416,67 @@ impl<'d> SpatialJointContext<'d> {
                 return Ok(eval);
             }
         }
-        self.cache
-            .ensure_theta(theta)
-            .map_err(EstimationError::InvalidInput)?;
         let kind = self.kind;
+        // #1033: the per-trial n×k design re-realization (`ensure_theta` →
+        // `apply_log_kappa`) plus the downstream n-row reconditioning
+        // (`reset_surface`) are the LAST n-passes in the certified κ loop. They
+        // are redundant on the Gaussian-identity certified path: the inner
+        // Gaussian PLS reads its `XᵀWX(ψ)/XᵀW(y−offset)(ψ)` entirely from the
+        // ψ-keyed `GaussianFixedCache` the certified tensor installs (zero row
+        // access), and the ψ-gradient HyperCoord is served from the k-space
+        // `(∂G/∂ψ, ∂b/∂ψ)` tensor derivatives — never the n×k ∂X/∂ψ slab. So when
+        //   (a) this is the single design-moving ψ coordinate (`rho_dim + 1`),
+        //   (b) the certified ψ-Gram tensor covers ψ for BOTH the value lane
+        //       (`psi_gram_tensor_covers`) AND the gradient sub-window
+        //       (`psi_gram_tensor_covers_gradient`) — so neither channel reads
+        //       the realized rows,
+        //   (c) this eval is gradient-only (`!allow_second_order`) — the exact
+        //       outer-Hessian `B_j` path DOES read the slab, so a Hessian trial
+        //       must keep a faithful (freshly realized) design, and
+        //   (d) the evaluator's design-revision fast path is ARMED at the
+        //       current realizer revision (`design_revision_fast_path_armed`) —
+        //       i.e. a prior slow-path eval already pinned a faithful reference
+        //       surface at this revision, which `prepare_eval_state` will reuse
+        //       while re-installing the ψ-keyed cache,
+        // we SKIP `ensure_theta`. The realizer revision then does not advance, so
+        // `prepare_eval_state` takes its design-revision fast path: it skips
+        // `reset_surface` + the n×k `apply_to_design`, keeps the (intentionally
+        // stale) reference surface, and re-keys the `GaussianFixedCache` to this
+        // ψ. The hyper_dirs built below are a pure function of (data, frozen
+        // spec, column layout) — ψ-invariant — so they are bit-identical whether
+        // or not the design was re-realized, and the tensor branch never reads
+        // their n×k slab anyway. Net: criterion + gradient + inner solve come
+        // from k-space statistics only, with no per-trial O(n·k) pass.
+        //
+        // When ANY gate clause fails (non-Gaussian, off-window, off the gradient
+        // sub-window, a Hessian eval, or the fast path not yet armed) we realize
+        // the design as before so the slow path rebuilds a faithful surface — the
+        // existing exact lane runs UNCHANGED.
+        let skip_design_realization = !allow_second_order
+            && theta.len() == self.rho_dim + 1
+            && {
+                let psi = theta[self.rho_dim];
+                self.evaluator.psi_gram_tensor_covers(psi)
+                    && self.evaluator.psi_gram_tensor_covers_gradient(psi)
+                    && self
+                        .evaluator
+                        .design_revision_fast_path_armed(self.cache.design_revision())
+            };
+        if skip_design_realization {
+            log::debug!(
+                "[STAGE] {} eval_full at psi={:.6}: skipping n×k design re-realization \
+                 + reconditioning — criterion/gradient/inner-solve served n-free from \
+                 the certified ψ-gram tensor (GaussianFixedCache + k-space ψ-derivatives)",
+                kind.label(),
+                theta[self.rho_dim],
+            );
+        } else {
+            self.cache
+                .ensure_theta(theta)
+                .map_err(EstimationError::InvalidInput)?;
+        }
         let warm_beta = self.evaluator.current_beta();
         self.ensure_frozen_glm_tensor(theta, warm_beta.as_ref())?;
-        // #1033: when a certified ψ-Gram tensor covers this trial's ψ-window,
-        // the value and gradient channels can both be served n-free.  The value
-        // channel installs a `GaussianFixedCache` inside `prepare_eval_state`;
-        // the gradient channel assembles `(∂G/∂ψ, ∂b/∂ψ)` from k-space
-        // derivatives, making the n×k ∂X/∂ψ slabs below redundant.  Log both
-        // so the n-independence regression class is visible in the STAGE log
-        // instead of hiding in an unlogged per-trial design pass.
-        if theta.len() == self.rho_dim + 1 {
-            let psi = theta[self.rho_dim];
-            if self.evaluator.psi_gram_tensor_covers(psi) {
-                log::debug!(
-                    "[STAGE] {} eval_full at psi={psi:.6}: ψ-gram tensor covers the \
-                     value channel (GaussianFixedCache n-free)",
-                    kind.label(),
-                );
-            }
-            if self.evaluator.psi_gram_tensor_covers_gradient(psi) {
-                log::debug!(
-                    "[STAGE] {} eval_full at psi={psi:.6}: ψ-gram tensor serves the \
-                     gradient n-free (∂X/∂ψ slab redundant on this channel)",
-                    kind.label(),
-                );
-            }
-        }
         // #1111 / #1033 mechanism (c): when the certified frozen-weight GLM
         // ψ-tensor covers this trial's ψ AND the trial's converged working
         // weight has not drifted past tolerance from the frozen snapshot, the
@@ -2395,19 +2546,13 @@ impl<'d> SpatialJointContext<'d> {
             }
             self.evaluator.stage_glm_psi_gram_deriv(staged_deriv);
         }
-        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-            self.data,
-            self.cache.spec(),
-            self.cache.design(),
-            &self.cache.spatial_terms,
-        )?
-        .ok_or_else(|| {
-            EstimationError::InvalidInput(format!(
-                "failed to build {} hyper_dirs at current {}",
-                kind.adjective(),
-                kind.coord_name(),
-            ))
-        })?;
+        // #1033: reuse the ψ-invariant hyper-direction slab when the realized
+        // design has not advanced (the certified Gaussian skip path never
+        // re-realizes it), retiring the per-trial basis ψ-derivative + O(n·k²)
+        // rotation rebuild. A slow-path trial advances the revision and rebuilds.
+        let hyper_dirs = self
+            .cache
+            .hyper_dirs_for_current_design(self.data, kind)?;
 
         let design_revision = Some(self.cache.design_revision());
         // Warm-start PIRLS from the previous outer step's converged β. This is
@@ -2431,7 +2576,7 @@ impl<'d> SpatialJointContext<'d> {
             design_revision,
         );
         if let Ok(ref value) = eval {
-            self.cache.store_eval(value.clone());
+            self.cache.store_eval_at(theta, value.clone());
         }
         eval
     }
@@ -2507,7 +2652,30 @@ impl<'d> SpatialJointContext<'d> {
                     .sqrt()
             })
             .unwrap_or(f64::NAN);
-        if self.cache.ensure_theta(theta).is_err() {
+        // #1033: a VALUE-only line-search probe needs only the certified ψ-Gram
+        // tensor's value lane (`XᵀWX(ψ)/XᵀW(y−offset)(ψ)`), which the inner
+        // Gaussian PLS reads n-free from the ψ-keyed `GaussianFixedCache`. So when
+        // the single design-moving ψ is covered for the VALUE lane and the
+        // evaluator's design-revision fast path is armed at the current realizer
+        // revision, skip the n×k design re-realization: the realizer revision
+        // stays pinned, `evaluate_cost_only` takes its `prepare_eval_state_cost_only`
+        // fast path (which skips `reset_surface` + the n×k `apply_to_design` and
+        // re-keys the cache to this probe's ψ), and the probe cost comes from
+        // k-space statistics only. Line-search probes are the bulk of the κ-loop
+        // per-trial work, so this is the dominant n-flat lever. Unlike the
+        // gradient path the value lane spans the FULL certified window, so only
+        // `psi_gram_tensor_covers` (not the narrower gradient sub-window) is
+        // required. Any miss (non-Gaussian, off-window, fast path not yet armed)
+        // realizes the design and runs the exact streamed probe unchanged.
+        let skip_value_realization = theta.len() == self.rho_dim + 1
+            && {
+                let psi = theta[self.rho_dim];
+                self.evaluator.psi_gram_tensor_covers(psi)
+                    && self
+                        .evaluator
+                        .design_revision_fast_path_armed(self.cache.design_revision())
+            };
+        if !skip_value_realization && self.cache.ensure_theta(theta).is_err() {
             return f64::INFINITY;
         }
         let design_revision = Some(self.cache.design_revision());
@@ -2534,7 +2702,7 @@ impl<'d> SpatialJointContext<'d> {
                      cost={cost:.6e} trial_theta_distance={psi_distance:.3e}",
                     probe_start.elapsed().as_secs_f64(),
                 );
-                self.cache.store_cost(cost);
+                self.cache.store_cost_at(theta, cost);
                 cost
             }
             Err(_) => f64::INFINITY,
@@ -2543,6 +2711,7 @@ impl<'d> SpatialJointContext<'d> {
 
     fn reset(&mut self) {
         self.cache.current_theta = None;
+        self.cache.last_eval_theta = None;
         self.cache.last_cost = None;
         self.cache.last_eval = None;
     }
@@ -5252,7 +5421,9 @@ where
         &[TermCollectionSpec],
         &[TermCollectionDesign],
     ) -> Result<crate::solver::outer_strategy::EfsEval, String>,
-    SeedFn: FnMut(&Array1<f64>) -> Result<(), EstimationError>,
+    SeedFn: FnMut(
+        &Array1<f64>,
+    ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>,
 {
     let n_blocks = block_specs.len();
     if block_term_indices.len() != n_blocks {

@@ -331,21 +331,30 @@ fn gam_competing_risks_cif_matches_lifelines_aalen_johansen_on_cirrhosis() {
     let death_indicator: Vec<f64> = event_code.iter().map(|&c| f64::from(c == 1.0)).collect();
     let tx_indicator: Vec<f64> = event_code.iter().map(|&c| f64::from(c == 2.0)).collect();
 
-    let h_death = cause_cumulative_hazard(
-        &headers,
-        &days,
-        &age_years,
-        &death_indicator,
-        &grid,
-        "death (D)",
-    );
-    let h_tx = cause_cumulative_hazard(
-        &headers,
-        &days,
-        &age_years,
-        &tx_indicator,
-        &grid,
-        "transplant (CL)",
+    // The two cause-specific Weibull hazard models are independent fits on the
+    // same covariates with different event indicators; running them concurrently
+    // halves the dominant fit cost and changes nothing each fit asserts.
+    let (h_death, h_tx) = rayon::join(
+        || {
+            cause_cumulative_hazard(
+                &headers,
+                &days,
+                &age_years,
+                &death_indicator,
+                &grid,
+                "death (D)",
+            )
+        },
+        || {
+            cause_cumulative_hazard(
+                &headers,
+                &days,
+                &age_years,
+                &tx_indicator,
+                &grid,
+                "transplant (CL)",
+            )
+        },
     );
 
     // Assemble per-subject CIF via gam's own competing-risks integrator, then

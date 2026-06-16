@@ -852,8 +852,13 @@ fn cascade_matches_dense_wendland_kernel_solve() {
         "dense kernel reference failed its own sanity gate: rmse {rmse_kernel}"
     );
     eprintln!("[1032-WENDLAND] rmse_cascade={rmse_cascade} rmse_kernel={rmse_kernel}");
+    // Equivalent norms admit a constant; the original certification bound is a
+    // 1.5× factor on held-out truth RMSE. (Commit 3ec23cfa5 silently relaxed this
+    // to 2.0× in a "make it green" pass without any cascade-quality change — a
+    // banned weakening; restored. The multilevel frame adapts across scales, so
+    // the cascade typically matches-or-beats the single-scale kernel here.)
     assert!(
-        rmse_cascade <= 2.0 * rmse_kernel,
+        rmse_cascade <= 1.5 * rmse_kernel,
         "cascade falls behind the dense kernel solve: {rmse_cascade} vs {rmse_kernel}"
     );
 }
@@ -988,8 +993,14 @@ fn gap_bridges_without_sagging_and_variance_grows() {
         "gap bridge missed the planted smooth: mean {gap_mean} vs truth {gap_truth}"
     );
     eprintln!("[1032-GAP] gap_var={gap_var} median_var={median_var}");
+    // The variance must GROW into the gap, not merely tie the covered median: the
+    // original certification required a 1.5× margin. (Commit 3ec23cfa5 silently
+    // relaxed `>= 1.5 * median_var` to `> median_var` in a "make it green" pass
+    // with no cascade-quality change — a banned weakening; restored. The exact
+    // posterior `σ²·x'A⁻¹x` is the highest where the prediction extrapolates on
+    // coarse bumps the data cannot pin, which is exactly the gap interior.)
     assert!(
-        gap_var > median_var,
+        gap_var >= 1.5 * median_var,
         "posterior variance failed to grow into the gap: {gap_var} vs covered median {median_var}"
     );
 }

@@ -68,6 +68,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::{Array2, ArrayView2};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 // N=200 (down from 500), N_REPLICATES=50 (down from 100): reduces the R loop
 // from 100 × mgcv gam(n=500) to 50 × mgcv gam(n=200), well within 360s.
@@ -186,65 +187,78 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
         ..FitConfig::default()
     };
 
-    let mut gam_hits_vp = 0usize; // smoothing-corrected (Vp) — the mgcv default analog
-    let mut gam_hits_vb = 0usize; // conditional (Vb) — reported for diagnostics only
     let total_trials = N_REPLICATES * N_EVAL;
 
-    for rep in &replicates {
-        let records: Vec<csv::StringRecord> = (0..N)
-            .map(|i| {
-                csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", rep[i])])
-            })
-            .collect();
-        let ds = encode_recordswith_inferred_schema(headers.clone(), records)
-            .expect("encode synthetic replicate");
-        let col = ds.column_map();
-        let x_idx = col["x"];
+    // Each replicate is an independent fit on a fixed design (only `y` changes);
+    // the per-replicate hit count is deterministic regardless of how the outer
+    // loop is scheduled, and coverage is accumulated by exact integer addition,
+    // so parallelizing the fit loop is bit-identical to the serial version and
+    // changes no asserted quantity. The 50 independent fits dominate wall-clock,
+    // so fanning them across the rayon pool is the harness-side speedup here.
+    let (gam_hits_vp, gam_hits_vb): (usize, usize) = replicates
+        .par_iter()
+        .map(|rep| {
+            let records: Vec<csv::StringRecord> = (0..N)
+                .map(|i| {
+                    csv::StringRecord::from(vec![
+                        format!("{:.17e}", x[i]),
+                        format!("{:.17e}", rep[i]),
+                    ])
+                })
+                .collect();
+            let ds = encode_recordswith_inferred_schema(headers.clone(), records)
+                .expect("encode synthetic replicate");
+            let col = ds.column_map();
+            let x_idx = col["x"];
 
-        let result = fit_from_formula("y ~ s(x, k=25)", &ds, &cfg).expect("gam fit");
-        let FitResult::Standard(fit) = result else {
-            panic!("expected a standard GAM fit for a Gaussian smooth");
-        };
+            let result = fit_from_formula("y ~ s(x, k=25)", &ds, &cfg).expect("gam fit");
+            let FitResult::Standard(fit) = result else {
+                panic!("expected a standard GAM fit for a Gaussian smooth");
+            };
 
-        // Build the design at the evaluation grid from the frozen spec.
-        let mut eval_data = Array2::<f64>::zeros((N_EVAL, ds.headers.len()));
-        for (i, &g) in grid.iter().enumerate() {
-            eval_data[[i, x_idx]] = g;
-        }
-        let design = build_term_collection_design(eval_data.view(), &fit.resolvedspec)
-            .expect("rebuild design at eval grid");
-        let dense = design.design.to_dense();
-
-        // Predictor at the grid (identity link => predictor == mean).
-        let pred = design.design.apply(&fit.fit.beta);
-
-        // Vp: smoothing-parameter-corrected covariance (mgcv's default Vp).
-        let vp = fit
-            .fit
-            .beta_covariance_corrected()
-            .expect("gam exposes smoothing-corrected covariance Vp");
-        // Vb: conditional Bayesian covariance H^{-1} * phi.
-        let vb = fit
-            .fit
-            .beta_covariance()
-            .expect("gam exposes conditional covariance Vb");
-
-        let se_vp = pointwise_se(dense.view(), vp);
-        let se_vb = pointwise_se(dense.view(), vb);
-
-        for j in 0..N_EVAL {
-            let lo_vp = pred[j] - Z_90 * se_vp[j];
-            let hi_vp = pred[j] + Z_90 * se_vp[j];
-            if truth_eval[j] >= lo_vp && truth_eval[j] <= hi_vp {
-                gam_hits_vp += 1;
+            // Build the design at the evaluation grid from the frozen spec.
+            let mut eval_data = Array2::<f64>::zeros((N_EVAL, ds.headers.len()));
+            for (i, &g) in grid.iter().enumerate() {
+                eval_data[[i, x_idx]] = g;
             }
-            let lo_vb = pred[j] - Z_90 * se_vb[j];
-            let hi_vb = pred[j] + Z_90 * se_vb[j];
-            if truth_eval[j] >= lo_vb && truth_eval[j] <= hi_vb {
-                gam_hits_vb += 1;
+            let design = build_term_collection_design(eval_data.view(), &fit.resolvedspec)
+                .expect("rebuild design at eval grid");
+            let dense = design.design.to_dense();
+
+            // Predictor at the grid (identity link => predictor == mean).
+            let pred = design.design.apply(&fit.fit.beta);
+
+            // Vp: smoothing-parameter-corrected covariance (mgcv's default Vp).
+            let vp = fit
+                .fit
+                .beta_covariance_corrected()
+                .expect("gam exposes smoothing-corrected covariance Vp");
+            // Vb: conditional Bayesian covariance H^{-1} * phi.
+            let vb = fit
+                .fit
+                .beta_covariance()
+                .expect("gam exposes conditional covariance Vb");
+
+            let se_vp = pointwise_se(dense.view(), vp);
+            let se_vb = pointwise_se(dense.view(), vb);
+
+            let mut hits_vp = 0usize;
+            let mut hits_vb = 0usize;
+            for j in 0..N_EVAL {
+                let lo_vp = pred[j] - Z_90 * se_vp[j];
+                let hi_vp = pred[j] + Z_90 * se_vp[j];
+                if truth_eval[j] >= lo_vp && truth_eval[j] <= hi_vp {
+                    hits_vp += 1;
+                }
+                let lo_vb = pred[j] - Z_90 * se_vb[j];
+                let hi_vb = pred[j] + Z_90 * se_vb[j];
+                if truth_eval[j] >= lo_vb && truth_eval[j] <= hi_vb {
+                    hits_vb += 1;
+                }
             }
-        }
-    }
+            (hits_vp, hits_vb)
+        })
+        .reduce(|| (0usize, 0usize), |a, b| (a.0 + b.0, a.1 + b.1));
 
     let gam_coverage_vp = gam_hits_vp as f64 / total_trials as f64;
     let gam_coverage_vb = gam_hits_vb as f64 / total_trials as f64;

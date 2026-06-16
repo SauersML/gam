@@ -972,7 +972,7 @@ fn closure_objective_delegates() {
         }),
         efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
-        seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<(), EstimationError>>,
+        seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
     };
     assert_eq!(obj.capability().n_params, 1);
@@ -1008,12 +1008,12 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         reset_fn: None::<fn(&mut Vec<f64>)>,
         efs_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         screening_proxy_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>>,
-        seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<(), EstimationError>>,
+        seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
     }
     .with_seed_inner_state(|state: &mut Vec<f64>, beta: &Array1<f64>| {
         state.extend(beta.iter().copied());
-        Ok(())
+        Ok(SeedOutcome::Installed)
     });
 
     let outcome = obj.seed_inner_state(&array![1.5, -2.0]).unwrap();
@@ -1073,7 +1073,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
             })
         }),
         screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
-        seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
+        seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
     };
     let mut bridge = OuterFixedPointBridge {
@@ -3087,7 +3087,7 @@ fn checkpointing_objective_persists_finite_evals() {
 #[test]
 fn checkpointing_objective_rejects_wrong_dim_on_decode() {
     // A payload from a 3-dim fit is invalid input for a 5-dim resume.
-    let bytes = encode_iterate(&array![1.0, 2.0, 3.0], None, 0.5, 0).expect("encode");
+    let bytes = encode_iterate(&array![1.0, 2.0, 3.0], None, None, 0.5, 0).expect("encode");
     assert!(decode_iterate(&bytes, 3).is_some());
     assert!(decode_iterate(&bytes, 5).is_none());
 }
@@ -3099,14 +3099,64 @@ fn iterate_payload_round_trips_beta() {
     // basin of quadratic attraction regardless of where ρ sits.
     let rho = array![10.0, -10.0, 5.0];
     let beta = array![0.12, -0.34, 0.56, 7.89];
-    let bytes = encode_iterate(&rho, Some(&beta), 1.0, 7).expect("encode");
+    let bytes = encode_iterate(&rho, Some(&beta), None, 1.0, 7).expect("encode");
     let decoded = decode_iterate(&bytes, rho.len()).expect("decode");
     assert_eq!(decoded.rho, rho.to_vec());
     assert_eq!(decoded.beta, beta.to_vec());
     // ρ-only writes (β = None) still encode but with an empty beta slot.
-    let ro_bytes = encode_iterate(&rho, None, 1.0, 7).expect("encode-rho-only");
+    let ro_bytes = encode_iterate(&rho, None, None, 1.0, 7).expect("encode-rho-only");
     let ro = decode_iterate(&ro_bytes, rho.len()).expect("decode-rho-only");
     assert!(ro.beta.is_empty());
+}
+
+#[test]
+fn iterate_payload_round_trips_converged_outer_hessian() {
+    // The converged outer curvature persists alongside (ρ, β) so the next
+    // structurally-matching fit can seed BFGS with H⁻¹ for a quasi-Newton
+    // first step instead of restarting from an unscaled identity metric.
+    let rho = array![0.5, -1.5];
+    let h = array![[4.0, 1.0], [1.0, 3.0]];
+    let bytes = encode_iterate(&rho, None, Some(&h), 1.0, 0).expect("encode");
+    let decoded = decode_iterate(&bytes, rho.len()).expect("decode");
+    assert_eq!(decoded.hessian_dim, 2);
+    assert_eq!(decoded.hessian, vec![4.0, 1.0, 1.0, 3.0]);
+
+    // The classifier surfaces the square Hessian as a (dim, flat) pair on the
+    // Seed decision so the resume path can reconstruct and invert it.
+    let loaded = crate::cache::LoadedEntry {
+        entry: crate::cache::CachedEntry {
+            payload: bytes,
+            objective: Some(1.0),
+            iteration: Some(0),
+            kind: crate::cache::EntryKind::Checkpoint,
+            written_unix_secs: 0,
+        },
+        source: crate::cache::LoadSource::Preloaded,
+    };
+    let CacheSeedDecision::Seed {
+        hessian: decoded_h, ..
+    } = classify_cache_entry_for_outer(&loaded, 2)
+    else {
+        panic!("expected Seed decision");
+    };
+    let (dim, flat) = decoded_h.expect("Seed must carry the persisted Hessian");
+    assert_eq!(dim, 2);
+    assert_eq!(flat, vec![4.0, 1.0, 1.0, 3.0]);
+}
+
+#[test]
+fn iterate_payload_scrubs_non_finite_or_non_square_hessian() {
+    // A malformed curvature must never reach the warm-start metric: a
+    // non-square or non-finite Hessian is scrubbed to "no Hessian" while the
+    // ρ/β seed is preserved, so the resume degrades to the scalar metric
+    // rather than corrupting the first BFGS step.
+    let rho = array![0.0];
+    let nan_h = array![[f64::NAN]];
+    let bytes = encode_iterate(&rho, None, Some(&nan_h), 1.0, 0).expect("encode");
+    // encode_iterate itself drops a non-finite Hessian before serialization.
+    let decoded = decode_iterate(&bytes, 1).expect("decode");
+    assert_eq!(decoded.hessian_dim, 0);
+    assert!(decoded.hessian.is_empty());
 }
 
 #[test]
@@ -3185,7 +3235,7 @@ fn classify_extracts_beta_from_v2_payload() {
     // would write β but never resurface it on resume.
     let rho = array![1.0, 2.0];
     let beta = array![10.0, 20.0, 30.0];
-    let payload = encode_iterate(&rho, Some(&beta), 1.0, 0).expect("encode");
+    let payload = encode_iterate(&rho, Some(&beta), None, 1.0, 0).expect("encode");
     let loaded = crate::cache::LoadedEntry {
         entry: crate::cache::CachedEntry {
             payload,
@@ -3205,7 +3255,7 @@ fn classify_extracts_beta_from_v2_payload() {
     assert_eq!(decoded_beta, beta.to_vec());
 
     // ρ-only payload (legacy or family-without-β) decodes to empty beta.
-    let payload = encode_iterate(&rho, None, 1.0, 0).expect("encode");
+    let payload = encode_iterate(&rho, None, None, 1.0, 0).expect("encode");
     let loaded = crate::cache::LoadedEntry {
         entry: crate::cache::CachedEntry {
             payload,
@@ -3275,8 +3325,14 @@ fn run_calls_seed_inner_state_with_cached_beta() {
     }
 
     let (_d, session) = tmp_cache_session("seed-inner-state-call");
-    let bytes =
-        encode_iterate(&array![1.0, 2.0], Some(&array![7.5, 8.5, 9.5]), 5.0, 3).expect("encode");
+    let bytes = encode_iterate(
+        &array![1.0, 2.0],
+        Some(&array![7.5, 8.5, 9.5]),
+        None,
+        5.0,
+        3,
+    )
+    .expect("encode");
     session.checkpoint(&bytes, Some(5.0), Some(3));
 
     let seeded: Arc<Mutex<Option<Array1<f64>>>> = Arc::new(Mutex::new(None));
@@ -3350,7 +3406,7 @@ fn run_skips_seed_inner_state_when_payload_has_no_beta() {
 
     let (_d, session) = tmp_cache_session("seed-inner-state-skip");
     // ρ-only payload — no β.
-    let bytes = encode_iterate(&array![1.0, 2.0], None, 5.0, 3).expect("encode");
+    let bytes = encode_iterate(&array![1.0, 2.0], None, None, 5.0, 3).expect("encode");
     session.checkpoint(&bytes, Some(5.0), Some(3));
 
     let seed_calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -3384,7 +3440,7 @@ fn cache_entry_classifier_honors_finite_seeds_regardless_of_saturation() {
     // — and the persisted β puts the next inner solve at zero-gradient,
     // making the cold-β failure mode impossible to re-create from cache.
     for rho_seed in [array![9.0, 0.0], array![10.0, -10.0], array![-10.0, 10.0]] {
-        let payload = encode_iterate(&rho_seed, None, 1.0, 0).expect("encode");
+        let payload = encode_iterate(&rho_seed, None, None, 1.0, 0).expect("encode");
         let loaded = crate::cache::LoadedEntry {
             entry: crate::cache::CachedEntry {
                 payload,
@@ -3419,7 +3475,7 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
     // Non-finite metadata objective: decode succeeds (finite payload
     // cost), but the entry-level objective is NaN — discard as
     // non-finite-payload.
-    let payload = encode_iterate(&array![0.5, 0.5], None, 1.0, 0).expect("encode");
+    let payload = encode_iterate(&array![0.5, 0.5], None, None, 1.0, 0).expect("encode");
     let loaded = crate::cache::LoadedEntry {
         entry: crate::cache::CachedEntry {
             payload,
@@ -3440,7 +3496,7 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
 
     // Dimension mismatch: 2-D payload viewed as a 3-D problem → decode
     // rejects shape → "payload-shape-mismatch".
-    let payload = encode_iterate(&array![0.5, 0.5], None, 1.0, 0).expect("encode");
+    let payload = encode_iterate(&array![0.5, 0.5], None, None, 1.0, 0).expect("encode");
     let loaded = crate::cache::LoadedEntry {
         entry: crate::cache::CachedEntry {
             payload,
@@ -3462,7 +3518,7 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
 
 #[test]
 fn exact_final_cache_hit_is_helpful_even_at_boundary() {
-    let payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 3).expect("encode");
+    let payload = encode_iterate(&array![10.0, -10.0], None, None, 1.0, 3).expect("encode");
     let loaded = crate::cache::LoadedEntry {
         entry: crate::cache::CachedEntry {
             payload,
@@ -3519,7 +3575,7 @@ fn cached_rho_is_prepended_as_first_seed() {
     // Hand-write the cached checkpoint: rho = [2.5], cost = 0.25.
     // Final exact hits return immediately; checkpoints still exercise the
     // regular seed-prepend path.
-    let payload = encode_iterate(&array![2.5], None, 0.25, 0).expect("encode");
+    let payload = encode_iterate(&array![2.5], None, None, 0.25, 0).expect("encode");
     session.checkpoint(&payload, Some(0.25), Some(0));
     assert!(
         session.try_load().is_some(),
@@ -3595,7 +3651,7 @@ fn all_saturated_cached_rho_is_honored_as_seed() {
     // finite, correctly-dimensioned entry is used as the seed. This
     // test pins that contract.
     let (_d, session) = tmp_cache_session("all-saturated-honored");
-    let payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 0).expect("encode");
+    let payload = encode_iterate(&array![10.0, -10.0], None, None, 1.0, 0).expect("encode");
     session.checkpoint(&payload, Some(1.0), Some(0));
     assert!(
         session.try_load().is_some(),
@@ -3648,7 +3704,7 @@ fn all_saturated_cached_rho_is_honored_as_seed() {
 #[test]
 fn exact_final_cache_hit_skips_outer_validation() {
     let (_d, session) = tmp_cache_session("final-skip");
-    let payload = encode_iterate(&array![2.5], None, 0.25, 7).expect("encode");
+    let payload = encode_iterate(&array![2.5], None, None, 0.25, 7).expect("encode");
     session.finalize(&payload, Some(0.25), Some(7));
 
     let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));

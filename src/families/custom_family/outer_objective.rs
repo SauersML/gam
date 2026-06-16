@@ -989,6 +989,21 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // the constrained-QP and matrix-free PCG paths, which keep their
             // existing globalization untouched.
             let mut joint_spectrum: Option<whitened_spectrum::WhitenedHessianSpectrum> = None;
+            // DENSE-FALLBACK OPERATOR MATERIALIZATION REUSE (gam#1040). On the
+            // DENSE_SPECTRAL path the inner Hessian `source` can be a matrix-free
+            // `Operator` (BMS flex, large n, p below the matrix-free joint-dim
+            // threshold so PCG is not requested): the dense-fallback below then
+            // calls `materialize_joint_hessian_source` to form the unpenalized
+            // dense `H` ONCE for the spectral `decompose`. Without capturing it,
+            // the per-cycle Cauchy leg and the up-to-`JOINT_TRUST_MAX_ATTEMPTS`
+            // predicted-reduction matvecs each re-apply the operator's `apply_into`
+            // — an `O(n·p)` row sweep over n≈196k rows, ~25× per cycle — when the
+            // identical action is already available as an `O(p²)` dense matvec.
+            // Capturing the unpenalized dense here and routing those matvecs
+            // through a `Dense` source is byte-identical (the dense build IS the
+            // operator's action by construction of `materialize_joint_hessian_source`)
+            // and removes the dominant residual per-cycle row work on this path.
+            let mut materialized_dense_unpenalized: Option<Array2<f64>> = None;
             let (candidate_beta, joint_active_set, joint_step_spectral_nullity) =
                 if solve_joint_constraints_dense
                     && let Some(constraints) = joint_constraints.as_ref()
@@ -1471,6 +1486,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             Ok(matrix) => matrix,
                             Err(_) => break,
                         };
+                        // Capture the unpenalized dense `H` for the rest of this
+                        // cycle (gam#1040): the Cauchy leg and trust-region
+                        // predicted-reduction matvecs below can then reuse it as a
+                        // cheap `O(p²)` dense matvec instead of re-applying a
+                        // matrix-free operator `O(n·p)` per attempt. Only when the
+                        // source is an `Operator` — a `Dense` source already gives
+                        // those matvecs the fast path, so cloning would be waste.
+                        if matches!(&joint_hessian_source, JointHessianSource::Operator { .. }) {
+                            materialized_dense_unpenalized = Some(lhs_true.clone());
+                        }
                         // Snapshot the Jeffreys information matrix only when a
                         // family supplies the contracted completion. The generic
                         // pairwise fallback costs p(p+1)/2 full second-directional
@@ -1619,6 +1644,20 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 hessian_and_qp_elapsed.as_secs_f64(),
             );
             let delta = &candidate_beta - &beta_joint;
+            // Effective Hessian source for the remaining per-cycle matvecs
+            // (Cauchy leg + trust-region predicted reduction). When the dense
+            // fallback above materialized a matrix-free `Operator` to dense, route
+            // those matvecs through that `Dense` snapshot so each is an `O(p²)`
+            // GEMV rather than an `O(n·p)` operator row-sweep repeated up to
+            // `JOINT_TRUST_MAX_ATTEMPTS` times (gam#1040). Byte-identical action
+            // (the dense build IS the operator's action by construction); falls
+            // back to the original source when no dense snapshot was taken (the
+            // already-`Dense` and PCG paths).
+            let dense_snapshot_source =
+                materialized_dense_unpenalized.map(JointHessianSource::Dense);
+            let effective_hessian_source: &JointHessianSource = dense_snapshot_source
+                .as_ref()
+                .unwrap_or(&joint_hessian_source);
 
             // Trust-region globalization for the joint Newton proposal.  The
             // previous implementation used up to eight backtracking likelihood
@@ -1784,39 +1823,46 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // unconstrained joint Newton path; the constrained-QP path keeps its
             // own globalization, so the dogleg is only built (and used) when no
             // active set is in force.
-            let dogleg_cauchy: Option<Array1<f64>> = if search_joint_active_set.is_none() {
-                let mut p_sd = Array1::<f64>::zeros(total_p);
-                for (i, (r, w)) in rhs.iter().zip(joint_trust_metric_diag.iter()).enumerate() {
-                    p_sd[i] = r / positive_joint_diagonal_entry(*w);
-                }
-                let mut h_psd = Array1::<f64>::zeros(total_p);
-                let mut cauchy_penalty_scratch = Array1::<f64>::zeros(total_p);
-                match apply_joint_penalized_hessian_into_with_workspace(
-                    &joint_hessian_source,
-                    &ranges,
-                    &s_lambdas,
-                    joint_mode_diagonal_ridge,
-                    &p_sd,
-                    &mut h_psd,
-                    &mut cauchy_penalty_scratch,
-                    joint_bundle,
-                ) {
-                    Ok(()) => {
-                        if let Some((_grad_phi, hphi)) = head_jeffreys_term.as_ref() {
-                            h_psd += &hphi.dot(&p_sd);
-                        }
-                        let cauchy = joint_cauchy_step(&rhs, &p_sd, &h_psd);
-                        if cauchy.iter().all(|v| v.is_finite()) {
-                            Some(cauchy)
-                        } else {
-                            None
-                        }
+            // Only the dogleg/box-truncation globalization (no spectrum) ever
+            // consumes the Cauchy leg; when the exact Moré–Sorensen spectrum is
+            // present the trust loop re-solves from it and `dogleg_cauchy` is dead.
+            // Skipping its construction there removes one coupled Hessian-vector
+            // product per cycle — an `O(n·p)` operator row-sweep on the matrix-free
+            // DENSE_SPECTRAL path that produced no value (gam#1040).
+            let dogleg_cauchy: Option<Array1<f64>> =
+                if search_joint_active_set.is_none() && joint_spectrum.is_none() {
+                    let mut p_sd = Array1::<f64>::zeros(total_p);
+                    for (i, (r, w)) in rhs.iter().zip(joint_trust_metric_diag.iter()).enumerate() {
+                        p_sd[i] = r / positive_joint_diagonal_entry(*w);
                     }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
+                    let mut h_psd = Array1::<f64>::zeros(total_p);
+                    let mut cauchy_penalty_scratch = Array1::<f64>::zeros(total_p);
+                    match apply_joint_penalized_hessian_into_with_workspace(
+                        effective_hessian_source,
+                        &ranges,
+                        &s_lambdas,
+                        joint_mode_diagonal_ridge,
+                        &p_sd,
+                        &mut h_psd,
+                        &mut cauchy_penalty_scratch,
+                        joint_bundle,
+                    ) {
+                        Ok(()) => {
+                            if let Some((_grad_phi, hphi)) = head_jeffreys_term.as_ref() {
+                                h_psd += &hphi.dot(&p_sd);
+                            }
+                            let cauchy = joint_cauchy_step(&rhs, &p_sd, &h_psd);
+                            if cauchy.iter().all(|v| v.is_finite()) {
+                                Some(cauchy)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;
@@ -1961,7 +2007,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // allocating per attempt.
                 hpen_delta.fill(0.0);
                 if apply_joint_penalized_hessian_into_with_workspace(
-                    &joint_hessian_source,
+                    effective_hessian_source,
                     &ranges,
                     &s_lambdas,
                     joint_mode_diagonal_ridge,
@@ -2066,7 +2112,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     let constrained_path_active = search_joint_active_set.is_some();
                     if !tried_preconditioned_descent && !constrained_path_active {
                         match joint_preconditioned_descent_delta(
-                            &joint_hessian_source,
+                            effective_hessian_source,
                             &ranges,
                             &s_lambdas,
                             joint_solver_diagonal_ridge,
@@ -2170,7 +2216,47 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // penalty so the threshold is the NLL the trial must beat.
                 let line_search_options =
                     coefficient_line_search_options(options, old_objective + 1e-10 - trial_penalty);
-                let trial_ll =
+                // Accept-on-first-attempt fast path (gam#979 `gradient_reload`
+                // cost). On the FIRST trust-region attempt of a cycle the step
+                // is the undamped (radius-bumped) Newton proposal, which on the
+                // common ρ≈1 `hold_inside` large-scale pattern accepts outright.
+                // The cheap scalar sweep below would then run a full row stream
+                // and immediately discard it, leaving `gradient_reload` to
+                // re-stream every row at the SAME β to build the gradient
+                // workspace — the ~5s redundant second pass per accepted cycle.
+                //
+                // Instead, when a workspace gradient source is available, build
+                // the joint-Newton workspace ONCE at the trial β and read its
+                // `joint_log_likelihood_evaluation()` (the same `Σ wᵢ log Φ` the
+                // cheap sweep computes, on the same row measure — both derive
+                // from `options`). The materialised per-row cache is threaded
+                // forward as `accepted_joint_workspace`, so on accept the reload
+                // short-circuits through `joint_gradient_evaluation()` with NO
+                // second stream — collapsing the accepted cycle to one row pass.
+                //
+                // Only the first attempt takes this path: it is the only one
+                // expected to accept, so a rejected first attempt pays a single
+                // full (non-early-exited) sweep — paid back many-fold on the
+                // dominant accept-on-first-attempt cycle. Later backtracking
+                // attempts keep the cheap early-exiting sweep (they are expected
+                // to reject and the workspace they would build is discarded).
+                // A workspace build that *errors* (e.g. an infeasible trial η on
+                // the radius-bumped first proposal) must NOT abort the whole
+                // solve: the cheap-sweep path below classifies that same failure
+                // as a recoverable likelihood-reject and shrinks the radius. So
+                // treat an `Err`/`None` here as "fast path unavailable" and fall
+                // through to the cheap sweep, which owns the reject bookkeeping.
+                let fused_first_attempt = if trust_attempt == 0 && joint_workspace_requested {
+                    joint_line_search_log_likelihood_with_workspace(family, options, specs, &states)
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                let trial_ll = if let Some((value, workspace)) = fused_first_attempt {
+                    accepted_joint_workspace = Some(workspace);
+                    value
+                } else {
                     match joint_line_search_log_likelihood(family, &line_search_options, &states) {
                         Ok((value, workspace)) => {
                             accepted_joint_workspace = workspace;
@@ -2192,7 +2278,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             );
                             continue;
                         }
-                    };
+                    }
+                };
                 let trialobjective = -trial_ll + trial_penalty;
                 // Row measure observed by the trial objective at β + δ. The
                 // line-search helper above runs under `coefficient_line_search_options`,
@@ -5999,17 +6086,26 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
     }
 }
 
-/// Drift closure producing the Tier-B Jeffreys-curvature drift
-/// `D_β H_Φ[δβ]` for a mode-response direction `δβ = dβ̂/dρ_k`.
+/// BATCHED Jeffreys-`H_Φ` mode-response drift over MANY directions at once.
 ///
-/// The closure already expects the actual perturbation direction `δβ` (NOT the
-/// raw `v_k` the trait hands the provider); the wrapper negates `v_k → δβ = −v_k`
-/// before calling, exactly mirroring `BorrowedJointDerivProvider`'s sign
-/// convention and the inner `compute_dh` it composes with. Returns `None` when
-/// the Jeffreys term is gated out or the family lacks the exact derivatives, so
-/// the wrapper falls back to the inner provider's drift unchanged.
-pub(crate) type JeffreysHphiDriftFn =
-    Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>;
+/// PERF (the biobank #979 outer-gradient black hole). The β-fixed base of the
+/// drift — the reduced-information eigendecomposition AND the `p` per-axis first
+/// directional derivatives `Hdot[e_a]` (each an `O(n)` n≈348k row-stream) — is
+/// IDENTICAL across every mode-response direction `δβ = −v_k` at fixed `β̂(ρ)`.
+/// A per-direction drift that rebuilt the base on every call would re-stream the
+/// whole dataset `k·p` extra times per outer gradient eval. This batched form
+/// prepares the base ONCE (via [`JeffreysHphiDriftBase`]) and then applies it to
+/// every direction, so the only per-direction cost is that direction's own
+/// `Hdot[δ]` and `p` second-directional `H²dot[δ,e_a]` passes. The per-direction
+/// result is byte-identical to the divided-difference drift it amortizes.
+///
+/// The closure expects the actual perturbation directions `δβ` (NOT the raw `v_k`
+/// the trait hands the provider); the [`JeffreysHphiAwareJointDerivatives`]
+/// wrapper negates `v_k → δβ = −v_k` before calling. A `None` entry (gated-out
+/// term / missing exact derivative on some axis) leaves the inner likelihood
+/// drift unchanged for that direction.
+pub(crate) type JeffreysHphiDriftBatchFn =
+    Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<Array2<f64>>>, String> + Send + Sync>;
 
 /// Jeffreys-`H_Φ`-aware joint derivative provider.
 ///
@@ -6028,23 +6124,43 @@ pub(crate) type JeffreysHphiDriftFn =
 /// added on top of the inner provider's already-correct likelihood drift.
 pub(crate) struct JeffreysHphiAwareJointDerivatives<'a> {
     pub(crate) inner: Box<dyn HessianDerivativeProvider + 'a>,
-    pub(crate) drift: JeffreysHphiDriftFn,
+    pub(crate) drift: JeffreysHphiDriftBatchFn,
     pub(crate) p: usize,
 }
 
 impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
     pub(crate) fn new(
         inner: Box<dyn HessianDerivativeProvider + 'a>,
-        drift: JeffreysHphiDriftFn,
+        drift: JeffreysHphiDriftBatchFn,
         p: usize,
     ) -> Self {
         Self { inner, drift, p }
     }
 
-    /// `D_β H_Φ[δβ]` with the trait's `v_k → δβ = −v_k` mode-response convention.
+    /// `D_β H_Φ[δβ]` for MANY mode-response directions at once, with the trait's
+    /// `v_k → δβ = −v_k` convention. The batched drift prepares the β-fixed base
+    /// (reduced-information eigendecomposition + the `p` per-axis first directional
+    /// derivatives `Hdot[e_a]`, each an `O(n)` row-stream) ONCE and reuses it for
+    /// every direction — collapsing the released `k·p` redundant full-data passes
+    /// (the biobank #979 outer-gradient black hole) to a single `p`-axis sweep plus
+    /// the genuinely per-direction `Hdot[δ]` / `H²dot[δ,e_a]` work. Per-direction
+    /// output is byte-identical to the singular hook.
+    pub(crate) fn hphi_drifts(
+        &self,
+        v_ks: &[Array1<f64>],
+    ) -> Result<Vec<Option<Array2<f64>>>, String> {
+        let deltas: Vec<Array1<f64>> = v_ks.iter().map(|v| v.mapv(|value| -value)).collect();
+        (self.drift)(&deltas)
+    }
+
+    /// `D_β H_Φ[δβ]` for a SINGLE mode-response direction. Routes through the
+    /// batched closure with a one-element slice so the singular trait methods reuse
+    /// the identical arithmetic; the dominant outer-gradient path goes through
+    /// [`Self::hphi_drifts`] where the base is amortized across all `k` directions.
     pub(crate) fn hphi_drift(&self, v_k: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
         let delta = v_k.mapv(|value| -value);
-        (self.drift)(&delta)
+        let mut out = (self.drift)(std::slice::from_ref(&delta))?;
+        Ok(out.pop().flatten())
     }
 }
 
@@ -6098,13 +6214,24 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
     ) -> Result<Vec<Option<DriftDerivResult>>, String> {
         // Delegate the (possibly batched) inner walk, then fold the per-direction
         // H_Φ drift into each result so the batched path stays consistent with the
-        // singular one.
+        // singular one. The H_Φ drift is computed for ALL `k` directions in ONE
+        // batched call so the β-fixed base (reduced eigendecomposition + the `p`
+        // per-axis first directional derivatives, each an `O(n)` row-stream) is
+        // prepared ONCE rather than recomputed `k` times — the biobank #979
+        // outer-gradient black hole. Per-direction values are byte-identical.
         let inner = self.inner.hessian_derivative_corrections_result(v_ks)?;
+        let drifts = self.hphi_drifts(v_ks)?;
+        if drifts.len() != inner.len() {
+            return Err(format!(
+                "JeffreysHphiAwareJointDerivatives: batched H_Φ drift returned {} results for {} directions",
+                drifts.len(),
+                inner.len()
+            ));
+        }
         inner
             .into_iter()
-            .zip(v_ks.iter())
-            .map(|(inner_result, v_k)| {
-                let drift = self.hphi_drift(v_k)?;
+            .zip(drifts.into_iter())
+            .map(|(inner_result, drift)| {
                 Ok(match (inner_result, drift) {
                     (Some(DriftDerivResult::Dense(mut dense)), Some(d)) => {
                         dense += &d;
@@ -7187,7 +7314,7 @@ pub(crate) fn joint_outer_evaluate(
     // first-order trace gains the `½ tr[(H+S_λ+H_Φ)⁻¹ D_β H_Φ[v_k]]` term that
     // makes the analytic gradient match the augmented objective. `None` ⇒ the
     // provider is used unwrapped.
-    jeffreys_hphi_drift: Option<JeffreysHphiDriftFn>,
+    jeffreys_hphi_drift: Option<JeffreysHphiDriftBatchFn>,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
@@ -7343,13 +7470,60 @@ pub(crate) fn joint_outer_evaluate(
                             pseudo_logdet_mode,
                         ))
                     }
-                    JointHessianSource::Operator { apply, .. } => {
+                    JointHessianSource::Operator {
+                        apply,
+                        dense_forced,
+                        ..
+                    } => {
                         let apply_h = Arc::clone(apply);
                         let apply_ranges = ranges_vec.clone();
                         let apply_s = Arc::clone(&s_lambdas);
                         let apply_hphi = robust_jeffreys_hphi_for_operator.clone();
                         let hphi_scale = rho_curvature_scale;
-                        Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                        // Single-pass dense assembly of the SAME penalized
+                        // operator `H_unpen + S_λ + scale·H_Φ`. When the
+                        // operator source can structurally build its full dense
+                        // `H_unpen` in one chunked BLAS-3 `XᵀWX` row pass
+                        // (`dense_forced`), the LAML logdet factorization assembles
+                        // it once here and adds the penalty/Jeffreys terms in
+                        // O(p²) — instead of `total` canonical-basis matvecs, each
+                        // a full n-row pass through `apply_h`. The matvec closure
+                        // below is the exact same algebra column-for-column, so the
+                        // materialized dense operator (and its logdet) are
+                        // numerically identical; the direct build is preferred only
+                        // when `dense_forced` actually yields a matrix.
+                        let dense_forced = Arc::clone(dense_forced);
+                        let dense_ranges = ranges_vec.clone();
+                        let dense_s = Arc::clone(&s_lambdas);
+                        let dense_hphi = robust_jeffreys_hphi_for_operator.clone();
+                        let dense_assemble: Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync> =
+                            Arc::new(move || {
+                                let mut matrix = match dense_forced() {
+                                    Ok(Some(matrix)) => matrix,
+                                    Ok(None) => return None,
+                                    Err(error) => {
+                                        log::warn!(
+                                            "joint exact-newton dense_forced failed during outer logdet materialization: {error}"
+                                        );
+                                        return None;
+                                    }
+                                };
+                                if matrix.nrows() != total || matrix.ncols() != total {
+                                    return None;
+                                }
+                                add_joint_penalty_to_matrix(
+                                    &mut matrix,
+                                    &dense_ranges,
+                                    dense_s.as_ref(),
+                                    trace_diagonal_ridge,
+                                    None,
+                                );
+                                if let Some(hphi) = dense_hphi.as_ref() {
+                                    matrix.scaled_add(hphi_scale, hphi);
+                                }
+                                Some(matrix)
+                            });
+                        Arc::new(MatrixFreeSpdOperator::new_with_mode_and_dense_assemble(
                             total,
                             move |v| {
                                 let mut out = match apply_h(v) {
@@ -7376,6 +7550,7 @@ pub(crate) fn joint_outer_evaluate(
                                 out
                             },
                             pseudo_logdet_mode,
+                            Some(dense_assemble),
                         ))
                     }
                 }
@@ -7685,11 +7860,48 @@ pub(crate) fn joint_outer_evaluate_efs(
                         pseudo_logdet_mode,
                     ))
                 }
-                JointHessianSource::Operator { apply, .. } => {
+                JointHessianSource::Operator {
+                    apply,
+                    dense_forced,
+                    ..
+                } => {
                     let apply_h = Arc::clone(apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    Arc::new(MatrixFreeSpdOperator::new_with_mode(
+                    // Single-pass dense assembly of the SAME penalized operator
+                    // `H_unpen + S_λ` (this fixed-point path carries no Jeffreys
+                    // term). One chunked BLAS-3 `XᵀWX` row pass via `dense_forced`
+                    // replaces `total` full-n canonical-basis matvecs for the LAML
+                    // logdet factorization; numerically identical to the matvec
+                    // reconstruction below.
+                    let dense_forced = Arc::clone(dense_forced);
+                    let dense_ranges = ranges_vec.clone();
+                    let dense_s = Arc::clone(&s_lambdas);
+                    let dense_assemble: Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync> =
+                        Arc::new(move || {
+                            let mut matrix = match dense_forced() {
+                                Ok(Some(matrix)) => matrix,
+                                Ok(None) => return None,
+                                Err(error) => {
+                                    log::warn!(
+                                        "joint exact-newton dense_forced failed during fixed-point logdet materialization: {error}"
+                                    );
+                                    return None;
+                                }
+                            };
+                            if matrix.nrows() != total || matrix.ncols() != total {
+                                return None;
+                            }
+                            add_joint_penalty_to_matrix(
+                                &mut matrix,
+                                &dense_ranges,
+                                dense_s.as_ref(),
+                                trace_diagonal_ridge,
+                                None,
+                            );
+                            Some(matrix)
+                        });
+                    Arc::new(MatrixFreeSpdOperator::new_with_mode_and_dense_assemble(
                         total,
                         move |v| {
                             let mut out = match apply_h(v) {
@@ -7712,6 +7924,7 @@ pub(crate) fn joint_outer_evaluate_efs(
                             out
                         },
                         pseudo_logdet_mode,
+                        Some(dense_assemble),
                     ))
                 }
             }
@@ -9255,12 +9468,27 @@ impl CustomOuterState {
         rho_dim: usize,
         specs: &[ParameterBlockSpec],
         beta: &Array1<f64>,
-    ) -> Result<(), EstimationError> {
+    ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError> {
+        // A seed β whose length disagrees with this fit's per-block
+        // coefficient widths is NOT an error: the outer warm-start cache
+        // looks up a *row-relaxed* prefix (`cache_seed_key`), so two folds
+        // of the same model share an ρ-dim and transfer ρ, but their
+        // realized basis ranks — hence the flattened inner β length — are
+        // row-population dependent and legitimately differ across folds
+        // (the LOSO p=37-vs-p=85 case). Cross-length β transfer is the job
+        // of the gauge-projected `FitArtifact` channel, which re-expresses
+        // the parent's raw β into this fold's reduced subspace. Here we
+        // simply decline the incompatible β and let the (already-installed)
+        // ρ seed stand — a ρ-only resume, never a full cold start.
+        let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        if beta.len() != expected {
+            return Ok(crate::solver::outer_strategy::SeedOutcome::Incompatible);
+        }
         let warm_start = constrained_warm_start_from_cached_beta(rho_dim, specs, beta)?;
         self.reset_warm_cache = Some(warm_start.clone());
         self.warm_cache = Some(warm_start);
         self.last_error = None;
-        Ok(())
+        Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
     }
 }
 
@@ -9695,156 +9923,6 @@ pub(crate) fn with_block_geometry<F: CustomFamily + ?Sized, T>(
     }
 }
 
-pub(crate) fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
-    let total = specs
-        .iter()
-        .map(|s| s.initial_log_lambdas.len())
-        .sum::<usize>();
-    let mut out = Array1::<f64>::zeros(total);
-    let mut at = 0usize;
-    for spec in specs {
-        let len = spec.initial_log_lambdas.len();
-        if len > 0 {
-            out.slice_mut(ndarray::s![at..at + len])
-                .assign(&spec.initial_log_lambdas);
-        }
-        at += len;
-    }
-    out
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PenaltyLabelLayout {
-    pub(crate) penalty_counts: Vec<usize>,
-    pub(crate) physical_to_outer: Vec<Option<usize>>,
-    pub(crate) fixed_log_lambdas: Vec<Option<f64>>,
-    pub(crate) initial_rho: Array1<f64>,
-}
-
-impl PenaltyLabelLayout {
-    pub(crate) fn physical_count(&self) -> usize {
-        self.physical_to_outer.len()
-    }
-
-    pub(crate) fn has_tied_coordinates(&self) -> bool {
-        self.initial_rho.len() != self.physical_to_outer.len()
-    }
-}
-
-pub(crate) fn penalty_label_layout(
-    specs: &[ParameterBlockSpec],
-    penalty_counts: Vec<usize>,
-) -> Result<PenaltyLabelLayout, String> {
-    let mut label_to_outer = BTreeMap::<String, usize>::new();
-    let mut physical_to_outer = Vec::<Option<usize>>::new();
-    let mut fixed_log_lambdas = Vec::<Option<f64>>::new();
-    let mut initial = Vec::<f64>::new();
-
-    for (block_idx, spec) in specs.iter().enumerate() {
-        for penalty_idx in 0..spec.penalties.len() {
-            if let Some(fixed) = spec.penalties[penalty_idx].fixed_log_lambda() {
-                if !fixed.is_finite() {
-                    return Err(CustomFamilyError::ConstraintViolation {
-                        reason: format!(
-                            "block {block_idx} penalty {penalty_idx} fixed log-precision is non-finite: {fixed}"
-                        ),
-                    }
-                    .into());
-                }
-                physical_to_outer.push(None);
-                fixed_log_lambdas.push(Some(fixed));
-                continue;
-            }
-            let label = spec.penalties[penalty_idx]
-                .precision_label()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
-            let rho0 = spec.initial_log_lambdas[penalty_idx];
-            let outer = if let Some(&outer) = label_to_outer.get(&label) {
-                let first = initial[outer];
-                if first.is_finite() && rho0.is_finite() && (first - rho0).abs() > 1e-10 {
-                    return Err(CustomFamilyError::ConstraintViolation { reason: format!(
-                        "precision label '{label}' has inconsistent initial log-precisions: {first} and {rho0}"
-                    ) }.into());
-                }
-                outer
-            } else {
-                let outer = initial.len();
-                label_to_outer.insert(label, outer);
-                initial.push(rho0);
-                outer
-            };
-            physical_to_outer.push(Some(outer));
-            fixed_log_lambdas.push(None);
-        }
-    }
-
-    Ok(PenaltyLabelLayout {
-        penalty_counts,
-        physical_to_outer,
-        fixed_log_lambdas,
-        initial_rho: Array1::from_vec(initial),
-    })
-}
-
-pub(crate) fn expand_labeled_log_lambdas(
-    rho: &Array1<f64>,
-    layout: &PenaltyLabelLayout,
-) -> Result<Array1<f64>, String> {
-    if rho.len() != layout.initial_rho.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "log-lambda label coordinate mismatch: got {}, expected {}",
-                rho.len(),
-                layout.initial_rho.len()
-            ),
-        }
-        .into());
-    }
-    let mut expanded = Array1::<f64>::zeros(layout.physical_count());
-    for (physical, outer) in layout.physical_to_outer.iter().enumerate() {
-        expanded[physical] = match *outer {
-            Some(outer) => rho[outer],
-            None => layout.fixed_log_lambdas[physical].ok_or_else(|| {
-                CustomFamilyError::ConstraintViolation {
-                    reason: format!(
-                        "fixed penalty layout missing value at physical slot {physical}"
-                    ),
-                }
-                .to_string()
-            })?,
-        };
-    }
-    Ok(expanded)
-}
-
-pub(crate) fn split_labeled_log_lambdas(
-    rho: &Array1<f64>,
-    layout: &PenaltyLabelLayout,
-) -> Result<Vec<Array1<f64>>, String> {
-    let expanded = expand_labeled_log_lambdas(rho, layout)?;
-    split_log_lambdas(&expanded, &layout.penalty_counts)
-}
-
-pub(crate) fn aggregate_labeled_gradient(
-    gradient: &Array1<f64>,
-    layout: &PenaltyLabelLayout,
-) -> Result<Array1<f64>, String> {
-    if gradient.len() != layout.physical_count() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "physical gradient length mismatch: got {}, expected {}",
-                gradient.len(),
-                layout.physical_count()
-            ),
-        }
-        .into());
-    }
-    let mut out = Array1::<f64>::zeros(layout.initial_rho.len());
-    for (physical, outer) in layout.physical_to_outer.iter().enumerate() {
-        if let Some(outer) = *outer {
-            out[outer] += gradient[physical];
-        }
-    }
-    Ok(out)
-}
+// Penalty-label layout + labeled log-λ (de)aggregation helpers moved to the
+// sibling `penalty_labels` module (re-exported through the parent), keeping this
+// file under the tracked-file line limit.

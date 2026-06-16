@@ -2298,7 +2298,7 @@ mod root_cause_tests {
         let current_penalized: f64 = 9e5;
         let predicted_reduction: f64 = 5e-16;
         let actual_reduction: f64 = -1e-14;
-        let noise_floor = current_penalized.abs().max(1.0) * 1e-14; // ~9e-9
+        let noise_floor = current_penalized.abs() * 1e-14; // ~9e-9 (#1127: relative floor, no absolute .max(1.0))
 
         let rho = if predicted_reduction > noise_floor {
             actual_reduction / predicted_reduction

@@ -470,4 +470,44 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     pub(super) flex_axis_fourth_tensors: crate::resource::RayonSafeOnce<
         Vec<crate::resource::RayonSafeOnce<Result<FlexAxisFourthRowTensors, String>>>,
     >,
+
+    /// Lazily-built full-data outer row list (`index = position`, `weight = 1.0`,
+    /// `stratum = 0` for every row in `0..n`). The full-data variant of
+    /// `outer_weighted_rows` depends only on `n`, which is constant across the
+    /// cache lifetime, yet the joint-Hessian / ψ directional-derivative
+    /// operator paths call it once per outer eval — re-allocating and filling a
+    /// length-`n` (`n≈3e5`) `Vec<WeightedOuterRow>` (24 B/row, ~8.5 MB) on every
+    /// call. Building it once here and lending a borrowed slice removes that
+    /// per-eval churn; the subsampled path stays a per-call owned `Vec` (it is
+    /// short — only the masked rows — and varies with the mask).
+    pub(super) full_data_outer_rows: std::sync::OnceLock<std::sync::Arc<Vec<WeightedOuterRow>>>,
+}
+
+impl BernoulliMarginalSlopeExactEvalCache {
+    /// Outer row list for an eval, reusing the cached full-data `0..n` list
+    /// when no subsample is active. Bit-identical to calling
+    /// `outer_weighted_rows(options, n)` directly: the full-data branch yields
+    /// the same `(index, 1.0, 0)` rows in the same order, and the subsampled
+    /// branch is the unmodified per-call owned `Vec`.
+    pub(super) fn outer_weighted_rows_cached<'a>(
+        &'a self,
+        options: &crate::custom_family::BlockwiseFitOptions,
+        n: usize,
+    ) -> std::borrow::Cow<'a, [WeightedOuterRow]> {
+        if options.outer_score_subsample.is_some() {
+            return std::borrow::Cow::Owned(outer_weighted_rows(options, n));
+        }
+        let rows = self.full_data_outer_rows.get_or_init(|| {
+            std::sync::Arc::new(
+                (0..n)
+                    .map(|index| WeightedOuterRow {
+                        index,
+                        weight: 1.0,
+                        stratum: 0,
+                    })
+                    .collect(),
+            )
+        });
+        std::borrow::Cow::Borrowed(rows.as_slice())
+    }
 }

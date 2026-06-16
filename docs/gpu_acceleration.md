@@ -1,14 +1,22 @@
 # GPU Acceleration
 
-CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. Solver-specific CUDA paths are selected with `Device::Cuda`. CPU remains the default, so existing fits keep the established solver unless the caller explicitly selects CUDA.
+CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, the runtime lazily probes for a usable CUDA device on first use (`GpuRuntime::global()`) and dispatches to the GPU when one is present, falling back to CPU when it is not. There is no manual device flag — the policy decides, the probe finds the hardware.
+
+The runtime policy is set through `crate::gpu::configure_global_policy`:
 
 ```rust
-use gam::solver::gpu::{Device, configure_device};
+use gam::gpu::{configure_global_policy, GpuPolicy};
 
-configure_device(Device::Cuda);
+configure_global_policy(GpuPolicy::Auto);  // Auto (default) | Off | Force
 ```
 
-Python callers can pass `{"device": "cuda"}` through the `config` dict; `device="cpu"` is the default. The `gpu` config string controls policy logging and auto/force/off behavior, while `device` controls the actual solver dispatch.
+`cuda_selected()` resolves the policy at each dispatch point: `Auto` returns `GpuRuntime::is_available()` (the probe), `Off` forces CPU, and `Force` forces GPU (propagating any GPU error instead of falling back).
+
+Python callers control this through a single `"gpu"` key in the `config` dict, whose value is one of `"auto"` (default), `"off"`, or `"force"`:
+
+```python
+gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})
+```
 
 Install `gamfit[cuda]` on Linux x86_64 when you want PyPI's NVIDIA CUDA
 12 runtime libraries in the environment. CPU-only installs can still
@@ -34,16 +42,16 @@ writes the symmetric row Hessian back to host-pinned storage.
 
 ## Dispatch
 
-CUDA is not behind a Cargo feature gate in this crate; `cudarc` is linked with `fallback-dynamic-loading`, and `GpuRuntime::global()` decides at runtime whether a CUDA device is available.
+CUDA is not behind a Cargo feature gate in this crate; `cudarc` is linked with `fallback-dynamic-loading`, and `GpuRuntime::global()` probes lazily at runtime whether a CUDA device is available. The probe also discovers every usable CUDA device into a pool (`src/gpu/pool.rs`, `scatter_batched` / `balanced_partition`), so multi-GPU work is fanned across devices by score.
 
 ```toml
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }
 ```
 
-The solver runtime switch is:
+The runtime policy switch is:
 
 ```rust
-crate::solver::gpu::configure_device(crate::solver::gpu::Device::Cuda);
+crate::gpu::configure_global_policy(crate::gpu::GpuPolicy::Auto);
 ```
 
 The dense PIRLS path checks `cuda_selected()` before CPU `X'WX`

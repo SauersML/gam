@@ -118,7 +118,7 @@ shape band (mean curve ± sd) and the typical coordinate range the atom is
 used over — where each manifold lives, what shape, and how confident.
 
 ```python
-fit = gamfit.sae_manifold_fit(Z=acts, K=16, d_atom=1, atom_topology="circle")
+fit = gamfit.sae_manifold_fit(X=acts, K=16, d_atom=1, atom_topology="circle")
 recon = fit.predict(acts)              # (N, p) reconstruction
 band = fit.shape_uncertainty(0)        # {"coords","mean","sd","lower","upper"}
 extent = fit.coords[0].min(0), fit.coords[0].max(0)   # where atom 0 lives
@@ -158,9 +158,10 @@ gamfit.fit(
 
 ![two predicted-probability surfaces over a (pc1, pc2) plane, at z = 0 and z = +2](docs/images/marginal_slope_3d.png)
 
-Survival models. `Surv(entry, exit, event)` is supported in four
-likelihood modes: transformation, Weibull, location-scale, and
-marginal-slope. `model.predict(...)` returns a `SurvivalPrediction`
+Survival models. `Surv(entry, exit, event)` is supported in several
+likelihood modes: transformation, Weibull, location-scale,
+marginal-slope, and latent-Gaussian frailty (`latent`,
+`latent-binary`). `model.predict(...)` returns a `SurvivalPrediction`
 with on-demand `S(t)`, `h(t)`, `H(t)` on any time grid:
 
 ```python

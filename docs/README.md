@@ -37,8 +37,8 @@ Building a model
   torus, sphere, Möbius double-cover, and boundary-conditioned smooths.
 - [Families and link functions](families-and-links.md) — including
   `flexible(...)`, `blended(...)`, `sas`, `beta-logistic`.
-- [Survival models](survival.md) — `Surv(...)` syntax, the four
-  likelihood modes, parametric baselines, frailty.
+- [Survival models](survival.md) — `Surv(...)` syntax, the likelihood
+  modes, parametric baselines, latent-Gaussian frailty.
 - [Marginal-slope models](marginal-slope.md) — Bernoulli marginal-slope
   with a calibrated risk score.
 - [Location-scale models](location-scale.md) — joint mean and variance.

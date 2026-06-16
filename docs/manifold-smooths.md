@@ -130,8 +130,11 @@ curves = sae.extract_feature_curves(grid_size=128)   # {atom_idx -> Tensor(grid,
 share a Rust kernel. Given equivalent configurations they return identical
 numerics on synthetic data for supported closed-form configurations (see
 `tests/torch/test_manifold_sae_parity.py`). Closed-form `.fit()` rejects
-nonzero decoder orthogonality / monotonicity penalties and cylinder atoms
-because those objectives are not represented by the Rust SAE primitive.
+nonzero decoder orthogonality / monotonicity penalties (those objectives are
+not represented by the Rust SAE primitive), the `bspline` basis (torch-only),
+and — at present — `cylinder` atoms: the closed-form bridge does not route the
+cylinder topology even though the Rust core has a genuine `cylinder` atom
+(`S¹ × ℝ`), so use a torch training loop for cylinder atoms here.
 
 Supported atom manifolds: `circle`, `cylinder`, `sphere`, `product`. Supported
 bases-on-manifold: `duchon`, `bspline`, `fourier`. Sparsity layers:

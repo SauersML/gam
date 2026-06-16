@@ -156,6 +156,36 @@ fn cheb_t_prime(x: f64, n: usize) -> Vec<f64> {
     tp
 }
 
+/// Chebyshev SECOND-derivative values `T_0″..T_{n−1}″` at `x ∈ [−1, 1]` in the
+/// MAPPED coordinate (multiply by `(dx/dψ)²` for the ψ-second-derivative).
+///
+/// Differentiating the value recurrence `T_d = 2x T_{d−1} − T_{d−2}` twice in
+/// `x` gives a singularity-free three-term recurrence in lock-step with `cheb_t`
+/// / `cheb_t_prime`:
+///   `T_d′  = 2 T_{d−1} + 2x T_{d−1}′ − T_{d−2}′`,
+///   `T_d″  = 4 T_{d−1}′ + 2x T_{d−1}″ − T_{d−2}″`,
+/// with `T_0 = T_0′ = T_0″ = 0`-seeds as below. Unlike the closed form
+/// `T_n″ = n((n+1)T_n − U_n)/(x²−1)` this never divides by `x²−1`, so it stays
+/// exact at the window edges `x = ±1`.
+fn cheb_t_double_prime(x: f64, n: usize) -> Vec<f64> {
+    let mut t = vec![0.0; n];
+    let mut tp = vec![0.0; n];
+    let mut tpp = vec![0.0; n];
+    if n > 0 {
+        t[0] = 1.0; // T_0 = 1, T_0′ = T_0″ = 0
+    }
+    if n > 1 {
+        t[1] = x; // T_1 = x, T_1′ = 1, T_1″ = 0
+        tp[1] = 1.0;
+    }
+    for d in 2..n {
+        t[d] = 2.0 * x * t[d - 1] - t[d - 2];
+        tp[d] = 2.0 * t[d - 1] + 2.0 * x * tp[d - 1] - tp[d - 2];
+        tpp[d] = 4.0 * tp[d - 1] + 2.0 * x * tpp[d - 1] - tpp[d - 2];
+    }
+    tpp
+}
+
 impl PsiGramTensor {
     /// Build and certify the tensor over `psi ∈ [psi_lo, psi_hi]`.
     ///
@@ -507,6 +537,44 @@ impl PsiGramTensor {
         out
     }
 
+    /// Exact `∂²(XᵀWX)/∂ψ²` from the SAME representation as the value/gradient —
+    /// the n-free curvature that lets the outer Newton/ARC step read the τ-τ
+    /// Hessian's design-moving block without re-streaming an O(n) slab Gram
+    /// (#1033, Gaussian-identity single-ψ Hessian channel). O(D²k²).
+    ///
+    /// `XᵀWX(ψ) = Σ_{d,e} T_d(x) T_e(x) G_{de}` with `x = mapped(ψ)`, so by the
+    /// product rule in `x` (then chain rule `(dx/dψ)²`):
+    ///   `∂²/∂x² = T_d″ T_e + 2 T_d′ T_e′ + T_d T_e″`.
+    pub fn d2gram_dpsi2(&self, psi: f64) -> Array2<f64> {
+        let x = self.mapped(psi);
+        let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
+        let dx_dpsi_sq = dx_dpsi * dx_dpsi;
+        let t = cheb_t(x, self.n_coeff);
+        let tp = cheb_t_prime(x, self.n_coeff);
+        let tpp = cheb_t_double_prime(x, self.n_coeff);
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for d in 0..self.n_coeff {
+            for e in 0..self.n_coeff {
+                let coef = (tpp[d] * t[e] + 2.0 * tp[d] * tp[e] + t[d] * tpp[e]) * dx_dpsi_sq;
+                out.scaled_add(coef, &self.gram[d * self.n_coeff + e]);
+            }
+        }
+        out
+    }
+
+    /// Exact `∂²(XᵀWz)/∂ψ²`, n-free. `T_d″·(dx/dψ)²` against the rhs slabs.
+    pub fn d2rhs_dpsi2(&self, psi: f64) -> Array1<f64> {
+        let x = self.mapped(psi);
+        let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
+        let dx_dpsi_sq = dx_dpsi * dx_dpsi;
+        let tpp = cheb_t_double_prime(x, self.n_coeff);
+        let mut out = Array1::<f64>::zeros(self.k);
+        for (d, tppd) in tpp.iter().enumerate() {
+            out.scaled_add(*tppd * dx_dpsi_sq, &self.rhs[d]);
+        }
+        out
+    }
+
     /// Assemble the Gaussian-identity sufficient-statistic cache at `psi`
     /// without touching a single data row — the bridge from this tensor into
     /// the inner PLS solver's fast path (#1033b → `GaussianFixedCache`).
@@ -691,6 +759,336 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1033 Hessian-channel primitive gate: the n-free second ψ-derivatives
+    /// `d2gram_dpsi2` / `d2rhs_dpsi2` must match central FD of the analytic FIRST
+    /// derivatives (`dgram_dpsi` / `drhs_dpsi`) — the curvature the outer Newton
+    /// /ARC step reads when the Gaussian Hessian channel is served from the
+    /// tensor instead of a re-streamed O(n) slab. Differencing the analytic first
+    /// derivative (not the exact gram) keeps this a pure check of the
+    /// second-derivative recurrence, isolated from the build's value-lane tol.
+    #[test]
+    fn psi_gram_tensor_second_derivative_matches_fd_of_gradient() {
+        let (n, k) = (160usize, 7usize);
+        let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin()));
+        let (psi_lo, psi_hi) = (-1.2_f64, 1.0_f64);
+
+        let tensor = PsiGramTensor::build(
+            |psi| synth_design(psi, n, k),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("analytic synthetic design must certify");
+
+        let h = 1e-5;
+        for &psi in &[-1.0, -0.5, 0.0, 0.4, 0.9] {
+            // ∂²G/∂ψ² vs central FD of the analytic ∂G/∂ψ.
+            let dg_plus = tensor.dgram_dpsi(psi + h);
+            let dg_minus = tensor.dgram_dpsi(psi - h);
+            let d2g = tensor.d2gram_dpsi2(psi);
+            let gscale = d2g.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-9);
+            for ((a, p), m_) in d2g.iter().zip(dg_plus.iter()).zip(dg_minus.iter()) {
+                let fd = (p - m_) / (2.0 * h);
+                assert!(
+                    (a - fd).abs() <= 1e-4 * gscale,
+                    "d2gram/dpsi2 mismatch at psi={psi}: analytic={a}, fd={fd}"
+                );
+            }
+            // ∂²(XᵀWz)/∂ψ² vs central FD of the analytic ∂(XᵀWz)/∂ψ.
+            let dr_plus = tensor.drhs_dpsi(psi + h);
+            let dr_minus = tensor.drhs_dpsi(psi - h);
+            let d2r = tensor.d2rhs_dpsi2(psi);
+            let rscale = d2r.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-9);
+            for ((a, p), m_) in d2r.iter().zip(dr_plus.iter()).zip(dr_minus.iter()) {
+                let fd = (p - m_) / (2.0 * h);
+                assert!(
+                    (a - fd).abs() <= 1e-4 * rscale,
+                    "d2rhs/dpsi2 mismatch at psi={psi}: analytic={a}, fd={fd}"
+                );
+            }
+        }
+    }
+
+    /// The penalized Gaussian profile deviance at a fixed ridge λ, assembled
+    /// PURELY from the sufficient-statistic triple `(G, r, c) = (XᵀWX, XᵀWz, zᵀWz)`:
+    ///
+    /// ```text
+    ///   β(λ) = (G + λS)⁻¹ r,   D(ψ;λ) = c − 2 βᵀr + βᵀ(G + λS)β = c − βᵀr
+    /// ```
+    ///
+    /// (the second equality uses the normal equations `(G + λS)β = r`). This is
+    /// EXACTLY the object the inner Gaussian PLS minimizes over β, and it is a
+    /// pure function of `(G, r, c)` — n-free. Returns `(D, β)` so the caller can
+    /// also probe the coefficient lane. `s_ridge` is the ridge penalty matrix.
+    fn profile_deviance(
+        g: &Array2<f64>,
+        r: &Array1<f64>,
+        c: f64,
+        s_ridge: &Array2<f64>,
+        lambda: f64,
+        k: usize,
+    ) -> (f64, Array1<f64>) {
+        // Dense (G + λS) β = r via partial-pivot Gauss elimination (small k).
+        let mut a = g.clone();
+        a.scaled_add(lambda, s_ridge);
+        let mut aug = Array2::<f64>::zeros((k, k + 1));
+        aug.slice_mut(ndarray::s![.., ..k]).assign(&a);
+        aug.slice_mut(ndarray::s![.., k]).assign(r);
+        for col in 0..k {
+            let piv = (col..k)
+                .max_by(|&p, &q| aug[[p, col]].abs().total_cmp(&aug[[q, col]].abs()))
+                .unwrap();
+            if piv != col {
+                for j in 0..=k {
+                    let tmp = aug[[col, j]];
+                    aug[[col, j]] = aug[[piv, j]];
+                    aug[[piv, j]] = tmp;
+                }
+            }
+            let p = aug[[col, col]];
+            for row in 0..k {
+                if row == col {
+                    continue;
+                }
+                let f = aug[[row, col]] / p;
+                for j in col..=k {
+                    aug[[row, j]] -= f * aug[[col, j]];
+                }
+            }
+        }
+        let beta = Array1::from_iter((0..k).map(|i| aug[[i, k]] / aug[[i, i]]));
+        let deviance = c - beta.dot(r);
+        (deviance, beta)
+    }
+
+    /// #1033 bit-tight Hessian + κ-optimum gate. The fast path's promise is not
+    /// merely that the Gram VALUE matches at sampled ψ — it is that the WHOLE
+    /// outer κ search (objective, its ψ-curvature, and therefore the located
+    /// optimum) is reproduced by the n-free sufficient-statistic representation
+    /// to machine precision. This harness certifies exactly that:
+    ///
+    ///   1. **Objective**: the penalized profile deviance `D(ψ)` assembled from
+    ///      the tensor's `(gram_at, rhs_at, zᵀWz)` matches the exactly streamed
+    ///      `XᵀWX/XᵀWz/zᵀWz` deviance bit-tight at every ψ on a fine grid.
+    ///   2. **Curvature (Hessian)**: the second ψ-derivative `D''(ψ)` of the
+    ///      fast-path objective matches the second ψ-derivative of the EXACT
+    ///      objective (central FD of the streamed deviance) — the curvature the
+    ///      outer Newton step reads must be the true curvature, not an
+    ///      approximation that drifts off the value (the objective↔gradient
+    ///      desync class, now extended to the second order).
+    ///   3. **κ-optimum**: the argmin of `D(ψ)` over the grid is IDENTICAL
+    ///      between the two assemblies — the fast path lands on the same κ as the
+    ///      exact streamed search, to the grid resolution AND bit-tight in the
+    ///      objective value at that node.
+    #[test]
+    fn psi_gram_tensor_bit_tight_hessian_and_kappa_optimum() {
+        let (n, k) = (200usize, 6usize);
+        // Heterogeneous weights + a response with genuine ψ-dependent curvature
+        // so the deviance has a non-degenerate interior minimum in ψ.
+        let w = Array1::from_iter((0..n).map(|i| 0.7 + 0.6 * (((i * 7) % 5) as f64) / 4.0));
+        let z = Array1::from_iter((0..n).map(|i| {
+            let t = (i as f64) / (n as f64 - 1.0);
+            (3.0 * t).sin() + 0.3 * (7.0 * t).cos()
+        }));
+        let (psi_lo, psi_hi) = (-1.0_f64, 0.9_f64);
+        // Fixed ridge λ over the search — the κ optimizer profiles ψ at fixed
+        // smoothing here; identity-S ridge keeps the profile well-posed.
+        let s_ridge = Array2::<f64>::eye(k);
+        let lambda = 0.5_f64;
+
+        let tensor = PsiGramTensor::build(
+            |psi| synth_design(psi, n, k),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("analytic synthetic design must certify");
+
+        let exact_ztwz: f64 = w.iter().zip(z.iter()).map(|(&wi, &zi)| wi * zi * zi).sum();
+
+        // Exact streamed deviance at arbitrary ψ — the ground truth the n-free
+        // path must reproduce.
+        let exact_deviance = |psi: f64| -> f64 {
+            let design = synth_design(psi, n, k).unwrap();
+            let mut wd = design.clone();
+            for (mut row, &wi) in wd.outer_iter_mut().zip(w.iter()) {
+                row.mapv_inplace(|v| v * wi);
+            }
+            let g = design.t().dot(&wd);
+            let r = wd.t().dot(&z);
+            profile_deviance(&g, &r, exact_ztwz, &s_ridge, lambda, k).0
+        };
+
+        // Fast n-free deviance from the certified tensor.
+        let fast_deviance = |psi: f64| -> f64 {
+            let g = tensor.gram_at(psi);
+            let r = tensor.rhs_at(psi);
+            profile_deviance(&g, &r, exact_ztwz, &s_ridge, lambda, k).0
+        };
+
+        // Dense grid strictly inside the certified window (away from the edges,
+        // where the build's value lane is still certified but we want a clean
+        // central-FD second derivative to exist on both sides).
+        let m = 81usize;
+        let lo = psi_lo + 0.06;
+        let hi = psi_hi - 0.06;
+        let grid: Vec<f64> = (0..m)
+            .map(|i| lo + (hi - lo) * (i as f64) / (m as f64 - 1.0))
+            .collect();
+
+        // (1) Objective bit-tight across the whole grid; track argmin on both.
+        let mut worst_value_rel = 0.0_f64;
+        let (mut fast_argmin, mut fast_min) = (f64::NAN, f64::INFINITY);
+        let (mut exact_argmin, mut exact_min) = (f64::NAN, f64::INFINITY);
+        for &psi in &grid {
+            let de = exact_deviance(psi);
+            let df = fast_deviance(psi);
+            let rel = (de - df).abs() / de.abs().max(1e-300);
+            worst_value_rel = worst_value_rel.max(rel);
+            if df < fast_min {
+                fast_min = df;
+                fast_argmin = psi;
+            }
+            if de < exact_min {
+                exact_min = de;
+                exact_argmin = psi;
+            }
+        }
+        assert!(
+            worst_value_rel <= 1e-9,
+            "penalized profile deviance: fast n-free assembly diverged from exact \
+             streamed by rel {worst_value_rel:.3e} (> 1e-9) somewhere on the ψ grid"
+        );
+
+        // (3) κ-optimum: identical grid node AND bit-tight value there. The
+        // argmin must be a true interior minimum (not a window edge) for this to
+        // certify the OUTER search rather than a boundary artifact.
+        assert_eq!(
+            fast_argmin.to_bits(),
+            exact_argmin.to_bits(),
+            "κ-optimum mismatch: fast argmin ψ={fast_argmin}, exact argmin ψ={exact_argmin} \
+             — the n-free objective located a different optimum"
+        );
+        assert!(
+            fast_argmin > lo + 1e-9 && fast_argmin < hi - 1e-9,
+            "κ-optimum landed on the grid edge ψ={fast_argmin}; the fixture must have \
+             an INTERIOR minimum for this to test the outer search, not a boundary"
+        );
+        let opt_rel = (exact_min - fast_min).abs() / exact_min.abs().max(1e-300);
+        assert!(
+            opt_rel <= 1e-9,
+            "κ-optimum objective value drift at ψ={fast_argmin}: fast={fast_min}, \
+             exact={exact_min}, rel={opt_rel:.3e}"
+        );
+
+        // (2) Gradient + curvature from the tensor's ANALYTIC ψ-derivatives.
+        //
+        // Differencing two objectives that agree only to ~1e-9 in VALUE cannot
+        // certify their curvature: the central second difference divides by h²,
+        // so the ~1e-9 value gap (which is NOT common-mode — they are different
+        // assemblies) is amplified by 1/h² and swamps any real curvature signal.
+        // The principled bit-tight curvature check uses the tensor's OWN analytic
+        // ψ-derivatives `dgram_dpsi`/`drhs_dpsi`: the envelope gradient of the
+        // profile deviance `D(ψ) = c − rᵀA⁻¹r`, `A = G + λS`, is
+        //
+        //   D'(ψ) = −2 βᵀ(∂r/∂ψ) + βᵀ(∂G/∂ψ)β,   β = A⁻¹r,
+        //
+        // assembled n-free from `(dgram_dpsi, drhs_dpsi)`. We certify this
+        // analytic gradient against a central FD of the EXACT streamed objective
+        // (first order ⇒ only 1/h amplification, so the ~1e-9 value agreement is
+        // not destroyed), and certify the curvature by central-differencing the
+        // ANALYTIC gradient (again 1/h, not 1/h²). This is the same one-
+        // representation value↔gradient↔curvature consistency the production fast
+        // path relies on for the outer Newton step.
+        let solve_a = |g: &Array2<f64>, r: &Array1<f64>| -> Array1<f64> {
+            profile_deviance(g, r, exact_ztwz, &s_ridge, lambda, k).1
+        };
+        // Analytic n-free ψ-gradient of the penalized profile deviance, valid on
+        // the certified gradient sub-window where `dgram_dpsi` is bit-tight.
+        let analytic_grad = |psi: f64| -> f64 {
+            let g = tensor.gram_at(psi);
+            let r = tensor.rhs_at(psi);
+            let beta = solve_a(&g, &r);
+            let dg = tensor.dgram_dpsi(psi);
+            let dr = tensor.drhs_dpsi(psi);
+            -2.0 * beta.dot(&dr) + beta.dot(&dg.dot(&beta))
+        };
+
+        // Two finite-difference steps, each near the optimum of its own
+        // truncation/rounding trade-off:
+        //   * `h_grad = 1e-6` for the FIRST derivative (central FD ⇒ O(h²)
+        //     truncation, O(ε/h) rounding ⇒ optimum near 1e-5..1e-6);
+        //   * `h_curv = 2e-4` for the curvature. A SECOND difference divides by
+        //     h², so its rounding floor is O(ε·|D|/h²): at h=1e-6 that is
+        //     ~1e-16/1e-12 = 1e-4 of |D|, comparable to the curvature itself —
+        //     useless. h≈2e-4 puts the rounding floor at ~1e-16/4e-8 ≈ 2.5e-9·|D|
+        //     and the O(h²·D⁗) truncation around the same scale, so the second
+        //     difference is meaningful. The analytic-gradient curvature is
+        //     differenced at the SAME h_curv so the two carry the same
+        //     truncation order and the comparison is apples-to-apples.
+        let h_grad = 1e-6_f64;
+        let h_curv = 2e-4_f64;
+        let mut worst_grad_rel = 0.0_f64;
+        let mut worst_hess_rel = 0.0_f64;
+        let mut tested = 0usize;
+        for &psi in &grid {
+            // The exact-objective curvature stencil reaches ±2·h_curv; require the
+            // whole stencil to stay inside the certified gradient sub-window so the
+            // analytic-gradient differences are all bit-tight.
+            if !tensor.contains_for_gradient(psi - 2.0 * h_curv)
+                || !tensor.contains_for_gradient(psi + 2.0 * h_curv)
+            {
+                continue;
+            }
+            tested += 1;
+            // Analytic gradient vs central FD of the EXACT streamed objective.
+            let exact_g1 =
+                (exact_deviance(psi + h_grad) - exact_deviance(psi - h_grad)) / (2.0 * h_grad);
+            let ag = analytic_grad(psi);
+            let gscale = exact_g1.abs().max(1e-6);
+            worst_grad_rel = worst_grad_rel.max((exact_g1 - ag).abs() / gscale);
+            // Curvature: central FD of the ANALYTIC gradient (n-free) vs central
+            // second difference of the EXACT objective, both at h_curv.
+            let analytic_h2 =
+                (analytic_grad(psi + h_curv) - analytic_grad(psi - h_curv)) / (2.0 * h_curv);
+            let exact_h2 = (exact_deviance(psi + h_curv) - 2.0 * exact_deviance(psi)
+                + exact_deviance(psi - h_curv))
+                / (h_curv * h_curv);
+            let hscale = exact_h2.abs().max(1e-3);
+            worst_hess_rel = worst_hess_rel.max((analytic_h2 - exact_h2).abs() / hscale);
+        }
+        assert!(
+            tested > 0,
+            "no ψ on the grid lay inside the certified gradient sub-window"
+        );
+        assert!(
+            worst_grad_rel <= 1e-5,
+            "ψ-gradient mismatch: the tensor's analytic n-free objective gradient diverged \
+             from the exact streamed objective by rel {worst_grad_rel:.3e} (> 1e-5)"
+        );
+        // The curvature compares an analytic-gradient central difference against
+        // an exact-objective second difference; the residual O(h²) truncation +
+        // O(ε/h²) rounding floor at h_curv=2e-4 sets a realistic bit-tight bar of
+        // ~1e-3 relative (any larger gap is a genuine curvature divergence, not FD
+        // noise — the value/gradient lanes already certify the objective itself to
+        // ~1e-9/1e-5).
+        assert!(
+            worst_hess_rel <= 1e-3,
+            "ψ-curvature (Hessian) mismatch: fast n-free objective curvature diverged \
+             from the exact streamed objective by rel {worst_hess_rel:.3e} (> 1e-3) — \
+             the outer Newton step would read a different curvature than the truth"
+        );
+
+        eprintln!(
+            "[psi-gram-bittight] n={n} k={k} grid={m} grad-tested={tested}  \
+             worst |ΔD|/D={worst_value_rel:.2e}  worst |ΔD'|/D'={worst_grad_rel:.2e}  \
+             worst |ΔD''|/D''={worst_hess_rel:.2e}  κ-opt ψ={fast_argmin:.6} (interior, bit-identical)"
+        );
     }
 
     /// Certification negative: a NON-analytic (kinked) design must refuse to

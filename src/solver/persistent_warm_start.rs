@@ -378,7 +378,7 @@ mod warm_start_artifact_tests {
         // Block-layer identity (the surviving, fold-invariant identity API):
         // the block name carries the variable, with one unlabeled penalty.
         let block_name = format!("s({var})");
-        let id = term_identity_from_block(TermRole::Mean, &block_name, &[None], &[1]);
+        let id = term_identity_from_block(TermRole::Mean, &block_name, &[None], &[1], 10);
         FitArtifact {
             schema: FIT_ARTIFACT_SCHEMA,
             created_unix_secs: unix_secs_now(),

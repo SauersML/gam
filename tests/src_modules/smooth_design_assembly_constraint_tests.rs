@@ -3165,7 +3165,7 @@
                     logdet_enclosure_gap: None,
                 })
             },
-            |_beta: &Array1<f64>| Ok(()),
+            |_beta: &Array1<f64>| Ok(crate::solver::outer_strategy::SeedOutcome::NoSlot),
         )
         .expect(expect_msg)
     }
@@ -5579,7 +5579,7 @@
                     logdet_enclosure_gap: None,
                 })
             },
-            |_beta: &Array1<f64>| Ok(()),
+            |_beta: &Array1<f64>| Ok(crate::solver::outer_strategy::SeedOutcome::NoSlot),
         )
         .expect("exact joint no-spatial fast path should succeed");
 
@@ -5969,7 +5969,7 @@
                 theta0.len(),
             )),
         );
-        cache.store_eval(eval.clone());
+        cache.store_eval_at(&theta0, eval.clone());
         let cached_eval = cache.memoized_eval(&theta0).expect("cached eval");
         assert!((cached_eval.0 - eval.0).abs() <= 1e-12);
         assert_eq!(cached_eval.1, eval.1);

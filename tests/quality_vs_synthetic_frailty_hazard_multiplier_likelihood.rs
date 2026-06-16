@@ -40,6 +40,7 @@
 use gam::families::lognormal_kernel::{LatentSurvivalRow, LatentSurvivalRowJet};
 use gam::quadrature::QuadratureContext;
 use gam::test_support::reference::{Column, run_r};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 /// Deterministic SplitMix64 PRNG — gives a fixed-seed, dependency-free stream so
 /// the synthetic dataset is reproducible and identical on every run.
@@ -132,22 +133,34 @@ fn gam_logsigma_jet(
     baseline_slope: f64,
     sigma: f64,
 ) -> (f64, f64, f64) {
+    // The per-row jets are independent Gauss-Hermite quadrature evaluations; the
+    // dominant cost of this MLE is the ~10^5 jet evaluations across the Newton +
+    // backtracking loop. Fan them across the rayon pool, then sum the per-row
+    // (log_lik, score, neg_hessian) triples back IN ROW ORDER so the accumulated
+    // floats are bit-identical to the serial reduction — the Newton path and
+    // every asserted recovery bar are unchanged, only wall-clock improves.
+    let per_row: Vec<(f64, f64, f64)> = (0..cum_hazard.len())
+        .into_par_iter()
+        .map(|i| {
+            let mass_exit = cum_hazard[i];
+            let row = if events[i] > 0.5 {
+                // Exact event: hazard_loaded = h_0(t) = baseline_slope.
+                LatentSurvivalRow::exact_event(0.0, mass_exit, 0.0, 0.0, baseline_slope, 0.0)
+            } else {
+                LatentSurvivalRow::right_censored(0.0, mass_exit, 0.0, 0.0)
+            };
+            let jet = LatentSurvivalRowJet::evaluate(quadctx, &row, 0.0, sigma)
+                .expect("gam kernel row likelihood");
+            (jet.log_lik, jet.score_log_sigma, jet.neg_hessian_log_sigma)
+        })
+        .collect();
     let mut loglik = 0.0;
     let mut score = 0.0;
     let mut neg_hess = 0.0;
-    for i in 0..cum_hazard.len() {
-        let mass_exit = cum_hazard[i];
-        let row = if events[i] > 0.5 {
-            // Exact event: hazard_loaded = h_0(t) = baseline_slope.
-            LatentSurvivalRow::exact_event(0.0, mass_exit, 0.0, 0.0, baseline_slope, 0.0)
-        } else {
-            LatentSurvivalRow::right_censored(0.0, mass_exit, 0.0, 0.0)
-        };
-        let jet = LatentSurvivalRowJet::evaluate(quadctx, &row, 0.0, sigma)
-            .expect("gam kernel row likelihood");
-        loglik += jet.log_lik;
-        score += jet.score_log_sigma;
-        neg_hess += jet.neg_hessian_log_sigma;
+    for (ll, sc, nh) in &per_row {
+        loglik += ll;
+        score += sc;
+        neg_hess += nh;
     }
     (loglik, score, neg_hess)
 }

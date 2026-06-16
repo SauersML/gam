@@ -31,6 +31,7 @@ use gam::{
 mod fixtures;
 use fixtures::Splitmix64;
 use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::time::Instant;
 
 const N: usize = 400;
 // Duchon order=1 in 3D has a 4-dimensional polynomial null space
@@ -172,8 +173,31 @@ fn survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges() {
         ..FitConfig::default()
     };
 
+    // gam#979 regression guard: the survival `marginal-slope` path used to
+    // HANG (rc=124) — the inner coupled joint-Newton ground to ~1000-1200
+    // cycles and the generic pairwise `p(p+1)/2` Jeffreys completion turned
+    // every near-converged polishing cycle into tens of seconds of full-data
+    // row work. After the Moré–Sorensen trust-region step + the
+    // contracted-hook gate on the completion (the generic pairwise fallback
+    // no longer fires at production scale), this structural shape converges
+    // in a handful of cycles. Assert a hard wall-clock budget so a
+    // re-introduction of the hang/grind fails loudly instead of timing out
+    // silently. The budget is deliberately generous relative to the observed
+    // sub-second fit at this size (n=400, centers=6) to stay non-flaky under
+    // CI contention while still being orders of magnitude below the old hang.
+    let fit_start = Instant::now();
     let outcome = fit_from_formula(&formula, &data, &config)
         .expect("large-scale survival marginal-slope fit should succeed under V+M");
+    let fit_elapsed = fit_start.elapsed();
+    const SURVIVAL_MARGSLOPE_BUDGET_SECS: f64 = 120.0;
+    assert!(
+        fit_elapsed.as_secs_f64() < SURVIVAL_MARGSLOPE_BUDGET_SECS,
+        "survival marginal-slope fit took {:.1}s, exceeding the {:.0}s budget \
+         (gam#979 hang/grind regression): the structural duplicated-duchon + \
+         linkwiggle shape at n={N}, centers={CENTERS} must converge promptly",
+        fit_elapsed.as_secs_f64(),
+        SURVIVAL_MARGSLOPE_BUDGET_SECS,
+    );
 
     let result = match outcome {
         FitResult::SurvivalMarginalSlope(r) => r,

@@ -1232,8 +1232,17 @@ where
                     // When predicted reduction is at floating-point noise level
                     // relative to the objective, both predicted and actual are
                     // meaningless — treat as a neutral step (rho = 1) rather
-                    // than hard-rejecting on the sign of noise.
-                    let noise_floor = current_penalized.abs().max(1.0) * 1e-14;
+                    // than hard-rejecting on the sign of noise. The floor tracks
+                    // the penalized objective's own magnitude (issue #1127): the
+                    // predicted/screening reductions and `current_penalized` all
+                    // scale as `O(a²)` under `y → a·y`, so a relative floor is
+                    // scale-equivariant. The previous `.max(1.0)` absolute floor
+                    // pinned it at `1e-14` for a micro-unit response, mismatching
+                    // genuine `O(a²)` reductions and biasing the step screening
+                    // toward the over-smoothed iterate. A converged objective
+                    // (`current_penalized == 0`) yields a `0` floor, so the
+                    // `predicted_reduction > floor` branch still governs.
+                    let noise_floor = current_penalized.abs() * 1e-14;
                     let screening_rho = if predicted_reduction > noise_floor {
                         screening_reduction / predicted_reduction
                     } else if screening_reduction >= -noise_floor {
@@ -1648,11 +1657,17 @@ where
                         //   here (it remains confined to the fast path's
                         //   relaxed degenerate band, which demands
                         //   stationarity).
-                        let objective_scale = final_state_ref
-                            .deviance
-                            .abs()
-                            .max(final_state_ref.penalty_term.abs())
-                            .max(1.0);
+                        // Scale-equivariant objective magnitude (issue #1127):
+                        // the predicted reduction and Δdeviance compared against
+                        // this band both scale as `O(a²)` under a response
+                        // rescaling `y → a·y`, so the band must track the
+                        // objective's own magnitude rather than the absolute
+                        // `.max(1.0)` floor, which pinned it at `1.0` for a
+                        // micro-unit response and accepted a non-converged
+                        // constrained iterate. Well-scaled fits (`|obj| ≳ 1`)
+                        // are unchanged.
+                        let objective_scale =
+                            final_state_ref.deviance.abs() + final_state_ref.penalty_term.abs();
                         let plateau_band = options.convergence_tolerance * objective_scale * 0.1;
                         let model_progress_exhausted = predicted_reduction.is_finite()
                             && predicted_reduction.abs() <= plateau_band;

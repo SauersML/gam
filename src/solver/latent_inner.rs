@@ -313,7 +313,19 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                         .map_err(|e| {
                         format!("LatentInnerSolver: objective failed at trial iter {iter}: {e}")
                     })?;
-                    let objective_scale = current_objective.abs().max(1.0);
+                    // Trust-region gain-ratio noise floor, keyed to the
+                    // objective's own magnitude so it is equivariant under a
+                    // response rescaling `y → a·y` (the penalized objective and
+                    // both the predicted and actual reductions all scale as
+                    // `O(a²)`). The previous `.max(1.0)` absolute floor broke
+                    // this for a micro-unit response: it pinned the floor at
+                    // `1e-14` while genuine reductions were `O(a²)`, treating a
+                    // real step as numerical noise and stalling the inner solve
+                    // at an over-smoothed iterate (issue #1127). A perfectly
+                    // converged objective (`current_objective == 0`) yields a
+                    // `0` floor, so the `predicted_reduction > 0` branch still
+                    // governs and no step is misclassified.
+                    let objective_scale = current_objective.abs();
                     let noise_floor = objective_scale * 1e-14;
                     let actual_reduction = current_objective - trial_objective;
                     let rho = if predicted_reduction > noise_floor {

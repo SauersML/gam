@@ -32,9 +32,9 @@ use ::opt::{
     FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
     FixedPointSample, FixedPointStatus, GradientTolerance, HessianFallbackPolicy,
     HessianMaterialization, HessianOperator, HessianValue, InitialMetric, MatrixFreeTrustRegion,
-    MaxIterations,
-    ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver,
-    SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance, ZerothOrderObjective,
+    MaxIterations, ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus,
+    OptimizerObserver, SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance,
+    ZerothOrderObjective,
 };
 
 use ndarray::{Array1, Array2, ArrayView2};

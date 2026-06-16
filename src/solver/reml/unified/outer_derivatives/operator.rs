@@ -321,12 +321,6 @@ pub(crate) struct OuterHessianCoord {
     pub(crate) b_depends_on_beta: bool,
 }
 
-impl OuterHessianCoord {
-    pub(crate) fn is_ext(&self) -> bool {
-        self.ext_index.is_some()
-    }
-}
-
 pub(crate) struct UnifiedOuterHessianOperator {
     pub(crate) hop: Arc<dyn HessianOperator>,
     pub(crate) coords: Vec<OuterHessianCoord>,
@@ -382,8 +376,20 @@ impl UnifiedOuterHessianOperator {
     /// inner mode inverse `hop.solve_multi` (see `build_outer_hessian_operator`),
     /// so this combination is the EXACT directional `β̇(α)` with no
     /// finite-difference or low-rank approximation — the same object the profiled
-    /// θ-HVP needs as `β̇ = −H⁻¹ ∂g/∂θ·v`. Extended (ψ) coordinates carry the
-    /// opposite drift sign, matching the `b_depends_on_beta` convention.
+    /// θ-HVP needs as `β̇ = −H⁻¹ ∂g/∂θ·v`.
+    ///
+    /// SIGN CONVENTION: every coordinate stores `coord.v = +K · rhs` (the
+    /// positive-convention mode-response solve; see `respond_stack`), and the
+    /// true first mode derivative is `β_j = −v_j` for BOTH ρ and ψ/ext
+    /// coordinates — the dense materialization (`dense.rs`) uses
+    /// `β = v.mapv(|x| −x)` uniformly with no `is_ext` branch. So the directional
+    /// derivative is `β̇(α) = Σ_j α_j β_j = −Σ_j α_j v_j`, the SAME `−` for every
+    /// coordinate type. (A previous revision applied `+` to ρ and `−` to ext: a
+    /// self-consistent convention that cancelled on the pure-ρ and pure-ψ
+    /// diagonals because the second-order callback `D²_β H[·,·]` is bilinear, but
+    /// it flipped the sign of the CROSS ρ-ψ second-order term — the bug the
+    /// `mixed-ρψ` arm of `profiled_theta_hvp_outer_hessian_matches_fd_of_gradient`
+    /// catches and the pure arms miss.)
     ///
     /// This is the reusable matrix-free primitive an O(K)-build θ-HVP matvec is
     /// organized around (one IFT solve per applied direction instead of the K²
@@ -398,11 +404,8 @@ impl UnifiedOuterHessianOperator {
             if alpha[j] == 0.0 {
                 continue;
             }
-            if coord.is_ext() {
-                out.scaled_add(-alpha[j], &coord.v);
-            } else {
-                out.scaled_add(alpha[j], &coord.v);
-            }
+            // True first mode derivative `β_j = −v_j` for every coordinate type.
+            out.scaled_add(-alpha[j], &coord.v);
         }
         out
     }
@@ -518,11 +521,27 @@ impl UnifiedOuterHessianOperator {
         Ok(c_trace + d_trace)
     }
 
+    /// Callback second-order correction trace for one HVP output row.
+    ///
+    /// `term1 = D_β H[u]` where `u` is the SECOND mode response `β̈ = K · rhs`,
+    /// and `term2 = D²_β H[β̇(α), β̇_idx]` — both arguments of the bilinear
+    /// `second` are TRUE first mode derivatives `β̇ = −v`: `mode_response_alpha`
+    /// is the directional `β̇(α)` and `second_v` is the per-row `β̇_idx`. This
+    /// mirrors the dense path's `compute_d2h(−v_l, −v_k)` exactly.
+    ///
+    /// `u` is solved with the FULL inner inverse `hop.solve` even when the LAML
+    /// logdet uses the projected penalty-subspace trace: `u = β̈` is a mode
+    /// response (an IFT stationarity derivative living in the full β-space), so
+    /// the IFT identity demands the full inverse. The penalty-subspace
+    /// projection acts only on the TRACE contraction (`trace_operator` below) —
+    /// the same `ThetaModeResponseKernel` principle that the FIRST mode response
+    /// and `dense.rs` follow (see `penalty_coordinate.rs` `respond_one`,
+    /// `objective.rs` IFT-solve note).
     pub(crate) fn callback_correction_trace(
         &self,
         rhs: &Array1<f64>,
         second_v: &Array1<f64>,
-        neg_m_alpha: &Array1<f64>,
+        mode_response_alpha: &Array1<f64>,
     ) -> Result<f64, String> {
         let OuterHessianDerivativeKernel::Callback { first, second } = &self.kernel else {
             return Err(RemlError::InvalidKernelMode {
@@ -530,14 +549,11 @@ impl UnifiedOuterHessianOperator {
             }
             .into());
         };
-        let u = match self.subspace.as_deref() {
-            Some(subspace) => subspace.apply_pseudo_inverse(rhs),
-            None => self.hop.solve(rhs),
-        };
+        let u = self.hop.solve(rhs);
         let Some(term1) = first(&u)? else {
             return Ok(0.0);
         };
-        let Some(term2) = second(neg_m_alpha, second_v)? else {
+        let Some(term2) = second(mode_response_alpha, second_v)? else {
             return Ok(0.0);
         };
         let combined = CompositeHyperOperator {
@@ -604,18 +620,17 @@ impl UnifiedOuterHessianOperator {
     }
 
     /// Per-coordinate outer-Hessian-row × `alpha` contraction shared by the
-    /// `matvec` and zero-alloc `apply_into` paths. `a_alpha`,
-    /// `correction_m_alpha`, and `callback_neg_m_alpha` are the
-    /// alpha-dependent quantities precomputed once per call by the caller.
-    /// `psi_contrib` carries the per-call ψψ-block hook contraction (#740);
-    /// `None` keeps the ψψ block in the precomputed tables.
+    /// `matvec` and zero-alloc `apply_into` paths. `a_alpha` and
+    /// `correction_m_alpha` (the directional first mode derivative
+    /// `β̇(α) = −Σ_j α_j v_j`) are the alpha-dependent quantities precomputed once
+    /// per call by the caller. `psi_contrib` carries the per-call ψψ-block hook
+    /// contraction (#740); `None` keeps the ψψ block in the precomputed tables.
     pub(crate) fn outer_hessian_index_entry(
         &self,
         idx: usize,
         alpha: &Array1<f64>,
         a_alpha: f64,
         correction_m_alpha: &Array1<f64>,
-        callback_neg_m_alpha: Option<&Array1<f64>>,
         psi_contrib: Option<&PsiContractedContrib>,
     ) -> Result<f64, String> {
         let coord = &self.coords[idx];
@@ -670,11 +685,7 @@ impl UnifiedOuterHessianOperator {
                     if let Some((contrib, i)) = psi_row {
                         rhs.scaled_add(-1.0, &contrib.score.row(i));
                     }
-                    self.callback_correction_trace(
-                        &rhs,
-                        second_v,
-                        callback_neg_m_alpha.expect("callback negated mode"),
-                    )?
+                    self.callback_correction_trace(&rhs, second_v, correction_m_alpha)?
                 }
             }
         } else {
@@ -723,9 +734,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             }
         }
         let correction_m_alpha = self.theta_direction_mode_response(alpha);
-        let callback_neg_m_alpha =
-            matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
-                .then(|| -&correction_m_alpha);
         // #740: one ψψ-block hook contraction per matvec (one family row pass),
         // shared read-only across the parallel per-row entries below.
         let psi_contrib = self.psi_contracted_contrib(alpha)?;
@@ -739,7 +747,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                     alpha,
                     a_alpha,
                     &correction_m_alpha,
-                    callback_neg_m_alpha.as_ref(),
                     psi_contrib.as_ref(),
                 )
             })
@@ -786,9 +793,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             }
         }
         let correction_m_alpha = self.theta_direction_mode_response(alpha);
-        let callback_neg_m_alpha =
-            matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
-                .then(|| -&correction_m_alpha);
         // #740: one ψψ-block hook contraction per matvec (see `matvec`).
         let psi_contrib = self.psi_contracted_contrib(alpha)?;
         let slice = out
@@ -803,7 +807,6 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                     alpha,
                     a_alpha,
                     &correction_m_alpha,
-                    callback_neg_m_alpha.as_ref(),
                     psi_contrib.as_ref(),
                 )?;
                 Ok(())
@@ -1535,19 +1538,17 @@ pub(crate) fn build_outer_hessian_operator(
         None
     };
 
+    // Per-coordinate FIRST mode derivative `β_idx = −v_idx`, the second argument
+    // of the bilinear `compute_d2h(β(α), β_idx)` callback correction. The true
+    // mode derivative is `−v` for BOTH ρ and ψ/ext (matching `dense.rs`, which
+    // uses `v.mapv(|x| −x)` with no `is_ext` branch); see the sign-convention
+    // note on `theta_direction_mode_response`. Using `−v` uniformly here keeps
+    // `compute_d2h`'s two arguments in the SAME true `β̇ = −v` convention as the
+    // directional `theta_direction_mode_response`, so the cross ρ-ψ second-order
+    // term carries the correct sign (the previous `is_ext` flip cancelled on the
+    // pure-ρ/pure-ψ diagonals but flipped the cross block).
     let callback_second_modes = matches!(kernel, OuterHessianDerivativeKernel::Callback { .. })
-        .then(|| {
-            coords
-                .iter()
-                .map(|coord| {
-                    if coord.is_ext() {
-                        coord.v.clone()
-                    } else {
-                        -&coord.v
-                    }
-                })
-                .collect::<Vec<_>>()
-        });
+        .then(|| coords.iter().map(|coord| -&coord.v).collect::<Vec<_>>());
     let fourth_trace = if incl_logdet_h && adjoint_z_c.is_some() {
         match (&kernel, leverage.as_ref()) {
             (

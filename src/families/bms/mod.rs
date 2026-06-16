@@ -1110,9 +1110,17 @@ impl LatentZConditionalCalibration {
                 vb.ncols()
             ));
         }
-        // G = Σ_i s_i ⊗ (∂ζ_i/∂θ₁)  (p_β × dim θ₁). Floored rows yield a
-        // zero J_zeta row, so they drop out of the accumulation exactly.
-        let mut g = Array2::<f64>::zeros((p_beta, dim_theta1));
+        // G = Σ_i s_i ⊗ (∂ζ_i/∂θ₁)  (p_β × dim θ₁). Each row contributes the
+        // rank-1 outer product `s_i ⊗ J_zeta_i`, so summed over the n rows this
+        // is exactly the cross product `G = Sᵀ·J` of the score-sensitivity
+        // matrix `S` (`n × p_β`, supplied) and the per-row ζ-Jacobian matrix
+        // `J` (`n × dim θ₁`). Forming `J` row-by-row is O(n·dim θ₁); the cross
+        // product is then a single BLAS-3 GEMM rather than the O(n·p_β·dim θ₁)
+        // scalar triple loop (≈1.5e9 FMA at biobank scale, n≈194k, the dominant
+        // ~13s/disease cost of the SE correction). Floored rows yield an exact
+        // all-zero `J` row, so they contribute zero to the GEMM — bit-identical
+        // to skipping them, no approximation.
+        let mut j_mat = Array2::<f64>::zeros((n, dim_theta1));
         for i in 0..n {
             let j_zeta_row = self.zeta_theta1_jacobian_row(z[i], a_block.row(i));
             assert_eq!(
@@ -1120,23 +1128,15 @@ impl LatentZConditionalCalibration {
                 dim_theta1,
                 "J_zeta row width must match the first-stage hyperparameter dimension"
             );
-            let s_i = score_zeta_sensitivity.row(i);
-            // Skip the outer product when the row carries no first-stage
-            // sensitivity (all-zero J_zeta on a floored row) — pure savings,
-            // bit-identical to accumulating zeros.
-            if j_zeta_row.iter().all(|&v| v == 0.0) {
-                continue;
-            }
-            for (b, &s_b) in s_i.iter().enumerate() {
-                if s_b == 0.0 {
-                    continue;
-                }
-                for (k, &jz) in j_zeta_row.iter().enumerate() {
-                    g[[b, k]] += s_b * jz;
-                }
+            let mut dst = j_mat.row_mut(i);
+            for (slot, jz) in dst.iter_mut().zip(j_zeta_row.into_iter()) {
+                *slot = jz;
             }
         }
-        // Vb·G = H_β⁻¹·G (vb is the naive reduced-frame covariance).
+        // G = Sᵀ·J (p_β × dim θ₁) via the SIMD/GPU-routed cross product.
+        let g = crate::linalg::faer_ndarray::fast_atb(&score_zeta_sensitivity, &j_mat);
+        // Vb·G = H_β⁻¹·G (vb is the naive reduced-frame covariance the fit
+        // already produced — reused, never recomputed).
         let vb_g = vb.dot(&g);
         Ok(self.generated_regressor_term(vb_g.view()))
     }
@@ -1297,39 +1297,28 @@ pub(crate) fn robust_conditional_score_pvalue(
             weights.len()
         ));
     }
-    let mut s = Array1::<f64>::zeros(r);
-    let mut omega = Array2::<f64>::zeros((r, r));
+    // Build the per-row scaled basis `B` with `B_i = (w_i u_i) ã_i` once, then
+    // recover both the score and the HC0 robust meat from it with two BLAS-3
+    // GEMMs over chunked row-blocks instead of an `O(n · r²)` per-row scatter:
+    //   • score  `s   = ãᵀ (w ∘ u) = Bᵀ 1`     (column sums of `B`),
+    //   • meat   `Ω̂  = Σ_i w_i² u_i² ã_i ã_iᵀ = BᵀB` since `(w_i u_i)² = w_i² u_i²`.
+    // A non-positive weight zeroes that row of `B` (its score and meat
+    // contributions both vanish), reproducing the `wi <= 0.0` skip EXACTLY.
+    // `fast_ata` is the same parallel Gramian the second-stage sandwich uses, so
+    // the statistic is numerically identical to the row-accumulated form up to
+    // the deterministic GEMM reduction order.
+    let mut b = a_centered.to_owned();
     for i in 0..n {
         let wi = weights[i];
-        if wi <= 0.0 {
+        let scale = if wi > 0.0 { wi * u[i] } else { 0.0 };
+        if scale == 0.0 {
+            b.row_mut(i).fill(0.0);
             continue;
         }
-        let ui = u[i];
-        let a_row = a_centered.row(i);
-        let wu = wi * ui;
-        for j in 0..r {
-            s[j] += wu * a_row[j];
-        }
-        // HC0 robust meat: Σ wᵢ² uᵢ² ãᵢ ãᵢᵀ.
-        let w2u2 = wi * wi * ui * ui;
-        if w2u2 == 0.0 {
-            continue;
-        }
-        for j in 0..r {
-            let aj = a_row[j];
-            if aj == 0.0 {
-                continue;
-            }
-            let scaled = w2u2 * aj;
-            for k in j..r {
-                let inc = scaled * a_row[k];
-                omega[[j, k]] += inc;
-                if k != j {
-                    omega[[k, j]] += inc;
-                }
-            }
-        }
+        b.row_mut(i).iter_mut().for_each(|value| *value *= scale);
     }
+    let s = b.sum_axis(ndarray::Axis(0));
+    let omega = crate::linalg::faer_ndarray::fast_ata(&b);
     if !s.iter().all(|v| v.is_finite()) || !omega.iter().all(|v| v.is_finite()) {
         return Ok(None);
     }
@@ -1909,8 +1898,64 @@ pub(super) const BMS_DERIV_TOL: f64 = 1e-8;
 /// remainder (relative to that pair's weight), so a pair/bin that is filled to
 /// within a few ulps advances the cursor instead of spinning on round-off.
 pub(super) const EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL: f64 = 1e-14;
-/// Chunk size for parallel row accumulation (rows per task).
+/// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
+/// row-accumulation phases.
+///
+/// This is also a hard *ceiling* the pool-aware [`bms_row_chunk_size`] must
+/// respect: several per-chunk fast paths (block-Hessian / block-gradient
+/// assembly) allocate fixed `[0.0f64; ROW_CHUNK_SIZE]` stack buffers and index
+/// them by the chunk's local row position, so a chunk may never carry more than
+/// `ROW_CHUNK_SIZE` rows.
 pub(super) const ROW_CHUNK_SIZE: usize = 1024;
+/// Floor for rows-per-chunk: below it the per-chunk scratch allocation +
+/// scheduler hand-off cost dominates the row arithmetic. Small enough that a
+/// moderate `n` on a many-core box still carves several chunks per worker.
+pub(super) const ROW_CHUNK_MIN: usize = 64;
+/// Target number of row-chunks per rayon worker for the BMS exact-Newton
+/// row-fan-out phases (gradient / HVP / diagonal directional-derivative sweeps).
+///
+/// Several chunks per worker keeps the pool load-balanced across the uneven
+/// per-row cost tail (work-stealing moves whole chunks, never partial sums) so
+/// the heavy coord-corrections / row-stream phases saturate the cores instead
+/// of stranding the tail on one worker.
+pub(super) const ROW_CHUNKS_PER_WORKER: usize = 4;
+
+/// Pool-aware rows-per-chunk for the BMS exact-Newton row fan-outs.
+///
+/// A *fixed* `ROW_CHUNK_SIZE` divisor makes the chunk **count** scale with `n`,
+/// so at moderate `n` (e.g. `n = 10·ROW_CHUNK_SIZE` on a 64-core box) the
+/// `into_par_iter` over `⌈n/ROW_CHUNK_SIZE⌉` chunks has far fewer tasks than
+/// workers and most cores idle — the measured ~30-90% core utilization on the
+/// biobank coord-corrections / row-stream phases. This sizes the chunk so the
+/// chunk count targets `ROW_CHUNKS_PER_WORKER × worker_count` (the same policy
+/// `chunked_row_reduction` uses), clamped to `[ROW_CHUNK_MIN, ROW_CHUNK_SIZE]`:
+///
+/// * the `ROW_CHUNK_SIZE` ceiling is mandatory — the block-assembly fast paths
+///   index fixed `[…; ROW_CHUNK_SIZE]` stack buffers by local row, so a chunk
+///   can never exceed it. At large `n` the per-1024-row count already exceeds
+///   the worker count, so the clamp costs nothing there;
+/// * the `ROW_CHUNK_MIN` floor stops sub-floor fan-out at tiny `n`.
+///
+/// The worker count is fixed for the process (one global pool; gam owns its
+/// threads), so for a given `n` the returned chunk size — and therefore the
+/// chunk boundaries `chunk_idx·chunk → (chunk_idx+1)·chunk` — is stable across
+/// calls regardless of rayon work-stealing. The `try_fold`/`try_reduce` callers
+/// already round-trip through these fixed boundaries, so swapping the divisor
+/// changes only the chunk *count*, never how a chunk's rows are summed; any
+/// bit-for-bit reduction-order property they had (same `n` ⇒ same boundaries ⇒
+/// same tree) is preserved.
+#[inline]
+pub(super) fn bms_row_chunk_size(n: usize) -> usize {
+    if n == 0 {
+        return ROW_CHUNK_SIZE;
+    }
+    let workers = rayon::current_num_threads().max(1);
+    let target_chunks = workers.saturating_mul(ROW_CHUNKS_PER_WORKER).max(1);
+    // Rows per chunk that yields ≈ `target_chunks` chunks, clamped into
+    // `[ROW_CHUNK_MIN, ROW_CHUNK_SIZE]`.
+    n.div_ceil(target_chunks)
+        .clamp(ROW_CHUNK_MIN, ROW_CHUNK_SIZE)
+}
 pub(super) const EXACT_WORK_LOG_MIN_ROWS: usize = 50_000;
 pub(super) const BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES: usize = 3;
 pub(super) const BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES: usize = 2;

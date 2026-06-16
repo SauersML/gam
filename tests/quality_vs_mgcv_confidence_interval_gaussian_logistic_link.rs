@@ -72,6 +72,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::{Array1, Array2};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::f64::consts::PI;
 
 /// Number of independent Bernoulli response replicates drawn on the fixed
@@ -171,10 +172,7 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
         ..FitConfig::default()
     };
 
-    let mut gam_eta_hits = 0usize;
-    let mut gam_mean_hits = 0usize;
     let total_trials = N_REPLICATES * N;
-    let mut edf_sum = 0.0_f64;
 
     // Bernoulli response replicates, drawn from the continuing seed-123 stream
     // so the (design, replicate) data are bit-for-bit reproducible and feed the
@@ -182,12 +180,6 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
     let replicates: Vec<Vec<f64>> = (0..N_REPLICATES)
         .map(|_| bernoulli_replicate(&mu_true, &mut rng))
         .collect();
-
-    // Rep-0 gam standard errors on the link scale, retained for the direct
-    // band-scale agreement check against mgcv (a different angle from coverage:
-    // it pins the `√(x Vᵦ x)` quadratic form + link Jacobian against the gold
-    // standard, not just the downstream coverage aggregate).
-    let mut gam_eta_se_rep0: Vec<f64> = Vec::new();
 
     let options = |mode: InferenceCovarianceMode| PredictUncertaintyOptions {
         confidence_level: 0.95,
@@ -202,89 +194,139 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
         ..PredictUncertaintyOptions::default()
     };
 
-    for (rep_idx, rep) in replicates.iter().enumerate() {
-        assert!(
-            rep.iter().any(|&v| v > 0.5) && rep.iter().any(|&v| v < 0.5),
-            "synthetic outcome must contain both classes"
-        );
+    // The replicates are independent fits on a fixed design (only `y` varies);
+    // each replicate's hit counts, EDF and rep-0 SE band are deterministic
+    // functions of its own data, unaffected by how the loop is scheduled. We fan
+    // the (dominant) per-replicate fits across the rayon pool, then fold the
+    // results back IN REPLICATE ORDER so the integer coverage counts AND the
+    // floating-point `edf_sum` are bit-identical to the serial accumulation —
+    // no asserted quantity changes, only wall-clock.
+    struct RepOutcome {
+        eta_hits: usize,
+        mean_hits: usize,
+        edf: f64,
+        eta_se_rep0: Option<Vec<f64>>,
+    }
 
-        // ---- build a gam dataset from (x, y_rep) ---------------------------
-        let records: Vec<csv::StringRecord> = (0..N)
-            .map(|i| {
-                csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", rep[i])])
-            })
-            .collect();
-        let ds = encode_recordswith_inferred_schema(headers.clone(), records)
-            .expect("encode synthetic replicate");
-        let col = ds.column_map();
-        let x_idx = col["x"];
+    let outcomes: Vec<RepOutcome> = replicates
+        .par_iter()
+        .enumerate()
+        .map(|(rep_idx, rep)| {
+            assert!(
+                rep.iter().any(|&v| v > 0.5) && rep.iter().any(|&v| v < 0.5),
+                "synthetic outcome must contain both classes"
+            );
 
-        // ---- fit gam: y ~ s(x, k=K), Binomial(logit), REML -----------------
-        let formula = format!("y ~ s(x, k={K})");
-        let result = fit_from_formula(&formula, &ds, &cfg).expect("gam binomial(logit) fit");
-        let FitResult::Standard(fit) = result else {
-            panic!("binomial(logit) smooth should be a Standard fit");
-        };
-        edf_sum += fit.fit.edf_total().unwrap_or(0.0);
-        assert!(
-            fit.fit.beta_covariance_corrected().is_some(),
-            "smoothing-parameter-corrected Vp must be available for every fit \
-             (the Nychka calibration target); replicate {rep_idx} produced none"
-        );
+            // ---- build a gam dataset from (x, y_rep) ---------------------------
+            let records: Vec<csv::StringRecord> = (0..N)
+                .map(|i| {
+                    csv::StringRecord::from(vec![
+                        format!("{:.17e}", x[i]),
+                        format!("{:.17e}", rep[i]),
+                    ])
+                })
+                .collect();
+            let ds = encode_recordswith_inferred_schema(headers.clone(), records)
+                .expect("encode synthetic replicate");
+            let col = ds.column_map();
+            let x_idx = col["x"];
 
-        // ---- rebuild the design at the training points and predict CIs -----
-        let mut grid = Array2::<f64>::zeros((N, ds.headers.len()));
-        for (i, &xi) in x.iter().enumerate() {
-            grid[[i, x_idx]] = xi;
-        }
-        let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-            .expect("rebuild design at training points");
-        let gam_eta_check = design.design.apply(&fit.fit.beta);
-        assert_eq!(gam_eta_check.len(), N, "design eta length mismatch");
-        let offset = Array1::<f64>::zeros(N);
+            // ---- fit gam: y ~ s(x, k=K), Binomial(logit), REML -----------------
+            let formula = format!("y ~ s(x, k={K})");
+            let result = fit_from_formula(&formula, &ds, &cfg).expect("gam binomial(logit) fit");
+            let FitResult::Standard(fit) = result else {
+                panic!("binomial(logit) smooth should be a Standard fit");
+            };
+            let edf = fit.fit.edf_total().unwrap_or(0.0);
+            assert!(
+                fit.fit.beta_covariance_corrected().is_some(),
+                "smoothing-parameter-corrected Vp must be available for every fit \
+                 (the Nychka calibration target); replicate {rep_idx} produced none"
+            );
 
-        // Bias correction OFF, boundary/OOD inflation OFF. The covariance is the
-        // smoothing-parameter-corrected Bayesian Vp (Marra & Wood 2012), which
-        // is exactly what mgcv's `predict(se.fit=TRUE)` reports — the band whose
-        // ACROSS-THE-FUNCTION coverage tracks the nominal level.
-        let pred = predict_gamwith_uncertainty(
-            design.design.clone(),
-            fit.fit.beta.view(),
-            offset.view(),
-            LikelihoodSpec::binomial_logit(),
-            &fit.fit,
-            &options(InferenceCovarianceMode::ConditionalPlusSmoothingPreferred),
-        )
-        .expect("gam uncertainty under logit link");
-
-        // Pool gam's nominal-95% interval coverage of the KNOWN truth, both
-        // scales, across this replicate's grid.
-        for i in 0..N {
-            if eta_true[i] >= pred.eta_lower[i] && eta_true[i] <= pred.eta_upper[i] {
-                gam_eta_hits += 1;
+            // ---- rebuild the design at the training points and predict CIs -----
+            let mut grid = Array2::<f64>::zeros((N, ds.headers.len()));
+            for (i, &xi) in x.iter().enumerate() {
+                grid[[i, x_idx]] = xi;
             }
-            if mu_true[i] >= pred.mean_lower[i] && mu_true[i] <= pred.mean_upper[i] {
-                gam_mean_hits += 1;
-            }
-        }
+            let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+                .expect("rebuild design at training points");
+            let gam_eta_check = design.design.apply(&fit.fit.beta);
+            assert_eq!(gam_eta_check.len(), N, "design eta length mismatch");
+            let offset = Array1::<f64>::zeros(N);
 
-        if rep_idx == 0 {
-            // For the band-scale agreement check we want the CONDITIONAL Vᵦ
-            // band (the exact analogue of mgcv's default `se.fit`, which omits
-            // the smoothing-parameter-uncertainty term), so the comparison is
-            // apples-to-apples on the core covariance machinery.
-            let pred_cond = predict_gamwith_uncertainty(
+            // Bias correction OFF, boundary/OOD inflation OFF. The covariance is the
+            // smoothing-parameter-corrected Bayesian Vp (Marra & Wood 2012), which
+            // is exactly what mgcv's `predict(se.fit=TRUE)` reports — the band whose
+            // ACROSS-THE-FUNCTION coverage tracks the nominal level.
+            let pred = predict_gamwith_uncertainty(
                 design.design.clone(),
                 fit.fit.beta.view(),
                 offset.view(),
                 LikelihoodSpec::binomial_logit(),
                 &fit.fit,
-                &options(InferenceCovarianceMode::Conditional),
+                &options(InferenceCovarianceMode::ConditionalPlusSmoothingPreferred),
             )
-            .expect("gam conditional uncertainty under logit link");
-            gam_eta_se_rep0 = (0..N)
-                .map(|i| (pred_cond.eta_upper[i] - pred_cond.eta_lower[i]) / (2.0 * 1.959964))
-                .collect();
+            .expect("gam uncertainty under logit link");
+
+            // Pool gam's nominal-95% interval coverage of the KNOWN truth, both
+            // scales, across this replicate's grid.
+            let mut eta_hits = 0usize;
+            let mut mean_hits = 0usize;
+            for i in 0..N {
+                if eta_true[i] >= pred.eta_lower[i] && eta_true[i] <= pred.eta_upper[i] {
+                    eta_hits += 1;
+                }
+                if mu_true[i] >= pred.mean_lower[i] && mu_true[i] <= pred.mean_upper[i] {
+                    mean_hits += 1;
+                }
+            }
+
+            let eta_se_rep0 = if rep_idx == 0 {
+                // For the band-scale agreement check we want the CONDITIONAL Vᵦ
+                // band (the exact analogue of mgcv's default `se.fit`, which omits
+                // the smoothing-parameter-uncertainty term), so the comparison is
+                // apples-to-apples on the core covariance machinery.
+                let pred_cond = predict_gamwith_uncertainty(
+                    design.design.clone(),
+                    fit.fit.beta.view(),
+                    offset.view(),
+                    LikelihoodSpec::binomial_logit(),
+                    &fit.fit,
+                    &options(InferenceCovarianceMode::Conditional),
+                )
+                .expect("gam conditional uncertainty under logit link");
+                Some(
+                    (0..N)
+                        .map(|i| {
+                            (pred_cond.eta_upper[i] - pred_cond.eta_lower[i]) / (2.0 * 1.959964)
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
+            RepOutcome {
+                eta_hits,
+                mean_hits,
+                edf,
+                eta_se_rep0,
+            }
+        })
+        .collect();
+
+    // Fold in replicate order for bit-identical sums.
+    let mut gam_eta_hits = 0usize;
+    let mut gam_mean_hits = 0usize;
+    let mut edf_sum = 0.0_f64;
+    let mut gam_eta_se_rep0: Vec<f64> = Vec::new();
+    for outcome in &outcomes {
+        gam_eta_hits += outcome.eta_hits;
+        gam_mean_hits += outcome.mean_hits;
+        edf_sum += outcome.edf;
+        if let Some(se) = &outcome.eta_se_rep0 {
+            gam_eta_se_rep0 = se.clone();
         }
     }
 

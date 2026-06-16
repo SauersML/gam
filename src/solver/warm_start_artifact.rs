@@ -97,18 +97,35 @@ pub struct TermIdentityKey(pub Fingerprint);
 /// "same model, different rows" while splitting on a genuine structural change
 /// (a different #penalties, a different label set, a different basis size).
 ///
+/// `reduced_width` is the realized per-block coefficient dimension
+/// (`spec.design.ncols()`) — the basis column count *after* the
+/// identifiability reduction, which is the load-bearing dimension of the
+/// block's β. It is fold-invariant within one model (LOSO drops rows, never
+/// columns) but DIFFERS across models whose spatial basis collapses to a lower
+/// effective support (e.g. a duchon marginal that realizes p=21 on one disease
+/// and p=45 on another). Folding it into the identity is what makes a p=37 fit
+/// refuse to match a p=85 artifact: without it, two models with the same block
+/// name / penalty-label / nullspace SHAPE but different realized β-width hash to
+/// the SAME [`TermIdentityKey`] (and hence the same [`FitDescriptor`] key),
+/// producing the spurious "cached inner beta has length 85, but blocks require
+/// length 37" lookups. With it, only fits whose per-block β actually live in the
+/// same-dimension coordinate system match — so the gauge β-projection is always
+/// well-posed and same-width folds transfer ρ AND β, while different-width
+/// models never collide.
+///
 /// NOTE (architect-assumption mismatch): the original design routed identity
 /// through `SmoothTerm.metadata`, but at this layer that metadata has already
-/// been compiled away. The block name + penalty structure is the honest,
-/// fold-invariant identity available here.
+/// been compiled away. The block name + penalty structure + realized reduced
+/// width is the honest, fold-invariant identity available here.
 pub fn term_identity_from_block(
     role: TermRole,
     block_name: &str,
     precision_labels: &[Option<String>],
     nullspace_dims: &[usize],
+    reduced_width: usize,
 ) -> TermIdentityKey {
     let mut fp = Fingerprinter::new();
-    fp.absorb_tag(b"fit-artifact-block-identity-v1");
+    fp.absorb_tag(b"fit-artifact-block-identity-v2");
     fp.absorb_u64(b"role", u64::from(role.discriminant()));
     fp.absorb_str(b"block_name", block_name);
     fp.absorb_u64(b"n_penalties", precision_labels.len() as u64);
@@ -122,6 +139,7 @@ pub fn term_identity_from_block(
     for d in nullspace_dims {
         fp.absorb_u64(b"nullspace_dim", *d as u64);
     }
+    fp.absorb_u64(b"reduced_width", reduced_width as u64);
     TermIdentityKey(fp.finalize())
 }
 
@@ -290,9 +308,10 @@ mod tests {
     use ndarray::Array2;
 
     /// Build a block-layer term identity (the surviving, fold-invariant
-    /// identity API). One unlabeled penalty with the given nullspace dim.
+    /// identity API). One unlabeled penalty with the given nullspace dim and a
+    /// fixed realized reduced width.
     fn block_id(role: TermRole, block_name: &str) -> TermIdentityKey {
-        term_identity_from_block(role, block_name, &[None], &[1])
+        term_identity_from_block(role, block_name, &[None], &[1], 10)
     }
 
     /// A minimal serializable basis-meta stub, as produced at the block-spec
@@ -325,9 +344,35 @@ mod tests {
 
     #[test]
     fn block_identity_splits_on_penalty_structure() {
-        let one = term_identity_from_block(TermRole::Mean, "s(x)", &[None], &[1]);
-        let two = term_identity_from_block(TermRole::Mean, "s(x)", &[None, None], &[1]);
+        let one = term_identity_from_block(TermRole::Mean, "s(x)", &[None], &[1], 10);
+        let two = term_identity_from_block(TermRole::Mean, "s(x)", &[None, None], &[1], 10);
         assert_ne!(one, two, "different #penalties must split identity");
+    }
+
+    #[test]
+    fn block_identity_splits_on_reduced_width() {
+        // The biobank LOSO collision: two models with identical block name /
+        // penalty / nullspace SHAPE but a different realized per-block β width
+        // (p=45 marginal vs the collapsed p=21) MUST hash to distinct
+        // identities, so a p=37 fit never matches a p=85 artifact.
+        let wide = term_identity_from_block(TermRole::Mean, "s(x)", &[None], &[1], 45);
+        let narrow = term_identity_from_block(TermRole::Mean, "s(x)", &[None], &[1], 21);
+        assert_ne!(
+            wide, narrow,
+            "different realized reduced width must split identity"
+        );
+    }
+
+    #[test]
+    fn block_identity_matches_across_folds_at_equal_width() {
+        // The marquee LOSO win: same model, same realized width, different rows
+        // -> identical identity, so ρ and the gauge β-projection both transfer.
+        let fold_a = term_identity_from_block(TermRole::Mean, "s(x)", &[None], &[1], 45);
+        let fold_b = term_identity_from_block(TermRole::Mean, "s(x)", &[None], &[1], 45);
+        assert_eq!(
+            fold_a, fold_b,
+            "same model at equal width must share identity across folds"
+        );
     }
 
     #[test]

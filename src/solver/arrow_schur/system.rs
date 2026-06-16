@@ -1490,40 +1490,115 @@ impl StreamingArrowSchur {
             });
         }
         let backend = CpuBatchedBlockSolver;
-        for row_idx in start..end {
-            let row = (self.row_builder)(row_idx)?;
-            let di = row.htt.nrows();
-            self.validate_row(row_idx, &row)?;
-            let htbeta = self.row_htbeta(row_idx, &row, di);
-            let factor =
-                factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
-            let v = backend.solve_block_vector(factor.view(), row.gt.view());
-            for c in 0..di {
-                let vc = v[c];
-                if vc == 0.0 {
-                    continue;
+        let k = self.k;
+        // Per-row factor + two block solves + a `k×k` GEMM subtract is the whole
+        // assembly cost at the SAE LLM shape (#1017); the rows are independent so
+        // the chunk fans across cores. Stay sequential for the handful-of-rows
+        // non-SAE callers, or when already inside a rayon worker (the topology
+        // race fans candidates with `run_topology_race_parallel`) to avoid
+        // nested-rayon oversubscription — the same gate `schur_matvec` uses.
+        let parallel = (end - start) >= SCHUR_MATVEC_PARALLEL_ROW_MIN
+            && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            // Bind `&self` so the per-row body borrows only the immutable
+            // streaming state. Each row contributes `+H_βt^(i)(H_tt^(i))⁻¹ g_t^(i)`
+            // (length `k`) to the reduced RHS and `−H_βt^(i)(H_tt^(i))⁻¹ H_tβ^(i)`
+            // (`k×k`) to the reduced Schur complement; both are written INTO a
+            // worker-private `(rhs_part, s_part)` pair so the chunk partials fold
+            // back in chunk order — bit-identical run-to-run regardless of thread
+            // scheduling (the #1017 verification gate: the criterion ranking
+            // across topology candidates must not move).
+            let this: &Self = self;
+            let row_into = |row_idx: usize,
+                            rhs_part: &mut Array1<f64>,
+                            s_part: &mut Array2<f64>|
+             -> Result<(), ArrowSchurError> {
+                let row = (this.row_builder)(row_idx)?;
+                let di = row.htt.nrows();
+                this.validate_row(row_idx, &row)?;
+                let htbeta = this.row_htbeta(row_idx, &row, di);
+                let factor =
+                    factor_one_row(&row, ridge_t, di, row_idx, this.tolerate_ill_conditioning)?;
+                let v = backend.solve_block_vector(factor.view(), row.gt.view());
+                for c in 0..di {
+                    let vc = v[c];
+                    if vc == 0.0 {
+                        continue;
+                    }
+                    for a in 0..k {
+                        rhs_part[a] += htbeta[[c, a]] * vc;
+                    }
                 }
-                for a in 0..self.k {
-                    self.rhs_acc[a] += htbeta[[c, a]] * vc;
+                match mode {
+                    // InexactPCG differs from Direct only in how the *reduced*
+                    // system is solved, not in how it is assembled, so it shares
+                    // the dense Schur subtraction here (see the serial branch).
+                    ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
+                        let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
+                        backend.block_gemm_subtract(s_part, &htbeta, &solved);
+                    }
+                    ArrowSolverMode::SqrtBA => {
+                        let whitened =
+                            backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
+                        backend.block_gemm_subtract(s_part, &whitened, &whitened);
+                    }
                 }
+                Ok(())
+            };
+            let partials: Vec<(Array1<f64>, Array2<f64>)> = (start..end)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let mut rhs_part = Array1::<f64>::zeros(k);
+                    let mut s_part = Array2::<f64>::zeros((k, k));
+                    for i in idxs {
+                        row_into(i, &mut rhs_part, &mut s_part)?;
+                    }
+                    Ok::<_, ArrowSchurError>((rhs_part, s_part))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Deterministic ordered reduction: fold chunk partials left-to-right.
+            // `block_gemm_subtract` already subtracted into each `s_part`, so the
+            // partials carry the negative Schur contribution; add them in.
+            for (rhs_part, s_part) in &partials {
+                for a in 0..k {
+                    self.rhs_acc[a] += rhs_part[a];
+                }
+                self.s_acc += s_part;
             }
-            match mode {
-                // The streaming accumulator forms the dense reduced Schur
-                // complement `S = H_ββ + ridge·I − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`
-                // incrementally across chunks. `InexactPCG` differs from
-                // `Direct` only in how the *reduced* system is solved, not in
-                // how it is assembled — and `solve_dense_reduced_system` already
-                // owns the reduced solve. So InexactPCG reduces, by construction,
-                // to the same dense Schur subtraction here; the prior hard
-                // rejection at this site is lifted because chunked assembly is
-                // exactly the matrix-free reduction the PCG path wants.
-                ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
-                    let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
-                    backend.block_gemm_subtract(&mut self.s_acc, &htbeta, &solved);
+        } else {
+            // Serial path accumulates DIRECTLY into the running `self.{rhs,s}_acc`
+            // (which carry the `reset_accumulator` seed `H_ββ + ridge·I`), exactly
+            // as before — bit-for-bit unchanged for the handful-of-rows callers.
+            for row_idx in start..end {
+                let row = (self.row_builder)(row_idx)?;
+                let di = row.htt.nrows();
+                self.validate_row(row_idx, &row)?;
+                let htbeta = self.row_htbeta(row_idx, &row, di);
+                let factor =
+                    factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
+                let v = backend.solve_block_vector(factor.view(), row.gt.view());
+                for c in 0..di {
+                    let vc = v[c];
+                    if vc == 0.0 {
+                        continue;
+                    }
+                    for a in 0..k {
+                        self.rhs_acc[a] += htbeta[[c, a]] * vc;
+                    }
                 }
-                ArrowSolverMode::SqrtBA => {
-                    let whitened = backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
-                    backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
+                match mode {
+                    ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
+                        let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
+                        backend.block_gemm_subtract(&mut self.s_acc, &htbeta, &solved);
+                    }
+                    ArrowSolverMode::SqrtBA => {
+                        let whitened =
+                            backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
+                        backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
+                    }
                 }
             }
         }
@@ -1673,17 +1748,27 @@ impl StreamingArrowSchur {
         // Total delta_t length = row_offsets[n_rows].
         let total_len = self.row_offsets[self.n_rows];
         let mut delta_t = Array1::<f64>::zeros(total_len);
-        let mut rhs = Array1::<f64>::zeros(self.d);
-        for start in (0..self.n_rows).step_by(self.chunk_size) {
-            let end = (start + self.chunk_size).min(self.n_rows);
-            for row_idx in start..end {
+        // Each row's back-solve `Δt_i = -(H_tt^(i))⁻¹(g_t^(i) + H_tβ^(i)Δβ)`
+        // writes a DISJOINT segment `delta_t[row_base .. row_base+di]` — no
+        // cross-row reduction, so this is embarrassingly parallel and the scatter
+        // is bit-identical regardless of which thread produced each segment (the
+        // #1017 verification gate). At the SAE LLM shape (`n` in the thousands)
+        // the per-row factor + solve is the whole cost; below the threshold, or
+        // when already inside a rayon worker (the topology race fans candidates
+        // with `run_topology_race_parallel`), stay sequential to avoid
+        // nested-rayon oversubscription — the same guard `schur_matvec` uses.
+        let parallel =
+            self.n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            // Per-row body: factor, form the RHS, solve, return `-(dt_i)`.
+            let row_solve = |row_idx: usize| -> Result<(usize, Array1<f64>), ArrowSchurError> {
                 let row = (self.row_builder)(row_idx)?;
                 let di = row.htt.nrows();
                 self.validate_row(row_idx, &row)?;
                 let factor =
                     factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
-                // `H_tβ^(i) Δβ`: route through the procedural operator when
-                // present (no dense slab), else through the dense slab.
                 let mut htbeta_delta = Array1::<f64>::zeros(di);
                 if let Some(op) = self.htbeta_matvec.as_ref() {
                     op(row_idx, delta_beta, &mut htbeta_delta);
@@ -1696,13 +1781,68 @@ impl StreamingArrowSchur {
                         htbeta_delta[c] = acc;
                     }
                 }
+                let mut rhs = Array1::<f64>::zeros(di);
                 for c in 0..di {
                     rhs[c] = row.gt[c] + htbeta_delta[c];
                 }
                 let dt_i = backend.solve_block_vector(factor.view(), rhs.view());
-                let row_base = self.row_offsets[row_idx];
+                let mut neg = Array1::<f64>::zeros(di);
                 for c in 0..di {
-                    delta_t[row_base + c] = -dt_i[c];
+                    neg[c] = -dt_i[c];
+                }
+                Ok((self.row_offsets[row_idx], neg))
+            };
+            // Collect per-row segments under rayon, then scatter into the disjoint
+            // slices. Errors are surfaced via `collect::<Result<…>>`.
+            let segments: Vec<(usize, Array1<f64>)> = (0..self.n_rows)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    idxs.into_iter()
+                        .map(&row_solve)
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            for (base, seg) in &segments {
+                for (c, &v) in seg.iter().enumerate() {
+                    delta_t[base + c] = v;
+                }
+            }
+        } else {
+            let mut rhs = Array1::<f64>::zeros(self.d);
+            for start in (0..self.n_rows).step_by(self.chunk_size) {
+                let end = (start + self.chunk_size).min(self.n_rows);
+                for row_idx in start..end {
+                    let row = (self.row_builder)(row_idx)?;
+                    let di = row.htt.nrows();
+                    self.validate_row(row_idx, &row)?;
+                    let factor =
+                        factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
+                    // `H_tβ^(i) Δβ`: route through the procedural operator when
+                    // present (no dense slab), else through the dense slab.
+                    let mut htbeta_delta = Array1::<f64>::zeros(di);
+                    if let Some(op) = self.htbeta_matvec.as_ref() {
+                        op(row_idx, delta_beta, &mut htbeta_delta);
+                    } else {
+                        for c in 0..di {
+                            let mut acc = 0.0_f64;
+                            for a in 0..self.k {
+                                acc += row.htbeta[[c, a]] * delta_beta[a];
+                            }
+                            htbeta_delta[c] = acc;
+                        }
+                    }
+                    for c in 0..di {
+                        rhs[c] = row.gt[c] + htbeta_delta[c];
+                    }
+                    let dt_i = backend.solve_block_vector(factor.view(), rhs.view());
+                    let row_base = self.row_offsets[row_idx];
+                    for c in 0..di {
+                        delta_t[row_base + c] = -dt_i[c];
+                    }
                 }
             }
         }

@@ -1831,7 +1831,23 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // Same logic for non-Firth and Firth paths; firth_active just gates
     // the second pass.
     let stalled_at_valid_minimum = |summary: &WorkingModelPirlsResult| -> bool {
-        let dev_scale = summary.state.deviance.abs().max(1.0);
+        // Scale-equivariant deviance plateau band (issue #1127). The
+        // `last_deviance_change` compared below and the deviance both scale as
+        // `O(a²)` under a response rescaling `y → a·y` (the penalized normal
+        // equations are linear in `y`, so `β → a·β` and the RSS-deviance
+        // scales by `a²`). Keying the plateau band to the deviance's own
+        // magnitude `+ |penalty|` makes the ratio `Δdev / dev_scale`
+        // scale-invariant. The previous `.max(1.0)` absolute floor broke this:
+        // for a micro-unit response (`a = 1e-6`) the deviance is `O(1e-12)`, so
+        // the floor pinned the band at `1.0` — ~1e9× too loose — and this
+        // max-iteration rescue declared `progress_stopped` at an over-smoothed
+        // iterate, propagating an inflated `λ̂` to the outer REML loop. For a
+        // well-scaled (`a ≳ 1`) or up-scaled (`a = 1e6`) objective the floor was
+        // already a no-op, so those directions are byte-identical. A perfect
+        // interpolating fit gives a `0` band, so the relative `Δdev` test cannot
+        // fire spuriously and the scale-invariant `near_stationary_kkt`
+        // certificate then governs acceptance.
+        let dev_scale = summary.state.deviance.abs() + summary.state.penalty_term.abs();
         // Progress plateau uses the fixed solver tolerance; only the KKT band below adapts.
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;

@@ -1,3 +1,126 @@
+## gamfit 0.1.218 (2026-06-15)
+
+- **Build fix**: wire the whole-`Xᵀdiag(w)X` GPU joint-Hessian path
+  (`rigid_joint_hessian_on_gpu`) into the rigid `hessian_dense_override`, guarded
+  by a GPU-presence probe (CPU boxes skip the weight-vector alloc and take the
+  chunked-BLAS3 path unchanged). Clears the dead-code ban that failed 0.1.217.
+- Saturate the rayon pool in `chunked_row_reduction` (4×workers chunks, was a
+  fixed 32 that idled half a 64-core box) — completes the CPU-utilization fix.
+- `DenseDesignMatrix::cache_identity` for memoizing the `X·F` projection across
+  the k per-coordinate correction operators within one outer eval.
+
+## gamfit 0.1.217 (2026-06-15)
+
+- **Build fix**: re-export `SaeBasisEvaluator` in the pyffi prelude. The #1117 SAE
+  fix retyped evaluators to `dyn SaeBasisSecondJet`; calling its supertrait
+  `.evaluate()` needs `SaeBasisEvaluator` in scope, which broke the 0.1.216 wheel.
+- Perf sweep continues: n-independent outer loop (eliminate redundant ext-coord
+  n-row drift re-streams), SIMD-batched rigid per-row jet, GPU-routed rigid
+  `XᵀWX` Gram when CUDA present (CPU fallback otherwise), cross-disease duchon
+  basis+identifiability cache (build once for the shared cohort, not 17×), and
+  the BLAS-3 batched all-axes second-directional override (~p× on the dominant
+  coord_corrections term).
+
+## gamfit 0.1.216 (2026-06-15)
+
+Open-issue bug fixes + inner-solve perf:
+- **#1128**: `gamfit.fit(Surv(...))` with no `survival_likelihood` now defaults to
+  `transformation` (matching the CLI) instead of the broken `location-scale` that
+  aborted the identifiability audit on right-censored data. Fixed at the single
+  `FitConfig::default()` source.
+- **#1127**: Gaussian `s(x)` REML is now scale-equivariant to `y→a·y` — the
+  singularity floor `smooth_floor_dp` is a fraction of the weighted null deviance
+  (was absolute 1e-12), so `λ̂`/EDF/smooth-shape are invariant down to a=1e-8.
+- **#1117**: the SAE production term builder now installs the analytic second jet,
+  so a rank-deficient K=1 circle decoder reparametrizes to its data-supported rank
+  and completes stage1-step0 in budget instead of stalling.
+- **#1126** (already on main): measure-jet κ non-convergence degrades to the
+  certified baseline geometry instead of fatally aborting at tol=1e-10.
+- **PERF**: the inner DENSE_SPECTRAL joint-Newton path no longer re-applies the
+  matrix-free operator ~25× per cycle (trust-region model + Cauchy leg) — those
+  route through the already-materialized dense Hessian (O(n·p)→O(p²)).
+- Removed a second per-outer-eval `log::debug!` spam site (gated to once/process).
+
+## gamfit 0.1.215 (2026-06-15)
+
+- Remove per-call `[STAGE] BMS rigid ... BLAS-3 ... path TAKEN/NOT-taken` log
+  lines from the rigid row-kernel dispatch (added in 0.1.213 for one-shot gate
+  diagnostics). They fired on every `directional_derivative`/`hessian_dense`
+  call — thousands of lines per fit — flooding the run log. The gate logic is
+  unchanged; only the logging is removed.
+- Cross-fit warm-start descriptor now encodes the realized per-block reduced
+  β-width, so a p=37 fit no longer matches a p=85 artifact (no misleading
+  length-mismatch skip) while same-width LOSO folds still transfer β.
+
+## gamfit 0.1.214 (2026-06-15)
+
+Biobank BMS speed sweep — attacks every recurring cost in the outer REML/LAML
+loop, all exact (bit-faithful, no approximation, no skip flags):
+- **coord_corrections** (the ~1.5–4min/eval Jeffreys H_phi drift): β-fixed base
+  hoisted out of the per-direction loop + both p-axis row-stream sweeps
+  parallelized across cores.
+- **gradient_reload** (~5s/inner-cycle): the accepted trust-region line-search
+  workspace is now reused, collapsing each accepted cycle from two row passes to one.
+- **Murphy–Topel** SE correction and the **latent-z Rao-gate** score+meat: per-row
+  scalar scatters replaced with single BLAS-3 GEMMs.
+- **identifiability audit**: joint RRQR now runs from a single shared Gram (was a
+  second full n-row stream); trivial full-rank case skips the redundant pass.
+- **FFI encode**: column-major borrow (no StringRecord clone), parse-once, and a
+  content-fingerprint cache so the shared base cohort is encoded once across diseases.
+- **outer BFGS eval count**: the converged outer Hessian is transferred across LOSO
+  folds to seed quasi-Newton, cutting line-search probes.
+- **large-p outer LAML logdet**: one-pass dense assembly instead of p matvecs.
+- BLAS-3 rigid Hessian fires for operator-backed designs; warm-start cross-fit
+  length-mismatch declines to ρ-only instead of cold-starting.
+
+## gamfit 0.1.213 (2026-06-15)
+
+Continues the biobank BMS perf attack on the outer REML/LAML derivative path —
+the real wall-clock black hole (coord_corrections, not Newton/PIRLS):
+- **BLAS-3 rigid Hessian fires for operator-backed designs.** The cycle-0
+  `hessian_qp` (~8s) and directional `gradient_reload` (~8s) floors were the
+  BLAS-3 override bailing to the per-row BLAS-1 SYR scatter whenever the
+  marginal/logslope design is operator-backed (always, at biobank scale, via the
+  #461 influence absorber / #978 overlap-Z). The override now chunks via
+  `try_row_chunk` and fires for any non-sparse design (sparse still routes to the
+  sparse-aware scatter); a `[STAGE]` line logs why the fast path was/wasn't taken.
+- **Jeffreys H_phi drift base hoisted** out of the per-direction loop — the
+  β-fixed part of the coord_corrections H_phi correction is computed once instead
+  of re-streamed per smoothing direction (full batched single-pass contraction
+  landing on top).
+
+## gamfit 0.1.212 (2026-06-15)
+
+First publishable build since 0.1.209 — the 0.1.210/0.1.211 wheels failed the
+build.rs ban gate (agent-collision leftovers) and never reached PyPI. This
+ships everything since 0.1.209 with the gate cleared (USE-or-DELETE, no `_`
+silencers): the row-kernel dense/directional override defaults now run the
+extracted generic per-row path (genuinely consuming their args) while the rigid
+kernel overrides with the BLAS-3 fast path; heartbeat scope guards bound + dropped
+explicitly; dead `is_ext` removed. Folds in the real BMS perf work:
+**BLAS-3 Jeffreys hessian_qp** floor, **BLAS-3 gradient_reload** floor, the
+**same-β rigid third/fourth-tensor cache** (the genuine coord_corrections
+collapse — the rigid path was rebuilding the per-row tensor every outer eval),
+canonicalise fast-path, seed-screen skip on warm hits, warm-start BFGS metric,
+and heartbeat CPU/active-scope diagnostics. Correctness: #740 ψ outer-gradient
+KKT correction + the outer-HVP cross-ρψ second-order sign and full-H⁻¹ β̈ solve
+(audit-confirmed), Murphy-Topel oracle fixture redesign.
+
+## gamfit 0.1.211 (2026-06-15)
+
+BMS biobank-fit perf + diagnostics. (1) **BLAS-3 rigid dense joint-Hessian**
+for the post-step Jeffreys/Firth KKT-residual term (the `gradient_reload`
+~8s/cycle floor) — same BLAS-1→BLAS-3 chunked-Gram treatment as the hessian_qp
+fix, bit-for-bit, full-data dense-design gated (subsample/HT fall through).
+(2) **Named heartbeat scopes for rigid coord_corrections** so the process
+monitor localizes where that step's time goes. (3) ψ outer gradient routed
+through the unified KKT-residual correction when the inner residual r≠0 (#740),
+vanishing at exact KKT. NOTE: the BLAS-3 inner-kernel fixes (this + 0.1.210's
+hessian_qp + 0.1.208's coord_corrections) all gate on the full-data
+unit-weight dense-design path; a run is the truth test for whether the biobank
+fit hits that gate (0.1.208's coord_corrections fix did not visibly land, under
+investigation).
+
 ## gamfit 0.1.210 (2026-06-15)
 
 BMS biobank-fit perf: **BLAS-3 rigid joint-Hessian directional derivative**

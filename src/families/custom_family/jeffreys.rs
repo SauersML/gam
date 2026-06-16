@@ -387,7 +387,7 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
 /// uses `log|H + S_λ + H_Φ|` and its analytic ρ-derivatives
 /// `tr((H+S_λ+H_Φ)⁻¹ ∂_ρ(H+S_λ+H_Φ))`.
 ///
-/// CORRECTNESS NOTE (was a bug — see `custom_family_outer_jeffreys_hphi_drift`).
+/// CORRECTNESS NOTE (was a bug — see `custom_family_outer_jeffreys_hphi_drift_batched`).
 /// `H_Φ` has no EXPLICIT ρ-dependence, but it DOES depend on ρ implicitly through
 /// the mode β̂(ρ): `H_Φ = H_Φ(β̂(ρ))` because it is built from `H_id = Z_Jᵀ H Z_J`
 /// and `D_a = Z_Jᵀ ∂_a H Z_J`, both functions of β̂. So the exact outer gradient
@@ -466,34 +466,30 @@ pub(crate) fn batched_outer_gradient_contract_allows_override(
     }
 }
 
-/// Build the Tier-B Jeffreys-curvature drift closure `D_β H_Φ[δβ]` for the outer
-/// gradient, evaluated at the current outer point (states = β̂(ρ)).
+/// Build the Tier-B Jeffreys-curvature drift over ALL `k` mode-response
+/// directions of one outer gradient eval, preparing the β-fixed `H_Φ` drift base
+/// ONCE ([`JeffreysHphiDriftBase`]) and reusing it across every direction.
 ///
-/// THE FIX. The outer LAML objective folds `H_Φ` into `½ log|H + S_λ + H_Φ|`;
-/// because `H_Φ` depends on ρ through β̂, the exact gradient's trace contraction
-/// must include `½ tr[(H+S_λ+H_Φ)⁻¹ D_β H_Φ[v_k]]`. The released Tier-B path
-/// supplied ONLY the likelihood-Hessian drift `D_β H[v_k]`, so the analytic
-/// gradient omitted `H_Φ`'s mode-response drift — wrong precisely when Jeffreys
-/// is active. This returns the missing drift as a `Send + Sync + 'static` closure
-/// the `JeffreysHphiAwareJointDerivatives` wrapper folds into the first-order
-/// trace, mirroring Tier-A's `FirthAwareGlmDerivatives` `−D(Hφ)[B_k]` term.
+/// The base's `p` first-directional-derivative row-streams `Hdot[e_a]` (the
+/// dominant `O(n·p)` cost) and the reduced-information eigendecomposition are
+/// β-fixed across the eval, so they are computed once instead of `k` times. Each
+/// direction then pays only its own `Hdot[δ]` (one row-stream) and `p`
+/// second-directional `H²dot[δ,e_a]` row-streams. Per-direction output is
+/// byte-identical to the per-direction divided-difference drift
+/// ([`crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_directional_derivative`]),
+/// which the outer LAML gradient folds via `JeffreysHphiAwareJointDerivatives`.
 ///
-/// The closure takes the mode-response direction `δβ = dβ̂/dρ_k` (the wrapper
-/// performs `v_k → δβ = −v_k`) and returns `D_β H_Φ[δβ]`. Returns `None` when
-/// there is no coefficient system — i.e. exactly when
-/// `custom_family_outer_jeffreys_hphi` itself returns `None`. The per-direction
-/// conditioning gate and floored
-/// pseudo-inverse inside `joint_jeffreys_hphi_directional_derivative` reproduce
-/// the value path's, so when the value's `H_Φ` is zero (gated/clean fit) the
-/// drift is identically zero too.
-pub(crate) fn custom_family_outer_jeffreys_hphi_drift<
+/// Returns `None` exactly when there is no coefficient system, the family exposes
+/// no exact joint Hessian, or the term is not required (clean / gated fit) — the
+/// same condition as `custom_family_outer_jeffreys_hphi`.
+pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
-) -> Result<Option<JeffreysHphiDriftFn>, String> {
+) -> Result<Option<JeffreysHphiDriftBatchFn>, String> {
     if !family.joint_jeffreys_term_required() {
         return Ok(None);
     }
@@ -505,9 +501,6 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift<
     if total_p == 0 || z_joint.ncols() == 0 {
         return Ok(None);
     }
-    // Snapshot the joint Hessian H(β̂) at the current outer point. If the family
-    // exposes no exact joint Hessian the Jeffreys term is inapplicable (matching
-    // `custom_family_joint_jeffreys_term`), so no drift is installed.
     let h_joint = match family.joint_jeffreys_information_with_specs(states, specs)? {
         Some(h) => h,
         None => return Ok(None),
@@ -515,19 +508,18 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift<
     if h_joint.nrows() != total_p || h_joint.ncols() != total_p {
         return Ok(None);
     }
-    // Own everything the closure needs so it is `'static + Send + Sync`. β̂ is
-    // fixed across the single outer evaluation, so capturing the snapshot states
-    // is correct; the closure recomputes the exact directional derivatives of the
-    // joint Hessian at that point for each mode-response direction.
     let family_owned = family.clone();
     let states_owned: Vec<ParameterBlockState> = states.to_vec();
     let specs_owned: Vec<ParameterBlockSpec> = specs.to_vec();
     let z_columns = z_joint.clone();
-    let drift: JeffreysHphiDriftFn = Arc::new(move |delta: &Array1<f64>| {
-        crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_directional_derivative(
+    let batch: JeffreysHphiDriftBatchFn = Arc::new(move |deltas: &[Array1<f64>]| {
+        // Prepare the β-fixed base ONCE: the reduced-information eigendecomposition
+        // plus the `p` per-axis first directional derivatives `Hdot[e_a]` (the
+        // dominant cost). `None` ⇒ gated out or no exact first derivative ⇒ every
+        // direction's drift is the zero matrix (matching the singular hook).
+        let base = crate::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare(
             h_joint.view(),
             z_columns.view(),
-            delta,
             |direction: &Array1<f64>| {
                 family_owned.joint_jeffreys_information_directional_derivative_with_specs(
                     &states_owned,
@@ -535,16 +527,41 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift<
                     direction,
                 )
             },
-            |u: &Array1<f64>, v: &Array1<f64>| {
-                family_owned.joint_jeffreys_information_second_directional_derivative_with_specs(
-                    &states_owned,
-                    &specs_owned,
-                    u,
-                    v,
-                )
-            },
-        )
-        .map(Some)
+        )?;
+        let Some(base) = base else {
+            let zeros = vec![Some(Array2::<f64>::zeros((total_p, total_p))); deltas.len()];
+            return Ok(zeros);
+        };
+        // Per direction: the only δ-dependent work — `pert_h = Hdot[δ]` and the
+        // `p` second-directional derivatives `H²dot[δ,e_a]` — reusing the base.
+        deltas
+            .iter()
+            .map(|delta| {
+                let pert_h = match family_owned
+                    .joint_jeffreys_information_directional_derivative_with_specs(
+                        &states_owned,
+                        &specs_owned,
+                        delta,
+                    )? {
+                    Some(hd) => hd,
+                    // No exact first derivative ⇒ drift undefined ⇒ safe zero
+                    // (matching `joint_jeffreys_hphi_directional_derivative`).
+                    None => return Ok(Some(Array2::<f64>::zeros((total_p, total_p)))),
+                };
+                // Batched all-axes second-directional object `{H²dot[δ,e_a]}` in
+                // ONE pass (BLAS-3 for the rigid family; per-axis fallback for the
+                // rest). This collapses the dominant `p` independent full-data
+                // second-directional sweeps the per-axis closure used to run.
+                let pert_axis_matrices = family_owned
+                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
+                        &states_owned,
+                        &specs_owned,
+                        delta,
+                    )?;
+                base.perturbation_derivative_batched_axes(&pert_h, pert_axis_matrices)
+                    .map(Some)
+            })
+            .collect()
     });
-    Ok(Some(drift))
+    Ok(Some(batch))
 }

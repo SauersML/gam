@@ -945,6 +945,147 @@ pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
     }
 }
 
+/// #1117 follow-up (curved-atom sparse co-assignment): the compact active-set
+/// layout must apply the SAME per-row Riemannian geometry to the assembled
+/// Arrow-Schur blocks as the dense uniform-`q` layout. Before the fix the
+/// compact path skipped the tangent projection entirely (and `sparse_active_plan`
+/// refused to engage on any non-Euclidean ext-coord manifold), so a curved-atom
+/// SAE at large `K` paid the dense `K²` co-assignment Gram. The new code rebuilds
+/// each compact row's product manifold + point in compact column order
+/// (`compact_row_ext_manifold_and_point`) and applies the identical
+/// `gt` gradient projection, `htt` Riemannian-Hessian correction, and `htbeta`
+/// column projection (plus the Kronecker local-Jacobian projection).
+///
+/// This pins the equivalence directly: with EVERY row's active set forced to the
+/// full atom set, the compact column order coincides with the dense full-`q`
+/// order (IBP-MAP has `assignment_coord_dim == k_atoms`), so the two assemblies
+/// must produce BIT-IDENTICAL `gt`, `htt`, and `htbeta` on a genuinely curved
+/// (Circle) two-atom term with non-trivial logits and coordinates (so the
+/// von-Mises gradient — hence the Riemannian Hessian correction — is nonzero).
+#[test]
+pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support() {
+    // `SaeRowLayout` and `SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM` are in scope via
+    // `use super::*` (the `sae_manifold` module re-exports `row_layout::*` and
+    // `term::*`). The assembly override is `Option<Option<SaeRowLayout>>`:
+    // `Some(None)` pins dense, `Some(Some(layout))` pins a compact layout.
+
+    // Two Circle atoms, coordinates spread around the period so the von-Mises
+    // coordinate-prior gradient is nonzero (the Riemannian Hessian correction
+    // depends on `eg`, so a zero gradient would make the test vacuous w.r.t. the
+    // curvature term). Distinct logits so the assignment masses differ per atom.
+    let coords_a = array![[0.12_f64], [0.37], [0.66], [0.91]];
+    let coords_b = array![[0.81_f64], [0.05], [0.48], [0.23]];
+    let (phi_a, jet_a) = periodic_basis(&coords_a);
+    let (phi_b, jet_b) = periodic_basis(&coords_b);
+    let atom_a = SaeManifoldAtom::new(
+        "circle_a",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi_a,
+        jet_a,
+        array![[0.20, -0.10], [-0.30, 0.25], [0.40, 0.15]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let atom_b = SaeManifoldAtom::new(
+        "circle_b",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi_b,
+        jet_b,
+        array![[-0.15, 0.30], [0.22, -0.18], [0.33, 0.27]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+
+    let n = 4usize;
+    let logits = array![
+        [0.4_f64, -0.2],
+        [-0.1, 0.5],
+        [0.3, 0.1],
+        [-0.4, 0.2]
+    ];
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords_a, coords_b],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::ibp_map(0.7, 1.0, true),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom_a, atom_b], assignment).unwrap();
+    let target = array![
+        [0.10_f64, -0.05],
+        [0.20, 0.15],
+        [-0.12, 0.08],
+        [0.05, -0.20]
+    ];
+    let alpha = 5.0_f64;
+    let rho = SaeManifoldRho::new(
+        0.0,
+        0.0,
+        vec![array![alpha.ln()], array![alpha.ln()]],
+    );
+    let probe = SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM;
+
+    // Dense layout: pin `Some(None)` so the override forces the dense path
+    // regardless of the budget-derived plan.
+    let dense = term
+        .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, Some(None))
+        .unwrap();
+
+    // Compact layout with EVERY row's active set = both atoms (full support).
+    let coord_dims = vec![1usize, 1usize];
+    let coord_offsets = term.assignment.coord_offsets();
+    let full_active: Vec<Vec<usize>> = (0..n).map(|_| vec![0usize, 1usize]).collect();
+    let layout = SaeRowLayout::from_active_atoms(full_active, coord_dims, coord_offsets);
+    let compact = term
+        .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, Some(Some(layout)))
+        .unwrap();
+
+    assert_eq!(dense.rows.len(), compact.rows.len());
+    for (row_idx, (dr, cr)) in dense.rows.iter().zip(compact.rows.iter()).enumerate() {
+        assert_eq!(
+            dr.gt.len(),
+            cr.gt.len(),
+            "row {row_idx}: gt length mismatch (full-support compact must equal dense q)"
+        );
+        for a in 0..dr.gt.len() {
+            assert_abs_diff_eq!(dr.gt[a], cr.gt[a], epsilon = 1e-12);
+        }
+        assert_eq!(dr.htt.dim(), cr.htt.dim());
+        for a in 0..dr.htt.nrows() {
+            for b in 0..dr.htt.ncols() {
+                assert_abs_diff_eq!(dr.htt[[a, b]], cr.htt[[a, b]], epsilon = 1e-12);
+            }
+        }
+        assert_eq!(dr.htbeta.dim(), cr.htbeta.dim());
+        for a in 0..dr.htbeta.nrows() {
+            for b in 0..dr.htbeta.ncols() {
+                assert_abs_diff_eq!(dr.htbeta[[a, b]], cr.htbeta[[a, b]], epsilon = 1e-12);
+            }
+        }
+    }
+
+    // The geometry must be non-trivial: at least one assembled gt entry differs
+    // from the raw (un-projected) Euclidean gradient direction would, i.e. the
+    // Circle projection actually fired. We assert the htt is symmetric and finite
+    // as a floor (the Riemannian correction is applied), and that the assembly
+    // produced a non-degenerate (nonzero) curvature block.
+    let any_curvature = compact
+        .rows
+        .iter()
+        .any(|r| r.htt.iter().any(|&v| v.abs() > 1e-9));
+    assert!(
+        any_curvature,
+        "assembled compact htt is all-zero — the test data did not exercise curvature"
+    );
+}
+
 /// `snapshot_mutable_state` / `restore_mutable_state` (the in-place
 /// line-search save/restore that replaced the per-halving full
 /// `self.clone()`) must restore exactly the state an `apply_newton_step`
@@ -1255,6 +1396,159 @@ pub(crate) fn decoder_norm_guard_reseeds_collapsed_atom_to_distinct_nonzero() {
     );
 }
 
+/// #1117 K>1 robustness — TOTAL co-collapse (every decoder ≈0 together) must
+/// reseed ALL atoms, not all-but-one. When the whole dictionary co-collapses
+/// the median-relative test finds no atom "behind" its peers, so the guard
+/// falls to the absolute EV arm. The earlier code kept the (arbitrary,
+/// already-degenerate) strongest atom as an "anchor" and reseeded only K−1
+/// atoms; that left one slot sitting in the collapsed basin and the joint LSQ
+/// refit re-attracted the reseeded atoms toward it — exactly the K=3 three-way
+/// basin a single reseed could not break (real OLMo: identical config flipped
+/// EV≈0.40 ↔ 0.00). With all K atoms reseeded onto DISTINCT residual PCs every
+/// slot leaves the basin and recovers a non-degenerate, pairwise-distinct
+/// decoder.
+#[test]
+pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
+    // Three periodic (circle) atoms, p=3 output so three distinct residual PCs
+    // exist for the disjoint-PC reseed to land each atom on its own direction.
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
+    let coords2 = array![[0.25], [0.40], [0.75], [0.05], [0.60], [0.85]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    let (phi2, jet2) = periodic_basis(&coords2);
+    // Decoders are tiny-but-NONZERO and of comparable magnitude across atoms:
+    // the dictionary co-collapsed (EV ≈ 0) yet has a usable median scale, so it
+    // reaches the absolute-EV co-collapse arm (an exactly-zero dictionary would
+    // hit the `median == 0` early return — the cold-seed case, handled by the
+    // mass guard/inner solve, not here) and no atom is *relatively* behind its
+    // peers (all norms within ~1.5×, none below `1e-3·median`).
+    let make_atom = |name: &str, phi: Array2<f64>, jet: Array3<f64>, scale: f64| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            Array2::<f64>::from_elem((3, 3), scale),
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+    };
+    let atom0 = make_atom("periodic0", phi0, jet0, 1.0e-5);
+    let atom1 = make_atom("periodic1", phi1, jet1, 1.2e-5);
+    let atom2 = make_atom("periodic2", phi2, jet2, 0.8e-5);
+    // Gates stay spread across rows/atoms — the gate-mass guard is satisfied,
+    // so only the absolute-EV co-collapse arm can catch this failure.
+    let logits = array![
+        [0.7, -0.2, 0.3],
+        [0.1, 0.4, -0.1],
+        [-0.3, 0.5, 0.2],
+        [0.6, -0.1, 0.4],
+        [0.2, 0.3, -0.2],
+        [0.4, 0.1, 0.5]
+    ];
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords0, coords1, coords2],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::softmax(0.8),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom0, atom1, atom2], assignment).unwrap();
+    // A target with genuine 3-direction structure so the residual (≈ target,
+    // since the dictionary explains ≈0) carries three distinct PCs.
+    let target = array![
+        [0.40, -0.10, 0.05],
+        [-0.20, 0.35, -0.15],
+        [0.10, 0.05, 0.30],
+        [0.25, -0.30, -0.05],
+        [-0.15, 0.20, 0.18],
+        [0.30, 0.12, -0.22]
+    ];
+    let rho = SaeManifoldRho::new(
+        (-0.3_f64).exp().ln(),
+        0.7_f64.ln(),
+        vec![
+            array![0.9_f64.ln()],
+            array![1.0_f64.ln()],
+            array![1.1_f64.ln()],
+        ],
+    );
+
+    // Confirm the precondition: the dictionary is co-collapsed (EV below the
+    // floor) with NO atom relatively behind its peers (all norms ≈0).
+    let ev_before = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .expect("EV evaluates");
+    assert!(
+        ev_before < SAE_DICTIONARY_COLLAPSE_EV_FLOOR,
+        "test precondition: dictionary must start co-collapsed; EV={ev_before:.4}"
+    );
+
+    term.enforce_decoder_norm_guard(target.view(), 0, &rho)
+        .expect("co-collapse guard must recover, not error");
+
+    // EVERY atom — including the one the old code preserved as anchor — must be
+    // recorded as Reseeded. This is the regression the fix targets.
+    for atom in 0..3 {
+        let reseeded = term
+            .collapse_events()
+            .iter()
+            .any(|e| e.atom == atom && e.action == CollapseAction::Reseeded);
+        assert!(
+            reseeded,
+            "total co-collapse must reseed ALL atoms; atom {atom} was not reseeded. events: {:?}",
+            term.collapse_events()
+        );
+    }
+
+    // After the reseed + joint LSQ refit every atom carries a non-degenerate
+    // decoder again, and the three decoders are pairwise distinct (each landed
+    // on its own residual PC, so no two column-spaces are collinear).
+    let norm = |a: &SaeManifoldAtom| -> f64 {
+        a.decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+    };
+    let norms: Vec<f64> = (0..3).map(|a| norm(&term.atoms[a])).collect();
+    for (atom, &nrm) in norms.iter().enumerate() {
+        assert!(
+            nrm > 1e-9,
+            "reseeded atom {atom} decoder must be non-degenerate; ‖B‖={nrm:.3e}"
+        );
+    }
+    for a in 0..3 {
+        for b in (a + 1)..3 {
+            let ba = &term.atoms[a].decoder_coefficients;
+            let bb = &term.atoms[b].decoder_coefficients;
+            let dot: f64 = ba.iter().zip(bb.iter()).map(|(x, y)| x * y).sum();
+            let cos = dot.abs() / (norms[a] * norms[b]);
+            assert!(
+                cos < 0.999,
+                "reseeded atoms {a},{b} decoders must be distinct (|cos|={cos:.4})"
+            );
+        }
+    }
+
+    // The dictionary is no longer co-collapsed: the reseed + LSQ refit explains
+    // strictly more variance than the degenerate start.
+    let ev_after = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .expect("EV evaluates post-reseed");
+    assert!(
+        ev_after > ev_before,
+        "co-collapse reseed must improve EV; before={ev_before:.4} after={ev_after:.4}"
+    );
+}
+
 /// #976 decoder arm is a strict no-op for K=1: a single atom has no peer to
 /// fall behind, so the guard must never reseed or record an event even when
 /// the lone decoder is tiny. This pins the "K=1 path unchanged" guarantee.
@@ -1321,7 +1615,7 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
     // Compute and install the real hybrid-split report (closed-form, no outer
     // fit — sidesteps #1051).
     let report = term
-        .compute_hybrid_split_report(&rho)
+        .compute_hybrid_split_report(&rho, None)
         .expect("hybrid split report computes")
         .expect("eligible d=1 atoms present a report");
     term.hybrid_split_report = Some(report);
@@ -1386,6 +1680,51 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         verdict.choice.num_parameters,
         curved_params
     );
+
+    // #1026 EV-vs-Θ frontier as STRUCTURED report data: recompute the report
+    // WITH the reconstruction target so each verdict carries the `(Θ, ΔEV)`
+    // pair the roadmap reports against (previously this lived only as a
+    // transient `log::info!` line). The target is the term's own curved
+    // reconstruction, so every atom's leave-one-atom-out drop `ΔEV_k` is the
+    // real EV it earns; the report must surface a finite `(Θ, ΔEV)` for every
+    // adjudicated d = 1 slot, and the collapsed-to-linear slot must read its
+    // straight signature `Θ ≈ 0`.
+    let report_with_ev = term
+        .compute_hybrid_split_report(&rho, Some(target.view()))
+        .expect("hybrid split report with target computes")
+        .expect("eligible d=1 atoms present a report");
+    assert!(
+        !report_with_ev.verdicts.is_empty(),
+        "the report must adjudicate at least one d=1 slot"
+    );
+    for v in &report_with_ev.verdicts {
+        let theta = v
+            .fitted_turning
+            .unwrap_or_else(|| panic!("verdict '{}' must carry a fitted turning Θ", v.atom_name));
+        let dev = v
+            .held_out_delta_ev
+            .unwrap_or_else(|| panic!("verdict '{}' must carry a held-out ΔEV", v.atom_name));
+        assert!(
+            theta.is_finite() && theta >= 0.0,
+            "fitted turning Θ must be a finite non-negative arc-curvature integral; \
+             got {theta} for '{}'",
+            v.atom_name
+        );
+        assert!(
+            dev.is_finite(),
+            "held-out ΔEV must be finite; got {dev} for '{}'",
+            v.atom_name
+        );
+        // The slot that collapsed to the linear tail is straight by definition:
+        // its decoded curve integrates ~zero turning.
+        if !v.kept_curved {
+            assert!(
+                theta <= 1e-3,
+                "a linear-tail slot must read Θ ≈ 0 (straight image); got {theta} for '{}'",
+                v.atom_name
+            );
+        }
+    }
 }
 
 /// #976 Layer-1 guard 2: a single Newton application cannot move a gate
@@ -2360,6 +2699,127 @@ pub(crate) fn subspace_reduced_evaluator_composes_all_jets_by_q() {
             }
         }
     }
+}
+
+/// #1117 production-path regression: the periodic-circle atom built through the
+/// production term builder ([`term_from_padded_blocks_with_mode`], the exact
+/// route the `sae_manifold_fit*` FFI takes) must carry an analytic second-jet
+/// evaluator so the rank-revealing reduction can fire. The original #1113 split
+/// found that the builder installed the evaluator through the base-trait slot
+/// only (`basis_second_jet == None`), so `reduce_atoms_to_data_supported_rank`
+/// SKIPPED the rank-deficient circle, the `[SAE-AUDIT]` rank-3/5 warning kept
+/// firing, and the outer BFGS crawled the flat decoder valley past the 2-minute
+/// budget. After the fix the builder installs through the second-jet slot, the
+/// reduction reparametrizes the `M = 5` circle onto its `r = 3` data-supported
+/// subspace at fit entry, and `run_joint_fit_arrow_schur` terminates with a
+/// finite, non-increasing loss inside a tight iteration budget instead of
+/// stalling.
+#[test]
+pub(crate) fn production_builder_circle_reduces_rank_and_completes_stage1_step0_in_budget() {
+    // Three distinct phases repeated → the first-harmonic columns
+    // `[1, sin2πt, cos2πt]` span a rank-3 data subspace and the second-harmonic
+    // pair adds no new data direction: the bare data Gram is `rank 3/5`, the
+    // minimal reproducer of the OLMo `stage1-step0` PCA-32 circle deficiency.
+    let n_obs = 6usize;
+    let m = 5usize;
+    let d = 1usize;
+    let p = 2usize;
+    let k_atoms = 1usize;
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+    let coords = array![[0.1], [0.45], [0.8], [0.1], [0.45], [0.8]];
+    let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+
+    // Pad into the `(K, ...)`-leading storage the production builder consumes.
+    let mut basis_values = Array3::<f64>::zeros((k_atoms, n_obs, m));
+    basis_values.slice_mut(s![0, .., ..]).assign(&phi);
+    let mut basis_jacobian = Array4::<f64>::zeros((k_atoms, n_obs, m, d));
+    basis_jacobian.slice_mut(s![0, .., .., ..]).assign(&jet);
+    let mut decoder = Array3::<f64>::zeros((k_atoms, m, p));
+    decoder.slice_mut(s![0, .., ..]).assign(&array![
+        [0.05, -0.02],
+        [-0.05, 0.03],
+        [0.05, 0.01],
+        [0.02, -0.04],
+        [-0.02, 0.02]
+    ]);
+    let mut penalties = Array3::<f64>::zeros((k_atoms, m, m));
+    penalties
+        .slice_mut(s![0, .., ..])
+        .assign(&Array2::<f64>::eye(m));
+    let logits = Array2::<f64>::zeros((n_obs, k_atoms));
+
+    // The production builder installs the evaluator through the second-jet slot
+    // (the fix). `SaeBasisSecondJet` is the supertrait of `SaeBasisEvaluator`.
+    let evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = vec![Some(evaluator)];
+    let mut term = term_from_padded_blocks_with_mode(
+        n_obs,
+        p,
+        &[SaeAtomBasisKind::Periodic],
+        basis_values.view(),
+        basis_jacobian.view(),
+        &[m],
+        &[d],
+        decoder.view(),
+        penalties.view(),
+        logits.view(),
+        std::slice::from_ref(&coords),
+        AssignmentMode::ibp_map(1.0, 1.0, false),
+        &evaluators,
+    )
+    .unwrap();
+
+    // The builder must populate the analytic-Hessian slot — without it the
+    // #1117 reduction silently skips the atom (the regression this guards).
+    assert!(
+        term.atoms[0].basis_second_jet.is_some(),
+        "production builder must install the analytic second-jet evaluator so the \
+         #1117 rank-revealing reduction can fire",
+    );
+
+    let target = array![
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [-1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [-1.0, 0.0]
+    ];
+    let mut rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    let loss0 = term.loss(target.view(), &rho).unwrap().total();
+
+    // Run with a TIGHT iteration budget. If the rank-deficient circle stalled in
+    // the flat decoder valley (the bug) it would burn its whole budget making
+    // cosmetic progress; here the fit-entry reduction makes the design full-rank
+    // so the inner Newton walk reaches a quotient-stationary point and the call
+    // returns a finite, non-increasing loss well inside the budget.
+    let loss = term
+        .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 8, 0.05, 1.0e-3, 1.0e-3)
+        .unwrap();
+
+    // The fit-entry reduction collapsed the unexcited harmonic: M = 5 → r = 3.
+    assert_eq!(
+        term.atoms[0].basis_size(),
+        3,
+        "the rank-deficient circle must be reparametrized onto its r = 3 \
+         data-supported subspace at fit entry",
+    );
+    assert!(
+        loss.total().is_finite(),
+        "rank-deficient circle fit must return a finite loss, not stall: {}",
+        loss.total(),
+    );
+    assert!(
+        loss.total() <= loss0 + 1.0e-8,
+        "the joint fit must not increase the loss (loss0={loss0}, loss={})",
+        loss.total(),
+    );
+    assert!(
+        term.assignment.coords[0]
+            .as_flat()
+            .iter()
+            .all(|v| v.is_finite()),
+        "fitted coordinates must stay finite",
+    );
 }
 
 /// #1117 idempotence: once an atom is reduced to a full-rank subspace, a

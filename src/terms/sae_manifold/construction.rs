@@ -1,5 +1,15 @@
 use super::*;
 
+/// Active-set layout override for [`SaeManifoldTerm::assemble_arrow_schur_inner`].
+///
+/// `None` is the production path: the layout is derived from the assignment mode
+/// and `sparse_active_plan`. `Some(layout_opt)` pins a specific layout — dense
+/// (`Some(None)`) or a chosen compact `SaeRowLayout` (`Some(Some(..))`) — so the
+/// compact-vs-dense Riemannian-geometry equality regression can drive both code
+/// paths on identical data without depending on the host/device memory budget
+/// that gates the compact path in production.
+pub(crate) type ForcedRowLayout = Option<Option<SaeRowLayout>>;
+
 impl SaeManifoldTerm {
     #[must_use = "build error must be handled"]
     pub fn new(atoms: Vec<SaeManifoldAtom>, assignment: SaeAssignment) -> Result<Self, String> {
@@ -51,6 +61,7 @@ impl SaeManifoldTerm {
             curvature_walk_report: None,
             expected_evidence_gauge_deflated_directions: None,
             evidence_gauge_deflation_reanchors: 0,
+            dictionary_cocollapse_reseeds: 0,
             hybrid_split_report: None,
             atom_inner_fits: None,
         })
@@ -1662,16 +1673,17 @@ impl SaeManifoldTerm {
         if k_atoms <= 1 {
             return None;
         }
-        // The per-row tangent projection used for non-Euclidean atom latents
-        // requires the uniform-`q` dense layout; the compact active-set path
-        // skips it. So the effective (truncating) sparse plan only engages
-        // when the ext-coord manifold is Euclidean. JumpReLU's structural gate
-        // is exact and handled separately, so this restriction does not affect
-        // it. At huge `K` on a curved manifold the streaming driver still
-        // bounds memory; only the per-atom truncation is withheld.
-        if !self.ext_coord_manifold().is_euclidean() {
-            return None;
-        }
+        // The per-row Riemannian tangent projection for non-Euclidean atom
+        // latents is now applied directly on the compact active-set rows (see
+        // the `Some(layout)` arm in `assemble_arrow_schur`, via
+        // `compact_row_ext_manifold_and_point`), which rebuilds each row's
+        // product manifold in its compact column order and applies the SAME
+        // gt/htt/htbeta + Kronecker-Jacobian projections the dense path uses. So
+        // the sparse plan may engage on curved ext-coord manifolds (circle /
+        // torus / sphere atoms) — the affordability lever for manifold-SAE at
+        // large `K`, where the dense `K²` co-assignment Gram is the cost. (The
+        // former `is_euclidean()`-only restriction punted every curved atom to
+        // the dense layout; it is lifted.)
         let p = self.output_dim();
         let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
         // Dense data Gram footprint: (m_total · m_total) f64.
@@ -1935,9 +1947,20 @@ impl SaeManifoldTerm {
     pub fn compute_hybrid_split_report(
         &self,
         rho: &SaeManifoldRho,
+        target: Option<ArrayView2<'_, f64>>,
     ) -> Result<Option<crate::terms::sae::hybrid_split::SaeHybridSplitReport>, String> {
         let n = self.n_obs();
         let p = self.output_dim();
+        // Per-atom held-out `ΔEV_k` (leave-one-atom-out explained-variance drop),
+        // paired with each atom's fitted turning Θ onto the verdict so the report
+        // carries the #1026 `(Θ, ΔEV)` frontier point as structured data. Absent
+        // when no reconstruction target is supplied.
+        let loao_ev: Vec<Option<f64>> = match target {
+            Some(t) => self.per_atom_loao_explained_variance(t, rho)?,
+            None => vec![None; self.k_atoms()],
+        };
+        let delta_ev_for =
+            |atom_idx: usize| -> Option<f64> { loao_ev.get(atom_idx).copied().flatten() };
         // Per-row assignment masses (once), so each atom's weighted straight-line
         // fit uses the same row weighting the joint reconstruction loss does.
         let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
@@ -1985,6 +2008,7 @@ impl SaeManifoldTerm {
             weights_for,
             decoded_for,
             manifold_for,
+            delta_ev_for,
         )
     }
 
@@ -2088,6 +2112,154 @@ impl SaeManifoldTerm {
         }
         let collapsed = self.hybrid_collapsed_reconstruction(rho)?;
         Ok(reconstruction_explained_variance(target, collapsed.view()))
+    }
+
+    /// #1026 ladder item 2/3 — the AMORTIZED ENCODER, wired from the fitted
+    /// dictionary. Builds the offline certified [`EncodeAtlas`] over this term's
+    /// frozen atoms and encodes a target corpus `targets` (`n × p`) through the
+    /// per-chart distilled Jacobian predictor, with the Kantorovich certificate
+    /// gating each row and an exact-solve fallback for the rows the amortized
+    /// predictor cannot certify. Returns one [`EncodeResult`] per atom (the
+    /// per-atom encoded coordinates + per-row certificate mask), in dictionary
+    /// order.
+    ///
+    /// This is the thread's "encoder + certificate-gated exact fallback"
+    /// deployment made reachable from a fit: the distilled map approximates
+    /// inference at one mat-vec/row, and any row whose amortized prediction fails
+    /// `h ≤ ½` falls back to the chart-center-start exact Newton encode
+    /// ([`EncodeAtlas::certified_encode_row`]); rows that still cannot be
+    /// certified ride the [`EncodeResult::encode_uncertified_count`] flag for the
+    /// upstream exact multi-start solve (honesty, never a silent wrong encode).
+    ///
+    /// Magic by default: the atlas's worst-case bounds are auto-derived from the
+    /// fit — `amplitude_bound[k]` is the largest fitted assignment mass `a[i,k]`
+    /// the encode can produce for atom `k` (the encode recovers `t` from
+    /// `x ≈ z·γ_k(t)` at amplitude `z = a[i,k]`), and `target_norm_bound` is the
+    /// largest target row norm — so no caller supplies a knob. Per-row amplitudes
+    /// are the fitted assignment masses for the same target the dictionary was fit
+    /// against; an external corpus reuses the per-row masses the assignment
+    /// produces for it upstream (passed in `amplitudes`, one column per atom).
+    pub fn amortized_encode_target(
+        &self,
+        targets: ArrayView2<'_, f64>,
+        amplitudes: ArrayView2<'_, f64>,
+    ) -> Result<Vec<crate::terms::sae_encode_atlas::EncodeResult>, String> {
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        let n = targets.nrows();
+        if targets.ncols() != p {
+            return Err(format!(
+                "SaeManifoldTerm::amortized_encode_target: targets have {} cols but output_dim is {p}",
+                targets.ncols()
+            ));
+        }
+        if amplitudes.dim() != (n, k_atoms) {
+            return Err(format!(
+                "SaeManifoldTerm::amortized_encode_target: amplitudes {:?} must be (n={n}, K={k_atoms})",
+                amplitudes.dim()
+            ));
+        }
+
+        // Magic-by-default offline bounds, auto-derived from the fit so no caller
+        // supplies a knob. `target_norm_bound` is the largest target row L2 norm
+        // (bounds `‖x‖` over the corpus); `amplitude_bound[k]` is the largest
+        // fitted assignment mass for atom `k` (bounds `|z_k|`), with a strictly
+        // positive floor so a near-inactive atom still certifies a finite radius.
+        let mut target_norm_bound = 0.0_f64;
+        for row in 0..n {
+            let norm = targets.row(row).dot(&targets.row(row)).sqrt();
+            if norm.is_finite() && norm > target_norm_bound {
+                target_norm_bound = norm;
+            }
+        }
+        let mut amplitude_bound = vec![0.0_f64; k_atoms];
+        for atom_idx in 0..k_atoms {
+            let mut bound = 0.0_f64;
+            for row in 0..n {
+                let z = amplitudes[[row, atom_idx]].abs();
+                if z.is_finite() && z > bound {
+                    bound = z;
+                }
+            }
+            // A strictly positive amplitude floor keeps the offline Lipschitz
+            // scaling finite for atoms with no active row in this corpus (those
+            // rows encode to the chart center via the certificate anyway).
+            amplitude_bound[atom_idx] = bound.max(1.0);
+        }
+
+        let atlas = crate::terms::sae_encode_atlas::EncodeAtlas::build(
+            &self.atoms,
+            &amplitude_bound,
+            target_norm_bound,
+            crate::terms::sae_encode_atlas::AtlasConfig::default(),
+        )?;
+
+        // Per-atom amortized encode with a certificate-gated exact-solve fallback:
+        // a row whose distilled prediction fails `h ≤ ½` is retried from the
+        // chart-center start (the non-amortized exact Newton); a row that still
+        // cannot be certified stays flagged for the upstream multi-start solve.
+        // (The atlas is rho-free; the per-row amplitudes already carry the
+        // rho-resolved assignment masses the caller produced upstream.)
+        let mut results = Vec::with_capacity(k_atoms);
+        for atom_idx in 0..k_atoms {
+            let atom = &self.atoms[atom_idx];
+            let amp_col = amplitudes.column(atom_idx).to_owned();
+            let amortized =
+                atlas.amortized_encode_batch(atom, atom_idx, targets, amp_col.view())?;
+            let mut coords = amortized.coords;
+            let mut certified = amortized.certified;
+            for row in 0..n {
+                if certified[row] {
+                    continue;
+                }
+                let (t, cert) =
+                    atlas.certified_encode_row(atom, atom_idx, targets.row(row), amp_col[row])?;
+                if cert.certified() {
+                    coords.row_mut(row).assign(&t);
+                    certified[row] = true;
+                }
+            }
+            results.push(crate::terms::sae_encode_atlas::EncodeResult::from_rows(
+                coords, certified,
+            ));
+        }
+        Ok(results)
+    }
+
+    /// #1026 — the fitted per-row assignment masses `a[i,k]` (the activation
+    /// amplitudes `z_k` the amortized encode recovers `t` against), as an
+    /// `n × K` matrix. These are exactly the masses
+    /// [`Self::try_fitted_with_rho`] assembles the reconstruction from, so
+    /// feeding them to [`Self::amortized_encode_target`] re-encodes the SAME
+    /// inference the dictionary was fit against — the self-consistency the
+    /// distilled encoder is supervised to approximate.
+    pub fn fitted_assignment_amplitudes(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.n_obs();
+        let k_atoms = self.k_atoms();
+        let mut amplitudes = Array2::<f64>::zeros((n, k_atoms));
+        for row in 0..n {
+            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            for atom_idx in 0..k_atoms {
+                amplitudes[[row, atom_idx]] = a[atom_idx];
+            }
+        }
+        Ok(amplitudes)
+    }
+
+    /// #1026 — encode the dictionary's own fit-time target with the amortized
+    /// encoder, deriving the per-row amplitudes from the fitted assignment so the
+    /// caller supplies neither bounds nor amplitudes (magic by default). The
+    /// end-to-end "fit → distilled encoder → certificate-gated encode" path.
+    pub fn amortized_encode_fitted(
+        &self,
+        targets: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<crate::terms::sae_encode_atlas::EncodeResult>, String> {
+        let amplitudes = self.fitted_assignment_amplitudes(rho)?;
+        self.amortized_encode_target(targets, amplitudes.view())
     }
 
     pub fn loss(
@@ -2605,6 +2777,31 @@ impl SaeManifoldTerm {
         penalty_scale: f64,
         dense_beta_penalty_probe_max_dim: usize,
     ) -> Result<ArrowSchurSystem, String> {
+        self.assemble_arrow_schur_inner(
+            target,
+            rho,
+            analytic_penalties,
+            penalty_scale,
+            dense_beta_penalty_probe_max_dim,
+            None,
+        )
+    }
+
+    /// Innermost assembly entry. `forced_layout` overrides the budget-derived
+    /// active-set layout so a caller can pin the dense (`Forced(None)`) or a
+    /// specific compact (`Forced(Some(layout))`) path — used by the
+    /// compact-vs-dense Riemannian-geometry equality regression test to drive
+    /// both layouts on identical data. `Computed` is the production path:
+    /// the layout is derived from the assignment mode + `sparse_active_plan`.
+    pub(crate) fn assemble_arrow_schur_inner(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        penalty_scale: f64,
+        dense_beta_penalty_probe_max_dim: usize,
+        forced_layout: ForcedRowLayout,
+    ) -> Result<ArrowSchurSystem, String> {
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
@@ -2774,7 +2971,9 @@ impl SaeManifoldTerm {
             .iter()
             .map(|c| c.latent_dim())
             .collect();
-        let row_layout: Option<SaeRowLayout> = match self.assignment.mode {
+        let row_layout: Option<SaeRowLayout> = match forced_layout {
+            Some(layout) => layout,
+            None => match self.assignment.mode {
             AssignmentMode::JumpReLU {
                 threshold,
                 temperature,
@@ -2818,6 +3017,7 @@ impl SaeManifoldTerm {
                     None => None,
                 }
             }
+            },
         };
         // #974 likelihood-whitening seam. The single per-row decision: when the
         // installed `RowMetric` is a genuinely estimated noise model
@@ -3592,42 +3792,111 @@ impl SaeManifoldTerm {
         // requires a uniform latent dimension. The sparse plan only engages on
         // Euclidean ext-coord manifolds (see `sparse_active_plan`), so skipping
         // the projector here is correct — there is nothing to project.
-        if row_layout.is_none() {
-            let raw_gt_rows: Vec<Array1<f64>> = sys.rows.iter().map(|row| row.gt.clone()).collect();
-            self.apply_sae_riemannian_geometry(&mut sys);
-            let manifold = self.ext_coord_manifold();
-            if !frames_engaged && !manifold.is_euclidean() {
-                let ext = self.ext_coord_matrix();
-                // Project the local Jacobian columns onto the tangent space at
-                // each row's ext-coord point. Each column `j` of the row's
-                // (q_row × p) Jacobian is an ambient-space vector of length
-                // `q_row`; the manifold projector acts on one such column at a
-                // time. Working directly on the row-major `jac_flat` storage via
-                // a single reusable `col_buf` avoids the two dense (q × p) copies
-                // (flatten→Array2, project, unflatten→Vec) that previously fired
-                // per row. `t_buf` still holds the row's ext-coord vector.
-                let mut t_buf = vec![0.0_f64; q];
-                let mut col_buf = Array1::<f64>::zeros(q);
-                for row_idx in 0..n {
-                    let ext_row = ext.row(row_idx);
-                    for (slot, &v) in t_buf.iter_mut().zip(ext_row.iter()) {
-                        *slot = v;
-                    }
-                    let t_i = ArrayView1::from(t_buf.as_slice());
-                    let raw_gt = raw_gt_rows[row_idx].view();
-                    let jac_flat = &mut kron_jac[row_idx];
-                    let q_row = jac_flat.len() / p;
-                    for j in 0..p {
-                        for c in 0..q_row {
-                            col_buf[c] = jac_flat[c * p + j];
+        match row_layout.as_ref() {
+            None => {
+                let raw_gt_rows: Vec<Array1<f64>> =
+                    sys.rows.iter().map(|row| row.gt.clone()).collect();
+                self.apply_sae_riemannian_geometry(&mut sys);
+                let manifold = self.ext_coord_manifold();
+                if !frames_engaged && !manifold.is_euclidean() {
+                    let ext = self.ext_coord_matrix();
+                    // Project the local Jacobian columns onto the tangent space at
+                    // each row's ext-coord point. Each column `j` of the row's
+                    // (q_row × p) Jacobian is an ambient-space vector of length
+                    // `q_row`; the manifold projector acts on one such column at a
+                    // time. Working directly on the row-major `jac_flat` storage via
+                    // a single reusable `col_buf` avoids the two dense (q × p) copies
+                    // (flatten→Array2, project, unflatten→Vec) that previously fired
+                    // per row. `t_buf` still holds the row's ext-coord vector.
+                    let mut t_buf = vec![0.0_f64; q];
+                    let mut col_buf = Array1::<f64>::zeros(q);
+                    for row_idx in 0..n {
+                        let ext_row = ext.row(row_idx);
+                        for (slot, &v) in t_buf.iter_mut().zip(ext_row.iter()) {
+                            *slot = v;
                         }
-                        let projected_col = manifold.project_vector_to_gradient_tangent(
-                            t_i,
-                            raw_gt.slice(ndarray::s![..q_row]),
-                            col_buf.slice(ndarray::s![..q_row]),
-                        );
-                        for c in 0..q_row {
-                            jac_flat[c * p + j] = projected_col[c];
+                        let t_i = ArrayView1::from(t_buf.as_slice());
+                        let raw_gt = raw_gt_rows[row_idx].view();
+                        let jac_flat = &mut kron_jac[row_idx];
+                        let q_row = jac_flat.len() / p;
+                        for j in 0..p {
+                            for c in 0..q_row {
+                                col_buf[c] = jac_flat[c * p + j];
+                            }
+                            let projected_col = manifold.project_vector_to_gradient_tangent(
+                                t_i,
+                                raw_gt.slice(ndarray::s![..q_row]),
+                                col_buf.slice(ndarray::s![..q_row]),
+                            );
+                            for c in 0..q_row {
+                                jac_flat[c * p + j] = projected_col[c];
+                            }
+                        }
+                    }
+                }
+            }
+            Some(layout) => {
+                // Compact active-set layout (#1117 follow-up): the dense
+                // `ext_coord_manifold()` is keyed to the uniform full-`q` block
+                // ordering, so it cannot be applied to the heterogeneous compact
+                // rows directly. Instead we rebuild, PER ROW, the product manifold
+                // and ext-coord point in that row's compact column order (see
+                // `compact_row_ext_manifold_and_point`) and apply the SAME three
+                // per-row Riemannian operations the dense
+                // `apply_riemannian_latent_geometry` applies — gradient tangent
+                // projection of `gt`, the Riemannian Hessian correction of `htt`,
+                // and the column tangent projection of `htbeta` — plus the
+                // identical Kronecker `kron_jac` column projection. On the shared
+                // active support this is byte-identical to slicing the dense
+                // product manifold, so engaging the sparse plan on a non-Euclidean
+                // ext manifold is now correct (the former
+                // `is_euclidean()`-only guard in `sparse_active_plan` is lifted).
+                //
+                // Euclidean ext manifolds still skip all of this (every
+                // per-row manifold is a product of Euclidean parts whose
+                // projector is the identity); we early-out so those rows stay
+                // byte-for-byte the historical compact path.
+                if !self.ext_coord_manifold().is_euclidean() {
+                    for row_idx in 0..n {
+                        let (manifold_i, point_i) =
+                            self.compact_row_ext_manifold_and_point(row_idx, layout);
+                        let t_i = point_i.view();
+                        // gt / htt / htbeta on the compact ArrowRowBlock, exactly
+                        // as `apply_riemannian_latent_geometry` does for dense
+                        // uniform-q rows.
+                        let gt_e = sys.rows[row_idx].gt.clone();
+                        let htt_e = sys.rows[row_idx].htt.clone();
+                        let htbeta_e = sys.rows[row_idx].htbeta.clone();
+                        sys.rows[row_idx].gt =
+                            manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
+                        sys.rows[row_idx].htt =
+                            manifold_i.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
+                        sys.rows[row_idx].htbeta = manifold_i
+                            .project_matrix_columns_to_gradient_tangent(
+                                t_i,
+                                gt_e.view(),
+                                htbeta_e.view(),
+                            );
+                        // Kronecker local-Jacobian column projection (full-B path
+                        // only), using the SAME pre-projection gradient `gt_e` so
+                        // the cross-block geometry matches the dense branch.
+                        if !frames_engaged {
+                            let jac_flat = &mut kron_jac[row_idx];
+                            let q_row = jac_flat.len() / p;
+                            let mut col_buf = Array1::<f64>::zeros(q_row);
+                            for j in 0..p {
+                                for c in 0..q_row {
+                                    col_buf[c] = jac_flat[c * p + j];
+                                }
+                                let projected_col = manifold_i.project_vector_to_gradient_tangent(
+                                    t_i,
+                                    gt_e.view(),
+                                    col_buf.view(),
+                                );
+                                for c in 0..q_row {
+                                    jac_flat[c * p + j] = projected_col[c];
+                                }
+                            }
                         }
                     }
                 }
@@ -4158,6 +4427,63 @@ impl SaeManifoldTerm {
         sys.apply_riemannian_latent_geometry(&latent);
     }
 
+    /// Build the compact-layout ext-coord product manifold and point for one row.
+    ///
+    /// The dense `ext_coord_manifold()` is keyed to the full-`q` block ordering
+    /// `[assignment parts (all Euclidean for IBP-MAP / JumpReLU), then per-atom
+    /// coord blocks in atom order]`. A compact active-set row instead lays its
+    /// `q_active` columns out as `[one Euclidean logit slot per active atom,
+    /// then each active atom's coord block in `active` order]` (see
+    /// [`SaeRowLayout::from_active_atoms`] / `coord_starts`). To reuse the exact
+    /// per-row Riemannian projector on the compact block we rebuild a product
+    /// manifold and the matching ext-coord point in that compact order: the
+    /// `active.len()` logit slots are `Euclidean` (the assignment channel is
+    /// always Euclidean for the modes that engage sparsity — `assignment_coord_dim
+    /// == k_atoms`), and each active atom contributes its own coordinate
+    /// manifold. On the shared active support this is byte-identical to slicing
+    /// the dense full-`q` product manifold, so the compact projection matches the
+    /// dense path exactly — it only drops the inactive atoms' (negligible-mass)
+    /// coordinate blocks the compact layout already excludes from curvature.
+    ///
+    /// Returns `(manifold, t_compact)` where `t_compact` has length `q_active`.
+    /// The logit-slot entries of `t_compact` are filled from the row logits (the
+    /// Euclidean projector ignores the point, so any finite value is equivalent;
+    /// using the true logits keeps the point well-defined and finite).
+    pub(crate) fn compact_row_ext_manifold_and_point(
+        &self,
+        row: usize,
+        layout: &SaeRowLayout,
+    ) -> (LatentManifold, Array1<f64>) {
+        let active = &layout.active_atoms[row];
+        let q_active = layout.row_q_active(row);
+        let mut parts: Vec<LatentManifold> = Vec::with_capacity(active.len() + active.len());
+        let mut point = Array1::<f64>::zeros(q_active);
+        // Logit slots: one Euclidean part per active atom, in `active` order.
+        let logits_row = self.assignment.logits.row(row);
+        for (j, &k) in active.iter().enumerate() {
+            parts.push(LatentManifold::Euclidean);
+            point[j] = logits_row[k];
+        }
+        // Coordinate blocks: each active atom's coordinate manifold + point, at
+        // the compact coord start the layout assigned it.
+        for (j, &k) in active.iter().enumerate() {
+            let coord = &self.assignment.coords[k];
+            let d = coord.latent_dim();
+            let coord_start = layout.coord_starts[row][j];
+            let manifold_k = coord.manifold();
+            // A `d`-dim coordinate whose manifold is a product (e.g. a torus =
+            // Circle×Circle) already carries its `d` parts; a scalar manifold is
+            // one part. Either way the manifold's ambient width must equal `d`,
+            // matching the `d` compact columns at `coord_start`.
+            parts.push(manifold_k.clone());
+            let coord_point = coord.row(row);
+            for axis in 0..d {
+                point[coord_start + axis] = coord_point[axis];
+            }
+        }
+        (LatentManifold::Product(parts), point)
+    }
+
     /// Numerical rank of a symmetric matrix: the count of eigenvalues
     /// exceeding `tol · max_eig`, with `tol = 1e-9` (the conventional
     /// relative spectral cutoff used elsewhere in the codebase).
@@ -4473,13 +4799,19 @@ impl SaeManifoldTerm {
                 // truly ill-posed evidence surface rather than a finite number of
                 // structural events. Each atom can contribute at most one
                 // birth/rank-reduction plus `SAE_ATOM_COLLAPSE_RESEED_BUDGET`
-                // reseeds, so a healthy walk re-anchors a bounded number of
-                // times. Exceeding that bound is the structural pathology, and
-                // there we refuse to compare.
+                // per-atom reseeds, and the whole dictionary can co-collapse and be
+                // multi-started at most `SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`
+                // times (each touching all K atoms), so a healthy walk re-anchors a
+                // bounded number of times. Exceeding that bound is the structural
+                // pathology, and there we refuse to compare.
                 self.evidence_gauge_deflation_reanchors += 1;
                 let reanchor_budget = self
                     .k_atoms()
-                    .saturating_mul(SAE_ATOM_COLLAPSE_RESEED_BUDGET + 1)
+                    .saturating_mul(
+                        SAE_ATOM_COLLAPSE_RESEED_BUDGET
+                            + SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET
+                            + 1,
+                    )
                     .saturating_add(1);
                 if self.evidence_gauge_deflation_reanchors > reanchor_budget {
                     return Err(format!(
@@ -7394,9 +7726,16 @@ impl SaeManifoldTerm {
 /// selecting each atom's active prefix.
 ///
 /// `evaluators`, when non-empty, must have length `K`. Each entry attaches an
-/// optional [`SaeBasisEvaluator`] to the matching atom so the Rust Newton
+/// optional [`SaeBasisSecondJet`] to the matching atom so the Rust Newton
 /// loop can refresh `Phi`/`dPhi/dt` between iterations without rebuilding the
-/// term from Python. An empty slice leaves every atom in snapshot-only mode.
+/// term from Python. The evaluator is installed through
+/// [`SaeManifoldAtom::with_basis_second_jet`], so its closed-form Hessian slot
+/// is populated too — this is what lets the #1117 rank-revealing reduction
+/// (`reduce_atoms_to_data_supported_rank`) reparametrize a rank-deficient
+/// fixed-width decoder (e.g. the periodic circle's 5-column basis whose data
+/// Gram comes out rank 3/5 on a near-degenerate checkpoint) onto its
+/// data-supported subspace instead of stalling on the flat REML valley. An
+/// empty slice leaves every atom in snapshot-only mode.
 #[must_use = "build error must be handled"]
 pub fn term_from_padded_blocks_with_mode(
     n_obs: usize,
@@ -7411,7 +7750,7 @@ pub fn term_from_padded_blocks_with_mode(
     logits: ArrayView2<'_, f64>,
     coords: &[Array2<f64>],
     mode: AssignmentMode,
-    evaluators: &[Option<Arc<dyn SaeBasisEvaluator>>],
+    evaluators: &[Option<Arc<dyn SaeBasisSecondJet>>],
 ) -> Result<SaeManifoldTerm, String> {
     let k_atoms = basis_sizes.len();
     if latent_dims.len() != k_atoms || basis_kinds.len() != k_atoms || coords.len() != k_atoms {
@@ -7447,7 +7786,13 @@ pub fn term_from_padded_blocks_with_mode(
             s,
         )?;
         let atom = match evaluators.get(k).and_then(|slot| slot.clone()) {
-            Some(evaluator) => atom.with_basis_evaluator(evaluator),
+            // Install through the second-jet slot so the analytic Hessian is
+            // available: the #1117 rank-revealing reduction needs it to compose
+            // the reduced jets when it reparametrizes a rank-deficient atom onto
+            // its data-supported subspace. All production SAE evaluators
+            // (periodic/sphere/torus/cylinder/Duchon/Euclidean-patch) implement
+            // `SaeBasisSecondJet`, so this is the standard install path.
+            Some(evaluator) => atom.with_basis_second_jet(evaluator),
             None => atom,
         };
         atoms.push(atom);
@@ -7698,4 +8043,83 @@ pub fn refresh_isometry_caches_from_term(
         }
     }
     Ok(refreshed_with_second)
+}
+
+#[cfg(test)]
+mod amortized_encoder_tests {
+    use crate::terms::sae_manifold::tests::small_two_atom_periodic_term;
+
+    /// #1026 ladder item 2/3 — the amortized encoder is reachable end-to-end
+    /// from a fitted term and is certificate-honest: it encodes the dictionary's
+    /// own fit-time target, returns one result per atom with the right shape, and
+    /// every row is either certified or counted in
+    /// `encode_uncertified_count` (never silently miscounted), with the exact
+    /// fallback strictly reducing the uncertified count it inherits.
+    #[test]
+    fn amortized_encode_fitted_is_reachable_and_certificate_honest() {
+        let (term, target, rho) = small_two_atom_periodic_term();
+        let n = term.n_obs();
+        let k = term.k_atoms();
+
+        let results = term
+            .amortized_encode_fitted(target.view(), &rho)
+            .expect("amortized encode of the fit-time target runs end-to-end");
+        assert_eq!(
+            results.len(),
+            k,
+            "one encode result per atom in dictionary order"
+        );
+
+        for (atom_idx, result) in results.iter().enumerate() {
+            assert_eq!(
+                result.coords.nrows(),
+                n,
+                "atom {atom_idx} encode must produce one coordinate per row"
+            );
+            assert_eq!(
+                result.coords.ncols(),
+                term.atoms[atom_idx].latent_dim,
+                "atom {atom_idx} encode coords must match its latent dim"
+            );
+            // The uncertified count is the honest tally of rows the certificate
+            // could not gate — it must equal the false entries of the mask.
+            let uncertified = result.certified.iter().filter(|c| !**c).count();
+            assert_eq!(
+                result.encode_uncertified_count, uncertified,
+                "atom {atom_idx} uncertified count must match the certificate mask"
+            );
+            assert_eq!(
+                result.certified.len(),
+                n,
+                "atom {atom_idx} certificate mask must cover every row"
+            );
+        }
+    }
+
+    /// The fitted amplitudes the encoder derives are exactly the assignment
+    /// masses the reconstruction is assembled from — feeding them back is the
+    /// self-consistency the distilled map is supervised against.
+    #[test]
+    fn fitted_assignment_amplitudes_match_the_assignment_masses() {
+        let (term, _target, rho) = small_two_atom_periodic_term();
+        let n = term.n_obs();
+        let k = term.k_atoms();
+        let amplitudes = term
+            .fitted_assignment_amplitudes(&rho)
+            .expect("fitted amplitudes derive from the assignment");
+        assert_eq!(amplitudes.dim(), (n, k));
+        for row in 0..n {
+            let a = term
+                .assignment
+                .try_assignments_row_for_rho(row, &rho)
+                .expect("assignment row resolves");
+            for atom_idx in 0..k {
+                assert_eq!(
+                    amplitudes[[row, atom_idx]],
+                    a[atom_idx],
+                    "amplitude[{row},{atom_idx}] must equal the assignment mass"
+                );
+            }
+        }
+    }
 }

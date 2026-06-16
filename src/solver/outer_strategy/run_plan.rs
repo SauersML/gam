@@ -1280,12 +1280,50 @@ pub(crate) fn run_outer_with_plan(
                             .as_ref()
                             .is_some_and(|initial| initial == seed);
                     if is_warm_seed {
-                        let g0_norm =
-                            seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-                        if g0_norm.is_finite() && g0_norm > 0.0 {
-                            let scale = (1.0 / g0_norm).clamp(1.0e-3, 1.0e3);
-                            optimizer =
-                                optimizer.with_initial_metric(InitialMetric::Scalar(scale));
+                        // Prefer the converged outer curvature transferred from
+                        // the prior structurally-matching fit (`H(θ̂)_parent`):
+                        // its inverse is the ideal BFGS iter-0 metric, making the
+                        // first outer direction a quasi-Newton step `d = -H⁻¹g₀`
+                        // rather than the unscaled `-g₀`. Across LOSO folds the
+                        // curvature differs by one held-out row, so the parent's
+                        // anisotropic Hessian is a far better local model than the
+                        // single-magnitude scalar — it eliminates most of the
+                        // StrongWolfe bracketing whose every probe is a full inner
+                        // joint-Newton re-solve. `invert_spd_with_ridge` only
+                        // returns when the curvature is SPD (after a tiny ridge),
+                        // which is exactly when it is a valid (descent-preserving)
+                        // metric; a non-PD transferred Hessian falls through to
+                        // the scalar magnitude metric. Either way the converged
+                        // optimum is unchanged: BFGS reaches ∇V=0 under any SPD
+                        // initial metric, and the gradient/KKT tests are identical.
+                        let dense_metric = config
+                            .warm_start_outer_hessian
+                            .as_ref()
+                            .filter(|h| {
+                                h.nrows() == layout.n_params
+                                    && h.ncols() == layout.n_params
+                                    && h.iter().all(|v| v.is_finite())
+                            })
+                            .and_then(|h| {
+                                crate::linalg::utils::invert_spd_with_ridge(h, 1.0e-8).ok()
+                            })
+                            .filter(|h_inv| h_inv.iter().all(|v| v.is_finite()));
+                        if let Some(h_inv) = dense_metric {
+                            log::info!(
+                                "[OUTER] {context}: warm-start BFGS metric = transferred \
+                                 H(θ̂)⁻¹ (dim={}); quasi-Newton first step",
+                                layout.n_params,
+                            );
+                            optimizer = optimizer
+                                .with_initial_metric(InitialMetric::DenseInverseHessian(h_inv));
+                        } else {
+                            let g0_norm =
+                                seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                            if g0_norm.is_finite() && g0_norm > 0.0 {
+                                let scale = (1.0 / g0_norm).clamp(1.0e-3, 1.0e3);
+                                optimizer =
+                                    optimizer.with_initial_metric(InitialMetric::Scalar(scale));
+                            }
                         }
                     }
                     if let Some(caps) = bfgs_axis_step_caps(config, layout) {

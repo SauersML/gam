@@ -422,7 +422,7 @@ impl SaeManifoldTerm {
         // (#1051): no continuation spine, no joint Hessian. The dictionary now
         // honestly reports which atoms earn their curvature and which collapse to
         // the linear tail.
-        match self.compute_hybrid_split_report(rho) {
+        match self.compute_hybrid_split_report(rho, Some(target)) {
             Ok(report) => {
                 if let Some(report) = &report {
                     log::info!(
@@ -1866,24 +1866,83 @@ impl SaeManifoldTerm {
             if ev >= SAE_DICTIONARY_COLLAPSE_EV_FLOOR {
                 return Ok(());
             }
-            // Co-collapsed. Reseed all atoms EXCEPT the strongest (kept as an
-            // anchor so the reseed targets a non-degenerate residual and the set
-            // does not re-symmetrise into the same basin) onto DISTINCT residual
-            // PCs below.
-            let anchor = (0..k)
-                .max_by(|&a, &b| {
-                    norms[a]
-                        .partial_cmp(&norms[b])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap_or(0);
-            breached = (0..k).filter(|&a| a != anchor).collect();
+            // Co-collapsed: every decoder is ≈0 TOGETHER. Reseed ALL atoms onto
+            // DISTINCT residual PCs — keeping no "anchor", because in a true
+            // co-collapse the "strongest" atom is itself degenerate, so there is no
+            // healthy atom worth anchoring. The two properties an anchor was meant
+            // to provide are already supplied by the residual seeding itself:
+            // (1) the residual is computed from the current (degenerate) fit, so
+            // with EV≈0 it is ≈ the target and therefore non-degenerate; and
+            // (2) `reseed_atoms_onto_distinct_residual_pcs` assigns each atom slot
+            // its OWN disjoint residual-PC pair (the #671 rule), so the set cannot
+            // re-symmetrise into one basin in a single step. Reseeding all K onto K
+            // distinct PC pairs is the maximal-diversity multi-start — the
+            // strongest basin break available.
+            //
+            // Budget: a SINGLE maximal-diversity reseed still cannot always break a
+            // K≥3 basin — one freshly-diversified start can re-symmetrise back into
+            // a shared basin under the joint LSQ refit (#1117 K>1 robustness:
+            // identical (K=3, seed) flipped EV≈0.40 ↔ 0.00 across runs). This arm
+            // is therefore a bounded DICTIONARY multi-start, NOT the per-atom
+            // mass-guard loop: each retry recomputes the residual from the
+            // (still-degenerate) current fit and seeds onto the NEW distinct PCs, so
+            // successive attempts explore genuinely different basins rather than
+            // fighting the optimizer over one atom. It gets its OWN budget
+            // (`SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`), distinct from the
+            // per-atom `SAE_ATOM_COLLAPSE_RESEED_BUDGET` (which stays 1 for the
+            // reasons in its doc). Because this branch only runs when
+            // EV < `SAE_DICTIONARY_COLLAPSE_EV_FLOOR` — a fit that already explains
+            // ~zero variance — it is a no-op for every healthy K=1/K=2 fit (real
+            // OLMo EV ~0.22 / ~0.40) and can only ADD basin-escape attempts to an
+            // already-failed dictionary.
+            if self.dictionary_cocollapse_reseeds >= SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET {
+                // Multi-start budget spent: record a terminal event for each atom
+                // once and leave the keep-or-kill verdict to the evidence-gated
+                // structure search, exactly as the per-atom arm does on its budget.
+                for atom in 0..k {
+                    let already_terminal = self
+                        .collapse_events
+                        .iter()
+                        .any(|e| e.atom == atom && e.action == CollapseAction::Terminal);
+                    if !already_terminal {
+                        self.collapse_events.push(CollapseEvent {
+                            iteration,
+                            atom,
+                            max_active_mass: ev,
+                            floor: SAE_DICTIONARY_COLLAPSE_EV_FLOOR,
+                            action: CollapseAction::Terminal,
+                        });
+                    }
+                }
+                return Ok(());
+            }
+            self.dictionary_cocollapse_reseeds += 1;
             log::warn!(
                 "SaeManifoldTerm: dictionary co-collapse (reconstruction EV={ev:.4} < \
                  {SAE_DICTIONARY_COLLAPSE_EV_FLOOR}) with no relative-norm breach; reseeding \
-                 {} of {k} atoms onto distinct residual PCs (anchor atom {anchor})",
-                breached.len()
+                 all {k} atoms onto distinct residual PCs (dictionary multi-start \
+                 {}/{SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET}: total co-collapse, no atom \
+                 carries material signal to anchor)",
+                self.dictionary_cocollapse_reseeds
             );
+            let all: Vec<usize> = (0..k).collect();
+            self.reseed_atoms_onto_distinct_residual_pcs(&all, target, rho)?;
+            for atom in 0..k {
+                self.reseed_collapsed_atom_logits(atom);
+                self.collapse_events.push(CollapseEvent {
+                    iteration,
+                    atom,
+                    max_active_mass: ev,
+                    floor: SAE_DICTIONARY_COLLAPSE_EV_FLOOR,
+                    action: CollapseAction::Reseeded,
+                });
+            }
+            // One joint least-squares decoder refit at the re-diversified state
+            // (same rationale as the per-atom arm below): every atom, the reseeded
+            // ones especially, gets a fresh non-degenerate decoder that distributes
+            // the available signal across the dictionary.
+            self.refit_decoder_least_squares_at_current_state(target, Some(rho))?;
+            return Ok(());
         }
         // Decide which breached atoms still have reseed budget (recording a
         // Reseeded or Terminal collapse event for each), then reseed the budgeted

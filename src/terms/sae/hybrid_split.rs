@@ -87,6 +87,20 @@ pub struct AtomHybridVerdict {
     /// `true` iff the slot kept the CURVED parameterization (the fitted atom);
     /// `false` iff it yielded to the LINEAR special case (the straight tail).
     pub kept_curved: bool,
+    /// The atom's fitted turning `Θ = ∫|κ| ds` (radians), the novel geometric
+    /// quantity #1026 pairs against reconstruction EV: `Θ ≈ 0` is a linear-tail
+    /// direction wearing a curved basis, `Θ ≈ 2π` is a full curved loop. `None`
+    /// iff the evaluator has no analytic second jet or the curve is degenerate.
+    /// Captured here (not just logged) so the EV-vs-Θ frontier is queryable
+    /// structured data on the persisted report rather than a transient log line.
+    pub fitted_turning: Option<f64>,
+    /// The atom's held-out leave-one-atom-out explained-variance contribution
+    /// `ΔEV_k = EV(full) − EV(full∖{k})` — how much reconstruction EV this single
+    /// atom earns. Paired with [`Self::fitted_turning`] this is the `(Θ, ΔEV)`
+    /// point the #1026 frontier reports: a `Θ ≈ 0` atom with large `ΔEV` is a
+    /// genuine linear-tail direction; a high-`Θ` atom with large `ΔEV` is a
+    /// genuine curved family. `None` iff the caller did not supply LOAO EV.
+    pub held_out_delta_ev: Option<f64>,
     /// The fitted straight sub-model for this slot, present iff the verdict
     /// selected LINEAR (`kept_curved == false`). The collapsed reconstruction
     /// substitutes this for the atom's curved decoded image, making the verdict
@@ -269,19 +283,23 @@ fn build_atom_candidates(
 ///
 /// Returns `None` (no report) when no atom is eligible — there is nothing to
 /// adjudicate.
-pub fn build_hybrid_split_report<'a, C, W, D, M>(
+pub fn build_hybrid_split_report<'a, C, W, D, M, E>(
     atoms: &'a [SaeManifoldAtom],
     eligible_d1: impl Iterator<Item = usize>,
     mut coords_for: C,
     mut weights_for: W,
     mut decoded_for: D,
     mut manifold_for: M,
+    mut delta_ev_for: E,
 ) -> Result<Option<SaeHybridSplitReport>, String>
 where
     C: FnMut(usize) -> Array1<f64>,
     W: FnMut(usize) -> Array1<f64>,
     D: FnMut(usize) -> Array2<f64>,
     M: FnMut(usize) -> LatentManifold,
+    // The atom's held-out LOAO `ΔEV_k`, keyed by atom index. `None` when LOAO EV
+    // is unavailable (e.g. the caller has no target to measure against).
+    E: FnMut(usize) -> Option<f64>,
 {
     let mut slots: Vec<Vec<HybridAtomCandidate>> = Vec::new();
     let mut names: Vec<String> = Vec::new();
@@ -290,6 +308,10 @@ where
     // the verdict iff the slot selects LINEAR so the collapsed reconstruction can
     // substitute it for the curved decoded image.
     let mut linear_images: Vec<AtomLinearImage> = Vec::new();
+    // Per-slot `(Θ, ΔEV)` — the #1026 frontier point — carried onto each verdict
+    // so the geometry/EV pairing is structured report data, not a log line.
+    let mut turnings: Vec<Option<f64>> = Vec::new();
+    let mut delta_evs: Vec<Option<f64>> = Vec::new();
 
     for atom_idx in eligible_d1 {
         let atom = &atoms[atom_idx];
@@ -327,6 +349,8 @@ where
         slots.push(slot);
         names.push(atom.name.clone());
         manifolds.push(manifold);
+        turnings.push(fitted_turning);
+        delta_evs.push(delta_ev_for(atom_idx));
         linear_images.push(AtomLinearImage {
             atom_idx,
             t_bar,
@@ -344,21 +368,27 @@ where
         .into_iter()
         .zip(selection.atoms.iter().copied())
         .zip(linear_images.into_iter())
-        .map(|((atom_name, choice), linear_image)| {
-            let kept_curved = !choice.param.is_linear();
-            AtomHybridVerdict {
-                atom_name,
-                choice,
-                kept_curved,
-                // Carry the straight sub-model only when the verdict collapses
-                // this slot to linear — the curved slots keep their fitted image.
-                linear_image: if kept_curved {
-                    None
-                } else {
-                    Some(linear_image)
-                },
-            }
-        })
+        .zip(turnings.into_iter())
+        .zip(delta_evs.into_iter())
+        .map(
+            |((((atom_name, choice), linear_image), fitted_turning), held_out_delta_ev)| {
+                let kept_curved = !choice.param.is_linear();
+                AtomHybridVerdict {
+                    atom_name,
+                    choice,
+                    kept_curved,
+                    fitted_turning,
+                    held_out_delta_ev,
+                    // Carry the straight sub-model only when the verdict collapses
+                    // this slot to linear — the curved slots keep their fitted image.
+                    linear_image: if kept_curved {
+                        None
+                    } else {
+                        Some(linear_image)
+                    },
+                }
+            },
+        )
         .collect();
 
     Ok(Some(SaeHybridSplitReport {

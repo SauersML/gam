@@ -3307,6 +3307,25 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains(psi))
     }
 
+    /// True when the design-revision fast path of [`Self::prepare_eval_state`]
+    /// would fire for `design_revision` — i.e. a prior eval has already pinned
+    /// `last_canonical_revision` to this exact realizer revision, so the next
+    /// `evaluate_with_order` at this revision will SKIP `reset_surface` (and the
+    /// n×k `apply_to_design` reconditioning) and instead re-install the ψ-keyed
+    /// `GaussianFixedCache` onto the existing surface (#1033).
+    ///
+    /// The spatial κ caller (`SpatialJointContext::eval_full`) consults this
+    /// BEFORE deciding to skip its own `ensure_theta` design re-realization: it
+    /// may only suppress the per-trial O(n·k) design rebuild when the evaluator
+    /// will take that fast path, because the fast path is exactly the lane that
+    /// keeps the (now intentionally stale) reference surface while serving the
+    /// trial's value + gradient n-free from the certified tensor. When this is
+    /// `false` the caller MUST realize the design so the slow path's
+    /// `reset_surface` rebuilds a faithful surface.
+    pub(crate) fn design_revision_fast_path_armed(&self, design_revision: u64) -> bool {
+        self.last_canonical_revision == Some(design_revision)
+    }
+
     /// Return the most-recently converged inner β from the last PIRLS solve, if
     /// it is finite and the right dimension. Used by `SpatialJointContext` to
     /// warm-start successive outer evaluations instead of cold-starting PIRLS
@@ -3326,16 +3345,32 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     ///
     /// Off-window, multi-ψ, ineligible family, or shape mismatch all return
     /// without installing — the streamed exact path runs unchanged.
-    fn install_psi_gram_statistics(&mut self, theta: &Array1<f64>, rho_dim: usize) {
+    /// Returns `true` when the n-free Gaussian ψ-GRADIENT derivative pair was
+    /// installed for this trial — i.e. the certified tensor serves both the
+    /// value AND the gradient n-free, so the conditioned n×k `∂X/∂ψ` slab in the
+    /// hyper_dirs is provably DEAD (the gradient HyperCoord's `j==0` branch reads
+    /// the k-space derivatives and never the slab). The caller uses this to skip
+    /// the per-trial slab conditioning on the design-revision fast path (#1033).
+    fn install_psi_gram_statistics(&mut self, theta: &Array1<f64>, rho_dim: usize) -> bool {
         let Some(tensor) = self.psi_gram_tensor.as_ref() else {
-            return;
+            // No tensor installed for this fit → the surface never carries a
+            // ψ-keyed Gaussian Gram, so there is nothing stale to clear.
+            return false;
         };
+        // #1033: every early return below is a trial for which we CANNOT serve
+        // the n-free per-ψ Gram (off-window, wrong shape, multi-ψ). On the
+        // design-revision fast path `reset_surface` is skipped, so a Gram keyed
+        // to the PREVIOUS in-window ψ would survive and be read stale by the
+        // inner Gaussian PLS. Clear it on every miss so the inner solver
+        // restreams the exact Gram for this trial's design.
         if theta.len() != rho_dim + 1 {
-            return;
+            self.reml_state.clear_gaussian_fixed_cache();
+            return false;
         }
         let psi = theta[rho_dim];
         if !tensor.contains(psi) {
-            return;
+            self.reml_state.clear_gaussian_fixed_cache();
+            return false;
         }
         // Clone the Arc handle so the immutable borrow of `self.psi_gram_tensor`
         // is released before the `&mut self.reml_state` installs below.
@@ -3344,7 +3379,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .reml_state
             .install_gaussian_fixed_cache(Arc::new(tensor.gaussian_fixed_cache_at(psi)))
         {
-            return;
+            self.reml_state.clear_gaussian_fixed_cache();
+            return false;
         }
         log::debug!(
             "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"
@@ -3364,6 +3400,15 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             log::debug!(
                 "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
             );
+            true
+        } else {
+            // In the VALUE window but outside the certified GRADIENT sub-window
+            // (or the deriv shape refused). The value cache above is sound and
+            // stays; clear any derivative pair left from a prior in-sub-window ψ
+            // so the gradient lane uses the exact slab for this trial rather than
+            // a stale derivative carried over on the design-revision fast path.
+            self.reml_state.clear_gaussian_psi_gram_deriv();
+            false
         }
     }
 
@@ -3395,22 +3440,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         if fast_path {
             validate_joint_hyper_direction_shapes(x, s_list.len(), theta, rho_dim, &hyper_dirs)?;
 
-            for dir in &mut hyper_dirs {
-                let mut x_tau = dir.x_tau_dense();
-                self.conditioning
-                    .transform_matrix_columnswith_a_inplace(&mut x_tau);
-                dir.x_tau_original =
-                    crate::solver::estimate::reml::HyperDesignDerivative::from(x_tau);
-                if let Some(rows) = dir.x_tau_tau_original.as_mut() {
-                    for mat in rows.iter_mut().flatten() {
-                        let mut dense = mat.materialize();
-                        self.conditioning
-                            .transform_matrix_columnswith_a_inplace(&mut dense);
-                        *mat = crate::solver::estimate::reml::HyperDesignDerivative::from(dense);
-                    }
-                }
-            }
-
             self.reml_state
                 .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
             self.reml_state.setwarm_start_original_beta(warm_start_beta);
@@ -3420,8 +3449,34 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // certified tensor — otherwise the inner PLS reads a stale Gram. The
             // slow path below clears + reinstalls these; the fast path skips
             // `reset_surface` (which clears them), so we re-install here directly.
-            self.install_psi_gram_statistics(theta, rho_dim);
+            // Install BEFORE conditioning so we learn whether the n-free
+            // ψ-gradient was served from the tensor: if so, the conditioned n×k
+            // `∂X/∂ψ` slab below is provably DEAD (the `j==0` gradient branch
+            // reads the k-space derivatives, never the slab), so we skip the
+            // per-trial slab conditioning — the LAST O(n·k²) pass in the κ loop.
+            let gradient_is_n_free = self.install_psi_gram_statistics(theta, rho_dim);
             self.install_pending_glm_first_step_gram();
+            if !gradient_is_n_free {
+                // The slab gradient lane is live for this trial (off the certified
+                // gradient sub-window, non-Gaussian, multi-ψ, …) — condition the
+                // n×k `∂X/∂ψ` slab into the inner solver's frame as before.
+                for dir in &mut hyper_dirs {
+                    let mut x_tau = dir.x_tau_dense();
+                    self.conditioning
+                        .transform_matrix_columnswith_a_inplace(&mut x_tau);
+                    dir.x_tau_original =
+                        crate::solver::estimate::reml::HyperDesignDerivative::from(x_tau);
+                    if let Some(rows) = dir.x_tau_tau_original.as_mut() {
+                        for mat in rows.iter_mut().flatten() {
+                            let mut dense = mat.materialize();
+                            self.conditioning
+                                .transform_matrix_columnswith_a_inplace(&mut dense);
+                            *mat =
+                                crate::solver::estimate::reml::HyperDesignDerivative::from(dense);
+                        }
+                    }
+                }
+            }
             return Ok(hyper_dirs);
         }
 
@@ -3631,6 +3686,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         s_list: &[BlockwisePenalty],
         nullspace_dims: &[usize],
         linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+        theta: &Array1<f64>,
+        rho_dim: usize,
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
         design_revision: Option<u64>,
@@ -3660,6 +3717,19 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // derivative (#1033 / #1111): clear it so a prior trial's ψ pair
             // never serves this probe's gradient; it restreams the exact slab.
             self.reml_state.clear_glm_psi_gram_deriv();
+            // #1033: the Gaussian-identity `gaussian_fixed_cache` is ALSO keyed to
+            // the trial's ψ (the certified ψ-Gram tensor's `XᵀWX(ψ)/XᵀWz(ψ)`), and
+            // a VALUE probe runs at a different ψ than the eval that installed it.
+            // On the fast path `reset_surface` is skipped, so without re-keying
+            // here the inner Gaussian PLS would read the PREVIOUS ψ's Gram — a
+            // stale-Gram correctness hazard. Re-install the n-free per-ψ Gram for
+            // THIS probe's ψ (in-window) so the value probe is both correct AND
+            // touches only k-dim sufficient statistics; off-window the installer
+            // is a no-op and the surface keeps its streamed Gram. The conditioned
+            // ψ-derivatives the installer also stages are gradient-channel objects
+            // unused by `compute_cost`, but keying them to this ψ keeps a single
+            // source of truth and avoids leaving a prior trial's pair installed.
+            self.install_psi_gram_statistics(theta, rho_dim);
             return Ok(());
         }
 
@@ -3731,6 +3801,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             s_list,
             nullspace_dims,
             linear_constraints,
+            theta,
+            rho_dim,
             warm_start_beta,
             context,
             design_revision,
@@ -3848,10 +3920,22 @@ fn reml_inner_progress_feedback(
 fn with_reml_beta_seed_hook<'state, 'data>() -> impl FnMut(
     &mut &'state mut crate::solver::estimate::reml::RemlState<'data>,
     &Array1<f64>,
-) -> Result<(), EstimationError> {
+) -> Result<
+    crate::solver::outer_strategy::SeedOutcome,
+    EstimationError,
+> {
     |state, beta| {
+        // The REML state stores β as a starting-iterate HINT and validates
+        // its width against the design (`self.p`) at store time, silently
+        // dropping a mismatched or non-finite hint rather than faulting
+        // (see `setwarm_start_original_beta`). A wrong-length seed is
+        // therefore never an error: a row-relaxed cross-fold prefix seed
+        // degrades to a ρ-only resume, exactly the desired warm-start
+        // behaviour. The slot's post-call state (the supplied β if it fit,
+        // else the prior state) is what the next eval warm-starts from, so
+        // `Installed` is the correct contract reply.
         state.setwarm_start_original_beta(Some(beta.view()));
-        Ok(())
+        Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
     }
 }
 
@@ -3929,6 +4013,77 @@ fn gaussian_identity_response_center(
     }
     let m = weighted.sum() / weight_sum;
     (m.is_finite() && m != 0.0).then_some(m)
+}
+
+/// The multiplicative scale an identity-link Gaussian outer REML λ-search should
+/// divide the (already centered) response by so its magnitude is `O(1)` for the
+/// duration of the search (issue #1127).
+///
+/// Replacing the response `y` by `a·y` (`a > 0`) for an identity-link Gaussian
+/// fit must rescale the entire fit by `a` and leave `λ̂` / EDF unchanged: the
+/// penalized normal equations are exactly linear in `y`, so `β̂(a·y)=a·β̂(y)`
+/// at any fixed `λ`, and the profiled REML criterion is `a`-invariant up to the
+/// additive constant `−(n−p)·ln a` (the dispersion `σ̂²` absorbs the `a²`).
+/// Numerically, though, the outer λ-selection's convergence band is keyed to an
+/// *absolute* objective scale (the inner-solve `objective_scale.max(1.0)` floor
+/// and the outer `1e-6` gradient floor): when the whole Gaussian objective is
+/// `O(a²) ≪ 1` those floors swamp the real signal and the optimizer declares
+/// premature convergence at an over-smoothed `λ` — silently over-smoothing
+/// small-magnitude responses (strains, volts, mole fractions, returns;
+/// `a ≈ 1e-6`). Normalizing the working response to `O(1)` makes the absolute
+/// floors track the true signal, restoring scale equivariance.
+///
+/// Returns `Some(s)` with `s = √(Σ wᵢ (yᵢ − mean)² / Σ wᵢ)` — the weighted RMS
+/// of the centered response — so the caller can divide by it and keep the outer
+/// working response `O(1)` regardless of magnitude. The same gate as
+/// [`gaussian_identity_response_center`] applies (identity-link Gaussian with an
+/// unpenalized intercept and no linear constraints); a non-finite, zero, or
+/// already-`O(1)` RMS returns `None` (do not scale, exact previous behaviour) —
+/// scaling near unity buys nothing and only risks a needless allocation.
+fn gaussian_identity_response_scale(
+    cfg: &RemlConfig,
+    conditioning: &ParametricColumnConditioning,
+    has_linear_constraints: bool,
+    center: f64,
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+) -> Option<f64> {
+    if has_linear_constraints
+        || conditioning.intercept_idx.is_none()
+        || !matches!(cfg.likelihood.spec.response, ResponseFamily::Gaussian)
+        || !matches!(cfg.link_function(), LinkFunction::Identity)
+    {
+        return None;
+    }
+    // A multiplicative response rescale `y → y/s` must be matched by `η → η/s`
+    // for the residual to scale cleanly. The intercept and smooth coefficients
+    // scale freely, but a *fixed* offset column does not — scaling the working
+    // response while leaving the offset on its original scale would change the
+    // residual geometry, not just its magnitude. The offset is shared verbatim
+    // into the outer state and reused by the accept-fit, so rather than thread a
+    // separately scaled copy everywhere, restrict the (rare) offset case to the
+    // exact previous path: only normalize when there is no nonzero offset.
+    if offset.iter().any(|&o| o != 0.0) {
+        return None;
+    }
+    let mut weight_sum = 0.0_f64;
+    let mut weighted_sq = KahanSum::default();
+    for ((&yi, &wi), &oi) in y.iter().zip(w.iter()).zip(offset.iter()) {
+        if wi > 0.0 {
+            weight_sum += wi;
+            let centered = (yi - oi) - center;
+            weighted_sq.add(wi * centered * centered);
+        }
+    }
+    if weight_sum <= 0.0 {
+        return None;
+    }
+    let rms = (weighted_sq.sum() / weight_sum).sqrt();
+    // Only normalize when the magnitude is far enough from `O(1)` to matter; a
+    // factor within ~one order of magnitude of unity cannot push the objective
+    // through the absolute floors, so leave the exact previous path untouched.
+    (rms.is_finite() && rms > 0.0 && !(0.1..=10.0).contains(&rms)).then_some(rms)
 }
 
 fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
@@ -4022,15 +4177,47 @@ where
         w_o.view(),
         offset_o.view(),
     );
+    // Issue #1127 (down-scale sibling of #1000): replacing the response `y` by
+    // `a·y` must rescale the whole fit by `a` and leave `λ̂`/EDF unchanged (the
+    // normal equations are exactly linear in `y`; the profiled REML criterion is
+    // `a`-invariant up to the additive `−(n−p)·ln a` the dispersion absorbs).
+    // But the outer λ-selection's convergence band is keyed to an *absolute*
+    // objective scale (an inner `objective_scale.max(1.0)` floor and a `1e-6`
+    // outer gradient floor); when the Gaussian objective is `O(a²) ≪ 1` those
+    // floors swamp the signal and the optimizer stops early at an over-smoothed
+    // `λ`. Normalize the (centered) working response to `O(1)` for the outer
+    // λ-search only, mirroring the #1000 centering: the final accept-fit below
+    // re-fits the *original* response at the REML-selected λ̂, so β, μ̂, σ̂² and
+    // every reported quantity stay exactly on the user's scale. `center` here is
+    // the constant the intercept already absorbs (so the scale is measured on the
+    // residual signal, not on the offset).
+    let response_scale = gaussian_identity_response_scale(
+        &cfg,
+        &conditioning,
+        opts.linear_constraints.is_some(),
+        response_center.unwrap_or(0.0),
+        y_o.view(),
+        w_o.view(),
+        offset_o.view(),
+    );
     // The outer loop borrows the response for the lifetime of `reml_state`;
-    // the centered copy (when any) is owned at function scope so the borrow
-    // outlives the state. Off the Gaussian-identity path `response_center` is
-    // `None` and the outer loop borrows the original response verbatim — no
-    // allocation, no behavioural change.
-    let reml_y_centered: Option<Array1<f64>> = response_center.map(|m| &y_o - m);
-    let reml_y_view = reml_y_centered
+    // the conditioned copy (when any) is owned at function scope so the borrow
+    // outlives the state. Off the Gaussian-identity path both `response_center`
+    // and `response_scale` are `None` and the outer loop borrows the original
+    // response verbatim — no allocation, no behavioural change. When only one is
+    // active we still apply just that transform. Both are exactly invertible by
+    // the accept-fit, which re-fits the original `y_o` at the selected λ̂.
+    let reml_y_conditioned: Option<Array1<f64>> = match (response_center, response_scale) {
+        (None, None) => None,
+        (center, scale) => {
+            let c = center.unwrap_or(0.0);
+            let s = scale.unwrap_or(1.0);
+            Some((&y_o - c) / s)
+        }
+    };
+    let reml_y_view = reml_y_conditioned
         .as_ref()
-        .map_or_else(|| y_o.view(), |centered| centered.view());
+        .map_or_else(|| y_o.view(), |conditioned| conditioned.view());
 
     let mut reml_state = RemlState::newwith_offset_shared(
         reml_y_view,
@@ -4735,14 +4922,15 @@ where
     // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
     // so the final accept-fit skips the streaming GEMM as well.
     //
-    // When the outer loop centered the response (issue #1000), that cache holds
-    // `XᵀW(centered_y − offset)`; the accept-fit runs on the *original*
-    // (uncentered) response `y_o`, so reusing the centered `XᵀWy` would solve
-    // for the centered intercept and report every fitted value, residual and
-    // scale on the shifted scale. Rebuild the cross-product from the original
-    // response in that case — the constant `XᵀWX` block is the only part the
-    // cache would have saved, a one-off cost paid only on large-mean responses.
-    let final_cache_handle = if response_center.is_some() {
+    // When the outer loop conditioned the response (centering for #1000, scaling
+    // for #1127), that cache holds `XᵀW((y−center)/scale)`; the accept-fit runs
+    // on the *original* response `y_o`, so reusing the conditioned `XᵀWy` would
+    // solve on the shifted/rescaled scale and report every fitted value, residual
+    // and dispersion off the user's scale. Rebuild the cross-product from the
+    // original response in that case — the constant `XᵀWX` block is the only part
+    // the cache would have saved, a one-off cost paid only on the rare
+    // large-mean / small-magnitude responses that trigger conditioning.
+    let final_cache_handle = if response_center.is_some() || response_scale.is_some() {
         None
     } else {
         reml_state.gaussian_fixed_cache_if_eligible()

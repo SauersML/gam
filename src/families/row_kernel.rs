@@ -88,6 +88,44 @@ fn arrow_row_chunk_count(n_rows: usize) -> usize {
     }
 }
 
+/// Row-block size for the parallel per-row **cache build** (`build_row_kernel_cache`).
+///
+/// Unlike the trace/Gram folds, the cache build writes per-row scalars into
+/// index-keyed slots and performs NO cross-row summation, so its chunk size is
+/// free of the deterministic-associativity contract that pins [`ARROW_ROW_CHUNK`]
+/// (= 256) for the reduction paths. At biobank scale the 256-row tiling fans the
+/// build into `n / 256` tasks (≈760 for n ≈ 195k) of light per-row jet work; on a
+/// wide `Par::rayon(0)` pool that many tiny tasks pays the crossbeam-epoch /
+/// rayon-scheduling overhead documented as the dominant fanning cost for this
+/// workload (issue #1045), not the per-row arithmetic itself. We instead size the
+/// build to roughly `OVERSUBSCRIBE × workers` blocks — full pool occupancy with
+/// load-balancing headroom, but two orders of magnitude fewer task entries — and
+/// clamp to a multiple of [`ARROW_ROW_CHUNK`] so the published-value scatter
+/// offsets stay chunk-aligned. Bit-identical output: each cache slot is written by
+/// its own absolute row index regardless of how the row range is partitioned.
+fn cache_build_chunk_rows(n_rows: usize) -> usize {
+    const OVERSUBSCRIBE: usize = 4;
+    if n_rows == 0 {
+        return ARROW_ROW_CHUNK;
+    }
+    let workers = rayon::current_num_threads().max(1);
+    let target_blocks = (workers * OVERSUBSCRIBE).max(1);
+    let by_target = n_rows.div_ceil(target_blocks).max(1);
+    // Round UP to a whole number of `ARROW_ROW_CHUNK` rows so each block spans an
+    // integer count of arrow tiles and the scatter offset `block_idx * chunk_rows`
+    // stays tile-aligned; floor at one tile so a tiny `n` still makes progress.
+    by_target.div_ceil(ARROW_ROW_CHUNK).max(1) * ARROW_ROW_CHUNK
+}
+
+#[inline]
+fn cache_build_block_count(n_rows: usize, chunk_rows: usize) -> usize {
+    if n_rows == 0 {
+        0
+    } else {
+        (n_rows - 1) / chunk_rows + 1
+    }
+}
+
 // ── Row selector ─────────────────────────────────────────────────────
 //
 // `RowSet` is the contract every outer-only assembly path uses to declare
@@ -458,10 +496,17 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// the generic Horvitz-Thompson per-row path runs.
     fn directional_derivative_dense_override(
         &self,
-        _rows: &RowSet,
-        _d_beta: &[f64],
+        rows: &RowSet,
+        d_beta: &[f64],
     ) -> Option<Result<Array2<f64>, String>> {
-        None
+        // Default = the exact generic per-row path, which consumes `rows`/`d_beta`.
+        // A kernel with a BLAS-3 fast path overrides this (see the rigid impl);
+        // returning `Some` here keeps the dispatcher's fall-through reserved for
+        // an override that explicitly declines (returns `None`) on a row-set it
+        // cannot accelerate.
+        Some(row_kernel_directional_derivative_generic(
+            self, rows, d_beta,
+        ))
     }
 
     /// Optional BLAS-3 fast path for the dense joint Hessian assembly
@@ -482,9 +527,64 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// non-unit-weight `RowSet` return `None` so the generic HT path runs.
     fn hessian_dense_override(
         &self,
-        _rows: &RowSet,
-        _row_hessians: &[[[f64; K]; K]],
+        rows: &RowSet,
+        row_hessians: &[[[f64; K]; K]],
     ) -> Option<Array2<f64>> {
+        // Default = the exact generic per-row pullback, which consumes
+        // `rows`/`row_hessians`. A kernel with a BLAS-3 fast path overrides this;
+        // returning `Some` keeps the dispatcher fall-through reserved for an
+        // override that declines (`None`) on a row-set it cannot accelerate.
+        Some(row_kernel_hessian_dense_generic(self, rows, row_hessians))
+    }
+
+    /// Optional BLAS-3 fast path for the BATCHED all-axes second directional
+    /// derivative of the dense Hessian: with one direction `d_beta_u` held fixed
+    /// and the second direction sweeping every canonical axis `e_a`, return the
+    /// `p` dense matrices `{H²dot[d_beta_u, e_a]}_{a=0..p}`,
+    ///
+    /// ```text
+    ///   H²dot[u, e_a] = Σ_i  Jᵢᵀ T⁴ᵢ[J·u, J·e_a] Jᵢ.
+    /// ```
+    ///
+    /// This is the dominant cost of the outer-REML Jeffreys `H_Φ` drift
+    /// (`coord_corrections`): the generic per-axis path
+    /// ([`row_kernel_second_directional_derivative`]) runs `p` independent
+    /// full-data sweeps, each scattering the `K×K` contracted fourth tensor
+    /// through `add_pullback_hessian` — a per-row rank-`K` BLAS-1 update — for a
+    /// total of `O(p · n · p²)` BLAS-1 scatter. For a kernel whose pullback is a
+    /// pure design-row Gram, the per-row jet work (the `J·u` projection and the
+    /// fourth-tensor partial contraction against `u`) is INDEPENDENT of the
+    /// swept axis, so it can be hoisted out of the `p`-loop and each axis closed
+    /// with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs reading the shared cached
+    /// fourth tensor. The default returns `None`, preserving the exact generic
+    /// per-axis path for every other kernel bit-for-bit. Overrides should claim
+    /// only the full-data unit-weight `RowSet::All` case; under a subsample /
+    /// non-unit-weight `RowSet` return `None` so the generic Horvitz-Thompson
+    /// per-row path runs per axis.
+    ///
+    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
+    /// per-axis `row_kernel_second_directional_derivative(self, rows, d_beta_u,
+    /// e_a)` reduced in deterministic in-row order (same contract as
+    /// [`Self::hessian_dense_override`]).
+    fn second_directional_derivative_all_axes_dense_override(
+        &self,
+        rows: &RowSet,
+        d_beta_u: &[f64],
+    ) -> Option<Result<Vec<Array2<f64>>, String>> {
+        // Default declines (the batched dispatcher then runs the generic
+        // per-axis sweep). A shape mismatch in the fixed direction is a hard
+        // caller-contract violation regardless of which path runs, so it is
+        // surfaced here where both `rows` and `d_beta_u` are consumed — keeping
+        // the default body free of unused bindings without masking a bad call.
+        if d_beta_u.len() != self.n_coefficients() {
+            let all = matches!(rows, RowSet::All);
+            return Some(Err(format!(
+                "second_directional_derivative_all_axes_dense_override: fixed direction has \
+                 {} entries, expected {} (rows::All = {all})",
+                d_beta_u.len(),
+                self.n_coefficients(),
+            )));
+        }
         None
     }
 }
@@ -614,12 +714,18 @@ pub fn build_row_kernel_cache<const K: usize>(
         (work_count >= ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS).then(LoopProgress::default_interval);
     match rows {
         RowSet::All => {
+            // Pool-aware block size (issue #1045): a few-per-worker partition of
+            // the row range instead of one task per 256-row arrow tile, so the
+            // light per-row jet build does not pay `n/256` task entries of
+            // crossbeam-epoch / rayon-scheduling overhead on a wide pool. Output
+            // is bit-identical — every slot is written by its absolute row index.
+            let block_rows = cache_build_chunk_rows(n);
             let evaluated_chunks: Vec<Vec<(f64, [f64; K], [[f64; K]; K])>> =
-                (0..arrow_row_chunk_count(n))
+                (0..cache_build_block_count(n, block_rows))
                     .into_par_iter()
-                    .map(|chunk_idx| {
-                        let start = chunk_idx * ARROW_ROW_CHUNK;
-                        let end = (start + ARROW_ROW_CHUNK).min(n);
+                    .map(|block_idx| {
+                        let start = block_idx * block_rows;
+                        let end = (start + block_rows).min(n);
                         let mut chunk = Vec::with_capacity(end - start);
                         for row in start..end {
                             let out = kern.row_kernel(row)?;
@@ -640,8 +746,8 @@ pub fn build_row_kernel_cache<const K: usize>(
                         Ok(chunk)
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-            for (chunk_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
-                let start = chunk_idx * ARROW_ROW_CHUNK;
+            for (block_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
+                let start = block_idx * block_rows;
                 for (local, (l, g, h)) in chunk.into_iter().enumerate() {
                     let i = start + local;
                     nll[i] = l;
@@ -654,8 +760,13 @@ pub fn build_row_kernel_cache<const K: usize>(
             // Evaluate only the sampled rows in parallel; scatter into
             // the n-sized cache slots keyed by their full-data index.
             let total = list.len();
+            // Pool-aware block size over the SAMPLED rows (issue #1045): same
+            // rationale as the `RowSet::All` arm — partition into a few blocks per
+            // worker, not one task per 256-row tile. Output is bit-identical; each
+            // slot is scattered by its full-data index `r.index`.
+            let block_rows = cache_build_chunk_rows(total);
             let pair_chunks: Vec<Vec<(usize, (f64, [f64; K], [[f64; K]; K]))>> = list
-                .par_chunks(ARROW_ROW_CHUNK)
+                .par_chunks(block_rows)
                 .map(|row_chunk| {
                     let mut chunk = Vec::with_capacity(row_chunk.len());
                     for r in row_chunk {
@@ -842,15 +953,28 @@ pub fn row_kernel_hessian_dense<const K: usize>(
     if let Some(dense) = kern.hessian_dense_override(rows, &cache.hessians) {
         return dense;
     }
-    let p = cache.p;
+    row_kernel_hessian_dense_generic(kern, rows, &cache.hessians)
+}
+
+/// Generic per-row dense joint-Hessian pullback `H = Σ_i w_i · Jᵢᵀ Hᵢ Jᵢ`.
+/// This is the default body of [`RowKernel::hessian_dense_override`] and the
+/// dispatcher fall-through; a kernel with a BLAS-3 fast path overrides the hook
+/// and may still call this for row-sets it does not accelerate.
+pub fn row_kernel_hessian_dense_generic<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    rows: &RowSet,
+    row_hessians: &[[[f64; K]; K]],
+) -> Array2<f64> {
+    let p = kern.n_coefficients();
+    let n = row_hessians.len();
     rows.par_reduce_fold(
-        cache.n,
+        n,
         || Array2::<f64>::zeros((p, p)),
         |mut acc, row, w| {
             if w == 1.0 {
-                kern.add_pullback_hessian(row, &cache.hessians[row], &mut acc);
+                kern.add_pullback_hessian(row, &row_hessians[row], &mut acc);
             } else {
-                let h = &cache.hessians[row];
+                let h = &row_hessians[row];
                 let mut scaled = [[0.0_f64; K]; K];
                 for a in 0..K {
                     for b in 0..K {
@@ -879,6 +1003,18 @@ pub fn row_kernel_directional_derivative<const K: usize>(
     if let Some(result) = kern.directional_derivative_dense_override(rows, d_beta) {
         return result;
     }
+    row_kernel_directional_derivative_generic(kern, rows, d_beta)
+}
+
+/// Generic per-row first directional derivative of the Hessian ∂H/∂β[d_beta].
+/// Default body of [`RowKernel::directional_derivative_dense_override`] and the
+/// dispatcher fall-through; a kernel with a BLAS-3 fast path overrides the hook
+/// and may still call this for row-sets it does not accelerate.
+pub fn row_kernel_directional_derivative_generic<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    rows: &RowSet,
+    d_beta: &[f64],
+) -> Result<Array2<f64>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
     kern.warm_up_directional_caches()?;
@@ -942,6 +1078,45 @@ pub fn row_kernel_second_directional_derivative<const K: usize>(
         },
         |a, b| Ok(a + b),
     )
+}
+
+/// Batched all-axes second directional derivative: with `d_beta_u` fixed and the
+/// second direction sweeping every canonical axis `e_a`, return the `p` dense
+/// matrices `{H²dot[d_beta_u, e_a]}_{a=0..p}`.
+///
+/// Dispatches to [`RowKernel::second_directional_derivative_all_axes_dense_override`]
+/// when the kernel provides a BLAS-3 fast path on this row-set; otherwise falls
+/// back to `p` independent [`row_kernel_second_directional_derivative`] sweeps,
+/// one per unit axis `e_a` — bit-for-bit the generic per-axis path the Jeffreys
+/// `H_Φ` drift consumed before the batched hook existed. The fall-back runs the
+/// axis sweep on the Rayon pool (each axis is an independent full-data pure
+/// evaluation) so it is no slower than the prior per-axis parallel loop; the
+/// nested-BLAS guard pins each axis's GEMMs to `Par::Seq`.
+pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized + Sync),
+    rows: &RowSet,
+    d_beta_u: &[f64],
+) -> Result<Vec<Array2<f64>>, String> {
+    if let Some(result) = kern.second_directional_derivative_all_axes_dense_override(rows, d_beta_u)
+    {
+        return result;
+    }
+    let p = kern.n_coefficients();
+    // Generic fall-back: each axis `e_a` is one independent full-data
+    // second-directional sweep. Fan the `p` axes across the pool with the
+    // nested-BLAS guard so any inner GEMM stays `Par::Seq` (mirrors the prior
+    // Jeffreys per-axis parallel sweep). Index-ordered collection keeps the
+    // output bit-identical to a serial axis loop.
+    (0..p)
+        .into_par_iter()
+        .map(|a| {
+            let mut axis = vec![0.0_f64; p];
+            axis[a] = 1.0;
+            crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                row_kernel_second_directional_derivative(kern, rows, d_beta_u, &axis)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 struct RowKernelDirectionalDerivativeOperator<const K: usize, T: RowKernel<K>> {

@@ -900,7 +900,30 @@ pub(super) fn pirls_soft_acceptance(
     progress_tol: f64,
     kkt_tol: f64,
 ) -> Option<PirlsSoftAccept> {
-    let objective_scale = state.deviance.abs().max(state.penalty_term.abs()).max(1.0);
+    // Scale-equivariant objective magnitude for the Δdeviance plateau band.
+    //
+    // The deviance-change tests below ask "has the penalized objective stopped
+    // moving relative to its own magnitude?" — a purely *relative* question.
+    // For a Gaussian identity-link fit the deviance is the (weighted) residual
+    // sum of squares and the penalty is `βᵀS_λβ`; rescaling the response
+    // `y → a·y` rescales `β → a·β` exactly at any fixed λ (the penalized normal
+    // equations are linear in `y`), so deviance, penalty, AND the inter-iterate
+    // `dev_change` all scale by `a²`. The ratio `dev_change / objective_scale`
+    // is therefore scale-invariant, which is exactly what equivariant smoothing
+    // selection requires.
+    //
+    // The previous `.max(1.0)` absolute floor broke this: for a micro-unit
+    // response (`a = 1e-6`) the whole objective is `O(a²) ≈ 1e-12`, so the floor
+    // pinned the band at `1.0` — ~1e10× too loose — and the inner solve declared
+    // a premature plateau at an over-smoothed iterate, which propagated to an
+    // inflated `λ̂` (issue #1127). Keying the band to the objective's own
+    // magnitude `(|deviance| + |penalty|)` removes the absolute floor while
+    // leaving the well-scaled (`a ≳ 1`) and up-scaled (`a = 1e6`) directions
+    // byte-identical, since there the floor was already a no-op. When both terms
+    // are exactly zero (a perfect interpolating fit) the band is `0`, so the
+    // strictly relative `dev_change < 0` test cannot fire spuriously and the
+    // separately scale-invariant KKT certificate governs acceptance.
+    let objective_scale = state.deviance.abs() + state.penalty_term.abs();
     // Progress tests stay on the fixed PIRLS tolerance; only KKT stationarity uses kkt_tol.
     let scaled_dev_tol = progress_tol * objective_scale;
 
@@ -915,13 +938,17 @@ pub(super) fn pirls_soft_acceptance(
             predicted_reduction,
             current_penalized,
         } => {
-            // Historical LM-rejection floor: model-predicted reduction
-            // below `1e-12 · max(|Φ|, 1)` is indistinguishable from
-            // numerical noise on the quadratic model. Keep this exact
-            // formula — it is strictly tighter than `tol · scaled_dev_tol`
-            // for the standard tol=1e-6, so the unified helper does not
-            // widen the LM-rejection acceptance set.
-            let reduction_noise_floor = current_penalized.abs().max(1.0) * 1e-12;
+            // LM-rejection floor: a model-predicted reduction below
+            // `1e-12 · |Φ|` is indistinguishable from numerical noise on the
+            // quadratic model relative to the objective's own magnitude. The
+            // predicted reduction and the penalized objective `Φ` both scale as
+            // `O(a²)` under `y → a·y`, so this relative floor is
+            // scale-equivariant. The historical `.max(1.0)` absolute floor
+            // broke that: for a micro-unit response it pinned the floor at
+            // `1e-12` while genuine reductions were themselves `O(a²) ≈ 1e-12`,
+            // accepting a non-converged iterate (issue #1127). For a well-scaled
+            // objective (`|Φ| ≳ 1`) the floor is unchanged.
+            let reduction_noise_floor = current_penalized.abs() * 1e-12;
             state.near_stationary_kkt(projected_grad, kkt_tol)
                 && predicted_reduction.abs() <= reduction_noise_floor
         }
@@ -946,7 +973,15 @@ pub(super) fn pirls_soft_acceptance(
         return Some(PirlsSoftAccept::BoundarySaturation);
     }
 
-    if projected_grad <= progress_tol.max(1e-6) * objective_scale
+    // Gradient and objective live on different response scales: for `y → a·y`
+    // the projected gradient is `O(a)` while `objective_scale` (deviance +
+    // penalty) is `O(a²)`. Compare each against a same-units scale-invariant
+    // band — the gradient against the data-driven natural gradient scale via
+    // `relative_gradient_norm`, the Δdeviance against `scaled_dev_tol` — so the
+    // relative-band plateau is equivariant rather than mixing the two scales
+    // (which the old `objective_scale`-only gradient test did, and which the
+    // `.max(1.0)` floor then masked at unit scale).
+    if state.relative_gradient_norm(projected_grad) <= progress_tol.max(1e-6)
         && dev_change.abs() < scaled_dev_tol * 0.1
         && dev_change >= 0.0
     {

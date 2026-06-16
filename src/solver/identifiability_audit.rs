@@ -90,11 +90,23 @@ use ndarray::{Array1, Array2};
 
 use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
 use crate::linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation,
+    FaerEigh, RrqrWithPermutation, default_rrqr_rank_alpha, fast_atb,
+    rrqr_from_gram_with_permutation, rrqr_with_permutation,
 };
 use crate::solver::estimate::EstimationError;
 
 const DEFAULT_GAUGE_PRIORITY: u8 = 100;
+
+/// Minimum `verdict_margin` (ratio between the closest kept/dropped pivot and the
+/// rank tolerance) at which the Gram-squared joint RRQR is trusted to reproduce
+/// the tall-design rank verdict bit-for-bit. Forming `G = XᵀX` squares the
+/// condition number, so a rank decision sitting right at the tolerance cliff
+/// could in principle flip; when the margin is below this bound the joint RRQR
+/// re-confirms on the full (un-squared) `n × p` design. At biobank scale the
+/// common full-rank-full-width case has a margin many orders of magnitude above
+/// this floor, so the n-row stream is skipped. 1e3 leaves ~3 decimal digits of
+/// head-room before the squared-condition error could move a pivot across `tol`.
+const JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN: f64 = 1.0e3;
 
 /// Lower bound on the cosine that may be reported as an `AliasedPair` when the
 /// per-pair null cosine distribution has little width (σ → 0, i.e. both columns
@@ -700,6 +712,26 @@ fn audit_identifiability_impl(
         }
     }
 
+    // Joint Gram G = Xᵀ·X of the UNAUGMENTED design, computed once with the
+    // blocked, parallel faer crossproduct. This is the single n-scale pass over
+    // the joint design — it serves BOTH the joint RRQR rank verdict (squared into
+    // the Gram, see `joint_gram_aug` + `rrqr_from_gram_with_permutation` below)
+    // AND the pairwise overlap scan further down (which reads `joint_gram[[ja,
+    // jb]]` as an O(1) cross-block dot product). Computing it here, before the
+    // RRQR, removes the redundant second full-design stream that the tall
+    // `rrqr_with_permutation(&x_joint_rank_input, …)` performed: at biobank scale
+    // (n≈2·10⁵) re-streaming the 194k×85 / 194k×45 design for the rank verdict was
+    // the dominant ~0.94s joint-RRQR cost. Mathematically G[[ja, jb]] = Σ_i
+    // X[i,ja]·X[i,jb] = caᵀcb, exactly the column geometry col-piv QR consumes.
+    let joint_gram = {
+        let unit_weights = Array1::<f64>::ones(n);
+        crate::linalg::faer_ndarray::fast_xt_diag_x_with_parallelism(
+            &x_joint,
+            &unit_weights,
+            faer::get_global_parallelism(),
+        )
+    };
+
     // Penalty-augmented joint design for the RANK verdict only: stack the
     // block-diagonal structural penalties beneath `x_joint`, so the joint rank
     // is `rank([X_joint; S_blockdiag])` and the only fatal deficiencies are
@@ -717,24 +749,62 @@ fn audit_identifiability_impl(
                 .map_or(0, |_| col_offsets[idx + 1] - col_offsets[idx])
         })
         .sum();
-    let x_joint_rank_input: Array2<f64> = if n_penalty_rows == 0 {
-        x_joint.clone()
+    // The tall penalty-augmented design `[X_joint; S_blockdiag]` is only needed
+    // for the bit-exact tall-RRQR FALLBACK (near-tolerance-cliff verdicts). The
+    // primary Gram path never materialises it — at biobank scale that avoids
+    // building a second n×p matrix on the hot path — so it is wrapped in a
+    // closure and built on demand. (`block_structural_penalty_dense` returns a
+    // p_block-square `S`, stacked as its own rows.)
+    let build_x_joint_rank_input = || -> Array2<f64> {
+        if n_penalty_rows == 0 {
+            x_joint.clone()
+        } else {
+            let mut aug = Array2::<f64>::zeros((n + n_penalty_rows, p_total));
+            aug.slice_mut(ndarray::s![..n, ..]).assign(&x_joint);
+            let mut row = n;
+            for (idx, s_opt) in block_penalties.iter().enumerate() {
+                let start = col_offsets[idx];
+                let end = col_offsets[idx + 1];
+                if let Some(s) = s_opt {
+                    let h = end - start;
+                    aug.slice_mut(ndarray::s![row..row + h, start..end])
+                        .assign(s);
+                    row += h;
+                }
+            }
+            aug
+        }
+    };
+
+    // Gram of the penalty-augmented joint design, `Gₐ = x_joint_rank_inputᵀ ·
+    // x_joint_rank_input`. Because the penalty rows are stacked block-diagonally
+    // beneath `x_joint`, this equals `Xᵀ·X + Σ_block Sᵀ·S` placed into the owning
+    // block's diagonal sub-square: no second n-row stream is needed — we add the
+    // tiny per-block `SᵀS` (p_block × p_block) onto the already-computed
+    // `joint_gram`. `rrqr_from_gram_with_permutation` runs col-piv QR on a square
+    // root of this Gram, reproducing the EXACT pivot order and per-pivot |R[i,i]|
+    // (and hence the rank cut) of col-piv QR on the tall `x_joint_rank_input`,
+    // since both depend only on the column inner products. The `m_rows` it needs
+    // for the tolerance scaling is the tall row count `n + n_penalty_rows`.
+    let joint_gram_aug: Array2<f64> = if n_penalty_rows == 0 {
+        joint_gram.clone()
     } else {
-        let mut aug = Array2::<f64>::zeros((n + n_penalty_rows, p_total));
-        aug.slice_mut(ndarray::s![..n, ..]).assign(&x_joint);
-        let mut row = n;
+        let mut g = joint_gram.clone();
         for (idx, s_opt) in block_penalties.iter().enumerate() {
-            let start = col_offsets[idx];
-            let end = col_offsets[idx + 1];
             if let Some(s) = s_opt {
-                let h = end - start;
-                aug.slice_mut(ndarray::s![row..row + h, start..end])
-                    .assign(s);
-                row += h;
+                let start = col_offsets[idx];
+                let end = col_offsets[idx + 1];
+                // SᵀS for this block's diagonal sub-square; S is (h × h) here
+                // (`block_structural_penalty_dense` returns a p_block-square
+                // structural penalty), so SᵀS is h × h.
+                let sts = fast_atb(s, s);
+                let mut sub = g.slice_mut(ndarray::s![start..end, start..end]);
+                sub += &sts;
             }
         }
-        aug
+        g
     };
+    let joint_rank_m_rows = n + n_penalty_rows;
 
     // Per-joint-column gauge priority, inherited from the owning block.
     // RRQR uses greedy column pivoting: at each step it picks the
@@ -831,27 +901,87 @@ fn audit_identifiability_impl(
             block_priority_summary.join(", "),
         );
     }
-    // RRQR runs on the penalty-augmented joint (`x_joint_rank_input`): the rank
-    // and the demoted-column attribution then reflect `ker(J) ∩ ker(S)`, not
-    // raw `ker(J)`. Column count is `p_total` in both; only the row count grows
-    // by the appended structural-penalty rows.
-    let rrqr = if priority_perm_is_identity {
-        rrqr_with_permutation(&x_joint_rank_input, default_rrqr_rank_alpha()).map_err(|e| {
-            EstimationError::LayoutError(format!("identifiability audit joint RRQR failed: {e:?}"))
-        })?
+    // RRQR runs on the penalty-augmented joint: the rank and the demoted-column
+    // attribution reflect `ker(J) ∩ ker(S)`, not raw `ker(J)`.
+    //
+    // PRIMARY PATH — Gram-squared col-piv QR (`rrqr_from_gram_with_permutation`).
+    // Col-piv QR's pivot order, per-pivot |R[i,i]| magnitudes, and rank cut depend
+    // ONLY on the column inner products, i.e. on the Gram `Gₐ = x_joint_rank_inputᵀ
+    // · x_joint_rank_input` (= `joint_gram_aug`, already assembled with NO second
+    // n-row stream). Running col-piv QR on a `p × p` square root of `Gₐ` therefore
+    // reproduces the tall path's rank/permutation exactly in exact arithmetic, in
+    // O(p³) instead of O(n·p²). The priority reorder becomes a symmetric
+    // permutation of `Gₐ` (both rows and columns), which is the Gram of the
+    // column-permuted design — bit-equivalent to permuting the tall columns.
+    //
+    // FALLBACK — squaring the design squares the condition number, so a rank
+    // decision sitting at the tolerance cliff could flip. `verdict_margin` reports
+    // how far the closest kept/dropped pivot sits from `tol`; when it is below
+    // `JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN` we re-run the exact tall RRQR on the
+    // un-squared `n × p` design so the verdict stays bit-exact. The biobank
+    // full-rank-full-width common case has a margin many orders of magnitude above
+    // the floor, so the n-row stream is skipped entirely.
+    let alpha = default_rrqr_rank_alpha();
+    let gram_for_rrqr: Array2<f64> = if priority_perm_is_identity {
+        joint_gram_aug.clone()
     } else {
-        let m_rows = x_joint_rank_input.nrows();
-        let mut x_priority = Array2::<f64>::zeros((m_rows, p_total));
-        for (new_j, &old_j) in priority_perm.iter().enumerate() {
-            x_priority
-                .column_mut(new_j)
-                .assign(&x_joint_rank_input.column(old_j));
+        // Symmetric permutation: Gₚ[new_a, new_b] = Gₐ[perm[new_a], perm[new_b]].
+        let mut gp = Array2::<f64>::zeros((p_total, p_total));
+        for (new_a, &old_a) in priority_perm.iter().enumerate() {
+            for (new_b, &old_b) in priority_perm.iter().enumerate() {
+                gp[[new_a, new_b]] = joint_gram_aug[[old_a, old_b]];
+            }
         }
-        rrqr_with_permutation(&x_priority, default_rrqr_rank_alpha()).map_err(|e| {
+        gp
+    };
+    let gram_rrqr = rrqr_from_gram_with_permutation(&gram_for_rrqr, joint_rank_m_rows, alpha)
+        .map_err(|e| {
             EstimationError::LayoutError(format!(
-                "identifiability audit joint RRQR (priority-ordered) failed: {e:?}"
+                "identifiability audit joint Gram RRQR failed: {e:?}"
             ))
-        })?
+        })?;
+    let use_gram = gram_rrqr.verdict_margin >= JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN;
+    let rrqr: RrqrWithPermutation = if use_gram {
+        log::info!(
+            "[STAGE] identifiability audit: joint RRQR path=gram verdict_margin={:.3e} \
+             (skipped n-row stream)",
+            gram_rrqr.verdict_margin,
+        );
+        RrqrWithPermutation {
+            rank: gram_rrqr.rank,
+            column_permutation: gram_rrqr.column_permutation,
+            leading_diag_abs: gram_rrqr.leading_diag_abs,
+            rank_tol: gram_rrqr.rank_tol,
+        }
+    } else {
+        // Near-cliff verdict: re-confirm on the exact tall (un-squared) design.
+        log::info!(
+            "[STAGE] identifiability audit: joint RRQR path=tall (gram verdict_margin={:.3e} \
+             below floor {:.1e}; re-confirming on n×p design)",
+            gram_rrqr.verdict_margin,
+            JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN,
+        );
+        let x_joint_rank_input = build_x_joint_rank_input();
+        if priority_perm_is_identity {
+            rrqr_with_permutation(&x_joint_rank_input, alpha).map_err(|e| {
+                EstimationError::LayoutError(format!(
+                    "identifiability audit joint RRQR failed: {e:?}"
+                ))
+            })?
+        } else {
+            let m_rows = x_joint_rank_input.nrows();
+            let mut x_priority = Array2::<f64>::zeros((m_rows, p_total));
+            for (new_j, &old_j) in priority_perm.iter().enumerate() {
+                x_priority
+                    .column_mut(new_j)
+                    .assign(&x_joint_rank_input.column(old_j));
+            }
+            rrqr_with_permutation(&x_priority, alpha).map_err(|e| {
+                EstimationError::LayoutError(format!(
+                    "identifiability audit joint RRQR (priority-ordered) failed: {e:?}"
+                ))
+            })?
+        }
     };
     log::info!(
         "[STAGE] identifiability audit: joint RRQR end rank={}/{} elapsed={:.3}s",
@@ -940,20 +1070,11 @@ fn audit_identifiability_impl(
     let pairwise_block_progress_ticker = (n.saturating_mul(p_total)
         >= AUDIT_PROGRESS_TICKER_WORK_THRESHOLD)
         .then(crate::util::loop_progress::LoopProgress::default_interval);
-    // Precompute the full joint Gram G = Xᵀ·X once with a blocked, parallel
-    // crossproduct (faer). Every cross-block column dot product below then
-    // becomes an O(1) lookup `joint_gram[[ja, jb]]` instead of an O(n) scalar
-    // pass, collapsing the pairwise scan from O(n·p²) scalar work to a single
-    // cache-friendly GEMM plus O(p²) scalar bookkeeping. Mathematically
-    // identical: G[[ja, jb]] = Σ_i X[i, ja]·X[i, jb] = caᵀcb.
-    let joint_gram = {
-        let unit_weights = Array1::<f64>::ones(n);
-        crate::linalg::faer_ndarray::fast_xt_diag_x_with_parallelism(
-            &x_joint,
-            &unit_weights,
-            faer::get_global_parallelism(),
-        )
-    };
+    // The full joint Gram `G = Xᵀ·X` was already assembled once (before the joint
+    // RRQR) and is reused here: every cross-block column dot product below is an
+    // O(1) lookup `joint_gram[[ja, jb]]` instead of an O(n) scalar pass, so the
+    // pairwise scan is O(p²) scalar bookkeeping over the shared GEMM. The single
+    // n-row stream now feeds BOTH the rank verdict and the overlap scan.
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
     let n_block_pairs = specs.len().saturating_mul(specs.len().saturating_sub(1)) / 2;
     for a_block_idx in 0..specs.len() {

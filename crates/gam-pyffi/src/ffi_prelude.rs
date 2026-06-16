@@ -75,7 +75,7 @@ pub(crate) use gam::hmc::{NutsConfig, NutsResult};
 
 pub(crate) use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
-    encode_recordswith_schema,
+    encode_recordswith_schema, infer_and_encode_column_major,
 };
 
 pub(crate) use gam::inference::formula_dsl::{parse_formula, parse_surv_response};
@@ -162,8 +162,9 @@ pub(crate) use gam::terms::linear_dictionary::{
 pub(crate) use gam::terms::sae_manifold::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SPHERE_CHART_PENALTY_DIAGONAL,
-    SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, SphereChartEvaluator,
-    TorusHarmonicEvaluator, sphere_chart_basis_jet, term_from_padded_blocks_with_mode,
+    SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldRho, ScheduleKind,
+    SphereChartEvaluator, TorusHarmonicEvaluator, sphere_chart_basis_jet,
+    term_from_padded_blocks_with_mode,
 };
 
 pub(crate) use gam::terms::skip_transcoder::{
@@ -221,3 +222,5 @@ pub(crate) use std::fmt;
 pub(crate) use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub(crate) use std::sync::Arc;
+
+pub(crate) use std::sync::{Mutex, OnceLock};

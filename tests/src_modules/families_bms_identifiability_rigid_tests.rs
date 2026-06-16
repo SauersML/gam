@@ -3618,9 +3618,18 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
         dummy_blockspec(1, 3),
         dummy_blockspec(2, 3),
     ];
+    // Flex (`score_warp` active) now advertises the EXACT profiled outer θ-HVP:
+    // `outer_hyper_hessian_hvp_available` returns true when the realized specs
+    // match the family row count, and `exact_outer_derivative_order` falls
+    // through to the HVP-aware order (`Second`) instead of demoting flex to a
+    // first-order BFGS outer loop. The operator is the matrix-free exact
+    // analytic θ-HVP assembled from the family's directional-derivative kernels,
+    // so the REML optimum is unchanged; only the outer optimizer geometry
+    // (ARC / exact Newton instead of BFGS) improves.
+    assert!(family.outer_hyper_hessian_hvp_available(&specs));
     assert_eq!(
         family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-        ExactOuterDerivativeOrder::First
+        ExactOuterDerivativeOrder::Second
     );
     assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
 
@@ -3634,10 +3643,16 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
         dummy_blockspec(1, n_large),
         dummy_blockspec(2, n_large),
     ];
+    // Large-scale flex stays on the exact second-order path through the
+    // matrix-free θ-HVP operator: even at n=50k the operator reuses the flex
+    // row stream once per Hv (near-gradient cost) and PCG converges in a few
+    // iters, so the outer Newton converges in ≤ a couple of iterations rather
+    // than several full-inner-resolve BFGS line searches.
+    assert!(large_flex_family.outer_hyper_hessian_hvp_available(&large_flex_specs));
     assert_eq!(
         large_flex_family
             .exact_outer_derivative_order(&large_flex_specs, &BlockwiseFitOptions::default()),
-        ExactOuterDerivativeOrder::First
+        ExactOuterDerivativeOrder::Second
     );
     let (large_flex_gradient, large_flex_hessian) = custom_family_outer_derivatives(
         &large_flex_family,
@@ -3650,7 +3665,7 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
     );
     assert_eq!(
         large_flex_hessian,
-        crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+        crate::solver::outer_strategy::DeclaredHessianForm::Either
     );
 
     let mut large_rigid_family = large_flex_family.clone();
@@ -3661,6 +3676,102 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
             .exact_outer_derivative_order(&large_rigid_specs, &BlockwiseFitOptions::default()),
         ExactOuterDerivativeOrder::Second
     );
+}
+
+
+#[test]
+fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
+    // Regression for the BMS outer-loop lever: the Bernoulli-marginal-slope
+    // family used to report `outer_hvp_available=false` (trait default), which
+    // forced the outer ρ-optimization onto BFGS — several outer iterations,
+    // each a Value + ValueAndGradient + multiple StrongWolfe line-search
+    // probes, every probe a full inner re-solve. BMS now mirrors its survival
+    // twin and advertises the EXACT matrix-free profiled outer θ-HVP, lifting
+    // the outer-derivative order to `Second` so the planner selects ARC /
+    // exact outer Newton and converges the outer loop in ≤ a couple of iters.
+    //
+    // The advertised operator is the exact analytic θ-HVP assembled from the
+    // family's `exact_newton_joint_hessian_directional_derivative` /
+    // `...second_directional_derivative` / `exact_newton_joint_psi_terms`
+    // kernels by the generic custom-family joint-hyper assembler — never a
+    // finite-difference or quasi-Newton surrogate — so the REML/LAML optimum
+    // is bit-identical to the first-order path.
+    use crate::solver::outer_strategy::{
+        plan, DeclaredHessianForm, Derivative, OuterCapability, Solver,
+    };
+
+    let arc_plan = |hessian: DeclaredHessianForm, n_params: usize, psi_dim: usize| {
+        // `(Analytic, Either)` is matched as `(Analytic, Analytic)` by the
+        // planner's `declared_hessian_for_planning`, which is the FIRST match
+        // arm — so it routes to ARC regardless of EFS/HybridEfs eligibility
+        // (the flex case carries ψ coords and would otherwise reach HybridEfs).
+        let cap = OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian,
+            n_params,
+            psi_dim,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        plan(&cap).solver
+    };
+
+    // Rigid two-block path (no ψ coords).
+    let rigid_family = make_rigid_test_family(64);
+    let rigid_specs = vec![dummy_blockspec(1, 64), dummy_blockspec(1, 64)];
+    assert!(rigid_family.outer_hyper_hessian_hvp_available(&rigid_specs));
+    assert_eq!(
+        rigid_family.exact_outer_derivative_order(&rigid_specs, &BlockwiseFitOptions::default()),
+        ExactOuterDerivativeOrder::Second
+    );
+    let (rigid_gradient, rigid_hessian) = custom_family_outer_derivatives(
+        &rigid_family,
+        &rigid_specs,
+        &BlockwiseFitOptions::default(),
+    );
+    assert_eq!(rigid_gradient, Derivative::Analytic);
+    assert_eq!(rigid_hessian, DeclaredHessianForm::Either);
+    assert_eq!(arc_plan(rigid_hessian, rigid_specs.len(), 0), Solver::Arc);
+
+    // Flex path (score-warp deviation block adds ψ coords): the prior behavior
+    // demoted this to BFGS; it now plans ARC on the exact θ-HVP.
+    let seed = array![-1.0, 0.0, 1.0];
+    let score_prepared = build_score_warp_deviation_block_from_seed(
+        &seed,
+        &DeviationBlockConfig {
+            num_internal_knots: 3,
+            ..DeviationBlockConfig::default()
+        },
+    )
+    .expect("score warp block");
+    let flex_family = BernoulliMarginalSlopeFamily {
+        y: Arc::new(array![0.0, 1.0, 0.0]),
+        weights: Arc::new(Array1::ones(3)),
+        z: Arc::new(seed.clone()),
+        marginal_design: dense_design(array![[1.0], [1.0], [1.0]]),
+        logslope_design: dense_design(array![[1.0], [1.0], [1.0]]),
+        score_warp: Some(score_prepared.runtime.clone()),
+        ..default_test_family()
+    };
+    let flex_specs = vec![
+        dummy_blockspec(1, 3),
+        dummy_blockspec(1, 3),
+        dummy_blockspec(2, 3),
+    ];
+    assert!(flex_family.outer_hyper_hessian_hvp_available(&flex_specs));
+    assert_eq!(
+        flex_family.exact_outer_derivative_order(&flex_specs, &BlockwiseFitOptions::default()),
+        ExactOuterDerivativeOrder::Second
+    );
+    let (flex_gradient, flex_hessian) =
+        custom_family_outer_derivatives(&flex_family, &flex_specs, &BlockwiseFitOptions::default());
+    assert_eq!(flex_gradient, Derivative::Analytic);
+    assert_eq!(flex_hessian, DeclaredHessianForm::Either);
+    // The flex deviation block carries ψ coords; assert ARC wins over the
+    // HybridEfs lane that would otherwise be eligible for a ψ-bearing problem.
+    assert_eq!(arc_plan(flex_hessian, flex_specs.len(), 1), Solver::Arc);
 }
 
 

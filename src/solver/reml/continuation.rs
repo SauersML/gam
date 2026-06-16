@@ -1195,7 +1195,13 @@ mod tests {
                     -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
             >,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
-            seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
+            seed_fn: None::<
+                fn(
+                    &mut (),
+                    &Array1<f64>,
+                )
+                    -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>,
+            >,
             continuation_prewarm: true,
         };
 
@@ -1262,7 +1268,13 @@ mod tests {
                     -> Result<crate::solver::outer_strategy::EfsEval, EstimationError>,
             >,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
-            seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<(), EstimationError>>,
+            seed_fn: None::<
+                fn(
+                    &mut (),
+                    &Array1<f64>,
+                )
+                    -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>,
+            >,
             continuation_prewarm: true,
         };
 

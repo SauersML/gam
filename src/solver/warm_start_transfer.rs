@@ -284,7 +284,7 @@ mod tests {
     /// Block-layer term identity (the surviving, fold-invariant identity API),
     /// one unlabeled penalty over a 1-dim nullspace.
     fn block_id(block_name: &str) -> TermIdentityKey {
-        term_identity_from_block(TermRole::Mean, block_name, &[None], &[1])
+        term_identity_from_block(TermRole::Mean, block_name, &[None], &[1], 10)
     }
 
     /// A ρ-only term context (no gauge block): β stays cold, only ρ transfers.

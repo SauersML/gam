@@ -2503,15 +2503,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 return Err(err);
             }
             use crate::solver::estimate::reml::unified::EvalMode;
-            let row_set_rows = match row_set {
-                crate::families::row_kernel::RowSet::All => spec.y.len(),
-                crate::families::row_kernel::RowSet::Subsample { rows, .. } => rows.len(),
-            };
-            log::debug!(
-                "[BMS exact outer eval] mode={:?} row_set_rows={}",
-                eval_mode,
-                row_set_rows
-            );
+            // One-shot row-measure waypoint. This closure runs on EVERY outer
+            // objective evaluation (value/gradient/Hessian probes, line-search
+            // cost-only probes, EFS evals), so an unconditional per-eval line
+            // floods the biobank fit log with thousands of near-identical
+            // entries. The bridge already emits a timed `[STAGE] outer eval`
+            // marker per eval; this one records the row-measure exactly once.
+            static BMS_OUTER_EVAL_ROWSET_LOGGED: std::sync::Once = std::sync::Once::new();
+            BMS_OUTER_EVAL_ROWSET_LOGGED.call_once(|| {
+                let row_set_rows = match row_set {
+                    crate::families::row_kernel::RowSet::All => spec.y.len(),
+                    crate::families::row_kernel::RowSet::Subsample { rows, .. } => rows.len(),
+                };
+                log::debug!(
+                    "[BMS exact outer eval] mode={eval_mode:?} row_set_rows={row_set_rows}"
+                );
+            });
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             // Promote a staged β seed (deposited by the outer ρ-cache hit
