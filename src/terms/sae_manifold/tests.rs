@@ -8404,7 +8404,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
 /// production channel by `sqrt(w_row)`.
 #[test]
 pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache() {
-    use crate::terms::sae_row_jet_program::{
+    use crate::terms::sae::row_jet_program::{
         AtomRowBasisJet, RowGate, SaeReconstructionRowProgram,
     };
 

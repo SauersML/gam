@@ -80,9 +80,9 @@ pub(crate) use crate::terms::analytic_penalties::{
 
 pub(crate) use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
-pub(crate) use crate::terms::sae_criterion_atoms::SaeCriterion;
+pub(crate) use crate::terms::sae::criterion_atoms::SaeCriterion;
 
-pub(crate) use crate::terms::sae_optimality_certificate::{
+pub(crate) use crate::terms::sae::optimality_certificate::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,
 };
