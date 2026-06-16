@@ -49,6 +49,14 @@ impl std::fmt::Display for GamlssError {
 
 impl std::error::Error for GamlssError {}
 
+impl From<crate::families::block_layout::block_count::BlockCountMismatch> for GamlssError {
+    fn from(err: crate::families::block_layout::block_count::BlockCountMismatch) -> GamlssError {
+        GamlssError::DimensionMismatch {
+            reason: err.message(),
+        }
+    }
+}
+
 impl From<GamlssError> for String {
     fn from(err: GamlssError) -> Self {
         err.to_string()
