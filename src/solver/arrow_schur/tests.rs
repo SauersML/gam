@@ -3724,3 +3724,94 @@ pub(crate) fn bench_block_jacobi_parallel_speedup() {
     );
     assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
 }
+
+/// #1017 scalar-Jacobi build parallelism: `build_scalar_jacobi` (the scalar-
+/// diagonal PCG preconditioner taken for wide/absent block structure with no
+/// SAE residency) fans its per-row diagonal sweep over rayon above
+/// `SCHUR_MATVEC_PARALLEL_ROW_MIN`. Must be DETERMINISTIC run-to-run (bit-
+/// identical apply). Numeric equivalence vs the resident path is already covered
+/// by `resident_scalar_jacobi_matches_generic`; this pins run-to-run stability.
+#[test]
+pub(crate) fn parallel_scalar_jacobi_deterministic() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
+    let d = 4usize;
+    let k = 24usize;
+    let sys = dense_direct_system(n, d, k); // no block_offsets, no resident → scalar path
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let r = Array1::from_iter((0..k).map(|a| 0.3 * ((a as f64) * 0.023).sin() + 0.11));
+
+    let p_a = JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("scalar Jacobi a");
+    let p_b = JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("scalar Jacobi b");
+    let out_a = p_a.apply(&r);
+    let out_b = p_b.apply(&r);
+    for a in 0..k {
+        assert_eq!(
+            out_a[a].to_bits(),
+            out_b[a].to_bits(),
+            "parallel scalar Jacobi must apply deterministically at {a}"
+        );
+    }
+}
+
+/// #1017 scalar-Jacobi build speedup bench (serial via nested-worker gate vs the
+/// live parallel build). Run with `--release --nocapture`.
+#[test]
+pub(crate) fn bench_scalar_jacobi_parallel_speedup() {
+    let n = 1500usize;
+    let d = 6usize;
+    let k = 480usize;
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let calls = 10usize;
+    let mut sink = 0.0_f64;
+
+    let seq_build = || -> f64 {
+        rayon::iter::once(())
+            .map(|_| {
+                JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+                    .expect("serial scalar Jacobi")
+                    .apply(&Array1::<f64>::ones(k))[0]
+            })
+            .sum::<f64>()
+    };
+    sink += seq_build();
+    let t_seq = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += seq_build();
+    }
+    let seq_per = t_seq.elapsed().as_secs_f64() / calls as f64;
+
+    let par_build = || -> f64 {
+        JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+            .expect("parallel scalar Jacobi")
+            .apply(&Array1::<f64>::ones(k))[0]
+    };
+    sink += par_build();
+    let t_par = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += par_build();
+    }
+    let par_per = t_par.elapsed().as_secs_f64() / calls as f64;
+
+    println!(
+        "[#1017 scalar-Jacobi build, n={n} d={d} k={k}, {calls} calls, \
+             {} rayon threads]\n  serial:   {:.3} ms/call\n  parallel: {:.3} ms/call\n  \
+             speedup:  {:.2}x  (sink {:.3e})",
+        rayon::current_num_threads(),
+        seq_per * 1e3,
+        par_per * 1e3,
+        seq_per / par_per,
+        sink,
+    );
+    assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
+}

@@ -1007,7 +1007,7 @@ impl JacobiPreconditioner {
     ///
     /// When `sys.htbeta_matvec` is set and per-row `htbeta` slabs are absent,
     /// each column is probed via the matvec (one call per column per row).
-    pub(crate) fn build_scalar_jacobi<B: BatchedBlockSolver>(
+    pub(crate) fn build_scalar_jacobi<B: BatchedBlockSolver + Sync>(
         sys: &ArrowSchurSystem,
         htt_factors: &ArrowFactorSlab,
         ridge_beta: f64,
@@ -1024,14 +1024,18 @@ impl JacobiPreconditioner {
         for a in 0..k {
             diag[a] += ridge_beta;
         }
-        // For each column a, extract H_tβ^(i) e_a via matvec probe when
-        // dense slab is absent, then compute the scalar Schur diagonal.
-        // Allocate scratch at max_d; per-row slice is ..di.
-        let mut col = Array1::<f64>::zeros(sys.d);
-        let mut e_a = Array1::<f64>::zeros(k);
-        for (i, row) in sys.rows.iter().enumerate() {
+        // Per-row body: subtract this row's `Σ_a (H_tβ^(i)e_a)ᵀ(H_tt^(i))⁻¹
+        // (H_tβ^(i)e_a)` contribution into a caller-provided length-`K` diagonal
+        // accumulator (`-=`). For each column `a`, probe the cross-block (or read
+        // the dense slab) and compute the scalar point-elimination quotient. The
+        // `O(K)` solves per row are the build's whole cost; the row contributions
+        // are independent length-`K` vectors, so a worker sums a chunk into a
+        // private `diag_part` and the caller folds the partials back in chunk
+        // order — bit-identical run-to-run (the #1017 preconditioner gate).
+        let row_into = |i: usize, row: &ArrowRowBlock, diag_part: &mut Array1<f64>| {
             let di = sys.row_dims[i];
-            let mut col_i = col.slice_mut(ndarray::s![..di]).to_owned();
+            let mut col_i = Array1::<f64>::zeros(di);
+            let mut e_a = Array1::<f64>::zeros(k);
             for a in 0..k {
                 if sys.htbeta_matvec.is_some() || row.htbeta.dim() != (di, k) {
                     // Kronecker / matrix-free path: probe column a.
@@ -1049,7 +1053,35 @@ impl JacobiPreconditioner {
                 for c in 0..di {
                     acc += col_i[c] * solved[c];
                 }
-                diag[a] -= acc;
+                diag_part[a] -= acc;
+            }
+        };
+        let n = sys.rows.len();
+        let parallel =
+            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            let partials: Vec<Array1<f64>> = (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let mut diag_part = Array1::<f64>::zeros(k);
+                    for i in idxs {
+                        row_into(i, &sys.rows[i], &mut diag_part);
+                    }
+                    diag_part
+                })
+                .collect();
+            // Deterministic ordered reduction: fold chunk partials left-to-right.
+            for part in &partials {
+                for a in 0..k {
+                    diag[a] += part[a];
+                }
+            }
+        } else {
+            for (i, row) in sys.rows.iter().enumerate() {
+                row_into(i, row, &mut diag);
             }
         }
         let mut blocks = Vec::with_capacity(k);
