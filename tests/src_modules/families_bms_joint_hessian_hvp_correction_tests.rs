@@ -1989,7 +1989,21 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         // perturbed center).
         let rho = Array1::from_elem(n_rho, 0.1_f64 + rho_offset);
 
-        let opts = BlockwiseFitOptions::default();
+        // The outer ψ-gradient this gate asserts is the ENVELOPE gradient
+        // `a + ½tr(H⁻¹Ḣ) − ½tr(S⁺Ṡ)`, which equals the centered FD of the
+        // RE-SOLVED outer value ONLY when the inner solve sits at the penalized
+        // KKT point (residual r → 0): the β-response `−coord.gᵀ(H⁻¹r)` that both
+        // the analytic correction and the FD would otherwise carry is amplified
+        // by `‖H⁻¹‖` and, for this near-singular matern H (log|H|≈13), a default
+        // `inner_tol = 1e-6` (⇒ r ≈ 5e-6) inflates it to O(1.5) — swamping the
+        // true ψ-gradient and breaking the FD comparison even though the
+        // analytic envelope gradient is exact. Drive the inner solve to a tight
+        // KKT residual so the envelope identity holds and the FD-of-value is a
+        // valid ground truth for the ψ outer gradient.
+        let opts = BlockwiseFitOptions {
+            inner_tol: 1e-12,
+            ..BlockwiseFitOptions::default()
+        };
         let res = evaluate_custom_family_joint_hyper(
             &family,
             &specs,
