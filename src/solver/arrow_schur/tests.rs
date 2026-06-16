@@ -3782,7 +3782,7 @@ pub(crate) fn bench_scalar_jacobi_parallel_speedup() {
     let mut sink = 0.0_f64;
 
     let seq_build = || -> f64 {
-        rayon::iter::once(())
+        std::iter::once(())
             .map(|_| {
                 JacobiPreconditioner::build_scalar_jacobi(&sys, &htt_factors, ridge_beta, &backend)
                     .expect("serial scalar Jacobi")
