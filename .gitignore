@@ -180,3 +180,4 @@ azuser@/
 # stray tool/run logs
 *.log
 .??*.log
+*.sbatch

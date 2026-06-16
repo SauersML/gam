@@ -718,7 +718,9 @@ impl HyperGradientRuntimeState {
         Self {
             budget: HyperGradientBudget::new(),
             adaptive_kkt_override: None,
-            trace_state: Arc::new(Mutex::new(super::reml_outer_engine::StochasticTraceState::default())),
+            trace_state: Arc::new(Mutex::new(
+                super::reml_outer_engine::StochasticTraceState::default(),
+            )),
         }
     }
 }
