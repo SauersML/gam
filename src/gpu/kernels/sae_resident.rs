@@ -900,14 +900,12 @@ fn fixture_for_shape_seeded(
     shape: DeviceResidentArrowShape,
     seed: u64,
 ) -> Result<DeviceResidentArrowWorkspace, DeviceResidentArrowError> {
-    if shape.d != 2 {
+    if shape.d == 0 {
         return Err(DeviceResidentArrowError::Shape {
-            reason: format!(
-                "fixture_for_shape_seeded supports d == 2 only (got d={})",
-                shape.d
-            ),
+            reason: "fixture_for_shape_seeded requires d >= 1".to_string(),
         });
     }
+    let d = shape.d;
     let mut rng = SplitMix64::new(seed);
     let mut target_x = vec![0.0_f64; shape.target_len()];
     for i in 0..shape.n {
@@ -934,20 +932,40 @@ fn fixture_for_shape_seeded(
             basis_sum +=
                 basis_values[i * shape.basis_cols + a] * gate_activations[i * shape.basis_cols + a];
         }
-        let h_base = i * shape.d * shape.d;
-        row_hessian_slabs[h_base] = 3.0 + 0.01 * basis_sum.abs();
-        row_hessian_slabs[h_base + 1] = 0.02 * basis_sum.sin();
-        row_hessian_slabs[h_base + 2] = row_hessian_slabs[h_base + 1];
-        row_hessian_slabs[h_base + 3] = 2.5 + 0.01 * basis_sum.abs();
-        let b_base = i * shape.d * shape.p;
-        for j in 0..shape.p {
-            let feature = ((j % 257) as f64) * 0.011;
-            row_cross_slabs[b_base + j] = 1.0e-4 * basis_sum.sin() * feature.cos();
-            row_cross_slabs[b_base + shape.p + j] = 1.0e-4 * basis_sum.cos() * feature.sin();
+        // Strongly diagonally-dominant d×d H_tt (row-major): diagonal ≈ 3, tiny
+        // symmetric off-diagonals — PD for any d so the dense reference factors.
+        let h_base = i * d * d;
+        for r in 0..d {
+            for c in 0..d {
+                let v = if r == c {
+                    3.0 + 0.01 * basis_sum.abs() + 0.1 * (r as f64)
+                } else {
+                    0.02 * (basis_sum + (r + c) as f64).sin() / (d as f64)
+                };
+                row_hessian_slabs[h_base + r * d + c] = v;
+            }
         }
-        let g_base = i * shape.d;
-        row_gradient_slabs[g_base] = 0.01 * basis_sum.sin();
-        row_gradient_slabs[g_base + 1] = 0.01 * basis_sum.cos();
+        // Symmetrize the off-diagonals exactly.
+        for r in 0..d {
+            for c in 0..r {
+                let avg = 0.5
+                    * (row_hessian_slabs[h_base + r * d + c]
+                        + row_hessian_slabs[h_base + c * d + r]);
+                row_hessian_slabs[h_base + r * d + c] = avg;
+                row_hessian_slabs[h_base + c * d + r] = avg;
+            }
+        }
+        // d×p cross block (row-major) and length-d gradient.
+        let b_base = i * d * shape.p;
+        let g_base = i * d;
+        for r in 0..d {
+            for j in 0..shape.p {
+                let feature = ((j % 257) as f64) * 0.011;
+                row_cross_slabs[b_base + r * shape.p + j] =
+                    1.0e-4 * (basis_sum + r as f64).sin() * feature.cos();
+            }
+            row_gradient_slabs[g_base + r] = 0.01 * (basis_sum + r as f64).sin();
+        }
     }
     let mut border_hessian = vec![0.0_f64; shape.border_hessian_len()];
     for r in 0..shape.p {
@@ -1125,6 +1143,29 @@ pub fn run_variant_sweep_multiplexed(
     String,
 > {
     let workspaces = build_sweep_workspaces(variants).map_err(|e| e.to_string())?;
+    run_battery_sweep_multiplexed(workspaces, opts)
+}
+
+/// Production battery entry (#1017 Phase 4): dispatch CALLER-ASSEMBLED resident
+/// workspaces concurrently on one device and measure cross-fit throughput.
+///
+/// This is the real-slab seam the OLMo battery uses: the host (pyffi) builds one
+/// [`DeviceResidentArrowWorkspace`] per matrix cell from the cell's ACTUAL SAE
+/// row_hessian/row_cross/border slabs via [`DeviceResidentArrowWorkspace::new`],
+/// then hands the workspaces here. Unlike [`run_variant_sweep_multiplexed`]
+/// (which builds frames from the deterministic harness fixture), this consumes
+/// real frames, so the printed throughput is the battery's true fits/sec on one
+/// device. Returns per-cell outcomes (in input order) + the throughput summary.
+pub fn run_battery_sweep_multiplexed(
+    workspaces: Vec<DeviceResidentArrowWorkspace>,
+    opts: DeviceResidentInnerOptions,
+) -> Result<
+    (
+        Vec<Result<MultiplexedFit, DeviceResidentArrowError>>,
+        SweepThroughput,
+    ),
+    String,
+> {
     let fits = workspaces.len();
     let start = std::time::Instant::now();
     let results = run_resident_fits_multiplexed(workspaces, opts)?;
@@ -1137,6 +1178,34 @@ pub fn run_variant_sweep_multiplexed(
         fits_per_second: (fits as f64) / wall_seconds.max(1e-9),
     };
     Ok((results, throughput))
+}
+
+/// The OLMo battery's full color-arm variant matrix as [`SweepVariant`]s:
+/// `K{1..=4} × topology{4} × basis{periodic, linear}` at the color-arm shape
+/// (n=180, p=5120). `d` and `basis_cols` follow the intrinsic-rank convention
+/// (periodic ⇒ d=2, basis_cols=8; linear ⇒ d=1, basis_cols=2). Exposed so the
+/// pyffi battery seam can quote cross-fit throughput on the real shape matrix
+/// (fixture frames) before the per-cell real-slab fits are wired through.
+#[must_use]
+pub fn color_arm_variant_matrix() -> Vec<SweepVariant> {
+    let topologies = ["euclidean", "circle", "torus", "sphere"];
+    let mut variants = Vec::with_capacity(4 * topologies.len() * 2);
+    for k in 1..=4u64 {
+        for (t_idx, _topology) in topologies.iter().enumerate() {
+            // periodic (2 harmonics) and linear basis arms.
+            for &(d, basis_cols, basis_tag) in &[(2usize, 8usize, 0u64), (1usize, 2usize, 1u64)] {
+                let mut dim = DeviceResidentArrowShape::color_arm();
+                dim.d = d;
+                dim.basis_cols = basis_cols;
+                let seed = 0x1017_C010_0000_0000
+                    ^ (k << 16)
+                    ^ ((t_idx as u64) << 8)
+                    ^ basis_tag;
+                variants.push(SweepVariant { dim, seed });
+            }
+        }
+    }
+    variants
 }
 
 /// Certified per-fit parity for a variant sweep: the multiplexed (concurrent)
