@@ -12,7 +12,8 @@
 //!
 //!   (a) PROVENANCE — for a Poisson/log smooth (closed-form Lawley jets) the
 //!       reported significance is built from the Bartlett-corrected LR
-//!       (`correction_provenance == "lawley_lr"`, `bartlett_factor > 1`,
+//!       (`correction_provenance == "lawley_lr_estimated_lambda"`,
+//!       `bartlett_factor > 1`,
 //!       `statistic_corrected == statistic_lr / bartlett_factor`).
 //!
 //!   (b) CALIBRATION — under a NULL data-generating process (the smooth's
@@ -101,7 +102,7 @@ fn poisson_smooth_lr_is_bartlett_corrected_and_better_calibrated() {
     let probe = run_one(&null_replicate(N, 1)).expect("s(z) report present");
     assert_eq!(
         probe.correction.label(),
-        "lawley_lr",
+        "lawley_lr_estimated_lambda",
         "Poisson/log smooth has closed-form Lawley jets — the correction must fire"
     );
     assert!(

@@ -30,7 +30,7 @@
 //! [`joint_jeffreys_term`] (self-limiting, returns the exact zero contribution on
 //! a well-conditioned fit) is the only "apply where needed" mechanism.
 
-use crate::linalg::faer_ndarray::{FaerEigh, fast_abt};
+use crate::linalg::faer_ndarray::FaerEigh;
 use crate::linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
@@ -970,22 +970,12 @@ where
         },
     };
     let phi = super::atoms::CriterionAtom::value(&value_atom);
-    // Daleckii–Krein divided-difference kernel of the floored signed inverse on
-    // this spectrum — the single source of truth tying `∇Φ` (its diagonal
-    // weights are `inv_diag = d(λ_i)`) to the exact curvature `H_Φ` below
-    // (gam#979).
-    let psi = floored_inverse_divided_differences(&evals, floor);
-
     // Gradient: grad[k] = ½ tr(K · Z_Jᵀ Hdot[e_k] Z_J) = ½ Σ_i d_i (Ṽ_k)_ii with
     // Ṽ_k = Vᵀ D_k V the reduced derivative rotated into the eigenbasis. For the
     // inner-Newton dense path the Hessian is beta-dependent through the working
     // weights only along coefficient directions; we evaluate Hdot per canonical
     // coefficient axis.
     let mut grad = Array1::<f64>::zeros(p);
-    // Eigenbasis sensitivity rows vec(Ṽ_k) and their Ψ-weighted partners
-    // vec(Ψ ∘ Ṽ_k), kept to assemble the exact curvature in one GEMM.
-    let mut a_rows = Array2::<f64>::zeros((p, m * m));
-    let mut aw_rows = Array2::<f64>::zeros((p, m * m));
     // PARALLEL DIRECTIONAL DERIVATIVES. Each canonical axis `e_k` requires one
     // FULL-DATA directional-derivative pass `Hdot[e_k]` (the n-row inner-Newton
     // exact derivative) — the dominant cost (e.g. ~1.5 s × p=35 ≈ 55 s serial on
@@ -996,9 +986,9 @@ where
     // combined with the nested-BLAS guard each pass runs single-threaded faer,
     // so the directions fan across cores with no rayon×BLAS oversubscription.
     //
-    // The cheap per-k reduction (D_k = ZᵀHdotZ rotation, grad/a_rows/aw_rows
-    // writes) stays SERIAL below over the index-ordered results, so the outputs
-    // are bit-identical to the original `for k in 0..p` loop. Early-return
+    // The cheap per-k reduction (D_k = ZᵀHdotZ rotation and atom input writes)
+    // stays SERIAL below over the index-ordered results, so the outputs are
+    // bit-identical to the original `for k in 0..p` loop. Early-return
     // semantics are preserved exactly: if ANY axis yields `Ok(None)` the family
     // does not expose the exact derivative and the whole term degenerates to
     // `(gate_weight·phi, 0, 0)` (matching the serial first-None behaviour); any
@@ -1059,15 +1049,6 @@ where
             let dlambda_max = a_k[[idx_max, idx_max]]; // v_maxᵀ D_k v_max
             floor_drift.insert(k, REDUCED_INFO_RELATIVE_FLOOR * dlambda_max);
         }
-        // Store vec(Ṽ_k) and vec(Ψ ∘ Ṽ_k) for the exact-curvature GEMM.
-        let mut col = 0usize;
-        for i in 0..m {
-            for j in 0..m {
-                a_rows[[k, col]] = a_k[[i, j]];
-                aw_rows[[k, col]] = psi[[i, j]] * a_k[[i, j]];
-                col += 1;
-            }
-        }
         reduced_drift.insert(k, Arc::new(a_k));
     }
     let gradient_atom = super::atoms::JeffreysLogdetAtom {
@@ -1089,18 +1070,20 @@ where
         };
         grad[k] = super::atoms::CriterionAtom::frozen_d1(&gradient_atom, &dir);
     }
-    // EXACT Jeffreys curvature on the floored spectrum (gam#979). The penalized
-    // objective is `−ℓ + ½βᵀSβ − Φ`, so the Newton system needs `−∇²Φ`. By the
+    // EXACT Jeffreys curvature on the floored spectrum (gam#979), now emitted
+    // by the same atom that emitted `phi` and `grad`. The penalized objective is
+    // `−ℓ + ½βᵀSβ − Φ`, so the Newton system needs `−∇²Φ`. By the
     // Daleckii–Krein formula (first-order eigen-perturbation), with
     // `Ṽ_k = Vᵀ D_k V` and `Ψ` the divided differences of `d = g'`:
     //   ∇²Φ[a,b] = ½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij + ½ tr(K D_ab),
-    // and we keep everything except the second-directional-Hessian term
-    // `½ tr(K D_ab)` (a genuinely separating direction's `D_ab` carries its
-    // vanishing curvature factor, so that remainder is O(1) exactly where the
-    // term arms — the trust region owns it). So
+    // and `JeffreysLogdetAtom::second_order_curvature` keeps everything except
+    // the second-directional-Hessian term `½ tr(K D_ab)` (a genuinely
+    // separating direction's `D_ab` carries its vanishing curvature factor, so
+    // that remainder is O(1) exactly where the term arms — the trust region owns
+    // it). So
     //   H_Φ[a,b] = −½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij,
-    // assembled as one BLAS-3 GEMM over the stored rows. On an unfloored PSD
-    // spectrum `Ψ_ij = −1/(λ_i λ_j)` and this is the classic PSD log-det
+    // assembled as one BLAS-3 GEMM over the atom's stored rows. On an unfloored
+    // PSD spectrum `Ψ_ij = −1/(λ_i λ_j)` and this is the classic PSD log-det
     // Gauss-Newton curvature `½ tr(K D_a K D_b)`.
     //
     // WHY NOT THE vec-GRAM `½⟨vec(K D_a), vec(K D_b)⟩` (the previous surrogate):
@@ -1119,11 +1102,8 @@ where
     // the objective and Newton recovers its quadratic rate. It is indefinite
     // exactly where `Φ` is (mixed-sign spectrum); the exact Moré–Sorensen
     // trust-region subproblem handles that rigorously.
-    let mut hphi = fast_abt(&aw_rows, &a_rows);
-    hphi.mapv_inplace(|v| -0.5 * v);
-    // Scale curvature by the smooth gate weight. The value and gradient have
-    // already been emitted by `JeffreysLogdetAtom` with that same gate.
-    Ok((phi, grad, hphi * gate_weight))
+    let hphi = gradient_atom.second_order_curvature(p)?;
+    Ok((phi, grad, hphi))
 }
 
 /// Exact second-directional-Hessian completion for the Tier-B joint Jeffreys

@@ -127,8 +127,8 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
 use super::jeffreys_subspace::{
-    floored_inverse, jeffreys_antiderivative, jeffreys_antiderivative_floor_sensitivity,
-    floored_inverse_divided_differences,
+    floored_inverse, floored_inverse_divided_differences, jeffreys_antiderivative,
+    jeffreys_antiderivative_floor_sensitivity,
 };
 use super::reml_outer_engine::PenaltySubspaceTrace;
 
@@ -853,12 +853,7 @@ impl SoftRhoGuardPriorAtom {
     /// so this module needs no cross-crate const import); `anchor` is the
     /// `rho_weight_anchor` shift. A single `tanh` per coordinate feeds all three
     /// emissions, so value/gradient/Hessian are projections of one computation.
-    pub fn evaluate(
-        rho: &Array1<f64>,
-        weight: f64,
-        sharpness: f64,
-        bound: f64,
-    ) -> Self {
+    pub fn evaluate(rho: &Array1<f64>, weight: f64, sharpness: f64, bound: f64) -> Self {
         Self::evaluate_anchored(rho, weight, sharpness, bound, 0.0)
     }
 
@@ -1377,6 +1372,7 @@ mod tests {
         // frozen_d1 = G·½·6.25 = 0.75·0.5·6.25 = 2.34375.
         let mut reduced_drift = std::collections::HashMap::new();
         reduced_drift.insert(0_usize, Arc::new(array![[1.0, 0.2], [0.2, 3.0]]));
+        reduced_drift.insert(1_usize, Arc::new(array![[2.0, 0.5], [0.5, 1.0]]));
 
         let atom = JeffreysLogdetAtom {
             eigvals: eigvals.clone(),
@@ -1411,6 +1407,13 @@ mod tests {
             "frozen_d1 {} vs 2.34375",
             atom.frozen_d1(&dir0)
         );
+        let hphi = atom
+            .second_order_curvature(2)
+            .expect("second-order Jeffreys atom curvature");
+        assert!((hphi[[0, 0]] - 13.5384375).abs() < 1e-12);
+        assert!((hphi[[0, 1]] - 4.584375).abs() < 1e-12);
+        assert!((hphi[[1, 0]] - 4.584375).abs() < 1e-12);
+        assert!((hphi[[1, 1]] - 1.6875).abs() < 1e-12);
 
         // A direction with no reduced drift entry has no frozen channel here.
         let dir_absent = ThetaDirection {
@@ -1560,11 +1563,10 @@ mod tests {
         assert!(atom.stratum().is_none(), "smooth everywhere");
 
         // Closed-form value.
-        let expected_value: f64 = w
-            * rho
-                .iter()
-                .map(|&r| (a * (r - anchor)).cosh().ln())
-                .sum::<f64>();
+        let expected_value: f64 = w * rho
+            .iter()
+            .map(|&r| (a * (r - anchor)).cosh().ln())
+            .sum::<f64>();
         assert!(
             (atom.value() - expected_value).abs() < 1e-12,
             "value {} vs {}",
@@ -1614,10 +1616,8 @@ mod tests {
             let mut rm = rho.clone();
             rp[i] += step;
             rm[i] -= step;
-            let vp =
-                SoftRhoGuardPriorAtom::evaluate_anchored(&rp, w, sharp, bound, anchor).value();
-            let vm =
-                SoftRhoGuardPriorAtom::evaluate_anchored(&rm, w, sharp, bound, anchor).value();
+            let vp = SoftRhoGuardPriorAtom::evaluate_anchored(&rp, w, sharp, bound, anchor).value();
+            let vm = SoftRhoGuardPriorAtom::evaluate_anchored(&rm, w, sharp, bound, anchor).value();
             let fd_grad = (vp - vm) / (2.0 * step);
             assert!(
                 (fd_grad - atom.gradient()[i]).abs() < 1e-6,

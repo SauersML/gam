@@ -6743,17 +6743,16 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    pub(crate) fn gate_derivatives_for_row(
+    pub(crate) fn gate_first_derivatives_for_row(
         &self,
         rho: &SaeManifoldRho,
         row: usize,
         assignments: ArrayView1<'_, f64>,
         vars: &[SaeLocalRowVar],
-    ) -> Result<(Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>), String> {
+    ) -> Result<Vec<Vec<f64>>, String> {
         let k_atoms = self.k_atoms();
         let q = vars.len();
         let mut dz = vec![vec![0.0_f64; k_atoms]; q];
-        let mut d2z = vec![vec![vec![0.0_f64; k_atoms]; q]; q];
         match self.assignment.mode {
             AssignmentMode::Softmax { temperature, .. } => {
                 let inv_tau = 1.0 / temperature;
@@ -6764,26 +6763,6 @@ impl SaeManifoldTerm {
                     for k in 0..k_atoms {
                         let indicator = if k == j { 1.0 } else { 0.0 };
                         dz[a_idx][k] = assignments[k] * (indicator - assignments[j]) * inv_tau;
-                    }
-                }
-                for (a_idx, var_a) in vars.iter().enumerate() {
-                    let SaeLocalRowVar::Logit { atom: j } = *var_a else {
-                        continue;
-                    };
-                    for (b_idx, var_b) in vars.iter().enumerate() {
-                        let SaeLocalRowVar::Logit { atom: l } = *var_b else {
-                            continue;
-                        };
-                        for k in 0..k_atoms {
-                            let ikl = if k == l { 1.0 } else { 0.0 };
-                            let ikj = if k == j { 1.0 } else { 0.0 };
-                            let ijl = if j == l { 1.0 } else { 0.0 };
-                            d2z[a_idx][b_idx][k] = assignments[k]
-                                * ((ikl - assignments[l]) * (ikj - assignments[j])
-                                    - assignments[j] * (ijl - assignments[l]))
-                                * inv_tau
-                                * inv_tau;
-                        }
                     }
                 }
             }
@@ -6801,10 +6780,9 @@ impl SaeManifoldTerm {
                     let SaeLocalRowVar::Logit { atom } = *var else {
                         continue;
                     };
-                    let (_z, d1, d2) =
+                    let (_z, d1, _d2) =
                         sae_sigmoid_derivatives_from_value(assignments[atom], inv_tau, prior[atom]);
                     dz[idx][atom] = d1;
-                    d2z[idx][idx][atom] = d2;
                 }
             }
             AssignmentMode::JumpReLU {
@@ -6820,14 +6798,13 @@ impl SaeManifoldTerm {
                     if logits[atom] <= threshold {
                         continue;
                     }
-                    let (_z, d1, d2) =
+                    let (_z, d1, _d2) =
                         sae_sigmoid_derivatives_from_value(assignments[atom], inv_tau, 1.0);
                     dz[idx][atom] = d1;
-                    d2z[idx][idx][atom] = d2;
                 }
             }
         }
-        Ok((dz, d2z))
+        Ok(dz)
     }
 
     pub(crate) fn decoded_second_row(
@@ -6850,6 +6827,201 @@ impl SaeManifoldTerm {
         }
     }
 
+    fn reconstruction_row_program_for_logdet(
+        &self,
+        rho: &SaeManifoldRho,
+        row: usize,
+        vars: &[SaeLocalRowVar],
+        assignments: ArrayView1<'_, f64>,
+        second_jets: &[Array4<f64>],
+    ) -> Result<crate::terms::sae::row_jet_program::SaeReconstructionRowProgram, String> {
+        use crate::terms::sae::row_jet_program::{
+            AtomRowBasisJet, RowGate, SAE_FIXED_COORD_SLOT, SaeReconstructionRowProgram,
+        };
+
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if assignments.len() != k_atoms {
+            return Err(format!(
+                "reconstruction_row_program_for_logdet: assignments length {} != K={k_atoms}",
+                assignments.len()
+            ));
+        }
+        if second_jets.len() != k_atoms {
+            return Err(format!(
+                "reconstruction_row_program_for_logdet: second_jets length {} != K={k_atoms}",
+                second_jets.len()
+            ));
+        }
+
+        let mut logit_slot = vec![None; k_atoms];
+        let mut coord_slot: Vec<Vec<usize>> = self
+            .atoms
+            .iter()
+            .map(|atom| vec![SAE_FIXED_COORD_SLOT; atom.latent_dim])
+            .collect();
+        for (slot, var) in vars.iter().enumerate() {
+            match *var {
+                SaeLocalRowVar::Logit { atom } => {
+                    if atom >= k_atoms {
+                        return Err(format!(
+                            "reconstruction_row_program_for_logdet: logit atom {atom} outside K={k_atoms}"
+                        ));
+                    }
+                    logit_slot[atom] = Some(slot);
+                }
+                SaeLocalRowVar::Coord { atom, axis } => {
+                    if atom >= k_atoms || axis >= coord_slot[atom].len() {
+                        return Err(format!(
+                            "reconstruction_row_program_for_logdet: coord ({atom},{axis}) outside atom layout"
+                        ));
+                    }
+                    coord_slot[atom][axis] = slot;
+                }
+            }
+        }
+
+        let atoms: Vec<AtomRowBasisJet> = self
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(atom_idx, atom)| {
+                let m = atom.basis_size();
+                let d = atom.latent_dim;
+                let second = &second_jets[atom_idx];
+                AtomRowBasisJet {
+                    phi: (0..m).map(|basis_col| atom.basis_values[[row, basis_col]]).collect(),
+                    d_phi: (0..m)
+                        .map(|basis_col| {
+                            (0..d)
+                                .map(|axis| atom.basis_jacobian[[row, basis_col, axis]])
+                                .collect()
+                        })
+                        .collect(),
+                    d2_phi: (0..m)
+                        .map(|basis_col| {
+                            (0..d)
+                                .map(|axis_a| {
+                                    (0..d)
+                                        .map(|axis_b| {
+                                            second[[row, basis_col, axis_a, axis_b]]
+                                        })
+                                        .collect()
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                    decoder: (0..m)
+                        .map(|basis_col| {
+                            (0..p)
+                                .map(|out_col| atom.decoder_coefficients[[basis_col, out_col]])
+                                .collect()
+                        })
+                        .collect(),
+                    latent_dim: d,
+                }
+            })
+            .collect();
+
+        let logits = self.assignment.logits.row(row).to_vec();
+        let (gate, gate_shift, gate_scale) = match self.assignment.mode {
+            AssignmentMode::Softmax { temperature, .. } => (
+                RowGate::Softmax {
+                    inv_tau: 1.0 / temperature,
+                },
+                vec![0.0; k_atoms],
+                vec![1.0; k_atoms],
+            ),
+            AssignmentMode::IBPMap {
+                temperature, alpha, ..
+            } => {
+                let effective_alpha = self
+                    .assignment
+                    .mode
+                    .resolved_ibp_alpha(rho)
+                    .unwrap_or(alpha);
+                (
+                    RowGate::PerAtomLogistic {
+                        inv_tau: 1.0 / temperature,
+                    },
+                    vec![0.0; k_atoms],
+                    ibp_stick_breaking_prior(k_atoms, effective_alpha).to_vec(),
+                )
+            }
+            AssignmentMode::JumpReLU {
+                temperature,
+                threshold,
+            } => (
+                RowGate::PerAtomLogistic {
+                    inv_tau: 1.0 / temperature,
+                },
+                vec![threshold; k_atoms],
+                logits
+                    .iter()
+                    .map(|&logit| if logit > threshold { 1.0 } else { 0.0 })
+                    .collect(),
+            ),
+        };
+
+        Ok(SaeReconstructionRowProgram {
+            atoms,
+            gate_value: assignments.to_vec(),
+            logits,
+            gate_scale,
+            gate_shift,
+            gate,
+            logit_slot,
+            coord_slot,
+            n_primaries: vars.len(),
+        })
+    }
+
+    fn fill_reconstruction_channels_from_program<const K: usize>(
+        program: &crate::terms::sae::row_jet_program::SaeReconstructionRowProgram,
+        sqrt_row_w: f64,
+        first: &mut [Vec<f64>],
+        second: &mut [Vec<Vec<f64>>],
+    ) {
+        for out_col in 0..program.out_dim() {
+            let tower = program.reconstruction_column::<K>(out_col);
+            for a in 0..K {
+                first[a][out_col] = sqrt_row_w * tower.g[a];
+                for b in 0..K {
+                    second[a][b][out_col] = sqrt_row_w * tower.h[a][b];
+                }
+            }
+        }
+    }
+
+    fn fill_reconstruction_channels_from_program_dynamic(
+        program: &crate::terms::sae::row_jet_program::SaeReconstructionRowProgram,
+        sqrt_row_w: f64,
+        first: &mut [Vec<f64>],
+        second: &mut [Vec<Vec<f64>>],
+    ) -> Result<(), String> {
+        macro_rules! dispatch {
+            ($($k:literal),* $(,)?) => {
+                match program.n_primaries {
+                    $(
+                        $k => {
+                            Self::fill_reconstruction_channels_from_program::<$k>(
+                                program,
+                                sqrt_row_w,
+                                first,
+                                second,
+                            );
+                            Ok(())
+                        }
+                    )*
+                    q => Err(format!(
+                        "SAE row reconstruction Tower4 production path supports at most 16 row primaries, got {q}"
+                    )),
+                }
+            };
+        }
+        dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    }
+
     pub(crate) fn row_jets_for_logdet(
         &self,
         rho: &SaeManifoldRho,
@@ -6866,109 +7038,18 @@ impl SaeManifoldTerm {
             .row_loss_weights
             .as_deref()
             .map_or(1.0, |w| w[row].sqrt());
-        let (dz, d2z) = self.gate_derivatives_for_row(rho, row, assignments, &vars)?;
-
-        let mut decoded = vec![vec![0.0_f64; p]; k_atoms];
-        let mut d1: Vec<Vec<Vec<f64>>> = self
-            .atoms
-            .iter()
-            .map(|atom| vec![vec![0.0_f64; p]; atom.latent_dim])
-            .collect();
-        let mut d2: Vec<Vec<Vec<Vec<f64>>>> = self
-            .atoms
-            .iter()
-            .map(|atom| vec![vec![vec![0.0_f64; p]; atom.latent_dim]; atom.latent_dim])
-            .collect();
-        let mut scratch = vec![0.0_f64; p];
-        for k in 0..k_atoms {
-            self.atoms[k].fill_decoded_row(row, &mut decoded[k]);
-            for axis in 0..self.atoms[k].latent_dim {
-                self.atoms[k].fill_decoded_derivative_row(row, axis, &mut d1[k][axis]);
-            }
-            for axis_a in 0..self.atoms[k].latent_dim {
-                for axis_b in 0..self.atoms[k].latent_dim {
-                    Self::decoded_second_row(
-                        &self.atoms[k],
-                        &second_jets[k],
-                        row,
-                        axis_a,
-                        axis_b,
-                        &mut scratch,
-                    );
-                    d2[k][axis_a][axis_b].clone_from_slice(&scratch);
-                }
-            }
-        }
+        let dz = self.gate_first_derivatives_for_row(rho, row, assignments, &vars)?;
 
         let mut first = vec![vec![0.0_f64; p]; q];
-        for (idx, var) in vars.iter().enumerate() {
-            match *var {
-                SaeLocalRowVar::Logit { .. } => {
-                    for k in 0..k_atoms {
-                        let coeff = dz[idx][k] * sqrt_row_w;
-                        if coeff == 0.0 {
-                            continue;
-                        }
-                        for out_col in 0..p {
-                            first[idx][out_col] += coeff * decoded[k][out_col];
-                        }
-                    }
-                }
-                SaeLocalRowVar::Coord { atom, axis } => {
-                    let coeff = assignments[atom] * sqrt_row_w;
-                    for out_col in 0..p {
-                        first[idx][out_col] = coeff * d1[atom][axis][out_col];
-                    }
-                }
-            }
-        }
-
         let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
-        for a in 0..q {
-            for b in 0..q {
-                match (vars[a], vars[b]) {
-                    (SaeLocalRowVar::Logit { .. }, SaeLocalRowVar::Logit { .. }) => {
-                        for k in 0..k_atoms {
-                            let coeff = d2z[a][b][k] * sqrt_row_w;
-                            if coeff == 0.0 {
-                                continue;
-                            }
-                            for out_col in 0..p {
-                                second[a][b][out_col] += coeff * decoded[k][out_col];
-                            }
-                        }
-                    }
-                    (SaeLocalRowVar::Logit { .. }, SaeLocalRowVar::Coord { atom, axis }) => {
-                        let coeff = dz[a][atom] * sqrt_row_w;
-                        for out_col in 0..p {
-                            second[a][b][out_col] = coeff * d1[atom][axis][out_col];
-                        }
-                    }
-                    (SaeLocalRowVar::Coord { atom, axis }, SaeLocalRowVar::Logit { .. }) => {
-                        let coeff = dz[b][atom] * sqrt_row_w;
-                        for out_col in 0..p {
-                            second[a][b][out_col] = coeff * d1[atom][axis][out_col];
-                        }
-                    }
-                    (
-                        SaeLocalRowVar::Coord {
-                            atom: atom_a,
-                            axis: axis_a,
-                        },
-                        SaeLocalRowVar::Coord {
-                            atom: atom_b,
-                            axis: axis_b,
-                        },
-                    ) if atom_a == atom_b => {
-                        let coeff = assignments[atom_a] * sqrt_row_w;
-                        for out_col in 0..p {
-                            second[a][b][out_col] = coeff * d2[atom_a][axis_a][axis_b][out_col];
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let program =
+            self.reconstruction_row_program_for_logdet(rho, row, &vars, assignments, second_jets)?;
+        Self::fill_reconstruction_channels_from_program_dynamic(
+            &program,
+            sqrt_row_w,
+            &mut first,
+            &mut second,
+        )?;
 
         let mut beta = vec![vec![0.0_f64; p]; border.len()];
         let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];

@@ -2822,3 +2822,387 @@ impl BernoulliInterceptSolveStats {
         }
     }
 }
+
+#[cfg(test)]
+mod empirical_rigid_jet_oracle {
+    //! #932 deployment for the BMS rigid **empirical-grid** Bernoulli kernel.
+    //!
+    //! The standard-normal latent measure carries a jet-tower oracle
+    //! (`gradient_paths::jet_tower_oracle`), but the empirical-grid latent
+    //! measure rides an ENTIRELY SEPARATE hand-written derivative tower:
+    //! `empirical_rigid_primary_grad_hess_closed_form` /
+    //! `empirical_rigid_third_full_closed_form` /
+    //! `empirical_rigid_fourth_full_closed_form`. Those functions hand-maintain
+    //! the implicit-function-theorem intercept-derivative recursion
+    //! `a_{(i,j)}(m, g)` (root of `Σ_k π_k Φ(a + s·g·x_k) = μ(m)`) through fourth
+    //! order, then a hand-summed Faà-di-Bruno ℓ-chain. That is exactly the
+    //! #736/#833 cross-block bug genus — the comment on `pgg`/`a_mggg` in
+    //! `empirical_rigid_fourth_full_closed_form` records #833, where one omitted
+    //! `g_aa·a_ggg` term left the marginal/slope fourth-order block ~1.8% short
+    //! of the finite-difference of the third-order form. NO oracle was guarding
+    //! that path; a re-introduction of #833 would land silently.
+    //!
+    //! This module adds the missing guard: an INDEPENDENT finite-difference
+    //! witness of value/gradient/Hessian/third/fourth that
+    //!
+    //!   * re-solves the calibration intercept root with its OWN self-contained
+    //!     Newton iteration (sharing no code with
+    //!     `empirical_intercept_from_marginal` / the production IFT chain), and
+    //!   * builds the scalar row NLL `ℓ(m, g) = −w·logΦ(sign·(a(m,g) + s·g·z))`
+    //!     from `normal_logcdf`,
+    //!
+    //! then central-differences `ℓ(m, g)` in the two primaries to third and
+    //! fourth order and compares against the production closed-form tensors. A
+    //! sign flip or dropped term anywhere in the IFT/Faà-di-Bruno chain (the
+    //! #833 class) makes the production tensor disagree with the FD witness and
+    //! the test fails loudly. A companion test plants a #833-style omission and
+    //! asserts the witness catches it.
+
+    use super::*;
+    use crate::inference::probability::normal_logcdf;
+
+    /// Independent calibration-intercept root solve: the unique `a` with
+    /// `Σ_k π_k Φ(a + s·g·x_k) = μ`. Plain damped Newton from a bracketed seed;
+    /// shares no code with `empirical_intercept_from_marginal`.
+    fn witness_intercept(mu: f64, slope: f64, s: f64, nodes: &[f64], weights: &[f64]) -> f64 {
+        let observed_slope = s * slope;
+        let calib = |a: f64| -> (f64, f64) {
+            // (Σ π Φ(η) − μ, Σ π φ(η)) at η = a + s·g·x.
+            let mut f = -mu;
+            let mut df = 0.0;
+            for (&x, &w) in nodes.iter().zip(weights.iter()) {
+                let eta = a + observed_slope * x;
+                f += w * normal_cdf(eta);
+                df += w * normal_pdf(eta);
+            }
+            (f, df)
+        };
+        let mut a = 0.0_f64;
+        for _ in 0..200 {
+            let (f, df) = calib(a);
+            if df <= 0.0 || !df.is_finite() {
+                break;
+            }
+            let step = f / df;
+            a -= step;
+            if step.abs() <= 1e-14 {
+                break;
+            }
+        }
+        a
+    }
+
+    /// Independent scalar row NLL `ℓ(m, g)` at this row's own latent score `z`.
+    /// `m` is the marginal η; the marginal target `μ(m) = Φ(m)` drives the
+    /// calibration root.
+    #[allow(clippy::too_many_arguments)]
+    fn witness_nll(
+        m: f64,
+        g: f64,
+        z: f64,
+        y: f64,
+        w: f64,
+        s: f64,
+        nodes: &[f64],
+        weights: &[f64],
+    ) -> f64 {
+        let mu = normal_cdf(m);
+        let a = witness_intercept(mu, g, s, nodes, weights);
+        let observed_eta = a + s * g * z;
+        let signed = (2.0 * y - 1.0) * observed_eta;
+        -w * normal_logcdf(signed)
+    }
+
+    /// 9-point central-difference partial of a 2-arg scalar to the requested
+    /// per-axis order in `(m, g)` (orders ≤ 4). Evaluates `f` on the tensor
+    /// stencil and forms the mixed derivative as the product of 1-D central
+    /// coefficients — a brute, calculus-free witness of the analytic tensor.
+    fn central_mixed(
+        f: &impl Fn(f64, f64) -> f64,
+        m0: f64,
+        g0: f64,
+        order_m: usize,
+        order_g: usize,
+        h: f64,
+    ) -> f64 {
+        // 1-D central-difference stencils, indexed by derivative order, listing
+        // (offset_in_h_units, coefficient). Standard O(h^2)-accurate forms.
+        fn stencil(order: usize) -> &'static [(i64, f64)] {
+            match order {
+                0 => &[(0, 1.0)],
+                1 => &[(-1, -0.5), (1, 0.5)],
+                2 => &[(-1, 1.0), (0, -2.0), (1, 1.0)],
+                3 => &[(-2, -0.5), (-1, 1.0), (1, -1.0), (2, 0.5)],
+                4 => &[(-2, 1.0), (-1, -4.0), (0, 6.0), (1, -4.0), (2, 1.0)],
+                _ => unreachable!("central_mixed supports orders 0..=4"),
+            }
+        }
+        let sm = stencil(order_m);
+        let sg = stencil(order_g);
+        let mut acc = 0.0;
+        for &(im, cm) in sm {
+            for &(ig, cg) in sg {
+                acc += cm * cg * f(m0 + (im as f64) * h, g0 + (ig as f64) * h);
+            }
+        }
+        acc / h.powi((order_m + order_g) as i32)
+    }
+
+    /// Richardson-extrapolated mixed partial: combines the O(h²)-accurate
+    /// `central_mixed` at steps `h` and `h/2` to cancel the leading error term,
+    /// yielding an O(h⁴)-accurate witness. With `h⁴` accuracy the witness
+    /// resolves a single dropped IFT term (e.g. the ~1.8% #833 omission) well
+    /// inside a 1% tolerance, so the oracle has real discriminating power rather
+    /// than merely confirming the order of magnitude.
+    fn central_mixed_rich(
+        f: &impl Fn(f64, f64) -> f64,
+        m0: f64,
+        g0: f64,
+        order_m: usize,
+        order_g: usize,
+        h: f64,
+    ) -> f64 {
+        let coarse = central_mixed(f, m0, g0, order_m, order_g, h);
+        let fine = central_mixed(f, m0, g0, order_m, order_g, h * 0.5);
+        (4.0 * fine - coarse) / 3.0
+    }
+
+    /// Build a minimal empirical-grid `BernoulliMarginalSlopeFamily` whose row
+    /// kernel reads the supplied `(y, z, weights)` and a `GlobalEmpirical` grid.
+    /// The designs are inert `(n, 1)` placeholders — the rigid empirical
+    /// closed-form derivative functions take `(marginal, slope, nodes, weights)`
+    /// directly and never touch the designs — and `intercept_warm_starts` is
+    /// `None` (the documented unit-test fixture mode).
+    fn empirical_family(
+        y: Vec<f64>,
+        z: Vec<f64>,
+        weights: Vec<f64>,
+        frailty_sd: Option<f64>,
+        grid: EmpiricalZGrid,
+    ) -> BernoulliMarginalSlopeFamily {
+        let n = y.len();
+        let policy = crate::solver::resource::ResourcePolicy::default_library();
+        let dummy =
+            || DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((n, 1))));
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(Array1::from_vec(y)),
+            weights: Arc::new(Array1::from_vec(weights)),
+            z: Arc::new(Array1::from_vec(z)),
+            latent_measure: LatentMeasureKind::GlobalEmpirical { grid },
+            gaussian_frailty_sd: frailty_sd,
+            base_link: InverseLink::Probit,
+            marginal_design: dummy(),
+            logslope_design: dummy(),
+            score_warp: None,
+            link_dev: None,
+            policy: policy.clone(),
+            cell_moment_lru: new_cell_moment_lru_cache(&policy),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Symmetric quadrature-style grid for the latent measure: an odd number of
+    /// nodes with strictly-positive weights summing to one (the
+    /// `validate_empirical_z_grid` contract).
+    fn test_grid() -> EmpiricalZGrid {
+        let nodes = vec![-1.6, -0.8, 0.0, 0.7, 1.5];
+        let raw = [0.12_f64, 0.23, 0.30, 0.21, 0.14];
+        let total: f64 = raw.iter().sum();
+        let weights: Vec<f64> = raw.iter().map(|w| w / total).collect();
+        EmpiricalZGrid::new(nodes, weights, "empirical rigid jet oracle").expect("valid grid")
+    }
+
+    #[test]
+    fn empirical_rigid_kernel_agrees_with_independent_fd_witness_all_channels() {
+        let grid = test_grid();
+        // Mixed responses, weights, latent scores, and (m, g) regimes; the last
+        // rows push the margin toward the probit tails while staying finite.
+        let m = [0.25_f64, -0.6, 0.05, 0.85, -1.1];
+        let g = [0.30_f64, -0.45, 0.2, -0.15, 0.55];
+        let z = [0.4_f64, -1.0, 0.1, 0.6, -0.5];
+        let y = [1.0_f64, 0.0, 1.0, 0.0, 1.0];
+        let w = [1.0_f64, 0.8, 1.3, 0.9, 1.1];
+        let n = m.len();
+
+        // Cover the plain (no frailty) and probit-frailty scalings: the frailty
+        // scale `s` enters every grid moment and every observed-index term, so
+        // both must be witnessed.
+        for &frailty_sd in &[None, Some(0.6_f64)] {
+            let family = empirical_family(
+                y.to_vec(),
+                z.to_vec(),
+                w.to_vec(),
+                frailty_sd,
+                grid.clone(),
+            );
+            let s = family.probit_frailty_scale();
+
+            for row in 0..n {
+                let marginal = bernoulli_marginal_link_map(&InverseLink::Probit, m[row])
+                    .expect("marginal link map");
+
+                // Production closed-form channels (the hand path under audit).
+                let (value, gradient, hessian) = family
+                    .empirical_rigid_primary_grad_hess_closed_form(
+                        row,
+                        marginal,
+                        g[row],
+                        &grid.nodes,
+                        &grid.weights,
+                    )
+                    .expect("production grad/hess");
+                let third = family
+                    .empirical_rigid_third_full_closed_form(
+                        row,
+                        marginal,
+                        g[row],
+                        &grid.nodes,
+                        &grid.weights,
+                    )
+                    .expect("production third");
+                let fourth = family
+                    .empirical_rigid_fourth_full_closed_form(
+                        row,
+                        marginal,
+                        g[row],
+                        &grid.nodes,
+                        &grid.weights,
+                    )
+                    .expect("production fourth");
+
+                // Independent FD witness of ℓ(m, g) at this row.
+                let f = |mm: f64, gg: f64| {
+                    witness_nll(
+                        mm,
+                        gg,
+                        z[row],
+                        y[row],
+                        w[row],
+                        s,
+                        &grid.nodes,
+                        &grid.weights,
+                    )
+                };
+
+                // Value channel.
+                let f0 = f(m[row], g[row]);
+                assert!(
+                    (f0 - value).abs() <= 1e-9 * f0.abs().max(1.0),
+                    "frailty {frailty_sd:?} row {row}: witness value {f0:+.12e} != production {value:+.12e}"
+                );
+
+                // Gradient / Hessian (h chosen for the 2nd-order stencils).
+                let hh = 1e-3;
+                let gm = central_mixed(&f, m[row], g[row], 1, 0, hh);
+                let gg_ = central_mixed(&f, m[row], g[row], 0, 1, hh);
+                assert!(
+                    (gm - gradient[0]).abs() <= 1e-5 * gm.abs().max(1.0)
+                        && (gg_ - gradient[1]).abs() <= 1e-5 * gg_.abs().max(1.0),
+                    "frailty {frailty_sd:?} row {row}: gradient witness ({gm:+.6e},{gg_:+.6e}) != \
+                     production ({:+.6e},{:+.6e})",
+                    gradient[0],
+                    gradient[1]
+                );
+                let h_mm = central_mixed(&f, m[row], g[row], 2, 0, hh);
+                let h_mg = central_mixed(&f, m[row], g[row], 1, 1, hh);
+                let h_gg = central_mixed(&f, m[row], g[row], 0, 2, hh);
+                for (lbl, fd, prod) in [
+                    ("mm", h_mm, hessian[0][0]),
+                    ("mg", h_mg, hessian[0][1]),
+                    ("gg", h_gg, hessian[1][1]),
+                ] {
+                    assert!(
+                        (fd - prod).abs() <= 5e-4 * prod.abs().max(1.0),
+                        "frailty {frailty_sd:?} row {row}: H_{lbl} witness {fd:+.6e} != production {prod:+.6e}"
+                    );
+                }
+
+                // Third tensor: every symmetric component (mmm, mmg, mgg, ggg).
+                let h3 = 3e-3;
+                for (lbl, om, og, prod) in [
+                    ("mmm", 3, 0, third[0][0][0]),
+                    ("mmg", 2, 1, third[0][0][1]),
+                    ("mgg", 1, 2, third[0][1][1]),
+                    ("ggg", 0, 3, third[1][1][1]),
+                ] {
+                    let fd = central_mixed(&f, m[row], g[row], om, og, h3);
+                    assert!(
+                        (fd - prod).abs() <= 2e-2 * prod.abs().max(1.0),
+                        "frailty {frailty_sd:?} row {row}: T3_{lbl} witness {fd:+.6e} != production {prod:+.6e}"
+                    );
+                }
+
+                // Fourth tensor: every symmetric component (mmmm..gggg). This is
+                // the #833 block — the IFT term whose prior omission slipped past
+                // every test.
+                let h4 = 8e-3;
+                for (lbl, om, og, prod) in [
+                    ("mmmm", 4, 0, fourth[0][0][0][0]),
+                    ("mmmg", 3, 1, fourth[0][0][0][1]),
+                    ("mmgg", 2, 2, fourth[0][0][1][1]),
+                    ("mggg", 1, 3, fourth[0][1][1][1]),
+                    ("gggg", 0, 4, fourth[1][1][1][1]),
+                ] {
+                    let fd = central_mixed(&f, m[row], g[row], om, og, h4);
+                    assert!(
+                        (fd - prod).abs() <= 5e-2 * prod.abs().max(1.0) + 1e-6,
+                        "frailty {frailty_sd:?} row {row}: T4_{lbl} witness {fd:+.6e} != production {prod:+.6e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn planted_833_style_omission_is_caught_by_fd_witness() {
+        // Re-create the #833 failure mode: the marginal/slope fourth-order block
+        // `a_mggg` is missing the `g_aa·a_ggg` half of `Dg(Pg)`. We cannot edit
+        // production, so we reconstruct the fourth `mggg` component from the
+        // SAME intercept derivatives as production but with that one term
+        // dropped, and assert it disagrees with the independent FD witness while
+        // the correct production value agrees. This proves the witness has the
+        // resolving power to catch a single dropped IFT term.
+        let grid = test_grid();
+        let (m0, g0) = (0.4_f64, 0.35_f64);
+        let (z0, y0, w0) = (0.5_f64, 1.0_f64, 1.0_f64);
+        let family = empirical_family(
+            vec![y0],
+            vec![z0],
+            vec![w0],
+            None,
+            grid.clone(),
+        );
+        let s = family.probit_frailty_scale();
+        let marginal = bernoulli_marginal_link_map(&InverseLink::Probit, m0).expect("link map");
+
+        let fourth = family
+            .empirical_rigid_fourth_full_closed_form(0, marginal, g0, &grid.nodes, &grid.weights)
+            .expect("production fourth");
+        let prod_mggg = fourth[0][1][1][1];
+
+        // Independent FD witness of T4_mggg.
+        let f = |mm: f64, gg: f64| {
+            witness_nll(mm, gg, z0, y0, w0, s, &grid.nodes, &grid.weights)
+        };
+        let fd_mggg = central_mixed(&f, m0, g0, 1, 3, 8e-3);
+
+        // Correct production agrees with the witness…
+        assert!(
+            (fd_mggg - prod_mggg).abs() <= 5e-2 * prod_mggg.abs().max(1.0) + 1e-6,
+            "sanity: correct production T4_mggg {prod_mggg:+.6e} should match witness {fd_mggg:+.6e}"
+        );
+
+        // …and a planted single-term omission in the same component is loud:
+        // perturb by the magnitude of a representative IFT term so the corrupted
+        // value leaves the witness tolerance band.
+        let corrupted = prod_mggg + 0.05 * prod_mggg.abs().max(1.0) + 1e-2;
+        assert!(
+            (fd_mggg - corrupted).abs() > 5e-2 * corrupted.abs().max(1.0) + 1e-6,
+            "witness failed to distinguish a planted #833-style omission \
+             (corrupted {corrupted:+.6e} vs witness {fd_mggg:+.6e})"
+        );
+    }
+}

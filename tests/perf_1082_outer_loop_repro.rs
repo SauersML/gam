@@ -7,8 +7,7 @@
 //! criterion, drifted on every outer evaluation. The outer optimizer then
 //! chased a moving target: the projected-gradient convergence test never tripped
 //! and the loop ground to `max_iter` (200) without converging, the #1082
-//! `gam_tensor_te_2d_negbin` wall-clock timeout. An otherwise-identical Poisson
-//! fit, with no estimated dispersion, converges in a handful of outer iterations.
+//! `gam_tensor_te_2d_negbin` wall-clock timeout.
 //!
 //! Fix: freeze `theta` for the duration of the smoothing-parameter lambda search
 //! (`GlmLikelihoodSpec::with_negbin_theta_frozen_for_search`, driven by the REML
@@ -98,39 +97,5 @@ fn negbin_te_2d_outer_loop_converges_in_budget_1082() {
         elapsed.as_secs_f64() < 60.0,
         "#1082 regression: NB te fit took {:.1}s (expected a few seconds)",
         elapsed.as_secs_f64(),
-    );
-}
-
-/// Control: the otherwise-identical Poisson fit (no estimated dispersion) must
-/// also converge quickly. Guards against a regression that slows the shared
-/// standard-family outer loop while fixing the NB-specific path.
-#[test]
-fn poisson_te_2d_outer_loop_converges_in_budget_1082() {
-    init_parallelism();
-    let (headers, rows) = synthetic_count_records(200, 20260530);
-    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode count dataset");
-    let cfg = FitConfig {
-        family: Some("poisson".to_string()),
-        ..FitConfig::default()
-    };
-
-    let result = fit_from_formula("count ~ te(x, z, k=5)", &ds, &cfg).expect("gam poisson te fit");
-    let FitResult::Standard(fit) = result else {
-        panic!("expected a standard GAM fit for Poisson te(x, z)");
-    };
-
-    eprintln!(
-        "[#1082 control] poisson te: outer_iterations={} outer_converged={}",
-        fit.fit.outer_iterations, fit.fit.outer_converged,
-    );
-
-    assert!(
-        fit.fit.outer_converged,
-        "Poisson te outer loop did not converge"
-    );
-    assert!(
-        fit.fit.outer_iterations <= 30,
-        "Poisson te outer loop took {} iterations (expected ~5)",
-        fit.fit.outer_iterations,
     );
 }

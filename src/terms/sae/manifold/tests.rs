@@ -8641,6 +8641,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 atoms,
                 gate_value: assignments.to_vec(),
                 logits: term.assignment.logits.row(row).to_vec(),
+                gate_scale: vec![1.0; k_atoms],
                 gate_shift: vec![0.0; k_atoms],
                 gate: RowGate::Softmax { inv_tau },
                 logit_slot,

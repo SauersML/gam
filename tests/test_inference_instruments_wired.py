@@ -201,6 +201,8 @@ def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
         "statistic_lr",
         "ref_df",
         "bartlett_factor",
+        "bartlett_factor_conditional",
+        "rho_variation_shift",
         "statistic_corrected",
         "p_value_uncorrected",
         "p_value_corrected",
@@ -209,7 +211,7 @@ def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
     ):
         assert key in row, f"smooth_significance row missing '{key}'"
     # Poisson carries closed-form Lawley jets, so the correction auto-applies.
-    assert row["correction_provenance"] == "lawley_lr"
+    assert row["correction_provenance"] == "lawley_lr_estimated_lambda"
     # The corrected statistic is the raw LR divided by the Bartlett factor.
     assert row["statistic_corrected"] == pytest.approx(
         row["statistic_lr"] / row["bartlett_factor"], rel=1e-9
