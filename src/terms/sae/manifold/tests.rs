@@ -9067,6 +9067,11 @@ mod inner_contract_probe_tests {
             max_fast_truth = max_fast_truth.max(fast_truth);
             max_exact_truth = max_exact_truth.max(exact_truth);
         }
+        eprintln!(
+            "#1154 AMORTIZED-VS-EXACT: held-out certified={heldout_certified} \
+             | max fast-vs-exact #1010 phase gap={max_fast_vs_exact:.6e} \
+             | max fast-vs-truth={max_fast_truth:.6e} | max exact-vs-truth={max_exact_truth:.6e}"
+        );
         assert!(
             heldout_certified > 0,
             "fast amortized encode must certify held-out rows on the known manifold"
@@ -9416,6 +9421,12 @@ mod inner_contract_probe_tests {
             .expect("co-trained warm-started inner solve converges");
         let (cot_gap, cot_certified) = heldout_recovery_gap(&cot_term);
 
+        eprintln!(
+            "#1154 RECOVERY: sequential max-phase-gap={seq_gap:.6e} (certified={seq_certified}) \
+             | co-trained max-phase-gap={cot_gap:.6e} (certified={cot_certified}) \
+             | delta(cot-seq)={:.6e}",
+            cot_gap - seq_gap
+        );
         assert!(
             seq_certified > 0 && cot_certified > 0,
             "both paths must certify held-out rows on the planted manifold: \

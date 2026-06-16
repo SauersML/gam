@@ -866,20 +866,21 @@ pub(crate) fn build_outer_hessian_operator(
             _ => (1.0, 1.0, 1.0, 0.0, false),
         };
 
-    let rho_penalty_a_k_betas: Vec<Array1<f64>> = (0..k)
-        .into_par_iter()
-        .map(|idx| penalty_a_k_beta(&solution.penalty_coords[idx], &solution.beta, lambdas[idx]))
-        .collect();
-    let rho_curvature_a_k_betas: Vec<Array1<f64>> = (0..k)
-        .into_par_iter()
-        .map(|idx| {
-            penalty_a_k_beta(
-                &solution.penalty_coords[idx],
-                &solution.beta,
-                curvature_lambdas[idx],
-            )
-        })
-        .collect();
+    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+        lambdas,
+        &solution.penalty_coords,
+        &solution.beta,
+    )?;
+    let curvature_penalty_quad_atom =
+        crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            &curvature_lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )?;
+
+    let rho_penalty_a_k_betas: Vec<Array1<f64>> = penalty_quad_atom.block_penalty_scores().to_vec();
+    let rho_curvature_a_k_betas: Vec<Array1<f64>> =
+        curvature_penalty_quad_atom.block_penalty_scores().to_vec();
     // Mode responses are fixed-β stationarity derivatives. The main
     // evaluator passes precomputed responses so gradient and Hessian share
     // the same solve kernel; when none are provided this standalone path
@@ -1008,7 +1009,7 @@ pub(crate) fn build_outer_hessian_operator(
             (Some(dense_hop), Some(matrix)) => Some(dense_hop.rotate_to_eigenbasis(matrix)),
             _ => None,
         };
-        let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambdas[idx]);
+        let a_i = penalty_quad_atom.rho_frozen_d1(idx);
         coords.push(OuterHessianCoord {
             a: a_i,
             g: curvature_a_k_beta,

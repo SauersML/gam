@@ -65,22 +65,6 @@ use crate::solver::estimate::smooth_floor_dp;
 /// Ridge floor for denominator safety.
 pub(crate) const DENOM_RIDGE: f64 = 1e-8;
 
-pub(crate) fn penalty_a_k_beta(
-    coord: &PenaltyCoordinate,
-    beta: &Array1<f64>,
-    lambda: f64,
-) -> Array1<f64> {
-    coord.apply_shifted_penalty(beta, lambda)
-}
-
-pub(crate) fn penalty_a_k_quadratic(
-    coord: &PenaltyCoordinate,
-    beta: &Array1<f64>,
-    lambda: f64,
-) -> f64 {
-    coord.shifted_quadratic(beta, lambda)
-}
-
 /// Apply the curvature-conditioning scale `s = rho_curvature_scale` to a
 /// raw ρ-coordinate `λ_k = exp(ρ_k)`.
 ///

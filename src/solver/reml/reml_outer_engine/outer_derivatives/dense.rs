@@ -67,34 +67,29 @@ pub(crate) fn compute_outer_hessian(
             }
             _ => (1.0, 1.0, 1.0, 0.0, false),
         };
+    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+        lambdas,
+        &solution.penalty_coords,
+        &solution.beta,
+    )?;
+    let curvature_penalty_quad_atom =
+        crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            curvature_lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )?;
 
     // ── ρ precomputation ──
 
     let penalty_a_k_betas_storage: Option<Vec<Array1<f64>>> = if workspace.is_some() {
         None
     } else {
-        Some(
-            (0..k)
-                .map(|idx| {
-                    penalty_a_k_beta(&solution.penalty_coords[idx], &solution.beta, lambdas[idx])
-                })
-                .collect(),
-        )
+        Some(penalty_quad_atom.block_penalty_scores().to_vec())
     };
     let curvature_a_k_betas_storage: Option<Vec<Array1<f64>>> = if workspace.is_some() {
         None
     } else {
-        Some(
-            (0..k)
-                .map(|idx| {
-                    penalty_a_k_beta(
-                        &solution.penalty_coords[idx],
-                        &solution.beta,
-                        curvature_lambdas[idx],
-                    )
-                })
-                .collect(),
-        )
+        Some(curvature_penalty_quad_atom.block_penalty_scores().to_vec())
     };
     let penalty_a_k_betas: &[Array1<f64>] = match workspace {
         Some(ws) => ws.rho_penalty_a_k_betas,
@@ -157,9 +152,7 @@ pub(crate) fn compute_outer_hessian(
 
     // Precompute a_k = ½ λₖ(β̂-μₖ)'Sₖ(β̂-μₖ) for profiled Gaussian correction.
     let rho_a_vals: Vec<f64> = (0..k)
-        .map(|idx| {
-            0.5 * penalty_a_k_quadratic(&solution.penalty_coords[idx], &solution.beta, lambdas[idx])
-        })
+        .map(|idx| penalty_quad_atom.rho_frozen_d1(idx))
         .collect();
 
     // Build pure Aₖ = λₖ Rₖᵀ Rₖ and Ḣₖ = Aₖ + correction for all k.

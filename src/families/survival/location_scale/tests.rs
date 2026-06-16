@@ -1,6 +1,7 @@
 use super::*;
 use crate::custom_family::BlockWorkingSet;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use crate::solver::gauge::Gauge;
 use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, array};
@@ -2051,12 +2052,12 @@ fn identified_time_block_preserves_expected_nullspace_dimension() {
     let p = time_block.design_entry.ncols();
 
     assert_eq!(
-        prepared.transform.z.nrows(),
+        prepared.transform.gauge.raw_total(),
         p,
         "identifiability transform must stay in the original coefficient space"
     );
     assert_eq!(
-        prepared.transform.z.ncols(),
+        prepared.transform.gauge.reduced_total(),
         p,
         "anchored time basis should keep the full coefficient dimension"
     );
@@ -2070,7 +2071,14 @@ fn identified_time_block_preserves_expected_nullspace_dimension() {
         p,
         "prepared exit design should keep the full anchored basis width"
     );
-    assert_eq!(prepared.transform.z, Array2::<f64>::eye(p));
+    assert_eq!(
+        prepared.transform.gauge.block_transform(0),
+        Array2::<f64>::eye(p)
+    );
+    assert_eq!(
+        prepared.transform.gauge.affine_shift,
+        Array1::<f64>::zeros(p)
+    );
 }
 
 #[test]
@@ -2106,18 +2114,19 @@ fn identified_time_block_can_reduce_to_parametric_penalty_nullspace() {
     .expect("prepare time block");
     // Canonical gauge pin (#892): the warp slope is folded into the offset,
     // so the FREE time block collapses to the single row-constant direction.
-    // The identifiability map is now p×1 (was p×2), with the pinned unit-log-t
-    // warp carried by `affine_shift` rather than a free column.
-    assert_eq!(prepared.transform.z.nrows(), 3);
-    assert_eq!(prepared.transform.z.ncols(), 1);
-    assert_eq!(prepared.transform.affine_shift.len(), 3);
+    // The Gauge map is now p×1 (was p×2), with the pinned unit-log-t
+    // warp carried by `Gauge::affine_shift` rather than a free column.
+    assert_eq!(prepared.transform.gauge.raw_total(), 3);
+    assert_eq!(prepared.transform.gauge.reduced_total(), 1);
+    assert_eq!(prepared.transform.gauge.affine_shift.len(), 3);
     assert!(
         prepared
             .transform
+            .gauge
             .affine_shift
             .iter()
             .any(|&v| v.abs() > 1e-9),
-        "pinned warp must contribute a non-zero unit-log-t affine_shift"
+        "pinned warp must contribute a non-zero Gauge affine_shift"
     );
     assert_eq!(prepared.design_entry.ncols(), 1);
     assert_eq!(prepared.design_exit.ncols(), 1);
@@ -2143,14 +2152,14 @@ fn identified_time_block_can_reduce_to_parametric_penalty_nullspace() {
 #[test]
 fn pinned_time_warp_affine_lift_round_trips() {
     // Golden round-trip (issue #892): on a rank-clean pinned reduced fit the
-    // raw time coefficients must be reconstructed EXACTLY through the affine
-    // transform `β_raw = z · β_reduced + affine_shift`. A wrong lift silently
+    // raw time coefficients must be reconstructed EXACTLY through the
+    // Gauge-owned affine section `β_raw = T · θ + a`. A wrong lift silently
     // corrupts every reported survival time-coefficient, so this guards the
     // finalize math directly. Choose a known reduced free coefficient `θ` and
     // verify the lifted raw coefficient reproduces both the free constant
-    // direction (`θ · z_c`) and the pinned unit-log-t warp (`affine_shift`),
+    // direction (`θ · z_c`) and the pinned unit-log-t warp (`a`),
     // and that the design image `X · β_raw` equals
-    // `(X · z_c) θ + X · affine_shift` (the free design plus the folded
+    // `(X · z_c) θ + X · a` (the free design plus the folded
     // offset), which is what the geometry actually consumes.
     let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
     let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
@@ -2180,12 +2189,17 @@ fn pinned_time_warp_affine_lift_round_trips() {
     )
     .expect("prepare time block");
     // Pin fired: single free column + non-zero pinned warp.
-    assert_eq!(prepared.transform.z.ncols(), 1);
+    assert_eq!(prepared.transform.gauge.reduced_total(), 1);
     let theta = array![0.731_f64];
-    let beta_raw = prepared.transform.z.dot(&theta) + &prepared.transform.affine_shift;
+    let beta_raw = prepared
+        .transform
+        .gauge
+        .lift_block_betas(&[theta.clone()])
+        .remove(0);
     // β_raw equals the free contribution plus the pinned warp, exactly.
+    let z_c = prepared.transform.gauge.block_transform(0);
     let expected_raw =
-        &(&prepared.transform.z.column(0).to_owned() * theta[0]) + &prepared.transform.affine_shift;
+        &(&z_c.column(0).to_owned() * theta[0]) + &prepared.transform.gauge.affine_shift;
     for (got, want) in beta_raw.iter().zip(expected_raw.iter()) {
         assert!(
             (got - want).abs() <= 1e-12,
@@ -2268,8 +2282,8 @@ fn rank1_reduced_time_warp_removes_warp_and_flags_location_log_time() {
     .expect("prepare time block");
 
     // Warp removed: zero free columns, empty designs + p×0 transform.
-    assert_eq!(prepared.transform.z.ncols(), 0);
-    assert_eq!(prepared.transform.z.nrows(), 3);
+    assert_eq!(prepared.transform.gauge.reduced_total(), 0);
+    assert_eq!(prepared.transform.gauge.raw_total(), 3);
     assert_eq!(prepared.design_exit.ncols(), 0);
     assert_eq!(prepared.design_entry.ncols(), 0);
     assert_eq!(prepared.design_derivative_exit.ncols(), 0);
@@ -2287,6 +2301,7 @@ fn rank1_reduced_time_warp_removes_warp_and_flags_location_log_time() {
     assert!(
         prepared
             .transform
+            .gauge
             .affine_shift
             .iter()
             .all(|&v| v.abs() <= 1e-12)
@@ -3263,10 +3278,12 @@ fn inverse_link_survival_prob_complements_failure_prob() {
 #[test]
 fn lift_conditional_covariance_rejects_time_map_wider_than_raw() {
     let z = array![[1.0, 0.0]];
+    let time_gauge = Gauge::from_block_transforms(&[z]);
     let cov_reduced = Array2::<f64>::eye(2);
-    let err = lift_conditional_covariance(&cov_reduced, &z, 0, 0, 0, 0, 0, 0, 0).expect_err(
-        "a reduced time block wider than the raw time map must fail before ndarray assignment",
-    );
+    let err = lift_conditional_covariance(&cov_reduced, &time_gauge, 0, 0, 0, 0, 0, 0, 0)
+        .expect_err(
+            "a reduced time block wider than the raw time map must fail before ndarray assignment",
+        );
     assert!(
         err.contains("time map is wider than tall"),
         "unexpected covariance-lift error: {err}"
@@ -3276,6 +3293,7 @@ fn lift_conditional_covariance_rejects_time_map_wider_than_raw() {
 #[test]
 fn lift_conditional_covariance_preserveswiggle_block() {
     let z = array![[1.0, 0.0], [0.5, 1.0], [0.0, 1.0]];
+    let time_gauge = Gauge::from_block_transforms(&[z]);
     let cov_reduced = array![
         [2.0, 0.1, 0.2, 0.3, 0.4],
         [0.1, 3.0, 0.5, 0.6, 0.7],
@@ -3283,7 +3301,7 @@ fn lift_conditional_covariance_preserveswiggle_block() {
         [0.3, 0.6, 0.8, 5.0, 1.1],
         [0.4, 0.7, 0.9, 1.1, 6.0],
     ];
-    let lifted = lift_conditional_covariance(&cov_reduced, &z, 1, 1, 0, 1, 1, 0, 1)
+    let lifted = lift_conditional_covariance(&cov_reduced, &time_gauge, 1, 1, 0, 1, 1, 0, 1)
         .expect("covariance lift");
     assert_eq!(lifted.dim(), (6, 6));
     assert!((lifted[[5, 5]] - 6.0).abs() <= 1e-12);

@@ -85,6 +85,13 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
     let mut steps = vec![0.0; total];
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
+    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+        &lambdas,
+        &solution.penalty_coords,
+        &solution.beta,
+    )
+    .expect("EFS penalty-quadratic atom must match InnerSolution penalty layout");
 
     // Universal-form EFS: `Δρ_i = log(1 − 2·g_full[i]/q_eff_i)`. This is
     // identical to the canonical `log((d−t)/q_eff)` when no out-of-band
@@ -94,9 +101,8 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
     // for one `EvalMode::ValueAndGradient` evaluation per outer
     // iteration.
     for idx in 0..k {
-        let coord = &solution.penalty_coords[idx];
-        let lambda = rho[idx].exp();
-        let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+        let lambda = lambdas[idx];
+        let a_i = penalty_quad_atom.rho_frozen_d1(idx);
         let q_eff = efs_q_eff_with_gamma_rate(
             efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
             lambda,
@@ -159,6 +165,13 @@ pub(crate) fn efs_single_loop_diagnostics(
     assert_eq!(steps.len(), total);
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
+    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+        &lambdas,
+        &solution.penalty_coords,
+        &solution.beta,
+    )
+    .expect("EFS diagnostics penalty-quadratic atom must match InnerSolution penalty layout");
     let mut grad_sq = 0.0_f64;
     let mut residual_sq = 0.0_f64;
     let mut step_inf_norm = 0.0_f64;
@@ -167,9 +180,8 @@ pub(crate) fn efs_single_loop_diagnostics(
         let g = gradient[idx];
         grad_sq += g * g;
         step_inf_norm = step_inf_norm.max(steps[idx].abs());
-        let coord = &solution.penalty_coords[idx];
-        let lambda = rho[idx].exp();
-        let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+        let lambda = lambdas[idx];
+        let a_i = penalty_quad_atom.rho_frozen_d1(idx);
         let q_eff = efs_q_eff_with_gamma_rate(
             efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
             lambda,
@@ -349,15 +361,21 @@ pub fn compute_hybrid_efs_update(
     // candidates in parallel once the block is large enough, then keep the
     // actual update write-back serial so fallback/backtracking decisions still
     // see a deterministic step vector.
+    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let penalty_quad_atom = crate::solver::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+        &lambdas,
+        &solution.penalty_coords,
+        &solution.beta,
+    )
+    .expect("hybrid EFS penalty-quadratic atom must match InnerSolution penalty layout");
     let rho_candidates: Vec<(usize, Option<f64>)> =
         if k >= HYBRID_EFS_SCALAR_PAR_THRESHOLD && rayon::current_thread_index().is_none() {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             (0..k)
                 .into_par_iter()
                 .map(|idx| {
-                    let coord = &solution.penalty_coords[idx];
-                    let lambda = rho[idx].exp();
-                    let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+                    let lambda = lambdas[idx];
+                    let a_i = penalty_quad_atom.rho_frozen_d1(idx);
                     let q_eff = efs_q_eff_with_gamma_rate(
                         efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
                         lambda,
@@ -370,9 +388,8 @@ pub fn compute_hybrid_efs_update(
         } else {
             (0..k)
                 .map(|idx| {
-                    let coord = &solution.penalty_coords[idx];
-                    let lambda = rho[idx].exp();
-                    let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+                    let lambda = lambdas[idx];
+                    let a_i = penalty_quad_atom.rho_frozen_d1(idx);
                     let q_eff = efs_q_eff_with_gamma_rate(
                         efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
                         lambda,
