@@ -59,7 +59,7 @@ pub use linear_dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryFit, fit_linear_dictionary,
 };
 pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
-pub use sae_criterion_atoms::{SaeCriterion, SaeCriterionAtom};
+pub use sae::criterion_atoms::{SaeCriterion, SaeCriterionAtom};
 pub use sae_encode_atlas::{
     AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
     EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
@@ -72,7 +72,7 @@ pub use sae_manifold::{
     TorusHarmonicEvaluator, dictionary_incoherence_report,
     dictionary_incoherence_report_with_dispersion,
 };
-pub use sae_optimality_certificate::{
+pub use sae::optimality_certificate::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,
 };

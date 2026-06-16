@@ -6,34 +6,25 @@
 //! compiled only for Linux builds that enable the `cuda` feature, so cudarc is
 //! never loaded by default CPU-only builds.
 
-pub mod arrow_schur;
-pub mod arrow_schur_nvrtc;
 pub mod backend_probe;
 pub mod blas;
 #[cfg(target_os = "linux")]
 pub mod calibration;
 pub mod common;
 pub mod cpu_traits;
-pub mod cubic_bspline_moments;
-pub mod cubic_cell;
 pub mod device;
 pub mod driver;
 #[macro_use]
 pub mod error;
+pub mod kernels;
 pub mod linalg;
 pub mod memory;
 pub mod numerics_device;
 pub mod numerics_host;
-pub mod pirls_row;
 pub mod policy;
-pub mod polya_gamma;
 pub mod pool;
 pub mod profile;
-pub mod reml_trace;
-pub mod row_hessian_ops;
 pub mod runtime;
-pub mod sae_resident;
-pub(crate) mod sigma_cubature;
 pub mod solver;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};

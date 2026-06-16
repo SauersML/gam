@@ -96,8 +96,8 @@ impl From<LatentSurvivalError> for String {
     }
 }
 
-impl From<crate::util::block_count::BlockCountMismatch> for LatentSurvivalError {
-    fn from(err: crate::util::block_count::BlockCountMismatch) -> LatentSurvivalError {
+impl From<crate::families::block_layout::block_count::BlockCountMismatch> for LatentSurvivalError {
+    fn from(err: crate::families::block_layout::block_count::BlockCountMismatch) -> LatentSurvivalError {
         LatentSurvivalError::BlockMismatch {
             reason: err.message(),
         }
@@ -287,7 +287,7 @@ impl LatentSurvivalFamily {
         LatentSurvivalError,
     > {
         let expected_blocks = if self.latent_sd_fixed.is_some() { 2 } else { 3 };
-        crate::util::block_count::validate_block_count::<LatentSurvivalError>(
+        crate::families::block_layout::block_count::validate_block_count::<LatentSurvivalError>(
             "LatentSurvivalFamily",
             expected_blocks,
             block_states.len(),
@@ -380,7 +380,7 @@ impl LatentBinaryFamily {
         block_states: &'a [ParameterBlockState],
     ) -> Result<(ArrayView1<'a, f64>, ArrayView1<'a, f64>, &'a Array1<f64>), LatentSurvivalError>
     {
-        crate::util::block_count::validate_block_count::<LatentSurvivalError>(
+        crate::families::block_layout::block_count::validate_block_count::<LatentSurvivalError>(
             "LatentBinaryFamily",
             2,
             block_states.len(),
