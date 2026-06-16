@@ -20,7 +20,7 @@ pub mod measure_jet_glm_sufficient;
 pub mod measure_jet_gram_cache;
 pub mod mixture_link;
 pub mod orthogonal_reparam;
-pub mod outer_strategy;
+pub mod rho_optimizer;
 pub(crate) mod persistent_warm_start;
 pub mod pirls;
 pub(crate) mod priority_selection;
