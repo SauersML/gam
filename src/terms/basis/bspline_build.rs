@@ -533,11 +533,12 @@ pub fn build_bspline_basis_1d(
                     &sparse_basis,
                     weights.as_ref().map(|w| w.view()),
                 )?;
+                let gauge = crate::solver::gauge::Gauge::sum_to_zero(z);
+                let z = gauge.block_transform(0);
                 let transformed_candidates = penalties_raw
                     .into_iter()
                     .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                        let zt_s = fast_atb(&z, &candidate.matrix);
-                        let matrix = fast_ab(&zt_s, &z);
+                        let matrix = gauge.restrict_penalty(&candidate.matrix);
                         Ok(PenaltyCandidate {
                             nullspace_dim_hint: candidate.nullspace_dim_hint,
                             matrix,
@@ -812,9 +813,11 @@ pub(crate) fn build_streaming_bspline_design_and_candidates(
                 chunk,
             )?;
             let z = bspline_sum_to_zero_transform_from_cross(&cross)?;
+            let gauge = crate::solver::gauge::Gauge::sum_to_zero(z);
+            let z = gauge.block_transform(0);
             penalty_mats = penalty_mats
                 .into_iter()
-                .map(|s| project_penalty_matrix(&s, Some(&z)))
+                .map(|s| gauge.restrict_penalty(&s))
                 .collect();
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
@@ -902,8 +905,11 @@ pub(crate) fn apply_bspline_identifiability_policy(
     let (design_c, z_opt): (Array2<f64>, Option<Array2<f64>>) = match identifiability {
         BSplineIdentifiability::None => (design, None),
         BSplineIdentifiability::WeightedSumToZero { weights } => {
-            let (b_c, z) =
+            let (_, z) =
                 apply_sum_to_zero_constraint(design.view(), weights.as_ref().map(|w| w.view()))?;
+            let gauge = crate::solver::gauge::Gauge::sum_to_zero(z);
+            let b_c = gauge.restrict_design(&design);
+            let z = gauge.block_transform(0);
             (b_c, Some(z))
         }
         BSplineIdentifiability::RemoveLinearTrend => {
@@ -932,12 +938,10 @@ pub(crate) fn apply_bspline_identifiability_policy(
     };
 
     let penalties_c = if let Some(ref z) = z_opt {
+        let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]);
         penalties
             .into_iter()
-            .map(|s| {
-                let zt_s = fast_atb(z, &s);
-                fast_ab(&zt_s, z)
-            })
+            .map(|s| gauge.restrict_penalty(&s))
             .collect()
     } else {
         penalties

@@ -1508,8 +1508,9 @@ pub fn apply_sum_to_zero_constraint(
         return Ok((basis_matrix.to_owned(), Array2::eye(k)));
     }
 
-    // Constrained basis
-    let constrained = fast_ab(&basis_matrix, &z);
+    let gauge = crate::solver::gauge::Gauge::sum_to_zero(z);
+    let constrained = gauge.restrict_design(&basis_matrix);
+    let z = gauge.block_transform(0);
     Ok((constrained, z))
 }
 

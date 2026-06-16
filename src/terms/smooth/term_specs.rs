@@ -4971,7 +4971,8 @@ fn build_tensor_bspline_basis(
                 )
             })?;
             let (_, z) = apply_sum_to_zero_constraint(dense_design_ref.view(), None)?;
-            Some(z)
+            let gauge = crate::solver::gauge::Gauge::sum_to_zero(z);
+            Some(gauge.block_transform(0))
         }
         TensorBSplineIdentifiability::MarginalSumToZero => {
             // `ti(...)`: drop the marginal main effects by centering every
@@ -4998,6 +4999,8 @@ fn build_tensor_bspline_basis(
                     );
                 }
                 let (_, z_dim) = apply_sum_to_zero_constraint(marginal.view(), None)?;
+                let gauge_dim = crate::solver::gauge::Gauge::sum_to_zero(z_dim);
+                let z_dim = gauge_dim.block_transform(0);
                 z = kronecker_product(&z, &z_dim);
             }
             Some(z)
@@ -5015,17 +5018,18 @@ fn build_tensor_bspline_basis(
     };
 
     if let Some(z) = z_opt.as_ref() {
+        let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]);
         let dense = dense_design.as_mut().ok_or_else(|| {
             BasisError::InvalidInput(
                 "tensor identifiability transform requires a realized basis".to_string(),
             )
         })?;
-        *dense = dense.dot(z);
+        let restricted_design = gauge.restrict_design(dense);
+        *dense = restricted_design;
         candidates = candidates
             .into_iter()
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                let zt_s = fast_atb(z, &candidate.matrix);
-                let matrix = fast_ab(&zt_s, z);
+                let matrix = gauge.restrict_penalty(&candidate.matrix);
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 let preserve_margin_scale =
                     matches!(&candidate.source, PenaltySource::TensorMarginal { .. });

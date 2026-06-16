@@ -7,26 +7,27 @@
 // coordinates β. This module owns that act once.
 //
 // A `Gauge` is the affine section itself: the lift matrix
-// `T : reduced → raw` (`β_raw = T · θ`) together with the per-block
-// partitions of both coordinate systems. Block-diagonal `T`
+// `T : reduced → raw` plus an affine shift `a`
+// (`β_raw = T · θ + a`) together with the per-block partitions
+// of both coordinate systems. Block-diagonal `T`
 // (independent per-block reductions, the canonical-audit case) and
 // block-upper-triangular `T` (cross-block residualisation, the
 // survival V+M-exact compile) are the same object — the partitions
 // record where each block's rows/columns live.
 //
 // Lift conventions (the whole point — there is exactly one):
-//   - point estimate:   β_raw = T · θ
+//   - point estimate:   β_raw = T · θ + a
 //   - covariance / any symmetric bilinear form: Σ_raw = T · Σ_θ · Tᵀ
-//   - η is invariant:   X_raw · T · θ = X_reduced · θ
+//   - η is invariant:   X_raw · (T · θ + a) = X_reduced · θ + offset_reduced
 //
 // Raw directions outside the section (zero rows of `T`) receive exactly
 // zero estimate, zero variance, and zero covariance with every other
 // coordinate: a coordinate the reduced fit cannot move carries no
 // posterior uncertainty in raw space.
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayBase, Data, Ix2};
 
-use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
+use crate::linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 
 /// The lift `T : reduced → raw` plus the per-block partitions of both
 /// coordinate systems. See the module docs for the lift conventions.
@@ -34,6 +35,8 @@ use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
 pub struct Gauge {
     /// Global lift matrix, shape `(Σ p_b_raw) × (Σ r_b_reduced)`.
     pub t_full: Array2<f64>,
+    /// Global affine shift in raw coordinates, length `Σ p_b_raw`.
+    pub affine_shift: Array1<f64>,
     /// Raw-coordinate block partition: `block_starts_raw[b]..block_starts_raw[b+1]`
     /// is block `b`'s raw row range in `t_full`. Length `n_blocks + 1`, starts at 0.
     pub block_starts_raw: Vec<usize>,
@@ -312,6 +315,38 @@ impl Gauge {
             .to_owned()
     }
 
+    /// Compose a raw design with the section: `X_reduced = X_raw · T`.
+    pub fn restrict_design<S: Data<Elem = f64>>(
+        &self,
+        raw_design: &ArrayBase<S, Ix2>,
+    ) -> Array2<f64> {
+        let raw_total = self.raw_total();
+        assert_eq!(
+            raw_design.ncols(),
+            raw_total,
+            "Gauge::restrict_design: design has {} columns, expected raw width {raw_total}",
+            raw_design.ncols(),
+        );
+        fast_ab(raw_design, &self.t_full)
+    }
+
+    /// Pull a raw-coordinate quadratic form back to reduced coordinates:
+    /// `S_reduced = Tᵀ · S_raw · T`.
+    pub fn restrict_penalty<S: Data<Elem = f64>>(
+        &self,
+        raw_penalty: &ArrayBase<S, Ix2>,
+    ) -> Array2<f64> {
+        let raw_total = self.raw_total();
+        assert_eq!(
+            raw_penalty.dim(),
+            (raw_total, raw_total),
+            "Gauge::restrict_penalty: matrix has shape {:?}, expected ({raw_total}, {raw_total})",
+            raw_penalty.dim(),
+        );
+        let t_s = fast_atb(&self.t_full, raw_penalty);
+        fast_ab(&t_s, &self.t_full)
+    }
+
     /// Append blocks that were never reduced (raw == reduced, identity
     /// lift). Used to lift joint objects that span both gauged blocks
     /// and untouched ones (e.g. the survival flex blocks alongside the
@@ -577,6 +612,7 @@ mod tests {
         )
         .unwrap();
         let b_c = fast_ab(&b, &z); // the constrained design B_c
+        assert_eq!(gauge.restrict_design(&b), b_c);
         let eta_reduced = b_c.dot(&theta);
         let eta_raw = b.dot(&expected_raw);
         for i in 0..4 {
@@ -599,6 +635,15 @@ mod tests {
                 );
             }
         }
+
+        let raw_penalty = Array2::from_shape_vec(
+            (3, 3),
+            vec![2.0, 0.5, 0.0, 0.5, 3.0, -0.25, 0.0, -0.25, 4.0],
+        )
+        .unwrap();
+        let reduced_penalty = gauge.restrict_penalty(&raw_penalty);
+        let expected_reduced_penalty = fast_ab(&fast_atb(&z, &raw_penalty), &z);
+        assert_eq!(reduced_penalty, expected_reduced_penalty);
     }
 
     #[test]
