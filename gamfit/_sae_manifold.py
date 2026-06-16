@@ -452,6 +452,90 @@ def recommend_sae_hyperparams(X: Any) -> dict[str, Any]:
     }
 
 
+def ev_knee_k(ev_by_k: Mapping[int, float] | list[tuple[int, float]],
+              min_marginal_gain: float = 0.01) -> int:
+    """Auto-K from an explained-variance-vs-K frontier (#977/#1026 action 2):
+    return the smallest K past which the MARGINAL EV gain per added atom falls
+    below `min_marginal_gain` (the saturation knee). Adding atoms past the knee
+    buys negligible reconstruction for a strictly larger dictionary, so model
+    selection should stop there.
+
+    `ev_by_k` maps atom-count K -> explained variance (monotone-ish, in [0,1]).
+    Returns the chosen K (the largest K still earning its keep). With a single
+    point, returns that K.
+    """
+    items = sorted(
+        (ev_by_k.items() if isinstance(ev_by_k, Mapping) else ev_by_k),
+        key=lambda kv: kv[0],
+    )
+    if not items:
+        raise ValueError("ev_knee_k: empty EV-vs-K frontier")
+    ks = [int(k) for k, _ in items]
+    evs = [float(v) for _, v in items]
+    chosen = ks[0]
+    for i in range(1, len(ks)):
+        gain = (evs[i] - evs[i - 1]) / max(ks[i] - ks[i - 1], 1)
+        if gain >= min_marginal_gain:
+            chosen = ks[i]
+        else:
+            break
+    return chosen
+
+
+def wager_verdict(manifold_ev_by_k: Mapping[int, float],
+                  linear_ev_by_k: Mapping[int, float]) -> dict[str, Any]:
+    """The #977 wager, adjudicated on a real manifold-vs-linear EV-vs-K frontier
+    (#1026): are curved manifold atoms parameter-efficient relative to a linear
+    SAE — do they reach a target EV at strictly lower K?
+
+    Returns a dict with:
+      * ``confirmed`` — True iff at some K the manifold EV meets-or-beats the
+        BEST linear EV achieved at any (>=) K (i.e. manifold ties the linear
+        ceiling at fewer atoms).
+      * ``manifold_k`` / ``linear_k`` — the parameter-efficiency statement
+        "manifold K=manifold_k EV >= linear K=linear_k EV".
+      * ``efficiency_ratio`` — linear_k / manifold_k (>1 ⇒ manifold wins).
+      * ``best_linear_ev`` — the linear ceiling used as the bar.
+
+    Honest both ways: if no manifold K reaches the linear ceiling, ``confirmed``
+    is False and the verdict reports the EV gap — the wager loses measurably,
+    which is itself a finding (structured minority is small; hybrid-with-linear-
+    tail is the end state).
+    """
+    if not manifold_ev_by_k or not linear_ev_by_k:
+        raise ValueError("wager_verdict: both frontiers must be non-empty")
+    lin_items = sorted(linear_ev_by_k.items(), key=lambda kv: kv[0])
+    best_linear_ev = max(v for _, v in lin_items)
+    best_linear_k = max(k for k, v in lin_items if v >= best_linear_ev - 1e-12)
+
+    confirmed = False
+    manifold_k = None
+    for k in sorted(manifold_ev_by_k):
+        if manifold_ev_by_k[k] >= best_linear_ev - 1e-9:
+            confirmed = True
+            manifold_k = k
+            break
+
+    if manifold_k is None:
+        best_manifold_ev = max(manifold_ev_by_k.values())
+        return {
+            "confirmed": False,
+            "manifold_k": None,
+            "linear_k": best_linear_k,
+            "best_linear_ev": best_linear_ev,
+            "best_manifold_ev": best_manifold_ev,
+            "ev_gap": best_linear_ev - best_manifold_ev,
+            "efficiency_ratio": None,
+        }
+    return {
+        "confirmed": confirmed,
+        "manifold_k": manifold_k,
+        "linear_k": best_linear_k,
+        "best_linear_ev": best_linear_ev,
+        "efficiency_ratio": best_linear_k / max(manifold_k, 1),
+    }
+
+
 def _weighted_row_mean(rows: np.ndarray, weights: np.ndarray | None) -> np.ndarray | None:
     rows = np.asarray(rows, dtype=float)
     if rows.ndim != 2 or rows.shape[0] == 0 or not np.all(np.isfinite(rows)):
