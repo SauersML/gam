@@ -1891,6 +1891,53 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
             );
         }
     }
+
+    // #1026 — the POSITIVE arm of the EV-vs-Θ discrimination. The fixture mixes
+    // a straightened slot (atom 0, Θ → 0) with a genuinely CURVED periodic slot
+    // (atom 1: nonzero higher harmonics ⇒ its decoded image traces a real loop).
+    // A correct classifier must do BOTH: collapse the straight slot to the
+    // linear tail (asserted above) AND keep the curved slot curved while it
+    // earns reconstruction. So at least one adjudicated slot must read a
+    // materially non-zero turning Θ, be kept curved, and carry a strictly
+    // positive held-out ΔEV — i.e. a high-Θ atom that earns EV is a genuine
+    // curved family, not a linear direction wearing a curved basis.
+    let curved_earner = report_with_ev.verdicts.iter().find(|v| {
+        v.kept_curved
+            && v.fitted_turning.map(|t| t > 1e-2).unwrap_or(false)
+            && v.held_out_delta_ev.map(|d| d > 0.0).unwrap_or(false)
+    });
+    assert!(
+        curved_earner.is_some(),
+        "a genuinely curved slot must be kept curved AND earn positive held-out \
+         ΔEV (the high-Θ-earns-EV signature); verdicts = {:?}",
+        report_with_ev
+            .verdicts
+            .iter()
+            .map(|v| (
+                v.atom_name.clone(),
+                v.kept_curved,
+                v.fitted_turning,
+                v.held_out_delta_ev
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    // The discrimination is sharp: the kept-curved earner's turning strictly
+    // exceeds the linear-tail Θ ≈ 0 threshold the collapsed slot reads, so the
+    // (Θ, ΔEV) pair separates the two atom classes on the turning axis.
+    let curved_theta = curved_earner.unwrap().fitted_turning.unwrap();
+    let max_linear_theta = report_with_ev
+        .verdicts
+        .iter()
+        .filter(|v| !v.kept_curved)
+        .filter_map(|v| v.fitted_turning)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        curved_theta > max_linear_theta,
+        "the kept-curved earner's turning Θ = {curved_theta} must exceed every \
+         linear-tail slot's Θ (max {max_linear_theta}) — the EV-vs-Θ axis must \
+         separate curved families from linear tails"
+    );
 }
 
 /// #976 Layer-1 guard 2: a single Newton application cannot move a gate

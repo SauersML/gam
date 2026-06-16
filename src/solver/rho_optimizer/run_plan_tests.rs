@@ -899,19 +899,16 @@ fn barrier_curvature_locally_concentrated_covers_both_failure_modes() {
 }
 
 #[test]
-fn hessian_result_unwrap_analytic() {
+fn hessian_result_reports_analytic_variant() {
     let h = Array2::<f64>::eye(3);
     let result = HessianResult::Analytic(h.clone());
     assert!(result.is_analytic());
-    let extracted = result.unwrap_analytic();
-    assert_eq!(extracted, h);
-}
-
-#[test]
-#[should_panic(expected = "expected analytic Hessian")]
-fn hessian_result_unwrap_unavailable_panics() {
-    let result = HessianResult::Unavailable;
-    result.unwrap_analytic();
+    match result {
+        HessianResult::Analytic(extracted) => assert_eq!(extracted, h),
+        HessianResult::Operator(_) | HessianResult::Unavailable => {
+            panic!("expected dense analytic Hessian")
+        }
+    }
 }
 
 #[test]
@@ -929,16 +926,6 @@ fn zero_params_selects_arc() {
     let p = plan(&cap);
     assert_eq!(p.solver, Solver::Arc);
     assert_eq!(p.hessian_source, HessianSource::Analytic);
-}
-
-#[test]
-fn hessian_result_into_option() {
-    let h = Array2::<f64>::eye(2);
-    let result = HessianResult::Analytic(h.clone());
-    assert_eq!(result.into_option(), Some(h));
-
-    let result = HessianResult::Unavailable;
-    assert_eq!(result.into_option(), None);
 }
 
 #[test]

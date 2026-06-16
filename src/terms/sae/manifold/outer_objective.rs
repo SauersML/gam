@@ -1066,6 +1066,17 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 .set_flat_beta(beta.view())
                 .map_err(EstimationError::RemlOptimizationFailed)?;
         }
+        // #1154 — warm-start the inner latent coords from the amortized encoder
+        // built on the running dictionary at this ρ (Design A), exactly as the
+        // value-probe lane (`evaluate_with_refine_policy`) does. The accepted
+        // iterate's inner solve then refines from the cheap one-mat-vec seed to
+        // the SAME stationary point, so the exact REML λ-gradient computed below
+        // is untouched — the warm-start changes only the basin entry, never the
+        // root. Advisory: a degenerate atlas certifies/warm-starts nothing and
+        // leaves the cold path byte-for-byte unchanged.
+        self.term
+            .warm_start_latents_from_amortized_encoder(self.target.view(), &rho_state)
+            .ok();
         let (cost, loss, cache) = self
             .term
             .reml_criterion_with_cache(

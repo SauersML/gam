@@ -486,18 +486,25 @@ pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Vec<usize> {
     if m == 0 || !(alpha.is_finite() && alpha > 0.0) {
         return Vec::new();
     }
-    assert!(
-        log_e_values.iter().all(|value| !value.is_nan()),
-        "e-BH log e-values must not be NaN"
-    );
+    // Robustness: a degenerate claim can bank a non-finite log e-value (a
+    // NaN from an upstream `(−∞) − (−∞)` split-LR that escaped the source
+    // guard). This is the documented honest FDR surface, so it must NEVER
+    // panic on such input. Treat any NaN as least-evidence (`−∞`): an
+    // undefined/contested claim contributes no evidence, sorts last, and can
+    // never be among the rejections. Finite/±∞ values pass through unchanged;
+    // `total_cmp` then gives a total order on the sanitized keys.
+    let sanitized: Vec<f64> = log_e_values
+        .iter()
+        .map(|&v| if v.is_nan() { f64::NEG_INFINITY } else { v })
+        .collect();
     let mut order: Vec<usize> = (0..m).collect();
-    order.sort_by(|&a, &b| log_e_values[b].total_cmp(&log_e_values[a]));
+    order.sort_by(|&a, &b| sanitized[b].total_cmp(&sanitized[a]));
     let m_f = m as f64;
     let mut k_star = 0usize;
     for (rank0, &idx) in order.iter().enumerate() {
         let k = (rank0 + 1) as f64;
         // e_(k) ≥ m / (α k)  ⟺  log e_(k) ≥ log m − log α − log k
-        if log_e_values[idx] >= m_f.ln() - alpha.ln() - k.ln() {
+        if sanitized[idx] >= m_f.ln() - alpha.ln() - k.ln() {
             k_star = rank0 + 1;
         }
     }

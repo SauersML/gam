@@ -4493,6 +4493,110 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
             .map(|(a, b)| (a - b).abs() / (1.0 + a.abs()))
             .fold(0.0_f64, f64::max),
     );
+
+    // ── End-to-end κ-optimum / coefficient bit-tightness across the window ──
+    // The θ₀ smoke-check proves the entry point matches; the optimizer-level
+    // claim ("same κ-optimum, EDF, coefficient vector") requires that EVERY
+    // in-window operating point the optimizer might visit produces the same
+    // CONVERGED inner solution on both lanes — not just the same cost/gradient.
+    //
+    // Each `evaluate_joint_reml_outer_eval_at_theta` runs a full inner PIRLS
+    // solve; the converged coefficient vector is exposed via
+    // `ExternalJointHyperEvaluator::current_beta` (original basis). The two
+    // lanes feed the IDENTICAL inner solver — the only difference is whether
+    // the Gaussian Gram is streamed from X or assembled n-free from the
+    // tensor's sufficient statistics — so β̂ must agree to solver round-off at
+    // every ψ. Because the effective degrees of freedom and the κ-optimum are
+    // deterministic functions of the same (H_λ, design, β̂) at each θ, a
+    // bit-tight β̂ across the whole window is exactly the end-to-end
+    // optimum/EDF/coeff equality the optimizer would observe. Any frame bug in
+    // the assembled-Gram handoff that the θ₀ point happened to miss is caught
+    // here by sweeping the certified window crossed with two ρ levels.
+    let psi_sweep = [
+        psi_lo + 0.12 * (psi_hi - psi_lo),
+        psi_lo + 0.40 * (psi_hi - psi_lo),
+        0.5 * (psi_lo + psi_hi),
+        psi_lo + 0.71 * (psi_hi - psi_lo),
+        psi_hi - 0.08 * (psi_hi - psi_lo),
+    ];
+    let rho_sweep = [
+        Array1::<f64>::from_elem(rho_dim, -2.0),
+        Array1::<f64>::from_elem(rho_dim, 0.0),
+        Array1::<f64>::from_elem(rho_dim, 1.5),
+    ];
+    let mut worst_beta_abs = 0.0_f64;
+    let beta_one = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+                    cache: &mut SingleBlockExactJointDesignCache<'_>,
+                    theta: &Array1<f64>|
+     -> Array1<f64> {
+        cache.ensure_theta(theta).expect("ensure_theta");
+        let hyper = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &spatial_terms,
+        )
+        .expect("hyper_dirs build")
+        .expect("hyper_dirs present");
+        let (_c, _g, _h) = evaluate_joint_reml_outer_eval_at_theta(
+            evaluator,
+            cache.design(),
+            theta,
+            rho_dim,
+            hyper,
+            None,
+            OuterEvalOrder::ValueAndGradient,
+            Some(cache.design_revision()),
+        )
+        .expect("evaluate_with_order");
+        evaluator
+            .current_beta()
+            .expect("converged inner β̂ available after the PIRLS solve")
+    };
+    for rho in &rho_sweep {
+        for &psi in &psi_sweep {
+            assert!(psi > psi_lo && psi < psi_hi, "sweep ψ inside window");
+            let mut theta = Array1::<f64>::zeros(rho_dim + 1);
+            theta.slice_mut(s![..rho_dim]).assign(rho);
+            theta[rho_dim] = psi;
+
+            let beta_s = beta_one(&mut streamed_eval, &mut stream_cache, &theta);
+            let beta_t = beta_one(&mut tensor_eval, &mut tensor_cache, &theta);
+
+            assert_eq!(
+                beta_s.len(),
+                beta_t.len(),
+                "coefficient dimension mismatch at ψ={psi:.4}"
+            );
+            for j in 0..beta_s.len() {
+                assert!(
+                    beta_s[j].is_finite() && beta_t[j].is_finite(),
+                    "non-finite β̂[{j}] at ψ={psi:.4}: streamed={}, tensor={}",
+                    beta_s[j],
+                    beta_t[j],
+                );
+                let babs = (beta_s[j] - beta_t[j]).abs();
+                let brel = babs / (1.0 + beta_s[j].abs());
+                worst_beta_abs = worst_beta_abs.max(babs);
+                assert!(
+                    brel <= 1e-6,
+                    "converged β̂[{j}] diverges between tensor and streamed lanes \
+                         at ψ={psi:.4}, ρ={:+.2}: streamed={:+.12e}, tensor={:+.12e}, \
+                         |Δ|={babs:.3e}, rel={brel:.3e} — the assembled-Gram handoff \
+                         changed the inner solution (EDF/κ-optimum would diverge)",
+                    rho[0],
+                    beta_s[j],
+                    beta_t[j],
+                );
+            }
+        }
+    }
+    eprintln!(
+        "[psi-gram-tensor e2e] coefficient bit-tightness: worst |Δβ̂|={worst_beta_abs:.3e} \
+             over {} (ρ,ψ) window points — converged inner solution (⇒ EDF, κ-optimum) \
+             is lane-invariant end-to-end",
+        rho_sweep.len() * psi_sweep.len(),
+    );
 }
 
 #[test]

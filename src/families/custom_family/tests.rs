@@ -2714,8 +2714,20 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
     )
     .expect("single-block fallback with zero d2H should evaluate");
 
-    let h_with = with_d2.outer_hessian.unwrap_analytic();
-    let h_without = without_d2_contribution.outer_hessian.unwrap_analytic();
+    let h_with = match with_d2.outer_hessian {
+        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => hessian,
+        crate::solver::rho_optimizer::HessianResult::Operator(_)
+        | crate::solver::rho_optimizer::HessianResult::Unavailable => {
+            panic!("expected dense analytic Hessian")
+        }
+    };
+    let h_without = match without_d2_contribution.outer_hessian {
+        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => hessian,
+        crate::solver::rho_optimizer::HessianResult::Operator(_)
+        | crate::solver::rho_optimizer::HessianResult::Unavailable => {
+            panic!("expected dense analytic Hessian")
+        }
+    };
     let d2h_delta = h_with[[0, 0]] - h_without[[0, 0]];
     assert!(
         d2h_delta.abs() > 1e-8,
