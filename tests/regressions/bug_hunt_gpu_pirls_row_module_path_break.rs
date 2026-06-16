@@ -50,9 +50,7 @@ fn pirls_row_family_as_str_is_hyphenated_and_distinct() {
         );
         // Hyphenated form: lowercase ascii + '-' separators, never '_'.
         assert!(
-            label
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c == '-'),
+            label.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
             "as_str() for {family:?} must be the hyphenated form (lowercase + '-'): got {label:?}"
         );
         assert!(
