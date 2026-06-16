@@ -1925,8 +1925,41 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         &joint_block_trust_radii,
                     )
                 };
-                if apply_joint_feasibility_limit(family, &states, &ranges, &mut trial_delta)
-                    .is_err()
+                // FEASIBILITY ENFORCEMENT — two mutually exclusive mechanisms
+                // (gam#979 survival flex non-convergence).
+                //
+                // When the joint design carries assembled linear constraints
+                // (`joint_constraints.is_some()` — the survival monotone
+                // time-derivative cone `Aβ ≥ b`), the feasible trial step is
+                // produced by the magnitude-PRESERVING cone projection below
+                // (gam#1108): it projects the trust-region trial iterate onto the
+                // strictly-interior cone, keeping the unconstrained step
+                // components and only correcting the binding directions.
+                //
+                // The older `apply_joint_feasibility_limit` enforces feasibility
+                // by a single fraction-to-boundary scalar `α` applied to the
+                // WHOLE joint step. On a binding monotonicity row at slack≈0 with
+                // negative drift, `α` collapses to ~1e-4, globally crushing the
+                // step so β moves ~1e-4/cycle while a huge time-block gradient
+                // (|g|≈720) persists: the objective drifts down ~50/cycle but the
+                // KKT residual never clears and the inner joint-Newton grinds the
+                // full cycle budget, then the seed is rejected — the survival
+                // marginal-slope hang. The α-crush also PREEMPTS the good cone
+                // projection: by globally shrinking the step it makes the trial
+                // iterate feasible, so the `check_linear_feasibility` gate below
+                // passes and the projection is skipped.
+                //
+                // So on the constrained path we DO NOT run the global α-crush at
+                // all — feasibility is fully handled by the cone projection, which
+                // preserves the constrained Newton step's fast convergence. The
+                // α-crush is retained ONLY for families that supply per-block
+                // `max_feasible_step_size` WITHOUT assembling joint linear
+                // constraints (`joint_constraints.is_none()`), where the cone
+                // projection has nothing to project against; there its `Err`
+                // (current iterate infeasible) still triggers a radius shrink.
+                if joint_constraints.is_none()
+                    && apply_joint_feasibility_limit(family, &states, &ranges, &mut trial_delta)
+                        .is_err()
                 {
                     joint_trust_radius = shrink_active_joint_block_trust_radii(
                         &mut joint_block_trust_radii,
@@ -1935,21 +1968,21 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     );
                     continue;
                 }
-                // CONSTRAINED-PATH FEASIBILITY PROJECTION (gam#1108). The
+                // CONSTRAINED-PATH FEASIBILITY PROJECTION (gam#1108 / gam#979). The
                 // trust-region trial step (Moré–Sorensen / dogleg / box-trunc) is
-                // taken in the UNCONSTRAINED D-metric ball, and
-                // `apply_joint_feasibility_limit` is a no-op for families whose
-                // `max_feasible_step_size` is `None` (e.g. `LatentSurvivalFamily`),
-                // so the step can cross the monotone time-derivative cone `Aβ ≥ b`.
-                // The next cycle's `check_linear_feasibility` gate would then reject
-                // the accepted iterate — the interval-censored survival warm-start
-                // abort. Project the trial iterate back onto the cone with the exact
+                // taken in the UNCONSTRAINED D-metric ball, so the step can cross
+                // the monotone time-derivative cone `Aβ ≥ b`. The next cycle's
+                // `check_linear_feasibility` gate would then reject the accepted
+                // iterate — the interval-censored survival warm-start abort.
+                // Project the trial iterate back onto the cone with the exact
                 // identity-Hessian active-set projection, preserving the trust
                 // step's fast convergence while guaranteeing every accepted iterate
-                // is feasible. No-op when the joint design is unconstrained or the
-                // trial is already feasible; `block_step_norms` is recomputed from
-                // the projected step just below so the trust-radius bookkeeping
-                // stays consistent.
+                // is feasible. This is now the SOLE feasibility mechanism on the
+                // constrained path (the global α-crush above is gated off there).
+                // No-op when the joint design is unconstrained or the trial is
+                // already feasible; `block_step_norms` is recomputed from the
+                // projected step just below so the trust-radius bookkeeping stays
+                // consistent.
                 if let Some(constraints) = joint_constraints.as_ref() {
                     let trial_beta = &beta_joint + &trial_delta;
                     if check_linear_feasibility(&trial_beta, constraints, 1e-8).is_err()
