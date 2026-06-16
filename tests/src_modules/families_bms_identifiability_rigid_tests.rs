@@ -87,7 +87,7 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
         base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
         score_warp: None,
         link_dev: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: crate::solver::resource::ResourcePolicy::default_library(),
         cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
         cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
         intercept_warm_starts: None,

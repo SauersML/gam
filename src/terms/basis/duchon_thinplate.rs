@@ -27,7 +27,7 @@ type DuchonBasisCacheKey = (u64, u64);
 #[derive(Clone)]
 struct CachedDuchonBasis(BasisBuildResult);
 
-impl crate::resource::ResidentBytes for CachedDuchonBasis {
+impl crate::solver::resource::ResidentBytes for CachedDuchonBasis {
     fn resident_bytes(&self) -> usize {
         // Coarse charge: the dominant resident cost is the dense design columns
         // and the penalty Grams. An estimate suffices — the byte budget only
@@ -55,11 +55,11 @@ impl crate::resource::ResidentBytes for CachedDuchonBasis {
 /// working set is a single `BasisBuildResult`, so even a modest budget retains
 /// the shared basis across the whole sweep.
 fn duchon_basis_cache()
--> &'static crate::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis> {
+-> &'static crate::solver::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis> {
     static CACHE: std::sync::OnceLock<
-        crate::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis>,
+        crate::solver::resource::ByteLruCache<DuchonBasisCacheKey, CachedDuchonBasis>,
     > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| crate::resource::ByteLruCache::new(1 << 30))
+    CACHE.get_or_init(|| crate::solver::resource::ByteLruCache::new(1 << 30))
 }
 
 /// 128-bit content fingerprint of `(data, spec)`. Two independent hashers (one

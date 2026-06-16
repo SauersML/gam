@@ -15,7 +15,7 @@ use crate::probability::{
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
 };
 
-use crate::resource::MatrixMaterializationError;
+use crate::solver::resource::MatrixMaterializationError;
 
 use crate::types::RhoPrior;
 

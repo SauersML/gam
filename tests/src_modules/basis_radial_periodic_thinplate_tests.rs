@@ -827,9 +827,9 @@
     #[test]
     fn owned_data_cache_respects_byte_budget() {
         // Tiny budget: only one 2x2 matrix fits.
-        let policy = crate::resource::ResourcePolicy {
+        let policy = crate::solver::resource::ResourcePolicy {
             max_owned_data_cache_bytes: 8 * 2 * 2,
-            ..crate::resource::ResourcePolicy::default_library()
+            ..crate::solver::resource::ResourcePolicy::default_library()
         };
         let cache = BasisCacheContext::with_policy(&policy);
 
@@ -870,7 +870,7 @@
 
         assert_eq!(
             cache.owned_data.len(),
-            crate::resource::OWNED_DATA_CACHE_MAX_ENTRIES
+            crate::solver::resource::OWNED_DATA_CACHE_MAX_ENTRIES
         );
         assert!(
             cache
