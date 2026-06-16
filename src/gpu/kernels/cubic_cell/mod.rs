@@ -133,15 +133,8 @@ pub(crate) enum CubicCellDerivativeMomentOutput {
     /// codes. Row `i` is `moments[i * stride ..][..stride]` where
     /// `stride = max_degree + 1`. Rows for non-OK cells are zeroed.
     Host {
-        // Carried for layout parity with the `Device` variant and consumed by
-        // the Linux/device dispatch + parity tests; on a CPU-only build the
-        // only `Host` matcher is `device.rs`'s `Host { .. } => panic!`, so the
-        // fields are write-only here. Keep them (the layout must mirror
-        // `Device`) and silence the `-D warnings` dead-code denial.
-        #[allow(dead_code)]
         moments: Vec<f64>,
         status: Vec<u8>,
-        #[allow(dead_code)]
         stride: usize,
     },
     /// Device-resident moments on the cubic-cell backend's shared CUDA
