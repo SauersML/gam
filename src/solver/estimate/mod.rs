@@ -9,7 +9,7 @@
 //!     parameters (`rho`) by maximizing a marginal likelihood criterion. For
 //!     non-Gaussian models (e.g., Logit), this is the Laplace Approximate
 //!     Marginal Likelihood (LAML). The concrete solver is chosen centrally by
-//!     `outer_strategy` from the derivative capability of the model path:
+//!     `rho_optimizer` from the derivative capability of the model path:
 //!     ARC with analytic Hessian when available, BFGS for gradient-only
 //!     problems, and EFS / hybrid EFS when the hyperparameter geometry
 //!     admits those fixed-point updates.
@@ -3575,19 +3575,19 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         hyper_dirs: Vec<DirectionalHyperParam>,
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
-        order: crate::solver::outer_strategy::OuterEvalOrder,
+        order: crate::solver::rho_optimizer::OuterEvalOrder,
         design_revision: Option<u64>,
     ) -> Result<
         (
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
+            crate::solver::rho_optimizer::HessianResult,
         ),
         EstimationError,
     > {
         let order = if matches!(
             order,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
         ) {
             // Firth pair Hessian terms are now available via Primitive A +
             // Primitive B in the reduced Firth dense operator; the tau-tau

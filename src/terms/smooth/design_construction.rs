@@ -7225,12 +7225,11 @@ fn spatial_subsample_seed(
 
 #[inline]
 fn spatial_seed_mix(state: &mut u64, value: u64) {
-    let mut z = value
-        .wrapping_add(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(*state);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    *state ^= z ^ (z >> 31);
+    // Canonical SplitMix64 step over `value + state` (the step adds G itself),
+    // then an extra rotate-multiply avalanche unique to the spatial seed mix.
+    let mut s = value.wrapping_add(*state);
+    let z = crate::linalg::utils::splitmix64(&mut s);
+    *state ^= z;
     *state = (*state).rotate_left(27).wrapping_mul(0x3C79_AC49_2BA7_B653);
 }
 

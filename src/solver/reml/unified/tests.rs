@@ -3486,7 +3486,7 @@ impl crate::solver::rho_optimizer::OuterHessianOperator for FixedOuterHessianOpe
 }
 
 pub(crate) struct FamilyOperatorDerivatives {
-    pub(crate) op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    pub(crate) op: Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>,
 }
 
 impl HessianDerivativeProvider for FamilyOperatorDerivatives {
@@ -3516,7 +3516,7 @@ impl HessianDerivativeProvider for FamilyOperatorDerivatives {
 
     fn family_outer_hessian_operator(
         &self,
-    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
         Some(Arc::clone(&self.op))
     }
 }
@@ -3524,7 +3524,7 @@ impl HessianDerivativeProvider for FamilyOperatorDerivatives {
 #[test]
 pub(crate) fn family_outer_hessian_operator_short_circuits_dense_pairwise_assembly() {
     let supplied = array![[2.5]];
-    let provider_op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator> =
+    let provider_op: Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator> =
         Arc::new(FixedOuterHessianOperator {
             matrix: supplied.clone(),
         });

@@ -921,12 +921,12 @@ pub fn fit_survival_marginal_slope_terms(
             // standard identifiability resolution, here at the operating-point
             // W rather than at β=0.
             {
-                use crate::families::identifiability_compiler::{
+                use crate::families::identifiability::compiler::{
                     BlockOrder as IdBlockOrder, compile_from_raw_grams,
                 };
                 let closed_form = (|| -> Result<
                     Option<(
-                        crate::families::identifiability_compiler::CompiledMap,
+                        crate::families::identifiability::compiler::CompiledMap,
                         (usize, usize, usize),
                     )>,
                     String,
@@ -1063,7 +1063,7 @@ pub fn fit_survival_marginal_slope_terms(
                         };
                         let full_row_hess = (|| -> Result<
                             Option<(
-                                crate::families::identifiability_compiler::CompiledMap,
+                                crate::families::identifiability::compiler::CompiledMap,
                                 (usize, usize, usize),
                             )>,
                             String,

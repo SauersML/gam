@@ -2984,10 +2984,15 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
         "Murphy–Topel correction must be PSD (≥0); got {mt_correction:.3e}"
     );
 
-    // --- FD ORACLE: ∂β̂/∂θ₁ (refit) vs the analytic Vb·G the term is built from ---
-    // The MT term is invariant to the overall sign of Vb·G (it is a quadratic
-    // form), but the per-component MAGNITUDES must match the true sensitivity of
-    // the refit slope to each first-stage coefficient, or G is structurally wrong.
+    // --- SIGNED FD ORACLE (#1131): ∂β̂/∂θ₁ (refit) vs the analytic Vb·G ---
+    // The MT term `(Vb·G)V₁(Vb·G)ᵀ` is invariant to the overall sign of Vb·G (it
+    // is a quadratic form), but the SIGNED sensitivity Vb·G must equal the true
+    // ∂β̂/∂θ₁ in BOTH sign and magnitude, or any signed downstream consumer (a
+    // first-order bias/coverage adjustment, a cross-covariance) gets the wrong
+    // sign. We assert the SIGNED equality fd == +vbg[k] (NOT |fd|==|analytic|).
+    // With the log-likelihood-score convention here (dscore_dzeta =
+    // ∂(log L)/∂β∂ζ = (y−2β̂ζ̂)/σ²) and vb=σ²/Σζ̂², the IFT on ∂(log L)/∂β=0 gives
+    // ∂β̂/∂θ₁ = +H_β⁻¹·G = +Vb·G.
     let h = 1e-5_f64;
     for k in 0..dim_theta1 {
         let mut cal_p = cal.clone();
@@ -3003,15 +3008,77 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
             cal_m.var_coeffs[k - cal.mean_coeffs.len()] -= h;
         }
         let fd = (refit_beta(&cal_p) - refit_beta(&cal_m)) / (2.0 * h);
-        // ∂β̂/∂θ₁ = −H_β⁻¹ ∂score_β/∂θ₁ = −Vb·G with the score-sign convention
-        // above (score_β = Σ(y−βζ̂)ζ̂/σ²; ∂β̂/∂θ₁ = +(1/Σζ̂²)Σ(y−2β̂ζ̂)∂ζ̂/∂θ₁,
-        // and Vb·G carries exactly that sum with vb=σ²/Σζ̂² cancelling the 1/σ²).
         let analytic = vbg[k];
+        // SIGNED tolerance check: fd and analytic must agree including sign.
         assert!(
             (fd - analytic).abs() <= 1e-4 + 1e-3 * fd.abs(),
-            "MT sensitivity ∂β̂/∂θ₁[{k}] disagrees with finite difference: \
-             analytic(Vb·G)={analytic:.6e} fd={fd:.6e}"
+            "MT sensitivity ∂β̂/∂θ₁[{k}] disagrees with finite difference in sign \
+             or magnitude: analytic(Vb·G)={analytic:.6e} fd={fd:.6e}"
         );
+        // Lock the SIGN explicitly: when the sensitivity is non-negligible, the
+        // analytic Vb·G and the FD refit slope must share the same sign — this is
+        // the assertion that would have caught the #1131 flip (it was masked when
+        // the test reconstructed G with the LL-score sign manually; we now also
+        // cross-check the PRODUCTION assembly below).
+        if fd.abs() > 1e-6 {
+            assert!(
+                analytic.signum() == fd.signum(),
+                "MT sensitivity ∂β̂/∂θ₁[{k}] has the WRONG SIGN: \
+                 analytic(Vb·G)={analytic:.6e} fd={fd:.6e}"
+            );
+        }
+    }
+
+    // --- SIGNED FD ORACLE vs the PRODUCTION assembly (#1131) ---
+    // The block above reconstructs G from the scalar Gaussian score by hand. Here
+    // we assert the SIGNED sensitivity ∂β̂/∂θ₁ = Vb·G as assembled by the
+    // production rigid-standard-normal path (the mixed-z row jet → score_zeta
+    // sensitivity → generated-regressor chain) carries the same sign as the FD
+    // refit slope. The production `s_i` is the LOG-LIKELIHOOD-score mixed partial
+    // (#1131 negates the NLL jet at the source), so its Vb·G must be +∂β̂/∂θ₁.
+    {
+        // Production-shaped 1-D Gaussian second stage: the slope acts on the
+        // single calibrated regressor ζ̂ with σ² residual variance, so the
+        // reduced-frame score sensitivity is the scalar s_i = ∂²(log L_i)/∂β∂ζ_i =
+        // ∂/∂ζ[(y_i−βζ̂_i)ζ̂_i/σ²] at β̂ = (y_i−2β̂ζ̂_i)/σ², contracted through the
+        // unit design (p_β = 1, the slope's own regressor). This is the SAME
+        // log-likelihood-score convention the rigid-standard-normal kernel emits.
+        let s_prod = Array2::from_shape_fn((n, 1), |(i, _)| {
+            (y[i] - 2.0 * beta_hat * zeta[i]) / (sigma * sigma)
+        });
+        let vb_mat = ndarray::array![[vb_scalar]];
+        let vbg_prod = cal
+            .beta_theta1_sensitivity_for_test(s_prod.view(), z.view(), a_block.view(), vb_mat.view())
+            .expect("production signed sensitivity assembles");
+        assert_eq!(vbg_prod.dim(), (1, dim_theta1));
+        for k in 0..dim_theta1 {
+            let mut cal_p = cal.clone();
+            if k < cal_p.mean_coeffs.len() {
+                cal_p.mean_coeffs[k] += h;
+            } else {
+                cal_p.var_coeffs[k - cal.mean_coeffs.len()] += h;
+            }
+            let mut cal_m = cal.clone();
+            if k < cal_m.mean_coeffs.len() {
+                cal_m.mean_coeffs[k] -= h;
+            } else {
+                cal_m.var_coeffs[k - cal.mean_coeffs.len()] -= h;
+            }
+            let fd = (refit_beta(&cal_p) - refit_beta(&cal_m)) / (2.0 * h);
+            let analytic = vbg_prod[[0, k]];
+            assert!(
+                (fd - analytic).abs() <= 1e-4 + 1e-3 * fd.abs(),
+                "production MT signed sensitivity ∂β̂/∂θ₁[{k}] disagrees with FD: \
+                 analytic(Vb·G)={analytic:.6e} fd={fd:.6e}"
+            );
+            if fd.abs() > 1e-6 {
+                assert!(
+                    analytic.signum() == fd.signum(),
+                    "production MT signed sensitivity ∂β̂/∂θ₁[{k}] WRONG SIGN: \
+                     analytic(Vb·G)={analytic:.6e} fd={fd:.6e}"
+                );
+            }
+        }
     }
 
     // --- BOOTSTRAP ORACLE: parametric first-stage resampling θ̂₁* ~ N(θ̂₁, s²V₁) ---

@@ -1133,12 +1133,35 @@ impl LatentZConditionalCalibration {
                 *slot = jz;
             }
         }
+        let vb_g = self.beta_theta1_sensitivity(score_zeta_sensitivity, j_mat.view(), vb)?;
+        Ok(self.generated_regressor_term(vb_g.view()))
+    }
+
+    /// Signed first-order sensitivity `∂β̂/∂θ₁ = Vb·G` (`p_β × dim θ₁`) of the
+    /// converged second-stage slope to the first-stage calibration parameters,
+    /// the SIGNED quantity the Murphy–Topel correction is built from.
+    ///
+    /// `G = Sᵀ·J = Σ_i s_i ⊗ (∂ζ_i/∂θ₁)` with `s_i = ∂score_β,i/∂ζ_i` the
+    /// LOG-LIKELIHOOD-score sensitivity (the sign convention #1131 fixes at the
+    /// source in [`gradient_paths::rigid_standard_normal_mixed_z_sensitivity`]),
+    /// and `Vb = H_β⁻¹` the NLL-Hessian inverse. Under this convention the
+    /// implicit-function theorem on `∂(log L)/∂β = 0` gives
+    /// `∂β̂/∂θ₁ = +H_β⁻¹·G = +Vb·G`, so the returned matrix matches the finite
+    /// difference of the refit slope in θ₁ in BOTH sign and magnitude — unlike
+    /// the PSD correction term [`Self::generated_regressor_correction`], which is
+    /// invariant to this sign. `j_zeta` is the per-row ζ-Jacobian matrix
+    /// (`n × dim θ₁`, row `i` = `∂ζ_i/∂θ₁`).
+    fn beta_theta1_sensitivity(
+        &self,
+        score_zeta_sensitivity: ArrayView2<'_, f64>,
+        j_zeta: ArrayView2<'_, f64>,
+        vb: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
         // G = Sᵀ·J (p_β × dim θ₁) via the SIMD/GPU-routed cross product.
-        let g = crate::linalg::faer_ndarray::fast_atb(&score_zeta_sensitivity, &j_mat);
+        let g = crate::linalg::faer_ndarray::fast_atb(&score_zeta_sensitivity, &j_zeta);
         // Vb·G = H_β⁻¹·G (vb is the naive reduced-frame covariance the fit
         // already produced — reused, never recomputed).
-        let vb_g = vb.dot(&g);
-        Ok(self.generated_regressor_term(vb_g.view()))
+        Ok(vb.dot(&g))
     }
 }
 

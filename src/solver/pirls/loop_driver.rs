@@ -10,7 +10,7 @@
 //! - The two GPU dispatch blocks (Stage 3.3) that call into
 //!   `crate::solver::gpu::pirls_dispatch_wire`.
 
-use super::gpu_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
+use crate::solver::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
 use super::{
     // state re-exports
     AdaptiveKktTolerance,
@@ -1987,7 +1987,7 @@ pub(super) fn assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) 
 }
 
 /// Build a DesignMatrix wrapping a lazy ReparamOperator (or the original for sparse-native).
-pub(super) fn make_reparam_operator(
+pub(crate) fn make_reparam_operator(
     x_original: &DesignMatrix,
     qs_arc: &Arc<Array2<f64>>,
     use_sparse_native: bool,

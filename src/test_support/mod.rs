@@ -1,6 +1,7 @@
 //! Generic testing utilities.
 
 pub mod cli_harness;
+pub mod fd_checker;
 pub mod reference;
 
 use crate::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};

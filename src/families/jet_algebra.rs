@@ -104,12 +104,9 @@ where
     total
 }
 
-/// Number of differentiation orders the kernel supports (value + 4 derivs).
-pub(crate) const MAX_ORDER: usize = 4;
-
 /// A tiny inline stack of slot indices — no heap traffic on the hot per-row
-/// path. Capacity is `MAX_ORDER` (the deepest tower) plus headroom for the
-/// directional jet's eight-bit masks.
+/// path. Capacity (8) covers the deepest tower (order 4) and the directional
+/// jet's eight-bit masks.
 #[derive(Clone, Copy)]
 pub(crate) struct SlotBuf {
     data: [usize; 8],
@@ -132,6 +129,13 @@ impl SlotBuf {
     fn push(&mut self, v: usize) {
         self.data[self.len] = v;
         self.len += 1;
+    }
+    /// Append a slot index. Public to the crate so other jet layouts (the
+    /// bitmask [`super::jet_partitions`]) can build a slot list to hand the
+    /// shared walkers.
+    #[inline]
+    pub(crate) fn push_slot(&mut self, v: usize) {
+        self.push(v);
     }
     #[inline]
     pub(crate) fn as_slice(&self) -> &[usize] {

@@ -507,12 +507,12 @@ impl SheafConsistencyPenalty {
         let mut q0 = vec![0.0_f64; n];
         for i in 0..n {
             // Splitmix-style scrambling of i: deterministic, dependency-free.
-            let mut z = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            z ^= z >> 30;
-            z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z ^= z >> 27;
-            z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
+            // The canonical stateful step adds G internally, so seed it with
+            // `i·G − G` to finalize the same `i·G` input and stay bit-identical.
+            let mut state = (i as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_sub(0x9E37_79B9_7F4A_7C15);
+            let z = crate::linalg::utils::splitmix64(&mut state);
             q0[i] = (z as f64 / u64::MAX as f64) - 0.5;
         }
         match symmetric_lanczos_eigenpairs(

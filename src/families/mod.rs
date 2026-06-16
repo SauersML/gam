@@ -9,6 +9,7 @@ pub mod fnv;
 pub mod gamlss;
 pub mod identifiability;
 pub mod inverse_link;
+pub(crate) mod jet_algebra;
 pub(crate) mod jet_partitions;
 pub mod jet_tower;
 pub mod joint_penalty;

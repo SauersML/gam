@@ -123,17 +123,18 @@ impl MultiDirJet {
         MUL_CALLS.fetch_add(1, Ordering::Relaxed);
         let count = self.coeffs.len();
         let mut out = vec![0.0; count];
-        for mask in 0..count {
-            let mut total = 0.0;
-            let mut submask = mask;
-            loop {
-                total += self.coeffs[submask] * other.coeffs[mask ^ submask];
-                if submask == 0 {
-                    break;
-                }
-                submask = (submask - 1) & mask;
-            }
-            out[mask] = total;
+        for (mask, slot) in out.iter_mut().enumerate() {
+            // The differentiation slots of coefficient `mask` are its set bits;
+            // the shared Leibniz walker sums over subsets of those bits. A
+            // slot-group (list of bit positions) maps back to a sub-mask, the
+            // same submask enumeration the hand loop used — now one kernel
+            // shared with `Tower4::mul` (#1151).
+            let bits = bit_positions(mask);
+            *slot = super::jet_algebra::leibniz_product(
+                bits.as_slice(),
+                |t| self.coeffs[mask_of(t)],
+                |c| other.coeffs[mask_of(c)],
+            );
         }
         Self { coeffs: out }
     }
@@ -144,20 +145,34 @@ impl MultiDirJet {
         let mut out = vec![0.0; count];
         out[0] = derivs[0];
         for (mask, value) in out.iter_mut().enumerate().skip(1) {
-            let mut total = 0.0;
-            for partition in partitions(mask) {
-                let order = partition.len();
-                if order == 0 || order >= derivs.len() {
-                    continue;
-                }
-                let mut prod = 1.0;
-                for &block in partition {
-                    prod *= self.coeffs[block];
-                }
-                total += derivs[order] * prod;
-            }
-            *value = total;
+            // Set-partition the bits of `mask`; each block's bits select a
+            // sub-mask coefficient. Routed through the shared Faà di Bruno
+            // walker `Tower4::compose_unary` also uses (#1151).
+            let bits = bit_positions(mask);
+            *value = super::jet_algebra::faa_di_bruno(
+                bits.as_slice(),
+                &derivs,
+                |block| self.coeffs[mask_of(block)],
+            );
         }
         Self { coeffs: out }
     }
+}
+
+/// The set-bit positions of `mask`, low to high — the differentiation slots of
+/// that coefficient.
+fn bit_positions(mask: usize) -> super::jet_algebra::SlotBuf {
+    let mut out = super::jet_algebra::SlotBuf::new();
+    let mut m = mask;
+    while m != 0 {
+        let bit = m.trailing_zeros() as usize;
+        out.push_slot(bit);
+        m &= m - 1;
+    }
+    out
+}
+
+/// Combine a slot-group (list of bit positions) back into a sub-mask.
+fn mask_of(slots: &[usize]) -> usize {
+    slots.iter().fold(0usize, |acc, &b| acc | (1usize << b))
 }
