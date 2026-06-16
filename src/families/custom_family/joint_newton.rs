@@ -2516,6 +2516,41 @@ pub(crate) fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
     // trust-region/line-search already chooses the appropriate step size
     // within direction, this barrier check just enforces feasibility on
     // top of that direction.
+    let (joint_alpha, limiting_block) =
+        compute_joint_feasibility_alpha(family, states, ranges, trial_delta)?;
+    if joint_alpha < 1.0 {
+        trial_delta.mapv_inplace(|v| joint_alpha * v);
+        log::debug!(
+            "[PIRLS/joint-Newton] feasibility scaled joint step by α={:.3e} (block {:?} binding)",
+            joint_alpha,
+            limiting_block,
+        );
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Compute the joint fraction-to-boundary feasibility scalar `α ∈ (0, 1]` that
+/// [`apply_joint_feasibility_limit`] would apply to `trial_delta`, WITHOUT
+/// mutating the step. Returns `(α, limiting_block)`. `α = 1.0` means the step is
+/// fully feasible (no binding constraint); `α < 1.0` is the min over blocks of
+/// each block's `max_feasible_step_size`. Returns `Err` iff a block has no
+/// positive feasible step (current iterate infeasible / degenerate).
+///
+/// Split out (gam#979) so the constrained joint-Newton path can DETECT the
+/// pathological α-collapse — a binding monotonicity row at slack≈0 driving
+/// `α → 0`, which globally crushes the whole joint step and freezes β — and
+/// reroute feasibility through the magnitude-preserving cone projection in that
+/// case ONLY, while keeping the exact existing α-scaling behaviour whenever `α`
+/// is healthy. Every currently-converging arm sees byte-identical numerics off
+/// the pathology.
+pub(crate) fn compute_joint_feasibility_alpha<F: CustomFamily + ?Sized>(
+    family: &F,
+    states: &[ParameterBlockState],
+    ranges: &[(usize, usize)],
+    trial_delta: &Array1<f64>,
+) -> Result<(f64, Option<usize>), String> {
     let mut joint_alpha = 1.0_f64;
     let mut limiting_block: Option<usize> = None;
     for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
@@ -2532,18 +2567,19 @@ pub(crate) fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
             }
         }
     }
-    if joint_alpha < 1.0 {
-        trial_delta.mapv_inplace(|v| joint_alpha * v);
-        log::debug!(
-            "[PIRLS/joint-Newton] feasibility scaled joint step by α={:.3e} (block {:?} binding)",
-            joint_alpha,
-            limiting_block,
-        );
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    Ok((joint_alpha, limiting_block))
 }
+
+/// Below this joint fraction-to-boundary `α`, scaling the WHOLE joint step by
+/// `α` crushes it so severely that β is effectively frozen for the cycle (the
+/// gam#979 survival hang: `α ≈ 1e-4` on a binding monotone time-derivative row
+/// reduced the step to noise while a huge time-block gradient persisted). At or
+/// above it the step retains enough magnitude that the existing α-scaling is a
+/// healthy globalization, so the constrained path keeps the legacy behaviour
+/// unchanged. The threshold is deliberately small (`1e-2`): a step scaled by
+/// `≥ 1%` still makes real progress, whereas the pathology drives `α` five-plus
+/// orders below it.
+pub(crate) const JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD: f64 = 1.0e-2;
 
 pub(crate) fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
     residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol

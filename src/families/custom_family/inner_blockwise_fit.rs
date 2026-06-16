@@ -1888,6 +1888,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // or after the preconditioned-descent fallback replaced
                 // `search_delta`) fall back to box-truncating the search step.
                 let mut trial_delta;
+                // gam#979: set when the constrained-QP candidate is taken
+                // untruncated because the global α-crush would otherwise collapse
+                // a feasible, within-trust QP step (see the gated bypass below).
+                let mut qp_feasible_bypass = false;
                 let mut block_step_norms = if let Some(spectrum) = joint_spectrum.as_ref() {
                     // Exact Moré–Sorensen trust-region step at the current radius
                     // (gam#979). The step already lies in the `D`-metric ball, so
@@ -1917,47 +1921,94 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         &mut trial_delta,
                     )
                 } else {
-                    trial_delta = search_delta.clone();
-                    truncate_joint_step_to_block_metric_radii(
-                        &mut trial_delta,
+                    // Box-truncation branch — taken on the CONSTRAINED-QP path
+                    // (search_joint_active_set is Some, so no spectrum / dogleg).
+                    // `search_delta` is the active-set QP's Newton step, FEASIBLE
+                    // by construction.
+                    //
+                    // gam#979 GATED QP-FEASIBILITY BYPASS. The default behaviour
+                    // box-truncates this feasible QP step per-block (which can push
+                    // it off the monotone cone face) and then the global
+                    // fraction-to-boundary α-crush scales the whole joint step by a
+                    // single α; on a binding monotonicity row at slack≈0 that α
+                    // collapses to ~1e-4, freezing β and hanging the inner solve.
+                    //
+                    // Bypass that ONLY when the observable pathology is present —
+                    // never on a healthy step — so every currently-converging arm
+                    // (binary BMS score-warp monotonicity especially) is byte-
+                    // identical. The three gate conditions:
+                    //   (i)   the candidate came from the constrained QP
+                    //         (search_joint_active_set.is_some()),
+                    //   (ii)  the QP step is already within the joint trust region
+                    //         (step_norm ≤ joint_trust_radius), so truncation is
+                    //         not needed for globalization, AND
+                    //   (iii) the α the legacy path WOULD apply is below the crush
+                    //         threshold (it would gut the step).
+                    // When all hold, take the untruncated QP step and let the
+                    // magnitude-preserving cone projection below enforce
+                    // feasibility. Otherwise truncate exactly as before.
+                    let qp_norms = joint_trust_region_block_metric_norms(
+                        &search_delta,
                         &ranges,
                         &joint_trust_metric_diag,
-                        &joint_block_trust_radii,
-                    )
+                    );
+                    let qp_step_norm = qp_norms.iter().copied().fold(0.0_f64, f64::max);
+                    let within_trust = qp_step_norm.is_finite()
+                        && joint_trust_radius.is_finite()
+                        && qp_step_norm <= joint_trust_radius;
+                    let alpha_would_crush = if search_joint_active_set.is_some() && within_trust {
+                        match compute_joint_feasibility_alpha(
+                            family,
+                            &states,
+                            &ranges,
+                            &search_delta,
+                        ) {
+                            Ok((alpha, _)) => alpha < JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD,
+                            // Err = current iterate infeasible / no positive step;
+                            // fall back to the legacy truncate + α path, which will
+                            // surface the same Err and shrink the radius.
+                            Err(_) => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if search_joint_active_set.is_some() && within_trust && alpha_would_crush {
+                        qp_feasible_bypass = true;
+                        trial_delta = search_delta.clone();
+                        qp_norms
+                    } else {
+                        trial_delta = search_delta.clone();
+                        truncate_joint_step_to_block_metric_radii(
+                            &mut trial_delta,
+                            &ranges,
+                            &joint_trust_metric_diag,
+                            &joint_block_trust_radii,
+                        )
+                    }
                 };
-                // FEASIBILITY ENFORCEMENT — two mutually exclusive mechanisms
-                // (gam#979 survival flex non-convergence).
+                // FEASIBILITY ENFORCEMENT (gam#979 survival flex non-convergence).
                 //
-                // When the joint design carries assembled linear constraints
-                // (`joint_constraints.is_some()` — the survival monotone
-                // time-derivative cone `Aβ ≥ b`), the feasible trial step is
-                // produced by the magnitude-PRESERVING cone projection below
-                // (gam#1108): it projects the trust-region trial iterate onto the
-                // strictly-interior cone, keeping the unconstrained step
-                // components and only correcting the binding directions.
-                //
-                // The older `apply_joint_feasibility_limit` enforces feasibility
-                // by a single fraction-to-boundary scalar `α` applied to the
-                // WHOLE joint step. On a binding monotonicity row at slack≈0 with
+                // The global `apply_joint_feasibility_limit` enforces feasibility
+                // by a single fraction-to-boundary scalar `α` applied to the WHOLE
+                // joint step. On a binding monotonicity row at slack≈0 with
                 // negative drift, `α` collapses to ~1e-4, globally crushing the
                 // step so β moves ~1e-4/cycle while a huge time-block gradient
                 // (|g|≈720) persists: the objective drifts down ~50/cycle but the
-                // KKT residual never clears and the inner joint-Newton grinds the
-                // full cycle budget, then the seed is rejected — the survival
-                // marginal-slope hang. The α-crush also PREEMPTS the good cone
-                // projection: by globally shrinking the step it makes the trial
-                // iterate feasible, so the `check_linear_feasibility` gate below
-                // passes and the projection is skipped.
+                // KKT residual never clears, the inner joint-Newton grinds the full
+                // cycle budget, and the seed is rejected — the survival
+                // marginal-slope hang.
                 //
-                // So on the constrained path we DO NOT run the global α-crush at
-                // all — feasibility is fully handled by the cone projection, which
-                // preserves the constrained Newton step's fast convergence. The
-                // α-crush is retained ONLY for families that supply per-block
-                // `max_feasible_step_size` WITHOUT assembling joint linear
-                // constraints (`joint_constraints.is_none()`), where the cone
-                // projection has nothing to project against; there its `Err`
-                // (current iterate infeasible) still triggers a radius shrink.
-                if joint_constraints.is_none()
+                // When the gated bypass above fired (`qp_feasible_bypass`), the
+                // pathology is present (constrained-QP candidate, within trust, α
+                // below the crush threshold): SKIP the α-crush and let the
+                // magnitude-preserving cone projection below enforce feasibility,
+                // which keeps the unconstrained step components and only corrects
+                // the binding directions. Off the pathology the α-crush runs
+                // exactly as before — a no-op when `α = 1` (healthy), the legacy
+                // scaling when `α ∈ [threshold, 1)` — so every converging arm is
+                // byte-identical. The α-crush `Err` (current iterate infeasible /
+                // no positive step) still triggers a radius shrink + retry.
+                if !qp_feasible_bypass
                     && apply_joint_feasibility_limit(family, &states, &ranges, &mut trial_delta)
                         .is_err()
                 {
@@ -1977,12 +2028,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // Project the trial iterate back onto the cone with the exact
                 // identity-Hessian active-set projection, preserving the trust
                 // step's fast convergence while guaranteeing every accepted iterate
-                // is feasible. This is now the SOLE feasibility mechanism on the
-                // constrained path (the global α-crush above is gated off there).
-                // No-op when the joint design is unconstrained or the trial is
-                // already feasible; `block_step_norms` is recomputed from the
-                // projected step just below so the trust-radius bookkeeping stays
-                // consistent.
+                // is feasible. This is the feasibility mechanism for the gated
+                // QP-bypass case (gam#979, where the α-crush is skipped) and the
+                // safety net for any truncation-induced infeasibility on the
+                // constrained path. No-op when the joint design is unconstrained or
+                // the trial is already feasible (the common case — including a
+                // bypassed QP step, which is feasible by construction);
+                // `block_step_norms` is recomputed from the projected step just
+                // below so the trust-radius bookkeeping stays consistent.
                 if let Some(constraints) = joint_constraints.as_ref() {
                     let trial_beta = &beta_joint + &trial_delta;
                     if check_linear_feasibility(&trial_beta, constraints, 1e-8).is_err() {
