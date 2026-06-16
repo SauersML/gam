@@ -3321,6 +3321,18 @@ impl<'a> RemlState<'a> {
         eval
     }
 
+    /// Emit the configured ρ-prior as a criterion atom after every REML/LAML
+    /// prior policy has been applied. Callers project cost, gradient, and
+    /// Hessian from this one object instead of making separate evaluator calls.
+    pub(crate) fn configured_rho_prior_atom(
+        &self,
+        rho: &Array1<f64>,
+    ) -> super::atoms::ConfiguredRhoPriorAtom {
+        super::atoms::ConfiguredRhoPriorAtom {
+            eval: self.evaluate_configured_rho_prior(rho),
+        }
+    }
+
     /// Resolve the *effective* outer prior on the log-precision ρ, applying the
     /// (unconditional) firth-general default-hyperprior policy.
     ///
@@ -3478,21 +3490,6 @@ impl<'a> RemlState<'a> {
             }
         }
         if count == 0 { 0.0 } else { sum / count as f64 }
-    }
-
-    pub(crate) fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
-        self.evaluate_configured_rho_prior(rho).cost
-    }
-
-    pub(crate) fn compute_configured_rho_prior_grad(&self, rho: &Array1<f64>) -> Array1<f64> {
-        self.evaluate_configured_rho_prior(rho).gradient
-    }
-
-    pub(crate) fn compute_configured_rho_prior_hess(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Option<Array2<f64>> {
-        self.evaluate_configured_rho_prior(rho).hessian
     }
 
     /// Returns the effective Hessian and the ridge value used (if any).

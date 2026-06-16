@@ -93,9 +93,10 @@ impl<'a> RemlState<'a> {
         // optimizer will reject this step — evaluate it first and return `+∞`
         // without paying for the inner P-IRLS solve or the log-determinant
         // assembly. This is exact, not an approximation: it reproduces the value
-        // the full path would return (`build_prior` adds the identical
-        // `compute_soft_priorcost(ρ) + compute_configured_rho_prior_cost(ρ)`).
-        let prior_cost = self.compute_soft_priorcost(p) + self.compute_configured_rho_prior_cost(p);
+        // the full path would return (`build_prior` projects the identical
+        // configured-prior cost from `ConfiguredRhoPriorAtom` and adds the soft
+        // guard prior).
+        let prior_cost = self.compute_soft_priorcost(p) + self.configured_rho_prior_atom(p).cost();
         if !prior_cost.is_finite() {
             log::debug!(
                 "[REML] eval#{} prior short-circuit | prior_cost {:.6e} | rejecting step \
@@ -1985,25 +1986,27 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         mode: super::reml_outer_engine::EvalMode,
     ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
-        super::assembly::soft_prior_for_mode(
-            rho,
-            mode,
-            |r| self.compute_soft_priorcost(r) + self.compute_configured_rho_prior_cost(r),
-            |r| self.compute_soft_priorgrad(r) + &self.compute_configured_rho_prior_grad(r),
-            |r| {
-                let mut hess = self
-                    .compute_soft_priorhess(r)
-                    .unwrap_or_else(|| Array2::<f64>::zeros((r.len(), r.len())));
-                if let Some(configured) = self.compute_configured_rho_prior_hess(r) {
-                    hess += &configured;
-                }
-                if hess.iter().any(|&v| v != 0.0) {
-                    Some(hess)
-                } else {
-                    None
-                }
-            },
-        )
+        let configured = self.configured_rho_prior_atom(rho);
+        let cost = self.compute_soft_priorcost(rho) + configured.cost();
+        if mode == super::reml_outer_engine::EvalMode::ValueOnly {
+            return (cost.abs() > 0.0).then(|| (cost, Array1::zeros(rho.len()), None));
+        }
+
+        let gradient = self.compute_soft_priorgrad(rho) + configured.gradient();
+        let hessian = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
+            let mut hess = self
+                .compute_soft_priorhess(rho)
+                .unwrap_or_else(|| Array2::<f64>::zeros((rho.len(), rho.len())));
+            if let Some(configured_hess) = configured.hessian() {
+                hess += configured_hess;
+            }
+            hess.iter().any(|&v| v != 0.0).then_some(hess)
+        } else {
+            None
+        };
+
+        (cost.abs() > 0.0 || gradient.iter().any(|&v| v != 0.0))
+            .then_some((cost, gradient, hessian))
     }
 
     /// Single assembly point: evaluate an `InnerAssembly`, compute prior, and

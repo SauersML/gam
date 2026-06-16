@@ -466,50 +466,6 @@ pub fn penalty_coords_from_blocks(
         .collect()
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Soft prior helper
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Compute the soft rho prior tuple for a given evaluation mode.
-///
-/// Extracts the repeated prior-assembly pattern that was copy-pasted 4×
-/// in `runtime.rs`. The caller provides cost/gradient/hessian via closures
-/// (typically `self.compute_soft_priorcost/grad/hess`).
-pub fn soft_prior_for_mode<F, G, H>(
-    rho: &Array1<f64>,
-    mode: EvalMode,
-    cost_fn: F,
-    grad_fn: G,
-    hess_fn: H,
-) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)>
-where
-    F: Fn(&Array1<f64>) -> f64,
-    G: Fn(&Array1<f64>) -> Array1<f64>,
-    H: Fn(&Array1<f64>) -> Option<Array2<f64>>,
-{
-    if mode == EvalMode::ValueOnly {
-        let pc = cost_fn(rho);
-        if pc.abs() > 0.0 {
-            Some((pc, Array1::zeros(rho.len()), None))
-        } else {
-            None
-        }
-    } else {
-        let pc = cost_fn(rho);
-        let pg = grad_fn(rho);
-        let ph = if mode == EvalMode::ValueGradientHessian {
-            hess_fn(rho)
-        } else {
-            None
-        };
-        if pc.abs() > 0.0 || pg.iter().any(|&v| v != 0.0) {
-            Some((pc, pg, ph))
-        } else {
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

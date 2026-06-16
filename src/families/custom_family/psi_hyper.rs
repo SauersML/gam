@@ -297,13 +297,15 @@ pub(crate) fn build_contracted_psi_hook(
         };
         if terms.objective.len() != psi_dim
             || terms.score.nrows() != psi_dim
+            || terms.score.ncols() != total
             || terms.hessian.len() != psi_dim
         {
             return Err(format!(
                 "contracted ψψ hook basis probe shape mismatch at axis {axis_idx}: \
-                 objective={}, score_rows={}, hessian={}, psi_dim={psi_dim}",
+                 objective={}, score={}x{}, hessian={}, psi_dim={psi_dim}, beta_dim={total}",
                 terms.objective.len(),
                 terms.score.nrows(),
+                terms.score.ncols(),
                 terms.hessian.len(),
             ));
         }
@@ -319,8 +321,9 @@ pub(crate) fn build_contracted_psi_hook(
             ));
         }
         // Family likelihood ψψ contraction (one combined-direction row pass).
-        // Declining here (e.g. a σ-aux axis carried weight) declines the whole
-        // hook so the operator builder keeps the per-pair assembly.
+        // The basis-axis probe above rejects partial kernels before the operator
+        // skips per-pair ψψ tables; a decline here means the workspace violated
+        // that coverage contract for a combined direction.
         let Some(likelihood) = workspace.second_order_terms_contracted(alpha_psi)? else {
             return Ok(None);
         };
@@ -330,11 +333,16 @@ pub(crate) fn build_contracted_psi_hook(
         // Per-output-row penalty drift `Σ_j α_j S_{ψi ψj}` (block-local),
         // composed onto the likelihood `hessian[i]` operator below.
         let mut hessian: Vec<DriftDerivResult> = likelihood.hessian;
-        if objective.len() != psi_dim || score.nrows() != psi_dim || hessian.len() != psi_dim {
+        if objective.len() != psi_dim
+            || score.nrows() != psi_dim
+            || score.ncols() != total
+            || hessian.len() != psi_dim
+        {
             return Err(format!(
-                "contracted ψψ hook: family kernel shape mismatch (objective={}, score_rows={}, hessian={}, psi_dim={psi_dim})",
+                "contracted ψψ hook: family kernel shape mismatch (objective={}, score={}x{}, hessian={}, psi_dim={psi_dim}, beta_dim={total})",
                 objective.len(),
                 score.nrows(),
+                score.ncols(),
                 hessian.len(),
             ));
         }

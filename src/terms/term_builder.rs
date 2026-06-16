@@ -1492,14 +1492,14 @@ pub(crate) fn resolve_smooth_type_name(
     // falls through to the scalar path below so the existing diagnostic fires.)
     if let Some(raw) = selector
         && bs_selector_is_vector(raw)
-        && matches!(kind, SmoothKind::Te | SmoothKind::Ti)
+        && matches!(kind, SmoothKind::Te | SmoothKind::Ti | SmoothKind::T2)
     {
         return "tensor".to_string();
     }
     selector
         .map(|s| canonicalize_smooth_type(&s.to_ascii_lowercase()).to_string())
         .unwrap_or_else(|| match kind {
-            SmoothKind::Te | SmoothKind::Ti => "tensor".to_string(),
+            SmoothKind::Te | SmoothKind::Ti | SmoothKind::T2 => "tensor".to_string(),
             SmoothKind::S if n_cols == 1 => "bspline".to_string(),
             // Mixed periodic Euclidean radial kernels are not separable on the
             // cylinder. Use a tensor product with a cyclic margin so s(theta,h)

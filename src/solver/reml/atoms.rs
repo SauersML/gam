@@ -712,6 +712,56 @@ impl CriterionAtom for JeffreysLogdetAtom {
     }
 }
 
+/// Atom 6 (ledger item "TK/Jeffreys/prior atoms"): the configured
+/// smoothing-parameter prior over packed `ρ` coordinates.
+///
+/// This is a θ-only atom: it has no dependence on the inner mode `β̂`, so its
+/// β-channel is `None` and it declares no smoothness stratum. Its internal state
+/// is the single [`RhoPriorEval`](super::rho_prior_eval::RhoPriorEval) emitted by
+/// the shared prior evaluator after all REML/LAML policies have been applied
+/// (weight anchoring, Saturate invalid-prior handling, and the Firth-default
+/// self-gated barrier). The objective assembly reads value, first derivative,
+/// and diagonal Hessian from this same object, so configured-prior cost and
+/// gradient can no longer come from separate wrapper calls.
+pub struct ConfiguredRhoPriorAtom {
+    pub eval: super::rho_prior_eval::RhoPriorEval,
+}
+
+impl ConfiguredRhoPriorAtom {
+    pub fn cost(&self) -> f64 {
+        self.eval.cost
+    }
+
+    pub fn gradient(&self) -> &Array1<f64> {
+        &self.eval.gradient
+    }
+
+    pub fn hessian(&self) -> Option<&Array2<f64>> {
+        self.eval.hessian.as_ref()
+    }
+}
+
+impl CriterionAtom for ConfiguredRhoPriorAtom {
+    fn name(&self) -> &'static str {
+        "configured_rho_prior"
+    }
+    fn value(&self) -> f64 {
+        self.cost()
+    }
+    fn frozen_d1(&self, dir: &ThetaDirection) -> f64 {
+        match dir.index {
+            Some(idx) if idx < self.eval.gradient.len() => self.eval.gradient[idx],
+            _ => 0.0,
+        }
+    }
+    fn beta_channel(&self) -> Option<BetaChannel> {
+        None
+    }
+    fn stratum(&self) -> Option<StratumFingerprint> {
+        None
+    }
+}
+
 // Atom 2 in the migration order is `penalty_logdet.rs` itself — it already
 // satisfies the contract (one factorization → value + ρ/ψ/cross
 // derivatives) and needs only the trait impl plus the deletion of its
@@ -822,7 +872,18 @@ impl CriterionAtom for JeffreysLogdetAtom {
 // `jeffreys_logdet_atom_emits_consistent_value_and_directional_derivative`
 // asserts the closed-form value/frozen_d1, the relative-floor channel, and an
 // FD oracle `g'(λ) ≈ floored_inverse(λ)` across all four branches. TK and
-// Gaussian-prior atoms remain unported.
+// beta-Gaussian prior atoms remain unported.
+//
+// LANDED (pass 4b, configured-prior atom): `ConfiguredRhoPriorAtom` wraps the
+// shared `RhoPriorEval` after the REML/LAML policies are applied (configured
+// prior, Firth-default barrier replacement, invalid-prior saturation, and
+// weight anchoring). The live `RemlState::build_prior` path now constructs
+// this atom once per prior assembly and projects configured-prior cost,
+// gradient, and diagonal Hessian from that one emission; the old
+// `compute_configured_rho_prior_{cost,grad,hess}` wrappers and the generic
+// `soft_prior_for_mode` closure helper are deleted. The soft numerical guard
+// prior remains a separate local contribution for now; TK and beta-Gaussian
+// prior atoms remain unported.
 
 #[cfg(test)]
 mod tests {
@@ -1127,6 +1188,46 @@ mod tests {
             floor_atom.frozen_d1(&dir_floor),
             expected_floor_d1
         );
+    }
+
+    /// Configured-prior atom isolation check: value and frozen directional
+    /// derivative are projections of one `RhoPriorEval`, and the optional
+    /// Hessian exposed to `build_prior` is the same emission rather than a
+    /// second evaluator call.
+    #[test]
+    pub(crate) fn configured_rho_prior_atom_projects_one_eval() {
+        let atom = ConfiguredRhoPriorAtom {
+            eval: super::super::rho_prior_eval::RhoPriorEval {
+                cost: 1.25,
+                gradient: array![0.5, -1.5, 2.0],
+                hessian: Some(array![[3.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 5.0]]),
+            },
+        };
+        assert_eq!(atom.name(), "configured_rho_prior");
+        assert!((atom.value() - 1.25).abs() < 1e-12);
+        assert!(
+            atom.beta_channel().is_none(),
+            "rho prior is theta-only and declares no β-channel"
+        );
+        assert!(
+            atom.stratum().is_none(),
+            "rho prior is smooth on its configured-valid branch"
+        );
+
+        let dir1 = ThetaDirection {
+            index: Some(1),
+            beta_dot: None,
+            h_dot_total: None,
+        };
+        assert!((atom.frozen_d1(&dir1) - (-1.5)).abs() < 1e-12);
+        let dir_absent = ThetaDirection {
+            index: Some(9),
+            beta_dot: None,
+            h_dot_total: None,
+        };
+        assert!(atom.frozen_d1(&dir_absent).abs() < 1e-12);
+        assert_eq!(atom.gradient(), &array![0.5, -1.5, 2.0]);
+        assert_eq!(atom.hessian().expect("configured Hessian")[[2, 2]], 5.0);
     }
 
     /// The #935 operator pass, end-to-end: [`Sensitivity::fill_direction`]
