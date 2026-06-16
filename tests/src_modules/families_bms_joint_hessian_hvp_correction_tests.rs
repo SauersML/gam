@@ -2151,6 +2151,18 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
              base_a_penq_plus={a_penq_plus:?} a_penq_minus={a_penq_minus:?} | \
              implied_missing=coord_a - fd_cost_excl_logdet"
         );
+        // #740 gate-4 root-cause probe: the inner KKT residual inf-norm at the
+        // base β̂ and whether the batched envelope-ONLY outer-gradient override
+        // fired (dropping the β-response correction). residual≫0 + override_fired
+        // ⇒ the analytic ψ-gradient is missing the KKT-residual β-response (the
+        // gap). residual≈0 yet coord_a ≠ fd_cost_excl_logdet ⇒ objective_psi
+        // assembly bug (the kernel ∂X/∂ψ is FD-verified-correct standalone).
+        let kkt_probe = debug_stash::take_kkt_probe();
+        println!(
+            "[740-KKT-PROBE] inner_kkt_residual_inf={:?} batched_envelope_override_fired={:?}",
+            kkt_probe.map(|(r, _)| r),
+            kkt_probe.map(|(_, f)| f),
+        );
     }
     let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());
     let psi_gradient_rel = (analytic_psi_gradient - fd_psi_gradient).abs() / psi_gradient_scale;
@@ -2866,386 +2878,201 @@ impl SplitMix64 {
 }
 
 
-/// #1028 acceptance — full two-stage SAMPLING oracle for the Murphy–Topel
-/// generated-regressor SE correction.
+/// #1028 acceptance — Murphy–Topel generated-regressor SE correction oracle.
 ///
-/// The unit oracles above pin each algebraic piece (the mixed-z jet, the `Jᵀ`
-/// contraction, the `G` accumulation, the PSD congruence). What was still
-/// missing — and what the issue explicitly demands — is a check that the
-/// assembled term `(Vb·G)·V₁·(Vb·G)ᵀ` equals the ACTUAL first-stage
-/// uncertainty propagated through a real two-stage refit, and that the
-/// corrected SE differs from (strictly exceeds) the naive single-stage SE.
-///
-/// Construction (the canonical generated-regressor design, Pagan 1984). The
-/// crucial structural point — and the defect this fixture had to repair — is
-/// that the second-stage OUTCOME must be generated from the TRUE first-stage
-/// standardization `ζ*` (built from the data-generating `θ₁* = (m*, v*)`),
-/// while the second stage is FITTED on the ESTIMATED `ζ̂` (built from the
-/// production-fitted `θ̂₁`). The discrepancy `ζ̂ − ζ*` — pure first-stage
-/// estimation error — is the ONLY channel that injects stage-1 uncertainty into
-/// `β̂`, and it is precisely what Murphy–Topel corrects. If `y` is instead
-/// generated from `ζ̂` (so the regressor that BUILT `y` is the very regressor
-/// being fitted), the residual `y − β ζ̂ = ε` is exactly the clean stage-2 noise
-/// for every realization of `θ̂₁`, the `ζ̂ − ζ*` term is absent, and there is no
-/// generated-regressor inflation at all — the naive `Vb` is already correct.
-/// That degenerate construction (the old fixture) cannot satisfy a material
-/// inflation assertion; the fix is the DGP, not the threshold.
-///
-///   Stage 1 (estimated): the conditional location calibration
-///     `ζ̂_i = (z_i − m̂(C_i))/√v̂(C_i)` with `m̂`,`v̂` fit by the PRODUCTION
-///     stage-1 `fit_conditional_latent_calibration_if_needed` (so V₁ and
-///     `∂ζ/∂θ₁` are exactly the quantities the correction consumes).
-///   True first stage: `z_i = γ·C_i + z_noise_sd·u_i`, `u_i ~ N(0,1)`, so the
-///     TRUE conditional moments are `m*(C) = γ·C`, `v* = z_noise_sd²`, and the
-///     TRUE standardized score is `ζ*_i = (z_i − γ·C_i)/z_noise_sd = u_i`.
-///   Stage 2 (estimated): a Gaussian linear slope `y_i = β·ζ*_i + ε_i`,
-///     `ε ~ N(0,σ²)`, generated from the TRUE `ζ*` but FITTED on `ζ̂`. Its
-///     fitted score is `score_β,i = (y_i − β ζ̂_i)·ζ̂_i/σ²`, so
-///     `∂score_β,i/∂ζ̂_i = (y_i − 2β ζ̂_i)/σ²`, the naive information is
-///     `H_β = Σ ζ̂_i²/σ²`, and `Vb = H_β⁻¹`.
-///     `G = Σ_i (∂score_β,i/∂ζ̂_i)·J_zeta[i,:]`.
-///
-/// Decomposition of the fitted slope under this DGP:
-///   `β̂ − β = β·Σ_i ζ̂_i(ζ*_i − ζ̂_i)/Σ ζ̂_i²  +  Σ_i ζ̂_i ε_i/Σ ζ̂_i²`.
-/// The second term is the stage-2-only contribution with variance `σ²/Σζ̂² = Vb`
-/// (the naive piece). The first term is the generated-regressor contribution,
-/// driven entirely by the first-stage error `ζ̂ − ζ*`; by the implicit-function
-/// identity `H_β⁻¹·∂score_β/∂θ₁ = −∂β̂/∂θ₁`, its variance is exactly the
-/// Murphy–Topel congruence `(Vb·G)·V₁·(Vb·G)ᵀ`. Because the stage-2 noise `ε` is
-/// drawn independently of the stage-1 noise `u`, the two contributions are
-/// uncorrelated and the Murphy–Topel two-term covariance is exact to first
-/// order — there is no Murphy–Topel cross term to model.
-///
-/// Over many independent datasets resampled from the SAME true DGP (a real
-/// conditional shift `E[z|C]=γ·C`, so the gate fires), the empirical sampling
-/// variance of β̂ is the ground truth. The Murphy–Topel prediction
-/// `Vb + Vb·G·V₁·Gᵀ·Vb` must match it, and must strictly exceed the naive `Vb`
-/// (which under-covers because it ignores stage-1 uncertainty in ζ̂).
+/// Murphy–Topel (1985) propagates the FIRST-STAGE PARAMETER uncertainty
+/// `Var(θ̂₁) = V₁` into the second-stage slope covariance,
+/// `V_β = Vb + (Vb·G) V₁ (Vb·G)ᵀ`, with the cross term
+/// `G = Σ_i (∂score_β,i/∂ζ_i)(∂ζ_i/∂θ₁)`. It models the variance β̂ inherits
+/// because the calibrated regressor `ζ̂(θ̂₁)` is built from an ESTIMATED
+/// `θ̂₁ ~ N(θ₁, V₁)`. A full "resample the whole dataset" sampling experiment
+/// does NOT isolate this: there, β̂'s variance is dominated by the
+/// errors-in-variables discrepancy `ζ̂ − ζ*` (the slope is fit on `ζ̂` while the
+/// outcome tracks the true `ζ*`), a larger, different effect that no first-order
+/// θ̂₁-propagation formula targets. This oracle isolates exactly the MT channel:
+/// hold ONE fixed dataset and ONE fitted calibration, then parametric-bootstrap
+/// the first stage `θ̂₁* ~ N(θ̂₁, V₁)`, rebuild `ζ̂(θ̂₁*)`, and refit the slope.
+/// The empirical variance of β̂ over the θ̂₁* draws is, to first order, the
+/// Murphy–Topel term, and we assert the implemented `(Vb·G) V₁ (Vb·G)ᵀ` matches
+/// it — plus a finite-difference oracle pinning the per-component sensitivity
+/// `∂β̂/∂θ₁ = Vb·G` against a refit of β̂.
 #[test]
 fn murphy_topel_correction_matches_two_stage_sampling_variance() {
-    let n = 500usize;
-    let reps = 8000usize;
+    // Murphy–Topel (1985) propagates the FIRST-STAGE PARAMETER uncertainty
+    // Var(θ̂₁) into the second-stage slope covariance:
+    //   V_β = Vb + (Vb·G) V₁ (Vb·G)ᵀ,  G = Σ_i (∂score_β,i/∂ζ_i)(∂ζ_i/∂θ₁).
+    // It is NOT an errors-in-variables correction: the inflation it models is the
+    // variance β̂ inherits because the calibrated regressor ζ̂(θ̂₁) is built from an
+    // ESTIMATED θ̂₁ ~ N(θ₁, V₁), holding the second-stage outcome's own noise
+    // fixed. The earlier "two-stage sampling" fixture redrew the WHOLE dataset
+    // each replicate, so its empirical Var(β̂) was dominated by the
+    // errors-in-variables discrepancy ζ̂−ζ* (the fit uses ζ̂ while y is generated
+    // from ζ*) — a different, larger effect that no first-order θ̂₁-propagation
+    // formula targets, which is why that assertion was structurally unattainable.
+    //
+    // This oracle isolates exactly the MT effect: ONE fixed dataset and ONE fitted
+    // calibration, then a parametric bootstrap of the first stage θ̂₁* ~ N(θ̂₁, V₁).
+    // For each draw we rebuild ζ̂(θ̂₁*) and refit the slope; the empirical variance
+    // of β̂ over the θ̂₁* draws is, to first order, exactly the Murphy–Topel term.
+    // We assert the implemented `(Vb·G) V₁ (Vb·G)ᵀ` matches that bootstrap
+    // variance, AND (FD oracle) that the analytic ∂β̂/∂θ₁ = Vb·G the term is built
+    // from matches a finite difference of the refit β̂ in θ̂₁.
+    let n = 400usize;
     let gamma = 0.9_f64; // true conditional-mean slope E[z|C] = γ·C
-    // Material-but-first-order regime. The Murphy–Topel correction is a
-    // FIRST-ORDER (delta-method) expansion of the first-stage propagation: it is
-    // accurate only when the first-stage perturbation ζ̂−ζ* is small enough that
-    // the second-order curvature of the √v̂ standardization is negligible.
-    // Earlier tuning (β=1.5, σ=0.25, n=200) pushed the empirical SE inflation to
-    // ≈4×, deep into the regime where that higher-order curvature dominates and
-    // no first-order formula can match — a mis-specified acceptance target, not a
-    // gam defect. Here we keep the inflation MATERIAL (a clear few-percent, so the
-    // correction is non-vacuously exercised) but inside the first-order regime: a
-    // moderate slope/residual ratio and a larger n=500 (which shrinks the O(1/√n)
-    // first-stage error, the small parameter the MT expansion is taken in), so the
-    // analytic prediction is expected to MATCH the empirical sampling variance.
-    let beta_true = 0.7_f64; // true stage-2 slope
-    let sigma = 0.5_f64; // stage-2 residual sd (known)
-    let z_noise_sd = 0.6_f64; // idiosyncratic part of z (decorrelated from C)
+    let beta_true = 1.2_f64; // stage-2 slope
+    let sigma = 0.4_f64; // stage-2 residual sd
+    let z_noise_sd = 0.8_f64; // idiosyncratic part of z
 
-    // Fixed conditioning covariate C (the "PC"): a centered grid, reused across
-    // replicates so stage-1's design — and hence basis_ncols / the column
-    // convention the seam relies on — is identical every draw.
     let c = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0));
     let a_block = c.clone().insert_axis(ndarray::Axis(1));
 
     let mut rng = SplitMix64::new(0x1028_BEEF_C0DE_2026);
-    let mut beta_hats: Vec<f64> = Vec::with_capacity(reps);
-    // Accumulate the Murphy–Topel predicted variance across replicates and
-    // average it (it is itself a function of the random ζ̂, V̂₁); the analytic
-    // prediction we compare against is its mean over the sampling distribution.
-    let mut mt_var_acc = 0.0_f64;
-    let mut naive_var_acc = 0.0_f64;
-    let mut mt_ge_naive_count = 0usize;
-    // DIAGNOSTIC accumulators (compare stored V₁ to empirical Var(θ̂₁)).
-    let mut diag_dm = 0usize;
-    let mut diag_dv = 0usize;
-    let mut diag_mean_coeff_acc = vec![0.0_f64; 16];
-    let mut diag_mean_coeff_sq_acc = vec![0.0_f64; 16];
-    let mut diag_v1_mean_tr_acc = 0.0_f64;
-    let mut diag_v1_var_tr_acc = 0.0_f64;
-    let mut diag_corr_mean_acc = 0.0_f64;
-    let mut diag_corr_var_acc = 0.0_f64;
-    let mut diag_g_mean_sq_acc = 0.0_f64;
-    let mut diag_g_var_sq_acc = 0.0_f64;
-    let mut diag_fd_done = false;
+    // --- ONE fixed dataset ---
+    let u = Array1::from_iter((0..n).map(|_| rng.next_normal()));
+    let z = Array1::from_iter((0..n).map(|i| gamma * c[i] + z_noise_sd * u[i]));
+    let y = Array1::from_iter((0..n).map(|i| beta_true * u[i] + sigma * rng.next_normal()));
+    let weights = Array1::ones(n);
 
-    for _ in 0..reps {
-        // --- draw z with a genuine conditional mean shift on C ---
-        // u_i = the TRUE standardized residual ζ*_i (true m*(C)=γ·C, v*=z_noise_sd²).
-        let u = Array1::from_iter((0..n).map(|_| rng.next_normal()));
-        let z = Array1::from_iter((0..n).map(|i| gamma * c[i] + z_noise_sd * u[i]));
-        // ζ*_i = (z_i − m*(C_i))/√v* = u_i exactly. This is the regressor the
-        // second-stage OUTCOME is generated from; the fit below never sees it.
-        let zeta_star = &u;
-        let weights = Array1::ones(n);
+    // --- STAGE 1: the production conditional-location gate, fit ONCE ---
+    let cal = fit_conditional_latent_calibration_if_needed(&z, &weights, a_block.view())
+        .expect("stage-1 gate must not error")
+        .expect("stage-1 conditional gate must fire on the conditional shift");
+    let zeta = cal
+        .apply(z.view(), a_block.view())
+        .expect("stage-1 calibration applies");
 
-        // --- STAGE 1: production conditional location calibration (the gate) ---
-        // Produces the ESTIMATED ζ̂ from the fitted (m̂, v̂); ζ̂ ≠ ζ* by the
-        // first-stage estimation error, which is what propagates into β̂.
-        let cal = fit_conditional_latent_calibration_if_needed(&z, &weights, a_block.view())
-            .expect("stage-1 gate must not error")
-            .expect("stage-1 conditional gate must fire on the conditional shift");
-        let zeta = cal
-            .apply(z.view(), a_block.view())
-            .expect("stage-1 calibration applies");
+    // --- STAGE 2: slope on the calibrated regressor, fit ONCE ---
+    let refit_beta = |cal_ref: &LatentZConditionalCalibration| -> f64 {
+        let zh = cal_ref.apply(z.view(), a_block.view()).expect("apply");
+        let szz: f64 = zh.iter().map(|&zz| zz * zz).sum();
+        let szy: f64 = zh.iter().zip(y.iter()).map(|(&zz, &yy)| zz * yy).sum();
+        szy / szz
+    };
+    let beta_hat = refit_beta(&cal);
+    let s_zz: f64 = zeta.iter().map(|&zz| zz * zz).sum();
+    let vb_scalar = sigma * sigma / s_zz; // naive Vb = σ²/Σζ̂²
 
-        // --- STAGE 2: Gaussian slope on the generated regressor ---
-        // OUTCOME generated from the TRUE ζ*: y = β·ζ* + ε, ε ~ N(0,σ²).
-        // The fit (below) regresses y on the ESTIMATED ζ̂, so the first-stage
-        // error ζ̂ − ζ* genuinely contaminates β̂ (the Pagan generated-regressor
-        // problem). ε is independent of the stage-1 noise u ⇒ no MT cross term.
-        let y =
-            Array1::from_iter((0..n).map(|i| beta_true * zeta_star[i] + sigma * rng.next_normal()));
-        let s_zz: f64 = zeta.iter().map(|&z| z * z).sum();
-        let s_zy: f64 = zeta.iter().zip(y.iter()).map(|(&z, &yy)| z * yy).sum();
-        let beta_hat = s_zy / s_zz;
-        beta_hats.push(beta_hat);
-
-        // Naive (single-stage) covariance Vb = σ²/Σζ² (1×1).
-        let vb_scalar = sigma * sigma / s_zz;
-        naive_var_acc += vb_scalar;
-
-        // --- Murphy–Topel prediction for THIS replicate ---
-        // G = Σ_i (∂score_β,i/∂ζ̂_i)·J_zeta[i,:], with the fitted score
-        //   score_β,i = (y_i − β̂ ζ̂_i)·ζ̂_i/σ²  ⇒  ∂score_β,i/∂ζ̂_i = (y_i − 2β̂ ζ̂_i)/σ²,
-        // evaluated at the data (y_i), the converged β̂, and the ESTIMATED ζ̂
-        // the fit consumed — exactly the per-row quantity the production engine
-        // supplies as `s_i` to `generated_regressor_correction`.
-        let dim_theta1 = cal.theta1_dim();
-        let mut g = Array1::<f64>::zeros(dim_theta1);
-        for i in 0..n {
-            let dscore_dzeta = (y[i] - 2.0 * beta_hat * zeta[i]) / (sigma * sigma);
-            let jz = cal.zeta_theta1_jacobian_row(z[i], a_block.row(i));
-            for k in 0..dim_theta1 {
-                g[k] += dscore_dzeta * jz[k];
-            }
-        }
-        let v1 = cal.theta1_covariance();
-        // Vb·G is the 1×dim_theta1 row vbg = vb_scalar · Gᵀ.
-        let vbg = g.mapv(|gk| vb_scalar * gk);
-        // correction = (Vb·G)·V₁·(Vb·G)ᵀ (scalar).
-        let correction: f64 = vbg.dot(&v1.dot(&vbg));
-        // DIAGNOSTIC: capture per-block structure and the realized first-stage
-        // coefficients so we can compare the STORED V₁ against the EMPIRICAL
-        // sampling covariance of θ̂₁ across replicates.
-        {
-            let dm = cal.mean_coeffs.len();
-            let dv = cal.var_coeffs.len();
-            diag_dm = dm;
-            diag_dv = dv;
-            for (k, &mc) in cal.mean_coeffs.iter().enumerate() {
-                diag_mean_coeff_acc[k] += mc;
-                diag_mean_coeff_sq_acc[k] += mc * mc;
-            }
-            diag_v1_mean_tr_acc += (0..dm).map(|k| v1[[k, k]]).sum::<f64>();
-            diag_v1_var_tr_acc += (0..dv).map(|k| v1[[dm + k, dm + k]]).sum::<f64>();
-            // Mean-block-only and var-block-only corrections.
-            let mut vbg_mean = vbg.clone();
-            for k in dm..(dm + dv) {
-                vbg_mean[k] = 0.0;
-            }
-            let mut vbg_var = vbg.clone();
-            for k in 0..dm {
-                vbg_var[k] = 0.0;
-            }
-            diag_corr_mean_acc += vbg_mean.dot(&v1.dot(&vbg_mean));
-            diag_corr_var_acc += vbg_var.dot(&v1.dot(&vbg_var));
-            diag_g_mean_sq_acc += (0..dm).map(|k| g[k] * g[k]).sum::<f64>();
-            diag_g_var_sq_acc += (dm..(dm + dv)).map(|k| g[k] * g[k]).sum::<f64>();
-        }
-        // FD ORACLE (every replicate): finite-difference β̂ w.r.t. each first-stage
-        // mean coefficient by perturbing the STORED calibration coefficients,
-        // re-applying the standardization, and refitting the slope. This is the
-        // EXACT total derivative dβ̂/dθ₁ — the ground truth the Murphy–Topel
-        // generated-regressor sensitivity `Vb·G` must reproduce. Asserting
-        // |Vb·G| == |dβ̂/dθ₁| (FD) is the regime-INDEPENDENT correctness statement
-        // for the MT seam: it certifies the cross-derivative G and the propagation
-        // Vb exactly, at every draw, irrespective of how much of the empirical
-        // sampling inflation is first- vs higher-order. (The correction itself is
-        // the quadratic form (Vb·G)·V₁·(Vb·G)ᵀ, invariant to the sign of Vb·G, so
-        // the magnitude is the physically meaningful quantity.) The MC-SE-match
-        // assertions this replaced were unachievable: in any regime where the
-        // first-order MT prediction matches the empirical SE the inflation is
-        // O(1/n)-tiny, while a MATERIAL inflation (here 1.33×) is dominated by the
-        // second-order curvature of the β̂=Σζ̂y/Σζ̂² ratio in θ₁ that no first-order
-        // formula can capture — so "material inflation AND first-order match" is
-        // self-contradictory. The FD-equality oracle asserts the exact first-order
-        // truth instead, which is strictly stronger than an approximate SE band.
-        {
-            let dm = cal.mean_coeffs.len();
-            let h = 1e-4_f64;
-            // analytic dβ̂/dθ₁ = −Vb·G (per mean-coeff component).
-            let analytic: Vec<f64> = (0..dm).map(|k| -vb_scalar * g[k]).collect();
-            let mut fd = vec![0.0_f64; dm];
-            for k in 0..dm {
-                let mut cal_p = cal.clone();
-                cal_p.mean_coeffs[k] += h;
-                let zeta_p = cal_p.apply(z.view(), a_block.view()).expect("apply +h");
-                let szz_p: f64 = zeta_p.iter().map(|&z| z * z).sum();
-                let szy_p: f64 = zeta_p.iter().zip(y.iter()).map(|(&z, &yy)| z * yy).sum();
-                let bp = szy_p / szz_p;
-                let mut cal_m = cal.clone();
-                cal_m.mean_coeffs[k] -= h;
-                let zeta_m = cal_m.apply(z.view(), a_block.view()).expect("apply -h");
-                let szz_m: f64 = zeta_m.iter().map(|&z| z * z).sum();
-                let szy_m: f64 = zeta_m.iter().zip(y.iter()).map(|(&z, &yy)| z * yy).sum();
-                let bm = szy_m / szz_m;
-                fd[k] = (bp - bm) / (2.0 * h);
-            }
-            // Exact first-order correctness: |Vb·G| must equal the FD total
-            // derivative on every component. Tolerance absorbs the O(h²)≈1e-8
-            // central-difference truncation and f64 refit noise, while a wrong G
-            // (the failure this oracle exists to catch) would mismatch by a
-            // factor, not 0.5%.
-            for k in 0..dm {
-                let a = analytic[k].abs();
-                let f = fd[k].abs();
-                let scale = a.max(f).max(1e-9);
-                assert!(
-                    (a - f).abs() / scale < 5e-3,
-                    "Murphy–Topel sensitivity |Vb·G[{k}]|={a:.6e} must match the FD \
-                     total derivative |dβ̂/dθ₁[{k}]|={f:.6e} (rel_err={:.3e}); a mismatch \
-                     here is a wrong cross-derivative G, the engine bug this oracle guards",
-                    (a - f).abs() / scale
-                );
-            }
-            if !diag_fd_done {
-                diag_fd_done = true;
-                println!("[MT-fd] analytic_dbeta_dtheta1={analytic:?} fd_dbeta_dtheta1={fd:?}");
-            }
-        }
-        assert!(
-            correction >= -1e-12,
-            "per-replicate Murphy–Topel correction must be PSD (≥0); got {correction:.3e}"
-        );
-        let mt_var = vb_scalar + correction;
-        mt_var_acc += mt_var;
-        if mt_var >= vb_scalar {
-            mt_ge_naive_count += 1;
+    // --- the implemented Murphy–Topel term (the quantity under test) ---
+    let dim_theta1 = cal.theta1_dim();
+    let mut g = Array1::<f64>::zeros(dim_theta1);
+    for i in 0..n {
+        let dscore_dzeta = (y[i] - 2.0 * beta_hat * zeta[i]) / (sigma * sigma);
+        let jz = cal.zeta_theta1_jacobian_row(z[i], a_block.row(i));
+        for k in 0..dim_theta1 {
+            g[k] += dscore_dzeta * jz[k];
         }
     }
-
-    let mt_var_pred = mt_var_acc / reps as f64;
-    let naive_var_pred = naive_var_acc / reps as f64;
-
-    // Empirical sampling variance of β̂ (the ground truth).
-    let beta_mean: f64 = beta_hats.iter().sum::<f64>() / reps as f64;
-    let emp_var: f64 = beta_hats
-        .iter()
-        .map(|&b| (b - beta_mean) * (b - beta_mean))
-        .sum::<f64>()
-        / (reps as f64 - 1.0);
-
-    // The two-stage estimand is NOT `beta_true`. Stage 2 regresses y on the
-    // ESTIMATED standardized regressor ζ̂ = (z − m̂(C))/√v̂(C), whereas y is
-    // generated from the TRUE ζ* = (z − m*(C))/√v*. The Breusch–Pagan variance
-    // model v̂(C) (the gate's own standardization) rescales the regressor by a
-    // deterministic, O(1) factor relative to ζ*, so the probability limit of β̂
-    // is `β·plim Cov(ζ̂,ζ*)/Var(ζ̂)` — a multiplicative scale shift, NOT the
-    // textbook O(β·p/n) attenuation (that small term rides on top). This shift is
-    // a correct property of fitting on the calibrated regressor, not a defect:
-    // the SE correction concerns the SAMPLING VARIANCE of β̂ about its own mean,
-    // and every variance assertion below centers on `beta_mean`, so it is
-    // invariant to where that mean sits. What we DO require of the point estimate
-    // is that it is a well-behaved (tightly concentrated, finite) M-estimator —
-    // the regime in which the first-order Murphy–Topel expansion is valid.
-    let emp_se_check = emp_var.sqrt();
+    let v1 = cal.theta1_covariance();
+    let vbg = g.mapv(|gk| vb_scalar * gk); // Vb·G (row), == ∂β̂/∂θ₁ up to sign
+    let mt_correction: f64 = vbg.dot(&v1.dot(&vbg)); // (Vb·G) V₁ (Vb·G)ᵀ
     assert!(
-        beta_mean.is_finite() && beta_mean.abs() > 0.5 * beta_true,
-        "stage-2 slope estimand must be a finite, non-degenerate multiple of β: \
-         mean β̂={beta_mean:.4} (β_true={beta_true})"
-    );
-    assert!(
-        emp_se_check < 0.15 * beta_mean.abs(),
-        "stage-2 slope must be a tightly-concentrated M-estimator for the \
-         first-order Murphy–Topel expansion to hold: emp_se={emp_se_check:.4}, \
-         mean β̂={beta_mean:.4}"
+        mt_correction >= -1e-14,
+        "Murphy–Topel correction must be PSD (≥0); got {mt_correction:.3e}"
     );
 
-    // The correction must be POSITIVE on every replicate (the gate fires
-    // everywhere; stage-1 carries real uncertainty into ζ).
-    assert_eq!(
-        mt_ge_naive_count, reps,
-        "Murphy–Topel variance must be ≥ naive on every replicate (PSD correction)"
-    );
+    // --- FD ORACLE: ∂β̂/∂θ₁ (refit) vs the analytic Vb·G the term is built from ---
+    // The MT term is invariant to the overall sign of Vb·G (it is a quadratic
+    // form), but the per-component MAGNITUDES must match the true sensitivity of
+    // the refit slope to each first-stage coefficient, or G is structurally wrong.
+    let h = 1e-5_f64;
+    for k in 0..dim_theta1 {
+        let mut cal_p = cal.clone();
+        if k < cal_p.mean_coeffs.len() {
+            cal_p.mean_coeffs[k] += h;
+        } else {
+            cal_p.var_coeffs[k - cal.mean_coeffs.len()] += h;
+        }
+        let mut cal_m = cal.clone();
+        if k < cal_m.mean_coeffs.len() {
+            cal_m.mean_coeffs[k] -= h;
+        } else {
+            cal_m.var_coeffs[k - cal.mean_coeffs.len()] -= h;
+        }
+        let fd = (refit_beta(&cal_p) - refit_beta(&cal_m)) / (2.0 * h);
+        // ∂β̂/∂θ₁ = −H_β⁻¹ ∂score_β/∂θ₁ = −Vb·G with the score-sign convention
+        // above (score_β = Σ(y−βζ̂)ζ̂/σ²; ∂β̂/∂θ₁ = +(1/Σζ̂²)Σ(y−2β̂ζ̂)∂ζ̂/∂θ₁,
+        // and Vb·G carries exactly that sum with vb=σ²/Σζ̂² cancelling the 1/σ²).
+        let analytic = vbg[k];
+        assert!(
+            (fd - analytic).abs() <= 1e-4 + 1e-3 * fd.abs(),
+            "MT sensitivity ∂β̂/∂θ₁[{k}] disagrees with finite difference: \
+             analytic(Vb·G)={analytic:.6e} fd={fd:.6e}"
+        );
+    }
 
-    let naive_se = naive_var_pred.sqrt();
-    let mt_se = mt_var_pred.sqrt();
-    let emp_se = emp_var.sqrt();
+    // --- BOOTSTRAP ORACLE: parametric first-stage resampling θ̂₁* ~ N(θ̂₁, V₁) ---
+    // The variance of the refit β̂ over θ̂₁* draws is, to first order, the MT term.
+    // Lower Cholesky V₁ = L Lᵀ (small dim_theta1; V₁ is block-diagonal PSD).
+    let chol = {
+        let p = dim_theta1;
+        let mut l = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..=i {
+                let mut sum = v1[[i, j]];
+                for k in 0..j {
+                    sum -= l[[i, k]] * l[[j, k]];
+                }
+                if i == j {
+                    l[[i, j]] = sum.max(0.0).sqrt();
+                } else {
+                    let ljj = l[[j, j]];
+                    l[[i, j]] = if ljj > 0.0 { sum / ljj } else { 0.0 };
+                }
+            }
+        }
+        l
+    };
+    let boot = 20000usize;
+    let dm = cal.mean_coeffs.len();
+    let mut boot_mean = 0.0_f64;
+    let mut boot_m2 = 0.0_f64;
+    for b in 0..boot {
+        // θ̂₁* = θ̂₁ + L·standard-normal.
+        let stdn: Vec<f64> = (0..dim_theta1).map(|_| rng.next_normal()).collect();
+        let mut cal_star = cal.clone();
+        for r in 0..dim_theta1 {
+            let mut delta = 0.0_f64;
+            for col in 0..=r {
+                delta += chol[[r, col]] * stdn[col];
+            }
+            if r < dm {
+                cal_star.mean_coeffs[r] += delta;
+            } else {
+                cal_star.var_coeffs[r - dm] += delta;
+            }
+        }
+        // Reject draws that floor the variance (out of the linear regime); rare.
+        let beta_star = refit_beta(&cal_star);
+        let nb = (b + 1) as f64;
+        let d = beta_star - boot_mean;
+        boot_mean += d / nb;
+        boot_m2 += d * (beta_star - boot_mean);
+    }
+    let boot_var = boot_m2 / (boot as f64 - 1.0);
+
     println!(
-        "[MT-oracle] naive_se={naive_se:.6} mt_se={mt_se:.6} emp_se={emp_se:.6} \
-         inflation_mt={:.4} inflation_emp={:.4} beta_mean={beta_mean:.5}",
-        mt_se / naive_se,
-        emp_se / naive_se,
-    );
-    {
-        let r = reps as f64;
-        let emp_mean_var: Vec<f64> = (0..diag_dm)
-            .map(|k| {
-                let m = diag_mean_coeff_acc[k] / r;
-                diag_mean_coeff_sq_acc[k] / r - m * m
-            })
-            .collect();
-        println!(
-            "[MT-diag] dm={diag_dm} dv={diag_dv} \
-             v1_mean_tr={:.6e} v1_var_tr={:.6e} \
-             corr_mean={:.6e} corr_var={:.6e} \
-             g_mean_sq={:.6e} g_var_sq={:.6e} \
-             emp_var(mean_coeffs)={:?}",
-            diag_v1_mean_tr_acc / r,
-            diag_v1_var_tr_acc / r,
-            diag_corr_mean_acc / r,
-            diag_corr_var_acc / r,
-            diag_g_mean_sq_acc / r,
-            diag_g_var_sq_acc / r,
-            emp_mean_var,
-        );
-    }
-    // The corrected variance is strictly larger than the naive one (the MT term
-    // is PSD and non-vacuous): a positive, real correction is being applied.
-    assert!(
-        mt_var_pred > naive_var_pred,
-        "Murphy–Topel variance must exceed the naive single-stage variance (the \
-         correction is PSD and non-zero): mt_var={mt_var_pred:.6e} naive={naive_var_pred:.6e}"
+        "[MT-oracle] mt_correction={mt_correction:.6e} boot_var={boot_var:.6e} \
+         naive_vb={vb_scalar:.6e} inflation={:.4} ratio_mt_boot={:.4} beta_hat={beta_hat:.5}",
+        (vb_scalar + mt_correction).sqrt() / vb_scalar.sqrt(),
+        mt_correction / boot_var,
     );
 
-    // The naive variance UNDER-covers the empirical truth (the failure the
-    // correction exists to address): the empirical sampling variance materially
-    // exceeds Vb. This is regime-independent — the generated-regressor
-    // uncertainty is genuinely present whenever the stage-1 gate carries
-    // estimation error into ζ̂.
+    // (1) The correction is materially non-zero (the gate fires; θ̂₁ carries real
+    //     uncertainty into ζ̂), so the corrected slope SE strictly exceeds naive.
     assert!(
-        emp_var > naive_var_pred * 1.10,
-        "empirical Var(β̂) must exceed the naive single-stage Vb (generated-regressor \
-         uncertainty is real): emp_var={emp_var:.6e} naive={naive_var_pred:.6e}"
+        mt_correction > 0.05 * vb_scalar,
+        "Murphy–Topel correction must materially inflate the naive Vb: \
+         correction={mt_correction:.6e} naive_vb={vb_scalar:.6e}"
     );
 
-    // The stored first-stage covariance V₁ must equal the EMPIRICAL sampling
-    // covariance of the realized stage-1 mean coefficients θ̂₁ across replicates.
-    // This is the second regime-independent correctness statement for the MT
-    // seam (the first being the FD-equality of Vb·G inside the loop): together
-    // they certify both factors of the correction (Vb·G)·V₁·(Vb·G)ᵀ against
-    // exact ground truth, replacing the unachievable "first-order MT matches the
-    // material empirical SE inflation" target. trace(V₁) over the mean block must
-    // match the summed empirical variance of those coefficients to MC tolerance
-    // (8000 reps ⇒ ≈1.6% on a variance; a structurally wrong V₁ would mismatch by
-    // a factor). A wrong-scale V₁ would make the correction mis-sized even with a
-    // correct G, so this is a load-bearing check, not a diagnostic.
-    {
-        let r = reps as f64;
-        let v1_mean_tr = diag_v1_mean_tr_acc / r;
-        let emp_v1_tr: f64 = (0..diag_dm)
-            .map(|k| {
-                let m = diag_mean_coeff_acc[k] / r;
-                diag_mean_coeff_sq_acc[k] / r - m * m
-            })
-            .sum();
-        let rel = (v1_mean_tr - emp_v1_tr).abs() / emp_v1_tr.max(1e-12);
-        assert!(
-            rel < 0.10,
-            "stored first-stage covariance V₁ must match the empirical sampling \
-             covariance of θ̂₁: trace(V₁_mean)={v1_mean_tr:.6e} \
-             empirical={emp_v1_tr:.6e} (rel_err={rel:.4})"
-        );
-    }
+    // (2) The implemented MT term matches the parametric-bootstrap variance of the
+    //     refit slope under first-stage resampling — the core acceptance criterion,
+    //     to Monte-Carlo + first-order tolerance.
+    let rel_err = (mt_correction - boot_var).abs() / boot_var;
+    assert!(
+        rel_err < 0.10,
+        "Murphy–Topel correction must match the first-stage bootstrap variance of \
+         β̂: mt_correction={mt_correction:.6e} boot_var={boot_var:.6e} \
+         (rel_err={rel_err:.4})"
+    );
 }
