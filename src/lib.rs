@@ -108,8 +108,8 @@ pub use linalg::{faer_ndarray, matrix, utils};
 // deleted in the same commit). `PenaltySubspaceTrace` is the #901 spectral kernel
 // the logdet atom's `Sensitivity` is built from.
 pub use solver::estimate::reml::atoms::{
-    BetaChannel, CriterionAtom, CriterionSum, HessianLogdetAtom, PenaltyQuadAtom, SampledBlockAtom,
-    Sensitivity, StratumFingerprint, ThetaDirection,
+    BetaChannel, CriterionAtom, CriterionSum, HessianLogdetAtom, JeffreysLogdetAtom,
+    PenaltyQuadAtom, SampledBlockAtom, Sensitivity, StratumFingerprint, ThetaDirection,
 };
 pub use solver::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
 // #986 frontier ρ-scaling: the per-atom decoupled EFS outer engine. `run_outer`
