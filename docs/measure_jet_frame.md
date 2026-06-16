@@ -87,6 +87,16 @@ the frame construction below generalizes that path.
 ## 4. Dials
 
 - (s, α, lnτ) jets: shipped, FD-gated, consumed by the live ψ enrollment.
+  The measure-jet term enrolls this `(α, lnτ[, s])` dial group through the
+  joint spatial-`(ρ, ψ)` optimizer, which is a *best-effort refinement* on top
+  of an already-valid REML-seeded baseline geometry. If the joint refinement
+  does not certify a stationary point (`NonConverged` — the formula/FFI path's
+  tight `tol=1e-10` can leave it mid-descent at the iteration cap where the
+  CLI's looser tolerance converges) **or** certifies a candidate that worsens
+  the profiled REML score, the fit **degrades to the frozen baseline geometry**
+  rather than aborting the parent fit (#1126). Only a genuine non-finite
+  terminal cost surfaces as an error; ordinary slow κ-convergence is no longer
+  fatal.
 - Density normalization: on a p-dimensional stratum with sampling density
   `ρ`, `q_ε ~ Cρ ε^p` and the local affine residual scales as
   `R_ε ~ Cρ ε^p F(ε|ξ|)`. With the uncorrected scale weight `ε^{-2s}`, the
