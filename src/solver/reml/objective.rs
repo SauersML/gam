@@ -1987,15 +1987,16 @@ impl<'a> RemlState<'a> {
         mode: super::reml_outer_engine::EvalMode,
     ) -> Option<(f64, Array1<f64>, Option<Array2<f64>>)> {
         let configured = self.configured_rho_prior_atom(rho);
-        let cost = self.compute_soft_priorcost(rho) + configured.cost();
+        let soft = self.soft_rho_guard_prior_atom(rho);
+        let cost = soft.cost() + configured.cost();
         if mode == super::reml_outer_engine::EvalMode::ValueOnly {
             return (cost.abs() > 0.0).then(|| (cost, Array1::zeros(rho.len()), None));
         }
 
-        let gradient = self.compute_soft_priorgrad(rho) + configured.gradient();
+        let gradient = soft.gradient() + configured.gradient();
         let hessian = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
-            let mut hess = self
-                .compute_soft_priorhess(rho)
+            let mut hess = soft
+                .hessian()
                 .unwrap_or_else(|| Array2::<f64>::zeros((rho.len(), rho.len())));
             if let Some(configured_hess) = configured.hessian() {
                 hess += configured_hess;

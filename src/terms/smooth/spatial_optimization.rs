@@ -6957,6 +6957,46 @@ pub struct SmoothTermLrInference {
 /// by more than 10%.
 pub const SMOOTH_LR_MATERIAL_THRESHOLD: f64 = 0.10;
 
+/// Build `S_b = lambda_b * S_b^unit` as global `p_total x p_total` matrices in
+/// exactly the fitted rho/lambda ordering. This is the narrow handoff the
+/// estimated-lambda Lawley correction needs: the same `design.penalties` order
+/// already paired with `fit.lambdas`, without changing #740's outer-Hessian
+/// algebra or the production penalty assembly.
+fn fitted_rho_penalty_components(
+    penalties: &[BlockwisePenalty],
+    lambdas: &[f64],
+    p_total: usize,
+) -> Result<Vec<crate::inference::lawley::RhoPenaltyComponent>, EstimationError> {
+    if penalties.len() != lambdas.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "smooth_term_lr_inference: penalty/lambda count mismatch ({} penalties, {} lambdas)",
+            penalties.len(),
+            lambdas.len()
+        )));
+    }
+    let mut components = Vec::with_capacity(penalties.len());
+    for (idx, (penalty, &lambda)) in penalties.iter().zip(lambdas.iter()).enumerate() {
+        if !(lambda.is_finite() && lambda >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "smooth_term_lr_inference: lambda[{idx}] is invalid: {lambda}"
+            )));
+        }
+        let r = &penalty.col_range;
+        if r.end > p_total {
+            return Err(EstimationError::InvalidInput(format!(
+                "smooth_term_lr_inference: penalty[{idx}] range {:?} exceeds coefficient dimension {p_total}",
+                r
+            )));
+        }
+        let mut s_component = Array2::<f64>::zeros((p_total, p_total));
+        s_component
+            .slice_mut(s![r.start..r.end, r.start..r.end])
+            .scaled_add(lambda, &penalty.local);
+        components.push(crate::inference::lawley::RhoPenaltyComponent { s_component });
+    }
+    Ok(components)
+}
+
 
 /// The end-to-end per-term likelihood-ratio significance report for every
 /// penalized (shape-unconstrained) smooth term in a fitted model, magically
@@ -7010,7 +7050,7 @@ pub fn smooth_term_lr_inference_forspec(
 ) -> Result<Vec<SmoothTermLrInference>, EstimationError> {
     use crate::inference::lawley::{
         LAWLEY_PAIR_MATRIX_MAX_ROWS, known_scale_expected_jets_with_dispersion,
-        lawley_lr_bartlett_factor,
+        lawley_lr_bartlett_factor, lawley_lr_mean_shift_with_rho_variation,
     };
 
     let n = data.nrows();
@@ -7027,15 +7067,17 @@ pub fn smooth_term_lr_inference_forspec(
     )?;
     let ll_full = full.fit.log_likelihood;
     let p_total = full.design.design.ncols();
-    let s_lambda = weighted_blockwise_penalty_sum(
-        &full.design.penalties,
-        full.fit.lambdas.as_slice().ok_or_else(|| {
+    let lambdas = full.fit.lambdas.as_slice().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "smooth_term_lr_inference: non-contiguous lambda vector".to_string(),
             )
-        })?,
-        p_total,
-    );
+        })?;
+    let s_lambda = weighted_blockwise_penalty_sum(&full.design.penalties, lambdas, p_total);
+    let rho_penalty_components =
+        fitted_rho_penalty_components(&full.design.penalties, lambdas, p_total)?;
+    let rho_covariance = full.fit.artifacts.rho_covariance.as_ref().filter(|cov| {
+        cov.nrows() == rho_penalty_components.len() && cov.ncols() == rho_penalty_components.len()
+    });
     // Full design as a dense n×p array for the Lawley pair-matrix reduction.
     let full_design_dense = full.design.design.to_dense();
     let influence = full.fit.coefficient_influence();
@@ -7114,6 +7156,8 @@ pub fn smooth_term_lr_inference_forspec(
         // family has closed-form jets, n is in the resolvable regime, and the
         // factor is computable. Otherwise the uncorrected χ² stands.
         let mut bartlett_factor = 1.0;
+        let mut bartlett_factor_conditional = None;
+        let mut rho_variation_shift = None;
         let mut statistic_corrected = statistic_lr;
         let mut p_corrected = p_uncorrected;
         let mut correction = SmoothLrCorrection::None;
@@ -7126,23 +7170,51 @@ pub fn smooth_term_lr_inference_forspec(
                 .map(|i| {
                     known_scale_expected_jets_with_dispersion(&family, eta[i], family_disp)
                         .and_then(|jets| jets.kappas().ok())
-                })
+            })
                 .collect();
             if let (Some(kappas), Some(dist)) = (kappas, chi2.as_ref()) {
-                if let Ok(c) = lawley_lr_bartlett_factor(
+                let fixed_factor = lawley_lr_bartlett_factor(
                     full_design_dense.view(),
                     &kappas,
                     Some(s_lambda.view()),
                     coeff_range.clone(),
                     ref_df,
-                ) {
-                    if c.is_finite() && c > 0.0 {
-                        use statrs::distribution::ContinuousCDF;
-                        bartlett_factor = c;
-                        statistic_corrected = statistic_lr / c;
-                        p_corrected = (1.0 - dist.cdf(statistic_corrected)).clamp(0.0, 1.0);
-                        correction = SmoothLrCorrection::LawleyLr;
+                );
+                if let Ok(c_cond) = fixed_factor
+                    && c_cond.is_finite()
+                    && c_cond > 0.0
+                {
+                    let mut c_applied = c_cond;
+                    correction = SmoothLrCorrection::LawleyLrFixedLambda;
+                    if let Some(cov) = rho_covariance
+                        && let Ok(total_shift) = lawley_lr_mean_shift_with_rho_variation(
+                            full_design_dense.view(),
+                            &kappas,
+                            s_lambda.view(),
+                            coeff_range.clone(),
+                            &rho_penalty_components,
+                            cov.view(),
+                        )
+                    {
+                        let mean_w = ref_df + total_shift;
+                        if let Some(c_est) =
+                            crate::inference::higher_order::bartlett_factor_from_mean(
+                                mean_w, ref_df,
+                            )
+                            && c_est.is_finite()
+                            && c_est > 0.0
+                        {
+                            let conditional_shift = (c_cond - 1.0) * ref_df;
+                            c_applied = c_est;
+                            bartlett_factor_conditional = Some(c_cond);
+                            rho_variation_shift = Some(total_shift - conditional_shift);
+                            correction = SmoothLrCorrection::LawleyLrEstimatedLambda;
+                        }
                     }
+                    use statrs::distribution::ContinuousCDF;
+                    bartlett_factor = c_applied;
+                    statistic_corrected = statistic_lr / c_applied;
+                    p_corrected = (1.0 - dist.cdf(statistic_corrected)).clamp(0.0, 1.0);
                 }
             }
         }
@@ -7153,7 +7225,8 @@ pub fn smooth_term_lr_inference_forspec(
         // p-value shift, whichever is larger (a factor near one can still flip a
         // p-value sitting on the α boundary, and vice versa).
         let material = match correction {
-            SmoothLrCorrection::LawleyLr => {
+            SmoothLrCorrection::LawleyLrEstimatedLambda
+            | SmoothLrCorrection::LawleyLrFixedLambda => {
                 let factor_move = (bartlett_factor - 1.0).abs();
                 let p_denom = p_uncorrected.max(p_corrected).max(f64::MIN_POSITIVE);
                 let p_move = if p_uncorrected.is_finite() && p_corrected.is_finite() {
@@ -7173,6 +7246,8 @@ pub fn smooth_term_lr_inference_forspec(
             statistic_lr,
             ref_df,
             bartlett_factor,
+            bartlett_factor_conditional,
+            rho_variation_shift,
             statistic_corrected,
             p_value_uncorrected: p_uncorrected,
             p_value_corrected: p_corrected,
