@@ -723,12 +723,7 @@ pub fn solve_spd_pcg_with_info<F>(
 where
     F: Fn(&Array1<f64>) -> Array1<f64>,
 {
-    let p = rhs.len();
-    if p == 0 || preconditioner_diag.len() != p || max_iter == 0 {
-        return None;
-    }
-    let mut x = Array1::<f64>::zeros(p);
-    let result = pcg_core(
+    solve_spd_pcg_with_info_into(
         |v, out| {
             let applied = apply(v);
             if applied.len() == out.len() {
@@ -737,26 +732,11 @@ where
                 out.fill(f64::NAN);
             }
         },
-        &rhs.view(),
-        &preconditioner_diag.view(),
+        rhs,
+        preconditioner_diag,
         rel_tol,
         max_iter,
-        32,
-        true,
-        &mut x.view_mut(),
-    );
-    if result.stop == PcgStop::BadPreconditioner {
-        log::warn!(
-            "SPD PCG rejected: preconditioner diagonal contained a non-positive or \
-             non-finite entry; caller should route to a direct factorization \
-             or indefinite Krylov path."
-        );
-    }
-    if result.stop == PcgStop::Converged && x.iter().all(|v| v.is_finite()) {
-        Some((x, pcg_solve_info(&result)))
-    } else {
-        None
-    }
+    )
 }
 
 pub fn solve_spd_pcg<F>(
@@ -806,6 +786,13 @@ where
     if result.stop == PcgStop::Converged && x.iter().all(|v| v.is_finite()) {
         Some((x, pcg_solve_info(&result)))
     } else {
+        if result.stop == PcgStop::BadPreconditioner {
+            log::warn!(
+                "SPD PCG rejected: preconditioner diagonal contained a non-positive or \
+                 non-finite entry; caller should route to a direct factorization \
+                 or indefinite Krylov path."
+            );
+        }
         None
     }
 }
