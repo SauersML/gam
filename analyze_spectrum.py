@@ -13,13 +13,17 @@ import numpy as np
 
 def log(*a): print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
-def spectrum(X, m=40000, seed=0):
+def spectrum(X, m=12000, seed=0):
+    # eigendecompose the d x d covariance (d=3584) instead of SVD of n x d:
+    # far faster and gives the full variance spectrum.
     Xc = X - X.mean(0, keepdims=True)
     if len(Xc) > m:
         idx = np.random.RandomState(seed).choice(len(Xc), m, replace=False)
         Xc = Xc[idx]
-    s = np.linalg.svd(Xc, full_matrices=False, compute_uv=False)
-    var = (s**2) / max(1, (len(Xc)-1))
+    n = len(Xc)
+    C = (Xc.T @ Xc) / max(1, n-1)          # d x d
+    w = np.linalg.eigvalsh(C)               # ascending
+    var = np.clip(w[::-1], 0, None)         # descending, nonneg
     return var
 
 def stats_from_var(var):
@@ -44,19 +48,19 @@ def main():
         X = np.asarray(X[:], dtype=np.float64)
         var = spectrum(X)
         raw = stats_from_var(var)
-        # rogue-removed: project out top-R principal directions, then re-spectrum
+        # rogue-removed: project out top-R principal directions via covariance eigvecs
         Xc = X - X.mean(0, keepdims=True)
-        m = min(len(Xc), 40000)
+        m = min(len(Xc), 12000)
         idx = np.random.RandomState(1).choice(len(Xc), m, replace=False) if len(Xc) > m else np.arange(len(Xc))
         Xs = Xc[idx]
-        U, S, Vt = np.linalg.svd(Xs, full_matrices=False)
+        C = (Xs.T @ Xs) / max(1, m-1)
+        w, V = np.linalg.eigh(C)              # ascending; V columns = eigvecs
         for R in (1, 3):
-            Vr = Vt[:R]                       # top-R right singular vectors (HxR)
-            Xres = Xs - (Xs @ Vr.T) @ Vr      # remove top-R subspace
-            sres = np.linalg.svd(Xres, full_matrices=False, compute_uv=False)
-            varr = (sres**2)/max(1,(m-1))
-            out_key = f"rogue_removed_top{R}"
-            raw[out_key] = stats_from_var(varr)
+            Vr = V[:, ::-1][:, :R]            # top-R eigvecs (d x R)
+            Xres = Xs - (Xs @ Vr) @ Vr.T      # remove top-R subspace
+            Cr = (Xres.T @ Xres) / max(1, m-1)
+            wr = np.clip(np.linalg.eigvalsh(Cr)[::-1], 0, None)
+            raw[f"rogue_removed_top{R}"] = stats_from_var(wr)
         out[f"L{L}"] = {"shape": list(X.shape), "raw": raw}
         r = raw
         log(f"L{L} RAW top1={r['ev_top1']:.4f} eff_rank={r['eff_rank']:.1f} k90={r['k90']} "

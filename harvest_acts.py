@@ -129,12 +129,14 @@ def main():
         fn = os.path.join(args.out, f"resid_L{L}.npy")
         np.save(fn, arr)
         # ---- stats: PCA spectrum, effective rank ----
+        # Eigendecompose the d x d covariance (d=3584) instead of n x d SVD:
+        # far faster + numerically robust (avoids slow LAPACK gesdd path).
         Xc = arr - arr.mean(0, keepdims=True)
-        # SVD on covariance via economy SVD of centered (subsample rows for speed)
-        m = min(len(Xc), 40000)
+        m = min(len(Xc), 20000)
         idx = np.random.RandomState(0).choice(len(Xc), m, replace=False) if len(Xc) > m else np.arange(len(Xc))
-        s = np.linalg.svd(Xc[idx], full_matrices=False, compute_uv=False)
-        var = (s**2) / max(1, (m-1))
+        Xs = Xc[idx].astype(np.float64)
+        C = (Xs.T @ Xs) / max(1, (m-1))
+        var = np.clip(np.linalg.eigvalsh(C)[::-1], 0, None)
         ev = var / var.sum()
         cum = np.cumsum(ev)
         # effective rank (entropy of normalized spectrum)
