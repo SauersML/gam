@@ -371,6 +371,7 @@ pub fn build_termspec(
                         name: name.clone(),
                         feature_col: col,
                         feature_cols: vec![col],
+                        categorical_levels: vec![],
                         // Parametric linear terms are unpenalized by default
                         // (MLE, matching mgcv/glm); see #749.
                         double_penalty: false,
@@ -385,6 +386,7 @@ pub fn build_termspec(
                                 name: name.clone(),
                                 feature_col: col,
                                 feature_cols: vec![col],
+                                categorical_levels: vec![],
                                 // Unpenalized parametric effect by default (#749).
                                 double_penalty: false,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
@@ -431,6 +433,7 @@ pub fn build_termspec(
                     name: name.clone(),
                     feature_col: col,
                     feature_cols: vec![col],
+                    categorical_levels: vec![],
                     double_penalty: false,
                     coefficient_geometry: LinearCoefficientGeometry::Bounded {
                         min: *min,
@@ -671,12 +674,20 @@ pub fn build_termspec(
                 ));
             }
             ParsedTerm::Interaction { vars } => {
-                // Validate every atom resolves to a numeric column. Linear
-                // `:` interactions produce a design column equal to the
-                // elementwise product of the operands; categorical operands
-                // would need a factor-aware expansion (one column per cell)
-                // that is not yet wired here.
-                let mut cols = Vec::<usize>::with_capacity(vars.len());
+                // A linear `:` interaction realizes one design column equal to
+                // the elementwise product of its operands. Numeric (continuous/
+                // binary) operands multiply directly; a categorical operand is
+                // a factor, so the product is expanded factor-aware: one design
+                // column per surviving cell of the factor(s), each an indicator
+                // `1[factor == level]` gating the numeric product. Levels are
+                // treatment-coded (the lexicographically first level of each
+                // factor is dropped) so the cell columns are identifiable
+                // against the intercept and the factor's own main effect —
+                // mgcv's `factor:x` convention.
+                let mut numeric_cols = Vec::<usize>::new();
+                // Per categorical operand: (var name, col, kept levels after
+                // dropping the first for treatment coding).
+                let mut categorical_factors = Vec::<(String, usize, Vec<(u64, String)>)>::new();
                 for var in vars {
                     let col = resolve_col(col_map, var)?;
                     let kind = ds.column_kinds.get(col).copied().ok_or_else(|| {
@@ -686,34 +697,97 @@ pub fn build_termspec(
                         .to_string()
                     })?;
                     match kind {
-                        ColumnKindTag::Continuous | ColumnKindTag::Binary => cols.push(col),
+                        ColumnKindTag::Continuous | ColumnKindTag::Binary => numeric_cols.push(col),
                         ColumnKindTag::Categorical => {
-                            return Err(TermBuilderError::incompatible_config(format!(
-                                "interaction `{}` references categorical column `{var}`; \
-                                 linear `:` interactions currently support only numeric \
-                                 (continuous/binary) operands. Use te(...) for smooth \
-                                 interactions or pre-encode the factor as numeric columns.",
-                                vars.join(":")
-                            )));
+                            let mut levels = encoded_levels_for_column(ds, ColIdx::new(col));
+                            if levels.len() > 1 {
+                                // Drop the first (reference) level: treatment coding.
+                                levels.remove(0);
+                            }
+                            if levels.is_empty() {
+                                return Err(TermBuilderError::incompatible_config(format!(
+                                    "interaction `{}` references categorical column `{var}` with no usable levels",
+                                    vars.join(":")
+                                )));
+                            }
+                            categorical_factors.push((var.clone(), col, levels));
                         }
                     }
                 }
+
                 let label = vars.join(":");
-                linear_terms.push(LinearTermSpec {
-                    name: label,
-                    feature_col: cols[0],
-                    feature_cols: cols,
-                    // Parametric `:` interaction column is unpenalized by
-                    // default, same as any other linear term (#749).
-                    double_penalty: false,
-                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
-                    coefficient_min: None,
-                    coefficient_max: None,
-                });
-                inference_notes.push(format!(
-                    "wired linear interaction `{}` as product of numeric columns",
-                    vars.join(":")
-                ));
+
+                if categorical_factors.is_empty() {
+                    // Pure numeric `:` interaction — single product column,
+                    // identical to the historical behaviour.
+                    linear_terms.push(LinearTermSpec {
+                        name: label,
+                        feature_col: numeric_cols[0],
+                        feature_cols: numeric_cols,
+                        categorical_levels: vec![],
+                        // Parametric `:` interaction column is unpenalized by
+                        // default, same as any other linear term (#749).
+                        double_penalty: false,
+                        coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                        coefficient_min: None,
+                        coefficient_max: None,
+                    });
+                    inference_notes.push(format!(
+                        "wired linear interaction `{}` as product of numeric columns",
+                        vars.join(":")
+                    ));
+                } else {
+                    // Factor-aware expansion: cartesian product over the kept
+                    // levels of every categorical operand. Each cell yields one
+                    // treatment-coded column gating the numeric product.
+                    let mut cells: Vec<Vec<(usize, u64, String)>> = vec![Vec::new()];
+                    for (_var, col, levels) in &categorical_factors {
+                        let mut next = Vec::with_capacity(cells.len() * levels.len());
+                        for cell in &cells {
+                            for (bits, level_label) in levels {
+                                let mut extended = cell.clone();
+                                extended.push((*col, *bits, level_label.clone()));
+                                next.push(extended);
+                            }
+                        }
+                        cells = next;
+                    }
+
+                    let n_cells = cells.len();
+                    for cell in cells {
+                        let cell_suffix = cell
+                            .iter()
+                            .map(|(_, _, level_label)| level_label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(":");
+                        let categorical_levels =
+                            cell.iter().map(|(col, bits, _)| (*col, *bits)).collect();
+                        // `feature_col` is required to point at a real column;
+                        // use the first numeric operand when present, otherwise
+                        // the first categorical column (its raw value is never
+                        // multiplied — `realized_design_column` starts from ones
+                        // and only gates by the level indicators).
+                        let feature_col = numeric_cols
+                            .first()
+                            .copied()
+                            .unwrap_or(categorical_factors[0].1);
+                        linear_terms.push(LinearTermSpec {
+                            name: format!("{label}:{cell_suffix}"),
+                            feature_col,
+                            feature_cols: numeric_cols.clone(),
+                            categorical_levels,
+                            double_penalty: false,
+                            coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                            coefficient_min: None,
+                            coefficient_max: None,
+                        });
+                    }
+                    inference_notes.push(format!(
+                        "wired factor-aware linear interaction `{}` as {} treatment-coded cell column(s)",
+                        vars.join(":"),
+                        n_cells
+                    ));
+                }
             }
         }
     }
@@ -4728,5 +4802,185 @@ mod tests {
             parsed.right,
             BSplineEndpointBoundaryCondition::Anchored { value } if value.abs() < 1e-12
         ));
+    }
+
+    #[test]
+    fn categorical_by_numeric_interaction_expands_treatment_coded_cells() {
+        // Regression for the #1133 checklist item: a `factor:numeric` linear
+        // interaction previously bailed with `incompatible_config` ("not yet
+        // wired here"). It must now expand factor-aware into one treatment-coded
+        // cell column per surviving factor level, each equal to the indicator
+        // `1[g == level] * x`, with the reference level dropped.
+        let ds = factor_dataset();
+        // `g` is categorical with two levels (encoded 0.0 → "a", 1.0 → "b").
+        // Treatment coding drops the reference level "a", leaving exactly one
+        // interaction column for level "b".
+        let parsed = parse_formula("y ~ x:g").expect("parse `y ~ x:g`");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+        )
+        .expect("factor-aware `x:g` interaction must build, not error");
+
+        assert_eq!(
+            terms.linear_terms.len(),
+            1,
+            "two-level factor (reference dropped) yields exactly one `x:g` cell column"
+        );
+        let term = &terms.linear_terms[0];
+        assert!(
+            term.is_interaction(),
+            "the categorical-by-numeric cell is a Wilkinson-Rogers interaction"
+        );
+
+        let x_col = *col_map.get("x").expect("x column");
+        let g_col = *col_map.get("g").expect("g column");
+        // The numeric operand `x` is carried as a product factor; the factor
+        // `g` is carried as a level gate, NOT a raw product column.
+        assert_eq!(term.feature_cols, vec![x_col]);
+        assert_eq!(term.categorical_levels.len(), 1);
+        let (gate_col, gate_bits) = term.categorical_levels[0];
+        assert_eq!(gate_col, g_col);
+        // The kept level is the non-reference level, encoded 1.0 ("b").
+        assert_eq!(gate_bits, 1.0_f64.to_bits());
+
+        // Realize the design column and check it equals `1[g == 1.0] * x` row by
+        // row — real numeric correctness, not merely "did not error".
+        let column = term
+            .realized_design_column(ds.values.view())
+            .expect("realize cell column");
+        let n = ds.values.nrows();
+        assert_eq!(column.len(), n);
+        let mut saw_active = false;
+        let mut saw_gated = false;
+        for row in 0..n {
+            let x = ds.values[[row, x_col]];
+            let g = ds.values[[row, g_col]];
+            let expected = if g.to_bits() == 1.0_f64.to_bits() {
+                saw_active = true;
+                x
+            } else {
+                saw_gated = true;
+                0.0
+            };
+            assert!(
+                (column[row] - expected).abs() < 1e-12,
+                "row {row}: g={g}, x={x}, expected {expected}, got {}",
+                column[row]
+            );
+        }
+        assert!(
+            saw_active && saw_gated,
+            "the test data must exercise both the active and gated branches"
+        );
+    }
+
+    #[test]
+    fn categorical_by_categorical_interaction_expands_full_cross_cells() {
+        // A `factor:factor` interaction expands to the cartesian product of the
+        // (treatment-coded) surviving levels of each factor. With a 3-level and a
+        // 2-level factor that is (3-1) * (2-1) = 2 cell columns, each the product
+        // of the two level indicators.
+        let n = 30usize;
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let y = (i as f64).sin();
+            let f = (i % 3) as f64; // 3 levels: 0,1,2
+            let g = (i % 2) as f64; // 2 levels: 0,1
+            rows.push(vec![y, f, g]);
+        }
+        let values = Array2::from_shape_vec(
+            (n, 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular cross-factor data");
+        let ds = Dataset {
+            headers: vec!["y".into(), "f".into(), "g".into()],
+            values,
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "y".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "f".into(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: vec!["f0".into(), "f1".into(), "f2".into()],
+                    },
+                    SchemaColumn {
+                        name: "g".into(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: vec!["g0".into(), "g1".into()],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Categorical,
+                ColumnKindTag::Categorical,
+            ],
+        };
+
+        let parsed = parse_formula("y ~ f:g").expect("parse `y ~ f:g`");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+        )
+        .expect("factor-by-factor `f:g` interaction must build, not error");
+
+        assert_eq!(
+            terms.linear_terms.len(),
+            2,
+            "(3-1)*(2-1) = 2 treatment-coded cross cells"
+        );
+
+        let f_col = *col_map.get("f").expect("f column");
+        let g_col = *col_map.get("g").expect("g column");
+        for term in &terms.linear_terms {
+            // No numeric operand: the realized column is a pure cell indicator.
+            assert!(term.feature_cols.is_empty());
+            assert_eq!(term.categorical_levels.len(), 2);
+            let column = term
+                .realized_design_column(ds.values.view())
+                .expect("realize cross cell");
+            // Each gate references its own factor column.
+            let mut gates = std::collections::HashMap::new();
+            for &(col, bits) in &term.categorical_levels {
+                gates.insert(col, bits);
+            }
+            let f_bits = *gates.get(&f_col).expect("f gate present");
+            let g_bits = *gates.get(&g_col).expect("g gate present");
+            for row in 0..n {
+                let f = ds.values[[row, f_col]];
+                let g = ds.values[[row, g_col]];
+                let expected = if f.to_bits() == f_bits && g.to_bits() == g_bits {
+                    1.0
+                } else {
+                    0.0
+                };
+                assert!(
+                    (column[row] - expected).abs() < 1e-12,
+                    "row {row}: expected {expected}, got {}",
+                    column[row]
+                );
+            }
+            // The cell must actually select some rows (non-empty intersection).
+            assert!(
+                column.iter().any(|&v| v == 1.0),
+                "each cross cell must be observed in the data"
+            );
+        }
     }
 }

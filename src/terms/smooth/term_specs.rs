@@ -943,6 +943,18 @@ pub struct LinearTermSpec {
     /// design column. `len() >= 1`; `len() == 1` is a plain linear effect.
     #[serde(default)]
     pub feature_cols: Vec<usize>,
+    /// Categorical-level gates for a factor-aware `:` interaction.
+    ///
+    /// Each `(col, level_bits)` multiplies the realized design column by the
+    /// indicator `1[data[row, col].to_bits() == level_bits]`. This is how a
+    /// `factor:x` (or `factor:factor`) interaction is expanded: `build_termspec`
+    /// emits one `LinearTermSpec` per surviving cell of the categorical
+    /// operand(s) (treatment-coded, first level dropped per factor), each
+    /// carrying the numeric operands in `feature_cols` and the cell's level
+    /// gate(s) here. Empty for a plain numeric `:` interaction or main effect,
+    /// in which case the realized column is exactly the numeric product.
+    #[serde(default)]
+    pub categorical_levels: Vec<(usize, u64)>,
     /// Optional ridge (`S = I`, REML-selected `λ`) on this linear coefficient.
     /// A parametric linear term carries no wiggliness, so it is **unpenalized by
     /// default** — gam reports the MLE, matching mgcv/glm/survreg/VGAM (which
@@ -972,7 +984,71 @@ impl LinearTermSpec {
 
     /// True when this term is a Wilkinson-Rogers `:` interaction (multi-col).
     pub fn is_interaction(&self) -> bool {
-        self.feature_cols.len() > 1
+        self.feature_cols.len() > 1 || !self.categorical_levels.is_empty()
+    }
+
+    /// Realize this linear term's `(n,)` design column from `data`.
+    ///
+    /// The column is the elementwise product of every numeric feature column
+    /// (`effective_feature_cols`) gated by the categorical-level indicators in
+    /// `categorical_levels`: each `(col, level_bits)` multiplies the running
+    /// column by `1[data[row, col].to_bits() == level_bits]`. A plain numeric
+    /// term (no `categorical_levels`) reduces to the bare product, matching the
+    /// historical behaviour. A pure categorical interaction (empty
+    /// `feature_cols`, non-empty `categorical_levels`) reduces to the cell
+    /// indicator. Bounds are validated here; the returned column has length
+    /// `data.nrows()`.
+    pub fn realized_design_column(
+        &self,
+        data: ArrayView2<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = data.nrows();
+        let p = data.ncols();
+        let bounds = |col: usize| -> Result<(), String> {
+            if col >= p {
+                Err(format!(
+                    "linear term '{}' feature column {} out of bounds for {} columns",
+                    self.name, col, p
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        // Numeric operands. When `categorical_levels` is set we treat
+        // `feature_cols` as the (possibly empty) numeric operand list and start
+        // from a column of ones; otherwise we preserve the legacy backfill from
+        // `feature_col` so a plain term with no `feature_cols` still resolves.
+        let mut column = if self.categorical_levels.is_empty() {
+            let cols = self.effective_feature_cols();
+            for &c in &cols {
+                bounds(c)?;
+            }
+            let mut acc = data.column(cols[0]).to_owned();
+            for &c in cols.iter().skip(1) {
+                acc *= &data.column(c);
+            }
+            acc
+        } else {
+            let mut acc = Array1::<f64>::ones(n);
+            for &c in &self.feature_cols {
+                bounds(c)?;
+                acc *= &data.column(c);
+            }
+            acc
+        };
+
+        for &(col, level_bits) in &self.categorical_levels {
+            bounds(col)?;
+            let gate = data.column(col);
+            for (out, &v) in column.iter_mut().zip(gate.iter()) {
+                if v.to_bits() != level_bits {
+                    *out = 0.0;
+                }
+            }
+        }
+
+        Ok(column)
     }
 }
 
@@ -1580,6 +1656,13 @@ impl TermCollectionSpec {
             // response/time columns shift the runtime layout (issue #898).
             for fc in lt.feature_cols.iter_mut() {
                 *fc = remap(*fc)?;
+            }
+            // A factor-aware `:` interaction also gates on categorical columns;
+            // those indices live in the same training-time layout and must be
+            // realigned to the runtime table alongside the numeric operands, or
+            // the predict-time level indicator would dereference a stale column.
+            for (col, _bits) in lt.categorical_levels.iter_mut() {
+                *col = remap(*col)?;
             }
         }
         for rt in &mut out.random_effect_terms {

@@ -5,7 +5,6 @@ fn build_term_collection_design_inner(
     use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     let n = data.nrows();
-    let p_data = data.ncols();
     let p_intercept = 1usize;
     let p_lin = spec.linear_terms.len();
 
@@ -36,24 +35,18 @@ fn build_term_collection_design_inner(
                         .map(|j| {
                             let linear = &spec.linear_terms[j];
                             // `:` interactions carry multiple feature columns; the
-                            // materialized column is their elementwise product (a
-                            // plain main effect has a single column). Mirror
-                            // `build_term_collection_fixed_blocks` so this path and
-                            // the incremental realizer agree on every interaction.
-                            let cols = linear.effective_feature_cols();
-                            for &col in &cols {
-                                if col >= p_data {
-                                    crate::bail_dim_basis!(
-                                        "linear term '{}' feature column {} out of bounds for {} columns",
-                                        linear.name, col, p_data
-                                    );
-                                }
-                            }
-                            let mut column = data.column(cols[0]).to_owned();
-                            for &c in cols.iter().skip(1) {
-                                column *= &data.column(c);
-                            }
-                            Ok(column)
+                            // materialized column is their elementwise product
+                            // (a plain main effect has a single column), gated by
+                            // any categorical-level indicators for a factor-aware
+                            // `factor:x` expansion. `realized_design_column`
+                            // validates bounds and is the single authority every
+                            // design path (this one, the incremental realizer in
+                            // `build_term_collection_fixed_blocks`, and the
+                            // marginal-slope rank check) shares so they agree on
+                            // every interaction.
+                            linear
+                                .realized_design_column(data)
+                                .map_err(BasisError::InvalidInput)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
 

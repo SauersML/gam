@@ -52,6 +52,7 @@ fn linear_fixture() -> (
             name: "x".to_string(),
             feature_col: 0,
             feature_cols: vec![0],
+            categorical_levels: vec![],
             double_penalty: true,
             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,

@@ -744,34 +744,12 @@ fn linear_term_training_column(
     data: &Dataset,
     term: &LinearTermSpec,
 ) -> Result<Array1<f64>, WorkflowError> {
-    let cols = term.effective_feature_cols();
-    if cols.is_empty() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!(
-                "linear term '{}' has no feature columns; cannot build its training column",
-                term.name
-            ),
-        });
-    }
-    let n = data.values.nrows();
-    let mut out = Array1::<f64>::ones(n);
-    for &col in &cols {
-        if col >= data.values.ncols() {
-            return Err(WorkflowError::SchemaMismatch {
-                reason: format!(
-                    "linear term '{}' feature column {} out of bounds for {} columns",
-                    term.name,
-                    col,
-                    data.values.ncols()
-                ),
-            }
-            .into());
-        }
-        for row in 0..n {
-            out[row] *= data.values[[row, col]];
-        }
-    }
-    Ok(out)
+    // Single shared realizer: numeric product gated by any categorical-level
+    // indicators (factor-aware `:` interaction). Same column the design
+    // assembly emits, so the marginal-slope rank check sees the realized cell
+    // columns rather than the raw categorical codes.
+    term.realized_design_column(data.values.view())
+        .map_err(|reason| WorkflowError::SchemaMismatch { reason })
 }
 
 fn residualize_against_orthonormal_basis(

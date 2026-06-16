@@ -1301,6 +1301,7 @@ mod runaway_tests {
             name: name.to_string(),
             feature_col,
             feature_cols: vec![feature_col],
+            categorical_levels: vec![],
             double_penalty: false,
             coefficient_geometry: LinearCoefficientGeometry::default(),
             coefficient_min: None,

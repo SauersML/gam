@@ -924,6 +924,7 @@ fn bernoulli_marginal_slope_prune_rejects_penalized_redundant_scalar_term() {
             name: "constant_spline_col".to_string(),
             feature_col: 1,
             feature_cols: vec![1],
+            categorical_levels: vec![],
             double_penalty: true,
             coefficient_geometry: crate::smooth::LinearCoefficientGeometry::Unconstrained,
             coefficient_min: None,

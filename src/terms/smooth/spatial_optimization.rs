@@ -4895,29 +4895,15 @@ fn build_term_collection_fixed_blocks(
     blocks.push(DesignBlock::Intercept(data.nrows()));
 
     if !spec.linear_terms.is_empty() {
-        for linear in &spec.linear_terms {
-            for &col in &linear.effective_feature_cols() {
-                if col >= data.ncols() {
-                    crate::bail_dim_basis!(
-                        "linear term '{}' feature column {} out of bounds for {} columns",
-                        linear.name,
-                        col,
-                        data.ncols()
-                    );
-                }
-            }
-        }
         let mut linear_block = Array2::<f64>::zeros((data.nrows(), spec.linear_terms.len()));
         for (j, linear) in spec.linear_terms.iter().enumerate() {
-            let cols = linear.effective_feature_cols();
-            let mut col_view = linear_block.column_mut(j);
-            col_view.assign(&data.column(cols[0]));
-            for &c in cols.iter().skip(1) {
-                let factor = data.column(c);
-                for (out, &x) in col_view.iter_mut().zip(factor.iter()) {
-                    *out *= x;
-                }
-            }
+            // Single shared realizer: numeric product gated by any
+            // categorical-level indicators (factor-aware `:` interaction),
+            // mirroring `build_term_collection_design_inner`.
+            let column = linear
+                .realized_design_column(data)
+                .map_err(BasisError::InvalidInput)?;
+            linear_block.column_mut(j).assign(&column);
         }
         blocks.push(DesignBlock::Dense(crate::matrix::DenseDesignMatrix::from(
             linear_block,

@@ -2828,6 +2828,7 @@ fn warns_for_linear_terms_overlappingwith_smoothvariables() {
             name: "pc1".to_string(),
             feature_col: 0,
             feature_cols: vec![0],
+            categorical_levels: vec![],
             double_penalty: true,
             coefficient_geometry: LinearCoefficientGeometry::default(),
             coefficient_min: None,
