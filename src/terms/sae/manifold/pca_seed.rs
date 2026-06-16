@@ -219,8 +219,12 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                 let pc_pairs = vt_rows / 2;
                 for axis in 0..d {
                     // Rotate each torus axis's PC pair by the multi-start offset
-                    // (same #976 distinct-basin lever as the periodic arm).
-                    let pair = if pc_pairs > 0 {
+                    // (same #976 distinct-basin lever as the periodic arm). With
+                    // `pc_pair_offset == 0` this is the identity (`pair == axis`)
+                    // and the original `pc_b_idx >= vt_rows` break is preserved
+                    // bit-for-bit; a nonzero offset wraps within the available
+                    // pairs so a retry reads a disjoint pair.
+                    let pair = if pc_pair_offset != 0 && pc_pairs > 0 {
                         (axis + pc_pair_offset) % pc_pairs
                     } else {
                         axis
