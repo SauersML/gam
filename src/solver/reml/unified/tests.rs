@@ -2300,7 +2300,7 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
     )
     .unwrap();
     let control_mat =
-        crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&control_operator)
+        crate::solver::rho_optimizer::OuterHessianOperator::materialize_dense(&control_operator)
             .unwrap();
 
     for row in 0..dense.nrows() {
@@ -3461,7 +3461,7 @@ pub(crate) struct FixedOuterHessianOperator {
     pub(crate) matrix: Array2<f64>,
 }
 
-impl crate::solver::outer_strategy::OuterHessianOperator for FixedOuterHessianOperator {
+impl crate::solver::rho_optimizer::OuterHessianOperator for FixedOuterHessianOperator {
     fn dim(&self) -> usize {
         self.matrix.nrows()
     }
