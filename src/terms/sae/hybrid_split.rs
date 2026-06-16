@@ -61,7 +61,7 @@ pub struct AtomLinearImage {
     pub atom_idx: usize,
     /// The mass-weighted coordinate mean `t̄` the line is centered on.
     pub t_bar: f64,
-    /// Per-output-channel intercept `b₀` (length `p`).
+    /// Per-output-channel centered intercept `b₀ = γ̄` at `t̄` (length `p`).
     pub b0: Array1<f64>,
     /// Per-output-channel slope `b₁` (length `p`).
     pub b1: Array1<f64>,
@@ -207,7 +207,7 @@ fn build_atom_candidates(
         }
         let slope = s_tg / s_tt;
         b1[j] = slope;
-        b0[j] = g_bar - slope * t_bar;
+        b0[j] = g_bar;
     }
 
     // Weighted residual sum of squares of the linear sub-model against the
@@ -217,7 +217,7 @@ fn build_atom_candidates(
     for i in 0..n {
         let dt = coords[i] - t_bar;
         for j in 0..p {
-            let pred = b0[j] + dt * b1[j] + t_bar * b1[j]; // = b0[j] + coords[i]*b1[j]
+            let pred = b0[j] + dt * b1[j];
             let r = decoded[[i, j]] - pred;
             linear_rss += weights[i] * r * r;
         }
