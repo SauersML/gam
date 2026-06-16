@@ -71,15 +71,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialLocationScaleWiggleFamily",
+            3,
+            block_states.len(),
+        )?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -171,15 +167,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialLocationScaleWiggleFamily",
+            3,
+            block_states.len(),
+        )?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -218,15 +210,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let Some(subsample) = options.outer_score_subsample.as_ref() else {
             return self.log_likelihood_only(block_states);
         };
-        if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialLocationScaleWiggleFamily",
+            3,
+            block_states.len(),
+        )?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -280,15 +268,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         block_idx: usize,
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialLocationScaleWiggleFamily",
+            3,
+            block_states.len(),
+        )?;
         let (x_t, x_ls) = self.dense_block_designs()?;
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
@@ -484,15 +468,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         //   qww  = 0,         dqww  = 0
         //
         // Implementation below follows these formulas exactly block-by-block.
-        if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialLocationScaleWiggleFamily",
+            3,
+            block_states.len(),
+        )?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -610,15 +590,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                    block_states.len()
-                ),
-            }
-            .into());
-        }
+        validate_block_count::<GamlssError>(
+            "BinomialLocationScaleWiggleFamily",
+            3,
+            block_states.len(),
+        )?;
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
