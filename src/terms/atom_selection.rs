@@ -116,7 +116,7 @@
 //!   [`crate::terms::analytic_penalties::SparsityPenalty`].
 //!
 //! Production SAE-manifold assembly is now first-class in
-//! [`crate::terms::sae_manifold::SaeManifoldTerm::assemble_arrow_schur`]:
+//! [`crate::terms::sae::manifold::SaeManifoldTerm::assemble_arrow_schur`]:
 //! it materializes the joint `(logits, t)` per-row block, including the
 //! assignment diagonal and `(a, t)` cross terms from the atom basis jets, then
 //! hands the result to [`crate::solver::arrow_schur::ArrowSchurSystem`].
@@ -125,7 +125,7 @@
 //!
 //! * Piece 1 (`arrow_schur.rs`, `solve_arrow_newton_step_with_options`): consumed by the
 //!   first-class SAE-manifold assembler in
-//!   [`crate::terms::sae_manifold::SaeManifoldTerm::assemble_arrow_schur`].
+//!   [`crate::terms::sae::manifold::SaeManifoldTerm::assemble_arrow_schur`].
 //! * Piece 4 (`SparsityPenalty`): consumed as a black box via the
 //!   [`AssignmentSparsityCoupling`] trait below. We do not edit Piece 4.
 //! * Piece 5 (REML outer loop): the per-strategy relaxation parameter
