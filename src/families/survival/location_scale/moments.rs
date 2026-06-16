@@ -1,4 +1,5 @@
 use super::*;
+use crate::solver::gauge::Gauge;
 
 pub(crate) fn survival_response_moment_block_ranges(
     p_time: usize,
@@ -504,7 +505,7 @@ pub(crate) fn exact_survival_response_moments(
 
 pub(crate) fn lift_conditional_covariance(
     cov_reduced: &Array2<f64>,
-    z: &Array2<f64>,
+    time_gauge: &Gauge,
     p_threshold_reduced: usize,
     p_threshold_full: usize,
     threshold_fixed_cols: usize,
@@ -513,8 +514,17 @@ pub(crate) fn lift_conditional_covariance(
     log_sigma_fixed_cols: usize,
     p_linkwiggle: usize,
 ) -> Result<Array2<f64>, String> {
-    let p_time_reduced = z.ncols();
-    let p_time_full = z.nrows();
+    if time_gauge.n_blocks() != 1 {
+        return Err(SurvivalLocationScaleError::InvalidConfiguration {
+            reason: format!(
+                "survival location-scale covariance lift expected a single-block time gauge, got {} blocks",
+                time_gauge.n_blocks()
+            ),
+        }
+        .into());
+    }
+    let p_time_reduced = time_gauge.reduced_total();
+    let p_time_full = time_gauge.raw_total();
     if threshold_fixed_cols + p_threshold_reduced != p_threshold_full {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
             "survival location-scale covariance lift threshold dimensions are inconsistent: fixed={}, reduced={}, full={}",
@@ -527,12 +537,12 @@ pub(crate) fn lift_conditional_covariance(
             log_sigma_fixed_cols, p_log_sigma_reduced, p_log_sigma_full
         ) }.into());
     }
-    // Raw↔canonical reconciliation at the time sub-block. The time
-    // identifiability map `z` lifts the inner solver's ACTIVE (reduced,
-    // canonical-gauge) time coefficients back to the RAW time layout, so it must
+    // Raw↔canonical reconciliation at the time sub-block. The time Gauge lifts
+    // the inner solver's ACTIVE (reduced, canonical-gauge) time coefficients
+    // back to the RAW time layout, so its linear map must
     // be at least as tall as it is wide — the active block can never carry more
     // columns than the raw block it expands into. If a future canonicalization
-    // ever produces a `z` whose active width exceeds the raw width (the
+    // ever produces a map whose active width exceeds the raw width (the
     // raw-vs-active drift behind the historical `[N,N] → [N-1,N-1]` finalization
     // panic, #735), surface it here as a structured DimensionMismatch instead of
     // letting the downstream block assignment fault with a bare ndarray
@@ -544,7 +554,7 @@ pub(crate) fn lift_conditional_covariance(
             reason: format!(
                 "survival location-scale covariance lift time map is wider than tall: \
              active(reduced)={p_time_reduced} exceeds raw(full)={p_time_full}; \
-             the time identifiability transform `z` must map reduced→raw"
+             the time identifiability Gauge must map reduced→raw"
             ),
         }
         .into());
@@ -560,28 +570,20 @@ pub(crate) fn lift_conditional_covariance(
         ) }.into());
     }
 
-    // The destination slice is sized from `z` itself (`p_time_full` rows,
-    // `p_time_reduced` cols), so the assign cannot broadcast-fault as long as the
-    // guards above hold and `t_map` is at least that large — which `p_full ≥
-    // p_time_full` and `p_reduced ≥ p_time_reduced` guarantee by construction.
-    let mut t_map = Array2::<f64>::zeros((p_full, p_reduced));
-    t_map
-        .slice_mut(s![0..p_time_full, 0..p_time_reduced])
-        .assign(z);
-    for j in 0..p_threshold_reduced {
-        t_map[[p_time_full + threshold_fixed_cols + j, p_time_reduced + j]] = 1.0;
-    }
-    for j in 0..p_log_sigma_reduced {
-        t_map[[
-            p_time_full + p_threshold_full + log_sigma_fixed_cols + j,
-            p_time_reduced + p_threshold_reduced + j,
-        ]] = 1.0;
-    }
-    for j in 0..p_linkwiggle {
-        t_map[[
-            p_time_full + p_threshold_full + p_log_sigma_full + j,
-            p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + j,
-        ]] = 1.0;
-    }
-    Ok(t_map.dot(cov_reduced).dot(&t_map.t()))
+    let fixed_tail_transform = |full: usize, fixed: usize, reduced: usize| {
+        let mut t = Array2::<f64>::zeros((full, reduced));
+        for j in 0..reduced {
+            t[[fixed + j, j]] = 1.0;
+        }
+        t
+    };
+    let joint_gauge = Gauge::from_block_transforms(&[
+        time_gauge.block_transform(0),
+        fixed_tail_transform(p_threshold_full, threshold_fixed_cols, p_threshold_reduced),
+        fixed_tail_transform(p_log_sigma_full, log_sigma_fixed_cols, p_log_sigma_reduced),
+        Array2::<f64>::eye(p_linkwiggle),
+    ]);
+    debug_assert_eq!(joint_gauge.raw_total(), p_full);
+    debug_assert_eq!(joint_gauge.reduced_total(), p_reduced);
+    Ok(joint_gauge.lift_covariance(cov_reduced))
 }

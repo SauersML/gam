@@ -1,4 +1,5 @@
 use super::*;
+use crate::solver::gauge::Gauge;
 
 pub(crate) fn structural_time_coefficient_constraints(
     design_derivative_exit: &DesignMatrix,
@@ -1151,11 +1152,7 @@ pub(crate) fn prepare_identified_time_block(
         // where it occurs (golden unit test), though real fits use rank-1 above.
         if r == 2
             && z.nrows() == p
-            && let Some(pinned) = pin_reduced_time_warp_slope(
-                &z,
-                &design_exit,
-                log_time_exit,
-            )
+            && let Some(pinned) = pin_reduced_time_warp_slope(&z, &design_exit, log_time_exit)
         {
             let PinnedTimeWarp { z_c, z_t } = pinned;
             let gauge = Gauge::from_block_transform_with_shift(z_c.clone(), z_t);
@@ -1167,10 +1164,7 @@ pub(crate) fn prepare_identified_time_block(
             let (reduced_exit, offset_exit) =
                 gauge.restrict_design_and_offset(&design_exit, &input.offset_exit);
             let (reduced_derivative_exit, derivative_offset_exit) = gauge
-                .restrict_design_and_offset(
-                    &design_derivative_exit,
-                    &input.derivative_offset_exit,
-                );
+                .restrict_design_and_offset(&design_derivative_exit, &input.derivative_offset_exit);
             let reduced_derivative_design =
                 DesignMatrix::Dense(DenseDesignMatrix::from(reduced_derivative_exit.clone()));
             // Pointwise monotonicity uses the AUGMENTED derivative offset so the
@@ -1202,9 +1196,7 @@ pub(crate) fn prepare_identified_time_block(
                 penalties: Vec::new(),
                 nullspace_dims: Vec::new(),
                 initial_beta,
-                transform: TimeIdentifiabilityTransform {
-                    gauge,
-                },
+                transform: TimeIdentifiabilityTransform { gauge },
                 offset_entry,
                 offset_exit,
                 derivative_offset_exit,

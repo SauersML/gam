@@ -814,11 +814,14 @@ pub(crate) fn finalize_survival_location_scale_fit(
     let beta_time_reduced = fit.block_states[SurvivalLocationScaleFamily::BLOCK_TIME]
         .beta
         .clone();
-    // Affine lift (issue #892): `β_time_raw = z · β_reduced + affine_shift`. The
-    // `affine_shift` is the pinned unit-log-t warp coefficient on the canonical
-    // gauge (zero on the non-pin/identity paths, so the lift stays plain linear).
-    let beta_time =
-        prepared.time_transform.z.dot(&beta_time_reduced) + &prepared.time_transform.affine_shift;
+    // Gauge-owned affine lift (issue #892): `β_time_raw = T · θ + a`. The
+    // pinned unit-log-t warp coefficient lives in `Gauge::affine_shift`; linear
+    // paths carry the zero shift.
+    let beta_time = prepared
+        .time_transform
+        .gauge
+        .lift_block_betas(&[beta_time_reduced.clone()])
+        .remove(0);
     let beta_threshold_active = fit.block_states[SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
         .beta
         .clone();
@@ -878,7 +881,7 @@ pub(crate) fn finalize_survival_location_scale_fit(
         .map(|cov_reduced| {
             lift_conditional_covariance(
                 cov_reduced,
-                &prepared.time_transform.z,
+                &prepared.time_transform.gauge,
                 beta_threshold_active.len(),
                 beta_threshold.len(),
                 prepared.threshold_fixed_cols,
@@ -899,7 +902,7 @@ pub(crate) fn finalize_survival_location_scale_fit(
                 Some(
                     lift_conditional_covariance(
                         &geom.penalized_hessian,
-                        &prepared.time_transform.z,
+                        &prepared.time_transform.gauge,
                         beta_threshold_active.len(),
                         beta_threshold.len(),
                         prepared.threshold_fixed_cols,
