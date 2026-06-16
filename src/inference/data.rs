@@ -1068,6 +1068,23 @@ enum ParquetBatchColumn {
     Strings(Vec<String>),
 }
 
+/// True iff an Arrow column should be treated as a string/categorical column.
+///
+/// Dictionary encoding is a *storage* detail, not a semantic type: pyarrow
+/// dictionary-encodes low-cardinality columns by default, including numeric
+/// ones (integer factor levels, small enums stored as ints). A
+/// `Dictionary(K, V)` column is categorical iff its *value* type `V` is a
+/// string type; `Dictionary(_, Int*/UInt*/Float*/Bool)` is numeric. We recurse
+/// through the value type so nested dictionaries resolve to their leaf type.
+fn parquet_field_is_string(dt: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Utf8 | DataType::LargeUtf8 => true,
+        DataType::Dictionary(_, value_type) => parquet_field_is_string(value_type),
+        _ => false,
+    }
+}
+
 fn decode_parquet_batch_column(
     col: &dyn arrow::array::Array,
     n_rows: usize,
@@ -1125,6 +1142,27 @@ fn decode_parquet_batch_column(
             (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
         ));
     }
+
+    // Numeric-valued dictionary columns (pyarrow dictionary-encodes
+    // low-cardinality numeric columns by default) are not directly a
+    // primitive array. Decode them to their concrete value type so the normal
+    // numeric arms below apply. `parquet_field_is_string` has already routed
+    // string-valued dictionaries through the categorical branch above, so any
+    // dictionary reaching here has a numeric value type.
+    let decoded_col;
+    let col: &dyn arrow::array::Array = if let DataType::Dictionary(_, value_type) = col.data_type()
+    {
+        decoded_col =
+            arrow::compute::cast(col, value_type).map_err(|e| DataError::ParseError {
+                reason: format!(
+                    "failed to decode dictionary-encoded numeric column '{}': {e}",
+                    header
+                ),
+            })?;
+        decoded_col.as_ref()
+    } else {
+        col
+    };
 
     let mut values = Vec::with_capacity(n_rows);
     match col.data_type() {
@@ -1199,7 +1237,6 @@ fn load_parquet_inferred(
     path: &Path,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, DataError> {
-    use arrow::datatypes::DataType;
     use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
     use rayon::prelude::*;
     use std::fs::File;
@@ -1258,12 +1295,12 @@ fn load_parquet_inferred(
     let mut is_string_col: Vec<bool> = vec![false; p];
 
     for (j, field) in selected_fields.iter().enumerate() {
-        match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _) => {
-                is_string_col[j] = true;
-                string_cols[j] = Some(Vec::new());
-            }
-            _ => {}
+        // A dictionary-encoded column is categorical only when its *value* type
+        // is a string type; a numeric-valued dictionary (e.g. pyarrow's default
+        // encoding of low-cardinality integer columns) must stay numeric.
+        if parquet_field_is_string(field.data_type()) {
+            is_string_col[j] = true;
+            string_cols[j] = Some(Vec::new());
         }
     }
 
@@ -2099,6 +2136,61 @@ mod tests {
 
         assert_eq!(ds.values[[0, 0]], 2.0);
         assert_eq!(ds.values[[0, 1]], 0.0);
+    }
+
+    #[test]
+    fn numeric_valued_dictionary_column_classifies_and_decodes_as_numeric() {
+        // Regression for #1162: pyarrow dictionary-encodes low-cardinality
+        // *numeric* columns by default (e.g. `Dictionary(Int8, Int64)`).
+        // Dictionary encoding is a storage detail, not a semantic type, so such
+        // a column must stay numeric — both at classification time
+        // (`parquet_field_is_string`) and at decode time
+        // (`decode_parquet_batch_column`). Previously the loader matched ALL
+        // `Dictionary(_, _)` as string/categorical, silently flipping numeric
+        // features to categorical and rejecting valid numeric prediction files
+        // with SchemaMismatch.
+        use arrow::array::{Array, ArrayRef, DictionaryArray, Int8Array, Int64Array};
+        use arrow::datatypes::{DataType, Int8Type};
+        use std::sync::Arc;
+
+        // Logical column values: 5, 7, 5, 7, 5 (low-cardinality integers).
+        let keys = Int8Array::from(vec![0i8, 1, 0, 1, 0]);
+        let dict_values: ArrayRef = Arc::new(Int64Array::from(vec![5i64, 7]));
+        let dict: DictionaryArray<Int8Type> =
+            DictionaryArray::new(keys, dict_values);
+
+        // The dictionary's *value* type is numeric, so the column must NOT be
+        // classified as string/categorical.
+        assert!(matches!(
+            dict.data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert!(
+            !parquet_field_is_string(dict.data_type()),
+            "Dictionary(Int8, Int64) must not be treated as a string column"
+        );
+
+        // A genuine string-valued dictionary still classifies as string.
+        let str_dict: DictionaryArray<Int8Type> =
+            vec!["a", "b", "a"].into_iter().collect();
+        assert!(
+            parquet_field_is_string(str_dict.data_type()),
+            "Dictionary(Int8, Utf8) must remain a string column"
+        );
+
+        // Decoding the numeric dictionary with `is_string_col = false` must
+        // resolve indices through the dictionary and yield the underlying
+        // numeric values (not error, not strings).
+        let decoded = decode_parquet_batch_column(&dict, dict.len(), 0, "x", false)
+            .expect("numeric dictionary column should decode as numeric");
+        match decoded {
+            ParquetBatchColumn::Numeric(values) => {
+                assert_eq!(values, vec![5.0, 7.0, 5.0, 7.0, 5.0]);
+            }
+            ParquetBatchColumn::Strings(_) => {
+                panic!("numeric dictionary column was decoded as strings");
+            }
+        }
     }
 
     #[test]
