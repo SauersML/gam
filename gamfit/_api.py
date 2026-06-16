@@ -401,6 +401,21 @@ def _normalize_smooths(
                 f"TensorBSpline / Pca / PeriodicSplineCurve / Categorical), "
                 f"got {type(descriptor).__name__}"
             )
+        if getattr(descriptor, "by", None) is not None:
+            # `by=` is a real, supported per-row multiplier on the
+            # primitive/manifold numpy FFI paths, but the formula `smooths={}`
+            # descriptor bridge has no consumer for it (the Rust
+            # descriptor-merge in `smooth_overrides.rs` reads no `by` key and is
+            # governed by `deny_unknown_fields`). Serializing it here would
+            # silently no-op. Reject loudly and point at the formula syntax that
+            # does wire `by` (`s(x, by=g)`), mirroring how the descriptor path
+            # rejects the unsupported `double_penalty` key.
+            raise ValueError(
+                f"smooths[{key!r}]: by= is not supported on the smooths={{}} "
+                f"descriptor path (it would be silently dropped). Use the "
+                f"formula by-smooth syntax instead, e.g. fit(df, "
+                f'"y ~ s({key}, by=g)").'
+            )
         payload = descriptor.to_rust_descriptor()
         if not isinstance(payload, Mapping):
             raise TypeError(
