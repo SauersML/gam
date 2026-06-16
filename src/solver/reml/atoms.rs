@@ -437,14 +437,85 @@ impl CriterionAtom for SampledBlockAtom {
     }
 }
 
+/// Atom 4 (the simplest β-channel anchor): the penalty quadratic
+/// `½ Σ_k λ_k (β̂ − μ_k)ᵀ S_k (β̂ − μ_k)`.
+///
+/// This is the migration's smallest non-trivial test of the β-channel
+/// discipline — the one place the calculus's envelope/noise-floor correction
+/// has a closed form, so its contract is checkable by hand:
+///
+/// - `value`      = `½ Σ_k λ_k qᵀ S_k q` with `q = β̂ − μ_k` (the prior mean
+///   `μ_k` is zero for the usual smoothing penalties; a nonzero `μ_k` carries
+///   a Gaussian-prior shift). One quadratic form, one internal state.
+/// - `frozen_d1`  w.r.t. the log-smoothing coordinate `ρ_k = ln λ_k` at FIXED
+///   `β̂` is `½ λ_k qᵀ S_k q` — the per-block term itself, because
+///   `∂λ_k/∂ρ_k = λ_k`. ψ-coordinates (which move `S_k`'s *entries*, not its
+///   weight) enter through the shared drift like every other term and are not
+///   this atom's explicit channel, so `frozen_d1` reads only the `ρ` index.
+/// - `beta_channel` = `Σ_k λ_k S_k (β̂ − μ_k) = Sλ(β̂ − μ)` — the *penalty
+///   half* of the KKT residual `g = ∂_β(NLL) + Sλ(β̂ − μ)`. The calculus
+///   contracts it with the shared `β̇`, so the implicit `β̂(θ)`-motion of the
+///   penalty quadratic is charged exactly once and by the same chain rule the
+///   logdet and sampled atoms ride. No site can forget it; none can build a
+///   second, drifting copy.
+///
+/// `stratum` is `None`: the quadratic is C^∞ in both θ and β̂ on its own, so
+/// it declares no boundary — any non-smoothness the evaluation crosses belongs
+/// to the spectral atoms, not here.
+pub struct PenaltyQuadAtom {
+    /// Per-block smoothing weights `λ_k` (NOT logs — the atom multiplies them
+    /// in directly; the `ρ_k = ln λ_k` chain factor lives in `frozen_d1`).
+    pub lambdas: Array1<f64>,
+    /// Per-block penalty quadratic forms `q_k = (β̂ − μ_k)ᵀ S_k (β̂ − μ_k) ≥ 0`,
+    /// evaluated once at the current `β̂` (the only internal state this atom
+    /// needs; value and `frozen_d1` are both projections of it).
+    pub block_quadratics: Array1<f64>,
+    /// `Σ_k λ_k S_k (β̂ − μ_k)` — the penalty half of the KKT residual, the
+    /// atom's exact `∂A/∂β̂`. Built once alongside `block_quadratics`.
+    pub penalty_score: Array1<f64>,
+}
+
+impl CriterionAtom for PenaltyQuadAtom {
+    fn name(&self) -> &'static str {
+        "penalty_quadratic"
+    }
+    fn value(&self) -> f64 {
+        // ½ Σ_k λ_k q_k.
+        0.5 * self
+            .lambdas
+            .iter()
+            .zip(self.block_quadratics.iter())
+            .map(|(&lam, &q)| lam * q)
+            .sum::<f64>()
+    }
+    fn frozen_d1(&self, dir: &ThetaDirection) -> f64 {
+        // ∂/∂ρ_k of ½ λ_k q_k at fixed β̂ is ½ λ_k q_k (since ∂λ_k/∂ρ_k = λ_k).
+        // Only the ρ-block coordinate matching `dir.index` has an explicit
+        // channel; ψ-motion of S_k's entries rides the shared drift.
+        match dir.index {
+            Some(k) if k < self.lambdas.len() => 0.5 * self.lambdas[k] * self.block_quadratics[k],
+            _ => 0.0,
+        }
+    }
+    fn beta_channel(&self) -> Option<BetaChannel> {
+        Some(BetaChannel {
+            grad_beta: self.penalty_score.clone(),
+        })
+    }
+    fn stratum(&self) -> Option<StratumFingerprint> {
+        None
+    }
+}
+
 // Atom 2 in the migration order is `penalty_logdet.rs` itself — it already
 // satisfies the contract (one factorization → value + ρ/ψ/cross
 // derivatives) and needs only the trait impl plus the deletion of its
 // remaining call-site special-casing. The penalty quadratic
-// `½ λ_k (β−μ_k)ᵀ S_k (β−μ_k)` is the simplest β-channel atom (frozen_d1 =
-// the explicit ½λ_k quadratic; beta_channel = Sλ(β̂−μ) = the KKT residual's
-// penalty half) and should be ported alongside the inner-objective atom so
-// the envelope/noise-floor correction emerges from the calculus on day one.
+// `½ λ_k (β−μ_k)ᵀ S_k (β−μ_k)` is realized above as `PenaltyQuadAtom` (the
+// simplest β-channel atom: frozen_d1 = the explicit ½λ_k quadratic;
+// beta_channel = Sλ(β̂−μ) = the KKT residual's penalty half) and is ported
+// alongside the inner-objective atom so the envelope/noise-floor correction
+// emerges from the calculus on day one.
 //
 // ── Migration ledger ──────────────────────────────────────────────────────
 //
@@ -607,5 +678,71 @@ mod tests {
         };
         assert!((sum.value() - (0.5 * 8.0_f64.ln() - 0.4)).abs() < 1e-12);
         assert!((sum.d1(&dir) - 0.935).abs() < 1e-12);
+    }
+
+    /// Per-atom isolation check for the penalty-quadratic anchor
+    /// (`PenaltyQuadAtom`): confirm `value` is `½ Σ_k λ_k q_k`, that the
+    /// `frozen_d1` w.r.t. the ρ_k coordinate is the per-block term `½ λ_k q_k`
+    /// (and zero for any non-ρ-block index), and that `beta_channel` returns
+    /// the penalty-half KKT residual so the `CriterionSum` fold charges its
+    /// envelope correction `⟨Sλ(β̂−μ), β̇⟩` exactly once. Everything is chosen
+    /// to be verifiable by hand against the closed form, matching the
+    /// `HessianLogdetAtom` isolation discipline above.
+    #[test]
+    pub(crate) fn penalty_quad_atom_emits_closed_form_value_score_and_directional_derivative() {
+        // Two penalty blocks: λ = (3, 5), block quadratics q = (qᵀS₀q, qᵀS₁q)
+        // = (2, 4). value = ½(3·2 + 5·4) = ½·26 = 13.
+        // Penalty score Sλ(β̂−μ) is supplied directly (a 2-vector here).
+        let atom = PenaltyQuadAtom {
+            lambdas: array![3.0, 5.0],
+            block_quadratics: array![2.0, 4.0],
+            penalty_score: array![1.5, -0.5],
+        };
+        assert_eq!(atom.name(), "penalty_quadratic");
+        assert!((atom.value() - 13.0).abs() < 1e-12);
+        assert!(
+            atom.stratum().is_none(),
+            "the penalty quadratic is C^∞ and declares no stratum boundary"
+        );
+
+        // frozen_d1 w.r.t. ρ_0 = ln λ_0: ½ λ_0 q_0 = ½·3·2 = 3.
+        let dir0 = ThetaDirection {
+            index: Some(0),
+            beta_dot: Some(Arc::new(array![0.5, 0.5])),
+            h_dot_total: Some(Arc::new(array![[0.0, 0.0], [0.0, 0.0]])),
+        };
+        assert!((atom.frozen_d1(&dir0) - 3.0).abs() < 1e-12);
+
+        // frozen_d1 w.r.t. ρ_1 = ln λ_1: ½ λ_1 q_1 = ½·5·4 = 10.
+        let dir1 = ThetaDirection {
+            index: Some(1),
+            beta_dot: Some(Arc::new(array![0.5, 0.5])),
+            h_dot_total: Some(Arc::new(array![[0.0, 0.0], [0.0, 0.0]])),
+        };
+        assert!((atom.frozen_d1(&dir1) - 10.0).abs() < 1e-12);
+
+        // An out-of-range / non-ρ-block index has no explicit channel.
+        let dir_none = ThetaDirection {
+            index: Some(7),
+            beta_dot: Some(Arc::new(array![0.5, 0.5])),
+            h_dot_total: Some(Arc::new(array![[0.0, 0.0], [0.0, 0.0]])),
+        };
+        assert!(atom.frozen_d1(&dir_none).abs() < 1e-12);
+
+        // β-channel is the penalty-half KKT residual; the calculus contracts
+        // it with β̇ = [0.5, 0.5] ⇒ ⟨[1.5, −0.5], [0.5, 0.5]⟩ = 0.5.
+        let channel = atom
+            .beta_channel()
+            .expect("penalty quadratic declares a β-channel");
+        assert!((channel.grad_beta.dot(&array![0.5, 0.5]) - 0.5).abs() < 1e-12);
+
+        // CriterionSum fold over the ρ_0 direction: value = 13, profiled
+        // d1 = frozen_d1(ρ_0) + ⟨Sλ(β̂−μ), β̇⟩ = 3 + 0.5 = 3.5. The envelope
+        // correction appears with no per-atom chain rule — exactly the win.
+        let sum = CriterionSum {
+            atoms: vec![Box::new(atom)],
+        };
+        assert!((sum.value() - 13.0).abs() < 1e-12);
+        assert!((sum.d1(&dir0) - 3.5).abs() < 1e-12);
     }
 }

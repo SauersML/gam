@@ -167,6 +167,26 @@ pub trait BetaPenaltyOp: Send + Sync {
     /// Materialize the full `K×K` dense penalty matrix (needed by
     /// Direct / SqrtBA modes that form the Schur complement explicitly).
     fn to_dense(&self) -> Array2<f64>;
+    /// Per-row absolute-value sums `out[r] = Σ_c |P[r,c]|`, the row contribution
+    /// to the operator's `∞`-norm. The default folds `to_dense()`, which costs an
+    /// `O(K²)` materialization; structured operators override this to fold their
+    /// compact factors directly so the backward-error certificate's
+    /// `arrow_operator_infinity_norm` never builds a dense `K×K` matrix on the
+    /// SAE LLM-border critical path (#1017). Overrides MUST agree bit-for-bit with
+    /// the `to_dense()` row sums (verified by the cross-check tests).
+    fn row_abs_sums(&self) -> Array1<f64> {
+        let dense = self.to_dense();
+        let k = dense.nrows();
+        let mut out = Array1::<f64>::zeros(k);
+        for r in 0..k {
+            let mut s = 0.0_f64;
+            for c in 0..dense.ncols() {
+                s += dense[[r, c]].abs();
+            }
+            out[r] = s;
+        }
+        out
+    }
     /// Mix the operator's defining state into `hasher` for cache-validity
     /// fingerprinting. Must change whenever `matvec` / `to_dense` would change,
     /// so the factorization / evidence cache (`cache_matches_system`) is
@@ -776,6 +796,30 @@ impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
                     for oc in 0..p {
                         out[[gi_base + oc, gj_base + oc]] += a_ij;
                     }
+                }
+            }
+        }
+        out
+    }
+
+    fn row_abs_sums(&self) -> Array1<f64> {
+        // Mirror `to_dense`: entry `(gi_base+oc, gj_base+oc) += a_ij`. Each
+        // `(li, lj, oc)` lands in a DISTINCT column (`gj_base+oc` is injective in
+        // `(lj, oc)` for a fixed block, and blocks with the same `row_off` have
+        // disjoint `col_off`), so the row's `Σ_c|P[r,c]|` is just the sum of
+        // `|a_ij|` over the contributing `(block, lj)` pairs — no dense matrix.
+        let p = self.p;
+        let mut out = Array1::<f64>::zeros(self.k);
+        for blk in &self.blocks {
+            let (m_i, m_j) = blk.data.dim();
+            for li in 0..m_i {
+                let gi_base = (blk.row_off + li) * p;
+                let mut row_abs = 0.0_f64;
+                for lj in 0..m_j {
+                    row_abs += blk.data[[li, lj]].abs();
+                }
+                for oc in 0..p {
+                    out[gi_base + oc] += row_abs;
                 }
             }
         }

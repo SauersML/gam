@@ -852,17 +852,34 @@ impl SaeManifoldOuterObjective {
         // untouched (Design A). The EFS quadratic fixed-point lane (`efs_step`)
         // cannot carry this non-Gaussian term; the cost lane that THIS path feeds
         // is what the cascade ranks ρ by, so steering it here is sufficient.
-        let consistency = self
-            .term
-            .amortized_encoder_consistency(self.target.view(), &rho)?;
-        let reml_scale = reml_cost.abs().max(1.0);
-        let cost = reml_cost
-            + super::COTRAIN_RECON_WEIGHT * reml_scale * consistency.recon_consistency
-            + super::COTRAIN_CERT_WEIGHT * reml_scale * consistency.uncertified_fraction;
+        let cost = self.fold_cotrain_consistency(reml_cost, &rho)?;
         let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         self.current_rho = rho;
         self.last_loss = Some(loss);
         Ok((cost, beta_hat))
+    }
+
+    /// #1154 — add the amortized-encoder consistency fold to an already-computed
+    /// REML criterion at the converged dictionary for `rho`. Factored out so the
+    /// value-probe lane (`evaluate_with_refine_policy`) and the gradient lane
+    /// (`eval`) fold the IDENTICAL penalty: a value-probe cost and the accepted
+    /// iterate's cost must live in ONE measure or the cascade compares ranked
+    /// points across two objectives (the objective↔gradient desync bug class).
+    /// The fold has no analytic gradient — under Design A the REML λ-gradient
+    /// stays exactly the implicit-function `dβ̂/dλ` path; the consistency term is
+    /// a small auto-scaled penalty the derivative-free cascade lane steers.
+    fn fold_cotrain_consistency(
+        &self,
+        reml_cost: f64,
+        rho: &SaeManifoldRho,
+    ) -> Result<f64, String> {
+        let consistency = self
+            .term
+            .amortized_encoder_consistency(self.target.view(), rho)?;
+        let reml_scale = reml_cost.abs().max(1.0);
+        Ok(reml_cost
+            + super::COTRAIN_RECON_WEIGHT * reml_scale * consistency.recon_consistency
+            + super::COTRAIN_CERT_WEIGHT * reml_scale * consistency.uncertified_fraction)
     }
 
     /// Fellner-Schall / Mackay multiplicative fixed-point step on ρ at
@@ -1062,6 +1079,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let gradient = components.gradient();
         let beta_hat = self.term.flatten_beta();
+        // #1154 — fold the amortized-encoder consistency penalty into the cost an
+        // ACCEPTED iterate reports, identically to the value-probe lane, so the
+        // cascade ranks every point in one measure. The gradient above stays the
+        // exact REML λ-gradient (the fold carries no analytic gradient under
+        // Design A).
+        let cost = self
+            .fold_cotrain_consistency(cost, &rho_state)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
         let cost = self
             .add_fit_data_collapse_penalty(cost, &rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
