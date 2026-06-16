@@ -10,6 +10,36 @@ use super::*;
 /// that gates the compact path in production.
 pub(crate) type ForcedRowLayout = Option<Option<SaeRowLayout>>;
 
+/// #1154 — base co-training weight for the amortized-encoder reconstruction
+/// consistency penalty, as a fraction of the REML criterion magnitude. The
+/// effective weight is `COTRAIN_RECON_WEIGHT · max(|REML|, 1)`, so the penalty
+/// is a bounded, scale-free share of the objective and needs no caller knob.
+pub(crate) const COTRAIN_RECON_WEIGHT: f64 = 0.1;
+
+/// #1154 — base co-training weight for the encoder's certifiable-coverage
+/// penalty (the fraction of (row, atom) encodes the Kantorovich certificate
+/// rejected). Scaled like [`COTRAIN_RECON_WEIGHT`].
+pub(crate) const COTRAIN_CERT_WEIGHT: f64 = 0.05;
+
+/// #1154 — amortized-encoder consistency of a fitted dictionary against its own
+/// fit-time target. The co-training signal of the joint amortized-encoder +
+/// REML loop: how faithfully (and how certifiably) the cheap one-mat-vec
+/// encoder inverts the dictionary the inner solve converged to.
+#[derive(Debug, Clone, Copy)]
+pub struct AmortizedEncoderConsistency {
+    /// Mean per-element squared gap between the amortized reconstruction and the
+    /// exact fitted reconstruction (`‖x̂_amortized − x̂_exact‖² / (n·p)`). Zero ⇒
+    /// the IFT predictor reproduces the encode map exactly to first order.
+    pub recon_consistency: f64,
+    /// Fraction of (row, atom) amortized encodes whose Kantorovich certificate
+    /// failed (`h > ½`) and fell back to the exact chart-center Newton.
+    pub uncertified_fraction: f64,
+    /// Count of uncertified (row, atom) encodes (numerator of the fraction).
+    pub n_uncertified: usize,
+    /// Total (row, atom) encodes scored (`n · K`).
+    pub n_encodes: usize,
+}
+
 impl SaeManifoldTerm {
     #[must_use = "build error must be handled"]
     pub fn new(atoms: Vec<SaeManifoldAtom>, assignment: SaeAssignment) -> Result<Self, String> {
