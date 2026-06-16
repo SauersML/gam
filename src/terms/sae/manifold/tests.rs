@@ -8731,4 +8731,160 @@ mod inner_contract_probe_tests {
             );
         }
     }
+
+    /// #1154 — the joint amortized-encoder + REML co-training fold (Design A).
+    ///
+    /// On a synthetic 1D periodic manifold with KNOWN structure (the target is
+    /// drawn from a true sine curve on the circle), after the inner `(t, β)`
+    /// solve converges to stationarity:
+    ///
+    /// 1. the co-trained criterion is the exact REML criterion PLUS a
+    ///    non-negative, correctly-scaled amortized-encoder consistency penalty —
+    ///    so the fold is sound and the REML λ-coupling is untouched (the inner
+    ///    solve still produces the stationary point the criterion is read at);
+    /// 2. the cheap one-mat-vec amortized encode is FAITHFUL: its reconstruction
+    ///    matches the exact fitted reconstruction (the encode-by-inner-solve
+    ///    truth) within a tight tolerance on the rows the certificate accepts —
+    ///    proving the encoder recovers the same structure the exact path does,
+    ///    at amortized cost; and
+    /// 3. the encoder CERTIFIES coverage of the fitted dictionary (a strictly
+    ///    positive certified fraction), so the co-training signal rewards a real,
+    ///    measurable encoder-quality axis rather than a vacuous one.
+    #[test]
+    fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
+        let n = 24usize;
+        let p = 4usize;
+        let m = 5usize; // periodic harmonic basis width (1, then 2 harmonics)
+        // A true circle coordinate per row, and a smooth periodic decoder, so the
+        // target lies on a genuine 1D periodic manifold (known structure).
+        let coords =
+            Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+        let (phi, jet) = periodic_basis(&coords);
+        // A smooth decoder B (M × p): low-order harmonics dominate so the encode
+        // map is well-conditioned and the IFT predictor is a faithful first-order
+        // model of it (the regime the amortized encoder is built for).
+        let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+            let scale = 1.0 / (1.0 + b as f64);
+            scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+        });
+        let atom = SaeManifoldAtom::new(
+            "periodic_truth",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi.clone(),
+            jet,
+            decoder.clone(),
+            Array2::<f64>::eye(p),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        // The ground-truth ambient target: the exact decoded curve Φ(t*)·B at
+        // unit amplitude, so a perfect fit reproduces the manifold exactly.
+        let target = phi.dot(&decoder);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+
+        // Converge the inner (t, β) solve to stationarity — the REML criterion
+        // and the co-training fold are both read at the converged dictionary.
+        let mut rho_fit = rho.clone();
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho_fit, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .expect("inner solve converges on the known periodic manifold");
+
+        // (1) Fold soundness: the co-trained criterion = REML + scaled, finite,
+        // non-negative consistency penalty.
+        let (reml, _loss) = term
+            .reml_criterion_with_refine_policy(
+                target.view(),
+                &rho,
+                None,
+                4,
+                0.1,
+                1.0e-4,
+                1.0e-4,
+                true,
+            )
+            .expect("REML criterion evaluates");
+        let (cotrained, _loss2, consistency) = term
+            .reml_criterion_cotrained(target.view(), &rho, None, 4, 0.1, 1.0e-4, 1.0e-4)
+            .expect("co-trained criterion evaluates");
+        assert!(
+            cotrained.is_finite() && reml.is_finite(),
+            "both criteria must be finite: cotrained={cotrained}, reml={reml}"
+        );
+        assert!(
+            cotrained >= reml - 1.0e-9,
+            "co-trained criterion must add a NON-NEGATIVE consistency penalty: \
+             cotrained={cotrained} < reml={reml}"
+        );
+        assert!(
+            consistency.recon_consistency >= 0.0
+                && consistency.recon_consistency.is_finite(),
+            "recon consistency must be a finite non-negative gap, got {}",
+            consistency.recon_consistency
+        );
+        assert!(
+            (0.0..=1.0).contains(&consistency.uncertified_fraction),
+            "uncertified fraction must be a probability, got {}",
+            consistency.uncertified_fraction
+        );
+
+        // (3) The encoder must certify real coverage of the fitted dictionary —
+        // not a vacuous all-uncertified fraction.
+        assert!(
+            consistency.uncertified_fraction < 1.0,
+            "the amortized encoder must certify at least some rows of a \
+             well-conditioned periodic dictionary; uncertified_fraction={}",
+            consistency.uncertified_fraction
+        );
+
+        // (2) Faithfulness: on the rows the certificate accepts, the cheap
+        // one-mat-vec amortized encode reconstructs the SAME structure the exact
+        // encode-by-inner-solve produced. Compare the amortized decoded curve to
+        // the exact fitted reconstruction row-by-row over certified rows.
+        let amplitudes = term.fitted_assignment_amplitudes(&rho).unwrap();
+        let encodes = term
+            .amortized_encode_target(target.view(), amplitudes.view())
+            .expect("amortized encode runs");
+        let exact_recon = term.try_fitted_for_rho(&rho).unwrap();
+        let atom0 = &term.atoms[0];
+        let evaluator = atom0.basis_evaluator.as_ref().unwrap();
+        let (phi_hat, _j) = evaluator.evaluate(encodes[0].coords.view()).unwrap();
+        let decoded_hat = phi_hat.dot(&atom0.decoder_coefficients); // (n × p)
+
+        let mut certified_rows = 0usize;
+        let mut max_certified_gap = 0.0_f64;
+        for row in 0..n {
+            if !encodes[0].certified[row] {
+                continue;
+            }
+            certified_rows += 1;
+            let z = amplitudes[[row, 0]];
+            for col in 0..p {
+                let amortized = z * decoded_hat[[row, col]];
+                let gap = (amortized - exact_recon[[row, col]]).abs();
+                if gap > max_certified_gap {
+                    max_certified_gap = gap;
+                }
+            }
+        }
+        assert!(
+            certified_rows > 0,
+            "the certificate must accept at least one row to measure faithfulness"
+        );
+        // The amortized encode is the first-order IFT model of the exact encode;
+        // on a well-conditioned periodic dictionary the certified rows must match
+        // the exact reconstruction to the encode's certified tolerance.
+        assert!(
+            max_certified_gap < 1.0e-2,
+            "amortized encode must reconstruct certified rows within the encode \
+             tolerance of the exact encode-by-inner-solve; max gap={max_certified_gap}"
+        );
+    }
 }
