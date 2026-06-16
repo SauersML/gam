@@ -83,18 +83,17 @@ fn univariate_small_k_smooth_degree_reduces_and_recovers_quadratic() {
         z = z ^ (z >> 31);
         (z >> 11) as f64 / (1u64 << 53) as f64
     };
-    let mut gauss = || {
-        let u1 = next_unit().max(1e-12);
-        let u2 = next_unit();
-        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-    };
-
     let n = 150usize;
     let mut x = Vec::with_capacity(n);
     let mut y = Vec::with_capacity(n);
     for _ in 0..n {
         let xi = 3.0 * next_unit();
-        let yi = (xi - 1.5).powi(2) + 0.05 * gauss();
+        // Box-Muller from two further uniforms (single `next_unit` closure
+        // keeps the borrow checker happy — no nested closure capture).
+        let u1 = next_unit().max(1e-12);
+        let u2 = next_unit();
+        let noise = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+        let yi = (xi - 1.5).powi(2) + 0.05 * noise;
         x.push(xi);
         y.push(yi);
     }
