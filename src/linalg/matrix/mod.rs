@@ -193,7 +193,7 @@ fn weighted_crossprod_dense_view(
     }
 
     let min_parallel_work = WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
-    let Some(chunk_rows) = crate::parallel_strategy::row_reduction_chunk_rows(
+    let Some(chunk_rows) = crate::solver::parallel_strategy::row_reduction_chunk_rows(
         n,
         p_left.saturating_mul(p_right),
         p_left.saturating_mul(p_right),
@@ -511,7 +511,7 @@ fn sparse_csr_weighted_xtwx(
     }
 
     let min_parallel_work = SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
-    let Some(chunk_rows) = crate::parallel_strategy::row_reduction_chunk_rows(
+    let Some(chunk_rows) = crate::solver::parallel_strategy::row_reduction_chunk_rows(
         n,
         avg.min(usize::MAX as u64) as usize,
         p.saturating_mul(p),
@@ -654,7 +654,7 @@ fn sparse_csr_diag_gram(
     }
     let min_parallel_work = SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
     let Some(chunk_rows) =
-        crate::parallel_strategy::row_reduction_chunk_rows(n, 1, p, min_parallel_work)
+        crate::solver::parallel_strategy::row_reduction_chunk_rows(n, 1, p, min_parallel_work)
     else {
         return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     };

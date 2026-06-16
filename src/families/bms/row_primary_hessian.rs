@@ -6916,7 +6916,7 @@ impl BernoulliMarginalSlopeFamily {
             .saturating_mul(primary.total)
             .saturating_mul(16);
         let reduction_cells = slices.total.saturating_mul(slices.total);
-        let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+        let chunk_rows = crate::solver::parallel_strategy::row_reduction_chunk_rows(
             n,
             row_work_units,
             reduction_cells,
@@ -6924,7 +6924,7 @@ impl BernoulliMarginalSlopeFamily {
         )
         .unwrap_or(ROW_CHUNK_SIZE)
         .min(n.max(1));
-        let n_chunks = crate::parallel_strategy::row_reduction_chunk_count(n, chunk_rows);
+        let n_chunks = crate::solver::parallel_strategy::row_reduction_chunk_count(n, chunk_rows);
         let completed_chunks = AtomicUsize::new(0);
         let progress_step = (n_chunks / 10).max(1);
         let acc = (0..n_chunks)
@@ -7130,7 +7130,7 @@ impl BernoulliMarginalSlopeFamily {
             .total
             .saturating_mul(slices.total)
             .saturating_add(slices.total);
-        let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+        let chunk_rows = crate::solver::parallel_strategy::row_reduction_chunk_rows(
             n,
             row_work_units,
             reduction_cells,
@@ -7138,7 +7138,7 @@ impl BernoulliMarginalSlopeFamily {
         )
         .unwrap_or(ROW_CHUNK_SIZE)
         .min(n.max(1));
-        let n_chunks = crate::parallel_strategy::row_reduction_chunk_count(n, chunk_rows);
+        let n_chunks = crate::solver::parallel_strategy::row_reduction_chunk_count(n, chunk_rows);
         let completed_chunks = AtomicUsize::new(0);
         let progress_step = (n_chunks / 10).max(1);
         let (log_likelihood, grad_marginal, grad_logslope, grad_h, grad_w, hessian_acc) =

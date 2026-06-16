@@ -222,7 +222,7 @@ pub(crate) fn weighted_cross_dense(
         return fast_xt_diag_y(left, weights, right);
     }
 
-    let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+    let chunk_rows = crate::solver::parallel_strategy::row_reduction_chunk_rows(
         n,
         p.saturating_mul(q),
         p.saturating_mul(q),
@@ -271,7 +271,7 @@ pub(crate) fn xt_diag_x_dense_into(
         return crate::faer_ndarray::fast_atb(x, weighted);
     }
 
-    let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+    let chunk_rows = crate::solver::parallel_strategy::row_reduction_chunk_rows(
         n,
         p.saturating_mul(p),
         p.saturating_mul(p),
