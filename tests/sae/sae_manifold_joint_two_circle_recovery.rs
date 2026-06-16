@@ -22,7 +22,7 @@
 //! `ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init`).
 
 use gam::linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
-use gam::solver::outer_strategy::OuterProblem;
+use gam::solver::rho_optimizer::OuterProblem;
 use gam::terms::CurvatureWalkReport;
 use gam::terms::latent::LatentManifold;
 use gam::terms::{

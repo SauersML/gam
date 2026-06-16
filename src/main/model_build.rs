@@ -155,20 +155,26 @@ pub(crate) fn fixed_gaussian_shift_frailty_from_spec(
                 sigma_fixed: Some(*sigma),
             },
         ),
-        gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None } => {
-            Err(format!(
-                "{context} currently requires a fixed GaussianShift sigma; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
-            ))
-        }
-        gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier { .. } => Err(format!(
-            "{context} requires --frailty-kind gaussian-shift or no frailty"
+        gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: None,
+        } => Err(format!(
+            "{context} currently requires a fixed GaussianShift sigma; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
         )),
+        gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier { .. } => Err(
+            format!("{context} requires --frailty-kind gaussian-shift or no frailty"),
+        ),
     }
 }
 
 pub(crate) fn fixed_hazard_multiplier_from_saved_family(
     family: &FittedFamily,
-) -> Result<(f64, gam::families::survival::lognormal_kernel::HazardLoading), String> {
+) -> Result<
+    (
+        f64,
+        gam::families::survival::lognormal_kernel::HazardLoading,
+    ),
+    String,
+> {
     match family.frailty() {
         Some(gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
             sigma_fixed: Some(sigma),

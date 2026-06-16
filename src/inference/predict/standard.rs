@@ -473,4 +473,3 @@ impl PredictableModel for StandardPredictor {
         }
     }
 }
-

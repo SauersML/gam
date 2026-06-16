@@ -3673,7 +3673,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
 
-    use crate::solver::outer_strategy::{
+    use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
     };
 
@@ -3760,7 +3760,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         } else {
             DeclaredHessianForm::Unavailable
         })
-        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Disabled)
+        .with_fallback_policy(crate::solver::rho_optimizer::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
         .with_max_iter(outer_max_iter)
@@ -3775,7 +3775,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
     let eval_outer = |st: &mut SpatialAdaptiveOuterState,
                       theta: &Array1<f64>,
-                      order: crate::solver::outer_strategy::OuterEvalOrder|
+                      order: crate::solver::rho_optimizer::OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
         let theta = clamp_theta(theta);
 
@@ -3788,7 +3788,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 .all(|(&a, &b)| (a - b).abs() <= 1e-12)
             && (!matches!(
                 order,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
             ) || analytic_outer_hessian_available)
         {
             st.warm_cache = Some(cached_warm.clone());
@@ -3797,7 +3797,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 gradient: cached_grad.clone(),
                 hessian: if matches!(
                     order,
-                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+                    crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
                 ) && analytic_outer_hessian_available
                 {
                     cached_hess.clone()
@@ -3812,7 +3812,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         let family_eval = base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
         let need_hessian = matches!(
             order,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
         ) && analytic_outer_hessian_available;
         let result = evaluate_custom_family_joint_hyper(
             &family_eval,
@@ -3921,15 +3921,15 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 st,
                 theta,
                 if analytic_outer_hessian_available {
-                    crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian
+                    crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
                 } else {
-                    crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient
+                    crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient
                 },
             )
         },
         |st: &mut SpatialAdaptiveOuterState,
          theta: &Array1<f64>,
-         order: crate::solver::outer_strategy::OuterEvalOrder| {
+         order: crate::solver::rho_optimizer::OuterEvalOrder| {
             eval_outer(st, theta, order)
         },
         Some(|st: &mut SpatialAdaptiveOuterState| {
@@ -7583,13 +7583,13 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     rho_dim: usize,
     hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
-    order: crate::solver::outer_strategy::OuterEvalOrder,
+    order: crate::solver::rho_optimizer::OuterEvalOrder,
     design_revision: Option<u64>,
 ) -> Result<
     (
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     ),
     EstimationError,
 > {
@@ -7617,7 +7617,7 @@ fn evaluate_joint_reml_efs_at_theta(
     hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     design_revision: Option<u64>,
-) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
     evaluator.evaluate_efs(
         &design.design,
         &design.penalties,

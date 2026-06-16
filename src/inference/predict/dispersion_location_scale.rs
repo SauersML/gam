@@ -296,4 +296,3 @@ impl PredictableModel for DispersionLocationScalePredictor {
         vec![BlockRole::Location, BlockRole::Scale]
     }
 }
-

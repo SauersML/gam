@@ -413,4 +413,3 @@ impl PredictableModel for SurvivalPredictor {
         vec![BlockRole::Threshold, BlockRole::Scale]
     }
 }
-

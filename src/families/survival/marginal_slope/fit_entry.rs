@@ -1666,10 +1666,10 @@ pub fn fit_survival_marginal_slope_terms(
 
     // ── Pilot fit: rigid (zero-penalty) to seed coefficients ────────────
     //
-    // The pilot is only a cold-start coefficient initializer. If the workflow
-    // dispatcher already attached an exact or prefix warm-start entry, the
-    // outer optimizer will consume that ρ seed and the first real inner solve
-    // will immediately overwrite these hints at the cached smoothing point.
+    // The pilot is only a cold-start coefficient initializer. If the caller
+    // supplied a warm-start cache session, the outer optimizer will consume
+    // that ρ seed and the first real inner solve will immediately overwrite
+    // these hints at the cached smoothing point.
     // Running the rigid pilot in that regime is pure latency at large scale
     // (the log shows ~15s for n≈196k), and worse, it seeds β at ρ=0 while the
     // cached outer seed may be far from ρ=0. Do a non-consuming peek so the

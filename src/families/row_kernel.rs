@@ -17,7 +17,10 @@
 //! All assembly — gradient, matvec, diagonal, dense Hessian, directional
 //! derivatives — is then generic over any `RowKernel<K>`.
 
-use crate::custom_family::{ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace};
+use crate::custom_family::{
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    JointHessianSourcePreference, MaterializationIntent, use_joint_matrix_free_path,
+};
 use crate::faer_ndarray::fast_ab;
 use crate::matrix::DesignMatrix;
 use crate::solver::estimate::reml::unified::{
@@ -1977,6 +1980,34 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         )))
     }
 
+    fn hessian_source_preference_for_intent(
+        &self,
+        intent: MaterializationIntent,
+    ) -> JointHessianSourcePreference {
+        match intent {
+            // The inner Newton step only needs H·v and the diagonal
+            // preconditioner. Keep large row-kernel families on the
+            // matrix-free path instead of forcing the direct dense build.
+            MaterializationIntent::InnerSolve
+                if use_joint_matrix_free_path(self.cache.p, self.cache.n) =>
+            {
+                JointHessianSourcePreference::Operator
+            }
+            MaterializationIntent::InnerSolve => JointHessianSourcePreference::Dense,
+            // Logdet and outer consumers either factorize/materialize H or
+            // have row-kernel-specific projected trace paths. The one-pass
+            // dense build is bounded and cheaper than reconstructing H from
+            // p canonical HVPs.
+            MaterializationIntent::LogdetFactorization
+            | MaterializationIntent::OuterEvaluation
+            | MaterializationIntent::OuterGradient => JointHessianSourcePreference::Dense,
+        }
+    }
+
+    fn hessian_matvec_available(&self) -> bool {
+        true
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let sl = v.as_slice().ok_or("hessian_matvec: non-contiguous input")?;
         Ok(Some(row_kernel_hessian_matvec(
@@ -1985,6 +2016,21 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
             &self.rows,
             sl,
         )))
+    }
+
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
+        let result = self
+            .hessian_matvec(v)?
+            .ok_or_else(|| "row-kernel hessian_matvec unexpectedly unavailable".to_string())?;
+        if result.len() != out.len() {
+            return Err(format!(
+                "row-kernel hessian_matvec_into: result length {} != out length {}",
+                result.len(),
+                out.len()
+            ));
+        }
+        out.assign(&result);
+        Ok(true)
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
@@ -2063,6 +2109,9 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
 #[cfg(test)]
 mod gram_inner_contraction_tests {
     use super::*;
+    use crate::custom_family::{
+        JointHessianSource, exact_newton_joint_hessian_source_from_workspace,
+    };
     use crate::solver::estimate::reml::unified::ProjectedFactorCache;
     use ndarray::Array2;
 
@@ -2208,6 +2257,40 @@ mod gram_inner_contraction_tests {
             }
             Ok(t)
         }
+    }
+
+    #[test]
+    fn row_kernel_workspace_routes_inner_solve_to_operator() {
+        let p = crate::custom_family::JOINT_MATRIX_FREE_MIN_DIM;
+        let kernel = SyntheticKernel::new(8, p, 0x979);
+        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
+            Arc::new(RowKernelHessianWorkspace::new(kernel).expect("workspace"));
+
+        let source = exact_newton_joint_hessian_source_from_workspace(
+            &workspace,
+            p,
+            MaterializationIntent::InnerSolve,
+            "row-kernel inner source",
+        )
+        .expect("source construction succeeds")
+        .expect("source is present");
+
+        let JointHessianSource::Operator {
+            apply,
+            apply_into,
+            diagonal,
+            ..
+        } = source
+        else {
+            panic!("row-kernel inner solve must use operator source");
+        };
+        assert_eq!(diagonal.len(), p);
+
+        let v = Array1::from_shape_fn(p, |i| (i as f64 % 7.0 - 3.0) * 0.125);
+        let hv = apply(&v).expect("operator apply succeeds");
+        let mut hv_into = Array1::<f64>::zeros(p);
+        apply_into(&v, &mut hv_into).expect("operator apply_into succeeds");
+        assert_eq!(hv, hv_into);
     }
 
     /// Independent reference: per-row, per-column bilinear-of-K-vector form,

@@ -1,4 +1,4 @@
-use gam::solver::outer_strategy::{
+use gam::solver::rho_optimizer::{
     DeclaredHessianForm, Derivative, HessianSource, OuterCapability, Solver, plan,
 };
 

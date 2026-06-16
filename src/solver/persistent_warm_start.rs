@@ -267,28 +267,6 @@ fn persistent_store() -> Option<WarmStartStore> {
     .ok()
 }
 
-/// Look up a single outer-iterate payload by string key without opening
-/// a long-lived session.
-///
-/// Used by the workflow dispatcher to fetch a *seed* from a near-match
-/// (data-independent) key. The session's own [`crate::warm_start::Session::preload`]
-/// stashes the returned entry so the next [`crate::warm_start::Session::try_load`]
-/// returns it ahead of the (empty) exact-key store lookup. Save writes
-/// always go to the session's own key — the prefix lookup is read-only.
-pub(crate) fn lookup_outer_iterate_payload(
-    seed_key: &str,
-) -> Option<crate::warm_start::CachedEntry> {
-    let store = persistent_store()?;
-    let mut fp = Fingerprinter::new();
-    fp.absorb_str(b"outer-iterate-key", seed_key);
-    // Seed-prefix entries can represent related but non-identical fits
-    // (different folds, diseases, or row sets). Their objectives are not on a
-    // common scale, so "lowest objective" is the wrong selection rule here.
-    // Prefer the newest valid seed; exact-key resume still uses objective-
-    // ranked lookup through Session::try_load().
-    store.lookup_latest(&fp.finalize()).ok().flatten()
-}
-
 /// Open a [`crate::warm_start::Session`] for outer-iterate (rho-axis) checkpoints.
 ///
 /// Uses a different fingerprint tag than the inner `warm-start-key`

@@ -96,6 +96,7 @@ pub fn solve_arrow_newton_step_with_options(
         htt_factors,
         htt_factors_undamped,
         schur_factor: step.schur_factor,
+        joint_hessian_log_det: None,
         solver_mode: options.mode,
         ridge_t,
         ridge_beta,
@@ -132,6 +133,7 @@ pub fn solve_arrow_newton_step_with_options(
             cache.cross_row_woodbury = Some(woodbury);
         }
     }
+    cache.joint_hessian_log_det = cache.compute_undamped_arrow_log_det();
     Ok((delta_t, delta_beta, cache))
 }
 

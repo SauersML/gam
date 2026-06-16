@@ -61,9 +61,9 @@
 //! genuine accuracy shortfall failing here is useful and points at a real bug.
 
 use csv::StringRecord;
+use gam::families::survival::assemble_competing_risks_cif;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::families::survival::assemble_competing_risks_cif;
 use gam::test_support::reference::{Column, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,

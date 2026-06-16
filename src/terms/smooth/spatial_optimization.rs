@@ -669,7 +669,7 @@ fn add_latent_id_objective_to_eval(
     eval: &mut (
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     ),
 ) -> Result<(), EstimationError> {
     let contribution =
@@ -684,7 +684,7 @@ fn add_latent_id_objective_to_eval(
     }
     eval.1 += &contribution.gradient;
     if eval.2.is_analytic() {
-        eval.2 = crate::solver::outer_strategy::HessianResult::Unavailable;
+        eval.2 = crate::solver::rho_optimizer::HessianResult::Unavailable;
     }
     Ok(())
 }
@@ -756,7 +756,7 @@ fn add_analytic_penalty_hessian_to_eval(
     eval: &mut (
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     ),
 ) -> Result<(), EstimationError> {
     let flat_len = latent.len();
@@ -771,9 +771,9 @@ fn add_analytic_penalty_hessian_to_eval(
             rho_end
         );
     }
-    let crate::solver::outer_strategy::HessianResult::Analytic(hessian) = &mut eval.2 else {
+    let crate::solver::rho_optimizer::HessianResult::Analytic(hessian) = &mut eval.2 else {
         if eval.2.is_analytic() {
-            eval.2 = crate::solver::outer_strategy::HessianResult::Unavailable;
+            eval.2 = crate::solver::rho_optimizer::HessianResult::Unavailable;
         }
         return Ok(());
     };
@@ -836,7 +836,7 @@ fn add_analytic_penalty_objective_to_eval(
     eval: &mut (
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     ),
 ) -> Result<(), EstimationError> {
     let contribution = analytic_penalty_objective_contribution(theta, rho_dim, latent, registry)?;
@@ -1181,7 +1181,7 @@ macro_rules! impl_exact_joint_theta_memo {
         ) -> Option<(
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
+            crate::solver::rho_optimizer::HessianResult,
         )> {
             if self
                 .current_theta
@@ -1199,7 +1199,7 @@ macro_rules! impl_exact_joint_theta_memo {
             eval: (
                 f64,
                 Array1<f64>,
-                crate::solver::outer_strategy::HessianResult,
+                crate::solver::rho_optimizer::HessianResult,
             ),
         ) {
             self.last_cost = Some(eval.0);
@@ -1223,7 +1223,7 @@ struct SingleBlockExactJointDesignCache<'d> {
     last_eval: Option<(
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     )>,
     // #1033: ψ-invariant hyper-direction slab cache. The κ hyper_dirs (the n×k
     // ∂X/∂ψ design-derivative slabs + their k×k penalty derivatives) are a pure
@@ -1361,7 +1361,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     ) -> Option<(
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     )> {
         if self
             .last_eval_theta
@@ -1383,7 +1383,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         eval: (
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
+            crate::solver::rho_optimizer::HessianResult,
         ),
     ) {
         self.last_eval_theta = Some(theta.clone());
@@ -1425,7 +1425,7 @@ struct SingleBlockLatentCoordDesignCache {
     last_eval: Option<(
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     )>,
     term_index: crate::types::SmoothTermIdx,
     feature_cols: Vec<usize>,
@@ -1861,7 +1861,7 @@ impl SingleBlockLatentCoordDesignCache {
     ) -> Option<(
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     )> {
         if self
             .current_theta
@@ -1881,7 +1881,7 @@ impl SingleBlockLatentCoordDesignCache {
         eval: (
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
+            crate::solver::rho_optimizer::HessianResult,
         ),
     ) {
         self.last_cost = Some(eval.0);
@@ -2397,17 +2397,17 @@ impl<'d> SpatialJointContext<'d> {
     fn eval_full(
         &mut self,
         theta: &Array1<f64>,
-        order: crate::solver::outer_strategy::OuterEvalOrder,
+        order: crate::solver::rho_optimizer::OuterEvalOrder,
         analytic_outer_hessian_available: bool,
     ) -> Result<
         (
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
+            crate::solver::rho_optimizer::HessianResult,
         ),
         EstimationError,
     > {
-        use crate::solver::outer_strategy::OuterEvalOrder;
+        use crate::solver::rho_optimizer::OuterEvalOrder;
         let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
             && analytic_outer_hessian_available;
         if let Some(eval) = self.cache.memoized_eval(theta) {
@@ -2526,7 +2526,7 @@ impl<'d> SpatialJointContext<'d> {
         // gradient then runs.
         {
             let mut staged_deriv: Option<(Array2<f64>, Array1<f64>)> = None;
-            if theta.len() == self.rho_dim + 1 {
+            if !allow_second_order && theta.len() == self.rho_dim + 1 {
                 let psi = theta[self.rho_dim];
                 if let (Some(tensor), Some(beta)) =
                     (self.frozen_glm_tensor.as_ref(), warm_beta.as_ref())
@@ -2584,7 +2584,7 @@ impl<'d> SpatialJointContext<'d> {
     fn eval_efs(
         &mut self,
         theta: &Array1<f64>,
-    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
         self.cache
             .ensure_theta(theta)
             .map_err(EstimationError::InvalidInput)?;
@@ -2802,7 +2802,7 @@ fn run_exact_joint_spatial_optimization(
         baseline_design.smooth.terms.len(),
         spatial_terms.len()
     );
-    use crate::solver::outer_strategy::{
+    use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
     };
 
@@ -2960,14 +2960,14 @@ fn run_exact_joint_spatial_optimization(
          theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={coord_dim}"
     );
     if outer_fd_audit_eligible {
-        let audit = (|| -> Result<crate::solver::outer_strategy::OuterGradientFdAudit, String> {
+        let audit = (|| -> Result<crate::solver::rho_optimizer::OuterGradientFdAudit, String> {
             let mut eval_at = |theta: &Array1<f64>,
                                mode: crate::solver::estimate::reml::unified::EvalMode|
              -> Result<
                 (
                     f64,
                     Array1<f64>,
-                    crate::solver::outer_strategy::HessianResult,
+                    crate::solver::rho_optimizer::HessianResult,
                 ),
                 String,
             > {
@@ -2988,7 +2988,7 @@ fn run_exact_joint_spatial_optimization(
                     format!("psi_kappa[{}]", i - rho_dim_audit)
                 }
             };
-            crate::solver::outer_strategy::outer_gradient_fd_audit(
+            crate::solver::rho_optimizer::outer_gradient_fd_audit(
                 theta0,
                 1e-4,
                 label_fn,
@@ -5087,7 +5087,7 @@ struct ExactJointDesignCache<'d> {
     last_eval: Option<(
         f64,
         Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
+        crate::solver::rho_optimizer::HessianResult,
     )>,
     rho_dim: usize,
     all_dims: Vec<usize>,
@@ -5263,8 +5263,8 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     rho_dim: usize,
     auxiliary_dim: usize,
     n_params: usize,
-    gradient: crate::solver::outer_strategy::Derivative,
-    hessian: crate::solver::outer_strategy::DeclaredHessianForm,
+    gradient: crate::solver::rho_optimizer::Derivative,
+    hessian: crate::solver::rho_optimizer::DeclaredHessianForm,
     prefer_gradient_only: bool,
     disable_fixed_point: bool,
     risk_profile: crate::seeding::SeedRiskProfile,
@@ -5302,12 +5302,12 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     // scale-free *absolute* floor and the solver's curvature reference are
     // corrected. `None` preserves the prior scale-free calibration.
     profiled_objective_size: Option<(usize, usize)>,
-) -> crate::solver::outer_strategy::OuterProblem {
+) -> crate::solver::rho_optimizer::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
     }
-    let mut problem = crate::solver::outer_strategy::OuterProblem::new(n_params)
+    let mut problem = crate::solver::rho_optimizer::OuterProblem::new(n_params)
         .with_gradient(gradient)
         .with_hessian(hessian)
         .with_prefer_gradient_only(prefer_gradient_only)
@@ -5321,7 +5321,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         // stationarity cannot be enforced, so the ladder routes correctly
         // to a joint gradient-based solver instead of grinding HybridEFS
         // for thousands of iterations.
-        .with_fallback_policy(crate::solver::outer_strategy::FallbackPolicy::Automatic)
+        .with_fallback_policy(crate::solver::rho_optimizer::FallbackPolicy::Automatic)
         .with_psi_dim(auxiliary_dim)
         .with_tolerance(tolerance)
         .with_max_iter(max_iter)
@@ -5412,7 +5412,7 @@ where
         (
             f64,
             Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
+            crate::solver::rho_optimizer::HessianResult,
         ),
         String,
     >,
@@ -5420,10 +5420,10 @@ where
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
-    ) -> Result<crate::solver::outer_strategy::EfsEval, String>,
+    ) -> Result<crate::solver::rho_optimizer::EfsEval, String>,
     SeedFn: FnMut(
         &Array1<f64>,
-    ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError>,
+    ) -> Result<crate::solver::rho_optimizer::SeedOutcome, EstimationError>,
 {
     let n_blocks = block_specs.len();
     if block_term_indices.len() != n_blocks {
@@ -5514,9 +5514,9 @@ where
     let analytic_outer_hessian_available = analytic_joint_hessian_available
         && matches!(
             policy_hessian_form,
-            crate::solver::outer_strategy::DeclaredHessianForm::Either
-                | crate::solver::outer_strategy::DeclaredHessianForm::Dense
-                | crate::solver::outer_strategy::DeclaredHessianForm::Operator { .. }
+            crate::solver::rho_optimizer::DeclaredHessianForm::Either
+                | crate::solver::rho_optimizer::DeclaredHessianForm::Dense
+                | crate::solver::rho_optimizer::DeclaredHessianForm::Operator { .. }
         );
     let prefer_gradient_only = !analytic_outer_hessian_available;
 
@@ -5674,7 +5674,7 @@ where
         (theta_norm, log_kappa_norm)
     };
 
-    use crate::solver::outer_strategy::{
+    use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
     };
 
@@ -5750,14 +5750,14 @@ where
         "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} analytic_grad={analytic_joint_gradient_available} n_total={n_total} theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={psi_dim}"
     );
     if outer_fd_audit_eligible {
-        let audit = (|| -> Result<crate::solver::outer_strategy::OuterGradientFdAudit, String> {
+        let audit = (|| -> Result<crate::solver::rho_optimizer::OuterGradientFdAudit, String> {
             let mut eval_at = |theta: &Array1<f64>,
                                mode: crate::solver::estimate::reml::unified::EvalMode|
              -> Result<
                 (
                     f64,
                     Array1<f64>,
-                    crate::solver::outer_strategy::HessianResult,
+                    crate::solver::rho_optimizer::HessianResult,
                 ),
                 String,
             > {
@@ -5785,7 +5785,7 @@ where
                     )
                 }
             };
-            crate::solver::outer_strategy::outer_gradient_fd_audit(
+            crate::solver::rho_optimizer::outer_gradient_fd_audit(
                 &theta0,
                 1e-4,
                 label,
@@ -6178,7 +6178,7 @@ fn try_exact_joint_latent_coord_optimization(
     options: &FitOptions,
     latent: &StandardLatentCoordConfig,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
-    use crate::solver::outer_strategy::{
+    use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
     };
 
@@ -6239,7 +6239,7 @@ fn try_exact_joint_latent_coord_optimization(
             (
                 f64,
                 Array1<f64>,
-                crate::solver::outer_strategy::HessianResult,
+                crate::solver::rho_optimizer::HessianResult,
             ),
             EstimationError,
         > {
@@ -6295,7 +6295,7 @@ fn try_exact_joint_latent_coord_optimization(
         fn eval_efs(
             &mut self,
             theta: &Array1<f64>,
-        ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+        ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
             self.cache
                 .ensure_theta(theta)
                 .map_err(EstimationError::InvalidInput)?;

@@ -590,9 +590,10 @@ pub(crate) fn latent_window_plugin_survival(
         unloaded_mass_entry,
         unloaded_mass_exit,
     );
-    let jet =
-        gam::families::survival::lognormal_kernel::LatentSurvivalRowJet::evaluate(quadctx, &row, mu, sigma)
-            .map_err(|e| format!("latent hazard-window prediction failed: {e}"))?;
+    let jet = gam::families::survival::lognormal_kernel::LatentSurvivalRowJet::evaluate(
+        quadctx, &row, mu, sigma,
+    )
+    .map_err(|e| format!("latent hazard-window prediction failed: {e}"))?;
     let score_q_entry = if row.mass_entry > 0.0 {
         let bundle = gam::families::survival::lognormal_kernel::log_kernel_bundle(
             quadctx,

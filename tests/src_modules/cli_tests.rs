@@ -38,6 +38,13 @@ use gam::estimate::{
 };
 use gam::families::bms::LatentMeasureKind;
 use gam::families::cubic_cell_kernel as exact_kernel;
+use gam::families::survival::construction::build_survival_baseline_offsets;
+use gam::families::survival::construction::build_survival_timewiggle_from_baseline;
+use gam::families::survival::construction::parse_survival_baseline_config;
+use gam::families::survival::construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
+use gam::families::survival::location_scale::{
+    ResidualDistribution, project_onto_linear_constraints,
+};
 use gam::families::wiggle::{
     buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
 };
@@ -59,11 +66,6 @@ use gam::probability::normal_cdf;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
 };
-use gam::families::survival::construction::build_survival_baseline_offsets;
-use gam::families::survival::construction::build_survival_timewiggle_from_baseline;
-use gam::families::survival::construction::parse_survival_baseline_config;
-use gam::families::survival::construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
-use gam::families::survival::location_scale::{ResidualDistribution, project_onto_linear_constraints};
 use gam::term_builder::{
     heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
 };
@@ -4428,11 +4430,25 @@ fn structural_survival_basis_error_explainswhy_bspline_is_rejected() {
 
 #[test]
 fn structural_survival_basis_detection_is_ispline_only() {
-    assert!(gam::families::survival::construction::survival_basis_supports_structural_monotonicity("ispline"));
-    assert!(gam::families::survival::construction::survival_basis_supports_structural_monotonicity("ISPLINE"));
-    assert!(!gam::families::survival::construction::survival_basis_supports_structural_monotonicity("linear"));
     assert!(
-        !gam::families::survival::construction::survival_basis_supports_structural_monotonicity("bspline")
+        gam::families::survival::construction::survival_basis_supports_structural_monotonicity(
+            "ispline"
+        )
+    );
+    assert!(
+        gam::families::survival::construction::survival_basis_supports_structural_monotonicity(
+            "ISPLINE"
+        )
+    );
+    assert!(
+        !gam::families::survival::construction::survival_basis_supports_structural_monotonicity(
+            "linear"
+        )
+    );
+    assert!(
+        !gam::families::survival::construction::survival_basis_supports_structural_monotonicity(
+            "bspline"
+        )
     );
 }
 

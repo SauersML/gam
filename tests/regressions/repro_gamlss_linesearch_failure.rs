@@ -1,6 +1,6 @@
 use ndarray::Array1;
 
-use gam::solver::outer_strategy::{Derivative, EfsEval, HessianResult, OuterEval, OuterProblem};
+use gam::solver::rho_optimizer::{Derivative, EfsEval, HessianResult, OuterEval, OuterProblem};
 
 /// Verify that `run_outer` propagates the error when the objective only
 /// produces finite values at the origin and errors everywhere else — the

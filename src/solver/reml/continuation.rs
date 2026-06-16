@@ -276,13 +276,13 @@ pub(crate) fn eval_step(
     // `seed_inner_state` call entirely rather than forwarding the empty slice.
     // Forwarding it is a semantic no-op for objectives whose `seed_inner_state`
     // treats an empty β as "leave inner state untouched", but it would CLOBBER
-    // an objective that observably tracks the last-seeded β (the dispatcher's
-    // cache-β warm-start install in `OuterProblem::run`, the survival/custom
-    // marginal-slope seed cache): an empty-β reset would overwrite a warm β the
-    // dispatcher just installed with nothing. The pre-warm is a warm-start
-    // optimization layered ON TOP of the dispatcher's seed-state contract, so
-    // it must never reset that state — only refine it when it carries a real
-    // (non-empty) warm-start β forward across continuation steps (#834, #236).
+    // an objective that observably tracks the last-seeded β (the cache-β
+    // warm-start install in `OuterProblem::run`, the survival/custom
+    // marginal-slope seed cache): an empty-β reset would overwrite a warm β
+    // with nothing. The pre-warm is a warm-start optimization layered ON TOP of
+    // the outer seed-state contract, so it must never reset that state — only
+    // refine it when it carries a real (non-empty) warm-start β forward across
+    // continuation steps (#834, #236).
     if !beta_seed.is_empty() {
         obj.seed_inner_state(beta_seed)
             .map_err(inner_failure_from)?;

@@ -7,11 +7,11 @@ use gam::families::bms::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
     marginal_slope_preserving_scale, marginal_slope_probit_eta,
 };
-use gam::probability::normal_cdf;
 use gam::families::survival::marginal_slope::{
     survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,
     survival_marginal_slope_vector_scale,
 };
+use gam::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 
 // ------------------------------------------------------------------

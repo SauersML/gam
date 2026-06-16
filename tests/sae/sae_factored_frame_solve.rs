@@ -29,7 +29,7 @@
 //! to make a fit pass. A real fit that cannot reach them is a finding.
 
 use gam::linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
-use gam::solver::outer_strategy::OuterProblem;
+use gam::solver::rho_optimizer::OuterProblem;
 use gam::terms::latent::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,

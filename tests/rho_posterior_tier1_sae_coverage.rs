@@ -10,7 +10,7 @@
 use faer::Side as FaerSide;
 use gam::estimate::EstimationError;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
-use gam::solver::outer_strategy::{
+use gam::solver::rho_optimizer::{
     DeclaredHessianForm, Derivative, HessianResult, OuterCapability, OuterEval, OuterObjective,
     OuterProblem, SeedOutcome,
 };

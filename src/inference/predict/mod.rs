@@ -5,15 +5,15 @@ pub mod linalg;
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::bms::{EmpiricalZGrid, LatentMeasureKind};
 use crate::families::bms::{bernoulli_marginal_link_map, empirical_intercept_from_marginal};
-use crate::families::survival::lognormal_kernel::FrailtySpec;
-use crate::families::marginal_slope_shared::{
-    ObservedDenestedCellPartials, eval_coeff4_at,
-    probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
-};
 use crate::families::family_runtime::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
     strategy_from_fit,
 };
+use crate::families::marginal_slope_shared::{
+    ObservedDenestedCellPartials, eval_coeff4_at,
+    probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
+};
+use crate::families::survival::lognormal_kernel::FrailtySpec;
 use crate::inference::model::{
     SavedCompiledFlexBlock, SavedLatentZNormalization, SavedLinkWiggleRuntime,
 };
@@ -822,7 +822,6 @@ pub use gaussian_location_scale::*;
 pub use standard::*;
 pub use survival::*;
 pub use transformation_normal::*;
-
 
 /// Compute eta standard errors from a design matrix and covariance/precision backend.
 fn eta_standard_errors_from_backend(

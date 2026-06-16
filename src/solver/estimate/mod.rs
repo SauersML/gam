@@ -122,11 +122,15 @@ pub(crate) use penalty::{
 pub(crate) use prefit::{
     reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
 };
-pub(crate) use result_types::validate_fitted_link_estimation;
+pub(crate) use result_types::{
+    ensure_finite_scalar_estimation, validate_all_finite_estimation,
+    validate_fitted_link_estimation,
+};
 pub use result_types::{
     AdaptiveRegularizationOptions, BlockRole, Dispersion, FitArtifacts, FitGeometry, FitInference,
     FitOptions, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
-    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
+    ensure_finite_scalar, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
+    saved_sas_state_from_fit, validate_all_finite,
 };
 pub(crate) use smoothing_correction::{
     DP_FLOOR, EigenClassification, PIRLS_INNER_TOLERANCE_FLOOR, RHO_BOUND, RemlConfig,

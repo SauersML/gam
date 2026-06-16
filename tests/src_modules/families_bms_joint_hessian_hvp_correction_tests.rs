@@ -903,11 +903,11 @@ fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
 
     assert_eq!(
         gradient,
-        crate::solver::outer_strategy::Derivative::Analytic
+        crate::solver::rho_optimizer::Derivative::Analytic
     );
     assert_eq!(
         hessian,
-        crate::solver::outer_strategy::DeclaredHessianForm::Either
+        crate::solver::rho_optimizer::DeclaredHessianForm::Either
     );
 }
 

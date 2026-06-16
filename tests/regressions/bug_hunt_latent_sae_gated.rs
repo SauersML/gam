@@ -1,4 +1,4 @@
-use gam::solver::outer_strategy::OuterObjective;
+use gam::solver::rho_optimizer::OuterObjective;
 use gam::terms::decoders::gated_decoder::GatedSAEDecoder;
 use gam::terms::latent::{LatentCoordValues, LatentIdMode};
 use gam::terms::sae::manifold::{

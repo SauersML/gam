@@ -113,6 +113,15 @@ def test_missing_x_raises():
         sae.sae_manifold_fit(K=2)
 
 
+def test_functional_basis_params_clamps_periodic_zero_harmonics():
+    assert sae._functional_basis_params(
+        {"kind": "periodic", "basis_size": 1, "n_harmonics": 0}
+    ) == {"n_harmonics": 1}
+    assert sae._functional_basis_params({"kind": "circle", "basis_size": 0}) == {
+        "n_harmonics": 1
+    }
+
+
 # ---------------------------------------------------------------------------
 # #607 — assignment summary thresholds are mode-specific on the canonical kind.
 # ---------------------------------------------------------------------------
@@ -301,6 +310,41 @@ class _FakeRustModule:
             "oos_projection_top1": False,
             "diagnostics": _diagnostics(k_atoms),
         }
+
+
+def test_oos_payload_threads_trained_basis_sizes(monkeypatch):
+    class _OosFake:
+        def __init__(self):
+            self.basis_sizes = None
+
+        def sae_manifold_predict_oos(self, *args, **kwargs):
+            x_new = np.asarray(args[0], dtype=float)
+            decoder_blocks = args[3]
+            self.basis_sizes = list(args[6])
+            return {
+                "assignments_z": np.ones((x_new.shape[0], 1), dtype=float),
+                "on_atom_coords_t": [np.zeros((x_new.shape[0], 1), dtype=float)],
+                "logits": np.zeros((x_new.shape[0], 1), dtype=float),
+                "fitted": np.zeros((x_new.shape[0], decoder_blocks[0].shape[1]), dtype=float),
+            }
+
+    fake = _OosFake()
+    monkeypatch.setattr(sae, "rust_module", lambda: fake)
+    fit = _make_fit("softmax", n_atoms=1)
+    fit._basis_kinds = ["euclidean"]
+    fit._atom_dims = [1]
+    fit._basis_sizes = [1]
+    fit._n_harmonics = [0]
+    fit._duchon_centers = [np.zeros((1, 1), dtype=float)]
+    fit.decoder_blocks = [np.zeros((1, 2), dtype=float)]
+    fit.training_data = np.zeros((1, 2), dtype=float)
+    fit.fitted = np.zeros((1, 2), dtype=float)
+    fit._oos_projection_top1 = False
+
+    reconstructed = fit.reconstruct(np.ones((2, 2), dtype=float))
+
+    assert fake.basis_sizes == [1]
+    assert reconstructed.shape == (2, 2)
 
 
 def test_new_sae_helpers_are_importable_and_defaults_are_research_objective():

@@ -6,7 +6,7 @@ use gam::inference::certificates::{Certificate, CertificateLedger, Verdict};
 
 use gam::inference::row_measure::CoresetCertificate;
 use gam::solver::logdet_bounds::LogdetEnclosure;
-use gam::solver::outer_strategy::CriterionCertificate;
+use gam::solver::rho_optimizer::CriterionCertificate;
 use gam::solver::structure_search::{CollapseAction, CollapseEvent};
 use gam::terms::sae::encode::EncodeResult;
 

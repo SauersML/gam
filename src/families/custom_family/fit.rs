@@ -938,14 +938,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     } else {
         problem
     };
-    // Attach the workflow-level warm-start session if one was threaded
-    // through. This makes the custom-family outer optimizer (BFGS / ARC
-    // depending on derivative capabilities) use the same persistent
-    // cache infrastructure as standard REML — every accepted outer step
-    // is checkpointed to disk, every fit starts by consulting the disk
-    // for a prior best iterate. Without this, every survival-marginal-
-    // slope / GAMLSS / latent fit starts cold even when a converged ρ
-    // from a near-identical prior fit is sitting in `~/.cache/gam/warm`.
+    // Attach an explicit warm-start session when the caller supplied one.
+    // This makes the custom-family outer optimizer (BFGS / ARC depending on
+    // derivative capabilities) use the same persistent cache infrastructure as
+    // standard REML. Ordinary workflow fits leave this empty so refit-heavy CI
+    // loops do not pay shared-store lookup/checkpoint/eviction I/O.
     let problem = if let Some(session) = options.cache_session.clone() {
         let key_hex = session.key().to_hex();
         log::info!(

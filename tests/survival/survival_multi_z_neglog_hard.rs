@@ -6,10 +6,10 @@
 //! `normal_cdf`) so the test file is self-contained.
 
 use gam::families::bms::MarginalSlopeCovariance;
-use gam::probability::normal_cdf;
 use gam::families::survival::marginal_slope::{
     survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,
 };
+use gam::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 
 // -------- inline splitmix64 PRNG ----------------------------------------

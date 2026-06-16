@@ -1,4 +1,3 @@
-
 fn latent_basis_kind(value: &str) -> Result<&'static str, String> {
     match value.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
         "duchon" | "duchonspline" => Ok("duchon"),
@@ -5713,10 +5712,15 @@ fn sae_manifold_predict_oos<'py>(
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
                     SaeAtomBasisKind::EuclideanPatch => {
-                        let degree = sae_euclidean_degree_for_basis_size(d, basis_size_list[atom_idx])
-                            .map_err(py_value_error)?;
-                        sae_build_euclidean_atom_with_degree(probe_pts.view(), centers.view(), degree)
-                            .map_err(py_value_error)?
+                        let degree =
+                            sae_euclidean_degree_for_basis_size(d, basis_size_list[atom_idx])
+                                .map_err(py_value_error)?;
+                        sae_build_euclidean_atom_with_degree(
+                            probe_pts.view(),
+                            centers.view(),
+                            degree,
+                        )
+                        .map_err(py_value_error)?
                     }
                     _ => sae_build_duchon_atom(probe_pts.view(), centers.view())
                         .map_err(py_value_error)?,
@@ -6211,10 +6215,15 @@ fn sae_steer_delta<'py>(
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
                     SaeAtomBasisKind::EuclideanPatch => {
-                        let degree = sae_euclidean_degree_for_basis_size(d, basis_size_list[atom_idx])
-                            .map_err(py_value_error)?;
-                        sae_build_euclidean_atom_with_degree(probe_pts.view(), centers.view(), degree)
-                            .map_err(py_value_error)?
+                        let degree =
+                            sae_euclidean_degree_for_basis_size(d, basis_size_list[atom_idx])
+                                .map_err(py_value_error)?;
+                        sae_build_euclidean_atom_with_degree(
+                            probe_pts.view(),
+                            centers.view(),
+                            degree,
+                        )
+                        .map_err(py_value_error)?
                     }
                     _ => sae_build_duchon_atom(probe_pts.view(), centers.view())
                         .map_err(py_value_error)?,

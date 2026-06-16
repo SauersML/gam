@@ -4,7 +4,7 @@ use crate::inference::data::load_dataset_projected;
 use crate::inference::formula_dsl::{default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec};
 use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use crate::smooth::SmoothBasisSpec;
-use crate::solver::outer_strategy::{HessianSource, OuterPlan, OuterResult, Solver};
+use crate::solver::rho_optimizer::{HessianSource, OuterPlan, OuterResult, Solver};
 use ndarray::Array2;
 use std::fs;
 use tempfile::tempdir;

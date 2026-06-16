@@ -102,7 +102,7 @@ pub(crate) use crate::solver::estimate::EstimationError;
 
 pub(crate) use crate::solver::evidence::arrow_log_det_from_cache;
 
-pub(crate) use crate::solver::outer_strategy::{
+pub(crate) use crate::solver::rho_optimizer::{
     DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
     OuterEvalOrder, OuterObjective, SeedOutcome,
 };

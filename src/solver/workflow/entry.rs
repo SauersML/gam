@@ -1,50 +1,12 @@
 use super::*;
 
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
-    // Single warm-start chokepoint: open a persistent cache session
-    // keyed on the FitRequest's exact family-shape fingerprint, and
-    // attach it to the variant's BlockwiseFitOptions (or top-level
-    // slot). Family-specific fit functions then consult
-    // `options.cache_session` to seed θ from the last accepted iterate
-    // and checkpoint accepted iterates. This is what makes warm-start
-    // uniform across every model class — adding a new family does NOT
-    // require remembering to wire the cache.
-    //
-    // Hierarchical near-match: if the exact key has no entry, try a
-    // data-independent seed prefix. Two fits that share the same family,
-    // link, baseline, and column structure but differ in their row sets
-    // (cross-validation folds, hyperparameter sweeps, anything refitting
-    // structurally identical models on related data) get their first
-    // fit's ρ as a seed instead of cold-starting. Save always goes to
-    // the exact key so future identical refits get exact hits.
-    let mut request = request;
-    let exact_key = request.cache_key();
-    let seed_key = request.cache_seed_key();
-    if let Some(session) = crate::solver::persistent_warm_start::open_outer_session(&exact_key) {
-        let exact_present = session.peek_load().is_some();
-        if !exact_present
-            && let Some(seed) =
-                crate::solver::persistent_warm_start::lookup_outer_iterate_payload(&seed_key)
-        {
-            let prior_obj = seed.objective.unwrap_or(f64::NAN);
-            log::info!(
-                "[CACHE] seed key={}.. via prefix family={} prior_obj={:.6e}",
-                &exact_key[..8.min(exact_key.len())],
-                request.family_tag(),
-                prior_obj,
-            );
-            session.preload(seed);
-        }
-        request.attach_cache_session(session);
-    }
-    // Mirror checkpoints and finalize to the seed-prefix keyspace so the
-    // *next* fit with related-but-not-identical structure can pick this run's
-    // ρ up via the prefix lookup above, even if the current process is killed
-    // before convergence.
-    let mirror_session = crate::solver::persistent_warm_start::open_outer_session(&seed_key);
-    if let Some(mirror) = mirror_session.as_ref() {
-        request.attach_cache_mirror(Arc::clone(mirror));
-    }
+    // Disk warm-start persistence is opt-in. The always-on in-memory warm start
+    // remains inside the fit engines, but the workflow dispatcher must not open
+    // the shared WarmStartStore for ordinary formula fits: refit-heavy quality
+    // tests get no cross-process reuse and previously paid cache lookup,
+    // checkpoint, and eviction scans on every replicate (#1082/#1114).
+    let request = request;
     // Each `fit_*_model` helper still returns `Result<_, String>` internally;
     // the boundary conversion happens here so the public API returns
     // `WorkflowError::IntegrationFailed` carrying the underlying solver text.

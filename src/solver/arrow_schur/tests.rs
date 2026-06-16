@@ -1556,6 +1556,14 @@ pub(crate) fn schur_inverse_beta_block_matches_dense() {
         }
     }
     let l = cholesky_lower(&h).expect("assembled bordered H must be SPD");
+    let dense_log_det: f64 = (0..l.nrows()).map(|i| 2.0 * l[[i, i]].ln()).sum();
+    let cached_log_det = cache
+        .joint_hessian_log_det
+        .expect("direct undamped solve must cache the joint Hessian log-det");
+    assert!(
+        (cached_log_det - dense_log_det).abs() < 1.0e-9,
+        "cached joint Hessian log-det {cached_log_det} vs dense {dense_log_det}"
+    );
     let h_inv = cholesky_solve_matrix(&l, &Array2::<f64>::eye(dim));
 
     // The β-block of H⁻¹ is the bottom-right K×K corner.

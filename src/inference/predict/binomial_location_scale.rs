@@ -544,4 +544,3 @@ impl PredictableModel for BinomialLocationScalePredictor {
         }
     }
 }
-

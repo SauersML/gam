@@ -1727,8 +1727,8 @@ mod tests {
         BlockRole, FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResult,
         UnifiedFitResultParts,
     };
-    use crate::matrix::DesignMatrix;
     use crate::families::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
+    use crate::matrix::DesignMatrix;
     use crate::types::{
         InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
         ResponseFamily, RhoPrior, StandardLink,

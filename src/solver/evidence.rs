@@ -1971,6 +1971,9 @@ pub fn arrow_log_det_from_cache(cache: &ArrowFactorCache) -> Option<f64> {
         // ridge damping, which is a different operator. Reject loudly.
         return None;
     }
+    if let Some(log_det) = cache.joint_hessian_log_det {
+        return log_det.is_finite().then_some(log_det);
+    }
     let schur = cache.schur_factor.as_ref()?;
 
     let mut acc = 0.0_f64;
@@ -3195,6 +3198,7 @@ mod tests {
             htt_factors: ArrowFactorSlab::from_blocks(vec![l_huu]),
             htt_factors_undamped: crate::solver::arrow_schur::ArrowUndampedFactors::SameAsDamped,
             schur_factor: Some(l_schur),
+            joint_hessian_log_det: None,
             solver_mode: crate::solver::arrow_schur::ArrowSolverMode::Direct,
             ridge_t: 0.0,
             ridge_beta: 0.0,

@@ -241,23 +241,17 @@ impl GpuDispatchPolicy {
     ///   Pass [`Self::MATVEC_OFFLOAD_MIN_CG_ITERS`] when no measured budget is
     ///   available; a tighter (smaller) value only makes the gate stricter.
     ///
-    /// ## Call site to re-key (owned by the arrow-Schur engine, not this file)
+    /// ## Live arrow-Schur call site
     ///
-    /// `crate::solver::arrow_schur::maybe_inject_gpu_schur_matvec` currently
-    /// gates the InexactPCG reduced-Schur matvec injection on
-    /// `dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k)` — the
-    /// **dense-Direct** flop floor keyed on `(n, k)` only, which ignores the
-    /// per-row frame depth `d` (the SAE active-set / M dimension) and the
-    /// `cg_iters` amortization that makes the resident matvec profitable. It
-    /// should instead call
+    /// `crate::solver::arrow_schur::maybe_inject_gpu_schur_matvec` gates the
+    /// InexactPCG reduced-Schur matvec injection on this predicate:
     /// `reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d,
     /// options.pcg.max_iterations.min(options.trust_region.max_iterations))`,
     /// where `sys.d` is the system's max per-row latent depth and the iteration
-    /// budget is the same `max_iterations` the PCG loop is launched with a few
-    /// lines below. `try_device_arrow_direct` (the **dense** Direct point
-    /// solve) correctly keeps `dense_hessian_work_target_is_gpu` — that path is
-    /// a single large factorization, not the amortised matvec, so its gate is
-    /// the right one and must not be changed.
+    /// budget is the same `max_iterations` the PCG loop launches with.
+    /// `try_device_arrow_direct` (the **dense** Direct point solve) correctly
+    /// keeps `dense_hessian_work_target_is_gpu`: that path is a single large
+    /// factorization, not the amortised matvec.
     pub const fn reduced_schur_matvec_should_offload(
         &self,
         n: usize,

@@ -7,7 +7,7 @@ use crate::basis::{
 };
 use crate::estimate::AdaptiveRegularizationOptions;
 use crate::faer_ndarray::{FaerEigh, FaerSvd};
-use crate::solver::outer_strategy::OuterEvalOrder;
+use crate::solver::rho_optimizer::OuterEvalOrder;
 use ndarray::{Axis, array};
 use rand::RngExt;
 use rand::SeedableRng;
@@ -3137,11 +3137,11 @@ fn run_two_block_exact_joint_optimize(
                     eval_mode,
                     crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
                 ) {
-                    crate::solver::outer_strategy::HessianResult::Analytic(Array2::zeros((
+                    crate::solver::rho_optimizer::HessianResult::Analytic(Array2::zeros((
                         theta_dim, theta_dim,
                     )))
                 } else {
-                    crate::solver::outer_strategy::HessianResult::Unavailable
+                    crate::solver::rho_optimizer::HessianResult::Unavailable
                 },
             ))
         },
@@ -3149,7 +3149,7 @@ fn run_two_block_exact_joint_optimize(
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             assert!(!designs.is_empty());
-            Ok(crate::solver::outer_strategy::EfsEval {
+            Ok(crate::solver::rho_optimizer::EfsEval {
                 cost: 0.0,
                 steps: vec![0.0; theta_dim],
                 beta: None,
@@ -3159,7 +3159,7 @@ fn run_two_block_exact_joint_optimize(
                 logdet_enclosure_gap: None,
             })
         },
-        |_beta: &Array1<f64>| Ok(crate::solver::outer_strategy::SeedOutcome::NoSlot),
+        |_beta: &Array1<f64>| Ok(crate::solver::rho_optimizer::SeedOutcome::NoSlot),
     )
     .expect(expect_msg)
 }
@@ -3362,7 +3362,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
     let eval_at = |theta: &Array1<f64>,
                    cache: &mut SingleBlockExactJointDesignCache<'_>,
                    evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
-                   order: crate::solver::outer_strategy::OuterEvalOrder| {
+                   order: crate::solver::rho_optimizer::OuterEvalOrder| {
         cache.ensure_theta(theta).expect("theta applied");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(),
@@ -3389,7 +3389,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
         &theta,
         &mut cache,
         &mut evaluator,
-        crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+        crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
     );
     let hessian = hessian_result
         .materialize_dense()
@@ -3594,7 +3594,7 @@ fn iso_kappa_fd_variant_driver(
             rho_dim,
             hyper_dirs,
             None,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
             None,
         )
         .expect("outer eval");
@@ -3908,7 +3908,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
 /// the tensor — the only thing the test varies is the lane.
 #[test]
 fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
-    use crate::solver::outer_strategy::OuterEvalOrder;
+    use crate::solver::rho_optimizer::OuterEvalOrder;
 
     // ── 1-D isotropic Duchon Gaussian fixture, n = 600. coord_dim == 1
     // routes through the exact-joint spatial optimizer's tensor gate; the
@@ -4106,7 +4106,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
                     theta: &Array1<f64>,
                     with_hessian: bool|
      -> (f64, Array1<f64>, Option<Array2<f64>>) {
-        use crate::solver::outer_strategy::HessianResult;
+        use crate::solver::rho_optimizer::HessianResult;
         cache.ensure_theta(theta).expect("ensure_theta");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(),
@@ -4687,7 +4687,7 @@ fn iso_kappa_duchon_penalty_subspace_projection_pins_trace() {
         rho_dim,
         hyper_dirs,
         None,
-        crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+        crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
         None,
     )
     .expect("analytic outer eval");
@@ -4961,7 +4961,7 @@ fn duchon_probit_per_row_dnu_dpsi_fd_vs_analytic() {
         rho_dim,
         hyper_dirs,
         None,
-        crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+        crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
         None,
     )
     .expect("analytic outer eval");
@@ -5130,9 +5130,9 @@ fn duchon_probit_pirls_determinism_at_zero() {
 
 #[test]
 fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
-    let cap = crate::solver::outer_strategy::OuterCapability {
-        gradient: crate::solver::outer_strategy::Derivative::Analytic,
-        hessian: crate::solver::outer_strategy::DeclaredHessianForm::Either,
+    let cap = crate::solver::rho_optimizer::OuterCapability {
+        gradient: crate::solver::rho_optimizer::Derivative::Analytic,
+        hessian: crate::solver::rho_optimizer::DeclaredHessianForm::Either,
         n_params: 40,
         psi_dim: 31,
         fixed_point_available: true,
@@ -5140,11 +5140,11 @@ fn spatial_aniso_joint_large_psi_dim_keeps_second_order_route() {
         prefer_gradient_only: false,
         disable_fixed_point: false,
     };
-    let route = crate::solver::outer_strategy::plan(&cap);
-    assert_eq!(route.solver, crate::solver::outer_strategy::Solver::Arc);
+    let route = crate::solver::rho_optimizer::plan(&cap);
+    assert_eq!(route.solver, crate::solver::rho_optimizer::Solver::Arc);
     assert_eq!(
         route.hessian_source,
-        crate::solver::outer_strategy::HessianSource::Analytic
+        crate::solver::rho_optimizer::HessianSource::Analytic
     );
     assert!(route.routing_log_line().contains("matrix-free=false"));
 }
@@ -5546,11 +5546,11 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
                     eval_mode,
                     crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
                 ) {
-                    crate::solver::outer_strategy::HessianResult::Analytic(Array2::zeros((
+                    crate::solver::rho_optimizer::HessianResult::Analytic(Array2::zeros((
                         theta_dim, theta_dim,
                     )))
                 } else {
-                    crate::solver::outer_strategy::HessianResult::Unavailable
+                    crate::solver::rho_optimizer::HessianResult::Unavailable
                 },
             ))
         },
@@ -5558,7 +5558,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             assert_eq!(designs.len(), 2);
-            Ok(crate::solver::outer_strategy::EfsEval {
+            Ok(crate::solver::rho_optimizer::EfsEval {
                 cost: 0.0,
                 steps: vec![0.0; theta_dim],
                 beta: None,
@@ -5568,7 +5568,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
                 logdet_enclosure_gap: None,
             })
         },
-        |_beta: &Array1<f64>| Ok(crate::solver::outer_strategy::SeedOutcome::NoSlot),
+        |_beta: &Array1<f64>| Ok(crate::solver::rho_optimizer::SeedOutcome::NoSlot),
     )
     .expect("exact joint no-spatial fast path should succeed");
 
@@ -5835,7 +5835,7 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
     let eval = (
         2.25,
         Array1::<f64>::ones(theta0.len()),
-        crate::solver::outer_strategy::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
+        crate::solver::rho_optimizer::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
     );
     cache.store_eval(eval.clone());
     let cached_eval = cache.memoized_eval(&theta0).expect("cached eval");
@@ -5950,7 +5950,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
     let eval = (
         0.5,
         Array1::<f64>::ones(theta0.len()),
-        crate::solver::outer_strategy::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
+        crate::solver::rho_optimizer::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
     );
     cache.store_eval_at(&theta0, eval.clone());
     let cached_eval = cache.memoized_eval(&theta0).expect("cached eval");
@@ -6060,7 +6060,7 @@ fn single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance
     let eval = (
         1.25_f64,
         Array1::<f64>::from_elem(theta.len(), 0.5),
-        crate::solver::outer_strategy::HessianResult::Analytic(Array2::<f64>::eye(theta.len())),
+        crate::solver::rho_optimizer::HessianResult::Analytic(Array2::<f64>::eye(theta.len())),
     );
     cache.store_eval(eval.clone());
 
@@ -6199,7 +6199,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 rho_dim,
                 build_hyper_dirs(),
                 None,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
                 None,
             )
             .expect("reused eval");
@@ -6226,7 +6226,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 rho_dim,
                 build_hyper_dirs(),
                 None,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
                 None,
             )
             .expect("fresh eval");

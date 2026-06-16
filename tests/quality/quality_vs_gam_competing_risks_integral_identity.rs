@@ -54,9 +54,9 @@
 //! A genuine divergence in (A) is a real bug in the quadrature / `S_total`
 //! factor and must fail — the bounds below are NOT to be loosened to pass.
 
+use gam::families::survival::assemble_competing_risks_cif;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::families::survival::assemble_competing_risks_cif;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,

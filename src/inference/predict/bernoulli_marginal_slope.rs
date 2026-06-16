@@ -2313,4 +2313,3 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         roles
     }
 }
-

@@ -18,7 +18,7 @@
 //! the line to high reconstruction R².
 
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
-use gam::solver::outer_strategy::OuterProblem;
+use gam::solver::rho_optimizer::OuterProblem;
 use gam::terms::latent::LatentManifold;
 use gam::terms::sae::manifold::EuclideanPatchEvaluator;
 use gam::terms::{

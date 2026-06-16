@@ -551,7 +551,10 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             "latent-cloglog-binomial",
         )?)
     } else {
-        if !matches!(frailty, gam::families::survival::lognormal_kernel::FrailtySpec::None) {
+        if !matches!(
+            frailty,
+            gam::families::survival::lognormal_kernel::FrailtySpec::None
+        ) {
             return Err(
                 "frailty is only supported here for --family latent-cloglog-binomial; use the frailty-aware marginal-slope or survival paths instead"
                     .to_string(),
@@ -1261,7 +1264,9 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         progress.set_stage("fit", "writing bernoulli marginal-slope model");
         let save_frailty = match (&frailty, solved.gaussian_frailty_sd) {
             (
-                gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift { sigma_fixed: None },
+                gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
+                    sigma_fixed: None,
+                },
                 Some(learned),
             ) => gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
                 sigma_fixed: Some(learned),

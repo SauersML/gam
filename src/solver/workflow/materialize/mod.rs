@@ -2692,8 +2692,8 @@ pub(crate) fn materialize_survival<'a>(
             ),
         });
     }
-    let cause_count =
-        crate::families::survival::cause_count_from_event_codes(event_codes.view()).into_workflow_result()?;
+    let cause_count = crate::families::survival::cause_count_from_event_codes(event_codes.view())
+        .into_workflow_result()?;
     if cause_count > 1
         && !matches!(
             survival_mode,

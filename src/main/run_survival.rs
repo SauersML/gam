@@ -419,8 +419,8 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         age_exit[i] = t1;
         event_target[i] = survival_event_code_from_value(ev, i)?;
     }
-    let cause_count =
-        gam::families::survival::cause_count_from_event_codes(event_target.view()).into_cli_result()?;
+    let cause_count = gam::families::survival::cause_count_from_event_codes(event_target.view())
+        .into_cli_result()?;
     if cause_count > 1
         && !matches!(
             likelihood_mode,
@@ -1736,28 +1736,29 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let dense_time_entry = prepared.time_design_entry.to_dense();
         let dense_time_exit = prepared.time_design_exit.to_dense();
         let dense_time_derivative = prepared.time_design_derivative_exit.to_dense();
-        let mut model = gam::families::survival::royston_parmar::working_model_from_time_covariateshared(
-            penalties,
-            monotonicity,
-            survivalspec,
-            gam::families::survival::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
-                age_entry: age_entry.view(),
-                age_exit: age_exit.view(),
-                event_target: event_target.view(),
-                event_competing: event_competing.view(),
-                weights: weights.view(),
-                time_entry: dense_time_entry.view(),
-                time_exit: dense_time_exit.view(),
-                time_derivative: dense_time_derivative.view(),
-                covariates: dense_cov_design.view(),
-                monotonicity_constraint_rows: None,
-                monotonicity_constraint_offsets: None,
-                eta_offset_entry: Some(eta_offset_entry.view()),
-                eta_offset_exit: Some(eta_offset_exit.view()),
-                derivative_offset_exit: Some(prepared.derivative_offset_exit.view()),
-            },
-        )
-        .map_err(|e| format!("failed to construct survival model: {e}"))?;
+        let mut model =
+            gam::families::survival::royston_parmar::working_model_from_time_covariateshared(
+                penalties,
+                monotonicity,
+                survivalspec,
+                gam::families::survival::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
+                    age_entry: age_entry.view(),
+                    age_exit: age_exit.view(),
+                    event_target: event_target.view(),
+                    event_competing: event_competing.view(),
+                    weights: weights.view(),
+                    time_entry: dense_time_entry.view(),
+                    time_exit: dense_time_exit.view(),
+                    time_derivative: dense_time_derivative.view(),
+                    covariates: dense_cov_design.view(),
+                    monotonicity_constraint_rows: None,
+                    monotonicity_constraint_offsets: None,
+                    eta_offset_entry: Some(eta_offset_entry.view()),
+                    eta_offset_exit: Some(eta_offset_exit.view()),
+                    derivative_offset_exit: Some(prepared.derivative_offset_exit.view()),
+                },
+            )
+            .map_err(|e| format!("failed to construct survival model: {e}"))?;
         if likelihood_mode != SurvivalLikelihoodMode::Weibull {
             model
                 .set_structural_monotonicity(true, p_time_total)

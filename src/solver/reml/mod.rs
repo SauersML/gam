@@ -2665,8 +2665,7 @@ pub(crate) enum DerivativeMatrixStorage {
 /// Mechanical surface every `DerivativeMatrixStorage` variant must expose so
 /// the `HyperDesignDerivative` / `HyperPenaltyDerivative` wrappers can dispatch
 /// with a single per-call `storage_dispatch!`. Each backend owns its variant's
-/// substantive math; the wrappers contain only one-line routing, the same way
-/// `FamilyFitRequest` collapses `FitRequest`'s per-variant case analysis.
+/// substantive math; the wrappers contain only one-line routing.
 ///
 /// `design_*` variants treat the backend as an X-style operator (rows index
 /// data, columns index coefficients); `penalty_*` variants treat the backend
@@ -4798,8 +4797,7 @@ pub(crate) struct RemlState<'a> {
     /// a single in-process fit (and a fortiori a loop of distinct throwaway
     /// fits, e.g. CI-coverage replicates each on different data, #1082/#1114)
     /// gets zero benefit from it and pays the per-fit open/scan/save in full.
-    /// The workflow dispatcher flips this to `true` only when the caller has
-    /// signalled cross-process intent by attaching a cache session — magic by
-    /// default, no flag: opt-in is the presence of a session.
+    /// `FitConfig::persist_warm_start_disk` flips this to `true` only when the
+    /// caller explicitly asks for cross-process / repeat-fit persistence.
     pub(crate) persistent_warm_start_disk_enabled: AtomicBool,
 }

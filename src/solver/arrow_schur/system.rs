@@ -2305,6 +2305,11 @@ pub struct ArrowFactorCache {
     /// [`ArrowSolverMode::InexactPCG`], where Agarwal-style inexact LM avoids
     /// the dense `K × K` factor.
     pub schur_factor: Option<Array2<f64>>,
+    /// Exact undamped joint-Hessian log-determinant produced by the dense
+    /// factorization path. REML evidence consumes this directly so the Laplace
+    /// normalizer cannot miss the log-det even when later cache consumers only
+    /// need solves/traces.
+    pub joint_hessian_log_det: Option<f64>,
     /// BA mode used to create this cache.
     pub solver_mode: ArrowSolverMode,
     /// Ridge values used to build the cached factors (recorded so the
@@ -2866,6 +2871,36 @@ impl ArrowFactorCache {
 
     pub fn undamped_factors_iter(&self) -> impl Iterator<Item = ArrayView2<'_, f64>> + '_ {
         (0..self.undamped_factor_count()).map(|row| self.undamped_factor(row))
+    }
+
+    pub fn compute_undamped_arrow_log_det(&self) -> Option<f64> {
+        if self.ridge_t != 0.0 || self.ridge_beta != 0.0 {
+            return None;
+        }
+        let schur = self.schur_factor.as_ref()?;
+
+        let mut acc = 0.0_f64;
+        for l in self.undamped_factors_iter() {
+            for i in 0..l.nrows() {
+                let d = l[[i, i]];
+                if d <= 0.0 || !d.is_finite() {
+                    return None;
+                }
+                acc += 2.0 * d.ln();
+            }
+        }
+        for i in 0..schur.nrows() {
+            let d = schur[[i, i]];
+            if d <= 0.0 || !d.is_finite() {
+                return None;
+            }
+            acc += 2.0 * d.ln();
+        }
+        let woodbury_correction = self.cross_row_woodbury_log_det();
+        if !woodbury_correction.is_finite() {
+            return None;
+        }
+        Some(acc + woodbury_correction)
     }
 
     /// The total length of `delta_t` / IFT output vectors for this cache.

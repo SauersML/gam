@@ -2134,7 +2134,7 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
                     1.0e-6,
                     1.0e-6,
                 );
-                crate::solver::outer_strategy::OuterProblem::new(n_params)
+                crate::solver::rho_optimizer::OuterProblem::new(n_params)
                     .with_initial_rho(init_rho_flat)
                     .run(&mut objective, "SAE planted circle dimensionless seed")
                     .unwrap();
@@ -6815,6 +6815,7 @@ pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
         htt_factors: ArrowFactorSlab::from_blocks(vec![array![[1.0_f64, 0.0], [0.0, 1.0e-7]]]),
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: Some(array![[1.0_f64]]),
+        joint_hessian_log_det: None,
         solver_mode: ArrowSolverMode::Direct,
         ridge_t: 0.0,
         ridge_beta: 0.0,
@@ -6841,6 +6842,7 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
         htt_factors: ArrowFactorSlab::from_blocks(vec![factor]),
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: None,
+        joint_hessian_log_det: None,
         solver_mode: ArrowSolverMode::Direct,
         ridge_t: 0.0,
         ridge_beta: 0.0,
@@ -6948,6 +6950,7 @@ pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         htt_factors: htt,
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: Some(schur),
+        joint_hessian_log_det: None,
         solver_mode: ArrowSolverMode::Direct,
         ridge_t: 0.0,
         ridge_beta: 0.0,

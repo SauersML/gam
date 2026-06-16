@@ -12,7 +12,9 @@
 //! computed directly from the q-values.
 
 use gam::families::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState};
-use gam::families::survival::marginal_slope::{SmsTimewiggleMarginalJacobian, SmsTimewiggleTimeJacobian};
+use gam::families::survival::marginal_slope::{
+    SmsTimewiggleMarginalJacobian, SmsTimewiggleTimeJacobian,
+};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 

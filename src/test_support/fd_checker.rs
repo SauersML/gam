@@ -148,6 +148,9 @@ mod tests {
         let wrong = array![2.0, 4.5];
         let err = verify_gradient_vs_fd(objective, &wrong, &x, 1e-6, 1e-5)
             .expect_err("perturbed gradient must be rejected");
-        assert!(err.contains("coordinate 1"), "error should name coord 1: {err}");
+        assert!(
+            err.contains("coordinate 1"),
+            "error should name coord 1: {err}"
+        );
     }
 }

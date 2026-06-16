@@ -3661,11 +3661,11 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
     );
     assert_eq!(
         large_flex_gradient,
-        crate::solver::outer_strategy::Derivative::Analytic
+        crate::solver::rho_optimizer::Derivative::Analytic
     );
     assert_eq!(
         large_flex_hessian,
-        crate::solver::outer_strategy::DeclaredHessianForm::Either
+        crate::solver::rho_optimizer::DeclaredHessianForm::Either
     );
 
     let mut large_rigid_family = large_flex_family.clone();
@@ -3696,7 +3696,7 @@ fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
     // kernels by the generic custom-family joint-hyper assembler — never a
     // finite-difference or quasi-Newton surrogate — so the REML/LAML optimum
     // is bit-identical to the first-order path.
-    use crate::solver::outer_strategy::{
+    use crate::solver::rho_optimizer::{
         plan, DeclaredHessianForm, Derivative, OuterCapability, Solver,
     };
 

@@ -13,7 +13,7 @@
 //! around `SaeManifoldOuterObjective`) and asserts the cascade COMPLETES with a
 //! finite criterion (not the all-seeds-rejected startup error).
 
-use gam::solver::outer_strategy::OuterProblem;
+use gam::solver::rho_optimizer::OuterProblem;
 use gam::terms::latent::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,

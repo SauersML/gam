@@ -41,8 +41,8 @@
 //!      each other.
 
 use csv::StringRecord;
-use gam::smooth::build_term_collection_design;
 use gam::families::survival::construction::evaluate_survival_baseline;
+use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };

@@ -118,7 +118,7 @@ pub use solver::resource::{
 pub use solver::{
     estimate, gaussian_reml, mixture_link, pirls, seeding, topology_selector, visualizer,
 };
-pub use terms::{basis, construction, geometry, smooth, term_builder};
+pub use terms::{basis, construction, smooth, term_builder};
 
 pub use families::custom_family;
 pub use families::gamlss;

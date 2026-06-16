@@ -145,8 +145,8 @@ pub(crate) struct SurvivalLocationScaleSpec {
     pub log_sigma_block: CovariateBlockKind,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
-    /// Persistent warm-start cache session threaded from the workflow
-    /// dispatcher. See [`BlockwiseFitOptions::cache_session`].
+    /// Explicit persistent warm-start cache session. See
+    /// [`BlockwiseFitOptions::cache_session`].
     pub cache_session: Option<std::sync::Arc<crate::warm_start::Session>>,
     /// Persistent warm-start mirror sessions; see
     /// [`BlockwiseFitOptions::cache_mirror_sessions`].
@@ -194,12 +194,10 @@ pub struct SurvivalLocationScaleTermSpec {
     /// Optional warm-start seed for the log-sigma-block log-smoothing parameters (ρ).
     /// Same semantics as `initial_threshold_log_lambdas`.
     pub initial_log_sigma_log_lambdas: Option<Array1<f64>>,
-    /// Persistent warm-start cache session, threaded from the workflow
-    /// dispatcher. See
+    /// Explicit persistent warm-start cache session. See
     /// [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
     pub cache_session: Option<std::sync::Arc<crate::warm_start::Session>>,
-    /// Persistent warm-start mirror sessions, threaded from the workflow
-    /// dispatcher. See
+    /// Explicit persistent warm-start mirror sessions. See
     /// [`crate::families::custom_family::BlockwiseFitOptions::cache_mirror_sessions`].
     pub cache_mirror_sessions: Vec<std::sync::Arc<crate::warm_start::Session>>,
 }

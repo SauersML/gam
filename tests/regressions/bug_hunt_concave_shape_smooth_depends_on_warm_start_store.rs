@@ -14,9 +14,9 @@
 //!   points `TMPDIR` at a fresh, empty, per-run directory; the store is
 //!   anchored under `std::env::temp_dir()/gam/warm/v1` —
 //!   `src/solver/persistent_warm_start.rs:246`, `persistent_store`).
-//! * The SECOND fit runs against the now-warm store, whose data-independent
-//!   seed-prefix lookup (`lookup_outer_iterate_payload`) hands the outer REML
-//!   loop a pre-converged rho seed from the first fit.
+//! * The SECOND fit runs against the now-warm store, whose exact persistent
+//!   outer-iterate entry hands the REML loop a pre-converged rho seed from the
+//!   first fit.
 //!
 //! Observed (debug build): the two fits converge to **different** smooths — the
 //! predictions on a dense grid differ by ~1.3e-2, which is ~30 % of the fitted
@@ -82,7 +82,10 @@ fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
     let col = ds.column_map();
     let x_idx = col["x"];
 
-    let cfg = FitConfig::default(); // gaussian / identity / REML
+    let cfg = FitConfig {
+        persist_warm_start_disk: true,
+        ..FitConfig::default()
+    }; // gaussian / identity / REML, with explicit disk-cache opt-in
     let result = fit_from_formula(formula, &ds, &cfg).unwrap_or_else(|e| {
         panic!("fit '{formula}' aborted (cold-store constrained-startup failure): {e}")
     });
@@ -139,7 +142,7 @@ fn concave_shape_smooth_is_invariant_to_warm_start_store_state() {
 
     // First fit: COLD store (no warm-start seed available).
     let pred_cold = fit_and_predict_on_grid(formula, &x, &y);
-    // Second fit: WARM store (the first fit populated the seed-prefix store).
+    // Second fit: WARM store (the first fit populated the exact persistent store).
     let pred_warm = fit_and_predict_on_grid(formula, &x, &y);
 
     assert!(

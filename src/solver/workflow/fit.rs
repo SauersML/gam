@@ -13,7 +13,7 @@ pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> b
 /// survival location-scale inverse-link profiling path to turn the optimized
 /// `rho` into the concrete `InverseLink` before the final fixed-link refit.
 pub(crate) fn recover_converged_survival_inverse_link<R>(
-    result: crate::solver::outer_strategy::OuterResult,
+    result: crate::solver::rho_optimizer::OuterResult,
     context: &str,
     recover: R,
 ) -> Result<InverseLink, String>
@@ -1137,7 +1137,7 @@ fn optimize_survival_transformation_smoothing(
     let upper = seed_rho.mapv(|v| v + 12.0);
     let problem = OuterProblem::new(num_smoothing)
         .with_gradient(Derivative::Analytic)
-        .with_hessian(crate::solver::outer_strategy::DeclaredHessianForm::Unavailable)
+        .with_hessian(crate::solver::rho_optimizer::DeclaredHessianForm::Unavailable)
         .with_tolerance(1e-4)
         .with_max_iter(120)
         .with_bounds(lower, upper)
@@ -1172,7 +1172,7 @@ fn optimize_survival_transformation_smoothing(
                 &mut (),
                 &Array1<f64>,
             )
-                -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
+                -> Result<crate::solver::rho_optimizer::EfsEval, crate::estimate::EstimationError>,
         >,
     );
     // The outer selector only ever IMPROVES on the seed; it must never be able
@@ -1332,8 +1332,9 @@ fn fit_cause_specific_survival_transformation_custom(
     derivative_floor: f64,
     penalty_block_gamma_priors: &[(String, f64, f64)],
 ) -> Result<SurvivalTransformationFitResult, String> {
-    let cause_count = crate::families::survival::cause_count_from_event_codes(spec.event_target.view())
-        .into_workflow_result()?;
+    let cause_count =
+        crate::families::survival::cause_count_from_event_codes(spec.event_target.view())
+            .into_workflow_result()?;
     if cause_count == 0 {
         return Err(WorkflowError::MissingDependency {
             reason: "cause-specific custom survival fit requires at least one cause".to_string(),
@@ -1820,7 +1821,9 @@ fn store_survival_transformation_persistent_warm_start(
 pub(crate) fn fit_survival_transformation_model(
     request: SurvivalTransformationFitRequest<'_>,
 ) -> Result<SurvivalTransformationFitResult, String> {
-    use crate::families::survival::{PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
+    use crate::families::survival::{
+        PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec,
+    };
 
     let SurvivalTransformationFitRequest {
         data,
@@ -1835,8 +1838,9 @@ pub(crate) fn fit_survival_transformation_model(
             .map_err(|err| err.to_string())?;
     let dense_cov_design = covariate_design.design.to_dense();
     let p_cov = dense_cov_design.ncols();
-    let cause_count = crate::families::survival::cause_count_from_event_codes(spec.event_target.view())
-        .into_workflow_result()?;
+    let cause_count =
+        crate::families::survival::cause_count_from_event_codes(spec.event_target.view())
+            .into_workflow_result()?;
     let exact_derivative_guard = survival_derivative_guard_for_likelihood(spec.likelihood_mode);
 
     let build_working_model =
@@ -2438,7 +2442,7 @@ pub(crate) fn fit_survival_location_scale_model(
                         &mut (),
                         &Array1<f64>,
                     ) -> Result<
-                        crate::solver::outer_strategy::EfsEval,
+                        crate::solver::rho_optimizer::EfsEval,
                         crate::estimate::EstimationError,
                     >,
                 >,

@@ -4443,8 +4443,8 @@ impl<'a> RemlState<'a> {
         }
         // Opt-in only: opening the cross-process outer-iterate session also
         // opens the shared on-disk `WarmStartStore` (dir/eviction scan). Skip
-        // it for in-process fits that never attached a cache session
-        // (#1082/#1114).
+        // it unless `FitConfig::persist_warm_start_disk` enabled disk
+        // persistence (#1082/#1114).
         if !self
             .persistent_warm_start_disk_enabled
             .load(Ordering::Relaxed)
@@ -4456,10 +4456,10 @@ impl<'a> RemlState<'a> {
     }
 
     /// Engage the cross-process ON-DISK warm-start layer. Called from the
-    /// estimate constructor when a cache session is attached (the
-    /// magic-by-default opt-in signal for cross-process / repeat-fit
-    /// persistence). Until this is set the disk load/store/eviction-scan path
-    /// is skipped entirely and only the in-memory warm start is used.
+    /// estimate constructor when `FitConfig::persist_warm_start_disk` requests
+    /// cross-process / repeat-fit persistence. Until this is set the disk
+    /// load/store/eviction-scan path is skipped entirely and only the
+    /// in-memory warm start is used.
     pub(crate) fn enable_persistent_warm_start_disk(&self) {
         self.persistent_warm_start_disk_enabled
             .store(true, Ordering::Relaxed);
@@ -4570,10 +4570,9 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return;
         }
-        // Cross-process disk restore is opt-in (a cache session was attached).
-        // Without it, skip the `persistent_store()` open + dir/eviction scan
-        // entirely — the in-memory warm start fully serves an in-process fit
-        // (#1082/#1114).
+        // Cross-process disk restore is opt-in. Without it, skip the
+        // `persistent_store()` open + dir/eviction scan entirely — the
+        // in-memory warm start fully serves an in-process fit (#1082/#1114).
         if !self
             .persistent_warm_start_disk_enabled
             .load(Ordering::Relaxed)
