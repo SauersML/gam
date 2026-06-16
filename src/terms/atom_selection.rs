@@ -66,7 +66,7 @@
 //!    the inactive coordinates from the active-set.
 //!
 //! The production SAE-manifold assembler now applies that stacking recipe in
-//! [`crate::terms::sae_manifold::SaeManifoldTerm::assemble_arrow_schur`]:
+//! [`crate::terms::sae::manifold::SaeManifoldTerm::assemble_arrow_schur`]:
 //! the `(K, K)` assignment block sits on the diagonal corner of `ext_n`, the
 //! `K` per-atom `(d_k, d_k)` coordinate blocks tile the rest, and the
 //! off-diagonal `(a_{n,k}, t_{n,k,·})` couplings are populated from each

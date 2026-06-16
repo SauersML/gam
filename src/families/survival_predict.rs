@@ -14,7 +14,7 @@ use ndarray::{Array1, Array2, ArrayView2, s};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::scale_design::scale_transform_from_payload;
 use crate::families::survival::assemble_competing_risks_cif_from_endpoints;
-use crate::families::survival_construction::{
+use crate::families::survival::construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
@@ -1806,7 +1806,7 @@ fn predict_survival_location_scale_batch(
     with_uncertainty: bool,
 ) -> Result<SurvivalPredictResult, String> {
     use crate::families::scale_design::build_scale_deviation_operator;
-    use crate::families::survival_construction::evaluate_survival_time_basis_row;
+    use crate::families::survival::construction::evaluate_survival_time_basis_row;
     use crate::families::survival_location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
         predict_survival_location_scale_from_linear_components,
@@ -2063,7 +2063,7 @@ fn predict_survival_location_scale_batch(
         if reduced_parametric_aft {
             for (slot, &t) in offset.iter_mut().zip(eval_exit.iter()) {
                 *slot -= t
-                    .max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
+                    .max(crate::families::survival::construction::SURVIVAL_TIME_FLOOR)
                     .ln();
             }
         }
@@ -2146,7 +2146,7 @@ fn predict_survival_location_scale_batch(
         if reduced_parametric_aft {
             for (slot, &t) in eta_t.iter_mut().zip(eval_exit.iter()) {
                 *slot -= t
-                    .max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
+                    .max(crate::families::survival::construction::SURVIVAL_TIME_FLOOR)
                     .ln();
             }
         }
@@ -2181,7 +2181,7 @@ fn predict_survival_location_scale_batch(
         let mut deriv = Array1::<f64>::zeros(eval_exit.len());
         for (k, slot) in deriv.iter_mut().enumerate() {
             let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls[k]);
-            let t = eval_exit[k].max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR);
+            let t = eval_exit[k].max(crate::families::survival::construction::SURVIVAL_TIME_FLOOR);
             *slot = inv_sigma / t;
         }
         deriv
