@@ -198,7 +198,16 @@ fn build_rigid_problem(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec
 
 fn main() {
     init();
-    let (data, spec) = build_rigid_problem(PROFILE_N);
+    // Optional positional arg overrides the problem size so the same example
+    // serves both a fast structural smoke (`cargo run --example ...`) and the
+    // large profiling regime (`cargo run --release --example ... -- 120000`)
+    // without env vars. Defaults to `PROFILE_N`.
+    let n = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse::<usize>().ok())
+        .filter(|&v| v >= 100)
+        .unwrap_or(PROFILE_N);
+    let (data, spec) = build_rigid_problem(n);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
         data: data.view(),
         spec,
@@ -214,7 +223,7 @@ fn main() {
     let elapsed = start.elapsed();
     eprintln!(
         "[RIGID-PROFILE] n={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={}",
-        PROFILE_N,
+        n,
         elapsed.as_secs_f64(),
         fit.fit.outer_iterations,
         fit.fit.inner_cycles,
