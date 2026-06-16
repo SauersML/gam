@@ -570,6 +570,61 @@ fn amortized_encode_matches_certified_newton_on_certified_rows() {
 }
 
 #[test]
+fn certified_encode_row_is_independent_of_distilled_warm_start() {
+    // Regression for #1166: the cold certified path is the exact probe used to
+    // audit the distilled encoder. It must not consume the distilled Jacobian;
+    // otherwise poisoning that Jacobian makes the "exact" probe self-referential
+    // and it can no longer detect amortized encode error.
+    let atom = planted_circle_atom(16);
+    let atlas = EncodeAtlas::build(
+        std::slice::from_ref(&atom),
+        &[1.0],
+        1.0,
+        AtlasConfig {
+            grid_resolution: 48,
+            ridge: 1.0e-9,
+            newton_steps: 2,
+        },
+    )
+    .expect("atlas build");
+    let x = circle_target(0.2);
+
+    let (cold_t, cold_cert) = atlas
+        .certified_encode_row(&atom, 0, x.view(), 1.0)
+        .expect("cold certified encode");
+    assert!(cold_cert.certified(), "baseline cold probe must certify");
+
+    let mut poisoned = atlas.clone();
+    for chart in &mut poisoned.atoms[0].charts {
+        if let Some(jacobian) = &mut chart.amortized_jacobian {
+            jacobian.fill(0.0);
+            jacobian[[0, 0]] = 100.0;
+        }
+    }
+
+    let (poisoned_cold_t, poisoned_cold_cert) = poisoned
+        .certified_encode_row(&atom, 0, x.view(), 1.0)
+        .expect("poisoned cold certified encode");
+    assert!(
+        poisoned_cold_cert.certified(),
+        "poisoning the distilled Jacobian must not affect the cold exact probe"
+    );
+    let cold_gap = (poisoned_cold_t[0] - cold_t[0]).abs();
+    assert!(
+        cold_gap < 1e-12,
+        "cold probe changed after distilled-Jacobian poison: gap = {cold_gap}"
+    );
+
+    let (_poisoned_amortized_t, poisoned_amortized_cert) = poisoned
+        .amortized_encode_row(&atom, 0, x.view(), 1.0)
+        .expect("poisoned amortized encode");
+    assert!(
+        !poisoned_amortized_cert.certified(),
+        "poisoned distilled encoder must be flagged by the honesty gate"
+    );
+}
+
+#[test]
 fn lsh_routed_amortized_encode_matches_direct_amortized_encode() {
     // The production token-rate path: LSH selects the atom per row, then the
     // distilled per-chart predictor encodes against it. With a single-atom

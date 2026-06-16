@@ -585,6 +585,15 @@ impl UnifiedOuterHessianOperator {
             return Ok(None);
         };
         let alpha_psi: Vec<f64> = alpha.iter().skip(self.k_rho).copied().collect();
+        if alpha_psi.iter().all(|weight| *weight == 0.0) {
+            let psi_dim = self.coords.len().saturating_sub(self.k_rho);
+            return Ok(Some(PsiContractedContrib {
+                objective: Array1::<f64>::zeros(psi_dim),
+                score: Array2::<f64>::zeros((psi_dim, self.hop.dim())),
+                ld_s: Array1::<f64>::zeros(psi_dim),
+                base_h2: vec![0.0; psi_dim],
+            }));
+        }
         let Some(contracted) = hook(&alpha_psi)? else {
             // The hook declined this direction (e.g. a σ-aux axis carried
             // weight): this operator must not have been built with a skipped

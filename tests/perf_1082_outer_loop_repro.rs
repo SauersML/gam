@@ -84,8 +84,7 @@ fn negbin_te_2d_outer_loop_converges_in_budget_1082() {
         fit.fit.outer_converged,
         "#1082 regression: NB te outer REML loop did not converge \
          (outer_iterations={}, grad_norm={:?})",
-        fit.fit.outer_iterations,
-        fit.fit.outer_gradient_norm,
+        fit.fit.outer_iterations, fit.fit.outer_gradient_norm,
     );
 
     assert!(
@@ -122,11 +121,13 @@ fn poisson_te_2d_outer_loop_converges_in_budget_1082() {
 
     eprintln!(
         "[#1082 control] poisson te: outer_iterations={} outer_converged={}",
-        fit.fit.outer_iterations,
-        fit.fit.outer_converged,
+        fit.fit.outer_iterations, fit.fit.outer_converged,
     );
 
-    assert!(fit.fit.outer_converged, "Poisson te outer loop did not converge");
+    assert!(
+        fit.fit.outer_converged,
+        "Poisson te outer loop did not converge"
+    );
     assert!(
         fit.fit.outer_iterations <= 30,
         "Poisson te outer loop took {} iterations (expected ~5)",

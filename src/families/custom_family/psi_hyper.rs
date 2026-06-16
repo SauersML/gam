@@ -285,6 +285,30 @@ pub(crate) fn build_contracted_psi_hook(
         return Ok(None);
     }
 
+    for axis_idx in 0..psi_dim {
+        let mut basis = vec![0.0; psi_dim];
+        basis[axis_idx] = 1.0;
+        let Some(terms) = workspace.second_order_terms_contracted(&basis)? else {
+            log::info!(
+                "[outer-hvp contracted-psi] declined: workspace does not cover psi basis axis {}",
+                axis_idx
+            );
+            return Ok(None);
+        };
+        if terms.objective.len() != psi_dim
+            || terms.score.nrows() != psi_dim
+            || terms.hessian.len() != psi_dim
+        {
+            return Err(format!(
+                "contracted ψψ hook basis probe shape mismatch at axis {axis_idx}: \
+                 objective={}, score_rows={}, hessian={}, psi_dim={psi_dim}",
+                terms.objective.len(),
+                terms.score.nrows(),
+                terms.hessian.len(),
+            ));
+        }
+    }
+
     let derivative_blocks = Arc::clone(&derivative_blocks);
 
     let hook = move |alpha_psi: &[f64]| -> Result<Option<ContractedPsiSecondOrder>, String> {
