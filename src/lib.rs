@@ -81,6 +81,7 @@ pub mod terms;
 pub mod test_support;
 pub mod types;
 pub mod util;
+pub mod warm_start;
 
 #[path = "heartbeat.rs"]
 pub mod process_monitor;
