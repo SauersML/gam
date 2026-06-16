@@ -866,11 +866,12 @@ pub(crate) fn build_outer_hessian_operator(
             _ => (1.0, 1.0, 1.0, 0.0, false),
         };
 
-    let penalty_quad_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-        lambdas,
-        &solution.penalty_coords,
-        &solution.beta,
-    )?;
+    let penalty_quad_atom =
+        crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )?;
     let curvature_penalty_quad_atom =
         crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
             &curvature_lambdas,

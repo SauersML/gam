@@ -2097,12 +2097,11 @@ mod jet_tower_oracle {
                 let tower = evaluate_program(&program, row).expect("tower evaluation");
 
                 // Production scalar kernel channels (the hand path under audit).
-                let marginal =
-                    bernoulli_marginal_link_map(
-                        &InverseLink::Standard(crate::types::StandardLink::Probit),
-                        eta[row],
-                    )
-                    .expect("link map");
+                let marginal = bernoulli_marginal_link_map(
+                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    eta[row],
+                )
+                .expect("link map");
                 let (value, gradient, hessian) = rigid_standard_normal_row_kernel(
                     marginal,
                     g[row],

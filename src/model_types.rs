@@ -671,7 +671,5 @@ pub use result_types::{
     saved_mixture_state_from_fit, saved_sas_state_from_fit, validate_all_finite,
     validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
-pub(crate) use result_types::{
-    CERTIFICATE_RAIL_MARGIN, CERTIFICATE_Z_GATE,
-};
+pub(crate) use result_types::{CERTIFICATE_RAIL_MARGIN, CERTIFICATE_Z_GATE};
 pub(crate) use result_types::{ensure_finite_scalar_estimation, validate_all_finite_estimation};

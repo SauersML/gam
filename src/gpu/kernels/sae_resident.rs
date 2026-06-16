@@ -397,47 +397,48 @@ impl DeviceResidentArrowWorkspace {
                 break;
             }
 
-            let solution = if on_device {
-                // Rebuild the resident frame only when the LM ridge changed; an
-                // unchanged ridge reuses the resident factors. A build failure
-                // becomes a Solve error so the LM-escalation arm below grows the
-                // ridge and retries, identical to a per-iterate solve failure.
-                let frame_matches = resident_frame
-                    .as_ref()
-                    .is_some_and(|(rt, rb, _)| *rt == ridge_t && *rb == ridge_beta);
-                let mut frame_build_error: Option<DeviceResidentArrowError> = None;
-                if !frame_matches {
-                    resident_frame = None;
-                    match crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
-                        &residual, ridge_t, ridge_beta,
-                    ) {
-                        Ok(frame) => resident_frame = Some((ridge_t, ridge_beta, frame)),
-                        Err(err) => frame_build_error = Some(map_gpu_error(err)),
+            let solution =
+                if on_device {
+                    // Rebuild the resident frame only when the LM ridge changed; an
+                    // unchanged ridge reuses the resident factors. A build failure
+                    // becomes a Solve error so the LM-escalation arm below grows the
+                    // ridge and retries, identical to a per-iterate solve failure.
+                    let frame_matches = resident_frame
+                        .as_ref()
+                        .is_some_and(|(rt, rb, _)| *rt == ridge_t && *rb == ridge_beta);
+                    let mut frame_build_error: Option<DeviceResidentArrowError> = None;
+                    if !frame_matches {
+                        resident_frame = None;
+                        match crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
+                            &residual, ridge_t, ridge_beta,
+                        ) {
+                            Ok(frame) => resident_frame = Some((ridge_t, ridge_beta, frame)),
+                            Err(err) => frame_build_error = Some(map_gpu_error(err)),
+                        }
                     }
-                }
-                match resident_frame.as_ref() {
-                    Some((_, _, frame)) => {
-                        // Per-iterate gradient r(z) = (g_t rows, g_β), extracted
-                        // from the residual system the frame was built to match.
-                        let mut g_t = Vec::with_capacity(n * d);
-                        for row in &residual.rows {
-                            for &v in row.gt.iter() {
-                                g_t.push(v);
+                    match resident_frame.as_ref() {
+                        Some((_, _, frame)) => {
+                            // Per-iterate gradient r(z) = (g_t rows, g_β), extracted
+                            // from the residual system the frame was built to match.
+                            let mut g_t = Vec::with_capacity(n * d);
+                            for row in &residual.rows {
+                                for &v in row.gt.iter() {
+                                    g_t.push(v);
+                                }
                             }
+                            let g_beta: Vec<f64> = residual.gb.iter().copied().collect();
+                            frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error)
                         }
-                        let g_beta: Vec<f64> = residual.gb.iter().copied().collect();
-                        frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error)
+                        None => Err(frame_build_error.unwrap_or_else(|| {
+                            DeviceResidentArrowError::Solve {
+                                reason: "SAE resident frame build declined".to_string(),
+                            }
+                        })),
                     }
-                    None => Err(frame_build_error.unwrap_or_else(|| {
-                        DeviceResidentArrowError::Solve {
-                            reason: "SAE resident frame build declined".to_string(),
-                        }
-                    })),
-                }
-            } else {
-                solve_arrow_newton_step_dense_reference(&residual, ridge_t, ridge_beta)
-                    .map_err(|reason| DeviceResidentArrowError::Solve { reason })
-            };
+                } else {
+                    solve_arrow_newton_step_dense_reference(&residual, ridge_t, ridge_beta)
+                        .map_err(|reason| DeviceResidentArrowError::Solve { reason })
+                };
 
             let solution = match solution {
                 Ok(sol) => sol,
@@ -1245,7 +1246,11 @@ mod tests {
                 opts.initial_ridge_beta,
             )
             .expect("resident frame must build on CUDA host");
-            let g_t: Vec<f64> = base.rows.iter().flat_map(|r| r.gt.iter().copied()).collect();
+            let g_t: Vec<f64> = base
+                .rows
+                .iter()
+                .flat_map(|r| r.gt.iter().copied())
+                .collect();
             let g_beta: Vec<f64> = base.gb.iter().copied().collect();
             let resident_sol = frame
                 .solve_gradient(&g_t, &g_beta)

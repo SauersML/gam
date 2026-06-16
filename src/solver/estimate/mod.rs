@@ -49,9 +49,7 @@ use crate::types::{MixtureLinkSpec, SasLinkSpec};
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 // faer: high-performance dense solvers
-use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, fast_ab, fast_atb,
-};
+use crate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, fast_ab, fast_atb};
 use faer::{MatRef, Side};
 use rayon::prelude::*;
 

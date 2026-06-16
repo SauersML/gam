@@ -86,12 +86,13 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-    let penalty_quad_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-        &lambdas,
-        &solution.penalty_coords,
-        &solution.beta,
-    )
-    .expect("EFS penalty-quadratic atom must match InnerSolution penalty layout");
+    let penalty_quad_atom =
+        crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            &lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )
+        .expect("EFS penalty-quadratic atom must match InnerSolution penalty layout");
 
     // Universal-form EFS: `Δρ_i = log(1 − 2·g_full[i]/q_eff_i)`. This is
     // identical to the canonical `log((d−t)/q_eff)` when no out-of-band
@@ -166,12 +167,13 @@ pub(crate) fn efs_single_loop_diagnostics(
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-    let penalty_quad_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-        &lambdas,
-        &solution.penalty_coords,
-        &solution.beta,
-    )
-    .expect("EFS diagnostics penalty-quadratic atom must match InnerSolution penalty layout");
+    let penalty_quad_atom =
+        crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            &lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )
+        .expect("EFS diagnostics penalty-quadratic atom must match InnerSolution penalty layout");
     let mut grad_sq = 0.0_f64;
     let mut residual_sq = 0.0_f64;
     let mut step_inf_norm = 0.0_f64;
@@ -362,12 +364,13 @@ pub fn compute_hybrid_efs_update(
     // actual update write-back serial so fallback/backtracking decisions still
     // see a deterministic step vector.
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-    let penalty_quad_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-        &lambdas,
-        &solution.penalty_coords,
-        &solution.beta,
-    )
-    .expect("hybrid EFS penalty-quadratic atom must match InnerSolution penalty layout");
+    let penalty_quad_atom =
+        crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            &lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )
+        .expect("hybrid EFS penalty-quadratic atom must match InnerSolution penalty layout");
     let rho_candidates: Vec<(usize, Option<f64>)> =
         if k >= HYBRID_EFS_SCALAR_PAR_THRESHOLD && rayon::current_thread_index().is_none() {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};

@@ -9,7 +9,7 @@ use super::*;
 // `RhoBlockAdditiveOuterHessian` wrapper and the materialization dimension cap
 // stay in `solver`.
 pub use crate::solver_contract::{
-    Derivative, DeclaredHessianForm, OuterHessianMaterialization, OuterHessianOperator,
+    DeclaredHessianForm, Derivative, OuterHessianMaterialization, OuterHessianOperator,
     OuterStrategyError,
 };
 

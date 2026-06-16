@@ -1854,7 +1854,7 @@ mod tests {
     /// projection, and Hessian carrier are read from one object.
     #[test]
     pub(crate) fn theta_only_correction_atom_projects_value_gradient_and_hessian() {
-        use crate::solver::estimate::reml::outer_eval::state_caches::TkCorrectionTerms;
+        use crate::solver::estimate::reml::outer_eval::TkCorrectionTerms;
 
         let tk_atom = TierneyKadaneAtom::from_terms(TkCorrectionTerms {
             value: -0.75,

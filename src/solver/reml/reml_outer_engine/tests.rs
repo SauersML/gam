@@ -12,7 +12,7 @@ pub(crate) fn trace_matrix_product_iterator_matches_scalar_reference_bitwise() {
     let right = Array2::from_shape_fn((4, 4), |(i, j)| {
         ((i as f64 + 1.25) * 0.23 - (j as f64 + 0.75) * 0.41).cos()
     });
-    let mut reference = 0.0;
+    let mut reference = 0.0_f64;
     for i in 0..left.nrows() {
         for j in 0..left.ncols() {
             reference += left[[i, j]] * right[[j, i]];
@@ -1436,7 +1436,7 @@ pub(crate) fn kkt_theta_correction_cross_and_psi_hessian_matches_finite_differen
             h = &h + &(&drift_mats[i] * theta[i]);
             r = &r + &(&score_derivs[i] * theta[i]);
         }
-        let hinv = crate::faer_ndarray::FaerCholesky::cholesky(&h)
+        let hinv = crate::faer_ndarray::FaerCholesky::cholesky(&h, faer::Side::Lower)
             .map(|c| c.solve_mat(&Array2::<f64>::eye(h.nrows())))
             .expect("H(θ) SPD");
         -0.5 * r.dot(&hinv.dot(&r))
@@ -4703,10 +4703,10 @@ pub(crate) fn hyper_operator_scaled_add_mul_vec_matches_owned_matvec() {
 
     let operators: [&dyn HyperOperator; 4] = [&dense, &block, &composite, &weighted];
     for op in operators {
-        let mut accumulated = base.clone();
+        let mut accumulated: Array1<f64> = base.clone();
         op.scaled_add_mul_vec(v_view, scale, accumulated.view_mut());
 
-        let mut expected = base.clone();
+        let mut expected: Array1<f64> = base.clone();
         expected.scaled_add(scale, &op.mul_vec(&v_owned));
         for idx in 0..accumulated.len() {
             assert_relative_eq!(

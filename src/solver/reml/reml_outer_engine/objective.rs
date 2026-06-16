@@ -111,9 +111,10 @@ pub fn reml_laml_evaluate(
     // `PenaltyQuadAtom` (built downstream for `rho_frozen_d1`) exposes. The cost
     // can no longer read a raw `solution.penalty_quadratic` that the gradient
     // atom does not own — value and ρ-derivative are projections of one atom.
-    let penalty_quad_value_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::stable_value_only(
-        0.5 * solution.penalty_quadratic,
-    );
+    let penalty_quad_value_atom =
+        crate::solver::estimate::reml::atoms::PenaltyQuadAtom::stable_value_only(
+            0.5 * solution.penalty_quadratic,
+        );
     let penalty_quad_value = penalty_quad_value_atom.value();
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
@@ -416,12 +417,13 @@ pub fn reml_laml_evaluate(
     // value the cost above consumed, so `value()` and `rho_frozen_d1` are
     // projections of one object (and any `CriterionSum` built from this atom
     // reports the numerically-sound stable energy, not the original-basis sum).
-    let penalty_quad_atom = crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-        &lambdas,
-        &solution.penalty_coords,
-        &solution.beta,
-    )?
-    .with_stable_value(0.5 * solution.penalty_quadratic);
+    let penalty_quad_atom =
+        crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+            &lambdas,
+            &solution.penalty_coords,
+            &solution.beta,
+        )?
+        .with_stable_value(0.5 * solution.penalty_quadratic);
     let curvature_penalty_quad_atom =
         crate::solver::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
             &curvature_lambdas,
