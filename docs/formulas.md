@@ -98,6 +98,7 @@ mutually exclusive.
 ```
 y ~ x + group(site)
 y ~ x + re(site)                         # random-intercept alias
+y ~ x + factor(site)                     # random-intercept alias
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -252,7 +253,7 @@ zero (recover the null by default; opt into overfitting). Scale-free unless
 trend + mass + tension) is built in, each block with its own REML smoothing
 parameter, and REML deselects unhelpful ones.
 
-### Sphere (`sphere`, `sos`, `spherical`) {#intrinsic-s2-sphere-smooth}
+### Sphere (`sphere`, `sos`, `spherical`, `s2`) {#intrinsic-s2-sphere-smooth}
 
 Intrinsic S² smooth for latitude/longitude data on a sphere. The default
 implementation uses Wahba/Sobolev spherical spline kernels with radial centers.
@@ -273,7 +274,7 @@ the poles.
 | `units` | `degrees` | Set `units=radians` as an alias for `radians=true`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the curvature penalty. |
 
-### Tensor product (`te`, `tensor`, `interaction`) {#periodic-cyclic-smooths}
+### Tensor product (`te`, `tensor`, `interaction`, `ti`) {#periodic-cyclic-smooths}
 
 `te(...)`, `tensor(...)`, and `interaction(...)` build penalized
 tensor-product B-splines for covariates whose axes have different units
@@ -281,6 +282,13 @@ or scales. Each margin is a 1-D B-spline; REML selects one smoothing
 parameter per margin. The fit and predict paths freeze the margin knots,
 periodicity, and tensor identifiability transform in the saved model, so
 fresh prediction grids use the same tensor basis as training.
+
+`ti(...)` is the tensor-*interaction* form (mgcv `ti`): structurally the
+same tensor-product smooth, but the marginal main effects are excluded so
+only the pure interaction is modeled (per-margin sum-to-zero
+identifiability). Use it to add `s(x1) + s(x2) + ti(x1, x2)` as a
+functional-ANOVA decomposition. It requires at least two variables and
+takes the same options as `te(...)`.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
