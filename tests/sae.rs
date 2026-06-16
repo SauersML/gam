@@ -72,6 +72,8 @@ mod sae_residual_gauge;
 mod sae_sphere_chart_canonicalization;
 #[path = "sae/sae_streaming_arrow_schur_contract.rs"]
 mod sae_streaming_arrow_schur_contract;
+#[path = "sae/sae_structure_ladder_bottom_rungs.rs"]
+mod sae_structure_ladder_bottom_rungs;
 #[path = "sae/sae_torus_chart_canonicalization.rs"]
 mod sae_torus_chart_canonicalization;
 #[path = "sae/sae_unit_speed_chart_canonicalization.rs"]
