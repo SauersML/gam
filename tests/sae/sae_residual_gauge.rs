@@ -13,7 +13,7 @@
 //! inactive) and one where the isometry pin removes that same rotation.
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
-use gam::sae_identifiability::{
+use gam::terms::sae::identifiability::{
     AtomTopology, FittedAtom, FittedSaeManifold, GeneratorFamily, residual_gauge,
 };
 use ndarray::{Array1, Array2};

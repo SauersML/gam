@@ -21,7 +21,7 @@
 //!    calibrated frame path.
 
 use gam::inference::row_metric::RowMetric;
-use gam::sae_identifiability::{
+use gam::terms::sae::identifiability::{
     AtomParameterView, AtomTopology, FittedAtom, FittedSaeManifold, GENERATOR_FLAT_ENERGY_TOL,
     GeneratorFamily, OrbitPenaltyOperator, isometry_orbit_penalty_operator, residual_gauge_exact,
 };
@@ -156,8 +156,8 @@ fn single_atom_model(atom: FittedAtom) -> FittedSaeManifold {
 }
 
 fn exact_isom_verdict(
-    report: &gam::sae_identifiability::ResidualGaugeReport,
-) -> &gam::sae_identifiability::GeneratorVerdict {
+    report: &gam::terms::sae::identifiability::ResidualGaugeReport,
+) -> &gam::terms::sae::identifiability::GeneratorVerdict {
     report
         .generators
         .iter()

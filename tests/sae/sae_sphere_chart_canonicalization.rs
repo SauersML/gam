@@ -26,7 +26,7 @@
 
 use faer::Side as FaerSide;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
-use gam::sae_identifiability::{GeneratorFamily, VerdictProvenance};
+use gam::terms::sae::identifiability::{GeneratorFamily, VerdictProvenance};
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::sae::chart_canonicalization::sphere_chart_isometry_defect;
 use gam::terms::{

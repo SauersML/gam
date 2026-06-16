@@ -17,7 +17,7 @@
 //!   sound: an e-process resumed mid-stream is still an e-process, so a
 //!   killed-and-restarted discovery run loses compute, never validity.
 //! * **At the chosen stop**, the caller certifies:
-//!   `sae_identifiability::dictionary_report(model, &ledger, α)` pairs
+//!   `sae::identifiability::dictionary_report(model, &ledger, α)` pairs
 //!   the e-BH structure certificate with the residual-gauge report. The
 //!   default level is [`STRUCTURE_CERTIFICATE_ALPHA`].
 //!

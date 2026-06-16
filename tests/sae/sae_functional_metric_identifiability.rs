@@ -35,7 +35,7 @@
 //! relative-curvature rule must call it pinned and report the fraction.
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
-use gam::sae_identifiability::{
+use gam::terms::sae::identifiability::{
     AtomTopology, FittedAtom, FittedSaeManifold, GENERATOR_FLAT_ENERGY_TOL, GeneratorFamily,
     residual_gauge,
 };
