@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Clone)]
 enum LatentInitSpec {
     Pca,
     Random,

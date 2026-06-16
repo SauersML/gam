@@ -1968,13 +1968,13 @@ mod tests {
     fn alo_exact_frozen_curvature_reports_nonconvergence() {
         let err = alo_eta_exact_frozen_curvature(0.0, 1.0, 0.0, &|eta| (eta + 1.0, 0.0))
             .expect_err("constant residual should exhaust the scalar iteration budget");
-        assert!(matches!(
-            err,
-            AloExactScalarError::MaxIterations {
-                iterations: ALO_EXACT_SCALAR_MAX_ITERS,
-                ..
-            }
-        ));
+        let AloExactScalarError::MaxIterations { iterations, .. } = err else {
+            panic!("constant residual must report MaxIterations, got {err:?}");
+        };
+        assert_eq!(
+            iterations, ALO_EXACT_SCALAR_MAX_ITERS,
+            "non-convergence must report the full scalar iteration budget"
+        );
     }
 
     #[test]
