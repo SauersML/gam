@@ -1,4 +1,4 @@
-use crate::cache::{Fingerprint, Fingerprinter};
+use crate::warm_start::{Fingerprint, Fingerprinter};
 use crate::gpu::device::GpuDeviceInfo;
 use crate::gpu::error::GpuError;
 use crate::gpu::policy::GpuDispatchPolicy;
