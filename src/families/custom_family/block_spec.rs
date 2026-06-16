@@ -402,11 +402,11 @@ impl BlockEffectiveJacobian for GaugeComposedJacobian {
     ) -> Result<Array2<f64>, String> {
         let raw_width = self.t_block.nrows();
         let reduced_width = self.t_block.ncols();
-        let beta_nonzero = state.beta.iter().any(|&v| v != 0.0);
         let lifted_beta;
         let lifted_state;
+        let zero_raw_beta;
         let delegate_state =
-            if state.beta.is_empty() || !beta_nonzero || state.beta.len() == raw_width {
+            if state.beta.len() == raw_width {
                 state
             } else if state.beta.len() == reduced_width {
                 lifted_beta = self.t_block.dot(&ndarray::ArrayView1::from(state.beta));
@@ -419,9 +419,20 @@ impl BlockEffectiveJacobian for GaugeComposedJacobian {
                     probit_frailty_scale: state.probit_frailty_scale,
                 };
                 &lifted_state
+            } else if state.beta.is_empty() {
+                zero_raw_beta = ndarray::Array1::<f64>::zeros(raw_width);
+                lifted_state = FamilyLinearizationState {
+                    beta: zero_raw_beta
+                        .as_slice()
+                        .expect("GaugeComposedJacobian zero raw beta is contiguous"),
+                    family_scalars: state.family_scalars.clone(),
+                    channel_hessian: state.channel_hessian.clone(),
+                    probit_frailty_scale: state.probit_frailty_scale,
+                };
+                &lifted_state
             } else {
                 return Err(format!(
-                    "GaugeComposedJacobian: nonzero beta has length {}, expected raw width {} \
+                    "GaugeComposedJacobian: beta has length {}, expected raw width {} \
                  or reduced width {}; this wrapper cannot infer a block slice from a joint \
                  coefficient vector",
                     state.beta.len(),
@@ -514,6 +525,49 @@ mod gauge_composed_jacobian_tests {
 
         assert_eq!(reduced, raw);
         assert_eq!(reduced, array![[15.0], [35.0]]);
+    }
+
+    struct StrictRawWidthJacobian {
+        design: Array2<f64>,
+    }
+
+    impl BlockEffectiveJacobian for StrictRawWidthJacobian {
+        fn effective_jacobian_rows(
+            &self,
+            state: &FamilyLinearizationState<'_>,
+            rows: Range<usize>,
+        ) -> Result<Array2<f64>, String> {
+            if state.beta.len() != self.design.ncols() {
+                return Err(format!(
+                    "StrictRawWidthJacobian expected raw beta len {}, got {}",
+                    self.design.ncols(),
+                    state.beta.len(),
+                ));
+            }
+            Ok(self.design.slice(ndarray::s![rows, ..]).to_owned())
+        }
+    }
+
+    #[test]
+    fn gauge_composed_jacobian_lifts_zero_reduced_beta_before_delegating() {
+        let inner: Arc<dyn BlockEffectiveJacobian> = Arc::new(StrictRawWidthJacobian {
+            design: array![[2.0, 3.0], [5.0, 7.0]],
+        });
+        let wrapped = GaugeComposedJacobian::new(inner, Arc::new(array![[0.0], [1.0]]));
+
+        let theta = [0.0];
+        let reduced_state = FamilyLinearizationState {
+            beta: &theta,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: 1.0,
+        };
+
+        let reduced = wrapped
+            .effective_jacobian_rows(&reduced_state, 0..2)
+            .expect("zero reduced beta must still be lifted to raw width");
+
+        assert_eq!(reduced, array![[3.0], [7.0]]);
     }
 
     #[test]
