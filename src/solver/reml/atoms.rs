@@ -1018,11 +1018,78 @@ impl CriterionAtom for SoftRhoGuardPriorAtom {
     }
 }
 
-/// Atom 7 (TK / sampled-correction application layer): a θ-only scalar
+/// Common projection surface for θ-only correction atoms whose value,
+/// gradient, and Hessian are emitted as one object.
+pub(crate) trait ThetaCorrectionProjection: CriterionAtom {
+    fn cost(&self) -> f64 {
+        self.value()
+    }
+    fn gradient(&self) -> Option<&Array1<f64>>;
+    fn hessian(&self) -> Option<&Array2<f64>>;
+}
+
+/// Atom 7a (TK kernel): the Tierney-Kadane frozen-curvature correction.
+///
+/// The row-kernel assembly in `tierney_kadane_terms` now returns this atom
+/// directly: value, first derivative, and Hessian are projected from the one
+/// `TkCorrectionTerms` emission produced by the shared TK intermediates. This
+/// is stronger than the previous application-layer wrapper: the live TK kernel
+/// itself is a `CriterionAtom`, so objective, gradient, and Hessian assembly
+/// cannot route around its single owner.
+pub struct TierneyKadaneAtom {
+    terms: super::state_caches::TkCorrectionTerms,
+}
+
+impl TierneyKadaneAtom {
+    pub(crate) fn from_terms(terms: super::state_caches::TkCorrectionTerms) -> Self {
+        Self { terms }
+    }
+
+    pub fn gradient(&self) -> Option<&Array1<f64>> {
+        self.terms.gradient.as_ref()
+    }
+
+    pub fn hessian(&self) -> Option<&Array2<f64>> {
+        self.terms.hessian.as_ref()
+    }
+}
+
+impl CriterionAtom for TierneyKadaneAtom {
+    fn name(&self) -> &'static str {
+        "tierney_kadane"
+    }
+    fn value(&self) -> f64 {
+        self.terms.value
+    }
+    fn frozen_d1(&self, dir: &ThetaDirection) -> f64 {
+        match (dir.index, self.terms.gradient.as_ref()) {
+            (Some(idx), Some(gradient)) if idx < gradient.len() => gradient[idx],
+            _ => 0.0,
+        }
+    }
+    fn beta_channel(&self) -> Option<BetaChannel> {
+        None
+    }
+    fn stratum(&self) -> Option<StratumFingerprint> {
+        None
+    }
+}
+
+impl ThetaCorrectionProjection for TierneyKadaneAtom {
+    fn gradient(&self) -> Option<&Array1<f64>> {
+        TierneyKadaneAtom::gradient(self)
+    }
+
+    fn hessian(&self) -> Option<&Array2<f64>> {
+        TierneyKadaneAtom::hessian(self)
+    }
+}
+
+/// Atom 7b (sampled-correction application layer): a θ-only scalar
 /// correction emitted as one value + derivative bundle.
 ///
-/// The TK row-kernel machinery and the #784 sampler still own the hard math
-/// that produces [`TkCorrectionTerms`](super::state_caches::TkCorrectionTerms).
+/// The #784 sampler still owns the hard math that produces
+/// [`TkCorrectionTerms`](super::state_caches::TkCorrectionTerms).
 /// This atom owns the assembly-side invariant: once such a correction exists,
 /// cost, gradient, and Hessian are projected from one object, so the caller
 /// cannot add the scalar value while forgetting or shape-shifting its analytic
@@ -1057,6 +1124,16 @@ impl ThetaOnlyCorrectionAtom {
 
     pub fn hessian(&self) -> Option<&Array2<f64>> {
         self.hessian.as_ref()
+    }
+}
+
+impl ThetaCorrectionProjection for ThetaOnlyCorrectionAtom {
+    fn gradient(&self) -> Option<&Array1<f64>> {
+        self.gradient()
+    }
+
+    fn hessian(&self) -> Option<&Array2<f64>> {
+        self.hessian()
     }
 }
 
@@ -1192,8 +1269,7 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // `joint_jeffreys_term` until the second-order atom pass. Isolation + FD pin:
 // `jeffreys_logdet_atom_emits_consistent_value_and_directional_derivative`
 // asserts the closed-form value/frozen_d1, the relative-floor channel, and an
-// FD oracle `g'(λ) ≈ floored_inverse(λ)` across all four branches. TK remains
-// unported as a full kernel atom.
+// FD oracle `g'(λ) ≈ floored_inverse(λ)` across all four branches.
 //
 // LANDED (pass 4b, configured-prior atom): `ConfiguredRhoPriorAtom` wraps the
 // shared `RhoPriorEval` after the REML/LAML policies are applied (configured
@@ -1202,8 +1278,7 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // this atom once per prior assembly and projects configured-prior cost,
 // gradient, and diagonal Hessian from that one emission; the old
 // `compute_configured_rho_prior_{cost,grad,hess}` wrappers and the generic
-// `soft_prior_for_mode` closure helper are deleted. TK remains unported as a
-// full kernel atom.
+// `soft_prior_for_mode` closure helper are deleted.
 //
 // LANDED (pass 4d, soft numerical-guard prior atom): `SoftRhoGuardPriorAtom`
 // ports the separable `log cosh` ρ-barrier. The three `compute_soft_prior{cost,
@@ -1221,15 +1296,22 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // oracle (FD of value == analytic gradient, FD of gradient == analytic
 // curvature) per coordinate.
 //
-// LANDED (pass 4c, TK/sampled-correction application atom): the live
-// runtime post-evaluator no longer splices `TkCorrectionTerms` into
-// `RemlLamlResult` field-by-field. `tierney_kadane_terms` and
-// `block_local_sampled_correction` still compute their row-kernel / sampler
-// emissions, but `assemble_and_evaluate*` immediately wraps each emission in a
-// `ThetaOnlyCorrectionAtom`; cost, gradient, and Hessian are then projected
-// from that atom in one application site with arity checks. This ports the
-// TK/block value+gradient splice to the atom ledger without touching #932's
-// row kernels. The TK kernel itself remains unported.
+// LANDED (pass 4c, sampled-correction application atom): the live runtime
+// post-evaluator no longer splices sampled `TkCorrectionTerms` into
+// `RemlLamlResult` field-by-field. `block_local_sampled_correction` still
+// computes the sampler emission, but `assemble_and_evaluate*` immediately
+// wraps it in a `ThetaOnlyCorrectionAtom`; cost, gradient, and Hessian are then
+// projected from that atom in one application site with arity checks. This
+// ports the block value+gradient splice to the atom ledger without touching
+// #932's row kernels.
+//
+// LANDED (pass 4f, TK kernel atom): `tierney_kadane_terms` now returns a
+// `TierneyKadaneAtom` directly. The TK row-kernel core still emits the same
+// `TkCorrectionTerms` from one shared-intermediates pass, but the kernel output
+// is the criterion atom itself, not a loose tuple later rewrapped by the
+// application layer. Standard assembly and EFS both apply that atom through
+// `ThetaCorrectionProjection`, so TK value, gradient, and Hessian share one
+// owner and one arity-checked projection path.
 //
 // LANDED (pass 4e, beta-Gaussian prior derivative atom): live ρ penalty
 // derivative assembly now builds `PenaltyQuadAtom` from `PenaltyCoordinate`s
@@ -1620,22 +1702,37 @@ mod tests {
     /// projection, and Hessian carrier are read from one object.
     #[test]
     pub(crate) fn theta_only_correction_atom_projects_value_gradient_and_hessian() {
-        let atom = ThetaOnlyCorrectionAtom {
-            label: "tierney_kadane",
-            value: -0.75,
-            gradient: Some(array![0.25, -0.5]),
-            hessian: Some(array![[2.0, 0.1], [0.1, 3.0]]),
-        };
-        assert_eq!(atom.name(), "tierney_kadane");
-        assert!((atom.value() - (-0.75)).abs() < 1e-12);
-        assert!(atom.beta_channel().is_none());
-        assert!(atom.stratum().is_none());
+        let tk_atom =
+            TierneyKadaneAtom::from_terms(crate::solver::reml::state_caches::TkCorrectionTerms {
+                value: -0.75,
+                gradient: Some(array![0.25, -0.5]),
+                hessian: Some(array![[2.0, 0.1], [0.1, 3.0]]),
+            });
+        assert_eq!(tk_atom.name(), "tierney_kadane");
+        assert!((tk_atom.value() - (-0.75)).abs() < 1e-12);
+        assert!(tk_atom.beta_channel().is_none());
+        assert!(tk_atom.stratum().is_none());
 
         let dir1 = ThetaDirection {
             index: Some(1),
             beta_dot: None,
             h_dot_total: None,
         };
+        assert!((tk_atom.frozen_d1(&dir1) - (-0.5)).abs() < 1e-12);
+        assert_eq!(tk_atom.gradient().expect("gradient"), &array![0.25, -0.5]);
+        assert_eq!(tk_atom.hessian().expect("hessian")[[1, 1]], 3.0);
+
+        let atom = ThetaOnlyCorrectionAtom {
+            label: "sampled_block_marginal",
+            value: -0.75,
+            gradient: Some(array![0.25, -0.5]),
+            hessian: Some(array![[2.0, 0.1], [0.1, 3.0]]),
+        };
+        assert_eq!(atom.name(), "sampled_block_marginal");
+        assert!((atom.value() - (-0.75)).abs() < 1e-12);
+        assert!(atom.beta_channel().is_none());
+        assert!(atom.stratum().is_none());
+
         assert!((atom.frozen_d1(&dir1) - (-0.5)).abs() < 1e-12);
         let dir_absent = ThetaDirection {
             index: Some(7),

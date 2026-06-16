@@ -1545,7 +1545,7 @@ impl<'a> RemlState<'a> {
         compute_gradient: bool,
         compute_hessian: bool,
         h_inv_solve: &S,
-    ) -> Result<TkCorrectionTerms, EstimationError>
+    ) -> Result<super::atoms::TierneyKadaneAtom, EstimationError>
     where
         S: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
     {
@@ -1562,11 +1562,13 @@ impl<'a> RemlState<'a> {
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
         let value = Self::tk_scalar_from_shared(x_dense, z, d_array, &shared, &mut gram)?;
         if !compute_gradient {
-            return Ok(TkCorrectionTerms {
-                value,
-                gradient: None,
-                hessian: None,
-            });
+            return Ok(super::atoms::TierneyKadaneAtom::from_terms(
+                TkCorrectionTerms {
+                    value,
+                    gradient: None,
+                    hessian: None,
+                },
+            ));
         }
 
         let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k + ext_coords.len());
@@ -1650,11 +1652,13 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
-        Ok(TkCorrectionTerms {
-            value,
-            gradient: Some(gradient),
-            hessian,
-        })
+        Ok(super::atoms::TierneyKadaneAtom::from_terms(
+            TkCorrectionTerms {
+                value,
+                gradient: Some(gradient),
+                hessian,
+            },
+        ))
     }
 
     pub(crate) fn tierney_kadane_terms(
@@ -1663,20 +1667,24 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
         ext_coords: &[super::reml_outer_engine::HyperCoord],
-    ) -> Result<TkCorrectionTerms, EstimationError> {
+    ) -> Result<super::atoms::TierneyKadaneAtom, EstimationError> {
         if reml_is_gaussian_identity(&self.config.likelihood) {
-            return Ok(TkCorrectionTerms {
-                value: 0.0,
-                gradient: None,
-                hessian: None,
-            });
+            return Ok(super::atoms::TierneyKadaneAtom::from_terms(
+                TkCorrectionTerms {
+                    value: 0.0,
+                    gradient: None,
+                    hessian: None,
+                },
+            ));
         }
         if reml_robust_jeffreys_link(&self.config).is_none() {
-            return Ok(TkCorrectionTerms {
-                value: 0.0,
-                gradient: None,
-                hessian: None,
-            });
+            return Ok(super::atoms::TierneyKadaneAtom::from_terms(
+                TkCorrectionTerms {
+                    value: 0.0,
+                    gradient: None,
+                    hessian: None,
+                },
+            ));
         }
         // The TK correction's c/d/e/f derivative arrays use the logit
         // 5th-derivative jet and are implemented only for canonical Binomial
@@ -1687,29 +1695,33 @@ impl<'a> RemlState<'a> {
         // the inner PIRLS solve, so it is fully retained — only the outer
         // marginal-likelihood refinement is dropped for non-logit links.
         if !self.tk_correction_is_canonical_logit() {
-            return Ok(TkCorrectionTerms {
-                value: 0.0,
-                gradient: None,
-                hessian: None,
-            });
+            return Ok(super::atoms::TierneyKadaneAtom::from_terms(
+                TkCorrectionTerms {
+                    value: 0.0,
+                    gradient: None,
+                    hessian: None,
+                },
+            ));
         }
 
         let compute_gradient = compute_gradient_for_tk(mode);
-        let zero_correction = || TkCorrectionTerms {
-            value: 0.0,
-            gradient: if compute_gradient {
-                Some(Array1::zeros(rho.len() + ext_coords.len()))
-            } else {
-                None
-            },
-            hessian: if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
-                Some(Array2::zeros((
-                    rho.len() + ext_coords.len(),
-                    rho.len() + ext_coords.len(),
-                )))
-            } else {
-                None
-            },
+        let zero_correction = || {
+            super::atoms::TierneyKadaneAtom::from_terms(TkCorrectionTerms {
+                value: 0.0,
+                gradient: if compute_gradient {
+                    Some(Array1::zeros(rho.len() + ext_coords.len()))
+                } else {
+                    None
+                },
+                hessian: if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
+                    Some(Array2::zeros((
+                        rho.len() + ext_coords.len(),
+                        rho.len() + ext_coords.len(),
+                    )))
+                } else {
+                    None
+                },
+            })
         };
 
         // The outer Firth gate (`firth_problem_scale_allows`) disables the dense
@@ -1977,11 +1989,16 @@ impl<'a> RemlState<'a> {
         Ok(())
     }
 
-    pub(crate) fn apply_theta_correction_atom_to_result(
+    pub(crate) fn apply_theta_correction_atom_to_result<A>(
         &self,
         mut result: super::reml_outer_engine::RemlLamlResult,
-        correction: super::atoms::ThetaOnlyCorrectionAtom,
-    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
+        correction: &A,
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError>
+    where
+        A: super::atoms::ThetaCorrectionProjection + ?Sized,
+    {
+        use super::atoms::{CriterionAtom, ThetaCorrectionProjection};
+
         result.cost += correction.cost();
         if let Some(correction_hess) = correction.hessian() {
             result
@@ -2004,7 +2021,7 @@ impl<'a> RemlState<'a> {
                 // outright instead of silently zero-padding or truncating.
                 crate::bail_invalid_estim!(
                     "{} gradient coordinate count mismatch: evaluator produced {} entries, correction atom produced {}; this indicates the correction term and the unified evaluator were assembled against different coordinate sets",
-                    correction.label,
+                    correction.name(),
                     grad.len(),
                     correction_grad.len()
                 );
