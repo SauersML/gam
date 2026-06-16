@@ -71,6 +71,48 @@ preds = model.predict(test_df, interval="conformal", conformal_level=0.95)
 full = model.predict(test_df, interval="full_conformal", conformal_level=0.95)
 ```
 
+## Split-conformal intervals
+
+`Model.predict_conformal(...)` runs the standard predictor on `data`, then
+replaces the response-scale `mean_lower` / `mean_upper` columns with the
+split-conformal interval `mu_hat(x) ± q_hat · s(x)` calibrated from a
+held-out labeled `calibration` fold. The interval carries finite-sample
+marginal coverage `≥ conformal_level` regardless of model misspecification,
+and applies to standard GAM models (not only the Gaussian-identity fits the
+jackknife+ `interval="conformal"` path requires).
+
+```python
+preds = model.predict_conformal(
+    test_df,
+    calibration=cal_df,        # held-out fold; MUST include the response column
+    conformal_level=0.9,
+)
+# columns: linear_predictor, mean, std_error, mean_lower, mean_upper
+```
+
+`calibration` must contain the response column in addition to the predictors
+(the conformal multiplier `q_hat` is computed from its held-out residuals).
+It may be any size and is independent of the training set. `covariance_mode`,
+`observation_interval`, `return_type`, and `id_column` behave as in
+`predict`. `conformal_level` is required (no default).
+
+## Predicting from a numeric array
+
+For models fitted via `gamfit.fit_array(...)` (positional columns
+`x0, x1, ..., x{p-1}`), predict directly from a numeric feature matrix:
+
+```python
+y = model.predict_array(X)                       # 1-D ndarray of point predictions
+table = model.predict_array(X, interval=0.95)    # adds std_error / mean_lower / mean_upper
+```
+
+`predict_array` accepts `interval`, `covariance_mode`, and
+`observation_interval` (same semantics as `predict`); it does not take
+`return_type` or `id_column`. It is rejected for models fitted from a named
+table — call `predict` with a `dict` / DataFrame there so columns match by
+name. The companion `model.design_matrix_array(X)` returns the materialised
+design matrix for a numeric feature matrix.
+
 ## Carrying an identifier column
 
 ```python
