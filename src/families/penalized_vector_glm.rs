@@ -69,7 +69,7 @@
 use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
 use crate::families::vector_response::VectorLikelihood;
 use crate::pirls::dense_block_xtwx;
-use crate::solver::estimate::EstimationError;
+use crate::model_types::EstimationError;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 

@@ -731,6 +731,23 @@ fn linear_slots(k: usize, corpus: &Corpus) -> Vec<Slot> {
     slots
 }
 
+/// `k` slots ALL routed onto the linear bulk (no curved family), each carrying
+/// the given basis `kind`. Used by the H_flat NEGATIVE CONTROL: on a corpus with
+/// no planted curvature the only thing distinguishing a circle-basis arm from a
+/// linear-basis arm is whether the (absent) curvature is spuriously rewarded, so
+/// both arms must land on the same EV(K) — the contrast that proves the H_curved
+/// dominance/discrimination signatures are real curvature, not metric artifacts.
+fn bulk_slots(k: usize, corpus: &Corpus, kind: Kind) -> Vec<Slot> {
+    let bulk = corpus.linear_bulk.max(1);
+    (0..k)
+        .map(|i| Slot {
+            seed_family: None,
+            bulk_dir: i % bulk,
+            kind,
+        })
+        .collect()
+}
+
 #[test]
 fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
     // KNOWN structure: 4 curved circle families (Θ = 2π each) + a 3-direction
@@ -932,5 +949,115 @@ fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
         "DISCRIMINATION FAIL: pure-linear tail gain ({lin_tail_gain:.6}) did not exceed the hybrid \
          tail gain ({tail_gain:.6}) by 0.02 — the discriminating signature is that the curved/hybrid \
          dictionary flattens while the pure-linear shatter is still refining at the same budget"
+    );
+}
+
+/// #1026 — the H_flat NEGATIVE CONTROL for the frontier discriminator.
+///
+/// The discrimination test above only ever sees the H_curved corpus, so a passing
+/// run alone cannot rule out a metric that *always* rewards the circle basis
+/// (i.e. a coding artifact that would "discriminate" even on unstructured data).
+/// This control closes that hole: on a corpus with NO planted curvature — only an
+/// unstructured linear bulk of sparse rank-1 rays — the circle-basis arm and the
+/// linear-basis arm are routed onto the SAME bulk coordinates and differ ONLY in
+/// whether absent curvature is spuriously paid for. The frontier MUST then report:
+///   * NO dominance: the circle arm does not beat the linear arm (a periodic
+///     basis fit over a non-periodic projection earns no extra held-out EV — and,
+///     paying for unused harmonic coefficients, can only match within noise);
+///   * NO discrimination signature: both arms flatten together (the linear arm is
+///     not "still shattering" because there is nothing curved to shatter).
+/// If THIS test's no-dominance / no-discrimination bounds were violated, the
+/// H_curved test's positive signal would be suspect. Together they are a real
+/// two-sided hypothesis test (H_curved fires, H_flat does not), not a one-armed
+/// "does the number come out big" check.
+#[test]
+fn ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus() {
+    // KNOWN STRUCTURE: zero curved families, a 6-direction linear bulk in p = 40.
+    // This is the H_flat hypothesis the frontier must REFUSE to call curved.
+    let k_curved = 0usize;
+    let linear_bulk = 6usize;
+    let p = 40usize;
+    let n_train = 1800usize;
+    let n_test = 1200usize;
+
+    let corpus = Corpus::new(k_curved, linear_bulk, p);
+    let (z_train, theta_train) = corpus.draw(n_train, 0x1026_F1A7);
+    let (z_test, theta_test) = corpus.draw(n_test, 0x1026_DEAD);
+
+    let ks = [1usize, 2, 4, 8];
+    let mut circle_ev: Vec<(usize, f64)> = Vec::new();
+    let mut linear_ev: Vec<(usize, f64)> = Vec::new();
+
+    for &k in &ks {
+        let cslots = bulk_slots(k, &corpus, Kind::Circle);
+        let (cfit, _) = run_production_fit(
+            &cslots,
+            &corpus,
+            &theta_train,
+            &z_train,
+            n_train,
+            &format!("flat-circle-K{k}"),
+        );
+        circle_ev.push((k, held_out_ev(&cfit, &cslots, &corpus, &theta_test, &z_test, n_test)));
+
+        let lslots = bulk_slots(k, &corpus, Kind::Linear);
+        let (lfit, _) = run_production_fit(
+            &lslots,
+            &corpus,
+            &theta_train,
+            &z_train,
+            n_train,
+            &format!("flat-linear-K{k}"),
+        );
+        linear_ev.push((k, held_out_ev(&lfit, &lslots, &corpus, &theta_test, &z_test, n_test)));
+    }
+
+    println!("=== #1026 EV-vs-K H_flat NEGATIVE CONTROL (held-out, production engine) ===");
+    println!(
+        "DGP: 0 curved families + {linear_bulk} unstructured linear-bulk dirs, p={p}, \
+         n_train={n_train}, n_test={n_test}, noise≈4%"
+    );
+    println!("K   circle_EV   linear_EV   (circle − linear)");
+    for i in 0..ks.len() {
+        let (k, c) = circle_ev[i];
+        let (_, l) = linear_ev[i];
+        println!("{k:<3} {c:>9.6}   {l:>9.6}   {:>+9.6}", c - l);
+    }
+
+    // --- NO DOMINANCE: the circle arm must not BEAT the linear arm anywhere. ---
+    // With no curvature to capture, the periodic basis earns no extra held-out EV;
+    // it can match (within a small noise slack) but a strict win at any K would
+    // mean the circle basis is being rewarded for structure that is not present.
+    for i in 0..ks.len() {
+        let (k, c) = circle_ev[i];
+        let (_, l) = linear_ev[i];
+        assert!(
+            c <= l + 0.05,
+            "NEGATIVE-CONTROL FAIL: circle-basis EV {c:.6} STRICTLY beat linear-basis EV {l:.6} \
+             at K={k} on an UNSTRUCTURED corpus — the frontier is rewarding absent curvature, so \
+             the H_curved dominance signal would be a metric artifact, not real geometry"
+        );
+    }
+
+    // --- NO DISCRIMINATION SIGNATURE: neither arm "keeps shattering". ---
+    // On H_flat both arms capture the same low-rank bulk and flatten together. The
+    // H_curved test fires when the linear tail gain exceeds the curved tail gain by
+    // >= 0.02 AND clears a 0.03 floor; the control must NOT meet that signature.
+    let c_kc = circle_ev.iter().find(|(k, _)| *k == 4).map(|(_, v)| *v).unwrap();
+    let c_k2c = circle_ev.iter().find(|(k, _)| *k == 8).map(|(_, v)| *v).unwrap();
+    let l_kc = linear_ev.iter().find(|(k, _)| *k == 4).map(|(_, v)| *v).unwrap();
+    let l_k2c = linear_ev.iter().find(|(k, _)| *k == 8).map(|(_, v)| *v).unwrap();
+    let circle_tail = c_k2c - c_kc;
+    let linear_tail = l_k2c - l_kc;
+    println!(
+        "discrimination(control): circle tail = {circle_tail:.4}, linear tail = {linear_tail:.4} \
+         (both should be small; linear must NOT exceed circle by the H_curved 0.02 margin)"
+    );
+    assert!(
+        linear_tail < circle_tail + 0.02 || linear_tail < 0.03,
+        "NEGATIVE-CONTROL FAIL: the H_curved discrimination signature FIRED on an unstructured \
+         corpus (linear tail {linear_tail:.6} exceeded circle tail {circle_tail:.6} by >= 0.02 \
+         while clearing the 0.03 floor) — the discriminator cannot tell flat from curved, so its \
+         positive verdict on the curved corpus is not trustworthy"
     );
 }

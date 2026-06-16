@@ -722,6 +722,33 @@ pub struct ResponseCurvatureFit {
     /// hyperbolic side cannot rail this way (κ < 0 has no conjugate radius), so a
     /// rail here always means strongly spherical relative to the spread.
     pub railed_at_resolution_limit: bool,
+    /// `true` only when the SIGN of κ̂ is statistically resolved — i.e. the
+    /// profile-likelihood CI excludes 0 (`profile_ci.verdict ≠ Flat`).
+    ///
+    /// ## Why a point estimate alone is not enough (the #944/#1059 flat-floor)
+    ///
+    /// Curvature is resolvable only through the dimensionless product `κ·r²`
+    /// (see [`kappa_r2`](Self::kappa_r2)); the per-point Fisher information for κ
+    /// scales like `σ⁴`. When the cloud is nearly flat at its own scale
+    /// (`|κ·r²| ≪ 1`), the profiled criterion is so shallow that its single-cloud
+    /// argmin κ̂ can land on the WRONG SIDE OF ZERO purely by Monte-Carlo
+    /// fluctuation — empirically a coin-flip below `|κ·r²| ≈ 0.03`, reliable above
+    /// `≈ 0.09` (the #944 power curve). The estimand itself is UNBIASED (the
+    /// criterion averaged over clouds minimises exactly at κ⋆), so this is a
+    /// resolution limit, not a bias.
+    ///
+    /// The CI, in contrast, is honest in this regime: at an under-resolved
+    /// operating point it reports `Flat` (straddles 0) rather than a confident
+    /// wrong sign — it essentially never claims the wrong-signed geometry. So the
+    /// SIGN-bearing summary the caller may quote is the CI verdict, not the bare
+    /// κ̂. This flag exposes that contract on the point-estimate surface: when it
+    /// is `false`, κ̂'s sign is noise — the caller must report "curvature not
+    /// resolved at this scale (|κ·r²| too small)" and quote the CI / `kappa_r2`,
+    /// never a sign-confident κ̂. It is the flat-floor twin of
+    /// [`railed_at_resolution_limit`](Self::railed_at_resolution_limit) (the
+    /// spherical-cap rail); together they bracket the two ends of the resolvable
+    /// `κ·r²` band where κ̂ is a genuine interior point estimate.
+    pub sign_resolved: bool,
     /// Profile-likelihood CI for κ and the geometry verdict from its sign.
     pub profile_ci: crate::geometry::curvature_estimand::KappaProfileCi,
     /// Interior-point χ²₁ likelihood-ratio test of flatness (κ = 0).
@@ -1027,12 +1054,23 @@ pub fn fit_response_curvature(
     )?;
     let flatness = crate::geometry::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)?;
 
+    // The sign of κ̂ is statistically resolved iff the profile CI excludes 0 — the
+    // CI is the honest sign-bearing summary (it reports Flat under-resolution rather
+    // than a confident wrong sign), so we mirror its verdict onto the point-estimate
+    // surface. Below the resolvable `κ·r²` floor (`|κ·r²| ≪ 1`) the bare κ̂ argmin can
+    // flip sign on Monte-Carlo noise, so `false` here means "do not quote κ̂'s sign".
+    let sign_resolved = !matches!(
+        profile_ci.verdict,
+        crate::geometry::curvature_estimand::CurvatureVerdict::Flat
+    );
+
     Ok(ResponseCurvatureFit {
         dim,
         kappa_hat,
         kappa_r2,
         characteristic_radius: rho_max,
         railed_at_resolution_limit,
+        sign_resolved,
         base,
         v_p_hat,
         profile_ci,

@@ -1,6 +1,6 @@
 use crate::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
 use crate::matrix::DesignMatrix;
-use crate::solver::estimate::PenaltySpec;
+use crate::model_types::PenaltySpec;
 use ndarray::Array1;
 
 const DEFAULT_GAUGE_PRIORITY: u8 = 100;

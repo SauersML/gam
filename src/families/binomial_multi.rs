@@ -53,7 +53,7 @@
 
 use crate::families::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
 use crate::families::vector_response::VectorLikelihood;
-use crate::solver::estimate::EstimationError;
+use crate::model_types::EstimationError;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
 /// Inputs for [`fit_penalized_binomial_multi`].

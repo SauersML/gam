@@ -4694,6 +4694,113 @@ mod tests {
         assert_close(p_d[1].1, 0.5, 1e-8, "direct ∂o_D/∂shape near 0");
     }
 
+    // ----------------------------------------------------------------------
+    // Gompertz hazard-channel shape derivatives: FD oracle + Taylor-branch
+    // continuity. These feed `survival_hazard_theta_partials` /
+    // `survival_hazard_theta_first_second` (the marginal-slope probit
+    // baseline). Before this test, the only coverage of
+    // `gompertz_cumulative_shape_{,second_}derivative` was the indirect
+    // marginal-slope Hessian FD at shape=0.025, which never touches the
+    // small-shape (`|shape| < 1e-10`) Taylor branch nor directly FD-checks
+    // these analytic shape derivatives.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn gompertz_hazard_shape_derivatives_match_central_diff() {
+        assert!(file!().ends_with(".rs"));
+        // shape stays well above the 1e-10 Taylor cutoff so the exact
+        // closed-form branch is exercised and the expm1/exp arithmetic is
+        // numerically clean. FD on the analytic value/first-derivative
+        // confirms the first and second shape derivatives.
+        let cases = [
+            (10.0_f64, 0.012_f64, 0.05_f64),
+            (2.5, 0.5, 0.2),
+            (15.0, 0.003, 0.01),
+            (40.0, 0.3, 0.001),
+        ];
+        let h = 1e-6;
+        for &(age, rate, shape) in &cases {
+            // First shape derivative of (H_G, h_G) vs central diff of value.
+            let (d_cum, d_inst) = gompertz_cumulative_shape_derivative(age, rate, shape);
+            let (cum_p, inst_p) = gompertz_hazard_components(age, rate, shape + h);
+            let (cum_m, inst_m) = gompertz_hazard_components(age, rate, shape - h);
+            assert_close(
+                d_cum,
+                (cum_p - cum_m) / (2.0 * h),
+                1e-6,
+                &format!("∂H_G/∂shape (age={age}, rate={rate}, shape={shape})"),
+            );
+            assert_close(
+                d_inst,
+                (inst_p - inst_m) / (2.0 * h),
+                1e-6,
+                &format!("∂h_G/∂shape (age={age}, rate={rate}, shape={shape})"),
+            );
+
+            // Second shape derivative vs central diff of the first derivative.
+            let (d2_cum, d2_inst) =
+                gompertz_cumulative_shape_second_derivative(age, rate, shape);
+            let (dcum_p, dinst_p) = gompertz_cumulative_shape_derivative(age, rate, shape + h);
+            let (dcum_m, dinst_m) = gompertz_cumulative_shape_derivative(age, rate, shape - h);
+            assert_close(
+                d2_cum,
+                (dcum_p - dcum_m) / (2.0 * h),
+                1e-5,
+                &format!("∂²H_G/∂shape² (age={age}, rate={rate}, shape={shape})"),
+            );
+            assert_close(
+                d2_inst,
+                (dinst_p - dinst_m) / (2.0 * h),
+                1e-5,
+                &format!("∂²h_G/∂shape² (age={age}, rate={rate}, shape={shape})"),
+            );
+        }
+    }
+
+    #[test]
+    fn gompertz_hazard_shape_derivatives_small_shape_taylor_agrees_with_direct_branch() {
+        assert!(file!().ends_with(".rs"));
+        // The `|shape| < 1e-10` Taylor branches must be continuous with the
+        // exact closed-form branch across the cutoff: evaluate the Taylor side
+        // just below 1e-10 and the direct side just above, and confirm both
+        // collapse to the analytic shape->0 limits.
+        //   ∂H_G/∂shape   -> rate·t²/2
+        //   ∂h_G/∂shape   -> rate·t
+        //   ∂²H_G/∂shape² -> rate·t³/3
+        //   ∂²h_G/∂shape² -> rate·t²
+        let age = 25.0;
+        let rate = 0.4;
+        let t = age;
+        let shape_taylor = 0.5e-10; // forces the Taylor branch
+        let shape_direct = 2.0e-10; // forces the exact branch
+
+        let (dt_cum, dt_inst) = gompertz_cumulative_shape_derivative(age, rate, shape_taylor);
+        let (dd_cum, dd_inst) = gompertz_cumulative_shape_derivative(age, rate, shape_direct);
+        assert_close(dt_cum, rate * t * t / 2.0, 1e-8, "taylor ∂H_G/∂shape near 0");
+        assert_close(dd_cum, rate * t * t / 2.0, 1e-8, "direct ∂H_G/∂shape near 0");
+        assert_close(dt_inst, rate * t, 1e-8, "taylor ∂h_G/∂shape near 0");
+        assert_close(dd_inst, rate * t, 1e-8, "direct ∂h_G/∂shape near 0");
+
+        let (st_cum, st_inst) =
+            gompertz_cumulative_shape_second_derivative(age, rate, shape_taylor);
+        let (sd_cum, sd_inst) =
+            gompertz_cumulative_shape_second_derivative(age, rate, shape_direct);
+        assert_close(
+            st_cum,
+            rate * t * t * t / 3.0,
+            1e-8,
+            "taylor ∂²H_G/∂shape² near 0",
+        );
+        assert_close(
+            sd_cum,
+            rate * t * t * t / 3.0,
+            1e-8,
+            "direct ∂²H_G/∂shape² near 0",
+        );
+        assert_close(st_inst, rate * t * t, 1e-8, "taylor ∂²h_G/∂shape² near 0");
+        assert_close(sd_inst, rate * t * t, 1e-8, "direct ∂²h_G/∂shape² near 0");
+    }
+
     #[test]
     fn weibull_offset_partials_match_central_diff() {
         let cases = [
