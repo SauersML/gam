@@ -1,10 +1,11 @@
-//! GPU acceleration hardware-abstraction layer.
+//! GPU acceleration support.
 //!
-//! The module is intentionally callable from CPU-only builds: all public entry
-//! points are available without CUDA, and the runtime reports an unavailable
-//! backend instead of changing numerical results. CUDA-specific code is
-//! compiled only for Linux builds that enable the `cuda` feature, so cudarc is
-//! never loaded by default CPU-only builds.
+//! Infrastructure modules live at this level and are intentionally callable
+//! from CPU-only builds: all public entry points are available without CUDA,
+//! and the runtime reports an unavailable backend instead of changing
+//! numerical results. CUDA-specific code is compiled only for Linux builds that
+//! enable the `cuda` feature, so cudarc is never loaded by default CPU-only
+//! builds.
 
 pub mod backend_probe;
 pub mod blas;
@@ -16,7 +17,6 @@ pub mod device_cache;
 pub mod driver;
 #[macro_use]
 pub mod gpu_error;
-pub mod kernels;
 pub mod linalg_dispatch;
 pub mod memory;
 pub mod numerics_device;
@@ -26,6 +26,9 @@ pub mod pool;
 pub mod profile;
 pub mod runtime;
 pub mod solver;
+
+// Domain-specific GPU kernels are isolated from the infrastructure modules.
+pub mod kernels;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
 pub use device::GpuDeviceInfo;

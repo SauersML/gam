@@ -5,8 +5,7 @@
 //! cubature, REML trace estimation, per-row Hessian ops, device-resident SAE,
 //! and the PIRLS row kernel). They are layered on top of the hardware
 //! abstraction in the parent [`crate::gpu`] module (runtime, memory, driver,
-//! linalg, error, …) and are kept separate from that infrastructure so the
-//! HAL stays free of domain logic.
+//! linalg, error, …) and are kept separate from that infrastructure boundary.
 
 pub mod arrow_schur;
 pub mod arrow_schur_nvrtc;
