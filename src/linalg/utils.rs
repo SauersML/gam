@@ -550,27 +550,6 @@ pub(crate) fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
     }
 }
 
-/// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
-/// Canonical in-place symmetrizer for a dense square `ndarray` matrix.
-///
-/// Replaces each off-diagonal pair `(i, j)`/`(j, i)` with their arithmetic
-/// mean, leaving the diagonal untouched. This is the single source of truth
-/// for the ndarray symmetrize operation; the `gam-pyffi` crate routes its
-/// former local `symmetrize_in_place` through this function. The faer-typed
-/// equivalent (`symmetrize_faer_matrix_in_place` in `terms/construction.rs`)
-/// is kept separate because it operates on `faer::Mat`.
-pub fn enforce_symmetry(matrix: &mut Array2<f64>) {
-    let n = matrix.nrows();
-    assert_eq!(n, matrix.ncols());
-    for i in 0..n {
-        for j in i + 1..n {
-            let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
-            matrix[[i, j]] = avg;
-            matrix[[j, i]] = avg;
-        }
-    }
-}
-
 pub(crate) fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
     if ridge <= 0.0 {
         return matrix.clone();

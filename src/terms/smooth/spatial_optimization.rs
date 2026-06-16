@@ -6878,10 +6878,15 @@ pub fn curvature_inference_forspec(
 /// statistic the reported p-value is built from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothLrCorrection {
+    /// A per-term LR statistic corrected by the full estimated-λ Lawley factor,
+    /// including the ρ̂-sampling-variation contribution from the regularized
+    /// inverse REML/LAML outer Hessian.
+    LawleyLrEstimatedLambda,
     /// A per-term likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null)` that has
-    /// been Bartlett-corrected with the exact Lawley factor `c = E[W]/d`
-    /// (`W* = W/c`, referenced against `χ²_d`): second-order accurate.
-    LawleyLr,
+    /// been Bartlett-corrected with the fixed-λ Lawley factor `c = E[W|λ]/d`
+    /// (`W* = W/c`, referenced against `χ²_d`). This is used only when the
+    /// estimated-λ handoff is unavailable.
+    LawleyLrFixedLambda,
     /// No second-order correction was applied — either the family has no
     /// closed-form Lawley cumulant jets or the null refit did not converge — so
     /// the uncorrected `χ²_d` of the raw LR statistic stands.
@@ -6893,7 +6898,8 @@ impl SmoothLrCorrection {
     /// The serialized provenance label surfaced in the summary table.
     pub fn label(self) -> &'static str {
         match self {
-            SmoothLrCorrection::LawleyLr => "lawley_lr",
+            SmoothLrCorrection::LawleyLrEstimatedLambda => "lawley_lr_estimated_lambda",
+            SmoothLrCorrection::LawleyLrFixedLambda => "lawley_lr_fixed_lambda",
             SmoothLrCorrection::None => "none",
         }
     }
@@ -6920,6 +6926,13 @@ pub struct SmoothTermLrInference {
     /// Lawley LR Bartlett factor `c = E[W]/d = 1 + Δε/d` when computable, else
     /// `1.0` (no correction).
     pub bartlett_factor: f64,
+    /// Fixed-λ conditional factor `c_cond = 1 + Δε(ρ̂)/d` when the estimated-λ
+    /// correction was applied. `None` means the applied factor was either the
+    /// fixed-λ factor itself or no Lawley correction was available.
+    pub bartlett_factor_conditional: Option<f64>,
+    /// Increment in Lawley's LR mean shift due solely to ρ̂ sampling variation,
+    /// `0.5 * tr(H_Δε Cov(ρ̂))`, when estimated-λ correction was applied.
+    pub rho_variation_shift: Option<f64>,
     /// Bartlett-corrected statistic `W* = W / c`.
     pub statistic_corrected: f64,
     /// Uncorrected p-value `P(χ²_d > W)`.
