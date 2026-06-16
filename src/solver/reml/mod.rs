@@ -1,8 +1,7 @@
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
-use crate::linalg::sparse_exact::{
-    SparseExactFactor, SparsePenaltyBlock, assemble_and_factor_sparse_penalized_system,
-};
+use crate::linalg::sparse_exact::{SparseExactFactor, SparsePenaltyBlock};
+use crate::solver::pirls::assemble_and_factor_sparse_penalized_system;
 use crate::solver::outer_strategy::OuterEval;
 use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::terms::basis::LocalDesignJacobianProvider;

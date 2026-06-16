@@ -18,7 +18,6 @@ pub mod matern_gradient;
 pub mod penalties;
 pub mod penalty_op;
 pub mod sae;
-pub mod sae_candidate_index;
 pub mod sae_chart_canonicalization;
 pub mod sae_corpus;
 pub mod sae_criterion_atoms;
