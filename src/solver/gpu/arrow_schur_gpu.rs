@@ -15,7 +15,7 @@
 //! is not a numerical failure, just a capability mismatch, so the CPU solver
 //! receives the full system without escalating any ridge.
 
-use crate::gpu::arrow_schur::{
+use crate::gpu::kernels::arrow_schur::{
     ArrowSchurGpuFailure, gpu_schur_matvec_backend, solve_arrow_newton_step,
 };
 use crate::solver::arrow_schur::{

@@ -41,7 +41,7 @@ use crate::smooth::{
     LinearCoefficientGeometry, build_term_collection_design, weighted_blockwise_penalty_sum,
 };
 use crate::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
-use crate::survival_construction::{
+use crate::families::survival::construction::{
     SurvivalLikelihoodMode, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, normalize_survival_time_pair,

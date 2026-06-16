@@ -1014,7 +1014,7 @@ fn optimize_survival_transformation_smoothing(
     beta0: &Array1<f64>,
     structural_lower_bounds: Option<&Array1<f64>>,
 ) -> Result<Option<Vec<f64>>, String> {
-    use crate::solver::outer_strategy::{Derivative, HessianResult, OuterEval, OuterProblem};
+    use crate::solver::rho_optimizer::{Derivative, HessianResult, OuterEval, OuterProblem};
     if num_smoothing == 0 {
         return Ok(None);
     }
@@ -2342,7 +2342,7 @@ pub(crate) fn fit_survival_location_scale_model(
         where
             R: Fn(&Array1<f64>) -> Option<InverseLink>,
         {
-            use crate::solver::outer_strategy::{
+            use crate::solver::rho_optimizer::{
                 DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
             };
             let dim = init.len();

@@ -22,7 +22,7 @@ use crate::families::bms::{
 };
 use crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::families::scale_design::ScaleDeviationTransform;
-use crate::families::survival_construction::{
+use crate::families::survival::construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, survival_baseline_targetname,
 };
 use crate::families::survival_location_scale::{

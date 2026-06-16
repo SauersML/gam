@@ -4280,7 +4280,7 @@ where
     ) = if mixture_dim > 0 && sas_dim > 0 {
         crate::bail_invalid_estim!("simultaneous mixture and SAS optimization is not supported");
     } else if mixture_dim == 0 && sas_dim == 0 {
-        use crate::solver::outer_strategy::{
+        use crate::solver::rho_optimizer::{
             DeclaredHessianForm, Derivative, OuterEvalOrder, OuterProblem,
         };
 
@@ -4606,7 +4606,7 @@ where
             reml_seed_config_mix.max_seeds = 1;
             reml_seed_config_mix.seed_budget = 1;
         }
-        use crate::solver::outer_strategy::{
+        use crate::solver::rho_optimizer::{
             DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
         };
         let initial_link_kind = cfg.link_kind.clone();

@@ -4,7 +4,7 @@ use crate::families::bms::{
     LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
 };
 use crate::families::lognormal_kernel::FrailtySpec;
-use crate::families::survival_construction::{
+use crate::families::survival::construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
 use crate::families::survival_location_scale::ResidualDistribution;

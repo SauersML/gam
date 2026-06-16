@@ -736,7 +736,7 @@ pub fn reml_laml_evaluate(
                 hop.prefers_stochastic_trace_estimation(),
                 solution.penalty_subspace_trace.is_some(),
             ) {
-            use crate::gpu::reml_trace::{
+            use crate::gpu::kernels::reml_trace::{
                 DerivativeHessian, HUTCHINSON_ADAPTIVE_REL_TOL, HUTCHINSON_ADAPTIVE_TAU_REL,
                 ProbeSeed, evidence_traces_adaptive,
             };

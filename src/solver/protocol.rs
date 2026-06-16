@@ -2,7 +2,7 @@ use crate::families::bms::{
     DEFAULT_EMPIRICAL_LATENT_GRID_SIZE, DeviationBlockConfig, LatentMeasureSpec, LatentZCheckMode,
     LatentZNormalizationMode, LatentZPolicy,
 };
-use crate::families::survival_construction::SurvivalBaselineTarget;
+use crate::families::survival::construction::SurvivalBaselineTarget;
 use crate::types::{InverseLink, StandardLink};
 
 /// Calibration semantics for the latent score `z` consumed by marginal-slope

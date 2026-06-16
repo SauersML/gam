@@ -97,7 +97,7 @@ use std::sync::Arc;
 // High-level formula-to-fit API imports. These are shared by the fitting,
 // orchestration-entry, and materialization concerns, so they live at the parent
 // level where every submodule's `use super::*;` picks them up.
-use crate::families::survival_construction::{
+use crate::families::survival::construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
     add_survival_time_derivative_guard_offset, append_zero_tail_columns,
     baseline_chain_rule_gradient, build_latent_survival_baseline_offsets,
