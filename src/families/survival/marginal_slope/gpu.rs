@@ -1150,6 +1150,143 @@ pub fn try_device_step5_primary_assembly(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+// Step 6 — joint-β pullback of the Step-5 primary gradient / Hessian into
+// the dense coefficient space.
+//
+// Step 5 produces, per row, the primary-space gradient `g_p ∈ ℝ^r` and
+// Hessian `H_p ∈ ℝ^{r×r}` (local coordinates: q0, q1, q̇1, g, and any
+// score-warp / link-dev primaries).  The joint-β pullback maps those into
+// the dense coefficient space through the per-row primary→coefficient
+// Jacobian `J ∈ ℝ^{r×p}` (`J[a,j] = ∂ primary_a / ∂ β_j`, assembled by the
+// family from its per-block design rows):
+//
+//     nll      = Σ_rows nll_row
+//     grad[j]  = Σ_rows Σ_a  J[a,j] · g_p[a]                 = Σ_rows Jᵀ g_p
+//     H[j,k]   = Σ_rows Σ_{a,b} J[a,j] · H_p[a,b] · J[b,k]   = Σ_rows Jᵀ H_p J
+//
+// (The primary coordinates are affine in β within a fit iteration — the
+// rigid/flex map composes the fixed design rows with the per-row scalar
+// chain — so there is no `∂²primary/∂β²` term here; the second-order curvature
+// already lives inside `H_p`.  This is the same contraction the family's
+// sparse CPU path `add_pullback_primary_hessian` performs block-by-block.)
+//
+// This is the device-shaped Step-6 kernel written as pure host algebra so it
+// is bit-exact CPU-verifiable now; the CUDA dispatch (Linux/V100) folds the
+// same contraction on-device once the substrate jet assembly lands.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Per-row inputs for the Step-6 joint-β pullback: the Step-5 primary
+/// gradient / Hessian for the row plus the row's dense primary→coefficient
+/// Jacobian `J` (`r × p`, row-major: `J[a*p + j] = ∂ primary_a / ∂ β_j`).
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexStep6RowPullback<'a> {
+    /// Primary-space row outputs from [`try_device_step5_primary_assembly`].
+    pub primary: &'a SurvivalFlexStep5RowOutputs,
+    /// Row-major `r × p` primary→coefficient Jacobian.
+    pub jacobian: &'a [f64],
+}
+
+/// Step-6 joint-β pullback: fold per-row Step-5 primary gradient / Hessian
+/// into the dense coefficient-space `(nll, grad ∈ ℝ^p, H ∈ ℝ^{p×p})`.
+///
+/// Pure host algebra (`Σ_rows Jᵀ g_p` and `Σ_rows Jᵀ H_p J`); CPU-verifiable
+/// and the reference the on-device contraction is checked against.  `p` is the
+/// joint coefficient dimension; every row's Jacobian must be `r × p` where
+/// `r` is that row's primary dimension (`primary.grad.len()`).
+pub fn pullback_step6_joint_beta(
+    rows: &[SurvivalFlexStep6RowPullback<'_>],
+    p: usize,
+) -> Result<(f64, Array1<f64>, Array2<f64>), GpuError> {
+    let mut nll = 0.0_f64;
+    let mut grad = Array1::<f64>::zeros(p);
+    let mut hess = Array2::<f64>::zeros((p, p));
+
+    for (i, row) in rows.iter().enumerate() {
+        let r = row.primary.grad.len();
+        if row.primary.hess.len() != r * r {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "step6 row {i}: primary.hess.len()={} expected r*r={}",
+                    row.primary.hess.len(),
+                    r * r
+                ),
+            });
+        }
+        if row.jacobian.len() != r * p {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "step6 row {i}: jacobian.len()={} expected r*p={}",
+                    row.jacobian.len(),
+                    r * p
+                ),
+            });
+        }
+
+        nll += row.primary.row_nll;
+
+        // grad += Jᵀ g_p.
+        let g_p = &row.primary.grad;
+        let j = row.jacobian;
+        for a in 0..r {
+            let ga = g_p[a];
+            if ga == 0.0 {
+                continue;
+            }
+            let j_row = &j[a * p..a * p + p];
+            for k in 0..p {
+                grad[k] += j_row[k] * ga;
+            }
+        }
+
+        // H += Jᵀ H_p J, computed as Σ_a Σ_b H_p[a,b] · (J_a ⊗ J_b).
+        // Form the intermediate M = H_p · J (r × p), then H += Jᵀ M, so the
+        // cost is O(r²·p + r·p²) instead of O(r²·p²).
+        let h_p = &row.primary.hess;
+        let mut m = vec![0.0_f64; r * p];
+        for a in 0..r {
+            for b in 0..r {
+                let hab = h_p[a * r + b];
+                if hab == 0.0 {
+                    continue;
+                }
+                let j_b = &j[b * p..b * p + p];
+                let m_a = &mut m[a * p..a * p + p];
+                for k in 0..p {
+                    m_a[k] += hab * j_b[k];
+                }
+            }
+        }
+        for a in 0..r {
+            let j_a = &j[a * p..a * p + p];
+            let m_a = &m[a * p..a * p + p];
+            for col in 0..p {
+                let jac = j_a[col];
+                if jac == 0.0 {
+                    continue;
+                }
+                for k in 0..p {
+                    hess[[col, k]] += jac * m_a[k];
+                }
+            }
+        }
+    }
+
+    // Symmetrize defensively: Jᵀ H_p J is symmetric when H_p is, but rounding
+    // in the two accumulation orders can leave a sub-ULP asymmetry; average the
+    // off-diagonal so downstream Cholesky / eigen paths see an exactly symmetric
+    // matrix (mirrors the CPU assembler's symmetric write-back).
+    for col in 0..p {
+        for k in (col + 1)..p {
+            let avg = 0.5 * (hess[[col, k]] + hess[[k, col]]);
+            hess[[col, k]] = avg;
+            hess[[k, col]] = avg;
+        }
+    }
+
+    Ok((nll, grad, hess))
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
 // `Ok(None)` (the unsupported sentinel) because the host-side flex jet
 // assembly (Steps 2–4: cubic-cell moments → intercept solve → η/χ/d
@@ -1175,6 +1312,7 @@ pub fn try_device_step5_primary_assembly(
 pub fn try_survival_flex_gradient(
     inputs: SurvivalFlexGpuRowInputs<'_>,
     intercept_solve: Option<&SurvivalFlexInterceptSolveInputs<'_>>,
+    step6: Option<&[SurvivalFlexStep6RowPullback<'_>]>,
 ) -> Result<Option<(f64, Array1<f64>)>, GpuError> {
     inputs.validate()?;
     if inputs.score_dim != 1 {
@@ -1207,14 +1345,29 @@ pub fn try_survival_flex_gradient(
             return Ok(None);
         }
     }
+    // Step 6: when the host has assembled the per-row primary jets (Step 5)
+    // and the family supplied the primary→coefficient Jacobian rows, fold them
+    // into the coefficient-space `(nll, grad)`.  This is the joint-β assembly
+    // that was previously the `Ok(None)` sentinel; it is pure host algebra and
+    // CPU-verifiable, and becomes the device contraction once the substrate
+    // jet assembly lands.
+    if let Some(rows) = step6 {
+        let (nll, grad, _hess) = pullback_step6_joint_beta(rows, inputs.p)?;
+        return Ok(Some((nll, grad)));
+    }
     Ok(None)
 }
 
 /// Evaluate the survival-flex joint-Hessian times a vector `v` on the
 /// GPU.  Returns `H·v` ∈ ℝ^p, or `Ok(None)` for unsupported shapes.
+///
+/// When `step6` carries the assembled per-row primary jets + Jacobians the
+/// product is the exact `H·v` from the Step-6 joint-β pullback; otherwise the
+/// entry point returns `Ok(None)` so the caller falls back to CPU.
 pub fn try_survival_flex_hvp(
     inputs: SurvivalFlexGpuRowInputs<'_>,
     v: &[f64],
+    step6: Option<&[SurvivalFlexStep6RowPullback<'_>]>,
 ) -> Result<Option<Array1<f64>>, GpuError> {
     inputs.validate()?;
     if v.len() != inputs.p {
@@ -1232,6 +1385,10 @@ pub fn try_survival_flex_hvp(
     if !SurvivalFlexGpuBackend::compiled() {
         return Ok(None);
     }
+    if let Some(rows) = step6 {
+        let (_nll, _grad, hess) = pullback_step6_joint_beta(rows, inputs.p)?;
+        return Ok(Some(hess.dot(&Array1::from(v.to_vec()))));
+    }
     Ok(None)
 }
 
@@ -1248,6 +1405,7 @@ pub fn try_survival_flex_hvp(
 pub fn try_survival_flex_dense_hessian(
     inputs: SurvivalFlexGpuRowInputs<'_>,
     cells: Option<SurvivalFlexRowCellsBatch<'_>>,
+    step6: Option<&[SurvivalFlexStep6RowPullback<'_>]>,
 ) -> Result<Option<Array2<f64>>, GpuError> {
     inputs.validate()?;
     if inputs.score_dim != 1 {
@@ -1268,11 +1426,17 @@ pub fn try_survival_flex_dense_hessian(
         };
         let ok_byte = crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8;
         if out.status.iter().any(|&b| b != ok_byte) {
-            // Any cell that failed the substrate classifier or kernel
-            // is a CPU fallback for this fit — Step 4/5/6 assembly is
-            // not landed yet so we cannot stitch a partial answer.
+            // Any cell that failed the substrate classifier or kernel is a CPU
+            // fallback for this fit — we cannot stitch a partial answer from a
+            // moment stage that did not fully evaluate.
             return Ok(None);
         }
+    }
+    // Step 6: fold the assembled per-row primary Hessians into the dense
+    // coefficient-space joint Hessian via the joint-β pullback.
+    if let Some(rows) = step6 {
+        let (_nll, _grad, hess) = pullback_step6_joint_beta(rows, inputs.p)?;
+        return Ok(Some(hess));
     }
     Ok(None)
 }
@@ -1805,4 +1969,199 @@ pub fn cpu_oracle_fourth_contraction(
         out[i] = 0.5 * (ordered_uv[i] + ordered_vu[i]);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod step6_tests {
+    use super::*;
+
+    /// Build a reference coefficient-space pullback by the textbook
+    /// quadruple-/triple-loop contraction (`Σ_rows Jᵀ g_p`, `Σ_rows Jᵀ H_p J`)
+    /// so the production `pullback_step6_joint_beta` (which uses the blocked
+    /// `M = H_p J` intermediate) is checked against an independent assembly.
+    fn reference_pullback(
+        rows: &[(f64, Vec<f64>, Vec<f64>, Vec<f64>)],
+        r: usize,
+        p: usize,
+    ) -> (f64, Vec<f64>, Vec<f64>) {
+        let mut nll = 0.0;
+        let mut grad = vec![0.0_f64; p];
+        let mut hess = vec![0.0_f64; p * p];
+        for (row_nll, g_p, h_p, jac) in rows {
+            nll += row_nll;
+            for a in 0..r {
+                for j in 0..p {
+                    grad[j] += jac[a * p + j] * g_p[a];
+                }
+            }
+            for a in 0..r {
+                for b in 0..r {
+                    let hab = h_p[a * r + b];
+                    for j in 0..p {
+                        for k in 0..p {
+                            hess[j * p + k] += jac[a * p + j] * hab * jac[b * p + k];
+                        }
+                    }
+                }
+            }
+        }
+        (nll, grad, hess)
+    }
+
+    #[test]
+    fn step6_pullback_matches_reference_contraction() {
+        // r=3 primaries, p=4 coefficients, 2 rows. Hand-built jets + Jacobians.
+        let r = 3usize;
+        let p = 4usize;
+        let row_specs: Vec<(f64, Vec<f64>, Vec<f64>, Vec<f64>)> = vec![
+            (
+                1.5,
+                vec![0.3, -0.7, 1.1],
+                // symmetric 3x3
+                vec![
+                    2.0, -0.5, 0.4, //
+                    -0.5, 1.3, 0.2, //
+                    0.4, 0.2, 0.9, //
+                ],
+                // 3x4 Jacobian
+                vec![
+                    1.0, 0.0, 0.5, -0.2, //
+                    0.0, 1.0, 0.0, 0.3, //
+                    0.7, -0.1, 1.0, 0.0, //
+                ],
+            ),
+            (
+                -0.25,
+                vec![-1.2, 0.4, 0.6],
+                vec![
+                    1.1, 0.3, -0.2, //
+                    0.3, 0.8, 0.5, //
+                    -0.2, 0.5, 1.4, //
+                ],
+                vec![
+                    0.2, 1.0, 0.0, 0.0, //
+                    -0.4, 0.0, 1.0, 0.6, //
+                    0.0, 0.3, 0.0, 1.0, //
+                ],
+            ),
+        ];
+
+        let primary_outputs: Vec<SurvivalFlexStep5RowOutputs> = row_specs
+            .iter()
+            .map(|(nll, g, h, _)| SurvivalFlexStep5RowOutputs {
+                row_nll: *nll,
+                grad: g.clone(),
+                hess: h.clone(),
+            })
+            .collect();
+        let pullbacks: Vec<SurvivalFlexStep6RowPullback<'_>> = primary_outputs
+            .iter()
+            .zip(row_specs.iter())
+            .map(|(po, (_, _, _, jac))| SurvivalFlexStep6RowPullback {
+                primary: po,
+                jacobian: jac,
+            })
+            .collect();
+
+        let (nll, grad, hess) = pullback_step6_joint_beta(&pullbacks, p).expect("step6 pullback");
+        let (ref_nll, ref_grad, ref_hess) = reference_pullback(&row_specs, r, p);
+
+        assert!((nll - ref_nll).abs() < 1e-12, "nll mismatch");
+        for j in 0..p {
+            assert!(
+                (grad[j] - ref_grad[j]).abs() < 1e-12,
+                "grad[{j}] {} vs {}",
+                grad[j],
+                ref_grad[j]
+            );
+        }
+        for j in 0..p {
+            for k in 0..p {
+                assert!(
+                    (hess[[j, k]] - ref_hess[j * p + k]).abs() < 1e-12,
+                    "hess[{j},{k}] {} vs {}",
+                    hess[[j, k]],
+                    ref_hess[j * p + k]
+                );
+                // Exactly symmetric after the symmetrization pass.
+                assert_eq!(hess[[j, k]], hess[[k, j]], "H not symmetric at ({j},{k})");
+            }
+        }
+    }
+
+    #[test]
+    fn step6_identity_jacobian_is_block_sum_of_primaries() {
+        // With r == p and J = I per row, the pullback is just the row-sum of
+        // the primary gradients / Hessians — a sanity anchor on the contraction.
+        let p = 3usize;
+        let g0 = vec![1.0, -2.0, 0.5];
+        let h0 = vec![
+            1.0, 0.0, 0.0, //
+            0.0, 2.0, 0.0, //
+            0.0, 0.0, 3.0, //
+        ];
+        let g1 = vec![0.25, 0.25, -1.0];
+        let h1 = vec![
+            0.5, 0.1, 0.0, //
+            0.1, 0.5, 0.0, //
+            0.0, 0.0, 0.5, //
+        ];
+        let eye = vec![
+            1.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, //
+            0.0, 0.0, 1.0, //
+        ];
+        let outs = [
+            SurvivalFlexStep5RowOutputs {
+                row_nll: 2.0,
+                grad: g0.clone(),
+                hess: h0.clone(),
+            },
+            SurvivalFlexStep5RowOutputs {
+                row_nll: 3.0,
+                grad: g1.clone(),
+                hess: h1.clone(),
+            },
+        ];
+        let pb = [
+            SurvivalFlexStep6RowPullback {
+                primary: &outs[0],
+                jacobian: &eye,
+            },
+            SurvivalFlexStep6RowPullback {
+                primary: &outs[1],
+                jacobian: &eye,
+            },
+        ];
+        let (nll, grad, hess) = pullback_step6_joint_beta(&pb, p).expect("identity pullback");
+        assert_eq!(nll, 5.0);
+        for j in 0..p {
+            assert!((grad[j] - (g0[j] + g1[j])).abs() < 1e-14);
+            for k in 0..p {
+                assert!((hess[[j, k]] - (h0[j * p + k] + h1[j * p + k])).abs() < 1e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn step6_rejects_jacobian_shape_mismatch() {
+        let out = SurvivalFlexStep5RowOutputs {
+            row_nll: 0.0,
+            grad: vec![1.0, 2.0],
+            hess: vec![1.0, 0.0, 0.0, 1.0],
+        };
+        // r = 2, p = 3 expects jacobian.len() == 6; supply 5.
+        let bad_jac = vec![0.0; 5];
+        let pb = [SurvivalFlexStep6RowPullback {
+            primary: &out,
+            jacobian: &bad_jac,
+        }];
+        let err = pullback_step6_joint_beta(&pb, 3).expect_err("shape mismatch must error");
+        match err {
+            GpuError::DriverCallFailed { reason } => {
+                assert!(reason.contains("jacobian.len()"), "got {reason}");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
 }

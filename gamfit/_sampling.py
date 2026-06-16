@@ -24,6 +24,11 @@ class PosteriorPredictive:
     mean: Any
     family_kind: str
     model_class: str
+    # Serialized parameterized inverse-link spec (JSON). Carries the per-fit
+    # state (skew/tail, mixture weights, latent SD) the bare ``family_kind`` tag
+    # drops, so the parameterized links' response-scale bands are exact
+    # (issue #1133). None for plain links / older payloads.
+    link_spec: str | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -56,6 +61,7 @@ class PosteriorPredictive:
                 int(eta.shape[1]),
                 self.family_kind,
                 float(level),
+                self.link_spec,
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -137,6 +143,8 @@ class PosteriorSamples:
     model_class: str
     family_kind: str
     config: SamplingConfig
+    # Serialized parameterized inverse-link spec (JSON); see PosteriorPredictive.
+    link_spec: str | None = None
     _model_bytes: bytes = field(repr=False, compare=False, default=_NO_MODEL)
     _name_index: Mapping[str, int] = field(repr=False, compare=False, default_factory=dict)
 
@@ -163,6 +171,7 @@ class PosteriorSamples:
                    rhat=float(p["rhat"]), ess=float(p["ess"]), converged=bool(p["converged"]),
                    method=str(p.get("method", "nuts")), model_class=str(p.get("model_class", "standard")),
                    family_kind=str(p.get("family_kind", "identity")),
+                   link_spec=(str(p["link_spec"]) if p.get("link_spec") is not None else None),
                    config=_config_from_payload(p.get("config", {})), _model_bytes=model_bytes)
 
     @classmethod
@@ -264,13 +273,14 @@ class PosteriorSamples:
 
     def predict_draws(self, new_data: Any) -> PosteriorPredictive:
         import numpy as np
-        eta, family_kind, model_class = self._posterior_predict_eta(new_data)
-        mean_flat = _call("apply_inverse_link_array", eta.ravel().tolist(), family_kind)
+        eta, family_kind, model_class, link_spec = self._posterior_predict_eta(new_data)
+        mean_flat = _call("apply_inverse_link_array", eta.ravel().tolist(), family_kind, link_spec)
         return PosteriorPredictive(eta=np.asarray(eta, dtype=float),
                                    mean=np.asarray(mean_flat, dtype=float).reshape(eta.shape),
-                                   family_kind=family_kind, model_class=model_class)
+                                   family_kind=family_kind, model_class=model_class,
+                                   link_spec=link_spec)
 
-    def _posterior_predict_eta(self, new_data: Any) -> tuple[Any, str, str]:
+    def _posterior_predict_eta(self, new_data: Any) -> tuple[Any, str, str, str | None]:
         import numpy as np
         self._need_model()
         h, r = self._normalize(new_data)
@@ -282,7 +292,10 @@ class PosteriorSamples:
         # allow-list (a): FFI input validation
         if flat.size != nd * nr:
             raise ValueError(f"posterior predict FFI payload shape mismatch: got {flat.size} floats, expected {nd} * {nr}")
-        return flat.reshape(nd, nr), str(p.get("family_kind", self.family_kind)), str(p.get("model_class", self.model_class))
+        link_spec = p.get("link_spec", self.link_spec)
+        link_spec = str(link_spec) if link_spec is not None else None
+        return (flat.reshape(nd, nr), str(p.get("family_kind", self.family_kind)),
+                str(p.get("model_class", self.model_class)), link_spec)
 
     def save(self, path: str | Path) -> str:
         import numpy as np
@@ -293,7 +306,8 @@ class PosteriorSamples:
         if out.suffix != ".npz":
             out = out.with_name(out.name + ".npz")
         md = {"coefficient_names": list(self.coefficient_names), "method": self.method,
-              "model_class": self.model_class, "family_kind": self.family_kind, "config": self.config.to_dict()}
+              "model_class": self.model_class, "family_kind": self.family_kind,
+              "link_spec": self.link_spec, "config": self.config.to_dict()}
         np.savez(out, samples=np.asarray(self.samples, dtype=float),
                  mean=np.asarray(self.mean, dtype=float), std=np.asarray(self.std, dtype=float),
                  rhat=np.float64(self.rhat), ess=np.float64(self.ess), converged=np.bool_(self.converged),
@@ -323,6 +337,7 @@ class PosteriorSamples:
                    converged=bool(npz["converged"].item()),
                    method=str(md.get("method", "nuts")), model_class=str(md.get("model_class", "standard")),
                    family_kind=str(md.get("family_kind", "identity")),
+                   link_spec=(str(md["link_spec"]) if md.get("link_spec") is not None else None),
                    config=_config_from_payload(md.get("config", {})),
                    _model_bytes=bytes(np.asarray(npz["model_bytes"], dtype=np.uint8).tobytes()))
 

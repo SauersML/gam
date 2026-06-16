@@ -178,9 +178,25 @@ fn posterior_eta_bands_impl(
     n_rows: usize,
     family_kind: &str,
     level: f64,
+    link_spec: Option<&str>,
 ) -> Result<String, String> {
+    // Prefer the typed link spec when supplied so the parameterized links
+    // (`Sas`, `Mixture`, `LatentCLogLog`, `BetaLogistic`) push their per-fit
+    // state through to the response-scale bands; otherwise fall back to the
+    // bare string tag (issue #1133).
+    let parsed_link: Option<InverseLink> = match link_spec {
+        Some(spec_json) => Some(
+            serde_json::from_str(spec_json)
+                .map_err(|err| format!("failed to parse link_spec for posterior bands: {err}"))?,
+        ),
+        None => None,
+    };
+    let selector = match parsed_link.as_ref() {
+        Some(link) => posterior_bands::LinkSelector::Spec(link),
+        None => posterior_bands::LinkSelector::Tag(family_kind),
+    };
     let payload =
-        posterior_bands::posterior_eta_bands(eta_flat, n_draws, n_rows, family_kind, level)?;
+        posterior_bands::posterior_eta_bands_link(eta_flat, n_draws, n_rows, selector, level)?;
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize posterior_eta_bands payload: {err}"))
 }
@@ -228,10 +244,24 @@ fn posterior_predict_bands_table_impl(
         .iter()
         .map(|v| v.as_f64().unwrap_or(0.0))
         .collect();
+    // Prefer the typed link spec carried by the predict payload so the
+    // parameterized links push their per-fit state through to response-scale
+    // bands; otherwise fall back to the bare `family_kind` tag (issue #1133).
+    let parsed_link: Option<InverseLink> = match parsed.get("link_spec").and_then(|v| v.as_str()) {
+        Some(spec_json) => Some(
+            serde_json::from_str(spec_json)
+                .map_err(|err| format!("failed to parse link_spec for posterior bands: {err}"))?,
+        ),
+        None => None,
+    };
+    let selector = match parsed_link.as_ref() {
+        Some(link) => posterior_bands::LinkSelector::Spec(link),
+        None => posterior_bands::LinkSelector::Tag(family_kind.as_str()),
+    };
     let eta = Array2::<f64>::from_shape_vec((n_draws_out, n_rows_out), eta_flat)
         .map_err(|err| format!("failed to reshape eta matrix: {err}"))?;
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
-        eta_bands_from_matrix(eta.view(), &family_kind, level)?;
+        posterior_bands::eta_bands_from_matrix_link(eta.view(), selector, level)?;
     let payload = PosteriorPredictBandsPayload {
         linear_predictor: eta_mean,
         linear_predictor_lower: eta_lower,
@@ -325,6 +355,7 @@ fn posterior_predict_marginal_slope_eta(
         n_rows,
         model_class: prediction_model_class_label(model),
         family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
+        link_spec: model_link_spec_json(model),
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize posterior_predict payload: {err}"))
@@ -429,6 +460,7 @@ fn posterior_predict_table_impl(
         n_rows,
         model_class: prediction_model_class_label(&model),
         family_kind: family_link_kind(&model_likelihood_spec(&model)).to_string(),
+        link_spec: model_link_spec_json(&model),
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize posterior_predict payload: {err}"))
@@ -475,6 +507,18 @@ fn family_link_kind(family: &LikelihoodSpec) -> &'static str {
         (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "beta-logistic",
         _ => family.link_function().name(),
     }
+}
+
+/// Serialize the fully parameterized [`InverseLink`] of a model's likelihood to
+/// JSON so the Python wrapper can carry it back into the response-scale
+/// transforms (`apply_inverse_link_array`, `posterior_eta_bands`) as a typed
+/// `link_spec` rather than a lossy `family_kind` tag. The parameterized links
+/// (`Sas`, `Mixture`, `LatentCLogLog`, `BetaLogistic`) carry per-fit state that
+/// the bare string tag cannot represent; this is the seam that wires their
+/// response-scale draws (issue #1133).
+fn model_link_spec_json(model: &FittedModel) -> Option<String> {
+    let spec = model_likelihood_spec(model);
+    serde_json::to_string(&spec.link).ok()
 }
 
 /// Extract the `LikelihoodSpec` carried by the saved model's `family_state`.
@@ -563,6 +607,7 @@ fn build_sample_payload(model: &FittedModel, nuts: &NutsResult, cfg: &NutsConfig
         },
         model_class: prediction_model_class_label(model),
         family_kind: family_link_kind(&model_likelihood_spec(&model)).to_string(),
+        link_spec: model_link_spec_json(model),
         method: nuts_method_label(model).to_string(),
     }
 }

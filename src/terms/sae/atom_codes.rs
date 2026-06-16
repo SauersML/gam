@@ -312,7 +312,66 @@ impl SparseAtomCodes {
             p_a_given_b: cond(n_joint, n_b),
             p_b_given_a: cond(n_joint, n_a),
             lift,
+            weight_correlation: self.weight_codependence(a, b),
         }
+    }
+
+    /// #976 — the AMPLITUDE half of the fusion criterion: the Pearson
+    /// correlation of the two atoms' activation WEIGHTS over the rows where both
+    /// are active. Support co-activation ([`CoactivationStats::dependence`]) only
+    /// says the two atoms fire together; it cannot distinguish a single curved
+    /// family SHATTERED across two near-duplicate atoms (where moving along the
+    /// family smoothly trades amplitude between the pair, so their weights are
+    /// strongly — typically negatively — correlated on the joint support) from
+    /// two GENUINELY INDEPENDENT atoms that merely happen to co-fire on the same
+    /// input class (weights uncorrelated). The magnitude `|ρ|` of this
+    /// correlation is the interaction-evidence the issue's fusion trigger pairs
+    /// with code dependence: high support-overlap AND high `|weight_correlation|`
+    /// is the shattering signature ("dependent codes + joint interaction
+    /// evidence"), whereas high overlap with `|ρ|≈0` is two independent features
+    /// that should NOT be fused.
+    ///
+    /// Returns `0.0` when fewer than two rows are jointly active or when either
+    /// atom's weight is constant on the joint support (an undefined correlation
+    /// is, for the trigger, "no amplitude dependence detected").
+    pub fn weight_codependence(&self, a: usize, b: usize) -> f64 {
+        assert!(
+            a < self.k_atoms && b < self.k_atoms,
+            "SparseAtomCodes::weight_codependence: atoms ({a}, {b}) out of range K={}",
+            self.k_atoms
+        );
+        let mut wa = Vec::new();
+        let mut wb = Vec::new();
+        for code in &self.codes {
+            if code.active_mask.get(a) && code.active_mask.get(b) {
+                wa.push(code.weights[a]);
+                wb.push(code.weights[b]);
+            }
+        }
+        let m = wa.len();
+        if m < 2 {
+            return 0.0;
+        }
+        let inv = 1.0 / m as f64;
+        let mean_a: f64 = wa.iter().sum::<f64>() * inv;
+        let mean_b: f64 = wb.iter().sum::<f64>() * inv;
+        let mut cov = 0.0_f64;
+        let mut var_a = 0.0_f64;
+        let mut var_b = 0.0_f64;
+        for i in 0..m {
+            let da = wa[i] - mean_a;
+            let db = wb[i] - mean_b;
+            cov += da * db;
+            var_a += da * da;
+            var_b += db * db;
+        }
+        if !(var_a > 0.0 && var_b > 0.0) {
+            return 0.0;
+        }
+        let rho = cov / (var_a.sqrt() * var_b.sqrt());
+        // Numerical clamp: accumulation can nudge a perfect ±1 a hair past the
+        // bound.
+        rho.clamp(-1.0, 1.0)
     }
 }
 
@@ -336,6 +395,11 @@ pub struct CoactivationStats {
     /// `P(a∧b) / (P(a)·P(b))`; `1` for independent atoms, `0` when either
     /// marginal is empty.
     pub lift: f64,
+    /// Pearson correlation of the two atoms' activation WEIGHTS over the
+    /// jointly-active rows (see [`SparseAtomCodes::weight_codependence`]) — the
+    /// amplitude/interaction half of the fusion criterion. `0` when the joint
+    /// support is too small or a weight is constant there.
+    pub weight_correlation: f64,
 }
 
 impl CoactivationStats {
@@ -354,6 +418,19 @@ impl CoactivationStats {
     /// acceptance criterion.
     pub fn absorption_asymmetry(&self) -> f64 {
         (self.p_a_given_b - self.p_b_given_a).abs()
+    }
+
+    /// #976 — the combined FUSION evidence: `dependence · |weight_correlation|`.
+    /// A fusion proposal needs BOTH halves — the atoms must co-activate (support
+    /// dependence) AND their amplitudes must be dependent on the joint support
+    /// (the interaction evidence that a single curved family was shattered). Two
+    /// independent atoms that happen to co-fire score near 0 on the second factor
+    /// and so are NOT proposed for fusion even at high support overlap; a genuine
+    /// shattered pair scores high on both. This is the scalar the canonical-order
+    /// fusion ranking ("fusions by code dependence descending") should sort on,
+    /// and the threshold the e-process acceptance gate guards.
+    pub fn fusion_evidence(&self) -> f64 {
+        self.dependence() * self.weight_correlation.abs()
     }
 }
 
@@ -457,5 +534,94 @@ mod tests {
         let empty = SparseAtomCodes::empty(4, 2).coactivation(0, 1);
         assert_eq!(empty.dependence(), 0.0);
         assert_eq!(empty.lift, 0.0);
+    }
+
+    /// #976 — the fusion criterion's discriminating power. Support co-activation
+    /// alone cannot tell a SHATTERED curved family (one manifold smeared across
+    /// two near-duplicate atoms) from two GENUINELY INDEPENDENT atoms that fire
+    /// on the same input class: BOTH can have identical supports (dependence = 1).
+    /// The amplitude half — [`SparseAtomCodes::weight_codependence`] — separates
+    /// them: a shattered pair trades activation weight smoothly as it moves along
+    /// the family, so the pair's weights are strongly correlated on the joint
+    /// support, while independent co-active atoms have uncorrelated weights.
+    /// `fusion_evidence` (dependence · |weight_correlation|) must therefore fire
+    /// on the planted shatter and stay near zero for the independent pair.
+    #[test]
+    fn fusion_criterion_distinguishes_shattered_from_independent_coactive() {
+        let n = 120usize;
+
+        // Planted SHATTER: a 1-D family parametrised by t ∈ [0,1] re-encoded as
+        // two near-duplicate atoms whose amplitudes are a smooth partition of
+        // unity — atom 0 carries `t`, atom 1 carries `1 − t`. Moving along the
+        // family trades weight between them, so on the (identical) joint support
+        // their weights are PERFECTLY anti-correlated (|ρ| = 1).
+        let mut shattered = SparseAtomCodes::empty(n, 2);
+        for row in 0..n {
+            let t = (row as f64 + 0.5) / n as f64;
+            shattered.row_mut(row).assign(0, t);
+            shattered.row_mut(row).assign(1, 1.0 - t);
+        }
+        let shat = shattered.coactivation(0, 1);
+        assert!(
+            (shat.dependence() - 1.0).abs() < 1e-12,
+            "shattered pair shares support: dependence={}",
+            shat.dependence()
+        );
+        assert!(
+            shat.weight_correlation < -0.99,
+            "shattered family's partition-of-unity weights are anti-correlated on \
+             the joint support: weight_correlation={}",
+            shat.weight_correlation
+        );
+        assert!(
+            shat.fusion_evidence() > 0.95,
+            "fusion evidence must FIRE on a planted shatter: {}",
+            shat.fusion_evidence()
+        );
+
+        // INDEPENDENT co-active pair: same identical support (dependence = 1),
+        // but the two atoms' weights are drawn independently — a deterministic,
+        // mutually-uncorrelated pair of sequences (one from a low-frequency
+        // sinusoid, one from a coprime-frequency sinusoid, phase-offset) so the
+        // joint-support weight correlation is ≈ 0.
+        let mut independent = SparseAtomCodes::empty(n, 2);
+        for row in 0..n {
+            let x = row as f64;
+            let wa = 0.5 + 0.4 * (2.0 * std::f64::consts::PI * x / 7.0).sin();
+            let wb = 0.5 + 0.4 * (2.0 * std::f64::consts::PI * x / 11.0 + 1.3).cos();
+            independent.row_mut(row).assign(0, wa);
+            independent.row_mut(row).assign(1, wb);
+        }
+        let indep = independent.coactivation(0, 1);
+        assert!(
+            (indep.dependence() - 1.0).abs() < 1e-12,
+            "independent pair was constructed with identical support: dependence={}",
+            indep.dependence()
+        );
+        assert!(
+            indep.weight_correlation.abs() < 0.3,
+            "independent co-active atoms have ~uncorrelated weights: \
+             weight_correlation={}",
+            indep.weight_correlation
+        );
+
+        // The criterion SEPARATES them despite identical support overlap.
+        assert!(
+            shat.fusion_evidence() > 3.0 * indep.fusion_evidence().max(1e-6),
+            "fusion evidence must rank the shattered pair far above the independent \
+             pair: shattered={}, independent={}",
+            shat.fusion_evidence(),
+            indep.fusion_evidence()
+        );
+
+        // Degenerate joint supports give a defined (zero) amplitude reading.
+        let mut tiny = SparseAtomCodes::empty(3, 2);
+        tiny.row_mut(0).assign(0, 1.0);
+        tiny.row_mut(0).assign(1, 1.0);
+        assert_eq!(
+            tiny.weight_codependence(0, 1),
+            0.0,
+            "a single jointly-active row carries no amplitude correlation"
+        );
     }
 }

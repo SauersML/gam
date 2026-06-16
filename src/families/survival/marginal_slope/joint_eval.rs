@@ -150,7 +150,7 @@ impl SurvivalMarginalSlopeFamily {
         };
         let inputs = batch.as_inputs(self);
         match crate::families::survival::marginal_slope::gpu::try_survival_flex_gradient(
-            inputs, None,
+            inputs, None, None,
         )
         .map_err(|e| e.to_string())?
         {
@@ -202,8 +202,10 @@ impl SurvivalMarginalSlopeFamily {
         let v_slice = v
             .as_slice()
             .ok_or_else(|| "survival-flex GPU HVP requires contiguous v".to_string())?;
-        match crate::families::survival::marginal_slope::gpu::try_survival_flex_hvp(inputs, v_slice)
-            .map_err(|e| e.to_string())?
+        match crate::families::survival::marginal_slope::gpu::try_survival_flex_hvp(
+            inputs, v_slice, None,
+        )
+        .map_err(|e| e.to_string())?
         {
             Some(hv) => {
                 if hv.len() != slices.total {
@@ -247,7 +249,7 @@ impl SurvivalMarginalSlopeFamily {
         };
         let inputs = batch.as_inputs(self);
         match crate::families::survival::marginal_slope::gpu::try_survival_flex_dense_hessian(
-            inputs, None,
+            inputs, None, None,
         )
         .map_err(|e| e.to_string())?
         {

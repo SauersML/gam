@@ -832,6 +832,17 @@ impl SaeManifoldOuterObjective {
                 self.term.set_flat_beta(beta.view())?;
             }
         }
+        // #1154 item 2 (Design A) — warm-start the inner latent coords from the
+        // amortized encoder built on the CURRENT dictionary. At outer step m this
+        // seeds the inner solve from the per-chart IFT predictor of the dictionary
+        // settled at step m−1, refined to the SAME stationary point (so the REML
+        // λ-gradient is untouched). Best-effort: a first-build / degenerate atlas
+        // certifies no rows and warm-starts nothing, leaving the cold path
+        // byte-for-byte unchanged; a transient atlas-build refusal must not abort
+        // the criterion evaluation, so the warm-start is advisory only.
+        self.term
+            .warm_start_latents_from_amortized_encoder(self.target.view(), &rho)
+            .ok();
         let (reml_cost, loss) = self.term.reml_criterion_with_refine_policy(
             self.target.view(),
             &rho,

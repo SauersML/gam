@@ -1684,8 +1684,17 @@ mod tests {
         s
     }
 
+    /// #933: a `jacobian_callback`-only block (no `stacked_design`) whose audit
+    /// attributes a dropped column is now SAFELY REDUCED rather than kept at raw
+    /// width. The callback is wrapped in `GaugeComposedJacobian` so its effective
+    /// Jacobian emerges at the reduced width, and the one Gauge lifts the reduced
+    /// fit back through the SAME selection `T_i`. The round-trip invariant is η:
+    /// the wrapped (reduced) callback applied to θ must equal the raw callback
+    /// applied to the lifted β_raw = T_i · θ.
     #[test]
-    fn callback_owned_geometry_keeps_raw_width_after_audit_drop() {
+    fn callback_owned_geometry_reduces_and_round_trips_via_gauge() {
+        use crate::families::custom_family::FamilyLinearizationState;
+
         let n = 48;
         let x = linspace(n);
         let mut anchor = Array2::<f64>::zeros((n, 2));
@@ -1693,6 +1702,7 @@ mod tests {
         for i in 0..n {
             anchor[[i, 0]] = 1.0;
             anchor[[i, 1]] = x[i];
+            // Block b column 0 aliases anchor's x direction; column 1 is x².
             callback_owned[[i, 0]] = x[i];
             callback_owned[[i, 1]] = x[i] * x[i];
         }
@@ -1700,16 +1710,16 @@ mod tests {
         let anchor_spec = spec_from_dense_with_priority("marginal_surface", anchor, 150);
         let mut callback_spec =
             spec_from_dense_with_priority("logslope_surface", callback_owned.clone(), 120);
-        callback_spec.jacobian_callback = Some(Arc::new(AdditiveBlockJacobian {
-            design: callback_owned,
+        let raw_callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(AdditiveBlockJacobian {
+            design: callback_owned.clone(),
             own_output: 0,
             n_family_outputs: 1,
-        }));
+        });
+        callback_spec.jacobian_callback = Some(Arc::clone(&raw_callback));
         let specs = [anchor_spec, callback_spec];
 
-        let canon = canonicalize_for_identifiability(&specs).expect(
-            "callback-owned overlap should be audit-attributed but width-preserving (#772)",
-        );
+        let canon = canonicalize_for_identifiability(&specs)
+            .expect("callback-only overlap must now reduce safely (#933)");
 
         assert!(
             !canon.audit.fatal,
@@ -1725,6 +1735,9 @@ mod tests {
             "test must exercise an attributed logslope drop; got {:?}",
             canon.audit.dropped_columns,
         );
+        // Anchor (higher priority) keeps both columns; the aliased callback block
+        // now sheds exactly one column — the reduction the width-preserving path
+        // used to refuse.
         assert_eq!(
             canon.reduced_specs[0].design.ncols(),
             2,
@@ -1732,26 +1745,55 @@ mod tests {
         );
         assert_eq!(
             canon.reduced_specs[1].design.ncols(),
-            2,
-            "callback-owned block keeps raw width instead of applying design-column surgery"
+            1,
+            "callback-only block is now column-reduced via the composed gauge (#933)",
         );
-        for block in 0..canon.gauge.n_blocks() {
-            let transform = canon.gauge.block_transform(block);
-            assert_eq!(
-                transform.dim(),
-                (2, 2),
-                "block {block} transform must be raw-width identity"
+
+        // The block's gauge transform is the 2×1 selection of the surviving
+        // column, and the reduced spec carries a wrapped callback that emits the
+        // reduced width.
+        let t_b = canon.gauge.block_transform(1);
+        assert_eq!(t_b.dim(), (2, 1), "reduced callback block transform is 2×1");
+        let reduced_cb = canon.reduced_specs[1]
+            .jacobian_callback
+            .as_ref()
+            .expect("reduced callback-only block must still carry a callback");
+
+        // η round-trip: (J_raw · T_b) · θ == J_raw · (T_b · θ) for an arbitrary θ.
+        let theta = Array1::from(vec![0.73_f64]);
+        let beta_raw = t_b.dot(&theta); // length-2 lifted coefficient
+        let zeros_red = vec![0.0_f64; 1];
+        let state_red = FamilyLinearizationState {
+            beta: &zeros_red,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: 1.0,
+        };
+        let j_reduced = reduced_cb
+            .effective_jacobian_at(&state_red)
+            .expect("reduced callback Jacobian");
+        assert_eq!(j_reduced.dim(), (n, 1), "reduced Jacobian is n×1");
+        let eta_reduced = j_reduced.dot(&theta);
+
+        let zeros_raw = vec![0.0_f64; 2];
+        let state_raw = FamilyLinearizationState {
+            beta: &zeros_raw,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: 1.0,
+        };
+        let j_raw = raw_callback
+            .effective_jacobian_at(&state_raw)
+            .expect("raw callback Jacobian");
+        let eta_raw = j_raw.dot(&beta_raw);
+        for i in 0..n {
+            assert!(
+                (eta_reduced[i] - eta_raw[i]).abs() < 1e-12,
+                "η must be invariant under the composed-gauge reduction at row {i}: \
+                 reduced {} vs raw {}",
+                eta_reduced[i],
+                eta_raw[i],
             );
-            for row in 0..2 {
-                for col in 0..2 {
-                    let expected = if row == col { 1.0 } else { 0.0 };
-                    assert_eq!(
-                        transform[[row, col]],
-                        expected,
-                        "block {block} transform must be identity"
-                    );
-                }
-            }
         }
     }
 

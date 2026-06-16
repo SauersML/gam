@@ -469,7 +469,7 @@ fn emulate_forward_block(
 ) -> Result<FusedRowState, usize> {
     // ---- Load D_i + ridge_t·I into L (column-major). ----
     let mut l = d_col_major.to_vec();
-    debug_assert_eq!(l.len(), p * p);
+    assert_eq!(l.len(), p * p);
     for j in 0..p {
         l[j * p + j] += ridge_t;
     }
@@ -501,7 +501,7 @@ fn emulate_forward_block(
 
     // ---- Forward solve L u = g (kernel's tid==0 sweep). ----
     let mut u = g.to_vec();
-    debug_assert_eq!(u.len(), p);
+    assert_eq!(u.len(), p);
     for row in 0..p {
         let mut s = u[row];
         for t in 0..row {
@@ -511,7 +511,7 @@ fn emulate_forward_block(
     }
     // ---- Forward solve L Y = B (kernel's per-column sweep). ----
     let mut y = b_col_major.to_vec();
-    debug_assert_eq!(y.len(), p * r);
+    assert_eq!(y.len(), p * r);
     for c in 0..r {
         for row in 0..p {
             let mut s = y[c * p + row];
@@ -800,5 +800,224 @@ mod tests {
         assert!(src.contains("#define R_TEMPLATE 8"));
         assert!(src.contains("arrow_schur_forward_pgroup"));
         assert!(src.contains("arrow_schur_back_sub_pgroup"));
+    }
+
+    // ----------------------------------------------------------------------
+    // Device-free verification of the fused Layer D + E kernel ALGORITHM
+    // (#1017). The CUDA source can only run on a GPU, but its arithmetic is
+    // mirrored by `emulate_fused_arrow_newton_step`; these tests pin that
+    // emulation against the dense reference so the fused kernel's correctness
+    // is checkable on any host before a V100/A100 window is available.
+    // ----------------------------------------------------------------------
+    use crate::gpu::kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
+    use crate::solver::arrow_schur::ArrowSchurSystem;
+
+    /// Deterministic SPD bordered system: per-row `H_tt = JJᵀ + (2+i)I` (PD),
+    /// arbitrary `H_tβ`, SPD border `H_ββ = MMᵀ + p·I`, fixed gradients. No RNG
+    /// — same inputs every run, so the test is reproducible.
+    fn build_spd_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+        for i in 0..n {
+            for r in 0..d {
+                for c in 0..d {
+                    // J[r][c] = sin(r + 2c + i); H_tt = JJᵀ + (2+i)I (SPD).
+                    let mut v = 0.0;
+                    for m in 0..d {
+                        let j_rm = ((r + 2 * m + i) as f64).sin();
+                        let j_cm = ((c + 2 * m + i) as f64).sin();
+                        v += j_rm * j_cm;
+                    }
+                    if r == c {
+                        v += 2.0 + i as f64;
+                    }
+                    sys.rows[i].htt[[r, c]] = v;
+                }
+                for c in 0..k {
+                    sys.rows[i].htbeta[[r, c]] = ((r + 3 * c + 2 * i) as f64).cos() * 0.5;
+                }
+                sys.rows[i].gt[r] = ((r + i) as f64).cos();
+            }
+        }
+        for r in 0..k {
+            for c in 0..k {
+                let mut v = 0.0;
+                for m in 0..k {
+                    v += ((r + 2 * m) as f64).cos() * ((c + 2 * m) as f64).cos();
+                }
+                if r == c {
+                    v += k as f64;
+                }
+                sys.hbb[[r, c]] = v;
+            }
+            sys.gb[r] = ((r + 1) as f64).sin();
+        }
+        sys.refresh_row_hessian_fingerprint();
+        sys
+    }
+
+    fn rel_err(a: &[f64], b: &[f64]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut num = 0.0_f64;
+        let mut den = 0.0_f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            num += (x - y) * (x - y);
+            den += y * y;
+        }
+        (num / den.max(1e-300)).sqrt()
+    }
+
+    #[test]
+    fn fused_cpu_emulation_matches_dense_reference() {
+        // SAE-flavoured shapes: few wide row blocks (small d, moderate k).
+        for &(n, d, k) in &[(1usize, 2usize, 4usize), (5, 3, 6), (8, 4, 5), (3, 2, 8)] {
+            let sys = build_spd_system(n, d, k);
+            let ridge_t = 1e-3;
+            let ridge_beta = 1e-2;
+            let dense = solve_arrow_newton_step_dense_reference(&sys, ridge_t, ridge_beta)
+                .expect("dense reference solves the SPD system");
+            let fused = emulate_fused_arrow_newton_step(&sys, ridge_t, ridge_beta)
+                .expect("fused emulation solves the SPD system");
+
+            assert!(
+                rel_err(&fused.delta_t, dense.delta_t.as_slice().unwrap()) < 1e-10,
+                "δt mismatch at (n={n},d={d},k={k})"
+            );
+            assert!(
+                rel_err(&fused.delta_beta, dense.delta_beta.as_slice().unwrap()) < 1e-10,
+                "δβ mismatch at (n={n},d={d},k={k})"
+            );
+            let ld_rel = (fused.log_det_hessian - dense.log_det_hessian).abs()
+                / dense.log_det_hessian.abs().max(1.0);
+            assert!(
+                ld_rel < 1e-10,
+                "log|H| mismatch at (n={n},d={d},k={k}): fused={} dense={}",
+                fused.log_det_hessian,
+                dense.log_det_hessian
+            );
+        }
+    }
+
+    #[test]
+    fn fused_cpu_emulation_is_deterministic() {
+        let sys = build_spd_system(6, 3, 5);
+        let a = emulate_fused_arrow_newton_step(&sys, 1e-3, 1e-2).unwrap();
+        let b = emulate_fused_arrow_newton_step(&sys, 1e-3, 1e-2).unwrap();
+        // Bit-identical: the emulation has fixed loop/accumulation order, so the
+        // criterion ranking across topology candidates cannot move (the #1017
+        // verification gate).
+        assert_eq!(a.delta_t, b.delta_t);
+        assert_eq!(a.delta_beta, b.delta_beta);
+        assert_eq!(a.log_det_hessian, b.log_det_hessian);
+    }
+
+    #[test]
+    fn fused_cpu_emulation_reports_non_pd_row() {
+        // A row whose H_tt is indefinite and ridge too small to rescue it: the
+        // emulation mirrors the kernel's `status_out[i] = j+1` non-PD branch.
+        let mut sys = build_spd_system(2, 2, 4);
+        sys.rows[1].htt[[0, 0]] = -5.0;
+        sys.rows[1].htt[[1, 1]] = -5.0;
+        sys.rows[1].htt[[0, 1]] = 0.0;
+        sys.rows[1].htt[[1, 0]] = 0.0;
+        sys.refresh_row_hessian_fingerprint();
+        let err = emulate_fused_arrow_newton_step(&sys, 1e-6, 1e-2).unwrap_err();
+        match err {
+            FusedCpuError::RowNotPositiveDefinite { row, pivot } => {
+                assert_eq!(row, 1);
+                assert_eq!(pivot, 1, "non-positive at the first pivot");
+            }
+            other => panic!("expected RowNotPositiveDefinite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fused_cpu_emulation_declines_matrix_free_and_degenerate() {
+        // Degenerate dims → Unavailable (the dense fused path declines).
+        let empty = ArrowSchurSystem::new(0, 2, 4);
+        assert_eq!(
+            emulate_fused_arrow_newton_step(&empty, 1e-3, 1e-2).unwrap_err(),
+            FusedCpuError::Unavailable
+        );
+    }
+
+    #[test]
+    fn forward_block_partials_reconstruct_g_block() {
+        // The per-block partials must equal the explicit reduced contribution:
+        // partial_s = Y_iᵀ Y_i where Y_i = L_i^{-1} B_i, i.e. the row's Schur
+        // term B_iᵀ (D_i+ρI)^{-1} B_i. Reconstruct and cross-check directly.
+        let sys = build_spd_system(1, 3, 4);
+        let p = sys.d;
+        let r = sys.k;
+        let row = &sys.rows[0];
+        let ridge_t = 1e-3;
+        let mut d_col = vec![0.0; p * p];
+        let mut b_col = vec![0.0; p * r];
+        let mut g = vec![0.0; p];
+        for c in 0..p {
+            for rr in 0..p {
+                d_col[c * p + rr] = row.htt[[rr, c]];
+            }
+        }
+        for c in 0..r {
+            for rr in 0..p {
+                b_col[c * p + rr] = row.htbeta[[rr, c]];
+            }
+        }
+        for rr in 0..p {
+            g[rr] = row.gt[rr];
+        }
+        let mut ps = vec![0.0; r * r];
+        let mut pr = vec![0.0; r];
+        let mut ld = 0.0;
+        emulate_forward_block(&d_col, &b_col, &g, p, r, ridge_t, &mut ps, &mut pr, &mut ld)
+            .expect("PD block factors");
+
+        // Direct: M = D + ρI; solve M Z = B; expect partial_s = Bᵀ Z = ZᵀMZ.
+        // Build M, invert via the same scalar Cholesky path indirectly by
+        // forming Bᵀ M^{-1} B through a dense solve.
+        let mut m = vec![vec![0.0; p]; p];
+        for rr in 0..p {
+            for c in 0..p {
+                m[rr][c] = row.htt[[rr, c]] + if rr == c { ridge_t } else { 0.0 };
+            }
+        }
+        // Solve M z = b_col[:,c] by Gaussian elimination (independent of the
+        // emulation's Cholesky path) → s_direct[c][c2] = z_cᵀ b_{c2}.
+        let solve = |m: &Vec<Vec<f64>>, rhs: &[f64]| -> Vec<f64> {
+            let mut a: Vec<Vec<f64>> = m.iter().map(|r| r.clone()).collect();
+            let mut x = rhs.to_vec();
+            for col in 0..p {
+                let piv = a[col][col];
+                for j in col..p {
+                    a[col][j] /= piv;
+                }
+                x[col] /= piv;
+                for rr in 0..p {
+                    if rr != col {
+                        let f = a[rr][col];
+                        for j in col..p {
+                            a[rr][j] -= f * a[col][j];
+                        }
+                        x[rr] -= f * x[col];
+                    }
+                }
+            }
+            x
+        };
+        for c in 0..r {
+            let bc: Vec<f64> = (0..p).map(|rr| b_col[c * p + rr]).collect();
+            let z = solve(&m, &bc);
+            for c2 in 0..r {
+                let mut dir = 0.0;
+                for rr in 0..p {
+                    dir += b_col[c2 * p + rr] * z[rr];
+                }
+                assert!(
+                    (ps[c * r + c2] - dir).abs() < 1e-9,
+                    "partial_s[{c}][{c2}] {} vs direct {dir}",
+                    ps[c * r + c2]
+                );
+            }
+        }
     }
 }

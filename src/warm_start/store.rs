@@ -104,6 +104,21 @@ pub struct WarmStartStore {
     /// Monotonically increasing save counter, shared across clones. Used
     /// together with `byte_total` to throttle the eviction directory walk.
     save_counter: Arc<AtomicU64>,
+    /// Root-directory mtime observed at the last completed eviction sweep,
+    /// shared across clones. When a throttled sweep fires while the store is
+    /// comfortably *under* the size budget, the only work left for it is a
+    /// TTL/byte resync over every key dir — an N-dir `read_dir` + `stat` walk
+    /// that, with thousands of fingerprint dirs in a long CI run, dominates
+    /// the per-32-save sweep even after the per-dir listing cache lands (the
+    /// residual #1114 walk). The root dir's mtime is bumped by the OS whenever
+    /// a key dir is created or removed under it, so an unchanged root mtime
+    /// means no key dir was added/dropped since our last sweep; combined with
+    /// a comfortably-under-budget byte total, the size-eviction walk is then a
+    /// guaranteed no-op and is skipped. TTL expiry of *existing* entries does
+    /// not change the root mtime, but it is already performed lazily on every
+    /// `lookup_with` and on the next root-changing save, so skipping it here is
+    /// behaviour-neutral (no entry the gate skips could be returned stale).
+    last_evict_root_mtime: Arc<Mutex<Option<SystemTime>>>,
     /// Per-store test-only monotonic time offset (nanoseconds) added to every
     /// `*_now` reading. Always zero in production. Tests mutate it through
     /// [`Self::test_advance_time`] to simulate elapsed time without
@@ -127,6 +142,7 @@ impl Clone for WarmStartStore {
             // clone per save/lookup.
             byte_total: Arc::clone(&self.byte_total),
             save_counter: Arc::clone(&self.save_counter),
+            last_evict_root_mtime: Arc::clone(&self.last_evict_root_mtime),
             test_time_offset_ns: AtomicU64::new(self.test_time_offset_ns.load(Ordering::Relaxed)),
         }
     }
@@ -142,6 +158,7 @@ impl WarmStartStore {
             index: Arc::new(Mutex::new(MetadataIndex::default())),
             byte_total: Arc::new(AtomicU64::new(0)),
             save_counter: Arc::new(AtomicU64::new(0)),
+            last_evict_root_mtime: Arc::new(Mutex::new(None)),
             test_time_offset_ns: AtomicU64::new(0),
         })
     }
@@ -455,6 +472,26 @@ impl WarmStartStore {
     /// mtime, batches of writes within the same second would sort
     /// arbitrarily and could evict the most recent entry.
     pub fn evict_overflow(&self) -> Result<(), StoreError> {
+        // Root-mtime short-circuit. A throttled sweep that fires while the
+        // approximate byte total is comfortably under budget has no size
+        // eviction to do; its only residual work is the TTL/byte resync walk
+        // over every key dir. The root mtime is bumped whenever a key dir is
+        // created/removed beneath it, so if it is unchanged since our last
+        // completed sweep AND we are under budget, no key dir was added or
+        // dropped and the size-eviction walk is provably a no-op — skip the
+        // N-dir `read_dir`+`stat` storm. (TTL expiry of existing entries does
+        // not move the root mtime, but it is already enforced lazily on every
+        // `lookup_with` and on the next root-changing save, so the gate cannot
+        // surface a stale entry.) This trims the residual #1114 walk in long
+        // refit-heavy CI runs where thousands of fingerprint dirs accumulate.
+        let current_root_mtime = fs::metadata(&self.root).ok().and_then(|m| m.modified().ok());
+        if self.byte_total.load(Ordering::Relaxed) <= self.opts.size_budget_bytes
+            && let Some(now_mtime) = current_root_mtime
+            && let Ok(last) = self.last_evict_root_mtime.lock()
+            && *last == Some(now_mtime)
+        {
+            return Ok(());
+        }
         let read_dir = match fs::read_dir(&self.root) {
             Ok(rd) => rd,
             Err(_) => return Ok(()),
@@ -508,6 +545,18 @@ impl WarmStartStore {
             // the budget on every call and triggers a full directory walk
             // on every save instead of every Nth save.
             self.byte_total.store(total, Ordering::Relaxed);
+            // Record the root mtime observed by this completed under-budget
+            // sweep so a subsequent throttled sweep can short-circuit while
+            // the root is unchanged. Re-read after the walk: any key dir the
+            // walk removed (empty-dir sweep above) bumps the root mtime, and
+            // capturing the post-walk value keeps the gate from skipping a
+            // genuinely-changed root on the next call.
+            if let (Ok(mut last), Some(m)) = (
+                self.last_evict_root_mtime.lock(),
+                fs::metadata(&self.root).ok().and_then(|m| m.modified().ok()),
+            ) {
+                *last = Some(m);
+            }
             return Ok(());
         }
         all.sort_by_key(|e| e.3);

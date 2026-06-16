@@ -48,6 +48,8 @@ mod bc_periodic_combination_rejected;
 mod bc_predict_dimension_invariants;
 #[path = "basis_smooth/bspline_derivative_identity_bug.rs"]
 mod bspline_derivative_identity_bug;
+#[path = "basis_smooth/bspline_derivative_fd_oracle.rs"]
+mod bspline_derivative_fd_oracle;
 #[path = "basis_smooth/bspline_knot_options_formula.rs"]
 mod bspline_knot_options_formula;
 #[path = "basis_smooth/bspline_partition_unity_degree_1.rs"]

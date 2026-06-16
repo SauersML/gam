@@ -1028,12 +1028,31 @@ fn optimize_survival_transformation_smoothing(
             .map(|&l| l.max(1e-12).ln()),
     );
 
+    // Memoize the most recent (ρ, cost, gradient) triple. The outer BFGS bridge
+    // queries this objective through TWO separate closures — a value-only probe
+    // (line search) and a value+gradient probe (accepted step) — and routinely
+    // re-asks for the SAME ρ across them (a successful line-search point becomes
+    // the next gradient evaluation). Each `eval_at` call re-runs the full
+    // constrained inner PIRLS over all n rows, so without memoization every
+    // accepted step pays for the identical inner solve twice. Caching one ρ (the
+    // last evaluated) collapses that duplicate to a hash-equality check; the
+    // returned cost/gradient are bit-identical to recomputing, so the BFGS path
+    // and every asserted recovery bar are unchanged — only redundant inner
+    // solves are removed. This mirrors the gamlss outer evaluator's `last_eval`
+    // cache (`families::gamlss::builders`).
+    let eval_cache: std::cell::RefCell<Option<(Array1<f64>, f64, Array1<f64>)>> =
+        std::cell::RefCell::new(None);
     // Evaluate the LAML objective and ρ-gradient at a smoothing-ρ proposal:
     // set the smoothing λ, re-run the constrained inner PIRLS, evaluate the
     // unified survival LAML, and project the gradient onto the smoothing
     // coordinates (the trailing ridge gradient component is discarded since the
     // ridge is fixed).
     let eval_at = |rho_smooth: &Array1<f64>| -> Result<(f64, Array1<f64>), String> {
+        if let Some((cached_rho, cached_cost, cached_grad)) = eval_cache.borrow().as_ref()
+            && cached_rho == rho_smooth
+        {
+            return Ok((*cached_cost, cached_grad.clone()));
+        }
         let mut candidate = model.clone();
         let mut lambdas = seed_lambdas.clone();
         for k in 0..num_smoothing {
@@ -1092,10 +1111,10 @@ fn optimize_survival_transformation_smoothing(
                 summary.lastgradient_norm,
                 summary.iterations,
             );
-            Ok((
-                SURVIVAL_TRANSFORMATION_NONCONVERGED_TRIAL_COST,
-                Array1::zeros(num_smoothing),
-            ))
+            let cost = SURVIVAL_TRANSFORMATION_NONCONVERGED_TRIAL_COST;
+            let grad = Array1::zeros(num_smoothing);
+            *eval_cache.borrow_mut() = Some((rho_smooth.to_owned(), cost, grad.clone()));
+            Ok((cost, grad))
         };
         let inner_converged = matches!(
             summary.status,
@@ -1130,6 +1149,7 @@ fn optimize_survival_transformation_smoothing(
         if grad.iter().any(|g| !g.is_finite()) {
             return bad_trial("LAML gradient non-finite");
         }
+        *eval_cache.borrow_mut() = Some((rho_smooth.to_owned(), cost, grad.clone()));
         Ok((cost, grad))
     };
 

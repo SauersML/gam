@@ -127,6 +127,19 @@ pub fn posterior_eta_bands(
     family_kind: &str,
     level: f64,
 ) -> Result<PosteriorPredictBandsPayload, String> {
+    posterior_eta_bands_link(eta_flat, n_draws, n_rows, LinkSelector::Tag(family_kind), level)
+}
+
+/// Spec-aware sibling of [`posterior_eta_bands`]. When `link` is a
+/// [`LinkSelector::Spec`] the parameterized inverse links are evaluated from
+/// their fitted state; the emitted `family_kind` is the link's display name.
+pub fn posterior_eta_bands_link(
+    eta_flat: Vec<f64>,
+    n_draws: usize,
+    n_rows: usize,
+    link: LinkSelector<'_>,
+    level: f64,
+) -> Result<PosteriorPredictBandsPayload, String> {
     if eta_flat.len() != n_draws * n_rows {
         return Err(format!(
             "posterior_eta_bands shape mismatch: got {} floats, expected {} * {}",
@@ -135,10 +148,14 @@ pub fn posterior_eta_bands(
             n_rows
         ));
     }
+    let family_kind = match link {
+        LinkSelector::Tag(tag) => tag.to_string(),
+        LinkSelector::Spec(spec) => spec.link_function().name().to_string(),
+    };
     let eta = Array2::<f64>::from_shape_vec((n_draws, n_rows), eta_flat)
         .map_err(|err| format!("failed to reshape eta matrix: {err}"))?;
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
-        eta_bands_from_matrix(eta.view(), family_kind, level)?;
+        eta_bands_from_matrix_link(eta.view(), link, level)?;
     Ok(PosteriorPredictBandsPayload {
         linear_predictor: eta_mean,
         linear_predictor_lower: eta_lower,
@@ -149,7 +166,7 @@ pub fn posterior_eta_bands(
         n_rows,
         n_draws,
         model_class: String::new(),
-        family_kind: family_kind.to_string(),
+        family_kind,
     })
 }
 

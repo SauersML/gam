@@ -433,11 +433,14 @@ pub(super) fn dispersion_row_kernel(
             // `s_phi`/`s_eta`/`curvature_eta` hand calculus.
             let tower = dispersion_tweedie_nll_tower(yi, em, ed, p, wi);
             let loglik = -tower.v;
-            let s_eta = if wi == 0.0 { 0.0 } else { -tower.g[1] / wi };
+            // η_d-space score and observed information off the tower, via the
+            // same helper the NB/Gamma/Beta arms use (returns `(0, 0)` when the
+            // prior weight is zero, so the row stays excluded below).
+            let (s_eta, info_eta_raw) = tower_score_info(&tower, 1, wi);
             let curvature_eta = if wi == 0.0 {
                 DISPERSION_MIN_CURVATURE
             } else {
-                (tower.h[1][1] / wi).max(DISPERSION_MIN_CURVATURE)
+                info_eta_raw.max(DISPERSION_MIN_CURVATURE)
             };
             // The working response divides by this per-row curvature so the
             // prior weight cancels (and a zero-prior-weight row stays excluded

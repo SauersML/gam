@@ -355,6 +355,14 @@ struct SamplePayload {
     /// correct response-scale transform (`identity`, `logit`, `probit`,
     /// `cloglog`, `log`, ...).
     family_kind: String,
+    /// Serialized parameterized [`gam::types::InverseLink`] (JSON). The bare
+    /// `family_kind` tag cannot represent the per-fit state of the
+    /// parameterized links (`Sas`, `Mixture`, `LatentCLogLog`, `BetaLogistic`),
+    /// so this carries the full link spec back into the response-scale
+    /// transforms. `None` when serialization is unavailable; the wrapper then
+    /// falls back to the string tag (issue #1133).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_spec: Option<String>,
     /// Whether the draws came from exact NUTS or the Laplace-Gaussian
     /// fallback. Currently only "nuts" or "laplace"; callers can use
     /// this to badge the posterior or to warn when a class has fallen

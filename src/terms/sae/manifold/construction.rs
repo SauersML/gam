@@ -2460,6 +2460,74 @@ impl SaeManifoldTerm {
         Ok((cotrained, loss, consistency))
     }
 
+    /// #1154 item 2 — warm-start the inner latent coordinates from the amortized
+    /// encoder (Design A). Builds the per-chart IFT-Jacobian atlas from the
+    /// CURRENT dictionary, runs the one-mat-vec amortized encode of `target`
+    /// against each atom at the rho-resolved assignment masses, and overwrites
+    /// each atom's stored latent coords with the predicted `t̂` ON THE ROWS THE
+    /// KANTOROVICH CERTIFICATE ACCEPTS. Uncertified rows are left at their
+    /// current coords (the cold chart-center / previous-iterate start), so the
+    /// warm-start can only HELP — a row the cheap predictor cannot certify never
+    /// corrupts the seed. The subsequent inner Newton refines from this seed to
+    /// the SAME stationary point (the warm-start changes only the basin entry,
+    /// not the root), so the REML λ-gradient stays exactly the implicit-function
+    /// path and the criterion is unchanged at convergence — the amortized encoder
+    /// only accelerates/co-adapts the inner solve, it never replaces the
+    /// stationary point.
+    ///
+    /// Returns the number of (row, atom) coords actually warm-started (the
+    /// certified-prediction count), for instrumentation / tests. A first-build
+    /// dictionary with no usable charts simply warm-starts nothing and returns 0
+    /// (the cold path is byte-for-byte unchanged).
+    pub fn warm_start_latents_from_amortized_encoder(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<usize, String> {
+        let n = self.n_obs();
+        let k_atoms = self.k_atoms();
+        if n == 0 || k_atoms == 0 {
+            return Ok(0);
+        }
+        let amplitudes = self.fitted_assignment_amplitudes(rho)?;
+        let encodes = self.amortized_encode_target(target, amplitudes.view())?;
+        let mut warm_started = 0usize;
+        for atom_idx in 0..k_atoms {
+            let d = self.atoms[atom_idx].latent_dim;
+            if d == 0 {
+                continue;
+            }
+            let result = &encodes[atom_idx];
+            // Start from the atom's CURRENT coords so uncertified rows are left
+            // exactly as they were; overwrite only the certified predictions.
+            let mut coords = self.assignment.coords[atom_idx].as_matrix();
+            if coords.dim() != (n, d) {
+                return Err(format!(
+                    "warm_start_latents_from_amortized_encoder: atom {atom_idx} coords {:?} != (n={n}, d={d})",
+                    coords.dim()
+                ));
+            }
+            for row in 0..n {
+                if !result.certified[row] {
+                    continue;
+                }
+                for axis in 0..d {
+                    coords[[row, axis]] = result.coords[[row, axis]];
+                }
+                warm_started += 1;
+            }
+            // `as_matrix` lays coords out row-major (`[[row, axis]]`), exactly the
+            // `values[row*d + axis]` order `set_flat` expects, so a plain
+            // row-major iterator reconstructs the flat vector.
+            let flat = Array1::from_iter(coords.iter().copied());
+            self.assignment.coords[atom_idx].set_flat(flat.view());
+        }
+        // The basis caches must follow the freshly-seeded coords so the next
+        // inner solve evaluates Φ at the warm-started t̂, not the stale coords.
+        self.refresh_basis_from_current_coords()?;
+        Ok(warm_started)
+    }
+
     pub fn loss(
         &self,
         target: ArrayView2<'_, f64>,

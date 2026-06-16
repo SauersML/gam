@@ -152,7 +152,11 @@ pub fn apply_inverse_link_spec_vec(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_inverse_link_vec;
+    use super::{apply_inverse_link_spec_vec, apply_inverse_link_vec};
+    use crate::solver::mixture_link::inverse_link_mu_d1_for_inverse_link;
+    use crate::types::{
+        InverseLink, LatentCLogLogState, LinkComponent, MixtureLinkSpec, StandardLink,
+    };
 
     /// The public log inverse link is the EXACT `exp(η)`, never the solver's
     /// `η.clamp(−700, 700).exp()` conditioning transform. This pins the contract
@@ -206,6 +210,141 @@ mod tests {
         assert_eq!(
             under[0], 0.0,
             "exp(-746) underflows to exactly 0.0 under the exact public transform"
+        );
+    }
+
+    /// The bare string-tag path cannot evaluate the parameterized links — it has
+    /// no access to the per-fit state (skew/tail, mixture weights, latent SD) —
+    /// so it must REFUSE rather than silently fall through to a wrong link, and
+    /// the error must point the caller at the typed `link_spec` seam (#1133).
+    #[test]
+    fn string_tag_refuses_parameterized_links_and_points_at_link_spec() {
+        for tag in ["sas", "mixture", "latent-cloglog", "beta-logistic"] {
+            let err = apply_inverse_link_vec(&[0.0, 0.5], tag)
+                .expect_err("parameterized link must not be evaluable from the bare tag");
+            assert!(
+                err.contains("link_spec"),
+                "refusal for {tag:?} must mention the typed link_spec seam; got {err}"
+            );
+        }
+    }
+
+    /// The typed spec path evaluates the parameterized SAS link exactly — its
+    /// per-row `μ` is bit-identical to the canonical solver evaluator
+    /// `inverse_link_mu_d1_for_inverse_link`, which the bare string tag could
+    /// never reach (#1133).
+    #[test]
+    fn spec_path_evaluates_sas_link_bit_identical_to_solver_jet() {
+        let state = crate::solver::mixture_link::SasLinkState::new(0.7, -0.4)
+            .expect("valid SAS link state");
+        let link = InverseLink::Sas(state);
+        let eta = [-2.0_f64, -0.5, 0.0, 0.5, 2.0, 4.0];
+
+        // The string tag has no state and refuses.
+        assert!(apply_inverse_link_vec(&eta, "sas").is_err());
+
+        // The spec path produces the exact solver-jet mean per row.
+        let out = apply_inverse_link_spec_vec(&eta, &link).expect("sas spec inverse link");
+        assert_eq!(out.len(), eta.len());
+        for (i, &e) in eta.iter().enumerate() {
+            let (mu, _d1) =
+                inverse_link_mu_d1_for_inverse_link(&link, e).expect("solver jet eval");
+            assert_eq!(
+                out[i], mu,
+                "SAS spec inverse link row {i} must equal the canonical solver mean"
+            );
+            assert!(
+                out[i] > 0.0 && out[i] < 1.0,
+                "SAS is a binomial inverse link; mu must lie in (0, 1), got {}",
+                out[i]
+            );
+        }
+    }
+
+    /// The mixture (blended) link's response-scale draws are exact through the
+    /// spec path: each row equals the softmax-weighted blend the solver computes,
+    /// and the link is strictly monotone in η (sanity on the recovered weights).
+    #[test]
+    fn spec_path_evaluates_mixture_link_bit_identical_to_solver_jet() {
+        let spec = MixtureLinkSpec {
+            components: vec![LinkComponent::Logit, LinkComponent::Probit],
+            initial_rho: ndarray::array![0.3],
+        };
+        let state = crate::solver::mixture_link::state_fromspec(&spec).expect("mixture state");
+        let link = InverseLink::Mixture(state);
+        let eta = [-3.0_f64, -1.0, 0.0, 1.0, 3.0];
+
+        assert!(apply_inverse_link_vec(&eta, "mixture").is_err());
+
+        let out = apply_inverse_link_spec_vec(&eta, &link).expect("mixture spec inverse link");
+        for (i, &e) in eta.iter().enumerate() {
+            let (mu, _d1) =
+                inverse_link_mu_d1_for_inverse_link(&link, e).expect("solver jet eval");
+            assert_eq!(out[i], mu, "mixture spec inverse link row {i} mismatch");
+        }
+        for w in out.windows(2) {
+            assert!(w[1] > w[0], "mixture inverse link must be strictly increasing");
+        }
+    }
+
+    /// The latent-cloglog link's response-scale draws are exact through the spec
+    /// path and depend on the fitted latent SD — a value the bare `cloglog` tag
+    /// cannot represent. Two different latent SDs give materially different μ at
+    /// the same η, proving the per-fit state is actually carried (#1133).
+    #[test]
+    fn spec_path_evaluates_latent_cloglog_with_fitted_latent_sd() {
+        let eta = [-1.0_f64, 0.0, 1.0];
+        let link_a = InverseLink::LatentCLogLog(
+            LatentCLogLogState::new(0.5).expect("valid latent SD"),
+        );
+        let link_b = InverseLink::LatentCLogLog(
+            LatentCLogLogState::new(1.5).expect("valid latent SD"),
+        );
+
+        assert!(apply_inverse_link_vec(&eta, "latent-cloglog").is_err());
+
+        let out_a = apply_inverse_link_spec_vec(&eta, &link_a).expect("latent-cloglog a");
+        let out_b = apply_inverse_link_spec_vec(&eta, &link_b).expect("latent-cloglog b");
+        for (i, &e) in eta.iter().enumerate() {
+            let (mu_a, _) = inverse_link_mu_d1_for_inverse_link(&link_a, e).expect("jet a");
+            assert_eq!(out_a[i], mu_a, "latent-cloglog row {i} must match solver jet");
+            assert!(out_a[i] > 0.0 && out_a[i] < 1.0, "mu in (0,1)");
+        }
+        // The fitted latent SD genuinely changes the response-scale mean.
+        assert!(
+            out_a
+                .iter()
+                .zip(out_b.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "different latent SDs must yield different response-scale means"
+        );
+    }
+
+    /// The spec path agrees with the string path for the `Standard` links —
+    /// including the EXACT-`exp` Log contract (#963): `Standard(Log)` is routed
+    /// back through the string path, so the boundary η = 705 still yields the
+    /// unclamped exp(705), not the solver clamp.
+    #[test]
+    fn spec_path_matches_string_path_for_standard_links_incl_exact_log() {
+        let eta = [-1.5_f64, 0.0, 0.8];
+        for (link, tag) in [
+            (InverseLink::Standard(StandardLink::Identity), "identity"),
+            (InverseLink::Standard(StandardLink::Logit), "logit"),
+            (InverseLink::Standard(StandardLink::Probit), "probit"),
+            (InverseLink::Standard(StandardLink::CLogLog), "cloglog"),
+            (InverseLink::Standard(StandardLink::Log), "log"),
+        ] {
+            let via_spec = apply_inverse_link_spec_vec(&eta, &link).expect("spec");
+            let via_tag = apply_inverse_link_vec(&eta, tag).expect("tag");
+            assert_eq!(via_spec, via_tag, "spec vs tag mismatch for {tag}");
+        }
+        // Exact-exp Log contract at the finite boundary, via the spec path.
+        let log_link = InverseLink::Standard(StandardLink::Log);
+        let out = apply_inverse_link_spec_vec(&[705.0], &log_link).expect("log spec");
+        assert_eq!(
+            out[0],
+            705.0_f64.exp(),
+            "Standard(Log) spec path must report exact exp(705), not the solver clamp"
         );
     }
 }

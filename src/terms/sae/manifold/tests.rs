@@ -9125,4 +9125,94 @@ mod inner_contract_probe_tests {
              pre-fix desync where the gradient lane dropped the consistency penalty"
         );
     }
+
+    /// #1154 item 2+3 — the amortized-encoder warm-start (Design A) accelerates
+    /// the inner solve to the SAME stationary point WITHOUT degrading recovery of
+    /// the planted manifold. On a known periodic manifold we
+    ///
+    /// 1. fit the dictionary (sequential / cold inner solve) and record the
+    ///    explained variance — the REML-then-distill baseline;
+    /// 2. build the amortized encoder from that fitted dictionary, warm-start the
+    ///    inner latent coords from it (the co-trained inner-solve seed), and
+    ///    confirm it certifies + seeds a positive number of rows (a real, not
+    ///    vacuous, warm-start);
+    /// 3. re-converge the inner solve FROM the warm-start and require the
+    ///    explained variance to be at least as good as the cold-fit baseline —
+    ///    the warm-start changes the basin entry, not the root, so recovery never
+    ///    regresses (and the seed lands the solve in the right basin immediately).
+    #[test]
+    fn amortized_warm_start_matches_or_beats_cold_inner_solve_on_known_manifold() {
+        let n = 24usize;
+        let p = 4usize;
+        let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+        let (phi, jet) = periodic_basis(&coords);
+        let m = phi.ncols();
+        let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+            let scale = 1.0 / (1.0 + b as f64);
+            scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+        });
+        let atom = SaeManifoldAtom::new(
+            "periodic_truth",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi.clone(),
+            jet,
+            decoder.clone(),
+            Array2::<f64>::eye(p),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let target = phi.dot(&decoder);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+
+        // (1) Cold (sequential) inner solve — the REML-then-distill baseline.
+        let mut rho_cold = rho.clone();
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho_cold, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .expect("cold inner solve converges on the known periodic manifold");
+        let cold_ev = {
+            let fitted = term.try_fitted_for_rho(&rho).unwrap();
+            reconstruction_explained_variance(target.view(), fitted.view())
+                .expect("explained variance is defined for the planted target")
+        };
+        assert!(
+            cold_ev > 0.9,
+            "cold fit must recover the planted periodic manifold (EV={cold_ev})"
+        );
+
+        // (2) Build the amortized encoder from the fitted dictionary and warm-start
+        // the inner latents from it. A well-conditioned periodic dictionary must
+        // certify + seed a strictly positive number of rows.
+        let warm_started = term
+            .warm_start_latents_from_amortized_encoder(target.view(), &rho)
+            .expect("amortized warm-start runs on the fitted dictionary");
+        assert!(
+            warm_started > 0,
+            "the amortized encoder must certify + warm-start at least one row of a \
+             well-conditioned fitted periodic dictionary; warm_started={warm_started}"
+        );
+
+        // (3) Re-converge FROM the warm-start; recovery must not regress.
+        let mut rho_warm = rho.clone();
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho_warm, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .expect("warm-started inner solve converges");
+        let warm_ev = {
+            let fitted = term.try_fitted_for_rho(&rho).unwrap();
+            reconstruction_explained_variance(target.view(), fitted.view())
+                .expect("explained variance is defined for the planted target")
+        };
+        assert!(
+            warm_ev >= cold_ev - 1.0e-6,
+            "amortized warm-start (co-trained inner solve) must recover the manifold \
+             at least as well as the cold/sequential solve: warm_ev={warm_ev}, \
+             cold_ev={cold_ev}"
+        );
+    }
 }

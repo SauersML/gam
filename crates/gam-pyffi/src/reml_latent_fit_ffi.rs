@@ -3331,6 +3331,7 @@ fn posterior_predict_bands_table(
 }
 
 #[pyfunction]
+#[pyo3(signature = (eta_flat, n_draws, n_rows, family_kind, level, link_spec=None))]
 fn posterior_eta_bands(
     py: Python<'_>,
     eta_flat: Vec<f64>,
@@ -3338,9 +3339,17 @@ fn posterior_eta_bands(
     n_rows: usize,
     family_kind: String,
     level: f64,
+    link_spec: Option<String>,
 ) -> PyResult<String> {
     detach_py_result(py, "posterior_eta_bands", move || {
-        posterior_eta_bands_impl(eta_flat, n_draws, n_rows, &family_kind, level)
+        posterior_eta_bands_impl(
+            eta_flat,
+            n_draws,
+            n_rows,
+            &family_kind,
+            level,
+            link_spec.as_deref(),
+        )
     })
 }
 
@@ -3375,14 +3384,35 @@ fn posterior_trace_selection_json(request_json: &str) -> PyResult<String> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (eta, family_kind, link_spec=None))]
 fn apply_inverse_link_array(
     py: Python<'_>,
     eta: Vec<f64>,
     family_kind: String,
+    link_spec: Option<String>,
 ) -> PyResult<Vec<f64>> {
     detach_py_result(py, "apply_inverse_link_array", move || {
-        apply_inverse_link_vec(&eta, &family_kind)
+        apply_inverse_link_with_optional_spec(&eta, &family_kind, link_spec.as_deref())
     })
+}
+
+/// Apply the inverse link to `eta`, preferring the typed `link_spec` (a
+/// serialized [`InverseLink`]) when present. The parameterized links (`Sas`,
+/// `Mixture`, `LatentCLogLog`, `BetaLogistic`) carry per-fit state the bare
+/// `family_kind` tag drops, so they are only fully evaluable via the spec; when
+/// no spec is supplied the call falls back to the string-tag path, which still
+/// covers every `Standard` link (issue #1133).
+fn apply_inverse_link_with_optional_spec(
+    eta: &[f64],
+    family_kind: &str,
+    link_spec: Option<&str>,
+) -> Result<Vec<f64>, String> {
+    if let Some(spec_json) = link_spec {
+        let link: InverseLink = serde_json::from_str(spec_json)
+            .map_err(|err| format!("failed to parse link_spec for inverse link: {err}"))?;
+        return apply_inverse_link_spec_vec(eta, &link);
+    }
+    apply_inverse_link_vec(eta, family_kind)
 }
 
 #[pyfunction]

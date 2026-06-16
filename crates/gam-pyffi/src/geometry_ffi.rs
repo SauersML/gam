@@ -6773,6 +6773,12 @@ struct PosteriorPredictPayload {
     n_rows: usize,
     model_class: String,
     family_kind: String,
+    /// Serialized parameterized `InverseLink` (JSON) carrying the per-fit state
+    /// the bare `family_kind` tag drops; consumed by `predict_draws` /
+    /// `posterior_predict_bands_table` to route the parameterized links'
+    /// response-scale draws (issue #1133). `None` falls back to the tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_spec: Option<String>,
 }
 
 fn eta_bands_from_matrix(

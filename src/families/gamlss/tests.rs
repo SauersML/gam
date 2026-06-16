@@ -15,6 +15,7 @@ use super::binomial_q_derivs::{
 };
 use super::dispersion_family::{
     DISPERSION_ETA_CLAMP, DISPERSION_MIN_CURVATURE, DispersionRowKernel, dispersion_row_kernel,
+    dispersion_tweedie_nll_tower,
 };
 use crate::basis::{
     CenterStrategy, Dense, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
@@ -407,8 +408,50 @@ pub(crate) fn hand_dispersion_row_kernel(
                 disp_response: ed + s_phi / (phi * info_phi),
             }
         }
-        DispersionFamilyKind::Tweedie { .. } => {
-            panic!("Tweedie dispersion witness is intentionally out of migration scope")
+        DispersionFamilyKind::Tweedie { p } => {
+            // Independent hand derivation of the Tweedie working set in the
+            // predictor coordinates `(η_μ, η_d)` with `μ = exp(η_μ)`,
+            // `φ = exp(−η_d)` — derived separately from the production tower so
+            // a tower-composition bug (a dropped chain term, a sign flip in the
+            // φ = exp(−η_d) curvature) shows up as a disagreement. Observed
+            // information `∂²NLL/∂η_d²` is used uniformly (the same Newton
+            // curvature the production arm reads off `tower.h[1][1]`), matching
+            // the NB/Gamma/Beta dispersion arms.
+            let mu = em.exp().max(1e-300);
+            let phi = (-ed).exp().max(1e-12);
+            let two_minus_p = 2.0 - p;
+            let one_minus_p = 1.0 - p;
+            let mean_weight = wi * mu.powf(two_minus_p) / phi;
+            let mean_response = em + (yi - mu) / mu;
+            let (loglik, s_eta, info_eta) = if yi > 0.0 {
+                let dev = 2.0
+                    * (yi.powf(two_minus_p) / (one_minus_p * two_minus_p)
+                        - yi * mu.powf(one_minus_p) / one_minus_p
+                        + mu.powf(two_minus_p) / two_minus_p);
+                let loglik = wi
+                    * (-dev / (2.0 * phi)
+                        - 0.5 * (2.0 * std::f64::consts::PI * phi).ln()
+                        - 0.5 * p * yi.ln());
+                // NLL(η_d) = w·[ (dev/2)·exp(η_d) − ½η_d + const ].
+                let s_eta = 0.5 - dev / (2.0 * phi);
+                let info_eta = dev / (2.0 * phi);
+                (loglik, s_eta, info_eta)
+            } else {
+                let c = mu.powf(two_minus_p) / two_minus_p;
+                let loglik = wi * (-c / phi);
+                // NLL(η_d) = w·c·exp(η_d).
+                let s_eta = -c / phi;
+                let info_eta = c / phi;
+                (loglik, s_eta, info_eta)
+            };
+            let curvature_eta = info_eta.max(DISPERSION_MIN_CURVATURE);
+            DispersionRowKernel {
+                loglik,
+                mean_weight,
+                mean_response,
+                disp_weight: wi * curvature_eta,
+                disp_response: ed + s_eta / curvature_eta,
+            }
         }
     }
 }
@@ -428,6 +471,14 @@ pub(crate) fn dispersion_row_towers_match_hand_witnesses() {
         (DispersionFamilyKind::Gamma, 9.0, 1.7, 25.0, 1.1),
         (DispersionFamilyKind::Beta, 0.02, -3.0, -20.0, 0.8),
         (DispersionFamilyKind::Beta, 0.98, 3.0, 20.0, 1.4),
+        // Tweedie #932: the previously-unmechanized arm. Both density branches
+        // (y = 0 exact point mass, y > 0 saddlepoint), two powers, and the
+        // η-clamp boundary so the clamped natural parameters are exercised.
+        (DispersionFamilyKind::Tweedie { p: 1.5 }, 0.0, -0.7, 0.4, 0.9),
+        (DispersionFamilyKind::Tweedie { p: 1.5 }, 3.2, 0.6, -0.3, 1.2),
+        (DispersionFamilyKind::Tweedie { p: 1.2 }, 0.0, 1.1, -0.8, 0.6),
+        (DispersionFamilyKind::Tweedie { p: 1.8 }, 7.5, -0.4, 1.0, 1.3),
+        (DispersionFamilyKind::Tweedie { p: 1.5 }, 2.0, -25.0, 25.0, 1.0),
     ];
     for (kind, y, eta_mu, eta_d, weight) in cases {
         let actual = dispersion_row_kernel(kind, y, eta_mu, eta_d, weight);
@@ -504,6 +555,87 @@ pub(crate) fn tweedie_zero_mass_dispersion_curvature_matches_finite_difference()
             kernel.disp_weight,
             c / phi,
             1e-10,
+        );
+    }
+}
+
+#[test]
+// #932: the single-expression `dispersion_tweedie_nll_tower` IS the production
+// Tweedie row NLL; its mechanically-derived gradient and Hessian channels must
+// be the exact derivatives of its own value channel. Anchor every channel of
+// the tower against centered finite differences of the value, in BOTH predictor
+// directions (η_μ, η_d) and BOTH density branches (y > 0 saddlepoint, y = 0
+// point mass), so a dropped chain term or a sign flip in the Faà-di-Bruno
+// composition shows up here independent of any closed-form witness.
+pub(crate) fn tweedie_nll_tower_is_finite_difference_consistent() {
+    // (p in (1,2), y, eta_mu, eta_d, weight); y = 0 hits the point-mass branch.
+    let cases = [
+        (1.5_f64, 0.0_f64, -0.7_f64, 0.4_f64, 0.9_f64),
+        (1.5, 3.2, 0.6, -0.3, 1.2),
+        (1.2, 0.0, 1.1, -0.8, 0.6),
+        (1.8, 7.5, -0.4, 1.0, 1.3),
+        (1.3, 2.0, 0.2, 0.7, 1.0),
+    ];
+    let eval = |p: f64, y: f64, em: f64, ed: f64, w: f64| -> f64 {
+        dispersion_tweedie_nll_tower(y, em, ed, p, w).v
+    };
+    for (p, y, em, ed, w) in cases {
+        let t = dispersion_tweedie_nll_tower(y, em, ed, p, w);
+        let h = 1e-5;
+        // value → gradient and gradient → Hessian, one direction at a time.
+        for (axis, perturb) in [
+            (0usize, [h, 0.0]),
+            (1usize, [0.0, h]),
+        ] {
+            let vp = eval(p, y, em + perturb[0], ed + perturb[1], w);
+            let vm = eval(p, y, em - perturb[0], ed - perturb[1], w);
+            let fd_g = (vp - vm) / (2.0 * h);
+            assert_rel_close(
+                "tweedie tower gradient vs finite difference",
+                t.g[axis],
+                fd_g,
+                1e-5,
+            );
+            // Diagonal Hessian via the gradient of a perturbed tower.
+            let tp = dispersion_tweedie_nll_tower(
+                y,
+                em + perturb[0],
+                ed + perturb[1],
+                p,
+                w,
+            );
+            let tm = dispersion_tweedie_nll_tower(
+                y,
+                em - perturb[0],
+                ed - perturb[1],
+                p,
+                w,
+            );
+            let fd_h = (tp.g[axis] - tm.g[axis]) / (2.0 * h);
+            assert_rel_close(
+                "tweedie tower diagonal Hessian vs finite difference",
+                t.h[axis][axis],
+                fd_h,
+                1e-5,
+            );
+        }
+        // Mixed cross block — the #736 fragility shape — anchored both ways.
+        let cross = {
+            let tp = dispersion_tweedie_nll_tower(y, em + h, ed, p, w);
+            let tm = dispersion_tweedie_nll_tower(y, em - h, ed, p, w);
+            (tp.g[1] - tm.g[1]) / (2.0 * h)
+        };
+        assert_rel_close(
+            "tweedie tower cross-Hessian vs finite difference",
+            t.h[0][1],
+            cross,
+            1e-5,
+        );
+        assert_rel_close(
+            "tweedie tower Hessian symmetry",
+            t.h[0][1],
+            t.h[1][0],
+            1e-12,
         );
     }
 }
