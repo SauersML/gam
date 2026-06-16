@@ -156,6 +156,36 @@ fn cheb_t_prime(x: f64, n: usize) -> Vec<f64> {
     tp
 }
 
+/// Chebyshev SECOND-derivative values `T_0″..T_{n−1}″` at `x ∈ [−1, 1]` in the
+/// MAPPED coordinate (multiply by `(dx/dψ)²` for the ψ-second-derivative).
+///
+/// Differentiating the value recurrence `T_d = 2x T_{d−1} − T_{d−2}` twice in
+/// `x` gives a singularity-free three-term recurrence in lock-step with `cheb_t`
+/// / `cheb_t_prime`:
+///   `T_d′  = 2 T_{d−1} + 2x T_{d−1}′ − T_{d−2}′`,
+///   `T_d″  = 4 T_{d−1}′ + 2x T_{d−1}″ − T_{d−2}″`,
+/// with `T_0 = T_0′ = T_0″ = 0`-seeds as below. Unlike the closed form
+/// `T_n″ = n((n+1)T_n − U_n)/(x²−1)` this never divides by `x²−1`, so it stays
+/// exact at the window edges `x = ±1`.
+fn cheb_t_double_prime(x: f64, n: usize) -> Vec<f64> {
+    let mut t = vec![0.0; n];
+    let mut tp = vec![0.0; n];
+    let mut tpp = vec![0.0; n];
+    if n > 0 {
+        t[0] = 1.0; // T_0 = 1, T_0′ = T_0″ = 0
+    }
+    if n > 1 {
+        t[1] = x; // T_1 = x, T_1′ = 1, T_1″ = 0
+        tp[1] = 1.0;
+    }
+    for d in 2..n {
+        t[d] = 2.0 * x * t[d - 1] - t[d - 2];
+        tp[d] = 2.0 * t[d - 1] + 2.0 * x * tp[d - 1] - tp[d - 2];
+        tpp[d] = 4.0 * tp[d - 1] + 2.0 * x * tpp[d - 1] - tpp[d - 2];
+    }
+    tpp
+}
+
 impl PsiGramTensor {
     /// Build and certify the tensor over `psi ∈ [psi_lo, psi_hi]`.
     ///
@@ -507,6 +537,44 @@ impl PsiGramTensor {
         out
     }
 
+    /// Exact `∂²(XᵀWX)/∂ψ²` from the SAME representation as the value/gradient —
+    /// the n-free curvature that lets the outer Newton/ARC step read the τ-τ
+    /// Hessian's design-moving block without re-streaming an O(n) slab Gram
+    /// (#1033, Gaussian-identity single-ψ Hessian channel). O(D²k²).
+    ///
+    /// `XᵀWX(ψ) = Σ_{d,e} T_d(x) T_e(x) G_{de}` with `x = mapped(ψ)`, so by the
+    /// product rule in `x` (then chain rule `(dx/dψ)²`):
+    ///   `∂²/∂x² = T_d″ T_e + 2 T_d′ T_e′ + T_d T_e″`.
+    pub fn d2gram_dpsi2(&self, psi: f64) -> Array2<f64> {
+        let x = self.mapped(psi);
+        let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
+        let dx_dpsi_sq = dx_dpsi * dx_dpsi;
+        let t = cheb_t(x, self.n_coeff);
+        let tp = cheb_t_prime(x, self.n_coeff);
+        let tpp = cheb_t_double_prime(x, self.n_coeff);
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for d in 0..self.n_coeff {
+            for e in 0..self.n_coeff {
+                let coef = (tpp[d] * t[e] + 2.0 * tp[d] * tp[e] + t[d] * tpp[e]) * dx_dpsi_sq;
+                out.scaled_add(coef, &self.gram[d * self.n_coeff + e]);
+            }
+        }
+        out
+    }
+
+    /// Exact `∂²(XᵀWz)/∂ψ²`, n-free. `T_d″·(dx/dψ)²` against the rhs slabs.
+    pub fn d2rhs_dpsi2(&self, psi: f64) -> Array1<f64> {
+        let x = self.mapped(psi);
+        let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
+        let dx_dpsi_sq = dx_dpsi * dx_dpsi;
+        let tpp = cheb_t_double_prime(x, self.n_coeff);
+        let mut out = Array1::<f64>::zeros(self.k);
+        for (d, tppd) in tpp.iter().enumerate() {
+            out.scaled_add(*tppd * dx_dpsi_sq, &self.rhs[d]);
+        }
+        out
+    }
+
     /// Assemble the Gaussian-identity sufficient-statistic cache at `psi`
     /// without touching a single data row — the bridge from this tensor into
     /// the inner PLS solver's fast path (#1033b → `GaussianFixedCache`).
@@ -688,6 +756,58 @@ mod tests {
                 assert!(
                     (a - b).abs() <= 1e-8 * bscale,
                     "penalized solve drift at psi={psi}: fast={a}, exact={b}"
+                );
+            }
+        }
+    }
+
+    /// #1033 Hessian-channel primitive gate: the n-free second ψ-derivatives
+    /// `d2gram_dpsi2` / `d2rhs_dpsi2` must match central FD of the analytic FIRST
+    /// derivatives (`dgram_dpsi` / `drhs_dpsi`) — the curvature the outer Newton
+    /// /ARC step reads when the Gaussian Hessian channel is served from the
+    /// tensor instead of a re-streamed O(n) slab. Differencing the analytic first
+    /// derivative (not the exact gram) keeps this a pure check of the
+    /// second-derivative recurrence, isolated from the build's value-lane tol.
+    #[test]
+    fn psi_gram_tensor_second_derivative_matches_fd_of_gradient() {
+        let (n, k) = (160usize, 7usize);
+        let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.5 * ((i % 3) as f64)));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin()));
+        let (psi_lo, psi_hi) = (-1.2_f64, 1.0_f64);
+
+        let tensor = PsiGramTensor::build(
+            |psi| synth_design(psi, n, k),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("analytic synthetic design must certify");
+
+        let h = 1e-5;
+        for &psi in &[-1.0, -0.5, 0.0, 0.4, 0.9] {
+            // ∂²G/∂ψ² vs central FD of the analytic ∂G/∂ψ.
+            let dg_plus = tensor.dgram_dpsi(psi + h);
+            let dg_minus = tensor.dgram_dpsi(psi - h);
+            let d2g = tensor.d2gram_dpsi2(psi);
+            let gscale = d2g.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-9);
+            for ((a, p), m_) in d2g.iter().zip(dg_plus.iter()).zip(dg_minus.iter()) {
+                let fd = (p - m_) / (2.0 * h);
+                assert!(
+                    (a - fd).abs() <= 1e-4 * gscale,
+                    "d2gram/dpsi2 mismatch at psi={psi}: analytic={a}, fd={fd}"
+                );
+            }
+            // ∂²(XᵀWz)/∂ψ² vs central FD of the analytic ∂(XᵀWz)/∂ψ.
+            let dr_plus = tensor.drhs_dpsi(psi + h);
+            let dr_minus = tensor.drhs_dpsi(psi - h);
+            let d2r = tensor.d2rhs_dpsi2(psi);
+            let rscale = d2r.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-9);
+            for ((a, p), m_) in d2r.iter().zip(dr_plus.iter()).zip(dr_minus.iter()) {
+                let fd = (p - m_) / (2.0 * h);
+                assert!(
+                    (a - fd).abs() <= 1e-4 * rscale,
+                    "d2rhs/dpsi2 mismatch at psi={psi}: analytic={a}, fd={fd}"
                 );
             }
         }
