@@ -26,6 +26,7 @@ import torch
 
 from ..smooth import (
     BSpline,
+    Categorical,
     Duchon,
     Matern,
     Pca,
@@ -442,6 +443,48 @@ def _build_design_penalty(
         penalty = 0.5 * (penalty + penalty.transpose(0, 1))
         return design.to(torch.float64), penalty
 
+    if entry == "categorical" and isinstance(smooth, Categorical):
+        # Sum-to-zero coded categorical contrast = i.i.d. Gaussian random
+        # effect with an identity ridge penalty on the level contrasts. This
+        # mirrors the Rust `RandomEffectTermSpec` (one-hot dummy block with an
+        # identity penalty on group coefficients) and the `Pca` torch branch
+        # (linear projection design + identity ridge penalty). The level codes
+        # are structural (integer category labels), so the design carries no
+        # autograd path back to `points`.
+        if smooth.levels is None:
+            raise ValueError("Categorical requires `levels` on the torch path")
+        n_levels = int(smooth.n_levels)
+        if n_levels < 2:
+            raise ValueError(
+                f"Categorical requires n_levels >= 2; got {n_levels}"
+            )
+        levels = _to_tensor(smooth.levels, points).reshape(-1).round().to(torch.int64)
+        if levels.shape[0] != N:
+            raise ValueError(
+                f"Categorical: levels has {levels.shape[0]} rows but points "
+                f"have N={N}"
+            )
+        lo = int(levels.min().item())
+        hi = int(levels.max().item())
+        if lo < 0 or hi >= n_levels:
+            raise ValueError(
+                f"Categorical: level codes must lie in [0, {n_levels - 1}]; "
+                f"observed range [{lo}, {hi}]"
+            )
+        # Sum-to-zero contrast: one column per non-reference level; the
+        # reference level (the last code) gets -1 across every column so the
+        # fitted level effects sum to zero (drop-last sum-to-zero coding).
+        contrast = n_levels - 1
+        onehot = torch.zeros(
+            N, n_levels, dtype=torch.float64, device=points.device
+        )
+        onehot[torch.arange(N, device=points.device), levels] = 1.0
+        design = onehot[:, :contrast] - onehot[:, contrast:contrast + 1]
+        penalty = torch.eye(
+            contrast, dtype=torch.float64, device=points.device
+        )
+        return design, penalty
+
     expected_smooth_type = {
         "duchon": "Duchon",
         "bspline": "BSpline",
@@ -457,13 +500,12 @@ def _build_design_penalty(
         )
 
     # Recognised-but-not-yet-wired entries: the Rust dispatch registers every
-    # `gamfit.torch`-exported Smooth subclass (single source of truth), but
-    # the tensor design/penalty backend for these kinds is not yet bound on
-    # the torch path. Raise the same NotImplementedError-shape the previous
-    # Python cascade used so callers see a consistent message.
-    unwired_entries = {
-        "categorical": "Categorical",
-    }
+    # `gamfit.torch`-exported Smooth subclass (single source of truth). Every
+    # currently-exported kind now has a tensor design/penalty backend wired on
+    # the torch path; this guard remains so that a future Rust enum variant
+    # added without a matching torch branch raises a consistent
+    # NotImplementedError-shape rather than falling through silently.
+    unwired_entries: dict[str, str] = {}
     if entry in unwired_entries:
         kind_name = unwired_entries[entry]
         raise NotImplementedError(
@@ -473,7 +515,7 @@ def _build_design_penalty(
             "basis + penalty. Currently supported on the torch path: "
             "Duchon (any d for basis; d=1 for penalty), BSpline (d=1), "
             "TensorBSpline (te), Matern (kernel-Gram penalty), "
-            "Sphere (S²), PeriodicSplineCurve, Pca."
+            "Sphere (S²), PeriodicSplineCurve, Pca, Categorical."
         )
 
     # Defensive raise: the Rust dispatch already rejected unknown specs

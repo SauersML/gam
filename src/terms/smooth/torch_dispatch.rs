@@ -9,10 +9,11 @@
 //! Every Python `Smooth` subclass that is re-exported from `gamfit.torch`
 //! must have a matching variant here, so that dispatch never fails for a
 //! class the user can legitimately import. `TensorBSpline` (te tensor
-//! product) and `Matern` (kernel-Gram penalty) are now fully wired on the
-//! torch path; only `Categorical` remains backend-unwired and resolves to a
-//! registered variant whose `fit.py` cascade raises `NotImplementedError`
-//! at the point where it would actually need the tensor backend.
+//! product), `Matern` (kernel-Gram penalty), and `Categorical` (sum-to-zero
+//! contrast with an identity ridge penalty — an i.i.d. Gaussian random
+//! effect, matching the Rust `RandomEffectTermSpec`) are now all fully wired
+//! on the torch path. Every exported variant resolves to a `fit.py` branch
+//! that builds a concrete `(design, penalty)` tensor pair.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TorchSmoothEntry {
@@ -44,11 +45,12 @@ impl TorchSmoothEntry {
 /// Map a Python `Smooth` subclass name to the matching torch entry kind.
 ///
 /// Returns `Ok(entry)` for every `Smooth` subclass that `gamfit.torch`
-/// re-exports — including those whose tensor backend is not yet wired.
-/// The `fit.py` cascade is responsible for raising `NotImplementedError`
-/// when it cannot build a design/penalty pair for a recognised-but-unwired
-/// entry. Truly unknown class names produce a `TypeError`-shaped message
-/// preserving the previous Python cascade's surface error.
+/// re-exports. Each recognised entry has a matching `fit.py` branch that
+/// builds a concrete design/penalty tensor pair; the `NotImplementedError`
+/// fallback there is now only a defensive guard for a future Rust variant
+/// added without a torch branch. Truly unknown class names produce a
+/// `TypeError`-shaped message preserving the previous Python cascade's
+/// surface error.
 pub fn dispatch_key(spec_kind: &str) -> Result<TorchSmoothEntry, String> {
     match spec_kind {
         "Duchon" => Ok(TorchSmoothEntry::Duchon),

@@ -230,13 +230,40 @@ def test_tensorbspline_dim_mismatch_rejected():
         )
 
 
-def test_categorical_fit_raises_notimplemented():
-    n = 20
-    t, y = _inputs(n=n)
-    levels = torch.zeros(n, dtype=torch.int64)
+def test_categorical_fit_wired_backend_shapes_and_recovery():
+    # Regression for the torch `Categorical` backend seam (#1133): the
+    # sum-to-zero categorical contrast must build a real (design, penalty)
+    # pair and fit, instead of raising NotImplementedError on the unwired
+    # branch. The drop-last sum-to-zero coding gives n_levels-1 contrast
+    # coefficients; the fitted per-group means must recover the data means
+    # up to ridge shrinkage.
+    n = 60
+    n_levels = 3
+    g = torch.Generator().manual_seed(7)
+    # Round-robin level codes so every level is well populated.
+    levels = torch.arange(n, dtype=torch.int64) % n_levels
+    t = torch.linspace(0.0, 1.0, n, dtype=torch.float64)
+    # Distinct, well-separated per-level means + small noise.
+    group_means = torch.tensor([2.0, -1.0, 0.5], dtype=torch.float64)
+    y = group_means[levels] + 0.01 * torch.randn(
+        n, generator=g, dtype=torch.float64,
+    )
 
-    with pytest.raises(NotImplementedError):
-        gt.fit(t, y, gt.Categorical(levels=levels, n_levels=3))
+    result = gt.fit(t, y, gt.Categorical(levels=levels, n_levels=n_levels))
+
+    # n_levels-1 contrast coefficients, single output column.
+    assert tuple(result.coefficients.shape) == (n_levels - 1, 1)
+    assert tuple(result.fitted.shape) == (n, 1)
+    assert torch.isfinite(result.fitted).all()
+
+    # Each row's fitted value should track its group; with light ridge
+    # shrinkage the fitted group means stay near the data group means.
+    fitted = result.fitted.reshape(-1)
+    for k in range(n_levels):
+        mask = levels == k
+        fitted_k = fitted[mask].mean()
+        data_k = y[mask].mean()
+        assert torch.abs(fitted_k - data_k) < 0.5
 
 
 def test_gam_module_train_then_freeze_then_eval():
