@@ -427,10 +427,56 @@ pub(crate) fn exact_newton_stabilizing_shift(
     lhs_dense: &Array2<f64>,
     ridge_floor: f64,
 ) -> Option<f64> {
+    stabilizing_shift_core(lhs_dense, lhs_dense, ridge_floor)
+}
+
+/// Stabilizing shift for a penalized joint Hessian `combined = H_data + S` whose
+/// penalty `S` is positive-semidefinite by construction.
+///
+/// Because `S ⪰ 0`, Weyl's inequality gives `λ_min(H_data + S) ≥ λ_min(H_data)`,
+/// so the lifting ridge needed to make `combined` PD is bounded by the curvature
+/// of the *data* Hessian alone. We therefore take the Gershgorin lower bound on
+/// `H_data` (the `gershgorin_src`) rather than on `combined`, while still using
+/// `combined` for the PD Cholesky certificate.
+///
+/// Why this is not a micro-optimization (gam#979 survival marginal-slope hang):
+/// Gershgorin's bound `min_i (H_ii − Σ_{j≠i}|H_ij|)` is only tight when the
+/// off-diagonals are small relative to the diagonal. A heavily over-smoothed
+/// penalty has large symmetric off-diagonals that are *balanced* by equally large
+/// diagonals — the matrix is exactly PSD, but the per-row `diag − radius` can be
+/// hugely negative. On the survival marginal-slope pilot the time-block penalty
+/// reaches `λ ≈ 6e7`, so Gershgorin on `combined` returned `≈ −1.2e7` even though
+/// the assembled penalty's true `λ_min` is `+1e-10`. The old `δ = floor − g`
+/// shift then added a `~1.2e7` ridge — `~550×` the data curvature (`~2e4`) — and
+/// every inner Newton step shrank to `g/(H+μ) ≈ 1e-4`, so the coupled solve
+/// crawled `30+` cycles without ever certifying KKT convergence and the fit hung.
+/// Bounding the shift by the data Hessian instead collapses the ridge to
+/// `O(data scale)`, restoring proper Newton steps and prompt convergence, while
+/// remaining a guaranteed PD certificate: `λ_min(combined + δI) ≥ λ_min(H_data)
+/// + δ ≥ g + (floor − g) = floor > 0`.
+pub(crate) fn exact_newton_stabilizing_shift_psd_penalized(
+    combined: &Array2<f64>,
+    gershgorin_src: &Array2<f64>,
+    ridge_floor: f64,
+) -> Option<f64> {
+    stabilizing_shift_core(combined, gershgorin_src, ridge_floor)
+}
+
+/// Shared engine for the stabilizing-shift helpers. `cholesky_test` is the matrix
+/// that must end up positive definite; `gershgorin_src` is the matrix whose
+/// Gershgorin disc lower-bounds `λ_min`. The two coincide for the plain
+/// [`exact_newton_stabilizing_shift`]; they differ when a PSD penalty lets us
+/// bound the shift by the data Hessian alone
+/// ([`exact_newton_stabilizing_shift_psd_penalized`]).
+fn stabilizing_shift_core(
+    cholesky_test: &Array2<f64>,
+    gershgorin_src: &Array2<f64>,
+    ridge_floor: f64,
+) -> Option<f64> {
     let floor = effective_solverridge(ridge_floor);
     // Fast path: already PD at zero shift ⇒ no stabilization needed. One Cholesky
     // (O(p³/3)), the common case on a well-conditioned cycle.
-    if lhs_dense.cholesky(Side::Lower).is_ok() {
+    if cholesky_test.cholesky(Side::Lower).is_ok() {
         return None;
     }
     // Near-singular / indefinite. We need a positive diagonal shift `δ` that makes
@@ -450,21 +496,21 @@ pub(crate) fn exact_newton_stabilizing_shift(
     // (handled by the Cholesky fast path above) and the downstream solve only
     // requires PD, not the tightest possible shift — and the trust region governs
     // step size regardless. `O(p²)` per cycle instead of `O(p³)`.
-    let p = lhs_dense.nrows();
+    let p = gershgorin_src.nrows();
     let mut gershgorin_min = f64::INFINITY;
     for i in 0..p {
-        let diag = lhs_dense[[i, i]];
+        let diag = gershgorin_src[[i, i]];
         let mut radius = 0.0_f64;
         for j in 0..p {
             if j != i {
-                radius += lhs_dense[[i, j]].abs();
+                radius += gershgorin_src[[i, j]].abs();
             }
         }
         gershgorin_min = gershgorin_min.min(diag - radius);
     }
     if !gershgorin_min.is_finite() {
-        let diag_max = (0..p)
-            .map(|d| lhs_dense[[d, d]].abs())
+        let diag_max = (0..cholesky_test.nrows())
+            .map(|d| cholesky_test[[d, d]].abs())
             .fold(0.0_f64, f64::max);
         return Some(floor.max(diag_max * 1e-6).max(1e-6));
     }

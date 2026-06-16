@@ -3868,7 +3868,15 @@ pub(crate) fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
         base_diagonal_ridge,
         joint_full_width,
     );
-    let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor).unwrap_or(0.0);
+    // The penalty added above is positive-semidefinite by construction (each
+    // block penalty is `λ_k·S_k` with `λ_k = exp(ρ_k) > 0` and `S_k ⪰ 0`, plus a
+    // non-negative diagonal ridge). Indefiniteness of the penalized Hessian can
+    // therefore only originate in the data Hessian `h_joint`, so the stabilizing
+    // shift is bounded by the data Hessian's curvature — NOT the penalty's. Pass
+    // `h_joint` as the Gershgorin source so the shift stays `O(data scale)` even
+    // when the penalty is heavily over-smoothed (gam#979; see the function doc).
+    let shift =
+        exact_newton_stabilizing_shift_psd_penalized(&lhs, h_joint, ridge_floor).unwrap_or(0.0);
     if shift > 0.0 {
         log::debug!(
             "[PIRLS/joint-Newton] stabilized dense penalized Hessian with diagonal shift {:.3e}",
