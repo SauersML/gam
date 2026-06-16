@@ -1054,6 +1054,42 @@ mod tests {
         assert!(log_e_from_p_calibrator(f64::NAN).is_err());
     }
 
+    /// The e-value validity condition: under the null `P ~ Uniform(0, 1]`,
+    /// the calibrated e-value must satisfy `E_{H0}[e(P)] = ∫₀¹ e(p) dp ≤ 1`
+    /// (Wang–Ramdas e-BH controls FDR ONLY for genuine e-values). The κ = ½
+    /// member `e(p) = ½ p^{−1/2}` integrates to exactly 1, the boundary of
+    /// admissibility. We verify this numerically with a midpoint Riemann sum
+    /// over the unit interval (which UNDER-estimates `∫ p^{−1/2}` slightly
+    /// because the integrand is convex, so the analytic value 1 sits just
+    /// above the quadrature estimate — both safely ≤ 1 + tolerance).
+    ///
+    /// This is the property `e = 1/p` VIOLATES — `∫₀¹ (1/p) dp = ∞` — which
+    /// is why the behavioral-head and anova-atom paths route through this
+    /// calibrator rather than `−ln p`.
+    #[test]
+    fn p_to_e_calibrator_null_expectation_at_most_one() {
+        let n = 2_000_000usize;
+        let h = 1.0 / n as f64;
+        let mut mean_e = 0.0_f64;
+        for i in 0..n {
+            // Midpoint of cell i: p = (i + 0.5)/n, always in (0, 1).
+            let p = (i as f64 + 0.5) * h;
+            let e = log_e_from_p_calibrator(p).unwrap().exp();
+            mean_e += e * h;
+        }
+        // Analytic E_{H0}[e(P)] = 1; allow a small quadrature tolerance, but
+        // it MUST NOT exceed 1 by more than that (an invalid calibrator like
+        // 1/p would diverge here, not land near 1).
+        assert!(
+            mean_e <= 1.0 + 1e-3,
+            "calibrated e-value null expectation {mean_e} exceeds 1 — not a valid e-value"
+        );
+        assert!(
+            mean_e > 0.99,
+            "calibrated e-value null expectation {mean_e} far below the analytic 1.0"
+        );
+    }
+
     /// POWER STUDY, null side: the heuristic gate every dictionary paper
     /// runs — "accept the K+1-th atom the first time the cumulative
     /// likelihood ratio shows improvement" — versus the e-gate, on a

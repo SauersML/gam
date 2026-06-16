@@ -104,33 +104,12 @@ impl std::fmt::Debug for HessianResult {
 }
 
 impl HessianResult {
-    /// Extract the Hessian matrix, panicking if unavailable.
-    pub fn unwrap_analytic(self) -> Array2<f64> {
-        match self {
-            HessianResult::Analytic(h) => h,
-            HessianResult::Operator(_) => outer_strategy_contract_panic(
-                "expected dense analytic Hessian but got HessianResult::Operator",
-            ),
-            HessianResult::Unavailable => outer_strategy_contract_panic(
-                "expected analytic Hessian but got HessianResult::Unavailable",
-            ),
-        }
-    }
-
     /// Returns `true` if an analytic Hessian is present in any exact form.
     pub fn is_analytic(&self) -> bool {
         matches!(
             self,
             HessianResult::Analytic(_) | HessianResult::Operator(_)
         )
-    }
-
-    /// Convert to the optional Hessian shape used by the opt bridge.
-    pub fn into_option(self) -> Option<Array2<f64>> {
-        match self {
-            HessianResult::Analytic(h) => Some(h),
-            HessianResult::Operator(_) | HessianResult::Unavailable => None,
-        }
     }
 
     pub fn dim(&self) -> Option<usize> {

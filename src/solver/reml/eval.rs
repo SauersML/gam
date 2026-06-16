@@ -639,9 +639,14 @@ impl<'a> RemlState<'a> {
     ) -> SmoothingCorrectionOutcome {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
 
+        // Always compute the fast first-order correction first.
+        let first_order = super::compute_smoothing_correction(self, final_rho, final_fit);
+        let first_order_correction = first_order.correction.clone();
+        let first_order_rho_covariance = first_order.rho_covariance.clone();
         let first_order_routine = |correction: Option<Array2<f64>>, reason: &'static str| {
             SmoothingCorrectionOutcome::FirstOrder {
                 correction,
+                rho_covariance: first_order_rho_covariance.clone(),
                 reason,
                 severity: Routine,
             }
@@ -649,14 +654,11 @@ impl<'a> RemlState<'a> {
         let first_order_numerical = |correction: Option<Array2<f64>>, reason: &'static str| {
             SmoothingCorrectionOutcome::FirstOrder {
                 correction,
+                rho_covariance: first_order_rho_covariance.clone(),
                 reason,
                 severity: NumericalFailure,
             }
         };
-
-        // Always compute the fast first-order correction first.
-        let first_order = super::compute_smoothing_correction(self, final_rho, final_fit);
-        let first_order_correction = first_order.correction.clone();
         let n_rho = final_rho.len();
         if n_rho == 0 {
             // No hyperparameters: the unified corrected covariance equals H^{-1}.
@@ -965,6 +967,7 @@ impl<'a> RemlState<'a> {
 
         self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Cubature {
             correction: corr,
+            rho_covariance: Some(hessian_rho_inv),
             rank,
             n_points: sigma_points.len(),
             near_boundary,
@@ -1005,6 +1008,7 @@ impl<'a> RemlState<'a> {
                 reason,
                 severity,
                 correction,
+                ..
             } => {
                 let has_matrix = correction.is_some();
                 match severity {
@@ -2182,6 +2186,7 @@ mod smoothing_correction_outcome_tests {
         };
         SmoothingCorrectionOutcome::FirstOrder {
             correction,
+            rho_covariance: None,
             reason,
             severity,
         }
@@ -2191,6 +2196,7 @@ mod smoothing_correction_outcome_tests {
     pub(crate) fn cubature_branch_label_and_extraction() {
         let outcome = SmoothingCorrectionOutcome::Cubature {
             correction: array![[2.0, 0.0], [0.0, 2.0]],
+            rho_covariance: None,
             rank: 2,
             n_points: 4,
             near_boundary: true,
