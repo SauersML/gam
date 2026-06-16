@@ -58,7 +58,7 @@ pub use sae_encode_atlas::{
     AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
     EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
 };
-pub use sae_manifold::{
+pub use sae::manifold::{
     AssignmentMode, CertificateInputs, CurvatureBifurcation, CurvatureWalkReport,
     GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
     SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,

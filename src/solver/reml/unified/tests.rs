@@ -1159,7 +1159,7 @@ impl crate::solver::rho_optimizer::OuterHessianOperator for SentinelOuterHessian
 }
 
 pub(crate) struct FamilyOperatorOnlyDerivatives {
-    pub(crate) op: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    pub(crate) op: Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>,
 }
 
 impl HessianDerivativeProvider for FamilyOperatorOnlyDerivatives {
@@ -1181,7 +1181,7 @@ impl HessianDerivativeProvider for FamilyOperatorOnlyDerivatives {
 
     fn family_outer_hessian_operator(
         &self,
-    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
         Some(Arc::clone(&self.op))
     }
 }
@@ -1270,7 +1270,7 @@ pub(crate) fn dense_and_materialized_outer_hessian(
     )
     .unwrap();
     let materialized =
-        crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator).unwrap();
+        crate::solver::rho_optimizer::OuterHessianOperator::materialize_dense(&operator).unwrap();
     (dense, operator, materialized)
 }
 
@@ -1327,7 +1327,7 @@ pub(crate) fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
 
     let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
         .expect("family outer operator evaluation");
-    let crate::solver::outer_strategy::HessianResult::Operator(op) = result.hessian else {
+    let crate::solver::rho_optimizer::HessianResult::Operator(op) = result.hessian else {
         panic!("expected family-supplied operator Hessian route");
     };
     let dense = op.materialize_dense().expect("sentinel materialization");
@@ -1725,7 +1725,7 @@ pub(crate) fn envelope_inconsistent_gradient_skips_outer_hessian_assembly() {
     assert!(
         matches!(
             result.hessian,
-            crate::solver::outer_strategy::HessianResult::Unavailable
+            crate::solver::rho_optimizer::HessianResult::Unavailable
         ),
         "inconsistent envelope gradient should skip Hessian assembly"
     );
@@ -2080,7 +2080,7 @@ pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_g
     }
 
     let alpha = array![0.37, -0.58];
-    let hvp = crate::solver::outer_strategy::OuterHessianOperator::matvec(&operator, &alpha)
+    let hvp = crate::solver::rho_optimizer::OuterHessianOperator::matvec(&operator, &alpha)
         .expect("operator HVP");
     let dense_hvp = dense.dot(&alpha);
     for i in 0..hvp.len() {
@@ -2405,7 +2405,7 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
     // matvec path, distinct from the materialize column-probes above, so it
     // also exercises the hook's per-matvec injection directly.)
     let mixed = array![0.6_f64, -1.1_f64]; // [ρ, ψ], both live
-    let hvp = crate::solver::outer_strategy::OuterHessianOperator::matvec(&operator, &mixed)
+    let hvp = crate::solver::rho_optimizer::OuterHessianOperator::matvec(&operator, &mixed)
         .expect("mixed-direction operator HVP");
     let dense_hvp = dense.dot(&mixed);
     for i in 0..hvp.len() {
@@ -2690,7 +2690,7 @@ pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alp
         array![0.7, -0.3],
     ];
     for alpha in alphas.iter() {
-        let hvp = crate::solver::outer_strategy::OuterHessianOperator::matvec(&operator, alpha)
+        let hvp = crate::solver::rho_optimizer::OuterHessianOperator::matvec(&operator, alpha)
             .expect("operator HVP");
         let dense_hvp = dense.dot(alpha);
         for i in 0..hvp.len() {
@@ -2912,7 +2912,7 @@ pub(crate) fn subspace_trace_large_k_routes_to_projected_operator() {
     assert!(
         matches!(
             result.hessian,
-            crate::solver::outer_strategy::HessianResult::Operator(_)
+            crate::solver::rho_optimizer::HessianResult::Operator(_)
         ),
         "large-k subspace-trace case should use projected outer Hessian operator"
     );
@@ -3569,7 +3569,7 @@ pub(crate) fn family_outer_hessian_operator_short_circuits_dense_pairwise_assemb
 
     let result =
         reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None).unwrap();
-    let crate::solver::outer_strategy::HessianResult::Operator(op) = result.hessian else {
+    let crate::solver::rho_optimizer::HessianResult::Operator(op) = result.hessian else {
         panic!("expected family-supplied operator Hessian");
     };
     assert_eq!(op.dim(), 1);

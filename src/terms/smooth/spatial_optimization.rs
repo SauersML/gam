@@ -5610,13 +5610,7 @@ where
         let mut mask: Vec<usize> = Vec::with_capacity(k);
         // Splitmix64-driven Floyd's sampler.
         let mut state = seed.wrapping_add(0x9E3779B97F4A7C15);
-        let splitmix = |s: &mut u64| -> u64 {
-            *s = s.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = *s;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        };
+        let splitmix = |s: &mut u64| -> u64 { crate::linalg::utils::splitmix64(s) };
         let mut taken = std::collections::HashSet::with_capacity(k);
         for j in (n_total - k)..n_total {
             let r = (splitmix(&mut state) % (j as u64 + 1)) as usize;
