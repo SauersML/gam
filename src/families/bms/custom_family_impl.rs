@@ -860,6 +860,53 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
+    fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        // Same trust dispatch as the per-axis
+        // `exact_newton_joint_hessian_directional_derivative_with_specs`: an
+        // untrusted, structurally-decoupled spec returns `None` so the caller
+        // keeps the released semantics (the inner Jeffreys term then degenerates
+        // to its value-only contribution), exactly as the per-axis path.
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+        // Flex-active fits use the dense exact-cache path; only the rigid
+        // marginal-slope kernel has the BLAS-3 design-row-Gram batched override.
+        // Fall back to the generic per-axis assembly (bit-for-bit identical to
+        // the trait default) when flex is active.
+        if self.effective_flex_active(block_states)? {
+            let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+            let mut axes = Vec::with_capacity(p);
+            for a in 0..p {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[a] = 1.0;
+                match self.joint_jeffreys_information_directional_derivative_with_specs(
+                    block_states,
+                    specs,
+                    &axis,
+                )? {
+                    Some(m) => axes.push(m),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(axes));
+        }
+        let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+        // The dispatcher takes the BLAS-3 override when available and otherwise
+        // runs the generic per-axis sweep — both bit-faithful to the per-axis
+        // `exact_newton_joint_hessian_directional_derivative` the default calls.
+        crate::families::row_kernel::row_kernel_directional_derivative_all_axes(
+            &kern,
+            &crate::families::row_kernel::RowSet::All,
+        )
+        .map(Some)
+    }
+
     fn joint_jeffreys_information_second_directional_all_axes_with_specs(
         &self,
         block_states: &[ParameterBlockState],

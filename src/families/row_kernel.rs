@@ -461,6 +461,54 @@ pub trait RowKernel<const K: usize>: Send + Sync {
         ))
     }
 
+    /// Optional BLAS-3 fast path for the BATCHED all-axes FIRST directional
+    /// derivative of the dense Hessian: with the direction sweeping every
+    /// canonical axis `e_a`, return the `p` dense matrices `{Hdot[e_a]}_{a=0..p}`,
+    ///
+    /// ```text
+    ///   Hdot[e_a] = Σ_i  Jᵢᵀ T³ᵢ[J·e_a] Jᵢ.
+    /// ```
+    ///
+    /// This is the per-cycle hotspot of the inner-Newton Jeffreys/Firth term
+    /// (`joint_jeffreys_term`'s `grad[k]`/`H_Φ` loop). The generic per-axis path
+    /// asks for `Hdot[e_a]` `p` separate times; for a kernel the family
+    /// reconstructs fresh per call (rigid Bernoulli marginal-slope) that rebuilds
+    /// the `O(n)` per-row tensor cache `p` times every cycle the Jeffreys gate
+    /// arms (gam#979). For a kernel whose pullback is a pure design-row Gram the
+    /// per-row third tensor is INDEPENDENT of the swept axis, so it is built once
+    /// and each axis closed with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs. The
+    /// default returns `None`, preserving the exact generic per-axis path
+    /// bit-for-bit. Overrides should claim only the full-data unit-weight
+    /// `RowSet::All` case; under a subsample / non-unit-weight `RowSet` return
+    /// `None` so the generic Horvitz-Thompson per-row path runs per axis.
+    ///
+    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
+    /// per-axis `row_kernel_directional_derivative(self, rows, e_a)` reduced in
+    /// deterministic in-row order (same contract as
+    /// [`Self::hessian_dense_override`]).
+    fn directional_derivative_all_axes_dense_override(
+        &self,
+        rows: &RowSet,
+        p: usize,
+    ) -> Option<Result<Vec<Array2<f64>>, String>> {
+        // Default declines (the batched dispatcher then runs the generic
+        // per-axis sweep). The dispatcher passes `p = n_coefficients()`; a
+        // mismatch is a hard caller-contract violation regardless of which path
+        // runs, so it is surfaced here where both `rows` and `p` are consumed —
+        // keeping the default body free of unused bindings without masking a bad
+        // call (same idiom as the second-directional default below).
+        if p != self.n_coefficients() {
+            let all = matches!(rows, RowSet::All);
+            return Some(Err(format!(
+                "directional_derivative_all_axes_dense_override: axis count {} \
+                 disagrees with n_coefficients() {} (rows::All = {all})",
+                p,
+                self.n_coefficients(),
+            )));
+        }
+        None
+    }
+
     /// Optional BLAS-3 fast path for the dense joint Hessian assembly
     /// `H = Σ_i w_i · Jᵢᵀ Hᵢ Jᵢ` from the cached per-row `K×K` Hessians.
     ///
@@ -1059,6 +1107,43 @@ pub fn row_kernel_directional_derivative_generic<const K: usize>(
         },
         |a, b| Ok(a + b),
     )
+}
+
+/// Batched all-axes FIRST directional derivative: with the direction sweeping
+/// every canonical axis `e_a`, return the `p` dense matrices
+/// `{Hdot[e_a]}_{a=0..p}`.
+///
+/// Dispatches to [`RowKernel::directional_derivative_all_axes_dense_override`]
+/// when the kernel provides a BLAS-3 fast path on this row-set; otherwise falls
+/// back to `p` independent [`row_kernel_directional_derivative`] sweeps, one per
+/// unit axis `e_a` — bit-for-bit the generic per-axis path the inner-Newton
+/// Jeffreys term consumed before the batched hook existed. The fall-back runs
+/// the axis sweep on the Rayon pool (each axis is an independent full-data pure
+/// evaluation) so it is no slower than the prior per-axis parallel loop; the
+/// nested-BLAS guard pins each axis's GEMMs to `Par::Seq`.
+pub fn row_kernel_directional_derivative_all_axes<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized + Sync),
+    rows: &RowSet,
+) -> Result<Vec<Array2<f64>>, String> {
+    let p = kern.n_coefficients();
+    if let Some(result) = kern.directional_derivative_all_axes_dense_override(rows, p) {
+        return result;
+    }
+    // Generic fall-back: each axis `e_a` is one independent full-data
+    // first-directional sweep. Fan the `p` axes across the pool with the
+    // nested-BLAS guard so any inner GEMM stays `Par::Seq` (mirrors the prior
+    // Jeffreys per-axis parallel sweep). Index-ordered collection keeps the
+    // output bit-identical to a serial axis loop.
+    (0..p)
+        .into_par_iter()
+        .map(|a| {
+            let mut axis = vec![0.0_f64; p];
+            axis[a] = 1.0;
+            crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                row_kernel_directional_derivative(kern, rows, &axis)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 /// Second directional derivative of the Hessian: ∂²H/∂β²[d_u, d_v] over `rows`.

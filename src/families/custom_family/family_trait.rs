@@ -1079,6 +1079,49 @@ pub trait CustomFamily {
         )
     }
 
+    /// BATCHED all-axes FIRST beta-directional derivative of
+    /// [`Self::joint_jeffreys_information_with_specs`]: with the direction
+    /// sweeping every canonical axis `e_a`, return the `p` dense matrices
+    /// `{Hdot[e_a]}_{a=0..p}`.
+    ///
+    /// This is the per-cycle hotspot of the inner-Newton Jeffreys/Firth term
+    /// (`joint_jeffreys_term`'s `grad[k]/H_Φ` loop): the generic per-axis path
+    /// asks the family for `Hdot[e_a]` `p` separate times, and a coupled family
+    /// whose per-axis derivative reconstructs a fresh row kernel each call
+    /// (rigid Bernoulli marginal-slope) then rebuilds its `O(n)` per-row tensor
+    /// cache `p` times — the dominant cost of every cycle on which the
+    /// conditioning gate arms (gam#979). A family whose joint information is a
+    /// pure design-row Gram can build the per-row tensor ONCE and close all `p`
+    /// axes from it. `None` ⇒ the family does not expose the exact derivative on
+    /// some axis (zero drift), matching the per-axis hook's first-`None`
+    /// collapse.
+    ///
+    /// The default builds the object by calling the per-axis
+    /// [`Self::joint_jeffreys_information_directional_derivative_with_specs`]
+    /// for each unit axis `e_a` — bit-for-bit the prior per-axis path. Families
+    /// with a batched fast path override this.
+    fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        let mut axes = Vec::with_capacity(p);
+        for a in 0..p {
+            let mut axis = Array1::<f64>::zeros(p);
+            axis[a] = 1.0;
+            match self.joint_jeffreys_information_directional_derivative_with_specs(
+                block_states,
+                specs,
+                &axis,
+            )? {
+                Some(m) => axes.push(m),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(axes))
+    }
+
     /// Second beta-directional derivative of
     /// [`Self::joint_jeffreys_information_with_specs`].
     fn joint_jeffreys_information_second_directional_derivative_with_specs(
