@@ -112,7 +112,65 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
         .filter(|tiles| tiles.len() > 1);
 
     let Some(tiles) = tiles else {
-        // Single-device / CPU: reduce serially in place (original order).
+        // Single-device / CPU. The per-row contributions `-Σ_i leftᵀ·right` fold
+        // into the `k×k` `schur` independently — the same dense-assembly axis the
+        // multi-GPU tile path partitions, and the dense-Direct analog of the
+        // per-row matvec / streaming `accumulate_chunk` loops already parallelized
+        // for #1017. At the SAE Direct-solve shape (`n` in the thousands, wide
+        // border `k`) this O(n·d·k²) reduction is the dense assembly's whole cost
+        // and was the last serial CPU step on the dense-Schur build.
+        //
+        // Fan it across rayon over fixed row chunks: each chunk reduces its rows
+        // (in row order) into a private zero-seeded `k×k` partial, then the
+        // partials are folded into `schur` in CHUNK order. The per-chunk row order
+        // and the inter-chunk fold order are both fixed independent of thread
+        // scheduling, so the f64 reduction is **bit-identical run-to-run** (the
+        // #1017 determinism gate: the criterion ranking across topology candidates
+        // must not move), and the only departure from the in-place serial loop is
+        // the chunk-boundary reassociation of the reduction sum — exactly the
+        // established equivalence `accumulate_chunk` / the per-row matvec operate
+        // under, well inside the Newton solve's tolerance. Stay in-place serial
+        // below the row floor and when already inside a rayon worker (the topology
+        // race fans candidates with `run_topology_race_parallel`) to avoid
+        // nested-rayon oversubscription — the same guard the matvec uses.
+        let n_rows = sys.rows.len();
+        let parallel =
+            n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            let partials: Result<Vec<Array2<f64>>, ArrowSchurError> = (0..n_rows)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let mut partial = Array2::<f64>::zeros((k, k));
+                    for i in idxs {
+                        subtract_row_schur_contribution(
+                            sys,
+                            i,
+                            &sys.rows[i],
+                            htt_factors.factor(i),
+                            backend,
+                            kind,
+                            &mut partial,
+                        )?;
+                    }
+                    Ok(partial)
+                })
+                .collect();
+            // Deterministic ordered fold: chunk partials hold `-Σ contribution`
+            // over their rows, so `schur += partial` reproduces the serial
+            // `schur -= Σ contribution` in fixed (chunk, a, b) order.
+            for partial in &partials? {
+                for a in 0..k {
+                    for b in 0..k {
+                        schur[[a, b]] += partial[[a, b]];
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // Serial in-place reduction (original order) — bit-for-bit reference.
         for (i, row) in sys.rows.iter().enumerate() {
             subtract_row_schur_contribution(
                 sys,
@@ -1133,6 +1191,7 @@ impl JacobiPreconditioner {
     ) -> Result<Self, ArrowSchurError> {
         let k = sys.k;
         let p = resident.p;
+        let n = resident.rows.len();
         // Seed with diag(H_ββ) + ridge — same penalty source the generic path
         // reads, so the only difference is how the point-elimination term is
         // gathered.

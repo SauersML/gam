@@ -1008,6 +1008,66 @@ mod tests {
             );
         }
     }
+
+    /// ORACLE FIXTURE (#939 deliverable 3): the FFI Skovgaard assembly reproduces
+    /// the certified scalar Exponential-rate closed form. `yᵢ ~ Exp(θ)` is a
+    /// single-coefficient (intercept-only) canonical model with `ℓ(θ)=n lnθ−θΣy`,
+    /// `θ̂=n/Σy`, and `ĵ = î = Î = n/θ̂²` at the MLE. With `c=[1]`, the matrix
+    /// assembler must yield exactly the in-tree `scalar_skovgaard_r_star` result:
+    /// `r=sign(θ̂−θ₀)√W`, `u=(θ̂−θ₀)√ĵ`, and the Wald-root sandwich `q<r*<r` that
+    /// pulls the right-skewed first-order root back. This proves the FFI passes
+    /// the ingredients through exactly — no approximation layer.
+    #[test]
+    fn skovgaard_ffi_assembler_recovers_exponential_closed_form() {
+        use gam::inference::skovgaard::scalar_skovgaard_from_matrices;
+        use ndarray::array;
+
+        let n = 25.0_f64;
+        let sum_y = 20.0_f64;
+        let theta_hat = n / sum_y; // 1.25
+        let theta0 = 1.0_f64;
+        let ll = |t: f64| n * t.ln() - t * sum_y;
+        let lr = (2.0 * (ll(theta_hat) - ll(theta0))).max(0.0);
+        // Observed info ĵ = n/θ̂²: a 1×1 penalized Hessian. cᵀĤ⁻¹c = 1/ĵ.
+        let obs = n / (theta_hat * theta_hat);
+        let beta = array![theta_hat];
+        let contrast = array![1.0_f64];
+        let h = Array2::from_shape_vec((1, 1), vec![obs]).unwrap();
+        // Canonical family: pass Fisher = Ĥ (î = ĵ). Score covariance Î = n/θ̂²
+        // is realised by rows whose Σ sᵢ² = Î·ĵ² so the sandwich (cᵀĤ⁻¹·ΣssᵀĤ⁻¹c)
+        // = Σsᵢ²/ĵ² = Î/ĵ² · ĵ² ... we instead set Σsᵢ² = ĵ² · ... :
+        // sandwich = Σ(sᵢ·a)² with a = 1/ĵ ⇒ score_cov = ĵ² / Σsᵢ². For Î = ĵ we
+        // need Σsᵢ² = ĵ, so a single row sᵢ = √ĵ.
+        let row_scores = Array2::from_shape_vec((1, 1), vec![obs.sqrt()]).unwrap();
+        let fisher = Array2::from_shape_vec((1, 1), vec![obs]).unwrap();
+
+        let res = scalar_skovgaard_from_matrices(
+            contrast.view(),
+            beta.view(),
+            h.view(),
+            Some(fisher.view()),
+            row_scores.view(),
+            lr,
+            theta0,
+        )
+        .expect("ffi-shape skovgaard");
+
+        let r_expected = (theta_hat - theta0).signum() * lr.sqrt();
+        assert!((res.r - r_expected).abs() < 1e-12, "r = {}", res.r);
+        // Canonical: u = (θ̂−θ₀)·î/√ĵ = (θ̂−θ₀)√ĵ, and Î = ĵ ⇒ u_emp = u.
+        let u_expected = (theta_hat - theta0) * obs.sqrt();
+        assert!((res.u - u_expected).abs() < 1e-12, "u = {}", res.u);
+        assert!((res.u_empirical - res.u).abs() < 1e-12, "u_emp = {}", res.u_empirical);
+        // The refinement ordering q < r* < r (Wald root < modified root < directed
+        // root) for the right-skewed exponential LR.
+        let q = (theta_hat - theta0) * obs.sqrt();
+        assert!(
+            q < res.r_star && res.r_star < r_expected,
+            "need q < r* < r: q={q} r*={} r={r_expected}",
+            res.r_star
+        );
+        assert!((0.0..=1.0).contains(&res.p_value_corrected));
+    }
 }
 
 /// Register the inference-instrument `#[pyfunction]`s and classes on the

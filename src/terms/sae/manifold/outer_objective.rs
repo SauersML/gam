@@ -887,10 +887,14 @@ impl SaeManifoldOuterObjective {
         let consistency = self
             .term
             .amortized_encoder_consistency(self.target.view(), rho)?;
-        let reml_scale = reml_cost.abs().max(1.0);
-        Ok(reml_cost
-            + super::COTRAIN_RECON_WEIGHT * reml_scale * consistency.recon_consistency
-            + super::COTRAIN_CERT_WEIGHT * reml_scale * consistency.uncertified_fraction)
+        // Route through the SINGLE source of the fold arithmetic on
+        // `SaeManifoldTerm` so the cascade-ranked cost and the public
+        // `reml_criterion_cotrained` value can never drift (the objective↔gradient
+        // desync bug class).
+        Ok(SaeManifoldTerm::fold_cotrain_consistency(
+            reml_cost,
+            &consistency,
+        ))
     }
 
     /// Fellner-Schall / Mackay multiplicative fixed-point step on ρ at

@@ -3195,6 +3195,68 @@ pub(crate) fn resident_scalar_jacobi_matches_generic() {
     }
 }
 
+/// #1017 SAE-resident scalar-Jacobi build parallelism: `build_scalar_jacobi_resident`
+/// fans its per-row support sweep over rayon above `SCHUR_MATVEC_PARALLEL_ROW_MIN`,
+/// accumulating worker-private length-`K` diagonal partials folded back in chunk
+/// order. The point-elimination term scatters into a SHARED diagonal, so the
+/// parallel build must (a) be bit-identical run-to-run and (b) exactly reproduce
+/// the serial chunk-free build (the serial branch is taken inside a single-thread
+/// rayon worker, where `current_thread_index()` is `Some`). A drifting diagonal
+/// would change the PCG iterate and the criterion ranking across topology
+/// candidates — the #1017 determinism gate.
+#[test]
+pub(crate) fn parallel_resident_scalar_jacobi_deterministic_and_matches_serial() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
+    let q = 4usize;
+    let p = 5usize;
+    let n_atoms = 20usize;
+    let m_active = 4usize;
+    let (sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, q, false)
+        .expect("SPD per-row blocks must factor");
+    let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
+        .expect("SAE structure must yield a resident operator");
+    let ridge_beta = 1e-6;
+    let k = sys.k;
+    let r = Array1::from_iter((0..k).map(|a| 0.3 * ((a as f64) * 0.019).sin() + 0.05));
+
+    // Two live (parallel) builds: bit-identical apply run-to-run.
+    let par_a = JacobiPreconditioner::build_scalar_jacobi_resident(&sys, ridge_beta, &resident)
+        .expect("resident scalar Jacobi a");
+    let par_b = JacobiPreconditioner::build_scalar_jacobi_resident(&sys, ridge_beta, &resident)
+        .expect("resident scalar Jacobi b");
+    let out_a = par_a.apply(&r);
+    let out_b = par_b.apply(&r);
+    for a in 0..k {
+        assert_eq!(
+            out_a[a].to_bits(),
+            out_b[a].to_bits(),
+            "parallel resident scalar Jacobi must apply deterministically at {a}"
+        );
+    }
+
+    // Serial branch: force the nested-worker gate (single-thread pool ⇒
+    // `current_thread_index()` is `Some` ⇒ sequential `row = 0..n` sweep).
+    let one_thread = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("one-thread pool");
+    let out_serial = one_thread.install(|| {
+        JacobiPreconditioner::build_scalar_jacobi_resident(&sys, ridge_beta, &resident)
+            .expect("serial resident scalar Jacobi")
+            .apply(&r)
+    });
+    for a in 0..k {
+        assert_eq!(
+            out_a[a].to_bits(),
+            out_serial[a].to_bits(),
+            "parallel chunk-ordered fold must equal the serial subtraction order at {a}"
+        );
+    }
+}
+
 /// The factored residency (storing `(L_i, Y_i)` and applying `G_i v =
 /// L_iᵀ(Y_i v)`) must reproduce the dense `p×p` block `G_i = L_iᵀ Y_i`
 /// exactly — this is the #1017 memory/compute win (`O(n·di·p)` vs `O(n·p²)`)
