@@ -85,8 +85,87 @@ pub fn apply_smooth_overrides(
                 format!("smooths[{symbol:?}] descriptor missing required \"kind\" field")
             })?;
         apply_one_override(term, kind, descriptor_obj, symbol, inference_notes)?;
+        apply_by_variable(term, descriptor_obj, symbol, data, &column_index, inference_notes)?;
     }
     Ok(())
+}
+
+/// Wrap the term's basis in the `ByVariable` row-gating envelope when the
+/// descriptor carries a `by` key (`Smooth.by` — the per-row multiplier
+/// `by · s(x)`). On the descriptor path `by` is the *name* of a data-frame
+/// column, resolved here to a `by_col` exactly as the formula `s(x, by=g)`
+/// syntax does in `term_builder.rs`. Numeric / binary columns scale the inner
+/// smooth (`ByVariableSpec::Numeric`); categorical `by` columns require the
+/// per-level term replication the formula builder performs and are not
+/// expressible as a single in-place override, so they are rejected with a
+/// pointer to the formula syntax.
+fn apply_by_variable(
+    term: &mut SmoothTermSpec,
+    descriptor: &serde_json::Map<String, JsonValue>,
+    symbol: &str,
+    data: &Dataset,
+    column_index: &HashMap<&str, usize>,
+    inference_notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let by_name = match descriptor.get("by") {
+        None => return Ok(()),
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| format!("smooths[{symbol:?}].by must be a column name string"))?,
+    };
+    let by_col = *column_index.get(by_name).ok_or_else(|| {
+        format!(
+            "smooths[{symbol:?}].by references unknown column {by_name:?}; \
+             known columns: {known:?}",
+            known = {
+                let mut k: Vec<&&str> = column_index.keys().collect();
+                k.sort();
+                k
+            },
+        )
+    })?;
+    match data.column_kinds.get(by_col).copied().ok_or_else(|| {
+        format!("internal column-kind lookup failed for smooths[{symbol:?}].by = {by_name:?}")
+    })? {
+        ColumnKindTag::Binary | ColumnKindTag::Continuous => {
+            // Wrap the (already-overridden) geometric core in place. Taking the
+            // basis out via a cheap stand-in avoids cloning the inner spec.
+            let inner = std::mem::replace(
+                &mut term.basis,
+                SmoothBasisSpec::BSpline1D {
+                    feature_col: by_col,
+                    spec: BSplineBasisSpec {
+                        degree: 0,
+                        penalty_order: 0,
+                        knotspec: BSplineKnotSpec::Generate {
+                            data_range: (0.0, 0.0),
+                            num_internal_knots: 0,
+                        },
+                        double_penalty: false,
+                        identifiability: Default::default(),
+                        boundary: OneDimensionalBoundary::Open,
+                        boundary_conditions: Default::default(),
+                    },
+                },
+            );
+            term.basis = SmoothBasisSpec::ByVariable {
+                inner: Box::new(inner),
+                by_col,
+                kind: BySmoothKind::Numeric,
+                by: ByVariableSpec::Numeric,
+            };
+            inference_notes.push(format!(
+                "smooths[{symbol:?}] gated by numeric column {by_name:?} (by·s(x))",
+            ));
+            Ok(())
+        }
+        ColumnKindTag::Categorical => Err(format!(
+            "smooths[{symbol:?}].by = {by_name:?} is a categorical column; a factor `by` \
+             replicates the smooth per level and is not expressible on the smooths={{}} \
+             descriptor path. Use the formula by-smooth syntax instead, e.g. \
+             fit(df, \"y ~ s({symbol}, by={by_name})\")."
+        )),
+    }
 }
 
 fn resolve_symbol_columns(
@@ -1118,6 +1197,98 @@ mod tests {
             operator_penalties: Default::default(),
             boundary: OneDimensionalBoundary::Open,
         }
+    }
+
+    use crate::inference::model::{DataSchema, SchemaColumn};
+
+    /// Minimal dataset carrying only the `headers` + `column_kinds` that
+    /// `apply_smooth_overrides` reads (it never touches `values`/`schema`).
+    fn dataset_with(cols: &[(&str, ColumnKindTag)]) -> Dataset {
+        Dataset {
+            headers: cols.iter().map(|(n, _)| n.to_string()).collect(),
+            values: Array2::zeros((0, cols.len())),
+            schema: DataSchema {
+                columns: cols
+                    .iter()
+                    .map(|(n, k)| SchemaColumn {
+                        name: n.to_string(),
+                        kind: *k,
+                        levels: Vec::new(),
+                    })
+                    .collect(),
+            },
+            column_kinds: cols.iter().map(|(_, k)| *k).collect(),
+        }
+    }
+
+    fn collection_with(term: SmoothTermSpec) -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![term],
+        }
+    }
+
+    /// Regression for gam issue #1160: `Smooth(by=...)` on the formula
+    /// `smooths={}` descriptor path used to be silently dropped. It must now
+    /// reach the fit as a `ByVariable` row-gating envelope, resolving the
+    /// `by` column name to the gating `by_col` just like `s(x, by=g)`.
+    #[test]
+    fn by_column_name_wraps_in_by_variable_envelope() {
+        // Columns: x (the smooth), g (the numeric gating multiplier at col 1).
+        let data = dataset_with(&[("x", ColumnKindTag::Continuous), ("g", ColumnKindTag::Continuous)]);
+        let mut spec = collection_with(bspline_term()); // s(x) on feature_col 0
+        let overrides = json!({"x": {"kind": "bspline", "by": "g"}});
+        let mut notes = Vec::new();
+
+        apply_smooth_overrides(&mut spec, &overrides, &data, &mut notes)
+            .expect("by= column-name descriptor must wire end-to-end");
+
+        match &spec.smooth_terms[0].basis {
+            SmoothBasisSpec::ByVariable {
+                inner,
+                by_col,
+                kind,
+                by,
+            } => {
+                assert_eq!(*by_col, 1, "by= must resolve to column 'g' (index 1)");
+                assert!(matches!(kind, BySmoothKind::Numeric));
+                assert!(matches!(by, ByVariableSpec::Numeric));
+                assert!(
+                    matches!(**inner, SmoothBasisSpec::BSpline1D { feature_col: 0, .. }),
+                    "inner geometric core (s(x) on col 0) must be preserved",
+                );
+            }
+            other => panic!("expected ByVariable envelope, got {other:?}"),
+        }
+    }
+
+    /// `by=` referencing a categorical column is rejected with a pointer to the
+    /// formula by-smooth syntax (per-level replication isn't an in-place merge).
+    #[test]
+    fn by_categorical_column_is_rejected_with_pointer() {
+        let data = dataset_with(&[("x", ColumnKindTag::Continuous), ("g", ColumnKindTag::Categorical)]);
+        let mut spec = collection_with(bspline_term());
+        let overrides = json!({"x": {"kind": "bspline", "by": "g"}});
+        let mut notes = Vec::new();
+
+        let err = apply_smooth_overrides(&mut spec, &overrides, &data, &mut notes)
+            .expect_err("categorical by= must be rejected on the descriptor path");
+        assert!(err.contains("categorical"), "got: {err}");
+        assert!(err.contains("by-smooth syntax"), "got: {err}");
+    }
+
+    /// An unknown `by=` column name surfaces a clear error rather than a panic.
+    #[test]
+    fn by_unknown_column_errors() {
+        let data = dataset_with(&[("x", ColumnKindTag::Continuous)]);
+        let mut spec = collection_with(bspline_term());
+        let overrides = json!({"x": {"kind": "bspline", "by": "nope"}});
+        let mut notes = Vec::new();
+
+        let err = apply_smooth_overrides(&mut spec, &overrides, &data, &mut notes)
+            .expect_err("unknown by= column must error");
+        assert!(err.contains("unknown column"), "got: {err}");
     }
 
     #[test]
