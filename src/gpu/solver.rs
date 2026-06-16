@@ -6,12 +6,8 @@
 
 use ndarray::{Array2, ArrayView2};
 
-pub fn backend_status() -> super::BackendStatus {
-    if super::runtime::GpuRuntime::global().is_some() {
-        super::BackendStatus::CudaReady
-    } else {
-        super::BackendStatus::CudaUnavailable
-    }
+pub fn solver_backend_status() -> super::CudaBackendStatus {
+    super::cuda_backend_status()
 }
 
 /// Outcome reported by [`iterative_refinement_cholesky_solve`].

@@ -6,28 +6,29 @@ fn backend_status_and_policy_dispatch_are_consistent() {
         std::panic::catch_unwind(|| gam::gpu::runtime::GpuRuntime::global().is_some())
             .unwrap_or(false);
 
-    let blas_status = std::panic::catch_unwind(gam::gpu::blas::backend_status).ok();
-    let solver_status = std::panic::catch_unwind(gam::gpu::solver::backend_status).ok();
+    let blas_status = std::panic::catch_unwind(gam::gpu::blas::blas_backend_status).ok();
+    let solver_status = std::panic::catch_unwind(gam::gpu::solver::solver_backend_status).ok();
 
     if runtime_available {
         assert_eq!(
             blas_status,
-            Some(gam::gpu::BackendStatus::CudaReady),
+            Some(gam::gpu::CudaBackendStatus::CudaReady),
             "BLAS backend status should report CUDA ready when runtime probe succeeds."
         );
         assert_eq!(
             solver_status,
-            Some(gam::gpu::BackendStatus::CudaReady),
+            Some(gam::gpu::CudaBackendStatus::CudaReady),
             "Solver backend status should report CUDA ready when runtime probe succeeds."
         );
     } else {
         assert!(
-            blas_status.is_none() || blas_status == Some(gam::gpu::BackendStatus::CudaUnavailable),
+            blas_status.is_none()
+                || blas_status == Some(gam::gpu::CudaBackendStatus::CudaUnavailable),
             "BLAS backend status should report CUDA unavailable or panic-cleanly when CUDA runtime cannot be loaded."
         );
         assert!(
             solver_status.is_none()
-                || solver_status == Some(gam::gpu::BackendStatus::CudaUnavailable),
+                || solver_status == Some(gam::gpu::CudaBackendStatus::CudaUnavailable),
             "Solver backend status should report CUDA unavailable or panic-cleanly when CUDA runtime cannot be loaded."
         );
     }

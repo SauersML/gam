@@ -14,12 +14,8 @@
 //! `super::linalg` falls back to the CPU fast path without disturbing
 //! numerics.
 
-pub fn backend_status() -> super::BackendStatus {
-    if super::runtime::GpuRuntime::global().is_some() {
-        super::BackendStatus::CudaReady
-    } else {
-        super::BackendStatus::CudaUnavailable
-    }
+pub fn blas_backend_status() -> super::CudaBackendStatus {
+    super::cuda_backend_status()
 }
 
 #[cfg(target_os = "linux")]

@@ -53,9 +53,18 @@ use std::fmt;
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendStatus {
+pub enum CudaBackendStatus {
     CudaUnavailable,
     CudaReady,
+}
+
+#[inline]
+pub(crate) fn cuda_backend_status() -> CudaBackendStatus {
+    if runtime::GpuRuntime::global().is_some() {
+        CudaBackendStatus::CudaReady
+    } else {
+        CudaBackendStatus::CudaUnavailable
+    }
 }
 
 /// User-facing GPU backend policy.
