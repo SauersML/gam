@@ -460,6 +460,54 @@ pub(crate) fn dispersion_row_towers_match_hand_witnesses() {
     }
 }
 
+#[test]
+// Regression for #1107: the Tweedie y=0 dispersion-channel curvature in the
+// η_d = −log φ link must equal the observed-information second derivative
+// ∂²(−ℓ)/∂η_d² = c/φ, NOT the Fisher-information shortcut 2c/φ. The shortcut
+// drops the first-order score term (valid only when E[score]=0, i.e. the
+// saddlepoint y>0 branch) and was 2× too large for the deterministic zero-mass
+// branch. This asserts the kernel's reported per-row curvature (`disp_weight`
+// at unit prior weight) matches a centered finite-difference of the NLL.
+pub(crate) fn tweedie_zero_mass_dispersion_curvature_matches_finite_difference() {
+    // (p in (1,2), eta_mu, eta_d) cases spanning small/large μ and φ.
+    let cases = [
+        (1.3_f64, -2.0_f64, -1.0_f64),
+        (1.5, -0.5, 0.5),
+        (1.5, 1.0, -1.5),
+        (1.7, 2.0, 2.0),
+        (1.1, -3.0, 0.0),
+    ];
+    for (p, eta_mu, eta_d) in cases {
+        let kind = DispersionFamilyKind::Tweedie { p };
+        // NLL(η_d) = −loglik(η_d) at unit prior weight; loglik is the kernel's
+        // reported log-likelihood contribution for this row.
+        let nll = |ed: f64| -dispersion_row_kernel(kind, 0.0, eta_mu, ed, 1.0).loglik;
+        let h = 1e-4;
+        let fd_curv = (nll(eta_d + h) - 2.0 * nll(eta_d) + nll(eta_d - h)) / (h * h);
+
+        let kernel = dispersion_row_kernel(kind, 0.0, eta_mu, eta_d, 1.0);
+        // disp_weight at unit prior weight is exactly the per-row curvature.
+        assert_rel_close(
+            "tweedie y=0 dispersion curvature vs finite difference",
+            kernel.disp_weight,
+            fd_curv,
+            1e-5,
+        );
+
+        // Closed-form guard: curvature must be c/φ, and a 2× error (the old
+        // 2c/φ) would be caught by the FD check above but we pin it explicitly.
+        let mu = (eta_mu as f64).exp();
+        let phi = (-eta_d).exp();
+        let c = mu.powf(2.0 - p) / (2.0 - p);
+        assert_rel_close(
+            "tweedie y=0 dispersion curvature equals c/phi (not 2c/phi)",
+            kernel.disp_weight,
+            c / phi,
+            1e-10,
+        );
+    }
+}
+
 pub(crate) fn logistic_numdual<D: DualNum<f64> + Copy>(x: D) -> D {
     D::one() / (D::one() + (-x).exp())
 }
