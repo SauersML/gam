@@ -17,10 +17,11 @@ The top-level package also exposes research/inference instruments used by
 the SAE and structure-discovery workflows: `split_likelihood_log_e`,
 `e_bh_dictionary_certificate`, `log_e_from_p_value`,
 `select_probe_by_expected_evidence`, `expected_resolution_budget`,
-`plan_probe_for_contested_claim`, `lawley_bartlett_factor`,
-`glm_full_conformal`, and `debiased_functional`. These are low-level
-building blocks rather than `Model` methods; see the [API
-reference](api-reference.md) for signatures.
+`plan_probe_for_contested_claim`, `lawley_bartlett_factor`, and
+`glm_full_conformal`. These are low-level building blocks rather than
+`Model` methods; see the [API reference](api-reference.md) for signatures.
+(`debiased_functional`, by contrast, is a `Model` method, not a
+top-level export.)
 
 ## summary()
 
@@ -41,8 +42,9 @@ s.coefficients_frame()         # pandas.DataFrame; requires pandas
 
 `Summary` supports `__getitem__` and `get(key, default)` like a dict.
 
-`model.smoothing_parameters()` is a thin helper returning a
-`{penalty_index: lambda}` dict derived from `summary()["lambdas"]`.
+`model.smoothing_parameters()` returns a `{penalty_index: lambda}` dict of
+the fitted smoothing/precision parameters by penalty index (via a dedicated
+FFI call), the same values surfaced under `summary()["lambdas"]`.
 
 ## diagnose()
 
