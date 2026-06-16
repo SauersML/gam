@@ -761,6 +761,85 @@ mod tests {
         }
     }
 
+    /// #1033 n-independence invariant (structural, build-free, bit-tight):
+    /// after the one-time `build` n-pass, EVERY per-trial accessor the certified
+    /// κ/ψ outer-loop hot path consumes — the value `(gram_at, rhs_at)`, the
+    /// gradient `(dgram_dpsi, drhs_dpsi)`, the Hessian-channel curvature
+    /// `(d2gram_dpsi2, d2rhs_dpsi2)`, and the inner-solver bridge
+    /// `gaussian_fixed_cache_at` — must touch ZERO data rows. We prove this by
+    /// instrumenting the `eval_design` closure with an invocation counter (the
+    /// closure is the ONLY route to the n×k design): the counter advances during
+    /// `build` (the certified node ladder + spot/gradient-window checks) and must
+    /// then stay FROZEN across an entire ψ-trial sweep. This is the
+    /// "no surface rebuild / no n×k re-realization on a cache-hit trial"
+    /// invariant the outer-loop seam (`SpatialJointContext::eval_full`,
+    /// `skip_design_realization`) relies on — asserted here at the tensor source
+    /// of truth, independent of whether the full κ-fit converges or of any
+    /// wall-clock measurement.
+    #[test]
+    fn psi_gram_tensor_trial_accessors_touch_no_data_rows() {
+        use std::cell::Cell;
+
+        let (n, k) = (256usize, 6usize);
+        let w = Array1::from_iter((0..n).map(|i| 0.8 + 0.4 * ((i % 4) as f64) / 3.0));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.21).sin() + 0.2));
+        let (psi_lo, psi_hi) = (-1.1_f64, 0.95_f64);
+
+        // The closure is the SOLE path to the n×k design; count every call.
+        let calls = Cell::new(0usize);
+        let tensor = PsiGramTensor::build(
+            |psi| {
+                calls.set(calls.get() + 1);
+                synth_design(psi, n, k)
+            },
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("analytic synthetic design must certify");
+
+        // The one-time build necessarily streamed the design at the Chebyshev
+        // nodes (plus off-node spot / gradient-window checks). Freeze the count.
+        let build_calls = calls.get();
+        assert!(
+            build_calls > 0,
+            "build must have streamed the design at least once (sanity)"
+        );
+
+        // A dense ψ-trial sweep strictly inside the certified window. Every
+        // accessor below is what a per-trial outer-loop eval consumes.
+        let m = 64usize;
+        let lo = psi_lo + 0.05;
+        let hi = psi_hi - 0.05;
+        for i in 0..m {
+            let psi = lo + (hi - lo) * (i as f64) / (m as f64 - 1.0);
+            assert!(tensor.contains(psi));
+            // Value lane.
+            let _g = tensor.gram_at(psi);
+            let _r = tensor.rhs_at(psi);
+            // Gradient lane.
+            let _dg = tensor.dgram_dpsi(psi);
+            let _dr = tensor.drhs_dpsi(psi);
+            // Hessian-channel curvature.
+            let _d2g = tensor.d2gram_dpsi2(psi);
+            let _d2r = tensor.d2rhs_dpsi2(psi);
+            // Inner-solver bridge (the GaussianFixedCache the PLS fast path reads).
+            let _cache = tensor.gaussian_fixed_cache_at(psi);
+        }
+
+        assert_eq!(
+            calls.get(),
+            build_calls,
+            "n-independence VIOLATED: a per-trial accessor re-streamed the n×k \
+             design ({} extra eval_design calls across {m} ψ-trials). The certified \
+             κ/ψ outer loop must serve value + gradient + Hessian curvature + the \
+             inner-solver cache from k-space sufficient statistics only, with NO \
+             per-trial n-row work.",
+            calls.get() - build_calls
+        );
+    }
+
     /// #1033 Hessian-channel primitive gate: the n-free second ψ-derivatives
     /// `d2gram_dpsi2` / `d2rhs_dpsi2` must match central FD of the analytic FIRST
     /// derivatives (`dgram_dpsi` / `drhs_dpsi`) — the curvature the outer Newton

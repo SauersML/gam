@@ -36,10 +36,10 @@ macro_rules! impl_reason_error_boilerplate {
 #[macro_export]
 macro_rules! bail_invalid_estim {
     ($fmt:literal $(, $($arg:tt)*)?) => {
-        return Err($crate::solver::estimate::EstimationError::InvalidInput(format!($fmt $(, $($arg)*)?)))
+        return Err($crate::model_types::EstimationError::InvalidInput(format!($fmt $(, $($arg)*)?)))
     };
     ($msg:expr $(,)?) => {
-        return Err($crate::solver::estimate::EstimationError::InvalidInput($msg))
+        return Err($crate::model_types::EstimationError::InvalidInput($msg))
     };
 }
 

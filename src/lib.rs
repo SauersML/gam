@@ -76,6 +76,7 @@ pub mod gpu;
 pub mod identifiability;
 pub mod inference;
 pub mod linalg;
+pub mod model_types;
 pub mod report;
 pub mod solver;
 pub mod terms;
