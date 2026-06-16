@@ -1,17 +1,8 @@
-//! Grouped integration-test crate root for sae tests (issue #1146).
+//! Grouped integration-test crate root for SAE / manifold-SAE tests (issue #1146).
 //!
-//! Former top-level crates included as modules so they link as ONE binary.
+//! The formerly-top-level `tests/sae_*.rs` crates are included here as modules so
+//! they link as ONE binary. Add new sae_* tests as a module here.
 
-#[path = "sae/behavioral_head_planted_truth.rs"]
-mod behavioral_head_planted_truth;
-#[path = "sae/dual_risk_test.rs"]
-mod dual_risk_test;
-#[path = "sae/gated_sae_decoder_heaviside_contract.rs"]
-mod gated_sae_decoder_heaviside_contract;
-#[path = "sae/jumprelu_ste.rs"]
-mod jumprelu_ste;
-#[path = "sae/sae.rs"]
-mod sae;
 #[path = "sae/sae_arrow_schur_large_scale.rs"]
 mod sae_arrow_schur_large_scale;
 #[path = "sae/sae_atom_smooth_structure_evidence.rs"]
@@ -78,9 +69,3 @@ mod sae_streaming_arrow_schur_contract;
 mod sae_torus_chart_canonicalization;
 #[path = "sae/sae_unit_speed_chart_canonicalization.rs"]
 mod sae_unit_speed_chart_canonicalization;
-#[path = "sae/scad_mcp_majorizer_contract.rs"]
-mod scad_mcp_majorizer_contract;
-#[path = "sae/softmax_entropy_majorizer_contract.rs"]
-mod softmax_entropy_majorizer_contract;
-#[path = "sae/steering_dosimetry.rs"]
-mod steering_dosimetry;

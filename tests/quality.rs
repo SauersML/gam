@@ -1,9 +1,39 @@
-//! Grouped integration-test crate root (issue #1146).
+//! Grouped integration-test crate root for quality tests (issue #1146).
 //!
-//! Each formerly-top-level `tests/quality_vs_*.rs` crate is included here as a
-//! module so the 150 quality-vs-reference tests link as ONE binary instead of
-//! 150 separate linker invocations. Add new quality_vs_* tests as a module here.
+//! Former top-level crates included as modules so they link as ONE binary.
 
+#[path = "quality/additive_models_quality_batch_f.rs"]
+mod additive_models_quality_batch_f;
+#[path = "quality/bc_quality_batch_b.rs"]
+mod bc_quality_batch_b;
+#[path = "quality/broad_sweep_batch_h.rs"]
+mod broad_sweep_batch_h;
+#[path = "quality/broad_sweep_batch_i.rs"]
+mod broad_sweep_batch_i;
+#[path = "quality/feature_correctness_sweep.rs"]
+mod feature_correctness_sweep;
+#[path = "quality/fit_quality_stress.rs"]
+mod fit_quality_stress;
+#[path = "quality/mega_batch_j.rs"]
+mod mega_batch_j;
+#[path = "quality/mega_batch_k.rs"]
+mod mega_batch_k;
+#[path = "quality/quality_competing_risks_truth_recovery.rs"]
+mod quality_competing_risks_truth_recovery;
+#[path = "quality/quality_corrected_aic_psis_loo_selection.rs"]
+mod quality_corrected_aic_psis_loo_selection;
+#[path = "quality/quality_expectile_gam_heteroscedastic_truth.rs"]
+mod quality_expectile_gam_heteroscedastic_truth;
+#[path = "quality/quality_llm_weekday_circle.rs"]
+mod quality_llm_weekday_circle;
+#[path = "quality/quality_mixture_rung_vs_reference.rs"]
+mod quality_mixture_rung_vs_reference;
+#[path = "quality/quality_re_random_slope_partial_pools_to_population.rs"]
+mod quality_re_random_slope_partial_pools_to_population;
+#[path = "quality/quality_spline_scan_vs_mgcv.rs"]
+mod quality_spline_scan_vs_mgcv;
+#[path = "quality/quality_tweedie_dispersion_location_scale_1060.rs"]
+mod quality_tweedie_dispersion_location_scale_1060;
 #[path = "quality/quality_vs_betareg_beta_logit.rs"]
 mod quality_vs_betareg_beta_logit;
 #[path = "quality/quality_vs_brute_force_loo_binomial_logit.rs"]
@@ -304,3 +334,5 @@ mod quality_vs_vgam_beta_logistic_link_parameterization;
 mod quality_vs_vgam_multinomial_smooth_by_factor;
 #[path = "quality/quality_vs_vgam_multinomial_softmax.rs"]
 mod quality_vs_vgam_multinomial_softmax;
+#[path = "quality/ws4a_end_to_end.rs"]
+mod ws4a_end_to_end;

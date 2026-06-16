@@ -1,19 +1,12 @@
 //! Grouped integration-test crate root for survival tests (issue #1146).
 //!
-//! Former top-level crates included as modules so they link as ONE binary.
+//! The formerly-top-level survival-focused crates are included here as modules
+//! so they link as ONE binary. Add new survival tests as a module here.
 
-#[path = "survival/competing_risks_survival.rs"]
-mod competing_risks_survival;
-#[path = "survival/frailty_scale_audit_plumbing.rs"]
-mod frailty_scale_audit_plumbing;
-#[path = "survival/integration_large_scale_survival_marginal_slope.rs"]
-mod integration_large_scale_survival_marginal_slope;
 #[path = "survival/pathological_tied_survival_times_no_divzero.rs"]
 mod pathological_tied_survival_times_no_divzero;
 #[path = "survival/surv_two_arg_shorthand_issue_156.rs"]
 mod surv_two_arg_shorthand_issue_156;
-#[path = "survival/survival.rs"]
-mod survival;
 #[path = "survival/survival_bug_hunt_regressions.rs"]
 mod survival_bug_hunt_regressions;
 #[path = "survival/survival_fit_from_parts_rejects_mismatched_lambda_lengths.rs"]
