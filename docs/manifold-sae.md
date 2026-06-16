@@ -302,28 +302,186 @@ Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
 `get_decoder()` / `get_anchors()`, and `to_dict` / `from_dict` / `save` /
 `load`.
 
-Structure-evidence and interpretability methods: `structure_certificate()`
-(anytime-valid e-BH certificate over structural claims — atom-exists,
-binding edges, geometry kind), `contested_claims()` /
-`contested_probe_report()` (the claims held-out data did not confirm),
-`atom_trust(k)` / `atom_diagnostics()` (per-atom trust and tangent-condition
-diagnostics), `steer(k, t_from, t_to)` (output-dosimetry steering plan along
-an atom's coordinate), and `distill_encoder(X, ...)` (train a post-hoc torch
-encoder from exact out-of-sample latent solves).
-
 ### Out-of-sample and encoder distillation (issue #357)
 
 `X=` is the data to reconstruct — it is **not** a warm start.
 To seed the joint solve from an amortized encoder's per-token prediction,
 pass `a_init` (assignment logits `(N, K)`) and/or `t_init` (coordinates
 `(K, N, D_max)`) and a small `n_iter` for a bounded refinement; read the
-converged supervision targets back with `fit.converged_latents(X)` (and the
-standalone `encode` / `project`). This enables the "encoder predicts →
-solver refines → distill the gap" loop.
+converged supervision targets back with `fit.converged_latents(X)`.
 
-## Torch mirror: `gamfit.torch.ManifoldSAE`
+The out-of-sample surface:
 
-A trainable `nn.Module` mirror of the closed-form primitive is documented in
-the [manifold smooths gallery](manifold-smooths.md#torch-side-gamfittorchmanifoldsae).
-`ManifoldSAE.fit(...)` delegates to `gamfit.sae_manifold_fit` and shares the
-Rust kernel, so the two return identical numerics on equivalent configs.
+```python
+fit.predict(X)               # (N, p) reconstruction under the frozen decoder
+fit.reconstruct(X, t_init=None, a_init=None)   # same, with optional warm starts
+gates = fit.encode(X)        # (N, K) out-of-sample gates
+gates, stats = fit.encode(X, return_stats=True)
+coords = fit.featurize(X)    # [ (N, d_k) ] per-atom coords (alias of per_atom_latent_for)
+coords = fit.per_atom_latent_for(X)
+active = fit.per_atom_active_set(X, threshold=None)  # (N, K) bool active mask
+proj_k = fit.project(X, atom_k=0)        # (N, p) single-atom reconstruction
+latents = fit.converged_latents(X)       # exact solver targets for distillation
+encoder = fit.distill_encoder(X)         # amortized torch encoder from exact solves
+```
+
+This enables the "encoder predicts → solver refines → distill the gap" loop:
+`distill_encoder` trains a post-hoc torch MLP from the exact out-of-sample
+latent solves so future inference is a single forward pass.
+
+## Steering and causal intervention
+
+`fit.steer(atom_k, t_from, t_to)` builds a **causal intervention plan** that
+moves one atom's latent coordinate from `t_from` to `t_to` and reports the
+resulting ambient delta with output dosimetry:
+
+```python
+plan = fit.steer(atom_k=3, t_from=0.1, t_to=0.4)
+plan["delta"]             # (p,) activation-space move a·(g_k(t_to) − g_k(t_from))
+plan["predicted_nats"]    # path-integrated output-Fisher KL dose (nats), or None
+plan["validity_radius"]   # latent step length the linearization is trusted to, or None
+plan["off_manifold_norm"] # component of the move off the atom's local tangents (≈0 on-manifold)
+plan["metric_provenance"] # "OutputFisher" if a Fisher metric was installed, else "Euclidean"
+```
+
+It answers "if I push token feature *k* along its manifold from here to there,
+what happens downstream, and how far can I trust that?" — the move stays on the
+atom's fitted shape, and `predicted_nats` quantifies the intervention strength
+in output-distribution terms. The KL dose and validity radius require an
+output-Fisher metric (`fisher_factors=` supplied to `sae_manifold_fit`);
+without it the geometry (`delta`, `off_manifold_norm`) is still returned but
+the dose degrades to `None`, not zero.
+
+## Certified structure (anytime-valid)
+
+The dictionary's structural claims — *does this atom exist*, *which atoms bind
+together*, *what geometry kind is each* — are adjudicated by an anytime-valid
+e-BH (Benjamini-Hochberg on e-values) certificate, so the false-discovery
+control holds under optional stopping:
+
+```python
+cert = fit.structure_certificate(alpha=0.05)   # confirmed/contested claims + e-values
+contested = fit.contested_claims(alpha=0.05)    # only the unconfirmed claims
+probes = fit.contested_probe_report(alpha=0.05) # what evidence would settle them
+```
+
+The same machinery is exposed at top level for working with raw claim ledgers:
+`gamfit.e_bh_dictionary_certificate(...)` and
+`gamfit.plan_probe_for_contested_claim(...)` (probe design for a contested
+claim). `contested_probe_report` pairs a contested claim with the probe that
+would most cheaply confirm or refute it — the design loop for active
+interpretability.
+
+## Trust, diagnostics, and curvature
+
+Per-atom trust scores fold tangent conditioning, activation frequency, and
+support into a single `[0, 1]` score:
+
+```python
+fit.atom_trust(0)            # scalar trust in [0, 1] for atom 0
+fit.atom_diagnostics(0)      # full per-atom diagnostic dict (tangent condition, ...)
+fit.coordinate_range(0)      # observed min/max/p05/p50/p95 of the atom's coords
+fit.typical_shape(0, quantile_range=(5.0, 95.0), n_sd=1.0)  # central-range curve+band
+```
+
+The top-level helpers `gamfit.sae_trust_diagnostics(payload)` and
+`gamfit.atom_trust_scores(diagnostics)` compute the same quantities from a raw
+fit payload / diagnostics mapping (for batch or offline analysis).
+
+## Supervised SAE
+
+`gamfit.sae_supervised` fits a manifold dictionary jointly with a supervised
+GLM head, so the learned atoms are predictive of a label on the rows where one
+is available (semi-supervised: `supervised_mask` selects them):
+
+```python
+fit = gamfit.sae_supervised(
+    X, Y, supervised_mask,        # (N, p) data, (N,) labels, (N,) bool mask
+    K=16, d_atom=2,
+    atom_topology="circle",       # default
+    family="auto",                # GLM family for the head; "auto" infers it
+    head_formula=None,            # optional formula over the latent coords
+    sae_kwargs=None,              # extra kwargs forwarded to sae_manifold_fit
+    fit_kwargs=None,              # extra kwargs forwarded to the head fit
+)
+```
+
+It returns a `SaeSupervisedFit` carrying `sae` (the fitted `ManifoldSAE`),
+`model` (the GLM head), `supervised_mask`, `latent_names`, `response_name`,
+`n_train`, and `n_supervised`. Methods: `fit.report()` (a metrics dict) and
+`fit.predict(X)` (label predictions through the frozen atoms + head).
+
+## Checkpoint dynamics and layer transport
+
+These track how the *same* dictionary atom moves as you sweep a third axis —
+training checkpoints or model layers — the OLMo-trajectory capability.
+
+`gamfit.sae_checkpoint_dynamics` takes a grid of per-checkpoint decoder
+evaluations and reports how each atom drifts across checkpoints with an
+anytime-valid stability test:
+
+```python
+dyn = gamfit.sae_checkpoint_dynamics(
+    decoder_grid,                 # decoder evaluations across checkpoints
+    checkpoint_ids=["step10k", "step20k", ...],
+    atom_names=["atom0", "atom1", ...],
+    latent_grid,                  # shared latent grid the atoms are evaluated on
+    alpha=0.05,
+)
+```
+
+`gamfit.layer_transport_fit` aligns one atom's coordinates between two layers,
+and `gamfit.layer_transport_ladder` chains the pairwise transports across a
+sequence of layers:
+
+```python
+t = gamfit.layer_transport_fit(coords_from, coords_to,
+                               topology_from="circle", topology_to="circle",
+                               layer_from=0, layer_to=1)
+ladder = gamfit.layer_transport_ladder(coords, topology="circle", layers=None)
+```
+
+## Cross-fit alignment
+
+`gamfit.align(fit_a, fit_b)` matches atoms between two independent fits (e.g.
+two seeds, or two checkpoints) so the same latent shape is identified across
+runs — the basis for reproducibility and trajectory analysis.
+
+## Visualization and benchmarking
+
+`gamfit.plot_atom(fit, k, ax=None)` draws one atom's fitted curve and band;
+`gamfit.plot_fit(fit)` draws the whole dictionary. `gamfit.sae_benchmark(...)`
+runs a single synthetic recovery benchmark and `gamfit.sweep_sae_benchmark()`
+sweeps the coherence/coverage/K/topology grid, returning a list of result rows.
+
+## Torch-native SAE: `gamfit.torch.ManifoldSAE`
+
+A trainable `nn.Module` (differentiable, GPU-capable) mirror of the closed-form
+primitive lives in `gamfit.torch`. Each atom is a parametric curve in ambient
+`ℝ^D`; a shared encoder produces per-atom on-manifold coordinates and
+amplitudes from each input batch.
+
+```python
+import torch
+from gamfit.torch import ManifoldSAE, ManifoldSAEConfig
+
+cfg = ManifoldSAEConfig(
+    input_dim=D, n_atoms=F, intrinsic_rank=2,    # intrinsic_rank default 2
+    atom_manifold="circle",                       # circle / cylinder / sphere / product
+    atom_basis="duchon",                          # duchon / bspline / fourier
+    basis_order=2, n_basis_per_atom=8,
+)
+sae = ManifoldSAE(cfg)
+out = sae(x)               # forward → ManifoldSAEOutput(z, x_hat, positions, ...)
+fitted = sae.fit(x, max_iter=None, random_state=0, learning_rate=None)
+```
+
+`forward` returns a `ManifoldSAEOutput` dataclass with fields `z`, `x_hat`,
+`positions`, `amplitudes`, `curves`, `gate`, `assignments`, `reml_score`,
+`lambdas`, `raw_magnitudes`. `ManifoldSAE.fit(...)` delegates to
+`gamfit.sae_manifold_fit` and shares the Rust kernel, so the closed-form and
+torch paths return identical numerics on equivalent configs. The torch-interop
+details (config fields, the closed-form `.fit()` restrictions on cylinder /
+bspline / decoder penalties) are in the
+[manifold smooths gallery](manifold-smooths.md#torch-side-gamfittorchmanifoldsae)
+and [torch interop guide](torch.md).
