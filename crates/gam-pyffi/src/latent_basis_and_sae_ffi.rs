@@ -2865,9 +2865,9 @@ fn sae_manifold_fit_inner<'py>(
     }
     // #1097 / #1103 — per-atom Riesz-debiased smooth-functional inference
     // (peak-vs-mode contrast, on-fit decoder-variation norm, data-averaged value;
-    // each with plug-in + one-step-debiased estimate, SE, penalty bias, 95% CI)
-    // and an any-n universal-inference e-value for smooth significance. One
-    // entry per fitted atom.
+    // each a plug-in + one-step-debiased POINT estimate with the removed penalty
+    // bias — #1115 dropped the coverage-claiming SE/CI) and an any-n-valid
+    // split-LRT e-value for smooth significance. One entry per fitted atom.
     out.set_item(
         "atom_inference",
         sae_atom_inference_list(py, &fit_diagnostics.atom_inference)?,
