@@ -287,21 +287,27 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
             gq <- gauss.quad.prob(128, dist = "normal", mu = 0, sigma = sigma)
             nodes <- gq$nodes
             wts <- gq$weights
-            # E[g(U)] for every row via one matrix of node evaluations.
+            # E[g(U)] for every row, fully VECTORIZED: the old per-row R `for`
+            # loop (one `exp(-M[i]*enodes)` allocation + reduction per row, per
+            # `optimize` step) was the dominant wall-clock cost of this baseline
+            # at N_TOTAL rows x 128 nodes x ~40 optimize evaluations. Replace it
+            # with a single (rows x nodes) matrix evaluated once per sigma:
+            #   base[i,j] = exp(-M[i] * exp(node_j)).
+            # The per-row L is then a single weighted matrix-vector contraction
+            # over nodes, with the event/censored cases differing only by the
+            # extra `enodes` factor. Identical math, identical likelihood — only
+            # the loop is gone.
             enodes <- exp(nodes)
-            # censored rows: L = sum_j w_j exp(-M exp(node_j))
-            # event   rows: L = h0 * sum_j w_j exp(node_j) exp(-M exp(node_j))
-            ll <- 0
-            for (i in seq_along(M)) {
-                base <- exp(-M[i] * enodes)
-                if (is_ev[i]) {
-                    Lrow <- h0 * sum(wts * enodes * base)
-                } else {
-                    Lrow <- sum(wts * base)
-                }
-                ll <- ll + log(Lrow)
-            }
-            -ll
+            # base: outer over rows (M) and nodes (enodes); R recycles M down the
+            # columns, so each column j is exp(-M * enodes[j]).
+            base <- exp(-outer(M, enodes))          # rows x nodes
+            # censored rows: L = sum_j w_j base[i,j]      => base %*% wts
+            # event   rows: L = h0 * sum_j w_j enodes[j] base[i,j]
+            #                                            => h0 * base %*% (wts*enodes)
+            L_cens <- as.numeric(base %*% wts)
+            L_ev   <- h0 * as.numeric(base %*% (wts * enodes))
+            Lrow   <- ifelse(is_ev, L_ev, L_cens)
+            -sum(log(Lrow))
         }
         opt <- optimize(negloglik, interval = c(0.05, 3.0), tol = 1e-8)
         emit("sigma_hat", opt$minimum)
