@@ -62,6 +62,7 @@ pub fn init_parallelism() {
     });
 }
 
+#[path = "main/config_resolve.rs"]
 pub mod config_resolve;
 pub mod families;
 pub mod geometry;
