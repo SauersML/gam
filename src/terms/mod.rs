@@ -76,5 +76,5 @@ pub use sae::optimality_certificate::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,
 };
-pub use sae_row_jet_program::{AtomRowBasisJet, RowGate, SaeReconstructionRowProgram};
+pub use sae::row_jet_program::{AtomRowBasisJet, RowGate, SaeReconstructionRowProgram};
 pub use sheaf::{EdgeRestriction, SheafConsistencyPenalty};
