@@ -1,4 +1,4 @@
-//! Shared primitives for the arrow-Schur solver: external imports re-exported
+//! Shared prelude for the arrow-Schur solver: external imports re-exported
 //! crate-wide, the module-level tuning constants, and the matvec function-
 //! pointer type aliases. Every sibling concern module pulls these in through
 //! `use super::*;`, preserving the single-namespace resolution the previous
