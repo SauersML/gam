@@ -8,8 +8,6 @@ use gam::types::SasLinkState;
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
 
-mod common;
-
 fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
     match freeze {
         true | false => vec![output],

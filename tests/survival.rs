@@ -12,8 +12,6 @@ mod integration_large_scale_survival_marginal_slope;
 mod pathological_tied_survival_times_no_divzero;
 #[path = "survival/surv_two_arg_shorthand_issue_156.rs"]
 mod surv_two_arg_shorthand_issue_156;
-#[path = "survival/survival.rs"]
-mod survival;
 #[path = "survival/survival_bug_hunt_regressions.rs"]
 mod survival_bug_hunt_regressions;
 #[path = "survival/survival_fit_from_parts_rejects_mismatched_lambda_lengths.rs"]

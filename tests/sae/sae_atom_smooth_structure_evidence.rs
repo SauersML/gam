@@ -227,8 +227,7 @@ fn constant_atom_does_not_accumulate_nonconstant_evidence() {
     // claim end-to-end (curved ≫ constant), not two independent thresholds.
     let curved_fit = curved_inner_fit([0.0, 0.5, 1.0], 1e-2);
     let curved_model = single_atom_model(patch_atom_with_fit("curved", curved_fit));
-    let curved_report =
-        dictionary_report(&curved_model, &ledger, 0.05).expect("dictionary report");
+    let curved_report = dictionary_report(&curved_model, &ledger, 0.05).expect("dictionary report");
     let curved_log_e = curved_report.atom_inference[0]
         .smooth_significance
         .as_ref()

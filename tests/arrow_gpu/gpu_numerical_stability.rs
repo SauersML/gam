@@ -3,7 +3,7 @@
 // of those synthetic-data fixtures, so including them would surface
 // per-binary `dead_code` warnings under the workspace's
 // `warnings = "deny"` lint policy.
-#[path = "common/gpu_gate.rs"]
+#[path = "../common/gpu_gate.rs"]
 mod gpu_gate;
 use gpu_gate::{GpuGate, gpu_gate};
 use ndarray::{Array1, Array2};

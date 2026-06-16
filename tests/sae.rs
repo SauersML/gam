@@ -10,8 +10,6 @@ mod dual_risk_test;
 mod gated_sae_decoder_heaviside_contract;
 #[path = "sae/jumprelu_ste.rs"]
 mod jumprelu_ste;
-#[path = "sae/sae.rs"]
-mod sae;
 #[path = "sae/sae_arrow_schur_large_scale.rs"]
 mod sae_arrow_schur_large_scale;
 #[path = "sae/sae_atom_smooth_structure_evidence.rs"]

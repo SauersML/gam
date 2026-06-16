@@ -20,7 +20,7 @@
 //! `--nocapture` preserves the per-fit phase summaries already emitted by
 //! the solver.
 
-#[path = "test_support/margslope_flex_equivalence.rs"]
+#[path = "../test_support/margslope_flex_equivalence.rs"]
 mod margslope_flex_equivalence;
 
 use gam::families::custom_family::BlockwiseFitOptions;

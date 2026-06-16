@@ -16,7 +16,7 @@
 //! If a test fails because the underlying GPU PIRLS fix has not yet landed,
 //! leave it as-is — it documents the gating contract.
 
-#[path = "common/gpu_gate.rs"]
+#[path = "../common/gpu_gate.rs"]
 mod gpu_gate;
 use faer::Side;
 use gam::construction::CanonicalPenalty;

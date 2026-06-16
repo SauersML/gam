@@ -9,8 +9,6 @@ use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative, second_derivative, third_derivative};
 use std::marker::PhantomData;
 
-mod common;
-
 fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
     match freeze {
         true | false => vec![output],

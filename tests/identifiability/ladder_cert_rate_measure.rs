@@ -8,7 +8,7 @@
 //! cells that fall through to 384. This test fits a flex problem and prints
 //! the per-rung histogram so the ladder's real cost is data, not faith.
 
-#[path = "test_support/margslope_flex_equivalence.rs"]
+#[path = "../test_support/margslope_flex_equivalence.rs"]
 mod margslope_flex_equivalence;
 
 use gam::families::cubic_cell_kernel::non_affine_ladder_cert_histogram;
