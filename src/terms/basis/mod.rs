@@ -36,6 +36,7 @@ mod duchon_psi_derivatives;
 mod duchon_thinplate;
 mod implicit_psi_derivative;
 mod internal;
+pub mod matern_gradient;
 mod matern_kernel;
 mod periodic_duchon;
 mod radial_jets_nd;
