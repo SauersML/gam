@@ -1122,10 +1122,22 @@ pub fn predict_competing_risks_survival(
                 out.survival[0] = (-cum_t).exp().clamp(0.0, 1.0);
             } else {
                 for (j, &t_query) in eval_times.iter().enumerate() {
-                    let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
-                    out.hazard[j] = haz_t;
-                    out.cumulative[j] = cum_t;
-                    out.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
+                    // Mirror the single-cause origin guard: every subject is
+                    // alive at the time origin, so S(0)=1, H(0)=0, h(0)=0.
+                    // Without this, the time basis floors t=0 to
+                    // SURVIVAL_TIME_FLOOR and returns a nonzero hazard, which
+                    // would anchor the Aalen-Johansen CIF assembly on a
+                    // non-unit S(0) and bias every downstream value.
+                    if t_query <= 0.0 {
+                        out.hazard[j] = 0.0;
+                        out.cumulative[j] = 0.0;
+                        out.survival[j] = 1.0;
+                    } else {
+                        let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
+                        out.hazard[j] = haz_t;
+                        out.cumulative[j] = cum_t;
+                        out.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
+                    }
                 }
                 let (eta_t, _, _) = evaluate_at(age_exit[i])?;
                 out.eta_exit = eta_t;
