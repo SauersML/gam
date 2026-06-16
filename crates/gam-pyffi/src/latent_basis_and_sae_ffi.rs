@@ -1571,7 +1571,7 @@ const SAE_SPHERE_BASIS_SIZE: usize = 7;
 const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
 
 fn seed_oos_softmax_logits_from_projection_residuals(
-    term: &mut gam::terms::sae_manifold::SaeManifoldTerm,
+    term: &mut gam::terms::sae::manifold::SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
     tau: f64,
 ) {
@@ -2442,7 +2442,7 @@ fn sae_manifold_fit_inner<'py>(
     // so the outer-cascade entry point owns the full target verbatim.
     // `sae_streaming_plan` is exposed separately as a standalone diagnostic
     // pyfunction.
-    let mut objective = gam::terms::sae_manifold::SaeManifoldOuterObjective::new(
+    let mut objective = gam::terms::sae::manifold::SaeManifoldOuterObjective::new(
         base_term,
         z_view.to_owned(),
         Some(registry),
@@ -2807,7 +2807,7 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("reml_score", loss.evidence_proxy())?;
     let reported_log_alpha = match term.assignment.mode {
-        gam::terms::sae_manifold::AssignmentMode::IBPMap { alpha, .. } => alpha.ln(),
+        gam::terms::sae::manifold::AssignmentMode::IBPMap { alpha, .. } => alpha.ln(),
         _ => alpha.ln(),
     };
     out.set_item("log_alpha", reported_log_alpha)?;

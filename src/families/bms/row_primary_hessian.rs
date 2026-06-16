@@ -981,7 +981,7 @@ impl BernoulliMarginalSlopeFamily {
                                 // The view above explicitly requested
                                 // `CubicCellMomentResidency::Host`, and the substrate's
                                 // contract (`try_build_cubic_cell_derivative_moments` in
-                                // `src/gpu/cubic_cell/mod.rs:170`) guarantees that a Host
+                                // `src/gpu/kernels/cubic_cell/mod.rs:170`) guarantees that a Host
                                 // request returns `Host(...)` even on Linux+CUDA. Reaching
                                 // this arm means the substrate's contract was violated —
                                 // a hard programming error in the GPU dispatcher, not a
