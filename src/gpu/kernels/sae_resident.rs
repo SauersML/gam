@@ -1197,10 +1197,7 @@ pub fn color_arm_variant_matrix() -> Vec<SweepVariant> {
                 let mut dim = DeviceResidentArrowShape::color_arm();
                 dim.d = d;
                 dim.basis_cols = basis_cols;
-                let seed = 0x1017_C010_0000_0000
-                    ^ (k << 16)
-                    ^ ((t_idx as u64) << 8)
-                    ^ basis_tag;
+                let seed = 0x1017_C010_0000_0000 ^ (k << 16) ^ ((t_idx as u64) << 8) ^ basis_tag;
                 variants.push(SweepVariant { dim, seed });
             }
         }

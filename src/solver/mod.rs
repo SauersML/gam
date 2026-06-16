@@ -63,8 +63,7 @@ pub use evidence::{
 };
 pub use topology_selector::{
     AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, EvidenceCertification, Headline,
-    HeldOutDensityProvider,
-    MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, STACKING_CV_FOLDS,
+    HeldOutDensityProvider, MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, STACKING_CV_FOLDS,
     TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
     TopologyAutoSelectorResult, TopologyRaceParallelCandidate, UnionRungFit, UnionRungResult,
     adjudicate_cross_class_race, build_cv_log_density_table, deterministic_cv_folds,

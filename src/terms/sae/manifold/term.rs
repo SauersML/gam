@@ -177,8 +177,6 @@ pub(crate) const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
 
 pub(crate) const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 
-pub(crate) const SAE_PRISTINE_SEED_EV_RETAIN_FLOOR: f64 = 0.95;
-
 pub(crate) const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
 
 pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;

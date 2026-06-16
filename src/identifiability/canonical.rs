@@ -1834,18 +1834,13 @@ mod tests {
             callback_owned[[i, 1]] = x[i] * x[i];
         }
 
-        // Both blocks carry a full-rank ridge penalty so the joint `[J; S]` is
-        // rank-clean. The MAP-uniqueness gate requires every null direction of
-        // `JᵀWJ` to carry penalty curvature (`nᵀSn > tol`); an unpenalised block
-        // leaves a flat direction and the reduction (correctly) refuses with
-        // MapUniquenessFailure. This test proves reduced-block ASSEMBLY does not
-        // shape-panic, NOT that an under-identified model fits, so the fixture
-        // must be identified — mirroring the multichannel sibling test.
-        let mut anchor_spec = spec_from_dense_with_priority("marginal_surface", anchor, 150);
-        anchor_spec.penalties = vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2))];
+        // Leave the shared direction unpenalised so the audit sees the real
+        // `ker(J) ∩ ker(S)` gauge direction and must quotient it through the
+        // callback wrapper. A full-rank ridge would make `[J; S]` full rank and
+        // let this test pass without exercising the reduced callback path.
+        let anchor_spec = spec_from_dense_with_priority("marginal_surface", anchor, 150);
         let mut callback_spec =
             spec_from_dense_with_priority("logslope_surface", callback_owned.clone(), 120);
-        callback_spec.penalties = vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2))];
         let raw_callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(AdditiveBlockJacobian {
             design: callback_owned.clone(),
             own_output: 0,
@@ -1858,6 +1853,20 @@ mod tests {
 
         let reduced_block = &canon.reduced_specs[1];
         let reduced_design = &reduced_block.design;
+        assert!(
+            canon
+                .audit
+                .dropped_columns
+                .iter()
+                .any(|drop| drop.block == "logslope_surface"),
+            "test must exercise a real callback-owned gauge drop; got {:?}",
+            canon.audit.dropped_columns,
+        );
+        assert_eq!(
+            reduced_design.ncols(),
+            1,
+            "callback-owned block must be reduced to the non-aliased column",
+        );
         let reduced_cb = reduced_block
             .jacobian_callback
             .as_ref()

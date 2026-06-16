@@ -125,10 +125,7 @@ impl EvVsKCurve {
     /// scanned in ascending `K` order, so this is the *cheapest* dictionary
     /// reaching the target. Returns `None` when the target is never reached.
     pub fn k_reaching(&self, target_ev: f64) -> Option<usize> {
-        self.points
-            .iter()
-            .find(|p| p.ev >= target_ev)
-            .map(|p| p.k)
+        self.points.iter().find(|p| p.ev >= target_ev).map(|p| p.k)
     }
 }
 
@@ -299,11 +296,7 @@ fn select_kneedle(curve: &EvVsKCurve, config: &KSelectionConfig, span: f64) -> K
     // Initial (steep-regime) slope: the first positive segment slope. If the
     // curve never rises, treat it as flat (handled by the span gate upstream,
     // but guard anyway).
-    let init_slope = slopes
-        .iter()
-        .copied()
-        .find(|s| *s > 0.0)
-        .unwrap_or(0.0);
+    let init_slope = slopes.iter().copied().find(|s| *s > 0.0).unwrap_or(0.0);
     if init_slope <= 0.0 {
         return KSelection {
             k: pts[0].k,
@@ -588,9 +581,8 @@ mod k_selection_tests {
     #[test]
     fn linear_curve_returns_full_k_with_flag() {
         // EV grows exactly linearly in K: no curvature, no knee.
-        let curve =
-            curve_from_pairs(&[(1, 0.10), (2, 0.20), (3, 0.30), (4, 0.40), (5, 0.50)])
-                .expect("linear curve");
+        let curve = curve_from_pairs(&[(1, 0.10), (2, 0.20), (3, 0.30), (4, 0.40), (5, 0.50)])
+            .expect("linear curve");
         let sel = select_k(&curve, &KSelectionConfig::default());
         assert_eq!(sel.flag, KSelectionFlag::Linear);
         assert_eq!(sel.k, 5, "linear curve returns the largest K");
@@ -599,14 +591,8 @@ mod k_selection_tests {
     #[test]
     fn still_climbing_curve_returns_full_k_no_knee() {
         // Concave but still steeply rising at K_max: not yet saturated.
-        let curve = curve_from_pairs(&[
-            (1, 0.10),
-            (2, 0.30),
-            (3, 0.48),
-            (4, 0.64),
-            (5, 0.78),
-        ])
-        .expect("climbing curve");
+        let curve = curve_from_pairs(&[(1, 0.10), (2, 0.30), (3, 0.48), (4, 0.64), (5, 0.78)])
+            .expect("climbing curve");
         let cfg = KSelectionConfig {
             // demand a sharp saturation (1% of initial slope) it cannot meet
             knee_slope_fraction: 0.01,
@@ -645,8 +631,16 @@ mod k_selection_tests {
         let sel = select_k(&curve, &cfg);
         // MDL trades EV gain against K/K_max=K/32. Past the knee the EV gain is
         // tiny while the size penalty keeps growing, so the optimum is interior.
-        assert!(sel.k <= 8, "MDL should not chase the saturated tail, got {}", sel.k);
-        assert!(sel.k >= 3, "MDL should not under-fit the steep rise, got {}", sel.k);
+        assert!(
+            sel.k <= 8,
+            "MDL should not chase the saturated tail, got {}",
+            sel.k
+        );
+        assert!(
+            sel.k >= 3,
+            "MDL should not under-fit the steep rise, got {}",
+            sel.k
+        );
     }
 
     #[test]
@@ -665,28 +659,19 @@ mod k_selection_tests {
     #[test]
     fn advantage_metric_rewards_manifold_compression() {
         // Manifold reaches EV 0.90 at K=4; linear needs K=16 for the same.
-        let manifold = curve_from_pairs(&[
-            (1, 0.40),
-            (2, 0.65),
-            (4, 0.90),
-            (8, 0.93),
-            (16, 0.94),
-        ])
-        .expect("manifold curve");
-        let linear = curve_from_pairs(&[
-            (1, 0.20),
-            (2, 0.35),
-            (4, 0.55),
-            (8, 0.78),
-            (16, 0.91),
-        ])
-        .expect("linear curve");
+        let manifold = curve_from_pairs(&[(1, 0.40), (2, 0.65), (4, 0.90), (8, 0.93), (16, 0.94)])
+            .expect("manifold curve");
+        let linear = curve_from_pairs(&[(1, 0.20), (2, 0.35), (4, 0.55), (8, 0.78), (16, 0.91)])
+            .expect("linear curve");
         let adv = manifold_vs_linear_advantage(&manifold, &linear, 0.90);
         assert_eq!(adv.k_manifold, Some(4));
         assert_eq!(adv.k_linear, Some(16));
         assert!(adv.manifold_dominates());
         let ratio = adv.compression_ratio.expect("both reach target");
-        assert!((ratio - 4.0).abs() < 1e-12, "expected 16/4 = 4x, got {ratio}");
+        assert!(
+            (ratio - 4.0).abs() < 1e-12,
+            "expected 16/4 = 4x, got {ratio}"
+        );
     }
 
     #[test]
@@ -747,7 +732,10 @@ mod k_selection_tests {
             [means[0], means[1]]
         ];
         let ev_mean = explained_variance(x.view(), mean_fit.view());
-        assert!(ev_mean.abs() < 1e-12, "mean baseline EV should be 0, got {ev_mean}");
+        assert!(
+            ev_mean.abs() < 1e-12,
+            "mean baseline EV should be 0, got {ev_mean}"
+        );
     }
 
     #[test]

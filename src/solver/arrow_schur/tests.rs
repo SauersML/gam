@@ -3513,6 +3513,64 @@ pub(crate) fn parallel_resident_scalar_jacobi_deterministic_and_matches_serial()
     }
 }
 
+/// The #1017 SAE-resident block-Jacobi builder must assemble the same
+/// block-diagonal Schur preconditioner as the generic block builder, without
+/// materializing each row's dense `H_tβ`. This is the block-preconditioner
+/// residency gate for per-atom blocks under `BLOCK_JACOBI_MAX_BLOCK`.
+#[test]
+pub(crate) fn resident_block_jacobi_deterministic_and_matches_generic() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
+    let q = 3usize;
+    let p = 6usize;
+    let n_atoms = 18usize;
+    let m_active = 4usize;
+    let (mut sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+    let offsets: Vec<std::ops::Range<usize>> =
+        (0..n_atoms).map(|atom| atom * p..(atom + 1) * p).collect();
+    sys.set_block_offsets(offsets.into());
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, q, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let r = Array1::from_iter((0..sys.k).map(|a| 0.3 * ((a as f64) * 0.017).sin() + 0.08));
+
+    let generic =
+        JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+            .expect("generic block Jacobi must build");
+    let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
+        .expect("SAE structure must yield a resident operator");
+    let resident_a = JacobiPreconditioner::build_block_jacobi_resident(&sys, ridge_beta, &resident)
+        .expect("resident block Jacobi a");
+    let resident_b = JacobiPreconditioner::build_block_jacobi_resident(&sys, ridge_beta, &resident)
+        .expect("resident block Jacobi b");
+
+    let out_generic = generic.apply(&r);
+    let out_a = resident_a.apply(&r);
+    let out_b = resident_b.apply(&r);
+    for a in 0..sys.k {
+        assert_eq!(
+            out_a[a].to_bits(),
+            out_b[a].to_bits(),
+            "resident block Jacobi must apply deterministically at {a}"
+        );
+    }
+    let scale = out_generic
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(1.0);
+    for a in 0..sys.k {
+        let rel = (out_a[a] - out_generic[a]).abs() / scale;
+        assert!(
+            rel < 1e-10,
+            "resident vs generic block Jacobi must agree at index {a}: \
+             {} vs {} (rel {rel:e})",
+            out_a[a],
+            out_generic[a]
+        );
+    }
+}
+
 /// The factored residency (storing `(L_i, Y_i)` and applying `G_i v =
 /// L_iᵀ(Y_i v)`) must reproduce the dense `p×p` block `G_i = L_iᵀ Y_i`
 /// exactly — this is the #1017 memory/compute win (`O(n·di·p)` vs `O(n·p²)`)
@@ -4073,6 +4131,80 @@ pub(crate) fn bench_block_jacobi_parallel_speedup() {
         sink,
     );
     assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
+}
+
+/// #1017 SAE-resident block-Jacobi build speedup bench. Times the generic
+/// block builder, which materializes each row's dense `H_tβ` from the
+/// matrix-free SAE operator, against the resident builder, which assembles
+/// per-atom blocks from the staged `(L_i, Y_i)` factors.
+///
+/// ```text
+/// cargo test --lib --release \
+///   solver::arrow_schur::tests::bench_resident_block_jacobi_speedup -- --nocapture
+/// ```
+#[test]
+pub(crate) fn bench_resident_block_jacobi_speedup() {
+    let n = 1200usize;
+    let q = 2usize;
+    let p = 16usize;
+    let n_atoms = 24usize; // border k = 384, 24 block-Jacobi blocks.
+    let m_active = 5usize;
+    let (mut sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+    let offsets: Vec<std::ops::Range<usize>> =
+        (0..n_atoms).map(|atom| atom * p..(atom + 1) * p).collect();
+    sys.set_block_offsets(offsets.into());
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, q, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let r = Array1::<f64>::ones(sys.k);
+    let calls = 3usize;
+    let mut sink = 0.0_f64;
+
+    let generic_build = || -> f64 {
+        JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
+            .expect("generic block Jacobi")
+            .apply(&r)[0]
+    };
+    sink += generic_build();
+    let t_generic = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += generic_build();
+    }
+    let generic_per = t_generic.elapsed().as_secs_f64() / calls as f64;
+
+    let resident =
+        SaeResidentReducedSchur::build(&sys, &htt_factors, &backend).expect("resident operator");
+    let resident_build = || -> f64 {
+        JacobiPreconditioner::build_block_jacobi_resident(&sys, ridge_beta, &resident)
+            .expect("resident block Jacobi")
+            .apply(&r)[0]
+    };
+    sink += resident_build();
+    let t_resident = std::time::Instant::now();
+    for _ in 0..calls {
+        sink += resident_build();
+    }
+    let resident_per = t_resident.elapsed().as_secs_f64() / calls as f64;
+
+    println!(
+        "[#1017 SAE resident block-Jacobi build, n={n} q={q} p={p} k={} \
+             m={m_active}, {} blocks, {calls} calls, {} rayon threads]\n  \
+             generic materialize: {:.3} ms/call\n  resident factors:    {:.3} ms/call\n  \
+             speedup:             {:.2}x  (sink {:.3e})",
+        sys.k,
+        sys.block_offsets.len(),
+        rayon::current_num_threads(),
+        generic_per * 1e3,
+        resident_per * 1e3,
+        generic_per / resident_per,
+        sink,
+    );
+    assert!(
+        generic_per > 0.0 && resident_per > 0.0,
+        "timings must be positive"
+    );
 }
 
 /// #1017 scalar-Jacobi build parallelism: `build_scalar_jacobi` (the scalar-

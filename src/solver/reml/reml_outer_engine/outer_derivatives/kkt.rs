@@ -50,10 +50,13 @@ pub(crate) struct KktThetaCorrections {
 /// `drift_apply(i, v) = A_i v` closure, so the SAME algebra produces every
 /// block — there is no separate ρ-only and ψ-only code path to drift apart.
 ///
-/// With `q = K r`:
+/// With `q = K r` and frozen first derivatives over this correction layer:
 ///   C_i  = −r_iᵀ q + ½ qᵀ A_i q,
 ///   q_j  = K(r_j − A_j q),
-///   C_ij = −δ_ij r_iᵀ q − r_iᵀ q_j + q_jᵀ A_i q + ½ δ_ij qᵀ A_i q.
+///   C_ij = −r_iᵀ q_j + q_jᵀ A_i q.
+/// Coordinate-curvature terms such as `∂²r/∂ρ²` and `∂²H/∂ρ²` belong to the
+/// outer pair assembly (`pair_a` / `h2_trace`) that already differentiates the
+/// log-λ coordinate map. Adding them again here over-corrects the ρρ diagonal.
 /// The dense/operator outer Hessian already carries the exact-KKT profile term
 /// `−r_iᵀ K r_j` for EVERY block (ρρ via the penalty profile, ρψ/ψψ via the
 /// IFT profile `a_iᵀ K a_j` in `outer_hessian_entry`), valid only at `r = 0`,
@@ -157,16 +160,17 @@ where
 
         // C_ij + (exact-KKT profile term r_iᵀ K r_j that the dense/operator
         // outer Hessian already subtracted). `a_solutions[j] = K r_j`, so the
-        // profile term is `r_iᵀ a_solutions[j]`.
+        // profile term is `r_iᵀ a_solutions[j]`. Coordinate second-derivative
+        // terms are intentionally absent here; the outer pair assembly owns
+        // them, and duplicating them in this residual-only correction inflates
+        // the diagonal.
         let entry = |i: usize, j: usize| -> f64 {
             if active[i] || active[j] {
                 return 0.0;
             }
-            let delta = if i == j { 1.0 } else { 0.0 };
             let cancel_exact_kkt_profile_term = score_derivs[i].dot(&a_solutions[j]);
-            cancel_exact_kkt_profile_term - delta * r_i_dot_q[i] - score_derivs[i].dot(&q_derivs[j])
+            cancel_exact_kkt_profile_term - score_derivs[i].dot(&q_derivs[j])
                 + q_derivs[j].dot(&a_i_qs[i])
-                + 0.5 * delta * q_a_i_q[i]
         };
 
         let mut h = Array2::<f64>::zeros((m, m));

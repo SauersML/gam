@@ -73,8 +73,7 @@ pub(crate) struct OuterConfig {
     /// seed-prefix key so the next fit with related structure can warm-start
     /// from this one, even after an interrupted run.
     pub(crate) cache_mirror_sessions: Vec<Arc<CacheSession>>,
-    pub(crate) rho_uncertainty_problem_size:
-        crate::rho_uncertainty::RhoUncertaintyProblemSize,
+    pub(crate) rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
     /// Set by the persistent-cache resume path (`run`) when the outer seed
     /// originates from a warm-start cache *hit* — i.e. `config.initial_rho`
     /// (and, since 0.1.204, the inner β) was populated from a prior fit's
@@ -413,11 +412,10 @@ impl OuterProblem {
     }
 
     pub fn with_problem_size(mut self, n_obs: usize, p_coefficients: usize) -> Self {
-        self.rho_uncertainty_problem_size =
-            crate::rho_uncertainty::RhoUncertaintyProblemSize {
-                n_obs: Some(n_obs),
-                p_coefficients: Some(p_coefficients),
-            };
+        self.rho_uncertainty_problem_size = crate::rho_uncertainty::RhoUncertaintyProblemSize {
+            n_obs: Some(n_obs),
+            p_coefficients: Some(p_coefficients),
+        };
         self
     }
 
@@ -880,8 +878,7 @@ pub struct OuterResult {
     /// Post-fit PSIS diagnostic for whether sampled smoothing-parameter weights
     /// show evidence that plug-in REML/LAML intervals are unreliable. Populated
     /// once by [`run_outer`] when the exact rho Hessian is cheap enough to use.
-    pub rho_uncertainty_diagnostic:
-        Option<crate::rho_uncertainty::RhoUncertaintyDiagnostic>,
+    pub rho_uncertainty_diagnostic: Option<crate::rho_uncertainty::RhoUncertaintyDiagnostic>,
 }
 
 impl OuterResult {

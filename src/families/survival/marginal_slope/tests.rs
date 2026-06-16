@@ -1631,9 +1631,33 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
         g: f64,
     }
     let fixtures = [
-        Fix { event: 1.0, weight: 0.75, z: -0.2, q0: -0.4, q1: 0.6, qd1: 0.85, g: 0.32 },
-        Fix { event: 0.0, weight: 1.35, z: -1.15, q0: -1.35, q1: -0.9, qd1: 0.42, g: -0.55 },
-        Fix { event: 1.0, weight: 0.9, z: 0.7, q0: 0.15, q1: 1.05, qd1: 0.6, g: 0.45 },
+        Fix {
+            event: 1.0,
+            weight: 0.75,
+            z: -0.2,
+            q0: -0.4,
+            q1: 0.6,
+            qd1: 0.85,
+            g: 0.32,
+        },
+        Fix {
+            event: 0.0,
+            weight: 1.35,
+            z: -1.15,
+            q0: -1.35,
+            q1: -0.9,
+            qd1: 0.42,
+            g: -0.55,
+        },
+        Fix {
+            event: 1.0,
+            weight: 0.9,
+            z: 0.7,
+            q0: 0.15,
+            q1: 1.05,
+            qd1: 0.6,
+            g: 0.45,
+        },
     ];
 
     for fix in &fixtures {
@@ -1669,9 +1693,18 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
         // primary NLL reduces to the rigid closed form so the rigid Tower4 is the
         // exact independent truth on the (q0,q1,qd1,g) block.
         let block_states = vec![
-            ParameterBlockState { beta: Array1::zeros(1), eta: Array1::zeros(1) },
-            ParameterBlockState { beta: Array1::zeros(0), eta: Array1::zeros(1) },
-            ParameterBlockState { beta: Array1::zeros(0), eta: array![fix.g] },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![fix.g],
+            },
             ParameterBlockState {
                 beta: Array1::zeros(score_runtime.basis_dim()),
                 eta: Array1::zeros(1),
@@ -1729,7 +1762,8 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
                     assert!(
                         (got - want).abs() <= 1e-7 * scale,
                         "third[{u},{v}] flex {got:+.9e} != independent rigid tower {want:+.9e} (z={}, event={})",
-                        fix.z, fix.event
+                        fix.z,
+                        fix.event
                     );
                 }
             }
@@ -1775,7 +1809,8 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
                     assert!(
                         (got - want).abs() <= 1e-6 * scale,
                         "fourth[{u},{v}] flex {got:+.9e} != independent rigid tower {want:+.9e} (z={}, event={})",
-                        fix.z, fix.event
+                        fix.z,
+                        fix.event
                     );
                 }
             }
@@ -1861,8 +1896,12 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
 
     // Small, distinct non-zero deviation coefficients so every basis column
     // carries signal into the derivative chain.
-    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
-    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+    let beta_h0: Vec<f64> = (0..h_dim)
+        .map(|k| 0.04 * ((k as f64 + 1.3).sin()))
+        .collect();
+    let beta_w0: Vec<f64> = (0..w_dim)
+        .map(|k| 0.035 * ((k as f64 + 0.7).cos()))
+        .collect();
 
     // ── Independent basis evaluations (raw design rows · β) ──────────────────
     let warp_eval = |beta_h: &[f64], z: f64| -> f64 {
@@ -1954,7 +1993,10 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         let log_phi_eta1 = -0.5 * (eta1 * eta1 + tau_ln);
         let log_phi_q1 = -0.5 * (q1 * q1 + tau_ln);
         weight
-            * (log_surv0 - (1.0 - event) * log_surv1 - event * log_phi_eta1 - event * chi1.ln()
+            * (log_surv0
+                - (1.0 - event) * log_surv1
+                - event * log_phi_eta1
+                - event * chi1.ln()
                 - event * log_phi_q1
                 + event * d1.ln()
                 - event * qd1.ln())
@@ -1975,11 +2017,26 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
 
     // ── De-risk: witness scalar NLL must match the production scalar value ───
     let block_states = vec![
-        ParameterBlockState { beta: Array1::zeros(1), eta: array![0.0] },
-        ParameterBlockState { beta: Array1::zeros(0), eta: array![0.0] },
-        ParameterBlockState { beta: Array1::zeros(0), eta: array![gv] },
-        ParameterBlockState { beta: Array1::from(beta_h0.clone()), eta: array![0.0] },
-        ParameterBlockState { beta: Array1::from(beta_w0.clone()), eta: array![0.0] },
+        ParameterBlockState {
+            beta: Array1::zeros(1),
+            eta: array![0.0],
+        },
+        ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: array![0.0],
+        },
+        ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: array![gv],
+        },
+        ParameterBlockState {
+            beta: Array1::from(beta_h0.clone()),
+            eta: array![0.0],
+        },
+        ParameterBlockState {
+            beta: Array1::from(beta_w0.clone()),
+            eta: array![0.0],
+        },
     ];
     let prod_value = family
         .row_neglog_flex_value(0, &block_states)
@@ -7135,11 +7192,26 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
         let sd = score_runtime.basis_dim();
         let ld = link_runtime.basis_dim();
         let bs = vec![
-            ParameterBlockState { beta: Array1::zeros(1), eta: Array1::zeros(1) },
-            ParameterBlockState { beta: Array1::zeros(0), eta: Array1::zeros(1) },
-            ParameterBlockState { beta: Array1::zeros(0), eta: array![g] },
-            ParameterBlockState { beta: Array1::zeros(sd), eta: Array1::zeros(1) },
-            ParameterBlockState { beta: Array1::zeros(ld), eta: Array1::zeros(1) },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![g],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(sd),
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(ld),
+                eta: Array1::zeros(1),
+            },
         ];
         (family, bs)
     };
@@ -7176,8 +7248,18 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
 
     // Independent FD of flex Hessian along dir4 (central, Richardson).
     let fd_dir = |h: f64| -> Array2<f64> {
-        let hp = flex_hess(q0 + h * dir4[0], q1 + h * dir4[1], qd1 + h * dir4[2], gv + h * dir4[3]);
-        let hm = flex_hess(q0 - h * dir4[0], q1 - h * dir4[1], qd1 - h * dir4[2], gv - h * dir4[3]);
+        let hp = flex_hess(
+            q0 + h * dir4[0],
+            q1 + h * dir4[1],
+            qd1 + h * dir4[2],
+            gv + h * dir4[3],
+        );
+        let hm = flex_hess(
+            q0 - h * dir4[0],
+            q1 - h * dir4[1],
+            qd1 - h * dir4[2],
+            gv - h * dir4[3],
+        );
         (&hp - &hm) / (2.0 * h)
     };
     let fd_coarse = fd_dir(1e-3);

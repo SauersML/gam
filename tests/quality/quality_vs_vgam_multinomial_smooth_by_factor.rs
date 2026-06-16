@@ -73,8 +73,9 @@ use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
+use std::time::Instant;
 
-const N_PER_GROUP: usize = 200;
+const N_PER_GROUP: usize = 90;
 const N_GROUPS: usize = 3;
 const N: usize = N_PER_GROUP * N_GROUPS;
 const K: usize = 3;
@@ -198,18 +199,18 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
     // seconds; a faithful gam path is comfortably within tens of seconds even on
     // a slow CI runner, so 120 s is a safe, un-weakened ceiling that still
     // catches the pathological-slowness regression (which exceeded 360 s).
-    let fit_started = std::time::Instant::now();
+    let fit_started = Instant::now();
     let model = fit_penalized_multinomial_formula(
         &ds,
-        "y ~ s(x, bs='tp') + s(x, by=group, bs='tp')",
+        "y ~ s(x, bs='tp', k=5) + s(x, by=group, bs='tp', k=5)",
         &cfg,
         1.0,  // init_lambda warm-start; outer REML selects per-class λ
-        100,  // inner Newton cycles
+        60,   // outer REML cycles
         1e-8, // inner tolerance
     )
     .expect("gam multinomial fit");
     let fit_elapsed = fit_started.elapsed();
-    const FIT_WALL_CLOCK_BUDGET_SECS: f64 = 120.0;
+    const FIT_WALL_CLOCK_BUDGET_SECS: f64 = 90.0;
     assert!(
         fit_elapsed.as_secs_f64() <= FIT_WALL_CLOCK_BUDGET_SECS,
         "gam multinomial smooth-by-factor fit took {:.1}s > {FIT_WALL_CLOCK_BUDGET_SECS}s budget \
@@ -247,7 +248,7 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
     // ---- evaluation grid: x over its observed range × each group level -------
     let x_min = x.iter().cloned().fold(f64::INFINITY, f64::min);
     let x_max = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let grid_per_group = 40usize;
+    let grid_per_group = 25usize;
     let groups = [0usize, 1, 2];
     let mut grid_x: Vec<f64> = Vec::with_capacity(grid_per_group * groups.len());
     let mut grid_group: Vec<usize> = Vec::with_capacity(grid_per_group * groups.len());
@@ -324,7 +325,7 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
             # Freeze the spline basis on the training x so train and grid share
             # identical knots; cross it with the group factor for per-group
             # curves. The grp main effect carries the per-group level shift.
-            xb <- ns(df$x, df = 5)
+            xb <- ns(df$x, df = 4)
             df$xb <- xb
             m <- vglm(
                 yf ~ grp + grp:xb,

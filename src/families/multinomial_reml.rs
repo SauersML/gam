@@ -1107,8 +1107,7 @@ impl MultinomialFamily {
                         let mut ddp_hat = vec![0.0_f64; m];
                         for c in 0..m {
                             let pc = probs_full[[row, c]];
-                            ddp_hat[c] =
-                                dp_v_hat[c] * (d_eta_u[[row, c]] - s_u) - pc * ds_u_dv;
+                            ddp_hat[c] = dp_v_hat[c] * (d_eta_u[[row, c]] - s_u) - pc * ds_u_dv;
                         }
                         // Ĵ²_{a0}[c,d] (the X[row,i0]-free per-row second jet),
                         // matching `second_directional_fisher_jet` term-for-term.
@@ -1458,10 +1457,9 @@ impl CustomFamily for MultinomialFamily {
         // per-axis `second_directional_fisher_jet → dense_block_xtwx` route up to
         // row-sum associativity, for a single Gram-assembly cost instead of `p`.
         let eta = self.collect_eta_matrix(block_states)?;
-        Ok(Some(self.assemble_all_axis_second_directional_derivatives(
-            eta.view(),
-            d_beta_u_flat,
-        )?))
+        Ok(Some(
+            self.assemble_all_axis_second_directional_derivatives(eta.view(), d_beta_u_flat)?,
+        ))
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
@@ -1860,8 +1858,9 @@ mod tests {
         let design = family.design.view();
         let block_states: Vec<ParameterBlockState> = (0..m)
             .map(|a| {
-                let beta =
-                    Array1::<f64>::from_shape_fn(p, |i| 0.25 * ((a + 1) as f64) - 0.13 * (i as f64));
+                let beta = Array1::<f64>::from_shape_fn(p, |i| {
+                    0.25 * ((a + 1) as f64) - 0.13 * (i as f64)
+                });
                 let eta = Array1::<f64>::from_shape_fn(n, |row| {
                     (0..p).map(|i| design[[row, i]] * beta[i]).sum()
                 });
@@ -1872,7 +1871,9 @@ mod tests {
         let dim = m * p;
 
         // A non-trivial first direction δ (not a canonical axis).
-        let delta = Array1::<f64>::from_shape_fn(dim, |i| 0.4 - 0.07 * (i as f64) + 0.03 * ((i * i) as f64).cos());
+        let delta = Array1::<f64>::from_shape_fn(dim, |i| {
+            0.4 - 0.07 * (i as f64) + 0.03 * ((i * i) as f64).cos()
+        });
 
         // Batched: all axes in one pass.
         let batched = family

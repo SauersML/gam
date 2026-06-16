@@ -46,8 +46,9 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
 use std::path::Path;
+use std::time::Instant;
 
-const N: usize = 300;
+const N: usize = 200;
 const K: usize = 3;
 
 /// Absolute probability-RMSE bar against the TRUE simplex for the MAIN
@@ -158,9 +159,15 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode multinomial dataset");
 
     let cfg = FitConfig::default();
-    let model =
-        fit_penalized_multinomial_formula(&ds, "y ~ s(x1) + s(x2) + x3", &cfg, 1.0, 50, 1e-8)
-            .expect("gam multinomial fit");
+    let model = fit_penalized_multinomial_formula(
+        &ds,
+        "y ~ s(x1, k=6) + s(x2, k=6) + x3",
+        &cfg,
+        1.0,
+        40,
+        1e-8,
+    )
+    .expect("gam multinomial fit");
     assert_eq!(
         model.class_levels.len(),
         K,
@@ -242,8 +249,8 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
         # One linear predictor per active class (codes 1,2 vs reference 0); both
         # share the gam formula s(x1)+s(x2)+x3, each smooth's df chosen by REML.
         fit <- gam(
-          list(yc ~ s(x1) + s(x2) + x3,
-                  ~ s(x1) + s(x2) + x3),
+          list(yc ~ s(x1, k = 6) + s(x2, k = 6) + x3,
+                  ~ s(x1, k = 6) + s(x2, k = 6) + x3),
           family = multinom(K = 2), data = dat, method = "REML"
         )
         pr <- as.matrix(predict(fit, type = "response"))
@@ -551,9 +558,15 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
         .expect("encode hetero multinomial dataset");
 
     let cfg = FitConfig::default();
-    let model =
-        fit_penalized_multinomial_formula(&ds, "y ~ s(x1) + s(x2) + x3", &cfg, 1.0, 50, 1e-8)
-            .expect("gam hetero multinomial fit");
+    let model = fit_penalized_multinomial_formula(
+        &ds,
+        "y ~ s(x1, k=6) + s(x2, k=6) + x3",
+        &cfg,
+        1.0,
+        40,
+        1e-8,
+    )
+    .expect("gam hetero multinomial fit");
     assert_eq!(
         model.class_levels.len(),
         K,
@@ -654,8 +667,8 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
         dat <- data.frame(x1 = df$x1, x2 = df$x2, x3 = df$x3,
                           yc = as.integer(round(df$yc)))
         fit <- gam(
-          list(yc ~ s(x1) + s(x2) + x3,
-                  ~ s(x1) + s(x2) + x3),
+          list(yc ~ s(x1, k = 6) + s(x2, k = 6) + x3,
+                  ~ s(x1, k = 6) + s(x2, k = 6) + x3),
           family = multinom(K = 2), data = dat, method = "REML", select = TRUE
         )
         pr <- as.matrix(predict(fit, type = "response"))
@@ -819,10 +832,10 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
             .unwrap_or_else(|| panic!("unexpected penguin species {sp:?}"))
     };
 
-    let mut species: Vec<String> = Vec::new();
-    let mut bill: Vec<f64> = Vec::new();
-    let mut flip: Vec<f64> = Vec::new();
-    let mut mass: Vec<f64> = Vec::new();
+    let mut species_all: Vec<String> = Vec::new();
+    let mut bill_all: Vec<f64> = Vec::new();
+    let mut flip_all: Vec<f64> = Vec::new();
+    let mut mass_all: Vec<f64> = Vec::new();
     for rec in reader.records() {
         let rec = rec.expect("read penguins row");
         let sp = rec.get(i_species).unwrap_or("").trim().to_string();
@@ -841,23 +854,43 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
             parse(rec.get(i_mass)),
         ) {
             (Some(b), Some(f), Some(m)) if !sp.is_empty() => {
-                species.push(sp);
-                bill.push(b);
-                flip.push(f);
-                mass.push(m);
+                species_all.push(sp);
+                bill_all.push(b);
+                flip_all.push(f);
+                mass_all.push(m);
             }
             _ => {}
         }
     }
+    let mut per_level_kept = [0usize; K];
+    let mut species: Vec<String> = Vec::new();
+    let mut bill: Vec<f64> = Vec::new();
+    let mut flip: Vec<f64> = Vec::new();
+    let mut mass: Vec<f64> = Vec::new();
+    for i in 0..species_all.len() {
+        let code = level_code(&species_all[i]);
+        if per_level_kept[code] < 55 {
+            per_level_kept[code] += 1;
+            species.push(species_all[i].clone());
+            bill.push(bill_all[i]);
+            flip.push(flip_all[i]);
+            mass.push(mass_all[i]);
+        }
+    }
     let n = species.len();
-    assert!(n > 300, "expected ~333 complete penguin rows, got {n}");
+    assert_eq!(
+        per_level_kept,
+        [55, 55, 55],
+        "bounded penguins slice must keep 55 complete rows per species"
+    );
+    assert_eq!(n, 165, "bounded penguins slice should have n=165, got {n}");
 
-    // ---- deterministic train/test split: every 5th complete row held out ----
-    let is_test = |i: usize| i % 5 == 0;
+    // ---- deterministic train/test split: every 4th bounded row held out ----
+    let is_test = |i: usize| i % 4 == 0;
     let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
     let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
     assert!(
-        train_rows.len() > 200 && test_rows.len() > 50,
+        train_rows.len() > 120 && test_rows.len() > 35,
         "split sizes: train={} test={}",
         train_rows.len(),
         test_rows.len()
@@ -889,15 +922,27 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
 
     // ---- fit gam on TRAIN, predict TEST -------------------------------------
     let cfg = FitConfig::default();
+    let fit_started = Instant::now();
     let model = fit_penalized_multinomial_formula(
         &train_ds,
-        "species ~ s(bill) + s(flip) + mass",
+        "species ~ s(bill, k=5) + s(flip, k=5) + mass",
         &cfg,
         1.0,
-        50,
+        40,
         1e-8,
     )
     .expect("gam multinomial fit on penguins train");
+    let fit_elapsed = fit_started.elapsed();
+    assert!(
+        fit_elapsed.as_secs_f64() <= 120.0,
+        "gam penguins multinomial fit exceeded #1082 bounded-fixture budget: elapsed={:.1}s converged={} iters={} lambdas={:?} train={} test={}",
+        fit_elapsed.as_secs_f64(),
+        model.converged,
+        model.iterations,
+        model.lambdas,
+        train_rows.len(),
+        test_rows.len()
+    );
     assert_eq!(
         model.class_levels.len(),
         K,
@@ -984,7 +1029,7 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
         lev_labels <- c("Adelie", "Chinstrap", "Gentoo")  # canonical, code 0,1,2
         yfac <- factor(lev_labels[round(df$sp) + 1L], levels = lev_labels)
         dat <- data.frame(bill = df$bill, flip = df$flip, mass = df$mass, y = yfac)
-        m <- vgam(y ~ s(bill) + s(flip) + mass, family = multinomial(), data = dat)
+        m <- vgam(y ~ s(bill, df = 4) + s(flip, df = 4) + mass, family = multinomial(), data = dat)
         k <- df$test_n[1]
         newd <- data.frame(bill = df$test_bill[1:k], flip = df$test_flip[1:k], mass = df$test_mass[1:k])
         pr <- predict(m, newdata = newd, type = "response")

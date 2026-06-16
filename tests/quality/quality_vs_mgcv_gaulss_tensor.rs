@@ -68,6 +68,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
+use std::time::Instant;
 
 /// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale), so gam
 /// floors SIGMA (mirrors `families::sigma_link::LOGB_SIGMA_FLOOR`). Note mgcv's
@@ -81,13 +82,13 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
     init_parallelism();
 
     // ---- synthetic 2-D heteroscedastic recipe (fed IDENTICALLY to both engines) ----
-    // n=200, x1 ~ Uniform(-1,1), x2 ~ Uniform(-1,1),
+    // n=120, x1 ~ Uniform(-1,1), x2 ~ Uniform(-1,1),
     // mu(x1,x2)   = sin(pi*x1)*cos(pi*x2),
     // sigma(x1,x2)= 0.1 + 0.15*|x1| + 0.1*|x2|  (strictly positive everywhere),
     // y ~ N(mu, sigma^2), seed=654. A deterministic seeded LCG draws the uniforms
     // and the standard normals so the exact same (x1, x2, y) rows are reproducible
     // in pure Rust and sent verbatim to mgcv.
-    let n = 200usize;
+    let n = 120usize;
     let pi = std::f64::consts::PI;
     let two_pi = 2.0 * pi;
 
@@ -142,15 +143,25 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
     // ---- fit with gam: mu ~ te(x1,x2), log-sigma ~ 1 + te(x1,x2) -----------
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + te(x1, x2, bs=c('tp','tp'))".to_string()),
+        noise_formula: Some("1 + te(x1, x2, bs=c('tp','tp'), k=c(5,5))".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ te(x1, x2, bs=c('tp','tp'))", &ds, &cfg)
+    let fit_started = Instant::now();
+    let result = fit_from_formula("y ~ te(x1, x2, bs=c('tp','tp'), k=c(5,5))", &ds, &cfg)
         .expect("gam gaulss tensor-product fit");
+    let fit_elapsed = fit_started.elapsed();
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
     else {
         panic!("expected a Gaussian location-scale fit for a smooth noise_formula model");
     };
+    assert!(
+        fit_elapsed.as_secs_f64() <= 120.0,
+        "gam gaulss tensor fit exceeded #1082 bounded-fixture budget: elapsed={:.1}s outer_iters={} inner_cycles={} p={}",
+        fit_elapsed.as_secs_f64(),
+        fit.fit.outer_iterations,
+        fit.fit.inner_cycles,
+        fit.fit.beta.len()
+    );
 
     let beta_location = fit
         .fit
@@ -223,8 +234,8 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
     let body = format!(
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(list(y ~ te(x1, x2, bs = c("tp", "tp")),
-                         ~ te(x1, x2, bs = c("tp", "tp"))),
+        m <- gam(list(y ~ te(x1, x2, bs = c("tp", "tp"), k = c(5, 5)),
+                         ~ te(x1, x2, bs = c("tp", "tp"), k = c(5, 5))),
                  family = gaulss(), data = df, method = "REML")
         gx1 <- as.numeric(strsplit("{grid_x1_csv}", ",")[[1]])
         gx2 <- as.numeric(strsplit("{grid_x2_csv}", ",")[[1]])

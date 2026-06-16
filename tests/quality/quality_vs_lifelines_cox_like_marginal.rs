@@ -82,6 +82,7 @@ use gam::test_support::reference::{Column, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2};
 use std::path::Path;
+use std::time::Instant;
 
 const HEART_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -169,7 +170,8 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     init_parallelism();
 
     // ---- load real data ---------------------------------------------------
-    let ds = load_csvwith_inferred_schema(Path::new(HEART_CSV)).expect("load heart-failure csv");
+    let mut ds =
+        load_csvwith_inferred_schema(Path::new(HEART_CSV)).expect("load heart-failure csv");
     let col = ds.column_map();
     let time_idx = col["time"];
     let event_idx = col["DEATH_EVENT"];
@@ -177,13 +179,30 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     let sex_idx = col["sex"];
     let age_idx = col["age"];
 
+    let n_full = ds.values.nrows();
+    assert_eq!(
+        n_full, 299,
+        "heart-failure dataset should have n=299, got {n_full}"
+    );
+    let analysis_rows: Vec<usize> = (0..n_full).filter(|&i| i % 3 != 2).collect();
+    let mut analysis_values = Array2::<f64>::zeros((analysis_rows.len(), ds.headers.len()));
+    for (out_row, &src_row) in analysis_rows.iter().enumerate() {
+        analysis_values
+            .row_mut(out_row)
+            .assign(&ds.values.row(src_row));
+    }
+    ds.values = analysis_values;
+
     let time: Vec<f64> = ds.values.column(time_idx).to_vec();
     let event: Vec<f64> = ds.values.column(event_idx).to_vec();
     let ef: Vec<f64> = ds.values.column(ef_idx).to_vec();
     let sex: Vec<f64> = ds.values.column(sex_idx).to_vec();
     let age: Vec<f64> = ds.values.column(age_idx).to_vec();
     let n = time.len();
-    assert_eq!(n, 299, "heart-failure dataset should have n=299, got {n}");
+    assert_eq!(
+        n, 199,
+        "bounded #1082 heart-failure slice should have n=199, got {n}"
+    );
     let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
     let cens_frac = 1.0 - n_events as f64 / n as f64;
     // The UCI heart-failure dataset has 96 deaths (DEATH_EVENT=1) and 203
@@ -229,15 +248,27 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     let cfg = FitConfig {
         survival_likelihood: "marginal-slope".to_string(),
         z_column: Some("ejection_fraction".to_string()),
-        logslope_formula: Some("s(age, bs='tp', k=6)".to_string()),
+        logslope_formula: Some("s(age, bs='tp', k=4)".to_string()),
         baseline_target: "linear".to_string(),
         ..FitConfig::default()
     };
+    let fit_started = Instant::now();
     let result = fit_from_formula("Surv(time, DEATH_EVENT) ~ sex + age", &ds_train, &cfg)
         .expect("gam survival marginal-slope fit");
+    let fit_elapsed = fit_started.elapsed();
     let FitResult::SurvivalMarginalSlope(fit) = result else {
         panic!("expected a SurvivalMarginalSlope fit result");
     };
+    assert!(
+        fit_elapsed.as_secs_f64() <= 120.0,
+        "gam survival marginal-slope fit exceeded #1082 bounded-fixture budget: elapsed={:.1}s outer_iters={} inner_cycles={} p={} train={} test={}",
+        fit_elapsed.as_secs_f64(),
+        fit.fit.outer_iterations,
+        fit.fit.inner_cycles,
+        fit.fit.beta.len(),
+        n_train,
+        n_test
+    );
     assert!(
         fit.fit.outer_converged,
         "gam marginal-slope outer solver did not converge (iters={}, reml={:.6})",

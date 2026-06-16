@@ -3271,8 +3271,14 @@ mod empirical_flex_jet_oracle_tests {
         // Degree-3 I-spline needs >=8 knots; 8 uniform knots over [-2.5, 2.5]
         // keep the basis low-dimensional and well-conditioned (order-2 drop).
         let knots = Array1::from_vec(vec![
-            -2.5_f64, -1.785_714_3, -1.071_428_6, -0.357_142_9, 0.357_142_9, 1.071_428_6,
-            1.785_714_3, 2.5,
+            -2.5_f64,
+            -1.785_714_3,
+            -1.071_428_6,
+            -0.357_142_9,
+            0.357_142_9,
+            1.071_428_6,
+            1.785_714_3,
+            2.5,
         ]);
         DeviationRuntime::try_new(knots, 0.0, 2).expect("deviation runtime")
     }

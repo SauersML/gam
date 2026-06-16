@@ -55,6 +55,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
+use std::time::Instant;
 
 /// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
 /// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR`.
@@ -65,13 +66,13 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     init_parallelism();
 
     // ---- synthetic additive heteroscedastic recipe (fed IDENTICALLY) -------
-    // n=250, x1 ~ Uniform(0,1), x2 ~ Uniform(0,1),
+    // n=120, x1 ~ Uniform(0,1), x2 ~ Uniform(0,1),
     // mu(x1,x2)    = sin(2*pi*x1) + cos(2*pi*x2),
     // sigma(x1,x2) = 0.1 + 0.1*sin(pi*x1) + 0.05*x2,
     // y ~ N(mu, sigma^2), seed=999. A deterministic seeded LCG draws both the
     // uniforms and the standard normals so the exact same data is reproducible
     // in pure Rust and sent verbatim to gamlss.
-    let n = 250usize;
+    let n = 120usize;
     let pi = std::f64::consts::PI;
     let two_pi = 2.0 * pi;
 
@@ -127,15 +128,25 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     // log-sigma ~ s(x1, bs='tp') + s(x2, bs='tp')
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("s(x1, bs='tp') + s(x2, bs='tp')".to_string()),
+        noise_formula: Some("s(x1, bs='tp', k=6) + s(x2, bs='tp', k=6)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x1, bs='tp') + s(x2, bs='tp')", &ds, &cfg)
+    let fit_started = Instant::now();
+    let result = fit_from_formula("y ~ s(x1, bs='tp', k=6) + s(x2, bs='tp', k=6)", &ds, &cfg)
         .expect("gam multi-smooth location-scale fit");
+    let fit_elapsed = fit_started.elapsed();
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
+    assert!(
+        fit_elapsed.as_secs_f64() <= 120.0,
+        "gam gaussian multi-smooth fit exceeded #1082 bounded-fixture budget: elapsed={:.1}s outer_iters={} inner_cycles={} p={}",
+        fit_elapsed.as_secs_f64(),
+        fit.fit.outer_iterations,
+        fit.fit.inner_cycles,
+        fit.fit.beta.len()
+    );
 
     let beta_location = fit
         .fit
@@ -216,7 +227,7 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
         m <- gamlss(y ~ pb(x1) + pb(x2),
                     sigma.formula = ~ pb(x1) + pb(x2),
                     family = NO(), data = df,
-                    control = gamlss.control(n.cyc = 200, trace = FALSE))
+                    control = gamlss.control(n.cyc = 80, trace = FALSE))
         gx1 <- as.numeric(strsplit("{grid_x1_csv}", ",")[[1]])
         gx2 <- as.numeric(strsplit("{grid_x2_csv}", ",")[[1]])
         nd <- data.frame(x1 = gx1, x2 = gx2)

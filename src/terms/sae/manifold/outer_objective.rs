@@ -140,14 +140,15 @@ impl SaeManifoldOuterObjective {
         // single ill-conditioned ρ poll can drag the per-row routing off the
         // decisive seed basin (the EM routing-seed / decoder-projection start)
         // into the near-uniform saddle. The settled `term` then reports that
-        // collapsed routing even though the seed basin reconstructs the planted
-        // disjoint atoms far better. `baseline_term` preserves the pristine
-        // seeded geometry; re-solve the inner joint fit from it at the SAME
-        // settled ρ the engine selected (smoothing choice is untouched) and
-        // keep whichever converged state attains the lower penalized objective.
-        // For an already-routed fit the two coincide (the seed basin is the
-        // optimum), so this is a no-op there and never weakens the criterion;
-        // for a drifted fit it recovers the routed solution the seed reached.
+        // collapsed routing even though the seed basin reconstructs the data
+        // far better. `baseline_term` preserves the pristine seeded geometry;
+        // re-solve the inner joint fit from it at the SAME settled ρ the engine
+        // selected (smoothing choice is untouched) and keep the seed-basin state
+        // when it wins either the penalized objective OR the reconstruction EV.
+        // The EV tie-breaker is deliberately load-bearing for real activations:
+        // a collapsed/rank-deficient outer walk can return a lower Laplace score
+        // by pinning the quotient/curvature normalizer while losing the actual
+        // reconstruction the SAE is fitted to provide.
         let settled_objective =
             term.penalized_objective_total(target.view(), &fitted_rho, registry.as_ref(), 1.0);
         let mut rho_seed = fitted_rho.clone();
@@ -193,6 +194,21 @@ impl SaeManifoldOuterObjective {
             if let Ok(seed_total) = seed_total {
                 seed_won = seed_total.is_finite() && seed_total < *settled_total;
             }
+            if !seed_won
+                && let (Ok(seed_fit), Ok(settled_fit)) = (
+                    baseline_term.try_fitted_for_rho(&fitted_rho),
+                    term.try_fitted_for_rho(&fitted_rho),
+                )
+                && let (Some(seed_ev), Some(settled_ev)) = (
+                    reconstruction_explained_variance(target.view(), seed_fit.view()),
+                    reconstruction_explained_variance(target.view(), settled_fit.view()),
+                )
+            {
+                seed_won = seed_ev.is_finite()
+                    && settled_ev.is_finite()
+                    && seed_ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR
+                    && settled_ev + SAE_FINAL_EV_DEGRADATION_TOL < seed_ev;
+            }
         }
         let (mut fitted, mut fitted_loss) = if seed_won {
             let seed_loss = seed_solve.expect("seed_won implies seed_solve is Ok");
@@ -206,8 +222,7 @@ impl SaeManifoldOuterObjective {
         ) && let (Some(seed_ev), Some(returned_ev)) = (
             reconstruction_explained_variance(target.view(), seed_fit.view()),
             reconstruction_explained_variance(target.view(), returned_fit.view()),
-        ) && seed_ev >= SAE_PRISTINE_SEED_EV_RETAIN_FLOOR
-            && returned_ev < SAE_PRISTINE_SEED_EV_RETAIN_FLOOR
+        ) && seed_ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR
             && returned_ev + SAE_FINAL_EV_DEGRADATION_TOL < seed_ev
             && let Ok(seed_loss) = pristine_seed_term.loss(target.view(), &pristine_seed_rho)
         {

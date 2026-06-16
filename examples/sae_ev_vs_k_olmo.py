@@ -47,6 +47,7 @@ EXAMPLE (generic harvested cache):
 from __future__ import annotations
 
 import argparse
+import time
 
 import numpy as np
 
@@ -94,10 +95,20 @@ def _ev(target: np.ndarray, fitted: np.ndarray) -> float:
     return 1.0 - float(np.sum(resid**2)) / denom
 
 
-def _fit_ev(z_tr, z_te, k: int, topology: str, seed: int, n_iter: int) -> float:
+def _fit_ev(
+    z_tr,
+    z_te,
+    k: int,
+    topology: str,
+    seed: int,
+    n_iter: int,
+    max_fit_seconds: float,
+    max_reconstruct_seconds: float,
+) -> tuple[float, float, float]:
     """Fit one dictionary through the production engine; return HELD-OUT EV."""
     from gamfit import sae_manifold_fit
 
+    fit_started = time.perf_counter()
     m = sae_manifold_fit(
         z_tr,
         K=k,
@@ -107,8 +118,22 @@ def _fit_ev(z_tr, z_te, k: int, topology: str, seed: int, n_iter: int) -> float:
         n_iter=n_iter,
         random_state=seed,
     )
+    fit_seconds = time.perf_counter() - fit_started
+    if fit_seconds > max_fit_seconds:
+        raise SystemExit(
+            f"{topology} K={k} fit exceeded wall-clock guard: "
+            f"{fit_seconds:.1f}s > {max_fit_seconds:.1f}s"
+        )
+
+    reconstruct_started = time.perf_counter()
     fitted_test = m.reconstruct(z_te)
-    return _ev(z_te, fitted_test)
+    reconstruct_seconds = time.perf_counter() - reconstruct_started
+    if reconstruct_seconds > max_reconstruct_seconds:
+        raise SystemExit(
+            f"{topology} K={k} held-out reconstruct exceeded wall-clock guard: "
+            f"{reconstruct_seconds:.1f}s > {max_reconstruct_seconds:.1f}s"
+        )
+    return _ev(z_te, fitted_test), fit_seconds, reconstruct_seconds
 
 
 def main() -> None:
@@ -122,6 +147,8 @@ def main() -> None:
     ap.add_argument("--test-frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--n-iter", type=int, default=40)
+    ap.add_argument("--max-fit-seconds", type=float, default=420.0)
+    ap.add_argument("--max-reconstruct-seconds", type=float, default=60.0)
     args = ap.parse_args()
 
     x = _load_activations(args)
@@ -135,11 +162,35 @@ def main() -> None:
 
     print(f"=== #1026 real-data EV-vs-K frontier ===")
     print(f"N={n} (train={len(train_idx)}, test={len(test_idx)}), D={x.shape[1]} -> PCA-{args.pcs}, seed={args.seed}")
-    print(f"{'K':>4}  {'curved_EV_out':>13}  {'linear_EV_out':>13}  {'(curved - linear)':>17}")
+    print(
+        f"{'K':>4}  {'curved_EV_out':>13}  {'linear_EV_out':>13}  "
+        f"{'(curved - linear)':>17}  {'curved_s':>9}  {'linear_s':>9}  {'recon_s':>9}"
+    )
     for k in ladder:
-        ev_c = _fit_ev(z_tr, z_te, k, "circle", args.seed, args.n_iter)
-        ev_l = _fit_ev(z_tr, z_te, k, "euclidean", args.seed, args.n_iter)
-        print(f"{k:>4}  {ev_c:>13.6f}  {ev_l:>13.6f}  {ev_c - ev_l:>17.6f}")
+        ev_c, fit_c, recon_c = _fit_ev(
+            z_tr,
+            z_te,
+            k,
+            "circle",
+            args.seed,
+            args.n_iter,
+            args.max_fit_seconds,
+            args.max_reconstruct_seconds,
+        )
+        ev_l, fit_l, recon_l = _fit_ev(
+            z_tr,
+            z_te,
+            k,
+            "euclidean",
+            args.seed,
+            args.n_iter,
+            args.max_fit_seconds,
+            args.max_reconstruct_seconds,
+        )
+        print(
+            f"{k:>4}  {ev_c:>13.6f}  {ev_l:>13.6f}  {ev_c - ev_l:>17.6f}  "
+            f"{fit_c:>9.1f}  {fit_l:>9.1f}  {max(recon_c, recon_l):>9.1f}"
+        )
 
     print(
         "\nDiscriminating read (issue H_flat vs H_curved): curved should DOMINATE linear at "

@@ -669,7 +669,11 @@ impl SaeResidentReducedSchur {
         let data = sys.device_sae_pcg.as_ref()?;
         let p = data.p;
         let n = sys.rows.len();
-        if p == 0 || data.a_phi.len() != n || data.local_jac.len() != n {
+        if p == 0
+            || sys.htbeta_dense_supplement
+            || data.a_phi.len() != n
+            || data.local_jac.len() != n
+        {
             return None;
         }
         let empty = || ResidentRowFactor {
@@ -1044,7 +1048,11 @@ impl JacobiPreconditioner {
                 .unwrap_or(0)
                 <= BLOCK_JACOBI_MAX_BLOCK;
         if use_block {
-            Self::build_block_jacobi(sys, htt_factors, ridge_beta, backend)
+            if let Some(res) = resident {
+                Self::build_block_jacobi_resident(sys, ridge_beta, res)
+            } else {
+                Self::build_block_jacobi(sys, htt_factors, ridge_beta, backend)
+            }
         } else if let Some(res) = resident {
             // #1017 — SAE residency scalar Jacobi. The generic scalar build
             // probes `H_tβ^(i) e_a` and re-solves `(H_tt^(i))⁻¹` once for EVERY
@@ -1292,6 +1300,164 @@ impl JacobiPreconditioner {
                 inv: Array1::from_elem(1, 1.0 / v),
                 range: a..a + 1,
             });
+        }
+        Ok(Self { blocks })
+    }
+
+    /// Build block-Jacobi from the pre-staged SAE residency factors `(L_i, Y_i)`.
+    ///
+    /// This is the block analogue of [`Self::build_scalar_jacobi_resident`].
+    /// When SAE block offsets are small enough to select BetaBlockJacobi (for
+    /// example per-atom decoder blocks with `basis_size·p <= 256`), the generic
+    /// block builder materializes every row's dense `(d_i × K)` `H_tβ` by probing
+    /// the matrix-free operator, then re-solves `(H_tt)⁻¹` for each block column.
+    /// The resident factors already carry `G_i = L_iᵀ(H_tt)⁻¹L_i`, so each block
+    /// is assembled by scattering only the active support pairs inside that block:
+    ///
+    /// ```text
+    /// S_block -= Σ_i Σ_(s,t in block support) φ_s φ_t · G_i[channel_s, channel_t]
+    /// ```
+    ///
+    /// It computes the same block-diagonal restriction as the generic path, but
+    /// avoids the full-row `H_tβ` materialization and per-column triangular solves.
+    pub(crate) fn build_block_jacobi_resident(
+        sys: &ArrowSchurSystem,
+        ridge_beta: f64,
+        resident: &SaeResidentReducedSchur,
+    ) -> Result<Self, ArrowSchurError> {
+        let block_offsets = &sys.block_offsets;
+        let p = resident.p;
+        let mut schur_blocks: Vec<Array2<f64>> = Vec::with_capacity(block_offsets.len());
+        for (block_idx, range) in block_offsets.iter().enumerate() {
+            let b = range.end - range.start;
+            let mut schur_block = Array2::<f64>::zeros((b, b));
+            sys.penalty_block_add(
+                BetaBlockId(block_idx),
+                block_offsets.as_ref(),
+                &mut schur_block,
+            );
+            for bi in 0..b {
+                schur_block[[bi, bi]] += ridge_beta;
+            }
+            schur_blocks.push(schur_block);
+        }
+
+        let row_into = |row: usize, blocks: &mut [Array2<f64>]| {
+            let rf = &resident.rows[row];
+            let di = rf.di;
+            if di == 0 {
+                return;
+            }
+            let support = &resident.a_phi[row];
+            if support.is_empty() {
+                return;
+            }
+            for (block_idx, range) in block_offsets.iter().enumerate() {
+                let block = &mut blocks[block_idx];
+                for &(base_left, phi_left) in support {
+                    if phi_left == 0.0 {
+                        continue;
+                    }
+                    let left_start = base_left.max(range.start);
+                    let left_end = (base_left + p).min(range.end);
+                    if left_start >= left_end {
+                        continue;
+                    }
+                    for &(base_right, phi_right) in support {
+                        if phi_right == 0.0 {
+                            continue;
+                        }
+                        let right_start = base_right.max(range.start);
+                        let right_end = (base_right + p).min(range.end);
+                        if right_start >= right_end {
+                            continue;
+                        }
+                        let phi = phi_left * phi_right;
+                        for gi in left_start..left_end {
+                            let li = gi - range.start;
+                            let ch_i = gi - base_left;
+                            for gj in right_start..right_end {
+                                let lj = gj - range.start;
+                                let ch_j = gj - base_right;
+                                let mut gij = 0.0_f64;
+                                for r in 0..di {
+                                    gij += rf.l[r * p + ch_i] * rf.y[r * p + ch_j];
+                                }
+                                block[[li, lj]] -= phi * gij;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let n = resident.rows.len();
+        let parallel =
+            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 64;
+            let n_blocks = block_offsets.len();
+            let block_dims: Vec<usize> = block_offsets.iter().map(|r| r.end - r.start).collect();
+            let partials: Vec<Vec<Array2<f64>>> = (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let mut local: Vec<Array2<f64>> = block_dims
+                        .iter()
+                        .map(|&b| Array2::<f64>::zeros((b, b)))
+                        .collect();
+                    for i in idxs {
+                        row_into(i, &mut local);
+                    }
+                    local
+                })
+                .collect();
+            for local in &partials {
+                for bidx in 0..n_blocks {
+                    schur_blocks[bidx] += &local[bidx];
+                }
+            }
+        } else {
+            for row in 0..n {
+                row_into(row, &mut schur_blocks);
+            }
+        }
+
+        let mut blocks = Vec::with_capacity(block_offsets.len());
+        for (block_idx, range) in block_offsets.iter().enumerate() {
+            let b = range.end - range.start;
+            let schur_block = &schur_blocks[block_idx];
+            let factor_opt = {
+                use faer::Side;
+                let view = FaerArrayView::new(schur_block);
+                FaerLlt::new(view.as_ref(), Side::Lower).ok()
+            };
+            if let Some(llt) = factor_opt {
+                blocks.push(BlockFactor::Chol {
+                    factor: llt,
+                    range: range.clone(),
+                });
+            } else {
+                let mut inv = Array1::<f64>::zeros(b);
+                for bi in 0..b {
+                    let v = schur_block[[bi, bi]];
+                    if !v.is_finite() || v <= JACOBI_DIAGONAL_PD_FLOOR {
+                        return Err(ArrowSchurError::PcgFailed {
+                            reason: format!(
+                                "SAE-resident block Jacobi scalar fallback: non-PD diagonal at \
+                                 global index {}: {v}; regularization required",
+                                range.start + bi
+                            ),
+                        });
+                    }
+                    inv[bi] = 1.0 / v;
+                }
+                blocks.push(BlockFactor::Scalar {
+                    inv,
+                    range: range.clone(),
+                });
+            }
         }
         Ok(Self { blocks })
     }

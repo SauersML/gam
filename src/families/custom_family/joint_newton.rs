@@ -2917,8 +2917,8 @@ pub(crate) mod whitened_spectrum {
             let c = evecs.t().dot(&whitened_rhs);
             let lambda_max_abs = gamma.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
             let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
-            let cutoff = rank_tol * lambda_max_abs;
-            let null_cutoff = cutoff.min(numerical_floor);
+            let rank_cutoff = rank_tol * lambda_max_abs;
+            let null_cutoff = rank_cutoff.max(numerical_floor);
             Ok(Self {
                 gamma,
                 evecs,
@@ -3356,6 +3356,45 @@ mod trust_region_subproblem_tests {
         // The identified direction takes its exact Newton component (1/2).
         assert!((step.delta[0] - 0.5).abs() < 1e-10);
         assert!(step.delta[1].abs() < 1e-10, "null coordinate left at 0");
+    }
+
+    /// Near-null directions below the public rank tolerance must be treated the
+    /// same way as exact null directions. Regresses the #1082 gauge-drift crawl:
+    /// using `min(rank_cutoff, numerical_floor)` classified this mode as
+    /// identified, so the step and Newton-decrement certificate chased a
+    /// rank-tolerance-null gauge direction instead of dropping it.
+    #[test]
+    pub(crate) fn rank_tolerance_null_direction_is_dropped_from_step_and_decrement() {
+        let h = array![[1.0, 0.0], [0.0, 1e-12]];
+        let rhs = array![1.0, 0.5];
+        let d = array![1.0, 1.0];
+        let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+
+        assert!(
+            spec.null_cutoff >= KKT_REFUSAL_RANK_TOL,
+            "rank tolerance must set the null cutoff; got {}",
+            spec.null_cutoff
+        );
+
+        let step = spec.trust_region_step(1e6);
+        assert_eq!(step.nullity, 1, "near-null direction expected");
+        assert!(
+            step.null_rhs_inf >= 0.5 - 1e-9,
+            "near-null rhs component must be reported, got {}",
+            step.null_rhs_inf
+        );
+        assert!((step.delta[0] - 1.0).abs() < 1e-10);
+        assert!(
+            step.delta[1].abs() < 1e-10,
+            "rank-tolerance-null coordinate must be dropped, got {}",
+            step.delta[1]
+        );
+
+        let decrement = spec.newton_decrement();
+        assert!(
+            (decrement - 0.5).abs() < 1e-10,
+            "decrement must exclude the near-null gauge mode; got {decrement}"
+        );
     }
 
     /// Non-identity metric: the boundary is measured in the `D` norm, so a step

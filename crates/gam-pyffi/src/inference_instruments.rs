@@ -1539,12 +1539,11 @@ pub(crate) fn sweep_color_arm_throughput<'py>(py: Python<'py>) -> PyResult<Bound
 
     let variants = color_arm_variant_matrix();
     let opts = DeviceResidentInnerOptions::default();
-    let (results, mux) =
-        run_variant_sweep_multiplexed(&variants, opts).map_err(py_value_error)?;
+    let (results, mux) = run_variant_sweep_multiplexed(&variants, opts).map_err(py_value_error)?;
     // Parity assertion (bit-for-bit vs sequential) doubles as the sequential
     // throughput measurement.
-    let seq = assert_sweep_parity_vs_sequential(&variants, &opts, &results)
-        .map_err(py_value_error)?;
+    let seq =
+        assert_sweep_parity_vs_sequential(&variants, &opts, &results).map_err(py_value_error)?;
 
     let used_device = results
         .iter()

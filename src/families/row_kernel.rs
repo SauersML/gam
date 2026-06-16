@@ -41,8 +41,8 @@ const ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS: usize = 100_000;
 // in-family `crate::families::row_kernel::RowSet` call sites (allowed to depend
 // on `families`) keep working, while `terms` and the type definition both
 // reference the lower layer directly.
-use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 pub use crate::outer_subsample::RowSet;
+use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 
 /// Byte budget above which the full dense `J·F` projection (`n × K·rank` f64)
 /// is no longer materialized-and-cached whole. Aligned with `ResourcePolicy`'s
