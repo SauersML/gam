@@ -3691,7 +3691,7 @@ pub(crate) fn bench_block_jacobi_parallel_speedup() {
     // Sequential baseline: the build's row gate stays serial when called from
     // inside a rayon worker (current_thread_index().is_some()).
     let seq_build = || -> f64 {
-        rayon::iter::once(()).map(|_| {
+        std::iter::once(()).map(|_| {
             let p = JacobiPreconditioner::build_block_jacobi(&sys, &htt_factors, ridge_beta, &backend)
                 .expect("serial block Jacobi");
             p.apply(&Array1::<f64>::ones(k))[0]
@@ -3820,4 +3820,64 @@ pub(crate) fn bench_scalar_jacobi_parallel_speedup() {
         sink,
     );
     assert!(seq_per > 0.0 && par_per > 0.0, "timings must be positive");
+}
+
+/// #1017 `arrow_operator_infinity_norm` must equal the brute-force inf-norm of
+/// the fully-assembled arrow operator `[[H_tt+ρ_t I, H_tβ],[H_βt, H_ββ+ρ_β I]]`.
+/// The optimized single-pass form (materialize each row's cross-block ONCE,
+/// fold its column-abs into a length-K vector) replaced an `O(K·n·K²)`
+/// re-materialization; it computes the SAME absolute row sums, so it must match
+/// a dense assembly bit-for-bit (same terms, same per-column accumulation order).
+#[test]
+pub(crate) fn arrow_operator_infinity_norm_matches_dense_assembly() {
+    let n = 12usize;
+    let d = 3usize;
+    let k = 7usize;
+    let sys = dense_direct_system(n, d, k);
+    let ridge_t = 0.3_f64;
+    let ridge_beta = 0.2_f64;
+
+    let got = arrow_operator_infinity_norm(&sys, ridge_t, ridge_beta).expect("inf-norm");
+
+    // Brute-force dense assembly: total dim = n*d (t) + k (beta).
+    let total = n * d + k;
+    let mut full = Array2::<f64>::zeros((total, total));
+    let hbb = sys.effective_penalty_op().to_dense();
+    // t-blocks on the diagonal + cross-blocks H_tβ / H_βt.
+    for i in 0..n {
+        let base = i * d;
+        let row = &sys.rows[i];
+        let htbeta = sys_htbeta_materialize_row(&sys, i, row).expect("materialize");
+        for a in 0..d {
+            for b in 0..d {
+                full[[base + a, base + b]] = row.htt[[a, b]];
+            }
+            full[[base + a, base + a]] += ridge_t;
+            for bc in 0..k {
+                let v = htbeta[[a, bc]];
+                full[[base + a, n * d + bc]] = v; // H_tβ
+                full[[n * d + bc, base + a]] = v; // H_βt (symmetric)
+            }
+        }
+    }
+    for br in 0..k {
+        for bc in 0..k {
+            full[[n * d + br, n * d + bc]] += hbb[[br, bc]];
+        }
+        full[[n * d + br, n * d + br]] += ridge_beta;
+    }
+    let mut want = 0.0_f64;
+    for r in 0..total {
+        let mut s = 0.0_f64;
+        for c in 0..total {
+            s += full[[r, c]].abs();
+        }
+        want = want.max(s);
+    }
+    let scale = want.max(1.0);
+    assert!(
+        (got - want).abs() / scale < 1e-12,
+        "arrow inf-norm {got} != dense assembly {want} (rel {:e})",
+        (got - want).abs() / scale
+    );
 }

@@ -1291,7 +1291,16 @@ pub(crate) fn arrow_operator_infinity_norm(
     ridge_t: f64,
     ridge_beta: f64,
 ) -> Result<f64, ArrowSchurError> {
+    // Single pass over rows. For each row we (a) take the max over its `t`-rows
+    // of `Σ_b|H_tt[a,b]| + ridge_t + Σ_β|H_tβ[a,β]|` (the arrow's t-block rows),
+    // and (b) accumulate `Σ_a|H_tβ^(i)[a,β]|` into `beta_cross_abs[β]` — the
+    // β-rows' coupling back into the t-blocks. The PRIOR form re-materialised
+    // every row's `(d_i×K)` cross-block once PER β-column (an `O(K·n·K²)`
+    // blow-up at the SAE LLM border); materialising each row ONCE and folding its
+    // column-abs into a length-`K` running vector makes the β-coupling a single
+    // `O(n·d·K)` pass.
     let mut out = 0.0_f64;
+    let mut beta_cross_abs = vec![0.0_f64; sys.k];
     for i in 0..sys.rows.len() {
         let di = sys.row_dims[i];
         let row = &sys.rows[i];
@@ -1303,24 +1312,21 @@ pub(crate) fn arrow_operator_infinity_norm(
             }
             row_sum += ridge_t;
             for beta_col in 0..sys.k {
-                row_sum += htbeta[[a, beta_col]].abs();
+                let v = htbeta[[a, beta_col]].abs();
+                row_sum += v;
+                beta_cross_abs[beta_col] += v;
             }
             out = out.max(row_sum);
         }
     }
+    // β-rows: `Σ_β'|H_ββ[β,β']| + ridge_β + Σ_i Σ_a|H_tβ^(i)[a,β]|`. The penalty
+    // block's per-row absolute sum comes from the effective operator; the
+    // cross-coupling term is the `beta_cross_abs` vector folded above.
     let hbb = sys.effective_penalty_op().to_dense();
     for beta_row in 0..sys.k {
-        let mut row_sum = 0.0_f64;
+        let mut row_sum = beta_cross_abs[beta_row] + ridge_beta;
         for beta_col in 0..sys.k {
             row_sum += hbb[[beta_row, beta_col]].abs();
-        }
-        row_sum += ridge_beta;
-        for i in 0..sys.rows.len() {
-            let di = sys.row_dims[i];
-            let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i])?;
-            for a in 0..di {
-                row_sum += htbeta[[a, beta_row]].abs();
-            }
         }
         out = out.max(row_sum);
     }
