@@ -1226,6 +1226,18 @@ struct SingleBlockExactJointDesignCache<'d> {
         Array1<f64>,
         crate::solver::outer_strategy::HessianResult,
     )>,
+    // #1033: ψ-invariant hyper-direction slab cache. The κ hyper_dirs (the n×k
+    // ∂X/∂ψ design-derivative slabs + their k×k penalty derivatives) are a pure
+    // function of (data, frozen spec, REALIZED column layout) — they do NOT
+    // depend on the trial ψ once the design is fixed. On the certified Gaussian
+    // n-free path `eval_full` evaluates trial ψ WITHOUT re-realizing the design,
+    // so the realized layout (and hence the hyper_dirs) is identical across an
+    // entire run of skip-path trials. Rebuilding them each trial re-runs the
+    // basis ψ-derivative over all n rows + an O(n·k²) `fast_ab` rotation — the
+    // last per-trial O(n) pass in the κ loop. Cache them keyed by the realizer
+    // `design_revision`: a skip-path trial (revision unchanged) reuses the
+    // build; a slow-path trial (revision advanced) rebuilds and re-keys.
+    cached_hyper_dirs: Option<(u64, Vec<DirectionalHyperParam>)>,
     spatial_terms: Vec<usize>,
     rho_dim: usize,
     dims_per_term: Vec<usize>,
@@ -1247,6 +1259,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
             last_eval_theta: None,
             last_cost: None,
             last_eval: None,
+            cached_hyper_dirs: None,
             spatial_terms,
             rho_dim,
             dims_per_term,
@@ -1255,6 +1268,43 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
 
     fn design_revision(&self) -> u64 {
         self.realizer.design_revision()
+    }
+
+    /// Build the κ hyper-directions for the CURRENT realized design, reusing the
+    /// `cached_hyper_dirs` slab when the realizer revision has not advanced since
+    /// the last build (#1033). The slab is ψ-invariant at a fixed realized
+    /// layout, so a skip-path trial (which does not re-realize the design) gets a
+    /// bit-identical clone instead of re-running the per-row basis ψ-derivative +
+    /// O(n·k²) rotation. A revision change (slow-path re-realization) rebuilds and
+    /// re-keys. The clone is an O(n·k) memcpy — far cheaper than the O(n·k²)
+    /// rebuild, and the conditioning pass it feeds is itself skipped on the
+    /// certified path (see `prepare_eval_state`'s fast path).
+    fn hyper_dirs_for_current_design(
+        &mut self,
+        data: ArrayView2<'_, f64>,
+        kind: SpatialOptimizerKind,
+    ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
+        let revision = self.realizer.design_revision();
+        if let Some((cached_rev, dirs)) = self.cached_hyper_dirs.as_ref()
+            && *cached_rev == revision
+        {
+            return Ok(dirs.clone());
+        }
+        let dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data,
+            self.realizer.spec(),
+            self.realizer.design(),
+            &self.spatial_terms,
+        )?
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "failed to build {} hyper_dirs at current {}",
+                kind.adjective(),
+                kind.coord_name(),
+            ))
+        })?;
+        self.cached_hyper_dirs = Some((revision, dirs.clone()));
+        Ok(dirs)
     }
 
     fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
@@ -2497,19 +2547,13 @@ impl<'d> SpatialJointContext<'d> {
             }
             self.evaluator.stage_glm_psi_gram_deriv(staged_deriv);
         }
-        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-            self.data,
-            self.cache.spec(),
-            self.cache.design(),
-            &self.cache.spatial_terms,
-        )?
-        .ok_or_else(|| {
-            EstimationError::InvalidInput(format!(
-                "failed to build {} hyper_dirs at current {}",
-                kind.adjective(),
-                kind.coord_name(),
-            ))
-        })?;
+        // #1033: reuse the ψ-invariant hyper-direction slab when the realized
+        // design has not advanced (the certified Gaussian skip path never
+        // re-realizes it), retiring the per-trial basis ψ-derivative + O(n·k²)
+        // rotation rebuild. A slow-path trial advances the revision and rebuilds.
+        let hyper_dirs = self
+            .cache
+            .hyper_dirs_for_current_design(self.data, kind)?;
 
         let design_revision = Some(self.cache.design_revision());
         // Warm-start PIRLS from the previous outer step's converged β. This is

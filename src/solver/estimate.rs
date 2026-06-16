@@ -3345,11 +3345,17 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     ///
     /// Off-window, multi-ψ, ineligible family, or shape mismatch all return
     /// without installing — the streamed exact path runs unchanged.
-    fn install_psi_gram_statistics(&mut self, theta: &Array1<f64>, rho_dim: usize) {
+    /// Returns `true` when the n-free Gaussian ψ-GRADIENT derivative pair was
+    /// installed for this trial — i.e. the certified tensor serves both the
+    /// value AND the gradient n-free, so the conditioned n×k `∂X/∂ψ` slab in the
+    /// hyper_dirs is provably DEAD (the gradient HyperCoord's `j==0` branch reads
+    /// the k-space derivatives and never the slab). The caller uses this to skip
+    /// the per-trial slab conditioning on the design-revision fast path (#1033).
+    fn install_psi_gram_statistics(&mut self, theta: &Array1<f64>, rho_dim: usize) -> bool {
         let Some(tensor) = self.psi_gram_tensor.as_ref() else {
             // No tensor installed for this fit → the surface never carries a
             // ψ-keyed Gaussian Gram, so there is nothing stale to clear.
-            return;
+            return false;
         };
         // #1033: every early return below is a trial for which we CANNOT serve
         // the n-free per-ψ Gram (off-window, wrong shape, multi-ψ). On the
@@ -3359,12 +3365,12 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // restreams the exact Gram for this trial's design.
         if theta.len() != rho_dim + 1 {
             self.reml_state.clear_gaussian_fixed_cache();
-            return;
+            return false;
         }
         let psi = theta[rho_dim];
         if !tensor.contains(psi) {
             self.reml_state.clear_gaussian_fixed_cache();
-            return;
+            return false;
         }
         // Clone the Arc handle so the immutable borrow of `self.psi_gram_tensor`
         // is released before the `&mut self.reml_state` installs below.
@@ -3374,7 +3380,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .install_gaussian_fixed_cache(Arc::new(tensor.gaussian_fixed_cache_at(psi)))
         {
             self.reml_state.clear_gaussian_fixed_cache();
-            return;
+            return false;
         }
         log::debug!(
             "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"
@@ -3394,6 +3400,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             log::debug!(
                 "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
             );
+            true
         } else {
             // In the VALUE window but outside the certified GRADIENT sub-window
             // (or the deriv shape refused). The value cache above is sound and
@@ -3401,6 +3408,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // so the gradient lane uses the exact slab for this trial rather than
             // a stale derivative carried over on the design-revision fast path.
             self.reml_state.clear_gaussian_psi_gram_deriv();
+            false
         }
     }
 
@@ -3432,22 +3440,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         if fast_path {
             validate_joint_hyper_direction_shapes(x, s_list.len(), theta, rho_dim, &hyper_dirs)?;
 
-            for dir in &mut hyper_dirs {
-                let mut x_tau = dir.x_tau_dense();
-                self.conditioning
-                    .transform_matrix_columnswith_a_inplace(&mut x_tau);
-                dir.x_tau_original =
-                    crate::solver::estimate::reml::HyperDesignDerivative::from(x_tau);
-                if let Some(rows) = dir.x_tau_tau_original.as_mut() {
-                    for mat in rows.iter_mut().flatten() {
-                        let mut dense = mat.materialize();
-                        self.conditioning
-                            .transform_matrix_columnswith_a_inplace(&mut dense);
-                        *mat = crate::solver::estimate::reml::HyperDesignDerivative::from(dense);
-                    }
-                }
-            }
-
             self.reml_state
                 .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
             self.reml_state.setwarm_start_original_beta(warm_start_beta);
@@ -3457,8 +3449,34 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // certified tensor — otherwise the inner PLS reads a stale Gram. The
             // slow path below clears + reinstalls these; the fast path skips
             // `reset_surface` (which clears them), so we re-install here directly.
-            self.install_psi_gram_statistics(theta, rho_dim);
+            // Install BEFORE conditioning so we learn whether the n-free
+            // ψ-gradient was served from the tensor: if so, the conditioned n×k
+            // `∂X/∂ψ` slab below is provably DEAD (the `j==0` gradient branch
+            // reads the k-space derivatives, never the slab), so we skip the
+            // per-trial slab conditioning — the LAST O(n·k²) pass in the κ loop.
+            let gradient_is_n_free = self.install_psi_gram_statistics(theta, rho_dim);
             self.install_pending_glm_first_step_gram();
+            if !gradient_is_n_free {
+                // The slab gradient lane is live for this trial (off the certified
+                // gradient sub-window, non-Gaussian, multi-ψ, …) — condition the
+                // n×k `∂X/∂ψ` slab into the inner solver's frame as before.
+                for dir in &mut hyper_dirs {
+                    let mut x_tau = dir.x_tau_dense();
+                    self.conditioning
+                        .transform_matrix_columnswith_a_inplace(&mut x_tau);
+                    dir.x_tau_original =
+                        crate::solver::estimate::reml::HyperDesignDerivative::from(x_tau);
+                    if let Some(rows) = dir.x_tau_tau_original.as_mut() {
+                        for mat in rows.iter_mut().flatten() {
+                            let mut dense = mat.materialize();
+                            self.conditioning
+                                .transform_matrix_columnswith_a_inplace(&mut dense);
+                            *mat =
+                                crate::solver::estimate::reml::HyperDesignDerivative::from(dense);
+                        }
+                    }
+                }
+            }
             return Ok(hyper_dirs);
         }
 
