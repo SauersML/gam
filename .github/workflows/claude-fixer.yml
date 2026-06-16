@@ -148,6 +148,7 @@ jobs:
             drop a short progress comment on the issue now and then so the
             thread shows a live trail. Don't sit silently for an hour and
             dump everything at the end, and don't hold finished work back.
+            Commit and push after each edit.
 
             **5. Release on finish.** When the fix is complete and pushed
             to main, post a final comment whose first line is exactly:
@@ -217,6 +218,11 @@ jobs:
             they pass; you reasoned explicitly about edge cases (degeneracy,
             extreme magnitudes, ill-conditioning, parallel/GPU paths if
             applicable) and either tested or documented why each is handled.
+
+            ## Scope
+
+            Be many times more ambitious than you think you should be.
+            Everything is in scope.
 
             Have fun. Take your time. Get it perfect.
 
