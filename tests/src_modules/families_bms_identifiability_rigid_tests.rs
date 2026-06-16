@@ -7072,6 +7072,229 @@ fn empirical_rigid_higher_order_match_finite_differences() {
 }
 
 
+/// #932 jet-program oracle for the rigid **empirical-grid** branch of the
+/// production `BernoulliRigidRowKernel` (`RowKernel<2>`).
+///
+/// The standard-normal branch of that kernel is already a jet program
+/// (`rigid_standard_normal_tower` evaluates the whole value/grad/Hess/3rd/4th
+/// tower over `Tower4` `compose_unary` — a true cutover, no hand calculus),
+/// and is guarded by `rigid_standard_normal_*_full` hand-witness tests above.
+/// The empirical-grid branch is the one production tower still derived by
+/// HAND: `empirical_rigid_primary_grad_hess_closed_form` /
+/// `empirical_rigid_third_full_closed_form` /
+/// `empirical_rigid_fourth_full_closed_form` write the implicit-function-theorem
+/// intercept chain `a_m, a_g, a_mm, … a_gggg` and the Faà-di-Bruno
+/// `ℓ_ijkl = u4·η⁴ + …` cross blocks term by term. That hand chain is exactly
+/// the #736/#833 desync genus (the comment at `empirical_rigid_fourth_full_closed_form`
+/// records #833 — a dropped `g_aa·a_ggg` term that left the 4th-order block
+/// ~1.8% short, previously caught only by finite differences).
+///
+/// Until now that branch was guarded only by the FINITE-DIFFERENCE oracles
+/// (`empirical_rigid_grad_hess_match_finite_differences`,
+/// `empirical_rigid_higher_order_match_finite_differences`). This test adds the
+/// #932 universal-oracle form the issue asks for: it writes the empirical row
+/// NLL ONCE over `Tower4<2>` and asserts the hand kernel's value / gradient /
+/// Hessian / `row_third_contracted` / `row_fourth_contracted` channels equal the
+/// single-expression tower truth EXACTLY (no FD truncation tolerance). The
+/// intercept jet `a(m, g)` is obtained by JET-NEWTON on the implicit
+/// calibration `Σ_k w_k·Φ(a + s·g·x_k) = μ(m)` — independent code that never
+/// writes a single `a_{(i,j)}` formula — so a sign/algebra slip in any
+/// intercept derivative or ℓ cross block is loud here, term by term.
+///
+/// The program expresses `μ(m)` via the link map's own `(mu, mu1..mu4)` jet
+/// seed (the marginal link is family data, not the intercept calculus under
+/// test) and the signed-probit NLL chain via the shared
+/// `signed_probit_neglog_unary_stack` — the same single scalar source of truth
+/// the hand kernel consumes, so agreement isolates the implicit-intercept and
+/// Faà-di-Bruno assembly the hand path maintains.
+struct EmpiricalRigidNllProgram {
+    /// Per-row converged intercept scalar root (the jet-Newton seed/anchor).
+    a_root: Vec<f64>,
+    /// Per-row marginal link map (mu + mu1..mu4 for the μ(m) jet seed).
+    marginal: Vec<BernoulliMarginalLinkMap>,
+    /// Per-row slope g and latent score z and weight w and ±1 sign.
+    slope: Vec<f64>,
+    z: Vec<f64>,
+    w: Vec<f64>,
+    sign: Vec<f64>,
+    /// Probit frailty scale s (shared across rows).
+    s: f64,
+    /// The empirical calibration grid (shared global grid).
+    nodes: Vec<f64>,
+    grid_w: Vec<f64>,
+}
+
+impl crate::families::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
+    fn n_rows(&self) -> usize {
+        self.a_root.len()
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+        // Primary 0 = marginal eta m; primary 1 = slope g.
+        Ok([self.marginal[row].q, self.slope[row]])
+    }
+
+    fn row_nll(
+        &self,
+        row: usize,
+        p: &[crate::families::jet_tower::Tower4<2>; 2],
+    ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
+        use crate::families::jet_tower::Tower4;
+        // p[0] is the seeded m-jet, p[1] the seeded g-jet. The marginal link
+        // value μ(m) and its m-derivatives enter as a constant-in-g jet seeded
+        // from the link map (μ depends only on m = primary 0).
+        let g = p[1];
+        let lm = self.marginal[row];
+        let mut mu = Tower4::<2>::constant(lm.mu);
+        mu.g[0] = lm.mu1;
+        mu.h[0][0] = lm.mu2;
+        mu.t3[0][0][0] = lm.mu3;
+        mu.t4[0][0][0][0] = lm.mu4;
+
+        let s = self.s;
+        // observed_slope = s·g, a jet in g.
+        let observed_slope = g * s;
+
+        // Jet-Newton for the intercept jet a(m, g) solving the implicit
+        // calibration G(a, m, g) = Σ_k w_k·Φ(a + s·g·x_k) − μ(m) = 0.
+        // Seed at the converged scalar root; Newton in the jet ring converges
+        // every derivative order quadratically, so a fixed handful of steps
+        // pins all of a_{(i,j)} for i+j ≤ 4 to full precision. This is the
+        // fully-independent derivation: no a_m/a_mm/… formula is written.
+        let mut a = Tower4::<2>::constant(self.a_root[row]);
+        for _ in 0..8 {
+            // G(a) and G_a(a) accumulated in one grid pass over the jet algebra.
+            let mut gsum = Tower4::<2>::zero() - mu; // − μ(m)
+            let mut ga = Tower4::<2>::zero();
+            for (&node, &weight) in self.nodes.iter().zip(self.grid_w.iter()) {
+                // η_k = a + (s·g)·x_k, a jet in (m via a, g).
+                let eta_k = a + observed_slope * node;
+                let cdf = eta_k.compose_unary(unary_derivatives_normal_cdf(eta_k.v));
+                let pdf = eta_k.compose_unary(unary_derivatives_normal_pdf(eta_k.v));
+                gsum = gsum + cdf * weight;
+                ga = ga + pdf * weight;
+            }
+            // Newton update a ← a − G / G_a in the jet ring.
+            a = a - gsum / ga;
+        }
+
+        // Observed index η = a + (s·g)·z; z is this row's data constant.
+        let z = self.z[row];
+        let eta = a + observed_slope * z;
+        let signed = eta * self.sign[row];
+        // ONE transcendental: the shared signed-probit NLL stack, the same
+        // single scalar source of truth the hand kernel consumes.
+        if !(signed.v.is_finite() || signed.v == f64::INFINITY) {
+            return Err(format!(
+                "empirical rigid nll program: non-finite signed margin {} at row {row}",
+                signed.v
+            ));
+        }
+        let stack = signed_probit_neglog_unary_stack(signed.v, self.w[row]);
+        if !stack[0].is_finite() {
+            return Err(format!(
+                "empirical rigid nll program: non-finite log Φ at row {row}"
+            ));
+        }
+        Ok(signed.compose_unary(stack))
+    }
+}
+
+#[test]
+fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
+    use crate::families::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
+
+    let (family, grid, marginal_etas, slopes) = empirical_rigid_fd_fixture();
+    let s = family.probit_frailty_scale();
+
+    // Build the independent jet program over the same grid / marginals /
+    // converged intercept roots the hand kernel uses.
+    let mut a_root = Vec::new();
+    let mut marginal = Vec::new();
+    let mut slope = Vec::new();
+    let mut zv = Vec::new();
+    let mut wv = Vec::new();
+    let mut signv = Vec::new();
+    for row in 0..3 {
+        let (m, g) = (marginal_etas[row], slopes[row]);
+        let lm = family.marginal_link_map(m).expect("link map");
+        let root = family
+            .empirical_rigid_intercept_for_row(row, lm, g, &grid.nodes, &grid.weights)
+            .expect("intercept root");
+        a_root.push(root);
+        marginal.push(lm);
+        slope.push(g);
+        zv.push(family.z[row]);
+        wv.push(family.weights[row]);
+        signv.push(2.0 * family.y[row] - 1.0);
+    }
+    let program = EmpiricalRigidNllProgram {
+        a_root,
+        marginal,
+        slope,
+        z: zv,
+        w: wv,
+        sign: signv,
+        s,
+        nodes: grid.nodes.to_vec(),
+        grid_w: grid.weights.to_vec(),
+    };
+
+    // Several deterministic direction vectors so every (m, g) cross block of
+    // the third/fourth tensors participates in the contraction.
+    let dirs: [[f64; 2]; 4] = [
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.7, -1.3],
+        [-0.4, 0.9],
+    ];
+
+    for row in 0..3 {
+        let (m, g) = (marginal_etas[row], slopes[row]);
+        let lm = family.marginal_link_map(m).expect("link map");
+
+        // First, confirm the program VALUE channel equals the production NLL
+        // exactly (the program is only a valid oracle if its value path is the
+        // production NLL). Then audit every derivative channel.
+        let (hand_v, hand_grad, hand_hess) = family
+            .empirical_rigid_primary_grad_hess_closed_form(row, lm, g, &grid.nodes, &grid.weights)
+            .expect("primary closed form");
+
+        // Hand third / fourth full tensors, contracted along each direction.
+        let hand_third_full = family
+            .empirical_rigid_third_full_closed_form(row, lm, g, &grid.nodes, &grid.weights)
+            .expect("third closed form");
+        let hand_fourth_full = family
+            .empirical_rigid_fourth_full_closed_form(row, lm, g, &grid.nodes, &grid.weights)
+            .expect("fourth closed form");
+
+        let third: Vec<([f64; 2], [[f64; 2]; 2])> = dirs
+            .iter()
+            .map(|d| (*d, contract_third_full(&hand_third_full, d[0], d[1])))
+            .collect();
+        let fourth: Vec<([f64; 2], [f64; 2], [[f64; 2]; 2])> = dirs
+            .iter()
+            .flat_map(|u| {
+                dirs.iter()
+                    .map(move |v| (*u, *v, contract_fourth_full(&hand_fourth_full, u[0], u[1], v[0], v[1])))
+            })
+            .collect();
+
+        let claims = KernelChannels::<2> {
+            value: hand_v,
+            gradient: hand_grad,
+            hessian: hand_hess,
+            third,
+            fourth,
+        };
+
+        let tower = evaluate_program(&program, row).expect("program tower");
+        verify_kernel_channels(&tower, &claims, 1e-7).unwrap_or_else(|e| {
+            panic!("empirical rigid jet-tower oracle mismatch at row {row}: {e}")
+        });
+    }
+}
+
 #[test]
 fn gaussian_rigid_intercept_miscalibrates_skewed_empirical_law() {
     let nodes = vec![-0.95, -0.7, -0.45, -0.2, 0.4, 1.3, 3.1];
