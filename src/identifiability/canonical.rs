@@ -1905,6 +1905,105 @@ mod tests {
         );
     }
 
+    /// #933 sweep coverage: the single-channel assembly-safety test above
+    /// guards the GLM/marginal-slope shape of callback-owned block. A
+    /// location-scale family emits a MULTI-channel effective Jacobian
+    /// (`n_family_outputs > 1`), which drives the channel-aware audit and the
+    /// `BlockJacobianAsRowOp::from_callback` zero-padding path. This test pins
+    /// that the channel-aware reduction is ALSO assembly-safe: a `k = 2`
+    /// callback block whose own column aliases a higher-priority anchor sheds
+    /// the aliased column, the reduced design width equals the wrapped callback's
+    /// per-channel emitted width, and real `syr_row_into` / `row_outer_into`
+    /// against a reduced-width target returns Ok for every row.
+    #[test]
+    fn multichannel_callback_owned_reduced_block_assembles_without_shape_panic() {
+        use crate::families::custom_family::FamilyLinearizationState;
+
+        let n = 40;
+        let x = linspace(n);
+        let mut anchor = Array2::<f64>::zeros((n, 2));
+        let mut callback_owned = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            anchor[[i, 0]] = 1.0;
+            anchor[[i, 1]] = x[i];
+            // Column 0 aliases anchor's x; column 1 (x²) is genuinely new.
+            callback_owned[[i, 0]] = x[i];
+            callback_owned[[i, 1]] = x[i] * x[i];
+        }
+
+        let anchor_spec = spec_from_dense_with_priority("location_anchor", anchor, 150);
+        let mut callback_spec =
+            spec_from_dense_with_priority("scale_logslope", callback_owned.clone(), 120);
+        // A 2-output (location-scale) callback: this block drives output 1 (the
+        // scale channel); its raw Jacobian is (2·n × 2) with the block design in
+        // the channel-1 row band and zeros in channel 0.
+        let raw_callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(AdditiveBlockJacobian {
+            design: callback_owned.clone(),
+            own_output: 1,
+            n_family_outputs: 2,
+        });
+        callback_spec.jacobian_callback = Some(Arc::clone(&raw_callback));
+
+        let canon = canonicalize_for_identifiability(&[anchor_spec, callback_spec])
+            .expect("multi-channel callback overlap must reduce safely (#933)");
+
+        let reduced_block = &canon.reduced_specs[1];
+        let reduced_design = &reduced_block.design;
+        let reduced_cb = reduced_block
+            .jacobian_callback
+            .as_ref()
+            .expect("reduced multi-channel callback block must still carry a callback");
+        assert_eq!(reduced_cb.n_outputs(), 2, "channel count is preserved");
+
+        // The reduced effective Jacobian is (2·n × r_reduced); its column count
+        // is the width the family's per-block row-Hessian assembly asserts on and
+        // must equal the reduced design's column count.
+        let zeros_red = vec![0.0_f64; reduced_design.ncols()];
+        let state_red = FamilyLinearizationState {
+            beta: &zeros_red,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: 1.0,
+        };
+        let j_reduced = reduced_cb
+            .effective_jacobian_at(&state_red)
+            .expect("reduced multi-channel callback Jacobian");
+        assert_eq!(
+            j_reduced.nrows(),
+            2 * n,
+            "two-channel Jacobian stacks both output bands",
+        );
+        assert_eq!(
+            reduced_design.ncols(),
+            j_reduced.ncols(),
+            "reduced design width {} must match the wrapped multi-channel callback's \
+             emitted width {} — the shape-match precondition for row-Hessian assembly",
+            reduced_design.ncols(),
+            j_reduced.ncols(),
+        );
+
+        // Drive the real assembly primitives at the reduced width.
+        let p = reduced_design.ncols();
+        let mut syr_target = Array2::<f64>::zeros((p, p));
+        let mut outer_target = Array2::<f64>::zeros((p, p));
+        for row in 0..n {
+            reduced_design
+                .syr_row_into(row, 1.0, &mut syr_target)
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: reduced design must syr_row_into without shape panic: {e}")
+                });
+            reduced_design
+                .row_outer_into(row, reduced_design, 1.0, &mut outer_target)
+                .unwrap_or_else(|e| {
+                    panic!("row {row}: reduced design must row_outer_into without shape panic: {e}")
+                });
+        }
+        assert!(
+            syr_target[[0, 0]] > 0.0,
+            "multi-channel reduced assembly must accumulate a positive diagonal",
+        );
+    }
+
     /// Two single-channel blocks with an exact shared column (anchor block
     /// `a` has column [1, x]; block `b` has [x, x²]). The `x` direction is
     /// shared. Orthogonalisation is unconditional, so block `b` (lower priority)
