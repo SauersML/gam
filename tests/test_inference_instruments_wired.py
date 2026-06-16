@@ -118,6 +118,50 @@ def test_lawley_bartlett_factor_exponential_fixture():
     assert out["p_value_corrected"] >= out["p_value_uncorrected"]
 
 
+def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
+    # #939/#1063 deliverable (4): the magic per-term LR Bartlett correction is
+    # auto-applied on the smooth-term significance test and its >10% materiality
+    # diagnostic is surfaced alongside the first-order p-value.
+    rng = np.random.default_rng(11)
+    n = 80
+    x = np.sort(rng.uniform(0.0, 1.0, size=n))
+    # A genuine non-flat smooth (so the term is significant) with Poisson noise.
+    mu = np.exp(0.5 + 1.2 * np.sin(2.0 * math.pi * x))
+    y = rng.poisson(mu).astype(float)
+    frame = {"y": y, "x": x}
+    model = gamfit.fit(frame, "y ~ s(x)", family="poisson")
+
+    rows = model.smooth_significance(frame)
+    assert rows, "expected at least one penalized smooth term"
+    row = rows[0]
+    # Every documented field is present.
+    for key in (
+        "name",
+        "statistic_lr",
+        "ref_df",
+        "bartlett_factor",
+        "statistic_corrected",
+        "p_value_uncorrected",
+        "p_value_corrected",
+        "material",
+        "correction_provenance",
+    ):
+        assert key in row, f"smooth_significance row missing '{key}'"
+    # Poisson carries closed-form Lawley jets, so the correction auto-applies.
+    assert row["correction_provenance"] == "lawley_lr"
+    # The corrected statistic is the raw LR divided by the Bartlett factor.
+    assert row["statistic_corrected"] == pytest.approx(
+        row["statistic_lr"] / row["bartlett_factor"], rel=1e-9
+    )
+    # `material` is a bool and is consistent with the 10% rule it documents.
+    assert isinstance(row["material"], bool)
+    factor_move = abs(row["bartlett_factor"] - 1.0)
+    p_lo = min(row["p_value_uncorrected"], row["p_value_corrected"])
+    p_hi = max(row["p_value_uncorrected"], row["p_value_corrected"])
+    p_move = (p_hi - p_lo) / max(p_hi, np.finfo(float).tiny)
+    assert row["material"] == bool(factor_move > 0.10 or p_move > 0.10)
+
+
 def test_glm_full_conformal_bernoulli_reaches_python_and_covers():
     # #942: the exact full-conformal engine for a canonical-link GLM. The
     # Bernoulli support {0,1} is exhaustive, so the returned set is the exact

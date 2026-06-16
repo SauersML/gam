@@ -114,6 +114,20 @@ fn poisson_smooth_lr_is_bartlett_corrected_and_better_calibrated() {
         probe.p_value_corrected >= probe.p_value_uncorrected - 1e-12,
         "dividing W by c > 1 can only RAISE the p-value (less significant)"
     );
+    // (a') Materiality diagnostic (#939 deliverable 4): a correction was applied,
+    // so `material` must agree with the 10% rule it documents.
+    {
+        let factor_move = (probe.bartlett_factor - 1.0).abs();
+        let p_hi = probe.p_value_uncorrected.max(probe.p_value_corrected);
+        let p_lo = probe.p_value_uncorrected.min(probe.p_value_corrected);
+        let p_move = (p_hi - p_lo) / p_hi.max(f64::MIN_POSITIVE);
+        let expected_material = factor_move > 0.10 || p_move > 0.10;
+        assert_eq!(
+            probe.material, expected_material,
+            "material flag must follow the 10% rule: c={}, factor_move={:.4}, p_move={:.4}",
+            probe.bartlett_factor, factor_move, p_move
+        );
+    }
 
     // (b) Calibration sweep under the null DGP.
     let mut sum_w = 0.0;
