@@ -3067,6 +3067,54 @@ fn residual_pdfthird_derivative_matchessecond_derivativefd() {
     }
 }
 
+/// #932: independent finite-difference witness of the residual-distribution
+/// **fourth** PDF derivative `f''''(z)` for every residual distribution.
+///
+/// `pdfthird_derivative` was directly FD-guarded
+/// (`residual_pdfthird_derivative_matchessecond_derivativefd`) but
+/// `pdffourth_derivative` — the highest-order, most error-dense scalar tower
+/// feeding the survival-LS outer-Hessian `m4` term — was only covered
+/// transitively through the row-kernel oracle, where a sign slip can cancel
+/// against another term. This pins it directly: a Richardson O(h⁴) central
+/// difference of `pdfthird_derivative` (independent of the closed-form fourth)
+/// must match `pdffourth_derivative`, and a planted sign flip must be rejected.
+#[test]
+fn residual_pdffourth_derivative_matches_independent_fd_witness() {
+    let dists = [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ];
+    let zs = [-1.3_f64, -0.5, 0.3, 1.1];
+    // Richardson-extrapolated central difference of f'''(z): cancels the O(h²)
+    // error of the plain central stencil, giving an O(h⁴) witness independent of
+    // the analytic fourth-derivative code path.
+    let central = |dist: &ResidualDistribution, z: f64, h: f64| {
+        (dist.pdfthird_derivative(z + h) - dist.pdfthird_derivative(z - h)) / (2.0 * h)
+    };
+    for &dist in &dists {
+        for &z in &zs {
+            let h = 1e-3_f64;
+            let coarse = central(&dist, z, h);
+            let fine = central(&dist, z, h * 0.5);
+            let fd = (4.0 * fine - coarse) / 3.0;
+            let analytic = dist.pdffourth_derivative(z);
+            assert!(
+                (analytic - fd).abs() <= 1e-4 * analytic.abs().max(1.0) + 1e-7,
+                "pdf'''' mismatch for {dist:?} at z={z}: analytic={analytic} fd={fd}"
+            );
+            // Planted-corruption tripwire: a sign flip must leave the witness band.
+            if analytic.abs() > 1e-6 {
+                let corrupted = -analytic;
+                assert!(
+                    (corrupted - fd).abs() > 1e-4 * analytic.abs().max(1.0) + 1e-7,
+                    "witness failed to reject a planted pdf'''' sign flip for {dist:?} at z={z}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn exact_log_pdf_derivatives_match_probit_closed_form() {
     let eta = 3.25;
