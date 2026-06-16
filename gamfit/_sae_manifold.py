@@ -759,11 +759,17 @@ class ManifoldSAE:
             order = np.argsort(coords[:, 0], kind="mergesort")
             coords = np.ascontiguousarray(coords[order])
             decoder = np.asarray(atom["decoder_B"], dtype=float)
+            # #1132 bug 1: a periodic atom is intrinsically at least one harmonic
+            # (basis width 2H+1 with H>=1). A plan field that collapsed to 0 (a
+            # degenerate constant-only width recovered from a born/fissioned atom
+            # at K>=4) must be floored to the harmonic count implied by the
+            # trained decoder width `M = 2H+1`, mirroring `_functional_basis_params`
+            # — never raised. Otherwise the curved (n_harmonics=0) EV-vs-K curve at
+            # K>=4 dies here instead of reconstructing the shape band.
             n_harmonics = int(plan["n_harmonics"])
             if n_harmonics <= 0:
-                raise ValueError(
-                    f"periodic atom requires positive n_harmonics; got {n_harmonics}"
-                )
+                n_harmonics = (int(decoder.shape[0]) - 1) // 2
+            n_harmonics = max(1, n_harmonics)
             phi, _jet, _penalty = rust_module().basis_with_jet(
                 "periodic",
                 coords,
