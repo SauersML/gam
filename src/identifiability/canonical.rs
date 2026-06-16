@@ -41,13 +41,13 @@ use crate::families::custom_family::{
     BlockEffectiveJacobian, CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec,
     PenaltyMatrix,
 };
-use crate::families::identifiability::compiler::{
+use crate::identifiability::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::gauge::Gauge;
-use crate::solver::identifiability_audit::{
+use crate::identifiability::audit::{
     IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
 };
 
@@ -1004,7 +1004,7 @@ fn canonicalize_for_identifiability_inner(
             // `j_can`) the reduced Jacobian equals `j_pre` exactly, so the
             // check reads `j_pre`; otherwise it reads the reduced `j_can`.
             let j_for_map = j_can_reduced.as_ref().unwrap_or(&j_pre);
-            crate::solver::identifiability_audit::check_map_uniqueness(
+            crate::identifiability::audit::check_map_uniqueness(
                 j_for_map,
                 &[],
                 &s_joint,
@@ -1822,7 +1822,7 @@ mod tests {
     /// directions, and a non-overlapping configuration must keep full width.
     #[test]
     fn orthogonalize_design_blocks_drops_only_overlap() {
-        use crate::families::identifiability::compiler::orthogonalize_design_blocks;
+        use crate::identifiability::families::compiler::orthogonalize_design_blocks;
         let n = 40;
         let x = linspace(n);
         let mut anchor = Array2::<f64>::zeros((n, 2));

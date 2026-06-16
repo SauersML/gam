@@ -32,7 +32,7 @@
 //   2. `audit_identifiability_channel_aware` (this module) acts as the
 //      structural rank gate — it detects full aliasing via the K=1 BMS row
 //      Jacobian before any install. `FlexEvaluation` anchors participate here.
-//   3. `crate::families::identifiability::compiler::compile` does the W-metric
+//   3. `crate::identifiability::families::compiler::compile` does the W-metric
 //      Gram + eigendecomp to produce the V selector and anchor-correction M.
 //   4. The compiled V/M are installed into the `DeviationRuntime`
 //      (`install_compiled_flex_block`), and the block design + penalties are
@@ -1650,7 +1650,7 @@ fn audit_identifiability_impl(
 /// every operator must share the same `K = row_hess.k()`.
 ///
 /// `row_hess` is the structural row metric `K^S` (typically an
-/// [`crate::families::identifiability::compiler::IdentityRowHessian`] —
+/// [`crate::identifiability::families::compiler::IdentityRowHessian`] —
 /// see [`compile_with_dual_metric`] for why the structural metric is
 /// the rank-decision metric, not the pilot curvature).
 ///
@@ -1670,10 +1670,10 @@ struct ChannelAwareStreamedGeometry {
 
 fn channel_aware_streamed_geometry(
     operators: &[std::sync::Arc<
-        dyn crate::families::identifiability::compiler::RowJacobianOperator,
+        dyn crate::identifiability::families::compiler::RowJacobianOperator,
     >],
-    row_hess: &dyn crate::families::identifiability::compiler::RowHessian,
-    row_structural: &dyn crate::families::identifiability::compiler::RowHessian,
+    row_hess: &dyn crate::identifiability::families::compiler::RowHessian,
+    row_structural: &dyn crate::identifiability::families::compiler::RowHessian,
     col_offsets: &[usize],
 ) -> Result<ChannelAwareStreamedGeometry, EstimationError> {
     if operators.is_empty() {
@@ -1752,7 +1752,7 @@ fn channel_aware_streamed_geometry(
 
 fn accumulate_channel_metric_gram(
     chunks: &[Array2<f64>],
-    metric: &dyn crate::families::identifiability::compiler::RowHessian,
+    metric: &dyn crate::identifiability::families::compiler::RowHessian,
     start: usize,
     end: usize,
     col_offsets: &[usize],
@@ -1799,11 +1799,11 @@ fn accumulate_channel_metric_gram(
 pub fn audit_identifiability_channel_aware(
     specs: &[ParameterBlockSpec],
     operators: &[std::sync::Arc<
-        dyn crate::families::identifiability::compiler::RowJacobianOperator,
+        dyn crate::identifiability::families::compiler::RowJacobianOperator,
     >],
-    row_hess: &dyn crate::families::identifiability::compiler::RowHessian,
+    row_hess: &dyn crate::identifiability::families::compiler::RowHessian,
 ) -> Result<IdentifiabilityAudit, EstimationError> {
-    use crate::families::identifiability::compiler::{IdentityRowHessian, compile_from_raw_grams};
+    use crate::identifiability::families::compiler::{IdentityRowHessian, compile_from_raw_grams};
 
     if specs.is_empty() {
         return Ok(IdentifiabilityAudit {
@@ -1869,8 +1869,8 @@ pub fn audit_identifiability_channel_aware(
     // tolerance through λ=σ², so the fail-closed reduction stays tied to the
     // exact Gram geometry without retaining `(n*K)×p` designs.
     let geometry = channel_aware_streamed_geometry(operators, row_hess, &id_struct, &col_offsets)?;
-    let ordering: Vec<crate::families::identifiability::compiler::BlockOrder> =
-        std::iter::repeat(crate::families::identifiability::compiler::BlockOrder::Marginal)
+    let ordering: Vec<crate::identifiability::families::compiler::BlockOrder> =
+        std::iter::repeat(crate::identifiability::families::compiler::BlockOrder::Marginal)
             .take(operators.len())
             .collect();
     let compiled_map = compile_from_raw_grams(

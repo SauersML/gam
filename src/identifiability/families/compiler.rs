@@ -68,7 +68,7 @@ pub trait RowJacobianOperator: Send + Sync {
     /// the compiler asks for the scaled design it needs, not the dense tensor.)
     ///
     /// [`evaluate_full`]: RowJacobianOperator::evaluate_full
-    /// [`compile_with_dual_metric`]: crate::families::identifiability_compiler::compile_with_dual_metric
+    /// [`compile_with_dual_metric`]: crate::identifiability::families::compiler::compile_with_dual_metric
     fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
         scale_block_by_sqrt_h(&self.evaluate_full(), h_full)
     }
@@ -1088,7 +1088,7 @@ pub fn build_raw_grams_structural(
 ///
 /// The GPU path is only attempted for survival-family geometry
 /// (`K = CHANNELS = 4`) — that is the case the GPU kernel
-/// ([`crate::families::identifiability::gpu::try_primary_state_gram_cuda`])
+/// ([`crate::identifiability::families::gpu::try_primary_state_gram_cuda`])
 /// is specialised for via the packed-symmetric `n × 10` weight layout.
 /// For any other `K` the CPU builders are used unconditionally.
 ///
@@ -1100,14 +1100,14 @@ pub fn build_primary_grams_gpu_or_cpu(
     raw_block_ranges: &[std::ops::Range<usize>],
 ) -> Result<(Array2<f64>, Array2<f64>), CompilerError> {
     let k = row_hess.k();
-    if k == crate::families::identifiability::gpu::CHANNELS {
+    if k == crate::identifiability::families::gpu::CHANNELS {
         let gpu_blocks: Vec<Vec<Option<Array2<f64>>>> = channel_blocks
             .blocks
             .iter()
             .map(|slots| slots.iter().cloned().collect())
             .collect();
         if let Some(h_packed) = pack_row_hessian_symmetric(row_hess) {
-            if let Some(bundle) = crate::families::identifiability::gpu::try_primary_state_gram_cuda(
+            if let Some(bundle) = crate::identifiability::families::gpu::try_primary_state_gram_cuda(
                 &gpu_blocks,
                 &h_packed,
                 raw_block_ranges,
@@ -1127,7 +1127,7 @@ pub fn build_primary_grams_gpu_or_cpu(
 /// upper-triangular row-major layout consumed by the GPU kernel
 /// (`packed_index(c, d)` for `c ≤ d`). Returns `None` when `K != 4`.
 fn pack_row_hessian_symmetric(row_hess: &dyn RowHessian) -> Option<Array2<f64>> {
-    use crate::families::identifiability::gpu::{CHANNELS, PACKED_LEN, packed_index};
+    use crate::identifiability::families::gpu::{CHANNELS, PACKED_LEN, packed_index};
     if row_hess.k() != CHANNELS {
         return None;
     }
