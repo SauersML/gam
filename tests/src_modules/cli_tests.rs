@@ -20,16 +20,17 @@ use super::{
     Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs, run_fit,
     run_predict, run_sample, write_model_json,
 };
+use crate::config_resolve::{
+    SurvivalInverseLinkInput, parse_survival_inverse_link as parse_config_survival_inverse_link,
+};
 use clap::Parser;
 use csv::StringRecord;
+use gam::MatrixMaterializationError;
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec, MaternNu, OneDimensionalBoundary,
     SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
-};
-use gam::config_resolve::{
-    SurvivalInverseLinkInput, parse_survival_inverse_link as parse_config_survival_inverse_link,
 };
 use gam::estimate::{
     ExternalOptimResult, FitGeometry, FitInference, FittedBlock, FittedLinkState,
@@ -55,7 +56,6 @@ use gam::inference::model_payload_builders::{
 use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
 use gam::predict::PredictableModel;
 use gam::probability::normal_cdf;
-use gam::resource::MatrixMaterializationError;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
 };
@@ -162,7 +162,7 @@ fn bounded_cli_termspec() -> TermCollectionSpec {
         &ds,
         &col_map,
         &mut inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )
     .expect("bounded term spec")
 }
@@ -3000,7 +3000,7 @@ fn build_termspec_leaves_parametric_linear_terms_unpenalized_by_default() {
         &ds,
         &col_map,
         &mut inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )
     .expect("term spec");
 
@@ -3079,7 +3079,7 @@ fn build_termspec_accepts_joint_thinplate_above_three_dimensions() {
         &ds,
         &col_map,
         &mut inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )
     .expect("4-d TPS should be accepted");
     assert_eq!(spec.smooth_terms.len(), 1, "should have one smooth term");
@@ -3818,7 +3818,7 @@ fn build_termspec_rejects_duchon_double_penalty_option() {
         &ds,
         &col_map,
         &mut inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )
     .expect_err("Duchon double_penalty should be rejected");
     assert!(err.to_string().contains("does not support double_penalty"));
@@ -3901,7 +3901,7 @@ fn build_termspec_escalates_explicit_duchon_power_below_d2_collocation_minimum()
         &ds,
         &col_map,
         &mut inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )
     .expect("explicit power=1 should auto-escalate, not reject");
     assert_eq!(spec.smooth_terms.len(), 1);

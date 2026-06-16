@@ -2192,8 +2192,11 @@ pub(crate) fn materialize_standard<'a>(
     let term_parsed = latent_parsed.as_ref().unwrap_or(parsed);
     let term_col_map = term_data.column_map();
 
-    let policy =
-        resolved_resource_policy(config, term_data, crate::solver::resource::ProblemHints::default());
+    let policy = resolved_resource_policy(
+        config,
+        term_data,
+        crate::solver::resource::ProblemHints::default(),
+    );
     let spec = build_termspec_with_geometry_and_overrides(
         &term_parsed.terms,
         term_data,
@@ -4106,7 +4109,11 @@ pub(crate) fn materialize_location_scale<'a>(
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
-    let policy = resolved_resource_policy(config, data, crate::solver::resource::ProblemHints::default());
+    let policy = resolved_resource_policy(
+        config,
+        data,
+        crate::solver::resource::ProblemHints::default(),
+    );
     let meanspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,

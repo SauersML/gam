@@ -2045,11 +2045,11 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             base_obj.is_finite(),
             "stash-capture base eval must reproduce a finite outer objective"
         );
-        let stash = debug_stash::take_terms();
+        let stash = debug_stash::test_support::take_terms();
         // `a`-channel split of the first ψ coordinate: (a_likelihood = objective_psi,
         // a_penalty_quadratic = ½β̂ᵀ(∂S_λ/∂ψ)β̂). Drained from the global sink
         // recorded by build_psi_hyper_coords for the base eval.
-        let a_split = debug_stash::take_a_split();
+        let a_split = debug_stash::test_support::take_a_split();
         let half_prod = stash.production_tr.map(|t| 0.5 * t);
         let half_ld_s = stash.coord_ld_s.map(|t| 0.5 * t);
         let recon = match (stash.coord_a, half_prod, half_ld_s) {
@@ -2065,11 +2065,11 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         //   FD(cost − ½ldh + ½lds)   ↔ coord_a        (probe a: cost/`a` term completeness)
         //   FD(log_det_s)            ↔ coord_ld_s
         let (_, _, _) = outer_at(eps, 0.0, EvalMode::ValueGradientHessian);
-        let stash_plus = debug_stash::take_terms();
-        let a_split_plus = debug_stash::take_a_split();
+        let stash_plus = debug_stash::test_support::take_terms();
+        let a_split_plus = debug_stash::test_support::take_a_split();
         let (_, _, _) = outer_at(-eps, 0.0, EvalMode::ValueGradientHessian);
-        let stash_minus = debug_stash::take_terms();
-        let a_split_minus = debug_stash::take_a_split();
+        let stash_minus = debug_stash::test_support::take_terms();
+        let a_split_minus = debug_stash::test_support::take_a_split();
         let central = |plus: Option<f64>, minus: Option<f64>| -> Option<f64> {
             match (plus, minus) {
                 (Some(p), Some(m)) => Some((p - m) / (2.0 * eps)),
@@ -2147,7 +2147,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         // ⇒ the analytic ψ-gradient is missing the KKT-residual β-response (the
         // gap). residual≈0 yet coord_a ≠ fd_cost_excl_logdet ⇒ objective_psi
         // assembly bug (the kernel ∂X/∂ψ is FD-verified-correct standalone).
-        let kkt_probe = debug_stash::take_kkt_probe();
+        let kkt_probe = debug_stash::test_support::take_kkt_probe();
         println!(
             "[740-KKT-PROBE] inner_kkt_residual_inf={:?} batched_envelope_override_fired={:?}",
             kkt_probe.map(|(r, _)| r),

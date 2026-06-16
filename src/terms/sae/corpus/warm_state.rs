@@ -39,9 +39,9 @@
 //! `HashMap` iteration, no float formatting), so the same warm state always
 //! hashes/round-trips identically.
 
+use crate::terms::smooth::TermCollectionSpec;
 use crate::warm_start::store::{EntryKind, StoreOptions, WarmStartStore};
 use crate::warm_start::{Fingerprint, Fingerprinter};
-use crate::terms::smooth::TermCollectionSpec;
 use std::collections::HashMap;
 use std::time::Duration;
 

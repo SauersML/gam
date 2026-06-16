@@ -1,6 +1,6 @@
 use super::*;
 
-const REML_SECOND_ORDER_RHO_CAP: usize = 4;
+pub(crate) const REML_SECOND_ORDER_RHO_CAP: usize = 4;
 /// Continuation prewarm is a seed-polishing pass, not part of the REML
 /// objective. It can be useful for tiny rho spaces where one or two warm
 /// solves amortize, but it scales with the number of starts and runs full
@@ -8,13 +8,13 @@ const REML_SECOND_ORDER_RHO_CAP: usize = 4;
 /// smooths (measure-jet spectral candidates are the motivating profile) start
 /// directly from the seed lattice; the optimizer's own line search owns
 /// globalization.
-const REML_CONTINUATION_PREWARM_RHO_CAP: usize = 4;
+pub(crate) const REML_CONTINUATION_PREWARM_RHO_CAP: usize = 4;
 /// Above this rho dimension, startup work must be linear in "one real solve",
 /// not "rank a seed lattice with capped PIRLS solves". The heuristic seed is
 /// deterministic and already centered on the current penalty scale; BFGS/ARC
 /// globalizes from there. Low-dimensional classic smooths keep screening
 /// because the extra probes are cheap and sometimes useful.
-const REML_SEED_SCREENING_RHO_CAP: usize = 4;
+pub(crate) const REML_SEED_SCREENING_RHO_CAP: usize = 4;
 
 /// Programmatic prior mean for a coefficient penalty block.
 ///
@@ -308,7 +308,7 @@ impl PenaltySpec {
 
 const KAHAN_SWITCH_ELEMS: usize = 10_000;
 
-fn faer_frob_inner(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> f64 {
+pub(crate) fn faer_frob_inner(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> f64 {
     let (m, n) = (a.nrows(), a.ncols());
     let elem_count = m.saturating_mul(n);
     if elem_count < KAHAN_SWITCH_ELEMS {
@@ -330,7 +330,7 @@ fn faer_frob_inner(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> f64 {
     }
 }
 
-fn kahan_sum<I>(iter: I) -> f64
+pub(crate) fn kahan_sum<I>(iter: I) -> f64
 where
     I: IntoIterator<Item = f64>,
 {
@@ -342,9 +342,9 @@ where
 }
 
 #[derive(Clone, Debug)]
-struct ParametricColumnConditioning {
-    intercept_idx: Option<usize>,
-    columns: Vec<(usize, f64, f64)>,
+pub(crate) struct ParametricColumnConditioning {
+    pub(crate) intercept_idx: Option<usize>,
+    pub(crate) columns: Vec<(usize, f64, f64)>,
 }
 
 impl ParametricColumnConditioning {
@@ -352,7 +352,7 @@ impl ParametricColumnConditioning {
     ///
     /// Reads only the specified columns from `x` (via `extract_column`) to
     /// compute per-column mean/variance — no full-design densification.
-    fn from_column_indices(x: &DesignMatrix, unpenalized_cols: &[usize]) -> Self {
+    pub(crate) fn from_column_indices(x: &DesignMatrix, unpenalized_cols: &[usize]) -> Self {
         const SCALE_EPS: f64 = 1e-12;
         let n = x.nrows();
         if n == 0 {
@@ -403,7 +403,7 @@ impl ParametricColumnConditioning {
     }
 
     /// Infer unpenalized columns from `PenaltySpec` slices.
-    fn infer_from_penalty_specs(x: &DesignMatrix, specs: &[PenaltySpec]) -> Self {
+    pub(crate) fn infer_from_penalty_specs(x: &DesignMatrix, specs: &[PenaltySpec]) -> Self {
         let p = x.ncols();
         let mut penalized = vec![false; p];
         for spec in specs {
@@ -416,7 +416,7 @@ impl ParametricColumnConditioning {
         Self::from_column_indices(x, &unpenalized)
     }
 
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         !self.columns.is_empty()
     }
 
@@ -424,7 +424,7 @@ impl ParametricColumnConditioning {
     ///
     /// Wraps `x` in a `ConditionedDesign` operator that applies per-column
     /// centering and scaling through matvec algebra, avoiding densification.
-    fn apply_to_design(&self, x: &DesignMatrix) -> DesignMatrix {
+    pub(crate) fn apply_to_design(&self, x: &DesignMatrix) -> DesignMatrix {
         if !self.is_active() {
             return x.clone();
         }
@@ -461,11 +461,14 @@ impl ParametricColumnConditioning {
     /// columns of `A_orig`, which is the canonical column-conditioning primitive
     /// [`Self::transform_matrix_columnswith_a`] — so delegate to it rather than
     /// carry a second copy of the per-column algebra.
-    fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn transform_constraint_matrix_to_internal(
+        &self,
+        a_original: &Array2<f64>,
+    ) -> Array2<f64> {
         self.transform_matrix_columnswith_a(a_original)
     }
 
-    fn transform_linear_constraints_to_internal(
+    pub(crate) fn transform_linear_constraints_to_internal(
         &self,
         constraints: Option<crate::pirls::LinearInequalityConstraints>,
     ) -> Option<crate::pirls::LinearInequalityConstraints> {
@@ -475,7 +478,7 @@ impl ParametricColumnConditioning {
         })
     }
 
-    fn backtransform_beta(&self, beta_internal: &Array1<f64>) -> Array1<f64> {
+    pub(crate) fn backtransform_beta(&self, beta_internal: &Array1<f64>) -> Array1<f64> {
         let mut beta = beta_internal.clone();
         for &(j, mean, scale) in &self.columns {
             if let Some(intercept_idx) = self.intercept_idx {
@@ -486,13 +489,13 @@ impl ParametricColumnConditioning {
         beta
     }
 
-    fn transform_matrix_columnswith_a(&self, mat: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn transform_matrix_columnswith_a(&self, mat: &Array2<f64>) -> Array2<f64> {
         let mut out = mat.clone();
         self.transform_matrix_columnswith_a_inplace(&mut out);
         out
     }
 
-    fn transform_matrix_columnswith_a_inplace(&self, mat: &mut Array2<f64>) {
+    pub(crate) fn transform_matrix_columnswith_a_inplace(&self, mat: &mut Array2<f64>) {
         if !self.is_active() {
             return;
         }
@@ -522,7 +525,7 @@ impl ParametricColumnConditioning {
     /// ```
     /// and is the identity elsewhere. Acts on each column of `mat_internal`
     /// the same way `backtransform_beta` acts on a single vector.
-    fn left_multiply_by_m(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn left_multiply_by_m(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
         let mut out = mat_internal.clone();
         if !self.is_active() {
             return out;
@@ -554,7 +557,7 @@ impl ParametricColumnConditioning {
     /// Right-multiply `mat_internal` by `Mᵀ` (the transpose of the
     /// coefficient back-transform). Mirror of [`Self::left_multiply_by_m`]
     /// on columns.
-    fn right_multiply_by_m_transpose(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn right_multiply_by_m_transpose(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
         let mut out = mat_internal.clone();
         if !self.is_active() {
             return out;
@@ -587,7 +590,10 @@ impl ParametricColumnConditioning {
     /// ```
     /// so `(M⁻ᵀ · X)[j, :] = scale_j · X[j, :] + mean_j · X[intercept, :]`
     /// and `(M⁻ᵀ · X)[intercept, :] = X[intercept, :]`.
-    fn left_multiply_by_m_inv_transpose(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn left_multiply_by_m_inv_transpose(
+        &self,
+        mat_internal: &Array2<f64>,
+    ) -> Array2<f64> {
         let mut out = mat_internal.clone();
         if !self.is_active() {
             return out;
@@ -615,7 +621,7 @@ impl ParametricColumnConditioning {
 
     /// Right-multiply `mat_internal` by `M⁻¹`. Mirror of
     /// [`Self::left_multiply_by_m_inv_transpose`] on columns.
-    fn right_multiply_by_m_inv(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn right_multiply_by_m_inv(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
         let mut out = mat_internal.clone();
         if !self.is_active() {
             return out;
@@ -648,7 +654,7 @@ impl ParametricColumnConditioning {
     /// implementation) silently swapped the variance of every conditioned
     /// parametric column with the variance of the intercept, off by exactly
     /// the basis change the intercept absorbs when columns are centered.
-    fn backtransform_covariance(&self, cov_internal: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn backtransform_covariance(&self, cov_internal: &Array2<f64>) -> Array2<f64> {
         let right = self.right_multiply_by_m_transpose(cov_internal);
         self.left_multiply_by_m(&right)
     }
@@ -660,12 +666,12 @@ impl ParametricColumnConditioning {
     /// implementation multiplied the intercept entry of `M⁻¹` by `scale_j`,
     /// silently scaling the Hessian by `scale_j²` along every conditioned
     /// column whenever scaling (not just centering) was active.
-    fn backtransform_penalized_hessian(&self, h_internal: &Array2<f64>) -> Array2<f64> {
+    pub(crate) fn backtransform_penalized_hessian(&self, h_internal: &Array2<f64>) -> Array2<f64> {
         let right = self.right_multiply_by_m_inv(h_internal);
         self.left_multiply_by_m_inv_transpose(&right)
     }
 
-    fn backtransform_external_result(
+    pub(crate) fn backtransform_external_result(
         &self,
         mut result: ExternalOptimResult,
     ) -> ExternalOptimResult {
@@ -730,7 +736,7 @@ impl ParametricColumnConditioning {
     }
 }
 
-fn map_hessian_to_original_basis(
+pub(crate) fn map_hessian_to_original_basis(
     pirls: &crate::pirls::PirlsResult,
 ) -> Result<Array2<f64>, EstimationError> {
     let qs = &pirls.reparam_result.qs;
@@ -755,7 +761,7 @@ fn map_hessian_to_original_basis(
 /// finite without perturbing any `φ` above the denormal range.
 const DISPERSION_POSITIVE_FLOOR: f64 = 1e-300;
 
-fn dispersion_from_likelihood(
+pub(crate) fn dispersion_from_likelihood(
     likelihood: &GlmLikelihoodSpec,
     standard_deviation: f64,
 ) -> Dispersion {
@@ -827,14 +833,3 @@ pub(crate) fn scaled_covariance(cov: Array2<f64>, phi: f64) -> Array2<f64> {
         cov * phi
     }
 }
-
-/// Default inner P-IRLS tolerance floor.
-///
-/// The inner Newton iteration certifies the coefficient mode against this
-/// (scale-aware) tolerance independently of the outer REML tolerance. Coupling
-/// the two collapses two unrelated convergence concepts: when a user dials the
-/// outer tolerance up to e.g. 1e-3 to make the smoothing-parameter search
-/// coarser, the inner solve becomes coarse too, returning betas whose
-/// stationarity residual is ~1e-3·scale rather than the floating-point noise
-/// floor. Outer derivatives then read those imprecise betas as if they were
-/// the true mode and accumulate error. Keeping the inner floor at 1e-6 lets

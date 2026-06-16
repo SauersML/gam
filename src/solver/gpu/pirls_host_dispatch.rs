@@ -16,6 +16,9 @@
 //! `crate::solver::gpu::pirls_dispatch_wire`; this file only owns the
 //! host-side admission logic and struct assembly.
 
+use crate::construction::ReparamResult;
+use crate::estimate::EstimationError;
+use crate::matrix::DesignMatrix;
 #[cfg(target_os = "linux")]
 use crate::solver::pirls::FIXED_STABILIZATION_RIDGE;
 #[cfg(target_os = "linux")]
@@ -24,9 +27,6 @@ use crate::solver::pirls::{
     GaussianFixedCache, LinearInequalityConstraints, PirlsConfig, PirlsCoordinateFrame,
     PirlsPenalty, PirlsResult, WorkingModelPirlsResult,
 };
-use crate::construction::ReparamResult;
-use crate::estimate::EstimationError;
-use crate::matrix::DesignMatrix;
 use crate::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1};
 use std::sync::Arc;

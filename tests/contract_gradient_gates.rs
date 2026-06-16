@@ -1,5 +1,6 @@
 use std::sync::{Arc, RwLock};
 
+use gam::ResourcePolicy;
 use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix,
@@ -16,7 +17,6 @@ use gam::families::survival::{
     WorkingModelSurvival,
 };
 use gam::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
-use gam::resource::ResourcePolicy;
 use gam::smooth::BlockwisePenalty;
 use gam::terms::sae::manifold::EuclideanPatchEvaluator;
 use gam::terms::{

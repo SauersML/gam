@@ -1,21 +1,36 @@
 use super::*;
 
+/// Default inner P-IRLS tolerance floor.
+///
+/// The inner Newton iteration certifies the coefficient mode against this
+/// (scale-aware) tolerance independently of the outer REML tolerance. Coupling
+/// the two collapses two unrelated convergence concepts: when a user dials the
+/// outer tolerance up to e.g. 1e-3 to make the smoothing-parameter search
+/// coarser, the inner solve becomes coarse too, returning betas whose
+/// stationarity residual is ~1e-3·scale rather than the floating-point noise
+/// floor. Outer derivatives then read those imprecise betas as if they were
+/// the true mode and accumulate error. Keeping the inner floor at 1e-6 lets
+/// the outer loop relax without contaminating the coefficient certificate.
 pub(crate) const PIRLS_INNER_TOLERANCE_FLOOR: f64 = 1e-6;
 
 #[derive(Clone)]
 pub(crate) struct RemlConfig {
-    likelihood: GlmLikelihoodSpec,
-    link_kind: InverseLink,
-    pirls_convergence_tolerance: f64,
-    max_iterations: usize,
-    reml_convergence_tolerance: f64,
-    firth_bias_reduction: bool,
+    pub(crate) likelihood: GlmLikelihoodSpec,
+    pub(crate) link_kind: InverseLink,
+    pub(crate) pirls_convergence_tolerance: f64,
+    pub(crate) max_iterations: usize,
+    pub(crate) reml_convergence_tolerance: f64,
+    pub(crate) firth_bias_reduction: bool,
     /// Forwarded to `pirls::PirlsConfig::geodesic_acceleration`. Off by default.
-    geodesic_acceleration: bool,
+    pub(crate) geodesic_acceleration: bool,
 }
 
 impl RemlConfig {
-    fn external(likelihood: GlmLikelihoodSpec, reml_tol: f64, firth_bias_reduction: bool) -> Self {
+    pub(crate) fn external(
+        likelihood: GlmLikelihoodSpec,
+        reml_tol: f64,
+        firth_bias_reduction: bool,
+    ) -> Self {
         // Inner P-IRLS certifies the coefficient mode against
         // `pirls_convergence_tolerance`; the outer REML iteration certifies
         // the smoothing-parameter optimum against `reml_convergence_tolerance`.
@@ -42,11 +57,11 @@ impl RemlConfig {
         self
     }
 
-    fn link_function(&self) -> LinkFunction {
+    pub(crate) fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }
 
-    fn as_pirls_config(&self) -> pirls::PirlsConfig {
+    pub(crate) fn as_pirls_config(&self) -> pirls::PirlsConfig {
         pirls::PirlsConfig {
             likelihood: self.likelihood.clone(),
             link_kind: self.link_kind.clone(),
@@ -293,7 +308,9 @@ pub(crate) enum EigenClassification {
 /// itself fails (non-finite eigenvalues or eigenvectors). An all-bad spectrum
 /// (active_rank == 0) still returns `Some`; the caller is responsible for
 /// deciding whether to use a zero-rank covariance.
-fn invert_regularized_rho_hessian(hessian_rho: &Array2<f64>) -> Option<InvertedRhoHessian> {
+pub(crate) fn invert_regularized_rho_hessian(
+    hessian_rho: &Array2<f64>,
+) -> Option<InvertedRhoHessian> {
     let n = hessian_rho.nrows();
     if let Ok(chol) = hessian_rho.cholesky(faer::Side::Lower) {
         let mut inverse = Array2::<f64>::eye(n);
@@ -638,7 +655,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
     }
 }
 
-fn compute_smoothing_correction(
+pub(crate) fn compute_smoothing_correction(
     reml_state: &RemlState<'_>,
     final_rho: &Array1<f64>,
     final_fit: &pirls::PirlsResult,
@@ -964,5 +981,3 @@ fn compute_smoothing_correction(
         active_rank: Some(active_rank_used),
     }
 }
-
-/// A comprehensive error type for the model estimation process.

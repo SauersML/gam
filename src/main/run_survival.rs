@@ -269,8 +269,8 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         );
     }
     parse_survival_distribution(&effective_config.survival_distribution)?;
-    let survival_inverse_link = gam::config_resolve::parse_survival_inverse_link(
-        gam::config_resolve::SurvivalInverseLinkInput {
+    let survival_inverse_link = crate::config_resolve::parse_survival_inverse_link(
+        crate::config_resolve::SurvivalInverseLinkInput {
             link: effective_config.link.as_deref(),
             mixture_rho: effective_args.mixture_rho.as_deref(),
             sas_init: effective_args.sas_init.as_deref(),
@@ -358,7 +358,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         &ds,
         col_map_for_termspec,
         &mut inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )?;
     if effective_config.scale_dimensions {
         enable_scale_dimensions(&mut termspec);
@@ -369,7 +369,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &ds,
             col_map_for_termspec,
             &mut inference_notes,
-            &gam::resource::ResourcePolicy::default_library(),
+            &gam::ResourcePolicy::default_library(),
         )?;
         if effective_config.scale_dimensions {
             enable_scale_dimensions(&mut spec);
@@ -920,7 +920,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             &ds,
             col_map_for_termspec,
             &mut inference_notes,
-            &gam::resource::ResourcePolicy::default_library(),
+            &gam::ResourcePolicy::default_library(),
         )?;
         if effective_config.scale_dimensions {
             enable_scale_dimensions(&mut logslopespec);

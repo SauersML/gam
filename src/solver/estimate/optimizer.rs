@@ -1,5 +1,6 @@
 use super::*;
 
+/// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
 pub fn optimize_external_design<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -44,7 +45,7 @@ where
     )
 }
 
-fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
+pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
     let gaussian = matches!(link, LinkFunction::Identity);
     if k >= REML_SEED_SCREENING_RHO_CAP {
         return SeedConfig {
@@ -268,7 +269,7 @@ fn gaussian_identity_response_scale(
     (rms.is_finite() && rms > 0.0 && !(0.1..=10.0).contains(&rms)).then_some(rms)
 }
 
-fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
+pub(crate) fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: X,
@@ -1766,4 +1767,3 @@ where
     };
     Ok(conditioning.backtransform_external_result(result))
 }
-

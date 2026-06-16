@@ -1,6 +1,6 @@
 use super::*;
 
-fn validate_joint_hyper_direction_shapes(
+pub(crate) fn validate_joint_hyper_direction_shapes(
     x: &DesignMatrix,
     canonical_len: usize,
     theta: &Array1<f64>,
@@ -97,11 +97,11 @@ fn validate_joint_hyper_direction_shapes(
 }
 
 pub(crate) struct ExternalJointHyperEvaluator<'a> {
-    conditioning: ParametricColumnConditioning,
-    penalty_shrinkage_floor: Option<f64>,
-    kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
-    kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
-    reml_state: RemlState<'a>,
+    pub(crate) conditioning: ParametricColumnConditioning,
+    pub(crate) penalty_shrinkage_floor: Option<f64>,
+    pub(crate) kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
+    pub(crate) kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
+    pub(crate) reml_state: RemlState<'a>,
     /// Cached design revision counter from the upstream
     /// `SingleBlockExactJointDesignCache` (or n-block analogue). When the
     /// caller threads a revision through `evaluate_with_order` /
@@ -111,7 +111,7 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// rebuild plus the bundle/PIRLS cache wipes. `None` means "no
     /// revision yet recorded" — every subsequent call is treated as a
     /// fresh-canonical case and the slow path runs.
-    last_canonical_revision: Option<u64>,
+    pub(crate) last_canonical_revision: Option<u64>,
     /// Certified Chebyshev-in-ψ Gram tensor for the SINGLE design-moving
     /// hyperparameter (#1033b, isotropic spatial κ): when present and the
     /// trial ψ lies inside the certified window, `prepare_eval_state`
@@ -120,7 +120,8 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// in the conditioned frame by `build_and_set_psi_gram_tensor` (the same
     /// fixed column transform the streamed Gram uses), so the installed
     /// statistics are frame-exact against the streamed ones.
-    psi_gram_tensor: Option<std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>>,
+    pub(crate) psi_gram_tensor:
+        Option<std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>>,
     /// Frozen-weight GLM first-Fisher-step data-fit Gram `XᵀWX` staged for the
     /// CURRENT ψ-trial (#1111 / #1033 mechanism (c)), in the conditioned
     /// (`x_fit`) frame. Set per-trial by [`SpatialJointContext::eval_full`] when
@@ -129,7 +130,7 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// `reset_surface`, on both the slow and design-revision fast paths) and
     /// cleared. `None` (the default) clears the surface slot so a stale
     /// previous-ψ Gram is never consumed.
-    pending_glm_first_step_gram: Option<std::sync::Arc<Array2<f64>>>,
+    pub(crate) pending_glm_first_step_gram: Option<std::sync::Arc<Array2<f64>>>,
     /// Conditioned-frame exact ψ-derivative pair `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)`
     /// staged for the CURRENT ψ-trial in the GLM frozen-W lane (#1033 / #1111),
     /// in the conditioned (`x_fit`) frame. Set per-trial by
@@ -140,7 +141,7 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// `prepare_eval_state` and cleared. Serves the GLM ψ-gradient `a_j` / `g_j`
     /// n-free; `B_j` stays the exact slab. `None` (the default) clears the
     /// surface slot so a stale previous-ψ derivative is never consumed.
-    pending_glm_psi_gram_deriv: Option<std::sync::Arc<(Array2<f64>, Array1<f64>)>>,
+    pub(crate) pending_glm_psi_gram_deriv: Option<std::sync::Arc<(Array2<f64>, Array1<f64>)>>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -767,7 +768,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// hyper-derivatives are required to produce a correct cost. Skipping
     /// the hyper_dir validation and the per-direction conditioning loop is
     /// what makes line-search probes cheap in the iso/aniso joint paths.
-    fn prepare_eval_state_cost_only(
+    pub(crate) fn prepare_eval_state_cost_only(
         &mut self,
         x: &DesignMatrix,
         s_list: &[BlockwisePenalty],
@@ -902,5 +903,3 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
 
 // canonicalize_active_penalties removed — replaced by
 // crate::construction::canonicalize_penalty_specs.
-
-/// Optimize smoothing parameters for an external design using the same REML/LAML machinery.

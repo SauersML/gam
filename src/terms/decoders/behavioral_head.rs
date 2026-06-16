@@ -33,7 +33,7 @@
 //!
 //! 1. [`BehavioralHead`] — the head GLM itself: value + gradient of the head
 //!    log-likelihood w.r.t. the head coefficients `(a, w)` AND w.r.t. the
-//!    latent codes `t` (the cross-channel coupling), under a [`TrustRegionRowMeasure`]
+//!    latent codes `t` (the cross-channel coupling), under a [`RowSubsampleMask`]
 //!    weighting so unlabeled rows carry zero head weight (semi-supervised).
 //!
 //! 2. [`LeakageAbsorber`] — the #461 Neyman-orthogonal device. Joint fitting
@@ -54,7 +54,7 @@
 use crate::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use crate::inference::structure_evidence::e_benjamini_hochberg;
 use crate::linalg::faer_ndarray::FaerSvd;
-use crate::solver::row_measure::TrustRegionRowMeasure;
+use crate::solver::row_measure::RowSubsampleMask;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// Outcome family for the behavioral head.
@@ -111,7 +111,7 @@ pub struct BehavioralHead {
     /// index in `0..n_classes` per row (stored as `f64`, integral-valued).
     y: Array1<f64>,
     /// Per-row head-channel weight. `0.0` on unlabeled rows (semi-supervised);
-    /// `1.0` on labeled rows by default. Derived from a [`TrustRegionRowMeasure`] via
+    /// `1.0` on labeled rows by default. Derived from a [`RowSubsampleMask`] via
     /// [`BehavioralHead::with_row_measure`].
     w_row: Array1<f64>,
 }
@@ -176,14 +176,14 @@ impl BehavioralHead {
         Self::new(family, y, Array1::from_elem(n, 1.0))
     }
 
-    /// Build a head whose per-row weights come from a [`TrustRegionRowMeasure`]: rows
+    /// Build a head whose per-row weights come from a [`RowSubsampleMask`]: rows
     /// outside the measure (unlabeled) get weight 0, rows inside get the
     /// measure's weight. This is the semi-supervised seam — no new mechanism,
     /// the same row-weighting the inner solver already enforces for ρ-coherence.
     pub fn with_row_measure(
         family: AuxOutcomeFamily,
         y: Array1<f64>,
-        measure: &TrustRegionRowMeasure,
+        measure: &RowSubsampleMask,
     ) -> Result<Self, String> {
         let n = y.len();
         let (indices, weights) = measure.indices_and_weights(n);

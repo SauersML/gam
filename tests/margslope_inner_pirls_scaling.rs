@@ -36,10 +36,10 @@
 //! and fit `total_s = a · n^α`. Honest fit: if R²<0.85 or max log-resid>0.5,
 //! refuses to extrapolate.
 
+use gam::ResourcePolicy;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
-use gam::resource::ResourcePolicy;
 use gam::terms::basis::{BSplineBasisSpec, BSplineKnotSpec};
 use gam::terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,

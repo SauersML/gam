@@ -29,6 +29,7 @@
 //! accuracy claim against ground truth, not a "reproduce gamlss's noisy fit"
 //! claim — the reference's rel-L2 is still printed for context but never gates.
 
+use gam::ResourcePolicy;
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, build_bspline_basis_1d,
 };
@@ -38,7 +39,6 @@ use gam::custom_family::{
 use gam::families::gamlss::GaussianLocationScaleFamily;
 use gam::load_csvwith_inferred_schema;
 use gam::matrix::DesignMatrix;
-use gam::resource::ResourcePolicy;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use ndarray::{Array1, Array2};
 use std::path::Path;

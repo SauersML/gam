@@ -1,25 +1,25 @@
 use super::*;
 
-fn sas_log_deltaridgeweight() -> f64 {
+pub(crate) fn sas_log_deltaridgeweight() -> f64 {
     // Weak fixed stabilization for the SAS tail parameter to avoid
     // boundary/flat-region pathologies in outer optimization.
     1e-4
 }
 
 #[inline]
-fn sas_log_delta_edge_barrierweight() -> f64 {
+pub(crate) fn sas_log_delta_edge_barrierweight() -> f64 {
     // Keep SAS raw log-delta away from tanh-saturation edges where
     // link sensitivities collapse and outer gradients become uninformative.
     1e-2
 }
 
 #[inline]
-fn sas_log_delta_bound() -> f64 {
+pub(crate) fn sas_log_delta_bound() -> f64 {
     crate::mixture_link::SAS_LOG_DELTA_BOUND
 }
 
 #[inline]
-fn sas_log_delta_edge_barriercostgrad(raw_log_delta: f64) -> (f64, f64) {
+pub(crate) fn sas_log_delta_edge_barriercostgrad(raw_log_delta: f64) -> (f64, f64) {
     let w = sas_log_delta_edge_barrierweight();
     if w <= 0.0 || !raw_log_delta.is_finite() {
         return (0.0, 0.0);
@@ -34,13 +34,13 @@ fn sas_log_delta_edge_barriercostgrad(raw_log_delta: f64) -> (f64, f64) {
 }
 
 #[inline]
-fn sas_epsilon_bound() -> f64 {
+pub(crate) fn sas_epsilon_bound() -> f64 {
     // Fixed smooth bound on raw SAS epsilon during outer optimization.
     8.0
 }
 
 #[inline]
-fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
+pub(crate) fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
     let bound = sas_epsilon_bound().max(f64::EPSILON);
     let t = (raw_epsilon / bound).tanh();
     let epsilon = bound * t;
@@ -49,7 +49,7 @@ fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
 }
 
 #[inline]
-fn sas_effective_epsilon_second(raw_epsilon: f64) -> (f64, f64, f64) {
+pub(crate) fn sas_effective_epsilon_second(raw_epsilon: f64) -> (f64, f64, f64) {
     let bound = sas_epsilon_bound().max(f64::EPSILON);
     let t = (raw_epsilon / bound).tanh();
     let first = 1.0 - t * t;
@@ -58,7 +58,7 @@ fn sas_effective_epsilon_second(raw_epsilon: f64) -> (f64, f64, f64) {
 }
 
 #[inline]
-fn sas_log_delta_edge_barriercostgradhess(raw_log_delta: f64) -> (f64, f64, f64) {
+pub(crate) fn sas_log_delta_edge_barriercostgradhess(raw_log_delta: f64) -> (f64, f64, f64) {
     let w = sas_log_delta_edge_barrierweight();
     if w <= 0.0 || !raw_log_delta.is_finite() {
         return (0.0, 0.0, 0.0);
@@ -72,7 +72,7 @@ fn sas_log_delta_edge_barriercostgradhess(raw_log_delta: f64) -> (f64, f64, f64)
     (cost, grad, hess)
 }
 
-fn materialize_link_outer_hessian(
+pub(crate) fn materialize_link_outer_hessian(
     hessian: crate::solver::rho_optimizer::HessianResult,
     theta_dim: usize,
 ) -> Result<Array2<f64>, EstimationError> {
@@ -458,10 +458,3 @@ where
     let ridge = reml_state.last_ridge_used().unwrap_or(0.0);
     Ok((cost, ridge))
 }
-
-#[path = "../reml/mod.rs"]
-pub(crate) mod reml;
-
-pub use reml::unified::PenaltyCoordinate;
-
-#[cfg(test)]

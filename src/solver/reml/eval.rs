@@ -201,8 +201,8 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
     sigma_points: &[Array1<f64>],
 ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
     use crate::construction::{EngineDims, stable_reparameterization_engine_canonical};
-    use crate::gpu::runtime::GpuRuntime;
     use crate::gpu::kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval;
+    use crate::gpu::runtime::GpuRuntime;
     use crate::solver::gpu::pirls_dispatch_wire::admission_for;
 
     if sigma_points.is_empty() {

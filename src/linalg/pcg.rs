@@ -4,9 +4,9 @@
 //! residual-refresh, diagnostics) and the GPU REML trace solver
 //! (`gpu::kernels::reml_trace::cg_solve`, serial, no refresh, no diagnostics)
 //! historically carried their own hand-rolled CG loop. They drifted: the GPU
-//! copy silently floored the (absent) preconditioner and accepted a partial
-//! solution on lost SPD, while the CPU copy rejected non-positive preconditioner
-//! diagonals and refreshed the residual every 32 iterations. The shared inner
+//! copy accepted a partial solution on lost SPD, while the CPU copy rejected
+//! non-positive preconditioner diagonals and refreshed the residual every 32
+//! iterations. The shared inner
 //! recurrence — `alpha = rz/pᵀAp`, `x += alpha p`, `r -= alpha Ap`,
 //! `beta = rz'/rz`, `p = z + beta p` — is identical.
 //!
@@ -32,9 +32,9 @@ use ndarray::{Array1, ArrayView1, ArrayViewMut1, Zip};
 /// `f64`, so we clamp the target to avoid iterating on numerical noise.
 pub(crate) const PCG_REL_TOL_FLOOR: f64 = 1e-12;
 
-/// Floor applied to each (already non-negative) preconditioner diagonal entry
-/// before reciprocation. Exactly-zero entries are treated as numerical noise and
-/// floored to this value rather than producing an infinite `1/m`.
+/// Floor applied to each positive preconditioner diagonal entry before
+/// reciprocation. Exactly-zero entries are rejected as non-positive rather than
+/// being treated as numerical noise.
 pub(crate) const PCG_PRECONDITIONER_FLOOR: f64 = 1e-12;
 
 /// Per-iteration trace of the PCG recurrence, sufficient to reconstruct the
@@ -77,7 +77,7 @@ pub(crate) enum PcgStop {
     /// The iterate written so far is the last numerically valid one; callers
     /// decide whether to keep it (GPU) or reject the whole solve (CPU).
     Breakdown,
-    /// The preconditioner diagonal contained a negative or non-finite entry,
+    /// The preconditioner diagonal contained a non-positive or non-finite entry,
     /// violating the SPD-PCG contract (`M ≻ 0`). Detected before any iteration;
     /// the solution buffer is untouched (left at the zero initial guess).
     BadPreconditioner,
@@ -113,7 +113,7 @@ fn serial_dot(a: &ArrayView1<f64>, b: &ArrayView1<f64>) -> f64 {
 ///
 /// * `precond_diag` — diagonal Jacobi preconditioner `M`; pass all-ones for an
 ///   unpreconditioned solve. Entries are floored to
-///   [`PCG_PRECONDITIONER_FLOOR`] before reciprocation; a negative or
+///   [`PCG_PRECONDITIONER_FLOOR`] before reciprocation; a non-positive or
 ///   non-finite entry is a contract violation reported as
 ///   [`PcgStop::BadPreconditioner`].
 /// * `refresh_period` — recompute `r ← rhs − A x` every `refresh_period`
@@ -178,12 +178,12 @@ where
     let tol = rel_tol.max(PCG_REL_TOL_FLOOR) * rhs_norm.max(1.0);
 
     // Precompute reciprocal preconditioner once: z = inv_m * r per iteration.
-    // SPD-PCG requires M ≻ 0; a negative/non-finite entry is a contract
+    // SPD-PCG requires M ≻ 0; a non-positive/non-finite entry is a contract
     // violation surfaced as BadPreconditioner rather than silently abs()-ed.
     let mut inv_m = Array1::<f64>::zeros(p);
     let mut bad_diag = false;
     for (slot, &m) in inv_m.iter_mut().zip(precond_diag.iter()) {
-        if !m.is_finite() || m < 0.0 {
+        if !m.is_finite() || m <= 0.0 {
             bad_diag = true;
             break;
         }
@@ -403,6 +403,28 @@ mod tests {
         let a = array![[4.0, 1.0], [1.0, 3.0]];
         let b = array![1.0, 2.0];
         let precond = array![-4.0, 3.0];
+        let mut x = Array1::<f64>::zeros(2);
+        let result = pcg_core(
+            |v: &Array1<f64>, out: &mut Array1<f64>| {
+                out.assign(&a.dot(v));
+            },
+            &b.view(),
+            &precond.view(),
+            1e-12,
+            20,
+            32,
+            false,
+            &mut x.view_mut(),
+        );
+        assert_eq!(result.stop, PcgStop::BadPreconditioner);
+        assert_eq!(x, Array1::<f64>::zeros(2));
+    }
+
+    #[test]
+    fn pcg_core_rejects_zero_preconditioner_entry() {
+        let a = array![[4.0, 1.0], [1.0, 3.0]];
+        let b = array![1.0, 2.0];
+        let precond = array![4.0, 0.0];
         let mut x = Array1::<f64>::zeros(2);
         let result = pcg_core(
             |v: &Array1<f64>, out: &mut Array1<f64>| {

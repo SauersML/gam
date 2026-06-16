@@ -511,16 +511,3 @@ impl fmt::Display for ModelSummary {
         Ok(())
     }
 }
-
-pub use crate::inference::predict::{
-    CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
-    PosteriorMeanOptions, PredictInput, PredictPosteriorMeanResult, PredictResult,
-    PredictUncertaintyOptions, PredictUncertaintyResult, PredictableModel, coefficient_uncertainty,
-    coefficient_uncertaintywith_mode, enrich_posterior_mean_bounds, predict_gam,
-    predict_gam_posterior_mean, predict_gam_posterior_meanwith_backend,
-    predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
-};
-
-/// Canonical engine entrypoint for external designs on supported GLM-style
-/// families.
-/// Likelihood dispatch is determined by `family` together with external-link

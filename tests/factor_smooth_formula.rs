@@ -1,10 +1,10 @@
 use ndarray::Array2;
 
+use gam::ResourcePolicy;
 use gam::basis::BSplineKnotSpec;
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::resource::ResourcePolicy;
 use gam::smooth::{ByVarKind, FactorSmoothFlavour, SmoothBasisSpec};
 use gam::terms::term_builder::build_termspec;
 

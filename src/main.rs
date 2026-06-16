@@ -201,6 +201,8 @@ macro_rules! cli_err {
 mod cli_args;
 #[path = "main/cli_errors.rs"]
 mod cli_errors;
+#[path = "main/config_resolve.rs"]
+mod config_resolve;
 #[path = "main/dataset_io.rs"]
 mod dataset_io;
 #[path = "main/family_resolve.rs"]

@@ -10,7 +10,7 @@ use super::row_kernel::*;
 
 use super::*;
 
-use crate::families::fnv::Fnv1a;
+use crate::families::fnv1a::Fnv1a;
 
 /// Bounded same-β reuse store for the BMS per-row cell-moment exact-cache.
 ///

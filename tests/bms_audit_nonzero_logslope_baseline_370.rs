@@ -37,10 +37,10 @@
 //!   - rigid:  empty log-slope smooth + constant offset  (≈ `logslope_formula="1"`)
 //!   - flex:   + score_warp / link_dev deviation blocks   (≈ `linkwiggle(...)`)
 
+use gam::ResourcePolicy;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
-use gam::resource::ResourcePolicy;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary,
 };

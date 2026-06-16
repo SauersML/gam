@@ -1,5 +1,5 @@
-use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerColView};
+use crate::linalg::LinalgError;
 use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
@@ -11,6 +11,12 @@ use std::sync::{Arc, Mutex};
 
 const ZERO_TOL: f64 = 1e-12;
 const PARALLEL_SPARSE_FILL_COLUMN_THRESHOLD: usize = 64;
+
+macro_rules! bail_invalid_linalg {
+    ($($arg:tt)*) => {
+        return Err(LinalgError::InvalidInput(format!($($arg)*)))
+    };
+}
 
 #[derive(Clone)]
 pub struct SparseExactFactor {
@@ -34,22 +40,10 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
     }
 }
 
-#[derive(Clone)]
-pub struct SparsePenaltyBlock {
-    pub penalty_idx: crate::types::PenaltyIdx,
-    pub p_start: usize,
-    pub p_end: usize,
-    pub positive_eigenvalues: Arc<Vec<f64>>,
-    pub block_support_strict: bool,
-    pub s_k_sparse: SparseColMat<usize, f64>,
-    pub s_k_block_dense: Arc<Array2<f64>>,
-    pub s_k_block_upper_entries: Arc<Vec<(usize, usize, f64)>>,
-}
-
 pub fn dense_to_sparse(
     matrix: &Array2<f64>,
     tol: f64,
-) -> Result<SparseColMat<usize, f64>, EstimationError> {
+) -> Result<SparseColMat<usize, f64>, LinalgError> {
     let nrows = matrix.nrows();
     let ncols = matrix.ncols();
     // Direct column-major CSC construction.  Three-pass: count nnz per
@@ -79,68 +73,6 @@ pub fn dense_to_sparse(
     Ok(SparseColMat::<usize, f64>::new(symbolic, values))
 }
 
-fn embed_dense_block_to_sparse_symmetric_upper(
-    local: &Array2<f64>,
-    offset: usize,
-    total_dim: usize,
-    tol: f64,
-) -> Result<SparseColMat<usize, f64>, EstimationError> {
-    let block_n = local.nrows();
-    if local.ncols() != block_n {
-        crate::bail_invalid_estim!(
-            "embed_dense_block_to_sparse_symmetric_upper requires a square block"
-        );
-    }
-    if offset + block_n > total_dim {
-        crate::bail_invalid_estim!(
-            "embed_dense_block_to_sparse_symmetric_upper offset+block exceeds total_dim"
-                .to_string(),
-        );
-    }
-    // Direct CSC build over the upper triangle of `local`, embedded at
-    // `(offset, offset)` in a `total_dim x total_dim` matrix.  Columns
-    // outside [offset, offset+block_n) are empty; within-block columns are
-    // counted in parallel, prefix-summed serially, and filled in parallel
-    // while preserving row-ascending order within each column.
-    let counts: Vec<usize> = (0..block_n)
-        .into_par_iter()
-        .map(|c| {
-            let mut count = 0usize;
-            for r in 0..=c {
-                if local[[r, c]].abs() > tol {
-                    count += 1;
-                }
-            }
-            count
-        })
-        .collect();
-    let block_col_ptr = prefix_sum_counts(&counts);
-    let mut col_ptr = vec![0usize; total_dim + 1];
-    for c in 0..block_n {
-        col_ptr[offset + c + 1] = block_col_ptr[c + 1];
-    }
-    let nnz_in_block_end = block_col_ptr[block_n];
-    for c in (offset + block_n)..total_dim {
-        col_ptr[c + 1] = nnz_in_block_end;
-    }
-    let nnz = col_ptr[total_dim];
-    let mut row_idx = vec![0usize; nnz];
-    let mut values = vec![0.0; nnz];
-    fill_embedded_symmetric_upper_columns(
-        local,
-        offset,
-        tol,
-        0,
-        block_n,
-        &block_col_ptr,
-        &mut row_idx,
-        &mut values,
-    );
-    let symbolic =
-        SymbolicSparseColMat::<usize>::new_checked(total_dim, total_dim, col_ptr, None, row_idx);
-    Ok(SparseColMat::<usize, f64>::new(symbolic, values))
-}
-
 /// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.
 ///
 /// This encoding is required by sparse SPD routines in this module that interpret
@@ -149,7 +81,7 @@ fn embed_dense_block_to_sparse_symmetric_upper(
 pub fn dense_to_sparse_symmetric_upper(
     matrix: &Array2<f64>,
     tol: f64,
-) -> Result<SparseColMat<usize, f64>, EstimationError> {
+) -> Result<SparseColMat<usize, f64>, LinalgError> {
     let nrows = matrix.nrows();
     let ncols = matrix.ncols();
     // Direct CSC build over the upper triangle.  Counts and fills are
@@ -314,64 +246,6 @@ fn fill_dense_symmetric_upper_columns(
     );
 }
 
-fn fill_embedded_symmetric_upper_columns(
-    local: &Array2<f64>,
-    offset: usize,
-    tol: f64,
-    col_start: usize,
-    col_end: usize,
-    col_ptr: &[usize],
-    row_idx: &mut [usize],
-    values: &mut [f64],
-) {
-    if col_end - col_start <= PARALLEL_SPARSE_FILL_COLUMN_THRESHOLD {
-        let base = col_ptr[col_start];
-        for col in col_start..col_end {
-            let mut write = col_ptr[col] - base;
-            for row in 0..=col {
-                let value = local[[row, col]];
-                if value.abs() > tol {
-                    row_idx[write] = offset + row;
-                    values[write] = value;
-                    write += 1;
-                }
-            }
-        }
-        return;
-    }
-
-    let mid = col_start + (col_end - col_start) / 2;
-    let split = col_ptr[mid] - col_ptr[col_start];
-    let (left_rows, right_rows) = row_idx.split_at_mut(split);
-    let (left_values, right_values) = values.split_at_mut(split);
-    rayon::join(
-        || {
-            fill_embedded_symmetric_upper_columns(
-                local,
-                offset,
-                tol,
-                col_start,
-                mid,
-                col_ptr,
-                left_rows,
-                left_values,
-            );
-        },
-        || {
-            fill_embedded_symmetric_upper_columns(
-                local,
-                offset,
-                tol,
-                mid,
-                col_end,
-                col_ptr,
-                right_rows,
-                right_values,
-            );
-        },
-    );
-}
-
 pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
     matrix: &SparseColMat<usize, f64>,
     vector: &ArrayBase<S, Ix1>,
@@ -396,7 +270,7 @@ pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
 
 pub fn factorize_sparse_spd(
     h: &SparseColMat<usize, f64>,
-) -> Result<SparseExactFactor, EstimationError> {
+) -> Result<SparseExactFactor, LinalgError> {
     // Canonicalize to symmetric-upper storage before factorization.
     //
     // Math contract:
@@ -410,7 +284,7 @@ pub fn factorize_sparse_spd(
     let n_input = h.ncols();
     let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
     let factor = h_upper.as_ref().sp_cholesky(Side::Upper).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
+        LinalgError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         }
     })?;
@@ -438,9 +312,9 @@ pub fn factorize_sparse_spd(
 fn canonicalize_sparse_symmetric_upper(
     matrix: &SparseColMat<usize, f64>,
     tol: f64,
-) -> Result<SparseColMat<usize, f64>, EstimationError> {
+) -> Result<SparseColMat<usize, f64>, LinalgError> {
     if matrix.nrows() != matrix.ncols() {
-        crate::bail_invalid_estim!(
+        bail_invalid_linalg!(
             "sparse SPD factorization requires square matrix, got {}x{}",
             matrix.nrows(),
             matrix.ncols()
@@ -516,7 +390,7 @@ fn canonicalize_sparse_symmetric_upper(
     }
 
     SparseColMat::try_new_from_triplets(matrix.nrows(), matrix.ncols(), &triplets).map_err(|_| {
-        EstimationError::InvalidInput(
+        LinalgError::InvalidInput(
             "failed to canonicalize sparse matrix to symmetric-upper CSC".to_string(),
         )
     })
@@ -529,7 +403,7 @@ fn solve_view<R, I, F>(
     mut result: R,
     non_finite_message: &'static str,
     mut consume: F,
-) -> Result<R, EstimationError>
+) -> Result<R, LinalgError>
 where
     I: IntoIterator<Item = (usize, usize)>,
     F: FnMut(&mut R, usize, usize, f64),
@@ -539,7 +413,7 @@ where
     for (row, col) in indices {
         let value = solved[(row, col)];
         if !value.is_finite() {
-            crate::bail_invalid_estim!("{}", non_finite_message.to_string());
+            bail_invalid_linalg!("{}", non_finite_message.to_string());
         }
         consume(&mut result, row, col, value);
     }
@@ -549,12 +423,12 @@ where
 pub fn solve_sparse_spd<S>(
     factor: &SparseExactFactor,
     rhs: &ArrayBase<S, Ix1>,
-) -> Result<Array1<f64>, EstimationError>
+) -> Result<Array1<f64>, LinalgError>
 where
     S: Data<Elem = f64>,
 {
     if rhs.len() != factor.n {
-        crate::bail_invalid_estim!(
+        bail_invalid_linalg!(
             "sparse SPD solve dimension mismatch: rhs has {}, factor has {}",
             rhs.len(),
             factor.n
@@ -573,19 +447,19 @@ pub fn solve_sparse_spd_into<S>(
     factor: &SparseExactFactor,
     rhs: &ArrayBase<S, Ix1>,
     out: &mut Array1<f64>,
-) -> Result<(), EstimationError>
+) -> Result<(), LinalgError>
 where
     S: Data<Elem = f64>,
 {
     if rhs.len() != factor.n {
-        crate::bail_invalid_estim!(
+        bail_invalid_linalg!(
             "sparse SPD solve dimension mismatch: rhs has {}, factor has {}",
             rhs.len(),
             factor.n
         );
     }
     if out.len() != factor.n {
-        crate::bail_invalid_estim!(
+        bail_invalid_linalg!(
             "sparse SPD solve output dimension mismatch: out has {}, factor has {}",
             out.len(),
             factor.n
@@ -596,7 +470,7 @@ where
     for i in 0..factor.n {
         let value = solved[(i, 0)];
         if !value.is_finite() {
-            crate::bail_invalid_estim!("sparse SPD solve produced non-finite values");
+            bail_invalid_linalg!("sparse SPD solve produced non-finite values");
         }
         out[i] = value;
     }
@@ -606,12 +480,12 @@ where
 pub fn solve_sparse_spdmulti<S>(
     factor: &SparseExactFactor,
     rhs: &ArrayBase<S, Ix2>,
-) -> Result<Array2<f64>, EstimationError>
+) -> Result<Array2<f64>, LinalgError>
 where
     S: Data<Elem = f64>,
 {
     if rhs.nrows() != factor.n {
-        crate::bail_invalid_estim!(
+        bail_invalid_linalg!(
             "sparse SPD multi-solve row mismatch: rhs has {}, factor has {}",
             rhs.nrows(),
             factor.n
@@ -635,19 +509,19 @@ pub fn solve_sparse_spdmulti_rows<S>(
     rhs: &ArrayBase<S, Ix2>,
     row_start: usize,
     row_end: usize,
-) -> Result<Array2<f64>, EstimationError>
+) -> Result<Array2<f64>, LinalgError>
 where
     S: Data<Elem = f64>,
 {
     if rhs.nrows() != factor.n {
-        crate::bail_invalid_estim!(
+        bail_invalid_linalg!(
             "sparse SPD multi-solve row mismatch: rhs has {}, factor has {}",
             rhs.nrows(),
             factor.n
         );
     }
     if row_start > row_end || row_end > factor.n {
-        crate::bail_invalid_estim!(
+        bail_invalid_linalg!(
             "sparse SPD selected rows out of bounds: row_start={}, row_end={}, factor={}",
             row_start,
             row_end,
@@ -671,12 +545,12 @@ pub fn solve_sparse_spdmulti_diagonal_sum<S>(
     factor: &SparseExactFactor,
     rhs: &ArrayBase<S, Ix2>,
     row_start: usize,
-) -> Result<f64, EstimationError>
+) -> Result<f64, LinalgError>
 where
     S: Data<Elem = f64>,
 {
     if row_start.saturating_add(rhs.ncols()) > rhs.nrows() {
-        crate::bail_invalid_estim!(
+        bail_invalid_linalg!(
             "sparse SPD selected diagonal out of bounds: row_start={}, rows={}, cols={}",
             row_start,
             rhs.nrows(),
@@ -696,86 +570,14 @@ where
     )
 }
 
-pub fn logdet_from_factor(factor: &SparseExactFactor) -> Result<f64, EstimationError> {
+pub fn logdet_from_factor(factor: &SparseExactFactor) -> Result<f64, LinalgError> {
     Ok(factor.logdet)
 }
 
 pub fn assemble_sparse_factor_h_dense(
     factor: &SparseExactFactor,
-) -> Result<Array2<f64>, EstimationError> {
+) -> Result<Array2<f64>, LinalgError> {
     factor.simplicial.assemble_h_dense_original_order()
-}
-
-/// Build sparse penalty blocks from canonical penalties, avoiding redundant
-/// block-range scanning and eigendecomposition. Uses the pre-computed col_range
-/// and positive_eigenvalues from `CanonicalPenalty`.
-pub fn build_sparse_penalty_blocks_from_canonical(
-    penalties: &[crate::construction::CanonicalPenalty],
-    p: usize,
-) -> Result<Option<Vec<SparsePenaltyBlock>>, EstimationError> {
-    if penalties.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-
-    // Check for overlapping ranges.
-    let mut sorted_ranges: Vec<(usize, usize, usize)> = penalties
-        .iter()
-        .enumerate()
-        .map(|(i, cp)| (i, cp.col_range.start, cp.col_range.end))
-        .collect();
-    sorted_ranges.sort_by_key(|&(_, start, _)| start);
-    for pair in sorted_ranges.windows(2) {
-        let (_, _, end_left) = pair[0];
-        let (_, start_right, _) = pair[1];
-        if end_left > start_right {
-            return Ok(None);
-        }
-    }
-
-    use rayon::prelude::*;
-
-    // `par_iter()` over a slice is indexed, and Rayon preserves the input
-    // sequence when collecting into a `Vec`, so the final blocks remain in
-    // canonical penalty order even though each block is built independently.
-    let block_results: Vec<Result<SparsePenaltyBlock, EstimationError>> = penalties
-        .par_iter()
-        .enumerate()
-        .map(|(penalty_ordinal, cp)| {
-            let p_start = cp.col_range.start;
-            let p_end = cp.col_range.end;
-            let s_k_block_dense = cp.local_penalty();
-            let s_k_sparse = embed_dense_block_to_sparse_symmetric_upper(
-                &s_k_block_dense,
-                p_start,
-                p,
-                ZERO_TOL,
-            )?;
-
-            let mut s_k_block_upper_entries = Vec::<(usize, usize, f64)>::new();
-            for col in 0..s_k_block_dense.ncols() {
-                for row in 0..=col {
-                    let value = s_k_block_dense[[row, col]];
-                    if value.abs() > ZERO_TOL {
-                        s_k_block_upper_entries.push((row, col, value));
-                    }
-                }
-            }
-
-            Ok(SparsePenaltyBlock {
-                penalty_idx: crate::types::PenaltyIdx::new(penalty_ordinal),
-                p_start,
-                p_end,
-                positive_eigenvalues: Arc::new(cp.positive_eigenvalues.clone()),
-                block_support_strict: true,
-                s_k_sparse,
-                s_k_block_dense: Arc::new(s_k_block_dense),
-                s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),
-            })
-        })
-        .collect();
-
-    let blocks = block_results.into_iter().collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(blocks))
 }
 
 // ---------------------------------------------------------------------------
@@ -812,16 +614,14 @@ pub struct SimplicialFactor {
 ///
 /// The factorization uses AMD fill-reducing ordering and faer's simplicial
 /// LLᵀ numeric factorization.
-pub fn factorize_simplicial(
-    h: &SparseColMat<usize, f64>,
-) -> Result<SimplicialFactor, EstimationError> {
+pub fn factorize_simplicial(h: &SparseColMat<usize, f64>) -> Result<SimplicialFactor, LinalgError> {
     let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
     factorize_simplicial_canonical_upper(&h_upper)
 }
 
 fn factorize_simplicial_canonical_upper(
     h_upper: &SparseColMat<usize, f64>,
-) -> Result<SimplicialFactor, EstimationError> {
+) -> Result<SimplicialFactor, LinalgError> {
     let n = h_upper.ncols();
     if n == 0 {
         return Ok(SimplicialFactor {
@@ -848,7 +648,7 @@ fn factorize_simplicial_canonical_upper(
             amd::Control::default(),
             MemStack::new(&mut mem),
         )
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
+        .map_err(|_| LinalgError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         })?;
     }
@@ -913,7 +713,7 @@ fn factorize_simplicial_canonical_upper(
             &col_counts,
             stack,
         )
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
+        .map_err(|_| LinalgError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         })?
     };
@@ -932,7 +732,7 @@ fn factorize_simplicial_canonical_upper(
             &symbolic,
             MemStack::new(&mut mem),
         )
-        .map_err(|_| EstimationError::HessianNotPositiveDefinite {
+        .map_err(|_| LinalgError::HessianNotPositiveDefinite {
             min_eigenvalue: f64::NAN,
         })?;
     }
@@ -946,7 +746,7 @@ fn factorize_simplicial_canonical_upper(
     for j in 0..n {
         let diag = l_values[l_col_ptr[j]];
         if diag <= 0.0 {
-            return Err(EstimationError::HessianNotPositiveDefinite {
+            return Err(LinalgError::HessianNotPositiveDefinite {
                 min_eigenvalue: f64::NAN,
             });
         }
@@ -971,9 +771,9 @@ impl SimplicialFactor {
     /// The simplicial factor stores `L` for `P H Pᵀ = L Lᵀ`, with
     /// `perm_inv[original] = permuted`. We first assemble the dense permuted
     /// product and then map rows/columns back to the caller's coordinate order.
-    fn assemble_h_dense_original_order(&self) -> Result<Array2<f64>, EstimationError> {
+    fn assemble_h_dense_original_order(&self) -> Result<Array2<f64>, LinalgError> {
         if self.perm_inv.len() != self.n {
-            crate::bail_invalid_estim!(
+            bail_invalid_linalg!(
                 "simplicial factor permutation length {} does not match dimension {}",
                 self.perm_inv.len(),
                 self.n
@@ -987,7 +787,7 @@ impl SimplicialFactor {
                 let left_row = self.l_row_idx[left_idx];
                 let left_value = self.l_values[left_idx];
                 if !left_value.is_finite() {
-                    crate::bail_invalid_estim!(
+                    bail_invalid_linalg!(
                         "simplicial factor has non-finite L entry at value index {left_idx}"
                     );
                 }
@@ -1003,22 +803,21 @@ impl SimplicialFactor {
         for i in 0..self.n {
             let pi = self.perm_inv[i];
             if pi >= self.n {
-                crate::bail_invalid_estim!(
+                bail_invalid_linalg!(
                     "simplicial factor permutation maps row {i} to out-of-bounds index {pi}"
                 );
             }
             for j in 0..self.n {
                 let pj = self.perm_inv[j];
                 if pj >= self.n {
-                    crate::bail_invalid_estim!(
+                    bail_invalid_linalg!(
                         "simplicial factor permutation maps column {j} to out-of-bounds index {pj}"
                     );
                 }
                 let value = h_permuted[[pi, pj]];
                 if !value.is_finite() {
-                    crate::bail_invalid_estim!(
+                    bail_invalid_linalg!(
                         "dense reconstruction from sparse Cholesky produced non-finite values"
-                            .to_string(),
                     );
                 }
                 h_original[[i, j]] = value;
@@ -1138,12 +937,12 @@ impl TakahashiInverse {
         row_idx: &[usize],
         row: usize,
         col: usize,
-    ) -> Result<f64, EstimationError> {
+    ) -> Result<f64, LinalgError> {
         let (lower_row, lower_col) = if row >= col { (row, col) } else { (col, row) };
         Self::find_entry(col_ptr, row_idx, lower_row, lower_col)
             .map(|idx| z_values[idx])
             .ok_or_else(|| {
-                EstimationError::InvalidInput(format!(
+                LinalgError::InvalidInput(format!(
                     "simplicial selected-inverse pattern is missing entry ({lower_row},{lower_col})"
                 ))
             })
@@ -1154,7 +953,7 @@ impl TakahashiInverse {
     /// Given H = LLᵀ in the permuted basis, this applies the Takahashi
     /// recurrence on the filled Cholesky pattern. Off-pattern exact entries are
     /// recovered later by cached column solves from the same simplicial factor.
-    pub fn compute(factor: &SimplicialFactor) -> Result<Self, EstimationError> {
+    pub fn compute(factor: &SimplicialFactor) -> Result<Self, LinalgError> {
         let n = factor.n;
         let col_ptr = factor.l_col_ptr.clone();
         let row_idx = factor.l_row_idx.clone();
@@ -1175,7 +974,7 @@ impl TakahashiInverse {
             let col_end = col_ptr[j + 1];
             let diag = factor.l_values[diag_idx];
             if !(diag.is_finite() && diag > 0.0) {
-                return Err(EstimationError::HessianNotPositiveDefinite {
+                return Err(LinalgError::HessianNotPositiveDefinite {
                     min_eigenvalue: f64::NAN,
                 });
             }
@@ -1190,7 +989,7 @@ impl TakahashiInverse {
                 }
                 let value = -correction / diag;
                 if !value.is_finite() {
-                    crate::bail_invalid_estim!(
+                    bail_invalid_linalg!(
                         "Takahashi selected inverse produced non-finite entry ({i},{j})"
                     );
                 }
@@ -1202,7 +1001,7 @@ impl TakahashiInverse {
             }
             let value = (1.0 / diag - correction) / diag;
             if !value.is_finite() {
-                crate::bail_invalid_estim!(
+                bail_invalid_linalg!(
                     "Takahashi selected inverse produced non-finite diagonal entry ({j},{j})"
                 );
             }
@@ -1266,7 +1065,7 @@ impl TakahashiInverse {
     /// row ≤ col), doubles off-diagonals, and skips lower-triangle entries.
     /// This is correct for both storage conventions:
     ///
-    /// - **Upper-triangle-only** (from `embed_dense_block_to_sparse_symmetric_upper`):
+    /// - **Upper-triangle-only** (for example, solver-owned sparse penalty blocks):
     ///   every off-diagonal pair has exactly one stored entry with row < col,
     ///   which we double.
     ///
@@ -1314,47 +1113,6 @@ mod tests {
             "values differ: left={a:.12e}, right={b:.12e}, |diff|={:.12e}, tol={tol:.12e}",
             (a - b).abs()
         );
-    }
-
-    #[test]
-    fn canonical_sparse_penalty_blocks_preserve_input_order() {
-        fn canonical_penalty(
-            col_range: std::ops::Range<usize>,
-            local: Array2<f64>,
-            positive_eigenvalues: Vec<f64>,
-            total_dim: usize,
-        ) -> crate::construction::CanonicalPenalty {
-            let block_dim = col_range.len();
-            crate::construction::CanonicalPenalty {
-                root: Array2::<f64>::zeros((0, block_dim)),
-                col_range,
-                total_dim,
-                nullity: 0,
-                local,
-                prior_mean: Array1::zeros(block_dim),
-                positive_eigenvalues,
-                op: None,
-            }
-        }
-
-        let penalties = vec![
-            canonical_penalty(2..4, array![[2.0, 0.5], [0.5, 3.0]], vec![2.0, 3.0], 5),
-            canonical_penalty(0..1, array![[7.0]], vec![7.0], 5),
-            canonical_penalty(4..5, array![[11.0]], vec![11.0], 5),
-        ];
-
-        let blocks = build_sparse_penalty_blocks_from_canonical(&penalties, 5)
-            .unwrap()
-            .expect("non-overlapping canonical blocks should be sparse-block compatible");
-
-        let observed: Vec<(usize, usize, usize)> = blocks
-            .iter()
-            .map(|block| (block.penalty_idx.get(), block.p_start, block.p_end))
-            .collect();
-        assert_eq!(observed, vec![(0, 2, 4), (1, 0, 1), (2, 4, 5)]);
-        assert_eq!(&*blocks[0].positive_eigenvalues, &vec![2.0, 3.0]);
-        assert_eq!(&*blocks[1].positive_eigenvalues, &vec![7.0]);
-        assert_eq!(&*blocks[2].positive_eigenvalues, &vec![11.0]);
     }
 
     #[test]

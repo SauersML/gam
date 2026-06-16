@@ -85,7 +85,7 @@ pub const MAX_FUSED_P: usize = 32;
 /// Schur driver always builds the system at a single uniform `R = K` (the
 /// shared β width), so the host JIT selects exactly one template
 /// instantiation per `(P, R)` pair encountered. Caching matches the
-/// `S2ModuleCacheKey` pattern in `crate::terms::sphere_gpu`.
+/// `S2ModuleCacheKey` pattern in `crate::terms::basis::sphere_gpu`.
 pub const FUSED_R_TEMPLATES: &[usize] = &[4, 5, 6, 8, 10, 12, 16, 20, 24, 32];
 
 /// Smallest entry in `FUSED_R_TEMPLATES` that is ≥ `r`. Used both by the
@@ -357,7 +357,7 @@ pub fn plan_fused_launch(n: usize, p: usize, r: usize) -> Option<FusedLaunchPlan
 /// Build the full NVRTC source for one `(p_max, r_template)` instantiation.
 /// The host caller prepends `#define`s for `P_MAX` and `R_TEMPLATE` so that
 /// the compile is a single `compile_ptx` call matching the sibling kernels
-/// in `crate::terms::sphere_gpu`.
+/// in `crate::terms::basis::sphere_gpu`.
 #[cfg(target_os = "linux")]
 #[inline]
 #[must_use]

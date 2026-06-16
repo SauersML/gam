@@ -1,6 +1,6 @@
 use super::*;
 
-fn validate_penalty_specs(
+pub(crate) fn validate_penalty_specs(
     specs: &[PenaltySpec],
     p: usize,
     context: &str,
@@ -236,7 +236,7 @@ fn detect_prefit_unpenalized_rank_deficiency_in_design(
     Ok(None)
 }
 
-fn reject_prefit_unpenalized_rank_deficiency(
+pub(crate) fn reject_prefit_unpenalized_rank_deficiency(
     w: ArrayView1<'_, f64>,
     x_fit: &DesignMatrix,
     penalties: &[CanonicalPenalty],
@@ -532,7 +532,7 @@ fn prefit_binomial_separation_supported_link(link: &InverseLink) -> bool {
     )
 }
 
-fn reject_prefit_binomial_separation(
+pub(crate) fn reject_prefit_binomial_separation(
     cfg: &RemlConfig,
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,

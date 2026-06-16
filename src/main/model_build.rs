@@ -60,20 +60,20 @@ pub(crate) fn route_marginal_slope_deviation_blocks(
 
 pub(crate) fn cli_frailty_kind(
     frailty_kind: Option<FrailtyKindArg>,
-) -> Option<gam::config_resolve::CliFrailtyKind> {
+) -> Option<crate::config_resolve::CliFrailtyKind> {
     frailty_kind.map(|kind| match kind {
-        FrailtyKindArg::GaussianShift => gam::config_resolve::CliFrailtyKind::GaussianShift,
-        FrailtyKindArg::HazardMultiplier => gam::config_resolve::CliFrailtyKind::HazardMultiplier,
+        FrailtyKindArg::GaussianShift => crate::config_resolve::CliFrailtyKind::GaussianShift,
+        FrailtyKindArg::HazardMultiplier => crate::config_resolve::CliFrailtyKind::HazardMultiplier,
     })
 }
 
 pub(crate) fn cli_hazard_loading(
     hazard_loading: Option<HazardLoadingArg>,
-) -> Option<gam::config_resolve::CliHazardLoading> {
+) -> Option<crate::config_resolve::CliHazardLoading> {
     hazard_loading.map(|loading| match loading {
-        HazardLoadingArg::Full => gam::config_resolve::CliHazardLoading::Full,
+        HazardLoadingArg::Full => crate::config_resolve::CliHazardLoading::Full,
         HazardLoadingArg::LoadedVsUnloaded => {
-            gam::config_resolve::CliHazardLoading::LoadedVsUnloaded
+            crate::config_resolve::CliHazardLoading::LoadedVsUnloaded
         }
     })
 }
@@ -120,7 +120,7 @@ pub(crate) fn fit_frailty_spec_from_args(
     args: &FitArgs,
     context: &str,
 ) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
-    gam::config_resolve::resolve_cli_frailty_spec(
+    crate::config_resolve::resolve_cli_frailty_spec(
         cli_frailty_kind(args.frailty_kind),
         args.frailty_sd,
         cli_hazard_loading(args.hazard_loading),
@@ -132,7 +132,7 @@ pub(crate) fn fit_frailty_spec_from_survival_args(
     args: &SurvivalArgs,
     context: &str,
 ) -> Result<gam::families::lognormal_kernel::FrailtySpec, String> {
-    gam::config_resolve::resolve_cli_frailty_spec(
+    crate::config_resolve::resolve_cli_frailty_spec(
         cli_frailty_kind(args.frailty_kind),
         args.frailty_sd,
         cli_hazard_loading(args.hazard_loading),

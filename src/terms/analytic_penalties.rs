@@ -120,6 +120,7 @@ pub(crate) use ndarray::{
 };
 pub(crate) use std::sync::{Arc, RwLock};
 
+pub(crate) use self::manifest::PenaltyManifest;
 pub(crate) use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
 pub(crate) use crate::linalg::lanczos::{
     SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
@@ -127,10 +128,9 @@ pub(crate) use crate::linalg::lanczos::{
 pub(crate) use crate::terms::basis::{
     BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
 };
-pub(crate) use self::manifest::PenaltyManifest;
 pub(crate) use crate::terms::penalties::op::PenaltyOp;
-pub(crate) use crate::terms::sae::manifold::{GumbelTemperatureSchedule, ScheduleKind};
 pub(crate) use crate::terms::penalties::sheaf::SheafConsistencyPenalty;
+pub(crate) use crate::terms::sae::manifold::{GumbelTemperatureSchedule, ScheduleKind};
 pub(crate) use crate::terms::smooth::BlockwisePenalty;
 
 #[macro_use]
@@ -140,10 +140,10 @@ mod ard;
 mod block_sparsity;
 mod ibp;
 mod isometry;
+mod manifest;
 mod nested_prefix;
 mod nuclear_norm;
 mod orthogonality;
-mod manifest;
 mod registry;
 mod row_precision;
 mod scad_mcp;

@@ -361,7 +361,7 @@ pub(crate) fn clear_outer_ift_residual_energy_for_fit() {
 }
 
 pub(crate) fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option<f64>) {
-    let Some(key) = super::cache::sanitized_rhokey(theta) else {
+    let Some(key) = super::rho_key::sanitized_rhokey(theta) else {
         return;
     };
     if let Ok(mut cache) = outer_ift_residual_energy_cache().lock() {

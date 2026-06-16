@@ -48,8 +48,8 @@ mod bug_hunt_cloglog_integrated_large_sigma;
 mod bug_hunt_cloglog_inverse_link_deep_tail_clamp_flattens;
 #[path = "regressions/bug_hunt_cloglog_survival_large_sigma_asymptotic_biased_low.rs"]
 mod bug_hunt_cloglog_survival_large_sigma_asymptotic_biased_low;
-#[path = "regressions/bug_hunt_concave_shape_smooth_depends_on_warm_start_cache.rs"]
-mod bug_hunt_concave_shape_smooth_depends_on_warm_start_cache;
+#[path = "regressions/bug_hunt_concave_shape_smooth_depends_on_warm_start_store.rs"]
+mod bug_hunt_concave_shape_smooth_depends_on_warm_start_store;
 #[path = "regressions/bug_hunt_conformal_held_out_calibration_fold_size_mismatch.rs"]
 mod bug_hunt_conformal_held_out_calibration_fold_size_mismatch;
 #[path = "regressions/bug_hunt_constrained_linear_active_bound_panics.rs"]
@@ -250,8 +250,6 @@ mod bug_hunt_wps_corrected_edf_below_conditional;
 mod bug_hunt_wps_weighted_gram_invariants;
 #[path = "regressions/bug_hunt_zero_weight_rows_not_equivalent_to_absent_rows.rs"]
 mod bug_hunt_zero_weight_rows_not_equivalent_to_absent_rows;
-#[path = "regressions/cache_bug_hunt_regressions.rs"]
-mod cache_bug_hunt_regressions;
 #[path = "regressions/cubic_cell_kernel_bug_hunt.rs"]
 mod cubic_cell_kernel_bug_hunt;
 #[path = "regressions/duchon_collocation_symmetry_psd_regression.rs"]
@@ -322,5 +320,7 @@ mod thin_plate_workspace_equivalence_regression;
 mod tps_smallk_basis_regression;
 #[path = "regressions/warm_start_quality_regression.rs"]
 mod warm_start_quality_regression;
+#[path = "regressions/warm_start_store_regressions.rs"]
+mod warm_start_store_regressions;
 #[path = "regressions/workflow_bug_hunt.rs"]
 mod workflow_bug_hunt;

@@ -23,12 +23,12 @@
 //! materializing it).
 
 use gam::matrix::LinearOperator;
-use gam::resource::{ProblemHints, ResourcePolicy};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam::{ProblemHints, ResourcePolicy};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

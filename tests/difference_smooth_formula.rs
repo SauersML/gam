@@ -1,7 +1,7 @@
+use gam::ResourcePolicy;
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::parse_formula;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::resource::ResourcePolicy;
 use gam::smooth::{BySmoothKind, SmoothBasisSpec};
 use gam::terms::term_builder::build_termspec;
 use ndarray::array;

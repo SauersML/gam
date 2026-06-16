@@ -212,23 +212,23 @@ fn fits_are_invariant_to_warm_start_cache_state_across_families() {
         // Fresh private store per configuration: the first arm is cold by
         // construction, AND the previous configuration's data-independent
         // seed-prefix entries cannot pre-warm this one.
-        let mut cache_root = std::env::temp_dir();
-        cache_root.push(format!(
+        let mut store_root = std::env::temp_dir();
+        store_root.push(format!(
             "gam_wsi_cold_{}_{}_{}",
             std::process::id(),
             idx,
             salt()
         ));
-        std::fs::create_dir_all(&cache_root).expect("create private cold-cache TMPDIR");
+        std::fs::create_dir_all(&store_root).expect("create private cold-store TMPDIR");
         // SAFETY: single #[test] binary, set between fits on the test
         // thread before the next fit reads the environment. Edition-2024
         // marks `set_var` unsafe.
         unsafe {
-            std::env::set_var("TMPDIR", &cache_root);
+            std::env::set_var("TMPDIR", &store_root);
         }
         assert_eq!(
             std::env::temp_dir(),
-            cache_root,
+            store_root,
             "TMPDIR override did not take effect; cannot guarantee a cold cache"
         );
 
@@ -273,7 +273,7 @@ fn fits_are_invariant_to_warm_start_cache_state_across_families() {
             }
         }
 
-        std::fs::remove_dir_all(&cache_root).ok();
+        std::fs::remove_dir_all(&store_root).ok();
     }
 
     assert!(

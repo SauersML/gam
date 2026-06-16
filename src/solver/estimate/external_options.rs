@@ -78,7 +78,7 @@ pub struct ExternalOptimOptions {
     pub persist_warm_start_disk: bool,
 }
 
-fn resolve_external_family(
+pub(crate) fn resolve_external_family(
     family: &crate::types::LikelihoodSpec,
     firth_override: Option<bool>,
 ) -> Result<(GlmLikelihoodSpec, bool), EstimationError> {
@@ -114,7 +114,7 @@ fn resolve_external_family(
 }
 
 #[inline]
-fn effective_sas_link_for_family(
+pub(crate) fn effective_sas_link_for_family(
     family: &crate::types::LikelihoodSpec,
     sas_link: Option<SasLinkSpec>,
 ) -> Option<SasLinkSpec> {
@@ -129,7 +129,7 @@ fn effective_sas_link_for_family(
 }
 
 #[inline]
-fn resolved_external_inverse_link(
+pub(crate) fn resolved_external_inverse_link(
     link: LinkFunction,
     latent_cloglog: Option<LatentCLogLogState>,
     mixture_link: Option<&MixtureLinkSpec>,
@@ -164,7 +164,7 @@ fn resolved_external_inverse_link(
 }
 
 #[inline]
-fn resolved_external_config(
+pub(crate) fn resolved_external_config(
     opts: &ExternalOptimOptions,
 ) -> Result<(RemlConfig, Option<SasLinkSpec>), EstimationError> {
     if opts.latent_cloglog.is_some() && (opts.mixture_link.is_some() || opts.sas_link.is_some()) {

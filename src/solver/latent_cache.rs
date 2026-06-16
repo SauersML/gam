@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
-use crate::warm_start::{Fingerprint, Fingerprinter};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
 use crate::solver::riemannian_retraction::{Retraction, RetractionKind};
@@ -27,6 +26,7 @@ use crate::terms::latent::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 use crate::terms::smooth::{TermCollectionDesign, TermCollectionSpec};
+use crate::warm_start::{Fingerprint, Fingerprinter};
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
 const DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY: usize = 16;

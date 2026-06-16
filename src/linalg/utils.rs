@@ -747,7 +747,7 @@ where
     );
     if result.stop == PcgStop::BadPreconditioner {
         log::warn!(
-            "SPD PCG rejected: preconditioner diagonal contained a negative or \
+            "SPD PCG rejected: preconditioner diagonal contained a non-positive or \
              non-finite entry; caller should route to a direct factorization \
              or indefinite Krylov path."
         );

@@ -25,11 +25,11 @@ use ndarray::{Array1, Array2};
 use gam::terms::sae::candidate_index::{
     IndexConfig, RandomProjectionFrameSketch, SaeCandidateIndex,
 };
-use gam::terms::sae::manifold::{
-    PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
-};
 use gam::terms::sae::encode_atlas::{
     AtlasConfig, EncodeAtlas, KANTOROVICH_THRESHOLD, row_certificate,
+};
+use gam::terms::sae::manifold::{
+    PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
 };
 
 /// `M = 3` periodic basis: `[1, sin(2πt), cos(2πt)]` (one harmonic).

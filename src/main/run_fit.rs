@@ -23,7 +23,7 @@ pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
 }
 
 pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
-    gam::config_resolve::resolve_cli_fit_config(gam::config_resolve::CliFitConfigInput {
+    crate::config_resolve::resolve_cli_fit_config(crate::config_resolve::CliFitConfigInput {
         family: family_arg_canonical_name(args.family).map(str::to_string),
         negative_binomial_theta: args.negative_binomial_theta,
         link: None,
@@ -63,7 +63,7 @@ pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, Stri
 }
 
 pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitConfig, String> {
-    gam::config_resolve::resolve_cli_fit_config(gam::config_resolve::CliFitConfigInput {
+    crate::config_resolve::resolve_cli_fit_config(crate::config_resolve::CliFitConfigInput {
         family: None,
         negative_binomial_theta: None,
         link: args.link.clone(),
@@ -259,7 +259,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         if let Some(components) = choice.mixture_components.as_ref() {
             let expected = components.len().saturating_sub(1);
             let initial_rho = if let Some(raw) = effective_mixture_rho.as_deref() {
-                let vals = gam::config_resolve::parse_comma_f64(raw, "link(rho=...)")?;
+                let vals = crate::config_resolve::parse_comma_f64(raw, "link(rho=...)")?;
                 if vals.len() != expected {
                     return Err(format!(
                         "link(rho=...) length mismatch: expected {expected}, got {}",
@@ -296,7 +296,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                 );
             }
             if let Some(raw) = effective_sas_init.as_deref() {
-                let vals = gam::config_resolve::parse_comma_f64(raw, "link(sas_init=...)")?;
+                let vals = crate::config_resolve::parse_comma_f64(raw, "link(sas_init=...)")?;
                 if vals.len() != 2 {
                     return Err(format!(
                         "link(sas_init=...) expects two values: epsilon,log_delta (got {})",
@@ -319,7 +319,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             }
             if let Some(raw) = effective_beta_logistic_init.as_deref() {
                 let vals =
-                    gam::config_resolve::parse_comma_f64(raw, "link(beta_logistic_init=...)")?;
+                    crate::config_resolve::parse_comma_f64(raw, "link(beta_logistic_init=...)")?;
                 if vals.len() != 2 {
                     return Err(format!(
                         "link(beta_logistic_init=...) expects two values: epsilon,delta (got {})",
@@ -449,11 +449,8 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // Shape-derived resource policy: at large-scale n we auto-select strict
     // (analytic-operator-required) so any silent dense fallback in the
     // term-construction layer fails fast.
-    let bare_fit_policy = gam::resource::ResourcePolicy::for_problem(
-        ds.values.nrows(),
-        0,
-        gam::resource::ProblemHints::default(),
-    );
+    let bare_fit_policy =
+        gam::ResourcePolicy::for_problem(ds.values.nrows(), 0, gam::ProblemHints::default());
     let mut spec = build_termspec(
         &parsed.terms,
         &ds,
@@ -1100,14 +1097,14 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         ds,
         col_map_for_termspec,
         inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )?;
     let mut logslopespec = build_termspec(
         &parsed_logslope.terms,
         ds,
         col_map_for_termspec,
         inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut marginalspec);
@@ -1211,7 +1208,7 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
             },
             options,
             kappa_options: kappa_options.clone(),
-            policy: gam::resource::ResourcePolicy::default_library(),
+            policy: gam::ResourcePolicy::default_library(),
         },
     )) {
         Ok(FitResult::BernoulliMarginalSlope(result)) => {
@@ -1342,7 +1339,7 @@ pub(crate) fn run_fit_transformation_normal(
         ds,
         col_map,
         inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut covariate_spec);
@@ -1463,14 +1460,14 @@ pub(crate) fn run_fitwith_predict_noise(
         ds,
         col_map,
         inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )?;
     let mut meanspec = build_termspec(
         &parsed.terms,
         ds,
         col_map,
         inference_notes,
-        &gam::resource::ResourcePolicy::default_library(),
+        &gam::ResourcePolicy::default_library(),
     )?;
     if args.scale_dimensions {
         enable_scale_dimensions(&mut meanspec);
@@ -1606,7 +1603,7 @@ pub(crate) fn run_fitwith_predict_noise(
             );
             let resolved_base_link = link_choice
                 .map(|choice| {
-                    gam::config_resolve::effective_link_to_standard(
+                    crate::config_resolve::effective_link_to_standard(
                         choice.link,
                         "gaussian location-scale base link",
                     )
@@ -2114,7 +2111,7 @@ pub(crate) fn validate_fit_args_preflight(
             return Err("--noise-offset-column requires --predict-noise".to_string());
         }
     }
-    gam::config_resolve::validate_survival_baseline_args(
+    crate::config_resolve::validate_survival_baseline_args(
         survival_likelihood,
         &baseline_target_raw,
         fit_config.baseline_scale,

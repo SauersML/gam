@@ -26,13 +26,13 @@ use crate::inference::formula_dsl::{
     option_usize_any, option_usize_any_strict, option_usize_strict, strip_quotes,
 };
 use crate::inference::model::ColumnKindTag;
-use crate::solver::resource::ResourcePolicy;
 use crate::smooth::{
     BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
     TermCollectionSpec,
 };
+use crate::solver::resource::ResourcePolicy;
 use crate::types::ColIdx;
 
 /// Fraction of the data bounding-box diameter used as the default Matérn
@@ -1563,19 +1563,19 @@ pub fn build_smooth_basis(
                 .max(1);
             capped.min(fs_default_internal)
         };
-        let (n_knots, _) = parse_ps_internal_knots(options, degree, default_internal)?;
+        let (n_knots, _, effective_degree) =
+            parse_ps_internal_knots_allowing_degree_reduction(options, degree, default_internal)?;
+        let penalty_order = option_usize(options, "penalty_order")
+            .unwrap_or(if effective_degree > 1 { 2 } else { 1 })
+            .min(effective_degree);
         let marginal = BSplineBasisSpec {
-            degree,
-            penalty_order: option_usize(options, "penalty_order").unwrap_or(if degree > 1 {
-                2
-            } else {
-                1
-            }),
+            degree: effective_degree,
+            penalty_order,
             knotspec: resolve_nonperiodic_bspline_knotspec(
                 options,
                 ds.values.column(c),
                 (minv, maxv),
-                degree,
+                effective_degree,
                 n_knots,
             )?,
             // mgcv's `bs="fs"` is a random-effect-style smooth: EVERY per-level
@@ -3847,6 +3847,48 @@ mod tests {
         }
     }
 
+    fn factor_dataset() -> Dataset {
+        let rows = (0..24)
+            .map(|i| {
+                let x = i as f64 / 23.0;
+                let g = (i % 2) as f64;
+                vec![x + g, x, g]
+            })
+            .collect::<Vec<_>>();
+        Dataset {
+            headers: vec!["y".into(), "x".into(), "g".into()],
+            values: Array2::from_shape_vec(
+                (rows.len(), 3),
+                rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+            )
+            .expect("rectangular factor test data"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "y".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "x".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "g".into(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: vec!["a".into(), "b".into()],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Categorical,
+            ],
+        }
+    }
+
     fn inferred_tensor_basis_product(ds: &Dataset) -> usize {
         let parsed = parse_formula("y ~ te(theta, h)").expect("parse tensor formula");
         let col_map = ds.column_map();
@@ -4244,6 +4286,50 @@ mod tests {
         assert_eq!(eff_degree, 3);
         assert_eq!(internal, 2);
         assert!(!inferred);
+    }
+
+    #[test]
+    fn factor_smooth_marginal_degree_reduces_for_small_k() {
+        let ds = factor_dataset();
+        let col_map = ds.column_map();
+
+        for (k, expected_degree) in [(3usize, 2usize), (2usize, 1usize)] {
+            let parsed =
+                parse_formula(&format!("y ~ s(x, g, bs=fs, k={k})")).expect("parse factor smooth");
+            let mut notes = Vec::new();
+            let terms = build_termspec(
+                &parsed.terms,
+                &ds,
+                &col_map,
+                &mut notes,
+                &crate::solver::resource::ResourcePolicy::default_library(),
+            )
+            .unwrap_or_else(|err| panic!("fs k={k} should degree-reduce, got: {err:?}"));
+            let SmoothBasisSpec::FactorSmooth { spec } = &terms.smooth_terms[0].basis else {
+                panic!(
+                    "expected factor smooth, got {:?}",
+                    terms.smooth_terms[0].basis
+                );
+            };
+            assert_eq!(spec.marginal.degree, expected_degree);
+            assert!(
+                spec.marginal.penalty_order <= spec.marginal.degree,
+                "penalty_order {} must be clamped to degree {}",
+                spec.marginal.penalty_order,
+                spec.marginal.degree
+            );
+            let basis_size = match spec.marginal.knotspec {
+                BSplineKnotSpec::Generate {
+                    num_internal_knots, ..
+                } => num_internal_knots + spec.marginal.degree + 1,
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots: Some(num_internal_knots),
+                    ..
+                } => num_internal_knots + spec.marginal.degree + 1,
+                ref other => panic!("unexpected factor-smooth knotspec: {other:?}"),
+            };
+            assert_eq!(basis_size, k);
+        }
     }
 
     #[test]

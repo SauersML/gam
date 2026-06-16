@@ -136,8 +136,8 @@
 use ndarray::{Array1, ArrayView1};
 
 use crate::terms::analytic_penalties::{AnalyticPenalty, SparsityPenalty};
-use crate::terms::sae::atom_codes::{BitVec, SparseAtomCode};
 use crate::terms::latent::LatentCoordValues;
+use crate::terms::sae::atom_codes::{BitVec, SparseAtomCode};
 
 // ---------------------------------------------------------------------------
 // Atom shape (decoder reference) — kept as an opaque token here.

@@ -38,10 +38,10 @@
 //! claim's history and restart its e-process from 1, which is exactly the
 //! optional-stopping abuse the ledger exists to prevent.
 
-use crate::warm_start::store::{EntryKind, StoreOptions, WarmStartStore};
-use crate::warm_start::{Fingerprint, Fingerprinter};
 use crate::inference::structure_evidence::StructureLedger;
 use crate::terms::smooth::TermCollectionSpec;
+use crate::warm_start::store::{EntryKind, StoreOptions, WarmStartStore};
+use crate::warm_start::{Fingerprint, Fingerprinter};
 use std::time::Duration;
 
 /// The default level for the dictionary's e-BH structure certificate.

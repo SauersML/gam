@@ -1001,12 +1001,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
 
     let n = 4usize;
-    let logits = array![
-        [0.4_f64, -0.2],
-        [-0.1, 0.5],
-        [0.3, 0.1],
-        [-0.4, 0.2]
-    ];
+    let logits = array![[0.4_f64, -0.2], [-0.1, 0.5], [0.3, 0.1], [-0.4, 0.2]];
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         vec![coords_a, coords_b],
@@ -1025,11 +1020,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
         [0.05, -0.20]
     ];
     let alpha = 5.0_f64;
-    let rho = SaeManifoldRho::new(
-        0.0,
-        0.0,
-        vec![array![alpha.ln()], array![alpha.ln()]],
-    );
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![alpha.ln()], array![alpha.ln()]]);
     let probe = SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM;
 
     // Dense layout: pin `Some(None)` so the override forces the dense path

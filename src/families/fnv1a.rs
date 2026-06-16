@@ -1,11 +1,15 @@
-//! Shared FNV-1a 64-bit hashing primitive used by the survival warm-start
-//! caches. Several caches key per-row warm-start state on the bit pattern of
-//! coefficient slices and scalars; this gives them one canonical byte-feeding
+//! Shared FNV-1a 64-bit hashing primitive for family-local cache
+//! fingerprints.
+//!
+//! Family implementations use this to key warm-start and exact-evaluation
+//! caches from byte-identical coefficient slices, row states, and scalar
+//! parameters. The type gives those caches one canonical byte-feeding
 //! convention so distinct cache streams stay mutually consistent.
 //!
 //! At 64 bits, false collisions across distinct inputs are astronomically
-//! rare; on a miss the caller simply re-solves from a closed-form seed, so the
-//! hash is a performance optimization rather than a correctness dependency.
+//! rare; on a miss the caller simply re-solves or rebuilds from the uncached
+//! path, so the hash is a performance optimization rather than a correctness
+//! dependency.
 
 use ndarray::Array1;
 
@@ -13,7 +17,7 @@ const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
 /// Streaming FNV-1a 64-bit hasher with the byte-feeding conventions shared by
-/// the survival intercept warm-start caches.
+/// family cache fingerprints.
 #[derive(Clone, Copy)]
 pub(crate) struct Fnv1a {
     hash: u64,

@@ -253,6 +253,78 @@ mod tests {
         assert_eq!(tf.h[0][1], tf.h[1][0], "tower mixed-partial symmetry");
     }
 
+    #[test]
+    fn tower_contractions_match_dirjet_directional_coefficients() {
+        const K: usize = 3;
+        let p = [0.37_f64, -0.42_f64, 0.19_f64];
+        let q = [0.25_f64, -0.7_f64, 1.3_f64];
+        let u = [-0.4_f64, 0.9_f64, 0.15_f64];
+        let w = [1.1_f64, -0.2_f64, 0.6_f64];
+
+        let tower = nonlinear_tower_program(p);
+        let third = tower.third_contracted(&q);
+        let fourth = tower.fourth_contracted(&u, &w);
+
+        for a in 0..K {
+            for b in 0..K {
+                let mut dirs3 = [[0.0; K]; 3];
+                dirs3[0][a] = 1.0;
+                dirs3[1][b] = 1.0;
+                dirs3[2] = q;
+                let jet3 = nonlinear_dirjet_program(p, &dirs3);
+                assert_close(
+                    jet3.coeff(jet3.full_mask()),
+                    third[a][b],
+                    &format!("third contraction ({a},{b})"),
+                );
+
+                let mut dirs4 = [[0.0; K]; 4];
+                dirs4[0][a] = 1.0;
+                dirs4[1][b] = 1.0;
+                dirs4[2] = u;
+                dirs4[3] = w;
+                let jet4 = nonlinear_dirjet_program(p, &dirs4);
+                assert_close(
+                    jet4.coeff(jet4.full_mask()),
+                    fourth[a][b],
+                    &format!("fourth contraction ({a},{b})"),
+                );
+            }
+        }
+    }
+
+    fn nonlinear_tower_program(p: [f64; 3]) -> Tower4<3> {
+        let x = Tower4::<3>::variable(p[0], 0);
+        let y = Tower4::<3>::variable(p[1], 1);
+        let z = Tower4::<3>::variable(p[2], 2);
+        let eta = x * y + x * z + z * 0.7;
+        let g = eta.exp();
+        (g + 2.0).ln() * g
+    }
+
+    fn nonlinear_dirjet_program(p: [f64; 3], dirs: &[[f64; 3]]) -> MultiDirJet {
+        let n_dirs = dirs.len();
+        let x = MultiDirJet::linear(n_dirs, p[0], &direction_components(dirs, 0));
+        let y = MultiDirJet::linear(n_dirs, p[1], &direction_components(dirs, 1));
+        let z = MultiDirJet::linear(n_dirs, p[2], &direction_components(dirs, 2));
+        let eta = x.mul(&y).add(&x.mul(&z)).add(&z.scale(0.7));
+        let g = exp_dirjet(&eta);
+        ln_dirjet(&g.add(&MultiDirJet::constant(n_dirs, 2.0))).mul(&g)
+    }
+
+    fn direction_components(dirs: &[[f64; 3]], axis: usize) -> Vec<f64> {
+        dirs.iter().map(|dir| dir[axis]).collect()
+    }
+
+    fn assert_close(got: f64, want: f64, label: &str) {
+        let tol = 1.0e-12 * want.abs().max(1.0);
+        assert!(
+            (got - want).abs() <= tol,
+            "{label}: got={got:.17e}, want={want:.17e}, diff={:.3e}, tol={tol:.3e}",
+            (got - want).abs()
+        );
+    }
+
     fn exp_dirjet(j: &MultiDirJet) -> MultiDirJet {
         let e = j.coeff(0).exp();
         j.compose_unary([e, e, e, e, e])

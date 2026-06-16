@@ -10,7 +10,6 @@
 //! - The two GPU dispatch blocks (Stage 3.3) that call into
 //!   `crate::solver::gpu::pirls_dispatch_wire`.
 
-use crate::solver::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
 use super::{
     // state re-exports
     AdaptiveKktTolerance,
@@ -61,6 +60,7 @@ use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatr
 use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
+use crate::solver::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
 use crate::types::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, LinkFunction,
     LogSmoothingParamsView, MixtureLinkState, ResponseFamily, RidgePassport, RidgePolicy,

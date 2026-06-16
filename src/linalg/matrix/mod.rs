@@ -3428,7 +3428,6 @@ impl DenseDesignOperator for ResidualisedDesignOperator {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // ConditionedDesign — lazy per-column affine transform
 // ---------------------------------------------------------------------------

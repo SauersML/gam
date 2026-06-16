@@ -1,9 +1,9 @@
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
-use crate::linalg::sparse_exact::{SparseExactFactor, SparsePenaltyBlock};
+use crate::linalg::sparse_exact::SparseExactFactor;
+use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::solver::pirls::assemble_and_factor_sparse_penalized_system;
 use crate::solver::rho_optimizer::OuterEval;
-use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::terms::basis::LocalDesignJacobianProvider;
 use crate::types::SasLinkState;
 use ndarray::{Array1, Array2, s};
@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 pub(crate) mod assembly;
 pub(crate) mod atoms;
-mod cache;
 pub(crate) mod continuation;
 pub(crate) mod eval;
 mod firth;
@@ -23,10 +22,16 @@ mod inner_strategy;
 pub(crate) mod jeffreys_subspace;
 pub(crate) mod penalty_logdet;
 pub(crate) mod per_atom_efs;
+mod rho_key;
 pub(crate) mod rho_prior_eval;
 pub(crate) mod runtime;
+mod sparse_exact_penalty;
 mod trace;
 pub(crate) mod unified;
+
+pub(crate) use sparse_exact_penalty::{
+    SparsePenaltyBlock, build_sparse_penalty_blocks_from_canonical,
+};
 
 pub(crate) const EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 pub(crate) const FIRTH_MAX_OBSERVATIONS: usize = 20_000;
@@ -4439,7 +4444,7 @@ impl EvalCacheManager {
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure key stability.
     pub(crate) fn sanitized_rhokey(rho: &Array1<f64>) -> Option<Vec<u64>> {
-        self::cache::sanitized_rhokey(rho)
+        self::rho_key::sanitized_rhokey(rho)
     }
 
     /// Memoizing wrapper for `PenaltySubspace` construction.

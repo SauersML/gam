@@ -325,4 +325,3 @@ where
 {
     fit_gamwith_heuristic_lambdas(x, y, weights, offset, s_list, None, family, opts)
 }
-

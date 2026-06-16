@@ -44,7 +44,6 @@ use std::sync::Arc;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::warm_start::Fingerprinter;
 use crate::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use crate::inference::structure_evidence::{ClaimKind, StructureLedger};
 use crate::linalg::faer_ndarray::{FaerCholesky, FaerEigh};
@@ -55,8 +54,8 @@ use crate::solver::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, TopologyScoreScale,
     select_topology_with_fit,
 };
-use crate::terms::sae::atom_codes::SparseAtomCodes;
 use crate::terms::latent::{LatentIdMode, LatentManifold};
+use crate::terms::sae::atom_codes::SparseAtomCodes;
 use crate::terms::sae::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
@@ -64,6 +63,7 @@ use crate::terms::sae::basis::{
 use crate::terms::sae::manifold::{
     SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
+use crate::warm_start::Fingerprinter;
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
 /// that row when deriving the discrete co-activation support. A soft softmax /
@@ -578,8 +578,11 @@ fn duplicate_atom(
     }
     let mut coords = term.assignment.coords.clone();
     coords.push(term.assignment.coords[parent].clone());
-    let assignment =
-        crate::terms::sae::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
+    let assignment = crate::terms::sae::manifold::SaeAssignment::with_mode(
+        logits,
+        coords,
+        term.assignment.mode,
+    )?;
     let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
@@ -1266,12 +1269,11 @@ fn born_atom(
             // Coordinate block matched to the winning evaluator's intrinsic dim,
             // carrying the winning chart manifold so the joint refit retracts on
             // the right geometry.
-            let coord_block =
-                crate::terms::latent::LatentCoordValues::from_matrix_with_manifold(
-                    fit.coords.view(),
-                    LatentIdMode::None,
-                    fit.manifold.clone(),
-                );
+            let coord_block = crate::terms::latent::LatentCoordValues::from_matrix_with_manifold(
+                fit.coords.view(),
+                LatentIdMode::None,
+                fit.manifold.clone(),
+            );
             (atom, coord_block)
         }
         None => {
@@ -1296,8 +1298,11 @@ fn born_atom(
     }
     let mut coords = term.assignment.coords.clone();
     coords.push(born_coord_block);
-    let assignment =
-        crate::terms::sae::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
+    let assignment = crate::terms::sae::manifold::SaeAssignment::with_mode(
+        logits,
+        coords,
+        term.assignment.mode,
+    )?;
     let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();

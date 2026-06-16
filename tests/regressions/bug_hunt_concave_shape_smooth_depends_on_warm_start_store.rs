@@ -1,6 +1,6 @@
 //! Bug-hunt regression: the result of a `shape=concave` (curvature-constrained)
-//! univariate smooth depends on whether the persistent warm-start cache is cold
-//! or warm. A cache is a performance optimization; it must never change the
+//! univariate smooth depends on whether the persistent warm-start store is cold
+//! or warm. The store is a performance optimization; it must never change the
 //! number a fit returns — let alone decide whether the fit succeeds at all.
 //!
 //! ## What happens
@@ -50,10 +50,10 @@
 //! ## The assertion
 //!
 //! Both fits must succeed, and a warm-start cache must not change the answer:
-//! the cold-cache and warm-cache predictions must agree to a tight tolerance.
+//! the cold-store and warm-store predictions must agree to a tight tolerance.
 //! When buggy, the cold fit aborts (release) or diverges by ~1.3e-2 (debug);
 //! either way this test fails. When the constrained startup is fixed so the
-//! cold-cache fit converges to the same constrained optimum the warm-start path
+//! cold-store fit converges to the same constrained optimum the warm-start path
 //! reaches, the test passes without edits.
 
 use gam::matrix::LinearOperator;
@@ -84,7 +84,7 @@ fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
 
     let cfg = FitConfig::default(); // gaussian / identity / REML
     let result = fit_from_formula(formula, &ds, &cfg).unwrap_or_else(|e| {
-        panic!("fit '{formula}' aborted (cold-cache constrained-startup failure): {e}")
+        panic!("fit '{formula}' aborted (cold-store constrained-startup failure): {e}")
     });
     let FitResult::Standard(fit) = result else {
         panic!("1-D gaussian smooth should be a Standard GAM fit");
@@ -103,25 +103,25 @@ fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
 }
 
 #[test]
-fn concave_shape_smooth_is_invariant_to_warm_start_cache_state() {
+fn concave_shape_smooth_is_invariant_to_warm_start_store_state() {
     init_parallelism();
 
     // Point the persistent warm-start store at a fresh, empty, per-run
-    // directory so the FIRST fit below runs against a guaranteed-cold cache.
+    // directory so the FIRST fit below runs against a guaranteed-cold store.
     // The store lives under `std::env::temp_dir()/gam/warm/v1`, and on Unix
     // `temp_dir()` resolves `TMPDIR`.
-    let mut cache_root = std::env::temp_dir();
-    cache_root.push(format!("gam_cold_cache_{}_{}", std::process::id(), salt()));
-    std::fs::create_dir_all(&cache_root).expect("create private cold-cache TMPDIR");
+    let mut store_root = std::env::temp_dir();
+    store_root.push(format!("gam_cold_store_{}_{}", std::process::id(), salt()));
+    std::fs::create_dir_all(&store_root).expect("create private cold-store TMPDIR");
     // SAFETY: single-threaded test setup, before any fit or other thread reads
     // the environment. Edition-2024 marks `set_var` unsafe.
     unsafe {
-        std::env::set_var("TMPDIR", &cache_root);
+        std::env::set_var("TMPDIR", &store_root);
     }
     assert_eq!(
         std::env::temp_dir(),
-        cache_root,
-        "TMPDIR override did not take effect; cannot guarantee a cold cache"
+        store_root,
+        "TMPDIR override did not take effect; cannot guarantee a cold store"
     );
 
     // Deterministic, noise-free binding signal: sin(3·π·x) has convex stretches
@@ -137,9 +137,9 @@ fn concave_shape_smooth_is_invariant_to_warm_start_cache_state() {
 
     let formula = "y ~ s(x, k=12, shape=concave)";
 
-    // First fit: COLD cache (no warm-start seed available).
+    // First fit: COLD store (no warm-start seed available).
     let pred_cold = fit_and_predict_on_grid(formula, &x, &y);
-    // Second fit: WARM cache (the first fit populated the seed-prefix store).
+    // Second fit: WARM store (the first fit populated the seed-prefix store).
     let pred_warm = fit_and_predict_on_grid(formula, &x, &y);
 
     assert!(
@@ -147,7 +147,7 @@ fn concave_shape_smooth_is_invariant_to_warm_start_cache_state() {
         "predictions must be finite"
     );
 
-    // A warm-start cache is a performance optimization: it must not change the
+    // A warm-start store is a performance optimization: it must not change the
     // fitted curve. The cold and warm fits must agree to a tight tolerance,
     // scaled by the response range so the bound is meaningful regardless of the
     // (small) amplitude of the best concave fit. The observed cold-vs-warm

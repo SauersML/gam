@@ -1,4 +1,4 @@
-//! Bug hunt: `cache::key::Fingerprinter` does NOT disambiguate primitive types,
+//! Bug hunt: `warm_start::key::Fingerprinter` does NOT disambiguate primitive types,
 //! contradicting its own module documentation.
 //!
 //! The `Fingerprinter` doc comment states (verbatim):
@@ -8,7 +8,7 @@
 //! > little-endian bytes of 0.5>)`.
 //!
 //! That promise is false. `absorb_f64(tag, v)` is implemented as
-//! `absorb_bytes(tag, &v.to_bits().to_le_bytes())` (src/cache/key.rs:100-102),
+//! `absorb_bytes(tag, &v.to_bits().to_le_bytes())` (src/warm_start/key.rs),
 //! and `absorb_str`/`absorb_u64` likewise forward to `absorb_bytes` with the
 //! caller's tag and the raw payload. None of them writes a per-*type*
 //! discriminator — only the caller-supplied content tag and a length. So two
@@ -24,7 +24,7 @@
 //! per-type discriminator is added to the typed `absorb_*` methods, every pair
 //! becomes distinct and this test passes unchanged.
 
-use gam::cache::Fingerprinter;
+use gam::warm_start::Fingerprinter;
 
 #[test]
 fn absorb_f64_does_not_collide_with_equivalent_absorb_bytes() {

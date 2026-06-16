@@ -1,16 +1,14 @@
-use crate::families::lognormal_kernel::{FrailtySpec, HazardLoading};
-use crate::families::survival::{
-    SurvivalLikelihoodMode, parse_survival_likelihood_mode,
-};
-use crate::inference::formula_dsl::parse_link_choice;
-use crate::inference::model::GroupMetadata;
-use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
-use crate::solver::build_analytic_penalty_registry_from_descriptors;
-use crate::solver::workflow::{CtnStage1Recipe, FitConfig};
-use crate::survival::parse_survival_distribution;
-use crate::survival_location_scale::residual_distribution_inverse_link;
-use crate::transformation_normal::TransformationNormalConfig;
-use crate::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};
+use gam::families::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam::families::survival::{SurvivalLikelihoodMode, parse_survival_likelihood_mode};
+use gam::inference::formula_dsl::parse_link_choice;
+use gam::inference::model::GroupMetadata;
+use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use gam::solver::build_analytic_penalty_registry_from_descriptors;
+use gam::solver::workflow::{CtnStage1Recipe, FitConfig};
+use gam::survival::parse_survival_distribution;
+use gam::survival_location_scale::residual_distribution_inverse_link;
+use gam::transformation_normal::TransformationNormalConfig;
+use gam::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};
 use ndarray::Array1;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -206,7 +204,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
     fit_config.topology_auto_selector = json_config
         .topology_auto_selector
         .as_ref()
-        .map(crate::solver::topology_selector::TopologyAutoSelector::from_json)
+        .map(gam::solver::topology_selector::TopologyAutoSelector::from_json)
         .transpose()?;
     fit_config.family = normalize_optional_family(json_config.family);
     fit_config.offset_column = json_config.offset;
@@ -906,8 +904,8 @@ fn group_metadata_from_groups(groups: JsonValue) -> Result<Option<GroupMetadata>
     }
 }
 
-fn parse_gpu_policy(raw_gpu: &str) -> Result<crate::gpu::GpuPolicy, String> {
-    crate::gpu::GpuPolicy::parse(raw_gpu).ok_or_else(|| {
+fn parse_gpu_policy(raw_gpu: &str) -> Result<gam::gpu::GpuPolicy, String> {
+    gam::gpu::GpuPolicy::parse(raw_gpu).ok_or_else(|| {
         format!(
             "invalid gpu policy '{}'; supported values are auto, off, force",
             raw_gpu
@@ -937,7 +935,7 @@ fn survival_link_usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::lognormal_kernel::FrailtySpec;
+    use gam::families::lognormal_kernel::FrailtySpec;
     use serde_json::{Value, json};
 
     struct ParityCase {

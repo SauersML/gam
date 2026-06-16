@@ -25,10 +25,10 @@
 //!
 //! Deterministic: fixed-seed `StdRng`, no time / unseeded RNG.
 
+use gam::ResourcePolicy;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
-use gam::resource::ResourcePolicy;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary,
 };

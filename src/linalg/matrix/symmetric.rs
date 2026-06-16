@@ -498,4 +498,3 @@ fn add_sparse_symmetric_upper(
     SparseColMat::try_new_from_triplets(lhs.nrows(), lhs.ncols(), &triplets)
         .map_err(|_| "add_sparse_symmetric_upper failed to assemble CSC".to_string())
 }
-

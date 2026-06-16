@@ -307,7 +307,9 @@ pub fn saved_sas_state_from_fit(fit: &UnifiedFitResult) -> Option<SasLinkState> 
     }
 }
 
-fn validate_fitted_link_estimation(fitted_link: &FittedLinkState) -> Result<(), EstimationError> {
+pub(crate) fn validate_fitted_link_estimation(
+    fitted_link: &FittedLinkState,
+) -> Result<(), EstimationError> {
     match fitted_link {
         FittedLinkState::Standard(_) => Ok(()),
         FittedLinkState::LatentCLogLog { state } => {
@@ -1593,4 +1595,3 @@ impl UnifiedFitResult {
         }
     }
 }
-

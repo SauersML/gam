@@ -1,3 +1,4 @@
+use gam::ResourcePolicy;
 use gam::custom_family::{CustomFamily, ParameterBlockSpec, ParameterBlockState};
 use gam::families::gamlss::{
     BinomialLocationScaleFamily, BinomialMeanWiggleFamily, GammaLogFamily,
@@ -5,7 +6,6 @@ use gam::families::gamlss::{
 };
 use gam::families::sigma_link::LOGB_SIGMA_FLOOR;
 use gam::matrix::DesignMatrix;
-use gam::resource::ResourcePolicy;
 use gam::types::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, array};
 

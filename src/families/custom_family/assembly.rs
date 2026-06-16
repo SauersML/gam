@@ -646,7 +646,7 @@ fn assembled_operator_cache() -> &'static Mutex<AssembledOperatorCache> {
 }
 
 /// Fold a finite `f64`'s canonical bit pattern into a hasher (±0.0 → +0.0,
-/// mirroring `solver::reml::cache::sanitized_rhokey`). Non-finite values poison
+/// mirroring `solver::reml::rho_key::sanitized_rhokey`). Non-finite values poison
 /// the fingerprint with a distinguished sentinel so a NaN/∞ assembly never
 /// aliases a finite one (it will simply never hit, which is the safe outcome).
 fn hash_f64<H: std::hash::Hasher>(value: f64, hasher: &mut H) {
@@ -2196,4 +2196,3 @@ pub(crate) struct CachedInnerMode {
     pub(crate) active_constraints:
         Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
-

@@ -655,10 +655,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // in the cycle, then hard-fail (Err) just before ρ if any of them
             // diverged. Cf. `src/solver/row_measure.rs`.
             let tr_row_measure_top =
-                crate::solver::row_measure::TrustRegionRowMeasure::from_options(
-                    options,
-                    total_joint_n,
-                );
+                crate::solver::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             let hessian_started = std::time::Instant::now();
             let hessian_scope_guard = crate::process_monitor::track_scope(format!(
                 "joint Newton hessian_qp cycle={cycle} n={total_joint_n} p={total_p}"
@@ -729,10 +726,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             };
             // Row measure observed by the Hessian build above.
             let tr_row_measure_hessian =
-                crate::solver::row_measure::TrustRegionRowMeasure::from_options(
-                    options,
-                    total_joint_n,
-                );
+                crate::solver::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             let joint_hessian_source = match joint_hessian_source {
                 Some(source) => source,
                 None => {
@@ -784,10 +778,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // now, the id captured here will diverge from the rest and the
             // pre-ρ check below will Err. Cf. `src/solver/row_measure.rs`.
             let tr_row_measure_gradient =
-                crate::solver::row_measure::TrustRegionRowMeasure::from_options(
-                    options,
-                    total_joint_n,
-                );
+                crate::solver::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             if grad_joint.len() != total_p {
                 break;
             }
@@ -1694,10 +1685,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // set on the previous cycle (or at function entry) under `options`;
             // see top-of-cycle capture for rationale.
             let tr_row_measure_old_objective =
-                crate::solver::row_measure::TrustRegionRowMeasure::from_options(
-                    options,
-                    total_joint_n,
-                );
+                crate::solver::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             let mut accepted = false;
             let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
@@ -2296,7 +2284,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // any further auto-install; if either contract is broken the
                 // id will diverge from `tr_row_measure_top` and we Err below.
                 let tr_row_measure_trial =
-                    crate::solver::row_measure::TrustRegionRowMeasure::from_options(
+                    crate::solver::row_measure::RowSubsampleMask::from_options(
                         options,
                         total_joint_n,
                     );

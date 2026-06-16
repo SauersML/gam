@@ -2,7 +2,7 @@
 //! snapshot of a converged fit, designed so a *related* later fit (a
 //! leave-one-subject-out fold, a re-fit on a different row population, a
 //! different reduced width) can warm-start from it even though the exact
-//! response-keyed inner cache (`persistent_cache.rs`) misses.
+//! response-keyed inner cache (`persistent_warm_start.rs`) misses.
 //!
 //! The artifact is keyed by *structural identity*, not by data bytes. Two
 //! fits of the same term family (same role, same variables, same basis kind
@@ -28,7 +28,7 @@ pub(crate) const FIT_ARTIFACT_SCHEMA: u32 = 1;
 
 /// Saturation magnitude past which a copied ρ coordinate is considered
 /// pinned at the outer optimizer's box and is NOT transferred. Mirrors the
-/// persist-side gate in `families/custom_family/persistent_cache.rs` and the
+/// persist-side gate in `families/custom_family/persistent_warm_start.rs` and the
 /// `[CACHE] hit-clamp` policy in `solver/outer_strategy.rs`.
 pub(crate) const RHO_SATURATION: f64 = 9.0;
 

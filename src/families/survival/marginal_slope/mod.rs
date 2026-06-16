@@ -99,7 +99,7 @@ pub(crate) use crate::solver::estimate::reml::unified::HyperOperator;
 
 pub(crate) use crate::types::{InverseLink, StandardLink};
 
-pub(crate) use crate::families::fnv::Fnv1a;
+pub(crate) use crate::families::fnv1a::Fnv1a;
 
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 

@@ -1453,8 +1453,8 @@ pub(crate) fn run_predict_survival(
     }
     if p_cov > 0 {
         let cov_start = p_time + p_timewiggle;
-        let chunk_rows = gam::resource::rows_for_target_bytes(
-            gam::resource::ResourcePolicy::default_library().row_chunk_target_bytes,
+        let chunk_rows = gam::solver::resource::rows_for_target_bytes(
+            gam::ResourcePolicy::default_library().row_chunk_target_bytes,
             p_cov,
         )
         .min(n.max(1));

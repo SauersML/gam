@@ -10,11 +10,11 @@
 //! Back-compat: a *scalar* `knots=<int>` keeps its historical meaning as an
 //! internal-knot count and still produces `BSplineKnotSpec::Generate`.
 
+use gam::ResourcePolicy;
 use gam::basis::{BSplineKnotPlacement, BSplineKnotSpec};
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::parse_formula;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::resource::ResourcePolicy;
 use gam::smooth::SmoothBasisSpec;
 use gam::terms::term_builder::build_termspec;
 use ndarray::Array2;

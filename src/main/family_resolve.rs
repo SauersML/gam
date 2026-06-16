@@ -99,7 +99,7 @@ pub(crate) fn resolve_binomial_inverse_link_for_fit(
         | InverseLink::Standard(StandardLink::Log)
         | InverseLink::LatentCLogLog(_)
         | InverseLink::Mixture(_) => Ok(InverseLink::Standard(
-            gam::config_resolve::effective_link_to_standard(effective_link, context)?,
+            crate::config_resolve::effective_link_to_standard(effective_link, context)?,
         )),
     }
 }

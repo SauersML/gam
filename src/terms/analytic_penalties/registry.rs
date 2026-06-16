@@ -255,7 +255,7 @@ impl AnalyticPenaltyRegistry {
 // ---------------------------------------------------------------------------
 //
 // The canonical PIRLS / REML pipeline consumes square symmetric operators
-// through the `PenaltyOp` trait (see `terms::penalty_op`). The non-quadratic
+// through the `PenaltyOp` trait (see `terms::penalties::op`). The non-quadratic
 // analytic penalties here are *not* linear in their target, but the inner
 // Newton step only sees their **Hessian at the current iterate**. We therefore
 // expose each penalty as a `PenaltyOp` by

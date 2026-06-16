@@ -1,5 +1,6 @@
 use super::*;
 
+/// A comprehensive error type for the model estimation process.
 pub enum EstimationError {
     #[error("Underlying basis function generation failed: {0}")]
     BasisError(#[from] crate::basis::BasisError),
@@ -207,6 +208,22 @@ impl EstimationError {
     }
 }
 
+impl From<crate::linalg::LinalgError> for EstimationError {
+    fn from(error: crate::linalg::LinalgError) -> Self {
+        match error {
+            crate::linalg::LinalgError::InvalidInput(message) => {
+                EstimationError::InvalidInput(message)
+            }
+            crate::linalg::LinalgError::HessianNotPositiveDefinite { min_eigenvalue } => {
+                EstimationError::HessianNotPositiveDefinite { min_eigenvalue }
+            }
+            crate::linalg::LinalgError::ModelIsIllConditioned { condition_number } => {
+                EstimationError::ModelIsIllConditioned { condition_number }
+            }
+        }
+    }
+}
+
 //
 // This uses the joint model architecture where the base predictor and
 // flexible link are fitted together in one optimization with REML.
@@ -215,4 +232,3 @@ impl EstimationError {
 // Domain-specific training orchestration is handled by caller adapters.
 // The gam engine exposes matrix/family-based external-design APIs for supported
 // GLM-style families: fit_gam / optimize_external_design.
-

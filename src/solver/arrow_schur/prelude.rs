@@ -6,7 +6,6 @@
 
 pub(crate) use super::reduced_solve::ArrowSchurError;
 pub(crate) use super::system::ArrowRowBlock;
-pub(crate) use crate::warm_start::Fingerprinter;
 pub(crate) use crate::linalg::faer_ndarray::{FaerArrayView, FaerEigh, FaerLlt};
 pub(crate) use crate::linalg::triangular::{
     cholesky_solve_matrix, cholesky_solve_vector, forward_substitution_lower_matrix,
@@ -15,6 +14,7 @@ pub(crate) use crate::terms::analytic_penalties::{
     AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier,
 };
 pub(crate) use crate::terms::latent::{LatentCoordValues, LatentManifold};
+pub(crate) use crate::warm_start::Fingerprinter;
 pub(crate) use faer::Side;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 pub(crate) use std::ops::Range;

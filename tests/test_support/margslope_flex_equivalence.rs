@@ -8,13 +8,13 @@
 //! mod margslope_flex_equivalence;
 //! ```
 
+use gam::ResourcePolicy;
 use gam::families::bms::{
     BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec, DeviationBlockConfig,
     LatentZPolicy,
 };
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
-use gam::resource::ResourcePolicy;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec,

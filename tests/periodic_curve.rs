@@ -1,6 +1,6 @@
+use gam::ResourcePolicy;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::resource::ResourcePolicy;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, OneDimensionalBoundary,
     PeriodicBSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d,

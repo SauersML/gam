@@ -19,15 +19,14 @@ pub use analytic_penalties::{
     BlockOrthogonalityPenalty, BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind,
     FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryDuchonRadialSource, IsometryPenalty,
     IsometryReference, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
-    NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty, ShapeMonotonicityPenalty,
+    NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
-    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ShapeMonotonicityPenalty,
     SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TopKActivationPenalty,
     TotalVariationPenalty, WeightField,
 };
-pub use sae::atom_selection::{
-    AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
-    L1Relaxed, ShapeRef, TopK,
+pub use basis::matern_gradient::{
+    MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator,
 };
 pub use decoders::gated_decoder::GatedSAEDecoder;
 pub use decoders::interchange_decoder::{
@@ -35,14 +34,18 @@ pub use decoders::interchange_decoder::{
     InterchangeSwapForward, interchange_decode_backward, interchange_decode_forward,
     interchange_swap_backward, interchange_swap_forward,
 };
+pub use dictionary::linear::{
+    LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryFit, fit_linear_dictionary,
+};
 pub use latent::{
     AuxPriorFamily, AuxPriorStrength, InputLocationDerivative, LatentCoordValues, LatentIdMode,
     LatentManifold,
 };
-pub use dictionary::linear::{
-    LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryFit, fit_linear_dictionary,
+pub use penalties::sheaf::{EdgeRestriction, SheafConsistencyPenalty};
+pub use sae::atom_selection::{
+    AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
+    L1Relaxed, ShapeRef, TopK,
 };
-pub use basis::matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
 pub use sae::criterion_atoms::{SaeCriterion, SaeCriterionAtom};
 pub use sae::encode_atlas::{
     AtlasConfig, AtomEncodeAtlas, BasisHessianLipschitz, CertifiedChart, ChartRegion, EncodeAtlas,
@@ -61,4 +64,3 @@ pub use sae::optimality_certificate::{
     deterministic_probe_direction, probe_step,
 };
 pub use sae::row_jet_program::{AtomRowBasisJet, RowGate, SaeReconstructionRowProgram};
-pub use penalties::sheaf::{EdgeRestriction, SheafConsistencyPenalty};

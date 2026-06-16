@@ -19,7 +19,7 @@
 //! - [`jeffreys`]         — the Jeffreys-prior contribution to the joint objective.
 //! - [`covariance`]       — joint covariance/geometry + stationarity/KKT residuals.
 //! - [`fit`]              — the public fit entry points + result assembly.
-//! - [`coefficient_groups`], [`persistent_cache`] — pre-existing concern modules.
+//! - [`coefficient_groups`], [`persistent_warm_start`] — pre-existing concern modules.
 //!
 //! Cross-submodule items are `pub(crate)`; each submodule pulls the shared
 //! crate-internal imports below in via `use super::*;`.
@@ -54,7 +54,7 @@ pub(crate) use coefficient_groups::validate_penalized_complexity_prior;
 pub(crate) use faer::Side;
 pub(crate) use joint_newton::whitened_spectrum;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
-pub(crate) use persistent_cache::{
+pub(crate) use persistent_warm_start::{
     capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
     store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
 };
@@ -88,7 +88,7 @@ mod psi_design;
 mod psi_hyper;
 
 mod coefficient_groups;
-mod persistent_cache;
+mod persistent_warm_start;
 
 // `pub use ...::*` preserves each item's own visibility (pub stays pub,
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.

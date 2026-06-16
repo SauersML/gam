@@ -207,7 +207,7 @@ pub struct SaeManifoldTerm {
     pub(crate) collapse_events: Vec<CollapseEvent>,
     /// Per-row **design honesty weights** (#991): Horvitz–Thompson inclusion
     /// corrections from a designed corpus subsample
-    /// ([`crate::inference::row_measure::EnrichmentRowMeasure::designed_subsample`] /
+    /// ([`crate::inference::row_measure::RowSamplingMeasure::designed_subsample`] /
     /// [`crate::terms::sae::corpus::designed_target`]), self-normalized to
     /// mean `1.0` over the term's rows so dispersion, dof, and the
     /// data-vs-penalty balance stay consistent at the fitted sample size while
@@ -291,7 +291,8 @@ pub struct SaeManifoldTerm {
     /// also profiled); a per-atom `None` means that atom had no active rows or a
     /// degenerate inner design. Read by [`Self::to_residual_gauge_model`], which
     /// attaches each onto its [`crate::terms::sae::identifiability::FittedAtom`].
-    pub(crate) atom_inner_fits: Option<Vec<Option<crate::terms::sae::identifiability::AtomInnerFit>>>,
+    pub(crate) atom_inner_fits:
+        Option<Vec<Option<crate::terms::sae::identifiability::AtomInnerFit>>>,
 }
 
 impl Clone for SaeManifoldTerm {

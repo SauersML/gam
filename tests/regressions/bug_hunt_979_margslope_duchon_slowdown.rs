@@ -25,6 +25,7 @@
 //!   cargo test --release --test bug_hunt_979_margslope_duchon_slowdown \
 //!       duchon_gaussian_smooth_baseline_is_fast -- --nocapture
 
+use gam::ResourcePolicy;
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability,
@@ -33,7 +34,6 @@ use gam::estimate::FitOptions;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
-use gam::resource::ResourcePolicy;
 use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TermCollectionSpec,

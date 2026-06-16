@@ -91,10 +91,6 @@ thread_local! {
     }) };
 }
 
-pub(crate) fn take_terms() -> TermStash {
-    TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
-}
-
 static A_SPLIT_SINK: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
 
 /// Record the first psi-coordinate's `a = a_likelihood + a_penalty_quadratic`
@@ -103,11 +99,6 @@ pub(crate) fn store_a_split(a_likelihood: f64, a_penalty_quadratic: f64) {
     if let Ok(mut slot) = A_SPLIT_SINK.lock() {
         *slot = Some((a_likelihood, a_penalty_quadratic));
     }
-}
-
-/// Drain the recorded `a`-channel split.
-pub(crate) fn take_a_split() -> Option<(f64, f64)> {
-    A_SPLIT_SINK.lock().ok().and_then(|mut slot| slot.take())
 }
 
 static KKT_PROBE_SINK: std::sync::Mutex<Option<(f64, bool)>> = std::sync::Mutex::new(None);
@@ -120,12 +111,25 @@ pub(crate) fn store_kkt_probe(residual_inf: f64, batched_override_fired: bool) {
     }
 }
 
-/// Drain the recorded KKT-residual probe.
-pub(crate) fn take_kkt_probe() -> Option<(f64, bool)> {
-    KKT_PROBE_SINK.lock().ok().and_then(|mut slot| slot.take())
-}
-
 /// Replace the calling thread's [`TermStash`].
 pub(crate) fn store_terms(stash: TermStash) {
     TERMS.with(|cell| *cell.borrow_mut() = stash);
+}
+
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn take_terms() -> TermStash {
+        TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+    }
+
+    /// Drain the recorded `a`-channel split.
+    pub(crate) fn take_a_split() -> Option<(f64, f64)> {
+        A_SPLIT_SINK.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Drain the recorded KKT-residual probe.
+    pub(crate) fn take_kkt_probe() -> Option<(f64, bool)> {
+        KKT_PROBE_SINK.lock().ok().and_then(|mut slot| slot.take())
+    }
 }

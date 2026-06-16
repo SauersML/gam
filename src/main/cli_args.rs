@@ -94,13 +94,13 @@ pub(crate) struct FitArgs {
     #[arg(long = "negative-binomial-theta", value_parser = parse_positive_f64_cli)]
     pub(crate) negative_binomial_theta: Option<f64>,
     /// Survival likelihood mode for Surv(...) formulas.
-    #[arg(long = "survival-likelihood", default_value = "transformation", value_parser = gam::config_resolve::parse_survival_likelihood_cli)]
+    #[arg(long = "survival-likelihood", default_value = "transformation", value_parser = crate::config_resolve::parse_survival_likelihood_cli)]
     pub(crate) survival_likelihood: String,
     /// Optional anchor time for survival location-scale mode.
     #[arg(long = "survival-time-anchor", value_parser = parse_nonnegative_f64_cli)]
     pub(crate) survival_time_anchor: Option<f64>,
     /// Baseline target for transformation survival mode.
-    #[arg(long = "baseline-target", default_value = "linear", value_parser = gam::config_resolve::parse_baseline_target_cli)]
+    #[arg(long = "baseline-target", default_value = "linear", value_parser = crate::config_resolve::parse_baseline_target_cli)]
     pub(crate) baseline_target: String,
     /// Weibull baseline scale (>0) when baseline-target=weibull.
     #[arg(long = "baseline-scale", value_parser = parse_positive_f64_cli)]

@@ -23,7 +23,7 @@ pub(crate) fn cache_schema_tag() -> String {
     // unified onto `Fingerprinter`. Prior on-disk warm-start entries are
     // walled off into the `schema2-` keyspace and cold-start once; this
     // is the intentional consequence of the unification, documented in
-    // the commit that performs it. See `src/cache/key.rs` for the new
+    // the commit that performs it. See `src/warm_start/key.rs` for the new
     // canonical hasher API.
     // Bumped to `v2` when the persistent warm-start key stopped hashing the
     // θ-dependent, lazily-refreshed isometry Jacobian cache slots
@@ -275,7 +275,9 @@ fn persistent_store() -> Option<WarmStartStore> {
 /// stashes the returned entry so the next [`crate::warm_start::Session::try_load`]
 /// returns it ahead of the (empty) exact-key store lookup. Save writes
 /// always go to the session's own key — the prefix lookup is read-only.
-pub(crate) fn lookup_outer_iterate_payload(seed_key: &str) -> Option<crate::warm_start::CachedEntry> {
+pub(crate) fn lookup_outer_iterate_payload(
+    seed_key: &str,
+) -> Option<crate::warm_start::CachedEntry> {
     let store = persistent_store()?;
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"outer-iterate-key", seed_key);
@@ -298,7 +300,9 @@ pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::warm
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"outer-iterate-key", key);
     let fp = fp.finalize();
-    Some(std::sync::Arc::new(crate::warm_start::Session::open(store, fp)))
+    Some(std::sync::Arc::new(crate::warm_start::Session::open(
+        store, fp,
+    )))
 }
 
 /// Persist a descriptor-indexed cross-fit [`FitArtifact`] under the

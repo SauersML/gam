@@ -365,11 +365,11 @@ pub(crate) fn locscale_joint_psi_direction_parts(
     primary_label: &str,
     policy: &crate::solver::resource::ResourcePolicy,
 ) -> Result<Option<LocScalePsiDirectionParts>, String> {
-    if block_states.len() != expected_blocks || derivative_blocks.len() != expected_blocks {
+    validate_block_count::<GamlssError>(family_name, expected_blocks, block_states.len())?;
+    if derivative_blocks.len() != expected_blocks {
         return Err(GamlssError::DimensionMismatch {
             reason: format!(
-                "{family_name} joint psi direction expects {expected_blocks} blocks and {expected_blocks} derivative block lists, got {} and {}",
-                block_states.len(),
+                "{family_name} joint psi direction expects {expected_blocks} derivative block lists, got {}",
                 derivative_blocks.len()
             ),
         }

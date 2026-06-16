@@ -565,7 +565,7 @@ fn max_principal_angle(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 
 #[test]
 fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
-    use gam::inference::row_measure::EnrichmentRowMeasure;
+    use gam::inference::row_measure::RowSamplingMeasure;
     use gam::inference::row_metric::RowMetric;
 
     let p = 12usize;
@@ -599,7 +599,7 @@ fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
         }
     });
     let metric = RowMetric::output_fisher(Arc::new(factors), 1, 1).expect("design metric");
-    let measure = EnrichmentRowMeasure::from_metric(&metric);
+    let measure = RowSamplingMeasure::from_metric(&metric);
     let budget = 90usize;
     let sample = measure.designed_subsample(budget, 23);
     assert!(

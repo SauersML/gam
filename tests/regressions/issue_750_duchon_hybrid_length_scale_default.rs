@@ -21,12 +21,12 @@
 //! recovers the canonical thin-plate smoothness order `m = ⌊d/2⌋ + 1` and agrees
 //! with the fractional cubic default for odd `d`.
 
+use gam::ResourcePolicy;
 use gam::basis::DuchonNullspaceOrder;
 use gam::estimate::FitOptions;
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::parse_formula;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::resource::ResourcePolicy;
 use gam::smooth::{SmoothBasisSpec, TermCollectionSpec};
 use gam::terms::term_builder::build_termspec;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};

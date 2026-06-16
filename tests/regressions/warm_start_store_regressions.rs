@@ -37,7 +37,7 @@ fn fingerprint_is_deterministic_and_distinguishes_typical_inputs() {
 #[test]
 fn fingerprint_hex_roundtrip_preserves_bits() {
     let mut h = Fingerprinter::new();
-    h.absorb_str(b"model", "cache-roundtrip");
+    h.absorb_str(b"model", "warm-start-roundtrip");
     h.absorb_f64_slice(b"x", &[1.5, -0.0, 9.25]);
     let fp = h.finalize();
 
@@ -176,6 +176,6 @@ fn concurrent_writes_do_not_lose_entries_and_budget_is_respected() {
 
     assert!(
         total <= 4096,
-        "Final on-disk cache size must not exceed the configured budget after concurrent insertion."
+        "Final on-disk warm-start store size must not exceed the configured budget after concurrent insertion."
     );
 }

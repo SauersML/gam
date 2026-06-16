@@ -46,7 +46,7 @@ impl RadialScalarKind {
     /// ```
     ///
     /// Re-pointing the existing ψ-derivative machinery at the first kernel
-    /// argument t (see `crate::terms::input_loc_derivatives`).
+    /// argument t (see `crate::terms::basis::input_loc_derivatives`).
     ///
     /// Returns `true` iff both `q = φ'(r)/r` and `t = (φ''(r) − q)/r²` have
     /// finite limits as `r → 0+` for this kernel. When this returns `false`

@@ -1,6 +1,6 @@
-//! Row-measure handle for trust-region invariant enforcement.
+//! Row-subsample mask handle for trust-region invariant enforcement.
 //!
-//! A `TrustRegionRowMeasure` is the explicit identity of the set of rows + per-row
+//! A `RowSubsampleMask` is the explicit identity of the set of rows + per-row
 //! weights used to evaluate any one of {Hessian, gradient, objective}
 //! during a single inner trust-region iteration. The trust-region
 //! globalization computes
@@ -14,10 +14,10 @@
 //! different objectives and ρ can take any sign, producing the observed
 //! ρ = -0.05 with predicted_reduction = +7.378e6 sign flip.
 //!
-//! `TrustRegionRowMeasure::id` is a stable 64-bit content hash: equal masks
+//! `RowSubsampleMask::id` is a stable 64-bit content hash: equal masks
 //! (`Arc<OuterScoreSubsample>` pointer equality OR identical mask
 //! contents) ⇒ equal ids; differing masks ⇒ differing ids with high
-//! probability. The TR loop captures one `TrustRegionRowMeasure` at the top of an
+//! probability. The TR loop captures one `RowSubsampleMask` at the top of an
 //! iteration and hard-asserts that the id observed by each of the four
 //! quantities matches before computing ρ.
 
@@ -26,12 +26,12 @@ use std::sync::Arc;
 use crate::custom_family::BlockwiseFitOptions;
 use crate::solver::outer_subsample::OuterScoreSubsample;
 
-/// Identifier-carrying handle for a single row measure.
+/// Identifier-carrying handle for a single row subsample mask.
 ///
 /// The handle is `Clone` and cheap to copy; the `Arc` is shared, not
 /// duplicated.
 #[derive(Clone, Debug)]
-pub struct TrustRegionRowMeasure {
+pub struct RowSubsampleMask {
     /// Stable 64-bit content hash. Same `mask` (by Arc pointer OR by
     /// row content) ⇒ same id; different `mask` ⇒ different id.
     pub id: u64,
@@ -40,7 +40,7 @@ pub struct TrustRegionRowMeasure {
     pub mask: Option<Arc<OuterScoreSubsample>>,
 }
 
-impl TrustRegionRowMeasure {
+impl RowSubsampleMask {
     /// Full-data measure: walk `0..n` with weight 1.0 per row.
     pub fn full_data(n: usize) -> Self {
         Self {
@@ -60,7 +60,7 @@ impl TrustRegionRowMeasure {
         }
     }
 
-    /// Build a `TrustRegionRowMeasure` from blockwise-fit options. The outer
+    /// Build a `RowSubsampleMask` from blockwise-fit options. The outer
     /// optimizer is the sole source of `outer_score_subsample`; inner
     /// paths read this once at the top of each TR iteration and freeze
     /// it for every quantity in that iteration.
@@ -73,14 +73,14 @@ impl TrustRegionRowMeasure {
 
     /// Materialize the row indices and per-row weights this measure
     /// implies. `full_data(n)` returns `(0..n collected, [1.0; n])`,
-    /// preserving the legacy semantics of any caller that walked
+    /// preserving the full-data semantics of any caller that walked
     /// `0..self.n` unconditionally with weight 1.0.
     pub fn indices_and_weights(&self, n: usize) -> (Vec<usize>, Vec<f64>) {
         match self.mask.as_ref() {
             Some(m) => {
                 assert_eq!(
                     m.n_full, n,
-                    "TrustRegionRowMeasure n_full ({}) must match caller n ({})",
+                    "RowSubsampleMask n_full ({}) must match caller n ({})",
                     m.n_full, n
                 );
                 let indices: Vec<usize> = m.mask.as_ref().clone();
@@ -103,10 +103,10 @@ fn splitmix64(x: u64) -> u64 {
     crate::linalg::utils::splitmix64_hash(x)
 }
 
-const FULL_DATA_ROW_MEASURE_SENTINEL: u64 = 0xA5A5_5A5A_DEAD_BEEF;
+const FULL_DATA_ROW_SUBSAMPLE_SENTINEL: u64 = 0xA5A5_5A5A_DEAD_BEEF;
 
 fn hash_full(n: usize) -> u64 {
-    let mut h = splitmix64(FULL_DATA_ROW_MEASURE_SENTINEL ^ (n as u64));
+    let mut h = splitmix64(FULL_DATA_ROW_SUBSAMPLE_SENTINEL ^ (n as u64));
     if h == 0 {
         h = 0x1234_5678_9ABC_DEF0;
     }
@@ -133,9 +133,9 @@ mod tests {
 
     #[test]
     fn full_data_id_is_stable_per_n() {
-        let a = TrustRegionRowMeasure::full_data(100);
-        let b = TrustRegionRowMeasure::full_data(100);
-        let c = TrustRegionRowMeasure::full_data(101);
+        let a = RowSubsampleMask::full_data(100);
+        let b = RowSubsampleMask::full_data(100);
+        let c = RowSubsampleMask::full_data(101);
         assert_eq!(a.id, b.id);
         assert_ne!(a.id, c.id);
         assert!(a.mask.is_none());
@@ -144,8 +144,8 @@ mod tests {
     #[test]
     fn subsample_id_matches_for_same_arc() {
         let s = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
-        let a = TrustRegionRowMeasure::subsample(Arc::clone(&s));
-        let b = TrustRegionRowMeasure::subsample(Arc::clone(&s));
+        let a = RowSubsampleMask::subsample(Arc::clone(&s));
+        let b = RowSubsampleMask::subsample(Arc::clone(&s));
         assert_eq!(a.id, b.id);
     }
 
@@ -153,8 +153,8 @@ mod tests {
     fn subsample_id_differs_for_different_arcs() {
         let s1 = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
         let s2 = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
-        let a = TrustRegionRowMeasure::subsample(s1);
-        let b = TrustRegionRowMeasure::subsample(s2);
+        let a = RowSubsampleMask::subsample(s1);
+        let b = RowSubsampleMask::subsample(s2);
         // Different Arc allocations ⇒ different ids; this is intentional
         // so the TR invariant catches mid-iteration mask rebuilds even
         // when the resulting mask happens to be content-equal.
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn indices_and_weights_full_data() {
-        let rm = TrustRegionRowMeasure::full_data(4);
+        let rm = RowSubsampleMask::full_data(4);
         let (idx, w) = rm.indices_and_weights(4);
         assert_eq!(idx, vec![0, 1, 2, 3]);
         assert_eq!(w, vec![1.0, 1.0, 1.0, 1.0]);
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn indices_and_weights_subsample() {
         let s = Arc::new(OuterScoreSubsample::new(vec![0, 2], 4, 7));
-        let rm = TrustRegionRowMeasure::subsample(s);
+        let rm = RowSubsampleMask::subsample(s);
         let (idx, w) = rm.indices_and_weights(4);
         assert_eq!(idx, vec![0, 2]);
         assert_eq!(w.len(), 4);
