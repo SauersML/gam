@@ -3230,6 +3230,7 @@ pub(crate) struct SurvivalLocationScaleExactNewtonJointHessianWorkspace {
     pub(crate) family: SurvivalLocationScaleFamily,
     pub(crate) q: SurvivalJointQuantities,
     pub(crate) dynamic: SurvivalDynamicGeometry,
+    pub(crate) deriv_log_scale: f64,
     pub(crate) row_mask: Option<Arc<Array1<f64>>>,
 }
 
@@ -3245,6 +3246,7 @@ impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
             family,
             q,
             dynamic,
+            deriv_log_scale: log_rescale,
             row_mask: None,
         })
     }
@@ -3313,7 +3315,26 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
             }
             .into());
         }
-        Ok(None)
+        if !self.family.row_kernel_directional_supported() {
+            return Ok(None);
+        }
+        let kernel = self.family.survival_ls_row_kernel_rescaled(
+            &self.q,
+            &self.dynamic,
+            self.deriv_log_scale,
+        );
+        let rows = row_set_from_survival_mask(self.row_mask.as_deref(), self.family.n);
+        crate::families::row_kernel::row_kernel_second_directional_derivative(
+            &kernel,
+            &rows,
+            d_beta_u_flat.as_slice().ok_or_else(|| {
+                "joint Hessian workspace second directional u must be contiguous".to_string()
+            })?,
+            d_beta_v_flat.as_slice().ok_or_else(|| {
+                "joint Hessian workspace second directional v must be contiguous".to_string()
+            })?,
+        )
+        .map(Some)
     }
 
     fn second_directional_derivative_operator(
@@ -3321,21 +3342,8 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        let p_total = *self
-            .family
-            .joint_block_offsets()
-            .last()
-            .ok_or_else(|| "missing joint block offsets".to_string())?;
-        if d_beta_u_flat.len() != p_total || d_beta_v_flat.len() != p_total {
-            return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: format!(
-                    "joint Hessian workspace second directional derivative operator length mismatch: got {} / {}, expected {p_total}",
-                    d_beta_u_flat.len(),
-                    d_beta_v_flat.len()
-                ),
-            }
-            .into());
-        }
-        Ok(None)
+        Ok(self
+            .second_directional_derivative(d_beta_u_flat, d_beta_v_flat)?
+            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 }
