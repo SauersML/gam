@@ -605,7 +605,7 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.AdaptiveTopK
+::: gamfit.torch.modules.AdaptiveTopK
     options:
       show_root_heading: true
       heading_level: 3
@@ -1326,17 +1326,17 @@ These symbols are re-exported at the top level for convenience but their
 implementations live behind the optional `torch` dependency; accessing them
 without torch installed raises `AttributeError`. See [torch.md](torch.md).
 
-::: gamfit.Crosscoder
+::: gamfit.crosscoder.Crosscoder
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.InterchangeSwapDecoder
+::: gamfit.torch.interchange.InterchangeSwapDecoder
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PoincareAtoms
+::: gamfit.torch.hyperbolic.PoincareAtoms
     options:
       show_root_heading: true
       heading_level: 3
