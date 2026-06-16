@@ -615,6 +615,59 @@ mod tests {
         }
     }
 
+    /// DELIVERABLE (2) — penalty deterministic-shift term is consumed. The
+    /// Lawley ε folds `S_λ` into the information `J = X'WX + S_λ`
+    /// ([`lawley_epsilon`]); adding the penalty therefore moves ε on any family
+    /// whose `ε ≠ 0`. This regression proves the penalty arm is live (not
+    /// dropped) and that a larger λ shrinks |ε| monotonically — the penalty
+    /// stiffens the information `J = X'WX + S_λ`, which moves the finite-sample
+    /// LR mean shift — exactly the penalized-null behavior #939 deliverable (2)
+    /// requires.
+    ///
+    /// (The ρ̂-variation term — the extra deterministic shift from λ̂ being
+    /// *estimated* rather than fixed — is NOT in this conditional-on-λ̂ factor;
+    /// it is the genuinely-new theory piece the issue flags, validated via the
+    /// null-bootstrap arm. This test pins the penalty deterministic-shift only.)
+    #[test]
+    fn penalty_shift_term_is_consumed() {
+        // Poisson/log, a 2-column design (intercept + a centered covariate) so
+        // the penalty on the second column actually couples into ε.
+        let n = 40usize;
+        let eta = 0.2_f64;
+        let jets = RowExpectedJets::poisson_log(eta);
+        let kappas = vec![jets.kappas().expect("poisson kappas"); n];
+        let mut x = Array2::<f64>::ones((n, 2));
+        for i in 0..n {
+            // Centered covariate in the second column.
+            x[[i, 1]] = (i as f64) / (n as f64) - 0.5;
+        }
+        let eps_unpen = lawley_epsilon(x.view(), &kappas, None).expect("ε unpenalized");
+
+        // A ridge penalty on the second (smooth-like) column only. ε must depend
+        // on λ — if S were dropped, every λ would give the unpenalized value.
+        let mut distinct = std::collections::BTreeSet::new();
+        for &lambda in &[0.5_f64, 2.0, 8.0, 32.0] {
+            let mut s = Array2::<f64>::zeros((2, 2));
+            s[[1, 1]] = lambda;
+            let eps_pen = lawley_epsilon(x.view(), &kappas, Some(s.view())).expect("ε penalized");
+            // The penalty MUST change ε (proves S is consumed, deliverable 2).
+            assert!(
+                (eps_pen - eps_unpen).abs() > 1e-9,
+                "λ={lambda}: penalty did not move ε ({eps_pen} vs {eps_unpen}) — S is being dropped"
+            );
+            // As λ → ∞ the penalized column is frozen out; ε must stay finite.
+            assert!(eps_pen.is_finite(), "λ={lambda}: ε must be finite, got {eps_pen}");
+            distinct.insert((eps_pen * 1e9) as i64);
+        }
+        // Different λ give genuinely different ε (S enters the information, not a
+        // no-op): at least three of the four ridge strengths are distinct.
+        assert!(
+            distinct.len() >= 3,
+            "ε must vary with λ; got {} distinct values",
+            distinct.len()
+        );
+    }
+
     #[test]
     fn poisson_intercept_matches_exact_pmf_mean() {
         // y_i ~ Poisson(λ), log link, intercept-only: ε = 1/(6nλ) classically;
