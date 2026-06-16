@@ -3641,6 +3641,7 @@ impl<'a> RemlState<'a> {
             last_inner_converged: Arc::new(AtomicBool::new(false)),
             ift_warm_start_cache: RwLock::new(None),
             last_pirls_lm_lambda: Arc::new(AtomicU64::new(0)),
+            frozen_negbin_theta: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
@@ -3732,6 +3733,10 @@ impl<'a> RemlState<'a> {
         self.clear_warm_start_predictor_state();
         self.clear_warm_start_adaptive_signals();
         self.reset_hypergradient_budget_controller();
+        // The λ-search frozen NB θ (#1082) is computed from the seed fit on the
+        // PREVIOUS design; a new surface (different X / penalties) must re-freeze
+        // it from its own seed. `0` = "not yet frozen".
+        self.frozen_negbin_theta.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -5942,6 +5947,31 @@ impl<'a> RemlState<'a> {
                         .expect("state-bearing link without runtime state"),
                 )
             };
+            // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
+            // the inner solver re-derives θ from each outer iterate's warm-start
+            // η, so the NB working response / deviance / penalty-logdet — and
+            // thus the REML criterion — drift every outer evaluation, defeating
+            // the projected-gradient convergence test and grinding the loop to
+            // max_iter. Once the first non-screening solve has fixed a
+            // data-driven θ (captured below into `frozen_negbin_theta`), pin
+            // every subsequent λ-search inner solve to that value so
+            // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ. θ is
+            // still ML-refreshed at the single final reported fit (the
+            // `refine_dispersion_at_converged_eta = true` accept-fit in
+            // `optimizer.rs`), exactly as the dispersion-at-converged-η contract
+            // requires. No effect on non-NB or user-fixed-θ specs.
+            if pirls_config.likelihood.negbin_theta_is_estimated() {
+                let frozen_bits = self.frozen_negbin_theta.load(Ordering::Relaxed);
+                if frozen_bits != 0 {
+                    let frozen_theta = f64::from_bits(frozen_bits);
+                    if frozen_theta.is_finite() && frozen_theta > 0.0 {
+                        pirls_config.likelihood = pirls_config
+                            .likelihood
+                            .clone()
+                            .with_negbin_theta_frozen_for_search(frozen_theta);
+                    }
+                }
+            }
             // Levenberg-Marquardt damping warm-start. Read the cached
             // λ from the previous successful PIRLS solve at this
             // surface (0 = no hint), and seed the inner solver. The
@@ -6076,6 +6106,32 @@ impl<'a> RemlState<'a> {
 
         let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
         let pirls_result = Arc::new(pirls_result);
+        // Capture the data-driven NB θ from the first converged non-screening
+        // λ-search solve and freeze it for the rest of the search (#1082). The
+        // first solve still estimated θ from the seed η (this branch only runs
+        // when no frozen value exists yet), so the captured value is the same
+        // ML θ the legacy estimated path would have used at the seed — we simply
+        // stop letting it drift on subsequent outer evaluations. Screening
+        // solves use a tiny inner budget and a partial mode, so they are never
+        // the source of the frozen value.
+        if !in_screening
+            && pirls_result.likelihood.negbin_theta_is_estimated()
+            && self.frozen_negbin_theta.load(Ordering::Relaxed) == 0
+            && matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
+            )
+            && let Some(theta) = pirls_result.likelihood.negbin_theta()
+            && theta.is_finite()
+            && theta > 0.0
+        {
+            self.frozen_negbin_theta
+                .store(theta.to_bits(), Ordering::Relaxed);
+            log::info!(
+                "[OUTER] negative-binomial λ-search θ frozen at {theta:.6e} (#1082); \
+                 outer REML criterion now stationary in ρ"
+            );
+        }
         // Under seed screening the inner solver is intentionally given a tiny
         // iteration budget, so KKT stationarity will not be satisfied at the
         // partial mode. Skip the certificate so the seed can still be ranked
@@ -6369,6 +6425,22 @@ impl<'a> RemlState<'a> {
                     .expect("state-bearing link without runtime state"),
             )
         };
+        // Pin the same λ-search-frozen NB θ the outer loop converged under
+        // (#1082), so the rho-uncertainty sigma-point criterion is evaluated on
+        // the identical stationary surface F(ρ) = REML(ρ, θ_frozen) rather than
+        // re-estimating θ at each off-trajectory σ-point.
+        if pirls_config.likelihood.negbin_theta_is_estimated() {
+            let frozen_bits = self.frozen_negbin_theta.load(Ordering::Relaxed);
+            if frozen_bits != 0 {
+                let frozen_theta = f64::from_bits(frozen_bits);
+                if frozen_theta.is_finite() && frozen_theta > 0.0 {
+                    pirls_config.likelihood = pirls_config
+                        .likelihood
+                        .clone()
+                        .with_negbin_theta_frozen_for_search(frozen_theta);
+                }
+            }
+        }
 
         // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
         // XᵀW(y − offset) across every inner solve; for other families /

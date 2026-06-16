@@ -4631,6 +4631,19 @@ pub(crate) struct RemlState<'a> {
     /// on failed solves.
     pub(crate) last_pirls_lm_lambda: Arc<AtomicU64>,
 
+    /// Negative-Binomial overdispersion `theta` frozen for the smoothing-
+    /// parameter (λ) search (#1082), bit-packed `f64` (`f64::to_bits`). `0`
+    /// (the default) signals "not yet frozen". On the first non-screening
+    /// λ-search inner solve of an estimated-θ NB fit, the seed's
+    /// maximum-likelihood θ is computed once and stored here; every subsequent
+    /// λ-search evaluation pins the inner solve to this value via
+    /// `GlmLikelihoodSpec::with_negbin_theta_frozen_for_search`, so the REML
+    /// criterion `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ and
+    /// the outer optimizer converges instead of chasing the per-eval θ drift
+    /// that the estimated path injects. The single final reported fit still
+    /// ML-refreshes θ at the converged η. Reset on `reset_surface`.
+    pub(crate) frozen_negbin_theta: Arc<AtomicU64>,
+
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
     /// / ‖β_converged‖`) from the most recent non-screening solve where
     /// the predictor was actually consumed. Bit-packed `f64` (low 64

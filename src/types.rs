@@ -2081,6 +2081,41 @@ impl GlmLikelihoodSpec {
             _ => None,
         }
     }
+
+    /// Produce a copy of this spec with the Negative-Binomial overdispersion
+    /// `theta` PINNED at `theta` for the duration of the smoothing-parameter
+    /// (λ) search (#1082). Converts an `EstimatedNegBinTheta` spec into the
+    /// statistically-identical `FixedNegBinTheta` form (`theta_fixed = true`),
+    /// which gates off the per-inner-solve ML refresh in
+    /// `GamWorkingModel::update_with_curvature` (its guard is
+    /// `negbin_theta_is_estimated()`).
+    ///
+    /// Rationale: with θ estimated, the inner solver re-derives θ from each
+    /// outer iterate's *warm-start* η, so θ — and hence the NB working response,
+    /// deviance and penalty-logdet that feed the REML criterion — drifts every
+    /// outer evaluation. The outer optimizer then chases a moving target and the
+    /// projected-gradient convergence test never trips, grinding the loop to
+    /// `max_iter` (the #1082 negative-binomial tensor timeout). Holding θ fixed
+    /// across the λ-search makes the REML objective `F(ρ) = REML(ρ, θ_frozen)` a
+    /// genuine stationary function of ρ, so the loop converges in a handful of
+    /// iterations — and θ is still ML-refreshed at the single final, reported fit
+    /// (the `refine_dispersion_at_converged_eta = true` accept-fit), exactly as
+    /// the function-level docs require ("estimate the scale at the converged fit,
+    /// not inside the λ search; mgcv likewise"). No-op for non-NB families and
+    /// for an already user-fixed θ.
+    #[inline]
+    pub fn with_negbin_theta_frozen_for_search(mut self, theta: f64) -> Self {
+        if let ResponseFamily::NegativeBinomial {
+            theta: family_theta,
+            theta_fixed,
+        } = &mut self.spec.response
+        {
+            *family_theta = theta;
+            *theta_fixed = true;
+            self.scale = LikelihoodScaleMetadata::FixedNegBinTheta { theta };
+        }
+        self
+    }
 }
 
 /// How ridge-adjusted determinants should be evaluated for outer criteria.
