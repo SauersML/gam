@@ -2419,6 +2419,45 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
             dense_hvp[i]
         );
     }
+
+    // Regression guard for #1165 / #740: the ψψ score term (`pair_g`, exposed
+    // by the contracted hook as `score`) must be a live part of the profiled
+    // HVP correction. The contracted path skips the dense ψψ pair table at
+    // build time; if the apply path forgets to inject `-score` into the
+    // correction RHS / scalar adjoint trace, the HVP collapses to this
+    // score-zeroed oracle instead of the true per-pair dense result.
+    let dense_without_psi_score_hvp = {
+        let mut sol = build_solution(false);
+        let pair_b_for_zero_score = psi_pair_b.clone();
+        sol.ext_coord_pair_fn = Some(Box::new(move |_, _| HyperCoordPair {
+            a: psi_pair_a,
+            g: Array1::zeros(2),
+            b_mat: pair_b_for_zero_score.clone(),
+            b_operator: None,
+            ld_s: psi_pair_ld_s,
+        }));
+        let dense_without_psi_score = compute_outer_hessian(
+            &sol,
+            &rho,
+            &lambdas,
+            sol.hessian_op.as_ref(),
+            sol.deriv_provider.as_ref(),
+            None,
+        )
+        .unwrap();
+        dense_without_psi_score.dot(&mixed)
+    };
+    let max_psi_score_effect = dense_hvp
+        .iter()
+        .zip(dense_without_psi_score_hvp.iter())
+        .map(|(with_score, without_score)| (with_score - without_score).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_psi_score_effect > 1e-6,
+        "#1165/#740 test is vacuous: ψψ score correction has no measurable HVP \
+             effect for the mixed direction (max effect={max_psi_score_effect:.3e}); \
+             pick a fixture where dropping contracted `score` would fail"
+    );
 }
 
 #[test]
