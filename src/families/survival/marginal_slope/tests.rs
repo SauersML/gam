@@ -7088,3 +7088,121 @@ fn block_hessian_dense_operator_parity_all_five_blocks() {
     let dense_bil = v.dot(&dense.dot(&u));
     assert_relative_eq!(bil, dense_bil, max_relative = 1e-12);
 }
+
+#[test]
+fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
+    use crate::families::jet_tower::derived_third_contracted;
+    // FAILURE 1 fixture row.
+    let event = 1.0_f64;
+    let weight = 0.75_f64;
+    let zr = -0.2_f64;
+    let q0 = -0.4_f64;
+    let q1 = 0.6_f64;
+    let qd1 = 0.85_f64;
+    let gv = 0.32_f64;
+
+    let make = |q0: f64, q1: f64, qd1: f64, g: f64| {
+        let score_runtime = test_deviation_runtime();
+        let link_runtime = test_deviation_runtime();
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![event]),
+            weights: Arc::new(array![weight]),
+            z: Arc::new(array![zr].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            offset_entry: Arc::new(array![q0]),
+            offset_exit: Arc::new(array![q1]),
+            derivative_offset_exit: Arc::new(array![qd1]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let sd = score_runtime.basis_dim();
+        let ld = link_runtime.basis_dim();
+        let bs = vec![
+            ParameterBlockState { beta: Array1::zeros(1), eta: Array1::zeros(1) },
+            ParameterBlockState { beta: Array1::zeros(0), eta: Array1::zeros(1) },
+            ParameterBlockState { beta: Array1::zeros(0), eta: array![g] },
+            ParameterBlockState { beta: Array1::zeros(sd), eta: Array1::zeros(1) },
+            ParameterBlockState { beta: Array1::zeros(ld), eta: Array1::zeros(1) },
+        ];
+        (family, bs)
+    };
+
+    let (family, bs) = make(q0, q1, qd1, gv);
+    let primary = flex_primary_slices(&family);
+    let p = primary.total;
+    let bidx = [primary.q0, primary.q1, primary.qd1, primary.g];
+
+    // Flex Hessian at a primary point (q0,q1,qd1,g).
+    let flex_hess = |q0: f64, q1: f64, qd1: f64, g: f64| -> Array2<f64> {
+        let (fam, bs) = make(q0, q1, qd1, g);
+        let qg = fam.row_dynamic_q_geometry(0, &bs).unwrap();
+        let pr = flex_primary_slices(&fam);
+        let (_, _, h) = fam
+            .compute_row_flex_primary_gradient_hessian_exact(0, &bs, &qg, &pr)
+            .unwrap();
+        h
+    };
+
+    let dir4 = [0.7f64, -1.3, 0.5, 0.9];
+    let dirvec = {
+        let mut v = Array1::zeros(p);
+        for (k, &s) in bidx.iter().enumerate() {
+            v[s] = dir4[k];
+        }
+        v
+    };
+
+    // Production flex third-contracted.
+    let flex_third = family
+        .row_flex_primary_third_contracted_exact(0, &bs, &dirvec)
+        .unwrap();
+
+    // Independent FD of flex Hessian along dir4 (central, Richardson).
+    let fd_dir = |h: f64| -> Array2<f64> {
+        let hp = flex_hess(q0 + h * dir4[0], q1 + h * dir4[1], qd1 + h * dir4[2], gv + h * dir4[3]);
+        let hm = flex_hess(q0 - h * dir4[0], q1 - h * dir4[1], qd1 - h * dir4[2], gv - h * dir4[3]);
+        (&hp - &hm) / (2.0 * h)
+    };
+    let fd_coarse = fd_dir(1e-3);
+    let fd_fine = fd_dir(5e-4);
+    let fd_rich = (&fd_fine * 4.0 - &fd_coarse) / 3.0;
+
+    // Rigid tower.
+    let program = SurvivalMarginalSlopeRigidNllProgram {
+        primaries: vec![[q0, q1, qd1, gv]],
+        z: vec![zr],
+        w: vec![weight],
+        d: vec![event],
+        probit_scale: family.probit_frailty_scale(),
+    };
+    let rigid = derived_third_contracted(&program, 0, &dir4).unwrap();
+
+    eprintln!("=== FAILURE1 third-contracted (q0,q1,qd1,g) block ===");
+    for (u, &bu) in bidx.iter().enumerate() {
+        for (v, &bv) in bidx.iter().enumerate() {
+            eprintln!(
+                "[{u},{v}] flex={:+.6e} fd_flexhess={:+.6e} rigid={:+.6e}",
+                flex_third[[bu, bv]],
+                fd_rich[[bu, bv]],
+                rigid[u][v]
+            );
+        }
+    }
+}

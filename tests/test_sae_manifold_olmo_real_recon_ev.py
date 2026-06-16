@@ -43,16 +43,12 @@ gamfit = pytest.importorskip("gamfit")
 
 _FIXTURE = Path(__file__).resolve().parent / "data" / "olmo_l25_pca64_768.npy"
 
-# PCA spectrum of the fixture (from README_olmo_fixture.md): the cumulative
-# explained-variance fraction at rank K is the held-out EV a rank-K *linear*
-# reconstruction attains. This is the linear ceiling the manifold SAE must
-# match-or-beat on real data. cum@K8 = 0.459.
-_LINEAR_CEILING_K8 = 0.459
-# Modest, defensible fraction of the K8 linear ceiling: we do not even demand
-# parity, only that the curved SAE earns a clear majority of the linear EV at
-# matched rank on held-out real activations.
+_K = 8
+# We do not even demand full parity with the linear ceiling — only that the
+# curved SAE earns a clear majority of the linear EV at matched rank on
+# held-out real activations. The linear ceiling itself is recomputed from the
+# committed fixture below (self-grounding; no trust in a hardcoded constant).
 _TARGET_FRACTION = 0.75
-_EV_TARGET = _TARGET_FRACTION * _LINEAR_CEILING_K8  # ~0.344
 
 
 def _ev(x: np.ndarray, fitted: np.ndarray) -> float:
@@ -61,6 +57,21 @@ def _ev(x: np.ndarray, fitted: np.ndarray) -> float:
     ss_res = float(np.sum((x - fitted) ** 2))
     ss_tot = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
     return 1.0 - ss_res / max(ss_tot, 1e-12)
+
+
+def _heldout_linear_ceiling(z_train: np.ndarray, z_test: np.ndarray, k: int) -> float:
+    """Held-out EV of a rank-k *linear* (PCA) reconstruction: fit the top-k
+    principal subspace on the train split (centered on the train mean), project
+    the held-out split onto it, score EV. This is the linear-dictionary ceiling
+    a TopK SAE attains for free; the manifold SAE must match-or-beat a fraction
+    of it. Computed from the committed fixture so the bar is self-grounding."""
+    mu = z_train.mean(axis=0, keepdims=True)
+    ztr = z_train - mu
+    zte = z_test - mu
+    _, _, vt = np.linalg.svd(ztr, full_matrices=False)
+    proj = vt[:k].T @ vt[:k]
+    recon = zte @ proj
+    return _ev(z_test, recon)
 
 
 def _load_fixture() -> np.ndarray:
