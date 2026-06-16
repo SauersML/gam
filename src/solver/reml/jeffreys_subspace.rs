@@ -146,6 +146,38 @@ pub(crate) fn jeffreys_antiderivative(lam: f64, floor: f64) -> f64 {
     }
 }
 
+/// `∂g/∂floor` with `λ` held fixed — the floor-motion term of the Jeffreys
+/// VALUE, the exact antiderivative partner of [`floored_inverse_floor_sensitivity`]
+/// (which is `∂g'/∂floor`). Pinned to the SAME four branches as
+/// [`jeffreys_antiderivative`] so the floor-response gradient cannot drift from
+/// the value the way the inline branches once did (gam#826):
+///
+///   * `λ ≥ Λ`:           `1/floor − 1/λ` when the cap is floor-bound
+///     (`Λ = floor`, extreme-scale regime), else `0` (the gate-bound cap does
+///     not move with the floor, so the value does not either);
+///   * `floor ≤ λ < Λ`:   `0`            (`g = ln λ` is floor-free here);
+///   * `0 ≤ λ < floor`:   `1/floor − λ/floor²` (the #787 linear continuation);
+///   * `λ < 0`:           `1/floor − λ/(floor − λ)²` (BOTTOM saturation).
+#[inline]
+pub(crate) fn jeffreys_antiderivative_floor_sensitivity(lam: f64, floor: f64) -> f64 {
+    let cap = jeffreys_cap(floor);
+    if lam >= cap {
+        if cap > CONDITIONING_GATE_ABSOLUTE_CLEAR {
+            // Floor-bound cap: g = ln(floor) + 1 − floor/λ ⇒ ∂g/∂floor = 1/floor − 1/λ.
+            1.0 / floor - 1.0 / lam
+        } else {
+            0.0
+        }
+    } else if lam >= floor {
+        0.0
+    } else if lam >= 0.0 {
+        1.0 / floor - lam / (floor * floor)
+    } else {
+        let denom = floor - lam;
+        1.0 / floor - lam / (denom * denom)
+    }
+}
+
 /// `d'(λ)` with the floor held fixed: `−2Λ/λ³` on the top saturation,
 /// `−1/λ²` in the log window, `0` inside the band (the linear continuation
 /// has no curvature in `λ`), `2·floor/(floor − λ)³` on the bottom saturation.
@@ -943,32 +975,17 @@ where
         // saturation; the saturating branch is monotone, bounded below, and
         // keeps the gam#814 guarantee that moderate negatives carry no phantom
         // score: `d(−0.3) = floor/(floor+0.3)² ≈ 0`).
-        let cap = jeffreys_cap(floor);
-        if lam >= cap {
-            phi += 0.5 * (cap.ln() + 1.0 - cap / lam);
-            inv_diag[i] = floored_inverse(lam, floor);
-            if cap > CONDITIONING_GATE_ABSOLUTE_CLEAR {
-                // Floor-bound cap (extreme-scale regime): g = ln(floor) + 1 − floor/λ,
-                // so ∂g/∂floor = 1/floor − 1/λ.
-                floor_value_sensitivity += 1.0 / floor - 1.0 / lam;
-            }
-        } else if lam >= floor {
-            phi += 0.5 * lam.ln();
-            inv_diag[i] = floored_inverse(lam, floor);
-        } else if lam >= 0.0 {
-            phi += 0.5 * (lam / floor + floor.ln() - 1.0);
-            inv_diag[i] = floored_inverse(lam, floor);
-            // ∂g(λ; floor)/∂floor = 1/floor − λ/floor², accumulated so the gradient
-            // below can add the floor-response term `½ · this · ∂floor/∂β_k`.
-            floor_value_sensitivity += 1.0 / floor - lam / (floor * floor);
-        } else {
-            phi += 0.5 * (floor.ln() - 1.0 + lam / (floor - lam));
-            inv_diag[i] = floored_inverse(lam, floor);
-            // ∂g(λ; floor)/∂floor = 1/floor − λ/(floor − λ)² for the saturating
-            // branch (λ < 0 makes both terms positive).
-            let denom = floor - lam;
-            floor_value_sensitivity += 1.0 / floor - lam / (denom * denom);
-        }
+        // SINGLE-EMISSION (gam#931). The value `g`, its λ-slope `g' = floored_inverse`,
+        // and its floor-motion `∂g/∂floor` are ALL read from the canonical
+        // `jeffreys_*` functions in this module rather than re-spelt inline: the
+        // value and the gradient weights are now PROJECTIONS OF ONE source, so the
+        // gam#787/#826 value↔gradient/floor desyncs are impossible by construction
+        // (no second copy of the four branches to drift). The floor-sensitivity is
+        // exactly zero on the log window and on a gate-bound top cap, so summing it
+        // unconditionally reproduces the previous branch-gated accumulation.
+        phi += 0.5 * jeffreys_antiderivative(lam, floor);
+        inv_diag[i] = floored_inverse(lam, floor);
+        floor_value_sensitivity += jeffreys_antiderivative_floor_sensitivity(lam, floor);
     }
     // Daleckii–Krein divided-difference kernel of the floored signed inverse on
     // this spectrum — the single source of truth tying `∇Φ` (its diagonal
@@ -2593,5 +2610,63 @@ mod tests {
             Ok(Array1::from_elem(v.len(), f64::NAN))
         };
         assert!(!jeffreys_term_skippable_via_matvec(hv, p).unwrap());
+    }
+
+    /// Single-emission pin (gam#931) for the Jeffreys eigenvalue function
+    /// `g(λ; floor)`: the three canonical functions `joint_jeffreys_term` now
+    /// reads from — the value `g = jeffreys_antiderivative`, its λ-slope
+    /// `g' = floored_inverse`, and its floor-motion
+    /// `∂g/∂floor = jeffreys_antiderivative_floor_sensitivity` — are a
+    /// consistent `(g, ∂g/∂λ, ∂g/∂floor)` triple. Because the production loop
+    /// now PROJECTS its value, gradient and floor-response off exactly these
+    /// functions (no inline copy), an FD agreement here is a structural
+    /// guarantee the value and its derivatives cannot drift. We sample one
+    /// point from each of the four branches and central-difference both `λ`
+    /// (floor fixed) and `floor` (λ fixed), avoiding the C¹ knots.
+    #[test]
+    pub(crate) fn jeffreys_antiderivative_is_consistent_value_slope_floor_triple() {
+        let floor = 1e-3_f64;
+        let cap = jeffreys_cap(floor);
+        // One sample comfortably inside each branch (away from cap/floor/0 knots).
+        // The top branch here is GATE-bound (cap = CLEAR ≫ floor), so its
+        // ∂g/∂floor is exactly 0 — exercised below alongside a separate
+        // floor-bound-cap point.
+        for &lam in &[cap * 4.0, (floor + cap) * 0.5, floor * 0.5, -0.7_f64] {
+            // ∂g/∂λ = floored_inverse.
+            let hl = 1e-7 * lam.abs().max(1e-3);
+            let fd_lam = (jeffreys_antiderivative(lam + hl, floor)
+                - jeffreys_antiderivative(lam - hl, floor))
+                / (2.0 * hl);
+            let dl = floored_inverse(lam, floor);
+            assert!(
+                (fd_lam - dl).abs() <= 1e-4 * dl.abs().max(1.0),
+                "∂g/∂λ desync at λ={lam}: fd={fd_lam} analytic={dl}"
+            );
+            // ∂g/∂floor = jeffreys_antiderivative_floor_sensitivity.
+            let hf = 1e-7 * floor;
+            let fd_floor = (jeffreys_antiderivative(lam, floor + hf)
+                - jeffreys_antiderivative(lam, floor - hf))
+                / (2.0 * hf);
+            let df = jeffreys_antiderivative_floor_sensitivity(lam, floor);
+            assert!(
+                (fd_floor - df).abs() <= 1e-4 * df.abs().max(1.0),
+                "∂g/∂floor desync at λ={lam}: fd={fd_floor} analytic={df}"
+            );
+        }
+        // Floor-bound-cap regime (`Λ = floor`, the extreme-scale branch): pick a
+        // floor above the gate-clear scale so `jeffreys_cap(floor) = floor` and a
+        // λ in the now-active top branch carries a nonzero ∂g/∂floor.
+        let big_floor = CONDITIONING_GATE_ABSOLUTE_CLEAR * 10.0;
+        assert!((jeffreys_cap(big_floor) - big_floor).abs() < 1e-12);
+        let lam_top = big_floor * 3.0;
+        let hf = 1e-7 * big_floor;
+        let fd_floor = (jeffreys_antiderivative(lam_top, big_floor + hf)
+            - jeffreys_antiderivative(lam_top, big_floor - hf))
+            / (2.0 * hf);
+        let df = jeffreys_antiderivative_floor_sensitivity(lam_top, big_floor);
+        assert!(
+            df != 0.0 && (fd_floor - df).abs() <= 1e-4 * df.abs().max(1.0),
+            "floor-bound-cap ∂g/∂floor desync: fd={fd_floor} analytic={df}"
+        );
     }
 }

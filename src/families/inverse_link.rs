@@ -83,11 +83,69 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
         other => {
             return Err(format!(
                 "posterior fitted-mean draws on response scale are not wired for \
-                 family_kind={other:?}; access posterior.predict_draws(...).eta \
+                 family_kind={other:?} from the bare string tag; the parameterized \
+                 links (sas, mixture, latent-cloglog, beta-logistic) carry per-fit \
+                 state and must be routed through the serialized `link_spec` (see \
+                 `apply_inverse_link_spec_vec`). access posterior.predict_draws(...).eta \
                  for link-scale draws or use model.predict(new_data, interval=...) \
                  for class-specific bands."
             ));
         }
+    }
+    Ok(out)
+}
+
+/// Apply a closed-form inverse link element-wise from a fully parameterized
+/// [`InverseLink`] spec.
+///
+/// This is the typed companion to [`apply_inverse_link_vec`]. The string-tag
+/// entry point cannot evaluate the *parameterized* links — `Sas`, `Mixture`,
+/// `LatentCLogLog`, `BetaLogistic` — because their fitted state (skew/tail,
+/// mixture weights, latent SD) is lost the moment the family is collapsed to a
+/// bare `&str`. The Python FFI now carries the serialized `InverseLink` through
+/// the sample payload as `link_spec`, so this function reconstructs the exact
+/// response-scale mean `μ = g⁻¹(η)` for every supported link by routing through
+/// the canonical solver evaluator `inverse_link_mu_d1_for_inverse_link`.
+///
+/// The returned `μ` is bit-identical to the `mu` field of the solver's full
+/// inverse-link jet for the parameterized links, and matches
+/// [`apply_inverse_link_vec`] exactly for the `Standard` links *except* for the
+/// `Log` link: the public response transform reports the EXACT `exp(η)` (see the
+/// `LinkFunction::Log` branch above and issue #963), whereas the solver jet
+/// applies the conditioning clamp `η.clamp(−700, 700)`. To preserve that public
+/// contract this routes `Standard(Log)` (and `Standard(Identity)`) through the
+/// string path, and only the genuinely parameterized / non-log links through the
+/// solver evaluator.
+pub fn apply_inverse_link_spec_vec(
+    eta: &[f64],
+    link: &crate::types::InverseLink,
+) -> Result<Vec<f64>, String> {
+    use crate::types::{InverseLink, StandardLink};
+
+    // Standard links have a documented EXACT public response transform (notably
+    // the unclamped `exp(η)` for Log) that diverges from the solver's clamped
+    // jet on finite boundary η. Keep them on the string path so the public
+    // contract pinned by `public_log_inverse_link_is_exact_exp_not_solver_clamp`
+    // is preserved regardless of which entry point is used.
+    if let InverseLink::Standard(std_link) = link {
+        let tag = match std_link {
+            StandardLink::Identity => "identity",
+            StandardLink::Log => "log",
+            StandardLink::Logit => "logit",
+            StandardLink::Probit => "probit",
+            StandardLink::CLogLog => "cloglog",
+        };
+        return apply_inverse_link_vec(eta, tag);
+    }
+
+    let mut out = Vec::with_capacity(eta.len());
+    for &e in eta {
+        let (mu, _d1) =
+            crate::solver::mixture_link::inverse_link_mu_d1_for_inverse_link(link, e)
+                .map_err(|err| {
+                    format!("failed to evaluate parameterized inverse link at eta={e}: {err}")
+                })?;
+        out.push(mu);
     }
     Ok(out)
 }

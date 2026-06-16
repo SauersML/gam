@@ -223,6 +223,59 @@ pub(crate) fn dispersion_beta_nll_tower(
     -loglik * wi
 }
 
+/// Tweedie compound Poisson–Gamma row NLL written ONCE over `Tower4<2>`, seeded
+/// directly on the PREDICTOR primaries `(η_μ, η_d)` (#932).
+///
+/// Unlike the NB/Gamma/Beta towers — which seed on the natural parameters and
+/// let the caller apply the precision→η chain via the Fisher-orthogonal
+/// `precision²·info` shortcut — this tower carries `μ = exp(η_μ)` and
+/// `φ = exp(−η_d)` INSIDE the program, so `tower.g[1]` / `tower.h[1][1]` are
+/// the η_d-space score and OBSERVED information directly, with the nonlinear
+/// `∂²φ/∂η_d²` chain correction the hand path documented (the `y = 0` branch's
+/// `2c/φ − c/φ = c/φ` cancellation) mechanically carried rather than re-derived.
+///
+/// Both density branches are smooth in `(η_μ, η_d)`:
+/// * `y > 0` — the Nelder–Pregibon saddlepoint density
+///   `ℓ = w·[ −dev/(2φ) − ½ln(2πφ) − ½p·ln y ]` with the unit deviance
+///   `dev = 2·[ y^{2−p}/((1−p)(2−p)) − y·μ^{1−p}/(1−p) + μ^{2−p}/(2−p) ]`.
+/// * `y = 0` — the exact compound-Poisson point mass
+///   `ℓ = w·[ −μ^{2−p}/(φ(2−p)) ]`.
+///
+/// `μ` and `φ` enter the deviance only through `powf` and a `recip`, whose
+/// `[f64; 5]` derivative stacks the tower owns, so no primitive is re-derived:
+/// only the Leibniz/Faà-di-Bruno composition is mechanized.
+#[inline]
+pub(crate) fn dispersion_tweedie_nll_tower(
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    p: f64,
+    wi: f64,
+) -> crate::families::jet_tower::Tower4<2> {
+    use crate::families::jet_tower::Tower4;
+    let one_minus_p = 1.0 - p;
+    let two_minus_p = 2.0 - p;
+    // μ = exp(η_μ), φ = exp(−η_d): the natural parameters as jets in the
+    // predictor primaries, so the whole derivative tower is in η-space.
+    let mu = Tower4::<2>::variable(eta_mu, 0).exp();
+    let phi = (Tower4::<2>::variable(eta_d, 1) * (-1.0)).exp();
+    if yi > 0.0 {
+        let dev = (mu.powf(two_minus_p) * (1.0 / two_minus_p)
+            - mu.powf(one_minus_p) * (yi / one_minus_p)
+            + Tower4::<2>::constant(yi.powf(two_minus_p) / (one_minus_p * two_minus_p)))
+            * 2.0;
+        let loglik = dev * (phi.recip() * (-0.5))
+            - (phi * (2.0 * std::f64::consts::PI)).ln() * 0.5
+            - Tower4::<2>::constant(0.5 * p * yi.ln());
+        loglik * (-wi)
+    } else {
+        // Exact point mass P(Y=0) = exp(−μ^{2−p}/(φ(2−p))).
+        let c = mu.powf(two_minus_p) * (1.0 / two_minus_p);
+        let loglik = c * phi.recip() * (-1.0);
+        loglik * (-wi)
+    }
+}
+
 #[inline]
 pub(crate) fn beta_observed_cross_weight_eta(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     let q = (mu * (1.0 - mu)).max(1e-12);
@@ -364,61 +417,39 @@ pub(super) fn dispersion_row_kernel(
             let mu = em.exp().max(1e-300);
             // Precision channel models log(1/φ) ⇒ φ = exp(−η_d).
             let phi = (-ed).exp().max(1e-12);
-            let one_minus_p = 1.0 - p;
             let two_minus_p = 2.0 - p;
+            // Mean channel: the quasi-score `(y−μ)/μ` and Fisher weight
+            // `μ^{2−p}/φ` are simple closed forms (and the mean block is
+            // Fisher-orthogonal to the dispersion block in this
+            // parameterization), so they stay hand-written exactly as the
+            // NB/Gamma mean arms do.
             let mean_weight = wi * mu.powf(two_minus_p) / phi;
             let mean_response = em + (yi - mu) / mu;
-            if yi > 0.0 {
-                // Saddlepoint (Nelder–Pregibon) density for y > 0.
-                let dev = 2.0
-                    * (yi.powf(two_minus_p) / (one_minus_p * two_minus_p)
-                        - yi * mu.powf(one_minus_p) / one_minus_p
-                        + mu.powf(two_minus_p) / two_minus_p);
-                let loglik = wi
-                    * (-dev / (2.0 * phi)
-                        - 0.5 * (2.0 * std::f64::consts::PI * phi).ln()
-                        - 0.5 * p * yi.ln());
-                // ∂ℓ/∂φ = dev/(2φ²) − 1/(2φ); chain to η_d = −log φ.
-                let s_phi = dev / (2.0 * phi * phi) - 1.0 / (2.0 * phi);
-                let s_eta = -phi * s_phi;
-                // Fisher information wrt φ is 1/(2φ²) (E[dev] = φ) ⇒ wrt η_d it
-                // is the constant 1/2.
-                let disp_weight = wi * 0.5;
-                let disp_response = ed + s_eta / 0.5;
-                DispersionRowKernel {
-                    loglik,
-                    mean_weight,
-                    mean_response,
-                    disp_weight,
-                    disp_response,
-                }
+            // Dispersion channel: the η_d-space score and OBSERVED information
+            // come straight off the single-expression `Tower4<2>` seeded on
+            // `(η_μ, η_d)` (#932), so the saddlepoint/point-mass branch split,
+            // the `φ = exp(−η_d)` chain and its nonlinear `∂²φ/∂η_d²` curvature
+            // correction are all mechanically carried — no per-branch
+            // `s_phi`/`s_eta`/`curvature_eta` hand calculus.
+            let tower = dispersion_tweedie_nll_tower(yi, em, ed, p, wi);
+            let loglik = -tower.v;
+            let s_eta = if wi == 0.0 { 0.0 } else { -tower.g[1] / wi };
+            let curvature_eta = if wi == 0.0 {
+                DISPERSION_MIN_CURVATURE
             } else {
-                // Exact point mass P(Y=0) = exp(−μ^{2−p}/(φ(2−p))) (1 < p < 2).
-                let c = mu.powf(two_minus_p) / two_minus_p;
-                let loglik = wi * (-c / phi);
-                // ∂ℓ/∂φ = c/φ²; chain to η_d = −log φ (so φ = exp(−η_d)).
-                let s_phi = c / (phi * phi);
-                let s_eta = -phi * s_phi;
-                // NLL(η_d) = c·exp(η_d) at y=0, so ∂²NLL/∂η_d² = c·exp(η_d) = c/φ.
-                // Equivalently, the full chain rule gives
-                //   ∂²NLL/∂η_d² = φ²·(2c/φ³) + φ·(−c/φ²) = 2c/φ − c/φ = c/φ,
-                // where the second term is the ∂²φ/∂η_d²·(∂NLL/∂φ) correction
-                // that the Fisher-information shortcut (which drops the first-order
-                // score term via E[score]=0) would have absorbed but which is
-                // non-zero in the observed-information computation. The working
-                // response divides by this per-row curvature so the prior weight
-                // cancels (and a zero-prior-weight row stays excluded via
-                // `disp_weight = 0`).
-                let curvature_eta = (c / phi).max(DISPERSION_MIN_CURVATURE);
-                let disp_weight = wi * curvature_eta;
-                let disp_response = ed + s_eta / curvature_eta;
-                DispersionRowKernel {
-                    loglik,
-                    mean_weight,
-                    mean_response,
-                    disp_weight,
-                    disp_response,
-                }
+                (tower.h[1][1] / wi).max(DISPERSION_MIN_CURVATURE)
+            };
+            // The working response divides by this per-row curvature so the
+            // prior weight cancels (and a zero-prior-weight row stays excluded
+            // via `disp_weight = 0`).
+            let disp_weight = wi * curvature_eta;
+            let disp_response = ed + s_eta / curvature_eta;
+            DispersionRowKernel {
+                loglik,
+                mean_weight,
+                mean_response,
+                disp_weight,
+                disp_response,
             }
         }
     }

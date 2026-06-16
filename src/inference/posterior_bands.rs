@@ -2,8 +2,32 @@ use ndarray::{Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-use crate::families::inverse_link::apply_inverse_link_vec;
+use crate::families::inverse_link::{apply_inverse_link_spec_vec, apply_inverse_link_vec};
+use crate::types::InverseLink;
 use crate::util::quantile::quantile_from_sorted;
+
+/// Inverse-link selector for the posterior-band engine.
+///
+/// The response-scale push-through accepts either the legacy bare string tag
+/// (`Tag`) — which cannot represent the parameterized links — or the fully
+/// parameterized [`InverseLink`] spec (`Spec`) carried through the FFI as
+/// `link_spec`. `Spec` is required for `Sas` / `Mixture` / `LatentCLogLog` /
+/// `BetaLogistic`; for the `Standard` links the two paths agree (modulo the
+/// documented exact-`exp` Log contract, which both honor).
+#[derive(Clone, Copy, Debug)]
+pub enum LinkSelector<'a> {
+    Tag(&'a str),
+    Spec(&'a InverseLink),
+}
+
+impl LinkSelector<'_> {
+    fn apply(&self, eta: &[f64]) -> Result<Vec<f64>, String> {
+        match self {
+            LinkSelector::Tag(tag) => apply_inverse_link_vec(eta, tag),
+            LinkSelector::Spec(spec) => apply_inverse_link_spec_vec(eta, spec),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PosteriorPredictBandsPayload {
@@ -36,6 +60,18 @@ pub fn eta_bands_from_matrix(
     family_kind: &str,
     level: f64,
 ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
+    eta_bands_from_matrix_link(eta, LinkSelector::Tag(family_kind), level)
+}
+
+/// Spec-aware sibling of [`eta_bands_from_matrix`]: identical band/mean
+/// semantics, but the response-scale push-through goes through a
+/// [`LinkSelector`] so the parameterized links (`Sas`, `Mixture`,
+/// `LatentCLogLog`, `BetaLogistic`) can be evaluated from their fitted state.
+pub fn eta_bands_from_matrix_link(
+    eta: ArrayView2<'_, f64>,
+    link: LinkSelector<'_>,
+    level: f64,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
     if !(level > 0.0 && level < 1.0) {
         return Err(format!("interval level must lie in (0, 1); got {level}"));
     }
@@ -62,7 +98,7 @@ pub fn eta_bands_from_matrix(
         eta_mean[j] = sum * inv_n;
         // Response-scale posterior mean: average inv-link draws, not
         // inv-link of the eta mean. See doc comment above.
-        let response_draws = apply_inverse_link_vec(&column, family_kind)?;
+        let response_draws = link.apply(&column)?;
         let mut rsum = 0.0_f64;
         for v in &response_draws {
             rsum += *v;
@@ -72,8 +108,8 @@ pub fn eta_bands_from_matrix(
         eta_lower[j] = quantile_from_sorted(&column, alpha);
         eta_upper[j] = quantile_from_sorted(&column, 1.0 - alpha);
     }
-    let mean_lower = apply_inverse_link_vec(&eta_lower, family_kind)?;
-    let mean_upper = apply_inverse_link_vec(&eta_upper, family_kind)?;
+    let mean_lower = link.apply(&eta_lower)?;
+    let mean_upper = link.apply(&eta_upper)?;
     Ok((
         eta_mean,
         eta_lower,

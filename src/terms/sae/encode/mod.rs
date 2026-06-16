@@ -1193,10 +1193,21 @@ impl EncodeAtlas {
             ));
         };
         let chart = &atom_atlas.charts[chart_idx];
-        let mut t = chart.region.center.clone();
+        // #1154 Design A — warm-start the exact inner Newton from the amortized
+        // encoder's prediction `t̂ = t_c + (1/z)·A₁·(x − z·m₁)` when this chart
+        // carries a distilled IFT Jacobian and the amplitude is usable, then
+        // REFINE to stationarity below. A good warm-start lands the row inside
+        // the certified Kantorovich ball more often (strictly easier than the
+        // cold chart-center start), so the exact encode that REML's inner solve
+        // consumes is seeded by the co-trained encoder yet still converges the
+        // SAME `(t, β)` stationary point — the λ-gradient stays exact. The chart
+        // center remains the start when no Jacobian / near-inactive amplitude.
+        let mut t = amortized_warm_start(chart, x, amplitude)
+            .unwrap_or_else(|| chart.region.center.clone());
 
-        // The per-row certificate is evaluated AT the start point (the chart
-        // center), using the chart's closed-form L. This is the exactness gate.
+        // The per-row certificate is evaluated AT the start point (the amortized
+        // warm-start, or the chart center), using the chart's closed-form L. This
+        // is the exactness gate.
         let (cert, mut delta) = row_certificate(
             atom,
             evaluator.as_ref(),
@@ -1286,23 +1297,15 @@ impl EncodeAtlas {
         // A chart whose Gauss–Newton block was singular carries no distilled
         // Jacobian — the amortized predictor cannot fire, so flag for the exact
         // fallback (never a silent wrong encode).
-        let Some(a1) = chart.amortized_jacobian.as_ref() else {
+        if chart.amortized_jacobian.is_none() {
             return Ok(uncertified());
-        };
+        }
         // Closed-form predicted start t̂ = t_c + (1/z)·A₁·(x − z·m₁). With z ≈ 0
         // the amplitude-divided map is undefined (a near-inactive atom); the
         // certificate at the chart center handles those rows, so flag here.
-        if !(amplitude.is_finite() && amplitude.abs() > 0.0) {
+        let Some(mut t_hat) = amortized_warm_start(chart, x, amplitude) else {
             return Ok(uncertified());
-        }
-        let p = atom.output_dim();
-        let mut t_hat = chart.region.center.clone();
-        for (out_idx, &m1_out) in chart.recon_center.iter().enumerate().take(p) {
-            let resid = x[out_idx] - amplitude * m1_out;
-            for axis in 0..d {
-                t_hat[axis] += a1[[axis, out_idx]] * resid / amplitude;
-            }
-        }
+        };
         // Evaluate the SAME Kantorovich certificate at the predicted start. The
         // amortized prediction is trusted iff the certificate holds there.
         let (cert, mut delta) = row_certificate(
@@ -1711,6 +1714,41 @@ pub(crate) fn center_beta(atom: &SaeManifoldAtom, center: &Array1<f64>, ridge: f
     } else {
         None
     }
+}
+
+/// #1154 — the amortized encoder's closed-form warm-start coordinate for one
+/// row `x` against one chart at amplitude `z`:
+///
+/// ```text
+/// t̂ = t_c + (1/z) · A₁ · (x − z · m₁(t_c)),
+/// ```
+///
+/// a single `O(d·p)` mat-vec from the chart's precomputed IFT Jacobian `A₁` and
+/// center reconstruction `m₁`. Returns `None` when the chart carries no
+/// distilled Jacobian (singular Gauss–Newton block) or the amplitude is not
+/// strictly positive and finite (a near-inactive atom, where the
+/// amplitude-divided map is undefined) — in those cases the caller starts from
+/// the chart center instead. Shared by the amortized encode (where `t̂` is the
+/// prediction) and the exact certified encode (where `t̂` is the Newton
+/// warm-start that then refines to stationarity, Design A).
+pub(crate) fn amortized_warm_start(
+    chart: &CertifiedChart,
+    x: ArrayView1<'_, f64>,
+    amplitude: f64,
+) -> Option<Array1<f64>> {
+    let a1 = chart.amortized_jacobian.as_ref()?;
+    if !(amplitude.is_finite() && amplitude.abs() > 0.0) {
+        return None;
+    }
+    let d = a1.nrows();
+    let mut t_hat = chart.region.center.clone();
+    for (out_idx, &m1_out) in chart.recon_center.iter().enumerate().take(a1.ncols()) {
+        let resid = x[out_idx] - amplitude * m1_out;
+        for axis in 0..d {
+            t_hat[axis] += a1[[axis, out_idx]] * resid / amplitude;
+        }
+    }
+    Some(t_hat)
 }
 
 /// The amplitude-1 distilled amortized-encoder Jacobian at a chart center

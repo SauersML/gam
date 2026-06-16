@@ -240,6 +240,22 @@ impl FrozenWeightGramTensor {
         self.inner.drhs_dpsi(psi)
     }
 
+    /// Exact `∂²/∂ψ² (XᵀW X)` at the frozen `W`, n-free in O(D²k²) — the
+    /// frozen-W Fisher curvature block for the single-ψ Hessian channel. The
+    /// GLM outer Hessian `B_j` carries an additional irreducibly-n-dependent
+    /// third-derivative term (`Xᵀdiag(c⊙X_τβ̂)X`) that this tensor does not
+    /// hold, so `B_j` stays on the exact slab (see the module header); this
+    /// accessor exposes ONLY the n-free frozen-W Fisher second-ψ-derivative, in
+    /// the same source-of-truth representation as the value and gradient.
+    pub fn d2gram_dpsi2(&self, psi: f64) -> Array2<f64> {
+        self.inner.d2gram_dpsi2(psi)
+    }
+
+    /// Exact `∂²/∂ψ² (XᵀW z)` at the frozen `W`, n-free.
+    pub fn d2rhs_dpsi2(&self, psi: f64) -> Array1<f64> {
+        self.inner.d2rhs_dpsi2(psi)
+    }
+
     /// The frozen working weight the tensor was built at.
     pub fn frozen_weights(&self) -> ArrayView1<'_, f64> {
         self.frozen_w.view()

@@ -358,6 +358,71 @@ pub(crate) fn clamp_jacobian_rows(rows: Range<usize>, n: usize) -> Range<usize> 
     start..end.max(start)
 }
 
+/// A [`BlockEffectiveJacobian`] that composes an inner callback's raw-width
+/// effective Jacobian with a fixed reduced→raw block transform `T_b`
+/// (`p_raw × r_reduced`), so the family sees the **reduced** coordinates by
+/// construction (#933).
+///
+/// The inner callback emits its row Jacobian in the raw coordinate system
+/// (`(rows · k) × p_raw`), the layout every `BlockEffectiveJacobian` impl
+/// produces — channel-major rows, raw columns. Post-multiplying each row by
+/// `T_b` rotates those raw columns into the reduced section: the effective
+/// reduced Jacobian is `J_raw · T_b`, with `r_reduced` columns. On the model
+/// `η = J_raw · β_raw = (J_raw · T_b) · θ` this is the exact reduced operator
+/// for the reduced coefficient θ, and the family lifts θ back to β_raw through
+/// the SAME `T_b` via the one [`crate::solver::gauge::Gauge`].
+///
+/// This is the inversion #933 calls for: instead of forwarding a raw-width
+/// callback alongside a column-selection `T_i` (which leaves the family
+/// asserting raw column counts on a reduced spec and panicking), the callback
+/// is wrapped so its output already has the reduced width — the family captures
+/// the reduced design and its row-Hessian column-count assertions hold by
+/// construction. A column-selection `T_b` (zero/one entries) makes this exactly
+/// the audit's drop; a general orthonormal `T_b` makes it any gauge section.
+pub struct GaugeComposedJacobian {
+    inner: Arc<dyn BlockEffectiveJacobian>,
+    /// Reduced→raw block transform `T_b`, shape `(p_raw × r_reduced)`.
+    t_block: Arc<Array2<f64>>,
+}
+
+impl GaugeComposedJacobian {
+    /// Wrap `inner` so its effective Jacobian is post-multiplied by `t_block`
+    /// (`p_raw × r_reduced`). `t_block.nrows()` must equal the inner callback's
+    /// raw column count.
+    pub fn new(inner: Arc<dyn BlockEffectiveJacobian>, t_block: Arc<Array2<f64>>) -> Self {
+        Self { inner, t_block }
+    }
+}
+
+impl BlockEffectiveJacobian for GaugeComposedJacobian {
+    fn effective_jacobian_rows(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, String> {
+        let j_raw = self.inner.effective_jacobian_rows(state, rows)?;
+        if j_raw.ncols() != self.t_block.nrows() {
+            return Err(format!(
+                "GaugeComposedJacobian: inner Jacobian has {} columns but T_b has {} rows",
+                j_raw.ncols(),
+                self.t_block.nrows(),
+            ));
+        }
+        // (rows·k × p_raw) · (p_raw × r_reduced) = (rows·k × r_reduced).
+        Ok(j_raw.dot(self.t_block.as_ref()))
+    }
+
+    fn n_outputs(&self) -> usize {
+        self.inner.n_outputs()
+    }
+
+    // Skewness scaling is a raw-row property; reducing the column space does not
+    // change the per-row scaling, so it is forwarded unchanged when present.
+    fn eta_row_scaling_for_skewness(&self) -> Option<Arc<[f64]>> {
+        self.inner.eta_row_scaling_for_skewness()
+    }
+}
+
 /// Static specification for one parameter block in a custom family.
 ///
 /// `design` and `stacked_design` are two structurally distinct operators:

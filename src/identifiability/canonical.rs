@@ -663,15 +663,26 @@ fn canonicalize_for_identifiability_inner(
     // downstream solve collapse a genuine covariate direction (a time-invariant
     // covariate's coefficient pinned to exactly 0; gam#1110). So veto only when a
     // dropped column is attributed to a block that actually owns its geometry.
-    let owns_geometry = |name: &str| -> bool {
-        specs.iter().any(|spec| {
-            spec.name == name && (spec.jacobian_callback.is_some() || spec.stacked_design.is_some())
-        })
+    // The veto now applies ONLY to `stacked_design` blocks (#933). A
+    // `jacobian_callback`-only block can be column-reduced safely: the per-block
+    // reduction loop below wraps its callback in `GaugeComposedJacobian` with the
+    // block's selection-`T_i`, so the family's effective Jacobian emerges at the
+    // REDUCED width by construction and its row-Hessian column-count assertions
+    // hold — the family captures the reduced design instead of asserting raw
+    // widths. A `stacked_design` block still carries the family's hidden
+    // `3·n`-row z-lift / leading-fixed-column / monotonicity layout (#892, #1068)
+    // that a raw-column drop would desynchronise from the reduced β, so those
+    // remain width-preserving and defer curvature on weak directions to the
+    // robust/Firth path.
+    let owns_stacked_geometry = |name: &str| -> bool {
+        specs
+            .iter()
+            .any(|spec| spec.name == name && spec.stacked_design.is_some())
     };
     let dropped_on_owned_block = audit
         .dropped_columns
         .iter()
-        .any(|drop| owns_geometry(&drop.block));
+        .any(|drop| owns_stacked_geometry(&drop.block));
     if dropped_on_owned_block {
         let raw_widths: Vec<usize> = specs.iter().map(|spec| spec.design.ncols()).collect();
         let dropped_summary = audit
@@ -773,6 +784,26 @@ fn canonicalize_for_identifiability_inner(
             None => None,
         };
 
+        // Compose the gauge INTO the callback (#933): when columns are dropped
+        // from a `jacobian_callback` block, the family must see the reduced
+        // width. `GaugeComposedJacobian` post-multiplies the callback's raw-width
+        // effective Jacobian by `T_i` (p_raw × r_block) so the effective
+        // Jacobian emerges at `r_block` columns — the family captures the reduced
+        // design and its row-Hessian column-count assertions hold by
+        // construction, instead of asserting the raw width against a reduced
+        // spec. With no drops `T_i` is the identity and the callback is forwarded
+        // unchanged. (`stacked_design` blocks never reach this width-reducing
+        // branch — they are vetoed above.)
+        let reduced_jacobian_callback = match spec.jacobian_callback.as_ref() {
+            Some(cb) if !dropped_sorted.is_empty() => {
+                Some(Arc::new(crate::families::custom_family::GaugeComposedJacobian::new(
+                    Arc::clone(cb),
+                    Arc::new(t_i.clone()),
+                )) as Arc<dyn BlockEffectiveJacobian>)
+            }
+            other => other.cloned(),
+        };
+
         reduced_specs.push(ParameterBlockSpec {
             name: spec.name.clone(),
             design: reduced_design,
@@ -788,10 +819,7 @@ fn canonicalize_for_identifiability_inner(
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
             gauge_priority: spec.gauge_priority,
-            // The jacobian_callback (if any) is forwarded: the callback
-            // internally uses the raw design width, which the column-
-            // selection T_i accounts for by selecting surviving columns.
-            jacobian_callback: spec.jacobian_callback.clone(),
+            jacobian_callback: reduced_jacobian_callback,
             stacked_design: reduced_stacked_design,
             stacked_offset: reduced_stacked_offset,
         });
