@@ -1,18 +1,14 @@
 use super::*;
 
-/// Active-set layout selector for [`SaeManifoldTerm::assemble_arrow_schur_inner`].
+/// Active-set layout override for [`SaeManifoldTerm::assemble_arrow_schur_inner`].
 ///
-/// Production assembly always passes [`ForcedRowLayout::Computed`] (the layout is
-/// derived from the assignment mode and `sparse_active_plan`). The
-/// [`ForcedRowLayout::Forced`] variant lets a caller pin a specific layout —
-/// dense (`Forced(None)`) or a chosen compact `SaeRowLayout`
-/// (`Forced(Some(..))`) — so the compact-vs-dense Riemannian-geometry equality
-/// regression can drive both code paths on identical data without depending on
-/// the host/device memory budget that gates the compact path in production.
-pub(crate) enum ForcedRowLayout {
-    Computed,
-    Forced(Option<SaeRowLayout>),
-}
+/// `None` is the production path: the layout is derived from the assignment mode
+/// and `sparse_active_plan`. `Some(layout_opt)` pins a specific layout — dense
+/// (`Some(None)`) or a chosen compact `SaeRowLayout` (`Some(Some(..))`) — so the
+/// compact-vs-dense Riemannian-geometry equality regression can drive both code
+/// paths on identical data without depending on the host/device memory budget
+/// that gates the compact path in production.
+pub(crate) type ForcedRowLayout = Option<Option<SaeRowLayout>>;
 
 impl SaeManifoldTerm {
     #[must_use = "build error must be handled"]
@@ -2787,7 +2783,7 @@ impl SaeManifoldTerm {
             analytic_penalties,
             penalty_scale,
             dense_beta_penalty_probe_max_dim,
-            ForcedRowLayout::Computed,
+            None,
         )
     }
 
@@ -2976,8 +2972,8 @@ impl SaeManifoldTerm {
             .map(|c| c.latent_dim())
             .collect();
         let row_layout: Option<SaeRowLayout> = match forced_layout {
-            ForcedRowLayout::Forced(layout) => layout,
-            ForcedRowLayout::Computed => match self.assignment.mode {
+            Some(layout) => layout,
+            None => match self.assignment.mode {
             AssignmentMode::JumpReLU {
                 threshold,
                 temperature,

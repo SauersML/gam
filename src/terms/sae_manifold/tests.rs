@@ -964,9 +964,10 @@ pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
 /// von-Mises gradient — hence the Riemannian Hessian correction — is nonzero).
 #[test]
 pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support() {
-    // `ForcedRowLayout`, `SaeRowLayout`, and `SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM`
-    // are all in scope via `use super::*` (the `sae_manifold` module re-exports
-    // `construction::*`, `row_layout::*`, and `term::*`).
+    // `SaeRowLayout` and `SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM` are in scope via
+    // `use super::*` (the `sae_manifold` module re-exports `row_layout::*` and
+    // `term::*`). The assembly override is `Option<Option<SaeRowLayout>>`:
+    // `Some(None)` pins dense, `Some(Some(layout))` pins a compact layout.
 
     // Two Circle atoms, coordinates spread around the period so the von-Mises
     // coordinate-prior gradient is nonzero (the Riemannian Hessian correction
@@ -1031,16 +1032,10 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     );
     let probe = SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM;
 
-    // Dense layout (forced None).
+    // Dense layout: pin `Some(None)` so the override forces the dense path
+    // regardless of the budget-derived plan.
     let dense = term
-        .assemble_arrow_schur_inner(
-            target.view(),
-            &rho,
-            None,
-            1.0,
-            probe,
-            ForcedRowLayout::Forced(None),
-        )
+        .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, Some(None))
         .unwrap();
 
     // Compact layout with EVERY row's active set = both atoms (full support).
@@ -1049,14 +1044,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     let full_active: Vec<Vec<usize>> = (0..n).map(|_| vec![0usize, 1usize]).collect();
     let layout = SaeRowLayout::from_active_atoms(full_active, coord_dims, coord_offsets);
     let compact = term
-        .assemble_arrow_schur_inner(
-            target.view(),
-            &rho,
-            None,
-            1.0,
-            probe,
-            ForcedRowLayout::Forced(Some(layout)),
-        )
+        .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, Some(Some(layout)))
         .unwrap();
 
     assert_eq!(dense.rows.len(), compact.rows.len());
