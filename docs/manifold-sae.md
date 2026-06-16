@@ -36,6 +36,42 @@ recon = fit.predict(Z)  # (N, p) reconstruction; == fit.fitted on training Z
 `sae_manifold_fit` returns a [`ManifoldSAE`](#the-manifoldsae-result). Both
 `gamfit.sae_manifold_fit` and `gamfit.ManifoldSAE` are top-level exports.
 
+### `sae_manifold_fit` parameters
+
+The full signature, with defaults (keyword-only arguments follow the `*`):
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `X` | `None` | `(N, p)` data to decompose |
+| `K` | `None` | dictionary size (number of atoms) |
+| `d_atom` | `2` | intrinsic dim per atom (int, or per-atom list) |
+| `atom_topology` | `"circle"` | global topology string (see table) |
+| `assignment` | `"ibp_map"` | gate kind: `ibp_map` / `softmax` / `jumprelu` |
+| `schedule` | `None` | `GumbelTemperatureSchedule` for annealed gates |
+| `isometry_weight` | `0.0` | unit-speed gauge penalty (off by default) |
+| `ard_per_atom` | `True` | ARD pruning of unused coordinate axes |
+| `decoder_feature_sparsity_groups` | `None` | output-feature partition for decoder group-lasso |
+| `n_iter` | `50` | joint-solve iterations |
+| `sparsity_weight` | `1.0` | strength of the gate-sparsity penalty |
+| `gate_sparsity` | `"scad"` | `scad` / `mcp` / `l1` |
+| `scad_mcp_gamma` | `None` | SCAD/MCP concavity (defaults SCAD 3.7, MCP 2.5) |
+| `smoothness_weight` | `1.0` | roughness penalty strength |
+| `alpha` | `1.0` | ARD/precision seed (`float` or a string policy) |
+| `learning_rate` | `None` | optional step size override |
+| `random_state` | `0` | RNG seed |
+| `block_orthogonality_weight` | `0.0` | orthogonalize latent axes (needs `d_atom >= 2`) |
+| `nuclear_norm_weight` | `1.0` | embedding-rank selection penalty |
+| `nuclear_norm_max_rank` | `None` | optional cap on the embedding rank |
+| `decoder_incoherence_weight` | `1.0` | cross-atom incoherence (separability lever) |
+| `top_k` | `None` | cap on per-token active atoms |
+| `t_init` | `None` | coordinate warm start `(K, N, D_max)` |
+| `a_init` | `None` | assignment-logit warm start `(N, K)` |
+| `tau` | `None` | Gumbel-softmax temperature |
+| `jumprelu_threshold` | `0.0` | hard-threshold cutoff for `jumprelu` |
+| `atom_basis` | `None` | per-atom topology list (overrides `atom_topology`) |
+| `fisher_factors` | `None` | per-token Fisher reweighting factors |
+| `weights` | `None` | per-row observation weights |
+
 ## Topology types
 
 Each atom carries a topology, set globally by `atom_topology=` or per atom by
@@ -80,11 +116,29 @@ smoothing weights selected by REML. Each piece plays a distinct role
   per-atom decoded points. Reported as `fit.reconstruction_r2`.
 
 - **Gate sparsity (`assignment=`, canonical).** The per-token, per-atom gate
-  is selected by the assignment prior. The canonical choice is `"ibp_map"`
-  (Indian Buffet Process MAP): it adapts the *number* of active atoms per
-  token and produces **true zeros** rather than a soft simplex. Alternatives
-  are `"softmax"` (dense, simplex-normalized) and `"jumprelu"`
-  (hard threshold). `top_k=` optionally caps the per-token active set.
+  is selected by the assignment prior. The three supported kinds are
+  `"ibp_map"` (default), `"softmax"`, and `"jumprelu"`. `"ibp_map"`
+  (Indian Buffet Process MAP) adapts the *number* of active atoms per token
+  and produces **true zeros** rather than a soft simplex; `"softmax"` is a
+  dense, simplex-normalized gate; `"jumprelu"` is a hard threshold (its
+  cutoff is `jumprelu_threshold=`, default `0.0`). `top_k=` optionally caps
+  the per-token active set, and `tau=` sets the Gumbel-softmax temperature.
+
+  **Gumbel temperature schedules.** For the annealed gates, pass `schedule=`
+  (a `GumbelTemperatureSchedule` or a mapping). Three constructors are
+  top-level exports:
+
+  ```python
+  from gamfit import (gumbel_geometric_schedule, gumbel_linear_schedule,
+                      gumbel_reciprocal_iter_schedule)
+  # geometric decay τ_start → τ_min at the given multiplicative rate
+  sched = gumbel_geometric_schedule(tau_start=4.0, tau_min=1.0, rate=0.9)
+  # linear ramp over `steps` iterations
+  sched = gumbel_linear_schedule(tau_start=4.0, tau_min=1.0, steps=50)
+  # reciprocal-in-iteration decay τ(i) = τ_start / (1 + i)
+  sched = gumbel_reciprocal_iter_schedule(tau_start=4.0, tau_min=1.0)
+  fit = gamfit.sae_manifold_fit(X=Z, K=16, assignment="softmax", schedule=sched)
+  ```
 
 - **Cross-atom decoder incoherence** (`decoder_incoherence_weight=1.0`, **on
   by default**, issue #671). The separability lever. For `K >= 2` it
