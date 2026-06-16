@@ -2,6 +2,8 @@
 //!
 //! Former top-level crates included as modules so they link as ONE binary.
 
+#[path = "perf_scale/glm_frozen_w_tensor_n_independence.rs"]
+mod glm_frozen_w_tensor_n_independence;
 #[path = "perf_scale/grid_spline_2d_exact_oracle.rs"]
 mod grid_spline_2d_exact_oracle;
 #[path = "perf_scale/grid_spline_2d_streaming_bench.rs"]
