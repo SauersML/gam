@@ -79,7 +79,7 @@ crate::impl_reason_error_boilerplate! {
 
 /// Installed cross-block flex block on the runtime.
 ///
-/// Direct on-runtime image of `identifiability::compiler::CompiledBlock`:
+/// Direct on-runtime image of `identifiability::families::compiler::CompiledBlock`:
 /// `anchor_correction` = `compiled.anchor_correction` (the d × k matrix M),
 /// `anchor_components` = the per-anchor predict-time tags (the parent
 /// predictor uses them to rebuild `n_row` at predict-time rows). The

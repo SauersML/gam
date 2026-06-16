@@ -7,12 +7,12 @@ use super::*;
 //      needed for both the audit gate and the compile step.
 //   2. `audit_identifiability_channel_aware` — structural rank gate using
 //      the BMS K=1 row Jacobian; catches full aliasing before any install.
-//   3. `identifiability::compiler::compile` — W-metric Gram + eigendecomp,
+//   3. `identifiability::families::compiler::compile` — W-metric Gram + eigendecomp,
 //      produces the V selector and anchor-correction M.
 //   4. Install V/M into the `DeviationRuntime` via `install_compiled_flex_block`,
 //      rebuild the block's design + penalties, and return `FlexCompileOutcome`.
 //
-// The K=1 row-Jacobian math still runs through `identifiability::compiler::compile`,
+// The K=1 row-Jacobian math still runs through `identifiability::families::compiler::compile`,
 // so there is exactly one cross-block residualisation math implementation in
 // the codebase.
 
@@ -57,7 +57,7 @@ pub(crate) struct BmsFlexBlockContext {
 /// Validate inputs, densify anchors, stack N_train, and assemble the
 /// `BernoulliDenseDesignOperator` / `BlockOrder` / `BernoulliRowHessian`
 /// vectors needed by both [`audit_identifiability_channel_aware`] and
-/// [`identifiability::compiler::compile`].
+/// [`identifiability::families::compiler::compile`].
 ///
 /// Returns `Ok(None)` when the anchor union is empty (no-anchor fast path).
 pub(crate) fn build_bms_flex_block_context(

@@ -1,9 +1,5 @@
 //! Identifiability: one coherent home for every identifiability concern in the
-//! crate (issue #1140).
-//!
-//! Previously the identifiability logic was smeared across four directories
-//! under four different vocabulary words. It now lives here, under one
-//! consistent vocabulary:
+//! crate.
 //!
 //! - [`kernel`] — the low-level rank / null-space kernels.
 //! - [`precondition`] — cheap pre-fit precondition checks.

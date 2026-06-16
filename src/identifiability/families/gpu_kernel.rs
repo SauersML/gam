@@ -79,8 +79,8 @@ pub const KERNEL_SRC: &str = r#"
 #define CHANNELS 4
 #define PACKED_LEN 10
 
-// packed_index(c, d) — mirrors the Rust const fn in
-// `identifiability_compile::packed_index`. Symmetric in (c, d).
+// packed_index(c, d) mirrors the Rust const fn in
+// `crate::identifiability::families::gpu::packed_index`. Symmetric in (c, d).
 __device__ __forceinline__ int packed_index_dev(int c, int d) {
     int lo = c <= d ? c : d;
     int hi = c <= d ? d : c;

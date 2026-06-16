@@ -374,7 +374,7 @@ mod cuda_impl {
                         .arg(&b_present_mask);
                     // SAFETY: every argument is a typed device pointer or
                     // scalar whose layout matches the kernel signature
-                    // declared in identifiability_compile_kernel::KERNEL_SRC.
+                    // declared in gpu_kernel::KERNEL_SRC.
                     // The grid covers (a_cols, b_cols) and out-of-tile
                     // threads early-return via the in_range guard.
                     unsafe { builder.launch(cfg) }.ok()?;

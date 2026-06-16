@@ -12,9 +12,9 @@
 //!   - Bernoulli marginal-slope (K=1): `BernoulliRowHessian`
 //!   - Gaussian location-scale (K=2): `GaussianLocationScaleChannelHessian`
 
-use gam::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian;
 use gam::families::custom_family::FamilyChannelHessian;
 use gam::families::gamlss::GaussianLocationScaleChannelHessian;
+use gam::identifiability::families::bernoulli::BernoulliRowHessian;
 use gam::identifiability::marginal_slope::{SurvivalRowHessian, survival_row_nll_grad_hess};
 use ndarray::Array1;
 
