@@ -213,9 +213,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// (#740).
 ///
 /// Returns `Some(hook)` only when the family's psi workspace supplies a
-/// combined-direction likelihood kernel (`second_order_terms_contracted`);
-/// otherwise `None`, which keeps the outer-Hessian operator on the exact
-/// per-pair `ext_ext_fn` assembly.
+/// combined-direction likelihood kernel (`second_order_terms_contracted`) that
+/// covers every ψ basis axis; otherwise `None`, which keeps the outer-Hessian
+/// operator on the exact per-pair `ext_ext_fn` assembly.
 ///
 /// The hook produces, for the ψ-direction weights `α_ψ`, the
 /// [`ContractedPsiSecondOrder`] ψψ-block contraction: it sums the family

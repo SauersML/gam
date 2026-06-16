@@ -2057,6 +2057,99 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
 }
 
 #[test]
+pub(crate) fn contracted_psi_hook_declines_partial_axis_coverage_before_pair_tables_are_skipped() {
+    struct PartialContractedPsiWorkspace;
+
+    impl ExactNewtonJointPsiWorkspace for PartialContractedPsiWorkspace {
+        fn second_order_terms(
+            &self,
+            psi_i: usize,
+            psi_j: usize,
+        ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+            assert!(psi_i < usize::MAX);
+            assert!(psi_j < usize::MAX);
+            Ok(None)
+        }
+
+        fn second_order_terms_contracted(
+            &self,
+            alpha_psi: &[f64],
+        ) -> Result<Option<ExactNewtonJointPsiSecondOrderContracted>, String> {
+            if alpha_psi.get(1).copied().unwrap_or(0.0) != 0.0 {
+                return Ok(None);
+            }
+            let psi_dim = alpha_psi.len();
+            Ok(Some(ExactNewtonJointPsiSecondOrderContracted {
+                objective: Array1::zeros(psi_dim),
+                score: Array2::zeros((psi_dim, 1)),
+                hessian: (0..psi_dim)
+                    .map(|_| DriftDerivResult::Dense(Array2::zeros((1, 1))))
+                    .collect(),
+            }))
+        }
+
+        fn hessian_directional_derivative(
+            &self,
+            psi_index: usize,
+            d_beta_flat: &Array1<f64>,
+        ) -> Result<Option<DriftDerivResult>, String> {
+            assert!(psi_index < usize::MAX);
+            assert_eq!(d_beta_flat.len(), 1);
+            Ok(None)
+        }
+    }
+
+    let specs = vec![ParameterBlockSpec {
+        name: "partial".to_string(),
+        design: DesignMatrix::from(Array2::ones((1, 1))),
+        offset: Array1::zeros(1),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let derivative_blocks = Arc::new(vec![vec![
+        CustomFamilyBlockPsiDerivative::new(
+            None,
+            Array2::zeros((1, 1)),
+            Array2::zeros((1, 1)),
+            None,
+            None,
+            None,
+            None,
+        ),
+        CustomFamilyBlockPsiDerivative::new(
+            None,
+            Array2::zeros((1, 1)),
+            Array2::zeros((1, 1)),
+            None,
+            None,
+            None,
+            None,
+        ),
+    ]]);
+    let hook = build_contracted_psi_hook(
+        &specs,
+        derivative_blocks,
+        &array![0.0],
+        &[],
+        &[0],
+        None,
+        Some(Arc::new(PartialContractedPsiWorkspace)),
+    )
+    .expect("partial contracted psi hook probe should not error");
+
+    assert!(
+        hook.is_none(),
+        "partial contracted psi coverage must keep the exact per-pair assembly path"
+    );
+}
+
+#[test]
 pub(crate) fn custom_family_outer_derivatives_respects_missing_second_order_capability() {
     #[derive(Clone)]
     struct OneBlockFirstOrderOnlyFamily;
