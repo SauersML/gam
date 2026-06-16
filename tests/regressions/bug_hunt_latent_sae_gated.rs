@@ -1,7 +1,7 @@
 use gam::solver::outer_strategy::OuterObjective;
 use gam::terms::gated_decoder::GatedSAEDecoder;
 use gam::terms::latent_coord::{LatentCoordValues, LatentIdMode};
-use gam::terms::sae_manifold::{
+use gam::terms::sae::manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeManifoldAtom,
     SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,
 };
@@ -21,7 +21,7 @@ fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
 
     let atom0 = SaeManifoldAtom::new(
         "a0",
-        gam::terms::sae_manifold::SaeAtomBasisKind::Precomputed("dict0".into()),
+        gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict0".into()),
         2,
         array![[1.0], [1.0]],
         Array3::zeros((2, 1, 2)),
@@ -31,7 +31,7 @@ fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
     .expect("test setup must construct atom0");
     let atom1 = SaeManifoldAtom::new(
         "a1",
-        gam::terms::sae_manifold::SaeAtomBasisKind::Precomputed("dict1".into()),
+        gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict1".into()),
         2,
         array![[1.0], [1.0]],
         Array3::zeros((2, 1, 2)),
@@ -149,7 +149,7 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
     }
     let atom = SaeManifoldAtom::new(
         "a",
-        gam::terms::sae_manifold::SaeAtomBasisKind::Precomputed("dict".into()),
+        gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict".into()),
         d,
         basis_values,
         basis_jacobian,
@@ -234,7 +234,7 @@ fn reml_criterion_has_interior_minimum_in_log_lambda_smooth() {
     ];
     let atom = SaeManifoldAtom::new(
         "a",
-        gam::terms::sae_manifold::SaeAtomBasisKind::Precomputed("dict".into()),
+        gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict".into()),
         1,
         phi,
         Array3::zeros((n, 2, 1)),
@@ -379,7 +379,7 @@ fn temperature_schedule_is_applied_each_iteration_and_near_zero_behaves_like_arg
             .map(|k| {
                 SaeManifoldAtom::new(
                     format!("a{k}"),
-                    gam::terms::sae_manifold::SaeAtomBasisKind::Precomputed("dict".into()),
+                    gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict".into()),
                     1,
                     array![[1.0]],
                     Array3::zeros((1, 1, 1)),
