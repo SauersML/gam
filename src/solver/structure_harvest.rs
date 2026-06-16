@@ -729,7 +729,7 @@ fn topology_candidates_for_dim(
                 // fraction-of-period convention `TorusHarmonicEvaluator` shares
                 // with the periodic 1-D atom). This MUST match the production
                 // seeding (`AtomTopology::Torus` → Product[Circle, Circle] in
-                // `sae_manifold::atom`); a flat `Euclidean` manifold would leave
+                // `sae::manifold::atom`); a flat `Euclidean` manifold would leave
                 // the born atom's angles un-wrapped and the joint refit would
                 // retract on the wrong geometry.
                 manifold: LatentManifold::Product(vec![
@@ -749,7 +749,7 @@ fn topology_candidates_for_dim(
                 // `LatentManifold::Sphere { dim: 2 }`, which would demand ambient
                 // unit 3-vectors the chart never produces. This matches the
                 // production seeding (`AtomTopology::Sphere` →
-                // Product[Interval(-π/2, π/2), Circle(τ)] in `sae_manifold::atom`).
+                // Product[Interval(-π/2, π/2), Circle(τ)] in `sae::manifold::atom`).
                 manifold: LatentManifold::Product(vec![
                     LatentManifold::Interval {
                         lo: -std::f64::consts::FRAC_PI_2,
@@ -779,7 +779,7 @@ fn topology_candidates_for_dim(
                 // with the periodic / torus atoms), axis 1 is the unbounded flat
                 // line (`Euclidean`). This MUST match the production seeding
                 // (`SaeAtomBasisKind::Cylinder` → Product[Circle(1.0), Euclidean]
-                // in `sae_manifold::atom`); a flat `Euclidean` manifold would leave
+                // in `sae::manifold::atom`); a flat `Euclidean` manifold would leave
                 // the born atom's phase axis un-wrapped, and a torus stand-in would
                 // wrap the linear axis spuriously. The harmonic / degree budget
                 // mirrors the torus (2 circle harmonics) and the patch (degree 2)

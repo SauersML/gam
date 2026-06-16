@@ -2096,7 +2096,7 @@ fn sae_manifold_fit_inner<'py>(
     // valid MechanismSparsityPenalty (target length = d · p_out, feature
     // groups partitioning p_out). For multi-atom fits the penalty cannot
     // group-lasso the whole concatenation as a single (Σ M_k, p_out) matrix —
-    // instead `add_sae_beta_penalty` in src/terms/sae_manifold.rs dispatches
+    // instead `add_sae_beta_penalty` in src/terms/sae/manifold.rs dispatches
     // the penalty per atom, rebuilding its target range/latent_dim to each
     // atom's (M_k, p_out) block. For k_atoms == 1 the per-atom dispatch
     // collapses to exactly this single block, so both paths agree (#240).
