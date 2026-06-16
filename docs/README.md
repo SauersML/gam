@@ -35,6 +35,8 @@ Building a model
   simultaneous contrasts between smooths.
 - [Manifold smooths gallery](manifold-smooths.md) — periodic, cylinder,
   torus, sphere, Möbius double-cover, and boundary-conditioned smooths.
+- [Manifold SAE dictionary](manifold-sae.md) — sparse typed-manifold
+  decomposition of an activation / embedding matrix.
 - [Families and link functions](families-and-links.md) — including
   `flexible(...)`, `blended(...)`, `sas`, `beta-logistic`.
 - [Survival models](survival.md) — `Surv(...)` syntax, the likelihood
@@ -68,6 +70,12 @@ Reference
   `explain_error()`.
 - [Cookbook](cookbook.md) — runnable examples verified against the test
   suite.
+- [GPU acceleration](gpu_acceleration.md) — CUDA dispatch, probe-time
+  thresholds, and CPU fallback.
+- [REML scaling](reml_scaling.md) — solver strategy at large data scales.
+- [Measure-jet frame notes](measure_jet_frame.md) — the measure-jet
+  smooth basis.
+- [Changelog](changelog.md) — release history.
 
 ## Example
 
