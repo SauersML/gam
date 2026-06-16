@@ -1628,6 +1628,95 @@ pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
     );
 }
 
+/// #976 distinct-basin lever: the co-collapse multi-start reseed must read a
+/// DIFFERENT principal subspace on each retry. The PC-pair rotation offset (=
+/// the 0-based retry index) shifts which residual PC pair each periodic atom
+/// reads, so two consecutive multi-start attempts produce seed coordinates that
+/// are not bit-identical. Without the rotation every retry re-reads the same
+/// leading PCs of the (unchanged) residual and the budget-N multi-start is N
+/// identical attempts — the K=3 coin-flip this fix targets.
+#[test]
+pub(crate) fn co_collapse_reseed_rotation_explores_distinct_subspaces() {
+    // A residual with three well-separated PC directions (p = 6 so >= 6 PCs
+    // exist and the offset can rotate through several disjoint pairs).
+    let residual = array![
+        [3.0, 0.1, 0.0, 0.0, 0.0, 0.0],
+        [-3.0, -0.1, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 2.0, 0.2, 0.0, 0.0],
+        [0.0, 0.0, -2.0, -0.2, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 0.3],
+        [0.0, 0.0, 0.0, 0.0, -1.0, -0.3],
+    ];
+    let kinds = vec![
+        SaeAtomBasisKind::Periodic,
+        SaeAtomBasisKind::Periodic,
+        SaeAtomBasisKind::Periodic,
+    ];
+    let dims = vec![1usize, 1, 1];
+    let seed0 = sae_pca_seed_initial_coords_with_pc_offset(residual.view(), &kinds, &dims, 0)
+        .expect("offset-0 seed");
+    let seed1 = sae_pca_seed_initial_coords_with_pc_offset(residual.view(), &kinds, &dims, 1)
+        .expect("offset-1 seed");
+    let seed2 = sae_pca_seed_initial_coords_with_pc_offset(residual.view(), &kinds, &dims, 2)
+        .expect("offset-2 seed");
+    let maxdiff = |a: &Array3<f64>, b: &Array3<f64>| -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
+    };
+    assert!(
+        maxdiff(&seed0, &seed1) > 1e-3,
+        "retry 0 vs 1 must read distinct PC pairs (max coord diff = {:.3e})",
+        maxdiff(&seed0, &seed1)
+    );
+    assert!(
+        maxdiff(&seed1, &seed2) > 1e-3,
+        "retry 1 vs 2 must read distinct PC pairs (max coord diff = {:.3e})",
+        maxdiff(&seed1, &seed2)
+    );
+    // Offset 0 must be byte-identical to the no-offset entry point (the K=1 and
+    // initial-fit seed paths must be untouched).
+    let seed_plain = sae_pca_seed_initial_coords(residual.view(), &kinds, &dims)
+        .expect("plain seed");
+    assert_eq!(
+        seed0, seed_plain,
+        "offset-0 seed must equal the no-offset seed bit-for-bit"
+    );
+}
+
+/// #976 determinism (issue requirement: identical inputs ⇒ identical output
+/// run-to-run). The PCA seed is the SAE-fit entry the owner flagged as flipping
+/// the collapse basin between runs. Pin that repeated calls on identical input
+/// are bit-identical under the process-default (global Rayon) faer backend, so
+/// the now-rotated multi-start is a fixed pass rather than a coin-flip. (The
+/// cross-thread-count arm is exercised on MSI via RAYON_NUM_THREADS; faer's
+/// blocked factorizations keep a fixed per-element reduction order, so the
+/// global-state-mutating Seq/Par toggle is deliberately NOT done here — it would
+/// race the rest of the suite's parallel tests.)
+#[test]
+pub(crate) fn pca_seed_is_run_to_run_reproducible() {
+    let residual = array![
+        [3.0, 0.1, -0.2, 0.4, 0.0, 0.05],
+        [-3.0, -0.1, 0.2, -0.4, 0.0, -0.05],
+        [0.3, 0.0, 2.0, 0.2, 0.1, 0.0],
+        [-0.3, 0.0, -2.0, -0.2, -0.1, 0.0],
+        [0.0, 0.2, 0.1, 0.0, 1.0, 0.3],
+        [0.0, -0.2, -0.1, 0.0, -1.0, -0.3],
+    ];
+    let kinds = vec![SaeAtomBasisKind::Periodic, SaeAtomBasisKind::Periodic];
+    let dims = vec![1usize, 1];
+    let seed_a = sae_pca_seed_initial_coords(residual.view(), &kinds, &dims)
+        .expect("seed #1");
+    let seed_b = sae_pca_seed_initial_coords(residual.view(), &kinds, &dims)
+        .expect("seed #2");
+    assert_eq!(
+        seed_a, seed_b,
+        "PCA seed must be bit-identical run-to-run (the issue's determinism \
+         requirement)"
+    );
+}
+
 /// #976 decoder arm is a strict no-op for K=1: a single atom has no peer to
 /// fall behind, so the guard must never reseed or record an event even when
 /// the lone decoder is tiny. This pins the "K=1 path unchanged" guarantee.
