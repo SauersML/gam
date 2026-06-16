@@ -9468,7 +9468,7 @@ impl CustomOuterState {
         rho_dim: usize,
         specs: &[ParameterBlockSpec],
         beta: &Array1<f64>,
-    ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError> {
+    ) -> Result<crate::solver::rho_optimizer::SeedOutcome, EstimationError> {
         // A seed β whose length disagrees with this fit's per-block
         // coefficient widths is NOT an error: the outer warm-start cache
         // looks up a *row-relaxed* prefix (`cache_seed_key`), so two folds
@@ -9482,20 +9482,20 @@ impl CustomOuterState {
         // ρ seed stand — a ρ-only resume, never a full cold start.
         let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         if beta.len() != expected {
-            return Ok(crate::solver::outer_strategy::SeedOutcome::Incompatible);
+            return Ok(crate::solver::rho_optimizer::SeedOutcome::Incompatible);
         }
         let warm_start = constrained_warm_start_from_cached_beta(rho_dim, specs, beta)?;
         self.reset_warm_cache = Some(warm_start.clone());
         self.warm_cache = Some(warm_start);
         self.last_error = None;
-        Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
+        Ok(crate::solver::rho_optimizer::SeedOutcome::Installed)
     }
 }
 
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
-    pub outer_hessian: crate::solver::outer_strategy::HessianResult,
+    pub outer_hessian: crate::solver::rho_optimizer::HessianResult,
     pub warm_start: CustomFamilyWarmStart,
     /// `false` when the inner blockwise/Newton solve hit its divergence
     /// early-exit or its max-cycle cap. Envelope-theorem outer gradients
@@ -9508,7 +9508,7 @@ pub struct CustomFamilyJointHyperResult {
 }
 
 pub struct CustomFamilyJointHyperEfsResult {
-    pub efs_eval: crate::solver::outer_strategy::EfsEval,
+    pub efs_eval: crate::solver::rho_optimizer::EfsEval,
     pub warm_start: CustomFamilyWarmStart,
     /// See [`CustomFamilyJointHyperResult::inner_converged`]. EFS gradients
     /// also assume a stationary inner solve.
@@ -9518,7 +9518,7 @@ pub struct CustomFamilyJointHyperEfsResult {
 pub(crate) struct OuterObjectiveEvalResult {
     pub(crate) objective: f64,
     pub(crate) gradient: Array1<f64>,
-    pub(crate) outer_hessian: crate::solver::outer_strategy::HessianResult,
+    pub(crate) outer_hessian: crate::solver::rho_optimizer::HessianResult,
     pub(crate) warm_start: ConstrainedWarmStart,
     pub(crate) inner_converged: bool,
 }
@@ -9541,7 +9541,7 @@ pub(crate) struct OwnedDenseOuterHessianOperator {
     pub(crate) matrix: Array2<f64>,
 }
 
-impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHessianOperator {
+impl crate::solver::rho_optimizer::OuterHessianOperator for OwnedDenseOuterHessianOperator {
     fn dim(&self) -> usize {
         self.matrix.nrows()
     }
@@ -9595,7 +9595,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHess
 }
 
 pub(crate) struct LabeledOuterHessianOperator {
-    pub(crate) base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    pub(crate) base: Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>,
     pub(crate) physical_to_outer: Vec<Option<usize>>,
     pub(crate) outer_dim: usize,
     /// Scratch buffers reused across `apply_into` calls to avoid
@@ -9606,7 +9606,7 @@ pub(crate) struct LabeledOuterHessianOperator {
 
 impl LabeledOuterHessianOperator {
     pub(crate) fn new(
-        base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+        base: Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>,
         layout: &PenaltyLabelLayout,
     ) -> Self {
         let n_physical = layout.physical_to_outer.len();
@@ -9622,7 +9622,7 @@ impl LabeledOuterHessianOperator {
     }
 }
 
-impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessianOperator {
+impl crate::solver::rho_optimizer::OuterHessianOperator for LabeledOuterHessianOperator {
     fn dim(&self) -> usize {
         self.outer_dim
     }
@@ -9743,7 +9743,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
 
     fn materialization_capability(
         &self,
-    ) -> crate::solver::outer_strategy::OuterHessianMaterialization {
+    ) -> crate::solver::rho_optimizer::OuterHessianMaterialization {
         self.base.materialization_capability()
     }
 }
@@ -9756,7 +9756,7 @@ pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
     rho: &Array1<f64>,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     eval_mode: EvalMode,
-) -> Result<Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>, String> {
+) -> Result<Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>>, String> {
     if eval_mode != EvalMode::ValueGradientHessian {
         return Ok(None);
     }
@@ -9766,11 +9766,11 @@ pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
         return Ok(None);
     };
     match terms.outer_hessian {
-        crate::solver::outer_strategy::HessianResult::Operator(operator) => Ok(Some(operator)),
-        crate::solver::outer_strategy::HessianResult::Analytic(matrix) => {
+        crate::solver::rho_optimizer::HessianResult::Operator(operator) => Ok(Some(operator)),
+        crate::solver::rho_optimizer::HessianResult::Analytic(matrix) => {
             Ok(Some(Arc::new(OwnedDenseOuterHessianOperator { matrix })))
         }
-        crate::solver::outer_strategy::HessianResult::Unavailable => Ok(None),
+        crate::solver::rho_optimizer::HessianResult::Unavailable => Ok(None),
     }
 }
 

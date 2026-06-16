@@ -19,7 +19,7 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// joint psi calculus. Threaded from the fit entry point so large-scale
     /// runs pick up the caller's analytic-operator preference instead of an
     /// inline default.
-    pub(super) policy: crate::resource::ResourcePolicy,
+    pub(super) policy: crate::solver::resource::ResourcePolicy,
     /// Fit-lifetime byte-limited LRU for de-nested cubic cell moments. The key
     /// is the exact bit pattern of `(c0, c1, c2, c3, left, right)`, so reuse
     /// across PIRLS cycles is safe only for byte-identical cells while LRU

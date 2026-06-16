@@ -1657,7 +1657,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     spec: BernoulliMarginalSlopeTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-    policy: &crate::resource::ResourcePolicy,
+    policy: &crate::solver::resource::ResourcePolicy,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
     let data_view = data;

@@ -64,7 +64,7 @@
 use crate::linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
 use crate::matrix::FactorizedSystem;
 use crate::solver::estimate::EstimationError;
-use crate::solver::outer_strategy::{
+use crate::solver::rho_optimizer::{
     HessianResult, OuterCapability, OuterHessianOperator, OuterObjective, OuterPlan, OuterResult,
 };
 use faer::Side;
@@ -763,7 +763,7 @@ pub fn run_per_atom_efs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::outer_strategy::{
+    use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, EfsEval, OuterEval, SeedOutcome,
     };
     use ndarray::array;

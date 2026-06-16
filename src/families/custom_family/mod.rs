@@ -33,7 +33,7 @@ pub(crate) use crate::matrix::{
 pub(crate) use crate::pirls::{
     LinearInequalityConstraints, solve_newton_directionwith_lower_bounds,
 };
-pub(crate) use crate::resource::{DerivativeStorageMode, ResourcePolicy};
+pub(crate) use crate::solver::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use crate::solver::active_set::{
     project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };

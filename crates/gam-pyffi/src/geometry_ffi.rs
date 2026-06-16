@@ -4429,7 +4429,7 @@ fn identifiable_factor_select_weights_array<'py>(
             "identifiable_factor_select_weights_array: n_obs must be > 0, got {n_obs}"
         )));
     }
-    let res = gam::sae_identifiability::identifiable_factor_select_weights(
+    let res = gam::terms::sae::identifiability::identifiable_factor_select_weights(
         rss_grid.as_array(),
         penalty_grid.as_array(),
         lam1_grid.as_array(),
@@ -4485,9 +4485,9 @@ fn partial_supervision_solve<'py>(
     free_constraint: &str,
 ) -> PyResult<Py<PyDict>> {
     let method_enum = match method {
-        "procrustes" => gam::sae_identifiability::PartialSupervisionSupMethod::Procrustes,
-        "anchor" => gam::sae_identifiability::PartialSupervisionSupMethod::Anchor,
-        "soft_l2" => gam::sae_identifiability::PartialSupervisionSupMethod::SoftL2,
+        "procrustes" => gam::terms::sae::identifiability::PartialSupervisionSupMethod::Procrustes,
+        "anchor" => gam::terms::sae::identifiability::PartialSupervisionSupMethod::Anchor,
+        "soft_l2" => gam::terms::sae::identifiability::PartialSupervisionSupMethod::SoftL2,
         other => {
             return Err(py_value_error(format!(
                 "partial_supervision_solve: method must be 'procrustes', 'anchor' or \
@@ -4497,9 +4497,9 @@ fn partial_supervision_solve<'py>(
     };
     let free_enum = match free_constraint {
         "orthogonal_to_sup" => {
-            gam::sae_identifiability::PartialSupervisionFreeConstraint::OrthogonalToSup
+            gam::terms::sae::identifiability::PartialSupervisionFreeConstraint::OrthogonalToSup
         }
-        "none" => gam::sae_identifiability::PartialSupervisionFreeConstraint::None,
+        "none" => gam::terms::sae::identifiability::PartialSupervisionFreeConstraint::None,
         other => {
             return Err(py_value_error(format!(
                 "partial_supervision_solve: free_constraint must be 'orthogonal_to_sup' or \
@@ -4516,7 +4516,7 @@ fn partial_supervision_solve<'py>(
         }
         anchor_usize.push(*idx as usize);
     }
-    let result = gam::sae_identifiability::partial_supervision_solve(
+    let result = gam::terms::sae::identifiability::partial_supervision_solve(
         t_sup.as_array(),
         aux.as_array(),
         t_free.as_array(),
@@ -4564,7 +4564,7 @@ fn thin_svd_scores<'py>(
             "thin_svd_scores: k must be non-negative, got {k}"
         )));
     }
-    let out = gam::sae_identifiability::thin_svd_scores(x.as_array(), k as usize)
+    let out = gam::terms::sae::identifiability::thin_svd_scores(x.as_array(), k as usize)
         .map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
 }

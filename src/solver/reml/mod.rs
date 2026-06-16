@@ -1351,7 +1351,7 @@ mod tests {
             let gm = state
                 .compute_outer_eval_with_order(
                     &rm,
-                    crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+                    crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
                 )
                 .expect("minus grad")
                 .gradient;

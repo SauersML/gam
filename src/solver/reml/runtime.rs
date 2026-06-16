@@ -33,7 +33,7 @@ pub(crate) use crate::linalg::utils::{
 pub(crate) use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 pub(crate) use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
-pub(crate) use crate::solver::outer_strategy::{HessianResult, OuterEval};
+pub(crate) use crate::solver::rho_optimizer::{HessianResult, OuterEval};
 pub(crate) use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, load_record, store_record,
 };
