@@ -5716,7 +5716,7 @@ pub struct FitArtifacts {
     /// optimum, Hessian-PD probe, λ-rail flags. `None` when the outer ran
     /// gradient-free or an audit probe could not evaluate.
     #[serde(default)]
-    pub criterion_certificate: Option<crate::solver::outer_strategy::CriterionCertificate>,
+    pub criterion_certificate: Option<crate::solver::rho_optimizer::CriterionCertificate>,
     /// Tier-0 marginal-smoothing (`ρ`-uncertainty) PSIS certificate (#938):
     /// the Pareto-`k̂` diagnostic that says whether the plug-in + first-order
     /// `V_ρ` correction is adequate or `ρ`-uncertainty needs a heavier
@@ -8106,7 +8106,7 @@ fn sas_log_delta_edge_barriercostgradhess(raw_log_delta: f64) -> (f64, f64, f64)
 }
 
 fn materialize_link_outer_hessian(
-    hessian: crate::solver::outer_strategy::HessianResult,
+    hessian: crate::solver::rho_optimizer::HessianResult,
     theta_dim: usize,
 ) -> Result<Array2<f64>, EstimationError> {
     match hessian.materialize_dense() {
