@@ -17,36 +17,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         true
     }
 
-    /// gam#979: lift the seed-screening inner-cycle cap off the generic
-    /// custom-family default of 2.
-    ///
-    /// The duplicated-`duchon` + `linkwiggle()` survival marginal-slope shape
-    /// shares a clustered-PC matern basis across the marginal AND log-slope
-    /// formulas, so the penalized joint Hessian is full-rank but ill-conditioned
-    /// (cf. [`Self::levenberg_on_ill_conditioning`]). Its coupled joint-Newton
-    /// inner solve descends healthily — the trust-region gain ratio sits near 1
-    /// and the objective drops monotonically — yet the augmented KKT residual
-    /// needs MORE than two cycles to fall into its convergence band. At the
-    /// generic `screen_max_inner_iterations = 2` cap every startup seed is
-    /// "budget-exhausted → rejected" before it can clear residual, so the
-    /// screening cascade escalates (×4, ×16, uncapped) and re-runs every seed at
-    /// successively larger cycle counts — turning seed selection into the
-    /// dominant fit cost and (at production scale) a hang. This mirrors exactly
-    /// the binary marginal-slope arm of #979, whose `BmsFamily` lifts the same
-    /// cap to 8 for the same KKT-reachability reason. Starting the screen at the
-    /// first viable cap lets the existing cascade escalate only when genuinely
-    /// needed.
-    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
-        let mut config = crate::seeding::SeedConfig::default();
-        if n_params == 0 {
-            return config;
-        }
-        config.max_seeds = if n_params <= 6 { 6 } else { 4 };
-        config.seed_budget = 1;
-        config.screen_max_inner_iterations = 8;
-        config
-    }
-
     fn persistent_warm_start_fingerprint(
         &self,
         specs: &[ParameterBlockSpec],
