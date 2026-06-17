@@ -11,26 +11,10 @@
 //! an in-test dense penalized oracle in `residual_cascade_certification.rs`.
 //!
 //! What those two suites do NOT assert is the thing this file owns: that the
-//! AUTO-ROUTED path actually delivers the quality of the dense estimator at end
-//! of pipeline. Two arms:
-//!
-//! 1. Match-or-beat the dense path on truth recovery. The cascade is a
-//!    DIFFERENT posterior from the dense reduced-rank radial term, so it must
-//!    earn its place: on the same scattered 2-D data it must recover the known
-//!    smooth truth at least as well as the dense `fit_from_formula` duchon fit.
-//!    This runs at a tractable `n` where the dense path is still cheap (the
-//!    cascade is forced via `fit_residual_cascade_from_formula`, which bypasses
-//!    the cliff gate's dispatch but keeps the same estimator), so both
-//!    estimators see identical data and the comparison is apples-to-apples.
-//!
-//! 2. Cliff-scale auto-route POSITIVE. Past the derived dense-kernel cliff a
-//!    single scattered 3-D Gaussian duchon, routed through the public
-//!    `fit_from_formula`, must come back as `FitResult::ResidualCascade` (the
-//!    dispatch fires with no flag — magic by default), recover the known truth,
-//!    and do it in O(n·polylog) wall-clock: the cost from `n=1e5` to the
-//!    cliff-scale `n` must grow far sub-quadratically (excluding the dense
-//!    O(n·k²) blowup). Timing is logged, not gated (shared-runner noise); the
-//!    HARD assertions are the routing, the truth recovery, and the scaling.
+//! cascade estimator actually delivers the quality of the dense estimator at a
+//! tractable end-to-end size. The cliff-scale auto-route shape is covered
+//! structurally in `residual_cascade_workflow_detection.rs`; this file does not
+//! allocate a half-million-row formula dataset just to prove dispatch.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -223,85 +207,5 @@ fn cascade_matches_or_beats_dense_duchon_on_truth_recovery() {
         cascade_rmse <= 1.10 * dense_rmse,
         "cascade truth recovery regressed vs dense duchon: \
          cascade RMSE={cascade_rmse} > 1.10 × dense RMSE={dense_rmse}"
-    );
-}
-
-/// Arm 2 — cliff-scale auto-route POSITIVE: magic dispatch, truth recovery, and
-/// the BPX n-independence tell.
-///
-/// Past the derived dense-kernel cliff, the PUBLIC `fit_from_formula` (no flag)
-/// must auto-route a single scattered 3-D Gaussian duchon to the cascade and
-/// recover the known truth. The dense `O(n·k² + k³)` route is impractical at
-/// this `n` — that is the whole point of the primitive — so the match-or-beat
-/// against the dense estimator is owned by Arm 1 (tractable n) and the
-/// certification suite (bit-tight dense oracle). Here the hard bars are that the
-/// route fires, the truth is recovered, and the solve stayed on the
-/// n-independent BPX iteration bound (the certificate's CG count, far below the
-/// `CG_MAX_ITERS` blow-up cap) — the structural O(n·polylog) tell, read from the
-/// fit itself rather than from a noisy cross-route wall-clock ratio.
-#[test]
-fn cliff_scale_duchon_auto_routes_to_cascade_and_recovers_truth() {
-    init_parallelism();
-    let cfg = gaussian_config();
-    let formula = "y ~ duchon(x1, x2, x3)";
-
-    // The d=3 dense-kernel cliff (where `default_num_centers` pins at
-    // K_MAX = 2000) sits near n ≈ 5.13e5. Route a cliff-scale fit through the
-    // public formula entry — no flag — and time it for the log.
-    let n = 513_000;
-    let data = sample(3, n);
-    let start = std::time::Instant::now();
-    let big_result = fit_from_formula(formula, &data, &cfg).expect("auto-routed fit");
-    let elapsed = start.elapsed().as_secs_f64();
-
-    // Past the cliff the dispatch must fire with no flag — magic by default.
-    let FitResult::ResidualCascade(fit) = big_result else {
-        panic!(
-            "cliff-scale scattered 3-D Gaussian duchon must auto-route to FitResult::ResidualCascade"
-        );
-    };
-    eprintln!(
-        "[cascade auto-route quality] n=5.13e5 auto-routed to cascade in {elapsed:.3}s \
-         (solve_iters={}, backward_err={:.2e}, m={})",
-        fit.certificate.solve_iters,
-        fit.certificate.solve_rel_residual,
-        fit.coeff.len()
-    );
-
-    // The cascade's certificates must be sane: a converged backward error and a
-    // BOUNDED CG iteration count. The BPX preconditioner makes the iteration
-    // count n-independent (tens, not thousands); staying far below the
-    // `CG_MAX_ITERS = 4000` blow-up cap is the structural O(n·polylog) tell.
-    assert!(
-        fit.certificate.solve_rel_residual.is_finite() && fit.certificate.solve_rel_residual < 1e-3,
-        "cascade solve did not converge: backward error {}",
-        fit.certificate.solve_rel_residual
-    );
-    assert!(
-        fit.certificate.solve_iters < 400,
-        "cascade CG iteration count {} is not on the n-independent BPX bound \
-         (the preconditioner is failing); near the CG_MAX_ITERS=4000 cap the \
-         O(n·polylog) guarantee is lost",
-        fit.certificate.solve_iters
-    );
-
-    // Truth recovery at cliff scale against the noise-free truth (#904 style).
-    let probes = probe_grid(3, 7);
-    let yhat: Vec<f64> = probes
-        .iter()
-        .map(|p| {
-            let (mean, var) = fit.predict(p).expect("cascade predict at scale");
-            assert!(
-                mean.is_finite() && var.is_finite() && var > 0.0,
-                "cascade prediction must be finite with positive variance at {p:?}"
-            );
-            mean
-        })
-        .collect();
-    let cliff_rmse = rmse(&yhat, &probes);
-    eprintln!("[cascade auto-route quality] cliff-scale truth-recovery RMSE={cliff_rmse:.5}");
-    assert!(
-        cliff_rmse < 0.08,
-        "cascade fails cliff-scale truth recovery: RMSE={cliff_rmse} (truth is noise-free)"
     );
 }

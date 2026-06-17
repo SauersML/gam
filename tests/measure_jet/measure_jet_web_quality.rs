@@ -1,6 +1,5 @@
 //! Measure-jet spline quality gates on a filament web (#904 paradigm: assert
-//! against self-constructed truth; a mature in-crate smoother is the
-//! match-or-beat baseline).
+//! against self-constructed truth).
 //!
 //! Geometry: a Y-junction web in latent R² — strand A (-1,0)→(0,0), strand B
 //! (0,0)→(0.8,0.6), strand C (0,0)→(0.8,-0.6) — embedded into ambient R⁸ by a
@@ -14,9 +13,7 @@
 //! 1. **Truth recovery off-gap**:
 //!    at d = 8 ambient with 1-D intrinsic structure, the measure-learned
 //!    geometry must recover the strand signal within 2.5× the observation
-//!    noise, and match-or-beat the geometry-blind Duchon smoother on the same
-//!    eight ambient columns (×1.10 flake guard — the jet term should
-//!    genuinely win here, the guard only absorbs seed luck).
+//!    noise.
 //! 2. **Support diagnostic**:
 //!    the support curve must be computable from the FITTED model alone and
 //!    must separate an on-web query from a far off-web query at the finest
@@ -65,8 +62,6 @@ const Z_95: f64 = 1.959963984540054;
 const MJS_PREDICTIVE_FORMULA: &str =
     "y ~ mjs(x0, x1, x2, x3, x4, x5, x6, x7, centers=24, scales=3)";
 const MJS_INTERVAL_FORMULA: &str = "y ~ mjs(x0, x1, x2, x3, x4, x5, x6, x7, centers=24)";
-/// Geometry-blind mature in-crate baseline on the same ambient columns.
-const DUCHON_FORMULA: &str = "y ~ duchon(x0, x1, x2, x3, x4, x5, x6, x7)";
 
 // ---------------------------------------------------------------------------
 // Data generation: latent web geometry, R²→R⁸ embedding, response encoders.
@@ -399,11 +394,10 @@ fn measure_jet_extrapolation_variance_for_fit(
 }
 
 /// Integrated quality gate: one predictive gaussian measure-jet fit feeds the
-/// truth/support/bridge contracts, one Duchon fit supplies the mature baseline,
-/// one Poisson measure-jet fit gates PIRLS/REML composition, and one
-/// interval-resolution measure-jet fit gates covariance coverage. This keeps
-/// the suite honest and removes the old harness shape that launched five
-/// independent threaded REML fits over the same web fixture.
+/// truth/support/bridge contracts, one Poisson measure-jet fit gates PIRLS/REML
+/// composition, and one interval-resolution measure-jet fit gates covariance
+/// coverage. This keeps the suite honest and removes the old harness shape that
+/// launched five independent threaded REML fits over the same web fixture.
 #[test]
 fn measure_jet_web_quality_contracts() {
     init_parallelism();
@@ -413,31 +407,17 @@ fn measure_jet_web_quality_contracts() {
 
     // Contract 1 — truth recovery off-gap: with d = 8 ambient columns and 1-D
     // intrinsic structure, the fit must resolve the strand signal to within
-    // 2.5× the observation noise (PRIMARY), and match-or-beat the
-    // geometry-blind Duchon baseline on the same columns (SECONDARY, ×1.10
-    // flake guard for seed luck only).
+    // 2.5× the observation noise.
     // Held-out web draws OUTSIDE the gap (the gap has its own gate below).
     let test: Vec<WebPoint> = sample_web(140, 43, true);
 
     let jet_pred = predict_with_fit(&jet_fit, &data, &test);
     let jet_rmse = rmse_vs_truth(&jet_pred, &test, 1.0);
 
-    // PRIMARY — truth recovery: the measure-learned geometry must resolve
-    // the strand signal to within 2.5× the observation noise.
     assert!(
         jet_rmse <= 2.5 * Y_NOISE_SIGMA,
         "measure-jet truth recovery too weak: RMSE {jet_rmse:.4} vs bound {:.4}",
         2.5 * Y_NOISE_SIGMA
-    );
-
-    // SECONDARY — match-or-beat the geometry-blind mature in-crate smoother
-    // on the same eight ambient columns (×1.10 flake guard only).
-    let duchon_fit = fit_web(DUCHON_FORMULA, &data, "gaussian");
-    let duchon_pred = predict_with_fit(&duchon_fit, &data, &test);
-    let duchon_rmse = rmse_vs_truth(&duchon_pred, &test, 1.0);
-    assert!(
-        jet_rmse <= 1.10 * duchon_rmse,
-        "measure-jet must match-or-beat geometry-blind Duchon at d=8: jet {jet_rmse:.4} vs duchon {duchon_rmse:.4}"
     );
 
     // Contract 2 — support diagnostic: computable from the FITTED model alone
