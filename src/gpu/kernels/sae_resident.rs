@@ -1614,6 +1614,127 @@ mod tests {
         }
     }
 
+    /// #1017 residency-isolating per-solve bench. The full-fit bench
+    /// ([`gpu_residency_wallclock_bench`]) runs an exact quadratic that converges
+    /// in ONE Newton step, so the resident frame is built once and solved once —
+    /// the across-iteration amortization (factor `D`/`B`/Schur once, reuse for
+    /// every gradient) has nothing to amortize over and the measured speedup is
+    /// only the single-solve `D`/`B` upload saving.
+    ///
+    /// This bench isolates the residency lever the way the production inner loop
+    /// actually exercises it: at a frozen gate/basis frame the Hessian blocks are
+    /// CONSTANT and the SAE inner Newton takes MANY gradient solves against them.
+    /// It therefore times
+    ///   * RESIDENT: build the [`crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle`]
+    ///     ONCE, then `N` `solve_gradient` calls (upload only the `O(n·d + k)`
+    ///     gradient per solve; no POTRF, no `D`/`B` re-upload);
+    ///   * REUPLOAD: `N` `solve_arrow_newton_step` calls (re-pack/upload `D`/`B`/`g`
+    ///     and re-run the per-row POTRF + border Schur factor every call).
+    /// Both produce bit-identical steps; the ratio is the pure across-iteration
+    /// residency speedup, which is what #1017 Phase 3 buys per inner iteration.
+    /// `N` mirrors a realistic SAE inner-Newton iteration count. CPU-only hosts
+    /// print a skip line. Run with `--nocapture`.
+    #[test]
+    fn gpu_residency_per_solve_bench() {
+        use std::time::Instant;
+        const N_SOLVES: usize = 24;
+        for (label, ws) in [
+            ("color_arm", super::color_arm_fixture()),
+            ("qwen_non_gating", super::qwen_non_gating_fixture()),
+        ] {
+            let ws = ws.expect("bench fixture must validate");
+            let base = ws.to_arrow_system();
+            // A family of distinct gradients standing in for the per-iterate
+            // residual r(z) = H z − g₀ the inner loop feeds. Distinct gradients
+            // make the reupload path redo the (g-independent) factor work each
+            // time — exactly the waste residency removes.
+            let n = ws.shape.n;
+            let d = ws.shape.d;
+            let p = ws.shape.p;
+            let gradients: Vec<(Vec<f64>, Vec<f64>)> = (0..N_SOLVES)
+                .map(|s| {
+                    let g_t: Vec<f64> = (0..n * d)
+                        .map(|i| ((i + s) as f64 * 0.001).sin())
+                        .collect();
+                    let g_beta: Vec<f64> =
+                        (0..p).map(|j| ((j + 7 * s) as f64 * 0.0007).cos()).collect();
+                    (g_t, g_beta)
+                })
+                .collect();
+
+            if !ws.device_resident() {
+                println!(
+                    "[#1017 per-solve {label}] no CUDA device — {N_SOLVES} solves skipped; \
+                     run on the GPU node for the across-iteration residency speedup"
+                );
+                continue;
+            }
+
+            // RESIDENT: factor once, then N gradient-only solves.
+            let t_res = Instant::now();
+            let frame = crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(&base, 0.0, 0.0)
+                .expect("resident frame must build on CUDA host");
+            let mut resident_steps = Vec::with_capacity(N_SOLVES);
+            for (g_t, g_beta) in &gradients {
+                resident_steps
+                    .push(frame.solve_gradient(g_t, g_beta).expect("resident solve_gradient"));
+            }
+            let resident_ms = t_res.elapsed().as_secs_f64() * 1e3;
+
+            // REUPLOAD: N full solves, each re-uploading D/B/g and re-factoring.
+            let t_reup = Instant::now();
+            let mut reupload_steps = Vec::with_capacity(N_SOLVES);
+            for (g_t, g_beta) in &gradients {
+                let mut sys = ws.to_arrow_system();
+                for (i, row) in sys.rows.iter_mut().enumerate() {
+                    for r in 0..d {
+                        row.gt[r] = g_t[i * d + r];
+                    }
+                }
+                for (j, gb) in sys.gb.iter_mut().enumerate() {
+                    *gb = g_beta[j];
+                }
+                sys.refresh_row_hessian_fingerprint();
+                reupload_steps.push(
+                    crate::gpu::kernels::arrow_schur::solve_arrow_newton_step(&sys, 0.0, 0.0)
+                        .expect("reupload solve_arrow_newton_step"),
+                );
+            }
+            let reupload_ms = t_reup.elapsed().as_secs_f64() * 1e3;
+
+            // Parity: resident and reupload steps must be bit-identical (same
+            // factor kernels; residency only skips re-deriving g-independent work).
+            let mut max_rel = 0.0_f64;
+            for (rs, us) in resident_steps.iter().zip(reupload_steps.iter()) {
+                let scale = us
+                    .delta_t
+                    .iter()
+                    .chain(us.delta_beta.iter())
+                    .fold(1.0_f64, |m, &v| m.max(v.abs()));
+                for (a, b) in rs.delta_t.iter().zip(us.delta_t.iter()) {
+                    max_rel = max_rel.max((a - b).abs() / scale);
+                }
+                for (a, b) in rs.delta_beta.iter().zip(us.delta_beta.iter()) {
+                    max_rel = max_rel.max((a - b).abs() / scale);
+                }
+            }
+
+            println!(
+                "[#1017 per-solve {label}] N={N_SOLVES} resident={resident_ms:.2}ms \
+                 ({:.3}ms/solve, 1 factor + N grad-uploads) reupload={reupload_ms:.2}ms \
+                 ({:.3}ms/solve, N factors + N D/B uploads) residency_speedup={:.2}x \
+                 parity_rel={max_rel:e}",
+                resident_ms / N_SOLVES as f64,
+                reupload_ms / N_SOLVES as f64,
+                reupload_ms / resident_ms.max(1e-9),
+            );
+            assert!(
+                max_rel < 1e-9,
+                "{label}: resident per-solve steps must match reupload (rel {max_rel:e})"
+            );
+        }
+    }
+
     /// #1017 GPU wall-clock bench. On a CUDA host this times the device-resident
     /// inner Newton loop against the CPU dense-reference loop at color-arm and
     /// Qwen scale, printing per-fit ms, the residency MiB ratio (device-resident
