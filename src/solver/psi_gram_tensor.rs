@@ -419,6 +419,9 @@ impl PsiGramTensor {
             // ladder; a non-certifying amplitude means the column is not
             // analytically normalizable on this window — escalate/fall back.
             if !cheb.tail_certifies() {
+                if std::env::var("DIAG1216").is_ok() {
+                    eprintln!("[DIAG1216] m={m} AMPLITUDE col {j} tail NOT certified");
+                }
                 return BuildOutcome::TailNotCertified;
             }
             amp.push(cheb);
@@ -452,6 +455,24 @@ impl PsiGramTensor {
             }
         }
         let tail_start = m - (m / 4).max(1);
+        if std::env::var("DIAG1216").is_ok() {
+            // Worst normalized-design tail coefficient relative to its column
+            // scale, to see whether per-ψ amplitude normalization actually brings
+            // the tail under 1e-12 (or whether the residual ψ-SHAPE variation
+            // still floors it).
+            let mut worst = 0.0_f64;
+            for slab in coeff_slabs.iter().skip(tail_start) {
+                for (j, &scale) in col_scale.iter().enumerate() {
+                    let s = scale.max(1e-300);
+                    for i in 0..n {
+                        worst = worst.max(slab[[i, j]].abs() / s);
+                    }
+                }
+            }
+            eprintln!(
+                "[DIAG1216] m={m} NORMALIZED-design worst tail rel = {worst:.3e} (need <= {PSI_GRAM_CERT_RTOL:.0e})"
+            );
+        }
         for slab in coeff_slabs.iter().skip(tail_start) {
             for (j, &scale) in col_scale.iter().enumerate() {
                 let bound = PSI_GRAM_CERT_RTOL * scale.max(1e-300);
