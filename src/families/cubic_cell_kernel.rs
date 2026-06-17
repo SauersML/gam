@@ -3526,8 +3526,8 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
 
 /// Relative agreement threshold for the progressive non-affine quadrature
 /// ladder: two consecutive Gauss-Legendre rules must agree on every moment
-/// slot (and the value integral, when computed) to this tolerance relative
-/// to the moment vector's own max magnitude before the finer rule's result
+/// slot to this tolerance relative to the moment vector's own max magnitude
+/// before the finer rule's result
 /// is accepted. Gauss-Legendre error decays geometrically in the node count
 /// for the analytic integrand `exp(-q(z))`, so agreement between an n-node
 /// and a 2n-node rule certifies that both are converged: the coarse rule's
@@ -3543,14 +3543,12 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
 /// reproduces the reference's erfc-noise realization, so any sub-384 rung
 /// drifts from the 384 value by `≈ 1e-13` — a drift that is NOT truncation,
 /// does NOT shrink with rung, and is NOT bounded by rung-to-rung agreement.
-/// Because the value- and derivative-only evaluators are contractually
-/// required to return *bit-identical* moments (so they must select the same
-/// rung), the value path cannot be split off to stay at 384 while the moment
-/// path certifies early. The `3e-15` test therefore stays tight: on these
-/// cells it does not certify, the value rides the bit-exact 384 rule, and the
-/// `non_affine_cell_state_matches_prefold_reference_to_1e_minus_13` accuracy
-/// contract holds. Any future early-certification must bound the value-vs-384
-/// error directly, not merely successive-moment agreement.
+/// The moment ladder remains independent of the value integral so value- and
+/// derivative-only evaluators keep returning bit-identical moments. The scalar
+/// value now evaluates on the terminal 384-node rule directly, preserving the
+/// `non_affine_cell_state_matches_prefold_reference_to_1e_minus_13` value
+/// contract without forcing every derivative-moment caller to use the terminal
+/// rung.
 const NON_AFFINE_LADDER_RTOL: f64 = 1e-15;
 
 /// Node counts of the progressive ladder below the 384-node terminal rung.
@@ -3621,9 +3619,9 @@ fn gauss_legendre_rule(n: usize) -> (Vec<f64>, Vec<f64>) {
 /// evaluators MUST select the same ladder rung so they accumulate the moment
 /// vector over the same nodes and return bit-identical moments (the
 /// `derivative_moment_evaluator_matches_value_evaluator_moments` invariant).
-/// The value integral converges at the same geometric Gauss-Legendre rate as
-/// the moments on the shared analytic integrand `exp(-q(z))`, so the
-/// moment-certified rung resolves the value to the same tolerance.
+/// Value-bearing callers evaluate the scalar cell probability separately on
+/// the terminal 384-node rule; this certificate governs only the reusable
+/// derivative moment vector.
 fn non_affine_ladder_converged(coarse: &CellMomentVec, fine: &CellMomentVec) -> bool {
     let mut scale = 0.0_f64;
     let mut err = 0.0_f64;
@@ -3691,12 +3689,20 @@ fn evaluate_non_affine_cell_simd<const COMPUTE_VALUE: bool>(
     evaluate_non_affine_cell_with_rule::<COMPUTE_VALUE>(cell, max_degree, &GL_NODES, &GL_WEIGHTS)
 }
 
+#[inline]
+fn evaluate_non_affine_cell_terminal_value(cell: DenestedCubicCell) -> f64 {
+    let (_, value_integral) =
+        evaluate_non_affine_cell_with_rule::<true>(cell, 0, &GL_NODES, &GL_WEIGHTS);
+    value_integral
+}
+
 fn evaluate_non_affine_cell_state(
     cell: DenestedCubicCell,
     branch: ExactCellBranch,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
-    let (moments, value_integral) = evaluate_non_affine_cell_simd::<true>(cell, max_degree);
+    let (moments, _) = evaluate_non_affine_cell_simd::<false>(cell, max_degree);
+    let value_integral = evaluate_non_affine_cell_terminal_value(cell);
     // Reference structure: `value_integral * half_width / sqrt(TAU)`. The
     // half_width factor is already applied inside the rule evaluator, so divide
     // by sqrt(TAU) here (a true division, NOT multiply-by-reciprocal) to
