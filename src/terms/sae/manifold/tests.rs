@@ -8862,8 +8862,9 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
         .expect("real-data inner solve at η=1 must converge");
 
     // Min undamped per-row pivot (squared lower-Cholesky diagonal). The
-    // undamped factors ARE the curvature anchor's H_tt blocks; a non-positive
-    // pivot means an indefinite/under-identified anchor.
+    // undamped factors ARE the curvature anchor's H_tt blocks AFTER any
+    // Faddeev-Popov / spectral deflation; the FACTOR is always PD by
+    // construction, so this measures only that the deflation succeeded.
     let mut min_undamped = f64::INFINITY;
     let mut max_undamped = 0.0_f64;
     for factor in cache.undamped_factors_iter() {
@@ -8874,26 +8875,70 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
             max_undamped = max_undamped.max(p);
         }
     }
-    let diag_scale = max_undamped.max(1.0);
-    let floor = f64::EPSILON * diag_scale;
+    let deflated = cache.gauge_deflated_directions;
+
+    // GENUINE curvature anchor = the RAW assembled per-row evidence Hessian
+    // blocks BEFORE factorization/deflation. This is what actually pins the
+    // atoms; if a block is genuinely indefinite (a negative eigenvalue OFF the
+    // closed-form gauge orbit), the spectral deflation will silently flatten
+    // that direction to unit stiffness — the factor stays PD but the atom
+    // coordinate along it is UNIDENTIFIED. Measure the raw spectrum directly.
+    use crate::linalg::faer_ndarray::FaerEigh;
+    let sys = objective
+        .term
+        .assemble_arrow_schur(z_train.view(), &rho, objective.registry.as_ref())
+        .expect("assemble raw curvature anchor");
+    let mut min_raw_eig = f64::INFINITY;
+    let mut max_raw_eig = 0.0_f64;
+    let mut indefinite_rows = 0usize;
+    let mut total_neg_dirs = 0usize;
+    for block in &sys.rows {
+        let d = block.htt.nrows();
+        if d == 0 {
+            continue;
+        }
+        let mut sym = Array2::<f64>::zeros((d, d));
+        for i in 0..d {
+            for j in 0..d {
+                sym[[i, j]] = 0.5 * (block.htt[[i, j]] + block.htt[[j, i]]);
+            }
+        }
+        let (evals, _) = sym.eigh(faer::Side::Lower).unwrap();
+        let max_abs = evals.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1.0);
+        let neg_floor = -1.0e-8 * max_abs;
+        let row_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let row_neg = evals.iter().filter(|&&v| v < neg_floor).count();
+        min_raw_eig = min_raw_eig.min(row_min);
+        max_raw_eig = max_raw_eig.max(max_abs);
+        if row_neg > 0 {
+            indefinite_rows += 1;
+            total_neg_dirs += row_neg;
+        }
+    }
+    let rel_min = min_raw_eig / max_raw_eig.max(1.0);
     eprintln!(
-        "[#1190] real-data undamped curvature anchor: min_pivot={min_undamped:.6e} \
-         max_pivot={max_undamped:.6e} floor={floor:.6e}"
+        "[#1190] real-data curvature anchor: undamped factor min_pivot={min_undamped:.6e} \
+         max_pivot={max_undamped:.6e} deflated_dirs={deflated} | RAW assembled H_tt: \
+         min_eig={min_raw_eig:.6e} (rel={rel_min:.3e}) indefinite_rows={indefinite_rows}/{} \
+         total_neg_dirs={total_neg_dirs}",
+        sys.rows.len()
     );
 
-    // The curvature anchor must be PD on the gauge quotient: either every
-    // undamped pivot clears the safe-SPD floor, OR the sub-floor directions are
-    // explained by closed-form gauge/null directions (Faddeev-Popov deflation),
-    // in which case the gauge-deflated outer-gradient solve succeeds. A genuine
-    // non-gauge indefinite anchor satisfies NEITHER and under-identifies.
-    let pivot_ok = min_undamped.is_finite() && min_undamped >= floor;
-    let gauge_explained = objective.term.outer_gradient_arrow_solver(&cache).is_ok();
+    // The curvature anchor is IDENTIFIED iff the genuine assembled per-row
+    // evidence Hessian is positive-semidefinite up to a relative floor on EVERY
+    // row: no row may carry a data-supported negative-curvature direction that
+    // the deflation would have to flatten (which would leave that atom
+    // coordinate unpinned). A relative floor of -1e-8 admits only round-off
+    // negatives; a genuine indefinite block sits orders of magnitude below it.
     assert!(
-        pivot_ok || gauge_explained,
-        "real-data curvature anchor is non-PD and NOT gauge-explained: \
-         min undamped pivot {min_undamped:.6e} < floor {floor:.6e}, and the \
-         gauge-deflated outer-gradient solve failed — the d=2 atoms are \
-         under-identified on real OLMo activations (#1190)."
+        rel_min >= -1.0e-8,
+        "real-data curvature anchor is genuinely indefinite: raw assembled H_tt \
+         min eigenvalue {min_raw_eig:.6e} (relative {rel_min:.3e}) is negative on \
+         {indefinite_rows}/{} rows ({total_neg_dirs} negative directions) — the \
+         d=2 atoms are under-identified on real OLMo activations (#1190). The \
+         curvature anchor must be PD (or its negative directions must be genuine \
+         closed-form gauge nulls, not data-supported directions).",
+        sys.rows.len()
     );
 }
 
