@@ -328,7 +328,11 @@ jobs:
             i=$((i+1))
             outcome=""; cause=""; reason=""; rc=0; cap=360
             echo "::group::[$i/$N] $t"
-            log="$OUT/logs/$t.log"
+            # Sanitize the log FILENAME: Rust test paths contain '::', which
+            # upload-artifact rejects (colon is invalid on NTFS). Keep $t intact
+            # for the test filter; only the on-disk filename is rewritten.
+            tsafe="${t//:/_}"
+            log="$OUT/logs/$tsafe.log"
             start=$SECONDS
             if [ "$discovery_error" -eq 1 ]; then
               outcome=TEST_ERROR; cause=test_discovery; rc=-1
