@@ -2,7 +2,7 @@
 //! location-scale (#913) models as binomial-location-scale.
 //!
 //! A fitted Gamma / NegativeBinomial / Beta / Tweedie dispersion model
-//! (`--family <fam> --predict-noise <formula>`) is a `ModelKind::LocationScale`
+//! (`--family <fam>-log --predict-noise <formula>`) is a `ModelKind::LocationScale`
 //! with a *non-Gaussian* likelihood. Before the fix, `FittedModel::from_payload`
 //! / `predict_model_class` classified **any** non-Gaussian location-scale
 //! payload as `BinomialLocationScale`, so the saved dispersion model was
@@ -60,8 +60,8 @@ fn fit_gamma_dispersion(train_path: &Path, model_path: &Path) -> String {
         .arg("fit")
         .arg(train_path)
         .arg("y ~ x")
-        .args(["--family", "gamma"])
-        // The noise (dispersion) formula is what magic-routes `--family gamma`
+        .args(["--family", "gamma-log"])
+        // The noise (dispersion) formula is what routes `--family gamma-log`
         // to the dispersion location-scale family (#913).
         .args(["--predict-noise", "x"])
         .arg("--out")
