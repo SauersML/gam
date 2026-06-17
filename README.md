@@ -268,10 +268,40 @@ Competing-risks survival. `competing_risks_cif(...)` and
 `CompetingRisksPrediction` evaluate cause-specific cumulative-incidence
 functions.
 
-Response geometry. `ResponseGeometryModel` fits GAMs for responses that
-live on the sphere or simplex via Fréchet-mean tangent-space maps
-(`sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`,
-`closure`).
+Manifold-valued responses. `ResponseGeometryModel` fits GAMs for
+responses that live on a manifold via Fréchet-mean tangent-space maps:
+the sphere, the simplex (`clr` / `alr`), the cone of SPD matrices, the
+Grassmann and Stiefel manifolds, and the hyperbolic (Poincaré) ball. A
+constant-curvature family estimates the curvature from the responses and
+reports a flat / spherical / hyperbolic verdict with a Wilks flatness
+test:
+
+```python
+gamfit.fit(df, "y ~ s(x)", response_geometry="poincare", response_columns=[...])
+gamfit.fit(df, "y ~ s(x)", response_geometry="constant_curvature", response_columns=[...])
+```
+
+Inference and calibration. Predictions carry Wald or posterior-credible
+bands; conformal intervals come in split, jackknife+, and exact
+full-conformal forms; `compare_models` reports smoothing-uncertainty
+corrected AIC and approximate-LOO elpd; `lawley_bartlett_factor` gives a
+Bartlett-corrected likelihood-ratio test for a smooth term.
+
+```python
+model.predict(test, interval="conformal", conformal_level=0.9)
+gamfit.compare_models([model_a, model_b])
+```
+
+Certified structure discovery. The interpretability stack ships
+anytime-valid, optional-stopping-immune evidence tools: universal-inference
+e-values, e-BH dictionary certificates with FDR control under arbitrary
+dependence, and resumable atom-birth gates — so claims like "this atom
+exists" or "these atoms bind" are confirmed with a certificate, not a
+post-hoc p-value.
+
+```python
+gamfit.e_bh_dictionary_certificate(log_e_values, alpha=0.05)
+```
 
 PyTorch bridge. Differentiable REML primitives, smooth-basis layers, and
 frozen fitted-model modules are available under `gamfit.torch` and
