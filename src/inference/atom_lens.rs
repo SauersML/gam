@@ -49,7 +49,7 @@
 //! suppress the atom, because suppression would be the loss-replacement mistake
 //! the amendment removes.
 
-use ndarray::ArrayView1;
+use ndarray::{ArrayView1, ArrayView2};
 
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 use crate::terms::sae::manifold::SaeManifoldTerm;
