@@ -200,8 +200,8 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     let age: Vec<f64> = ds.values.column(age_idx).to_vec();
     let n = time.len();
     assert_eq!(
-        n, 199,
-        "bounded #1082 heart-failure slice should have n=199, got {n}"
+        n, 200,
+        "bounded #1082 heart-failure slice should have n=200, got {n}"
     );
     let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
     let cens_frac = 1.0 - n_events as f64 / n as f64;
