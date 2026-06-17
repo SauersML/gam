@@ -246,7 +246,7 @@ pub(crate) fn transformation_complexity_knot_budget(
     min_internal.saturating_add(extra)
 }
 
-pub(crate) fn effective_response_num_internal_knots(
+pub fn effective_response_num_internal_knots(
     config: &TransformationNormalConfig,
     n_obs: usize,
     p_cov: usize,

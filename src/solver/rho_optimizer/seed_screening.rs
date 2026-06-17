@@ -156,12 +156,15 @@ pub(crate) fn should_screen_seeds(
     generated_seed_count: usize,
     seed_budget: usize,
 ) -> bool {
+    if matches!(solver, Solver::Efs | Solver::HybridEfs) {
+        return false;
+    }
+    if config.initial_rho.is_some() && seed_budget == 1 && !config.screen_initial_rho {
+        return false;
+    }
     config.screening_cap.is_some()
         && generated_seed_count > seed_budget
-        && matches!(
-            solver,
-            Solver::Arc | Solver::Bfgs | Solver::Efs | Solver::HybridEfs
-        )
+        && matches!(solver, Solver::Arc | Solver::Bfgs)
 }
 
 #[inline]
