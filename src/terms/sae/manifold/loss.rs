@@ -89,3 +89,39 @@ impl SaeOuterRhoGradientComponents {
         &(&(&self.explicit + &self.logdet_trace) + &self.occam) + &self.third_order_correction
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1231 — the public score is the NEGATIVE penalized loss of the four loss
+    /// components, and the breakdown itemizes exactly those components. It is not
+    /// (and must not be presented as) a REML criterion.
+    #[test]
+    fn penalized_loss_score_is_negative_total_with_breakdown() {
+        let loss = SaeManifoldLoss {
+            data_fit: 1.5,
+            assignment_sparsity: 0.25,
+            smoothness: 0.5,
+            ard: 0.75,
+            evidence_gauge_deflated_directions: 3,
+        };
+        let total = 1.5 + 0.25 + 0.5 + 0.75;
+        assert!((loss.total() - total).abs() < 1e-12);
+        assert!((loss.penalized_loss_score() - (-total)).abs() < 1e-12);
+
+        let b = loss.breakdown();
+        assert!((b.data_fit - 1.5).abs() < 1e-12);
+        assert!((b.assignment_sparsity - 0.25).abs() < 1e-12);
+        assert!((b.smoothness - 0.5).abs() < 1e-12);
+        assert!((b.ard - 0.75).abs() < 1e-12);
+        assert!((b.total_penalized_loss - total).abs() < 1e-12);
+        assert!((b.penalized_loss_score - (-total)).abs() < 1e-12);
+        // The breakdown's four components must sum to the reported total — the
+        // score is fully explained by what the breakdown lists, with no hidden
+        // evidence pieces folded into it.
+        let summed = b.data_fit + b.assignment_sparsity + b.smoothness + b.ard;
+        assert!((summed - b.total_penalized_loss).abs() < 1e-12);
+        assert_eq!(b.evidence_gauge_deflated_directions, 3);
+    }
+}

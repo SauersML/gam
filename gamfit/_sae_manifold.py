@@ -30,6 +30,23 @@ _PUBLIC_ASSIGNMENT_KINDS: dict[str, str] = {
 }
 
 
+def _penalized_loss_score(payload: Mapping[str, Any]) -> float:
+    """Read the SAE fit's penalized-loss score honestly (#1231).
+
+    The Rust FFI surfaces the negative penalized loss under
+    ``penalized_loss_score`` (in-sample) / ``oos_penalized_loss`` (fixed-decoder
+    OOS), with the legacy misleading ``reml_score`` retained only as a
+    back-compat alias. Prefer the honest keys; fall back to the alias.
+    """
+    for key in ("penalized_loss_score", "oos_penalized_loss", "reml_score"):
+        if key in payload:
+            return float(payload[key])
+    raise KeyError(
+        "SAE fit payload is missing a penalized-loss score "
+        "(penalized_loss_score / oos_penalized_loss / reml_score)"
+    )
+
+
 def _e_benjamini_hochberg(log_e_values: list[float], alpha: float) -> list[int]:
     """e-BH confirmed set, mirroring `inference::structure_evidence::e_benjamini_hochberg`.
 
@@ -1084,7 +1101,7 @@ class ManifoldSAE:
                 decoder_coefficients=np.asarray(atom["decoder_B"], dtype=float),
                 assignments=np.asarray(atom["assignments_z"], dtype=float),
                 coords=np.asarray(atom["on_atom_coords_t"], dtype=float),
-                evidence=float(payload["reml_score"]),
+                evidence=_penalized_loss_score(payload),
                 active_dim=int(atom["active_dim"]),
                 decoder_covariance=_opt_arr(atom, "decoder_covariance"),
                 shape_band_coords=shape_band_coords,
@@ -1097,7 +1114,7 @@ class ManifoldSAE:
         logits = np.asarray(payload["logits"], dtype=float)
         diagnostics = coerce_sae_trust_diagnostics(payload)
         coords = [atom.coords.copy() for atom in atoms]
-        score = float(payload["reml_score"])
+        score = _penalized_loss_score(payload)
         chosen_k = int(payload["chosen_k"])
         low = SaeManifoldFitResult(atoms, chosen_k, {chosen_k: score}, {"winner": f"K={chosen_k}"}, fitted, assigns, coords, score)
         kinds = [str(p["kind"]) for p in plans]

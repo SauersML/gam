@@ -330,6 +330,56 @@ fn latent_aux_prior_stats(
     })
 }
 
+/// Honestly surface the SAE manifold loss score under `primary_key` (#1231).
+///
+/// The score is `−(data_fit + assignment_sparsity + smoothness + ard)` — the
+/// NEGATIVE penalized loss of the four loss components — NOT a REML / marginal
+/// likelihood: it omits the Hessian log-determinant, the Occam log-λ term, any
+/// extra analytic penalties, the co-training fold, the top-k projection effect,
+/// and hybrid-collapse effects. `primary_key` must therefore be an honest name
+/// (`"penalized_loss_score"` on the in-sample fit, `"oos_penalized_loss"` on the
+/// fixed-decoder OOS path). The full component breakdown is written under
+/// `"penalized_loss_breakdown"` so a consumer can see exactly what the score is
+/// (and is not). `"reml_score"` is also written as a deprecated back-compat alias
+/// for existing readers; new code should read `primary_key`.
+fn sae_set_penalized_loss_items(
+    out: &Bound<'_, PyDict>,
+    loss: &gam::terms::sae::manifold::SaeManifoldLoss,
+    primary_key: &str,
+) -> PyResult<()> {
+    let b = loss.breakdown();
+    out.set_item(primary_key, b.penalized_loss_score)?;
+    // Deprecated alias: the field was historically (mis)named `reml_score`.
+    out.set_item("reml_score", b.penalized_loss_score)?;
+    let breakdown = PyDict::new(out.py());
+    breakdown.set_item("penalized_loss_score", b.penalized_loss_score)?;
+    breakdown.set_item("total_penalized_loss", b.total_penalized_loss)?;
+    breakdown.set_item("data_fit", b.data_fit)?;
+    breakdown.set_item("assignment_sparsity", b.assignment_sparsity)?;
+    breakdown.set_item("smoothness", b.smoothness)?;
+    breakdown.set_item("ard", b.ard)?;
+    breakdown.set_item(
+        "evidence_gauge_deflated_directions",
+        b.evidence_gauge_deflated_directions,
+    )?;
+    // Honesty markers: this score is NOT a REML criterion; these evidence pieces
+    // are deliberately absent (#1231). Surfaced as `None` so a consumer that
+    // wants real evidence sees that it was not computed here, rather than reading
+    // the penalized loss as if it were the marginal likelihood.
+    for missing in [
+        "logdet_hessian",
+        "occam_log_lambda",
+        "extra_penalty_energy",
+        "amortization_consistency",
+        "collapse_penalty",
+    ] {
+        breakdown.set_item(missing, out.py().None())?;
+    }
+    breakdown.set_item("is_reml", false)?;
+    out.set_item("penalized_loss_breakdown", breakdown)?;
+    Ok(())
+}
+
 fn set_aux_strength_items<'py>(
     py: Python<'py>,
     out: &Bound<'py, PyDict>,
@@ -2476,7 +2526,7 @@ fn sae_manifold_fit_inner<'py>(
     // (`OuterProblem::run` → `plan()` → derivative-free / FD outer strategy).
     // `SaeManifoldOuterObjective::eval_cost` evaluates the term's true REML
     // criterion at each candidate ρ via an inner Arrow-Schur joint fit; the
-    // engine selects ρ. No hand-rolled λ-grid, no manual `evidence_proxy` max:
+    // engine selects ρ. No hand-rolled λ-grid, no manual penalized-loss-max:
     // the criterion + cascade subsume both, so smoothness/sparsity selection is
     // automatic (magic by default — no per-call grid kwarg).
     //
@@ -2873,7 +2923,9 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
-    out.set_item("reml_score", loss.evidence_proxy())?;
+    // #1231 — in-sample fit: the score is the negative penalized loss, surfaced
+    // honestly as `penalized_loss_score` (NOT `reml_score`) with a breakdown.
+    sae_set_penalized_loss_items(&out, &loss, "penalized_loss_score")?;
     let reported_log_alpha = match term.assignment.mode {
         gam::terms::sae::manifold::AssignmentMode::IBPMap { alpha, .. } => alpha.ln(),
         _ => alpha.ln(),
@@ -6159,7 +6211,11 @@ fn sae_manifold_predict_oos<'py>(
     out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
-    out.set_item("reml_score", loss.evidence_proxy())?;
+    // #1231 — fixed-decoder OOS path: this is the penalized reconstruction loss
+    // of held-out data under the frozen decoder, NOT a frozen-decoder evidence
+    // criterion, so it is surfaced as `oos_penalized_loss` (with a breakdown),
+    // never `reml_score`.
+    sae_set_penalized_loss_items(&out, &loss, "oos_penalized_loss")?;
     out.set_item("log_alpha", alpha.ln())?;
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
     out.set_item("log_ard", log_ard_py)?;
