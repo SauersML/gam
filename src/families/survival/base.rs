@@ -2414,7 +2414,14 @@ impl WorkingModelSurvival {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             contracted_psi_second_order: None,
-            kkt_residual: None,
+            // #931: supply the penalized KKT residual (Sβ̂ − ∇ℓ, exactly `state.gradient`)
+            // so the single-source IFT envelope correction (−½rᵀH⁻¹r in the value, paired
+            // with its exact ρ-gradient) is applied. Leaving this `None` asserted exact inner
+            // stationarity and silently dropped the envelope term, producing a constant ~0.225
+            // objective↔gradient leak (the survival-LAML desync). Mirrors the custom_family path.
+            kkt_residual: Some(crate::model_types::ProjectedKktResidual::from_active_projected(
+                state.gradient.clone(),
+            )),
             active_constraints: None,
         }
         .evaluate(
