@@ -518,27 +518,63 @@ pub fn response_frechet_mean(
         Ok(acc)
     };
 
-    // Initialise at the projected ambient mean: a single log/exp round trip from
-    // the first sample lands on the manifold for any geometry (the raw ambient
-    // average is generally off-manifold for SPD/Grassmann/Stiefel/Poincaré).
-    let mut p = manifold
-        .exp_point(samples[0].view(), Array1::<f64>::zeros(ambient).view())
-        .map_err(|e| format!("response geometry Fréchet mean init: {e}"))?;
-    {
-        // Average the log-tangents of all samples at the seed and step there:
-        // one Riemannian averaging step gives an order-independent interior
-        // start without assuming the ambient mean is on-manifold.
+    // Seed the Karcher iteration at a sample whose tangent star is fully
+    // defined, then take one Riemannian averaging step for an interior start.
+    //
+    // A fixed seed at `samples[0]` is fragile: if any *other* sample lies at
+    // that seed's cut locus the seeding log is undefined and the whole mean
+    // aborts, even though the Fréchet mean itself is well defined. On
+    // `Gr(1,n) = ℝP^{n-1}` two orthogonal lines (principal angle π/2) are
+    // exactly such a cut-locus pair, so a design whose first response happens
+    // to be orthogonal to another could never be averaged. Instead, try each
+    // sample as the seed and keep the first whose log-tangents to *every*
+    // sample land: the safeguarded descent below converges to the same mean
+    // from any admissible seed, so this only changes which interior point the
+    // iteration starts from — and the very first sample is chosen whenever it
+    // is admissible (so SPD/Stiefel/Poincaré data with no cut-locus pair seed
+    // exactly as before). A design where every sample sits at another's cut
+    // locus has a genuinely ambiguous mean and is reported as such.
+    let mut seeded: Option<Array1<f64>> = None;
+    let mut last_seed_err = String::new();
+    for seed in &samples {
+        let base = match manifold.exp_point(seed.view(), Array1::<f64>::zeros(ambient).view()) {
+            Ok(base) => base,
+            Err(e) => {
+                last_seed_err = e.to_string();
+                continue;
+            }
+        };
         let mut xi = Array1::<f64>::zeros(ambient);
+        let mut admissible = true;
         for (i, x) in samples.iter().enumerate() {
-            let lg = manifold
-                .log_point(p.view(), x.view())
-                .map_err(|e| format!("response geometry Fréchet mean init log: {e}"))?;
-            xi.scaled_add(w[i], &lg);
+            match manifold.log_point(base.view(), x.view()) {
+                Ok(lg) => xi.scaled_add(w[i], &lg),
+                Err(e) => {
+                    last_seed_err = e.to_string();
+                    admissible = false;
+                    break;
+                }
+            }
         }
-        p = manifold
-            .exp_point(p.view(), xi.view())
-            .map_err(|e| format!("response geometry Fréchet mean init step: {e}"))?;
+        if !admissible {
+            continue;
+        }
+        match manifold.exp_point(base.view(), xi.view()) {
+            Ok(stepped) => {
+                seeded = Some(stepped);
+                break;
+            }
+            Err(e) => {
+                last_seed_err = e.to_string();
+            }
+        }
     }
+    let mut p = seeded.ok_or_else(|| {
+        format!(
+            "response geometry Fréchet mean init: no admissible seed among samples \
+             (every sample lies at another's cut locus; last error: {last_seed_err})"
+        )
+    })?;
 
     let mut f_cur = dispersion(p.view())?;
     let mut best_p = p.clone();
