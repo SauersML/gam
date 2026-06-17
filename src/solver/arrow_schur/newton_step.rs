@@ -1793,8 +1793,10 @@ pub(crate) fn arrow_cross_row_matvec(
     // was already fanned out, but this cross-row path ran it on one core. Fan it
     // over rayon row chunks, folding the `y_beta` partials in chunk order so the
     // f64 reduction is bit-identical run-to-run regardless of thread scheduling
-    // (the #1017 determinism gate: the criterion ranking across topology
-    // candidates must not move). The `y_t` writes are disjoint per row, so no
+    // (the #1017 determinism gate). The chunk fold reassociates the row sum vs
+    // serial, so the criterion ranking is stable only up to that f64 margin — a
+    // near-tie winner inside the margin can flip, not an exact no-move guarantee
+    // (#1211). The `y_t` writes are disjoint per row, so no
     // reduction is needed there. Stay sequential below the floor and when
     // already inside a rayon worker (the topology race fans candidates with
     // `run_topology_race_parallel`) — the same nesting guard `schur_matvec` uses.

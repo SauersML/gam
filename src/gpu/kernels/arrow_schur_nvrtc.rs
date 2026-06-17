@@ -588,8 +588,12 @@ fn emulate_back_sub_block(
 /// is exactly reproduced here so its correctness is checkable on any host
 /// against the dense reference, before any GPU wall-clock is available. The
 /// loop order and inner-product accumulation order match the kernel so the
-/// result is deterministic and the criterion ranking across topology
-/// candidates cannot move between this path and the device.
+/// result is deterministic and reproduces the device arithmetic in the same
+/// accumulation order. Where the order genuinely matches (this host reference
+/// vs the device) the result is bit-identical; but this is an order-match
+/// guarantee, not a license to claim a criterion ranking "cannot move" under
+/// any reassociated reduction — a parallel/reassociated path can still flip a
+/// near-tie winner within the f64 margin (#1211).
 ///
 /// Sign and reduction conventions (from `arrow_schur::solve` host assembly):
 ///   `S_β = (H_ββ + ρ_β I) − Σ_i Y_iᵀ Y_i`,  `r_β = −g_β + Σ_i Y_iᵀ u_i`,
@@ -902,9 +906,12 @@ mod tests {
         let sys = build_spd_system(6, 3, 5);
         let a = emulate_fused_arrow_newton_step(&sys, 1e-3, 1e-2).unwrap();
         let b = emulate_fused_arrow_newton_step(&sys, 1e-3, 1e-2).unwrap();
-        // Bit-identical: the emulation has fixed loop/accumulation order, so the
-        // criterion ranking across topology candidates cannot move (the #1017
-        // verification gate).
+        // Bit-identical run-to-run: the emulation has a fixed loop/accumulation
+        // order, so two calls reproduce each other exactly (the #1017
+        // determinism gate). This proves run-to-run determinism for THIS
+        // fixed-order path only; it does not establish that an arbitrary
+        // reassociated/parallel reduction leaves a criterion ranking invariant —
+        // reassociation can flip a near-tie winner within the f64 margin (#1211).
         assert_eq!(a.delta_t, b.delta_t);
         assert_eq!(a.delta_beta, b.delta_beta);
         assert_eq!(a.log_det_hessian, b.log_det_hessian);

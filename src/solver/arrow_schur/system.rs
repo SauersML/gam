@@ -767,9 +767,14 @@ impl ArrowSchurSystem {
     /// pinned one core and grows as `k²`. The dense GEMV is embarrassingly
     /// parallel over output rows `a` — each `y[a] = Σ_b hbb[a,b]·x[b] + ridge·x[a]`
     /// is independent and its inner sum order is identical whether one thread or
-    /// many compute it, so the result is bit-identical run-to-run (the #1017
-    /// determinism gate: the criterion ranking across topology candidates must
-    /// not move). The `penalty_op` path stays serial — it is an opaque operator
+    /// many compute it. Here parallelism is over independent output rows (NOT a
+    /// reassociated reduction), so each `y[a]` accumulates in the SAME order as
+    /// serial — the result is bit-identical to serial, not merely deterministic
+    /// run-to-run (the #1017 determinism gate). On THIS exact-order path the
+    /// criterion ranking is invariant; that no-move guarantee holds because the
+    /// order matches serial, and does NOT generalise to chunk-reassociated
+    /// reductions, where a near-tie winner can flip within the f64 margin
+    /// (#1211). The `penalty_op` path stays serial — it is an opaque operator
     /// with its own structure (SAE uses the dense `hbb`), and small `k` stays
     /// serial to avoid rayon overhead on a trivial GEMV.
     ///
@@ -1508,8 +1513,10 @@ impl StreamingArrowSchur {
             // (`k×k`) to the reduced Schur complement; both are written INTO a
             // worker-private `(rhs_part, s_part)` pair so the chunk partials fold
             // back in chunk order — bit-identical run-to-run regardless of thread
-            // scheduling (the #1017 verification gate: the criterion ranking
-            // across topology candidates must not move).
+            // scheduling (the #1017 verification gate). The chunk fold reassociates
+            // the row sum relative to serial, so the criterion ranking is stable
+            // only up to that f64 margin; a near-tie winner inside the margin can
+            // flip — not an exact no-move guarantee (#1211).
             let this: &Self = self;
             let row_into = |row_idx: usize,
                             rhs_part: &mut Array1<f64>,

@@ -2552,12 +2552,14 @@ pub(crate) fn schur_matvec_sequential_ref<B: BatchedBlockSolver>(
 
 /// The parallel reduced-Schur matvec (rows ≥ `SCHUR_MATVEC_PARALLEL_ROW_MIN`)
 /// must be (a) DETERMINISTIC run-to-run — bit-identical across repeated
-/// invocations regardless of thread scheduling, the #1017 verification gate
-/// that the criterion ranking across candidates cannot move; and (b)
-/// numerically equal to the sequential per-row fold up to the ULP-level
+/// invocations regardless of thread scheduling, the #1017 verification gate;
+/// and (b) numerically equal to the sequential per-row fold up to the ULP-level
 /// reordering of an otherwise-identical sum (the chunk-partial reduction
 /// reassociates the same row contributions, so it agrees with the per-row
-/// fold to a tight relative tolerance, not bit-for-bit).
+/// fold to a tight relative tolerance, not bit-for-bit). Because (b) is only
+/// tolerance-equal and not bit-for-bit, the criterion ranking across candidates
+/// is stable up to that reassociation margin but CAN flip a near-tie winner
+/// inside it — run-to-run determinism does not by itself pin the ranking (#1211).
 #[test]
 pub(crate) fn parallel_schur_matvec_deterministic_and_matches_sequential() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
@@ -2631,11 +2633,13 @@ pub(crate) fn parallel_schur_matvec_deterministic_and_matches_sequential() {
 /// folded into `schur` in chunk order).
 ///
 /// Assert (a) DETERMINISM — two independent parallel builds are bit-for-bit
-/// identical regardless of thread scheduling (the #1017 verification gate: the
-/// criterion ranking across topology candidates cannot move); and (b)
-/// EQUIVALENCE with the in-place serial per-row reduction up to ULP-scale
+/// identical regardless of thread scheduling (the #1017 verification gate); and
+/// (b) EQUIVALENCE with the in-place serial per-row reduction up to ULP-scale
 /// chunk-boundary reassociation of an otherwise-identical sum (the same bar the
-/// streaming `accumulate_chunk` and per-row matvec parity tests hold).
+/// streaming `accumulate_chunk` and per-row matvec parity tests hold). Note (a)
+/// only fixes the result run-to-run; because (b) is tolerance-equal not
+/// bit-for-bit with serial, the criterion ranking is stable up to the
+/// reassociation margin and a near-tie winner inside it can flip (#1211).
 #[test]
 pub(crate) fn parallel_dense_schur_reduction_deterministic_and_matches_sequential() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // > MIN → trips the parallel CPU fold
@@ -2711,8 +2715,11 @@ pub(crate) fn parallel_dense_schur_reduction_deterministic_and_matches_sequentia
 /// and folds chunk partials in chunk order, exactly like `build_block_jacobi`.
 /// This pins the parallel-fold preconditioner against (a) bit-identical
 /// run-to-run determinism and (b) an independent serial row-order reference of
-/// the same Schur block — so the criterion ranking the preconditioner feeds
-/// cannot move with the thread schedule.
+/// the same Schur block (tolerance-equal, not bit-for-bit). (a) makes the
+/// preconditioner invariant to the thread SCHEDULE run-to-run; it does not make
+/// it bit-identical to serial, so a criterion ranking the preconditioner feeds
+/// is stable only up to the reassociation margin — a near-tie can still flip
+/// (#1211).
 #[test]
 pub(crate) fn cluster_jacobi_build_deterministic_and_matches_serial() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // > MIN → trips the parallel CPU fold
@@ -2883,10 +2890,12 @@ pub(crate) fn cross_row_matvec_sequential_ref(
 /// The parallel cross-row matvec (`arrow_cross_row_matvec`, the per-CG-iteration
 /// operator of the cross-row coupled Newton solve) must, like its `schur_matvec`
 /// twin, be (a) DETERMINISTIC run-to-run — bit-identical across repeated
-/// invocations regardless of thread scheduling (the #1017 gate: the criterion
-/// ranking across candidates cannot move); and (b) equal to the sequential
-/// row-order fold — bit-identical on the disjoint `y_t` writes and within
-/// ULP-scale reassociation on the cross-row `y_beta` sum.
+/// invocations regardless of thread scheduling (the #1017 gate); and (b) equal
+/// to the sequential row-order fold — bit-identical on the disjoint `y_t` writes
+/// and within ULP-scale reassociation on the cross-row `y_beta` sum. Since the
+/// `y_beta` sum is only tolerance-equal to serial (not bit-for-bit), the
+/// criterion ranking is stable up to that margin but a near-tie winner inside it
+/// can flip; run-to-run determinism alone does not pin the ranking (#1211).
 #[test]
 pub(crate) fn parallel_cross_row_matvec_deterministic_and_matches_sequential() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
@@ -3313,8 +3322,11 @@ pub(crate) fn sae_structured_system(
 /// The CPU-resident SAE reduced-Schur matvec (#1017) must compute the SAME
 /// `S·x` as the generic per-row `apply → solve → transpose` path, up to f64
 /// reassociation. This is the residency correctness gate: a resident matvec
-/// that changed the reduced operator would change the Newton step and the
-/// criterion ranking — a correctness regression, not a speedup.
+/// that changed the reduced operator (beyond f64 reassociation) would change the
+/// Newton step and could move the criterion ranking — a correctness regression,
+/// not a speedup. (The allowed f64 reassociation can itself still flip a
+/// near-tie ranking within the margin; this gate bounds the operator to that
+/// margin, it does not promise an exact no-move — see #1211.)
 #[test]
 pub(crate) fn resident_sae_matvec_matches_generic() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
@@ -3397,7 +3409,10 @@ pub(crate) fn resident_sae_matvec_matches_generic() {
 /// factors in one support-sparse pass) must produce the SAME reduced-Schur
 /// diagonal — hence the SAME `BlockFactor::Scalar` inverses — as the generic
 /// per-column probe-and-solve `build_scalar_jacobi`. A diverging
-/// preconditioner would change the PCG iterate and the criterion ranking.
+/// preconditioner (beyond f64 reassociation) would change the PCG iterate and
+/// could move the criterion ranking. (Even the matching preconditioner is only
+/// tolerance-equal to the generic build, so a near-tie ranking can still flip
+/// within that margin — this is not an exact no-move guarantee, see #1211.)
 #[test]
 pub(crate) fn resident_scalar_jacobi_matches_generic() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
@@ -3534,11 +3549,14 @@ pub(crate) fn resident_scalar_jacobi_col_dot_hoist_bit_identical() {
 /// fans its per-row support sweep over rayon above `SCHUR_MATVEC_PARALLEL_ROW_MIN`,
 /// accumulating worker-private length-`K` diagonal partials folded back in chunk
 /// order. The point-elimination term scatters into a SHARED diagonal, so the
-/// parallel build must (a) be bit-identical run-to-run and (b) exactly reproduce
-/// the serial chunk-free build (the serial branch is taken inside a single-thread
-/// rayon worker, where `current_thread_index()` is `Some`). A drifting diagonal
-/// would change the PCG iterate and the criterion ranking across topology
-/// candidates — the #1017 determinism gate.
+/// parallel build must (a) be bit-identical run-to-run and (b) reproduce the
+/// serial chunk-free build up to chunk reassociation (asserted to `rel < 1e-12`,
+/// NOT bit-for-bit; the serial branch is taken inside a single-thread rayon
+/// worker, where `current_thread_index()` is `Some`). A diagonal drifting beyond
+/// that margin would change the PCG iterate and could move the criterion ranking
+/// — the #1017 determinism gate. Because (b) is tolerance-equal not bit-exact,
+/// the ranking is stable only up to the reassociation margin; a near-tie winner
+/// inside it can still flip (#1211).
 #[test]
 pub(crate) fn parallel_resident_scalar_jacobi_deterministic_and_matches_serial() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
@@ -3836,11 +3854,14 @@ pub(crate) fn bench_resident_sae_matvec_speedup() {
 /// reduced-RHS assembly) and `back_substitute` (per-row `Δt_i`) fan over rows
 /// with rayon above `SCHUR_MATVEC_PARALLEL_ROW_MIN`. Both must be
 /// (a) DETERMINISTIC run-to-run — bit-identical regardless of thread
-/// scheduling, the #1017 verification gate that the criterion ranking cannot
-/// move; and (b) numerically equal to the sequential per-row computation up to
-/// ULP-level reassociation (the chunk-partial fold reassociates the SAME row
-/// contributions). For `back_substitute` the per-row writes are DISJOINT, so it
-/// must match the sequential scatter bit-for-bit.
+/// scheduling, the #1017 verification gate; and (b) numerically equal to the
+/// sequential per-row computation up to ULP-level reassociation (the
+/// chunk-partial fold reassociates the SAME row contributions). For
+/// `back_substitute` the per-row writes are DISJOINT, so it must match the
+/// sequential scatter bit-for-bit. For `accumulate_chunk` (b) is only
+/// tolerance-equal, so the criterion ranking it feeds is stable up to the
+/// reassociation margin but a near-tie winner inside it can flip — run-to-run
+/// determinism alone does not pin the ranking (#1211).
 #[test]
 pub(crate) fn parallel_streaming_assembly_deterministic_and_matches_sequential() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
@@ -4028,10 +4049,13 @@ pub(crate) fn bench_streaming_assembly_parallel_speedup() {
 /// (so O(inner-Newton-iters) times per fit) — fans its per-row reduced-Schur
 /// sub-block sweep over rayon above `SCHUR_MATVEC_PARALLEL_ROW_MIN`. It must be
 /// (a) DETERMINISTIC run-to-run — bit-identical regardless of thread scheduling
-/// (the preconditioner, hence the criterion ranking, cannot move); and
+/// (so the preconditioner is invariant to thread SCHEDULE run-to-run); and
 /// (b) numerically equal to the sequential per-row fold up to ULP-level
 /// reassociation. Asserted through the applied output `P⁻¹ r` (the factored
-/// block apply), which is what the PCG iterate actually consumes.
+/// block apply), which is what the PCG iterate actually consumes. Because (b) is
+/// tolerance-equal not bit-for-bit with serial, the criterion ranking the
+/// preconditioner feeds is stable only up to the reassociation margin and a
+/// near-tie winner inside it can flip — not an exact no-move guarantee (#1211).
 #[test]
 pub(crate) fn parallel_block_jacobi_deterministic_and_matches_sequential() {
     let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path

@@ -521,8 +521,12 @@ fn build_row_procedural_matvec(
             // and fold the per-chunk length-`K` partials in chunk order so the
             // f64 reduction is deterministic (bit-identical run-to-run)
             // regardless of thread scheduling — it agrees with the serial sum up
-            // to ULP-scale chunk reassociation (the #1017 verification gate: the
-            // criterion ranking across topology candidates must not move). Stay
+            // to ULP-scale chunk reassociation (the #1017 verification gate).
+            // Because that reassociation is a real (if tiny) departure from
+            // serial, the criterion ranking across topology candidates is stable
+            // except for candidates separated by less than the reassociation
+            // margin, where the near-tie winner can flip — not an exact no-move
+            // guarantee (#1211). Stay
             // sequential below
             // `SCHUR_MATVEC_PARALLEL_ROW_MIN` rows and when already inside a
             // rayon worker (the topology race fans candidates with
@@ -3968,8 +3972,12 @@ mod tests {
     /// rayon worker. The chunk-ordered fold makes the parallel result
     /// **deterministic** (two parallel calls are bit-identical — scheduling
     /// cannot change the numbers) and it agrees with the serial accumulation up
-    /// to ULP-scale chunk reassociation, so the criterion ranking across
-    /// topology candidates cannot move (the #1017 verification gate).
+    /// to ULP-scale chunk reassociation (the #1017 verification gate). That
+    /// reassociation is a genuine f64 departure from serial, so the criterion
+    /// ranking across topology candidates is stable only up to the reassociation
+    /// margin: a near-tie winner inside that margin can flip. This is NOT an
+    /// exact no-move guarantee (#1211); for that, the ranking path must use the
+    /// fixed-order serial accumulation.
     #[test]
     fn row_procedural_matvec_parallel_deterministic_and_matches_serial() {
         use crate::solver::arrow_schur::SCHUR_MATVEC_PARALLEL_ROW_MIN;

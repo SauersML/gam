@@ -125,11 +125,15 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
         // partials are folded into `schur` in CHUNK order. The per-chunk row order
         // and the inter-chunk fold order are both fixed independent of thread
         // scheduling, so the f64 reduction is **bit-identical run-to-run** (the
-        // #1017 determinism gate: the criterion ranking across topology candidates
-        // must not move), and the only departure from the in-place serial loop is
-        // the chunk-boundary reassociation of the reduction sum — exactly the
+        // #1017 determinism gate). NOTE: bit-identical run-to-run does NOT make
+        // it bit-identical to the in-place serial loop — the chunk-boundary
+        // reassociation of the reduction sum is a genuine f64 departure (the
         // established equivalence `accumulate_chunk` / the per-row matvec operate
-        // under, well inside the Newton solve's tolerance. Stay in-place serial
+        // under, well inside the Newton solve's tolerance). It bounds candidate-
+        // to-candidate drift to that reassociation margin, so the criterion
+        // ranking is stable EXCEPT for candidates tying within the margin, where
+        // the winner can flip; it is not an exact no-move guarantee (#1211). For
+        // an exact-order guarantee, take the serial path. Stay in-place serial
         // below the row floor and when already inside a rayon worker (the topology
         // race fans candidates with `run_topology_race_parallel`) to avoid
         // nested-rayon oversubscription — the same guard the matvec uses.
@@ -617,8 +621,11 @@ pub(crate) const SCHUR_PROLOGUE_PARALLEL_K_MIN: usize = 512;
 /// β-columns, so the gather/scatter term is NOT negligible and is counted here.
 ///
 /// Numerically identical to the generic path up to floating-point reassociation
-/// (it differentiates and accumulates the SAME quotient), so the criterion
-/// ranking across topology candidates cannot move — the #1017 verification gate.
+/// (it differentiates and accumulates the SAME quotient). It is deterministic
+/// run-to-run and within the reassociation margin of the serial path, so the
+/// criterion ranking across topology candidates is stable except for candidates
+/// separated by less than that f64 margin, where reassociation can flip the
+/// near-tie winner — it is NOT an exact no-move guarantee (#1211).
 pub(crate) struct SaeResidentReducedSchur {
     /// Decoder output dimension `p` (the side length of every `G_i = L_iᵀ Y_i`).
     pub(crate) p: usize,
@@ -857,8 +864,10 @@ pub(crate) fn schur_matvec<B: BatchedBlockSolver + Sync>(
     // the SAE LLM shape (#1017) this is the matvec's whole cost and is
     // embarrassingly parallel. Run it under rayon over fixed row chunks, summing
     // the per-chunk partials in chunk order so the f64 reduction is bit-identical
-    // run-to-run regardless of thread scheduling (the #1017 verification gate:
-    // the criterion ranking across topology candidates must not move). Stay
+    // run-to-run regardless of thread scheduling (the #1017 verification gate).
+    // This is deterministic and within the chunk-reassociation margin of serial,
+    // so the criterion ranking is stable except for candidates that tie inside
+    // that f64 margin — not an exact no-move guarantee (#1211). Stay
     // sequential when already inside a rayon worker (the topology race fans
     // candidates with `run_topology_race_parallel`) to avoid nested-rayon
     // oversubscription — the same guard `HyperOperator::mul_mat` uses. The
@@ -1202,7 +1211,10 @@ impl JacobiPreconditioner {
     /// resident factors — no probe, no per-column solve, the staged `Y_i` reused
     /// from the matvec residency. The result is the SAME quotient the generic
     /// path computes (up to float reassociation of the row sum), so the PCG
-    /// preconditioner — and therefore the criterion ranking — is unchanged.
+    /// preconditioner is unchanged up to that f64 margin. Since the preconditioner
+    /// only steers the iterate (which still terminates at the PCG tolerance), the
+    /// criterion ranking is stable except for candidates within that margin,
+    /// where the near-tie winner can flip — not an exact no-move guarantee (#1211).
     pub(crate) fn build_scalar_jacobi_resident(
         sys: &ArrowSchurSystem,
         ridge_beta: f64,
@@ -1233,9 +1245,12 @@ impl JacobiPreconditioner {
         // length-`K` partials folded back in chunk order: each chunk is a
         // contiguous ascending row range and rows within it stay ascending, so the
         // chunk-ordered fold reproduces the serial `row = 0..n` subtraction order
-        // bit-for-bit run-to-run (the #1017 determinism gate: the preconditioner —
-        // and therefore the criterion ranking across topology candidates — must not
-        // move). This build runs once per inexact-PCG solve = O(inner-Newton-iters)
+        // bit-for-bit run-to-run (the #1017 determinism gate). Run-to-run
+        // bit-identity does not extend to bit-identity with the in-place serial
+        // accumulation, so the preconditioner — and any criterion ranking it
+        // steers — is stable only up to the chunk-reassociation margin; a near-tie
+        // winner inside that margin can flip (#1211).
+        // This build runs once per inexact-PCG solve = O(inner-Newton-iters)
         // per fit; at the SAE LLM shape (thousands of rows, wide border `k`) the
         // per-row support sweep is the build's whole cost and was on one core.
         // The per-channel column dot `col_dot[j] = Σ_r L_i[r·p+j]·Y_i[r·p+j]`
@@ -1536,8 +1551,11 @@ impl JacobiPreconditioner {
         // accumulator (`-=`) so a rayon worker can subtract a chunk's rows into
         // a worker-private zero-seeded `Vec<Array2>` and the caller folds the
         // chunk partials back in chunk order — bit-identical run-to-run
-        // regardless of thread scheduling (the #1017 verification gate: the
-        // preconditioner, hence the criterion ranking, must not move).
+        // regardless of thread scheduling (the #1017 verification gate). This
+        // is deterministic and within the chunk-reassociation margin of serial,
+        // so the preconditioner, hence the criterion ranking, is stable except
+        // for near-tie candidates inside that f64 margin — not an exact no-move
+        // guarantee (#1211).
         let row_into = |i: usize,
                         row: &ArrowRowBlock,
                         blocks: &mut [Array2<f64>]|
