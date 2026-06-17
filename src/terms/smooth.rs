@@ -1,8 +1,6 @@
 // Split from the original oversized module; keep included in order.
 include!("smooth/prelude.rs");
 
-mod bspline_boundary;
-
 mod coefficient_transforms;
 
 mod error;

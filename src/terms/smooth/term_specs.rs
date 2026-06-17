@@ -1,5 +1,3 @@
-use bspline_boundary::bspline_boundary_linear_constraints;
-
 use coefficient_transforms::{
     convex_divided_difference_transform_matrix, cumulative_exp, cumulative_sum_transform_matrix,
     second_cumulative_exp,
@@ -6401,14 +6399,9 @@ fn build_single_local_smooth_term(
                 // Sum-to-zero side constraints conflict with monotonic/convex cones.
                 spec_local.identifiability = BSplineIdentifiability::None;
             }
-            // Boundary conditions are emitted by the smooth-level paired
-            // linear-constraint path (`bspline_boundary_linear_constraints`),
-            // which supports non-zero anchors and composes them with the frozen
-            // identifiability transform. Clear them here so the basis builder
-            // does not also bake them into the basis null space — the legacy
-            // basis-level path rejected non-zero anchors and dropped columns
-            // before the frozen transform, conflicting with the constraint path.
-            spec_local.boundary_conditions = BSplineBoundaryConditions::default();
+            // Endpoint boundary conditions are structural for B-splines: the
+            // basis builder bakes their homogeneous nullspace transform into
+            // the design, penalties, and stored raw-basis transform.
             build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
         }
         SmoothBasisSpec::ThinPlate {
@@ -6985,17 +6978,7 @@ fn build_single_local_smooth_term(
     } else {
         None
     };
-    let boundary_linear_constraints = match &term.basis {
-        SmoothBasisSpec::BSpline1D { spec, .. } => bspline_boundary_linear_constraints(
-            spec.boundary_conditions,
-            &metadata,
-            spec.degree,
-            coefficient_transform_for_constraints.as_ref(),
-        )?,
-        _ => None,
-    };
-    let linear_constraints_local =
-        merge_linear_constraints_global(shape_linear_constraints, boundary_linear_constraints);
+    let linear_constraints_local = merge_linear_constraints_global(shape_linear_constraints, None);
 
     // Joint-null absorption rotation. Fresh fit specs compute Q from the final
     // per-smooth penalty set (after all in-smooth reparameterizations have

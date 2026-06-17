@@ -225,7 +225,7 @@ pub fn build_bspline_basis_1d(
     // knots/penalties downstream, otherwise we fall through to the regular
     // dense/sparse path below (which will build its own knots — that path is
     // shared with several knot-spec shapes and is not worth refactoring).
-    let auto_chunk_streaming = {
+    let auto_chunk_streaming = if spec.boundary_conditions.is_free() {
         let knots_for_estimate = match &spec.knotspec {
             BSplineKnotSpec::Generate {
                 data_range,
@@ -270,6 +270,8 @@ pub fn build_bspline_basis_1d(
             }
             None => None,
         }
+    } else {
+        None
     };
     if let Some((knots, p_raw, chunk)) = auto_chunk_streaming {
         let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
@@ -339,13 +341,11 @@ pub fn build_bspline_basis_1d(
             joint_null_rotation: None,
         });
     }
-    // Boundary conditions are emitted by the smooth-level paired
-    // linear-constraint path (`bspline_boundary_linear_constraints` in
-    // smooth.rs), and `build_local_smooth_term` clears `spec.boundary_conditions`
-    // before reaching this builder, so the basis builder no longer bakes them.
-    // The `is_free` guard is retained defensively: any direct caller that still
-    // supplies non-free endpoints must take the dense identifiability path
-    // rather than the sparse branch, which never threaded boundary handling.
+    // Non-free endpoint boundary conditions are structural: they must be baked
+    // into the raw B-spline coefficient chart before identifiability handling.
+    // The sparse path is reserved for free endpoints; non-free endpoints take
+    // the dense path below, where the boundary nullspace transform is composed
+    // into the stored raw-basis identifiability transform.
     let prefer_sparse_design = spec.boundary_conditions.is_free()
         && matches!(
             spec.identifiability,
@@ -576,20 +576,32 @@ pub fn build_bspline_basis_1d(
             }
         }
     } else {
-        // Boundary conditions are no longer baked into the basis null space:
-        // they are emitted by the smooth-level paired linear-constraint path
-        // (`bspline_boundary_linear_constraints` in smooth.rs), which supports
-        // non-zero anchors and composes with the frozen identifiability
-        // transform. `build_local_smooth_term` clears `boundary_conditions`
-        // before calling this builder, so the basis-level boundary path is no
-        // longer reached.
-        let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
-            design_dense_opt.expect("dense B-spline basis should be present"),
-            penalties_raw_mats,
-            &knots,
-            spec.degree,
-            &spec.identifiability,
-        )?;
+        let raw_design = design_dense_opt.expect("dense B-spline basis should be present");
+        let boundary_transform =
+            bspline_boundary_nullspace_transform(&knots, spec.degree, spec.boundary_conditions)?;
+        let (boundary_design, boundary_penalties) = if let Some(z_bc) = boundary_transform.as_ref()
+        {
+            (
+                fast_ab(&raw_design, z_bc),
+                penalties_raw_mats
+                    .into_iter()
+                    .map(|s| project_penalty_matrix(&s, Some(z_bc)))
+                    .collect(),
+            )
+        } else {
+            (raw_design, penalties_raw_mats)
+        };
+        let (design, penalties, identifiability_local) =
+            apply_bspline_identifiability_policy_in_chart(
+                boundary_design,
+                boundary_penalties,
+                &knots,
+                spec.degree,
+                &spec.identifiability,
+                boundary_transform.as_ref(),
+            )?;
+        let identifiability_transform =
+            compose_optional_bspline_transform(boundary_transform, identifiability_local)?;
         let transformed_candidates = penalties
             .into_iter()
             .zip(penalties_raw.into_iter())
@@ -651,6 +663,219 @@ pub(crate) fn compose_bspline_transform(
             Ok(fast_ab(&prev, &next))
         }
         None => Ok(next),
+    }
+}
+
+fn compose_optional_bspline_transform(
+    existing: Option<Array2<f64>>,
+    next: Option<Array2<f64>>,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    match (existing, next) {
+        (Some(prev), Some(next)) => Ok(Some(compose_bspline_transform(Some(prev), next)?)),
+        (Some(prev), None) => Ok(Some(prev)),
+        (None, Some(next)) => Ok(Some(next)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn bspline_boundary_endpoint(
+    knots: &Array1<f64>,
+    degree: usize,
+    right: bool,
+) -> Result<f64, BasisError> {
+    if knots.len() <= degree + 1 {
+        crate::bail_invalid_basis!("B-spline boundary condition requires a valid knot vector");
+    }
+    let n_basis = knots.len() - degree - 1;
+    Ok(if right { knots[n_basis] } else { knots[degree] })
+}
+
+fn bspline_endpoint_value_row(
+    knots: &Array1<f64>,
+    degree: usize,
+    endpoint: f64,
+) -> Result<Array1<f64>, BasisError> {
+    let point = Array1::from_vec(vec![endpoint]);
+    let (raw, _) = create_basis::<Dense>(
+        point.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::value(),
+    )?;
+    Ok(raw.row(0).to_owned())
+}
+
+fn bspline_endpoint_derivative_row(
+    knots: &Array1<f64>,
+    degree: usize,
+    endpoint: f64,
+) -> Result<Array1<f64>, BasisError> {
+    let n_basis = knots
+        .len()
+        .checked_sub(degree + 1)
+        .ok_or_else(|| BasisError::InvalidInput("invalid B-spline knot vector".to_string()))?;
+    let mut row = vec![0.0; n_basis];
+    evaluate_bspline_derivative_scalar(endpoint, knots.view(), degree, &mut row)?;
+    Ok(Array1::from_vec(row))
+}
+
+fn push_bspline_boundary_rows_for_endpoint(
+    rows: &mut Vec<Array1<f64>>,
+    knots: &Array1<f64>,
+    degree: usize,
+    condition: BSplineEndpointBoundaryCondition,
+    right: bool,
+) -> Result<(), BasisError> {
+    let endpoint = bspline_boundary_endpoint(knots, degree, right)?;
+    match condition {
+        BSplineEndpointBoundaryCondition::Free => {}
+        BSplineEndpointBoundaryCondition::Clamped => {
+            rows.push(bspline_endpoint_derivative_row(knots, degree, endpoint)?);
+        }
+        BSplineEndpointBoundaryCondition::Anchored { value } => {
+            if !value.is_finite() || value.abs() > 1e-12 {
+                crate::bail_invalid_basis!(
+                    "anchored B-spline boundary value must be zero for the structural Hermite pin; non-zero anchors are not supported"
+                );
+            }
+            rows.push(bspline_endpoint_value_row(knots, degree, endpoint)?);
+            rows.push(bspline_endpoint_derivative_row(knots, degree, endpoint)?);
+        }
+    }
+    Ok(())
+}
+
+fn bspline_boundary_constraint_rows(
+    knots: &Array1<f64>,
+    degree: usize,
+    boundary_conditions: BSplineBoundaryConditions,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    if boundary_conditions.is_free() {
+        return Ok(None);
+    }
+    let p_raw = knots
+        .len()
+        .checked_sub(degree + 1)
+        .ok_or_else(|| BasisError::InvalidInput("invalid B-spline knot vector".to_string()))?;
+    let mut rows = Vec::<Array1<f64>>::new();
+    push_bspline_boundary_rows_for_endpoint(
+        &mut rows,
+        knots,
+        degree,
+        boundary_conditions.left,
+        false,
+    )?;
+    push_bspline_boundary_rows_for_endpoint(
+        &mut rows,
+        knots,
+        degree,
+        boundary_conditions.right,
+        true,
+    )?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut c = Array2::<f64>::zeros((rows.len(), p_raw));
+    for (i, row) in rows.into_iter().enumerate() {
+        if row.len() != p_raw {
+            crate::bail_dim_basis!(
+                "B-spline boundary row has {} columns but raw basis has {}",
+                row.len(),
+                p_raw
+            );
+        }
+        c.row_mut(i).assign(&row);
+    }
+    Ok(Some(c))
+}
+
+fn bspline_boundary_nullspace_transform(
+    knots: &Array1<f64>,
+    degree: usize,
+    boundary_conditions: BSplineBoundaryConditions,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    let Some(c) = bspline_boundary_constraint_rows(knots, degree, boundary_conditions)? else {
+        return Ok(None);
+    };
+    let p_raw = c.ncols();
+    let frob = c.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let (z, rank) =
+        rrqr_nullspace_basis(&c.t(), default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    if rank >= p_raw || z.ncols() == 0 {
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "bspline_boundary_nullspace_transform",
+            cross_rank: rank,
+            coeff_dim: p_raw,
+            cross_frobenius: frob,
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
+    }
+    if rank == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(z))
+    }
+}
+
+fn bspline_geometric_constraint_rows(
+    knots: &Array1<f64>,
+    degree: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let g = compute_greville_abscissae(knots, degree)?;
+    let k = g.len();
+    if k < 3 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: k });
+    }
+    let mut c_geom = Array2::<f64>::zeros((2, k));
+    for j in 0..k {
+        c_geom[[0, j]] = 1.0;
+        c_geom[[1, j]] = g[j];
+    }
+    let g_mean = g.mean().unwrap_or(0.0);
+    let gvar = g.iter().map(|&x| (x - g_mean).powi(2)).sum::<f64>() / (k as f64);
+    let g_std = gvar.sqrt().max(1e-10);
+    for j in 0..k {
+        c_geom[[1, j]] = (c_geom[[1, j]] - g_mean) / g_std;
+    }
+    Ok(c_geom)
+}
+
+fn compute_geometric_constraint_transform_in_chart(
+    knots: &Array1<f64>,
+    degree: usize,
+    raw_to_current: Option<&Array2<f64>>,
+) -> Result<Array2<f64>, BasisError> {
+    if let Some(t) = raw_to_current {
+        let c_geom_raw = bspline_geometric_constraint_rows(knots, degree)?;
+        if c_geom_raw.ncols() != t.nrows() {
+            crate::bail_dim_basis!(
+                "B-spline geometric constraint transform mismatch: raw constraint has {} columns but transform has {} rows",
+                c_geom_raw.ncols(),
+                t.nrows()
+            );
+        }
+        let c_geom = fast_ab(&c_geom_raw, t);
+        let k = c_geom.ncols();
+        let frob = c_geom.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let (z, rank) = rrqr_nullspace_basis(&c_geom.t(), default_rrqr_rank_alpha())
+            .map_err(BasisError::LinalgError)?;
+        if rank >= k || z.ncols() == 0 {
+            return Err(BasisError::ConstraintNullspaceCollapsed {
+                site: "compute_geometric_constraint_transform_in_chart",
+                cross_rank: rank,
+                coeff_dim: k,
+                cross_frobenius: frob,
+                constrained_gram_max_eigenvalue: f64::NAN,
+                constrained_gram_min_eigenvalue: f64::NAN,
+                spectral_tolerance: f64::NAN,
+            });
+        }
+        Ok(z)
+    } else {
+        let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
+        Ok(z)
     }
 }
 
@@ -795,9 +1020,8 @@ pub(crate) fn build_streaming_bspline_design_and_candidates(
     chunk_size: Option<usize>,
 ) -> Result<(DesignMatrix, Vec<PenaltyCandidate>, Option<Array2<f64>>), BasisError> {
     let chunk = chunk_size.unwrap_or(DEFAULT_STREAMING_CHUNK_ROWS).max(1);
-    // Boundary conditions are emitted by the smooth-level paired
-    // linear-constraint path; the basis builder no longer bakes them, so this
-    // streaming path starts from no boundary transform.
+    // Streaming is selected only for free endpoint boundary conditions. Non-free
+    // endpoints route through the dense structural boundary transform first.
     let mut transform_opt: Option<Array2<f64>> = None;
 
     match identifiability {
@@ -902,6 +1126,24 @@ pub(crate) fn apply_bspline_identifiability_policy(
     degree: usize,
     identifiability: &BSplineIdentifiability,
 ) -> Result<(Array2<f64>, Vec<Array2<f64>>, Option<Array2<f64>>), BasisError> {
+    apply_bspline_identifiability_policy_in_chart(
+        design,
+        penalties,
+        knots,
+        degree,
+        identifiability,
+        None,
+    )
+}
+
+fn apply_bspline_identifiability_policy_in_chart(
+    design: Array2<f64>,
+    penalties: Vec<Array2<f64>>,
+    knots: &Array1<f64>,
+    degree: usize,
+    identifiability: &BSplineIdentifiability,
+    raw_to_current: Option<&Array2<f64>>,
+) -> Result<(Array2<f64>, Vec<Array2<f64>>, Option<Array2<f64>>), BasisError> {
     let (design_c, z_opt): (Array2<f64>, Option<Array2<f64>>) = match identifiability {
         BSplineIdentifiability::None => (design, None),
         BSplineIdentifiability::WeightedSumToZero { weights } => {
@@ -913,7 +1155,7 @@ pub(crate) fn apply_bspline_identifiability_policy(
             (b_c, Some(z))
         }
         BSplineIdentifiability::RemoveLinearTrend => {
-            let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
+            let z = compute_geometric_constraint_transform_in_chart(knots, degree, raw_to_current)?;
             (fast_ab(&design, &z), Some(z))
         }
         BSplineIdentifiability::OrthogonalToDesignColumns { columns, weights } => {
@@ -927,6 +1169,13 @@ pub(crate) fn apply_bspline_identifiability_policy(
         BSplineIdentifiability::FrozenTransform { transform } => {
             let z = transform.clone();
             if design.ncols() != z.nrows() {
+                if let Some(t) = raw_to_current {
+                    if t.nrows() == z.nrows() {
+                        crate::bail_dim_basis!(
+                            "frozen B-spline transform already maps from the raw basis; clear boundary_conditions before replaying FrozenTransform"
+                        );
+                    }
+                }
                 crate::bail_dim_basis!(
                     "frozen identifiability transform mismatch: design has {} columns but transform has {} rows",
                     design.ncols(),
