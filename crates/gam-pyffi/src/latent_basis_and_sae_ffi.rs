@@ -7753,3 +7753,77 @@ mod sae_euclidean_oos_rebuild_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sae_linear_atom_tests {
+    use super::{sae_atom_basis_kind_from_str, sae_atom_basis_kind_name};
+    use gam::terms::sae::manifold::{EuclideanPatchEvaluator, SaeAtomBasisKind, SaeBasisEvaluator};
+    use ndarray::Array2;
+
+    /// #1221 — `"linear"` (and its synonyms) is a first-class topology distinct
+    /// from `"euclidean"`/`"euclidean_patch"` (the degree-2 quadratic patch), and
+    /// it round-trips under the honest name `"linear"`. The quadratic patch keeps
+    /// its own `"euclidean_patch"` name and additionally accepts the explicit
+    /// `"euclidean_quadratic_patch"` synonym.
+    #[test]
+    fn linear_topology_is_first_class_and_round_trips() {
+        for name in ["linear", "linear_rank1", "affine", "LINEAR"] {
+            assert_eq!(
+                sae_atom_basis_kind_from_str(name),
+                SaeAtomBasisKind::Linear,
+                "{name:?} must parse to the genuinely-linear atom"
+            );
+        }
+        assert_eq!(
+            sae_atom_basis_kind_name(&SaeAtomBasisKind::Linear),
+            "linear",
+            "the linear atom must round-trip under its honest name"
+        );
+        // The quadratic patch is a DIFFERENT kind — `"linear"` must not collapse
+        // onto it, or the curved-vs-linear comparison would be mislabeled again.
+        for name in ["euclidean", "euclidean_patch", "euclidean_quadratic_patch"] {
+            assert_eq!(
+                sae_atom_basis_kind_from_str(name),
+                SaeAtomBasisKind::EuclideanPatch,
+                "{name:?} is the degree-2 quadratic patch, distinct from linear"
+            );
+        }
+    }
+
+    /// #1221 — the genuinely-linear atom's decoder reconstructs the affine image
+    /// `γ(t) = b₀ + t·b₁` EXACTLY. Its evaluator is the degree-1 monomial patch
+    /// `Φ(t) = [1, t]` (width `d + 1 = 2` at `d = 1`), so for a decoder
+    /// `B = [[b₀…], [b₁…]]` the reconstruction `Φ(t)·B` equals `b₀ + t·b₁` to
+    /// machine precision — the property the reconstruction-parity baseline needs.
+    #[test]
+    fn linear_atom_reconstructs_affine_image_exactly() {
+        let evaluator = EuclideanPatchEvaluator::new(1, 1).expect("degree-1 patch");
+        assert_eq!(
+            evaluator.basis_size(),
+            2,
+            "a degree-1 (linear/affine) patch in 1-D has width 2: {{1, t}}"
+        );
+        // Decoder over p = 2 output channels: γ(t) = b0 + t·b1.
+        let b0 = [0.7_f64, -1.3];
+        let b1 = [2.0_f64, 0.5];
+        let decoder = Array2::from_shape_vec((2, 2), vec![b0[0], b0[1], b1[0], b1[1]])
+            .expect("2x2 decoder");
+
+        let coords = Array2::from_shape_vec((5, 1), vec![-2.0, -0.5, 0.0, 1.0, 3.0])
+            .expect("5x1 coords");
+        let (phi, _jet) = evaluator.evaluate(coords.view()).expect("evaluate linear patch");
+        assert_eq!(phi.dim(), (5, 2));
+        let recon = phi.dot(&decoder); // (5, 2) = Φ·B
+        for (row, &t) in coords.column(0).iter().enumerate() {
+            for ch in 0..2 {
+                let expected = b0[ch] + t * b1[ch];
+                assert!(
+                    (recon[[row, ch]] - expected).abs() < 1e-12,
+                    "linear atom must reconstruct b0 + t·b1 exactly: \
+                     row {row} ch {ch} got {} want {expected}",
+                    recon[[row, ch]]
+                );
+            }
+        }
+    }
+}
