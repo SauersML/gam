@@ -413,6 +413,7 @@ fn canonicalize_for_identifiability_inner(
     specs: &[ParameterBlockSpec],
     orthogonalize: bool,
 ) -> Result<CanonicalSpecs, CustomFamilyError> {
+    eprintln!("TRACE1197 enter canonicalize_inner orthogonalize={orthogonalize} nblocks={}", specs.len());
     // Exact orthogonalisation of structural confounds. Runs only on the top-
     // level entry AND only where the design is single-channel dense (the general
     // multi-channel coupled path is handled by the Tier-B joint-Newton Jeffreys
@@ -420,9 +421,12 @@ fn canonicalize_for_identifiability_inner(
     // the orthogonaliser cannot express as a per-block transform, it falls
     // through to the unmodified audit gate below — never worse than today.
     if orthogonalize {
+        eprintln!("TRACE1197 before try_orthogonalize_blocks");
         if let Some(canon) = try_orthogonalize_blocks(specs)? {
+            eprintln!("TRACE1197 try_orthogonalize returned Some");
             return Ok(canon);
         }
+        eprintln!("TRACE1197 try_orthogonalize returned None");
     }
     if specs.is_empty() {
         return Ok(CanonicalSpecs {
@@ -614,6 +618,7 @@ fn canonicalize_for_identifiability_inner(
         // sound or needed here.
         audit_result
     } else {
+        eprintln!("TRACE1197 before flat audit_identifiability");
         let audit_result = audit_identifiability(specs).map_err(|reason| {
             CustomFamilyError::DimensionMismatch {
                 reason: format!("pre-fit identifiability audit failed: {reason}"),
@@ -630,6 +635,7 @@ fn canonicalize_for_identifiability_inner(
         );
         audit_result
     };
+    eprintln!("TRACE1197 audit done fatal={} dropped={:?}", audit.fatal, audit.dropped_columns);
 
     if audit.fatal {
         return Err(CustomFamilyError::IdentifiabilityFailure { audit });
@@ -847,6 +853,7 @@ fn canonicalize_for_identifiability_inner(
     // direction of J^T W J also lies in ker(S), the MAP is non-unique —
     // refuse with MapUniquenessFailure naming the dominant block.
     {
+        eprintln!("TRACE1197 enter MAP block");
         let p_total_raw: usize = specs.iter().map(|s| s.design.ncols()).sum();
         let p_total_red: usize = per_block_transform.iter().map(|t| t.ncols()).sum();
         let k = if use_channel_aware { max_n_outputs } else { 1 };
@@ -873,6 +880,7 @@ fn canonicalize_for_identifiability_inner(
             .max()
             .unwrap_or(0);
         let r_map = nk.max(stacked_rows);
+        eprintln!("TRACE1197 MAP r_map={r_map} nk={nk} stacked_rows={stacked_rows} n_rows={n_rows}");
         // Dense stacked designs (k_s·n × p_b) for the observation-band detection
         // and stacked packing.
         let stacked_dense: Vec<Option<Array2<f64>>> = specs
@@ -922,6 +930,7 @@ fn canonicalize_for_identifiability_inner(
             vec![0]
         };
 
+        eprintln!("TRACE1197 MAP observation_bands={observation_bands:?} k_bands={k_bands}");
         // Build J_pre_T: (r_map, p_total_raw) by row-stacking per-block Jacobians.
         let mut j_pre = Array2::<f64>::zeros((r_map, p_total_raw));
         let mut col_off = 0usize;
@@ -1007,6 +1016,7 @@ fn canonicalize_for_identifiability_inner(
             }
             col_off += p_b;
         }
+        eprintln!("TRACE1197 MAP j_pre built shape={:?}", j_pre.dim());
 
         // ── Identity-T fast path (exact, data-independent) ──────────────────
         //
@@ -1066,12 +1076,15 @@ fn canonicalize_for_identifiability_inner(
             }
 
             // RRQR rank on J_pre and J_can.
+            eprintln!("TRACE1197 MAP before rrqr j_pre");
             let rank_j_pre = rrqr_with_permutation(&j_pre, default_rrqr_rank_alpha())
                 .map(|r| r.rank)
                 .unwrap_or(0);
+            eprintln!("TRACE1197 MAP rrqr j_pre done rank={rank_j_pre}; before rrqr j_can");
             let rank_j_can = rrqr_with_permutation(&j_can, default_rrqr_rank_alpha())
                 .map(|r| r.rank)
                 .unwrap_or(0);
+            eprintln!("TRACE1197 MAP rrqr j_can done rank={rank_j_can}");
 
             log::info!(
                 "[CANON] post-T invariant: rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
@@ -1145,6 +1158,7 @@ fn canonicalize_for_identifiability_inner(
             // `j_can`) the reduced Jacobian equals `j_pre` exactly, so the
             // check reads `j_pre`; otherwise it reads the reduced `j_can`.
             let j_for_map = j_can_reduced.as_ref().unwrap_or(&j_pre);
+            eprintln!("TRACE1197 MAP before check_map_uniqueness j_for_map shape={:?}", j_for_map.dim());
             crate::identifiability::audit::check_map_uniqueness(
                 j_for_map,
                 &[],
