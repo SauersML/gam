@@ -347,6 +347,75 @@ impl SaeManifoldTerm {
         // boost singularity — the scoped residue of the hairy-ball obstruction)
         // is honestly refused by the reparameterization and left as fitted.
 
+        // #1227 — canonicalize charts FIRST, then compute every
+        // chart-dependent diagnostic (Θ, LOAO ΔEV, hybrid split). The chart
+        // canonicalization below is a (generally nonlinear) reparameterization
+        // of each eligible atom's latent coordinate: a straight line `b0 + (t −
+        // t̄) b1` fit in the OLD coordinate `t` is NOT a straight line in the
+        // canonical coordinate `u`. The hybrid split stores exactly such an
+        // `AtomLinearImage` and later evaluates it in the CURRENT coordinate, so
+        // computing the split before canonicalization records the linear image
+        // in a coordinate system that is about to be replaced. Run the
+        // reparameterization here, then the diagnostics, so every stored
+        // chart-dependent quantity is expressed in the canonical coordinate.
+        if !eligible.is_empty() {
+            let snapshot = self.snapshot_mutable_state();
+            let prior_flags: Vec<bool> = self
+                .atoms
+                .iter()
+                .map(|atom| atom.chart_canonicalized)
+                .collect();
+            let pre_total =
+                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+
+            let mut any_changed = false;
+            for (atom_idx, plan) in &eligible {
+                let outcome = match plan {
+                    ChartPlan::UnitSpeed(topology) => {
+                        self.canonicalize_atom_unit_speed_chart(*atom_idx, topology)
+                    }
+                    ChartPlan::TorusFlow { period } => {
+                        self.canonicalize_atom_torus_flow_chart(*atom_idx, *period)
+                    }
+                    ChartPlan::PatchFlow => self.canonicalize_atom_patch_flow_chart(*atom_idx),
+                    ChartPlan::SphereFlow => self.canonicalize_atom_sphere_flow_chart(*atom_idx),
+                };
+                match outcome {
+                    Ok(changed) => any_changed |= changed,
+                    Err(err) => {
+                        self.restore_mutable_state(&snapshot);
+                        for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
+                            atom.chart_canonicalized = *flag;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            if any_changed {
+                // Keep the canonical state only when the optimized scalar is
+                // preserved within the image-invariance tolerance (the data fit
+                // moved by at most the certified recomposition residual; the
+                // intrinsic penalty is reparameterization-invariant, transported
+                // exactly).
+                let canonical_total =
+                    self.penalized_objective_total(target, rho, analytic_penalties, 1.0);
+                let keep = match canonical_total {
+                    Ok(total) => {
+                        total.is_finite()
+                            && total
+                                <= pre_total + CHART_RECOMPOSITION_REL_TOL * (1.0 + pre_total.abs())
+                    }
+                    Err(_) => false,
+                };
+                if !keep {
+                    self.restore_mutable_state(&snapshot);
+                    for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
+                        atom.chart_canonicalized = *flag;
+                    }
+                }
+            }
+        }
+
         // #1026 EV-vs-Θ measurement: log each d = 1 atom's fitted TURNING
         // `Θ = ∫κ ds` (integrated curvature of its decoded curve). A linear SAE
         // shatters a curved feature of turning Θ into `N(ε) ≈ Θ/(2√(2ε))` rank-1
@@ -440,63 +509,6 @@ impl SaeManifoldTerm {
             }
         }
 
-        if eligible.is_empty() {
-            return Ok(());
-        }
-
-        let snapshot = self.snapshot_mutable_state();
-        let prior_flags: Vec<bool> = self
-            .atoms
-            .iter()
-            .map(|atom| atom.chart_canonicalized)
-            .collect();
-        let pre_total = self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
-
-        let mut any_changed = false;
-        for (atom_idx, plan) in &eligible {
-            let outcome = match plan {
-                ChartPlan::UnitSpeed(topology) => {
-                    self.canonicalize_atom_unit_speed_chart(*atom_idx, topology)
-                }
-                ChartPlan::TorusFlow { period } => {
-                    self.canonicalize_atom_torus_flow_chart(*atom_idx, *period)
-                }
-                ChartPlan::PatchFlow => self.canonicalize_atom_patch_flow_chart(*atom_idx),
-                ChartPlan::SphereFlow => self.canonicalize_atom_sphere_flow_chart(*atom_idx),
-            };
-            match outcome {
-                Ok(changed) => any_changed |= changed,
-                Err(err) => {
-                    self.restore_mutable_state(&snapshot);
-                    for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
-                        atom.chart_canonicalized = *flag;
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        if !any_changed {
-            return Ok(());
-        }
-
-        // Keep the canonical state only when the optimized scalar is preserved
-        // within the image-invariance tolerance (the data fit moved by at most
-        // the certified recomposition residual; the intrinsic penalty is
-        // reparameterization-invariant, transported exactly).
-        let canonical_total = self.penalized_objective_total(target, rho, analytic_penalties, 1.0);
-        let keep = match canonical_total {
-            Ok(total) => {
-                total.is_finite()
-                    && total <= pre_total + CHART_RECOMPOSITION_REL_TOL * (1.0 + pre_total.abs())
-            }
-            Err(_) => false,
-        };
-        if !keep {
-            self.restore_mutable_state(&snapshot);
-            for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
-                atom.chart_canonicalized = *flag;
-            }
-        }
         Ok(())
     }
 

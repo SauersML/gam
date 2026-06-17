@@ -3284,14 +3284,41 @@ fn sae_hybrid_split_dict<'py>(
             Some(theta) => a.set_item("fitted_turning", theta)?,
             None => a.set_item("fitted_turning", py.None())?,
         }
-        // Per-atom held-out leave-one-atom-out explained-variance contribution
+        // Per-atom IN-SAMPLE leave-one-atom-out explained-variance contribution
         // `ΔEV_k = EV(full) − EV(full∖{k})` — the EV axis of the #1026 (Θ, ΔEV)
-        // frontier. Computed during fit (target supplied) but previously not
-        // surfaced to Python; exposing it makes the discriminating measurement
-        // queryable as structured data rather than a transient log line.
+        // frontier. Computed during fit on the TRAINING reconstruction target
+        // (`per_atom_loao_explained_variance(target, rho)` in
+        // `compute_hybrid_split_report`), so it is an in-sample LOAO ΔEV, NOT a
+        // held-out generalization number (#1226). Emitted under the honest key
+        // `train_loao_delta_ev`; the legacy `held_out_delta_ev` key carried the
+        // SAME in-sample value under a misleading name and is retained only as a
+        // deprecated alias for one release so existing readers don't break.
         match verdict.held_out_delta_ev {
-            Some(dev) => a.set_item("held_out_delta_ev", dev)?,
-            None => a.set_item("held_out_delta_ev", py.None())?,
+            Some(dev) => {
+                a.set_item("train_loao_delta_ev", dev)?;
+                a.set_item("held_out_delta_ev", dev)?;
+            }
+            None => {
+                a.set_item("train_loao_delta_ev", py.None())?;
+                a.set_item("held_out_delta_ev", py.None())?;
+            }
+        }
+        // #1228 — the fitted straight sub-model `b₀ + (t − t̄)·b₁` for a slot the
+        // verdict collapsed to LINEAR. Serialized so a held-out reconstruction
+        // (`sae_manifold_predict_oos`) can decode this slot by the SAME straight
+        // image the training reconstruction used, instead of the original curved
+        // decoder — otherwise train and OOS EV would score different models.
+        // `None` for slots that kept the curved parameterization.
+        match verdict.linear_image.as_ref() {
+            Some(img) => {
+                let li = PyDict::new(py);
+                li.set_item("atom_idx", img.atom_idx)?;
+                li.set_item("t_bar", img.t_bar)?;
+                li.set_item("b0", img.b0.clone().into_pyarray(py))?;
+                li.set_item("b1", img.b1.clone().into_pyarray(py))?;
+                a.set_item("linear_image", li)?;
+            }
+            None => a.set_item("linear_image", py.None())?,
         }
         atoms.append(a)?;
     }
@@ -5736,6 +5763,7 @@ fn sae_manifold_fit_minimal<'py>(
     initial_coords = None,
     jumprelu_threshold = 0.0,
     top_k = None,
+    hybrid_linear_images = None,
 ))]
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
@@ -5759,6 +5787,14 @@ fn sae_manifold_predict_oos<'py>(
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
     jumprelu_threshold: f64,
     top_k: Option<usize>,
+    // #1228 — the trained dictionary's hybrid-collapsed straight sub-models, one
+    // per verdict-linear d=1 slot, as `(atom_idx, t_bar, b0[p], b1[p])`. Attached
+    // to the OOS term so held-out reconstruction decodes those slots by the same
+    // linear image the training reconstruction used. `None`/empty ⇒ all-curved
+    // OOS reconstruction (the prior behaviour).
+    hybrid_linear_images: Option<
+        Vec<(usize, f64, PyReadonlyArray1<'py, f64>, PyReadonlyArray1<'py, f64>)>,
+    >,
 ) -> PyResult<Py<PyDict>> {
     let x_view = x_new.as_array();
     let (n_obs, p_out) = x_view.dim();

@@ -325,6 +325,16 @@ pub struct SaeManifoldTerm {
     /// attaches each onto its [`crate::terms::sae::identifiability::FittedAtom`].
     pub(crate) atom_inner_fits:
         Option<Vec<Option<crate::terms::sae::identifiability::AtomInnerFit>>>,
+    /// #1228 — the trained dictionary's hybrid-collapsed linear images, attached
+    /// to an OOS term so held-out reconstruction decodes verdict-linear `d = 1`
+    /// slots by the SAME straight sub-model the training reconstruction used.
+    /// `None` on a fitted term (its collapse policy lives in
+    /// [`Self::hybrid_split_report`]); `Some` only on the fresh OOS term built in
+    /// `sae_manifold_predict_oos`, set from the serialized payload via
+    /// [`Self::set_hybrid_linear_images`]. Consulted by
+    /// [`Self::hybrid_linear_image_map`] so train and OOS share one collapse map.
+    pub(crate) oos_linear_images:
+        Option<Vec<crate::terms::sae::hybrid_split::AtomLinearImage>>,
 }
 
 impl Clone for SaeManifoldTerm {
@@ -348,6 +358,7 @@ impl Clone for SaeManifoldTerm {
             dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
+            oos_linear_images: self.oos_linear_images.clone(),
         }
     }
 }

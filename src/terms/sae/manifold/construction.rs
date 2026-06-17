@@ -95,6 +95,7 @@ impl SaeManifoldTerm {
             dictionary_cocollapse_reseeds: 0,
             hybrid_split_report: None,
             atom_inner_fits: None,
+            oos_linear_images: None,
         })
     }
 
@@ -1885,16 +1886,66 @@ impl SaeManifoldTerm {
     pub(crate) fn hybrid_linear_image_map(
         &self,
     ) -> std::collections::HashMap<usize, &crate::terms::sae::hybrid_split::AtomLinearImage> {
-        self.hybrid_split_report
-            .as_ref()
-            .map(|report| {
-                report
-                    .verdicts
-                    .iter()
-                    .filter_map(|v| v.linear_image.as_ref().map(|img| (img.atom_idx, img)))
-                    .collect()
-            })
-            .unwrap_or_default()
+        // A fitted term carries its collapse policy on the post-fit
+        // `hybrid_split_report`; an OOS term carries the same trained images on
+        // `oos_linear_images` (#1228). At most one is `Some` in practice, but
+        // prefer the report when both are present.
+        if let Some(report) = self.hybrid_split_report.as_ref() {
+            return report
+                .verdicts
+                .iter()
+                .filter_map(|v| v.linear_image.as_ref().map(|img| (img.atom_idx, img)))
+                .collect();
+        }
+        if let Some(images) = self.oos_linear_images.as_ref() {
+            return images.iter().map(|img| (img.atom_idx, img)).collect();
+        }
+        std::collections::HashMap::new()
+    }
+
+    /// #1228 — attach the trained dictionary's hybrid-collapsed linear images to
+    /// this (typically OOS) term so its reconstruction (`fitted` / the top-k
+    /// assembler) decodes verdict-linear `d = 1` slots by the SAME straight
+    /// sub-model the training reconstruction used, instead of the original
+    /// curved decoder. Each image's `atom_idx` must index a real slot; an image
+    /// whose channel count `p` disagrees with this term's output dim, or whose
+    /// `atom_idx` is out of range, is rejected so a stale/mismatched payload
+    /// cannot silently corrupt the reconstruction. Pass an empty slice (or never
+    /// call this) for an all-curved OOS reconstruction.
+    pub(crate) fn set_hybrid_linear_images(
+        &mut self,
+        images: Vec<crate::terms::sae::hybrid_split::AtomLinearImage>,
+    ) -> Result<(), String> {
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        for img in &images {
+            if img.atom_idx >= k_atoms {
+                return Err(format!(
+                    "set_hybrid_linear_images: atom_idx {} out of range (k_atoms={k_atoms})",
+                    img.atom_idx
+                ));
+            }
+            if img.b0.len() != p || img.b1.len() != p {
+                return Err(format!(
+                    "set_hybrid_linear_images: atom {} linear image has p=({}, {}) != output_dim {p}",
+                    img.atom_idx,
+                    img.b0.len(),
+                    img.b1.len()
+                ));
+            }
+            if self.atoms[img.atom_idx].latent_dim != 1 {
+                return Err(format!(
+                    "set_hybrid_linear_images: atom {} is not d=1; only d=1 slots collapse to a straight image",
+                    img.atom_idx
+                ));
+            }
+        }
+        self.oos_linear_images = if images.is_empty() {
+            None
+        } else {
+            Some(images)
+        };
+        Ok(())
     }
 
     /// Assemble the reconstruction `Σ_k a[i,k]·g_k(t_{ik})` from an EXPLICIT
@@ -1953,76 +2004,6 @@ impl SaeManifoldTerm {
         // Production/user-facing reconstruction: honours the #1026 hybrid-split
         // verdict (verdict-linear `d = 1` slots decode their straight sub-model).
         self.try_fitted_with_rho(None, true)
-    }
-
-    /// #1233 — the SINGLE reconstruction assembler for an **externally supplied**
-    /// per-row assignment matrix (e.g. a hard top-k projection of the fitted or
-    /// OOS assignments). Assembles `Σ_k a[i,k]·image_k(t_{ik})` honouring the
-    /// #1026 hybrid-split collapse exactly as the internal [`Self::try_fitted`]
-    /// does: a verdict-linear `d = 1` slot decodes its straight sub-model image
-    /// at this row's fitted on-atom coordinate `t`, every other slot its curved
-    /// decoded row. `assignments` is `n × k_atoms`; rows with `a[i,k] == 0`
-    /// contribute nothing (the top-k gate zeroes the unselected slots).
-    ///
-    /// This replaces the manual `term.atoms[k].fill_decoded_row` loops in the
-    /// FFI top-k recomputation, which used the curved decoder unconditionally and
-    /// so reconstructed a collapsed-linear atom from the WRONG image — train (via
-    /// `try_fitted`) and top-k reconstruction would otherwise score different
-    /// dictionaries for the same atom (#1233). Sharing the assembler also makes
-    /// the regression invariant `top_k == K reconstruction == try_fitted()` hold
-    /// even when a slot is hybrid-collapsed.
-    pub fn reconstruct_from_assignments(
-        &self,
-        assignments: ArrayView2<'_, f64>,
-        collapse: bool,
-    ) -> Result<Array2<f64>, String> {
-        let n = self.n_obs();
-        let p = self.output_dim();
-        let k_atoms = self.k_atoms();
-        if assignments.dim() != (n, k_atoms) {
-            return Err(format!(
-                "SaeManifoldTerm::reconstruct_from_assignments: assignments {:?} != ({n}, {k_atoms})",
-                assignments.dim()
-            ));
-        }
-        let linear_images: std::collections::HashMap<
-            usize,
-            &crate::terms::sae::hybrid_split::AtomLinearImage,
-        > = if collapse {
-            self.hybrid_split_report
-                .as_ref()
-                .map(|report| {
-                    report
-                        .verdicts
-                        .iter()
-                        .filter_map(|v| v.linear_image.as_ref().map(|img| (img.atom_idx, img)))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            std::collections::HashMap::new()
-        };
-        let mut out = Array2::<f64>::zeros((n, p));
-        let mut g_buf = vec![0.0_f64; p];
-        for row in 0..n {
-            for atom_idx in 0..k_atoms {
-                let a_k = assignments[[row, atom_idx]];
-                if a_k == 0.0 {
-                    continue;
-                }
-                if let Some(image) = linear_images.get(&atom_idx) {
-                    let t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                    image.fill_row(t, &mut g_buf);
-                } else {
-                    self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
-                }
-                let mut out_row = out.row_mut(row);
-                for out_col in 0..p {
-                    out_row[out_col] += a_k * g_buf[out_col];
-                }
-            }
-        }
-        Ok(out)
     }
 
     pub(crate) fn try_fitted_for_rho(&self, rho: &SaeManifoldRho) -> Result<Array2<f64>, String> {

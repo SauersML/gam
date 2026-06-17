@@ -9905,67 +9905,102 @@ mod inner_contract_probe_tests {
         eprintln!(
             "DIAG1154: n_holdout={n_holdout} target_norm_bound={norm_bound:.4e} S_B={s_b:.4e}"
         );
-        // Reconstruct each chart's L decomposition once.
-        let resolution = crate::terms::sae::encode::AtlasConfig::default().grid_resolution;
-        let centers = crate::terms::sae::encode::chart_center_grid(atom0, resolution);
-        let nominal_radius = crate::terms::sae::encode::chart_nominal_radius(atom0, resolution);
-        let mut certified = 0usize;
-        for hrow in 0..n_holdout {
-            let x = heldout.row(hrow);
-            // Nearest chart center (same routing as production).
-            let Some((chart_idx, _)) = crate::terms::sae::encode::nearest_chart(
-                &atlas.atoms[0],
-                x,
-                atom0,
-                evaluator.as_ref(),
-            ) else {
-                eprintln!("DIAG1154 row {hrow}: no chart");
-                continue;
+        let ridge = AtlasConfig::default().ridge;
+        // Sweep grid resolution AND start choice (chart center vs amortized t̂),
+        // and a TIGHTENED chart-local residual bound r_local = ||r(t0)|| + m_jac·R
+        // vs the global r_norm_bound. This localizes the minimal principled change.
+        for resolution in [16usize, 32, 64, 128] {
+            let cfg = AtlasConfig {
+                grid_resolution: resolution,
+                ..AtlasConfig::default()
             };
-            let center = centers.row(chart_idx).to_owned();
-            let region =
-                crate::terms::sae::encode::chart_region(atom0, center.clone(), nominal_radius);
-            let sups = family_jet_sups(atom0, &region).unwrap();
-            let recon_sups = reconstruction_jet_sups(atom0, sups);
-            let lipschitz = hessian_lipschitz_constant(recon_sups, 1.0, norm_bound, 0.0);
-            // Actual residual at the chart center start (amplitude 1).
-            let center_row = center.clone().into_shape_with_order((1, 1)).unwrap();
-            let (phi_c, _j) = evaluator.evaluate(center_row.view()).unwrap();
-            let recon_c = phi_c.dot(&decoder); // (1 × p)
-            let r_actual = (&recon_c.row(0) - &x).dot(&(&recon_c.row(0) - &x)).sqrt();
-            // L terms.
-            let m_jac = recon_sups.jacobian;
-            let m_hess = recon_sups.hessian;
-            let m_third = recon_sups.third;
-            let recon_value = recon_sups.value;
-            let r_norm_bound = norm_bound + recon_value;
-            let term_gn = 3.0 * m_jac * m_hess;
-            let term_res = r_norm_bound * m_third;
-            let (cert, _delta) = row_certificate(
-                atom0,
-                evaluator.as_ref(),
-                center.view(),
-                x,
-                1.0,
-                lipschitz,
-                crate::terms::sae::encode::AtlasConfig::default().ridge,
-            )
-            .unwrap();
-            if cert.certified() {
-                certified += 1;
+            let res_atlas = EncodeAtlas::build(&atoms, &[1.0], norm_bound, cfg).expect("atlas");
+            let centers = crate::terms::sae::encode::chart_center_grid(atom0, resolution);
+            let nominal_radius =
+                crate::terms::sae::encode::chart_nominal_radius(atom0, resolution);
+            let mut cert_center_global = 0usize;
+            let mut cert_center_local = 0usize;
+            let mut cert_that_global = 0usize;
+            let mut cert_that_local = 0usize;
+            let mut worst_h_center_local = 0.0_f64;
+            let mut worst_h_that_local = 0.0_f64;
+            for hrow in 0..n_holdout {
+                let x = heldout.row(hrow);
+                let Some((chart_idx, _)) = crate::terms::sae::encode::nearest_chart(
+                    &res_atlas.atoms[0],
+                    x,
+                    atom0,
+                    evaluator.as_ref(),
+                ) else {
+                    continue;
+                };
+                let chart = &res_atlas.atoms[0].charts[chart_idx];
+                let center = centers.row(chart_idx).to_owned();
+                let region =
+                    crate::terms::sae::encode::chart_region(atom0, center.clone(), nominal_radius);
+                let sups = family_jet_sups(atom0, &region).unwrap();
+                let recon_sups = reconstruction_jet_sups(atom0, sups);
+                let m_jac = recon_sups.jacobian; // amplitude 1.
+                let m_third = recon_sups.third;
+                let l_fixed = 3.0 * m_jac * recon_sups.hessian; // residual-free part.
+                let l_global =
+                    hessian_lipschitz_constant(recon_sups, 1.0, norm_bound, 0.0);
+                // Residual at a start, and the chart-local L derived from it:
+                // L_local = l_fixed + (||r(t0)|| + m_jac·R)·m_third.
+                let r_at = |t: &Array1<f64>| -> f64 {
+                    let tr = t.clone().into_shape_with_order((1, 1)).unwrap();
+                    let (phi_t, _j) = evaluator.evaluate(tr.view()).unwrap();
+                    let recon_t = phi_t.dot(&decoder);
+                    (&recon_t.row(0) - &x).dot(&(&recon_t.row(0) - &x)).sqrt()
+                };
+                let radius = region.radius;
+                // (a) chart-center start.
+                let r_c = r_at(&center);
+                let l_center_local = l_fixed + (r_c + m_jac * radius) * m_third;
+                let (cg, _d) = row_certificate(
+                    atom0, evaluator.as_ref(), center.view(), x, 1.0, l_global, ridge,
+                )
+                .unwrap();
+                let (cl, _d) = row_certificate(
+                    atom0, evaluator.as_ref(), center.view(), x, 1.0, l_center_local, ridge,
+                )
+                .unwrap();
+                if cg.certified() {
+                    cert_center_global += 1;
+                }
+                if cl.certified() {
+                    cert_center_local += 1;
+                } else {
+                    worst_h_center_local = worst_h_center_local.max(cl.h);
+                }
+                // (b) amortized predicted start t̂.
+                if let Some(t_hat) = amortized_warm_start(chart, x, 1.0) {
+                    let r_h = r_at(&t_hat);
+                    let l_that_local = l_fixed + (r_h + m_jac * radius) * m_third;
+                    let (tg, _d) = row_certificate(
+                        atom0, evaluator.as_ref(), t_hat.view(), x, 1.0, l_global, ridge,
+                    )
+                    .unwrap();
+                    let (tl, _d) = row_certificate(
+                        atom0, evaluator.as_ref(), t_hat.view(), x, 1.0, l_that_local, ridge,
+                    )
+                    .unwrap();
+                    if tg.certified() {
+                        cert_that_global += 1;
+                    }
+                    if tl.certified() {
+                        cert_that_local += 1;
+                    } else {
+                        worst_h_that_local = worst_h_that_local.max(tl.h);
+                    }
+                }
             }
             eprintln!(
-                "DIAG1154 row {hrow}: chart={chart_idx} center={:.4} L={lipschitz:.3e} \
-                 [term_GN={term_gn:.3e} term_res={term_res:.3e}] r_norm_bound={r_norm_bound:.3e} \
-                 r_actual_center={r_actual:.3e} | beta={:.3e} eta={:.3e} h={:.3e} cert={}",
-                center[0],
-                cert.beta,
-                cert.eta,
-                cert.h,
-                cert.certified(),
+                "DIAG1154 res={resolution}: center[global={cert_center_global} local={cert_center_local} \
+                 worst_h_local={worst_h_center_local:.3e}] | t_hat[global={cert_that_global} \
+                 local={cert_that_local} worst_h_local={worst_h_that_local:.3e}] / {n_holdout}"
             );
         }
-        eprintln!("DIAG1154 SUMMARY: certified={certified}/{n_holdout}");
     }
 
     /// #1154 item 3 — the JOINTLY co-trained encoder recovers the planted

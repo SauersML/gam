@@ -52,6 +52,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use crate::linalg::faer_ndarray::FaerEigh;
 use crate::solver::evidence::{
     HybridAtomCandidate, HybridAtomChoice, HybridSplitSelection, select_hybrid_split,
 };
@@ -68,6 +69,90 @@ use crate::terms::sae::manifold::SaeManifoldAtom;
 /// their shared design — no factor cache or HVP callback to assemble.
 fn reduced_laplace_nle(residual_objective: f64, log_det_h: f64) -> f64 {
     residual_objective + 0.5 * log_det_h
+}
+
+/// Rank-aware `log|ΦᵀWΦ|_+` of the curved atom's weighted design Gram over its
+/// `M` decoder basis columns, with per-row weight `wᵢ = a_k²` (the same
+/// assignment-mass design weight the linear arm uses), summed over the
+/// eigenvalues above a relative spectral floor (#1223). This is the genuine
+/// weighted-design determinant the linear arm already reports — `log|XᵀWX|` —
+/// assembled for the curved basis so the two arms' Laplace complexity prices are
+/// computed on the SAME footing instead of pricing the curved arm with a
+/// parameter-count proxy `M·log(Σw)`.
+///
+/// Mirrors the linear arm exactly in what it does NOT include: no smoothing-
+/// penalty `λS` normalizer (the linear arm's Gram is the bare data Gram
+/// `diag(w_sum, s_tt)` too), so the comparison stays symmetric. The Gram is the
+/// design's outer Gram over its basis columns; it is identical across the `p`
+/// output channels (every channel shares the design `Φ`), so the per-channel
+/// `log|G|_+` is multiplied by `p` — matching the linear arm's `p·(…)` form.
+///
+/// `phi` is the curved design `Φ(t)` evaluated on the atom's assigned rows
+/// (`n × M`); `assign` is the per-row assignment mass `a_k` (NOT squared).
+/// Returns `None` when `Φ` is missing rows, the Gram is non-finite, or it has no
+/// positive eigenvalues (a fully rank-deficient design carries no determinant);
+/// the caller then falls back to the parameter-count proxy rather than fabricate
+/// a determinant.
+fn curved_design_gram_logdet(
+    phi: ArrayView2<'_, f64>,
+    assign: ArrayView1<'_, f64>,
+    p: usize,
+) -> Option<f64> {
+    let n = phi.nrows();
+    let m = phi.ncols();
+    if m == 0 || assign.len() != n || n == 0 {
+        return None;
+    }
+    // G = Φᵀ diag(a²) Φ  (M×M, symmetric PSD).
+    let mut gram = Array2::<f64>::zeros((m, m));
+    for i in 0..n {
+        let w = assign[i] * assign[i];
+        if !(w.is_finite() && w >= 0.0) {
+            return None;
+        }
+        if w == 0.0 {
+            continue;
+        }
+        let row = phi.row(i);
+        for a in 0..m {
+            let wa = w * row[a];
+            for b in a..m {
+                gram[[a, b]] += wa * row[b];
+            }
+        }
+    }
+    // Symmetrize the lower triangle (we only filled the upper).
+    for a in 0..m {
+        for b in 0..a {
+            gram[[a, b]] = gram[[b, a]];
+        }
+    }
+    if gram.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let (vals, _vecs) = gram.eigh(faer::Side::Lower).ok()?;
+    // Rank-aware log-determinant: sum log of eigenvalues above a relative floor
+    // tied to the largest eigenvalue, dropping the numerically-null directions
+    // (the curved design's null space, analogous to the linear arm's full-rank
+    // 2-D Gram). A design with no positive eigenvalue carries no determinant.
+    let lambda_max = vals.iter().cloned().fold(0.0_f64, f64::max);
+    if !(lambda_max > 0.0 && lambda_max.is_finite()) {
+        return None;
+    }
+    let floor = lambda_max * 1e-12;
+    let mut log_det = 0.0_f64;
+    let mut rank = 0usize;
+    for &lambda in vals.iter() {
+        if lambda > floor {
+            log_det += lambda.ln();
+            rank += 1;
+        }
+    }
+    if rank == 0 || !log_det.is_finite() {
+        return None;
+    }
+    // The design Gram is shared across the p output channels.
+    Some((p as f64) * log_det)
 }
 
 /// The fitted straight sub-model `γ̃(t) = b₀ + (t − t̄)·b₁` of one `d = 1` atom:
@@ -183,6 +268,7 @@ fn build_atom_candidates(
     decoded: ArrayView2<'_, f64>,
     target_resid: ArrayView2<'_, f64>,
     curved_num_params: usize,
+    curved_phi: Option<ArrayView2<'_, f64>>,
     fitted_turning: Option<f64>,
 ) -> Option<(
     HybridAtomCandidate,
@@ -302,18 +388,29 @@ fn build_atom_candidates(
     // wide, heavily-massed coordinate spread is better-determined than one through
     // a tiny spread, and the Laplace evidence must reflect that (#1203).
     //
-    // The curved arm's genuine Laplace determinant over its `M·p` decoder
-    // coefficients is not assembled in this post-fit path (it would need the
-    // atom's penalized smoothing Hessian); we price its complexity with the
-    // parameter-count proxy `curved_num_params · log(w_sum)`. The data-fit terms,
-    // which carry the actual evidence comparison, are now BOTH measured on the
-    // common response residual — the asymmetry is confined to the complexity
-    // (logdet) price, not the likelihood.
+    // The curved arm's Laplace determinant is now the genuine weighted-design
+    // Gram log-determinant `p · log|ΦᵀWΦ|_+` (#1223): the SAME quantity the
+    // linear arm reports (`p·(log w_sum + log s_tt) = p·log|XᵀWX|`), assembled
+    // from the curved basis `Φ` on the atom's assigned rows under the same
+    // assignment-mass design weight `wᵢ = a_k²`. Both arms omit the smoothing
+    // `λS` normalizer, so the complexity price is computed on a symmetric
+    // footing — no parameter-count proxy. Only when `Φ` is unavailable (the
+    // caller could not evaluate the basis) or its Gram is fully rank-deficient do
+    // we fall back to the historical `curved_num_params · log(w_sum)` proxy, so
+    // the comparison degrades gracefully rather than fabricating a determinant.
     if !(w_sum > 0.0 && w_sum.is_finite() && s_tt.is_finite()) {
         return None;
     }
     let linear_log_det_h = (p as f64) * (w_sum.ln() + s_tt.ln());
-    let curved_log_det_h = (curved_num_params as f64) * w_sum.ln();
+    let curved_log_det_h = curved_phi
+        .and_then(|phi| {
+            if phi.nrows() == n {
+                curved_design_gram_logdet(phi, assign, p)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| (curved_num_params as f64) * w_sum.ln());
 
     // Reduced Laplace NLE `residual_objective + ½ log|H|`. Both omit an explicit
     // smoothing-penalty logdet (the intrinsic smoothness penalty is
@@ -393,12 +490,30 @@ where
             .ok()
             .flatten()
         });
+        // Evaluate the curved design `Φ(t)` on this atom's assigned rows so the
+        // curved arm's Laplace complexity is the real weighted-design Gram
+        // log-determinant rather than a parameter-count proxy (#1223). A `d = 1`
+        // atom's coordinate column is presented as an `n × 1` design input. If
+        // the evaluator is absent or refuses, `curved_phi` stays `None` and
+        // `build_atom_candidates` falls back to the proxy.
+        let coords_col = coords
+            .view()
+            .into_shape((coords.len(), 1))
+            .ok()
+            .map(|v| v.to_owned());
+        let curved_phi = match (atom.basis_evaluator.as_ref(), coords_col.as_ref()) {
+            (Some(evaluator), Some(col)) => {
+                evaluator.evaluate(col.view()).ok().map(|(phi, _jet)| phi)
+            }
+            _ => None,
+        };
         let Some((linear, curved, (t_bar, b0, b1))) = build_atom_candidates(
             coords.view(),
             assign.view(),
             decoded.view(),
             target_resid.view(),
             curved_num_params,
+            curved_phi.as_ref().map(|phi| phi.view()),
             fitted_turning,
         ) else {
             continue;
@@ -495,6 +610,7 @@ mod tests {
             data.view(),
             // a generous curved parameter price (M·p)
             10,
+            None,
             Some(0.0),
         )
         .expect("straight residual yields a candidate pair");
@@ -538,6 +654,7 @@ mod tests {
             decoded.view(),
             data.view(),
             5,
+            None,
             Some(2.0 * PI),
         )
         .expect("turning residual yields a candidate pair");
@@ -590,6 +707,7 @@ mod tests {
             data.view(),
             // a real curved Θ above the floor so the dominance floor does not fire
             6,
+            None,
             Some(1.0),
         )
         .expect("candidate pair");
@@ -638,6 +756,7 @@ mod tests {
                 decoded.view(),
                 data.view(),
                 10,
+                None,
                 Some(0.0),
             )
             .expect("straight residual yields a pair");
@@ -668,6 +787,71 @@ mod tests {
         );
     }
 
+    /// #1223 — the curved arm's Laplace complexity is the REAL weighted-design
+    /// Gram log-determinant `p·log|ΦᵀWΦ|_+`, not a parameter-count proxy. Build a
+    /// curved design whose columns are the constant and the centered coordinate
+    /// (a 2-column basis), so `ΦᵀWΦ = diag(w_sum, s_tt)` exactly matches the
+    /// linear arm's data Gram, and assert `curved_design_gram_logdet` returns
+    /// `p·(log w_sum + log s_tt)` — the same determinant the linear arm reports
+    /// on the same design weight. A proxy `M·log(w_sum)` would instead omit the
+    /// `log(s_tt)` spread term, so this pins the genuine determinant.
+    #[test]
+    fn curved_gram_logdet_is_real_weighted_design_determinant() {
+        let n = 40;
+        let p = 3usize;
+        let coords =
+            Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
+        let assign = Array1::<f64>::from_iter((0..n).map(|i| 0.5 + 0.01 * (i as f64)));
+
+        // Mass-weighted coordinate mean and spread under wᵢ = a_k².
+        let mut w_sum = 0.0;
+        let mut t_bar = 0.0;
+        for i in 0..n {
+            let w = assign[i] * assign[i];
+            w_sum += w;
+            t_bar += w * coords[i];
+        }
+        t_bar /= w_sum;
+        let mut s_tt = 0.0;
+        for i in 0..n {
+            let dt = coords[i] - t_bar;
+            s_tt += assign[i] * assign[i] * dt * dt;
+        }
+
+        // Curved design columns: [1, (t − t̄)]. Its weighted Gram is exactly
+        // diag(w_sum, s_tt) (the cross term Σ w·(t−t̄) vanishes by construction),
+        // so log|ΦᵀWΦ| = log(w_sum) + log(s_tt).
+        let mut phi = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            phi[[i, 0]] = 1.0;
+            phi[[i, 1]] = coords[i] - t_bar;
+        }
+        let got = curved_design_gram_logdet(phi.view(), assign.view(), p)
+            .expect("non-degenerate curved design has a determinant");
+        let want = (p as f64) * (w_sum.ln() + s_tt.ln());
+        assert!(
+            (got - want).abs() < 1e-9,
+            "curved Gram logdet must be the real p·log|ΦᵀWΦ| = {want}, got {got}"
+        );
+
+        // A rank-deficient design (a duplicated column) drops the null direction:
+        // its determinant equals that of the single retained constant column,
+        // p·log(w_sum), NOT a 2-column proxy.
+        let mut phi_dup = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            phi_dup[[i, 0]] = 1.0;
+            phi_dup[[i, 1]] = 1.0;
+        }
+        let got_dup = curved_design_gram_logdet(phi_dup.view(), assign.view(), p)
+            .expect("rank-1 design still has a positive determinant");
+        let want_dup = (p as f64) * (2.0 * w_sum).ln();
+        assert!(
+            (got_dup - want_dup).abs() < 1e-9,
+            "rank-deficient curved Gram must report only its positive direction \
+             (p·log(2·w_sum) = {want_dup}), got {got_dup}"
+        );
+    }
+
     /// A degenerate (single-point-mass) coordinate has no slope direction and is
     /// refused rather than adjudicated on a fabricated deviance.
     #[test]
@@ -684,6 +868,7 @@ mod tests {
                 decoded.view(),
                 data.view(),
                 6,
+                None,
                 Some(0.0)
             )
             .is_none(),
