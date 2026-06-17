@@ -1240,7 +1240,7 @@ impl FreePatchFlowBasis {
         }
         let mut exps = Vec::new();
         for total in 1..=PATCH_FLOW_MAX_DEGREE {
-            for a in 0..=total {
+            for a in (0..=total).rev() {
                 let b = total - a;
                 exps.push((a, b));
             }
@@ -2393,7 +2393,13 @@ pub fn d1_atom_fitted_turning(
         }
         // Wedge norm² = ‖γ'‖²‖γ''‖² − ⟨γ',γ''⟩² (Lagrange identity); clamp tiny
         // negative round-off to 0 before the sqrt.
-        let wedge_sq = (n1 * n2 - dot * dot).max(0.0);
+        let raw_wedge_sq = n1 * n2 - dot * dot;
+        let roundoff_floor = 64.0 * f64::EPSILON * (n1 * n2).abs().max(dot.abs() * dot.abs());
+        let wedge_sq = if raw_wedge_sq <= roundoff_floor {
+            0.0
+        } else {
+            raw_wedge_sq
+        };
         integrand[node] = wedge_sq.sqrt() / n1;
         if !integrand[node].is_finite() {
             return Ok(None);
