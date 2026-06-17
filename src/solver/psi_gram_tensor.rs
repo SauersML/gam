@@ -298,31 +298,6 @@ impl PsiGramTensor {
             }
         }
         let tail_start = m - (m / 4).max(1);
-        // #1033 (C): the design columns X(ψ)=matern(r·e^{−ψ}) are ENTIRE in ψ, so
-        // the Chebyshev coefficients decay geometrically; the node count needed to
-        // push the tail below PSI_GRAM_CERT_RTOL is therefore bounded and DERIVABLE
-        // from the per-coefficient decay rate. Under DIAG1033 we surface the
-        // relative magnitude of EVERY coefficient slab (max over entries / column
-        // scale) so the required m can be extrapolated from the geometric rate
-        // rather than guessed.
-        if std::env::var("DIAG1033").is_ok() {
-            let mut rels = Vec::with_capacity(m);
-            for slab in &coeff_slabs {
-                let mut r = 0.0_f64;
-                for (j, &scale) in col_scale.iter().enumerate() {
-                    let s = scale.max(1e-300);
-                    for i in 0..n {
-                        r = r.max(slab[[i, j]].abs() / s);
-                    }
-                }
-                rels.push(r);
-            }
-            let printed: Vec<String> = rels.iter().map(|v| format!("{v:.2e}")).collect();
-            eprintln!(
-                "[DIAG1033] m={m} coeff_rel_decay=[{}] tail_start={tail_start} rtol={PSI_GRAM_CERT_RTOL:.0e}",
-                printed.join(",")
-            );
-        }
         for slab in coeff_slabs.iter().skip(tail_start) {
             for (j, &scale) in col_scale.iter().enumerate() {
                 let bound = PSI_GRAM_CERT_RTOL * scale.max(1e-300);
