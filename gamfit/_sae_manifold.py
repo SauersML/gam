@@ -947,7 +947,11 @@ class ManifoldSAE:
     # (one entry per eligible d=1 atom, each ``{"atom": str, "kept_curved": bool,
     # "parameterization": str, "negative_log_evidence": float, "num_parameters":
     # int, "curved_evidence_margin": float, "fitted_turning": float | None,
-    # "held_out_delta_ev": float | None}``). This is a POST-HOC curve-simplification
+    # "train_loao_delta_ev": float | None}``). NOTE (#1226): ``train_loao_delta_ev``
+    # is the per-atom IN-SAMPLE leave-one-atom-out ΔEV (computed on the training
+    # matrix during the fit), NOT a held-out generalization number; the legacy
+    # ``held_out_delta_ev`` key carries the SAME in-sample value and is retained
+    # only as a deprecated alias. This is a POST-HOC curve-simplification
     # diagnostic (#1202), NOT a data-level dominance guarantee. Previously the FFI
     # emitted this block but the public class dropped it, forcing callers to
     # monkey-patch ``from_payload`` (see examples/structural_truth_ledger.py);

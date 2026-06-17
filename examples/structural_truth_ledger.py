@@ -7,10 +7,13 @@ which method choices are actually GOOD. Five falsifiable tests, each yielding a
 number/verdict; aggregated into one ledger.
 
   1. EV-vs-Theta frontier (the discriminating measurement): per fitted atom,
-     (fitted turning Theta = integral kappa ds, held-out Delta-EV). Classify
-     GENUINE-CURVED (high Theta + earns EV) vs LINEAR (Theta~0 + earns EV) vs
-     OVERFIT-CURVATURE (high Theta + ~0 EV). Report the fraction of held-out EV
-     attributable to genuinely-curved atoms.
+     (fitted turning Theta = integral kappa ds, in-sample LOAO Delta-EV). The
+     per-atom Delta-EV is an IN-SAMPLE leave-one-atom-out drop on the TRAINING
+     matrix (#1226), not a held-out number — only the dictionary-level ev_out is
+     measured on the held-out split. Classify GENUINE-CURVED (high Theta + earns
+     EV) vs LINEAR (Theta~0 + earns EV) vs OVERFIT-CURVATURE (high Theta + ~0
+     EV). Report the fraction of in-sample LOAO Delta-EV attributable to
+     genuinely-curved atoms.
   2. EV-vs-K curve shape: K in {1,2,4,8,16,32}, curved vs linear dictionaries,
      held-out EV each. FLATTEN-early (structured minority thesis) vs KEEP-CLIMBING
      (pervasive structure, parity live).
@@ -18,7 +21,7 @@ number/verdict; aggregated into one ledger.
      (NLE_linear - NLE_curved) from solver/evidence.rs select_hybrid_atom. Curved
      is TRUE only when it WINS on evidence, not merely fits better.
   4. Seed-stability: re-fit >=3 seeds; a structure is TRUE only if it reappears
-     (similar Theta, similar held-out EV) across seeds.
+     (similar Theta, similar in-sample LOAO Delta-EV) across seeds.
   5. Two-directional null test: (a) planted circle must recover; (b) matched
      ISOTROPIC NOISE (same dim/scale, no structure) must NOT hallucinate curved
      structure. Recover real AND reject noise = genuine truth-discrimination.
@@ -38,9 +41,10 @@ import numpy as np
 
 # --------------------------------------------------------------------------
 # #1204: ManifoldSAE now surfaces the `hybrid_split` report as a public field,
-# so the per-atom verdicts (fitted_turning Theta, held_out_delta_ev,
-# curved_evidence_margin) are readable directly off the model — no monkey-patch
-# of from_payload needed any more. Kept as a no-op for call-site compatibility.
+# so the per-atom verdicts (fitted_turning Theta, train_loao_delta_ev — the
+# honest in-sample LOAO key, #1226 — curved_evidence_margin) are readable
+# directly off the model — no monkey-patch of from_payload needed any more.
+# Kept as a no-op for call-site compatibility.
 # --------------------------------------------------------------------------
 def _install_payload_capture():
     return None
@@ -89,7 +93,7 @@ def _hybrid_atoms(model):
 # Test 1 + 3: EV-vs-Theta frontier + evidence adjudication (one fit).
 # --------------------------------------------------------------------------
 THETA_HI = 0.5  # rad; below this an atom is a linear-tail direction wearing a curve.
-EV_FLOOR = 1e-3  # held-out Delta-EV below which an atom earns ~nothing.
+EV_FLOOR = 1e-3  # in-sample LOAO Delta-EV below which an atom earns ~nothing.
 
 
 def classify_atom(theta, dev, margin):
@@ -114,7 +118,14 @@ def test_ev_theta(z_tr, z_te, k, seed, n_iter):
     rows = []
     for a in atoms:
         theta = a.get("fitted_turning")
-        dev = a.get("held_out_delta_ev")
+        # #1226 — this is the IN-SAMPLE leave-one-atom-out ΔEV (computed on the
+        # training matrix during the fit), surfaced under the honest key
+        # ``train_loao_delta_ev``. The legacy ``held_out_delta_ev`` key carried
+        # the SAME in-sample number under a misleading name; read the honest key
+        # and fall back to the deprecated alias only for older payloads.
+        dev = a.get("train_loao_delta_ev")
+        if dev is None:
+            dev = a.get("held_out_delta_ev")
         margin = a.get("curved_evidence_margin")
         rows.append({
             "atom": a.get("atom"),
@@ -124,7 +135,8 @@ def test_ev_theta(z_tr, z_te, k, seed, n_iter):
             "kept_curved": a.get("kept_curved"),
             "class": classify_atom(theta, dev, margin),
         })
-    # Fraction of (positive) held-out EV attributable to genuinely-curved atoms.
+    # Fraction of (positive) in-sample LOAO Delta-EV attributable to
+    # genuinely-curved atoms (#1226: per-atom Delta-EV is in-sample, not held-out).
     pos = [r for r in rows if r["delta_ev"] is not None and r["delta_ev"] > 0]
     tot_dev = sum(r["delta_ev"] for r in pos) or float("nan")
     curved_dev = sum(r["delta_ev"] for r in pos if r["class"] == "GENUINE_CURVED")
@@ -312,8 +324,8 @@ def main():
     print(f"  atoms adjudicated={t1['n_atoms_adjudicated']}  "
           f"genuine_curved={t1['n_genuine_curved']}  linear={t1['n_linear']}  "
           f"overfit={t1['n_overfit']}  curved_wins_evidence={t1['n_curved_wins_evidence']}")
-    print(f"  held-out EV from genuine-curved atoms: {t1['ev_from_genuine_curved']}")
-    print(f"  held-out EV from linear atoms:         {t1['ev_from_linear']}")
+    print(f"  in-sample LOAO ΔEV from genuine-curved atoms: {t1['ev_from_genuine_curved']}")
+    print(f"  in-sample LOAO ΔEV from linear atoms:         {t1['ev_from_linear']}")
     ledger["T1_ev_vs_theta"] = t1
 
     print(f"\n[T4] seed-stability (K={args.theta_k}, seeds={seeds})")
