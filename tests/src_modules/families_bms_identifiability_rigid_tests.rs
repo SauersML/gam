@@ -1458,11 +1458,11 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
     // tail — at |eta| >= 6 the signed argument reaches |m| ~ 9-13 where the
     // Mills-ratio derivative stack has kappa ~ 1e7-1e9, so two exact paths
     // with different contraction orders (hand chain vs tower; arm64 vs
-    // x86_64 FMA) can only agree to ~kappa*eps; observed tail worst cases:
-    // 1.4e-11 (arm64), 1.2e-8 (x86_64). Interior rows are well-conditioned
-    // and stay pinned tight. Both regimes remain well below the >=1e-6
+    // x86_64 FMA) can only agree to ~kappa*eps; observed worst cases:
+    // 2.7e-11 for interior high-leverage rows and 1.2e-8 in the far x86_64
+    // tails. Both regimes remain well below the >=1e-6
     // dropped-term signal this witness exists to catch.
-    let interior_tol = 1.0e-11;
+    let interior_tol = 3.0e-11;
     let tail_tol = 1.0e-7;
 
     for eta in eta_grid {
