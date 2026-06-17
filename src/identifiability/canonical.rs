@@ -852,11 +852,94 @@ fn canonicalize_for_identifiability_inner(
         let k = if use_channel_aware { max_n_outputs } else { 1 };
         let nk = n_rows * k;
 
-        // Build J_pre_T: (nk, p_total_raw) by row-stacking per-block Jacobians.
-        let mut j_pre = Array2::<f64>::zeros((nk, p_total_raw));
+        // A `stacked_design` block owns its effective geometry through a
+        // `k_s·n`-row `[entry; exit; deriv]·β` operator whose TRUE column span
+        // lives across all channels — not in the `n`-row `design` that
+        // `effective_jacobian_at` returns for it. The MAP-uniqueness check must
+        // see that full span, or a stacked column collinear with another block's
+        // covariate in the first `n` rows (e.g. a monotone time column vs an
+        // `age` covariate that are affine-equal on the observation grid) is
+        // falsely flagged as a flat null direction (gam#1197). Mirror the joint
+        // audit's geometry exactly: size `j_pre` to the tallest stacked
+        // operator, pack stacked blocks at their native `k_s·n` rows, and
+        // replicate plain per-observation blocks across the stacked operator's
+        // OBSERVATION bands (the bands carrying an ~constant intercept column;
+        // the derivative band annihilates constants and is excluded), so a plain
+        // block's intercept aligns with the stacked additive constant while a
+        // genuine covariate stays distinguished by the derivative band.
+        let stacked_rows = specs
+            .iter()
+            .filter_map(|s| s.stacked_design.as_ref().map(|d| d.nrows()))
+            .max()
+            .unwrap_or(0);
+        let r_map = nk.max(stacked_rows);
+        // Dense stacked designs (k_s·n × p_b) for the observation-band detection
+        // and stacked packing.
+        let stacked_dense: Vec<Option<Array2<f64>>> = specs
+            .iter()
+            .map(|s| {
+                s.stacked_design.as_ref().and_then(|d| {
+                    d.try_to_dense_arc("canonicalize_rank_check stacked")
+                        .ok()
+                        .map(|a| a.as_ref().clone())
+                })
+            })
+            .collect();
+        let k_bands = (r_map / n_rows).max(1);
+        let observation_bands: Vec<usize> = if k_bands <= 1 {
+            vec![0]
+        } else if let Some(stacked_ref) = stacked_dense
+            .iter()
+            .flatten()
+            .max_by_key(|d| d.nrows())
+        {
+            let mut bands: Vec<usize> = (0..k_bands)
+                .filter(|&b| {
+                    let lo = b * n_rows;
+                    let hi = ((b + 1) * n_rows).min(stacked_ref.nrows());
+                    if hi <= lo {
+                        return false;
+                    }
+                    // Observation band iff the INTERCEPT column (column 0, the
+                    // additive constant) is ~constant non-zero there; a pure
+                    // derivative band maps the intercept coefficient to ~0 and is
+                    // excluded (see the matching audit.rs comment, gam#1197).
+                    if stacked_ref.ncols() == 0 {
+                        return false;
+                    }
+                    let first = stacked_ref[[lo, 0]];
+                    first.abs() > 1e-12
+                        && (lo..hi).all(|r| {
+                            (stacked_ref[[r, 0]] - first).abs() <= 1e-9 * first.abs().max(1.0)
+                        })
+                })
+                .collect();
+            if bands.is_empty() {
+                bands.push(0);
+            }
+            bands
+        } else {
+            vec![0]
+        };
+
+        // Build J_pre_T: (r_map, p_total_raw) by row-stacking per-block Jacobians.
+        let mut j_pre = Array2::<f64>::zeros((r_map, p_total_raw));
         let mut col_off = 0usize;
-        for spec in specs.iter() {
+        for (idx, spec) in specs.iter().enumerate() {
             let p_b = spec.design.ncols();
+            // Stacked-geometry blocks: pack the full k_s·n-row stacked operator
+            // directly (rows 0..stacked.nrows()), so their column span carries the
+            // entry/exit/deriv channels the n-row flat Jacobian omits.
+            if let Some(dense) = stacked_dense[idx].as_ref() {
+                let br = dense.nrows().min(r_map);
+                for i in 0..br {
+                    for j in 0..p_b.min(dense.ncols()) {
+                        j_pre[[i, col_off + j]] = dense[[i, j]];
+                    }
+                }
+                col_off += p_b;
+                continue;
+            }
             let zeros = vec![0.0f64; p_b];
             let state = FamilyLinearizationState {
                 beta: &zeros,
@@ -867,35 +950,56 @@ fn canonicalize_for_identifiability_inner(
             match spec.effective_jacobian_at("canonicalize_rank_check", &state) {
                 Ok(j_b) => {
                     // j_b is channel-major (k_b·n_rows, p_b): row `r·n_rows + i`
-                    // carries observation `i`'s channel-`r` row Jacobian
-                    // (the layout produced by every BlockEffectiveJacobian
-                    // impl — see `BlockJacobianAsRowOp`).  j_pre is built in
-                    // the audit-compiler's interleaved layout (row `i*k + r`
-                    // for observation `i`, channel `r`), so this is a
-                    // channel-major → interleaved transpose.
+                    // carries observation `i`'s channel-`r` row Jacobian. For a
+                    // single-channel plain block (k_b == 1) replicate it across
+                    // the observation bands so its intercept aligns with the
+                    // stacked additive constant (gam#1197); a genuinely multi-
+                    // channel block keeps its own channel-major rows.
                     let k_b = j_b.nrows() / n_rows;
-                    let r_max = k_b.min(k);
-                    for r in 0..r_max {
-                        let src_row_base = r * n_rows;
-                        for i in 0..n_rows {
-                            let dst_row = i * k + r;
-                            let src_row = src_row_base + i;
-                            for j in 0..p_b {
-                                j_pre[[dst_row, col_off + j]] = j_b[[src_row, j]];
+                    if k_b <= 1 {
+                        for &b in &observation_bands {
+                            let base = b * n_rows;
+                            for i in 0..n_rows {
+                                let dst_row = base + i;
+                                if dst_row >= r_map {
+                                    break;
+                                }
+                                for j in 0..p_b {
+                                    j_pre[[dst_row, col_off + j]] = j_b[[i, j]];
+                                }
+                            }
+                        }
+                    } else {
+                        let r_max = k_b.min(k);
+                        for r in 0..r_max {
+                            let src_row_base = r * n_rows;
+                            for i in 0..n_rows {
+                                let dst_row = i * k + r;
+                                let src_row = src_row_base + i;
+                                for j in 0..p_b {
+                                    j_pre[[dst_row, col_off + j]] = j_b[[src_row, j]];
+                                }
                             }
                         }
                     }
                 }
                 Err(_) => {
-                    // Fall back: embed flat design as channel 0.
+                    // Fall back: embed flat design across the observation bands.
                     if let Ok(flat) = spec
                         .design
                         .try_to_dense_arc("canonicalize_rank_check")
                         .map(|a| a.as_ref().clone())
                     {
-                        for i in 0..n_rows.min(flat.nrows()) {
-                            for j in 0..p_b.min(flat.ncols()) {
-                                j_pre[[i * k, col_off + j]] = flat[[i, j]];
+                        for &b in &observation_bands {
+                            let base = b * n_rows;
+                            for i in 0..n_rows.min(flat.nrows()) {
+                                let dst_row = base + i;
+                                if dst_row >= r_map {
+                                    break;
+                                }
+                                for j in 0..p_b.min(flat.ncols()) {
+                                    j_pre[[dst_row, col_off + j]] = flat[[i, j]];
+                                }
                             }
                         }
                     }
@@ -938,7 +1042,7 @@ fn canonicalize_for_identifiability_inner(
             );
         } else {
             // Build J_can = J_pre · T_full where T_full = blockdiag(T_i).
-            let mut j_can = Array2::<f64>::zeros((nk, p_total_red));
+            let mut j_can = Array2::<f64>::zeros((r_map, p_total_red));
             let mut raw_col_off = 0usize;
             let mut red_col_off = 0usize;
             for t_i in per_block_transform.iter() {
@@ -947,7 +1051,7 @@ fn canonicalize_for_identifiability_inner(
                 if p_i > 0 && r_i > 0 {
                     // J_can[:, red_col_off .. red_col_off+r_i]
                     //   = J_pre[:, raw_col_off .. raw_col_off+p_i] · T_i
-                    for row in 0..nk {
+                    for row in 0..r_map {
                         for out_col in 0..r_i {
                             let mut acc = 0.0_f64;
                             for in_col in 0..p_i {
@@ -2379,62 +2483,6 @@ mod tests {
             threshold_reduced.design.ncols(),
             1,
             "threshold keeps exactly its `age` column after the intercept drop",
-        );
-    }
-
-    /// TEMP instrumentation (#1197): dump the audit verdict + canonicalize
-    /// outcome for the AFT stacked-geometry case so we can see the runtime
-    /// drop attribution + reduced widths (and whether the MAP check fires).
-    /// Delete once #1197 is confirmed fixed.
-    #[test]
-    fn debug_1197_aft_stacked_geometry_dump() {
-        let n = 96;
-        let x = linspace(n);
-        let age: Vec<f64> = (0..n)
-            .map(|i| (i as f64) - (n as f64 - 1.0) / 2.0)
-            .collect();
-        let mut time_exit = Array2::<f64>::zeros((n, 2));
-        let mut time_stacked = Array2::<f64>::zeros((3 * n, 2));
-        for i in 0..n {
-            time_exit[[i, 0]] = 1.0;
-            time_exit[[i, 1]] = x[i];
-            time_stacked[[i, 0]] = 1.0;
-            time_stacked[[i, 1]] = 0.5 * x[i];
-            time_stacked[[n + i, 0]] = 1.0;
-            time_stacked[[n + i, 1]] = x[i];
-            time_stacked[[2 * n + i, 0]] = 0.0;
-            time_stacked[[2 * n + i, 1]] = 1.0;
-        }
-        let mut threshold = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            threshold[[i, 0]] = 1.0;
-            threshold[[i, 1]] = age[i];
-        }
-        let mut t_spec = spec_from_dense("time_transform", time_exit);
-        t_spec.gauge_priority = 200;
-        t_spec.stacked_design = Some(DesignMatrix::Dense(DenseDesignMatrix::from(time_stacked)));
-        t_spec.stacked_offset = Some(Array1::<f64>::zeros(3 * n));
-        let mut th_spec = spec_from_dense("threshold", threshold);
-        th_spec.gauge_priority = 150;
-        let specs = [t_spec, th_spec];
-
-        let audit = crate::identifiability::audit::audit_identifiability(&specs)
-            .expect("audit ok");
-        let canon = match canonicalize_for_identifiability(&specs) {
-            Ok(c) => format!(
-                "OK dropped={:?} reduced=[{}]",
-                c.audit.dropped_columns,
-                c.reduced_specs
-                    .iter()
-                    .map(|s| format!("{}={}", s.name, s.design.ncols()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Err(e) => format!("ERR {e:?}"),
-        };
-        panic!(
-            "DIAG1197 audit.fatal={} audit.dropped={:?} aliased={:?} summary={} || canon={}",
-            audit.fatal, audit.dropped_columns, audit.aliased_pairs, audit.summary, canon
         );
     }
 }
