@@ -80,7 +80,7 @@ fn strip_cfg_test_blocks(source: &str) -> String {
 fn strip_fd_ok_regions(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut in_fd_ok_region = false;
-    for line in source.lines_inclusive() {
+    for line in source.split_inclusive('\n') {
         let has_region_start = line.contains("FD-OK:");
         let has_region_end = line.contains("END-FD-OK");
         let has_line_marker = line.contains("fd-ok:");
