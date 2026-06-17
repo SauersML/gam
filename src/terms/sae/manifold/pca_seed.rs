@@ -108,7 +108,7 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
         }
         match &basis_kinds[atom_idx] {
             SaeAtomBasisKind::Periodic => {
-                if vt_rows >= 2 {
+                if vt_rows >= 1 {
                     // Diversify the per-atom circle seed (issue #671). The
                     // previous scheme shared PC0 as the first phase axis for
                     // *every* atom, so all periodic atoms read off nearly the
@@ -128,19 +128,51 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
                         let pair = (atom_idx + pc_pair_offset) % pc_pairs;
                         (2 * pair, 2 * pair + 1)
                     } else {
-                        (0, 1)
+                        (0, 0)
                     };
                     let pc1 = vt.row(pc1_row.min(vt_rows - 1));
-                    let pc2 = vt.row(pc2_row.min(vt_rows - 1));
-                    for row in 0..n_obs {
-                        let mut a = 0.0_f64;
-                        let mut b = 0.0_f64;
-                        for col in 0..centered.ncols() {
-                            a += centered[[row, col]] * pc1[col];
-                            b += centered[[row, col]] * pc2[col];
+                    let phase_offset = if pc_pairs > 0 && pc_pairs < k_atoms {
+                        atom_idx as f64 / k_atoms as f64
+                    } else {
+                        0.0
+                    };
+                    let s0 = s_vals.get(pc1_row).copied().unwrap_or(0.0).abs();
+                    let s1 = s_vals.get(pc2_row).copied().unwrap_or(0.0).abs();
+                    let has_two_dimensional_phase =
+                        vt_rows >= 2 && pc2_row != pc1_row && s1 > 1.0e-10 * s0.max(1.0);
+                    if has_two_dimensional_phase {
+                        let pc2 = vt.row(pc2_row.min(vt_rows - 1));
+                        for row in 0..n_obs {
+                            let mut a = 0.0_f64;
+                            let mut b = 0.0_f64;
+                            for col in 0..centered.ncols() {
+                                a += centered[[row, col]] * pc1[col];
+                                b += centered[[row, col]] * pc2[col];
+                            }
+                            let phase = b.atan2(a) / two_pi + phase_offset;
+                            out[[atom_idx, row, 0]] = phase - phase.floor();
                         }
-                        let phase = b.atan2(a) / two_pi;
-                        out[[atom_idx, row, 0]] = phase - phase.floor();
+                    } else {
+                        let mut proj = Array1::<f64>::zeros(n_obs);
+                        for row in 0..n_obs {
+                            let mut acc = 0.0_f64;
+                            for col in 0..centered.ncols() {
+                                acc += centered[[row, col]] * pc1[col];
+                            }
+                            proj[row] = acc;
+                        }
+                        let (min_v, max_v) = proj
+                            .iter()
+                            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                                (lo.min(v), hi.max(v))
+                            });
+                        let span = max_v - min_v;
+                        if span > 0.0 {
+                            for row in 0..n_obs {
+                                let phase = (proj[row] - min_v) / span + phase_offset;
+                                out[[atom_idx, row, 0]] = phase - phase.floor();
+                            }
+                        }
                     }
                 }
                 for axis in 1..d {
