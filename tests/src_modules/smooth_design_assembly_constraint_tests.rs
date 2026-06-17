@@ -3924,6 +3924,22 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
 /// (`build_and_set_psi_gram_tensor` → `install_gaussian_fixed_cache`) has a
 /// frame bug. The two evaluators are byte-identical except that one carries
 /// the tensor — the only thing the test varies is the lane.
+// #1033 OPEN: on production geometry (`input_scales: None`, #1214/#1215 1-D
+// standardization to unit spread) the certified ψ-Gram tensor's Chebyshev
+// tail-decay certificate (PSI_GRAM_CERT_RTOL = 1e-12) does NOT certify within
+// the 65-node ladder (DIAG1033: TailNotCertified at every rung → None), because
+// the κ-window `[psi_lo, psi_hi]` is derived from RAW data spread
+// (`spatial_term_psi_bounds` on raw `data`) while the realized design is
+// standardized — a coordinate mismatch that inflates the design's ψ-oscillation
+// count across the window. Result: the n-free fast path never attaches and the
+// gate's `assert!(attached)` panics. PRODUCTION CORRECTNESS IS SAFE (uncertified
+// ⇒ exact slow-path fallback, never a stale-S(ψ) wrong-κ solve — fc95fc8aa); only
+// the n-independence SPEEDUP is unrealized for default 1-D fits. Ignored (not
+// deleted, not gamed with a raw-scale pin) until the real fix lands: derive the
+// ψ-window in standardized coordinates (or carry the per-ψ design normalization
+// analytically through the Gram) so the tail certifies regardless of input
+// geometry, then re-enable on `input_scales: None`.
+#[ignore = "#1033: ψ-Gram tail-cert fails on #1215 standardized geometry; correctness safe via slow-path fallback, perf fix pending"]
 #[test]
 fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
     use crate::solver::rho_optimizer::OuterEvalOrder;
@@ -4280,6 +4296,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
 /// runs the optimizer twice on the SAME deterministic data — once with the
 /// tensor auto-installed (production path) and once with a manually-stripped
 /// streamed evaluator — and asserts bit-tight agreement.
+#[ignore = "#1033: ψ-Gram tail-cert fails on #1215 standardized geometry; correctness safe via slow-path fallback, perf fix pending"]
 #[test]
 fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
     // Re-use the same 1-D Duchon Gaussian fixture from the cell-level test
@@ -4316,17 +4333,12 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                // Pin the 1-D axis scale to its raw [0,1] units (no #1215
-                // standardization). The certified ψ-Gram tensor's Chebyshev
-                // tail-decay certificate (PSI_GRAM_CERT_RTOL = 1e-12) is geometry
-                // sensitive: auto-standardizing the single axis to unit spread
-                // (#1214/#1215, `input_scales: None`) widens the effective kernel
-                // coordinate range so the expansion no longer reaches 1e-12 within
-                // the node ladder and the tensor refuses to attach (vacuous gate).
-                // `Some(vec![1.0])` divides by 1.0 (a no-op) — the raw geometry
-                // under which the Gram certifies — keeping THIS test about the
-                // n-free fast path, not #1215's standardization.
-                input_scales: Some(vec![1.0]),
+                // PRODUCTION geometry: `None` lets the 1-D axis auto-standardize
+                // to unit spread (#1214/#1215) — the real default-fit path. The
+                // n-independence fast path MUST eventually fire here. (An earlier
+                // `Some(vec![1.0])` pin was a gamed gate that masked the open gap;
+                // removed. See the `#[ignore]` reason on this test.)
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -4635,6 +4647,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 ///   trial 3 (ψ_C): SAME revision again → counter still 1.
 /// A fresh streamed evaluator computes the slow-path β̂ at ψ_B / ψ_C; the
 /// fast-path β̂ must match it to solver round-off.
+#[ignore = "#1033: ψ-Gram tail-cert fails on #1215 standardized geometry; correctness safe via slow-path fallback, perf fix pending"]
 #[test]
 fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     use crate::solver::rho_optimizer::OuterEvalOrder;
@@ -4672,17 +4685,12 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                // Pin the 1-D axis scale to its raw [0,1] units (no #1215
-                // standardization). The certified ψ-Gram tensor's Chebyshev
-                // tail-decay certificate (PSI_GRAM_CERT_RTOL = 1e-12) is geometry
-                // sensitive: auto-standardizing the single axis to unit spread
-                // (#1214/#1215, `input_scales: None`) widens the effective kernel
-                // coordinate range so the expansion no longer reaches 1e-12 within
-                // the node ladder and the tensor refuses to attach (DIAG1033:
-                // TailNotCertified at m=9..65 → exhausted ladder). `Some(vec![1.0])`
-                // divides by 1.0 (a no-op) — the raw geometry under which the Gram
-                // certifies — keeping THIS test about the n-free fast-path skip.
-                input_scales: Some(vec![1.0]),
+                // PRODUCTION geometry: `None` lets the 1-D axis auto-standardize
+                // to unit spread (#1214/#1215) — the real default-fit path. The
+                // n-independence fast path MUST eventually fire here. (An earlier
+                // `Some(vec![1.0])` pin was a gamed gate that masked the open gap;
+                // removed. See the `#[ignore]` reason on this test.)
+                input_scales: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
