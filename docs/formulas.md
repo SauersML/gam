@@ -281,8 +281,7 @@ path through a distinct `type=`:
 
 - `mjs(...)` (aliases `measurejet`, `measure_jet`, `web`) — measure-jet
   spline for a response varying along an unknown low-dimensional set
-  inside a higher-dimensional ambient space. See
-  [measure_jet_frame.md](measure_jet_frame.md).
+  inside a higher-dimensional ambient space.
 - `curv(...)` (aliases `curvature`, `constant_curvature`, `mkappa`) —
   constant-curvature `M_κ` geodesic-kernel smooth, the κ-generic sibling
   of `sphere()` that interpolates `Sᵈ → ℝᵈ → Hᵈ` via `kappa=` (default

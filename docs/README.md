@@ -73,8 +73,6 @@ Reference
 - [GPU acceleration](gpu_acceleration.md) — CUDA dispatch, probe-time
   thresholds, and CPU fallback.
 - [REML scaling](reml_scaling.md) — solver strategy at large data scales.
-- [Measure-jet frame notes](measure_jet_frame.md) — the measure-jet
-  smooth basis.
 - [Changelog](changelog.md) — release history.
 
 ## Example
