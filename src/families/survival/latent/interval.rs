@@ -168,7 +168,7 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
         if event > 1 && !is_interval {
             return Err(LatentSurvivalError::InvalidDataset {
                 reason: format!(
-                    "{context} row {} has invalid event target {}; expected 0, 1, or the interval code",
+                    "{context} row {} has invalid event target {}; expected 0 or 1",
                     i + 1,
                     event
                 ),
