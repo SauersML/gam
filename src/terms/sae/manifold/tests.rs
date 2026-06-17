@@ -8983,14 +8983,17 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
     // A modest real-activation slice keeps the single certified η-walk fast while
     // still exercising the K>=2 multi-atom routing the fix targets on genuine
-    // long-tailed LLM data (the cause of the unreachable absolute floor).
-    let z_train = z.slice(s![..160, ..]).to_owned();
+    // long-tailed LLM data (the cause of the unreachable absolute floor). 320
+    // rows / 3 atoms keeps the Eckart-Young anchor non-degenerate (so the walk
+    // reaches the arrival-floor gate the fix corrects) while staying small enough
+    // for a single-walk regression test.
+    let z_train = z.slice(s![..320, ..]).to_owned();
 
-    // Production-style K=2, d=2 periodic (torus) dictionary, PCA-seeded from the
-    // real activations exactly as the cold path does. K=2 (with 2 harmonics)
-    // keeps the inner joint Newton small while still routing through the K>=2
-    // certified curvature-homotopy entry that the fix corrects.
-    let k = 2usize;
+    // Production-style K=3, d=2 periodic (torus) dictionary, PCA-seeded from the
+    // real activations exactly as the cold path does. 2 harmonics keep the inner
+    // joint Newton small while still routing through the K>=2 certified
+    // curvature-homotopy entry that the fix corrects.
+    let k = 3usize;
     let term = real_data_torus_seed_term(z_train.view(), k, 2);
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; k]);
     let mut objective = SaeManifoldOuterObjective::new(
@@ -9005,19 +9008,21 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     );
 
     // Run the certified curvature-homotopy entry (the K>=2 entry of record).
-    // Pre-#1189 this returned `false` (demoted to bifurcation by the unreachable
-    // absolute floor); post-#1189 the relative floor accepts the genuine arrival.
+    // Pre-#1189 this demoted to a bifurcation (arrived=false) by the unreachable
+    // absolute floor; post-#1189 the relative floor accepts the genuine arrival.
     let arrived = objective
         .run_curvature_homotopy_entry_at_rho(&rho)
         .expect("real-data curvature-homotopy entry must not error");
-    let report = objective
-        .curvature_walk_report()
-        .cloned()
-        .expect("the entry must record a curvature-walk report");
+    // A `None` report means the entry took the degenerate-anchor / failed-η=0-solve
+    // early-out — i.e. the certified entry produced no usable arrival and the fit
+    // falls to the blind cascade. On this non-degenerate slice that itself is a
+    // failure mode; surface `bifurcation` explicitly when a report exists.
+    let report = objective.curvature_walk_report().cloned();
+    let bifurcation = report.as_ref().and_then(|r| r.bifurcation.clone());
     eprintln!(
-        "[#1189] real-data entry: arrived={arrived} bifurcation={:?} eta_steps={} \
-         reseeds={}",
-        report.bifurcation, report.eta_steps, report.reseeds
+        "[#1189] real-data entry: arrived={arrived} report_present={} bifurcation={:?}",
+        report.is_some(),
+        bifurcation
     );
 
     // The fitted reconstruction at the arrival state.
@@ -9030,12 +9035,12 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     eprintln!("[#1189] real-data entry in-sample EV = {ev:.5}");
 
     assert!(
-        arrived && report.bifurcation.is_none(),
+        arrived && report.is_some() && bifurcation.is_none(),
         "certified curvature walk did NOT arrive on real OLMo activations \
-         (arrived={arrived}, bifurcation={:?}, EV={ev:.5}): the absolute arrival floor rejected \
-         the genuine fit and demoted to the blind cascade that collapses into the degenerate \
-         basin and pins the outer loop at the sentinel (#1189).",
-        report.bifurcation
+         (arrived={arrived}, report_present={}, bifurcation={bifurcation:?}, EV={ev:.5}): the \
+         absolute arrival floor rejected the genuine fit and demoted to the blind cascade that \
+         collapses into the degenerate basin and pins the outer loop at the sentinel (#1189).",
+        report.is_some()
     );
     assert!(
         ev.is_finite() && ev > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
