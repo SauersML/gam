@@ -3028,9 +3028,7 @@ fn sae_manifold_fit_inner<'py>(
         descriptor.set_item("top_level_model", "post_topk")?;
         descriptor.set_item("pre_projection_model", "pre_topk")?;
         out.set_item("top_k_projection", descriptor)?;
-        if let (Some(pre_assignments), Some(pre_fitted)) =
-            (pre_topk_assignments, pre_topk_fitted)
-        {
+        if let (Some(pre_assignments), Some(pre_fitted)) = (pre_topk_assignments, pre_topk_fitted) {
             let pre_topk = PyDict::new(py);
             pre_topk.set_item("assignments_z", pre_assignments.into_pyarray(py))?;
             pre_topk.set_item("fitted", pre_fitted.into_pyarray(py))?;
@@ -5927,7 +5925,12 @@ fn sae_manifold_predict_oos<'py>(
     // linear image the training reconstruction used. `None`/empty ⇒ all-curved
     // OOS reconstruction (the prior behaviour).
     hybrid_linear_images: Option<
-        Vec<(usize, f64, PyReadonlyArray1<'py, f64>, PyReadonlyArray1<'py, f64>)>,
+        Vec<(
+            usize,
+            f64,
+            PyReadonlyArray1<'py, f64>,
+            PyReadonlyArray1<'py, f64>,
+        )>,
     >,
 ) -> PyResult<Py<PyDict>> {
     let x_view = x_new.as_array();
@@ -7884,12 +7887,14 @@ mod sae_linear_atom_tests {
         // Decoder over p = 2 output channels: γ(t) = b0 + t·b1.
         let b0 = [0.7_f64, -1.3];
         let b1 = [2.0_f64, 0.5];
-        let decoder = Array2::from_shape_vec((2, 2), vec![b0[0], b0[1], b1[0], b1[1]])
-            .expect("2x2 decoder");
+        let decoder =
+            Array2::from_shape_vec((2, 2), vec![b0[0], b0[1], b1[0], b1[1]]).expect("2x2 decoder");
 
-        let coords = Array2::from_shape_vec((5, 1), vec![-2.0, -0.5, 0.0, 1.0, 3.0])
-            .expect("5x1 coords");
-        let (phi, _jet) = evaluator.evaluate(coords.view()).expect("evaluate linear patch");
+        let coords =
+            Array2::from_shape_vec((5, 1), vec![-2.0, -0.5, 0.0, 1.0, 3.0]).expect("5x1 coords");
+        let (phi, _jet) = evaluator
+            .evaluate(coords.view())
+            .expect("evaluate linear patch");
         assert_eq!(phi.dim(), (5, 2));
         let recon = phi.dot(&decoder); // (5, 2) = Φ·B
         for (row, &t) in coords.column(0).iter().enumerate() {

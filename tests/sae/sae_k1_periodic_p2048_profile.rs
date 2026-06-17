@@ -172,7 +172,7 @@ fn profile_k1_periodic_high_p_phase_breakdown() {
             .run(&mut obj_full, &format!("profile p={p}"))
             .expect("outer engine must complete");
         let full_s = t_b.elapsed().as_secs_f64();
-        let (fitted, _r, _l) = obj_full.into_fitted();
+        let fitted = obj_full.into_fitted().term;
         let ev = global_ev(z.view(), fitted.fitted().view());
 
         println!(

@@ -506,7 +506,7 @@ fn run_production_fit(
     problem
         .run(&mut objective, label)
         .expect("outer cascade must complete");
-    let (fitted_term, _rho, _loss) = objective.into_fitted();
+    let fitted_term = objective.into_fitted().term;
     fitted_term
 }
 

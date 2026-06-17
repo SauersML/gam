@@ -160,7 +160,9 @@ fn run_production_fit(z: &Array2<f64>, seed_logit: f64) -> (SaeManifoldTerm, Sae
         .with_initial_rho(init_flat)
         .run(&mut objective, "K=1 circle radial bias")
         .expect("production outer fit must converge");
-    let (term, rho, _loss) = objective.into_fitted();
+    let fitted_result = objective.into_fitted();
+    let term = fitted_result.term;
+    let rho = fitted_result.rho;
     (term, rho)
 }
 

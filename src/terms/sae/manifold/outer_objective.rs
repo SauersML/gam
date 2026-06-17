@@ -1420,12 +1420,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // cross-seed ranking lane (`eval_cost`).
                 let (cost, _beta_hat) =
                     match self.evaluate_with_refine_policy(rho.view(), false, false) {
-                    Ok(evaluated) => evaluated,
-                    Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                        return Ok(OuterEval::infeasible(rho.len()));
-                    }
-                    Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
-                };
+                        Ok(evaluated) => evaluated,
+                        Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                            return Ok(OuterEval::infeasible(rho.len()));
+                        }
+                        Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+                    };
                 Ok(OuterEval {
                     cost,
                     gradient: Array1::zeros(rho.len()),

@@ -10299,8 +10299,7 @@ mod inner_contract_probe_tests {
             };
             let res_atlas = EncodeAtlas::build(&atoms, &[1.0], norm_bound, cfg).expect("atlas");
             let centers = crate::terms::sae::encode::chart_center_grid(atom0, resolution);
-            let nominal_radius =
-                crate::terms::sae::encode::chart_nominal_radius(atom0, resolution);
+            let nominal_radius = crate::terms::sae::encode::chart_nominal_radius(atom0, resolution);
             let mut cert_center_global = 0usize;
             let mut cert_center_local = 0usize;
             let mut cert_that_global = 0usize;
@@ -10326,8 +10325,7 @@ mod inner_contract_probe_tests {
                 let m_jac = recon_sups.jacobian; // amplitude 1.
                 let m_third = recon_sups.third;
                 let l_fixed = 3.0 * m_jac * recon_sups.hessian; // residual-free part.
-                let l_global =
-                    hessian_lipschitz_constant(recon_sups, 1.0, norm_bound, 0.0);
+                let l_global = hessian_lipschitz_constant(recon_sups, 1.0, norm_bound, 0.0);
                 // Residual at a start, and the chart-local L derived from it:
                 // L_local = l_fixed + (||r(t0)|| + m_jac·R)·m_third.
                 let r_at = |t: &Array1<f64>| -> f64 {
@@ -10341,11 +10339,23 @@ mod inner_contract_probe_tests {
                 let r_c = r_at(&center);
                 let l_center_local = l_fixed + (r_c + m_jac * radius) * m_third;
                 let (cg, _d) = row_certificate(
-                    atom0, evaluator.as_ref(), center.view(), x, 1.0, l_global, ridge,
+                    atom0,
+                    evaluator.as_ref(),
+                    center.view(),
+                    x,
+                    1.0,
+                    l_global,
+                    ridge,
                 )
                 .unwrap();
                 let (cl, _d) = row_certificate(
-                    atom0, evaluator.as_ref(), center.view(), x, 1.0, l_center_local, ridge,
+                    atom0,
+                    evaluator.as_ref(),
+                    center.view(),
+                    x,
+                    1.0,
+                    l_center_local,
+                    ridge,
                 )
                 .unwrap();
                 if cg.certified() {
@@ -10361,11 +10371,23 @@ mod inner_contract_probe_tests {
                     let r_h = r_at(&t_hat);
                     let l_that_local = l_fixed + (r_h + m_jac * radius) * m_third;
                     let (tg, _d) = row_certificate(
-                        atom0, evaluator.as_ref(), t_hat.view(), x, 1.0, l_global, ridge,
+                        atom0,
+                        evaluator.as_ref(),
+                        t_hat.view(),
+                        x,
+                        1.0,
+                        l_global,
+                        ridge,
                     )
                     .unwrap();
                     let (tl, _d) = row_certificate(
-                        atom0, evaluator.as_ref(), t_hat.view(), x, 1.0, l_that_local, ridge,
+                        atom0,
+                        evaluator.as_ref(),
+                        t_hat.view(),
+                        x,
+                        1.0,
+                        l_that_local,
+                        ridge,
                     )
                     .unwrap();
                     if tg.certified() {

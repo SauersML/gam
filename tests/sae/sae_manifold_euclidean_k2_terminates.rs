@@ -173,7 +173,7 @@ fn sae_manifold_euclidean_k2_fit_terminates() {
         .run(&mut objective, "SAE euclidean K=2 terminates (#1094)")
         .expect("outer cascade must complete on a K=2 euclidean fit");
     let elapsed = t0.elapsed().as_secs_f64();
-    let (fitted_term, _rho, _loss) = objective.into_fitted();
+    let fitted_term = objective.into_fitted().term;
     let fitted = fitted_term.fitted();
     let r2 = reconstruction_r2(&fitted, &z);
     println!(

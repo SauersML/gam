@@ -142,7 +142,7 @@ fn sae_manifold_small_n_circle_accepts_a_seed_and_fits() {
             "outer cascade must complete on a small-N circle bank — \
              all seeds rejected reproduces #1095",
         );
-    let (fitted_term, _rho, _loss) = objective.into_fitted();
+    let fitted_term = objective.into_fitted().term;
     let fitted = fitted_term.fitted();
     let r2 = reconstruction_r2(&fitted, &z);
     println!(
