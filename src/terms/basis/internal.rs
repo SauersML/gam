@@ -11,6 +11,8 @@ pub struct BsplineScratch {
     pub(crate) left: Vec<f64>,
     pub(crate) right: Vec<f64>,
     pub(crate) n: Vec<f64>,
+    pub(crate) all_prev: Vec<f64>,
+    pub(crate) all_curr: Vec<f64>,
 }
 
 impl BsplineScratch {
@@ -21,6 +23,8 @@ impl BsplineScratch {
             left: vec![0.0; len],
             right: vec![0.0; len],
             n: vec![0.0; len],
+            all_prev: Vec::new(),
+            all_curr: Vec::new(),
         }
     }
 
@@ -33,6 +37,75 @@ impl BsplineScratch {
             self.n.resize(len, 0.0);
         }
     }
+}
+
+/// Evaluates all B-spline basis functions using the full knot support instead
+/// of clamping to the modeling interval `[t_degree, t_num_basis]`.
+///
+/// The ordinary value evaluator intentionally clamps for linear extension at
+/// clamped boundaries. Derivative recurrences need the mathematical B-spline
+/// values on the whole supplied knot vector, including the exterior support
+/// spans used by cyclic fold-back constructions.
+#[inline]
+pub(crate) fn evaluate_splines_at_point_full_support_into(
+    x: f64,
+    degree: usize,
+    knots: ArrayView1<f64>,
+    basisvalues: &mut [f64],
+    scratch: &mut BsplineScratch,
+) {
+    let num_knots = knots.len();
+    let num_basis = num_knots - degree - 1;
+    assert_eq!(basisvalues.len(), num_basis);
+    basisvalues.fill(0.0);
+
+    if !x.is_finite() || num_knots < 2 {
+        return;
+    }
+
+    let zero_degree_len = num_knots - 1;
+    scratch.all_prev.resize(zero_degree_len, 0.0);
+    scratch.all_prev.fill(0.0);
+
+    let last_knot = knots[num_knots - 1];
+    for i in 0..zero_degree_len {
+        if (knots[i] <= x && x < knots[i + 1]) || (x == last_knot && i + 1 == zero_degree_len) {
+            scratch.all_prev[i] = 1.0;
+        }
+    }
+
+    if degree == 0 {
+        basisvalues.copy_from_slice(&scratch.all_prev[..num_basis]);
+        return;
+    }
+
+    for d in 1..=degree {
+        let level_len = num_knots - d - 1;
+        scratch.all_curr.resize(level_len, 0.0);
+        scratch.all_curr.fill(0.0);
+
+        for i in 0..level_len {
+            let denom_left = knots[i + d] - knots[i];
+            let left = if denom_left.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
+                ((x - knots[i]) / denom_left) * scratch.all_prev[i]
+            } else {
+                0.0
+            };
+
+            let denom_right = knots[i + d + 1] - knots[i + 1];
+            let right = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
+                ((knots[i + d + 1] - x) / denom_right) * scratch.all_prev[i + 1]
+            } else {
+                0.0
+            };
+
+            scratch.all_curr[i] = left + right;
+        }
+
+        std::mem::swap(&mut scratch.all_prev, &mut scratch.all_curr);
+    }
+
+    basisvalues.copy_from_slice(&scratch.all_prev[..num_basis]);
 }
 
 /// Generates the full knot vector with clamped boundary knots.

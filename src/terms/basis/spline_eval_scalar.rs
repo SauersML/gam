@@ -830,8 +830,11 @@ pub fn evaluate_bspline_derivative_scalar_into(
 
     let x_eval = one_sided_derivative_eval_point(x, knot_vector, degree);
 
-    // Evaluate lower-degree (k-1) basis functions
-    internal::evaluate_splines_at_point_into(
+    // Evaluate lower-degree (k-1) basis functions on the full knot support.
+    // Cyclic fold-back constructs intentionally use the exterior support spans
+    // of a uniform knot vector; clamping here collapses `x + period` onto the
+    // right modeling boundary and breaks derivative periodicity.
+    internal::evaluate_splines_at_point_full_support_into(
         x_eval,
         degree - 1,
         knot_vector,
@@ -1170,15 +1173,6 @@ pub(crate) fn evaluate_bspline_derivative_recurrence_into(
             num_basis
         )));
     }
-    if num_basis > 0 {
-        let left = knot_vector[degree];
-        let right = knot_vector[num_basis];
-        if x < left || x > right {
-            out.fill(0.0);
-            return Ok(());
-        }
-    }
-
     // Evaluate the order-(m-1) derivative on degree-1 into this level's buffer.
     // Length matches `num_basis` of the degree-(degree-1) basis:
     // `knot_vector.len() - (degree - 1) - 1 = knot_vector.len() - degree`.

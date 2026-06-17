@@ -351,14 +351,14 @@ pub(crate) fn one_sided_derivative_eval_point(
     if !left.is_finite() || !right.is_finite() || left >= right {
         return x;
     }
-    if x <= left {
+    if x == left {
         let next = left.next_up();
         if next < right {
             next
         } else {
             left + 0.5 * (right - left)
         }
-    } else if x >= right {
+    } else if x == right {
         let prev = right.next_down();
         if prev > left {
             prev
@@ -482,22 +482,33 @@ pub(crate) struct BasisEvalScratch {
     pub(crate) basis: internal::BsplineScratch,
     pub(crate) lower_basis: Vec<f64>,
     pub(crate) lower_scratch: internal::BsplineScratch,
-    pub(crate) lower_lower_basis: Vec<f64>,
-    pub(crate) lower_lower_scratch: internal::BsplineScratch,
+    pub(crate) derivative_workspace: BsplineDerivativeWorkspace,
 }
 
 impl BasisEvalScratch {
     pub(crate) fn new(degree: usize) -> Self {
         let lower_degree = degree.saturating_sub(1);
-        let lower_lower_degree = degree.saturating_sub(2);
         Self {
             basis: internal::BsplineScratch::new(degree),
             lower_basis: vec![0.0; lower_degree + 1],
             lower_scratch: internal::BsplineScratch::new(lower_degree),
-            lower_lower_basis: vec![0.0; lower_lower_degree + 1],
-            lower_lower_scratch: internal::BsplineScratch::new(lower_lower_degree),
+            derivative_workspace: BsplineDerivativeWorkspace::new(),
         }
     }
+}
+
+#[inline]
+pub(crate) fn copy_full_row_to_sparse_window(full: &[f64], values: &mut [f64]) -> usize {
+    values.fill(0.0);
+    let Some(start_col) = full.iter().position(|&v| v != 0.0) else {
+        return 0;
+    };
+    for (offset, value_slot) in values.iter_mut().enumerate() {
+        if let Some(&v) = full.get(start_col + offset) {
+            *value_slot = v;
+        }
+    }
+    start_col
 }
 
 pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
@@ -505,73 +516,50 @@ pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
     degree: usize,
     knotview: ArrayView1<f64>,
     values: &mut [f64],
-    basis_scratch: &mut internal::BsplineScratch,
     lowervalues: &mut [f64],
     lower_scratch: &mut internal::BsplineScratch,
 ) -> usize {
     let num_basis = knotview.len().saturating_sub(degree + 1);
-    let x_eval = if num_basis > 0 {
-        let left = knotview[degree];
-        let right = knotview[num_basis];
-        one_sided_derivative_eval_point(x.clamp(left, right), knotview, degree)
-    } else {
-        x
-    };
-    // Linear extrapolation outside the domain uses the boundary slope, so
-    // first derivatives clamp to the nearest boundary derivative value.
-
-    let start_col =
-        internal::evaluate_splines_sparse_into(x_eval, degree, knotview, values, basis_scratch);
     if degree == 0 {
         values.fill(0.0);
-        return start_col;
+        return 0;
     }
 
-    let lower_degree = degree - 1;
-    let lower_support = lower_degree + 1;
-    if lowervalues.len() != lower_support {
-        return start_col;
+    let num_basis_lower = knotview.len().saturating_sub(degree);
+    if lowervalues.len() < num_basis_lower {
+        values.fill(0.0);
+        return 0;
     }
+    lowervalues[..num_basis_lower].fill(0.0);
 
-    let start_lower = internal::evaluate_splines_sparse_into(
+    let x_eval = one_sided_derivative_eval_point(x, knotview, degree);
+    internal::evaluate_splines_at_point_full_support_into(
         x_eval,
-        lower_degree,
+        degree - 1,
         knotview,
-        lowervalues,
+        &mut lowervalues[..num_basis_lower],
         lower_scratch,
     );
 
-    values.fill(0.0);
-    for offset in 0..=degree {
-        let i = start_col + offset;
-        let left_idx = i as isize - start_lower as isize;
-        let right_idx = (i + 1) as isize - start_lower as isize;
-        let left = if left_idx >= 0 && (left_idx as usize) < lower_support {
-            lowervalues[left_idx as usize]
-        } else {
-            0.0
-        };
-        let right = if right_idx >= 0 && (right_idx as usize) < lower_support {
-            lowervalues[right_idx as usize]
-        } else {
-            0.0
-        };
+    let mut full_derivative = vec![0.0; num_basis];
+    for i in 0..num_basis {
         let denom_left = knotview[i + degree] - knotview[i];
         let denom_right = knotview[i + degree + 1] - knotview[i + 1];
         let left_term = if denom_left.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
-            left / denom_left
+            lowervalues[i] / denom_left
         } else {
             0.0
         };
         let right_term = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
-            right / denom_right
+            lowervalues[i + 1] / denom_right
         } else {
             0.0
         };
-        values[offset] = (degree as f64) * (left_term - right_term);
+        let value = (degree as f64) * (left_term - right_term);
+        full_derivative[i] = value;
     }
 
-    start_col
+    copy_full_row_to_sparse_window(&full_derivative, values)
 }
 
 #[inline]
@@ -582,18 +570,18 @@ pub(crate) fn evaluate_splines_derivative_sparse_into(
     values: &mut [f64],
     scratch: &mut BasisEvalScratch,
 ) -> usize {
-    let lower_degree = degree.saturating_sub(1);
-    let lower_support = lower_degree + 1;
-    if scratch.lower_basis.len() != lower_support {
-        scratch.lower_basis.resize(lower_support, 0.0);
-        scratch.lower_scratch.ensure_degree(lower_degree);
+    let num_basis_lower = knotview.len().saturating_sub(degree);
+    if scratch.lower_basis.len() != num_basis_lower {
+        scratch.lower_basis.resize(num_basis_lower, 0.0);
+        scratch
+            .lower_scratch
+            .ensure_degree(degree.saturating_sub(1));
     }
     evaluate_splines_derivative_sparse_intowith_lower(
         x,
         degree,
         knotview,
         values,
-        &mut scratch.basis,
         &mut scratch.lower_basis,
         &mut scratch.lower_scratch,
     )
@@ -607,87 +595,26 @@ pub(crate) fn evaluate_splinessecond_derivative_sparse_into(
     scratch: &mut BasisEvalScratch,
 ) -> usize {
     let num_basis = knotview.len().saturating_sub(degree + 1);
-    if num_basis > 0 {
-        let left = knotview[degree];
-        let right = knotview[num_basis];
-        // Constant extrapolation outside the domain implies zero derivatives.
-        if x < left || x > right {
-            values.fill(0.0);
-            return 0;
-        }
-    }
-
-    let start_col =
-        internal::evaluate_splines_sparse_into(x, degree, knotview, values, &mut scratch.basis);
     if degree < 2 {
         values.fill(0.0);
-        return start_col;
+        return 0;
     }
 
-    let lower_degree = degree - 1;
-    let lower_support = lower_degree + 1;
-    if scratch.lower_basis.len() != lower_support {
-        scratch.lower_basis.resize(lower_support, 0.0);
-        scratch.lower_scratch.ensure_degree(lower_degree);
+    if scratch.lower_basis.len() != num_basis {
+        scratch.lower_basis.resize(num_basis, 0.0);
     }
-
-    let lower_lower_degree = lower_degree.saturating_sub(1);
-    let lower_lower_support = lower_lower_degree + 1;
-    if scratch.lower_lower_basis.len() != lower_lower_support {
-        scratch.lower_lower_basis.resize(lower_lower_support, 0.0);
-        scratch
-            .lower_lower_scratch
-            .ensure_degree(lower_lower_degree);
-    }
-
-    // Build B'_{i, k-1}(x) (first derivative of the lower-degree basis, k-1).
-    // We then apply the derivative recursion one more time:
-    // B''_{i,k}(x) = k * ( B'_{i,k-1}(x)/(t_{i+k}-t_i)
-    //                  -B'_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}) )
-    //
-    // So `scratch.lower_basis` below stores derivative values, not raw basis values.
-    let start_lower = evaluate_splines_derivative_sparse_intowith_lower(
+    evaluate_bspline_derivative_recurrence_into(
+        2,
         x,
-        lower_degree,
         knotview,
+        degree,
         &mut scratch.lower_basis,
-        &mut scratch.lower_scratch,
-        &mut scratch.lower_lower_basis,
-        &mut scratch.lower_lower_scratch,
-    );
+        &mut scratch.derivative_workspace,
+        0,
+    )
+    .expect("validated B-spline second-derivative inputs");
 
-    values.fill(0.0);
-    for offset in 0..=degree {
-        let i = start_col + offset;
-        let left_idx = i as isize - start_lower as isize;
-        let right_idx = (i + 1) as isize - start_lower as isize;
-        // These are B'_{i,k-1} and B'_{i+1,k-1} aligned from the sparse lower block.
-        let left = if left_idx >= 0 && (left_idx as usize) < lower_support {
-            scratch.lower_basis[left_idx as usize]
-        } else {
-            0.0
-        };
-        let right = if right_idx >= 0 && (right_idx as usize) < lower_support {
-            scratch.lower_basis[right_idx as usize]
-        } else {
-            0.0
-        };
-        let denom_left = knotview[i + degree] - knotview[i];
-        let denom_right = knotview[i + degree + 1] - knotview[i + 1];
-        let left_term = if denom_left.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
-            left / denom_left
-        } else {
-            0.0
-        };
-        let right_term = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
-            right / denom_right
-        } else {
-            0.0
-        };
-        values[offset] = (degree as f64) * (left_term - right_term);
-    }
-
-    start_col
+    copy_full_row_to_sparse_window(&scratch.lower_basis, values)
 }
 
 #[inline]
