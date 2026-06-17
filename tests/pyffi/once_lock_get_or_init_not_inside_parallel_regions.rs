@@ -24,13 +24,32 @@ fn once_lock_get_or_init_not_inside_parallel_regions() {
             for i in 0..lines.len() {
                 let line = lines[i];
                 if line.contains("get_or_init(") {
-                    let start = i.saturating_sub(80);
-                    let end = (i + 80).min(lines.len().saturating_sub(1));
-                    let window = &lines[start..=end];
-                    if window
-                        .iter()
-                        .any(|l| l.contains(".par_iter(") || l.contains(".into_par_iter("))
-                    {
+                    // The risk this gate guards against is a `get_or_init` running
+                    // *inside* a rayon parallel closure (first-init landing on a
+                    // worker thread). A blind ±N-line window mis-fires when an
+                    // unrelated `fn` that merely happens to sit near a parallel
+                    // loop also uses a cache. Walk backwards within the SAME
+                    // function body (stop at the previous top-level `fn ` opener)
+                    // and only flag if a parallel iterator was opened before this
+                    // line without an intervening function boundary.
+                    let mut opened_parallel = false;
+                    for j in (0..i).rev() {
+                        let prev = lines[j];
+                        // Top-level `fn ` declaration ends the enclosing-scope walk.
+                        let trimmed = prev.trim_start();
+                        if trimmed.starts_with("fn ")
+                            || trimmed.starts_with("pub fn ")
+                            || trimmed.starts_with("pub(crate) fn ")
+                            || trimmed.starts_with("async fn ")
+                        {
+                            break;
+                        }
+                        if prev.contains(".par_iter(") || prev.contains(".into_par_iter(") {
+                            opened_parallel = true;
+                            break;
+                        }
+                    }
+                    if opened_parallel {
                         offenders.push(format!("{}:{}", path.display(), i + 1));
                     }
                 }
