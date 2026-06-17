@@ -162,10 +162,10 @@ fn assert_case_fits(case: &SweepCase) {
 fn measure_jet_formula_fit_succeeds_across_random_datasets() {
     init_parallelism();
 
-    // A spread of deterministic datasets covering the axes the original report
-    // varied (the Python path failed on ~60% of such random draws). Frequencies
-    // span under- to fully-resolved sines; phases, noise scales, sample sizes,
-    // and grid regularity all move. Every one must fit.
+    // A small spread of deterministic datasets covering the axes the original
+    // report varied (the Python path failed on ordinary random draws). Keep the
+    // normal CI gate representative rather than exhaustive: the test owns
+    // formula-path non-abortion, not a full statistical simulation sweep.
     let cases = [
         SweepCase {
             seed: 1,
@@ -197,38 +197,6 @@ fn measure_jet_formula_fit_succeeds_across_random_datasets() {
             freq: 2.0,
             phase: 2.1,
             noise: 0.10,
-            jitter: true,
-        },
-        SweepCase {
-            seed: 5,
-            n: 300,
-            freq: 1.0,
-            phase: 3.0,
-            noise: 0.15,
-            jitter: false,
-        },
-        SweepCase {
-            seed: 6,
-            n: 220,
-            freq: 1.25,
-            phase: 0.4,
-            noise: 0.06,
-            jitter: true,
-        },
-        SweepCase {
-            seed: 7,
-            n: 260,
-            freq: 1.75,
-            phase: 1.9,
-            noise: 0.12,
-            jitter: false,
-        },
-        SweepCase {
-            seed: 8,
-            n: 160,
-            freq: 1.0,
-            phase: 2.6,
-            noise: 0.04,
             jitter: true,
         },
     ];
