@@ -580,6 +580,7 @@ impl SurvivalMarginalSlopeFamily {
                     }
                     let mut coeff_dir_poly = vec![0.0; 4];
                     let mut coeff_a_dir_poly = vec![0.0; 4];
+                    let mut coeff_aa_dir_poly = vec![0.0; 4];
                     for c in 0..p {
                         if dir[c] == 0.0 {
                             continue;
@@ -587,11 +588,15 @@ impl SurvivalMarginalSlopeFamily {
                         for k in 0..4 {
                             coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
                             coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
+                            coeff_aa_dir_poly[k] += fixed.coeff_aau[c][k] * dir[c];
                         }
                     }
                     let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
                     let chi_dir_poly =
                         poly_add(&poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly);
+                    // D_dir(eta_aa) = eta_aaa·a_dir + ∂³c/∂a²∂dir(direct).
+                    let eta_aa_dir_poly =
+                        poly_add(&poly_scale(&eta_aaa_poly, a_dir), &coeff_aa_dir_poly);
 
                     for u in 0..p {
                         for v in u..p {
@@ -717,48 +722,110 @@ impl SurvivalMarginalSlopeFamily {
                                 ),
                                 &cu_dir_fixed_v,
                             );
-                            let eta_uv_dir_poly = poly_add(
-                                &poly_add(
-                                    &poly_scale(&chi_poly, a_uv_dir[[u, v]]),
-                                    &poly_scale(
-                                        &eta_aa_poly,
-                                        a_u_dir[u] * a_u[v]
-                                            + a_u[u] * a_u_dir[v]
-                                            + a_uv[[u, v]] * a_dir,
-                                    ),
-                                ),
-                                &poly_add(
-                                    &poly_add(
-                                        &poly_scale(fixed.coeff_au[u].as_ref(), a_u_dir[v]),
-                                        &poly_scale(fixed.coeff_au[v].as_ref(), a_u_dir[u]),
-                                    ),
-                                    &{
-                                        let mut fp = vec![0.0; 4];
-                                        for c in 0..p {
-                                            if dir[c] == 0.0 {
-                                                continue;
-                                            }
-                                            let sca_u = self.cell_pair_third_coeff_a(
-                                                primary,
-                                                &fixed.coeff_abu,
-                                                u,
-                                                c,
-                                            );
-                                            let sca_v = self.cell_pair_third_coeff_a(
-                                                primary,
-                                                &fixed.coeff_abu,
-                                                v,
-                                                c,
-                                            );
-                                            for k in 0..4 {
-                                                fp[k] += sca_u[k] * dir[c] * a_u[v]
-                                                    + sca_v[k] * dir[c] * a_u[u];
-                                            }
-                                        }
-                                        fp
-                                    },
+                            // eta_uv_dir_poly = D_dir(eta_uv_poly), the FULL third
+                            // mixed-with-direction partial of the cell index.
+                            // eta_uv_poly has five terms (see above):
+                            //   chi·a_uv + eta_aa·a_u·a_v + coeff_au[u]·a_v
+                            //     + coeff_au[v]·a_u + r_uv_fixed.
+                            // Differentiating along `dir` term-by-term, the FIXED
+                            // (direct-parameter) directional crosses of each piece
+                            // — `chi_dir`/`eta_aa_dir` direct parts, the `coeff_au`
+                            // a-cross direct part, and the entire D_dir(r_uv_fixed)
+                            // (which carries `coeff_abu·a_dir` AND the `coeff_bbu`
+                            // ∂²/∂g² curvature cross) — were dropped here, so the
+                            // density-normalization third (`ln d` chain) lost the
+                            // same beta_w/g cross that #1195 restored in the
+                            // f_uv_dir cell-integral chain. Re-derive every piece.
+                            //
+                            // D_dir(coeff_au[u]) = coeff_aau[u]·a_dir
+                            //                      + ∂³c/∂a∂u∂dir(direct).
+                            let coeff_au_dir_u = {
+                                let mut acc = poly_scale(fixed.coeff_aau[u].as_ref(), a_dir);
+                                for c in 0..p {
+                                    if dir[c] == 0.0 {
+                                        continue;
+                                    }
+                                    let sca =
+                                        self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                                    for k in 0..4 {
+                                        acc[k] += sca[k] * dir[c];
+                                    }
+                                }
+                                acc
+                            };
+                            let coeff_au_dir_v = {
+                                let mut acc = poly_scale(fixed.coeff_aau[v].as_ref(), a_dir);
+                                for c in 0..p {
+                                    if dir[c] == 0.0 {
+                                        continue;
+                                    }
+                                    let sca =
+                                        self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
+                                    for k in 0..4 {
+                                        acc[k] += sca[k] * dir[c];
+                                    }
+                                }
+                                acc
+                            };
+                            // D_dir(r_uv_fixed) = ∂³c/∂u∂v∂dir:
+                            //   a-chain  coeff_abu[other]·a_dir  (other = the non-g axis)
+                            //   direct   coeff_bbu cross contracted along dir.
+                            let r_uv_dir = {
+                                let mut acc = vec![0.0; 4];
+                                // a-chain: D_a of the fixed second cross r_uv_fixed.
+                                let sca = self.cell_pair_third_coeff_a(
+                                    primary,
+                                    &fixed.coeff_abu,
+                                    u,
+                                    v,
+                                );
+                                for k in 0..4 {
+                                    acc[k] += sca[k] * a_dir;
+                                }
+                                // direct: ∂²/∂g² curvature cross (the #1195 family).
+                                let mut bbu = [0.0; 4];
+                                self.add_cell_pair_third_coeff_dir(
+                                    primary,
+                                    &fixed.coeff_bbu,
+                                    u,
+                                    v,
+                                    dir,
+                                    1.0,
+                                    &mut bbu,
+                                );
+                                for k in 0..4 {
+                                    acc[k] += bbu[k];
+                                }
+                                acc
+                            };
+                            // Term 1: D_dir(chi·a_uv) = chi_dir·a_uv + chi·a_uv_dir.
+                            let term1 = poly_add(
+                                &poly_scale(&chi_dir_poly, a_uv[[u, v]]),
+                                &poly_scale(&chi_poly, a_uv_dir[[u, v]]),
+                            );
+                            // Term 2: D_dir(eta_aa·a_u·a_v)
+                            //   = eta_aa_dir·a_u·a_v + eta_aa·(a_u_dir·a_v + a_u·a_v_dir).
+                            let term2 = poly_add(
+                                &poly_scale(&eta_aa_dir_poly, a_u[u] * a_u[v]),
+                                &poly_scale(
+                                    &eta_aa_poly,
+                                    a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v],
                                 ),
                             );
+                            // Terms 3+4: D_dir(coeff_au[u]·a_v + coeff_au[v]·a_u).
+                            let term34 = poly_add(
+                                &poly_add(
+                                    &poly_scale(&coeff_au_dir_u, a_u[v]),
+                                    &poly_scale(fixed.coeff_au[u].as_ref(), a_u_dir[v]),
+                                ),
+                                &poly_add(
+                                    &poly_scale(&coeff_au_dir_v, a_u[u]),
+                                    &poly_scale(fixed.coeff_au[v].as_ref(), a_u_dir[u]),
+                                ),
+                            );
+                            // Term 5: D_dir(r_uv_fixed).
+                            let eta_uv_dir_poly =
+                                poly_add(&poly_add(&term1, &term2), &poly_add(&term34, &r_uv_dir));
 
                             // Differentiate each of the 5 integrand terms
                             let t1_dir = poly_add(
