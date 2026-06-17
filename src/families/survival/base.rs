@@ -2584,7 +2584,8 @@ impl WorkingModelSurvival {
             const LM_MU_MIN: f64 = 1e-14;
             let p = beta.len();
             let mut mu = LM_MU_INIT;
-            for _ in 0..POLISH_MAX_ITERS {
+            let dbg = std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some();
+            for polish_iter in 0..POLISH_MAX_ITERS {
                 let st = match candidate.update_state(&beta) {
                     Ok(st) => st,
                     Err(_) => break,
@@ -2595,6 +2596,27 @@ impl WorkingModelSurvival {
                     break;
                 }
                 let h = st.hessian.to_dense();
+                if dbg && polish_iter < 6 {
+                    // Probe the UNDAMPED full-Newton step's effect on ||r|| to
+                    // tell apart (i) feasibility rejection, (ii) gradient/Hessian
+                    // inconsistency, and (iii) a genuine near-null H direction.
+                    if let Ok(h0) = crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h) {
+                        use crate::estimate::reml::reml_outer_engine::HessianOperator;
+                        let step0 = h0.solve(&r);
+                        let hr = h.dot(&r);
+                        let hr_norm = hr.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        let trial0 = &beta - &step0;
+                        let (feasible0, tn0) = match candidate.update_state(&trial0) {
+                            Ok(ts) => (true, ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt()),
+                            Err(_) => (false, f64::NAN),
+                        };
+                        eprintln!(
+                            "[931-POLISH] iter={} r_norm={:+.6e} ||Hr||={:+.6e} r={:?} h_diag=[{:+.4e},{:+.4e}] h_off={:+.4e} newton_feasible={} newton_tn={:+.6e}",
+                            polish_iter, r_norm, hr_norm, r.to_vec(),
+                            h[[0,0]], h[[p-1,p-1]], h[[0,p.saturating_sub(1)]], feasible0, tn0
+                        );
+                    }
+                }
                 let diag: Vec<f64> = (0..p).map(|d| h[[d, d]].abs().max(1e-12)).collect();
                 // Inner LM loop: grow mu until a feasible ||r||-decreasing step is found.
                 let mut accepted = false;
