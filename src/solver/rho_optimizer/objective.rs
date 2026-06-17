@@ -299,7 +299,15 @@ pub trait OuterObjective {
             "[OUTER] finalize: re-installing best rho into the objective (solver {:?})",
             plan.solver
         );
-        self.eval_cost(rho).map(|_| ())
+        match plan.solver {
+            Solver::Efs | Solver::HybridEfs => self.eval_efs(rho).map(|_| ()),
+            Solver::Bfgs => self
+                .eval_with_order(rho, OuterEvalOrder::ValueAndGradient)
+                .map(|_| ()),
+            Solver::Arc => self
+                .eval_with_order(rho, OuterEvalOrder::ValueGradientHessian)
+                .map(|_| ()),
+        }
     }
 }
 

@@ -1357,6 +1357,9 @@ pub(crate) fn run_outer(
     context: &str,
 ) -> Result<OuterResult, EstimationError> {
     let mut result = run_outer_uncertified(obj, config, context)?;
+    if config.max_iter <= 1 {
+        return Ok(result);
+    }
     // First-order optimality self-audit (#934): once, at the returned θ̂,
     // outside all hot loops, for every entry point of the solver ladder
     // (dense, device, per-atom EFS, fallback plans). Probes evaluate the
