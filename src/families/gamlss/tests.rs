@@ -7768,7 +7768,54 @@ pub(crate) fn binomial_location_scale_expected_hphi_drift_matches_finite_differe
         },
     ];
     let total = beta_t.len() + beta_ls.len();
-    let z = Array2::<f64>::eye(total);
+    // IDENTIFIABLE-SPAN Jeffreys subspace `Z_J`. The binomial location-scale map
+    // `q = −η_t/σ` carries an EXACT threshold↔scale gauge degeneracy: the
+    // direction `(δη_t = η_t, δη_ls = 1)` gives `q̇ = q_t·η_t + q_ls = −η_t/σ +
+    // η_t/σ = 0`, so the per-row q-gradient — hence the whole expected Fisher
+    // information `I(β)` — is rank-deficient by exactly one along this gauge
+    // axis. On the constant-design fixture every row is proportional, so `I` is
+    // rank 1 and its smallest eigenvalue is structurally ZERO. Differencing the
+    // floored-pseudo-inverse `H_Φ` over the FULL span (`Z = I`) therefore
+    // central-differences a quantity whose near-zero-eigenvalue eigenvector is
+    // arbitrary up to numerical noise: the FD is meaningless (it swings by
+    // O(1/floor) with the eps choice) even though the analytic drift is exact.
+    // Production never runs the Jeffreys term on the raw gauge-degenerate span;
+    // it reduces to the identifiable coordinates first. We mirror that here by
+    // taking `Z_J` to be the eigenvectors of the base information with
+    // non-negligible eigenvalue, so the reduced `H_Φ` is well-conditioned and
+    // its central difference converges to the analytic directional derivative at
+    // the 1e-7 bar. (The dropped gauge axis carries no identifiable curvature, so
+    // restricting to it loses nothing the objective ever uses.)
+    let z = {
+        use crate::faer_ndarray::FaerEigh;
+        use faer::Side;
+        let base_info = family
+            .joint_jeffreys_information_with_specs(&states, &specs)
+            .expect("base expected info")
+            .expect("base expected info present");
+        let mut sym = Array2::<f64>::zeros((total, total));
+        for i in 0..total {
+            for j in 0..total {
+                sym[[i, j]] = 0.5 * (base_info[[i, j]] + base_info[[j, i]]);
+            }
+        }
+        let (evals, evecs) = sym.eigh(Side::Lower).expect("base info eigendecomposition");
+        let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+        // Keep the identifiable directions (curvature ≥ a tiny fraction of the
+        // dominant eigenvalue); drop the structural gauge null space.
+        let keep: Vec<usize> = (0..total)
+            .filter(|&i| evals[i] > lambda_max * 1e-8)
+            .collect();
+        assert!(
+            !keep.is_empty(),
+            "base information must have an identifiable direction"
+        );
+        let mut z = Array2::<f64>::zeros((total, keep.len()));
+        for (col, &i) in keep.iter().enumerate() {
+            z.column_mut(col).assign(&evecs.column(i));
+        }
+        z
+    };
     let direction = Array1::from_shape_fn(total, |i| 0.03 * ((i + 1) as f64).sin());
     let perturb = |scale: f64| {
         let mut next = states.clone();
