@@ -677,24 +677,42 @@ impl PsiGramTensor {
             self.skip_psi_hi = f64::NAN;
             return;
         }
-        let bound = PSI_GRAM_SKIP_COND_FACTOR * cond_center;
         let span = self.psi_hi - self.psi_lo;
         let n = PSI_GRAM_SKIP_SCAN_POINTS;
-        // Walk outward from the center to the first ψ (each side) whose
-        // conditioning exceeds the bound; the stable band is the interval up to
-        // (but not including) that crossing.
+        // Expand a centered band, tracking the running min/max conditioning over
+        // EVERYTHING admitted so far. Stop on each side when admitting the next
+        // ψ would push `cond_max / cond_min` over [`PSI_GRAM_SKIP_COND_FACTOR`].
+        // Bounding the RATIO across the whole band (not each point vs the center)
+        // guarantees ANY reference→trial pair inside it — e.g. the
+        // revision-pinning ψ vs a later skip trial — sees a conditioning move of
+        // at most the factor, so the reduced basis is stable between them.
+        let mut cond_min = cond_center;
+        let mut cond_max = cond_center;
+        let mut admit = |c: f64, cmin: &mut f64, cmax: &mut f64| -> bool {
+            if !c.is_finite() {
+                return false;
+            }
+            let nmin = cmin.min(c);
+            let nmax = cmax.max(c);
+            if nmax / nmin > PSI_GRAM_SKIP_COND_FACTOR {
+                return false;
+            }
+            *cmin = nmin;
+            *cmax = nmax;
+            true
+        };
         let mut lo = center;
         let mut hi = center;
         for i in 1..=n {
             let psi = center - span * 0.5 * (i as f64) / (n as f64);
-            if psi < self.psi_lo || cond_at(self, psi) > bound {
+            if psi < self.psi_lo || !admit(cond_at(self, psi), &mut cond_min, &mut cond_max) {
                 break;
             }
             lo = psi;
         }
         for i in 1..=n {
             let psi = center + span * 0.5 * (i as f64) / (n as f64);
-            if psi > self.psi_hi || cond_at(self, psi) > bound {
+            if psi > self.psi_hi || !admit(cond_at(self, psi), &mut cond_min, &mut cond_max) {
                 break;
             }
             hi = psi;
