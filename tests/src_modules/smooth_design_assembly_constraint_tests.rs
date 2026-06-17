@@ -4797,9 +4797,33 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // reference surface + revision, then evaluate ψ_B / ψ_C against that same
     // revision WITHOUT re-realizing — exactly what `eval_full` does on the
     // certified skip path.
-    let psi_a = psi_lo + 0.30 * (psi_hi - psi_lo);
-    let psi_b = 0.5 * (psi_lo + psi_hi);
-    let psi_c = psi_hi - 0.15 * (psi_hi - psi_lo);
+    //
+    // #1216 item 3: the skip is only SOUND inside the tensor's
+    // conditioning-stable sub-window (production gates `eval_full`'s skip on
+    // `psi_gram_tensor_covers_skip`; outside it the reduced basis has moved and
+    // the full `reset_surface` slow path runs). Mirror that here — pick the three
+    // operating points INSIDE that band (scan it from the attached tensor), so
+    // the test exercises the skip exactly where production would take it. A test
+    // that pinned points across the whole window would exercise an unsound skip
+    // production never performs.
+    let skip_band: Vec<f64> = {
+        let m = 256usize;
+        (0..=m)
+            .map(|i| psi_lo + (psi_hi - psi_lo) * (i as f64) / (m as f64))
+            .filter(|&p| tensor_eval.psi_gram_tensor_covers_skip(p))
+            .collect()
+    };
+    assert!(
+        skip_band.len() >= 3,
+        "conditioning-stable skip sub-window must contain ≥3 ψ points for a \
+         non-vacuous fast-path gate (found {})",
+        skip_band.len()
+    );
+    let skip_lo = *skip_band.first().unwrap();
+    let skip_hi = *skip_band.last().unwrap();
+    let psi_a = skip_lo + 0.25 * (skip_hi - skip_lo);
+    let psi_b = 0.5 * (skip_lo + skip_hi);
+    let psi_c = skip_lo + 0.75 * (skip_hi - skip_lo);
     let rho = Array1::<f64>::from_elem(rho_dim, 0.5);
     let theta_at = |psi: f64| {
         let mut theta = Array1::<f64>::zeros(rho_dim + 1);
