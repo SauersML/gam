@@ -20,7 +20,3 @@ mod measure_jet_perf_parity;
 mod measure_jet_scale_smoke;
 #[path = "measure_jet/measure_jet_web_quality.rs"]
 mod measure_jet_web_quality;
-#[path = "measure_jet/zz_diag_1040_probe.rs"]
-mod zz_diag_1040_probe;
-#[path = "measure_jet/zz_gamma_fd_hsweep_diag.rs"]
-mod zz_gamma_fd_hsweep_diag;
