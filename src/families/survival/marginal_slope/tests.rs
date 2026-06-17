@@ -2281,6 +2281,16 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
             "DIAG979U(FD-a) a_u[g]={:+.6e} a_u[w]={:+.6e} a_uv[g,w]={:+.6e} a_uv_dir[g,w]={:+.6e}",
             a_u_g, a_u_w, a_uv_gw, d3a(3e-3)
         );
+        // FD f_uv_dir by calling the directional fn at b=g±hb with FIXED a=a1b.
+        // The DIAG979A print emits base f_uv(g) per call; the test reads them from
+        // the log (b-tagged). Trigger the extra calls here.
+        let hb = 1e-3;
+        for db in [hb, -hb] {
+            let _ = family.compute_survival_timepoint_directional_exact(
+                0, &primary_s, q1v, primary_s.q1, a1b, gv + db,
+                Some(&beta_h_arr), Some(&beta_w_arr), &unit(gi), true,
+            );
+        }
     }
     let third_checks = [(q0i, hi0), (gi, wi0), (hi0, wi0), (q0i, wi0)];
     for &(u, v) in &third_checks {
