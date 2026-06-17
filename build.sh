@@ -18,7 +18,11 @@ REPO=/Users/user/gam
 S="$REPO/.buildd"; mkdir -p "$S"
 LOCK="$S/build.lock"; COVER="$S/coverage.marker"; SNAP="$S/snap.marker"
 LOG="$S/last.log"; RESULT="$S/last.code"
-export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=0
+# Incremental ON (default): rustc reuses unchanged functions at item/body
+# granularity, so a small edit recompiles only the affected closure, not the
+# whole gam crate. (CI sets =0 for an unrelated per-file-test-loop reason; that
+# does NOT apply to this single-flight shared builder.)
+export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1
 TIMEOUT=1800
 
 # If args given, this is a (cheap) test-run after binaries are already built:
