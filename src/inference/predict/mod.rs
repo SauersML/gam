@@ -34,7 +34,8 @@ use crate::mixture_link::{
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
 };
 use crate::probability::{
-    gamma_moment_matched_interval, normal_cdf, normal_pdf, standard_normal_quantile,
+    beta_moment_matched_interval, gamma_moment_matched_interval,
+    negative_binomial_moment_matched_interval, normal_cdf, normal_pdf, standard_normal_quantile,
 };
 use crate::quadrature::QuadratureContext;
 use crate::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
@@ -1755,56 +1756,55 @@ where
         clamp_to_support(lower, upper)
     };
 
-    // Skew-aware equal-tailed band for a strictly-positive, right-skewed
-    // response whose conditional law is well-approximated by a Gamma. A
-    // symmetric `μ ± z·σ` band gets the *width* right but the *shape* wrong:
-    // for a Gamma the true lower 2.5% quantile sits well above zero while the
-    // symmetric lower edge hugs the support floor, so the lower tail captures
-    // (almost) the whole lower half of the distribution and the upper tail then
-    // overshoots the nominal level (#817).
+    // Skew-aware equal-tailed observation band for a non-Gaussian response. A
+    // symmetric `μ ± z·σ` band gets the *width* right but the *shape* wrong: on
+    // a skewed family the true lower/upper quantiles are not symmetric about the
+    // mean, so the symmetric edges land in the wrong place and each tail
+    // mis-covers even though the two-sided total lands near nominal by
+    // cancellation (#817 Gamma; #1193 NegativeBinomial; #1194 Beta).
     //
-    // Instead, model the predictive distribution of a *new* observation as a
-    // Gamma whose first two moments match the point prediction: mean `μ` and
-    // total predictive variance `V = SE(μ̂)² + Var(Y|μ)` (estimation +
-    // observation noise). That fixes `shape k = μ²/V`, `scale θ = V/μ`, and the
-    // band is the pair of equal-tailed Gamma quantiles at the same tail
-    // probabilities the symmetric band targeted, `Φ(−z_lower)` and `Φ(z_upper)`.
-    //
-    // When estimation uncertainty vanishes (`SE(μ̂) → 0`) this is *exact*: with
-    // `Var(Y|μ) = φμ²`, `k → 1/φ` and `θ → φμ`, recovering the conditional Gamma
-    // `Gamma(shape = 1/φ, scale = φμ)` exactly. With nonzero `SE(μ̂)` it is the
-    // moment-matched Gamma predictive — the minimal skew-correct widening.
-    let gamma_predictive_bounds = |response_var: Array1<f64>| {
-        let n = mean.len();
-        let mut lower = Array1::<f64>::zeros(n);
-        let mut upper = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let mu = mean[i];
-            let total_var = (mean_standard_error[i].powi(2) + response_var[i]).max(0.0);
-            // Lower-tail probability of the lower edge and cumulative
-            // probability of the upper edge — identical tail mass to the
-            // symmetric band, routed through the correct distribution.
-            let p_lower = normal_cdf(-z_lower_per_row[i]);
-            let p_upper = normal_cdf(z_upper_per_row[i]);
-            match gamma_moment_matched_interval(mu, total_var, p_lower, p_upper) {
-                Some((q_lo, q_hi)) => {
-                    lower[i] = q_lo;
-                    upper[i] = q_hi;
-                }
-                None => {
-                    // Degenerate point (non-positive mean / zero variance), or an
-                    // enormous shape where the incomplete-gamma inverse loses
-                    // precision and the Gamma is essentially Gaussian anyway: fall
-                    // back to the (then-accurate) symmetric Gaussian edges, then
-                    // clamp to support.
-                    let s = total_var.sqrt();
-                    lower[i] = mu - z_lower_per_row[i] * s;
-                    upper[i] = mu + z_upper_per_row[i] * s;
+    // The fix is one construction parameterized by the family's predictive
+    // quantile: model a *new* observation by a distribution in the response's
+    // own family whose first two moments match the point prediction — mean `μ`
+    // and total predictive variance `V = SE(μ̂)² + Var(Y|μ)` (estimation +
+    // observation noise) — then read its equal-tailed quantiles at the SAME tail
+    // masses the symmetric band targeted, `Φ(−z_lower)` and `Φ(z_upper)`. When
+    // estimation uncertainty vanishes (`SE(μ̂) → 0`) the moment-matched
+    // predictive collapses to the exact conditional law, so the band is exact;
+    // with nonzero `SE(μ̂)` it is the minimal skew-correct widening. `predictive`
+    // returns the `(lower, upper)` quantile pair, or `None` for degenerate /
+    // near-Gaussian rows where the caller should keep the symmetric edges.
+    let skew_predictive_bounds =
+        |response_var: Array1<f64>,
+         predictive: &dyn Fn(f64, f64, f64, f64) -> Option<(f64, f64)>| {
+            let n = mean.len();
+            let mut lower = Array1::<f64>::zeros(n);
+            let mut upper = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let mu = mean[i];
+                let total_var = (mean_standard_error[i].powi(2) + response_var[i]).max(0.0);
+                // Lower-tail probability of the lower edge and cumulative
+                // probability of the upper edge — identical tail mass to the
+                // symmetric band, routed through the correct distribution.
+                let p_lower = normal_cdf(-z_lower_per_row[i]);
+                let p_upper = normal_cdf(z_upper_per_row[i]);
+                match predictive(mu, total_var, p_lower, p_upper) {
+                    Some((q_lo, q_hi)) => {
+                        lower[i] = q_lo;
+                        upper[i] = q_hi;
+                    }
+                    None => {
+                        // Degenerate / near-Gaussian row: fall back to the
+                        // (then-accurate) symmetric Gaussian edges, clamped to
+                        // support below.
+                        let s = total_var.sqrt();
+                        lower[i] = mu - z_lower_per_row[i] * s;
+                        upper[i] = mu + z_upper_per_row[i] * s;
+                    }
                 }
             }
-        }
-        clamp_to_support(lower, upper)
-    };
+            clamp_to_support(lower, upper)
+        };
 
     match response {
         ResponseFamily::Gaussian => {
@@ -1842,13 +1842,30 @@ where
             }) else {
                 return (None, None);
             };
+            // The NB is discrete with a real atom at zero, so a symmetric band
+            // sits below the true upper quantile on right-skewed counts and
+            // under-covers the upper tail (#1193). Build the edges from genuine
+            // equal-tailed NB quantiles (estimation uncertainty folded into an
+            // effective dispersion), NOT a continuous moment-matched surrogate —
+            // a Gamma has no zero atom and would grossly over-cover the lower
+            // tail at low means.
             let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
-            response_observation_bounds(response_var)
+            skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
+                negative_binomial_moment_matched_interval(mu, theta, total_var, p_lo, p_hi)
+            })
         }
         ResponseFamily::Tweedie { p } => {
             let Some(phi) = source.observation_phi() else {
                 return (None, None);
             };
+            // Tweedie (1 < p < 2) is a compound Poisson–Gamma: a point mass at
+            // zero plus a continuous right-skewed positive part. Its symmetric
+            // band shares the #817 skew defect, but the skew-correct predictive
+            // is the compound-distribution quantile — NOT a moment-matched Gamma
+            // (which lacks the zero atom and would over-cover the lower tail like
+            // the NB surrogate, #1193). That quantile (a Poisson-weighted sum of
+            // Gamma CDFs) is a distinct numeric scheme; until it lands, keep the
+            // symmetric edges rather than substitute a wrong-shaped surrogate.
             let response_var = mean.mapv(|mu| phi * mu.powf(*p));
             response_observation_bounds(response_var)
         }
@@ -1861,7 +1878,9 @@ where
                 return (None, None);
             };
             let response_var = mean.mapv(|mu| phi * mu.powi(2));
-            gamma_predictive_bounds(response_var)
+            skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
+                gamma_moment_matched_interval(mu, total_var, p_lo, p_hi)
+            })
         }
         ResponseFamily::Beta { .. } => {
             // Beta's precision is estimated jointly with the mean (#567/#769)
@@ -1874,8 +1893,14 @@ where
             let Some(phi) = source.observation_phi() else {
                 return (None, None);
             };
+            // Beta is continuous on (0,1) and skewed toward whichever edge its
+            // mean is near, so a symmetric band mis-covers BOTH tails (#1194).
+            // Build the edges from equal-tailed quantiles of a moment-matched
+            // Beta predictive, mirroring the Gamma arm.
             let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
-            response_observation_bounds(response_var)
+            skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
+                beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
+            })
         }
         ResponseFamily::Binomial => {
             // Prediction returns probability/proportion means; trial counts are not in this API.
