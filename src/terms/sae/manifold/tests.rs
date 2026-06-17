@@ -6953,7 +6953,7 @@ pub(crate) fn warmstart_test_objective_with_evaluator() -> SaeManifoldOuterObjec
     // `PeriodicHarmonicEvaluator::new(3)` produces the SAME 3-column Fourier
     // basis `[1, sin(2πt), cos(2πt)]` (1 harmonic) and matching first jet that
     // `periodic_basis` builds, so phi/jet are consistent with the decoder dims.
-    let evaluator = Arc::new(crate::terms::sae::basis::PeriodicHarmonicEvaluator::new(3).unwrap());
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
     let coords = array![[0.10_f64], [0.35], [0.62], [0.88]];
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let atom = SaeManifoldAtom::new(
@@ -9553,6 +9553,18 @@ mod inner_contract_probe_tests {
         assert!(
             value_lane.is_finite() && gradient_lane.is_finite(),
             "both lanes must be finite: value={value_lane}, gradient={gradient_lane}"
+        );
+
+        // The amortized warm-start on this arbitrary-target fixture certifies no
+        // rows (the conservative Kantorovich gate), so it leaves the inner coords
+        // untouched — which means the lanes and the bare criterions below all
+        // solve from the identical seed state and the bare comparisons are exact.
+        assert_eq!(
+            objective.warm_start_telemetry().total_rows_warm_started,
+            0,
+            "fixture precondition: warm-start must certify zero rows so the bare \
+             comparisons are drift-free; got {:?}",
+            objective.warm_start_telemetry()
         );
 
         // Bare REML for the VALUE lane, computed on the SAME probe refine policy
