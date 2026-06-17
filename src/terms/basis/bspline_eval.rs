@@ -340,10 +340,7 @@ pub(crate) fn apply_dense_bspline_extrapolation(
 }
 
 #[inline]
-pub(crate) fn has_clamped_bspline_boundaries(
-    knotview: ArrayView1<f64>,
-    degree: usize,
-) -> bool {
+pub(crate) fn has_clamped_bspline_boundaries(knotview: ArrayView1<f64>, degree: usize) -> bool {
     let clamp_count = degree + 1;
     if knotview.len() < 2 * clamp_count {
         return false;
