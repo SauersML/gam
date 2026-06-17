@@ -2628,9 +2628,19 @@ impl WorkingModelSurvival {
                     .map(|d| h[[d, d]].abs())
                     .fold(0.0_f64, f64::max)
                     .max(1.0);
+                // Solve (H + λI) step = r by an EXACT Cholesky factorization
+                // (faer Llt), NOT the DenseSpectralOperator: the spectral
+                // operator clamps tiny/negative eigenvalues, which on the
+                // catastrophically ill-conditioned boundary Hessian (cond ~2400,
+                // exp(η) huge at β₀≈4.6) corrupts the solve so badly that
+                // rᵀH⁻¹r lost its sign and the previous polish broke on iter 0.
+                // Cholesky succeeds iff H+λI is SPD; sweeping λ up from 0 finds
+                // the smallest SPD shift, and for an SPD system rᵀ(H+λI)⁻¹r > 0
+                // EXACTLY (Cholesky is backward-stable, no clamping), so the
+                // Newton direction is a guaranteed descent direction.
                 let mut step: Option<Array1<f64>> = None;
                 let mut dir_deriv = 0.0_f64;
-                for lm_pow in 0..16 {
+                for lm_pow in 0..18 {
                     let lambda_lm = if lm_pow == 0 {
                         0.0
                     } else {
@@ -2640,19 +2650,18 @@ impl WorkingModelSurvival {
                     for d in 0..p {
                         h_reg[[d, d]] += lambda_lm;
                     }
-                    let hop = match crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h_reg) {
-                        Ok(op) => op,
+                    let factor = match crate::faer_ndarray::FaerCholesky::cholesky(
+                        &h_reg,
+                        faer::Side::Lower,
+                    ) {
+                        Ok(f) => f,
                         Err(_) => continue,
                     };
-                    let candidate_step = {
-                        use crate::estimate::reml::reml_outer_engine::HessianOperator;
-                        hop.solve(&r)
-                    };
+                    let candidate_step = factor.solvevec(&r);
                     if candidate_step.iter().any(|v| !v.is_finite()) {
                         continue;
                     }
-                    // ∇fᵀd = rᵀ(−step) = −r·H_reg⁻¹r. Require it negative and not
-                    // negligibly small relative to ‖r‖² (a genuine descent dir).
+                    // ∇fᵀd = rᵀ(−step) = −r·(H+λI)⁻¹r < 0 exactly for SPD systems.
                     let dd = -r.dot(&candidate_step);
                     if dd.is_finite() && dd < -1e-14 * r_norm * r_norm {
                         step = Some(candidate_step);
@@ -2692,10 +2701,22 @@ impl WorkingModelSurvival {
                     .update_state(&beta)
                     .map(|st| st.gradient.iter().map(|v| v * v).sum::<f64>().sqrt())
                     .unwrap_or(f64::NAN);
-                eprintln!(
-                    "[931-POLISH] rho={:?} iters={} exit_reason={} final_r_norm={:+.6e}",
+                let line = format!(
+                    "[931-POLISH] rho={:?} iters={} exit_reason={} final_r_norm={:+.6e}\n",
                     rho, iters_done, exit_reason, final_r
                 );
+                // Flush to stderr so a slow/killed sbatch job still surfaces the
+                // datum, and append to a file so it survives a scancel.
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(line.as_bytes());
+                let _ = std::io::stderr().flush();
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/931_polish.txt")
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
             }
         }
 
