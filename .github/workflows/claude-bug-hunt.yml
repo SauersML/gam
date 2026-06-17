@@ -96,7 +96,7 @@ jobs:
             with their own failing test are MORE valuable to the maintainer
             than one big writeup.
 
-            If you find a lot of bugs (5+), keep going as long as each one
+            If you find a lot of bugs (50+), keep going as long as each one
             is genuinely distinct and well-posed. Don't pad — quality over
             quantity. But also don't artificially stop at one when you've
             uncovered a chain.
@@ -133,7 +133,9 @@ jobs:
 
             If you genuinely can't find anything real this run, that's a
             fine outcome. Say so in the workflow log and exit. Don't ship
-            a contrived issue to look productive.
+            a contrived issue to look productive. But this is very unlikely.
+            A more common failure mode is under-ambition. Find more chains.
+            Look in CI jobs for failures and inaccuracies. Get creative.
 
             Have fun with it.
 
