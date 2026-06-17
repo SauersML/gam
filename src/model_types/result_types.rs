@@ -157,7 +157,7 @@ impl CriterionCertificate {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FitOptions {
     pub latent_cloglog: Option<LatentCLogLogState>,
     pub mixture_link: Option<MixtureLinkSpec>,
