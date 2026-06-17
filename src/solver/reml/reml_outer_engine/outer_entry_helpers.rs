@@ -471,7 +471,16 @@ pub(crate) fn outer_gradient_entry(
         0.0
     };
     let det_term = if incl_logdet_s { 0.5 * ld_s_i } else { 0.0 };
-    penalty_term + trace_term - det_term
+    let value = penalty_term + trace_term - det_term;
+    // #931 TEMPORARY env-gated per-term breakdown to localize the residual
+    // large-lambda envelope desync (analytic vs FD at rho=6 with the inner now
+    // converged to ~1e-12). Removed once fixed.
+    if std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some() {
+        eprintln!(
+            "[931-RHOGRAD] value={value:+.9e} a_i={penalty_term:+.9e} half_trace_logH={trace_term:+.9e} half_ld_s={det_term:+.9e} raw_trace_i={trace_logdet_i:+.9e} raw_ld_s_i={ld_s_i:+.9e}"
+        );
+    }
+    value
 }
 
 /// Compute one entry of the outer Hessian.

@@ -2739,7 +2739,16 @@ impl WorkingModelSurvival {
         // convention of this shim.
         let rho_arr = Array1::from_vec(rho.to_vec());
         let state = candidate.update_state(&beta)?;
-        candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
+        let out = candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr);
+        if std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some() {
+            if let Ok((v, g)) = &out {
+                eprintln!(
+                    "[931-SHIM] rho={:?} laml_value={:+.12e} analytic_grad={:?}",
+                    rho, v, g.to_vec()
+                );
+            }
+        }
+        out
     }
 }
 
