@@ -2275,10 +2275,10 @@ impl SurvivalLocationScaleFamily {
             grad_time_eta_d: d1_qdot1,
             h_time_h0: d2_q0,
             h_time_h1: d2_q1,
-            h_time_d: tower.h[2][2],
+            h_time_d: d2_qdot1,
             d_h_h0: d3_q0,
             d_h_h1: d3_q1,
-            d_h_d: tower.t3[2][2][2],
+            d_h_d: -tower.t3[2][2][2],
         }))
     }
 }
