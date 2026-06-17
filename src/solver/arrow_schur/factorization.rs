@@ -743,6 +743,13 @@ pub(crate) fn factor_one_row_result(
                 // factor is genuinely PD, so its diagonal gives an exact log|S|
                 // and an inaccurate Δβ would be discarded anyway.
                 if tolerate_ill_conditioning {
+                    if ridge_t == 0.0
+                        && !row_gauges.is_empty()
+                        && let Some(deflated) =
+                            factor_gauge_deflated_evidence_row(row, d, row_gauges)
+                    {
+                        return Ok(deflated);
+                    }
                     break ArrowRowFactorResult {
                         factor,
                         gauge_deflated_directions: 0,
@@ -815,7 +822,9 @@ pub(crate) fn factor_one_row_result(
                         // The undamped exact Cholesky still owns every genuinely
                         // PD block (this arm is reached only on a refused factor),
                         // so K=1 and any PD K>1 row are bit-for-bit unchanged.
-                        if let Some(deflated) = factor_spectral_deflated_evidence_row(row, d) {
+                        if !row_gauges.is_empty()
+                            && let Some(deflated) = factor_spectral_deflated_evidence_row(row, d)
+                        {
                             return Ok(deflated);
                         }
                     }

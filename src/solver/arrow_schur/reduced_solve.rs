@@ -408,30 +408,7 @@ pub(crate) fn solve_dense_reduced_system(
 ) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
     let factor = match cholesky_lower(schur) {
         Ok(factor) => factor,
-        Err(e) => {
-            // Evidence/log-det-only callers must not die on a genuinely non-PD
-            // reduced Schur complement (#1118 β-block analogue). On a
-            // rank-deficient multi-atom dictionary the per-row H_tt blocks are
-            // unit-stiffness deflated to stay PD, but the Schur subtraction
-            // `Σ H_tβᵀ H_tt⁻¹ H_tβ` can still drive a β-complement pivot negative
-            // off the inner optimum (the reported `-0.064 at index 256` on the
-            // OLMo K=8 capstone). Condition the offending eigen-directions to
-            // unit stiffness exactly as the per-row evidence path does: the
-            // deflated directions contribute a ρ-independent `log 1 = 0` to
-            // `log|S|`, so the evidence value stays consistent with the analytic
-            // ρ-gradient and the EV≥0 / finite-normaliser guarantee is preserved.
-            // The discarded Δβ is solved against the conditioned factor (harmless
-            // — evidence mode ignores it). Non-evidence (step-accuracy) callers
-            // still surface the hard `SchurFactorFailed` so the outer LM loop can
-            // lift `ridge_beta` and re-form a genuinely PD complement.
-            if options.tolerate_ill_conditioning {
-                if let Some(deflated) = factor_spectral_deflated_evidence_dense(schur) {
-                    let delta_beta = cholesky_solve_vector(&deflated, rhs_beta);
-                    return Ok((delta_beta, Some(deflated), PcgDiagnostics::default()));
-                }
-            }
-            return Err(ArrowSchurError::SchurFactorFailed { reason: e });
-        }
+        Err(e) => return Err(ArrowSchurError::SchurFactorFailed { reason: e }),
     };
     // Ill-conditioned-but-PD Schur guard. The per-row factor checks reject
     // any single barely-PD H_tt^(i) block, but the reduced Schur complement
