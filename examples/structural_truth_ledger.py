@@ -37,24 +37,13 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------
-# Raw-payload capture: ManifoldSAE.from_payload drops the `hybrid_split` block.
-# We stash the raw payload dict on the returned object so the per-atom verdicts
-# (fitted_turning Theta, held_out_delta_ev, curved_evidence_margin) are readable.
+# #1204: ManifoldSAE now surfaces the `hybrid_split` report as a public field,
+# so the per-atom verdicts (fitted_turning Theta, held_out_delta_ev,
+# curved_evidence_margin) are readable directly off the model — no monkey-patch
+# of from_payload needed any more. Kept as a no-op for call-site compatibility.
 # --------------------------------------------------------------------------
 def _install_payload_capture():
-    from gamfit import _sae_manifold as M
-
-    orig = M.ManifoldSAE.from_payload.__func__
-
-    def patched(cls, x, payload, *a, **k):
-        obj = orig(cls, x, payload, *a, **k)
-        try:
-            object.__setattr__(obj, "_raw_payload", dict(payload))
-        except Exception:
-            pass
-        return obj
-
-    M.ManifoldSAE.from_payload = classmethod(patched)
+    return None
 
 
 def _ev(target: np.ndarray, fitted: np.ndarray) -> float:
@@ -86,11 +75,11 @@ def _fit(z_tr, k, topology, seed, n_iter):
 
 
 def _hybrid_atoms(model):
-    """Return the per-atom hybrid-split verdict list, or [] if absent."""
-    raw = getattr(model, "_raw_payload", None)
-    if not raw:
-        return []
-    hs = raw.get("hybrid_split")
+    """Return the per-atom hybrid-split verdict list, or [] if absent.
+
+    Reads the now-public ``ManifoldSAE.hybrid_split`` field (#1204).
+    """
+    hs = getattr(model, "hybrid_split", None)
     if not hs:
         return []
     return hs.get("atoms", [])

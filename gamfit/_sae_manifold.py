@@ -923,6 +923,21 @@ class ManifoldSAE:
     # follow-up :meth:`steer` re-installs the matching ``RowMetric`` so the dose
     # is measured in the same geometry the fit's gauge used.
     fisher_provenance: str = "output_fisher"
+    # Per-atom curved-vs-linear hybrid-split report (#1202/#1204), the structured
+    # EV-vs-Θ frontier the FFI emits under the payload ``hybrid_split`` key. Keys:
+    # ``curved_atom_count``, ``linear_atom_count``, ``total_negative_log_evidence``,
+    # ``total_parameters``, ``is_pure_linear``, ``is_pure_curved``, and ``atoms``
+    # (one entry per eligible d=1 atom, each ``{"atom": str, "kept_curved": bool,
+    # "parameterization": str, "negative_log_evidence": float, "num_parameters":
+    # int, "curved_evidence_margin": float, "fitted_turning": float | None,
+    # "held_out_delta_ev": float | None}``). This is a POST-HOC curve-simplification
+    # diagnostic (#1202), NOT a data-level dominance guarantee. Previously the FFI
+    # emitted this block but the public class dropped it, forcing callers to
+    # monkey-patch ``from_payload`` (see examples/structural_truth_ledger.py);
+    # surfaced here so the (Θ, ΔEV) frontier is queryable per atom off the normal
+    # object. ``None`` when no eligible d=1 atom existed (nothing to adjudicate) or
+    # for payloads predating the report.
+    hybrid_split: dict[str, Any] | None = None
 
     @property
     def chosen_k(self) -> int:
@@ -1177,6 +1192,15 @@ class ManifoldSAE:
                 else str(payload["structure_certificate"])
             ),
             cotrain=cotrain,
+            # #1204: the per-atom curved-vs-linear hybrid-split frontier the FFI
+            # emits under ``hybrid_split``. Read it through verbatim so callers can
+            # query the (Θ, ΔEV) frontier off the public object rather than
+            # monkey-patching this method. ``None`` when the FFI emitted no report.
+            hybrid_split=(
+                None
+                if payload.get("hybrid_split") is None
+                else dict(payload["hybrid_split"])
+            ),
         )
 
     def structure_certificate(self, *, alpha: float | None = None) -> dict[str, Any]:
@@ -2062,6 +2086,7 @@ class ManifoldSAE:
             ),
             "structure_certificate": self.structure_certificate_json,
             "cotrain": None if self.cotrain is None else _jsonable(self.cotrain),
+            "hybrid_split": None if self.hybrid_split is None else _jsonable(self.hybrid_split),
         }
 
     def save(self, path: str | Path) -> None:
@@ -2173,6 +2198,12 @@ class ManifoldSAE:
                 else str(payload["structure_certificate"])
             ),
             cotrain=_coerce_cotrain_report(payload.get("cotrain")),
+            # #1204: round-trip the hybrid-split frontier through save/load.
+            hybrid_split=(
+                None
+                if payload.get("hybrid_split") is None
+                else dict(payload["hybrid_split"])
+            ),
         )
 
     @classmethod
