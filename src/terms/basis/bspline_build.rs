@@ -487,7 +487,24 @@ pub fn build_bspline_basis_1d(
         kronecker_factors: None,
         op: None,
     }];
-    if spec.double_penalty {
+    // The nullspace-shrinkage ("double") penalty shrinks the polynomial
+    // null space of the difference penalty (the {1, x, …} directions the
+    // wiggliness penalty leaves unpenalized). Non-free endpoint boundary
+    // conditions structurally REMOVE those low-order degrees of freedom: an
+    // anchored Hermite pin kills the constant AND linear directions at the
+    // endpoint, and a clamped pin kills the linear direction. After the
+    // boundary nullspace reparameterization (`bspline_boundary_nullspace_transform`)
+    // projects the shrinkage block, the surviving null directions are largely
+    // gone, leaving the projected double-penalty block rank-deficient and very
+    // nearly flat. A near-flat penalty block carries its own smoothing
+    // parameter whose REML log-λ coordinate is (numerically) unidentified — the
+    // outer REML objective is almost flat along it and the outer optimizer
+    // crawls without certifying termination (the same non-termination the
+    // cyclic basis avoids by emitting only its wiggliness penalty; see the
+    // periodic arm above). Since the boundary conditions already pin the
+    // low-order DOF, the extra nullspace-shrinkage penalty is redundant here:
+    // skip it whenever the endpoints are constrained.
+    if spec.double_penalty && spec.boundary_conditions.is_free() {
         penalties_raw.push(PenaltyCandidate {
             matrix: build_nullspace_shrinkage_penalty(&s_bend_raw)?
                 .map(|shrink| shrink.sym_penalty)
