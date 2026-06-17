@@ -6,21 +6,27 @@ train split of genuine LLM residual-stream activations, reconstruct a
 *held-out* split via the OOS path (`m.reconstruct(z_test)`), and require a
 principled, defensible held-out reconstruction-quality bar.
 
-The fixture `tests/data/olmo_l25_pca64_768.npy` is a real-activation slice:
-OLMo-3-32B layer-25 residual stream, 768 token positions, mean-centered and
-PCA-reduced to 64 dims (the SAE PCA-reduces its input anyway). Spectrum:
-PC1=0.253, cum@K8=0.459, cum@K32=0.631, cum@K64=0.737 — a structured
-minority sitting on an unstructured bulk, which is exactly the regime the
-manifold dictionary is supposed to win in.
+The fixture `tests/data/olmo_mixedlayer_pca64_768.npy` is a real-activation
+*cross-layer mixture* (see #1199): 768 rows sampled across the flattened
+`(prompt, layer)` axis of the banked OLMo-3-32B `635 × 64 × 5120` corpus,
+mean-centered and PCA-reduced to 64 dims. It is NOT a single-layer L25 slice
+(a true L25 slice has 635 rows, one per prompt); its 64 leading PCs are
+dominated by cross-layer nuisance variation. Spectrum: PC1=0.253, cum@K8=0.459,
+cum@K32=0.631, cum@K64=0.737 — a long-tailed cloud, exactly the
+ill-conditioned regime the manifold dictionary is stress-tested on.
 
 WHY THIS IS RED (a real e2e gap, not a flaky/bogus assertion):
-  The defensible bar here is *linear parity*: a TopK / linear dictionary of
-  K shards trivially attains held-out EV equal to the cumulative PCA
-  spectrum at its rank. The whole wager of curved atoms (#1026 recon-parity
-  roadmap) is that the manifold SAE matches-or-beats that linear ceiling at
-  equal or lower K on real activations. We assert the production SAE clears
-  a *modest fraction* of the K8 linear ceiling (cum@K8 = 0.459) on held-out
-  real data. On real OLMo activations the curved-atom reconstruct path does
+  The reference bar here is the rank-k held-out EV of the affine PCA subspace.
+  This is a *reference upper bound* on what any rank-k LINEAR reconstruction
+  can attain on held-out data (the optimal rank-k subspace by Eckart–Young),
+  NOT a "ceiling the matched linear SAE attains for free": the production SAE
+  decoder path is gated/assignment-structured and (for the euclidean atom) a
+  degree-2 patch, not a dense rank-k orthogonal projector, so it does not
+  automatically realize this subspace. The whole wager of curved atoms (#1026
+  recon-parity roadmap) is that the manifold SAE matches-or-beats this linear
+  reference at equal or lower K on real activations. We assert the production
+  SAE clears a *modest fraction* of the K8 linear reference (cum@K8 = 0.459)
+  on held-out real data. On real OLMo activations the curved-atom reconstruct path does
   not currently reach this bar — it under-recovers on the long-tailed real
   spectrum (degenerate-basin under-recovery, the #976/#1117 collapse class
   manifesting on real-vs-synthetic data). This pins the genuine e2e gap:
@@ -28,9 +34,9 @@ WHY THIS IS RED (a real e2e gap, not a flaky/bogus assertion):
   yet earn its EV on real LLM activations.
 
 Closing this requires the manifold dictionary to actually earn held-out EV
-on real activations at parity with (or beating) the linear PCA ceiling at
-equal K — i.e. the #1026 recon-parity frontier landing in the green on real
-data, not just on planted synthetic harmonics.
+on real activations at parity with (or beating) the rank-k linear PCA
+reference at equal K — i.e. the #1026 recon-parity frontier landing in the
+green on real data, not just on planted synthetic harmonics.
 """
 from __future__ import annotations
 
@@ -50,9 +56,9 @@ _N_TRAIN = 384
 _N_TEST = 128
 _N_ITER = 32
 _FIT_TIMEOUT_SECONDS = 90.0
-# We do not even demand full parity with the linear ceiling — only that the
-# curved SAE earns a meaningful fraction of the linear EV at matched rank on
-# held-out real activations. The linear ceiling itself is recomputed from the
+# We do not even demand full parity with the linear PCA reference — only that
+# the curved SAE earns a meaningful fraction of the linear EV at matched rank on
+# held-out real activations. The linear reference itself is recomputed from the
 # committed fixture below (self-grounding; no trust in a hardcoded constant).
 _TARGET_FRACTION = 0.50
 
@@ -66,17 +72,26 @@ def _ev(x: np.ndarray, fitted: np.ndarray) -> float:
 
 
 def _heldout_linear_ceiling(z_train: np.ndarray, z_test: np.ndarray, k: int) -> float:
-    """Held-out EV of a rank-k *linear* (PCA) reconstruction: fit the top-k
-    principal subspace on the train split (centered on the train mean), project
-    the held-out split onto it, score EV. This is the linear-dictionary ceiling
-    a TopK SAE attains for free; the manifold SAE must match-or-beat a fraction
-    of it. Computed from the committed fixture so the bar is self-grounding."""
+    """Held-out EV of a rank-k *linear* (affine PCA) reconstruction: fit the
+    top-k principal subspace on the train split (centered on the train mean),
+    project the held-out split onto it, restore the mean, score EV. This is the
+    optimal rank-k LINEAR subspace by Eckart–Young — a *reference upper bound*
+    on any rank-k linear reconstruction of held-out data, NOT a ceiling the
+    gated/quadratic-patch SAE decoder attains for free. The manifold SAE must
+    match-or-beat a fraction of it. Computed from the committed fixture so the
+    bar is self-grounding."""
     mu = z_train.mean(axis=0, keepdims=True)
     ztr = z_train - mu
     zte = z_test - mu
     _, _, vt = np.linalg.svd(ztr, full_matrices=False)
     proj = vt[:k].T @ vt[:k]
-    recon = zte @ proj
+    # Restore the train mean before scoring so the reconstruction lives in the
+    # SAME (uncentered) coordinates as the target z_test. Scoring a centered
+    # reconstruction `zte @ proj` against an uncentered z_test mixes coordinate
+    # frames and yields a wrong EV (the projection cannot reproduce the constant
+    # mean offset it never saw). With the mean added back, EV is consistently the
+    # held-out reconstruction quality of the rank-k AFFINE PCA model.
+    recon = mu + zte @ proj
     return _ev(z_test, recon)
 
 
@@ -133,8 +148,9 @@ def _fit_and_score_olmo_real(queue: mp.Queue) -> None:
 
 def test_olmo_real_heldout_reconstruction_ev_meets_linear_parity():
     """Production manifold-SAE held-out reconstruction EV on real OLMo-3-32B
-    activations must clear a fixed fraction of the rank-8 *linear* PCA ceiling,
-    where that ceiling is recomputed from the committed fixture itself.
+    activations must clear a fixed fraction of the rank-8 *linear* PCA reference
+    upper bound, where that reference is recomputed from the committed fixture
+    itself.
 
     RED: on real activations the curved-atom reconstruct path under-recovers
     relative to this bar (it clears the synthetic planted-circle bars but not
@@ -149,9 +165,10 @@ def test_olmo_real_heldout_reconstruction_ev_meets_linear_parity():
     assert z_train.shape == (_N_TRAIN, 64)
     assert z_test.shape == (_N_TEST, 64)
 
-    # Self-grounding linear ceiling: the rank-K PCA held-out EV a TopK / linear
-    # dictionary attains for free at the SAME rank K. The manifold SAE must earn
-    # a fixed fraction of it on real data.
+    # Self-grounding linear reference: the rank-K affine PCA held-out EV — the
+    # optimal rank-K LINEAR subspace (Eckart–Young upper bound), NOT a ceiling
+    # the gated/quadratic-patch SAE decoder attains for free. The manifold SAE
+    # must earn a fixed fraction of it on real data.
     linear_ceiling = _heldout_linear_ceiling(z_train, z_test, _K)
     ev_target = _TARGET_FRACTION * linear_ceiling
 
@@ -181,7 +198,8 @@ def test_olmo_real_heldout_reconstruction_ev_meets_linear_parity():
     assert oos_ev >= ev_target, (
         f"Held-out reconstruction EV on real OLMo activations = {oos_ev:.4f}, "
         f"below the bar {ev_target:.4f} (= {_TARGET_FRACTION:.0%} of the "
-        f"measured rank-{_K} linear PCA ceiling {linear_ceiling:.4f}). "
+        f"measured rank-{_K} linear PCA reference upper bound "
+        f"{linear_ceiling:.4f}). "
         f"In-sample EV was {in_sample_ev:.4f}. "
         f"The manifold SAE does not yet earn its EV on real LLM activations "
         f"at parity with the linear dictionary — the #1026 recon-parity gap "
