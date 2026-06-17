@@ -144,3 +144,56 @@ def test_warm_start_shapes_are_validated() -> None:
             assignment="softmax", n_iter=1, random_state=0,
             t_init=np.zeros((k, n + 1, 1)),
         )
+
+
+def _oos_holdout(n_train: int = 48, n_test: int = 24, d: int = 6, k: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    """Disjoint train / held-out matrices drawn from the same circle mixture."""
+    return _synth(n=n_train, d=d, k=k, seed=0), _synth(n=n_test, d=d, k=k, seed=101)
+
+
+def test_oos_solve_returns_converged_latents_not_post_solve_reseed() -> None:
+    # Regression for #1229. The frozen-decoder OOS solve used to RESEED the
+    # assignment logits from projection residuals AFTER the joint Newton solve
+    # had converged the coords + logits, then read assignments / fitted from the
+    # reseeded logits. The returned routing was therefore the one-shot residual
+    # heuristic, not the solver's converged solution that the OOS path
+    # advertises (and that `fitted` was supposed to reflect).
+    #
+    # The reseed only fired on the COLD path (no a_init), so we exercise a cold
+    # held-out solve. A converged latent is a fixed point of the solver: warm-
+    # restarting the SAME solve from the returned (a*, t*) must barely move it.
+    # The pre-fix residual reseed is NOT a solver fixed point, so the warm
+    # re-solve would shift the routing materially — this test would have caught
+    # the bug and passes only on the converged-latent fix.
+    X_train, X_test = _oos_holdout()
+    fit = _fit(X_train, k=3)
+
+    cold = fit.converged_latents(X_test)  # cold OOS solve (no warm start)
+    a_star = np.asarray(cold["assignments"], dtype=float)
+    coords = cold["coords"]
+    n, kk = X_test.shape[0], 3
+    assert a_star.shape == (n, kk)
+    assert np.isfinite(a_star).all()
+
+    # Warm-restart the OOS solve from the returned converged latents.
+    a_init = np.asarray(cold["logits"], dtype=float)
+    t_init = np.stack([np.asarray(c, dtype=float) for c in coords], axis=0)
+    assert t_init.shape == (kk, n, 1)
+    warm = fit.converged_latents(X_test, a_init=a_init, t_init=t_init)
+    a_warm = np.asarray(warm["assignments"], dtype=float)
+
+    # The cold-returned routing is (near) a fixed point: re-solving from it moves
+    # each row's assignment vector only negligibly. The pre-fix residual-reseed
+    # routing is not a fixed point and would shift well past this bound.
+    per_row_shift = np.abs(a_warm - a_star).sum(axis=1)
+    assert float(per_row_shift.max()) < 1e-3, (
+        "returned OOS assignments are not a solver fixed point — the converged "
+        f"logits were overwritten by a post-solve reseed (#1229); max row L1 "
+        f"shift on warm re-solve = {float(per_row_shift.max()):.3e}"
+    )
+
+    # `fitted` is read at the SAME converged state as `assignments`: reconstruct
+    # via the public predict path and confirm it matches the latents' fitted.
+    fitted = np.asarray(cold["fitted"], dtype=float)
+    predicted = np.asarray(fit.reconstruct(X_test), dtype=float)
+    np.testing.assert_allclose(predicted, fitted, rtol=0.0, atol=1e-9)

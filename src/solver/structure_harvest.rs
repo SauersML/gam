@@ -1902,6 +1902,93 @@ mod tests {
     }
 
     /// #977 discovery oracle: with the production birth budget enabled, a fit
+    /// #1230 — `StructureSearchResult::structure_changed()` is the trigger the
+    /// FFI uses to decide whether the pre-search joint-Hessian shape bands are
+    /// stale and must be recomputed from the final post-search model.
+    ///
+    /// It must report `true` iff at least one move LANDED and mutated the
+    /// returned `term`/`rho`: an `Accepted` move (certified birth / fission /
+    /// fusion + warm refit) or a `Demoted` death. It must report `false` when
+    /// every round was contested / vetoed (the term/rho are byte-for-byte the
+    /// pre-search fit, so the exact joint-Hessian bands stay valid), and when no
+    /// round ran at all. A false negative leaves seed atoms with stale bands
+    /// (the #1230 bug); a false positive needlessly discards exact bands.
+    #[test]
+    fn structure_changed_is_true_only_when_a_move_lands() {
+        use crate::solver::structure_search::{MoveRecord, MoveVerdict};
+
+        fn ledger_with(verdicts: Vec<MoveVerdict>) -> SearchLedger {
+            SearchLedger {
+                alpha: 0.05,
+                moves: verdicts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, verdict)| MoveRecord {
+                        mv: StructureMove::Death { atom: i },
+                        trigger: 0.0,
+                        structure_hash: i as u64,
+                        claim: ClaimKind::AtomExists { atom: i },
+                        verdict,
+                    })
+                    .collect(),
+                collapse_events: Vec::new(),
+            }
+        }
+
+        // No rounds ran at all: nothing changed.
+        let (term0, rho0) = planted_term(&[vec![true], vec![true]]);
+        let empty = StructureSearchResult {
+            term: term0.clone(),
+            rho: rho0.clone(),
+            rounds: Vec::new(),
+        };
+        assert!(
+            !empty.structure_changed(),
+            "no rounds ⇒ the term/rho are the pre-search fit ⇒ structure_changed() must be false"
+        );
+
+        // Every move contested or vetoed: the dictionary is byte-for-byte the
+        // pre-search fit, so the exact joint-Hessian bands remain valid.
+        let no_landed = StructureSearchResult {
+            term: term0.clone(),
+            rho: rho0.clone(),
+            rounds: vec![ledger_with(vec![
+                MoveVerdict::Contested { log_e: -1.0 },
+                MoveVerdict::Vetoed { log_e: -2.0 },
+            ])],
+        };
+        assert!(
+            !no_landed.structure_changed(),
+            "all-contested/vetoed rounds leave the model unchanged ⇒ structure_changed() must be false"
+        );
+
+        // An Accepted move landed (certified restructuring + warm refit): the
+        // returned model differs from the pre-search fit ⇒ bands are stale.
+        let accepted = StructureSearchResult {
+            term: term0.clone(),
+            rho: rho0.clone(),
+            rounds: vec![ledger_with(vec![
+                MoveVerdict::Contested { log_e: -1.0 },
+                MoveVerdict::Accepted { log_e: 3.0 },
+            ])],
+        };
+        assert!(
+            accepted.structure_changed(),
+            "a landed Accepted move mutates term/rho ⇒ structure_changed() must be true (recompute bands)"
+        );
+
+        // A Demoted death is also a landed structure change.
+        let demoted = StructureSearchResult {
+            term: term0.clone(),
+            rho: rho0.clone(),
+            rounds: vec![ledger_with(vec![MoveVerdict::Demoted { log_e: -1.0 }])],
+        };
+        assert!(
+            demoted.structure_changed(),
+            "a landed Demoted death folds an atom to ~0 routing ⇒ structure_changed() must be true"
+        );
+    }
+
     /// whose residuals carry an unexplained factor direction (a structure the
     /// current dictionary does not express) HARVESTS a birth proposal — the
     /// candidate atom whose held-out e-value the gate then adjudicates. This is

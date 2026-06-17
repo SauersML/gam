@@ -1469,6 +1469,69 @@ pub(crate) fn per_atom_loao_ev_attributes_each_load_bearing_atom() {
     );
 }
 
+/// #1230 — when structure search settles on a CHANGED model, the pre-search
+/// joint-Hessian shape bands are stale and must be recomputed from the final
+/// per-atom inner fits. The FFI signals "recompute" by calling
+/// [`SaeShapeUncertainty::invalidate_bands_for_recompute`], whose contract is:
+/// drop EVERY atom's `decoder_covariance` and set EVERY atom's `band_sd` to
+/// `NaN`, so the subsequent `complete_born_atom_shape_bands` completion pass —
+/// which refills any `NaN` band but SKIPS already-filled bands — recomputes the
+/// bands of ALL atoms (seed and born), not just the born ones.
+///
+/// The #1230 bug was that a SEED atom kept its pre-search joint-Hessian band
+/// even after a landed move re-converged the dictionary at a new ρ: the
+/// completion pass skipped it because its band_sd was still filled. This test
+/// pins the invalidation contract that makes that skip impossible — after the
+/// call no band is left filled for the completion pass to skip.
+#[test]
+pub(crate) fn invalidate_bands_for_recompute_clears_every_seed_band() {
+    // A fully-FILLED two-atom shape-uncertainty payload, as the pre-search
+    // joint Hessian would assemble: finite band_sd and a materialized
+    // decoder_covariance for BOTH atoms (the "seed" atoms).
+    fn filled_atom(cov_diag: f64) -> SaeAtomShapeUncertainty {
+        SaeAtomShapeUncertainty {
+            decoder_covariance: Some(Array2::<f64>::eye(3) * cov_diag),
+            band_coords: array![[0.0_f64], [0.5], [1.0]],
+            band_mean: Array2::<f64>::from_elem((3, 2), 0.25),
+            band_sd: Array2::<f64>::from_elem((3, 2), 0.10),
+        }
+    }
+    let mut shape = SaeShapeUncertainty {
+        dispersion: 1.0,
+        atoms: vec![filled_atom(1.0), filled_atom(2.0)],
+    };
+
+    // Precondition: both seed atoms start fully filled (nothing to recompute).
+    for atom in &shape.atoms {
+        assert!(atom.decoder_covariance.is_some());
+        assert!(
+            atom.band_sd.iter().all(|v| v.is_finite()),
+            "precondition: a seed band starts with finite band_sd"
+        );
+    }
+
+    shape.invalidate_bands_for_recompute();
+
+    // Postcondition: EVERY atom's band is now flagged for recompute — no filled
+    // band survives for the completion pass to skip. A seed atom can no longer
+    // keep its stale pre-search band.
+    for (idx, atom) in shape.atoms.iter().enumerate() {
+        assert!(
+            atom.decoder_covariance.is_none(),
+            "atom {idx}: decoder_covariance must be dropped so the band is recomputed"
+        );
+        assert!(
+            atom.band_sd.iter().all(|v| v.is_nan()),
+            "atom {idx}: every band_sd entry must be NaN so complete_born_atom_shape_bands refills it"
+        );
+        // The completion pass rebuilds band_coords/band_mean from the final
+        // fitted atom; invalidation leaves their shape intact for that refill.
+        assert_eq!(atom.band_coords.dim(), (3, 1));
+        assert_eq!(atom.band_mean.dim(), (3, 2));
+        assert_eq!(atom.band_sd.dim(), (3, 2));
+    }
+}
+
 /// #976 decoder arm (prevention): a K>1 fit whose second atom's decoder has
 /// collapsed to ≈0 — gates still spread, so the gate-mass guard is satisfied
 /// — is caught by [`SaeManifoldTerm::enforce_decoder_norm_guard`], which
@@ -2553,6 +2616,84 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
         .expect("probe-budget criterion must converge on the small fixture");
     assert_abs_diff_eq!(probe_cost, full_cost, epsilon = 1.0e-8);
     assert_abs_diff_eq!(probe_loss.total(), full_loss.total(), epsilon = 1.0e-8);
+}
+
+/// #1224 — the BFGS/ARC line-search cost probe must see PURE REML, not the
+/// co-training consistency fold `f+c`.
+///
+/// The outer optimizer compares three lanes at a fixed ρ:
+///   * `eval` (`OuterEvalOrder::ValueAndGradient`) returns the consistent
+///     gradient-lane pair `(f, ∇f)` — pure REML cost paired with the exact
+///     REML λ-gradient.
+///   * `eval_with_order(Value)` is the line-search probe: it accepts/rejects
+///     steps whose DIRECTION came from `eval`'s `∇f`, so its cost must be the
+///     SAME pure REML `f`. Folding the gradient-free consistency penalty `c(ρ)`
+///     here while the direction is `∇f` mixes two functions in the Armijo test
+///     (the objective↔gradient desync bug class). The fix threads
+///     `fold_cotrain = false` into this lane.
+///   * `eval_cost` is the derivative-free cross-seed RANKING lane, where no
+///     gradient is ever paired with the cost, so it legitimately carries the
+///     fold (`fold_cotrain = true`): its cost is `f + c`.
+///
+/// This fixture's atoms carry NO basis evaluator, so every amortized encode is
+/// uncertified (`uncertified_fraction = 1.0`) and the consistency fold `c` is
+/// strictly positive. The regression therefore pins:
+///   (1) line-search lane cost == gradient lane cost  (the desync invariant),
+///   (2) ranking lane cost  >  line-search lane cost   (the fold IS present on
+///       the ranking lane and ABSENT on the line-search lane).
+/// The pre-fix code fed `f+c` to the line search, collapsing (1)/(2): the
+/// line-search cost would equal the ranking cost and exceed the gradient cost.
+#[test]
+pub(crate) fn line_search_value_probe_sees_pure_reml_not_cotrain_fold() {
+    use crate::solver::rho_optimizer::capability::OuterEvalOrder;
+    use crate::solver::rho_optimizer::objective::OuterObjective;
+
+    // A fixed ρ at which all three lanes converge from the same fixture state.
+    let rho_flat = warmstart_test_objective().baseline_rho.to_flat();
+
+    // Gradient lane (ValueAndGradient): the consistent `(f, ∇f)` pair. Its cost
+    // is pure REML (+ the discrete collapse barrier, which stays on both lanes).
+    let mut grad_obj = warmstart_test_objective();
+    let grad_cost = grad_obj
+        .eval(&rho_flat)
+        .expect("gradient lane must converge on the warm-start fixture")
+        .cost;
+
+    // Line-search lane (Value order): the BFGS/ARC probe. Post-fix this reports
+    // the SAME pure REML cost the gradient lane reports.
+    let mut ls_obj = warmstart_test_objective();
+    let ls_cost = ls_obj
+        .eval_with_order(&rho_flat, OuterEvalOrder::Value)
+        .expect("line-search probe must converge on the warm-start fixture")
+        .cost;
+
+    // Ranking lane (`eval_cost`): the derivative-free cross-seed screen, which
+    // DOES carry the consistency fold `c`.
+    let mut rank_obj = warmstart_test_objective();
+    let rank_cost = rank_obj
+        .eval_cost(&rho_flat)
+        .expect("ranking lane must converge on the warm-start fixture");
+
+    // (1) The line-search cost equals the gradient-lane cost: the BFGS Armijo
+    //     sufficient-decrease test now pairs `f` with `∇f` (no desync).
+    assert_abs_diff_eq!(ls_cost, grad_cost, epsilon = 1.0e-10);
+
+    // The fold is genuinely present in this fixture (no basis evaluator ⇒
+    // uncertified_fraction = 1.0), so the ranking lane is strictly costlier.
+    assert!(
+        rank_cost > grad_cost + 1.0e-6,
+        "ranking lane must carry a strictly positive co-training fold: \
+             rank_cost={rank_cost:.12} grad_cost={grad_cost:.12}"
+    );
+
+    // (2) The line-search lane must NOT carry the fold: it is strictly cheaper
+    //     than the ranking lane by exactly the fold magnitude. The pre-fix bug
+    //     (line search sees `f+c`) would make `ls_cost == rank_cost`.
+    assert!(
+        ls_cost < rank_cost - 1.0e-6,
+        "line-search lane must exclude the co-training fold the ranking lane \
+             carries: ls_cost={ls_cost:.12} rank_cost={rank_cost:.12}"
+    );
 }
 
 /// #1029 budget-policy gate: value probes get the base refine budget and
