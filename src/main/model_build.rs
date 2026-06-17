@@ -379,7 +379,12 @@ pub(crate) fn core_saved_fit_result(
             reml_score: summary.reml_score,
             stable_penalty_term: summary.stable_penalty_term,
             penalized_objective,
-            used_device: summary.used_device,
+            // A fit reconstructed from a saved-model summary performed no device
+            // (GPU) execution in this process — it was deserialized from disk —
+            // so the device-use flag is false. `SavedFitSummary` does not persist
+            // this field; it is a property of the original fit run, not the saved
+            // artifact.
+            used_device: false,
             outer_iterations: summary.iterations,
             outer_converged: matches!(summary.pirls_status, gam::pirls::PirlsStatus::Converged),
             outer_gradient_norm: Some(summary.finalgrad_norm),
