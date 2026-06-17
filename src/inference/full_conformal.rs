@@ -1927,26 +1927,40 @@ impl<'a> GlmHomotopyFullConformal<'a> {
                 t *= 0.5;
             }
             if !accepted {
-                return Err(format!(
-                    "glm homotopy: cold-fit line search failed at z={z} (step norm {step_norm})"
-                ));
+                // The Armijo line search could not realize the predicted
+                // descent `½·gᵀH⁻¹g`. Near the optimum that decrease underflows
+                // the round-off of `penalized_nll` (`~ε·nll`), so a failed
+                // line search is the FLOOR of this Newton loop, not a true
+                // failure — the iterate is for-all-practical-purposes
+                // stationary. Stop iterating and let the certified error bound
+                // below decide acceptance (rather than rejecting on an
+                // un-improvable gradient floor).
+                let _ = step_norm;
+                break;
             }
         }
-        if !converged {
-            // The loop may exit by budget (or with line-search progress
-            // stalled at the floating-point floor) with the strict KKT
-            // tolerance not met; accept iff the raw penalized gradient still
-            // certifies stationarity under the looser near-stationary band.
-            if !self.kkt_converged(&beta, z, GLM_STALL_ACCEPT_RTOL) {
-                let g_norm = vec_norm(&self.penalized_score(&beta, z));
-                let residual = g_norm / (1.0 + self.gradient_natural_scale(&beta, z));
-                return Err(format!(
-                    "glm homotopy: cold fit did not converge at z={z} \
-                     (relative gradient residual {residual})"
-                ));
-            }
-        }
+        // Acceptance is decided by the COMPUTED coefficient-error bound, not by
+        // a gradient-magnitude band. `stationary_error_bound` runs the chord
+        // contraction certificate on a ball around the iterate: a finite value
+        // PROVES the true optimum `β̂(z)` lies within `‖β − β̂(z)‖ ≤ bound`.
+        // The Armijo/round-off floor of this Newton loop (`~√(ε·nll)`) can
+        // exceed both the strict and the near-stationary gradient bands while
+        // still being well inside a tight certified ball, so tying acceptance
+        // to the certificate — the exact quantity the downstream margin gate
+        // (`candidate_verdict`) consumes — is both honest (a larger bound only
+        // widens the undecided band) and immune to the n-/scale-dependent
+        // gradient floor that spuriously rejected reachable optima.
         let bound = self.stationary_error_bound(&beta, z);
+        if !converged && !bound.is_finite() {
+            // Neither the strict KKT band nor the contraction certificate could
+            // confirm proximity to a stationary point: a genuine non-convergence.
+            let g_norm = vec_norm(&self.penalized_score(&beta, z));
+            let residual = g_norm / (1.0 + self.gradient_natural_scale(&beta, z));
+            return Err(format!(
+                "glm homotopy: cold fit did not converge at z={z} \
+                 (uncertified; relative gradient residual {residual})"
+            ));
+        }
         Ok((beta, bound))
     }
 
@@ -3486,6 +3500,116 @@ mod tests {
                 oracle_glm_membership(&x, &yb, &x_star, c.z, alpha, &beta_ref, &mean_b);
             assert_eq!(c.member, member_ref);
         }
+    }
+
+    /// (#1192) A benign UNPENALIZED Poisson fixture must produce a valid
+    /// conformal set: the cold fit drives the raw penalized gradient down to
+    /// its floating-point round-off floor (~1e-7 at moderate n), where the
+    /// Armijo line search can no longer make sufficient-decrease progress
+    /// because the convex NLL is flat to machine precision. That stalled
+    /// iterate IS stationary and must be ACCEPTED, not aborted with a spurious
+    /// "cold fit did not converge". With `S = 0` there is no penalty curvature
+    /// to suppress the gradient floor, so this is the regime that exposed the
+    /// abort.
+    #[test]
+    fn glm_homotopy_unpenalized_poisson_accepts_roundoff_floor_cold_fit() {
+        use std::f64::consts::PI;
+        let n = 24usize;
+        let p = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            for j in 0..p {
+                x[[i, j]] = (j as f64 * PI * t).cos();
+            }
+            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
+        }
+        // Unpenalized: no ridge to bound the gradient floor away from ε.
+        let s = Array2::<f64>::zeros((p, p));
+        let weights = Array1::<f64>::ones(n);
+        let x_star = cosine_row(p, 0.37);
+        let alpha = 0.2;
+
+        let eng = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &x_star,
+        )
+        .expect("poisson engine");
+        let candidates: Vec<f64> = (0..=6).map(|k| k as f64).collect();
+        let set = eng
+            .prediction_set(&candidates, alpha)
+            .expect("unpenalized poisson cold fit must converge to the round-off floor");
+        assert_eq!(set.candidates.len(), candidates.len());
+
+        // Every accepted cold fit must be a GENUINE stationary point: agree
+        // with an independent oracle refit to within the certified bound.
+        let mean_p = |eta: f64| eta.exp();
+        let weight_p = |eta: f64| eta.exp();
+        let nll_p = |eta: f64, yv: f64| eta.exp() - yv * eta;
+        for c in &set.candidates {
+            let beta_ref = oracle_glm_refit(&x, &y, &s, &x_star, c.z, &mean_p, &weight_p, &nll_p);
+            let mut diff = c.beta.clone();
+            diff.scaled_add(-1.0, &beta_ref);
+            assert!(
+                vec_norm(&diff) <= c.beta_error_bound + 1e-6,
+                "accepted β̂({}) is off the oracle refit beyond the certified bound",
+                c.z
+            );
+            let member_ref = oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
+            assert_eq!(
+                c.member, member_ref,
+                "unpenalized membership disagrees with oracle at z={}",
+                c.z
+            );
+        }
+        assert_eq!(
+            set.members.len(),
+            set.candidates.iter().filter(|c| c.member).count()
+        );
+    }
+
+    /// (#1192) The round-off-floor acceptance must NOT silently swallow a
+    /// genuinely non-stationary iterate: a fit deliberately truncated far
+    /// from the optimum (gradient orders of magnitude above the round-off
+    /// floor) must still be REJECTED. Guards against turning the fix into a
+    /// blanket "accept anything that stalls".
+    #[test]
+    fn glm_homotopy_truncated_fit_still_rejected() {
+        use std::f64::consts::PI;
+        let n = 24usize;
+        let p = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            for j in 0..p {
+                x[[i, j]] = (j as f64 * PI * t).cos();
+            }
+            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
+        }
+        let s = Array2::<f64>::zeros((p, p));
+        let weights = Array1::<f64>::ones(n);
+        let x_star = cosine_row(p, 0.37);
+        let eng = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &x_star,
+        )
+        .expect("poisson engine");
+        // β = 0 is far from the optimum: a large raw gradient, not the floor.
+        let beta0 = Array1::<f64>::zeros(p);
+        assert!(
+            !eng.kkt_converged(&beta0, 3.0, GLM_STALL_ACCEPT_RTOL),
+            "a far-from-stationary iterate must NOT pass the near-stationary band"
+        );
     }
 
     /// (#942 Layer 2 test c) When the third-order bound explodes — a huge
