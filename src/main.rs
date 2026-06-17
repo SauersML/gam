@@ -245,10 +245,41 @@ pub(crate) use smooth_warnings::*;
 /// `cudart` at-exit teardown bug described in [`main`].
 const HARD_EXIT: fn(i32) -> ! = std::process::exit;
 
+/// Stack reserved for the CLI worker thread that drives every command.
+///
+/// The fit drivers keep large fixed-size structures live on the call stack:
+/// the survival location-scale row kernel evaluates a `Tower4<9>` jet program
+/// (9⁴ fourth-order entries, ≈59 KiB per scalar held by value, with several
+/// towers live at once), and the dense linear-algebra recursions fan out over
+/// every penalty block. On a model with many penalized smooths this comfortably
+/// exceeds the 8 MiB default main-thread stack and aborts with
+/// "thread 'main' has overflowed its stack" before the first outer iteration
+/// even completes. The library's own survival-LS tests already side-step this
+/// by spawning a 64 MiB-stack worker; the CLI must do the same so real models
+/// fit instead of crashing. The reservation is virtual address space — pages
+/// commit lazily, so the headroom costs nothing until the deep paths use it.
+const CLI_WORKER_STACK_SIZE: usize = 512 << 20;
+
 fn main() {
     gam::init_parallelism();
     gam::process_monitor::start();
-    let result = run();
+    // Drive the whole command on a dedicated wide-stack thread (see
+    // `CLI_WORKER_STACK_SIZE`). `run` returns the same `CliResult` it would on
+    // the main thread; a `join` error means `run` itself panicked, which the
+    // default panic hook has already reported, so we flush and exit non-zero.
+    let worker = std::thread::Builder::new()
+        .name("gam-cli".to_string())
+        .stack_size(CLI_WORKER_STACK_SIZE)
+        .spawn(run)
+        .expect("spawn gam CLI worker thread");
+    let result = match worker.join() {
+        Ok(command_result) => command_result,
+        Err(_) => {
+            drop(std::io::Write::flush(&mut std::io::stdout()));
+            drop(std::io::Write::flush(&mut std::io::stderr()));
+            HARD_EXIT(1);
+        }
+    };
     if let Err(e) = result {
         cli_err!("error: {e}");
         if let Some(advice) = e.advice() {
