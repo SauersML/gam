@@ -9,7 +9,8 @@ The #1026 reconstruction-parity question, posed honestly as the issue asks it:
 This driver runs BOTH baselines on the SAME real activation slice and the SAME
 held-out split, measuring HELD-OUT reconstruction explained variance (EV):
 
-  A) gam manifold-SAE (curved circle + linear euclidean), K small, via the
+  A) gam manifold-SAE (curved circle + degree-2 quadratic "euclidean" patch —
+     NOT a linear atom, #1201), K small, via the
      production engine `gamfit.sae_manifold_fit` + `ManifoldSAE.reconstruct`.
      This is the matched-K, same-solver, geometry-only-differs comparison.
 

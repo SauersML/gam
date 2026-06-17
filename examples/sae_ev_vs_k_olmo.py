@@ -113,7 +113,7 @@ def _fit_ev(
         z_tr,
         K=k,
         d_atom=1,
-        atom_topology=topology,  # "circle" (curved) or "euclidean" (linear)
+        atom_topology=topology,  # "circle" (curved) or "euclidean" (degree-2 quadratic patch, #1201 — NOT a linear atom)
         assignment="ibp_map",
         n_iter=n_iter,
         random_state=seed,

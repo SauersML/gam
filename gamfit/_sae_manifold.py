@@ -2259,6 +2259,13 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Shared topology label used when ``atom_basis`` is not supplied. Common
         values are ``"circle"``, ``"periodic"``, ``"sphere"``, ``"torus"``,
         and ``"euclidean"``. If omitted, the default is ``"circle"``.
+
+        NOTE (#1201): ``"euclidean"`` is a degree-2 QUADRATIC monomial patch
+        (``{1, t, t²}`` at ``d_atom=1``), NOT a single straight decoder direction
+        ``γ(t)=t·b``. Do not treat ``atom_topology="euclidean"`` as the "linear"
+        SAE baseline — a curved-vs-``"euclidean"`` comparison is curved-vs-
+        quadratic. The genuinely linear per-atom secant is the hybrid-split LINEAR
+        candidate (see :attr:`ManifoldSAE.hybrid_split`).
     assignment
         Assignment/gating family. ``"ibp_map"`` uses the IBP-MAP gate path,
         ``"softmax"`` uses soft mixture masses, and ``"jumprelu"`` uses the

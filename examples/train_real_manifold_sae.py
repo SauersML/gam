@@ -21,8 +21,10 @@ This is the honest end-to-end run the manifold-SAE machinery exists for:
 NO fitting math lives here. This is the #977 numeric boundary: activations are
 just a response matrix fed to ``gamfit.sae_manifold_fit`` and read back through
 ``ManifoldSAE``. The honest question it answers: does the discovered-geometry
-dictionary beat a matched linear SAE on held-out real activations, and what
-topology did it discover?
+dictionary beat a matched degree-2 quadratic "euclidean" patch baseline on
+held-out real activations, and what topology did it discover? (#1201: the
+``atom_topology="euclidean"`` baseline is a QUADRATIC patch ``{1,t,t²}``, NOT a
+straight linear atom — so this is curved-vs-quadratic, not curved-vs-linear.)
 
 EXAMPLE (Qwen2.5-7B wikitext layer 14, 40k-token subsample, on a compute node):
   python examples/train_real_manifold_sae.py \
@@ -221,25 +223,28 @@ def main() -> None:
         print(f"[manifold] structure certificate unavailable: {e}")
     print()
 
-    # --- linear baseline: forced euclidean d=1 at matched K (SAME transform/metric) ---
-    mlin, ev_lin, ev_lin_raw, fit_lin, recon_lin = _fit(
+    # --- quadratic-patch baseline: forced euclidean d=1 at matched K (SAME
+    # transform/metric). NOTE (#1201): atom_topology="euclidean" is a DEGREE-2
+    # quadratic monomial patch {1,t,t²}, NOT a straight linear atom γ(t)=t·b — so
+    # this is a curved-circle-vs-quadratic-patch comparison, NOT curved-vs-linear.
+    mquad, ev_quad, ev_quad_raw, fit_quad, recon_quad = _fit(
         z_tr, z_te, args.k, "euclidean", args.seed, args.n_iter,
         lift=lift, x_te_raw=x_te_raw)
-    print(f"[linear]   K = {mlin.chosen_k}, topology dist = {dict(Counter(mlin.basis_specs))}")
-    print(f"[linear]   held-out {pc_metric} = {ev_lin:.4f}   "
-          f"(fit {fit_lin:.1f}s, recon {recon_lin:.1f}s)")
-    print(f"[linear]   held-out raw-resid-stream EV = {ev_lin_raw:.4f}")
+    print(f"[quad]     K = {mquad.chosen_k}, topology dist = {dict(Counter(mquad.basis_specs))}")
+    print(f"[quad]     held-out {pc_metric} = {ev_quad:.4f}   "
+          f"(fit {fit_quad:.1f}s, recon {recon_quad:.1f}s)")
+    print(f"[quad]     held-out raw-resid-stream EV = {ev_quad_raw:.4f}")
     print()
 
     # Margin is reported in BOTH metrics; both arms share the identical transform,
     # so each comparison is apples-to-apples within its own metric (#1212).
-    margin = ev_m - ev_lin
-    margin_raw = ev_m_raw - ev_lin_raw
-    verdict = "manifold BEATS linear" if margin > 0 else "manifold does NOT beat linear"
-    print(f"=== held-out {pc_metric}: manifold {ev_m:.4f} vs linear {ev_lin:.4f}  "
+    margin = ev_m - ev_quad
+    margin_raw = ev_m_raw - ev_quad_raw
+    verdict = "circle BEATS quadratic patch" if margin > 0 else "circle does NOT beat quadratic patch"
+    print(f"=== held-out {pc_metric}: circle {ev_m:.4f} vs quadratic-patch {ev_quad:.4f}  "
           f"(margin {margin:+.4f}) -> {verdict} ===")
-    print(f"=== held-out raw-resid-stream EV: manifold {ev_m_raw:.4f} vs linear "
-          f"{ev_lin_raw:.4f}  (margin {margin_raw:+.4f}) ===")
+    print(f"=== held-out raw-resid-stream EV: circle {ev_m_raw:.4f} vs quadratic-patch "
+          f"{ev_quad_raw:.4f}  (margin {margin_raw:+.4f}) ===")
 
     if args.json_out:
         out = {
@@ -256,11 +261,14 @@ def main() -> None:
                 "held_out_pc_ev": ev_m, "held_out_raw_ev": ev_m_raw,
                 "fit_s": fit_m, "recon_s": recon_m,
             },
-            "linear": {
-                "chosen_k": int(mlin.chosen_k),
-                "topology_distribution": dict(Counter(mlin.basis_specs)),
-                "held_out_pc_ev": ev_lin, "held_out_raw_ev": ev_lin_raw,
-                "fit_s": fit_lin, "recon_s": recon_lin,
+            # #1201: this baseline is the degree-2 quadratic "euclidean" patch,
+            # NOT a linear atom. Keyed "quadratic_patch" so downstream readers are
+            # not misled into calling it the linear baseline.
+            "quadratic_patch": {
+                "chosen_k": int(mquad.chosen_k),
+                "topology_distribution": dict(Counter(mquad.basis_specs)),
+                "held_out_pc_ev": ev_quad, "held_out_raw_ev": ev_quad_raw,
+                "fit_s": fit_quad, "recon_s": recon_quad,
             },
             "margin_pc_ev": margin, "margin_raw_ev": margin_raw,
         }

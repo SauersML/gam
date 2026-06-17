@@ -1677,8 +1677,17 @@ fn seed_oos_ibp_logits_from_projected_decoder_lsq(
 fn sae_duchon_atom_m(dim: usize) -> usize {
     dim / 2 + 2
 }
-/// Maximum total monomial degree for a Euclidean tangent-patch SAE atom
-/// (`{1, t_a, t_a t_b}` at degree 2).
+/// Maximum total monomial degree for a Euclidean tangent-patch SAE atom.
+///
+/// IMPORTANT (#1201): this is **degree 2**, so the `"euclidean"` atom basis is a
+/// QUADRATIC patch `{1, t, t²}` at `d_atom = 1` (and `{1, t_a, t_b, t_a², t_a t_b,
+/// t_b²}` at `d_atom = 2`), NOT a single straight decoder direction `γ(t) = t·b`.
+/// Any comparison that calls the `"euclidean"` atom the "linear" baseline is
+/// therefore comparing curved-vs-QUADRATIC, not curved-vs-linear — label such
+/// comparisons honestly. (A genuinely linear secant baseline is available as the
+/// per-atom hybrid-split LINEAR candidate, `crate::terms::sae::hybrid_split`,
+/// which fits `b₀ + (t − t̄)·b₁` exactly; the `"euclidean"` OUTER fit path is the
+/// quadratic patch.)
 const SAE_EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
 
 /// Flat-line polynomial degree of a Cylinder `S¹ × ℝ` atom's line axis (axis 1).

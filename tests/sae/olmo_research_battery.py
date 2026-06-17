@@ -224,6 +224,13 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
     results["meta"]["has_prompt_labels"] = bool(kinds)
 
     # --- experiment 2: SAE-variant sweep ------------------------------------
+    # NOTE (#1201): atom_basis="linear" is NOT a recognized FFI basis kind (it
+    # maps to a Precomputed placeholder and the cell typically fails into the
+    # try/except below); and atom_topology="euclidean" is a DEGREE-2 quadratic
+    # patch, not a straight linear atom. So this sweep does not contain a genuine
+    # linear-SAE arm — the real linear baseline is `linear_topk_sae` in the
+    # recon-parity experiment (3) below. The labels here are descriptive sweep
+    # cells, not a curved-vs-linear dominance claim.
     Ks = [1, 2, 3, 4]
     topologies = ["euclidean", "circle", "torus", "sphere"]
     bases = ["periodic", "linear"]
