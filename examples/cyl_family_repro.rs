@@ -67,7 +67,11 @@ fn fit_and_predict_eta(
         "  beta(len={}) min={:.4} max={:.4} mean={:.4}",
         fit.fit.beta.len(),
         fit.fit.beta.iter().cloned().fold(f64::INFINITY, f64::min),
-        fit.fit.beta.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        fit.fit
+            .beta
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max),
         fit.fit.beta.iter().sum::<f64>() / fit.fit.beta.len() as f64,
     );
     eprintln!("  lambdas={:?}", fit.fit.lambdas);
@@ -80,7 +84,11 @@ fn logistic(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 fn mse(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    a.iter().zip(b.iter()).map(|(p, t)| (p - t).powi(2)).sum::<f64>() / a.len() as f64
+    a.iter()
+        .zip(b.iter())
+        .map(|(p, t)| (p - t).powi(2))
+        .sum::<f64>()
+        / a.len() as f64
 }
 
 fn main() {
