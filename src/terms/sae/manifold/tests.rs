@@ -2645,8 +2645,7 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
 /// line-search cost would equal the ranking cost and exceed the gradient cost.
 #[test]
 pub(crate) fn line_search_value_probe_sees_pure_reml_not_cotrain_fold() {
-    use crate::solver::rho_optimizer::capability::OuterEvalOrder;
-    use crate::solver::rho_optimizer::objective::OuterObjective;
+    use crate::solver::rho_optimizer::{OuterEvalOrder, OuterObjective};
 
     // A fixed ρ at which all three lanes converge from the same fixture state.
     let rho_flat = warmstart_test_objective().baseline_rho.to_flat();
