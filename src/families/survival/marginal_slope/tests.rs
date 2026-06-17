@@ -2195,6 +2195,33 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
     // ── Third order: production D_dir H[u,v] vs witness ∂³ along (u,v,dir) ───
     // Contract along the logslope axis g; check cross blocks touching the
     // deviation coordinates (the channels Arm A cannot reach).
+    // DIAG979F: validate which f_uv_dir is TRUTH by FD-ing the WITNESS calibration
+    // F(a) (the trusted per-cell oracle) at FIXED a in (g, w[0]) — independent of
+    // production's cell-integral kernel. f_uv = ∂²F/∂g∂w; f_uv_dir = ∂³F/∂g∂w∂g.
+    if std::env::var("DIAG979F").is_ok() {
+        let beta_h_arr = Array1::from(beta_h0.clone());
+        let (a1b, _) = family
+            .solve_row_survival_intercept_with_slot(
+                q1v, gv, Some(&beta_h_arr), Some(&Array1::from(beta_w0.clone())), None,
+            )
+            .unwrap();
+        // F at fixed a=a1b as a function of (g, w0); calibration adds -Φ(-q) (const in g,w).
+        let f_of = |dg: f64, dw: f64| -> f64 {
+            let mut bw = beta_w0.clone();
+            bw[0] += dw;
+            calibration(a1b, q1v, gv + dg, &beta_h0, &bw)
+        };
+        let h = 1e-3;
+        let f_uv_gw = (f_of(h, h) - f_of(h, -h) - f_of(-h, h) + f_of(-h, -h)) / (4.0 * h * h);
+        // ∂³F/∂g∂w∂g (dir=g): central in g², central in w.
+        let f_uvdir = {
+            let gw2 = |dw: f64| (f_of(h, dw) - 2.0 * f_of(0.0, dw) + f_of(-h, dw)) / (h * h);
+            (gw2(h) - gw2(-h)) / (2.0 * h)
+        };
+        eprintln!(
+            "DIAG979F(witness) a={a1b:+.10e} f_uv[g,w]={f_uv_gw:+.10e} f_uv_dir[g,w]={f_uvdir:+.10e}"
+        );
+    }
     let third = family
         .row_flex_primary_third_contracted_exact(0, &block_states, &unit(gi))
         .expect("production third contracted (nonzero deviation)");
