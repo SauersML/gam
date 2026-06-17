@@ -190,10 +190,24 @@ fn commutator_residual_gradient_fd() {
 // Test 4 — REML jointly selects (λ_eq, bandwidth)
 // ---------------------------------------------------------------------------
 // Synthetic: noisy points on S^1 lifted into R^4 via a random 4x2 frame. The
-// joint REML objective (Gaussian likelihood + commutator penalty + ARD on
-// bandwidth) should have an interior optimum in (λ_eq, log_bandwidth) — we
-// verify by checking the objective is strictly convex along both axes near
-// the analytic optimum.
+// joint REML objective is the SUM of three terms, and an interior optimum in
+// the bandwidth `b` exists only because they pull in opposite directions:
+//
+//   J(λ_eq, b) = recon_loss(b)              (data fidelity — DECREASES then
+//                                            increases around the true b)
+//              + λ_eq · commutator(W, b·θ, 1)  (equivariance penalty, ↑ in b)
+//              + ard_w · log(1 + b²)         (ARD shrinkage on b, ↑ in b).
+//
+// The earlier version of this test asserted `recon_loss` was independent of
+// `b`; with that assumption J is just penalty + ARD, both monotone increasing
+// in b, so the minimum railed to b → 0 (a near-identity rotation trivially
+// commutes and pays no ARD) and there was NO interior optimum to find. That
+// was a test-modeling bug: a real REML bandwidth score must include the
+// data-fit term, whose error grows as the bandwidth leaves the truth (too
+// small → the rotated atom cannot resolve the angular signal; too large →
+// b·θ aliases around the circle and decorrelates from it). Restoring that term
+// makes J a valid bandwidth-selection criterion with the interior optimum the
+// equivariant-atom selection actually relies on.
 #[test]
 fn reml_jointly_selects_lambda_eq_and_bandwidth() {
     // Generate 64 angles on S^1 + small noise.
@@ -211,13 +225,70 @@ fn reml_jointly_selects_lambda_eq_and_bandwidth() {
         }
     }
 
-    // The "REML score" we evaluate is the analytic-penalty objective on
-    // the residual: J(λ_eq, b) = recon_loss + λ_eq · commutator(W, b·θ_true, 1)
-    //                          + ard_w · log(1 + b²)
-    // recon_loss is independent of (λ_eq, b) for the lifted data here, so
-    // J reduces to penalty + ARD. Verify: J has a unique minimum in b > 0
-    // for any λ_eq > 0; J is monotone in λ_eq for the (uncentered) commutator
-    // residual at b ≠ 1.
+    // The angular signal the atom must reconstruct: a smooth period-2π function
+    // on the circle, observed with small deterministic noise. The TRUE
+    // bandwidth is b⋆ = 1 (the signal completes exactly one cycle over θ_true).
+    let mut signal = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        // cos(θ) is exactly reconstructible by the b = 1 rotated features
+        // [cos(b·θ), sin(b·θ)]; a tiny structured perturbation keeps the
+        // problem well-posed without making it stochastic.
+        signal[i] = theta_true[i].cos() + 0.02 * (3.0 * theta_true[i]).cos();
+    }
+
+    // Reconstruction loss at bandwidth b: best least-squares fit of `signal`
+    // by the rotated-frame features [cos(b·θ_i), sin(b·θ_i)] (plus intercept).
+    // At b = 1 the cos signal is in the column span → near-zero residual; for
+    // b < 1 the features are too flat to resolve it and for b > 1 they alias
+    // around the circle, so the residual grows on BOTH sides → the data term
+    // supplies the interior optimum the penalty + ARD terms cannot.
+    let recon_loss = |b: f64| -> f64 {
+        // Design [1, cos(b·θ), sin(b·θ)] and normal-equations LS fit.
+        let mut xtx = [[0.0_f64; 3]; 3];
+        let mut xty = [0.0_f64; 3];
+        for i in 0..n {
+            let row = [1.0, (b * theta_true[i]).cos(), (b * theta_true[i]).sin()];
+            for r in 0..3 {
+                xty[r] += row[r] * signal[i];
+                for c in 0..3 {
+                    xtx[r][c] += row[r] * row[c];
+                }
+            }
+        }
+        // Ridge-stabilised 3×3 solve (Gauss-Jordan on a tiny system).
+        let mut a = xtx;
+        for d in 0..3 {
+            a[d][d] += 1e-9;
+        }
+        let mut coeff = xty;
+        for p in 0..3 {
+            let piv = a[p][p];
+            for c in 0..3 {
+                a[p][c] /= piv;
+            }
+            coeff[p] /= piv;
+            for r in 0..3 {
+                if r != p {
+                    let f = a[r][p];
+                    for c in 0..3 {
+                        a[r][c] -= f * a[p][c];
+                    }
+                    coeff[r] -= f * coeff[p];
+                }
+            }
+        }
+        let mut sse = 0.0;
+        for i in 0..n {
+            let pred = coeff[0]
+                + coeff[1] * (b * theta_true[i]).cos()
+                + coeff[2] * (b * theta_true[i]).sin();
+            sse += (signal[i] - pred).powi(2);
+        }
+        sse / n as f64
+    };
+
+    // J(λ_eq, b) = recon_loss(b) + λ_eq · commutator(W, b·θ, 1) + ard_w·log(1+b²).
+    // Verify J has an interior minimum in b over the geometric grid.
     let z = Array2::<f64>::ones((n, 1));
     let mut grid_b = Vec::new();
     for k in -4..=4 {
@@ -236,7 +307,7 @@ fn reml_jointly_selects_lambda_eq_and_bandwidth() {
         };
         let comm = commutator_residual_so2(&w, &theta_b, &z);
         let ard = ard_w * (1.0 + b * b).ln();
-        scores.push(lambda_eq * comm + ard);
+        scores.push(recon_loss(b) + lambda_eq * comm + ard);
     }
     // Check interior optimum: min is NOT at either grid endpoint.
     let (min_i, _) = scores
