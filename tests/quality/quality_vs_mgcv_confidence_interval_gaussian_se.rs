@@ -35,6 +35,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::{Array1, Array2};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 /// Deterministic SplitMix64 -> standard-normal stream (Box–Muller). Keeps the
 /// simulation reproducible without an external RNG crate, and lets us emit the
@@ -130,77 +131,93 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
         ..FitConfig::default()
     };
 
-    let mut gam_hit = 0usize;
-    let mut gam_total = 0usize;
     // For context only: rel-L2 between gam's and mgcv's per-rep SE vector,
     // averaged over replicates. NOT a pass criterion.
-    let mut gam_se_by_rep: Vec<Vec<f64>> = Vec::with_capacity(reps);
+    // The 60 replicate fits are independent (only `y` changes); each produces a
+    // per-rep `(hit_count, se_vector)`. Fanning them across the rayon pool and
+    // collecting in replicate order is bit-identical to the serial version —
+    // `gam_hit`/`gam_total` are exact integer sums and `gam_se_by_rep` keeps its
+    // order — so no asserted quantity changes. The fits dominate wall-clock, so
+    // this is the harness-side speedup (#1082).
+    let per_rep: Vec<(usize, Vec<f64>)> = y_reps
+        .par_iter()
+        .map(|yk| {
+            // Build an in-memory dataset (x, y) for this replicate, identical
+            // numerically to what R receives.
+            let headers = vec!["x".to_string(), "y".to_string()];
+            let records: Vec<StringRecord> = (0..n)
+                .map(|i| {
+                    StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", yk[i])])
+                })
+                .collect();
+            let ds = encode_recordswith_inferred_schema(headers, records)
+                .expect("encode simulated replicate");
+            let col = ds.column_map();
+            let x_idx = col["x"];
 
-    for yk in &y_reps {
-        // Build an in-memory dataset (x, y) for this replicate, identical
-        // numerically to what R receives.
-        let headers = vec!["x".to_string(), "y".to_string()];
-        let records: Vec<StringRecord> = (0..n)
-            .map(|i| StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", yk[i])]))
-            .collect();
-        let ds = encode_recordswith_inferred_schema(headers, records)
-            .expect("encode simulated replicate");
-        let col = ds.column_map();
-        let x_idx = col["x"];
+            let result = fit_from_formula("y ~ s(x)", &ds, &cfg).expect("gam fit");
+            let FitResult::Standard(fit) = result else {
+                panic!("expected a standard GAM fit");
+            };
 
-        let result = fit_from_formula("y ~ s(x)", &ds, &cfg).expect("gam fit");
-        let FitResult::Standard(fit) = result else {
-            panic!("expected a standard GAM fit");
-        };
+            let vb = fit
+                .fit
+                .beta_covariance()
+                .expect("gam reports Bayesian coefficient covariance Vb")
+                .clone();
+            let beta = fit.fit.beta.clone();
+            let p = beta.len();
+            assert_eq!(vb.nrows(), p, "Vb dimension must match coefficient count");
 
-        let vb = fit
-            .fit
-            .beta_covariance()
-            .expect("gam reports Bayesian coefficient covariance Vb")
-            .clone();
-        let beta = fit.fit.beta.clone();
-        let p = beta.len();
-        assert_eq!(vb.nrows(), p, "Vb dimension must match coefficient count");
+            // Rebuild the frozen design at the (shared) x grid. Identity link, so
+            // the design row is exactly ∂η/∂β and η̂ = X·β.
+            let mut grid = Array2::<f64>::zeros((n, ds.headers.len()));
+            for (i, &xi) in x.iter().enumerate() {
+                grid[[i, x_idx]] = xi;
+            }
+            let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+                .expect("rebuild design at grid points");
+            assert_eq!(design.design.ncols(), p, "design cols must match coeff dim");
+            assert_eq!(design.design.nrows(), n, "design rows must match grid");
 
-        // Rebuild the frozen design at the (shared) x grid. Identity link, so the
-        // design row is exactly ∂η/∂β and η̂ = X·β.
-        let mut grid = Array2::<f64>::zeros((n, ds.headers.len()));
-        for (i, &xi) in x.iter().enumerate() {
-            grid[[i, x_idx]] = xi;
-        }
-        let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-            .expect("rebuild design at grid points");
-        assert_eq!(design.design.ncols(), p, "design cols must match coeff dim");
-        assert_eq!(design.design.nrows(), n, "design rows must match grid");
+            // Dense X by applying the operator to each unit basis vector.
+            let mut x_dense = Array2::<f64>::zeros((n, p));
+            for j in 0..p {
+                let mut e_j = Array1::<f64>::zeros(p);
+                e_j[j] = 1.0;
+                let col_j = design.design.apply(&e_j);
+                for i in 0..n {
+                    x_dense[[i, j]] = col_j[i];
+                }
+            }
 
-        // Dense X by applying the operator to each unit basis vector.
-        let mut x_dense = Array2::<f64>::zeros((n, p));
-        for j in 0..p {
-            let mut e_j = Array1::<f64>::zeros(p);
-            e_j[j] = 1.0;
-            let col_j = design.design.apply(&e_j);
+            // η̂(x) = X·β and pointwise SE = sqrt(xᵀ Vb x).
+            let eta_hat = design.design.apply(&beta);
+            let mut se = Vec::with_capacity(n);
             for i in 0..n {
-                x_dense[[i, j]] = col_j[i];
+                let xi = x_dense.row(i);
+                let vbxi = vb.dot(&xi);
+                se.push(xi.dot(&vbxi).max(0.0).sqrt());
             }
-        }
 
-        // η̂(x) = X·β and pointwise SE = sqrt(xᵀ Vb x).
-        let eta_hat = design.design.apply(&beta);
-        let mut se = Vec::with_capacity(n);
-        for i in 0..n {
-            let xi = x_dense.row(i);
-            let vbxi = vb.dot(&xi);
-            se.push(xi.dot(&vbxi).max(0.0).sqrt());
-        }
-
-        for i in 0..n {
-            let lo = eta_hat[i] - z * se[i];
-            let hi = eta_hat[i] + z * se[i];
-            if f_true[i] >= lo && f_true[i] <= hi {
-                gam_hit += 1;
+            let mut hit = 0usize;
+            for i in 0..n {
+                let lo = eta_hat[i] - z * se[i];
+                let hi = eta_hat[i] + z * se[i];
+                if f_true[i] >= lo && f_true[i] <= hi {
+                    hit += 1;
+                }
             }
-            gam_total += 1;
-        }
+            (hit, se)
+        })
+        .collect();
+
+    let mut gam_hit = 0usize;
+    let mut gam_total = 0usize;
+    let mut gam_se_by_rep: Vec<Vec<f64>> = Vec::with_capacity(reps);
+    for (hit, se) in per_rep {
+        gam_hit += hit;
+        gam_total += n;
         gam_se_by_rep.push(se);
     }
 

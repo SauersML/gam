@@ -51,6 +51,7 @@ use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::f64::consts::PI;
 
 const N_TRAIN: usize = 300;
@@ -94,106 +95,139 @@ fn gam_confidence_interval_domain_averaged_coverage_hits_nominal() {
     let mut x_col: Vec<f64> = Vec::with_capacity(N_TRAIN * N_REPLICATES);
     let mut y_col: Vec<f64> = Vec::with_capacity(N_TRAIN * N_REPLICATES);
 
-    let z = standard_normal_quantile(0.5 + 0.5 * CONFIDENCE_LEVEL);
+    // Materialize every replicate's (x, y) up front from the deterministic
+    // per-replicate seed, IN ORDER, so the stacked frame shipped to mgcv is
+    // byte-identical to the serial version regardless of how the gam fits below
+    // are scheduled. Each replicate is an independent draw + fit; only the
+    // ordered stacking is sequential.
+    let replicate_data: Vec<(Vec<f64>, Vec<f64>)> = (0..N_REPLICATES)
+        .map(|rep| {
+            let mut rng =
+                StdRng::seed_from_u64(BASE_SEED.wrapping_mul(1_000_003).wrapping_add(rep as u64));
+            let unif = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
+            let noise = Normal::new(0.0, NOISE_SD).expect("normal noise");
+            let mut x = Vec::with_capacity(N_TRAIN);
+            let mut y = Vec::with_capacity(N_TRAIN);
+            for _ in 0..N_TRAIN {
+                let xi = unif.sample(&mut rng);
+                let yi = true_eta(xi) + noise.sample(&mut rng);
+                x.push(xi);
+                y.push(yi);
+            }
+            (x, y)
+        })
+        .collect();
 
-    for rep in 0..N_REPLICATES {
-        // Deterministic per-replicate seed derived from the base seed.
-        let mut rng =
-            StdRng::seed_from_u64(BASE_SEED.wrapping_mul(1_000_003).wrapping_add(rep as u64));
-        let unif = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
-        let noise = Normal::new(0.0, NOISE_SD).expect("normal noise");
-
-        let mut x = Vec::with_capacity(N_TRAIN);
-        let mut y = Vec::with_capacity(N_TRAIN);
-        for _ in 0..N_TRAIN {
-            let xi = unif.sample(&mut rng);
-            let yi = true_eta(xi) + noise.sample(&mut rng);
-            x.push(xi);
-            y.push(yi);
-        }
-
-        // Stash for the (single) mgcv reference call.
+    // Stash for the (single) mgcv reference call, in replicate order.
+    for (rep, (x, y)) in replicate_data.iter().enumerate() {
         for i in 0..N_TRAIN {
             rep_col.push(rep as f64);
             x_col.push(x[i]);
             y_col.push(y[i]);
         }
-
-        // ---- fit with gam: y ~ s(x, k=12), Gaussian identity, REML --------
-        let headers = ["x", "y"].into_iter().map(String::from).collect();
-        let rows: Vec<StringRecord> = (0..N_TRAIN)
-            .map(|i| StringRecord::from(vec![x[i].to_string(), y[i].to_string()]))
-            .collect();
-        let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode replicate");
-        let col = ds.column_map();
-        let x_idx = col["x"];
-
-        let cfg = FitConfig {
-            family: Some("gaussian".to_string()),
-            ..FitConfig::default()
-        };
-        let result =
-            fit_from_formula("y ~ s(x, k=12)", &ds, &cfg).expect("gam gaussian smooth fit");
-        let FitResult::Standard(fit) = result else {
-            panic!("expected a standard GAM fit for y ~ s(x, k=12)");
-        };
-
-        // Conditional posterior covariance Vb = H^{-1}*phi — the exact analogue
-        // of what mgcv's predict(se.fit=TRUE) reports for the linear predictor.
-        let cov: Array2<f64> = fit
-            .fit
-            .beta_covariance()
-            .expect("gam must expose a conditional coefficient covariance for a Gaussian smooth")
-            .clone();
-
-        // Rebuild the frozen design at the shared eval grid.
-        let mut grid_mat = Array2::<f64>::zeros((N_GRID, ds.headers.len()));
-        for (i, &xg) in grid.iter().enumerate() {
-            grid_mat[[i, x_idx]] = xg;
-        }
-        let eval_design = build_term_collection_design(grid_mat.view(), &fit.resolvedspec)
-            .expect("rebuild s(x) design at eval grid");
-        let offset = Array1::<f64>::zeros(N_GRID);
-
-        // Base conditional-covariance Wald interval: boundary correction OFF so
-        // this is the unadorned eta_hat ± z*se path, matching mgcv's se.fit.
-        let pred = predict_gamwith_uncertainty(
-            &eval_design.design,
-            fit.fit.beta.view(),
-            offset.view(),
-            LikelihoodSpec::gaussian_identity(),
-            &cov,
-            &PredictUncertaintyOptions {
-                confidence_level: CONFIDENCE_LEVEL,
-                covariance_mode: InferenceCovarianceMode::Conditional,
-                mean_interval_method: MeanIntervalMethod::TransformEta,
-                includeobservation_interval: false,
-                apply_bias_correction: false,
-                edgeworth_one_sided: false,
-                boundary_correction: false,
-                ood_inflation: false,
-                multi_point_joint: false,
-                ..PredictUncertaintyOptions::default()
-            },
-        )
-        .expect("gam conditional-covariance interval prediction");
-
-        // Score: is the TRUE eta inside [eta_lower, eta_upper] at each grid point?
-        assert_eq!(
-            pred.eta_lower.len(),
-            N_GRID,
-            "gam eta_lower length mismatch"
-        );
-        for g in 0..N_GRID {
-            let lo = pred.eta_lower[g];
-            let hi = pred.eta_upper[g];
-            let b = bin_of(grid[g]);
-            gam_total[b] += 1;
-            if lo <= truth_grid[g] && truth_grid[g] <= hi {
-                gam_hits[b] += 1;
-            }
-        }
     }
+
+    // ---- fit each replicate with gam in parallel ----------------------------
+    // The 50 fits are independent (only `y` changes); per-bin hits/totals are
+    // accumulated by exact integer addition, so fanning the fits across the
+    // rayon pool and reducing the per-replicate count arrays is bit-identical to
+    // the serial accumulation and changes no asserted quantity. The fits
+    // dominate wall-clock, so this is the harness-side speedup (#1082).
+    let (par_hits, par_total): ([usize; N_BINS], [usize; N_BINS]) = replicate_data
+        .par_iter()
+        .map(|(x, y)| {
+            // ---- fit with gam: y ~ s(x, k=12), Gaussian identity, REML ----
+            let headers = ["x", "y"].into_iter().map(String::from).collect();
+            let rows: Vec<StringRecord> = (0..N_TRAIN)
+                .map(|i| StringRecord::from(vec![x[i].to_string(), y[i].to_string()]))
+                .collect();
+            let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode replicate");
+            let col = ds.column_map();
+            let x_idx = col["x"];
+
+            let cfg = FitConfig {
+                family: Some("gaussian".to_string()),
+                ..FitConfig::default()
+            };
+            let result =
+                fit_from_formula("y ~ s(x, k=12)", &ds, &cfg).expect("gam gaussian smooth fit");
+            let FitResult::Standard(fit) = result else {
+                panic!("expected a standard GAM fit for y ~ s(x, k=12)");
+            };
+
+            // Conditional posterior covariance Vb = H^{-1}*phi — the exact
+            // analogue of what mgcv's predict(se.fit=TRUE) reports.
+            let cov: Array2<f64> = fit
+                .fit
+                .beta_covariance()
+                .expect(
+                    "gam must expose a conditional coefficient covariance for a Gaussian smooth",
+                )
+                .clone();
+
+            // Rebuild the frozen design at the shared eval grid.
+            let mut grid_mat = Array2::<f64>::zeros((N_GRID, ds.headers.len()));
+            for (i, &xg) in grid.iter().enumerate() {
+                grid_mat[[i, x_idx]] = xg;
+            }
+            let eval_design = build_term_collection_design(grid_mat.view(), &fit.resolvedspec)
+                .expect("rebuild s(x) design at eval grid");
+            let offset = Array1::<f64>::zeros(N_GRID);
+
+            // Base conditional-covariance Wald interval: boundary correction OFF
+            // so this is the unadorned eta_hat ± z*se path, matching mgcv.
+            let pred = predict_gamwith_uncertainty(
+                &eval_design.design,
+                fit.fit.beta.view(),
+                offset.view(),
+                LikelihoodSpec::gaussian_identity(),
+                &cov,
+                &PredictUncertaintyOptions {
+                    confidence_level: CONFIDENCE_LEVEL,
+                    covariance_mode: InferenceCovarianceMode::Conditional,
+                    mean_interval_method: MeanIntervalMethod::TransformEta,
+                    includeobservation_interval: false,
+                    apply_bias_correction: false,
+                    edgeworth_one_sided: false,
+                    boundary_correction: false,
+                    ood_inflation: false,
+                    multi_point_joint: false,
+                    ..PredictUncertaintyOptions::default()
+                },
+            )
+            .expect("gam conditional-covariance interval prediction");
+
+            // Score: is the TRUE eta inside [eta_lower, eta_upper] per grid point?
+            assert_eq!(pred.eta_lower.len(), N_GRID, "gam eta_lower length mismatch");
+            let mut hits = [0usize; N_BINS];
+            let mut total = [0usize; N_BINS];
+            for g in 0..N_GRID {
+                let lo = pred.eta_lower[g];
+                let hi = pred.eta_upper[g];
+                let b = bin_of(grid[g]);
+                total[b] += 1;
+                if lo <= truth_grid[g] && truth_grid[g] <= hi {
+                    hits[b] += 1;
+                }
+            }
+            (hits, total)
+        })
+        .reduce(
+            || ([0usize; N_BINS], [0usize; N_BINS]),
+            |(mut ah, mut at), (bh, bt)| {
+                for b in 0..N_BINS {
+                    ah[b] += bh[b];
+                    at[b] += bt[b];
+                }
+                (ah, at)
+            },
+        );
+    for b in 0..N_BINS {
+        gam_hits[b] += par_hits[b];
+        gam_total[b] += par_total[b];
+    }
+
+    let z = standard_normal_quantile(0.5 + 0.5 * CONFIDENCE_LEVEL);
 
     // ---- fit ALL 50 replicates with mgcv (the mature reference) -----------
     // One R process: split the stacked frame by `rep`, fit y ~ s(x, k=12) by
