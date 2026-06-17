@@ -483,4 +483,81 @@ mod tests {
             "expected a bounded nonzero PG curvature correction, got {correction}",
         );
     }
+
+    /// #1218: the returned `neg_log_evidence` must equal the documented closed
+    /// form `½log|Q| − ½hᵀQ⁻¹h − ½·d_g·log(2π)` in **absolute** value, not merely
+    /// up to a relative delta. The pre-fix code added `+½·d_g·log(2π)` instead of
+    /// subtracting it, biasing every K-vs-(K+1) gate Occam comparison by
+    /// `d_g·log(2π)` per gate coordinate. The existing tests only pin
+    /// relative/determinism properties (curvature deltas, FD derivatives,
+    /// bit-determinism), so that constant-offset sign error was invisible to them.
+    ///
+    /// This reconstructs the closed form independently with an explicit 2×2
+    /// determinant and inverse (no shared factorization with the module) on a
+    /// `psi_hat=None` block where every PG weight is exactly `ω_i = b_i/4` and the
+    /// curvature correction is identically zero — so the moment-matched lane
+    /// exercises precisely the `value − ½·d_g·log(2π)` assembly. Fails on the old
+    /// `+` sign (off by exactly `d_g·log(2π) = 2·log(2π)`), passes on the fix.
+    #[test]
+    fn moment_matched_evidence_matches_absolute_closed_form() {
+        // Concrete 4-row, d_g = 2 gate block from the #1218 repro.
+        let design = array![[1.0, 0.5], [1.0, -0.5], [1.0, 1.5], [1.0, -1.0]];
+        let y = array![1.0, 0.0, 2.0, 3.0];
+        let b = Array1::<f64>::from_elem(4, 3.0);
+        let s = array![[1.5, 0.1], [0.1, 1.2]];
+        let block = GateBlock {
+            design: design.view(),
+            y: y.view(),
+            b: b.view(),
+            offset: None,
+            psi_hat: None, // untilted PG(b, 0) ⇒ ω_i = b_i/4 exactly, no curvature.
+            penalty: Some(s.view()),
+            hess_rest: None,
+            h_rest: None,
+        };
+
+        // Independent closed form. ω_i = E[PG(3, 0)] = 3/4 = 0.75 (pinned below).
+        let omega = pg_moments(3.0, 0.0).mean;
+        assert!(
+            (omega - 0.75).abs() < 1e-12,
+            "PG(3, 0) mean must be b/4 = 0.75, got {omega}",
+        );
+        let kappa = &y - &(&b * 0.5); // κ = y − b/2.
+        // Q = S + Xᵀ Ω X  (Ω = ω·I since every weight is equal).
+        let xtx = design.t().dot(&design);
+        let q = &s + &(omega * &xtx);
+        let h = design.t().dot(&kappa); // h = Xᵀκ (no offset / h_rest).
+
+        // Explicit 2×2 determinant and inverse — fully independent of faer.
+        let (q00, q01, q10, q11) = (q[[0, 0]], q[[0, 1]], q[[1, 0]], q[[1, 1]]);
+        let det = q00 * q11 - q01 * q10;
+        assert!(det > 0.0, "gate Q must be SPD, det = {det}");
+        // Q⁻¹ h via the closed 2×2 inverse.
+        let inv_h0 = (q11 * h[0] - q01 * h[1]) / det;
+        let inv_h1 = (-q10 * h[0] + q00 * h[1]) / det;
+        let quad = h[0] * inv_h0 + h[1] * inv_h1; // hᵀQ⁻¹h.
+        let log_two_pi = (2.0 * std::f64::consts::PI).ln();
+        let d_g = 2.0;
+        let want = 0.5 * det.ln() - 0.5 * quad - 0.5 * d_g * log_two_pi;
+
+        let got = pg_gate_evidence_moment_matched(&block)
+            .expect("moment-matched gate evidence")
+            .neg_log_evidence;
+
+        assert!(
+            (got - want).abs() < 1e-10,
+            "neg_log_evidence must match the absolute closed form: got {got}, want {want}, \
+             gap {} (the pre-fix sign bug gives a gap of d_g·log(2π) = {})",
+            got - want,
+            d_g * log_two_pi,
+        );
+
+        // Guard the sign direction explicitly: the buggy `+` assembly would land
+        // exactly `d_g·log(2π)` ABOVE the correct value, so confirm we are not there.
+        let buggy = want + d_g * log_two_pi;
+        assert!(
+            (got - buggy).abs() > 1.0,
+            "neg_log_evidence must not match the buggy +½·d_g·log(2π) assembly ({buggy})",
+        );
+    }
 }
