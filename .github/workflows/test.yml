@@ -264,7 +264,18 @@ jobs:
           # serialized link job within the runner's disk budget.
           for test_file in tests/*.rs; do
             test_name="$(basename "$test_file" .rs)"
-            if ! run_cargo_test "$INTEGRATION_TEST_TIMEOUT" --test "$test_name"; then
+            # The `pyffi` binary holds one test that shells out to
+            # `python3 -c "import gamfit"` (the Rust↔Python FFI parity check).
+            # This Rust-only job has no maturin-built `gamfit._rust` extension
+            # installed, so that test can never import it here. It is run in the
+            # `python-tests` job below, AFTER the wheel is built and installed.
+            # Exclude only that one test here so the rest of the `pyffi` binary
+            # still runs in this job (#1251).
+            extra_filter=()
+            if [ "$test_name" = "pyffi" ]; then
+              extra_filter=(-E 'not test(python_rust_ffi_parity_gaussian_linear_case)')
+            fi
+            if ! run_cargo_test "$INTEGRATION_TEST_TIMEOUT" --test "$test_name" "${extra_filter[@]}"; then
               test_status=1
             fi
             # Prune only the executed test EXECUTABLE to reclaim disk. Do NOT
@@ -386,6 +397,21 @@ jobs:
           python -m pip install \
             'pytest>=8' 'numpy>=1.26' 'pandas>=2.0' 'pyarrow>=14' \
             'matplotlib>=3.8' 'scikit-learn>=1.4'
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Run Rust↔Python FFI parity test (needs installed gamfit wheel)
+        # This `pyffi` integration test shells out to `python3 -c "import
+        # gamfit"` and compares Rust-engine vs Python-binding fit output. It
+        # requires the maturin-built `gamfit._rust` extension installed above,
+        # so it is excluded from the Rust-only `test` job and run here (#1251).
+        run: |
+          cargo nextest run --all-features \
+            --test pyffi \
+            -E 'test(python_rust_ffi_parity_gaussian_linear_case)'
 
       - name: Run Python API + pipeline smoke tests
         run: python -m pytest tests/test_python_api.py -v --tb=short
