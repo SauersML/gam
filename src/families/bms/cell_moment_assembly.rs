@@ -2864,6 +2864,24 @@ mod empirical_rigid_jet_oracle_tests {
     /// Independent calibration-intercept root solve: the unique `a` with
     /// `Σ_k π_k Φ(a + s·g·x_k) = μ`. Plain damped Newton from a bracketed seed;
     /// shares no code with `empirical_intercept_from_marginal`.
+    // Witness-exact standard-normal primitives (`libm::erfc`, no piecewise
+    // rational approximation). The high-order FD witness divides by h⁴, so it
+    // amplifies any *smooth* approximation error in the CDF/logCDF by ~1/h⁴:
+    // production's `normal_logcdf`/`normal_cdf` carry an ~1e-11 oscillating
+    // approximation error on a scale near `h`, whose 4th finite difference is
+    // ~2% of the mmmg tensor (#932). Routing the witness through ulp-accurate
+    // `erfc` keeps it a genuinely INDEPENDENT, exact oracle of the analytic
+    // production tensor (which differentiates the true log Φ analytically).
+    fn wnorm_cdf(x: f64) -> f64 {
+        0.5 * libm::erfc(-x / std::f64::consts::SQRT_2)
+    }
+    fn wnorm_pdf(x: f64) -> f64 {
+        (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+    }
+    fn wnorm_logcdf(x: f64) -> f64 {
+        wnorm_cdf(x).max(1e-300).ln()
+    }
+
     fn witness_intercept(mu: f64, slope: f64, s: f64, nodes: &[f64], weights: &[f64]) -> f64 {
         let observed_slope = s * slope;
         let calib = |a: f64| -> (f64, f64) {
@@ -2872,8 +2890,8 @@ mod empirical_rigid_jet_oracle_tests {
             let mut df = 0.0;
             for (&x, &w) in nodes.iter().zip(weights.iter()) {
                 let eta = a + observed_slope * x;
-                f += w * normal_cdf(eta);
-                df += w * normal_pdf(eta);
+                f += w * wnorm_cdf(eta);
+                df += w * wnorm_pdf(eta);
             }
             (f, df)
         };
@@ -2906,11 +2924,11 @@ mod empirical_rigid_jet_oracle_tests {
         nodes: &[f64],
         weights: &[f64],
     ) -> f64 {
-        let mu = normal_cdf(m);
+        let mu = wnorm_cdf(m);
         let a = witness_intercept(mu, g, s, nodes, weights);
         let observed_eta = a + s * g * z;
         let signed = (2.0 * y - 1.0) * observed_eta;
-        -w * normal_logcdf(signed)
+        -w * wnorm_logcdf(signed)
     }
 
     /// 9-point central-difference partial of a 2-arg scalar to the requested
@@ -3144,41 +3162,6 @@ mod empirical_rigid_jet_oracle_tests {
                 // Richardson witness resolves that magnitude well inside the 1%
                 // band below, so the guard would have caught #833.
                 let h4 = 6e-3;
-                // DIAGNOSTIC (temporary, #932): dump the actual Rust witness FD
-                // vs production for the mmmg channel so we can compare against an
-                // independent off-box re-derivation. Both should be ~-0.2682 for
-                // frailty None row 0.
-                if frailty_sd.is_none() && row == 0 {
-                    let fd_mmmg = central_mixed_rich(&f, m[row], g[row], 3, 1, h4);
-                    let base = f(m[row], g[row]);
-                    let s_used = s;
-                    eprintln!(
-                        "DIAG932: frailty=None row=0 s={s_used} base_nll={base:+.12e} \
-                         witness_T4_mmmg={fd_mmmg:+.12e} production_T4_mmmg={:+.12e}",
-                        fourth[0][0][0][1]
-                    );
-                    // Dump every stencil evaluation f(m0+im*h, g0+ig*h) at the
-                    // coarse step h4 for the mmmg (order_m=3, order_g=1) stencil so
-                    // an off-box re-derivation can diff point-by-point and localize
-                    // the divergent term.
-                    let m0d = m[row];
-                    let g0d = g[row];
-                    for im in [-2_i64, -1, 1, 2] {
-                        for ig in [-1_i64, 1] {
-                            let mm = m0d + (im as f64) * h4;
-                            let gg = g0d + (ig as f64) * h4;
-                            let val = f(mm, gg);
-                            // also dump the witness intercept and signed arg
-                            let mu = normal_cdf(mm);
-                            let a_int = witness_intercept(mu, gg, s, &grid.nodes, &grid.weights);
-                            let signed = (2.0 * y[row] - 1.0) * (a_int + s * gg * z[row]);
-                            eprintln!(
-                                "DIAG932PT: im={im} ig={ig} mm={mm:+.12e} gg={gg:+.12e} \
-                                 a={a_int:+.12e} signed={signed:+.12e} f={val:+.12e}"
-                            );
-                        }
-                    }
-                }
                 for (lbl, om, og, prod) in [
                     ("mmmm", 4, 0, fourth[0][0][0][0]),
                     ("mmmg", 3, 1, fourth[0][0][0][1]),
