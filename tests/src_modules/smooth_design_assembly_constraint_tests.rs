@@ -4599,6 +4599,331 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
     );
 }
 
+/// #1033 (mechanism b) bounded-skip gate: a κ-loop trial that lands on the
+/// design-revision FAST PATH must NOT re-enter the n-row reconditioning lane,
+/// AND must produce the bit-identical converged inner solution (⇒ same EDF /
+/// κ-optimum) as the streamed slow path.
+///
+/// The outer ρ/κ optimizer drives `evaluate_joint_reml_outer_eval_at_theta`
+/// with a `design_revision` that only advances when the realizer rebuilds the
+/// n×k design. On the certified Gaussian ψ-Gram path the spatial caller
+/// (`SpatialJointContext::eval_full`) deliberately does NOT re-realize the
+/// design for an in-window ψ move, so the revision is unchanged and
+/// `prepare_eval_state` takes its fast path: it skips `reset_surface` (the
+/// O(n·p) reconditioning + O(Σ pₖ³) canonical rebuild) and instead re-keys the
+/// n-free `GaussianFixedCache` to the new ψ. Value-equality is already pinned
+/// by `psi_gram_tensor_e2e_kappa_optimum_matches_streamed`; this test adds the
+/// COMPLEMENTARY structural claim it cannot make — that the n-row lane is
+/// genuinely not re-entered — via the `slow_path_reset_count` instrumentation
+/// counter, which increments only on a `reset_surface` rebuild.
+///
+/// Sequence on the tensor evaluator at a FIXED design_revision:
+///   trial 1 (ψ_A): first eval at this revision → slow path runs once
+///                  (counter 0 → 1), pinning the reference surface.
+///   trial 2 (ψ_B): SAME revision, ψ moved inside the window → fast path
+///                  fires, counter stays 1 (n-row lane NOT re-entered).
+///   trial 3 (ψ_C): SAME revision again → counter still 1.
+/// A fresh streamed evaluator computes the slow-path β̂ at ψ_B / ψ_C; the
+/// fast-path β̂ must match it to solver round-off.
+#[test]
+fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
+    use crate::solver::rho_optimizer::OuterEvalOrder;
+
+    // Same 1-D Duchon Gaussian fixture as the e2e κ-optimum test (n = 600).
+    let n = 600usize;
+    let mut data = Array2::<f64>::zeros((n, 1));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = i as f64 / (n as f64 - 1.0);
+        data[[i, 0]] = t;
+        let signal = 1.2 * (2.0 * std::f64::consts::PI * t).sin() + 0.4 * (t - 0.5);
+        let noise = 0.15 * (((i as f64) * 12.9898).sin() * 43758.547).fract();
+        y[i] = signal + noise;
+    }
+    let weights = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let family = LikelihoodSpec::gaussian_identity();
+
+    let spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "fast_path_skip".to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: vec![0],
+                spec: DuchonBasisSpec {
+                    periodic: None,
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                    length_scale: Some(1.0),
+                    power: 1.0,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    boundary: OneDimensionalBoundary::Open,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+
+    let design = build_term_collection_design(data.view(), &spec).expect("design");
+    let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+    let frozen_design = build_term_collection_design(data.view(), &frozen).expect("frozen design");
+    let spatial_terms = spatial_length_scale_term_indices(&frozen);
+    let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+    let rho_dim = frozen_design.penalties.len();
+    let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+    let log_kappa0 =
+        SpatialLogKappaCoords::from_length_scales(&frozen, &spatial_terms, &kappa_options);
+    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_from_data(
+        data.view(),
+        &frozen,
+        &spatial_terms,
+        &kappa_options,
+    );
+    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
+        data.view(),
+        &frozen,
+        &spatial_terms,
+        &kappa_options,
+    );
+    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
+    const JOINT_RHO_BOUND: f64 = 12.0;
+    let setup = ExactJointHyperSetup::new(
+        Array1::<f64>::zeros(rho_dim),
+        Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
+        Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
+        log_kappa0.clone(),
+        log_kappa_lower.clone(),
+        log_kappa_upper.clone(),
+    );
+    let theta0 = setup.theta0();
+    let lower = setup.lower();
+    let upper = setup.upper();
+    let psi_lo = lower[rho_dim];
+    let psi_hi = upper[rho_dim];
+    let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
+    let external_opts = external_opts_for_design(
+        &family,
+        &frozen_design,
+        &FitOptions {
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            penalty_shrinkage_floor: None,
+            ..FitOptions::default()
+        },
+    );
+
+    let make_eval = || {
+        crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "fast_path_skip",
+        )
+        .expect("evaluator")
+    };
+    let make_cache = || {
+        SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("design cache")
+    };
+
+    // Tensor evaluator with the certified tensor attached over the window.
+    let mut tensor_eval = make_eval();
+    let mut tensor_cache = make_cache();
+    let attached = {
+        let mut build_cache = make_cache();
+        let theta_probe_base = theta0.clone();
+        tensor_eval.build_and_set_psi_gram_tensor(
+            |psi| {
+                let mut theta_probe = theta_probe_base.clone();
+                theta_probe[rho_dim] = psi;
+                build_cache.ensure_theta(&theta_probe)?;
+                Ok(build_cache.design().design.clone())
+            },
+            weights.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+    };
+    assert!(
+        attached,
+        "tensor must certify on this fixture for a non-vacuous gate"
+    );
+
+    // Three in-window ψ operating points reached at a SINGLE fixed
+    // design_revision. We realize the design ONCE (at ψ_A) to pin the
+    // reference surface + revision, then evaluate ψ_B / ψ_C against that same
+    // revision WITHOUT re-realizing — exactly what `eval_full` does on the
+    // certified skip path.
+    let psi_a = psi_lo + 0.30 * (psi_hi - psi_lo);
+    let psi_b = 0.5 * (psi_lo + psi_hi);
+    let psi_c = psi_hi - 0.15 * (psi_hi - psi_lo);
+    let rho = Array1::<f64>::from_elem(rho_dim, 0.5);
+    let theta_at = |psi: f64| {
+        let mut theta = Array1::<f64>::zeros(rho_dim + 1);
+        theta.slice_mut(s![..rho_dim]).assign(&rho);
+        theta[rho_dim] = psi;
+        theta
+    };
+
+    // Realize the design once and FREEZE the revision the rest of the test
+    // pins on. The hyper_dirs are a ψ-invariant pure function of the realized
+    // design, so the same slab is sound for every ψ at this revision.
+    tensor_cache.ensure_theta(&theta_at(psi_a)).unwrap();
+    let frozen_revision = tensor_cache.design_revision();
+    let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+        data.view(),
+        tensor_cache.spec(),
+        tensor_cache.design(),
+        &spatial_terms,
+    )
+    .unwrap()
+    .unwrap();
+
+    let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+                       theta: &Array1<f64>|
+     -> (f64, Array1<f64>, Array1<f64>) {
+        let (cost, grad, _h) = evaluate_joint_reml_outer_eval_at_theta(
+            evaluator,
+            tensor_cache.design(),
+            theta,
+            rho_dim,
+            hyper_dirs.clone(),
+            None,
+            OuterEvalOrder::ValueAndGradient,
+            Some(frozen_revision),
+        )
+        .expect("tensor eval");
+        let beta = evaluator
+            .current_beta()
+            .expect("converged inner β̂ available");
+        (cost, grad, beta)
+    };
+
+    // Trial 1 (ψ_A): first eval at this revision → slow path runs ONCE.
+    assert_eq!(
+        tensor_eval.slow_path_reset_count(),
+        0,
+        "no slow-path reset before the first eval"
+    );
+    let (c_a, _g_a, beta_a) = eval_tensor(&mut tensor_eval, &theta_at(psi_a));
+    assert_eq!(
+        tensor_eval.slow_path_reset_count(),
+        1,
+        "first eval at a fresh revision must take the slow path exactly once"
+    );
+
+    // Trial 2 (ψ_B): SAME revision, ψ moved inside window → FAST PATH.
+    let (c_b, _g_b, beta_b) = eval_tensor(&mut tensor_eval, &theta_at(psi_b));
+    assert_eq!(
+        tensor_eval.slow_path_reset_count(),
+        1,
+        "cache-hit trial (repeated design_revision) re-entered the n-row \
+         reconditioning lane — the #1033 bounded skip is broken"
+    );
+
+    // Trial 3 (ψ_C): SAME revision again → still no new slow-path entry.
+    let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &theta_at(psi_c));
+    assert_eq!(
+        tensor_eval.slow_path_reset_count(),
+        1,
+        "second cache-hit trial re-entered the n-row reconditioning lane"
+    );
+
+    assert!(
+        c_a.is_finite() && c_b.is_finite() && c_c.is_finite(),
+        "all fast/slow path costs must be finite"
+    );
+
+    // κ-optimum invariance: the fast-path converged β̂ (⇒ EDF / κ-optimum) at
+    // ψ_B and ψ_C must equal a FRESH streamed slow-path solve at the same θ.
+    // A fresh streamed evaluator + cache re-realizes the design per ψ (its
+    // revision advances each call), so it always runs the exact n-row lane —
+    // the reference the fast path must reproduce.
+    let mut streamed_eval = make_eval();
+    let mut stream_cache = make_cache();
+    let beta_streamed = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+                         cache: &mut SingleBlockExactJointDesignCache<'_>,
+                         theta: &Array1<f64>|
+     -> Array1<f64> {
+        cache.ensure_theta(theta).expect("ensure_theta");
+        let hyper = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &spatial_terms,
+        )
+        .unwrap()
+        .unwrap();
+        evaluate_joint_reml_outer_eval_at_theta(
+            evaluator,
+            cache.design(),
+            theta,
+            rho_dim,
+            hyper,
+            None,
+            OuterEvalOrder::ValueAndGradient,
+            Some(cache.design_revision()),
+        )
+        .expect("streamed eval");
+        evaluator.current_beta().expect("streamed β̂")
+    };
+
+    let mut worst = 0.0_f64;
+    for (label, theta, beta_fast) in [
+        ("psi_b", theta_at(psi_b), &beta_b),
+        ("psi_c", theta_at(psi_c), &beta_c),
+    ] {
+        let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta);
+        assert_eq!(beta_fast.len(), beta_slow.len(), "β̂ dim mismatch @ {label}");
+        for j in 0..beta_fast.len() {
+            assert!(
+                beta_fast[j].is_finite() && beta_slow[j].is_finite(),
+                "non-finite β̂[{j}] @ {label}"
+            );
+            let babs = (beta_fast[j] - beta_slow[j]).abs();
+            let brel = babs / (1.0 + beta_slow[j].abs());
+            worst = worst.max(babs);
+            assert!(
+                brel <= 1e-6,
+                "fast-path β̂[{j}] @ {label} diverges from streamed slow path: \
+                 fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} rel={brel:.3e} — the \
+                 n-free fast path changed the κ-optimum",
+                beta_fast[j],
+                beta_slow[j],
+            );
+        }
+    }
+    // β̂ at ψ_A (the slow-path reference inside the tensor evaluator itself)
+    // must be finite — sanity that the pinning eval converged.
+    assert!(
+        beta_a.iter().all(|v| v.is_finite()),
+        "ψ_A pinning β̂ must be finite"
+    );
+
+    eprintln!(
+        "[psi-gram-tensor #1033] fast path served 2 in-window ψ trials with \
+         slow_path_reset_count=1 (n-row lane NOT re-entered); worst |Δβ̂| vs \
+         streamed slow path = {worst:.3e} — κ-optimum lane-invariant"
+    );
+}
+
 #[test]
 fn iso_kappa_duchon_binomial_logit_fd() {
     let (pass, worst, violations) =

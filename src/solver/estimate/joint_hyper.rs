@@ -142,6 +142,15 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// n-free; `B_j` stays the exact slab. `None` (the default) clears the
     /// surface slot so a stale previous-ψ derivative is never consumed.
     pub(crate) pending_glm_psi_gram_deriv: Option<std::sync::Arc<(Array2<f64>, Array1<f64>)>>,
+    /// #1033 instrumentation: count of slow-path entries — i.e. trials for which
+    /// `prepare_eval_state` (or its cost-only twin) rebuilt the canonical
+    /// penalty and re-ran `reset_surface`, paying the per-trial O(n·p) design
+    /// reconditioning + O(Σ pₖ³) canonical rebuild. The design-revision fast
+    /// path does NOT increment this. A bit-tight test asserts that a cache-hit
+    /// trial (repeated `design_revision`) leaves this counter unchanged, proving
+    /// the n-row reconditioning lane was not re-entered. Pure observability; it
+    /// never gates control flow.
+    pub(crate) slow_path_reset_count: std::cell::Cell<u64>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -215,7 +224,17 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             psi_gram_tensor: None,
             pending_glm_first_step_gram: None,
             pending_glm_psi_gram_deriv: None,
+            slow_path_reset_count: std::cell::Cell::new(0),
         })
+    }
+
+    /// #1033 instrumentation accessor: number of slow-path `reset_surface`
+    /// rebuilds the evaluator has performed since construction. A trial that
+    /// takes the design-revision fast path (cache hit) does not advance this, so
+    /// a test can assert the n-row reconditioning lane was not re-entered by
+    /// checking this counter is unchanged across a repeat-revision eval.
+    pub(crate) fn slow_path_reset_count(&self) -> u64 {
+        self.slow_path_reset_count.get()
     }
 
     /// Stage (or clear) the frozen-weight GLM first-Fisher-step Gram for the
@@ -605,6 +624,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             self.kronecker_penalty_system.clone(),
             self.kronecker_factored.clone(),
         )?;
+        // #1033 instrumentation: this is the slow (n-row) reconditioning lane.
+        self.slow_path_reset_count
+            .set(self.slow_path_reset_count.get().wrapping_add(1));
         self.reml_state
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
@@ -849,6 +871,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             self.kronecker_penalty_system.clone(),
             self.kronecker_factored.clone(),
         )?;
+        // #1033 instrumentation: this is the slow (n-row) reconditioning lane.
+        self.slow_path_reset_count
+            .set(self.slow_path_reset_count.get().wrapping_add(1));
         self.reml_state
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
