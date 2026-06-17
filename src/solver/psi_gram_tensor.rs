@@ -115,21 +115,16 @@ pub const PSI_GRAM_NODE_LADDER: [usize; 5] = [9, 17, 33, 65, 129];
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
 
-/// Maximum factor by which the value-Gram conditioning may move ACROSS the
-/// fast-path skip band before the #1033 design-revision skip is considered
-/// unsound (#1216, item 3 — the reduced basis has shifted). Inside the resulting
-/// `[skip_psi_lo, skip_psi_hi]` (where `cond_max/cond_min ≤` this factor) the
-/// fast path (re-key Gram + penalty on a frozen reference surface) reproduces
-/// the slow-path β̂; outside it the caller takes the full `reset_surface`.
+/// Minimum RRQR rank-verdict margin accepted for the fast-path skip frame.
 ///
-/// A 10× band still left a ~10% β̂ drift on the gate (the radial reduced-rank
-/// basis crosses its RRQR threshold within a 10× conditioning move), so this is
-/// set to 3× — tight enough that the reference→trial reduced basis is stable
-/// while keeping a useful n-free skip band around the κ-optimum.
-pub const PSI_GRAM_SKIP_COND_FACTOR: f64 = 3.0;
+/// The skip gate is intentionally conservative: a Gram-derived pivot frame is
+/// used only when the rank decision is well away from both the tolerance cliff
+/// and the Gram precision floor reported by `rrqr_from_gram_with_permutation`.
+/// Near-cliff frames fall back to the full `reset_surface` path.
+pub const PSI_GRAM_SKIP_RRQR_MARGIN_MIN: f64 = 16.0;
 
-/// Number of equispaced scan points used to locate the conditioning-stable skip
-/// sub-window at build (each is a k×k symmetric-eigenvalue solve — cheap).
+/// Number of equispaced scan points used to locate the RRQR-pivot-stable skip
+/// sub-window at build (each probe is a k×k Gram-derived RRQR — cheap).
 pub const PSI_GRAM_SKIP_SCAN_POINTS: usize = 64;
 
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
@@ -152,24 +147,26 @@ pub struct PsiGramTensor {
     /// still spans the full window.
     grad_psi_lo: f64,
     grad_psi_hi: f64,
-    /// Conditioning-stable sub-window `[skip_psi_lo, skip_psi_hi] ⊆ [psi_lo,
+    /// RRQR-pivot-stable sub-window `[skip_psi_lo, skip_psi_hi] ⊆ [psi_lo,
     /// psi_hi]` over which the design's REDUCED BASIS is ψ-invariant enough that
     /// the #1033 design-revision FAST PATH (which skips `reset_surface` and
     /// re-keys only the Gram + penalty on a surface pinned at a reference ψ) is
-    /// SOUND (#1216, item 3).
+    /// SOUND (#1264).
     ///
     /// The fast path keeps the conditioned reduced design / null-space basis
     /// frozen at the revision-pinning ψ and only swaps in `gram_at(ψ_new)` and
-    /// `S(ψ_new)`. That is exact only while the design's effective conditioning
-    /// (hence its reduced-rank basis) does not move materially with ψ. On the
-    /// WIDE standardized window (#1215) the radial-kernel Gram conditioning grows
-    /// by orders of magnitude across the window, so a far ψ move silently pairs a
-    /// stale reduced basis with a re-keyed Gram → a wrong β̂ (~35% on the gate).
-    /// This sub-window is the centered ψ-range where `cond(gram_at(ψ))` stays
-    /// within [`PSI_GRAM_SKIP_COND_FACTOR`] of the window-center conditioning;
+    /// `S(ψ_new)`. That is exact only while the RRQR rank and pivot frame used by
+    /// the reduced basis are unchanged. On the WIDE standardized window (#1215)
+    /// the radial-kernel frame can pivot while the conditioning ratio still looks
+    /// tame, so a conditioning-only gate silently pairs a stale reduced basis
+    /// with a re-keyed Gram → a wrong β̂. This sub-window is the largest scanned
+    /// contiguous ψ-range whose Gram-derived RRQR rank and permutation match;
     /// outside it the caller must take the full `reset_surface` slow path.
     skip_psi_lo: f64,
     skip_psi_hi: f64,
+    /// Original row count of the design whose Gram was tensorized. Needed to run
+    /// the Gram-derived RRQR with the same rank tolerance as the tall design.
+    n_rows: usize,
     /// Number of Chebyshev coefficients (degree + 1).
     n_coeff: usize,
     k: usize,
@@ -259,58 +256,6 @@ fn cheb_t_double_prime(x: f64, n: usize) -> Vec<f64> {
     tpp
 }
 
-/// Eigenvalues of a small symmetric matrix via cyclic Jacobi rotations
-/// (#1216, item 3 — the conditioning probe for the fast-path skip window).
-/// Self-contained (the k×k Grams here are tiny); returns the diagonal after the
-/// off-diagonal mass is driven to ~machine zero. Used only for a λ_max/λ_min
-/// ratio, so eigenvectors are not accumulated.
-fn symmetric_eigenvalues_jacobi(a: &Array2<f64>) -> Vec<f64> {
-    let n = a.nrows();
-    if n == 0 || a.ncols() != n {
-        return Vec::new();
-    }
-    let mut m = a.clone();
-    const MAX_SWEEPS: usize = 100;
-    for _ in 0..MAX_SWEEPS {
-        let mut off = 0.0_f64;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                off += m[[i, j]] * m[[i, j]];
-            }
-        }
-        if off <= 1e-30 {
-            break;
-        }
-        for p in 0..n {
-            for q in (p + 1)..n {
-                let apq = m[[p, q]];
-                if apq.abs() <= 1e-300 {
-                    continue;
-                }
-                let app = m[[p, p]];
-                let aqq = m[[q, q]];
-                let phi = 0.5 * (aqq - app) / apq;
-                let t = phi.signum() / (phi.abs() + (phi * phi + 1.0).sqrt());
-                let c = 1.0 / (t * t + 1.0).sqrt();
-                let s = t * c;
-                for k in 0..n {
-                    let mkp = m[[k, p]];
-                    let mkq = m[[k, q]];
-                    m[[k, p]] = c * mkp - s * mkq;
-                    m[[k, q]] = s * mkp + c * mkq;
-                }
-                for k in 0..n {
-                    let mpk = m[[p, k]];
-                    let mqk = m[[q, k]];
-                    m[[p, k]] = c * mpk - s * mqk;
-                    m[[q, k]] = s * mpk + c * mqk;
-                }
-            }
-        }
-    }
-    (0..n).map(|i| m[[i, i]]).collect()
-}
-
 impl PsiGramTensor {
     /// Build and certify the tensor over `psi ∈ [psi_lo, psi_hi]`.
     ///
@@ -345,7 +290,7 @@ impl PsiGramTensor {
                         // interior (the value lane keeps the full window).
                         candidate.certify_gradient_window(&mut eval_design, weights);
                         // Narrow the design-revision skip lane to the
-                        // conditioning-stable interior (#1216, item 3).
+                        // RRQR-pivot-stable interior (#1264).
                         candidate.compute_skip_window();
                         return Some(candidate);
                     }
@@ -480,10 +425,11 @@ impl PsiGramTensor {
             // the value spot-check passes (`certify_gradient_window`).
             grad_psi_lo: psi_lo,
             grad_psi_hi: psi_hi,
-            // Provisional: `build` narrows these to the conditioning-stable
+            // Provisional: `build` narrows these to the RRQR-pivot-stable
             // interior after the spot-check passes (`compute_skip_window`).
             skip_psi_lo: psi_lo,
             skip_psi_hi: psi_hi,
+            n_rows: n,
             n_coeff: m,
             k,
             gram,
@@ -654,76 +600,87 @@ impl PsiGramTensor {
         }
     }
 
-    /// Locate the centered conditioning-stable sub-window `[skip_psi_lo,
-    /// skip_psi_hi]` where the value Gram's conditioning stays within
-    /// [`PSI_GRAM_SKIP_COND_FACTOR`] of the window-center conditioning, and store
-    /// it (#1216, item 3). The #1033 design-revision fast path (re-key Gram +
-    /// penalty on a frozen reference surface) is only sound here; outside it the
-    /// reduced basis has moved and the caller must take the full slow path.
+    /// Locate the largest scanned RRQR-pivot-stable sub-window `[skip_psi_lo,
+    /// skip_psi_hi]`, and store it (#1264). The #1033 design-revision fast path
+    /// (re-key Gram + penalty on a frozen reference surface) is only sound here;
+    /// outside it the reduced basis has moved and the caller must take the full
+    /// slow path.
     ///
-    /// n-free: `gram_at` is k-space, and each conditioning probe is a k×k
-    /// symmetric eigensolve.
+    /// n-free: `gram_at` is k-space, and each pivot probe is a Gram-derived k×k
+    /// RRQR with the tall-design rank tolerance.
     fn compute_skip_window(&mut self) {
-        let cond_at = |me: &Self, psi: f64| -> f64 {
+        #[derive(Clone, Eq, PartialEq)]
+        struct Frame {
+            rank: usize,
+            permutation: Vec<usize>,
+        }
+
+        let frame_at = |me: &Self, psi: f64| -> Option<Frame> {
             let g = me.gram_at(psi);
-            let evals = symmetric_eigenvalues_jacobi(&g);
-            let lo = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-            let hi = evals.iter().cloned().fold(0.0_f64, f64::max);
-            if !(lo.is_finite() && hi.is_finite()) || lo <= 0.0 {
-                return f64::INFINITY;
+            if g.iter().any(|v| !v.is_finite()) {
+                return None;
             }
-            hi / lo
+            let rrqr = crate::linalg::faer_ndarray::rrqr_from_gram_with_permutation(
+                &g,
+                me.n_rows,
+                crate::linalg::faer_ndarray::default_rrqr_rank_alpha(),
+            )
+            .ok()?;
+            if !rrqr.verdict_margin.is_finite()
+                || rrqr.verdict_margin < PSI_GRAM_SKIP_RRQR_MARGIN_MIN
+            {
+                return None;
+            }
+            Some(Frame {
+                rank: rrqr.rank,
+                permutation: rrqr.column_permutation,
+            })
         };
-        let center = 0.5 * (self.psi_lo + self.psi_hi);
-        let cond_center = cond_at(self, center);
-        if !cond_center.is_finite() {
-            // Degenerate center conditioning — disable the skip lane entirely.
+        let span = self.psi_hi - self.psi_lo;
+        if !(span.is_finite() && span > 0.0) {
             self.skip_psi_lo = f64::NAN;
             self.skip_psi_hi = f64::NAN;
             return;
         }
-        let span = self.psi_hi - self.psi_lo;
         let n = PSI_GRAM_SKIP_SCAN_POINTS;
-        // Expand a centered band, tracking the running min/max conditioning over
-        // EVERYTHING admitted so far. Stop on each side when admitting the next
-        // ψ would push `cond_max / cond_min` over [`PSI_GRAM_SKIP_COND_FACTOR`].
-        // Bounding the RATIO across the whole band (not each point vs the center)
-        // guarantees ANY reference→trial pair inside it — e.g. the
-        // revision-pinning ψ vs a later skip trial — sees a conditioning move of
-        // at most the factor, so the reduced basis is stable between them.
-        let mut cond_min = cond_center;
-        let mut cond_max = cond_center;
-        let mut admit = |c: f64, cmin: &mut f64, cmax: &mut f64| -> bool {
-            if !c.is_finite() {
-                return false;
+        let probes: Vec<(f64, Option<Frame>)> = (0..=n)
+            .map(|i| {
+                let psi = self.psi_lo + span * (i as f64) / (n as f64);
+                (psi, frame_at(self, psi))
+            })
+            .collect();
+
+        let mut best_start = None;
+        let mut best_end = None;
+        let mut best_len = 0usize;
+        let mut start = 0usize;
+        while start < probes.len() {
+            let Some(frame) = probes[start].1.as_ref() else {
+                start += 1;
+                continue;
+            };
+            let mut end = start;
+            while end + 1 < probes.len() && probes[end + 1].1.as_ref() == Some(frame) {
+                end += 1;
             }
-            let nmin = cmin.min(c);
-            let nmax = cmax.max(c);
-            if nmax / nmin > PSI_GRAM_SKIP_COND_FACTOR {
-                return false;
+            let len = end - start + 1;
+            if len > best_len {
+                best_len = len;
+                best_start = Some(start);
+                best_end = Some(end);
             }
-            *cmin = nmin;
-            *cmax = nmax;
-            true
-        };
-        let mut lo = center;
-        let mut hi = center;
-        for i in 1..=n {
-            let psi = center - span * 0.5 * (i as f64) / (n as f64);
-            if psi < self.psi_lo || !admit(cond_at(self, psi), &mut cond_min, &mut cond_max) {
-                break;
-            }
-            lo = psi;
+            start = end + 1;
         }
-        for i in 1..=n {
-            let psi = center + span * 0.5 * (i as f64) / (n as f64);
-            if psi > self.psi_hi || !admit(cond_at(self, psi), &mut cond_min, &mut cond_max) {
-                break;
-            }
-            hi = psi;
+
+        if let (Some(start), Some(end)) = (best_start, best_end)
+            && best_len >= 3
+        {
+            self.skip_psi_lo = probes[start].0;
+            self.skip_psi_hi = probes[end].0;
+        } else {
+            self.skip_psi_lo = f64::NAN;
+            self.skip_psi_hi = f64::NAN;
         }
-        self.skip_psi_lo = lo;
-        self.skip_psi_hi = hi;
     }
 
     /// True when `psi` lies inside the certified window.
@@ -731,9 +688,9 @@ impl PsiGramTensor {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
     }
 
-    /// True when `psi` lies inside the conditioning-stable sub-window where the
+    /// True when `psi` lies inside the RRQR-pivot-stable sub-window where the
     /// #1033 design-revision fast-path skip (re-key Gram + penalty on a frozen
-    /// reference surface) reproduces the exact slow-path β̂ (#1216, item 3).
+    /// reference surface) reproduces the exact slow-path β̂ (#1264).
     /// Outside it the design's reduced basis has moved with ψ, so the caller must
     /// take the full `reset_surface` slow path.
     pub fn contains_for_skip(&self, psi: f64) -> bool {

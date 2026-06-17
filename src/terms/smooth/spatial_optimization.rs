@@ -2493,16 +2493,15 @@ impl<'d> SpatialJointContext<'d> {
                 let psi = theta[self.rho_dim];
                 self.evaluator.psi_gram_tensor_covers(psi)
                     && self.evaluator.psi_gram_tensor_covers_gradient(psi)
-                    // #1216 item 3: the skip keeps the conditioned reduced /
+                    // #1264: the skip keeps the conditioned reduced /
                     // null-space basis frozen at the revision-pinning ψ and only
                     // re-keys the Gram + penalty. That is exact only inside the
-                    // CONDITIONING-STABLE sub-window; on the wide standardized
-                    // window a far ψ move shifts the radial-kernel Gram
-                    // conditioning (hence the reduced basis), and skipping there
-                    // pairs a stale basis with a re-keyed Gram → a wrong β̂. Gate
-                    // the skip on the stable band; elsewhere the full
-                    // `reset_surface` slow path runs (still n-free in the SEARCH
-                    // — the slow path realizes once per revision).
+                    // RRQR-pivot-stable sub-window; on the wide standardized
+                    // window a far ψ move can change the radial-kernel pivot
+                    // frame, and skipping there pairs a stale basis with a
+                    // re-keyed Gram → a wrong β̂. Gate the skip on the stable
+                    // frame band; elsewhere the full `reset_surface` slow path
+                    // runs.
                     && self.evaluator.psi_gram_tensor_covers_skip(psi)
                     // #1033 penalty lane: ψ moves S(ψ) too, and the skip leaves
                     // `reset_surface` un-run; only skip when the penalty can be

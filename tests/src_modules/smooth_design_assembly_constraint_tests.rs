@@ -4323,9 +4323,8 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
                 },
                 // PRODUCTION geometry: `None` lets the 1-D axis auto-standardize
                 // to unit spread (#1214/#1215) — the real default-fit path. The
-                // n-independence fast path MUST eventually fire here. (An earlier
-                // `Some(vec![1.0])` pin was a gamed gate that masked the open gap;
-                // removed. See the `#[ignore]` reason on this test.)
+                // n-independence fast path must fire here. An earlier
+                // `Some(vec![1.0])` pin was a gamed gate that masked the open gap.
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
@@ -4636,36 +4635,17 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 /// A fresh streamed evaluator computes the slow-path β̂ at ψ_B / ψ_C; the
 /// fast-path β̂ must match it to solver round-off.
 ///
-/// #1216 item 3 — STRUCTURAL BOUNDARY (why this is `#[ignore]`d, measured at
-/// HEAD c2b463491, n=600 Duchon fixture): the design-revision fast path keeps
-/// the reference surface (its conditioned frame AND its RRQR-reduced / null
-/// basis) FROZEN at ψ_A while re-keying the Gram `XᵀWX(ψ)` and penalty `S(ψ)`
-/// to ψ_B. The streamed slow path re-realizes and RE-PIVOTS the radial-kernel
-/// design at ψ_B, so it forms its solve in a DIFFERENT reduced basis. The skip
-/// is gated on `psi_gram_tensor_covers_skip`, whose band bounds the Gram
-/// CONDITIONING-NUMBER ratio to `PSI_GRAM_SKIP_COND_FACTOR` (3×) across the
-/// band — but a bounded conditioning ratio does NOT bound RRQR pivot-set /
-/// null-space-split stability: on this fixture the band lands at the high-ψ end
-/// `[2.357, 2.801]` of the window `[-0.547, 6.150]` where `‖XᵀX‖_F ~1.7e7` and
-/// the radial Gram is most ill-conditioned, so the pivot order is least stable
-/// there. Re-keying G(ψ_B)+S(ψ_B) onto the stale ψ_A reduced basis lands at a
-/// genuinely different κ-optimum: β̂[0] fast=+1154.7 vs slow=+897.4, rel=2.86e-1
-/// at ψ_B = 2.579 — the BAND MIDPOINT. The error is MAXIMAL at the center of
-/// the band, not at its edges, so tightening the band (already tried twice:
-/// 10×→3×, each plateauing at ~10%/~35% — see `PSI_GRAM_SKIP_COND_FACTOR`
-/// docs) cannot recover it: every sub-interval still contains the divergent
-/// center. A real fix must gate the skip on RRQR pivot-frame stability (e.g.
-/// require the ψ_A and ψ_B pivot sets / rank to coincide), not on the
-/// conditioning ratio. Until that lands the production caller correctly keeps
-/// the slow `reset_surface` path here (the skip never fires for a real fit
-/// because production never asserts this revision-pinned unsound skip), so this
-/// is a TEST of an unimplemented optimization, not a live correctness bug.
-#[ignore = "#1216 item 3: fast-path n-free skip is unsound on the wide \
-            standardized window — conditioning-ratio band (3×) does not bound \
-            RRQR pivot-frame stability; β̂rel=2.86e-1 at the band MIDPOINT \
-            (ψ=2.579), maximal at center so band-tightening cannot fix it. \
-            Needs a pivot-set-stability skip gate. Gates 1+2 (cost/grad lane \
-            + e2e κ-optimum) cover the correctness this would have added."]
+/// #1264: the design-revision fast path keeps the reference surface (its
+/// conditioned frame AND its RRQR-reduced / null basis) FROZEN at ψ_A while
+/// re-keying the Gram `XᵀWX(ψ)` and penalty `S(ψ)` to ψ_B. The streamed slow
+/// path re-realizes and RE-PIVOTS the radial-kernel design at ψ_B, so it forms
+/// its solve in a fresh reduced basis. A conditioning-ratio skip gate was not
+/// enough: on the production standardized fixture it admitted a high-ψ band
+/// whose midpoint changed β̂ by ~29%. The production skip gate is now keyed to
+/// the Gram-derived RRQR rank/permutation frame instead. This test scans the
+/// attached tensor's RRQR-stable band and asserts both structural n-row skip
+/// (`slow_path_reset_count` stays pinned) and β̂ equivalence against a fresh
+/// streamed slow-path solve.
 #[test]
 fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     use crate::solver::rho_optimizer::OuterEvalOrder;
@@ -4705,9 +4685,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                 },
                 // PRODUCTION geometry: `None` lets the 1-D axis auto-standardize
                 // to unit spread (#1214/#1215) — the real default-fit path. The
-                // n-independence fast path MUST eventually fire here. (An earlier
-                // `Some(vec![1.0])` pin was a gamed gate that masked the open gap;
-                // removed. See the `#[ignore]` reason on this test.)
+                // n-independence fast path must fire here. An earlier
+                // `Some(vec![1.0])` pin was a gamed gate that masked the open gap.
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
@@ -4829,8 +4808,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // revision WITHOUT re-realizing — exactly what `eval_full` does on the
     // certified skip path.
     //
-    // #1216 item 3: the skip is only SOUND inside the tensor's
-    // conditioning-stable sub-window (production gates `eval_full`'s skip on
+    // #1264: the skip is only SOUND inside the tensor's RRQR-pivot-stable
+    // sub-window (production gates `eval_full`'s skip on
     // `psi_gram_tensor_covers_skip`; outside it the reduced basis has moved and
     // the full `reset_surface` slow path runs). Mirror that here — pick the three
     // operating points INSIDE that band (scan it from the attached tensor), so
@@ -4846,7 +4825,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     };
     assert!(
         skip_band.len() >= 3,
-        "conditioning-stable skip sub-window must contain ≥3 ψ points for a \
+        "RRQR-pivot-stable skip sub-window must contain ≥3 ψ points for a \
          non-vacuous fast-path gate (found {})",
         skip_band.len()
     );
