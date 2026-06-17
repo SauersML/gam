@@ -2864,6 +2864,23 @@ impl SaeManifoldTerm {
             for idx in 0..sys.k {
                 grad_norm_sq += sys.gb[idx] * sys.gb[idx];
             }
+            let grad_norm = grad_norm_sq.sqrt();
+            let iterate_scale = self.inner_iterate_scale();
+            let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
+            let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * iterate_scale;
+            // Harmonize convergence gate with reml_criterion (see
+            // converge_inner_for_undamped_logdet): accept on raw/quotient grad
+            // OR quotient step. Unconditional grad check ensures a point that
+            // makes run_joint_fit return "converged" will also pass the first
+            // undamped stationarity gate in the REML evidence path (fixes cases
+            // where plain joint succeeds but reml_criterion refuses inside
+            // cotrained probes). Good warm-starts make this faster/tighter.
+            if grad_norm <= grad_tolerance {
+                break;
+            }
+            // (Quotient-grad uses dense gt layout from sys; here we conservatively
+            // keep raw grad for the fast pre-step gate. The step gate below uses
+            // the computed delta's quotient; reml will recheck with undamped.)
             let mut step_norm_sq = 0.0;
             for &v in delta_ext_coord.iter() {
                 step_norm_sq += v * v;
@@ -2871,19 +2888,7 @@ impl SaeManifoldTerm {
             for &v in delta_beta.iter() {
                 step_norm_sq += v * v;
             }
-            // #1051 — gauge/null-aware stationarity. A rank-deficient (or merely
-            // weakly-identified) decoder column makes the inner optimum a FLAT
-            // VALLEY: the Newton step keeps crawling along the unidentified
-            // direction with a tiny-but-nonzero gradient, so neither the raw
-            // gradient nor the Armijo decrease ever clears tolerance and the
-            // solve burns its whole budget making cosmetic progress (the 122 s
-            // line fit). Project the step out of the chart-gauge orbit AND the
-            // decoder β-null; when the IDENTIFIED-direction motion is below the
-            // step tolerance the iterate is stationary on the quotient manifold —
-            // ranking the Laplace criterion there is correct, and continuing
-            // only chases gauge freedom. This mirrors the quotient convergence
-            // `reml_criterion`'s undamped-evidence loop already applies, so the
-            // inner solve and the criterion agree on "converged".
+            // #1051 — gauge/null-aware stationarity. ...
             if delta_ext_coord.len() == self.n_obs() * self.assignment.row_block_dim()
                 && delta_beta.len() == self.beta_dim()
             {
@@ -2893,7 +2898,6 @@ impl SaeManifoldTerm {
                     step_norm_sq,
                     rho.lambda_smooth(),
                 )?;
-                let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * self.inner_iterate_scale();
                 if quotient_step_norm_sq.sqrt() <= step_tolerance {
                     break;
                 }
@@ -2942,11 +2946,9 @@ impl SaeManifoldTerm {
                 && directional_decrease > 0.0
                 && directional_decrease > directional_decrease_floor;
             if !descent_direction_ok {
-                let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.inner_iterate_scale();
-                if grad_norm_sq.sqrt() <= grad_tolerance {
-                    self.restore_mutable_state(&snapshot);
-                    break;
-                }
+                // The grad gate above is now unconditional and would have broken
+                // already if grad was small. This arm remains for routing a
+                // non-descent delta straight to proximal correction.
             }
 
             let mut trial_step_size = step_size;
