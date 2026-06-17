@@ -1364,10 +1364,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         Err(_) => true,
     };
     if outer_needs_audit {
-        const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
-        const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32;
+        // FD-OK: FD-audit of the analytic custom-family outer gradient (small-problem gate, never feeds the optimizer)
+        const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+        const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
         let audit_n = specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0);
-        if n_rho >= 1 && n_rho <= OUTER_FD_AUDIT_MAX_RHO_DIM && audit_n <= OUTER_FD_AUDIT_MAX_N {
+        if n_rho >= 1 && n_rho <= OUTER_FD_AUDIT_MAX_RHO_DIM && audit_n <= OUTER_FD_AUDIT_MAX_N { // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
             log::warn!(
                 "[OUTER-FD-AUDIT/custom-family] outer did not certify convergence; running desync/identifiability audit n={audit_n} n_rho={n_rho} need_outer_hessian={need_outer_hessian}"
             );
@@ -1396,7 +1397,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 }
                 Ok((e.objective, e.gradient, e.outer_hessian))
             };
-            match crate::solver::rho_optimizer::outer_gradient_fd_audit(
+            match crate::solver::rho_optimizer::outer_gradient_fd_audit( // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
                 &rho0,
                 1e-4,
                 |i| format!("rho[{i}]"),
@@ -1406,6 +1407,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 Err(e) => log::warn!("[OUTER-FD-AUDIT/custom-family] skipped: {e}"),
             }
         }
+        // END-FD-OK
     }
 
     let last_error_detail = obj

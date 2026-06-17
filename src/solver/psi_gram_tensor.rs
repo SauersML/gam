@@ -574,6 +574,7 @@ impl PsiGramTensor {
         // the reference, pushing the reference error well below the rtol where it
         // IS converged. `h` stays window-relative but smaller, balancing the
         // O(h⁶) truncation against the O(ε/h) rounding floor.
+        // FD-OK: FD-audit certificate (Richardson-validated FD reference certifying the analytic ψ-derivative)
         const FD_CONVERGED_RTOL: f64 = 1e-9;
         let h = (span * 2e-4).max(1e-6);
         let exact_dgram = move |psi: f64,
@@ -598,6 +599,7 @@ impl PsiGramTensor {
             // leading term → O(h⁶) reference.
             Some((16.0 * &fd_h2 - &fd_h) / 15.0)
         };
+        // END-FD-OK
         // True when the analytic derivative matches the (Richardson-validated)
         // exact FD at `psi`.
         let certifies = |me: &Self,

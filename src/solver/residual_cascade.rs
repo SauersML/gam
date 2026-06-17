@@ -1194,14 +1194,29 @@ fn extend_net(
     };
     for p in points {
         try_add(net, &mut grid, &mut new_centers, p);
+        if net.len() > MAX_CENTERS {
+            return new_centers;
+        }
     }
     // Fill the bounding box so the net covers the domain, not just the data.
+    //
+    // The box has ~`(box_hi/h)^dim` cells, so the fill cost grows like
+    // `(2^l)^dim` as the covering radius `h = h₀·2^{-l}` shrinks with the
+    // level `l`. At fine levels below the data spacing that is an explosion
+    // (every sub-data-spacing cell of the whole domain becomes a synthetic
+    // center), which is unbounded work the caller never needs: once the net
+    // crosses `MAX_CENTERS` the build path errors and the auto-route
+    // refinement (`next_level_gain_bound`) treats it as "stop refining". So
+    // cap the fill IN the loop — stop planting synthetic centers the moment
+    // the net exceeds the cap rather than materializing the entire fine-level
+    // box first. Coarse levels (few cells, never near the cap) keep the full
+    // quasi-uniform domain fill and the polynomial-bridge gap behavior intact.
     let mut cells = [1_i64; 3];
     for a in 0..dim {
         cells[a] = (box_hi[a] / h).ceil() as i64 + 1;
     }
     let mut c = [0.0_f64; 3];
-    for i0 in 0..cells[0] {
+    'fill: for i0 in 0..cells[0] {
         c[0] = (i0 as f64 + 0.5) * h;
         for i1 in 0..cells[1] {
             if dim > 1 {
@@ -1212,6 +1227,9 @@ fn extend_net(
                     c[2] = (i2 as f64 + 0.5) * h;
                 }
                 try_add(net, &mut grid, &mut new_centers, &c);
+                if net.len() > MAX_CENTERS {
+                    break 'fill;
+                }
             }
         }
     }

@@ -32,11 +32,23 @@ fn cyclic_bspline_second_derivative_periodicity_breaks() {
     )
     .expect("basis should build at x+period");
 
+    // The extended (open-knot) basis has `total_knots - degree - 1` columns,
+    // which for a cyclic layout is `num_basis + degree` — NOT `2 * num_basis`.
+    // Fold exactly as the production cyclic evaluator does
+    // (`cyclic[j % num_basis] += extended[j]`, see
+    // `evaluate_bspline_basis_chunk` in src/terms/basis/bspline_eval.rs), then
+    // compare the folded second-derivative rows at `x` and `x + period`.
+    let ncols = b0.ncols();
+    assert_eq!(ncols, num_basis + degree, "extended basis column count");
+    let mut folded0 = vec![0.0_f64; num_basis];
+    let mut folded1 = vec![0.0_f64; num_basis];
+    for j in 0..ncols {
+        folded0[j % num_basis] += b0[[0, j]];
+        folded1[j % num_basis] += b1[[0, j]];
+    }
     for j in 0..num_basis {
-        let folded0 = b0[[0, j]] + b0[[0, j + num_basis]];
-        let folded1 = b1[[0, j]] + b1[[0, j + num_basis]];
         assert!(
-            (folded0 - folded1).abs() < 1e-10,
+            (folded0[j] - folded1[j]).abs() < 1e-10,
             "bug: cyclic B-spline second derivative is not periodic after fold-back"
         );
     }

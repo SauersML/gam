@@ -212,6 +212,10 @@ path = "examples/perf/arrow_schur_hill_climb.rs"
 name = "sae_perf_harness"
 path = "examples/sae_perf_harness.rs"
 
+[[example]]
+name = "cyl_family_repro"
+path = "examples/cyl_family_repro.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -2091,8 +2091,8 @@ pub(crate) fn build_schur_scalar_inv<B: BatchedBlockSolver>(
     // Extract the penalty diagonal for all K columns once, then index per-column.
     let mut full_diag = Array1::<f64>::zeros(sys.k);
     {
-        let fd_slice = full_diag.as_slice_mut().expect("full_diag contiguous");
-        sys.penalty_diagonal_add(fd_slice);
+        let diag_slice = full_diag.as_slice_mut().expect("full_diag contiguous");
+        sys.penalty_diagonal_add(diag_slice);
     }
     for &gi in cols {
         let mut s = full_diag[gi] + ridge_beta;

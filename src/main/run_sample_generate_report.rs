@@ -973,8 +973,10 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         criterion_certificate: fit.artifacts.criterion_certificate.as_ref().map(|cert| {
             report::CriterionCertificateRow {
                 analytic_directional: cert.analytic_directional,
+                // FD-OK: copying the FD-audit certificate's oracle fields into the report payload (reporting only)
                 fd_directional: cert.fd_directional,
                 fd_error: cert.fd_error,
+                // END-FD-OK
                 agreement_z: cert.agreement_z,
                 grad_norm: cert.grad_norm,
                 hessian_pd: cert.hessian_pd,

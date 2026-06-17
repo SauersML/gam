@@ -3080,18 +3080,19 @@ fn run_exact_joint_spatial_optimization(
     // Gated strictly to diagnostic-sized problems (auto-derived from the
     // realized (n, θ_dim), no flag) so it never taxes a production fit. The
     // same gate the n-block driver uses.
-    const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
-    const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32;
+    // FD-OK: FD-audit of the analytic outer gradient (small-problem gate, never feeds the optimizer)
+    const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+    const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
     let n_total = data.nrows();
-    let outer_fd_audit_eligible = analytic_outer_hessian_available
-        && n_total <= OUTER_FD_AUDIT_MAX_N
-        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM;
+    let outer_fd_audit_eligible = analytic_outer_hessian_available // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+        && n_total <= OUTER_FD_AUDIT_MAX_N // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
     log::warn!(
         "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} \
          analytic_grad={analytic_outer_hessian_available} n_total={n_total} \
          theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={coord_dim}"
     );
-    if outer_fd_audit_eligible {
+    if outer_fd_audit_eligible { // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
         let audit = (|| -> Result<crate::solver::rho_optimizer::OuterGradientFdAudit, String> {
             let mut eval_at = |theta: &Array1<f64>,
                                mode: crate::solver::estimate::reml::reml_outer_engine::EvalMode|
@@ -3120,13 +3121,14 @@ fn run_exact_joint_spatial_optimization(
                     format!("psi_kappa[{}]", i - rho_dim_audit)
                 }
             };
-            crate::solver::rho_optimizer::outer_gradient_fd_audit(
+            crate::solver::rho_optimizer::outer_gradient_fd_audit( // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
                 theta0,
                 1e-4,
                 label_fn,
                 &mut eval_at,
             )
         })();
+        // END-FD-OK
         match audit {
             Ok(audit) => audit.log_verdict("spatial-exact-joint"),
             Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
@@ -6052,15 +6054,16 @@ where
     // Gated strictly to small problems so it never taxes a production fit: the
     // failing large-scale fits skip it entirely. Auto-derived from the realized
     // (n, θ_dim) — no flag.
-    const OUTER_FD_AUDIT_MAX_N: usize = 4_000;
-    const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32;
-    let outer_fd_audit_eligible = analytic_joint_gradient_available
-        && n_total <= OUTER_FD_AUDIT_MAX_N
-        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM;
+    // FD-OK: FD-audit of the analytic outer gradient (small-problem gate, never feeds the optimizer)
+    const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+    const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+    let outer_fd_audit_eligible = analytic_joint_gradient_available // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+        && n_total <= OUTER_FD_AUDIT_MAX_N // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
+        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
     log::warn!(
         "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} analytic_grad={analytic_joint_gradient_available} n_total={n_total} theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={psi_dim}"
     );
-    if outer_fd_audit_eligible {
+    if outer_fd_audit_eligible { // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
         let audit = (|| -> Result<crate::solver::rho_optimizer::OuterGradientFdAudit, String> {
             let mut eval_at = |theta: &Array1<f64>,
                                mode: crate::solver::estimate::reml::reml_outer_engine::EvalMode|
@@ -6096,13 +6099,14 @@ where
                     )
                 }
             };
-            crate::solver::rho_optimizer::outer_gradient_fd_audit(
+            crate::solver::rho_optimizer::outer_gradient_fd_audit( // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
                 &theta0,
                 1e-4,
                 label,
                 &mut eval_at,
             )
         })();
+        // END-FD-OK
         match audit {
             Ok(audit) => audit.log_verdict("spatial-exact-joint"),
             Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),

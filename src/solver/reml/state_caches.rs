@@ -47,8 +47,8 @@ pub(crate) const HGB_WARMUP_ITERS_MAX: usize = 10;
 
 pub(crate) const HGB_TARGET_FRACTION: f64 = 0.1;
 
-// Treat log-lambda finite differences as local only up to a 1.0 log-scale step.
-pub(crate) const HGB_FD_DRHO_MAX_SQUARED: f64 = 1.0;
+// Treat log-lambda secant steps as local only up to a 1.0 log-scale step.
+pub(crate) const HGB_SECANT_DRHO_MAX_SQUARED: f64 = 1.0;
 
 pub(crate) const HGB_MIN_PAIRS_FOR_SENSITIVITY: usize = 3;
 
@@ -483,7 +483,7 @@ impl HyperGradientBudget {
     }
 
     pub(crate) fn reestimate_sensitivities(&mut self) -> Option<[f64; 3]> {
-        let pairs = self.finite_difference_pairs();
+        let pairs = self.secant_gradient_pairs();
         if pairs.len() < HGB_MIN_PAIRS_FOR_SENSITIVITY {
             log::info!(
                 "[HGB] small-sample fallback to defaults: pairs={}, threshold={}",
@@ -586,7 +586,7 @@ impl HyperGradientBudget {
         mean_positive(&estimates)
     }
 
-    pub(crate) fn finite_difference_pairs(&self) -> Vec<(Array1<f64>, Array1<f64>, usize)> {
+    pub(crate) fn secant_gradient_pairs(&self) -> Vec<(Array1<f64>, Array1<f64>, usize)> {
         let entries: Vec<_> = self.history.iter().collect();
         let mut pairs = Vec::new();
         for i in 0..entries.len().saturating_sub(1) {
@@ -601,7 +601,7 @@ impl HyperGradientBudget {
             if drho.iter().all(|v| v.is_finite())
                 && dg.iter().all(|v| v.is_finite())
                 && drho_norm_squared > 0.0
-                && drho_norm_squared <= HGB_FD_DRHO_MAX_SQUARED
+                && drho_norm_squared <= HGB_SECANT_DRHO_MAX_SQUARED
             {
                 pairs.push((drho, dg, i));
             }

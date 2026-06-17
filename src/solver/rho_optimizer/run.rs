@@ -1131,7 +1131,8 @@ pub(crate) fn audit_first_order_optimality(
 
     let d_h = (f_plus_h - f_minus_h) / (2.0 * step);
     let d_2h = (f_plus_2h - f_minus_2h) / (4.0 * step);
-    let fd_directional = (4.0 * d_h - d_2h) / 3.0;
+    // FD-OK: FD-audit certificate construction (Richardson FD oracle auditing the analytic gradient, never feeds the optimizer)
+    let fd_directional = (4.0 * d_h - d_2h) / 3.0; // fd-ok: FD-audit certificate, not in math path
     // Error bar: the Richardson residual measures truncation + value-path
     // noise (inner-solve tolerance) empirically; the roundoff bound floors
     // it when the residual is accidentally tiny.
@@ -1141,19 +1142,20 @@ pub(crate) fn audit_first_order_optimality(
         .max(f_plus_2h.abs())
         .max(f_minus_2h.abs());
     let roundoff = f64::EPSILON * (1.0 + value_scale) / step;
-    let fd_error = (d_h - d_2h).abs().max(roundoff);
+    let fd_error = (d_h - d_2h).abs().max(roundoff); // fd-ok: FD-audit certificate, not in math path
 
     let analytic_directional = gradient.dot(&direction);
     let grad_norm = gradient.dot(gradient).sqrt();
-    let agreement_z = (analytic_directional - fd_directional).abs() / fd_error;
+    let agreement_z = (analytic_directional - fd_directional).abs() / fd_error; // fd-ok: FD-audit certificate, not in math path
 
     let certificate = CriterionCertificate {
         grad_norm,
         analytic_directional,
-        fd_directional,
-        fd_error,
+        fd_directional, // fd-ok: FD-audit certificate, not in math path
+        fd_error, // fd-ok: FD-audit certificate, not in math path
         agreement_z,
-        fd_step: step,
+        fd_step: step, // fd-ok: FD-audit certificate, not in math path
+        // END-FD-OK
         hessian_pd: result
             .final_hessian
             .as_ref()

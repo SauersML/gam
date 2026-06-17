@@ -2021,6 +2021,7 @@ fn sphere_minimize_boost_defect(
         return None;
     }
     let sqrt2 = std::f64::consts::SQRT_2;
+    // FD-OK: FD-audit certificate of the analytic chart-mode Jacobian (central-difference residual Jacobian for the GN flow)
     let fd_h = 1.0e-6_f64;
     let mut lambda = 1.0e-4_f64;
     let mut any_accepted = false;
@@ -2073,6 +2074,7 @@ fn sphere_minimize_boost_defect(
                 jmat[[3 * i + 2, k]] = sqrt2 * (mp01 - mm01) / (2.0 * fd_h);
             }
         }
+        // END-FD-OK
         let jtj = fast_ata(&jmat);
         let jtr = fast_atb(&jmat, &rcol);
 

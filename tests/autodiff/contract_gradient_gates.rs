@@ -208,7 +208,7 @@ fn sae_euclidean_line_row() -> Vec<GradientChannel> {
         coord_fd.push((sae_value(&plus, &z, &rho) - sae_value(&minus, &z, &rho)) / (2.0 * FD_STEP));
     }
 
-    let decoder_probes = [(0usize, 0usize), (1, 2), (2, 5)];
+    let decoder_probes = [(0usize, 0usize), (0, 2), (0, 5)];
     let mut decoder_an = Vec::new();
     let mut decoder_fd = Vec::new();
     let p = term.output_dim();

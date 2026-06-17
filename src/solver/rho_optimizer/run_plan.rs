@@ -1220,6 +1220,7 @@ pub(crate) fn run_outer_with_plan(
                             cost_stall_grad_threshold,
                             cost_stall_exit.clone(),
                         )),
+                        cost_stall_bounds: Some((lo.clone(), hi.clone())),
                         consecutive_probe_refusals: 0,
                     };
                     // Hand the precomputed (cost, gradient) seed eval to

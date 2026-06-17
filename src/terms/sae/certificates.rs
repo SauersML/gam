@@ -60,7 +60,9 @@ pub struct CriterionCertificate {
     pub grad_norm: f64,
     /// Central-difference directional derivative of the **value path**:
     /// `[V(ρ̂ + h v) − V(ρ̂ − h v)] / (2h)`.
-    pub fd_directional: f64,
+    // FD-OK: FD-audit certificate oracle field verifying the analytic directional derivative
+    pub fd_directional: f64, // fd-ok: FD-audit certificate, not in math path
+    // END-FD-OK
     /// Analytic directional derivative `∇V(ρ̂)·v` from the production gradient
     /// path, on the same unit direction `v`.
     pub analytic_directional: f64,
@@ -68,7 +70,9 @@ pub struct CriterionCertificate {
     /// `|D(h) − D(2h)| / 3`, the leading `O(h²)` truncation term of the central
     /// difference. The FD/analytic gap is only meaningful relative to this — a
     /// gap below the error bar is consistent with exact agreement.
-    pub fd_error_bar: f64,
+    // FD-OK: Richardson error-bar of the FD-audit oracle (reporting only)
+    pub fd_error_bar: f64, // fd-ok: FD-audit certificate, not in math path
+    // END-FD-OK
     /// The probe step `h` actually used (scaled to the coordinate magnitude).
     pub step: f64,
     /// Whether the criterion's curvature at `ρ̂` is usable: the value-path
@@ -86,13 +90,15 @@ impl CriterionCertificate {
     /// resolve).
     #[must_use]
     pub fn agreement_rel(&self) -> f64 {
+        // FD-OK: comparing FD-audit oracle against the analytic directional derivative
         let scale = self
             .analytic_directional
             .abs()
-            .max(self.fd_directional.abs())
-            .max(self.fd_error_bar)
+            .max(self.fd_directional.abs()) // fd-ok: FD-audit certificate, not in math path
+            .max(self.fd_error_bar) // fd-ok: FD-audit certificate, not in math path
             .max(1e-12);
-        (self.fd_directional - self.analytic_directional).abs() / scale
+        (self.fd_directional - self.analytic_directional).abs() / scale // fd-ok: FD-audit certificate, not in math path
+        // END-FD-OK
     }
 
     /// The certificate's verdict against a relative tolerance: `true` means the
@@ -203,14 +209,16 @@ pub struct DirectionalSamples {
 /// Richardson remainder). The reported `fd_directional` is `D(h)`.
 #[must_use]
 pub fn certificate_from_samples(s: &DirectionalSamples) -> CriterionCertificate {
+    // FD-OK: Richardson FD oracle constructed to audit the analytic directional derivative
     let d_h = (s.plus_h - s.minus_h) / (2.0 * s.step);
     let d_2h = (s.plus_2h - s.minus_2h) / (4.0 * s.step);
-    let fd_error_bar = (d_h - d_2h).abs() / 3.0;
+    let fd_error_bar = (d_h - d_2h).abs() / 3.0; // fd-ok: FD-audit certificate, not in math path
     CriterionCertificate {
         grad_norm: s.grad_norm,
-        fd_directional: d_h,
+        fd_directional: d_h, // fd-ok: FD-audit certificate, not in math path
         analytic_directional: s.analytic_directional,
-        fd_error_bar,
+        fd_error_bar, // fd-ok: FD-audit certificate, not in math path
+        // END-FD-OK
         step: s.step,
         well_posed: s.well_posed
             && s.plus_h.is_finite()
@@ -258,13 +266,13 @@ mod tests {
             cert.agreement_rel() < 1e-6,
             "quadratic FD must match analytic: rel {}, fd {}, analytic {}",
             cert.agreement_rel(),
-            cert.fd_directional,
+            cert.fd_directional, // fd-ok: FD-audit certificate, not in math path
             cert.analytic_directional
         );
         assert!(
-            cert.fd_error_bar < 1e-6,
+            cert.fd_error_bar < 1e-6, // fd-ok: FD-audit certificate, not in math path
             "quadratic has zero third derivative, error bar must be tiny: {}",
-            cert.fd_error_bar
+            cert.fd_error_bar // fd-ok: FD-audit certificate, not in math path
         );
         assert!(cert.passes(1e-4), "well-posed quadratic must certify");
     }
@@ -303,7 +311,7 @@ mod tests {
             !cert.passes(1e-3),
             "30% desync must fail the certificate: rel {}, fd {}, analytic {}",
             cert.agreement_rel(),
-            cert.fd_directional,
+            cert.fd_directional, // fd-ok: FD-audit certificate, not in math path
             cert.analytic_directional
         );
     }

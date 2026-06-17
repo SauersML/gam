@@ -35,10 +35,12 @@ impl Certificate for CriterionCertificate {
     fn claim(&self) -> Claim {
         Claim::new(
             "outer-optimality",
-            "the returned outer optimum is a genuine stationary point: the \
-             analytic gradient agrees with the finite-difference of the criterion \
-             value, the final Hessian is not indefinite, and no smoothing \
-             coordinate is railed at a box bound",
+            concat!(
+                "the returned outer optimum is a genuine stationary point: the ", // fd-ok: FD-audit certificate, not in math path
+                "analytic gradient agrees with the finite-difference of the criterion ", // fd-ok: FD-audit certificate, not in math path
+                "value, the final Hessian is not indefinite, and no smoothing ",
+                "coordinate is railed at a box bound",
+            ),
         )
     }
 
@@ -46,10 +48,10 @@ impl Certificate for CriterionCertificate {
         let mut e = Evidence::new();
         put_finite(&mut e, "grad_norm", self.grad_norm);
         put_finite(&mut e, "analytic_directional", self.analytic_directional);
-        put_finite(&mut e, "fd_directional", self.fd_directional);
-        put_finite(&mut e, "fd_error", self.fd_error);
+        put_finite(&mut e, "fd_directional", self.fd_directional); // fd-ok: FD-audit certificate, not in math path
+        put_finite(&mut e, "fd_error", self.fd_error); // fd-ok: FD-audit certificate, not in math path
         put_finite(&mut e, "agreement_z", self.agreement_z);
-        put_finite(&mut e, "fd_step", self.fd_step);
+        put_finite(&mut e, "fd_step", self.fd_step); // fd-ok: FD-audit certificate, not in math path
         e.insert(
             "hessian_pd",
             match self.hessian_pd {

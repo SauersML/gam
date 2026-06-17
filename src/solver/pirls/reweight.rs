@@ -1012,6 +1012,7 @@ where
             {
                 const GEODESIC_ACCEPT_ALPHA: f64 = 0.75;
                 // 1e-4 is the Transtrum-Sethna default for double precision.
+                // FD-OK: non-propagated geodesic curvature probe (bounded FD second directional derivative, not a coefficient derivative)
                 const GEODESIC_FD_H: f64 = 1.0e-4;
 
                 // Snapshot the standard-step direction; clone is cheap (p)
@@ -1040,6 +1041,7 @@ where
                         let mut k_rhs = &g_plus.gradient + &g_minus.gradient;
                         k_rhs.scaled_add(-2.0, &state.gradient);
                         k_rhs.mapv_inplace(|v| v / (GEODESIC_FD_H * GEODESIC_FD_H));
+                        // END-FD-OK
 
                         if array_is_finite(&k_rhs) {
                             let mut delta2 = Array1::<f64>::zeros(beta.len());

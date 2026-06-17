@@ -1186,6 +1186,7 @@ fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
         last_value_grad_rho: None,
         value_probe_cache: Vec::new(),
         cost_stall: None,
+        cost_stall_bounds: None,
         consecutive_probe_refusals: 0,
     };
 

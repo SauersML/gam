@@ -67,6 +67,20 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// non-converged — the remaining gradient lies along weakly-identified ρ
     /// directions that do not reduce the objective.
     pub(crate) cost_stall: Option<CostStallGuard>,
+    /// Box bounds `(lower, upper)` on the outer parameter vector, used ONLY to
+    /// form the bound-PROJECTED gradient norm the [`CostStallGuard`] stationarity
+    /// test consumes. The cost-stall guard's documented contract is to certify a
+    /// stall as converged iff the *projected* gradient at the best iterate clears
+    /// the outer tolerance — the same KKT criterion `opt`'s primary exit uses
+    /// (`GradientTolerance{ projected: true }`). Without the bounds here the guard
+    /// fell back to the RAW gradient norm, which on a separation fit never clears
+    /// the tolerance (the bound-active log-λ directions carry a persistent
+    /// ∂V/∂ρ pushing further out of bounds), so a genuinely stationary
+    /// bound-pinned optimum was reported NON-converged and the outer search
+    /// re-seeded forever (#1082 separable-multinomial / penalized-tensor
+    /// cycling). `None` ⇒ unconstrained, no projection (raw norm). Cheap to hold
+    /// (the outer dimension is the smoothing-param count).
+    pub(crate) cost_stall_bounds: Option<(Array1<f64>, Array1<f64>)>,
     /// Count of consecutive `eval_cost` calls that returned `Recoverable`
     /// without a single success in between. When every trial step in every
     /// search direction is infeasible (the inner solve refuses to converge at
@@ -655,7 +669,15 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // a stationary one is a real optimum (`converged = true`). Both share the
         // sentinel; the verdict rides on the published `CostStallExit.converged`.
         if let Some(guard) = self.cost_stall.as_mut() {
-            match guard.observe(x, eval.cost, g_norm) {
+            // The stall guard's stationarity test must use the bound-PROJECTED
+            // gradient norm (KKT residual), not the raw `g_norm` above — a
+            // separation fit pins log-λ directions at the bound with a
+            // persistent out-of-bounds ∂V/∂ρ that inflates the raw norm forever
+            // and otherwise blocks the converged verdict (#1082). The raw
+            // `g_norm` is kept for the inner-cap schedule / logging.
+            let projected_g_norm =
+                projected_gradient_norm(x, &gradient, self.cost_stall_bounds.as_ref());
+            match guard.observe(x, eval.cost, projected_g_norm) {
                 CostStallVerdict::Continue => {}
                 CostStallVerdict::Converged => {
                     log::info!(
@@ -1355,6 +1377,39 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
 // shared with `run_operator_trust_region` (now deleted in favor of
 // `opt::MatrixFreeTrustRegion`), but they remain in use by the dense
 // ARC and BFGS arms of the seed loop.
+
+/// Euclidean norm of the bound-PROJECTED gradient at `x` under box bounds
+/// `(lower, upper)` — the KKT residual of a box-constrained minimization.
+///
+/// For a component sitting on its lower bound (`x_i ≤ lo_i`), a negative
+/// `g_i` would drive `x_i` further below the bound, which is infeasible; the
+/// projected gradient zeroes that out-of-feasible-set pull (`min(g_i, 0)` is
+/// the active part, so the *retained* contribution is `max(g_i, 0)`).
+/// Symmetrically at the upper bound the retained part is `min(g_i, 0)`. Interior
+/// components keep `g_i`. A point is a constrained stationary optimum iff this
+/// projected norm is ~0, matching `opt`'s `GradientTolerance{ projected: true }`
+/// exit. With no bounds this is just `‖g‖₂`.
+#[inline]
+pub(crate) fn projected_gradient_norm(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+) -> f64 {
+    let sumsq = match bounds {
+        Some((lower, upper)) => (0..gradient.len())
+            .map(|i| {
+                let gi = gradient[i];
+                // Active lower bound: drop the negative (out-of-bounds) pull.
+                let gi = if x[i] <= lower[i] { gi.max(0.0) } else { gi };
+                // Active upper bound: drop the positive (out-of-bounds) pull.
+                let gi = if x[i] >= upper[i] { gi.min(0.0) } else { gi };
+                gi * gi
+            })
+            .sum::<f64>(),
+        None => gradient.iter().map(|v| v * v).sum::<f64>(),
+    };
+    sumsq.sqrt()
+}
 
 #[inline]
 pub(crate) fn project_to_bounds(
