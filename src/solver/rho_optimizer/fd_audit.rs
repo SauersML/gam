@@ -157,7 +157,8 @@ impl OuterGradientFdAudit {
 /// Cost: one `ValueGradientHessian` eval at θ₀ plus `2·len(θ)` `ValueOnly`
 /// evals. The caller is responsible for only invoking this on a
 /// diagnostic-sized problem (it is not part of the production hot loop).
-pub fn outer_gradient_fd_audit<EvalF>( // fd-ok: FD-audit certificate, not in math path
+pub fn outer_gradient_fd_audit<EvalF>(
+    // fd-ok: FD-audit certificate, not in math path
     theta0: &Array1<f64>,
     h: f64,
     block_for_index: impl Fn(usize) -> String,

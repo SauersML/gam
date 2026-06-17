@@ -829,11 +829,7 @@ fn bspline_boundary_nullspace_transform(
             spectral_tolerance: f64::NAN,
         });
     }
-    if rank == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(z))
-    }
+    if rank == 0 { Ok(None) } else { Ok(Some(z)) }
 }
 
 fn bspline_geometric_constraint_rows(

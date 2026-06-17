@@ -145,11 +145,7 @@ fn disjoint_diagonal_blocks(s_k_matrices: &[Array2<f64>]) -> Option<Vec<(usize, 
         }
     }
 
-    if blocks.len() > 1 {
-        Some(blocks)
-    } else {
-        None
-    }
+    if blocks.len() > 1 { Some(blocks) } else { None }
 }
 
 /// Result of a penalty pseudo-logdet computation.

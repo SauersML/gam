@@ -2420,9 +2420,7 @@ impl WorkingModelSurvival {
             let projected_norm = array1_l2_norm(&projected);
             let relative_projected_norm = state.relative_gradient_norm(projected_norm);
             if relative_projected_norm <= SURVIVAL_LAML_IFT_RELATIVE_KKT_GATE {
-                Some(crate::model_types::ProjectedKktResidual::from_active_projected(
-                    projected,
-                ))
+                Some(crate::model_types::ProjectedKktResidual::from_active_projected(projected))
             } else {
                 None
             }

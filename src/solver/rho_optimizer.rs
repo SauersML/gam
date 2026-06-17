@@ -54,8 +54,8 @@ mod run;
 mod run_plan;
 mod seed_screening;
 
-pub use crate::model_types::CriterionCertificate;
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
+pub use crate::model_types::CriterionCertificate;
 pub use crate::solver::objective_base::{HessianResult, OuterEval};
 pub(crate) use bridges::*;
 pub use capability::*;

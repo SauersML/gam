@@ -1327,7 +1327,11 @@ pub(crate) fn prepare_identified_time_block(
             if validate_linear_constraints("time initial beta", &clipped, constraints).is_ok() {
                 Some(clipped)
             } else {
-                Some(project_onto_linear_constraints(p, constraints, Some(beta0))?)
+                Some(project_onto_linear_constraints(
+                    p,
+                    constraints,
+                    Some(beta0),
+                )?)
             }
         }
         (_, Some(beta0)) => Some(beta0.clone()),

@@ -1877,11 +1877,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let rows = crate::families::row_kernel::RowSet::All;
             let cache = crate::families::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
             let ll = crate::families::row_kernel::row_kernel_log_likelihood(&cache, &rows);
-            let gradient = -crate::families::row_kernel::row_kernel_gradient(
-                &kernel,
-                &cache,
-                &rows,
-            );
+            let gradient =
+                -crate::families::row_kernel::row_kernel_gradient(&kernel, &cache, &rows);
             let hessian =
                 crate::families::row_kernel::row_kernel_hessian_dense(&kernel, &cache, &rows);
             let offsets = self.joint_block_offsets();

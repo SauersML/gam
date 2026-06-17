@@ -216,8 +216,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         fit_config.transformation_normal = flag;
     }
     if let Some(mode) = json_config.survival_likelihood {
-        fit_config.survival_likelihood =
-            parse_survival_likelihood_cli(&mode)?;
+        fit_config.survival_likelihood = parse_survival_likelihood_cli(&mode)?;
     }
     if let Some(target) = json_config.baseline_target {
         fit_config.baseline_target =

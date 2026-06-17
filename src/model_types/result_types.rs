@@ -149,7 +149,7 @@ impl CriterionCertificate {
             "grad·v={:.6e} fd·v={:.6e}±{:.1e} z={:.2} |g|={:.3e} hessian_pd={} railed={:?} → {}",
             self.analytic_directional,
             self.fd_directional, // fd-ok: FD-audit certificate, not in math path
-            self.fd_error, // fd-ok: FD-audit certificate, not in math path
+            self.fd_error,       // fd-ok: FD-audit certificate, not in math path
             // END-FD-OK
             self.agreement_z,
             self.grad_norm,
