@@ -26,6 +26,18 @@ fn rho_so2_jvp(theta: f64) -> Array2<f64> {
     array![[-s, -c], [c, -s]]
 }
 
+/// Ambient SO(2) action on R^4: rotate the first two coordinates and leave the
+/// remaining coordinates fixed.
+fn ambient_rho_so2_4(theta: f64) -> Array2<f64> {
+    let (c, s) = (theta.cos(), theta.sin());
+    array![
+        [c, -s, 0.0, 0.0],
+        [s, c, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
 /// SO(3) Rodrigues: axis-angle (3-vec) -> 3x3 rotation.
 fn rho_so3(omega: [f64; 3]) -> Array2<f64> {
     let n = (omega[0].powi(2) + omega[1].powi(2) + omega[2].powi(2))
@@ -54,7 +66,7 @@ fn rho_so3_jvp(omega: [f64; 3], domega: [f64; 3]) -> Array2<f64> {
 }
 
 /// EquivariantPenalty commutator residual ½‖resid·z‖²,
-/// resid = W ρ(θ) − P_W W ρ(θ),  P_W = W (W^T W)^{-1} W^T.
+/// resid = A(θ) W − W ρ(θ), where A is the ambient action.
 fn commutator_residual_so2(w_frame: &Array3<f64>, theta: &Array2<f64>, z: &Array2<f64>) -> f64 {
     let (n_atoms, _d, r) = (w_frame.shape()[0], w_frame.shape()[1], w_frame.shape()[2]);
     assert_eq!(r, 2, "SO(2) needs R=2");
@@ -63,24 +75,11 @@ fn commutator_residual_so2(w_frame: &Array3<f64>, theta: &Array2<f64>, z: &Array
     let mut count = 0usize;
     for a in 0..n_atoms {
         let wa = w_frame.slice(s![a, .., ..]).to_owned(); // (D, 2)
-        // WtW^{-1}
-        let wtw = wa.t().dot(&wa) + Array2::<f64>::eye(2) * 1e-6;
-        let det = wtw[[0, 0]] * wtw[[1, 1]] - wtw[[0, 1]] * wtw[[1, 0]];
-        let inv = array![
-            [wtw[[1, 1]] / det, -wtw[[0, 1]] / det],
-            [-wtw[[1, 0]] / det, wtw[[0, 0]] / det]
-        ];
         for b in 0..n_b {
-            let rg = rho_so2(theta[[b, a]]);
-            let w_rot = wa.dot(&rg); // (D, 2)
-            // proj = wa @ inv @ wa.T @ w_rot
-            let m = wa.t().dot(&w_rot); // (2, 2)
-            let x = inv.dot(&m);
-            let proj = wa.dot(&x);
-            let resid = &w_rot - &proj;
-            // ‖resid[:,0]‖² · z[b,a]
-            let r0 = resid.slice(s![.., 0]);
-            let sq: f64 = r0.iter().map(|v| v * v).sum();
+            let ambient = ambient_rho_so2_4(theta[[b, a]]);
+            let latent = rho_so2(theta[[b, a]]);
+            let resid = ambient.dot(&wa) - wa.dot(&latent);
+            let sq: f64 = resid.iter().map(|v| v * v).sum();
             total += 0.5 * z[[b, a]] * sq;
             count += 1;
         }
@@ -294,8 +293,8 @@ fn reml_jointly_selects_lambda_eq_and_bandwidth() {
     for k in -4..=4 {
         grid_b.push(2_f64.powi(k));
     }
-    let lambda_eq = 1.0;
-    let ard_w = 1e-2;
+    let lambda_eq = 1.0e-3;
+    let ard_w = 1.0e-4;
     let mut scores = Vec::new();
     for &b in &grid_b {
         let theta_b = {
