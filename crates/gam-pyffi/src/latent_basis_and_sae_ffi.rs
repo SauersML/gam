@@ -2824,6 +2824,16 @@ fn sae_manifold_fit_inner<'py>(
     // are renormalised so the resulting per-row distribution sums to 1; for
     // the other modes the kept entries retain their unnormalised values
     // (those modes' assignments are not probability distributions).
+    //
+    // #1232 — the penalized-loss score the payload reports at top level must
+    // describe the SAME (projected) model as the top-level
+    // `assignments`/`fitted`/`diagnostics`. The smooth-optimization `loss` from
+    // `into_fitted` is the score of the UNPROJECTED model; after a hard top-k
+    // gate, only its data-fit term changes (the assignment-sparsity / smoothness
+    // / ARD penalties are decoder/ρ properties the gate does not touch). So we
+    // recompute the data-fit on the projected reconstruction and swap it into a
+    // `post_topk_loss`; the unprojected `loss` is surfaced under `pre_topk`.
+    let mut post_topk_loss: Option<gam::terms::sae::manifold::SaeManifoldLoss> = None;
     if let Some(k_top) = top_k {
         if k_top < k_atoms {
             let n_obs_local = z_view.nrows();
@@ -2887,6 +2897,19 @@ fn sae_manifold_fit_inner<'py>(
             fitted = term
                 .reconstruct_from_assignments(assignments.view(), true)
                 .map_err(py_value_error)?;
+            // #1232 — projected-model penalized loss: the reconstruction data-fit
+            // recomputed on the projected `fitted` (same per-row metric / honesty
+            // weights as the smooth `loss`), with the decoder/ρ penalties carried
+            // over unchanged (the top-k gate touches assignments, not the decoder
+            // smoothness / ARD / assignment-prior strength). This is the score
+            // that describes the returned (projected) model.
+            let projected_data_fit = term
+                .data_fit_for_reconstruction(z_view.view(), fitted.view())
+                .map_err(py_value_error)?;
+            post_topk_loss = Some(gam::terms::sae::manifold::SaeManifoldLoss {
+                data_fit: projected_data_fit,
+                ..loss
+            });
         }
     }
     term.record_fit_data_collapse_if_needed(
@@ -2975,21 +2998,38 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
-    // #1231 — in-sample fit: the score is the negative penalized loss, surfaced
-    // honestly as `penalized_loss_score` (NOT `reml_score`) with a breakdown.
-    // When top-k projection is applied, this score describes the SMOOTH
-    // optimization model; the projected inference model is in the top-level
-    // `assignments`/`fitted`/`diagnostics`, with the pre-projection state under
-    // `pre_topk` (#1232).
-    sae_set_penalized_loss_items(&out, &loss, "penalized_loss_score")?;
+    // #1231 / #1232 — in-sample fit: the score is the negative penalized loss,
+    // surfaced honestly as `penalized_loss_score` (NOT `reml_score`) with a
+    // breakdown. The top-level payload describes ONE coherent model: when a hard
+    // top-k gate is applied the top-level `assignments`/`fitted`/`diagnostics`
+    // AND this score all describe the PROJECTED model (the score's data-fit is
+    // recomputed on the projected reconstruction; the decoder/ρ penalties are
+    // unchanged by the gate). The unprojected smooth-optimization model — its
+    // assignments, fitted, and score — is carried in full under `pre_topk`, with
+    // a `top_k_projection` descriptor naming the split so no reader ever conflates
+    // the two layers.
+    let top_level_loss = post_topk_loss.as_ref().unwrap_or(&loss);
+    sae_set_penalized_loss_items(&out, top_level_loss, "penalized_loss_score")?;
     if top_k_will_project {
         out.set_item("top_k_projection_applied", true)?;
+        // Self-describing split descriptor (#1232): every top-level model field
+        // describes the post-top-k projected model; the pre-projection model is
+        // under `pre_topk`.
+        let descriptor = PyDict::new(py);
+        descriptor.set_item("applied", true)?;
+        if let Some(k_top) = top_k {
+            descriptor.set_item("top_k", k_top)?;
+        }
+        descriptor.set_item("top_level_model", "post_topk")?;
+        descriptor.set_item("pre_projection_model", "pre_topk")?;
+        out.set_item("top_k_projection", descriptor)?;
         if let (Some(pre_assignments), Some(pre_fitted)) =
             (pre_topk_assignments, pre_topk_fitted)
         {
             let pre_topk = PyDict::new(py);
             pre_topk.set_item("assignments_z", pre_assignments.into_pyarray(py))?;
             pre_topk.set_item("fitted", pre_fitted.into_pyarray(py))?;
+            // The smooth-model score (unprojected data-fit + the same penalties).
             sae_set_penalized_loss_items(&pre_topk, &loss, "penalized_loss_score")?;
             out.set_item("pre_topk", pre_topk)?;
         }
