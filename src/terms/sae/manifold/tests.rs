@@ -2530,7 +2530,9 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
                     .with_initial_rho(init_rho_flat)
                     .run(&mut objective, "SAE planted circle dimensionless seed")
                     .unwrap();
-                let (fitted_term, rho, _loss) = objective.into_fitted();
+                let fitted_result = objective.into_fitted();
+                let fitted_term = fitted_result.term;
+                let rho = fitted_result.rho;
                 let fitted = fitted_term.fitted();
                 let ev = global_ev(z.view(), fitted.view());
                 assert!(

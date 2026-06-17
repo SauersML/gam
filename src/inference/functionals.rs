@@ -68,7 +68,6 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
     }
 
     let penalty_bias = riesz.dot(&input.penalty_beta);
-    let mut influence_sum = 0.0_f64;
     let mut influence_sq_sum = 0.0_f64;
     for i in 0..n {
         let residual = input.y[i] - input.mu[i];
@@ -79,11 +78,10 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
         // a'H^-1 X'(y - mu) = a'H^-1 S beta, the same correction used by the
         // shared Riesz path.
         let phi_i = (n as f64) * row_score_projection;
-        influence_sum += phi_i;
         influence_sq_sum += phi_i * phi_i;
     }
 
-    let theta_onestep = theta_plugin + influence_sum / n as f64;
+    let theta_onestep = theta_plugin + penalty_bias;
     let se = influence_sq_sum.sqrt() / n as f64;
     if !theta_plugin.is_finite()
         || !theta_onestep.is_finite()

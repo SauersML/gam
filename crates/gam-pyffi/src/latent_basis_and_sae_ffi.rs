@@ -2606,7 +2606,12 @@ fn sae_manifold_fit_inner<'py>(
     let mut shape_uncertainty = objective
         .decoder_shape_uncertainty()
         .map_err(py_value_error)?;
-    let (mut term, mut rho, loss) = objective.into_fitted();
+    let fitted_result = objective.into_fitted();
+    let finalization_invalidated_shape_uncertainty =
+        fitted_result.invalidates_pre_final_shape_uncertainty();
+    let mut term = fitted_result.term;
+    let mut rho = fitted_result.rho;
+    let loss = fitted_result.loss;
     {
         let assignments = term.assignment.assignments();
         let fitted = term.fitted();
@@ -2774,7 +2779,7 @@ fn sae_manifold_fit_inner<'py>(
     // NOT change, term/rho are byte-for-byte the pre-search fit and the exact
     // joint-Hessian seed bands are kept (higher quality than the per-atom Laplace
     // approximation).
-    if structure_changed {
+    if structure_changed || finalization_invalidated_shape_uncertainty {
         shape_uncertainty.invalidate_bands_for_recompute();
     }
     term.complete_born_atom_shape_bands(&mut shape_uncertainty)

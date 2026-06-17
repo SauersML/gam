@@ -59,6 +59,29 @@ pub struct AmortizedWarmStartTelemetry {
     pub total_rows_warm_started: usize,
 }
 
+#[derive(Debug)]
+pub struct SaeIntoFittedResult {
+    pub term: SaeManifoldTerm,
+    pub rho: SaeManifoldRho,
+    pub loss: SaeManifoldLoss,
+    /// True when the settled outer state was replaced by the re-solved seeded
+    /// basin at the selected rho.
+    pub used_seed_basin_fallback: bool,
+    /// True when the pristine construction seed beat the returned state and was
+    /// restored with its original rho.
+    pub used_pristine_seed_fallback: bool,
+    /// True when post-fit chart canonicalization changed any atom's chart.
+    pub charts_canonicalized: bool,
+}
+
+impl SaeIntoFittedResult {
+    pub fn invalidates_pre_final_shape_uncertainty(&self) -> bool {
+        self.used_seed_basin_fallback
+            || self.used_pristine_seed_fallback
+            || self.charts_canonicalized
+    }
+}
+
 impl AmortizedWarmStartTelemetry {
     /// Fold one warm-start outcome into the running tally. `Ok(rows)` with
     /// `rows > 0` is a genuine warm-start; `Ok(0)` is a degenerate-atlas cold
@@ -171,9 +194,9 @@ impl SaeManifoldOuterObjective {
         self.warm_start_telemetry.record(&outcome);
     }
 
-    /// Consume the objective, returning the inner-fitted term, the last ρ the
-    /// engine evaluated, and the inner loss breakdown at that ρ.
-    pub fn into_fitted(self) -> (SaeManifoldTerm, SaeManifoldRho, SaeManifoldLoss) {
+    /// Consume the objective, returning the inner-fitted term, the last rho the
+    /// engine evaluated, and the inner loss breakdown at that rho.
+    pub fn into_fitted(self) -> SaeIntoFittedResult {
         let Self {
             term,
             mut baseline_term,
@@ -280,6 +303,7 @@ impl SaeManifoldOuterObjective {
         } else {
             (term, loss)
         };
+        let mut pristine_seed_won = false;
         if let (Ok(seed_fit), Ok(returned_fit)) = (
             pristine_seed_term.try_fitted_for_rho(&pristine_seed_rho),
             fitted.try_fitted_for_rho(&fitted_rho),
@@ -293,6 +317,7 @@ impl SaeManifoldOuterObjective {
             fitted = pristine_seed_term;
             fitted_rho = pristine_seed_rho;
             fitted_loss = seed_loss;
+            pristine_seed_won = true;
         }
         // #1019 — the post-fit assembly seam: canonicalize every eligible
         // atom's chart to its canonical Diff(M) representative (arc length
@@ -302,15 +327,32 @@ impl SaeManifoldOuterObjective {
         // fitted state is restored verbatim on any failure or tolerance
         // breach), so the fit this returns is never degraded — an error here
         // is a refused canonicalization, not a broken fit.
+        let pre_canonical_flags = fitted
+            .atoms
+            .iter()
+            .map(|atom| atom.chart_canonicalized)
+            .collect::<Vec<_>>();
         if let Err(err) =
             fitted.canonicalize_charts_post_fit(target.view(), &fitted_rho, registry.as_ref())
         {
             log::debug!("into_fitted: chart canonicalization refused: {err}");
         }
+        let charts_canonicalized = fitted
+            .atoms
+            .iter()
+            .zip(pre_canonical_flags.iter())
+            .any(|(atom, before)| atom.chart_canonicalized != *before);
         if fitted.assignment.persist_resolved_ibp_alpha(&fitted_rho) {
             fitted_rho.log_lambda_sparse = 0.0;
         }
-        (fitted, fitted_rho, fitted_loss)
+        SaeIntoFittedResult {
+            term: fitted,
+            rho: fitted_rho,
+            loss: fitted_loss,
+            used_seed_basin_fallback: seed_won,
+            used_pristine_seed_fallback: pristine_seed_won,
+            charts_canonicalized,
+        }
     }
 
     /// First-order optimality certificate for this fit (#934).
