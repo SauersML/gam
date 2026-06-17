@@ -1253,6 +1253,8 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         g_norm_initial: None,
         last_g_norm: None,
         last_value_grad_rho: None,
+        cost_stall: None,
+        cost_stall_bounds: None,
     };
     let grad_sample = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
     assert_eq!(grad_sample.value, 1.0);
@@ -1314,6 +1316,8 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         g_norm_initial: None,
         last_g_norm: None,
         last_value_grad_rho: None,
+        cost_stall: None,
+        cost_stall_bounds: None,
     };
     let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
         .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
@@ -1329,6 +1333,104 @@ fn analytic_route_unavailable_hessian_is_fatal() {
                  got Recoverable: {message}"
         ),
     }
+}
+
+/// #1237 — On a near-separable multinomial fit the outer REML criterion
+/// decreases monotonically as λ→0, so several log-λ directions slam to the
+/// lower box bound and the ARC outer loop cycles to `max_iter` without ever
+/// certifying a stationary point (the #1082 multinomial timeout). The
+/// `OuterSecondOrderBridge` now carries the same cost-stall guard the BFGS
+/// bridge does: once the REML score has stopped improving over
+/// `COST_STALL_WINDOW` evals, `eval_grad` returns the `Fatal` cost-stall
+/// sentinel so the runner halts ARC at the published best iterate. The
+/// converged verdict rides on the BOUND-PROJECTED gradient: a direction pinned
+/// at the bound with a persistent out-of-bounds ∂V/∂ρ is KKT-stationary even
+/// though its raw gradient never vanishes. This drives the ARC bridge directly
+/// (no 380s end-to-end fit) and asserts the stall is reached and certified.
+#[test]
+fn arc_bridge_cost_stall_certifies_at_bound_separation() {
+    // A flat objective at the lower bound `rho = -10` whose raw gradient is a
+    // constant `g = -1` (points further DOWN, out of the feasible box): the
+    // projected KKT residual there is 0, so a stall is a CONVERGED optimum —
+    // exactly the separation signature (the REML score has bottomed out but the
+    // unprojected gradient keeps pushing λ→0 forever).
+    let lo = array![-10.0];
+    let hi = array![10.0];
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either);
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        |_: &mut (), _: &Array1<f64>| Ok(1.0),
+        |_: &mut (), _: &Array1<f64>| {
+            Err(EstimationError::InvalidInput(
+                "legacy eager eval should not run".to_string(),
+            ))
+        },
+        move |_: &mut (), _: &Array1<f64>, order: OuterEvalOrder| {
+            Ok(OuterEval {
+                // Constant cost: the score has flat-lined (separation valley).
+                cost: 1.0,
+                // Gradient points out of the lower bound; raw norm = 1 forever,
+                // but the bound-projected residual at rho=-10 is 0.
+                gradient: array![-1.0],
+                hessian: match order {
+                    OuterEvalOrder::ValueGradientHessian => HessianResult::Analytic(array![[1.0]]),
+                    _ => HessianResult::Unavailable,
+                },
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    // Threshold the projected residual (0 here) must clear; any positive value
+    // certifies the at-bound stall as converged.
+    let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, 1.0e-3, exit.clone());
+    let mut bridge = OuterSecondOrderBridge {
+        obj: &mut obj,
+        layout: OuterThetaLayout::new(1, 0),
+        hessian_source: HessianSource::Analytic,
+        materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+        eval_count: 0,
+        outer_inner_cap: None,
+        g_norm_initial: None,
+        last_g_norm: None,
+        last_value_grad_rho: None,
+        cost_stall: Some(guard),
+        cost_stall_bounds: Some((lo.clone(), hi.clone())),
+    };
+    // Hammer eval_grad at the lower bound; the guard tolerates the first
+    // `COST_STALL_WINDOW` no-improve steps, then halts with the sentinel.
+    let mut sentinel_fired = false;
+    for _ in 0..(COST_STALL_WINDOW + 2) {
+        match FirstOrderObjective::eval_grad(&mut bridge, &lo) {
+            Ok(_) => {}
+            Err(ObjectiveEvalError::Fatal { message }) => {
+                assert_eq!(
+                    message, COST_STALL_CONVERGED_SENTINEL,
+                    "ARC cost-stall must halt via the shared convergence sentinel"
+                );
+                sentinel_fired = true;
+                break;
+            }
+            Err(other) => panic!("unexpected ARC bridge error: {other:?}"),
+        }
+    }
+    assert!(
+        sentinel_fired,
+        "ARC bridge must halt the cost-stall valley within {} evals (separation never settles otherwise)",
+        COST_STALL_WINDOW + 2
+    );
+    let published = exit.lock().unwrap().take().expect("best iterate published");
+    assert!(
+        published.converged,
+        "an at-bound stall with a ZERO projected KKT residual must certify CONVERGED \
+         (raw |g|=1 is the out-of-bounds separation gradient, not non-stationarity)"
+    );
+    assert_eq!(published.rho, lo, "best iterate is the bound-pinned ρ");
+    assert_eq!(published.value, 1.0);
 }
 
 // Phase 5 (Cargo dep at opt 0.3) replaces the gam-side bridge
