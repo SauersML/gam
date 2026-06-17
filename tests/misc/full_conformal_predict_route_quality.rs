@@ -41,7 +41,7 @@ use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand_distr::{Distribution, Normal};
+use rand_distr::{Distribution, Normal, StudentT};
 
 // ───────────────────────── Bernoulli full conformal ─────────────────────────
 
@@ -309,10 +309,15 @@ fn gaussian_split_conformal_covers_fresh_response() {
 // set has FINITE-SAMPLE coverage `≥ 1 − α` for the next exchangeable response,
 // with NO distributional assumption on the noise — one Cholesky per test point,
 // zero refits. This arm pins that distribution-free guarantee on a DELIBERATELY
-// MIS-SPECIFIED DGP (heteroscedastic noise the homoscedastic Gaussian
-// likelihood cannot represent) where the parametric delta-method/Wald band
-// provably UNDER-covers, and shows the exact set repairs coverage while staying
-// finite and efficient (not absurdly wide).
+// MIS-SPECIFIED DGP (heavy-tailed Student-`t₃` noise the Gaussian likelihood
+// cannot represent) where the parametric delta-method/Wald band — whose
+// half-width is the Gaussian quantile `z·σ̂` — provably UNDER-covers because the
+// `t₃` tails carry more mass beyond `±z·σ̂` than a Gaussian of equal variance,
+// and shows the exact set repairs coverage while staying finite and efficient
+// (not absurdly wide). A symmetric *Gaussian* heteroscedastic DGP would NOT
+// work here: its single-width band's interior over-coverage cancels the tail
+// under-coverage, leaving marginal coverage ≈ nominal. The tail mismatch (not a
+// variance mismatch) is the mis-specification that makes the guarantee bite.
 //
 // Why this strengthens coverage beyond the existing tests:
 //   * `conformal_coverage_quality.rs` and the split arm above both exercise the
@@ -327,19 +332,33 @@ fn gaussian_split_conformal_covers_fresh_response() {
 /// `1.6448536269514722 = Φ⁻¹(0.95)`, the two-sided 90% normal Wald multiplier.
 const Z_90: f64 = 1.644_853_626_951_472_2;
 
-/// Heteroscedastic homotopy of [`draw`]: noise SD grows as `base_sd·(1+|x|)`,
-/// which a homoscedastic Gaussian-identity fit structurally cannot represent —
-/// the mis-specification that makes the parametric Wald band under-cover and the
-/// distribution-free conformal guarantee bite.
+/// Heavy-tailed mis-specified homotopy of [`draw`]: the noise is symmetric
+/// Student-`t` with `nu = 3` degrees of freedom, scaled to unit variance and
+/// then by `base_sd`, which a homoscedastic Gaussian-identity fit structurally
+/// cannot represent. The parametric Wald band sets its half-width from the
+/// Gaussian quantile `z·σ̂`, but a `t₃` puts materially more mass beyond `±z·σ̂`
+/// than a Gaussian of the same variance, so the symmetric single-width Gaussian
+/// band UNDER-covers in BOTH tails (no interior over-coverage compensates — the
+/// failure mode a symmetric *Gaussian* heteroscedastic DGP would wrongly let the
+/// marginal coverage average back to nominal). The distribution-free conformal
+/// set, which calibrates off the empirical residual rank rather than a Gaussian
+/// quantile, repairs the under-coverage. `nu = 3` keeps the variance finite
+/// (`= nu/(nu−2) = 3`) so the unit-variance rescale `√((nu−2)/nu)` is well
+/// defined and the conformal set stays finite and efficient.
 fn draw_heteroscedastic(n: usize, base_sd: f64, rng: &mut StdRng) -> (Array1<f64>, Array1<f64>) {
     let unit = Normal::new(0.0, 1.0).unwrap();
+    let nu = 3.0_f64;
+    let t = StudentT::new(nu).unwrap();
+    // Rescale the raw t (variance nu/(nu−2)) to unit variance so `base_sd` is the
+    // true noise SD — the Gaussian fit recovers σ̂ ≈ base_sd, and the tail
+    // mismatch (not a variance mismatch) is what makes the Wald band under-cover.
+    let unit_var_scale = ((nu - 2.0) / nu).sqrt();
     let mut x = Array1::<f64>::zeros(n);
     let mut y = Array1::<f64>::zeros(n);
     for i in 0..n {
         let xi = -2.0 + 4.0 * (i as f64 + 0.5) / (n as f64) + 0.05 * unit.sample(rng);
-        let sd = base_sd * (1.0 + xi.abs());
         x[i] = xi;
-        y[i] = true_mean(xi) + sd * unit.sample(rng);
+        y[i] = true_mean(xi) + base_sd * unit_var_scale * t.sample(rng);
     }
     (x, y)
 }
@@ -354,8 +373,8 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
     let alpha = 1.0 - nominal;
     let mut rng = StdRng::seed_from_u64(0xF011_C0FE);
 
-    // Train a homoscedastic Gaussian-identity cubic on HETEROSCEDASTIC data the
-    // model cannot represent. Unit prior weights (required for exchangeability).
+    // Train a Gaussian-identity cubic on HEAVY-TAILED (t₃) data the Gaussian
+    // likelihood cannot represent. Unit prior weights (required for exchangeability).
     let (x_train, y_train) = draw_heteroscedastic(160, 0.6, &mut rng);
     let train_design = poly_design(&x_train);
 
@@ -381,9 +400,9 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
 
     // Parametric mean + predictive SD for the delta-method Wald baseline: μ̂ =
     // x_*ᵀβ̂, β̂ = M₀⁻¹Xᵀy, Var(μ̂) = σ̂²·x_*ᵀM₀⁻¹XᵀX M₀⁻¹x_* (sandwich), and the
-    // homoscedastic residual variance σ̂². This is exactly the parametric band a
-    // Gaussian GLM reports; it omits the (real, x-dependent) excess noise and so
-    // under-covers the heteroscedastic response.
+    // Gaussian residual variance σ̂². This is exactly the parametric band a
+    // Gaussian GLM reports; its half-width is the Gaussian quantile z·√(Var(μ̂)+σ̂²),
+    // which the heavier-than-Gaussian t₃ tails overflow, so it under-covers.
     let m0_chol = m0.cholesky(Side::Lower).expect("M0 chol");
     let beta = m0_chol.solvevec(&train_design.t().dot(&y_train));
     let resid = &y_train - &train_design.dot(&beta);
@@ -454,7 +473,7 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
     );
 
     // DISTRIBUTION-FREE COVERAGE: the exact set covers the fresh response at ≥
-    // nominal − finite-sample slack, REGARDLESS of the homoscedastic
+    // nominal − finite-sample slack, REGARDLESS of the heavy-tailed
     // mis-specification (n_train=160 ⇒ the conformal rank is exact but the small
     // calibration n widens the slack).
     assert!(
@@ -463,13 +482,13 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
          (distribution-free guarantee violated); wald covered {wald_cov:.3}"
     );
 
-    // The parametric Wald band UNDER-covers under heteroscedastic
+    // The parametric Wald band UNDER-covers under the heavy-tailed
     // mis-specification — the failure the exact set repairs — and the exact set
     // covers strictly better.
     assert!(
         wald_cov < nominal - 0.01,
         "expected the parametric delta-method band to UNDER-cover the \
-         heteroscedastic DGP, but it covered {wald_cov:.3}; conformal {conf_cov:.3}"
+         heavy-tailed t₃ DGP, but it covered {wald_cov:.3}; conformal {conf_cov:.3}"
     );
     assert!(
         conf_cov > wald_cov,
