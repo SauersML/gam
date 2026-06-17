@@ -785,9 +785,8 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     let user_m = duchon_p_from_nullspace_order(spec.nullspace_order);
     // Force constant-only nullspace (only periodic-in-every-axis polynomial).
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
-    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order_int = 0usize;
-    validate_duchon_kernel_orders(None, p_order, s_order_int as f64, d)?;
+    validate_duchon_kernel_orders(None, user_m, s_order_int as f64, d)?;
 
     let z = kernel_constraint_nullspace(
         centers.view(),
