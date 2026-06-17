@@ -289,15 +289,6 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        if std::env::var("DIAG979F").is_ok() && q_index == primary.q1 {
-            let gi = primary.g;
-            let wi0 = primary.w.as_ref().map(|r| r.start).unwrap_or(0);
-            eprintln!(
-                "DIAG979F a={a:+.10e} b={b:+.10e} f_uv[g,w]={:+.10e} f_uv_dir[g,w]={:+.10e} f_au[w]={:+.10e} f_au_dir[w]={:+.10e}",
-                f_uv[[gi, wi0]], f_uv_dir[[gi, wi0]], f_au[wi0], f_au_dir[wi0]
-            );
-        }
-
         // Observed-point quantities and their dir-extensions
         let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
