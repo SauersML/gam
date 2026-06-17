@@ -10023,8 +10023,8 @@ mod inner_contract_probe_tests {
     #[ignore = "#1154 diagnostic measurement only"]
     fn diag_1154_certificate_h_decomposition() {
         use crate::terms::sae::encode::{
-            EncodeAtlas, decoder_row_norm_sum, family_jet_sups, hessian_lipschitz_constant,
-            reconstruction_jet_sups, row_certificate,
+            AtlasConfig, EncodeAtlas, amortized_warm_start, decoder_row_norm_sum, family_jet_sups,
+            hessian_lipschitz_constant, reconstruction_jet_sups, row_certificate,
         };
         let n = 32usize;
         let p = 4usize;
