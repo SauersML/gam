@@ -1,19 +1,37 @@
-# Real LLM activation fixture — OLMo-3-32B
+# Real LLM activation fixtures — OLMo-3-32B
 
-`olmo_l25_pca64_768.npy` — float32, shape (768, 64).
+## olmo_mixedlayer_pca64_768.npy — CROSS-LAYER mixture, shape (768, 64) float32
 
-- **Source:** OLMo-3-32B residual-stream activations (layer L25), real model run, not synthetic.
-- **Construction:** 768 token-position activations sampled (seed 0) from the banked
-  635×64×5120 corpus, mean-centered, projected onto the top **64 PCA components**
-  (SVD of the centered subsample). The manifold-SAE pipeline PCA-reduces its input,
-  so this is a faithful, low-dim slice of what the SAE actually consumes.
+- **Source:** OLMo-3-32B residual-stream activations, real model run, not synthetic.
+- **Provenance (the honest story — see #1199):** this is **NOT a single-layer L25
+  slice**. The banked corpus `activations.npy` is `635 prompts × 64 layers × 5120`.
+  A true single-layer L25 slice (`activations.npy[:, 25, :]`) has exactly **635** rows,
+  one per prompt. This fixture has **768** rows, which it cannot have as a single-layer
+  slice — it is a **cross-layer mixture**: activations sampled across the flattened
+  `(prompt, layer)` axis of the corpus and PCA-reduced to **64 components**. Because the
+  PCA basis is fit across layers, the leading axes mostly capture the (large)
+  between-layer mean/scale nuisance variation, not within-layer semantic structure.
+  This makes it a deliberately ill-conditioned cross-layer mixture, which is why the
+  manifold-SAE pins at the `cost=1e12` sentinel on it (#1189).
+- **Do not** label this "L25" or call it a faithful single-layer SAE input. The
+  `_768` row count is the tell.
 - **Spectrum** (explained-variance fraction): PC1=0.253, cum@K8=0.459, cum@K32=0.631,
-  cum@K64=0.737 — a structured-but-long-tailed signal (structured minority + unstructured bulk).
-- **Use:** real-data e2e regression test for the manifold-SAE (`tests/...`). Held-out
-  reconstruction EV / structure recovery on genuine LLM activations.
+  cum@K64=0.737 — a long-tailed signal whose leading axes are dominated by cross-layer
+  nuisance variation.
+- **Use:** real-data e2e *stress* regression for the manifold-SAE on a hard,
+  ill-conditioned cross-layer cloud (`tests/test_sae_manifold_olmo_real_recon_ev.py`).
 
-## olmo_l18_qualia_635.npz (the principled single-layer fixture)
+## olmo_l18_qualia_635.npz — the principled SINGLE-LAYER fixture, shape (635, 64)
 
-`X` = (635, 64) float32 — PCA-64 of OLMo-3-32B **layer-18** residual stream (the best-qualia layer, probe AUC 0.95), one vector per prompt. `experiential` = (635,) int8 — 1 if the prompt frames the entity as having subjective experience ("genuinely feels…"), 0 if not ("feels nothing…").
+`X` = (635, 64) float32 — PCA-64 of OLMo-3-32B **layer-18** residual stream (the
+best-qualia layer, probe AUC 0.95), **one vector per prompt** (635 rows = 635 prompts,
+the single-layer tell). `experiential` = (635,) int8 — 1 if the prompt frames the entity
+as having subjective experience ("genuinely feels…"), 0 if not ("feels nothing…").
 
-This is the CORRECT manifold-SAE input: a single semantic layer across prompts. (The earlier `olmo_l25_pca64_768.npy` mixed all 64 layers, which is ill-posed — see #1189: the SAE pins at cost=1e12 cross-layer but converges within-layer to a curved Θ≈2π atom with held-out ΔEV≈0.27.)
+This is the CORRECT single-layer manifold-SAE input: one semantic layer across prompts.
+(The cross-layer `olmo_mixedlayer_pca64_768.npy` mixed across all 64 layers, which is
+ill-posed — see #1189/#1199: the SAE pins at cost=1e12 on the cross-layer mixture but
+converges within a single layer to a curved Θ≈2π atom with held-out ΔEV≈0.27.)
+
+> A genuine single-layer L25 slice can be regenerated with `tests/sae/extract_olmo_fixture.py`
+> (`--layer 25`), which produces a **635-row** `olmo_l25_pca64.npy` — note 635, not 768.

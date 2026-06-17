@@ -8832,7 +8832,7 @@ pub(crate) fn real_data_torus_seed_term(
 #[test]
 pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data/olmo_l25_pca64_768.npy");
+        .join("tests/data/olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
     let z_train = z.slice(s![..384, ..]).to_owned();
@@ -8966,7 +8966,7 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 #[test]
 pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data/olmo_l25_pca64_768.npy");
+        .join("tests/data/olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
     let z_train = z.slice(s![..384, ..]).to_owned();
@@ -9462,32 +9462,37 @@ mod inner_contract_probe_tests {
             .min((1.0 - raw.fract()).abs())
     }
 
-    /// #1154 — the co-training fold must live in ONE measure across the outer
-    /// engine's two cost lanes. The derivative-free value-probe lane
-    /// (`eval_cost` / `OuterEvalOrder::Value`) and the analytic gradient lane
-    /// (`eval` / `OuterEvalOrder::ValueAndGradient`) BOTH report the cost the
-    /// cascade ranks ρ by; if only the value lane folded the amortized-encoder
-    /// consistency penalty, an accepted iterate's reported cost would sit BELOW
-    /// its own value-probe cost at the same ρ, and the optimizer would compare
-    /// ranked points across two different objectives — the objective↔gradient
-    /// desync bug class. This pins both lanes to the identical co-trained cost at
-    /// a fixed ρ, and confirms the fold is actually present (cotrained strictly
-    /// above the bare REML value when the encoder has any inconsistency).
+    /// #1206 — the gradient lane's `(cost, gradient)` pair must be SELF-CONSISTENT
+    /// for the outer BFGS Armijo line search. The amortized-encoder consistency
+    /// fold `c(ρ)` (#1154) has no analytic gradient (under Design A the exact
+    /// outer derivative is the REML λ-gradient `∇f` only), so it MUST NOT enter
+    /// the cost the gradient lane (`eval` / `OuterEvalOrder::ValueAndGradient`)
+    /// returns alongside `∇f` — otherwise BFGS minimizes `f+c` while believing the
+    /// gradient is `∇(f+c)`, which is the objective↔gradient desync bug class
+    /// (#931). The fold is a DERIVATIVE-FREE ranking regularizer carried ONLY by
+    /// the value-probe lane (`eval_cost`), whose cost is never paired with a
+    /// gradient.
+    ///
+    /// This test pins the corrected split:
+    /// - the value-probe lane carries a strictly positive fold over bare REML
+    ///   (the encoder has some inconsistency on this fixture), and
+    /// - the gradient lane's cost EQUALS bare REML (it does NOT carry the fold),
+    ///   so it sits a full fold below the value lane and its (cost, ∇f) pair is
+    ///   self-consistent.
     #[test]
-    fn cotrain_fold_is_one_measure_across_value_and_gradient_lanes() {
+    fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
         let mut objective = warmstart_test_objective();
         let rho_flat = objective.current_rho.to_flat();
 
         // Value-probe lane: the cheap derivative-free comparand the cascade uses
-        // for line-search / seed validation.
+        // for seed validation / cross-seed ranking. Carries the consistency fold.
         let value_lane = objective
             .eval_cost(&rho_flat)
             .expect("value-probe lane evaluates the co-trained cost");
 
-        // Gradient lane: the cost an ACCEPTED iterate reports (drives the
-        // incumbent the optimizer settles on). A fresh objective each lane so the
-        // two paths solve from the identical seed state — no cross-lane warm-start
-        // contamination of the comparison.
+        // Gradient lane: the cost an ACCEPTED iterate reports, paired with the
+        // analytic ∇f the BFGS Armijo test consumes. A fresh objective so the two
+        // paths solve from the identical seed state.
         let mut objective_grad = warmstart_test_objective();
         let gradient_lane = objective_grad
             .eval(&rho_flat)
@@ -9499,10 +9504,8 @@ mod inner_contract_probe_tests {
             "both lanes must be finite: value={value_lane}, gradient={gradient_lane}"
         );
 
-        // The fold is genuinely present on the value lane (the pre-fix state):
-        // the lane cost exceeds the bare REML criterion by the non-negative
-        // consistency penalty, evaluated on the SAME refine-policy path the value
-        // lane uses, so the delta isolates exactly the fold.
+        // Bare REML (+ the collapse barrier the gradient lane also keeps),
+        // evaluated on the SAME refine-policy path, isolates exactly the fold.
         let bare = {
             let mut probe = warmstart_test_objective();
             let target = probe.target.clone();
@@ -9531,18 +9534,23 @@ mod inner_contract_probe_tests {
              over bare REML): value_lane={value_lane}, bare={bare}, fold={value_fold}"
         );
 
-        // The fix: the gradient (accepted-iterate) lane now reports the SAME
-        // co-trained measure. Pre-fix it returned bare REML, so it would sit a full
-        // fold BELOW the value lane; post-fix the two lanes agree to inner-solve
-        // tolerance. The gap must be far smaller than the fold the value lane shows
-        // — i.e. the gradient lane is NOT off by a whole fold.
-        let lane_gap = (value_lane - gradient_lane).abs();
+        // #1206: the gradient lane's cost is bare REML — it does NOT carry the
+        // fold, so its (cost, ∇f) pair describes one function. It therefore sits a
+        // FULL fold below the value lane (the value lane is co-trained, the
+        // gradient lane is not). The gap must equal the fold, not ~0.
+        let gradient_vs_bare = (gradient_lane - bare).abs();
         assert!(
-            lane_gap < 0.1 * value_fold,
-            "value-probe and gradient lanes must report the SAME co-trained cost \
-             (one measure): value={value_lane}, gradient={gradient_lane}, \
-             gap={lane_gap}, fold={value_fold} — a gap near the fold size is the \
-             pre-fix desync where the gradient lane dropped the consistency penalty"
+            gradient_vs_bare < 1.0e-9,
+            "the gradient lane must report bare REML (no consistency fold), so its \
+             (cost, ∇f) pair is self-consistent for BFGS Armijo: \
+             gradient_lane={gradient_lane}, bare={bare}, diff={gradient_vs_bare}"
+        );
+        let lane_gap = value_lane - gradient_lane;
+        assert!(
+            (lane_gap - value_fold).abs() < 1.0e-9,
+            "the value lane must sit exactly one fold above the gradient lane \
+             (fold is value-lane-only): value={value_lane}, gradient={gradient_lane}, \
+             lane_gap={lane_gap}, fold={value_fold}"
         );
     }
 

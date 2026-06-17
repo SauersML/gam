@@ -36,7 +36,7 @@ ev_knee_k = H["ev_knee_k"]
 wager_verdict = H["wager_verdict"]
 
 BATTERY_JSON = Path(__file__).resolve().parents[1] / "olmo_battery_results.json"
-OLMO_FIXTURE = Path(__file__).resolve().parent / "data" / "olmo_l25_pca64_768.npy"
+OLMO_FIXTURE = Path(__file__).resolve().parent / "data" / "olmo_mixedlayer_pca64_768.npy"
 
 
 def test_knee_stops_at_saturation():

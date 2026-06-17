@@ -54,7 +54,7 @@ OLMO_L25_HILLCLIMB_OPTIMUM: dict | None = None
 # Path the battery writes; the OLMo arm reads the measured fixture statistics +
 # optimum from it so the calibration is against real data, not a hand value.
 BATTERY_JSON = Path(__file__).resolve().parents[1] / "olmo_battery_results.json"
-OLMO_FIXTURE = Path(__file__).resolve().parent / "data" / "olmo_l25_pca64_768.npy"
+OLMO_FIXTURE = Path(__file__).resolve().parent / "data" / "olmo_mixedlayer_pca64_768.npy"
 
 
 def _clean_ring(seed: int = 0, n: int = 400, p: int = 64) -> np.ndarray:
