@@ -391,6 +391,62 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    /// Third cell-coefficient cross `∂³c/∂u∂v∂(dir)` contracted with a
+    /// direction `dir`, accumulated into `out` (scaled by `sign`).
+    ///
+    /// The denested cell coefficient `c` is an exact cubic in the latent `z`
+    /// whose coefficients depend on the intercept `a`, the rigid slope `b≡g`,
+    /// and the score/link basis parameters. Differentiating w.r.t. three
+    /// *parameter* axes leaves a nonzero coefficient only when at least two of
+    /// the three axes are the slope `g` (= the `b` argument): the basis
+    /// channels enter `c` linearly, so any triple with two or more distinct
+    /// basis indices vanishes. Hence `∂³c/∂u∂v∂c'` is carried by the `bbu`
+    /// family (`∂²/∂b² ∂param`):
+    ///   - `u==g, v==g`  →  `Σ_{c'} coeff_bbu[c']·dir[c']`   (incl. `∂³c/∂g³`),
+    ///   - `u==g, v≠g`   →  `coeff_bbu[v]·dir[g]`,
+    ///   - `v==g, u≠g`   →  `coeff_bbu[u]·dir[g]`,
+    ///   - otherwise     →  `0`.
+    ///
+    /// This is the `f_uv` analogue of `cell_pair_third_coeff_a`'s role for the
+    /// `f_au` jets: omitting it drops the `∂²/∂g²` curvature of a basis
+    /// coefficient from every `D_g f_uv[g, ·]` cell integral (gam#1195).
+    pub(crate) fn add_cell_pair_third_coeff_dir(
+        &self,
+        primary: &FlexPrimarySlices,
+        coeff_bbu: &[[f64; 4]],
+        u: usize,
+        v: usize,
+        dir: &Array1<f64>,
+        sign: f64,
+        out: &mut [f64; 4],
+    ) {
+        let g = primary.g;
+        if u == g && v == g {
+            for (c, &dir_c) in dir.iter().enumerate() {
+                if dir_c == 0.0 {
+                    continue;
+                }
+                for k in 0..4 {
+                    out[k] += sign * coeff_bbu[c][k] * dir_c;
+                }
+            }
+        } else if u == g {
+            let dir_g = dir[g];
+            if dir_g != 0.0 {
+                for k in 0..4 {
+                    out[k] += sign * coeff_bbu[v][k] * dir_g;
+                }
+            }
+        } else if v == g {
+            let dir_g = dir[g];
+            if dir_g != 0.0 {
+                for k in 0..4 {
+                    out[k] += sign * coeff_bbu[u][k] * dir_g;
+                }
+            }
+        }
+    }
+
     /// Directional derivative of the fixed eta second partial r_uv w.r.t.
     /// a contraction direction.  Only (g,g), (g,h), (g,w) entries are nonzero.
     pub(crate) fn observed_fixed_eta_second_partial_dir(

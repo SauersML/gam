@@ -176,6 +176,25 @@ impl SurvivalMarginalSlopeFamily {
                                 }
                             }
 
+                            // Third cell-coefficient cross `∂³c/∂u∂v∂dir`. It is
+                            // NOT identically zero: when two of the three axes
+                            // are the slope `g` (= the `b` argument of the cubic
+                            // cell coefficient), it carries the `∂²/∂b²`
+                            // curvature of a basis coefficient (`coeff_bbu`).
+                            // Dropping it lost the `D_g f_uv[g, ·]` curvature
+                            // term and corrupted the Block-10 third contraction
+                            // (gam#1195).
+                            let mut neg_coeff_uv_dir = [0.0; 4];
+                            self.add_cell_pair_third_coeff_dir(
+                                primary,
+                                &fixed.coeff_bbu,
+                                u,
+                                v,
+                                dir,
+                                -1.0,
+                                &mut neg_coeff_uv_dir,
+                            );
+
                             let dir_val = exact_kernel::cell_third_derivative_from_moments(
                                 neg_cell,
                                 &neg_coeff_u,
@@ -184,7 +203,7 @@ impl SurvivalMarginalSlopeFamily {
                                 &neg_sc_uv,
                                 &neg_coeff_u_dir,
                                 &neg_coeff_v_dir,
-                                &[0.0; 4], // third cross vanishes for cubic cells
+                                &neg_coeff_uv_dir,
                                 &state.moments,
                             )?;
                             f_uv_dir[u * p + v] = dir_val;
