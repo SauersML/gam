@@ -5,7 +5,7 @@ fn build_term_collection_design_inner(
     use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     let n = data.nrows();
-    let p_intercept = 1usize;
+    let p_intercept = usize::from(!term_collection_has_anchored_bspline(spec));
     let p_lin = spec.linear_terms.len();
 
     // Smooth construction, random-effect construction, and linear-column
@@ -114,8 +114,12 @@ fn build_term_collection_design_inner(
 
     let mut blocks = Vec::<DesignBlock>::new();
 
-    // Block 0: intercept — zero storage.
-    blocks.push(DesignBlock::Intercept(n));
+    // Block 0: intercept — zero storage. Anchored B-splines consume the
+    // absolute level at their endpoint, so a free intercept would violate the
+    // structural anchor.
+    if p_intercept == 1 {
+        blocks.push(DesignBlock::Intercept(n));
+    }
 
     // Block 1: linear terms.
     if let Some(lin_block) = linear_block {
@@ -356,12 +360,53 @@ fn build_term_collection_design_inner(
             None
         },
         linear_constraints,
-        intercept_range: 0..1,
+        intercept_range: 0..p_intercept,
         linear_ranges,
         random_effect_ranges,
         random_effect_levels,
         smooth,
     })
+}
+
+fn term_collection_has_anchored_bspline(spec: &TermCollectionSpec) -> bool {
+    spec.smooth_terms
+        .iter()
+        .any(|term| smooth_basis_has_anchored_bspline(&term.basis))
+}
+
+fn smooth_basis_has_anchored_bspline(basis: &SmoothBasisSpec) -> bool {
+    match basis {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            smooth_basis_has_anchored_bspline(inner)
+        }
+        SmoothBasisSpec::BSpline1D { spec, .. } => {
+            bspline_conditions_have_anchor(&spec.boundary_conditions)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_basis_has_anchored_bspline(smooth),
+        SmoothBasisSpec::TensorBSpline { spec, .. } => spec
+            .marginalspecs
+            .iter()
+            .any(|marginal| bspline_conditions_have_anchor(&marginal.boundary_conditions)),
+        SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::Sphere { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. } => false,
+    }
+}
+
+fn bspline_conditions_have_anchor(conditions: &crate::basis::BSplineBoundaryConditions) -> bool {
+    matches!(
+        conditions.left,
+        crate::basis::BSplineEndpointBoundaryCondition::Anchored { .. }
+    ) || matches!(
+        conditions.right,
+        crate::basis::BSplineEndpointBoundaryCondition::Anchored { .. }
+    )
 }
 
 pub fn build_term_collection_design(

@@ -5149,7 +5149,9 @@ fn build_term_collection_fixed_blocks(
     spec: &TermCollectionSpec,
 ) -> Result<Vec<DesignBlock>, BasisError> {
     let mut blocks = Vec::<DesignBlock>::new();
-    blocks.push(DesignBlock::Intercept(data.nrows()));
+    if !term_collection_has_anchored_bspline(spec) {
+        blocks.push(DesignBlock::Intercept(data.nrows()));
+    }
 
     if !spec.linear_terms.is_empty() {
         let mut linear_block = Array2::<f64>::zeros((data.nrows(), spec.linear_terms.len()));
