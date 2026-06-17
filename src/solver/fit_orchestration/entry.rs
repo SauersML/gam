@@ -238,6 +238,117 @@ fn expectile_row_weights(
     })
 }
 
+fn constant_gaussian_standard_fit(
+    request: &StandardFitRequest<'_>,
+) -> Result<StandardFitResult, WorkflowError> {
+    if !request.family.is_gaussian_identity() || request.y.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "constant Gaussian shortcut requires a non-empty Gaussian identity request"
+                .to_string(),
+        });
+    }
+    if request.y.iter().any(|value| !value.is_finite())
+        || request.offset.iter().any(|value| !value.is_finite())
+        || request.weights.iter().any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "constant Gaussian shortcut requires finite response, offset, and non-negative weights"
+                .to_string(),
+        });
+    }
+    let weight_sum = request.weights.sum();
+    if !(weight_sum.is_finite() && weight_sum > 0.0) {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "constant Gaussian shortcut requires positive total weight".to_string(),
+        });
+    }
+    let mut centered_sum = 0.0_f64;
+    for i in 0..request.y.len() {
+        centered_sum += request.weights[i] * (request.y[i] - request.offset[i]);
+    }
+    let intercept = centered_sum / weight_sum;
+    let design = build_term_collection_design(request.data.view(), &request.spec)
+        .map_err(|err| WorkflowError::InvalidConfig {
+            reason: format!("constant Gaussian shortcut could not rebuild design: {err}"),
+        })?;
+    let p = design.design.ncols();
+    let mut beta = Array1::<f64>::zeros(p);
+    for col in design.intercept_range.clone() {
+        if col < p {
+            beta[col] = intercept;
+        }
+    }
+    let lambdas = Array1::<f64>::ones(design.penalties.len());
+    let log_lambdas = Array1::<f64>::zeros(design.penalties.len());
+    let fit = crate::estimate::UnifiedFitResult::try_from_parts(
+        crate::estimate::UnifiedFitResultParts {
+            blocks: vec![crate::estimate::FittedBlock {
+                beta: beta.clone(),
+                role: crate::estimate::BlockRole::Mean,
+                edf: design.intercept_range.len() as f64,
+                lambdas: lambdas.clone(),
+            }],
+            log_lambdas,
+            lambdas,
+            likelihood_family: Some(request.family.clone()),
+            likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: crate::types::LogLikelihoodNormalization::UserProvided,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: Some(0.0),
+            standard_deviation: 0.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: crate::estimate::FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: crate::pirls::PirlsStatus::Converged,
+            max_abs_eta: intercept.abs(),
+            constraint_kkt: None,
+            artifacts: crate::estimate::FitArtifacts {
+                pirls: None,
+                ..Default::default()
+            },
+            inner_cycles: 0,
+        },
+    )
+    .map_err(|err| WorkflowError::IntegrationFailed {
+        reason: format!("constant Gaussian shortcut produced invalid fit: {err}"),
+    })?;
+    Ok(StandardFitResult {
+        fit,
+        design,
+        resolvedspec: request.spec.clone(),
+        adaptive_diagnostics: None,
+        saved_link_state: crate::estimate::FittedLinkState::Standard(None),
+        wiggle_knots: None,
+        wiggle_degree: None,
+    })
+}
+
+fn gaussian_response_is_constant(request: &StandardFitRequest<'_>) -> bool {
+    if !request.family.is_gaussian_identity()
+        || request.y.is_empty()
+        || request.y.iter().any(|value| !value.is_finite())
+    {
+        return false;
+    }
+    let (lo, hi) = request
+        .y
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &value| {
+            (lo.min(value), hi.max(value))
+        });
+    (hi - lo).abs() <= 1.0e-12 * hi.abs().max(1.0)
+}
+
 pub fn fit_from_formula(
     formula: &str,
     data: &Dataset,
@@ -268,6 +379,9 @@ pub fn fit_from_formula(
     // (main.rs run_fit) and FFI consumers, which build the persistence payload
     // from this same `SplineScanFit`.
     if let FitRequest::Standard(request) = &mat.request {
+        if gaussian_response_is_constant(request) {
+            return constant_gaussian_standard_fit(request).map(FitResult::Standard);
+        }
         if let Some(inputs) = spline_scan_fast_path(request) {
             let scan = crate::solver::spline_scan::fit_spline_scan(
                 &inputs.x,
