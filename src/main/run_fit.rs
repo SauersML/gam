@@ -562,37 +562,35 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         }
         None
     };
-    let base_fit_options = FitOptions {
-        latent_cloglog: latent_cloglog_state,
-        mixture_link: mixture_linkspec.clone(),
-        optimize_mixture: true,
-        sas_link: sas_linkspec,
-        optimize_sas: sas_linkspec.is_some()
-            && matches!(
-                effective_link,
-                LinkFunction::Sas | LinkFunction::BetaLogistic
-            ),
-        // Posterior covariance is needed by `predict --uncertainty` for ALL
-        // families, not just non-Gaussian. Previously Gaussian skipped it as
-        // a perf optimization, which made `gam predict --uncertainty` error
-        // with "fit result does not contain conditional covariance or a
-        // usable penalized Hessian" on any standard Gaussian fit. The
-        // existing `COV_MAX_P=5000` diagonal-fallback guard in
-        // `solver/estimate.rs::3252` already caps the cost on huge models.
-        compute_inference: true,
-        skip_rho_posterior_inference: false,
-        max_iter: fit_max_iter,
-        tol: fit_tol,
-        nullspace_dims: vec![],
-        linear_constraints: None,
-        firth_bias_reduction: false,
-        adaptive_regularization: adaptive_opts,
-        penalty_shrinkage_floor: Some(1e-6),
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-        persist_warm_start_disk: false,
-    };
+    // Standard-fit `FitOptions` are built through the single shared policy
+    // source (#1196). The CLI passes only the request-specific link/Firth/
+    // adaptive inputs; the outer-REML optimization policy
+    // (`compute_inference`, `skip_rho_posterior_inference`, `tol`, the
+    // `max_iter` default, the penalty shrinkage floor) is filled in by
+    // `canonical_standard_fit_options`, identical to the formula/Python path,
+    // so the same model can no longer fit differently across entry points.
+    // (Previously this hand-built block used `tol: 1e-6` /
+    // `skip_rho_posterior_inference: false`, diverging from the formula path's
+    // `1e-10`/`true` — the structural defect behind #1191/#1196.)
+    // `fit_max_iter`/`fit_tol` remain the inputs to the separate forced-Firth
+    // external-design branch below.
+    let base_fit_options = gam::solver::fit_orchestration::canonical_standard_fit_options(
+        &fit_config,
+        gam::solver::fit_orchestration::StandardFitOptionsInputs {
+            latent_cloglog: latent_cloglog_state,
+            mixture_link: mixture_linkspec.clone(),
+            optimize_mixture: true,
+            sas_link: sas_linkspec,
+            optimize_sas: sas_linkspec.is_some()
+                && matches!(
+                    effective_link,
+                    LinkFunction::Sas | LinkFunction::BetaLogistic
+                ),
+            firth_bias_reduction: false,
+            adaptive_regularization: adaptive_opts,
+            ..Default::default()
+        },
+    );
     let standard_wiggle = if learn_linkwiggle
         && fit_config.noise_formula.is_none()
         && (!mean_only_flexible_linkwiggle || route_flexible_through_standard)

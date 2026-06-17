@@ -1,5 +1,87 @@
 use super::*;
 
+/// Request-specific inputs to the canonical standard-fit `FitOptions`.
+///
+/// Everything in here varies per call (the link state extracted from the
+/// formula/config, the linear constraints synthesized from `bounded()` /
+/// shape-constrained terms, the Firth / adaptive-regularization toggles read
+/// off the `FitConfig`). Every *policy* field of `FitOptions` — the ones that
+/// decide HOW the outer REML optimization behaves (`compute_inference`,
+/// `skip_rho_posterior_inference`, `tol`, the `max_iter` default, the penalty
+/// shrinkage floor) — is filled in by [`canonical_standard_fit_options`] and is
+/// NOT settable here, so the CLI binary and the Python/PyO3 path cannot resolve
+/// a different optimization policy for the same model (#1196). Before this seam
+/// existed the CLI hand-built `FitOptions` with `tol: 1e-6` /
+/// `skip_rho_posterior_inference: false` while the formula path used
+/// `tol: 1e-10` / `skip_rho_posterior_inference: true`, so the identical model
+/// fit *differently* depending on which entry point you called it from — the
+/// exact class of divergence #1191 surfaced.
+#[derive(Default)]
+pub struct StandardFitOptionsInputs {
+    pub latent_cloglog: Option<LatentCLogLogState>,
+    pub mixture_link: Option<MixtureLinkSpec>,
+    pub optimize_mixture: bool,
+    pub sas_link: Option<SasLinkSpec>,
+    pub optimize_sas: bool,
+    pub linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    pub firth_bias_reduction: bool,
+    pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
+    /// `Some` only when a caller (the forced-Firth CLI branch) overrides the
+    /// canonical default. `None` keeps the single-source default `Some(1e-6)`.
+    pub penalty_shrinkage_floor_override: Option<Option<f64>>,
+    pub persist_warm_start_disk: bool,
+}
+
+/// The single source of truth for standard-fit `FitOptions` *policy*.
+///
+/// Both standard-fit entry points — `materialize_standard` (the formula /
+/// Python / PyO3 path) and the `gam` CLI's `run_fit` — construct their
+/// `StandardFitRequest` options through this function, so the outer REML
+/// optimization policy (`compute_inference`, `skip_rho_posterior_inference`,
+/// `tol`, `max_iter` default, `penalty_shrinkage_floor`) is identical by
+/// construction. New policy fields must be set HERE, never re-derived at a call
+/// site, which is what makes Python/CLI behavioral divergence structurally
+/// impossible rather than enforced by parallel-but-equal code (#1196).
+pub fn canonical_standard_fit_options(
+    config: &FitConfig,
+    inputs: StandardFitOptionsInputs,
+) -> FitOptions {
+    FitOptions {
+        latent_cloglog: inputs.latent_cloglog,
+        mixture_link: inputs.mixture_link,
+        optimize_mixture: inputs.optimize_mixture,
+        sas_link: inputs.sas_link,
+        optimize_sas: inputs.optimize_sas,
+        // Posterior covariance is always computed so `predict --uncertainty`
+        // works for every family (the `COV_MAX_P` diagonal fallback caps cost).
+        compute_inference: true,
+        // Formula/CLI fits are the interactive/default path: keep coefficient
+        // covariance and the smoothing correction, but do not run the optional
+        // live-rho posterior certificate/escalation, which can launch NUTS over
+        // rho and turn ordinary fits into sampler benchmarks. Lower-level
+        // callers that explicitly need the rho posterior opt in elsewhere.
+        skip_rho_posterior_inference: true,
+        max_iter: config.outer_max_iter.unwrap_or(200),
+        // Outer REML/LAML smoothing-selection tolerance. `1e-10` (effective
+        // projected-gradient threshold ≈ 1e-7) resolves λ̂ to optimiser
+        // precision and restores the `w=c ⇔ c-fold replication` invariance in
+        // smoothing selection (gam#893). The CLI previously used the stale
+        // `1e-6`, which over-smoothed relative to the formula path.
+        tol: 1e-10,
+        nullspace_dims: vec![],
+        linear_constraints: inputs.linear_constraints,
+        firth_bias_reduction: inputs.firth_bias_reduction,
+        adaptive_regularization: inputs.adaptive_regularization,
+        penalty_shrinkage_floor: inputs
+            .penalty_shrinkage_floor_override
+            .unwrap_or(Some(1e-6)),
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+        persist_warm_start_disk: inputs.persist_warm_start_disk,
+    }
+}
+
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     // Disk warm-start persistence is opt-in. The always-on in-memory warm start
     // remains inside the fit engines, but the workflow dispatcher must not open

@@ -170,54 +170,22 @@ pub(crate) fn materialize_standard<'a>(
         }
         None
     };
-    let options = FitOptions {
-        latent_cloglog,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        compute_inference: true,
-        // Formula/workflow fits are the interactive/default path. Keep
-        // coefficient covariance and smoothing correction, but do not run the
-        // optional live-rho posterior certificate/escalation here: escalation can
-        // launch NUTS over rho and turns ordinary quality gates into sampler
-        // benchmarks. Lower-level callers that explicitly need the rho posterior
-        // can still opt in through `FitOptions`.
-        skip_rho_posterior_inference: true,
-        max_iter: config.outer_max_iter.unwrap_or(200),
-        // Outer REML/LAML smoothing-selection tolerance. The outer convergence
-        // test (`outer_gradient_tolerance`) uses a `rel_cost` criterion whose
-        // effective projected-gradient threshold is ≈ `tol · (1 + |V(ρ)|)`. The
-        // LAML cost grows like O(n), so at the old `1e-7` the effective gradient
-        // threshold was ≈ `1e-7 · |V|` ≈ 1e-4 for a typical fit — far too coarse
-        // to *resolve* the smoothing parameter: the descent halted while λ̂ could
-        // still move several percent. That under-resolution is benign for a
-        // single fit but breaks an exact invariance — for a fixed-dispersion
-        // family a uniform prior weight `w = c` is exact `c`-fold replication, so
-        // the two encodings share a byte-identical LAML surface and an identical
-        // optimum, yet their (replication-equal) surfaces carry O(1e-7)
-        // floating-point differences AWAY from the optimum. With the coarse
-        // threshold the descent stopped at those encoding-dependent points,
-        // systematically over-smoothing the weighted encoding (gam#893; up to a
-        // ~22× λ ratio across seeds). Tightening to `1e-10` (effective gradient
-        // threshold ≈ 1e-7, ~100× below the FP-noise floor) drives both
-        // encodings to the shared optimum, restoring `w=c ⇔ c-fold replication`
-        // in smoothing selection to optimiser precision. Max-iter is handled
-        // best-effort (the optimiser returns its best ρ on budget exhaustion, it
-        // does not hard-fail), so a harder problem that cannot reach 1e-10 in
-        // `outer_max_iter` is no worse off than before — just better-resolved
-        // when it can.
-        tol: 1e-10,
-        nullspace_dims: vec![],
-        linear_constraints: None,
-        firth_bias_reduction: config.firth,
-        adaptive_regularization: standard_adaptive_regularization_options(config),
-        penalty_shrinkage_floor: Some(1e-6),
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-        persist_warm_start_disk: config.persist_warm_start_disk,
-    };
+    // Standard-fit `FitOptions` are built through the single shared policy
+    // source (#1196) so the formula/Python path and the `gam` CLI cannot
+    // resolve a different outer-REML optimization policy for the same model.
+    // The link state here is folded into the `family`/`link` by `resolve_family`
+    // (the mixture/SAS spec rides on the family, not on these option fields),
+    // so the formula path leaves the `*_link` inputs empty.
+    let options = crate::solver::fit_orchestration::canonical_standard_fit_options(
+        config,
+        crate::solver::fit_orchestration::StandardFitOptionsInputs {
+            latent_cloglog,
+            firth_bias_reduction: config.firth,
+            adaptive_regularization: standard_adaptive_regularization_options(config),
+            persist_warm_start_disk: config.persist_warm_start_disk,
+            ..Default::default()
+        },
+    );
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
 
     let wiggle = effective_linkwiggle.as_ref().and_then(|cfg| {

@@ -1684,3 +1684,120 @@ fn resolve_family_accepts_mgcv_parenthesized_family_link_syntax() {
     ));
     assert!(matches!(nb.link, InverseLink::Standard(StandardLink::Log)));
 }
+
+/// A strictly-increasing 1-D Gaussian dataset — the #1191 reproduce shape
+/// (`y = sqrt(x) + small noise`) on which `s(x, shape=monotone_increasing)`
+/// must fit. Deterministic (no RNG) so the parity assertion is exact.
+fn monotone_parity_dataset() -> Dataset {
+    let n = 60usize;
+    let mut flat = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let x = (i as f64 + 0.5) / n as f64; // (0,1), strictly increasing
+        // Deterministic tiny wiggle so the data is not perfectly smooth but
+        // is unambiguously increasing; keeps the monotone constraint feasible.
+        let y = x.sqrt() + 0.01 * ((7 * i) % 5) as f64 / 5.0;
+        flat.push(x);
+        flat.push(y);
+    }
+    Dataset {
+        headers: vec!["x".to_string(), "y".to_string()],
+        values: Array2::from_shape_vec((n, 2), flat).expect("monotone parity data shape"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
+    }
+}
+
+/// #1196 structural-parity guard. The `gam` CLI (`run_fit`) and the
+/// formula/Python (`materialize_standard`) entry points must build the SAME
+/// outer-REML `FitOptions` policy for the same model. Both now route through
+/// `canonical_standard_fit_options`; this test reconstructs the CLI-side call
+/// with the CLI's request-specific inputs and asserts the resulting options are
+/// byte-for-byte identical (Debug form, since `FitOptions` is not `PartialEq`)
+/// to the options `materialize` actually puts on the `StandardFitRequest`.
+/// Before #1196 the CLI used `tol: 1e-6` / `skip_rho_posterior_inference:
+/// false` while the formula path used `1e-10`/`true`, so this would have
+/// diverged — the exact class of defect #1191 exposed.
+#[test]
+fn issue_1196_cli_and_formula_standard_fit_options_match() {
+    let data = monotone_parity_dataset();
+    let config = FitConfig::default();
+    let formula = "y ~ s(x, shape=monotone_increasing)";
+
+    let materialized =
+        materialize(formula, &data, &config).expect("formula path materializes the monotone fit");
+    let FitRequest::Standard(request) = materialized.request else {
+        panic!("expected a standard request for a Gaussian shape-constrained smooth");
+    };
+
+    // Reconstruct the CLI's call: the CLI passes only request-specific inputs
+    // (here: no mixture/SAS link, Firth off, no adaptive regularization), the
+    // same set `run_fit` feeds for an ordinary Gaussian smooth.
+    let cli_options = crate::solver::fit_orchestration::canonical_standard_fit_options(
+        &config,
+        crate::solver::fit_orchestration::StandardFitOptionsInputs {
+            firth_bias_reduction: config.firth,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        format!("{:#?}", request.options),
+        format!("{cli_options:#?}"),
+        "CLI and formula entry points must build identical standard FitOptions (#1196)"
+    );
+
+    // The policy fields that diverged pre-#1196 are now the single-sourced
+    // canonical values for BOTH paths.
+    assert!(
+        request.options.skip_rho_posterior_inference,
+        "canonical formula/CLI policy skips the live-rho posterior path"
+    );
+    assert_eq!(
+        request.options.tol, 1e-10,
+        "canonical outer-REML tolerance is the gam#893 value, not the stale CLI 1e-6"
+    );
+}
+
+/// #1191 regression, structural form: the shape-constrained smooth that the
+/// CLI fit but `gamfit.fit` rejected must now fit through the SHARED driver
+/// (`materialize` + `fit_model`) that the Python path uses — no "no candidate
+/// seeds passed outer startup validation" ALO-NaN rejection. Because the CLI
+/// and Python now share this exact driver, a pass here is a pass for both.
+#[test]
+fn issue_1191_shape_constrained_monotone_fits_through_shared_driver() {
+    let data = monotone_parity_dataset();
+    let config = FitConfig::default();
+    let formula = "y ~ s(x, shape=monotone_increasing)";
+
+    let materialized = materialize(formula, &data, &config)
+        .expect("monotone shape-constrained smooth materializes");
+    let result = fit_model(materialized.request)
+        .expect("monotone shape-constrained smooth fits through the shared driver (#1191)");
+    let FitResult::Standard(standard) = result else {
+        panic!("expected a standard fit result");
+    };
+    // A genuine converged fit, not a degenerate seed-rejection escape.
+    let beta = standard
+        .fit
+        .block_by_role(crate::estimate::BlockRole::Mean)
+        .expect("fitted mean block")
+        .beta
+        .clone();
+    assert!(
+        beta.iter().all(|b| b.is_finite()),
+        "fitted coefficients must be finite (no ALO-NaN seed rejection)"
+    );
+}
