@@ -1938,17 +1938,43 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
     fn wnorm_pdf(x: f64) -> f64 {
         (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
     }
-    // Calibration F(a) = ∫ Φ(−index(a,g,z)) φ(z) dz − Φ(−q), by composite Simpson
-    // on a wide latent grid (the integrand decays with φ(z)).
-    let calibration = |a: f64, q: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> f64 {
-        let lo = -8.0_f64;
-        let hi = 8.0_f64;
-        let m = 4000usize; // even
+    // ── Like-for-like model representation: production's own denested cells ──
+    // Production does NOT Simpson-integrate the symbolic composed `index` over a
+    // uniform latent grid. It partitions z into cells at every score-warp knot and
+    // every link-knot crossing `z=(τ−a)/g`, and on each cell represents the index
+    // as the EXACT piecewise cubic `cell.eta(z)=c0+c1 z+c2 z²+c3 z³`. Because the
+    // deviation bases are piecewise-cubic, `cell.eta(z)` equals the symbolic
+    // `index(a,g,z)` pointwise — but a single uniform Simpson grid that straddles
+    // those interior breakpoints integrates a piecewise-cubic integrand with nodes
+    // off the breaks, leaving a ~4e-6 aliasing error in `d1` (the #979 value gap).
+    // The witness here re-derives production's SAME moment integral by an
+    // INDEPENDENT quadrature: composite Simpson applied PER production cell (so every
+    // breakpoint is an exact node, and each subinterval integrand is a smooth product
+    // of a single cubic with φ). Infinite tail cells are clamped to ±8 (φ decay).
+    //
+    // `index(a,g,z)` is retained above and used for the observed-node eta/χ, where a
+    // single cell covers z_row and the symbolic form coincides with `cell.eta`.
+    let denested_cells = |a: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| {
+        let beta_h_arr = Array1::from(beta_h.to_vec());
+        let beta_w_arr = Array1::from(beta_w.to_vec());
+        family
+            .denested_partition_cells(a, g, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("production denested partition cells")
+    };
+    // Composite Simpson of `f` over a single (possibly infinite) cell, clamped to
+    // [-8, 8]; `sub` even subintervals so every cell is integrated to round-off for
+    // the smooth single-cubic·φ integrand.
+    let cell_simpson = |left: f64, right: f64, sub: usize, f: &dyn Fn(f64) -> f64| -> f64 {
+        let lo = left.max(-8.0_f64);
+        let hi = right.min(8.0_f64);
+        if !(hi > lo) {
+            return 0.0;
+        }
+        let m = sub; // even
         let h = (hi - lo) / m as f64;
         let mut acc = 0.0_f64;
         for k in 0..=m {
             let z = lo + h * k as f64;
-            let f = wnorm_cdf(-index(a, g, beta_h, beta_w, z)) * wnorm_pdf(z);
             let coef = if k == 0 || k == m {
                 1.0
             } else if k % 2 == 1 {
@@ -1956,9 +1982,22 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
             } else {
                 2.0
             };
-            acc += coef * f;
+            acc += coef * f(z);
         }
-        acc * h / 3.0 - wnorm_cdf(-q)
+        acc * h / 3.0
+    };
+    // Calibration F(a) = ∑cells ∫_cell Φ(−eta_cell(z)) φ(z) dz − Φ(−q), Simpson per
+    // production cell on its exact representation of the index.
+    let calibration = |a: f64, q: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> f64 {
+        let cells = denested_cells(a, g, beta_h, beta_w);
+        let mut acc = 0.0_f64;
+        for partition_cell in &cells {
+            let cell = partition_cell.cell;
+            acc += cell_simpson(cell.left, cell.right, 1024, &|z| {
+                wnorm_cdf(-cell.eta(z)) * wnorm_pdf(z)
+            });
+        }
+        acc - wnorm_cdf(-q)
     };
     // Intercept root + density normalization D = |∂F/∂a|.
     let solve_intercept = |q: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> (f64, f64) {
@@ -1982,38 +2021,30 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
             }
         }
         let a = a1;
-        // Density D = |∂F/∂a| = ∫ φ(index)·(1 + linkdev'(a+g·z))·φ(z) dz, integrated
-        // DIRECTLY as one Simpson pass over the analytic density integrand — NOT
-        // as a finite difference `(F(a+ε)−F(a−ε))/2ε` of two outer Simpson sums.
-        // The φ(index) factor is sharply peaked in z and that peak slides with a,
-        // so differencing two grid-quadratures aliases the sliding peak into a
-        // ~4e-6 density error; through `event·ln(d1)` that left the ~1.3e-5
-        // self-validation gap of #979. The inner linkdev'(u) is the derivative of
-        // a smooth exactly-evaluated spline basis, so a tight central FD resolves
-        // it to ~1e-10 (no integral, no peak to alias).
-        let dlink = 1e-5;
-        let lo = -8.0_f64;
-        let hi = 8.0_f64;
-        let m = 4000usize; // even
-        let hstep = (hi - lo) / m as f64;
+        // Density D = |∂F/∂a| = ∑cells ∫_cell φ(eta_cell(z))·(∂eta_cell/∂a)(z)·φ(z) dz,
+        // Simpson per production cell. On each cell `∂eta/∂a` is the EXACT cubic in z
+        // whose coefficients production derives from the same score/link spans via
+        // `denested_cell_coefficient_partials` (this equals `1 + linkdev'(a+g·z)` on
+        // the cell, but taken from production's own cell algebra so the witness
+        // re-derives production's density with no symbolic-vs-cell aliasing — the
+        // ~4e-6 `d1` value gap of #979). Integrating per cell puts every breakpoint on
+        // a Simpson node, so the single-cubic·φ integrand resolves to round-off.
+        let cells = denested_cells(a, g, beta_h, beta_w);
         let mut acc = 0.0_f64;
-        for k in 0..=m {
-            let z = lo + hstep * k as f64;
-            let u = a + g * z;
-            let dlinkdev =
-                (linkdev_eval(beta_w, u + dlink) - linkdev_eval(beta_w, u - dlink)) / (2.0 * dlink);
-            let integrand =
-                wnorm_pdf(index(a, g, beta_h, beta_w, z)) * (1.0 + dlinkdev) * wnorm_pdf(z);
-            let coef = if k == 0 || k == m {
-                1.0
-            } else if k % 2 == 1 {
-                4.0
-            } else {
-                2.0
-            };
-            acc += coef * integrand;
+        for partition_cell in &cells {
+            let cell = partition_cell.cell;
+            let (dc_da, _) = exact_kernel::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                g,
+            );
+            acc += cell_simpson(cell.left, cell.right, 1024, &|z| {
+                let deta_da = dc_da[0] + dc_da[1] * z + dc_da[2] * z * z + dc_da[3] * z * z * z;
+                wnorm_pdf(cell.eta(z)) * deta_da * wnorm_pdf(z)
+            });
         }
-        let d = (acc * hstep / 3.0).abs();
+        let d = acc.abs();
         (a, d)
     };
     // χ1 = ∂η1/∂a at the observed node (FD of the observed index in a).
