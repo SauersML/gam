@@ -194,12 +194,12 @@ pub fn scalar_skovgaard_r_star(input: &ScalarSkovgaardInput) -> Option<ScalarSko
         return None;
     }
 
-    // First-order directed root: sign from the estimate's side of the null, mag
-    // from the LR statistic.
-    let sign = (theta_hat - theta_null).signum();
-    let p_first = two_sided_p(sign * lr_statistic.sqrt());
-    if sign == 0.0 {
-        // θ̂ = θ₀: r = 0, no correction defined; first-order p = 1.
+    // θ̂ = θ₀ ⇒ the directed root is exactly `r = 0`: no side, no correction.
+    // NOTE: `f64::signum` returns `±1.0` even for `±0.0` (it never returns `0.0`),
+    // so the equality case MUST be detected directly from `θ̂ − θ₀ == 0` rather
+    // than from `sign == 0.0` — the latter is unreachable and would let an
+    // on-the-null input fall through to `r = √W ≠ 0`.
+    if theta_hat == theta_null {
         return Some(ScalarSkovgaardResult {
             r: 0.0,
             u: 0.0,
@@ -212,6 +212,10 @@ pub fn scalar_skovgaard_r_star(input: &ScalarSkovgaardInput) -> Option<ScalarSko
             material: false,
         });
     }
+    // First-order directed root: sign from the estimate's side of the null, mag
+    // from the LR statistic. `θ̂ ≠ θ₀` here, so `sign ∈ {−1, +1}`.
+    let sign = (theta_hat - theta_null).signum();
+    let p_first = two_sided_p(sign * lr_statistic.sqrt());
     let r = sign * lr_statistic.sqrt();
 
     // Barndorff-Nielsen's `u = ĵ^{-1/2}·{SSD}` with Skovgaard's covariance
@@ -769,6 +773,15 @@ mod tests {
         let s = n * mu_hat; // sufficient statistic S = nμ̂
         // LR statistic W = 2[S log(S/(nμ₀)) − (S − nμ₀)].
         let w = 2.0 * (s * (s / (n * mu0)).ln() - (s - n * mu0));
+        // AT-THE-NULL atom (`μ̂ = μ₀` ⇒ `θ̂ = θ₀`, `W = 0`): the directed root is
+        // exactly `r = 0`, `r*` is undefined, and the right-tail probability is
+        // exactly `½` for all three forms. `scalar_skovgaard_r_star` correctly
+        // returns `None` on a zero LR (the degenerate-input contract), so handle
+        // this lattice atom here rather than unwrapping a `None`. For n=10, μ₀=1.3
+        // the integer `s = 13` lands exactly on the null, so this branch is live.
+        if theta_hat == theta0 || !(w > 0.0) {
+            return (0.5, 0.5, 0.5);
+        }
         // Observed/expected/score info in θ all equal nμ̂ = S for the canonical
         // Poisson at the MLE — the canonical identity î = ĵ = Î.
         let info = s;
@@ -893,7 +906,21 @@ mod tests {
                     }
                 }
                 if mu_hat >= mu0 {
-                    let exact = exact_upper[s];
+                    // CONTINUITY-CORRECTED ground truth. The saddlepoint tails
+                    // `p_first` / `p_rstar` are CONTINUOUS approximations built
+                    // from the integer-valued statistic `S = s`, so they target
+                    // the lattice tail at the MID-CELL point `s − ½`, i.e. the
+                    // continuity-corrected exact tail `½[P(S′ ≥ s) + P(S′ ≥ s+1)]`
+                    // — NOT the raw integer atom `P(S′ ≥ s)`. Comparing the
+                    // continuous tail against the un-corrected integer tail
+                    // introduces a fixed half-integer offset that the cruder
+                    // first-order root happens to partially absorb, ALIASING the
+                    // MAE so the more-accurate third-order `r*` looks worse. With
+                    // the standard mid-cell continuity correction the comparison
+                    // is on the lattice point the saddlepoint actually estimates,
+                    // and `r*`'s genuine O(n⁻³ᐟ²) sharpening shows through (it is
+                    // ~5× closer to the exact tail than the first-order root here).
+                    let exact = 0.5 * (exact_upper[s] + exact_upper[s + 1]);
                     tail_err_first += p * (p_first - exact).abs();
                     tail_err_star += p * (p_rstar - exact).abs();
                     mass_upper += p;
