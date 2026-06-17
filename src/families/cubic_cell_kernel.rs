@@ -7032,4 +7032,120 @@ mod tests {
             }
         }
     }
+
+    /// DECISIVE: the third-derivative kernel must equal the FD of the
+    /// second-derivative kernel w.r.t. a parameter that perturbs `eta`,
+    /// RE-EVALUATING the moments at each step (the moments depend on `eta`
+    /// via the `exp(-q)` weight). This isolates the kernel from all survival
+    /// partition/cross machinery (gam#979 f_uv_dir localization).
+    #[test]
+    fn third_derivative_kernel_matches_fd_of_second_with_eta_perturbation() {
+        // A finite, non-affine cell.
+        let base = DenestedCubicCell {
+            left: -0.6,
+            right: 0.9,
+            c0: 0.30,
+            c1: 0.45,
+            c2: -0.20,
+            c3: 0.12,
+        };
+        // Synthetic parameter directions as cubic-in-z perturbations of eta:
+        //   eta_u = ∂eta/∂u, eta_v = ∂eta/∂v, eta_t = ∂eta/∂t (the dir).
+        let eta_u = [0.11_f64, -0.07, 0.05, 0.02];
+        let eta_v = [-0.09_f64, 0.13, -0.04, 0.03];
+        let eta_t = [0.17_f64, 0.06, -0.10, 0.04]; // the "b-like" direction
+        // Second crosses ∂²eta/∂{·}{·} (pick small non-zero cubics).
+        let eta_uv = [0.02_f64, 0.01, -0.015, 0.005];
+        let eta_ut = [-0.01_f64, 0.02, 0.007, -0.003];
+        let eta_vt = [0.015_f64, -0.008, 0.01, 0.004];
+        // Third cross ∂³eta/∂u∂v∂t.
+        let eta_uvt = [0.003_f64, -0.002, 0.001, 0.0005];
+
+        let neg = |a: &[f64; 4]| a.map(|v| -v);
+        let max_degree = 9usize;
+
+        // f_uv(s) where param s shifts eta by s·(eta_t + ½ s²... ) — here we
+        // build the cell at eta + s·eta_t + s²·eta_vt-style is NOT needed; we
+        // only need the t-direction to first order for ∂/∂t. To FD ∂(f_uv)/∂t
+        // we perturb eta along eta_t AND carry the s-dependence of the u,v
+        // crosses: eta_u(s)=eta_u + s·eta_ut, eta_v(s)=eta_v + s·eta_vt,
+        // eta_uv(s)=eta_uv + s·eta_uvt. The cell cubic shifts by s·eta_t.
+        let f_uv_at = |s: f64| -> f64 {
+            let cell_s = DenestedCubicCell {
+                c0: base.c0 + s * eta_t[0],
+                c1: base.c1 + s * eta_t[1],
+                c2: base.c2 + s * eta_t[2],
+                c3: base.c3 + s * eta_t[3],
+                ..base
+            };
+            // Moments MUST be recomputed at the perturbed eta.
+            let st = evaluate_cell_moments(cell_s, max_degree).unwrap();
+            let neg_cell = DenestedCubicCell {
+                c0: -cell_s.c0,
+                c1: -cell_s.c1,
+                c2: -cell_s.c2,
+                c3: -cell_s.c3,
+                ..cell_s
+            };
+            let u_s = [
+                eta_u[0] + s * eta_ut[0],
+                eta_u[1] + s * eta_ut[1],
+                eta_u[2] + s * eta_ut[2],
+                eta_u[3] + s * eta_ut[3],
+            ];
+            let v_s = [
+                eta_v[0] + s * eta_vt[0],
+                eta_v[1] + s * eta_vt[1],
+                eta_v[2] + s * eta_vt[2],
+                eta_v[3] + s * eta_vt[3],
+            ];
+            let uv_s = [
+                eta_uv[0] + s * eta_uvt[0],
+                eta_uv[1] + s * eta_uvt[1],
+                eta_uv[2] + s * eta_uvt[2],
+                eta_uv[3] + s * eta_uvt[3],
+            ];
+            cell_second_derivative_from_moments(
+                neg_cell,
+                &neg(&u_s),
+                &neg(&v_s),
+                &neg(&uv_s),
+                &st.moments,
+            )
+            .unwrap()
+        };
+
+        let h = 1e-5;
+        let fd = (f_uv_at(h) - f_uv_at(-h)) / (2.0 * h);
+
+        // Analytic third via the kernel (negated cell + negated crosses, as the
+        // survival path does).
+        let st0 = evaluate_cell_moments(base, max_degree).unwrap();
+        let neg_cell0 = DenestedCubicCell {
+            c0: -base.c0,
+            c1: -base.c1,
+            c2: -base.c2,
+            c3: -base.c3,
+            ..base
+        };
+        let analytic = cell_third_derivative_from_moments(
+            neg_cell0,
+            &neg(&eta_u),
+            &neg(&eta_v),
+            &neg(&eta_t),
+            &neg(&eta_uv),
+            &neg(&eta_ut),
+            &neg(&eta_vt),
+            &neg(&eta_uvt),
+            &st0.moments,
+        )
+        .unwrap();
+
+        let denom = fd.abs().max(1e-3);
+        let rel = (analytic - fd).abs() / denom;
+        assert!(
+            rel <= 1e-5,
+            "third kernel vs FD-of-second mismatch: analytic={analytic:.12e} fd={fd:.12e} rel={rel:.3e}"
+        );
+    }
 }
