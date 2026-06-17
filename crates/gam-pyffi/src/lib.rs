@@ -8,6 +8,10 @@
 //!   ndarray re-exports the FFI boundary leans on.
 //! * [`ffi_errors`] — the canonical gamfit exception hierarchy and the typed
 //!   engine-error → Python-exception adaptors (issue #343).
+//!
+//! Analytic penalty JSON dispatch is shared through
+//! `build_analytic_penalty_registry_from_json`; the accepted descriptor kinds
+//! include `"nested_prefix"` for `NestedPrefixPenalty`.
 
 mod ffi_prelude;
 
