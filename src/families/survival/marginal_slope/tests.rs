@@ -2254,6 +2254,33 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
             dirx.chi_uv_dir[[gi, wi0]], fd_chi,
             dirx.d_uv_dir[[gi, wi0]], fd_d,
         );
+        // Independent FD of the exit intercept a1(q1,g,beta) for a_u, a_uv, a_uv_dir.
+        let a1_of = |dg: f64, dw: f64| -> f64 {
+            let mut bw = beta_w0.clone();
+            bw[0] += dw;
+            let (a1, _) = family
+                .solve_row_survival_intercept_with_slot(
+                    q1v, gv + dg, Some(&beta_h_arr), Some(&Array1::from(bw)), None,
+                )
+                .unwrap();
+            a1
+        };
+        let hh = 1e-3;
+        // a_u[g] = ∂a/∂g, a_u[w]=∂a/∂w
+        let a_u_g = (a1_of(hh, 0.0) - a1_of(-hh, 0.0)) / (2.0 * hh);
+        let a_u_w = (a1_of(0.0, hh) - a1_of(0.0, -hh)) / (2.0 * hh);
+        // a_uv[g,w] = ∂²a/∂g∂w
+        let a_uv_gw = (a1_of(hh, hh) - a1_of(hh, -hh) - a1_of(-hh, hh) + a1_of(-hh, -hh))
+            / (4.0 * hh * hh);
+        // a_uv_dir[g,w] = ∂³a/∂g²∂w (dir=g)
+        let d3a = |h: f64| -> f64 {
+            let g2 = |dw: f64| (a1_of(h, dw) - 2.0 * a1_of(0.0, dw) + a1_of(-h, dw)) / (h * h);
+            (g2(h) - g2(-h)) / (2.0 * h)
+        };
+        eprintln!(
+            "DIAG979U(FD-a) a_u[g]={:+.6e} a_u[w]={:+.6e} a_uv[g,w]={:+.6e} a_uv_dir[g,w]={:+.6e}",
+            a_u_g, a_u_w, a_uv_gw, d3a(3e-3)
+        );
     }
     let third_checks = [(q0i, hi0), (gi, wi0), (hi0, wi0), (q0i, wi0)];
     for &(u, v) in &third_checks {
