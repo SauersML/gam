@@ -97,15 +97,20 @@ pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
 /// e.g. σ ≈ 9 (s_max ≈ 8, ±1.1 window) needs degree ≳ 40, so 33 nodes refuse
 /// and 65 certify. Node counts stay trivially cheap (one design eval each).
 ///
-/// On the WIDE STANDARDIZED geometry default 1-D fits use (#1215) the blocker
-/// at every rung was NOT the degree but a per-column rounding FLOOR in the tail
-/// certificate; the per-ENTRY tail certificate (see `build_at`) removes that
-/// floor so the design certifies WITHIN this 65-node ladder on production
-/// geometry. The ladder is intentionally NOT extended past 65: the build holds
-/// `m` n×k coefficient slabs, so a deeper ladder would multiply the one-time
-/// build memory at large production `n` (e.g. 320k rows) without need — the
-/// floor, not the degree, was the standardized-geometry obstruction.
-pub const PSI_GRAM_NODE_LADDER: [usize; 4] = [9, 17, 33, 65];
+/// On the WIDE STANDARDIZED geometry default 1-D fits use (#1215) the tail
+/// decays cleanly but GEOMETRICALLY-slowly: measured per-column worst tail rel
+/// is ~3.2e-8 at m=33 and ~2.3e-11 at m=65 (a clean ~1300×/doubling decay, NOT a
+/// floor). m=65 certifies under [`PSI_GRAM_CERT_RTOL`], so the VALUE Gram is
+/// accurate to ~2.3e-11 — fine for the cost lane. But the inner penalized solve
+/// `β̂ = (G+λS)⁻¹r` AMPLIFIES that Gram error by the conditioning of the radial
+/// kernel Gram, which grows sharply with ψ (`‖XᵀX‖_F` rises from ~6e2 at ψ≈0 to
+/// ~1.7e7 at ψ≈2.1 on the gate fixture), so at the higher-ψ sweep points β̂ from
+/// the n-free Gram drifts from the streamed β̂ by ~6e-6 — over the gate's 1e-6
+/// bar. Extending the ladder to 129 nodes continues the geometric decay to
+/// ~1.7e-14, dropping the amplified β̂ drift to ~1e-9, comfortably bit-tight
+/// (#1216). The build frees the per-node realized designs right after the DCT so
+/// the deeper ladder does not balloon peak memory at large production `n`.
+pub const PSI_GRAM_NODE_LADDER: [usize; 5] = [9, 17, 33, 65, 129];
 
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
@@ -305,29 +310,31 @@ impl PsiGramTensor {
             }
             coeff_slabs.push(slab);
         }
+        // The per-node realized designs are consumed by the DCT above and not
+        // needed again (the certificate, Gram products, and spot/gradient checks
+        // all work from `coeff_slabs` or fresh evals). Free them now so the
+        // deeper node ladder (#1216) does not balloon peak build memory at large
+        // production `n` — only `coeff_slabs` (+ later `weighted`) is retained.
+        drop(designs);
         // Tail-decay certificate per design column: the trailing quarter of the
         // coefficient slabs must fall below [`PSI_GRAM_CERT_RTOL`] × column
         // scale.
         //
         // #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215)
-        // the per-column Chebyshev tail does not keep decaying to 1e-12 — it
-        // PLATEAUS at the realized design's own numerical-precision floor
-        // (~2e-11 of column scale, flat across the trailing coefficients, NOT
-        // slow geometric decay). The design entry `kernel(r·e^ψ)` over the wide
-        // window is realized only to ~that relative precision, so no node count
-        // can drive the tail below an over-tight 1e-12; the previous 1e-12 bar
-        // therefore refused at every rung and the n-free fast path never
-        // attached. The certificate is a cheap NECESSARY-CONDITION pre-filter
-        // whose job is to guarantee the ASSEMBLED Gram is accurate enough; that
-        // accuracy is authoritatively enforced by the off-node `spot_check`
-        // (`PSI_GRAM_SPOT_RTOL`, on the assembled Gram against an exact rebuild).
-        // A tail plateaued at ~2e-11 reconstructs the Gram to ~2e-11 relative —
-        // comfortably inside the spot-check's tolerance and FAR inside the
-        // downstream gates' 1e-6 bar — so the pre-filter is set to
-        // [`PSI_GRAM_CERT_RTOL`] (sized above the realized-design floor and below
-        // the spot-check gate). A design that is genuinely non-analytic (a true
-        // kink) still floors ORDERS above this and is refused, with the
-        // spot-check as the hard backstop.
+        // the per-column Chebyshev tail decays cleanly but GEOMETRICALLY-SLOWLY
+        // (measured ~3.2e-8 at m=33, ~2.3e-11 at m=65 — a ~1300×/doubling decay,
+        // NOT a floor). The previous over-tight 1e-12 bar refused at m=65 and the
+        // n-free fast path never attached. The certificate is a cheap
+        // NECESSARY-CONDITION pre-filter whose job is to guarantee the ASSEMBLED
+        // Gram is accurate enough; that accuracy is authoritatively enforced by
+        // the off-node `spot_check` (`PSI_GRAM_SPOT_RTOL`, on the assembled Gram
+        // against an exact rebuild). Sizing the pre-filter to
+        // [`PSI_GRAM_CERT_RTOL`] = 1e-9 lets the (geometrically-decaying) design
+        // certify at m=65, and the ladder's m=129 rung drives the residual to
+        // ~1.7e-14 so the inner penalized solve's conditioning-amplified β̂ stays
+        // bit-tight. A design that is genuinely non-analytic (a true kink) floors
+        // ORDERS above this and is refused, with the spot-check as the hard
+        // backstop.
         let mut col_scale = vec![0.0_f64; k];
         for slab in &coeff_slabs {
             for (j, scale) in col_scale.iter_mut().enumerate() {
