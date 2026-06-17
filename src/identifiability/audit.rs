@@ -696,19 +696,54 @@ fn audit_identifiability_impl(
         });
     }
 
-    let mut x_joint = Array2::<f64>::zeros((n, p_total));
-    for (idx, block) in dense_blocks.iter().enumerate() {
+    // Per-block effective rank-geometry design. A block that carries a
+    // multi-channel `stacked_design` (survival location-scale / latent-survival
+    // time-transform: its solver eta is the `k·n`-row `[entry; exit; deriv]·β`
+    // operator) has its TRUE column geometry spread across all `k` channels, not
+    // in the `n`-row canonical `design` (which is only the channel-the-audit-saw
+    // slice). Feeding the audit the `n`-row `design` mis-represents that span: a
+    // time column that looks collinear with another block's covariate in the
+    // first `n` rows is genuinely distinguished by the deriv/entry channels
+    // (gam#1197). Use the `k·n`-row stacked operator as the block's effective
+    // rank/alias geometry whenever present; plain blocks keep their `n`-row
+    // design. `stacked_design` has the SAME column count as `design`, so the
+    // joint column layout (`col_offsets`) is unchanged.
+    let block_effective_designs: Vec<std::borrow::Cow<'_, Array2<f64>>> = specs
+        .iter()
+        .enumerate()
+        .map(|(idx, spec)| match spec.stacked_design.as_ref() {
+            Some(stacked) => stacked
+                .try_to_dense_arc("identifiability::audit stacked_design rank geometry")
+                .map(|arc| std::borrow::Cow::Owned(arc.as_ref().clone()))
+                .unwrap_or_else(|_| std::borrow::Cow::Borrowed(&dense_blocks[idx])),
+            None => std::borrow::Cow::Borrowed(&dense_blocks[idx]),
+        })
+        .collect();
+    // Joint row count spans the tallest effective block (a `k·n`-row stacked
+    // operator). Plain per-obs blocks fill rows `..n`; the stacked block fills
+    // its `k·n` rows; the trailing rows of shorter blocks stay zero (disjoint
+    // support, exactly as for global-scalar blocks below `n`).
+    let r_joint = block_effective_designs
+        .iter()
+        .map(|d| d.nrows())
+        .max()
+        .unwrap_or(n)
+        .max(n);
+
+    let mut x_joint = Array2::<f64>::zeros((r_joint, p_total));
+    for (idx, block) in block_effective_designs.iter().enumerate() {
         let start = col_offsets[idx];
         let end = col_offsets[idx + 1];
         if end > start {
             // Global-scalar blocks (rows < n) occupy only their own leading rows;
             // the remaining rows stay zero so their disjoint support keeps them
             // from aliasing per-observation columns. Per-obs blocks have br == n
-            // and fill the whole column span exactly as before.
+            // and fill the leading n rows; a stacked block has br == k·n and fills
+            // its full multi-channel span exactly as before for the n-row case.
             let br = block.nrows();
             x_joint
                 .slice_mut(ndarray::s![..br, start..end])
-                .assign(block);
+                .assign(block.as_ref());
         }
     }
 
@@ -724,7 +759,7 @@ fn audit_identifiability_impl(
     // the dominant ~0.94s joint-RRQR cost. Mathematically G[[ja, jb]] = Σ_i
     // X[i,ja]·X[i,jb] = caᵀcb, exactly the column geometry col-piv QR consumes.
     let joint_gram = {
-        let unit_weights = Array1::<f64>::ones(n);
+        let unit_weights = Array1::<f64>::ones(r_joint);
         crate::linalg::faer_ndarray::fast_xt_diag_x_with_parallelism(
             &x_joint,
             &unit_weights,
@@ -759,9 +794,9 @@ fn audit_identifiability_impl(
         if n_penalty_rows == 0 {
             x_joint.clone()
         } else {
-            let mut aug = Array2::<f64>::zeros((n + n_penalty_rows, p_total));
-            aug.slice_mut(ndarray::s![..n, ..]).assign(&x_joint);
-            let mut row = n;
+            let mut aug = Array2::<f64>::zeros((r_joint + n_penalty_rows, p_total));
+            aug.slice_mut(ndarray::s![..r_joint, ..]).assign(&x_joint);
+            let mut row = r_joint;
             for (idx, s_opt) in block_penalties.iter().enumerate() {
                 let start = col_offsets[idx];
                 let end = col_offsets[idx + 1];
@@ -804,7 +839,7 @@ fn audit_identifiability_impl(
         }
         g
     };
-    let joint_rank_m_rows = n + n_penalty_rows;
+    let joint_rank_m_rows = r_joint + n_penalty_rows;
 
     // Per-joint-column gauge priority, inherited from the owning block.
     // RRQR uses greedy column pivoting: at each step it picks the
