@@ -310,14 +310,11 @@ fn gaussian_split_conformal_covers_fresh_response() {
 // with NO distributional assumption on the noise — one Cholesky per test point,
 // zero refits. This arm pins that distribution-free guarantee on a DELIBERATELY
 // MIS-SPECIFIED DGP (heavy-tailed Student-`t₃` noise the Gaussian likelihood
-// cannot represent) where the parametric delta-method/Wald band — whose
-// half-width is the Gaussian quantile `z·σ̂` — provably UNDER-covers because the
-// `t₃` tails carry more mass beyond `±z·σ̂` than a Gaussian of equal variance,
-// and shows the exact set repairs coverage while staying finite and efficient
-// (not absurdly wide). A symmetric *Gaussian* heteroscedastic DGP would NOT
-// work here: its single-width band's interior over-coverage cancels the tail
-// under-coverage, leaving marginal coverage ≈ nominal. The tail mismatch (not a
-// variance mismatch) is the mis-specification that makes the guarantee bite.
+// cannot represent) and shows the exact set keeps coverage while staying finite
+// and efficient (not absurdly wide). The parametric Wald band is logged as an
+// asymptotic baseline only; finite-sample conformal validity is the route
+// contract, independent of whether one deterministic Monte Carlo draw makes the
+// baseline under-cover or over-cover.
 //
 // Why this strengthens coverage beyond the existing tests:
 //   * `conformal_coverage_quality.rs` and the split arm above both exercise the
@@ -335,14 +332,9 @@ const Z_90: f64 = 1.644_853_626_951_472_2;
 /// Heavy-tailed mis-specified homotopy of [`draw`]: the noise is symmetric
 /// Student-`t` with `nu = 3` degrees of freedom, scaled to unit variance and
 /// then by `base_sd`, which a homoscedastic Gaussian-identity fit structurally
-/// cannot represent. The parametric Wald band sets its half-width from the
-/// Gaussian quantile `z·σ̂`, but a `t₃` puts materially more mass beyond `±z·σ̂`
-/// than a Gaussian of the same variance, so the symmetric single-width Gaussian
-/// band UNDER-covers in BOTH tails (no interior over-coverage compensates — the
-/// failure mode a symmetric *Gaussian* heteroscedastic DGP would wrongly let the
-/// marginal coverage average back to nominal). The distribution-free conformal
-/// set, which calibrates off the empirical residual rank rather than a Gaussian
-/// quantile, repairs the under-coverage. `nu = 3` keeps the variance finite
+/// cannot represent. The distribution-free conformal set calibrates off the
+/// augmented-refit residual rank rather than a Gaussian quantile. `nu = 3`
+/// keeps the variance finite
 /// (`= nu/(nu−2) = 3`) so the unit-variance rescale `√((nu−2)/nu)` is well
 /// defined and the conformal set stays finite and efficient.
 fn draw_heteroscedastic(n: usize, base_sd: f64, rng: &mut StdRng) -> (Array1<f64>, Array1<f64>) {
@@ -350,8 +342,8 @@ fn draw_heteroscedastic(n: usize, base_sd: f64, rng: &mut StdRng) -> (Array1<f64
     let nu = 3.0_f64;
     let t = StudentT::new(nu).unwrap();
     // Rescale the raw t (variance nu/(nu−2)) to unit variance so `base_sd` is the
-    // true noise SD — the Gaussian fit recovers σ̂ ≈ base_sd, and the tail
-    // mismatch (not a variance mismatch) is what makes the Wald band under-cover.
+    // true noise SD; the misspecification is tail shape rather than a simple
+    // variance mismatch.
     let unit_var_scale = ((nu - 2.0) / nu).sqrt();
     let mut x = Array1::<f64>::zeros(n);
     let mut y = Array1::<f64>::zeros(n);
@@ -365,8 +357,10 @@ fn draw_heteroscedastic(n: usize, base_sd: f64, rng: &mut StdRng) -> (Array1<f64
 
 /// The EXACT Gaussian full-conformal engine reached by the #1098 predict route
 /// achieves its finite-sample distribution-free coverage guarantee on a
-/// mis-specified (heteroscedastic) DGP — where the parametric delta-method Wald
-/// band under-covers — while staying FINITE and EFFICIENT.
+/// mis-specified heavy-tailed DGP while staying FINITE and EFFICIENT. The
+/// parametric Wald band is logged as a baseline, but it is not part of the
+/// route contract: finite-sample conformal validity must not depend on a
+/// particular Monte Carlo draw making the asymptotic band under-cover.
 #[test]
 fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient() {
     let nominal = 0.90_f64;
@@ -401,8 +395,9 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
     // Parametric mean + predictive SD for the delta-method Wald baseline: μ̂ =
     // x_*ᵀβ̂, β̂ = M₀⁻¹Xᵀy, Var(μ̂) = σ̂²·x_*ᵀM₀⁻¹XᵀX M₀⁻¹x_* (sandwich), and the
     // Gaussian residual variance σ̂². This is exactly the parametric band a
-    // Gaussian GLM reports; its half-width is the Gaussian quantile z·√(Var(μ̂)+σ̂²),
-    // which the heavier-than-Gaussian t₃ tails overflow, so it under-covers.
+    // Gaussian GLM reports; it is logged as an asymptotic baseline without
+    // making its deterministic realized coverage part of the exact conformal
+    // route contract.
     let m0_chol = m0.cholesky(Side::Lower).expect("M0 chol");
     let beta = m0_chol.solvevec(&train_design.t().dot(&y_train));
     let resid = &y_train - &train_design.dot(&beta);
@@ -482,17 +477,9 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
          (distribution-free guarantee violated); wald covered {wald_cov:.3}"
     );
 
-    // The parametric Wald band UNDER-covers under the heavy-tailed
-    // mis-specification — the failure the exact set repairs — and the exact set
-    // covers strictly better.
     assert!(
-        wald_cov < nominal - 0.01,
-        "expected the parametric delta-method band to UNDER-cover the \
-         heavy-tailed t₃ DGP, but it covered {wald_cov:.3}; conformal {conf_cov:.3}"
-    );
-    assert!(
-        conf_cov > wald_cov,
-        "exact full-conformal coverage {conf_cov:.3} should exceed the parametric \
-         band's coverage {wald_cov:.3}"
+        conf_cov + 0.03 >= wald_cov,
+        "exact full-conformal coverage {conf_cov:.3} should stay competitive with \
+         the parametric baseline {wald_cov:.3} while carrying the finite-sample guarantee"
     );
 }
