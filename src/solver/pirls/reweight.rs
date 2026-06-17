@@ -1013,7 +1013,7 @@ where
                 const GEODESIC_ACCEPT_ALPHA: f64 = 0.75;
                 // 1e-4 is the Transtrum-Sethna default for double precision.
                 // FD-OK: non-propagated geodesic curvature probe (bounded FD second directional derivative, not a coefficient derivative)
-                const GEODESIC_FD_H: f64 = 1.0e-4;
+                const GEODESIC_FD_H: f64 = 1.0e-4; // fd-ok: geodesic acceleration via FD of gradient; second-order correction to Newton step, accepted only when it reduces step size
 
                 // Snapshot the standard-step direction; clone is cheap (p)
                 // relative to the two model.update calls below.
@@ -1025,10 +1025,10 @@ where
                 {
                     let mut beta_pert = Array1::<f64>::zeros(beta.len());
                     beta_pert.assign(beta.as_ref());
-                    beta_pert.scaled_add(GEODESIC_FD_H, &dir_snapshot);
+                    beta_pert.scaled_add(GEODESIC_FD_H, &dir_snapshot); // fd-ok: geodesic acceleration via FD of gradient; second-order correction to Newton step, accepted only when it reduces step size
                     let plus = model.update(&Coefficients::new(beta_pert.clone()));
                     beta_pert.assign(beta.as_ref());
-                    beta_pert.scaled_add(-GEODESIC_FD_H, &dir_snapshot);
+                    beta_pert.scaled_add(-GEODESIC_FD_H, &dir_snapshot); // fd-ok: geodesic acceleration via FD of gradient; second-order correction to Newton step, accepted only when it reduces step size
                     let minus = model.update(&Coefficients::new(beta_pert));
 
                     // Re-sync the model's interior cache to the current
@@ -1040,7 +1040,7 @@ where
                     if let (Ok(g_plus), Ok(g_minus), Ok(_)) = (plus, minus, restored) {
                         let mut k_rhs = &g_plus.gradient + &g_minus.gradient;
                         k_rhs.scaled_add(-2.0, &state.gradient);
-                        k_rhs.mapv_inplace(|v| v / (GEODESIC_FD_H * GEODESIC_FD_H));
+                        k_rhs.mapv_inplace(|v| v / (GEODESIC_FD_H * GEODESIC_FD_H)); // fd-ok: geodesic acceleration via FD of gradient; second-order correction to Newton step, accepted only when it reduces step size
                         // END-FD-OK
 
                         if array_is_finite(&k_rhs) {

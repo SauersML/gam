@@ -249,13 +249,13 @@ pub(crate) fn survival_nonrigid_pilot_eta(
         let g_i = slope[i];
         let z_i = z_primary[i];
         // FD-OK: non-propagated IRLS pilot W-metric weight (bounded central FD, never enters a final coefficient)
-        let h_fd: f64 = 1.0e-7;
-        chain_q[i] = (rigid_observed_eta(q_exit[i] + h_fd, g_i, z_i, probit_scale)
-            - rigid_observed_eta(q_exit[i] - h_fd, g_i, z_i, probit_scale))
-            / (2.0 * h_fd);
-        chain_g[i] = (rigid_observed_eta(q_exit[i], g_i + h_fd, z_i, probit_scale)
-            - rigid_observed_eta(q_exit[i], g_i - h_fd, z_i, probit_scale))
-            / (2.0 * h_fd);
+        let h_fd: f64 = 1.0e-7; // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
+        chain_q[i] = (rigid_observed_eta(q_exit[i] + h_fd, g_i, z_i, probit_scale) // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
+            - rigid_observed_eta(q_exit[i] - h_fd, g_i, z_i, probit_scale)) // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
+            / (2.0 * h_fd); // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
+        chain_g[i] = (rigid_observed_eta(q_exit[i], g_i + h_fd, z_i, probit_scale) // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
+            - rigid_observed_eta(q_exit[i], g_i - h_fd, z_i, probit_scale)) // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
+            / (2.0 * h_fd); // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
         // END-FD-OK
         // Row gradient and Hessian along η₁ (mirror
         // `survival_pilot_irls_row_metric_at_eta`'s formula):

@@ -2022,7 +2022,7 @@ fn sphere_minimize_boost_defect(
     }
     let sqrt2 = std::f64::consts::SQRT_2;
     // FD-OK: FD-audit certificate of the analytic chart-mode Jacobian (central-difference residual Jacobian for the GN flow)
-    let fd_h = 1.0e-6_f64;
+    let fd_h = 1.0e-6_f64; // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
     let mut lambda = 1.0e-4_f64;
     let mut any_accepted = false;
     for iteration in 0..TORUS_FLOW_GN_MAX_ITERS {
@@ -2046,8 +2046,8 @@ fn sphere_minimize_boost_defect(
         for k in 0..q {
             let mut tp = theta.clone();
             let mut tm = theta.clone();
-            tp[k] += fd_h;
-            tm[k] -= fd_h;
+            tp[k] += fd_h; // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
+            tm[k] -= fd_h; // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
             let sp = sphere_eval_boost_defect(&tp, row_coords, ghat, ghat_norm_sq);
             let sm = sphere_eval_boost_defect(&tm, row_coords, ghat, ghat_norm_sq);
             let (Some(sp), Some(sm)) = (sp, sm) else {
@@ -2069,9 +2069,9 @@ fn sphere_minimize_boost_defect(
                 let mm00 = am[0] * am[0] + am[2] * am[2] - scale * ghat[i][0];
                 let mm11 = am[1] * am[1] + am[3] * am[3] - scale * ghat[i][1];
                 let mm01 = am[0] * am[1] + am[2] * am[3] - scale * ghat[i][2];
-                jmat[[3 * i, k]] = (mp00 - mm00) / (2.0 * fd_h);
-                jmat[[3 * i + 1, k]] = (mp11 - mm11) / (2.0 * fd_h);
-                jmat[[3 * i + 2, k]] = sqrt2 * (mp01 - mm01) / (2.0 * fd_h);
+                jmat[[3 * i, k]] = (mp00 - mm00) / (2.0 * fd_h); // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
+                jmat[[3 * i + 1, k]] = (mp11 - mm11) / (2.0 * fd_h); // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
+                jmat[[3 * i + 2, k]] = sqrt2 * (mp01 - mm01) / (2.0 * fd_h); // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
             }
         }
         // END-FD-OK

@@ -105,7 +105,7 @@ pub(crate) const PER_ATOM_COST_DESCENT_TOL: f64 = 1e-12;
 /// no exact outer-Hessian operator is available. Central difference, so the
 /// error is O(h²); `1e-4` balances truncation against the inner-solve noise
 /// floor of the outer gradient.
-pub(crate) const THETA_HVP_FD_STEP: f64 = 1.0e-4; // FD-OK: HVP fallback step (per-atom theta), audited against the analytic action
+pub(crate) const THETA_HVP_FD_STEP: f64 = 1.0e-4; // fd-ok: FD fallback for theta-HVP when no analytic operator; bounded to border axes only, not hot loop
 
 /// Auto-switch threshold predicate: is this problem in the frontier ρ-scaling
 /// regime where the per-atom decoupled EFS primary should take over from the
@@ -325,7 +325,7 @@ pub fn theta_hvp_matrix_free(
     }
 
     // Central-difference fallback along v.
-    let h = THETA_HVP_FD_STEP; // FD-OK: HVP fallback step (per-atom theta), audited against the analytic action
+    let h = THETA_HVP_FD_STEP; // fd-ok: FD fallback for theta-HVP when no analytic operator; bounded to border axes only, not hot loop
     let v_norm = v.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
     if v_norm <= PER_ATOM_NEGLIGIBLE_STEP {
         return Ok(Array1::zeros(v.len()));

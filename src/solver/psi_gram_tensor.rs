@@ -575,29 +575,29 @@ impl PsiGramTensor {
         // IS converged. `h` stays window-relative but smaller, balancing the
         // O(h⁶) truncation against the O(ε/h) rounding floor.
         // FD-OK: FD-audit certificate (Richardson-validated FD reference certifying the analytic ψ-derivative)
-        const FD_CONVERGED_RTOL: f64 = 1e-9;
+        const FD_CONVERGED_RTOL: f64 = 1e-9; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
         let h = (span * 2e-4).max(1e-6);
         let exact_dgram = move |psi: f64,
                                 eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
               -> Option<Array2<f64>> {
-            let fd_h = fd4(psi, h, eval)?;
-            let fd_h2 = fd4(psi, 0.5 * h, eval)?;
-            let scale = fd_h2
+            let fd_h = fd4(psi, h, eval)?; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
+            let fd_h2 = fd4(psi, 0.5 * h, eval)?; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
+            let scale = fd_h2 // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
                 .iter()
                 .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
                 .max(1e-300);
             // Convergence guard: the two step sizes must agree, else the FD is
             // not a trustworthy reference at this ψ.
-            let converged = fd_h
+            let converged = fd_h // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
                 .iter()
-                .zip(fd_h2.iter())
-                .all(|(a, b)| (a - b).abs() <= FD_CONVERGED_RTOL * scale);
+                .zip(fd_h2.iter()) // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
+                .all(|(a, b)| (a - b).abs() <= FD_CONVERGED_RTOL * scale); // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
             if !converged {
                 return None;
             }
             // Richardson extrapolation: (16·fd(h/2) − fd(h))/15 cancels the O(h⁴)
             // leading term → O(h⁶) reference.
-            Some((16.0 * &fd_h2 - &fd_h) / 15.0)
+            Some((16.0 * &fd_h2 - &fd_h) / 15.0) // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
         };
         // END-FD-OK
         // True when the analytic derivative matches the (Richardson-validated)
