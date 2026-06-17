@@ -1,5 +1,5 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec,
     BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeResult,
     BasisPsiSecondDerivativeResult, BasisWorkspace, CenterStrategy, CenterStrategyKind,
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,

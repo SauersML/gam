@@ -1844,8 +1844,6 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
 /// flip on a deviation-touching cross block must leave the band.
 #[test]
 fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
-    use crate::probability::{normal_cdf, normal_pdf};
-
     let score_runtime = test_deviation_runtime();
     let link_runtime = test_deviation_runtime();
     let h_dim = score_runtime.basis_dim();

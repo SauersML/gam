@@ -149,9 +149,9 @@ pub(crate) use crate::linalg::matrix::{
 };
 use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, ProjectedKktResidual};
 pub use crate::reml_contracts::{
-    BlockLocalDrift, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
-    DenseMatrixHyperOperator, DriftDerivResult, EvalMode, FixedDriftDerivFn, HyperCoord,
-    HyperCoordDrift, HyperCoordPair, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
+    ContractedPsiSecondOrderFn, DenseMatrixHyperOperator, DriftDerivResult, EvalMode,
+    FixedDriftDerivFn, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
+    ProjectedFactorCache, ProjectedFactorKey,
 };
 
 // ─────────────────────────────────────────────────────────────────────────
