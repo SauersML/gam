@@ -2583,52 +2583,91 @@ impl WorkingModelSurvival {
             const ARMIJO_C: f64 = 1e-4;
             const BACKTRACK: f64 = 0.5;
             const MAX_BACKTRACK: usize = 80;
+            let p = beta.len();
             // Penalized inner objective f(β) = −ℓ(β) + ½β'Sβ + ½ridge‖β‖² whose
             // gradient is exactly `state.gradient` and whose Hessian is exactly
             // `state.hessian`. `update_state` exposes the pieces directly.
             let penalized_objective = |st: &WorkingState| -> f64 {
                 -st.log_likelihood + st.penalty_term
             };
+            let dbg = std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some();
+            let mut iters_done = 0usize;
+            let mut exit_reason = "max_iters";
             for _ in 0..POLISH_MAX_ITERS {
+                iters_done += 1;
                 let st = match candidate.update_state(&beta) {
                     Ok(st) => st,
-                    Err(_) => break,
+                    Err(_) => {
+                        exit_reason = "update_state_err";
+                        break;
+                    }
                 };
                 let r = st.gradient.clone();
                 let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
                 if !r_norm.is_finite() || r_norm < POLISH_TOL {
+                    exit_reason = "converged";
                     break;
                 }
                 let h = st.hessian.to_dense();
                 let f0 = penalized_objective(&st);
-                let hop = match crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h) {
-                    Ok(op) => op,
-                    Err(_) => break,
-                };
                 // Newton DIRECTION d = −H⁻¹r on the convex penalized survival
-                // likelihood. The full Newton STEP overshoots badly here because
-                // exp(η) is strongly nonlinear at large β₀ (the undamped step
-                // raised ‖r‖ ~1000×), so a pure ‖r‖-monotone or LM-diagonal
-                // damping stalls — the small-curvature intercept is under-damped
-                // exactly where exp(η) demands the most damping. An Armijo
-                // backtracking line search on the penalized OBJECTIVE VALUE (not
-                // ‖r‖) is globally convergent for this convex objective: the
-                // Newton direction is always a descent direction (∇fᵀd = −rᵀH⁻¹r
-                // < 0 for SPD H), so some α∈(0,1] gives sufficient decrease, and
-                // near the optimum α→1 recovers quadratic convergence — driving
-                // ‖r‖ below the FD round-off floor.
-                let step = {
-                    use crate::estimate::reml::reml_outer_engine::HessianOperator;
-                    hop.solve(&r)
+                // likelihood, found via a Levenberg–Marquardt-regularized solve
+                // so an ill-conditioned H (h_diag ratio ~2400 at β₀≈4.6, where
+                // exp(η) is huge) cannot produce a garbage direction whose
+                // quadratic form rᵀH⁻¹r loses its sign. If even the regularized
+                // Newton direction is not a sufficient descent direction, fall
+                // back to STEEPEST DESCENT d = −r, which is ALWAYS a descent
+                // direction on the convex objective (∇fᵀ(−r) = −‖r‖² < 0). The
+                // line search below is on the OBJECTIVE VALUE (not ‖r‖), so any
+                // descent direction makes monotone progress; near the optimum
+                // the (lightly regularized) Newton step recovers fast local
+                // convergence. This is globally convergent for the convex
+                // penalized survival NLL — driving ‖r‖ below the FD round-off
+                // floor so the envelope ρ-gradient equals the finite difference.
+                let h_scale = (0..p)
+                    .map(|d| h[[d, d]].abs())
+                    .fold(0.0_f64, f64::max)
+                    .max(1.0);
+                let mut step: Option<Array1<f64>> = None;
+                let mut dir_deriv = 0.0_f64;
+                for lm_pow in 0..16 {
+                    let lambda_lm = if lm_pow == 0 {
+                        0.0
+                    } else {
+                        1e-12 * h_scale * 10f64.powi(lm_pow)
+                    };
+                    let mut h_reg = h.clone();
+                    for d in 0..p {
+                        h_reg[[d, d]] += lambda_lm;
+                    }
+                    let hop = match crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h_reg) {
+                        Ok(op) => op,
+                        Err(_) => continue,
+                    };
+                    let candidate_step = {
+                        use crate::estimate::reml::reml_outer_engine::HessianOperator;
+                        hop.solve(&r)
+                    };
+                    if candidate_step.iter().any(|v| !v.is_finite()) {
+                        continue;
+                    }
+                    // ∇fᵀd = rᵀ(−step) = −r·H_reg⁻¹r. Require it negative and not
+                    // negligibly small relative to ‖r‖² (a genuine descent dir).
+                    let dd = -r.dot(&candidate_step);
+                    if dd.is_finite() && dd < -1e-14 * r_norm * r_norm {
+                        step = Some(candidate_step);
+                        dir_deriv = dd;
+                        break;
+                    }
+                }
+                let (step, dir_deriv) = match step {
+                    Some(s) => (s, dir_deriv),
+                    None => {
+                        // Steepest-descent fallback: d = −r ⇒ step = +r (we step
+                        // β − step), ∇fᵀd = −‖r‖² < 0.
+                        (r.clone(), -r_norm * r_norm)
+                    }
                 };
-                if step.iter().any(|v| !v.is_finite()) {
-                    break;
-                }
-                // Directional derivative ∇fᵀd = rᵀ(−step) = −r·H⁻¹r ≤ 0.
-                let dir_deriv = -r.dot(&step);
-                if !dir_deriv.is_finite() || dir_deriv >= 0.0 {
-                    break;
-                }
                 let mut alpha = 1.0_f64;
                 let mut accepted = false;
                 for _ in 0..MAX_BACKTRACK {
@@ -2644,8 +2683,19 @@ impl WorkingModelSurvival {
                     alpha *= BACKTRACK;
                 }
                 if !accepted {
+                    exit_reason = "linesearch_no_decrease";
                     break;
                 }
+            }
+            if dbg {
+                let final_r = candidate
+                    .update_state(&beta)
+                    .map(|st| st.gradient.iter().map(|v| v * v).sum::<f64>().sqrt())
+                    .unwrap_or(f64::NAN);
+                eprintln!(
+                    "[931-POLISH] rho={:?} iters={} exit_reason={} final_r_norm={:+.6e}",
+                    rho, iters_done, exit_reason, final_r
+                );
             }
         }
 
