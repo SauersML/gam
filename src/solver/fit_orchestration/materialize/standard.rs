@@ -39,8 +39,8 @@ pub(crate) fn materialize_standard<'a>(
         .validate_response_support(y.view())
         .map_err(|violation| violation.message_for(&parsed.response))?;
 
-    // Per-family response-distribution degeneracy (#331 all-0/all-1 Bernoulli,
-    // #332 near-constant Gaussian). Symmetric to validate_response_support —
+    // Per-family response-distribution degeneracy (#331 all-0/all-1 Bernoulli).
+    // Symmetric to validate_response_support —
     // each `ResponseFamily` variant owns its own degeneracy classifier, the
     // workflow only forwards the column name.
     family

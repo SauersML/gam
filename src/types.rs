@@ -671,9 +671,6 @@ impl ResponseFamily {
     /// Concretely:
     /// * `Binomial` — refuses an all-zero or all-one response: the saturated
     ///   logit is ±∞ and the REML score is +∞ (issue #331).
-    /// * `Gaussian` — refuses a response whose sample standard deviation is
-    ///   below `GAUSSIAN_MIN_SAMPLE_SD` (≈ machine ε); the marginal
-    ///   `-n/2·log σ²` REML term diverges to +∞ as σ → 0 (issue #332).
     /// * Every other family currently returns `Ok(())` at this layer — the
     ///   support check already guarantees enough variation to make the
     ///   log-likelihood finite.
@@ -713,27 +710,7 @@ impl ResponseFamily {
                     kind,
                 })
             }
-            Self::Gaussian => {
-                if y.is_empty() {
-                    return Ok(());
-                }
-                let n = y.len();
-                let mean: f64 = y.iter().copied().sum::<f64>() / (n as f64);
-                let ssq: f64 = y.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>();
-                let var = if n > 1 { ssq / ((n - 1) as f64) } else { ssq };
-                let sd = var.sqrt();
-                if !sd.is_finite() || sd <= GAUSSIAN_MIN_SAMPLE_SD {
-                    Err(ResponseDegeneracy {
-                        family_label: self.response_support_label(),
-                        kind: ResponseDegeneracyKind::GaussianNearConstant {
-                            sample_sd: sd,
-                            min_sd: GAUSSIAN_MIN_SAMPLE_SD,
-                        },
-                    })
-                } else {
-                    Ok(())
-                }
-            }
+            Self::Gaussian => Ok(()),
             Self::Poisson
             | Self::Tweedie { .. }
             | Self::NegativeBinomial { .. }
@@ -881,16 +858,6 @@ pub const BINOMIAL_BINARY_TOL: f64 = 1.0e-12;
 /// continuous data, whose fractional parts are O(1).
 pub const COUNT_INTEGER_TOL: f64 = 1.0e-9;
 
-/// Floor on the sample standard deviation of a Gaussian response.
-///
-/// The marginal Gaussian REML objective contains `-n/2·log σ̂²`; when σ̂ → 0
-/// this diverges to +∞ and the outer solver reports the cryptic
-/// `fit_result.reml_score must be finite, got inf` (issue #332). The
-/// threshold is generous (≈ machine ε scaled) so well-conditioned scientific
-/// data never trips it; only data that is effectively constant in f64
-/// arithmetic gets rejected.
-pub const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
-
 /// Classifier for a [`ResponseDegeneracy`]. Each variant carries the family-
 /// specific evidence the caller needs to format a useful message without
 /// having to re-derive the diagnostic.
@@ -900,10 +867,6 @@ pub enum ResponseDegeneracyKind {
     BinomialAllZeros,
     /// Bernoulli / Binomial response with every observed value equal to 1.
     BinomialAllOnes,
-    /// Gaussian response whose sample sd is below
-    /// [`GAUSSIAN_MIN_SAMPLE_SD`]; carries the observed sd and the threshold
-    /// so the message can be precise.
-    GaussianNearConstant { sample_sd: f64, min_sd: f64 },
 }
 
 /// Degenerate-response detail produced by
@@ -942,17 +905,6 @@ impl ResponseDegeneracy {
                  sample that includes both classes).",
                 family = self.family_label,
                 name = response_name,
-            ),
-            ResponseDegeneracyKind::GaussianNearConstant { sample_sd, min_sd } => format!(
-                "{family} response '{name}' is effectively constant (sample sd ≈ {sd:.3e} ≤ {floor:.0e}); \
-                 the marginal REML log-likelihood −n/2·log σ² diverges to +∞ as σ → 0. \
-                 Fix: check the response column units (is it being read in the right \
-                 scale?), centre/rescale the response, or drop the column if it carries \
-                 no signal.",
-                family = self.family_label,
-                name = response_name,
-                sd = sample_sd,
-                floor = min_sd,
             ),
         }
     }

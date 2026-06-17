@@ -685,14 +685,11 @@ fn family_gaussian_cylinder_recovers_with_tight_tolerance() {
 // 5. Edge cases
 // =============================================================================
 
-/// All-y-identical (zero response variance) is a degenerate Gaussian fit: the
-/// marginal REML objective contains `-n/2·log σ̂²`, which diverges to +∞ as the
-/// residual σ̂² → 0. There is no finite REML optimum, so the fit must reject the
-/// response with an actionable `InvalidConfig` (issue #332,
-/// `GAUSSIAN_MIN_SAMPLE_SD`) rather than silently returning a fragile mean-only
-/// solution or panicking on a non-finite REML score.
+/// All-y-identical should collapse to the Gaussian constant fit rather than
+/// being rejected at response validation. The prediction surface must be the
+/// observed constant, with no spurious cyclic wiggle.
 #[test]
-fn edge_all_same_y_is_rejected_as_degenerate_response() {
+fn edge_all_same_y_yields_constant_prediction() {
     init_parallelism();
     let n = 60usize;
     let theta: Vec<f64> = (0..n).map(|i| TAU * (i as f64) / (n as f64)).collect();
@@ -704,16 +701,25 @@ fn edge_all_same_y_is_rejected_as_degenerate_response() {
         "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586)",
         &data,
         &cfg,
-    );
-    let err = match result {
-        Ok(_) => panic!("zero-variance Gaussian response must be rejected, not fitted"),
-        Err(err) => err,
+    )
+    .expect("zero-variance Gaussian response should fit the constant limit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard Gaussian fit")
     };
-    let message = err.to_string();
-    eprintln!("[edge-zero-variance] rejection message: {message}");
+    let mut m = Array2::<f64>::zeros((n, 2));
+    for (i, &t) in theta.iter().enumerate() {
+        m[[i, 0]] = t;
+        m[[i, 1]] = 0.0;
+    }
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild");
+    let pred = design.design.apply(&fit.fit.beta);
+    let max_abs = pred
+        .iter()
+        .map(|value| (value - y_const).abs())
+        .fold(0.0_f64, f64::max);
     assert!(
-        message.contains("effectively constant") && message.contains("diverges"),
-        "expected the degenerate-Gaussian (issue #332) rejection, got: {message}"
+        max_abs <= 1.0e-8,
+        "constant-response fit must predict the observed constant; max_abs={max_abs:.3e}"
     );
 }
 

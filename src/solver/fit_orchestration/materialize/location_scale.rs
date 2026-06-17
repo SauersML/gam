@@ -35,10 +35,8 @@ pub(crate) fn materialize_location_scale<'a>(
         .validate_response_support(y.view())
         .map_err(|violation| violation.message_for(&parsed.response))?;
 
-    // Per-family response-distribution degeneracy (#331, #332). The
-    // location-scale path has its own σ-model so a near-constant Gaussian
-    // mean response is even more pathological here than in the standard
-    // path; same typed check, same family-owned classifier.
+    // Per-family response-distribution degeneracy (#331 all-0/all-1 Bernoulli),
+    // owned by the family type.
     family
         .response
         .validate_response_degeneracy(y.view())
