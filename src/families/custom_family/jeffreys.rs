@@ -557,20 +557,40 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
     let z_columns = z_joint.clone();
     let batch: JeffreysHphiDriftBatchFn = Arc::new(move |deltas: &[Array1<f64>]| {
         // Prepare the β-fixed base ONCE: the reduced-information eigendecomposition
-        // plus the `p` per-axis first directional derivatives `Hdot[e_a]` (the
-        // dominant cost). `None` ⇒ gated out or no exact first derivative ⇒ every
-        // direction's drift is the zero matrix (matching the singular hook).
-        let base = crate::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare(
-            h_joint.view(),
-            z_columns.view(),
-            |direction: &Array1<f64>| {
-                family_owned.joint_jeffreys_information_directional_derivative_with_specs(
-                    &states_owned,
-                    &specs_owned,
-                    direction,
-                )
-            },
-        )?;
+        // plus the `p` first directional derivatives `Hdot[e_a]` (the dominant
+        // cost). Acquire the WHOLE canonical-axis set in ONE batched hook call —
+        // the same path the value-path `joint_jeffreys_term` uses — so a family
+        // that assembles every axis in one shared softmax/Gram pass (multinomial)
+        // pays a SINGLE sweep instead of the `p` concurrent cache-miss sweeps the
+        // per-axis fan-out triggered on a fresh β (#1082/#979). `None` batch ⇒ some
+        // axis lacks the exact derivative ⇒ fall back to the per-axis closure,
+        // whose first `None` collapses the base to the zero drift everywhere
+        // (matching the singular hook).
+        let all_axes = family_owned
+            .joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+                &states_owned,
+                &specs_owned,
+            )?;
+        let base = match all_axes {
+            Some(hdots) => {
+                crate::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_with_axes(
+                    h_joint.view(),
+                    z_columns.view(),
+                    hdots,
+                )?
+            }
+            None => crate::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare(
+                h_joint.view(),
+                z_columns.view(),
+                |direction: &Array1<f64>| {
+                    family_owned.joint_jeffreys_information_directional_derivative_with_specs(
+                        &states_owned,
+                        &specs_owned,
+                        direction,
+                    )
+                },
+            )?,
+        };
         let Some(base) = base else {
             let zeros = vec![Some(Array2::<f64>::zeros((total_p, total_p))); deltas.len()];
             return Ok(zeros);

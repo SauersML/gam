@@ -1104,17 +1104,36 @@ pub trait CustomFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+    ) -> Result<Option<Vec<Array2<f64>>>, String>
+    where
+        Self: Sync,
+    {
         let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        // PARALLEL canonical-axis sweep. Each axis `e_a` is an independent pure
+        // evaluation of `(family, β̂, e_a)`; fan them across the Rayon pool with the
+        // nested-BLAS guard pinning each pass's faer GEMM to `Par::Seq` so the axes
+        // fan across cores without rayon×BLAS oversubscription (the same scheme the
+        // value-path `joint_jeffreys_term` and the prior `JeffreysHphiDriftBase`
+        // closure used). First-anomaly semantics preserved: any `Err` propagates
+        // and the first `None` (in index order) collapses the whole batch to `None`.
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+            .into_par_iter()
+            .map(|a| {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[a] = 1.0;
+                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    self.joint_jeffreys_information_directional_derivative_with_specs(
+                        block_states,
+                        specs,
+                        &axis,
+                    )
+                })
+            })
+            .collect();
         let mut axes = Vec::with_capacity(p);
-        for a in 0..p {
-            let mut axis = Array1::<f64>::zeros(p);
-            axis[a] = 1.0;
-            match self.joint_jeffreys_information_directional_derivative_with_specs(
-                block_states,
-                specs,
-                &axis,
-            )? {
+        for result in results {
+            match result? {
                 Some(m) => axes.push(m),
                 None => return Ok(None),
             }

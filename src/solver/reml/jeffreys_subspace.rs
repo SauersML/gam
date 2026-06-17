@@ -1351,6 +1351,104 @@ impl JeffreysHphiDriftBase {
         if m == 0 || p == 0 {
             return Ok(None);
         }
+        // The β-FIXED per-axis base needs the `p` first directional derivatives
+        // `Hdot[e_a]` (the dominant `O(n·p)` cost). PARALLEL AXIS SWEEP: each axis
+        // is an independent pure evaluation of `(family, β̂, e_a)`, fanned across
+        // the Rayon pool exactly as the value-path `joint_jeffreys_term` does; the
+        // `Sync` bound makes the evaluator safe to call concurrently and the
+        // nested-BLAS guard pins each pass's faer GEMM to `Par::Seq`. First-anomaly
+        // semantics: any `Err` propagates and the first `None` collapses to `None`.
+        //
+        // NOTE for families that serve every canonical axis from ONE shared
+        // softmax/Gram pass (multinomial `cached_axis_directional_derivative`):
+        // prefer [`prepare_with_axes`], which takes the precomputed all-axes batch
+        // and avoids the `p` concurrent cache-miss sweeps this fan-out triggers on
+        // a fresh β. This per-axis-closure path stays for families without a
+        // batched hook (the trait default already serves bit-identically).
+        let hdots: Vec<Array2<f64>> = {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+                .into_par_iter()
+                .map(|a| {
+                    let mut axis = Array1::<f64>::zeros(p);
+                    axis[a] = 1.0;
+                    crate::linalg::faer_ndarray::with_nested_parallel(|| base_hessian_dir(&axis))
+                })
+                .collect();
+            let mut hdots = Vec::with_capacity(p);
+            for result in results {
+                let hdot = match result? {
+                    Some(hd) => hd,
+                    None => return Ok(None),
+                };
+                hdots.push(hdot);
+            }
+            hdots
+        };
+        Self::from_axis_derivatives(h_joint, z_j, hdots)
+    }
+
+    /// Same prepared base as [`prepare`], but consuming the PRECOMPUTED all-axes
+    /// first-directional derivatives `{Hdot[e_a]}` (one entry per canonical axis,
+    /// `a = 0..p`) instead of re-deriving them axis-by-axis. Families that assemble
+    /// the whole canonical axis set in a single shared softmax/Gram pass (e.g.
+    /// multinomial) build that batch once and pass it here, collapsing the `p`
+    /// redundant full-data sweeps the per-axis closure would otherwise trigger
+    /// (each parallel cache-miss reruns the entire assembly — #1082/#979). The
+    /// reduction is identical to `prepare`, so the prepared base is bit-faithful.
+    pub(crate) fn prepare_with_axes(
+        h_joint: ArrayView2<'_, f64>,
+        z_j: ArrayView2<'_, f64>,
+        hdots: Vec<Array2<f64>>,
+    ) -> Result<Option<JeffreysHphiDriftBase>, String> {
+        let p = h_joint.nrows();
+        if h_joint.ncols() != p {
+            return Err(format!(
+                "JeffreysHphiDriftBase::prepare_with_axes: H must be square, got {}x{}",
+                h_joint.nrows(),
+                h_joint.ncols()
+            ));
+        }
+        if z_j.nrows() != p {
+            return Err(format!(
+                "JeffreysHphiDriftBase::prepare_with_axes: Z_J has {} rows, expected {p}",
+                z_j.nrows()
+            ));
+        }
+        if hdots.len() != p {
+            return Err(format!(
+                "JeffreysHphiDriftBase::prepare_with_axes: got {} axis derivatives, expected {p}",
+                hdots.len()
+            ));
+        }
+        let m = z_j.ncols();
+        if m == 0 || p == 0 {
+            return Ok(None);
+        }
+        Self::from_axis_derivatives(h_joint, z_j, hdots)
+    }
+
+    /// Shared reduction: from the `p` first-directional derivatives `{Hdot[e_a]}`
+    /// (however they were obtained) and the fixed `(H, Z_J)`, build the prepared
+    /// β-fixed drift base. Reproduces EXACTLY the value-path reduced information,
+    /// conditioning gate, and floored pseudo-inverse so the derivative stays
+    /// consistent with the `H_Φ` the objective uses.
+    fn from_axis_derivatives(
+        h_joint: ArrayView2<'_, f64>,
+        z_j: ArrayView2<'_, f64>,
+        hdots: Vec<Array2<f64>>,
+    ) -> Result<Option<JeffreysHphiDriftBase>, String> {
+        let p = h_joint.nrows();
+        let m = z_j.ncols();
+        for hdot in &hdots {
+            if hdot.nrows() != p || hdot.ncols() != p {
+                return Err(format!(
+                    "JeffreysHphiDriftBase: Hdot[e_a] shape {}x{} != {p}x{p}",
+                    hdot.nrows(),
+                    hdot.ncols()
+                ));
+            }
+        }
         // Reproduce EXACTLY the value-path reduced information, conditioning gate,
         // and floored pseudo-inverse so the derivative is consistent with the
         // `H_Φ` the objective uses.
@@ -1386,50 +1484,11 @@ impl JeffreysHphiDriftBase {
             }
         }
         // The β-FIXED per-axis base: `Ṽ_a = Vᵀ D_a V` and `Ψ ∘ Ṽ_a`, formed from
-        // the `p` first directional derivatives `Hdot[e_a]` (the dominant `O(n·p)`
-        // cost — done ONCE here, reused for every drift direction).
-        //
-        // PARALLEL AXIS SWEEP. Each axis `e_a` requires one FULL-DATA
-        // directional-derivative row-stream `Hdot[e_a]` (n≈348k biobank rows) — the
-        // dominant cost of the whole outer-gradient eval. The `p` passes are
-        // independent pure evaluations of `(family, β̂, e_a)`, so we fan them across
-        // the Rayon pool exactly as the value-path `joint_jeffreys_term` does; the
-        // `Sync` bound on `BaseFn` makes the evaluator safe to call concurrently and
-        // the nested-BLAS guard pins each pass's faer GEMM to `Par::Seq` so the
-        // axes fan across cores without rayon×BLAS oversubscription. The cheap
-        // per-axis reduction (`Ṽ_a` rotation + row writes) stays serial over the
-        // index-ordered results, so the prepared base is bit-identical to the
-        // original serial loop. First-anomaly semantics preserved: any `Err`
-        // propagates and the first `None` (family lacks the exact derivative on
-        // some axis) collapses the whole base to `None` (zero drift everywhere).
+        // the `p` supplied first directional derivatives `Hdot[e_a]`. The cheap
+        // per-axis reduction (`Ṽ_a` rotation + row writes) is serial over the
+        // index-ordered axes, so the prepared base is bit-identical regardless of
+        // how the `{Hdot[e_a]}` were obtained (per-axis closure or batched hook).
         let z_owned = z_j.to_owned();
-        let hdots: Vec<Array2<f64>> = {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
-                .into_par_iter()
-                .map(|a| {
-                    let mut axis = Array1::<f64>::zeros(p);
-                    axis[a] = 1.0;
-                    crate::linalg::faer_ndarray::with_nested_parallel(|| base_hessian_dir(&axis))
-                })
-                .collect();
-            let mut hdots = Vec::with_capacity(p);
-            for result in results {
-                let hdot = match result? {
-                    Some(hd) => hd,
-                    None => return Ok(None),
-                };
-                if hdot.nrows() != p || hdot.ncols() != p {
-                    return Err(format!(
-                        "JeffreysHphiDriftBase::prepare: Hdot[e_a] shape {}x{} != {p}x{p}",
-                        hdot.nrows(),
-                        hdot.ncols()
-                    ));
-                }
-                hdots.push(hdot);
-            }
-            hdots
-        };
         let mut a_rows = Array2::<f64>::zeros((p, m * m));
         let mut aw_rows = Array2::<f64>::zeros((p, m * m));
         for (a, hdot_a) in hdots.into_iter().enumerate() {
