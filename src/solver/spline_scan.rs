@@ -930,20 +930,46 @@ pub fn fit_spline_scan(
         ));
     }
     let (nodes, ssr_within, n_obs) = pool_nodes(x, y, w, order)?;
+    // Covariate-rescaling equivariance (#1214). The order-`m` IWP process noise
+    // is `Q(δ) ∝ q · δ^{2m−1}`, so under an affine covariate rescale `x → a·x`
+    // (all abscissa gaps `δ → a·δ`) the posterior `f(x)` is *exactly* invariant
+    // iff the smoothing parameter co-transforms as `q → q / a^{2m−1}`, i.e.
+    // `log λ → log λ + (2m−1)·log a` (λ = 1/q). The whole smoother — criterion,
+    // fit, and the Gaussian-bridge `predict` — runs self-consistently in the raw
+    // covariate units, so the *only* place covariate scale leaks in is this
+    // outer `log λ` search: a fixed absolute bracket `[LOG_LAMBDA_LO,
+    // LOG_LAMBDA_HI]` does not track the data span, so at small/large covariate
+    // scale the equivariant optimum rails out of the bracket and the fit drifts.
+    // Anchor the bracket to the data's own length scale: search `log λ` around
+    // `(2m−1)·log L` where `L` is the abscissa span (which scales linearly with
+    // the covariate), so the search is performed in scale-free units and the
+    // selected `q · L^{2m−1}` — hence the posterior `f(x)` — is invariant.
+    let span = nodes
+        .last()
+        .map(|n| n.x)
+        .unwrap_or(0.0)
+        - nodes.first().map(|n| n.x).unwrap_or(0.0);
+    let scale_shift = if span.is_finite() && span > 0.0 {
+        (2 * order - 1) as f64 * span.ln()
+    } else {
+        0.0
+    };
+    let lo_anchor = LOG_LAMBDA_LO + scale_shift;
+    let hi_anchor = LOG_LAMBDA_HI + scale_shift;
     let crit = |ll: f64| concentrated_criterion(&nodes, ssr_within, n_obs, ll, order);
     let mut best_i = 0usize;
     let mut best_v = f64::NEG_INFINITY;
-    let step = (LOG_LAMBDA_HI - LOG_LAMBDA_LO) / (LOG_LAMBDA_GRID - 1) as f64;
+    let step = (hi_anchor - lo_anchor) / (LOG_LAMBDA_GRID - 1) as f64;
     for i in 0..LOG_LAMBDA_GRID {
-        let ll = LOG_LAMBDA_LO + step * i as f64;
+        let ll = lo_anchor + step * i as f64;
         let v = crit(ll)?;
         if v > best_v {
             best_v = v;
             best_i = i;
         }
     }
-    let mut lo = LOG_LAMBDA_LO + step * best_i.saturating_sub(1) as f64;
-    let mut hi = (LOG_LAMBDA_LO + step * (best_i + 1) as f64).min(LOG_LAMBDA_HI);
+    let mut lo = lo_anchor + step * best_i.saturating_sub(1) as f64;
+    let mut hi = (lo_anchor + step * (best_i + 1) as f64).min(hi_anchor);
     // Golden-section maximization on [lo, hi].
     let inv_phi = 0.618_033_988_749_894_9_f64;
     let mut x1 = hi - inv_phi * (hi - lo);
