@@ -2389,36 +2389,43 @@ impl WorkingModelSurvival {
         let penalty_quadratic = 2.0 * state.penalty_term;
         let provider = SurvivalDerivProvider::new(self.clone(), beta.clone());
 
-        // #931 survival-LAML IFT envelope: the inner constrained survival PIRLS
-        // does not in general reach EXACT stationarity (it exits on a scaled
-        // KKT certificate, and the monotonicity constraints can bind), so the
-        // penalized stationarity vector `r = Sβ̂ + ridge·β̂ − ∇ℓ = state.gradient`
-        // is nonzero at β̂. Passing `kkt_residual: None` asserted exact inner
-        // stationarity and silently dropped the IFT envelope term — a
-        // value↔ρ-gradient leak (`Ṽ = V − ½rᵀH⁻¹r`, paired with its exact
-        // ρ-gradient/Hessian corrections) that desynced the survival LAML
-        // objective from its analytic gradient under finite difference.
+        // #931 survival-LAML IFT envelope: attach the one-step Newton correction
+        // only when this state is actually a near-stationary inner solution.
+        // `unified_lamlobjective_and_rhogradient` is also used by algebraic
+        // fixed-beta objective tests; feeding a large non-stationary residual
+        // there makes the value a different surface. The re-converged shim
+        // polishes the inner mode to an absolute residual floor, so certified
+        // states still keep the envelope correction while arbitrary beta probes
+        // evaluate the documented LAML objective.
         //
-        // The residual MUST be the ACTIVE-SET-PROJECTED stationarity vector,
-        // not the raw `state.gradient`: a binding monotonicity constraint
-        // contributes a Lagrange-multiplier normal component (`r = Aᵀλ`, λ≥0)
-        // that is NOT a stationarity residual. Project it out through the same
-        // single-source cone primitive the custom_family IFT path uses, so the
-        // `ProjectedKktResidual::from_active_projected` invariant
-        // (`r_A = P_T(Sβ̂ + Γβ̂ − ∇ℓ)`) actually holds. Without this projection
-        // (the reverted first attempt), a tight derivative-floor row injects a
-        // spurious `−½rᵀH⁻¹r` whose ρ-derivative does not match the value's,
-        // making the desync WORSE than dropping the term.
+        // The residual MUST be the active-set-projected stationarity vector, not
+        // raw `state.gradient`: a binding monotonicity constraint contributes a
+        // Lagrange-multiplier normal component (`r = A^T lambda`, lambda >= 0)
+        // that is not a stationarity residual.
+        const SURVIVAL_LAML_IFT_RELATIVE_KKT_GATE: f64 = 1.0e-8;
         let kkt_residual = {
             let raw = state.gradient.clone();
             let projected = match self.monotonicity_linear_constraints() {
                 Some(constraints) => {
                     projected_linear_constraint_stationarity_vector(&raw, beta, &constraints, None)
-                        .unwrap_or(raw)
+                        .ok_or_else(|| {
+                            EstimationError::InvalidInput(
+                                "survival LAML could not project the monotonicity KKT residual"
+                                    .to_string(),
+                            )
+                        })?
                 }
                 None => raw,
             };
-            crate::model_types::ProjectedKktResidual::from_active_projected(projected)
+            let projected_norm = array1_l2_norm(&projected);
+            let relative_projected_norm = state.relative_gradient_norm(projected_norm);
+            if relative_projected_norm <= SURVIVAL_LAML_IFT_RELATIVE_KKT_GATE {
+                Some(crate::model_types::ProjectedKktResidual::from_active_projected(
+                    projected,
+                ))
+            } else {
+                None
+            }
         };
 
         let result = InnerAssembly {
@@ -2447,7 +2454,7 @@ impl WorkingModelSurvival {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             contracted_psi_second_order: None,
-            kkt_residual: Some(kkt_residual),
+            kkt_residual,
             active_constraints: None,
         }
         .evaluate(
