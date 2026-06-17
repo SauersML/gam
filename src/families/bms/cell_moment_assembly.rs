@@ -3157,6 +3157,27 @@ mod empirical_rigid_jet_oracle_tests {
                          witness_T4_mmmg={fd_mmmg:+.12e} production_T4_mmmg={:+.12e}",
                         fourth[0][0][0][1]
                     );
+                    // Dump every stencil evaluation f(m0+im*h, g0+ig*h) at the
+                    // coarse step h4 for the mmmg (order_m=3, order_g=1) stencil so
+                    // an off-box re-derivation can diff point-by-point and localize
+                    // the divergent term.
+                    let m0d = m[row];
+                    let g0d = g[row];
+                    for im in [-2_i64, -1, 1, 2] {
+                        for ig in [-1_i64, 1] {
+                            let mm = m0d + (im as f64) * h4;
+                            let gg = g0d + (ig as f64) * h4;
+                            let val = f(mm, gg);
+                            // also dump the witness intercept and signed arg
+                            let mu = normal_cdf(mm);
+                            let a_int = witness_intercept(mu, gg, s, &grid.nodes, &grid.weights);
+                            let signed = (2.0 * y[row] - 1.0) * (a_int + s * gg * z[row]);
+                            eprintln!(
+                                "DIAG932PT: im={im} ig={ig} mm={mm:+.12e} gg={gg:+.12e} \
+                                 a={a_int:+.12e} signed={signed:+.12e} f={val:+.12e}"
+                            );
+                        }
+                    }
                 }
                 for (lbl, om, og, prod) in [
                     ("mmmm", 4, 0, fourth[0][0][0][0]),
