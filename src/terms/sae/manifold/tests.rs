@@ -1793,10 +1793,19 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         }
     }
 
+    // Target = the term's own curved reconstruction (after straightening atom 0)
+    // ⇒ EV(curved) = 1 exactly, and each atom's leave-this-atom-out response
+    // residual `y_resp` equals its own mass-scaled contribution `a_k·γ_k`. The
+    // common-evidence selector (#1202) scores both candidates against that
+    // residual, so the target is required.
+    let target = term
+        .try_fitted_for_rho(&rho)
+        .expect("post-straighten curved reconstruction assembles");
+
     // Compute and install the real hybrid-split report (closed-form, no outer
     // fit — sidesteps #1051).
     let report = term
-        .compute_hybrid_split_report(&rho, None)
+        .compute_hybrid_split_report(&rho, Some(target.view()))
         .expect("hybrid split report computes")
         .expect("eligible d=1 atoms present a report");
     term.hybrid_split_report = Some(report);
@@ -1815,11 +1824,7 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         "a straight atom must collapse at least one slot to the linear tail"
     );
 
-    // Target = the term's own curved reconstruction (after straightening atom
-    // 0) ⇒ EV(curved) = 1 exactly.
-    let target = term
-        .try_fitted_for_rho(&rho)
-        .expect("post-straighten curved reconstruction assembles");
+    // EV(curved) = 1 exactly, since the target IS the curved reconstruction.
     let ev_curved = reconstruction_explained_variance(target.view(), target.view())
         .expect("self-reconstruction EV defined");
     assert!(

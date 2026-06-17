@@ -1988,13 +1988,18 @@ impl SaeManifoldTerm {
     /// eligible `d = 1` atom's fitted curved image against its straight (linear
     /// special-case) sub-model on the common rank-aware Laplace evidence scale.
     ///
-    /// Both candidates reconstruct the SAME fitted decoded image over the SAME
-    /// assigned rows; the linear candidate's deviance is the exact penalized-LS
-    /// residual of the best straight line through those points (the collapsed
-    /// linear lane — closed form, NOT the broken euclidean outer fit path of
-    /// #1051). Eligible atoms are `d = 1` atoms with an installed evaluator at
-    /// the full curvature dial (`homotopy_eta == 1.0`) whose live coordinate dim
-    /// still matches the atom's latent dim.
+    /// Both candidates are scored against the SAME data — the atom's
+    /// leave-this-atom-out response residual `y_resp = target − (full − a_k·γ_k)`
+    /// (#1202) — over its assigned rows: the curved candidate predicts its actual
+    /// mass-scaled contribution `a_k·γ_k`, the linear candidate the best
+    /// mass-weighted straight line fit to `y_resp` (the collapsed linear lane —
+    /// closed form, NOT the broken euclidean outer fit path of #1051). Linear is
+    /// the curved family's nested `Θ = 0` sub-model on common data, so the
+    /// per-slot evidence argmin is a genuine match-or-beat comparison. Eligible
+    /// atoms are `d = 1` atoms with an installed evaluator at the full curvature
+    /// dial (`homotopy_eta == 1.0`) whose live coordinate dim still matches the
+    /// atom's latent dim. Returns `None` when no reconstruction `target` is
+    /// supplied (there is no data to adjudicate against).
     pub fn compute_hybrid_split_report(
         &self,
         rho: &SaeManifoldRho,
@@ -2012,12 +2017,28 @@ impl SaeManifoldTerm {
         };
         let delta_ev_for =
             |atom_idx: usize| -> Option<f64> { loao_ev.get(atom_idx).copied().flatten() };
+        // The common-evidence comparison (#1202) scores both candidates against
+        // the response data the atom is responsible for. That requires a target;
+        // with none supplied there is nothing to adjudicate against, so no report.
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::compute_hybrid_split_report: target {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
         // Per-row assignment masses (once), so each atom's weighted straight-line
         // fit uses the same row weighting the joint reconstruction loss does.
         let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
         for row in 0..n {
             weights.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
         }
+        // The full assembled reconstruction `Σ_k a[i,k]·γ_k`, computed once. Each
+        // atom's leave-this-atom-out response residual is `y_resp = target −
+        // (full − a_k·γ_k)`, the data both that atom's candidates fit (#1202).
+        let full = self.try_fitted_for_rho(rho)?;
         let eligible: Vec<usize> = (0..self.k_atoms())
             .filter(|&atom_idx| {
                 let atom = &self.atoms[atom_idx];
@@ -2035,7 +2056,7 @@ impl SaeManifoldTerm {
                 .column(0)
                 .to_owned()
         };
-        let weights_for = |atom_idx: usize| -> Array1<f64> {
+        let assign_for = |atom_idx: usize| -> Array1<f64> {
             Array1::from_iter((0..n).map(|row| weights[row][atom_idx]))
         };
         let decoded_for = |atom_idx: usize| -> Array2<f64> {
@@ -2049,6 +2070,21 @@ impl SaeManifoldTerm {
             }
             decoded
         };
+        // The atom's leave-this-atom-out response residual `y_resp = target −
+        // (full − a_k·γ_k) = (target − full) + a_k·γ_k`. Both the curved and the
+        // linear candidate are scored against this on common data (#1202).
+        let target_resid_for = |atom_idx: usize| -> Array2<f64> {
+            let mut resid = Array2::<f64>::zeros((n, p));
+            let mut buf = vec![0.0_f64; p];
+            for row in 0..n {
+                let a_k = weights[row][atom_idx];
+                self.atoms[atom_idx].fill_decoded_row(row, &mut buf);
+                for col in 0..p {
+                    resid[[row, col]] = target[[row, col]] - full[[row, col]] + a_k * buf[col];
+                }
+            }
+            resid
+        };
         let manifold_for = |atom_idx: usize| -> crate::terms::latent::LatentManifold {
             self.assignment.coords[atom_idx].manifold().clone()
         };
@@ -2056,8 +2092,9 @@ impl SaeManifoldTerm {
             &self.atoms,
             eligible.into_iter(),
             coords_for,
-            weights_for,
+            assign_for,
             decoded_for,
+            target_resid_for,
             manifold_for,
             delta_ev_for,
         )

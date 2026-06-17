@@ -2695,36 +2695,39 @@ pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) ->
 // #1026 hybrid curved + linear-tail dictionary split-selection
 // ---------------------------------------------------------------------------
 //
-// HONESTY NOTE (#1202): this is a POST-HOC CURVE-SIMPLIFICATION selector, not a
-// common-data refit. The candidates do NOT both fit the original response — the
-// curved candidate is the atom's ALREADY-FITTED decoded image (residual 0 by
-// construction) and the linear candidate is the best weighted line through that
-// SAME fitted image. So the "match-or-beat" statements below are about the
-// per-slot argmin over {keep the fitted curve, replace it with its straight
-// approximation}, NOT a guarantee that this dictionary beats a SEPARATELY
-// re-fitted pure-linear dictionary on the data. There is no data-level nesting
-// guarantee here; see `crate::terms::sae::hybrid_split` for the honest framing.
+// COMMON-EVIDENCE NOTE (#1202): the candidates BOTH fit the same data — the
+// atom's leave-this-atom-out response residual `y_resp` (the response with every
+// other atom's contribution removed). The curved candidate predicts the atom's
+// actual mass-scaled contribution `a_k·γ_k`, the linear candidate the best
+// mass-weighted straight line fit to `y_resp`. Because the curved family's
+// `Θ = 0` member reproduces the linear prediction exactly, linear IS the nested
+// `Θ = 0` sub-model on common data, so the "match-or-beat" statements below are a
+// genuine data-level comparison: the curved candidate wins only when fitting the
+// response residual better than its own straight projection pays for its extra
+// parameters. See `crate::terms::sae::hybrid_split` for the residual assembly.
 //
 // The per-slot adjudication uses the SAME rank-aware Laplace evidence criterion
-// the union/mixture rungs use (`−V = NLE`, lower wins), comparing the cost of
-// keeping the curved image against the cost of the straight approximation.
+// the union/mixture rungs use (`−V = NLE`, lower wins), comparing the data-fit +
+// complexity cost of the curved contribution against that of the straight line.
 //
 // ## The turning floor (Θ → 0) and the curved ceiling (Θ large)
 //
-// Per slot, the curved candidate carries zero curve-residual (it reconstructs
-// its own image) but pays a larger free-parameter price `P_curved > P_linear`;
-// the linear candidate carries a positive curve-residual (the curvature a line
-// cannot express) but a smaller price, now charged with its genuine weighted
-// Gram logdet `p·(log w_sum + log s_tt)` (#1203). Hence:
+// Per slot, the curved candidate fits the response residual with its actual
+// mass-scaled contribution `a_k·γ_k` (data-fit `½·curved_rss`) and pays a larger
+// free-parameter price `P_curved > P_linear`; the linear candidate fits the same
+// residual with its best straight line (data-fit `½·linear_rss ≥ ½·curved_rss`
+// whenever the curve beats its own straight projection) at a smaller price,
+// charged with its genuine weighted Gram logdet `p·(log w_sum + log s_tt)`
+// (#1203). Hence:
 //
-//   * Θ → 0 (a straight fitted image): the line approximates the curve with
-//     ~zero residual at a lower price, so LINEAR wins — the turning floor. A
-//     curved parameterization "buys nothing" on an already-straight image.
-//   * Θ large (a genuinely turning fitted image): the line's residual exceeds
-//     the curved atom's extra parameter price, so CURVED wins. (Whether curved
-//     wins also depends on the coordinate spread `s_tt` and image amplitude, via
-//     the honest logdet — a tightly-spread, mildly-curved image can still prefer
-//     the cheaper line.)
+//   * Θ → 0 (the residual is straight): the curve and the line fit it equally, so
+//     the cheaper LINEAR candidate wins — the turning floor / nested dominance. A
+//     curved parameterization "buys nothing" on an already-straight residual.
+//   * Θ large (a genuinely turning residual): the line's data-fit residual
+//     exceeds the curved atom's extra parameter price, so CURVED wins. (Whether
+//     curved wins also depends on the coordinate spread `s_tt` and amplitude, via
+//     the honest logdet — a tightly-spread, mildly-curved residual can still
+//     prefer the cheaper line.)
 //
 // The crossover is governed by the documented shatter law: a linear SAE shatters
 // a feature of total turning Θ into `N(ε) ≈ Θ/(2√(2ε))` rank-1 directions at
@@ -2766,9 +2769,10 @@ impl HybridAtomParam {
 /// One fitted candidate parameterization for a single hybrid-dictionary atom
 /// slot, scored on the COMMON rank-aware Laplace scale (`−V = NLE`, lower wins,
 /// identical to the union/mixture rungs). The curved and linear candidates for
-/// the SAME slot are fit on the same rows, so their NLEs are directly
-/// comparable; the only structural difference is the curved candidate's larger
-/// free-parameter price.
+/// the SAME slot are fit on the same rows AND the same data (the atom's response
+/// residual, #1202), so their NLEs are directly comparable; the structural
+/// difference is the curved candidate's larger free-parameter price and whatever
+/// data-fit it buys with its curvature.
 #[derive(Debug, Clone, Copy)]
 pub struct HybridAtomCandidate {
     pub param: HybridAtomParam,
@@ -2853,13 +2857,13 @@ pub const HYBRID_LINEAR_TURNING_FLOOR: f64 = 1e-9;
 ///  2. **Evidence comparison.** Otherwise select the candidate with the smaller
 ///     `NLE`. The curved candidate wins only when its extra curvature lowers the
 ///     NLE by MORE than its extra parameter price — the `Θ/√ε` crossover, decided
-///     here by the evidence numbers themselves, not by fiat. NOTE: this is a
-///     post-hoc curve-simplification comparison (the candidates approximate the
-///     already-fitted curved image, see `crate::terms::sae::hybrid_split`), NOT a
-///     common-data refit in which linear is the curved family's nested `Θ = 0`
-///     sub-model — there is no "linear can never beat curved on common data"
-///     guarantee here (#1202), and indeed a tightly-spread, mildly-curved image
-///     can prefer the cheaper line.
+///     here by the evidence numbers themselves, not by fiat. This is a
+///     common-data comparison (both candidates fit the atom's response residual,
+///     see `crate::terms::sae::hybrid_split`) in which linear is the curved
+///     family's nested `Θ = 0` sub-model (#1202): the curved candidate cannot be
+///     charged its extra parameters to fit the residual no better than its own
+///     straight projection, and a tightly-spread, mildly-curved residual can
+///     still prefer the cheaper line.
 ///  3. **Tie-break.** Exact NLE ties go to the cheaper (fewer-parameter)
 ///     candidate — i.e. linear — preserving the strict-generalization guarantee
 ///     that the hybrid never pays for curvature it does not need.
@@ -2920,12 +2924,12 @@ pub struct HybridSplitSelection {
     pub atoms: Vec<HybridAtomChoice>,
     /// `Σ NLE` across the selected per-atom parameterizations — the dictionary's
     /// summed rank-aware Laplace negative-log-evidence (lower wins). Because each
-    /// slot picks the argmin over {curved image, its straight approximation}, this
-    /// is ≤ the sum of the per-slot LINEAR-candidate NLEs. NOTE (#1202): that
-    /// "linear baseline" is the straight approximation of each ALREADY-FITTED
-    /// curved image, NOT a separately re-fitted pure-linear dictionary on the
-    /// response — so this is a post-hoc curve-simplification dominance, not a
-    /// data-level match-or-beat guarantee.
+    /// slot picks the argmin over {curved contribution, best straight line to the
+    /// response residual}, this is ≤ the sum of the per-slot LINEAR-candidate
+    /// NLEs. The linear baseline is the best straight line fit to each atom's
+    /// leave-this-atom-out RESPONSE residual (#1202), the curved family's nested
+    /// `Θ = 0` member on common data — so this is a genuine data-level
+    /// match-or-beat dominance, not a post-hoc curve-simplification one.
     pub total_negative_log_evidence: f64,
     /// `Σ P` across the selected parameterizations — the dictionary's total
     /// free-parameter price (the matched-active-budget accounting).
@@ -2959,9 +2963,10 @@ impl HybridSplitSelection {
 ///
 /// The result reduces EXACTLY to pure-linear when every slot's curved candidate
 /// has `Θ → 0` (the turning floor fires everywhere) and to pure-curved when
-/// every slot's curved candidate wins the evidence comparison. (Post-hoc
-/// curve-simplification criterion, #1202 — see the module header above and
-/// `crate::terms::sae::hybrid_split`; not a data-level pure-linear dominance.)
+/// every slot's curved candidate wins the evidence comparison. (Common-data
+/// criterion, #1202 — both candidates fit the atom's response residual, with
+/// linear nested as the curved family's `Θ = 0` sub-model; see the module header
+/// above and `crate::terms::sae::hybrid_split`.)
 ///
 /// Returns an error only if some slot has no candidates to adjudicate (an empty
 /// dictionary slot is a caller bug, not a silent skip).
@@ -3709,11 +3714,11 @@ mod tests {
         // the curved fit captures the loop), slots 3..7 are LINEAR DIRECTIONS
         // (straight, Θ = 0). The evidence split must select curved for the
         // circles and linear for the directions — and the hybrid's summed
-        // evidence must be ≤ the summed per-slot LINEAR-candidate NLE (the
-        // straight approximation of each already-fitted image). This is a
-        // post-hoc curve-simplification dominance (#1202: NOT a data-level
-        // match-or-beat over a separately re-fitted pure-linear dictionary), and
-        // holds simply because each slot picks the argmin of its two candidates.
+        // evidence must be ≤ the summed per-slot LINEAR-candidate NLE (each
+        // slot's best straight line fit to its response residual). This is a
+        // data-level match-or-beat dominance (#1202: linear is the curved
+        // family's nested Θ = 0 sub-model on common data), and holds because each
+        // slot picks the argmin of its two common-data candidates.
         let mut slots: Vec<Vec<HybridAtomCandidate>> = Vec::new();
         let mut pure_linear_baseline = 0.0_f64;
         // Three circle features: a curved atom replaces ~10-30 linear secants, so
@@ -3760,10 +3765,10 @@ mod tests {
         assert_eq!(split.linear_atom_count(), 4);
 
         // The hybrid's summed negative-log-evidence is ≤ the summed per-slot
-        // LINEAR-candidate NLE (each slot's straight approximation of its fitted
-        // image): the per-slot argmin can only lower the sum. This is a post-hoc
-        // curve-simplification dominance (#1202), NOT a data-level guarantee over
-        // a separately re-fitted pure-linear dictionary.
+        // LINEAR-candidate NLE (each slot's best straight line fit to its response
+        // residual): the per-slot argmin can only lower the sum. This is a
+        // data-level match-or-beat dominance (#1202): linear is the curved
+        // family's nested Θ = 0 sub-model on common data.
         assert!(
             split.total_negative_log_evidence <= pure_linear_baseline + 1e-9,
             "hybrid NLE {} must be <= summed linear-candidate NLE {}",

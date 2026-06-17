@@ -11,31 +11,44 @@
 //! two already-realized candidates and adjudicating them by the common
 //! evidence criterion.
 //!
-//! ## What this is — and is NOT (the honest criterion, #1202)
+//! ## The common-evidence comparison on the data (#1202)
 //!
-//! This selector is a **post-hoc curve-simplification diagnostic**, NOT a
-//! common-evidence refit of curved-vs-linear dictionaries on the original
-//! response matrix. It does not (and cannot, while the euclidean / multi-atom
-//! OUTER fit path is broken under #1051 — singular joint Hessian at the
-//! continuation spine) re-fit a separate pure-linear dictionary to the original
-//! residuals and compare it against the curved fit.
+//! Both candidates are scored against the SAME data: the portion of the
+//! response matrix the atom is responsible for reconstructing, namely its
+//! **leave-this-atom-out residual**
 //!
-//! Instead, both candidates target the atom's **already-fitted decoded image**
-//! `γ_k(t) = Φ(t) B_k` over its assigned rows:
-//!   * the CURVED candidate reconstructs its own image with zero curve-residual
-//!     by construction (its NLE is purely a parameter/Laplace price), and
-//!   * the LINEAR candidate is the best weighted straight line `γ̃_k(t) = b₀ +
-//!     (t − t̄)·b₁` through those SAME decoded points (exact weighted least
-//!     squares), whose residual measures how much curvature a line cannot
-//!     express.
+//!     y_resp[i] = target[i] − ( Σ_j a[i,j]·γ_j(t_{ij}) − a[i,k]·γ_k(t_{ik}) )
+//!               = target[i] − without_k[i],
 //!
-//! So the question answered is honestly: *can a straight line approximate the
-//! already-fitted curved image cheaply enough to be preferred?* It is NOT a
-//! "match-or-beat the separately-fitted pure-linear dictionary on the response"
-//! guarantee — the curved family does NOT nest linear as a Θ=0 sub-model fitted
-//! on common data here, because the comparison is against the curved image, not
-//! the data. That false dominance claim is removed; the criterion is the honest
-//! post-hoc simplification one.
+//! the response with every OTHER atom's contribution subtracted. Over the rows
+//! assigned to atom `k` (assignment mass `a[i,k] = a_k`), the two candidates
+//! predict that residual:
+//!
+//!   * the CURVED candidate predicts `a_k · γ_k(t)` — the atom's actual
+//!     already-fitted contribution; its data-fit deviance is the weighted RSS of
+//!     that contribution against `y_resp`, no longer zero by construction.
+//!   * the LINEAR candidate predicts `a_k · (b₀ + (t − t̄)·b₁)`, the best
+//!     weighted least-squares straight line fit to `y_resp` (design column
+//!     scaled by the same assignment mass `a_k`), so its data-fit deviance is the
+//!     weighted RSS of the best line against the SAME residual.
+//!
+//! Because the curved family's `Θ = 0` member reproduces exactly the linear
+//! prediction `a_k·(b₀ + (t − t̄)·b₁)` on this data, linear IS the nested `Θ = 0`
+//! sub-model of the curved family on common data — so the per-slot evidence
+//! argmin is a genuine "match-or-beat" comparison: the curved candidate is
+//! preferred only when its extra curvature lowers the data-fit deviance by more
+//! than its extra Laplace parameter price, and the linear special case wins
+//! whenever a straight line already explains the residual.
+//!
+//! This replaces the earlier post-hoc curve-simplification diagnostic, in which
+//! both candidates targeted the atom's already-fitted decoded image `γ_k(t)`
+//! (giving the curved arm a free zero residual against itself) rather than the
+//! response data. That version could not nest linear in curved on common data
+//! and so carried no real dominance guarantee (#1202); it is removed. The
+//! comparison here re-fits nothing in the (broken under #1051) euclidean /
+//! multi-atom outer continuation — it scores the already-realized curved
+//! contribution and the closed-form linear lane against the realized residual,
+//! both on the data, with no joint Hessian or continuation spine.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -58,11 +71,13 @@ fn reduced_laplace_nle(residual_objective: f64, log_det_h: f64) -> f64 {
 }
 
 /// The fitted straight sub-model `γ̃(t) = b₀ + (t − t̄)·b₁` of one `d = 1` atom:
-/// the exact weighted least-squares line through the atom's OWN decoded image
-/// over its assigned rows. Carried on a verdict that selects LINEAR so the
-/// collapsed reconstruction can replace the curved decoded row with this straight
-/// image at any coordinate WITHOUT re-entering the (broken, #1051) outer fit —
-/// the coefficients are already realized inside the adjudication.
+/// the exact assignment-mass-weighted least-squares line fit to the atom's
+/// leave-this-atom-out RESPONSE residual `y_resp` over its assigned rows (the
+/// curved family's nested `Θ = 0` sub-model on common data, #1202). Carried on a
+/// verdict that selects LINEAR so the collapsed reconstruction can replace the
+/// curved decoded row with this straight image at any coordinate WITHOUT
+/// re-entering the (broken, #1051) outer fit — the coefficients are already
+/// realized inside the adjudication.
 #[derive(Clone, Debug)]
 pub struct AtomLinearImage {
     /// The atom's slot index in the dictionary (so the collapsed assembly knows
@@ -138,21 +153,35 @@ pub struct SaeHybridSplitReport {
 const MIN_ROWS_FOR_LINEAR_FIT: usize = 3;
 
 /// Build the curved + linear candidates for ONE fitted `d = 1` atom and return
-/// them as `(linear, curved)`, or `None` if the atom cannot present an honest
-/// pair (too few rows, degenerate coordinate span, or no analytic turning).
+/// them as `(linear, curved, (t̄, b₀, b₁))`, or `None` if the atom cannot present
+/// an honest pair (too few rows, degenerate coordinate span, or non-finite
+/// numbers). Both candidates are scored against the SAME data — the atom's
+/// leave-this-atom-out response residual `y_resp` — so the comparison is a
+/// genuine common-evidence one with linear nested as the curved family's `Θ = 0`
+/// sub-model (#1202).
 ///
-/// `weighted_rows` are the `(coord, weight, decoded)` triples for the rows
-/// assigned to this atom: `coord` is the fitted on-atom coordinate `t`, `weight`
-/// the assignment mass `a_k`, and `decoded` the fitted decoded image
-/// `γ_k(t) = Φ(t) B_k` (length `p`). The curved candidate's deviance is the
-/// atom's OWN reconstruction (zero residual against itself is not the point —
-/// the curved deviance is its penalized smoothness-evidence price, captured by
-/// its parameter count and Laplace logdet); the linear candidate's deviance is
-/// the residual of the best straight line through the SAME decoded points.
+/// Inputs over the atom's assigned rows:
+///   * `coords` — the fitted on-atom coordinate `t`.
+///   * `assign` — the per-row assignment mass `a_k` (NOT squared; this routine
+///     squares it where the design weight `a_k²` is needed).
+///   * `decoded` — the atom's fitted decoded image `γ_k(t) = Φ(t) B_k` (`p` cols),
+///     whose mass-scaled value `a_k·γ_k` is the curved candidate's PREDICTION.
+///   * `target_resid` — the atom's leave-this-atom-out response residual `y_resp`
+///     (`p` cols): the response with every OTHER atom's contribution removed.
+///     This is the data both candidates fit.
+///
+/// The curved candidate's data-fit deviance is `½ Σ ‖y_resp − a_k·γ_k‖²` (the
+/// plain reconstruction SSE, matching the joint loss — the mass already lives in
+/// the prediction `a_k·γ_k`); the linear candidate fits the best mass-weighted
+/// straight line to `y_resp` and pays `½ Σ ‖y_resp − a_k·(b₀ + (t − t̄)·b₁)‖²`.
+/// Because the curved family's `Θ = 0` member reproduces the linear prediction
+/// exactly, linear is the nested sub-model and the argmin is the honest
+/// match-or-beat criterion.
 fn build_atom_candidates(
     coords: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
+    assign: ArrayView1<'_, f64>,
     decoded: ArrayView2<'_, f64>,
+    target_resid: ArrayView2<'_, f64>,
     curved_num_params: usize,
     fitted_turning: Option<f64>,
 ) -> Option<(
@@ -162,21 +191,29 @@ fn build_atom_candidates(
 )> {
     let n = coords.len();
     let p = decoded.ncols();
-    if n < MIN_ROWS_FOR_LINEAR_FIT || decoded.nrows() != n || weights.len() != n || p == 0 {
+    if n < MIN_ROWS_FOR_LINEAR_FIT
+        || decoded.nrows() != n
+        || assign.len() != n
+        || target_resid.nrows() != n
+        || target_resid.ncols() != p
+        || p == 0
+    {
         return None;
     }
 
-    // Weighted means for the centered (mass-weighted) straight-line normal
-    // equations `γ̃(t) = b₀ + (t − t̄)·b₁`. The weighting is the assignment mass
-    // `a_k`, so rows that barely belong to the atom contribute proportionally —
-    // the same row weighting the joint reconstruction loss uses.
+    // The LINEAR candidate fits `a_k·(b₀ + (t − t̄)·b₁)` to the residual `y_resp`,
+    // so the natural design column is `a_k·[1, (t − t̄)]` and the per-row Gram
+    // weight is `wᵢ = a_k²`. We accumulate the mass-weighted coordinate mean `t̄`
+    // and spread `s_tt` under that weight; a row that barely belongs to the atom
+    // (`a_k ≈ 0`) contributes ≈ nothing, exactly as in the joint loss.
     let mut w_sum = 0.0_f64;
     let mut t_bar = 0.0_f64;
     for i in 0..n {
-        let w = weights[i];
-        if !(w.is_finite() && w >= 0.0) {
+        let a = assign[i];
+        if !(a.is_finite() && a >= 0.0) {
             return None;
         }
+        let w = a * a;
         w_sum += w;
         t_bar += w * coords[i];
     }
@@ -185,63 +222,68 @@ fn build_atom_candidates(
     }
     t_bar /= w_sum;
 
-    // Weighted Σ w·(t − t̄)² — the coordinate spread. A degenerate (single-point
-    // mass) coordinate has no slope direction; refuse rather than divide by ~0.
+    // Weighted Σ wᵢ·(t − t̄)² with `wᵢ = a_k²` — the coordinate spread under the
+    // line's design weight. A degenerate (single-point mass) coordinate has no
+    // slope direction; refuse rather than divide by ~0.
     let mut s_tt = 0.0_f64;
     for i in 0..n {
         let dt = coords[i] - t_bar;
-        s_tt += weights[i] * dt * dt;
+        s_tt += assign[i] * assign[i] * dt * dt;
     }
     if !(s_tt > 1e-12 * (1.0 + t_bar * t_bar)) {
         return None;
     }
 
-    // Per-output-channel weighted least squares slope/intercept, accumulating
-    // the residual sum of squares of the straight-line fit to the curved atom's
-    // OWN decoded image. This is the linear special case's data-fit deviance:
-    // how much of the fitted curve a straight line fails to capture.
+    // Per-output-channel mass-weighted least squares for the line fit to the
+    // RESIDUAL `y_resp`. Minimizing `Σᵢ ‖y_resp[i] − a_k·(b₀ + (t − t̄)·b₁)‖²` in
+    // the centered basis has the diagonal normal equations
+    //   b₀[j] = (Σ a_k·y_resp[i,j]) / w_sum,   (recall the design intercept is a_k)
+    //   b₁[j] = (Σ a_k·(t − t̄)·y_resp[i,j]) / s_tt.
     let mut b0 = Array1::<f64>::zeros(p);
     let mut b1 = Array1::<f64>::zeros(p);
     for j in 0..p {
-        let mut s_tg = 0.0_f64;
-        let mut g_bar = 0.0_f64;
+        let mut s_1y = 0.0_f64;
+        let mut s_ty = 0.0_f64;
         for i in 0..n {
-            let w = weights[i];
-            g_bar += w * decoded[[i, j]];
-        }
-        g_bar /= w_sum;
-        for i in 0..n {
+            let a = assign[i];
             let dt = coords[i] - t_bar;
-            s_tg += weights[i] * dt * (decoded[[i, j]] - g_bar);
+            let y = target_resid[[i, j]];
+            s_1y += a * y;
+            s_ty += a * dt * y;
         }
-        let slope = s_tg / s_tt;
-        b1[j] = slope;
-        b0[j] = g_bar;
+        b0[j] = s_1y / w_sum;
+        b1[j] = s_ty / s_tt;
     }
 
-    // Weighted residual sum of squares of the linear sub-model against the
-    // fitted curve. This is exactly the curvature the straight line cannot
-    // express — zero for a genuinely straight image, growing with turning.
+    // Data-fit residual sums of squares of BOTH candidates against `y_resp`, the
+    // common data. The curved candidate predicts the atom's actual mass-scaled
+    // contribution `a_k·γ_k`; the linear candidate predicts the best line
+    // `a_k·(b₀ + (t − t̄)·b₁)`. These are no longer trivially zero for the curved
+    // arm — both are real misfits to the response residual, so the argmin is a
+    // genuine common-evidence comparison (#1202).
+    let mut curved_rss = 0.0_f64;
     let mut linear_rss = 0.0_f64;
     for i in 0..n {
+        let a = assign[i];
         let dt = coords[i] - t_bar;
         for j in 0..p {
-            let pred = b0[j] + dt * b1[j];
-            let r = decoded[[i, j]] - pred;
-            linear_rss += weights[i] * r * r;
+            let y = target_resid[[i, j]];
+            let r_curved = y - a * decoded[[i, j]];
+            curved_rss += r_curved * r_curved;
+            let r_linear = y - a * (b0[j] + dt * b1[j]);
+            linear_rss += r_linear * r_linear;
         }
     }
 
-    // Gaussian-reconstruction deviance: the (weighted) residual objective `½ RSS`
-    // the Laplace normalizer is added to. The curved atom reconstructs its own
-    // image with zero curve-residual by construction, so its data-fit term is 0
-    // — its NLE is purely the parameter-price/Laplace cost of its `M·p` decoder
-    // coefficients. The linear candidate pays `½·linear_rss` of data-fit but only
-    // a `2·p`-parameter price. The argmin between the two is the `Θ/√ε`
-    // crossover: a high-turning atom's `linear_rss` exceeds the curved atom's
-    // extra Laplace price, so curved wins; a straight atom's `linear_rss ≈ 0`
-    // lets the cheaper linear special case win (the dominance floor).
-    let curved_residual_objective = 0.0_f64;
+    // Gaussian-reconstruction deviance: the residual objective `½ RSS` the
+    // Laplace normalizer is added to. The curved arm pays `½·curved_rss` (how
+    // well its fitted curve explains the residual) plus its larger `M·p`
+    // parameter price; the linear arm pays `½·linear_rss` plus a `2·p` price.
+    // Because the curved family's `Θ = 0` member equals the linear prediction,
+    // `curved_rss ≤ linear_rss` whenever the fitted curve is at least as good a
+    // residual fit as its own straight projection — the match-or-beat floor — and
+    // the argmin trades that data-fit gain against the curvature parameter price.
+    let curved_residual_objective = 0.5 * curved_rss;
     let linear_residual_objective = 0.5 * linear_rss;
 
     // Linear candidate parameter price: intercept + slope per output channel.
@@ -249,42 +291,34 @@ fn build_atom_candidates(
 
     // Laplace logdet of the (weighted) design Gram for the LINEAR candidate.
     //
-    // For the centered weighted line fit `γ̃(t) = b₀ + (t − t̄)·b₁`, the per-output-
-    // channel design is `[1, (t − t̄)]`, whose weighted Gram is DIAGONAL in the
-    // centered basis: `diag(Σ wᵢ, Σ wᵢ(tᵢ − t̄)²) = diag(w_sum, s_tt)`. Its log
-    // determinant is therefore `log(w_sum) + log(s_tt)` PER output channel, i.e.
+    // For the centered weighted line fit `a_k·(b₀ + (t − t̄)·b₁)`, the per-output-
+    // channel design column is `a_k·[1, (t − t̄)]`, whose Gram is DIAGONAL in the
+    // centered basis: `diag(Σ a_k², Σ a_k²(t − t̄)²) = diag(w_sum, s_tt)`. Its log
+    // determinant is `log(w_sum) + log(s_tt)` PER output channel, i.e.
     //
     //     log|H_linear| = p · ( log(w_sum) + log(s_tt) ).
     //
-    // The earlier `linear_num_params · log(w_sum) = 2p · log(w_sum)` form DROPPED
-    // the weighted coordinate-spread term `log(s_tt)` (#1203) — it was a pure
-    // parameter-count penalty, not the weighted-design Laplace determinant. The
-    // dropped term is exactly the slope direction's curvature: a line through a
-    // wide coordinate spread is better-determined (larger `s_tt`) than one through
-    // a tiny spread, and the Laplace evidence must reflect that. We restore it.
+    // The `log(s_tt)` term is the slope direction's information: a line through a
+    // wide, heavily-massed coordinate spread is better-determined than one through
+    // a tiny spread, and the Laplace evidence must reflect that (#1203).
     //
-    // NOTE on the curved arm: the curved candidate's genuine Laplace determinant
-    // over its `M·p` decoder coefficients is NOT assembled here (it would require
-    // the atom's penalized smoothing Hessian, which the post-fit path does not
-    // carry). We price it with the parameter-count proxy `curved_num_params ·
-    // log(w_sum)`. This asymmetry is honest and documented: this selector is a
-    // POST-HOC CURVE-SIMPLIFICATION diagnostic (does a straight line approximate
-    // the already-fitted curved image cheaply enough?), NOT a common-evidence
-    // refit of curved-vs-linear on the original response (#1202). The linear arm
-    // now carries its real weighted Gram logdet; the curved arm carries a
-    // parameter-count proxy because its true determinant is unavailable post-fit.
+    // The curved arm's genuine Laplace determinant over its `M·p` decoder
+    // coefficients is not assembled in this post-fit path (it would need the
+    // atom's penalized smoothing Hessian); we price its complexity with the
+    // parameter-count proxy `curved_num_params · log(w_sum)`. The data-fit terms,
+    // which carry the actual evidence comparison, are now BOTH measured on the
+    // common response residual — the asymmetry is confined to the complexity
+    // (logdet) price, not the likelihood.
     if !(w_sum > 0.0 && w_sum.is_finite() && s_tt.is_finite()) {
         return None;
     }
     let linear_log_det_h = (p as f64) * (w_sum.ln() + s_tt.ln());
     let curved_log_det_h = (curved_num_params as f64) * w_sum.ln();
 
-    // The linear arm carries its real weighted Gram logdet; the curved arm a
-    // parameter-count proxy (its penalized smoothing Hessian is not assembled in
-    // this post-fit path). Both omit an explicit smoothing-penalty logdet (the
-    // intrinsic smoothness penalty is reparameterization-invariant and identical
-    // in expectation across the two parameterizations of the same image), so the
-    // reduced Laplace NLE is `residual_objective + ½ log|H|`.
+    // Reduced Laplace NLE `residual_objective + ½ log|H|`. Both omit an explicit
+    // smoothing-penalty logdet (the intrinsic smoothness penalty is
+    // reparameterization-invariant and identical in expectation across the two
+    // parameterizations of the same image).
     let linear_nle = reduced_laplace_nle(linear_residual_objective, linear_log_det_h);
     let curved_nle = reduced_laplace_nle(curved_residual_objective, curved_log_det_h);
     if !(linear_nle.is_finite() && curved_nle.is_finite()) {
@@ -300,19 +334,23 @@ fn build_atom_candidates(
 /// fitted `d = 1` atoms, run the adjudication, and return the report.
 ///
 /// `atoms` are the fitted dictionary atoms; `coords_for` yields the on-atom
-/// coordinate column for a slot, `weights_for` the per-row assignment mass, and
-/// `decoded_for` the fitted decoded image rows for the atom's assigned rows.
-/// `manifold_for` yields the atom's chart manifold (a flat / Euclidean chart can
-/// present only the linear candidate, enforced inside the selector).
+/// coordinate column for a slot, `assign_for` the per-row assignment mass `a_k`,
+/// `decoded_for` the fitted decoded image rows `γ_k`, and `target_resid_for` the
+/// atom's leave-this-atom-out response residual `y_resp` (the data both
+/// candidates are scored against, #1202). `manifold_for` yields the atom's chart
+/// manifold (a flat / Euclidean chart can present only the linear candidate,
+/// enforced inside the selector).
 ///
 /// Returns `None` (no report) when no atom is eligible — there is nothing to
 /// adjudicate.
-pub fn build_hybrid_split_report<'a, C, W, D, M, E>(
+#[allow(clippy::too_many_arguments)]
+pub fn build_hybrid_split_report<'a, C, W, D, R, M, E>(
     atoms: &'a [SaeManifoldAtom],
     eligible_d1: impl Iterator<Item = usize>,
     mut coords_for: C,
-    mut weights_for: W,
+    mut assign_for: W,
     mut decoded_for: D,
+    mut target_resid_for: R,
     mut manifold_for: M,
     mut delta_ev_for: E,
 ) -> Result<Option<SaeHybridSplitReport>, String>
@@ -320,6 +358,7 @@ where
     C: FnMut(usize) -> Array1<f64>,
     W: FnMut(usize) -> Array1<f64>,
     D: FnMut(usize) -> Array2<f64>,
+    R: FnMut(usize) -> Array2<f64>,
     M: FnMut(usize) -> LatentManifold,
     // The atom's held-out LOAO `ΔEV_k`, keyed by atom index. `None` when LOAO EV
     // is unavailable (e.g. the caller has no target to measure against).
@@ -340,8 +379,9 @@ where
     for atom_idx in eligible_d1 {
         let atom = &atoms[atom_idx];
         let coords = coords_for(atom_idx);
-        let weights = weights_for(atom_idx);
+        let assign = assign_for(atom_idx);
         let decoded = decoded_for(atom_idx);
+        let target_resid = target_resid_for(atom_idx);
         // Curved parameter price = the decoder's `M · p` coefficients.
         let curved_num_params = atom.decoder_coefficients.len();
         let fitted_turning = atom.basis_evaluator.as_ref().and_then(|evaluator| {
@@ -355,8 +395,9 @@ where
         });
         let Some((linear, curved, (t_bar, b0, b1))) = build_atom_candidates(
             coords.view(),
-            weights.view(),
+            assign.view(),
             decoded.view(),
+            target_resid.view(),
             curved_num_params,
             fitted_turning,
         ) else {
@@ -426,75 +467,93 @@ mod tests {
     use super::*;
     use std::f64::consts::PI;
 
-    /// A straight image (zero turning) presents a linear candidate that fits it
-    /// with zero residual, and the dominance floor selects linear.
+    /// A straight RESPONSE residual (the atom's data is a line) is explained
+    /// equally well by both candidates, so the cheaper linear special case wins.
+    /// With `a_k = 1` the curved decoded image is straight too (Θ = 0), so both
+    /// the dominance floor and the evidence argmin select linear. This is the
+    /// common-data nested comparison (#1202): linear is the curved family's
+    /// `Θ = 0` member, so it cannot lose when a line already explains the data.
     #[test]
-    fn straight_image_selects_linear_via_dominance_floor() {
-        // γ(t) = t·b — a straight line in ℝ².
+    fn straight_residual_selects_linear() {
         let n = 40;
         let coords = Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
-        let weights = Array1::<f64>::ones(n);
+        let assign = Array1::<f64>::ones(n);
+        // The data the atom must explain is a straight line in ℝ²; the curved
+        // decoded image equals that same line (a Θ = 0 curved fit).
+        let mut data = Array2::<f64>::zeros((n, 2));
         let mut decoded = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
+            data[[i, 0]] = coords[i];
+            data[[i, 1]] = 0.6 * coords[i];
             decoded[[i, 0]] = coords[i];
             decoded[[i, 1]] = 0.6 * coords[i];
         }
         let (linear, curved, _) = build_atom_candidates(
             coords.view(),
-            weights.view(),
+            assign.view(),
             decoded.view(),
+            data.view(),
             // a generous curved parameter price (M·p)
             10,
             Some(0.0),
         )
-        .expect("straight image yields a candidate pair");
+        .expect("straight residual yields a candidate pair");
         let choice =
             crate::solver::evidence::select_hybrid_atom(&[linear, curved]).expect("non-empty slot");
         assert!(
             choice.param.is_linear(),
-            "a straight image must keep the linear special case (Θ = 0 dominance floor)"
+            "a straight response residual must keep the linear special case"
         );
     }
 
-    /// A turning image (full circle) has large linear residual; the curved
-    /// candidate wins on evidence once its turning exceeds the floor.
+    /// A turning RESPONSE residual (the atom's data traces a full circle) is fit
+    /// well by the curved decoded image (curved_rss ≈ 0) but poorly by any
+    /// straight line (large linear_rss), so the curved candidate wins the common
+    /// evidence comparison once its data-fit gain exceeds its extra parameter
+    /// price (#1202).
     #[test]
-    fn turning_image_selects_curved_on_evidence() {
-        // γ(t) = (cos θ, sin θ) over a FULL circle (θ ∈ [0, 2π]): strong
-        // curvature, so the best straight-line residual is large. (A half circle
-        // over a unit coordinate span is borderline — under the CORRECT weighted
-        // Gram logdet `p·(log w_sum + log s_tt)`, whose s_tt < 1 term LOWERS the
-        // line's evidence price, the cheaper line actually wins the half circle.
-        // The earlier test only saw curved win because the buggy `2p·log(w_sum)`
-        // logdet inflated the line's cost (#1203). A full circle has residual
-        // large enough that curved wins under the honest determinant.)
+    fn turning_residual_selects_curved_on_evidence() {
         let n = 60;
         let coords = Array1::from_iter((0..n).map(|i| (i as f64) / ((n - 1) as f64)));
-        let weights = Array1::<f64>::ones(n);
+        let assign = Array1::<f64>::ones(n);
+        // The data is a full circle; the curved decoded image is that same
+        // circle (the curved atom reconstructs its assigned residual), so the
+        // curved candidate has ≈ zero data-fit residual while a straight line
+        // cannot follow the loop.
+        let mut data = Array2::<f64>::zeros((n, 2));
         let mut decoded = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
             let theta = 2.0 * PI * coords[i];
+            data[[i, 0]] = theta.cos();
+            data[[i, 1]] = theta.sin();
             decoded[[i, 0]] = theta.cos();
             decoded[[i, 1]] = theta.sin();
         }
         // The curved atom has 5 parameters (just above the 4 = 2·p linear budget);
-        // the full-circle linear residual exceeds the extra-parameter overhead even
-        // with the honest (smaller) linear logdet, so curved wins on evidence.
-        let (linear, curved, _) =
-            build_atom_candidates(coords.view(), weights.view(), decoded.view(), 5, Some(2.0 * PI))
-                .expect("turning image yields a candidate pair");
-        // Linear candidate must have a strictly positive data-fit residual: a
-        // straight line cannot reconstruct a full circle.
+        // the full-circle linear residual exceeds the extra-parameter overhead, so
+        // curved wins on evidence.
+        let (linear, curved, _) = build_atom_candidates(
+            coords.view(),
+            assign.view(),
+            decoded.view(),
+            data.view(),
+            5,
+            Some(2.0 * PI),
+        )
+        .expect("turning residual yields a candidate pair");
         assert!(
-            linear.negative_log_evidence.is_finite(),
-            "linear candidate must carry a real deviance"
+            linear.negative_log_evidence > curved.negative_log_evidence,
+            "the line must misfit the circular residual worse than the curve does \
+             (linear NLE {} should exceed curved NLE {})",
+            linear.negative_log_evidence,
+            curved.negative_log_evidence
         );
         let choice =
             crate::solver::evidence::select_hybrid_atom(&[linear, curved]).expect("non-empty slot");
         assert_eq!(
             choice.param,
             crate::solver::evidence::HybridAtomParam::Curved { latent_dim: 1 },
-            "a full-circle image must keep the curved parameterization (5 params, large linear RSS)"
+            "a full-circle response residual must keep the curved parameterization"
         );
         assert!(
             choice.curved_evidence_margin > 0.0,
@@ -502,40 +561,94 @@ mod tests {
         );
     }
 
+    /// The nested-dominance floor on common data (#1202): when the curved decoded
+    /// image is a WORSE fit to the response residual than its own best straight
+    /// projection, linear must win — the curved family cannot be charged extra
+    /// parameters to fit the residual no better than its `Θ = 0` member. Here the
+    /// data is a line but the curved image bends away from it, so curved_rss >
+    /// linear_rss and the cheaper, better-fitting line is selected.
+    #[test]
+    fn linear_beats_curved_when_curve_misfits_residual() {
+        let n = 50;
+        let coords = Array1::from_iter((0..n).map(|i| (i as f64) / ((n - 1) as f64)));
+        let assign = Array1::<f64>::ones(n);
+        // Data is a straight line; the curved decoded image is a parabola that
+        // departs from it, so a straight line fits the data strictly better.
+        let mut data = Array2::<f64>::zeros((n, 2));
+        let mut decoded = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = coords[i];
+            data[[i, 0]] = t;
+            data[[i, 1]] = 0.5 * t;
+            decoded[[i, 0]] = t;
+            decoded[[i, 1]] = t * t; // bends away from the linear data
+        }
+        let (linear, curved, _) = build_atom_candidates(
+            coords.view(),
+            assign.view(),
+            decoded.view(),
+            data.view(),
+            // a real curved Θ above the floor so the dominance floor does not fire
+            6,
+            Some(1.0),
+        )
+        .expect("candidate pair");
+        let choice =
+            crate::solver::evidence::select_hybrid_atom(&[linear, curved]).expect("non-empty slot");
+        assert!(
+            choice.param.is_linear(),
+            "a curved image that fits the data worse than its own line must yield \
+             to the linear special case on common-data evidence (#1202)"
+        );
+    }
+
     /// The LINEAR candidate's Laplace logdet is the genuine weighted-design Gram
-    /// determinant `p·(log w_sum + log s_tt)` — it INCLUDES the weighted
-    /// coordinate-spread term `log(s_tt)` (#1203). Verify both contributions are
-    /// present: doubling the coordinate spread (at fixed weights) must raise the
-    /// linear logdet by exactly `p·log(4)` (s_tt scales as the square of the
-    /// coordinate range), and doubling all weights must raise it by `2p·log(2)`
-    /// (both Gram diagonals scale linearly in weight). The old code used
-    /// `2p·log(w_sum)` and DROPPED the spread term entirely, so the spread
-    /// sensitivity below would have been zero — that is the dropped-determinant
-    /// bug this guards against.
+    /// determinant `p·(log w_sum + log s_tt)` with `w_sum = Σ a_k²`, `s_tt =
+    /// Σ a_k²(t − t̄)²` — it INCLUDES the coordinate-spread term `log(s_tt)`
+    /// (#1203). Verify both contributions are present by reading the logdet off a
+    /// candidate whose linear residual is exactly zero (response residual = the
+    /// fitted line), so `NLE_linear = ½·logdet`. Doubling the coordinate spread
+    /// (at fixed assignment mass) scales `s_tt` by 4 → logdet += `p·log(4)`;
+    /// doubling all assignment masses scales BOTH `w_sum` and `s_tt` by 4 (they
+    /// are quadratic in `a_k`) → logdet += `2p·log(4)`.
     #[test]
     fn linear_logdet_includes_weighted_coordinate_spread() {
         let n = 40;
         let p = 2usize;
-        // For a STRAIGHT image the linear RSS is 0, so NLE_linear = ½·logdet
-        // exactly — we read the logdet back off the candidate's NLE.
-        let logdet = |coords: &Array1<f64>, weights: &Array1<f64>| -> f64 {
+        // Read the logdet back off a candidate with zero linear residual: the
+        // response residual is exactly `a_k·(line)`, so the WLS line recovers it
+        // with RSS == 0 and `NLE_linear = ½·logdet`.
+        let logdet = |coords: &Array1<f64>, assign: &Array1<f64>| -> f64 {
+            // A straight image; the response residual is the same line scaled by
+            // the per-row assignment mass `a_k`, so the prediction `a_k·(b₀+dt·b₁)`
+            // matches it exactly and linear_rss == 0.
+            let line = |t: f64| -> [f64; 2] { [t, 0.6 * t] };
             let mut decoded = Array2::<f64>::zeros((n, p));
+            let mut data = Array2::<f64>::zeros((n, p));
             for i in 0..n {
-                // straight image independent of the coordinate scale so RSS == 0
-                decoded[[i, 0]] = i as f64;
-                decoded[[i, 1]] = 0.6 * i as f64;
+                let l = line(coords[i]);
+                decoded[[i, 0]] = l[0];
+                decoded[[i, 1]] = l[1];
+                data[[i, 0]] = assign[i] * l[0];
+                data[[i, 1]] = assign[i] * l[1];
             }
-            let (linear, _curved, _) =
-                build_atom_candidates(coords.view(), weights.view(), decoded.view(), 10, Some(0.0))
-                    .expect("straight image yields a pair");
-            2.0 * linear.negative_log_evidence // = logdet (RSS == 0)
+            let (linear, _curved, _) = build_atom_candidates(
+                coords.view(),
+                assign.view(),
+                decoded.view(),
+                data.view(),
+                10,
+                Some(0.0),
+            )
+            .expect("straight residual yields a pair");
+            2.0 * linear.negative_log_evidence // = logdet (linear_rss == 0)
         };
 
         let base_coords =
             Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
         let ones = Array1::<f64>::ones(n);
 
-        // Doubling the coordinate spread → s_tt ×4 → logdet += p·log(4).
+        // Doubling the coordinate spread → s_tt ×4, w_sum fixed → logdet += p·log(4).
         let wide_coords = base_coords.mapv(|t| 2.0 * t);
         let d_spread = logdet(&wide_coords, &ones) - logdet(&base_coords, &ones);
         assert!(
@@ -544,12 +657,14 @@ mod tests {
              (got {d_spread}); the spread term log(s_tt) must be present"
         );
 
-        // Doubling all weights → both Gram diagonals ×2 → logdet += 2p·log(2).
+        // Doubling all assignment masses → w_sum ×4 AND s_tt ×4 (quadratic in a_k)
+        // → logdet += 2p·log(4).
         let twos = Array1::<f64>::from_elem(n, 2.0);
         let d_weight = logdet(&base_coords, &twos) - logdet(&base_coords, &ones);
         assert!(
-            (d_weight - 2.0 * (p as f64) * 2.0_f64.ln()).abs() < 1e-9,
-            "linear logdet must move by 2p·log(2) when all weights double (got {d_weight})"
+            (d_weight - 2.0 * (p as f64) * 4.0_f64.ln()).abs() < 1e-9,
+            "linear logdet must move by 2p·log(4) when all assignment masses double \
+             (got {d_weight})"
         );
     }
 
@@ -559,11 +674,19 @@ mod tests {
     fn degenerate_coordinate_is_refused() {
         let n = 5;
         let coords = Array1::<f64>::from_elem(n, 0.5); // no spread
-        let weights = Array1::<f64>::ones(n);
+        let assign = Array1::<f64>::ones(n);
         let decoded = Array2::<f64>::zeros((n, 2));
+        let data = Array2::<f64>::zeros((n, 2));
         assert!(
-            build_atom_candidates(coords.view(), weights.view(), decoded.view(), 6, Some(0.0))
-                .is_none(),
+            build_atom_candidates(
+                coords.view(),
+                assign.view(),
+                decoded.view(),
+                data.view(),
+                6,
+                Some(0.0)
+            )
+            .is_none(),
             "a degenerate coordinate span must be refused"
         );
     }
