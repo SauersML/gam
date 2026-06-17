@@ -147,7 +147,17 @@ def main() -> None:
     ap.add_argument("--test-frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--n-iter", type=int, default=40)
-    ap.add_argument("--max-fit-seconds", type=float, default=420.0)
+    ap.add_argument(
+        "--max-fit-seconds",
+        type=float,
+        default=900.0,
+        help=(
+            "PER-ATOM wall-clock guard, scaled by K (the K>=2 joint inner solve + "
+            "the inter-atom routing-collapse-protected outer homotopy walk both grow "
+            "with K, so a fixed budget that fits K=1 (~67s) wrongly trips K=2 (~1245s). "
+            "The effective guard for a rung is max-fit-seconds * K."
+        ),
+    )
     ap.add_argument("--max-reconstruct-seconds", type=float, default=60.0)
     args = ap.parse_args()
 
@@ -167,6 +177,10 @@ def main() -> None:
         f"{'(curved - linear)':>17}  {'curved_s':>9}  {'linear_s':>9}  {'recon_s':>9}"
     )
     for k in ladder:
+        # Per-K wall-clock guard: the K>=2 fit's joint inner solve and the
+        # routing-collapse-protected outer homotopy walk both grow with K, so the
+        # budget must scale with K rather than gate every rung on the K=1 time.
+        k_max_fit_seconds = args.max_fit_seconds * k
         ev_c, fit_c, recon_c = _fit_ev(
             z_tr,
             z_te,
@@ -174,7 +188,7 @@ def main() -> None:
             "circle",
             args.seed,
             args.n_iter,
-            args.max_fit_seconds,
+            k_max_fit_seconds,
             args.max_reconstruct_seconds,
         )
         ev_l, fit_l, recon_l = _fit_ev(
@@ -184,7 +198,7 @@ def main() -> None:
             "euclidean",
             args.seed,
             args.n_iter,
-            args.max_fit_seconds,
+            k_max_fit_seconds,
             args.max_reconstruct_seconds,
         )
         print(
