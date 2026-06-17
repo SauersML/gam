@@ -20,7 +20,10 @@ use tempfile::tempdir;
 
 const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 7;
 const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 76;
+// Additive fields since the original pin: used_device, training_feature_ranges,
+// transformation_response_*, transformation_score_calibration, resolved_termspec*,
+// adaptive_regularization_diagnostics, gaussian_jackknife_plus, full_conformal.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 90;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {

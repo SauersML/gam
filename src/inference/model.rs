@@ -774,6 +774,25 @@ impl FittedModelPayload {
         self.training_feature_ranges = Some(feature_ranges);
     }
 
+    fn synchronize_empty_feature_contract(&mut self) {
+        if self.fit_result.is_none() {
+            return;
+        }
+        let Some(schema) = self.data_schema.as_ref() else {
+            return;
+        };
+        if !schema.columns.is_empty() {
+            return;
+        }
+        self.training_headers.get_or_insert_with(Vec::new);
+        self.resolved_termspec
+            .get_or_insert_with(|| TermCollectionSpec {
+                linear_terms: Vec::new(),
+                smooth_terms: Vec::new(),
+                random_effect_terms: Vec::new(),
+            });
+    }
+
     /// Write the persistable time-basis snapshot for a survival model.
     ///
     /// This is the only path that should populate the `survival_time_*`
@@ -2525,6 +2544,7 @@ impl FittedModel {
             .as_ref()
             .or(payload.unified.as_ref())
             .is_some_and(|fit| fit.used_device);
+        payload.synchronize_empty_feature_contract();
         let Some(fit) = payload.fit_result.as_ref() else {
             return;
         };
