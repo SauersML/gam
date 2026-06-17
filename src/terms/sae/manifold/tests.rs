@@ -9517,9 +9517,11 @@ mod inner_contract_probe_tests {
             "both lanes must be finite: value={value_lane}, gradient={gradient_lane}"
         );
 
-        // Bare REML (+ the collapse barrier the gradient lane also keeps),
-        // evaluated on the SAME refine-policy path, isolates exactly the fold.
-        let bare = {
+        // Bare REML for the VALUE lane, computed on the SAME probe refine policy
+        // (`refine_progress_extension = false`) the value lane uses, plus the
+        // collapse barrier it also keeps — so the only difference from the value
+        // lane is the consistency fold.
+        let bare_value = {
             let mut probe = warmstart_test_objective();
             let target = probe.target.clone();
             let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
@@ -9529,41 +9531,59 @@ mod inner_contract_probe_tests {
                     target.view(),
                     &rho_state,
                     None,
-                    8,
-                    1.0,
-                    1.0e-6,
-                    1.0e-6,
+                    probe.inner_max_iter,
+                    probe.learning_rate,
+                    probe.ridge_ext_coord,
+                    probe.ridge_beta,
                     false,
                 )
-                .expect("bare REML criterion evaluates");
+                .expect("bare value-lane REML criterion evaluates");
             probe
                 .add_fit_data_collapse_penalty(reml, &rho_state)
                 .expect("collapse penalty evaluates")
         };
-        let value_fold = value_lane - bare;
+        let value_fold = value_lane - bare_value;
         assert!(
             value_fold > 1.0e-12,
             "the value-probe lane carries the co-training fold (positive penalty \
-             over bare REML): value_lane={value_lane}, bare={bare}, fold={value_fold}"
+             over bare REML): value_lane={value_lane}, bare={bare_value}, \
+             fold={value_fold}"
         );
 
-        // #1206: the gradient lane's cost is bare REML — it does NOT carry the
-        // fold, so its (cost, ∇f) pair describes one function. It therefore sits a
-        // FULL fold below the value lane (the value lane is co-trained, the
-        // gradient lane is not). The gap must equal the fold, not ~0.
-        let gradient_vs_bare = (gradient_lane - bare).abs();
+        // Bare REML for the GRADIENT lane, computed on the SAME full-refine path
+        // (`reml_criterion_with_cache`, i.e. `refine_progress_extension = true`)
+        // the gradient lane uses, plus the collapse barrier. The gradient lane
+        // must EQUAL this (it carries NO consistency fold), so its (cost, ∇f) pair
+        // describes one function — the #1206 contract for BFGS Armijo. (The
+        // gradient-lane and value-lane bares may differ by the refine policy, so
+        // each lane is checked against its OWN matched bare.)
+        let bare_grad = {
+            let mut probe = warmstart_test_objective();
+            let target = probe.target.clone();
+            let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
+            let (reml, _loss, _cache) = probe
+                .term
+                .reml_criterion_with_cache(
+                    target.view(),
+                    &rho_state,
+                    None,
+                    probe.inner_max_iter,
+                    probe.learning_rate,
+                    probe.ridge_ext_coord,
+                    probe.ridge_beta,
+                )
+                .expect("bare gradient-lane REML criterion evaluates");
+            probe
+                .add_fit_data_collapse_penalty(reml, &rho_state)
+                .expect("collapse penalty evaluates")
+        };
+        let gradient_vs_bare = (gradient_lane - bare_grad).abs();
         assert!(
             gradient_vs_bare < 1.0e-9,
             "the gradient lane must report bare REML (no consistency fold), so its \
              (cost, ∇f) pair is self-consistent for BFGS Armijo: \
-             gradient_lane={gradient_lane}, bare={bare}, diff={gradient_vs_bare}"
-        );
-        let lane_gap = value_lane - gradient_lane;
-        assert!(
-            (lane_gap - value_fold).abs() < 1.0e-9,
-            "the value lane must sit exactly one fold above the gradient lane \
-             (fold is value-lane-only): value={value_lane}, gradient={gradient_lane}, \
-             lane_gap={lane_gap}, fold={value_fold}"
+             gradient_lane={gradient_lane}, bare_grad={bare_grad}, \
+             diff={gradient_vs_bare}"
         );
     }
 
