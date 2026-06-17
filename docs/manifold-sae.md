@@ -9,10 +9,9 @@ embedding (a decoder block) and a
 per-token coordinate on that shape. A token's reconstruction is the sum of
 the atoms it activates, evaluated at their per-token coordinates.
 
-The result is interpretable by construction: instead of opaque feature
-vectors, each atom answers **where it lives** (a typed manifold embedded in
-ambient space), **what shape it is** (the topology and its fitted curve),
-and **how confident** that shape is (a posterior band).
+Each atom answers **where it lives** (a typed manifold embedded in ambient
+space), **what shape it is** (the topology and its fitted curve), and **how
+confident** that shape is (a posterior band).
 
 ```python
 import numpy as np
@@ -141,7 +140,7 @@ smoothing weights selected by REML. Each piece plays a distinct role
   ```
 
 - **Cross-atom decoder incoherence** (`decoder_incoherence_weight=1.0`, **on
-  by default**, issue #671). The separability lever. For `K >= 2` it
+  by default**). The separability lever. For `K >= 2` it
   penalizes the squared output-space cross-Gram `||B_j B_k^T||_F^2` between
   the `(M_k, p)` decoder blocks of *co-activating* atom pairs, weighted by
   their empirical co-activation `mean_n gate_j·gate_k`. This drives co-firing
@@ -150,7 +149,7 @@ smoothing weights selected by REML. Each piece plays a distinct role
   disable.
 
 - **Nuclear-norm embedding-rank selection** (`nuclear_norm_weight=1.0`, **on
-  by default**; `nuclear_norm_max_rank=` optional cap, issue #672). Adds a
+  by default**; `nuclear_norm_max_rank=` optional cap). Adds a
   smoothed sum-of-singular-values penalty on each atom's `(M_k, p)` decoder matrix,
   shrinking its singular spectrum so the **embedding dimension** — how many
   ambient output directions the atom spends — is *selected* rather than
@@ -164,7 +163,7 @@ smoothing weights selected by REML. Each piece plays a distinct role
   count per atom is `fit.atoms[k].active_dim` (also `fit.summary()
   ["active_dims"]`).
 
-- **Isometry gauge** (`isometry_weight=0.0`, **off by default**, issue #673).
+- **Isometry gauge** (`isometry_weight=0.0`, **off by default**).
   `IsometryPenalty` drives the pulled-back metric
   `g = J^T J` toward a unit-average-speed chart, making `t` easier to read as
   near arc length when the penalty is enabled. It is no longer required for
@@ -184,7 +183,7 @@ smoothing weights selected by REML. Each piece plays a distinct role
 
 Two more knobs: `decoder_feature_sparsity_groups=` group-lassoes the decoder
 over a partition of the `p` output features (encouraging each basis function
-to load on a single feature cluster, issue #240), and
+to load on a single feature cluster), and
 `block_orthogonality_weight=` orthogonalizes the latent coordinate axes
 (requires `d_atom >= 2`).
 
@@ -229,12 +228,11 @@ atom.shape_band_mean      # (G, p)
 atom.shape_band_sd        # (G, p)
 ```
 
-This is an **honest epistemic posterior**, not a cosmetic ribbon: it shrinks
-as `~1/sqrt(N)` with more data, scales with the reconstruction dispersion
-`fit.dispersion`, and **fans out automatically** for a poorly-identified
-atom (a near-singular Schur block widens the band). It is a *different,
-tighter* quantity than the per-observation data scatter — with many tokens
-the manifold is pinned far more tightly than any single noisy observation.
+This is an epistemic posterior on the manifold, not the per-observation data
+scatter: it shrinks as `~1/sqrt(N)` with more data, scales with the
+reconstruction dispersion `fit.dispersion`, and widens for a poorly-identified
+atom (a near-singular Schur block fans the band out). With many tokens the
+manifold is pinned far more tightly than any single noisy observation.
 
 !!! note
     The uncertainty arrays are populated only on a **freshly-fit** model.
@@ -302,7 +300,7 @@ Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
 `get_decoder()` / `get_anchors()`, and `to_dict` / `from_dict` / `save` /
 `load`.
 
-### Out-of-sample and encoder distillation (issue #357)
+### Out-of-sample and encoder distillation
 
 `X=` is the data to reconstruct — it is **not** a warm start.
 To seed the joint solve from an amortized encoder's per-token prediction,
