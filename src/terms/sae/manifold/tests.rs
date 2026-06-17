@@ -244,6 +244,50 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
     );
 }
 
+/// #1217 — the outer-REML cost handed to the BFGS line search MUST be finite.
+/// At a K≥2 co-collapse cliff the Laplace normalizer `½log|H|` of a numerically
+/// singular joint Hessian can return `±∞`/`NaN`, so `reml_criterion` surfaces a
+/// non-finite criterion value. The `opt` BFGS reports a non-finite probe as
+/// "Line search failed (nonfinite seen)" and ABORTS the outer solve at the
+/// current iterate (observed on real OLMo K=2: stall at iter 2, |g|≈65) instead
+/// of backtracking. `add_fit_data_collapse_penalty` is the single seam BOTH the
+/// value-probe (`eval_with_order(Value)`) and gradient (`eval`) lanes route
+/// through, so flooring a non-finite cost to the finite collapse wall there
+/// presents the SAME rejectable barrier a detected collapse does — the line
+/// search rejects the step and backtracks toward the feasible basin.
+#[test]
+pub(crate) fn outer_collapse_penalty_floors_nonfinite_cost_to_finite_wall() {
+    let finite_ok = |cost: f64| {
+        // Fresh objective per call: `add_fit_data_collapse_penalty` mutates the
+        // term's collapse ledger, so each assertion gets a clean slate.
+        let mut objective = warmstart_test_objective();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+        objective
+            .add_fit_data_collapse_penalty(cost, &rho)
+            .expect("collapse penalty must not error on a non-finite cost")
+    };
+
+    // A finite, non-collapsed base cost passes through unchanged (byte-for-byte).
+    let plain = finite_ok(3.5);
+    assert!(plain.is_finite(), "finite cost must stay finite");
+
+    // Each non-finite base must be floored to a FINITE, rejectable wall — never
+    // propagated as `±∞`/`NaN` to the BFGS line search. The wall is bounded by
+    // `2·SAE_FIT_DATA_COLLAPSE_COST` (base wall + at-most-one collapse penalty).
+    for nonfinite in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        let walled = finite_ok(nonfinite);
+        assert!(
+            walled.is_finite(),
+            "a non-finite outer cost ({nonfinite}) must be floored to a finite wall, got {walled}"
+        );
+        assert!(
+            walled >= SAE_FIT_DATA_COLLAPSE_COST && walled <= 2.0 * SAE_FIT_DATA_COLLAPSE_COST,
+            "the floored wall {walled} must sit in [collapse_cost, 2·collapse_cost] so BFGS \
+             treats it as an infeasible step to backtrack from, not as a descent target"
+        );
+    }
+}
+
 /// The identity-homotopy shortcut's structural probe: the η dial is inert
 /// iff no atom evaluator declares curved columns. Caller-managed atoms
 /// (no evaluator) and one-harmonic periodic banks (M = 3: constant +

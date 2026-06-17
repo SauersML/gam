@@ -928,10 +928,36 @@ impl SaeManifoldOuterObjective {
             assignments.view(),
             self.inner_max_iter,
         )?;
-        if collapsed {
-            Ok(cost + SAE_FIT_DATA_COLLAPSE_COST)
+        // #1217 — FINITE-GUARD the outer-REML cost handed to the BFGS line search
+        // (same class as the #1192 Poisson Armijo finite-floor). At a K≥2
+        // co-collapse cliff the Laplace normalizer `½log|H|` of a numerically
+        // singular joint Hessian can return `±∞`/`NaN`, so `reml_criterion`
+        // surfaces a non-finite `v` even when the discrete `record_fit_data_
+        // collapse_if_needed` detector has not (yet) classified the iterate as a
+        // collapse. The `opt` BFGS reports a non-finite probe as "Line search
+        // failed (nonfinite seen)" and ABORTS the whole outer solve at the
+        // current iterate (observed on real OLMo K=2: stall at iter 2, |g|≈65),
+        // rather than treating it as an infeasible step to backtrack from. A
+        // non-finite criterion is the STRONGEST infeasibility signal — it must
+        // present to the line search as the SAME finite wall a detected collapse
+        // does, so the search rejects the step and backtracks toward the feasible
+        // basin instead of giving up. We therefore floor any non-finite cost to
+        // the finite collapse wall `SAE_FIT_DATA_COLLAPSE_COST` (a rejectable
+        // barrier, not `∞`), then add the collapse penalty on top of the already
+        // finite base. The non-collapsed, finite-cost path is byte-for-byte
+        // unchanged.
+        let base = if cost.is_finite() {
+            cost
         } else {
-            Ok(cost)
+            SAE_FIT_DATA_COLLAPSE_COST
+        };
+        if collapsed {
+            // The wall is itself finite, so a non-finite base already floored to
+            // the wall cannot be pushed back to `∞`; clamp the sum defensively in
+            // case the (finite) REML base is itself near `f64::MAX`.
+            Ok((base + SAE_FIT_DATA_COLLAPSE_COST).min(2.0 * SAE_FIT_DATA_COLLAPSE_COST))
+        } else {
+            Ok(base)
         }
     }
 

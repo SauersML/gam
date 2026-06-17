@@ -1576,7 +1576,15 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         "periodic" | "periodic_spline" | "circle" => SaeAtomBasisKind::Periodic,
         "sphere" => SaeAtomBasisKind::Sphere,
         "torus" => SaeAtomBasisKind::Torus,
-        "euclidean" | "euclidean_patch" => SaeAtomBasisKind::EuclideanPatch,
+        // #1221 — the genuinely-linear (affine) atom: `γ(t) = b₀ + Σ t_a·b_a`,
+        // the degree-1 monomial patch. This is the honest "linear" baseline,
+        // distinct from `"euclidean"` / `"euclidean_patch"`, which is the degree-2
+        // QUADRATIC patch `{1, t, t²}`. `"euclidean_quadratic_patch"` is accepted
+        // as an explicit synonym so callers can name the quadratic patch honestly.
+        "linear" | "linear_rank1" | "affine" => SaeAtomBasisKind::Linear,
+        "euclidean" | "euclidean_patch" | "euclidean_quadratic_patch" => {
+            SaeAtomBasisKind::EuclideanPatch
+        }
         "poincare" | "poincare_patch" | "hyperbolic" => SaeAtomBasisKind::Poincare,
         "cylinder" => SaeAtomBasisKind::Cylinder,
         other => SaeAtomBasisKind::Precomputed(other.to_string()),
@@ -1595,6 +1603,13 @@ fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::Duchon => "duchon".to_string(),
         SaeAtomBasisKind::Sphere => "sphere".to_string(),
         SaeAtomBasisKind::Torus => "torus".to_string(),
+        // #1221 — the genuinely-linear atom round-trips under its own honest
+        // name. The degree-2 patch keeps its established `"euclidean_patch"` wire
+        // name (renaming it would break every consumer reading the serialized
+        // dictionary); honesty for it is carried by the distinct `"linear"`
+        // topology, the `"euclidean_quadratic_patch"` input synonym, and the
+        // documentation that `"euclidean"` is quadratic, not linear.
+        SaeAtomBasisKind::Linear => "linear".to_string(),
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch".to_string(),
         SaeAtomBasisKind::Poincare => "poincare".to_string(),
         SaeAtomBasisKind::Cylinder => "cylinder".to_string(),
@@ -1911,6 +1926,14 @@ fn build_sae_basis_evaluators(
                 let (h, d_line) = sae_cylinder_harmonics_degree(m)?;
                 Arc::new(CylinderHarmonicEvaluator::new(h, d_line)?)
             }
+            // #1221 — the genuinely-linear (affine) atom is the degree-1 monomial
+            // patch `{1, t}`. It shares the `EuclideanPatchEvaluator`, built at
+            // `max_degree = 1` recovered from its basis width `m = d + 1` so the
+            // refreshed Φ/jet stays column-consistent with the seed design.
+            SaeAtomBasisKind::Linear => Arc::new(EuclideanPatchEvaluator::new(
+                d,
+                sae_euclidean_degree_for_basis_size(d, m)?,
+            )?),
             SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => Arc::new(
                 EuclideanPatchEvaluator::new(d, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?,
             ),
@@ -5123,7 +5146,8 @@ fn sae_build_padded_basis_stacks(
                     .slice_mut(s![atom_idx, 0..m, 0..m])
                     .assign(&penalty);
             }
-            SaeAtomBasisKind::Duchon
+            SaeAtomBasisKind::Linear
+            | SaeAtomBasisKind::Duchon
             | SaeAtomBasisKind::EuclideanPatch
             | SaeAtomBasisKind::Poincare => {
                 let centers = plan
@@ -5141,7 +5165,15 @@ fn sae_build_padded_basis_stacks(
                     ));
                 }
                 let (phi, jet, penalty) = match plan.kind {
-                    SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
+                    // #1221 — the linear atom and the euclidean (quadratic) patch
+                    // share the monomial evaluator; the polynomial DEGREE is
+                    // recovered from the plan's basis width (`d + 1` ⇒ degree 1
+                    // linear, the full monomial count ⇒ degree 2 quadratic), so a
+                    // genuinely-linear atom builds `{1, t}` and a euclidean atom
+                    // builds `{1, t, t²}`.
+                    SaeAtomBasisKind::Linear
+                    | SaeAtomBasisKind::EuclideanPatch
+                    | SaeAtomBasisKind::Poincare => {
                         let degree = sae_euclidean_degree_for_basis_size(d, basis_sizes[atom_idx])?;
                         sae_build_euclidean_atom_with_degree(coords.view(), centers.view(), degree)?
                     }
@@ -5310,7 +5342,8 @@ fn sae_build_atom_plans(
                     basis_size,
                 });
             }
-            SaeAtomBasisKind::Duchon
+            SaeAtomBasisKind::Linear
+            | SaeAtomBasisKind::Duchon
             | SaeAtomBasisKind::EuclideanPatch
             | SaeAtomBasisKind::Poincare => {
                 // A Duchon atom's curvature penalty degrades (and ultimately
@@ -5338,11 +5371,15 @@ fn sae_build_atom_plans(
                         centers[[out_row, col]] = seed_coords[[atom_idx, src_row, col]];
                     }
                 }
-                // Probe one build to learn the final basis size. Euclidean
-                // patches use the polynomial atom; everything else (Duchon)
-                // uses the thin-plate kernel.
+                // Probe one build to learn the final basis size. The linear atom
+                // builds the degree-1 monomial patch `{1, t}` (width `d + 1`); the
+                // euclidean (quadratic) patch builds the degree-2 monomial patch
+                // (#1221); everything else (Duchon) uses the thin-plate kernel.
                 let probe_pts = Array2::<f64>::zeros((1, d));
                 let (phi, _jet, _penalty) = match kind {
+                    SaeAtomBasisKind::Linear => {
+                        sae_build_euclidean_atom_with_degree(probe_pts.view(), centers.view(), 1)?
+                    }
                     SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
                         sae_build_euclidean_atom(probe_pts.view(), centers.view())?
                     }
@@ -5910,7 +5947,14 @@ fn sae_manifold_predict_oos<'py>(
                     .to_owned();
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
-                    SaeAtomBasisKind::EuclideanPatch => {
+                    // #1221 — the linear atom and the euclidean (quadratic) patch
+                    // share the monomial OOS rebuild; the polynomial degree is
+                    // recovered from the TRAINED decoder block's row count `M`
+                    // against the centers' dimension, so a degree-1 linear decoder
+                    // (`M = d + 1`) rebuilds `{1, t}` and a degree-2 euclidean
+                    // decoder rebuilds `{1, t, t²}`, each bit-for-bit matching its
+                    // trained block width.
+                    SaeAtomBasisKind::Linear | SaeAtomBasisKind::EuclideanPatch => {
                         // #1132 bug 3: the monomial WIDTH of a Euclidean patch is
                         // `monomial_exponents(dim, degree).len()` where `dim` is
                         // the build dimension `sae_build_euclidean_atom_with_degree`
@@ -6432,7 +6476,10 @@ fn sae_steer_delta<'py>(
                     .to_owned();
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
-                    SaeAtomBasisKind::EuclideanPatch => {
+                    // #1221 — linear (degree-1) and euclidean-quadratic (degree-2)
+                    // share the monomial rebuild; the degree is recovered from the
+                    // trained block width so each matches its decoder bit-for-bit.
+                    SaeAtomBasisKind::Linear | SaeAtomBasisKind::EuclideanPatch => {
                         // #1132 bug 3: recover the Euclidean patch degree from the
                         // TRAINED decoder block's `M` against the centers' own
                         // dimension (the build dim is `centers.ncols()`), not from

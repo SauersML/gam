@@ -106,7 +106,8 @@ impl SaeManifoldTerm {
         for atom_idx in 0..self.k_atoms() {
             if !matches!(
                 self.atoms[atom_idx].basis_kind,
-                SaeAtomBasisKind::EuclideanPatch
+                SaeAtomBasisKind::Linear
+                    | SaeAtomBasisKind::EuclideanPatch
                     | SaeAtomBasisKind::Duchon
                     | SaeAtomBasisKind::Poincare
             ) {
@@ -312,9 +313,12 @@ impl SaeManifoldTerm {
                 (SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus, 1) => {
                     ChartPlan::UnitSpeed(CanonicalChartTopology::Circle { period: 1.0 })
                 }
-                (SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch, 1) => {
-                    ChartPlan::UnitSpeed(CanonicalChartTopology::Interval)
-                }
+                (
+                    SaeAtomBasisKind::Linear
+                    | SaeAtomBasisKind::Duchon
+                    | SaeAtomBasisKind::EuclideanPatch,
+                    1,
+                ) => ChartPlan::UnitSpeed(CanonicalChartTopology::Interval),
                 // #1019 stage 2: d = 2 torus atoms pin to the
                 // minimum-isometry-defect flow representative.
                 (SaeAtomBasisKind::Torus, 2) => ChartPlan::TorusFlow { period: 1.0 },
@@ -322,9 +326,12 @@ impl SaeManifoldTerm {
                 // atoms admit a global polynomial flow basis (contractible —
                 // no hairy ball), so they pin to the flat uniform-speed
                 // minimum-anisotropy-defect representative.
-                (SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch, 2) => {
-                    ChartPlan::PatchFlow
-                }
+                (
+                    SaeAtomBasisKind::Linear
+                    | SaeAtomBasisKind::Duchon
+                    | SaeAtomBasisKind::EuclideanPatch,
+                    2,
+                ) => ChartPlan::PatchFlow,
                 // #1019 sphere arm: d = 2 sphere atoms pin to the
                 // minimum-isometry-defect conformal-boost flow against the
                 // round-sphere reference. The pin is scoped to data away from
@@ -1119,7 +1126,13 @@ impl SaeManifoldTerm {
                 // translation + scale gauge orbit on the tangent coordinate
                 // (the hyperbolic structure lives in the penalty, not the
                 // gauge), so it deflates the same step-gauge vectors.
-                SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
+                // The genuinely-linear (affine) atom shares the Euclidean patch's
+                // translation + scale gauge orbit on its tangent coordinate (its
+                // constant column carries the translation gauge, its `t` column
+                // the scale gauge), so it deflates the same step-gauge vectors.
+                SaeAtomBasisKind::Linear
+                | SaeAtomBasisKind::EuclideanPatch
+                | SaeAtomBasisKind::Poincare => {
                     for axis in 0..d {
                         let mut field = Array2::<f64>::zeros((n, d));
                         field.column_mut(axis).fill(1.0);
@@ -1280,7 +1293,8 @@ impl SaeManifoldTerm {
         let d = self.assignment.coords[atom_idx].latent_dim();
         let mut tangent = vec![0.0_f64; self.output_dim()];
         match self.atoms[atom_idx].basis_kind {
-            SaeAtomBasisKind::EuclideanPatch
+            SaeAtomBasisKind::Linear
+            | SaeAtomBasisKind::EuclideanPatch
             | SaeAtomBasisKind::Duchon
             | SaeAtomBasisKind::Poincare => {
                 for axis in 0..d {
