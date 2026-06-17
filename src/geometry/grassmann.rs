@@ -135,11 +135,27 @@ impl RiemannianManifold for GrassmannManifold {
             // lines that are ε apart. At the projective cut locus p_from·p_to=0
             // (principal angle π/2) the log is not unique, so we reject it —
             // mirroring the (YᵀZ)⁻¹ singularity of the general-k branch below.
+            // At the projective cut locus p_from·p_to = 0 (principal angle
+            // pi/2) the minimal geodesic is non-unique, but the cut-locus
+            // distance is exactly pi/2 and at least one minimal geodesic always
+            // exists: it leaves p_from along the unit direction in span(p_to)
+            // orthogonal to p_from. Rather than abort — which strands an
+            // otherwise well-defined Frechet mean whenever two responses happen
+            // to be orthogonal lines — return that canonical length-pi/2
+            // tangent. It is a genuine Riemannian log (correct magnitude,
+            // tangent at p_from), so exp∘log round-trips and the Karcher descent
+            // converges; only the arbitrary choice among equivalent minimizers
+            // is fixed.
             let c = dot(p_from, p_to);
             if c.abs() <= GEOMETRY_EPS {
-                return Err(GeometryError::Singular(
-                    "Grassmann Gr(1,n) log is undefined at the projective cut locus (principal angle π/2)",
-                ));
+                let mut dir = p_to.to_owned();
+                dir.scaled_add(-c, &p_from);
+                let norm = dir.dot(&dir).sqrt();
+                if norm <= GEOMETRY_EPS {
+                    return Ok(Array1::<f64>::zeros(p_from.len()));
+                }
+                dir.mapv_inplace(|x| x * (std::f64::consts::FRAC_PI_2 / norm));
+                return Ok(dir);
             }
             if c < 0.0 {
                 let aligned = -&p_to.to_owned();
