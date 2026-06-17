@@ -697,12 +697,22 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             options: base_fit_options,
             kappa_options: kappa_options.clone(),
             wiggle: standard_wiggle,
-            coefficient_groups: Vec::new(),
-            // Gamma precision hyperpriors on penalty blocks are only reachable via the
-            // Python FFI fit config. The CLI exposes no flag,
-            // config file, or formula-DSL syntax for them, and the magic-by-default
-            // policy forbids inventing one here, so an empty prior list is correct.
-            penalty_block_gamma_priors: Vec::new(),
+            // Request fields that are derived from the resolved `FitConfig` are
+            // sourced from `fit_config` here exactly as `materialize_standard`
+            // sources them (#1196), instead of being hardcoded to empty. The CLI
+            // arg→config resolver (`resolve_cli_fit_config`) currently leaves
+            // `coefficient_groups` / `penalty_block_gamma_priors` at their empty
+            // defaults because no CLI flag sets them, so this is value-identical
+            // today; routing them through `fit_config` makes the CLI request a
+            // function of the same resolved config the Python/PyO3 path consumes,
+            // so a future config knob can never be silently dropped on the CLI
+            // side while the FFI honors it — the divergence class behind #1191.
+            coefficient_groups: fit_config.coefficient_groups.clone(),
+            penalty_block_gamma_priors: fit_config.penalty_block_gamma_priors.clone(),
+            // `latent_coord` is resolved (its `term_index` bound to a smooth in
+            // the spec) only inside `materialize_standard` from a formula latent
+            // term; the CLI standard-fit path parses no latent coordinate, so
+            // `None` is the materialized value, not a dropped config field.
             latent_coord: None,
             _marker: std::marker::PhantomData,
         };
