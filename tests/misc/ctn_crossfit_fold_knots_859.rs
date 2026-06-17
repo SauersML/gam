@@ -45,7 +45,12 @@ fn fold_complement(response: &Array1<f64>, fold: usize, k: usize) -> Array1<f64>
     Array1::from_vec(kept)
 }
 
-fn fit_effective_knots(config: &TransformationNormalConfig, n: usize, p_cov: usize, response: &Array1<f64>) -> usize {
+fn fit_effective_knots(
+    config: &TransformationNormalConfig,
+    n: usize,
+    p_cov: usize,
+    response: &Array1<f64>,
+) -> usize {
     if config.response_num_internal_knots_pinned {
         config.response_num_internal_knots
     } else {
@@ -55,7 +60,7 @@ fn fit_effective_knots(config: &TransformationNormalConfig, n: usize, p_cov: usi
 
 #[test]
 fn ctn_crossfit_pins_response_knots_across_folds_859() {
-    let response = skewed_score(1000);
+    let response = skewed_score(500);
     let config = TransformationNormalConfig::default();
     let p_cov = 10usize;
     let k = 5usize;
