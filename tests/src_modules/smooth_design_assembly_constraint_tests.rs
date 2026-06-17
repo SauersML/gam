@@ -4190,6 +4190,21 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
                 let (cost_t, grad_t, hess_t) =
                     eval_one(&mut tensor_eval, &mut tensor_cache, &theta, with_hessian);
 
+                if std::env::var("DIAG1216").is_ok() {
+                    let cov_grad = tensor_eval.psi_gram_tensor_covers_gradient(psi);
+                    let cov_val = tensor_eval.psi_gram_tensor_covers(psi);
+                    let cr = (cost_s - cost_t).abs() / (1.0 + cost_s.abs());
+                    let gr = grad_s
+                        .iter()
+                        .zip(grad_t.iter())
+                        .fold(0.0_f64, |a, (x, y)| a.max((x - y).abs() / (1.0 + x.abs())));
+                    eprintln!(
+                        "[DIAG1216-GATE] ψ={psi:.4} ρ={:+.2} hess={with_hessian} \
+                         covers_val={cov_val} covers_grad={cov_grad} cost_rel={cr:.2e} grad_rel={gr:.2e}",
+                        rho[0]
+                    );
+                }
+
                 assert!(
                     cost_s.is_finite() && cost_t.is_finite(),
                     "non-finite REML cost at ψ={psi:.4} hessian={with_hessian}: \

@@ -520,6 +520,55 @@ impl PsiGramTensor {
                 .zip(exact.iter())
                 .all(|(a, b)| (a - b).abs() <= PSI_GRAM_GRAD_SPOT_RTOL * scale)
         };
+        // DIAG1216: decompose the per-ψ gradient certification verdict so we can
+        // see WHY the sub-window scan refuses on standardized geometry — FD
+        // convergence (h vs h/2), Richardson-vs-analytic relative error, and the
+        // dominant term. Inert unless DIAG1216 is set. Probe a coarse ψ grid.
+        if std::env::var("DIAG1216").is_ok() {
+            eprintln!(
+                "[DIAG1216] certify_gradient_window: window [{:.4},{:.4}] span={span:.4} h={h:.3e} \
+                 grad_rtol={PSI_GRAM_GRAD_SPOT_RTOL:.0e} fd_conv_rtol={FD_CONVERGED_RTOL:.0e}",
+                self.psi_lo, self.psi_hi
+            );
+            for p in 0..=10 {
+                let psi = self.psi_lo + span * (p as f64) / 10.0;
+                if psi - 2.0 * h <= self.psi_lo || psi + 2.0 * h >= self.psi_hi {
+                    eprintln!("[DIAG1216]   ψ={psi:.4}: stencil hits edge (skipped)");
+                    continue;
+                }
+                let fd_h = fd4(psi, h, eval_design);
+                let fd_h2 = fd4(psi, 0.5 * h, eval_design);
+                match (fd_h, fd_h2) {
+                    (Some(fh), Some(fh2)) => {
+                        let scale = fh2.iter().fold(0.0, |a: f64, &v| a.max(v.abs())).max(1e-300);
+                        let conv = fh
+                            .iter()
+                            .zip(fh2.iter())
+                            .fold(0.0, |a: f64, (x, y)| a.max((x - y).abs()))
+                            / scale;
+                        let rich = (16.0 * &fh2 - &fh) / 15.0;
+                        let analytic = self.dgram_dpsi(psi);
+                        let rscale =
+                            rich.iter().fold(0.0, |a: f64, &v| a.max(v.abs())).max(1e-300);
+                        let grad_err = analytic
+                            .iter()
+                            .zip(rich.iter())
+                            .fold(0.0, |a: f64, (x, y)| a.max((x - y).abs()))
+                            / rscale;
+                        eprintln!(
+                            "[DIAG1216]   ψ={psi:.4}: fd_conv={conv:.2e} ({}) analytic-vs-richardson={grad_err:.2e} ({})",
+                            if conv <= FD_CONVERGED_RTOL { "CONVERGED" } else { "NOT-conv" },
+                            if conv <= FD_CONVERGED_RTOL && grad_err <= PSI_GRAM_GRAD_SPOT_RTOL {
+                                "CERTIFIES"
+                            } else {
+                                "refuses"
+                            }
+                        );
+                    }
+                    _ => eprintln!("[DIAG1216]   ψ={psi:.4}: FD eval failed"),
+                }
+            }
+        }
         // Scan inward from each endpoint to the first certified point.
         let n = PSI_GRAM_GRAD_SCAN_POINTS;
         let mut lo = self.psi_hi;
@@ -539,6 +588,17 @@ impl PsiGramTensor {
                 hi = psi;
                 break;
             }
+        }
+        if std::env::var("DIAG1216").is_ok() {
+            eprintln!(
+                "[DIAG1216] certify_gradient_window RESULT: found={found} lo={lo:.4} hi={hi:.4} \
+                 -> {}",
+                if found && hi > lo {
+                    "gradient lane ACTIVE"
+                } else {
+                    "gradient lane DISABLED (exact slab fallback)"
+                }
+            );
         }
         if found && hi > lo {
             self.grad_psi_lo = lo;
