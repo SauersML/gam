@@ -41,29 +41,19 @@ green on real data, not just on planted synthetic harmonics.
 from __future__ import annotations
 
 import multiprocessing as mp
-import os
 from pathlib import Path
 import traceback
 
 import numpy as np
 import pytest
 
-# #1200 — this is a real-data REGRESSION GATE, not a convenience demo. In the CI /
-# MSI lane that is supposed to enforce it (signalled by GAM_ENFORCE_REAL_OLMO=1, set
-# by that lane), a missing `gamfit` wheel must HARD-FAIL, never silently skip — a
-# skipped gate is not a gate. On a plain dev box without the built wheel we still
-# allow a skip so unrelated work isn't blocked, but the enforcement lane cannot.
-_ENFORCE = os.environ.get("GAM_ENFORCE_REAL_OLMO", "") not in ("", "0", "false", "False")
-try:
-    import gamfit  # noqa: F401
-except ImportError as exc:  # pragma: no cover - environment-dependent
-    if _ENFORCE:
-        raise RuntimeError(
-            "GAM_ENFORCE_REAL_OLMO=1 but `gamfit` is not importable — the real-OLMo "
-            "e2e regression gate cannot be enforced without the built wheel. This is a "
-            "hard failure (non-skippable in the enforcement lane), not a skip."
-        ) from exc
-    gamfit = pytest.importorskip("gamfit")
+# #1200 — this is a real-data REGRESSION GATE, not a convenience demo. The fit runs
+# on CPU (no GPU dependency), so there is no environment in which this is legitimately
+# skippable: a missing `gamfit` wheel must HARD-FAIL the suite, never silently skip —
+# a skipped gate is not a gate. The import is therefore unconditional and unguarded
+# (no `pytest.importorskip`, no env-var toggle): if the wheel is not built, collecting
+# this module raises ImportError and the suite errors, which is the whole point.
+import gamfit  # noqa: F401
 
 _FIXTURE = Path(__file__).resolve().parent / "data" / "olmo_mixedlayer_pca64_768.npy"
 
