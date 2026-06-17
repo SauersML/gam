@@ -1672,18 +1672,6 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
     }
 }
 
-/// #931 TEMP diagnostic (committed atomically, removed in the next commit):
-/// signed log|det| of a symmetric matrix via full eigendecomposition with NO
-/// clamping/stability floor — the reference the clamped DenseSpectralOperator
-/// logdet is FD-compared against to localize the large-lambda survival-LAML
-/// envelope desync. Sums ln(|lambda_i|). NaN on factorization failure.
-pub fn sym_logdet_unclamped_931(matrix: &Array2<f64>) -> f64 {
-    match matrix.eigh(Side::Lower) {
-        Ok((evals, _)) => evals.iter().map(|&l| l.abs().ln()).sum(),
-        Err(_) => f64::NAN,
-    }
-}
-
 pub struct FaerCholeskyFactor {
     factor: solvers::Llt<f64>,
 }
