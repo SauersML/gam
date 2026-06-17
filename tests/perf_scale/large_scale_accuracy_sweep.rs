@@ -685,40 +685,32 @@ fn family_gaussian_cylinder_recovers_with_tight_tolerance() {
 // 5. Edge cases
 // =============================================================================
 
-/// All-y-identical (zero response variance): the fit must succeed, predictions
-/// must equal the constant response, and the smoothing parameters must NOT
-/// blow up to NaN/inf.  A pathological optimizer would either fail or
-/// produce wild βs.
+/// All-y-identical (zero response variance) is a degenerate Gaussian fit: the
+/// marginal REML objective contains `-n/2·log σ̂²`, which diverges to +∞ as the
+/// residual σ̂² → 0. There is no finite REML optimum, so the fit must reject the
+/// response with an actionable `InvalidConfig` (issue #332,
+/// `GAUSSIAN_MIN_SAMPLE_SD`) rather than silently returning a fragile mean-only
+/// solution or panicking on a non-finite REML score.
 #[test]
-fn edge_all_same_y_yields_constant_prediction() {
+fn edge_all_same_y_is_rejected_as_degenerate_response() {
     init_parallelism();
     let n = 60usize;
     let theta: Vec<f64> = (0..n).map(|i| TAU * (i as f64) / (n as f64)).collect();
     let y_const = 1.7_f64;
     let y = vec![y_const; n];
     let data = encode_columns(&["theta", "y"], &[&theta, &y]);
-    let test = predict_matrix(2, &[&theta, &vec![0.0; n]]);
-    let pred = fit_and_predict_eta(
+    let cfg = gaussian_cfg();
+    let err = fit_from_formula(
         "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586)",
         &data,
-        &gaussian_cfg(),
-        &test,
-    );
-    let mut max_dev = 0.0_f64;
-    for v in pred.iter() {
-        assert!(
-            v.is_finite(),
-            "non-finite prediction in zero-variance fit: {v}"
-        );
-        max_dev = max_dev.max((v - y_const).abs());
-    }
-    eprintln!("[edge-zero-variance] max |pred - {y_const}| = {max_dev:.3e}");
-    // The mean-only solution is exact; allow only floating-point noise.
-    // (The smooth nullspace contains the constant, so smoothing -> ∞ recovers
-    // the mean exactly.)
+        &cfg,
+    )
+    .expect_err("zero-variance Gaussian response must be rejected, not fitted");
+    let message = err.to_string();
+    eprintln!("[edge-zero-variance] rejection message: {message}");
     assert!(
-        max_dev < 1.0e-6,
-        "constant-y fit deviated by {max_dev:.3e} from the truth"
+        message.contains("effectively constant") && message.contains("diverges"),
+        "expected the degenerate-Gaussian (issue #332) rejection, got: {message}"
     );
 }
 
