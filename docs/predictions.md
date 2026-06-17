@@ -204,8 +204,7 @@ Writes one row per `(prediction_row, time)` pair. Columns are
 ### Survival uncertainty
 
 For the location-scale survival likelihood, passing any `interval=...`
-populates delta-method standard errors (issue #342 — there is no
-separate `with_uncertainty` flag; the coverage level is the request):
+populates delta-method standard errors:
 
 ```python
 pred = model.predict(test_df, interval=0.95)
