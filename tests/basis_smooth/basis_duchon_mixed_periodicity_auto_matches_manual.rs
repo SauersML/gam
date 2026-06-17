@@ -11,11 +11,17 @@ fn mixed_periodicity_auto_dispatch_matches_manual_path() {
         vec![0.0, 0.0, 0.2, 0.4, 0.5, 0.8, 0.7, 1.1, 1.0, 1.4, 1.3, 1.8],
     )
     .unwrap();
+    // Mixed-periodicity (cylinder/torus) Duchon is intentionally restricted to
+    // the pure-polyharmonic spectrum: the generalized chord distance combined
+    // with the partial-fraction Matérn chain is not validated on periodic axes,
+    // so the builder hard-errors on `length_scale=Some` / `power!=0`. This test
+    // exercises the supported pure case to assert the auto-vs-manual dispatch
+    // equivalence it is named for.
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: Some(vec![Some(1.0), None]),
-        length_scale: Some(1.1),
-        power: 2.0,
+        length_scale: None,
+        power: 0.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: Default::default(),
         aniso_log_scales: None,

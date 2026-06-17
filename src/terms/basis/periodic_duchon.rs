@@ -907,15 +907,6 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     })
 }
 
-fn pure_mixed_periodicity_duchon_spec(spec: &DuchonBasisSpec) -> DuchonBasisSpec {
-    DuchonBasisSpec {
-        length_scale: None,
-        power: 0.0,
-        periodic: None,
-        ..spec.clone()
-    }
-}
-
 /// Public driver for the mixed-periodicity Duchon basis: derives per-axis
 /// ``(left_j, period_j)`` from the supplied centers (mirroring how the 1D
 /// periodic path infers the period from min/max), then dispatches into
@@ -981,10 +972,9 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
         periodic_spec.periodic = Some(vec![Some(resolved_periods[0])]);
         return build_periodic_duchon_basis_1d(data, &periodic_spec, centers, &mut workspace);
     }
-    let pure_spec = pure_mixed_periodicity_duchon_spec(spec);
     build_duchon_basis_mixed_periodicity(
         data,
-        &pure_spec,
+        spec,
         centers,
         periodic_per_axis,
         &resolved_periods,
