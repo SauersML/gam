@@ -2880,6 +2880,64 @@ impl SaeManifoldTerm {
         })
     }
 
+    /// Reconstruction data-fit `0.5·Σ_i w_i·‖whiten(Z_i − R_i)‖²` for an EXPLICIT
+    /// reconstruction matrix `R` (e.g. the hard top-k–projected `fitted`), using
+    /// the SAME per-row metric and design-honesty weights as [`Self::loss_scaled`]
+    /// (the soft-assignment data-fit). The only difference is the residual source:
+    /// `loss_scaled` decodes the soft assignments on the fly, this consumes a
+    /// reconstruction the caller already assembled (so the projected loss and the
+    /// returned projected `fitted` describe one and the same model). The penalty
+    /// terms (`assignment_sparsity`/`smoothness`/`ard`) are decoder/ρ properties
+    /// the top-k gate does not change, so the caller keeps them from the soft
+    /// `loss_scaled` and only swaps this data-fit in — see #1232.
+    pub fn data_fit_for_reconstruction(
+        &self,
+        target: ArrayView2<'_, f64>,
+        reconstruction: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::data_fit_for_reconstruction: Z must be ({n}, {p}); got {:?}",
+                target.dim()
+            ));
+        }
+        if reconstruction.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::data_fit_for_reconstruction: reconstruction must be ({n}, {p}); got {:?}",
+                reconstruction.dim()
+            ));
+        }
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let row_loss_w = self.row_loss_weights.as_deref();
+        let mut resid = vec![0.0_f64; p];
+        let mut total = 0.0_f64;
+        for row in 0..n {
+            for out_col in 0..p {
+                resid[out_col] = target[[row, out_col]] - reconstruction[[row, out_col]];
+            }
+            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+            match self.row_metric.as_ref() {
+                Some(metric) if whitens => {
+                    let r = ArrayView1::from(&resid[..p]);
+                    for w in metric.whiten_residual_row(row, r) {
+                        total += 0.5 * w_row * w * w;
+                    }
+                }
+                _ => {
+                    for &r in resid[..p].iter() {
+                        total += 0.5 * w_row * r * r;
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
     pub fn analytic_penalty_value_total(
         &self,
         registry: &AnalyticPenaltyRegistry,
