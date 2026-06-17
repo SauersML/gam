@@ -1,11 +1,11 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec,
-    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeResult,
-    BasisPsiSecondDerivativeResult, BasisWorkspace, CenterStrategy, CenterStrategyKind,
-    ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
-    KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, MeasureJetBasisSpec,
-    MeasureJetFrozenQuadrature, MeasureJetIdentifiability, OneDimensionalBoundary,
-    PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
+    BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, BasisWorkspace,
+    CenterStrategy, CenterStrategyKind, ConstantCurvatureBasisSpec,
+    ConstantCurvatureIdentifiability, DuchonBasisSpec, KroneckerFactoredBasis, MaternBasisSpec,
+    MaternIdentifiability, MeasureJetBasisSpec, MeasureJetFrozenQuadrature,
+    MeasureJetIdentifiability, OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo,
+    PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
     build_bspline_basis_1d, build_constant_curvature_basis,
     build_constant_curvature_basis_kappa_derivatives, build_duchon_basiswithworkspace,
@@ -96,8 +96,6 @@ mod prelude_lock_tests {
     /// pasted in. Also pins a representative re-exported symbol.
     #[test]
     fn smooth_prelude_include_path_is_locked() {
-        assert!(
-            core::any::type_name::<crate::matrix::DesignMatrix>().contains("DesignMatrix")
-        );
+        assert!(core::any::type_name::<crate::matrix::DesignMatrix>().contains("DesignMatrix"));
     }
 }

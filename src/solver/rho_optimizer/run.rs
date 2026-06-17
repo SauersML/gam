@@ -1152,7 +1152,7 @@ pub(crate) fn audit_first_order_optimality(
         grad_norm,
         analytic_directional,
         fd_directional, // fd-ok: FD-audit certificate, not in math path
-        fd_error, // fd-ok: FD-audit certificate, not in math path
+        fd_error,       // fd-ok: FD-audit certificate, not in math path
         agreement_z,
         fd_step: step, // fd-ok: FD-audit certificate, not in math path
         // END-FD-OK
