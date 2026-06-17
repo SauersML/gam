@@ -429,22 +429,10 @@ pub(crate) fn border_hessian_block(
     Ok(block)
 }
 
-/// Solve the restricted coupled Newton correction on the shared-border axes:
-/// `Δρ_border = − (H_bb + ridge·I)⁻¹ · g_border`, where `H_bb` is the `m × m`
-/// border outer-Hessian block from [`border_hessian_block`] and `g_border` is
-/// the outer gradient restricted to the border axes.
-///
-/// Returns a full-length ρ step that is zero off the border. A small adaptive
-/// ridge guards an indefinite/ill-conditioned border block (the border may sit
-/// where the EFS multiplicative surrogate's PSD assumption is weakest); the
-/// ridge scales with the block's diagonal magnitude so it is basis-aware and
-/// vanishes for a well-conditioned block.
-pub(crate) fn shared_border_correction(
+fn solve_shared_border_block(
     topology: &SharedBorderTopology,
-    operator: Option<&Arc<dyn OuterHessianOperator>>,
-    rho: &Array1<f64>,
+    mut block: Array2<f64>,
     gradient: &Array1<f64>,
-    eval_grad_at: &(dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + Sync),
 ) -> Result<Array1<f64>, EstimationError> {
     let m = topology.border_count();
     let mut step = Array1::<f64>::zeros(topology.rho_dim());
@@ -452,22 +440,20 @@ pub(crate) fn shared_border_correction(
         return Ok(step);
     }
     let border = topology.border_axes();
-
     let g_border_inf = border
         .iter()
         .map(|&i| gradient[i].abs())
         .fold(0.0_f64, f64::max);
     if g_border_inf <= PER_ATOM_NEGLIGIBLE_STEP {
-        // Border axes are already stationary; the coupled correction nulls out.
-        // This is the FD-consistency invariant: zero outer gradient ⇒ zero
-        // correction, matching the coupled objective at any stationary point.
         return Ok(step);
     }
+    if block.dim() != (m, m) {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "per-atom shared-border block shape {:?} != expected {m}x{m}",
+            block.dim()
+        )));
+    }
 
-    let mut block = border_hessian_block(topology, operator, rho, eval_grad_at)?;
-
-    // Adaptive ridge from the mean absolute diagonal so the regularization is
-    // dimensionally consistent with the block's curvature scale.
     let diag_scale = {
         let mut acc = 0.0_f64;
         for r in 0..m {
@@ -503,12 +489,35 @@ pub(crate) fn shared_border_correction(
         ))
     })?;
 
-    // Newton step is −H⁻¹ g; clamp each border component to the per-atom step
-    // cap so a near-singular border block cannot eject the iterate.
     for (row, &axis) in border.iter().enumerate() {
         step[axis] = sanitize_step(-delta[row]);
     }
     Ok(step)
+}
+
+/// Solve the restricted coupled Newton correction on the shared-border axes:
+/// `Δρ_border = − (H_bb + ridge·I)⁻¹ · g_border`, where `H_bb` is the `m × m`
+/// border outer-Hessian block from [`border_hessian_block`] and `g_border` is
+/// the outer gradient restricted to the border axes.
+///
+/// Returns a full-length ρ step that is zero off the border. A small adaptive
+/// ridge guards an indefinite/ill-conditioned border block (the border may sit
+/// where the EFS multiplicative surrogate's PSD assumption is weakest); the
+/// ridge scales with the block's diagonal magnitude so it is basis-aware and
+/// vanishes for a well-conditioned block.
+pub(crate) fn shared_border_correction(
+    topology: &SharedBorderTopology,
+    operator: Option<&Arc<dyn OuterHessianOperator>>,
+    rho: &Array1<f64>,
+    gradient: &Array1<f64>,
+    eval_grad_at: &(dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + Sync),
+) -> Result<Array1<f64>, EstimationError> {
+    let m = topology.border_count();
+    if m == 0 {
+        return Ok(Array1::<f64>::zeros(topology.rho_dim()));
+    }
+    let block = border_hessian_block(topology, operator, rho, eval_grad_at)?;
+    solve_shared_border_block(topology, block, gradient)
 }
 
 /// Whole-vector cost line search for the per-atom EFS step.
@@ -641,57 +650,57 @@ pub fn run_per_atom_efs(
             // full `eval` hook (the EFS eval surfaces steps, not the raw
             // gradient/operator). One inner solve.
             let outer_eval = obj.eval(&rho)?;
-            let operator: Option<Arc<dyn OuterHessianOperator>> = match &outer_eval.hessian {
-                HessianResult::Operator(op) => Some(Arc::clone(op)),
-                HessianResult::Analytic(_) | HessianResult::Unavailable => None,
-            };
             let gradient = outer_eval.gradient.clone();
             if gradient.len() == rho_dim {
-                // Borrow split: the FD branch of the θ-HVP needs to re-evaluate
-                // the outer gradient at perturbed ρ, but `obj` is already
-                // borrowed for the eval above. We snapshot the operator (an
-                // Arc, cheap) so the gradient probe closure only needs the
-                // operator path; when no operator exists we cannot FD-probe
-                // through the borrowed `obj`, so we degrade the border
-                // correction to operator-only and skip it when absent. This is
-                // safe: layer-1 already produced a valid decoupled step; the
-                // border correction is a refinement, never a feasibility gate.
-                if operator.is_some() {
-                    // FD probe is unreachable here (operator path is taken), but
-                    // the θ-HVP signature requires a gradient re-evaluator; this
-                    // closure errors loudly if the operator branch ever defers
-                    // to it, which it does not while `operator.is_some()`.
-                    let degraded_eval = |_p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-                        Err(EstimationError::RemlOptimizationFailed(
-                            "per-atom border FD probe unavailable without an \
-                                 outer-Hessian operator"
-                                .to_string(),
-                        ))
-                    };
-                    match shared_border_correction(
-                        topology,
-                        operator.as_ref(),
-                        &rho,
-                        &gradient,
-                        &degraded_eval,
-                    ) {
-                        Ok(border_step) => {
-                            for i in 0..rho_dim {
-                                full_step[i] = sanitize_step(full_step[i] + border_step[i]);
+                let border_step_result = match &outer_eval.hessian {
+                    HessianResult::Analytic(hessian)
+                        if hessian.nrows() == rho_dim && hessian.ncols() == rho_dim =>
+                    {
+                        let m = topology.border_count();
+                        let border = topology.border_axes();
+                        let mut block = Array2::<f64>::zeros((m, m));
+                        for (r, &axis_r) in border.iter().enumerate() {
+                            for (c, &axis_c) in border.iter().enumerate() {
+                                block[[r, c]] = hessian[[axis_r, axis_c]];
                             }
                         }
-                        Err(err) => {
-                            // A border-correction failure is non-fatal: keep the
-                            // decoupled layer-1 step. Log via the cost path's
-                            // own diagnostics on the next stall.
-                            log::debug!("[PER-ATOM-EFS] shared-border correction skipped: {err}");
+                        solve_shared_border_block(topology, block, &gradient)
+                    }
+                    HessianResult::Operator(op) => {
+                        let operator = Some(Arc::clone(op));
+                        let degraded_eval =
+                            |_p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+                                Err(EstimationError::RemlOptimizationFailed(
+                                    "per-atom border FD probe unavailable without an \
+                                     outer-Hessian operator"
+                                        .to_string(),
+                                ))
+                            };
+                        shared_border_correction(
+                            topology,
+                            operator.as_ref(),
+                            &rho,
+                            &gradient,
+                            &degraded_eval,
+                        )
+                    }
+                    _ => {
+                        log::debug!(
+                            "[PER-ATOM-EFS] no usable outer Hessian; shared-border \
+                             correction deferred to decoupled step for this iter"
+                        );
+                        Ok(Array1::<f64>::zeros(rho_dim))
+                    }
+                };
+                match border_step_result {
+                    Ok(border_step) => {
+                        for &axis in topology.border_axes() {
+                            full_step[axis] = border_step[axis];
                         }
                     }
-                } else {
-                    log::debug!(
-                        "[PER-ATOM-EFS] no outer-Hessian operator; shared-border \
-                         correction deferred to decoupled step for this iter"
-                    );
+                    Err(err) => {
+                        log::debug!("[PER-ATOM-EFS] shared-border correction skipped: {err}");
+                    }
                 }
             }
         }
