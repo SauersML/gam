@@ -35,9 +35,12 @@
 //!
 //! Same discipline as [`crate::basis::radial_profile`]: [`PsiGramTensor::build`]
 //! returns `None` (callers keep the exact per-trial path) unless BOTH
-//! 1. the Chebyshev coefficient tail of the EXPANDED DESIGN decays below
-//!    [`PSI_GRAM_CERT_RTOL`] of the design scale (geometric-decay certificate
-//!    for analytic interpolands, with node-count escalation), and
+//! 1. the Chebyshev coefficient tail of the per-ψ AMPLITUDE-NORMALIZED design
+//!    `X(ψ)/a(ψ)` decays below [`PSI_GRAM_CERT_RTOL`] of the design scale
+//!    (geometric-decay certificate for analytic interpolands, with node-count
+//!    escalation; the scalar amplitude `a(ψ)` is factored out before the
+//!    certificate so it holds regardless of input geometry — #1216 — and
+//!    carried analytically back through the assembled Gram), and
 //! 2. deterministic off-node spot checks of the ASSEMBLED Gram against an
 //!    exactly rebuilt Gram agree to [`PSI_GRAM_SPOT_RTOL`].
 //!
@@ -72,6 +75,14 @@ pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
 /// (s = κr), which only drops below the 1e-12 tail tolerance for `d ≳ 2σ` —
 /// e.g. σ ≈ 9 (s_max ≈ 8, ±1.1 window) needs degree ≳ 40, so 33 nodes refuse
 /// and 65 certify. Node counts stay trivially cheap (one design eval each).
+///
+/// The per-ψ amplitude normalization (#1216, [`PsiGramTensor::amp`]) is what
+/// keeps this ladder sufficient on the WIDE STANDARDIZED geometry default 1-D
+/// fits use (#1215): without it the design's many-decade ψ-dynamic-range floors
+/// the relative coefficient tail above 1e-12 (a rounding floor, not analytic
+/// decay) at every rung; factoring out the scalar amplitude `a(ψ)` first lets
+/// the normalized design's true geometric tail certify inside the 65-node ladder
+/// regardless of input geometry.
 pub const PSI_GRAM_NODE_LADDER: [usize; 4] = [9, 17, 33, 65];
 
 /// Number of deterministic off-node spot-check ψ values.
@@ -100,14 +111,113 @@ pub struct PsiGramTensor {
     /// Number of Chebyshev coefficients (degree + 1).
     n_coeff: usize,
     k: usize,
-    /// `gram[d * n_coeff + e]` = `X_dᵀ W X_e` (k×k); symmetric in (d, e) up to
-    /// transpose: `gram[d][e] == gram[e][d]ᵀ`.
+    /// `gram[d * n_coeff + e]` = `Y_dᵀ W Y_e` (k×k) of the **per-ψ NORMALIZED**
+    /// design `Y(ψ) = X(ψ)/a(ψ)`; symmetric in (d, e) up to transpose:
+    /// `gram[d][e] == gram[e][d]ᵀ`. The physical Gram is recovered analytically
+    /// as `XᵀWX(ψ) = a(ψ)²·Σ T_d T_e gram[d][e]` (see [`Self::gram_at`]).
     gram: Vec<Array2<f64>>,
-    /// `rhs[d]` = `X_dᵀ W z` (the caller's fixed weighted response/offset).
+    /// `rhs[d]` = `Y_dᵀ W z` of the normalized design; the physical RHS is
+    /// `XᵀWz(ψ) = a(ψ)·Σ T_d rhs[d]`.
     rhs: Vec<Array1<f64>>,
     /// `zᵀWz` — ψ-free, captured at build so the Gaussian sufficient-statistic
     /// triple can be assembled per trial without any row access.
     zt_w_z: f64,
+    /// Certified 1-D Chebyshev expansion of the per-ψ design AMPLITUDE
+    /// `a(ψ) = √(‖X(ψ)‖²_F / (n·k))` (root-mean-square design entry), in the
+    /// mapped coordinate `ψ̃ ∈ [−1,1]`.
+    ///
+    /// ## Why per-ψ normalization (#1216)
+    ///
+    /// The raw radial design column is `X(ψ)[i,j] = kernel(r_{ij}·e^{ψ})`. Over
+    /// a WIDE ψ-window (production standardizes the covariate axis to unit spread
+    /// since #1215, so `r·e^ψ` ranges over orders of magnitude) the design's
+    /// amplitude varies by many decades across the window. The first-kind DCT
+    /// coefficient slabs `X_d` are then dominated by the large-amplitude end of
+    /// the window, and the per-column tail certificate — which is RELATIVE to the
+    /// window-global column scale — never sees the small-amplitude end's true
+    /// geometric decay: it floors at the rounding level of the large evaluations
+    /// (~2e-11 of col-scale, NOT 1e-12), so the certificate refuses at every
+    /// rung and the n-free fast path never attaches on standardized geometry.
+    ///
+    /// Factoring out the scalar amplitude `a(ψ)` BEFORE the certificate collapses
+    /// the design's ψ-dynamic-range to ~O(1) across the whole window, so the
+    /// NORMALIZED design's Chebyshev tail decays to true `1e-12` within the
+    /// existing 65-node ladder REGARDLESS of input geometry. `a(ψ)` is itself a
+    /// single positive analytic-in-ψ scalar (root-mean-square of analytic kernel
+    /// entries), so it Chebyshev-expands and certifies trivially, and is carried
+    /// back through the Gram/rhs and their ψ-derivatives ANALYTICALLY — value,
+    /// gradient and curvature stay one source of truth.
+    amp: Cheb1d,
+}
+
+/// A certified 1-D Chebyshev expansion of a smooth scalar `f(ψ̃)` on the mapped
+/// window `ψ̃ ∈ [−1, 1]`, holding its coefficients so `value`, `deriv` (in `ψ̃`)
+/// and `deriv2` (in `ψ̃`) are exact O(D) reconstructions. The caller applies the
+/// `dψ̃/dψ` chain-rule factors.
+struct Cheb1d {
+    /// First-kind Chebyshev coefficients `c_0..c_{m−1}` so
+    /// `f(ψ̃) = Σ_d c_d T_d(ψ̃)`.
+    coeff: Vec<f64>,
+}
+
+impl Cheb1d {
+    /// Build from `m` exact node samples at the first-kind nodes
+    /// `x_i = cos(π(2i+1)/(2m))` (the SAME nodes `build_at` uses), via the
+    /// first-kind discrete orthogonality `c_d = (γ_d/m) Σ_i f(x_i) T_d(x_i)`.
+    fn from_node_samples(samples: &[f64], t_at_nodes: &[Vec<f64>], m: usize) -> Self {
+        let mut coeff = vec![0.0_f64; m];
+        for (d, c) in coeff.iter_mut().enumerate() {
+            let gamma = if d == 0 { 1.0 } else { 2.0 };
+            let mut acc = 0.0_f64;
+            for (i, &f) in samples.iter().enumerate() {
+                acc += f * t_at_nodes[i][d];
+            }
+            *c = gamma / m as f64 * acc;
+        }
+        Self { coeff }
+    }
+
+    /// Relative tail-decay certificate, mirroring the design tail certificate:
+    /// the trailing quarter of the coefficients must fall below
+    /// `PSI_GRAM_CERT_RTOL × scale`, where `scale = max_d |c_d|`.
+    fn tail_certifies(&self) -> bool {
+        let m = self.coeff.len();
+        let scale = self
+            .coeff
+            .iter()
+            .fold(0.0_f64, |a, &c| a.max(c.abs()))
+            .max(1e-300);
+        let tail_start = m - (m / 4).max(1);
+        self.coeff
+            .iter()
+            .skip(tail_start)
+            .all(|&c| c.abs() <= PSI_GRAM_CERT_RTOL * scale)
+    }
+
+    fn value(&self, x: f64) -> f64 {
+        let t = cheb_t(x, self.coeff.len());
+        self.coeff.iter().zip(t.iter()).map(|(&c, &td)| c * td).sum()
+    }
+
+    /// `df/dψ̃` (mapped-coordinate derivative).
+    fn deriv(&self, x: f64) -> f64 {
+        let tp = cheb_t_prime(x, self.coeff.len());
+        self.coeff
+            .iter()
+            .zip(tp.iter())
+            .map(|(&c, &tpd)| c * tpd)
+            .sum()
+    }
+
+    /// `d²f/dψ̃²` (mapped-coordinate second derivative).
+    fn deriv2(&self, x: f64) -> f64 {
+        let tpp = cheb_t_double_prime(x, self.coeff.len());
+        self.coeff
+            .iter()
+            .zip(tpp.iter())
+            .map(|(&c, &tppd)| c * tppd)
+            .sum()
+    }
 }
 
 /// One ladder rung's outcome: a hard evaluation failure aborts the whole
@@ -259,15 +369,43 @@ impl PsiGramTensor {
         {
             return BuildOutcome::EvalFailed;
         }
-        // First-kind discrete orthogonality: coefficient slabs
-        //   X_d = (γ_d / m) Σ_i X(ψ_i) T_d(x_i),  γ_0 = 1, γ_d = 2.
         let t_at_nodes: Vec<Vec<f64>> = nodes_x.iter().map(|&x| cheb_t(x, m)).collect();
+
+        // ── Per-ψ design normalization (#1216) ──────────────────────────────
+        // Probe the per-node design amplitude `a(ψ_i) = √(‖X(ψ_i)‖²_F / (n·k))`
+        // (root-mean-square design entry). On WIDE standardized geometry the
+        // raw design varies by many decades across the window, flooring the
+        // RELATIVE coefficient tail above the certificate; normalizing by `a(ψ)`
+        // removes that ψ-dynamic-range so the tail decays to true 1e-12 within
+        // the existing ladder. `a(ψ)` is a single positive analytic-in-ψ scalar
+        // (RMS of analytic kernel entries), Chebyshev-expanded and certified
+        // here, then carried analytically back through the Gram/rhs.
+        let nk = (n * k) as f64;
+        let amp_samples: Vec<f64> = designs
+            .iter()
+            .map(|d| (d.iter().map(|&v| v * v).sum::<f64>() / nk).sqrt())
+            .collect();
+        // A degenerate (all-zero) design at any node has no amplitude to factor
+        // out — refuse rather than divide by zero (no larger rung repairs it).
+        if amp_samples.iter().any(|&a| !a.is_finite() || a <= 0.0) {
+            return BuildOutcome::EvalFailed;
+        }
+        let amp = Cheb1d::from_node_samples(&amp_samples, &t_at_nodes, m);
+        // The amplitude scalar must itself certify (it is analytic, so this is
+        // far inside the ladder); a non-certifying amplitude means the design is
+        // not analytically normalizable on this window — fall back.
+        if !amp.tail_certifies() {
+            return BuildOutcome::TailNotCertified;
+        }
+
+        // First-kind discrete orthogonality on the NORMALIZED design slabs
+        //   Y_d = (γ_d / m) Σ_i (X(ψ_i)/a(ψ_i)) T_d(x_i),  γ_0 = 1, γ_d = 2.
         let mut coeff_slabs: Vec<Array2<f64>> = Vec::with_capacity(m);
         for d in 0..m {
             let gamma = if d == 0 { 1.0 } else { 2.0 };
             let mut slab = Array2::<f64>::zeros((n, k));
             for (i, design) in designs.iter().enumerate() {
-                let wgt = gamma / m as f64 * t_at_nodes[i][d];
+                let wgt = gamma / m as f64 * t_at_nodes[i][d] / amp_samples[i];
                 slab.scaled_add(wgt, design);
             }
             coeff_slabs.push(slab);
@@ -293,7 +431,9 @@ impl PsiGramTensor {
                 }
             }
         }
-        // One-time n-pass products: G̃[d][e] = X_dᵀ W X_e, c̃[d] = X_dᵀ W z.
+        // One-time n-pass products on the NORMALIZED slabs:
+        //   G̃[d][e] = Y_dᵀ W Y_e, c̃[d] = Y_dᵀ W z (the amplitude `a(ψ)` is
+        //   reattached analytically at assembly, #1216).
         let mut weighted: Vec<Array2<f64>> = Vec::with_capacity(m);
         for slab in &coeff_slabs {
             let mut ws = slab.clone();
@@ -334,6 +474,7 @@ impl PsiGramTensor {
             gram,
             rhs,
             zt_w_z,
+            amp,
         })
     }
 
@@ -481,59 +622,94 @@ impl PsiGramTensor {
         (2.0 * psi - (self.psi_lo + self.psi_hi)) / (self.psi_hi - self.psi_lo)
     }
 
-    /// `XᵀWX(ψ)` assembled n-free in O(D²k²).
-    pub fn gram_at(&self, psi: f64) -> Array2<f64> {
-        let x = self.mapped(psi);
+    /// Normalized-design Gram `N(ψ) = Σ T_d T_e (Y_dᵀWY_e)` and its first two
+    /// mapped-coordinate `ψ̃`-derivatives, assembled n-free in O(D²k²).
+    /// Returns `(N, dN/dψ̃, d²N/dψ̃²)`. The physical Gram and its ψ-derivatives
+    /// reattach the amplitude `a(ψ)` via the product rule in [`Self::gram_at`]
+    /// & friends.
+    fn norm_gram_jets(&self, x: f64) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
         let t = cheb_t(x, self.n_coeff);
-        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        let tp = cheb_t_prime(x, self.n_coeff);
+        let tpp = cheb_t_double_prime(x, self.n_coeff);
+        let mut n0 = Array2::<f64>::zeros((self.k, self.k));
+        let mut n1 = Array2::<f64>::zeros((self.k, self.k));
+        let mut n2 = Array2::<f64>::zeros((self.k, self.k));
         for d in 0..self.n_coeff {
             for e in 0..self.n_coeff {
-                out.scaled_add(t[d] * t[e], &self.gram[d * self.n_coeff + e]);
+                let g = &self.gram[d * self.n_coeff + e];
+                n0.scaled_add(t[d] * t[e], g);
+                n1.scaled_add(tp[d] * t[e] + t[d] * tp[e], g);
+                n2.scaled_add(tpp[d] * t[e] + 2.0 * tp[d] * tp[e] + t[d] * tpp[e], g);
             }
         }
+        (n0, n1, n2)
+    }
+
+    /// Normalized-design RHS `M(ψ) = Σ T_d (Y_dᵀWz)` and its first two mapped
+    /// `ψ̃`-derivatives, n-free in O(Dk). Returns `(M, dM/dψ̃, d²M/dψ̃²)`.
+    fn norm_rhs_jets(&self, x: f64) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+        let t = cheb_t(x, self.n_coeff);
+        let tp = cheb_t_prime(x, self.n_coeff);
+        let tpp = cheb_t_double_prime(x, self.n_coeff);
+        let mut m0 = Array1::<f64>::zeros(self.k);
+        let mut m1 = Array1::<f64>::zeros(self.k);
+        let mut m2 = Array1::<f64>::zeros(self.k);
+        for d in 0..self.n_coeff {
+            m0.scaled_add(t[d], &self.rhs[d]);
+            m1.scaled_add(tp[d], &self.rhs[d]);
+            m2.scaled_add(tpp[d], &self.rhs[d]);
+        }
+        (m0, m1, m2)
+    }
+
+    /// `XᵀWX(ψ) = a(ψ)²·N(ψ)` assembled n-free in O(D²k²).
+    pub fn gram_at(&self, psi: f64) -> Array2<f64> {
+        let x = self.mapped(psi);
+        let a = self.amp.value(x);
+        let (mut out, _, _) = self.norm_gram_jets(x);
+        out.mapv_inplace(|v| v * a * a);
         out
     }
 
-    /// `XᵀWz(ψ)` assembled n-free in O(Dk).
+    /// `XᵀWz(ψ) = a(ψ)·M(ψ)` assembled n-free in O(Dk).
     pub fn rhs_at(&self, psi: f64) -> Array1<f64> {
         let x = self.mapped(psi);
-        let t = cheb_t(x, self.n_coeff);
-        let mut out = Array1::<f64>::zeros(self.k);
-        for (d, td) in t.iter().enumerate() {
-            out.scaled_add(*td, &self.rhs[d]);
-        }
+        let a = self.amp.value(x);
+        let (mut out, _, _) = self.norm_rhs_jets(x);
+        out.mapv_inplace(|v| v * a);
         out
     }
 
     /// Exact `∂(XᵀWX)/∂ψ` from the SAME representation as the value — the
     /// structural cure for the objective↔gradient desync class on this
     /// channel. n-free, O(D²k²).
+    ///
+    /// `G(ψ) = a²·N`, so by the product rule (all in the mapped `ψ̃`, then chain
+    /// rule `dψ̃/dψ`):  `dG/dψ̃ = 2 a a' N + a² N'`.
     pub fn dgram_dpsi(&self, psi: f64) -> Array2<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
-        let t = cheb_t(x, self.n_coeff);
-        let tp = cheb_t_prime(x, self.n_coeff);
-        let mut out = Array2::<f64>::zeros((self.k, self.k));
-        for d in 0..self.n_coeff {
-            for e in 0..self.n_coeff {
-                out.scaled_add(
-                    (tp[d] * t[e] + t[d] * tp[e]) * dx_dpsi,
-                    &self.gram[d * self.n_coeff + e],
-                );
-            }
-        }
+        let a = self.amp.value(x);
+        let ap = self.amp.deriv(x);
+        let (n0, n1, _) = self.norm_gram_jets(x);
+        let mut out = n0;
+        out.mapv_inplace(|v| v * (2.0 * a * ap));
+        out.scaled_add(a * a, &n1);
+        out.mapv_inplace(|v| v * dx_dpsi);
         out
     }
 
-    /// Exact `∂(XᵀWz)/∂ψ`, n-free.
+    /// Exact `∂(XᵀWz)/∂ψ`, n-free. `r(ψ) = a·M`, `dr/dψ̃ = a' M + a M'`.
     pub fn drhs_dpsi(&self, psi: f64) -> Array1<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
-        let tp = cheb_t_prime(x, self.n_coeff);
-        let mut out = Array1::<f64>::zeros(self.k);
-        for (d, tpd) in tp.iter().enumerate() {
-            out.scaled_add(*tpd * dx_dpsi, &self.rhs[d]);
-        }
+        let a = self.amp.value(x);
+        let ap = self.amp.deriv(x);
+        let (m0, m1, _) = self.norm_rhs_jets(x);
+        let mut out = m0;
+        out.mapv_inplace(|v| v * ap);
+        out.scaled_add(a, &m1);
+        out.mapv_inplace(|v| v * dx_dpsi);
         out
     }
 
@@ -549,29 +725,34 @@ impl PsiGramTensor {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
         let dx_dpsi_sq = dx_dpsi * dx_dpsi;
-        let t = cheb_t(x, self.n_coeff);
-        let tp = cheb_t_prime(x, self.n_coeff);
-        let tpp = cheb_t_double_prime(x, self.n_coeff);
-        let mut out = Array2::<f64>::zeros((self.k, self.k));
-        for d in 0..self.n_coeff {
-            for e in 0..self.n_coeff {
-                let coef = (tpp[d] * t[e] + 2.0 * tp[d] * tp[e] + t[d] * tpp[e]) * dx_dpsi_sq;
-                out.scaled_add(coef, &self.gram[d * self.n_coeff + e]);
-            }
-        }
+        let a = self.amp.value(x);
+        let ap = self.amp.deriv(x);
+        let app = self.amp.deriv2(x);
+        let (n0, n1, n2) = self.norm_gram_jets(x);
+        // d²/dψ̃² [a²N] = (2a'² + 2a a'')N + 4 a a' N' + a² N''.
+        let mut out = n0;
+        out.mapv_inplace(|v| v * (2.0 * ap * ap + 2.0 * a * app));
+        out.scaled_add(4.0 * a * ap, &n1);
+        out.scaled_add(a * a, &n2);
+        out.mapv_inplace(|v| v * dx_dpsi_sq);
         out
     }
 
-    /// Exact `∂²(XᵀWz)/∂ψ²`, n-free. `T_d″·(dx/dψ)²` against the rhs slabs.
+    /// Exact `∂²(XᵀWz)/∂ψ²`, n-free. `r = a·M`, so
+    /// `d²/dψ̃² [aM] = a''M + 2a'M' + aM''`, times `(dψ̃/dψ)²`.
     pub fn d2rhs_dpsi2(&self, psi: f64) -> Array1<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
         let dx_dpsi_sq = dx_dpsi * dx_dpsi;
-        let tpp = cheb_t_double_prime(x, self.n_coeff);
-        let mut out = Array1::<f64>::zeros(self.k);
-        for (d, tppd) in tpp.iter().enumerate() {
-            out.scaled_add(*tppd * dx_dpsi_sq, &self.rhs[d]);
-        }
+        let a = self.amp.value(x);
+        let ap = self.amp.deriv(x);
+        let app = self.amp.deriv2(x);
+        let (m0, m1, m2) = self.norm_rhs_jets(x);
+        let mut out = m0;
+        out.mapv_inplace(|v| v * app);
+        out.scaled_add(2.0 * ap, &m1);
+        out.scaled_add(a, &m2);
+        out.mapv_inplace(|v| v * dx_dpsi_sq);
         out
     }
 

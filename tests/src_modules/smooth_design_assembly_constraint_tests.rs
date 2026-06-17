@@ -3924,31 +3924,11 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
 /// (`build_and_set_psi_gram_tensor` → `install_gaussian_fixed_cache`) has a
 /// frame bug. The two evaluators are byte-identical except that one carries
 /// the tensor — the only thing the test varies is the lane.
-// #1033 OPEN: on production geometry (`input_scales: None`, #1214/#1215 1-D
-// standardization to unit spread) the certified ψ-Gram tensor's Chebyshev
-// tail-decay certificate (PSI_GRAM_CERT_RTOL = 1e-12) does NOT certify within
-// the 65-node ladder (DIAG1033 on this exact fixture: TailNotCertified at every
-// rung m=9..65 → exhausted ladder → None), so the n-free fast path never
-// attaches and the gate's `assert!(attached)` panics.
-//
-// EVIDENCED mechanism: the design column is the kernel `matern(r·e^{ψ})`. The
-// ψ-window `[psi_lo, psi_hi]` IS already derived in standardized coordinates
-// (`spatial_term_psi_bounds` → `standardized_spatial_term_data` /
-// post-freeze UserProvided centers), so its WIDTH is geometry-invariant for a
-// uniform fixture; standardization to unit spread instead TRANSLATES the window
-// to larger `r·e^{ψ}`, where the matern kernel varies faster in ψ — raising the
-// Chebyshev degree the tail needs beyond 65. (NOT a raw-vs-standardized window
-// mismatch; that earlier claim was disproved by reading `spatial_term_psi_bounds`.)
-//
-// PRODUCTION CORRECTNESS IS SAFE: an uncertified Gram ⇒ exact slow-path
-// fallback, never a stale-S(ψ) wrong-κ solve (fc95fc8aa); only the
-// n-independence SPEEDUP is unrealized for default 1-D fits. Ignored (not
-// deleted, not gamed with a raw-scale pin) until the real fix lands: make the
-// tail certify regardless of input geometry — e.g. normalize the per-ψ kernel
-// argument before the certificate and carry that scaling analytically through
-// the Gram, or extend the node ladder with the geometric-decay-rate bound the
-// DIAG profile exposes — then re-enable on `input_scales: None`.
-#[ignore = "#1033: ψ-Gram tail-cert fails on #1215 standardized geometry; correctness safe via slow-path fallback, perf fix pending"]
+///
+/// Runs on PRODUCTION geometry (`input_scales: None`, #1215 1-D standardization
+/// to unit spread). The per-ψ amplitude normalization (#1216) is what makes the
+/// Chebyshev tail certify on the wide standardized window so the n-free tensor
+/// actually attaches here (`assert!(attached)`).
 #[test]
 fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
     use crate::solver::rho_optimizer::OuterEvalOrder;
@@ -4305,7 +4285,6 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
 /// runs the optimizer twice on the SAME deterministic data — once with the
 /// tensor auto-installed (production path) and once with a manually-stripped
 /// streamed evaluator — and asserts bit-tight agreement.
-#[ignore = "#1033: ψ-Gram tail-cert fails on #1215 standardized geometry; correctness safe via slow-path fallback, perf fix pending"]
 #[test]
 fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
     // Re-use the same 1-D Duchon Gaussian fixture from the cell-level test
@@ -4656,7 +4635,6 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 ///   trial 3 (ψ_C): SAME revision again → counter still 1.
 /// A fresh streamed evaluator computes the slow-path β̂ at ψ_B / ψ_C; the
 /// fast-path β̂ must match it to solver round-off.
-#[ignore = "#1033: ψ-Gram tail-cert fails on #1215 standardized geometry; correctness safe via slow-path fallback, perf fix pending"]
 #[test]
 fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     use crate::solver::rho_optimizer::OuterEvalOrder;
