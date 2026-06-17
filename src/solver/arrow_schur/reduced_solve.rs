@@ -609,8 +609,12 @@ pub(crate) const SCHUR_PROLOGUE_PARALLEL_K_MIN: usize = 512;
 /// turning each subsequent matvec into a sparse gather → two `di×p` GEMVs →
 /// sparse scatter, with no per-iteration triangular solve and no operator-closure
 /// re-walk. It never materialises the dense `p×p` product: `di ≪ p` for SAE
-/// rows, so the factored apply is `2·di·p` flops/row (vs `p²`) and `O(n·di·p)`
-/// memory (vs `O(n·p²)` ≈ 67 GB at the Qwen shape — the dense form is OOM).
+/// rows, so the factored apply is `2·support_i·p + 2·di·p` flops/row — the two
+/// `di·p` GEMVs PLUS the `support_i·p` sparse gather (`P_i x`) and `support_i·p`
+/// sparse scatter (`P_iᵀ prod`) — versus the dense `p²` block apply, and
+/// `O(n·di·p)` memory (vs `O(n·p²)` ≈ 67 GB at the Qwen shape — the dense form
+/// is OOM). For dense/full active support `support_i` can scale with the active
+/// β-columns, so the gather/scatter term is NOT negligible and is counted here.
 ///
 /// Numerically identical to the generic path up to floating-point reassociation
 /// (it differentiates and accumulates the SAME quotient), so the criterion
@@ -625,9 +629,12 @@ pub(crate) struct SaeResidentReducedSchur {
     /// while `p` is the decoder block width, ~2048). Materialising the dense
     /// `p×p` block would cost `O(n·p²)` memory (≈67 GB at the Qwen shape) and
     /// `p²` flops per matvec/row; the factored form costs `O(n·di·p)` memory and
-    /// `2·di·p` flops/row, applying `G_i v = L_iᵀ (Y_i v)` (gather → `di`-length
-    /// GEMV → `p`-length GEMV → scatter). A row with empty active support /
-    /// degenerate dims gets `di = 0` and is skipped.
+    /// `2·support_i·p + 2·di·p` flops/row, applying `G_i v = L_iᵀ (Y_i v)`
+    /// (sparse gather over `support_i` atoms → `di`-length GEMV → `p`-length
+    /// GEMV → sparse scatter over `support_i` atoms). The `2·support_i·p`
+    /// gather/scatter term is part of the per-row cost — for dense/full support
+    /// `support_i` scales with active β-columns — and is not dropped. A row with
+    /// empty active support / degenerate dims gets `di = 0` and is skipped.
     /// `(di, L_i, Y_i)` per row; `L_i`/`Y_i` are `di·p`-length row-major buffers.
     pub(crate) rows: Vec<ResidentRowFactor>,
     /// Per-row active atom support `(β-block base index, φ weight)`, shared with
@@ -727,9 +734,13 @@ impl SaeResidentReducedSchur {
     /// into `acc` (length `K`). `gather`/`prod` are caller-owned length-`p`
     /// buffers and `w` a caller-owned `≥ max_i di`-length buffer, all reused
     /// across rows to keep the hot loop allocation-free. The matvec applies the
-    /// factored block: `w = Y_i·(P_i x)` (`di`-length, `di·p` flops) then
-    /// `prod = L_iᵀ·w` (`p`-length, `di·p` flops) — `2·di·p` total, never the
-    /// dense `p²` product.
+    /// factored block in four steps: sparse gather `P_i x = Σ_s φ_s·x[base_s..]`
+    /// (`support_i·p` flops), `w = Y_i·(P_i x)` (`di`-length, `di·p` flops),
+    /// `prod = L_iᵀ·w` (`p`-length, `di·p` flops), and sparse scatter
+    /// `acc += P_iᵀ prod` (`support_i·p` flops) — `2·support_i·p + 2·di·p`
+    /// total, never the dense `p²` product. The gather/scatter `2·support_i·p`
+    /// term is counted: it is not dominated by the GEMVs when the active support
+    /// is wide.
     #[inline]
     pub(crate) fn row_into(
         &self,
@@ -1227,7 +1238,16 @@ impl JacobiPreconditioner {
         // move). This build runs once per inexact-PCG solve = O(inner-Newton-iters)
         // per fit; at the SAE LLM shape (thousands of rows, wide border `k`) the
         // per-row support sweep is the build's whole cost and was on one core.
-        let row_into = |row: usize, diag_part: &mut [f64]| {
+        // The per-channel column dot `col_dot[j] = Σ_r L_i[r·p+j]·Y_i[r·p+j]`
+        // (the diagonal of `G_i = L_iᵀ(H_tt)⁻¹L_i`) depends ONLY on the row `i`,
+        // not on the support entry `(beta_base, φ)`. The previous loop recomputed
+        // it once per support entry — a row with `m` active atoms paid `m·p`
+        // column dots over `di`. Hoist it: compute the `p` column dots once per
+        // row into reusable `col_dot` scratch, then each support entry is a pure
+        // scatter `diag[beta_base+j] -= φ²·col_dot[j]`. Bit-for-bit identical:
+        // each `col_dot[j]` is the same `r`-ascending sum, and `φ²·col_dot[j]`
+        // yields identical bits whether `col_dot[j]` was just computed or cached.
+        let row_into = |row: usize, diag_part: &mut [f64], col_dot: &mut [f64]| {
             let rf = &resident.rows[row];
             let di = rf.di;
             if di == 0 {
@@ -1237,18 +1257,21 @@ impl JacobiPreconditioner {
             if support.is_empty() {
                 return;
             }
+            for (j, slot) in col_dot.iter_mut().enumerate().take(p) {
+                let mut acc = 0.0_f64;
+                for r in 0..di {
+                    let idx = r * p + j;
+                    acc += rf.l[idx] * rf.y[idx];
+                }
+                *slot = acc;
+            }
             for &(beta_base, phi) in support {
                 if phi == 0.0 {
                     continue;
                 }
                 let phi2 = phi * phi;
                 for j in 0..p {
-                    let mut col_dot = 0.0_f64;
-                    for r in 0..di {
-                        let idx = r * p + j;
-                        col_dot += rf.l[idx] * rf.y[idx];
-                    }
-                    diag_part[beta_base + j] -= phi2 * col_dot;
+                    diag_part[beta_base + j] -= phi2 * col_dot[j];
                 }
             }
         };
@@ -1262,11 +1285,12 @@ impl JacobiPreconditioner {
                 .chunks(CHUNK)
                 .map(|idxs| {
                     let mut diag_part = Array1::<f64>::zeros(k);
+                    let mut col_dot = vec![0.0_f64; p];
                     let slice = diag_part
                         .as_slice_mut()
                         .expect("diag_part must be contiguous");
                     for i in idxs {
-                        row_into(i, slice);
+                        row_into(i, slice, &mut col_dot);
                     }
                     diag_part
                 })
@@ -1281,8 +1305,9 @@ impl JacobiPreconditioner {
             }
         } else {
             let diag_slice = diag.as_slice_mut().expect("diag must be contiguous");
+            let mut col_dot = vec![0.0_f64; p];
             for row in 0..n {
-                row_into(row, diag_slice);
+                row_into(row, diag_slice, &mut col_dot);
             }
         }
         let mut blocks = Vec::with_capacity(k);
@@ -2095,7 +2120,8 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
 ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
     // #1017 CPU residency: stage the per-row reduced-Schur factors `(L_i, Y_i)`
     // (NOT the dense `p×p` block — `di ≪ p`, so the factored form is `O(n·di·p)`
-    // memory and `2·di·p` flops/row) once, up
+    // memory and `2·support_i·p + 2·di·p` flops/row including the sparse
+    // gather/scatter over the active support) once, up
     // front, when the SAE structure is installed and the matvec runs on host
     // (CPU). The GPU matvec carries its own residency, so skip when it is engaged.
     // The same staged operator is reused across the whole preconditioner ladder
