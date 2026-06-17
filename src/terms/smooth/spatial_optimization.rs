@@ -7140,9 +7140,24 @@ pub fn curvature_inference_forspec(
         enabled: false,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
+    // Memoize V_p across κ probes. The CI walk's bracketing/bisection, the
+    // central-difference v_pp seed, and the flatness LR test all re-evaluate
+    // V_p at the SAME κ (κ̂ alone is fit ≥3×, and the bisection revisits its
+    // bracket endpoints), each a full fixed-κ inner fit. Identical κ ⇒
+    // identical fit ⇒ identical score, so caching by κ removes the redundant
+    // fits with no change to the statistical answer — the dominant cost in the
+    // otherwise-timing-out flat/hyperbolic e2e arms. The key is the raw bits of
+    // κ so only EXACT repeats hit the cache (no tolerance fuzz that could
+    // collapse distinct probes).
+    let v_p_cache: std::cell::RefCell<std::collections::HashMap<u64, f64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     let v_p = |kappa: f64| -> Result<f64, String> {
         if !kappa.is_finite() {
             return Err(format!("V_p probed a non-finite κ = {kappa}"));
+        }
+        let key = kappa.to_bits();
+        if let Some(&cached) = v_p_cache.borrow().get(&key) {
+            return Ok(cached);
         }
         let mut probe_spec = resolvedspec.clone();
         match probe_spec
@@ -7170,6 +7185,7 @@ pub fn curvature_inference_forspec(
         .map_err(|e| format!("V_p fixed-κ fit at κ={kappa} failed: {e}"))?;
         let score = fit_score(&fit.fit);
         if score.is_finite() {
+            v_p_cache.borrow_mut().insert(key, score);
             Ok(score)
         } else {
             Err(format!(
