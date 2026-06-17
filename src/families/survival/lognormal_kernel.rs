@@ -14,9 +14,7 @@
 use crate::model_types::EstimationError;
 use crate::probability::signed_log_sum_exp;
 use crate::quadrature::{
-    IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
-    latent_cloglog_inverse_link_jet5_controlled, lognormal_laplace_unit_log_term_shared,
-    validate_latent_cloglog_inputs,
+    IntegratedExpectationMode, QuadratureContext, lognormal_laplace_unit_log_term_shared,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -420,55 +418,14 @@ pub fn kernel_ratio_jet(
     jet
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct LatentCLogLogJet5 {
-    pub mean: f64,
-    pub d1: f64,
-    pub d2: f64,
-    pub d3: f64,
-    pub d4: f64,
-    pub d5: f64,
-    pub mode: IntegratedExpectationMode,
-}
-
-pub fn latent_cloglog_jet5(
-    quadctx: &QuadratureContext,
-    eta: f64,
-    sigma: f64,
-) -> Result<LatentCLogLogJet5, EstimationError> {
-    validate_latent_cloglog_inputs(eta, sigma)?;
-    // Authoritative latent cloglog backend via `quadrature.rs`:
-    //
-    // - mean through d5 are all derived from the same lognormal-Laplace kernel
-    //   terms K_{k,1}(eta, sigma),
-    // - every derivative order uses the same routed analytic kernel backend.
-    let jet = latent_cloglog_inverse_link_jet5_controlled(quadctx, eta, sigma);
-    Ok(LatentCLogLogJet5 {
-        mean: jet.mean,
-        d1: jet.d1,
-        d2: jet.d2,
-        d3: jet.d3,
-        d4: jet.d4,
-        d5: jet.d5,
-        mode: jet.mode,
-    })
-}
-
-#[inline]
-pub fn latent_cloglog_inverse_link_jet(
-    quadctx: &QuadratureContext,
-    eta: f64,
-    sigma: f64,
-) -> Result<IntegratedInverseLinkJet, EstimationError> {
-    let jet = latent_cloglog_jet5(quadctx, eta, sigma)?;
-    Ok(IntegratedInverseLinkJet {
-        mean: jet.mean,
-        d1: jet.d1,
-        d2: jet.d2,
-        d3: jet.d3,
-        mode: jet.mode,
-    })
-}
+// `LatentCLogLogJet5` + `latent_cloglog_jet5` / `latent_cloglog_inverse_link_jet`
+// moved DOWN to `crate::quadrature` (#1135), co-located with their analytic
+// backend, so the `solver` link layer names them without importing up into
+// `families::survival`. Re-exported here so the in-family callers (e.g.
+// `family_runtime`) keep resolving.
+pub use crate::quadrature::{
+    LatentCLogLogJet5, latent_cloglog_inverse_link_jet, latent_cloglog_jet5,
+};
 
 // ─── LogKernelSumJet: log-sum derivatives from log-space bundles ─────────────
 

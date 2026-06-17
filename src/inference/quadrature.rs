@@ -3650,6 +3650,65 @@ pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
     }
 }
 
+/// Fifth-order latent-cloglog inverse-link jet.
+///
+/// Relocated here from `families::survival::lognormal_kernel` (#1135): this is
+/// the public face of the latent-cloglog link jet, and its analytic backend
+/// (`latent_cloglog_inverse_link_jet5_controlled`) already lives in this
+/// quadrature module. Hosting the wrapper here lets the `solver` link layer
+/// (`mixture_link`, `pirls`) name it via `crate::quadrature::*` instead of
+/// importing *up* into `families::survival`. `lognormal_kernel` re-exports these
+/// names so the in-family callers keep working.
+#[derive(Clone, Copy, Debug)]
+pub struct LatentCLogLogJet5 {
+    pub mean: f64,
+    pub d1: f64,
+    pub d2: f64,
+    pub d3: f64,
+    pub d4: f64,
+    pub d5: f64,
+    pub mode: IntegratedExpectationMode,
+}
+
+pub fn latent_cloglog_jet5(
+    quadctx: &QuadratureContext,
+    eta: f64,
+    sigma: f64,
+) -> Result<LatentCLogLogJet5, EstimationError> {
+    validate_latent_cloglog_inputs(eta, sigma)?;
+    // Authoritative latent cloglog backend:
+    //
+    // - mean through d5 are all derived from the same lognormal-Laplace kernel
+    //   terms K_{k,1}(eta, sigma),
+    // - every derivative order uses the same routed analytic kernel backend.
+    let jet = latent_cloglog_inverse_link_jet5_controlled(quadctx, eta, sigma);
+    Ok(LatentCLogLogJet5 {
+        mean: jet.mean,
+        d1: jet.d1,
+        d2: jet.d2,
+        d3: jet.d3,
+        d4: jet.d4,
+        d5: jet.d5,
+        mode: jet.mode,
+    })
+}
+
+#[inline]
+pub fn latent_cloglog_inverse_link_jet(
+    quadctx: &QuadratureContext,
+    eta: f64,
+    sigma: f64,
+) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    let jet = latent_cloglog_jet5(quadctx, eta, sigma)?;
+    Ok(IntegratedInverseLinkJet {
+        mean: jet.mean,
+        d1: jet.d1,
+        d2: jet.d2,
+        d3: jet.d3,
+        mode: jet.mode,
+    })
+}
+
 #[inline]
 fn integrated_cloglog_inverse_link_jet_controlled(
     ctx: &QuadratureContext,
