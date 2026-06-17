@@ -1693,15 +1693,12 @@ mod tests {
         s
     }
 
-    /// TEMP instrumentation (#933 debug): dump the audit + canonicalize internals
-    /// for the failing callback-owned same-channel overlap so we can see WHY the
-    /// MAP uniqueness check fires. Run with:
-    ///   cargo test -p <crate> debug_933_callback_overlap_dump -- --nocapture --ignored
+    /// TEMP instrumentation (#933 debug): this test PANICS on purpose, embedding
+    /// the full audit + canonicalize verdict in its failure message, so a normal
+    /// `cargo test --lib` run surfaces the runtime values with NO special flags.
+    /// Delete once the #933 root cause is identified and fixed.
     #[test]
-    #[ignore]
     fn debug_933_callback_overlap_dump() {
-        use crate::families::custom_family::FamilyLinearizationState;
-
         let n = 48;
         let x = linspace(n);
         let mut anchor = Array2::<f64>::zeros((n, 2));
@@ -1724,46 +1721,52 @@ mod tests {
         callback_spec.jacobian_callback = Some(Arc::clone(&raw_callback));
         let specs = [anchor_spec, callback_spec];
 
-        // 1) Run the flat audit directly and dump its verdict.
         let audit = crate::identifiability::audit::audit_identifiability(&specs)
             .expect("audit must not error");
-        eprintln!("=== AUDIT ===");
-        eprintln!("fatal           = {}", audit.fatal);
-        eprintln!("dropped_columns = {:?}", audit.dropped_columns);
-        eprintln!("aliased_pairs   = {:?}", audit.aliased_pairs);
-        for b in &audit.blocks {
-            eprintln!(
-                "block {:>18}: orig={} eff={} range_rank={}",
-                b.block_name, b.original_dim, b.effective_dim, b.design_range_rank
-            );
-        }
-        eprintln!("summary         = {}", audit.summary);
+        let blocks: Vec<String> = audit
+            .blocks
+            .iter()
+            .map(|b| {
+                format!(
+                    "{}(orig={},eff={},range_rank={})",
+                    b.block_name, b.original_dim, b.effective_dim, b.design_range_rank
+                )
+            })
+            .collect();
 
-        // 2) Run canonicalize and dump the outcome (Ok vs Err).
-        eprintln!("=== CANONICALIZE ===");
-        match canonicalize_for_identifiability(&specs) {
+        let canon_outcome = match canonicalize_for_identifiability(&specs) {
             Ok(canon) => {
-                eprintln!("OK");
-                eprintln!("audit.dropped   = {:?}", canon.audit.dropped_columns);
-                for (i, rs) in canon.reduced_specs.iter().enumerate() {
-                    eprintln!(
-                        "reduced_spec[{i}] {:>18}: design.ncols={} has_cb={}",
-                        rs.name,
-                        rs.design.ncols(),
-                        rs.jacobian_callback.is_some(),
-                    );
-                }
-                let _ = FamilyLinearizationState {
-                    beta: &[],
-                    family_scalars: None,
-                    channel_hessian: None,
-                    probit_frailty_scale: 1.0,
-                };
+                let widths: Vec<String> = canon
+                    .reduced_specs
+                    .iter()
+                    .map(|rs| {
+                        format!(
+                            "{}(ncols={},has_cb={})",
+                            rs.name,
+                            rs.design.ncols(),
+                            rs.jacobian_callback.is_some()
+                        )
+                    })
+                    .collect();
+                format!(
+                    "OK dropped={:?} reduced=[{}]",
+                    canon.audit.dropped_columns,
+                    widths.join(", ")
+                )
             }
-            Err(e) => {
-                eprintln!("ERR = {e:?}");
-            }
-        }
+            Err(e) => format!("ERR {e:?}"),
+        };
+
+        panic!(
+            "DIAG933 audit.fatal={} | audit.dropped_columns={:?} | aliased_pairs={:?} | \
+             blocks=[{}] | summary={} | canonicalize={}",
+            audit.fatal,
+            audit.dropped_columns,
+            audit.aliased_pairs,
+            blocks.join(", "),
+            audit.summary,
+            canon_outcome,
+        );
     }
 
     /// #933: a `jacobian_callback`-only block (no `stacked_design`) whose audit
