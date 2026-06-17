@@ -549,6 +549,19 @@ impl PsiGramTensor {
                 break;
             }
         }
+        if std::env::var("DIAG1216").is_ok() {
+            eprintln!(
+                "[DIAG1216] gradient sub-window: found={found} lo={lo:.4} hi={hi:.4} \
+                 (full ψ window [{:.4},{:.4}]) -> {}",
+                self.psi_lo,
+                self.psi_hi,
+                if found && hi > lo {
+                    "gradient lane ACTIVE on sub-window"
+                } else {
+                    "gradient lane DISABLED (exact slab fallback)"
+                }
+            );
+        }
         if found && hi > lo {
             self.grad_psi_lo = lo;
             self.grad_psi_hi = hi;
