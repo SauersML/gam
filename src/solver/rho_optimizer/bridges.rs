@@ -1036,61 +1036,80 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         // chart's x-coord progresses on every accepted-or-rejected eval and
         // the accepted line moves only on rho-acceptance.
         crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
-        // Cost-stall halt (#1089/#1237). Mirror the BFGS-side guard: when the
-        // REML score has stopped improving over `COST_STALL_WINDOW` consecutive
-        // evals, halt ARC by returning the `Fatal` sentinel (an objective cannot
-        // otherwise stop `opt::Arc`). The runner rebuilds the outer result from
-        // the published best iterate; the converged verdict rides on the
-        // bound-PROJECTED gradient norm (KKT residual), NOT the raw `g_norm`
-        // above — a near-separable multinomial fit pins several log-λ directions
-        // at the lower bound with a persistent out-of-bounds ∂V/∂ρ that inflates
-        // the raw norm forever and would otherwise block the converged verdict
-        // and cycle ARC to `max_iter` (#1237). The raw `g_norm` is kept for the
-        // inner-cap schedule / logging only.
-        if let Some(guard) = self.cost_stall.as_mut() {
-            let projected_g_norm =
-                projected_gradient_norm(x, &eval.gradient, self.cost_stall_bounds.as_ref());
-            match guard.observe(x, eval.cost, projected_g_norm) {
-                CostStallVerdict::Continue => {}
-                CostStallVerdict::Converged => {
-                    log::info!(
-                        "[OUTER] ARC cost-stall convergence: REML objective improved < {:.3e} \
-                         (relative) over {} consecutive outer steps AND the projected gradient \
-                         cleared the outer tolerance (|g|={:.3e} <= {:.3e}); accepting best-so-far \
-                         as a stationary optimum (value={:.6e}).",
-                        guard.rel_tol,
-                        guard.window,
-                        guard.best_grad_norm,
-                        guard.grad_threshold,
-                        guard.best_value,
-                    );
-                    return Err(ObjectiveEvalError::Fatal {
-                        message: COST_STALL_CONVERGED_SENTINEL.to_string(),
-                    });
-                }
-                CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
-                    log::warn!(
-                        "[OUTER] ARC cost-stall FLAT-VALLEY STALL: REML objective improved < {:.3e} \
-                         (relative) over {} consecutive outer steps but the projected gradient is \
-                         still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); halting on a \
-                         weakly-identified ρ valley floor and reporting NON-CONVERGED (residual \
-                         outer non-stationarity, value={:.6e}).",
-                        guard.rel_tol,
-                        guard.window,
-                        residual_grad_norm,
-                        guard.grad_threshold,
-                        guard.best_value,
-                    );
-                    return Err(ObjectiveEvalError::Fatal {
-                        message: COST_STALL_CONVERGED_SENTINEL.to_string(),
-                    });
-                }
-            }
-        }
+        // NOTE: the cost-stall guard lives in `eval_hessian` below, NOT here.
+        // `opt::Arc`'s per-iterate oracle (`eval_cost_grad_hessian`) calls
+        // `eval_hessian` for the (value, grad, Hessian) triple and never calls
+        // this `eval_grad` on the ARC route, so folding the guard in here would
+        // leave it dead and let the near-separable multinomial loop keep cycling
+        // to `max_iter` (#1237). See `observe_cost_stall`.
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
         })
+    }
+}
+
+impl OuterSecondOrderBridge<'_> {
+    /// Fold one ARC oracle eval `(ρ, cost, grad)` into the cost-stall guard,
+    /// returning the `Fatal` cost-stall sentinel when the guard halts the loop.
+    ///
+    /// Cost-stall halt (#1089/#1237). `opt::Arc` evaluates the (value, gradient,
+    /// Hessian) triple at every trial point — accepted or rejected — through
+    /// `eval_hessian`, so observing here counts ARC's outer descent. On a
+    /// near-separable multinomial fit the unpenalized softmax MLE is unbounded:
+    /// the outer REML criterion keeps decreasing as λ→0, several log-λ
+    /// directions slam to the lower box bound and bounce, and ARC otherwise
+    /// cycles to its `max_iter` cap without certifying a stationary point. The
+    /// guard halts the moment the REML score plateaus over `COST_STALL_WINDOW`
+    /// evals; the converged verdict rides on the bound-PROJECTED gradient norm
+    /// (KKT residual), NOT the raw `g_norm` — a bound-pinned separating
+    /// direction with a persistent out-of-bounds ∂V/∂ρ is KKT-stationary even
+    /// though its raw gradient never vanishes. A trial that beats the best cost
+    /// resets the streak, so genuine descent never trips the halt.
+    fn observe_cost_stall(
+        &mut self,
+        x: &Array1<f64>,
+        eval: &OuterEval,
+    ) -> Option<ObjectiveEvalError> {
+        let bounds = self.cost_stall_bounds.clone();
+        let guard = self.cost_stall.as_mut()?;
+        let projected_g_norm = projected_gradient_norm(x, &eval.gradient, bounds.as_ref());
+        match guard.observe(x, eval.cost, projected_g_norm) {
+            CostStallVerdict::Continue => None,
+            CostStallVerdict::Converged => {
+                log::info!(
+                    "[OUTER] ARC cost-stall convergence: REML objective improved < {:.3e} \
+                     (relative) over {} consecutive outer steps AND the projected gradient \
+                     cleared the outer tolerance (|g|={:.3e} <= {:.3e}); accepting best-so-far \
+                     as a stationary optimum (value={:.6e}).",
+                    guard.rel_tol,
+                    guard.window,
+                    guard.best_grad_norm,
+                    guard.grad_threshold,
+                    guard.best_value,
+                );
+                Some(ObjectiveEvalError::Fatal {
+                    message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                })
+            }
+            CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
+                log::warn!(
+                    "[OUTER] ARC cost-stall FLAT-VALLEY STALL: REML objective improved < {:.3e} \
+                     (relative) over {} consecutive outer steps but the projected gradient is \
+                     still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); halting on a \
+                     weakly-identified ρ valley floor and reporting NON-CONVERGED (residual \
+                     outer non-stationarity, value={:.6e}).",
+                    guard.rel_tol,
+                    guard.window,
+                    residual_grad_norm,
+                    guard.grad_threshold,
+                    guard.best_value,
+                );
+                Some(ObjectiveEvalError::Fatal {
+                    message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                })
+            }
+        }
     }
 }
 
@@ -1178,6 +1197,14 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
+        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
+        // Cost-stall halt BEFORE the (possibly expensive) Hessian build: ARC's
+        // per-iterate oracle reaches here, so this is where the near-separable
+        // multinomial cycling is caught and certified (#1237). See
+        // `observe_cost_stall`.
+        if let Some(err) = self.observe_cost_stall(x, &eval) {
+            return Err(err);
+        }
         let hessian = build_bridge_hessian_for_source(
             self.hessian_source,
             eval.hessian,

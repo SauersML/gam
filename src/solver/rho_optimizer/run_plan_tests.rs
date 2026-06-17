@@ -1341,12 +1341,15 @@ fn analytic_route_unavailable_hessian_is_fatal() {
 /// certifying a stationary point (the #1082 multinomial timeout). The
 /// `OuterSecondOrderBridge` now carries the same cost-stall guard the BFGS
 /// bridge does: once the REML score has stopped improving over
-/// `COST_STALL_WINDOW` evals, `eval_grad` returns the `Fatal` cost-stall
-/// sentinel so the runner halts ARC at the published best iterate. The
-/// converged verdict rides on the BOUND-PROJECTED gradient: a direction pinned
-/// at the bound with a persistent out-of-bounds ∂V/∂ρ is KKT-stationary even
-/// though its raw gradient never vanishes. This drives the ARC bridge directly
-/// (no 380s end-to-end fit) and asserts the stall is reached and certified.
+/// `COST_STALL_WINDOW` evals, the bridge returns the `Fatal` cost-stall
+/// sentinel so the runner halts ARC at the published best iterate. The guard
+/// fires from `eval_hessian` — `opt::Arc`'s per-iterate oracle evaluates the
+/// (value, grad, Hessian) triple there and NEVER calls `eval_grad` on the ARC
+/// route, so the guard must live where ARC actually steps. The converged
+/// verdict rides on the BOUND-PROJECTED gradient: a direction pinned at the
+/// bound with a persistent out-of-bounds ∂V/∂ρ is KKT-stationary even though
+/// its raw gradient never vanishes. This drives the ARC bridge directly (no
+/// 380s end-to-end fit) and asserts the stall is reached and certified.
 #[test]
 fn arc_bridge_cost_stall_certifies_at_bound_separation() {
     // A flat objective at the lower bound `rho = -10` whose raw gradient is a
@@ -1401,11 +1404,12 @@ fn arc_bridge_cost_stall_certifies_at_bound_separation() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
     };
-    // Hammer eval_grad at the lower bound; the guard tolerates the first
-    // `COST_STALL_WINDOW` no-improve steps, then halts with the sentinel.
+    // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
+    // The guard tolerates the first `COST_STALL_WINDOW` no-improve steps, then
+    // halts with the sentinel.
     let mut sentinel_fired = false;
     for _ in 0..(COST_STALL_WINDOW + 2) {
-        match FirstOrderObjective::eval_grad(&mut bridge, &lo) {
+        match SecondOrderObjective::eval_hessian(&mut bridge, &lo) {
             Ok(_) => {}
             Err(ObjectiveEvalError::Fatal { message }) => {
                 assert_eq!(
