@@ -4481,6 +4481,57 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             last_cycle_residual_below_tol = residual <= residual_tol;
             last_cycle_obj_change_below_tol = objective_change <= objective_tol;
 
+            // Flat-residual stall early-exit (gam#1040/#979/#370/#859).
+            //
+            // The `tr_clamped_during_stall` residual-stall exit above only fires
+            // when the accepted step kept hitting the trust-region boundary. A
+            // distinct but equally terminal stall reaches neither it nor any
+            // acceptance certificate: the KKT residual stops improving (no ≥10%
+            // drop for the full `RESIDUAL_STALL_NO_IMPROVE_CYCLES` window) while
+            // the accepted steps stay strictly INSIDE the trust region (so
+            // `tr_clamped_during_stall` never latches) and the objective keeps
+            // drifting just above `objective_tol` (so the relative-objective
+            // plateau exit's flat streak never completes). This is the measured
+            // "[joint-newton-tr] cycles 1000+" wall on the binomial location-scale
+            // / bms-flex / CTN inner solves: without an exit the loop grinds the
+            // remaining budget to `inner_loop_hard_ceiling` on every outer
+            // ρ-evaluation, then hands the outer optimizer a non-converged result
+            // anyway.
+            //
+            // Reaching this point means every acceptance certificate above already
+            // DECLINED this cycle — the residual is above `residual_tol`, its
+            // range-space component is above tolerance (so the iterate is NOT
+            // stationary on the identifiable subspace), and there is no
+            // constrained-multiplier signature. The honest action mirrors the
+            // `tr_clamped` `converged=false` exit: stop and return the current
+            // finite β as NON-converged so the outer optimizer rejects this ρ
+            // cleanly. This is purely a termination/perf guard — it certifies
+            // nothing (`converged=false`) and so cannot bias the envelope
+            // gradient; it only rejects the same non-optimum sooner. The `≥10%
+            // drop` reset of `cycles_since_residual_improved` keeps a
+            // geometrically-descending solve (residual dropping by a steady factor
+            // each cycle) from ever reaching the window — only a genuinely flat
+            // residual does.
+            if residual.is_finite()
+                && residual > residual_tol
+                && cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
+                && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
+            {
+                log::warn!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | flat-residual stall early-exit (gam#1040): residual={:.3e} (tol={:.3e}) best_seen={:.3e} stalled {} cycles with steps inside the trust region (tr_clamped={}) and no acceptance certificate satisfied; the residual is neither trending toward KKT nor stationary on the identifiable subspace, so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
+                    cycle,
+                    residual,
+                    residual_tol,
+                    best_residual_seen,
+                    cycles_since_residual_improved,
+                    tr_clamped_during_stall,
+                    inner_max_cycles,
+                );
+                cycles_done = cycle + 1;
+                converged = false;
+                break;
+            }
+
             // NOTE: there is deliberately NO wall-clock-driven "adaptive
             // early-exit" here. A convergence verdict that fires when a cycle's
             // wall-clock happens to fall below a fraction of a running EMA is
