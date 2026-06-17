@@ -9554,6 +9554,63 @@ mod inner_contract_probe_tests {
         );
     }
 
+    /// #1207 — the amortized warm-start outcome must be OBSERVABLE, not silently
+    /// swallowed by `.ok()`. Each outer eval that invokes the warm-start records
+    /// its outcome in the objective's telemetry: a genuine warm-start (≥1 row
+    /// certified), a full cold fallback (zero rows — degenerate atlas), or a
+    /// (logged) failure. This verifies "uses amortized warm-start" is checkable
+    /// rather than an overstated claim.
+    ///
+    /// The fixture's atom is built via `SaeManifoldAtom::new` (no basis
+    /// evaluator), so the amortized encoder certifies zero rows — i.e. this is the
+    /// SILENT-COLD-FALLBACK case #1207 is about. The telemetry must show the
+    /// attempts and classify them as cold fallbacks (never a hidden no-op), and
+    /// `warm_started_evals` must be 0 so the "uses amortized warm-start" claim is
+    /// correctly FALSE for this dictionary.
+    #[test]
+    fn amortized_warm_start_outcome_is_observable_not_silently_swallowed() {
+        let mut objective = warmstart_test_objective();
+        let rho_flat = objective.current_rho.to_flat();
+
+        // Fresh objective starts with an empty tally.
+        assert_eq!(
+            objective.warm_start_telemetry(),
+            AmortizedWarmStartTelemetry::default(),
+            "telemetry must start empty"
+        );
+
+        // Both lanes invoke the warm-start; drive each once.
+        objective
+            .eval_cost(&rho_flat)
+            .expect("value-probe lane evaluates");
+        objective.eval(&rho_flat).expect("gradient lane evaluates");
+
+        let tel = objective.warm_start_telemetry();
+        assert_eq!(
+            tel.attempts, 2,
+            "both the value-probe and gradient lanes must record a warm-start \
+             attempt (observable, not swallowed): {tel:?}"
+        );
+        assert_eq!(
+            tel.warm_started_evals, 0,
+            "this no-evaluator fixture cannot certify any row, so 'uses amortized \
+             warm-start' must read FALSE — not be silently overstated: {tel:?}"
+        );
+        assert_eq!(
+            tel.failed_evals, 0,
+            "a no-evaluator atom is a clean zero-row encode, not an error: {tel:?}"
+        );
+        assert_eq!(
+            tel.cold_fallback_evals, 2,
+            "both evals must be recorded as cold fallbacks (zero certified rows), \
+             so the silent cold solve is now visible: {tel:?}"
+        );
+        assert_eq!(
+            tel.total_rows_warm_started, 0,
+            "no rows warm-started on a no-evaluator dictionary: {tel:?}"
+        );
+    }
+
     /// #1154 item 2+3 — the amortized-encoder warm-start (Design A) accelerates
     /// the inner solve to the SAME stationary point WITHOUT degrading recovery of
     /// the planted manifold. On a known periodic manifold we
