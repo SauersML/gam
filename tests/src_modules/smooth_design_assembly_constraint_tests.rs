@@ -1,7 +1,8 @@
 use super::*;
 use crate::basis::{
-    BSplineBasisSpec, BSplineEndpointBoundaryCondition, BSplineIdentifiability, BSplineKnotSpec,
-    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy, Dense, DuchonBasisSpec,
+    DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
     SpatialIdentifiability, ThinPlateBasisSpec,
 };

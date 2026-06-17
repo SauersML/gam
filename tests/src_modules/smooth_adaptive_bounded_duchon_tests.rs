@@ -1,3 +1,5 @@
+use crate::basis::BSplineBoundaryConditions;
+
 #[test]
 fn pure_duchon_aniso_penalties_stay_symmetric_through_freeze_and_cache() {
     fn max_asymmetry(matrix: &Array2<f64>) -> f64 {
