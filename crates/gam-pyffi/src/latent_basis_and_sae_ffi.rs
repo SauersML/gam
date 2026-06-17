@@ -6151,21 +6151,16 @@ fn sae_manifold_predict_oos<'py>(
                     }
                 }
             }
-            fitted = Array2::<f64>::zeros((n_obs, p_out));
-            let mut g_buf = vec![0.0_f64; p_out];
-            for row in 0..n_obs {
-                for atom_idx in 0..k_atoms {
-                    let a_k = assignments[[row, atom_idx]];
-                    if a_k == 0.0 {
-                        continue;
-                    }
-                    term.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
-                    let mut out_row = fitted.row_mut(row);
-                    for out_col in 0..p_out {
-                        out_row[out_col] += a_k * g_buf[out_col];
-                    }
-                }
-            }
+            // Recompute through the SHARED collapse-aware assembler so the OOS
+            // top-k projection composes with the #1026 hybrid collapse (#1233):
+            // when the trained dictionary's hybrid-collapsed linear images are
+            // attached to this OOS term (`set_hybrid_linear_images`, #1228), a
+            // verdict-linear slot decodes its straight sub-model image here too,
+            // matching the train-side reconstruction policy. With no images
+            // attached this is the curved reconstruction, identical to before.
+            fitted = term
+                .reconstruct_from_assignments(assignments.view(), true)
+                .map_err(py_value_error)?;
         }
     }
 
