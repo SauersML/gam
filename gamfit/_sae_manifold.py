@@ -855,6 +855,8 @@ class ManifoldSAE:
     max_iter: int = 50
     random_state: int = 0
     top_k: int | None = None
+    top_k_projection: dict[str, Any] | None = None
+    pre_topk: dict[str, Any] | None = None
     jumprelu_threshold: float = 0.0
     solver_plan: dict[str, Any] | None = None
     # Gaussian reconstruction scale phi-hat that scales every per-atom decoder
@@ -951,8 +953,9 @@ class ManifoldSAE:
     # is the per-atom IN-SAMPLE leave-one-atom-out ΔEV (computed on the training
     # matrix during the fit), NOT a held-out generalization number; the legacy
     # ``held_out_delta_ev`` key carries the SAME in-sample value and is retained
-    # only as a deprecated alias. This is a POST-HOC curve-simplification
-    # diagnostic (#1202), NOT a data-level dominance guarantee. Previously the FFI
+    # only as a deprecated alias. This is a common-data curved-vs-linear evidence
+    # comparison (#1202): both candidates fit the atom's response residual, with
+    # the line as the curved family's Θ=0 sub-model. Previously the FFI
     # emitted this block but the public class dropped it, forcing callers to
     # monkey-patch ``from_payload`` (see examples/structural_truth_ledger.py);
     # surfaced here so the (Θ, ΔEV) frontier is queryable per atom off the normal
@@ -1165,6 +1168,16 @@ class ManifoldSAE:
             smoothness=float(smoothness), learning_rate=float(learning_rate),
             max_iter=int(max_iter), random_state=int(random_state),
             top_k=None if top_k is None else int(top_k),
+            top_k_projection=(
+                None
+                if payload.get("top_k_projection") is None
+                else dict(payload["top_k_projection"])
+            ),
+            pre_topk=(
+                None
+                if payload.get("pre_topk") is None
+                else dict(payload["pre_topk"])
+            ),
             jumprelu_threshold=float(jumprelu_threshold),
             solver_plan=None if payload.get("solver_plan") is None else dict(payload["solver_plan"]),
             dispersion=float(payload["dispersion"]),
@@ -2097,6 +2110,10 @@ class ManifoldSAE:
             "max_iter": int(self.max_iter),
             "random_state": int(self.random_state),
             "top_k": self.top_k,
+            "top_k_projection": (
+                None if self.top_k_projection is None else _jsonable(self.top_k_projection)
+            ),
+            "pre_topk": None if self.pre_topk is None else _jsonable(self.pre_topk),
             "jumprelu_threshold": float(self.jumprelu_threshold),
             "oos_projection_top1": bool(self._oos_projection_top1),
             "dispersion": float(self.dispersion),
@@ -2240,6 +2257,16 @@ class ManifoldSAE:
             max_iter=int(payload["max_iter"]),
             random_state=int(payload["random_state"]),
             top_k=None if payload["top_k"] is None else int(payload["top_k"]),
+            top_k_projection=(
+                None
+                if payload.get("top_k_projection") is None
+                else dict(payload["top_k_projection"])
+            ),
+            pre_topk=(
+                None
+                if payload.get("pre_topk") is None
+                else dict(payload["pre_topk"])
+            ),
             jumprelu_threshold=float(payload["jumprelu_threshold"]),
             solver_plan=None if payload.get("solver_plan") is None else dict(payload["solver_plan"]),
             _oos_projection_top1=bool(payload["oos_projection_top1"]),
