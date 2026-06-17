@@ -2164,14 +2164,33 @@ pub fn build_smooth_basis(
                     .map(|u| u.eq_ignore_ascii_case("radian") || u.eq_ignore_ascii_case("radians"))
                     .unwrap_or(false)
             });
+            // An explicit `degree`/`l`/`max_degree` names a spherical-harmonic
+            // truncation, so with no explicit kernel/method it selects the
+            // Harmonic construction (the Wahba kernel ignores `degree` and would
+            // silently emit a 1-column kernel design). An explicit kernel/method
+            // still wins.
+            let degree_requested = options.contains_key("degree")
+                || options.contains_key("l")
+                || options.contains_key("max_degree")
+                || options.contains_key("max-degree");
             let kernel = options
                 .get("kernel")
                 .or_else(|| options.get("method"))
                 .map(|raw| strip_quotes(raw).trim().to_ascii_lowercase())
-                .unwrap_or_else(|| "sobolev".to_string());
+                .unwrap_or_else(|| {
+                    if degree_requested {
+                        "harmonic".to_string()
+                    } else {
+                        "sobolev".to_string()
+                    }
+                });
             let (method, wahba_kernel) = match kernel.as_str() {
-                "sobolev" | "wahba" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev),
-                "pseudo" | "mgcv" | "sos" => (SphereMethod::Wahba, SphereWahbaKernel::Pseudo),
+                "sobolev" | "wahba" | "wahba_sobolev" | "wahba-sobolev" => {
+                    (SphereMethod::Wahba, SphereWahbaKernel::Sobolev)
+                }
+                "pseudo" | "mgcv" | "sos" | "wahba_pseudo" | "wahba-pseudo" => {
+                    (SphereMethod::Wahba, SphereWahbaKernel::Pseudo)
+                }
                 "harmonic" | "spherical_harmonic" | "spherical-harmonic" => {
                     (SphereMethod::Harmonic, SphereWahbaKernel::Sobolev)
                 }
