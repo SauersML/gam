@@ -2048,6 +2048,35 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         .row_neglog_flex_value(0, &block_states)
         .expect("production flex row value");
     let wit_value = witness_nll(&p0);
+    // DIAGNOSTIC (temporary, #979): localize the residual ~1.3e-5 self-validation
+    // gap by comparing each witness intermediate against production's own.
+    {
+        let beta_h_arr = Array1::from(beta_h0.clone());
+        let beta_w_arr = Array1::from(beta_w0.clone());
+        let (w_a0, _) = solve_intercept(q0v, gv, &beta_h0, &beta_w0);
+        let (w_a1, w_d1) = solve_intercept(q1v, gv, &beta_h0, &beta_w0);
+        let (w_eta0, _) = observed_eta_chi(w_a0, gv, &beta_h0, &beta_w0);
+        let (w_eta1, w_chi1) = observed_eta_chi(w_a1, gv, &beta_h0, &beta_w0);
+        let (p_a0, _) = family
+            .solve_row_survival_intercept_with_slot(q0v, gv, Some(&beta_h_arr), Some(&beta_w_arr), None)
+            .expect("prod a0");
+        let (p_a1, p_d1) = family
+            .solve_row_survival_intercept_with_slot(q1v, gv, Some(&beta_h_arr), Some(&beta_w_arr), None)
+            .expect("prod a1");
+        let (p_eta0, _) = family
+            .observed_denested_eta_chi(0, p_a0, gv, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("prod eta0");
+        let (p_eta1, p_chi1) = family
+            .observed_denested_eta_chi(0, p_a1, gv, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("prod eta1");
+        eprintln!("DIAG979: delta_nll={:+.4e}", wit_value - prod_value);
+        eprintln!("DIAG979: a0   wit={w_a0:+.12e} prod={p_a0:+.12e} d={:+.3e}", w_a0 - p_a0);
+        eprintln!("DIAG979: a1   wit={w_a1:+.12e} prod={p_a1:+.12e} d={:+.3e}", w_a1 - p_a1);
+        eprintln!("DIAG979: eta0 wit={w_eta0:+.12e} prod={p_eta0:+.12e} d={:+.3e}", w_eta0 - p_eta0);
+        eprintln!("DIAG979: eta1 wit={w_eta1:+.12e} prod={p_eta1:+.12e} d={:+.3e}", w_eta1 - p_eta1);
+        eprintln!("DIAG979: chi1 wit={w_chi1:+.12e} prod={p_chi1:+.12e} d={:+.3e}", w_chi1 - p_chi1);
+        eprintln!("DIAG979: d1   wit={w_d1:+.12e} prod={p_d1:+.12e} d={:+.3e}", w_d1 - p_d1);
+    }
     assert!(
         (prod_value - wit_value).abs() <= 1e-7 * prod_value.abs().max(1.0),
         "witness re-derivation disagrees with production scalar NLL: witness {wit_value:+.10e} vs production {prod_value:+.10e} \
