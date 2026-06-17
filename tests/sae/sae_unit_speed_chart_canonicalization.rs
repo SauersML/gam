@@ -270,6 +270,74 @@ fn circle_canonicalization_freezes_the_image() {
     );
 }
 
+/// #1227 regression: the hybrid-split report must be computed AFTER chart
+/// canonicalization, not before. The split stores a per-atom linear image
+/// `b0 + (t − t̄) b1` keyed to the coordinate `t` in use; canonicalization is a
+/// (nonlinear) reparameterization of `t`, so a report computed before the
+/// reparameterization records the line in a coordinate system that is then
+/// replaced. The fix runs the reparameterization first, then the split — so the
+/// stored report must equal a fresh report recomputed against the post-
+/// canonicalization (current) coordinate. On the warped circle the canonical
+/// coordinate differs materially from the fitted one (19× speed warp), so a
+/// stale pre-canonicalization report would NOT match this recompute.
+#[test]
+fn hybrid_split_report_is_computed_after_chart_canonicalization() {
+    let (mut term, z, rho) = planted_warped_circle();
+
+    term.canonicalize_charts_post_fit(z.view(), &rho, None)
+        .expect("canonicalization pass");
+    assert!(
+        term.atoms[0].chart_canonicalized,
+        "the warped circle must canonicalize for this regression to be meaningful"
+    );
+
+    let stored = term
+        .hybrid_split_report()
+        .cloned()
+        .expect("post-fit canonicalization must store a hybrid-split report");
+
+    // Recompute against the CURRENT (canonical) coordinate. If the stored report
+    // had been computed before canonicalization (the #1227 bug), its
+    // chart-dependent verdict fields would disagree with this recompute.
+    let recomputed = term
+        .compute_hybrid_split_report(&rho, Some(z.view()))
+        .expect("recompute hybrid split against canonical coords")
+        .expect("recomputed report present");
+
+    assert_eq!(
+        stored.verdicts.len(),
+        recomputed.verdicts.len(),
+        "stored vs recomputed verdict count"
+    );
+    for (s, r) in stored.verdicts.iter().zip(recomputed.verdicts.iter()) {
+        assert_eq!(s.atom_name, r.atom_name);
+        assert_eq!(
+            s.kept_curved, r.kept_curved,
+            "atom '{}' curved/linear verdict must match the canonical-coord recompute",
+            s.atom_name
+        );
+        match (&s.linear_image, &r.linear_image) {
+            (Some(si), Some(ri)) => assert!(
+                (si.t_bar - ri.t_bar).abs() <= 1.0e-9,
+                "atom '{}' linear-image t̄ must be in the canonical coordinate: \
+                 stored {} vs recomputed {}",
+                s.atom_name,
+                si.t_bar,
+                ri.t_bar
+            ),
+            (None, None) => {}
+            _ => panic!(
+                "atom '{}' linear-image presence must match the canonical recompute",
+                s.atom_name
+            ),
+        }
+    }
+    assert_eq!(
+        stored.selection.curved_atom_count, recomputed.selection.curved_atom_count,
+        "curved-atom count must match the canonical-coord recompute"
+    );
+}
+
 #[test]
 fn certificate_reports_chart_pinned_by_canonicalization_with_finite_group() {
     let (mut term, z, rho) = planted_warped_circle();
