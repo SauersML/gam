@@ -286,6 +286,9 @@ pub(crate) fn apply_dense_bspline_extrapolation(
     if num_basis_functions == 0 {
         return Ok(());
     }
+    if !has_clamped_bspline_boundaries(knotview, degree) {
+        return Ok(());
+    }
 
     let left = knotview[degree];
     let right = knotview[num_basis_functions];
@@ -334,6 +337,31 @@ pub(crate) fn apply_dense_bspline_extrapolation(
     }
 
     Ok(())
+}
+
+#[inline]
+pub(crate) fn has_clamped_bspline_boundaries(
+    knotview: ArrayView1<f64>,
+    degree: usize,
+) -> bool {
+    let clamp_count = degree + 1;
+    if knotview.len() < 2 * clamp_count {
+        return false;
+    }
+    let left = knotview[0];
+    let right = knotview[knotview.len() - 1];
+    let scale = (right - left).abs().max(1.0);
+    let tol = KNOT_SPAN_DEGENERACY_FLOOR * scale;
+    let left_clamped = knotview
+        .iter()
+        .take(clamp_count)
+        .all(|&k| (k - left).abs() <= tol);
+    let right_clamped = knotview
+        .iter()
+        .rev()
+        .take(clamp_count)
+        .all(|&k| (k - right).abs() <= tol);
+    left_clamped && right_clamped
 }
 
 #[inline]
@@ -761,7 +789,8 @@ impl BasisStorage for SparseStorage {
         let nrows = data.len();
         let left = knotview[degree];
         let right = knotview[num_basis_functions];
-        let needs_extrapolation = data.iter().any(|&x| x < left || x > right);
+        let needs_extrapolation = has_clamped_bspline_boundaries(knotview, degree)
+            && data.iter().any(|&x| x < left || x > right);
         if needs_extrapolation {
             let dense = DenseStorage::build(
                 data,
