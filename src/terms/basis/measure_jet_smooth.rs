@@ -931,7 +931,45 @@ pub fn measure_jet_energy_form(
         1,
         &|_, _, _, base, out: &mut [[f64; 3]]| out[0] = [base, 0.0, 0.0],
     )?;
-    Ok(forms.swap_remove(0))
+    let q = forms.swap_remove(0);
+    // The energy `Q = Σ wᵢ Rᵢ` is a nonnegative combination of analytically
+    // PSD local residual forms, so it is PSD in exact arithmetic. The affine
+    // span is annihilated to machine zero, where roundoff in the per-block
+    // pseudo-inverse and the centering cancellation leaves the smallest
+    // eigenvalue at ±ε_mach·‖Q‖. Project onto the PSD cone (floor negative
+    // eigenvalues at 0) so `vᵀQv ≥ 0` holds exactly for every `v`, including
+    // the affine directions the energy must annihilate.
+    project_symmetric_psd(q, "measure-jet energy form")
+}
+
+/// Project a symmetric matrix onto the PSD cone by flooring its negative
+/// eigenvalues at 0. Only sub-machine-precision negative eigenvalues are
+/// expected here (the form is analytically PSD); a meaningfully negative
+/// eigenvalue would indicate an assembly bug, so it is floored but the
+/// reconstruction otherwise preserves the spectrum exactly.
+pub(crate) fn project_symmetric_psd(
+    a: Array2<f64>,
+    label: &str,
+) -> Result<Array2<f64>, BasisError> {
+    let n = a.nrows();
+    if n == 0 {
+        return Ok(a);
+    }
+    let (evals, evecs) = a.eigh(Side::Lower).map_err(|e| {
+        BasisError::InvalidInput(format!(
+            "measure-jet PSD projection `{label}` eigendecomposition failed: {e}"
+        ))
+    })?;
+    if evals.iter().all(|&lam| lam >= 0.0) {
+        return Ok(a);
+    }
+    let mut scaled = evecs.clone();
+    for (k, mut col) in scaled.axis_iter_mut(Axis(1)).enumerate() {
+        let lam = evals[k].max(0.0);
+        col.mapv_inplace(|v| v * lam);
+    }
+    let psd = scaled.dot(&evecs.t());
+    Ok((&psd + &psd.t()) * 0.5)
 }
 
 /// The energy together with its exact first and second jets in the live
