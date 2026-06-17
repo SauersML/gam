@@ -471,7 +471,16 @@ pub(crate) fn outer_gradient_entry(
         0.0
     };
     let det_term = if incl_logdet_s { 0.5 * ld_s_i } else { 0.0 };
-    penalty_term + trace_term - det_term
+    let value = penalty_term + trace_term - det_term;
+    // #931 TEMPORARY instrumentation: env-gated per-term breakdown of the
+    // survival-LAML ρ-gradient entry to localize the large-λ desync. Remove
+    // once the dropped term is fixed. Inert unless GAM_931_RHOGRAD_DEBUG is set.
+    if std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some() {
+        eprintln!(
+            "[931-RHOGRAD] value={value:+.9e} a_i(penalty_quad)={penalty_term:+.9e} half_trace_logH={trace_term:+.9e} half_ld_s(penalty_logdet)={det_term:+.9e} raw_trace_logdet_i={trace_logdet_i:+.9e} raw_ld_s_i={ld_s_i:+.9e} incl_h={incl_logdet_h} incl_s={incl_logdet_s}"
+        );
+    }
+    value
 }
 
 /// Compute one entry of the outer Hessian.
