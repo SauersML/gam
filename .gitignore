@@ -187,3 +187,8 @@ azuser@/
 
 # Internal dev/MSI tooling — not for the public repo
 /dev/
+
+# Stray nested working-copy of the repo an agent left in-tree; never track
+# (orphan gitlink with no .gitmodules accidentally swept in by git add -A,
+# broke the build.rs line-count audit). Ignore so it can not be re-added.
+/gam_saetrain/
