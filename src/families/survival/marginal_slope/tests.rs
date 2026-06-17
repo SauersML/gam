@@ -2083,33 +2083,6 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
                 - event * qd1.ln())
     };
 
-    // DIAG979: witness NLL restricted to one term group (0=eta surv/dens, 1=chi, 2=d, 3=q-only).
-    let witness_nll_term = |pv: &[f64], group: usize| -> f64 {
-        let q0 = pv[primary.q0];
-        let q1 = pv[primary.q1];
-        let qd1 = pv[primary.qd1];
-        let g = pv[primary.g];
-        let beta_h: Vec<f64> = h_range.clone().map(|i| pv[i]).collect();
-        let beta_w: Vec<f64> = w_range.clone().map(|i| pv[i]).collect();
-        let (a0, _) = solve_intercept(q0, g, &beta_h, &beta_w);
-        let (a1, d1) = solve_intercept(q1, g, &beta_h, &beta_w);
-        let (eta0, _) = observed_eta_chi(a0, g, &beta_h, &beta_w);
-        let (eta1, chi1) = observed_eta_chi(a1, g, &beta_h, &beta_w);
-        let tau_ln = std::f64::consts::TAU.ln();
-        let log_phi_eta1 = -0.5 * (eta1 * eta1 + tau_ln);
-        let log_phi_q1 = -0.5 * (q1 * q1 + tau_ln);
-        let v = match group {
-            0 => {
-                wnorm_cdf(-eta0).ln() - (1.0 - event) * wnorm_cdf(-eta1).ln()
-                    - event * log_phi_eta1
-            }
-            1 => -event * chi1.ln(),
-            2 => event * d1.ln(),
-            _ => -event * log_phi_q1 - event * qd1.ln(),
-        };
-        weight * v
-    };
-
     // Base primary point with NON-ZERO deviation coefficients.
     let mut p0 = vec![0.0_f64; p];
     p0[primary.q0] = q0v;
@@ -2225,42 +2198,6 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
     let third = family
         .row_flex_primary_third_contracted_exact(0, &block_states, &unit(gi))
         .expect("production third contracted (nonzero deviation)");
-    // DIAG979: per-term third-FD breakdown for the (g,w) block (dir=g).
-    {
-        let fd_term = |group: usize, h: f64| -> f64 {
-            let nll = |pv: &[f64]| witness_nll_term(pv, group);
-            let d3 = |hh: f64| {
-                let mut s = 0.0;
-                for (oi, ci) in [(-1.0, -0.5), (1.0, 0.5)] {
-                    for (oj, cj) in [(-1.0, -0.5), (1.0, 0.5)] {
-                        for (ok, ck) in [(-1.0, -0.5), (1.0, 0.5)] {
-                            let mut pp = p0.clone();
-                            pp[gi] += oi * hh;
-                            pp[wi0] += oj * hh;
-                            pp[gi] += ok * hh;
-                            s += ci * cj * ck * nll(&pp);
-                        }
-                    }
-                }
-                s / hh.powi(3)
-            };
-            let co = d3(h);
-            let fi = d3(h * 0.5);
-            (4.0 * fi - co) / 3.0
-        };
-        for grp in 0..4 {
-            eprintln!(
-                "DIAG979 (g,w) term[{}] fd3 = {:+.6e}",
-                grp,
-                fd_term(grp, 3e-3)
-            );
-        }
-        eprintln!(
-            "DIAG979 (g,w) full witness = {:+.6e}  production = {:+.6e}",
-            central_rich(&[(gi, 1), (wi0, 1), (gi, 1)], 3e-3),
-            third[[gi, wi0]]
-        );
-    }
     let third_checks = [(q0i, hi0), (gi, wi0), (hi0, wi0), (q0i, wi0)];
     for &(u, v) in &third_checks {
         let want = central_rich(&[(u, 1), (v, 1), (gi, 1)], 6e-3);
