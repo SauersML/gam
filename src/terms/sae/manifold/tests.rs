@@ -172,52 +172,67 @@ pub(crate) fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()
 }
 
-/// The #1037 quotient-dimension guard (re-anchoring semantics): the recorded
-/// count of gauge-deflated evidence directions need not be CONSTANT — a
-/// legitimate quotient-dimension event (atom birth / #976 reseed /
-/// rank-reduction) moves it, and each such change is evidence-preserving (a
+/// The #1037 quotient-dimension guard, with #1217 oscillation semantics: the
+/// recorded count of gauge-deflated evidence directions need not be CONSTANT —
+/// it is a per-ROW-summed O(N) count of near-null evidence directions that
+/// drifts smoothly across the ρ-walk, and every change is evidence-preserving (a
 /// deflated direction contributes `log 1 = 0` to `½log|H|` either way). The
-/// guard therefore RE-ANCHORS the comparison to the new dimension instead of
-/// aborting, so cross-ρ comparisons within the optimization stay consistent.
-/// The genuine pathology it must still catch is a count that NEVER
-/// STABILIZES: re-anchors beyond the per-atom structural-event budget mean
-/// the quotient dimension is runaway, which is refused loudly.
+/// guard RE-ANCHORS the comparison to the new dimension instead of aborting. A
+/// MONOTONE drift of any length is benign (the conditioning is just improving),
+/// so it never trips the budget; the genuine pathology the guard must still
+/// catch is an OSCILLATING count — repeated direction reversals that never
+/// settle — which is refused loudly past the reversal budget.
 #[test]
 pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runaway() {
     let mut term = trivial_k1_euclidean_term();
     assert!(term.expected_evidence_gauge_deflated_directions.is_none());
 
-    // First observation pins the expected count.
-    term.record_evidence_gauge_deflation_count(5).unwrap();
-    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
+    // First observation pins the expected count (high, like a real K=2 walk
+    // that starts with many near-null evidence directions).
+    term.record_evidence_gauge_deflation_count(60).unwrap();
+    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(60));
 
     // A matching later observation is a no-op (still Ok, count unchanged).
-    term.record_evidence_gauge_deflation_count(5).unwrap();
-    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(5));
+    term.record_evidence_gauge_deflation_count(60).unwrap();
+    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(60));
 
-    // K=1 ⇒ re-anchor budget = 1·(RESEED_BUDGET + 1) + 1 = 3 legitimate
-    // quotient-dimension events. Each DIFFERING observation (any magnitude:
-    // the #1037 invariant is dimension-consistency of the comparison, not a
-    // ±1 flicker band) re-anchors the expected count and stays Ok while
-    // under budget.
-    term.record_evidence_gauge_deflation_count(6).unwrap(); // re-anchor 1
-    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(6));
-    term.record_evidence_gauge_deflation_count(9).unwrap(); // re-anchor 2 (a larger jump still re-anchors)
-    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(9));
-    term.record_evidence_gauge_deflation_count(7).unwrap(); // re-anchor 3 (at budget)
-    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(7));
+    // A MONOTONE drift (the #1217 benign case — a per-row conditioning count
+    // shrinking across the ρ-walk) re-anchors freely without charging the budget,
+    // no matter how many steps it takes. This is exactly the real-OLMo K=2
+    // signature (171→…→113) that the old `k`-event budget wrongly tripped on.
+    for c in [50usize, 40, 33, 21, 12, 9, 6, 4, 3, 2] {
+        term.record_evidence_gauge_deflation_count(c).unwrap();
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(c));
+    }
+    assert_eq!(term.evidence_gauge_deflation_reanchors, 0, "monotone drift charges no reversals");
 
-    // A FOURTH re-anchor exceeds the budget: the count is not stabilizing →
-    // loud error (#1037 invariant preserved as a runaway-quotient guard).
-    let err = term
-        .record_evidence_gauge_deflation_count(8)
-        .expect_err("a runaway quotient dimension must error past the re-anchor budget");
-    assert!(
-        err.contains("not stabilizing") && err.contains("re-anchored"),
-        "guard must report the runaway re-anchoring explicitly; got: {err}"
-    );
-    // The expected count is NOT re-anchored on a runaway refusal.
-    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(7));
+    // An OSCILLATING count (up/down/up/down…) IS the runaway pathology. K=1 ⇒
+    // reversal budget = 1·(RESEED_BUDGET + 1) + 1 = 6. Each direction reversal
+    // charges one; a sustained oscillation exhausts the budget and refuses.
+    let mut last_ok = 2usize;
+    let mut hi = true;
+    let oscillation = [9usize, 2, 9, 2, 9, 2, 9, 2, 9, 2, 9, 2, 9, 2];
+    let mut errored = false;
+    for &c in &oscillation {
+        match term.record_evidence_gauge_deflation_count(c) {
+            Ok(()) => {
+                last_ok = c;
+                hi = !hi;
+            }
+            Err(err) => {
+                assert!(
+                    err.contains("not stabilizing") && err.contains("oscillated"),
+                    "guard must report the oscillating quotient dimension explicitly; got: {err}"
+                );
+                // On the refusal the expected count is NOT re-anchored.
+                assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(last_ok));
+                errored = true;
+                break;
+            }
+        }
+    }
+    let _ = hi;
+    assert!(errored, "a sustained oscillation must exceed the reversal budget and error");
 }
 
 /// The identity-homotopy shortcut's structural probe: the η dial is inert

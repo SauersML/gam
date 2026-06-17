@@ -285,6 +285,17 @@ pub struct SaeManifoldTerm {
     /// never settles is the genuine pathology the guard must still catch. Reset
     /// to `0` alongside `expected_evidence_gauge_deflated_directions`.
     pub(crate) evidence_gauge_deflation_reanchors: usize,
+    /// #1217 oscillation detector: the sign of the most recent change in the
+    /// gauge-deflation count (`+1` when it last increased, `−1` when it last
+    /// decreased, `0` before the first change). The deflation count is a
+    /// per-ROW-summed count of near-null evidence directions, so on real K≥2
+    /// data it drifts smoothly (and monotonically) as the conditioning improves
+    /// across the ρ-walk — a benign O(N) quantity, NOT a discrete dictionary
+    /// event. The genuine pathology the #1037 guard must catch is an
+    /// OSCILLATING count (repeated direction reversals that never settle), so
+    /// the re-anchor budget is charged only on a direction REVERSAL, not on
+    /// every monotone drift step. Reset to `0` alongside the re-anchor counter.
+    pub(crate) evidence_gauge_deflation_last_delta_sign: i8,
     /// #976 / #1117 K>1 robustness: how many full-dictionary co-collapse
     /// multi-starts the decoder-norm guard has already spent in the current
     /// optimization. Bounded by [`SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`];
@@ -333,6 +344,8 @@ impl Clone for SaeManifoldTerm {
             expected_evidence_gauge_deflated_directions: self
                 .expected_evidence_gauge_deflated_directions,
             evidence_gauge_deflation_reanchors: self.evidence_gauge_deflation_reanchors,
+            evidence_gauge_deflation_last_delta_sign: self
+                .evidence_gauge_deflation_last_delta_sign,
             dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),

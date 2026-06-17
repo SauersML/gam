@@ -91,6 +91,7 @@ impl SaeManifoldTerm {
             curvature_walk_report: None,
             expected_evidence_gauge_deflated_directions: None,
             evidence_gauge_deflation_reanchors: 0,
+            evidence_gauge_deflation_last_delta_sign: 0,
             dictionary_cocollapse_reseeds: 0,
             hybrid_split_report: None,
             atom_inner_fits: None,
@@ -5100,18 +5101,42 @@ impl SaeManifoldTerm {
                 // must agree across a comparison, and re-anchoring restores that.
                 //
                 // The genuine pathology the guard must still catch is a count
-                // that NEVER STABILIZES — an oscillating / runaway quotient
-                // dimension that re-anchors without converging, signalling a
-                // truly ill-posed evidence surface rather than a finite number of
-                // structural events. Each atom can contribute at most one
-                // birth/rank-reduction plus `SAE_ATOM_COLLAPSE_RESEED_BUDGET`
-                // per-atom reseeds, and the whole dictionary can co-collapse and be
-                // multi-started at most `SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`
-                // times (each touching all K atoms), so a healthy walk re-anchors a
-                // bounded number of times. Exceeding that bound is the structural
-                // pathology, and there we refuse to compare.
-                self.evidence_gauge_deflation_reanchors += 1;
-                let reanchor_budget = self
+                // that NEVER STABILIZES — an OSCILLATING quotient dimension that
+                // re-anchors without converging, signalling a truly ill-posed
+                // evidence surface. But the deflation count is NOT a discrete
+                // dictionary-level event count: it is the per-ROW-summed number of
+                // near-null evidence directions across all N rows (#1217). On real
+                // K≥2 activations it is an O(N) quantity that drifts SMOOTHLY and
+                // monotonically as the conditioning improves over the ρ-walk
+                // (e.g. 171→156→…→113 as smoothing increases) — a benign,
+                // evidence-neutral change (each deflated direction contributes the
+                // ρ-independent `log 1 = 0` to `½log|H|`, so re-anchoring never
+                // moves the criterion value). Charging such a monotone drift
+                // against a `k`-sized "structural event" budget was wrong: it
+                // counts threshold crossings of a continuous per-row quantity, not
+                // atom births/reseeds, so the budget tripped on a perfectly healthy
+                // converging K=2 fit (#1217 regression from the #1189/#1190
+                // basin-escape fixes, which shifted which rows sit near the
+                // deflation floor).
+                //
+                // The principled discriminator is DIRECTION REVERSALS: a count
+                // that drifts one way and settles is benign; a count that bounces
+                // up and down without settling is the oscillating-quotient
+                // pathology. We therefore charge the re-anchor budget ONLY on a
+                // reversal of the change direction, and size the budget by the
+                // number of distinct dictionary structural events (births/reseeds)
+                // that can each legitimately flip the drift direction. A monotone
+                // drift of any length re-anchors freely (it is consistently
+                // re-anchored and evidence-neutral); a genuinely oscillating count
+                // exhausts the reversal budget and refuses loudly.
+                let delta_sign: i8 = if count > expected { 1 } else { -1 };
+                let is_reversal = self.evidence_gauge_deflation_last_delta_sign != 0
+                    && delta_sign != self.evidence_gauge_deflation_last_delta_sign;
+                self.evidence_gauge_deflation_last_delta_sign = delta_sign;
+                if is_reversal {
+                    self.evidence_gauge_deflation_reanchors += 1;
+                }
+                let reversal_budget = self
                     .k_atoms()
                     .saturating_mul(
                         SAE_ATOM_COLLAPSE_RESEED_BUDGET
@@ -5119,21 +5144,22 @@ impl SaeManifoldTerm {
                             + 1,
                     )
                     .saturating_add(1);
-                if self.evidence_gauge_deflation_reanchors > reanchor_budget {
+                if self.evidence_gauge_deflation_reanchors > reversal_budget {
                     return Err(format!(
                         "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count \
-                         re-anchored {} times (last {expected}->{count}) within one optimization, \
-                         exceeding the {reanchor_budget}-event budget for {} atoms; the quotient \
-                         dimension is not stabilizing, refusing to compare Laplace normalizers",
+                         oscillated (reversed direction {} times, last {expected}->{count}) within \
+                         one optimization, exceeding the {reversal_budget}-reversal budget for {} \
+                         atoms; the quotient dimension is not stabilizing, refusing to compare \
+                         Laplace normalizers",
                         self.evidence_gauge_deflation_reanchors,
                         self.k_atoms()
                     ));
                 }
-                log::warn!(
+                log::debug!(
                     "SaeManifoldTerm::reml_criterion: per-row evidence deflation count changed \
-                     {expected}->{count} (a legitimate quotient-dimension event — atom \
-                     birth/reseed/rank-reduction across the ρ-walk); re-anchoring the Laplace \
-                     normalizer comparison to the new dimension (re-anchor {}/{reanchor_budget})",
+                     {expected}->{count} (a benign per-row conditioning drift across the ρ-walk; \
+                     reversal {}/{reversal_budget}); re-anchoring the Laplace normalizer comparison \
+                     to the new dimension",
                     self.evidence_gauge_deflation_reanchors
                 );
                 self.expected_evidence_gauge_deflated_directions = Some(count);
