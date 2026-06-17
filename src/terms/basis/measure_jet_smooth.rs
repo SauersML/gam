@@ -72,7 +72,7 @@
 //!
 //! Mirroring the constant-curvature κ-contract (#944): centers, masses, the
 //! band are deliberately hyperparameter-FIXED at build time; the representer
-//! range ℓ is the ONE design-moving dial (REML-learned, #1116). Consequences:
+//! range ℓ is the ONE opt-in design-moving dial (#1116). Consequences:
 //!
 //! - **Penalty-dial design drift is identically zero**: the (s, α, τ) dials
 //!   reweight only the jet-energy penalty, never the Gaussian representer
@@ -82,11 +82,10 @@
 //! - **The representer range ℓ is a design-moving dial** (matérn's `log_kappa`
 //!   analog, #1116): `X = K(data, centers; ℓ)·z` depends on ℓ, so
 //!   `∂X/∂lnℓ = (K ⊙ r²/ℓ²)·z ≠ 0`, while the jet-energy penalty does NOT
-//!   depend on ℓ (`∂S/∂lnℓ ≡ 0`). ℓ is REML-learned and rebuilds the design
-//!   per outer trial; it does not change the basis RANK (the Gaussian kernel
-//!   is PD ∀ℓ > 0 → rank ≡ m centers) but it does change which m-dim subspace
-//!   the representers span — the span-alignment lever that fixes over-smoothing
-//!   on low-intrinsic-dimension manifolds. FD-gated by
+//!   depend on ℓ (`∂S/∂lnℓ ≡ 0`). When explicitly enabled, ℓ rebuilds the
+//!   design per outer trial; it does not change the basis RANK (the Gaussian
+//!   kernel is PD ∀ℓ > 0 → rank ≡ m centers) but it does change which m-dim
+//!   subspace the representers span. FD-gated by
 //!   `psi_producer_matches_fd_length_scale`.
 //! - **Exact (s, α) penalty jets are shipped**:
 //!   [`measure_jet_energy_form_with_jets`] returns `∂Q/∂s`, `∂²Q/∂s²`,
@@ -227,12 +226,11 @@ pub struct MeasureJetFrozenQuadrature {
     pub fused_penalty_normalization_scale: Option<f64>,
 }
 
-/// Serde default for [`MeasureJetBasisSpec::learn_length_scale`]: REML-learn ℓ.
-/// A function (not a literal) because `#[serde(default)]` on a `bool` would
-/// deserialize a missing field as `false`, silently freezing ℓ on every spec
-/// that predates the field — the opposite of the intended default.
+/// Serde default for [`MeasureJetBasisSpec::learn_length_scale`]: freeze ℓ at
+/// the realized auto/user value unless a fit explicitly opts into the
+/// design-moving outer coordinate.
 fn measure_jet_learn_length_scale_default() -> bool {
-    true
+    false
 }
 
 /// Measure-jet smooth configuration (`mjs(x0, …, xd)`).
@@ -264,15 +262,12 @@ pub struct MeasureJetBasisSpec {
     /// penalty.
     pub double_penalty: bool,
     /// REML-learn the representer range ℓ as a design-moving outer dial
-    /// (`true`, default), mirroring Matérn's `log_kappa`. The Gaussian kernel is
+    /// (opt-in), mirroring Matérn's `log_kappa`. The Gaussian kernel is
     /// strictly PD for every ℓ > 0, so ℓ does NOT change the basis rank (always
     /// `m` centers) — but it changes WHICH `m`-dim subspace the representers
-    /// span, i.e. the span alignment with the true surface. The frozen
-    /// ambient-spacing ℓ over-smooths data on a low-intrinsic-dimension manifold
-    /// (#1116: 13× worse than Matérn on a 1-D curve in 3-D, where ambient
-    /// nearest-center spacing over-estimates the resolution needed); letting
-    /// REML pick ℓ recovers the aligned subspace. `false` freezes ℓ at the auto
-    /// (or explicit) value with no outer enrollment.
+    /// span, i.e. the span alignment with the true surface. The stable default
+    /// freezes ℓ at the auto/user value; `true` enrolls the outer coordinate for
+    /// experiments that need REML-selected representer range.
     #[serde(default = "measure_jet_learn_length_scale_default")]
     pub learn_length_scale: bool,
     /// Explicit opt-in for multiscale mode: the per-scale spectral penalty
@@ -314,7 +309,7 @@ impl Default for MeasureJetBasisSpec {
             num_scales: 0,
             length_scale: 0.0,
             double_penalty: true,
-            learn_length_scale: true,
+            learn_length_scale: false,
             multiscale: false,
             identifiability: MeasureJetIdentifiability::CenterSumToZero,
             frozen_quadrature: None,
@@ -2411,8 +2406,8 @@ mod tests {
     /// ℓ-independent). This is the FD gate matérn's log_kappa has and mjs lacked.
     #[test]
     pub(crate) fn psi_producer_matches_fd_length_scale() {
-        // Single-scale default with ℓ learning ON; frozen geometry so only ℓ
-        // moves across the FD trials.
+        // Single-scale with opt-in ℓ learning; frozen geometry so only ℓ moves
+        // across the FD trials.
         let (data, mut frozen) = frozen_spec_fixture(0.0, false);
         frozen.learn_length_scale = true;
         let derivs =

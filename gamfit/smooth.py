@@ -483,10 +483,9 @@ class MeasureJet(Smooth):
     masses as μ-weights, local jet residuals as the roughness carrier, with
     no graph, mesh, or neighbor-set inside the statistical object. Every
     option is auto-derived from the data when omitted; set a field only to
-    pin it. The per-scale spectral penalty split and the smoothness/density
-    dials auto-enable only at large center counts (a spectrum needs many
-    centers to identify); small fits use one fused penalty at Duchon-class
-    cost.
+    pin it or explicitly opt into an outer coordinate. The default uses one
+    fused penalty at Duchon-class cost; per-scale multiscale penalties and
+    learned representer range are explicit opt-ins.
 
     Parameters
     ----------
@@ -504,6 +503,9 @@ class MeasureJet(Smooth):
     scales : optional int — number of scale nodes in the multiscale band.
     length_scale : optional positive float — representer (Gaussian RBF)
         range.
+    learn_length_scale : optional bool — opt into REML learning of the
+        representer range. ``None`` defers to the engine default (fixed);
+        pass ``True`` to add the design-moving outer coordinate.
     double_penalty : optional bool — add the ridge-like shrinkage penalty
         alongside the jet-energy penalty. ``None`` defers to the engine
         default (on); pass ``False`` to disable it explicitly.
@@ -516,6 +518,7 @@ class MeasureJet(Smooth):
     tau: float | None = None
     scales: int | None = None
     length_scale: float | None = None
+    learn_length_scale: bool | None = None
     # Tri-state override of the base ``bool = False`` field: the engine
     # default for measure-jet is double-penalty ON, so ``None`` must mean
     # "defer to the engine" and an explicit ``False`` must be emitted.
@@ -537,6 +540,8 @@ class MeasureJet(Smooth):
             out["scales"] = int(self.scales)
         if self.length_scale is not None:
             out["length_scale"] = float(self.length_scale)
+        if self.learn_length_scale is not None:
+            out["learn_length_scale"] = bool(self.learn_length_scale)
         if self.double_penalty is not None:
             out["double_penalty"] = bool(self.double_penalty)
         return out

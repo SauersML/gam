@@ -2385,11 +2385,11 @@ pub fn build_smooth_basis(
             // affine-preserving ridge) is an explicit opt-in (#1116): default
             // single-scale at any center count, the Duchon/Matérn footprint.
             let multiscale = option_bool(options, "multiscale").unwrap_or(false);
-            // REML-learn the representer range ℓ as a design-moving dial
-            // (default true, #1116) — matérn's log_kappa analog; the cure for
-            // over-smoothing on low-intrinsic-dimension manifolds. An explicit
-            // positive `length_scale=` with `learn_length_scale=false` freezes ℓ.
-            let learn_length_scale = option_bool(options, "learn_length_scale").unwrap_or(true);
+            // REML-learning the representer range ℓ is an explicit opt-in.
+            // The stable default freezes ℓ at the auto/user value; the
+            // design-moving coordinate is expensive and can overfit low-signal
+            // surfaces when enabled implicitly.
+            let learn_length_scale = option_bool(options, "learn_length_scale").unwrap_or(false);
             Ok(SmoothBasisSpec::MeasureJet {
                 feature_cols: cols.to_vec(),
                 spec: MeasureJetBasisSpec {

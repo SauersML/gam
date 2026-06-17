@@ -675,8 +675,8 @@ fn apply_measure_jet(
     if let Some(multiscale) = descriptor.get("multiscale").and_then(JsonValue::as_bool) {
         spec.multiscale = multiscale;
     }
-    // REML-learn the representer length-scale ℓ as a design-moving dial
-    // (default true, #1116). matérn's log_kappa analog.
+    // REML-learning the representer length-scale ℓ is explicit opt-in; the
+    // default keeps the realized auto/user scale fixed.
     if let Some(learn) = descriptor
         .get("learn_length_scale")
         .and_then(JsonValue::as_bool)

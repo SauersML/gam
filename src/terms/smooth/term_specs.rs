@@ -2902,10 +2902,9 @@ fn measure_jet_term_spec(
 /// `spatial_term_uses_per_axis_psi` both defer here so the θ-layout
 /// sources cannot disagree.
 fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
-    // Two independent enrollment sources (#1116):
+    // Two independent enrollment sources (#1116), both explicit:
     //   * the design-moving representer length-scale ℓ (`learn_length_scale`),
-    //     available in EVERY mode (it is the cure for the over-smoothing on
-    //     low-intrinsic-dimension manifolds — matérn's log_kappa analog);
+    //     available in every mode when the spec opts in;
     //   * the multiscale penalty dials (s, α, lnτ): the per-scale spectral
     //     split's (α, lnτ) ride the explicit `multiscale` opt-in, and the lnτ
     //     channel additionally needs a positive ridge (τ = 0 is the
@@ -2915,9 +2914,8 @@ fn measure_jet_enrolls_psi(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
         || (mj.tau0 > 0.0 && crate::basis::measure_jet_multiscale_mode(mj))
 }
 
-/// Whether the design-moving ℓ dial is enrolled for this term. ℓ is learnable
-/// in every mode; an explicitly-pinned positive `length_scale` with
-/// `learn_length_scale = false` freezes it (matches a user-fixed kernel scale).
+/// Whether the design-moving ℓ dial is enrolled for this term. ℓ is fixed by
+/// default and learnable in every mode only when `learn_length_scale = true`.
 fn measure_jet_learns_length_scale(mj: &crate::basis::MeasureJetBasisSpec) -> bool {
     mj.learn_length_scale
 }
@@ -2934,10 +2932,8 @@ const MEASURE_JET_PSI_ALPHA_BOUNDS: (f64, f64) = (-1.0, 3.0);
 const MEASURE_JET_PSI_LN_TAU_BOUNDS: (f64, f64) = (-18.420680743952367, 4.605170185988092);
 
 /// Log-ℓ box for the design-moving representer length-scale dial (#1116). An
-/// ABSOLUTE window in the data coordinate scale (ln of ℓ ∈ [1e-3, 1e2]): wide
-/// enough to let REML shrink ℓ ~orders below the auto ambient-spacing seed
-/// (the fix for the 1-D-curve-in-3-D over-smoothing) or grow it for very smooth
-/// surfaces, while keeping the Gaussian kernel numerically well-scaled. Absolute
+/// ABSOLUTE window in the data coordinate scale (ln of ℓ ∈ [1e-3, 1e2]) used
+/// only when the spec explicitly enrolls the learned representer range. Absolute
 /// (not seed-relative) so the bound producer needs no data view, matching the
 /// other dial boxes. `ln(1e-3) = -6.9077…`, `ln(1e2) = 4.6051…`.
 const MEASURE_JET_PSI_LN_LENGTH_SCALE_BOUNDS: (f64, f64) = (-6.907755278982137, 4.605170185988092);

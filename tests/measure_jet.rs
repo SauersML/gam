@@ -24,5 +24,3 @@ mod measure_jet_web_quality;
 mod zz_diag_1040_probe;
 #[path = "measure_jet/zz_gamma_fd_hsweep_diag.rs"]
 mod zz_gamma_fd_hsweep_diag;
-#[path = "measure_jet/zz_mjs_lengthscale_sweep_1041.rs"]
-mod zz_mjs_lengthscale_sweep_1041;
