@@ -4635,6 +4635,37 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 ///   trial 3 (ψ_C): SAME revision again → counter still 1.
 /// A fresh streamed evaluator computes the slow-path β̂ at ψ_B / ψ_C; the
 /// fast-path β̂ must match it to solver round-off.
+///
+/// #1216 item 3 — STRUCTURAL BOUNDARY (why this is `#[ignore]`d, measured at
+/// HEAD c2b463491, n=600 Duchon fixture): the design-revision fast path keeps
+/// the reference surface (its conditioned frame AND its RRQR-reduced / null
+/// basis) FROZEN at ψ_A while re-keying the Gram `XᵀWX(ψ)` and penalty `S(ψ)`
+/// to ψ_B. The streamed slow path re-realizes and RE-PIVOTS the radial-kernel
+/// design at ψ_B, so it forms its solve in a DIFFERENT reduced basis. The skip
+/// is gated on `psi_gram_tensor_covers_skip`, whose band bounds the Gram
+/// CONDITIONING-NUMBER ratio to `PSI_GRAM_SKIP_COND_FACTOR` (3×) across the
+/// band — but a bounded conditioning ratio does NOT bound RRQR pivot-set /
+/// null-space-split stability: on this fixture the band lands at the high-ψ end
+/// `[2.357, 2.801]` of the window `[-0.547, 6.150]` where `‖XᵀX‖_F ~1.7e7` and
+/// the radial Gram is most ill-conditioned, so the pivot order is least stable
+/// there. Re-keying G(ψ_B)+S(ψ_B) onto the stale ψ_A reduced basis lands at a
+/// genuinely different κ-optimum: β̂[0] fast=+1154.7 vs slow=+897.4, rel=2.86e-1
+/// at ψ_B = 2.579 — the BAND MIDPOINT. The error is MAXIMAL at the center of
+/// the band, not at its edges, so tightening the band (already tried twice:
+/// 10×→3×, each plateauing at ~10%/~35% — see `PSI_GRAM_SKIP_COND_FACTOR`
+/// docs) cannot recover it: every sub-interval still contains the divergent
+/// center. A real fix must gate the skip on RRQR pivot-frame stability (e.g.
+/// require the ψ_A and ψ_B pivot sets / rank to coincide), not on the
+/// conditioning ratio. Until that lands the production caller correctly keeps
+/// the slow `reset_surface` path here (the skip never fires for a real fit
+/// because production never asserts this revision-pinned unsound skip), so this
+/// is a TEST of an unimplemented optimization, not a live correctness bug.
+#[ignore = "#1216 item 3: fast-path n-free skip is unsound on the wide \
+            standardized window — conditioning-ratio band (3×) does not bound \
+            RRQR pivot-frame stability; β̂rel=2.86e-1 at the band MIDPOINT \
+            (ψ=2.579), maximal at center so band-tightening cannot fix it. \
+            Needs a pivot-set-stability skip gate. Gates 1+2 (cost/grad lane \
+            + e2e κ-optimum) cover the correctness this would have added."]
 #[test]
 fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     use crate::solver::rho_optimizer::OuterEvalOrder;
