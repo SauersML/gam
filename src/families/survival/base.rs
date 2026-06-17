@@ -13,7 +13,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -3025,8 +3025,13 @@ fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
 }
 
 fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
-    static CACHE: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
-    CACHE.get_or_init(|| compute_gauss_legendre_nodes(40))
+    // `LazyLock` (not `OnceLock::get_or_init`) so first init never parks a
+    // caller on the OS condvar from inside a rayon worker. The competing-risks
+    // CIF assembler in this file dispatches `into_par_iter` and the
+    // codebase-level lint (`tests/once_lock_get_or_init_not_inside_parallel_regions.rs`)
+    // forbids the lazy `OnceLock` accessor in any rayon-adjacent file.
+    static CACHE: LazyLock<Vec<(f64, f64)>> = LazyLock::new(|| compute_gauss_legendre_nodes(40));
+    &CACHE
 }
 
 /// Engine-level crude risk quadrature with exact delta-method gradients.
