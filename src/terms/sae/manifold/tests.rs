@@ -8912,10 +8912,12 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 /// outer trial and the whole REML loop pinned at `~1e12`.
 ///
 /// The #1189 fix makes the arrival floor RELATIVE to the certified anchor's own
-/// reconstruction EV (the achievable linear ceiling). This test pins, on the
-/// committed real fixture, that the certified entry arrives with a genuine,
-/// non-degenerate fit: the cost AFTER the data-collapse penalty is finite and
-/// strictly below the sentinel, and the in-sample EV clears the collapse floor.
+/// reconstruction EV (the achievable linear ceiling). This test drives the FULL
+/// production outer loop (`OuterProblem::run`, the same call the FFI makes) on
+/// the committed real fixture and pins that the settled fit is genuine: it
+/// records NO terminal data-collapse event, its in-sample EV clears the collapse
+/// floor, the settled loss is finite, and the cost AFTER the data-collapse
+/// penalty stays strictly below the `1e12` sentinel.
 #[test]
 pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -8928,51 +8930,91 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     // real activations exactly as the cold path does.
     let k = 8usize;
     let term = real_data_torus_seed_term(z_train.view(), k, 3);
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; k]);
+    let init_rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; k]);
+    let init_rho_flat = init_rho.to_flat();
+    let n_params = init_rho_flat.len();
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         z_train.clone(),
         None,
-        rho.clone(),
+        init_rho,
         25,
         0.04,
         1.0e-6,
         1.0e-6,
     );
 
-    // Run the certified curvature-homotopy entry (the K>=2 entry of record).
-    objective
-        .run_curvature_homotopy_entry_at_rho(&rho)
-        .expect("real-data curvature-homotopy entry must not error");
+    // Drive the FULL production outer REML loop (curvature-homotopy entry +
+    // ρ-anneal + seed cascade), exactly as the FFI does. Pre-#1189 this pinned
+    // every outer trial at `base + SAE_FIT_DATA_COLLAPSE_COST` and the fit fell
+    // into the degenerate basin; the `.run` itself must succeed (not error out
+    // on the sentinel) and the settled fit must be genuine.
+    crate::solver::rho_optimizer::OuterProblem::new(n_params)
+        .with_initial_rho(init_rho_flat)
+        .run(&mut objective, "SAE manifold #1189 real OLMo")
+        .expect("real-data outer REML loop must converge (not abort on the sentinel)");
 
-    // The fitted reconstruction must clear the data-collapse EV floor: this is
-    // exactly the predicate `record_fit_data_collapse_if_needed` tests before it
-    // would stamp the sentinel.
-    let fitted = objective
-        .term
-        .try_fitted_for_rho(&rho)
-        .expect("fitted reconstruction at entry rho");
+    let (fitted_term, fitted_rho, loss) = objective.into_fitted();
+
+    // No TERMINAL data-collapse event: a terminal collapse is the recorded
+    // signature of the degenerate-basin failure that drives the sentinel.
+    let terminal_collapses: Vec<_> = fitted_term
+        .collapse_events()
+        .iter()
+        .filter(|e| e.action == CollapseAction::Terminal)
+        .collect();
+    eprintln!(
+        "[#1189] real-data settled fit: {} collapse events ({} terminal)",
+        fitted_term.collapse_events().len(),
+        terminal_collapses.len()
+    );
+
+    // In-sample EV must clear the data-collapse floor — the exact predicate
+    // `record_fit_data_collapse_if_needed` (and the sentinel) keys on.
+    let fitted = fitted_term.fitted();
     let ev = reconstruction_explained_variance(z_train.view(), fitted.view())
         .expect("finite EV on the real fixture");
-    eprintln!("[#1189] real-data entry in-sample EV = {ev:.5}");
+    eprintln!("[#1189] real-data settled in-sample EV = {ev:.5}");
     assert!(
         ev.is_finite() && ev > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
         "real-data fit collapsed (EV {ev:.5} <= collapse floor {SAE_FIT_DATA_COLLAPSE_EV_FLOOR}): \
          the certified anchor arrival was rejected and the fit fell into the degenerate basin \
-         (#1189)."
+         (#1189). terminal collapses: {terminal_collapses:?}"
+    );
+    assert!(
+        terminal_collapses.is_empty(),
+        "real-data fit recorded {} TERMINAL data-collapse event(s) — the degenerate-basin \
+         signature that pins the outer loop at the sentinel (#1189): {terminal_collapses:?}",
+        terminal_collapses.len()
     );
 
-    // The cost lane the outer ρ-optimizer ranks: the REML criterion PLUS the
-    // data-collapse penalty. A collapsed fit adds `SAE_FIT_DATA_COLLAPSE_COST`
-    // (~1e12) here, pinning the loop; a genuine fit leaves it untouched.
-    let base_loss = objective
-        .term
-        .loss(z_train.view(), &rho)
-        .expect("loss at entry rho");
+    // The settled loss must be finite, and the cost lane the outer optimizer
+    // ranks (REML criterion + data-collapse penalty) must stay strictly below
+    // the `1e12` sentinel.
+    let total = loss.total();
+    assert!(
+        total.is_finite(),
+        "settled loss must be finite on real OLMo activations; got {total} (#1189)"
+    );
+    let base_loss = fitted_term
+        .loss(z_train.view(), &fitted_rho)
+        .expect("loss at settled rho");
     let base_cost = base_loss.total();
-    let penalized = objective
-        .add_fit_data_collapse_penalty(base_cost, &rho)
-        .expect("data-collapse penalty evaluation");
+    // Re-evaluate the data-collapse penalty on the settled fit through a fresh
+    // objective (the penalty consumes `&mut self.term`); a genuine fit leaves
+    // `base_cost` untouched, a collapsed one adds `SAE_FIT_DATA_COLLAPSE_COST`.
+    let penalized = SaeManifoldOuterObjective::new(
+        fitted_term.clone(),
+        z_train.clone(),
+        None,
+        fitted_rho.clone(),
+        0,
+        0.04,
+        1.0e-6,
+        1.0e-6,
+    )
+    .add_fit_data_collapse_penalty(base_cost, &fitted_rho)
+    .expect("data-collapse penalty evaluation");
     eprintln!(
         "[#1189] real-data outer cost: base={base_cost:.6e} after-collapse-penalty={penalized:.6e} \
          sentinel={SAE_FIT_DATA_COLLAPSE_COST:.3e}"
