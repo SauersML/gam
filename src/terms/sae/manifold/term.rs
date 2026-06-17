@@ -333,8 +333,7 @@ pub struct SaeManifoldTerm {
     /// `sae_manifold_predict_oos`, set from the serialized payload via
     /// [`Self::set_hybrid_linear_images`]. Consulted by
     /// [`Self::hybrid_linear_image_map`] so train and OOS share one collapse map.
-    pub(crate) oos_linear_images:
-        Option<Vec<crate::terms::sae::hybrid_split::AtomLinearImage>>,
+    pub(crate) oos_linear_images: Option<Vec<crate::terms::sae::hybrid_split::AtomLinearImage>>,
 }
 
 impl Clone for SaeManifoldTerm {

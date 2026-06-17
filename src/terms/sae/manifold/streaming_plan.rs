@@ -258,11 +258,7 @@ pub(crate) const fn sae_host_in_core_budget_from_available(available: usize) -> 
     };
     // Cap at usable: if the floor exceeds usable memory the budget collapses to
     // usable, so the direct-plan admission gate refuses and the term streams.
-    if floored < usable {
-        floored
-    } else {
-        usable
-    }
+    if floored < usable { floored } else { usable }
 }
 
 pub(crate) fn sae_host_in_core_budget_bytes() -> (usize, usize) {
@@ -358,7 +354,14 @@ mod host_in_core_budget_tests {
 
         // A direct plan needing 1.5 GiB (> usable) must NOT be admitted.
         let plan = sae_streaming_plan_from_budget(
-            10_000, 4_096, 8, 8, 64, budget, SAE_CPU_L2_CACHE_BYTES, avail,
+            10_000,
+            4_096,
+            8,
+            8,
+            64,
+            budget,
+            SAE_CPU_L2_CACHE_BYTES,
+            avail,
         );
         assert!(
             !plan.direct_admitted || plan.estimated_direct_peak_bytes <= budget,

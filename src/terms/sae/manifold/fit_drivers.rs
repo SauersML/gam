@@ -372,8 +372,7 @@ impl SaeManifoldTerm {
                 .iter()
                 .map(|atom| atom.chart_canonicalized)
                 .collect();
-            let pre_total =
-                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            let pre_total = self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
 
             let mut any_changed = false;
             for (atom_idx, plan) in &eligible {

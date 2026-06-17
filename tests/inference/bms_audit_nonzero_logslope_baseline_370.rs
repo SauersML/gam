@@ -10,8 +10,8 @@
 //! full Bernoulli marginal-slope solve: both BMS callbacks own enough data to
 //! compute `q_i`, `g_i`, `c_i`, and `z_i` themselves.
 
-use gam::families::bms::{BmsLogslopeJacobian, BmsMarginalJacobian};
 use gam::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState};
+use gam::families::bms::{BmsLogslopeJacobian, BmsMarginalJacobian};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 

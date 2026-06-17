@@ -249,7 +249,10 @@ fn constant_gaussian_standard_fit(
     }
     if request.y.iter().any(|value| !value.is_finite())
         || request.offset.iter().any(|value| !value.is_finite())
-        || request.weights.iter().any(|value| !value.is_finite() || *value < 0.0)
+        || request
+            .weights
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
     {
         return Err(WorkflowError::InvalidConfig {
             reason: "constant Gaussian shortcut requires finite response, offset, and non-negative weights"
@@ -267,9 +270,11 @@ fn constant_gaussian_standard_fit(
         centered_sum += request.weights[i] * (request.y[i] - request.offset[i]);
     }
     let intercept = centered_sum / weight_sum;
-    let design = build_term_collection_design(request.data.view(), &request.spec)
-        .map_err(|err| WorkflowError::InvalidConfig {
-            reason: format!("constant Gaussian shortcut could not rebuild design: {err}"),
+    let design =
+        build_term_collection_design(request.data.view(), &request.spec).map_err(|err| {
+            WorkflowError::InvalidConfig {
+                reason: format!("constant Gaussian shortcut could not rebuild design: {err}"),
+            }
         })?;
     let p = design.design.ncols();
     let mut beta = Array1::<f64>::zeros(p);
@@ -280,8 +285,8 @@ fn constant_gaussian_standard_fit(
     }
     let lambdas = Array1::<f64>::ones(design.penalties.len());
     let log_lambdas = Array1::<f64>::zeros(design.penalties.len());
-    let fit = crate::estimate::UnifiedFitResult::try_from_parts(
-        crate::estimate::UnifiedFitResultParts {
+    let fit =
+        crate::estimate::UnifiedFitResult::try_from_parts(crate::estimate::UnifiedFitResultParts {
             blocks: vec![crate::estimate::FittedBlock {
                 beta: beta.clone(),
                 role: crate::estimate::BlockRole::Mean,
@@ -317,11 +322,10 @@ fn constant_gaussian_standard_fit(
                 ..Default::default()
             },
             inner_cycles: 0,
-        },
-    )
-    .map_err(|err| WorkflowError::IntegrationFailed {
-        reason: format!("constant Gaussian shortcut produced invalid fit: {err}"),
-    })?;
+        })
+        .map_err(|err| WorkflowError::IntegrationFailed {
+            reason: format!("constant Gaussian shortcut produced invalid fit: {err}"),
+        })?;
     Ok(StandardFitResult {
         fit,
         design,

@@ -799,8 +799,7 @@ mod tests {
     fn curved_gram_logdet_is_real_weighted_design_determinant() {
         let n = 40;
         let p = 3usize;
-        let coords =
-            Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
+        let coords = Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
         let assign = Array1::<f64>::from_iter((0..n).map(|i| 0.5 + 0.01 * (i as f64)));
 
         // Mass-weighted coordinate mean and spread under wᵢ = a_k².
