@@ -150,6 +150,8 @@ mod bug_hunt_measure_jet_formula_fit_aborts_at_tight_outer_tol;
 mod bug_hunt_monotone_shape_binding_constraint;
 #[path = "regressions/bug_hunt_monotone_shape_smooth_aborts_fit.rs"]
 mod bug_hunt_monotone_shape_smooth_aborts_fit;
+#[path = "regressions/bug_hunt_shape_constrained_alo_seed_validation_aborts_1191.rs"]
+mod bug_hunt_shape_constrained_alo_seed_validation_aborts_1191;
 #[path = "regressions/bug_hunt_monotonicity_hvp_extra_eps_factor.rs"]
 mod bug_hunt_monotonicity_hvp_extra_eps_factor;
 #[path = "regressions/bug_hunt_multinomial_blocks_collapse_to_zero_width.rs"]
