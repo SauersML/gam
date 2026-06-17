@@ -2553,7 +2553,41 @@ impl WorkingModelSurvival {
             &opts,
             |_| {},
         )?;
-        let beta = summary.beta.as_ref().to_owned();
+        let mut beta = summary.beta.as_ref().to_owned();
+
+        // PIRLS exits on a RELATIVE KKT / deviance-plateau certificate, which can leave
+        // an ABSOLUTE penalized stationarity residual r = S beta_hat - grad_ell of order
+        // 0.1-1 (the score scales as O(sqrt(n))). The unified LAML gradient uses the
+        // envelope theorem, exact only at r = 0; a residual that large leaks <r, beta_dot>
+        // into the objective<->gradient consistency. Newton-polish the mode toward true
+        // stationarity (beta <- beta - H^-1 r on the penalized objective, whose Hessian
+        // and residual update_state already returns) with monotone-feasibility damping.
+        {
+            const POLISH_MAX_ITERS: usize = 60;
+            const POLISH_TOL: f64 = 1e-11;
+            for _ in 0..POLISH_MAX_ITERS {
+                let st = match candidate.update_state(&beta) { Ok(st) => st, Err(_) => break };
+                let r = st.gradient.clone();
+                let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if !r_norm.is_finite() || r_norm < POLISH_TOL { break; }
+                let h = st.hessian.to_dense();
+                let hop = match crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h) { Ok(op) => op, Err(_) => break };
+                let step = { use crate::estimate::reml::reml_outer_engine::HessianOperator; hop.solve(&r) };
+                let sn = step.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if !sn.is_finite() || sn == 0.0 { break; }
+                let mut alpha = 1.0_f64;
+                let mut accepted = false;
+                for _ in 0..50 {
+                    let trial = &beta - &(alpha * &step);
+                    if let Ok(ts) = candidate.update_state(&trial) {
+                        let tn = ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        if tn.is_finite() && tn <= r_norm { beta = trial; accepted = true; break; }
+                    }
+                    alpha *= 0.5;
+                }
+                if !accepted { break; }
+            }
+        }
 
         // Re-converged β̂(ρ); evaluate the unified survival LAML value and
         // analytic ρ-gradient at that mode. The ρ passed to the unified

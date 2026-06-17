@@ -1084,10 +1084,28 @@ pub fn reml_laml_evaluate(
         let mut score_derivs: Vec<Array1<f64>> = Vec::with_capacity(k + ext_dim);
         score_derivs.extend(rho_penalty_a_k_betas.iter().cloned());
         score_derivs.extend((0..ext_dim).map(|ext_idx| solution.ext_coords[ext_idx].g.clone()));
-        // Frozen drift matvec A_i[v]: ρ uses λ_iS_i, ψ uses the frozen B_i.
+        // Total drift dH/dtheta_i[v] for the IFT envelope correction. This MUST be
+        // the SAME total drift the log|H| trace uses: the penalty term
+        // curvature_lambda_i * S_i PLUS the family curvature term D_beta H[v_i]
+        // (rho_corrections[i]). Pairing the value correction -1/2 r^T H^-1 r with a
+        // gradient correction that differentiates a DIFFERENT H makes them disagree
+        // whenever the inner residual r is not exactly zero -- the survival
+        // large-lambda desync, where the event-time Hessian scales as 1/s^2 in the
+        // penalized coefficient so the dropped D_beta H term is large. For
+        // Gaussian/canonical families rho_corrections[i] is None, so this reduces to
+        // the penalty term and matches the prior behaviour exactly.
+        let rho_total_drifts: Vec<DriftDerivResult> = (0..k)
+            .map(|idx| {
+                penalty_total_drift_result(
+                    &solution.penalty_coords[idx],
+                    curvature_lambdas[idx],
+                    rho_corrections[idx].as_ref(),
+                )
+            })
+            .collect();
         let drift_apply = |idx: usize, v: &Array1<f64>| -> Array1<f64> {
             if idx < k {
-                solution.penalty_coords[idx].scaled_matvec(v, lambdas[idx])
+                rho_total_drifts[idx].apply(v)
             } else {
                 ext_frozen_drifts[idx - k].apply(v)
             }

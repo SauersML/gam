@@ -424,6 +424,16 @@ fn positive_response_single_block(seed: u64, intercept: f64) -> GlmFixture {
     }
 }
 
+/// Count-valued design for integer-only families (negative-binomial). Identical
+/// mean structure to positive_response_single_block, but the response is rounded
+/// to a non-negative integer so the negative-binomial log density (which validly
+/// rejects non-integer responses) is well defined.
+fn count_response_single_block(seed: u64, intercept: f64) -> GlmFixture {
+    let mut fix = positive_response_single_block(seed, intercept);
+    fix.y = fix.y.mapv(|v| v.round().max(0.0));
+    fix
+}
+
 /// Beta-regression design: response strictly inside (0, 1) via a logit mean
 /// plus bounded noise, so the logit link and the Beta(a, b) log-density are
 /// both well defined for every observation.
@@ -551,7 +561,7 @@ fn glm_objective_gradient_consistent_interior_multifamily() {
 
     // Negative-binomial-log (fixed θ): the μθ/(θ+μ) IRLS weight feeds the LAML
     // logdet ρ-derivative, a previously unpinned outer-gradient channel.
-    let negbin = positive_response_single_block(606, 0.5);
+    let negbin = count_response_single_block(606, 0.5);
     let negbin_opts = glm_opts(
         standard_spec(
             ResponseFamily::NegativeBinomial {
