@@ -10,7 +10,6 @@ use super::install_flex::validate_spec;
 
 use super::*;
 
-
 use super::exact_kernel::{
     DenestedCubicCell as ExactDenestedCubicCell, ExactCellBranch as ExactCellBranchShared,
     LocalSpanCubic, branch_cell as branch_exact_cell, build_denested_partition_cells,
@@ -23,17 +22,14 @@ use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
 
 use ndarray::array;
 
-
 #[inline]
 fn bernoulli_marginal_slope_probit_link() -> InverseLink {
     InverseLink::Standard(StandardLink::Probit)
 }
 
-
 fn dense_design(matrix: Array2<f64>) -> DesignMatrix {
     DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(matrix))
 }
-
 
 fn test_family_with_dense_designs(
     y: Array1<f64>,
@@ -52,7 +48,6 @@ fn test_family_with_dense_designs(
     }
 }
 
-
 fn test_family_with_zero_primary_designs(
     y: Array1<f64>,
     weights: Array1<f64>,
@@ -61,7 +56,6 @@ fn test_family_with_zero_primary_designs(
     let n = z.len();
     test_family_with_dense_designs(y, weights, z, Array2::zeros((n, 0)), Array2::zeros((n, 0)))
 }
-
 
 fn test_family_with_intercept_designs(
     y: Array1<f64>,
@@ -72,7 +66,6 @@ fn test_family_with_intercept_designs(
     let ones_col = Array2::ones((n, 1));
     test_family_with_dense_designs(y, weights, z, ones_col.clone(), ones_col)
 }
-
 
 fn default_test_family() -> BernoulliMarginalSlopeFamily {
     let empty_design = dense_design(Array2::zeros((0, 0)));
@@ -95,7 +88,6 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
         auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
     }
 }
-
 
 #[test]
 fn bernoulli_marginal_slope_outer_seed_config_screens_glm_stability_anchors() {
@@ -125,7 +117,6 @@ fn bernoulli_marginal_slope_outer_seed_config_screens_glm_stability_anchors() {
     }
 }
 
-
 fn empty_termspec() -> TermCollectionSpec {
     TermCollectionSpec {
         linear_terms: vec![],
@@ -133,7 +124,6 @@ fn empty_termspec() -> TermCollectionSpec {
         smooth_terms: vec![],
     }
 }
-
 
 fn dummy_blockspec(p: usize, n_rows: usize) -> ParameterBlockSpec {
     // Block names must be unique across a single `validate_blockspecs`
@@ -159,7 +149,6 @@ fn dummy_blockspec(p: usize, n_rows: usize) -> ParameterBlockSpec {
     }
 }
 
-
 fn dummy_block_state(beta: Array1<f64>, n_rows: usize) -> ParameterBlockState {
     ParameterBlockState {
         beta,
@@ -167,14 +156,12 @@ fn dummy_block_state(beta: Array1<f64>, n_rows: usize) -> ParameterBlockState {
     }
 }
 
-
 fn scalar_block_state(value: f64, n_rows: usize) -> ParameterBlockState {
     ParameterBlockState {
         beta: array![value],
         eta: Array1::from_elem(n_rows, value),
     }
 }
-
 
 fn flex_hessian_matvec_fixture(
     n: usize,
@@ -245,7 +232,6 @@ fn flex_hessian_matvec_fixture(
     Ok((family, states, cache, direction))
 }
 
-
 fn dual_flex_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
     let z = array![-0.8, 0.2, 1.1];
     let y = array![0.0, 1.0, 1.0];
@@ -291,7 +277,6 @@ fn dual_flex_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBloc
     (family, block_states)
 }
 
-
 fn h_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
     let prepared = build_score_warp_deviation_block_from_seed(
@@ -326,7 +311,6 @@ fn h_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockSt
     };
     (family, block_states)
 }
-
 
 fn w_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -363,7 +347,6 @@ fn w_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockSt
     (family, block_states)
 }
 
-
 fn assert_allclose_relative(actual: &Array1<f64>, expected: &Array1<f64>, tol: f64) {
     assert_eq!(actual.len(), expected.len());
     for (idx, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
@@ -375,7 +358,6 @@ fn assert_allclose_relative(actual: &Array1<f64>, expected: &Array1<f64>, tol: f
         );
     }
 }
-
 
 #[test]
 fn cross_block_identifiability_anchor_wider_than_candidate_no_false_alias() {
@@ -449,7 +431,6 @@ fn cross_block_identifiability_anchor_wider_than_candidate_no_false_alias() {
         "Aᵀ C̃ should be at noise floor; max|.|={max_abs:.3e}, scale={scale:.3e}",
     );
 }
-
 
 /// Case (1) from the bug analysis: textbook minimal counterexample
 /// where the old `null(AᵀC)` test silently dropped a direction it
@@ -530,7 +511,6 @@ fn cross_block_identifiability_minimal_counterexample_keeps_orthogonal_complemen
     );
 }
 
-
 /// Case (3) from the bug analysis: true alias `span(C) ⊆ span(A)`.
 /// P5 converts the `k_kept == 0` outcome from a hard error into a
 /// structured `FullyAliased { reason }` that the production caller
@@ -590,7 +570,6 @@ fn cross_block_identifiability_true_alias_returns_fully_aliased_outcome() {
     }
 }
 
-
 /// Flex-anchor counterpart of the parametric true-alias test. Captures
 /// the invariant that flex-evaluation anchors are real participants in
 /// the cross-block W-orthogonalisation: when the flex-anchor's column
@@ -647,7 +626,6 @@ fn cross_block_identifiability_flex_anchor_true_alias_returns_fully_aliased() {
     }
 }
 
-
 /// Direct match-arm coverage on the `FlexCompileOutcome`
 /// API. Confirms that the production code's `match outcome` against
 /// `FullyAliased { reason }` extracts the reason as documented. No
@@ -666,7 +644,6 @@ fn cross_block_identifiability_outcome_fully_aliased_extracts_reason() {
         }
     }
 }
-
 
 /// Case (4) from the bug analysis: partial alias. Build an anchor
 /// whose first k_alias columns are the leading orthonormal basis
@@ -766,7 +743,6 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
     );
 }
 
-
 #[test]
 fn flex_hessian_matvec_matches_dense_hessian() {
     assert!(file!().ends_with(".rs"));
@@ -781,7 +757,6 @@ fn flex_hessian_matvec_matches_dense_hessian() {
     let from_dense = dense.dot(&direction);
     assert_allclose_relative(&from_matvec, &from_dense, 1.0e-13);
 }
-
 
 #[test]
 fn row_primary_third_trace_many_matches_single_direction_contracts() {
@@ -830,7 +805,6 @@ fn row_primary_third_trace_many_matches_single_direction_contracts() {
         }
     }
 }
-
 
 #[test]
 fn bernoulli_margslope_warm_start_cache_persists_across_eval_cache_builds() {
@@ -925,7 +899,6 @@ fn bernoulli_margslope_warm_start_cache_persists_across_eval_cache_builds() {
     }
 }
 
-
 #[test]
 fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
     let n = 24_000usize;
@@ -1004,7 +977,6 @@ fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
     );
 }
 
-
 #[test]
 fn row_primary_fourth_contracted_rejects_bad_direction_lengths() {
     let family = test_family_with_zero_primary_designs(array![1.0], array![1.0], array![0.25]);
@@ -1044,7 +1016,6 @@ fn row_primary_fourth_contracted_rejects_bad_direction_lengths() {
     );
 }
 
-
 fn base_spec(
     y: Array1<f64>,
     weights: Array1<f64>,
@@ -1068,7 +1039,6 @@ fn base_spec(
     }
 }
 
-
 #[test]
 fn bernoulli_marginal_link_map_zeroes_derivatives_on_clamped_tails() {
     let link = bernoulli_marginal_slope_probit_link();
@@ -1086,7 +1056,6 @@ fn bernoulli_marginal_link_map_zeroes_derivatives_on_clamped_tails() {
     assert_eq!([lower.q1, lower.q2, lower.q3, lower.q4], [0.0; 4]);
     assert_eq!([upper.q1, upper.q2, upper.q3, upper.q4], [0.0; 4]);
 }
-
 
 #[test]
 fn rigid_transformed_gradient_matches_negative_log_likelihood_derivative() {
@@ -1127,7 +1096,6 @@ fn rigid_transformed_gradient_matches_negative_log_likelihood_derivative() {
     );
 }
 
-
 struct HandRigidProbitKernel {
     logcdf: f64,
     u1: f64,
@@ -1141,7 +1109,6 @@ struct HandRigidProbitKernel {
     eta_q: f64,
     eta_g: f64,
 }
-
 
 impl HandRigidProbitKernel {
     #[inline]
@@ -1254,7 +1221,6 @@ impl HandRigidProbitKernel {
     }
 }
 
-
 #[inline]
 fn hand_rigid_transformed_gradient(
     marginal: BernoulliMarginalLinkMap,
@@ -1265,7 +1231,6 @@ fn hand_rigid_transformed_gradient(
         kernel.u1 * kernel.eta_g,
     ]
 }
-
 
 #[inline]
 fn hand_rigid_transformed_hessian(
@@ -1283,7 +1248,6 @@ fn hand_rigid_transformed_hessian(
     ]
 }
 
-
 #[inline]
 fn hand_rigid_internal_third_components(
     marginal: BernoulliMarginalLinkMap,
@@ -1293,7 +1257,6 @@ fn hand_rigid_internal_third_components(
     let g_dir = kernel.third_contracted(marginal.q, 0.0, 1.0);
     (q_dir[0][0], q_dir[0][1], q_dir[1][1], g_dir[1][1])
 }
-
 
 #[inline]
 fn hand_rigid_transformed_third_full(
@@ -1311,7 +1274,6 @@ fn hand_rigid_transformed_third_full(
     let f_etagg = f_qgg * marginal.q1;
     hand_third_full_from_symmetric_components(f_etaetaeta, f_etaetag, f_etagg, f_ggg)
 }
-
 
 #[inline]
 fn hand_third_full_from_symmetric_components(
@@ -1331,7 +1293,6 @@ fn hand_third_full_from_symmetric_components(
     t[1][1][1] = t_ggg;
     t
 }
-
 
 #[inline]
 fn hand_rigid_transformed_fourth_full(
@@ -1364,7 +1325,6 @@ fn hand_rigid_transformed_fourth_full(
     hand_fourth_full_from_symmetric_components(f_eta4, f_eta3g, f_eta2g2, f_etag3, f_gggg)
 }
 
-
 #[inline]
 fn hand_fourth_full_from_symmetric_components(
     t_qqqq: f64,
@@ -1393,7 +1353,6 @@ fn hand_fourth_full_from_symmetric_components(
     t
 }
 
-
 fn hand_rigid_standard_normal_row_kernel(
     marginal: BernoulliMarginalLinkMap,
     g: f64,
@@ -1410,7 +1369,6 @@ fn hand_rigid_standard_normal_row_kernel(
     ))
 }
 
-
 fn hand_rigid_standard_normal_third_full(
     marginal: BernoulliMarginalLinkMap,
     g: f64,
@@ -1422,7 +1380,6 @@ fn hand_rigid_standard_normal_third_full(
     let kernel = HandRigidProbitKernel::new(marginal.q, g, z, y, w, probit_scale)?;
     Ok(hand_rigid_transformed_third_full(marginal, &kernel))
 }
-
 
 fn hand_rigid_standard_normal_fourth_full(
     marginal: BernoulliMarginalLinkMap,
@@ -1436,7 +1393,6 @@ fn hand_rigid_standard_normal_fourth_full(
     Ok(hand_rigid_transformed_fourth_full(marginal, &kernel))
 }
 
-
 fn assert_scalar_close(actual: f64, expected: f64, tol: f64, context: &str) {
     let denom = actual.abs().max(expected.abs()).max(1.0);
     let rel = (actual - expected).abs() / denom;
@@ -1445,7 +1401,6 @@ fn assert_scalar_close(actual: f64, expected: f64, tol: f64, context: &str) {
         "{context}: actual={actual:.17e}, expected={expected:.17e}, rel={rel:.3e}, tol={tol:.3e}"
     );
 }
-
 
 #[test]
 fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
@@ -1599,11 +1554,9 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
     }
 }
 
-
 fn pair_distance(lhs: (f64, f64), rhs: (f64, f64)) -> f64 {
     (lhs.0 - rhs.0).abs() + (lhs.1 - rhs.1).abs()
 }
-
 
 /// Build a tiny synthetic rigid-probit family with `n` rows. The marginal
 /// and log-slope blocks each carry a single all-ones column so the
@@ -1624,7 +1577,6 @@ fn make_rigid_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
     test_family_with_dense_designs(y, weights, z, ones_col.clone(), ones_col)
 }
 
-
 fn rigid_block_states(
     family: &BernoulliMarginalSlopeFamily,
     q: f64,
@@ -1633,7 +1585,6 @@ fn rigid_block_states(
     let n = family.y.len();
     vec![scalar_block_state(q, n), scalar_block_state(b, n)]
 }
-
 
 #[test]
 fn bernoulli_log_likelihood_subsample_full_equals_unsampled() {
@@ -1665,7 +1616,6 @@ fn bernoulli_log_likelihood_subsample_full_equals_unsampled() {
         rel
     );
 }
-
 
 #[test]
 fn bernoulli_log_likelihood_subsample_half_scales_correctly() {
@@ -1723,7 +1673,6 @@ fn bernoulli_log_likelihood_subsample_half_scales_correctly() {
     );
 }
 
-
 /// Same shape as `make_rigid_test_family` but with a non-zero
 /// gaussian_frailty_sd so the sigma-aware joint psi paths fire.
 fn make_sigma_aware_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
@@ -1731,7 +1680,6 @@ fn make_sigma_aware_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
     family.gaussian_frailty_sd = Some(0.7);
     family
 }
-
 
 fn rel_diff_array1(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
     let mut max = 0.0f64;
@@ -1744,7 +1692,6 @@ fn rel_diff_array1(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
     max
 }
 
-
 fn rel_diff_array2(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     let mut max = 0.0f64;
     for ((i, j), &av) in a.indexed_iter() {
@@ -1756,7 +1703,6 @@ fn rel_diff_array2(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     }
     max
 }
-
 
 #[test]
 fn bernoulli_sigma_psi_terms_subsample_full_equals_unsampled() {
@@ -1801,7 +1747,6 @@ fn bernoulli_sigma_psi_terms_subsample_full_equals_unsampled() {
     let h_rel = rel_diff_array2(&h_full, &h_baseline);
     assert!(h_rel < 1e-12, "hessian rel {}", h_rel);
 }
-
 
 #[test]
 fn bernoulli_sigma_psi_terms_subsample_half_scales_correctly() {
@@ -1848,7 +1793,6 @@ fn bernoulli_sigma_psi_terms_subsample_half_scales_correctly() {
     assert!(h_rel < 1e-12, "hessian rel {}", h_rel);
 }
 
-
 #[test]
 fn bernoulli_sigma_psi_second_order_subsample_full_equals_unsampled() {
     use crate::solver::outer_subsample::OuterScoreSubsample;
@@ -1879,7 +1823,6 @@ fn bernoulli_sigma_psi_second_order_subsample_full_equals_unsampled() {
     let score_rel = rel_diff_array1(&with_full.score_psi_psi, &baseline.score_psi_psi);
     assert!(score_rel < 1e-12, "score rel {}", score_rel);
 }
-
 
 #[test]
 fn bernoulli_sigma_psi_second_order_subsample_half_scales_correctly() {
@@ -1920,7 +1863,6 @@ fn bernoulli_sigma_psi_second_order_subsample_half_scales_correctly() {
     assert!(score_rel < 1e-12, "score rel {}", score_rel);
 }
 
-
 #[test]
 fn bernoulli_sigma_psihessian_directional_derivative_subsample_full_equals_unsampled() {
     use crate::solver::outer_subsample::OuterScoreSubsample;
@@ -1948,7 +1890,6 @@ fn bernoulli_sigma_psihessian_directional_derivative_subsample_full_equals_unsam
     let rel = rel_diff_array2(&with_full, &baseline);
     assert!(rel < 1e-12, "drift rel {}", rel);
 }
-
 
 #[test]
 fn bernoulli_sigma_psihessian_directional_derivative_subsample_half_scales_correctly() {
@@ -1986,7 +1927,6 @@ fn bernoulli_sigma_psihessian_directional_derivative_subsample_half_scales_corre
     let rel = rel_diff_array2(&scaled, &exp);
     assert!(rel < 1e-12, "drift rel {}", rel);
 }
-
 
 #[test]
 fn bernoulli_psi_workspace_with_options_threads_subsample_to_first_order() {
@@ -2107,14 +2047,12 @@ fn bernoulli_psi_workspace_with_options_threads_subsample_to_first_order() {
     );
 }
 
-
 fn build_test_link_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
     build_link_deviation_block_from_knots_design_seed_and_weights(seed, seed, cfg)
 }
-
 
 #[test]
 fn score_warp_basis_smoothness_penalty_is_full_rank() {
@@ -2160,7 +2098,8 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
     let evals_slice = evals
         .as_slice()
         .expect("contiguous transformed-basis penalty eigenvalues");
-    let threshold = crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
+    let threshold =
+        crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
     let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
         smallest > threshold,
@@ -2168,7 +2107,6 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
              threshold {threshold} — null space was not fully dropped"
     );
 }
-
 
 #[test]
 fn link_deviation_basis_smoothness_penalty_is_full_rank() {
@@ -2207,7 +2145,8 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
     let evals_slice = evals
         .as_slice()
         .expect("contiguous transformed-basis penalty eigenvalues");
-    let threshold = crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
+    let threshold =
+        crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
     let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
         smallest > threshold,
@@ -2215,7 +2154,6 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
              threshold {threshold} — null space was not fully dropped"
     );
 }
-
 
 #[test]
 fn bernoulli_marginal_slope_rejects_nonprobit_base_link() {
@@ -2250,7 +2188,6 @@ fn bernoulli_marginal_slope_rejects_nonprobit_base_link() {
     assert!(err.contains("requires link(type=probit)"));
 }
 
-
 fn expand_integer_weight_rows(
     y: &Array1<f64>,
     z: &Array1<f64>,
@@ -2272,7 +2209,6 @@ fn expand_integer_weight_rows(
     }
     (Array1::from_vec(y_expanded), Array1::from_vec(z_expanded))
 }
-
 
 #[test]
 fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
@@ -2379,7 +2315,6 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
     );
 }
 
-
 #[test]
 fn zero_deviation_intercept_fast_path_matches_denested_calibration() {
     let seed = Array1::from_iter((0..25).map(|i| -2.4 + 4.8 * i as f64 / 24.0));
@@ -2447,7 +2382,6 @@ fn zero_deviation_intercept_fast_path_matches_denested_calibration() {
     assert_eq!(deriv_fast, analytic_deriv);
 }
 
-
 #[test]
 fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -2514,7 +2448,6 @@ fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
     );
 }
 
-
 #[test]
 fn score_warp_block_exposes_structural_derivative_lower_bounds() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -2571,7 +2504,6 @@ fn score_warp_block_exposes_structural_derivative_lower_bounds() {
     );
 }
 
-
 #[test]
 fn post_update_block_beta_rejects_infeasible_score_warp_step() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -2615,7 +2547,6 @@ fn post_update_block_beta_rejects_infeasible_score_warp_step() {
     );
 }
 
-
 #[test]
 fn structural_deviation_runtime_is_piecewise_cubic() {
     let seed = array![-1.0, 0.0, 1.0];
@@ -2638,7 +2569,6 @@ fn structural_deviation_runtime_is_piecewise_cubic() {
         "structural deviation basis must expose true cubic span coefficients"
     );
 }
-
 
 #[test]
 fn structural_deviation_runtime_is_c2_at_internal_breakpoints() {
@@ -2680,7 +2610,6 @@ fn structural_deviation_runtime_is_c2_at_internal_breakpoints() {
     }
 }
 
-
 #[test]
 fn structural_deviation_rejects_noncubic_degree() {
     let seed = array![-1.0, 0.0, 1.0];
@@ -2694,7 +2623,6 @@ fn structural_deviation_rejects_noncubic_degree() {
     .expect_err("structural deviation block should reject non-cubic degree");
     assert!(err.contains("degree must be 3"));
 }
-
 
 #[test]
 fn deviation_runtime_replays_exact_training_design() {
@@ -2719,7 +2647,6 @@ fn deviation_runtime_replays_exact_training_design() {
         }
     }
 }
-
 
 #[test]
 fn structural_constraints_match_exact_monotonicity_guard() {
@@ -2763,7 +2690,6 @@ fn structural_constraints_match_exact_monotonicity_guard() {
             .is_err()
     );
 }
-
 
 #[test]
 fn structural_constraints_are_quadratic_derivative_bernstein_controls() {
@@ -2809,7 +2735,6 @@ fn structural_constraints_are_quadratic_derivative_bernstein_controls() {
         );
     }
 }
-
 
 #[test]
 fn deviation_penalties_are_integrated_function_penalties() {
@@ -2873,7 +2798,6 @@ fn deviation_penalties_are_integrated_function_penalties() {
         "deviation double penalty must be integrated L2, not coefficient identity"
     );
 }
-
 
 #[test]
 fn local_cubic_span_reconstructs_deviation_exactly() {
@@ -2970,7 +2894,6 @@ fn local_cubic_span_reconstructs_deviation_exactly() {
     }
 }
 
-
 #[test]
 fn basis_span_cubic_reconstructs_basis_column_exactly() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -3020,7 +2943,6 @@ fn basis_span_cubic_reconstructs_basis_column_exactly() {
     }
 }
 
-
 #[test]
 fn deviation_runtime_saturates_outside_support() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -3068,7 +2990,6 @@ fn deviation_runtime_saturates_outside_support() {
     assert!((right_tail_near.c0 - right_tail_far.c0).abs() < 1e-12);
 }
 
-
 #[test]
 fn deviation_runtime_replays_the_exact_training_basis() {
     let seed = array![-2.0, -1.0, -0.25, 0.25, 1.0, 2.0];
@@ -3096,7 +3017,6 @@ fn deviation_runtime_replays_the_exact_training_basis() {
         }
     }
 }
-
 
 #[test]
 fn denested_microcells_follow_score_and_link_breaks() {
@@ -3181,7 +3101,6 @@ fn denested_microcells_follow_score_and_link_breaks() {
     );
 }
 
-
 #[test]
 fn denested_microcell_eta_matches_direct_denested_formula() {
     let score_seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
@@ -3252,7 +3171,6 @@ fn denested_microcell_eta_matches_direct_denested_formula() {
     }
 }
 
-
 #[test]
 fn local_cubic_global_transform_reconstructs_same_function() {
     let cubic = exact_kernel::LocalSpanCubic {
@@ -3280,7 +3198,6 @@ fn local_cubic_global_transform_reconstructs_same_function() {
         );
     }
 }
-
 
 #[test]
 fn denested_branch_selection_uses_normalized_cell_coefficients() {
@@ -3315,7 +3232,6 @@ fn denested_branch_selection_uses_normalized_cell_coefficients() {
         ExactCellBranchShared::Sextic
     );
 }
-
 
 #[test]
 fn denested_cell_coefficient_partials_match_finite_differences() {
@@ -3407,7 +3323,6 @@ fn denested_cell_coefficient_partials_match_finite_differences() {
     }
 }
 
-
 #[test]
 fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_link() {
     let z = array![-0.8, 0.2, 1.1];
@@ -3461,7 +3376,6 @@ fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_lin
     );
 }
 
-
 #[test]
 fn pooled_probit_baseline_matches_expanded_integer_weight_fit() {
     let y = array![0.0, 1.0, 0.0, 1.0];
@@ -3485,7 +3399,6 @@ fn pooled_probit_baseline_matches_expanded_integer_weight_fit() {
     );
 }
 
-
 #[test]
 fn validate_spec_rejects_nonfinite_or_negative_weights() {
     let data = Array2::<f64>::zeros((3, 0));
@@ -3504,7 +3417,6 @@ fn validate_spec_rejects_nonfinite_or_negative_weights() {
     assert!(err.contains("finite non-negative weights"));
 }
 
-
 #[test]
 fn validate_spec_rejects_nonfinite_z_values() {
     let data = Array2::<f64>::zeros((3, 0));
@@ -3520,7 +3432,6 @@ fn validate_spec_rejects_nonfinite_z_values() {
     assert!(err.contains("finite z values"));
 }
 
-
 #[test]
 fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
     assert!(file!().ends_with(".rs"));
@@ -3534,7 +3445,6 @@ fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
 
     validate_spec(data.view(), &spec).expect("learnable GaussianShift sigma should validate");
 }
-
 
 #[test]
 fn signed_probit_helpers_handle_nonfinite_boundaries_explicitly() {
@@ -3550,7 +3460,6 @@ fn signed_probit_helpers_handle_nonfinite_boundaries_explicitly() {
     assert!(logcdf_nan.is_nan());
     assert!(lambda_nan.is_nan());
 }
-
 
 #[test]
 fn signed_probit_exact_derivative_helper_rejects_invalid_nonfinite_margins() {
@@ -3569,7 +3478,6 @@ fn signed_probit_exact_derivative_helper_rejects_invalid_nonfinite_margins() {
     assert!(nan_err.contains("non-finite signed margin"));
 }
 
-
 #[test]
 fn unary_neglog_phi_preserves_negative_infinity_and_nan_boundaries() {
     assert_eq!(
@@ -3583,7 +3491,6 @@ fn unary_neglog_phi_preserves_negative_infinity_and_nan_boundaries() {
     let nan_terms = unary_derivatives_neglog_phi(f64::NAN, 1.75);
     assert!(nan_terms.iter().all(|value| value.is_nan()));
 }
-
 
 #[test]
 fn flexible_family_routes_outer_derivatives_by_scale() {
@@ -3678,7 +3585,6 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
     );
 }
 
-
 #[test]
 fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
     // Regression for the BMS outer-loop lever: the Bernoulli-marginal-slope
@@ -3697,7 +3603,7 @@ fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
     // finite-difference or quasi-Newton surrogate — so the REML/LAML optimum
     // is bit-identical to the first-order path.
     use crate::solver::rho_optimizer::{
-        plan, DeclaredHessianForm, Derivative, OuterCapability, Solver,
+        DeclaredHessianForm, Derivative, OuterCapability, Solver, plan,
     };
 
     let arc_plan = |hessian: DeclaredHessianForm, n_params: usize, psi_dim: usize| {
@@ -3773,7 +3679,6 @@ fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
     // HybridEfs lane that would otherwise be eligible for a ψ-bearing problem.
     assert_eq!(arc_plan(flex_hessian, flex_specs.len(), 1), Solver::Arc);
 }
-
 
 #[test]
 fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
@@ -3905,7 +3810,6 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     );
 }
 
-
 #[test]
 fn bernoulli_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
     use crate::custom_family::default_coefficient_hessian_cost;
@@ -3976,7 +3880,6 @@ fn bernoulli_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
     );
     assert!(family.coefficient_hessian_cost(&specs) > default_coefficient_hessian_cost(&specs));
 }
-
 
 #[test]
 fn rigid_fast_path_matches_loglik_finite_differences() {
@@ -4074,7 +3977,6 @@ fn rigid_fast_path_matches_loglik_finite_differences() {
         primary_hess[[1, 1]]
     );
 }
-
 
 /// Exercises the w-only (link_dev without score_warp) layout through the
 /// full gradient + Hessian path, verifying that:
@@ -4180,7 +4082,6 @@ fn w_only_gradient_hessian_finite_and_symmetric() {
     }
 }
 
-
 #[test]
 fn h_only_gradient_hessian_finite_and_symmetric() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -4271,7 +4172,6 @@ fn h_only_gradient_hessian_finite_and_symmetric() {
     }
 }
 
-
 #[test]
 fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -4360,7 +4260,6 @@ fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
         }
     }
 }
-
 
 #[test]
 fn h_only_exact_outer_directional_derivatives_are_present_and_finite() {
@@ -4508,7 +4407,6 @@ fn h_only_exact_outer_directional_derivatives_are_present_and_finite() {
     }
 }
 
-
 #[test]
 fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
@@ -4624,7 +4522,6 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         "expected nonzero h-only fourth contraction"
     );
 }
-
 
 #[test]
 fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
@@ -4742,7 +4639,6 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     );
 }
 
-
 #[test]
 fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let (family, block_states) = dual_flex_exact_fixture();
@@ -4827,7 +4723,6 @@ fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     );
 }
 
-
 #[test]
 fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
     let (family, block_states) = dual_flex_exact_fixture();
@@ -4869,7 +4764,6 @@ fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
     }
 }
 
-
 #[test]
 fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
     let (family, block_states) = h_only_exact_fixture();
@@ -4909,7 +4803,6 @@ fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
         );
     }
 }
-
 
 #[test]
 fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
@@ -4951,7 +4844,6 @@ fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
     }
 }
 
-
 #[test]
 fn dual_flex_exact_outer_zero_direction_returns_zero() {
     let (family, block_states) = dual_flex_exact_fixture();
@@ -4976,7 +4868,6 @@ fn dual_flex_exact_outer_zero_direction_returns_zero() {
         "expected zero dual-flex fourth directional derivative for zero directions"
     );
 }
-
 
 #[test]
 fn dual_flex_exact_outer_fourth_direction_swap_is_symmetric() {
@@ -5024,7 +4915,6 @@ fn dual_flex_exact_outer_fourth_direction_swap_is_symmetric() {
         }
     }
 }
-
 
 #[test]
 fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
@@ -5091,7 +4981,6 @@ fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
         }
     }
 }
-
 
 #[test]
 fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
@@ -5174,7 +5063,6 @@ fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
     }
 }
 
-
 #[test]
 fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
     let (family, block_states) = h_only_exact_fixture();
@@ -5235,7 +5123,6 @@ fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
     }
 }
 
-
 #[test]
 fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
     let (family, block_states) = w_only_exact_fixture();
@@ -5295,7 +5182,6 @@ fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
         }
     }
 }
-
 
 #[test]
 fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
@@ -5360,7 +5246,6 @@ fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
     }
 }
 
-
 #[test]
 fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
     let (family, block_states) = w_only_exact_fixture();
@@ -5424,7 +5309,6 @@ fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
     }
 }
 
-
 #[test]
 fn dual_flex_exact_outer_direction_sign_rules_hold() {
     let (family, block_states) = dual_flex_exact_fixture();
@@ -5487,7 +5371,6 @@ fn dual_flex_exact_outer_direction_sign_rules_hold() {
     }
 }
 
-
 #[test]
 fn dual_flex_exact_outer_fourth_double_sign_flip_is_invariant() {
     let (family, block_states) = dual_flex_exact_fixture();
@@ -5541,7 +5424,6 @@ fn dual_flex_exact_outer_fourth_double_sign_flip_is_invariant() {
     }
 }
 
-
 #[test]
 fn dual_flex_exact_outer_third_direction_is_linear() {
     let (family, block_states) = dual_flex_exact_fixture();
@@ -5592,7 +5474,6 @@ fn dual_flex_exact_outer_third_direction_is_linear() {
         }
     }
 }
-
 
 #[test]
 fn dual_flex_row_primary_third_direction_is_linear() {
@@ -5649,7 +5530,6 @@ fn dual_flex_row_primary_third_direction_is_linear() {
     }
 }
 
-
 #[test]
 fn h_only_row_primary_third_direction_is_linear() {
     let (family, block_states) = h_only_exact_fixture();
@@ -5701,7 +5581,6 @@ fn h_only_row_primary_third_direction_is_linear() {
     }
 }
 
-
 #[test]
 fn w_only_row_primary_third_direction_is_linear() {
     let (family, block_states) = w_only_exact_fixture();
@@ -5752,7 +5631,6 @@ fn w_only_row_primary_third_direction_is_linear() {
         }
     }
 }
-
 
 #[test]
 fn dual_flex_exact_outer_fourth_first_direction_is_linear() {
@@ -5811,7 +5689,6 @@ fn dual_flex_exact_outer_fourth_first_direction_is_linear() {
     }
 }
 
-
 #[test]
 fn h_only_exact_outer_third_direction_is_linear() {
     let (family, block_states) = h_only_exact_fixture();
@@ -5855,7 +5732,6 @@ fn h_only_exact_outer_third_direction_is_linear() {
     }
 }
 
-
 #[test]
 fn w_only_exact_outer_third_direction_is_linear() {
     let (family, block_states) = w_only_exact_fixture();
@@ -5898,7 +5774,6 @@ fn w_only_exact_outer_third_direction_is_linear() {
         }
     }
 }
-
 
 #[test]
 fn h_only_exact_outer_direction_sign_rules_hold() {
@@ -5944,7 +5819,6 @@ fn h_only_exact_outer_direction_sign_rules_hold() {
     }
 }
 
-
 #[test]
 fn w_only_exact_outer_direction_sign_rules_hold() {
     let (family, block_states) = w_only_exact_fixture();
@@ -5989,7 +5863,6 @@ fn w_only_exact_outer_direction_sign_rules_hold() {
     }
 }
 
-
 #[test]
 fn h_only_exact_outer_fourth_direction_swap_is_symmetric() {
     let (family, block_states) = h_only_exact_fixture();
@@ -6026,7 +5899,6 @@ fn h_only_exact_outer_fourth_direction_swap_is_symmetric() {
         }
     }
 }
-
 
 #[test]
 fn w_only_exact_outer_fourth_direction_swap_is_symmetric() {
@@ -6065,7 +5937,6 @@ fn w_only_exact_outer_fourth_direction_swap_is_symmetric() {
     }
 }
 
-
 #[test]
 fn h_only_exact_outer_zero_direction_returns_zero() {
     let (family, block_states) = h_only_exact_fixture();
@@ -6090,7 +5961,6 @@ fn h_only_exact_outer_zero_direction_returns_zero() {
     );
 }
 
-
 #[test]
 fn w_only_exact_outer_zero_direction_returns_zero() {
     let (family, block_states) = w_only_exact_fixture();
@@ -6114,7 +5984,6 @@ fn w_only_exact_outer_zero_direction_returns_zero() {
         "expected zero w-only fourth directional derivative for zero directions"
     );
 }
-
 
 #[test]
 fn w_only_gradient_matches_loglik_finite_differences() {
@@ -6225,7 +6094,6 @@ fn w_only_gradient_matches_loglik_finite_differences() {
     assert!((grad_w0 - fd("w0", eps)).abs() < 2e-4);
 }
 
-
 #[test]
 fn h_only_gradient_matches_loglik_finite_differences() {
     let z = array![-0.8, 0.2, 1.1];
@@ -6333,7 +6201,6 @@ fn h_only_gradient_matches_loglik_finite_differences() {
     assert!((grad_b - fd("b", eps)).abs() < 2e-4);
     assert!((grad_h0 - fd("h0", eps)).abs() < 2e-4);
 }
-
 
 #[test]
 fn flexible_denested_gradient_matches_loglik_finite_differences() {
@@ -6478,7 +6345,6 @@ fn flexible_denested_gradient_matches_loglik_finite_differences() {
     assert!((grad_w0 - fd("w0", eps)).abs() < 2e-4);
 }
 
-
 #[test]
 fn flexible_exact_outer_directional_derivatives_are_present_and_finite() {
     let z = array![-0.8, 0.2, 1.1];
@@ -6608,7 +6474,6 @@ fn flexible_exact_outer_directional_derivatives_are_present_and_finite() {
     }
 }
 
-
 #[test]
 fn flexible_evaluate_block_diagonals_match_joint_exact_oracle() {
     let z = array![-1.1, -0.25, 0.35, 1.2];
@@ -6732,7 +6597,6 @@ fn flexible_evaluate_block_diagonals_match_joint_exact_oracle() {
     }
 }
 
-
 #[test]
 fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
     let z = array![
@@ -6756,7 +6620,6 @@ fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
     assert!((var.sqrt() - 1.0).abs() < 1e-12);
 }
 
-
 #[test]
 fn latent_z_normalization_rejects_extreme_non_gaussian_scores() {
     let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
@@ -6770,7 +6633,6 @@ fn latent_z_normalization_rejects_extreme_non_gaussian_scores() {
             .expect_err("expected non-gaussian rejection");
     assert!(err.contains("approximately latent N(0,1)"));
 }
-
 
 /// Under P4, bad-normal latent z routes through a rank-INT
 /// calibration (Blom rankits → `Φ⁻¹`) instead of the legacy
@@ -6841,7 +6703,6 @@ fn auto_latent_measure_uses_rank_int_calibration_for_bad_normal_diagnostics() {
     }
 }
 
-
 #[test]
 fn empirical_intercept_calibrates_marginal_probability() {
     let nodes = vec![-2.0, -0.25, 0.5, 3.0];
@@ -6861,7 +6722,6 @@ fn empirical_intercept_calibrates_marginal_probability() {
         .sum::<f64>();
     assert!((calibrated - target_mu).abs() <= 1e-10);
 }
-
 
 #[test]
 fn skewed_rigid_empirical_grid_calibrates_marginal_probability() {
@@ -6893,7 +6753,6 @@ fn skewed_rigid_empirical_grid_calibrates_marginal_probability() {
     assert!((calibrated - target_mu).abs() <= 1e-10);
 }
 
-
 /// Builds a 3-row family on a global empirical latent grid plus a closure
 /// returning the closed-form `(neglog, grad, hess)` as a function of
 /// `(m = marginal_eta, g = slope)`. Shared by the finite-difference
@@ -6917,7 +6776,6 @@ fn empirical_rigid_fd_fixture() -> (
     };
     (family, grid, [0.25, -0.4, 0.7], [1.35, 0.9, 1.1])
 }
-
 
 /// Validates the §2 implicit-function-theorem closed form for the rigid
 /// empirical-grid kernel against central finite differences of its own
@@ -6979,7 +6837,6 @@ fn empirical_rigid_grad_hess_match_finite_differences() {
         }
     }
 }
-
 
 /// Higher-order analogue: the §2 IFT closed forms for the rigid
 /// empirical-grid **third** and **fourth** derivative tensors must equal the
@@ -7070,7 +6927,6 @@ fn empirical_rigid_higher_order_match_finite_differences() {
         }
     }
 }
-
 
 /// #932 jet-program oracle for the rigid **empirical-grid** branch of the
 /// production `BernoulliRigidRowKernel` (`RowKernel<2>`).
@@ -7242,12 +7098,7 @@ fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
 
     // Several deterministic direction vectors so every (m, g) cross block of
     // the third/fourth tensors participates in the contraction.
-    let dirs: [[f64; 2]; 4] = [
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [0.7, -1.3],
-        [-0.4, 0.9],
-    ];
+    let dirs: [[f64; 2]; 4] = [[1.0, 0.0], [0.0, 1.0], [0.7, -1.3], [-0.4, 0.9]];
 
     for row in 0..3 {
         let (m, g) = (marginal_etas[row], slopes[row]);
@@ -7275,8 +7126,13 @@ fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
         let fourth: Vec<([f64; 2], [f64; 2], [[f64; 2]; 2])> = dirs
             .iter()
             .flat_map(|u| {
-                dirs.iter()
-                    .map(move |v| (*u, *v, contract_fourth_full(&hand_fourth_full, u[0], u[1], v[0], v[1])))
+                dirs.iter().map(move |v| {
+                    (
+                        *u,
+                        *v,
+                        contract_fourth_full(&hand_fourth_full, u[0], u[1], v[0], v[1]),
+                    )
+                })
             })
             .collect();
 
@@ -7327,7 +7183,6 @@ fn gaussian_rigid_intercept_miscalibrates_skewed_empirical_law() {
     assert!((empirical_mu - target_mu).abs() <= 1e-10);
 }
 
-
 /// Pathological warm-start: a stale cached intercept buried so deep in
 /// the left tail that every quadrature node `ηᵢ = a + b·zᵢ` underflows
 /// `φ(ηᵢ)` and `Φ(ηᵢ)` to exactly zero in linear arithmetic. The legacy
@@ -7369,7 +7224,6 @@ fn empirical_intercept_recovers_from_deep_tail_warm_start() {
     );
 }
 
-
 /// Same recovery contract on the right tail (a +∞-side stale warm start),
 /// where it is `1 − Φ` that underflows in linear arithmetic. The
 /// log-space residual is bounded above by `−log μ★ < ∞`, and the natural
@@ -7405,7 +7259,6 @@ fn empirical_intercept_recovers_from_far_right_warm_start() {
     );
 }
 
-
 /// Weighted covariance of two equal-length vectors. Test helper for the
 /// conditional latent-z calibration tests below.
 fn weighted_cov_for_test(a: &Array1<f64>, b: &Array1<f64>, w: &Array1<f64>) -> f64 {
@@ -7419,7 +7272,6 @@ fn weighted_cov_for_test(a: &Array1<f64>, b: &Array1<f64>, w: &Array1<f64>) -> f
         .sum::<f64>()
         / sw
 }
-
 
 /// #905: the conditional `E[z|C]`/`Var(z|C)` Rao gate must fire when the
 /// latent score has a conditional mean shift on the marginal-index span — the
@@ -7459,7 +7311,6 @@ fn conditional_latent_gate_detects_and_removes_conditional_mean_shift() {
     // The post-correction sanity-check moments are recorded.
     assert!(cal.post_mean.abs() < 1.0e-6, "post_mean={}", cal.post_mean);
 }
-
 
 /// Regression test on `weighted_ridge_sandwich_cov` directly: the HC0 sandwich
 /// must be FINITE on a numerically rank-deficient normal matrix, the smallest
@@ -7515,7 +7366,6 @@ fn weighted_ridge_sandwich_cov_is_finite_on_rank_deficient_normal_matrix() {
         "variance in the identifiable direction must be finite positive: {projected}"
     );
 }
-
 
 /// Regression test: the Murphy–Topel first-stage sandwich must be FINITE on a
 /// wide rank-deficient conditioning basis. The large-scale benchmarks tripped
@@ -7592,7 +7442,6 @@ fn conditional_latent_gate_handles_rank_deficient_conditioning_basis() {
     );
 }
 
-
 /// #905: with NO conditional structure (z independent of the conditioning
 /// span), the Rao gate must NOT fire — the conditional correction is reserved
 /// for genuine conditional shifts, leaving the pooled-marginal gate in charge.
@@ -7614,7 +7463,6 @@ fn conditional_latent_gate_silent_without_conditional_structure() {
         "conditional gate must stay silent when z carries no conditional structure"
     );
 }
-
 
 /// #905: the Auto path routes a conditional shift to the conditional
 /// location-scale calibration when a conditioning span is supplied, but falls
@@ -7662,7 +7510,6 @@ fn auto_latent_measure_routes_conditional_shift_to_location_scale() {
     );
 }
 
-
 #[test]
 fn auto_latent_measure_preserves_standard_normal_fast_path() {
     let n = 2001usize;
@@ -7692,7 +7539,6 @@ fn auto_latent_measure_preserves_standard_normal_fast_path() {
     );
 }
 
-
 #[test]
 fn flexible_family_exposes_exact_newton_workspaces() {
     let (family, block_states) = dual_flex_exact_fixture();
@@ -7718,7 +7564,6 @@ fn flexible_family_exposes_exact_newton_workspaces() {
             .is_some()
     );
 }
-
 
 #[test]
 fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
@@ -7780,7 +7625,6 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
     assert!((terms.objective_psi - objective_fd).abs() < 1e-5);
 }
 
-
 /// Multi-row rigid-probit family with non-trivial marginal/logslope
 /// designs (per-row eta varies), so half-mask Horvitz-Thompson rescaling
 /// over even rows is a representative subsample for the block-path
@@ -7813,7 +7657,6 @@ fn make_block_psi_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
     }
 }
 
-
 fn block_psi_test_block_states(
     family: &BernoulliMarginalSlopeFamily,
     m_beta: f64,
@@ -7835,7 +7678,6 @@ fn block_psi_test_block_states(
     ]
 }
 
-
 fn block_psi_test_marginal_derivative_blocks(
     n: usize,
 ) -> Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>> {
@@ -7855,7 +7697,6 @@ fn block_psi_test_marginal_derivative_blocks(
         Vec::new(),
     ]
 }
-
 
 fn block_psi_test_dual_derivative_blocks(
     n: usize,
@@ -7887,7 +7728,6 @@ fn block_psi_test_dual_derivative_blocks(
         )],
     ]
 }
-
 
 #[test]
 fn bernoulli_psi_terms_from_cache_subsample_full_equals_unsampled() {
@@ -7929,7 +7769,6 @@ fn bernoulli_psi_terms_from_cache_subsample_full_equals_unsampled() {
     let score_rel = rel_diff_array1(&with_full.score_psi, &baseline.score_psi);
     assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
 }
-
 
 #[test]
 fn bernoulli_psi_terms_from_cache_subsample_half_scales_correctly() {
@@ -7986,7 +7825,6 @@ fn bernoulli_psi_terms_from_cache_subsample_half_scales_correctly() {
     assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
 }
 
-
 #[test]
 fn bernoulli_psi_second_order_terms_from_cache_subsample_full_equals_unsampled() {
     use crate::solver::outer_subsample::OuterScoreSubsample;
@@ -8034,7 +7872,6 @@ fn bernoulli_psi_second_order_terms_from_cache_subsample_full_equals_unsampled()
     let score_rel = rel_diff_array1(&with_full.score_psi_psi, &baseline.score_psi_psi);
     assert!(score_rel < 1e-12, "score rel {}", score_rel);
 }
-
 
 #[test]
 fn bernoulli_psi_second_order_terms_from_cache_subsample_half_scales_correctly() {
@@ -8093,7 +7930,6 @@ fn bernoulli_psi_second_order_terms_from_cache_subsample_half_scales_correctly()
     assert!(score_rel < 1e-12, "score rel {}", score_rel);
 }
 
-
 #[test]
 fn bernoulli_psihessian_directional_derivative_from_cache_subsample_full_equals_unsampled() {
     use crate::solver::outer_subsample::OuterScoreSubsample;
@@ -8141,7 +7977,6 @@ fn bernoulli_psihessian_directional_derivative_from_cache_subsample_full_equals_
     let rel = rel_diff_array2(&with_full, &baseline);
     assert!(rel < 1e-12, "drift rel {}", rel);
 }
-
 
 #[test]
 fn bernoulli_psihessian_directional_derivative_from_cache_subsample_half_scales_correctly() {
@@ -8201,7 +8036,6 @@ fn bernoulli_psihessian_directional_derivative_from_cache_subsample_half_scales_
     assert!(rel < 1e-12, "drift rel {}", rel);
 }
 
-
 #[test]
 fn bernoulli_psihessian_operator_from_cache_subsample_full_equals_unsampled() {
     use crate::solver::outer_subsample::OuterScoreSubsample;
@@ -8252,7 +8086,6 @@ fn bernoulli_psihessian_operator_from_cache_subsample_full_equals_unsampled() {
     let rel = rel_diff_array2(&with_full_dense, &baseline_dense);
     assert!(rel < 1e-12, "operator drift rel {}", rel);
 }
-
 
 #[test]
 fn bernoulli_psihessian_operator_from_cache_subsample_half_scales_correctly() {

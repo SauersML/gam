@@ -357,11 +357,7 @@ pub(crate) fn pinv_active(ep: &EighPinv, i: usize) -> bool {
 
 #[inline]
 pub(crate) fn pinv_value(ep: &EighPinv, i: usize) -> f64 {
-    if pinv_active(ep, i) {
-        ep.inv[i]
-    } else {
-        0.0
-    }
+    if pinv_active(ep, i) { ep.inv[i] } else { 0.0 }
 }
 
 #[inline]
@@ -498,11 +494,11 @@ pub(crate) struct BlockForms {
 /// one walk so a value↔derivative desync is structurally impossible.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn block_residual_jets(
-    phi: &Array2<f64>,            // ml×d : δ/ε (metric-free local features)
-    masses_local: &Array1<f64>,  // ml
-    m: ArrayView2<'_, f64>,      // d×d : M
-    dm: &[Array2<f64>],          // n × (d×d) : ∂M/∂L_a
-    d2m: &[Array2<f64>],         // n² × (d×d) : ∂²M/∂L_a∂L_b
+    phi: &Array2<f64>,          // ml×d : δ/ε (metric-free local features)
+    masses_local: &Array1<f64>, // ml
+    m: ArrayView2<'_, f64>,     // d×d : M
+    dm: &[Array2<f64>],         // n × (d×d) : ∂M/∂L_a
+    d2m: &[Array2<f64>],        // n² × (d×d) : ∂²M/∂L_a∂L_b
     n_active: usize,
 ) -> BlockForms {
     let ml = phi.nrows();
@@ -631,10 +627,7 @@ pub(crate) fn block_residual_jets(
     }
 
     // B = WΦ − w·a_meanᵀ  (ml×d):  B[a,k] = w_a·psi[a,k] − w_a·amean[k].
-    let bmat = |wv: &Array1<f64>,
-                psiv: &Array2<f64>,
-                am: &Array1<f64>|
-     -> Array2<f64> {
+    let bmat = |wv: &Array1<f64>, psiv: &Array2<f64>, am: &Array1<f64>| -> Array2<f64> {
         let mut bb = Array2::<f64>::zeros((ml, d));
         for a in 0..ml {
             for k in 0..d {
@@ -650,8 +643,8 @@ pub(crate) fn block_residual_jets(
         let mut bb = Array2::<f64>::zeros((ml, d));
         for a in 0..ml {
             for k in 0..d {
-                bb[(a, k)] = dw[x][a] * (psi[(a, k)] - amean[k])
-                    + w[a] * (dpsi[x][(a, k)] - damean[x][k]);
+                bb[(a, k)] =
+                    dw[x][a] * (psi[(a, k)] - amean[k]) + w[a] * (dpsi[x][(a, k)] - damean[x][k]);
             }
         }
         db.push(bb);
@@ -829,10 +822,7 @@ pub(crate) fn block_residual_jets(
     }
 
     // R = diag(w) − w wᵀ/q − P/q.
-    let assemble_r = |wv: &Array1<f64>,
-                      qv: f64,
-                      pv: &Array2<f64>|
-     -> Array2<f64> {
+    let assemble_r = |wv: &Array1<f64>, qv: f64, pv: &Array2<f64>| -> Array2<f64> {
         let mut rr = Array2::<f64>::zeros((ml, ml));
         for a in 0..ml {
             for c in 0..ml {
@@ -852,8 +842,7 @@ pub(crate) fn block_residual_jets(
         let mut rr = Array2::<f64>::zeros((ml, ml));
         for a in 0..ml {
             for c in 0..ml {
-                let wwt_d = (dw[x][a] * w[c] + w[a] * dw[x][c]) / q
-                    - w[a] * w[c] * dq[x] / (q * q);
+                let wwt_d = (dw[x][a] * w[c] + w[a] * dw[x][c]) / q - w[a] * w[c] * dq[x] / (q * q);
                 let pd = dp[x][(a, c)] / q - p[(a, c)] * dq[x] / (q * q);
                 rr[(a, c)] = -wwt_d - pd;
             }
@@ -880,8 +869,7 @@ pub(crate) fn block_residual_jets(
                         + dw[x][a] * dw[y][c]
                         + dw[y][a] * dw[x][c]
                         + w[a] * d2w[x * n + y][c];
-                    let wwt_d2 = num_xy / q
-                        - (num_x * qy + num_y * qx + num * qxy) / (q * q)
+                    let wwt_d2 = num_xy / q - (num_x * qy + num_y * qx + num * qxy) / (q * q)
                         + 2.0 * num * qx * qy / (q * q * q);
                     // P / q second derivative.
                     let pn = p[(a, c)];
@@ -923,10 +911,7 @@ pub fn measure_jet_anisotropy_energy_form(
     alpha: f64,
     l: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    Ok(measure_jet_anisotropy_energy_form_with_jets(
-        centers, masses, band, order_s, alpha, l,
-    )?
-    .q)
+    Ok(measure_jet_anisotropy_energy_form_with_jets(centers, masses, band, order_s, alpha, l)?.q)
 }
 
 /// The det-normalized anisotropic energy together with its EXACT first and
@@ -979,10 +964,12 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
     let md = metric_sq_dists(centers, nf.m.view());
 
     let mut q_form = Array2::<f64>::zeros((m_centers, m_centers));
-    let mut d_first: Vec<Array2<f64>> =
-        (0..n).map(|_| Array2::<f64>::zeros((m_centers, m_centers))).collect();
-    let mut d_second: Vec<Array2<f64>> =
-        (0..n * n).map(|_| Array2::<f64>::zeros((m_centers, m_centers))).collect();
+    let mut d_first: Vec<Array2<f64>> = (0..n)
+        .map(|_| Array2::<f64>::zeros((m_centers, m_centers)))
+        .collect();
+    let mut d_second: Vec<Array2<f64>> = (0..n * n)
+        .map(|_| Array2::<f64>::zeros((m_centers, m_centers)))
+        .collect();
 
     for &eps in &band.eps {
         let cutoff2 = (PROFILE_CUTOFF * eps) * (PROFILE_CUTOFF * eps);
@@ -1051,14 +1038,7 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
                 continue;
             }
 
-            let blk = block_residual_jets(
-                &phi,
-                &masses_local,
-                nf.m.view(),
-                &nf.dm,
-                &nf.d2m,
-                n,
-            );
+            let blk = block_residual_jets(&phi, &masses_local, nf.m.view(), &nf.dm, &nf.d2m, n);
 
             // Outer weight base = log_step · ε^(−η) · net_mass_i · q^(1−2α),
             // η = 2s + d(2−2α), preserving the advertised |ξ|^(2s) order for

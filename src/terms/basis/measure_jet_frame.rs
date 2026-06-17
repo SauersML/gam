@@ -336,7 +336,8 @@ pub fn build_measure_jet_frame(
 
     // The growing pool of mass-orthonormal columns: head first, then the lifted
     // innovations as they are constructed level by level.
-    let mut ortho_pool: Vec<Array1<f64>> = (0..head_dim).map(|j| head.column(j).to_owned()).collect();
+    let mut ortho_pool: Vec<Array1<f64>> =
+        (0..head_dim).map(|j| head.column(j).to_owned()).collect();
     let mut innovation_cols: Vec<Array1<f64>> = Vec::new();
     let mut level_dims: Vec<usize> = Vec::with_capacity(eps_band.len());
     let mut level_precisions: Vec<f64> = Vec::with_capacity(eps_band.len());
@@ -469,7 +470,10 @@ pub(crate) fn enumerate_fixed_total(
 
 /// Evaluate the monomial design `[ ∏_k x_{i,k}^{α_k} ]` for each exponent vector
 /// `α` at each center `x_i`. Returns an `n × |exponents|` matrix.
-pub(crate) fn monomial_design(centers: ArrayView2<'_, f64>, exponents: &[Vec<usize>]) -> Array2<f64> {
+pub(crate) fn monomial_design(
+    centers: ArrayView2<'_, f64>,
+    exponents: &[Vec<usize>],
+) -> Array2<f64> {
     let n = centers.nrows();
     let mut out = Array2::<f64>::zeros((n, exponents.len()));
     for (j, alpha) in exponents.iter().enumerate() {
@@ -715,7 +719,12 @@ mod tests {
 
     /// Evaluate a degree < r polynomial on the centers (for affine = r=2 this is
     /// `a + b·x + c·y`).
-    pub(crate) fn affine_values(centers: ArrayView2<'_, f64>, a: f64, b: f64, c: f64) -> Array1<f64> {
+    pub(crate) fn affine_values(
+        centers: ArrayView2<'_, f64>,
+        a: f64,
+        b: f64,
+        c: f64,
+    ) -> Array1<f64> {
         let n = centers.nrows();
         let mut v = Array1::<f64>::zeros(n);
         for i in 0..n {

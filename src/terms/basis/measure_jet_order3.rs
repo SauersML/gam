@@ -110,7 +110,10 @@ pub(crate) fn pairwise_sq_dists(a: ArrayView2<'_, f64>) -> Array2<f64> {
 /// Rank-revealing symmetric pseudo-inverse via the symmetric eigendecomposition,
 /// with eigenvalues clamped at zero and a `RTOL · n · λ_max` rank cutoff. Mirrors
 /// the affine energy so both layers treat unresolved directions identically.
-pub(crate) fn symmetric_pseudoinverse(a: &Array2<f64>, label: &str) -> Result<Array2<f64>, BasisError> {
+pub(crate) fn symmetric_pseudoinverse(
+    a: &Array2<f64>,
+    label: &str,
+) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
     if a.ncols() != n {
         crate::bail_dim_basis!(
@@ -361,10 +364,8 @@ pub fn measure_jet_order3_energy_form(
     };
 
     let n_scales = band.eps.len();
-    let parallel_ok = m
-        .saturating_mul(m)
-        .saturating_mul(n_scales)
-        <= MEASURE_JET3_PARALLEL_BUDGET_DOUBLES;
+    let parallel_ok =
+        m.saturating_mul(m).saturating_mul(n_scales) <= MEASURE_JET3_PARALLEL_BUDGET_DOUBLES;
     let per_scale: Vec<Array2<f64>> = if parallel_ok {
         band.eps
             .par_iter()
@@ -455,15 +456,9 @@ mod tests {
         let masses = uniform_masses(centers.nrows());
         let band = band_for(&centers);
 
-        let q3 = measure_jet_order3_energy_form(
-            centers.view(),
-            masses.view(),
-            &band,
-            1.5,
-            1.0,
-            1e-3,
-        )
-        .expect("r=3 energy");
+        let q3 =
+            measure_jet_order3_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
+                .expect("r=3 energy");
         let q2 = crate::terms::basis::measure_jet_energy_form(
             centers.view(),
             masses.view(),
@@ -516,22 +511,14 @@ mod tests {
         let centers = grid_centers();
         let masses = uniform_masses(centers.nrows());
         let band = band_for(&centers);
-        let q = measure_jet_order3_energy_form(
-            centers.view(),
-            masses.view(),
-            &band,
-            1.5,
-            1.0,
-            1e-3,
-        )
-        .expect("r=3 energy");
+        let q =
+            measure_jet_order3_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
+                .expect("r=3 energy");
         let m = q.nrows();
         let scale = q.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
         assert!(scale > 0.0, "r=3 energy form is identically zero");
         for trial in 0..8usize {
-            let v = Array1::from_shape_fn(m, |i| {
-                ((i * 13 + trial * 29) % 23) as f64 / 23.0 - 0.5
-            });
+            let v = Array1::from_shape_fn(m, |i| ((i * 13 + trial * 29) % 23) as f64 / 23.0 - 0.5);
             let e = energy_of(&q, &v);
             assert!(
                 e >= -1e-9 * scale,

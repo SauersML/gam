@@ -56,8 +56,6 @@ mod prelude_lock_tests {
     /// `include!("prelude.rs")`. Also pins a representative re-exported symbol.
     #[test]
     fn basis_prelude_include_path_is_locked() {
-        assert!(
-            core::any::type_name::<crate::matrix::DesignMatrix>().contains("DesignMatrix")
-        );
+        assert!(core::any::type_name::<crate::matrix::DesignMatrix>().contains("DesignMatrix"));
     }
 }
