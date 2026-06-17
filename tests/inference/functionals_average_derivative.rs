@@ -131,15 +131,15 @@ fn average_derivative_onestep_corrects_oversmoothed_gaussian_spline() {
             "seed {seed}: one-step average derivative error {onestep_error:.4}"
         );
         assert!(
-            estimate.penalty_bias.signum() == plugin_error.signum(),
-            "seed {seed}: penalty bias {:.4} should point in the observed plugin-error direction {:.4}",
+            estimate.penalty_bias.signum() == (-plugin_error).signum(),
+            "seed {seed}: penalty correction {:.4} should point opposite the observed plugin error {:.4}",
             estimate.penalty_bias,
             plugin_error
         );
         assert!(
             estimate.penalty_bias.abs() > 0.2 * plugin_error.abs()
                 && estimate.penalty_bias.abs() < 1.2 * plugin_error.abs(),
-            "seed {seed}: penalty bias {:.4} should be same order as plugin error {:.4}",
+            "seed {seed}: penalty correction {:.4} should be same order as plugin error {:.4}",
             estimate.penalty_bias,
             plugin_error
         );
