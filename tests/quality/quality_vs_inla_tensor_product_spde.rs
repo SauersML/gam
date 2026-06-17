@@ -61,9 +61,7 @@ use std::path::Path;
 const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
 
 /// Number of rows loaded from the quakes panel, then split train/test.
-// N=300: reduced from 500 to keep the INLA SPDE mesh + inference within the
-// 360s CI budget (INLA mesh/matrix ops scale super-linearly with n).
-const N: usize = 300;
+const N: usize = 500;
 
 /// Held-out coefficient of determination `R² = 1 − SS_res/SS_tot`, where
 /// `SS_tot` is taken about the mean of the held-out truth. A self-contained

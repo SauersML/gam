@@ -60,10 +60,7 @@ fn gam_poisson_2d_recovers_true_log_mean_surface() {
 
     // ---- synthetic Poisson-count truth on the unit square ------------------
     // true_eta = sin(pi*x) * cos(pi*z); count ~ Poisson(exp(true_eta)).
-    // n=150 (down from 300): pyGAM's fitting cost is super-linear in n and
-    // the 300-row version exceeded the 360s CI budget; 150 rows still give
-    // enough signal for both gam and pyGAM to recover the smooth truth.
-    let n = 150usize;
+    let n = 300usize;
     let mut rng = StdRng::seed_from_u64(20260530);
     let u = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
 
@@ -297,14 +294,11 @@ fn gam_poisson_2d_recovers_true_log_mean_surface_on_real_data() {
     assert!(n > 1000, "badhealth should have ~1127 rows, got {n}");
 
     // ---- deterministic train/test split: every 4th row is held out ---------
-    // Cap train at 400 rows so that pyGAM's fitting completes within the
-    // 360s CI budget; both gam and pyGAM train on the same 400 rows.
     let is_test = |i: usize| i % 4 == 0;
-    let all_train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
-    let train_rows: Vec<usize> = all_train_rows.into_iter().take(400).collect();
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
     let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
     assert!(
-        train_rows.len() == 400 && test_rows.len() > 250,
+        train_rows.len() > 700 && test_rows.len() > 250,
         "split sizes: train={} test={}",
         train_rows.len(),
         test_rows.len()

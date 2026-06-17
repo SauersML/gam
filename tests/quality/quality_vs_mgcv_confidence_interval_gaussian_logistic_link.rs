@@ -78,17 +78,12 @@ use std::f64::consts::PI;
 /// Number of independent Bernoulli response replicates drawn on the fixed
 /// design. Pooled across the grid this gives a low-Monte-Carlo-error estimate
 /// of the across-the-function coverage expectation.
-// Halved from 60 to keep total wall-clock inside the 360s CI budget while
-// still giving 9,000 pooled trials for coverage estimation (MC SE ≈ 0.002,
-// far below the ±0.06 tolerance window).
-const N_REPLICATES: usize = 30;
+const N_REPLICATES: usize = 60;
 
 /// Fixed design size. Chosen so a 1½-cycle non-saturating logit smooth is
 /// resolvable by REML (EDF ≈ 8–9) — the regime where the Nychka coverage
 /// guarantee is well-posed.
-// Halved from 600; at n=300 REML still resolves the 1½-cycle truth (EDF>5)
-// and the 30×300=9,000 pooled trials give MC SE ≈ 0.002 on coverage rate.
-const N: usize = 300;
+const N: usize = 600;
 
 /// Basis dimension for `s(x, k=K)`. Comfortably spans the 1½-cycle truth.
 const K: usize = 15;

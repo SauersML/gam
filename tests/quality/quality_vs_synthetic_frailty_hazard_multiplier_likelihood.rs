@@ -174,11 +174,7 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     // E ~ Exp(1), i.e. integrating H(t|U) = H_0(t)*exp(U) to a draw. Times are
     // administratively censored at `tau` to produce a censored/event mix.
     //
-    // 100 groups (reduced from 400 to keep R's Gauss–Hermite quadrature loop
-    // within the 360s CI budget).  MLE is still in its asymptotic regime at
-    // this size; the wider se_sigma naturally widens the recovery bar so the
-    // primary assertion remains tight relative to estimation uncertainty.
-    const M_GROUPS: usize = 100;
+    const M_GROUPS: usize = 400;
     const N_PER: usize = 8;
     const N_TOTAL: usize = M_GROUPS * N_PER;
     const SIGMA_TRUE: f64 = 0.5;

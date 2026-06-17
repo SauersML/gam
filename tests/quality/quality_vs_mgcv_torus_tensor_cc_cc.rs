@@ -336,15 +336,11 @@ fn gam_torus_tensor_cc_cc_recovers_truth_and_wraps_at_both_seams_on_real_data() 
     assert!(n > 1000, "bike torus should have ~1752 rows, got {n}");
 
     // ---- deterministic train/test split: every 5th row held out -----------
-    // Cap train at 400 rows so that mgcv's torus te(season,hour) REML fit
-    // completes within the 360s CI budget.  Both gam and mgcv train on the
-    // same 400 rows; the held-out comparison remains apples-to-apples.
     let is_test = |i: usize| i % 5 == 0;
-    let all_train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
-    let train_rows: Vec<usize> = all_train_rows.into_iter().take(400).collect();
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
     let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
     assert!(
-        train_rows.len() == 400 && test_rows.len() > 300,
+        train_rows.len() > 1000 && test_rows.len() > 300,
         "split sizes: train={} test={}",
         train_rows.len(),
         test_rows.len()
@@ -449,11 +445,9 @@ fn gam_torus_tensor_cc_cc_recovers_truth_and_wraps_at_both_seams_on_real_data() 
     // (daily commute peaks × seasonal trend); a competent torus smoother
     // explains the large majority of held-out variance. R2 >= 0.80 is well
     // above the constant-mean baseline (0) and catches under/over-smoothing.
-    // 400 training rows (capped for CI budget); still expect strong periodicity
-    // to yield a good R² on the held-out set.
     assert!(
-        gam_test_r2 >= 0.70,
-        "gam's held-out predictive R2 too low: {gam_test_r2:.4} (< 0.70)"
+        gam_test_r2 >= 0.80,
+        "gam's held-out predictive R2 too low: {gam_test_r2:.4} (< 0.80)"
     );
 
     // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----

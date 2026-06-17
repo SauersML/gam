@@ -40,10 +40,7 @@ use ndarray::Array2;
 use std::path::Path;
 
 const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
-// Reduced from 5 to 3 to keep the 5×(gam fit + EBM + pyGAM) Python
-// subprocess within the 360s CI wall-clock budget.  3-fold gives ~218 test
-// rows per fold; the AUC estimate remains reliable at that size.
-const N_FOLDS: usize = 3;
+const N_FOLDS: usize = 5;
 
 /// Absolute hold-out quality bar gam must clear on its OWN predictions. The
 /// prostate `y ~ pc1 + pc2` signal is moderate; a model that has learned real
@@ -55,8 +52,7 @@ const GAM_MIN_HOLDOUT_AUC: f64 = 0.62;
 
 /// Match-or-beat slack against the strongest mature baseline. gam must be at
 /// least this close to the best of {EBM, pyGAM}; 0.02 AUC is the hold-out
-/// sampling slack (3-fold gives ~218 test rows/fold, more than the original
-/// 5-fold's ~130, so the AUC estimator is at least as precise).
+/// sampling slack.
 const BASELINE_AUC_MARGIN: f64 = 0.02;
 
 /// Absolute hold-out negative-log-likelihood (mean per-row log-loss) ceiling
