@@ -55,7 +55,8 @@ use crate::identifiability::audit::{
 use crate::identifiability::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
-use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
+use crate::linalg::faer_ndarray::{FaerEigh, fast_ata};
+use faer::Side;
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::gauge::Gauge;
 
@@ -409,6 +410,52 @@ pub fn canonicalize_for_identifiability(
 /// [`Gauge::lift_block_betas`] / [`Gauge::lift_covariance`] machinery maps the
 /// reduced fit back to raw coordinates unchanged (the lift is `β_raw = V_b · θ`,
 /// already supported for dense transforms).
+/// Rank of `j` under the SAME σ²-Gram eigenvalue convention the
+/// channel-aware audit uses to decide which columns to drop
+/// (`families::compiler::keep_positive_eigenspace`).
+///
+/// The post-T rank invariant must compare `rank(J)` and `rank(J_can)` with the
+/// exact threshold/operator under which the audit declared the dropped columns
+/// gauge — otherwise it compares two non-comparable ranks. The audit ranks a
+/// design by the positive eigenspace of its Gram `G = JᵀJ`, retaining an
+/// eigenvalue `λ_i` iff `λ_i > scale · 64 · (n·k) · ε` with
+/// `scale = max(λ_max, tr(G))`. Because `λ = σ²`, that is a σ²-space cutoff:
+/// near-separable directions with `σ_i/σ_max` between ~`√ε` and the RRQR floor
+/// (~`ε`) are gauge under THIS metric but full-rank under a fresh σ-space RRQR.
+/// On the near-separable penguin multinomial the two metrics disagreed by 4
+/// directions (164 vs 160; gam#1220) — the audit (correctly, by its own
+/// convention) dropped 4 weak softmax-channel directions that the post-T RRQR
+/// still counted, tripping the invariant. Ranking BOTH `J` and `J_can` here
+/// makes the invariant hold by construction for a pure column-selection `T`
+/// (dropping audit-gauge columns), while still catching a genuine `T` bug:
+/// dropping a column the audit deemed identifiable lowers `rank_audit(J_can)`
+/// below `rank_audit(J)`.
+///
+/// `nk_scale` mirrors the audit's tolerance size term
+/// `(n·K).max(p).max(1)` (`keep_positive_eigenspace`).
+fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize) -> usize {
+    let p = j.ncols();
+    if p == 0 || j.nrows() == 0 {
+        return 0;
+    }
+    // G = JᵀJ (p × p), symmetric PSD — same Gram the audit eigendecomposes.
+    let gram = fast_ata(j);
+    let (evals, _) = match gram.eigh(Side::Lower) {
+        Ok(ev) => ev,
+        // Eigendecomposition failure: fall back to the structural column count
+        // (no demotion), so a numerical hiccup never turns into a spurious
+        // invariant violation.
+        Err(_) => return p,
+    };
+    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
+    let trace: f64 = (0..p).map(|i| gram[[i, i]].max(0.0)).sum();
+    let scale = lambda_max.max(trace);
+    // RANK_REVEAL_EPS_SLACK = 64.0 in families::compiler — kept in sync here.
+    let nk = nk_scale.max(p).max(1) as f64;
+    let tau = scale * 64.0 * nk * f64::EPSILON;
+    evals.iter().filter(|&&l| l > tau).count()
+}
+
 fn canonicalize_for_identifiability_inner(
     specs: &[ParameterBlockSpec],
     orthogonalize: bool,
@@ -1065,16 +1112,21 @@ fn canonicalize_for_identifiability_inner(
                 red_col_off += r_i;
             }
 
-            // RRQR rank on J_pre and J_can.
-            let rank_j_pre = rrqr_with_permutation(&j_pre, default_rrqr_rank_alpha())
-                .map(|r| r.rank)
-                .unwrap_or(0);
-            let rank_j_can = rrqr_with_permutation(&j_can, default_rrqr_rank_alpha())
-                .map(|r| r.rank)
-                .unwrap_or(0);
+            // Rank J_pre and J_can under the SAME σ²-Gram eigenvalue convention
+            // the audit used to DECIDE the drops (`audit_convention_rank`), not
+            // a fresh σ-space RRQR with a different threshold. On near-separable
+            // data the two disagree by ~6 orders of magnitude in the relative-σ
+            // cutoff, so a plain RRQR would count weak directions the audit (by
+            // its own convention) correctly demoted, tripping the invariant on
+            // genuine gauge drops (gam#1220). `nk_scale` mirrors the audit's
+            // tolerance size term: r_map is the (n·k)-stacked row count.
+            let nk_scale = r_map;
+            let rank_j_pre = audit_convention_rank(&j_pre, nk_scale);
+            let rank_j_can = audit_convention_rank(&j_can, nk_scale);
 
             log::info!(
-                "[CANON] post-T invariant: rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
+                "[CANON] post-T invariant (audit σ²-Gram convention): \
+                 rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
                  (p_raw={p_total_raw} p_red={p_total_red} k={k})",
             );
 
@@ -1741,6 +1793,111 @@ mod tests {
             3,
             "time_surface must retain all 3 columns after gauge canonicalisation",
         );
+    }
+
+    /// #1220: the post-T rank invariant must rank `J` and `J_can` with the
+    /// SAME threshold/operator the audit used to decide the drops, so a column
+    /// the audit (σ²-Gram eigenvalue convention) demotes on near-separable data
+    /// does not trip the invariant (which previously re-ranked `J` with a
+    /// σ-space RRQR whose cutoff is ~6 orders of magnitude lower, counting the
+    /// demoted direction and reporting `rank(J) > rank(J_can)`).
+    ///
+    /// Fixture mirrors the multinomial Firth/Jeffreys penguin geometry: two
+    /// softmax channel blocks share an identical design, each routed through an
+    /// `AdditiveBlockJacobian` (`n_family_outputs = 2`, `own_output = a`) so
+    /// canonicalisation runs the CHANNEL-AWARE audit (block-diagonal
+    /// `blkdiag(X, X)`, not a false `[X | X]` alias). `X` carries a
+    /// near-separable direction: a column whose relative singular value sits in
+    /// the gap between the σ-space RRQR floor (~ε) and the σ²-Gram cutoff
+    /// (~√ε) — full-rank under RRQR, gauge under the audit. The invariant must
+    /// HOLD (no `DimensionMismatch` rank-invariant panic) for either audit
+    /// verdict.
+    #[test]
+    fn canonical_multinomial_near_separable_post_t_rank_invariant_holds() {
+        let n = 120;
+        let x = linspace(n);
+        // Shared per-channel design X (n × 4): three well-conditioned smooth
+        // basis columns plus one NEAR-SEPARABLE column. The weak column is
+        // `c3 = c1 + ε_rel · w`, where `w` is an independent oscillation and
+        // `ε_rel` places the residual singular value of `c3` (after projecting
+        // out c0..c2) at ~`1e-7 · σ_max` — comfortably above the σ-space RRQR
+        // floor (~`1e-13 · σ_max`) yet below the σ²-Gram retain cutoff
+        // (~`8·√(nk·ε)·σ_max` ≈ `4e-6 · σ_max`). RRQR ⇒ full rank 4; the
+        // channel-aware audit may demote the weak column.
+        let eps_rel = 1e-7_f64;
+        let p = 4usize;
+        let mut xmat = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let xi = x[i];
+            xmat[[i, 0]] = 1.0; // constant
+            xmat[[i, 1]] = xi; // linear
+            xmat[[i, 2]] = (3.0 * xi).sin(); // oscillation
+            // Near-separable: ~equal to a fixed combination of c0..c1 plus a
+            // tiny independent wiggle.
+            let w = (7.0 * xi).cos();
+            xmat[[i, 3]] = 1.0 + 0.5 * xi + eps_rel * w;
+        }
+
+        let m = 2usize; // K-1 active softmax channels
+        let specs: Vec<ParameterBlockSpec> = (0..m)
+            .map(|a| {
+                let mut spec = spec_from_dense_with_priority(
+                    &format!("class_{a}"),
+                    xmat.clone(),
+                    100u8.saturating_add((m - a) as u8),
+                );
+                spec.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
+                    design: xmat.clone(),
+                    own_output: a,
+                    n_family_outputs: m,
+                }));
+                spec
+            })
+            .collect();
+
+        // The contract: canonicalisation must NOT fail with the post-T
+        // rank-invariant `DimensionMismatch`. It may legitimately reduce
+        // (dropping audit-gauge directions) or keep identity — either is fine;
+        // what must never happen is the rank(J) != rank(J_can) panic.
+        match canonicalize_for_identifiability(&specs) {
+            Ok(canon) => {
+                // If it reduced, the gauge must round-trip the reduced fit back
+                // to raw width without shape mismatch.
+                let theta: Vec<Array1<f64>> = canon
+                    .reduced_specs
+                    .iter()
+                    .map(|s| Array1::<f64>::zeros(s.design.ncols()))
+                    .collect();
+                let raw = canon.gauge.lift_block_betas(&theta);
+                assert_eq!(raw.len(), m, "lift must return one beta per channel block");
+                for (a, b) in raw.iter().enumerate() {
+                    assert_eq!(
+                        b.len(),
+                        p,
+                        "lifted channel {a} beta must be raw width {p}, got {}",
+                        b.len()
+                    );
+                }
+            }
+            Err(CustomFamilyError::DimensionMismatch { reason })
+                if reason.contains("post-T rank invariant violated") =>
+            {
+                panic!(
+                    "post-T rank invariant must hold under the shared audit rank \
+                     convention on near-separable multinomial data (#1220); got: {reason}"
+                );
+            }
+            // A correct, separation-aware refusal (e.g. fatal identifiability
+            // failure) is acceptable per the issue — only the rank-invariant
+            // panic is the regression we pin against.
+            Err(other) => {
+                let msg = format!("{other:?}");
+                assert!(
+                    !msg.contains("post-T rank invariant"),
+                    "must not be a post-T rank-invariant failure; got {msg}"
+                );
+            }
+        }
     }
 
     /// On a clean (non-fatal) configuration with a non-trivial penalty,

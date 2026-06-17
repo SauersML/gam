@@ -759,12 +759,23 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
         self.last_canonical_revision = design_revision;
-        // #1033b: single design-moving ψ with a certified tensor — install the
-        // n-free assembled Gaussian sufficient statistics so the inner PLS and
-        // the sparse scatter skip the per-trial O(n·p²) Gram re-stream
-        // (`reset_surface` above just cleared the slot for the new design). Same
-        // installer the fast path uses, so both branches key the Gram to ψ.
-        self.install_psi_gram_statistics(theta, rho_dim);
+        // #1216 hybrid: on the SLOW path the design was just REALIZED (the n×k
+        // `x_fit` is live in `reset_surface` above), so the inner PLS forms the
+        // EXACT `XᵀWX(ψ)` from it. We deliberately do NOT install the certified
+        // tensor's n-free assembled Gram here: the tensor reconstruction is
+        // bit-tight for the COST / κ-SEARCH (~1e-8) but its ~1e-14 Chebyshev
+        // residual, amplified by the radial-kernel Gram conditioning at
+        // weakly-penalized high-ψ (cond ~1e8), drifts the RECONSTRUCTED β̂ by
+        // ~1e-6 from the exact solve. Since the slow path already paid the O(n·k)
+        // realization (and reset_surface's O(n·p²) reconditioning), forming the
+        // exact Gram is incremental and keeps the MATERIALIZED β̂ bit-exact. The
+        // n-free win is preserved where it matters: the per-trial SEARCH loop
+        // takes the design-revision FAST path (in-window ψ at a pinned revision),
+        // which DOES install the tensor Gram (`prepare_eval_state` fast branch)
+        // and never realizes n rows — the slow path runs only once per revision
+        // (the #1033 "single initial pass"). The Gram slot was cleared by
+        // `reset_surface`, so leaving it clear routes the inner solve to the
+        // exact realized Gram.
         self.install_pending_glm_trial_statistics();
         // #1033 penalty lane: the slow path just rebuilt `S` from the freshly
         // realized design inside `reset_surface`, so a staged n-free penalty (if
