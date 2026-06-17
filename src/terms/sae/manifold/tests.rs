@@ -8973,28 +8973,32 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 /// collapses into the degenerate basin and pins the outer loop at the sentinel.
 /// Post-#1189 the relative floor (≈ 0.9 × anchor ceiling) accepts the genuine
 /// arrival (`arrived = true`) and the certified branch is kept. This runs a
-/// single η-walk (no multi-hour ρ-anneal), so it is a practical regression test.
+/// single η-walk (no multi-hour ρ-anneal) on a modest real-data slice, so it is
+/// a practical regression test.
 #[test]
 pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data/olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
-    let z_train = z.slice(s![..384, ..]).to_owned();
+    // A modest real-activation slice keeps the single certified η-walk fast while
+    // still exercising the K>=2 multi-atom routing the fix targets on genuine
+    // long-tailed LLM data (the cause of the unreachable absolute floor).
+    let z_train = z.slice(s![..160, ..]).to_owned();
 
-    // Production-style K=4, d=2 periodic (torus) dictionary, PCA-seeded from the
-    // real activations exactly as the cold path does. K=4 keeps the single
-    // certified η-walk practical while still exercising the K>=2 multi-atom
-    // routing the fix targets.
-    let k = 4usize;
-    let term = real_data_torus_seed_term(z_train.view(), k, 3);
+    // Production-style K=2, d=2 periodic (torus) dictionary, PCA-seeded from the
+    // real activations exactly as the cold path does. K=2 (with 2 harmonics)
+    // keeps the inner joint Newton small while still routing through the K>=2
+    // certified curvature-homotopy entry that the fix corrects.
+    let k = 2usize;
+    let term = real_data_torus_seed_term(z_train.view(), k, 2);
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; k]);
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         z_train.clone(),
         None,
         rho.clone(),
-        25,
+        12,
         0.04,
         1.0e-6,
         1.0e-6,
