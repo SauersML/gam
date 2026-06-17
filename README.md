@@ -277,19 +277,11 @@ import gamfit
 print(gamfit.format_cuda_diagnostics())
 ```
 
-If both a system CUDA toolkit and PyTorch's `nvidia-*-cu12` wheels are
-present in the same environment, the same SONAME (e.g.
-`libcublas.so.12`) can appear twice in `/proc/self/maps`. This is
-benign when glibc resolves `dlopen(SONAME)` to a single file; gamfit
-warns once per conflict-set and continues. The pathological case
-(`cublasDestroy_v2` aborting in glibc) only occurs if calling code
-`dlopen`s both files by absolute path. Keep one CUDA toolkit
-reachable.
-
-If you use gamfit together with `torch` and your driver is CUDA 12.x,
-install a torch build whose CUDA suffix matches the driver
-(`+cu12x`). gamfit itself loads cuBLAS / cuSOLVER / cuSPARSE through
-whichever `libcudart.so.12` is reachable.
+Keep one CUDA toolkit reachable. If a system CUDA install and PyTorch's
+bundled CUDA wheels are both present, gamfit warns once and continues; it
+loads cuBLAS / cuSOLVER / cuSPARSE through whichever `libcudart.so.12` it
+finds first. When using gamfit with `torch` on a CUDA 12.x driver,
+install a torch build whose CUDA suffix matches (`+cu12x`).
 
 ## Repository layout
 
@@ -326,10 +318,36 @@ Benchmarks: `python3 bench/run_suite.py --help` for the suite runner or
 - Manifold smooths gallery: [docs/manifold-smooths.md](docs/manifold-smooths.md).
 - Manifold SAE dictionary: [docs/manifold-sae.md](docs/manifold-sae.md).
 
-## Issues
+## Contributing
 
-Open a [GitHub issue](https://github.com/SauersML/gam/issues) for bug
-reports, feature requests, or questions.
+This is meant to be one of the easiest projects anywhere to contribute
+to — on purpose, not by neglect.
+
+The correctness bar is high: smooths are checked against analytic oracles
+and finite-difference jets, and CI is strict. But that bar is on the
+merged result, and keeping it there is the maintainer's job — not a toll
+you pay to take part. So the bar to *contribute* is zero:
+
+- **Broken PRs are welcome.** Fails CI, half-finished, you're not sure
+  it's right — open it anyway. A broken PR with a good idea in it beats a
+  good idea that never got sent.
+- **Beginners welcome.** You don't need REML, Rust, or PyO3 to help. A
+  confusing error message, a typo, a docs gap, or "why does it do this?"
+  is a real contribution.
+- **AI is allowed.** Wrote it with Claude, Copilot, or an agent? Fine —
+  mention it or don't.
+- **Any feature request, however far-fetched.** "Can it do X?" is useful
+  even when the answer is no — it shows how people want to use this.
+- **No template, no checklist, no CLA, no guidelines.** Have fun.
+
+The point is engagement. Ideas, bug reports, "here's how I'm using
+this," a PR that's mostly wrong but sparks the right fix — all of it
+helps. The only real failure is a good thought that never gets sent
+because the friction felt too high.
+
+Open a [pull request](https://github.com/SauersML/gam/pulls) or an
+[issue](https://github.com/SauersML/gam/issues) — bugs, features,
+questions, wild ideas. That's the whole process.
 
 ## License
 
