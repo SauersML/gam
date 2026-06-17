@@ -2044,17 +2044,6 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let (cost_minus, _, _) = outer_at(-eps, 0.0, EvalMode::ValueOnly);
     let fd_psi_gradient = (cost_plus - cost_minus) / (2.0 * eps);
     let analytic_psi_gradient = grad0[n_rho];
-
-    eprintln!(
-        "[#740 diag] psi: analytic={:+.6e} fd={:+.6e} cost_plus={:+.6e} cost_minus={:+.6e} \
-         d_cost={:+.6e} eps={:.1e}",
-        analytic_psi_gradient,
-        fd_psi_gradient,
-        cost_plus,
-        cost_minus,
-        cost_plus - cost_minus,
-        eps
-    );
     let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());
     let psi_gradient_rel = (analytic_psi_gradient - fd_psi_gradient).abs() / psi_gradient_scale;
     assert!(
