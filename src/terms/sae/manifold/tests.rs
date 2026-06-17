@@ -9441,18 +9441,39 @@ mod inner_contract_probe_tests {
         );
 
         // (2) Faithfulness: on the rows the certificate accepts, the cheap
-        // one-mat-vec amortized encode reconstructs the SAME structure the exact
-        // encode-by-inner-solve produced. Compare the amortized decoded curve to
-        // the exact fitted reconstruction row-by-row over certified rows.
+        // one-mat-vec amortized encode recovers the SAME latent coordinate the
+        // EXACT encode-by-inner-solve (the certified cold chart-center Newton
+        // probe) produces. This is the encoder-fidelity question Design A makes —
+        // amortized-encode ≈ exact-encode PER ROW. (It is NOT the same as the
+        // joint-fitted reconstruction `try_fitted_for_rho`: the joint fit smooths
+        // the latent coords across rows under the λ_smooth penalty, so its
+        // per-row reconstruction legitimately differs from a per-row encode by the
+        // smoothing bias — comparing against it would conflate encoder fidelity
+        // with the smoother. We therefore compare the two PER-ROW encodes, decoded
+        // through the SAME basis, exactly as the held-out arm below does.)
         let amplitudes = term.fitted_assignment_amplitudes(&rho_fit).unwrap();
         let encodes = term
             .amortized_encode_target(target.view(), amplitudes.view())
             .expect("amortized encode runs");
-        let exact_recon = term.try_fitted_for_rho(&rho_fit).unwrap();
         let atom0 = &term.atoms[0];
         let evaluator = atom0.basis_evaluator.as_ref().unwrap();
         let (phi_hat, _j) = evaluator.evaluate(encodes[0].coords.view()).unwrap();
         let decoded_hat = phi_hat.dot(&atom0.decoder_coefficients); // (n × p)
+
+        // The exact per-row encode the sequential path would use as its teacher:
+        // a certified cold chart-center Newton solve for each row.
+        let mut in_sample_norm_bound = 0.0_f64;
+        for row in 0..n {
+            in_sample_norm_bound =
+                in_sample_norm_bound.max(target.row(row).dot(&target.row(row)).sqrt());
+        }
+        let in_sample_atlas = crate::terms::sae::encode::EncodeAtlas::build(
+            &term.atoms,
+            &[1.0],
+            in_sample_norm_bound,
+            crate::terms::sae::encode::AtlasConfig::default(),
+        )
+        .expect("in-sample encode atlas builds");
 
         let mut certified_rows = 0usize;
         let mut max_certified_gap = 0.0_f64;
@@ -9460,11 +9481,27 @@ mod inner_contract_probe_tests {
             if !encodes[0].certified[row] {
                 continue;
             }
-            certified_rows += 1;
             let z = amplitudes[[row, 0]];
+            let (exact_t, exact_cert) = in_sample_atlas
+                .certified_encode_row(atom0, 0, target.row(row), z)
+                .expect("exact per-row encode runs");
+            if !exact_cert.certified() {
+                // The exact teacher could not certify this row at the fitted
+                // amplitude; skip it (the held-out arm asserts joint certification
+                // on a unit-amplitude grid). We only measure faithfulness where
+                // BOTH the amortized encode and the exact teacher certify.
+                continue;
+            }
+            certified_rows += 1;
+            let exact_phi = evaluator
+                .evaluate(exact_t.view().insert_axis(ndarray::Axis(0)))
+                .unwrap()
+                .0;
+            let exact_decoded = exact_phi.dot(&atom0.decoder_coefficients); // (1 × p)
             for col in 0..p {
                 let amortized = z * decoded_hat[[row, col]];
-                let gap = (amortized - exact_recon[[row, col]]).abs();
+                let exact = z * exact_decoded[[0, col]];
+                let gap = (amortized - exact).abs();
                 if gap > max_certified_gap {
                     max_certified_gap = gap;
                 }
@@ -9476,11 +9513,11 @@ mod inner_contract_probe_tests {
         );
         // The amortized encode is the first-order IFT model of the exact encode;
         // on a well-conditioned periodic dictionary the certified rows must match
-        // the exact reconstruction to the encode's certified tolerance.
+        // the exact per-row encode to the encode's certified tolerance.
         assert!(
             max_certified_gap < 1.0e-2,
             "amortized encode must reconstruct certified rows within the encode \
-             tolerance of the exact encode-by-inner-solve; max gap={max_certified_gap}"
+             tolerance of the exact per-row encode-by-inner-solve; max gap={max_certified_gap}"
         );
 
         // Held-out recovery: compare the fast #1010 amortized row encode against
@@ -9875,11 +9912,24 @@ mod inner_contract_probe_tests {
             let mut max_gap = 0.0_f64;
             let mut certified = 0usize;
             for row in 0..n_holdout {
-                if !encoded.certified[row] {
+                // The Design-A encode path is the amortized one-mat-vec predictor
+                // with a certificate-gated EXACT cold-Newton fallback (exactly what
+                // production `amortized_encode_target` does): a row the cheap
+                // predictor cannot certify is retried from the chart center. Only a
+                // row that NEITHER path certifies is left uncertified.
+                let (coord, cert) = if encoded.certified[row] {
+                    (encoded.coords[[row, 0]], true)
+                } else {
+                    let (t, c) = atlas
+                        .certified_encode_row(atom0, 0, heldout.row(row), amps[row])
+                        .expect("held-out exact certified fallback encode runs");
+                    (t[0], c.certified())
+                };
+                if !cert {
                     continue;
                 }
                 certified += 1;
-                let gap = circle_phase_gap(encoded.coords[[row, 0]], heldout_truth[[row, 0]]);
+                let gap = circle_phase_gap(coord, heldout_truth[[row, 0]]);
                 max_gap = max_gap.max(gap);
             }
             (max_gap, certified)
