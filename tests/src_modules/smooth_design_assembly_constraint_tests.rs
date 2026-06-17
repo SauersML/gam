@@ -4742,9 +4742,10 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         .expect("design cache")
     };
 
-    // Tensor evaluator with the certified tensor attached over the window.
+    // Tensor evaluator with the certified Gram tensor attached over the window.
     let mut tensor_eval = make_eval();
     let mut tensor_cache = make_cache();
+    let p_total = frozen_design.design.ncols();
     let attached = {
         let mut build_cache = make_cache();
         let theta_probe_base = theta0.clone();
@@ -4764,6 +4765,40 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     assert!(
         attached,
         "tensor must certify on this fixture for a non-vacuous gate"
+    );
+    // #1033 penalty lane: also attach the certified ψ-penalty tensor so the
+    // fast-path skip can re-key S(ψ) n-free. Without it the fast path keeps the
+    // stale S(ψ_A) and β̂ at ψ_B/ψ_C diverges from the streamed slow path — the
+    // exact regression this test guards.
+    let penalty_attached = {
+        let mut build_cache = make_cache();
+        let theta_probe_base = theta0.clone();
+        tensor_eval.build_and_set_psi_penalty_tensor(
+            |psi| {
+                let mut theta_probe = theta_probe_base.clone();
+                theta_probe[rho_dim] = psi;
+                build_cache.ensure_theta(&theta_probe)?;
+                let design = build_cache.design();
+                let specs: Vec<crate::estimate::PenaltySpec> = design
+                    .penalties
+                    .iter()
+                    .map(crate::estimate::PenaltySpec::from_blockwise_ref)
+                    .collect();
+                crate::construction::canonicalize_penalty_specs(
+                    &specs,
+                    &design.nullspace_dims,
+                    p_total,
+                    "fast_path_skip psi-penalty",
+                )
+                .map_err(|e| e.to_string())
+            },
+            psi_lo,
+            psi_hi,
+        )
+    };
+    assert!(
+        penalty_attached,
+        "ψ-penalty tensor must certify on this fixture so the fast path re-keys S(ψ)"
     );
 
     // Three in-window ψ operating points reached at a SINGLE fixed

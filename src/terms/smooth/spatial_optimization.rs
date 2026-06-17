@@ -2458,6 +2458,11 @@ impl<'d> SpatialJointContext<'d> {
                 let psi = theta[self.rho_dim];
                 self.evaluator.psi_gram_tensor_covers(psi)
                     && self.evaluator.psi_gram_tensor_covers_gradient(psi)
+                    // #1033 penalty lane: ψ moves S(ψ) too, and the skip leaves
+                    // `reset_surface` un-run; only skip when the certified penalty
+                    // tensor can re-key S(ψ) n-free on the fast path, else the
+                    // inner solve would pair XᵀWX(ψ_new) with the stale S(ψ_old).
+                    && self.evaluator.psi_penalty_tensor_covers(psi)
                     && self
                         .evaluator
                         .design_revision_fast_path_armed(self.cache.design_revision())
@@ -2671,6 +2676,11 @@ impl<'d> SpatialJointContext<'d> {
             && {
                 let psi = theta[self.rho_dim];
                 self.evaluator.psi_gram_tensor_covers(psi)
+                    // #1033 penalty lane: the value-probe fast path also skips
+                    // `reset_surface`, so the probe must be able to re-key S(ψ)
+                    // n-free; otherwise its cost would use the stale S(ψ_old) and
+                    // mis-rank the line search.
+                    && self.evaluator.psi_penalty_tensor_covers(psi)
                     && self
                         .evaluator
                         .design_revision_fast_path_armed(self.cache.design_revision())
@@ -2927,6 +2937,62 @@ fn run_exact_joint_spatial_optimization(
                 "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
                  in-window trials assemble Gaussian sufficient statistics n-free"
             );
+            // #1033 penalty lane: ψ also moves the penalty `S(ψ)` (the
+            // Duchon/Matérn Hilbert scale is an analytic function of the
+            // length-scale, built from the basis CENTERS — not the data rows).
+            // The design-revision fast path that the Gram tensor enables SKIPS
+            // `reset_surface`, the only place the canonical penalty surface is
+            // rebuilt; without re-keying, the inner solve would pair
+            // `XᵀWX(ψ_new)` with the stale `S(ψ_old)` and converge to the wrong
+            // β̂ / κ-optimum. Build a PARALLEL certified penalty tensor over the
+            // same window: its per-ψ accessor reconstructs the canonical penalty
+            // list n-free, in the IDENTICAL canonical frame the slow-path
+            // `reset_surface` produces. The closure realizes the design at the
+            // node ψ (an n-row build, but ONE-TIME like the Gram build) and runs
+            // the SAME `from_blockwise_ref` + `canonicalize_penalty_specs`
+            // pipeline `prepare_eval_state`'s slow path runs, so the captured
+            // penalty is frame-exact. The realizer revision advances during this
+            // build; the caller re-pins the reference surface on its first eval.
+            let p_total = baseline_design.design.ncols();
+            let penalty_attached = evaluator.build_and_set_psi_penalty_tensor(
+                |psi| {
+                    let mut theta_probe = theta_probe_base.clone();
+                    theta_probe[rho_dim] = psi;
+                    cache.ensure_theta(&theta_probe)?;
+                    let design = cache.design();
+                    let specs: Vec<crate::estimate::PenaltySpec> = design
+                        .penalties
+                        .iter()
+                        .map(crate::estimate::PenaltySpec::from_blockwise_ref)
+                        .collect();
+                    crate::construction::canonicalize_penalty_specs(
+                        &specs,
+                        &design.nullspace_dims,
+                        p_total,
+                        "psi-penalty-tensor build",
+                    )
+                    .map_err(|e| e.to_string())
+                },
+                psi_lo,
+                psi_hi,
+            );
+            if penalty_attached {
+                log::info!(
+                    "[{label}] certified ψ-penalty tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
+                     in-window fast-path trials re-key S(ψ) n-free (no reset_surface)"
+                );
+            } else {
+                // The penalty did not certify. The fast-path skip gates also
+                // require `psi_penalty_tensor_covers`, so with no penalty tensor
+                // they never fire and every trial keeps the slow `reset_surface`
+                // (faithful S). The Gram tensor still serves the streamed-Gram
+                // value lane on the slow path, so this only forgoes the
+                // design-realization skip — never correctness.
+                log::info!(
+                    "[{label}] ψ-penalty tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \
+                     fast-path design-realization skip disabled (slow path re-keys S exactly)"
+                );
+            }
         } else {
             log::info!(
                 "[{label}] ψ-gram tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \

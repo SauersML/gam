@@ -3693,6 +3693,72 @@ impl<'a> RemlState<'a> {
         Ok(())
     }
 
+    /// #1033: refresh ONLY the canonical-penalty surface in k-space, keeping the
+    /// realized n×k design `self.x` (and the externally-installed Gaussian Gram
+    /// cache) untouched.
+    ///
+    /// On the certified κ-loop fast path the design coordinate ψ does NOT move
+    /// the rows we re-stream — the n-free `PsiGramTensor` serves `XᵀWX(ψ)/XᵀWz(ψ)`
+    /// — but for a spatial smooth ψ ALSO moves the penalty matrix `S(ψ)` (the
+    /// Duchon/Matérn Hilbert scale is built as a function of the length scale).
+    /// `reset_surface` is the only place the canonical penalty surface
+    /// (`balanced_penalty_root` / `reparam_invariant` / `sparse_penalty_blocks`)
+    /// is rebuilt, and the fast path skips it — so without this the inner solve
+    /// would pair `XᵀWX(ψ_new)` with the STALE `S(ψ_old)` and converge to the
+    /// wrong β̂ / κ-optimum. This re-keys `S(ψ_new)` from the supplied canonical
+    /// penalties (a k×k object built from the basis centers, not the data rows,
+    /// so the refresh stays n-free) and re-runs exactly the three k-space penalty
+    /// derivations `reset_surface` runs — nothing design- or n-shaped.
+    ///
+    /// It does NOT touch `self.x`, the Gaussian-fixed Gram cache, or the
+    /// conditioned-frame ψ-gram derivative: those are re-keyed to ψ_new by the
+    /// tensor lane independently. It DOES invalidate the eval/factor/PIRLS caches
+    /// (the penalized Hessian `H_λ = QsᵀXᵀWXQs + S(ψ)` changed), so the next inner
+    /// solve refactors against the correct penalty.
+    pub(crate) fn refresh_canonical_penalty_surface(
+        &mut self,
+        canonical_penalties: Arc<Vec<crate::construction::CanonicalPenalty>>,
+        nullspace_dims: Vec<usize>,
+    ) -> Result<(), EstimationError> {
+        if canonical_penalties.len() != self.canonical_penalties.len() {
+            crate::bail_invalid_estim!(
+                "refresh_canonical_penalty_surface: penalty count changed ({} → {}) — the \
+                 fast path requires a fixed penalty topology",
+                self.canonical_penalties.len(),
+                canonical_penalties.len()
+            );
+        }
+        if nullspace_dims.len() != canonical_penalties.len() {
+            crate::bail_invalid_estim!(
+                "refresh_canonical_penalty_surface: nullspace_dims length {} does not match \
+                 penalties {}",
+                nullspace_dims.len(),
+                canonical_penalties.len()
+            );
+        }
+        let p = self.p;
+        let balanced_penalty_root =
+            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
+        let reparam_invariant =
+            precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
+        let sparse_penalty_blocks =
+            build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
+                .map(Arc::new);
+
+        self.canonical_penalties = canonical_penalties;
+        self.balanced_penalty_root = balanced_penalty_root;
+        self.reparam_invariant = reparam_invariant;
+        self.sparse_penalty_blocks = sparse_penalty_blocks;
+        self.nullspace_dims = nullspace_dims;
+        // The penalized Hessian / logdet depend on S(ψ); a new penalty
+        // invalidates every memoized factorization and eval. The design-keyed
+        // Gaussian Gram cache and its ψ-derivative are NOT cleared here: those
+        // are re-keyed to ψ_new by the tensor lane (`install_psi_gram_statistics`).
+        self.cache_manager.clear_eval_and_factor_caches();
+        self.cache_manager.pirls_cache.write().unwrap().clear();
+        Ok(())
+    }
+
     /// Inject Kronecker penalty system metadata for tensor-product smooth terms.
     ///
     /// When set, the REML evaluator will use O(∏q_j) logdet instead of O(p³)
