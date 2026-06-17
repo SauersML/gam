@@ -1,5 +1,29 @@
 use super::*;
 
+/// Per-term effective degrees of freedom as the trace of the coefficient-space
+/// influence (hat) matrix `F = H⁻¹X'WX` restricted to the term's coefficient
+/// columns `coeff_range`: `edf_j = tr(F[coeff_range, coeff_range])`.
+///
+/// This is the decomposition mgcv uses: `tr(F)` is the model EDF and the diagonal
+/// of `F` apportions it across coefficients, so summing the per-term traces
+/// recovers `edf_total` exactly and each per-term EDF is bounded by it. Unlike
+/// summing per-penalty-block EDFs, it does not double-count coefficients shared
+/// by several penalties (the tensor-product te()/ti() case). Returns `None` when
+/// the influence matrix is unavailable or the range is out of bounds, so the
+/// caller can fall back to the per-block sum.
+fn term_influence_edf(
+    influence: Option<&Array2<f64>>,
+    coeff_range: &std::ops::Range<usize>,
+) -> Option<f64> {
+    let f = influence?;
+    let (start, end) = (coeff_range.start, coeff_range.end);
+    if start >= end || end > f.nrows() || end > f.ncols() {
+        return None;
+    }
+    let tr = (start..end).map(|i| f[[i, i]]).sum::<f64>();
+    tr.is_finite().then_some(tr)
+}
+
 pub(crate) fn build_model_summary(
     design: &gam::smooth::TermCollectionDesign,
     spec: &TermCollectionSpec,
@@ -188,12 +212,26 @@ pub(crate) fn build_model_summary(
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
         let term_penalty_start = penalty_cursor;
-        let edf = fit
-            .edf_by_block()
-            .get(penalty_cursor..penalty_cursor + k)
-            .map(|block| block.iter().sum::<f64>())
-            .unwrap_or(0.0);
         penalty_cursor += k;
+        // Per-term EDF is the trace of the coefficient-space influence (hat)
+        // matrix F = H⁻¹X'WX restricted to this term's *coefficient* block:
+        //   edf_j = tr(F[coeff_range, coeff_range]).
+        // Summing the per-penalty-block EDFs (edf_by_block) is WRONG for a
+        // tensor-product smooth te()/ti(): such a term carries one penalty per
+        // marginal (k>1) over a SINGLE shared coefficient block, so summing the
+        // per-penalty traces counts the shared coefficients once per marginal
+        // and over-reports EDF (it can exceed both edf_total and ncols(X)).
+        // tr(F_jj) counts the term's coefficients exactly once regardless of how
+        // many penalties act on them, and Σ_j tr(F_jj) = tr(F) = edf_total.
+        // The per-block sum remains the fallback only when the influence matrix
+        // is unavailable (single-penalty smooths give the same value either way).
+        let edf = term_influence_edf(fit.coefficient_influence(), &term.coeff_range)
+            .or_else(|| {
+                fit.edf_by_block()
+                    .get(term_penalty_start..term_penalty_start + k)
+                    .map(|block| block.iter().sum::<f64>())
+            })
+            .unwrap_or(0.0);
         let smooth_test = if term.shape == gam::smooth::ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
                 wood_smooth_test(SmoothTestInput {
