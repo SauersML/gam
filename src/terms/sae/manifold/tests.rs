@@ -9321,61 +9321,6 @@ mod inner_contract_probe_tests {
         }
     }
 
-    /// DIAG1154: temporary probe — fit the planted-circle fixture under several
-    /// (learning_rate, iters) settings and print the resulting KKT ‖g‖ so we can
-    /// see empirically which knobs let the inner solve reach the convergence guard.
-    #[test]
-    #[ignore]
-    fn diag1154_inner_convergence_knob_sweep() {
-        let n = 24usize;
-        let p = 4usize;
-        let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
-        let (phi, jet) = periodic_basis(&coords);
-        let m = phi.ncols();
-        let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
-            let scale = 1.0 / (1.0 + b as f64);
-            scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
-        });
-        let target = phi.dot(&decoder);
-        for &(lr, iters) in &[(0.1_f64, 12usize), (1.0, 12), (1.0, 64), (1.0, 200)] {
-            let atom = SaeManifoldAtom::new(
-                "periodic_truth",
-                SaeAtomBasisKind::Periodic,
-                1,
-                phi.clone(),
-                jet.clone(),
-                decoder.clone(),
-                Array2::<f64>::eye(m),
-            )
-            .unwrap()
-            .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-            let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-                Array2::<f64>::zeros((n, 1)),
-                vec![coords.clone()],
-                vec![LatentManifold::Circle { period: 1.0 }],
-                AssignmentMode::softmax(1.0),
-            )
-            .unwrap();
-            let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-            let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
-            let fit = term.run_joint_fit_arrow_schur(
-                target.view(),
-                &mut rho,
-                None,
-                iters,
-                lr,
-                1.0e-4,
-                1.0e-4,
-            );
-            let crit = term.reml_criterion(target.view(), &rho, None, iters, lr, 1.0e-4, 1.0e-4);
-            eprintln!(
-                "DIAG1154 lr={lr} iters={iters} fit_ok={} crit={:?}",
-                fit.is_ok(),
-                crit.as_ref().map(|(v, _)| *v).map_err(|e| e.clone())
-            );
-        }
-    }
-
     /// #1154 — the joint amortized-encoder + REML co-training fold (Design A).
     ///
     /// On a synthetic 1D periodic manifold with KNOWN structure (the target is
@@ -9439,8 +9384,14 @@ mod inner_contract_probe_tests {
 
         // Converge the inner (t, β) solve to stationarity — the REML criterion
         // and the co-training fold are both read at the converged dictionary.
+        // Full Newton steps (learning_rate = 1.0): the heavily-damped 0.1 step
+        // cannot drive this well-conditioned planted-circle fit to the strict KKT
+        // tolerance within the refine budget (it stalls at ‖g‖≈6e-3), so the
+        // criterion correctly refuses to rank an off-optimum Laplace value. At
+        // full Newton the inner solve reaches true stationarity in a handful of
+        // iterations.
         let mut rho_fit = rho.clone();
-        term.run_joint_fit_arrow_schur(target.view(), &mut rho_fit, None, 12, 0.1, 1.0e-4, 1.0e-4)
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho_fit, None, 12, 1.0, 1.0e-4, 1.0e-4)
             .expect("inner solve converges on the known periodic manifold");
 
         // (1) Fold soundness: the co-trained criterion = REML + scaled, finite,
@@ -9450,15 +9401,15 @@ mod inner_contract_probe_tests {
                 target.view(),
                 &rho_fit,
                 None,
-                4,
-                0.1,
+                12,
+                1.0,
                 1.0e-4,
                 1.0e-4,
                 true,
             )
             .expect("REML criterion evaluates");
         let (cotrained, _loss2, consistency) = term
-            .reml_criterion_cotrained(target.view(), &rho_fit, None, 4, 0.1, 1.0e-4, 1.0e-4)
+            .reml_criterion_cotrained(target.view(), &rho_fit, None, 12, 1.0, 1.0e-4, 1.0e-4)
             .expect("co-trained criterion evaluates");
         assert!(
             cotrained.is_finite() && reml.is_finite(),
@@ -9940,7 +9891,7 @@ mod inner_contract_probe_tests {
         for rho in &rho_grid {
             let mut probe = build_term();
             let Ok((reml, _loss)) =
-                probe.reml_criterion(target.view(), rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+                probe.reml_criterion(target.view(), rho, None, 12, 1.0, 1.0e-4, 1.0e-4)
             else {
                 continue;
             };
@@ -9957,7 +9908,7 @@ mod inner_contract_probe_tests {
         let mut seq_term = build_term();
         let mut seq_rho = best_seq_rho.clone();
         seq_term
-            .run_joint_fit_arrow_schur(target.view(), &mut seq_rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .run_joint_fit_arrow_schur(target.view(), &mut seq_rho, None, 12, 1.0, 1.0e-4, 1.0e-4)
             .expect("sequential cold inner solve converges");
         let (seq_gap, seq_certified) = heldout_recovery_gap(&seq_term);
 
@@ -9973,7 +9924,7 @@ mod inner_contract_probe_tests {
                 .warm_start_latents_from_amortized_encoder(target.view(), rho)
                 .ok();
             let Ok((cotrained, _loss, _consistency)) =
-                probe.reml_criterion_cotrained(target.view(), rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+                probe.reml_criterion_cotrained(target.view(), rho, None, 12, 1.0, 1.0e-4, 1.0e-4)
             else {
                 continue;
             };
@@ -9992,7 +9943,7 @@ mod inner_contract_probe_tests {
             .warm_start_latents_from_amortized_encoder(target.view(), &cot_rho)
             .ok();
         cot_term
-            .run_joint_fit_arrow_schur(target.view(), &mut cot_rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .run_joint_fit_arrow_schur(target.view(), &mut cot_rho, None, 12, 1.0, 1.0e-4, 1.0e-4)
             .expect("co-trained warm-started inner solve converges");
         let (cot_gap, cot_certified) = heldout_recovery_gap(&cot_term);
 
