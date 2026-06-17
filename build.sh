@@ -1,45 +1,46 @@
 #!/usr/bin/env bash
-# build.sh — single-flight, coalescing build gate for the shared gam tree.
+# build.sh — single-flight, coalescing, content-dedup build gate for the shared
+# gam tree. The ONE process allowed to run cargo. Agents call THIS, never cargo.
 #
-# The ONE process allowed to run cargo. Agents call THIS, never cargo directly.
-# Contract: call me, I block until a compile covering the current on-disk tree
-# has finished, then hand you that result. One cargo at a time on the shared
-# target dir => no concurrent-build OOM/ENOSPC. Callers that pile up during a
-# build reuse its result if nothing changed since its snapshot (coalescing): a
-# burst of N requests collapses to one build.
+#   ./build.sh                 # warm the gam lib (single-flight, content-dedup)
+#   ./build.sh nextest run X   # run test X (serialized; reuses the warm lib)
 #
-# Usage:
-#   ./build.sh                 # compile lib + all test binaries (the heavy shared step)
-#   ./build.sh nextest run X   # after a successful build, run test X (fast, no recompile)
-# Exit: 0 = ok, 101 = compile/test errors (cached), 75 = transient (timeout/OOM) — retry.
+# Every invocation appends a structured record to .buildd/history.log:
+#   time | request | dedup HIT/MISS | crates recompiled (count + names) | duration | exit
 set -uo pipefail
 
 REPO=/Users/user/gam
 S="$REPO/.buildd"; mkdir -p "$S"
-LOCK="$S/build.lock"; COVER="$S/coverage.marker"; SNAP="$S/snap.marker"
-LOG="$S/last.log"; RESULT="$S/last.code"
-# Incremental ON (default): rustc reuses unchanged functions at item/body
-# granularity, so a small edit recompiles only the affected closure, not the
-# whole gam crate. (CI sets =0 for an unrelated per-file-test-loop reason; that
-# does NOT apply to this single-flight shared builder.)
-export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1
+LOCK="$S/build.lock"; LOG="$S/last.log"; RESULT="$S/last.code"; HASHFILE="$S/last.hash"; HIST="$S/history.log"
+export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1   # item-granularity reuse
 TIMEOUT=1800
+now() { date +%H:%M:%S; }; ep() { date +%s; }
 
-# If args given, this is a (cheap) test-run after binaries are already built:
-# serialize it behind the same lock but don't touch the coalescing markers.
+# What did cargo actually (re)compile? Cargo prints "   Compiling <crate> ..." per
+# crate it builds; absence => reused from cache. This is the crate-level recompile set.
+compiled_crates() { grep -E '^[[:space:]]*Compiling ' "$LOG" 2>/dev/null | sed -E 's/^[[:space:]]*Compiling //' | awk '{print $1}'; }
+record() { # args: req dedup exit dur
+  local req="$1" dedup="$2" code="$3" dur="$4"
+  local names; names="$(compiled_crates | paste -sd, - 2>/dev/null | cut -c1-400)"
+  local n; n="$(compiled_crates | grep -c . 2>/dev/null || echo 0)"
+  printf '[%s] req=%-26s dedup=%-4s recompiled=%-3s [%s] duration=%ss exit=%s\n' \
+    "$(now)" "\"$req\"" "$dedup" "$n" "$names" "$dur" "$code" >> "$HIST"
+}
+
+# ---- test-run lane (args present): serialized, reuses warm lib ----
 if [[ $# -gt 0 ]]; then
+  REQ="$*"
   exec 9>"$LOCK"; flock -x 9
   cd "$REPO" || exit 1
-  timeout "$TIMEOUT" cargo "$@"; exit $?
+  t0=$(ep); timeout "$TIMEOUT" cargo "$@" >"$LOG" 2>&1; code=$?; dur=$(( $(ep)-t0 ))
+  record "$REQ" "n/a" "$code" "$dur"
+  flock -u 9
+  echo "[build.sh] $REQ -> exit $code in ${dur}s (recompiled $(compiled_crates | grep -c . ) crates)"
+  tail -n 30 "$LOG"; exit $code
 fi
 
-# No args: warm the gam lib (the ~10min monolith long-pole) once.
-# Test binaries then compile incrementally per-test on top of the warm lib.
+# ---- warm-lib lane (no args): content-dedup ----
 BUILD=(cargo build --lib)
-HASHFILE="$S/last.hash"
-
-# Content hash of the source tree: identical code => identical hash => no rebuild,
-# regardless of mtimes (catches touch-but-unchanged and revert-to-identical).
 tree_hash() {
   find "$REPO/src" "$REPO/tests" "$REPO/crates" "$REPO/Cargo.toml" \
     -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
@@ -48,20 +49,19 @@ tree_hash() {
 
 exec 9>"$LOCK"; flock -x 9
 cd "$REPO" || exit 1
-HASH="$(tree_hash)"
+HASH="$(tree_hash)"; t0=$(ep)
 if [[ "$HASH" == "$(cat "$HASHFILE" 2>/dev/null)" && -f "$RESULT" ]]; then
-  : # exact same code already built — DEDUP: return cached result, no rebuild
+  code="$(cat "$RESULT")"
+  record "LIB" "HIT" "$code" "0"             # exact same code — no rebuild
 else
-  timeout "$TIMEOUT" "${BUILD[@]}" >"$LOG" 2>&1; code=$?
-  if (( code != 124 && code < 128 )); then        # cargo reached a verdict (0 ok / 101 errors)
-    echo "$code" >"$RESULT"; echo "$HASH" >"$HASHFILE"
+  timeout "$TIMEOUT" "${BUILD[@]}" >"$LOG" 2>&1; code=$?; dur=$(( $(ep)-t0 ))
+  if (( code != 124 && code < 128 )); then
+    echo "$code" >"$RESULT"; echo "$HASH" >"$HASHFILE"; record "LIB" "MISS" "$code" "$dur"
   else
-    echo "(did not complete: $code — timeout/OOM/killed)" >>"$LOG"
+    record "LIB" "MISS" "$code(transient)" "$dur"
     flock -u 9; echo "TRANSIENT BUILD FAILURE ($code) — retry"; exit 75
   fi
 fi
-code="$(cat "$RESULT" 2>/dev/null || echo 1)"
 flock -u 9
-
-if [[ "$code" == "0" ]]; then echo "BUILD OK (latest tree)"; exit 0
+if [[ "$code" == "0" ]]; then echo "BUILD OK (latest tree, hash ${HASH:0:12})"; exit 0
 else echo "BUILD FAILED ($code):"; tail -n 40 "$LOG"; exit "$code"; fi
