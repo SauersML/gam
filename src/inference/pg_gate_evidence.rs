@@ -194,7 +194,7 @@ fn evaluate(block: &GateBlock<'_>, lane: Lane) -> Result<PgGateEvidence, String>
         Lane::MomentMatched => 0.0,
     };
     let log_two_pi = (2.0 * std::f64::consts::PI).ln();
-    let neg_log_evidence = eval.value + 0.5 * d_g as f64 * log_two_pi - 0.5 * correction;
+    let neg_log_evidence = eval.value - 0.5 * d_g as f64 * log_two_pi - 0.5 * correction;
     let lane_tag = match lane {
         Lane::CurvatureCorrected => PgGateLane::CurvatureCorrected,
         Lane::MomentMatched => PgGateLane::MomentMatched,
