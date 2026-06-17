@@ -3144,6 +3144,20 @@ mod empirical_rigid_jet_oracle_tests {
                 // Richardson witness resolves that magnitude well inside the 1%
                 // band below, so the guard would have caught #833.
                 let h4 = 6e-3;
+                // DIAGNOSTIC (temporary, #932): dump the actual Rust witness FD
+                // vs production for the mmmg channel so we can compare against an
+                // independent off-box re-derivation. Both should be ~-0.2682 for
+                // frailty None row 0.
+                if frailty_sd.is_none() && row == 0 {
+                    let fd_mmmg = central_mixed_rich(&f, m[row], g[row], 3, 1, h4);
+                    let base = f(m[row], g[row]);
+                    let s_used = s;
+                    eprintln!(
+                        "DIAG932: frailty=None row=0 s={s_used} base_nll={base:+.12e} \
+                         witness_T4_mmmg={fd_mmmg:+.12e} production_T4_mmmg={:+.12e}",
+                        fourth[0][0][0][1]
+                    );
+                }
                 for (lbl, om, og, prod) in [
                     ("mmmm", 4, 0, fourth[0][0][0][0]),
                     ("mmmg", 3, 1, fourth[0][0][0][1]),
