@@ -449,16 +449,6 @@ pub fn fit_periodic_bspline_curve(
         let penalty = create_cyclic_difference_penalty_matrix(spec.num_basis, spec.penalty_order)?;
         lhs = lhs + smoothing_lambda * penalty;
     }
-    // A tiny ridge selects a stable coefficient representative in the rare case
-    // of undersampled or exactly aliased parameter grids while leaving ordinary
-    // fits unchanged at test tolerances.
-    let diag_scale = (0..lhs.nrows())
-        .map(|i| lhs[[i, i]].abs())
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-    for i in 0..lhs.nrows() {
-        lhs[[i, i]] += 1e-12 * diag_scale;
-    }
     let rhs = basis.t().dot(&y);
     let coefficients = solve_spd_cholesky(lhs, &rhs)?;
     Ok(PeriodicSplineCurve {
