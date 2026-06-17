@@ -2559,33 +2559,85 @@ impl WorkingModelSurvival {
         // an ABSOLUTE penalized stationarity residual r = S beta_hat - grad_ell of order
         // 0.1-1 (the score scales as O(sqrt(n))). The unified LAML gradient uses the
         // envelope theorem, exact only at r = 0; a residual that large leaks <r, beta_dot>
-        // into the objective<->gradient consistency. Newton-polish the mode toward true
-        // stationarity (beta <- beta - H^-1 r on the penalized objective, whose Hessian
-        // and residual update_state already returns) with monotone-feasibility damping.
+        // into the objective<->gradient consistency, AND the IFT envelope correction is
+        // only leading-order in r, so it cannot make the analytic gradient the exact
+        // derivative of the (re-converged, non-smooth-in-r) value surface either. The
+        // robust cure is to drive the inner to TRUE stationarity (||r|| ~ 1e-11) so the
+        // envelope is exactly valid and the IFT term is ~1e-22 — which it is at small
+        // lambda, but a plain undamped Newton-polish STALLS at large lambda (rho=4..8):
+        // there the intercept-direction curvature exp(eta)*n is large while the penalized
+        // time block is lambda*S, so H is ill-conditioned and an undamped step neither
+        // decreases ||r|| nor stays feasible, leaving ||r|| ~ 3e-2.
+        //
+        // Levenberg–Marquardt damping fixes this: solve (H + mu*diag(H)) delta = r,
+        // accept on a genuine ||r||^2 decrease (Gauss–Newton on the stationarity system,
+        // whose Jacobian is the penalized Hessian H), shrink mu on success and grow it on
+        // rejection. The diagonal (Marquardt) scaling makes the damping curvature-aware so
+        // the stiff time block and the soft intercept are damped commensurately. This
+        // reliably reaches ||r|| below the FD-step round-off floor across the whole
+        // rho = [-0.5 .. 8] range exercised by the consistency gates.
         {
-            const POLISH_MAX_ITERS: usize = 60;
+            const POLISH_MAX_ITERS: usize = 200;
             const POLISH_TOL: f64 = 1e-11;
+            const LM_MU_INIT: f64 = 1e-8;
+            const LM_MU_MAX: f64 = 1e12;
+            const LM_MU_MIN: f64 = 1e-14;
+            let p = beta.len();
+            let mut mu = LM_MU_INIT;
             for _ in 0..POLISH_MAX_ITERS {
-                let st = match candidate.update_state(&beta) { Ok(st) => st, Err(_) => break };
+                let st = match candidate.update_state(&beta) {
+                    Ok(st) => st,
+                    Err(_) => break,
+                };
                 let r = st.gradient.clone();
                 let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
-                if !r_norm.is_finite() || r_norm < POLISH_TOL { break; }
+                if !r_norm.is_finite() || r_norm < POLISH_TOL {
+                    break;
+                }
                 let h = st.hessian.to_dense();
-                let hop = match crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h) { Ok(op) => op, Err(_) => break };
-                let step = { use crate::estimate::reml::reml_outer_engine::HessianOperator; hop.solve(&r) };
-                let sn = step.iter().map(|v| v * v).sum::<f64>().sqrt();
-                if !sn.is_finite() || sn == 0.0 { break; }
-                let mut alpha = 1.0_f64;
+                let diag: Vec<f64> = (0..p).map(|d| h[[d, d]].abs().max(1e-12)).collect();
+                // Inner LM loop: grow mu until a feasible ||r||-decreasing step is found.
                 let mut accepted = false;
-                for _ in 0..50 {
-                    let trial = &beta - &(alpha * &step);
+                for _ in 0..60 {
+                    let mut h_lm = h.clone();
+                    for d in 0..p {
+                        h_lm[[d, d]] += mu * diag[d];
+                    }
+                    let hop = match crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h_lm) {
+                        Ok(op) => op,
+                        Err(_) => {
+                            mu = (mu * 10.0).min(LM_MU_MAX);
+                            continue;
+                        }
+                    };
+                    let step = {
+                        use crate::estimate::reml::reml_outer_engine::HessianOperator;
+                        hop.solve(&r)
+                    };
+                    if step.iter().any(|v| !v.is_finite()) {
+                        mu = (mu * 10.0).min(LM_MU_MAX);
+                        continue;
+                    }
+                    let trial = &beta - &step;
                     if let Ok(ts) = candidate.update_state(&trial) {
                         let tn = ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-                        if tn.is_finite() && tn <= r_norm { beta = trial; accepted = true; break; }
+                        if tn.is_finite() && tn < r_norm {
+                            beta = trial;
+                            accepted = true;
+                            // Step succeeded: trust a larger region next iteration.
+                            mu = (mu * 0.5).max(LM_MU_MIN);
+                            break;
+                        }
                     }
-                    alpha *= 0.5;
+                    // Rejected (infeasible or non-decreasing): damp harder.
+                    if mu >= LM_MU_MAX {
+                        break;
+                    }
+                    mu = (mu * 10.0).min(LM_MU_MAX);
                 }
-                if !accepted { break; }
+                if !accepted {
+                    break;
+                }
             }
         }
 
