@@ -1914,9 +1914,15 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         let row = link_runtime.design(&array![u]).expect("link-dev basis row");
         row.row(0).iter().zip(beta_w).map(|(b, c)| b * c).sum()
     };
-    // Survival deviation index inside Φ: a + g·warp(z) + linkdev(a + g·z).
+    // Survival deviation index inside Φ: a + g·z + g·warp(z) + linkdev(a + g·z).
+    // The rigid slope term `g·z` is explicit: the score-warp value basis is a
+    // pure DEVIATION (identity excluded — deviation_runtime.rs documents "zero
+    // coefficients mean the identity map"), and production adds the rigid `b·z`
+    // separately in the denested cell coefficient. Omitting it here left an
+    // odd-in-z residual that the φ(z)-weighted calibration mostly absorbed into
+    // the intercept, surfacing as a ~8.4e-4 self-validation gap.
     let index = |a: f64, g: f64, beta_h: &[f64], beta_w: &[f64], z: f64| -> f64 {
-        a + g * warp_eval(beta_h, z) + linkdev_eval(beta_w, a + g * z)
+        a + g * z + g * warp_eval(beta_h, z) + linkdev_eval(beta_w, a + g * z)
     };
     // Calibration F(a) = ∫ Φ(−index(a,g,z)) φ(z) dz − Φ(−q), by composite Simpson
     // on a wide latent grid (the integrand decays with φ(z)).
