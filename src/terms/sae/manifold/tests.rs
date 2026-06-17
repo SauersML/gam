@@ -3590,6 +3590,13 @@ pub(crate) fn sae_nuclear_norm_beta_block_routes_through_gb_and_shrinks_spectrum
 pub(crate) struct TestPeriodicEvaluator;
 
 impl SaeBasisEvaluator for TestPeriodicEvaluator {
+    /// Second derivative of the test periodic basis `[1, sin(2πt), cos(2πt)]`:
+    /// `Φ'' = [0, -(2π)² sin(2πt), -(2π)² cos(2πt)]`. The encode-atlas Kantorovich
+    /// certificate (`row_certificate`) needs `∂²Φ/∂t²` for the full-Hessian
+    /// residual term and returns NO certificate when the second jet is absent
+    /// (never a silent Gauss-Newton substitute, see encode.rs). A test double
+    /// that claims to evaluate this basis must therefore supply its real second
+    /// jet, or every certified-encode path it feeds becomes vacuously uncertified.
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         if coords.ncols() != 1 {
             return Some(Err(format!(
@@ -3597,9 +3604,22 @@ impl SaeBasisEvaluator for TestPeriodicEvaluator {
                 coords.ncols()
             )));
         }
-        None
+        let n = coords.nrows();
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let freq2 = two_pi * two_pi;
+        let mut h = Array4::<f64>::zeros((n, 3, 1, 1));
+        for row in 0..n {
+            let angle = two_pi * coords[[row, 0]];
+            // basis 0 is the constant 1 → Φ''=0; basis 1=sin, basis 2=cos.
+            h[[row, 1, 0, 0]] = -freq2 * angle.sin();
+            h[[row, 2, 0, 0]] = -freq2 * angle.cos();
+        }
+        Some(Ok(h))
     }
 
+    /// Third derivative of `[1, sin(2πt), cos(2πt)]`:
+    /// `Φ''' = [0, -(2π)³ cos(2πt), +(2π)³ sin(2πt)]` (sin→ωc→−ω²s→−ω³c,
+    /// cos→−ωs→−ω²c→+ω³s).
     fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
         if coords.ncols() != 1 {
             return Some(Err(format!(
@@ -3607,7 +3627,16 @@ impl SaeBasisEvaluator for TestPeriodicEvaluator {
                 coords.ncols()
             )));
         }
-        None
+        let n = coords.nrows();
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let freq3 = two_pi * two_pi * two_pi;
+        let mut h = Array5::<f64>::zeros((n, 3, 1, 1, 1));
+        for row in 0..n {
+            let angle = two_pi * coords[[row, 0]];
+            h[[row, 1, 0, 0, 0]] = -freq3 * angle.cos();
+            h[[row, 2, 0, 0, 0]] = freq3 * angle.sin();
+        }
+        Some(Ok(h))
     }
 
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
