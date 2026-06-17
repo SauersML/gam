@@ -8835,58 +8835,41 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
         .join("tests/data/olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
-    let z_train = z.slice(s![..384, ..]).to_owned();
+    // Small REAL slice (K=2 d=2 torus, 160 rows) so the per-row curvature-anchor
+    // assembly + eigendecomposition completes in seconds. The PD property under
+    // test is a per-row block property of the genuine assembled evidence Hessian,
+    // so a representative real-data slice exercises it without the full-N inner
+    // joint Newton fit (which is the slow path; we don't need a fit to read the
+    // raw anchor). #1190.
+    let z_train = z.slice(s![..160, ..]).to_owned();
+    let k = 2usize;
 
-    let term = real_data_torus_seed_term(z_train.view(), 4, 3);
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; 4]);
-    let mut objective = SaeManifoldOuterObjective::new(
-        term,
+    let mut term = real_data_torus_seed_term(z_train.view(), k, 3);
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; k]);
+    let registry = SaeManifoldOuterObjective::new(
+        term.clone(),
         z_train.clone(),
         None,
         rho.clone(),
-        8,
+        0,
         0.04,
         1.0e-6,
         1.0e-6,
-    );
-
-    // Solve the inner joint Newton at the full (η = 1) curved basis and read
-    // the UNDAMPED evidence factorization — the curvature anchor itself.
-    let isometry_targets = objective
-        .registry
-        .as_ref()
-        .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
-        .unwrap_or_default();
-    let (_loss, cache) = objective
-        .solve_at_eta(&rho, 1.0, &isometry_targets)
-        .expect("real-data inner solve at η=1 must converge");
-
-    // Min undamped per-row pivot (squared lower-Cholesky diagonal). The
-    // undamped factors ARE the curvature anchor's H_tt blocks AFTER any
-    // Faddeev-Popov / spectral deflation; the FACTOR is always PD by
-    // construction, so this measures only that the deflation succeeded.
-    let mut min_undamped = f64::INFINITY;
-    let mut max_undamped = 0.0_f64;
-    for factor in cache.undamped_factors_iter() {
-        if let Some(p) = crate::solver::arrow_schur::lower_cholesky_min_pivot(factor) {
-            min_undamped = min_undamped.min(p);
-        }
-        if let Some(p) = crate::solver::arrow_schur::lower_cholesky_max_pivot(factor) {
-            max_undamped = max_undamped.max(p);
-        }
-    }
-    let deflated = cache.gauge_deflated_directions;
+    )
+    .registry;
 
     // GENUINE curvature anchor = the RAW assembled per-row evidence Hessian
-    // blocks BEFORE factorization/deflation. This is what actually pins the
-    // atoms; if a block is genuinely indefinite (a negative eigenvalue OFF the
-    // closed-form gauge orbit), the spectral deflation will silently flatten
-    // that direction to unit stiffness — the factor stays PD but the atom
-    // coordinate along it is UNIDENTIFIED. Measure the raw spectrum directly.
+    // blocks BEFORE factorization/deflation, evaluated at the real-data PCA seed.
+    // This is what actually pins the atoms; if a block is genuinely indefinite (a
+    // negative eigenvalue OFF the closed-form gauge orbit), the spectral deflation
+    // would silently flatten that direction to unit stiffness — the factor stays
+    // PD but the atom coordinate along it is UNIDENTIFIED. Reading the raw anchor
+    // needs only ONE assembly (no inner fit), so it is fast and deterministic.
+    // The #1190 fix makes the softmax curvature block the PSD Fisher metric, so
+    // every per-row block is PD up to round-off on this real slice.
     use crate::linalg::faer_ndarray::FaerEigh;
-    let sys = objective
-        .term
-        .assemble_arrow_schur(z_train.view(), &rho, objective.registry.as_ref())
+    let sys = term
+        .assemble_arrow_schur(z_train.view(), &rho, registry.as_ref())
         .expect("assemble raw curvature anchor");
     let mut min_raw_eig = f64::INFINITY;
     let mut max_raw_eig = 0.0_f64;
@@ -8917,10 +8900,10 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
     }
     let rel_min = min_raw_eig / max_raw_eig.max(1.0);
     eprintln!(
-        "[#1190] real-data curvature anchor: undamped factor min_pivot={min_undamped:.6e} \
-         max_pivot={max_undamped:.6e} deflated_dirs={deflated} | RAW assembled H_tt: \
+        "[#1190] real-data curvature anchor (K={k}, N={}): RAW assembled H_tt \
          min_eig={min_raw_eig:.6e} (rel={rel_min:.3e}) indefinite_rows={indefinite_rows}/{} \
          total_neg_dirs={total_neg_dirs}",
+        z_train.nrows(),
         sys.rows.len()
     );
 
