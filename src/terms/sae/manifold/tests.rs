@@ -8708,6 +8708,195 @@ pub(crate) fn ibp_map_outer_objective_advertises_analytic_gradient() {
     assert_eq!(obj.capability().gradient, Derivative::Analytic);
 }
 
+/// Read a 2-D float32 (`<f4`) C-contiguous `.npy` into an `Array2<f64>`.
+/// The committed OLMo activation fixtures are float32; the production smooth
+/// loader only parses `<f8`, so this test-local reader covers the `<f4` case
+/// for the real-data curvature-anchor probe.
+pub(crate) fn read_npy_f32_2d(path: &std::path::Path) -> Array2<f64> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert!(bytes.len() > 10 && &bytes[0..6] == b"\x93NUMPY", "not a .npy");
+    let major = bytes[6];
+    let (hdr_start, hdr_len) = if major == 1 {
+        (10usize, u16::from_le_bytes([bytes[8], bytes[9]]) as usize)
+    } else {
+        (
+            12usize,
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize,
+        )
+    };
+    let data_off = hdr_start + hdr_len;
+    let header = std::str::from_utf8(&bytes[hdr_start..data_off]).unwrap();
+    assert!(
+        header.contains("'<f4'") || header.contains("\"<f4\""),
+        "fixture must be little-endian float32; header: {header}"
+    );
+    assert!(!header.contains("True"), "fixture must be C-contiguous");
+    let open = header.find('(').unwrap();
+    let close = header[open..].find(')').unwrap() + open;
+    let dims: Vec<usize> = header[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<usize>().unwrap())
+        .collect();
+    assert_eq!(dims.len(), 2, "fixture must be 2-D");
+    let (n, p) = (dims[0], dims[1]);
+    let mut out = Array2::<f64>::zeros((n, p));
+    let payload = &bytes[data_off..];
+    assert!(payload.len() >= n * p * 4, "truncated payload");
+    for r in 0..n {
+        for c in 0..p {
+            let i = (r * p + c) * 4;
+            let v = f32::from_le_bytes([
+                payload[i],
+                payload[i + 1],
+                payload[i + 2],
+                payload[i + 3],
+            ]);
+            out[[r, c]] = v as f64;
+        }
+    }
+    out
+}
+
+/// Build a production-style K-atom, d=2 periodic (torus = Circle×Circle) SAE
+/// manifold term seeded from REAL activations `z` exactly the way the
+/// production cold path does: PCA-seed the per-atom chart, fit a per-atom
+/// decoder by ridge LSQ on the gated basis, install the analytic torus
+/// evaluator, and assemble the multi-atom assignment with the curved product
+/// manifold on every atom. This is the d>=2 atom regime the #1019 canonical
+/// charts gauge and the #1007 curvature anchor have to identify on real data.
+pub(crate) fn real_data_torus_seed_term(
+    z: ArrayView2<'_, f64>,
+    k: usize,
+    num_harmonics: usize,
+) -> SaeManifoldTerm {
+    let n = z.nrows();
+    let evaluator = Arc::new(TorusHarmonicEvaluator::new(2, num_harmonics).unwrap());
+    let basis_kinds = vec![SaeAtomBasisKind::Periodic; k];
+    let atom_dims = vec![2usize; k];
+    let seed_coords = sae_pca_seed_initial_coords(z, &basis_kinds, &atom_dims).unwrap();
+    let mut atoms = Vec::with_capacity(k);
+    let mut coords_blocks = Vec::with_capacity(k);
+    let mut manifolds = Vec::with_capacity(k);
+    for atom_idx in 0..k {
+        let coords = seed_coords.slice(s![atom_idx, .., 0..2]).to_owned();
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let m = phi.ncols();
+        // Per-atom decoder by ridge LSQ on the gated basis (gate = 1 at seed).
+        let mut xtx = fast_ata(&phi);
+        for i in 0..m {
+            xtx[[i, i]] += 1.0e-8;
+        }
+        let xtz = fast_atb(&phi, &z.to_owned());
+        let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
+        let atom = SaeManifoldAtom::new(
+            "torus",
+            SaeAtomBasisKind::Periodic,
+            2,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_evaluator(evaluator.clone());
+        atoms.push(atom);
+        coords_blocks.push(coords);
+        manifolds.push(LatentManifold::Product(vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ]));
+    }
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::from_elem((n, k), 0.0),
+        coords_blocks,
+        manifolds,
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    SaeManifoldTerm::new(atoms, assignment).unwrap()
+}
+
+/// #1190 — REAL-data curvature-anchor positive-definiteness.
+///
+/// On genuine OLMo-3-32B residual-stream activations the manifold-SAE
+/// curvature anchor (the undamped evidence Hessian assembled at the #1007
+/// homotopy `η = 1` basis) must be positive-definite on the gauge quotient so
+/// the d=2 atoms are IDENTIFIED. The pre-fix failure mode: on the long-tailed
+/// real spectrum the undamped per-row `H_tt` blocks carry a near-null /
+/// negative direction that is NOT a closed-form chart-gauge direction, so the
+/// smallest undamped pivot collapses below the safe-SPD floor and the atoms
+/// are under-identified. This test pins the anchor PD-ness on the committed
+/// real fixture.
+#[test]
+pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/olmo_l25_pca64_768.npy");
+    let z = read_npy_f32_2d(&path);
+    assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
+    let z_train = z.slice(s![..384, ..]).to_owned();
+
+    let term = real_data_torus_seed_term(z_train.view(), 4, 3);
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; 4]);
+    let mut objective = SaeManifoldOuterObjective::new(
+        term,
+        z_train.clone(),
+        None,
+        rho.clone(),
+        8,
+        0.04,
+        1.0e-6,
+        1.0e-6,
+    );
+
+    // Solve the inner joint Newton at the full (η = 1) curved basis and read
+    // the UNDAMPED evidence factorization — the curvature anchor itself.
+    let isometry_targets = objective
+        .registry
+        .as_ref()
+        .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
+        .unwrap_or_default();
+    let (_loss, cache) = objective
+        .solve_at_eta(&rho, 1.0, &isometry_targets)
+        .expect("real-data inner solve at η=1 must converge");
+
+    // Min undamped per-row pivot (squared lower-Cholesky diagonal). The
+    // undamped factors ARE the curvature anchor's H_tt blocks; a non-positive
+    // pivot means an indefinite/under-identified anchor.
+    let mut min_undamped = f64::INFINITY;
+    let mut max_undamped = 0.0_f64;
+    for factor in cache.undamped_factors_iter() {
+        if let Some(p) = crate::solver::arrow_schur::lower_cholesky_min_pivot(factor) {
+            min_undamped = min_undamped.min(p);
+        }
+        if let Some(p) = crate::solver::arrow_schur::lower_cholesky_max_pivot(factor) {
+            max_undamped = max_undamped.max(p);
+        }
+    }
+    let diag_scale = max_undamped.max(1.0);
+    let floor = f64::EPSILON * diag_scale;
+    eprintln!(
+        "[#1190] real-data undamped curvature anchor: min_pivot={min_undamped:.6e} \
+         max_pivot={max_undamped:.6e} floor={floor:.6e}"
+    );
+
+    // The curvature anchor must be PD on the gauge quotient: either every
+    // undamped pivot clears the safe-SPD floor, OR the sub-floor directions are
+    // explained by closed-form gauge/null directions (Faddeev-Popov deflation),
+    // in which case the gauge-deflated outer-gradient solve succeeds. A genuine
+    // non-gauge indefinite anchor satisfies NEITHER and under-identifies.
+    let pivot_ok = min_undamped.is_finite() && min_undamped >= floor;
+    let gauge_explained = objective.term.outer_gradient_arrow_solver(&cache).is_ok();
+    assert!(
+        pivot_ok || gauge_explained,
+        "real-data curvature anchor is non-PD and NOT gauge-explained: \
+         min undamped pivot {min_undamped:.6e} < floor {floor:.6e}, and the \
+         gauge-deflated outer-gradient solve failed — the d=2 atoms are \
+         under-identified on real OLMo activations (#1190)."
+    );
+}
+
 #[cfg(test)]
 mod inner_contract_probe_tests {
     use super::*;
