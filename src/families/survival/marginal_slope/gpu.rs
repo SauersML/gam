@@ -2086,6 +2086,30 @@ pub fn cpu_oracle_third_contraction(
                 val += wi * di * (-2.0 / (inputs.qd1 * inputs.qd1 * inputs.qd1)) * qd1_dir;
             }
 
+            if std::env::var("DIAG979").is_ok() {
+                let eta_term = entry_u3 * entry_eta_dir * entry.eta_u[u] * entry.eta_u[v]
+                    + entry_u2
+                        * (entry_eta_u_dir[u] * entry.eta_u[v]
+                            + entry.eta_u[u] * entry_eta_u_dir[v])
+                    + entry_u2 * entry_eta_dir * b10_at(&entry.eta_uv, u, v, p)
+                    + entry_u1 * b10_at(&entry_ext.eta_uv_dir, u, v, p)
+                    + exit_u3 * exit_eta_dir * exit.eta_u[u] * exit.eta_u[v]
+                    + exit_u2
+                        * (exit_eta_u_dir[u] * exit.eta_u[v] + exit.eta_u[u] * exit_eta_u_dir[v])
+                    + exit_u2 * exit_eta_dir * b10_at(&exit.eta_uv, u, v, p)
+                    + exit_u1 * b10_at(&exit_ext.eta_uv_dir, u, v, p)
+                    + wi * di
+                        * (exit_eta_u_dir[u] * exit.eta_u[v]
+                            + exit.eta_u[u] * exit_eta_u_dir[v]
+                            + exit_eta_dir * b10_at(&exit.eta_uv, u, v, p)
+                            + exit.eta * b10_at(&exit_ext.eta_uv_dir, u, v, p));
+                let chi_term = -wi * di * (chi_uv_over_chi_dir - chi_u_chi_v_over_chi2_dir);
+                let d_term = wi * di * (d_uv_over_d_dir - d_u_d_v_over_d2_dir);
+                eprintln!(
+                    "DIAG979P [{u},{v}] eta_term={eta_term:+.6e} chi_term={chi_term:+.6e} d_term={d_term:+.6e}"
+                );
+            }
+
             out[u * p + v] = val;
             out[v * p + u] = val;
         }
