@@ -1924,6 +1924,20 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
     let index = |a: f64, g: f64, beta_h: &[f64], beta_w: &[f64], z: f64| -> f64 {
         a + g * z + g * warp_eval(beta_h, z) + linkdev_eval(beta_w, a + g * z)
     };
+    // Witness-exact standard-normal primitives (`libm::erfc`, no piecewise
+    // rational approximation). The intercept density `d1 = |∂F/∂a|` is taken by
+    // a central FD with ε = 1e-6, which divides any error in `F` by 2ε = 2e-6;
+    // production's `normal_cdf` carries an ~5e-12 oscillating approximation
+    // error, so `F(a±ε)` inherit independent ~5e-12 perturbations whose FD is
+    // ~4e-6 — exactly the residual `d1` gap (and hence the `ln d1` term left a
+    // ~1.3e-5 self-validation gap, #979). Routing the calibration and the
+    // survival log-CDF through ulp-accurate `erfc` removes that amplified noise.
+    fn wnorm_cdf(x: f64) -> f64 {
+        0.5 * libm::erfc(-x / std::f64::consts::SQRT_2)
+    }
+    fn wnorm_pdf(x: f64) -> f64 {
+        (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+    }
     // Calibration F(a) = ∫ Φ(−index(a,g,z)) φ(z) dz − Φ(−q), by composite Simpson
     // on a wide latent grid (the integrand decays with φ(z)).
     let calibration = |a: f64, q: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> f64 {
@@ -1934,7 +1948,7 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         let mut acc = 0.0_f64;
         for k in 0..=m {
             let z = lo + h * k as f64;
-            let f = normal_cdf(-index(a, g, beta_h, beta_w, z)) * normal_pdf(z);
+            let f = wnorm_cdf(-index(a, g, beta_h, beta_w, z)) * wnorm_pdf(z);
             let coef = if k == 0 || k == m {
                 1.0
             } else if k % 2 == 1 {
@@ -1944,9 +1958,9 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
             };
             acc += coef * f;
         }
-        acc * h / 3.0 - normal_cdf(-q)
+        acc * h / 3.0 - wnorm_cdf(-q)
     };
-    // Intercept root + density normalization D = |∂F/∂a| (FD of the integral).
+    // Intercept root + density normalization D = |∂F/∂a|.
     let solve_intercept = |q: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> (f64, f64) {
         let f = |a: f64| calibration(a, q, g, beta_h, beta_w);
         // Monotone in a; secant from two seeds around the rigid closed form.
@@ -1968,9 +1982,39 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
             }
         }
         let a = a1;
-        let eps = 1e-6;
-        let d = (f(a + eps) - f(a - eps)) / (2.0 * eps);
-        (a, d.abs())
+        // Density D = |∂F/∂a| = ∫ φ(index)·(1 + linkdev'(a+g·z))·φ(z) dz, integrated
+        // DIRECTLY as one Simpson pass over the analytic density integrand — NOT
+        // as a finite difference `(F(a+ε)−F(a−ε))/2ε` of two outer Simpson sums.
+        // The φ(index) factor is sharply peaked in z and that peak slides with a,
+        // so differencing two grid-quadratures aliases the sliding peak into a
+        // ~4e-6 density error; through `event·ln(d1)` that left the ~1.3e-5
+        // self-validation gap of #979. The inner linkdev'(u) is the derivative of
+        // a smooth exactly-evaluated spline basis, so a tight central FD resolves
+        // it to ~1e-10 (no integral, no peak to alias).
+        let dlink = 1e-5;
+        let lo = -8.0_f64;
+        let hi = 8.0_f64;
+        let m = 4000usize; // even
+        let hstep = (hi - lo) / m as f64;
+        let mut acc = 0.0_f64;
+        for k in 0..=m {
+            let z = lo + hstep * k as f64;
+            let u = a + g * z;
+            let dlinkdev =
+                (linkdev_eval(beta_w, u + dlink) - linkdev_eval(beta_w, u - dlink)) / (2.0 * dlink);
+            let integrand =
+                wnorm_pdf(index(a, g, beta_h, beta_w, z)) * (1.0 + dlinkdev) * wnorm_pdf(z);
+            let coef = if k == 0 || k == m {
+                1.0
+            } else if k % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            acc += coef * integrand;
+        }
+        let d = (acc * hstep / 3.0).abs();
+        (a, d)
     };
     // χ1 = ∂η1/∂a at the observed node (FD of the observed index in a).
     let observed_eta_chi = |a: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> (f64, f64) {
@@ -1993,8 +2037,8 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         let (a1, d1) = solve_intercept(q1, g, &beta_h, &beta_w);
         let (eta0, _) = observed_eta_chi(a0, g, &beta_h, &beta_w);
         let (eta1, chi1) = observed_eta_chi(a1, g, &beta_h, &beta_w);
-        let log_surv0 = normal_cdf(-eta0).ln();
-        let log_surv1 = normal_cdf(-eta1).ln();
+        let log_surv0 = wnorm_cdf(-eta0).ln();
+        let log_surv1 = wnorm_cdf(-eta1).ln();
         let tau_ln = std::f64::consts::TAU.ln();
         let log_phi_eta1 = -0.5 * (eta1 * eta1 + tau_ln);
         let log_phi_q1 = -0.5 * (q1 * q1 + tau_ln);
@@ -2048,35 +2092,6 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         .row_neglog_flex_value(0, &block_states)
         .expect("production flex row value");
     let wit_value = witness_nll(&p0);
-    // DIAGNOSTIC (temporary, #979): localize the residual ~1.3e-5 self-validation
-    // gap by comparing each witness intermediate against production's own.
-    {
-        let beta_h_arr = Array1::from(beta_h0.clone());
-        let beta_w_arr = Array1::from(beta_w0.clone());
-        let (w_a0, _) = solve_intercept(q0v, gv, &beta_h0, &beta_w0);
-        let (w_a1, w_d1) = solve_intercept(q1v, gv, &beta_h0, &beta_w0);
-        let (w_eta0, _) = observed_eta_chi(w_a0, gv, &beta_h0, &beta_w0);
-        let (w_eta1, w_chi1) = observed_eta_chi(w_a1, gv, &beta_h0, &beta_w0);
-        let (p_a0, _) = family
-            .solve_row_survival_intercept_with_slot(q0v, gv, Some(&beta_h_arr), Some(&beta_w_arr), None)
-            .expect("prod a0");
-        let (p_a1, p_d1) = family
-            .solve_row_survival_intercept_with_slot(q1v, gv, Some(&beta_h_arr), Some(&beta_w_arr), None)
-            .expect("prod a1");
-        let (p_eta0, _) = family
-            .observed_denested_eta_chi(0, p_a0, gv, Some(&beta_h_arr), Some(&beta_w_arr))
-            .expect("prod eta0");
-        let (p_eta1, p_chi1) = family
-            .observed_denested_eta_chi(0, p_a1, gv, Some(&beta_h_arr), Some(&beta_w_arr))
-            .expect("prod eta1");
-        eprintln!("DIAG979: delta_nll={:+.4e}", wit_value - prod_value);
-        eprintln!("DIAG979: a0   wit={w_a0:+.12e} prod={p_a0:+.12e} d={:+.3e}", w_a0 - p_a0);
-        eprintln!("DIAG979: a1   wit={w_a1:+.12e} prod={p_a1:+.12e} d={:+.3e}", w_a1 - p_a1);
-        eprintln!("DIAG979: eta0 wit={w_eta0:+.12e} prod={p_eta0:+.12e} d={:+.3e}", w_eta0 - p_eta0);
-        eprintln!("DIAG979: eta1 wit={w_eta1:+.12e} prod={p_eta1:+.12e} d={:+.3e}", w_eta1 - p_eta1);
-        eprintln!("DIAG979: chi1 wit={w_chi1:+.12e} prod={p_chi1:+.12e} d={:+.3e}", w_chi1 - p_chi1);
-        eprintln!("DIAG979: d1   wit={w_d1:+.12e} prod={p_d1:+.12e} d={:+.3e}", w_d1 - p_d1);
-    }
     assert!(
         (prod_value - wit_value).abs() <= 1e-7 * prod_value.abs().max(1.0),
         "witness re-derivation disagrees with production scalar NLL: witness {wit_value:+.10e} vs production {prod_value:+.10e} \
