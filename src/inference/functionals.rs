@@ -19,7 +19,6 @@ pub struct GaussianIdentityAverageDerivativeInput<'a> {
     pub y: ArrayView1<'a, f64>,
     pub mu: ArrayView1<'a, f64>,
     pub beta: ArrayView1<'a, f64>,
-    pub penalized_hessian: ArrayView2<'a, f64>,
     pub penalty_beta: ArrayView1<'a, f64>,
 }
 
@@ -28,10 +27,10 @@ pub fn average_derivative_gaussian_identity(
 ) -> Result<FunctionalEstimate, EstimationError> {
     validate_average_derivative_input(input)?;
 
-    let h = input.penalized_hessian.to_owned();
-    let h_factor = h.cholesky(Side::Lower).map_err(|err| {
+    let information = input.design.t().dot(&input.design);
+    let h_factor = information.cholesky(Side::Lower).map_err(|err| {
         EstimationError::InvalidInput(format!(
-            "average-derivative functional requires SPD penalized Hessian: {err}"
+            "average-derivative functional requires SPD Gaussian information matrix: {err}"
         ))
     })?;
     let sensitivity = FitSensitivity::from_faer_cholesky(&h_factor, input.beta.len());
@@ -73,10 +72,10 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
         let residual = input.y[i] - input.mu[i];
         let row_score_projection = input.design.row(i).dot(&riesz) * residual;
         // One-step (von Mises) debiasing of the oversmoothed plugin theta=a'beta.
-        // For Gaussian identity fits, the penalized normal equations give
-        // X'(y - mu) = S beta. Therefore the residual score contributes
-        // a'H^-1 X'(y - mu) = a'H^-1 S beta, the same correction used by the
-        // shared Riesz path.
+        // For Gaussian identity fits, the unpenalized score equation perturbed by
+        // the smoothing pull is X'(y - mu) = S beta. The Riesz solve above uses
+        // X'X, not the penalized Hessian, so this correction estimates the
+        // smoothing bias rather than shrinking it through the penalty again.
         let phi_i = (n as f64) * row_score_projection;
         influence_sq_sum += phi_i * phi_i;
     }
@@ -135,13 +134,6 @@ fn validate_average_derivative_input(
             input.penalty_beta.len()
         );
     }
-    if input.penalized_hessian.nrows() != p || input.penalized_hessian.ncols() != p {
-        crate::bail_invalid_estim!(
-            "average-derivative penalized Hessian must be {p}x{p}, got {}x{}",
-            input.penalized_hessian.nrows(),
-            input.penalized_hessian.ncols()
-        );
-    }
     if input.design.iter().any(|value| !value.is_finite())
         || input
             .derivative_design
@@ -150,14 +142,10 @@ fn validate_average_derivative_input(
         || input.y.iter().any(|value| !value.is_finite())
         || input.mu.iter().any(|value| !value.is_finite())
         || input.beta.iter().any(|value| !value.is_finite())
-        || input
-            .penalized_hessian
-            .iter()
-            .any(|value| !value.is_finite())
         || input.penalty_beta.iter().any(|value| !value.is_finite())
     {
         crate::bail_invalid_estim!(
-            "average-derivative functional requires finite design, derivative design, response, fit, Hessian, and penalty-gradient inputs"
+            "average-derivative functional requires finite design, derivative design, response, fit, and penalty-gradient inputs"
         );
     }
     Ok(())

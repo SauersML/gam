@@ -63,7 +63,7 @@ fn fit_penalized_gaussian(
     y: &Array1<f64>,
     penalty: &Array2<f64>,
     lambda: f64,
-) -> (Array1<f64>, Array1<f64>, Array2<f64>, Array2<f64>) {
+) -> (Array1<f64>, Array1<f64>, Array2<f64>) {
     let mut scaled_penalty = penalty.clone();
     scaled_penalty.mapv_inplace(|value| lambda * value);
     let mut hessian = design.t().dot(design);
@@ -72,7 +72,7 @@ fn fit_penalized_gaussian(
     let chol = hessian.cholesky(Side::Lower).expect("penalized Hessian");
     let beta = chol.solvevec(&rhs);
     let mu = design.dot(&beta);
-    (beta, mu, hessian, scaled_penalty)
+    (beta, mu, scaled_penalty)
 }
 
 fn draw_sample(seed: u64) -> (Array1<f64>, Array1<f64>, f64) {
@@ -102,8 +102,7 @@ fn average_derivative_onestep_corrects_oversmoothed_gaussian_spline() {
     for seed in seeds {
         let (x, y, truth) = draw_sample(seed);
         let (design, derivative_design, penalty) = bspline_design_and_derivative(&x);
-        let (beta, mu, hessian, scaled_penalty) =
-            fit_penalized_gaussian(&design, &y, &penalty, 10.0);
+        let (beta, mu, scaled_penalty) = fit_penalized_gaussian(&design, &y, &penalty, 10.0);
         let penalty_beta = penalty_times_beta(scaled_penalty.view(), beta.view());
         let estimate =
             average_derivative_gaussian_identity(&GaussianIdentityAverageDerivativeInput {
@@ -112,7 +111,6 @@ fn average_derivative_onestep_corrects_oversmoothed_gaussian_spline() {
                 y: y.view(),
                 mu: mu.view(),
                 beta: beta.view(),
-                penalized_hessian: hessian.view(),
                 penalty_beta: penalty_beta.view(),
             })
             .expect("average derivative functional");
