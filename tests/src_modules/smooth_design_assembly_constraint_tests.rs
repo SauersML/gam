@@ -4745,7 +4745,6 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // Tensor evaluator with the certified Gram tensor attached over the window.
     let mut tensor_eval = make_eval();
     let mut tensor_cache = make_cache();
-    let p_total = frozen_design.design.ncols();
     let attached = {
         let mut build_cache = make_cache();
         let theta_probe_base = theta0.clone();
@@ -4766,40 +4765,17 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         attached,
         "tensor must certify on this fixture for a non-vacuous gate"
     );
-    // #1033 penalty lane: also attach the certified ψ-penalty tensor so the
-    // fast-path skip can re-key S(ψ) n-free. Without it the fast path keeps the
-    // stale S(ψ_A) and β̂ at ψ_B/ψ_C diverges from the streamed slow path — the
-    // exact regression this test guards.
-    let penalty_attached = {
-        let mut build_cache = make_cache();
-        let theta_probe_base = theta0.clone();
-        tensor_eval.build_and_set_psi_penalty_tensor(
-            |psi| {
-                let mut theta_probe = theta_probe_base.clone();
-                theta_probe[rho_dim] = psi;
-                build_cache.ensure_theta(&theta_probe)?;
-                let design = build_cache.design();
-                let specs: Vec<crate::estimate::PenaltySpec> = design
-                    .penalties
-                    .iter()
-                    .map(crate::estimate::PenaltySpec::from_blockwise_ref)
-                    .collect();
-                crate::construction::canonicalize_penalty_specs(
-                    &specs,
-                    &design.nullspace_dims,
-                    p_total,
-                    "fast_path_skip psi-penalty",
-                )
-                .map_err(|e| e.to_string())
-            },
-            psi_lo,
-            psi_hi,
-        )
-    };
+    // #1033 penalty lane: enable the EXACT n-free penalty re-key so the
+    // fast-path skip can rebuild S(ψ) from the frozen basis geometry. Without it
+    // the fast path keeps the stale S(ψ_A) and β̂ at ψ_B/ψ_C diverges from the
+    // streamed slow path — the exact regression this test guards. The frozen
+    // single-Duchon-term fixture must admit the n-free rebuild.
+    let nfree_penalty = tensor_cache.supports_nfree_penalty_rekey();
     assert!(
-        penalty_attached,
-        "ψ-penalty tensor must certify on this fixture so the fast path re-keys S(ψ)"
+        nfree_penalty,
+        "single frozen Duchon term must admit the exact n-free S(ψ) re-key"
     );
+    tensor_eval.set_supports_nfree_penalty_rekey(nfree_penalty);
 
     // Three in-window ψ operating points reached at a SINGLE fixed
     // design_revision. We realize the design ONCE (at ψ_A) to pin the
@@ -4831,12 +4807,23 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     .unwrap()
     .unwrap();
 
+    // #1033 penalty lane: mirror the production caller — stage the EXACT n-free
+    // S(ψ) for THIS trial's ψ (rebuilt from the frozen Duchon geometry) before
+    // every eval, so the design-revision fast path re-keys S(ψ) without
+    // `reset_surface`. The slow path (trial 1) clears it; the fast paths (trials
+    // 2/3) consume it. Built from frozen centers ⇒ n-free, valid even though the
+    // design is NOT re-realized at ψ_B/ψ_C.
     let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+                       cache: &mut SingleBlockExactJointDesignCache<'_>,
                        theta: &Array1<f64>|
      -> (f64, Array1<f64>, Array1<f64>) {
+        let penalty = cache
+            .canonical_penalties_at(theta)
+            .expect("exact n-free S(ψ) rebuild");
+        evaluator.stage_fast_path_penalty(Some(penalty));
         let (cost, grad, _h) = evaluate_joint_reml_outer_eval_at_theta(
             evaluator,
-            tensor_cache.design(),
+            cache.design(),
             theta,
             rho_dim,
             hyper_dirs.clone(),
@@ -4857,7 +4844,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         0,
         "no slow-path reset before the first eval"
     );
-    let (c_a, _g_a, beta_a) = eval_tensor(&mut tensor_eval, &theta_at(psi_a));
+    let (c_a, _g_a, beta_a) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a));
     assert_eq!(
         tensor_eval.slow_path_reset_count(),
         1,
@@ -4865,7 +4852,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
 
     // Trial 2 (ψ_B): SAME revision, ψ moved inside window → FAST PATH.
-    let (c_b, _g_b, beta_b) = eval_tensor(&mut tensor_eval, &theta_at(psi_b));
+    let (c_b, _g_b, beta_b) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b));
     assert_eq!(
         tensor_eval.slow_path_reset_count(),
         1,
@@ -4874,7 +4861,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
 
     // Trial 3 (ψ_C): SAME revision again → still no new slow-path entry.
-    let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &theta_at(psi_c));
+    let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c));
     assert_eq!(
         tensor_eval.slow_path_reset_count(),
         1,

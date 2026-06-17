@@ -417,6 +417,77 @@ fn build_duchon_basis_uncached(
     })
 }
 
+/// Rebuild the Duchon penalty list at a NEW `length_scale` purely from FROZEN
+/// basis geometry — no data rows touched (#1033, n-free per-ψ penalty re-key).
+///
+/// The κ-loop fast path skips the n-row `reset_surface`, so it needs `S(ψ_new)`
+/// reconstructed exactly and `n`-free at each trial length-scale. This mirrors
+/// the cold penalty assembly (`build_duchon_basis_uncached` lines ~345-396)
+/// EXACTLY, but every input is taken from the already-frozen
+/// `BasisMetadata::Duchon` (centers, identifiability transform, operator
+/// collocation points) plus the spec's `(power, nullspace_order,
+/// aniso_log_scales, operator_penalties)`. The only thing that moves is
+/// `length_scale`.
+///
+/// The polynomial-column count is `C(d + r, r)` — a pure function of `(d, r)` —
+/// so it is recomputed from the centers (`polynomial_block_from_order(centers,
+/// order).ncols()`), which equals the cold build's `polynomial_block_from_order(
+/// data, order).ncols()` because `.ncols()` does not depend on the row count.
+///
+/// Returns the per-block penalty matrices (term-local frame, same order/count
+/// the cold build emits) and the active per-block nullspace dims — exactly the
+/// objects the cold build feeds into `filter_active_penalty_candidates_with_ops`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn duchon_penalties_at_length_scale(
+    centers: ArrayView2<'_, f64>,
+    identifiability_transform: Option<&Array2<f64>>,
+    operator_collocation_points: Option<ArrayView2<'_, f64>>,
+    operator_penalties: &DuchonOperatorPenaltySpec,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
+    length_scale: Option<f64>,
+    workspace: &mut BasisWorkspace,
+) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
+    // Recompute the effective order + auto-seeded anisotropy exactly as the cold
+    // build does (duchon_thinplate.rs:151/159). Both are pure functions of the
+    // frozen centers + spec, so the κ trial replays the SAME structural choices.
+    let effective_nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let aniso = auto_seed_aniso_contrasts(centers, aniso_log_scales);
+    // n-free kernel-constraint nullspace (from centers; cached on the workspace).
+    let kernel_transform =
+        kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    // Polynomial column count: `C(d+r, r)`, independent of the row count, so the
+    // n-free centers-based form equals the cold build's data-based `.ncols()`.
+    let poly_cols = polynomial_block_from_order(centers, effective_nullspace_order).ncols();
+    let mut candidates = duchon_native_penalty_candidates(
+        centers,
+        length_scale,
+        power,
+        effective_nullspace_order,
+        aniso.as_deref(),
+        &kernel_transform,
+        identifiability_transform,
+        poly_cols,
+    )?;
+    if let Some(points) = operator_collocation_points {
+        candidates.extend(duchon_operator_penalty_candidates(
+            points,
+            centers,
+            operator_penalties,
+            length_scale,
+            power,
+            effective_nullspace_order,
+            aniso.is_some(),
+            identifiability_transform,
+            workspace,
+        )?);
+    }
+    let (penalties, nullspace_dims, _info, _eig, _ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok((penalties, nullspace_dims))
+}
+
 /// Materialise the polynomial null-space block for a Duchon basis.
 ///
 /// Returns an `(n, C(d+r, r))` matrix whose columns are all monomials of total

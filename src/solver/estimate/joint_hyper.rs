@@ -122,21 +122,39 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// statistics are frame-exact against the streamed ones.
     pub(crate) psi_gram_tensor:
         Option<std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>>,
-    /// Certified Chebyshev-in-ψ CANONICAL PENALTY tensor for the SAME single
-    /// design-moving hyperparameter as `psi_gram_tensor` (#1033, penalty lane).
-    /// For a spatial smooth ψ (= log length-scale) moves BOTH the design Gram
-    /// AND the penalty `S(ψ)` (the Duchon/Matérn Hilbert scale is built as a
-    /// function of the length-scale from the basis centers). The design-revision
-    /// fast path skips `reset_surface` — the only place the canonical penalty
-    /// surface is rebuilt — so without re-keying `S(ψ)` the inner solve would
-    /// pair `XᵀWX(ψ_new)` with the STALE `S(ψ_old)` and converge to the wrong
-    /// β̂ / κ-optimum. When present and ψ is in-window, the fast path pulls the
-    /// per-ψ canonical penalty list (k×k, built from centers ⇒ n-free) from this
-    /// tensor and calls `refresh_canonical_penalty_surface`, re-installing
-    /// `S(ψ_new)` on the kept reference surface. Built alongside the Gram tensor
-    /// by `build_and_set_psi_penalty_tensor` over the same ψ window.
-    pub(crate) psi_penalty_tensor:
-        Option<std::sync::Arc<crate::solver::psi_gram_tensor::PsiPenaltyTensor>>,
+    /// EXACT n-free per-ψ canonical penalty surface `S(ψ)` staged for the
+    /// CURRENT ψ-trial (#1033, penalty lane). For a spatial smooth ψ (= log
+    /// length-scale) moves BOTH the design Gram AND the penalty `S(ψ)` (the
+    /// Duchon/Matérn Hilbert scale is built as a function of the length-scale
+    /// from the FROZEN basis centers — n-free). The design-revision fast path
+    /// skips `reset_surface` — the only place the canonical penalty surface is
+    /// rebuilt — so without re-keying `S(ψ)` the inner solve would pair
+    /// `XᵀWX(ψ_new)` with the STALE `S(ψ_old)` and converge to the wrong β̂ /
+    /// κ-optimum.
+    ///
+    /// The CALLER (`SpatialJointContext::eval_full` / `eval_cost`, which holds
+    /// the design `cache`) computes the exact rebuild via
+    /// `cache.canonical_penalties_at(theta)` and hands the owned
+    /// `(Vec<CanonicalPenalty>, active_nullspace_dims)` here through
+    /// `stage_fast_path_penalty` BEFORE the eval — avoiding a `&mut cache`
+    /// borrow alias with the evaluator. On the fast path `prepare_eval_state`
+    /// consumes the staged value (`refresh_psi_penalty_surface`) and re-installs
+    /// `S(ψ_new)` on the kept reference surface via
+    /// `refresh_canonical_penalty_surface`; the slow path takes the freshly
+    /// realized penalties as before and clears this slot. `None` (the default)
+    /// means no exact rebuild is staged — the fast path then refuses (hard
+    /// error) when `supports_nfree_penalty_rekey` is set, so a stale `S` can
+    /// never be silently paired.
+    pub(crate) pending_psi_penalty: Option<
+        std::sync::Arc<(Vec<crate::construction::CanonicalPenalty>, Vec<usize>)>,
+    >,
+    /// True when the design `cache` can rebuild `S(ψ)` exactly and n-free for
+    /// the single spatial term (frozen-geometry Duchon/Matérn/ThinPlate). The
+    /// fast-path design-realization skip gates on this (replacing the old
+    /// certified `psi_penalty_tensor_covers` window check): when set, every
+    /// fast-path trial MUST have a staged exact penalty, and a missing stage is
+    /// a hard error rather than a stale-`S` solve.
+    pub(crate) supports_nfree_penalty_rekey: bool,
     /// Frozen-weight GLM first-Fisher-step data-fit Gram `XᵀWX` staged for the
     /// CURRENT ψ-trial (#1111 / #1033 mechanism (c)), in the conditioned
     /// (`x_fit`) frame. Set per-trial by [`SpatialJointContext::eval_full`] when
@@ -237,7 +255,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             reml_state,
             last_canonical_revision: None,
             psi_gram_tensor: None,
-            psi_penalty_tensor: None,
+            pending_psi_penalty: None,
+            supports_nfree_penalty_rekey: false,
             pending_glm_first_step_gram: None,
             pending_glm_psi_gram_deriv: None,
             slow_path_reset_count: std::cell::Cell::new(0),
@@ -365,51 +384,38 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         }
     }
 
-    /// Build and attach a certified ψ-CANONICAL-PENALTY tensor (#1033, penalty
-    /// lane) for the single design-moving hyperparameter ψ over `[psi_lo, psi_hi]`.
-    ///
-    /// `eval_canonical_penalties(psi)` must return the EXACT canonical penalty
-    /// list at `psi` — the same `(Vec<CanonicalPenalty>, active_nullspace_dims)`
-    /// the slow path produces inside `prepare_eval_state` via
-    /// `PenaltySpec::from_blockwise_ref` + `canonicalize_penalty_specs` — so the
-    /// tensor lives in the IDENTICAL canonical frame `reset_surface` installs.
-    /// Unlike the Gram, the penalty is NOT threaded through the column
-    /// conditioning: the slow path conditions only the design (`x_fit`) and runs
-    /// `canonicalize_penalty_specs` on the raw penalty blocks, so the penalty
-    /// frame is the raw canonical frame and the caller must hand canonical
-    /// penalties already in it.
-    ///
-    /// Returns whether a certified tensor was attached; `false` keeps the slow
-    /// `reset_surface` path (re-realizing the design) so the penalty is never
-    /// served stale. Attaching this WITHOUT the Gram tensor is harmless but
-    /// pointless — the design-revision fast path that consumes it only fires when
-    /// the Gram tensor also covers ψ.
-    pub(crate) fn build_and_set_psi_penalty_tensor(
+    /// Declare whether the design `cache` can rebuild `S(ψ)` exactly and n-free
+    /// for the single spatial term (#1033, penalty lane). Set ONCE at setup from
+    /// `cache.supports_nfree_penalty_rekey()`. When `true`, the design-revision
+    /// fast path's design-realization skip is permitted (the penalty can be
+    /// re-keyed without `reset_surface`) and every fast-path trial MUST have a
+    /// staged exact penalty (`stage_fast_path_penalty`), else `prepare_eval_state`
+    /// hard-errors rather than pairing a stale `S`.
+    pub(crate) fn set_supports_nfree_penalty_rekey(&mut self, supported: bool) {
+        self.supports_nfree_penalty_rekey = supported;
+    }
+
+    /// True when the n-free penalty re-key lane is enabled for this fit.
+    pub(crate) fn supports_nfree_penalty_rekey(&self) -> bool {
+        self.supports_nfree_penalty_rekey
+    }
+
+    /// Stage (or clear) the EXACT n-free canonical penalty surface `S(ψ)` for the
+    /// NEXT trial eval (#1033, penalty lane). The CALLER (which holds the design
+    /// `cache`) computes `cache.canonical_penalties_at(theta)` and hands the
+    /// owned `(Vec<CanonicalPenalty>, active_nullspace_dims)` here BEFORE the
+    /// eval — sidestepping a `&mut cache` borrow alias with the evaluator. On the
+    /// design-revision fast path `prepare_eval_state` /
+    /// `prepare_eval_state_cost_only` consume the staged value via
+    /// `refresh_psi_penalty_surface` and re-install `S(ψ_new)` on the kept
+    /// reference surface; the slow path clears it (the freshly realized penalty
+    /// is used instead). Passing `None` clears any previously staged surface so a
+    /// stale previous-ψ `S` is never consumed.
+    pub(crate) fn stage_fast_path_penalty(
         &mut self,
-        eval_canonical_penalties: impl FnMut(
-            f64,
-        ) -> Result<
-            (
-                Vec<crate::construction::CanonicalPenalty>,
-                Vec<usize>,
-            ),
-            String,
-        >,
-        psi_lo: f64,
-        psi_hi: f64,
-    ) -> bool {
-        let tensor = crate::solver::psi_gram_tensor::PsiPenaltyTensor::build(
-            eval_canonical_penalties,
-            psi_lo,
-            psi_hi,
-        );
-        match tensor {
-            Some(tensor) => {
-                self.psi_penalty_tensor = Some(std::sync::Arc::new(tensor));
-                true
-            }
-            None => false,
-        }
+        penalty: Option<(Vec<crate::construction::CanonicalPenalty>, Vec<usize>)>,
+    ) {
+        self.pending_psi_penalty = penalty.map(std::sync::Arc::new);
     }
 
     /// Build a certified frozen-weight GLM ψ-Gram tensor (#1111 / #1033
@@ -477,20 +483,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains(psi))
     }
 
-    /// True when a certified ψ-CANONICAL-PENALTY tensor is installed AND `psi`
-    /// lies inside its certified window — i.e. the n-free per-ψ canonical penalty
-    /// list `S(ψ)` reproduces the slow-path `canonicalize_penalty_specs` output to
-    /// the certification tolerance, so the design-revision fast path can re-key
-    /// `S(ψ_new)` via `refresh_canonical_penalty_surface` instead of paying
-    /// `reset_surface`. The spatial caller gates its `reset_surface`-skip on this
-    /// (alongside the Gram coverage) so the fast path is NEVER taken with a
-    /// penalty that cannot be re-keyed exactly — without it the inner solve would
-    /// pair `XᵀWX(ψ_new)` with the stale `S(ψ_old)`.
-    pub(crate) fn psi_penalty_tensor_covers(&self, psi: f64) -> bool {
-        self.psi_penalty_tensor
-            .as_ref()
-            .is_some_and(|t| t.contains(psi))
-    }
 
     /// True when the design-revision fast path of [`Self::prepare_eval_state`]
     /// would fire for `design_revision` — i.e. a prior eval has already pinned
@@ -599,43 +591,33 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
 
     /// #1033 penalty lane: on the design-revision fast path (`reset_surface`
     /// skipped) re-install the per-ψ canonical penalty surface `S(ψ)` from the
-    /// certified `psi_penalty_tensor`, so the kept reference surface pairs
-    /// `XᵀWX(ψ_new)` (re-keyed by `install_psi_gram_statistics`) with the CORRECT
-    /// `S(ψ_new)` instead of the stale `S(ψ_old)` left from the slow-path reset.
+    /// EXACT n-free rebuild the caller staged via `stage_fast_path_penalty`, so
+    /// the kept reference surface pairs `XᵀWX(ψ_new)` (re-keyed by
+    /// `install_psi_gram_statistics`) with the CORRECT `S(ψ_new)` instead of the
+    /// stale `S(ψ_old)` left from the slow-path reset. The staged penalty is the
+    /// output of `cache.canonical_penalties_at(theta)` — the SAME
+    /// `canonicalize_penalty_specs` pipeline `reset_surface` runs, but built from
+    /// the frozen basis geometry at the trial length-scale (no data rows).
     ///
-    /// Returns `true` when the penalty was re-keyed for this trial's ψ (a single
-    /// design-moving ψ that the penalty tensor covers). Returns `false` when there
-    /// is no penalty tensor, ψ is multi-coordinate, or ψ is off the certified
-    /// window — in which case the fast path MUST NOT have been taken (the spatial
-    /// caller gates its skip on `psi_penalty_tensor_covers`), so a `false` here is
-    /// a hard signal that the skip gate and the re-key coverage have drifted out
-    /// of sync; the caller treats it as an error rather than silently solving with
-    /// a stale penalty.
-    fn refresh_psi_penalty_surface(
-        &mut self,
-        theta: &Array1<f64>,
-        rho_dim: usize,
-    ) -> Result<bool, EstimationError> {
-        let Some(tensor) = self.psi_penalty_tensor.as_ref() else {
+    /// Returns `true` when a staged penalty was consumed and re-keyed. Returns
+    /// `false` when NO penalty was staged — in which case the fast path MUST NOT
+    /// have been taken (the spatial caller only skips design realization when
+    /// `cache.supports_nfree_penalty_rekey()` and always stages the rebuild on
+    /// that lane), so a `false` here is a hard signal that the skip gate and the
+    /// staging have drifted out of sync; the caller treats it as an error rather
+    /// than silently solving with a stale penalty.
+    fn refresh_psi_penalty_surface(&mut self) -> Result<bool, EstimationError> {
+        // Take the staged penalty (consume it — it is keyed to THIS trial's ψ).
+        let Some(staged) = self.pending_psi_penalty.take() else {
             return Ok(false);
         };
-        if theta.len() != rho_dim + 1 {
-            return Ok(false);
-        }
-        let psi = theta[rho_dim];
-        if !tensor.contains(psi) {
-            return Ok(false);
-        }
-        // Release the immutable borrow of `self.psi_penalty_tensor` before the
-        // `&mut self.reml_state` refresh below.
-        let tensor = std::sync::Arc::clone(tensor);
-        let canonical = tensor.penalties_at(psi);
-        let nullspace_dims = tensor.nullspace_dims();
+        let (canonical, nullspace_dims) = std::sync::Arc::try_unwrap(staged)
+            .unwrap_or_else(|arc| (*arc).clone());
         self.reml_state
             .refresh_canonical_penalty_surface(Arc::new(canonical), nullspace_dims)?;
         log::debug!(
-            "[psi-penalty-tensor] re-installed n-free canonical penalty surface S(psi) \
-             at psi={psi:.6} on the design-revision fast path"
+            "[nfree-psi-penalty] re-installed exact n-free canonical penalty surface S(psi) \
+             on the design-revision fast path"
         );
         Ok(true)
     }
@@ -686,24 +668,22 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // #1033 penalty lane: ψ moved BOTH the Gram (re-keyed above) AND the
             // penalty `S(ψ)`. The skipped `reset_surface` is the only place the
             // canonical penalty surface is rebuilt, so re-install `S(ψ_new)` from
-            // the certified penalty tensor here — otherwise the inner solve would
-            // pair `XᵀWX(ψ_new)` with the stale `S(ψ_old)` and converge to the
-            // wrong β̂ / κ-optimum. Done AFTER the Gram install because
-            // `refresh_canonical_penalty_surface` deliberately does NOT clear the
-            // Gaussian Gram cache (it is re-keyed independently above). The spatial
-            // caller only takes the design-realization skip when
-            // `psi_penalty_tensor_covers(psi)`, so if a penalty tensor is present
-            // the re-key must succeed; a `false` means the skip gate and the
-            // penalty coverage drifted apart, which would silently pair a stale
-            // `S` — surface it as a hard error instead.
-            if self.psi_penalty_tensor.is_some()
-                && !self.refresh_psi_penalty_surface(theta, rho_dim)?
-            {
+            // the EXACT n-free penalty the caller staged here — otherwise the
+            // inner solve would pair `XᵀWX(ψ_new)` with the stale `S(ψ_old)` and
+            // converge to the wrong β̂ / κ-optimum. Done AFTER the Gram install
+            // because `refresh_canonical_penalty_surface` deliberately does NOT
+            // clear the Gaussian Gram cache (it is re-keyed independently above).
+            // The spatial caller only takes the design-realization skip when
+            // `cache.supports_nfree_penalty_rekey()`, and always stages the exact
+            // rebuild on that lane, so the re-key must succeed; a `false` means
+            // the skip gate and the staging drifted apart, which would silently
+            // pair a stale `S` — surface it as a hard error instead.
+            if self.supports_nfree_penalty_rekey && !self.refresh_psi_penalty_surface()? {
                 crate::bail_invalid_estim!(
-                    "design-revision fast path fired but the certified ψ-penalty tensor does \
-                     not cover psi={:.6} (theta_len={}, rho_dim={}); the reset_surface skip \
-                     would leave a stale S(psi). The caller's skip gate must also check \
-                     psi_penalty_tensor_covers.",
+                    "design-revision fast path fired with n-free penalty re-key enabled but no \
+                     exact S(psi) was staged for psi={:.6} (theta_len={}, rho_dim={}); the \
+                     reset_surface skip would leave a stale S(psi). The caller must call \
+                     stage_fast_path_penalty before every skip-path eval.",
                     if theta.len() > rho_dim { theta[rho_dim] } else { f64::NAN },
                     theta.len(),
                     rho_dim,
@@ -785,6 +765,11 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // installer the fast path uses, so both branches key the Gram to ψ.
         self.install_psi_gram_statistics(theta, rho_dim);
         self.install_pending_glm_trial_statistics();
+        // #1033 penalty lane: the slow path just rebuilt `S` from the freshly
+        // realized design inside `reset_surface`, so a staged n-free penalty (if
+        // any) is superseded — drop it so a later fast-path eval at a DIFFERENT
+        // revision never consumes this trial's stale `S`.
+        self.pending_psi_penalty = None;
         Ok(hyper_dirs)
     }
 
@@ -993,22 +978,20 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             self.install_psi_gram_statistics(theta, rho_dim);
             // #1033 penalty lane (value-probe twin): the probe's ψ differs from the
             // eval that ran the last `reset_surface`, so the kept surface still
-            // carries that ψ's `S`. Re-key `S(ψ_probe)` from the certified penalty
-            // tensor for the same reason as the full-eval fast path — otherwise the
-            // probe's inner Gaussian PLS pairs `XᵀWX(ψ_probe)` (re-keyed above) with
-            // a stale `S` and reports the wrong cost, mis-ranking the line search.
-            // The caller's `skip_value_realization` gate must include
-            // `psi_penalty_tensor_covers`, so a present penalty tensor must cover
-            // this probe's ψ; treat a miss as a hard error rather than a stale-`S`
-            // cost.
-            if self.psi_penalty_tensor.is_some()
-                && !self.refresh_psi_penalty_surface(theta, rho_dim)?
-            {
+            // carries that ψ's `S`. Re-key `S(ψ_probe)` from the EXACT n-free
+            // penalty the caller staged, for the same reason as the full-eval fast
+            // path — otherwise the probe's inner Gaussian PLS pairs `XᵀWX(ψ_probe)`
+            // (re-keyed above) with a stale `S` and reports the wrong cost,
+            // mis-ranking the line search. The caller's `skip_value_realization`
+            // gate requires `cache.supports_nfree_penalty_rekey()` and stages the
+            // rebuild, so when enabled the re-key must succeed; treat a miss as a
+            // hard error rather than a stale-`S` cost.
+            if self.supports_nfree_penalty_rekey && !self.refresh_psi_penalty_surface()? {
                 crate::bail_invalid_estim!(
-                    "value-probe design-revision fast path fired but the certified ψ-penalty \
-                     tensor does not cover psi={:.6} (theta_len={}, rho_dim={}); the \
-                     reset_surface skip would leave a stale S(psi). The caller's \
-                     skip_value_realization gate must also check psi_penalty_tensor_covers.",
+                    "value-probe design-revision fast path fired with n-free penalty re-key \
+                     enabled but no exact S(psi) was staged for psi={:.6} (theta_len={}, \
+                     rho_dim={}); the reset_surface skip would leave a stale S(psi). The caller \
+                     must call stage_fast_path_penalty before every skip-path value probe.",
                     if theta.len() > rho_dim { theta[rho_dim] } else { f64::NAN },
                     theta.len(),
                     rho_dim,
@@ -1049,6 +1032,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
         self.last_canonical_revision = design_revision;
         self.install_psi_gram_statistics(theta, rho_dim);
+        // #1033 penalty lane: the slow cost-only path rebuilt `S` from the freshly
+        // realized design — drop any staged n-free penalty so a later fast-path
+        // probe never consumes this trial's stale `S`.
+        self.pending_psi_penalty = None;
         Ok(())
     }
 

@@ -1409,6 +1409,41 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     fn design(&self) -> &TermCollectionDesign {
         self.realizer.design()
     }
+
+    /// True when the single spatial term's frozen geometry admits an EXACT,
+    /// n-free penalty re-key at a new length-scale (#1033). The κ-loop fast path
+    /// gates its design-realization skip on this (replacing the old certified
+    /// `psi_penalty_tensor_covers` gate): the skip leaves `reset_surface`
+    /// un-run, so it is sound only when `S(ψ_new)` can be rebuilt n-free.
+    fn supports_nfree_penalty_rekey(&self) -> bool {
+        self.realizer.supports_nfree_penalty_rekey(&self.spatial_terms)
+    }
+
+    /// Build the EXACT canonical penalty surface `S(ψ)` at the length-scale
+    /// implied by `theta`'s ψ tail, entirely n-free (#1033). Maps ψ→length-scale
+    /// with the IDENTICAL `spatial_term_psi_to_length_scale_and_aniso` the slow
+    /// path uses, reuses the frozen basis geometry, and runs the SAME
+    /// `canonicalize_penalty_specs` pipeline `reset_surface` runs — so the
+    /// returned canonical list is the one the kept reference surface must be
+    /// re-keyed with on the design-revision fast path. The caller (which holds
+    /// `cache`) computes this and hands the owned result to the evaluator via
+    /// `stage_fast_path_penalty`, avoiding a `&mut cache` borrow alias.
+    fn canonical_penalties_at(
+        &mut self,
+        theta: &Array1<f64>,
+    ) -> Result<
+        (
+            Vec<crate::construction::CanonicalPenalty>,
+            Vec<usize>,
+        ),
+        String,
+    > {
+        let psi = &theta.as_slice().ok_or_else(|| {
+            "canonical_penalties_at: theta is not contiguous".to_string()
+        })?[self.rho_dim..];
+        self.realizer
+            .canonical_penalties_at_psi(&self.spatial_terms, psi)
+    }
 }
 
 
@@ -2459,10 +2494,10 @@ impl<'d> SpatialJointContext<'d> {
                 self.evaluator.psi_gram_tensor_covers(psi)
                     && self.evaluator.psi_gram_tensor_covers_gradient(psi)
                     // #1033 penalty lane: ψ moves S(ψ) too, and the skip leaves
-                    // `reset_surface` un-run; only skip when the certified penalty
-                    // tensor can re-key S(ψ) n-free on the fast path, else the
-                    // inner solve would pair XᵀWX(ψ_new) with the stale S(ψ_old).
-                    && self.evaluator.psi_penalty_tensor_covers(psi)
+                    // `reset_surface` un-run; only skip when the penalty can be
+                    // rebuilt EXACTLY and n-free on the fast path, else the inner
+                    // solve would pair XᵀWX(ψ_new) with the stale S(ψ_old).
+                    && self.evaluator.supports_nfree_penalty_rekey()
                     && self
                         .evaluator
                         .design_revision_fast_path_armed(self.cache.design_revision())
@@ -2560,6 +2595,33 @@ impl<'d> SpatialJointContext<'d> {
             .hyper_dirs_for_current_design(self.data, kind)?;
 
         let design_revision = Some(self.cache.design_revision());
+        // #1033 penalty lane: stage the EXACT n-free `S(ψ)` for this trial so the
+        // evaluator's design-revision fast path can re-key the kept reference
+        // surface without `reset_surface`. Built from the FROZEN basis geometry
+        // (centers + identifiability transform + operator collocation points) at
+        // the trial length-scale — no data rows — so it is valid even on the
+        // design-realization skip path (where the design was not re-realized). The
+        // caller (holding `cache`) computes it and hands the owned result to the
+        // evaluator, sidestepping a `&mut cache` borrow alias. On the slow path
+        // the evaluator ignores + clears the staged value (it rebuilds S from the
+        // realized design). A build error here clears the stage; if the skip
+        // already fired (fast path), the evaluator then hard-errors rather than
+        // pairing a stale S — the safe outcome, since a rebuild from frozen
+        // geometry should never fail in practice.
+        if self.evaluator.supports_nfree_penalty_rekey() {
+            match self.cache.canonical_penalties_at(theta) {
+                Ok(penalty) => self.evaluator.stage_fast_path_penalty(Some(penalty)),
+                Err(e) => {
+                    log::warn!(
+                        "[STAGE] {} eval_full at psi={:.6}: exact n-free S(ψ) rebuild failed \
+                         ({e}); clearing stage (eval falls to slow path)",
+                        kind.label(),
+                        theta[self.rho_dim],
+                    );
+                    self.evaluator.stage_fast_path_penalty(None);
+                }
+            }
+        }
         // Warm-start PIRLS from the previous outer step's converged β. This is
         // especially impactful for GLM families (Poisson, NB, Binomial) that
         // cannot use the Gaussian Gram tensor n-free shortcut: without the warm
@@ -2678,15 +2740,26 @@ impl<'d> SpatialJointContext<'d> {
                 self.evaluator.psi_gram_tensor_covers(psi)
                     // #1033 penalty lane: the value-probe fast path also skips
                     // `reset_surface`, so the probe must be able to re-key S(ψ)
-                    // n-free; otherwise its cost would use the stale S(ψ_old) and
-                    // mis-rank the line search.
-                    && self.evaluator.psi_penalty_tensor_covers(psi)
+                    // EXACTLY and n-free; otherwise its cost would use the stale
+                    // S(ψ_old) and mis-rank the line search.
+                    && self.evaluator.supports_nfree_penalty_rekey()
                     && self
                         .evaluator
                         .design_revision_fast_path_armed(self.cache.design_revision())
             };
         if !skip_value_realization && self.cache.ensure_theta(theta).is_err() {
             return f64::INFINITY;
+        }
+        // #1033 penalty lane: stage the EXACT n-free `S(ψ)` for this probe's ψ so
+        // the cost-only fast path re-keys the kept surface without `reset_surface`
+        // (built from frozen geometry — valid even when the design was not
+        // re-realized). The slow path clears it. A rebuild failure clears the
+        // stage; the evaluator then takes the slow path or hard-errors (safe).
+        if self.evaluator.supports_nfree_penalty_rekey() {
+            match self.cache.canonical_penalties_at(theta) {
+                Ok(penalty) => self.evaluator.stage_fast_path_penalty(Some(penalty)),
+                Err(_) => self.evaluator.stage_fast_path_penalty(None),
+            }
         }
         let design_revision = Some(self.cache.design_revision());
         let cost_label = self.kind.label();
@@ -2939,58 +3012,40 @@ fn run_exact_joint_spatial_optimization(
             );
             // #1033 penalty lane: ψ also moves the penalty `S(ψ)` (the
             // Duchon/Matérn Hilbert scale is an analytic function of the
-            // length-scale, built from the basis CENTERS — not the data rows).
-            // The design-revision fast path that the Gram tensor enables SKIPS
-            // `reset_surface`, the only place the canonical penalty surface is
-            // rebuilt; without re-keying, the inner solve would pair
+            // length-scale, built from the FROZEN basis CENTERS — not the data
+            // rows). The design-revision fast path that the Gram tensor enables
+            // SKIPS `reset_surface`, the only place the canonical penalty surface
+            // is rebuilt; without re-keying, the inner solve would pair
             // `XᵀWX(ψ_new)` with the stale `S(ψ_old)` and converge to the wrong
-            // β̂ / κ-optimum. Build a PARALLEL certified penalty tensor over the
-            // same window: its per-ψ accessor reconstructs the canonical penalty
-            // list n-free, in the IDENTICAL canonical frame the slow-path
-            // `reset_surface` produces. The closure realizes the design at the
-            // node ψ (an n-row build, but ONE-TIME like the Gram build) and runs
-            // the SAME `from_blockwise_ref` + `canonicalize_penalty_specs`
-            // pipeline `prepare_eval_state`'s slow path runs, so the captured
-            // penalty is frame-exact. The realizer revision advances during this
-            // build; the caller re-pins the reference surface on its first eval.
-            let p_total = baseline_design.design.ncols();
-            let penalty_attached = evaluator.build_and_set_psi_penalty_tensor(
-                |psi| {
-                    let mut theta_probe = theta_probe_base.clone();
-                    theta_probe[rho_dim] = psi;
-                    cache.ensure_theta(&theta_probe)?;
-                    let design = cache.design();
-                    let specs: Vec<crate::estimate::PenaltySpec> = design
-                        .penalties
-                        .iter()
-                        .map(crate::estimate::PenaltySpec::from_blockwise_ref)
-                        .collect();
-                    crate::construction::canonicalize_penalty_specs(
-                        &specs,
-                        &design.nullspace_dims,
-                        p_total,
-                        "psi-penalty-tensor build",
-                    )
-                    .map_err(|e| e.to_string())
-                },
-                psi_lo,
-                psi_hi,
-            );
-            if penalty_attached {
+            // β̂ / κ-optimum. Rather than interpolate `S(ψ)`, the fast path rebuilds
+            // it EXACTLY and n-free per trial from the frozen geometry via
+            // `cache.canonical_penalties_at(theta)` (the SAME
+            // `canonicalize_penalty_specs` pipeline the slow `reset_surface` runs).
+            // Here we only DECLARE the capability to the evaluator; the per-trial
+            // staging happens in `eval_full` / `eval_cost`. The skip is enabled
+            // exactly when the single spatial term's frozen metadata
+            // (Duchon/Matérn/ThinPlate) admits the exact rebuild.
+            let nfree_penalty = cache.supports_nfree_penalty_rekey();
+            evaluator.set_supports_nfree_penalty_rekey(nfree_penalty);
+            if nfree_penalty {
                 log::info!(
-                    "[{label}] certified ψ-penalty tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
-                     in-window fast-path trials re-key S(ψ) n-free (no reset_surface)"
+                    "[{label}] exact n-free ψ-penalty re-key enabled over [{psi_lo:.3}, \
+                     {psi_hi:.3}]: in-window fast-path trials rebuild S(ψ) n-free from frozen \
+                     geometry (no reset_surface)"
                 );
             } else {
-                // The penalty did not certify. The fast-path skip gates also
-                // require `psi_penalty_tensor_covers`, so with no penalty tensor
-                // they never fire and every trial keeps the slow `reset_surface`
-                // (faithful S). The Gram tensor still serves the streamed-Gram
-                // value lane on the slow path, so this only forgoes the
-                // design-realization skip — never correctness.
+                // The frozen geometry does not admit an exact n-free penalty
+                // rebuild (multi-term, or a non-spatial-kernel basis). The
+                // fast-path design-realization skip gates on
+                // `supports_nfree_penalty_rekey`, so it never fires and every
+                // trial keeps the slow `reset_surface` (faithful S). The Gram
+                // tensor still serves the streamed-Gram value lane on the slow
+                // path, so this only forgoes the design-realization skip — never
+                // correctness.
                 log::info!(
-                    "[{label}] ψ-penalty tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \
-                     fast-path design-realization skip disabled (slow path re-keys S exactly)"
+                    "[{label}] exact n-free ψ-penalty re-key unavailable over [{psi_lo:.3}, \
+                     {psi_hi:.3}]; fast-path design-realization skip disabled (slow path re-keys \
+                     S exactly)"
                 );
             }
         } else {
@@ -4587,6 +4642,197 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
 
     fn design(&self) -> &TermCollectionDesign {
         &self.design
+    }
+
+    /// True when this realizer carries exactly ONE spatial smooth term whose
+    /// frozen basis geometry (`BasisMetadata::Duchon`/`Matern`/`ThinPlate`)
+    /// admits an EXACT, n-free penalty rebuild at a new length-scale (#1033).
+    /// The κ-loop fast path gates its design-realization skip on this: the skip
+    /// leaves `reset_surface` un-run, so it is only sound when `S(ψ_new)` can be
+    /// re-keyed n-free from the frozen geometry (centers + identifiability
+    /// transform + operator collocation points), never from the data rows.
+    fn supports_nfree_penalty_rekey(&self, spatial_terms: &[usize]) -> bool {
+        if spatial_terms.len() != 1 {
+            return false;
+        }
+        let term_idx = spatial_terms[0];
+        matches!(
+            self.design.smooth.terms.get(term_idx).map(|t| &t.metadata),
+            Some(
+                BasisMetadata::Duchon { .. }
+                    | BasisMetadata::Matern { .. }
+                    | BasisMetadata::ThinPlate { .. }
+            )
+        )
+    }
+
+    /// Rebuild the EXACT canonical penalty surface `S(ψ)` at the length-scale
+    /// implied by `psi`, entirely n-free (#1033). Reuses the FROZEN basis
+    /// geometry from the single spatial term's `BasisMetadata` (centers,
+    /// identifiability transform, operator collocation points — all `k × d`, no
+    /// data rows) and the spec's `(power, nullspace_order, operator_penalties,
+    /// nu, …)`; only the length-scale moves. The reconstructed term-local
+    /// penalty matrices replace the `local` of the FROZEN
+    /// `design.penalties` templates (whose `col_range` / `prior_mean` /
+    /// `structure_hint` / `op` are ψ-invariant), so the resulting
+    /// `PenaltySpec`s are bit-identical in topology to the slow path's; running
+    /// them through the SAME `canonicalize_penalty_specs` pipeline yields the
+    /// canonical list the kept reference surface must be re-keyed with.
+    fn canonical_penalties_at_psi(
+        &mut self,
+        spatial_terms: &[usize],
+        psi: &[f64],
+    ) -> Result<
+        (
+            Vec<crate::construction::CanonicalPenalty>,
+            Vec<usize>,
+        ),
+        String,
+    > {
+        if spatial_terms.len() != 1 {
+            return Err(format!(
+                "n-free penalty re-key requires exactly one spatial term, found {}",
+                spatial_terms.len()
+            ));
+        }
+        let term_idx = spatial_terms[0];
+        // Duchon/Matérn/ThinPlate η is a geometry-derived basis parameter
+        // (auto-seeded from centers), not a ψ axis — the ψ-derived contrasts are
+        // unused here (and `None` for the single-isotropic-ψ fast path anyway);
+        // the FROZEN metadata aniso is what the penalty rebuild consumes.
+        let (ls_opt, _aniso_from_psi) = spatial_term_psi_to_length_scale_and_aniso(psi);
+        // Pull the spec-level penalty configuration (which operator orders are
+        // active / double_penalty) — ψ-invariant, frozen at construction.
+        let termspec = self
+            .spec
+            .smooth_terms
+            .get(term_idx)
+            .ok_or_else(|| format!("spatial term {term_idx} out of range for n-free penalty"))?;
+        let term = self
+            .design
+            .smooth
+            .terms
+            .get(term_idx)
+            .ok_or_else(|| format!("realized smooth term {term_idx} out of range"))?;
+        // The per-term penalties live contiguously in the collection penalty
+        // list at the term's `coeff_range` (single-spatial-term collection).
+        let p_total = self.design.design.ncols();
+        let (locals, nullspace_dims): (Vec<Array2<f64>>, Vec<usize>) = match &term.metadata {
+            BasisMetadata::Duchon {
+                centers,
+                identifiability_transform,
+                operator_collocation_points,
+                power,
+                nullspace_order,
+                aniso_log_scales,
+                ..
+            } => {
+                let operator_penalties = match &termspec.basis {
+                    SmoothBasisSpec::Duchon { spec, .. } => spec.operator_penalties.clone(),
+                    _ => crate::basis::DuchonOperatorPenaltySpec::default(),
+                };
+                crate::basis::duchon_penalties_at_length_scale(
+                    centers.view(),
+                    identifiability_transform.as_ref(),
+                    operator_collocation_points.as_ref().map(|p| p.view()),
+                    &operator_penalties,
+                    *power,
+                    *nullspace_order,
+                    aniso_log_scales.as_deref(),
+                    ls_opt,
+                    &mut self.basisworkspace,
+                )
+                .map_err(|e| e.to_string())?
+            }
+            BasisMetadata::Matern {
+                centers,
+                nu,
+                include_intercept,
+                identifiability_transform,
+                aniso_log_scales,
+                nullspace_shrinkage_survived,
+                ..
+            } => {
+                let ls = ls_opt.ok_or_else(|| {
+                    "Matérn n-free penalty re-key requires a finite length-scale".to_string()
+                })?;
+                let double_penalty = match &termspec.basis {
+                    SmoothBasisSpec::Matern { spec, .. } => spec.double_penalty,
+                    _ => true,
+                };
+                crate::basis::matern_penalties_at_length_scale(
+                    centers.view(),
+                    identifiability_transform.as_ref(),
+                    *nu,
+                    *include_intercept,
+                    aniso_log_scales.as_deref(),
+                    *nullspace_shrinkage_survived,
+                    double_penalty,
+                    ls,
+                )
+                .map_err(|e| e.to_string())?
+            }
+            BasisMetadata::ThinPlate {
+                centers,
+                identifiability_transform,
+                ..
+            } => {
+                let ls = ls_opt.ok_or_else(|| {
+                    "thin-plate n-free penalty re-key requires a finite length-scale".to_string()
+                })?;
+                let double_penalty = match &termspec.basis {
+                    SmoothBasisSpec::ThinPlate { spec, .. } => spec.double_penalty,
+                    _ => false,
+                };
+                crate::basis::thin_plate_penalties_at_length_scale(
+                    centers.view(),
+                    identifiability_transform.as_ref(),
+                    ls,
+                    double_penalty,
+                    &mut self.basisworkspace,
+                )
+                .map_err(|e| e.to_string())?
+            }
+            other => {
+                return Err(format!(
+                    "n-free penalty re-key unsupported for basis metadata {:?}",
+                    std::mem::discriminant(other)
+                ));
+            }
+        };
+        // The frozen collection penalties for THIS term are the templates whose
+        // ψ-invariant structure (col_range / prior_mean / structure_hint / op)
+        // we keep, swapping only the numeric `local`. For a single-spatial-term
+        // collection the term owns the whole penalty list.
+        let templates = &self.design.penalties;
+        if templates.len() != locals.len() {
+            return Err(format!(
+                "n-free penalty re-key produced {} blocks but the frozen design carries {} \
+                 — penalty topology is not ψ-stable",
+                locals.len(),
+                templates.len()
+            ));
+        }
+        let specs: Vec<crate::estimate::PenaltySpec> = templates
+            .iter()
+            .zip(locals.into_iter())
+            .map(|(tmpl, local)| {
+                crate::estimate::PenaltySpec::Block {
+                    local,
+                    col_range: tmpl.col_range.clone(),
+                    prior_mean: tmpl.prior_mean.clone(),
+                    structure_hint: tmpl.structure_hint.clone(),
+                    op: tmpl.op.clone(),
+                }
+            })
+            .collect();
+        crate::construction::canonicalize_penalty_specs(
+            &specs,
+            &nullspace_dims,
+            p_total,
+            "nfree-psi-penalty",
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn apply_log_kappa(

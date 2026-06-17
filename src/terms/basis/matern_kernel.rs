@@ -250,6 +250,143 @@ pub fn build_thin_plate_basiswithworkspace(
     })
 }
 
+/// Rebuild the thin-plate (Matérn-blended) penalty list at a NEW `length_scale`
+/// from FROZEN basis geometry — no data rows touched (#1033, n-free per-ψ
+/// penalty re-key). Mirrors the cold penalty assembly in
+/// `build_thin_plate_basiswithworkspace` (the bending + optional ridge built by
+/// [`build_thin_plate_penalty_matrices`], normalized, gauge-restricted through
+/// the frozen identifiability transform, then filtered), but every input is the
+/// already-frozen `BasisMetadata::ThinPlate` (centers, identifiability
+/// transform); only `length_scale` moves.
+///
+/// Returns the per-block penalty matrices (term-local frame, same order/count
+/// the cold build emits) and the active per-block nullspace dims.
+pub(crate) fn thin_plate_penalties_at_length_scale(
+    centers: ArrayView2<'_, f64>,
+    identifiability_transform: Option<&Array2<f64>>,
+    length_scale: f64,
+    double_penalty: bool,
+    workspace: &mut BasisWorkspace,
+) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
+    let internal_kernel_transform =
+        thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
+    let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
+    let (penalty_bending, penalty_ridge) = build_thin_plate_penalty_matrices(
+        centers,
+        length_scale,
+        &internal_kernel_transform,
+        double_penalty,
+    )?;
+    let (penalty_bending_norm, c_bending) = normalize_penalty(&penalty_bending);
+    let mut candidates = vec![PenaltyCandidate {
+        matrix: penalty_bending_norm,
+        nullspace_dim_hint: poly_cols,
+        source: PenaltySource::Primary,
+        normalization_scale: c_bending,
+        kronecker_factors: None,
+        op: None,
+    }];
+    if let Some(penalty_ridge) = penalty_ridge {
+        let (penalty_ridge_norm, c_ridge) = normalize_penalty(&penalty_ridge);
+        candidates.push(PenaltyCandidate {
+            matrix: penalty_ridge_norm,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+            normalization_scale: c_ridge,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+    if let Some(gauge) = identifiability_transform
+        .map(|z| crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]))
+    {
+        candidates = candidates
+            .into_iter()
+            .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+                let matrix = gauge.restrict_penalty(&candidate.matrix);
+                Ok(PenaltyCandidate {
+                    nullspace_dim_hint: candidate.nullspace_dim_hint,
+                    matrix,
+                    source: candidate.source,
+                    normalization_scale: candidate.normalization_scale,
+                    kronecker_factors: None,
+                    op: None,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    let (penalties, nullspace_dims, _info, _eig, _ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok((penalties, nullspace_dims))
+}
+
+/// Rebuild the Matérn penalty list at a NEW `length_scale` from FROZEN basis
+/// geometry — no data rows touched (#1033, n-free per-ψ penalty re-key). Mirrors
+/// the centers-based penalty assembly used by the streaming / lazy arms of
+/// `build_matern_basiswithworkspace` (the only arms a large-n κ fit takes): the
+/// `double_penalty` path builds the projected kernel penalty via
+/// [`build_matern_kernel_penalty`] + [`project_penalty_matrix`] and decides the
+/// nullspace-shrinkage candidate from the FROZEN
+/// `nullspace_shrinkage_survived` decision; the single-penalty path builds the
+/// collocation operator candidates. Both are pure functions of the frozen
+/// centers + identifiability transform + `(nu, include_intercept,
+/// aniso_log_scales)` — only `length_scale` moves.
+///
+/// `full_transform` is reconstructed from the frozen `identifiability_transform`
+/// (= the metadata `z_opt`) exactly as the cold build does: append the intercept
+/// column when `include_intercept`.
+///
+/// Returns the per-block penalty matrices (term-local frame, same order/count
+/// the cold build emits) and the active per-block nullspace dims.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matern_penalties_at_length_scale(
+    centers: ArrayView2<'_, f64>,
+    identifiability_transform: Option<&Array2<f64>>,
+    nu: MaternNu,
+    include_intercept: bool,
+    aniso_log_scales: Option<&[f64]>,
+    nullspace_shrinkage_survived: bool,
+    double_penalty: bool,
+    length_scale: f64,
+) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
+    let full_transform = identifiability_transform.map(|z| {
+        if include_intercept {
+            append_intercept_to_transform(z)
+        } else {
+            z.clone()
+        }
+    });
+    let candidates = if double_penalty {
+        let penalty_kernel = build_matern_kernel_penalty(
+            centers,
+            length_scale,
+            nu,
+            include_intercept,
+            aniso_log_scales,
+        )?;
+        let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
+        // Honor the frozen bootstrap-κ shrinkage decision so the learned-penalty
+        // count stays invariant across the κ-optimizer's per-trial rebuilds.
+        let (candidates, _survived) = matern_double_penalty_candidates_with_decision(
+            &primary,
+            Some(nullspace_shrinkage_survived),
+        )?;
+        candidates
+    } else {
+        build_matern_operator_penalty_candidates(
+            centers,
+            length_scale,
+            nu,
+            include_intercept,
+            identifiability_transform,
+            aniso_log_scales,
+        )?
+    };
+    let (penalties, nullspace_dims, _info, _eig, _ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok((penalties, nullspace_dims))
+}
+
 /// Canonical domain guard for Matérn kernel evaluations: distance `r` must be
 /// finite and non-negative, length scale must be finite and positive. Single
 /// source of truth for the `(r, length_scale)` validity check shared by every
