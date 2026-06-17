@@ -553,15 +553,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // is released before the `&mut self.reml_state` installs below.
         let tensor = std::sync::Arc::clone(tensor);
         let cache = tensor.gaussian_fixed_cache_at(psi);
-        if std::env::var("DIAG1216").is_ok() {
-            let gfro: f64 = cache.xtwx_orig.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let rfro: f64 = cache.xtwy_orig.iter().map(|v| v * v).sum::<f64>().sqrt();
-            eprintln!(
-                "[DIAG1216-INSTALL] installing Gaussian cache at ψ={psi:.6}: \
-                 ‖XtWX‖_F={gfro:.6e} ‖XtWy‖_F={rfro:.6e} ztwz={:.6e}",
-                cache.centered_weighted_y_sq
-            );
-        }
         if !self
             .reml_state
             .install_gaussian_fixed_cache(Arc::new(cache))

@@ -4190,21 +4190,6 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
                 let (cost_t, grad_t, hess_t) =
                     eval_one(&mut tensor_eval, &mut tensor_cache, &theta, with_hessian);
 
-                if std::env::var("DIAG1216").is_ok() {
-                    let cov_grad = tensor_eval.psi_gram_tensor_covers_gradient(psi);
-                    let cov_val = tensor_eval.psi_gram_tensor_covers(psi);
-                    let cr = (cost_s - cost_t).abs() / (1.0 + cost_s.abs());
-                    let gr = grad_s
-                        .iter()
-                        .zip(grad_t.iter())
-                        .fold(0.0_f64, |a, (x, y)| a.max((x - y).abs() / (1.0 + x.abs())));
-                    eprintln!(
-                        "[DIAG1216-GATE] ψ={psi:.4} ρ={:+.2} hess={with_hessian} \
-                         covers_val={cov_val} covers_grad={cov_grad} cost_rel={cr:.2e} grad_rel={gr:.2e}",
-                        rho[0]
-                    );
-                }
-
                 assert!(
                     cost_s.is_finite() && cost_t.is_finite(),
                     "non-finite REML cost at ψ={psi:.4} hessian={with_hessian}: \
@@ -4587,38 +4572,6 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 
             let beta_s = beta_one(&mut streamed_eval, &mut stream_cache, &theta);
             let beta_t = beta_one(&mut tensor_eval, &mut tensor_cache, &theta);
-
-            if std::env::var("DIAG1216").is_ok() {
-                let brel = beta_s
-                    .iter()
-                    .zip(beta_t.iter())
-                    .fold(0.0_f64, |a, (x, y)| a.max((x - y).abs() / (1.0 + x.abs())));
-                let cov_v = tensor_eval.psi_gram_tensor_covers(psi);
-                let cov_g = tensor_eval.psi_gram_tensor_covers_gradient(psi);
-                // Compare the tensor's value Gram against the exact rebuild at
-                // THIS swept ψ (spot_check only sampled 3 golden points), and the
-                // rhs, to localize whether the β̂ shift is a value-Gram error here.
-                // Exact realized design at this ψ, conditioned and reduced to the
-                // SAME frame the tensor Gram lives in (apply the cache's
-                // conditioning + penalty-null reduction is internal; here we use
-                // the raw realized Gram norm as a coarse magnitude reference to
-                // catch a stale-ψ or wrong-magnitude tensor Gram).
-                let gfro_exact = {
-                    let mut bc = make_cache();
-                    let mut tp = theta.clone();
-                    tp[rho_dim] = psi;
-                    bc.ensure_theta(&tp).unwrap();
-                    let d = bc.design().design.clone();
-                    let dd = d.to_dense();
-                    let g = dd.t().dot(&dd);
-                    g.iter().map(|v| v * v).sum::<f64>().sqrt()
-                };
-                eprintln!(
-                    "[DIAG1216-E2E] ψ={psi:.4} ρ={:+.2} β̂rel={brel:.3e} covers_val={cov_v} \
-                     covers_grad={cov_g} raw-exact-‖XtX‖_F={gfro_exact:.6e}",
-                    rho[0],
-                );
-            }
 
             assert_eq!(
                 beta_s.len(),
