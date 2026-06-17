@@ -455,7 +455,7 @@ fn certificate_reports_torus_chart_pinned_by_canonicalization() {
     assert!(term.atoms[0].chart_canonicalized);
 
     let report = term
-        .fit_diagnostics_report(None, false, None)
+        .fit_diagnostics_report(None, false, None, None)
         .expect("diagnostics")
         .residual_gauge;
     let chart = report

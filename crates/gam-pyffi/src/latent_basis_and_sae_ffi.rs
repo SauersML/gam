@@ -2799,16 +2799,23 @@ fn sae_manifold_fit_inner<'py>(
             }
         })
         .collect();
-    let fit_diagnostics = term
-        .fit_diagnostics_report(
-            Some(&ard_variances),
-            isometry_pin_active,
-            Some(shape_uncertainty.dispersion),
-        )
-        .map_err(py_value_error)?;
-
     let mut assignments = term.assignment.assignments();
     let mut fitted = term.fitted();
+    // #1232 — when a hard top-k gate is applied, the smooth optimization model
+    // (full assignments, fitted, penalized loss) differs from the projected
+    // inference model returned on the payload. Capture the optimization-era state
+    // before projection so the payload can expose both layers honestly.
+    let top_k_will_project = top_k.is_some_and(|k_top| k_top < k_atoms);
+    let pre_topk_assignments = if top_k_will_project {
+        Some(assignments.clone())
+    } else {
+        None
+    };
+    let pre_topk_fitted = if top_k_will_project {
+        Some(fitted.clone())
+    } else {
+        None
+    };
     // Apply hard top-k projection per row, then recompute `fitted` from the
     // projected assignments so the returned `assignments` and `fitted` stay
     // mutually consistent (i.e. `fitted == sum_k a_k * decoder_k @ basis_k`).
@@ -2892,6 +2899,16 @@ fn sae_manifold_fit_inner<'py>(
     let trust_diagnostics = term
         .trust_diagnostics_report(assignments.view())
         .map_err(py_value_error)?;
+    // Assignment-support diagnostics (atom lens) must read the SAME assignments
+    // the payload exposes — after any hard top-k projection (#1232).
+    let fit_diagnostics = term
+        .fit_diagnostics_report(
+            Some(&ard_variances),
+            isometry_pin_active,
+            Some(shape_uncertainty.dispersion),
+            Some(assignments.view()),
+        )
+        .map_err(py_value_error)?;
     let log_ard_py = PyList::empty(py);
     for atom_log_ard in &rho.log_ard {
         log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
@@ -2960,7 +2977,23 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("fitted", fitted.into_pyarray(py))?;
     // #1231 — in-sample fit: the score is the negative penalized loss, surfaced
     // honestly as `penalized_loss_score` (NOT `reml_score`) with a breakdown.
+    // When top-k projection is applied, this score describes the SMOOTH
+    // optimization model; the projected inference model is in the top-level
+    // `assignments`/`fitted`/`diagnostics`, with the pre-projection state under
+    // `pre_topk` (#1232).
     sae_set_penalized_loss_items(&out, &loss, "penalized_loss_score")?;
+    if top_k_will_project {
+        out.set_item("top_k_projection_applied", true)?;
+        if let (Some(pre_assignments), Some(pre_fitted)) =
+            (pre_topk_assignments, pre_topk_fitted)
+        {
+            let pre_topk = PyDict::new(py);
+            pre_topk.set_item("assignments_z", pre_assignments.into_pyarray(py))?;
+            pre_topk.set_item("fitted", pre_fitted.into_pyarray(py))?;
+            sae_set_penalized_loss_items(&pre_topk, &loss, "penalized_loss_score")?;
+            out.set_item("pre_topk", pre_topk)?;
+        }
+    }
     let reported_log_alpha = match term.assignment.mode {
         gam::terms::sae::manifold::AssignmentMode::IBPMap { alpha, .. } => alpha.ln(),
         _ => alpha.ln(),

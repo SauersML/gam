@@ -163,7 +163,7 @@ fn lens_flags_loud_represented_not_used_and_quiet_used() {
     // (nonzero), because the Euclidean activation fit represents everything — the
     // loud structure is NOT suppressed.
     let euclid = RowMetric::euclidean(N, P).expect("Euclidean metric must build");
-    let euclid_report = atom_two_lens(&term, &euclid);
+    let euclid_report = atom_two_lens(&term, &euclid, None);
     assert_eq!(
         euclid_report.coupling_provenance,
         Some(MetricProvenance::Euclidean)
@@ -196,7 +196,7 @@ fn lens_flags_loud_represented_not_used_and_quiet_used() {
 
     // --- The additive lens: Fisher enters ONLY here, as a report. ---
     let fisher = output_fisher_metric();
-    let report = atom_two_lens(&term, &fisher);
+    let report = atom_two_lens(&term, &fisher, None);
     assert!(matches!(
         report.coupling_provenance,
         Some(MetricProvenance::OutputFisher { .. })

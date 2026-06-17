@@ -508,9 +508,21 @@ impl SaeManifoldTerm {
         per_atom_ard_variances: Option<&[Option<Array1<f64>>]>,
         isometry_pin_active: bool,
         reconstruction_dispersion: Option<f64>,
+        assignments_override: Option<ArrayView2<'_, f64>>,
     ) -> Result<SaeManifoldFitDiagnostics, String> {
+        if let Some(view) = assignments_override {
+            let n = self.n_obs();
+            let k = self.k_atoms();
+            if view.dim() != (n, k) {
+                return Err(format!(
+                    "fit_diagnostics_report: assignments_override shape {:?} must be ({n}, {k})",
+                    view.dim()
+                ));
+            }
+        }
         let metric = self.diagnostic_metric()?;
-        let atom_two_lens = crate::inference::atom_lens::atom_two_lens(self, &metric);
+        let atom_two_lens =
+            crate::inference::atom_lens::atom_two_lens(self, &metric, assignments_override);
 
         let (certificate_model, streamed_curvature) =
             self.to_residual_gauge_model(metric, per_atom_ard_variances, isometry_pin_active)?;

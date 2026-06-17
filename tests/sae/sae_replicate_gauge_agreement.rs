@@ -299,11 +299,11 @@ fn replicate_fits_agree_up_to_exactly_the_reported_gauge() {
     // ---- residual-gauge certificates (production lowering, Euclidean, no
     // isometry pin: the smallest honest scope) ------------------------------
     let report_a = term_a
-        .fit_diagnostics_report(None, false, None)
+        .fit_diagnostics_report(None, false, None, None)
         .expect("replicate A diagnostics")
         .residual_gauge;
     let report_b = term_b
-        .fit_diagnostics_report(None, false, None)
+        .fit_diagnostics_report(None, false, None, None)
         .expect("replicate B diagnostics")
         .residual_gauge;
 

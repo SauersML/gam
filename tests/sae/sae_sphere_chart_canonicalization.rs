@@ -531,7 +531,7 @@ fn certificate_reports_sphere_chart_pinned_by_canonicalization() {
     );
 
     let report = term
-        .fit_diagnostics_report(None, false, None)
+        .fit_diagnostics_report(None, false, None, None)
         .expect("diagnostics")
         .residual_gauge;
     let chart = report

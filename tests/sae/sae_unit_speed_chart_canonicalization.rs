@@ -349,7 +349,7 @@ fn certificate_reports_chart_pinned_by_canonicalization_with_finite_group() {
     // to the finite isometry group, with the canonicalization provenance —
     // distinct from curvature/penalty pinning.
     let report = term
-        .fit_diagnostics_report(None, false, None)
+        .fit_diagnostics_report(None, false, None, None)
         .expect("diagnostics")
         .residual_gauge;
     let chart = report
