@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const BANNED_PRODUCTION_MARKERS: &[&str] = &[
     "finite difference",
@@ -36,16 +36,37 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn is_test_only_source_file(path: &Path) -> bool {
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    if matches!(file_name, Some("tests.rs" | "test_support.rs"))
+        || file_name.is_some_and(|name| name.ends_with("_tests.rs"))
+    {
+        return true;
+    }
+
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name)
+                if matches!(name.to_str(), Some("tests" | "test_support" | "testing"))
+        )
+    })
+}
+
 fn strip_cfg_test_blocks(source: &str) -> String {
     let mut out = String::new();
     let mut cursor = 0usize;
-    while let Some(rel_attr) = source[cursor..].find("#[cfg(test)]") {
-        let attr_start = cursor + rel_attr;
+    while let Some(attr_start) = find_next_cfg_test_only_attr(source, cursor) {
         out.push_str(&source[cursor..attr_start]);
-        let Some(open_brace) = find_next_code_byte(source, attr_start, b'{') else {
+        let Some(item_delimiter) = find_next_cfg_test_item_delimiter(source, attr_start) else {
             cursor = source.len();
             break;
         };
+        if source.as_bytes()[item_delimiter] == b';' {
+            cursor = item_delimiter + 1;
+            continue;
+        }
+        let open_brace = item_delimiter;
         let Some(block_end) = find_matching_code_brace(source, open_brace) else {
             cursor = source.len();
             break;
@@ -56,7 +77,7 @@ fn strip_cfg_test_blocks(source: &str) -> String {
     out
 }
 
-fn find_next_code_byte(source: &str, start: usize, needle: u8) -> Option<usize> {
+fn find_next_cfg_test_only_attr(source: &str, start: usize) -> Option<usize> {
     let bytes = source.as_bytes();
     let mut i = start;
     while i < bytes.len() {
@@ -77,7 +98,145 @@ fn find_next_code_byte(source: &str, start: usize, needle: u8) -> Option<usize> 
                 let hashes = raw_string_hashes_at(bytes, i).expect("checked raw string");
                 i = skip_raw_string(bytes, i + 1 + hashes + 1, hashes);
             }
-            value if value == needle => return Some(i),
+            b'#' if bytes.get(i..i + 6) == Some(b"#[cfg(") => {
+                let attr_start = i;
+                let Some(attr_end) = bytes[attr_start..]
+                    .iter()
+                    .position(|byte| *byte == b']')
+                    .map(|end| attr_start + end + 1)
+                else {
+                    return None;
+                };
+                if cfg_attr_is_test_only(&source[attr_start..attr_end]) {
+                    return Some(attr_start);
+                }
+                i = attr_end;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+fn cfg_attr_is_test_only(attr: &str) -> bool {
+    let compact: String = attr.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact == "#[cfg(test)]" {
+        return true;
+    }
+
+    let Some(all_args) = compact
+        .strip_prefix("#[cfg(all(")
+        .and_then(|value| value.strip_suffix("))]"))
+    else {
+        return false;
+    };
+    cfg_all_args_have_direct_test_clause(all_args)
+}
+
+fn cfg_all_args_have_direct_test_clause(args: &str) -> bool {
+    let bytes = args.as_bytes();
+    let mut depth = 0usize;
+    let mut arg_start = 0usize;
+    for (i, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                if args[arg_start..i].trim() == "test" {
+                    return true;
+                }
+                arg_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args[arg_start..].trim() == "test"
+}
+
+fn strip_prose(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    out.push('\n');
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let comment_start = i;
+                i = skip_block_comment(bytes, i + 2);
+                preserve_comment_spacing(&source[comment_start..i], &mut out);
+            }
+            b'"' => {
+                i = skip_cooked_string(bytes, i + 1);
+                out.push_str("\"\"");
+            }
+            b'r' if raw_string_hashes_at(bytes, i).is_some() => {
+                let hashes = raw_string_hashes_at(bytes, i).expect("checked raw string");
+                i = skip_raw_string(bytes, i + 1 + hashes + 1, hashes);
+                out.push_str("r\"\"");
+            }
+            _ => {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn preserve_comment_spacing(comment: &str, out: &mut String) {
+    for byte in comment.bytes() {
+        if byte == b'\n' {
+            out.push('\n');
+        }
+    }
+    out.push(' ');
+}
+
+fn find_next_cfg_test_item_delimiter(source: &str, start: usize) -> Option<usize> {
+    find_next_code_byte_where(source, start, |value| matches!(value, b'{' | b';'))
+}
+
+fn find_next_code_byte(source: &str, start: usize, needle: u8) -> Option<usize> {
+    find_next_code_byte_where(source, start, |value| value == needle)
+}
+
+fn find_next_code_byte_where(
+    source: &str,
+    start: usize,
+    mut matches_byte: impl FnMut(u8) -> bool,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = skip_block_comment(bytes, i + 2);
+            }
+            b'"' => {
+                i = skip_cooked_string(bytes, i + 1);
+            }
+            b'r' if raw_string_hashes_at(bytes, i).is_some() => {
+                let hashes = raw_string_hashes_at(bytes, i).expect("checked raw string");
+                i = skip_raw_string(bytes, i + 1 + hashes + 1, hashes);
+            }
+            value if matches_byte(value) => return Some(i),
             _ => i += 1,
         }
     }
@@ -181,17 +340,88 @@ fn skip_block_comment(bytes: &[u8], mut i: usize) -> usize {
 }
 
 #[test]
+fn cfg_test_out_of_line_module_does_not_strip_following_production_item() {
+    let source = r#"
+#[cfg(test)]
+mod tests;
+
+fn production_fd_grad() {
+}
+"#;
+
+    let stripped = strip_cfg_test_blocks(source);
+    assert!(stripped.contains("production_fd_grad"));
+}
+
+#[test]
+fn cfg_all_test_module_is_stripped_but_cfg_any_test_module_is_not() {
+    let test_only = r#"
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    fn fd_grad() {}
+}
+
+fn production_code() {}
+"#;
+    let not_test_only = r#"
+#[cfg(any(test, feature = "diagnostics"))]
+fn production_visible_fd_grad() {}
+"#;
+
+    let stripped_test_only = strip_cfg_test_blocks(test_only);
+    assert!(!stripped_test_only.contains("fd_grad"));
+    assert!(stripped_test_only.contains("production_code"));
+
+    let stripped_not_test_only = strip_cfg_test_blocks(not_test_only);
+    assert!(stripped_not_test_only.contains("production_visible_fd_grad"));
+}
+
+#[test]
+fn test_only_source_file_classification_covers_out_of_line_test_modules() {
+    for path in [
+        "src/families/gamlss/tests.rs",
+        "src/solver/estimate/continuous_order_tests.rs",
+        "src/families/custom_family/test_support.rs",
+        "src/test_support/fd_checker.rs",
+        "src/testing/mod.rs",
+        "src/foo/tests/bar.rs",
+    ] {
+        assert!(is_test_only_source_file(Path::new(path)), "{path}");
+    }
+
+    assert!(!is_test_only_source_file(Path::new(
+        "src/inference/quadrature.rs"
+    )));
+}
+
+#[test]
+fn production_marker_scan_ignores_comment_prose() {
+    let source = r#"
+//! exact composition: no finite differences anywhere
+fn production_code() {
+    let message = "finite-difference fallback is forbidden here";
+    let fd_grad = 1.0;
+}
+"#;
+
+    let production = strip_prose(&strip_cfg_test_blocks(source)).to_lowercase();
+    assert!(!production.contains("finite difference"));
+    assert!(!production.contains("finite-difference"));
+    assert!(production.contains("fd_"));
+}
+
+#[test]
 fn production_code_has_no_finite_difference_markers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     collect_rust_files(&root.join("src"), &mut files);
     let mut violations = Vec::new();
     for path in files {
-        if path.ends_with("src/testing/mod.rs") {
+        if is_test_only_source_file(&path) {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read source file");
-        let production = strip_cfg_test_blocks(&source).to_lowercase();
+        let production = strip_prose(&strip_cfg_test_blocks(&source)).to_lowercase();
         for marker in BANNED_PRODUCTION_MARKERS {
             if production.contains(marker) {
                 violations.push(format!("{} contains `{}`", path.display(), marker));
