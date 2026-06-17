@@ -2381,4 +2381,60 @@ mod tests {
             "threshold keeps exactly its `age` column after the intercept drop",
         );
     }
+
+    /// TEMP instrumentation (#1197): dump the audit verdict + canonicalize
+    /// outcome for the AFT stacked-geometry case so we can see the runtime
+    /// drop attribution + reduced widths (and whether the MAP check fires).
+    /// Delete once #1197 is confirmed fixed.
+    #[test]
+    fn debug_1197_aft_stacked_geometry_dump() {
+        let n = 96;
+        let x = linspace(n);
+        let age: Vec<f64> = (0..n)
+            .map(|i| (i as f64) - (n as f64 - 1.0) / 2.0)
+            .collect();
+        let mut time_exit = Array2::<f64>::zeros((n, 2));
+        let mut time_stacked = Array2::<f64>::zeros((3 * n, 2));
+        for i in 0..n {
+            time_exit[[i, 0]] = 1.0;
+            time_exit[[i, 1]] = x[i];
+            time_stacked[[i, 0]] = 1.0;
+            time_stacked[[i, 1]] = 0.5 * x[i];
+            time_stacked[[n + i, 0]] = 1.0;
+            time_stacked[[n + i, 1]] = x[i];
+            time_stacked[[2 * n + i, 0]] = 0.0;
+            time_stacked[[2 * n + i, 1]] = 1.0;
+        }
+        let mut threshold = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            threshold[[i, 0]] = 1.0;
+            threshold[[i, 1]] = age[i];
+        }
+        let mut t_spec = spec_from_dense("time_transform", time_exit);
+        t_spec.gauge_priority = 200;
+        t_spec.stacked_design = Some(DesignMatrix::Dense(DenseDesignMatrix::from(time_stacked)));
+        t_spec.stacked_offset = Some(Array1::<f64>::zeros(3 * n));
+        let mut th_spec = spec_from_dense("threshold", threshold);
+        th_spec.gauge_priority = 150;
+        let specs = [t_spec, th_spec];
+
+        let audit = crate::identifiability::audit::audit_identifiability(&specs)
+            .expect("audit ok");
+        let canon = match canonicalize_for_identifiability(&specs) {
+            Ok(c) => format!(
+                "OK dropped={:?} reduced=[{}]",
+                c.audit.dropped_columns,
+                c.reduced_specs
+                    .iter()
+                    .map(|s| format!("{}={}", s.name, s.design.ncols()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(e) => format!("ERR {e:?}"),
+        };
+        panic!(
+            "DIAG1197 audit.fatal={} audit.dropped={:?} aliased={:?} summary={} || canon={}",
+            audit.fatal, audit.dropped_columns, audit.aliased_pairs, audit.summary, canon
+        );
+    }
 }
