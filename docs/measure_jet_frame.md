@@ -59,11 +59,6 @@ the frame construction below generalizes that path.
   Support curves, Gaussian Gram entries at other queries, and Gaussian
   `XᵀWX` products with moved kernels require their own kernel pass or a
   certified approximation; order-2 moments alone cannot determine them.
-- Repo seams: third moment substrate sibling to `gpu/cubic_cell`
-  (host_substrate / kernel_src / device NVRTC layout) and the `bms`
-  chunked-row-reduction streaming pattern. CPU streaming reference lands
-  first (`measure_jet_moments.rs`); the GPU sibling follows the existing
-  NVRTC pattern.
 
 ## 3. Solver: one factorization, everything exact
 
@@ -94,7 +89,7 @@ the frame construction below generalizes that path.
   tight `tol=1e-10` can leave it mid-descent at the iteration cap where the
   CLI's looser tolerance converges) **or** certifies a candidate that worsens
   the profiled REML score, the fit **degrades to the frozen baseline geometry**
-  rather than aborting the parent fit (#1126). Only a genuine non-finite
+  rather than aborting the parent fit. Only a genuine non-finite
   terminal cost surfaces as an error; ordinary slow κ-convergence is no longer
   fatal.
 - Density normalization: on a p-dimensional stratum with sampling density
@@ -104,7 +99,7 @@ the frame construction below generalizes that path.
   The fixed-order implementation uses `ε^{-[2s+p(2−2α)]}` with the available
   dimension parameter so the advertised smoothness order does not silently
   change with `α`.
-- NEW: learned anisotropy A = LLᵀ as a ψ-block (Hermite-derivative moments,
+- Learned anisotropy A = LLᵀ as a ψ-block (Hermite-derivative moments,
   one pass per step); per-coordinate noise scales can feed the
   rank-revealing projection threshold and certificate budget — the formal
   license for low-precision moment inputs without adding an affine ridge.
@@ -150,7 +145,7 @@ and interval become one statement.
   crossover; nets keep all-arm cells at stars so shared-jet coupling
   emerges.
 
-## 7. Acceptance gates (all existing gates kept verbatim; these are added)
+## 7. Acceptance gates
 
 1. Exact affine pass-through at the default settings.
 2. Off-support variance growth: posterior variance plus `Var_extrap` obeys the support-domination
@@ -163,22 +158,3 @@ and interval become one statement.
 6. Certificates printed per fit: truncation, frame ratio,
    refine-one-level delta, backward error — tolerances budgeted at
    δ·min_T se(T).
-
-## 8. Slice order (each lands tree-consistent)
-
-1. `measure_jet_moments.rs`: CPU streaming moment tables + binomial-shift
-   monoid + closed-form frozen-weight polynomial couplings, oracle-tested
-   against direct assembly. (No consumer change yet; the substrate.)
-2. Estimand-level acceptance gates that don't wait for the frame basis
-   (near-miss decoupling; scale smoke on the current path).
-3. §5 extrapolation-variance seam: pure function + predict-side wiring
-   plan; fuse when the frame basis lands.
-4. Jet-frame basis mode (per-level nets → atoms, lifting, unpenalized
-   head) behind the same `mjs()` surface; the multiscale per-level candidates
-   become the structural diagonal (the single-scale default stays one fused
-   penalty); the Gaussian-representer path retired the moment the frame path passes
-   every existing gate (no parallel layers kept).
-5. Arrow/Schur whitened solver wiring; spectral identities; certificates.
-6. GPU moment substrate (NVRTC sibling); A-metric ψ-block; r = 3.
-7. Manifold-SAE hybrid: frozen x-only `latent_coord`/SAE frames into the
-   metric slot; evidence adjudicates the learned chart.
