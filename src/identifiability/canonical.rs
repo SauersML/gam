@@ -1693,6 +1693,79 @@ mod tests {
         s
     }
 
+    /// TEMP instrumentation (#933 debug): dump the audit + canonicalize internals
+    /// for the failing callback-owned same-channel overlap so we can see WHY the
+    /// MAP uniqueness check fires. Run with:
+    ///   cargo test -p <crate> debug_933_callback_overlap_dump -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn debug_933_callback_overlap_dump() {
+        use crate::families::custom_family::FamilyLinearizationState;
+
+        let n = 48;
+        let x = linspace(n);
+        let mut anchor = Array2::<f64>::zeros((n, 2));
+        let mut callback_owned = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            anchor[[i, 0]] = 1.0;
+            anchor[[i, 1]] = x[i];
+            callback_owned[[i, 0]] = x[i];
+            callback_owned[[i, 1]] = x[i] * x[i];
+        }
+
+        let anchor_spec = spec_from_dense_with_priority("marginal_surface", anchor, 150);
+        let mut callback_spec =
+            spec_from_dense_with_priority("logslope_surface", callback_owned.clone(), 120);
+        let raw_callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(AdditiveBlockJacobian {
+            design: callback_owned.clone(),
+            own_output: 0,
+            n_family_outputs: 1,
+        });
+        callback_spec.jacobian_callback = Some(Arc::clone(&raw_callback));
+        let specs = [anchor_spec, callback_spec];
+
+        // 1) Run the flat audit directly and dump its verdict.
+        let audit = crate::identifiability::audit::audit_identifiability(&specs)
+            .expect("audit must not error");
+        eprintln!("=== AUDIT ===");
+        eprintln!("fatal           = {}", audit.fatal);
+        eprintln!("dropped_columns = {:?}", audit.dropped_columns);
+        eprintln!("aliased_pairs   = {:?}", audit.aliased_pairs);
+        for b in &audit.blocks {
+            eprintln!(
+                "block {:>18}: orig={} eff={} range_rank={}",
+                b.block_name, b.original_dim, b.effective_dim, b.design_range_rank
+            );
+        }
+        eprintln!("summary         = {}", audit.summary);
+
+        // 2) Run canonicalize and dump the outcome (Ok vs Err).
+        eprintln!("=== CANONICALIZE ===");
+        match canonicalize_for_identifiability(&specs) {
+            Ok(canon) => {
+                eprintln!("OK");
+                eprintln!("audit.dropped   = {:?}", canon.audit.dropped_columns);
+                for (i, rs) in canon.reduced_specs.iter().enumerate() {
+                    eprintln!(
+                        "reduced_spec[{i}] {:>18}: design.ncols={} has_cb={}",
+                        rs.name,
+                        rs.design.ncols(),
+                        rs.jacobian_callback.is_some(),
+                    );
+                }
+                let _ = FamilyLinearizationState {
+                    beta: &[],
+                    family_scalars: None,
+                    channel_hessian: None,
+                    probit_frailty_scale: 1.0,
+                };
+            }
+            Err(e) => {
+                eprintln!("ERR = {e:?}");
+            }
+        }
+    }
+
     /// #933: a `jacobian_callback`-only block (no `stacked_design`) whose audit
     /// attributes a dropped column is now SAFELY REDUCED rather than kept at raw
     /// width. The callback is wrapped in `GaugeComposedJacobian` so its effective
