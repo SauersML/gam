@@ -236,6 +236,78 @@ impl SoftmaxAssignmentSparsityPenalty {
         }
         dh
     }
+
+    /// Per-row softmax **Fisher-information metric** `G = scale·(diag(a) − a aᵀ)`
+    /// over the row's logits, with `a = softmax(row_logits)` and
+    /// `scale = λ/τ²` (#1190). Returns the symmetric `K×K` block
+    ///
+    /// ```text
+    ///   G_kj = scale·a_k·(δ_kj − a_j).
+    /// ```
+    ///
+    /// This is the PSD curvature operator the manifold-SAE evidence Hessian uses
+    /// in place of the (indefinite) exact entropy Hessian
+    /// [`Self::row_dense_hessian`]. `G` is a covariance/Gram matrix, hence
+    /// exactly PSD and smooth in the logits, so the per-row evidence block stays
+    /// PD by construction and the downstream Faddeev–Popov deflation never fires
+    /// on the entropy block. Because the entropy penalty is a FIXED prior whose
+    /// stationary point is set by its (unchanged) EXACT gradient, substituting
+    /// its curvature with the Fisher metric only conditions the Newton step and
+    /// the Laplace normalizer's curvature operator — it does NOT move the
+    /// optimum (a fixed-prior curvature majorization, exactly like the ARD
+    /// `prior.hess.max(0.0)` precedent). The criterion's `log|H|`, its θ-adjoint
+    /// [`Self::row_fisher_metric_logit_derivative`], and the assembled Hessian
+    /// all differentiate this SAME operator `G`, keeping value and adjoint on
+    /// one exact branch.
+    #[must_use]
+    pub fn row_fisher_metric(&self, row_logits: &[f64], scale: f64) -> Array2<f64> {
+        let k = self.k_atoms;
+        let a = self.softmax_row(row_logits);
+        let mut g = Array2::<f64>::zeros((k, k));
+        for kk in 0..k {
+            for jj in 0..k {
+                let indicator = if kk == jj { 1.0 } else { 0.0 };
+                g[[kk, jj]] = scale * a[kk] * (indicator - a[jj]);
+            }
+        }
+        g
+    }
+
+    /// Derivative of the per-row softmax Fisher metric
+    /// [`Self::row_fisher_metric`] with respect to a single row logit `z_w`,
+    /// scaled by `scale = λ/τ²` (#1190). Returns the symmetric `K×K` block
+    /// `∂G_kj/∂z_w`, the third-derivative tensor slice the θ-adjoint contracts
+    /// against the row's selected inverse so the adjoint differentiates the SAME
+    /// PSD `G = scale·(diag(a) − a aᵀ)` the assembly added (value/adjoint on one
+    /// branch, no deflation needed). Built from the SAME softmax derivative
+    /// convention as [`Self::row_dense_hessian_logit_derivative`]
+    /// (`∂a_r/∂z_w = a_r(δ_rw − a_w)/τ`). For `G_kj = scale·a_k(δ_kj − a_j)`,
+    /// the product rule gives
+    /// `∂G_kj/∂z_w = scale·[ (∂a_k/∂z_w)(δ_kj − a_j) − a_k(∂a_j/∂z_w) ]`.
+    #[must_use]
+    pub fn row_fisher_metric_logit_derivative(
+        &self,
+        row_logits: &[f64],
+        scale: f64,
+        w: usize,
+    ) -> Array2<f64> {
+        let k = self.k_atoms;
+        let inv_tau = 1.0 / self.temperature;
+        let a = self.softmax_row(row_logits);
+        // ∂a_r/∂z_w = a_r (δ_rw − a_w)/τ — identical convention to the entropy
+        // Hessian derivative above.
+        let da: Vec<f64> = (0..k)
+            .map(|r| a[r] * (if r == w { 1.0 } else { 0.0 } - a[w]) * inv_tau)
+            .collect();
+        let mut dg = Array2::<f64>::zeros((k, k));
+        for kk in 0..k {
+            for jj in 0..k {
+                let indicator = if kk == jj { 1.0 } else { 0.0 };
+                dg[[kk, jj]] = scale * (da[kk] * (indicator - a[jj]) - a[kk] * da[jj]);
+            }
+        }
+        dg
+    }
 }
 
 impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {

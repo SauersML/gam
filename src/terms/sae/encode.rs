@@ -1281,12 +1281,24 @@ impl EncodeAtlas {
             .atoms
             .get(atom_index)
             .ok_or_else(|| format!("certified_encode_row: atom {atom_index} not in atlas"))?;
-        let evaluator = atom
-            .basis_evaluator
-            .as_ref()
-            .ok_or_else(|| format!("certified_encode_row: atom {atom_index} has no evaluator"))?
-            .clone();
         let d = atom.latent_dim;
+        // A missing basis evaluator means the amortized/cold predictor cannot fire
+        // for this atom (e.g. a frozen-baseline or first-build atom that never
+        // attached a distilled evaluator). That is exactly the "cannot certify"
+        // state — flag the row uncertified (zeros coords, ∞ certificate) so the
+        // upstream exact multi-start solve owns it, never a hard error that aborts
+        // the whole criterion. Mirrors the no-chart / singular-Jacobian branches.
+        let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
+            return Ok((
+                Array1::<f64>::zeros(d),
+                RowCertificate {
+                    beta: f64::INFINITY,
+                    eta: f64::INFINITY,
+                    lipschitz: f64::INFINITY,
+                    h: f64::INFINITY,
+                },
+            ));
+        };
 
         // Route to the nearest chart center (ambient routing happens upstream via
         // sae_candidate_index; here we pick the in-atom chart). Without a chart we
@@ -1372,11 +1384,6 @@ impl EncodeAtlas {
             .atoms
             .get(atom_index)
             .ok_or_else(|| format!("amortized_encode_row: atom {atom_index} not in atlas"))?;
-        let evaluator = atom
-            .basis_evaluator
-            .as_ref()
-            .ok_or_else(|| format!("amortized_encode_row: atom {atom_index} has no evaluator"))?
-            .clone();
         let d = atom.latent_dim;
         let uncertified = || {
             (
@@ -1388,6 +1395,14 @@ impl EncodeAtlas {
                     h: f64::INFINITY,
                 },
             )
+        };
+        // A missing basis evaluator means the distilled predictor cannot fire for
+        // this atom — flag the row uncertified (the exact upstream solve owns it)
+        // rather than erroring, exactly as the no-chart / singular-Jacobian /
+        // non-positive-amplitude branches below do. Never a silent wrong encode,
+        // never a hard abort of the criterion.
+        let Some(evaluator) = atom.basis_evaluator.as_ref().cloned() else {
+            return Ok(uncertified());
         };
         let Some((chart_idx, _)) = nearest_chart(atom_atlas, x, atom, evaluator.as_ref()) else {
             return Ok(uncertified());

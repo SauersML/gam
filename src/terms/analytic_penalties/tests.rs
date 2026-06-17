@@ -162,6 +162,58 @@ fn softmax_row_dense_hessian_logit_derivative_matches_finite_difference() {
 }
 
 #[test]
+fn softmax_row_fisher_metric_is_psd_gauge_null_and_derivative_matches_fd() {
+    // #1190: the softmax Fisher metric `G = scale·(diag(a) − a aᵀ)` is the PSD
+    // curvature operator the manifold-SAE evidence Hessian uses in place of the
+    // indefinite entropy Hessian. It must be (a) symmetric PSD (all eigenvalues
+    // >= 0), (b) gauge-null (`G·𝟙 = 0`, softmax shift-invariance), and (c) its
+    // θ-derivative must match a central finite difference of `G` so the
+    // assembly, log|H|, and adjoint stay on one exact branch.
+    use crate::linalg::faer_ndarray::FaerEigh;
+    let pen = SoftmaxAssignmentSparsityPenalty::new(4, 0.8);
+    let row = [0.3_f64, -0.6, 0.9, 0.2];
+    let scale = 1.1_f64 * (1.0 / 0.8_f64) * (1.0 / 0.8_f64);
+    let g = pen.row_fisher_metric(&row, scale);
+    // (a) symmetric.
+    for i in 0..4 {
+        for j in 0..4 {
+            assert_abs_diff_eq!(g[[i, j]], g[[j, i]], epsilon = 1e-12);
+        }
+    }
+    // (a) PSD: every eigenvalue >= -tiny round-off.
+    let (evals, _) = g.eigh(faer::Side::Lower).expect("eigh");
+    let max_abs = evals.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1.0);
+    for &lambda in evals.iter() {
+        assert!(
+            lambda >= -1e-10 * max_abs,
+            "Fisher metric must be PSD; got eigenvalue {lambda}"
+        );
+    }
+    // (b) gauge null: G·𝟙 = 0.
+    for i in 0..4 {
+        let row_sum: f64 = (0..4).map(|j| g[[i, j]]).sum();
+        assert_abs_diff_eq!(row_sum, 0.0, epsilon = 1e-12);
+    }
+    // (c) derivative matches central FD.
+    let eps = 1e-6;
+    for w in 0..4 {
+        let dg = pen.row_fisher_metric_logit_derivative(&row, scale, w);
+        let mut rp = row;
+        let mut rm = row;
+        rp[w] += eps;
+        rm[w] -= eps;
+        let gp = pen.row_fisher_metric(&rp, scale);
+        let gm = pen.row_fisher_metric(&rm, scale);
+        for i in 0..4 {
+            for j in 0..4 {
+                let fd = (gp[[i, j]] - gm[[i, j]]) / (2.0 * eps);
+                assert_abs_diff_eq!(dg[[i, j]], fd, epsilon = 1e-6);
+            }
+        }
+    }
+}
+
+#[test]
 fn ibp_assignment_grad_target_matches_value_finite_difference() {
     let pen = IBPAssignmentPenalty::new(4, 6.0, 0.8, false);
     let t = array![

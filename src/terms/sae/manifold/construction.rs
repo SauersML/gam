@@ -2365,12 +2365,17 @@ impl SaeManifoldTerm {
         let mut uncertified = 0usize;
         for atom_idx in 0..k_atoms {
             let atom = &self.atoms[atom_idx];
-            let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
-                format!(
-                    "SaeManifoldTerm::amortized_encoder_consistency: atom {atom_idx} has no basis evaluator"
-                )
-            })?;
             let result = &encodes[atom_idx];
+            // An atom with no basis evaluator cannot decode an amortized
+            // reconstruction; every one of its rows is necessarily uncertified
+            // (the encode flagged them all), so it contributes nothing to the
+            // amortized recon and its full row-count to the uncertified tally.
+            // Count it and skip the decode rather than erroring — the consistency
+            // fold stays a bounded penalty, never a hard abort of the criterion.
+            let Some(evaluator) = atom.basis_evaluator.as_ref() else {
+                uncertified += n;
+                continue;
+            };
             uncertified += result.encode_uncertified_count;
             // Decode the amortized coords: Φ_k(t̂) is (n × M_k); B_k is (M_k × p).
             let (phi, _jac) = evaluator.evaluate(result.coords.view())?;
@@ -3769,24 +3774,38 @@ impl SaeManifoldTerm {
                             block.gt[free_idx] += assignment_grad[assignment_base + free_idx];
                         }
                         if let Some((penalty, scale)) = softmax_dense.as_ref() {
-                            // #1038: write the EXACT dense entropy Hessian (diagonal +
-                            // off-diagonals) onto the row's logit block. Softmax uses
-                            // the REDUCED K−1 free-logit chart (the last reference logit
-                            // is fixed at 0, `assignment_coord_dim() = K−1`), which
-                            // already removes the shift-gauge null. Holding z_{K-1}
-                            // fixed, the reduced Hessian over the free logits 0..K−1 is
-                            // exactly the top-left (K−1)×(K−1) submatrix of the full
-                            // K×K dense entropy Hessian (the fixed logit contributes no
-                            // row/column to the free curvature). Summing it onto the
-                            // data-fit `htt` keeps the block PD for the Cholesky factor,
-                            // and the dense Cholesky makes `log|H|` carry it exactly (no
-                            // separate Woodbury — `htt` is already a small dense per-row
-                            // factor). Its diagonal equals `assignment_hdiag` for these
-                            // logits, so we skip the diagonal-only add above.
+                            // #1190: write the PSD softmax Fisher-information metric
+                            // `G = scale·(diag(a) − a aᵀ)` onto the row's logit block in
+                            // place of the EXACT entropy Hessian. The entropy Hessian is
+                            // INDEFINITE (concave directions on long-tailed rows), which
+                            // drove the per-row evidence block non-PD and forced the
+                            // downstream Faddeev–Popov deflation to flatten data-relevant
+                            // logit directions (under-identifying the atoms) while leaving
+                            // value/adjoint on two branches (log|H| read the deflated
+                            // factor; the θ-adjoint differentiated the raw dense Hessian).
+                            // `G` is a covariance/Gram, hence exactly PSD and smooth in the
+                            // logits, so the block is PD by construction and the deflation
+                            // no longer fires on the entropy block. Because the entropy
+                            // penalty is a FIXED prior whose stationary point is set by its
+                            // (unchanged) EXACT gradient, substituting its curvature with
+                            // the Fisher metric only conditions the Newton step and the
+                            // Laplace normalizer's curvature operator — it does NOT move the
+                            // optimum (a fixed-prior curvature majorization, exactly like
+                            // the ARD `prior.hess.max(0.0)` precedent ~line 3848).
+                            //
+                            // Softmax uses the REDUCED K−1 free-logit chart (the last
+                            // reference logit is fixed at 0, `assignment_coord_dim() = K−1`).
+                            // Holding z_{K-1} fixed, the reduced curvature over the free
+                            // logits 0..K−1 is exactly the top-left (K−1)×(K−1) submatrix of
+                            // the full K×K metric (the fixed logit contributes no row/column
+                            // to the free curvature). The criterion's `log|H|` and the
+                            // #1006 θ-adjoint differentiate this SAME `G` (see the
+                            // `row_fisher_metric_logit_derivative` site below), so value and
+                            // adjoint stay on one exact branch.
                             let row_logits: Vec<f64> = (0..k_atoms)
                                 .map(|k| self.assignment.logits[[row, k]])
                                 .collect();
-                            let h_dense = penalty.row_dense_hessian(&row_logits, *scale);
+                            let h_dense = penalty.row_fisher_metric(&row_logits, *scale);
                             for ki in 0..assignment_dim {
                                 for kj in 0..assignment_dim {
                                     block.htt[[ki, kj]] += h_dense[[ki, kj]];
@@ -6392,7 +6411,14 @@ impl SaeManifoldTerm {
                     .map(|k| self.assignment.logits[[row, k]])
                     .collect();
                 // ∂H/∂ρ over this row's free-logit block (position j ↔ atom j).
-                let dh_rho = penalty.row_dense_hessian(&row_logits, scale);
+                // #1190: the assembled curvature block is the softmax Fisher metric
+                // `G = scale·(diag(a) − a aᵀ)` (the PSD operator that replaced the
+                // indefinite entropy Hessian). `scale = λ_sparse·sparsity/τ²` is
+                // linear in `λ_sparse = exp(ρ)`, so `∂(scale·G)/∂ρ = scale·G = G`
+                // evaluated at the current scale — differentiate the SAME operator
+                // the assembly and θ-adjoint use so the ρ-gradient stays on one
+                // branch.
+                let dh_rho = penalty.row_fisher_metric(&row_logits, scale);
                 for kj in 0..logit_dim {
                     let mut rhs_t = Array1::<f64>::zeros(total_t);
                     let rhs_beta = Array1::<f64>::zeros(cache.k);
@@ -7404,13 +7430,16 @@ impl SaeManifoldTerm {
                 }
             }
 
-            // #1038: when `w` is a logit and the assignment is softmax, the dense
-            // entropy Hessian's full θ-derivative `∂H_{k,j}/∂z_w` (diagonal AND
-            // off-diagonal) is the SAME `(a,L,m)`-derived tensor the assembly and
-            // logdet use. Compute it once per logit `w` and add it at every logit
-            // pair `(a,b)` below. The diagonal softmax case is therefore handled
-            // here, NOT in `assignment_prior_hdiag_derivative_entry` (which returns
-            // 0 for softmax to avoid double-counting).
+            // #1190: when `w` is a logit and the assignment is softmax, the per-row
+            // softmax Fisher-metric `G = scale·(diag(a) − a aᵀ)` is what the assembly
+            // wrote into `htt` (the PSD curvature operator that replaces the
+            // indefinite exact entropy Hessian). Its full θ-derivative `∂G_{k,j}/∂z_w`
+            // (diagonal AND off-diagonal) is the SAME `a`-derived tensor the assembly
+            // and logdet now differentiate, so value and adjoint stay on ONE exact
+            // branch. Compute it once per logit `w` and add it at every logit pair
+            // `(a,b)` below. The diagonal softmax case is therefore handled here, NOT
+            // in `assignment_prior_hdiag_derivative_entry` (which returns 0 for
+            // softmax to avoid double-counting).
             let row_logits_softmax: Option<Vec<f64>> = softmax_dense_adjoint.as_ref().map(|_| {
                 (0..k_atoms)
                     .map(|k| self.assignment.logits[[row, k]])
@@ -7424,7 +7453,7 @@ impl SaeManifoldTerm {
                     jets.vars[w],
                 ) {
                     (Some((penalty, scale)), Some(row_logits), SaeLocalRowVar::Logit { atom }) => {
-                        Some(penalty.row_dense_hessian_logit_derivative(row_logits, *scale, atom))
+                        Some(penalty.row_fisher_metric_logit_derivative(row_logits, *scale, atom))
                     }
                     _ => None,
                 };
