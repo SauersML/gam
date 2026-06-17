@@ -243,19 +243,16 @@ pub(crate) struct SurvivalLsRowKernel<'a> {
     pub(crate) offsets: Vec<usize>,
 }
 
-/// Per-index `(D, D2, D3)` map-derivative tensors for one row, plus the
+/// Per-index `(D, D2)` map-derivative tensors for one row, plus the
 /// index-space log-likelihood derivatives. `D[i][a] = ∂(index i)/∂(channel a)`,
-/// `D2[i][a][b] = ∂²(index i)/∂a∂b`, `D3[i][a][b][c] = ∂³(index i)/∂a∂b∂c`.
+/// `D2[i][a][b] = ∂²(index i)/∂a∂b`.
 pub(crate) struct SlsRowMaps {
     /// ell_i  = (ell_u0, ell_u1, ell_g)
     pub(crate) l1: [f64; 3],
     /// ell_ii = (ell_u0u0, ell_u1u1, ell_gg)
     pub(crate) l2: [f64; 3],
-    /// ell_iii = (ell_u0u0u0, ell_u1u1u1, ell_ggg)
-    pub(crate) l3: [f64; 3],
     pub(crate) d: [[f64; SLS_ROW_K]; 3],
     pub(crate) d2: [[[f64; SLS_ROW_K]; SLS_ROW_K]; 3],
-    pub(crate) d3: [[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]; 3],
 }
 
 impl SurvivalLsRowKernel<'_> {
@@ -270,39 +267,20 @@ impl SurvivalLsRowKernel<'_> {
     }
 
     /// Build the per-row index/map derivative tensors from the cached scalars.
-    /// Symmetric `D2`/`D3` entries are written in every permuted slot so the
+    /// Symmetric `D2` entries are written in both slots so the
     /// uniform accumulation loops never have to special-case ordering.
     pub(crate) fn row_maps(&self, row: usize) -> SlsRowMaps {
         let q = self.q;
         let mut m = SlsRowMaps {
             l1: [q.d1_q0[row], q.d1_q1[row], q.d1_qdot1[row]],
             l2: [q.d2_q0[row], q.d2_q1[row], q.d2_qdot1[row]],
-            // ell_ggg = w·d·d3_log_g = -d_h_d (d_h_d stores the NLL-sign value).
-            l3: [q.d3_q0[row], q.d3_q1[row], -q.d_h_d[row]],
             d: [[0.0; SLS_ROW_K]; 3],
             d2: [[[0.0; SLS_ROW_K]; SLS_ROW_K]; 3],
-            d3: [[[[0.0; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]; 3],
         };
         // helper closures to set symmetric entries
         let set2 = |t: &mut [[f64; SLS_ROW_K]; SLS_ROW_K], a: usize, b: usize, v: f64| {
             t[a][b] = v;
             t[b][a] = v;
-        };
-        let set3 = |t: &mut [[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K],
-                    a: usize,
-                    b: usize,
-                    c: usize,
-                    v: f64| {
-            for &(i, j, k) in &[
-                (a, b, c),
-                (a, c, b),
-                (b, a, c),
-                (b, c, a),
-                (c, a, b),
-                (c, b, a),
-            ] {
-                t[i][j][k] = v;
-            }
         };
 
         // Entry-side q-chain derivatives are always populated (equal to the
@@ -319,16 +297,6 @@ impl SurvivalLsRowKernel<'_> {
             .d2q_ls_entry
             .as_ref()
             .map_or(q.d2q_ls[row], |a| a[row]);
-        let d3q_tls_ls_en = self
-            .q
-            .d3q_tls_ls_entry
-            .as_ref()
-            .map_or(q.d3q_tls_ls[row], |a| a[row]);
-        let d3q_ls_en = self
-            .q
-            .d3q_ls_entry
-            .as_ref()
-            .map_or(q.d3q_ls[row], |a| a[row]);
 
         // Index 0: u0 = h0 + q0(eta_t_entry=ch4, eta_ls_entry=ch7).
         m.d[0][0] = 1.0;
@@ -336,8 +304,6 @@ impl SurvivalLsRowKernel<'_> {
         m.d[0][7] = dq_ls_en;
         set2(&mut m.d2[0], 4, 7, d2q_tls_en);
         m.d2[0][7][7] = d2q_ls_en;
-        set3(&mut m.d3[0], 4, 7, 7, d3q_tls_ls_en);
-        m.d3[0][7][7][7] = d3q_ls_en;
 
         // Index 1: u1 = h1 + q1(eta_t_exit=ch3, eta_ls_exit=ch6).
         m.d[1][1] = 1.0;
@@ -345,8 +311,6 @@ impl SurvivalLsRowKernel<'_> {
         m.d[1][6] = q.dq_ls[row];
         set2(&mut m.d2[1], 3, 6, q.d2q_tls[row]);
         m.d2[1][6][6] = q.d2q_ls[row];
-        set3(&mut m.d3[1], 3, 6, 6, q.d3q_tls_ls[row]);
-        m.d3[1][6][6][6] = q.d3q_ls[row];
 
         // Index 2: g = d_raw + qdot1(eta_t_exit=ch3, eta_t_deriv=ch5,
         // eta_ls_exit=ch6, eta_ls_deriv=ch8).
@@ -362,11 +326,6 @@ impl SurvivalLsRowKernel<'_> {
         m.d2[2][6][6] = q.d2qdot_ls[row];
         set2(&mut m.d2[2], 6, 5, q.d2qdot_lstd[row]);
         set2(&mut m.d2[2], 6, 8, q.d2qdot_lslsd[row]);
-        set3(&mut m.d3[2], 3, 6, 6, q.d3qdot_tls_ls[row]);
-        set3(&mut m.d3[2], 3, 6, 8, q.d3qdot_tls_lsd[row]);
-        set3(&mut m.d3[2], 5, 6, 6, q.d3qdot_td_ls_ls[row]);
-        m.d3[2][6][6][6] = q.d3qdot_ls_ls_ls[row];
-        set3(&mut m.d3[2], 6, 6, 8, q.d3qdot_ls_ls_lsd[row]);
 
         m
     }
@@ -744,54 +703,7 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         row: usize,
         dir: &[f64; SLS_ROW_K],
     ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        let m = self.row_maps(row);
-        // Δ_i = Σ_c D_i[c]·dir[c]  (rate of change of index i along dir).
-        // dD_i[a] = Σ_c D2_i[a][c]·dir[c]; dD2_i[a][b] = Σ_c D3_i[a][b][c]·dir[c].
-        // d(ell_ii)/dt = ell_iii·Δ_i; d(ell_i)/dt = ell_ii·Δ_i.
-        // dH[a][b] = -Σ_i [ ell_iii·Δ_i·D_i[a]·D_i[b]
-        //                 + ell_ii·(dD_i[a]·D_i[b] + D_i[a]·dD_i[b])
-        //                 + ell_ii·Δ_i·D2_i[a][b]
-        //                 + ell_i·dD2_i[a][b] ].
-        let mut out = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-        for i in 0..3 {
-            let di = &m.d[i];
-            let d2i = &m.d2[i];
-            let d3i = &m.d3[i];
-            let mut delta = 0.0;
-            let mut dd = [0.0_f64; SLS_ROW_K];
-            for c in 0..SLS_ROW_K {
-                let s = dir[c];
-                if s == 0.0 {
-                    continue;
-                }
-                delta += di[c] * s;
-                for a in 0..SLS_ROW_K {
-                    dd[a] += d2i[a][c] * s;
-                }
-            }
-            let l2 = m.l2[i];
-            let l3 = m.l3[i];
-            let l1 = m.l1[i];
-            for a in 0..SLS_ROW_K {
-                for b in 0..SLS_ROW_K {
-                    let mut t = l3 * delta * di[a] * di[b]
-                        + l2 * (dd[a] * di[b] + di[a] * dd[b])
-                        + l2 * delta * d2i[a][b];
-                    if l1 != 0.0 {
-                        let mut dd2 = 0.0;
-                        for c in 0..SLS_ROW_K {
-                            let s = dir[c];
-                            if s != 0.0 {
-                                dd2 += d3i[a][b][c] * s;
-                            }
-                        }
-                        t += l1 * dd2;
-                    }
-                    out[a][b] -= t;
-                }
-            }
-        }
-        Ok(out)
+        Ok(self.row_nll_tower(row)?.third_contracted(dir))
     }
 
     fn row_fourth_contracted(

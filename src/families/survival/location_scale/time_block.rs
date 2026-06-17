@@ -1317,11 +1317,19 @@ pub(crate) fn prepare_identified_time_block(
     let linear_constraints =
         append_linear_constraints(coefficient_constraints.clone(), derivative_constraints)?;
     let initial_beta = match (linear_constraints.as_ref(), input.initial_beta.as_ref()) {
-        (Some(constraints), Some(beta0)) => Some(project_onto_linear_constraints(
-            p,
-            constraints,
-            Some(beta0),
-        )?),
+        (Some(constraints), Some(beta0)) => {
+            let mut clipped = beta0.clone();
+            for (value, &lower) in clipped.iter_mut().zip(coefficient_lower_bounds.iter()) {
+                if lower.is_finite() && *value < lower {
+                    *value = lower;
+                }
+            }
+            if validate_linear_constraints("time initial beta", &clipped, constraints).is_ok() {
+                Some(clipped)
+            } else {
+                Some(project_onto_linear_constraints(p, constraints, Some(beta0))?)
+            }
+        }
         (_, Some(beta0)) => Some(beta0.clone()),
         _ => None,
     };

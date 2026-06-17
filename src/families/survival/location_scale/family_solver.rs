@@ -958,7 +958,7 @@ impl SurvivalLocationScaleFamily {
         let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
         if self.row_kernel_joint_hessian_supported() {
             let dynamic = self.build_dynamic_geometry(block_states)?;
-            let kernel = self.survival_ls_row_kernel(&q, &dynamic);
+            let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_scale);
             let rows = crate::families::row_kernel::RowSet::All;
             let cache = crate::families::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
             return Ok(Some((
@@ -983,6 +983,7 @@ impl SurvivalLocationScaleFamily {
             d_beta_flat,
             &q,
             &dynamic,
+            log_rescale,
         )
     }
 
@@ -999,11 +1000,13 @@ impl SurvivalLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         q: &SurvivalJointQuantities,
         dynamic: &SurvivalDynamicGeometry,
+        deriv_log_scale: f64,
     ) -> Result<Option<Array2<f64>>, String> {
         self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
             d_beta_flat,
             q,
             dynamic,
+            deriv_log_scale,
             None,
         )
     }
@@ -1018,6 +1021,7 @@ impl SurvivalLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         q: &SurvivalJointQuantities,
         dynamic: &SurvivalDynamicGeometry,
+        deriv_log_scale: f64,
         row_mask: Option<&Array1<f64>>,
     ) -> Result<Option<Array2<f64>>, String> {
         let offsets = self.joint_block_offsets();
@@ -1035,7 +1039,7 @@ impl SurvivalLocationScaleFamily {
         }
 
         if self.row_kernel_directional_supported() {
-            let kernel = self.survival_ls_row_kernel(q, dynamic);
+            let kernel = self.survival_ls_row_kernel_rescaled(q, dynamic, deriv_log_scale);
             let rows = row_set_from_survival_mask(row_mask, self.n);
             return crate::families::row_kernel::row_kernel_directional_derivative(
                 &kernel,
@@ -1866,6 +1870,39 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        if self.row_kernel_joint_hessian_supported() {
+            let q = self.collect_joint_quantities(block_states)?;
+            let dynamic = self.build_dynamic_geometry(block_states)?;
+            let kernel = self.survival_ls_row_kernel(&q, &dynamic);
+            let rows = crate::families::row_kernel::RowSet::All;
+            let cache = crate::families::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
+            let ll = crate::families::row_kernel::row_kernel_log_likelihood(&cache, &rows);
+            let gradient = -crate::families::row_kernel::row_kernel_gradient(
+                &kernel,
+                &cache,
+                &rows,
+            );
+            let hessian =
+                crate::families::row_kernel::row_kernel_hessian_dense(&kernel, &cache, &rows);
+            let offsets = self.joint_block_offsets();
+            let blockworking_sets = (0..self.expected_blocks())
+                .map(|block_idx| {
+                    let start = offsets[block_idx];
+                    let end = offsets[block_idx + 1];
+                    BlockWorkingSet::ExactNewton {
+                        gradient: gradient.slice(s![start..end]).to_owned(),
+                        hessian: SymmetricMatrix::Dense(
+                            hessian.slice(s![start..end, start..end]).to_owned(),
+                        ),
+                    }
+                })
+                .collect();
+            return Ok(FamilyEvaluation {
+                log_likelihood: ll,
+                blockworking_sets,
+            });
+        }
+
         let (ll, block_gradients) =
             self.evaluate_log_likelihood_and_block_gradients(block_states)?;
 
@@ -3275,6 +3312,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
                 d_beta_flat,
                 &self.q,
                 &self.dynamic,
+                self.deriv_log_scale,
                 self.row_mask.as_deref(),
             )
     }
@@ -3289,6 +3327,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
                 d_beta_flat,
                 &self.q,
                 &self.dynamic,
+                self.deriv_log_scale,
                 self.row_mask.as_deref(),
             )?
             .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
