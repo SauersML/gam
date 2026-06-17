@@ -1746,7 +1746,16 @@ mod tests {
     /// CPU-only host it prints a skip line and still asserts CPU convergence, so
     /// the same `cargo test` invocation is the runnable bench on the GPU node and
     /// a harmless no-op on the build box. Run with `--nocapture` to see numbers.
+    ///
+    /// `#[ignore]`d because it is a wall-clock BENCHMARK, not a correctness gate:
+    /// on a CPU-only CI runner it still drives the color-arm and Qwen-scale CPU
+    /// reference fits (hundreds of seconds), which SIGTERMs the test budget
+    /// without measuring anything the device path proves (#1082). The device
+    /// residency parity it would assert on a CUDA host is already covered by the
+    /// dedicated GPU parity tests; run this explicitly on a GPU node with
+    /// `cargo test gpu_residency_wallclock_bench -- --ignored --nocapture`.
     #[test]
+    #[ignore = "wall-clock GPU residency bench; runs hundreds of seconds of CPU reference fits on non-GPU runners — run explicitly on a GPU node with --ignored"]
     fn gpu_residency_wallclock_bench() {
         use std::time::Instant;
         let opts = DeviceResidentInnerOptions::default();
