@@ -6,15 +6,9 @@
 [![Rust CI](https://github.com/SauersML/gam/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/gam/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
-A generalized additive model engine with a reach well past curve
-fitting. One formula DSL and one Rust engine span classical regression
-families, parametric and semi-parametric survival, location-scale
-(GAMLSS) and learnable-link models, smooths on manifolds with correct
-topology, manifold-valued responses, distribution-free and higher-order
-inference, and a statistically vetted manifold dictionary (SAE) for
-decomposing neural-network activations. The public interfaces are a Rust
-CLI (`gam`) and a Python package (`gamfit`), sharing one engine, one
-formula DSL, and one on-disk model format.
+A generalized additive model engine. The fitting code is in Rust; the
+public interfaces are a Rust CLI (`gam`) and a Python package (`gamfit`),
+which share one engine, one formula DSL, and one on-disk model format.
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
 
@@ -49,23 +43,32 @@ uses NUTS over the coefficient posterior conditional on the fitted
 smoothing parameters where the family supports it, and a Gaussian
 Laplace approximation otherwise.
 
-Beyond standard GAM fitting, the engine covers several areas described in
-the [Examples](#examples) below and the [docs](https://gamfit.readthedocs.io/):
+The engine also provides, past fitting and point prediction (see
+[Examples](#examples) and the [docs](https://gamfit.readthedocs.io/)):
 
-- **Inference and calibration** — Wald and credible bands, conformal
-  intervals (split, jackknife+, and exact full conformal), Bartlett-corrected
-  likelihood-ratio tests, and smoothing-uncertainty-corrected model comparison.
-- **Manifold-valued responses** — GAMs for responses that live on the
-  sphere, simplex, SPD-matrix cone, Grassmann / Stiefel manifolds, or
-  hyperbolic ball, including a constant-curvature family that *estimates*
-  the curvature and reports a flat / spherical / hyperbolic verdict.
-- **Interpretability** — a manifold SAE that decomposes neural-network
-  activations into typed curved atoms, with steering, crosscoders,
-  cross-layer transport, checkpoint dynamics, and certified, anytime-valid
-  structure discovery (e-BH dictionary certificates).
-- **Scaling** — O(n) and O(n log n) solver paths for large univariate and
-  spatial smooths, chunked / streamed prediction, and optional GPU
-  acceleration with measured CPU/GPU dispatch.
+- **Prediction intervals** — Wald and delta-method bands, conformal
+  intervals (split, jackknife+, and full conformal), and posterior draws
+  via NUTS or a Laplace approximation, with posterior-predictive checks.
+- **Model comparison** — per-term Wald and likelihood-ratio tests, and
+  AIC / approximate-leave-one-out comparison via `compare_models`.
+- **Difference smooths** — covariance-aware contrasts between by-group
+  smooths, with optional simultaneous bands.
+- **Diagnostics and reports** — `summary` (coefficient table, effective
+  degrees of freedom), `diagnose` (residuals and fit metrics), residual and
+  partial-effect `plot`, schema `check`, and a self-contained HTML `report`.
+- **Manifold-valued responses** — responses on the sphere, simplex,
+  SPD-matrix cone, Grassmann, Stiefel, or hyperbolic ball, fit in the
+  tangent space at the Fréchet mean; a constant-curvature family estimates
+  the curvature.
+- **Sparse manifold dictionaries (SAE)** — decompose a matrix into K sparse
+  atoms, each a low-dimensional curve or surface (line, circle, sphere,
+  torus) with a per-row coordinate, with a differentiable `gamfit.torch`
+  version, steering, crosscoders, and cross-layer transport.
+- **Integration and scale** — scikit-learn estimators, differentiable
+  `gamfit.torch` REML and basis primitives, pandas / polars / pyarrow /
+  numpy and CSV / Parquet inputs, O(n) / O(n log n) solver paths for large
+  univariate and 2-3D spatial smooths, streamed prediction, and optional
+  CUDA.
 
 ## Install
 
@@ -160,11 +163,9 @@ plan = fit.steer(atom_k=0, t_from=0.0, t_to=1.0)      # steering + dosimetry
 
 The dictionary supports three gating families (`assignment="ibp_map"`,
 `"softmax"`, `"jumprelu"`) and a `gamfit.torch.ManifoldSAE` autograd
-mirror with out-of-sample encoder distillation. Around it the interp
-stack adds: `e_bh_dictionary_certificate` (e-BH certified structure
-claims) and `select_topology` in `gamfit.structure_discovery` /
-`gamfit.topology`; `sae_checkpoint_dynamics` for tracking atoms across
-training checkpoints; `gamfit.crosscoder.Crosscoder` and
+mirror with out-of-sample encoder distillation. Around it: `select_topology`
+to choose an atom's shape by evidence; `sae_checkpoint_dynamics` to track
+atoms across training checkpoints; `gamfit.crosscoder.Crosscoder` and
 `layer_transport_fit` / `layer_transport_ladder` for cross-layer
 dictionaries; and `gamfit.identifiability` factor-recovery diagnostics.
 
@@ -269,39 +270,28 @@ Competing-risks survival. `competing_risks_cif(...)` and
 functions.
 
 Manifold-valued responses. `ResponseGeometryModel` fits GAMs for
-responses that live on a manifold via Fréchet-mean tangent-space maps:
-the sphere, the simplex (`clr` / `alr`), the cone of SPD matrices, the
-Grassmann and Stiefel manifolds, and the hyperbolic (Poincaré) ball. A
-constant-curvature family estimates the curvature from the responses and
-reports a flat / spherical / hyperbolic verdict with a Wilks flatness
-test:
+responses that live on a manifold, mapped to a tangent space at the
+Fréchet mean: the sphere, the simplex (`clr` / `alr`), the cone of SPD
+matrices, the Grassmann and Stiefel manifolds, and the hyperbolic
+(Poincaré) ball. A constant-curvature family estimates the curvature from
+the responses:
 
 ```python
 gamfit.fit(df, "y ~ s(x)", response_geometry="poincare", response_columns=[...])
 gamfit.fit(df, "y ~ s(x)", response_geometry="constant_curvature", response_columns=[...])
 ```
 
-Inference and calibration. Predictions carry Wald or posterior-credible
-bands; conformal intervals come in split, jackknife+, and exact
-full-conformal forms; `compare_models` reports smoothing-uncertainty
-corrected AIC and approximate-LOO elpd; `lawley_bartlett_factor` gives a
-Bartlett-corrected likelihood-ratio test for a smooth term.
+Model comparison. `compare_models` reports AIC and approximate
+leave-one-out (elpd), corrected for smoothing-parameter selection.
 
 ```python
-model.predict(test, interval="conformal", conformal_level=0.9)
 gamfit.compare_models([model_a, model_b])
 ```
 
-Certified structure discovery. The interpretability stack ships
-anytime-valid, optional-stopping-immune evidence tools: universal-inference
-e-values, e-BH dictionary certificates with FDR control under arbitrary
-dependence, and resumable atom-birth gates — so claims like "this atom
-exists" or "these atoms bind" are confirmed with a certificate, not a
-post-hoc p-value.
-
-```python
-gamfit.e_bh_dictionary_certificate(log_e_values, alpha=0.05)
-```
+Diagnostics and reports. `model.summary()` gives the coefficient table and
+per-term effective degrees of freedom; `model.diagnose(data)` returns
+residuals and fit metrics; `model.plot(...)` draws partial effects and
+residuals; `model.report("out.html")` writes a self-contained HTML report.
 
 PyTorch bridge. Differentiable REML primitives, smooth-basis layers, and
 frozen fitted-model modules are available under `gamfit.torch` and
