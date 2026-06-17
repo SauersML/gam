@@ -1617,11 +1617,43 @@ impl<'a> RemlState<'a> {
         if edf.is_finite() && edf > ALO_EDF_FRACTION_SATURATION * (n as f64) {
             return Ok(None);
         }
-        let alo = crate::inference::alo::compute_alo_diagnostics_from_pirls(
+        // Graceful degradation when the ALO diagnostic itself is not computable
+        // at this ρ (#1191). The stabilizer is an OUTER-OPTIMIZER aid, never part
+        // of the genuine criterion (see the header comment), so a failure to form
+        // its leverage / leave-one-out diagnostic must NOT abort the outer
+        // objective evaluation — it must behave like every other "conditions not
+        // right for stabilization" branch above and simply skip the augmentation.
+        //
+        // The diagnostic legitimately fails at *intermediate* ρ on designs whose
+        // penalized Hessian is indefinite or near-saturated, which is exactly the
+        // transient state shape-constrained smooths (monotone/convex/concave) pass
+        // through during the smoothing-parameter search: the constrained Hessian
+        // is indefinite away from the optimum, so the exact frozen-curvature ALO
+        // fixed point receives a non-finite per-row score/curvature and reports
+        // `LooComputationFailed`. Before this guard that `?` propagated as an
+        // `EstimationError` that the seed loop classified as a *domain* rejection,
+        // so every candidate seed was rejected and the entire fit aborted with
+        // "no candidate seeds passed outer startup validation" — making all four
+        // shape-constrained smooths unfittable from `gamfit.fit`, even though the
+        // genuine REML criterion (and the `gam` CLI, which only computes ALO as a
+        // post-convergence diagnostic on the well-conditioned final Hessian) fits
+        // the identical data fine. Skipping the augmentation here returns the
+        // outer eval to the plain REML surface for that ρ; the augmentation
+        // re-engages automatically once the search reaches well-conditioned ρ
+        // where the diagnostic is computable again.
+        let alo = match crate::inference::alo::compute_alo_diagnostics_from_pirls(
             bundle.pirls_result.as_ref(),
             self.y,
             self.config.link_function(),
-        )?;
+        ) {
+            Ok(alo) => alo,
+            Err(err) => {
+                log::debug!(
+                    "[ALO-STABILIZED-REML] skipping augmentation at this ρ: ALO diagnostic not computable ({err}); falling back to the plain REML criterion for this evaluation",
+                );
+                return Ok(None);
+            }
+        };
         let max_leverage = alo
             .leverage
             .iter()
