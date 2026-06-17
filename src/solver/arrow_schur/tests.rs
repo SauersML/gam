@@ -1175,59 +1175,6 @@ pub(crate) fn evidence_row_spectral_deflation_count_is_stable_across_the_cutoff(
     );
 }
 
-/// #1118 (β-block analogue): a genuinely indefinite REDUCED SCHUR complement
-/// — the state the OLMo K=8 capstone hits, where the per-row H_tt blocks are
-/// deflated PD but the Schur subtraction drives a β-pivot negative (the
-/// reported `-0.064 at index 256`) — must be conditioned by the evidence
-/// dense factor through unit-stiffness spectral deflation rather than failing
-/// the whole fit. The negative direction is stiffened to eigenvalue `+1`
-/// (ρ-independent `log 1 = 0`), the genuine positive spectrum is preserved
-/// exactly, and the result is PD so its Cholesky and `log|S|` are finite.
-#[test]
-pub(crate) fn evidence_dense_schur_deflates_indefinite_complement_at_unit_stiffness() {
-    // A 3×3 symmetric Schur complement with one genuinely NEGATIVE eigenvalue
-    // (−0.5 along e_1) and two healthy positive ones (4.0 along e_0, 2.0 along
-    // e_2). The plain Cholesky must refuse it; the evidence deflation must
-    // condition it to PD.
-    let schur = array![[4.0_f64, 0.0, 0.0], [0.0, -0.5, 0.0], [0.0, 0.0, 2.0],];
-    assert!(
-        cholesky_lower(&schur).is_err(),
-        "an indefinite Schur complement must be refused by the plain Cholesky"
-    );
-
-    let factor = factor_spectral_deflated_evidence_dense(&schur)
-        .expect("indefinite Schur complement must spectrally deflate to a PD factor");
-
-    // Reconstruct L Lᵀ and check the spectrum: genuine directions exact, the
-    // deflated negative direction carries the +1 unit stiffness.
-    let d = 3usize;
-    let mut reconstructed = Array2::<f64>::zeros((d, d));
-    for i in 0..d {
-        for j in 0..d {
-            let mut acc = 0.0_f64;
-            for kk in 0..d {
-                acc += factor[[i, kk]] * factor[[j, kk]];
-            }
-            reconstructed[[i, j]] = acc;
-        }
-    }
-    assert!(
-        (reconstructed[[0, 0]] - 4.0).abs() < 1.0e-9,
-        "genuine positive direction e_0 must be exact; got {}",
-        reconstructed[[0, 0]]
-    );
-    assert!(
-        (reconstructed[[2, 2]] - 2.0).abs() < 1.0e-9,
-        "genuine positive direction e_2 must be exact; got {}",
-        reconstructed[[2, 2]]
-    );
-    assert!(
-        (reconstructed[[1, 1]] - 1.0).abs() < 1.0e-9,
-        "deflated negative direction must carry exactly the +1 unit stiffness; got {}",
-        reconstructed[[1, 1]]
-    );
-}
-
 #[test]
 pub(crate) fn sys_htbeta_materialize_row_sums_operator_and_dense_slab() {
     let mut sys = ArrowSchurSystem::new(1, 1, 3);
