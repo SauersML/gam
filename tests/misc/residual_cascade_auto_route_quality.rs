@@ -228,8 +228,8 @@ fn past_cliff_fit_from_formula_returns_quality_residual_cascade() {
     );
     let data = sample(3, n);
     let cfg = gaussian_config();
-    let result = fit_from_formula("y ~ duchon(x1, x2, x3)", &data, &cfg)
-        .expect("past-cliff duchon fit");
+    let result =
+        fit_from_formula("y ~ duchon(x1, x2, x3)", &data, &cfg).expect("past-cliff duchon fit");
     let FitResult::ResidualCascade(cascade) = result else {
         panic!("past-cliff scattered 3-D duchon must auto-route to ResidualCascade");
     };
