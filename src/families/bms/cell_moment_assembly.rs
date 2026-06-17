@@ -3281,11 +3281,13 @@ mod empirical_flex_jet_oracle_tests {
         EmpiricalZGrid::new(nodes, weights, "empirical flex jet oracle").expect("valid grid")
     }
 
-    /// Build a `DeviationRuntime` over a small knot range; the smoothness drop
-    /// (order 2) yields a low-dimensional, well-conditioned cubic basis.
+    /// Build a `DeviationRuntime` over a small knot range; the constant
+    /// smoothness-nullspace drop yields a low-dimensional, well-conditioned
+    /// cubic basis for the independent finite-difference witness.
     fn build_runtime() -> DeviationRuntime {
         // Degree-3 I-spline needs >=8 knots; 8 uniform knots over [-2.5, 2.5]
-        // keep the basis low-dimensional and well-conditioned (order-2 drop).
+        // keep the basis low-dimensional and well-conditioned for this
+        // row-local oracle.
         let knots = Array1::from_vec(vec![
             -2.5_f64,
             -1.785_714_3,
@@ -3296,7 +3298,7 @@ mod empirical_flex_jet_oracle_tests {
             1.785_714_3,
             2.5,
         ]);
-        DeviationRuntime::try_new(knots, 0.0, 2).expect("deviation runtime")
+        DeviationRuntime::try_new(knots, 0.0, 1).expect("deviation runtime")
     }
 
     fn make_fixture(is_score_warp: bool) -> FlexFixture {
