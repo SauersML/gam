@@ -2911,7 +2911,7 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
             crate::seeding::SeedRiskProfile::GeneralizedLinear,
             true,
         ),
-        1
+        2
     );
     assert_eq!(
         effective_seed_budget(
