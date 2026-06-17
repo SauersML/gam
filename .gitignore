@@ -181,3 +181,6 @@ azuser@/
 *.log
 .??*.log
 *.sbatch
+
+# top-level scratch python scripts (do not track root .py)
+/*.py
