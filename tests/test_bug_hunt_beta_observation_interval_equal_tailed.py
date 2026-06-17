@@ -48,8 +48,18 @@ def test_beta_observation_interval_is_equal_tailed_both_tails():
 
 
 def test_beta_observation_edges_track_true_quantiles():
-    """Different angle: each edge must track the corresponding true Beta quantile
-    rather than both sitting below it.
+    """Different angle: the band's *shape* must be the skew-correct equal-tailed
+    Beta, not a symmetric band — i.e. the upper edge reaches the true upper Beta
+    quantile (the symmetric band sat below it) and the band is right-skewed about
+    the mean on these small-mean proportions.
+
+    NB on what NOT to assert: a per-row "fraction of edges below the true
+    quantile" is the *wrong* statistic. A correctly-calibrated equal-tailed band
+    tracks the true conditional quantile, so it straddles it ~50/50 (plus a small
+    upward shift from the estimation-uncertainty widening) — and the per-row
+    fraction is dominated by the flexible-smooth mean wiggle, so it swings
+    wildly with the seed (~0.02..0.75) and can never sit below 0.5, let alone
+    0.25. The robust shape signatures below are seed-stable to ~1%.
     """
     from scipy.stats import beta as B
 
@@ -58,17 +68,31 @@ def test_beta_observation_edges_track_true_quantiles():
     m = gamfit.fit(train, "y ~ s(x)", family="beta")
     p = m.predict(test, interval=0.95, observation_interval=True)
 
+    mu_hat = p["mean"].to_numpy()
     lo = p["observation_lower"].to_numpy()
     hi = p["observation_upper"].to_numpy()
     mu = 1.0 / (1.0 + np.exp(-(-1.6 + 1.3 * np.sin(2 * np.pi * test["x"].to_numpy()))))
-    q025 = B.ppf(0.025, mu * PHI, (1.0 - mu) * PHI)
     q975 = B.ppf(0.975, mu * PHI, (1.0 - mu) * PHI)
 
-    # Pre-fix both edges sat below the true quantile for essentially every row
-    # (upper: 0.935 below; lower: 1.0 below). After the fix the edges bracket the
-    # true quantiles, so neither "below" fraction is near-universal.
-    assert np.mean(hi < q975) < 0.25, "upper edge below true 0.975 quantile too often"
-    assert np.mean(lo < q025) < 0.75, "lower edge below true 0.025 quantile too often"
+    # The upper edge must REACH the true upper quantile (median ratio ≈ 1). The
+    # pre-fix symmetric band sat systematically below it (median ratio ≈ 0.90,
+    # mean edge 0.443 vs true 0.494); the equal-tailed fix lifts it onto the
+    # quantile. The median is robust to the per-row mean wiggle.
+    median_ratio = np.median(hi / q975)
+    assert 0.95 <= median_ratio <= 1.05, (
+        f"upper edge does not track the true 0.975 quantile: median(hi/q975)={median_ratio}"
+    )
+
+    # The band must be right-skewed about the fitted mean — the defining
+    # difference from a symmetric μ ± z·σ band, whose half-widths are equal. On
+    # these small-mean (right-skewed) rows the upper half-width is ~1.9× the
+    # lower; a symmetric band would give a ratio of 1.0.
+    upper_half = np.median(hi - mu_hat)
+    lower_half = np.median(mu_hat - lo)
+    assert upper_half > 1.3 * lower_half, (
+        f"band is not right-skewed (symmetric-band signature): "
+        f"upper half-width {upper_half} vs lower {lower_half}"
+    )
 
 
 if __name__ == "__main__":
