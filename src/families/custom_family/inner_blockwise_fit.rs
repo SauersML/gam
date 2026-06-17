@@ -58,9 +58,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             .exact_newton_joint_hessian_with_specs(&states, specs)?
             .is_some()
     };
+    let structurally_coupled_joint_hessian = specs.len() >= 2
+        && !family.likelihood_blocks_uncoupled()
+        && !family.has_explicit_joint_hessian()
+        && !has_workspace_source
+        && family.joint_hessian_is_structurally_coupled(&states)?;
     let coupled_exact_joint_required = specs.len() >= 2
         && !family.likelihood_blocks_uncoupled()
-        && (family.has_explicit_joint_hessian() || has_workspace_source);
+        && (family.has_explicit_joint_hessian()
+            || has_workspace_source
+            || structurally_coupled_joint_hessian);
     // When the family declares its likelihood blocks UNCOUPLED
     // (`∂²L/∂β_a∂β_b = 0` for every a ≠ b) the joint penalized objective is
     // fully separable across blocks: the joint Hessian is exactly
