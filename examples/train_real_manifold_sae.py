@@ -78,7 +78,11 @@ def _pca_project(train: np.ndarray, test: np.ndarray, pcs: int,
     kept PC to unit TRAIN variance so no single axis sets the global scale and
     starves the rest (the failure mode behind the dictionary co-collapse).
 
-    Returns (z_tr, z_te, var_kept_fraction_of_post_drop_total).
+    Returns (z_tr, z_te, var_kept, lift), where ``lift`` is a callable that maps
+    a reconstruction in the fit's (whitened) PC coordinates back to RAW
+    residual-stream space (un-whiten, un-project, re-add the TRAIN mean). It lets
+    callers score EV in the original D-dimensional residual stream (#1212),
+    apples-to-apples across arms, instead of only in whitened-PC coordinates.
     """
     mean = train.mean(axis=0, keepdims=True)
     tc = train - mean
@@ -95,9 +99,14 @@ def _pca_project(train: np.ndarray, test: np.ndarray, pcs: int,
         # per-PC unit TRAIN std; guards against a single PC dominating the scale.
         sd = np.sqrt(np.mean(z_tr**2, axis=0, keepdims=True))
         sd[sd == 0] = 1.0
-        return z_tr / sd, z_te / sd, var_kept
-    scale = float(np.sqrt(np.mean(z_tr**2))) or 1.0
-    return z_tr / scale, z_te / scale, var_kept
+    else:
+        sd = np.full((1, z_tr.shape[1]), float(np.sqrt(np.mean(z_tr**2))) or 1.0)
+
+    def lift(z_pc: np.ndarray) -> np.ndarray:
+        """(N, pcs) reconstruction in whitened-PC coords -> (N, D) raw resid stream."""
+        return (np.asarray(z_pc) * sd) @ comp.T + mean
+
+    return z_tr / sd, z_te / sd, var_kept, lift
 
 
 def _ev(target: np.ndarray, fitted: np.ndarray) -> float:
@@ -109,7 +118,15 @@ def _ev(target: np.ndarray, fitted: np.ndarray) -> float:
     return 1.0 - float(np.sum(resid**2)) / denom
 
 
-def _fit(z_tr, z_te, k, topology, seed, n_iter):
+def _fit(z_tr, z_te, k, topology, seed, n_iter, lift=None, x_te_raw=None):
+    """Fit, reconstruct the held-out split, and score EV.
+
+    Returns ``(m, ev_pc, ev_raw, fit_s, recon_s)`` where ``ev_pc`` is EV in the
+    fit's (whitened) PC coordinates (the metric the optimizer sees) and ``ev_raw``
+    is EV in the ORIGINAL residual-stream space (#1212) — the apples-to-apples
+    number to compare against raw PCA variance or a raw linear-SAE. ``ev_raw`` is
+    ``nan`` when the raw test matrix / lift were not supplied.
+    """
     from gamfit import sae_manifold_fit
 
     t0 = time.perf_counter()
@@ -126,7 +143,13 @@ def _fit(z_tr, z_te, k, topology, seed, n_iter):
     t1 = time.perf_counter()
     fitted_te = m.reconstruct(z_te)
     recon_s = time.perf_counter() - t1
-    return m, _ev(z_te, fitted_te), fit_s, recon_s
+    ev_pc = _ev(z_te, fitted_te)
+    ev_raw = (
+        _ev(x_te_raw, lift(fitted_te))
+        if lift is not None and x_te_raw is not None
+        else float("nan")
+    )
+    return m, ev_pc, ev_raw, fit_s, recon_s
 
 
 def main() -> None:
@@ -153,27 +176,42 @@ def main() -> None:
     perm = rng.permutation(n)
     n_test = max(1, int(round(args.test_frac * n)))
     test_idx, train_idx = perm[:n_test], perm[n_test:]
-    z_tr, z_te, var_kept = _pca_project(
-        x[train_idx], x[test_idx], args.pcs,
-        drop_top=args.drop_top_pcs, whiten=not args.no_whiten)
+    whiten = not args.no_whiten
+    x_te_raw = x[test_idx]  # RAW held-out residual stream (for apples-to-apples EV)
+    z_tr, z_te, var_kept, lift = _pca_project(
+        x[train_idx], x_te_raw, args.pcs,
+        drop_top=args.drop_top_pcs, whiten=whiten)
+
+    # EV-metric labels (#1212): the optimizer scores EV in the (whitened) PC
+    # coordinates it fits in; "raw" EV un-whitens + un-projects the reconstruction
+    # back to the original residual stream so it is comparable to raw PCA variance
+    # kept and a raw linear-SAE. Both arms use the IDENTICAL transform/metric.
+    pc_metric = "whitened-PC EV" if whiten else "RMS-scaled-PC EV"
 
     print("=== #1026 REAL manifold-SAE training (discovery ON) ===")
     print(f"data: {args.npy}")
     print(f"N={n} tokens (train={len(train_idx)}, test={len(test_idx)}), D={d}")
     print(f"PCA: dropped top {args.drop_top_pcs} rogue PC(s), kept {args.pcs} comps = "
           f"{100*var_kept:.1f}% of post-drop TRAIN variance, "
-          f"whiten={not args.no_whiten}")
+          f"whiten={whiten}")
+    print(f"EV metrics: '{pc_metric}' (the metric the SAE optimizes) and "
+          f"'raw-resid-stream EV' (un-whitened/un-projected, apples-to-apples vs "
+          f"raw PCA / raw linear-SAE)")
     print(f"seed K={args.k}, seed topology={args.seed_topology!r}, n_iter={args.n_iter}, seed={args.seed}")
     print()
 
     # --- manifold SAE: discovery ON (seed topology only) ---
-    m, ev_m, fit_m, recon_m = _fit(z_tr, z_te, args.k, args.seed_topology, args.seed, args.n_iter)
+    m, ev_m, ev_m_raw, fit_m, recon_m = _fit(
+        z_tr, z_te, args.k, args.seed_topology, args.seed, args.n_iter,
+        lift=lift, x_te_raw=x_te_raw)
     kinds = list(m.basis_specs)
     dist = Counter(kinds)
     print(f"[manifold] discovered K = {m.chosen_k}")
     print(f"[manifold] per-atom topology distribution: {dict(dist)}")
     print(f"[manifold] scalar atom_topology = {m.atom_topology!r}")
-    print(f"[manifold] held-out EV = {ev_m:.4f}   (fit {fit_m:.1f}s, recon {recon_m:.1f}s)")
+    print(f"[manifold] held-out {pc_metric} = {ev_m:.4f}   "
+          f"(fit {fit_m:.1f}s, recon {recon_m:.1f}s)")
+    print(f"[manifold] held-out raw-resid-stream EV = {ev_m_raw:.4f}")
     try:
         cert = m.structure_certificate()
         confirmed = [c for c in cert.get("claims", []) if c.get("confirmed")]
@@ -183,36 +221,48 @@ def main() -> None:
         print(f"[manifold] structure certificate unavailable: {e}")
     print()
 
-    # --- linear baseline: forced euclidean d=1 at matched K ---
-    mlin, ev_lin, fit_lin, recon_lin = _fit(z_tr, z_te, args.k, "euclidean", args.seed, args.n_iter)
+    # --- linear baseline: forced euclidean d=1 at matched K (SAME transform/metric) ---
+    mlin, ev_lin, ev_lin_raw, fit_lin, recon_lin = _fit(
+        z_tr, z_te, args.k, "euclidean", args.seed, args.n_iter,
+        lift=lift, x_te_raw=x_te_raw)
     print(f"[linear]   K = {mlin.chosen_k}, topology dist = {dict(Counter(mlin.basis_specs))}")
-    print(f"[linear]   held-out EV = {ev_lin:.4f}   (fit {fit_lin:.1f}s, recon {recon_lin:.1f}s)")
+    print(f"[linear]   held-out {pc_metric} = {ev_lin:.4f}   "
+          f"(fit {fit_lin:.1f}s, recon {recon_lin:.1f}s)")
+    print(f"[linear]   held-out raw-resid-stream EV = {ev_lin_raw:.4f}")
     print()
 
+    # Margin is reported in BOTH metrics; both arms share the identical transform,
+    # so each comparison is apples-to-apples within its own metric (#1212).
     margin = ev_m - ev_lin
+    margin_raw = ev_m_raw - ev_lin_raw
     verdict = "manifold BEATS linear" if margin > 0 else "manifold does NOT beat linear"
-    print(f"=== held-out EV: manifold {ev_m:.4f} vs linear {ev_lin:.4f}  "
+    print(f"=== held-out {pc_metric}: manifold {ev_m:.4f} vs linear {ev_lin:.4f}  "
           f"(margin {margin:+.4f}) -> {verdict} ===")
+    print(f"=== held-out raw-resid-stream EV: manifold {ev_m_raw:.4f} vs linear "
+          f"{ev_lin_raw:.4f}  (margin {margin_raw:+.4f}) ===")
 
     if args.json_out:
         out = {
             "npy": args.npy, "N": n, "D": d,
             "n_train": len(train_idx), "n_test": len(test_idx),
             "pcs": args.pcs, "var_kept_frac": var_kept,
+            "whiten": whiten, "pc_ev_metric": pc_metric,
             "seed_k": args.k, "seed_topology": args.seed_topology,
             "n_iter": args.n_iter, "seed": args.seed,
             "manifold": {
                 "chosen_k": int(m.chosen_k),
                 "topology_distribution": dict(dist),
                 "scalar_topology": m.atom_topology,
-                "held_out_ev": ev_m, "fit_s": fit_m, "recon_s": recon_m,
+                "held_out_pc_ev": ev_m, "held_out_raw_ev": ev_m_raw,
+                "fit_s": fit_m, "recon_s": recon_m,
             },
             "linear": {
                 "chosen_k": int(mlin.chosen_k),
                 "topology_distribution": dict(Counter(mlin.basis_specs)),
-                "held_out_ev": ev_lin, "fit_s": fit_lin, "recon_s": recon_lin,
+                "held_out_pc_ev": ev_lin, "held_out_raw_ev": ev_lin_raw,
+                "fit_s": fit_lin, "recon_s": recon_lin,
             },
-            "margin": margin,
+            "margin_pc_ev": margin, "margin_raw_ev": margin_raw,
         }
         with open(args.json_out, "w") as f:
             json.dump(out, f, indent=2)

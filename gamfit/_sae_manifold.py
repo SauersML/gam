@@ -924,6 +924,17 @@ class ManifoldSAE:
     # is measured in the same geometry the fit's gauge used.
     fisher_provenance: str = "output_fisher"
 
+    @property
+    def chosen_k(self) -> int:
+        """The number of atoms the structure search settled on (#1205).
+
+        Convenience forwarder to ``self.low_level.chosen_k`` so callers can read
+        the discovered K directly off the high-level model. ``slots=True`` blocks
+        a same-named instance attribute, but a class-level property is fine and
+        always equals ``len(self.atoms)`` for a resolved fit.
+        """
+        return int(self.low_level.chosen_k)
+
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
         n, p = (self.fitted.shape if self.fitted.ndim == 2 else (self.fitted.shape[0], 1))
