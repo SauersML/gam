@@ -73,9 +73,15 @@ pub fn average_derivative_gaussian_identity_with_sensitivity(
     for i in 0..n {
         let residual = input.y[i] - input.mu[i];
         let row_score_projection = input.design.row(i).dot(&riesz) * residual;
-        // phi_i = -a'Hbar^-1 grad l_i with grad l_i = -x_i r_i, so the sign is
-        // positive; its mean is +a'H^-1 S beta, cancelling the smoothing bias.
-        let phi_i = (n as f64) * row_score_projection;
+        // One-step (von-Mises) debiasing of the oversmoothed plugin θ̂ = a'β̂.
+        // The penalty pulls β̂ toward 0, so the plugin bias is
+        //   θ̂ − θ = +a'H̄⁻¹ Sλβ̂ = +penalty_bias
+        // (penalty_bias and the plugin error share a sign — the smoothing pull
+        // is the dominant bias). The correction must SUBTRACT that pull:
+        //   θ_onestep = θ̂ − a'H̄⁻¹ Sλβ̂ = θ̂ − penalty_bias,
+        // recovered as θ̂ + (1/n)Σ φ_i with φ_i = −n·(x_i·riesz)·r_i, since at
+        // the penalized MAP Σ x_i r_i = Sλβ̂ ⇒ (1/n)Σ φ_i = −penalty_bias.
+        let phi_i = -(n as f64) * row_score_projection;
         influence_sum += phi_i;
         influence_sq_sum += phi_i * phi_i;
     }
