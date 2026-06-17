@@ -1973,8 +1973,23 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         // analytic envelope gradient is exact. Drive the inner solve to a tight
         // KKT residual so the envelope identity holds and the FD-of-value is a
         // valid ground truth for the ψ outer gradient.
+        // Drive the inner solve to a TIGHT penalized-KKT residual so the
+        // envelope identity `dV/dψ = a + ½tr(H⁻¹Ḣ) − ½tr(S⁺Ṡ)` holds and the
+        // centered FD of the re-solved outer value is a valid ground truth for
+        // the ψ outer gradient. NOTE: `evaluate_custom_family_joint_hyper` runs
+        // the inner solve at `max(outer_tol, 1e-10)` (the
+        // DIRECT_JOINT_HYPER_INNER_TOL_FLOOR in
+        // `derivative_quality_options_and_warm_start`), so requesting a tiny
+        // `inner_tol` alone is silently clamped UP to the *default* `outer_tol`
+        // (1e-5) — five orders of magnitude looser than intended, at which the
+        // near-singular matern H (log|H|≈13) amplifies the β-response KKT term
+        // by ‖H⁻¹‖ and swamps the true ψ-gradient (the +0.12-vs-FD-(-1.39)
+        // disagreement). Pin `outer_tol` to the floor too so the effective
+        // inner target is 1e-10 (r≈5e-10 ⇒ the amplified term is ~1e-5, far
+        // below the 2e-3 gate tolerance) and the envelope gradient is exact.
         let opts = BlockwiseFitOptions {
             inner_tol: 1e-12,
+            outer_tol: 1e-10,
             ..BlockwiseFitOptions::default()
         };
         let res = evaluate_custom_family_joint_hyper(
@@ -2030,6 +2045,16 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let fd_psi_gradient = (cost_plus - cost_minus) / (2.0 * eps);
     let analytic_psi_gradient = grad0[n_rho];
 
+    eprintln!(
+        "[#740 diag] psi: analytic={:+.6e} fd={:+.6e} cost_plus={:+.6e} cost_minus={:+.6e} \
+         d_cost={:+.6e} eps={:.1e}",
+        analytic_psi_gradient,
+        fd_psi_gradient,
+        cost_plus,
+        cost_minus,
+        cost_plus - cost_minus,
+        eps
+    );
     let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());
     let psi_gradient_rel = (analytic_psi_gradient - fd_psi_gradient).abs() / psi_gradient_scale;
     assert!(
