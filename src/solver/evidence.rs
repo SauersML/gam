@@ -2695,32 +2695,36 @@ pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) ->
 // #1026 hybrid curved + linear-tail dictionary split-selection
 // ---------------------------------------------------------------------------
 //
-// A linear SAE atom is the EXACT special case of a curved d=1 atom: the
-// euclidean-d=1-linear basis is one decoder direction (`γ(t) = t·b`, a straight
-// image with zero turning). So a dictionary whose atom set INCLUDES the linear
-// atom as a special case cannot lose to a pure-linear dictionary at matched
-// active budget — it strictly generalizes it. The only open question is, per
-// atom, whether paying for the curved parameterization buys enough likelihood
-// to beat the cheaper linear special case. This module adjudicates that split
-// by the SAME rank-aware Laplace evidence criterion the union/mixture rungs use
-// (`−V = NLE`, lower wins), so the fit selects the curved-vs-linear split by
-// evidence rather than fiat.
+// HONESTY NOTE (#1202): this is a POST-HOC CURVE-SIMPLIFICATION selector, not a
+// common-data refit. The candidates do NOT both fit the original response — the
+// curved candidate is the atom's ALREADY-FITTED decoded image (residual 0 by
+// construction) and the linear candidate is the best weighted line through that
+// SAME fitted image. So the "match-or-beat" statements below are about the
+// per-slot argmin over {keep the fitted curve, replace it with its straight
+// approximation}, NOT a guarantee that this dictionary beats a SEPARATELY
+// re-fitted pure-linear dictionary on the data. There is no data-level nesting
+// guarantee here; see `crate::terms::sae::hybrid_split` for the honest framing.
 //
-// ## The dominance floor (Θ → 0) and the curved ceiling (Θ large)
+// The per-slot adjudication uses the SAME rank-aware Laplace evidence criterion
+// the union/mixture rungs use (`−V = NLE`, lower wins), comparing the cost of
+// keeping the curved image against the cost of the straight approximation.
 //
-// The decision is structurally pinned by nesting. Because the linear fit is the
-// curved family restricted to its straight (`Θ = 0`) sub-model, the curved fit's
-// maximized likelihood is ALWAYS ≥ the linear fit's at the same rows. But the
-// curved atom pays a strictly larger free-parameter price `P_curved > P_linear`
-// (the extra basis coefficients beyond the single decoder direction), which the
-// rank-aware Laplace normalizer charges. Hence:
+// ## The turning floor (Θ → 0) and the curved ceiling (Θ large)
 //
-//   * Θ → 0 (a straight feature): the curved fit recovers no extra likelihood
-//     over its linear sub-model, so `NLE_curved ≥ NLE_linear` and LINEAR wins —
-//     the dominance floor. A curved atom "buys nothing on a straight feature."
-//   * Θ large (a genuinely turning feature): the curved fit captures curvature
-//     the linear secant cannot, lowering `NLE_curved` below `NLE_linear` by more
-//     than the parameter price, so CURVED wins.
+// Per slot, the curved candidate carries zero curve-residual (it reconstructs
+// its own image) but pays a larger free-parameter price `P_curved > P_linear`;
+// the linear candidate carries a positive curve-residual (the curvature a line
+// cannot express) but a smaller price, now charged with its genuine weighted
+// Gram logdet `p·(log w_sum + log s_tt)` (#1203). Hence:
+//
+//   * Θ → 0 (a straight fitted image): the line approximates the curve with
+//     ~zero residual at a lower price, so LINEAR wins — the turning floor. A
+//     curved parameterization "buys nothing" on an already-straight image.
+//   * Θ large (a genuinely turning fitted image): the line's residual exceeds
+//     the curved atom's extra parameter price, so CURVED wins. (Whether curved
+//     wins also depends on the coordinate spread `s_tt` and image amplitude, via
+//     the honest logdet — a tightly-spread, mildly-curved image can still prefer
+//     the cheaper line.)
 //
 // The crossover is governed by the documented shatter law: a linear SAE shatters
 // a feature of total turning Θ into `N(ε) ≈ Θ/(2√(2ε))` rank-1 directions at
@@ -2847,10 +2851,15 @@ pub const HYBRID_LINEAR_TURNING_FLOOR: f64 = 1e-9;
 ///     it cannot lose — we enforce that exactly instead of trusting evidence
 ///     noise at the floor.
 ///  2. **Evidence comparison.** Otherwise select the candidate with the smaller
-///     `NLE`. Because the linear atom is the curved family's `Θ = 0` sub-model,
-///     the curved candidate can only win when its extra curvature lowers the NLE
-///     by MORE than its extra parameter price — the `Θ/√ε` crossover, decided
-///     here by the evidence numbers themselves, not by fiat.
+///     `NLE`. The curved candidate wins only when its extra curvature lowers the
+///     NLE by MORE than its extra parameter price — the `Θ/√ε` crossover, decided
+///     here by the evidence numbers themselves, not by fiat. NOTE: this is a
+///     post-hoc curve-simplification comparison (the candidates approximate the
+///     already-fitted curved image, see `crate::terms::sae::hybrid_split`), NOT a
+///     common-data refit in which linear is the curved family's nested `Θ = 0`
+///     sub-model — there is no "linear can never beat curved on common data"
+///     guarantee here (#1202), and indeed a tightly-spread, mildly-curved image
+///     can prefer the cheaper line.
 ///  3. **Tie-break.** Exact NLE ties go to the cheaper (fewer-parameter)
 ///     candidate — i.e. linear — preserving the strict-generalization guarantee
 ///     that the hybrid never pays for curvature it does not need.
@@ -2911,8 +2920,12 @@ pub struct HybridSplitSelection {
     pub atoms: Vec<HybridAtomChoice>,
     /// `Σ NLE` across the selected per-atom parameterizations — the dictionary's
     /// summed rank-aware Laplace negative-log-evidence (lower wins). Because each
-    /// slot picks the argmin, this is ≤ the pure-linear dictionary's summed NLE
-    /// at the same slots: the hybrid match-or-beats pure-linear by construction.
+    /// slot picks the argmin over {curved image, its straight approximation}, this
+    /// is ≤ the sum of the per-slot LINEAR-candidate NLEs. NOTE (#1202): that
+    /// "linear baseline" is the straight approximation of each ALREADY-FITTED
+    /// curved image, NOT a separately re-fitted pure-linear dictionary on the
+    /// response — so this is a post-hoc curve-simplification dominance, not a
+    /// data-level match-or-beat guarantee.
     pub total_negative_log_evidence: f64,
     /// `Σ P` across the selected parameterizations — the dictionary's total
     /// free-parameter price (the matched-active-budget accounting).
@@ -2945,9 +2958,10 @@ impl HybridSplitSelection {
 /// atom slot `i` (each scored on the same rows, on the common Laplace scale).
 ///
 /// The result reduces EXACTLY to pure-linear when every slot's curved candidate
-/// has `Θ → 0` (the dominance floor fires everywhere) and to pure-curved when
-/// every slot's curved candidate wins the evidence comparison — the two limits
-/// the strict-generalization argument demands.
+/// has `Θ → 0` (the turning floor fires everywhere) and to pure-curved when
+/// every slot's curved candidate wins the evidence comparison. (Post-hoc
+/// curve-simplification criterion, #1202 — see the module header above and
+/// `crate::terms::sae::hybrid_split`; not a data-level pure-linear dominance.)
 ///
 /// Returns an error only if some slot has no candidates to adjudicate (an empty
 /// dictionary slot is a caller bug, not a silent skip).
@@ -3694,9 +3708,12 @@ mod tests {
         // Mixed synthetic: slots 0..3 are CIRCLE features (high turning Θ = 2π,
         // the curved fit captures the loop), slots 3..7 are LINEAR DIRECTIONS
         // (straight, Θ = 0). The evidence split must select curved for the
-        // circles and linear for the directions — and at matched actives the
-        // hybrid's summed evidence must be ≤ the pure-linear baseline (the
-        // strict-generalization, match-or-beat guarantee, (4)).
+        // circles and linear for the directions — and the hybrid's summed
+        // evidence must be ≤ the summed per-slot LINEAR-candidate NLE (the
+        // straight approximation of each already-fitted image). This is a
+        // post-hoc curve-simplification dominance (#1202: NOT a data-level
+        // match-or-beat over a separately re-fitted pure-linear dictionary), and
+        // holds simply because each slot picks the argmin of its two candidates.
         let mut slots: Vec<Vec<HybridAtomCandidate>> = Vec::new();
         let mut pure_linear_baseline = 0.0_f64;
         // Three circle features: a curved atom replaces ~10-30 linear secants, so
@@ -3742,13 +3759,14 @@ mod tests {
         assert_eq!(split.curved_atom_count, 3);
         assert_eq!(split.linear_atom_count(), 4);
 
-        // EV at matched actives: the hybrid's summed negative-log-evidence is ≤
-        // the pure-linear dictionary's (lower NLE = higher evidence = the curved
-        // atoms strictly improved the circle slots, the linear slots are
-        // unchanged). The hybrid match-or-beats pure-linear by construction.
+        // The hybrid's summed negative-log-evidence is ≤ the summed per-slot
+        // LINEAR-candidate NLE (each slot's straight approximation of its fitted
+        // image): the per-slot argmin can only lower the sum. This is a post-hoc
+        // curve-simplification dominance (#1202), NOT a data-level guarantee over
+        // a separately re-fitted pure-linear dictionary.
         assert!(
             split.total_negative_log_evidence <= pure_linear_baseline + 1e-9,
-            "hybrid NLE {} must be <= pure-linear baseline {}",
+            "hybrid NLE {} must be <= summed linear-candidate NLE {}",
             split.total_negative_log_evidence,
             pure_linear_baseline
         );
