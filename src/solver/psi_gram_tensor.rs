@@ -326,6 +326,45 @@ impl PsiGramTensor {
             }
         }
         let tail_start = m - (m / 4).max(1);
+        // DIAG1216: print the ACTUAL realized tail-plateau magnitude (relative to
+        // column scale) the cert sees on this geometry, per rung, so we can size
+        // the fix to the measured floor (or document an honest gap). Inert unless
+        // DIAG1216 is set.
+        let diag = std::env::var("DIAG1216").is_ok();
+        if diag {
+            // Worst per-entry tail coeff relative to its column scale, and the
+            // per-column worst, across the trailing quarter.
+            let mut worst_rel = 0.0_f64;
+            let mut worst_col = 0usize;
+            let mut col_worst = vec![0.0_f64; k];
+            for slab in coeff_slabs.iter().skip(tail_start) {
+                for (j, &scale) in col_scale.iter().enumerate() {
+                    let s = scale.max(1e-300);
+                    for i in 0..n {
+                        let rel = slab[[i, j]].abs() / s;
+                        col_worst[j] = col_worst[j].max(rel);
+                        if rel > worst_rel {
+                            worst_rel = rel;
+                            worst_col = j;
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[DIAG1216] m={m} k={k} n={n}  worst tail rel={worst_rel:.3e} (col {worst_col})  \
+                 cert_rtol={PSI_GRAM_CERT_RTOL:.0e}  -> {}",
+                if worst_rel <= PSI_GRAM_CERT_RTOL {
+                    "CERT PASSES"
+                } else {
+                    "CERT REFUSES (tail floor > rtol)"
+                }
+            );
+            eprint!("[DIAG1216] m={m} per-col worst tail rel: ");
+            for (j, &w) in col_worst.iter().enumerate() {
+                eprint!("c{j}={w:.2e} ");
+            }
+            eprintln!();
+        }
         for slab in coeff_slabs.iter().skip(tail_start) {
             for (j, &scale) in col_scale.iter().enumerate() {
                 let bound = PSI_GRAM_CERT_RTOL * scale.max(1e-300);
@@ -335,6 +374,9 @@ impl PsiGramTensor {
                     }
                 }
             }
+        }
+        if diag {
+            eprintln!("[DIAG1216] m={m} tail certified -> proceeding to spot_check");
         }
         // One-time n-pass products: G̃[d][e] = X_dᵀ W X_e, c̃[d] = X_dᵀ W z.
         let mut weighted: Vec<Array2<f64>> = Vec::with_capacity(m);
@@ -404,6 +446,21 @@ impl PsiGramTensor {
                 .iter()
                 .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
                 .max(1e-300);
+            // DIAG1216: print the ACTUAL assembled-vs-exact Gram error so we can
+            // tell whether the cert ATTACHES but the Gram is inaccurate (spot
+            // mismatch) vs a clean attach.
+            if std::env::var("DIAG1216").is_ok() {
+                let worst = assembled
+                    .iter()
+                    .zip(exact.iter())
+                    .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()))
+                    / scale;
+                eprintln!(
+                    "[DIAG1216] spot ψ={psi:.4}  assembled-Gram worst rel err={worst:.3e}  \
+                     (spot_rtol={PSI_GRAM_SPOT_RTOL:.0e}) -> {}",
+                    if worst <= PSI_GRAM_SPOT_RTOL { "PASS" } else { "FAIL" }
+                );
+            }
             for (a, b) in assembled.iter().zip(exact.iter()) {
                 if (a - b).abs() > PSI_GRAM_SPOT_RTOL * scale {
                     return false;
