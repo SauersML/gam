@@ -315,4 +315,54 @@ mod host_in_core_budget_tests {
         assert_eq!(budget, fraction);
         assert!(budget >= SAE_HOST_IN_CORE_FALLBACK_BYTES);
     }
+
+    /// The budget must keep an OS/allocator reserve free: it can never exceed
+    /// `available − max(available/8, 256 MiB)`. Sizing a plan at 100% of the
+    /// reported available figure OOMs in practice even though it "fits".
+    #[test]
+    fn budget_reserves_headroom_below_usable() {
+        for &avail in &[
+            256 * 1024 * 1024usize,
+            512 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024 * 1024,
+            128 * 1024 * 1024 * 1024,
+        ] {
+            let reserve = (avail / SAE_HOST_MEMORY_RESERVE_FRACTION_DENOMINATOR)
+                .max(SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES);
+            let usable = avail.saturating_sub(reserve);
+            let budget = sae_host_in_core_budget_from_available(avail);
+            assert!(
+                budget <= usable,
+                "budget {budget} must leave reserve free: usable={usable}, avail={avail}"
+            );
+        }
+    }
+
+    /// On a box whose *usable* memory is below the 2 GiB in-core floor, the
+    /// budget collapses to usable (not the floor), so a dense direct plan that
+    /// needs more than usable cannot be admitted and the term streams instead
+    /// of OOMing — the original S16 bug.
+    #[test]
+    fn below_floor_box_streams_not_oom() {
+        let avail = 1024 * 1024 * 1024usize; // 1 GiB: below the 2 GiB floor.
+        let reserve = (avail / SAE_HOST_MEMORY_RESERVE_FRACTION_DENOMINATOR)
+            .max(SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES);
+        let usable = avail - reserve;
+        let budget = sae_host_in_core_budget_from_available(avail);
+        assert_eq!(
+            budget, usable,
+            "below-floor budget must collapse to usable {usable}, got {budget}"
+        );
+        assert!(budget < SAE_HOST_IN_CORE_FALLBACK_BYTES);
+
+        // A direct plan needing 1.5 GiB (> usable) must NOT be admitted.
+        let plan = sae_streaming_plan_from_budget(
+            10_000, 4_096, 8, 8, 64, budget, SAE_CPU_L2_CACHE_BYTES, avail,
+        );
+        assert!(
+            !plan.direct_admitted || plan.estimated_direct_peak_bytes <= budget,
+            "a plan exceeding the usable budget must not be direct-admitted"
+        );
+    }
 }
