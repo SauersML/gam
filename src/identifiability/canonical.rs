@@ -56,9 +56,9 @@ use crate::identifiability::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ata};
-use faer::Side;
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::gauge::Gauge;
+use faer::Side;
 
 enum BlockJacobianSource {
     Callback(Arc<dyn BlockEffectiveJacobian>),
@@ -935,11 +935,7 @@ fn canonicalize_for_identifiability_inner(
         let k_bands = (r_map / n_rows).max(1);
         let observation_bands: Vec<usize> = if k_bands <= 1 {
             vec![0]
-        } else if let Some(stacked_ref) = stacked_dense
-            .iter()
-            .flatten()
-            .max_by_key(|d| d.nrows())
-        {
+        } else if let Some(stacked_ref) = stacked_dense.iter().flatten().max_by_key(|d| d.nrows()) {
             let mut bands: Vec<usize> = (0..k_bands)
                 .filter(|&b| {
                     let lo = b * n_rows;

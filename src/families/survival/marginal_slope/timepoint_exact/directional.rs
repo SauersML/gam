@@ -751,8 +751,12 @@ impl SurvivalMarginalSlopeFamily {
                                     if dir[c] == 0.0 {
                                         continue;
                                     }
-                                    let sca =
-                                        self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
+                                    let sca = self.cell_pair_third_coeff_a(
+                                        primary,
+                                        &fixed.coeff_abu,
+                                        u,
+                                        c,
+                                    );
                                     for k in 0..4 {
                                         acc[k] += sca[k] * dir[c];
                                     }
@@ -765,8 +769,12 @@ impl SurvivalMarginalSlopeFamily {
                                     if dir[c] == 0.0 {
                                         continue;
                                     }
-                                    let sca =
-                                        self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, v, c);
+                                    let sca = self.cell_pair_third_coeff_a(
+                                        primary,
+                                        &fixed.coeff_abu,
+                                        v,
+                                        c,
+                                    );
                                     for k in 0..4 {
                                         acc[k] += sca[k] * dir[c];
                                     }
@@ -779,12 +787,8 @@ impl SurvivalMarginalSlopeFamily {
                             let r_uv_dir = {
                                 let mut acc = vec![0.0; 4];
                                 // a-chain: D_a of the fixed second cross r_uv_fixed.
-                                let sca = self.cell_pair_third_coeff_a(
-                                    primary,
-                                    &fixed.coeff_abu,
-                                    u,
-                                    v,
-                                );
+                                let sca =
+                                    self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, v);
                                 for k in 0..4 {
                                     acc[k] += sca[k] * a_dir;
                                 }
@@ -870,12 +874,8 @@ impl SurvivalMarginalSlopeFamily {
                             // D_dir(r1_uv) = coeff_aabu[other]·a_dir + coeff_abbu cross.
                             let r1_uv_dir = {
                                 let mut acc = vec![0.0; 4];
-                                let sca = self.cell_pair_third_coeff_a(
-                                    primary,
-                                    &fixed.coeff_aabu,
-                                    u,
-                                    v,
-                                );
+                                let sca =
+                                    self.cell_pair_third_coeff_a(primary, &fixed.coeff_aabu, u, v);
                                 for k in 0..4 {
                                     acc[k] += sca[k] * a_dir;
                                 }

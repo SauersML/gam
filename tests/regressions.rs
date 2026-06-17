@@ -108,8 +108,6 @@ mod bug_hunt_gaussian_smooth_high_leverage_alo_hessian_abort;
 mod bug_hunt_gaussian_smooth_not_invariant_to_small_response_rescale;
 #[path = "regressions/bug_hunt_gaussian_smooth_shape_not_response_shift_invariant.rs"]
 mod bug_hunt_gaussian_smooth_shape_not_response_shift_invariant;
-#[path = "regressions/bug_hunt_smooth_not_covariate_scale_invariant.rs"]
-mod bug_hunt_smooth_not_covariate_scale_invariant;
 #[path = "regressions/bug_hunt_gpu_pirls_row_module_path_break.rs"]
 mod bug_hunt_gpu_pirls_row_module_path_break;
 #[path = "regressions/bug_hunt_group_random_effect_sparse_exact_smoothing_correction.rs"]
@@ -152,10 +150,6 @@ mod bug_hunt_measure_jet_formula_fit_aborts_at_tight_outer_tol;
 mod bug_hunt_monotone_shape_binding_constraint;
 #[path = "regressions/bug_hunt_monotone_shape_smooth_aborts_fit.rs"]
 mod bug_hunt_monotone_shape_smooth_aborts_fit;
-#[path = "regressions/bug_hunt_shape_constrained_alo_seed_validation_aborts_1191.rs"]
-mod bug_hunt_shape_constrained_alo_seed_validation_aborts_1191;
-#[path = "regressions/cli_ffi_fit_parity_1196.rs"]
-mod cli_ffi_fit_parity_1196;
 #[path = "regressions/bug_hunt_monotonicity_hvp_extra_eps_factor.rs"]
 mod bug_hunt_monotonicity_hvp_extra_eps_factor;
 #[path = "regressions/bug_hunt_multinomial_blocks_collapse_to_zero_width.rs"]
@@ -202,10 +196,14 @@ mod bug_hunt_reml_unified_2_3;
 mod bug_hunt_sample_generative_polya_gamma;
 #[path = "regressions/bug_hunt_scad_mcp_majorizer_not_psd.rs"]
 mod bug_hunt_scad_mcp_majorizer_not_psd;
+#[path = "regressions/bug_hunt_shape_constrained_alo_seed_validation_aborts_1191.rs"]
+mod bug_hunt_shape_constrained_alo_seed_validation_aborts_1191;
 #[path = "regressions/bug_hunt_sheaf_hessian_diag_wrong_on_self_loop_edge.rs"]
 mod bug_hunt_sheaf_hessian_diag_wrong_on_self_loop_edge;
 #[path = "regressions/bug_hunt_smooth_extrapolation_axes_whole_class.rs"]
 mod bug_hunt_smooth_extrapolation_axes_whole_class;
+#[path = "regressions/bug_hunt_smooth_not_covariate_scale_invariant.rs"]
+mod bug_hunt_smooth_not_covariate_scale_invariant;
 #[path = "regressions/bug_hunt_smooth_term_predict_flat_clamped_outside_training_range.rs"]
 mod bug_hunt_smooth_term_predict_flat_clamped_outside_training_range;
 #[path = "regressions/bug_hunt_softmax_entropy_majorizer_not_psd.rs"]
@@ -258,6 +256,8 @@ mod bug_hunt_wps_corrected_edf_below_conditional;
 mod bug_hunt_wps_weighted_gram_invariants;
 #[path = "regressions/bug_hunt_zero_weight_rows_not_equivalent_to_absent_rows.rs"]
 mod bug_hunt_zero_weight_rows_not_equivalent_to_absent_rows;
+#[path = "regressions/cli_ffi_fit_parity_1196.rs"]
+mod cli_ffi_fit_parity_1196;
 #[path = "regressions/cubic_cell_kernel_bug_hunt.rs"]
 mod cubic_cell_kernel_bug_hunt;
 #[path = "regressions/duchon_collocation_symmetry_psd_regression.rs"]

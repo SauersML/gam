@@ -2412,10 +2412,10 @@ impl WorkingModelSurvival {
         let kkt_residual = {
             let raw = state.gradient.clone();
             let projected = match self.monotonicity_linear_constraints() {
-                Some(constraints) => projected_linear_constraint_stationarity_vector(
-                    &raw, beta, &constraints, None,
-                )
-                .unwrap_or(raw),
+                Some(constraints) => {
+                    projected_linear_constraint_stationarity_vector(&raw, beta, &constraints, None)
+                        .unwrap_or(raw)
+                }
                 None => raw,
             };
             crate::model_types::ProjectedKktResidual::from_active_projected(projected)
@@ -2587,9 +2587,8 @@ impl WorkingModelSurvival {
             // Penalized inner objective f(β) = −ℓ(β) + ½β'Sβ + ½ridge‖β‖² whose
             // gradient is exactly `state.gradient` and whose Hessian is exactly
             // `state.hessian`. `update_state` exposes the pieces directly.
-            let penalized_objective = |st: &WorkingState| -> f64 {
-                -st.log_likelihood + st.penalty_term
-            };
+            let penalized_objective =
+                |st: &WorkingState| -> f64 { -st.log_likelihood + st.penalty_term };
             let dbg = std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some();
             let mut iters_done = 0usize;
             let mut exit_reason = "max_iters";
@@ -2744,7 +2743,9 @@ impl WorkingModelSurvival {
             if let Ok((v, g)) = &out {
                 eprintln!(
                     "[931-SHIM] rho={:?} laml_value={:+.12e} analytic_grad={:?}",
-                    rho, v, g.to_vec()
+                    rho,
+                    v,
+                    g.to_vec()
                 );
             }
         }

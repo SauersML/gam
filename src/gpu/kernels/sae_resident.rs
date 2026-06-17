@@ -1653,11 +1653,11 @@ mod tests {
             let p = ws.shape.p;
             let gradients: Vec<(Vec<f64>, Vec<f64>)> = (0..N_SOLVES)
                 .map(|s| {
-                    let g_t: Vec<f64> = (0..n * d)
-                        .map(|i| ((i + s) as f64 * 0.001).sin())
+                    let g_t: Vec<f64> =
+                        (0..n * d).map(|i| ((i + s) as f64 * 0.001).sin()).collect();
+                    let g_beta: Vec<f64> = (0..p)
+                        .map(|j| ((j + 7 * s) as f64 * 0.0007).cos())
                         .collect();
-                    let g_beta: Vec<f64> =
-                        (0..p).map(|j| ((j + 7 * s) as f64 * 0.0007).cos()).collect();
                     (g_t, g_beta)
                 })
                 .collect();
@@ -1672,12 +1672,16 @@ mod tests {
 
             // RESIDENT: factor once, then N gradient-only solves.
             let t_res = Instant::now();
-            let frame = crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(&base, 0.0, 0.0)
-                .expect("resident frame must build on CUDA host");
+            let frame =
+                crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(&base, 0.0, 0.0)
+                    .expect("resident frame must build on CUDA host");
             let mut resident_steps = Vec::with_capacity(N_SOLVES);
             for (g_t, g_beta) in &gradients {
-                resident_steps
-                    .push(frame.solve_gradient(g_t, g_beta).expect("resident solve_gradient"));
+                resident_steps.push(
+                    frame
+                        .solve_gradient(g_t, g_beta)
+                        .expect("resident solve_gradient"),
+                );
             }
             let resident_ms = t_res.elapsed().as_secs_f64() * 1e3;
 

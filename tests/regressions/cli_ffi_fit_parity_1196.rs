@@ -102,11 +102,7 @@ fn load_sqrt_dataset(n: usize) -> gam::inference::data::EncodedDataset {
 /// The shared FitOptions-policy assertion still runs for that case; the β̂
 /// comparison runs on the four shape-constrained smooths (which carry linear
 /// constraints, are ineligible for the scan, and are the #1191 critical cases).
-fn assert_parity_for(
-    formula: &str,
-    ds: &gam::inference::data::EncodedDataset,
-    compare_beta: bool,
-) {
+fn assert_parity_for(formula: &str, ds: &gam::inference::data::EncodedDataset, compare_beta: bool) {
     let cfg = FitConfig::default(); // gaussian / identity / REML — the CLI `fit` default
 
     // ---- The request the formula/FFI path builds. -----------------------------
