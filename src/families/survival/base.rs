@@ -2579,13 +2579,17 @@ impl WorkingModelSurvival {
         {
             const POLISH_MAX_ITERS: usize = 200;
             const POLISH_TOL: f64 = 1e-11;
-            const LM_MU_INIT: f64 = 1e-8;
-            const LM_MU_MAX: f64 = 1e12;
-            const LM_MU_MIN: f64 = 1e-14;
-            let p = beta.len();
-            let mut mu = LM_MU_INIT;
-            let dbg = std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some();
-            for polish_iter in 0..POLISH_MAX_ITERS {
+            // Armijo sufficient-decrease constant and backtracking factor.
+            const ARMIJO_C: f64 = 1e-4;
+            const BACKTRACK: f64 = 0.5;
+            const MAX_BACKTRACK: usize = 80;
+            // Penalized inner objective f(β) = −ℓ(β) + ½β'Sβ + ½ridge‖β‖² whose
+            // gradient is exactly `state.gradient` and whose Hessian is exactly
+            // `state.hessian`. `update_state` exposes the pieces directly.
+            let penalized_objective = |st: &WorkingState| -> f64 {
+                -st.log_likelihood + st.penalty_term
+            };
+            for _ in 0..POLISH_MAX_ITERS {
                 let st = match candidate.update_state(&beta) {
                     Ok(st) => st,
                     Err(_) => break,
@@ -2596,66 +2600,48 @@ impl WorkingModelSurvival {
                     break;
                 }
                 let h = st.hessian.to_dense();
-                if dbg && polish_iter < 6 {
-                    // Probe the UNDAMPED full-Newton step's effect on ||r|| to
-                    // tell apart (i) feasibility rejection, (ii) gradient/Hessian
-                    // inconsistency, and (iii) a genuine near-null H direction.
-                    if let Ok(h0) = crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h) {
-                        use crate::estimate::reml::reml_outer_engine::HessianOperator;
-                        let step0 = h0.solve(&r);
-                        let hr = h.dot(&r);
-                        let hr_norm = hr.iter().map(|v| v * v).sum::<f64>().sqrt();
-                        let trial0 = &beta - &step0;
-                        let (feasible0, tn0) = match candidate.update_state(&trial0) {
-                            Ok(ts) => (true, ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt()),
-                            Err(_) => (false, f64::NAN),
-                        };
-                        eprintln!(
-                            "[931-POLISH] iter={} r_norm={:+.6e} ||Hr||={:+.6e} r={:?} h_diag=[{:+.4e},{:+.4e}] h_off={:+.4e} newton_feasible={} newton_tn={:+.6e}",
-                            polish_iter, r_norm, hr_norm, r.to_vec(),
-                            h[[0,0]], h[[p-1,p-1]], h[[0,p.saturating_sub(1)]], feasible0, tn0
-                        );
-                    }
+                let f0 = penalized_objective(&st);
+                let hop = match crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h) {
+                    Ok(op) => op,
+                    Err(_) => break,
+                };
+                // Newton DIRECTION d = −H⁻¹r on the convex penalized survival
+                // likelihood. The full Newton STEP overshoots badly here because
+                // exp(η) is strongly nonlinear at large β₀ (the undamped step
+                // raised ‖r‖ ~1000×), so a pure ‖r‖-monotone or LM-diagonal
+                // damping stalls — the small-curvature intercept is under-damped
+                // exactly where exp(η) demands the most damping. An Armijo
+                // backtracking line search on the penalized OBJECTIVE VALUE (not
+                // ‖r‖) is globally convergent for this convex objective: the
+                // Newton direction is always a descent direction (∇fᵀd = −rᵀH⁻¹r
+                // < 0 for SPD H), so some α∈(0,1] gives sufficient decrease, and
+                // near the optimum α→1 recovers quadratic convergence — driving
+                // ‖r‖ below the FD round-off floor.
+                let step = {
+                    use crate::estimate::reml::reml_outer_engine::HessianOperator;
+                    hop.solve(&r)
+                };
+                if step.iter().any(|v| !v.is_finite()) {
+                    break;
                 }
-                let diag: Vec<f64> = (0..p).map(|d| h[[d, d]].abs().max(1e-12)).collect();
-                // Inner LM loop: grow mu until a feasible ||r||-decreasing step is found.
+                // Directional derivative ∇fᵀd = rᵀ(−step) = −r·H⁻¹r ≤ 0.
+                let dir_deriv = -r.dot(&step);
+                if !dir_deriv.is_finite() || dir_deriv >= 0.0 {
+                    break;
+                }
+                let mut alpha = 1.0_f64;
                 let mut accepted = false;
-                for _ in 0..60 {
-                    let mut h_lm = h.clone();
-                    for d in 0..p {
-                        h_lm[[d, d]] += mu * diag[d];
-                    }
-                    let hop = match crate::estimate::reml::reml_outer_engine::DenseSpectralOperator::from_symmetric(&h_lm) {
-                        Ok(op) => op,
-                        Err(_) => {
-                            mu = (mu * 10.0).min(LM_MU_MAX);
-                            continue;
-                        }
-                    };
-                    let step = {
-                        use crate::estimate::reml::reml_outer_engine::HessianOperator;
-                        hop.solve(&r)
-                    };
-                    if step.iter().any(|v| !v.is_finite()) {
-                        mu = (mu * 10.0).min(LM_MU_MAX);
-                        continue;
-                    }
-                    let trial = &beta - &step;
+                for _ in 0..MAX_BACKTRACK {
+                    let trial = &beta - &(alpha * &step);
                     if let Ok(ts) = candidate.update_state(&trial) {
-                        let tn = ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-                        if tn.is_finite() && tn < r_norm {
+                        let ft = penalized_objective(&ts);
+                        if ft.is_finite() && ft <= f0 + ARMIJO_C * alpha * dir_deriv {
                             beta = trial;
                             accepted = true;
-                            // Step succeeded: trust a larger region next iteration.
-                            mu = (mu * 0.5).max(LM_MU_MIN);
                             break;
                         }
                     }
-                    // Rejected (infeasible or non-decreasing): damp harder.
-                    if mu >= LM_MU_MAX {
-                        break;
-                    }
-                    mu = (mu * 10.0).min(LM_MU_MAX);
+                    alpha *= BACKTRACK;
                 }
                 if !accepted {
                     break;
