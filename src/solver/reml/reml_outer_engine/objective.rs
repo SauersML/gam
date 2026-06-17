@@ -1127,26 +1127,7 @@ pub fn reml_laml_evaluate(
         None
     };
     if let Some(corrections) = kkt_theta_corrections.as_ref() {
-        if std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some() {
-            let r_norm = kkt_residual_vec
-                .as_ref()
-                .map(|r| r.as_ref().iter().map(|v| v * v).sum::<f64>().sqrt())
-                .unwrap_or(f64::NAN);
-            eprintln!(
-                "[931-IFT] correction_active={} kkt_r_norm={:+.6e} ift_grad_correction={:?} grad_before_corr={:?}",
-                kkt_residual_correction_active,
-                r_norm,
-                corrections.gradient.to_vec(),
-                grad.to_vec(),
-            );
-        }
         grad += &corrections.gradient;
-    } else if std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some() {
-        eprintln!(
-            "[931-IFT] NO kkt_theta_corrections (correction_active={} kkt_residual.is_some()={})",
-            kkt_residual_correction_active,
-            solution.kkt_residual.is_some(),
-        );
     }
 
     // Extended hyperparameter gradient (ψ/τ coordinates).

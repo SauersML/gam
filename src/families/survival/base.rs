@@ -2647,24 +2647,7 @@ impl WorkingModelSurvival {
         // convention of this shim.
         let rho_arr = Array1::from_vec(rho.to_vec());
         let state = candidate.update_state(&beta)?;
-        // #931 TEMPORARY instrumentation: env-gated. Print the polished inner
-        // KKT residual norm and β̂ so we can confirm whether the envelope theorem
-        // is valid at large λ (if ‖r‖ is not ≈0, the inner is NOT stationary and
-        // the analytic envelope gradient legitimately differs from the FD of the
-        // re-converged value surface). Inert unless GAM_931_RHOGRAD_DEBUG is set.
-        let out = candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr);
-        if std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some() {
-            let r_norm = state.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let (value, analytic_grad) = match &out {
-                Ok((v, g)) => (*v, g.to_vec()),
-                Err(_) => (f64::NAN, Vec::new()),
-            };
-            eprintln!(
-                "[931-SHIM] rho={:?} lambdas={:?} beta={:?} polished_kkt_r_norm={:+.6e} laml_value={:+.9e} analytic_grad={:?}",
-                rho, lambdas, beta.to_vec(), r_norm, value, analytic_grad
-            );
-        }
-        out
+        candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
     }
 }
 
