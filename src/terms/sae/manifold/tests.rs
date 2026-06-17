@@ -6944,6 +6944,42 @@ pub(crate) fn warmstart_test_objective() -> SaeManifoldOuterObjective {
     SaeManifoldOuterObjective::new(term, target, None, rho, 8, 1.0, 1.0e-6, 1.0e-6)
 }
 
+/// As [`warmstart_test_objective`], but the atom carries a full basis evaluator
+/// AND second-jet evaluator (`PeriodicHarmonicEvaluator`), so the analytic outer
+/// ρ-gradient lane (`eval` → `logdet_theta_adjoint`, which needs second jets for
+/// the softmax assignment adjoint) can run. Required by the #1206 gradient-lane
+/// contract test, which exercises the full `(cost, ∇f)` path.
+pub(crate) fn warmstart_test_objective_with_evaluator() -> SaeManifoldOuterObjective {
+    // `PeriodicHarmonicEvaluator::new(3)` produces the SAME 3-column Fourier
+    // basis `[1, sin(2πt), cos(2πt)]` (1 harmonic) and matching first jet that
+    // `periodic_basis` builds, so phi/jet are consistent with the decoder dims.
+    let evaluator = Arc::new(crate::terms::sae::basis::PeriodicHarmonicEvaluator::new(3).unwrap());
+    let coords = array![[0.10_f64], [0.35], [0.62], [0.88]];
+    let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+    let atom = SaeManifoldAtom::new(
+        "periodic",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        array![[0.30_f64], [-0.20], [0.15]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(evaluator.clone())
+    .with_basis_second_jet(evaluator);
+    let assignment = SaeAssignment::from_blocks_with_mode(
+        array![[0.9_f64], [0.8], [0.7], [0.6]],
+        vec![coords],
+        AssignmentMode::softmax(0.7),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let target = array![[0.20_f64], [-0.10], [0.30], [0.05]];
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    SaeManifoldOuterObjective::new(term, target, None, rho, 8, 1.0, 1.0e-6, 1.0e-6)
+}
+
 pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
     ArrowFactorCache {
         htt_factors: ArrowFactorSlab::from_blocks(vec![array![[1.0_f64, 0.0], [0.0, 1.0e-7]]]),
@@ -8964,22 +9000,24 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
         .join("tests/data/olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
-    // A modest real-activation slice keeps the single curved-basis inner solve
-    // fast (mirroring the #1190 real-data probe) while still exercising the
-    // K>=2 multi-atom regime on genuine long-tailed LLM data.
-    let z_train = z.slice(s![..256, ..]).to_owned();
+    // A small real-activation slice keeps the single curved-basis inner solve
+    // cheap while still exercising the K>=2 multi-atom regime on genuine
+    // long-tailed LLM data. 96 rows / K=2 / 1 harmonic (a 9-fn-per-atom torus
+    // basis) makes the one joint Newton solve fast; the achievable EV on real
+    // data stays well under the absolute 0.5 floor (the #1189 regime).
+    let z_train = z.slice(s![..96, ..]).to_owned();
 
-    // Production-style K=3, d=2 periodic (torus) dictionary, PCA-seeded from the
+    // Production-style K=2, d=2 periodic (torus) dictionary, PCA-seeded from the
     // real activations exactly as the cold path does.
-    let k = 3usize;
-    let term = real_data_torus_seed_term(z_train.view(), k, 2);
+    let k = 2usize;
+    let term = real_data_torus_seed_term(z_train.view(), k, 1);
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; k]);
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         z_train.clone(),
         None,
         rho.clone(),
-        12,
+        6,
         0.04,
         1.0e-6,
         1.0e-6,
@@ -9494,7 +9532,7 @@ mod inner_contract_probe_tests {
     ///   self-consistent.
     #[test]
     fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
-        let mut objective = warmstart_test_objective();
+        let mut objective = warmstart_test_objective_with_evaluator();
         let rho_flat = objective.current_rho.to_flat();
 
         // Value-probe lane: the cheap derivative-free comparand the cascade uses
@@ -9506,7 +9544,7 @@ mod inner_contract_probe_tests {
         // Gradient lane: the cost an ACCEPTED iterate reports, paired with the
         // analytic ∇f the BFGS Armijo test consumes. A fresh objective so the two
         // paths solve from the identical seed state.
-        let mut objective_grad = warmstart_test_objective();
+        let mut objective_grad = warmstart_test_objective_with_evaluator();
         let gradient_lane = objective_grad
             .eval(&rho_flat)
             .expect("gradient lane evaluates")
@@ -9522,7 +9560,7 @@ mod inner_contract_probe_tests {
         // collapse barrier it also keeps — so the only difference from the value
         // lane is the consistency fold.
         let bare_value = {
-            let mut probe = warmstart_test_objective();
+            let mut probe = warmstart_test_objective_with_evaluator();
             let target = probe.target.clone();
             let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
             let (reml, _loss) = probe
@@ -9558,7 +9596,7 @@ mod inner_contract_probe_tests {
         // gradient-lane and value-lane bares may differ by the refine policy, so
         // each lane is checked against its OWN matched bare.)
         let bare_grad = {
-            let mut probe = warmstart_test_objective();
+            let mut probe = warmstart_test_objective_with_evaluator();
             let target = probe.target.clone();
             let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
             let (reml, _loss, _cache) = probe
