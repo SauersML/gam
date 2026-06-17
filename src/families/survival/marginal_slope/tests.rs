@@ -2221,6 +2221,61 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         eprintln!(
             "DIAG979F(witness) a={a1b:+.10e} f_uv[g,w]={f_uv_gw:+.10e} f_uv_dir[g,w]={f_uvdir:+.10e}"
         );
+        // FIXED-PARTITION variant: hold the cell bounds at base g; integrate the
+        // perturbed-g cubic over those fixed bounds. If this reproduces production's
+        // f_uv_dir (which uses fixed-boundary per-cell moments), then the boundary
+        // MOTION (crossings z=(τ−a)/b move with b) is the missing term.
+        let base_cells = family
+            .denested_partition_cells(a1b, gv, Some(&beta_h_arr), Some(&Array1::from(beta_w0.clone())))
+            .unwrap();
+        let bounds: Vec<(f64, f64)> = base_cells
+            .iter()
+            .map(|c| (c.cell.left.max(-8.0), c.cell.right.min(8.0)))
+            .collect();
+        // F over FIXED bounds, integrand eta from perturbed g (rebuild cells at g+dg
+        // to get the cubic, but integrate over the BASE bounds).
+        let f_fixed = |dg: f64, dw: f64| -> f64 {
+            let mut bw = beta_w0.clone();
+            bw[0] += dw;
+            let pert = family
+                .denested_partition_cells(a1b, gv + dg, Some(&beta_h_arr), Some(&Array1::from(bw)))
+                .unwrap();
+            // For each base bound interval, find the perturbed cell covering its
+            // midpoint and integrate that cubic over the base bound.
+            let mut acc = 0.0;
+            for &(lo, hi) in &bounds {
+                if !(hi > lo) {
+                    continue;
+                }
+                let mid = 0.5 * (lo + hi);
+                let pc = pert
+                    .iter()
+                    .find(|c| c.cell.left <= mid && mid <= c.cell.right)
+                    .unwrap_or(&pert[0]);
+                let cell = pc.cell;
+                let m = 512usize;
+                let h = (hi - lo) / m as f64;
+                let mut s = 0.0;
+                for k in 0..=m {
+                    let z = lo + h * k as f64;
+                    let eta = cell.c0 + cell.c1 * z + cell.c2 * z * z + cell.c3 * z * z * z;
+                    let val = 0.5 * libm::erfc(eta / std::f64::consts::SQRT_2)
+                        * ((-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt());
+                    let c = if k == 0 || k == m { 1.0 } else if k % 2 == 1 { 4.0 } else { 2.0 };
+                    s += c * val;
+                }
+                acc += s * h / 3.0;
+            }
+            acc
+        };
+        let f_uv_fixed = (f_fixed(h, h) - f_fixed(h, -h) - f_fixed(-h, h) + f_fixed(-h, -h)) / (4.0 * h * h);
+        let f_uvdir_fixed = {
+            let gw2 = |dw: f64| (f_fixed(h, dw) - 2.0 * f_fixed(0.0, dw) + f_fixed(-h, dw)) / (h * h);
+            (gw2(h) - gw2(-h)) / (2.0 * h)
+        };
+        eprintln!(
+            "DIAG979F(fixed-bound) f_uv[g,w]={f_uv_fixed:+.10e} f_uv_dir[g,w]={f_uvdir_fixed:+.10e}"
+        );
     }
     let third = family
         .row_flex_primary_third_contracted_exact(0, &block_states, &unit(gi))
