@@ -2347,6 +2347,17 @@ impl WorkingModelSurvival {
         let h_dense = state.hessian.to_dense();
         let hop = DenseSpectralOperator::from_symmetric(&h_dense)
             .map_err(EstimationError::InvalidInput)?;
+        // #931 TEMP value-term breakdown: the clamped spectral logdet the
+        // objective uses for the ½log|H| term, plus the raw symmetric-Cholesky
+        // logdet that has NO clamping. FD-ing both against the analytic ½tr
+        // localizes whether the large-λ desync is the eigenvalue clamp.
+        let dbg_logdet_h_931 = std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some();
+        let logdet_h_clamped_931 = if dbg_logdet_h_931 { hop.logdet() } else { 0.0 };
+        let logdet_h_raw_931 = if dbg_logdet_h_931 {
+            crate::linalg::faer_ndarray::sym_logdet_unclamped_931(&h_dense)
+        } else {
+            0.0
+        };
 
         // --- Penalty coordinates via shared assembler helper ---
         let block_descs: Vec<PenaltyBlockDesc> = self
@@ -2458,6 +2469,17 @@ impl WorkingModelSurvival {
         .map_err(EstimationError::InvalidInput)?;
 
         let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
+        if dbg_logdet_h_931 {
+            eprintln!(
+                "[931-VALTERM] rho={:?} cost={:+.12e} loglik={:+.12e} penalty_term={:+.12e} half_logdet_h_clamped={:+.12e} half_logdet_h_raw={:+.12e}",
+                rho.to_vec(),
+                result.cost,
+                state.log_likelihood,
+                state.penalty_term,
+                0.5 * logdet_h_clamped_931,
+                0.5 * logdet_h_raw_931,
+            );
+        }
         Ok((result.cost, gradient))
     }
 

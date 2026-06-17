@@ -814,12 +814,25 @@ impl SaeManifoldOuterObjective {
         // it climbs back toward `anchor_ev`, still capped by the absolute
         // `0.9 * anchor_ev` so a large dictionary is never held above the linear
         // optimum it relaxed from.
-        let k_active = self.term.k_atoms().max(1) as f64;
-        let per_atom_share_floor = anchor_ev * ((k_active - 1.0) / k_active);
-        let arrival_floor = CURVATURE_WALK_ARRIVAL_EV_FLOOR
+        // The base #1189 floor (absolute vs. the certified linear-ceiling
+        // fraction) governs the SINGLE-atom regime, where there is no second atom
+        // to collapse onto and the share concept is undefined. For K >= 2 it is
+        // ADDITIONALLY relaxed by the per-atom share so a curved K-atom fit that
+        // recovers within `1/K` of the cumulative ceiling is accepted; K = 1 keeps
+        // the original gate exactly (no co-collapse to forgive there).
+        let k_active = self.term.k_atoms().max(1);
+        let base_floor = CURVATURE_WALK_ARRIVAL_EV_FLOOR
             .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * anchor_ev)
-            .min(per_atom_share_floor.max(0.0))
             .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
+        let arrival_floor = if k_active >= 2 {
+            let k = k_active as f64;
+            let per_atom_share_floor = anchor_ev * ((k - 1.0) / k);
+            base_floor
+                .min(per_atom_share_floor.max(0.0))
+                .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR)
+        } else {
+            base_floor
+        };
         if arrived
             && let Ok(final_fit) = self.term.try_fitted_for_rho(&rho)
             && let Some(final_ev) =

@@ -9295,19 +9295,24 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     // constants the fix uses and pin its defining property across the two regimes
     // that matter — using the REAL fixture's row count / SST so the test is
     // grounded in genuine activations, not a synthetic stand-in.
-    // Mirror the production floor EXACTLY: relative to the cumulative linear
-    // ceiling, capped by the absolute fraction, discounted by one atom's share
-    // (#1026), floored at the data-collapse EV. `k_active = 1` recovers the
-    // original single-atom calibration the #1189 cases below pin.
+    // Mirror the production floor EXACTLY. The base #1189 gate (absolute vs. the
+    // linear-ceiling fraction, clamped to the data-collapse floor) governs K = 1;
+    // for K >= 2 it is additionally relaxed by the per-atom share (#1026) so a
+    // curved K-atom fit within `1/K` of the cumulative ceiling is accepted.
     let arrival_floor_k = |achievable_ceiling: f64, k_active: usize| -> f64 {
-        let k = (k_active.max(1)) as f64;
-        let per_atom_share_floor = achievable_ceiling * ((k - 1.0) / k);
-        CURVATURE_WALK_ARRIVAL_EV_FLOOR
+        let base = CURVATURE_WALK_ARRIVAL_EV_FLOOR
             .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * achievable_ceiling)
-            .min(per_atom_share_floor.max(0.0))
-            .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR)
+            .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
+        if k_active >= 2 {
+            let k = k_active as f64;
+            let per_atom_share_floor = achievable_ceiling * ((k - 1.0) / k);
+            base.min(per_atom_share_floor.max(0.0))
+                .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR)
+        } else {
+            base
+        }
     };
-    // The #1189 single-atom regimes (K=1) keep the original gate (share floor 0).
+    // The #1189 single-atom regimes (K=1) keep the original gate unchanged.
     let arrival_floor = |achievable_ceiling: f64| -> f64 { arrival_floor_k(achievable_ceiling, 1) };
 
     // REAL-DATA REGIME (the #1189 bug): on genuine long-tailed LLM activations the
@@ -9375,7 +9380,12 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     // the 1e12 sentinel. Pin that a curved K=3 arrival at the real OLMo branch
     // (EV = 0.2461, the verified K=1 held-out value; a K=3 dictionary on the same
     // L25 signal lands in the same band) now CLEARS the floor.
-    let k3_linear_ceiling = anchor_ev.max(0.30_f64); // cumulative K=3 PCA ceiling
+    // Representative real-OLMo K=3 cumulative linear ceiling (the production L44
+    // run measured ~0.30-0.56). Pin a fixed value so the regression is grounded in
+    // the REAL co-collapse regime, independent of this small fixture's anchor_ev
+    // (which, with a rich K=8 d=2 torus basis on 64-dim output, saturates to ~1.0
+    // and would never exercise the fractional-ceiling co-collapse the bug lives in).
+    let k3_linear_ceiling = 0.30_f64;
     let k3_curved_arrival = 0.2461_f64; // verified real-OLMo curved-branch EV
     let k3_floor = arrival_floor_k(k3_linear_ceiling, 3);
     let k3_floor_old = CURVATURE_WALK_ARRIVAL_EV_FLOOR
@@ -9397,22 +9407,30 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
          arrival at EV {k3_curved_arrival:.4} — if it did not, this fixture no longer exercises \
          the co-collapse bug and the regression is vacuous."
     );
-    // Monotonicity: the share floor must be NON-DECREASING in K (a larger
-    // dictionary is held closer to its linear ceiling), bounded above by the
-    // absolute-fraction cap. K=1 -> 0 share; K->inf -> the full relative cap.
+    // Structure of the floor across K. K=1 keeps the original #1189 base gate
+    // (no co-collapse to forgive); for K >= 2 the per-atom share relaxes it BELOW
+    // the base (a curved K-atom fit is allowed to fall one atom's share short of
+    // the cumulative ceiling), and within the K >= 2 family the floor is
+    // NON-DECREASING in K (a larger dictionary is held closer to its ceiling),
+    // bounded above by the base #1189 gate it relaxes from.
     let f1 = arrival_floor_k(k3_linear_ceiling, 1);
     let f2 = arrival_floor_k(k3_linear_ceiling, 2);
+    let f3 = arrival_floor_k(k3_linear_ceiling, 3);
     let f8 = arrival_floor_k(k3_linear_ceiling, 8);
     assert!(
-        f1 <= f2 && f2 <= f8,
-        "[#1026] per-atom-share floor is not monotone non-decreasing in K \
-         (K=1 {f1:.4}, K=2 {f2:.4}, K=8 {f8:.4})."
+        f2 <= f1 + 1e-12,
+        "[#1026] K=2 floor {f2:.4} should relax BELOW the K=1 base gate {f1:.4} \
+         (the per-atom share must forgive one collapsed atom)."
     );
     assert!(
-        f8 <= CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * k3_linear_ceiling + 1e-12,
-        "[#1026] the share floor exceeded the absolute-fraction cap at large K \
-         (K=8 {f8:.4} > {:.4}).",
-        CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * k3_linear_ceiling
+        f2 <= f3 && f3 <= f8,
+        "[#1026] per-atom-share floor is not monotone non-decreasing across K>=2 \
+         (K=2 {f2:.4}, K=3 {f3:.4}, K=8 {f8:.4})."
+    );
+    assert!(
+        f8 <= f1 + 1e-12,
+        "[#1026] the share floor exceeded the K=1 base gate at large K \
+         (K=8 {f8:.4} > base {f1:.4})."
     );
 
     // Guard the sentinel constant the fix exists to avoid pinning the loop at.
