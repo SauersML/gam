@@ -4316,7 +4316,17 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                // Pin the 1-D axis scale to its raw [0,1] units (no #1215
+                // standardization). The certified ψ-Gram tensor's Chebyshev
+                // tail-decay certificate (PSI_GRAM_CERT_RTOL = 1e-12) is geometry
+                // sensitive: auto-standardizing the single axis to unit spread
+                // (#1214/#1215, `input_scales: None`) widens the effective kernel
+                // coordinate range so the expansion no longer reaches 1e-12 within
+                // the node ladder and the tensor refuses to attach (vacuous gate).
+                // `Some(vec![1.0])` divides by 1.0 (a no-op) — the raw geometry
+                // under which the Gram certifies — keeping THIS test about the
+                // n-free fast path, not #1215's standardization.
+                input_scales: Some(vec![1.0]),
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -4662,7 +4672,17 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                // Pin the 1-D axis scale to its raw [0,1] units (no #1215
+                // standardization). The certified ψ-Gram tensor's Chebyshev
+                // tail-decay certificate (PSI_GRAM_CERT_RTOL = 1e-12) is geometry
+                // sensitive: auto-standardizing the single axis to unit spread
+                // (#1214/#1215, `input_scales: None`) widens the effective kernel
+                // coordinate range so the expansion no longer reaches 1e-12 within
+                // the node ladder and the tensor refuses to attach (DIAG1033:
+                // TailNotCertified at m=9..65 → exhausted ladder). `Some(vec![1.0])`
+                // divides by 1.0 (a no-op) — the raw geometry under which the Gram
+                // certifies — keeping THIS test about the n-free fast-path skip.
+                input_scales: Some(vec![1.0]),
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
