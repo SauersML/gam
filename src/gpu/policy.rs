@@ -199,8 +199,10 @@ impl GpuDispatchPolicy {
     /// `d`) register arithmetic the row-count gate misses.
     ///
     /// USE FOR DISPATCH GATING ONLY. This is **not** a flop count: it omits the
-    /// transpose cross-block GEMV. For benchmark / speedup accounting use
-    /// [`Self::estimated_actual_reduced_schur_matvec_flops`] instead.
+    /// transpose cross-block GEMV (`2·d·k`), so it is a strict lower bound on the
+    /// true per-apply work `n·(4·d·k + d²)`. The gate can therefore only
+    /// under-admit, never over-admit. Do not reuse it for benchmark / speedup
+    /// accounting.
     const fn admission_work_lower_bound(n: usize, k: usize, d: usize) -> u128 {
         let n = n as u128;
         let k = k as u128;
@@ -209,26 +211,6 @@ impl GpuDispatchPolicy {
         // transpose GEMV is intentionally dropped so this stays a lower bound.
         n.saturating_mul(
             2u128
-                .saturating_mul(d)
-                .saturating_mul(k)
-                .saturating_add(d * d),
-        )
-    }
-
-    /// Estimated **actual** per-apply arithmetic of the reduced-Schur matvec,
-    /// `≈ n·(4·d·k + d²)`: a forward cross-block GEMV (`2·d·k`), the transpose
-    /// cross-block GEMV (`2·d·k`), and the `d×d` triangular solve (`d²`).
-    ///
-    /// USE FOR ACCOUNTING ONLY (benchmark reporting, speedup claims). It is
-    /// *not* the dispatch gate — admission deliberately uses the conservative
-    /// [`Self::admission_work_lower_bound`] so the gate can only under-admit.
-    pub const fn estimated_actual_reduced_schur_matvec_flops(n: usize, k: usize, d: usize) -> u128 {
-        let n = n as u128;
-        let k = k as u128;
-        let d = d as u128;
-        // 4·d·k cross-block apply (forward + transpose) + d² per-row solve.
-        n.saturating_mul(
-            4u128
                 .saturating_mul(d)
                 .saturating_mul(k)
                 .saturating_add(d * d),
@@ -569,27 +551,25 @@ mod reduced_schur_matvec_offload_tests {
         assert!(pol.reduced_schur_matvec_should_offload(n, k, d, 5_000));
     }
 
-    /// The admission lower bound must stay strictly below the estimated actual
-    /// flops for any non-degenerate cross-block shape (it drops the transpose
-    /// GEMV). Mixing them up would either over-admit the gate or under-report
-    /// speedups, so the split is the contract this asserts.
+    /// The admission lower bound must stay strictly below the true per-apply
+    /// work `n·(4·d·k + d²)` for any non-degenerate cross-block shape (it drops
+    /// the transpose GEMV). Treating the lower bound as a flop count would
+    /// over-report device speedups, so this asserts the gap is real.
     #[test]
-    fn admission_lower_bound_undercounts_actual_flops() {
+    fn admission_lower_bound_undercounts_actual_work() {
         for &(n, k, d) in &[
             (2_000usize, 2_048usize, 8usize),
             (200, GpuDispatchPolicy::DEVICE_LOOP_MIN_P, 4),
             (1, 1, 1),
         ] {
             let lower = GpuDispatchPolicy::admission_work_lower_bound(n, k, d);
-            let actual = GpuDispatchPolicy::estimated_actual_reduced_schur_matvec_flops(n, k, d);
+            // True per-apply work models the full forward+transpose GEMV pair
+            // plus the d×d solve: n·(4·d·k + d²).
+            let actual = (n as u128) * (4 * (d as u128) * (k as u128) + (d as u128) * (d as u128));
             assert!(
                 lower < actual,
-                "admission lower bound {lower} must undercount actual flops {actual} for ({n},{k},{d})"
+                "admission lower bound {lower} must undercount actual work {actual} for ({n},{k},{d})"
             );
-            // The actual estimate models the full forward+transpose GEMV pair:
-            // exactly n·(4·d·k + d²).
-            let expect = (n as u128) * (4 * (d as u128) * (k as u128) + (d as u128) * (d as u128));
-            assert_eq!(actual, expect);
         }
     }
 }

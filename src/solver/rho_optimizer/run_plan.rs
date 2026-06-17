@@ -888,6 +888,24 @@ pub(crate) fn run_outer_with_plan(
                     let grad_tol = outer_gradient_tolerance(config);
                     let max_iter = outer_max_iterations(config.max_iter)?;
 
+                    // Cost-stall convergence guard for the ARC outer loop
+                    // (#1089/#1237). Identical wiring to the BFGS branch below:
+                    // a near-separable multinomial REML criterion decreases
+                    // monotonically as λ→0, so several log-λ directions slam to
+                    // the lower bound and bounce and ARC otherwise cycles to its
+                    // `max_iter` cap (the #1082 multinomial timeout) without
+                    // certifying a stationary point. The guard halts ARC at the
+                    // best iterate; the bound-PROJECTED gradient norm decides the
+                    // converged verdict (a bound-pinned separating direction is
+                    // KKT-stationary even though its raw ∂V/∂ρ never vanishes).
+                    let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
+                        Arc::new(Mutex::new(None));
+                    let cost_stall_rel_tol = (config.tolerance * 1.0e-2).max(f64::EPSILON);
+                    let arc_seed_grad_norm =
+                        seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                    let cost_stall_grad_threshold =
+                        grad_tol.threshold(seed_eval.cost, arc_seed_grad_norm);
+
                     let objective = OuterSecondOrderBridge {
                         obj,
                         layout,
@@ -898,6 +916,13 @@ pub(crate) fn run_outer_with_plan(
                         g_norm_initial: None,
                         last_g_norm: None,
                         last_value_grad_rho: None,
+                        cost_stall: Some(CostStallGuard::new(
+                            cost_stall_rel_tol,
+                            COST_STALL_WINDOW,
+                            cost_stall_grad_threshold,
+                            cost_stall_exit.clone(),
+                        )),
+                        cost_stall_bounds: Some((lo.clone(), hi.clone())),
                     };
 
                     // Build the opt seed sample from the precomputed
@@ -963,6 +988,34 @@ pub(crate) fn run_outer_with_plan(
                                 last_solution.final_gradient_norm.unwrap_or(f64::NAN),
                             );
                             Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                        }
+                        Err(ArcError::ObjectiveFailed { message })
+                            if message == COST_STALL_CONVERGED_SENTINEL =>
+                        {
+                            // The bridge's cost-stall guard halted ARC because
+                            // the REML score stopped decreasing (#1089/#1237).
+                            // Rebuild the outer result from the published best
+                            // iterate; the converged flag rides on the guard's
+                            // bound-projected stationarity test (`exit.converged`)
+                            // exactly as the BFGS branch does. A non-converged
+                            // cost-stall flows into the same best-so-far
+                            // non-convergence reporting as MaxIterations.
+                            let exit =
+                                cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
+                            match exit {
+                                Some(exit) => Ok(outer_result_with_gradient_norm(
+                                    exit.rho,
+                                    exit.value,
+                                    exit.iterations,
+                                    Some(exit.grad_norm),
+                                    exit.converged,
+                                    *the_plan,
+                                )),
+                                None => Err(EstimationError::RemlOptimizationFailed(format!(
+                                    "ARC cost-stall sentinel fired without a published best \
+                                     iterate ({context})"
+                                ))),
+                            }
                         }
                         Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                             "Arc solver failed: {e:?}"
