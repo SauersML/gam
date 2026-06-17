@@ -4824,6 +4824,17 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     let psi_a = skip_lo + 0.25 * (skip_hi - skip_lo);
     let psi_b = 0.5 * (skip_lo + skip_hi);
     let psi_c = skip_lo + 0.75 * (skip_hi - skip_lo);
+    if std::env::var("DIAG1216").is_ok() {
+        eprintln!(
+            "[DIAG1216-FP] window [{psi_lo:.4},{psi_hi:.4}] skip_band [{skip_lo:.4},{skip_hi:.4}] \
+             ({} pts)  ψ_a={psi_a:.4} ψ_b={psi_b:.4} ψ_c={psi_c:.4}  \
+             covers_skip(a/b/c)={}/{}/{}",
+            skip_band.len(),
+            tensor_eval.psi_gram_tensor_covers_skip(psi_a),
+            tensor_eval.psi_gram_tensor_covers_skip(psi_b),
+            tensor_eval.psi_gram_tensor_covers_skip(psi_c),
+        );
+    }
     let rho = Array1::<f64>::from_elem(rho_dim, 0.5);
     let theta_at = |psi: f64| {
         let mut theta = Array1::<f64>::zeros(rho_dim + 1);
@@ -4952,6 +4963,16 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         ("psi_c", theta_at(psi_c), &beta_c),
     ] {
         let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta);
+        if std::env::var("DIAG1216").is_ok() {
+            let r = beta_fast
+                .iter()
+                .zip(beta_slow.iter())
+                .fold(0.0_f64, |a, (f, s)| a.max((f - s).abs() / (1.0 + s.abs())));
+            eprintln!(
+                "[DIAG1216-FP] {label} ψ={:.4} β̂rel={r:.3e} β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
+                theta[rho_dim], beta_fast[0], beta_slow[0]
+            );
+        }
         assert_eq!(beta_fast.len(), beta_slow.len(), "β̂ dim mismatch @ {label}");
         for j in 0..beta_fast.len() {
             assert!(
