@@ -10506,8 +10506,22 @@ mod inner_contract_probe_tests {
         });
         let (heldout_phi, _hjet) = periodic_basis(&heldout_truth);
 
-        // Encode the held-out rows with the amortized encoder distilled from a
-        // fitted `term`, returning the max circle-phase gap to the planted truth.
+        // Encode the held-out rows under a fitted `term` and return (max
+        // circle-phase recovery gap to the planted truth, amortized-certified
+        // count). The recovery gap measures whether the FITTED DICTIONARY places
+        // the held-out rows on the planted circle — the actual claim of the test
+        // (co-training selects a dictionary that recovers truth at least as well
+        // as the sequential one). It is read off the EXACT cold-Newton encode
+        // (`certified_encode_row` from the chart center), which converges to the
+        // true circle phase on this clean planted manifold for EVERY row,
+        // regardless of whether the Kantorovich certificate formally fires at the
+        // hold-out amplitude. The amortized one-mat-vec predictor's certified
+        // count is reported separately as a fidelity diagnostic (its per-row
+        // amortized==exact agreement on certified rows is asserted by the
+        // dedicated `cotrained_criterion_folds_faithful_amortized_encoder…`
+        // faithfulness test); it must not gate the dictionary-recovery
+        // measurement, or the recovery gaps go vacuously zero whenever the
+        // certificate reach is short at unit amplitude.
         let heldout_recovery_gap = |term: &SaeManifoldTerm| -> (f64, usize) {
             let atom0 = &term.atoms[0];
             let heldout = heldout_phi.dot(&atom0.decoder_coefficients);
@@ -10527,29 +10541,22 @@ mod inner_contract_probe_tests {
                 .amortized_encode_batch(atom0, 0, heldout.view(), amps.view())
                 .expect("held-out amortized encode runs");
             let mut max_gap = 0.0_f64;
-            let mut certified = 0usize;
+            let mut amortized_certified = 0usize;
             for row in 0..n_holdout {
-                // The Design-A encode path is the amortized one-mat-vec predictor
-                // with a certificate-gated EXACT cold-Newton fallback (exactly what
-                // production `amortized_encode_target` does): a row the cheap
-                // predictor cannot certify is retried from the chart center. Only a
-                // row that NEITHER path certifies is left uncertified.
-                let (coord, cert) = if encoded.certified[row] {
-                    (encoded.coords[[row, 0]], true)
-                } else {
-                    let (t, c) = atlas
-                        .certified_encode_row(atom0, 0, heldout.row(row), amps[row])
-                        .expect("held-out exact certified fallback encode runs");
-                    (t[0], c.certified())
-                };
-                if !cert {
-                    continue;
+                if encoded.certified[row] {
+                    amortized_certified += 1;
                 }
-                certified += 1;
-                let gap = circle_phase_gap(coord, heldout_truth[[row, 0]]);
+                // The exact cold-Newton encode from the chart center is the
+                // recovery oracle: on this planted low-order periodic manifold it
+                // converges to the true circle phase for every row, so the gap is
+                // the dictionary's genuine held-out recovery error — never skipped.
+                let (coord, _cert) = atlas
+                    .certified_encode_row(atom0, 0, heldout.row(row), amps[row])
+                    .expect("held-out exact encode converges");
+                let gap = circle_phase_gap(coord[0], heldout_truth[[row, 0]]);
                 max_gap = max_gap.max(gap);
             }
-            (max_gap, certified)
+            (max_gap, amortized_certified)
         };
 
         // --- Sequential: rank ρ by BARE REML, fit cold, distill post-hoc. ---
@@ -10620,24 +10627,26 @@ mod inner_contract_probe_tests {
              | delta(cot-seq)={:.6e}",
             cot_gap - seq_gap
         );
-        // Current honest state (#1154): the Kantorovich cert may return 0 for
-        // unit-amplitude hold-outs on this fixture (L scales with amp; see the
-        // in-sample faithfulness test for certified exact/amortized match).
-        // We still assert the inequality (vacuously true when both gaps=0) and
-        // report the numbers; the real "≥ sequential + amortized==exact on cert rows"
-        // is verified by cotrained_criterion_folds... + warm-start test.
-        if seq_certified > 0 && cot_certified > 0 {
-            assert!(
-                cot_gap <= seq_gap + 1.0e-3,
-                "co-trained encoder must recover the planted held-out manifold at \
-                 least as well as the sequential REML-then-distill path: \
-                 co-trained max phase gap={cot_gap}, sequential={seq_gap}"
-            );
-        } else {
-            eprintln!(
-                "#1154 RECOVERY note: 0 certified rows (cert reach gap at amp=1); \
-                 gaps vacuous (0<=0) but convergence + cotrain fold succeeded."
-            );
-        }
+        // The recovery gaps are read off the exact cold-Newton encode, which
+        // converges on every held-out row of this planted manifold, so the
+        // comparison is LIVE (non-vacuous) on both dictionaries: the co-trained
+        // dictionary must place the held-out rows on the planted circle at least
+        // as well as the bare-REML-selected sequential dictionary. The amortized
+        // one-mat-vec predictor's certified count (`*_certified`) is a reported
+        // fidelity diagnostic; the amortized==exact-on-certified-rows claim is the
+        // separate `cotrained_criterion_folds_faithful_amortized_encoder…` test.
+        assert!(
+            seq_gap.is_finite() && cot_gap.is_finite(),
+            "both dictionaries' exact held-out recovery gaps must be finite: \
+             sequential={seq_gap}, co-trained={cot_gap}"
+        );
+        assert!(
+            cot_gap <= seq_gap + 1.0e-3,
+            "co-trained dictionary must recover the planted held-out manifold at \
+             least as well as the sequential REML-then-distill path: \
+             co-trained max phase gap={cot_gap}, sequential={seq_gap} \
+             (amortized-certified rows: co-trained={cot_certified}, \
+             sequential={seq_certified})"
+        );
     }
 }
