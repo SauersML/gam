@@ -736,7 +736,18 @@ struct ScannedEntry {
     bin_path: PathBuf,
     meta_len: u64,
     bin_len: u64,
+    meta_mtime: Option<SystemTime>,
+    bin_mtime: Option<SystemTime>,
     meta: OnDiskMeta,
+}
+
+impl ScannedEntry {
+    fn matches_files(&self, meta_md: &fs::Metadata, bin_md: &fs::Metadata) -> bool {
+        meta_md.len() == self.meta_len
+            && bin_md.len() == self.bin_len
+            && meta_md.modified().ok() == self.meta_mtime
+            && bin_md.modified().ok() == self.bin_mtime
+    }
 }
 
 /// True iff a meta with the given (`secs`, `nanos`) write timestamp is older
@@ -959,11 +970,17 @@ impl WarmStartStore {
         let dir_mtime = dir_md.modified().ok()?;
         let index = self.index.lock().ok()?;
         let cached = index.by_key_dir.get(dir)?;
-        if cached.dir_mtime == dir_mtime {
-            Some(cached.entries.clone())
-        } else {
-            None
+        if cached.dir_mtime != dir_mtime {
+            return None;
         }
+        for entry in &cached.entries {
+            let meta_md = fs::metadata(&entry.meta_path).ok()?;
+            let bin_md = fs::metadata(&entry.bin_path).ok()?;
+            if !entry.matches_files(&meta_md, &bin_md) {
+                return None;
+            }
+        }
+        Some(cached.entries.clone())
     }
 
     fn store_dir_scan(&self, dir: &Path, dir_mtime: SystemTime, entries: &[ScannedEntry]) {
@@ -1109,6 +1126,8 @@ impl WarmStartStore {
                 bin_path: bin,
                 meta_len: meta_md.len(),
                 bin_len: bin_md.len(),
+                meta_mtime: meta_md.modified().ok(),
+                bin_mtime: bin_md.modified().ok(),
                 meta,
             });
         }
