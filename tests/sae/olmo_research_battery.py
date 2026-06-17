@@ -405,10 +405,10 @@ RUN_SPEC = """\
 === #977 OLMo research battery — MSI run spec (overlap on the held A100) ===
 # data already staged at olmo_data/instruct; wheel built by the lead's GPU job.
 srun --overlap --jobid <ALLOC_JOBID> --gres=gpu:a100:1 -t 60 bash -lc '
-  source /projects/standard/hsiehph/sauer354/gam_env.sh
-  cd /projects/standard/hsiehph/sauer354/gam
+  source /path/to/scratch/gam_env.sh
+  cd /path/to/scratch/gam
   python tests/sae/olmo_research_battery.py \\
-    --data /projects/standard/hsiehph/sauer354/olmo_data/instruct/<rev> \\
+    --data /path/to/scratch/olmo_data/instruct/<rev> \\
     --out olmo_battery_results.json'
 # Then send olmo_battery_results.json back; I post the tables on #977 / #1026.
 """

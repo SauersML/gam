@@ -184,3 +184,6 @@ azuser@/
 
 # top-level scratch python scripts (do not track root .py)
 /*.py
+
+# Internal dev/MSI tooling — not for the public repo
+/dev/

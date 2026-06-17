@@ -12,7 +12,7 @@ geometry the manifold-SAE must recover.
 
 USAGE (on MSI, login node ok — tiny):
   python tests/sae/extract_olmo_fixture.py \
-      --data /projects/standard/hsiehph/sauer354/olmo_data/instruct/<rev> \
+      --data /path/to/scratch/olmo_data/instruct/<rev> \
       --pcs 64 --out-dir tests/data
 Then: git add tests/data/olmo_l25_pca64.npy tests/data/olmo_l25_labels.csv && commit.
 """

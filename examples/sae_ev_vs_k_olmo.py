@@ -38,7 +38,7 @@ and fails loudly if a requested rung is not production-ready.
 
 EXAMPLE (OLMo-3-32B base, layer 25, on an MSI compute node):
   python examples/sae_ev_vs_k_olmo.py \
-      --npy /projects/standard/hsiehph/sauer354/olmo_data/.../base/activations.npy \
+      --npy /path/to/scratch/olmo_data/.../base/activations.npy \
       --olmo-layer 25 --pcs 32 --k-ladder 1,2 --seed 42
 
 EXAMPLE (generic harvested cache):

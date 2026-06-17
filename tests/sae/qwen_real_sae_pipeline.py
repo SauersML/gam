@@ -243,28 +243,28 @@ RUN_SPEC = """\
 === #977 real Qwen SGD-SAE -> gam-adjudication pipeline — MSI run spec ===
 
 Data (already staged):
-  /projects/standard/hsiehph/sauer354/qwen_acts/activations/layer_30_residual_post/*.npy
+  /path/to/scratch/qwen_acts/activations/layer_30_residual_post/*.npy
 
 Build the wheel on a COMPUTE node (never login), then run on an a100:
 
   # STEP 1 (build, if the olmo_venv wheel lacks adjudicate_atom_shape):
   sbatch -p msigpu --gres=gpu:a100:1 -t 90 --wrap '
-    source /projects/standard/hsiehph/sauer354/gam_env.sh
-    export HF_HOME=/projects/standard/hsiehph/sauer354/hf
-    export TMPDIR=/projects/standard/hsiehph/sauer354/tmp
-    cd /projects/standard/hsiehph/sauer354/gam
+    source /path/to/scratch/gam_env.sh
+    export HF_HOME=/path/to/scratch/hf
+    export TMPDIR=/path/to/scratch/tmp
+    cd /path/to/scratch/gam
     maturin build --release -o dist && pip install --force-reinstall dist/*.whl'
 
   # STEP 2 (train SAE + adjudicate):
   sbatch -p msigpu --gres=gpu:a100:1 -t 120 --wrap '
-    source /projects/standard/hsiehph/sauer354/olmo_venv/bin/activate
-    export HF_HOME=/projects/standard/hsiehph/sauer354/hf
-    export TMPDIR=/projects/standard/hsiehph/sauer354/tmp
-    cd /projects/standard/hsiehph/sauer354/gam
+    source /path/to/scratch/olmo_venv/bin/activate
+    export HF_HOME=/path/to/scratch/hf
+    export TMPDIR=/path/to/scratch/tmp
+    cd /path/to/scratch/gam
     python tests/sae/qwen_real_sae_pipeline.py \\
-      --act-dir /projects/standard/hsiehph/sauer354/qwen_acts/activations/layer_30_residual_post \\
+      --act-dir /path/to/scratch/qwen_acts/activations/layer_30_residual_post \\
       --dict-size 16384 --epochs 8 --max-tokens 400000 \\
-      --out /projects/standard/hsiehph/sauer354/qwen_sae_verdict.json'
+      --out /path/to/scratch/qwen_sae_verdict.json'
 
 Tune down for a quick smoke: --dict-size 4096 --epochs 2 --max-tokens 50000.
 """

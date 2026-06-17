@@ -150,7 +150,7 @@ RUN_SPEC = """\
 === #977 real-activation atom demo — MSI run spec (serialize on the GPU lane) ===
 
 STEP 1 — stage data (login node ahl03, submit-only; small download, OK on login):
-  cd /projects/standard/hsiehph/sauer354
+  cd /path/to/scratch
   ./olmo_tools/azcopy copy \\
     "https://olmoselfqualia174830.blob.core.windows.net/results/nvme/results/OLMO3_32B_SELFQ_V2/instruct/?se=2026-12-09T23:59:59Z&sp=rl&spr=https&sv=2026-04-06&sr=c&sig=1CCWDg4mQHK3gkFQzTArznGlKekBgJ0AAu47oUNcgaM%3D" \\
     olmo_data/instruct --recursive
@@ -158,16 +158,16 @@ STEP 1 — stage data (login node ahl03, submit-only; small download, OK on logi
 
 STEP 2 — build the wheel on a COMPUTE node (NEVER the login node), CUDA build:
   sbatch -p msigpu --gres=gpu:a100:1 -t 60 --wrap '
-    source /projects/standard/hsiehph/sauer354/gam_env.sh
-    cd /projects/standard/hsiehph/sauer354/gam
+    source /path/to/scratch/gam_env.sh
+    cd /path/to/scratch/gam
     maturin build --release --features gpu -o dist  &&  pip install --force-reinstall dist/*.whl'
 
 STEP 3 — run the demo on a COMPUTE GPU node:
   sbatch -p msigpu --gres=gpu:a100:1 -t 30 --wrap '
-    source /projects/standard/hsiehph/sauer354/gam_env.sh
-    cd /projects/standard/hsiehph/sauer354/gam
+    source /path/to/scratch/gam_env.sh
+    cd /path/to/scratch/gam
     python tests/sae/olmo_real_activation_atom_demo.py \\
-      --data /projects/standard/hsiehph/sauer354/olmo_data/instruct/<rev> \\
+      --data /path/to/scratch/olmo_data/instruct/<rev> \\
       --layer 25  --out olmo_atom_verdict.json'
   # exit 0 + a verdict line = the first real-activation end-to-end win recorded.
   # GPU residency (sae-perf's engine) accelerates sae_manifold_fit transparently;
