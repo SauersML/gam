@@ -129,7 +129,22 @@ fn build_duchon_basis_uncached(
     }
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     assert_spatial_centers_below_large_scale_cap(data.ncols(), centers.view())?;
-    if spec.periodic.is_some() {
+    if let Some(periodic) = spec.periodic.as_ref() {
+        if periodic.len() != data.ncols() {
+            crate::bail_invalid_basis!(
+                "periodic must have length d={}, got {}",
+                data.ncols(),
+                periodic.len()
+            );
+        }
+        if data.ncols() > 1 && periodic.iter().any(Option::is_some) {
+            let flags = periodic.iter().map(Option::is_some).collect::<Vec<_>>();
+            let periods = periodic
+                .iter()
+                .map(|axis| axis.unwrap_or(1.0))
+                .collect::<Vec<_>>();
+            return build_duchon_basis_mixed_periodicity_auto(data, spec, &flags, Some(&periods));
+        }
         return build_periodic_duchon_basis_1d(data, spec, centers, workspace);
     }
     // `spec.power` is the LITERAL Duchon spectral power `s` at the basis layer.

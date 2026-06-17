@@ -1109,7 +1109,7 @@ pub(crate) fn validate_duchon_kernel_orders(
     if !s_order.is_finite() || s_order < 0.0 {
         crate::bail_invalid_basis!("Duchon spectral power must be finite and ≥ 0; got s={s_order}");
     }
-    if length_scale.is_none() && 2.0 * s_order >= k_dim as f64 {
+    if length_scale.is_none() && p_order < 2 && 2.0 * s_order >= k_dim as f64 {
         crate::bail_invalid_basis!(
             "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
         );
