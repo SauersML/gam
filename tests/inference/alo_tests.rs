@@ -402,7 +402,20 @@ fn alo_hat_diag_sane_and_bounded() {
 }
 
 #[test]
-fn alo_matches_exact_linearized_loo_small_n_binomial() {
+fn alo_matches_exact_frozen_curvature_loo_small_n_binomial() {
+    // `eta_tilde` for a canonical-link GLM is the EXACT frozen-curvature
+    // leave-`i`-out predictor: the scalar fixed point
+    //   η = η̂_i + h_i · ℓ_i'(η),   h_i = x_iᵀH⁻¹x_i (unweighted influence),
+    //   ℓ_i'(η) = c_i (μ(η) − y_i),  c_i = W_H[i] / μ'(η̂_i),
+    // iterated to convergence (see `alo_eta_exact_frozen_curvature`). This is a
+    // genuine second-order REFINEMENT of the classical single-Newton-step
+    // ("linearized") ALO, not equal to it — the linearized predictor is only the
+    // FIRST Newton iterate of this same fixed point. We therefore reconstruct the
+    // production fixed point independently here (a cross-implementation oracle of
+    // the SAME equation) and require `eta_tilde` to match it to solver tolerance,
+    // and we additionally pin that the linearized one-step is the first iterate
+    // (so the refinement is doing real work beyond it). The sandwich SE is
+    // unaffected by the refinement and is still checked to the exact value.
     let n = 150;
     let p = 10;
     let (x, y, _) = generate_synthetic_binary_data(n, p, 42);
@@ -433,15 +446,41 @@ fn alo_matches_exact_linearized_loo_small_n_binomial() {
 
     let eta_hat = x_dense.dot(fit.beta_transformed.as_ref());
     let z = &fit.solveworking_response;
+    let dmu_hat = &fit.solve_dmu_deta;
     let mut loo_pred = Array1::<f64>::zeros(n);
+    let mut one_step = Array1::<f64>::zeros(n);
     let mut naive_se = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let mut aii = 0.0;
+        // Weighted leverage a_ii = w_i x_iᵀH⁻¹x_i (drives the one-step denom);
+        // the unweighted influence h_i = x_iᵀH⁻¹x_i drives the frozen-curvature
+        // fixed point exactly as the production path does.
+        let mut aii_weighted = 0.0;
         for r in 0..p_dim {
-            aii += u[[i, r]] * s_all_nd[(r, i)];
+            aii_weighted += u[[i, r]] * s_all_nd[(r, i)];
         }
-        let denom = (1.0 - aii).max(1e-12);
-        loo_pred[i] = (eta_hat[i] - aii * z[i]) / denom;
+        let wi = w_full[i].max(1e-12);
+        let h_i = aii_weighted / wi;
+
+        // Single-Newton-step ("linearized") ALO: the first iterate.
+        let denom = (1.0 - aii_weighted).max(1e-12);
+        one_step[i] = (eta_hat[i] - aii_weighted * z[i]) / denom;
+
+        // Exact frozen-curvature fixed point, reconstructed independently.
+        let c_i = wi / dmu_hat[i].abs().max(1e-12);
+        let mut eta = one_step[i];
+        for _ in 0..64 {
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            let dmu = mu * (1.0 - mu);
+            let ell_prime = c_i * (mu - y[i]);
+            let residual = eta - eta_hat[i] - h_i * ell_prime;
+            if residual.abs() <= 1e-12 {
+                break;
+            }
+            let jac = 1.0 - h_i * c_i * dmu;
+            eta -= residual / jac;
+        }
+        loo_pred[i] = eta;
+
         let mut quad = 0.0;
         for r in 0..p_dim {
             let mut tmp = 0.0;
@@ -450,16 +489,30 @@ fn alo_matches_exact_linearized_loo_small_n_binomial() {
             }
             quad += s_all_nd[(r, i)] * tmp;
         }
-        let wi = w_full[i].max(1e-12);
         naive_se[i] = (quad / wi).max(0.0).sqrt();
     }
 
+    // eta_tilde must equal the independently-reconstructed exact frozen-curvature
+    // LOO to solver tolerance.
     let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
         loo_compare(&alo.eta_tilde, &alo.se_sandwich, &loo_pred, &naive_se);
-    assert!(rmse_pred <= 1e-9);
-    assert!(max_abs_pred <= 1e-8);
+    assert!(
+        rmse_pred <= 1e-9,
+        "eta_tilde must match the exact frozen-curvature LOO: rmse_pred={rmse_pred:.6e}"
+    );
+    assert!(max_abs_pred <= 1e-8, "max_abs_pred={max_abs_pred:.6e}");
     assert!(rmse_se <= 1e-9);
     assert!(max_abs_se <= 1e-8);
+
+    // The refinement must genuinely differ from the linearized first iterate
+    // (otherwise it is not the second-order predictor it claims to be).
+    let (rmse_vs_one_step, _, _, _) =
+        loo_compare(&alo.eta_tilde, &alo.se_sandwich, &one_step, &naive_se);
+    assert!(
+        rmse_vs_one_step > 1e-7,
+        "exact frozen-curvature eta_tilde must refine beyond the linearized one-step, \
+         but they coincide (rmse={rmse_vs_one_step:.6e})"
+    );
 }
 
 #[test]
