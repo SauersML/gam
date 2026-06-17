@@ -8897,6 +8897,94 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
     );
 }
 
+/// #1189 — the outer loop must NOT pin at the `1e12` data-collapse sentinel on
+/// real OLMo-3-32B activations.
+///
+/// The production entry of record for a K >= 2 dictionary is the #1007
+/// certified curvature-homotopy walk from the Eckart-Young LINEAR anchor. On
+/// the long-tailed real spectrum the best achievable reconstruction EV at K
+/// atoms is bounded by the cumulative linear (PCA) ceiling — well under the
+/// absolute `CURVATURE_WALK_ARRIVAL_EV_FLOOR = 0.5`. The pre-#1189 absolute
+/// floor rejected EVERY genuine anchor arrival, the fit fell through to the
+/// blind seed cascade, and the cascade collapsed into the degenerate basin
+/// (in-sample EV <= `SAE_FIT_DATA_COLLAPSE_EV_FLOOR`), so
+/// `add_fit_data_collapse_penalty` added `SAE_FIT_DATA_COLLAPSE_COST` on every
+/// outer trial and the whole REML loop pinned at `~1e12`.
+///
+/// The #1189 fix makes the arrival floor RELATIVE to the certified anchor's own
+/// reconstruction EV (the achievable linear ceiling). This test pins, on the
+/// committed real fixture, that the certified entry arrives with a genuine,
+/// non-degenerate fit: the cost AFTER the data-collapse penalty is finite and
+/// strictly below the sentinel, and the in-sample EV clears the collapse floor.
+#[test]
+pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/olmo_l25_pca64_768.npy");
+    let z = read_npy_f32_2d(&path);
+    assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
+    let z_train = z.slice(s![..384, ..]).to_owned();
+
+    // Production-style K=8, d=2 periodic (torus) dictionary, PCA-seeded from the
+    // real activations exactly as the cold path does.
+    let k = 8usize;
+    let term = real_data_torus_seed_term(z_train.view(), k, 3);
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; k]);
+    let mut objective = SaeManifoldOuterObjective::new(
+        term,
+        z_train.clone(),
+        None,
+        rho.clone(),
+        25,
+        0.04,
+        1.0e-6,
+        1.0e-6,
+    );
+
+    // Run the certified curvature-homotopy entry (the K>=2 entry of record).
+    objective
+        .run_curvature_homotopy_entry_at_rho(&rho)
+        .expect("real-data curvature-homotopy entry must not error");
+
+    // The fitted reconstruction must clear the data-collapse EV floor: this is
+    // exactly the predicate `record_fit_data_collapse_if_needed` tests before it
+    // would stamp the sentinel.
+    let fitted = objective
+        .term
+        .try_fitted_for_rho(&rho)
+        .expect("fitted reconstruction at entry rho");
+    let ev = reconstruction_explained_variance(z_train.view(), fitted.view())
+        .expect("finite EV on the real fixture");
+    eprintln!("[#1189] real-data entry in-sample EV = {ev:.5}");
+    assert!(
+        ev.is_finite() && ev > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
+        "real-data fit collapsed (EV {ev:.5} <= collapse floor {SAE_FIT_DATA_COLLAPSE_EV_FLOOR}): \
+         the certified anchor arrival was rejected and the fit fell into the degenerate basin \
+         (#1189)."
+    );
+
+    // The cost lane the outer ρ-optimizer ranks: the REML criterion PLUS the
+    // data-collapse penalty. A collapsed fit adds `SAE_FIT_DATA_COLLAPSE_COST`
+    // (~1e12) here, pinning the loop; a genuine fit leaves it untouched.
+    let base_loss = objective
+        .term
+        .loss(z_train.view(), &rho)
+        .expect("loss at entry rho");
+    let base_cost = base_loss.total();
+    let penalized = objective
+        .add_fit_data_collapse_penalty(base_cost, &rho)
+        .expect("data-collapse penalty evaluation");
+    eprintln!(
+        "[#1189] real-data outer cost: base={base_cost:.6e} after-collapse-penalty={penalized:.6e} \
+         sentinel={SAE_FIT_DATA_COLLAPSE_COST:.3e}"
+    );
+    assert!(
+        penalized.is_finite() && penalized < SAE_FIT_DATA_COLLAPSE_COST,
+        "outer cost pinned at the data-collapse sentinel on real OLMo activations: \
+         base={base_cost:.6e}, after penalty={penalized:.6e} >= {SAE_FIT_DATA_COLLAPSE_COST:.3e} \
+         (#1189)."
+    );
+}
+
 #[cfg(test)]
 mod inner_contract_probe_tests {
     use super::*;

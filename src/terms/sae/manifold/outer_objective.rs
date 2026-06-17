@@ -683,15 +683,62 @@ impl SaeManifoldOuterObjective {
         // branch); otherwise we demote to a recorded bifurcation so the cascade
         // takes over from the pristine baseline. A genuinely good arrival (the
         // common case, every fit already passing) never enters this block.
+        // #1189 — the arrival floor is RELATIVE to the certified linear ceiling.
+        // The absolute `CURVATURE_WALK_ARRIVAL_EV_FLOOR` is calibrated for planted
+        // synthetic harmonics (a real circle reconstructs at EV ≳ 0.9); on real
+        // high-dim data whose signal sits on a long-tailed spectrum the best
+        // achievable EV at K atoms is bounded by the cumulative linear (PCA)
+        // ceiling — which is well under 0.5 on real LLM activations — so the
+        // absolute floor rejected EVERY genuine arrival, the fit fell to the blind
+        // cascade, and the cascade collapsed to the `1e12` data-collapse sentinel.
+        // The Eckart-Young anchor's OWN reconstruction EV is exactly that
+        // achievable linear ceiling (`anchor_ev = 1 − ‖residual‖² / SST`); a
+        // curved arrival that recovers at least `CURVATURE_WALK_ARRIVAL_ANCHOR_
+        // FRACTION` of it has, by construction, NOT tracked into a worse basin
+        // than the convex linear optimum it started on. The effective floor is the
+        // MIN of the absolute floor and this fraction of the anchor ceiling: on
+        // synthetic data the absolute floor still binds (and the curved fit clears
+        // both); on real data it relaxes to the data-achievable ceiling.
+        let target_sst = {
+            let (n, p) = self.target.dim();
+            let mut means = vec![0.0_f64; p];
+            for col in 0..p {
+                let mut acc = 0.0;
+                for row in 0..n {
+                    acc += self.target[[row, col]];
+                }
+                means[col] = acc / (n.max(1) as f64);
+            }
+            let mut sst = 0.0_f64;
+            for row in 0..n {
+                for col in 0..p {
+                    let centered = self.target[[row, col]] - means[col];
+                    sst += centered * centered;
+                }
+            }
+            sst
+        };
+        let anchor_ev = if target_sst > f64::MIN_POSITIVE
+            && anchor_residual_norm_sq.is_finite()
+        {
+            1.0 - anchor_residual_norm_sq / target_sst
+        } else {
+            // No usable ceiling estimate: fall back to the absolute floor.
+            CURVATURE_WALK_ARRIVAL_EV_FLOOR
+        };
+        let arrival_floor = CURVATURE_WALK_ARRIVAL_EV_FLOOR
+            .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * anchor_ev);
         if arrived
             && let Ok(final_fit) = self.term.try_fitted_for_rho(&rho)
             && let Some(final_ev) =
                 reconstruction_explained_variance(self.target.view(), final_fit.view())
-            && final_ev < CURVATURE_WALK_ARRIVAL_EV_FLOOR
+            && final_ev < arrival_floor
         {
             log::info!(
-                "[#1007] curvature walk reached η=1 but the reconstruction is degenerate \
-                 (EV={final_ev:.4} < arrival floor {CURVATURE_WALK_ARRIVAL_EV_FLOOR}); running a \
+                "[#1007/#1189] curvature walk reached η=1 but the reconstruction is degenerate \
+                 (EV={final_ev:.4} < arrival floor {arrival_floor:.4} = min(abs \
+                 {CURVATURE_WALK_ARRIVAL_EV_FLOOR}, {CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION} × \
+                 anchor ceiling {anchor_ev:.4})); running a \
                  bounded joint Newton fit from the pristine seed to recover the curved branch"
             );
             // Real joint Newton fit from the pristine baseline (circle-aware
@@ -719,7 +766,7 @@ impl SaeManifoldOuterObjective {
                     })
             });
             match (recovery_fit, recovered_ev) {
-                (Ok(loss), Some(ev)) if ev > final_ev && ev >= CURVATURE_WALK_ARRIVAL_EV_FLOOR => {
+                (Ok(loss), Some(ev)) if ev > final_ev && ev >= arrival_floor => {
                     // The bounded joint fit found the curved branch: adopt it and
                     // keep `arrived = true` (the walk delivered a usable fit).
                     log::info!(
