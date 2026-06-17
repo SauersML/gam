@@ -12,6 +12,37 @@ use ndarray::Array1;
 use crate::gpu::kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
 };
+
+/// Per-iterate solve backend for the resident inner Newton loop.
+///
+/// All three modes run the IDENTICAL host control flow (`run_inner_loop`):
+/// residual-gradient assembly, LM trust-region accept/reject, ridge schedule.
+/// They differ ONLY in how the per-iterate arrow step is computed, which is
+/// exactly the residency lever #1017 measures:
+///
+/// * [`InnerSolveMode::DeviceResident`] — the Phase-3 fix: factor the constant
+///   Hessian blocks ONCE into a [`crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle`]
+///   and, every iterate, upload only the `O(n·d + k)` gradient and read back
+///   only `δ`. No per-solve D/B re-upload, no per-solve POTRF.
+/// * [`InnerSolveMode::DeviceReupload`] — the BEFORE path: call
+///   `solve_arrow_newton_step` per iterate, which re-packs and re-uploads
+///   `D`/`B`/`g` and re-runs the per-row POTRF + border Schur factor every call.
+///   This is the residency baseline the bench divides against.
+/// * [`InnerSolveMode::CpuReference`] — the dense f64 oracle (re-factors per
+///   iterate on the host), used for the correctness parity check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InnerSolveMode {
+    DeviceResident,
+    DeviceReupload,
+    CpuReference,
+}
+
+impl InnerSolveMode {
+    #[inline]
+    const fn on_device(self) -> bool {
+        matches!(self, Self::DeviceResident | Self::DeviceReupload)
+    }
+}
 use crate::solver::arrow_schur::{ArrowSchurError, ArrowSchurSystem};
 
 /// SAE shape used by the resident inner-iteration workspace.
@@ -340,7 +371,26 @@ impl DeviceResidentArrowWorkspace {
                 reason: "SAE resident inner loop unavailable: CUDA runtime did not admit the qwen-scale row-block workload".to_string(),
             });
         }
-        self.run_inner_loop(opts, true)
+        self.run_inner_loop(opts, InnerSolveMode::DeviceResident)
+    }
+
+    /// The #1017 residency baseline: run the SAME inner Newton loop but compute
+    /// each per-iterate arrow step through `solve_arrow_newton_step`, which
+    /// re-packs/re-uploads `D`/`B`/`g` and re-runs the per-row POTRF + border
+    /// Schur factor on EVERY iterate. This is the "current re-uploading path";
+    /// the bench divides [`Self::device_fit`] (resident) against it to isolate
+    /// the across-iteration residency speedup on one device, holding the host
+    /// control flow and the GPU factor kernels fixed.
+    pub fn device_reupload_fit(
+        &self,
+        opts: &DeviceResidentInnerOptions,
+    ) -> Result<DeviceResidentInnerOutcome, DeviceResidentArrowError> {
+        if !self.device_resident() {
+            return Err(DeviceResidentArrowError::Unavailable {
+                reason: "SAE re-uploading inner loop unavailable: CUDA runtime did not admit the row-block workload".to_string(),
+            });
+        }
+        self.run_inner_loop(opts, InnerSolveMode::DeviceReupload)
     }
 
     /// CPU dense-reference inner loop. Bit-for-bit the same host arithmetic as
@@ -350,14 +400,15 @@ impl DeviceResidentArrowWorkspace {
         &self,
         opts: &DeviceResidentInnerOptions,
     ) -> Result<DeviceResidentInnerOutcome, DeviceResidentArrowError> {
-        self.run_inner_loop(opts, false)
+        self.run_inner_loop(opts, InnerSolveMode::CpuReference)
     }
 
     fn run_inner_loop(
         &self,
         opts: &DeviceResidentInnerOptions,
-        on_device: bool,
+        mode: InnerSolveMode,
     ) -> Result<DeviceResidentInnerOutcome, DeviceResidentArrowError> {
+        let on_device = mode.on_device();
         let n = self.shape.n;
         let d = self.shape.d;
         let p = self.shape.p;
@@ -410,8 +461,8 @@ impl DeviceResidentArrowWorkspace {
                 break;
             }
 
-            let solution =
-                if on_device {
+            let solution = match mode {
+                InnerSolveMode::DeviceResident => {
                     // Rebuild the resident frame only when the LM ridge changed; an
                     // unchanged ridge reuses the resident factors. A build failure
                     // becomes a Solve error so the LM-escalation arm below grows the
@@ -448,10 +499,18 @@ impl DeviceResidentArrowWorkspace {
                             }
                         })),
                     }
-                } else {
+                }
+                InnerSolveMode::DeviceReupload => {
+                    // #1017 residency baseline: re-upload D/B/g and re-factor on
+                    // every iterate. Same GPU factor kernels as the resident path,
+                    // minus the across-iteration buffer/factor reuse.
+                    solve_arrow_newton_step(&residual, ridge_t, ridge_beta).map_err(map_gpu_error)
+                }
+                InnerSolveMode::CpuReference => {
                     solve_arrow_newton_step_dense_reference(&residual, ridge_t, ridge_beta)
                         .map_err(|reason| DeviceResidentArrowError::Solve { reason })
-                };
+                }
+            };
 
             let solution = match solution {
                 Ok(sol) => sol,
@@ -1512,12 +1571,36 @@ mod tests {
                 max_step_rel < 1e-9,
                 "resident solve_gradient must match full dense reference step (rel {max_step_rel:e})"
             );
+
+            // The re-uploading GPU loop (residency baseline) must reach the same
+            // minimiser as both the resident loop and the CPU reference.
+            let reup = ws
+                .device_reupload_fit(&opts)
+                .expect("device re-uploading fit");
+            assert!(reup.used_device, "device_reupload_fit must run on device");
+            assert!(reup.converged, "re-uploading loop must converge");
+            let mut max_reup_rel = 0.0_f64;
+            for (a, b) in reup.t.iter().zip(cpu.t.iter()) {
+                max_reup_rel = max_reup_rel.max((a - b).abs() / t_scale);
+            }
+            for (a, b) in reup.beta.iter().zip(cpu.beta.iter()) {
+                max_reup_rel = max_reup_rel.max((a - b).abs() / b_scale);
+            }
+            assert!(
+                max_reup_rel < 1e-9,
+                "re-uploading GPU fit must match CPU reference (rel {max_reup_rel:e})"
+            );
         } else {
             // CPU-only host: the resident path must decline, not disagree.
             let dev = ws.device_fit(&opts);
             assert!(
                 matches!(dev, Err(DeviceResidentArrowError::Unavailable { .. })),
                 "device_fit must report Unavailable on a CPU-only host, got {dev:?}"
+            );
+            let reup = ws.device_reupload_fit(&opts);
+            assert!(
+                matches!(reup, Err(DeviceResidentArrowError::Unavailable { .. })),
+                "device_reupload_fit must report Unavailable on a CPU-only host, got {reup:?}"
             );
             let frame = crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
                 &base,
@@ -1554,6 +1637,16 @@ mod tests {
             assert!(cpu.converged, "{label}: cpu reference must converge");
 
             if ws.device_resident() {
+                // BEFORE: the re-uploading GPU path — re-pack/upload D,B,g and
+                // re-factor every iterate. This is the residency baseline.
+                let t_reup = Instant::now();
+                let reup = ws
+                    .device_reupload_fit(&opts)
+                    .expect("device re-uploading fit");
+                let reup_ms = t_reup.elapsed().as_secs_f64() * 1e3;
+
+                // AFTER: the device-resident path — factor once, upload only the
+                // per-iterate gradient.
                 let t_dev = Instant::now();
                 let dev = ws.device_fit(&opts).expect("device resident fit");
                 let dev_ms = t_dev.elapsed().as_secs_f64() * 1e3;
@@ -1567,20 +1660,36 @@ mod tests {
                 for (a, b) in dev.beta.iter().zip(cpu.beta.iter()) {
                     max_rel = max_rel.max((a - b).abs() / b_scale);
                 }
+                // Resident vs re-uploading must reach the same minimiser too —
+                // they share the GPU factor kernels and differ only in reuse.
+                let mut max_reup_rel = 0.0_f64;
+                for (a, b) in dev.t.iter().zip(reup.t.iter()) {
+                    max_reup_rel = max_reup_rel.max((a - b).abs() / t_scale);
+                }
+                for (a, b) in dev.beta.iter().zip(reup.beta.iter()) {
+                    max_reup_rel = max_reup_rel.max((a - b).abs() / b_scale);
+                }
                 let resident_mib = ws.resident_device_bytes() as f64 / (1024.0 * 1024.0);
                 let host_mib = ws.host_shadow_bytes() as f64 / (1024.0 * 1024.0);
                 println!(
-                    "[#1017 bench {label}] device_fit={dev_ms:.2}ms cpu_ref={cpu_ms:.2}ms \
-                     speedup={:.1}x resident={resident_mib:.1}MiB host_shadow={host_mib:.1}MiB \
-                     ratio={:.2} iters(dev={}/cpu={}) parity_rel={max_rel:e}",
+                    "[#1017 bench {label}] resident={dev_ms:.2}ms reupload={reup_ms:.2}ms \
+                     cpu_ref={cpu_ms:.2}ms residency_speedup={:.2}x (vs reupload) \
+                     vs_cpu={:.1}x resident_mem={resident_mib:.1}MiB host_shadow={host_mib:.1}MiB \
+                     ratio={:.2} iters(res={}/reup={}/cpu={}) parity_rel(cpu={max_rel:e},reup={max_reup_rel:e})",
+                    reup_ms / dev_ms.max(1e-9),
                     cpu_ms / dev_ms.max(1e-9),
                     resident_mib / host_mib.max(1e-9),
                     dev.iterations,
+                    reup.iterations,
                     cpu.iterations,
                 );
                 assert!(
                     max_rel < 1e-9,
                     "{label}: resident device fit must match CPU reference (rel {max_rel:e})"
+                );
+                assert!(
+                    max_reup_rel < 1e-9,
+                    "{label}: resident fit must match re-uploading GPU fit (rel {max_reup_rel:e})"
                 );
             } else {
                 println!(
