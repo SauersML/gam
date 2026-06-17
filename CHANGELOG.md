@@ -1,3 +1,89 @@
+## v0.3.118 — gam 0.3.118 / gamfit 0.1.219 (2026-06-17)
+
+crates.io + PyPI release. The `gam` crate is bumped 0.3.117 → 0.3.118: this is a
+crates.io catch-up that publishes to the `gam` crate all the engine work that has
+shipped to the `gamfit` wheel since gam 0.3.117 (gamfit 0.1.203), plus the open-
+issue bug-fix wave landed since gamfit 0.1.218. Highlights:
+
+**Basis & boundary conditions**
+- **#1238**: B-spline `bc=anchored`/`bc=clamped` endpoints are now enforced as a
+  *structural* nullspace reparameterization — anchored endpoints are pinned to
+  zero (and drop their constrained column), clamped derivatives are zeroed, and a
+  non-zero anchor is rejected. The free intercept is suppressed only for a
+  *one-sided* anchor (which consumes the absolute level at that endpoint); a
+  two-sided anchor keeps the intercept.
+- **#1239**: periodic B-splines evaluate the derivative recurrence on the full
+  wrapped knot support, no longer extrapolate past a clamped boundary, and drop
+  the ridge fallback that masked the wrap.
+- **#1257**: `periodic(x, …)` is accepted as a term-function alias and routes to
+  `cyclic`. **#1132**: periodic/torus `n_harmonics` floored at the decoder-
+  implied harmonic count.
+
+**Manifold-SAE (large body of work: #977 / #1026 / #1132 / #1154 / #1189–#1232)**
+- Chart canonicalization ordering/turning stabilized and the hybrid curved-vs-
+  linear split computed *after* canonicalization (#1227); OOS fixed-decoder solve
+  returns the converged latents (#1229); shape uncertainty recomputed after the
+  structure search settles (#1230); hybrid-collapsed linear images threaded into
+  OOS reconstruction (#1228).
+- Outer objective fixes: BFGS/ARC line-search probe sees pure REML, not `f+c`
+  (#1224); streaming SAE branch optimizes the full REML criterion (#1225);
+  consistent cost/gradient pair in the cotrain outer objective (#1206/#1207);
+  PSD softmax Fisher metric for the curvature anchor (#1190); corrected PG
+  gate-block normalizer in the live K-vs-K+1 birth gate (#1218).
+- n-free per-ψ penalty rebuild + ψ-Gram certification on standardized geometry
+  (#1033 / #1216); EV-knee auto-K + manifold-vs-linear wager verdict (#977 /
+  #1026); honest EV/centering and labeling throughout (#1198 / #1201 / #1202 /
+  #1203 / #1209 / #1213 / #1226).
+- **#1232**: SAE top-k projection metadata preserved in the Python payload;
+  per-atom `held_out_delta_ev` and the (Θ, ΔEV) frontier surfaced through the FFI.
+
+**Survival**
+- **#931**: robust inner-solve polish (regularized-Newton + steepest-descent +
+  Armijo value line-search + exact Cholesky) reaches stationarity at all ρ and
+  large λ; survival LAML objective↔gradient desync closed via the active-set-
+  projected IFT envelope.
+- **#740**: full-θ KKT-residual correction (cross-ρ-ψ + ψ-ψ Hessian); binomial
+  loc-scale drift FD on the identifiable Jeffreys span. **#1242**: derivative-
+  channel location-scale row derivatives aligned with the exact-Newton kernel.
+- **#1248**: `survival_likelihood` canonicalized consistently across CLI and JSON
+  config paths. **#1258**: consistent `expected 0 or 1` event-target message.
+
+**Gaussian / GLM / conformal**
+- **#1262**: an effectively-constant Gaussian response now fits to the exact
+  constant instead of erroring out of the REML path.
+- **#1261**: Gaussian average-derivative one-step debiased against the unpenalized
+  information (sign + smoothing-pull corrections). **#1127**: scale-equivariant
+  REML smoothing-parameter selection.
+- **#942 / #1098 / #1192 / #1263**: GLM full-conformal route contract stabilized
+  (KKT-scaled cold-fit/corrector convergence, round-off-floor cold fit, alternate
+  ARC seed retained after screening).
+
+**Inference**
+- **#939**: Skovgaard r* modified directed-likelihood root for scalar contrasts
+  (matrix-level assembler + ρ̂-variation Bartlett factor + >10% material flag).
+- **#1219**: per-term EDF for `te()`/`ti()` is the influence-matrix trace over the
+  term's coefficient block (was double-counting shared tensor coefficients).
+
+**Terms, families & observation bands**
+- **#1064**: `--family gamma` accepted as an alias for `gamma-log`. **#1160**:
+  `Smooth(by=col)` plumbed through the `smooths={}` descriptor path. **#1158 /
+  #1159**: marginality-aware `:` interaction expansion. **#1214 / #1215**:
+  covariate-rescaling invariance for `cr` and `tp` smooths. **#1246**: sphere
+  `wahba_sobolev`/`wahba_pseudo` aliases + `degree=` route to `harmonic`.
+- **#1193 / #1194** (with #817): equal-tailed Poisson, Tweedie, NB and Beta
+  observation bands.
+
+**Numerics & performance**
+- n-free κ-loop fast path with bit-exact β̂ on the slow path (#1216); on-device
+  CUDA Step-6 joint-β contraction for survival-flex (#1133); per-block
+  λ-coercivity threshold in the penalty pseudo-logdet (#1237); flat-residual
+  stall now exits the inner joint-Newton instead of grinding to the cycle cap
+  (#1040); exact tall RRQR on exact-collinearity (#933); ALO stabilization
+  degrades gracefully instead of aborting the outer eval (#1191).
+
+(See the 0.1.217 / 0.1.218 entries below for the GPU joint-Hessian build fix and
+the BLAS-3 `coord_corrections` perf sweep that this crate release also carries.)
+
 ## gamfit 0.1.218 (2026-06-15)
 
 - **Build fix**: wire the whole-`Xᵀdiag(w)X` GPU joint-Hessian path
