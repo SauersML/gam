@@ -3551,7 +3551,7 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
 /// `non_affine_cell_state_matches_prefold_reference_to_1e_minus_13` accuracy
 /// contract holds. Any future early-certification must bound the value-vs-384
 /// error directly, not merely successive-moment agreement.
-const NON_AFFINE_LADDER_RTOL: f64 = 3e-15;
+const NON_AFFINE_LADDER_RTOL: f64 = 1e-15;
 
 /// Node counts of the progressive ladder below the 384-node terminal rung.
 /// All divisible by 4 so the SIMD sweep needs no scalar tail.
@@ -7062,7 +7062,7 @@ mod tests {
         let eta_uvt = [0.003_f64, -0.002, 0.001, 0.0005];
 
         let neg = |a: &[f64; 4]| a.map(|v| -v);
-        let max_degree = 9usize;
+        let max_degree = 15usize;
 
         // f_uv(s) where param s shifts eta by s·(eta_t + ½ s²... ) — here we
         // build the cell at eta + s·eta_t + s²·eta_vt-style is NOT needed; we
