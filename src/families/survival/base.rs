@@ -1,6 +1,7 @@
 use crate::faer_ndarray::{fast_atv, fast_av, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::custom_family::{
     BlockWorkingSet, CustomFamily, FamilyEvaluation, ParameterBlockState,
+    projected_linear_constraint_stationarity_vector,
 };
 use crate::matrix::SymmetricMatrix;
 use crate::model_types::EstimationError;
@@ -2388,6 +2389,38 @@ impl WorkingModelSurvival {
         let penalty_quadratic = 2.0 * state.penalty_term;
         let provider = SurvivalDerivProvider::new(self.clone(), beta.clone());
 
+        // #931 survival-LAML IFT envelope: the inner constrained survival PIRLS
+        // does not in general reach EXACT stationarity (it exits on a scaled
+        // KKT certificate, and the monotonicity constraints can bind), so the
+        // penalized stationarity vector `r = Sβ̂ + ridge·β̂ − ∇ℓ = state.gradient`
+        // is nonzero at β̂. Passing `kkt_residual: None` asserted exact inner
+        // stationarity and silently dropped the IFT envelope term — a
+        // value↔ρ-gradient leak (`Ṽ = V − ½rᵀH⁻¹r`, paired with its exact
+        // ρ-gradient/Hessian corrections) that desynced the survival LAML
+        // objective from its analytic gradient under finite difference.
+        //
+        // The residual MUST be the ACTIVE-SET-PROJECTED stationarity vector,
+        // not the raw `state.gradient`: a binding monotonicity constraint
+        // contributes a Lagrange-multiplier normal component (`r = Aᵀλ`, λ≥0)
+        // that is NOT a stationarity residual. Project it out through the same
+        // single-source cone primitive the custom_family IFT path uses, so the
+        // `ProjectedKktResidual::from_active_projected` invariant
+        // (`r_A = P_T(Sβ̂ + Γβ̂ − ∇ℓ)`) actually holds. Without this projection
+        // (the reverted first attempt), a tight derivative-floor row injects a
+        // spurious `−½rᵀH⁻¹r` whose ρ-derivative does not match the value's,
+        // making the desync WORSE than dropping the term.
+        let kkt_residual = {
+            let raw = state.gradient.clone();
+            let projected = match self.monotonicity_linear_constraints() {
+                Some(constraints) => projected_linear_constraint_stationarity_vector(
+                    &raw, beta, &constraints, None,
+                )
+                .unwrap_or(raw),
+                None => raw,
+            };
+            crate::model_types::ProjectedKktResidual::from_active_projected(projected)
+        };
+
         let result = InnerAssembly {
             log_likelihood: state.log_likelihood,
             penalty_quadratic,
@@ -2414,7 +2447,7 @@ impl WorkingModelSurvival {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             contracted_psi_second_order: None,
-            kkt_residual: None,
+            kkt_residual: Some(kkt_residual),
             active_constraints: None,
         }
         .evaluate(
