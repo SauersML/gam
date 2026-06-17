@@ -115,15 +115,18 @@ pub const PSI_GRAM_NODE_LADDER: [usize; 5] = [9, 17, 33, 65, 129];
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
 
-/// Maximum factor by which the value-Gram conditioning may grow from the window
-/// center before the #1033 design-revision fast-path skip is considered unsound
-/// (#1216, item 3 — the reduced basis has moved). Inside the resulting
-/// `[skip_psi_lo, skip_psi_hi]` the fast path (re-key Gram + penalty on a frozen
-/// reference surface) reproduces the slow-path β̂; outside it the caller must
-/// take the full `reset_surface`. 10× is comfortably below the conditioning
-/// excursion that shifts the reduced-rank basis, yet wide enough to keep a
-/// useful n-free skip band around the κ-optimum.
-pub const PSI_GRAM_SKIP_COND_FACTOR: f64 = 10.0;
+/// Maximum factor by which the value-Gram conditioning may move ACROSS the
+/// fast-path skip band before the #1033 design-revision skip is considered
+/// unsound (#1216, item 3 — the reduced basis has shifted). Inside the resulting
+/// `[skip_psi_lo, skip_psi_hi]` (where `cond_max/cond_min ≤` this factor) the
+/// fast path (re-key Gram + penalty on a frozen reference surface) reproduces
+/// the slow-path β̂; outside it the caller takes the full `reset_surface`.
+///
+/// A 10× band still left a ~10% β̂ drift on the gate (the radial reduced-rank
+/// basis crosses its RRQR threshold within a 10× conditioning move), so this is
+/// set to 3× — tight enough that the reference→trial reduced basis is stable
+/// while keeping a useful n-free skip band around the κ-optimum.
+pub const PSI_GRAM_SKIP_COND_FACTOR: f64 = 3.0;
 
 /// Number of equispaced scan points used to locate the conditioning-stable skip
 /// sub-window at build (each is a k×k symmetric-eigenvalue solve — cheap).
