@@ -292,6 +292,28 @@ pub fn build_periodic_bspline_basis_1d(
     Ok(out)
 }
 
+fn distinct_periodic_phase_count(u: ArrayView1<'_, f64>, origin: f64, period: f64) -> usize {
+    let mut phases = u
+        .iter()
+        .map(|&value| wrap_periodic_phase(value, origin, period))
+        .collect::<Vec<_>>();
+    phases.sort_by(f64::total_cmp);
+    let tol = 1.0e-12 * period.abs().max(1.0);
+    let mut count = 0usize;
+    let mut previous: Option<f64> = None;
+    for phase in phases {
+        if previous
+            .map(|prev| (phase - prev).abs() <= tol)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        count += 1;
+        previous = Some(phase);
+    }
+    count
+}
+
 pub(crate) fn solve_spd_cholesky(
     a: Array2<f64>,
     b: &Array2<f64>,
@@ -410,6 +432,15 @@ pub fn fit_periodic_bspline_curve(
     }
     if y.iter().any(|v| !v.is_finite()) {
         crate::bail_invalid_basis!("periodic curve outputs must all be finite");
+    }
+    let distinct_phases = distinct_periodic_phase_count(u, spec.origin, spec.period);
+    if distinct_phases < spec.num_basis {
+        crate::bail_invalid_basis!(
+            "periodic curve fit needs at least {} distinct wrapped sample positions for {} basis functions; got {}",
+            spec.num_basis,
+            spec.num_basis,
+            distinct_phases
+        );
     }
 
     let basis = build_periodic_bspline_basis_1d(u, spec)?;

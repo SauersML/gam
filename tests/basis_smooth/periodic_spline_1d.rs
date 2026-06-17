@@ -23,7 +23,7 @@ fn periodic_spline_interpolates_anisotropic_ellipse_in_multi_output_space() {
         y[[i, 1]] = 0.35 * t.sin();
     }
 
-    let spec = PeriodicBSplineBasisSpec::new(3, 16, TWO_PI, 0.0, 2);
+    let spec = PeriodicBSplineBasisSpec::new(3, n, TWO_PI, 0.0, 2);
     let spline =
         fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0).expect("periodic ellipse fit");
     let fitted = spline.evaluate(u.view()).expect("ellipse eval at knots");
@@ -63,7 +63,7 @@ fn periodic_spline_handles_skewed_oval_embedded_in_3d() {
         y[[i, 2]] = 0.25 * (t + 0.3).sin() + 0.1 * (4.0 * t).cos();
     }
 
-    let spec = PeriodicBSplineBasisSpec::new(3, 24, TWO_PI, 0.0, 2);
+    let spec = PeriodicBSplineBasisSpec::new(3, n, TWO_PI, 0.0, 2);
     let spline =
         fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0).expect("periodic 3d oval fit");
     let fitted = spline.evaluate(u.view()).expect("oval eval at knots");
