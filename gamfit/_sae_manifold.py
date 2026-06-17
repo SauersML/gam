@@ -1736,8 +1736,38 @@ class ManifoldSAE:
             initial_logits=logits_init, initial_coords=coords_init,
             top_k=self.top_k,
             jumprelu_threshold=float(self.jumprelu_threshold),
+            # #1228 — thread the trained dictionary's hybrid-collapsed straight
+            # sub-models so the held-out reconstruction decodes verdict-linear
+            # d=1 slots by the SAME linear image the training reconstruction used.
+            hybrid_linear_images=self._hybrid_linear_images_for_oos(),
         )
         return dict(payload)
+
+    def _hybrid_linear_images_for_oos(
+        self,
+    ) -> "list[tuple[int, float, np.ndarray, np.ndarray]] | None":
+        """Extract the per-slot collapsed straight sub-models from the stored
+        ``hybrid_split`` report as ``(atom_idx, t_bar, b0, b1)`` tuples for the
+        OOS reconstruction (#1228). ``None`` when no report is attached or no
+        slot collapsed to linear (an all-curved OOS reconstruction)."""
+        hs = self.hybrid_split
+        if not hs:
+            return None
+        atoms = hs.get("atoms") if isinstance(hs, Mapping) else None
+        if not atoms:
+            return None
+        images: "list[tuple[int, float, np.ndarray, np.ndarray]]" = []
+        for entry in atoms:
+            li = entry.get("linear_image") if isinstance(entry, Mapping) else None
+            if not li:
+                continue
+            images.append((
+                int(li["atom_idx"]),
+                float(li["t_bar"]),
+                np.ascontiguousarray(np.asarray(li["b0"], dtype=float)),
+                np.ascontiguousarray(np.asarray(li["b1"], dtype=float)),
+            ))
+        return images or None
 
     def _is_training_data(self, x: np.ndarray) -> bool:
         """True only for an input that is bit-exactly the training matrix.
