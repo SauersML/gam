@@ -2778,7 +2778,6 @@ fn sae_manifold_fit_inner<'py>(
     if let Some(k_top) = top_k {
         if k_top < k_atoms {
             let n_obs_local = z_view.nrows();
-            let p_out_local = z_view.ncols();
             let renormalise = assignment_kind == "softmax";
             for row in 0..n_obs_local {
                 // Collect (value, atom_idx) pairs; pick the indices of the
@@ -2827,24 +2826,18 @@ fn sae_manifold_fit_inner<'py>(
                     }
                 }
             }
-            // Recompute `fitted` from the projected assignments. Mirrors the
-            // body of `SaeManifoldTerm::try_fitted` but uses our projected
-            // matrix instead of the logit-derived row distribution.
-            fitted = Array2::<f64>::zeros((n_obs_local, p_out_local));
-            let mut g_buf = vec![0.0_f64; p_out_local];
-            for row in 0..n_obs_local {
-                for atom_idx in 0..k_atoms {
-                    let a_k = assignments[[row, atom_idx]];
-                    if a_k == 0.0 {
-                        continue;
-                    }
-                    term.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
-                    let mut out_row = fitted.row_mut(row);
-                    for out_col in 0..p_out_local {
-                        out_row[out_col] += a_k * g_buf[out_col];
-                    }
-                }
-            }
+            // Recompute `fitted` from the projected assignments through the
+            // SHARED collapse-aware assembler so the hard top-k projection
+            // composes with the #1026 hybrid collapse (#1233): a verdict-linear
+            // d = 1 slot still decodes its straight sub-model image, exactly as
+            // the non-projected `term.fitted()` (above) does. Re-deriving the
+            // curved image here by hand with `fill_decoded_row` previously
+            // bypassed the collapse, so `top_k == k_atoms` reconstruction
+            // diverged from the unprojected reconstruction whenever any atom was
+            // hybrid-collapsed linear.
+            fitted = term
+                .reconstruct_from_assignments(assignments.view(), true)
+                .map_err(py_value_error)?;
         }
     }
     term.record_fit_data_collapse_if_needed(
@@ -6108,11 +6101,13 @@ fn sae_manifold_predict_oos<'py>(
         )
         .map_err(py_value_error)?;
 
-    if !logits_are_warm && assignment_kind == "softmax" {
-        seed_oos_softmax_logits_from_projection_residuals(&mut term, x_view, tau);
-    } else if !logits_are_warm && assignment_kind == "ibp_map" {
-        seed_oos_ibp_logits_from_projected_decoder_lsq(&mut term, x_view, tau, alpha);
-    }
+    // Do NOT reseed the logits here. The pre-solve seed above puts each row in
+    // the right basin; `run_fixed_decoder_arrow_schur` then jointly optimizes
+    // the coords AND the assignment logits to convergence. Reseeding from
+    // projection residuals after the solve overwrote those converged logits, so
+    // the returned assignments were the residual-seed routing rather than the
+    // Newton solution the OOS path advertises (#1229). The returned assignments
+    // and fitted values must both be read at the converged state.
     let mut assignments = term.assignment.assignments();
     let mut fitted = term.fitted();
     if let Some(k_top) = top_k {

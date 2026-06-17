@@ -15,6 +15,14 @@ pub(crate) const SAE_CHUNK_CACHE_MULTIPLE: usize = 8;
 pub(crate) const SAE_MIN_STREAMING_CHUNK_ROWS: usize = 256;
 
 pub(crate) const SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER: usize = 32;
+
+/// Headroom kept free when admitting an in-core plan: we never hand the whole
+/// reported "available" figure to a single allocation. `available` from the OS
+/// is an estimate (reclaimable cache, other processes, allocator slack), so a
+/// plan sized at 100% of it routinely OOMs in practice. Reserve the larger of
+/// 1/8 of available and a fixed 256 MiB floor before computing the budget.
+pub(crate) const SAE_HOST_MEMORY_RESERVE_FRACTION_DENOMINATOR: usize = 8;
+pub(crate) const SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES: usize = 256 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaeStreamingPlan {
     pub streaming: bool,
@@ -167,21 +175,80 @@ pub(crate) fn sae_host_available_memory_bytes() -> usize {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let available = sys.available_memory() as usize;
-    if available == 0 {
+    let available = if available == 0 {
         SAE_HOST_IN_CORE_FALLBACK_BYTES
     } else {
         available
+    };
+    // In a container/cgroup the global "available" can vastly exceed the cgroup
+    // memory budget the process is actually allowed; admitting against the host
+    // figure OOM-kills the container. Clamp to the cgroup headroom (limit −
+    // current usage) whenever a finite limit is present.
+    match sae_cgroup_available_bytes() {
+        Some(cgroup) => available.min(cgroup),
+        None => available,
     }
+}
+
+/// Bytes still available to this process under its cgroup memory controller, if
+/// a finite limit is configured (`limit − current`). Returns `None` when there
+/// is no cgroup limit (unlimited / `max`) or the controller cannot be read
+/// (non-Linux, missing files) — in which case the global figure stands.
+fn sae_cgroup_available_bytes() -> Option<usize> {
+    // cgroup v2 unified hierarchy.
+    if let Some(limit) = sae_read_usize_file("/sys/fs/cgroup/memory.max") {
+        let current = sae_read_usize_file("/sys/fs/cgroup/memory.current").unwrap_or(0);
+        return Some(limit.saturating_sub(current));
+    }
+    // cgroup v1 memory controller.
+    if let Some(limit) = sae_read_usize_file("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        let current =
+            sae_read_usize_file("/sys/fs/cgroup/memory/memory.usage_in_bytes").unwrap_or(0);
+        return Some(limit.saturating_sub(current));
+    }
+    None
+}
+
+/// Parse a single unsigned integer from a sysfs/cgroup file. Returns `None`
+/// for `max` (cgroup v2 "no limit"), a v1 sentinel limit larger than any sane
+/// physical budget (effectively unlimited), an unreadable file, or unparseable
+/// contents.
+fn sae_read_usize_file(path: &str) -> Option<usize> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    let value: usize = trimmed.parse().ok()?;
+    // cgroup v1 encodes "unlimited" as a near-`u64::MAX` sentinel; treat any
+    // implausibly large limit (≥ 2^62 bytes) as no limit.
+    if value >= (1usize << 62) {
+        return None;
+    }
+    Some(value)
 }
 
 /// Pure in-core budget rule, factored out of [`sae_host_in_core_budget_bytes`]
 /// so the admission bound can be tested without reading live system memory.
 ///
 /// The in-core fallback floor is a *useful-work* minimum, not a license to
-/// admit more than the box actually has: the budget is `max(fraction, floor)`
-/// but then capped at `available`, so a dense direct plan up to the floor can
-/// never be admitted on a box with less RAM than the floor (which would OOM).
+/// admit more than the box actually has. The budget is `max(fraction, floor)`
+/// capped at the *usable* memory `available − reserve`, where the reserve keeps
+/// OS/allocator headroom free (`available` is an over-estimate). A dense direct
+/// plan up to the floor can never be admitted on a box with less usable RAM
+/// than the floor (which would OOM) — it streams instead.
 pub(crate) const fn sae_host_in_core_budget_from_available(available: usize) -> usize {
+    // Keep headroom free: never size a single plan at 100% of the reported
+    // available figure. Reserve max(available/8, 256 MiB).
+    let reserve = {
+        let frac = available / SAE_HOST_MEMORY_RESERVE_FRACTION_DENOMINATOR;
+        if frac > SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES {
+            frac
+        } else {
+            SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES
+        }
+    };
+    let usable = available.saturating_sub(reserve);
     let fraction = (available.saturating_mul(SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR))
         / SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR;
     let floored = if fraction > SAE_HOST_IN_CORE_FALLBACK_BYTES {
@@ -189,10 +256,12 @@ pub(crate) const fn sae_host_in_core_budget_from_available(available: usize) -> 
     } else {
         SAE_HOST_IN_CORE_FALLBACK_BYTES
     };
-    if floored < available {
+    // Cap at usable: if the floor exceeds usable memory the budget collapses to
+    // usable, so the direct-plan admission gate refuses and the term streams.
+    if floored < usable {
         floored
     } else {
-        available
+        usable
     }
 }
 

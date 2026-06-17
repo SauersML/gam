@@ -956,6 +956,7 @@ impl SaeManifoldOuterObjective {
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
         refine_progress_extension: bool,
+        fold_cotrain: bool,
     ) -> Result<(f64, Array1<f64>), String> {
         let rho = self.baseline_rho.from_flat(rho_flat);
         if let Some(beta) = self.seeded_beta.take() {
@@ -995,11 +996,26 @@ impl SaeManifoldOuterObjective {
         // one-mat-vec encoder can faithfully and certifiably invert. The inner
         // solve already converged to stationarity above, so the consistency fold
         // is evaluated at the exact fitted dictionary and the REML λ-gradient is
-        // untouched (Design A). This is the VALUE-PROBE lane — its cost is never
-        // paired with a gradient — so it is the correct (and per #1206 the ONLY)
-        // place to carry the gradient-free consistency fold; the gradient lane
-        // (`eval`) deliberately omits it to keep its (cost, ∇f) pair consistent.
-        let cost = self.fold_cotrain_consistency(reml_cost, &rho)?;
+        // untouched (Design A).
+        //
+        // #1224 — the fold `c(ρ)` has NO analytic gradient, so it may only be
+        // carried where the cost is never compared against the REML gradient
+        // `∇f`. `fold_cotrain == true` is the CROSS-SEED RANKING / EFS lane
+        // (`eval_cost`): a value-only screen across independent seeds and final
+        // selection, where no `∇f` is in play, so `f+c` is the right ranking
+        // criterion. `fold_cotrain == false` is the BFGS / ARC LINE-SEARCH lane
+        // (`eval_with_order(Value)`): those probes accept/reject steps whose
+        // search DIRECTION came from `eval`'s `∇f`, so a sufficient-decrease test
+        // on `f+c` paired with `∇f` mixes two functions and can stall or wander
+        // (the objective↔gradient desync class, #931/#1206). The line search must
+        // see the SAME pure REML `f` the gradient lane (`eval`) reports. Either
+        // way the discrete collapse barrier stays on both lanes (BFGS rejects
+        // steps into it — the intended infeasibility wall, not a smooth fold).
+        let cost = if fold_cotrain {
+            self.fold_cotrain_consistency(reml_cost, &rho)?
+        } else {
+            reml_cost
+        };
         let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         self.current_rho = rho;
         self.last_loss = Some(loss);
@@ -1193,7 +1209,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // before any derivative consumption, and a probe value — when one is
         // returned at all — is converged to the same KKT/step tolerance as
         // the full-budget path, so all ranked comparisons stay in one measure.
-        match self.evaluate_with_refine_policy(rho.view(), false) {
+        // #1224 — `eval_cost` is the value-only CROSS-SEED RANKING / EFS lane
+        // (seed screening, cross-seed final selection, EFS backtracking). No `∇f`
+        // is ever paired with this cost, so it is the correct place to carry the
+        // derivative-free co-training fold `f+c` (`fold_cotrain = true`).
+        match self.evaluate_with_refine_policy(rho.view(), false, true) {
             Ok((cost, _beta)) => Ok(cost),
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => Ok(f64::INFINITY),
             Err(err) => Err(EstimationError::RemlOptimizationFailed(err)),
@@ -1287,7 +1307,16 @@ impl OuterObjective for SaeManifoldOuterObjective {
     ) -> Result<OuterEval, EstimationError> {
         match order {
             OuterEvalOrder::Value => {
-                let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false) {
+                // #1224 — the `Value` order is the BFGS / ARC LINE-SEARCH cost
+                // probe (see `solver/rho_optimizer/bridges.rs`). Its cost is
+                // compared against steps whose direction came from `eval`'s pure
+                // REML `∇f`, so it must NOT fold in the gradient-free co-training
+                // consistency penalty (`fold_cotrain = false`) — otherwise the
+                // Armijo/Wolfe sufficient-decrease test mixes `f+c` with `∇f` and
+                // can stall or wander. The fold is carried only by the value-only
+                // cross-seed ranking lane (`eval_cost`).
+                let (cost, _beta_hat) =
+                    match self.evaluate_with_refine_policy(rho.view(), false, false) {
                     Ok(evaluated) => evaluated,
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                         return Ok(OuterEval::infeasible(rho.len()));
