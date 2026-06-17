@@ -63,6 +63,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(beta);
         }
+        let beta = project_monotone_wiggle_beta_nonnegative(beta);
         validate_monotone_wiggle_beta_nonnegative(
             &beta,
             "BinomialLocationScaleWiggleFamily post-update",

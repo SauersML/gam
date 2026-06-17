@@ -185,6 +185,34 @@ pub(crate) fn validate_monotone_wiggle_beta_nonnegative<'a>(
     Ok(())
 }
 
+/// Slack tolerance for the `beta >= 0` monotone-wiggle inequality constraints.
+///
+/// The constrained inner Newton/QP holds a binding coordinate at the boundary
+/// only up to its own KKT tolerance, so an accepted step can leave the active
+/// coordinate a few ULPs below zero (e.g. `-2e-9`). That is feasibility within
+/// the solver tolerance, not a genuine sign violation, so the post-update hook
+/// projects such coordinates back onto the non-negative cone (clamps them to
+/// exactly `0`) rather than failing the fit. The band matches the constrained
+/// blockwise solver's KKT tolerances (`1e-6 * scale + 1e-10`,
+/// `1e-10 * (1 + scale)`); anything more negative survives the projection and
+/// is rejected by [`validate_monotone_wiggle_beta_nonnegative`].
+pub(crate) const MONOTONE_WIGGLE_ACTIVE_SET_TOL: f64 = 1e-6;
+
+/// Project a monotone-wiggle coefficient vector onto the non-negative cone the
+/// `beta >= 0` constraints define, clamping coordinates the constrained solve
+/// left slightly negative (within [`MONOTONE_WIGGLE_ACTIVE_SET_TOL`]) to exactly
+/// `0`. Coordinates more negative than the tolerance are left untouched so the
+/// subsequent [`validate_monotone_wiggle_beta_nonnegative`] still rejects
+/// genuine sign violations.
+pub(crate) fn project_monotone_wiggle_beta_nonnegative(mut beta: Array1<f64>) -> Array1<f64> {
+    for value in beta.iter_mut() {
+        if *value < 0.0 && *value >= -MONOTONE_WIGGLE_ACTIVE_SET_TOL {
+            *value = 0.0;
+        }
+    }
+    beta
+}
+
 /// Resolve a requested wiggle penalty-order set into:
 ///
 /// - the primary order used by the monotone I-spline coefficient penalty, and

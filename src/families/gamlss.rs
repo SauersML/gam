@@ -79,8 +79,8 @@ use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::families::wiggle::{
     SelectedWiggleBasis, WiggleBlockConfig, buildwiggle_block_input_from_knots,
     initializewiggle_knots_from_seed, monotone_wiggle_basis_with_derivative_order,
-    monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
-    validate_monotone_wiggle_beta_nonnegative,
+    monotone_wiggle_nonnegative_constraints, project_monotone_wiggle_beta_nonnegative,
+    select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative,
 };
 
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};

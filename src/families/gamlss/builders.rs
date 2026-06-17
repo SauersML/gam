@@ -1991,7 +1991,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             self.wiggle_block.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "gaussian location-scale wiggle")?;
-        let (meanspec, noisespec) = build_gaussian_mean_and_scale_blocks(
+        let (mut meanspec, mut noisespec) = build_gaussian_mean_and_scale_blocks(
             &self.y,
             &self.weights,
             mean_design,
@@ -2004,6 +2004,13 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             noise_beta_hint,
             "GaussianLocationScaleWiggle::build_blocks",
         )?;
+        // Keep the dynamic full-width wiggle basis safe from a canonical-gauge
+        // column drop: route the shared level/intercept alias onto the
+        // column-reducible mean and log-sigma blocks by giving them a lower
+        // gauge priority than the wiggle block's fixed 100 (see the binomial
+        // wiggle path and `build_location_scale_wiggle_block`).
+        meanspec.gauge_priority = LINK_WIGGLE_GAUGE_PRIORITY;
+        noisespec.gauge_priority = LINK_WIGGLE_GAUGE_PRIORITY;
         let n_rows = meanspec.design.nrows();
         let wigglespec = build_location_scale_wiggle_block(
             "wiggle",
@@ -2251,7 +2258,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             self.wiggle_block.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "wiggle location-scale")?;
-        let (thresholdspec, log_sigmaspec) = build_binomial_threshold_and_scale_blocks(
+        let (mut thresholdspec, mut log_sigmaspec) = build_binomial_threshold_and_scale_blocks(
             &self.y,
             &self.weights,
             &self.link_kind,
@@ -2265,6 +2272,19 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             noise_beta_hint,
             "BinomialLocationScaleWiggle::build_blocks",
         )?;
+        // The dynamic monotone wiggle basis is regenerated at full raw width
+        // every inner iteration and asserts `x.ncols() == spec.design.ncols()`
+        // in `block_geometry`, so it cannot tolerate a canonical-gauge column
+        // drop. The level/intercept direction the I-spline shares with the
+        // threshold block must therefore be routed onto the threshold (and the
+        // log-sigma) block, whose static designs are column-reducible and
+        // lifted back via the canonical per-block transform `T`. Give both
+        // non-wiggle blocks a lower gauge priority than the wiggle block (which
+        // `build_location_scale_wiggle_block` fixes at 100) so the shared-level
+        // alias drop lands on them and leaves the dynamic wiggle basis full
+        // width — mirroring the binomial mean-wiggle path.
+        thresholdspec.gauge_priority = LINK_WIGGLE_GAUGE_PRIORITY;
+        log_sigmaspec.gauge_priority = LINK_WIGGLE_GAUGE_PRIORITY;
         let n_rows = thresholdspec.design.nrows();
         let wigglespec = build_location_scale_wiggle_block(
             "wiggle",
