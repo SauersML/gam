@@ -2198,6 +2198,63 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
     let third = family
         .row_flex_primary_third_contracted_exact(0, &block_states, &unit(gi))
         .expect("production third contracted (nonzero deviation)");
+    // DIAG979U: FD-localize which directional THIRD (eta_uv_dir/chi_uv_dir/d_uv_dir)
+    // disagrees with the FD of production's OWN base Hessian jet along g, at the
+    // exit timepoint, entry (gi,wi0). The base eta_uv/chi_uv/d_uv are Hessian-level
+    // (tested-correct); their FD along g IS the true directional third.
+    if std::env::var("DIAG979").is_ok() {
+        let primary_s = flex_primary_slices(&family);
+        let beta_h_arr = Array1::from(beta_h0.clone());
+        let beta_w_arr = Array1::from(beta_w0.clone());
+        let o_infl = family.influence_index_offset(0, &block_states).unwrap();
+        // Base exit timepoint at perturbed g; FD eta_uv/chi_uv/d_uv along g.
+        let base_jets = |gp: f64| -> (f64, f64, f64) {
+            let (a1, d1) = family
+                .solve_row_survival_intercept_with_slot(
+                    q1v,
+                    gp,
+                    Some(&beta_h_arr),
+                    Some(&beta_w_arr),
+                    None,
+                )
+                .unwrap();
+            let tp = family
+                .compute_survival_timepoint_exact(
+                    0, &primary_s, q1v, primary_s.q1, a1, gp, d1,
+                    Some(&beta_h_arr), Some(&beta_w_arr), o_infl, true,
+                )
+                .unwrap();
+            (
+                tp.eta_uv[[gi, wi0]],
+                tp.chi_uv[[gi, wi0]],
+                tp.d_uv[[gi, wi0]],
+            )
+        };
+        let h = 1e-4;
+        let (ep, cp, dp) = base_jets(gv + h);
+        let (em, cm, dm) = base_jets(gv - h);
+        let fd_eta = (ep - em) / (2.0 * h);
+        let fd_chi = (cp - cm) / (2.0 * h);
+        let fd_d = (dp - dm) / (2.0 * h);
+        // Production directional thirds at base g.
+        let (a1b, _d1b) = family
+            .solve_row_survival_intercept_with_slot(
+                q1v, gv, Some(&beta_h_arr), Some(&beta_w_arr), None,
+            )
+            .unwrap();
+        let dirx = family
+            .compute_survival_timepoint_directional_exact(
+                0, &primary_s, q1v, primary_s.q1, a1b, gv,
+                Some(&beta_h_arr), Some(&beta_w_arr), &unit(gi), true,
+            )
+            .unwrap();
+        eprintln!(
+            "DIAG979U eta_uv_dir prod={:+.6e} fd={:+.6e} | chi_uv_dir prod={:+.6e} fd={:+.6e} | d_uv_dir prod={:+.6e} fd={:+.6e}",
+            dirx.eta_uv_dir[[gi, wi0]], fd_eta,
+            dirx.chi_uv_dir[[gi, wi0]], fd_chi,
+            dirx.d_uv_dir[[gi, wi0]], fd_d,
+        );
+    }
     let third_checks = [(q0i, hi0), (gi, wi0), (hi0, wi0), (q0i, wi0)];
     for &(u, v) in &third_checks {
         let want = central_rich(&[(u, 1), (v, 1), (gi, 1)], 6e-3);
