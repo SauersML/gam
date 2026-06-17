@@ -344,8 +344,7 @@ impl Clone for SaeManifoldTerm {
             expected_evidence_gauge_deflated_directions: self
                 .expected_evidence_gauge_deflated_directions,
             evidence_gauge_deflation_reanchors: self.evidence_gauge_deflation_reanchors,
-            evidence_gauge_deflation_last_delta_sign: self
-                .evidence_gauge_deflation_last_delta_sign,
+            evidence_gauge_deflation_last_delta_sign: self.evidence_gauge_deflation_last_delta_sign,
             dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),

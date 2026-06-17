@@ -851,7 +851,6 @@ impl PsiGramTensor {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1455,5 +1454,4 @@ mod tests {
             "kinked design must fail the tail-decay/spot-check certificates"
         );
     }
-
 }

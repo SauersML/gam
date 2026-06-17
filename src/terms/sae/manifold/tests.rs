@@ -204,7 +204,10 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
         term.record_evidence_gauge_deflation_count(c).unwrap();
         assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(c));
     }
-    assert_eq!(term.evidence_gauge_deflation_reanchors, 0, "monotone drift charges no reversals");
+    assert_eq!(
+        term.evidence_gauge_deflation_reanchors, 0,
+        "monotone drift charges no reversals"
+    );
 
     // An OSCILLATING count (up/down/up/down…) IS the runaway pathology. K=1 ⇒
     // reversal budget = 1·(RESEED_BUDGET + 1) + 1 = 6. Each direction reversal
@@ -225,14 +228,20 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
                     "guard must report the oscillating quotient dimension explicitly; got: {err}"
                 );
                 // On the refusal the expected count is NOT re-anchored.
-                assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(last_ok));
+                assert_eq!(
+                    term.expected_evidence_gauge_deflated_directions,
+                    Some(last_ok)
+                );
                 errored = true;
                 break;
             }
         }
     }
     let _ = hi;
-    assert!(errored, "a sustained oscillation must exceed the reversal budget and error");
+    assert!(
+        errored,
+        "a sustained oscillation must exceed the reversal budget and error"
+    );
 }
 
 /// The identity-homotopy shortcut's structural probe: the η dial is inert
@@ -8799,7 +8808,10 @@ pub(crate) fn ibp_map_outer_objective_advertises_analytic_gradient() {
 /// for the real-data curvature-anchor probe.
 pub(crate) fn read_npy_f32_2d(path: &std::path::Path) -> Array2<f64> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert!(bytes.len() > 10 && &bytes[0..6] == b"\x93NUMPY", "not a .npy");
+    assert!(
+        bytes.len() > 10 && &bytes[0..6] == b"\x93NUMPY",
+        "not a .npy"
+    );
     let major = bytes[6];
     let (hdr_start, hdr_len) = if major == 1 {
         (10usize, u16::from_le_bytes([bytes[8], bytes[9]]) as usize)
@@ -8832,12 +8844,8 @@ pub(crate) fn read_npy_f32_2d(path: &std::path::Path) -> Array2<f64> {
     for r in 0..n {
         for c in 0..p {
             let i = (r * p + c) * 4;
-            let v = f32::from_le_bytes([
-                payload[i],
-                payload[i + 1],
-                payload[i + 2],
-                payload[i + 3],
-            ]);
+            let v =
+                f32::from_le_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
             out[[r, c]] = v as f64;
         }
     }
@@ -9905,14 +9913,12 @@ mod inner_contract_probe_tests {
         for hrow in 0..n_holdout {
             let x = heldout.row(hrow);
             // Nearest chart center (same routing as production).
-            let Some((chart_idx, _)) =
-                crate::terms::sae::encode::nearest_chart(
-                    &atlas.atoms[0],
-                    x,
-                    atom0,
-                    evaluator.as_ref(),
-                )
-            else {
+            let Some((chart_idx, _)) = crate::terms::sae::encode::nearest_chart(
+                &atlas.atoms[0],
+                x,
+                atom0,
+                evaluator.as_ref(),
+            ) else {
                 eprintln!("DIAG1154 row {hrow}: no chart");
                 continue;
             };

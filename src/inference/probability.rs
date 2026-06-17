@@ -640,7 +640,11 @@ pub fn negative_binomial_moment_matched_interval(
     // `total_var = SE(μ̂)² + (μ + μ²/θ) > μ` always, so the excess is positive;
     // fall back to the nominal dispersion only if a degenerate caller breaks it.
     let excess = total_var - mu;
-    let theta_eff = if excess > 0.0 { mu * mu / excess } else { theta };
+    let theta_eff = if excess > 0.0 {
+        mu * mu / excess
+    } else {
+        theta
+    };
     let q_lo = negative_binomial_quantile(p_lo, mu, theta_eff);
     let q_hi = negative_binomial_quantile(p_hi, mu, theta_eff);
     if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
@@ -1554,7 +1558,10 @@ mod tests {
         for i in 1..100 {
             let p = i as f64 / 100.0;
             let q = beta_quantile(p, 3.0, 5.0);
-            assert!(q > prev, "beta quantile not increasing at p={p}: {q} <= {prev}");
+            assert!(
+                q > prev,
+                "beta quantile not increasing at p={p}: {q} <= {prev}"
+            );
             prev = q;
         }
     }
@@ -1588,7 +1595,10 @@ mod tests {
         let z = 1.959_963_984_540_054_f64;
         let (lo, hi) =
             beta_moment_matched_interval(mu, total_var, normal_cdf(-z), normal_cdf(z)).unwrap();
-        assert!(0.0 < lo && lo < mu && mu < hi && hi < 1.0, "interval [{lo},{hi}] ∌ μ={mu}");
+        assert!(
+            0.0 < lo && lo < mu && mu < hi && hi < 1.0,
+            "interval [{lo},{hi}] ∌ μ={mu}"
+        );
         let lower_gap = mu - lo;
         let upper_gap = hi - mu;
         assert!(
@@ -1623,8 +1633,7 @@ mod tests {
         let mu = 0.3_f64;
         let obs_var = mu * (1.0 - mu) / (1.0 + phi);
         let (lo0, hi0) = beta_moment_matched_interval(mu, obs_var, 0.025, 0.975).unwrap();
-        let (lo1, hi1) =
-            beta_moment_matched_interval(mu, obs_var + 0.01, 0.025, 0.975).unwrap();
+        let (lo1, hi1) = beta_moment_matched_interval(mu, obs_var + 0.01, 0.025, 0.975).unwrap();
         assert!(
             lo1 < lo0 && hi1 > hi0,
             "estimation uncertainty must widen the band: [{lo0},{hi0}] -> [{lo1},{hi1}]"
@@ -1667,7 +1676,10 @@ mod tests {
                 let prob = theta / (theta + mu);
                 for &p in &[0.01_f64, 0.025, 0.1, 0.5, 0.9, 0.975, 0.99] {
                     let k = negative_binomial_quantile(p, mu, theta);
-                    assert!(k.is_finite() && k >= 0.0 && k.fract() == 0.0, "non-integer k={k}");
+                    assert!(
+                        k.is_finite() && k >= 0.0 && k.fract() == 0.0,
+                        "non-integer k={k}"
+                    );
                     let cdf_k = beta_reg(theta, k + 1.0, prob);
                     assert!(
                         cdf_k + 1e-12 >= p,
@@ -1730,7 +1742,10 @@ mod tests {
         let (lo1, hi1) =
             negative_binomial_moment_matched_interval(mu, theta, obs_var + 40.0, 0.025, 0.975)
                 .unwrap();
-        assert!(lo1 <= lo0 && hi1 > hi0, "band did not widen: [{lo0},{hi0}] -> [{lo1},{hi1}]");
+        assert!(
+            lo1 <= lo0 && hi1 > hi0,
+            "band did not widen: [{lo0},{hi0}] -> [{lo1},{hi1}]"
+        );
     }
 
     #[test]
@@ -1776,7 +1791,10 @@ mod tests {
         for &mu in &[0.3_f64, 1.6, 5.0, 25.0, 120.0] {
             for &p in &[0.01_f64, 0.025, 0.1, 0.5, 0.9, 0.975, 0.99] {
                 let k = poisson_quantile(p, mu);
-                assert!(k.is_finite() && k >= 0.0 && k.fract() == 0.0, "non-integer k={k}");
+                assert!(
+                    k.is_finite() && k >= 0.0 && k.fract() == 0.0,
+                    "non-integer k={k}"
+                );
                 let cdf_k = poisson_cdf_at(k, mu);
                 assert!(cdf_k + 1e-12 >= p, "CDF({k}) = {cdf_k} < p = {p} (μ={mu})");
                 if k >= 1.0 {
@@ -1804,7 +1822,10 @@ mod tests {
         for i in 1..100 {
             let p = i as f64 / 100.0;
             let q = poisson_quantile(p, 4.0);
-            assert!(q >= prev, "Poisson quantile decreased at p={p}: {q} < {prev}");
+            assert!(
+                q >= prev,
+                "Poisson quantile decreased at p={p}: {q} < {prev}"
+            );
             prev = q;
         }
     }
@@ -1828,7 +1849,10 @@ mod tests {
         let mu = 20.0_f64;
         let (lo0, hi0) = poisson_moment_matched_interval(mu, mu, 0.025, 0.975).unwrap();
         let (lo1, hi1) = poisson_moment_matched_interval(mu, mu + 40.0, 0.025, 0.975).unwrap();
-        assert!(lo1 <= lo0 && hi1 > hi0, "band did not widen: [{lo0},{hi0}] -> [{lo1},{hi1}]");
+        assert!(
+            lo1 <= lo0 && hi1 > hi0,
+            "band did not widen: [{lo0},{hi0}] -> [{lo1},{hi1}]"
+        );
         // A negligible excess (θ_eff above the switch threshold) must coincide
         // with the exact conditional Poisson — no discontinuity at the boundary.
         let (lo2, hi2) =
@@ -1850,7 +1874,10 @@ mod tests {
             "equal-tailed upper {hi} should exceed symmetric upper {sym_hi}"
         );
         // Upper tail reaches further from μ than the lower tail (right skew).
-        assert!((hi - mu) > (mu - lo), "band not right-skewed: lo={lo}, hi={hi}, μ={mu}");
+        assert!(
+            (hi - mu) > (mu - lo),
+            "band not right-skewed: lo={lo}, hi={hi}, μ={mu}"
+        );
     }
 
     #[test]
@@ -1873,7 +1900,10 @@ mod tests {
         let lambda = mu.powf(2.0 - power) / (phi * (2.0 - power));
         let zero_mass = (-lambda).exp();
         for &q in &[0.30_f64, 0.5, 0.75, 0.9, 0.975, 0.99] {
-            assert!(q > zero_mass, "test q must exceed the zero atom {zero_mass}");
+            assert!(
+                q > zero_mass,
+                "test q must exceed the zero atom {zero_mass}"
+            );
             let y = tweedie_quantile(q, mu, phi, power);
             assert!(y.is_finite() && y > 0.0, "quantile out of support: {y}");
             let cdf = tweedie_cdf_at(y, mu, phi, power);
@@ -1891,7 +1921,10 @@ mod tests {
         let power = 1.5_f64;
         let lambda = mu.powf(2.0 - power) / (phi * (2.0 - power));
         let zero_mass = (-lambda).exp();
-        assert!(zero_mass > 0.025, "fixture must have a fat zero atom: {zero_mass}");
+        assert!(
+            zero_mass > 0.025,
+            "fixture must have a fat zero atom: {zero_mass}"
+        );
         assert_eq!(tweedie_quantile(0.025, mu, phi, power), 0.0);
         assert_eq!(tweedie_quantile(0.5 * zero_mass, mu, phi, power), 0.0);
     }
@@ -1934,7 +1967,10 @@ mod tests {
         let (lo, hi) =
             tweedie_moment_matched_interval(mu, phi, power, total_var, 0.025, 0.975).unwrap();
         assert!(lo >= 0.0 && hi > mu && lo < mu);
-        assert!(hi - mu > mu - lo, "interval is not right-skewed: lo={lo}, hi={hi}");
+        assert!(
+            hi - mu > mu - lo,
+            "interval is not right-skewed: lo={lo}, hi={hi}"
+        );
     }
 
     #[test]
@@ -1949,7 +1985,10 @@ mod tests {
             tweedie_moment_matched_interval(mu, phi, power, obs_var, 0.025, 0.975).unwrap();
         let (lo1, hi1) =
             tweedie_moment_matched_interval(mu, phi, power, obs_var + 30.0, 0.025, 0.975).unwrap();
-        assert!(lo1 <= lo0 && hi1 > hi0, "band did not widen: [{lo0},{hi0}] -> [{lo1},{hi1}]");
+        assert!(
+            lo1 <= lo0 && hi1 > hi0,
+            "band did not widen: [{lo0},{hi0}] -> [{lo1},{hi1}]"
+        );
     }
 
     #[test]

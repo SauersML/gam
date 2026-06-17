@@ -944,11 +944,7 @@ pub fn fit_spline_scan(
     // `(2m−1)·log L` where `L` is the abscissa span (which scales linearly with
     // the covariate), so the search is performed in scale-free units and the
     // selected `q · L^{2m−1}` — hence the posterior `f(x)` — is invariant.
-    let span = nodes
-        .last()
-        .map(|n| n.x)
-        .unwrap_or(0.0)
-        - nodes.first().map(|n| n.x).unwrap_or(0.0);
+    let span = nodes.last().map(|n| n.x).unwrap_or(0.0) - nodes.first().map(|n| n.x).unwrap_or(0.0);
     let scale_shift = if span.is_finite() && span > 0.0 {
         (2 * order - 1) as f64 * span.ln()
     } else {

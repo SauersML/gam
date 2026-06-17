@@ -2392,8 +2392,8 @@ mod tests {
         // squaring may report 3 or 4 — only that the margin signals the cliff.)
         let unit = Array1::<f64>::ones(n);
         let gram = fast_xt_diag_x_with_parallelism(&a, &unit, faer::get_global_parallelism());
-        let gram_rrqr = rrqr_from_gram_with_permutation(&gram, n, alpha)
-            .expect("Gram RRQR should succeed");
+        let gram_rrqr =
+            rrqr_from_gram_with_permutation(&gram, n, alpha).expect("Gram RRQR should succeed");
         assert!(
             gram_rrqr.verdict_margin < JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST,
             "exact-collinearity Gram verdict must report low margin to force tall \
@@ -2424,8 +2424,8 @@ mod tests {
         let alpha = default_rrqr_rank_alpha();
         let unit = Array1::<f64>::ones(n);
         let gram = fast_xt_diag_x_with_parallelism(&a, &unit, faer::get_global_parallelism());
-        let gram_rrqr = rrqr_from_gram_with_permutation(&gram, n, alpha)
-            .expect("Gram RRQR should succeed");
+        let gram_rrqr =
+            rrqr_from_gram_with_permutation(&gram, n, alpha).expect("Gram RRQR should succeed");
         assert_eq!(gram_rrqr.rank, p, "full-rank design must keep all columns");
         assert!(
             gram_rrqr.verdict_margin >= JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST,

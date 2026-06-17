@@ -1,9 +1,9 @@
 use crate::estimate::EstimationError;
-use crate::quadrature::latent_cloglog_jet5;
 use crate::probability::{
     normal_cdf, normal_pdf,
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
 };
+use crate::quadrature::latent_cloglog_jet5;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
     MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, StandardLink,

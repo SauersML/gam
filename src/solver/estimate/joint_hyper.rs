@@ -145,9 +145,8 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// means no exact rebuild is staged — the fast path then refuses (hard
     /// error) when `supports_nfree_penalty_rekey` is set, so a stale `S` can
     /// never be silently paired.
-    pub(crate) pending_psi_penalty: Option<
-        std::sync::Arc<(Vec<crate::construction::CanonicalPenalty>, Vec<usize>)>,
-    >,
+    pub(crate) pending_psi_penalty:
+        Option<std::sync::Arc<(Vec<crate::construction::CanonicalPenalty>, Vec<usize>)>>,
     /// True when the design `cache` can rebuild `S(ψ)` exactly and n-free for
     /// the single spatial term (frozen-geometry Duchon/Matérn/ThinPlate). The
     /// fast-path design-realization skip gates on this (replacing the old
@@ -498,7 +497,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains_for_skip(psi))
     }
 
-
     /// True when the design-revision fast path of [`Self::prepare_eval_state`]
     /// would fire for `design_revision` — i.e. a prior eval has already pinned
     /// `last_canonical_revision` to this exact realizer revision, so the next
@@ -627,8 +625,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let Some(staged) = self.pending_psi_penalty.take() else {
             return Ok(false);
         };
-        let (canonical, nullspace_dims) = std::sync::Arc::try_unwrap(staged)
-            .unwrap_or_else(|arc| (*arc).clone());
+        let (canonical, nullspace_dims) =
+            std::sync::Arc::try_unwrap(staged).unwrap_or_else(|arc| (*arc).clone());
         self.reml_state
             .refresh_canonical_penalty_surface(Arc::new(canonical), nullspace_dims)?;
         log::debug!(
@@ -700,7 +698,11 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                      exact S(psi) was staged for psi={:.6} (theta_len={}, rho_dim={}); the \
                      reset_surface skip would leave a stale S(psi). The caller must call \
                      stage_fast_path_penalty before every skip-path eval.",
-                    if theta.len() > rho_dim { theta[rho_dim] } else { f64::NAN },
+                    if theta.len() > rho_dim {
+                        theta[rho_dim]
+                    } else {
+                        f64::NAN
+                    },
                     theta.len(),
                     rho_dim,
                 );
@@ -1019,7 +1021,11 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                      enabled but no exact S(psi) was staged for psi={:.6} (theta_len={}, \
                      rho_dim={}); the reset_surface skip would leave a stale S(psi). The caller \
                      must call stage_fast_path_penalty before every skip-path value probe.",
-                    if theta.len() > rho_dim { theta[rho_dim] } else { f64::NAN },
+                    if theta.len() > rho_dim {
+                        theta[rho_dim]
+                    } else {
+                        f64::NAN
+                    },
                     theta.len(),
                     rho_dim,
                 );

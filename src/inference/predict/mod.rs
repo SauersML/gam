@@ -35,8 +35,8 @@ use crate::mixture_link::{
 };
 use crate::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
-    negative_binomial_moment_matched_interval, normal_cdf, normal_pdf, poisson_moment_matched_interval,
-    standard_normal_quantile, tweedie_moment_matched_interval,
+    negative_binomial_moment_matched_interval, normal_cdf, normal_pdf,
+    poisson_moment_matched_interval, standard_normal_quantile, tweedie_moment_matched_interval,
 };
 use crate::quadrature::QuadratureContext;
 use crate::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};

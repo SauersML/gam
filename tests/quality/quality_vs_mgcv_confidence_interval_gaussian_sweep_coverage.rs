@@ -198,7 +198,11 @@ fn gam_confidence_interval_domain_averaged_coverage_hits_nominal() {
             .expect("gam conditional-covariance interval prediction");
 
             // Score: is the TRUE eta inside [eta_lower, eta_upper] per grid point?
-            assert_eq!(pred.eta_lower.len(), N_GRID, "gam eta_lower length mismatch");
+            assert_eq!(
+                pred.eta_lower.len(),
+                N_GRID,
+                "gam eta_lower length mismatch"
+            );
             let mut hits = [0usize; N_BINS];
             let mut total = [0usize; N_BINS];
             for g in 0..N_GRID {

@@ -166,9 +166,7 @@ impl SaeManifoldOuterObjective {
     /// telemetry tally and the log, never invisible.
     fn record_warm_start(&mut self, outcome: Result<usize, String>) {
         if let Err(err) = &outcome {
-            log::debug!(
-                "[SAE/#1207] amortized warm-start fell back to a cold inner solve: {err}"
-            );
+            log::debug!("[SAE/#1207] amortized warm-start fell back to a cold inner solve: {err}");
         }
         self.warm_start_telemetry.record(&outcome);
     }
@@ -784,9 +782,7 @@ impl SaeManifoldOuterObjective {
             }
             sst
         };
-        let anchor_ev = if target_sst > f64::MIN_POSITIVE
-            && anchor_residual_norm_sq.is_finite()
-        {
+        let anchor_ev = if target_sst > f64::MIN_POSITIVE && anchor_residual_norm_sq.is_finite() {
             1.0 - anchor_residual_norm_sq / target_sst
         } else {
             // No usable ceiling estimate: fall back to the absolute floor.
