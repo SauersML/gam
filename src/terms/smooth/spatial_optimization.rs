@@ -5149,7 +5149,7 @@ fn build_term_collection_fixed_blocks(
     spec: &TermCollectionSpec,
 ) -> Result<Vec<DesignBlock>, BasisError> {
     let mut blocks = Vec::<DesignBlock>::new();
-    if !term_collection_has_anchored_bspline(spec) {
+    if !term_collection_has_one_sided_anchored_bspline(spec) {
         blocks.push(DesignBlock::Intercept(data.nrows()));
     }
 
