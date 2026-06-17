@@ -4707,11 +4707,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             ));
         }
         let term_idx = spatial_terms[0];
-        // Duchon/Matérn/ThinPlate η is a geometry-derived basis parameter
-        // (auto-seeded from centers), not a ψ axis — the ψ-derived contrasts are
-        // unused here (and `None` for the single-isotropic-ψ fast path anyway);
-        // the FROZEN metadata aniso is what the penalty rebuild consumes.
-        let (ls_opt, _aniso_from_psi) = spatial_term_psi_to_length_scale_and_aniso(psi);
+        // Decode ψ with the same chart used by the slow rebuild path. For
+        // Matérn, per-axis ψ entries are REML hyper-coordinates, so the n-free
+        // penalty rebuild must consume the trial η contrasts as well as the
+        // scalar length scale. Duchon keeps η as fixed geometry and continues
+        // to use frozen metadata below.
+        let (ls_opt, aniso_from_psi) = spatial_term_psi_to_length_scale_and_aniso(psi);
         // Pull the spec-level penalty configuration (which operator orders are
         // active / double_penalty) — ψ-invariant, frozen at construction.
         let termspec = self
@@ -4771,12 +4772,13 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     SmoothBasisSpec::Matern { spec, .. } => spec.double_penalty,
                     _ => true,
                 };
+                let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
                 crate::basis::matern_penalties_at_length_scale(
                     centers.view(),
                     identifiability_transform.as_ref(),
                     *nu,
                     *include_intercept,
-                    aniso_log_scales.as_deref(),
+                    aniso_for_penalty,
                     *nullspace_shrinkage_survived,
                     double_penalty,
                     ls,
