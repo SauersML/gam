@@ -726,8 +726,16 @@ impl SaeManifoldOuterObjective {
             // No usable ceiling estimate: fall back to the absolute floor.
             CURVATURE_WALK_ARRIVAL_EV_FLOOR
         };
+        // The relative floor relaxes the absolute one DOWN to the data-achievable
+        // ceiling, but never BELOW the data-collapse floor the sentinel itself
+        // keys on: a fit at or under `SAE_FIT_DATA_COLLAPSE_EV_FLOOR` is genuinely
+        // degenerate (worse than a constant predictor would warrant) and must
+        // always route to recovery, even when a pathological anchor estimate
+        // (negative / near-zero `anchor_ev`) would otherwise drop the floor to
+        // zero and wave the collapse through.
         let arrival_floor = CURVATURE_WALK_ARRIVAL_EV_FLOOR
-            .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * anchor_ev);
+            .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * anchor_ev)
+            .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
         if arrived
             && let Ok(final_fit) = self.term.try_fitted_for_rho(&rho)
             && let Some(final_ev) =
