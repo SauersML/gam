@@ -500,6 +500,100 @@ fn run_device_inner_iter(shape: &Shape) -> Result<(), String> {
     Ok(())
 }
 
+/// Per-solve host→device upload bytes for the two inner-loop modes (#1017).
+///
+/// `reupload` re-packs and re-uploads the full constant system every iterate:
+/// `D` (n·d·d), `B` (n·d·k), and the gradient (n·d + k). `resident` keeps
+/// `D`/`B`/their factors on the device and uploads only the gradient
+/// (n·d + k). The difference is the per-solve traffic residency eliminates.
+fn per_solve_upload_bytes(n: usize, d: usize, k: usize) -> (usize, usize) {
+    let f64_sz = std::mem::size_of::<f64>();
+    let gradient = (n * d + k) * f64_sz;
+    let constant_blocks = (n * d * d + n * d * k) * f64_sz;
+    let reupload = constant_blocks + gradient;
+    let resident = gradient;
+    (reupload, resident)
+}
+
+/// #1017 residency measurement: resident vs reupload on one device. Asserts
+/// bit-for-bit identity (the two paths share host control flow + GPU factor
+/// kernels, differing ONLY in across-iteration reuse) and reports the per-solve
+/// upload bytes residency eliminates plus the across-iteration wall-clock.
+fn measure_residency_vs_reupload(
+    shape: &Shape,
+    workspace: &gam::gpu::kernels::sae_resident::DeviceResidentArrowWorkspace,
+    opts: &DeviceResidentInnerOptions,
+) -> Result<(), String> {
+    let reupload_start = Instant::now();
+    let reupload = match workspace.device_reupload_fit(opts) {
+        Ok(outcome) => outcome,
+        Err(DeviceResidentArrowError::Unavailable { reason }) => {
+            print_stage(
+                shape,
+                "device_residency",
+                0.0,
+                &format!("status=skipped reason=\"{}\"", reason.replace('"', "'")),
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(format!("device_reupload_fit failed: {err}")),
+    };
+    let reupload_ms = ms(reupload_start);
+
+    let resident_start = Instant::now();
+    let resident = workspace
+        .device_fit(opts)
+        .map_err(|err| format!("device_fit (resident) failed: {err}"))?;
+    let resident_ms = ms(resident_start);
+
+    let t_err = max_abs_diff(
+        resident.t.as_slice().ok_or("resident t not contiguous")?,
+        reupload.t.as_slice().ok_or("reupload t not contiguous")?,
+    );
+    let beta_err = max_abs_diff(
+        resident
+            .beta
+            .as_slice()
+            .ok_or("resident beta not contiguous")?,
+        reupload
+            .beta
+            .as_slice()
+            .ok_or("reupload beta not contiguous")?,
+    );
+    let obj_err = (resident.objective - reupload.objective).abs();
+    let max_err = t_err.max(beta_err).max(obj_err);
+
+    let shp = workspace.shape();
+    let (reupload_bytes, resident_bytes) = per_solve_upload_bytes(shp.n, shp.d, shp.p);
+    let saved_bytes = reupload_bytes.saturating_sub(resident_bytes);
+    // Both paths take the same number of accepted iterates (identical control
+    // flow), so per-solve bytes × iterations is the traffic residency removes.
+    let iters = resident.iterations.max(1);
+    let total_saved = saved_bytes * iters;
+    print_stage(
+        shape,
+        "device_residency",
+        resident_ms,
+        &format!(
+            "status=ok max_abs_err={max_err:.3e} bit_identical={} \
+             reupload_ms={reupload_ms:.3} resident_ms={resident_ms:.3} speedup={:.3} \
+             iters={iters} per_solve_upload_reupload_bytes={reupload_bytes} \
+             per_solve_upload_resident_bytes={resident_bytes} \
+             per_solve_upload_saved_bytes={saved_bytes} \
+             total_upload_saved_bytes={total_saved}",
+            max_err == 0.0,
+            reupload_ms / resident_ms.max(f64::MIN_POSITIVE),
+        ),
+    );
+    if max_err != 0.0 {
+        return Err(format!(
+            "device_residency non-identical: resident vs reupload max_abs_err={max_err:e} \
+             (the two paths share host flow + GPU factor kernels and MUST be bit-identical)"
+        ));
+    }
+    Ok(())
+}
+
 fn run_device_fit(shape: &Shape) -> Result<(), String> {
     let build_start = Instant::now();
     let workspace = qwen_non_gating_fixture().map_err(|err| err.to_string())?;
@@ -563,6 +657,16 @@ fn run_device_fit(shape: &Shape) -> Result<(), String> {
             "device_fit parity failed: max_abs_err={max_err:e} > {DEVICE_PARITY_TOL:e}"
         ));
     }
+
+    // #1017 residency lever: resident `device_fit` vs the `device_reupload_fit`
+    // baseline on ONE device. Both run the identical host inner-Newton loop and
+    // the identical GPU factor kernels; they differ ONLY in across-iteration
+    // buffer/factor reuse, so the outputs MUST be bit-for-bit identical. The
+    // measured win is the per-solve upload eliminated: the reupload path re-packs
+    // and re-uploads D (n·d·d), B (n·d·k) and g (n·d + k) on EVERY iterate and
+    // re-runs the per-row POTRF + border Schur factor, whereas the resident path
+    // uploads only the O(n·d + k) gradient and re-runs no factorization.
+    measure_residency_vs_reupload(shape, &workspace, &opts)?;
 
     // Phase 4: stream-multiplexed independent fits == sequential, bit-identical.
     let fit_count = 8usize;
