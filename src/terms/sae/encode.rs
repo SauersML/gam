@@ -51,8 +51,9 @@
 //!    Newton radius `R_c` solved from the Kantorovich inequality at the
 //!    worst-case in-chart start.
 //! 2. **Online, per row** ([`EncodeAtlas::certified_encode_row`]): route to the
-//!    nearest chart, take one or two Newton steps, then the `h ≤ ½` check AT the
-//!    start point is the per-row certificate.
+//!    nearest chart, start from its distilled IFT predictor, take one or two
+//!    Newton steps, then the `h ≤ ½` check AT the start point is the per-row
+//!    certificate.
 //! 3. **Uncertified tail**: rows whose start fails `h ≤ ½` are FLAGGED (counted
 //!    in [`EncodeResult::encode_uncertified_count`]) and must be routed by the
 //!    caller to the existing exact multi-start solve. No approximation enters
@@ -1265,11 +1266,54 @@ impl EncodeAtlas {
         })
     }
 
+    fn refine_certified_encode_start(
+        &self,
+        atom: &SaeManifoldAtom,
+        evaluator: &dyn SaeBasisEvaluator,
+        chart: &CertifiedChart,
+        t: Array1<f64>,
+        x: ArrayView1<'_, f64>,
+        amplitude: f64,
+    ) -> Result<(Array1<f64>, RowCertificate), String> {
+        let (cert, delta) = row_certificate(
+            atom,
+            evaluator,
+            t.view(),
+            x,
+            amplitude,
+            chart.lipschitz,
+            self.config.ridge,
+        )?;
+        if !cert.certified() {
+            return Ok((t, cert));
+        }
+        let Some(probe) = refine_certified_start(
+            atom,
+            evaluator,
+            t,
+            x,
+            amplitude,
+            chart.lipschitz,
+            self.config.ridge,
+            self.config.newton_steps,
+            cert,
+            delta,
+        )?
+        else {
+            return Ok((
+                Array1::<f64>::zeros(atom.latent_dim),
+                uncertified_certificate(chart.lipschitz),
+            ));
+        };
+        Ok((probe.coord, probe.initial_cert))
+    }
+
     /// Online certified encode of one target row `x` against one atom `k` with
-    /// fixed amplitude `z`. Routes to the nearest chart, starts from the chart
-    /// center, runs `config.newton_steps` Newton steps, and returns the encoded
-    /// coordinate with its certificate. An uncertified start (no chart, `h > ½`)
-    /// flags the row for the exact multi-start fallback.
+    /// fixed amplitude `z`. Routes to the nearest chart, starts from that chart's
+    /// distilled IFT warm start, runs `config.newton_steps` Newton steps, and
+    /// returns the encoded coordinate with its certificate. An uncertified start
+    /// (no chart, no distilled Jacobian, non-positive amplitude, or `h > ½`)
+    /// flags the row for the exact multi-start caller.
     pub fn certified_encode_row(
         &self,
         atom: &SaeManifoldAtom,
@@ -1315,42 +1359,13 @@ impl EncodeAtlas {
             ));
         };
         let chart = &atom_atlas.charts[chart_idx];
-        // This path is the independent cold certified probe. It deliberately
-        // starts from the chart center rather than the distilled encoder's
-        // prediction; otherwise the "exact" probe would share the approximation
-        // being audited and could not bound amortized encode error.
-        let t = chart.region.center.clone();
-        let (cert, delta) = row_certificate(
-            atom,
-            evaluator.as_ref(),
-            t.view(),
-            x,
-            amplitude,
-            chart.lipschitz,
-            self.config.ridge,
-        )?;
-        if !cert.certified() {
-            return Ok((t, cert));
-        }
-        let Some(probe) = refine_certified_start(
-            atom,
-            evaluator.as_ref(),
-            t,
-            x,
-            amplitude,
-            chart.lipschitz,
-            self.config.ridge,
-            self.config.newton_steps,
-            cert,
-            delta,
-        )?
-        else {
+        let Some(t) = amortized_warm_start(chart, x, amplitude) else {
             return Ok((
                 Array1::<f64>::zeros(d),
                 uncertified_certificate(chart.lipschitz),
             ));
         };
-        Ok((probe.coord, probe.initial_cert))
+        self.refine_certified_encode_start(atom, evaluator.as_ref(), chart, t, x, amplitude)
     }
 
     /// Amortized (distilled) encode of one target row `x` against one atom `k`
@@ -1745,7 +1760,8 @@ impl EncodeAtlas {
     /// [`Self::certified_encode_with_index`] (LSH proposes the best-aligned atom,
     /// the atlas routes to the in-atom nearest chart), but the in-atom encode is
     /// the closed-form per-chart Jacobian predictor + certificate gate of
-    /// [`Self::amortized_encode_row`] rather than the chart-center Newton solve.
+    /// [`Self::amortized_encode_row`] rather than the certified Newton-refinement
+    /// path.
     /// This is the deployment path: the distilled affine map produces the encode
     /// in one mat-vec, the Kantorovich certificate decides trust-or-fallback per
     /// row, and uncertified rows (the adversarial tail the thread expects to
@@ -2173,7 +2189,9 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
         // take the tighter (periodic) step `0.5/res` to keep every chart valid
         // on both axes. The certified Kantorovich radius refines it per chart.
         Cylinder => 0.5 / (resolution.max(2) as f64),
-        Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) => 1.0 / (resolution.max(2) as f64),
+        Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) => {
+            1.0 / (resolution.max(2) as f64)
+        }
     }
 }
 
@@ -2208,6 +2226,7 @@ pub(crate) fn chart_region(
         }
         // Cylinder has no radial kernel block (it is a harmonic × polynomial
         // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
-        Periodic | Sphere | Torus | Cylinder | Linear | EuclideanPatch | Poincare | Precomputed(_) => region,
+        Periodic | Sphere | Torus | Cylinder | Linear | EuclideanPatch | Poincare
+        | Precomputed(_) => region,
     }
 }

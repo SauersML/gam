@@ -32,7 +32,7 @@ pub struct AmortizedEncoderConsistency {
     /// the IFT predictor reproduces the encode map exactly to first order.
     pub recon_consistency: f64,
     /// Fraction of (row, atom) amortized encodes whose Kantorovich certificate
-    /// failed (`h > ½`) and fell back to the exact chart-center Newton.
+    /// failed (`h > ½`) and fell back to the certified Newton encode.
     pub uncertified_fraction: f64,
     /// Count of uncertified (row, atom) encodes (numerator of the fraction).
     pub n_uncertified: usize,
@@ -2343,7 +2343,7 @@ impl SaeManifoldTerm {
     /// This is the thread's "encoder + certificate-gated exact fallback"
     /// deployment made reachable from a fit: the distilled map approximates
     /// inference at one mat-vec/row, and any row whose amortized prediction fails
-    /// `h ≤ ½` falls back to the chart-center-start exact Newton encode
+    /// `h ≤ ½` falls back to the certified IFT-warm-start Newton encode
     /// ([`EncodeAtlas::certified_encode_row`]); rows that still cannot be
     /// certified ride the [`EncodeResult::encode_uncertified_count`] flag for the
     /// upstream exact multi-start solve (honesty, never a silent wrong encode).
@@ -2412,9 +2412,9 @@ impl SaeManifoldTerm {
         )?;
 
         // Per-atom amortized encode with a certificate-gated exact-solve fallback:
-        // a row whose distilled prediction fails `h ≤ ½` is retried from the
-        // chart-center start (the non-amortized exact Newton); a row that still
-        // cannot be certified stays flagged for the upstream multi-start solve.
+        // a row whose distilled prediction fails `h ≤ ½` is retried through the
+        // certified IFT-warm-start Newton path; a row that still cannot be
+        // certified stays flagged for the upstream multi-start solve.
         // (The atlas is rho-free; the per-row amplitudes already carry the
         // rho-resolved assignment masses the caller produced upstream.)
         let mut results = Vec::with_capacity(k_atoms);
@@ -2497,7 +2497,7 @@ impl SaeManifoldTerm {
     ///   faithful amortized encode — the architectural co-adaptation #1154 adds.
     /// * `uncertified_fraction`: the share of (row, atom) encodes whose
     ///   Kantorovich certificate failed (`h > ½`), i.e. that fell back to the
-    ///   exact chart-center Newton. This is the encoder's *certifiable coverage*
+    ///   certified IFT-warm-start Newton. This is the encoder's *certifiable coverage*
     ///   of the dictionary; co-training rewards dictionaries the cheap encode
     ///   certifies, not just ones it happens to land.
     ///
@@ -2614,9 +2614,13 @@ impl SaeManifoldTerm {
         // inner solve closer to the stationary point used for the fold.
         // Advisory only (0 or err falls back to cold); telemetry recorded by
         // outer objective callers when present.
-        let warm_n = self.warm_start_latents_from_amortized_encoder(target, rho).unwrap_or(0);
+        let warm_n = self
+            .warm_start_latents_from_amortized_encoder(target, rho)
+            .unwrap_or(0);
         if warm_n > 0 {
-            eprintln!("SAE-INNER: warm-started {warm_n} rows for reml_criterion (inner_max_iter={inner_max_iter})");
+            eprintln!(
+                "SAE-INNER: warm-started {warm_n} rows for reml_criterion (inner_max_iter={inner_max_iter})"
+            );
         }
         let (reml, loss) = self.reml_criterion_with_refine_policy(
             target,
@@ -2665,7 +2669,7 @@ impl SaeManifoldTerm {
     /// against each atom at the rho-resolved assignment masses, and overwrites
     /// each atom's stored latent coords with the predicted `t̂` ON THE ROWS THE
     /// KANTOROVICH CERTIFICATE ACCEPTS. Uncertified rows are left at their
-    /// current coords (the cold chart-center / previous-iterate start), so the
+    /// current coords (the previous-iterate start), so the
     /// warm-start can only HELP — a row the cheap predictor cannot certify never
     /// corrupts the seed. The subsequent inner Newton refines from this seed to
     /// the SAME stationary point (the warm-start changes only the basin entry,
@@ -5838,7 +5842,9 @@ impl SaeManifoldTerm {
                 if let Ok((_dt, _db, stationary_cache)) =
                     solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
                 {
-                    eprintln!("SAE-INNER-STALL-OK: accepted at numerical fixed point after objective stall, ‖g‖={grad_norm:.6e}");
+                    eprintln!(
+                        "SAE-INNER-STALL-OK: accepted at numerical fixed point after objective stall, ‖g‖={grad_norm:.6e}"
+                    );
                     return Ok(stationary_cache);
                 }
                 // Stagnated AND the undamped factor still fails: this is the

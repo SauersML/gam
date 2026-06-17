@@ -507,7 +507,7 @@ fn amortized_encode_recovers_planted_coordinate_on_certified_rows() {
 
 #[test]
 fn amortized_encode_matches_certified_newton_on_certified_rows() {
-    // The distilled encoder and the chart-center Newton encoder solve the SAME
+    // The distilled encoder and the certified Newton encoder solve the SAME
     // frozen-dictionary problem; on rows both certify, they must converge to the
     // same coordinate (both land the unique root in the certified ball). This is
     // the "encoder approximates inference" guarantee made exact by the
@@ -570,11 +570,11 @@ fn amortized_encode_matches_certified_newton_on_certified_rows() {
 }
 
 #[test]
-fn certified_encode_row_is_independent_of_distilled_warm_start() {
-    // Regression for #1166: the cold certified path is the exact probe used to
-    // audit the distilled encoder. It must not consume the distilled Jacobian;
-    // otherwise poisoning that Jacobian makes the "exact" probe self-referential
-    // and it can no longer detect amortized encode error.
+fn amortized_encode_row_audits_poisoned_distilled_warm_start() {
+    // The production certified encode now starts from the distilled IFT warm
+    // start (#1154). The amortized encoder's honesty gate still carries the
+    // independent chart-center audit, so poisoning the distilled Jacobian must
+    // be flagged rather than silently accepted.
     let atom = planted_circle_atom(16);
     let atlas = EncodeAtlas::build(
         std::slice::from_ref(&atom),
@@ -589,10 +589,13 @@ fn certified_encode_row_is_independent_of_distilled_warm_start() {
     .expect("atlas build");
     let x = circle_target(0.2);
 
-    let (cold_t, cold_cert) = atlas
+    let (_baseline_t, baseline_cert) = atlas
         .certified_encode_row(&atom, 0, x.view(), 1.0)
-        .expect("cold certified encode");
-    assert!(cold_cert.certified(), "baseline cold probe must certify");
+        .expect("baseline certified encode");
+    assert!(
+        baseline_cert.certified(),
+        "baseline certified encode must certify"
+    );
 
     let mut poisoned = atlas.clone();
     for chart in &mut poisoned.atoms[0].charts {
@@ -601,19 +604,6 @@ fn certified_encode_row_is_independent_of_distilled_warm_start() {
             jacobian[[0, 0]] = 100.0;
         }
     }
-
-    let (poisoned_cold_t, poisoned_cold_cert) = poisoned
-        .certified_encode_row(&atom, 0, x.view(), 1.0)
-        .expect("poisoned cold certified encode");
-    assert!(
-        poisoned_cold_cert.certified(),
-        "poisoning the distilled Jacobian must not affect the cold exact probe"
-    );
-    let cold_gap = (poisoned_cold_t[0] - cold_t[0]).abs();
-    assert!(
-        cold_gap < 1e-12,
-        "cold probe changed after distilled-Jacobian poison: gap = {cold_gap}"
-    );
 
     let (_poisoned_amortized_t, poisoned_amortized_cert) = poisoned
         .amortized_encode_row(&atom, 0, x.view(), 1.0)
