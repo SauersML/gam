@@ -4930,23 +4930,26 @@ impl SaeManifoldTerm {
             self.k_atoms(),
         )?;
         if plan.streaming {
-            let mut rho_fixed = rho.clone();
-            let loss = self.run_joint_fit_arrow_schur(
+            // #1225: streaming and dense MUST optimize the SAME mathematical
+            // objective — the full REML criterion `loss.total() + extra_penalty +
+            // ½ log|H| − Occam`. The streaming branch previously returned only
+            // `loss.total() + extra_penalty_energy`, dropping the Laplace
+            // normalizer `½ log|H|` and the Occam term, so large shapes (exactly
+            // where streaming is needed) were ranked by penalized loss rather than
+            // REML — and dense vs streaming disagreed on the objective. Route
+            // through the streaming exact-logdet path, which assembles the same
+            // chunk-by-chunk-bit-identical `½ log|H|_stream` and the same
+            // `−Occam`/extra-penalty terms as the dense `reml_criterion_with_cache`
+            // (different memory strategy, same objective).
+            self.reml_criterion_streaming_exact(
                 target,
-                &mut rho_fixed,
+                rho,
                 registry,
                 inner_max_iter,
                 learning_rate,
                 ridge_ext_coord,
                 ridge_beta,
-            )?;
-            let extra_penalty_energy = match registry {
-                Some(reg) => self
-                    .reml_extra_penalty_value_total(reg)
-                    .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
-                None => 0.0,
-            };
-            Ok((loss.total() + extra_penalty_energy, loss))
+            )
         } else {
             let (v, loss, _cache) = self.reml_criterion_with_cache_refine_policy(
                 target,

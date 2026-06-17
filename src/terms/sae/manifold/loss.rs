@@ -15,12 +15,54 @@ impl SaeManifoldLoss {
         self.data_fit + self.assignment_sparsity + self.smoothness + self.ard
     }
 
-    /// Laplace/REML wrappers rank larger evidence higher. This local score is
-    /// the negative penalized objective, used when a full `RemlState` is not
-    /// driving the term yet.
-    pub const fn evidence_proxy(&self) -> f64 {
+    /// Negative penalized loss `−(data_fit + assignment_sparsity + smoothness +
+    /// ard)`. Larger is "less penalized loss", so Laplace/REML wrappers that rank
+    /// larger-is-better can sort on it — but this is **not** a REML / marginal
+    /// likelihood: it omits the Hessian log-determinant, the Occam log-λ term,
+    /// any extra analytic penalties, the co-training fold, the top-k projection
+    /// effect, and hybrid-collapse effects (#1231). Callers must surface it under
+    /// an honest name (`penalized_loss_score`, or `oos_penalized_loss` on the
+    /// fixed-decoder OOS path), never `reml_score`.
+    pub const fn penalized_loss_score(&self) -> f64 {
         -self.total()
     }
+
+    /// Honest component breakdown of [`Self::total`] — the four penalized-loss
+    /// terms this struct actually carries — so a consumer can see exactly what
+    /// the score is (and what it is *not*: it is missing the evidence pieces
+    /// listed on [`Self::penalized_loss_score`]). The values are the raw
+    /// (positive) loss contributions; `penalized_loss_score == −Σ` of the first
+    /// four.
+    pub const fn breakdown(&self) -> SaeManifoldLossBreakdown {
+        SaeManifoldLossBreakdown {
+            data_fit: self.data_fit,
+            assignment_sparsity: self.assignment_sparsity,
+            smoothness: self.smoothness,
+            ard: self.ard,
+            total_penalized_loss: self.total(),
+            penalized_loss_score: self.penalized_loss_score(),
+            evidence_gauge_deflated_directions: self.evidence_gauge_deflated_directions,
+        }
+    }
+}
+
+/// Honest, fully-itemized view of [`SaeManifoldLoss`] for the model output. It
+/// reports the penalized-loss components that the score is actually built from,
+/// and is deliberately NOT named or shaped like a REML / evidence breakdown:
+/// the Hessian log-determinant, Occam log-λ, extra penalties, co-training fold,
+/// and top-k / hybrid-collapse effects are not part of this object (#1231).
+#[derive(Debug, Clone, Copy)]
+pub struct SaeManifoldLossBreakdown {
+    pub data_fit: f64,
+    pub assignment_sparsity: f64,
+    pub smoothness: f64,
+    pub ard: f64,
+    /// `data_fit + assignment_sparsity + smoothness + ard`.
+    pub total_penalized_loss: f64,
+    /// `−total_penalized_loss` (larger = less penalized loss).
+    pub penalized_loss_score: f64,
+    /// Count of evidence-gauge-deflated directions recorded on the loss.
+    pub evidence_gauge_deflated_directions: usize,
 }
 
 /// Componentized analytic derivative of the SAE REML criterion with respect to

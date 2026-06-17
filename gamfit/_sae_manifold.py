@@ -1722,9 +1722,27 @@ class ManifoldSAE:
         )
         return dict(payload)
 
+    def _is_training_data(self, x: np.ndarray) -> bool:
+        """True only for an input that is bit-exactly the training matrix.
+
+        Reconstruction / encoding is a function of the EXACT input, so the
+        cached-training shortcut must require exact equality — a near-duplicate
+        input must take the OOS solve path. Identity is the fast path; otherwise
+        compare shape, dtype, and every byte via :func:`np.array_equal`. Never
+        use tolerance equality (``np.allclose``) for model semantics.
+        """
+        td = self.training_data
+        if x is td:
+            return True
+        return (
+            x.shape == td.shape
+            and x.dtype == td.dtype
+            and np.array_equal(x, td)
+        )
+
     def reconstruct(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> np.ndarray:
         x = _as_2d_float(X, "X")
-        if t_init is None and a_init is None and x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+        if t_init is None and a_init is None and self._is_training_data(x):
             return self.fitted.copy()
         payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
         return np.asarray(payload["fitted"], dtype=float)
@@ -1770,7 +1788,7 @@ class ManifoldSAE:
             if return_stats:
                 return encoded, stats.to_dict()
             return encoded
-        if t_init is None and a_init is None and x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+        if t_init is None and a_init is None and self._is_training_data(x):
             encoded = self.assignments.copy()
             if return_stats:
                 return encoded, {
@@ -1806,7 +1824,7 @@ class ManifoldSAE:
         x = None if X is None else _as_2d_float(X, "X")
         use_training = (
             t_init is None and a_init is None
-            and (x is None or (x.shape == self.training_data.shape and np.allclose(x, self.training_data)))
+            and (x is None or self._is_training_data(x))
         )
         if use_training:
             return {
@@ -1834,7 +1852,7 @@ class ManifoldSAE:
         if k < 0 or k >= len(self.atoms):
             raise IndexError(f"atom_k={atom_k} out of range for K={len(self.atoms)} atoms")
         x = _as_2d_float(X, "X")
-        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+        if self._is_training_data(x):
             return self.coords[k].copy()
         payload = self._oos_payload(x)
         return np.asarray(payload["atoms"][k]["on_atom_coords_t"], dtype=float)
@@ -1929,7 +1947,7 @@ class ManifoldSAE:
         is run on ``X`` and its converged assignments are thresholded."""
         x = _as_2d_float(X, "X")
         cut = 0.5 if threshold is None else float(threshold)
-        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+        if self._is_training_data(x):
             return self.assignments >= cut
         payload = self._oos_payload(x)
         return np.asarray(payload["assignments_z"], dtype=float) >= cut
@@ -1941,7 +1959,7 @@ class ManifoldSAE:
         returned; otherwise the frozen-decoder OOS solve is run on ``X`` and its
         converged per-atom coordinates are returned."""
         x = _as_2d_float(X, "X")
-        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+        if self._is_training_data(x):
             return [c.copy() for c in self.coords]
         payload = self._oos_payload(x)
         return [np.asarray(atom["on_atom_coords_t"], dtype=float) for atom in payload["atoms"]]
@@ -3066,9 +3084,7 @@ def _trust_scores(model: ManifoldSAE, activations: np.ndarray | None = None) -> 
     n_rows = int(x.shape[0])
     atom_trust = atom_trust_scores(model.diagnostics)
     n_atoms = int(atom_trust.shape[0])
-    if activations is None or (
-        x.shape == model.training_data.shape and np.allclose(x, model.training_data)
-    ):
+    if activations is None or model._is_training_data(x):
         assignments = np.asarray(model.assignments, dtype=float)
     else:
         assignments = np.asarray(model.encode(x), dtype=float)

@@ -299,3 +299,64 @@ def test_sae_manifold_oos_reconstruction_idempotence():
         z_test_guard,
         err_msg="reconstruct mutated its input array in place",
     )
+
+
+def test_near_duplicate_training_input_takes_oos_path_not_cache():
+    """Regression for S17 (#1235): the cached-training shortcut must require
+    BIT-EXACT input. A tiny perturbation of the training matrix is NOT the
+    training data, so ``reconstruct`` / ``encode`` must run the OOS solve and
+    produce input-specific output — never silently return the cached training
+    fit (which the old ``np.allclose`` shortcut did for any near-duplicate
+    within tolerance).
+    """
+    z_train, _ = _circle_data(n=200, p=48, noise=0.04, seed=11)
+    fit = gamfit.sae_manifold_fit(
+        X=z_train,
+        K=1,
+        atom_basis="periodic",
+        d_atom=2,
+        assignment="ibp_map",
+        n_iter=50,
+        learning_rate=0.04,
+        random_state=0,
+    )
+
+    # Exact training input still hits the cache (bit-identical to fit.fitted).
+    cached = fit.reconstruct(z_train)
+    np.testing.assert_array_equal(
+        cached,
+        fit.fitted,
+        err_msg="exact training input must return the cached training fit",
+    )
+
+    # A perturbation well inside np.allclose's default tolerance (rtol=1e-5,
+    # atol=1e-8) but NOT bit-exact: the old shortcut would have returned the
+    # cache for this; the exact shortcut must route it through the OOS solve.
+    z_near = z_train.copy()
+    z_near[0, 0] += 1e-7
+    assert np.allclose(z_near, z_train), (
+        "test perturbation must be within np.allclose tolerance to exercise "
+        "the regression (otherwise the old code would also miss the cache)"
+    )
+    assert not np.array_equal(z_near, z_train)
+
+    near = fit.reconstruct(z_near)
+    # The OOS path must produce a result that reflects the perturbed input,
+    # not a verbatim copy of the cached training fit.
+    assert not np.array_equal(near, fit.fitted), (
+        "near-duplicate input silently returned the cached training "
+        "reconstruction — the tolerance-based shortcut is back"
+    )
+    assert np.all(np.isfinite(near))
+
+    # encode shares the same exact-match guard.
+    enc_exact = fit.encode(z_train)
+    enc_near = fit.encode(z_near)
+    np.testing.assert_array_equal(
+        enc_exact,
+        fit.assignments,
+        err_msg="exact training input must return cached assignments",
+    )
+    assert not np.array_equal(enc_near, fit.assignments), (
+        "near-duplicate input silently returned cached encode assignments"
+    )

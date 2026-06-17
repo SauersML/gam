@@ -174,9 +174,76 @@ pub(crate) fn sae_host_available_memory_bytes() -> usize {
     }
 }
 
+/// Pure in-core budget rule, factored out of [`sae_host_in_core_budget_bytes`]
+/// so the admission bound can be tested without reading live system memory.
+///
+/// The in-core fallback floor is a *useful-work* minimum, not a license to
+/// admit more than the box actually has: the budget is `max(fraction, floor)`
+/// but then capped at `available`, so a dense direct plan up to the floor can
+/// never be admitted on a box with less RAM than the floor (which would OOM).
+pub(crate) const fn sae_host_in_core_budget_from_available(available: usize) -> usize {
+    let fraction = (available.saturating_mul(SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR))
+        / SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR;
+    let floored = if fraction > SAE_HOST_IN_CORE_FALLBACK_BYTES {
+        fraction
+    } else {
+        SAE_HOST_IN_CORE_FALLBACK_BYTES
+    };
+    if floored < available {
+        floored
+    } else {
+        available
+    }
+}
+
 pub(crate) fn sae_host_in_core_budget_bytes() -> (usize, usize) {
     let available = sae_host_available_memory_bytes();
-    let fraction = available.saturating_mul(SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR)
-        / SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR;
-    (fraction.max(SAE_HOST_IN_CORE_FALLBACK_BYTES), available)
+    (sae_host_in_core_budget_from_available(available), available)
+}
+
+#[cfg(test)]
+mod host_in_core_budget_tests {
+    use super::*;
+
+    #[test]
+    fn budget_never_exceeds_available() {
+        // Below the floor: the 2 GiB fallback must NOT inflate the budget past
+        // the (smaller) available memory, or a dense direct plan up to 2 GiB
+        // could be admitted on a box with <2 GiB → OOM.
+        let tiny = 512 * 1024 * 1024; // 512 MiB available
+        let budget = sae_host_in_core_budget_from_available(tiny);
+        assert!(
+            budget <= tiny,
+            "budget {budget} must not exceed available {tiny}"
+        );
+
+        // Just above the floor but with the fraction below it: budget is the
+        // floor, still capped at available.
+        for &avail in &[
+            0usize,
+            1,
+            SAE_HOST_IN_CORE_FALLBACK_BYTES - 1,
+            SAE_HOST_IN_CORE_FALLBACK_BYTES,
+            SAE_HOST_IN_CORE_FALLBACK_BYTES + 1,
+            16 * 1024 * 1024 * 1024,
+        ] {
+            let budget = sae_host_in_core_budget_from_available(avail);
+            assert!(
+                budget <= avail,
+                "budget {budget} must not exceed available {avail}"
+            );
+        }
+    }
+
+    #[test]
+    fn ample_memory_uses_fraction_floored_at_2gib() {
+        // 16 GiB available → fraction = 3/5·16 = 9.6 GiB, above the floor and
+        // below available, so the budget is the fraction.
+        let avail = 16 * 1024 * 1024 * 1024usize;
+        let budget = sae_host_in_core_budget_from_available(avail);
+        let fraction = avail * SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR
+            / SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR;
+        assert_eq!(budget, fraction);
+        assert!(budget >= SAE_HOST_IN_CORE_FALLBACK_BYTES);
+    }
 }
