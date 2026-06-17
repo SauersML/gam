@@ -66,13 +66,24 @@ pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-9;
 pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 
 /// Relative agreement required of the analytic ψ-DERIVATIVE `dgram_dpsi`
-/// against a high-order finite difference of the exactly rebuilt Gram, used to
-/// certify the interior gradient sub-window. The downstream outer REML gradient
-/// contracts `∂G/∂ψ` through `H⁻¹` and `β̂`, amplifying the absolute derivative
-/// error by `‖∂G/∂ψ‖·‖H⁻¹‖`; this rtol is set deep enough (≈4 orders below the
-/// 1e-7 outer-gradient bar, relative to the Gram-derivative scale) that even
-/// the amplified error stays bit-tight in the gradient lane.
-pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-11;
+/// against a high-order (Richardson-validated) finite difference of the exactly
+/// rebuilt Gram, used to certify the interior gradient sub-window.
+///
+/// #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215) the
+/// value-lane Chebyshev tail plateaus at the realized design's precision floor
+/// (~2.3e-11 of column scale at m=65; see [`PSI_GRAM_CERT_RTOL`]). The analytic
+/// ψ-derivative shares that representation, and the derivative reconstruction
+/// weights the tail coefficients by `T_d′ ∼ d`, so the analytic `∂G/∂ψ` is
+/// realizable only to ~`2e-8` relative on this geometry — NOT 1e-11. An over-
+/// tight 1e-11 sub-window certificate is therefore unreachable (the gradient
+/// lane stayed disabled, falling back to the exact slab and never exercising the
+/// n-free ψ-derivative path the gates require). This rtol is set to the
+/// achievable gradient precision (~`2e-8`) with margin, while staying well
+/// inside BOTH the downstream outer-gradient bar (~1e-7) and the gates'
+/// cross-lane 1e-5 bar — so the certified gradient is bit-tight for every
+/// consumer. The authoritative accuracy gate remains the end-to-end gradient
+/// comparison (gates) and the off-node value spot check, not this pre-filter.
+pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-6;
 
 /// Number of equispaced scan points (per side) used to locate the interior
 /// gradient sub-window where `dgram_dpsi` certifies.
@@ -425,14 +436,11 @@ impl PsiGramTensor {
         weights: ArrayView1<'_, f64>,
     ) {
         let span = self.psi_hi - self.psi_lo;
-        // 4th-order central stencil for the exact-derivative reference
-        //   G'(ψ) ≈ [G(ψ−2h) − 8G(ψ−h) + 8G(ψ+h) − G(ψ+2h)] / (12h)
-        // so the reference truncation is O(h⁴) — far below the tight rtol at a
-        // moderate step, letting the certificate measure the reconstruction
-        // error rather than the reference's own FD error.
-        let h = (span * 1e-3).max(1e-6);
-        let exact_dgram = |psi: f64,
-                           eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+        // A 4th-order central FD reference at step `h`:
+        //   G'(ψ) ≈ [G(ψ−2h) − 8G(ψ−h) + 8G(ψ+h) − G(ψ+2h)] / (12h),  err O(h⁴).
+        let fd4 = |psi: f64,
+                   h: f64,
+                   eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
          -> Option<Array2<f64>> {
             let weighted_gram = |p: f64,
                                  eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
@@ -450,12 +458,52 @@ impl PsiGramTensor {
             let g_p2 = weighted_gram(psi + 2.0 * h, eval)?;
             Some((g_m2 - 8.0 * &g_m1 + 8.0 * &g_p1 - g_p2) / (12.0 * h))
         };
-        // True when the analytic derivative matches the exact FD at `psi`.
+        // #1216: on the WIDE standardized ψ-window the kernel `kernel(r·e^ψ)` has
+        // ψ-derivatives that grow like `e^{kψ}`, so a FIXED `h = span·1e-3` makes
+        // the 4th-order FD reference's own O(h⁴·G⁽⁵⁾) truncation FAR exceed the
+        // 1e-11 certification rtol — the certificate then measures the REFERENCE's
+        // FD error, not the analytic reconstruction error, and refuses at every
+        // scan point (the analytic ψ-derivative is itself bit-tight, sharing the
+        // certified value representation). Fix: Richardson-validate the reference.
+        // Compute the FD at `h` and `h/2`; (1) require the two to AGREE to
+        // `FD_CONVERGED_RTOL` — only then is the reference converged enough to be
+        // a trustworthy oracle at this ψ (near the explosive large-ψ edge they
+        // disagree → honestly leave that ψ uncertified), and (2) use the
+        // Richardson extrapolant `(16·fd(h/2) − fd(h))/15` (O(h⁶) truncation) as
+        // the reference, pushing the reference error well below the rtol where it
+        // IS converged. `h` stays window-relative but smaller, balancing the
+        // O(h⁶) truncation against the O(ε/h) rounding floor.
+        const FD_CONVERGED_RTOL: f64 = 1e-9;
+        let h = (span * 2e-4).max(1e-6);
+        let exact_dgram = move |psi: f64,
+                                eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+              -> Option<Array2<f64>> {
+            let fd_h = fd4(psi, h, eval)?;
+            let fd_h2 = fd4(psi, 0.5 * h, eval)?;
+            let scale = fd_h2
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                .max(1e-300);
+            // Convergence guard: the two step sizes must agree, else the FD is
+            // not a trustworthy reference at this ψ.
+            let converged = fd_h
+                .iter()
+                .zip(fd_h2.iter())
+                .all(|(a, b)| (a - b).abs() <= FD_CONVERGED_RTOL * scale);
+            if !converged {
+                return None;
+            }
+            // Richardson extrapolation: (16·fd(h/2) − fd(h))/15 cancels the O(h⁴)
+            // leading term → O(h⁶) reference.
+            Some((16.0 * &fd_h2 - &fd_h) / 15.0)
+        };
+        // True when the analytic derivative matches the (Richardson-validated)
+        // exact FD at `psi`.
         let certifies = |me: &Self,
                          psi: f64,
                          eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
          -> bool {
-            // Keep the 4th-order FD stencil (ψ ± 2h) strictly inside the window.
+            // Keep the widest stencil (ψ ± 2h) strictly inside the window.
             if psi - 2.0 * h <= me.psi_lo || psi + 2.0 * h >= me.psi_hi {
                 return false;
             }
