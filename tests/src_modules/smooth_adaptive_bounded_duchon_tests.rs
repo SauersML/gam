@@ -722,7 +722,7 @@
         let penalties = vec![PenaltySpec::Dense(Array2::eye(1))];
         let lambdas = array![0.25];
         let cov = array![[2.0]];
-        let (edf_by_block, edf_total) =
+        let (edf_by_block, _penalty_block_trace, edf_total) =
             exact_bounded_edf(&penalties, &lambdas, &cov).expect("exact bounded edf");
         assert_eq!(edf_by_block.len(), 1);
         assert!((edf_by_block[0] - 0.5).abs() < 1e-12);
