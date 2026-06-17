@@ -2622,6 +2622,11 @@ fn sae_manifold_fit_inner<'py>(
     // earns its atom across rounds; a spurious one fails the held-out gate and is
     // recorded contested.
     let mut structure_ledger = gam::inference::structure_evidence::StructureLedger::new();
+    // #1230 — whether structure search actually changed the model (a landed
+    // birth/fission/fusion or a demoted death). When it did, the pre-search
+    // joint-Hessian shape bands assembled above are stale and must be recomputed
+    // from the final post-search per-atom inner fits (below).
+    let mut structure_changed = false;
     let structure_search_json = {
         // Per-round harvest breadth derived from the fitted K (magic-by-default):
         // propose at most a handful of each move kind, scaled gently with the
@@ -2669,6 +2674,7 @@ fn sae_manifold_fit_inner<'py>(
             &mut structure_ledger,
         ) {
             Ok(result) => {
+                structure_changed = result.structure_changed();
                 term = result.term;
                 rho = result.rho;
                 gam::solver::structure_harvest::rounds_to_json(&result.rounds).ok()
@@ -2735,6 +2741,19 @@ fn sae_manifold_fit_inner<'py>(
     // missing bands are filled, and a degenerate born atom (no active rows /
     // non-SPD inner Hessian) keeps an honest NaN band rather than a fabricated one.
     // After this, NO post-search atom is reported without an uncertainty band.
+    // #1230 — if structure search changed the model (a landed birth/fission/
+    // fusion or a demoted death), the warm refit re-converged the WHOLE
+    // dictionary at a new ρ, so the SEED atoms' pre-search joint-Hessian bands
+    // (assembled before `into_fitted`/search) are stale. Invalidate every band so
+    // the completion pass below recomputes ALL of them — seed and born — from
+    // each atom's OWN final penalized inner Hessian harvested at the settled
+    // post-search state by `set_atom_inner_fits` above. When the structure did
+    // NOT change, term/rho are byte-for-byte the pre-search fit and the exact
+    // joint-Hessian seed bands are kept (higher quality than the per-atom Laplace
+    // approximation).
+    if structure_changed {
+        shape_uncertainty.invalidate_bands_for_recompute();
+    }
     term.complete_born_atom_shape_bands(&mut shape_uncertainty)
         .map_err(py_value_error)?;
 

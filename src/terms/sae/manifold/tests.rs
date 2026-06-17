@@ -1969,6 +1969,128 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
     );
 }
 
+/// #1233 — the hard `top_k` reconstruction must compose with the #1026 hybrid
+/// collapse. The FFI top-k path reconstructs from a PROJECTED assignment matrix
+/// through [`SaeManifoldTerm::reconstruct_from_assignments`]; that shared
+/// assembler must decode a verdict-linear `d = 1` slot by its straight
+/// sub-model image (exactly as the production `fitted()` does), not by the
+/// original curved decoder. The regression: with `top_k == K` (every atom kept,
+/// i.e. the full soft assignment), the collapse-aware projected reconstruction
+/// must EXACTLY equal the non-projected collapsed reconstruction, INCLUDING when
+/// a slot is hybrid-collapsed linear — and must DIFFER from the curved-only
+/// reconstruction, proving the collapse is genuinely engaged on this path.
+#[test]
+pub(crate) fn topk_reconstruction_composes_with_hybrid_collapse() {
+    let (mut term, _t, rho) = small_two_atom_periodic_term();
+
+    // Straighten atom 0 so its verdict collapses to the linear tail.
+    for basis_row in 1..term.atoms[0].decoder_coefficients.nrows() {
+        for out_col in 0..term.atoms[0].decoder_coefficients.ncols() {
+            term.atoms[0].decoder_coefficients[[basis_row, out_col]] = 0.0;
+        }
+    }
+    let target = term
+        .try_fitted_for_rho(&rho)
+        .expect("post-straighten curved reconstruction assembles");
+    let report = term
+        .compute_hybrid_split_report(&rho, Some(target.view()))
+        .expect("hybrid split report computes")
+        .expect("eligible d=1 atoms present a report");
+    term.hybrid_split_report = Some(report);
+    assert!(
+        term.hybrid_linear_image_map().contains_key(&0),
+        "atom 0 must have collapsed to a linear image for this regression"
+    );
+
+    // `top_k == K` keeps every atom: the projected assignment matrix IS the full
+    // soft assignment, so the projected (collapse-aware) reconstruction must
+    // match the production collapsed `fitted()` bit-for-bit.
+    let full_assignments = term.assignment.assignments();
+    let projected_collapsed = term
+        .reconstruct_from_assignments(full_assignments.view(), true)
+        .expect("collapse-aware projected reconstruction assembles");
+    let production_collapsed = term.fitted();
+    let max_gap = (&projected_collapsed - &production_collapsed)
+        .iter()
+        .fold(0.0_f64, |m, d| m.max(d.abs()));
+    assert!(
+        max_gap < 1e-12,
+        "top_k==K collapse-aware reconstruction must equal the non-projected \
+         collapsed fitted() (incl. the linear-collapsed slot); max gap {max_gap:e}"
+    );
+
+    // And it must DIFFER from the curved-only assembly — otherwise the collapse
+    // is a silent no-op and the test would pass vacuously.
+    let projected_curved = term
+        .reconstruct_from_assignments(full_assignments.view(), false)
+        .expect("curved projected reconstruction assembles");
+    let curved_gap = (&projected_collapsed - &projected_curved)
+        .iter()
+        .fold(0.0_f64, |m, d| m.max(d.abs()));
+    assert!(
+        curved_gap > 1e-9,
+        "the collapsed slot must change the reconstruction vs the curved decoder \
+         (collapse engaged); max gap {curved_gap:e}"
+    );
+}
+
+/// #1228 — an OOS term must reconstruct a hybrid-collapsed `d = 1` slot by the
+/// trained dictionary's straight sub-model when those images are attached via
+/// [`SaeManifoldTerm::set_hybrid_linear_images`], matching the train-side
+/// collapse policy instead of the original curved decoder.
+#[test]
+pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
+    let (mut term, _t, rho) = small_two_atom_periodic_term();
+    for basis_row in 1..term.atoms[0].decoder_coefficients.nrows() {
+        for out_col in 0..term.atoms[0].decoder_coefficients.ncols() {
+            term.atoms[0].decoder_coefficients[[basis_row, out_col]] = 0.0;
+        }
+    }
+    let target = term
+        .try_fitted_for_rho(&rho)
+        .expect("curved reconstruction assembles");
+    let report = term
+        .compute_hybrid_split_report(&rho, Some(target.view()))
+        .expect("hybrid split report computes")
+        .expect("eligible d=1 atoms present a report");
+
+    // Harvest the trained linear images, then drop the report — emulating a
+    // fresh OOS term that knows the decoder but not the in-fit report.
+    let images: Vec<_> = report
+        .verdicts
+        .iter()
+        .filter_map(|v| v.linear_image.clone())
+        .collect();
+    assert!(
+        !images.is_empty(),
+        "the straight slot must yield at least one linear image to thread to OOS"
+    );
+    let collapsed_with_report = term.fitted();
+    term.hybrid_split_report = None;
+
+    // Without images attached, the fresh term reconstructs all-curved.
+    let curved = term.fitted();
+    assert!(
+        (&curved - &collapsed_with_report)
+            .iter()
+            .any(|d| d.abs() > 1e-9),
+        "with no images attached the OOS reconstruction must be the curved one"
+    );
+
+    // Attaching the trained images restores the collapsed reconstruction exactly.
+    term.set_hybrid_linear_images(images)
+        .expect("valid linear images attach");
+    let collapsed_oos = term.fitted();
+    let gap = (&collapsed_oos - &collapsed_with_report)
+        .iter()
+        .fold(0.0_f64, |m, d| m.max(d.abs()));
+    assert!(
+        gap < 1e-12,
+        "attached OOS linear images must reproduce the train-side collapsed \
+         reconstruction; max gap {gap:e}"
+    );
+}
+
 /// #976 Layer-1 guard 2: a single Newton application cannot move a gate
 /// logit by more than the gate-scale cap, however large the solver's raw
 /// delta. Softmax canonicalization shifts whole rows, so the invariant is

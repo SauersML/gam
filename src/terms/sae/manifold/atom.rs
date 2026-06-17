@@ -20,6 +20,17 @@ pub enum SaeAtomBasisKind {
     /// periodic-times-linear feature is adjudicable on its true manifold instead
     /// of being forced into a torus or flat-patch stand-in.
     Cylinder,
+    /// A genuinely LINEAR (affine) decoder atom: `γ(t) = b₀ + Σ_a t_a·b_a`, the
+    /// degree-1 monomial patch `{1, t₁, …, t_d}` (#1221). This is the principled
+    /// reconstruction-parity baseline — one straight decoder direction per latent
+    /// axis plus an intercept — distinct from [`Self::EuclideanPatch`], which is
+    /// the degree-2 QUADRATIC patch `{1, t, t²}`. It shares the
+    /// [`crate::terms::sae::basis::EuclideanPatchEvaluator`] (at `max_degree = 1`)
+    /// and the flat Euclidean latent manifold, so the only difference from the
+    /// quadratic patch is the (smaller, linear) basis width — which is exactly
+    /// what makes a "curved vs linear" comparison honest rather than
+    /// "curved vs quadratic." Round-trips under the name `"linear"`.
+    Linear,
     EuclideanPatch,
     /// Hyperbolic (Poincaré-ball) tangent patch at unit curvature `c = −1`.
     ///
@@ -104,9 +115,11 @@ impl SaeAtomBasisKind {
             // ball origin, optimised in the unconstrained tangent chart (the
             // hyperbolic geometry enters through the penalty, not a constrained
             // retraction), so it shares the Euclidean latent manifold.
-            Self::Duchon | Self::EuclideanPatch | Self::Poincare | Self::Precomputed(_) => {
-                LatentManifold::Euclidean
-            }
+            Self::Linear
+            | Self::Duchon
+            | Self::EuclideanPatch
+            | Self::Poincare
+            | Self::Precomputed(_) => LatentManifold::Euclidean,
         }
     }
 
@@ -134,7 +147,11 @@ impl SaeAtomBasisKind {
             // The tangent latent of a Poincaré patch lies in the convex hull of
             // its PCA seed exactly like the Euclidean patch, so no compact
             // projection grid is needed.
-            Self::Duchon | Self::EuclideanPatch | Self::Poincare | Self::Precomputed(_) => None,
+            Self::Linear
+            | Self::Duchon
+            | Self::EuclideanPatch
+            | Self::Poincare
+            | Self::Precomputed(_) => None,
         }
     }
 }

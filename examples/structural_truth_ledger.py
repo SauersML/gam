@@ -145,14 +145,24 @@ def test_ev_theta(z_tr, z_te, k, seed, n_iter):
 
 
 # --------------------------------------------------------------------------
-# Test 2: EV-vs-K curve shape (curved vs linear dictionaries).
+# Test 2: EV-vs-K curve shape (curved vs Euclidean-quadratic-patch dictionaries).
+#
+# NOTE (#1221): the comparison arm uses ``atom_topology="euclidean"``, which is a
+# degree-2 QUADRATIC monomial patch ``{1, t, t²}`` — NOT a true rank-1 linear
+# atom ``γ(t)=t·b``. So this is "curved vs Euclidean quadratic patch", a STRONGER
+# baseline than a true linear atom; the curved advantage it shows is a LOWER
+# bound on the curved-vs-linear advantage. The fields are named
+# ``euclidean_quadratic_*`` to stop mislabeling the quadratic patch as "linear".
+# A first-class true-linear atom would require a degree-1 EuclideanPatch path in
+# the FFI (see #1221).
 # --------------------------------------------------------------------------
 def test_ev_k(z_tr, z_te, ladder, seed, n_iter):
     table = []
     for k in ladder:
         ev_c = _ev(z_te, _fit(z_tr, k, "circle", seed, n_iter).reconstruct(z_te))
         ev_l = _ev(z_te, _fit(z_tr, k, "euclidean", seed, n_iter).reconstruct(z_te))
-        table.append({"K": k, "curved_ev_out": ev_c, "linear_ev_out": ev_l,
+        table.append({"K": k, "curved_ev_out": ev_c,
+                      "euclidean_quadratic_ev_out": ev_l,
                       "margin": ev_c - ev_l})
     # Flatten verdict: does curved EV gain flatten after the first few K?
     cs = [r["curved_ev_out"] for r in table]
@@ -283,11 +293,11 @@ def main():
     ledger = {"data": args.npy, "N": int(n), "D": int(x.shape[1]),
               "pcs": args.pcs, "seeds": seeds, "theta_k": args.theta_k}
 
-    print("\n[T2] EV-vs-K curve (curved vs linear)")
+    print("\n[T2] EV-vs-K curve (curved vs Euclidean quadratic patch, #1221)")
     t2 = test_ev_k(z_tr, z_te, ladder, seed0, args.n_iter)
     for r in t2["table"]:
         print(f"  K={r['K']:>3}  curved={r['curved_ev_out']:.6f}  "
-              f"linear={r['linear_ev_out']:.6f}  margin={r['margin']:+.6f}")
+              f"euclid_quad={r['euclidean_quadratic_ev_out']:.6f}  margin={r['margin']:+.6f}")
     print(f"  shape verdict: {t2['shape_verdict']}")
     ledger["T2_ev_vs_k"] = t2
 

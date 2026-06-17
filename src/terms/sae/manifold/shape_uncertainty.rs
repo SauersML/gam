@@ -54,3 +54,35 @@ pub struct SaeShapeUncertainty {
     /// One entry per atom, in atom order.
     pub atoms: Vec<SaeAtomShapeUncertainty>,
 }
+
+impl SaeShapeUncertainty {
+    /// #1230 — invalidate every PRE-search seed band so it is recomputed from the
+    /// FINAL post-structure-search model state.
+    ///
+    /// The production fit assembles these bands from the joint Hessian at the ρ
+    /// the OUTER optimizer settled on, BEFORE evidence-guarded structure search.
+    /// When a structure move lands (a certified birth/fission/fusion, or a demoted
+    /// death), the warm refit re-converges the WHOLE dictionary at a new ρ, so the
+    /// seed atoms' decoders / coordinates / inner curvature change and their
+    /// pre-search joint-Hessian bands no longer describe the returned model. This
+    /// resets each existing band's posterior `band_sd` to `NaN` and drops the
+    /// stale dense `decoder_covariance`, so the subsequent
+    /// [`SaeManifoldTerm::complete_born_atom_shape_bands`] pass — which fills every
+    /// `NaN` band from each atom's OWN final penalized inner Hessian
+    /// `H_k = Φ_kᵀ W_k Φ_k + S̃_k` harvested at the settled post-search state —
+    /// recomputes the band for EVERY atom (seed and born) against the final model,
+    /// not just the born atoms. A genuinely-degenerate atom keeps an honest `NaN`
+    /// band rather than a stale fabricated one. `band_coords` / `band_mean` are
+    /// re-derived directly from the final fitted atom by the completion pass, so
+    /// they stay consistent too.
+    ///
+    /// No-op when the structure did not change (every atom keeps its exact
+    /// joint-Hessian band, which is still valid and strictly higher quality than
+    /// the per-atom Laplace approximation).
+    pub fn invalidate_bands_for_recompute(&mut self) {
+        for atom in &mut self.atoms {
+            atom.decoder_covariance = None;
+            atom.band_sd.fill(f64::NAN);
+        }
+    }
+}
