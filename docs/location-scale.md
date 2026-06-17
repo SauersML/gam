@@ -82,8 +82,7 @@ predictions.
 For survival location-scale, predictions return a
 [`SurvivalPrediction`](predictions.md#survivalprediction). Pass any
 `interval=...` to get delta-method standard errors on the survival
-surface and linear predictor (issue #342 — the single `interval` knob
-replaces the previous `with_uncertainty` boolean):
+surface and linear predictor:
 
 ```python
 pred = model.predict(test_df, interval=0.95)
