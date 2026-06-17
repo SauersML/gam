@@ -1972,7 +1972,7 @@ impl SaeManifoldTerm {
     /// re-deriving the curved image by hand and silently bypassing the verdict.
     /// The atom coordinates (`t`) and decoded curves are the term's own fitted
     /// ones; only the assignment masses come from `assignments`.
-    pub(crate) fn reconstruct_from_assignments(
+    pub fn reconstruct_from_assignments(
         &self,
         assignments: ArrayView2<'_, f64>,
         collapse: bool,
