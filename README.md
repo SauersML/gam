@@ -6,10 +6,15 @@
 [![Rust CI](https://github.com/SauersML/gam/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/gam/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
-A generalized additive model engine. The fitting code is in Rust. The
-public interfaces are a Rust CLI (`gam`) and a Python package
-(`gamfit`). Both share one engine, one formula DSL, and one on-disk
-model format.
+A generalized additive model engine with a reach well past curve
+fitting. One formula DSL and one Rust engine span classical regression
+families, parametric and semi-parametric survival, location-scale
+(GAMLSS) and learnable-link models, smooths on manifolds with correct
+topology, manifold-valued responses, distribution-free and higher-order
+inference, and a statistically vetted manifold dictionary (SAE) for
+decomposing neural-network activations. The public interfaces are a Rust
+CLI (`gam`) and a Python package (`gamfit`), sharing one engine, one
+formula DSL, and one on-disk model format.
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
 
@@ -22,21 +27,45 @@ friction by design. See [Contributing](#contributing).
 ## Scope
 
 Supported response families: Gaussian, binomial / Bernoulli (including a
-marginal-slope variant for calibrated risk scores), Poisson,
-negative-binomial, Gamma, Beta, Tweedie, multinomial-logit, conditional
-transformation-normal, and parametric / semi-parametric survival.
+marginal-slope variant for calibrated risk scores, and a latent-cloglog
+form), Poisson, negative-binomial, Gamma, Beta, Tweedie, multinomial-logit,
+conditional transformation-normal, Royston-Parmar, and parametric /
+semi-parametric survival in six likelihood modes (transformation, Weibull,
+location-scale, marginal-slope, and latent-Gaussian frailty). Firth /
+Jeffreys bias reduction handles separation in binomial fits.
 
 Supported term types in formulas: parametric terms, univariate smooths
 (`s`), tensor-product smooths (`te`, `ti`), radial smooths in arbitrary
-dimension (`matern`, `duchon`, `thinplate`), intrinsic sphere smooths
-(`sphere`), random effects (`group`), interval-bounded coefficients
-(`bounded`), and learnable links (`link(type=flexible(...))`,
+dimension (`matern`, `duchon`, `thinplate`), intrinsic manifold smooths
+(`sphere`, periodic / cyclic, torus, cylinder via `te(..., periodic=...)`),
+measure-jet (`mjs`) and constant-curvature (`curv`) smooths, random effects
+and factor smooths (`group`, `fs`, `sz`, `by=`), shape-constrained smooths
+(monotone / convex / concave), interval-bounded coefficients (`bounded`),
+and learnable links (`link(type=flexible(...))`,
 `link(type=blended(...))`, `sas`, `beta-logistic`, `linkwiggle`).
 
 Smoothing parameters are selected by REML or LAML. Posterior sampling
 uses NUTS over the coefficient posterior conditional on the fitted
 smoothing parameters where the family supports it, and a Gaussian
 Laplace approximation otherwise.
+
+Beyond standard GAM fitting, the engine covers several areas described in
+the [Examples](#examples) below and the [docs](https://gamfit.readthedocs.io/):
+
+- **Inference and calibration** — Wald and credible bands, conformal
+  intervals (split, jackknife+, and exact full conformal), Bartlett-corrected
+  likelihood-ratio tests, and smoothing-uncertainty-corrected model comparison.
+- **Manifold-valued responses** — GAMs for responses that live on the
+  sphere, simplex, SPD-matrix cone, Grassmann / Stiefel manifolds, or
+  hyperbolic ball, including a constant-curvature family that *estimates*
+  the curvature and reports a flat / spherical / hyperbolic verdict.
+- **Interpretability** — a manifold SAE that decomposes neural-network
+  activations into typed curved atoms, with steering, crosscoders,
+  cross-layer transport, checkpoint dynamics, and certified, anytime-valid
+  structure discovery (e-BH dictionary certificates).
+- **Scaling** — O(n) and O(n log n) solver paths for large univariate and
+  spatial smooths, chunked / streamed prediction, and optional GPU
+  acceleration with measured CPU/GPU dispatch.
 
 ## Install
 

@@ -416,6 +416,43 @@ impl PenaltyPseudologdet {
         }
 
         let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
+
+        // λ-COERCIVITY ON SEPARATING DIRECTIONS (#1237). The penalty sum
+        // S(λ) = Σ_k λ_k S_k decomposes into disjoint diagonal blocks whenever
+        // the penalized terms occupy disjoint coordinate ranges (the common
+        // multi-smooth case: each `s(xⱼ)` penalizes its own column block; the
+        // multinomial K-1 class blocks are themselves separate `from_components`
+        // calls, each carrying that class's per-term penalties). When one term's
+        // `λ_t → 0` (the near-separable signature: a wigglier spline separates
+        // the classes ever better, so the outer REML search drives that λ down),
+        // ALL of S_t's eigenvalues scale by λ_t. If the positive/null split is
+        // taken against the GLOBAL spectrum's `max|e|` — set by the other,
+        // moderately-penalized terms — then S_t's genuine range-space modes
+        // `λ_t σ_t` slide below the relative noise floor `100·p·ε·max|e|` and are
+        // misclassified as structural null. Dropping them deletes their
+        // `−½ log(λ_t σ_t) = −½ ρ_t − const` contribution to `−½ log|S|₊`, which
+        // is exactly the coercivity term that would otherwise make V(ρ) blow up
+        // as ρ_t → −∞. Without it the outer criterion is monotone-decreasing in
+        // ρ_t, λ slams to its lower box bound and bounces, and the search never
+        // certifies a stationary point (the #1082 penguin `_nnet` timeout).
+        //
+        // Thresholding PER disjoint diagonal block fixes this: within a single
+        // block governed by one λ, every eigenvalue scales by that λ, so the
+        // relative floor `100·b·ε·max_block|e|` scales identically and λ CANCELS
+        // — the dropped set is the genuine λ-invariant structural null of the
+        // unit penalty, and a barely-penalized real mode keeps its coercivity.
+        // This mirrors `from_penalties_block_factored` (which already thresholds
+        // block-local from `CanonicalPenalty` col-ranges); here we recover the
+        // same block structure from the dense components' union support, so the
+        // custom-family/multinomial value (joint_newton) and gradient
+        // (`rho_derivatives` via `compute_block_penalty_logdet_derivs`) paths —
+        // both routed through `from_components` — agree by construction.
+        if let Some(blocks) = disjoint_diagonal_blocks(s_k_matrices)
+            && blocks.len() > 1
+        {
+            return Self::from_assembled_block_local(s_total, ridge_hint, &blocks);
+        }
+
         Self::from_assembled(s_total, ridge_hint)
     }
 
