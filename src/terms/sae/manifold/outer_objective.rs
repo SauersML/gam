@@ -36,46 +36,6 @@ pub(crate) fn reconstruction_explained_variance(
     }
 }
 
-/// #1207 — observable telemetry for the amortized warm-start (Design A). The
-/// warm-start is advisory (a transient atlas-build / encode refusal must not
-/// abort the criterion), so its failures were previously discarded with `.ok()`
-/// and a silent cold solve was indistinguishable from a successful warm-start.
-/// This counter makes the warm-start outcome verifiable: how many outer evals
-/// attempted it, how many certified ≥1 row (a genuine warm-start), how many
-/// certified ZERO rows (a full cold fallback — degenerate atlas), and how many
-/// the warm-start path errored (logged, then cold). "Uses amortized warm-start"
-/// is true exactly when `warm_started_evals > 0`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AmortizedWarmStartTelemetry {
-    /// Outer evals that invoked the warm-start (gradient + value-probe lanes).
-    pub attempts: usize,
-    /// Evals where the amortized encoder certified ≥1 row → a real warm-start.
-    pub warm_started_evals: usize,
-    /// Evals where the encoder certified ZERO rows → a full cold fallback.
-    pub cold_fallback_evals: usize,
-    /// Evals where the warm-start path returned an error (logged, then cold).
-    pub failed_evals: usize,
-    /// Total certified (row, atom) coords warm-started across all evals.
-    pub total_rows_warm_started: usize,
-}
-
-impl AmortizedWarmStartTelemetry {
-    /// Fold one warm-start outcome into the running tally. `Ok(rows)` with
-    /// `rows > 0` is a genuine warm-start; `Ok(0)` is a degenerate-atlas cold
-    /// fallback; `Err` is a (logged) failure that also proceeded cold.
-    pub(crate) fn record(&mut self, outcome: &Result<usize, String>) {
-        self.attempts += 1;
-        match outcome {
-            Ok(0) => self.cold_fallback_evals += 1,
-            Ok(rows) => {
-                self.warm_started_evals += 1;
-                self.total_rows_warm_started += rows;
-            }
-            Err(_) => self.failed_evals += 1,
-        }
-    }
-}
-
 /// Outer REML objective for the SAE-manifold term.
 ///
 /// Routes the SAE's smoothing hyperparameters ρ
@@ -113,9 +73,6 @@ pub struct SaeManifoldOuterObjective {
     /// Optional warm-start β slot. When the cache / continuation walk seeds a
     /// β, the next inner solve opens from it instead of cold.
     pub(crate) seeded_beta: Option<Array1<f64>>,
-    /// #1207 — running tally of amortized warm-start outcomes, so a silent cold
-    /// fallback is observable instead of hidden behind `.ok()`.
-    pub(crate) warm_start_telemetry: AmortizedWarmStartTelemetry,
 }
 
 impl SaeManifoldOuterObjective {
@@ -147,29 +104,7 @@ impl SaeManifoldOuterObjective {
             ridge_beta,
             last_loss: None,
             seeded_beta: None,
-            warm_start_telemetry: AmortizedWarmStartTelemetry::default(),
         }
-    }
-
-    /// #1207 — the accumulated amortized warm-start telemetry. "Uses amortized
-    /// warm-start" is verifiable as `telemetry.warm_started_evals > 0`; a silent
-    /// cold solve shows up as `cold_fallback_evals` / `failed_evals`.
-    pub fn warm_start_telemetry(&self) -> AmortizedWarmStartTelemetry {
-        self.warm_start_telemetry
-    }
-
-    /// #1207 — record the outcome of one amortized warm-start attempt, logging a
-    /// failure instead of silently swallowing it. The warm-start is advisory (a
-    /// transient atlas/encode refusal must not abort the criterion), so the
-    /// caller still proceeds cold — but the failure is now observable in both the
-    /// telemetry tally and the log, never invisible.
-    fn record_warm_start(&mut self, outcome: Result<usize, String>) {
-        if let Err(err) = &outcome {
-            log::debug!(
-                "[SAE/#1207] amortized warm-start fell back to a cold inner solve: {err}"
-            );
-        }
-        self.warm_start_telemetry.record(&outcome);
     }
 
     /// Consume the objective, returning the inner-fitted term, the last ρ the
@@ -974,13 +909,10 @@ impl SaeManifoldOuterObjective {
         // λ-gradient is untouched). Best-effort: a first-build / degenerate atlas
         // certifies no rows and warm-starts nothing, leaving the cold path
         // byte-for-byte unchanged; a transient atlas-build refusal must not abort
-        // the criterion evaluation, so the warm-start is advisory only. #1207 —
-        // the outcome is recorded (and a failure logged) so the cold fallback is
-        // observable, never silently swallowed.
-        let warm_start_outcome = self
-            .term
-            .warm_start_latents_from_amortized_encoder(self.target.view(), &rho);
-        self.record_warm_start(warm_start_outcome);
+        // the criterion evaluation, so the warm-start is advisory only.
+        self.term
+            .warm_start_latents_from_amortized_encoder(self.target.view(), &rho)
+            .ok();
         let (reml_cost, loss) = self.term.reml_criterion_with_refine_policy(
             self.target.view(),
             &rho,
@@ -998,10 +930,9 @@ impl SaeManifoldOuterObjective {
         // one-mat-vec encoder can faithfully and certifiably invert. The inner
         // solve already converged to stationarity above, so the consistency fold
         // is evaluated at the exact fitted dictionary and the REML λ-gradient is
-        // untouched (Design A). This is the VALUE-PROBE lane — its cost is never
-        // paired with a gradient — so it is the correct (and per #1206 the ONLY)
-        // place to carry the gradient-free consistency fold; the gradient lane
-        // (`eval`) deliberately omits it to keep its (cost, ∇f) pair consistent.
+        // untouched (Design A). The EFS quadratic fixed-point lane (`efs_step`)
+        // cannot carry this non-Gaussian term; the cost lane that THIS path feeds
+        // is what the cascade ranks ρ by, so steering it here is sufficient.
         let cost = self.fold_cotrain_consistency(reml_cost, &rho)?;
         let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         self.current_rho = rho;
@@ -1010,21 +941,14 @@ impl SaeManifoldOuterObjective {
     }
 
     /// #1154 — add the amortized-encoder consistency fold to an already-computed
-    /// REML criterion at the converged dictionary for `rho`. The fold has NO
-    /// analytic gradient: under Design A the inner solve converges to the same
-    /// stationary point, so the exact outer derivative is the REML λ-gradient
-    /// `∇f` (the implicit-function `dβ̂/dλ` path) and nothing else.
-    ///
-    /// #1206 — for that reason the fold is carried ONLY by the DERIVATIVE-FREE
-    /// value-probe lane (`evaluate_with_refine_policy` → `eval_cost`), where the
-    /// cost is never paired with a gradient (seed screening, cross-seed final
-    /// ranking, EFS backtracking). It is NOT folded into the gradient lane
-    /// (`eval`/`OuterEvalOrder::ValueAndGradient`), whose `(cost, gradient)` pair
-    /// must be self-consistent for the BFGS Armijo line search — folding `c` into
-    /// the cost there while returning `∇f` is exactly the objective↔gradient
-    /// desync bug class (#931). The consistency term thus steers the value-only
-    /// ranking the cascade does between certified candidates, never the smooth
-    /// descent direction.
+    /// REML criterion at the converged dictionary for `rho`. Factored out so the
+    /// value-probe lane (`evaluate_with_refine_policy`) and the gradient lane
+    /// (`eval`) fold the IDENTICAL penalty: a value-probe cost and the accepted
+    /// iterate's cost must live in ONE measure or the cascade compares ranked
+    /// points across two objectives (the objective↔gradient desync bug class).
+    /// The fold has no analytic gradient — under Design A the REML λ-gradient
+    /// stays exactly the implicit-function `dβ̂/dλ` path; the consistency term is
+    /// a small auto-scaled penalty the derivative-free cascade lane steers.
     fn fold_cotrain_consistency(
         &self,
         reml_cost: f64,
@@ -1219,12 +1143,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // the SAME stationary point, so the exact REML λ-gradient computed below
         // is untouched — the warm-start changes only the basin entry, never the
         // root. Advisory: a degenerate atlas certifies/warm-starts nothing and
-        // leaves the cold path byte-for-byte unchanged. #1207 — the outcome is
-        // recorded (failure logged) so a silent cold fallback is observable.
-        let warm_start_outcome = self
-            .term
-            .warm_start_latents_from_amortized_encoder(self.target.view(), &rho_state);
-        self.record_warm_start(warm_start_outcome);
+        // leaves the cold path byte-for-byte unchanged.
+        self.term
+            .warm_start_latents_from_amortized_encoder(self.target.view(), &rho_state)
+            .ok();
         let (cost, loss, cache) = self
             .term
             .reml_criterion_with_cache(
@@ -1253,23 +1175,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let gradient = components.gradient();
         let beta_hat = self.term.flatten_beta();
-        // #1206 — the gradient lane (`OuterEvalOrder::ValueAndGradient`, consumed
-        // by the outer BFGS Armijo line search) MUST return a cost whose gradient
-        // is the gradient we return. The amortized-encoder consistency fold `c(ρ)`
-        // (#1154) has NO analytic gradient — under Design A the inner solve
-        // converges to the same stationary point and the exact REML λ-gradient is
-        // `∇f` only. Folding `c` into the cost here while returning `∇f` would hand
-        // BFGS the value of `f+c` paired with `∇f`, so its sufficient-decrease test
-        // `f(ρ+αd)+c(ρ+αd) ≤ f(ρ)+c(ρ) + c₁α·∇f·d` mixes two functions and can
-        // stall or wander (the objective↔gradient desync bug class, #931). So the
-        // gradient lane reports the consistent pair `(f, ∇f)`; the consistency fold
-        // `c` is a DERIVATIVE-FREE ranking regularizer carried ONLY by the
-        // value-probe lane (`eval_cost`/`evaluate_with_refine_policy`), where no
-        // gradient is ever paired with the cost (seed screening, cross-seed final
-        // ranking, EFS backtracking). The collapse penalty is a discrete
-        // infeasibility wall (a huge constant on a degenerate fit), not a smooth
-        // regularizer — BFGS simply rejects steps into it, which is the intended
-        // barrier behaviour, so it stays on both lanes.
+        // #1154 — fold the amortized-encoder consistency penalty into the cost an
+        // ACCEPTED iterate reports, identically to the value-probe lane, so the
+        // cascade ranks every point in one measure. The gradient above stays the
+        // exact REML λ-gradient (the fold carries no analytic gradient under
+        // Design A).
+        let cost = self
+            .fold_cotrain_consistency(cost, &rho_state)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
         let cost = self
             .add_fit_data_collapse_penalty(cost, &rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
