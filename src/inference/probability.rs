@@ -650,6 +650,169 @@ pub fn negative_binomial_moment_matched_interval(
     }
 }
 
+/// CDF of a Poisson with mean `mu ≥ 0` at the integer count `k ≥ 0`:
+/// `P(Y ≤ k) = Q(k+1, μ)`, the regularized *upper* incomplete gamma (the standard
+/// Poisson↔gamma identity). Increasing in `k`; `P(Y ≤ 0) = e^{−μ}` is the zero mass.
+#[inline]
+fn poisson_cdf_at(k: f64, mu: f64) -> f64 {
+    // P(Y ≤ k) = Q(k+1, μ) = 1 − P(k+1, μ); `regularized_lower_gamma` is `P`.
+    (1.0 - regularized_lower_gamma(k + 1.0, mu)).clamp(0.0, 1.0)
+}
+
+/// Quantile (inverse CDF) of a Poisson with mean `mu ≥ 0` at probability
+/// `p ∈ (0, 1)`: the smallest integer count `k ≥ 0` with `P(Y ≤ k) ≥ p`,
+/// returned as an `f64`.
+///
+/// `p ≤ 0` maps to the `0` support floor and `p ≥ 1` to `+∞`; a non-finite or
+/// negative mean yields `NaN`; a zero mean is the degenerate point mass at `0`.
+///
+/// Like the Negative-Binomial, the Poisson is *discrete* with a real atom at
+/// zero, so its skew-correct predictive band must come from the genuine integer
+/// quantiles — a symmetric `μ ± z·σ` band sits below the true upper quantile on
+/// low-rate counts and under-covers the upper tail (the #817 defect, Poisson
+/// sibling of #1193). A normal-approximation seed brackets the root, then an
+/// exact bisection on the gamma-tail CDF finds the smallest qualifying integer.
+pub fn poisson_quantile(p: f64, mu: f64) -> f64 {
+    if !(mu.is_finite() && mu >= 0.0) {
+        return f64::NAN;
+    }
+    if !p.is_finite() || p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+    if mu == 0.0 {
+        return 0.0;
+    }
+    let cdf = |k: f64| poisson_cdf_at(k, mu);
+
+    // The zero atom already covers the requested lower-tail mass on low-rate
+    // counts (the common right-skewed case), so short-circuit before bracketing.
+    if cdf(0.0) >= p {
+        return 0.0;
+    }
+
+    // Normal-approximation seed on the Poisson moments (Var = μ), floored into
+    // the support.
+    let z = standard_normal_quantile(p).unwrap_or(0.0);
+    let seed = (mu + z * mu.sqrt()).floor().max(1.0);
+
+    // Bracket the smallest integer with CDF ≥ p: `lo` always satisfies
+    // CDF(lo) < p (starts at 0, which failed the short-circuit) and `hi`
+    // satisfies CDF(hi) ≥ p. Grow geometrically from the seed in whichever
+    // direction is needed.
+    let mut lo: f64;
+    let mut hi: f64;
+    if cdf(seed) >= p {
+        hi = seed;
+        lo = 0.0;
+        let mut step = 1.0;
+        let mut cand = seed - 1.0;
+        while cand > 0.0 && cdf(cand) >= p {
+            hi = cand;
+            step *= 2.0;
+            cand = seed - step;
+        }
+        if cand > 0.0 {
+            lo = cand; // CDF(cand) < p
+        }
+    } else {
+        lo = seed; // CDF(seed) < p
+        let mut step = 1.0;
+        let mut cand = seed + 1.0;
+        // CDF → 1 as k → ∞ and p < 1, so this terminates; the cap is a
+        // finite-arithmetic backstop (returns an effectively infinite edge).
+        while cdf(cand) < p {
+            lo = cand;
+            step *= 2.0;
+            cand = seed + step;
+            if cand > 1.0e18 {
+                return f64::INFINITY;
+            }
+        }
+        hi = cand;
+    }
+
+    // Bisection for the smallest integer k with CDF(k) ≥ p, maintaining the
+    // invariant CDF(lo) < p ≤ CDF(hi).
+    while hi - lo > 1.0 {
+        let mid = (lo + (hi - lo) / 2.0).floor();
+        if cdf(mid) >= p {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
+/// Equal-tailed predictive interval for a Poisson count response whose
+/// conditional law has mean `mu > 0` (so `Var(Y|μ) = μ`), widened for estimation
+/// uncertainty to a total predictive variance `total_var ≥ μ` (estimation +
+/// observation noise). Returns the pair of integer quantiles at lower-tail
+/// probabilities `p_lo < p_hi` — the skew-correct, zero-atom-aware replacement
+/// for a symmetric `mu ± z·σ` band, which on low-rate counts sits below the true
+/// upper quantile and under-covers the upper tail (the #817 defect, Poisson
+/// sibling of #1193).
+///
+/// A pure Poisson has no free dispersion parameter to absorb estimation
+/// uncertainty, so the widening is carried by the *conjugate over-dispersed count
+/// law*: if the point estimate `μ̂` carries (approximately) a Gamma sampling
+/// uncertainty with mean `μ` and variance `SE(μ̂)² = total_var − μ`, the posterior
+/// predictive for a *new* Poisson draw is exactly a Negative-Binomial — the
+/// Gamma–Poisson mixture — with mean `μ` and dispersion `θ_eff = μ² / (total_var − μ)`
+/// (matching the inflated variance `μ + μ²/θ_eff = total_var`). As estimation
+/// uncertainty vanishes (`total_var → μ`, `θ_eff → ∞`) the NB collapses to the
+/// *exact* conditional Poisson, which is then used directly — both because it is
+/// the correct limit and because an NB with `θ → ∞` is numerically degenerate.
+/// The two regimes agree (both are integer quantiles that coincide once `θ_eff`
+/// is large), so the switch introduces no discontinuity in the emitted edge.
+///
+/// Returns `None` for degenerate inputs (non-positive mean, non-finite, or a
+/// total variance below the Poisson floor `μ`), or a numerically mis-ordered
+/// pair, in which case the caller falls back to the symmetric edges.
+pub fn poisson_moment_matched_interval(
+    mu: f64,
+    total_var: f64,
+    p_lo: f64,
+    p_hi: f64,
+) -> Option<(f64, f64)> {
+    if !(mu.is_finite() && mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
+        return None;
+    }
+    // Estimation uncertainty inflates the count variance beyond the Poisson
+    // floor `Var(Y|μ) = μ`; the excess is the (approximate) sampling variance of
+    // `μ̂`. A `total_var` below `μ` is degenerate (a caller broke the contract).
+    let excess = total_var - mu;
+    if excess < 0.0 {
+        return None;
+    }
+    // Above this effective dispersion the NB surrogate and the conditional
+    // Poisson agree to far more than the integer resolution of the quantile, and
+    // `negative_binomial_quantile`'s `I_{θ/(θ+μ)}(θ, k+1)` is better conditioned
+    // as the exact Poisson; below it the NB widening is genuine.
+    const THETA_EFF_MAX: f64 = 1.0e9;
+    let theta_eff = if excess > 0.0 {
+        mu * mu / excess
+    } else {
+        f64::INFINITY
+    };
+    let (q_lo, q_hi) = if theta_eff > THETA_EFF_MAX {
+        (poisson_quantile(p_lo, mu), poisson_quantile(p_hi, mu))
+    } else {
+        (
+            negative_binomial_quantile(p_lo, mu, theta_eff),
+            negative_binomial_quantile(p_hi, mu, theta_eff),
+        )
+    };
+    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
+        Some((q_lo, q_hi))
+    } else {
+        None
+    }
+}
+
 /// CDF of a Tweedie compound Poisson–Gamma response (power `1 < p < 2`) with
 /// mean `mu > 0` and dispersion `phi > 0` at `y ≥ 0`:
 /// `P(Y ≤ y) = e^{−λ} + Σ_{k≥1} Poisson(k; λ)·GammaCDF(y; kα, γ)`, the mixture of
@@ -1580,6 +1743,124 @@ mod tests {
             negative_binomial_moment_matched_interval(f64::NAN, 1.5, 1.0, 0.025, 0.975).is_none()
         );
         assert!(negative_binomial_moment_matched_interval(2.0, 1.5, 6.0, 0.025, 0.975).is_some());
+    }
+
+    #[test]
+    fn poisson_quantile_matches_known_reference_values() {
+        // Reference integer quantiles from scipy.stats.poisson.ppf.
+        let cases: [(f64, f64, f64); 9] = [
+            // (p, μ, expected integer quantile)
+            (0.025, 1.6, 0.0), // zero mass e^{−1.6} ≈ 0.20 < 0.025? no: 0.20 > 0.025 ⇒ 0
+            (0.5, 1.6, 1.0),
+            (0.975, 1.6, 4.0),
+            (0.99, 1.6, 5.0),
+            (0.025, 20.0, 12.0),
+            (0.975, 20.0, 29.0),
+            (0.5, 20.0, 20.0),
+            (0.975, 0.5, 2.0),
+            (0.025, 0.5, 0.0),
+        ];
+        for (p, mu, expected) in cases {
+            let got = poisson_quantile(p, mu);
+            assert_eq!(
+                got, expected,
+                "poisson_quantile(p={p}, μ={mu}) = {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn poisson_quantile_is_a_valid_cdf_inverse() {
+        // The returned integer k must be the *smallest* with CDF(k) ≥ p:
+        // CDF(k) ≥ p and (for k ≥ 1) CDF(k−1) < p, across a grid of (μ, p).
+        for &mu in &[0.3_f64, 1.6, 5.0, 25.0, 120.0] {
+            for &p in &[0.01_f64, 0.025, 0.1, 0.5, 0.9, 0.975, 0.99] {
+                let k = poisson_quantile(p, mu);
+                assert!(k.is_finite() && k >= 0.0 && k.fract() == 0.0, "non-integer k={k}");
+                let cdf_k = poisson_cdf_at(k, mu);
+                assert!(cdf_k + 1e-12 >= p, "CDF({k}) = {cdf_k} < p = {p} (μ={mu})");
+                if k >= 1.0 {
+                    let cdf_below = poisson_cdf_at(k - 1.0, mu);
+                    assert!(
+                        cdf_below < p,
+                        "k={k} not minimal: CDF({}) = {cdf_below} ≥ p = {p} (μ={mu})",
+                        k - 1.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn poisson_quantile_boundaries_and_degeneracy() {
+        assert_eq!(poisson_quantile(0.0, 2.0), 0.0);
+        assert_eq!(poisson_quantile(-0.1, 2.0), 0.0);
+        assert!(poisson_quantile(1.0, 2.0).is_infinite());
+        assert_eq!(poisson_quantile(0.5, 0.0), 0.0); // point mass at 0
+        assert!(poisson_quantile(0.5, -1.0).is_nan());
+        assert!(poisson_quantile(0.5, f64::NAN).is_nan());
+        // Monotone non-decreasing in p (discrete ⇒ plateaus allowed).
+        let mut prev = 0.0;
+        for i in 1..100 {
+            let p = i as f64 / 100.0;
+            let q = poisson_quantile(p, 4.0);
+            assert!(q >= prev, "Poisson quantile decreased at p={p}: {q} < {prev}");
+            prev = q;
+        }
+    }
+
+    #[test]
+    fn poisson_moment_matched_interval_is_exact_conditional_when_se_vanishes() {
+        // SE(μ̂) = 0 ⇒ total_var = μ ⇒ θ_eff = ∞, recovering the exact conditional
+        // Poisson quantiles directly (no NB widening).
+        for &mu in &[0.5_f64, 1.6, 20.0] {
+            let (lo, hi) = poisson_moment_matched_interval(mu, mu, 0.025, 0.975).unwrap();
+            assert_eq!(lo, poisson_quantile(0.025, mu));
+            assert_eq!(hi, poisson_quantile(0.975, mu));
+        }
+    }
+
+    #[test]
+    fn poisson_moment_matched_interval_widens_with_estimation_uncertainty() {
+        // Adding estimation variance lowers θ_eff (genuine overdispersion) and
+        // must not shrink the band; with enough added variance the upper edge
+        // grows beyond the conditional Poisson quantile.
+        let mu = 20.0_f64;
+        let (lo0, hi0) = poisson_moment_matched_interval(mu, mu, 0.025, 0.975).unwrap();
+        let (lo1, hi1) = poisson_moment_matched_interval(mu, mu + 40.0, 0.025, 0.975).unwrap();
+        assert!(lo1 <= lo0 && hi1 > hi0, "band did not widen: [{lo0},{hi0}] -> [{lo1},{hi1}]");
+        // A negligible excess (θ_eff above the switch threshold) must coincide
+        // with the exact conditional Poisson — no discontinuity at the boundary.
+        let (lo2, hi2) =
+            poisson_moment_matched_interval(mu, mu + mu * mu * 1.0e-12, 0.025, 0.975).unwrap();
+        assert_eq!((lo2, hi2), (lo0, hi0));
+    }
+
+    #[test]
+    fn poisson_moment_matched_interval_is_skewed_not_symmetric() {
+        // The whole point of #1193/#817: on a low-rate count the equal-tailed
+        // upper edge sits ABOVE the symmetric `μ + z·√μ` band that under-covers
+        // the upper tail, and the band is asymmetric about μ.
+        let mu = 2.0_f64;
+        let z = standard_normal_quantile(0.975).unwrap();
+        let (lo, hi) = poisson_moment_matched_interval(mu, mu, 0.025, 0.975).unwrap();
+        let sym_hi = mu + z * mu.sqrt();
+        assert!(
+            hi > sym_hi,
+            "equal-tailed upper {hi} should exceed symmetric upper {sym_hi}"
+        );
+        // Upper tail reaches further from μ than the lower tail (right skew).
+        assert!((hi - mu) > (mu - lo), "band not right-skewed: lo={lo}, hi={hi}, μ={mu}");
+    }
+
+    #[test]
+    fn poisson_moment_matched_interval_rejects_degenerate_inputs() {
+        assert!(poisson_moment_matched_interval(0.0, 1.0, 0.025, 0.975).is_none());
+        assert!(poisson_moment_matched_interval(-1.0, 1.0, 0.025, 0.975).is_none());
+        assert!(poisson_moment_matched_interval(2.0, 0.0, 0.025, 0.975).is_none());
+        assert!(poisson_moment_matched_interval(2.0, 1.0, 0.025, 0.975).is_none()); // total_var < μ
+        assert!(poisson_moment_matched_interval(f64::NAN, 5.0, 0.025, 0.975).is_none());
+        assert!(poisson_moment_matched_interval(2.0, 5.0, 0.025, 0.975).is_some());
     }
 
     #[test]

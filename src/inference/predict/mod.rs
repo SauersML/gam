@@ -35,8 +35,8 @@ use crate::mixture_link::{
 };
 use crate::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
-    negative_binomial_moment_matched_interval, normal_cdf, normal_pdf, standard_normal_quantile,
-    tweedie_moment_matched_interval,
+    negative_binomial_moment_matched_interval, normal_cdf, normal_pdf, poisson_moment_matched_interval,
+    standard_normal_quantile, tweedie_moment_matched_interval,
 };
 use crate::quadrature::QuadratureContext;
 use crate::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
@@ -1826,8 +1826,18 @@ where
             clamp_to_support(lower, upper)
         }
         ResponseFamily::Poisson => {
+            // The Poisson is discrete with a real atom at zero, so a symmetric
+            // band sits below the true upper quantile on low-rate counts and
+            // under-covers the upper tail (the #817 defect, Poisson sibling of
+            // #1193). Build the edges from genuine equal-tailed quantiles: the
+            // exact conditional Poisson, widened for estimation uncertainty by
+            // the conjugate Negative-Binomial (Gamma–Poisson) posterior
+            // predictive — NOT a continuous moment-matched surrogate, which has
+            // no zero atom and would over-cover the lower tail at low rates.
             let response_var = mean.mapv(|mu| mu.max(0.0));
-            response_observation_bounds(response_var)
+            skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
+                poisson_moment_matched_interval(mu, total_var, p_lo, p_hi)
+            })
         }
         ResponseFamily::NegativeBinomial { theta, theta_fixed } => {
             // `theta` is estimated jointly with the mean (#802) and recorded
