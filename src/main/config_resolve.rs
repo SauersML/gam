@@ -217,7 +217,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
     }
     if let Some(mode) = json_config.survival_likelihood {
         fit_config.survival_likelihood =
-            resolve_nonempty_string(mode, "survival_likelihood must be a non-empty string")?;
+            parse_survival_likelihood_cli(&mode)?;
     }
     if let Some(target) = json_config.baseline_target {
         fit_config.baseline_target =
@@ -312,7 +312,7 @@ pub fn resolve_cli_fit_config(input: CliFitConfigInput) -> Result<FitConfig, Str
     fit_config.time_degree = input.time_degree;
     fit_config.time_num_internal_knots = input.time_num_internal_knots;
     fit_config.time_smooth_lambda = input.time_smooth_lambda;
-    fit_config.survival_likelihood = input.survival_likelihood;
+    fit_config.survival_likelihood = parse_survival_likelihood_cli(&input.survival_likelihood)?;
     fit_config.survival_distribution = input.survival_distribution;
     fit_config.threshold_time_k = input.threshold_time_k;
     fit_config.threshold_time_degree = input.threshold_time_degree;
@@ -389,8 +389,9 @@ pub fn resolve_cli_frailty_spec(
 }
 
 pub fn parse_survival_likelihood_cli(raw: &str) -> Result<String, String> {
-    parse_survival_likelihood_mode(raw)?;
-    Ok(raw.trim().to_ascii_lowercase())
+    let normalized = raw.trim().to_ascii_lowercase();
+    parse_survival_likelihood_mode(&normalized)?;
+    Ok(normalized)
 }
 
 pub fn parse_baseline_target_cli(raw: &str) -> Result<String, String> {
@@ -1071,6 +1072,17 @@ mod tests {
                     "baseline_shape": 1.2,
                     "baseline_rate": 0.04,
                     "baseline_makeham": 0.01
+                }),
+            },
+            ParityCase {
+                name: "survival likelihood values are canonicalized",
+                cli: {
+                    let mut input = base_cli();
+                    input.survival_likelihood = "TRANSFORMATION".to_string();
+                    input
+                },
+                json: json!({
+                    "survival_likelihood": "Transformation"
                 }),
             },
             ParityCase {
