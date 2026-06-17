@@ -38,7 +38,7 @@ pub(crate) fn block_local_bilinear_iterator_matches_scalar_reference_bitwise() {
     };
     let v = Array1::from_shape_fn(8, |i| ((i as f64 + 0.4) * 0.31).cos());
     let u = Array1::from_shape_fn(8, |i| ((i as f64 + 0.8) * 0.17).sin());
-    let mut reference = 0.0;
+    let mut reference = 0.0_f64;
     for row in 0..local.nrows() {
         let mut row_dot = 0.0;
         for col in 0..local.ncols() {
@@ -4660,6 +4660,7 @@ pub(crate) fn hyper_operator_bilinear_view_matches_owned_bilinear() {
 
     let operators: [&dyn HyperOperator; 4] = [&dense, &block, &composite, &weighted];
     for op in operators {
+        let op: &dyn HyperOperator = op;
         assert_relative_eq!(
             op.bilinear_view(v_view, u_view),
             op.bilinear(&v_owned, &u_owned),
@@ -4703,6 +4704,7 @@ pub(crate) fn hyper_operator_scaled_add_mul_vec_matches_owned_matvec() {
 
     let operators: [&dyn HyperOperator; 4] = [&dense, &block, &composite, &weighted];
     for op in operators {
+        let op: &dyn HyperOperator = op;
         let mut accumulated: Array1<f64> = base.clone();
         op.scaled_add_mul_vec(v_view, scale, accumulated.view_mut());
 
