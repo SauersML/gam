@@ -184,16 +184,19 @@ impl GpuDispatchPolicy {
     /// Per-apply flop estimate for one reduced-Schur matvec `S·x` of a
     /// matrix-free SAE Kronecker system, as a pure function of the system shape.
     ///
-    /// Per row block `i` the apply does: a sparse forward gather
-    /// `v_i = H_tβ^(i)·x` (`≈ 2·m_i·k`, modelled by the per-row latent depth
-    /// `d` as the M-frame width), a `d×d` triangular solve through the cached
-    /// Cholesky factor (`≈ d²`), and a sparse transpose scatter
-    /// `H_βt^(i)·w_i` (`≈ 2·m_i·k`). Summed over `n` homogeneous rows and
-    /// folding the gather/scatter into the dominant `d·k` cross term, the apply
-    /// is `≈ n·(2·d·k + d²)`. This is the `n × p × M`-flavoured batched work the
-    /// charter names — keyed on the *frame depth* `d` (M) and border width `k`
-    /// (p), not row count alone, so LLM shapes (few rows, wide `k`, modest `d`)
-    /// register the real arithmetic the row-count gate misses.
+    /// Per row block `i` the apply does: a forward cross-block GEMV
+    /// `v_i = H_tβ^(i)·x` (`≈ 2·d·k` multiply-adds, with the per-row latent
+    /// depth `d` as the M-frame width and `k` the border), a `d×d` triangular
+    /// solve through the cached Cholesky factor (`≈ d²`), and a transpose
+    /// cross-block GEMV `H_βt^(i)·w_i` (`≈ 2·d·k`). The two `2·d·k` GEMVs would
+    /// sum to `4·d·k`; this estimate deliberately undercounts to a single
+    /// `2·d·k` cross term as a conservative (lower-bound) admission floor, so
+    /// the apply is modelled as `≈ n·(2·d·k + d²)`. NOTE: this is a deliberate
+    /// lower bound on the true `≈ n·(4·d·k + d²)` arithmetic — admitting a
+    /// shape under the smaller figure can only be more conservative, never
+    /// over-eager. It is keyed on the *frame depth* `d` (M) and border width
+    /// `k` (p), not row count alone, so LLM shapes (few rows, wide `k`, modest
+    /// `d`) register arithmetic the row-count gate misses.
     const fn reduced_schur_matvec_flops(n: usize, k: usize, d: usize) -> u128 {
         let n = n as u128;
         let k = k as u128;
@@ -475,7 +478,9 @@ mod reduced_schur_matvec_offload_tests {
     }
 
     /// Even with only a single conservative CG iteration the wide LLM border
-    /// clears the breakeven (the per-apply work alone is ~3.3e7 flops > 1e7),
+    /// clears the breakeven (the per-apply work alone is `2_000·(2·8·2_048 +
+    /// 8²) ≈ 6.6e7` flops > 1e7 by the conservative `n·(2·d·k + d²)` model;
+    /// the true `n·(4·d·k + d²)` arithmetic is ≈1.3e8),
     /// so the gate is not relying on an inflated iteration count.
     #[test]
     fn admits_llm_shape_with_one_cg_iter() {
