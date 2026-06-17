@@ -9321,6 +9321,61 @@ mod inner_contract_probe_tests {
         }
     }
 
+    /// DIAG1154: temporary probe — fit the planted-circle fixture under several
+    /// (learning_rate, iters) settings and print the resulting KKT ‖g‖ so we can
+    /// see empirically which knobs let the inner solve reach the convergence guard.
+    #[test]
+    #[ignore]
+    fn diag1154_inner_convergence_knob_sweep() {
+        let n = 24usize;
+        let p = 4usize;
+        let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+        let (phi, jet) = periodic_basis(&coords);
+        let m = phi.ncols();
+        let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+            let scale = 1.0 / (1.0 + b as f64);
+            scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+        });
+        let target = phi.dot(&decoder);
+        for &(lr, iters) in &[(0.1_f64, 12usize), (1.0, 12), (1.0, 64), (1.0, 200)] {
+            let atom = SaeManifoldAtom::new(
+                "periodic_truth",
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi.clone(),
+                jet.clone(),
+                decoder.clone(),
+                Array2::<f64>::eye(m),
+            )
+            .unwrap()
+            .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+            let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+                Array2::<f64>::zeros((n, 1)),
+                vec![coords.clone()],
+                vec![LatentManifold::Circle { period: 1.0 }],
+                AssignmentMode::softmax(1.0),
+            )
+            .unwrap();
+            let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+            let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+            let fit = term.run_joint_fit_arrow_schur(
+                target.view(),
+                &mut rho,
+                None,
+                iters,
+                lr,
+                1.0e-4,
+                1.0e-4,
+            );
+            let crit = term.reml_criterion(target.view(), &rho, None, iters, lr, 1.0e-4, 1.0e-4);
+            eprintln!(
+                "DIAG1154 lr={lr} iters={iters} fit_ok={} crit={:?}",
+                fit.is_ok(),
+                crit.as_ref().map(|(v, _)| *v).map_err(|e| e.clone())
+            );
+        }
+    }
+
     /// #1154 — the joint amortized-encoder + REML co-training fold (Design A).
     ///
     /// On a synthetic 1D periodic manifold with KNOWN structure (the target is
