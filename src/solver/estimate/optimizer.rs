@@ -1221,6 +1221,9 @@ where
     let penalty_rank_total = pirls_res.reparam_result.e_transformed.nrows();
     let mp = (p_dim as f64 - penalty_rank_total as f64).max(0.0);
     let mut edf_by_block = vec![0.0; k];
+    // Raw per-block penalty trace tr_kk = λ_kk·tr(H⁻¹S_kk), retained so per-term
+    // EDF can be assembled as |coeff_range| − Σ tr_kk (issue #1219).
+    let mut penalty_block_trace = vec![0.0; k];
     let mut edf_total = 0.0;
     let mut smoothing_correction = None;
     let mut rho_covariance = None;
@@ -1317,6 +1320,7 @@ where
             traces[kk] = lambdas[kk] * frob;
         }
         edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
+        penalty_block_trace.clone_from(&traces);
         for (kk, cp) in pirls_res
             .reparam_result
             .canonical_transformed
@@ -1669,6 +1673,7 @@ where
     }
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
+        penalty_block_trace,
         edf_total,
         smoothing_correction,
         penalized_hessian: penalized_hessian.into(),

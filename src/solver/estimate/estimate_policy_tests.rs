@@ -605,6 +605,7 @@ fn decode_invariant_test_fit() -> UnifiedFitResult {
         covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
         inference: Some(FitInference {
             edf_by_block: vec![0.6, 0.9],
+            penalty_block_trace: vec![],
             edf_total: 1.5,
             smoothing_correction: Some(array![[0.2, 0.0], [0.0, 0.2]]),
             penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),

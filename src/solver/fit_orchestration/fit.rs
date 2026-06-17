@@ -925,7 +925,7 @@ fn fitted_weibull_baseline_from_linear_time_beta(
 fn survival_transformation_edf(
     state: &crate::pirls::WorkingState,
     penalty_blocks: &[PenaltyBlock],
-) -> Result<(f64, Vec<f64>, Array2<f64>), String> {
+) -> Result<(f64, Vec<f64>, Vec<f64>, Array2<f64>), String> {
     let h_dense = state.hessian.to_dense();
     let p = h_dense.nrows();
     let h_sym = crate::linalg::matrix::SymmetricMatrix::Dense(h_dense.clone());
@@ -954,11 +954,14 @@ fn survival_transformation_edf(
         }
     };
     let mut edf_by_block = vec![0.0_f64; penalty_blocks.len()];
+    // Raw per-block penalty trace tr_kk = λ_kk·tr(H⁻¹S_kk) (issue #1219).
+    let mut penalty_block_trace = vec![0.0_f64; penalty_blocks.len()];
     let mut total_trace = 0.0_f64;
     for (kk, block) in penalty_blocks.iter().enumerate() {
         let block_cols = block.range.end - block.range.start;
         if block.lambda <= 0.0 || block_cols == 0 {
             edf_by_block[kk] = block_cols as f64;
+            penalty_block_trace[kk] = 0.0;
             continue;
         }
         // RHS = S_k embedded into the full p×block_cols layout: column j holds
@@ -980,13 +983,17 @@ fn survival_transformation_edf(
         }
         let lam_trace = block.lambda * trace;
         total_trace += lam_trace;
+        penalty_block_trace[kk] = lam_trace;
         edf_by_block[kk] = (block_cols as f64 - lam_trace).clamp(0.0, block_cols as f64);
     }
     let edf_total = (p as f64 - total_trace).clamp(0.0, p as f64);
-    if !edf_total.is_finite() || edf_by_block.iter().any(|v| !v.is_finite()) {
+    if !edf_total.is_finite()
+        || edf_by_block.iter().any(|v| !v.is_finite())
+        || penalty_block_trace.iter().any(|v| !v.is_finite())
+    {
         return Err("survival edf: non-finite effective degrees of freedom".to_string());
     }
-    Ok((edf_total, edf_by_block, h_dense))
+    Ok((edf_total, edf_by_block, penalty_block_trace, h_dense))
 }
 
 /// REML/LAML smoothing-parameter selection for the single-cause transformation
@@ -1250,12 +1257,14 @@ fn survival_unified_fit_result(
     // Hessian and penalty roots (issue #565). `lambdas` is built one entry per
     // penalty block, so `edf_by_block` aligns 1:1 with `lambdas` as the
     // `try_from_parts` invariant requires.
-    let (edf_total, edf_by_block, penalized_hessian) =
+    let (edf_total, edf_by_block, penalty_block_trace, penalized_hessian) =
         survival_transformation_edf(state, penalty_blocks)?;
     assert_eq!(edf_by_block.len(), lambdas.len());
+    assert_eq!(penalty_block_trace.len(), lambdas.len());
 
     let inference = crate::estimate::FitInference {
         edf_by_block: edf_by_block.clone(),
+        penalty_block_trace,
         edf_total,
         smoothing_correction: None,
         penalized_hessian: penalized_hessian.into(),

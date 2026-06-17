@@ -345,6 +345,21 @@ impl std::fmt::Debug for FitArtifacts {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitInference {
     pub edf_by_block: Vec<f64>,
+    /// Raw per-penalty-block trace `tr_kk = λ_kk·tr(H⁻¹ S_kk)`, one entry per
+    /// smoothing parameter (aligned 1:1 with `lambdas`, like `edf_by_block`).
+    /// Unclamped, in either coefficient basis (the trace of a matrix product is
+    /// basis-invariant). This is the quantity both the dense and survival EDF
+    /// paths already form internally; storing it lets per-term EDF be assembled
+    /// as `edf_term = |coeff_range| − Σ_{kk∈term} tr_kk`, which equals the trace
+    /// of the influence matrix `F = H⁻¹X'WX` over the term's coefficient block,
+    /// is additive across terms, and sums exactly to `edf_total`. The legacy
+    /// `Σ_kk(rank(S_kk) − tr_kk)` block-sum over-counts whenever several
+    /// penalties share one coefficient range (`te`/`ti`, anisotropic, adaptive),
+    /// reporting a per-term EDF that can exceed the model total (issue #1219).
+    /// May be empty for fits produced before this field existed or by paths that
+    /// do not record traces; consumers fall back to `coefficient_influence`.
+    #[serde(default)]
+    pub penalty_block_trace: Vec<f64>,
     pub edf_total: f64,
     pub smoothing_correction: Option<Array2<f64>>,
     /// Raw penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
@@ -783,6 +798,10 @@ impl FitInference {
             self.edf_by_block.iter().copied(),
         )?;
         validate_all_finite_estimation(
+            "fit_result.penalty_block_trace",
+            self.penalty_block_trace.iter().copied(),
+        )?;
+        validate_all_finite_estimation(
             "fit_result.working_weights",
             self.working_weights.iter().copied(),
         )?;
@@ -1096,6 +1115,14 @@ impl UnifiedFitResult {
                 crate::bail_invalid_estim!(
                     "UnifiedFitResult EDF smoothing-parameter count mismatch: edf_by_block={}, lambdas={}",
                     inf.edf_by_block.len(),
+                    lambdas.len()
+                );
+            }
+            if !inf.penalty_block_trace.is_empty() && inf.penalty_block_trace.len() != lambdas.len()
+            {
+                crate::bail_invalid_estim!(
+                    "UnifiedFitResult EDF smoothing-parameter count mismatch: penalty_block_trace={}, lambdas={}",
+                    inf.penalty_block_trace.len(),
                     lambdas.len()
                 );
             }
@@ -1588,6 +1615,16 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .map(|inf| inf.edf_by_block.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Raw per-penalty-block trace `tr_kk = λ_kk·tr(H⁻¹ S_kk)`, aligned 1:1 with
+    /// `lambdas`. Empty when the producing path did not record traces (issue
+    /// #1219); callers must treat an empty slice as "unavailable".
+    pub fn penalty_block_trace(&self) -> &[f64] {
+        self.inference
+            .as_ref()
+            .map(|inf| inf.penalty_block_trace.as_slice())
             .unwrap_or(&[])
     }
 

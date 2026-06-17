@@ -1823,6 +1823,7 @@ mod tests {
             }],
             Some(FitInference {
                 edf_by_block: vec![],
+                penalty_block_trace: vec![],
                 edf_total: 2.0,
                 smoothing_correction: None,
                 penalized_hessian: hessian.clone().into(),

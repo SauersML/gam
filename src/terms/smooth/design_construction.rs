@@ -3920,14 +3920,19 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             ));
         }
     }
-    let (edf_by_block, edf_total) = if let Some(cov) = beta_covariance.as_ref() {
+    let (edf_by_block, penalty_block_trace, edf_total) = if let Some(cov) = beta_covariance.as_ref()
+    {
         exact_bounded_edf(
             &local_penalty_blocks,
             &Array1::from_elem(local_penalty_blocks.len(), 1.0),
             cov,
         )?
     } else {
-        (vec![0.0; local_penalty_blocks.len()], 0.0)
+        (
+            vec![0.0; local_penalty_blocks.len()],
+            vec![0.0; local_penalty_blocks.len()],
+            0.0,
+        )
     };
     let stable_penalty_term =
         2.0 * final_eval.adaptive_penalty_value + beta.dot(&fixed_total.dot(&beta));
@@ -4001,6 +4006,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             let log_lambdas = full_lambdas.mapv(|v| v.max(1e-300).ln());
             let inf = FitInference {
                 edf_by_block,
+                penalty_block_trace,
                 edf_total,
                 smoothing_correction: None,
                 // Boundary adapter: wrap the raw `Array2<f64>` Hessian as
@@ -6175,7 +6181,7 @@ fn exact_bounded_edf(
     penalties: &[PenaltySpec],
     lambdas: &Array1<f64>,
     latent_cov: &Array2<f64>,
-) -> Result<(Vec<f64>, f64), EstimationError> {
+) -> Result<(Vec<f64>, Vec<f64>, f64), EstimationError> {
     if penalties.len() != lambdas.len() {
         crate::bail_invalid_estim!(
             "bounded EDF penalty/lambda mismatch: {} penalties vs {} lambdas",
@@ -6190,6 +6196,8 @@ fn exact_bounded_edf(
     let p = latent_cov.nrows();
     let mut s_lambda = Array2::<f64>::zeros((p, p));
     let mut edf_by_block = Vec::with_capacity(penalties.len());
+    // Raw per-block penalty trace tr_kk = λ_kk·tr(H⁻¹S_kk) (issue #1219).
+    let mut penalty_block_trace = Vec::with_capacity(penalties.len());
     let mut trace_sum = 0.0;
 
     for (k, ps) in penalties.iter().enumerate() {
@@ -6214,6 +6222,7 @@ fn exact_bounded_edf(
                     * trace_of_dense_product(&cov_block.to_owned(), local)
                         .map_err(EstimationError::InvalidInput)?;
                 trace_sum += trace_k;
+                penalty_block_trace.push(trace_k);
                 let p_k = penalty_rank as f64;
                 edf_by_block.push((p_k - trace_k).clamp(0.0, p_k));
             }
@@ -6226,6 +6235,7 @@ fn exact_bounded_edf(
                     * trace_of_dense_product(latent_cov, m)
                         .map_err(EstimationError::InvalidInput)?;
                 trace_sum += trace_k;
+                penalty_block_trace.push(trace_k);
                 let p_k = penalty_rank as f64;
                 edf_by_block.push((p_k - trace_k).clamp(0.0, p_k));
             }
@@ -6236,7 +6246,7 @@ fn exact_bounded_edf(
         .map_err(|e| EstimationError::InvalidInput(format!("bounded EDF nullity failed: {e}")))?
         as f64;
     let edf_total = (p as f64 - trace_sum).clamp(nullity_total, p as f64);
-    Ok((edf_by_block, edf_total))
+    Ok((edf_by_block, penalty_block_trace, edf_total))
 }
 
 /// Symmetric posterior-precision inverse for the bounded-coefficient path.
@@ -6571,10 +6581,14 @@ fn fit_bounded_term_collection_with_design(
     } else {
         -2.0 * eta_state.log_likelihood
     };
-    let (edf_by_block, edf_total) = if let Some(cov) = latent_cov.as_ref() {
+    let (edf_by_block, penalty_block_trace, edf_total) = if let Some(cov) = latent_cov.as_ref() {
         exact_bounded_edf(&fit_penalties, &fit.lambdas, cov)?
     } else {
-        (vec![0.0; fit_penalties.len()], 0.0)
+        (
+            vec![0.0; fit_penalties.len()],
+            vec![0.0; fit_penalties.len()],
+            0.0,
+        )
     };
     let geometry = Some(crate::estimate::FitGeometry {
         penalized_hessian: penalized_hessian.clone().into(),
@@ -6597,6 +6611,7 @@ fn fit_bounded_term_collection_with_design(
             let log_lambdas = fit.lambdas.mapv(|v| v.max(1e-300).ln());
             let inf = FitInference {
                 edf_by_block,
+                penalty_block_trace,
                 edf_total,
                 smoothing_correction: None,
                 // Boundary adapter: `penalized_hessian` storage is now

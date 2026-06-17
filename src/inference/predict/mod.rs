@@ -3813,6 +3813,7 @@ mod tests {
             // No penalty in this fixture (lambdas empty), so leave edf_by_block
             // empty to satisfy the EDF/lambdas count invariant.
             edf_by_block: vec![],
+            penalty_block_trace: vec![],
             edf_total: p as f64,
             smoothing_correction: None,
             penalized_hessian: Array2::<f64>::eye(p).into(),

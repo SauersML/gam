@@ -91,7 +91,7 @@ pub(crate) fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical
                 working_weights: Array1::ones(2),
                 working_response: Array1::zeros(2),
             }),
-            precomputed_edf: Some((1.0, Vec::new(), vec![1.0])),
+            precomputed_edf: Some((1.0, Vec::new(), vec![1.0], Vec::new())),
         },
         &[spec],
     )

@@ -191,7 +191,10 @@ pub struct BlockwiseFitResultParts {
     /// otherwise inject. `None` when the caller has no reduced geometry (e.g.
     /// the one-cycle inner probe), in which case `blockwise_fit_from_parts`
     /// falls back to computing edf from whatever geometry it was handed.
-    pub precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>)>,
+    /// Tuple layout: `(edf_total, edf_by_penalty, block_edf, penalty_trace)`,
+    /// where `penalty_trace[k] = λ_k·tr(H⁻¹S_k)` feeds the per-term EDF
+    /// decomposition `|coeff_range| − Σ tr_k` (issue #1219).
+    pub precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)>,
 }
 
 pub(crate) fn validate_parameter_block_state_finiteness(
@@ -265,7 +268,7 @@ pub(crate) fn custom_family_blockwise_edf(
     penalized_hessian: &Array2<f64>,
     specs: &[ParameterBlockSpec],
     lambdas: &ndarray::ArrayView1<'_, f64>,
-) -> Result<(f64, Vec<f64>, Vec<f64>), String> {
+) -> Result<(f64, Vec<f64>, Vec<f64>, Vec<f64>), String> {
     let p = penalized_hessian.nrows();
     let total_cols: usize = specs.iter().map(|s| s.design.ncols()).sum();
     if penalized_hessian.ncols() != p || total_cols != p {
@@ -316,6 +319,9 @@ pub(crate) fn custom_family_blockwise_edf(
     };
 
     let mut edf_by_penalty = vec![0.0_f64; expected_rho];
+    // Raw per-penalty trace tr_kk = λ_kk·tr(H⁻¹S_kk), aligned with edf_by_penalty
+    // (issue #1219), so per-term EDF assembles as |coeff_range| − Σ tr_kk.
+    let mut penalty_trace = vec![0.0_f64; expected_rho];
     let mut block_edf = Vec::with_capacity(specs.len());
     let mut total_trace = 0.0_f64;
     let mut penalty_offset = 0usize;
@@ -357,6 +363,7 @@ pub(crate) fn custom_family_blockwise_edf(
             }
             let lam_trace = if lambda > 0.0 { lambda * trace } else { 0.0 };
             total_trace += lam_trace;
+            penalty_trace[global_k] = lam_trace;
             // Per-penalty edf is bounded by the columns this penalty acts on,
             // i.e. its block's column count (a `Blockwise` penalty reports the
             // full joint width from `dim()`, so cap at `block_cols`, not `dim()`).
@@ -377,10 +384,11 @@ pub(crate) fn custom_family_blockwise_edf(
     if !edf_total.is_finite()
         || edf_by_penalty.iter().any(|v| !v.is_finite())
         || block_edf.iter().any(|v| !v.is_finite())
+        || penalty_trace.iter().any(|v| !v.is_finite())
     {
         return Err("custom-family edf: non-finite effective degrees of freedom".to_string());
     }
-    Ok((edf_total, edf_by_penalty, block_edf))
+    Ok((edf_total, edf_by_penalty, block_edf, penalty_trace))
 }
 
 /// Compute reduced-space effective degrees of freedom for a converged fit,
@@ -398,7 +406,7 @@ pub(crate) fn reduced_blockwise_edf(
     reduced_geometry: Option<&FitGeometry>,
     canonical: &crate::identifiability::canonical::CanonicalSpecs,
     lambdas: &Array1<f64>,
-) -> Option<(f64, Vec<f64>, Vec<f64>)> {
+) -> Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)> {
     let geom = reduced_geometry?;
     match custom_family_blockwise_edf(
         geom.penalized_hessian.as_array(),
@@ -557,40 +565,44 @@ pub fn blockwise_fit_from_parts(
     // with `edf=0`/`inference=None` rather than aborting, but in practice the
     // ridge-retry inside `custom_family_blockwise_edf` recovers any boundary
     // indefiniteness.
-    let (edf_total_opt, edf_by_penalty, block_edf): (Option<f64>, Vec<f64>, Vec<f64>) =
-        match precomputed_edf {
-            // Reduced-space edf supplied by the caller (the principled path:
-            // the trace is computed where the Hessian is full rank, then
-            // reported on the raw fit — exact because the trace edf is
-            // reparameterization-invariant).
-            Some((edf_total, edf_by_penalty, block_edf)) => {
-                (Some(edf_total), edf_by_penalty, block_edf)
-            }
-            // Fallback: compute from whatever geometry we were handed. Used
-            // only when the caller did not precompute (no reduced geometry);
-            // the ridge-retry factorization makes this robust to a marginally
-            // indefinite Hessian.
-            None => match geometry.as_ref() {
-                Some(geom) => {
-                    match custom_family_blockwise_edf(
-                        geom.penalized_hessian.as_array(),
-                        specs,
-                        &lambdas.view(),
-                    ) {
-                        Ok((edf_total, edf_by_penalty, block_edf)) => {
-                            (Some(edf_total), edf_by_penalty, block_edf)
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "[custom-family inference] effective degrees of freedom unavailable: {err}"
-                            );
-                            (None, Vec::new(), vec![0.0; block_states.len()])
-                        }
+    let (edf_total_opt, edf_by_penalty, block_edf, penalty_trace): (
+        Option<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+    ) = match precomputed_edf {
+        // Reduced-space edf supplied by the caller (the principled path:
+        // the trace is computed where the Hessian is full rank, then
+        // reported on the raw fit — exact because the trace edf is
+        // reparameterization-invariant).
+        Some((edf_total, edf_by_penalty, block_edf, penalty_trace)) => {
+            (Some(edf_total), edf_by_penalty, block_edf, penalty_trace)
+        }
+        // Fallback: compute from whatever geometry we were handed. Used
+        // only when the caller did not precompute (no reduced geometry);
+        // the ridge-retry factorization makes this robust to a marginally
+        // indefinite Hessian.
+        None => match geometry.as_ref() {
+            Some(geom) => {
+                match custom_family_blockwise_edf(
+                    geom.penalized_hessian.as_array(),
+                    specs,
+                    &lambdas.view(),
+                ) {
+                    Ok((edf_total, edf_by_penalty, block_edf, penalty_trace)) => {
+                        (Some(edf_total), edf_by_penalty, block_edf, penalty_trace)
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "[custom-family inference] effective degrees of freedom unavailable: {err}"
+                        );
+                        (None, Vec::new(), vec![0.0; block_states.len()], Vec::new())
                     }
                 }
-                None => (None, Vec::new(), vec![0.0; block_states.len()]),
-            },
-        };
+            }
+            None => (None, Vec::new(), vec![0.0; block_states.len()], Vec::new()),
+        },
+    };
 
     let mut lambda_offset = 0usize;
     let blocks: Vec<FittedBlock> = block_states
@@ -621,6 +633,7 @@ pub fn blockwise_fit_from_parts(
     let inference = match (edf_total_opt, geometry.as_ref()) {
         (Some(edf_total), Some(geom)) => Some(crate::model_types::FitInference {
             edf_by_block: edf_by_penalty,
+            penalty_block_trace: penalty_trace,
             edf_total,
             smoothing_correction: None,
             penalized_hessian: geom.penalized_hessian.clone(),
