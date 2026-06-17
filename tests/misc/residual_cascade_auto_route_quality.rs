@@ -209,3 +209,40 @@ fn cascade_matches_or_beats_dense_duchon_on_truth_recovery() {
          cascade RMSE={cascade_rmse} > 1.10 × dense RMSE={dense_rmse}"
     );
 }
+
+/// Arm 2 — the formula auto-route itself must return a quality cascade past
+/// the dense-kernel cliff.
+///
+/// This is intentionally a positive `fit_from_formula` route test, not just a
+/// direct estimator check: it owns the deleted cliff-scale auto-route arm. The
+/// dense radial posterior is not built here; once `default_num_centers` is at
+/// its cap, the route must return `FitResult::ResidualCascade`, and that
+/// returned fit must still recover the planted truth on interior probes.
+#[test]
+fn past_cliff_fit_from_formula_returns_quality_residual_cascade() {
+    init_parallelism();
+    let n = 525_000;
+    assert!(
+        gam::basis::default_num_centers(n, 3) >= 2_000,
+        "test shape must be past the dense-kernel center cliff"
+    );
+    let data = sample(3, n);
+    let cfg = gaussian_config();
+    let result = fit_from_formula("y ~ duchon(x1, x2, x3)", &data, &cfg)
+        .expect("past-cliff duchon fit");
+    let FitResult::ResidualCascade(cascade) = result else {
+        panic!("past-cliff scattered 3-D duchon must auto-route to ResidualCascade");
+    };
+
+    let probes = probe_grid(3, 4);
+    let yhat: Vec<f64> = probes
+        .iter()
+        .map(|p| cascade.predict(p).expect("auto-route cascade predict").0)
+        .collect();
+    let cascade_rmse = rmse(&yhat, &probes);
+    eprintln!("[cascade auto-route cliff quality] n={n} cascade_rmse={cascade_rmse:.5}");
+    assert!(
+        cascade_rmse < 0.08,
+        "auto-routed residual cascade fails planted-truth recovery: RMSE={cascade_rmse}"
+    );
+}
