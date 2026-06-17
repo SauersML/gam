@@ -650,6 +650,182 @@ pub fn negative_binomial_moment_matched_interval(
     }
 }
 
+/// CDF of a Tweedie compound Poisson–Gamma response (power `1 < p < 2`) with
+/// mean `mu > 0` and dispersion `phi > 0` at `y ≥ 0`:
+/// `P(Y ≤ y) = e^{−λ} + Σ_{k≥1} Poisson(k; λ)·GammaCDF(y; kα, γ)`, the mixture of
+/// a point mass at zero (no jumps) and `k` i.i.d. Gamma jumps. The Tweedie
+/// parameters map to `λ = μ^{2−p} / (φ(2−p))` (Poisson mean number of jumps),
+/// Gamma jump shape `α = (2−p)/(p−1)` and scale `γ = φ(p−1)μ^{p−1}`, which
+/// reproduce `E[Y] = μ` and `Var(Y) = φμ^p`.
+///
+/// The zero atom `e^{−λ}` is returned directly at `y = 0`. For `y > 0` the
+/// Poisson weights are accumulated in log-space and the series is truncated once
+/// the remaining Poisson mass beyond the current term is negligible — the Gamma
+/// CDF factor is ≤ 1, so the unsummed tail is bounded by the Poisson survival.
+#[inline]
+fn tweedie_cdf_at(y: f64, mu: f64, phi: f64, power: f64) -> f64 {
+    if !(y.is_finite() && y >= 0.0) {
+        return f64::NAN;
+    }
+    let lambda = mu.powf(2.0 - power) / (phi * (2.0 - power));
+    let alpha = (2.0 - power) / (power - 1.0);
+    let scale = phi * (power - 1.0) * mu.powf(power - 1.0);
+    let zero_mass = (-lambda).exp();
+    if y <= 0.0 {
+        return zero_mass;
+    }
+    let x = y / scale; // unit-scale Gamma argument
+    // Poisson(k; λ) weights via a log-space recurrence: w_k = w_{k-1}·λ/k.
+    // Sum k ≥ 1 only; the k = 0 term contributes the zero atom (GammaCDF = 1 at
+    // any y > 0 for shape 0 is the degenerate point mass already in `zero_mass`).
+    let mut acc = zero_mass; // P(Y ≤ y) includes the no-jump mass (Y = 0 ≤ y)
+    let mut ln_w = -lambda; // ln Poisson(0; λ)
+    // Centre the truncation window on the Poisson mode so very large λ stays cheap.
+    let k_max = (lambda + 10.0 * lambda.sqrt()).ceil() as usize + 50;
+    let mut remaining = 1.0 - zero_mass; // Poisson mass still unaccounted for (k ≥ 1)
+    for k in 1..=k_max {
+        ln_w += lambda.ln() - (k as f64).ln();
+        let w = ln_w.exp();
+        remaining -= w;
+        // GammaCDF(y; kα, γ) = P(kα, y/γ) on the unit scale.
+        acc += w * regularized_lower_gamma(alpha * k as f64, x);
+        if remaining <= 1e-15 && k as f64 > lambda {
+            break;
+        }
+    }
+    acc.clamp(0.0, 1.0)
+}
+
+/// Quantile (inverse CDF) of a Tweedie compound Poisson–Gamma response
+/// (power `1 < p < 2`) with mean `mu > 0` and dispersion `phi > 0` at
+/// probability `q ∈ (0, 1)`: the value `y ≥ 0` with `P(Y ≤ y) = q`.
+///
+/// `q ≤ 0` maps to the `0` support floor and `q ≥ 1` to `+∞`. If the requested
+/// lower-tail probability is at or below the zero atom `e^{−λ}` the quantile is
+/// exactly `0` (the common right-skewed lower-tail case). Otherwise a normal seed
+/// on the Tweedie moments brackets the root, which is then refined by bisection
+/// on [`tweedie_cdf_at`] — the continuous part above the atom is strictly
+/// increasing, so the bracket converges.
+pub fn tweedie_quantile(q: f64, mu: f64, phi: f64, power: f64) -> f64 {
+    if !(mu.is_finite()
+        && mu > 0.0
+        && phi.is_finite()
+        && phi > 0.0
+        && power.is_finite()
+        && power > 1.0
+        && power < 2.0)
+    {
+        return f64::NAN;
+    }
+    if !q.is_finite() || q <= 0.0 {
+        return 0.0;
+    }
+    if q >= 1.0 {
+        return f64::INFINITY;
+    }
+    let lambda = mu.powf(2.0 - power) / (phi * (2.0 - power));
+    let zero_mass = (-lambda).exp();
+    // The zero atom carries the lower-tail mass: q at or below it ⇒ quantile 0.
+    if q <= zero_mass {
+        return 0.0;
+    }
+
+    // Normal-approximation seed on the Tweedie moments, then geometric bracketing.
+    let var = phi * mu.powf(power);
+    let z = standard_normal_quantile(q).unwrap_or(0.0);
+    let mut hi = (mu + z * var.sqrt()).max(scale_floor(mu));
+    let cdf = |y: f64| tweedie_cdf_at(y, mu, phi, power);
+
+    // Grow `hi` until it covers `q`; `lo` stays below it. CDF → 1 as y → ∞.
+    let mut lo = 0.0_f64;
+    let mut guard = 0;
+    while cdf(hi) < q {
+        lo = hi;
+        hi *= 2.0;
+        guard += 1;
+        if guard > 200 || hi > 1.0e18 {
+            return f64::INFINITY;
+        }
+    }
+
+    // Bisection on the strictly-increasing continuous part above the atom.
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if cdf(mid) < q {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo <= (hi.abs() + 1.0) * 1e-12 {
+            break;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// A strictly-positive starting scale for the Tweedie bracket: a small fraction
+/// of the mean keeps the initial `hi` inside the support when the normal seed
+/// underflows to or below zero on a heavily right-skewed row.
+#[inline]
+fn scale_floor(mu: f64) -> f64 {
+    (mu * 1e-3).max(f64::MIN_POSITIVE)
+}
+
+/// Equal-tailed predictive interval for a Tweedie compound Poisson–Gamma
+/// response (power `1 < p < 2`) whose conditional law has mean `mu > 0` and
+/// dispersion `phi > 0`, widened for estimation uncertainty to a total
+/// predictive variance `total_var` (estimation + observation noise). Returns the
+/// pair of Tweedie quantiles at lower-tail probabilities `p_lo < p_hi` — the
+/// skew-correct, zero-atom-aware replacement for a symmetric `mu ± z·σ` band,
+/// which on a right-skewed Tweedie sits below the true upper quantile and
+/// under-covers the upper tail (the #817 defect, Tweedie sibling of #1193).
+///
+/// Estimation uncertainty is folded in through an *effective dispersion*: a
+/// Tweedie with mean `μ` has variance `φμ^p`, so the `φ_eff` matching the
+/// inflated total variance solves `φ_eff·μ^p = total_var`, i.e.
+/// `φ_eff = total_var / μ^p`. When estimation uncertainty vanishes
+/// (`total_var → φμ^p`) this is *exact*: `φ_eff → φ`, recovering the conditional
+/// Tweedie. With nonzero estimation variance `φ_eff > φ` widens the band inside
+/// the Tweedie family — the minimal skew-correct widening. Unlike a moment-
+/// matched Gamma surrogate, this keeps the genuine zero atom, so it does not
+/// over-cover the lower tail on low-mean rows (#1193).
+///
+/// Returns `None` for degenerate inputs (non-positive mean / variance,
+/// non-finite, power outside `(1, 2)`) or a mis-ordered pair, in which case the
+/// caller falls back to the symmetric edges.
+pub fn tweedie_moment_matched_interval(
+    mu: f64,
+    phi: f64,
+    power: f64,
+    total_var: f64,
+    p_lo: f64,
+    p_hi: f64,
+) -> Option<(f64, f64)> {
+    if !(mu.is_finite()
+        && mu > 0.0
+        && phi.is_finite()
+        && phi > 0.0
+        && power.is_finite()
+        && power > 1.0
+        && power < 2.0
+        && total_var.is_finite()
+        && total_var > 0.0)
+    {
+        return None;
+    }
+    let phi_eff = total_var / mu.powf(power);
+    if !(phi_eff.is_finite() && phi_eff > 0.0) {
+        return None;
+    }
+    let q_lo = tweedie_quantile(p_lo, mu, phi_eff, power);
+    let q_hi = tweedie_quantile(p_hi, mu, phi_eff, power);
+    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
+        Some((q_lo, q_hi))
+    } else {
+        None
+    }
+}
+
 /// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` — the CDF of a
 /// unit-scale `Gamma(shape = a)` variate — accurate down to the smallest
 /// representable `x`.
@@ -1404,5 +1580,105 @@ mod tests {
             negative_binomial_moment_matched_interval(f64::NAN, 1.5, 1.0, 0.025, 0.975).is_none()
         );
         assert!(negative_binomial_moment_matched_interval(2.0, 1.5, 6.0, 0.025, 0.975).is_some());
+    }
+
+    #[test]
+    fn tweedie_quantile_is_a_valid_cdf_inverse() {
+        // For a probability strictly above the zero atom the quantile `y` must
+        // satisfy `CDF(y) ≈ q`: the bisection inverts `tweedie_cdf_at` exactly.
+        let mu = 3.0_f64;
+        let phi = 1.2_f64;
+        let power = 1.5_f64;
+        let lambda = mu.powf(2.0 - power) / (phi * (2.0 - power));
+        let zero_mass = (-lambda).exp();
+        for &q in &[0.30_f64, 0.5, 0.75, 0.9, 0.975, 0.99] {
+            assert!(q > zero_mass, "test q must exceed the zero atom {zero_mass}");
+            let y = tweedie_quantile(q, mu, phi, power);
+            assert!(y.is_finite() && y > 0.0, "quantile out of support: {y}");
+            let cdf = tweedie_cdf_at(y, mu, phi, power);
+            assert!((cdf - q).abs() < 1e-6, "CDF(Q(q)) != q: q={q}, cdf={cdf}");
+        }
+    }
+
+    #[test]
+    fn tweedie_quantile_returns_zero_atom_for_low_tail() {
+        // When the requested lower-tail probability is at or below the point
+        // mass at zero `e^{−λ}`, the quantile is exactly 0 (right-skewed low
+        // means) — the zero-atom behaviour a continuous surrogate cannot mimic.
+        let mu = 0.4_f64; // small mean ⇒ large zero atom
+        let phi = 1.0_f64;
+        let power = 1.5_f64;
+        let lambda = mu.powf(2.0 - power) / (phi * (2.0 - power));
+        let zero_mass = (-lambda).exp();
+        assert!(zero_mass > 0.025, "fixture must have a fat zero atom: {zero_mass}");
+        assert_eq!(tweedie_quantile(0.025, mu, phi, power), 0.0);
+        assert_eq!(tweedie_quantile(0.5 * zero_mass, mu, phi, power), 0.0);
+    }
+
+    #[test]
+    fn tweedie_quantile_boundaries_and_degeneracy() {
+        let (mu, phi, power) = (2.0_f64, 1.0_f64, 1.6_f64);
+        assert_eq!(tweedie_quantile(0.0, mu, phi, power), 0.0);
+        assert_eq!(tweedie_quantile(-0.1, mu, phi, power), 0.0);
+        assert_eq!(tweedie_quantile(1.0, mu, phi, power), f64::INFINITY);
+        // Power outside (1, 2) or non-positive params are NaN.
+        assert!(tweedie_quantile(0.5, mu, phi, 2.0).is_nan());
+        assert!(tweedie_quantile(0.5, mu, phi, 1.0).is_nan());
+        assert!(tweedie_quantile(0.5, 0.0, phi, power).is_nan());
+        assert!(tweedie_quantile(0.5, mu, 0.0, power).is_nan());
+    }
+
+    #[test]
+    fn tweedie_moment_matched_interval_is_exact_conditional_when_se_vanishes() {
+        // total_var = φμ^p ⇒ φ_eff = φ, recovering the exact conditional Tweedie
+        // quantiles.
+        let mu = 3.0_f64;
+        let phi = 1.2_f64;
+        let power = 1.5_f64;
+        let total_var = phi * mu.powf(power);
+        let (lo, hi) =
+            tweedie_moment_matched_interval(mu, phi, power, total_var, 0.025, 0.975).unwrap();
+        assert_eq!(lo, tweedie_quantile(0.025, mu, phi, power));
+        assert_eq!(hi, tweedie_quantile(0.975, mu, phi, power));
+    }
+
+    #[test]
+    fn tweedie_moment_matched_interval_is_skewed_not_symmetric() {
+        // A right-skewed Tweedie has the upper edge farther from the mean than
+        // the lower edge — the symmetric `mu ± z·σ` band cannot reproduce this.
+        let mu = 2.0_f64;
+        let phi = 1.5_f64;
+        let power = 1.5_f64;
+        let total_var = phi * mu.powf(power);
+        let (lo, hi) =
+            tweedie_moment_matched_interval(mu, phi, power, total_var, 0.025, 0.975).unwrap();
+        assert!(lo >= 0.0 && hi > mu && lo < mu);
+        assert!(hi - mu > mu - lo, "interval is not right-skewed: lo={lo}, hi={hi}");
+    }
+
+    #[test]
+    fn tweedie_moment_matched_interval_widens_with_estimation_uncertainty() {
+        // Adding estimation variance raises φ_eff and must not shrink the band;
+        // the upper edge grows.
+        let mu = 4.0_f64;
+        let phi = 1.0_f64;
+        let power = 1.5_f64;
+        let obs_var = phi * mu.powf(power);
+        let (lo0, hi0) =
+            tweedie_moment_matched_interval(mu, phi, power, obs_var, 0.025, 0.975).unwrap();
+        let (lo1, hi1) =
+            tweedie_moment_matched_interval(mu, phi, power, obs_var + 30.0, 0.025, 0.975).unwrap();
+        assert!(lo1 <= lo0 && hi1 > hi0, "band did not widen: [{lo0},{hi0}] -> [{lo1},{hi1}]");
+    }
+
+    #[test]
+    fn tweedie_moment_matched_interval_rejects_degenerate_inputs() {
+        assert!(tweedie_moment_matched_interval(0.0, 1.0, 1.5, 1.0, 0.025, 0.975).is_none());
+        assert!(tweedie_moment_matched_interval(-1.0, 1.0, 1.5, 1.0, 0.025, 0.975).is_none());
+        assert!(tweedie_moment_matched_interval(2.0, 0.0, 1.5, 1.0, 0.025, 0.975).is_none());
+        assert!(tweedie_moment_matched_interval(2.0, 1.0, 2.0, 1.0, 0.025, 0.975).is_none());
+        assert!(tweedie_moment_matched_interval(2.0, 1.0, 1.5, 0.0, 0.025, 0.975).is_none());
+        assert!(tweedie_moment_matched_interval(f64::NAN, 1.0, 1.5, 1.0, 0.025, 0.975).is_none());
+        assert!(tweedie_moment_matched_interval(2.0, 1.0, 1.5, 6.0, 0.025, 0.975).is_some());
     }
 }

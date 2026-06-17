@@ -36,6 +36,7 @@ use crate::mixture_link::{
 use crate::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
     negative_binomial_moment_matched_interval, normal_cdf, normal_pdf, standard_normal_quantile,
+    tweedie_moment_matched_interval,
 };
 use crate::quadrature::QuadratureContext;
 use crate::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
@@ -1860,14 +1861,17 @@ where
             };
             // Tweedie (1 < p < 2) is a compound Poisson–Gamma: a point mass at
             // zero plus a continuous right-skewed positive part. Its symmetric
-            // band shares the #817 skew defect, but the skew-correct predictive
-            // is the compound-distribution quantile — NOT a moment-matched Gamma
-            // (which lacks the zero atom and would over-cover the lower tail like
-            // the NB surrogate, #1193). That quantile (a Poisson-weighted sum of
-            // Gamma CDFs) is a distinct numeric scheme; until it lands, keep the
-            // symmetric edges rather than substitute a wrong-shaped surrogate.
+            // band shares the #817 skew defect, and the skew-correct predictive
+            // is the genuine compound-distribution quantile — a Poisson-weighted
+            // sum of Gamma CDFs — NOT a moment-matched Gamma (which lacks the
+            // zero atom and would over-cover the lower tail like the NB
+            // surrogate, #1193). Estimation uncertainty is folded into an
+            // effective dispersion that matches the inflated total variance.
             let response_var = mean.mapv(|mu| phi * mu.powf(*p));
-            response_observation_bounds(response_var)
+            let power = *p;
+            skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
+                tweedie_moment_matched_interval(mu, phi, power, total_var, p_lo, p_hi)
+            })
         }
         ResponseFamily::Gamma => {
             // Conditional response variance `Var(Y|μ) = φμ²`. The Gamma is
