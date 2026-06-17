@@ -259,6 +259,7 @@ fn parse_leading_f64(s: &str) -> Option<f64> {
     let mut end = 0usize;
     let mut seen_digit = false;
     let mut seen_exp = false;
+    let mut seen_dot = false;
     while end < bytes.len() {
         let c = bytes[end] as char;
         match c {
@@ -275,7 +276,10 @@ fn parse_leading_f64(s: &str) -> Option<f64> {
                     break;
                 }
             }
-            '.' => end += 1,
+            '.' if !seen_dot && !seen_exp => {
+                seen_dot = true;
+                end += 1;
+            }
             'e' | 'E' if seen_digit && !seen_exp => {
                 seen_exp = true;
                 end += 1;
