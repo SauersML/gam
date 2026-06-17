@@ -174,6 +174,7 @@ const R: usize = 5;
 /// datasets at a planted spherical κ⋆, the 95% profile CI must cover κ⋆ at close
 /// to the nominal rate and κ̂ must recover κ⋆ with low bias and correct sign.
 #[test]
+#[ignore = "MSI-only #944 statistical coverage simulation; runs repeated profiled κ fits"]
 fn profile_ci_covers_planted_curvature_across_replicates() {
     gam::init_parallelism();
     let kappa_star = 1.5_f64;
@@ -235,6 +236,7 @@ fn profile_ci_covers_planted_curvature_across_replicates() {
 /// reject most), and the profile CI must cover κ=0 (verdict Flat) in a large
 /// majority — the controlled-size "is my latent space flat?" claim.
 #[test]
+#[ignore = "MSI-only #944 statistical size simulation; runs repeated profiled κ fits"]
 fn flatness_test_holds_size_across_flat_replicates() {
     gam::init_parallelism();
     let alpha = 0.05_f64;
