@@ -962,7 +962,7 @@ mod tests {
             time_degree: 3,
             time_num_internal_knots: 8,
             time_smooth_lambda: 1e-2,
-            survival_likelihood: "location-scale".to_string(),
+            survival_likelihood: "transformation".to_string(),
             survival_distribution: "gaussian".to_string(),
             threshold_time_k: None,
             threshold_time_degree: 3,
