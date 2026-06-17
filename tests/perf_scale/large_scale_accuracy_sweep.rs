@@ -700,12 +700,15 @@ fn edge_all_same_y_is_rejected_as_degenerate_response() {
     let y = vec![y_const; n];
     let data = encode_columns(&["theta", "y"], &[&theta, &y]);
     let cfg = gaussian_cfg();
-    let err = fit_from_formula(
+    let result = fit_from_formula(
         "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586)",
         &data,
         &cfg,
-    )
-    .expect_err("zero-variance Gaussian response must be rejected, not fitted");
+    );
+    let err = match result {
+        Ok(_) => panic!("zero-variance Gaussian response must be rejected, not fitted"),
+        Err(err) => err,
+    };
     let message = err.to_string();
     eprintln!("[edge-zero-variance] rejection message: {message}");
     assert!(
