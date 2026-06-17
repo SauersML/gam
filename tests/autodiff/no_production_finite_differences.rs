@@ -77,6 +77,36 @@ fn strip_cfg_test_blocks(source: &str) -> String {
     out
 }
 
+fn strip_fd_ok_regions(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_fd_ok_region = false;
+    for line in source.lines_inclusive() {
+        let has_region_start = line.contains("FD-OK:");
+        let has_region_end = line.contains("END-FD-OK");
+        let has_line_marker = line.contains("fd-ok:");
+        if in_fd_ok_region || has_region_start || has_line_marker {
+            preserve_newline_shape(line, &mut out);
+        } else {
+            out.push_str(line);
+        }
+        if has_region_start {
+            in_fd_ok_region = true;
+        }
+        if has_region_end {
+            in_fd_ok_region = false;
+        }
+    }
+    out
+}
+
+fn preserve_newline_shape(line: &str, out: &mut String) {
+    if line.ends_with('\n') {
+        out.push('\n');
+    } else {
+        out.push(' ');
+    }
+}
+
 fn find_next_cfg_test_only_attr(source: &str, start: usize) -> Option<usize> {
     let bytes = source.as_bytes();
     let mut i = start;
@@ -411,6 +441,27 @@ fn production_code() {
 }
 
 #[test]
+fn production_marker_scan_ignores_explicit_fd_ok_audit_regions() {
+    let source = r#"
+fn production_code() {
+    let fd_grad = 1.0;
+    // FD-OK: diagnostic audit block, not model math
+    let fd_directional = 2.0;
+    let fd_error = 0.1;
+    // END-FD-OK
+    let fd_step = 1.0e-4; // fd-ok: diagnostic audit scalar
+}
+"#;
+
+    let production =
+        strip_prose(&strip_fd_ok_regions(&strip_cfg_test_blocks(source))).to_lowercase();
+    assert!(production.contains("fd_grad"));
+    assert!(!production.contains("fd_directional"));
+    assert!(!production.contains("fd_error"));
+    assert!(!production.contains("fd_step"));
+}
+
+#[test]
 fn production_code_has_no_finite_difference_markers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
@@ -421,7 +472,8 @@ fn production_code_has_no_finite_difference_markers() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read source file");
-        let production = strip_prose(&strip_cfg_test_blocks(&source)).to_lowercase();
+        let production =
+            strip_prose(&strip_fd_ok_regions(&strip_cfg_test_blocks(&source))).to_lowercase();
         for marker in BANNED_PRODUCTION_MARKERS {
             if production.contains(marker) {
                 violations.push(format!("{} contains `{}`", path.display(), marker));
