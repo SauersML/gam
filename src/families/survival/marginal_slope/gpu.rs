@@ -2086,15 +2086,6 @@ pub fn cpu_oracle_third_contraction(
                 val += wi * di * (-2.0 / (inputs.qd1 * inputs.qd1 * inputs.qd1)) * qd1_dir;
             }
 
-            if std::env::var("DIAG979").is_ok() {
-                let chi_term = -wi * di * (chi_uv_over_chi_dir - chi_u_chi_v_over_chi2_dir);
-                let d_term = wi * di * (d_uv_over_d_dir - d_u_d_v_over_d2_dir);
-                let eta_term = val - chi_term - d_term;
-                eprintln!(
-                    "DIAG979P [{u},{v}] eta_term={eta_term:+.6e} chi_term={chi_term:+.6e} d_term={d_term:+.6e}"
-                );
-            }
-
             out[u * p + v] = val;
             out[v * p + u] = val;
         }
