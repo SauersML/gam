@@ -209,35 +209,20 @@ impl PsiGramTensor {
             match Self::build_at(&mut eval_design, weights, z, psi_lo, psi_hi, m) {
                 // An exact evaluation failed or was non-finite somewhere in
                 // the window — no larger rung can fix that.
-                BuildOutcome::EvalFailed => {
-                    if std::env::var("DIAG1033").is_ok() {
-                        eprintln!("[DIAG1033] PsiGramTensor::build EvalFailed at m={m}");
-                    }
-                    return None;
-                }
+                BuildOutcome::EvalFailed => return None,
                 // Tail not yet below the certificate at this rung: escalate.
                 // (Conflating this with EvalFailed would kill the ladder at
                 // its first — intentionally coarse — rung.)
-                BuildOutcome::TailNotCertified => {
-                    if std::env::var("DIAG1033").is_ok() {
-                        eprintln!("[DIAG1033] PsiGramTensor::build TailNotCertified at m={m}");
-                    }
-                    continue;
-                }
+                BuildOutcome::TailNotCertified => continue,
                 BuildOutcome::Candidate(mut candidate) => {
                     if candidate.spot_check(&mut eval_design, weights) {
                         // Narrow the gradient sub-window to the certified
                         // interior (the value lane keeps the full window).
                         candidate.certify_gradient_window(&mut eval_design, weights);
                         return Some(candidate);
-                    } else if std::env::var("DIAG1033").is_ok() {
-                        eprintln!("[DIAG1033] PsiGramTensor::build spot_check FAILED at m={m}");
                     }
                 }
             }
-        }
-        if std::env::var("DIAG1033").is_ok() {
-            eprintln!("[DIAG1033] PsiGramTensor::build exhausted ladder → None");
         }
         None
     }
