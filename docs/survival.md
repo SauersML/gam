@@ -185,8 +185,7 @@ arrays are endpoint-stacked with shape `(K * n_rows, n_times)`;
 ## Uncertainty on the survival surface
 
 For location-scale survival, passing any `interval=...` produces
-delta-method standard errors (issue #342 — the single `interval` knob
-replaces the previous `with_uncertainty` boolean):
+delta-method standard errors:
 
 ```python
 pred = model.predict(test_df, interval=0.95)
@@ -236,8 +235,8 @@ print(pred.survival_at([1, 5, 10, 20]))
 
 ## Marginal-slope for risk scores
 
-When a risk score (e.g. a risk score) has an effect that varies
-across covariate space, `survival_likelihood="marginal-slope"` with
+When a risk score has an effect that varies across covariate space,
+`survival_likelihood="marginal-slope"` with
 `logslope_formula=` models the score's spatially-varying effect separately
 from the baseline. Supply `transformation_normal_stage1=gamfit.CtnStage1(...)`
 to condition the score on covariates and cross-fit it inside the one call,
