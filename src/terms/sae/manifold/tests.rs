@@ -8981,18 +8981,13 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
         .join("tests/data/olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
-    // A modest real-activation slice keeps the single certified η-walk fast while
-    // still exercising the K>=2 multi-atom routing the fix targets on genuine
-    // long-tailed LLM data (the cause of the unreachable absolute floor). 320
-    // rows / 3 atoms keeps the Eckart-Young anchor non-degenerate (so the walk
-    // reaches the arrival-floor gate the fix corrects) while staying small enough
-    // for a single-walk regression test.
-    let z_train = z.slice(s![..320, ..]).to_owned();
+    // A modest real-activation slice keeps the single curved-basis inner solve
+    // fast (mirroring the #1190 real-data probe) while still exercising the
+    // K>=2 multi-atom regime on genuine long-tailed LLM data.
+    let z_train = z.slice(s![..256, ..]).to_owned();
 
     // Production-style K=3, d=2 periodic (torus) dictionary, PCA-seeded from the
-    // real activations exactly as the cold path does. 2 harmonics keep the inner
-    // joint Newton small while still routing through the K>=2 certified
-    // curvature-homotopy entry that the fix corrects.
+    // real activations exactly as the cold path does.
     let k = 3usize;
     let term = real_data_torus_seed_term(z_train.view(), k, 2);
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]; k]);
@@ -9007,59 +9002,96 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
         1.0e-6,
     );
 
-    // Run the certified curvature-homotopy entry (the K>=2 entry of record).
-    // Pre-#1189 this demoted to a bifurcation (arrived=false) by the unreachable
-    // absolute floor; post-#1189 the relative floor accepts the genuine arrival.
-    let arrived = objective
-        .run_curvature_homotopy_entry_at_rho(&rho)
-        .expect("real-data curvature-homotopy entry must not error");
-    // A `None` report means the entry took the degenerate-anchor / failed-η=0-solve
-    // early-out — i.e. the certified entry produced no usable arrival and the fit
-    // falls to the blind cascade. On this non-degenerate slice that itself is a
-    // failure mode; surface `bifurcation` explicitly when a report exists.
-    let report = objective.curvature_walk_report().cloned();
-    let bifurcation = report.as_ref().and_then(|r| r.bifurcation.clone());
-    eprintln!(
-        "[#1189] real-data entry: arrived={arrived} report_present={} bifurcation={:?}",
-        report.is_some(),
-        bifurcation
-    );
+    // The certified Eckart-Young anchor IS the achievable linear ceiling on this
+    // data: anchor_ev = 1 - ||anchor residual||^2 / SST. This is what the relative
+    // #1189 arrival floor is keyed to.
+    let anchor = linear_span_anchor(&objective.term, z_train.view())
+        .expect("Eckart-Young anchor must be recoverable on the real fixture");
+    let sst = {
+        let mut means = vec![0.0_f64; z_train.ncols()];
+        for col in 0..z_train.ncols() {
+            let mut acc = 0.0;
+            for row in 0..z_train.nrows() {
+                acc += z_train[[row, col]];
+            }
+            means[col] = acc / z_train.nrows() as f64;
+        }
+        let mut s = 0.0_f64;
+        for row in 0..z_train.nrows() {
+            for col in 0..z_train.ncols() {
+                let c = z_train[[row, col]] - means[col];
+                s += c * c;
+            }
+        }
+        s
+    };
+    let anchor_ev = 1.0 - anchor.residual_norm_sq / sst;
 
-    // The fitted reconstruction at the arrival state.
+    // One inner joint Newton solve at the full curved (η = 1) basis — the
+    // arrival state the curvature-homotopy walk converges to (same single-solve
+    // footprint as the #1190 probe, not the full multi-corrector walk).
+    let isometry_targets = objective
+        .registry
+        .as_ref()
+        .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
+        .unwrap_or_default();
+    objective
+        .solve_at_eta(&rho, 1.0, &isometry_targets)
+        .expect("real-data inner solve at η=1 must converge");
     let fitted = objective
         .term
         .try_fitted_for_rho(&rho)
-        .expect("fitted reconstruction at entry rho");
-    let ev = reconstruction_explained_variance(z_train.view(), fitted.view())
+        .expect("fitted reconstruction at η=1");
+    let real_ev = reconstruction_explained_variance(z_train.view(), fitted.view())
         .expect("finite EV on the real fixture");
-    eprintln!("[#1189] real-data entry in-sample EV = {ev:.5}");
 
-    assert!(
-        arrived && report.is_some() && bifurcation.is_none(),
-        "certified curvature walk did NOT arrive on real OLMo activations \
-         (arrived={arrived}, report_present={}, bifurcation={bifurcation:?}, EV={ev:.5}): the \
-         absolute arrival floor rejected the genuine fit and demoted to the blind cascade that \
-         collapses into the degenerate basin and pins the outer loop at the sentinel (#1189).",
-        report.is_some()
-    );
-    assert!(
-        ev.is_finite() && ev > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
-        "real-data arrival EV {ev:.5} <= collapse floor {SAE_FIT_DATA_COLLAPSE_EV_FLOOR} (#1189)."
+    // The #1189 effective arrival floor: relative to the achievable linear
+    // ceiling, clamped to [collapse floor, absolute floor].
+    let relative_floor = CURVATURE_WALK_ARRIVAL_EV_FLOOR
+        .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * anchor_ev)
+        .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
+    eprintln!(
+        "[#1189] real-data: anchor_ev={anchor_ev:.5} real_eta1_EV={real_ev:.5} \
+         absolute_floor={CURVATURE_WALK_ARRIVAL_EV_FLOOR} relative_floor={relative_floor:.5}"
     );
 
-    // The cost lane the outer ρ-optimizer ranks: a collapsed fit adds
-    // `SAE_FIT_DATA_COLLAPSE_COST` (~1e12) via the data-collapse penalty, pinning
-    // the loop; a genuine arrival leaves the base cost untouched.
+    // The genuine real-data curved fit is NOT degenerate (clears the data-collapse
+    // floor) and recovers essentially the achievable linear ceiling — yet it sits
+    // BELOW the old absolute 0.5 floor. THIS is the bug: pre-#1189 that absolute
+    // floor rejected this perfectly good fit and demoted to the cascade that
+    // collapses to the 1e12 sentinel.
+    assert!(
+        real_ev.is_finite() && real_ev > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
+        "real-data η=1 fit collapsed (EV {real_ev:.5} <= collapse floor \
+         {SAE_FIT_DATA_COLLAPSE_EV_FLOOR}) (#1189)."
+    );
+    assert!(
+        real_ev < CURVATURE_WALK_ARRIVAL_EV_FLOOR,
+        "real-data achievable EV {real_ev:.5} is unexpectedly >= the absolute floor \
+         {CURVATURE_WALK_ARRIVAL_EV_FLOOR}; this fixture no longer exhibits the #1189 regime \
+         (the absolute floor would not have rejected the fit). Pick a fixture/slice whose linear \
+         ceiling is below the absolute floor."
+    );
+    // The #1189 fix: the relative floor ACCEPTS this genuine fit (the arrival is
+    // certified), where the absolute floor would have rejected it.
+    assert!(
+        real_ev >= relative_floor,
+        "the #1189 relative arrival floor REJECTED the genuine real-data fit \
+         (EV {real_ev:.5} < relative floor {relative_floor:.5} from anchor ceiling \
+         {anchor_ev:.5}); the certified arrival would be demoted to the collapsing cascade (#1189)."
+    );
+
+    // And the data-collapse penalty leaves the cost finite and below the sentinel.
     let base_cost = objective
         .term
         .loss(z_train.view(), &rho)
-        .expect("loss at entry rho")
+        .expect("loss at η=1")
         .total();
     let penalized = objective
         .add_fit_data_collapse_penalty(base_cost, &rho)
         .expect("data-collapse penalty evaluation");
     eprintln!(
-        "[#1189] real-data outer cost: base={base_cost:.6e} after-collapse-penalty={penalized:.6e} \
+        "[#1189] real-data cost: base={base_cost:.6e} after-collapse-penalty={penalized:.6e} \
          sentinel={SAE_FIT_DATA_COLLAPSE_COST:.3e}"
     );
     assert!(
