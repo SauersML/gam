@@ -828,7 +828,11 @@ pub fn evaluate_bspline_derivative_scalar_into(
         *v = 0.0;
     }
 
-    let x_eval = one_sided_derivative_eval_point(x, knot_vector, degree);
+    let x_eval = one_sided_derivative_eval_point(
+        periodic_unclamped_derivative_eval_point(x, knot_vector, degree),
+        knot_vector,
+        degree,
+    );
 
     // Evaluate lower-degree (k-1) basis functions on the full knot support.
     // Cyclic fold-back constructs intentionally use the exterior support spans
@@ -1145,6 +1149,11 @@ pub(crate) fn evaluate_bspline_derivative_recurrence_into(
             minimum_degree: derivative_order,
         });
     }
+    let x = if depth == 0 {
+        periodic_unclamped_derivative_eval_point(x, knot_vector, degree)
+    } else {
+        x
+    };
 
     // Order 1 is the base case: it is computed directly from the plain
     // degree-`degree` basis rather than from a lower-order derivative.
