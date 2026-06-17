@@ -1992,15 +1992,14 @@ mod jet_tower_oracle_tests {
     //!   production `signed` jet → exercises the Leibniz/Faà-di-Bruno layer
     //!   where the #736 cross-block sign-flip bug genus lives), and
     //! * a special-function-independent central-FD witness of the value channel
-    //!   that re-derives `logΦ` from [`normal_logcdf`], pinning the probit
-    //!   derivative stack itself (so the oracle does not merely re-use the
-    //!   production transcendental).
+    //!   that re-derives `logΦ` from `libm::erfc`, pinning the probit derivative
+    //!   stack itself (so the oracle does not merely re-use the production
+    //!   transcendental).
 
     use super::*;
     use crate::families::jet_tower::{
         KernelChannels, RowNllProgram, evaluate_program, verify_kernel_channels,
     };
-    use crate::inference::probability::normal_logcdf;
 
     /// Independent single-expression row NLL for the rigid standard-normal
     /// Bernoulli kernel, primaries `(q_eta = marginal η, g = slope)`.
@@ -2055,7 +2054,7 @@ mod jet_tower_oracle_tests {
     }
 
     /// Special-function-independent scalar row NLL `ℓ(q_eta, g)` using
-    /// `normal_logcdf`, for the central-FD value-channel witness.
+    /// `libm::erfc`, for the central-FD value-channel witness.
     fn scalar_nll(eta_marginal: f64, g: f64, z: f64, y: f64, w: f64, s: f64) -> f64 {
         let link = bernoulli_marginal_link_map(
             &InverseLink::Standard(crate::types::StandardLink::Probit),
@@ -2066,7 +2065,8 @@ mod jet_tower_oracle_tests {
         let c = (observed_slope * observed_slope + 1.0).sqrt();
         let eta = link.q * c + observed_slope * z;
         let signed = (2.0 * y - 1.0) * eta;
-        -w * normal_logcdf(signed)
+        let cdf = 0.5 * libm::erfc(-signed / std::f64::consts::SQRT_2);
+        -w * cdf.max(1e-300).ln()
     }
 
     #[test]
@@ -2164,8 +2164,8 @@ mod jet_tower_oracle_tests {
                 });
 
                 // Special-function-independent FD witness of the value channel:
-                // re-derives logΦ from `normal_logcdf`, pinning the probit
-                // derivative stack rather than re-using the production one.
+                // re-derives logΦ from `libm::erfc`, pinning the probit derivative
+                // stack rather than re-using the production one.
                 let h = 1e-3;
                 let f = |de: f64, dg: f64| {
                     scalar_nll(

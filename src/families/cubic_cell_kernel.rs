@@ -3360,7 +3360,7 @@ fn evaluate_affine_cell_derivative_state(
 fn accumulate_moments_unrolled4(moments: &mut [f64], mw: f64, z: f64) {
     let mut z_pow = 1.0_f64;
     for slot in moments.iter_mut() {
-        *slot += mw * z_pow;
+        *slot = mw.mul_add(z_pow, *slot);
         z_pow *= z;
     }
 }
@@ -3373,8 +3373,8 @@ fn accumulate_moments_unrolled4(moments: &mut [f64], mw: f64, z: f64) {
 //
 // Single source of truth for the moment SIMD lane ordering, the Horner-with-FMA
 // pattern for η(z), the `0.5 * (z² + η²)` quadratic-form evaluation order, the
-// `scaled_weight = weight * half_width` pre-fold, and the per-lane
-// `accumulate_moments_unrolled4` call. The previous duplicated code paths
+// unscaled per-node GL moment weights, the post-loop half-width fold, and the
+// per-lane `accumulate_moments_unrolled4` call. The previous duplicated code paths
 // drifted by 1 ULP whenever any of these details diverged; here both paths
 // share the same instructions, eliminating an entire class of regressions
 // where a tweak to the quadrature order or the FMA pattern would silently
@@ -3456,9 +3456,8 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
             .mul_add(z_v, c0_v);
         let z2_v = z_v * z_v;
         let neg_q_v = neg_half_v * (z2_v + eta_v * eta_v);
-        let scaled_weight_v = weight_v * half_width_v;
         let exp_negq_v = neg_q_v.exp();
-        let moment_weight_v = scaled_weight_v * exp_negq_v;
+        let moment_weight_v = weight_v * exp_negq_v;
         let z_arr = z_v.to_array();
         let mw_arr = moment_weight_v.to_array();
         if COMPUTE_VALUE {
@@ -3499,8 +3498,7 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
         let z = center + half_width * node;
         let eta = c3.mul_add(z, c2).mul_add(z, c1).mul_add(z, c0);
         let q = 0.5 * (z * z + eta * eta);
-        let scaled_weight = weight * half_width;
-        let moment_weight = scaled_weight * (-q).exp();
+        let moment_weight = weight * (-q).exp();
         accumulate_moments_unrolled4(moments_slice, moment_weight, z);
         if COMPUTE_VALUE {
             // Bit-for-bit the reference value structure (see SIMD branch): the
@@ -3512,10 +3510,12 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
         }
         i += 1;
     }
-    // Apply the cell half-width to the value integral ONCE at the end, mirroring
-    // the reference's `value_integral * half_width` (the per-node accumulation
-    // above uses the unscaled GL weight). Folding half_width per-term instead
-    // would change the f64 rounding and reintroduce the ~1e-13 value drift.
+    // Apply the cell half-width to both moment and value integrals ONCE at the
+    // end, mirroring the prefold reference. Folding half_width per-term changes
+    // f64 rounding enough to show up at the 1e-13 contract.
+    for moment in moments_slice.iter_mut() {
+        *moment *= half_width;
+    }
     let value = if COMPUTE_VALUE {
         value_integral * half_width
     } else {

@@ -2859,7 +2859,6 @@ mod empirical_rigid_jet_oracle_tests {
     //! asserts the witness catches it.
 
     use super::*;
-    use crate::inference::probability::normal_logcdf;
 
     /// Independent calibration-intercept root solve: the unique `a` with
     /// `Σ_k π_k Φ(a + s·g·x_k) = μ`. Plain damped Newton from a bracketed seed;
@@ -3257,7 +3256,6 @@ mod empirical_flex_jet_oracle_tests {
     //! flip and asserts the witness rejects it.
 
     use super::*;
-    use crate::inference::probability::normal_logcdf;
 
     /// Test handle bundling a family with one active deviation block and the
     /// primary layout / fixed coefficients the kernel reads.
@@ -3403,13 +3401,25 @@ mod empirical_flex_jet_oracle_tests {
         scale * inside
     }
 
+    fn witness_normal_cdf(x: f64) -> f64 {
+        0.5 * libm::erfc(-x / std::f64::consts::SQRT_2)
+    }
+
+    fn witness_normal_pdf(x: f64) -> f64 {
+        (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+    }
+
+    fn witness_normal_logcdf(x: f64) -> f64 {
+        witness_normal_cdf(x).max(1e-300).ln()
+    }
+
     /// Solve the flex calibration root `Σ_k π_k Φ(η(a; x_k)) = μ` with an
     /// independent secant iteration (numeric — no shared IFT/jet-Newton code).
     fn witness_intercept(fx: &FlexFixture, mu: f64, b: f64, beta: &Array1<f64>, scale: f64) -> f64 {
         let calib = |a: f64| -> f64 {
             let mut acc = -mu;
             for (node, weight) in fx.grid.pairs() {
-                acc += weight * normal_cdf(witness_eta(fx, a, b, beta, node, scale));
+                acc += weight * witness_normal_cdf(witness_eta(fx, a, b, beta, node, scale));
             }
             acc
         };
@@ -3455,7 +3465,7 @@ mod empirical_flex_jet_oracle_tests {
         let z = fx.family.z[0];
         let eta = witness_eta(fx, a, b, &beta, z, scale);
         let signed = (2.0 * fx.family.y[0] - 1.0) * eta;
-        -fx.family.weights[0] * normal_logcdf(signed)
+        -fx.family.weights[0] * witness_normal_logcdf(signed)
     }
 
     /// Central-difference mixed partial of the scalar NLL along the listed
@@ -3551,7 +3561,7 @@ mod empirical_flex_jet_oracle_tests {
         // F_a at the root for `m_a` (must be finite, > 0).
         let mut m_a = 0.0;
         for (node, weight) in fx.grid.pairs() {
-            m_a += weight * normal_pdf(witness_eta(fx, intercept, b, &beta, node, scale));
+            m_a += weight * witness_normal_pdf(witness_eta(fx, intercept, b, &beta, node, scale));
         }
         let row_ctx = BernoulliMarginalSlopeRowExactContext {
             intercept,
@@ -3720,7 +3730,7 @@ mod empirical_flex_jet_oracle_tests {
         let intercept = witness_intercept(&fx, marginal.mu, b0, &beta, scale);
         let mut m_a = 0.0;
         for (node, weight) in fx.grid.pairs() {
-            m_a += weight * normal_pdf(witness_eta(&fx, intercept, b0, &beta, node, scale));
+            m_a += weight * witness_normal_pdf(witness_eta(&fx, intercept, b0, &beta, node, scale));
         }
         let row_ctx = BernoulliMarginalSlopeRowExactContext {
             intercept,
