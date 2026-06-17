@@ -100,11 +100,23 @@ pub struct PcgDiagnostics {
     pub stopping_reason: PcgStopReason,
     /// Mixed-precision certificate outcome for this solve.
     pub mixed_precision_status: MixedPrecisionStatus,
-    /// True when this Direct-mode point solve was served by the fully
-    /// device-resident batched Arrow-Schur sequence (#1017). Lets harnesses and
-    /// parity tests observe that the production auto-selection routed to the
-    /// device rather than the CPU dense Cholesky, without changing the numbers.
+    /// True only when the reduced-Schur solve was **actually executed on the
+    /// device**: either the fully device-resident batched Arrow-Schur Direct
+    /// sequence (`try_device_arrow_direct` → `solve_arrow_newton_step`) or the
+    /// device-resident matrix-free SAE PCG (`solve_sae_matrix_free_pcg`, which
+    /// runs the matvec in CUDA kernels over device-resident frames). It is NOT
+    /// set merely because a GPU runtime exists and a dispatch gate fired (#1209).
     pub used_device_arrow: bool,
+    /// True when a reduced-Schur matvec backend was injected through
+    /// `maybe_inject_gpu_schur_matvec` but the matvec itself runs as a
+    /// **host** (CPU Rust/Rayon) procedural closure — both the matrix-free
+    /// `build_row_procedural_matvec` branch and the `cuda::build_schur_matvec_backend`
+    /// branch return host closures that evaluate `Σ_i Y_iᵀ(Y_i x)` on the CPU,
+    /// even when a CUDA context was opened to build the per-row factors. This
+    /// path must NOT report `used_device_arrow`: the arithmetic is host-side
+    /// (#1209). Distinct field so perf accounting never mistakes a host
+    /// procedural matvec for true device execution.
+    pub injected_host_procedural_matvec: bool,
 }
 
 /// Outcome of an opt-in mixed-precision arrow solve.

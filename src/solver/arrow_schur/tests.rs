@@ -2015,6 +2015,10 @@ pub(crate) fn device_seam_declines_without_gpu_and_matches_cpu() {
         !diag.used_device_arrow,
         "no device present, so the solve must not be flagged device-served"
     );
+    assert!(
+        !diag.injected_host_procedural_matvec,
+        "no backend injected, so the host-procedural-matvec flag must stay clear (#1209)"
+    );
     let artifacts =
         solve_arrow_newton_step_artifacts(&sys, 0.0, 0.0, &options).expect("artifacts solve");
     for (a, b) in dt_core.iter().zip(artifacts.delta_t.iter()) {
@@ -3435,6 +3439,93 @@ pub(crate) fn resident_scalar_jacobi_matches_generic() {
                  {} vs {} (rel {rel:e})",
             out_resident[a],
             out_generic[a]
+        );
+    }
+}
+
+/// #1017 SAE-resident scalar-Jacobi col-dot hoist: the per-channel column dot
+/// `Σ_r L_i[r·p+j]·Y_i[r·p+j]` depends only on the row, not the support entry,
+/// so the builder now computes it once per row and scatters it across that
+/// row's `m_active` support atoms. This must be BIT-FOR-BIT identical to the
+/// pre-hoist algorithm (recompute the col-dot inside the support loop). Build
+/// the reference diagonal here from the raw resident `(L_i, Y_i, a_phi)` with
+/// the old inner-recompute structure, factor it the same way, and assert the
+/// resident-built preconditioner's applied output matches it to the last bit.
+#[test]
+pub(crate) fn resident_scalar_jacobi_col_dot_hoist_bit_identical() {
+    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64;
+    let q = 4usize;
+    let p = 5usize;
+    let n_atoms = 20usize;
+    let m_active = 4usize; // >1 ⇒ the hoist actually folds redundant col-dots.
+    let (sys, _a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, q, false)
+        .expect("SPD per-row blocks must factor");
+    let ridge_beta = 1e-6;
+    let k = sys.k;
+
+    let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
+        .expect("SAE structure must yield a resident operator");
+
+    // Reference diagonal via the EXACT pre-hoist nested structure: for each
+    // active support entry, recompute the col-dot inside the j loop. Same
+    // additions in the same order ⇒ identical f64 bits as the hoisted form,
+    // which only moves the (loop-invariant) col-dot out of the support loop.
+    let mut diag_ref = Array1::<f64>::zeros(k);
+    {
+        let slice = diag_ref.as_slice_mut().unwrap();
+        sys.penalty_diagonal_add(slice);
+    }
+    for a in 0..k {
+        diag_ref[a] += ridge_beta;
+    }
+    for row in 0..resident.rows.len() {
+        let rf = &resident.rows[row];
+        let di = rf.di;
+        if di == 0 {
+            continue;
+        }
+        let support = &resident.a_phi[row];
+        for &(beta_base, phi) in support {
+            if phi == 0.0 {
+                continue;
+            }
+            let phi2 = phi * phi;
+            for j in 0..p {
+                let mut col_dot = 0.0_f64;
+                for r in 0..di {
+                    let idx = r * p + j;
+                    col_dot += rf.l[idx] * rf.y[idx];
+                }
+                diag_ref[beta_base + j] -= phi2 * col_dot;
+            }
+        }
+    }
+
+    // Apply the reference diagonal directly (1/diag scaling) and the actual
+    // resident-built preconditioner; compare bit-for-bit. Force the serial
+    // build branch so the comparison is exact (no chunk-fold reassociation).
+    let r = Array1::from_iter((0..k).map(|a| 0.4 * ((a as f64) * 0.013).cos() + 0.06));
+    let one_thread = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("one-thread pool");
+    let out_resident = one_thread.install(|| {
+        JacobiPreconditioner::build_scalar_jacobi_resident(&sys, ridge_beta, &resident)
+            .expect("resident scalar Jacobi")
+            .apply(&r)
+    });
+    for a in 0..k {
+        let want = r[a] / diag_ref[a];
+        assert_eq!(
+            out_resident[a].to_bits(),
+            want.to_bits(),
+            "col-dot hoist must be bit-identical to inner-recompute at {a}: \
+             {} vs {}",
+            out_resident[a],
+            want
         );
     }
 }

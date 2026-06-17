@@ -195,7 +195,15 @@ pub fn solve_arrow_newton_step_core(
         return solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, &device_options).map(
             |step| {
                 let mut diagnostics = step.pcg_diagnostics;
-                diagnostics.used_device_arrow = true;
+                // #1209: the injected backend (`gpu_schur_matvec_backend`) runs the
+                // reduced-Schur matvec in a HOST Rust/Rayon closure in BOTH branches
+                // (`build_row_procedural_matvec` and `cuda::build_schur_matvec_backend`),
+                // even though a CUDA context may have been opened to build the per-row
+                // Cholesky factors. The matvec arithmetic is therefore CPU-side, so we
+                // must NOT claim device execution here — flag it as a host procedural
+                // matvec instead. `used_device_arrow` stays reserved for the genuinely
+                // device-executed Direct and device-resident PCG paths.
+                diagnostics.injected_host_procedural_matvec = true;
                 (step.delta_t, step.delta_beta, diagnostics)
             },
         );
@@ -1982,6 +1990,7 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
         stopping_reason: PcgStopReason::Converged,
         mixed_precision_status: MixedPrecisionStatus::Off,
         used_device_arrow: false,
+        injected_host_procedural_matvec: false,
     };
 
     Ok(ArrowNewtonStepArtifacts {
