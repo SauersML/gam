@@ -135,6 +135,7 @@ fn fit_options(skip_rho_posterior_inference: bool) -> FitOptions {
 }
 
 #[test]
+#[ignore = "MSI-only #979 wall-clock regression; shared CI timing is not stable"]
 fn gaussian_duchon_rho_posterior_inference_is_not_quadratic_in_n() {
     gam::init_parallelism();
     let n = 2000;

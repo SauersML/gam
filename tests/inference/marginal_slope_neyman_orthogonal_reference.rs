@@ -390,6 +390,7 @@ fn median_pointwise_beta_variance(fit: &BernoulliMarginalSlopeFitResult, x_grid:
 // band (false positive), while the ORTHOGONALIZED ratio sits inside it.
 // ===========================================================================
 #[test]
+#[ignore = "MSI-only #979/#461 simulation: runs CTN crossfit plus paired BMS fits"]
 fn sim_a_false_heterogeneity_is_controlled_by_orthogonalization() {
     init_parallelism();
     const N: usize = 3000;
@@ -471,6 +472,7 @@ fn sim_a_false_heterogeneity_is_controlled_by_orthogonalization() {
 // the naive arm's RMSE.
 // ===========================================================================
 #[test]
+#[ignore = "MSI-only #979/#461 simulation: runs CTN crossfit plus paired BMS fits"]
 fn sim_b_orthogonalization_preserves_real_heterogeneity_signal() {
     init_parallelism();
     const N: usize = 3000;

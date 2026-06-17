@@ -215,6 +215,7 @@ fn fit_large_scale_problem(
 }
 
 #[test]
+#[ignore = "MSI-only large-scale #979 perf gate; normal CI cannot budget n=60000 exact BMS"]
 fn large_scale_margslope_repro_completes_under_ci_budget() {
     init();
     let options = BlockwiseFitOptions::default();
@@ -245,6 +246,7 @@ fn large_scale_margslope_repro_completes_under_ci_budget() {
 }
 
 #[test]
+#[ignore = "MSI-only large-scale #979 Hessian build gate; normal CI cannot budget n=60000 exact BMS"]
 fn large_scale_margslope_hessian_build_regression_baseline() {
     init();
     let options = BlockwiseFitOptions {
@@ -272,6 +274,7 @@ fn large_scale_margslope_hessian_build_regression_baseline() {
 }
 
 #[test]
+#[ignore = "MSI-only #979 numerical fixture; runs repeated exact marginal-slope fits"]
 fn large_scale_margslope_known_good_beta_numerical_fixture() {
     init();
     let options = BlockwiseFitOptions {
