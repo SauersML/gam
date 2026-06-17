@@ -801,7 +801,6 @@ fn audit_identifiability_impl(
         bands
     };
 
-    eprintln!("TRACEA1197 audit r_joint={r_joint} n={n} k_bands={k_bands} obs_bands={observation_bands:?} p_total={p_total}");
     let mut x_joint = Array2::<f64>::zeros((r_joint, p_total));
     for (idx, block) in block_effective_designs.iter().enumerate() {
         let start = col_offsets[idx];
@@ -1122,7 +1121,6 @@ fn audit_identifiability_impl(
             JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN,
             has_exact_cross_block_duplicate,
         );
-        eprintln!("TRACEA1197 audit tall RRQR path entered");
         let x_joint_rank_input = build_x_joint_rank_input();
         if priority_perm_is_identity {
             rrqr_with_permutation(&x_joint_rank_input, alpha).map_err(|e| {
@@ -1151,7 +1149,6 @@ fn audit_identifiability_impl(
         p_total,
         rrqr_started.elapsed().as_secs_f64(),
     );
-    eprintln!("TRACEA1197 audit joint RRQR done rank={}", rrqr.rank);
     let joint_rank = rrqr.rank;
     let joint_rank_tol = rrqr.rank_tol;
     // RRQR's `column_permutation` indexes into the matrix it actually
