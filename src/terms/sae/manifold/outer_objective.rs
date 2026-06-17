@@ -795,8 +795,30 @@ impl SaeManifoldOuterObjective {
         // always route to recovery, even when a pathological anchor estimate
         // (negative / near-zero `anchor_ev`) would otherwise drop the floor to
         // zero and wave the collapse through.
+        // #1026 — the relative floor must also be PER-ATOM-SHARE aware. The
+        // anchor's certified ceiling `anchor_ev` is the CUMULATIVE Eckart-Young EV
+        // across ALL K atoms (sequential residual deflation in `linear_span_anchor`).
+        // In a K-atom dictionary each atom carries on average ~1/K of the captured
+        // variance, so a single atom that curves trades at most ~one atom's share of
+        // the linear ceiling for the geometry it gains. Holding the whole-dictionary
+        // curved EV to `0.9 * anchor_ev` (the full linear ceiling) therefore rejects
+        // genuine arrivals whenever the curved fit recovers slightly less than the
+        // cumulative linear optimum -- the K >= 2 co-collapse signature: the walk
+        // reaches a real curved branch (EV = 0.2461 / 0.29 / 0.37 on real OLMo) but
+        // `0.9 * anchor_ev` demotes it to a bifurcation and the cascade then
+        // collapses. The principled floor discounts the linear ceiling by exactly one
+        // atom's share: a curved K-atom fit need only stay within `1/K` of the linear
+        // ceiling (`anchor_ev * (K - 1)/K`), never within a flat 10%. At K = 1 the
+        // share floor is 0 (a single curved atom is judged only against the absolute /
+        // data-collapse floors -- it already beats its linear counterpart); as K grows
+        // it climbs back toward `anchor_ev`, still capped by the absolute
+        // `0.9 * anchor_ev` so a large dictionary is never held above the linear
+        // optimum it relaxed from.
+        let k_active = self.term.k_atoms().max(1) as f64;
+        let per_atom_share_floor = anchor_ev * ((k_active - 1.0) / k_active);
         let arrival_floor = CURVATURE_WALK_ARRIVAL_EV_FLOOR
             .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * anchor_ev)
+            .min(per_atom_share_floor.max(0.0))
             .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
         if arrived
             && let Ok(final_fit) = self.term.try_fitted_for_rho(&rho)

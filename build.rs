@@ -3177,6 +3177,14 @@ fn parse_git_index(bytes: &[u8]) -> Result<Vec<PathBuf>, String> {
             return Err(format!("truncated entry {entry_idx} fixed header"));
         }
         let flags = u16::from_be_bytes(bytes[pos + 60..pos + 62].try_into().expect("2-byte slice"));
+        // Entry mode: 4 bytes at offset 24 within the 62-byte fixed prefix
+        // (after ctime/mtime=16 + dev/ino=8). The low 16 bits are the git
+        // st_mode; 0o160000 (S_IFGITLINK) marks a submodule gitlink — a commit
+        // pointer, NOT a readable file. The line-count audit must skip it, or it
+        // panics trying to read the submodule path as a file.
+        let entry_mode =
+            u32::from_be_bytes(bytes[pos + 24..pos + 28].try_into().expect("4-byte slice"));
+        let is_gitlink = (entry_mode & 0o170000) == 0o160000;
         pos += 62;
         let extended = (flags & 0x4000) != 0;
         if extended {
@@ -3241,6 +3249,11 @@ fn parse_git_index(bytes: &[u8]) -> Result<Vec<PathBuf>, String> {
         // Stage 0 = ordinary tracked file; stages 1/2/3 are conflict variants
         // of the same path. Take stage 0 only so the audit sees each path once.
         if stage != 0 {
+            continue;
+        }
+        // Submodule gitlinks are commit pointers, not files — skip so the
+        // tracked-file line-count audit never tries to read a directory.
+        if is_gitlink {
             continue;
         }
         let path_str = std::str::from_utf8(&path_bytes)
