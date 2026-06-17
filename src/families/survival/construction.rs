@@ -4794,9 +4794,19 @@ mod tests {
         let cases = [
             (25.0_f64, 0.4_f64, 1e-9_f64),
             (100.0, 0.4, 1e-6),   // x = 1e-4
-            (100.0, 0.012, 1e-5), // x = 1e-3, the old-pivot failure point
+            (100.0, 0.012, 1e-6), // x = 1e-4, the old-pivot band (large age, tiny shape)
             (50.0, 1.2, 1e-8),
         ];
+        // NOTE: every quantity below is compared against its shape->0 *limit*.
+        // For the cancelling cumulative branches (∂H/∂shape, ∂²H/∂shape²,
+        // ∂²h/∂shape²) the limit is the correct shape->0 target and the
+        // implementation routes through Taylor in this band. But the
+        // instantaneous first derivative ∂h_G/∂shape = rate·age·e^x carries NO
+        // cancellation: it is exact, and its departure from the limit rate·t is
+        // a genuine O(x) effect. At x=1e-3 that departure is ~1.2e-3 (> tol),
+        // so the cases here keep x <= 1e-4 where the limit is a valid 1e-3
+        // oracle for *all four* quantities. The cancelling-branch regression at
+        // larger x is covered by gompertz_second_shape_derivative_is_accurate_in_old_pivot_gap.
         for &(age, rate, shape) in &cases {
             let t = age;
             let (d_cum, d_inst) = gompertz_cumulative_shape_derivative(age, rate, shape);
