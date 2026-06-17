@@ -9935,6 +9935,7 @@ mod inner_contract_probe_tests {
     ///    regresses (and the seed lands the solve in the right basin immediately).
     #[test]
     fn amortized_warm_start_matches_or_beats_cold_inner_solve_on_known_manifold() {
+        use crate::terms::sae::encode::{AtlasConfig, EncodeAtlas, amortized_warm_start};
         let n = 24usize;
         let p = 4usize;
         let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);

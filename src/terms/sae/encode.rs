@@ -727,7 +727,7 @@ pub(crate) fn family_jet_sups(
             let ev = CylinderHarmonicEvaluator::new(h.max(1), SAE_CYLINDER_LINE_DEGREE)?;
             JetSups::from_family(&ev, chart)
         }
-        EuclideanPatch | Poincare => {
+        Linear | EuclideanPatch | Poincare => {
             // The patch width fixes max_degree implicitly; bound by a degree that
             // covers the column count (conservative). Degree d-patch column count
             // grows fast; we recover the smallest degree whose patch is ≥ m.
@@ -2067,7 +2067,7 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
         Cylinder if d == 2 => cylinder_chart_center_grid(resolution),
         Cylinder => regular_product_grid(d, resolution, -0.5, 0.5, true),
         Sphere if d == 2 => sphere_latlon_grid(resolution),
-        Sphere | Duchon | EuclideanPatch | Poincare | Precomputed(_) => {
+        Linear | Sphere | Duchon | EuclideanPatch | Poincare | Precomputed(_) => {
             // Unbounded / non-compact latents: a strided cover of a unit box
             // about the origin per axis. The certified radius refines each chart;
             // out-of-cover starts route to the exact fallback honestly.
@@ -2173,7 +2173,7 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
         // take the tighter (periodic) step `0.5/res` to keep every chart valid
         // on both axes. The certified Kantorovich radius refines it per chart.
         Cylinder => 0.5 / (resolution.max(2) as f64),
-        Duchon | EuclideanPatch | Poincare | Precomputed(_) => 1.0 / (resolution.max(2) as f64),
+        Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) => 1.0 / (resolution.max(2) as f64),
     }
 }
 
@@ -2208,6 +2208,6 @@ pub(crate) fn chart_region(
         }
         // Cylinder has no radial kernel block (it is a harmonic × polynomial
         // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
-        Periodic | Sphere | Torus | Cylinder | EuclideanPatch | Poincare | Precomputed(_) => region,
+        Periodic | Sphere | Torus | Cylinder | Linear | EuclideanPatch | Poincare | Precomputed(_) => region,
     }
 }
