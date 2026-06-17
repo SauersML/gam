@@ -1,4 +1,5 @@
 use super::*;
+use crate::model_types::CERTIFICATE_Z_GATE;
 use ::opt::FixedPointObjective;
 use ndarray::array;
 use std::sync::atomic::{AtomicUsize, Ordering};

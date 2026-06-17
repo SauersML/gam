@@ -1,5 +1,3 @@
-use crate::basis::BSplineBoundaryConditions;
-
 #[test]
 fn pure_duchon_aniso_penalties_stay_symmetric_through_freeze_and_cache() {
     fn max_asymmetry(matrix: &Array2<f64>) -> f64 {
@@ -163,7 +161,7 @@ fn single_block_no_spatial_fast_path_returns_fully_frozen_spec() {
                     double_penalty: true,
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
-                    boundary_conditions: BSplineBoundaryConditions::default(),
+                    boundary_conditions: crate::basis::BSplineBoundaryConditions::default(),
                 },
             },
             shape: ShapeConstraint::None,
