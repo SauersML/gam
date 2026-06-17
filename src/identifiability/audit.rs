@@ -940,7 +940,45 @@ fn audit_identifiability_impl(
                 "identifiability audit joint Gram RRQR failed: {e:?}"
             ))
         })?;
-    let use_gram = gram_rrqr.verdict_margin >= JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN;
+    // Exact-duplicate guard (gam#933): the Gram-squared rank verdict squares the
+    // condition number, so a pair of *exactly* collinear cross-block columns
+    // (|cosine| = 1, e.g. an anchor `x` aliased by a callback-owned `x`) can be
+    // mis-counted as full rank -- the pivot that should be 0 floats above the
+    // relative tolerance in squared coordinates, and `verdict_margin` is large
+    // and confidently wrong, so it never trips the near-cliff tall fallback.
+    // The downstream MAP-uniqueness eigendecomposition (un-squared) then catches
+    // the exact null and the whole canonicalisation fails. Cheaply pre-scan the
+    // (already-computed) joint Gram for any cross-block exact-duplicate pair
+    // (|cosine| > 1 - 1e-8) and, if one exists, force the exact tall RRQR on the
+    // un-squared `[J; S]` design, which demotes the duplicate correctly. The
+    // scan reads only `joint_gram` (no new n-row stream) and early-exits on the
+    // first hit, so it is negligible on the full-rank common case.
+    let has_exact_cross_block_duplicate = {
+        let mut found = false;
+        'scan: for a in 0..p_total {
+            let gaa = joint_gram[[a, a]];
+            if gaa <= 0.0 {
+                continue;
+            }
+            for b in (a + 1)..p_total {
+                if col_block_idx[a] == col_block_idx[b] {
+                    continue;
+                }
+                let gbb = joint_gram[[b, b]];
+                if gbb <= 0.0 {
+                    continue;
+                }
+                let cosine = joint_gram[[a, b]] / (gaa * gbb).sqrt();
+                if cosine.abs() > 1.0 - 1.0e-8 {
+                    found = true;
+                    break 'scan;
+                }
+            }
+        }
+        found
+    };
+    let use_gram = gram_rrqr.verdict_margin >= JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN
+        && !has_exact_cross_block_duplicate;
     let rrqr: RrqrWithPermutation = if use_gram {
         log::info!(
             "[STAGE] identifiability audit: joint RRQR path=gram verdict_margin={:.3e} \
@@ -954,12 +992,15 @@ fn audit_identifiability_impl(
             rank_tol: gram_rrqr.rank_tol,
         }
     } else {
-        // Near-cliff verdict: re-confirm on the exact tall (un-squared) design.
+        // Near-cliff verdict OR an exact cross-block duplicate (gam#933):
+        // re-confirm on the exact tall (un-squared) design, which does not
+        // square the condition number and demotes exact aliases correctly.
         log::info!(
             "[STAGE] identifiability audit: joint RRQR path=tall (gram verdict_margin={:.3e} \
-             below floor {:.1e}; re-confirming on n×p design)",
+             vs floor {:.1e}, exact_cross_block_duplicate={}; re-confirming on n×p design)",
             gram_rrqr.verdict_margin,
             JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN,
+            has_exact_cross_block_duplicate,
         );
         let x_joint_rank_input = build_x_joint_rank_input();
         if priority_perm_is_identity {
