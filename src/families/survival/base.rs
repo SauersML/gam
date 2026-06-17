@@ -2577,7 +2577,7 @@ impl WorkingModelSurvival {
         // reliably reaches ||r|| below the FD-step round-off floor across the whole
         // rho = [-0.5 .. 8] range exercised by the consistency gates.
         {
-            const POLISH_MAX_ITERS: usize = 200;
+            const POLISH_MAX_ITERS: usize = 400;
             const POLISH_TOL: f64 = 1e-11;
             // Armijo sufficient-decrease constant and backtracking factor.
             const ARMIJO_C: f64 = 1e-4;
@@ -2683,7 +2683,20 @@ impl WorkingModelSurvival {
                     let trial = &beta - &(alpha * &step);
                     if let Ok(ts) = candidate.update_state(&trial) {
                         let ft = penalized_objective(&ts);
-                        if ft.is_finite() && ft <= f0 + ARMIJO_C * alpha * dir_deriv {
+                        let tn = ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        // Accept on EITHER a sufficient objective decrease (Armijo,
+                        // the global-convergence guarantee on the convex objective)
+                        // OR a strict residual-norm decrease. Near the solution the
+                        // penalized objective is flat to f64 roundoff (f0 ≈ ft), so a
+                        // pure-Armijo test backtracks α→0 and crawls (the asymmetric
+                        // ρ=3.99999 stall: 200 iters at 3.7e-7 vs 12 iters at the
+                        // other two ρ). The ‖r‖-decrease arm lets the exact Cholesky
+                        // Newton step (α=1) through, restoring quadratic convergence
+                        // to ~1e-12 symmetrically across all three FD points so the
+                        // centered FD of the value surface is itself exact.
+                        let armijo_ok = ft.is_finite() && ft <= f0 + ARMIJO_C * alpha * dir_deriv;
+                        let residual_ok = tn.is_finite() && tn < r_norm;
+                        if armijo_ok || residual_ok {
                             beta = trial;
                             accepted = true;
                             break;
