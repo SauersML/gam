@@ -233,6 +233,7 @@ fn basis_kind_tag(kind: &SaeAtomBasisKind) -> &str {
         SaeAtomBasisKind::Periodic => "periodic",
         SaeAtomBasisKind::Sphere => "sphere",
         SaeAtomBasisKind::Torus => "torus",
+        SaeAtomBasisKind::Linear => "linear",
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
         SaeAtomBasisKind::Poincare => "poincare",
         SaeAtomBasisKind::Cylinder => "cylinder",
@@ -1407,6 +1408,31 @@ pub struct StructureSearchResult {
     /// One ledger per round actually run (a round that applies no move is the
     /// last; its ledger is included so the certificate covers the fixpoint).
     pub rounds: Vec<SearchLedger>,
+}
+
+impl StructureSearchResult {
+    /// `true` iff at least one structure-changing move LANDED across the rounds —
+    /// an `Accepted` move (certified birth / fission / fusion that restructured
+    /// the dictionary and triggered a warm refit) or a `Demoted` death (an atom
+    /// folded to ~0 routing). Both mutate the returned `term`/`rho` away from the
+    /// pre-search joint fit, so any shape uncertainty assembled from the
+    /// PRE-search joint Hessian is stale and must be recomputed from the final
+    /// post-search per-atom inner fits (#1230). When this is `false`, every round
+    /// was contested / vetoed / deduplicated / deferred / stale, the term/rho are
+    /// byte-for-byte the pre-search fit, and the exact joint-Hessian bands remain
+    /// valid.
+    #[must_use]
+    pub fn structure_changed(&self) -> bool {
+        use crate::solver::structure_search::MoveVerdict;
+        self.rounds.iter().any(|round| {
+            round.moves.iter().any(|record| {
+                matches!(
+                    record.verdict,
+                    MoveVerdict::Accepted { .. } | MoveVerdict::Demoted { .. }
+                )
+            })
+        })
+    }
 }
 
 /// The round driver's configuration: how the data is split into shards, the

@@ -854,7 +854,8 @@ impl SaeManifoldTerm {
                 // real continuous gauge and leaves the linear axis ungauged.
                 (SaeAtomBasisKind::Cylinder, _) => AtomTopology::Circle,
                 (
-                    SaeAtomBasisKind::Duchon
+                    SaeAtomBasisKind::Linear
+                    | SaeAtomBasisKind::Duchon
                     | SaeAtomBasisKind::EuclideanPatch
                     | SaeAtomBasisKind::Poincare
                     | SaeAtomBasisKind::Precomputed(_),
@@ -938,6 +939,7 @@ impl SaeManifoldTerm {
                             && matches!(
                                 atom.basis_kind,
                                 SaeAtomBasisKind::Torus
+                                    | SaeAtomBasisKind::Linear
                                     | SaeAtomBasisKind::Duchon
                                     | SaeAtomBasisKind::EuclideanPatch
                                     | SaeAtomBasisKind::Sphere
@@ -8139,12 +8141,21 @@ impl SaeManifoldTerm {
     ///
     /// This is a strict completion: an atom whose band the Schur path already
     /// filled (a finite `band_sd`) is left untouched; only atoms with a missing
-    /// entry (index past the assembled set) or an all-NaN band (the
-    /// no-decoder-covariance fallback) are filled. An atom whose inner fit is
-    /// degenerate (`None` — no active rows / non-SPD inner Hessian) is left with
-    /// its NaN band, faithfully reporting "unidentified" rather than fabricating a
-    /// number. Requires [`Self::set_atom_inner_fits`] to have run; without it the
-    /// completion is a no-op (the band stays as the Schur path left it).
+    /// entry (index past the assembled set) or an all-NaN band are filled. An
+    /// all-NaN band arises either as the no-decoder-covariance fallback OR when
+    /// the caller deliberately invalidated a stale PRE-search band via
+    /// [`SaeShapeUncertainty::invalidate_bands_for_recompute`] after a structure
+    /// move re-converged the dictionary (#1230); in both cases the band is
+    /// recomputed here against the FINAL model. When a band is (re)filled the
+    /// whole slot — `band_coords`, `band_mean`, AND `band_sd` — is rebuilt from
+    /// the current fitted atom, so an atom whose coordinates / decoded mean / row
+    /// count shifted under a structure-search refit gets a fully consistent band
+    /// (never a stale-coordinate or shape-mismatched one). An atom whose inner fit
+    /// is degenerate (`None` — no active rows / non-SPD inner Hessian) is left
+    /// with its NaN band, faithfully reporting "unidentified" rather than
+    /// fabricating a number. Requires [`Self::set_atom_inner_fits`] to have run;
+    /// without it the completion is a no-op (the band stays as the Schur path left
+    /// it).
     pub fn complete_born_atom_shape_bands(
         &self,
         unc: &mut SaeShapeUncertainty,
@@ -8221,9 +8232,31 @@ impl SaeManifoldTerm {
             };
             // Evenly-strided on-atom rows, matched to the band the Schur path uses.
             let n_rows = atom.n_obs();
+            let d = atom.latent_dim;
             let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
             let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
+            let g = eval_rows.len();
+            // Rebuild the ENTIRE band slot (coords / mean / sd) from the CURRENT
+            // fitted atom rather than only overwriting `band_sd`. #1230 — a seed
+            // atom whose pre-search band was invalidated for recompute (because
+            // structure search re-converged the dictionary) may have changed its
+            // coordinates, decoded mean, AND on-atom row count, so reusing the old
+            // `band_coords` / `band_mean` (or indexing the old-shaped `band_sd`)
+            // would mismatch the final model. A born atom whose slot was just
+            // pushed with the right shape is rebuilt identically — same result.
+            let coords_mat = self.assignment.coords[k].as_matrix();
+            let mut band_coords = Array2::<f64>::zeros((g, d));
+            let mut band_mean = Array2::<f64>::zeros((g, p));
+            let mut band_sd = Array2::<f64>::from_elem((g, p), f64::NAN);
+            let mut decoded = vec![0.0_f64; p];
             for (gi, &row) in eval_rows.iter().enumerate() {
+                for axis in 0..d {
+                    band_coords[[gi, axis]] = coords_mat[[row, axis]];
+                }
+                atom.fill_decoded_row(row, &mut decoded);
+                for c in 0..p {
+                    band_mean[[gi, c]] = decoded[c];
+                }
                 // Φ_k(t) at this on-atom row.
                 let phi_t = atom.basis_values.row(row).to_owned();
                 // H_k⁻¹ Φ(t), then the quadratic form Φ(t)ᵀ H_k⁻¹ Φ(t).
@@ -8233,9 +8266,12 @@ impl SaeManifoldTerm {
                 // inner Hessian is shared; the decoder differs only in the mean).
                 let sd = (dispersion * quad).sqrt();
                 for c in 0..p {
-                    band.band_sd[[gi, c]] = sd;
+                    band_sd[[gi, c]] = sd;
                 }
             }
+            band.band_coords = band_coords;
+            band.band_mean = band_mean;
+            band.band_sd = band_sd;
         }
         Ok(())
     }
