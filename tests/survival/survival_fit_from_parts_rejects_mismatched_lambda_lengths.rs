@@ -25,6 +25,7 @@ fn survival_fit_from_parts_rejects_mismatched_lambda_lengths() {
         outer_converged: true,
         covariance_conditional: Some(Array2::eye(5)),
         geometry: None,
+        used_device: false,
     };
 
     let result = survival_fit_from_parts(parts);

@@ -242,6 +242,7 @@ fn external_fit_result_preserves_outer_convergence_flag() {
         inference: None,
         reml_score: 4.0,
         fitted_link: FittedLinkState::Standard(None),
+        used_device: false,
     };
 
     let fit = fit_result_from_external(ext);
