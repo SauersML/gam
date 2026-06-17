@@ -349,21 +349,6 @@ install a torch build whose CUDA suffix matches (`+cu12x`).
 | `examples/` | Python and Rust demos, including SAE and topology examples. |
 | `scripts/` | Documentation figure, gallery, and diagnostic scripts. |
 
-## Development
-
-```bash
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
-cargo test --all-features
-
-uv venv --python 3.12 .venv-docs
-uv pip install --python .venv-docs/bin/python -r docs/requirements.txt
-.venv-docs/bin/mkdocs serve
-```
-
-Benchmarks: `python3 bench/run_suite.py --help` for the suite runner or
-`python3 bench/run.py --help` for the current benchmark entrypoint.
-
 ## Documentation
 
 - Full Python documentation: <https://gamfit.readthedocs.io/>.
@@ -401,6 +386,8 @@ because the friction felt too high.
 Open a [pull request](https://github.com/SauersML/gam/pulls) or an
 [issue](https://github.com/SauersML/gam/issues) — bugs, features,
 questions, wild ideas. That's the whole process.
+
+Note, this README was written mostly by Claude, with some feedback from the human.
 
 ## License
 
