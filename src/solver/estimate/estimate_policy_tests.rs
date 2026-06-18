@@ -57,7 +57,10 @@ fn generalized_external_reml_keeps_multistart_policy() {
     let cfg = external_reml_seed_config(2, LinkFunction::Logit);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
     assert!(cfg.max_seeds > 1);
-    assert_eq!(cfg.seed_budget, 1);
+    assert_eq!(
+        cfg.seed_budget, 2,
+        "GLM REML must request the alternate ARC startup basin"
+    );
 }
 
 #[test]
