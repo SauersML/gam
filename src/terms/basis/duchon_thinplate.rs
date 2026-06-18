@@ -1130,6 +1130,14 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
         .assign(&kernel_rotated);
     basis.slice_mut(s![.., kernel_cols..]).assign(&poly_block);
 
+    if std::env::var_os("DIAG1271").is_some() {
+        let mut sorted: Vec<f64> = radial_eigvals.iter().copied().collect();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!(
+            "[DIAG1271] kernel_cols={kernel_cols} poly_cols={poly_cols} radial_eigvals(desc)={:?}",
+            sorted.iter().map(|v| format!("{v:.3e}")).collect::<Vec<_>>()
+        );
+    }
     let mut penalty_bending = Array2::<f64>::zeros((total_cols, total_cols));
     for i in 0..kernel_cols {
         penalty_bending[[i, i]] = radial_eigvals[i];
