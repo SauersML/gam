@@ -138,7 +138,7 @@ pub const PSI_GRAM_SKIP_SCAN_POINTS: usize = 64;
 /// to change β̂. Keep the skip in the low-ψ, well-conditioned prefix where the
 /// Gram scale remains close to the pinning surface; later trials take the full
 /// slow path.
-pub const PSI_GRAM_SKIP_FROB_GROWTH_MAX: f64 = 16.0;
+pub const PSI_GRAM_SKIP_FROB_GROWTH_MAX: f64 = 256.0;
 
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
 ///
