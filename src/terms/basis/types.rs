@@ -1016,7 +1016,6 @@ pub struct DuchonBasisSpec {
     /// a spec reaches the builder this value is the final intended `s`. The
     /// hybrid Duchon–Matérn path (`length_scale = Some`) still requires an
     /// integer `s` (read via `spec.power_as_usize()`).
-    #[serde(alias = "power_int")]
     pub power: f64,
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]

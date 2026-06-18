@@ -460,7 +460,7 @@ fn latent_glm_family_from_str(
                 InverseLink::Standard(StandardLink::Logit),
             ))
         }
-        "gamma" | "gamma-log" => Ok(LikelihoodSpec::new(
+        "gamma-log" => Ok(LikelihoodSpec::new(
             ResponseFamily::Gamma,
             InverseLink::Standard(StandardLink::Log),
         )),

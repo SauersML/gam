@@ -363,7 +363,6 @@ pub(crate) enum FamilyArg {
     LatentCloglogBinomial,
     PoissonLog,
     NegativeBinomial,
-    #[value(alias = "gamma")]
     GammaLog,
     Tweedie,
     Beta,
