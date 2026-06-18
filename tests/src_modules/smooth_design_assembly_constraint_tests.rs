@@ -3865,7 +3865,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
             rho_dim,
             &kappa_options,
         )
-        .map(|outcome| match outcome {
+        .map(|(outcome, _timing)| match outcome {
             SpatialJointOutcome::Optimized {
                 theta_star,
                 final_value,
