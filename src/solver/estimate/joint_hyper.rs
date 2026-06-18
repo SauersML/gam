@@ -647,35 +647,34 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         );
         // Install the conditioned-frame EXACT ANALYTIC ψ-derivatives so the
         // Gaussian ψ-gradient HyperCoord is assembled from these k×k objects
-        // instead of the n×k ∂X/∂ψ slab — retiring the second per-trial n-pass.
-        //
-        // `dgram_dpsi`/`drhs_dpsi` differentiate the SAME certified Chebyshev value
-        // expansion (`∂/∂ψ Σ_d T_d(x) G_d = Σ_d T_d′(x)·(dx/dψ)·G_d`), so the
-        // derivative is the EXACT analytic derivative of the value polynomial — no
-        // finite difference. It is valid across the whole VALUE window: the
-        // narrower `contains_for_gradient` sub-window reflects only where the
-        // 4th-order-FD CERTIFICATION ORACLE in `certify_gradient_window` itself
-        // converges (the FD reference explodes near the large-ψ edge), NOT a
-        // failure of the analytic derivative — which shares the certified value
-        // representation and is bit-tight wherever the value lane is. Gating the
-        // install on the narrow sub-window forced every value-but-not-gradient
-        // trial (common near edges / early in the κ trajectory) onto the O(n·k)
-        // ∂X/∂ψ slab AND advanced the realizer revision, cascading the following
-        // value probes to the slow path too (the #1033 outer-loop O(n)). Install
-        // the analytic derivative across the full value window instead.
-        if self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
-            tensor.dgram_dpsi(psi),
-            tensor.drhs_dpsi(psi),
-        ))) {
+        // instead of the n×k ∂X/∂ψ slab — but ONLY on the certified gradient
+        // SUB-window `contains_for_gradient`. Differentiating the Chebyshev value
+        // interpolant AMPLIFIES its interpolation error (`T_d′ ∼ d²`), so near the
+        // large-ψ window edges the analytic ψ-derivative GENUINELY fails the
+        // certification tolerance even though the VALUE reconstruction still
+        // certifies there — this is a real accuracy boundary, not a certification
+        // artifact. Outside the sub-window we return `false` (no tensor derivative
+        // installed): the caller then computes the EXACT STREAMED ψ-gradient from
+        // the realized n×k ∂X/∂ψ slab for that trial (O(n) for the rare edge evals;
+        // most κ trials land interior). Every gradient is therefore EXACT —
+        // analytic in the interior, exact-streamed at the edges — never an
+        // approximation (no finite difference in production).
+        if tensor.contains_for_gradient(psi)
+            && self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
+                tensor.dgram_dpsi(psi),
+                tensor.drhs_dpsi(psi),
+            )))
+        {
             log::debug!(
                 "[psi-gram-tensor] installed n-free analytic ψ-gradient derivatives at \
                  psi={psi:.6}"
             );
             true
         } else {
-            // The derivative shape refused (width mismatch). Clear any
-            // derivative pair left from a prior in-window ψ so the gradient lane
-            // uses the exact slab for this trial rather than a stale carry-over.
+            // Outside the certified gradient sub-window (or the derivative shape
+            // refused). Clear any derivative pair left from a prior in-sub-window ψ
+            // so the gradient lane computes the EXACT streamed slab for this trial
+            // rather than reusing a stale derivative carried over on the fast path.
             self.reml_state.clear_gaussian_psi_gram_deriv();
             false
         }

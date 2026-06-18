@@ -2502,17 +2502,20 @@ impl<'d> SpatialJointContext<'d> {
         let skip_design_realization = !allow_second_order && theta.len() == self.rho_dim + 1 && {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
-                    // #1033 gradient coverage: the `&& covers_gradient` clause is
-                    // DROPPED. It required the strictly-narrower analytic-derivative
-                    // sub-window, so any ψ in the value window but outside it (common
-                    // near edges / early in the κ trajectory) refused the skip → O(n)
-                    // `reset_surface` + a realizer-revision bump that cascaded the
-                    // following value probes to the slow path too. The ψ-gradient is
-                    // now served n-free across the WHOLE value window:
-                    // `install_psi_gram_statistics` installs the analytic k×k
-                    // derivative inside the sub-window and an n-free central-difference
-                    // of the certified value lane (`fd_psi_gram_deriv`) outside it, so
-                    // value coverage alone certifies a sound n-free gradient.
+                    // #1033 gradient coverage: the skip serves the ψ-gradient n-free
+                    // only where the analytic Chebyshev derivative is CERTIFIED
+                    // (`contains_for_gradient`). Differentiating the value interpolant
+                    // amplifies its error (`T_d′ ∼ d²`), so near the window edges the
+                    // analytic derivative genuinely fails the gradient tolerance even
+                    // though the value still certifies — a real accuracy boundary. For
+                    // those edge ψ the gradient must come from the EXACT streamed n×k
+                    // ∂X/∂ψ slab, which needs the realized design at this ψ, so the
+                    // skip is refused there (whole design realized → exact value AND
+                    // gradient). Most κ trials land interior (inside the sub-window) →
+                    // n-free; only the rare edge evals pay O(n), and every gradient is
+                    // EXACT (analytic interior, exact-streamed at edges) — no
+                    // production finite difference.
+                    && self.evaluator.psi_gram_tensor_covers_gradient(psi)
                     // #1033 (reduced-basis rotation, supersedes #1264 gate): the
                     // Gaussian-identity inner solve the skip serves reads its data
                     // statistics ONLY from re-keyed k×k objects — XᵀWX(ψ)/XᵀW(y−
