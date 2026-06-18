@@ -132,18 +132,15 @@ pub const PSI_GRAM_SKIP_RRQR_MARGIN_MIN: f64 = 16.0;
 /// much drift or misses the stable interval entirely.
 pub const PSI_GRAM_SKIP_SCAN_POINTS: usize = 256;
 
-/// Maximum growth in `||X(ψ)ᵀWX(ψ)||_F` admitted inside the design-revision
-/// skip window.
+/// Number of scan intervals admitted after the first probe of an RRQR-stable
+/// component.
 ///
-/// The skip path keeps the realized REML surface pinned at the first ψ in a
-/// design revision and only re-keys k-space sufficient statistics. Matching the
-/// RRQR rank and pivot order is necessary, but #1264 showed it is not
-/// sufficient on the wide standardized Duchon window: the high-ψ end can keep
-/// the same pivot metadata while the reduced solve geometry has drifted enough
-/// to change β̂. Keep the skip in the low-ψ, well-conditioned prefix where the
-/// Gram scale remains close to the pinning surface; later trials take the full
-/// slow path.
-pub const PSI_GRAM_SKIP_FROB_GROWTH_MAX: f64 = 16.0;
+/// Matching RRQR rank and pivot order is necessary, but #1264 showed it is not
+/// sufficient over a wide high-ψ band. The design-revision skip is therefore a
+/// strictly local fast path: it may cover only the first three scan probes of
+/// the first stable component, keeping the pinned reference surface close to
+/// every skipped trial. Wider moves take the full `reset_surface` path.
+pub const PSI_GRAM_SKIP_MAX_SCAN_INTERVALS: usize = 2;
 
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
 ///
@@ -177,10 +174,9 @@ pub struct PsiGramTensor {
     /// the reduced basis are unchanged. On the WIDE standardized window (#1215)
     /// the radial-kernel frame can pivot while the conditioning ratio still looks
     /// tame, so a conditioning-only gate silently pairs a stale reduced basis
-    /// with a re-keyed Gram → a wrong β̂. This sub-window is the low-ψ prefix
-    /// whose Gram-derived RRQR rank/permutation match and whose Gram Frobenius
-    /// scale stays close to the reference; outside it the caller must take the
-    /// full `reset_surface` slow path.
+    /// with a re-keyed Gram → a wrong β̂. This sub-window is the first local
+    /// low-ψ prefix whose Gram-derived RRQR rank/permutation match; outside it
+    /// the caller must take the full `reset_surface` slow path.
     skip_psi_lo: f64,
     skip_psi_hi: f64,
     /// Original row count of the design whose Gram was tensorized. Needed to run
@@ -634,13 +630,9 @@ impl PsiGramTensor {
             permutation: Vec<usize>,
         }
 
-        let frame_and_frob_at = |me: &Self, psi: f64| -> Option<(Frame, f64)> {
+        let frame_at = |me: &Self, psi: f64| -> Option<Frame> {
             let g = me.gram_at(psi);
             if g.iter().any(|v| !v.is_finite()) {
-                return None;
-            }
-            let frob = g.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if !frob.is_finite() || frob <= 0.0 {
                 return None;
             }
             let rrqr = crate::linalg::faer_ndarray::rrqr_from_gram_with_permutation(
@@ -654,13 +646,10 @@ impl PsiGramTensor {
             {
                 return None;
             }
-            Some((
-                Frame {
-                    rank: rrqr.rank,
-                    permutation: rrqr.column_permutation,
-                },
-                frob,
-            ))
+            Some(Frame {
+                rank: rrqr.rank,
+                permutation: rrqr.column_permutation,
+            })
         };
         let span = self.psi_hi - self.psi_lo;
         if !(span.is_finite() && span > 0.0) {
@@ -669,46 +658,33 @@ impl PsiGramTensor {
             return;
         }
         let n = PSI_GRAM_SKIP_SCAN_POINTS;
-        let probes: Vec<(f64, Option<(Frame, f64)>)> = (0..=n)
+        let probes: Vec<(f64, Option<Frame>)> = (0..=n)
             .map(|i| {
                 let psi = self.psi_lo + span * (i as f64) / (n as f64);
-                (psi, frame_and_frob_at(self, psi))
+                (psi, frame_at(self, psi))
             })
             .collect();
 
-        let Some(reference_frob) = probes
-            .iter()
-            .filter_map(|(_, probe)| probe.as_ref().map(|(_, frob)| *frob))
-            .min_by(f64::total_cmp)
-        else {
-            self.skip_psi_lo = f64::NAN;
-            self.skip_psi_hi = f64::NAN;
-            return;
-        };
-        let frob_ceiling = reference_frob * PSI_GRAM_SKIP_FROB_GROWTH_MAX;
         let mut start = 0usize;
         while start < probes.len() {
-            let Some((reference_frame, start_frob)) = probes[start].1.as_ref() else {
+            let Some(reference_frame) = probes[start].1.as_ref() else {
                 start += 1;
                 continue;
             };
-            if *start_frob > frob_ceiling {
-                start += 1;
-                continue;
-            }
             let mut end = start;
             while end + 1 < probes.len() {
-                let Some((frame, frob)) = probes[end + 1].1.as_ref() else {
+                let Some(frame) = probes[end + 1].1.as_ref() else {
                     break;
                 };
-                if frame != reference_frame || *frob > frob_ceiling {
+                if frame != reference_frame {
                     break;
                 }
                 end += 1;
             }
             if end - start + 1 >= 3 {
                 self.skip_psi_lo = probes[start].0;
-                self.skip_psi_hi = probes[end].0;
+                let local_end = (start + PSI_GRAM_SKIP_MAX_SCAN_INTERVALS).min(end);
+                self.skip_psi_hi = probes[local_end].0;
                 return;
             }
             start = end + 1;
