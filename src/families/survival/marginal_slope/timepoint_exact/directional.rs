@@ -370,6 +370,75 @@ impl SurvivalMarginalSlopeFamily {
         let a_dir = a_u.dot(dir);
         let a_u_dir = a_uv.dot(dir);
         let dir_g = if primary.g < p { dir[primary.g] } else { 0.0 };
+        if b != 0.0 && (a_dir != 0.0 || dir_g != 0.0) {
+            for cell_entry in &cached.cells {
+                let neg_cell = cell_entry.neg_cell;
+                let fixed = &cell_entry.fixed;
+                let part = &cell_entry.partition_cell;
+                let edge_velocity =
+                    |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                        match edge {
+                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
+                                ..
+                            } => -(a_dir + z * dir_g) / b,
+                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                        }
+                    };
+                let v_right = edge_velocity(part.right_edge, neg_cell.right);
+                let v_left = edge_velocity(part.left_edge, neg_cell.left);
+                if v_right == 0.0 && v_left == 0.0 {
+                    continue;
+                }
+
+                let boundary = |neg_r: &[f64], neg_s: &[f64], neg_rs: &[f64]| -> f64 {
+                    let right = if v_right != 0.0 {
+                        v_right
+                            * crate::families::cubic_cell_kernel::cell_second_derivative_boundary_integrand(
+                                neg_cell,
+                                neg_r,
+                                neg_s,
+                                neg_rs,
+                                neg_cell.right,
+                            )
+                    } else {
+                        0.0
+                    };
+                    let left = if v_left != 0.0 {
+                        v_left
+                            * crate::families::cubic_cell_kernel::cell_second_derivative_boundary_integrand(
+                                neg_cell,
+                                neg_r,
+                                neg_s,
+                                neg_rs,
+                                neg_cell.left,
+                            )
+                    } else {
+                        0.0
+                    };
+                    right - left
+                };
+
+                let neg_dc_da = fixed.dc_da.map(|val| -val);
+                let neg_dc_daa = fixed.dc_daa.map(|val| -val);
+                f_aa_dir += boundary(&neg_dc_da, &neg_dc_da, &neg_dc_daa);
+                for u in 0..p {
+                    let neg_coeff_u = fixed.coeff_u[u].map(|val| -val);
+                    let neg_coeff_au = fixed.coeff_au[u].map(|val| -val);
+                    f_au_dir[u] += boundary(&neg_dc_da, &neg_coeff_u, &neg_coeff_au);
+                    for v in u..p {
+                        let neg_coeff_v = fixed.coeff_u[v].map(|val| -val);
+                        let neg_sc_uv = self
+                            .cell_pair_second_coeff(primary, &fixed.coeff_bu, u, v)
+                            .map(|val| -val);
+                        let bval = boundary(&neg_coeff_u, &neg_coeff_v, &neg_sc_uv);
+                        f_uv_dir[[u, v]] += bval;
+                        if u != v {
+                            f_uv_dir[[v, u]] += bval;
+                        }
+                    }
+                }
+            }
+        }
         let mut a_uv_dir = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
