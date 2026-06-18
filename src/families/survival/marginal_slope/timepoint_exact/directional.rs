@@ -254,13 +254,29 @@ impl SurvivalMarginalSlopeFamily {
                             // call integrates.)
                             let boundary =
                                 |neg_r: &[f64], neg_s: &[f64], neg_rs: &[f64]| -> f64 {
-                                    let fr = crate::families::cubic_cell_kernel::cell_second_derivative_boundary_integrand(
-                                    neg_cell, neg_r, neg_s, neg_rs, neg_cell.right,
-                                );
-                                    let fl = crate::families::cubic_cell_kernel::cell_second_derivative_boundary_integrand(
-                                    neg_cell, neg_r, neg_s, neg_rs, neg_cell.left,
-                                );
-                                    fr * v_right - fl * v_left
+                                    // Evaluate the boundary integrand ONLY for a
+                                    // moving (Crossing) edge. A Fixed edge has
+                                    // zero velocity AND may sit at `±∞` (tail
+                                    // cells), where the integrand is `0·∞ = NaN`;
+                                    // multiplying that by a `0.0` velocity would
+                                    // poison the sum with `NaN·0 = NaN`. Skipping
+                                    // the eval entirely keeps zero-velocity edges
+                                    // contributing exactly 0.
+                                    let fr = if v_right != 0.0 {
+                                        v_right * crate::families::cubic_cell_kernel::cell_second_derivative_boundary_integrand(
+                                            neg_cell, neg_r, neg_s, neg_rs, neg_cell.right,
+                                        )
+                                    } else {
+                                        0.0
+                                    };
+                                    let fl = if v_left != 0.0 {
+                                        v_left * crate::families::cubic_cell_kernel::cell_second_derivative_boundary_integrand(
+                                            neg_cell, neg_r, neg_s, neg_rs, neg_cell.left,
+                                        )
+                                    } else {
+                                        0.0
+                                    };
+                                    fr - fl
                                 };
 
                             let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
