@@ -16,6 +16,18 @@ def _assert_rejects_nonbinomial_flexible_link(df, formula, *, family, match):
         gamfit.fit(df, formula, family=family)
 
 
+def test_flexible_link_kwarg_is_rejected_on_gaussian():
+    x = np.linspace(-1.5, 1.5, 64)
+    y = 1.0 + 0.8 * x + 0.7 * np.tanh(3.0 * x)
+    df = pd.DataFrame({"y": y, "x": x})
+
+    with pytest.raises(
+        gamfit.InvalidConfigurationError,
+        match="flexible\\(\\.\\.\\.\\).*non-binomial",
+    ):
+        gamfit.fit(df, "y ~ x", family="gaussian", flexible_link=True)
+
+
 def test_flexible_log_link_is_rejected_on_poisson():
     x = np.linspace(-1.5, 1.5, 64)
     y = np.maximum(0, np.round(np.exp(0.5 + 0.8 * x))).astype(float)
