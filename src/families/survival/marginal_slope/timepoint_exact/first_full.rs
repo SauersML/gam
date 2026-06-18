@@ -468,11 +468,16 @@ impl SurvivalMarginalSlopeFamily {
                     let eta_aaa_poly = fixed.dc_daaa.to_vec();
                     let mut eta_u_poly = vec![PolyVec::new(); p];
                     let mut chi_u_poly = vec![PolyVec::new(); p];
+                    let mut d_u_integrand_poly = vec![PolyVec::new(); p];
                     let mut d_uv = vec![0.0; p * p];
                     for u in 0..p {
                         eta_u_poly[u] = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
                         chi_u_poly[u] =
                             poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
+                        d_u_integrand_poly[u] = poly_sub(
+                            &chi_u_poly[u],
+                            &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
+                        );
                     }
                     for u in 0..p {
                         for v in u..p {
@@ -544,8 +549,56 @@ impl SurvivalMarginalSlopeFamily {
                                 &state.moments,
                                 "survival D_t second derivative",
                             )?;
-                            d_uv[u * p + v] = value;
-                            d_uv[v * p + u] = value;
+                            let boundary = if b != 0.0 {
+                                let part = &entry.partition_cell;
+                                let edge_vel =
+                                    |axis: usize,
+                                     edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                     z: f64|
+                                     -> f64 {
+                                        match edge {
+                                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
+                                                ..
+                                            } => {
+                                                let direct_g =
+                                                    if axis == primary.g { z } else { 0.0 };
+                                                -(a_u[axis] + direct_g) / b
+                                            }
+                                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(
+                                                _,
+                                            ) => 0.0,
+                                        }
+                                    };
+                                let flux = |axis: usize, poly: &[f64]| -> f64 {
+                                    let v_r = edge_vel(axis, part.right_edge, cell.right);
+                                    let v_l = edge_vel(axis, part.left_edge, cell.left);
+                                    let right = if v_r != 0.0 {
+                                        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                            cell,
+                                            poly,
+                                            cell.right,
+                                        )
+                                    } else {
+                                        0.0
+                                    };
+                                    let left = if v_l != 0.0 {
+                                        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                            cell,
+                                            poly,
+                                            cell.left,
+                                        )
+                                    } else {
+                                        0.0
+                                    };
+                                    right - left
+                                };
+                                0.5 * (flux(v, &d_u_integrand_poly[u])
+                                    + flux(u, &d_u_integrand_poly[v]))
+                            } else {
+                                0.0
+                            };
+                            d_uv[u * p + v] = value + boundary;
+                            d_uv[v * p + u] = value + boundary;
                         }
                     }
                     Ok(d_uv)
