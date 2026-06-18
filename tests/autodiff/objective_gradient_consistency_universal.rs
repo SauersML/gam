@@ -1291,6 +1291,31 @@ fn survival_objective_gradient_consistent_at_large_lambda_boundary() {
     }
 }
 
+#[test]
+fn survival_boundary_rho_six_fd_step_scan_probe_931() {
+    let model = survival_single_block_model(1.0);
+    let beta0 = array![-2.5_f64, 1.0];
+    let rho = array![6.0_f64];
+    let analytic = survival_grad(&model, &beta0, &rho)[0];
+    let fd_at = |h: f64| -> f64 {
+        let mut rp = rho.clone();
+        rp[0] += h;
+        let mut rm = rho.clone();
+        rm[0] -= h;
+        (survival_cost(&model, &beta0, &rp) - survival_cost(&model, &beta0, &rm)) / (2.0 * h)
+    };
+    println!("[931-SCAN] analytic={analytic:.15e}");
+    for h in [1.0e-5_f64, 5.0e-5, 1.0e-4, 2.5e-4, 5.0e-4, 1.0e-3, 2.0e-3, 4.0e-3] {
+        let fd = fd_at(h);
+        let rich = (4.0 * fd_at(h / 2.0) - fd) / 3.0;
+        let rel_fd = (fd - analytic).abs() / analytic.abs().max(1.0);
+        let rel_rich = (rich - analytic).abs() / analytic.abs().max(1.0);
+        println!(
+            "[931-SCAN] h={h:.1e} fd={fd:.15e} rel_fd={rel_fd:.3e}  rich={rich:.15e} rel_rich={rel_rich:.3e}"
+        );
+    }
+}
+
 // --- Regime R2: near-degenerate eigenvalue pair (Daleckii–Krein) -------
 
 #[test]
