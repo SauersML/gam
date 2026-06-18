@@ -33,7 +33,12 @@ pub fn build_spherical_spline_basis(
         spec.radians,
         spec.wahba_kernel,
     )?;
-    let low_degree_residual = wahba_low_degree_residual_projector(centers.view(), spec.radians)?;
+    let low_degree_residual = wahba_low_degree_residual_projector(
+        centers.view(),
+        spec.radians,
+        spec.penalty_order,
+        spec.wahba_kernel,
+    )?;
     let mut raw_penalty = low_degree_residual
         .dot(&raw_penalty)
         .dot(&low_degree_residual);
@@ -132,7 +137,10 @@ pub fn build_spherical_spline_basis(
         op: None,
     }];
     if spec.double_penalty {
-        let ridge = gauge.restrict_penalty(&low_degree_residual);
+        let null_shrinkage =
+            &Array2::<f64>::eye(low_degree_residual.nrows()) - &low_degree_residual;
+        let null_shrinkage = (&null_shrinkage + &null_shrinkage.t()) * 0.5;
+        let ridge = gauge.restrict_penalty(&null_shrinkage);
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
@@ -236,6 +244,8 @@ fn orthonormal_column_basis(matrix: ArrayView2<'_, f64>, rel_tol: f64) -> Array2
 fn wahba_low_degree_residual_projector(
     centers: ArrayView2<'_, f64>,
     radians: bool,
+    penalty_order: usize,
+    kernel: SphereWahbaKernel,
 ) -> Result<Array2<f64>, BasisError> {
     let low_cols = SPHERE_UNPENALIZED_LOW_DEGREE * (SPHERE_UNPENALIZED_LOW_DEGREE + 2);
     if centers.nrows() <= low_cols {
@@ -246,12 +256,65 @@ fn wahba_low_degree_residual_projector(
         SPHERE_UNPENALIZED_LOW_DEGREE,
         radians,
     );
-    let q = orthonormal_column_basis(harmonics.view(), 1e-10);
+    let gram =
+        spherical_wahba_kernel_matrix_with_kind(centers, centers, penalty_order, radians, kernel)?;
+    let low_degree_coefficients = solve_spd_columns_ridged(gram.view(), harmonics.view())?;
+    let q = orthonormal_column_basis(low_degree_coefficients.view(), 1e-10);
     if q.ncols() == 0 {
         return Ok(Array2::<f64>::eye(centers.nrows()));
     }
     let projector = Array2::<f64>::eye(centers.nrows()) - q.dot(&q.t());
     Ok((&projector + &projector.t()) * 0.5)
+}
+
+fn solve_spd_columns_ridged(
+    a: ArrayView2<'_, f64>,
+    b: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, BasisError> {
+    use crate::linalg::faer_ndarray::{FaerArrayView, FaerLlt, FaerSolve};
+    use faer::Side;
+
+    let n = a.nrows();
+    if n == 0 || a.ncols() != n || b.nrows() != n {
+        crate::bail_dim_basis!(
+            "ridged SPD solve needs square A and matching RHS rows, got A={}x{} and B={}x{}",
+            a.nrows(),
+            a.ncols(),
+            b.nrows(),
+            b.ncols()
+        );
+    }
+    let trace: f64 = (0..n).map(|i| a[[i, i]].abs()).sum();
+    let ridge = if trace.is_finite() && trace > 0.0 {
+        1e-8 * trace / n as f64
+    } else {
+        1e-12
+    };
+    let mut m = a.to_owned();
+    for i in 0..n {
+        m[[i, i]] += ridge;
+    }
+    let mview = FaerArrayView::new(&m);
+    let factor = FaerLlt::new(mview.as_ref(), Side::Lower).map_err(|err| {
+        BasisError::InvalidInput(format!(
+            "sphere Wahba low-degree Gram solve failed after ridge {ridge:.3e}: {err:?}"
+        ))
+    })?;
+    let rhs_owned = b.to_owned();
+    let rhs = FaerArrayView::new(&rhs_owned);
+    let solved = factor.solve(rhs.as_ref());
+    let mut out = Array2::<f64>::zeros((n, b.ncols()));
+    for j in 0..b.ncols() {
+        for i in 0..n {
+            out[[i, j]] = solved[(i, j)];
+        }
+    }
+    if !out.iter().all(|v| v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "sphere Wahba low-degree Gram solve produced non-finite coefficients".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Precomputed √(2)·N(l,m) coefficients for the real spherical-harmonic
@@ -552,7 +615,6 @@ pub(crate) fn build_spherical_harmonic_basis(
         joint_null_rotation: None,
     })
 }
-
 
 pub fn build_matern_basis(
     data: ArrayView2<'_, f64>,
