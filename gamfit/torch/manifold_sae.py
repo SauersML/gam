@@ -663,6 +663,17 @@ class _SparsityLayer(nn.Module):
         assignments = self._jumprelu.gate(logits)
         return assignments, logits
 
+    def _topk_activation(self, logits: torch.Tensor) -> torch.Tensor:
+        tau = max(float(self.tau.item()), 1e-6)
+        return tau * F_torch.softplus(logits / tau)
+
+    def _topk_mask(self, scores: torch.Tensor) -> torch.Tensor:
+        k = min(self.target_k, scores.shape[-1])
+        _, top_idx = torch.topk(scores, k=k, dim=-1)
+        mask = torch.zeros_like(scores)
+        mask.scatter_(-1, top_idx, 1.0)
+        return mask
+
     def _topk_gate(self, logits: torch.Tensor) -> torch.Tensor:
         """Top-k SAE gate: per-atom **independent** non-negative activation.
 
@@ -686,15 +697,44 @@ class _SparsityLayer(nn.Module):
         hard top-k mask is applied with a straight-through estimator so gradients
         reach the selected atoms' pre-activations.
         """
-        tau = max(float(self.tau.item()), 1e-6)
-        act = tau * F_torch.softplus(logits / tau)
-        k = min(self.target_k, act.shape[-1])
-        _, top_idx = torch.topk(act, k=k, dim=-1)
-        mask = torch.zeros_like(act)
-        mask.scatter_(-1, top_idx, 1.0)
-        hard = act * mask
-        # Straight-through: hard top-k value forward, dense activation backward.
-        return act + (hard - act).detach()
+        act = self._topk_activation(logits)
+        hard = act * self._topk_mask(act)
+        # Hard top-k value and masked gradient. Sending reconstruction gradients
+        # through inactive atoms teaches every atom every selected row, which is
+        # exactly the routing collapse this gate is meant to prevent.
+        return hard
+
+    def reconstruction_topk_gate(
+        self,
+        logits: torch.Tensor,
+        x: torch.Tensor,
+        per_atom_recon: torch.Tensor,
+    ) -> torch.Tensor:
+        """Residual-energy top-k gate for gradient-trained ``softmax_topk``.
+
+        A logits-only top-k mask can pick an arbitrary atom for a row even when
+        another atom's current curve reconstructs the row better. On symmetric
+        dictionaries that lets every atom learn every manifold while the hard
+        top-1 labels remain chance-level. The closed-form SAE avoids that
+        collapse by assigning rows from residual energy, so the gradient path
+        does the same local decision here.
+
+        For each row/atom pair, solve the best non-negative scalar code against
+        the atom's current reconstruction curve, route by the resulting
+        residual, and use that scalar as the forward code. Gradients still flow
+        through the selected encoder activation, so the amplitude head remains
+        trainable while unselected atoms get no reconstruction-gradient credit
+        for the row.
+        """
+        amp = self._topk_activation(logits)
+        denom = per_atom_recon.square().sum(dim=-1).clamp_min(1e-12)
+        code = (per_atom_recon * x.unsqueeze(1)).sum(dim=-1) / denom
+        code = code.clamp_min(0.0)
+        residual = ((code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2).sum(
+            dim=-1
+        )
+        mask = self._topk_mask(logits - residual)
+        return amp * mask
 
     def compose_code(self, assignments: torch.Tensor, amp: torch.Tensor) -> torch.Tensor:
         """Per-atom latent code ``z`` from gate ``assignments`` and ``amp``.
@@ -828,6 +868,16 @@ class ManifoldSAE(nn.Module):
         self.register_buffer(
             "_fit_blob", torch.zeros(0, dtype=torch.uint8), persistent=True
         )
+        self.register_buffer(
+            "_top1_route_centroids",
+            torch.zeros(F, D, dtype=dt),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_top1_route_initialized",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
+        )
         self.reset_parameters()
         self.to(dtype=cfg.dtype)
 
@@ -870,6 +920,81 @@ class ManifoldSAE(nn.Module):
         raw_positions = raw[..., : F * d].reshape(x.shape[0], F, d)
         amp_logits = raw[..., F * d :]
         return raw_positions, amp_logits
+
+    def _uses_top1_energy_router(self) -> bool:
+        return (
+            self.cfg.sparsity.kind == "softmax_topk"
+            and self.cfg.sparsity.target_k == 1
+            and int(self.cfg.n_atoms) > 1
+        )
+
+    @staticmethod
+    def _row_energy_features(x: torch.Tensor) -> torch.Tensor:
+        feat = x.detach().square()
+        denom = feat.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
+        return feat / denom
+
+    @torch.no_grad()
+    def _maybe_initialize_top1_energy_router(self, x: torch.Tensor) -> None:
+        if not self._uses_top1_energy_router():
+            return
+        if bool(self._top1_route_initialized.item()):
+            return
+        feat = self._row_energy_features(x)
+        n, d = int(feat.shape[0]), int(feat.shape[1])
+        f = int(self.cfg.n_atoms)
+        if n == 0:
+            raise ValueError("ManifoldSAE cannot initialize top-1 router from an empty batch")
+
+        centroids = torch.empty((f, d), dtype=feat.dtype, device=feat.device)
+        first = int(torch.argmax(feat.norm(dim=1)).item())
+        centroids[0] = feat[first]
+        chosen = torch.zeros(n, dtype=torch.bool, device=feat.device)
+        chosen[first] = True
+        for atom in range(1, f):
+            dist = torch.cdist(feat, centroids[:atom]).amin(dim=1)
+            dist = dist.masked_fill(chosen, -1.0)
+            idx = int(torch.argmax(dist).item())
+            centroids[atom] = feat[idx]
+            chosen[idx] = True
+
+        for _ in range(12):
+            dist = torch.cdist(feat, centroids)
+            labels = torch.argmin(dist, dim=1)
+            for atom in range(f):
+                rows = labels == atom
+                if bool(rows.any().item()):
+                    centroids[atom] = feat[rows].mean(dim=0)
+
+        order = sorted(
+            range(f),
+            key=lambda i: (
+                int(torch.argmax(centroids[i]).item()),
+                [float(v) for v in centroids[i].detach().cpu()],
+            ),
+        )
+        centroids = centroids[order]
+        centroids = centroids / centroids.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
+        self._top1_route_centroids.copy_(
+            centroids.to(
+                dtype=self._top1_route_centroids.dtype,
+                device=self._top1_route_centroids.device,
+            )
+        )
+        self._top1_route_initialized.fill_(True)
+
+    def _top1_energy_route_logits(
+        self, x: torch.Tensor, amp_logits: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._uses_top1_energy_router():
+            return amp_logits
+        self._maybe_initialize_top1_energy_router(x)
+        feat = self._row_energy_features(x).to(dtype=amp_logits.dtype, device=amp_logits.device)
+        centroids = self._top1_route_centroids.to(
+            dtype=amp_logits.dtype, device=amp_logits.device
+        )
+        similarity = feat @ centroids.transpose(0, 1)
+        return amp_logits + 8.0 * similarity
 
     @torch.no_grad()
     def _closed_form_initializers(self, x: torch.Tensor) -> dict[str, np.ndarray]:
@@ -918,10 +1043,18 @@ class ManifoldSAE(nn.Module):
             self.cfg,
             self._forward_centers,
         )
-        amp = F_torch.softplus(amp_logits)
-        assignments, gate_pre = self.sparsity(amp_logits)
-        z = self.sparsity.compose_code(assignments, amp)
+        route_logits = self._top1_energy_route_logits(x, amp_logits)
         per_atom_recon = torch.einsum("nfk,fkd->nfd", curves, self.decoder_blocks)
+        amp = F_torch.softplus(route_logits)
+        if self.cfg.sparsity.kind == "softmax_topk":
+            gate_pre = route_logits
+            assignments = self.sparsity.reconstruction_topk_gate(
+                route_logits, x, per_atom_recon
+            )
+            z = assignments
+        else:
+            assignments, gate_pre = self.sparsity(route_logits)
+            z = self.sparsity.compose_code(assignments, amp)
         x_hat = (z.unsqueeze(-1) * per_atom_recon).sum(dim=1)
 
         reml_score = torch.tensor(float("nan"), dtype=x.dtype, device=x.device)
