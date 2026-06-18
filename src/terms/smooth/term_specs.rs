@@ -4381,15 +4381,52 @@ fn matern_operator_penalty_triplet_from_metadata(
         Some(scales) => compensate_length_scale_for_standardization(*length_scale, scales),
         None => *length_scale,
     };
-    let penalty_centers = crate::basis::expand_periodic_centers(centers, periodic.as_deref())?;
+    matern_operator_penalty_triplet_at_length_scale(
+        centers.view(),
+        periodic.as_deref(),
+        identifiability_transform.as_ref(),
+        *nu,
+        *include_intercept,
+        aniso_log_scales.as_deref(),
+        penalty_length_scale,
+    )
+}
+
+/// Build the canonical Matérn operator-penalty triplet (mass / tension /
+/// stiffness) at an explicit **effective** length scale — i.e. the
+/// σ_geom-compensated, standardized-frame scale the design's kernel was built
+/// against (NOT the original-coordinate `length_scale` stored in metadata).
+///
+/// This is the SINGLE source of truth for the Matérn penalty topology. Two
+/// callers route through it and must therefore stay byte-for-byte consistent:
+///   * the cold/slow design rebuild (`matern_operator_penalty_triplet_from_metadata`,
+///     compensating the frozen metadata `length_scale`), and
+///   * the n-free κ-optimizer re-key (`FrozenTermCollectionIncrementalRealizer::
+///     canonical_penalties_at_psi`, compensating the trial `ψ → exp(-ψ)` scale).
+///
+/// Sharing the body makes the penalty BLOCK COUNT and the per-block numerics
+/// one deterministic function of `(geometry, ν, η, ℓ_eff)`. The active-operator
+/// gate is `m = ν + d/2`, which is independent of ℓ, so the block count is
+/// **ψ-stable by construction**: the re-key can never produce a different number
+/// of blocks than the frozen design (the desync that #1270 hard-errored on).
+pub(crate) fn matern_operator_penalty_triplet_at_length_scale(
+    centers: ArrayView2<'_, f64>,
+    periodic: Option<&[Option<f64>]>,
+    identifiability_transform: Option<&Array2<f64>>,
+    nu: crate::basis::MaternNu,
+    include_intercept: bool,
+    aniso_log_scales: Option<&[f64]>,
+    effective_length_scale: f64,
+) -> Result<(Vec<Array2<f64>>, Vec<usize>, Vec<PenaltyInfo>), BasisError> {
+    let penalty_centers = crate::basis::expand_periodic_centers(&centers.to_owned(), periodic)?;
     let ops = build_matern_collocation_operator_matrices(
         penalty_centers.view(),
         None,
-        penalty_length_scale,
-        *nu,
-        *include_intercept,
-        identifiability_transform.as_ref().map(|z| z.view()),
-        aniso_log_scales.as_deref(),
+        effective_length_scale,
+        nu,
+        include_intercept,
+        identifiability_transform.map(|z| z.view()),
+        aniso_log_scales,
     )?;
     // Gate the operator dials on the Matérn-ν RKHS Sobolev order m = ν + d/2:
     // mass (j=0) is always on, tension (j=1) is on for m > 1, stiffness (j=2)

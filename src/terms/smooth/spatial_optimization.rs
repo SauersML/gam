@@ -4709,32 +4709,48 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             }
             BasisMetadata::Matern {
                 centers,
+                periodic,
                 nu,
                 include_intercept,
                 identifiability_transform,
                 aniso_log_scales,
-                nullspace_shrinkage_survived,
+                input_scales,
                 ..
             } => {
+                // `spatial_term_psi_to_length_scale_and_aniso` decodes ψ to a
+                // length scale in ORIGINAL data coordinates — exactly what the
+                // slow-path rebuild writes into `spec.length_scale` before
+                // `matern_operator_penalty_triplet_from_metadata` compensates it
+                // by σ_geom. Compensate identically here so the n-free re-key
+                // reproduces the slow-path penalty surface byte-for-byte (#706).
                 let ls = ls_opt.ok_or_else(|| {
                     "Matérn n-free penalty re-key requires a finite length-scale".to_string()
                 })?;
-                let double_penalty = match &termspec.basis {
-                    SmoothBasisSpec::Matern { spec, .. } => spec.double_penalty,
-                    _ => true,
+                let effective_ls = match input_scales.as_deref() {
+                    Some(scales) => compensate_length_scale_for_standardization(ls, scales),
+                    None => ls,
                 };
                 let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
-                crate::basis::matern_penalties_at_length_scale(
-                    centers.view(),
-                    identifiability_transform.as_ref(),
-                    *nu,
-                    *include_intercept,
-                    aniso_for_penalty,
-                    *nullspace_shrinkage_survived,
-                    double_penalty,
-                    ls,
-                )
-                .map_err(|e| e.to_string())?
+                // Route through the SAME canonical operator-triplet builder the
+                // realized design uses (`matern_operator_penalty_triplet_from_
+                // metadata`). The Matérn design ALWAYS overrides the kernel
+                // double-penalty with this {mass, tension, stiffness} triplet
+                // (see `build_inner_smooth_basis`), so re-keying via the kernel
+                // path produced a 1-block surface against a 3-block frozen
+                // design — the topology desync #1270 hard-errored on. Sharing
+                // the builder makes the block count ψ-stable by construction.
+                let (penalties, nullspace_dims, _info) =
+                    matern_operator_penalty_triplet_at_length_scale(
+                        centers.view(),
+                        periodic.as_deref(),
+                        identifiability_transform.as_ref(),
+                        *nu,
+                        *include_intercept,
+                        aniso_for_penalty,
+                        effective_ls,
+                    )
+                    .map_err(|e| e.to_string())?;
+                (penalties, nullspace_dims)
             }
             BasisMetadata::ThinPlate {
                 centers,
