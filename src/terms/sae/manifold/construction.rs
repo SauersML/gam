@@ -3576,7 +3576,8 @@ impl SaeManifoldTerm {
             .streaming_plan()
             .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
             .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
-        let dense_beta_curvature = admission_plan.direct_admitted
+        let dense_beta_curvature = (admission_plan.direct_admitted
+            || beta_dim <= dense_beta_penalty_probe_max_dim)
             && !(frames_engaged && beta_dim > dense_beta_penalty_probe_max_dim);
         let row_htbeta_dim = if frames_engaged {
             self.factored_border_dim()
@@ -4684,7 +4685,11 @@ impl SaeManifoldTerm {
                 ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
             }
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: beta_dim, ops }));
-            self.reclaim_border_hbb_workspace(&mut sys);
+            // Keep the dense beta block owned by the returned system when it
+            // was admitted.  The structured `penalty_op` is the authoritative
+            // curvature path; `hbb` remains the dense supplement / inspection
+            // block and must preserve the shared beta dimensions for public
+            // assembly and streaming-contract probes.
         }
         if let Some(deflation) = self.row_gauge_deflation_for_layout(row_layout.as_ref()) {
             sys.set_row_gauge_deflation(deflation);

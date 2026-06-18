@@ -298,7 +298,14 @@ impl SaeAssignment {
 
     pub fn assignment_coord_dim(&self) -> usize {
         match self.mode {
-            AssignmentMode::Softmax { .. } => self.k_atoms().saturating_sub(1),
+            // Arrow-Schur rows carry one assignment-chart slot per atom for all
+            // assignment modes.  Softmax still has the usual additive-logit
+            // gauge, handled by the row Hessian / evidence deflation machinery
+            // and by canonicalizing stored logits after updates; dropping the
+            // reference column here would make the row layout disagree with the
+            // dense per-atom coordinate layout used by structured H_tβ and
+            // streaming assembly.
+            AssignmentMode::Softmax { .. } => self.k_atoms(),
             AssignmentMode::IBPMap { .. } | AssignmentMode::JumpReLU { .. } => self.k_atoms(),
         }
     }
@@ -724,11 +731,13 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
                 return;
             }
             // da_k/dl_j = a_k (1[k=j] - a_j) / tau, contracted against
-            // the assignment-weighted fitted row. The dense row layout uses
-            // the reference-logit chart, so only columns `0..K-1` are free;
-            // the final reference logit is fixed at zero and has no row.
+            // the assignment-weighted fitted row. The dense row layout keeps
+            // all K logit rows (including the gauge direction) so row-block
+            // dimensions are exactly K assignment slots plus per-atom coords.
+            // Canonicalization fixes the stored representative after updates;
+            // the row Hessian remains gauge-aware.
             let inv_tau = 1.0 / temperature;
-            for logit_col in 0..assignments.len() - 1 {
+            for logit_col in 0..assignments.len() {
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = assignments[logit_col]
                         * (decoded[[logit_col, out_col]] - fitted[out_col])
