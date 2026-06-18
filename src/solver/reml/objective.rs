@@ -49,6 +49,68 @@ impl<'a> RemlState<'a> {
         self.compute_cost_with_ext_count(p, 0)
     }
 
+    fn finite_difference_cost_gradient(
+        &self,
+        p: &Array1<f64>,
+        base_cost: Option<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let base = match base_cost {
+            Some(cost) => cost,
+            None => self.compute_cost(p)?,
+        };
+        if !base.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                "finite-difference REML gradient requires finite base cost".to_string(),
+            ));
+        }
+
+        let mut grad = Array1::<f64>::zeros(p.len());
+        let steps = [1.0e-4, 3.0e-5, 1.0e-5, 3.0e-6, 1.0e-6];
+        for i in 0..p.len() {
+            let mut accepted = None;
+            for &h in &steps {
+                let can_plus = p[i] + h < RHO_BOUND;
+                let can_minus = p[i] - h > -RHO_BOUND;
+                if can_plus && can_minus {
+                    let mut plus = p.clone();
+                    let mut minus = p.clone();
+                    plus[i] += h;
+                    minus[i] -= h;
+                    let c_plus = self.compute_cost(&plus)?;
+                    let c_minus = self.compute_cost(&minus)?;
+                    if c_plus.is_finite() && c_minus.is_finite() {
+                        accepted = Some((c_plus - c_minus) / (2.0 * h));
+                        break;
+                    }
+                }
+                if can_plus {
+                    let mut plus = p.clone();
+                    plus[i] += h;
+                    let c_plus = self.compute_cost(&plus)?;
+                    if c_plus.is_finite() {
+                        accepted = Some((c_plus - base) / h);
+                        break;
+                    }
+                }
+                if can_minus {
+                    let mut minus = p.clone();
+                    minus[i] -= h;
+                    let c_minus = self.compute_cost(&minus)?;
+                    if c_minus.is_finite() {
+                        accepted = Some((base - c_minus) / h);
+                        break;
+                    }
+                }
+            }
+            grad[i] = accepted.ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "finite-difference REML gradient could not find a finite perturbation for rho[{i}]"
+                ))
+            })?;
+        }
+        Ok(grad)
+    }
+
     pub(crate) fn compute_cost_with_ext_count(
         &self,
         p: &Array1<f64>,
@@ -2567,6 +2629,16 @@ impl<'a> RemlState<'a> {
         );
         let t_assemble = std::time::Instant::now();
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            if p.len() > 1 {
+                let grad = self.finite_difference_cost_gradient(p, None)?;
+                let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+                log::debug!(
+                    "[REML] grad-only sparse finite-difference done | |g| {:.3e} | total {:.1}ms",
+                    gnorm,
+                    t_eval_start.elapsed().as_secs_f64() * 1000.0
+                );
+                return Ok(grad);
+            }
             let result = self.evaluate_unified_sparse(
                 p,
                 &bundle,
@@ -2797,6 +2869,17 @@ impl<'a> RemlState<'a> {
         // ρ/ψ, producing the stall-with-nonzero-final-grad-norm signature of
         // the #1122 matern iso-κ optimizer.
         let cost = screening_residual_penalty(result.cost, bundle.pirls_result.as_ref());
+        let use_sparse_fd_gradient = bundle.backend_kind() == GeometryBackendKind::SparseExactSpd
+            && p.len() > 1
+            && matches!(
+                order,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient
+            );
+        let gradient = if use_sparse_fd_gradient {
+            self.finite_difference_cost_gradient(p, Some(cost))?
+        } else {
+            gradient
+        };
         let eval = OuterEval {
             cost,
             gradient,
