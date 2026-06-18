@@ -710,6 +710,47 @@ impl SurvivalMarginalSlopeFamily {
                         &state_ref.moments,
                         "survival D_t first derivative directional",
                     )?;
+
+                    // Moving-domain (Leibniz) boundary flux. The density
+                    // integral ∫_{z_L}^{z_R} integrand_base·exp(-q)/2π dz is over
+                    // a cell whose link-knot-crossing edges z=(τ-a)/b move with
+                    // `dir` at velocity z' = -(a_dir + z·dir_g)/b. Its directional
+                    // derivative therefore picks up
+                    //   integrand_base(z_R)·w(z_R)·z_R' - integrand_base(z_L)·w(z_L)·z_L'.
+                    // Unlike the Hessian-integral boundary term (which is shared
+                    // by adjacent cells and cancels across each interior knot),
+                    // this ln-density integrand is NOT shared, so the flux is
+                    // live and must be added (gam#932/#979).
+                    if b != 0.0 {
+                        let part = &cell_entry.partition_cell;
+                        let edge_vel =
+                            |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                                match edge {
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                        -(a_dir + z * dir_g) / b
+                                    }
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                                }
+                            };
+                        let v_r = edge_vel(part.right_edge, cell.right);
+                        let v_l = edge_vel(part.left_edge, cell.left);
+                        if v_r != 0.0 {
+                            d_u_dir[u] += v_r
+                                * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                    cell,
+                                    &integrand_base,
+                                    cell.right,
+                                );
+                        }
+                        if v_l != 0.0 {
+                            d_u_dir[u] -= v_l
+                                * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                    cell,
+                                    &integrand_base,
+                                    cell.left,
+                                );
+                        }
+                    }
                 }
                 Ok(d_u_dir)
             })

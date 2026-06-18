@@ -1947,6 +1947,23 @@ pub fn cell_second_derivative_boundary_integrand(
     (c_rs - eta * c_r * c_s) * (-cell.q(z)).exp() * INV_TWO_PI
 }
 
+/// Pointwise value of the density-weighted integrand `g(z)·exp(-q(z))/2π` at a
+/// single `z`, for an arbitrary integrand polynomial `g`.
+///
+/// This is the boundary value needed for the moving-domain (Leibniz) term of a
+/// density-normalization integral `∫ g(z)·exp(-q(z))/2π dz` whose cell edge is a
+/// link-knot crossing `z=(τ-a)/b` that moves with a parameter direction: the
+/// directional derivative of the integral picks up
+/// `g(z_R)·w(z_R)·z_R'(dir) - g(z_L)·w(z_L)·z_L'(dir)` on top of the
+/// fixed-domain part, with `w(z)=exp(-q(z))/2π` the same weight the moment
+/// reductions integrate. Unlike the Hessian-integral boundary term (which is
+/// shared by adjacent cells and cancels across each interior knot), the
+/// ln-density integrand `D_t`/`D_t,uv` carries a non-shared `g`, so this
+/// Leibniz term does NOT cancel and must be added (gam#932/#979).
+pub fn cell_density_boundary_integrand(cell: DenestedCubicCell, g: &[f64], z: f64) -> f64 {
+    poly_eval_at(g, z) * (-cell.q(z)).exp() * INV_TWO_PI
+}
+
 /// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
 #[inline]
 fn poly_eval_at(coefficients: &[f64], z: f64) -> f64 {
