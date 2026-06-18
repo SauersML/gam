@@ -25,7 +25,13 @@ def test_flexible_link_kwarg_is_rejected_on_gaussian():
         gamfit.InvalidConfigurationError,
         match="flexible\\(\\.\\.\\.\\).*non-binomial",
     ):
-        gamfit.fit(df, "y ~ x", family="gaussian", flexible_link=True)
+        gamfit.fit(
+            df,
+            "y ~ x",
+            family="gaussian",
+            link="identity",
+            flexible_link=True,
+        )
 
 
 def test_flexible_log_link_is_rejected_on_poisson():
