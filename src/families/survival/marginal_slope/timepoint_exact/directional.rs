@@ -617,11 +617,17 @@ impl SurvivalMarginalSlopeFamily {
 
 
         // D_u_dir: directional derivative of the density normalization first derivative.
+        #[cfg(test)]
+        let dbg_w0: usize = primary.w.as_ref().map(|w| w.start).unwrap_or(usize::MAX);
         let d_u_dir_cell_accums = cached
             .cells
             .iter()
-            .map(|cell_entry| -> Result<Array1<f64>, String> {
+            .map(|cell_entry| -> Result<(Array1<f64>, [f64; 4]), String> {
                 let mut d_u_dir = Array1::<f64>::zeros(p);
+                #[cfg(test)]
+                let mut dbg_polys = [0.0_f64; 4];
+                #[cfg(not(test))]
+                let dbg_polys = [0.0_f64; 4];
                 let cell = cell_entry.partition_cell.cell;
                 let state_ref = &cell_entry.state;
                 let fixed = &cell_entry.fixed;
@@ -642,6 +648,8 @@ impl SurvivalMarginalSlopeFamily {
 
                 let mut coeff_dir_poly = vec![0.0; 4];
                 let mut coeff_a_dir_poly = vec![0.0; 4];
+                #[cfg(test)]
+                let mut coeff_aa_dir_poly_dbg = vec![0.0; 4];
                 for c in 0..p {
                     if dir[c] == 0.0 {
                         continue;
@@ -649,6 +657,10 @@ impl SurvivalMarginalSlopeFamily {
                     for k in 0..4 {
                         coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
                         coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
+                        #[cfg(test)]
+                        {
+                            coeff_aa_dir_poly_dbg[k] += fixed.coeff_aau[c][k] * dir[c];
+                        }
                     }
                 }
                 let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
@@ -705,21 +717,79 @@ impl SurvivalMarginalSlopeFamily {
                         &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &integrand_base),
                     );
 
+                    #[cfg(test)]
+                    if u == dbg_w0 {
+                        let ig = |poly: &[f64]| -> f64 {
+                            exact_kernel::cell_polynomial_integral_from_moments(
+                                poly,
+                                &state_ref.moments,
+                                "dbg",
+                            )
+                            .unwrap_or(f64::NAN)
+                        };
+                        // TOTAL D_dir of chi_u / eta_u (with the β_w cross +
+                        // intercept a-chain restored), then the moment-measure
+                        // correction so each equals D_dir(∫poly·m).
+                        let chi_dir_poly =
+                            poly_add(&poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly);
+                        let eta_aa_dir_poly =
+                            poly_add(&poly_scale(&eta_aaa_poly, a_dir), &coeff_aa_dir_poly_dbg);
+                        let eta_u_dir_total = poly_add(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_scale(&chi_poly, a_u_dir[u]),
+                                    &poly_scale(&chi_dir_poly, a_u[u]),
+                                ),
+                                &eta_u_dir_fixed,
+                            ),
+                            &poly_scale(fixed.coeff_au[u].as_ref(), a_dir),
+                        );
+                        let chi_u_dir_total = poly_add(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_scale(&eta_aa_poly, a_u_dir[u]),
+                                    &poly_scale(&eta_aa_dir_poly, a_u[u]),
+                                ),
+                                &chi_u_dir_fixed,
+                            ),
+                            &poly_scale(fixed.coeff_aau[u].as_ref(), a_dir),
+                        );
+                        let mw = poly_mul(&eta_poly, &eta_dir_poly);
+                        // base ∫chi_u·m, ∫eta_u·m
+                        dbg_polys[0] += ig(&chi_u_poly[u]);
+                        dbg_polys[1] += ig(&eta_u_poly[u]);
+                        // D_dir(∫chi_u·m) = ∫chi_u_dir_total·m - ∫mw·chi_u·m
+                        dbg_polys[2] +=
+                            ig(&chi_u_dir_total) - ig(&poly_mul(&mw, &chi_u_poly[u]));
+                        dbg_polys[3] +=
+                            ig(&eta_u_dir_total) - ig(&poly_mul(&mw, &eta_u_poly[u]));
+                    }
                     d_u_dir[u] += exact_kernel::cell_polynomial_integral_from_moments(
                         &full_integrand,
                         &state_ref.moments,
                         "survival D_t first derivative directional",
                     )?;
                 }
-                Ok(d_u_dir)
+                Ok((d_u_dir, dbg_polys))
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut d_u_dir = Array1::<f64>::zeros(p);
-        for cell_d_u_dir in d_u_dir_cell_accums {
+        #[cfg(test)]
+        let mut dbg_d_u_sum = [0.0_f64; 4];
+        for (cell_d_u_dir, _cell_dbg) in &d_u_dir_cell_accums {
             for u in 0..p {
                 d_u_dir[u] += cell_d_u_dir[u];
             }
+            #[cfg(test)]
+            for k in 0..4 {
+                dbg_d_u_sum[k] += _cell_dbg[k];
+            }
         }
+        #[cfg(test)]
+        let debug_d_u_polys = Some((
+            [dbg_d_u_sum[0], dbg_d_u_sum[1]],
+            [dbg_d_u_sum[2], dbg_d_u_sum[3]],
+        ));
 
         // D_uv_dir
         let mut d_uv_dir = Array2::<f64>::zeros((p, p));
@@ -1272,6 +1342,8 @@ impl SurvivalMarginalSlopeFamily {
             d_uv_dir,
             #[cfg(test)]
             debug_d_uv_terms,
+            #[cfg(test)]
+            debug_d_u_polys,
         })
     }
 }
