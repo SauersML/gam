@@ -3252,7 +3252,7 @@ fn run_exact_joint_spatial_optimization(
         OuterEvalOrder::ValueAndGradient
     };
     let kphase_prime_start = std::time::Instant::now();
-    let _ = ctx.eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?;
+    drop(ctx.eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?);
     log::info!(
         "[KAPPA-PHASE-PRIME] order={:?} elapsed_s={:.4} slow_path_resets_total={} design_revision={}",
         kphase_prime_order,

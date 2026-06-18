@@ -594,7 +594,7 @@ mod pad_to_tests {
     #[should_panic(expected = "pad_to cannot shrink")]
     fn shrink_to_train_split_is_a_clear_error() {
         let full = vec![1.0; 654];
-        let _ = pad_to(&full, 490);
+        drop(pad_to(&full, 490));
     }
 
     /// The documented fix: padding both a full-data column and a train-split
