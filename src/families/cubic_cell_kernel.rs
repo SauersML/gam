@@ -7198,4 +7198,89 @@ mod tests {
             "third kernel vs FD-of-second mismatch: analytic={analytic:.12e} fd={fd:.12e} rel={rel:.3e}"
         );
     }
+
+    #[test]
+    fn moving_shared_edge_second_integral_derivative_has_leibniz_jump_sign() {
+        let edge0 = 0.2_f64;
+        let edge_velocity = -0.37_f64;
+
+        let left_eta = [0.22_f64, -0.18, 0.09, 0.03];
+        let right_eta = [-0.11_f64, 0.26, -0.04, 0.02];
+        let left_r = [0.08_f64, -0.05, 0.03, 0.01];
+        let left_s = [-0.06_f64, 0.04, 0.02, -0.015];
+        let left_rs = [0.025_f64, -0.012, 0.006, 0.004];
+        let right_r = [-0.03_f64, 0.07, -0.02, 0.012];
+        let right_s = [0.05_f64, -0.025, 0.018, 0.007];
+        let right_rs = [-0.018_f64, 0.014, -0.005, 0.003];
+
+        let integral_at = |shift: f64| -> f64 {
+            let edge = edge0 + edge_velocity * shift;
+            let left = DenestedCubicCell {
+                left: -0.7,
+                right: edge,
+                c0: left_eta[0],
+                c1: left_eta[1],
+                c2: left_eta[2],
+                c3: left_eta[3],
+            };
+            let right = DenestedCubicCell {
+                left: edge,
+                right: 1.1,
+                c0: right_eta[0],
+                c1: right_eta[1],
+                c2: right_eta[2],
+                c3: right_eta[3],
+            };
+            let left_state = evaluate_cell_moments(left, 12).expect("left moments");
+            let right_state = evaluate_cell_moments(right, 12).expect("right moments");
+            cell_second_derivative_from_moments(
+                left,
+                &left_r,
+                &left_s,
+                &left_rs,
+                &left_state.moments,
+            )
+            .expect("left second")
+                + cell_second_derivative_from_moments(
+                    right,
+                    &right_r,
+                    &right_s,
+                    &right_rs,
+                    &right_state.moments,
+                )
+                .expect("right second")
+        };
+
+        let h = 1e-5;
+        let fd = (integral_at(h) - integral_at(-h)) / (2.0 * h);
+
+        let left = DenestedCubicCell {
+            left: -0.7,
+            right: edge0,
+            c0: left_eta[0],
+            c1: left_eta[1],
+            c2: left_eta[2],
+            c3: left_eta[3],
+        };
+        let right = DenestedCubicCell {
+            left: edge0,
+            right: 1.1,
+            c0: right_eta[0],
+            c1: right_eta[1],
+            c2: right_eta[2],
+            c3: right_eta[3],
+        };
+        let f_left =
+            cell_second_derivative_boundary_integrand(left, &left_r, &left_s, &left_rs, edge0);
+        let f_right =
+            cell_second_derivative_boundary_integrand(right, &right_r, &right_s, &right_rs, edge0);
+        let analytic = edge_velocity * (f_left - f_right);
+
+        let denom = analytic.abs().max(1e-8);
+        let rel = (fd - analytic).abs() / denom;
+        assert!(
+            rel <= 5e-8,
+            "moving edge sign mismatch: fd={fd:.12e} analytic={analytic:.12e} rel={rel:.3e}"
+        );
+    }
 }
