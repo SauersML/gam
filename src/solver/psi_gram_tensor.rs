@@ -605,7 +605,7 @@ impl PsiGramTensor {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
     }
 
-    /// True when `psi` lies inside the RRQR-pivot-stable sub-window where the
+    /// True when `psi` lies inside the reduced-basis-equality sub-window where the
     /// #1033 design-revision fast-path skip (re-key Gram + penalty on a frozen
     /// reference surface) reproduces the exact slow-path β̂ (#1264).
     /// Outside it the design's reduced basis has moved with ψ, so the caller must
