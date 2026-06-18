@@ -139,13 +139,12 @@ pub(crate) fn effective_seed_budget(
     _screening_enabled: bool,
 ) -> usize {
     let requested_budget = requested_budget.max(1);
-    let capped = match (solver, risk_profile) {
+    match (solver, risk_profile) {
         (Solver::Efs | Solver::HybridEfs, _) => 1,
         (Solver::Arc, crate::seeding::SeedRiskProfile::Survival) => 1,
         (Solver::Arc, crate::seeding::SeedRiskProfile::GeneralizedLinear) => 2,
         _ => requested_budget,
-    };
-    requested_budget.min(capped)
+    }
 }
 
 #[inline]
