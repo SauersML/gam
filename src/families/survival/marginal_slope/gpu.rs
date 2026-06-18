@@ -228,9 +228,10 @@ pub struct SurvivalFlexRowCellsBatch<'a> {
     pub n_cells: usize,
     /// Number of rows (logical observations).
     pub n_rows: usize,
-    /// Highest moment degree to evaluate, in `0..=24`.  Survival flex
-    /// Hessian needs degree 24 for the `D_uv` cross terms; degree 9 is
-    /// sufficient for value-only evaluations.
+    /// Highest moment degree to evaluate, in `0..=24`. The full CPU
+    /// bidirectional survival path now needs degree 27, so callers must not
+    /// route that path through this degree-24 substrate until the kernel bound
+    /// is raised. Degree 9 is sufficient for value-only evaluations.
     pub max_degree: usize,
     /// Flat SoA cell quadruples, length `n_cells` each.
     pub left: &'a [f64],

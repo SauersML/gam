@@ -176,6 +176,6 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<CachedPartitionCells, String> {
-        self.build_cached_partition_with_moment_order(primary, a, b, beta_h, beta_w, 24)
+        self.build_cached_partition_with_moment_order(primary, a, b, beta_h, beta_w, 27)
     }
 }
