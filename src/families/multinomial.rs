@@ -148,11 +148,17 @@ const MULTINOMIAL_FORMULA_INNER_TOL: f64 = 1.0e-5;
 ///
 /// The term builder's normalized penalties are calibrated on single-response
 /// Gaussian-style score curvature. A reference-coded softmax class block sees
-/// smaller per-row Fisher curvature (`p_a(1-p_a)` with cross-class coupling), so
-/// the same physical penalty scale over-shrinks when the REML surface drives rho
-/// to the effective-df cap. Scaling the adapter's penalty matrices preserves the
-/// selected penalty directions while matching the softmax likelihood curvature.
-const MULTINOMIAL_FORMULA_PENALTY_SCALE: f64 = 0.5;
+/// per-row active-class Fisher diagonal `p_a(1-p_a)` plus negative cross-class
+/// coupling. At the neutral simplex (`p_k = 1/K`) the active diagonal is
+/// `(K-1)/K²`, so the binary-logit calibration is `2·(K-1)/K² = 1/2` and the
+/// three-class calibration is `4/9` rather than the historical hard-coded
+/// `1/2`. Making the scale a function of `K` keeps the physical smoothness
+/// prior tied to the likelihood curvature instead of over-penalizing every
+/// class as the simplex gains categories.
+fn multinomial_formula_penalty_scale(n_classes: usize) -> f64 {
+    let k = n_classes.max(2) as f64;
+    2.0 * (k - 1.0) / (k * k)
+}
 
 /// Largest smoothing-parameter dimension where exact dense outer curvature is
 /// still worth paying for multinomial formula fits.
@@ -940,13 +946,11 @@ fn build_formula_design_for_multinomial(
     Ok((spec, design, y_col, parsed.response, y_kind))
 }
 
-fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix) -> PenaltyMatrix {
+fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix, scale: f64) -> PenaltyMatrix {
     match penalty {
-        PenaltyMatrix::Dense(matrix) => {
-            PenaltyMatrix::Dense(matrix.mapv(|v| v * MULTINOMIAL_FORMULA_PENALTY_SCALE))
-        }
+        PenaltyMatrix::Dense(matrix) => PenaltyMatrix::Dense(matrix.mapv(|v| v * scale)),
         PenaltyMatrix::KroneckerFactored { left, right } => PenaltyMatrix::KroneckerFactored {
-            left: left.mapv(|v| v * MULTINOMIAL_FORMULA_PENALTY_SCALE),
+            left: left.mapv(|v| v * scale),
             right,
         },
         PenaltyMatrix::Blockwise {
@@ -954,17 +958,17 @@ fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix) -> PenaltyMatrix {
             col_range,
             total_dim,
         } => PenaltyMatrix::Blockwise {
-            local: local.mapv(|v| v * MULTINOMIAL_FORMULA_PENALTY_SCALE),
+            local: local.mapv(|v| v * scale),
             col_range,
             total_dim,
         },
         PenaltyMatrix::Labeled { label, inner } => PenaltyMatrix::Labeled {
             label,
-            inner: Box::new(scale_multinomial_formula_penalty(*inner)),
+            inner: Box::new(scale_multinomial_formula_penalty(*inner, scale)),
         },
         PenaltyMatrix::Fixed { log_lambda, inner } => PenaltyMatrix::Fixed {
             log_lambda,
-            inner: Box::new(scale_multinomial_formula_penalty(*inner)),
+            inner: Box::new(scale_multinomial_formula_penalty(*inner, scale)),
         },
     }
 }
@@ -1118,15 +1122,16 @@ pub fn fit_penalized_multinomial_formula(
     // behaviour) forced a single λ per class that scales `Σ_t S_t`, so one
     // shared λ had to over-smooth a rough term while under-smoothing a smooth
     // one — biasing any multi-term class-probability surface.
-    let per_term_penalties: Vec<PenaltyMatrix> = design
-        .penalties_as_penalty_matrix()
-        .into_iter()
-        .map(scale_multinomial_formula_penalty)
-        .collect();
-    let per_term_nullspace_dims = design.nullspace_dims.clone();
     let k = y_one_hot.ncols();
     let m = k - 1;
     let n_obs = y_one_hot.nrows();
+    let penalty_scale = multinomial_formula_penalty_scale(k);
+    let per_term_penalties: Vec<PenaltyMatrix> = design
+        .penalties_as_penalty_matrix()
+        .into_iter()
+        .map(|penalty| scale_multinomial_formula_penalty(penalty, penalty_scale))
+        .collect();
+    let per_term_nullspace_dims = design.nullspace_dims.clone();
 
     // ── Custom-family driven REML/LAML path ───────────────────────────────
     // Each active class becomes one ParameterBlockSpec, all sharing X and the
@@ -1785,6 +1790,22 @@ mod fisher_override_tests {
         assert!(
             multinomial_formula_use_outer_hessian(16),
             "D=16 multinomial fits need exact ARC curvature for the #1082 stall halt"
+        );
+    }
+
+    #[test]
+    fn formula_penalty_scale_tracks_softmax_fisher_curvature() {
+        assert!(
+            (multinomial_formula_penalty_scale(2) - 0.5).abs() < 1.0e-12,
+            "binary-logit neutral-simplex curvature scale should remain at 1/2"
+        );
+        assert!(
+            (multinomial_formula_penalty_scale(3) - 4.0 / 9.0).abs() < 1.0e-12,
+            "three-class softmax penalties should be calibrated to 2*(K-1)/K^2"
+        );
+        assert!(
+            multinomial_formula_penalty_scale(5) < multinomial_formula_penalty_scale(3),
+            "active-class Fisher curvature decreases as the simplex gains classes"
         );
     }
 
