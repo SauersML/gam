@@ -661,12 +661,37 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
             );
             true
+        } else if let Some((dgram, drhs)) = tensor.fd_psi_gram_deriv(psi) {
+            // In the VALUE window but outside the certified analytic GRADIENT
+            // sub-window (the analytic Chebyshev derivative T_d′ ∼ d² is not
+            // bit-tight near the edges). The value lane IS certified to
+            // `PSI_GRAM_SPOT_RTOL` across the FULL window, so a central difference
+            // of the n-free value Gram/RHS — `(gram_at(ψ+h)−gram_at(ψ−h))/2h`,
+            // `(rhs_at(ψ+h)−rhs_at(ψ−h))/2h` — gives a k×k, n-FREE ψ-gradient at
+            // ~spot-tol/h precision (≈2e-8), well inside the outer-gradient
+            // tolerance the analytic sub-window already targets. Installing it
+            // lets the design-revision skip serve the GRADIENT lane n-free over the
+            // whole value window — without it, every value-but-not-gradient trial
+            // (common near edges / early in the κ trajectory) falls to the O(n·k)
+            // ∂X/∂ψ slab AND advances the realizer revision, cascading the
+            // following value probes to the slow path too (#1033 outer-loop O(n)).
+            if self
+                .reml_state
+                .install_gaussian_psi_gram_deriv(Arc::new((dgram, drhs)))
+            {
+                log::debug!(
+                    "[psi-gram-tensor] installed n-free FD ψ-gradient (value-lane central \
+                     difference) at psi={psi:.6} (outside analytic sub-window)"
+                );
+                true
+            } else {
+                self.reml_state.clear_gaussian_psi_gram_deriv();
+                false
+            }
         } else {
-            // In the VALUE window but outside the certified GRADIENT sub-window
-            // (or the deriv shape refused). The value cache above is sound and
-            // stays; clear any derivative pair left from a prior in-sub-window ψ
-            // so the gradient lane uses the exact slab for this trial rather than
-            // a stale derivative carried over on the design-revision fast path.
+            // Off the value window entirely (or the FD shape refused). Clear any
+            // derivative pair left from a prior in-window ψ so the gradient lane
+            // uses the exact slab for this trial rather than a stale carry-over.
             self.reml_state.clear_gaussian_psi_gram_deriv();
             false
         }
