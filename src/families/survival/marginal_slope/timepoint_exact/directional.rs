@@ -583,7 +583,13 @@ impl SurvivalMarginalSlopeFamily {
 
         let mut tau_dir = Array1::<f64>::zeros(p);
         let mut tau_a_dir = Array1::<f64>::zeros(p);
+        let mut rho_dir = Array1::<f64>::zeros(p);
         for u in 0..p {
+            let fixed_rho_dir =
+                g_jet.param_directional_from_b_family(g_jet.b_first, u, dir, COEFF_SUPPORT_GHW);
+            rho_dir[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs) * a_dir
+                + eval_coeff4_at(&fixed_rho_dir, z_obs);
+
             let fixed_tau_dir =
                 g_jet.param_directional_from_b_family(g_jet.ab_first, u, dir, COEFF_SUPPORT_GW);
             tau_dir[u] = eval_coeff4_at(&g_jet.aa_first[u], z_obs) * a_dir
@@ -598,7 +604,7 @@ impl SurvivalMarginalSlopeFamily {
         let mut eta_u_dir = Array1::<f64>::zeros(p);
         let mut chi_u_dir = Array1::<f64>::zeros(p);
         for u in 0..p {
-            eta_u_dir[u] = chi_dir * a_u[u] + chi_val * a_u_dir[u] + tau_dir[u];
+            eta_u_dir[u] = chi_dir * a_u[u] + chi_val * a_u_dir[u] + rho_dir[u];
             chi_u_dir[u] = eta_aa_dir * a_u[u] + eta_aa * a_u_dir[u] + tau_a_dir[u];
         }
 
