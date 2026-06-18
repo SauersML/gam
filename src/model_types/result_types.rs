@@ -1664,7 +1664,12 @@ impl UnifiedFitResult {
     /// stored per-block traces (basis-invariant; exact even when `F` was never
     /// materialised for a large model), then — only when neither was recorded —
     /// the legacy block-sum as a last resort.
-    pub fn per_term_edf(&self, coeff_range: std::ops::Range<usize>, penalty_cursor: usize, k: usize) -> f64 {
+    pub fn per_term_edf(
+        &self,
+        coeff_range: std::ops::Range<usize>,
+        penalty_cursor: usize,
+        k: usize,
+    ) -> f64 {
         let dim = coeff_range.len() as f64;
         // Primary: trace of the influence matrix over the term's coefficient block.
         if let Some(f) = self.coefficient_influence()
@@ -1688,9 +1693,14 @@ impl UnifiedFitResult {
         }
         // Last resort: the legacy per-block EDF sum. Correct for disjoint penalties;
         // retained only for fits that recorded neither `F` nor per-block traces.
+        // Clamp to `[0, dim]`: a term's EDF is a sub-block trace of the influence
+        // operator and can never exceed the term's own coefficient count, so even
+        // this over-counting fallback must not report more than `dim` (without the
+        // clamp a `te`/`ti` block-sum reports e.g. 40 EDF for a 36-coefficient term
+        // and exceeds the model total — #1277).
         self.edf_by_block()
             .get(penalty_cursor..penalty_cursor + k)
-            .map(|block| block.iter().sum::<f64>())
+            .map(|block| block.iter().sum::<f64>().clamp(0.0, dim))
             .unwrap_or(0.0)
     }
 
