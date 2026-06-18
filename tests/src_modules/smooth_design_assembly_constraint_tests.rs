@@ -5045,22 +5045,63 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         ("psi_c", theta_at(psi_c), &beta_c),
     ] {
         let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta);
-        // κ of the STREAMED exact Gram (the reference conditioning that amplifies
-        // the n-free Gram's interpolation error into β̂).
-        let kappa = gram_condition_number(&streamed_eval);
+        // GATE 1b INLINE — the LOAD-BEARING INPUT to the conditioning conclusion:
+        // the n-free fast-path Gram (Chebyshev `gram_at(ψ)`, installed on
+        // `tensor_eval`) must agree with the STREAMED exact Gram (installed on
+        // `streamed_eval`) to the certified `PSI_GRAM_SPOT_RTOL`. This proves the
+        // β̂ INPUT error is genuine round-off ON THIS DUCHON FIXTURE — without it,
+        // a β̂rel~1e-5 could be unconverted INPUT error, not amplification, and the
+        // conditioning-aware β̂ tolerance would be unjustified (closer-1's gate).
+        let installed_gram =
+            |e: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> ndarray::Array2<f64> {
+                e.reml_state
+                    .installed_gaussian_fixed_cache()
+                    .expect("installed Gaussian Gram cache")
+                    .xtwx_orig
+                    .clone()
+            };
+        let g_fast = installed_gram(&tensor_eval);
+        let g_exact = installed_gram(&streamed_eval);
+        assert_eq!(g_fast.dim(), g_exact.dim(), "@ {label}: Gram dim mismatch");
+        let gram_scale = g_exact.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        let gram_rel = g_fast
+            .iter()
+            .zip(g_exact.iter())
+            .fold(0.0_f64, |a, (f, e)| a.max((f - e).abs()))
+            / gram_scale.max(1e-300);
         assert!(
-            kappa.is_finite() && kappa > 0.0,
-            "@ {label}: streamed Gram condition number must be finite/positive, got {kappa:.3e}"
+            gram_rel <= crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL,
+            "@ {label}: n-free fast-path Gram differs from the streamed exact Gram by \
+             rel {gram_rel:.3e} > certified spot tol {:.0e} — the β̂ INPUT is NOT \
+             round-off on this Duchon fixture, so the β̂ divergence cannot be \
+             attributed to conditioning amplification (GATE 1b on Duchon)",
+            crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL
         );
-        let beta_bar = SOUNDNESS_SAFETY * kappa * crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL;
+
+        // κ of the STREAMED exact Gram — the conditioning that amplifies the n-free
+        // Gram's (now-certified-round-off) input error into β̂. BOUNDED BY A CONCRETE
+        // CAP so the bar can't be inflated by a degenerate Hessian to mask a leak.
+        let kappa = gram_condition_number(&streamed_eval);
+        const KAPPA_CAP: f64 = 1.0e8;
+        assert!(
+            kappa.is_finite() && kappa > 0.0 && kappa <= KAPPA_CAP,
+            "@ {label}: streamed Gram condition number must be finite, positive, and \
+             ≤ {KAPPA_CAP:.0e} (else the conditioning-aware β̂ bar is meaningless); \
+             got κ(G)={kappa:.3e}"
+        );
+        // β̂ tolerance = κ · (MEASURED Gram input error) — exactly the conditioning
+        // arithmetic, not a loosened constant. A genuine n-row leak diverges by
+        // MORE than this and the assert below fires.
+        let beta_bar = SOUNDNESS_SAFETY * kappa * gram_rel.max(f64::MIN_POSITIVE);
         if std::env::var("DIAG1216").is_ok() {
             let r = beta_fast
                 .iter()
                 .zip(beta_slow.iter())
                 .fold(0.0_f64, |a, (f, s)| a.max((f - s).abs() / (1.0 + s.abs())));
             eprintln!(
-                "[DIAG1216-FP] {label} ψ={:.4} β̂rel={r:.3e} κ(G)={kappa:.3e} \
-                 bar(SAFETY·κ·rtol)={beta_bar:.3e} β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
+                "[DIAG1216-FP] {label} ψ={:.4} gram_rel={gram_rel:.3e} κ(G)={kappa:.3e} \
+                 β̂rel={r:.3e} bar(SAFETY·κ·gram_rel)={beta_bar:.3e} \
+                 β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
                 theta[rho_dim], beta_fast[0], beta_slow[0]
             );
         }
@@ -5076,14 +5117,14 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             assert!(
                 brel <= beta_bar.max(1e-12),
                 "fast-path β̂[{j}] @ {label} diverges from streamed slow path BY MORE \
-                 than conditioning amplification of the certified Gram error explains: \
-                 fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} rel={brel:.3e} > bar \
-                 {beta_bar:.3e} (= {SOUNDNESS_SAFETY}·κ(G)={kappa:.3e}·rtol={:.0e}) — \
-                 this is the signature of an n-row (`self.x`) LEAK into β̂ across the \
-                 rotation, NOT interpolation conditioning",
+                 than conditioning amplification of the MEASURED Gram input error \
+                 explains: fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} rel={brel:.3e} > \
+                 bar {beta_bar:.3e} (= {SOUNDNESS_SAFETY}·κ(G)={kappa:.3e}·gram_rel={gram_rel:.3e}) \
+                 — gram_rel is certified ≤ round-off above, so a β̂ divergence exceeding \
+                 κ·gram_rel is the signature of an n-row (`self.x`) LEAK into β̂ across \
+                 the rotation, NOT interpolation conditioning",
                 beta_fast[j],
                 beta_slow[j],
-                crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL,
             );
         }
     }
