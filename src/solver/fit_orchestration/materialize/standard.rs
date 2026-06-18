@@ -18,7 +18,7 @@ pub(crate) fn materialize_standard<'a>(
     let y_kind = response_column_kind(data, y_col);
     let mut inference_notes = Vec::new();
 
-    let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
+    let link_choice = effective_link_choice_for_materialize(parsed, config)?;
     let family = resolve_family(
         config.family.as_deref(),
         config.negative_binomial_theta,
@@ -52,6 +52,7 @@ pub(crate) fn materialize_standard<'a>(
     // binomial family; reject it for a non-binomial response rather than drop
     // it silently (#371).
     reject_explicit_linkwiggle_for_nonbinomial(parsed, &family)?;
+    reject_flexible_link_for_nonbinomial(link_choice.as_ref(), &family)?;
 
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());

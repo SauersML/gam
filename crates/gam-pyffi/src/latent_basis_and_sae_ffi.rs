@@ -340,8 +340,7 @@ fn latent_aux_prior_stats(
 /// (`"penalized_loss_score"` on the in-sample fit, `"oos_penalized_loss"` on the
 /// fixed-decoder OOS path). The full component breakdown is written under
 /// `"penalized_loss_breakdown"` so a consumer can see exactly what the score is
-/// (and is not). `"reml_score"` is also written as a deprecated back-compat alias
-/// for existing readers; new code should read `primary_key`.
+/// (and is not).
 fn sae_set_penalized_loss_items(
     out: &Bound<'_, PyDict>,
     loss: &gam::terms::sae::manifold::SaeManifoldLoss,
@@ -349,8 +348,6 @@ fn sae_set_penalized_loss_items(
 ) -> PyResult<()> {
     let b = loss.breakdown();
     out.set_item(primary_key, b.penalized_loss_score)?;
-    // Deprecated alias: the field was historically (mis)named `reml_score`.
-    out.set_item("reml_score", b.penalized_loss_score)?;
     let breakdown = PyDict::new(out.py());
     breakdown.set_item("penalized_loss_score", b.penalized_loss_score)?;
     breakdown.set_item("total_penalized_loss", b.total_penalized_loss)?;
@@ -3419,19 +3416,10 @@ fn sae_hybrid_split_dict<'py>(
         // frontier. Computed during fit on the TRAINING reconstruction target
         // (`per_atom_loao_explained_variance(target, rho)` in
         // `compute_hybrid_split_report`), so it is an in-sample LOAO ΔEV, NOT a
-        // held-out generalization number (#1226). Emitted under the honest key
-        // `train_loao_delta_ev`; the legacy `held_out_delta_ev` key carried the
-        // SAME in-sample value under a misleading name and is retained only as a
-        // deprecated alias for one release so existing readers don't break.
-        match verdict.held_out_delta_ev {
-            Some(dev) => {
-                a.set_item("train_loao_delta_ev", dev)?;
-                a.set_item("held_out_delta_ev", dev)?;
-            }
-            None => {
-                a.set_item("train_loao_delta_ev", py.None())?;
-                a.set_item("held_out_delta_ev", py.None())?;
-            }
+        // held-out generalization number (#1226).
+        match verdict.train_loao_delta_ev {
+            Some(dev) => a.set_item("train_loao_delta_ev", dev)?,
+            None => a.set_item("train_loao_delta_ev", py.None())?,
         }
         // #1228 — the fitted straight sub-model `b₀ + (t − t̄)·b₁` for a slot the
         // verdict collapsed to LINEAR. Serialized so a held-out reconstruction

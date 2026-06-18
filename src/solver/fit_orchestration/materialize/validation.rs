@@ -64,11 +64,9 @@ pub(crate) fn reject_survival_only_terms_for_nonsurvival(
 /// Poisson / etc. response the term is built and then dropped on the floor,
 /// the same silent-no-op contract violation as #371. We error here.
 ///
-/// This guards only the *explicit* formula term (`parsed.linkwiggle`), not the
-/// implicit wiggle auto-derived from a `Flexible` link choice: a flexible link
-/// requested against a non-binomial family is a separate, already-handled link
-/// concern, and silently declining to add a binomial-only correction there is
-/// the intended behavior rather than a dropped user-authored term.
+/// This guards only the *explicit* formula term (`parsed.linkwiggle`). The
+/// implicit wiggle auto-derived from a `Flexible` link choice is checked by
+/// [`reject_flexible_link_for_nonbinomial`].
 pub(super) fn reject_explicit_linkwiggle_for_nonbinomial(
     parsed: &ParsedFormula,
     family: &LikelihoodSpec,
@@ -79,6 +77,63 @@ pub(super) fn reject_explicit_linkwiggle_for_nonbinomial(
                      and is only supported for a binomial response; it is meaningless for \
                      the resolved non-binomial family and would otherwise be silently ignored"
                 .to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn effective_link_choice_for_materialize(
+    parsed: &ParsedFormula,
+    config: &FitConfig,
+) -> Result<Option<LinkChoice>, WorkflowError> {
+    if let Some(linkspec) = parsed.linkspec.as_ref() {
+        if linkspec.mixture_rho.is_some()
+            || linkspec.sas_init.is_some()
+            || linkspec.beta_logistic_init.is_some()
+        {
+            return Err(WorkflowError::InvalidConfig {
+                reason: "link(...) initialization options are not supported by the materialized fit path; pass only link(type=...) in the formula"
+                    .to_string(),
+            });
+        }
+        return parse_link_choice(Some(&linkspec.link), false).map_err(WorkflowError::from);
+    }
+    parse_link_choice(config.link.as_deref(), config.flexible_link).map_err(WorkflowError::from)
+}
+
+/// Reject a `flexible(...)` link choice (the implicit link wiggle) when the
+/// resolved response family is not binomial.
+///
+/// `flexible(base)` adds a jointly-fit anchored spline offset to the base link.
+/// The whole offset engine ([`crate::families::gamlss::gaussian::BinomialMeanWiggleFamily`]
+/// and the location-scale wiggle solver) is specialised to the binomial mean
+/// likelihood: it differentiates the binomial neg-log-likelihood through the
+/// warped link to fourth order under a monotone-spline constraint. For a
+/// Gaussian / Poisson / Gamma / etc. response there is no implemented mean-wiggle
+/// solver, so the standard and location-scale materializers used to build the
+/// implicit wiggle and then drop it on the floor: a silent no-op of a
+/// documented link (`flexible(identity)` on Gaussian, `flexible(log)` on
+/// Poisson/Gamma fit bit-identically to the plain base link), gam#1275. Rather
+/// than silently discard a requested-and-documented link configuration we error
+/// loudly here, exactly as [`reject_explicit_linkwiggle_for_nonbinomial`] does
+/// for the explicit term. Wiring a genuine non-binomial mean-wiggle is tracked
+/// as a separate feature.
+pub(super) fn reject_flexible_link_for_nonbinomial(
+    link_choice: Option<&LinkChoice>,
+    family: &LikelihoodSpec,
+) -> Result<(), WorkflowError> {
+    let requested_flexible =
+        link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible));
+    if requested_flexible && !family.is_binomial() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "flexible(...) links (the jointly-fit anchored spline link offset) are \
+                 implemented only for a binomial response; the resolved family is {} (a \
+                 non-binomial family), for which the link offset has no solver and would \
+                 otherwise be silently discarded. Use the plain base link, or fit a binomial \
+                 response.",
+                family.response_family_name()
+            ),
         });
     }
     Ok(())

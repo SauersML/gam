@@ -1,7 +1,7 @@
 """#1204 — the public ``ManifoldSAE`` must surface the ``hybrid_split`` report.
 
 The FFI emits a structured ``hybrid_split`` payload (per-atom curved-vs-linear
-verdicts: ``fitted_turning`` Θ, ``held_out_delta_ev``, ``curved_evidence_margin``,
+verdicts: ``fitted_turning`` Θ, ``train_loao_delta_ev``, ``curved_evidence_margin``,
 plus dictionary-level aggregates), but the public Python ``ManifoldSAE`` used to
 DROP it — ``from_payload`` never read ``payload["hybrid_split"]``, the dataclass
 had no field for it, and ``to_dict`` omitted it. Callers had to monkey-patch
@@ -19,7 +19,11 @@ import numpy as np
 import pytest
 
 gamfit = pytest.importorskip("gamfit")
-from gamfit._sae_manifold import ManifoldSAE, SaeManifoldFitResult  # noqa: E402
+from gamfit._sae_manifold import (  # noqa: E402
+    ManifoldSAE,
+    SaeManifoldFitResult,
+    _penalized_loss_score,
+)
 
 
 def _representative_hybrid_split() -> dict:
@@ -41,7 +45,7 @@ def _representative_hybrid_split() -> dict:
                 "num_parameters": 5,
                 "curved_evidence_margin": 1.5,
                 "fitted_turning": 3.14159,
-                "held_out_delta_ev": 0.12,
+                "train_loao_delta_ev": 0.12,
             },
             {
                 "atom": "atom_1",
@@ -51,7 +55,7 @@ def _representative_hybrid_split() -> dict:
                 "num_parameters": 2,
                 "curved_evidence_margin": -0.3,
                 "fitted_turning": 0.0,
-                "held_out_delta_ev": 0.03,
+                "train_loao_delta_ev": 0.03,
             },
         ],
     }
@@ -97,7 +101,7 @@ def _minimal_model(hybrid_split: dict | None) -> ManifoldSAE:
 
 
 def test_manifoldsae_has_hybrid_split_field_defaulting_none():
-    # Field exists and defaults to None (back-compat for payloads predating it).
+    # Field exists and defaults to None when the Rust payload has no report.
     m = _minimal_model(None)
     assert hasattr(m, "hybrid_split"), "ManifoldSAE must expose a hybrid_split field"
     assert m.hybrid_split is None
@@ -110,7 +114,7 @@ def test_to_dict_emits_hybrid_split():
     assert d["hybrid_split"]["curved_atom_count"] == 1
     assert len(d["hybrid_split"]["atoms"]) == 2
     assert d["hybrid_split"]["atoms"][0]["fitted_turning"] == pytest.approx(3.14159)
-    assert d["hybrid_split"]["atoms"][1]["held_out_delta_ev"] == pytest.approx(0.03)
+    assert d["hybrid_split"]["atoms"][1]["train_loao_delta_ev"] == pytest.approx(0.03)
 
 
 def test_to_dict_emits_none_when_absent():
@@ -128,3 +132,8 @@ def test_hybrid_split_round_trips_through_from_dict():
     assert restored.hybrid_split["atoms"][0]["curved_evidence_margin"] == pytest.approx(1.5)
     assert restored.hybrid_split["atoms"][0]["kept_curved"] is True
     assert restored.hybrid_split["atoms"][1]["parameterization"] == "linear"
+
+
+def test_penalized_loss_score_rejects_legacy_reml_alias():
+    with pytest.raises(KeyError, match="penalized-loss score"):
+        _penalized_loss_score({"reml_score": 1.25})

@@ -470,14 +470,14 @@ impl SaeManifoldTerm {
             ) {
                 Ok(Some(theta)) => log::info!(
                     "[#1026] atom '{}' fitted turning Θ = {theta:.6e} rad, \
-                     held-out ΔEV = {dev} \
+                     training LOAO ΔEV = {dev} \
                      (∫κ ds; 0 = linear-tail direction, 2π = full curved loop; \
                      Θ≈0 + large ΔEV = linear direction, high-Θ + large ΔEV = \
                      genuine curved family — the hybrid-vs-shatter signal)",
                     atom.name
                 ),
                 Ok(None) => log::info!(
-                    "[#1026] atom '{}' fitted turning unavailable, held-out ΔEV = {dev} \
+                    "[#1026] atom '{}' fitted turning unavailable, training LOAO ΔEV = {dev} \
                      (no analytic second jet or degenerate curve)",
                     atom.name
                 ),

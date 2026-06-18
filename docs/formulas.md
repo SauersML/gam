@@ -404,7 +404,7 @@ y ~ x + link(type=flexible(probit))
 | `sas` | Sinh-arcsinh skewed link. Not compatible with `linkwiggle`. |
 | `beta-logistic` | Bounded link. Not compatible with `linkwiggle`. |
 | `blended(a, b, ...)` / `mixture(a, b, ...)` | Mixture of component inverse links from `logit`, `probit`, `cloglog`, `loglog`, `cauchit`. |
-| `flexible(base)` | Spline offset from a base link; enables `linkwiggle`. |
+| `flexible(base)` | Binomial-only spline offset from a base link; enables `linkwiggle`. |
 
 `link(type=...)` in the formula and `link=` on `fit()` are equivalent.
 The formula value wins if both are set.
@@ -421,7 +421,7 @@ y ~ s(x) + linkwiggle(internal_knots=10)
 y ~ s(x) + linkwiggle(degree=2, internal_knots=8, penalty_order=all)
 ```
 
-Adds a spline offset to a base link. The base link is the prior; the
+Adds a binomial-only spline offset to a base link. The base link is the prior; the
 data can correct for link misspecification.
 
 | Option | Default | Meaning |

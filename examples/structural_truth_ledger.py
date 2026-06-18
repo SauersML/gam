@@ -120,12 +120,8 @@ def test_ev_theta(z_tr, z_te, k, seed, n_iter):
         theta = a.get("fitted_turning")
         # #1226 — this is the IN-SAMPLE leave-one-atom-out ΔEV (computed on the
         # training matrix during the fit), surfaced under the honest key
-        # ``train_loao_delta_ev``. The legacy ``held_out_delta_ev`` key carried
-        # the SAME in-sample number under a misleading name; read the honest key
-        # and fall back to the deprecated alias only for older payloads.
+        # ``train_loao_delta_ev``.
         dev = a.get("train_loao_delta_ev")
-        if dev is None:
-            dev = a.get("held_out_delta_ev")
         margin = a.get("curved_evidence_margin")
         rows.append({
             "atom": a.get("atom"),

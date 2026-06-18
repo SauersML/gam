@@ -135,8 +135,9 @@ or with `flexible(...)`.
 
 ### `flexible(base)`
 
-Adds a jointly fit anchored spline offset to a base link. Accepted base
-links: `identity`, `log`, `logit`, `probit`, `cloglog`. The `sas`,
+Adds a jointly fit anchored spline offset to a base link for binomial
+responses. Accepted base links: `identity`, `log`, `logit`, `probit`,
+`cloglog`. The `sas`,
 `beta-logistic`, `blended(...)`, and `mixture(...)` types are not
 supported as a `flexible(...)` base.
 
@@ -154,6 +155,10 @@ y ~ s(x) + link(type=flexible(probit)) + linkwiggle(internal_knots=8, penalty_or
 
 See [formulas.md](formulas.md#linkwiggle-flexible-link-offset) for
 `linkwiggle` options.
+
+For Gaussian, Poisson, Gamma, and other non-binomial responses, use the
+plain base link. Non-binomial `flexible(...)` links are rejected because
+there is no fitted offset-spline solver for those likelihoods.
 
 ## Firth bias reduction
 

@@ -1440,7 +1440,7 @@ pub(crate) fn per_atom_loao_ev_attributes_each_load_bearing_atom() {
         let d = d.unwrap_or_else(|| panic!("atom {atom_idx} ΔEV must be defined"));
         assert!(
             d > 1e-9,
-            "load-bearing atom {atom_idx} must earn positive held-out ΔEV; got {d:.3e}"
+            "load-bearing atom {atom_idx} must earn positive training LOAO ΔEV; got {d:.3e}"
         );
         // ΔEV is bounded by EV(full) = 1 (an atom cannot carry more EV than
         // the whole dictionary explains).
@@ -2004,8 +2004,8 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
             .fitted_turning
             .unwrap_or_else(|| panic!("verdict '{}' must carry a fitted turning Θ", v.atom_name));
         let dev = v
-            .held_out_delta_ev
-            .unwrap_or_else(|| panic!("verdict '{}' must carry a held-out ΔEV", v.atom_name));
+            .train_loao_delta_ev
+            .unwrap_or_else(|| panic!("verdict '{}' must carry a training LOAO ΔEV", v.atom_name));
         assert!(
             theta.is_finite() && theta >= 0.0,
             "fitted turning Θ must be a finite non-negative arc-curvature integral; \
@@ -2014,7 +2014,7 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
         );
         assert!(
             dev.is_finite(),
-            "held-out ΔEV must be finite; got {dev} for '{}'",
+            "training LOAO ΔEV must be finite; got {dev} for '{}'",
             v.atom_name
         );
         // The slot that collapsed to the linear tail is straight by definition:
@@ -2035,16 +2035,16 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
     // linear tail (asserted above) AND keep the curved slot curved while it
     // earns reconstruction. So at least one adjudicated slot must read a
     // materially non-zero turning Θ, be kept curved, and carry a strictly
-    // positive held-out ΔEV — i.e. a high-Θ atom that earns EV is a genuine
+    // positive training LOAO ΔEV — i.e. a high-Θ atom that earns EV is a genuine
     // curved family, not a linear direction wearing a curved basis.
     let curved_earner = report_with_ev.verdicts.iter().find(|v| {
         v.kept_curved
             && v.fitted_turning.map(|t| t > 1e-2).unwrap_or(false)
-            && v.held_out_delta_ev.map(|d| d > 0.0).unwrap_or(false)
+            && v.train_loao_delta_ev.map(|d| d > 0.0).unwrap_or(false)
     });
     assert!(
         curved_earner.is_some(),
-        "a genuinely curved slot must be kept curved AND earn positive held-out \
+        "a genuinely curved slot must be kept curved AND earn positive training LOAO \
          ΔEV (the high-Θ-earns-EV signature); verdicts = {:?}",
         report_with_ev
             .verdicts
@@ -2053,7 +2053,7 @@ pub(crate) fn hybrid_collapse_is_load_bearing_and_dominates() {
                 v.atom_name.clone(),
                 v.kept_curved,
                 v.fitted_turning,
-                v.held_out_delta_ev
+                v.train_loao_delta_ev
             ))
             .collect::<Vec<_>>()
     );

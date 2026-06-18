@@ -203,13 +203,13 @@ pub struct AtomHybridVerdict {
     /// Captured here (not just logged) so the EV-vs-Θ frontier is queryable
     /// structured data on the persisted report rather than a transient log line.
     pub fitted_turning: Option<f64>,
-    /// The atom's held-out leave-one-atom-out explained-variance contribution
+    /// The atom's training leave-one-atom-out explained-variance contribution
     /// `ΔEV_k = EV(full) − EV(full∖{k})` — how much reconstruction EV this single
     /// atom earns. Paired with [`Self::fitted_turning`] this is the `(Θ, ΔEV)`
     /// point the #1026 frontier reports: a `Θ ≈ 0` atom with large `ΔEV` is a
     /// genuine linear-tail direction; a high-`Θ` atom with large `ΔEV` is a
     /// genuine curved family. `None` iff the caller did not supply LOAO EV.
-    pub held_out_delta_ev: Option<f64>,
+    pub train_loao_delta_ev: Option<f64>,
     /// The fitted straight sub-model for this slot, present iff the verdict
     /// selected LINEAR (`kept_curved == false`). The collapsed reconstruction
     /// substitutes this for the atom's curved decoded image, making the verdict
@@ -551,14 +551,14 @@ where
         .zip(turnings.into_iter())
         .zip(delta_evs.into_iter())
         .map(
-            |((((atom_name, choice), linear_image), fitted_turning), held_out_delta_ev)| {
+            |((((atom_name, choice), linear_image), fitted_turning), train_loao_delta_ev)| {
                 let kept_curved = !choice.param.is_linear();
                 AtomHybridVerdict {
                     atom_name,
                     choice,
                     kept_curved,
                     fitted_turning,
-                    held_out_delta_ev,
+                    train_loao_delta_ev,
                     // Carry the straight sub-model only when the verdict collapses
                     // this slot to linear — the curved slots keep their fitted image.
                     linear_image: if kept_curved {

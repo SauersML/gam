@@ -1204,6 +1204,73 @@ fn linkwiggle_rejected_for_nonbinomial_response() {
 }
 
 #[test]
+fn flexible_link_rejected_for_nonbinomial_standard_response() {
+    let data = workflow_test_dataset();
+    let mut config = FitConfig::default();
+    config.family = Some("poisson".to_string());
+    config.link = Some("flexible(log)".to_string());
+
+    let err = materialize("bmi ~ z", &data, &config)
+        .err()
+        .expect("flexible(log) on a Poisson response must be rejected, not silently ignored");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flexible(...)") && msg.contains("non-binomial"),
+        "error should explain flexible links are binomial-only, got: {msg}"
+    );
+}
+
+#[test]
+fn formula_flexible_link_rejected_for_nonbinomial_standard_response() {
+    let data = workflow_test_dataset();
+    let mut config = FitConfig::default();
+    config.family = Some("poisson".to_string());
+
+    let err = materialize("bmi ~ z + link(type=flexible(log))", &data, &config)
+        .err()
+        .expect("formula flexible(log) on a Poisson response must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flexible(...)") && msg.contains("non-binomial"),
+        "error should explain flexible links are binomial-only, got: {msg}"
+    );
+}
+
+#[test]
+fn flexible_link_flag_rejected_for_nonbinomial_standard_response() {
+    let data = workflow_test_dataset();
+    let mut config = FitConfig::default();
+    config.family = Some("gaussian".to_string());
+    config.flexible_link = true;
+
+    let err = materialize("bmi ~ z", &data, &config)
+        .err()
+        .expect("flexible_link=True on a Gaussian response must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flexible(...)") && msg.contains("non-binomial"),
+        "error should explain flexible links are binomial-only, got: {msg}"
+    );
+}
+
+#[test]
+fn flexible_link_rejected_for_nonbinomial_location_scale_response() {
+    let data = workflow_test_dataset();
+    let mut config = FitConfig::default();
+    config.link = Some("flexible(identity)".to_string());
+    config.noise_formula = Some("1".to_string());
+
+    let err = materialize("bmi ~ z", &data, &config)
+        .err()
+        .expect("flexible(identity) on a Gaussian location-scale response must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flexible(...)") && msg.contains("non-binomial"),
+        "error should explain flexible links are binomial-only, got: {msg}"
+    );
+}
+
+#[test]
 fn timewiggle_still_accepted_in_survival_formula() {
     // Guard must not regress the legitimate survival path: a Surv(...)
     // response still consumes timewiggle(...) without hitting the

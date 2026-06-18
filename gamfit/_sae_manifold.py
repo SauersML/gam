@@ -34,16 +34,14 @@ def _penalized_loss_score(payload: Mapping[str, Any]) -> float:
     """Read the SAE fit's penalized-loss score honestly (#1231).
 
     The Rust FFI surfaces the negative penalized loss under
-    ``penalized_loss_score`` (in-sample) / ``oos_penalized_loss`` (fixed-decoder
-    OOS), with the legacy misleading ``reml_score`` retained only as a
-    back-compat alias. Prefer the honest keys; fall back to the alias.
+    ``penalized_loss_score`` (in-sample) / ``oos_penalized_loss`` (fixed-decoder OOS).
     """
-    for key in ("penalized_loss_score", "oos_penalized_loss", "reml_score"):
+    for key in ("penalized_loss_score", "oos_penalized_loss"):
         if key in payload:
             return float(payload[key])
     raise KeyError(
         "SAE fit payload is missing a penalized-loss score "
-        "(penalized_loss_score / oos_penalized_loss / reml_score)"
+        "(penalized_loss_score / oos_penalized_loss)"
     )
 
 
@@ -1124,9 +1122,8 @@ class ManifoldSAE:
     # int, "curved_evidence_margin": float, "fitted_turning": float | None,
     # "train_loao_delta_ev": float | None}``). NOTE (#1226): ``train_loao_delta_ev``
     # is the per-atom IN-SAMPLE leave-one-atom-out ΔEV (computed on the training
-    # matrix during the fit), NOT a held-out generalization number; the legacy
-    # ``held_out_delta_ev`` key carries the SAME in-sample value and is retained
-    # only as a deprecated alias. This is a common-data curved-vs-linear evidence
+    # matrix during the fit), NOT a held-out generalization number. This is a
+    # common-data curved-vs-linear evidence
     # comparison (#1202): both candidates fit the atom's response residual, with
     # the line as the curved family's Θ=0 sub-model. Previously the FFI
     # emitted this block but the public class dropped it, forcing callers to
