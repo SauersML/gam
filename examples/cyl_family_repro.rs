@@ -80,6 +80,182 @@ fn fit_and_predict_eta(
     test_design.design.apply(&fit.fit.beta)
 }
 
+/// #1263 lane-discrimination diagnostic for the Poisson cylinder fit.
+///
+/// Pinpoints WHERE the ~0.38 log-level offset enters by dumping, at the
+/// converged optimum on the SAME design gam used:
+///   (1) the free intercept beta_0 vs true ln(mean rate), AND the GLM
+///       intercept score identity Σμ vs Σy (must hold to machine eps if the
+///       unpenalized intercept truly converged its score equation);
+///   (2) per-margin fitted lambdas (is the cyclic-theta margin over-penalized?);
+///   (3) an INDEPENDENT from-scratch UNPENALIZED Poisson IRLS on the identical
+///       design matrix — if the unpenalized hand-fit recovers the level/structure
+///       but gam (penalized REML) does not, the offset is penalty/λ-induced
+///       (outer-REML lane); if the unpenalized hand-fit ALSO mis-levels, the
+///       basis/working-response/weights are the culprit (IRLS/family lane).
+fn poisson_level_diagnostic(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    train_rows: &Array2<f64>,
+    y: &[f64],
+    rate_true: &[f64],
+) {
+    let pcfg = FitConfig {
+        family: Some("poisson".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(formula, data, &pcfg).expect("poisson fit succeeded");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit");
+    };
+    let beta = &fit.fit.beta;
+    let n = y.len() as f64;
+
+    // --- gam's fitted training mean from its converged beta on the SAME design ---
+    let train_design = build_term_collection_design(train_rows.view(), &fit.resolvedspec)
+        .expect("rebuild training design");
+    let eta_gam = train_design.design.apply(beta);
+    let mu_gam: Array1<f64> = eta_gam.mapv(f64::exp);
+    let sum_mu = mu_gam.sum();
+    let sum_y: f64 = y.iter().sum();
+    let mean_y = sum_y / n;
+
+    eprintln!("---- #1263 POISSON LANE DIAGNOSTIC ----");
+    eprintln!(
+        "  (1) free intercept beta_0={:.5} | ln(mean_y)={:.5} | diff={:+.5}  (true level base=1.5)",
+        beta[0],
+        mean_y.ln(),
+        beta[0] - mean_y.ln()
+    );
+    eprintln!(
+        "      GLM intercept score identity: Σμ={:.4}  Σy={:.4}  rel_gap={:+.3e}  (≈0 ⇒ unpenalized intercept score CONVERGED)",
+        sum_mu,
+        sum_y,
+        (sum_mu - sum_y) / sum_y
+    );
+    // Level locus: smooth columns are sum-to-zero, so Σ over rows of the
+    // non-intercept contribution should be ~0; any drift means the smooth is
+    // carrying level the intercept should own.
+    let n_cols = train_design.design.ncols();
+    let mut beta_no_intercept = beta.clone();
+    beta_no_intercept[0] = 0.0;
+    let smooth_part = train_design.design.apply(&beta_no_intercept);
+    eprintln!(
+        "      smooth-only Σ(rows)/n={:+.5} (sum-to-zero ⇒ ~0; nonzero ⇒ smooth leaks LEVEL) | design ncols={}",
+        smooth_part.sum() / n,
+        n_cols
+    );
+
+    // --- (2) per-margin lambdas ---
+    eprintln!("  (2) fitted lambdas (per penalty block) = {:?}", fit.fit.lambdas);
+    eprintln!(
+        "      deviance={:.4}  reml_score={:.4}  outer_converged={}",
+        fit.fit.deviance, fit.fit.reml_score, fit.fit.outer_converged
+    );
+
+    // --- (3) independent UNPENALIZED Poisson IRLS on the identical design ---
+    // Materialize the dense design once (n×p) and run textbook Fisher-scoring
+    // Poisson IRLS: W=μ, z=η+(y-μ)/μ, solve (XᵀWX)β = XᵀWz with a tiny ridge
+    // for numerical safety only (1e-8, far below any smoothing scale).
+    let xdense = train_design.design.to_dense();
+    let (nn, p) = (xdense.nrows(), xdense.ncols());
+    let mut b = Array1::<f64>::zeros(p);
+    b[0] = mean_y.max(1e-6).ln(); // same intercept warm start gam uses
+    let yv = Array1::from(y.to_vec());
+    for _it in 0..200 {
+        let eta = xdense.dot(&b);
+        let mu = eta.mapv(|e| e.exp().clamp(1e-10, 1e10));
+        let w = &mu; // Poisson canonical: W = μ
+        let z = &eta + &((&yv - &mu) / &mu);
+        // Build XᵀWX and XᵀWz
+        let mut ata = Array2::<f64>::zeros((p, p));
+        let mut atz = Array1::<f64>::zeros(p);
+        for i in 0..nn {
+            let row = xdense.row(i);
+            let wi = w[i];
+            let zi = z[i];
+            for a in 0..p {
+                let xa = row[a] * wi;
+                atz[a] += xa * zi;
+                for c in a..p {
+                    ata[[a, c]] += xa * row[c];
+                }
+            }
+        }
+        for a in 0..p {
+            ata[[a, a]] += 1e-8;
+            for c in (a + 1)..p {
+                ata[[c, a]] = ata[[a, c]];
+            }
+        }
+        let bnew = solve_spd(&ata, &atz).unwrap_or_else(|| b.clone());
+        let delta = (&bnew - &b).mapv(f64::abs).fold(0.0_f64, |m, &v| m.max(v));
+        b = bnew;
+        if delta < 1e-9 {
+            break;
+        }
+    }
+    let eta_hand = xdense.dot(&b);
+    let mu_hand: Array1<f64> = eta_hand.mapv(f64::exp);
+    let rate_true_arr = Array1::from(rate_true.to_vec());
+    eprintln!(
+        "  (3) UNPENALIZED hand Poisson IRLS on identical design: beta_0={:.5} | Σμ={:.4} (Σy={:.4}) | MSE(rate vs truth)={:.4e}",
+        b[0],
+        mu_hand.sum(),
+        sum_y,
+        mse(&mu_hand, &rate_true_arr)
+    );
+    eprintln!(
+        "      gam penalized fit MSE(rate vs truth, TRAIN)={:.4e}",
+        mse(&mu_gam, &rate_true_arr)
+    );
+    eprintln!(
+        "      VERDICT: if hand-IRLS MSE ≈ truth (small) but gam MSE large ⇒ PENALTY/λ lane (outer-REML).\n               if hand-IRLS ALSO large ⇒ working-response/weights/basis lane (IRLS/family)."
+    );
+    eprintln!("---------------------------------------");
+}
+
+/// Minimal SPD solve via Cholesky (lower). Returns None if not PD.
+fn solve_spd(a: &Array2<f64>, b: &Array1<f64>) -> Option<Array1<f64>> {
+    let n = a.nrows();
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut s = a[[i, j]];
+            for k in 0..j {
+                s -= l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                if s <= 0.0 {
+                    return None;
+                }
+                l[[i, j]] = s.sqrt();
+            } else {
+                l[[i, j]] = s / l[[j, j]];
+            }
+        }
+    }
+    // forward solve L y = b
+    let mut yv = b.clone();
+    for i in 0..n {
+        let mut s = yv[i];
+        for k in 0..i {
+            s -= l[[i, k]] * yv[k];
+        }
+        yv[i] = s / l[[i, i]];
+    }
+    // back solve Lᵀ x = y
+    let mut x = yv.clone();
+    for i in (0..n).rev() {
+        let mut s = x[i];
+        for k in (i + 1)..n {
+            s -= l[[k, i]] * x[k];
+        }
+        x[i] = s / l[[i, i]];
+    }
+    Some(x)
+}
+
 fn logistic(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -208,5 +384,15 @@ fn main() {
         eta_pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
         mse(&rate_pred, &rate_true_arr),
         rate_true.iter().sum::<f64>() / n as f64
+    );
+
+    // The training design is the same rows as `test` here (test reuses theta,h
+    // with a dummy y column), so reuse `test` as the train design rows.
+    poisson_level_diagnostic(
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None], k=4)",
+        &data,
+        &test,
+        &y,
+        &rate_true,
     );
 }
