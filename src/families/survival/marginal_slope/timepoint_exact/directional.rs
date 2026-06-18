@@ -1137,23 +1137,40 @@ impl SurvivalMarginalSlopeFamily {
                             // third (the dominant d-term error in the [g,w] block, #979).
                             //
                             // D_dir(coeff_aau[u]) = coeff_aaau[u]·a_dir
-                            //                       + coeff_aabu[u]·dir[g](direct).
+                            //                       + ∂⁴c/∂a²∂u∂dir(direct).
                             let coeff_aau_dir_u = {
-                                let mut acc = poly_scale(fixed.coeff_aau[u].as_ref(), a_dir);
-                                // direct ∂/∂g of ∂²c/∂a²∂u is coeff_aabu[u]·dir[g].
-                                let dg = dir[primary.g];
-                                for k in 0..4 {
-                                    acc[k] = fixed.coeff_aaau[u][k] * a_dir
-                                        + fixed.coeff_aabu[u][k] * dg;
+                                let mut acc = poly_scale(fixed.coeff_aaau[u].as_ref(), a_dir);
+                                for c in 0..p {
+                                    if dir[c] == 0.0 {
+                                        continue;
+                                    }
+                                    let scaa = self.cell_pair_third_coeff_a(
+                                        primary,
+                                        &fixed.coeff_aabu,
+                                        u,
+                                        c,
+                                    );
+                                    for k in 0..4 {
+                                        acc[k] += scaa[k] * dir[c];
+                                    }
                                 }
                                 acc
                             };
                             let coeff_aau_dir_v = {
-                                let mut acc = vec![0.0; 4];
-                                let dg = dir[primary.g];
-                                for k in 0..4 {
-                                    acc[k] = fixed.coeff_aaau[v][k] * a_dir
-                                        + fixed.coeff_aabu[v][k] * dg;
+                                let mut acc = poly_scale(fixed.coeff_aaau[v].as_ref(), a_dir);
+                                for c in 0..p {
+                                    if dir[c] == 0.0 {
+                                        continue;
+                                    }
+                                    let scaa = self.cell_pair_third_coeff_a(
+                                        primary,
+                                        &fixed.coeff_aabu,
+                                        v,
+                                        c,
+                                    );
+                                    for k in 0..4 {
+                                        acc[k] += scaa[k] * dir[c];
+                                    }
                                 }
                                 acc
                             };
