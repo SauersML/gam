@@ -1,5 +1,14 @@
 use super::*;
 
+// FD-OK: this entire module is the outer-gradient finite-difference AUDIT
+// oracle. It deliberately computes central finite differences of the outer
+// REML/LAML criterion to verify the analytic gradient against — it is a
+// diagnostic that runs only behind the `outer_fd_audit_eligible` gates in
+// spatial_optimization.rs / custom_family/fit.rs, never on the fit math path.
+// The `fd`-named struct fields and fn names below are intrinsic to that audit
+// role, so the no-production-finite-differences guard treats this file as a
+// sanctioned audit region closed at the bottom of the module.
+
 /// Per-θ component of an outer-gradient finite-difference audit.
 #[derive(Clone, Debug)]
 pub struct OuterGradientFdComponent {
@@ -227,3 +236,4 @@ where
         hessian_eigenvalues,
     })
 }
+// END-FD-OK
