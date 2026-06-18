@@ -30,6 +30,31 @@ def test_bspline_double_penalty_does_not_inflate_linear_edf():
     assert np.mean(on) <= np.mean(off) + 1e-8, (on, off)
 
 
+def test_double_penalty_still_shrinks_unsupported_term_to_zero():
+    # The #1266 fix must not be the "neutering single-lambda fold": the second
+    # (null-space) smoothing parameter has to remain live so the default double
+    # penalty drives a genuinely unsupported term toward EDF -> 0 (mgcv
+    # select=TRUE behaviour). y depends only on x; s(z) is pure noise and should
+    # be shrunk out, not merely "not inflated".
+    n = 800
+    z_edf = []
+    for seed in range(200, 205):
+        rng = np.random.default_rng(seed)
+        x = rng.uniform(0.0, 1.0, n)
+        z = rng.uniform(0.0, 1.0, n)
+        df = pd.DataFrame(
+            {"x": x, "z": z, "y": np.sin(6.0 * x) + rng.normal(0.0, 0.3, n)}
+        )
+        m = gamfit.fit(df, "y ~ s(x) + s(z)")
+        z_term = next(t for t in m.summary().smooth_terms if "z" in t["name"])
+        z_edf.append(float(z_term["edf"]))
+
+    # An unsupported term has a 1-d constant + 1-d linear null space (~2 EDF
+    # under a single wiggliness penalty). With the live null-space coordinate it
+    # must shrink well below that floor.
+    assert np.mean(z_edf) < 1.0, z_edf
+
+
 def test_default_double_penalty_does_not_inflate_irrelevant_smooth_edf():
     n = 800
     on = []
