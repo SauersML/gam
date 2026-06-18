@@ -2461,13 +2461,11 @@ impl<'d> SpatialJointContext<'d> {
                     && self.evaluator.psi_gram_tensor_covers_gradient(psi)
                     // #1264: the skip keeps the conditioned reduced /
                     // null-space basis frozen at the revision-pinning ψ and only
-                    // re-keys the Gram + penalty. That is exact only inside the
-                    // RRQR-pivot-stable sub-window; on the wide standardized
-                    // window a far ψ move can change the radial-kernel pivot
-                    // frame, and skipping there pairs a stale basis with a
-                    // re-keyed Gram → a wrong β̂. Gate the skip on the stable
-                    // frame band; elsewhere the full `reset_surface` slow path
-                    // runs.
+                    // re-keys the Gram + penalty. That is exact only where the
+                    // reduced basis is proven equal. RRQR rank/permutation was
+                    // not sufficient on the standardized fixture, so the tensor
+                    // currently exposes an empty skip band and moving-ψ trials
+                    // take the full `reset_surface` slow path.
                     && self.evaluator.psi_gram_tensor_covers_skip(psi)
                     // #1033 penalty lane: ψ moves S(ψ) too, and the skip leaves
                     // `reset_surface` un-run; only skip when the penalty can be
@@ -2706,7 +2704,7 @@ impl<'d> SpatialJointContext<'d> {
         // per-trial work, so this is the dominant n-flat lever. Unlike the
         // gradient path the value lane spans the FULL certified window, but the
         // probe still skips `reset_surface`, so it must also stay inside the
-        // β̂-sound skip sub-window. Any miss (non-Gaussian, off-window,
+        // reduced-basis-equality skip sub-window. Any miss (non-Gaussian, off-window,
         // off-skip-window, fast path not yet armed) realizes the design and runs
         // the exact streamed probe unchanged.
         let skip_value_realization = theta.len() == self.rho_dim + 1 && {
@@ -2715,10 +2713,11 @@ impl<'d> SpatialJointContext<'d> {
                     // #1264: value-only line-search probes still run the inner
                     // solve on the kept reduced surface. A full-window value
                     // certificate only proves the k-space Gram is accurate; it
-                    // does NOT prove the frozen RRQR-reduced basis is valid at
-                    // this ψ. Gate the reset_surface skip on the same β̂-sound
-                    // sub-window as `eval_full`, else a cost probe can pair a
-                    // correct Gram with a stale basis and mis-rank κ moves.
+                    // does NOT prove the frozen reduced basis is valid at this
+                    // ψ. Gate the reset_surface skip on the same
+                    // reduced-basis-equality sub-window as `eval_full`, else a
+                    // cost probe can pair a correct Gram with a stale basis and
+                    // mis-rank κ moves.
                     && self.evaluator.psi_gram_tensor_covers_skip(psi)
                     // #1033 penalty lane: the value-probe fast path also skips
                     // `reset_surface`, so the probe must be able to re-key S(ψ)
