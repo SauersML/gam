@@ -51,19 +51,16 @@ use ndarray::{Array1, Array2, ArrayView1};
 /// This is a cheap NECESSARY-CONDITION pre-filter, not the accuracy gate: the
 /// authoritative accuracy gate is the off-node `spot_check` on the ASSEMBLED
 /// Gram ([`PSI_GRAM_SPOT_RTOL`]). On the WIDE STANDARDIZED geometry default 1-D
-/// fits use (#1215) the realized radial design `kernel(r·e^ψ)` is accurate only
-/// to ~1e-11 relative over the wide ψ-window, so its Chebyshev tail PLATEAUS at
-/// ~2e-11 of column scale (flat, NOT decaying) — no node count drives it below a
-/// 1e-12 bar. Sizing this pre-filter just above that realized-design floor (and
-/// below the spot-check gate) lets an analytic design certify on production
-/// geometry while a genuinely non-analytic design (a true kink), whose tail
-/// plateaus orders higher, is still refused; the spot-check is the hard
-/// backstop either way. A Gram reconstructed to ~2e-11 is far inside the
-/// downstream gates' 1e-6 bar.
-pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-9;
+/// fits use (#1215) the realized radial design needs the deeper ladder below to
+/// drive the tail beneath the beta-invariance bar. Keep this pre-filter tight:
+/// accepting the old ~2e-11 column tail at 65 nodes was fine for cost-only
+/// gates, but the weakly penalized radial solve amplified it into a visible
+/// beta-hat drift across the reduced-basis rotation. A genuinely non-analytic
+/// design (a true kink) still refuses here or at the assembled-Gram spot check.
+pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-12;
 
 /// Relative agreement required at the off-node Gram spot checks.
-pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
+pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-12;
 
 /// Relative agreement required of the analytic ψ-DERIVATIVE `dgram_dpsi`
 /// against a high-order (Richardson-validated) finite difference of the exactly
@@ -100,17 +97,16 @@ pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
 /// On the WIDE STANDARDIZED geometry default 1-D fits use (#1215) the tail
 /// decays cleanly but GEOMETRICALLY-slowly: measured per-column worst tail rel
 /// is ~3.2e-8 at m=33 and ~2.3e-11 at m=65 (a clean ~1300×/doubling decay, NOT a
-/// floor). m=65 certifies under [`PSI_GRAM_CERT_RTOL`], so the VALUE Gram is
-/// accurate to ~2.3e-11 — fine for the cost lane. But the inner penalized solve
-/// `β̂ = (G+λS)⁻¹r` AMPLIFIES that Gram error by the conditioning of the radial
-/// kernel Gram, which grows sharply with ψ (`‖XᵀX‖_F` rises from ~6e2 at ψ≈0 to
-/// ~1.7e7 at ψ≈2.1 on the gate fixture), so at the higher-ψ sweep points β̂ from
-/// the n-free Gram drifts from the streamed β̂ by ~6e-6 — over the gate's 1e-6
-/// bar. Extending the ladder to 129 nodes continues the geometric decay to
-/// ~1.7e-14, dropping the amplified β̂ drift to ~1e-9, comfortably bit-tight
-/// (#1216). The build frees the per-node realized designs right after the DCT so
-/// the deeper ladder does not balloon peak memory at large production `n`.
-pub const PSI_GRAM_NODE_LADDER: [usize; 5] = [9, 17, 33, 65, 129];
+/// floor). The old 65-node acceptance was fine for the cost lane but not for the
+/// beta-hat soundness gate: the inner penalized solve `β̂ = (G+λS)⁻¹r`
+/// amplifies Gram residuals by the radial-kernel conditioning, especially after
+/// the production skip was relaxed to cross a reduced-basis rotation. The 129
+/// and 257 rungs keep escalating until the assembled Gram itself passes the
+/// tighter spot check, preserving the n-free per-trial path without weakening
+/// the rotated-basis beta identity witness. The build frees per-node realized
+/// designs right after the DCT so deeper rungs do not balloon peak memory at
+/// large production `n`.
+pub const PSI_GRAM_NODE_LADDER: [usize; 6] = [9, 17, 33, 65, 129, 257];
 
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
