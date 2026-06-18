@@ -203,6 +203,64 @@ fn kappa_iso_1d_n_threshold_sweep() {
     }
 }
 
+/// #1033 FAST-READ companion to `kappa_outer_loop_is_n_independent`: the same
+/// marginal κ-phase measurement on a SMALL n-ladder (1k → 16k) that completes in
+/// ~2–3 min, so the n-free skip's flat-vs-linear behaviour can be read inside an
+/// iteration loop without waiting on the 320k sweep (which walls the 1:30 slot).
+///
+/// The discriminant is unambiguous at this scale: across a 16× n increase an
+/// O(n) per-trial regression tracks ~16×, while a truly n-free outer loop holds
+/// the marginal κ-phase ~flat (drifting only with the fixed O(D²k²) trial cost
+/// and shared-node timing jitter). The same ≤8× bar as the headline applies — at
+/// 16× n it is ~n^0.72, decisively sub-linear but safely above timing noise. A
+/// green here is the fast close-signal; the full 320k sweep is the final stamp.
+#[test]
+fn kappa_outer_loop_is_n_independent_fast_ladder() {
+    let (aniso, bounds) = (false, (1e-2, 1e2));
+    let warm = run_fit(1000, true, aniso, bounds).unwrap_or_else(|reason| {
+        panic!(
+            "[kappa-fast-ladder] warm iso-κ fit failed ({reason}) — iso-1D κ \
+             convergence is fixed (#1053/#1066/#1069); a failure here is a real \
+             regression in the tensor-eligible isotropic length-scale optimizer"
+        )
+    });
+    eprintln!("[kappa-fast-ladder] warm-up fit primed caches in {warm:.4}s");
+
+    // Small ladder: 1k → 16k (16×). Enough to read the slope; ~2–3 min total.
+    let ns = [1_000usize, 4_000, 16_000];
+    let mut kappa_phase = Vec::with_capacity(ns.len());
+    eprintln!(
+        "[kappa-fast-ladder] {:>9}  {:>10}  {:>10}  {:>12}",
+        "n", "t_kappa_s", "t_single_s", "kappa_phase_s"
+    );
+    for &n in &ns {
+        let t_kappa = run_fit(n, true, aniso, bounds)
+            .unwrap()
+            .min(run_fit(n, true, aniso, bounds).unwrap());
+        let t_single = run_fit(n, false, aniso, bounds)
+            .unwrap()
+            .min(run_fit(n, false, aniso, bounds).unwrap());
+        let phase = (t_kappa - t_single).max(0.0);
+        kappa_phase.push(phase);
+        eprintln!("[kappa-fast-ladder] {n:>9}  {t_kappa:>10.4}  {t_single:>10.4}  {phase:>12.4}");
+    }
+
+    let first = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
+    let last = kappa_phase.last().copied().unwrap_or(0.0).max(1e-3);
+    let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 16
+    let phase_ratio = last / first;
+    eprintln!(
+        "[kappa-fast-ladder] n grew {n_ratio:.0}× ; kappa-phase grew {phase_ratio:.2}× \
+         (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×) — fast #1033 close-signal"
+    );
+    assert!(
+        phase_ratio <= 8.0,
+        "kappa outer-loop phase grew {phase_ratio:.2}× across a {n_ratio:.0}× \
+         increase in n — the #1033 n-free skip is still falling to an O(n) \
+         per-trial pass across the reduced-basis rotation (fast-ladder read)"
+    );
+}
+
 #[test]
 fn kappa_outer_loop_is_n_independent() {
     // ISOTROPIC path (`aniso=false`, `aniso_log_scales=None`): the single
