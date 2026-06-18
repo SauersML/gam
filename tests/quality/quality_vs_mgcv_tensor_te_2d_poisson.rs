@@ -288,18 +288,20 @@ fn gam_tensor_te_2d_poisson_matches_mgcv_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        # badh is BINARY {0,1} (exactly 2 unique values), so its tensor margin can
-        # hold at most a 2-function basis. mgcv's default `cr` (cubic-regression)
-        # margin has a hard minimum of k=3 and would REJECT k=2 ("k too small -
-        # reset to default") then fail constructing 5 knots on a 2-value covariate.
-        # A thin-plate (`tp`) margin DOES support k=2, giving exactly the linear-
-        # across-the-two-levels effect that fully represents a binary covariate.
-        # age is continuous and keeps the smooth `cr` margin at k=5. The resulting
-        # tensor basis dimensions c(5, 2) match the gam side (apples-to-apples).
-        m <- gam(numvisit ~ te(age, badh, bs = c("cr", "tp"), k = c(5, 2)), data = df,
+        # badh is BINARY {0,1}. mgcv rejects tensor margins with only two unique
+        # covariate values for the usual smooth bases, so the reference expresses
+        # the same capability as separate age smooths by bad-health level plus
+        # the factor main effect. This is the standard mgcv representation for a
+        # continuous smooth modulated by a binary covariate and avoids asking mgcv
+        # to construct an invalid two-value smooth margin.
+        df$badhf <- factor(df$badh)
+        m <- gam(numvisit ~ badhf + s(age, by = badhf, bs = "cr", k = 5), data = df,
                  family = poisson(link = "log"), method = "REML")
         k <- df$test_n[1]
-        newd <- data.frame(age = df$test_age[1:k], badh = df$test_badh[1:k])
+        newd <- data.frame(
+            age = df$test_age[1:k],
+            badhf = factor(df$test_badh[1:k], levels = levels(df$badhf))
+        )
         emit("test_mu", as.numeric(predict(m, newdata = newd, type = "response")))
         emit("edf", sum(m$edf))
         "#,

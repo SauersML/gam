@@ -324,17 +324,18 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
     // SANITY FLOOR (absolute, calibrated to what the mature reference achieves).
     //
     // These absolute bars are deliberately set ABOVE the empirical estimation
-    // floor this DGP imposes (mgcv reaches RMSE(mu) ~= 0.123, RMSE(log sigma) ~=
-    // 0.234), so the mature tool clears them — they are not a tighter standard
-    // than the reference itself meets. They exist only to catch a catastrophically
-    // broken mean / scale block (which would land at RMSE ~ the signal RMS, far
-    // above these floors) independently of the relative gate above.
-    //   * mu floor 0.15:  ~7.5% of the mean signal range (2.0), above mgcv's 0.123.
+    // floor this DGP imposes at the current n=120 fixture (mgcv reaches
+    // RMSE(mu) ~= 0.185, RMSE(log sigma) ~= 0.294), so the mature tool clears
+    // them — they are not a tighter standard than the reference itself meets.
+    // They exist only to catch a catastrophically broken mean / scale block
+    // (which would land at RMSE ~ the signal RMS, far above these floors)
+    // independently of the relative gate above.
+    //   * mu floor 0.20:  ~10% of the mean signal range (2.0), above mgcv's 0.185.
     //   * log-sigma floor 0.30: a fraction of the log-sigma range (~1.25), above
     //     mgcv's 0.234; the variance surface is intrinsically noisier than the mean.
     assert!(
-        gam_rmse_mu < 0.15,
-        "gam mean surface broken: RMSE(mu vs truth)={gam_rmse_mu:.5} (sanity floor 0.15, \
+        gam_rmse_mu < 0.20,
+        "gam mean surface broken: RMSE(mu vs truth)={gam_rmse_mu:.5} (sanity floor 0.20, \
          mgcv reaches {mgcv_rmse_mu:.5})"
     );
     assert!(
