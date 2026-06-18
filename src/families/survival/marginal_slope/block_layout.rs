@@ -442,6 +442,7 @@ pub(crate) fn block10_pack_dir(
 ) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
     crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
         eta_uv_dir: ext.eta_uv_dir.iter().copied().collect(),
+        chi_u_dir: ext.chi_u_dir.to_vec(),
         chi_uv_dir: ext.chi_uv_dir.iter().copied().collect(),
         d_u_dir: ext.d_u_dir.to_vec(),
         d_uv_dir: ext.d_uv_dir.iter().copied().collect(),

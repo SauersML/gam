@@ -595,6 +595,11 @@ impl SurvivalMarginalSlopeFamily {
                 + eval_coeff4_at(&fixed_tau_a_dir, z_obs);
         }
 
+        let mut chi_u_dir = Array1::<f64>::zeros(p);
+        for u in 0..p {
+            chi_u_dir[u] = eta_aa_dir * a_u[u] + eta_aa * a_u_dir[u] + tau_a_dir[u];
+        }
+
         let mut eta_uv_dir = Array2::<f64>::zeros((p, p));
         let mut chi_uv_dir = Array2::<f64>::zeros((p, p));
         for u in 0..p {
@@ -1483,6 +1488,7 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok(SurvivalFlexTimepointDirectionalExact {
             eta_uv_dir,
+            chi_u_dir,
             chi_uv_dir,
             d_u_dir,
             d_uv_dir,
