@@ -1210,15 +1210,25 @@ fn assert_survival_consistent(
     tol: f64,
 ) {
     let analytic = survival_grad(model, beta0, rho);
+    // The large-lambda survival boundary has an ill-conditioned inner mode:
+    // the analytic envelope derivative is stable, but the scalar value's
+    // logdet-H term loses several digits when FD probes use the global 1e-5
+    // step. Keep the same boundary tolerance, but use a wider centered step so
+    // the FD oracle measures the smooth value surface instead of f64 jitter.
+    let fd_step = if regime == "boundary/large-lambda" {
+        5.0e-4
+    } else {
+        FD_STEP
+    };
     let k = rho.len();
     let mut fd = Array1::<f64>::zeros(k);
     for i in 0..k {
         let mut rp = rho.clone();
-        rp[i] += FD_STEP;
+        rp[i] += fd_step;
         let mut rm = rho.clone();
-        rm[i] -= FD_STEP;
+        rm[i] -= fd_step;
         fd[i] =
-            (survival_cost(model, beta0, &rp) - survival_cost(model, beta0, &rm)) / (2.0 * FD_STEP);
+            (survival_cost(model, beta0, &rp) - survival_cost(model, beta0, &rm)) / (2.0 * fd_step);
     }
     assert!(
         analytic.iter().all(|v| v.is_finite()) && fd.iter().all(|v| v.is_finite()),
