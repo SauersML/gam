@@ -438,9 +438,16 @@ impl SurvivalMarginalSlopeFamily {
         let phi_q = crate::probability::normal_pdf(q);
         f_u[q_index] += phi_q;
         f_uv[[q_index, q_index]] += -q * phi_q;
-        f_uv_d1[[q_index, q_index]] += dir1[q_index] * (1.0 - q * q) * phi_q;
-        f_uv_d2[[q_index, q_index]] += dir2[q_index] * (1.0 - q * q) * phi_q;
-        f_uv_d12[[q_index, q_index]] += dir1[q_index] * dir2[q_index] * q * (q * q - 3.0) * phi_q;
+        // q-marginal calibration RHS self-coupling, differentiated along the two
+        // independent directions. Base: `f_uv[[q,q]] = -q·φ(q)`. Its first and
+        // second q-derivatives (the d1/d2 single-direction and d12 cross terms)
+        // are `∂_q(-qφ) = (q²-1)φ` and `∂²_q(-qφ) = q·(3-q²)φ`. The previous
+        // `(1-q²)` / `q·(q²-3)` were both sign-flipped relative to the shared
+        // base, corrupting the (q,·) blocks of the contracted fourth tower
+        // (gam#932/#979).
+        f_uv_d1[[q_index, q_index]] += dir1[q_index] * (q * q - 1.0) * phi_q;
+        f_uv_d2[[q_index, q_index]] += dir2[q_index] * (q * q - 1.0) * phi_q;
+        f_uv_d12[[q_index, q_index]] += dir1[q_index] * dir2[q_index] * q * (3.0 - q * q) * phi_q;
 
         let inv = 1.0 / f_a;
         let mut au = Array1::<f64>::zeros(p);

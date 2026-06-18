@@ -254,7 +254,13 @@ impl SurvivalMarginalSlopeFamily {
         let phi_q = crate::probability::normal_pdf(q);
         f_u[q_index] += phi_q;
         f_uv[[q_index, q_index]] += -q * phi_q;
-        f_uv_dir[[q_index, q_index]] += dir[q_index] * (1.0 - q * q) * phi_q;
+        // q-marginal calibration RHS self-coupling. The base second derivative
+        // is `f_uv[[q,q]] = -q·φ(q)`; its exact directional derivative along
+        // `dir` is `dir[q]·∂_q(-q·φ(q)) = dir[q]·(q²-1)·φ(q)`. The previous
+        // `(1 - q²)` had this third q-self term sign-flipped relative to its own
+        // base, corrupting the (q,·) blocks of the contracted third tower
+        // (gam#932/#979).
+        f_uv_dir[[q_index, q_index]] += dir[q_index] * (q * q - 1.0) * phi_q;
 
         let inv_f_a = 1.0 / f_a;
         let mut a_u = Array1::<f64>::zeros(p);
