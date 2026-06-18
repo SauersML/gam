@@ -162,6 +162,8 @@ mod periodic_formula_integration;
 mod periodic_quality_batch_c;
 #[path = "basis_smooth/periodic_spline_1d.rs"]
 mod periodic_spline_1d;
+#[path = "basis_smooth/psi_gram_tensor_adversarial.rs"]
+mod psi_gram_tensor_adversarial;
 #[path = "basis_smooth/precision_gamma_hyperprior.rs"]
 mod precision_gamma_hyperprior;
 #[path = "basis_smooth/reml_iter_reduction_correctness.rs"]
