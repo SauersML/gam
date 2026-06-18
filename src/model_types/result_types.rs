@@ -65,6 +65,86 @@ pub(crate) fn dispersion_from_likelihood(
     }
 }
 
+#[cfg(test)]
+mod per_term_edf_tests {
+    use super::*;
+
+    fn eye(n: usize) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            out[[j, j]] = 1.0;
+        }
+        out
+    }
+
+    fn fit_with_legacy_tensor_block_sum() -> UnifiedFitResult {
+        let beta = Array1::zeros(36);
+        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: beta.clone(),
+                role: BlockRole::Mean,
+                edf: 28.0,
+                lambdas: Array1::from_vec(vec![1.0, 1.0]),
+            }],
+            log_lambdas: Array1::zeros(2),
+            lambdas: Array1::from_vec(vec![1.0, 1.0]),
+            likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: Some(0.0),
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: Some(FitInference {
+                edf_by_block: vec![20.0, 20.0],
+                penalty_block_trace: Vec::new(),
+                edf_total: 28.0,
+                smoothing_correction: None,
+                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(
+                    eye(36),
+                ),
+                working_weights: Array1::ones(1),
+                working_response: Array1::zeros(1),
+                reparam_qs: None,
+                dispersion: Dispersion::Estimated(1.0),
+                beta_covariance: None,
+                beta_standard_errors: None,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                coefficient_influence: None,
+                weighted_gram: None,
+                bias_correction_beta: None,
+            }),
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: crate::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts::default(),
+            inner_cycles: 0,
+        })
+    }
+
+    #[test]
+    fn per_term_edf_legacy_block_sum_is_capped_by_model_total() {
+        let fit = fit_with_legacy_tensor_block_sum();
+
+        let edf = fit.per_term_edf(1..36, 0, 2);
+
+        assert_eq!(edf, 28.0);
+    }
+}
+
 /// Standardized-disagreement gate: the audit flags inconsistency when the
 /// analytic and FD directional derivatives differ by more than this many FD
 /// error bars (and also fail the relative gate).
