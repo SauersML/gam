@@ -51,14 +51,24 @@ fn main() {
             probes.push((lat, lon));
         }
     }
-    for seed in [3u64, 17, 23] {
-        let data = make_dataset(300, seed);
-        let result =
-            fit_from_formula("y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo)", &data, &cfg)
-                .unwrap_or_else(|e| panic!("seed={seed} fit: {e}"));
+    let formulas = [
+        ("pseudo-k25-m4", "y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo)"),
+        ("pseudo-k25-m2", "y ~ sphere(lat, lon, k=25, m=2, kernel=pseudo)"),
+        ("harmonic-deg8", "y ~ sphere(lat, lon, method=harmonic, max_degree=8)"),
+    ];
+    for seed in [17u64, 23] {
+      let data = make_dataset(300, seed);
+      for (label, formula) in formulas.iter() {
+        let result = fit_from_formula(formula, &data, &cfg)
+            .unwrap_or_else(|e| panic!("seed={seed} {label} fit: {e}"));
         let FitResult::Standard(fit) = result else {
             panic!()
         };
+        println!(
+            "--- seed={seed} {label}: edf={:?} lambdas={:?} ---",
+            fit.fit.edf_total(),
+            fit.fit.lambdas.to_vec()
+        );
         let n = probes.len();
         let mut m = Array2::<f64>::zeros((n, 3));
         for (i, (lat, lon)) in probes.iter().enumerate() {
@@ -100,5 +110,6 @@ fn main() {
         for (e, lat, lon) in errs.iter().take(5) {
             println!("  worst |err|={e:.4} at lat={lat:.1} lon={lon:.1}");
         }
+      }
     }
 }
