@@ -71,6 +71,7 @@ use crate::families::vector_response::{
 };
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::dense_block_xtwx;
+use crate::reml_contracts::{DenseMatrixHyperOperator, HyperOperator};
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::{Arc, Mutex};
 
@@ -806,6 +807,148 @@ impl MultinomialFamily {
             }
         }
         Ok(out)
+    }
+
+    /// Assemble `D_beta H[d_j]` for an arbitrary batch of coefficient
+    /// directions in one shared softmax/probability pass.
+    ///
+    /// This is the outer-LAML mode-response counterpart to
+    /// [`Self::assemble_all_axis_directional_derivatives`]: the directions are
+    /// not canonical axes, but the row probabilities and design outer products
+    /// are identical for every `d_j` at a frozen beta. Sharing that row sweep is
+    /// the #1082 penguin lever; the old path rebuilt the softmax jet and dense
+    /// Gram once per outer coordinate.
+    fn assemble_directional_derivatives_from_probs(
+        &self,
+        probs_full: ArrayView2<'_, f64>,
+        directions: &[Array1<f64>],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        let n_dirs = directions.len();
+        if n_dirs == 0 {
+            return Ok(Vec::new());
+        }
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let dim = m * p;
+        for (idx, direction) in directions.iter().enumerate() {
+            if direction.len() != dim {
+                return Err(format!(
+                    "MultinomialFamily batched direction {idx} length {} != (K-1)·P = {dim}",
+                    direction.len()
+                ));
+            }
+        }
+        let design = self.design.view();
+        let flat = (0..n)
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f64; n_dirs * dim * dim],
+                |mut acc, row| {
+                    let w = self.weights[row];
+                    if w == 0.0 {
+                        return acc;
+                    }
+                    let mut d_eta = vec![0.0_f64; m];
+                    let mut dp = vec![0.0_f64; m];
+                    for (dir_idx, direction) in directions.iter().enumerate() {
+                        let mut s = 0.0_f64;
+                        for a in 0..m {
+                            let base = a * p;
+                            let mut eta_dir = 0.0_f64;
+                            for i in 0..p {
+                                eta_dir += design[[row, i]] * direction[base + i];
+                            }
+                            d_eta[a] = eta_dir;
+                            s += probs_full[[row, a]] * eta_dir;
+                        }
+                        for a in 0..m {
+                            dp[a] = probs_full[[row, a]] * (d_eta[a] - s);
+                        }
+
+                        let dir_base = dir_idx * dim * dim;
+                        for a in 0..m {
+                            let pa = probs_full[[row, a]];
+                            let row_a = a * p;
+                            let jaa = w * (dp[a] - 2.0 * dp[a] * pa);
+                            if jaa != 0.0 {
+                                for i in 0..p {
+                                    let xi = design[[row, i]];
+                                    if xi == 0.0 {
+                                        continue;
+                                    }
+                                    let scaled = jaa * xi;
+                                    let out_row = dir_base + (row_a + i) * dim;
+                                    for j in 0..p {
+                                        acc[out_row + row_a + j] += scaled * design[[row, j]];
+                                    }
+                                }
+                            }
+                            for b in (a + 1)..m {
+                                let pb = probs_full[[row, b]];
+                                let jab = w * (-(dp[a] * pb + pa * dp[b]));
+                                if jab == 0.0 {
+                                    continue;
+                                }
+                                let row_b = b * p;
+                                for i in 0..p {
+                                    let xi = design[[row, i]];
+                                    if xi == 0.0 {
+                                        continue;
+                                    }
+                                    let scaled = jab * xi;
+                                    let out_a = dir_base + (row_a + i) * dim;
+                                    let out_b = dir_base + (row_b + i) * dim;
+                                    for j in 0..p {
+                                        let xj = design[[row, j]];
+                                        let value = scaled * xj;
+                                        acc[out_a + row_b + j] += value;
+                                        acc[out_b + row_a + j] += value;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0_f64; n_dirs * dim * dim],
+                |mut a, b| {
+                    for (av, bv) in a.iter_mut().zip(b.iter()) {
+                        *av += *bv;
+                    }
+                    a
+                },
+            );
+
+        let mut out = Vec::with_capacity(n_dirs);
+        for dir_idx in 0..n_dirs {
+            let start = dir_idx * dim * dim;
+            let mut mat =
+                Array2::<f64>::from_shape_vec((dim, dim), flat[start..start + dim * dim].to_vec())
+                    .expect("batched direction derivative buffer is dim·dim");
+            for i in 0..dim {
+                for j in (i + 1)..dim {
+                    let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
+                    mat[[i, j]] = avg;
+                    mat[[j, i]] = avg;
+                }
+            }
+            out.push(mat);
+        }
+        Ok(out)
+    }
+
+    fn assemble_directional_derivatives(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        directions: &[Array1<f64>],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let probs = self.row_probabilities(eta);
+        self.assemble_directional_derivatives_from_probs(probs.view(), directions)
     }
 
     /// Second directional derivative kernel `D²_β H[d_u, d_v]`. Built by
@@ -1560,6 +1703,20 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
             .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
     }
 
+    fn directional_derivative_operators(
+        &self,
+        d_beta_flats: &[Array1<f64>],
+    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        self.family
+            .assemble_directional_derivatives_from_probs(self.probs.view(), d_beta_flats)?
+            .into_iter()
+            .map(|matrix| {
+                Some(Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>)
+            })
+            .map(Ok)
+            .collect()
+    }
+
     fn second_directional_derivative(
         &self,
         d_beta_u: &Array1<f64>,
@@ -1906,6 +2063,88 @@ mod tests {
                     assert!(
                         (a - b).abs() <= 1e-10 * (1.0 + b.abs()),
                         "axis {axis} entry ({r},{c}): batched {a} != per-axis {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_general_directional_derivatives_match_per_direction() {
+        // The penguin #1082 timeout spends each exact outer-gradient eval
+        // rebuilding `D_beta H[delta_j]` for many non-canonical mode-response
+        // directions. The workspace batch must preserve the old per-direction
+        // arithmetic while sharing the row/probability sweep.
+        let family = toy_family(11, 4, 3);
+        let p = family.design.ncols();
+        let m = family.active_classes();
+        let n = family.weights.len();
+        let dim = m * p;
+        let design = family.design.view();
+        let block_states: Vec<ParameterBlockState> = (0..m)
+            .map(|a| {
+                let beta = Array1::<f64>::from_shape_fn(p, |i| {
+                    0.18 * ((a + 2) as f64) + 0.09 * ((i + 1) as f64).sin()
+                });
+                let eta = Array1::<f64>::from_shape_fn(n, |row| {
+                    (0..p).map(|i| design[[row, i]] * beta[i]).sum()
+                });
+                ParameterBlockState { beta, eta }
+            })
+            .collect();
+        let eta = family
+            .collect_eta_matrix(&block_states)
+            .expect("eta collection must succeed");
+        let directions: Vec<Array1<f64>> = (0..5)
+            .map(|seed| {
+                Array1::<f64>::from_shape_fn(dim, |idx| {
+                    0.31 * ((seed + 1 + idx) as f64).sin()
+                        - 0.07 * ((seed * 3 + idx + 2) as f64).cos()
+                })
+            })
+            .collect();
+
+        let batched = family
+            .assemble_directional_derivatives(eta.view(), &directions)
+            .expect("batched first directional derivatives must succeed");
+        assert_eq!(batched.len(), directions.len());
+        for (dir_idx, direction) in directions.iter().enumerate() {
+            let per_direction = family
+                .exact_newton_joint_hessian_directional_derivative(&block_states, direction)
+                .expect("per-direction derivative must succeed")
+                .expect("per-direction derivative must be present");
+            for r in 0..dim {
+                for c in 0..dim {
+                    let a = batched[dir_idx][[r, c]];
+                    let b = per_direction[[r, c]];
+                    assert!(
+                        (a - b).abs() <= 1e-10 * (1.0 + b.abs()),
+                        "direction {dir_idx} entry ({r},{c}): batched {a} != per-direction {b}"
+                    );
+                }
+            }
+        }
+
+        let specs = family.build_block_specs();
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&block_states, &specs)
+            .expect("workspace build must succeed")
+            .expect("workspace must be present");
+        let operators = workspace
+            .directional_derivative_operators(&directions)
+            .expect("workspace batched operators must succeed");
+        assert_eq!(operators.len(), directions.len());
+        for (dir_idx, maybe_operator) in operators.into_iter().enumerate() {
+            let dense = maybe_operator
+                .expect("workspace must return a derivative operator")
+                .to_dense();
+            for r in 0..dim {
+                for c in 0..dim {
+                    let a = dense[[r, c]];
+                    let b = batched[dir_idx][[r, c]];
+                    assert!(
+                        (a - b).abs() <= 1e-12 * (1.0 + b.abs()),
+                        "operator direction {dir_idx} entry ({r},{c}): {a} != {b}"
                     );
                 }
             }
