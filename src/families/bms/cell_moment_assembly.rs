@@ -3738,8 +3738,9 @@ mod empirical_flex_jet_oracle_tests {
         let q0 = 0.2_f64;
         let b0 = 0.35_f64;
         let q = fx.primary.q;
+        let b = fx.primary.logslope;
         let dev_range = fx.primary.w.clone().unwrap();
-        for scale in [0.1_f64, 0.25, 0.5, 1.0] {
+        for scale in [0.1_f64, 0.2, 0.3, 0.4, 0.5, 1.0] {
             let mut fxs = make_fixture(false);
             fxs.beta_dev = fx.beta_dev.mapv(|v| v * scale);
             let mut p0 = vec![0.0; r];
@@ -3748,13 +3749,18 @@ mod empirical_flex_jet_oracle_tests {
             for (k, i) in dev_range.clone().enumerate() {
                 p0[i] = fxs.beta_dev[k];
             }
-            let prod = prod_flex_coeff(&fxs, &p0, &[q, q]);
-            let wit_coarse = central_along(&fxs, &p0, &[(q, 2)], 2e-3);
-            let wit_fine = central_along(&fxs, &p0, &[(q, 2)], 5e-4);
             let max_beta = fxs.beta_dev.iter().cloned().fold(0.0_f64, |m, v| m.max(v.abs()));
+            // H[q,q] and the q×b cross — the two blocks that have tripped the
+            // unsound secant-calibration witness.
+            let pqq = prod_flex_coeff(&fxs, &p0, &[q, q]);
+            let wqq_c = central_along(&fxs, &p0, &[(q, 2)], 2e-3);
+            let wqq_f = central_along(&fxs, &p0, &[(q, 2)], 5e-4);
+            let pqb = prod_flex_coeff(&fxs, &p0, &[q, b]);
+            let wqb_c = central_along(&fxs, &p0, &[(q, 1), (b, 1)], 2e-3);
+            let wqb_f = central_along(&fxs, &p0, &[(q, 1), (b, 1)], 5e-4);
             eprintln!(
-                "scale={scale:.2} max|beta|={max_beta:.3}: prod H[q,q]={prod:+.6e} wit(h=2e-3)={wit_coarse:+.6e} wit(h=5e-4)={wit_fine:+.6e} (witness h-stable? gap={:.2e})",
-                (wit_coarse - wit_fine).abs()
+                "scale={scale:.2} max|beta|={max_beta:.3}: H[q,q] prod={pqq:+.5e} wc={wqq_c:+.5e} wf={wqq_f:+.5e} (hgap {:.1e}) | H[q,b] prod={pqb:+.5e} wc={wqb_c:+.5e} wf={wqb_f:+.5e} (hgap {:.1e})",
+                (wqq_c - wqq_f).abs(), (wqb_c - wqb_f).abs()
             );
         }
     }
