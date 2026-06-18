@@ -3108,5 +3108,36 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         result.penalties_cross_provider = Some(cross_provider);
     }
 
+    if dim > 1 && !result.penalties_first.is_empty() {
+        let scalar_bundle =
+            build_matern_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
+        let scalar_first = scalar_bundle.first.penalties_derivative;
+        if scalar_first.len() != result.penalties_first[0].len() {
+            return Err(BasisError::InvalidInput(format!(
+                "Matérn aniso raw-psi penalty derivative block mismatch: scalar={}, axis={}",
+                scalar_first.len(),
+                result.penalties_first[0].len()
+            )));
+        }
+        let inv_dim = 1.0 / dim as f64;
+        for block in 0..scalar_first.len() {
+            let mut eta_mean = Array2::<f64>::zeros(scalar_first[block].raw_dim());
+            for axis in 0..dim {
+                if result.penalties_first[axis][block].raw_dim() != scalar_first[block].raw_dim() {
+                    return Err(BasisError::InvalidInput(format!(
+                        "Matérn aniso raw-psi penalty derivative shape mismatch on axis {axis}, block {block}"
+                    )));
+                }
+                eta_mean += &result.penalties_first[axis][block];
+            }
+            eta_mean.mapv_inplace(|value| value * inv_dim);
+            let scalar_share = scalar_first[block].mapv(|value| value * inv_dim);
+            for axis in 0..dim {
+                result.penalties_first[axis][block] =
+                    &result.penalties_first[axis][block] - &eta_mean + &scalar_share;
+            }
+        }
+    }
+
     Ok(result)
 }
