@@ -6,6 +6,24 @@
 
 use super::*;
 
+#[inline]
+fn eval_poly_slice(coefficients: &[f64], z: f64) -> f64 {
+    let mut acc = 0.0;
+    for &coefficient in coefficients.iter().rev() {
+        acc = acc * z + coefficient;
+    }
+    acc
+}
+
+#[inline]
+fn eval_poly_derivative_slice(coefficients: &[f64], z: f64) -> f64 {
+    let mut acc = 0.0;
+    for (power, &coefficient) in coefficients.iter().enumerate().skip(1).rev() {
+        acc = acc * z + (power as f64) * coefficient;
+    }
+    acc
+}
+
 impl SurvivalMarginalSlopeFamily {
     /// Compute directional extensions of a timepoint's exact quantities.
     /// Given the base `SurvivalFlexTimepointExact`, returns the directional
@@ -1252,6 +1270,70 @@ impl SurvivalMarginalSlopeFamily {
                                 &i_base_dir,
                                 &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &i_base),
                             );
+                            let d_u_integrand_u = poly_sub(
+                                &chi_u_poly[u],
+                                &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
+                            );
+                            let d_u_integrand_v = poly_sub(
+                                &chi_u_poly[v],
+                                &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[v]),
+                            );
+                            let d_u_integrand_dir_u = {
+                                let integrand_dir = poly_sub(
+                                    &poly_sub(
+                                        &poly_sub(
+                                            &chi_u_dir_poly_u,
+                                            &poly_mul(
+                                                &poly_mul(&chi_dir_poly, &eta_poly),
+                                                &eta_u_poly[u],
+                                            ),
+                                        ),
+                                        &poly_mul(
+                                            &poly_mul(&chi_poly, &eta_dir_poly),
+                                            &eta_u_poly[u],
+                                        ),
+                                    ),
+                                    &poly_mul(
+                                        &poly_mul(&chi_poly, &eta_poly),
+                                        &eta_u_dir_poly_u,
+                                    ),
+                                );
+                                poly_sub(
+                                    &integrand_dir,
+                                    &poly_mul(
+                                        &poly_mul(&eta_poly, &eta_dir_poly),
+                                        &d_u_integrand_u,
+                                    ),
+                                )
+                            };
+                            let d_u_integrand_dir_v = {
+                                let integrand_dir = poly_sub(
+                                    &poly_sub(
+                                        &poly_sub(
+                                            &chi_u_dir_poly_v,
+                                            &poly_mul(
+                                                &poly_mul(&chi_dir_poly, &eta_poly),
+                                                &eta_u_poly[v],
+                                            ),
+                                        ),
+                                        &poly_mul(
+                                            &poly_mul(&chi_poly, &eta_dir_poly),
+                                            &eta_u_poly[v],
+                                        ),
+                                    ),
+                                    &poly_mul(
+                                        &poly_mul(&chi_poly, &eta_poly),
+                                        &eta_u_dir_poly_v,
+                                    ),
+                                );
+                                poly_sub(
+                                    &integrand_dir,
+                                    &poly_mul(
+                                        &poly_mul(&eta_poly, &eta_dir_poly),
+                                        &d_u_integrand_v,
+                                    ),
+                                )
+                            };
 
                             let value = exact_kernel::cell_polynomial_integral_from_moments(
                                 &full_integrand,
@@ -1301,6 +1383,59 @@ impl SurvivalMarginalSlopeFamily {
                                         crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                                     }
                                 };
+                                let edge_axis = |axis: usize, edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> (f64, f64, f64) {
+                                    match edge {
+                                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                            let z_dir = -(a_dir + z * dir_g) / b;
+                                            let axis_g = if axis == primary.g { 1.0 } else { 0.0 };
+                                            let z_axis = -(a_u[axis] + z * axis_g) / b;
+                                            let z_axis_dir =
+                                                -(a_u_dir[axis] + z_dir * axis_g + z_axis * dir_g) / b;
+                                            (z_axis, z_axis_dir, z_dir)
+                                        }
+                                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
+                                            (0.0, 0.0, 0.0)
+                                        }
+                                    }
+                                };
+                                let density_z_derivative = |poly: &[f64], z: f64| -> f64 {
+                                    let eta = cell.eta(z);
+                                    let eta_z =
+                                        cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+                                    let amp = eval_poly_slice(poly, z);
+                                    let amp_z = eval_poly_derivative_slice(poly, z);
+                                    let q_z = z + eta * eta_z;
+                                    (amp_z - amp * q_z) * (-cell.q(z)).exp()
+                                        / std::f64::consts::TAU
+                                };
+                                let base_flux_dir = |axis: usize,
+                                                     poly: &[f64],
+                                                     poly_dir: &[f64],
+                                                     edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                                     z: f64|
+                                 -> f64 {
+                                    let (z_axis, z_axis_dir, z_dir) = edge_axis(axis, edge, z);
+                                    if z_axis == 0.0 && z_axis_dir == 0.0 && z_dir == 0.0 {
+                                        return 0.0;
+                                    }
+                                    z_axis_dir
+                                        * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                            cell, poly, z,
+                                        )
+                                        + z_axis
+                                            * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                                cell, poly_dir, z,
+                                            )
+                                        + z_axis * z_dir * density_z_derivative(poly, z)
+                                };
+                                let base_boundary_dir = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                                    let uv = base_flux_dir(v, &d_u_integrand_u, &d_u_integrand_dir_u, edge, z);
+                                    if u == v {
+                                        uv
+                                    } else {
+                                        uv + base_flux_dir(u, &d_u_integrand_v, &d_u_integrand_dir_v, edge, z)
+                                    }
+                                };
                                 let v_r = edge_vel(part.right_edge, cell.right);
                                 let v_l = edge_vel(part.left_edge, cell.left);
                                 if v_r != 0.0 {
@@ -1315,6 +1450,8 @@ impl SurvivalMarginalSlopeFamily {
                                             cell, &i_base, cell.left,
                                         );
                                 }
+                                d_uv_dir[[u, v]] += base_boundary_dir(part.right_edge, cell.right);
+                                d_uv_dir[[u, v]] -= base_boundary_dir(part.left_edge, cell.left);
                             }
                             d_uv_dir[[v, u]] = d_uv_dir[[u, v]];
                         }
