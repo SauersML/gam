@@ -346,7 +346,7 @@ impl CostStallGuard {
     /// Returns `Continue` until the infeasible streak fills the window; never
     /// fires before any finite iterate has been recorded (there would be nothing
     /// to halt back to).
-    fn observe_infeasible(&mut self, rho: &Array1<f64>) -> CostStallVerdict {
+    pub(crate) fn observe_infeasible(&mut self, rho: &Array1<f64>) -> CostStallVerdict {
         if self.best_rho.is_none() || !self.best_value.is_finite() {
             // No feasible iterate recorded yet: an infeasible run this early is
             // the inner solver's startup problem, not a converged stall. Keep
