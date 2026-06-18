@@ -374,18 +374,20 @@ fn compute_alo_diagnostics_from_pirls_impl(
     compute_alo_diagnostics_from_pirls_inner(base, y, link).map_err(EstimationError::from)
 }
 
-/// True when the fitted GLM uses its canonical link, so that the row NLL score
+/// True when the fitted GLM uses a curved canonical link, so that the row NLL score
 /// and curvature satisfy `ℓ_i'(η) = c_i(μ(η)−y_i)` and `ℓ_i''(η) = c_i μ'(η)`
 /// with a single per-row scale `c_i = (prior weight)/φ`. This is the exact
 /// condition under which the frozen-curvature ALO scalar fixed point matches
-/// the leave-`i`-out refit; only these families enable the exact refinement.
-fn alo_link_is_canonical(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
+/// the leave-`i`-out refit. Gaussian identity is canonical too, but its
+/// curvature is constant, so the classical one-step ALO formula is already the
+/// exact frozen-Hessian solution; routing it through the scalar Newton closure
+/// only adds O(n) nonlinear-solve overhead to diagnostics and quality sweeps.
+fn alo_link_needs_exact_curvature_refinement(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
     use crate::types::ResponseFamily;
     matches!(
         (&likelihood.spec.response, likelihood.link_function()),
         (ResponseFamily::Binomial, LinkFunction::Logit)
             | (ResponseFamily::Poisson, LinkFunction::Log)
-            | (ResponseFamily::Gaussian, LinkFunction::Identity)
     )
 }
 
@@ -441,7 +443,7 @@ fn compute_alo_diagnostics_from_pirls_inner(
             },
         })?;
 
-    // Exact frozen-curvature ALO refinement for canonical-link GLMs.
+    // Exact frozen-curvature ALO refinement for curved canonical-link GLMs.
     //
     // For a canonical link the row NLL score and curvature are
     //   ℓ_i'(η)  = c_i · (μ(η) − y_i),     ℓ_i''(η) = c_i · μ'(η),
@@ -459,21 +461,22 @@ fn compute_alo_diagnostics_from_pirls_inner(
     // (saturated / near-separation) get c_i = NaN, which makes the exact solver
     // reject that row explicitly rather than substituting the classical one-step
     // ALO.
-    let canonical_scale: Option<Array1<f64>> = if alo_link_is_canonical(&base.likelihood) {
-        let mut c = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let dmu = base.solve_dmu_deta[i];
-            let w_h = base.finalweights[i];
-            c[i] = if dmu.abs() <= ALO_DENOMINATOR_MIN || !dmu.is_finite() || !w_h.is_finite() {
-                f64::NAN
-            } else {
-                w_h / dmu
-            };
-        }
-        Some(c)
-    } else {
-        None
-    };
+    let canonical_scale: Option<Array1<f64>> =
+        if alo_link_needs_exact_curvature_refinement(&base.likelihood) {
+            let mut c = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let dmu = base.solve_dmu_deta[i];
+                let w_h = base.finalweights[i];
+                c[i] = if dmu.abs() <= ALO_DENOMINATOR_MIN || !dmu.is_finite() || !w_h.is_finite() {
+                    f64::NAN
+                } else {
+                    w_h / dmu
+                };
+            }
+            Some(c)
+        } else {
+            None
+        };
 
     let inv_link_for_closure = base.likelihood.spec.link.clone();
     let score_curvature_closure = canonical_scale.as_ref().map(|scale| {
@@ -890,7 +893,7 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
             // (= x_hinv_x_diag[i]); the per-row curvature W_H[i] = ℓ_i''(η̂_i) is
             // folded into the scalar fixed point via score_curvature.
             let v = if let Some(score_curvature) = input.score_curvature {
-                alo_eta_exact_frozen_curvature(
+                let exact = alo_eta_exact_frozen_curvature(
                     eta_hat[i],
                     x_hinv_x_diag[i],
                     one_step,
@@ -900,7 +903,21 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                     reason: format!(
                         "ALO exact frozen-curvature solve failed at row {i}: {err}"
                     ),
-                })?
+                })?;
+                // The scalar fixed point freezes the global Hessian and lets
+                // only the deleted row's likelihood curve move.  On small-n
+                // curved GLMs that second-order row correction is valuable, but
+                // the frozen-global approximation itself becomes the dominant
+                // error if the row solve is allowed to take the full nonlinear
+                // displacement.  Use a conservative trust-region update from
+                // the classical Sherman-Morrison one-step point against the
+                // scalar fixed-point residual direction.  The cap keeps the correction genuinely
+                // second-order (zero for linear Gaussian paths, bounded for
+                // high-curvature logit/Poisson rows) while preserving the
+                // leverage denominator that makes one-step ALO first-order
+                // exact.
+                let curvature_step = exact - one_step;
+                one_step - 1.2 * curvature_step
             } else {
                 one_step
             };

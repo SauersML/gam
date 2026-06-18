@@ -274,6 +274,13 @@ fn validate_input(input: &RieszInput<'_>) -> Result<(), EstimationError> {
                 leverage.len()
             );
         }
+        for (row_idx, &h_ii) in leverage.iter().enumerate() {
+            if !(0.0..1.0).contains(&h_ii) {
+                crate::bail_invalid_estim!(
+                    "Riesz leverage must lie in [0, 1) for own-observation removal; row {row_idx} has {h_ii}"
+                );
+            }
+        }
     }
     if input.beta.iter().any(|value| !value.is_finite())
         || input
@@ -319,7 +326,7 @@ fn influence_values(
             None => raw,
             Some(leverage) => {
                 let denom = 1.0 - leverage[row_idx];
-                if !denom.is_finite() || denom.abs() <= f64::EPSILON {
+                if !denom.is_finite() || denom <= f64::EPSILON {
                     crate::bail_invalid_estim!(
                         "Riesz own-observation removal is singular at row {row_idx}: leverage={}",
                         leverage[row_idx]
