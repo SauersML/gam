@@ -171,8 +171,10 @@ pub struct PsiGramTensor {
     /// Number of Chebyshev coefficients (degree + 1).
     n_coeff: usize,
     k: usize,
-    /// `gram[d * n_coeff + e]` = `X_dᵀ W X_e` (k×k); symmetric in (d, e) up to
-    /// transpose: `gram[d][e] == gram[e][d]ᵀ`.
+    /// Chebyshev coefficients of `X(ψ)ᵀ W X(ψ)` obtained from the expanded
+    /// products `X_dᵀ W X_e` via `T_d T_e = (T_{d+e}+T_|d-e|)/2`. Collapsing to a
+    /// single series keeps the product expansion but avoids per-trial
+    /// cancellation from evaluating `Σ T_d T_e G_de` directly.
     gram: Vec<Array2<f64>>,
     /// `rhs[d]` = `X_dᵀ W z` (the caller's fixed weighted response/offset).
     rhs: Vec<Array1<f64>>,
@@ -399,20 +401,31 @@ impl PsiGramTensor {
             }
             weighted.push(ws);
         }
-        let mut gram: Vec<Array2<f64>> = Vec::with_capacity(m * m);
+        let mut gram_products: Vec<Array2<f64>> = Vec::with_capacity(m * m);
         let mut rhs = Vec::with_capacity(m);
         for d in 0..m {
             for e in 0..m {
                 if e < d {
                     // Symmetry: G̃[d][e] = G̃[e][d]ᵀ — reuse, don't recompute.
-                    let g: Array2<f64> = gram[e * m + d].t().to_owned();
-                    gram.push(g);
+                    let g: Array2<f64> = gram_products[e * m + d].t().to_owned();
+                    gram_products.push(g);
                 } else {
-                    gram.push(coeff_slabs[d].t().dot(&weighted[e]));
+                    gram_products.push(coeff_slabs[d].t().dot(&weighted[e]));
                 }
             }
             rhs.push(coeff_slabs[d].t().dot(&wz));
         }
+        let mut gram: Vec<Array2<f64>> = (0..(2 * m - 1))
+            .map(|_| Array2::<f64>::zeros((k, k)))
+            .collect();
+        for d in 0..m {
+            for e in 0..m {
+                let product = &gram_products[d * m + e];
+                gram[d + e].scaled_add(0.5, product);
+                gram[d.abs_diff(e)].scaled_add(0.5, product);
+            }
+        }
+        drop(gram_products);
         drop(designs);
         drop(coeff_slabs);
         BuildOutcome::Candidate(Self {
@@ -732,15 +745,13 @@ impl PsiGramTensor {
         (2.0 * psi - (self.psi_lo + self.psi_hi)) / (self.psi_hi - self.psi_lo)
     }
 
-    /// `XᵀWX(ψ)` assembled n-free in O(D²k²).
+    /// `XᵀWX(ψ)` assembled n-free in O(Dk²) from the collapsed product series.
     pub fn gram_at(&self, psi: f64) -> Array2<f64> {
         let x = self.mapped(psi);
-        let t = cheb_t(x, self.n_coeff);
+        let t = cheb_t(x, self.gram.len());
         let mut out = Array2::<f64>::zeros((self.k, self.k));
-        for d in 0..self.n_coeff {
-            for e in 0..self.n_coeff {
-                out.scaled_add(t[d] * t[e], &self.gram[d * self.n_coeff + e]);
-            }
+        for (d, td) in t.iter().enumerate() {
+            out.scaled_add(*td, &self.gram[d]);
         }
         out
     }
@@ -758,20 +769,14 @@ impl PsiGramTensor {
 
     /// Exact `∂(XᵀWX)/∂ψ` from the SAME representation as the value — the
     /// structural cure for the objective↔gradient desync class on this
-    /// channel. n-free, O(D²k²).
+    /// channel. n-free, O(Dk²) from the collapsed product series.
     pub fn dgram_dpsi(&self, psi: f64) -> Array2<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
-        let t = cheb_t(x, self.n_coeff);
-        let tp = cheb_t_prime(x, self.n_coeff);
+        let tp = cheb_t_prime(x, self.gram.len());
         let mut out = Array2::<f64>::zeros((self.k, self.k));
-        for d in 0..self.n_coeff {
-            for e in 0..self.n_coeff {
-                out.scaled_add(
-                    (tp[d] * t[e] + t[d] * tp[e]) * dx_dpsi,
-                    &self.gram[d * self.n_coeff + e],
-                );
-            }
+        for (d, tpd) in tp.iter().enumerate() {
+            out.scaled_add(*tpd * dx_dpsi, &self.gram[d]);
         }
         out
     }
@@ -791,24 +796,19 @@ impl PsiGramTensor {
     /// Exact `∂²(XᵀWX)/∂ψ²` from the SAME representation as the value/gradient —
     /// the n-free curvature that lets the outer Newton/ARC step read the τ-τ
     /// Hessian's design-moving block without re-streaming an O(n) slab Gram
-    /// (#1033, Gaussian-identity single-ψ Hessian channel). O(D²k²).
+    /// (#1033, Gaussian-identity single-ψ Hessian channel). O(Dk²) from the
+    /// collapsed product series.
     ///
-    /// `XᵀWX(ψ) = Σ_{d,e} T_d(x) T_e(x) G_{de}` with `x = mapped(ψ)`, so by the
-    /// product rule in `x` (then chain rule `(dx/dψ)²`):
-    ///   `∂²/∂x² = T_d″ T_e + 2 T_d′ T_e′ + T_d T_e″`.
+    /// `XᵀWX(ψ) = Σ_d T_d(x) G_d` with `x = mapped(ψ)`, so by the chain rule
+    /// `d²/dψ² = T_d″(x) · (dx/dψ)²`.
     pub fn d2gram_dpsi2(&self, psi: f64) -> Array2<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
         let dx_dpsi_sq = dx_dpsi * dx_dpsi;
-        let t = cheb_t(x, self.n_coeff);
-        let tp = cheb_t_prime(x, self.n_coeff);
-        let tpp = cheb_t_double_prime(x, self.n_coeff);
+        let tpp = cheb_t_double_prime(x, self.gram.len());
         let mut out = Array2::<f64>::zeros((self.k, self.k));
-        for d in 0..self.n_coeff {
-            for e in 0..self.n_coeff {
-                let coef = (tpp[d] * t[e] + 2.0 * tp[d] * tp[e] + t[d] * tpp[e]) * dx_dpsi_sq;
-                out.scaled_add(coef, &self.gram[d * self.n_coeff + e]);
-            }
+        for (d, tppd) in tpp.iter().enumerate() {
+            out.scaled_add(*tppd * dx_dpsi_sq, &self.gram[d]);
         }
         out
     }
