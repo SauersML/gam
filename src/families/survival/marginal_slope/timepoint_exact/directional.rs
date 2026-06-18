@@ -946,33 +946,51 @@ impl SurvivalMarginalSlopeFamily {
                                     cu_dir_fixed_v[k] += sca_v[k] * dir[c];
                                 }
                             }
+                            // TOTAL D_dir(eta_u[·]) / D_dir(chi_u[·]) — including
+                            // the β_w cross + intercept a-chain (chi_dir_poly·a_u
+                            // / eta_aa_dir_poly·a_u and a_dir·coeff_au /
+                            // a_dir·coeff_aau) that the partial form dropped, the
+                            // same fix that closed d_u_dir at the deviation index
+                            // (gam#932/#979).
                             let eta_u_dir_poly_u = poly_add(
                                 &poly_add(
-                                    &poly_scale(&chi_poly, a_u_dir[u]),
-                                    &poly_scale(&eta_aa_poly, a_u[u] * a_dir),
+                                    &poly_add(
+                                        &poly_scale(&chi_poly, a_u_dir[u]),
+                                        &poly_scale(&chi_dir_poly, a_u[u]),
+                                    ),
+                                    &eu_dir_fixed_u,
                                 ),
-                                &eu_dir_fixed_u,
+                                &poly_scale(fixed.coeff_au[u].as_ref(), a_dir),
                             );
                             let eta_u_dir_poly_v = poly_add(
                                 &poly_add(
-                                    &poly_scale(&chi_poly, a_u_dir[v]),
-                                    &poly_scale(&eta_aa_poly, a_u[v] * a_dir),
+                                    &poly_add(
+                                        &poly_scale(&chi_poly, a_u_dir[v]),
+                                        &poly_scale(&chi_dir_poly, a_u[v]),
+                                    ),
+                                    &eu_dir_fixed_v,
                                 ),
-                                &eu_dir_fixed_v,
+                                &poly_scale(fixed.coeff_au[v].as_ref(), a_dir),
                             );
                             let chi_u_dir_poly_u = poly_add(
                                 &poly_add(
-                                    &poly_scale(&eta_aa_poly, a_u_dir[u]),
-                                    &poly_scale(&eta_aaa_poly, a_u[u] * a_dir),
+                                    &poly_add(
+                                        &poly_scale(&eta_aa_poly, a_u_dir[u]),
+                                        &poly_scale(&eta_aa_dir_poly, a_u[u]),
+                                    ),
+                                    &cu_dir_fixed_u,
                                 ),
-                                &cu_dir_fixed_u,
+                                &poly_scale(fixed.coeff_aau[u].as_ref(), a_dir),
                             );
                             let chi_u_dir_poly_v = poly_add(
                                 &poly_add(
-                                    &poly_scale(&eta_aa_poly, a_u_dir[v]),
-                                    &poly_scale(&eta_aaa_poly, a_u[v] * a_dir),
+                                    &poly_add(
+                                        &poly_scale(&eta_aa_poly, a_u_dir[v]),
+                                        &poly_scale(&eta_aa_dir_poly, a_u[v]),
+                                    ),
+                                    &cu_dir_fixed_v,
                                 ),
-                                &cu_dir_fixed_v,
+                                &poly_scale(fixed.coeff_aau[v].as_ref(), a_dir),
                             );
                             // eta_uv_dir_poly = D_dir(eta_uv_poly), the FULL third
                             // mixed-with-direction partial of the cell index.
@@ -1304,6 +1322,35 @@ impl SurvivalMarginalSlopeFamily {
                                 dbg_terms[9] += ig(&t5_dir) - corr(&t5);
                             }
                             d_uv_dir[[u, v]] += value;
+                            // Moving-domain (Leibniz) boundary flux for the
+                            // density second-derivative integral: same
+                            // crossing-edge velocity as d_u_dir, with the d_uv
+                            // integrand `i_base` (gam#932/#979).
+                            if b != 0.0 {
+                                let part = &cell_entry.partition_cell;
+                                let edge_vel = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                                    match edge {
+                                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                            -(a_dir + z * dir_g) / b
+                                        }
+                                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                                    }
+                                };
+                                let v_r = edge_vel(part.right_edge, cell.right);
+                                let v_l = edge_vel(part.left_edge, cell.left);
+                                if v_r != 0.0 {
+                                    d_uv_dir[[u, v]] += v_r
+                                        * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                            cell, &i_base, cell.right,
+                                        );
+                                }
+                                if v_l != 0.0 {
+                                    d_uv_dir[[u, v]] -= v_l
+                                        * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                            cell, &i_base, cell.left,
+                                        );
+                                }
+                            }
                             d_uv_dir[[v, u]] = d_uv_dir[[u, v]];
                         }
                     }
