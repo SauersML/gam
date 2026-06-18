@@ -198,6 +198,71 @@ fn poisson_level_diagnostic(
     let eta_hand = xdense.dot(&b);
     let mu_hand: Array1<f64> = eta_hand.mapv(f64::exp);
     let rate_true_arr = Array1::from(rate_true.to_vec());
+
+    // --- (3b) DESIGN-SPAN PROBE: can the materialized design even represent the
+    // truth? OLS of the TRUE log-rate onto xdense (no family, no penalty, no
+    // weights). If the relative residual is large, the te-periodic basis simply
+    // does NOT span eta_true = 1.5 + 0.4 cos(theta) + 0.2 h, which is a pure
+    // design/basis bug, fully decoupled from IRLS/weights/family/penalty.
+    let log_rate_true: Array1<f64> = rate_true_arr.mapv(f64::ln);
+    {
+        let mut gram = Array2::<f64>::zeros((p, p));
+        let mut xty = Array1::<f64>::zeros(p);
+        for i in 0..nn {
+            let row = xdense.row(i);
+            let ti = log_rate_true[i];
+            for a in 0..p {
+                let xa = row[a];
+                xty[a] += xa * ti;
+                for c in a..p {
+                    gram[[a, c]] += xa * row[c];
+                }
+            }
+        }
+        for a in 0..p {
+            gram[[a, a]] += 1e-10;
+            for c in (a + 1)..p {
+                gram[[c, a]] = gram[[a, c]];
+            }
+        }
+        let bls = solve_spd(&gram, &xty).unwrap_or_else(|| Array1::<f64>::zeros(p));
+        let fit_ls = xdense.dot(&bls);
+        let resid = (&fit_ls - &log_rate_true).mapv(|v| v * v).sum();
+        let tss = log_rate_true
+            .mapv(|v| {
+                let m = log_rate_true.sum() / nn as f64;
+                (v - m) * (v - m)
+            })
+            .sum();
+        eprintln!(
+            "  (3b) DESIGN-SPAN OLS(log_rate_true ~ xdense): SSE={:.4e} TSS={:.4e} rel_resid={:.4e} (≈0 ⇒ basis SPANS truth ⇒ bug is NOT basis)",
+            resid,
+            tss,
+            resid / tss.max(1e-30)
+        );
+        // Also report how much of the FIRST HARMONIC cos(theta) the design can
+        // represent: OLS of cos(theta_rows) onto xdense.
+        let cos_t: Array1<f64> = train_rows.column(0).mapv(f64::cos);
+        let mut xtc = Array1::<f64>::zeros(p);
+        for i in 0..nn {
+            let row = xdense.row(i);
+            let ci = cos_t[i];
+            for a in 0..p {
+                xtc[a] += row[a] * ci;
+            }
+        }
+        let bc = solve_spd(&gram, &xtc).unwrap_or_else(|| Array1::<f64>::zeros(p));
+        let fit_c = xdense.dot(&bc);
+        let resid_c = (&fit_c - &cos_t).mapv(|v| v * v).sum();
+        let tss_c = {
+            let m = cos_t.sum() / nn as f64;
+            cos_t.mapv(|v| (v - m) * (v - m)).sum()
+        };
+        eprintln!(
+            "       cos(theta) span: rel_resid={:.4e} (≈0 ⇒ design spans the first harmonic)",
+            resid_c / tss_c.max(1e-30)
+        );
+    }
     eprintln!(
         "  (3) UNPENALIZED hand Poisson IRLS on identical design: beta_0={:.5} | Σμ={:.4} (Σy={:.4}) | MSE(rate vs truth)={:.4e}",
         b[0],
