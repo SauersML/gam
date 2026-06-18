@@ -167,7 +167,7 @@ fn harmonic_degree_for_wahba_basis_width(spec: &SphericalSplineBasisSpec, n_rows
     (1..=32)
         .find(|&l| l * (l + 2) >= target)
         .unwrap_or_else(|| default_spherical_harmonic_degree(n_rows))
-        .max(2)
+        .max(8)
 }
 
 fn real_spherical_harmonic_design_up_to_degree(
