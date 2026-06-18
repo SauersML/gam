@@ -610,6 +610,74 @@ pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
     monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
 }
 
+const THIN_PLATE_RADIAL_RETAIN_REL_TOL: f64 = 1.0e-3;
+
+fn thin_plate_retained_radial_indices(evals: &Array1<f64>) -> Vec<usize> {
+    if evals.is_empty() {
+        return Vec::new();
+    }
+    let max_eval = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if !max_eval.is_finite() || max_eval <= 0.0 {
+        return Vec::new();
+    }
+    let tol = max_eval * THIN_PLATE_RADIAL_RETAIN_REL_TOL;
+    evals
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &value)| (value > tol).then_some(idx))
+        .collect()
+}
+
+pub(crate) fn thin_plate_radial_reparam_from_constrained_penalty(
+    omega_constrained: &Array2<f64>,
+) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+    let kernel_cols = omega_constrained.nrows();
+    if kernel_cols != omega_constrained.ncols() {
+        crate::bail_dim_basis!(
+            "thin-plate constrained radial penalty must be square: got {:?}",
+            omega_constrained.dim()
+        );
+    }
+    if kernel_cols == 0 {
+        return Ok((Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0)));
+    }
+    let sym = symmetrize_penalty(omega_constrained);
+    let (mut evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    for value in evals.iter_mut() {
+        if *value < 0.0 {
+            *value = 0.0;
+        }
+    }
+    let keep = thin_plate_retained_radial_indices(&evals);
+    Ok((evecs.select(Axis(1), &keep), evals.select(Axis(0), &keep)))
+}
+
+pub(crate) fn thin_plate_radial_reparam_from_centers(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    kernel_transform: &Array2<f64>,
+) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let mut omega = Array2::<f64>::zeros((k, k));
+    let length_scale_sq = length_scale * length_scale;
+    fill_symmetric_from_row_kernel(&mut omega, |i, j| {
+        let mut dist2 = 0.0;
+        for c in 0..d {
+            let delta = centers[[i, c]] - centers[[j, c]];
+            dist2 += delta * delta;
+        }
+        thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
+    })?;
+    let kernel_gauge =
+        crate::solver::gauge::Gauge::from_block_transforms(&[kernel_transform.clone()]);
+    let omega_constrained = symmetrize_penalty(&kernel_gauge.restrict_penalty(&omega));
+    thin_plate_radial_reparam_from_constrained_penalty(&omega_constrained)
+}
+
 pub(crate) fn kernel_constraint_nullspace_from_matrix(
     constraint_matrix: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
@@ -1079,47 +1147,44 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
         omega_constrained.nrows()
     );
 
-    let kernel_cols = kernel_constrained.ncols();
-    let total_cols = kernel_cols + poly_cols;
+    let constrained_kernel_cols = kernel_constrained.ncols();
 
     // Radial penalty eigenspace reparameterization. Eigendecompose
     // Ω_constrained = V Λ V' and rotate the radial design columns into the
     // same basis. This preserves the TPS model space while making the bending
-    // block diagonal.
+    // block diagonal. Numerically near-null radial directions are not part of
+    // the polynomial null space; keeping them as almost-free columns lets REML
+    // spend EDF on wiggle with effectively zero curvature cost (#1271). Drop
+    // them from the exposed basis so only genuinely penalized radial directions
+    // remain.
     let (radial_reparam, radial_eigvals): (Array2<f64>, Array1<f64>) = if let Some(frozen) =
         frozen_radial_reparam
     {
-        if frozen.nrows() != kernel_cols || frozen.ncols() != kernel_cols {
+        if frozen.nrows() != constrained_kernel_cols {
             crate::bail_dim_basis!(
-                "thin-plate frozen radial reparam shape {:?} does not match radial dimension {}",
+                "thin-plate frozen radial reparam shape {:?} does not match constrained radial dimension {}",
                 frozen.dim(),
-                kernel_cols
+                constrained_kernel_cols
             );
         }
         let v = frozen.to_owned();
         let vt_omega_v = fast_atb(&v, &omega_constrained);
         let lambda_diag = fast_ab(&vt_omega_v, &v);
-        let mut evals = Array1::<f64>::zeros(kernel_cols);
-        for i in 0..kernel_cols {
+        let mut evals = Array1::<f64>::zeros(v.ncols());
+        for i in 0..v.ncols() {
             evals[i] = lambda_diag[[i, i]].max(0.0);
         }
         (v, evals)
-    } else if kernel_cols == 0 {
+    } else if constrained_kernel_cols == 0 {
         (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
     } else {
-        let sym = symmetrize_penalty(&omega_constrained);
-        let (mut evals, evecs) =
-            FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
-        for v in evals.iter_mut() {
-            if *v < 0.0 {
-                *v = 0.0;
-            }
-        }
-        (evecs, evals)
+        thin_plate_radial_reparam_from_constrained_penalty(&omega_constrained)?
     };
+    let kernel_cols = radial_eigvals.len();
+    let total_cols = kernel_cols + poly_cols;
 
     let kernel_rotated = if kernel_cols == 0 {
-        kernel_constrained.clone()
+        Array2::<f64>::zeros((n, 0))
     } else {
         fast_ab(&kernel_constrained, &radial_reparam)
     };
@@ -1130,14 +1195,6 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
         .assign(&kernel_rotated);
     basis.slice_mut(s![.., kernel_cols..]).assign(&poly_block);
 
-    if std::env::var_os("DIAG1271").is_some() {
-        let mut sorted: Vec<f64> = radial_eigvals.iter().copied().collect();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        eprintln!(
-            "[DIAG1271] kernel_cols={kernel_cols} poly_cols={poly_cols} radial_eigvals(desc)={:?}",
-            sorted.iter().map(|v| format!("{v:.3e}")).collect::<Vec<_>>()
-        );
-    }
     let mut penalty_bending = Array2::<f64>::zeros((total_cols, total_cols));
     for i in 0..kernel_cols {
         penalty_bending[[i, i]] = radial_eigvals[i];
@@ -1202,9 +1259,8 @@ pub(crate) fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     // order as the build path so the analytic derivative is of the exact
     // materialized penalty surface.
     let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
-    let kernel_cols = z_kernel.ncols();
+    let constrained_kernel_cols = z_kernel.ncols();
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
-    let total_cols = kernel_cols + poly_cols;
     let k = centers.nrows();
     let d = centers.ncols();
 
@@ -1280,21 +1336,21 @@ pub(crate) fn build_thin_plate_penalty_psi_derivativeswithworkspace(
 
     // 3) Get V (frozen or fresh from eigh).
     let (v, lambda) = if let Some(frozen) = spec.radial_reparam.as_ref() {
-        if frozen.nrows() != kernel_cols || frozen.ncols() != kernel_cols {
+        if frozen.nrows() != constrained_kernel_cols {
             crate::bail_dim_basis!(
-                "thin-plate frozen radial reparam shape {:?} does not match radial dimension {}",
+                "thin-plate frozen radial reparam shape {:?} does not match constrained radial dimension {}",
                 frozen.dim(),
-                kernel_cols
+                constrained_kernel_cols
             );
         }
         let v_owned = frozen.to_owned();
         let lambda_diag = fast_ab(&fast_atb(&v_owned, &m_constrained), &v_owned);
-        let mut evals = Array1::<f64>::zeros(kernel_cols);
-        for i in 0..kernel_cols {
+        let mut evals = Array1::<f64>::zeros(v_owned.ncols());
+        for i in 0..v_owned.ncols() {
             evals[i] = lambda_diag[[i, i]].max(0.0);
         }
         (v_owned, evals)
-    } else if kernel_cols == 0 {
+    } else if constrained_kernel_cols == 0 {
         (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
     } else {
         let (mut evals, evecs) =
@@ -1304,8 +1360,11 @@ pub(crate) fn build_thin_plate_penalty_psi_derivativeswithworkspace(
                 *ev = 0.0;
             }
         }
-        (evecs, evals)
+        let keep = thin_plate_retained_radial_indices(&evals);
+        (evecs.select(Axis(1), &keep), evals.select(Axis(0), &keep))
     };
+    let kernel_cols = lambda.len();
+    let total_cols = kernel_cols + poly_cols;
     let v_is_frozen = spec.radial_reparam.is_some();
 
     // 4) Rotate the constrained-space derivatives into V's basis. These are the
@@ -1416,19 +1475,20 @@ pub(crate) fn build_thin_plate_scalar_design_psi_derivatives(
     workspace: &mut BasisWorkspace,
 ) -> Result<ScalarDesignPsiDerivatives, BasisError> {
     let z_kernel = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
-    let kernel_cols = z_kernel.ncols();
+    let constrained_kernel_cols = z_kernel.ncols();
     let kernel_transform = if let Some(v) = spec.radial_reparam.as_ref() {
-        if v.nrows() != kernel_cols || v.ncols() != kernel_cols {
+        if v.nrows() != constrained_kernel_cols {
             crate::bail_dim_basis!(
-                "thin-plate radial reparam shape {:?} does not match radial dimension {}",
+                "thin-plate radial reparam shape {:?} does not match constrained radial dimension {}",
                 v.dim(),
-                kernel_cols
+                constrained_kernel_cols
             );
         }
         fast_ab(&z_kernel, v)
     } else {
         z_kernel
     };
+    let kernel_cols = kernel_transform.ncols();
     let poly_cols = thin_plate_polynomial_basis_dimension(data.ncols());
     let p_after_pad = kernel_cols + poly_cols;
     let p_final = identifiability_transform

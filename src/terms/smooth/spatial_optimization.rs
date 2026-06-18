@@ -4792,6 +4792,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             BasisMetadata::ThinPlate {
                 centers,
                 identifiability_transform,
+                radial_reparam,
                 ..
             } => {
                 let ls = ls_opt.ok_or_else(|| {
@@ -4804,6 +4805,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 crate::basis::thin_plate_penalties_at_length_scale(
                     centers.view(),
                     identifiability_transform.as_ref(),
+                    radial_reparam.as_ref(),
                     ls,
                     double_penalty,
                     &mut self.basisworkspace,

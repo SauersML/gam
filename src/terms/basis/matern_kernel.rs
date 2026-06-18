@@ -79,7 +79,25 @@ pub fn build_thin_plate_basiswithworkspace(
     let internal_kernel_transform =
         thin_plate_kernel_constraint_nullspace(centers.view(), &mut workspace.cache)?;
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
-    let base_cols = internal_kernel_transform.ncols() + poly_cols;
+    let radial_reparam = if let Some(v) = spec.radial_reparam.as_ref() {
+        if v.nrows() != internal_kernel_transform.ncols() {
+            crate::bail_dim_basis!(
+                "thin-plate radial reparam shape {:?} does not match constrained radial dimension {}",
+                v.dim(),
+                internal_kernel_transform.ncols()
+            );
+        }
+        v.clone()
+    } else {
+        thin_plate_radial_reparam_from_centers(
+            centers.view(),
+            spec.length_scale,
+            &internal_kernel_transform,
+        )?
+        .0
+    };
+    let reduced_kernel_transform = fast_ab(&internal_kernel_transform, &radial_reparam);
+    let base_cols = reduced_kernel_transform.ncols() + poly_cols;
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
     let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols, workspace.policy());
     if use_lazy {
@@ -111,7 +129,7 @@ pub fn build_thin_plate_basiswithworkspace(
             kernel_fn,
             Some(Arc::new(
                 crate::solver::gauge::Gauge::from_block_transforms(&[
-                    internal_kernel_transform.clone()
+                    reduced_kernel_transform.clone()
                 ]),
             )),
             Some(Arc::new(poly_block)),
@@ -121,7 +139,7 @@ pub fn build_thin_plate_basiswithworkspace(
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(base_op)));
         let identifiability_transform = thin_plate_identifiability_transform_from_design_matrix(
             &base_design,
-            internal_kernel_transform.ncols(),
+            reduced_kernel_transform.ncols(),
             poly_cols,
             &spec.identifiability,
         )?;
@@ -133,7 +151,7 @@ pub fn build_thin_plate_basiswithworkspace(
         let (penalty_bending, penalty_ridge) = build_thin_plate_penalty_matrices(
             centers.view(),
             spec.length_scale,
-            &internal_kernel_transform,
+            &reduced_kernel_transform,
             spec.double_penalty,
         )?;
         let (penalty_bending_norm, c_bending) = normalize_penalty(&penalty_bending);
@@ -156,7 +174,12 @@ pub fn build_thin_plate_basiswithworkspace(
                 op: None,
             });
         }
-        (design, identifiability_transform, candidates, None)
+        (
+            design,
+            identifiability_transform,
+            candidates,
+            Some(radial_reparam.clone()),
+        )
     } else {
         let tps = create_thin_plate_spline_basis_scaledwithworkspace(
             data,
@@ -264,17 +287,35 @@ pub fn build_thin_plate_basiswithworkspace(
 pub(crate) fn thin_plate_penalties_at_length_scale(
     centers: ArrayView2<'_, f64>,
     identifiability_transform: Option<&Array2<f64>>,
+    radial_reparam: Option<&Array2<f64>>,
     length_scale: f64,
     double_penalty: bool,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
     let internal_kernel_transform =
         thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
+    let reduced_kernel_transform = if let Some(v) = radial_reparam {
+        if v.nrows() != internal_kernel_transform.ncols() {
+            crate::bail_dim_basis!(
+                "thin-plate radial reparam shape {:?} does not match constrained radial dimension {}",
+                v.dim(),
+                internal_kernel_transform.ncols()
+            );
+        }
+        fast_ab(&internal_kernel_transform, v)
+    } else {
+        let (v, _) = thin_plate_radial_reparam_from_centers(
+            centers,
+            length_scale,
+            &internal_kernel_transform,
+        )?;
+        fast_ab(&internal_kernel_transform, &v)
+    };
     let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
     let (penalty_bending, penalty_ridge) = build_thin_plate_penalty_matrices(
         centers,
         length_scale,
-        &internal_kernel_transform,
+        &reduced_kernel_transform,
         double_penalty,
     )?;
     let (penalty_bending_norm, c_bending) = normalize_penalty(&penalty_bending);

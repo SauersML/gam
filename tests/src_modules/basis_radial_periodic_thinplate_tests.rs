@@ -1342,7 +1342,7 @@ fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
         length_scale: 1.0,
         double_penalty: false,
         identifiability: SpatialIdentifiability::None,
-        radial_reparam: None,
+        radial_reparam: Some(Array2::<f64>::eye(k - 2)),
     };
     let result = build_thin_plate_basis(data.view(), &spec).expect("large thin-plate basis");
     assert!(matches!(

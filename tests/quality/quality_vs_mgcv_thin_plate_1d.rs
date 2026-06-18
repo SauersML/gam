@@ -41,10 +41,6 @@ use std::path::Path;
 #[test]
 fn tp_single_penalty_does_not_overfit_linear_data_1271() {
     init_parallelism();
-    // DIAG1271 (temporary): dump the bending penalty's radial eigenvalue
-    // spectrum from inside the tp builder so the over-fit mechanism's natural
-    // eigenvalue gap is visible. Removed once the floor threshold is pinned.
-    unsafe { std::env::set_var("DIAG1271", "1") };
 
     // DGP from the issue: y = 2 + 3x + N(0, 0.15), x = linspace(0,1,800), k=20.
     // Deterministic LCG + Box-Muller noise so the test is bit-reproducible and

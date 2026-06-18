@@ -269,11 +269,13 @@ pub struct ThinPlateSplineBasis {
     pub num_kernel_basis: usize,
     pub num_polynomial_basis: usize,
     pub dimension: usize,
-    /// Wood-TPRS radial reparameterization (k-M) × (k-M) matrix V whose columns are
-    /// eigenvectors of the constrained kernel penalty Z' Ω Z, sorted so the leading
-    /// columns carry the most penalized directions. `kernel_constrained` columns and
-    /// the radial penalty block are expressed in this rotated basis: design columns
-    /// are `Φ Z V` and the radial penalty is `diag(Λ)`.
+    /// Wood-TPRS radial reparameterization matrix `V`.
+    ///
+    /// Rows live in the side-constrained radial coefficient space. Columns are
+    /// the retained positive bending eigendirections of `Z' Ω Z`; numerically
+    /// near-null radial directions are dropped before the basis is exposed.
+    /// Therefore `V` can be rectangular: design columns are `Φ Z V`, and the
+    /// radial penalty is `diag(Λ_retained)`.
     pub radial_reparam: Array2<f64>,
 }
 

@@ -171,4 +171,9 @@ fn tp_single_penalty_edf_inflation_1271() {
         single_vals.iter().all(|v| v.is_finite()),
         "tp single-penalty fits must converge to finite EDF"
     );
+    assert!(
+        mean(&single_vals) < 3.0,
+        "tp single-penalty over-fits linear data: mean EDF={:.4}, per-seed={single_vals:?}",
+        mean(&single_vals)
+    );
 }
