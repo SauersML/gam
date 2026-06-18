@@ -1236,10 +1236,10 @@ fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialI
 ///   - **Sphere, Harmonic method**: the real-spherical-harmonic basis starts at
 ///     degree `l = 1` (`build_spherical_harmonic_basis`), so it never spans the
 ///     degree-0 constant — no centering is needed.
-///   - **Sphere, Wahba method**: INCLUDED (#532). Its
-///     `weighted_coefficient_sum_to_zero_transform` is a *center*-space
-///     constraint, so the realized design still spans the constant — same class
-///     as Matérn `CenterSumToZero`. The composed parametric transform is frozen
+///   - **Sphere, Wahba method**: INCLUDED (#532). Its raw finite-center kernel
+///     chart can span a near-constant realized direction even though the
+///     continuous kernel omits the l=0 mode — same collision class as Matérn
+///     `CenterSumToZero`. The composed parametric transform is frozen
 ///     onto `SphericalSplineBasisSpec::identifiability`
 ///     (`SphericalSplineIdentifiability::FrozenTransform`) and replayed by
 ///     `build_spherical_spline_basis` at predict time, so the orthogonalization
@@ -1288,12 +1288,11 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
             spec.identifiability,
             MaternIdentifiability::CenterSumToZero | MaternIdentifiability::CenterLinearOrthogonal
         ),
-        // Wahba sphere (`bs="sos"`, method=Wahba): the area-weighted center
-        // sum-to-zero `z` is a *coefficient*-space constraint, so the realized
-        // `K·z` design still spans the constant — the same #531 collision class
-        // as Matérn `CenterSumToZero`. It requires the global parametric
-        // orthogonalization (#532). The Harmonic method starts at degree l=1
-        // and never spans the constant, so it is excluded.
+        // Wahba sphere (`bs="sos"`, method=Wahba): the finite-center kernel
+        // chart can still span a near-constant realized direction on the data
+        // rows, so it requires global parametric orthogonalization (#532). The
+        // Harmonic method starts at degree l=1 and never spans the constant, so
+        // it is excluded.
         SmoothBasisSpec::Sphere { spec, .. } => {
             matches!(spec.method, crate::basis::SphereMethod::Wahba)
                 && matches!(

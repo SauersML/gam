@@ -1578,11 +1578,9 @@ mod sphere_gpu_tests {
         )
         .expect("cpu raw design");
 
-        // The build wraps raw · Z into the final design; rebuild Z from
-        // the same weighted sum-to-zero transform.
-        let weights = crate::basis::sphere_area_weights(centers.view(), false);
-        let z =
-            crate::basis::weighted_coefficient_sum_to_zero_transform(weights.view()).expect("z");
+        // The build keeps raw Wahba center coefficients unless a frozen
+        // realized-design transform is supplied.
+        let z = Array2::<f64>::eye(centers.nrows());
         let cpu_design = raw_cpu.dot(&z);
 
         let gpu_design = result_gpu.design.as_dense().expect("dense design").clone();
@@ -1800,9 +1798,7 @@ mod sphere_gpu_tests {
         let centers =
             crate::basis::select_spherical_farthest_point_centers(data_ll.view(), m, false)
                 .expect("centers");
-        let weights = crate::basis::sphere_area_weights(centers.view(), false);
-        let z =
-            crate::basis::weighted_coefficient_sum_to_zero_transform(weights.view()).expect("z");
+        let z = Array2::<f64>::eye(centers.nrows());
         let t1 = std::time::Instant::now();
         let raw_cpu = spherical_wahba_kernel_matrix_with_kind(
             data_ll.view(),
@@ -1851,8 +1847,7 @@ mod sphere_gpu_tests {
     #[test]
     fn sphere_gpu_end_to_end_fit_parity_vs_cpu_truncated() {
         use crate::basis::{
-            select_spherical_farthest_point_centers, sphere_area_weights,
-            spherical_wahba_kernel_matrix_with_kind, weighted_coefficient_sum_to_zero_transform,
+            select_spherical_farthest_point_centers, spherical_wahba_kernel_matrix_with_kind,
         };
         use crate::linalg::faer_ndarray::FaerCholesky;
         use faer::Side;
@@ -1888,12 +1883,11 @@ mod sphere_gpu_tests {
             .expect("farthest-point centers");
         assert_eq!(centers_ll.nrows(), m);
 
-        // Constraint transform Z (m × (m-1)).
-        let weights = sphere_area_weights(centers_ll.view(), false);
-        let z = weighted_coefficient_sum_to_zero_transform(weights.view())
-            .expect("weighted sum-to-zero transform");
+        // The Wahba sphere basis no longer imposes a finite-center coefficient
+        // gauge; parity compares the raw center coefficient chart.
+        let z = Array2::<f64>::eye(centers_ll.nrows());
         let p = z.ncols();
-        assert_eq!(p, m - 1);
+        assert_eq!(p, m);
 
         // Penalty K(centers, centers), built once on CPU. The penalty
         // kernel evaluation is m × m (= 6400 entries), well outside the

@@ -3,20 +3,19 @@
 //! not be refused by the identifiability audit.
 //!
 //! Root cause (the #531 constant-vs-intercept collision class). The Wahba
-//! design is `K(data, centers) · z`, where `z =
-//! weighted_coefficient_sum_to_zero_transform(area_weights)` enforces
-//! `1ᵀ W α = 0` over the *centers* — a coefficient-space constraint. The
-//! realized design at the data rows therefore still spans the constant, which
-//! duplicates the global parametric intercept (every model carries one). The
-//! intra-block rank-1 deficiency makes the identifiability audit FATAL.
+//! design is `K(data, centers) · z`, where `z` is now the identity at the raw
+//! Wahba basis stage. The realized design at the data rows can still span a
+//! near-constant direction, which duplicates the global parametric intercept
+//! (every model carries one). The intra-block rank-1 deficiency makes the
+//! identifiability audit FATAL.
 //!
 //! The fix routes the Wahba sphere through
 //! `apply_global_smooth_identifiability`'s parametric orthogonalization (it is
 //! now in `smooth_requires_parametric_orthogonality`), composes the resulting
 //! transform onto `z`, and FREEZES the composed realized-design transform onto
 //! `SphericalSplineBasisSpec::identifiability` so the predict-time rebuild
-//! reuses it verbatim instead of recomputing the center-space `z` (which would
-//! drop the orthogonalization and resurrect the collision at predict time).
+//! reuses it verbatim instead of dropping the orthogonalization and resurrecting
+//! the collision at predict time).
 //!
 //! What we assert:
 //!   1. The Wahba-sphere-plus-intercept Gaussian fit COMPLETES (no audit

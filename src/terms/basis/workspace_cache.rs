@@ -755,19 +755,6 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     Ok(z)
 }
 
-pub(crate) fn sphere_area_weights(centers: ArrayView2<'_, f64>, radians: bool) -> Array1<f64> {
-    let to_rad = if radians {
-        1.0
-    } else {
-        std::f64::consts::PI / 180.0
-    };
-    Array1::from_iter(
-        centers
-            .outer_iter()
-            .map(|row| (row[0] * to_rad).cos().max(0.0)),
-    )
-}
-
 #[inline]
 pub(crate) fn spherical_chord_distance2(
     a: ArrayView1<'_, f64>,
