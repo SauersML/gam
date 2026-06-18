@@ -1198,6 +1198,32 @@ impl SurvivalMarginalSlopeFamily {
                                 &state_ref.moments,
                                 "survival D_t second derivative directional",
                             )?;
+                            #[cfg(test)]
+                            {
+                                // #932 d_uv_dir per-term localization for the debug
+                                // fixture's exit timepoint (q1=0.6) at the deviation
+                                // diagonal/cross blocks.
+                                let w0 = primary.w.as_ref().map(|w| w.start).unwrap_or(usize::MAX);
+                                if (q - 0.6_f64).abs() < 1e-9
+                                    && ((u == primary.g && v == w0) || (u == w0 && v == w0))
+                                {
+                                    let ig = |poly: &[f64]| {
+                                        exact_kernel::cell_polynomial_integral_from_moments(
+                                            poly, &state_ref.moments, "dbg",
+                                        )
+                                        .unwrap_or(f64::NAN)
+                                    };
+                                    let corr = poly_mul(
+                                        &poly_mul(&eta_poly, &eta_dir_poly),
+                                        &i_base,
+                                    );
+                                    eprintln!(
+                                        "DBGD932 [{u},{v}] cell: t1d={:+.4e} t2d={:+.4e} t3d={:+.4e} t4d={:+.4e} t5d={:+.4e} corr={:+.4e} val={:+.4e}",
+                                        ig(&t1_dir), ig(&t2_dir), ig(&t3_dir), ig(&t4_dir),
+                                        ig(&t5_dir), ig(&corr), value,
+                                    );
+                                }
+                            }
                             d_uv_dir[[u, v]] += value;
                             d_uv_dir[[v, u]] = d_uv_dir[[u, v]];
                         }
