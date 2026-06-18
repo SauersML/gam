@@ -4617,35 +4617,21 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 /// with a `design_revision` that only advances when the realizer rebuilds the
 /// n×k design. On the certified Gaussian ψ-Gram path the spatial caller
 /// (`SpatialJointContext::eval_full`) deliberately does NOT re-realize the
-/// design for an in-window ψ move, so the revision is unchanged and
-/// `prepare_eval_state` takes its fast path: it skips `reset_surface` (the
-/// O(n·p) reconditioning + O(Σ pₖ³) canonical rebuild) and instead re-keys the
-/// n-free `GaussianFixedCache` to the new ψ. Value-equality is already pinned
-/// by `psi_gram_tensor_e2e_kappa_optimum_matches_streamed`; this test adds the
-/// COMPLEMENTARY structural claim it cannot make — that the n-row lane is
-/// genuinely not re-entered — via the `slow_path_reset_count` instrumentation
-/// counter, which increments only on a `reset_surface` rebuild.
-///
-/// Sequence on the tensor evaluator at a FIXED design_revision:
-///   trial 1 (ψ_A): first eval at this revision → slow path runs once
-///                  (counter 0 → 1), pinning the reference surface.
-///   trial 2 (ψ_B): SAME revision, ψ moved inside the window → fast path
-///                  fires, counter stays 1 (n-row lane NOT re-entered).
-///   trial 3 (ψ_C): SAME revision again → counter still 1.
-/// A fresh streamed evaluator computes the slow-path β̂ at ψ_B / ψ_C; the
-/// fast-path β̂ must match it to solver round-off.
+/// design for an in-window ψ move only if the skip gate proves the realized
+/// reduced basis is unchanged. The former RRQR rank/permutation gate was not
+/// strong enough: it skipped `reset_surface` while the basis moved and shipped a
+/// β̂ mismatch. This test keeps the same standardized Duchon fixture and asserts
+/// that the moving-ψ skip is now refused; the slow path must re-enter for every
+/// moved ψ and the resulting β̂ must match a fresh streamed solve.
 ///
 /// #1264: the design-revision fast path keeps the reference surface (its
 /// conditioned frame AND its RRQR-reduced / null basis) FROZEN at ψ_A while
 /// re-keying the Gram `XᵀWX(ψ)` and penalty `S(ψ)` to ψ_B. The streamed slow
 /// path re-realizes and RE-PIVOTS the radial-kernel design at ψ_B, so it forms
-/// its solve in a fresh reduced basis. A conditioning-ratio skip gate was not
-/// enough: on the production standardized fixture it admitted a high-ψ band
-/// whose midpoint changed β̂ by ~29%. The production skip gate is now keyed to
-/// the Gram-derived RRQR rank/permutation frame instead. This test scans the
-/// attached tensor's RRQR-stable band and asserts both structural n-row skip
-/// (`slow_path_reset_count` stays pinned) and β̂ equivalence against a fresh
-/// streamed slow-path solve.
+/// its solve in a fresh reduced basis. Conditioning-ratio and Gram-derived RRQR
+/// rank/permutation gates were both insufficient on MSI. Until production has a
+/// true reduced-basis-equality witness, `psi_gram_tensor_covers_skip` must be
+/// empty and production must keep the exact `reset_surface` lane.
 #[test]
 fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     use crate::solver::rho_optimizer::OuterEvalOrder;
@@ -4802,20 +4788,10 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
     tensor_eval.set_supports_nfree_penalty_rekey(nfree_penalty);
 
-    // Three in-window ψ operating points reached at a SINGLE fixed
-    // design_revision. We realize the design ONCE (at ψ_A) to pin the
-    // reference surface + revision, then evaluate ψ_B / ψ_C against that same
-    // revision WITHOUT re-realizing — exactly what `eval_full` does on the
-    // certified skip path.
-    //
-    // #1264: the skip is only SOUND inside the tensor's RRQR-pivot-stable
-    // sub-window (production gates `eval_full`'s skip on
-    // `psi_gram_tensor_covers_skip`; outside it the reduced basis has moved and
-    // the full `reset_surface` slow path runs). Mirror that here — pick the three
-    // operating points INSIDE that band (scan it from the attached tensor), so
-    // the test exercises the skip exactly where production would take it. A test
-    // that pinned points across the whole window would exercise an unsound skip
-    // production never performs.
+    // The old RRQR-only gate admitted the first two 1/256 scan intervals from
+    // the low-ψ edge on this fixture and MSI measured β̂-rel ≈ 7.8e-2 there.
+    // That is not a reduced-basis-equality proof, so the production skip window
+    // must now be empty. Probe the exact same scan lattice the old test used.
     let skip_band: Vec<f64> = {
         let m = 256usize;
         (0..=m)
@@ -4824,20 +4800,25 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             .collect()
     };
     assert!(
-        skip_band.len() >= 3,
-        "RRQR-pivot-stable skip sub-window must contain ≥3 ψ points for a \
-         non-vacuous fast-path gate (found {})",
+        skip_band.is_empty(),
+        "moving-ψ reset-skip must stay disabled without a reduced-basis-equality \
+         witness; old RRQR-only gate admitted {} points",
         skip_band.len()
     );
-    let skip_lo = *skip_band.first().unwrap();
-    let skip_hi = *skip_band.last().unwrap();
-    let psi_a = skip_lo + 0.25 * (skip_hi - skip_lo);
-    let psi_b = 0.5 * (skip_lo + skip_hi);
-    let psi_c = skip_lo + 0.75 * (skip_hi - skip_lo);
+    let span = psi_hi - psi_lo;
+    let psi_a = psi_lo;
+    let psi_b = psi_lo + span / 256.0;
+    let psi_c = psi_lo + 2.0 * span / 256.0;
+    assert!(
+        !tensor_eval.psi_gram_tensor_covers_skip(psi_a)
+            && !tensor_eval.psi_gram_tensor_covers_skip(psi_b)
+            && !tensor_eval.psi_gram_tensor_covers_skip(psi_c),
+        "the old low-edge RRQR prefix must not be eligible for the reset-skip"
+    );
     if std::env::var("DIAG1216").is_ok() {
         eprintln!(
-            "[DIAG1216-FP] window [{psi_lo:.4},{psi_hi:.4}] skip_band [{skip_lo:.4},{skip_hi:.4}] \
-             ({} pts)  ψ_a={psi_a:.4} ψ_b={psi_b:.4} ψ_c={psi_c:.4}  \
+            "[DIAG1216-FP] window [{psi_lo:.4},{psi_hi:.4}] skip_band EMPTY \
+             ({} pts)  old_low_prefix ψ_a={psi_a:.4} ψ_b={psi_b:.4} ψ_c={psi_c:.4}  \
              covers_skip(a/b/c)={}/{}/{}",
             skip_band.len(),
             tensor_eval.psi_gram_tensor_covers_skip(psi_a),
@@ -4853,30 +4834,23 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         theta
     };
 
-    // Realize the design once and FREEZE the revision the rest of the test
-    // pins on. The hyper_dirs are a ψ-invariant pure function of the realized
-    // design, so the same slab is sound for every ψ at this revision.
-    tensor_cache.ensure_theta(&theta_at(psi_a)).unwrap();
-    let frozen_revision = tensor_cache.design_revision();
-    let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-        data.view(),
-        tensor_cache.spec(),
-        tensor_cache.design(),
-        &spatial_terms,
-    )
-    .unwrap()
-    .unwrap();
-
-    // #1033 penalty lane: mirror the production caller — stage the EXACT n-free
-    // S(ψ) for THIS trial's ψ (rebuilt from the frozen Duchon geometry) before
-    // every eval, so the design-revision fast path re-keys S(ψ) without
-    // `reset_surface`. The slow path (trial 1) clears it; the fast paths (trials
-    // 2/3) consume it. Built from frozen centers ⇒ n-free, valid even though the
-    // design is NOT re-realized at ψ_B/ψ_C.
+    // Mirror production after the tightened gate: every moved ψ fails
+    // `psi_gram_tensor_covers_skip`, so the caller realizes the design before
+    // evaluating. `prepare_eval_state` must therefore take the exact slow path
+    // and increment `slow_path_reset_count` on all three trials.
     let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
                        cache: &mut SingleBlockExactJointDesignCache<'_>,
                        theta: &Array1<f64>|
      -> (f64, Array1<f64>, Array1<f64>) {
+        cache.ensure_theta(theta).expect("ensure_theta");
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &spatial_terms,
+        )
+        .unwrap()
+        .unwrap();
         let penalty = cache
             .canonical_penalties_at(theta)
             .expect("exact n-free S(ψ) rebuild");
@@ -4886,10 +4860,10 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             cache.design(),
             theta,
             rho_dim,
-            hyper_dirs.clone(),
+            hyper_dirs,
             None,
             OuterEvalOrder::ValueAndGradient,
-            Some(frozen_revision),
+            Some(cache.design_revision()),
         )
         .expect("tensor eval");
         let beta = evaluator
@@ -4898,7 +4872,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         (cost, grad, beta)
     };
 
-    // Trial 1 (ψ_A): first eval at this revision → slow path runs ONCE.
+    // Trial 1 (ψ_A): first eval at this revision -> slow path runs once.
     assert_eq!(
         tensor_eval.slow_path_reset_count(),
         0,
@@ -4911,21 +4885,20 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         "first eval at a fresh revision must take the slow path exactly once"
     );
 
-    // Trial 2 (ψ_B): SAME revision, ψ moved inside window → FAST PATH.
+    // Trial 2 (ψ_B): moved ψ -> skip refused -> slow path runs again.
     let (c_b, _g_b, beta_b) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b));
     assert_eq!(
         tensor_eval.slow_path_reset_count(),
-        1,
-        "cache-hit trial (repeated design_revision) re-entered the n-row \
-         reconditioning lane — the #1033 bounded skip is broken"
+        2,
+        "moved-ψ trial did not re-enter reset_surface after the skip gate refused it"
     );
 
-    // Trial 3 (ψ_C): SAME revision again → still no new slow-path entry.
+    // Trial 3 (ψ_C): moved ψ again -> skip refused -> slow path runs again.
     let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c));
     assert_eq!(
         tensor_eval.slow_path_reset_count(),
-        1,
-        "second cache-hit trial re-entered the n-row reconditioning lane"
+        3,
+        "second moved-ψ trial did not re-enter reset_surface after skip refusal"
     );
 
     assert!(
@@ -5010,9 +4983,9 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
 
     eprintln!(
-        "[psi-gram-tensor #1033] fast path served 2 in-window ψ trials with \
-         slow_path_reset_count=1 (n-row lane NOT re-entered); worst |Δβ̂| vs \
-         streamed slow path = {worst:.3e} — κ-optimum lane-invariant"
+        "[psi-gram-tensor #1033/#1264] moving-ψ reset-skip refused without a \
+         reduced-basis-equality witness; slow_path_reset_count=3 and worst |Δβ̂| \
+         vs streamed slow path = {worst:.3e}"
     );
 }
 
