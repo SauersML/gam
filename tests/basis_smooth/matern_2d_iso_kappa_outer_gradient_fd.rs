@@ -414,3 +414,57 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
          got g_signal-g_noise={analytic_contrast:.6e}"
     );
 }
+
+/// #1270 regression: a single `matern(x1, x2)` 2-D smooth must fit an ordinary
+/// Gaussian surface to convergence over the FULL (uncapped) κ-optimizer loop,
+/// exactly like the `duchon` control below.
+///
+/// Root cause: the single-spatial-term "n-free penalty re-key" fast path
+/// declared itself supported for Matérn, so the design-revision skip path was
+/// taken. But the realized Matérn design carries the collocation operator
+/// triplet (mass/tension/stiffness, #1259) while the n-free re-key rebuilds the
+/// projected-kernel double-penalty — a different block topology. The block-count
+/// guard rejected the rebuild, cleared the staged surface, and the next
+/// skip-path eval converted "no exact S(ψ) staged" into a HARD ERROR
+/// (IntegrationError), aborting the fit. `duchon`/`thinplate`/`te` were
+/// unaffected because their re-key reproduces the frozen topology exactly.
+///
+/// The fix drops `Matern` from `supports_nfree_penalty_rekey`, routing it
+/// through the slow path that re-realizes the design every trial (re-deriving
+/// the correct operator triplet). This test caps NOTHING on the outer loop, so
+/// it reaches the skip-window evals that armed the bug; pre-fix it aborts with
+/// IntegrationError, post-fix it converges.
+#[test]
+fn matern_2d_smooth_fits_ordinary_surface_full_outer_loop() {
+    let _guard = TEST_LOG_LOCK.lock().unwrap();
+    init();
+    let data = build_dataset(160, 0.05, 0x1270_0001_2D5Eu64);
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        // No outer_max_iter cap: run the FULL κ loop so the design-revision
+        // skip path (the bug's trigger) is actually reached.
+        gpu_policy: if cfg!(target_os = "macos") {
+            gam::gpu::GpuPolicy::Off
+        } else {
+            gam::gpu::GpuPolicy::Auto
+        },
+        ..FitConfig::default()
+    };
+
+    // matern: must fit without the IntegrationError abort (#1270).
+    let matern = gam::fit_from_formula("y ~ matern(x1, x2)", &data, &config);
+    assert!(
+        matern.is_ok(),
+        "matern(x1,x2) 2-D smooth must fit an ordinary surface, but the fit \
+         returned an error (#1270 regression): {:?}",
+        matern.err()
+    );
+
+    // duchon control: the sibling spatial smooth that was always healthy.
+    let duchon = gam::fit_from_formula("y ~ duchon(x1, x2)", &data, &config);
+    assert!(
+        duchon.is_ok(),
+        "duchon(x1,x2) control must fit (it always did): {:?}",
+        duchon.err()
+    );
+}

@@ -4614,12 +4614,28 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     }
 
     /// True when this realizer carries exactly ONE spatial smooth term whose
-    /// frozen basis geometry (`BasisMetadata::Duchon`/`Matern`/`ThinPlate`)
-    /// admits an EXACT, n-free penalty rebuild at a new length-scale (#1033).
-    /// The κ-loop fast path gates its design-realization skip on this: the skip
-    /// leaves `reset_surface` un-run, so it is only sound when `S(ψ_new)` can be
+    /// frozen basis geometry (`BasisMetadata::Duchon`/`ThinPlate`) admits an
+    /// EXACT, n-free penalty rebuild at a new length-scale (#1033). The κ-loop
+    /// fast path gates its design-realization skip on this: the skip leaves
+    /// `reset_surface` un-run, so it is only sound when `S(ψ_new)` can be
     /// re-keyed n-free from the frozen geometry (centers + identifiability
-    /// transform + operator collocation points), never from the data rows.
+    /// transform + operator collocation points), never from the data rows, AND
+    /// the re-keyed penalty's block topology is IDENTICAL to the one the frozen
+    /// design carries.
+    ///
+    /// `Matern` is deliberately EXCLUDED (#1270): the realized Matérn design's
+    /// penalty list is the collocation operator triplet (mass/tension/stiffness,
+    /// gated by the Sobolev order `m = ν + d/2`) installed by
+    /// `matern_operator_penalty_triplet_from_metadata` at realization, but the
+    /// n-free re-key in `canonical_penalties_at_psi` rebuilds the projected
+    /// kernel double-penalty (1–2 blocks) instead — a DIFFERENT topology. Since
+    /// the #1259 operator-triplet penalty is what the frozen design actually
+    /// carries, the re-key can never reproduce it; the block-count guard in
+    /// `canonical_penalties_at_psi` rejects the rebuild, clears the staged
+    /// surface, and the next skip-path eval hard-errors. Routing Matérn through
+    /// the slow path (which re-realizes the design every trial, re-deriving the
+    /// correct operator triplet) is the principled fix; clearing the stage then
+    /// hard-erroring on a "supported" term is never acceptable.
     fn supports_nfree_penalty_rekey(&self, spatial_terms: &[usize]) -> bool {
         if spatial_terms.len() != 1 {
             return false;
@@ -4627,11 +4643,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         let term_idx = spatial_terms[0];
         matches!(
             self.design.smooth.terms.get(term_idx).map(|t| &t.metadata),
-            Some(
-                BasisMetadata::Duchon { .. }
-                    | BasisMetadata::Matern { .. }
-                    | BasisMetadata::ThinPlate { .. }
-            )
+            Some(BasisMetadata::Duchon { .. } | BasisMetadata::ThinPlate { .. })
         )
     }
 
