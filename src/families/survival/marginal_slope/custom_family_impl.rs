@@ -420,6 +420,79 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         .map(Some)
     }
 
+    fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+
+        let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+            .into_par_iter()
+            .map(|axis_idx| {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[axis_idx] = 1.0;
+                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    self.exact_newton_joint_hessian_directional_derivative(block_states, &axis)
+                })
+            })
+            .collect();
+
+        let mut axes = Vec::with_capacity(p);
+        for result in results {
+            match result? {
+                Some(matrix) => axes.push(matrix),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(axes))
+    }
+
+    fn joint_jeffreys_information_second_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+
+        let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+            .into_par_iter()
+            .map(|axis_idx| {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[axis_idx] = 1.0;
+                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    self.exact_newton_joint_hessiansecond_directional_derivative(
+                        block_states,
+                        d_beta_u_flat,
+                        &axis,
+                    )
+                })
+            })
+            .collect();
+
+        let mut axes = Vec::with_capacity(p);
+        for result in results {
+            match result? {
+                Some(matrix) => axes.push(matrix),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(axes))
+    }
+
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
