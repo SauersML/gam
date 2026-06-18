@@ -155,6 +155,82 @@ fn sphere_formula_and_mgcv_sos_alias_resolve_to_sphere_basis() {
 }
 
 #[test]
+fn sphere_m4_wahba_formula_enforces_stable_center_floor_only_for_m4() {
+    let parsed = parse_formula(
+        "y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo) + sphere(lat, lon, k=25, m=2, kernel=pseudo)",
+    )
+    .expect("formula parses");
+    let values = array![
+        [1.0, -80.0, -170.0],
+        [2.0, -30.0, -60.0],
+        [3.0, 0.0, 0.0],
+        [4.0, 30.0, 60.0],
+        [5.0, 80.0, 170.0]
+    ];
+    let ds = EncodedDataset {
+        headers: vec!["y".into(), "lat".into(), "lon".into()],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "lat".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "lon".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![ColumnKindTag::Continuous; 3],
+    };
+    let col_map = ds.column_map();
+    let mut notes = Vec::new();
+    let spec = build_termspec(
+        &parsed.terms,
+        &ds,
+        &col_map,
+        &mut notes,
+        &gam::ResourcePolicy::default_library(),
+    )
+    .expect("term spec");
+    let SmoothBasisSpec::Sphere { spec: m4_spec, .. } = &spec.smooth_terms[0].basis else {
+        panic!("expected m=4 sphere basis");
+    };
+    let CenterStrategy::FarthestPoint {
+        num_centers: m4_centers,
+    } = &m4_spec.center_strategy
+    else {
+        panic!("expected m=4 farthest-point centers");
+    };
+    assert_eq!(
+        *m4_centers, 30,
+        "m=4 Wahba needs the stable center floor that fixed the k=25 seed regression"
+    );
+
+    let SmoothBasisSpec::Sphere { spec: m2_spec, .. } = &spec.smooth_terms[1].basis else {
+        panic!("expected m=2 sphere basis");
+    };
+    let CenterStrategy::FarthestPoint {
+        num_centers: m2_centers,
+    } = &m2_spec.center_strategy
+    else {
+        panic!("expected m=2 farthest-point centers");
+    };
+    assert_eq!(
+        *m2_centers, 25,
+        "the m=4 stability floor must not change ordinary Wahba k semantics"
+    );
+}
+
+#[test]
 fn wahba_kernel_radians_matches_degrees() {
     let deg = array![[10.0, 25.0], [-30.0, -60.0], [45.0, 170.0]];
     let to_rad = std::f64::consts::PI / 180.0;
