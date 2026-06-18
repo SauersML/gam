@@ -2283,15 +2283,18 @@ fn debug_flex_directional_quantities_fd_localize() {
     let p = primary.total;
     let h_dim = score_runtime.basis_dim();
     let w_dim = link_runtime.basis_dim();
-    let beta_h = Array1::<f64>::zeros(h_dim);
-    let beta_w = Array1::<f64>::zeros(w_dim);
+    // NON-ZERO deviations so the link curvature is live (mirrors the
+    // flex_..._fd_witness test that still fails third[3,6]=[g,w0]).
+    let beta_h: Array1<f64> =
+        Array1::from_iter((0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())));
+    let beta_w: Array1<f64> =
+        Array1::from_iter((0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())));
 
-    // Direction confined to (q0,q1,qd1,g); exit timepoint reads (q1, g).
+    // Contract along e_g ONLY (matches the failing third[3,6] check), so the
+    // FD perturbs g alone.
+    let w_range = primary.w.clone().unwrap();
     let mut dir = Array1::<f64>::zeros(p);
-    dir[primary.q0] = 0.7;
-    dir[primary.q1] = -1.3;
-    dir[primary.qd1] = 0.5;
-    dir[primary.g] = 0.9;
+    dir[primary.g] = 1.0;
 
     // Base + directional at the EXIT timepoint.
     let (a1, d1) = family
@@ -2341,7 +2344,8 @@ fn debug_flex_directional_quantities_fd_localize() {
 
     let g = primary.g;
     let q1 = primary.q1;
-    let probe = [(q1, q1), (g, q1), (g, g)];
+    let w0 = w_range.start;
+    let probe = [(q1, q1), (g, q1), (g, g), (g, w0), (w0, w0)];
     for &(u, v) in &probe {
         let eta_fd = fd(&|b| b.eta_uv[[u, v]], 4e-3);
         let chi_fd = fd(&|b| b.chi_uv[[u, v]], 4e-3);
