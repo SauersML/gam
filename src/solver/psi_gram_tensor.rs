@@ -115,13 +115,13 @@ pub const PSI_GRAM_NODE_LADDER: [usize; 5] = [9, 17, 33, 65, 129];
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
 
-/// Minimum RRQR rank-verdict margin accepted for the fast-path skip frame.
+/// Minimum RRQR rank-verdict margin accepted for the low-edge fast-path skip
+/// frame.
 ///
-/// The skip gate is intentionally conservative: a Gram-derived pivot frame is
-/// used only when the rank decision is well away from both the tolerance cliff
-/// and the Gram precision floor reported by `rrqr_from_gram_with_permutation`.
-/// Near-cliff frames fall back to the full `reset_surface` path.
-pub const PSI_GRAM_SKIP_RRQR_MARGIN_MIN: f64 = 16.0;
+/// The skip gate's primary safety condition is locality at the low-ψ edge; this
+/// margin only rejects rank decisions already on the wrong side of the RRQR
+/// tolerance cliff. Later / high-ψ components are never admitted by this gate.
+pub const PSI_GRAM_SKIP_RRQR_MARGIN_MIN: f64 = 1.0;
 
 /// Number of equispaced scan points used to locate the RRQR-pivot-stable skip
 /// sub-window at build (each probe is a k×k Gram-derived RRQR — cheap).
@@ -132,14 +132,14 @@ pub const PSI_GRAM_SKIP_RRQR_MARGIN_MIN: f64 = 16.0;
 /// much drift or misses the stable interval entirely.
 pub const PSI_GRAM_SKIP_SCAN_POINTS: usize = 256;
 
-/// Number of scan intervals admitted after the first probe of an RRQR-stable
-/// component.
+/// Number of scan intervals admitted from the low-ψ edge.
 ///
 /// Matching RRQR rank and pivot order is necessary, but #1264 showed it is not
 /// sufficient over a wide high-ψ band. The design-revision skip is therefore a
-/// strictly local fast path: it may cover only the first three scan probes of
-/// the first stable component, keeping the pinned reference surface close to
-/// every skipped trial. Wider moves take the full `reset_surface` path.
+/// strictly local low-ψ fast path: it may cover only the first three scan probes
+/// from `psi_lo`, keeping the pinned reference surface close to every skipped
+/// trial and excluding later high-ψ components entirely. Wider moves take the
+/// full `reset_surface` path.
 pub const PSI_GRAM_SKIP_MAX_SCAN_INTERVALS: usize = 2;
 
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
@@ -174,9 +174,9 @@ pub struct PsiGramTensor {
     /// the reduced basis are unchanged. On the WIDE standardized window (#1215)
     /// the radial-kernel frame can pivot while the conditioning ratio still looks
     /// tame, so a conditioning-only gate silently pairs a stale reduced basis
-    /// with a re-keyed Gram → a wrong β̂. This sub-window is the first local
-    /// low-ψ prefix whose Gram-derived RRQR rank/permutation match; outside it
-    /// the caller must take the full `reset_surface` slow path.
+    /// with a re-keyed Gram → a wrong β̂. This sub-window is the local low-ψ
+    /// prefix whose Gram-derived RRQR rank/permutation match; outside it the
+    /// caller must take the full `reset_surface` slow path.
     skip_psi_lo: f64,
     skip_psi_hi: f64,
     /// Original row count of the design whose Gram was tensorized. Needed to run
@@ -658,36 +658,21 @@ impl PsiGramTensor {
             return;
         }
         let n = PSI_GRAM_SKIP_SCAN_POINTS;
-        let probes: Vec<(f64, Option<Frame>)> = (0..=n)
+        let probes: Vec<(f64, Option<Frame>)> = (0..=PSI_GRAM_SKIP_MAX_SCAN_INTERVALS)
             .map(|i| {
                 let psi = self.psi_lo + span * (i as f64) / (n as f64);
                 (psi, frame_at(self, psi))
             })
             .collect();
 
-        let mut start = 0usize;
-        while start < probes.len() {
-            let Some(reference_frame) = probes[start].1.as_ref() else {
-                start += 1;
-                continue;
-            };
-            let mut end = start;
-            while end + 1 < probes.len() {
-                let Some(frame) = probes[end + 1].1.as_ref() else {
-                    break;
-                };
-                if frame != reference_frame {
-                    break;
-                }
-                end += 1;
-            }
-            if end - start + 1 >= 3 {
-                self.skip_psi_lo = probes[start].0;
-                let local_end = (start + PSI_GRAM_SKIP_MAX_SCAN_INTERVALS).min(end);
-                self.skip_psi_hi = probes[local_end].0;
-                return;
-            }
-            start = end + 1;
+        if probes.len() >= 3
+            && let Some(reference_frame) = probes[0].1.as_ref()
+            && probes[1].1.as_ref() == Some(reference_frame)
+            && probes[2].1.as_ref() == Some(reference_frame)
+        {
+            self.skip_psi_lo = probes[0].0;
+            self.skip_psi_hi = probes[2].0;
+            return;
         }
         self.skip_psi_lo = f64::NAN;
         self.skip_psi_hi = f64::NAN;
