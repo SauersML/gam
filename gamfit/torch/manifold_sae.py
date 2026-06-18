@@ -223,7 +223,7 @@ class ManifoldSAEConfig:
     sparsity: SparsityConfig = field(default_factory=SparsityConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     reml: RemlConfig = field(default_factory=RemlConfig)
-    encoder_hidden: int = 0
+    encoder_hidden: int = 16
     init_scale: float = 0.05
     dtype: Any = field(default=None)
 
@@ -706,7 +706,8 @@ class _SparsityLayer(nn.Module):
 
     def reconstruction_topk_gate(
         self,
-        logits: torch.Tensor,
+        route_logits: torch.Tensor,
+        magnitude_logits: torch.Tensor,
         x: torch.Tensor,
         per_atom_recon: torch.Tensor,
     ) -> torch.Tensor:
@@ -726,14 +727,14 @@ class _SparsityLayer(nn.Module):
         trainable while unselected atoms get no reconstruction-gradient credit
         for the row.
         """
-        amp = self._topk_activation(logits)
+        amp = self._topk_activation(magnitude_logits)
         denom = per_atom_recon.square().sum(dim=-1).clamp_min(1e-12)
         code = (per_atom_recon * x.unsqueeze(1)).sum(dim=-1) / denom
         code = code.clamp_min(0.0)
         residual = ((code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2).sum(
             dim=-1
         )
-        mask = self._topk_mask(logits - residual)
+        mask = self._topk_mask(route_logits - residual)
         return amp * mask
 
     def compose_code(self, assignments: torch.Tensor, amp: torch.Tensor) -> torch.Tensor:
@@ -1045,11 +1046,11 @@ class ManifoldSAE(nn.Module):
         )
         route_logits = self._top1_energy_route_logits(x, amp_logits)
         per_atom_recon = torch.einsum("nfk,fkd->nfd", curves, self.decoder_blocks)
-        amp = F_torch.softplus(route_logits)
+        amp = F_torch.softplus(amp_logits)
         if self.cfg.sparsity.kind == "softmax_topk":
             gate_pre = route_logits
             assignments = self.sparsity.reconstruction_topk_gate(
-                route_logits, x, per_atom_recon
+                route_logits, amp_logits, x, per_atom_recon
             )
             z = assignments
         else:
