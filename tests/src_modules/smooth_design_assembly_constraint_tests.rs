@@ -835,10 +835,10 @@ fn smooth_design_assembles_terms_and_penalties() {
     let sd = build_smooth_design(data.view(), &terms).unwrap();
     assert_eq!(sd.nrows(), data.nrows());
     assert_eq!(sd.terms.len(), 2);
-    // bspline double-penalty contributes two blocks; tps double-penalty also
-    // contributes two blocks (bending + nullspace ridge).
-    assert_eq!(sd.penalties.len(), 4);
-    assert_eq!(sd.nullspace_dims.len(), 4);
+    // bspline double-penalty is folded into its primary block; tps
+    // double-penalty still contributes two blocks (bending + nullspace ridge).
+    assert_eq!(sd.penalties.len(), 3);
+    assert_eq!(sd.nullspace_dims.len(), 3);
     for bp in &sd.penalties {
         assert_eq!(bp.local.nrows(), bp.block_size());
         assert_eq!(bp.local.ncols(), bp.block_size());

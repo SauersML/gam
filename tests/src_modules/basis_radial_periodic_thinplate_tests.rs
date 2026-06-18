@@ -1548,15 +1548,10 @@ fn test_build_bspline_basis_1d_double_penalty() {
         boundary_conditions: BSplineBoundaryConditions::default(),
     };
     let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
-    assert_eq!(result.penalties.len(), 2);
-    // Default identifiability centers the smooth, removing one null-space
-    // dimension from the raw second-difference penalty.
-    // Second penalty is the nullspace projector (rank = nullity of first penalty);
-    // its own nullspace dimension is p - rank_of_projector.
+    assert_eq!(result.penalties.len(), 1);
     let p_constrained = result.design.ncols();
-    assert_eq!(result.nullspace_dims[0], 1);
-    // The shrinkage penalty targets a small subspace; most dims are unpenalized.
-    assert!(result.nullspace_dims[1] >= p_constrained - 2);
+    assert_eq!(result.nullspace_dims[0], 0);
+    assert_eq!(result.penaltyinfo[0].effective_rank, p_constrained);
     assert_eq!(result.design.nrows(), x.len());
 }
 
