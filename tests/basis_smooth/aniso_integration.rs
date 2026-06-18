@@ -82,7 +82,7 @@ fn aniso_matern_recovers_signal_axis() {
 
     let kappa_options = SpatialLengthScaleOptimizationOptions {
         enabled: true,
-        max_outer_iter: 3,
+        max_outer_iter: 30,
         rel_tol: 1e-5,
         log_step: std::f64::consts::LN_2,
         min_length_scale: 1e-2,
