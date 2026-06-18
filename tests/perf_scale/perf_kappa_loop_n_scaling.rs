@@ -142,11 +142,27 @@ fn run_fit(n: usize, kappa_enabled: bool, aniso: bool, bounds: (f64, f64)) -> Re
 
     match result {
         FitResult::Standard(s) => {
-            if s.fit.beta.iter().all(|v: &f64| v.is_finite()) {
-                Ok(dt)
-            } else {
-                Err("non-finite coefficients".to_string())
+            if !s.fit.beta.iter().all(|v: &f64| v.is_finite()) {
+                return Err("non-finite coefficients".to_string());
             }
+            // Non-degeneracy guard (#1033): the n-free κ path must not pass the
+            // timing gate by collapsing to a trivially-cheap degenerate fit (an
+            // all-zero / fully-flattened smooth is fast but wrong). The target
+            // `y = sin(t)` has unit-order amplitude, so a smooth that actually
+            // tracks it has a non-trivial coefficient norm. A collapsed fit would
+            // shrink β to ≈0. This is a coarse tripwire against a "fast because
+            // wrong" optimum; the principled κ-optimum/fit-quality oracle is the
+            // separate mgcv/truth-recovery quality suite (gam_duchon_1d_matches_
+            // mgcv_ds, gam_matern_smooth_recovers_truth).
+            let beta_norm = s.fit.beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if kappa_enabled && beta_norm < 1e-3 {
+                return Err(format!(
+                    "κ fit collapsed to a near-zero smooth (‖β‖={beta_norm:.3e}); the \
+                     n-free outer loop must recover the sin(t) signal, not a fast \
+                     degenerate optimum"
+                ));
+            }
+            Ok(dt)
         }
         _ => Err("expected Standard fit result".to_string()),
     }
