@@ -104,19 +104,36 @@ pub fn sae_streaming_plan_for_shape(
 ) -> SaeStreamingPlan {
     let (budget, chunk_window, host_available) =
         match crate::gpu::device_runtime::GpuRuntime::global() {
-            Some(rt) => {
+            Some(rt) if rt.device_count() > 0 => {
                 let aggregate_budget: usize = rt
                     .device_ordinals()
                     .iter()
                     .map(|&ord| rt.memory_budget_for(ord))
                     .sum();
-                let per_device_budget = aggregate_budget / rt.device_count().max(1);
-                let window =
-                    (per_device_budget / 16).max(SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE);
-                let host_available = sae_host_available_memory_bytes();
+                if aggregate_budget > 0 {
+                    let per_device_budget = aggregate_budget / rt.device_count();
+                    let window = (per_device_budget / 16)
+                        .max(SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE);
+                    let host_available = sae_host_available_memory_bytes();
+                    (
+                        (aggregate_budget / 4).min(host_available),
+                        window,
+                        host_available,
+                    )
+                } else {
+                    let (budget, host_available) = sae_host_in_core_budget_bytes();
+                    (
+                        budget,
+                        SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,
+                        host_available,
+                    )
+                }
+            }
+            Some(_) => {
+                let (budget, host_available) = sae_host_in_core_budget_bytes();
                 (
-                    (aggregate_budget / 4).min(host_available),
-                    window,
+                    budget,
+                    SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,
                     host_available,
                 )
             }
