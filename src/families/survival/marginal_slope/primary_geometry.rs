@@ -267,6 +267,13 @@ pub(crate) struct SurvivalFlexTimepointDirectionalExact {
     pub(crate) chi_uv_dir: Array2<f64>,
     pub(crate) d_u_dir: Array1<f64>,
     pub(crate) d_uv_dir: Array2<f64>,
+    /// #932 debug: for the hardcoded probe block, the 5 base per-term d_uv
+    /// integrals (t1..t5) and the 5 analytic dir per-term integrals
+    /// (t1_dir..t5_dir). The harness FDs the base terms and compares to the
+    /// dir terms to pin which t_i_dir drops a w-cross. Populated only in test
+    /// builds; `None` otherwise.
+    #[cfg(test)]
+    pub(crate) debug_d_uv_terms: Option<([f64; 5], [f64; 5])>,
 }
 
 pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {

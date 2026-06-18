@@ -2369,6 +2369,41 @@ fn debug_flex_directional_quantities_fd_localize() {
             ext.d_u_dir[u], d_u_fd, (ext.d_u_dir[u] - d_u_fd).abs()
         );
     }
+    // Per-term d_uv_dir localization at the (w0,w0) probe block: FD each base
+    // term integral T_i (from the directional struct's debug_d_uv_terms.0) and
+    // compare to the analytic dir term integral T_i_dir (debug_d_uv_terms.1).
+    {
+        let dir_terms_base = |s: f64| -> [f64; 5] {
+            let q = q1v + s * dir[primary.q1];
+            let g = gv + s * dir[primary.g];
+            let (a, _d) = family
+                .solve_row_survival_intercept_with_slot(
+                    q,
+                    g,
+                    Some(&beta_h),
+                    Some(&beta_w),
+                    Some((0, SurvivalInterceptSlotKind::Exit)),
+                )
+                .expect("perturbed dir intercept");
+            let e = family
+                .compute_survival_timepoint_directional_exact(
+                    0, &primary, q, primary.q1, a, g, Some(&beta_h), Some(&beta_w), &dir, true,
+                )
+                .expect("perturbed dir");
+            e.debug_d_uv_terms.expect("debug terms").0
+        };
+        let dir_terms = ext.debug_d_uv_terms.expect("debug terms").1;
+        let h = 2e-3_f64;
+        let plus = dir_terms_base(h);
+        let minus = dir_terms_base(-h);
+        for i in 0..5 {
+            let fd_i = (plus[i] - minus[i]) / (2.0 * h);
+            eprintln!(
+                "[w0,w0] term t{}: T_i_dir(analytic)={:+.6e} D_dir(T_i)(fd)={:+.6e} gap={:.2e}",
+                i + 1, dir_terms[i], fd_i, (dir_terms[i] - fd_i).abs()
+            );
+        }
+    }
     // Scalar/first-order base quantities to localize the eta_uv_dir error:
     // chi_dir (=D_dir chi), eta_dir (=D_dir eta), and D_dir eta_u[u].
     eprintln!(
