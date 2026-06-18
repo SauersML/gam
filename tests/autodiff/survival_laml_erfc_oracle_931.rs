@@ -117,7 +117,10 @@ impl ProbitOracle {
                 }
                 alpha *= 0.5;
             }
-            assert!(accepted, "oracle Newton line search failed at beta={beta:?}");
+            assert!(
+                accepted,
+                "oracle Newton line search failed at beta={beta:?}"
+            );
         }
         let (nll, grad, h) = self.nll_grad_hess(beta, rho);
         assert!(
@@ -181,8 +184,7 @@ fn production_probit_gradient_at_rho_six(oracle: &ProbitOracle) -> f64 {
         &opts,
         &rho,
     )
-    .expect("production probit LAML gradient")
-    [0]
+    .expect("production probit LAML gradient")[0]
 }
 
 #[test]
