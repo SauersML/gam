@@ -45,6 +45,11 @@ pub(crate) const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
 /// `k = M·r` up to ~512 (e.g. m=8 basis fns, p=32, r=8 → k=64, but for
 /// m=16 → k=128, m=32 → k=256); 512 covers all typical small-atom PCA cases
 /// while keeping the O(k³) cost ≈ 0.13B ops — negligible next to the solve.
+///
+/// #1273: the outer-gradient deflation no longer probes the raw unit-β basis
+/// (it now uses the penalty-aware `decoder_beta_null_directions`), so this
+/// dimension cap is retained for the documented contract / other call sites.
+#[allow(dead_code)]
 pub(crate) const SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM: usize = 512;
 
 /// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`

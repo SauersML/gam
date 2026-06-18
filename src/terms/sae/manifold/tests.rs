@@ -7399,7 +7399,10 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
 pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge() {
     let cache = near_singular_outer_gradient_cache();
     let obj = warmstart_test_objective();
-    let err = match obj.term.outer_gradient_arrow_solver(&cache) {
+    let err = match obj
+        .term
+        .outer_gradient_arrow_solver(&cache, obj.current_rho.lambda_smooth())
+    {
         Err(err) => err,
         Ok(..) => panic!("near-singular evidence factor without a matching gauge must reject"),
     };
@@ -7521,8 +7524,8 @@ pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() 
     // of rejecting with "analytic outer gradient undefined".
     let solver = obj
         .term
-        .outer_gradient_arrow_solver(&cache)
-        .expect("rank-deficient decoder β-null must be deflated, not rejected (#1051)");
+        .outer_gradient_arrow_solver(&cache, obj.current_rho.lambda_smooth())
+        .expect("rank-deficient decoder β-null must be deflated, not rejected (#1051/#1273)");
     // The deflated solve must REGULARISE the near-null β response: a plain
     // inverse divides by the 1e-7 pivot and explodes; the deflated solve is
     // bounded at the Hessian scale.

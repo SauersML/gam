@@ -5910,6 +5910,7 @@ impl SaeManifoldTerm {
     pub(crate) fn outer_gradient_arrow_solver<'a>(
         &'a self,
         cache: &'a ArrowFactorCache,
+        penalized_gram_scale: f64,
     ) -> Result<DeflatedArrowSolver<'a>, String> {
         let Err(conditioning_err) = Self::outer_gradient_conditioning_error(cache) else {
             return Ok(DeflatedArrowSolver::plain(cache));
@@ -5933,23 +5934,25 @@ impl SaeManifoldTerm {
             }
             raw_gauges.push(gauge);
         }
-        // #1051: admit the β (decoder) coordinate basis as additional deflation
-        // candidates when the block is small enough to eigendecompose cheaply.
-        // A rank-deficient decoder design (e.g. a euclidean-1D line in a p=2
-        // ambient: decoder column rank 1 of 3) puts a genuine near-null
-        // direction of the joint Hessian in the β block, OUTSIDE the closed-form
-        // chart gauge orbit. Feeding the β basis into the same Rayleigh
-        // eigendecomposition below lets that flat direction be identified and
-        // Faddeev-Popov-deflated exactly like a chart gauge, so the analytic
-        // outer gradient becomes well-defined instead of rejecting the trial ρ.
-        // The Rayleigh floor still keeps only genuinely flat (sub-floor)
-        // directions, so a well-conditioned decoder is unaffected.
-        let delta_t_len = cache.delta_t_len();
-        if cache.k > 0 && cache.k <= SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM {
-            for beta_idx in 0..cache.k {
-                let mut unit = Array1::<f64>::zeros(full_len);
-                unit[delta_t_len + beta_idx] = 1.0;
-                raw_gauges.push(unit);
+        // #1051/#1273: admit the penalty-aware decoder-β null directions as
+        // additional deflation candidates. A rank-deficient decoder design
+        // (e.g. a euclidean-1D line in a p=2 ambient: decoder column rank 1 of
+        // 3) puts a genuine near-null direction of the joint Hessian in the β
+        // block, OUTSIDE the closed-form chart gauge orbit. #1273: probing the
+        // RAW unit-β basis `e_j` produced an INCOMPLETE candidate set — the
+        // true flat direction is the penalised null of `G_k + λ_smooth·S_k`,
+        // not an axis-aligned coordinate, so the outer gate rejected trial ρ
+        // with a pivot ratio (5.3e-16 < 1e-12) that the inner gate (which
+        // already uses `decoder_beta_null_directions(λ_smooth)`) accepts. Use
+        // the SAME penalty-aware null directions here, evaluated at the smooth
+        // scale the Schur factor used, so the outer and inner gates agree.
+        // These full (n·q + beta_dim)-length vectors drop into the same
+        // Gram-Schmidt + Rayleigh + Faddeev-Popov path below; the Rayleigh
+        // floor still keeps only genuinely flat (sub-floor) directions, so a
+        // well-conditioned decoder is unaffected.
+        for dir in self.decoder_beta_null_directions(penalized_gram_scale)? {
+            if dir.len() == full_len {
+                raw_gauges.push(dir);
             }
         }
         if raw_gauges.is_empty() {
@@ -7913,7 +7916,7 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<SaeOuterRhoGradientComponents, String> {
-        let solver = self.outer_gradient_arrow_solver(cache)?;
+        let solver = self.outer_gradient_arrow_solver(cache, rho.lambda_smooth())?;
         self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
     }
 
@@ -7963,7 +7966,7 @@ impl SaeManifoldTerm {
         };
         let data_fit_priors_value = loss.total() + extra_penalty_energy;
 
-        let solver = self.outer_gradient_arrow_solver(&cache)?;
+        let solver = self.outer_gradient_arrow_solver(&cache, rho.lambda_smooth())?;
         let components =
             self.analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)?;
         Ok(SaeCriterion::assemble(

@@ -398,7 +398,9 @@ impl SaeManifoldOuterObjective {
             self.ridge_ext_coord,
             self.ridge_beta,
         )?;
-        let solver = self.term.outer_gradient_arrow_solver(&cache)?;
+        let solver = self
+            .term
+            .outer_gradient_arrow_solver(&cache, rho_hat.lambda_smooth())?;
         let components = self.term.analytic_outer_rho_gradient_components(
             self.target.view(),
             &rho_hat,
@@ -674,7 +676,10 @@ impl SaeManifoldOuterObjective {
             let diag_scale = arrow_factor_max_pivot(&cache).unwrap_or(1.0);
             let floor = f64::EPSILON * diag_scale;
             let pivot_deficit_is_gauge = !(pivot.is_finite() && pivot >= floor)
-                && self.term.outer_gradient_arrow_solver(&cache).is_ok();
+                && self
+                    .term
+                    .outer_gradient_arrow_solver(&cache, rho.lambda_smooth())
+                    .is_ok();
             if !(pivot.is_finite() && pivot >= floor) && !pivot_deficit_is_gauge {
                 if eta_step > CURVATURE_WALK_MIN_ETA_STEP {
                     eta_step *= 0.5;
@@ -1359,7 +1364,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let solver = self
             .term
-            .outer_gradient_arrow_solver(&cache)
+            .outer_gradient_arrow_solver(&cache, rho_state.lambda_smooth())
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let components = self
             .term
@@ -1523,10 +1528,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
     /// degenerate anchor or a detected bifurcation the term is left at the full
     /// basis (`η = 1`) and the documented cascade takes over — the outcome is
     /// recorded on the fit payload either way.
+    ///
+    /// For objectives that don't require continuation entry (K=1 periodic atoms
+    /// whose topology is baked into the basis), return `None` so the standard
+    /// seed cascade is used directly without the curvature walk.
     fn curvature_homotopy_entry(
         &mut self,
         rho: &Array1<f64>,
     ) -> Option<Result<bool, EstimationError>> {
+        // K=1 periodic atoms don't need the curvature walk: their circular
+        // topology is baked into the basis, so the linear basin is not an
+        // attractor and the walk would just add overhead / potential failure.
+        // Return `None` to use the standard seed cascade directly.
+        if !self.requires_continuation_path_entry() {
+            return None;
+        }
         let rho_state = self.baseline_rho.from_flat(rho.view());
         Some(
             self.run_curvature_homotopy_entry_at_rho(&rho_state)
