@@ -2225,6 +2225,8 @@ pub struct SpatialLengthScaleOptimizationTiming {
     pub eval_total_s: f64,
     pub efs_calls: usize,
     pub efs_total_s: f64,
+    pub slow_path_resets: u64,
+    pub design_revision_delta: u64,
     pub optim_total_s: f64,
 }
 

@@ -3254,6 +3254,8 @@ fn run_exact_joint_spatial_optimization(
     let kphase_efs_total_s = std::cell::Cell::new(0.0);
     let kphase_optim_start = std::time::Instant::now();
     let kphase_log_kappa_dim = coord_dim;
+    let kphase_slow_resets_start = ctx.evaluator.slow_path_reset_count();
+    let kphase_design_revision_start = ctx.cache.design_revision();
 
     let problem = exact_joint_multistart_outer_problem(
         theta0,
@@ -3419,9 +3421,18 @@ fn run_exact_joint_spatial_optimization(
             kind.adjective(),
         ))
     })?;
+    drop(obj);
     let kphase_total_s = kphase_optim_start.elapsed().as_secs_f64();
+    let kphase_slow_resets = ctx
+        .evaluator
+        .slow_path_reset_count()
+        .saturating_sub(kphase_slow_resets_start);
+    let kphase_design_revision_delta = ctx
+        .cache
+        .design_revision()
+        .saturating_sub(kphase_design_revision_start);
     log::info!(
-        "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} optim_total_s={:.4}",
+        "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} optim_total_s={:.4}",
         kphase_log_kappa_dim,
         kphase_cost_calls.get(),
         kphase_cost_total_s.get(),
@@ -3429,6 +3440,8 @@ fn run_exact_joint_spatial_optimization(
         kphase_eval_total_s.get(),
         kphase_efs_calls.get(),
         kphase_efs_total_s.get(),
+        kphase_slow_resets,
+        kphase_design_revision_delta,
         kphase_total_s,
     );
     let timing = SpatialLengthScaleOptimizationTiming {
@@ -3439,6 +3452,8 @@ fn run_exact_joint_spatial_optimization(
         eval_total_s: kphase_eval_total_s.get(),
         efs_calls: kphase_efs_calls.get(),
         efs_total_s: kphase_efs_total_s.get(),
+        slow_path_resets: kphase_slow_resets,
+        design_revision_delta: kphase_design_revision_delta,
         optim_total_s: kphase_total_s,
     };
     if !result.converged {
@@ -6819,6 +6834,8 @@ where
         eval_total_s: kphase_eval_total_s.get(),
         efs_calls: kphase_efs_calls.get(),
         efs_total_s: kphase_efs_total_s.get(),
+        slow_path_resets: 0,
+        design_revision_delta: 0,
         optim_total_s: kphase_total_s,
     };
 
