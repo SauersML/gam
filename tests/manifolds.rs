@@ -76,6 +76,8 @@ mod sphere_penalty_order_sweep;
 mod sphere_pole_and_seam_predict;
 #[path = "manifolds/sphere_pole_continuity.rs"]
 mod sphere_pole_continuity;
+#[path = "manifolds/sphere_polar_latitude_band_profile.rs"]
+mod sphere_polar_latitude_band_profile;
 #[path = "manifolds/sphere_quality_batch_a.rs"]
 mod sphere_quality_batch_a;
 #[path = "manifolds/sphere_response_robustness.rs"]
