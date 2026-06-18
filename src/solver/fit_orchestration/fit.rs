@@ -719,6 +719,7 @@ fn rescale_gaussian_location_scale_to_raw(
                 }
                 if let Some(state) = result.fit.fit.block_states.get_mut(block_idx) {
                     state.beta.mapv_inplace(|v| v * s);
+                    state.eta.mapv_inplace(|v| v * s);
                 }
             }
             BlockRole::Scale => {
@@ -735,6 +736,9 @@ fn rescale_gaussian_location_scale_to_raw(
                     {
                         state.beta[col] += ln_s;
                     }
+                }
+                if let Some(state) = result.fit.fit.block_states.get_mut(block_idx) {
+                    state.eta.mapv_inplace(|v| v + ln_s);
                 }
             }
             BlockRole::Time | BlockRole::Threshold => {
