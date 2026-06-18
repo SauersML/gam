@@ -295,25 +295,15 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
     let ns = [1_000usize, 4_000, 16_000];
     let mut kappa_phase = Vec::with_capacity(ns.len());
     eprintln!(
-        "[kappa-fast-ladder] {:>9}  {:>10}  {:>10}  {:>12}",
-        "n", "t_kappa_s", "t_single_s", "kappa_phase_s"
+        "[kappa-fast-ladder] {:>9}  {:>10}  {:>12}",
+        "n", "t_kappa_s", "kappa_phase_s"
     );
     for &n in &ns {
-        let kappa_a = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
-        let kappa_b = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
-        let kappa = if kappa_a.kappa_trial_s.unwrap() <= kappa_b.kappa_trial_s.unwrap() {
-            kappa_a
-        } else {
-            kappa_b
-        };
-        let t_single = run_fit(n, false, aniso, bounds)
-            .unwrap()
-            .wall_s
-            .min(run_fit(n, false, aniso, bounds).unwrap().wall_s);
+        let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
         let phase = kappa.kappa_trial_s.unwrap().max(0.0);
         kappa_phase.push(phase);
         eprintln!(
-            "[kappa-fast-ladder] {n:>9}  {:>10.4}  {t_single:>10.4}  {phase:>12.4}",
+            "[kappa-fast-ladder] {n:>9}  {:>10.4}  {phase:>12.4}",
             kappa.wall_s
         );
     }
@@ -367,26 +357,15 @@ fn kappa_outer_loop_is_n_independent() {
     let mut kappa_phase = Vec::with_capacity(ns.len());
 
     eprintln!(
-        "[kappa-n-scaling] {:>9}  {:>10}  {:>10}  {:>12}",
-        "n", "t_kappa_s", "t_single_s", "kappa_phase_s"
+        "[kappa-n-scaling] {:>9}  {:>10}  {:>12}",
+        "n", "t_kappa_s", "kappa_phase_s"
     );
     for &n in &ns {
-        // Best-of-two to suppress shared-cluster wall-clock noise.
-        let kappa_a = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
-        let kappa_b = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
-        let kappa = if kappa_a.kappa_trial_s.unwrap() <= kappa_b.kappa_trial_s.unwrap() {
-            kappa_a
-        } else {
-            kappa_b
-        };
-        let t_single = run_fit(n, false, aniso, bounds)
-            .unwrap()
-            .wall_s
-            .min(run_fit(n, false, aniso, bounds).unwrap().wall_s);
+        let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
         let phase = kappa.kappa_trial_s.unwrap().max(0.0);
         kappa_phase.push(phase);
         eprintln!(
-            "[kappa-n-scaling] {n:>9}  {:>10.4}  {t_single:>10.4}  {phase:>12.4}",
+            "[kappa-n-scaling] {n:>9}  {:>10.4}  {phase:>12.4}",
             kappa.wall_s
         );
     }
