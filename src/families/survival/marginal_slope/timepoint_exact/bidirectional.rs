@@ -1418,17 +1418,31 @@ impl SurvivalMarginalSlopeFamily {
                         let eta_d2_poly = poly_coeff_mask(&eta_poly_jet, 2);
                         let eta_d12_poly = poly_coeff_mask(&eta_poly_jet, 3);
 
-                        let correction = poly_add(
-                            &poly_mul(
-                                &poly_add(
-                                    &poly_mul(&eta_d2_poly, &eta_d1_poly),
-                                    &poly_mul(&eta_poly, &eta_d12_poly),
-                                ),
-                                &i_base,
+                        let density_curvature = poly_mul(
+                            &poly_add(
+                                &poly_mul(&eta_d1_poly, &eta_d2_poly),
+                                &poly_mul(&eta_poly, &eta_d12_poly),
                             ),
-                            &poly_mul(&poly_mul(&eta_poly, &eta_d1_poly), &i_base_d2),
+                            &i_base,
                         );
-                        let full_integrand = poly_sub(&i_base_d12, &correction);
+                        let weight_d1_times_i_d2 =
+                            poly_mul(&poly_mul(&eta_poly, &eta_d1_poly), &i_base_d2);
+                        let weight_d2_times_i_d1 =
+                            poly_mul(&poly_mul(&eta_poly, &eta_d2_poly), &i_base_d1);
+                        let second_weight_product = poly_mul(
+                            &poly_mul(&poly_mul(&eta_poly, &eta_poly), &eta_d1_poly),
+                            &poly_mul(&eta_d2_poly, &i_base),
+                        );
+                        let full_integrand = poly_add(
+                            &poly_sub(
+                                &poly_sub(
+                                    &poly_sub(&i_base_d12, &density_curvature),
+                                    &weight_d1_times_i_d2,
+                                ),
+                                &weight_d2_times_i_d1,
+                            ),
+                            &second_weight_product,
+                        );
                         let value = exact_kernel::cell_polynomial_integral_from_moments(
                             &full_integrand,
                             &st.moments,
