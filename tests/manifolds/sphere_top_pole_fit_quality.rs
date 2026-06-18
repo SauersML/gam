@@ -27,10 +27,13 @@ use rand_distr::{Distribution, Normal, Uniform};
 const TAU: f64 = std::f64::consts::TAU;
 
 fn truth(lat: f64, lon: f64) -> f64 {
-    // Smooth low-frequency signal — degree ≤ 2 in spherical harmonics.
-    1.0 + 0.6 * lat.sin()
-        + 0.4 * lat.cos() * (2.0 * lon).cos()
-        + 0.3 * lat.cos().powi(2) * lon.sin()
+    // Smooth low-frequency signal — degree <= 2 in spherical harmonics.
+    let (sin_lon, cos_lon) = lon.sin_cos();
+    let cos_lat = lat.cos();
+    let x = cos_lat * cos_lon;
+    let y = cos_lat * sin_lon;
+    let z = lat.sin();
+    1.0 + 0.6 * z + 0.4 * (x * x - y * y) + 0.6 * x * y
 }
 
 fn make_training_data(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
