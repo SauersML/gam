@@ -101,12 +101,13 @@ pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
 /// floor). The old 65-node acceptance was fine for the cost lane but not for the
 /// beta-hat soundness gate: the inner penalized solve `β̂ = (G+λS)⁻¹r`
 /// amplifies Gram residuals by the radial-kernel conditioning, especially after
-/// the production skip was relaxed to cross a reduced-basis rotation. Start at
-/// 129 nodes so the production gate no longer accepts the shallow tensor; keep a
-/// 257-node fallback for geometries whose assembled-Gram spot check still
-/// refuses. The build frees per-node realized designs right after the DCT so
-/// deeper rungs do not balloon peak memory at large production `n`.
-pub const PSI_GRAM_NODE_LADDER: [usize; 2] = [129, 257];
+/// the production skip was relaxed to cross a reduced-basis rotation. The
+/// runtime surface now interpolates the sufficient statistics directly; because
+/// `G(ψ) = X(ψ)ᵀWX(ψ)` is a product surface, it needs roughly the next doubled
+/// spectral degree to reach the same beta bar. Start at 257 nodes and keep a
+/// 513-node fallback for geometries whose assembled-Gram spot check still
+/// refuses or whose weakly-penalized solve needs the deeper product surface.
+pub const PSI_GRAM_NODE_LADDER: [usize; 2] = [257, 513];
 
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
