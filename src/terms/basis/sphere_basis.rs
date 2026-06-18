@@ -34,13 +34,11 @@ pub fn build_spherical_spline_basis(
         spec.wahba_kernel,
     )?;
     let low_degree_residual = wahba_low_degree_residual_projector(centers.view(), spec.radians)?;
-    let mut raw_penalty = low_degree_residual.dot(&raw_penalty).dot(&low_degree_residual);
-    let diag_scale = raw_penalty
-        .diag()
-        .iter()
-        .map(|v| v.abs())
-        .sum::<f64>()
-        / raw_penalty.nrows().max(1) as f64;
+    let mut raw_penalty = low_degree_residual
+        .dot(&raw_penalty)
+        .dot(&low_degree_residual);
+    let diag_scale =
+        raw_penalty.diag().iter().map(|v| v.abs()).sum::<f64>() / raw_penalty.nrows().max(1) as f64;
     if diag_scale.is_finite() && diag_scale > 0.0 {
         // The raw finite-center chart is intentionally not coefficient-gauged.
         // Tie a small coefficient ridge to the primary RKHS penalty so REML
