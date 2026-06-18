@@ -203,6 +203,14 @@ const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 /// KKT target unchanged.
 const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 
+/// The first multinomial formula solve is a separation probe: it is accepted
+/// only when the unbiased REML criterion reaches a finite interior optimum.
+/// Near-separable data such as the penguin fixture otherwise spend the caller's
+/// full outer budget on an iterate that is discarded before the Firth/Jeffreys
+/// refit. Keep enough iterations for ordinary interior fits to certify quickly,
+/// but hand slow/non-interior probes to the proper-prior refit promptly.
+const MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER: usize = 20;
+
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
     for ((row, active_class), &value) in eta.indexed_iter() {
@@ -1311,10 +1319,15 @@ pub fn fit_penalized_multinomial_formula(
     // mathematically cannot (`Sv = 0` ⇒ λ never touches `v`). The Firth refit
     // is the accepted result for separated data — finite, Firth-bounded
     // coefficients with calibrated probabilities (83debb24b contract).
+    let mut unbiased_probe_options = options.clone();
+    unbiased_probe_options.outer_max_iter = unbiased_probe_options
+        .outer_max_iter
+        .min(MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER);
+
     let fit = match fit_custom_family_with_rho_prior(
         &family,
         &blocks,
-        &options,
+        &unbiased_probe_options,
         crate::types::RhoPrior::Flat,
     ) {
         Ok(unbiased_fit)
