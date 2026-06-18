@@ -137,11 +137,6 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// design-revision fast path can reuse that anchor to remove the tensor's
     /// residual without realizing rows again.
     pub(crate) psi_gram_anchor_correction: Option<(f64, Array2<f64>, Array1<f64>)>,
-    /// First-derivative companion to [`Self::psi_gram_anchor_correction`],
-    /// captured on the slow path while the exact conditioned `X_ψ` slab is
-    /// already live. The fast path applies it as
-    /// `(G'_exact(ref)-G'_tensor(ref)) * (ψ-ref)` and likewise for the RHS.
-    pub(crate) psi_gram_anchor_deriv_correction: Option<(f64, Array2<f64>, Array1<f64>)>,
     /// EXACT n-free per-ψ canonical penalty surface `S(ψ)` staged for the
     /// CURRENT ψ-trial (#1033, penalty lane). For a spatial smooth ψ (= log
     /// length-scale) moves BOTH the design Gram AND the penalty `S(ψ)` (the
@@ -276,7 +271,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             last_reset_psi: None,
             psi_gram_tensor: None,
             psi_gram_anchor_correction: None,
-            psi_gram_anchor_deriv_correction: None,
             pending_psi_penalty: None,
             supports_nfree_penalty_rekey: false,
             pending_glm_first_step_gram: None,
@@ -640,15 +634,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 cache.xtwx_orig += gram_delta;
                 cache.xtwy_orig += rhs_delta;
             }
-            if let Some((p, dgram_delta, drhs_delta)) = &self.psi_gram_anchor_deriv_correction
-                && *p == psi_ref
-                && dgram_delta.dim() == cache.xtwx_orig.dim()
-                && drhs_delta.len() == cache.xtwy_orig.len()
-            {
-                let dpsi = psi - psi_ref;
-                cache.xtwx_orig.scaled_add(dpsi, dgram_delta);
-                cache.xtwy_orig.scaled_add(dpsi, drhs_delta);
-            }
         }
         if !self
             .reml_state
@@ -718,57 +703,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
              on the design-revision fast path"
         );
         Ok(true)
-    }
-
-    fn refresh_psi_gram_anchor_derivative(
-        &mut self,
-        theta: &Array1<f64>,
-        rho_dim: usize,
-        x_fit: &DesignMatrix,
-        hyper_dirs: &[DirectionalHyperParam],
-    ) {
-        self.psi_gram_anchor_deriv_correction = None;
-        let Some(tensor) = self.psi_gram_tensor.as_ref() else {
-            return;
-        };
-        if theta.len() != rho_dim + 1 {
-            return;
-        }
-        let psi_ref = theta[rho_dim];
-        if !tensor.contains(psi_ref) {
-            return;
-        }
-        let Some(dir) = hyper_dirs.first() else {
-            return;
-        };
-        let x_dense = x_fit.to_dense();
-        let x_tau = dir.x_tau_dense();
-        if x_tau.dim() != x_dense.dim() || x_dense.nrows() != self.reml_state.weights.len() {
-            return;
-        }
-        let mut wx = x_dense.clone();
-        for (mut row, &w) in wx.outer_iter_mut().zip(self.reml_state.weights.iter()) {
-            row.mapv_inplace(|v| v * w);
-        }
-        let mut wx_tau = x_tau.clone();
-        for (mut row, &w) in wx_tau.outer_iter_mut().zip(self.reml_state.weights.iter()) {
-            row.mapv_inplace(|v| v * w);
-        }
-        let mut exact_dgram = x_tau.t().dot(&wx);
-        exact_dgram += &x_dense.t().dot(&wx_tau);
-        let mut wz = self.reml_state.y.to_owned();
-        wz -= &self.reml_state.offset;
-        wz *= &self.reml_state.weights;
-        let exact_drhs = x_tau.t().dot(&wz);
-        let tensor_dgram = tensor.dgram_dpsi(psi_ref);
-        let tensor_drhs = tensor.drhs_dpsi(psi_ref);
-        if tensor_dgram.dim() == exact_dgram.dim() && tensor_drhs.len() == exact_drhs.len() {
-            self.psi_gram_anchor_deriv_correction = Some((
-                psi_ref,
-                exact_dgram - tensor_dgram,
-                exact_drhs - tensor_drhs,
-            ));
-        }
     }
 
     fn prepare_eval_state(
@@ -909,7 +843,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             }
         }
 
-        self.refresh_psi_gram_anchor_derivative(theta, rho_dim, &x_fit, &hyper_dirs);
         crate::solver::estimate::reml::RemlState::reset_surface(
             &mut self.reml_state,
             x_fit,
@@ -1231,7 +1164,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // #1264: freeze the reduced-basis reference ψ this slow-path reset pins.
         self.record_reset_psi(theta, rho_dim);
         self.psi_gram_anchor_correction = None;
-        self.psi_gram_anchor_deriv_correction = None;
         self.install_pending_glm_trial_statistics();
         self.install_psi_gram_statistics(theta, rho_dim);
         // #1033 penalty lane: the slow cost-only path rebuilt `S` from the freshly
