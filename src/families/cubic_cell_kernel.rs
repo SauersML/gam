@@ -7367,27 +7367,15 @@ mod tests {
                 let cr = poly_eval_at(r, edge0);
                 let cs = poly_eval_at(s, edge0);
                 let crs = poly_eval_at(rs, edge0);
-                let cr_z = r
-                    .iter()
-                    .enumerate()
-                    .skip(1)
-                    .fold(0.0, |acc, (k, val)| {
-                        acc + (k as f64) * val * edge0.powi(k as i32 - 1)
-                    });
-                let cs_z = s
-                    .iter()
-                    .enumerate()
-                    .skip(1)
-                    .fold(0.0, |acc, (k, val)| {
-                        acc + (k as f64) * val * edge0.powi(k as i32 - 1)
-                    });
-                let crs_z = rs
-                    .iter()
-                    .enumerate()
-                    .skip(1)
-                    .fold(0.0, |acc, (k, val)| {
-                        acc + (k as f64) * val * edge0.powi(k as i32 - 1)
-                    });
+                let cr_z = r.iter().enumerate().skip(1).fold(0.0, |acc, (k, val)| {
+                    acc + (k as f64) * val * edge0.powi(k as i32 - 1)
+                });
+                let cs_z = s.iter().enumerate().skip(1).fold(0.0, |acc, (k, val)| {
+                    acc + (k as f64) * val * edge0.powi(k as i32 - 1)
+                });
+                let crs_z = rs.iter().enumerate().skip(1).fold(0.0, |acc, (k, val)| {
+                    acc + (k as f64) * val * edge0.powi(k as i32 - 1)
+                });
                 let amp = crs - eta * cr * cs;
                 let amp_z = crs_z - eta_z * cr * cs - eta * cr_z * cs - eta * cr * cs_z;
                 let q_z = edge0 + eta * eta_z;
@@ -7400,8 +7388,7 @@ mod tests {
             cell_second_derivative_boundary_integrand(right, &right_r, &right_s, &right_rs, edge0);
         let fz_left = boundary_z_derivative(left, &left_r, &left_s, &left_rs);
         let fz_right = boundary_z_derivative(right, &right_r, &right_s, &right_rs);
-        let analytic =
-            edge_d12 * (f_left - f_right) + edge_d1 * edge_d2 * (fz_left - fz_right);
+        let analytic = edge_d12 * (f_left - f_right) + edge_d1 * edge_d2 * (fz_left - fz_right);
 
         let denom = analytic.abs().max(1e-8);
         let rel = (fd - analytic).abs() / denom;
