@@ -4725,11 +4725,24 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 power,
                 nullspace_order,
                 aniso_log_scales,
+                input_scales,
                 ..
             } => {
                 let operator_penalties = match &termspec.basis {
                     SmoothBasisSpec::Duchon { spec, .. } => spec.operator_penalties.clone(),
                     _ => crate::basis::DuchonOperatorPenaltySpec::default(),
+                };
+                // Slow-path Duchon realization stores centers/collocation points
+                // in standardized coordinates and compensates the user-facing
+                // length_scale by σ_geom before building penalties. The n-free
+                // re-key must use the same effective length scale, or the fast
+                // path pairs G(ψ_new) with an S(ψ_new) from a different
+                // coordinate scale.
+                let effective_ls = match input_scales.as_deref() {
+                    Some(scales) => {
+                        compensate_optional_length_scale_for_standardization(ls_opt, scales)
+                    }
+                    None => ls_opt,
                 };
                 crate::basis::duchon_penalties_at_length_scale(
                     centers.view(),
@@ -4739,7 +4752,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     *power,
                     *nullspace_order,
                     aniso_log_scales.as_deref(),
-                    ls_opt,
+                    effective_ls,
                     &mut self.basisworkspace,
                 )
                 .map_err(|e| e.to_string())?
