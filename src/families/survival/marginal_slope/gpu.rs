@@ -1512,7 +1512,8 @@ pub fn try_device_step6_joint_beta(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = &rows;
+        // No CUDA toolchain off Linux; `rows` was already consumed by the
+        // emptiness check above, and the host caller folds the contraction.
         Ok(None)
     }
 }

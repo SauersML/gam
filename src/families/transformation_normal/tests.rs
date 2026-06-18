@@ -2189,9 +2189,6 @@ pub(crate) fn ctn_pairwise_oracle_dumps_json() {
     let n_obs = family.weights.as_ref().len();
 
     eprintln!("[oracle] toy CTN: n={n_obs}, p_resp=2, p_cov=2, p_total={p_total}, ψ_dim={psi_dim}");
-    eprintln!("[oracle] β = {:?}", beta.as_slice().unwrap());
-    eprintln!("[oracle] ψ = {:?}", psi.as_slice().unwrap());
-    eprintln!("[oracle] v = {:?}", v.as_slice().unwrap());
 
     // The CTN psi-psi second-order kernel can return the dense block
     // either eagerly (`hessian_psi_psi`, p_total×p_total) or lazily
