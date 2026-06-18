@@ -437,7 +437,7 @@ pub fn assemble_bernoulli_marginal_slope_payload(
         ModelKind::MarginalSlope,
         FittedFamily::MarginalSlope {
             likelihood: marginal_likelihood_spec,
-            base_link: Some(base_link.clone()),
+            base_link: base_link.clone(),
             frailty,
         },
         FAMILY_BERNOULLI_MARGINAL_SLOPE.to_string(),

@@ -869,8 +869,7 @@ pub enum FittedFamily {
     },
     MarginalSlope {
         likelihood: LikelihoodSpec,
-        #[serde(default)]
-        base_link: Option<InverseLink>,
+        base_link: InverseLink,
         frailty: FrailtySpec,
     },
     Survival {
@@ -3217,7 +3216,7 @@ impl FittedModel {
             FittedFamily::Standard { link, .. } => {
                 Ok(stateful.or_else(|| link.map(InverseLink::Standard)))
             }
-            FittedFamily::MarginalSlope { base_link, .. } => Ok(base_link.clone()),
+            FittedFamily::MarginalSlope { base_link, .. } => Ok(Some(base_link.clone())),
             FittedFamily::Survival { .. }
             | FittedFamily::LatentSurvival { .. }
             | FittedFamily::LatentBinary { .. } => Ok(None),
@@ -4860,7 +4859,7 @@ mod tests {
             ModelKind::MarginalSlope,
             FittedFamily::MarginalSlope {
                 likelihood: LikelihoodSpec::binomial_probit(),
-                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
+                base_link: InverseLink::Standard(StandardLink::Probit),
                 frailty: FrailtySpec::None,
             },
             "bernoulli-marginal-slope".to_string(),

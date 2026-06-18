@@ -35,7 +35,7 @@ fn fitted_family_all_variants_round_trip_to_identical_json_bytes() {
         },
         FittedFamily::MarginalSlope {
             likelihood: LikelihoodSpec::binomial_probit(),
-            base_link: Some(InverseLink::Standard(StandardLink::Probit)),
+            base_link: InverseLink::Standard(StandardLink::Probit),
             frailty: FrailtySpec::None,
         },
         FittedFamily::Survival {
@@ -94,7 +94,7 @@ fn fitted_family_likelihood_returns_variant_specific_likelihood() {
     assert_eq!(
         FittedFamily::MarginalSlope {
             likelihood: ms.clone(),
-            base_link: None,
+            base_link: InverseLink::Standard(StandardLink::Probit),
             frailty: FrailtySpec::None,
         }
         .likelihood(),
@@ -200,7 +200,7 @@ fn from_payload_model_kind_maps_to_expected_fitted_model_variant() {
             },
             ModelKind::MarginalSlope => FittedFamily::MarginalSlope {
                 likelihood: LikelihoodSpec::binomial_probit(),
-                base_link: Some(InverseLink::Standard(StandardLink::Probit)),
+                base_link: InverseLink::Standard(StandardLink::Probit),
                 frailty: FrailtySpec::None,
             },
             ModelKind::Survival => FittedFamily::Survival {

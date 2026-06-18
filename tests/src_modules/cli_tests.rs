@@ -1642,7 +1642,7 @@ fn saved_bernoulli_marginal_slope_replays_main_and_logslope_deviation_runtimes()
                 ResponseFamily::Binomial,
                 InverseLink::Standard(StandardLink::Probit),
             ),
-            base_link: Some(InverseLink::Standard(StandardLink::Probit)),
+            base_link: InverseLink::Standard(StandardLink::Probit),
             frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
         },
         "bernoulli-marginal-slope".to_string(),
