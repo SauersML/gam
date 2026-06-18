@@ -2551,10 +2551,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 }
                 other => other,
             };
+            let mut eval_options =
+                joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
+            if let crate::families::row_kernel::RowSet::Subsample { rows, n_full } = row_set {
+                let subsample = crate::solver::outer_subsample::OuterScoreSubsample::from_weighted_rows(
+                    rows.as_ref().clone(),
+                    *n_full,
+                    0,
+                );
+                eval_options.outer_score_subsample = Some(Arc::new(subsample));
+                eval_options.auto_outer_subsample = false;
+            }
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
-                &joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol),
+                &eval_options,
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
