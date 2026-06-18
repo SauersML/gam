@@ -246,10 +246,6 @@ fn find_next_cfg_test_item_delimiter(source: &str, start: usize) -> Option<usize
     find_next_code_byte_where(source, start, |value| matches!(value, b'{' | b';'))
 }
 
-fn find_next_code_byte(source: &str, start: usize, needle: u8) -> Option<usize> {
-    find_next_code_byte_where(source, start, |value| value == needle)
-}
-
 fn find_next_code_byte_where(
     source: &str,
     start: usize,
