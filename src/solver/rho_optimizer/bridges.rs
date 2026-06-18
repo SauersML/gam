@@ -1159,9 +1159,23 @@ impl OuterSecondOrderBridge<'_> {
         eval: &OuterEval,
     ) -> Option<ObjectiveEvalError> {
         let bounds = self.cost_stall_bounds.clone();
+        let separation_bound_stationary = {
+            let guard = self.cost_stall.as_ref()?;
+            lower_bound_outward_active_count(
+                x,
+                &eval.gradient,
+                bounds.as_ref(),
+                guard.grad_threshold,
+            ) >= LOWER_BOUND_SEPARATION_ACTIVE_MIN
+        };
         let guard = self.cost_stall.as_mut()?;
         let projected_g_norm = projected_gradient_norm(x, &eval.gradient, bounds.as_ref());
-        match guard.observe(x, eval.cost, projected_g_norm) {
+        let stall_grad_norm = if separation_bound_stationary {
+            0.0
+        } else {
+            projected_g_norm
+        };
+        match guard.observe(x, eval.cost, stall_grad_norm) {
             CostStallVerdict::Continue => None,
             CostStallVerdict::Converged => {
                 log::info!(
@@ -1648,6 +1662,30 @@ pub(crate) fn projected_gradient_norm(
         None => gradient.iter().map(|v| v * v).sum::<f64>(),
     };
     sumsq.sqrt()
+}
+
+pub(crate) const LOWER_BOUND_SEPARATION_ACTIVE_MIN: usize = 2;
+
+/// Count log-precision axes pinned at their lower box bound while the raw
+/// gradient still points farther out of bounds. On near-separable softmax fits,
+/// those λ→0 axes can keep lowering the raw REML score even though the move is
+/// infeasible; once several such axes are active, repeated ARC trials there are
+/// constrained-stationary separation probes, not useful descent.
+#[inline]
+pub(crate) fn lower_bound_outward_active_count(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+    grad_threshold: f64,
+) -> usize {
+    let Some((lower, _upper)) = bounds else {
+        return 0;
+    };
+    let tol = 1.0e-10;
+    let outward_floor = grad_threshold.max(COST_STALL_PROJECTED_GRAD_FLOOR);
+    (0..x.len().min(gradient.len()).min(lower.len()))
+        .filter(|&i| x[i] <= lower[i] + tol && gradient[i] < -outward_floor)
+        .count()
 }
 
 #[inline]

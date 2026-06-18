@@ -1683,6 +1683,21 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
     assert!(published.converged);
 }
 
+#[test]
+fn lower_bound_outward_axes_mark_separation_stationarity() {
+    let lower = array![-10.0, -10.0, -10.0, -10.0];
+    let upper = array![10.0, 10.0, 10.0, 10.0];
+    let rho = array![-10.0, -10.0, 0.25, 1.0];
+    let gradient = array![-2.0e-2, -4.0e-2, 3.0, -1.0];
+
+    assert_eq!(
+        lower_bound_outward_active_count(&rho, &gradient, Some(&(lower, upper)), 1.0e-3),
+        LOWER_BOUND_SEPARATION_ACTIVE_MIN,
+        "two lower-bound axes with outward gradients are enough to identify \
+         a separation-bound stationary probe"
+    );
+}
+
 // Phase 5 (Cargo dep at opt 0.3) replaces the gam-side bridge
 // seed cache with `opt::{Bfgs, Arc, NewtonTrustRegion}::with_initial_sample`.
 // The two cache tests that lived here have been removed;
