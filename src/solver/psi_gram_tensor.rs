@@ -153,9 +153,6 @@ pub struct PsiGramTensor {
     /// callers must take the full `reset_surface` slow path for moving-ψ trials.
     skip_psi_lo: f64,
     skip_psi_hi: f64,
-    /// Original row count of the design whose Gram was tensorized. Needed to run
-    /// the Gram-derived RRQR with the same rank tolerance as the tall design.
-    n_rows: usize,
     /// Number of Chebyshev coefficients (degree + 1).
     n_coeff: usize,
     k: usize,
@@ -414,11 +411,10 @@ impl PsiGramTensor {
             // the value spot-check passes (`certify_gradient_window`).
             grad_psi_lo: psi_lo,
             grad_psi_hi: psi_hi,
-            // Provisional: `build` narrows these to the RRQR-pivot-stable
+            // Provisional: `build` narrows these to the reduced-basis-equality
             // interior after the spot-check passes (`compute_skip_window`).
             skip_psi_lo: psi_lo,
             skip_psi_hi: psi_hi,
-            n_rows: n,
             n_coeff: m,
             k,
             gram,
