@@ -1464,4 +1464,145 @@ mod tests {
             "kinked design must fail the tail-decay/spot-check certificates"
         );
     }
+
+    /// #1264 reduced-basis-equality witness — REFLEXIVITY + GAUGE INVARIANCE.
+    ///
+    /// `reduced_basis_equal(ψ, ψ)` is trivially sound (the surface is its own
+    /// reference), and the witness must accept two ψ's whose RANGE subspace is
+    /// identical even when the per-ψ eigenvECTORS differ (the projector is
+    /// gauge-invariant). The synthetic full-rank Matérn-shaped design's range is
+    /// the whole k-space for every ψ, so every in-window pair shares a reduced
+    /// basis and must certify.
+    #[test]
+    fn reduced_basis_witness_reflexive_and_gauge_invariant() {
+        let (n, k) = (160usize, 6usize);
+        let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.3 * ((i % 5) as f64)));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.29).sin()));
+        let (psi_lo, psi_hi) = (-1.0_f64, 0.8_f64);
+        let tensor =
+            PsiGramTensor::build(|psi| synth_design(psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
+                .expect("analytic synthetic design must certify");
+
+        // Reflexive: same ψ is always sound.
+        for &psi in &[-0.9, -0.2, 0.0, 0.5, 0.79] {
+            assert!(
+                tensor.reduced_basis_equal(psi, psi),
+                "witness must be reflexive at psi={psi}"
+            );
+        }
+        // The full-rank synthetic design spans all of k-space at every ψ, so the
+        // range projector is the identity for all ψ → every pair certifies.
+        let grid: Vec<f64> = (0..=12).map(|i| psi_lo + 0.05 + 0.06 * i as f64).collect();
+        for &a in &grid {
+            for &b in &grid {
+                assert!(
+                    tensor.reduced_basis_equal(a, b),
+                    "full-rank design: range is ψ-invariant (identity projector), \
+                     so the skip witness must certify (ψ_ref={a}, ψ_new={b})"
+                );
+            }
+        }
+        // Off-window ψ refuses.
+        assert!(!tensor.reduced_basis_equal(psi_lo - 0.5, 0.0));
+        assert!(!tensor.reduced_basis_equal(0.0, psi_hi + 0.5));
+    }
+
+    /// #1264 reduced-basis-equality witness — REFUSES across a genuine subspace
+    /// change (the exact failure mode of the old RRQR-only gate).
+    ///
+    /// Construct a design whose first two columns are fixed (ψ-invariant) profiles
+    /// and whose third column's AMPLITUDE `ε(ψ) = e^{αψ}` analytically sweeps the
+    /// third eigendirection's eigenvalue `∝ ε²` across the rank-revealing cutoff.
+    /// Below the cutoff the reduced (range) basis is the 2-D span of the first two
+    /// profiles; above it the range is 3-D. Two ψ's on the SAME side of the
+    /// threshold share a reduced basis (witness accepts); two ψ's STRADDLING it do
+    /// not (witness refuses) — exactly the stale-basis pairing the design-revision
+    /// fast path must not perform. The amplitude is smooth/analytic so the tensor
+    /// still certifies (this is a reduced-basis change, not a non-analytic kink).
+    #[test]
+    fn reduced_basis_witness_refuses_across_subspace_change() {
+        let (n, k) = (200usize, 3usize);
+        // Three fixed, well-separated column profiles (full column rank when all
+        // present). The third is scaled by ε(ψ).
+        let base = |i: usize, j: usize| -> f64 {
+            let t = (i as f64 + 0.5) / n as f64;
+            match j {
+                0 => 1.0,
+                1 => (2.0 * std::f64::consts::PI * t).sin(),
+                _ => (4.0 * std::f64::consts::PI * t).cos(),
+            }
+        };
+        // ε(ψ) crosses √cutoff (relative to λ_max ~ O(n)) within the window: at
+        // λ_max ≈ n the cutoff is rank_rtol·n ≈ 1e-10·200 = 2e-8, so the third
+        // eigenvalue ε²·‖c3‖² ≈ ε²·(n/2) crosses it at ε ≈ sqrt(4e-8/n) ≈ 1.4e-5,
+        // i.e. ψ* ≈ ln(1.4e-5)/α. With α = 10 and window [−1.6,−0.8], ψ* ≈ −1.12
+        // sits inside the window, giving a clean below/above split.
+        let alpha = 10.0_f64;
+        let design = move |psi: f64| -> Result<Array2<f64>, String> {
+            let eps = (alpha * psi).exp();
+            let mut x = Array2::<f64>::zeros((n, k));
+            for i in 0..n {
+                x[[i, 0]] = base(i, 0);
+                x[[i, 1]] = base(i, 1);
+                x[[i, 2]] = eps * base(i, 2);
+            }
+            Ok(x)
+        };
+        let w = Array1::from_elem(n, 1.0);
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.13).sin()));
+        let (psi_lo, psi_hi) = (-1.6_f64, -0.8_f64);
+        let tensor = PsiGramTensor::build(design, w.view(), z.view(), psi_lo, psi_hi)
+            .expect("smooth ε(ψ) design must still certify (analytic, no kink)");
+
+        // Find the actual threshold by scanning the rank.
+        let rank_at = |psi: f64| -> usize {
+            tensor
+                .range_projector(psi, PSI_GRAM_SKIP_RANK_RTOL)
+                .map(|(_, r)| r)
+                .unwrap_or(0)
+        };
+        let lo_rank = rank_at(psi_lo + 0.02);
+        let hi_rank = rank_at(psi_hi - 0.02);
+        assert_eq!(
+            lo_rank, 2,
+            "low-ψ end must be rank-2 (third column below cutoff)"
+        );
+        assert_eq!(
+            hi_rank, 3,
+            "high-ψ end must be rank-3 (third column above cutoff)"
+        );
+
+        // Same-side pairs (both rank-2) certify; straddling pairs refuse.
+        let psi_low_a = psi_lo + 0.05;
+        let psi_low_b = psi_lo + 0.10;
+        assert_eq!(rank_at(psi_low_a), 2);
+        assert_eq!(rank_at(psi_low_b), 2);
+        assert!(
+            tensor.reduced_basis_equal(psi_low_a, psi_low_b),
+            "two low-ψ trials share the rank-2 reduced basis → skip is sound"
+        );
+        let psi_high_a = psi_hi - 0.05;
+        let psi_high_b = psi_hi - 0.10;
+        assert_eq!(rank_at(psi_high_a), 3);
+        assert_eq!(rank_at(psi_high_b), 3);
+        // High-side: the range is the full 3-D space at both, so the projector is
+        // the identity at both → still a shared reduced basis.
+        assert!(
+            tensor.reduced_basis_equal(psi_high_a, psi_high_b),
+            "two high-ψ trials share the rank-3 reduced basis → skip is sound"
+        );
+        // Straddling the rank change: the reduced basis MOVED (2-D → 3-D). The
+        // witness MUST refuse — this is precisely the stale-basis pairing the old
+        // RRQR-only gate let through.
+        assert!(
+            !tensor.reduced_basis_equal(psi_low_a, psi_high_a),
+            "witness must REFUSE a skip that straddles the reduced-basis (rank) \
+             change — freezing the low-ψ rank-2 basis and re-keying the high-ψ \
+             rank-3 Gram is the exact ~7.8e-2 β̂ regression #1264 guards"
+        );
+        assert!(
+            !tensor.reduced_basis_equal(psi_high_a, psi_low_a),
+            "witness must refuse symmetrically (high pin, low trial)"
+        );
+    }
 }
