@@ -805,10 +805,13 @@ pub(crate) fn joint_ift_cache_matches_theta(
     true
 }
 
-pub(crate) static IFT_LATEST_OUTER_THETA: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
+thread_local! {
+    pub(crate) static IFT_LATEST_OUTER_THETA: std::cell::RefCell<Option<Array1<f64>>> =
+        const { std::cell::RefCell::new(None) };
 
-pub(crate) static IFT_LATEST_OUTER_RHO_UPPER_BOUNDS: OnceLock<Mutex<Option<Array1<f64>>>> =
-    OnceLock::new();
+    pub(crate) static IFT_LATEST_OUTER_RHO_UPPER_BOUNDS: std::cell::RefCell<Option<Array1<f64>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
     let value = if theta.is_empty() || theta.iter().any(|v| !v.is_finite()) {
@@ -816,10 +819,7 @@ pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
     } else {
         Some(theta.clone())
     };
-    *IFT_LATEST_OUTER_THETA
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap() = value;
+    IFT_LATEST_OUTER_THETA.with(|slot| *slot.borrow_mut() = value);
 }
 
 pub(crate) fn record_current_outer_rho_upper_bounds_for_ift(upper: &Array1<f64>) {
@@ -828,26 +828,15 @@ pub(crate) fn record_current_outer_rho_upper_bounds_for_ift(upper: &Array1<f64>)
     } else {
         Some(upper.clone())
     };
-    *IFT_LATEST_OUTER_RHO_UPPER_BOUNDS
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap() = value;
+    IFT_LATEST_OUTER_RHO_UPPER_BOUNDS.with(|slot| *slot.borrow_mut() = value);
 }
 
 pub(crate) fn latest_outer_rho_upper_bounds_for_ift() -> Option<Array1<f64>> {
-    IFT_LATEST_OUTER_RHO_UPPER_BOUNDS
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap()
-        .clone()
+    IFT_LATEST_OUTER_RHO_UPPER_BOUNDS.with(|slot| slot.borrow().clone())
 }
 
 pub(crate) fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
-    IFT_LATEST_OUTER_THETA
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap()
-        .clone()
+    IFT_LATEST_OUTER_THETA.with(|slot| slot.borrow().clone())
 }
 
 pub(crate) fn l2_norm(values: &Array1<f64>) -> f64 {
