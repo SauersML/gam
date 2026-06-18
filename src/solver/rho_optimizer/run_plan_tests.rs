@@ -1437,6 +1437,116 @@ fn arc_bridge_cost_stall_certifies_at_bound_separation() {
     assert_eq!(published.value, 1.0);
 }
 
+/// Near-separable multinomial timeout (#1082/#1237), infeasible-trial arm. ARC
+/// finds one feasible iterate, then keeps probing the unbounded λ→0 separating
+/// region where the inner softmax solve does not converge and every trial comes
+/// back INFEASIBLE (cost = +∞). Those infeasible trials are rejected by the
+/// finite-eval validator BEFORE the finite cost-stall guard sees them, so the
+/// no-improvement window can never fill — and the outer loop used to grind to
+/// `max_iter` (the timeout). The bridge now feeds infeasible trials to the
+/// guard's dedicated infeasible-streak path: a run of `COST_STALL_WINDOW`
+/// consecutive infeasible trials after a feasible best halts ARC at that best
+/// feasible iterate. This drives the ARC bridge directly and asserts the halt.
+#[test]
+fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
+    let lo = array![-10.0];
+    let hi = array![10.0];
+    // The single feasible point: a small projected gradient so the eventual
+    // halt certifies CONVERGED (a clean stationary optimum on the feasible side).
+    let feasible_rho = array![0.0];
+    let eval_idx = std::cell::Cell::new(0usize);
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either);
+    let feasible_for_obj = feasible_rho.clone();
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        |_: &mut (), _: &Array1<f64>| Ok(1.0),
+        |_: &mut (), _: &Array1<f64>| {
+            Err(EstimationError::InvalidInput(
+                "legacy eager eval should not run".to_string(),
+            ))
+        },
+        move |_: &mut (), x: &Array1<f64>, order: OuterEvalOrder| {
+            let n = eval_idx.get();
+            eval_idx.set(n + 1);
+            // First call: the lone feasible iterate (finite cost, tiny gradient).
+            // Every later call: an infeasible λ→0 probe (cost = +∞).
+            if n == 0 && x == &feasible_for_obj {
+                Ok(OuterEval {
+                    cost: 1.0,
+                    gradient: array![1.0e-9],
+                    hessian: match order {
+                        OuterEvalOrder::ValueGradientHessian => {
+                            HessianResult::Analytic(array![[1.0]])
+                        }
+                        _ => HessianResult::Unavailable,
+                    },
+                    inner_beta_hint: None,
+                })
+            } else {
+                Ok(OuterEval::infeasible(1))
+            }
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, 1.0e-3, exit.clone());
+    let mut bridge = OuterSecondOrderBridge {
+        obj: &mut obj,
+        layout: OuterThetaLayout::new(1, 0),
+        hessian_source: HessianSource::Analytic,
+        materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+        eval_count: 0,
+        outer_inner_cap: None,
+        g_norm_initial: None,
+        last_g_norm: None,
+        last_value_grad_rho: None,
+        cost_stall: Some(guard),
+        cost_stall_bounds: Some((lo.clone(), hi.clone())),
+    };
+    // One feasible eval records the best; the next `COST_STALL_WINDOW` infeasible
+    // evals fill the infeasible-streak window and trip the sentinel.
+    let mut sentinel_fired = false;
+    // First: the feasible iterate.
+    SecondOrderObjective::eval_hessian(&mut bridge, &feasible_rho)
+        .expect("feasible iterate must evaluate cleanly");
+    let separating = array![-10.0];
+    for _ in 0..(COST_STALL_WINDOW + 2) {
+        match SecondOrderObjective::eval_hessian(&mut bridge, &separating) {
+            Ok(_) => panic!("an infeasible (cost=∞) trial must not return a finite sample"),
+            Err(ObjectiveEvalError::Fatal { message }) => {
+                assert_eq!(
+                    message, COST_STALL_CONVERGED_SENTINEL,
+                    "infeasible-run halt must use the shared convergence sentinel"
+                );
+                sentinel_fired = true;
+                break;
+            }
+            // Before the window fills, infeasible trials surface as the normal
+            // recoverable non-finite-cost error (the optimizer shrinks + retries).
+            Err(ObjectiveEvalError::Recoverable { .. }) => {}
+            Err(other) => panic!("unexpected ARC bridge error: {other:?}"),
+        }
+    }
+    assert!(
+        sentinel_fired,
+        "ARC bridge must halt after {} consecutive infeasible separating trials",
+        COST_STALL_WINDOW
+    );
+    let published = exit.lock().unwrap().take().expect("best iterate published");
+    assert!(
+        published.converged,
+        "halt back to the feasible iterate (projected |g|≈1e-9 ≤ 1e-3) must certify CONVERGED"
+    );
+    assert_eq!(
+        published.rho, feasible_rho,
+        "the published best must be the lone FEASIBLE iterate, not a separating λ→0 probe"
+    );
+    assert_eq!(published.value, 1.0, "published cost is the feasible cost");
+}
+
 // Phase 5 (Cargo dep at opt 0.3) replaces the gam-side bridge
 // seed cache with `opt::{Bfgs, Arc, NewtonTrustRegion}::with_initial_sample`.
 // The two cache tests that lived here have been removed;

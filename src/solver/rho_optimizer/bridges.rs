@@ -219,6 +219,17 @@ pub(crate) struct CostStallGuard {
     best_rho: Option<Array1<f64>>,
     best_grad_norm: f64,
     no_improve_streak: usize,
+    /// Consecutive infeasible (non-finite cost) outer trials since the last
+    /// finite observation. On a near-separable multinomial fit ARC repeatedly
+    /// probes the unbounded λ→0 separating region where the inner softmax solve
+    /// does not converge and returns `OuterEval::infeasible` (cost=∞). Those
+    /// trials never produce a finite descent, so the normal `no_improve_streak`
+    /// (which only counts finite trials) can never fill its window — the loop
+    /// would otherwise grind to `max_iter`. A run of `window` consecutive
+    /// infeasible trials, once a finite best is in hand, is the same "no further
+    /// real progress" signal and trips the same halt at the best feasible
+    /// iterate (#1082/#1237).
+    infeasible_streak: usize,
     accepted_iters: usize,
     /// Shared publication slot read by the seed-loop runner after
     /// `optimizer.run()` returns the sentinel error.
@@ -240,6 +251,7 @@ impl CostStallGuard {
             best_rho: None,
             best_grad_norm: f64::INFINITY,
             no_improve_streak: 0,
+            infeasible_streak: 0,
             accepted_iters: 0,
             exit,
         }
@@ -258,10 +270,15 @@ impl CostStallGuard {
         if !value.is_finite() {
             // A non-finite accepted objective is the inner-solver's problem,
             // not a stall; reset so a later real descent is not falsely
-            // credited as a no-improvement step.
+            // credited as a no-improvement step. The dedicated infeasible-trial
+            // bookkeeping lives in `observe_infeasible`; this finite-path entry
+            // is left untouched for non-finite values.
             self.no_improve_streak = 0;
             return CostStallVerdict::Continue;
         }
+        // A finite trial means the inner solve produced a real cost: the
+        // separating-region infeasible run is broken, so clear its streak.
+        self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         let improvement = self.best_value - value;
         let floor = self.rel_tol * (1.0 + self.best_value.abs());
@@ -278,6 +295,45 @@ impl CostStallGuard {
         if self.no_improve_streak < self.window {
             return CostStallVerdict::Continue;
         }
+        self.publish_stall(rho, value, grad_norm)
+    }
+
+    /// Fold one INFEASIBLE outer trial (non-finite cost — typically a near-λ=0
+    /// separating point whose inner softmax solve did not converge) into the
+    /// guard. ARC keeps proposing these on a near-separable multinomial fit and
+    /// they never reach `observe` with a finite value, so without this the
+    /// no-improvement window can never fill and the outer loop grinds to
+    /// `max_iter` (#1082/#1237). A run of `window` consecutive infeasible trials
+    /// — provided a finite best is already in hand to halt back to — is the same
+    /// "no further real progress" signal and trips the same halt.
+    ///
+    /// Returns `Continue` until the infeasible streak fills the window; never
+    /// fires before any finite iterate has been recorded (there would be nothing
+    /// to halt back to).
+    fn observe_infeasible(&mut self, rho: &Array1<f64>) -> CostStallVerdict {
+        if self.best_rho.is_none() || !self.best_value.is_finite() {
+            // No feasible iterate recorded yet: an infeasible run this early is
+            // the inner solver's startup problem, not a converged stall. Keep
+            // descending so the optimizer can find its first feasible point.
+            return CostStallVerdict::Continue;
+        }
+        self.infeasible_streak = self.infeasible_streak.saturating_add(1);
+        if self.infeasible_streak < self.window {
+            return CostStallVerdict::Continue;
+        }
+        // Halt back to the best feasible iterate. Its projected gradient decides
+        // converged-vs-flat-valley exactly as the finite stall path does.
+        self.publish_stall(rho, self.best_value, self.best_grad_norm)
+    }
+
+    /// Publish the best iterate to the shared exit cell and decide the stall
+    /// verdict. Shared by the finite-stall and infeasible-stall paths.
+    fn publish_stall(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+    ) -> CostStallVerdict {
         // Publish the best iterate. Prefer the recorded best; fall back to the
         // current point if (pathologically) none was stored.
         let best_rho = self.best_rho.clone().unwrap_or_else(|| rho.clone());
@@ -1111,6 +1167,49 @@ impl OuterSecondOrderBridge<'_> {
             }
         }
     }
+
+    /// Fold one INFEASIBLE ARC trial (non-finite cost) into the cost-stall
+    /// guard. Mirrors `observe_cost_stall` but routes through the guard's
+    /// infeasible-streak path: a run of `COST_STALL_WINDOW` consecutive
+    /// infeasible trials after a feasible best halts the outer loop at that
+    /// best feasible iterate rather than letting ARC grind to `max_iter`
+    /// probing the unbounded λ→0 separating region (#1082/#1237).
+    fn observe_cost_stall_infeasible(&mut self, x: &Array1<f64>) -> Option<ObjectiveEvalError> {
+        let guard = self.cost_stall.as_mut()?;
+        match guard.observe_infeasible(x) {
+            CostStallVerdict::Continue => None,
+            CostStallVerdict::Converged => {
+                log::info!(
+                    "[OUTER] ARC cost-stall convergence (infeasible run): {} consecutive \
+                     infeasible λ→0 trials after the best feasible iterate, whose projected \
+                     gradient cleared the outer tolerance (|g|={:.3e} <= {:.3e}); accepting \
+                     best feasible as a stationary optimum (value={:.6e}).",
+                    guard.window,
+                    guard.best_grad_norm,
+                    guard.grad_threshold,
+                    guard.best_value,
+                );
+                Some(ObjectiveEvalError::Fatal {
+                    message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                })
+            }
+            CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
+                log::warn!(
+                    "[OUTER] ARC cost-stall halt (infeasible run): {} consecutive infeasible \
+                     λ→0 trials after the best feasible iterate, whose projected gradient is \
+                     still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); halting at the best \
+                     feasible iterate and reporting NON-CONVERGED (value={:.6e}).",
+                    guard.window,
+                    residual_grad_norm,
+                    guard.grad_threshold,
+                    guard.best_value,
+                );
+                Some(ObjectiveEvalError::Fatal {
+                    message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                })
+            }
+        }
+    }
 }
 
 impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
@@ -1170,6 +1269,19 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
+        // Infeasible (non-finite cost) trials are the near-separable
+        // multinomial failure mode: ARC probes the unbounded λ→0 separating
+        // region where the inner softmax solve does not converge. These never
+        // reach `observe_cost_stall` below (validation rejects them), so feed
+        // them to the guard's dedicated infeasible-streak path FIRST — a run of
+        // consecutive infeasible trials after a feasible best halts the outer
+        // loop at that best iterate instead of grinding to `max_iter`
+        // (#1082/#1237).
+        if !eval.cost.is_finite() {
+            if let Some(err) = self.observe_cost_stall_infeasible(x) {
+                return Err(err);
+            }
+        }
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
