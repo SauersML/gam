@@ -52,5 +52,7 @@ mod lbfgs_secant_pair_curvature_positive;
 mod no_production_finite_differences;
 #[path = "autodiff/objective_gradient_consistency_universal.rs"]
 mod objective_gradient_consistency_universal;
+#[path = "autodiff/survival_laml_erfc_oracle_931.rs"]
+mod survival_laml_erfc_oracle_931;
 #[path = "autodiff/zero_gradient_proposes_zero_step.rs"]
 mod zero_gradient_proposes_zero_step;
