@@ -1460,7 +1460,10 @@ fn fit_cause_specific_survival_transformation_custom(
                     col_range: block.range.clone(),
                     total_dim: p,
                 }
-                .with_precision_label(format!("cause_specific_survival_penalty_{penalty_idx}")),
+                .with_precision_label(format!(
+                    "cause_specific_survival_cause_{}_penalty_{penalty_idx}",
+                    cause + 1
+                )),
             );
             nullspace_dims.push(block.nullspace_dim);
             initial_log_lambdas[penalty_idx] = block.lambda.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln();
@@ -1518,8 +1521,11 @@ fn fit_cause_specific_survival_transformation_custom(
         compute_covariance: false,
         ..Default::default()
     };
-    let rho_prior =
-        cause_specific_survival_rho_prior(penalty_blocks.len(), penalty_block_gamma_priors)?;
+    let rho_prior = cause_specific_survival_rho_prior(
+        cause_count,
+        penalty_blocks.len(),
+        penalty_block_gamma_priors,
+    )?;
     let mut fit = fit_custom_family_with_rho_prior(&family, &block_specs, &fit_options, rho_prior)
         .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
     fit.likelihood_family = Some(LikelihoodSpec::royston_parmar());
@@ -1571,6 +1577,7 @@ fn fit_cause_specific_survival_transformation_custom(
 }
 
 fn cause_specific_survival_rho_prior(
+    cause_count: usize,
     penalty_count: usize,
     penalty_block_gamma_priors: &[(String, f64, f64)],
 ) -> Result<crate::types::RhoPrior, String> {
@@ -1605,17 +1612,22 @@ fn cause_specific_survival_rho_prior(
         }
     }
     let mut consumed = Vec::<String>::new();
-    let mut priors = Vec::<crate::types::RhoPrior>::with_capacity(penalty_count);
-    for penalty_idx in 0..penalty_count {
-        let label = format!("cause_specific_survival_penalty_{penalty_idx}");
-        if let Some((shape, rate)) = keyed.get(&label) {
-            consumed.push(label);
-            priors.push(crate::types::RhoPrior::GammaPrecision {
-                shape: *shape,
-                rate: *rate,
-            });
-        } else {
-            priors.push(crate::types::RhoPrior::Flat);
+    let mut priors = Vec::<crate::types::RhoPrior>::with_capacity(cause_count * penalty_count);
+    for cause in 0..cause_count {
+        for penalty_idx in 0..penalty_count {
+            let label = format!(
+                "cause_specific_survival_cause_{}_penalty_{penalty_idx}",
+                cause + 1
+            );
+            if let Some((shape, rate)) = keyed.get(&label) {
+                consumed.push(label);
+                priors.push(crate::types::RhoPrior::GammaPrecision {
+                    shape: *shape,
+                    rate: *rate,
+                });
+            } else {
+                priors.push(crate::types::RhoPrior::Flat);
+            }
         }
     }
     let unknown = keyed
@@ -1624,8 +1636,12 @@ fn cause_specific_survival_rho_prior(
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
-        let available = (0..penalty_count)
-            .map(|idx| format!("cause_specific_survival_penalty_{idx}"))
+        let available = (0..cause_count)
+            .flat_map(|cause| {
+                (0..penalty_count).map(move |idx| {
+                    format!("cause_specific_survival_cause_{}_penalty_{idx}", cause + 1)
+                })
+            })
             .collect::<Vec<_>>()
             .join(", ");
         return Err(WorkflowError::InvalidConfig {

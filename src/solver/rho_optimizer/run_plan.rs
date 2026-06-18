@@ -900,11 +900,13 @@ pub(crate) fn run_outer_with_plan(
                     // KKT-stationary even though its raw ∂V/∂ρ never vanishes).
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
-                    let cost_stall_rel_tol = (config.tolerance * 1.0e-2).max(f64::EPSILON);
+                    let cost_stall_rel_tol =
+                        (config.tolerance * 1.0e-2).max(COST_STALL_REL_TOL_FLOOR);
                     let arc_seed_grad_norm =
                         seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-                    let cost_stall_grad_threshold =
-                        grad_tol.threshold(seed_eval.cost, arc_seed_grad_norm);
+                    let cost_stall_grad_threshold = grad_tol
+                        .threshold(seed_eval.cost, arc_seed_grad_norm)
+                        .max(COST_STALL_PROJECTED_GRAD_FLOOR);
 
                     let objective = OuterSecondOrderBridge {
                         obj,
@@ -918,7 +920,7 @@ pub(crate) fn run_outer_with_plan(
                         last_value_grad_rho: None,
                         cost_stall: Some(CostStallGuard::new(
                             cost_stall_rel_tol,
-                            COST_STALL_WINDOW,
+                            ARC_COST_STALL_WINDOW,
                             cost_stall_grad_threshold,
                             cost_stall_exit.clone(),
                         )),
@@ -1236,27 +1238,25 @@ pub(crate) fn run_outer_with_plan(
                     // Cost-stall convergence shared cell (#1089). The bridge is
                     // moved into `opt::Bfgs`, so the best iterate it captures on
                     // a flat-valley stall is handed back through this `Arc`.
-                    // Relative score-change floor is derived one decade tighter
-                    // than the outer gradient tolerance so it only triggers once
-                    // the objective is genuinely flat — never preempting a real
-                    // (if slow) descent that still clears the gradient test.
+                    // Relative score-change floor is derived from the outer
+                    // tolerance but has a numerical floor so very tight user
+                    // tolerances do not disable the mgcv-style flat-valley stop.
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
-                    let cost_stall_rel_tol = (config.tolerance * 1.0e-2).max(f64::EPSILON);
+                    let cost_stall_rel_tol =
+                        (config.tolerance * 1.0e-2).max(COST_STALL_REL_TOL_FLOOR);
                     // Stationarity gate for the cost-stall exit. Convergence must
                     // mean stationarity, not cost-flatness: a cost stall only
                     // counts as a converged optimum when the projected gradient
                     // norm at the best iterate clears the SAME outer gradient
-                    // tolerance the genuine BFGS convergence path uses. Evaluate
-                    // that threshold once at the seed (cost + initial gradient
-                    // norm), exactly as `opt::Bfgs` does internally. Reusing
-                    // `grad_tol` here means no new/widened tolerance is
-                    // introduced — a flat-valley stall whose residual gradient
-                    // exceeds this is surfaced as non-converged.
+                    // tolerance the genuine BFGS convergence path uses, with
+                    // the same practical floor the ARC guard uses for
+                    // bound-pinned separation fits.
                     let seed_grad_norm =
                         seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-                    let cost_stall_grad_threshold =
-                        grad_tol.threshold(seed_eval.cost, seed_grad_norm);
+                    let cost_stall_grad_threshold = grad_tol
+                        .threshold(seed_eval.cost, seed_grad_norm)
+                        .max(COST_STALL_PROJECTED_GRAD_FLOOR);
                     let objective = OuterFirstOrderBridge {
                         obj,
                         layout,

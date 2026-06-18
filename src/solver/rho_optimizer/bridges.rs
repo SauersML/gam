@@ -175,6 +175,9 @@ pub(crate) enum CostStallVerdict {
 /// but, crucially, is gated on the cost alone (not on gradient smallness),
 /// which is the condition `opt` never checks in isolation.
 pub(crate) const COST_STALL_WINDOW: usize = 6;
+pub(crate) const ARC_COST_STALL_WINDOW: usize = 3;
+pub(crate) const COST_STALL_REL_TOL_FLOOR: f64 = 1.0e-7;
+pub(crate) const COST_STALL_PROJECTED_GRAD_FLOOR: f64 = 1.0e-3;
 
 /// Best iterate captured by a cost-stall convergence, handed from the bridge
 /// (which is moved into `opt::Bfgs`) back to the seed-loop runner via the
@@ -300,8 +303,7 @@ impl CostStallGuard {
         // fill and the guard halts at the (stationary) best feasible iterate.
         // `opt::Arc`'s own gradient-tolerance check never trips here because it
         // tests the RAW gradient, which points out of the box forever.
-        let kkt_stationary_at_bound =
-            grad_norm.is_finite() && grad_norm <= self.grad_threshold;
+        let kkt_stationary_at_bound = grad_norm.is_finite() && grad_norm <= self.grad_threshold;
         if improvement <= floor || kkt_stationary_at_bound {
             self.no_improve_streak = self.no_improve_streak.saturating_add(1);
         } else {
@@ -343,12 +345,7 @@ impl CostStallGuard {
 
     /// Publish the best iterate to the shared exit cell and decide the stall
     /// verdict. Shared by the finite-stall and infeasible-stall paths.
-    fn publish_stall(
-        &mut self,
-        rho: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-    ) -> CostStallVerdict {
+    fn publish_stall(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) -> CostStallVerdict {
         // Publish the best iterate. Prefer the recorded best; fall back to the
         // current point if (pathologically) none was stored.
         let best_rho = self.best_rho.clone().unwrap_or_else(|| rho.clone());
