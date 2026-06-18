@@ -1284,6 +1284,30 @@ fn survival_objective_gradient_consistent_interior() {
 // points ρ=4 and ρ=8, whose value surfaces are smooth.
 
 #[test]
+fn survival_boundary_rho_eight_value_probe_931() {
+    let model = survival_single_block_model(1.0);
+    let beta0 = array![-2.5_f64, 1.0];
+    let base = array![8.0_f64];
+    let analytic = survival_grad(&model, &beta0, &base)[0];
+    let v0 = survival_cost(&model, &beta0, &base);
+    println!("[931-R8] analytic={analytic:.15e} V(8)={v0:.15e}");
+    for h in [1.0e-5_f64, 1.0e-4, 5.0e-4, 1.0e-3, 2.0e-3, 4.0e-3] {
+        let mut rp = base.clone();
+        rp[0] += h;
+        let mut rm = base.clone();
+        rm[0] -= h;
+        let vp = survival_cost(&model, &beta0, &rp);
+        let vm = survival_cost(&model, &beta0, &rm);
+        let fd = (vp - vm) / (2.0 * h);
+        println!(
+            "[931-R8] h={h:.1e} V(8+h)={vp:.15e} V(8-h)={vm:.15e} dV={:.6e} fd={fd:.12e}",
+            vp - vm
+        );
+    }
+    panic!("[931-R8] probe complete (intentional fail to surface stdout)");
+}
+
+#[test]
 fn survival_objective_gradient_consistent_at_large_lambda_boundary() {
     let model = survival_single_block_model(1.0);
     let beta0 = array![-2.5_f64, 1.0];
