@@ -4933,6 +4933,24 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // (skip_c={skip_c}) yet the value-covered skip gate still fires the fast path.
     // The β̂ bit-identity check below is the load-bearing soundness proof that the
     // rotated-basis skip never changes the κ-optimum.
+    //
+    // SOUNDNESS WITNESS (#1033 witness-C): the entire point of the #1033 fix is
+    // that dropping `reduced_basis_equal` as a skip precondition is sound EVEN WHEN
+    // THE BASIS GENUINELY ROTATES. If ψ_C did not actually rotate the reduced basis
+    // (witness would ADMIT it), this trial would prove nothing about the rotation
+    // case and the gate would be vacuous — a silent pass that masks the open gap.
+    // Assert ψ_C is a real rotation (the witness REFUSES it) so the bit-identity
+    // proof below is non-vacuous. If a future fixture change makes the low-edge ψ
+    // stop rotating the basis, this fires and tells us to pick a more rotated ψ_C
+    // rather than passing on a degenerate fixture.
+    assert!(
+        !skip_c,
+        "ψ_C={psi_c:.6} must GENUINELY rotate the reduced basis (reduced_basis_equal \
+         must REFUSE the pin↔ψ_C pair) so the bit-identity check below is a real \
+         rotated-basis soundness proof, not a vacuous same-basis pass; if this fires \
+         the standardized fixture's low-edge basis stopped rotating — pick a ψ_C \
+         further toward the edge"
+    );
     let before_c = tensor_eval.slow_path_reset_count();
     let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c));
     let after_c = tensor_eval.slow_path_reset_count();
@@ -5008,11 +5026,20 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             let babs = (beta_fast[j] - beta_slow[j]).abs();
             let brel = babs / (1.0 + beta_slow[j].abs());
             worst = worst.max(babs);
+            // #1033 witness-C headline soundness bar: 1e-10, not 1e-6. Both the
+            // fast-path and streamed solves read XᵀWX(ψ)/XᵀW(y−offset)(ψ) from the
+            // SAME re-keyed k×k Gaussian Gram cache and conjugate by the SAME
+            // penalty-derived Qs, so a sound skip is bit-identical to floating
+            // round-off (~1e-12), NOT merely 1e-6-close. A 1e-6-but-not-1e-10
+            // divergence would mean some n-row (`self.x`) statistic still leaks into
+            // β̂ across the rotation — exactly the wrong-β̂ leak this witness must
+            // catch. Hold the tight bar.
             assert!(
-                brel <= 1e-6,
+                brel <= 1e-10,
                 "fast-path β̂[{j}] @ {label} diverges from streamed slow path: \
                  fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} rel={brel:.3e} — the \
-                 n-free fast path changed the κ-optimum",
+                 n-free fast path changed the κ-optimum (rotated-basis skip leaked an \
+                 n-row statistic into β̂; soundness bar is 1e-10)",
                 beta_fast[j],
                 beta_slow[j],
             );
@@ -5027,9 +5054,10 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
 
     eprintln!(
         "[psi-gram-tensor #1033/#1264] pairwise reduced-basis-equality witness: \
-         skip(ψ_b)={skip_b} skip(ψ_c)={skip_c}, slow_path_reset_count={}, worst \
-         |Δβ̂| vs streamed slow path = {worst:.3e} (≤ the 1e-6 soundness bar on \
-         WHICHEVER path fired)",
+         skip(ψ_b)={skip_b} skip(ψ_c={psi_c:.4} ROTATED)={skip_c}, \
+         slow_path_reset_count={}, worst |Δβ̂| vs streamed slow path = {worst:.3e} \
+         (≤ the 1e-10 #1033 witness-C soundness bar — bit-identical across the basis \
+         rotation the witness refuses)",
         tensor_eval.slow_path_reset_count()
     );
 }
