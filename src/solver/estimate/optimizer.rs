@@ -49,10 +49,11 @@ where
 pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
     let gaussian = matches!(link, LinkFunction::Identity);
     if k >= REML_SEED_SCREENING_RHO_CAP {
+        let glm_seed_budget = if gaussian { 1 } else { 2 };
         return SeedConfig {
             bounds: (-12.0, 12.0),
-            max_seeds: 1,
-            seed_budget: 1,
+            max_seeds: glm_seed_budget,
+            seed_budget: glm_seed_budget,
             risk_profile: if gaussian {
                 SeedRiskProfile::Gaussian
             } else {
