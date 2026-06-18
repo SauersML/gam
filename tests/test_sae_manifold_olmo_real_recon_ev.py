@@ -125,6 +125,10 @@ def _fit_and_score_olmo_real(queue: mp.Queue) -> None:
             learning_rate=0.04,
             random_state=0,
         )
+        uses_affine_pca_lane = (
+            getattr(fit, "_oos_affine_pca_mean", None) is not None
+            or getattr(fit, "_oos_affine_pca_components", None) is not None
+        )
         in_sample_ev = _ev(z_train, fit.fitted)
         if not hasattr(fit, "reconstruct"):
             queue.put(
@@ -146,6 +150,7 @@ def _fit_and_score_olmo_real(queue: mp.Queue) -> None:
                 "oos_ev": float(_ev(z_test, oos)),
                 "oos_shape": tuple(oos.shape),
                 "oos_finite": bool(np.all(np.isfinite(oos))),
+                "uses_affine_pca_lane": bool(uses_affine_pca_lane),
             }
         )
     except BaseException:
@@ -197,6 +202,14 @@ def test_olmo_real_heldout_reconstruction_ev_meets_linear_parity():
     assert result["ok"], result.get("error", "OLMo fit failed")
     assert result["oos_shape"] == z_test.shape
     assert result["oos_finite"], "OOS reconstruction produced NaN/Inf"
+    assert not result["uses_affine_pca_lane"], (
+        "The real-OLMo #1026 gate must exercise the production manifold-SAE "
+        "decoder and frozen-decoder OOS solve. Returning an affine PCA projector "
+        "from sae_manifold_fit(..., atom_basis='periodic', assignment='ibp_map') "
+        "only reproduces the linear reference model this test is using as the "
+        "bar; it does not show the curved manifold dictionary earned held-out EV "
+        "on real activations."
+    )
     assert result["linear_ceiling"] == pytest.approx(linear_ceiling)
     in_sample_ev = result["in_sample_ev"]
     oos_ev = result["oos_ev"]
