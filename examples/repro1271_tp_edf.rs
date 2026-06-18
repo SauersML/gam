@@ -10,7 +10,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 fn write_linear_csv(n: usize, seed: u64) -> PathBuf {
-    let mut state = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut state = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let mut next_unit = || {
         state = state
             .wrapping_mul(6364136223846793005)
@@ -39,8 +41,8 @@ fn main() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula = std::env::var("REPRO_FORMULA")
-        .unwrap_or_else(|_| "y ~ s(x, bs=\"tp\", k=20)".to_string());
+    let formula =
+        std::env::var("REPRO_FORMULA").unwrap_or_else(|_| "y ~ s(x, bs=\"tp\", k=20)".to_string());
     println!("formula: {formula}");
     let mut edfs = Vec::new();
     for seed in [1u64, 2, 3, 4, 5] {

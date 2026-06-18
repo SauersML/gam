@@ -2498,13 +2498,9 @@ mod tests {
         // their structural effect — so comparing them would assert a property the
         // cap is not meant to preserve (and the adopted-fit check below is the
         // real guarantee that the converged state matches).
-        let round_moves =
-            |rounds: &[SearchLedger]| -> String {
-                serde_json::to_string(
-                    &rounds.iter().map(|r| &r.moves).collect::<Vec<_>>(),
-                )
-                .unwrap()
-            };
+        let round_moves = |rounds: &[SearchLedger]| -> String {
+            serde_json::to_string(&rounds.iter().map(|r| &r.moves).collect::<Vec<_>>()).unwrap()
+        };
         assert_eq!(
             round_moves(&reference.rounds),
             round_moves(&capped.rounds),

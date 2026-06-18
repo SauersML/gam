@@ -3302,9 +3302,9 @@ mod empirical_flex_jet_oracle_tests {
         // ~7 columns after the 3-dim drop, comfortably enough for the oracle's
         // q/b/deviation axes.
         let n_knots = 11usize;
-        let knots = Array1::from_iter((0..n_knots).map(|i| {
-            -2.5_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)
-        }));
+        let knots = Array1::from_iter(
+            (0..n_knots).map(|i| -2.5_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)),
+        );
         DeviationRuntime::try_new(knots, 0.0, 3).expect("deviation runtime")
     }
 
@@ -3378,8 +3378,7 @@ mod empirical_flex_jet_oracle_tests {
         // (h-gap ~1e-6). This is witness-conditioning calibration, NOT masking
         // a real bug. (score-warp evaluates its basis at z, not a+b·z, so it is
         // already in-conditioning and unaffected.)
-        let beta_dev =
-            Array1::from_shape_fn(basis_dim, |i| 0.024 * (i as f64 + 1.0) - 0.036);
+        let beta_dev = Array1::from_shape_fn(basis_dim, |i| 0.024 * (i as f64 + 1.0) - 0.036);
         FlexFixture {
             family,
             primary,
@@ -3753,7 +3752,11 @@ mod empirical_flex_jet_oracle_tests {
             for (k, i) in dev_range.clone().enumerate() {
                 p0[i] = fxs.beta_dev[k];
             }
-            let max_beta = fxs.beta_dev.iter().cloned().fold(0.0_f64, |m, v| m.max(v.abs()));
+            let max_beta = fxs
+                .beta_dev
+                .iter()
+                .cloned()
+                .fold(0.0_f64, |m, v| m.max(v.abs()));
             // H[q,q] and the q×b cross — the two blocks that have tripped the
             // unsound secant-calibration witness.
             let pqq = prod_flex_coeff(&fxs, &p0, &[q, q]);
@@ -3764,7 +3767,8 @@ mod empirical_flex_jet_oracle_tests {
             let wqb_f = central_along(&fxs, &p0, &[(q, 1), (b, 1)], 5e-4);
             eprintln!(
                 "scale={scale:.2} max|beta|={max_beta:.3}: H[q,q] prod={pqq:+.5e} wc={wqq_c:+.5e} wf={wqq_f:+.5e} (hgap {:.1e}) | H[q,b] prod={pqb:+.5e} wc={wqb_c:+.5e} wf={wqb_f:+.5e} (hgap {:.1e})",
-                (wqq_c - wqq_f).abs(), (wqb_c - wqb_f).abs()
+                (wqq_c - wqq_f).abs(),
+                (wqb_c - wqb_f).abs()
             );
         }
     }

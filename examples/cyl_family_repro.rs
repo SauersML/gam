@@ -147,7 +147,10 @@ fn poisson_level_diagnostic(
     );
 
     // --- (2) per-margin lambdas ---
-    eprintln!("  (2) fitted lambdas (per penalty block) = {:?}", fit.fit.lambdas);
+    eprintln!(
+        "  (2) fitted lambdas (per penalty block) = {:?}",
+        fit.fit.lambdas
+    );
     eprintln!(
         "      deviance={:.4}  reml_score={:.4}  outer_converged={}",
         fit.fit.deviance, fit.fit.reml_score, fit.fit.outer_converged

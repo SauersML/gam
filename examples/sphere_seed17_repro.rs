@@ -52,64 +52,76 @@ fn main() {
         }
     }
     let formulas = [
-        ("pseudo-k25-m4", "y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo)"),
-        ("pseudo-k25-m2", "y ~ sphere(lat, lon, k=25, m=2, kernel=pseudo)"),
-        ("harmonic-deg8", "y ~ sphere(lat, lon, method=harmonic, max_degree=8)"),
+        (
+            "pseudo-k25-m4",
+            "y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo)",
+        ),
+        (
+            "pseudo-k25-m2",
+            "y ~ sphere(lat, lon, k=25, m=2, kernel=pseudo)",
+        ),
+        (
+            "harmonic-deg8",
+            "y ~ sphere(lat, lon, method=harmonic, max_degree=8)",
+        ),
     ];
     for seed in [17u64, 23] {
-      let data = make_dataset(300, seed);
-      for (label, formula) in formulas.iter() {
-        let result = fit_from_formula(formula, &data, &cfg)
-            .unwrap_or_else(|e| panic!("seed={seed} {label} fit: {e}"));
-        let FitResult::Standard(fit) = result else {
-            panic!()
-        };
-        println!(
-            "--- seed={seed} {label}: edf={:?} lambdas={:?} ---",
-            fit.fit.edf_total(),
-            fit.fit.lambdas.to_vec()
-        );
-        let n = probes.len();
-        let mut m = Array2::<f64>::zeros((n, 3));
-        for (i, (lat, lon)) in probes.iter().enumerate() {
-            m[[i, 0]] = *lat;
-            m[[i, 1]] = *lon;
-        }
-        let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
-        let pred = design.design.apply(&fit.fit.beta).to_vec();
-        let sumsq: f64 = pred
-            .iter()
-            .zip(probes.iter())
-            .map(|(p, (lat, lon))| (p - truth(*lat, *lon)).powi(2))
-            .sum();
-        let rmse = (sumsq / n as f64).sqrt();
-        println!("=== seed={seed} overall rmse={rmse:.4} ===");
+        let data = make_dataset(300, seed);
+        for (label, formula) in formulas.iter() {
+            let result = fit_from_formula(formula, &data, &cfg)
+                .unwrap_or_else(|e| panic!("seed={seed} {label} fit: {e}"));
+            let FitResult::Standard(fit) = result else {
+                panic!()
+            };
+            println!(
+                "--- seed={seed} {label}: edf={:?} lambdas={:?} ---",
+                fit.fit.edf_total(),
+                fit.fit.lambdas.to_vec()
+            );
+            let n = probes.len();
+            let mut m = Array2::<f64>::zeros((n, 3));
+            for (i, (lat, lon)) in probes.iter().enumerate() {
+                m[[i, 0]] = *lat;
+                m[[i, 1]] = *lon;
+            }
+            let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+            let pred = design.design.apply(&fit.fit.beta).to_vec();
+            let sumsq: f64 = pred
+                .iter()
+                .zip(probes.iter())
+                .map(|(p, (lat, lon))| (p - truth(*lat, *lon)).powi(2))
+                .sum();
+            let rmse = (sumsq / n as f64).sqrt();
+            println!("=== seed={seed} overall rmse={rmse:.4} ===");
 
-        // Per latitude-band RMSE.
-        let bands = [(-70.0, -40.0), (-40.0, 40.0), (40.0, 70.1)];
-        for (lo, hi) in bands {
-            let mut ss = 0.0;
-            let mut cnt = 0usize;
-            for (p, (lat, lon)) in pred.iter().zip(probes.iter()) {
-                if *lat >= lo && *lat < hi {
-                    ss += (p - truth(*lat, *lon)).powi(2);
-                    cnt += 1;
+            // Per latitude-band RMSE.
+            let bands = [(-70.0, -40.0), (-40.0, 40.0), (40.0, 70.1)];
+            for (lo, hi) in bands {
+                let mut ss = 0.0;
+                let mut cnt = 0usize;
+                for (p, (lat, lon)) in pred.iter().zip(probes.iter()) {
+                    if *lat >= lo && *lat < hi {
+                        ss += (p - truth(*lat, *lon)).powi(2);
+                        cnt += 1;
+                    }
+                }
+                if cnt > 0 {
+                    println!(
+                        "  band lat[{lo:.0},{hi:.0}) rmse={:.4} (n={cnt})",
+                        (ss / cnt as f64).sqrt()
+                    );
                 }
             }
-            if cnt > 0 {
-                println!("  band lat[{lo:.0},{hi:.0}) rmse={:.4} (n={cnt})", (ss / cnt as f64).sqrt());
+            // Worst 5 probes.
+            let mut errs: Vec<(f64, f64, f64)> = pred
+                .iter()
+                .zip(probes.iter())
+                .map(|(p, (lat, lon))| ((p - truth(*lat, *lon)).abs(), *lat, *lon))
+                .collect();
+            errs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            for (e, lat, lon) in errs.iter().take(5) {
+                println!("  worst |err|={e:.4} at lat={lat:.1} lon={lon:.1}");
             }
         }
-        // Worst 5 probes.
-        let mut errs: Vec<(f64, f64, f64)> = pred
-            .iter()
-            .zip(probes.iter())
-            .map(|(p, (lat, lon))| ((p - truth(*lat, *lon)).abs(), *lat, *lon))
-            .collect();
-        errs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        for (e, lat, lon) in errs.iter().take(5) {
-            println!("  worst |err|={e:.4} at lat={lat:.1} lon={lon:.1}");
-        }
-      }
     }
 }

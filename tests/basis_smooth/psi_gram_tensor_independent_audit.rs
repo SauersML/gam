@@ -153,7 +153,10 @@ fn nfree_triple_and_solve_are_bit_identical_to_dense() {
         let g_fast = tensor.gram_at(psi);
         let r_fast = tensor.rhs_at(psi);
         let gscale = max_abs(&g_dense).max(1e-300);
-        let rscale = r_dense.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1e-300);
+        let rscale = r_dense
+            .iter()
+            .fold(0.0_f64, |m, &v| m.max(v.abs()))
+            .max(1e-300);
         let worst_g = g_fast
             .iter()
             .zip(g_dense.iter())
@@ -255,7 +258,10 @@ fn per_trial_accessors_are_n_independent() {
     // The one-time build streams the design (node ladder + spot/grad checks). That
     // is allowed to be O(n) and is NOT the claim under test. The PER-TRIAL count
     // is the claim: it must be ZERO at both sizes.
-    assert!(build_small > 0 && build_large > 0, "build must stream the design");
+    assert!(
+        build_small > 0 && build_large > 0,
+        "build must stream the design"
+    );
     assert_eq!(
         trial_small, 0,
         "per-trial accessors re-streamed the n×k design at n={n_small} \
@@ -268,7 +274,8 @@ fn per_trial_accessors_are_n_independent() {
     );
     // The assembled per-trial objects are k×k at BOTH n — no n in the hot path.
     assert_eq!(
-        shape_small, (k, k),
+        shape_small,
+        (k, k),
         "assembled Gram must be k×k, got {shape_small:?}"
     );
     assert_eq!(

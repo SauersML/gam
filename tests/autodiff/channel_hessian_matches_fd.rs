@@ -130,10 +130,9 @@ fn survival_marginal_slope_channel_hessian_matches_fd() {
             // (negative) curvature the FD measures — that is a property of the
             // clamp, not a derivative error. The derivative-correctness check
             // this test exists for is the RAW Hessian vs FD.
-            let (_, _, hess) = survival_row_nll_grad_hess(
-                u[0], u[1], u[2], u[3], z, w, d, dguard, pscale,
-            )
-            .expect("survival_row_nll_grad_hess failed");
+            let (_, _, hess) =
+                survival_row_nll_grad_hess(u[0], u[1], u[2], u[3], z, w, d, dguard, pscale)
+                    .expect("survival_row_nll_grad_hess failed");
 
             for a in 0..4 {
                 for b in 0..4 {
