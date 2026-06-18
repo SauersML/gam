@@ -655,13 +655,18 @@ pub(crate) fn build_spherical_harmonic_basis(
             col += 1;
         }
     }
-    let mut ridge = Array2::<f64>::eye(p);
+    // Double-penalty shrinkage lives on the primary penalty's null space.
+    // The harmonic basis omits the constant mode, so the unpenalized Wahba
+    // low-degree span is exactly the l <= SPHERE_UNPENALIZED_LOW_DEGREE block.
+    // Penalizing the complement here would duplicate the curvature penalty and
+    // leave the nominal null-space penalty inert.
+    let mut ridge = Array2::<f64>::zeros((p, p));
     {
         let mut col = 0usize;
         for l in 1..=l_max {
             for _ in 0..(2 * l + 1) {
                 if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
-                    ridge[[col, col]] = 0.0;
+                    ridge[[col, col]] = 1.0;
                 }
                 col += 1;
             }
@@ -3377,4 +3382,59 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod harmonic_penalty_invariants_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn harmonic_double_penalty_targets_primary_nullspace() {
+        let data = array![
+            [-0.9, 0.0],
+            [-0.4, 1.0],
+            [0.0, 2.0],
+            [0.4, 3.0],
+            [0.9, 4.0],
+            [0.2, 5.0],
+        ];
+        let spec = SphericalSplineBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+            penalty_order: 2,
+            double_penalty: true,
+            radians: true,
+            method: SphereMethod::Harmonic,
+            max_degree: Some(3),
+            wahba_kernel: SphereWahbaKernel::Sobolev,
+            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        };
+        let built = build_spherical_harmonic_basis(data.view(), &spec).expect("harmonic basis");
+        assert_eq!(built.penalties.len(), 2);
+        let primary = &built.penalties[0];
+        let shrink = &built.penalties[1];
+        for col in 0..primary.ncols() {
+            let primary_diag = primary[[col, col]].abs();
+            let shrink_diag = shrink[[col, col]].abs();
+            if col < SPHERE_UNPENALIZED_LOW_DEGREE * (SPHERE_UNPENALIZED_LOW_DEGREE + 2) {
+                assert!(
+                    primary_diag <= 1e-12,
+                    "low-degree column {col} must be primary-null"
+                );
+                assert!(
+                    shrink_diag > 0.0,
+                    "low-degree column {col} must be shrink-penalized"
+                );
+            } else {
+                assert!(
+                    primary_diag > 0.0,
+                    "higher-degree column {col} must carry roughness"
+                );
+                assert!(
+                    shrink_diag <= 1e-12,
+                    "higher-degree column {col} must not be in null shrinkage"
+                );
+            }
+        }
+    }
 }
