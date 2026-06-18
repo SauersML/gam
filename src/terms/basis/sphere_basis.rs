@@ -33,11 +33,8 @@ pub fn build_spherical_spline_basis(
         spec.radians,
         spec.wahba_kernel,
     )?;
-    let decomposition = wahba_low_degree_decomposition(
-        centers.view(),
-        center_kernel.view(),
-        spec.radians,
-    )?;
+    let decomposition =
+        wahba_low_degree_decomposition(centers.view(), spec.radians, center_kernel.view())?;
 
     let raw_kernel_design = spherical_wahba_kernel_matrix_with_kind(
         data,
@@ -46,12 +43,8 @@ pub fn build_spherical_spline_basis(
         spec.radians,
         spec.wahba_kernel,
     )?;
-    let raw_design = build_wahba_decomposed_design(
-        raw_kernel_design.view(),
-        data,
-        spec.radians,
-        &decomposition,
-    );
+    let raw_design =
+        build_wahba_decomposed_design(raw_kernel_design.view(), data, spec.radians, &decomposition);
     let mut raw_penalty = build_wahba_decomposed_penalty(center_kernel.view(), &decomposition);
     let kernel_rank = decomposition.kernel_basis.ncols();
     let diag_scale = if kernel_rank > 0 {
@@ -209,30 +202,160 @@ fn orthonormal_column_basis(matrix: ArrayView2<'_, f64>, rel_tol: f64) -> Array2
     q
 }
 
-fn wahba_low_degree_residual_projector(
+fn orthonormal_complement(q: ArrayView2<'_, f64>, rel_tol: f64) -> Array2<f64> {
+    let n = q.nrows();
+    let mut cols: Vec<Vec<f64>> = Vec::new();
+    let tol = rel_tol.max(0.0);
+    for i in 0..n {
+        let mut v = vec![0.0_f64; n];
+        v[i] = 1.0;
+        for _ in 0..2 {
+            for q_col in q.columns() {
+                let dot = v.iter().zip(q_col.iter()).map(|(a, b)| a * b).sum::<f64>();
+                for (vi, qi) in v.iter_mut().zip(q_col.iter()) {
+                    *vi -= dot * qi;
+                }
+            }
+            for c in &cols {
+                let dot = v.iter().zip(c.iter()).map(|(a, b)| a * b).sum::<f64>();
+                for (vi, ci) in v.iter_mut().zip(c.iter()) {
+                    *vi -= dot * ci;
+                }
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > tol {
+            for vi in &mut v {
+                *vi /= norm;
+            }
+            cols.push(v);
+        }
+    }
+    let mut out = Array2::<f64>::zeros((n, cols.len()));
+    for (j, col) in cols.iter().enumerate() {
+        for i in 0..n {
+            out[[i, j]] = col[i];
+        }
+    }
+    out
+}
+
+struct WahbaLowDegreeDecomposition {
+    kernel_basis: Array2<f64>,
+    low_degree_centers: Option<Array2<f64>>,
+    kernel_low_projection: Option<Array2<f64>>,
+    low_degree_cols: usize,
+}
+
+fn wahba_low_degree_decomposition(
     centers: ArrayView2<'_, f64>,
     radians: bool,
-    penalty_order: usize,
-    kernel: SphereWahbaKernel,
-) -> Result<Array2<f64>, BasisError> {
+    center_kernel: ArrayView2<'_, f64>,
+) -> Result<WahbaLowDegreeDecomposition, BasisError> {
     let low_cols = SPHERE_UNPENALIZED_LOW_DEGREE * (SPHERE_UNPENALIZED_LOW_DEGREE + 2);
     if centers.nrows() <= low_cols {
-        return Ok(Array2::<f64>::eye(centers.nrows()));
+        return Ok(WahbaLowDegreeDecomposition {
+            kernel_basis: Array2::<f64>::eye(centers.nrows()),
+            low_degree_centers: None,
+            kernel_low_projection: None,
+            low_degree_cols: 0,
+        });
     }
     let harmonics = real_spherical_harmonic_design_up_to_degree(
         centers,
         SPHERE_UNPENALIZED_LOW_DEGREE,
         radians,
     );
-    let gram =
-        spherical_wahba_kernel_matrix_with_kind(centers, centers, penalty_order, radians, kernel)?;
-    let low_degree_coefficients = solve_spd_columns_ridged(gram.view(), harmonics.view())?;
-    let q = orthonormal_column_basis(low_degree_coefficients.view(), 1e-10);
-    if q.ncols() == 0 {
-        return Ok(Array2::<f64>::eye(centers.nrows()));
+    let low_degree_coefficients = solve_spd_columns_ridged(center_kernel, harmonics.view())?;
+    let low_coeff_basis = orthonormal_column_basis(low_degree_coefficients.view(), 1e-10);
+    let kernel_basis = orthonormal_complement(low_coeff_basis.view(), 1e-10);
+    let low_degree_centers = harmonics;
+    if low_degree_centers.ncols() == 0 || kernel_basis.ncols() == centers.nrows() {
+        return Ok(WahbaLowDegreeDecomposition {
+            kernel_basis,
+            low_degree_centers: None,
+            kernel_low_projection: None,
+            low_degree_cols: 0,
+        });
     }
-    let projector = Array2::<f64>::eye(centers.nrows()) - q.dot(&q.t());
-    Ok((&projector + &projector.t()) * 0.5)
+    let center_kernel_reduced = center_kernel.dot(&kernel_basis);
+    let low_normal = low_degree_centers.t().dot(&low_degree_centers);
+    let low_cross = low_degree_centers.t().dot(&center_kernel_reduced);
+    let kernel_low_projection = solve_spd_columns_ridged(low_normal.view(), low_cross.view())?;
+    let low_degree_cols = low_degree_centers.ncols();
+    Ok(WahbaLowDegreeDecomposition {
+        kernel_basis,
+        low_degree_centers: Some(low_degree_centers),
+        kernel_low_projection: Some(kernel_low_projection),
+        low_degree_cols,
+    })
+}
+
+fn hstack_dense(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> Array2<f64> {
+    let n = left.nrows();
+    assert_eq!(right.nrows(), n);
+    let mut out = Array2::<f64>::zeros((n, left.ncols() + right.ncols()));
+    out.slice_mut(s![.., 0..left.ncols()]).assign(&left);
+    out.slice_mut(s![.., left.ncols()..]).assign(&right);
+    out
+}
+
+fn build_wahba_decomposed_design(
+    raw_kernel_design: ArrayView2<'_, f64>,
+    data: ArrayView2<'_, f64>,
+    radians: bool,
+    decomposition: &WahbaLowDegreeDecomposition,
+) -> Array2<f64> {
+    let mut kernel_design = raw_kernel_design.dot(&decomposition.kernel_basis);
+    match (
+        &decomposition.low_degree_centers,
+        &decomposition.kernel_low_projection,
+    ) {
+        (Some(low_degree_centers), Some(kernel_low_projection)) => {
+            let raw_low = real_spherical_harmonic_design_up_to_degree(
+                data,
+                SPHERE_UNPENALIZED_LOW_DEGREE,
+                radians,
+            );
+            debug_assert_eq!(raw_low.ncols(), low_degree_centers.ncols());
+            let low_design = raw_low;
+            kernel_design -= &low_design.dot(kernel_low_projection);
+            hstack_dense(kernel_design.view(), low_design.view())
+        }
+        _ => kernel_design,
+    }
+}
+
+fn build_wahba_decomposed_penalty(
+    center_kernel: ArrayView2<'_, f64>,
+    decomposition: &WahbaLowDegreeDecomposition,
+) -> Array2<f64> {
+    let kernel_penalty = decomposition
+        .kernel_basis
+        .t()
+        .dot(&center_kernel.dot(&decomposition.kernel_basis));
+    let p = kernel_penalty.nrows() + decomposition.low_degree_cols;
+    let mut out = Array2::<f64>::zeros((p, p));
+    out.slice_mut(s![0..kernel_penalty.nrows(), 0..kernel_penalty.ncols()])
+        .assign(&kernel_penalty);
+    (&out + &out.t()) * 0.5
+}
+
+fn build_wahba_decomposed_null_shrinkage(
+    decomposition: &WahbaLowDegreeDecomposition,
+) -> Array2<f64> {
+    let p = decomposition.kernel_basis.ncols() + decomposition.low_degree_cols;
+    let mut out = Array2::<f64>::zeros((p, p));
+    if decomposition.low_degree_cols == 0 {
+        for i in 0..p {
+            out[[i, i]] = 1.0;
+        }
+    } else {
+        for i in decomposition.kernel_basis.ncols()..p {
+            out[[i, i]] = 1.0;
+        }
+    }
+    out
 }
 
 fn solve_spd_columns_ridged(

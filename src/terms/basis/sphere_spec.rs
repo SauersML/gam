@@ -161,8 +161,9 @@ pub enum SphericalSplineIdentifiability {
     CenterSumToZero,
     /// Predict-time replay: use this frozen realized-design transform directly
     /// (the composed raw-chart/parametric transform captured at fit time).
-    /// `transform.nrows()` equals the number of centers; `transform.ncols()` is
-    /// the constrained smooth dimension.
+    /// `transform.nrows()` equals the raw Wahba basis width after its
+    /// finite-center kernel / low-degree harmonic decomposition;
+    /// `transform.ncols()` is the constrained smooth dimension.
     FrozenTransform { transform: Array2<f64> },
 }
 
