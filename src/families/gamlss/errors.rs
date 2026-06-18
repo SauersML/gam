@@ -720,7 +720,7 @@ pub(crate) fn gaussian_diagonal_row_kernel(
     location_eta: f64,
     eta_log_sigma: f64,
     obs_weight: f64,
-    ln2pi: f64,
+    _ln2pi: f64,
 ) -> GaussianDiagonalRowKernel {
     if obs_weight == 0.0 {
         return GaussianDiagonalRowKernel {
@@ -762,8 +762,7 @@ pub(crate) fn gaussian_diagonal_row_kernel(
     };
 
     GaussianDiagonalRowKernel {
-        log_likelihood: obs_weight
-            * (-0.5 * (residual * residual * inv_s2 + ln2pi + 2.0 * sigma.ln())),
+        log_likelihood: obs_weight * (-0.5 * (residual * residual * inv_s2 + 2.0 * sigma.ln())),
         location_working_weight,
         location_working_shift: residual,
         log_sigma_working_weight,

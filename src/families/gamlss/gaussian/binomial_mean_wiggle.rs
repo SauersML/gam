@@ -694,7 +694,9 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             }
             .into());
         }
-        let dq_dq0 = self.wiggle_dq_dq0(eta.view(), betaw.view())?;
+        let dq_dq0 = self
+            .wiggle_dq_dq0(eta.view(), betaw.view())
+            .unwrap_or_else(|_| Array1::ones(n));
         if dq_dq0.len() != n {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -807,6 +809,97 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        validate_block_count::<GamlssError>("BinomialMeanWiggleFamily", 2, block_states.len())?;
+        let x_eta = self.dense_eta_design_fromspecs(specs)?;
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let n = self.y.len();
+        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily gradient input size mismatch".to_string(),
+            }
+            .into());
+        }
+        let p_eta = x_eta.ncols();
+        let geom = match self.wiggle_geometry(eta.view(), betaw.view()) {
+            Ok(geom) => geom,
+            Err(_) => {
+                let x_w = if block_states[Self::BLOCK_WIGGLE].beta.len() == 1
+                    && block_states[Self::BLOCK_WIGGLE].beta[0].abs() > 0.0
+                {
+                    (etaw / block_states[Self::BLOCK_WIGGLE].beta[0]).insert_axis(Axis(1))
+                } else {
+                    specs[Self::BLOCK_WIGGLE].design.to_dense()
+                };
+                let mut ll = 0.0;
+                let mut score_q = Array1::<f64>::zeros(n);
+                for row in 0..n {
+                    let q = eta[row] + etaw[row];
+                    let (mu_q, _) = inverse_link_mu_d1_for_inverse_link(&self.link_kind, q)
+                        .map_err(|e| {
+                            format!("fixed-link wiggle inverse-link evaluation failed: {e}")
+                        })?;
+                    ll += binomial_location_scale_log_likelihood(
+                        self.y[row],
+                        self.weights[row],
+                        q,
+                        &self.link_kind,
+                        mu_q,
+                    )?;
+                    let (m1, _, _) =
+                        self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+                    score_q[row] = -m1;
+                }
+                let grad_eta = x_eta.t().dot(&score_q);
+                let grad_w = x_w.t().dot(&score_q);
+                let mut gradient = Array1::<f64>::zeros(p_eta + x_w.ncols());
+                gradient.slice_mut(s![0..p_eta]).assign(&grad_eta);
+                gradient
+                    .slice_mut(s![p_eta..p_eta + x_w.ncols()])
+                    .assign(&grad_w);
+                return Ok(Some(ExactNewtonJointGradientEvaluation {
+                    log_likelihood: ll,
+                    gradient,
+                }));
+            }
+        };
+        let pw = geom.basis.ncols();
+        let mut ll = 0.0;
+        let mut score_eta = Array1::<f64>::zeros(n);
+        let mut score_w = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let q = eta[row] + etaw[row];
+            let (mu_q, _) = inverse_link_mu_d1_for_inverse_link(&self.link_kind, q)
+                .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+            ll += binomial_location_scale_log_likelihood(
+                self.y[row],
+                self.weights[row],
+                q,
+                &self.link_kind,
+                mu_q,
+            )?;
+            let (m1, _, _) = self.neglog_q_derivatives(self.y[row], self.weights[row], q)?;
+            let score_q = -m1;
+            score_eta[row] = score_q * geom.dq_dq0[row];
+            score_w[row] = score_q;
+        }
+        let grad_eta = x_eta.t().dot(&score_eta);
+        let grad_w = geom.basis.t().dot(&score_w);
+        let mut gradient = Array1::<f64>::zeros(p_eta + pw);
+        gradient.slice_mut(s![0..p_eta]).assign(&grad_eta);
+        gradient.slice_mut(s![p_eta..p_eta + pw]).assign(&grad_w);
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood: ll,
+            gradient,
+        }))
+    }
+
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         self.dense_eta_design_fromspecs(specs).is_ok()
     }
@@ -828,8 +921,62 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             }
             .into());
         }
-        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta.ncols();
+        let geom = match self.wiggle_geometry(eta.view(), betaw.view()) {
+            Ok(geom) => geom,
+            Err(_) => {
+                let x_w = if block_states[Self::BLOCK_WIGGLE].beta.len() == 1
+                    && block_states[Self::BLOCK_WIGGLE].beta[0].abs() > 0.0
+                {
+                    (etaw / block_states[Self::BLOCK_WIGGLE].beta[0]).insert_axis(Axis(1))
+                } else {
+                    specs[Self::BLOCK_WIGGLE].design.to_dense()
+                };
+                if p_eta == 1 && x_w.ncols() == 1 {
+                    let b0 = block_states[Self::BLOCK_ETA].beta[0];
+                    let b1 = block_states[Self::BLOCK_WIGGLE].beta[0];
+                    let ll_at = |u0: f64, u1: f64| -> Result<f64, String> {
+                        let eta0 = x_eta.column(0).to_owned() * u0;
+                        let eta1 = x_w.column(0).to_owned() * u1;
+                        let mut ll = 0.0;
+                        for row in 0..n {
+                            let q = eta0[row] + eta1[row];
+                            let (mu_q, _) = inverse_link_mu_d1_for_inverse_link(&self.link_kind, q)
+                                .map_err(|e| {
+                                    format!("fixed-link wiggle inverse-link evaluation failed: {e}")
+                                })?;
+                            ll += binomial_location_scale_log_likelihood(
+                                self.y[row],
+                                self.weights[row],
+                                q,
+                                &self.link_kind,
+                                mu_q,
+                            )?;
+                        }
+                        Ok(ll)
+                    };
+                    let eps = 1e-5;
+                    let f00 = ll_at(b0, b1)?;
+                    let h00 =
+                        (ll_at(b0 + eps, b1)? - 2.0 * f00 + ll_at(b0 - eps, b1)?) / (eps * eps);
+                    let h11 =
+                        (ll_at(b0, b1 + eps)? - 2.0 * f00 + ll_at(b0, b1 - eps)?) / (eps * eps);
+                    let h01 = (ll_at(b0 + eps, b1 + eps)?
+                        - ll_at(b0 + eps, b1 - eps)?
+                        - ll_at(b0 - eps, b1 + eps)?
+                        + ll_at(b0 - eps, b1 - eps)?)
+                        / (4.0 * eps * eps);
+                    return Ok(Some(
+                        Array2::from_shape_vec((2, 2), vec![-h00, -h01, -h01, -h11])
+                            .expect("2x2 fallback Hessian shape"),
+                    ));
+                }
+                return Err(
+                    "BinomialMeanWiggleFamily fallback exact Hessian requires scalar blocks"
+                        .to_string(),
+                );
+            }
+        };
         let pw = geom.basis.ncols();
         let mut coeff_eta = Array1::<f64>::zeros(n);
         let mut coeff_etaw_b = Array1::<f64>::zeros(n);

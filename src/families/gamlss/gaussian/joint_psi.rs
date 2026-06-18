@@ -962,7 +962,7 @@ pub(crate) fn gaussian_locscale_fisher_joint_row_coeffs(
     rows: &GaussianJointRowScalars,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let mm = rows.w.clone();
-    let ml = Array1::<f64>::zeros(rows.kappa.len());
+    let ml = 2.0 * &rows.kappa * &rows.m;
     let ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
     (mm, ml, ll)
 }

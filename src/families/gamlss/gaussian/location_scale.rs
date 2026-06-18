@@ -4,6 +4,40 @@
 // resolve through the parent namespace.
 use super::*;
 
+fn dense_or_operator_transpose_vector_multiply(
+    design: &DenseOrOperator<'_>,
+    values: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    if values.len() != design.nrows() {
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "DenseOrOperator transpose-vector length mismatch: got {}, expected {}",
+                values.len(),
+                design.nrows()
+            ),
+        }
+        .into());
+    }
+    let mut out = Array1::<f64>::zeros(design.ncols());
+    match design {
+        DenseOrOperator::Borrowed(dense) => {
+            out.assign(&fast_atv(*dense, values));
+        }
+        DenseOrOperator::Owned(dense) => {
+            out.assign(&fast_atv(dense, values));
+        }
+        DenseOrOperator::Operator(op) => {
+            for rows in exact_design_row_chunks(design.nrows(), design.ncols()) {
+                let chunk = op
+                    .try_row_chunk(rows.clone())
+                    .map_err(|e| format!("DenseOrOperator transpose chunk failed: {e}"))?;
+                out += &fast_atv(&chunk, &values.slice(s![rows]));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub struct GaussianLocationScaleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -188,6 +222,36 @@ impl GaussianLocationScaleFamily {
             return Ok(None);
         };
         self.exact_newton_joint_hessian_from_designs(block_states, &xmu, &x_ls)
+    }
+
+    pub(crate) fn exact_newton_joint_gradient_for_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        validate_block_count::<GamlssError>("GaussianLocationScaleFamily", 2, block_states.len())?;
+        let n = self.y.len();
+        let etamu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if etamu.len() != n || eta_ls.len() != n || self.weights.len() != n {
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily gradient input size mismatch".to_string(),
+            }
+            .into());
+        }
+        let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
+        let score_mu_eta = rows.m.clone();
+        let score_ls_eta = &rows.kappa * &(&rows.n - &rows.obs_weight);
+        let score_mu = dense_or_operator_transpose_vector_multiply(&xmu, &score_mu_eta)?;
+        let score_ls = dense_or_operator_transpose_vector_multiply(&x_ls, &score_ls_eta)?;
+        let log_likelihood = self.log_likelihood_only(block_states)?;
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood,
+            gradient: gaussian_pack_joint_score(&score_mu, &score_ls),
+        }))
     }
 
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_for_specs(
@@ -1429,6 +1493,14 @@ impl CustomFamily for GaussianLocationScaleFamily {
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
         self.exact_newton_joint_hessian_for_specs(block_states, Some(specs))
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        self.exact_newton_joint_gradient_for_specs(block_states, specs)
     }
 
     fn exact_newton_joint_hessian_directional_derivative_with_specs(

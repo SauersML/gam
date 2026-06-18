@@ -124,6 +124,68 @@ fn evaluate_log_link_diagonal_irls<F: LogLinkDiagonalIrlsFamily + ?Sized>(
     })
 }
 
+fn exact_log_link_joint_gradient_and_hessian<F: LogLinkDiagonalIrlsFamily + ?Sized>(
+    family: &F,
+    block_states: &[ParameterBlockState],
+    block_specs: &[ParameterBlockSpec],
+) -> Result<(ExactNewtonJointGradientEvaluation, Array2<f64>), String> {
+    if block_specs.len() != 1 {
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "{} exact joint path expects one block spec, got {}",
+                family.family_label(),
+                block_specs.len()
+            ),
+        }
+        .into());
+    }
+    let label = family.family_label();
+    let eta = &expect_single_block(block_states, label)?.eta;
+    let y = family.y();
+    let prior_weights = family.prior_weights();
+    let n = y.len();
+    if eta.len() != n || prior_weights.len() != n || block_specs[0].design.nrows() != n {
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!("{label} exact joint input size mismatch"),
+        }
+        .into());
+    }
+    family.validate_self()?;
+
+    let mut ll = 0.0;
+    let mut score_eta = Array1::<f64>::zeros(n);
+    let mut hess_weight = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let yi = y[i];
+        family.validate_yi(yi, i)?;
+        let e_raw = eta[i];
+        let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
+        let active_clamp = e != e_raw;
+        let m = saturated_exp_eta(e_raw);
+        let prior_w = prior_weights[i];
+        let row = family.row_kernel(yi, e, m, prior_w);
+        ll += row.log_lik_increment;
+        if prior_w == 0.0 || active_clamp {
+            continue;
+        }
+        let observed_weight = floor_positiveweight(row.observed_weight, MIN_WEIGHT);
+        hess_weight[i] = observed_weight;
+        score_eta[i] = observed_weight * row.working_step;
+    }
+
+    let design = &block_specs[0].design;
+    let gradient = design.transpose_vector_multiply(&score_eta);
+    let x = design.to_dense();
+    let hessian = xt_diag_x_dense(&x, &hess_weight)?;
+    Ok((
+        ExactNewtonJointGradientEvaluation {
+            log_likelihood: ll,
+            gradient,
+        },
+        hessian,
+    ))
+}
+
 impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
     fn family_label(&self) -> &'static str {
         "PoissonLogFamily"
@@ -163,6 +225,16 @@ impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
 impl CustomFamily for PoissonLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        Ok(Some(
+            exact_log_link_joint_gradient_and_hessian(self, block_states, block_specs)?.0,
+        ))
     }
 }
 
@@ -266,6 +338,16 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
 impl CustomFamily for GammaLogFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
+    }
+
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        Ok(Some(
+            exact_log_link_joint_gradient_and_hessian(self, block_states, block_specs)?.0,
+        ))
     }
 
     fn diagonalworking_weights_directional_derivative(
