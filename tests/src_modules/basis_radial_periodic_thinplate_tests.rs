@@ -1548,10 +1548,46 @@ fn test_build_bspline_basis_1d_double_penalty() {
         boundary_conditions: BSplineBoundaryConditions::default(),
     };
     let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
-    assert_eq!(result.penalties.len(), 1);
+
+    // #1266: on a free (non-boundary-conditioned) basis the default double
+    // penalty ships the bending penalty and the Marra & Wood (2011) null-space
+    // shrinkage block `Z Zᵀ` as TWO separate, identified REML coordinates — not
+    // a single folded penalty. The second coordinate lets REML drive an
+    // unsupported term's constant/linear part to `EDF → 0` independently of its
+    // wiggliness (mgcv `select = TRUE`). Folding both into one coordinate (the
+    // pre-#1266 geometry) left `λ_nullspace` unidentified, so REML weakened the
+    // wiggliness penalty instead of shrinking the term out and *inflated* the
+    // smooth's EDF.
+    assert_eq!(result.penalties.len(), 2);
+    assert_eq!(result.penaltyinfo.len(), 2);
+    assert_eq!(result.nullspace_dims.len(), 2);
+    assert!(result.penaltyinfo.iter().all(|info| info.active));
+    assert!(matches!(result.penaltyinfo[0].source, PenaltySource::Primary));
+    assert!(matches!(
+        result.penaltyinfo[1].source,
+        PenaltySource::DoublePenaltyNullspace
+    ));
+
     let p_constrained = result.design.ncols();
-    assert_eq!(result.nullspace_dims[0], 0);
-    assert_eq!(result.penaltyinfo[0].effective_rank, p_constrained);
+    let bend_rank = result.penaltyinfo[0].effective_rank;
+    let null_rank = result.penaltyinfo[1].effective_rank;
+    // The bend penalty leaves its polynomial null space unpenalized (so it is
+    // rank-deficient on its own), and the shrinkage block carries real rank in
+    // exactly those directions.
+    assert!(bend_rank > 0 && bend_rank < p_constrained);
+    assert!(null_rank > 0);
+    // Together the two blocks leave NO unpenalized direction: the assembled
+    // double penalty `S_bend + Z Zᵀ` has full structural rank. This — not a
+    // clean rank partition (the blocks overlap on the same coefficient block) —
+    // is the property that lets REML *shrink* (never inflate) the null space
+    // (#1266); the overlapping-block geometry is what the penalty-logdet
+    // structural-rank handling on the REML side is built around.
+    let summed = &result.penalties[0] + &result.penalties[1];
+    let joint_rank = analyze_penalty_block_with_op(&summed, None)
+        .expect("assembled double penalty analyzes")
+        .rank;
+    assert_eq!(joint_rank, p_constrained);
+
     assert_eq!(result.design.nrows(), x.len());
 }
 
