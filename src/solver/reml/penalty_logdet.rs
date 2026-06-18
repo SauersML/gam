@@ -148,6 +148,33 @@ fn disjoint_diagonal_blocks(s_k_matrices: &[Array2<f64>]) -> Option<Vec<(usize, 
     if blocks.len() > 1 { Some(blocks) } else { None }
 }
 
+fn structural_rank_from_assembled(s_total: &Array2<f64>) -> Result<usize, String> {
+    let p_dim = s_total.nrows();
+    if p_dim == 0 {
+        return Ok(0);
+    }
+    let (evals, _) = s_total.eigh(Side::Lower).map_err(|e| {
+        format!("PenaltyPseudologdet structural-rank eigendecomposition failed: {e}")
+    })?;
+    let threshold =
+        super::reml_outer_engine::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+    Ok(evals.iter().filter(|&&eval| eval > threshold).count())
+}
+
+fn structural_rank_from_canonical_penalties(
+    penalties: &[crate::construction::CanonicalPenalty],
+    lambdas: &[f64],
+    p_total: usize,
+) -> Result<usize, String> {
+    let mut structural = Array2::<f64>::zeros((p_total, p_total));
+    for (k, penalty) in penalties.iter().enumerate() {
+        if k < lambdas.len() && lambdas[k] > 0.0 {
+            penalty.accumulate_weighted(&mut structural, 1.0);
+        }
+    }
+    structural_rank_from_assembled(&structural)
+}
+
 /// Result of a penalty pseudo-logdet computation.
 ///
 /// Holds the eigendecomposition and precomputed W-factor so that derivative
@@ -240,8 +267,10 @@ impl PenaltyPseudologdet {
                     s_total[[i, i]] += ridge;
                 }
             }
+            let structural_rank =
+                structural_rank_from_canonical_penalties(penalties, lambdas, p_total)?;
             let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
-            Self::from_assembled(s_total, ridge_hint)
+            Self::from_assembled_with_rank_hint(s_total, ridge_hint, Some(structural_rank))
         }
     }
 
@@ -263,6 +292,7 @@ impl PenaltyPseudologdet {
             pub(crate) start: usize,
             pub(crate) end: usize,
             pub(crate) local: Array2<f64>,
+            pub(crate) structural_local: Array2<f64>,
         }
 
         // Group penalties by their exact block range.
@@ -276,14 +306,22 @@ impl PenaltyPseudologdet {
                 .find(|bd| bd.start == r.start && bd.end == r.end)
             {
                 bd.local.scaled_add(lambda, &cp.local);
+                if lambda > 0.0 {
+                    bd.structural_local.scaled_add(1.0, &cp.local);
+                }
             } else {
                 let bd = cp.block_dim();
                 let mut local = Array2::<f64>::zeros((bd, bd));
                 local.scaled_add(lambda, &cp.local);
+                let mut structural_local = Array2::<f64>::zeros((bd, bd));
+                if lambda > 0.0 {
+                    structural_local.scaled_add(1.0, &cp.local);
+                }
                 blocks.push(BlockData {
                     start: r.start,
                     end: r.end,
                     local,
+                    structural_local,
                 });
             }
         }
@@ -325,7 +363,12 @@ impl PenaltyPseudologdet {
 
         let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
         let process_block = |bd: &BlockData| -> Result<BlockResult, String> {
-            let block_pld = Self::from_assembled(bd.local.clone(), ridge_hint)?;
+            let structural_rank = structural_rank_from_assembled(&bd.structural_local)?;
+            let block_pld = Self::from_assembled_with_rank_hint(
+                bd.local.clone(),
+                ridge_hint,
+                Some(structural_rank),
+            )?;
             let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
             Ok(BlockResult {
                 start: bd.start,
@@ -519,7 +562,7 @@ impl PenaltyPseudologdet {
             return Self::from_assembled_block_local(s_total, ridge_hint, &blocks);
         }
 
-        Self::from_assembled(s_total, ridge_hint)
+        Self::from_assembled_with_rank_hint(s_total, ridge_hint, None)
     }
 
     /// Build from a pre-assembled penalty matrix.
@@ -548,6 +591,26 @@ impl PenaltyPseudologdet {
     /// eigenspace and removes the redundant metadata invariant that issues
     /// #192 and #318 both stemmed from.
     pub fn from_assembled(s_total: Array2<f64>, ridge: Option<f64>) -> Result<Self, String> {
+        Self::from_assembled_with_rank_hint(s_total, ridge, None)
+    }
+
+    /// Build from a pre-assembled penalty matrix, optionally pinning the
+    /// structural positive rank.
+    ///
+    /// A rank hint is needed for canonical overlapping penalties such as a
+    /// B-spline bend penalty plus its Marra-Wood null-space shrinkage ridge:
+    /// the two components live on the same coefficient block but can have very
+    /// different lambdas. The current weighted spectrum can then contain
+    /// small-but-real positive eigenvalues far below the block's largest
+    /// eigenvalue. Those directions are still part of the structural penalty
+    /// range and contribute `log(lambda)` coercivity to REML; dropping them by a
+    /// relative threshold removes the cost term whose derivative keeps the
+    /// bend lambda moving upward (#1266).
+    pub(crate) fn from_assembled_with_rank_hint(
+        s_total: Array2<f64>,
+        ridge: Option<f64>,
+        rank_hint: Option<usize>,
+    ) -> Result<Self, String> {
         let p_dim = s_total.nrows();
         if p_dim == 0 {
             return Ok(Self {
@@ -586,11 +649,30 @@ impl PenaltyPseudologdet {
         };
         let mut positive_indices = Vec::with_capacity(p_dim);
         let mut null_indices = Vec::with_capacity(p_dim);
-        for (idx, &eval) in evals.iter().enumerate() {
-            if eval > boundary {
-                positive_indices.push(idx);
-            } else {
-                null_indices.push(idx);
+        if let Some(rank_hint) = rank_hint {
+            let rank_hint = rank_hint.min(p_dim);
+            let first_positive = p_dim.saturating_sub(rank_hint);
+            for idx in 0..p_dim {
+                if idx >= first_positive {
+                    let eval = evals[idx];
+                    if !(eval.is_finite() && eval > 0.0) {
+                        return Err(format!(
+                            "PenaltyPseudologdet structural rank hint {rank_hint} selected \
+                             non-positive eigenvalue {eval} at sorted index {idx}"
+                        ));
+                    }
+                    positive_indices.push(idx);
+                } else {
+                    null_indices.push(idx);
+                }
+            }
+        } else {
+            for (idx, &eval) in evals.iter().enumerate() {
+                if eval > boundary {
+                    positive_indices.push(idx);
+                } else {
+                    null_indices.push(idx);
+                }
             }
         }
         let rank = positive_indices.len();
@@ -1740,6 +1822,47 @@ mod tests {
         }
         assert!(block_second[[0, 2]].abs() < 1e-12);
         assert!(block_second[[1, 2]].abs() < 1e-12);
+    }
+
+    #[test]
+    pub(crate) fn test_same_block_double_penalty_keeps_structural_rank_under_lambda_imbalance() {
+        let p_total = 3;
+        let lambdas = [1.0e12_f64, 1.0e-6_f64];
+        let penalties = vec![
+            crate::construction::CanonicalPenalty {
+                root: array![[10.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                col_range: 0..3,
+                total_dim: p_total,
+                nullity: 1,
+                local: array![[100.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+                prior_mean: Array1::zeros(3),
+                positive_eigenvalues: vec![100.0, 1.0],
+                op: None,
+            },
+            crate::construction::CanonicalPenalty {
+                root: array![[0.0, 0.0, 1.0]],
+                col_range: 0..3,
+                total_dim: p_total,
+                nullity: 2,
+                local: array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                prior_mean: Array1::zeros(3),
+                positive_eigenvalues: vec![1.0],
+                op: None,
+            },
+        ];
+
+        let pld = PenaltyPseudologdet::from_penalties(&penalties, &lambdas, 0.0, p_total)
+            .expect("same-block double penalty pseudo-logdet");
+        assert_eq!(
+            pld.rank(),
+            3,
+            "same-block double penalty must keep the unweighted structural rank even when \
+             the current null-ridge eigenvalue is tiny relative to the bend block"
+        );
+
+        let (det1, _) = pld.rho_derivatives_from_penalties(&penalties, &lambdas);
+        assert!((det1[0] - 2.0).abs() < 1e-9);
+        assert!((det1[1] - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -26,14 +26,17 @@ fn fit_edf(formula: &str, data: &gam::data::EncodedDataset) -> f64 {
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else {
-        panic!("expected a standard Gaussian fit");
-    };
-    fit.fit
-        .inference
-        .as_ref()
-        .expect("default fit must compute inference")
-        .edf_total
+    match result {
+        FitResult::Standard(fit) => {
+            fit.fit
+                .inference
+                .as_ref()
+                .expect("default fit must compute inference")
+                .edf_total
+        }
+        FitResult::SplineScan(scan) => scan.edf(),
+        _ => panic!("expected a standard Gaussian or spline-scan fit"),
+    }
 }
 
 #[test]
@@ -42,23 +45,22 @@ fn bspline_double_penalty_does_not_inflate_linear_edf() {
 
     let mut edf_on = Vec::new();
     let mut edf_off = Vec::new();
-    // degree=2 keeps this regression on the sparse-native REML P-spline path.
-    // The exact spline-scan route is deliberately single-penalty, so the
-    // double_penalty=false arm would otherwise bypass the EDF code under test.
     for seed in 0..5 {
         let data = linear_dataset(seed, 800);
-        edf_on.push(fit_edf(
-            "y ~ s(x, k=20, bs=ps, degree=2, double_penalty=True)",
-            &data,
-        ));
+        edf_on.push(fit_edf("y ~ s(x, k=20, bs=ps, double_penalty=True)", &data));
         edf_off.push(fit_edf(
-            "y ~ s(x, k=20, bs=ps, degree=2, double_penalty=False)",
+            "y ~ s(x, k=20, bs=ps, double_penalty=False)",
             &data,
         ));
     }
 
     let mean_on = edf_on.iter().sum::<f64>() / edf_on.len() as f64;
     let mean_off = edf_off.iter().sum::<f64>() / edf_off.len() as f64;
+    assert!(
+        mean_on <= 2.35,
+        "B-spline double penalty did not reach the mgcv linear-data EDF target \
+         (~2.10): double_penalty=true mean={mean_on:.6}, values={edf_on:?}"
+    );
     assert!(
         mean_on <= mean_off + 1.0e-8,
         "enabling B-spline double penalty inflated EDF on linear data: \
