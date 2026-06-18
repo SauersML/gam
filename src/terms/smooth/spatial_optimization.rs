@@ -3253,7 +3253,16 @@ fn run_exact_joint_spatial_optimization(
             eval_outer(
                 ctx,
                 theta,
-                if analytic_outer_hessian_available {
+                // #1033: when the n-free Gaussian ψ-lane is armed we suppress the
+                // outer Hessian and route BFGS — so this default gradient eval MUST
+                // request `ValueAndGradient`, not `ValueGradientHessian`. A
+                // second-order order sets `allow_second_order`, which forces
+                // `ensure_theta` → the O(n) design re-realization (the Hessian slab
+                // is irreducibly n-dependent), DISARMING the design-revision fast
+                // path for every trial — exactly the O(n) κ-loop this lane exists to
+                // remove. Gating only the planner's solver (Unavailable→BFGS)
+                // without gating this eval-order left every trial second-order.
+                if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
                     OuterEvalOrder::ValueGradientHessian
                 } else {
                     OuterEvalOrder::ValueAndGradient
