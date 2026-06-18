@@ -125,6 +125,114 @@ fn matern_2d_nfree_rekey_preserves_penalty_topology_across_psi() {
 }
 
 #[test]
+fn matern_2d_admits_nfree_rekey_and_matches_slow_path_across_psi_1274() {
+    // #1274 — re-admit Matérn to the n-free κ fast path. The byte/topology
+    // identity that #1270 lacked is now provided by the shared operator-triplet
+    // builder (`matern_operator_penalty_triplet_at_length_scale`), so the
+    // design-realization skip is sound for Matérn and the κ outer loop is n-free
+    // for it too (no more O(n) re-realization per trial).
+    //
+    // This test FAILS on pre-#1274 main because `supports_nfree_penalty_rekey`
+    // returns false for `BasisMetadata::Matern` (the gate that decides whether
+    // the fast path is even armed). It PASSES after the fix re-admits Matérn AND
+    // the re-key reproduces the slow-path realized operator triplet
+    // byte-for-byte across the ψ window the optimizer sweeps.
+    let data = matern_2d_dataset(360);
+    let seed_length_scale = 0.30;
+    let (resolved, design) = frozen_matern_2d(data.view(), seed_length_scale);
+
+    // ν=5/2, d=2 ⇒ m = ν + d/2 = 3.5 > 2: all three operator dials active.
+    let frozen_blocks = design.penalties.len();
+    assert!(
+        frozen_blocks >= 3,
+        "expected the ν=5/2 d=2 Matérn design to ship the 3-block operator triplet; got {frozen_blocks}"
+    );
+
+    let mut realizer =
+        FrozenTermCollectionIncrementalRealizer::new(data.view(), resolved.clone(), design.clone())
+            .expect("build incremental realizer");
+    let spatial_terms = vec![0usize];
+
+    // THE #1274 GATE: a single frozen Matérn term must ADMIT the exact n-free
+    // S(ψ) re-key (was hard-excluded by #1270). Without this the κ outer loop
+    // never arms the design-realization skip for Matérn and stays O(n).
+    assert!(
+        realizer.supports_nfree_penalty_rekey(&spatial_terms),
+        "single frozen Matérn term must admit the exact n-free S(ψ) re-key (#1274) — \
+         the operator-triplet re-key is now byte/topology-identical to the realized design"
+    );
+
+    // Across the ψ (log length-scale) window the optimizer sweeps, the n-free
+    // re-key must match the SLOW-PATH realized Matérn penalty (operator triplet:
+    // mass/tension/stiffness) — same block count, same topology, entrywise equal
+    // to tight tolerance. This is the byte/topology-IDENTITY contract.
+    let psi0 = -seed_length_scale.ln();
+    let mut worst_diff = 0.0_f64;
+    for step in [-1.0_f64, -0.4, 0.0, 0.4, 1.0] {
+        let psi = psi0 + step;
+        let trial_length_scale = (-psi).exp();
+
+        // Slow path: rebuild the frozen design with only the length scale moved,
+        // then derive its operator triplet exactly as a cold κ trial would.
+        let mut trial_spec = resolved.clone();
+        set_spatial_length_scale(&mut trial_spec, 0, trial_length_scale)
+            .expect("set trial length scale");
+        let trial_design = build_term_collection_design(data.view(), &trial_spec)
+            .expect("slow-path trial design");
+        let truth_metadata = &trial_design.smooth.terms[0].metadata;
+        let (truth_locals, truth_nulldims, _info) =
+            matern_operator_penalty_triplet_from_metadata(truth_metadata)
+                .expect("slow-path operator triplet");
+
+        // Fast path: the n-free re-key at the same ψ.
+        let (rekey, rekey_nulldims) = realizer
+            .canonical_penalties_at_psi(&spatial_terms, &[psi])
+            .unwrap_or_else(|e| panic!("re-key must succeed at psi={psi} (step {step}): {e}"));
+
+        assert_eq!(
+            rekey.len(),
+            truth_locals.len(),
+            "psi={psi}: re-key block count {} != slow-path {} — topology must be identical",
+            rekey.len(),
+            truth_locals.len()
+        );
+        assert_eq!(
+            rekey.len(),
+            frozen_blocks,
+            "psi={psi}: re-key block count {} != frozen design {frozen_blocks} (ψ-stable triplet)",
+            rekey.len()
+        );
+        assert_eq!(
+            rekey_nulldims, truth_nulldims,
+            "psi={psi}: nullspace dims must match the slow path"
+        );
+
+        for (k, (rk, truth)) in rekey.iter().zip(truth_locals.iter()).enumerate() {
+            assert_eq!(
+                rk.local.dim(),
+                truth.dim(),
+                "psi={psi} block {k}: re-key local shape {:?} != slow-path {:?}",
+                rk.local.dim(),
+                truth.dim()
+            );
+            let max_abs_diff = rk
+                .local
+                .iter()
+                .zip(truth.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            worst_diff = worst_diff.max(max_abs_diff);
+            assert!(
+                max_abs_diff < 1e-10,
+                "psi={psi} block {k}: n-free re-key deviates from the slow-path realized \
+                 Matérn penalty by {max_abs_diff:.3e} — must be byte/topology-identical (#1274)"
+            );
+        }
+    }
+    eprintln!("[#1274] max entrywise re-key vs slow-path diff across ψ window = {worst_diff:.3e}");
+}
+
+#[test]
 fn matern_2d_nfree_rekey_matches_frozen_design_at_seed() {
     // The strongest exactness contract: at the SEED ψ the design was built at,
     // the n-free re-key must reconstruct the frozen design's own canonical
