@@ -2676,11 +2676,12 @@ impl WorkingModelSurvival {
     /// (total_cost, analytic_grad0, penalized_nll, half_logdet_h, half_logdet_s,
     ///  penalty_quad_half, r_norm, beta_hat).
     #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
     pub fn survival_lamlterm_split_931(
         &self,
         rho: &[f64],
         beta0: &Array1<f64>,
-    ) -> Result<(f64, f64, f64, f64, f64, f64, f64, Array1<f64>), EstimationError> {
+    ) -> Result<(f64, f64, f64, f64, f64, f64, f64, Array1<f64>, Array2<f64>), EstimationError> {
         use crate::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
 
         // Re-converge with the SAME settings as the shim.
@@ -2831,6 +2832,7 @@ impl WorkingModelSurvival {
             penalty_quad_half,
             r_norm,
             beta,
+            h_dense,
         ))
     }
 }

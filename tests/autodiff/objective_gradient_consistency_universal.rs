@@ -1312,6 +1312,22 @@ fn survival_rho_eight_term_split_probe_931() {
         "[931-TS] @rho=8: cost={:.12e} analyticGrad={:.12e} pnll={:.12e} halfLdH={:.12e} halfLdS={:.12e} quadHalf={:.12e} rnorm={:.3e} beta={:?}",
         base.0, base.1, base.2, base.3, base.4, base.5, base.6, base.7.to_vec()
     );
+    // Clean ½·d log|H|/dρ via matrix trace-FD: ½·tr(H⁻¹·(H₊−H₋)/2h). This avoids
+    // logdet cancellation entirely, so it is a NOISE-FREE reference for the term.
+    // The analytic half_trace_logH (implied) = analyticGrad − d(pnll) + d(½ldS)
+    //   = base.1 − ~1.92e-4 + 0.5.
+    let h_base = base.8.clone();
+    let hinv = {
+        // Solve H X = I by Cholesky to get H⁻¹ (2x2, tiny).
+        let n = h_base.nrows();
+        let mut inv = ndarray::Array2::<f64>::zeros((n, n));
+        let det = h_base[[0, 0]] * h_base[[1, 1]] - h_base[[0, 1]] * h_base[[1, 0]];
+        inv[[0, 0]] = h_base[[1, 1]] / det;
+        inv[[1, 1]] = h_base[[0, 0]] / det;
+        inv[[0, 1]] = -h_base[[0, 1]] / det;
+        inv[[1, 0]] = -h_base[[1, 0]] / det;
+        inv
+    };
     for h in h_list {
         let p = model.survival_lamlterm_split_931(&[8.0 + h], &beta0).unwrap();
         let m = model.survival_lamlterm_split_931(&[8.0 - h], &beta0).unwrap();
@@ -1321,11 +1337,17 @@ fn survival_rho_eight_term_split_probe_931() {
         let fd_lds = (p.4 - m.4) / (2.0 * h);
         let fd_quad = (p.5 - m.5) / (2.0 * h);
         let dbeta = (&p.7 - &m.7).iter().map(|v| v.abs()).fold(0.0, f64::max);
+        // Clean ½·tr(H⁻¹ dH/dρ).
+        let dh = (&p.8 - &m.8).mapv(|v| v / (2.0 * h));
+        let hinv_dh = hinv.dot(&dh);
+        let trace = (0..hinv_dh.nrows()).map(|i| hinv_dh[[i, i]]).sum::<f64>();
+        let clean_half_ldh = 0.5 * trace;
         println!(
-            "[931-TS] h={h:.1e} fdCost={fd_cost:.6e} | d(pnll)/dr={fd_pnll:.6e} d(½ldH)/dr={fd_ldh:.6e} d(½ldS)/dr={fd_lds:.6e} d(quad½)/dr={fd_quad:.6e} | dBeta(±h)={dbeta:.3e} rnorm+={:.2e} rnorm-={:.2e}",
-            p.6, m.6
+            "[931-TS] h={h:.1e} fdCost={fd_cost:.6e} | d(pnll)/dr={fd_pnll:.6e} d(½ldH)logdetFD={fd_ldh:.6e} d(½ldH)traceFD={clean_half_ldh:.6e} d(½ldS)/dr={fd_lds:.6e} d(quad½)/dr={fd_quad:.6e} | dBeta(±h)={dbeta:.3e}"
         );
     }
+    let analytic_half_ldh = base.1 - 1.923e-4 + 0.5;
+    println!("[931-TS] analytic-implied half_trace_logH ≈ {analytic_half_ldh:.9e} (compare to traceFD column)");
     panic!("[931-TS] term-split probe complete (intentional fail to surface stdout)");
 }
 
