@@ -505,6 +505,23 @@ pub fn resolve_family(
             // Sas/BetaLogistic/Mixture state, which `from_link.link` already
             // holds) to the explicit family's response variant (preserving e.g.
             // NB theta, Tweedie p, Beta phi).
+            if matches!(
+                choice.mode,
+                crate::inference::formula_dsl::LinkMode::Flexible
+            ) && !matches!(explicit_spec.response, ResponseFamily::Binomial)
+            {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "flexible(...) links (the jointly-fit anchored spline link offset) are \
+                         implemented only for a binomial response; the resolved family is {} (a \
+                         non-binomial family), for which the link offset has no solver and would \
+                         otherwise be silently discarded. Use the plain base link, or fit a binomial \
+                         response.",
+                        explicit_spec.pretty_name()
+                    ),
+                }
+                .into());
+            }
             let mixture_requested = choice.mixture_components.is_some();
             let legal = if mixture_requested {
                 // The mixture link is a Binomial latent construct; it has no
