@@ -9,22 +9,26 @@
 //! window every design entry `X(ψ)[i, j]` is an ANALYTIC function of ψ on a
 //! compact interval (Matérn channels depend on (r, ℓ) only through κr and
 //! κ-power prefactors; Duchon power blocks are ψ-free; partial-fraction
-//! coefficients are analytic scalars), so the whole design admits a
-//! geometrically-convergent Chebyshev expansion
+//! coefficients are analytic scalars), so both the design and its Gaussian
+//! sufficient statistics admit geometrically-convergent Chebyshev expansions
 //!
 //! ```text
 //!   X(ψ) = Σ_{d=0}^{D} X_d · T_d(ψ̃),     ψ̃ = affine map of ψ to [−1, 1],
 //! ```
 //!
 //! with n×k coefficient slabs `X_d` computed ONCE from D+1 exact design
-//! evaluations at Chebyshev nodes (a first-kind DCT). Precomputing the expanded
-//! Gram `G̃[d][e] = X_dᵀ W X_e` and cross-products `c̃[d] = X_dᵀ W z` in ONE
-//! pass over the data makes every subsequent trial n-free:
+//! evaluations at Chebyshev nodes (a first-kind DCT). The design coefficients
+//! certify analyticity, while the shipped runtime series is fit directly to the
+//! exact node sufficient statistics `G(ψ_i)=X(ψ_i)ᵀ W X(ψ_i)` and
+//! `c(ψ_i)=X(ψ_i)ᵀ W z`. Interpolating the sufficient statistics directly avoids
+//! the extra product-truncation residual from forming `Σ_d,e X_dᵀWX_e T_dT_e`,
+//! which a weakly penalized radial solve can amplify into visible β̂ drift.
+//! Every subsequent trial is n-free:
 //!
 //! ```text
-//!   XᵀWX(ψ) = Σ_{d,e} T_d(ψ̃) T_e(ψ̃) G̃[d][e]          O(D²k²)
-//!   XᵀWz(ψ) = Σ_d T_d(ψ̃) c̃[d]                          O(D k)
-//!   ∂/∂ψ (XᵀWX) = Σ_{d,e} (T_d′T_e + T_dT_e′) G̃[d][e]   O(D²k²)
+//!   XᵀWX(ψ) = Σ_d T_d(ψ̃) G_d          O(D k²)
+//!   XᵀWz(ψ) = Σ_d T_d(ψ̃) c_d          O(D k)
+//!   ∂/∂ψ (XᵀWX) = Σ_d T_d′(ψ̃) G_d     O(D k²)
 //! ```
 //!
 //! The ψ-gradient comes from the SAME representation as the value — one
@@ -131,8 +135,8 @@ pub const PSI_GRAM_SKIP_PROJ_ATOL: f64 = 1.0e-7;
 
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
 ///
-/// Holds the one-time n-pass products; every per-trial accessor is O(D²k²)
-/// or cheaper and never touches n rows again.
+/// Holds the one-time Chebyshev sufficient-statistic series; every per-trial
+/// accessor is O(Dk²) or cheaper and never touches n rows again.
 pub struct PsiGramTensor {
     psi_lo: f64,
     psi_hi: f64,
@@ -170,12 +174,11 @@ pub struct PsiGramTensor {
     /// Number of Chebyshev coefficients (degree + 1).
     n_coeff: usize,
     k: usize,
-    /// Chebyshev coefficients of `X(ψ)ᵀ W X(ψ)` obtained from the expanded
-    /// products `X_dᵀ W X_e` via `T_d T_e = (T_{d+e}+T_|d-e|)/2`. Collapsing to a
-    /// single series keeps the product expansion but avoids per-trial
-    /// cancellation from evaluating `Σ T_d T_e G_de` directly.
+    /// Chebyshev coefficients of `X(ψ)ᵀ W X(ψ)`, obtained by a first-kind DCT of
+    /// the exact node sufficient statistics. This keeps the per-trial path to a
+    /// single O(Dk²) series and avoids product-truncation drift in β̂.
     gram: Vec<Array2<f64>>,
-    /// `rhs[d]` = `X_dᵀ W z` (the caller's fixed weighted response/offset).
+    /// Chebyshev coefficients of `X(ψ)ᵀ W z`.
     rhs: Vec<Array1<f64>>,
     /// `zᵀWz` — ψ-free, captured at build so the Gaussian sufficient-statistic
     /// triple can be assembled per trial without any row access.
@@ -425,44 +428,35 @@ impl PsiGramTensor {
             zt_w_z_comp = (t - zt_w_z) - y;
             zt_w_z = t;
         }
-        // One-time n-pass products: G̃[d][e] = X_dᵀ W X_e, c̃[d] = X_dᵀ W z.
-        let mut weighted: Vec<Array2<f64>> = Vec::with_capacity(m);
-        for slab in &coeff_slabs {
-            let mut ws = slab.clone();
-            for (mut row, &w) in ws.outer_iter_mut().zip(weights.iter()) {
+        // One-time exact node sufficient statistics, then a first-kind DCT in ψ.
+        // This still pays all row work only during build, but the retained series
+        // approximates G(ψ) and c(ψ) directly instead of multiplying two
+        // separately truncated design series.
+        let mut node_grams: Vec<Array2<f64>> = Vec::with_capacity(m);
+        let mut node_rhs: Vec<Array1<f64>> = Vec::with_capacity(m);
+        for design in &designs {
+            let mut wd = design.clone();
+            for (mut row, &w) in wd.outer_iter_mut().zip(weights.iter()) {
                 row.mapv_inplace(|v| v * w);
             }
-            weighted.push(ws);
+            node_grams.push(design.t().dot(&wd));
+            node_rhs.push(design.t().dot(&wz));
         }
-        let mut gram_products: Vec<Array2<f64>> = Vec::with_capacity(m * m);
-        let mut rhs = Vec::with_capacity(m);
+        let mut gram: Vec<Array2<f64>> = (0..m).map(|_| Array2::<f64>::zeros((k, k))).collect();
+        let mut gram_comp: Vec<Array2<f64>> =
+            (0..m).map(|_| Array2::<f64>::zeros((k, k))).collect();
+        let mut rhs: Vec<Array1<f64>> = (0..m).map(|_| Array1::<f64>::zeros(k)).collect();
+        let mut rhs_comp: Vec<Array1<f64>> = (0..m).map(|_| Array1::<f64>::zeros(k)).collect();
         for d in 0..m {
-            for e in 0..m {
-                if e < d {
-                    // Symmetry: G̃[d][e] = G̃[e][d]ᵀ — reuse, don't recompute.
-                    let g: Array2<f64> = gram_products[e * m + d].t().to_owned();
-                    gram_products.push(g);
-                } else {
-                    gram_products.push(coeff_slabs[d].t().dot(&weighted[e]));
-                }
-            }
-            rhs.push(coeff_slabs[d].t().dot(&wz));
-        }
-        let mut gram: Vec<Array2<f64>> = (0..(2 * m - 1))
-            .map(|_| Array2::<f64>::zeros((k, k)))
-            .collect();
-        let mut gram_comp: Vec<Array2<f64>> = (0..(2 * m - 1))
-            .map(|_| Array2::<f64>::zeros((k, k)))
-            .collect();
-        for d in 0..m {
-            for e in 0..m {
-                let product = &gram_products[d * m + e];
-                kahan_scaled_add_array2(&mut gram[d + e], &mut gram_comp[d + e], 0.5, product);
-                let folded = d.abs_diff(e);
-                kahan_scaled_add_array2(&mut gram[folded], &mut gram_comp[folded], 0.5, product);
+            let gamma = if d == 0 { 1.0 } else { 2.0 };
+            for i in 0..m {
+                let wgt = gamma / m as f64 * t_at_nodes[i][d];
+                kahan_scaled_add_array2(&mut gram[d], &mut gram_comp[d], wgt, &node_grams[i]);
+                kahan_scaled_add_array1(&mut rhs[d], &mut rhs_comp[d], wgt, &node_rhs[i]);
             }
         }
-        drop(gram_products);
+        drop(node_grams);
+        drop(node_rhs);
         drop(designs);
         drop(coeff_slabs);
         BuildOutcome::Candidate(Self {
@@ -782,7 +776,7 @@ impl PsiGramTensor {
         (2.0 * psi - (self.psi_lo + self.psi_hi)) / (self.psi_hi - self.psi_lo)
     }
 
-    /// `XᵀWX(ψ)` assembled n-free in O(Dk²) from the collapsed product series.
+    /// `XᵀWX(ψ)` assembled n-free in O(Dk²) from the direct Gram series.
     pub fn gram_at(&self, psi: f64) -> Array2<f64> {
         let x = self.mapped(psi);
         let t = cheb_t(x, self.gram.len());
@@ -808,7 +802,7 @@ impl PsiGramTensor {
 
     /// Exact `∂(XᵀWX)/∂ψ` from the SAME representation as the value — the
     /// structural cure for the objective↔gradient desync class on this
-    /// channel. n-free, O(Dk²) from the collapsed product series.
+    /// channel. n-free, O(Dk²) from the direct Gram series.
     pub fn dgram_dpsi(&self, psi: f64) -> Array2<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
@@ -838,7 +832,7 @@ impl PsiGramTensor {
     /// the n-free curvature that lets the outer Newton/ARC step read the τ-τ
     /// Hessian's design-moving block without re-streaming an O(n) slab Gram
     /// (#1033, Gaussian-identity single-ψ Hessian channel). O(Dk²) from the
-    /// collapsed product series.
+    /// direct Gram series.
     ///
     /// `XᵀWX(ψ) = Σ_d T_d(x) G_d` with `x = mapped(ψ)`, so by the chain rule
     /// `d²/dψ² = T_d″(x) · (dx/dψ)²`.
