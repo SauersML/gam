@@ -685,8 +685,20 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // `reset_surface` work entirely. Hyper-direction conditioning still
         // runs (hyper_dirs are freshly constructed per call) and the
         // warm-start beta / penalty-shrinkage floor still need refreshing.
+        //
+        // #1033 (reduced-basis rotation): the fast path keeps the realized
+        // `self.x` frozen at the pinning ψ but re-keys the Gaussian Gram cache
+        // (`install_psi_gram_statistics`) and the canonical penalty surface
+        // (`refresh_psi_penalty_surface`) to this trial's ψ. The inner
+        // Gaussian-identity solve reads its data statistics ONLY from those
+        // re-keyed k×k objects (and the penalty-derived reparametrization Qs),
+        // never from `self.x` rows, so the skip is sound across a basis ROTATION
+        // — gated on the n-free VALUE coverage (`psi_gram_tensor_covers`), the
+        // condition under which the cache re-key actually fires, rather than the
+        // stricter `reduced_basis_equal` witness (which refused sound rotated-
+        // basis skips and forced the O(n) `reset_surface` fallback).
         let skip_window_allows_fast_path = match (self.psi_gram_tensor.is_some(), theta.len()) {
-            (true, len) if len == rho_dim + 1 => self.psi_gram_tensor_covers_skip(theta[rho_dim]),
+            (true, len) if len == rho_dim + 1 => self.psi_gram_tensor_covers(theta[rho_dim]),
             _ => true,
         };
         let fast_path = match (design_revision, self.last_canonical_revision) {
@@ -1007,8 +1019,16 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // full `reset_surface`, the cached surface's X, canonical penalties,
         // gaussian-fixed cache, and PIRLS cache are all still keyed to the
         // exact same (X, y, w, offset) — skip the eigendecomp + cache wipe.
+        //
+        // #1033 (reduced-basis rotation): a value-only probe's Gaussian-identity
+        // inner solve reads its data statistics ONLY from the re-keyed
+        // `GaussianFixedCache` + penalty-derived reparametrization Qs, never from
+        // the frozen `self.x` rows, so the skip is sound across a basis ROTATION.
+        // Gate on the n-free VALUE coverage (the condition under which the cache
+        // re-key fires) rather than the stricter `reduced_basis_equal` witness,
+        // which refused sound rotated-basis skips and forced the O(n) fallback.
         let skip_window_allows_fast_path = match (self.psi_gram_tensor.is_some(), theta.len()) {
-            (true, len) if len == rho_dim + 1 => self.psi_gram_tensor_covers_skip(theta[rho_dim]),
+            (true, len) if len == rho_dim + 1 => self.psi_gram_tensor_covers(theta[rho_dim]),
             _ => true,
         };
         let fast_path = match (design_revision, self.last_canonical_revision) {

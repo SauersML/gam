@@ -4809,7 +4809,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // in below from the witness itself (smallest step among a shrinking ladder
     // that the pinned witness accepts), keeping the positive lane robustly
     // non-vacuous without depending on a hand-tuned magnitude.
-    let mut psi_b = psi_a + span / 4096.0;
+    let psi_b = psi_a + span / 4096.0;
     // ψ_C: a LARGE move toward the low edge — the radial-kernel reduced basis has
     // moved there, so the witness should REFUSE and the slow path must re-run. (If
     // the fixture's basis happens to stay equal even here, the test still passes:
@@ -4887,62 +4887,61 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         "first eval at a fresh revision must take the slow path exactly once"
     );
 
-    // With ψ_A now pinned, the witness `psi_gram_tensor_covers_skip` is live.
-    // Pick ψ_B as the smallest step (down a shrinking ladder) the pinned witness
-    // ACCEPTS, so the positive fast-path lane is robustly exercised without a
-    // hand-tuned magnitude. The reduced basis is continuous in ψ at an interior
-    // pin, so a sufficiently small step is always accepted.
-    for d in 0..16 {
-        let cand = psi_a + span / (4096.0 * 2f64.powi(d));
-        if tensor_eval.psi_gram_tensor_covers_skip(cand) {
-            psi_b = cand;
-            break;
-        }
-    }
-
-    // Query the witness verdict for the two moved trials. These are the SAME
-    // predicate the production caller consults to decide whether to skip design
-    // realization, so the test's expected reset deltas are derived from it rather
-    // than hard-coded — keeping the gate honest on whatever the standardized
-    // fixture actually does.
+    // ψ_B stays a small step off the interior pin (reduced basis essentially
+    // unchanged — the `reduced_basis_equal` witness would ADMIT it). ψ_C is the
+    // LARGE move toward the low edge where the radial-kernel reduced basis has
+    // ROTATED, so the witness `reduced_basis_equal` REFUSES it. Both lie inside
+    // the certified VALUE window, so under the #1033 reduced-basis-rotation fix
+    // the production skip gate (now keyed on n-free VALUE coverage, not the
+    // pairwise basis-equality witness) fires the design-realization skip for
+    // BOTH — including ψ_C across the rotation. The soundness this exercises:
+    // the skipped fast path re-keys only the Gaussian Gram cache + penalty (k×k),
+    // never reads the frozen `self.x`, so β̂ stays bit-identical to the streamed
+    // slow path EVEN across the basis rotation the witness refuses.
     let skip_b = tensor_eval.psi_gram_tensor_covers_skip(psi_b);
     let skip_c = tensor_eval.psi_gram_tensor_covers_skip(psi_c);
+    // Both trials are inside the n-free VALUE window — the condition the
+    // production gate now uses to fire the skip.
+    let covers_b = tensor_eval.psi_gram_tensor_covers(psi_b);
+    let covers_c = tensor_eval.psi_gram_tensor_covers(psi_c);
     if std::env::var("DIAG1216").is_ok() {
         eprintln!(
-            "[DIAG1216-FP] pinned ψ_a={psi_a:.5}  covers_skip(ψ_b={psi_b:.5})={skip_b}  \
-             covers_skip(ψ_c={psi_c:.5})={skip_c}"
+            "[DIAG1216-FP] pinned ψ_a={psi_a:.5}  ψ_b={psi_b:.5} covers={covers_b} \
+             basis_equal={skip_b}  ψ_c={psi_c:.5} covers={covers_c} basis_equal={skip_c}"
         );
     }
-    // A tiny ψ move off the pin must keep the reduced basis (non-vacuous positive
-    // lane): the skip witness has to ADMIT it, exercising the actual fast-path
-    // skip whose β̂ we then certify against the streamed solve below.
     assert!(
-        skip_b,
-        "a tiny ψ move off the pin must preserve the reduced basis and ADMIT the \
-         skip (else the positive fast-path lane is never exercised); ψ_a={psi_a:.6} \
-         ψ_b={psi_b:.6}"
+        covers_b && covers_c,
+        "both moved trials must lie inside the certified value window so the n-free \
+         skip gate can fire; ψ_b={psi_b:.6} (covers={covers_b}) ψ_c={psi_c:.6} \
+         (covers={covers_c})"
     );
 
-    // Trial 2 (ψ_B): the witness decides the path; reset_count tracks the verdict.
+    // Trial 2 (ψ_B): value-covered ⇒ the production gate fires the skip (no
+    // slow-path reset), regardless of the basis-equality witness verdict.
     let before_b = tensor_eval.slow_path_reset_count();
     let (c_b, _g_b, beta_b) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b));
     let after_b = tensor_eval.slow_path_reset_count();
     assert_eq!(
         after_b - before_b,
-        if skip_b { 0 } else { 1 },
-        "ψ_B reset-count delta must match the witness verdict (skip={skip_b}): an \
-         admitted skip takes the fast path (no reset), a refused skip re-runs the \
-         slow path (+1)"
+        0,
+        "ψ_B is value-covered, so the #1033 skip gate must take the design-revision \
+         fast path with no slow-path reset"
     );
 
-    // Trial 3 (ψ_C): same self-consistency check at the far ψ.
+    // Trial 3 (ψ_C): the ROTATION case — `reduced_basis_equal` REFUSES it
+    // (skip_c={skip_c}) yet the value-covered skip gate still fires the fast path.
+    // The β̂ bit-identity check below is the load-bearing soundness proof that the
+    // rotated-basis skip never changes the κ-optimum.
     let before_c = tensor_eval.slow_path_reset_count();
     let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c));
     let after_c = tensor_eval.slow_path_reset_count();
     assert_eq!(
         after_c - before_c,
-        if skip_c { 0 } else { 1 },
-        "ψ_C reset-count delta must match the witness verdict (skip={skip_c})"
+        0,
+        "ψ_C is value-covered, so the #1033 skip gate must take the fast path with no \
+         slow-path reset EVEN across the basis rotation the witness refuses \
+         (reduced_basis_equal={skip_c})"
     );
 
     assert!(

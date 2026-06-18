@@ -2459,17 +2459,28 @@ impl<'d> SpatialJointContext<'d> {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
                     && self.evaluator.psi_gram_tensor_covers_gradient(psi)
-                    // #1264: the skip keeps the conditioned reduced /
-                    // null-space basis frozen at the revision-pinning ψ and only
-                    // re-keys the Gram + penalty. That is exact only where the
-                    // reduced basis is proven equal. RRQR rank/permutation was
-                    // not sufficient on the standardized fixture; the pairwise
-                    // range-projector witness (`reduced_basis_equal`) certifies
-                    // subspace equality between the pinning ψ and this trial ψ
-                    // n-free, so the skip fires only where the frozen reduced
-                    // basis is still valid — otherwise the full `reset_surface`
-                    // slow path runs.
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi)
+                    // #1033 (reduced-basis rotation, supersedes #1264 gate): the
+                    // Gaussian-identity inner solve the skip serves reads its data
+                    // statistics ONLY from re-keyed k×k objects — XᵀWX(ψ)/XᵀW(y−
+                    // offset)(ψ) from the `GaussianFixedCache` (re-installed at this
+                    // trial's ψ by `install_psi_gram_statistics`) and the stable
+                    // reparametrization Qs, which is built from the PENALTY
+                    // (`stable_reparameterization_engine_canonical`), NOT the data
+                    // Gram, and is rebuilt every inner PLS call from the re-keyed
+                    // `S(ψ)`. β̂, EDF, scale/deviance, and the j==0 ψ-gradient
+                    // (from the re-keyed `∂G/∂ψ`,`∂b/∂ψ` derivative pair, conjugated
+                    // by Qs) never read `self.x` rows. So the skip is sound whether
+                    // or not the conditioned reduced basis ROTATES with ψ: the
+                    // realized `self.x` frozen at the pinning ψ is never consumed on
+                    // this lane. The earlier wrong-β̂ regression a wide-window MSI
+                    // run found was the STALE PENALTY `S(ψ_old)` (fixed by re-keying
+                    // it n-free below), not a stale reduced basis. The pairwise
+                    // range-projector witness `reduced_basis_equal` is retained as a
+                    // soundness reference, but is no longer a skip precondition — it
+                    // refused sound rotated-basis skips, forcing the O(n)
+                    // `reset_surface` fallback and breaking n-independence across a
+                    // basis rotation.
+                    //
                     // #1033 penalty lane: ψ moves S(ψ) too, and the skip leaves
                     // `reset_surface` un-run; only skip when the penalty can be
                     // rebuilt EXACTLY and n-free on the fast path, else the inner
@@ -2713,15 +2724,17 @@ impl<'d> SpatialJointContext<'d> {
         let skip_value_realization = theta.len() == self.rho_dim + 1 && {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
-                    // #1264: value-only line-search probes still run the inner
-                    // solve on the kept reduced surface. A full-window value
-                    // certificate only proves the k-space Gram is accurate; it
-                    // does NOT prove the frozen reduced basis is valid at this
-                    // ψ. Gate the reset_surface skip on the same
-                    // reduced-basis-equality sub-window as `eval_full`, else a
-                    // cost probe can pair a correct Gram with a stale basis and
-                    // mis-rank κ moves.
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi)
+                    // #1033 (reduced-basis rotation): a value-only line-search probe
+                    // runs the inner Gaussian-identity solve from the re-keyed
+                    // `GaussianFixedCache` (XᵀWX(ψ)/XᵀW(y−offset)(ψ)) and the stable
+                    // reparametrization Qs (penalty-derived, re-keyed every call from
+                    // the n-free `S(ψ)`). β̂ and the cost never read the frozen
+                    // `self.x` rows, so the probe is correct whether or not the
+                    // conditioned reduced basis rotates with ψ. The
+                    // `reduced_basis_equal` precondition is therefore dropped here
+                    // too (it refused sound rotated-basis probes and forced the O(n)
+                    // `reset_surface` fallback); the witness is kept as a soundness
+                    // reference. See the eval_full gate for the full justification.
                     // #1033 penalty lane: the value-probe fast path also skips
                     // `reset_surface`, so the probe must be able to re-key S(ψ)
                     // EXACTLY and n-free; otherwise its cost would use the stale
