@@ -47,7 +47,7 @@ fn dense_stats(
 }
 
 #[test]
-fn psi_gram_tensor_cache_matches_dense_xtwx_tightly_and_is_n_free() {
+fn psi_gram_tensor_cache_matches_dense_xtwx_bit_identically_and_is_n_free() {
     let (n, k) = (192usize, 8usize);
     let weights = Array1::from_iter((0..n).map(|i| 0.75 + ((i % 7) as f64) * 0.08));
     let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.19).cos() + 0.1));
@@ -88,26 +88,20 @@ fn psi_gram_tensor_cache_matches_dense_xtwx_tightly_and_is_n_free() {
             dense_ztwz.to_bits(),
             "z'Wz changed bits at psi={psi}"
         );
-        let gram_scale = dense_gram
-            .iter()
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-            .max(1e-300);
         for ((r, c), &dense) in dense_gram.indexed_iter() {
             let hoisted = cache.xtwx_orig[[r, c]];
-            assert!(
-                (hoisted - dense).abs() <= 1e-9 * gram_scale,
-                "hoisted X'WX differs from dense path beyond tolerance at psi={psi}, entry=({r},{c}); hoisted={hoisted:.17e}, dense={dense:.17e}"
+            assert_eq!(
+                hoisted.to_bits(),
+                dense.to_bits(),
+                "hoisted X'WX differs from dense path bits at psi={psi}, entry=({r},{c}); hoisted={hoisted:.17e}, dense={dense:.17e}"
             );
         }
-        let rhs_scale = dense_rhs
-            .iter()
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-            .max(1e-300);
         for (j, &dense) in dense_rhs.iter().enumerate() {
             let hoisted = cache.xtwy_orig[j];
-            assert!(
-                (hoisted - dense).abs() <= 1e-9 * rhs_scale,
-                "hoisted X'Wz differs from dense path beyond tolerance at psi={psi}, entry={j}; hoisted={hoisted:.17e}, dense={dense:.17e}"
+            assert_eq!(
+                hoisted.to_bits(),
+                dense.to_bits(),
+                "hoisted X'Wz differs from dense path bits at psi={psi}, entry={j}; hoisted={hoisted:.17e}, dense={dense:.17e}"
             );
         }
     }
@@ -148,7 +142,7 @@ fn ridge_profile_deviance(gram: &Array2<f64>, rhs: &Array1<f64>, ywy: f64, lambd
 }
 
 #[test]
-fn reduced_basis_skip_witness_keeps_profile_objective_tight_and_n_free() {
+fn reduced_basis_skip_witness_does_not_certify_bit_identical_stats() {
     let (n, k) = (192usize, 8usize);
     let weights = Array1::from_iter((0..n).map(|i| 0.75 + ((i % 7) as f64) * 0.08));
     let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.19).cos() + 0.1));
@@ -197,29 +191,23 @@ fn reduced_basis_skip_witness_keeps_profile_objective_tight_and_n_free() {
          but hoisted profile objective drifted by rel={rel:.3e}"
     );
 
-    let gram_scale = dense_gram
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-        .max(1e-300);
     for ((r, c), &dense) in dense_gram.indexed_iter() {
         let hoisted = cache.xtwx_orig[[r, c]];
-        assert!(
-            (hoisted - dense).abs() <= 1e-9 * gram_scale,
+        assert_eq!(
+            hoisted.to_bits(),
+            dense.to_bits(),
             "reduced-basis witness accepted psi_ref={psi_ref}, psi_trial={psi_trial}, \
-             but hoisted X'WX drift exceeds tolerance at entry=({r},{c}); \
+             but hoisted X'WX is not bit-identical at entry=({r},{c}); \
              hoisted={hoisted:.17e}, dense={dense:.17e}"
         );
     }
-    let rhs_scale = dense_rhs
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-        .max(1e-300);
     for (j, &dense) in dense_rhs.iter().enumerate() {
         let hoisted = cache.xtwy_orig[j];
-        assert!(
-            (hoisted - dense).abs() <= 1e-9 * rhs_scale,
+        assert_eq!(
+            hoisted.to_bits(),
+            dense.to_bits(),
             "reduced-basis witness accepted psi_ref={psi_ref}, psi_trial={psi_trial}, \
-             but hoisted X'Wz drift exceeds tolerance at entry={j}; \
+             but hoisted X'Wz is not bit-identical at entry={j}; \
              hoisted={hoisted:.17e}, dense={dense:.17e}"
         );
     }
