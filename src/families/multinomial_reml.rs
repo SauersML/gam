@@ -942,6 +942,7 @@ impl MultinomialFamily {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn assemble_directional_derivatives(
         &self,
         eta: ArrayView2<'_, f64>,
