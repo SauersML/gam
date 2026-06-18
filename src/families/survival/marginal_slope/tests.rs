@@ -2361,12 +2361,14 @@ fn debug_flex_directional_quantities_fd_localize() {
             d_fd_fine, (ext.d_uv_dir[[u, v]] - d_fd_fine).abs(),
         );
     }
-    // d_u_dir localization too.
-    for &u in &[q1, g] {
+    // d_u_dir localization too — INCLUDING w0 (the untested deviation index).
+    for &u in &[q1, g, w0] {
         let d_u_fd = fd(&|b| b.d_u[u], 4e-3);
+        let d_u_fd_fine = fd(&|b| b.d_u[u], 1e-3);
         eprintln!(
-            "[{u}] d_u_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
-            ext.d_u_dir[u], d_u_fd, (ext.d_u_dir[u] - d_u_fd).abs()
+            "[{u}] d_u_dir prod {:+.6e} fd {:+.6e} gap {:.2e} (fine {:+.6e} gap {:.2e})",
+            ext.d_u_dir[u], d_u_fd, (ext.d_u_dir[u] - d_u_fd).abs(),
+            d_u_fd_fine, (ext.d_u_dir[u] - d_u_fd_fine).abs()
         );
     }
     // Per-term d_uv_dir localization at the (w0,w0) probe block: FD each base
