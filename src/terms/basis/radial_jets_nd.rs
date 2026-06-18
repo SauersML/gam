@@ -1891,8 +1891,8 @@ pub(crate) fn spherical_harmonic_jet(
 /// - **Harmonic** (`spec.method == Harmonic`): `K = L(L+2)`, no transform.
 /// - **Wahba** (Sobolev/Pseudo/truncated): centers are resolved exactly as the
 ///   forward does, the raw `(N, K_c, 2)` kernel jet is built, then contracted
-///   with the same area-weighted sum-to-zero (or frozen) transform `z` so the
-///   result aligns column-for-column with `raw_design · z`.
+///   with the same identity-or-frozen transform `z` so the result aligns
+///   column-for-column with `raw_design · z`.
 pub fn spherical_spline_design_jet(
     data: ArrayView2<'_, f64>,
     spec: &SphericalSplineBasisSpec,
@@ -1933,10 +1933,7 @@ pub fn spherical_spline_design_jet(
             }
             transform.clone()
         }
-        SphericalSplineIdentifiability::CenterSumToZero => {
-            let weights = sphere_area_weights(centers.view(), spec.radians);
-            weighted_coefficient_sum_to_zero_transform(weights.view())?
-        }
+        SphericalSplineIdentifiability::CenterSumToZero => Array2::<f64>::eye(centers.nrows()),
     };
     let raw_jet = spherical_wahba_kernel_jet_with_kind(
         data,
