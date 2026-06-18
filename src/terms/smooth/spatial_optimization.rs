@@ -3474,12 +3474,20 @@ fn freeze_smooth_basis_from_metadata(
                 None => BSplineIdentifiability::None,
             };
             // Boundary projections are folded into `identifiability_transform`
-            // by `build_bspline_basis_1d`. A frozen prediction spec must
-            // rebuild the same raw knot basis and apply the captured
-            // transform exactly once; keeping the original boundary
-            // conditions would project the raw basis a second time and
-            // shrink its width before `FrozenTransform` is applied.
-            s.boundary_conditions = Default::default();
+            // by `build_bspline_basis_1d`. A frozen prediction spec rebuilds the
+            // same raw knot basis and replays the captured `FrozenTransform`
+            // exactly once; the builder now SKIPS re-deriving the boundary
+            // nullspace transform whenever identifiability is `FrozenTransform`
+            // (it is already baked into that transform), so re-projection can no
+            // longer happen. We therefore KEEP the original
+            // `boundary_conditions`: they are the single source of truth the
+            // intercept-suppression decision reads
+            // (`term_collection_has_one_sided_anchored_bspline`), and a
+            // one-sided anchored smooth suppresses the global intercept at fit
+            // time (#1238). Clearing them here flipped that decision at predict
+            // and re-added a spurious intercept column → save→load→predict
+            // 21-vs-22 design mismatch (#1265). Boundary conditions are left
+            // exactly as fit.
         }
         (
             SmoothBasisSpec::ThinPlate {

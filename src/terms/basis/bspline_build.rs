@@ -594,8 +594,23 @@ pub fn build_bspline_basis_1d(
         }
     } else {
         let raw_design = design_dense_opt.expect("dense B-spline basis should be present");
-        let boundary_transform =
-            bspline_boundary_nullspace_transform(&knots, spec.degree, spec.boundary_conditions)?;
+        // A `FrozenTransform` already maps from the RAW knot basis with the
+        // endpoint boundary projection baked in (it was composed as
+        // `boundary ∘ identifiability` at fit time). Re-deriving and re-applying
+        // the boundary nullspace transform here would project the raw basis a
+        // second time and shrink its width before the frozen transform replays,
+        // so a frozen anchored/clamped spec must NOT re-run the boundary step.
+        // Skipping it lets the frozen spec keep its original
+        // `boundary_conditions` (the single source of truth the intercept-
+        // suppression decision reads, #1238/#1265) without double-projecting.
+        let boundary_transform = if matches!(
+            spec.identifiability,
+            BSplineIdentifiability::FrozenTransform { .. }
+        ) {
+            None
+        } else {
+            bspline_boundary_nullspace_transform(&knots, spec.degree, spec.boundary_conditions)?
+        };
         let (boundary_design, boundary_penalties) = if let Some(z_bc) = boundary_transform.as_ref()
         {
             (
@@ -824,9 +839,8 @@ fn bspline_boundary_nullspace_transform(
             cross_rank: rank,
             coeff_dim: p_raw,
             cross_frobenius: frob,
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
+            gram_spectrum: "not computed (structural rank collapse before Gram eigendecomposition)"
+                .to_string(),
         });
     }
     if rank == 0 { Ok(None) } else { Ok(Some(z)) }
@@ -880,9 +894,9 @@ fn compute_geometric_constraint_transform_in_chart(
                 cross_rank: rank,
                 coeff_dim: k,
                 cross_frobenius: frob,
-                constrained_gram_max_eigenvalue: f64::NAN,
-                constrained_gram_min_eigenvalue: f64::NAN,
-                spectral_tolerance: f64::NAN,
+                gram_spectrum: "not computed (structural rank collapse before Gram \
+                                eigendecomposition)"
+                    .to_string(),
             });
         }
         Ok(z)
@@ -913,9 +927,8 @@ pub(crate) fn bspline_sum_to_zero_transform_from_cross(
             cross_rank: rank,
             coeff_dim: k,
             cross_frobenius: c.iter().map(|v| v * v).sum::<f64>().sqrt(),
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
+            gram_spectrum: "not computed (structural rank collapse before Gram eigendecomposition)"
+                .to_string(),
         });
     }
     Ok(z)
