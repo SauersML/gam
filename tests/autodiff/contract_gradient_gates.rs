@@ -26,11 +26,11 @@ use gam::terms::{
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 
-const FD_STEP: f64 = 1.0e-6;
+const FD_STEP: f64 = 5.0e-6;
 const OUTER_FD_STEP: f64 = 5.0e-6;
 const REL_TOL: f64 = 1.0e-5;
 const REL_FLOOR: f64 = 1.0e-8;
-const ABS_TOL: f64 = 5.0e-10;
+const ABS_TOL: f64 = 1.0e-9;
 
 struct GradientChannel {
     name: &'static str,
