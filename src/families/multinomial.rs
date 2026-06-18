@@ -1331,7 +1331,8 @@ pub fn fit_penalized_multinomial_formula(
         crate::types::RhoPrior::Flat,
     ) {
         Ok(unbiased_fit)
-            if multinomial_formula_separation_evidence(&unbiased_fit.block_states).is_none() =>
+            if unbiased_fit.outer_converged
+                && multinomial_formula_separation_evidence(&unbiased_fit.block_states).is_none() =>
         {
             unbiased_fit
         }
