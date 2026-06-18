@@ -2444,6 +2444,32 @@ impl WorkingModelSurvival {
         rho: &[f64],
         beta0: &Array1<f64>,
     ) -> Result<(f64, Array1<f64>), EstimationError> {
+        let (candidate, beta) = self.reconverge_survival_inner_mode(rho, beta0)?;
+        // Re-converged β̂(ρ); evaluate the unified survival LAML value and
+        // analytic ρ-gradient at that mode. The ρ passed to the unified
+        // evaluator enumerates active blocks in block order, exactly the input
+        // convention of this shim.
+        let rho_arr = Array1::from_vec(rho.to_vec());
+        let state = candidate.update_state(&beta)?;
+        candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
+    }
+
+    /// Re-converge the survival inner mode at `λ = exp(ρ)` from warm-start
+    /// `beta0`, returning the λ-set model candidate and the converged `β̂(ρ)`.
+    /// This is the shared inner-solve used by
+    /// [`evaluate_survival_lamlcost_and_gradient`](Self::evaluate_survival_lamlcost_and_gradient)
+    /// and the converged-mode accessor
+    /// [`survival_converged_mode_at_rho`](Self::survival_converged_mode_at_rho):
+    /// inner PIRLS to a tight relative certificate, followed by a
+    /// Levenberg–Marquardt / exact-Cholesky stationarity polish that drives the
+    /// absolute penalized residual `‖S β̂ − ∇ℓ‖` below the FD round-off floor so
+    /// the envelope ρ-gradient is exact. (Without the polish, PIRLS alone leaves
+    /// `‖r‖ ~ 1` at large λ where H is ill-conditioned.)
+    fn reconverge_survival_inner_mode(
+        &self,
+        rho: &[f64],
+        beta0: &Array1<f64>,
+    ) -> Result<(WorkingModelSurvival, Array1<f64>), EstimationError> {
         // Inner-PIRLS settings mirror the survival transformation outer loop's
         // constrained inner solve. Tighter convergence than the production
         // outer loop so the inner mode is converged well below the FD step's
@@ -2461,14 +2487,14 @@ impl WorkingModelSurvival {
             .count();
         if rho.len() != active_block_count {
             crate::bail_invalid_estim!(
-                "evaluate_survival_lamlcost_and_gradient: rho dimension {} does not match active penalty block count {}",
+                "reconverge_survival_inner_mode: rho dimension {} does not match active penalty block count {}",
                 rho.len(),
                 active_block_count
             );
         }
         if beta0.len() != self.coefficient_dim() {
             crate::bail_invalid_estim!(
-                "evaluate_survival_lamlcost_and_gradient: beta0 dimension {} does not match coefficient dimension {}",
+                "reconverge_survival_inner_mode: beta0 dimension {} does not match coefficient dimension {}",
                 beta0.len(),
                 self.coefficient_dim()
             );
@@ -2659,13 +2685,69 @@ impl WorkingModelSurvival {
             }
         }
 
-        // Re-converged β̂(ρ); evaluate the unified survival LAML value and
-        // analytic ρ-gradient at that mode. The ρ passed to the unified
-        // evaluator enumerates active blocks in block order, exactly the input
-        // convention of this shim.
+        Ok((candidate, beta))
+    }
+
+    /// Converged-mode survival-LAML quantities at `ρ`, for the cancellation-free
+    /// large-λ objective↔gradient consistency oracle (#931). Re-converges the
+    /// inner mode (PIRLS + stationarity polish) exactly as the value path does,
+    /// then returns
+    /// `(analytic_rho_gradient, half_logdet_lambda_s, penalized_nll, hessian, penalty_rank)`:
+    ///
+    /// * `analytic_rho_gradient` — the unified analytic ρ-gradient at `β̂(ρ)`.
+    /// * `half_logdet_lambda_s` — ½·log|λS|₊ (the value's penalty-logdet term).
+    /// * `penalized_nll` — −ℓ(β̂) + ½β̂ᵀ(λS)β̂ (the value's likelihood+quadratic part).
+    /// * `hessian` — the dense penalized Hessian H at the converged mode.
+    /// * `penalty_rank` — Σ rank of the active penalty blocks (so the structural
+    ///   ½·log|λS| ρ-derivative is exactly ½·rank).
+    ///
+    /// The caller forms the ½·log|H| ρ-derivative as a *cancellation-free* matrix
+    /// trace-FD `½·tr(H⁻¹·ΔH/2h)` (never differencing two logdets), which at
+    /// extreme λ is the only finite-difference of that term that is not destroyed
+    /// by catastrophic cancellation — see the boundary test for the full analysis.
+    pub fn survival_converged_mode_at_rho(
+        &self,
+        rho: &[f64],
+        beta0: &Array1<f64>,
+    ) -> Result<(Array1<f64>, f64, f64, Array2<f64>, usize), EstimationError> {
+        use crate::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
+
+        let (candidate, beta) = self.reconverge_survival_inner_mode(rho, beta0)?;
         let rho_arr = Array1::from_vec(rho.to_vec());
         let state = candidate.update_state(&beta)?;
-        candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
+        let (_cost, gradient) =
+            candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)?;
+
+        let penalized_nll = -state.log_likelihood + state.penalty_term;
+        let h_dense = state.hessian.to_dense();
+
+        let mut half_logdet_lambda_s = 0.0_f64;
+        let mut penalty_rank = 0usize;
+        let mut active_idx = 0usize;
+        for block in candidate.penalties.blocks.iter() {
+            if block.lambda > 0.0 {
+                let lam = rho[active_idx].exp();
+                let scaled = &block.matrix * lam;
+                half_logdet_lambda_s += 0.5
+                    * DenseSpectralOperator::from_symmetric(&scaled)
+                        .map_err(EstimationError::InvalidInput)?
+                        .logdet();
+                penalty_rank += block
+                    .matrix
+                    .diag()
+                    .iter()
+                    .filter(|&&d| d.abs() > 0.0)
+                    .count();
+                active_idx += 1;
+            }
+        }
+        Ok((
+            gradient,
+            half_logdet_lambda_s,
+            penalized_nll,
+            h_dense,
+            penalty_rank,
+        ))
     }
 }
 

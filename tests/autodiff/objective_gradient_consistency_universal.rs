@@ -1305,6 +1305,87 @@ fn survival_objective_gradient_consistent_at_large_lambda_boundary() {
     }
 }
 
+// --- Regime R1b: extreme-λ boundary via a CANCELLATION-FREE oracle ------
+//
+// At ρ ≥ 6 the value's ½log|H| term cannot be finite-differenced (see the
+// comment above `survival_objective_gradient_consistent_at_large_lambda_boundary`):
+// differencing two ~5.6 logdets is catastrophic cancellation. But the analytic
+// ρ-gradient is still directly checkable on the ACTUAL survival fixture (not only
+// via the erfc oracle's separate fixture) by reconstructing ∂V/∂ρ term-by-term
+// with each term differenced in a cancellation-free form:
+//
+//   ∂V/∂ρ = ∂(−ℓ + ½β'Sβ)/∂ρ            (well-conditioned scalar, plain central FD)
+//          + ½·tr(H⁻¹ · ∂H/∂ρ)          (Hessian MATRIX central-FD trace — never
+//                                          forms log|H₊| − log|H₋|, so NO logdet
+//                                          cancellation)
+//          − ½·rank(S)                   (∂[½log|λS|₊]/∂ρ is structurally exact)
+//
+// `½·tr(H⁻¹ ΔH/2h)` converges to the true ∂(½log|H|)/∂ρ with only the smooth
+// β̂(ρ)-chain FD scatter (~1%), where the logdet-self-FD swings 0.5→1.0. This
+// certifies the analytic gradient directly at ρ=6 and ρ=8.
+fn assert_survival_grad_matches_cancellation_free_oracle(
+    model: &WorkingModelSurvival,
+    beta0: &Array1<f64>,
+    rho: f64,
+    tol_rel: f64,
+) {
+    let (analytic, _half_lds0, _pnll0, h0, rank) = model
+        .survival_converged_mode_at_rho(&[rho], beta0)
+        .expect("converged mode at base rho");
+    let analytic = analytic[0];
+
+    // 2x2 H⁻¹ (the survival single-block fixture has p=2).
+    assert_eq!(h0.nrows(), 2, "oracle assumes the 2-parameter survival fixture");
+    let det = h0[[0, 0]] * h0[[1, 1]] - h0[[0, 1]] * h0[[1, 0]];
+    assert!(det > 0.0 && det.is_finite(), "converged H must be SPD, det={det:.3e}");
+    let mut hinv = ndarray::Array2::<f64>::zeros((2, 2));
+    hinv[[0, 0]] = h0[[1, 1]] / det;
+    hinv[[1, 1]] = h0[[0, 0]] / det;
+    hinv[[0, 1]] = -h0[[0, 1]] / det;
+    hinv[[1, 0]] = -h0[[1, 0]] / det;
+
+    // Cancellation-free reconstruction of ∂V/∂ρ, averaged over a few post-
+    // cancellation steps to damp the β̂-chain FD scatter.
+    let mut clean_fd_acc = 0.0_f64;
+    let steps = [5.0e-4_f64, 1.0e-3, 2.0e-3];
+    for &h in &steps {
+        let (_gp, _ldsp, pnll_p, hp, _rp) = model
+            .survival_converged_mode_at_rho(&[rho + h], beta0)
+            .expect("converged mode at rho+h");
+        let (_gm, _ldsm, pnll_m, hm, _rm) = model
+            .survival_converged_mode_at_rho(&[rho - h], beta0)
+            .expect("converged mode at rho-h");
+        let d_pnll = (pnll_p - pnll_m) / (2.0 * h);
+        let dh = (&hp - &hm).mapv(|v| v / (2.0 * h));
+        let hinv_dh = hinv.dot(&dh);
+        let half_tr = 0.5 * (hinv_dh[[0, 0]] + hinv_dh[[1, 1]]);
+        let d_half_lds = 0.5 * rank as f64;
+        clean_fd_acc += d_pnll + half_tr - d_half_lds;
+    }
+    let clean_fd = clean_fd_acc / steps.len() as f64;
+    let scale = analytic.abs().max(clean_fd.abs()).max(1.0e-3);
+    let rel = (analytic - clean_fd).abs() / scale;
+    assert!(
+        rel < tol_rel,
+        "#931 extreme-λ analytic ρ-gradient disagrees with the cancellation-free \
+         trace-FD oracle at rho={rho}: analytic={analytic:.9e}, clean_fd={clean_fd:.9e}, \
+         rel={rel:.3e} (>= tol {tol_rel:.1e}). The analytic gradient and the value's \
+         ρ-derivative (reconstructed cancellation-free) have drifted apart."
+    );
+}
+
+#[test]
+fn survival_objective_gradient_consistent_at_extreme_lambda_via_trace_oracle() {
+    let model = survival_single_block_model(1.0);
+    let beta0 = array![-2.5_f64, 1.0];
+    // The trace-FD carries the smooth β̂(ρ)-chain FD scatter (~1%); use 2% so the
+    // SOUND oracle reliably clears its own noise (a tighter tol would re-create
+    // the very ill-conditioning problem this oracle exists to avoid).
+    for rho in [6.0_f64, 8.0_f64] {
+        assert_survival_grad_matches_cancellation_free_oracle(&model, &beta0, rho, 2.0e-2);
+    }
+}
+
 // --- Regime R2: near-degenerate eigenvalue pair (Daleckii–Krein) -------
 
 #[test]
