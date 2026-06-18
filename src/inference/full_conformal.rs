@@ -1905,7 +1905,6 @@ impl<'a> GlmHomotopyFullConformal<'a> {
                 .cholesky(Side::Lower)
                 .map_err(|e| format!("glm homotopy: augmented Hessian not SPD at z={z}: {e:?}"))?;
             let step = chol.solvevec(&g);
-            let step_norm = vec_norm(&step);
             if self.kkt_converged(&beta, z, GLM_CONVERGENCE_RTOL) {
                 converged = true;
                 break;
@@ -1935,7 +1934,6 @@ impl<'a> GlmHomotopyFullConformal<'a> {
                 // stationary. Stop iterating and let the certified error bound
                 // below decide acceptance (rather than rejecting on an
                 // un-improvable gradient floor).
-                let _ = step_norm;
                 break;
             }
         }

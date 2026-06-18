@@ -96,9 +96,11 @@ pub fn init_parallelism() {
         // Ignore the error returned when the global pool was already built by
         // an earlier caller: we cannot resize an existing pool, and the only
         // path that strictly needs the wide stack (the CLI) reaches this first.
-        let _ = rayon::ThreadPoolBuilder::new()
-            .stack_size(RAYON_WORKER_STACK_SIZE)
-            .build_global();
+        drop(
+            rayon::ThreadPoolBuilder::new()
+                .stack_size(RAYON_WORKER_STACK_SIZE)
+                .build_global(),
+        );
         faer::set_global_parallelism(faer::Par::rayon(0));
     });
 }
