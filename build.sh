@@ -13,8 +13,19 @@ REPO=/Users/user/gam
 S="$REPO/.buildd"; mkdir -p "$S"
 LOCK="$S/build.lock"; LOG="$S/last.log"; RESULT="$S/last.code"; HASHFILE="$S/last.hash"; HIST="$S/history.log"
 export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1   # item-granularity reuse
+export CARGO_BUILD_JOBS="${BUILD_JOBS:-2}"   # cap parallel rustc — default OOM-kills the 8GB box
 TIMEOUT=1800
+MIN_FREE_GB="${MIN_FREE_GB:-8}"
 now() { date +%H:%M:%S; }; ep() { date +%s; }
+
+# Preflight: bail FAST instead of dying at link with ENOSPC (which also corrupts
+# the target dir and wastes ~90s). If disk is too low, point the caller at MSI.
+free_gb="$(df -g "$REPO" 2>/dev/null | awk 'NR==2{print $4}')"
+if [[ -n "$free_gb" && "$free_gb" -lt "$MIN_FREE_GB" ]]; then
+  echo "[build.sh] only ${free_gb}G free (< ${MIN_FREE_GB}G) — refusing to build locally (would ENOSPC at link)." >&2
+  echo "[build.sh] route to MSI instead: bash /Users/user/msi_test.sh <test_name>" >&2
+  exit 70
+fi
 
 # What did cargo actually (re)compile? Cargo prints "   Compiling <crate> ..." per
 # crate it builds; absence => reused from cache. This is the crate-level recompile set.
@@ -42,9 +53,11 @@ fi
 # ---- warm-lib lane (no args): content-dedup ----
 BUILD=(cargo build --lib)
 tree_hash() {
-  find "$REPO/src" "$REPO/tests" "$REPO/crates" "$REPO/Cargo.toml" \
-    -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
-    | sort -z | xargs -0 shasum 2>/dev/null | shasum | cut -d' ' -f1
+  # Include Cargo.lock so a dependency bump invalidates the dedup cache (else a
+  # stale cached result could be served after deps changed but no *.rs did).
+  { find "$REPO/src" "$REPO/tests" "$REPO/crates" -type f \( -name '*.rs' -o -name '*.toml' \) -print0 2>/dev/null \
+      | sort -z | xargs -0 shasum 2>/dev/null
+    shasum "$REPO/Cargo.toml" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
 }
 
 exec 9>"$LOCK"; flock -x 9

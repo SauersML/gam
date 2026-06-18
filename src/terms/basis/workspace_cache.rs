@@ -748,9 +748,8 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
             cross_rank: rank,
             coeff_dim: k,
             cross_frobenius: 1.0,
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
+            gram_spectrum: "not computed (structural rank collapse before Gram eigendecomposition)"
+                .to_string(),
         });
     }
     Ok(z)

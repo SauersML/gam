@@ -1590,9 +1590,8 @@ pub fn apply_sum_to_zero_constraint(
             cross_rank: rank,
             coeff_dim: k,
             cross_frobenius: c.iter().map(|v| v * v).sum::<f64>().sqrt(),
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
+            gram_spectrum: "not computed (structural rank collapse before Gram eigendecomposition)"
+                .to_string(),
         });
     }
     if rank == 0 {
@@ -1674,9 +1673,8 @@ pub fn apply_sum_to_zero_constraint_sparse(
             cross_rank: rank,
             coeff_dim: k,
             cross_frobenius: c.iter().map(|v| v * v).sum::<f64>().sqrt(),
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
+            gram_spectrum: "not computed (structural rank collapse before Gram eigendecomposition)"
+                .to_string(),
         });
     }
     if rank == 0 {
@@ -1910,9 +1908,8 @@ pub fn compute_geometric_constraint_transform(
             cross_rank: rank,
             coeff_dim: k,
             cross_frobenius: f64::NAN,
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
+            gram_spectrum: "not computed (structural rank collapse before Gram eigendecomposition)"
+                .to_string(),
         });
     }
 
@@ -1922,9 +1919,8 @@ pub fn compute_geometric_constraint_transform(
             cross_rank: 0,
             coeff_dim: k,
             cross_frobenius: f64::NAN,
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
+            gram_spectrum: "not computed (structural rank collapse before Gram eigendecomposition)"
+                .to_string(),
         });
     }
 

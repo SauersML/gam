@@ -88,9 +88,7 @@ pub enum BasisError {
         "Failed to identify a constraint nullspace basis at {site}: \
          coefficient dim {coeff_dim}, cross-rank {cross_rank}, \
          constraint Frobenius {cross_frobenius:.3e}, \
-         constrained Gram max eigenvalue {constrained_gram_max_eigenvalue:.3e} \
-         (min {constrained_gram_min_eigenvalue:.3e}, \
-         spectral tolerance {spectral_tolerance:.3e}). \
+         constrained Gram spectrum {gram_spectrum}. \
          The smooth basis collapses onto the parametric block — typical causes: \
          (a) the smooth's evaluated kernel underflows after projecting out the \
          polynomial nullspace, leaving only floating-point noise (Duchon hybrid \
@@ -104,9 +102,12 @@ pub enum BasisError {
         cross_rank: usize,
         coeff_dim: usize,
         cross_frobenius: f64,
-        constrained_gram_max_eigenvalue: f64,
-        constrained_gram_min_eigenvalue: f64,
-        spectral_tolerance: f64,
+        /// Pre-formatted constrained-Gram spectrum summary. The structural
+        /// early-return sites bail at the cross-rank check before the Gram is
+        /// ever eigendecomposed, so they report `not computed` rather than a
+        /// misleading NaN; only the spectral-rank-deficiency site fills in real
+        /// max/min eigenvalues and tolerance.
+        gram_spectrum: String,
     },
 
     #[error(
@@ -2040,9 +2041,9 @@ pub(crate) fn positive_spectral_whitener_from_gram(
             cross_rank: 0,
             coeff_dim: gram.nrows(),
             cross_frobenius: gram.iter().map(|v| v * v).sum::<f64>().sqrt(),
-            constrained_gram_max_eigenvalue: max_eval,
-            constrained_gram_min_eigenvalue: min_ev,
-            spectral_tolerance: tol,
+            gram_spectrum: format!(
+                "max eigenvalue {max_eval:.3e} (min {min_ev:.3e}, spectral tolerance {tol:.3e})"
+            ),
         });
     }
     // `eigh` returns eigenvalues in ascending order, so the largest `keep`
@@ -2093,9 +2094,9 @@ pub(crate) fn orthogonality_transform_from_cross_and_gram(
             cross_rank: rank,
             coeff_dim: k,
             cross_frobenius: constraint_cross.iter().map(|v| v * v).sum::<f64>().sqrt(),
-            constrained_gram_max_eigenvalue: f64::NAN,
-            constrained_gram_min_eigenvalue: f64::NAN,
-            spectral_tolerance: f64::NAN,
+            gram_spectrum: "not computed (structural cross-rank collapse: null(Mᵀ) is empty, \
+                            so no constrained design exists to eigendecompose)"
+                .to_string(),
         });
     }
 
