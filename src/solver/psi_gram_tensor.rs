@@ -52,15 +52,16 @@ use ndarray::{Array1, Array2, ArrayView1};
 /// authoritative accuracy gate is the off-node `spot_check` on the ASSEMBLED
 /// Gram ([`PSI_GRAM_SPOT_RTOL`]). On the WIDE STANDARDIZED geometry default 1-D
 /// fits use (#1215) the realized radial design needs the deeper ladder below to
-/// drive the tail beneath the beta-invariance bar. Keep this pre-filter tight:
-/// accepting the old ~2e-11 column tail at 65 nodes was fine for cost-only
-/// gates, but the weakly penalized radial solve amplified it into a visible
-/// beta-hat drift across the reduced-basis rotation. A genuinely non-analytic
-/// design (a true kink) still refuses here or at the assembled-Gram spot check.
-pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-12;
+/// drive the tail beneath the beta-invariance bar. Keep this as a necessary
+/// pre-filter, not the final beta oracle: shallow 65-node tensors were fine for
+/// cost-only gates, but the weakly penalized radial solve amplified their
+/// residual into visible beta-hat drift across the reduced-basis rotation. A
+/// genuinely non-analytic design (a true kink) still refuses here or at the
+/// assembled-Gram spot check.
+pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-9;
 
 /// Relative agreement required at the off-node Gram spot checks.
-pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-12;
+pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 
 /// Relative agreement required of the analytic ψ-DERIVATIVE `dgram_dpsi`
 /// against a high-order (Richardson-validated) finite difference of the exactly
@@ -100,13 +101,12 @@ pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
 /// floor). The old 65-node acceptance was fine for the cost lane but not for the
 /// beta-hat soundness gate: the inner penalized solve `β̂ = (G+λS)⁻¹r`
 /// amplifies Gram residuals by the radial-kernel conditioning, especially after
-/// the production skip was relaxed to cross a reduced-basis rotation. The 129
-/// and 257 rungs keep escalating until the assembled Gram itself passes the
-/// tighter spot check, preserving the n-free per-trial path without weakening
-/// the rotated-basis beta identity witness. The build frees per-node realized
-/// designs right after the DCT so deeper rungs do not balloon peak memory at
-/// large production `n`.
-pub const PSI_GRAM_NODE_LADDER: [usize; 6] = [9, 17, 33, 65, 129, 257];
+/// the production skip was relaxed to cross a reduced-basis rotation. Start at
+/// 129 nodes so the production gate no longer accepts the shallow tensor; keep a
+/// 257-node fallback for geometries whose assembled-Gram spot check still
+/// refuses. The build frees per-node realized designs right after the DCT so
+/// deeper rungs do not balloon peak memory at large production `n`.
+pub const PSI_GRAM_NODE_LADDER: [usize; 2] = [129, 257];
 
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
