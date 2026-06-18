@@ -715,10 +715,10 @@ pub fn plan_spatial_basis(
 }
 
 pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
-    if d >= 4 {
-        CenterStrategy::EqualMassCovarRepresentative { num_centers }
+    if d <= 3 {
+        CenterStrategy::FarthestPoint { num_centers }
     } else {
-        CenterStrategy::EqualMass { num_centers }
+        CenterStrategy::EqualMassCovarRepresentative { num_centers }
     }
 }
 
@@ -729,8 +729,10 @@ pub fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrat
         // low-frequency Duchon radial block slightly under-resolved at the
         // boundaries, and REML then compensates with an over-smooth λ on
         // low-noise signals (#504). The maximin grid matches the native
-        // reproducing-kernel interpolation geometry while keeping the existing
-        // equal-mass defaults for genuinely multivariate smooths.
+        // reproducing-kernel interpolation geometry. The default strategy below
+        // extends the same space-filling contract to low-dimensional spatial
+        // GP bases, where kriging accuracy is governed by fill distance rather
+        // than marginal quantile balance.
         CenterStrategy::FarthestPoint { num_centers }
     } else {
         default_spatial_center_strategy(num_centers, d)
