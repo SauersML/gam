@@ -780,73 +780,24 @@ pub fn select_spherical_farthest_point_centers(
     radians: bool,
 ) -> Result<Array2<f64>, BasisError> {
     validate_lat_lon_matrix(data, "spherical farthest-point centers", radians)?;
-    let n = data.nrows();
     if num_centers == 0 {
         crate::bail_invalid_basis!("spherical farthest-point center count must be positive");
     }
-    if num_centers > n {
-        crate::bail_invalid_basis!(
-            "requested {} spherical centers but only {} rows are available",
-            num_centers,
-            n
-        );
-    }
 
-    let mut seed_idx = 0usize;
-    for i in 1..n {
-        let lat_i = data[[i, 0]];
-        let lon_i = data[[i, 1]];
-        let lat_s = data[[seed_idx, 0]];
-        let lon_s = data[[seed_idx, 1]];
-        if lat_i < lat_s || (lat_i == lat_s && lon_i < lon_s) {
-            seed_idx = i;
-        }
-    }
-
-    let mut selected = Vec::with_capacity(num_centers);
-    let mut chosen = vec![false; n];
-    let mut min_dist2 = vec![f64::INFINITY; n];
-    selected.push(seed_idx);
-    chosen[seed_idx] = true;
-
-    min_dist2.par_iter_mut().enumerate().for_each(|(i, slot)| {
-        *slot = spherical_chord_distance2(data.row(i), data.row(seed_idx), radians);
-    });
-    min_dist2[seed_idx] = 0.0;
-
-    while selected.len() < num_centers {
-        let best_idx = min_dist2
-            .par_iter()
-            .enumerate()
-            .filter(|(i, _)| !chosen[*i])
-            .map(|(i, &cand)| (i, cand))
-            .reduce_with(|a, b| {
-                if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
-                    b
-                } else {
-                    a
-                }
-            })
-            .map(|(i, _)| i);
-        let Some(next_idx) = best_idx else {
-            break;
-        };
-        selected.push(next_idx);
-        chosen[next_idx] = true;
-        min_dist2.par_iter_mut().enumerate().for_each(|(i, slot)| {
-            if chosen[i] {
-                return;
-            }
-            let d2 = spherical_chord_distance2(data.row(i), data.row(next_idx), radians);
-            if d2 < *slot {
-                *slot = d2;
-            }
-        });
-    }
-
-    let mut centers = Array2::<f64>::zeros((selected.len(), 2));
-    for (r, &idx) in selected.iter().enumerate() {
-        centers.row_mut(r).assign(&data.row(idx));
+    let to_units = if radians {
+        1.0
+    } else {
+        180.0 / std::f64::consts::PI
+    };
+    let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+    let mut centers = Array2::<f64>::zeros((num_centers, 2));
+    for i in 0..num_centers {
+        let z = (2.0 * i as f64 + 1.0) / num_centers as f64 - 1.0;
+        let lon = ((i as f64) * golden_angle + std::f64::consts::PI)
+            .rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI;
+        centers[[i, 0]] = z.asin() * to_units;
+        centers[[i, 1]] = lon * to_units;
     }
     Ok(centers)
 }

@@ -359,6 +359,29 @@ pub(crate) fn build_spherical_harmonic_basis(
         kronecker_factors: None,
         op: None,
     }];
+    if l_max > 2 {
+        let mut high_degree = Array2::<f64>::zeros((p, p));
+        let mut col = 0usize;
+        for l in 1..=l_max {
+            let eig = if l > 2 {
+                (l as f64 * (l as f64 + 1.0)).powi((spec.penalty_order + 1) as i32)
+            } else {
+                0.0
+            };
+            for _ in 0..(2 * l + 1) {
+                high_degree[[col, col]] = eig;
+                col += 1;
+            }
+        }
+        candidates.push(PenaltyCandidate {
+            matrix: high_degree,
+            nullspace_dim_hint: 8,
+            source: PenaltySource::Other("SphereHarmonicHighDegree".to_string()),
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
     if spec.double_penalty {
         let ridge = Array2::<f64>::eye(p);
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
