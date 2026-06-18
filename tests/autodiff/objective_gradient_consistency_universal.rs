@@ -1210,12 +1210,14 @@ fn assert_survival_consistent(
     tol: f64,
 ) {
     let analytic = survival_grad(model, beta0, rho);
-    // The large-lambda survival boundary has an ill-conditioned inner mode:
+    // The rho=6 large-lambda survival boundary has an ill-conditioned inner mode:
     // the analytic envelope derivative is stable, but the scalar value's
     // logdet-H term loses several digits when FD probes use the global 1e-5
-    // step. Keep the same boundary tolerance, but use a wider centered step so
-    // the FD oracle measures the smooth value surface instead of f64 jitter.
-    let fd_step = if regime == "boundary/large-lambda" {
+    // step. Keep the same boundary tolerance, but use a wider centered step
+    // only at that identified point so the FD oracle measures the smooth value
+    // surface instead of f64 jitter.
+    let fd_step = if regime == "boundary/large-lambda" && rho.iter().any(|v| (*v - 6.0).abs() < 0.1)
+    {
         5.0e-4
     } else {
         FD_STEP
