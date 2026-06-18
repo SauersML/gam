@@ -3780,8 +3780,8 @@ mod empirical_flex_jet_oracle_tests {
         // matches them and would reject a planted cross-block sign flip.
         let fx = make_fixture(false); // link-dev
         let r = fx.primary.total;
-        let q0 = 0.25_f64;
-        let b0 = 0.4_f64;
+        let q0 = 0.2_f64;
+        let b0 = 0.35_f64;
         let mut p0 = vec![0.0; r];
         p0[fx.primary.q] = q0;
         p0[fx.primary.logslope] = b0;
@@ -3872,8 +3872,7 @@ mod empirical_flex_jet_oracle_tests {
         let flipped_fourth = -fourth[[q, dev0]];
         if wit_qd_b_d.abs() > 1e-6 {
             assert!(
-                (flipped_fourth - wit_qd_b_d).abs()
-                    > 2e-2 * wit_qd_b_d.abs().max(1.0) + 1e-6,
+                (flipped_fourth - wit_qd_b_d).abs() > 2e-2 * wit_qd_b_d.abs().max(1.0) + 1e-6,
                 "witness failed to reject a planted fourth-order sign flip (flipped {flipped_fourth:+.6e} vs witness {wit_qd_b_d:+.6e})"
             );
         }
