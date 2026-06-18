@@ -115,6 +115,26 @@ pub const PSI_GRAM_NODE_LADDER: [usize; 5] = [9, 17, 33, 65, 129];
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
 
+/// Rank-revealing relative eigenvalue cutoff for the reduced-basis (range)
+/// projector witness [`PsiGramTensor::reduced_basis_equal`] (#1264). An
+/// eigendirection of the conditioned Gram `XᵀWX(ψ)` is counted in the range
+/// (reduced) basis when its eigenvalue exceeds `PSI_GRAM_SKIP_RANK_RTOL · λ_max`.
+/// Sized to match the inner solve's effective rank-revealing scale on the
+/// standardized radial-kernel Gram, whose conditioning sweeps several orders of
+/// magnitude across the ψ-window; a directly-below-cutoff direction is exactly
+/// the one whose inclusion flips with ψ and silently rotates the frozen reduced
+/// basis, which this witness must catch.
+pub const PSI_GRAM_SKIP_RANK_RTOL: f64 = 1.0e-10;
+
+/// Max-norm tolerance on the range-PROJECTOR agreement between the pinning ψ and
+/// the candidate ψ in [`PsiGramTensor::reduced_basis_equal`] (#1264). The
+/// orthogonal projector onto the reduced subspace is gauge-invariant and O(1) in
+/// scale, so a tight absolute tolerance certifies the two reduced bases span the
+/// SAME subspace. A subspace that has measurably rotated (the basis the frozen
+/// fast-path surface would mis-pair with a re-keyed Gram) exceeds this by orders
+/// of magnitude, so it refuses the skip well before the ~1e-6 β̂ bar is at risk.
+pub const PSI_GRAM_SKIP_PROJ_ATOL: f64 = 1.0e-7;
+
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
 ///
 /// Holds the one-time n-pass products; every per-trial accessor is O(D²k²)
@@ -588,16 +608,108 @@ impl PsiGramTensor {
     /// Locate the reduced-basis-equality skip sub-window `[skip_psi_lo,
     /// skip_psi_hi]`, and store it (#1264).
     ///
-    /// The previous implementation accepted a tiny low-ψ prefix when
-    /// Gram-derived RRQR rank and pivot permutation matched the reference frame.
-    /// A real MSI run refuted that guard: the prefix still let a stale realized
-    /// reduced basis pair with `XᵀWX(ψ_new)` and produced β̂-rel ≈ 7.8e-2. The
-    /// tensor only knows k-space Grams, not the realized basis transform the
-    /// slow path rebuilds inside `reset_surface`; therefore it cannot prove
-    /// reduced-basis equality. Refuse the skip window until such a guard exists.
+    /// Historically this held a tiny low-ψ prefix accepted when the Gram-derived
+    /// RRQR rank and pivot permutation matched a reference frame — a necessary
+    /// but NOT sufficient condition. An MSI run refuted it: the prefix still let
+    /// a stale realized reduced basis pair with `XᵀWX(ψ_new)` and produced β̂-rel
+    /// ≈ 7.8e-2. The soundness of the design-revision skip depends on the PAIR
+    /// `(ψ_ref, ψ_new)` — whether the realized reduced basis frozen at the pinning
+    /// `ψ_ref` is still valid at `ψ_new` — and is therefore not a single
+    /// ψ-interval the build can fix once. The real witness is
+    /// [`Self::reduced_basis_equal`], evaluated per trial against the caller's
+    /// current pinning ψ. This precomputed single-ψ window stays empty; the
+    /// (legacy, single-ψ) [`Self::contains_for_skip`] accessor consequently never
+    /// fires and callers must use the pairwise witness.
     fn compute_skip_window(&mut self) {
         self.skip_psi_lo = f64::NAN;
         self.skip_psi_hi = f64::NAN;
+    }
+
+    /// Range (reduced-basis) projector of the conditioned Gram `XᵀWX(ψ)` and the
+    /// numerical rank, computed n-free from the k-space tensor. The reduced basis
+    /// the inner penalized solve forms is the column span of the eigenvectors of
+    /// the (symmetric PSD) Gram whose eigenvalue exceeds a rank-revealing cutoff
+    /// relative to the largest eigenvalue. The orthogonal projector `P = U_r U_rᵀ`
+    /// onto that span is a frame-INVARIANT witness of the reduced basis: two ψ's
+    /// share a reduced basis iff their range projectors coincide (the projector
+    /// is invariant to the orthonormal-basis gauge freedom within the range, so
+    /// it isolates exactly the subspace identity the skip needs, not an arbitrary
+    /// eigenvector rotation). Returns `None` if the Gram is non-finite or its
+    /// symmetric eigendecomposition fails.
+    fn range_projector(&self, psi: f64, rank_rtol: f64) -> Option<(Array2<f64>, usize)> {
+        use crate::faer_ndarray::FaerEigh;
+        let g = self.gram_at(psi);
+        if g.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        // Symmetrize defensively (gram_at is symmetric up to rounding).
+        let gsym = 0.5 * (&g + &g.t());
+        let (evals, evecs) = gsym.eigh(faer::Side::Lower).ok()?;
+        // `eigh` returns ascending eigenvalues; the Gram is PSD so the largest is
+        // the trailing one. The rank cutoff is relative to that maximum.
+        let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+        if !(lambda_max > 0.0) {
+            return None;
+        }
+        let cutoff = rank_rtol * lambda_max;
+        let mut proj = Array2::<f64>::zeros((self.k, self.k));
+        let mut rank = 0usize;
+        for (col, &lam) in evals.iter().enumerate() {
+            if lam > cutoff {
+                let u = evecs.column(col);
+                // P += u uᵀ.
+                for a in 0..self.k {
+                    for b in 0..self.k {
+                        proj[[a, b]] += u[a] * u[b];
+                    }
+                }
+                rank += 1;
+            }
+        }
+        Some((proj, rank))
+    }
+
+    /// True when the realized reduced basis the design-revision fast path freezes
+    /// at the pinning `psi_ref` is still valid at `psi_new` — the genuine
+    /// reduced-basis-equality witness the skip requires (#1264, #1216 item 3).
+    ///
+    /// The fast path keeps the reference surface (its conditioned frame and its
+    /// RRQR-reduced / null-space basis) frozen at `psi_ref` while re-keying only
+    /// the Gram `XᵀWX(ψ)` and penalty `S(ψ)` to `psi_new`. That is exact iff the
+    /// reduced basis — the range / null split of the conditioned data Gram — is
+    /// unchanged. A conditioning-ratio or RRQR rank/permutation gate only bounds
+    /// NECESSARY conditions; the reduced SUBSPACE can still rotate while rank and
+    /// pivot order look tame, which is exactly the ~7.8e-2 β̂ regression an MSI run
+    /// found. This witness compares the orthogonal RANGE PROJECTORS of the
+    /// conditioned Gram at `psi_ref` and `psi_new` (both assembled n-free from the
+    /// tensor): the skip is sound only when the numerical ranks match AND the
+    /// projectors agree to `proj_atol` in max-norm — i.e. the two reduced bases
+    /// span the SAME subspace. The projector identity is gauge-invariant, so it
+    /// certifies subspace equality directly rather than a particular basis choice.
+    ///
+    /// `psi_ref == psi_new` (a repeat trial at the same ψ) is trivially sound.
+    /// Off-window ψ's, a non-finite / rank-degenerate Gram, or any eigendecomp
+    /// failure return `false` (refuse the skip → caller takes the slow path).
+    pub fn reduced_basis_equal(&self, psi_ref: f64, psi_new: f64) -> bool {
+        if !(self.contains(psi_ref) && self.contains(psi_new)) {
+            return false;
+        }
+        if psi_ref == psi_new {
+            return true;
+        }
+        let Some((p_ref, r_ref)) = self.range_projector(psi_ref, PSI_GRAM_SKIP_RANK_RTOL) else {
+            return false;
+        };
+        let Some((p_new, r_new)) = self.range_projector(psi_new, PSI_GRAM_SKIP_RANK_RTOL) else {
+            return false;
+        };
+        if r_ref != r_new {
+            return false;
+        }
+        p_ref
+            .iter()
+            .zip(p_new.iter())
+            .all(|(a, b)| (a - b).abs() <= PSI_GRAM_SKIP_PROJ_ATOL)
     }
 
     /// True when `psi` lies inside the certified window.
@@ -605,11 +717,12 @@ impl PsiGramTensor {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
     }
 
-    /// True when `psi` lies inside the reduced-basis-equality sub-window where the
-    /// #1033 design-revision fast-path skip (re-key Gram + penalty on a frozen
-    /// reference surface) reproduces the exact slow-path β̂ (#1264).
-    /// Outside it the design's reduced basis has moved with ψ, so the caller must
-    /// take the full `reset_surface` slow path.
+    /// True when `psi` lies inside the precomputed single-ψ reduced-basis-equality
+    /// sub-window. This window is deliberately empty (the skip's soundness is a
+    /// PAIRWISE property of `(ψ_ref, ψ_new)` — see [`Self::reduced_basis_equal`]),
+    /// so this accessor never fires. Retained only as the legacy single-ψ shape;
+    /// callers gate the design-revision skip on the pairwise witness against their
+    /// pinning ψ.
     pub fn contains_for_skip(&self, psi: f64) -> bool {
         psi.is_finite()
             && self.skip_psi_lo.is_finite()
