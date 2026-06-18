@@ -937,28 +937,6 @@ impl SurvivalDesign {
             }
         }
     }
-
-    fn transpose_vector_multiply(
-        &self,
-        time_mat: &Array2<f64>,
-        vector: &Array1<f64>,
-        include_covariates: bool,
-    ) -> Array1<f64> {
-        match self {
-            Self::Flat { .. } => fast_atv(time_mat, vector),
-            Self::TimeCovariateShared { covariates, .. } => {
-                let p_time = time_mat.ncols();
-                let mut out = Array1::<f64>::zeros(p_time + covariates.ncols());
-                out.slice_mut(ndarray::s![..p_time])
-                    .assign(&fast_atv(time_mat, vector));
-                if include_covariates && covariates.ncols() > 0 {
-                    out.slice_mut(ndarray::s![p_time..])
-                        .assign(&fast_atv(covariates, vector));
-                }
-                out
-            }
-        }
-    }
 }
 
 /// Pre-allocated workspace buffers for `update_state` to avoid per-iteration allocations.
@@ -1162,26 +1140,6 @@ impl WorkingModelSurvival {
         }
     }
 
-    fn derivative_transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let time_mat = match &self.design {
-            SurvivalDesign::Flat { x_derivative, .. } => x_derivative,
-            SurvivalDesign::TimeCovariateShared {
-                time_derivative, ..
-            } => time_derivative,
-        };
-        self.design
-            .transpose_vector_multiply(time_mat, vector, false)
-    }
-
-    fn exit_transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let time_mat = match &self.design {
-            SurvivalDesign::Flat { x_exit, .. } => x_exit,
-            SurvivalDesign::TimeCovariateShared { time_exit, .. } => time_exit,
-        };
-        self.design
-            .transpose_vector_multiply(time_mat, vector, true)
-    }
-
     fn derivative_xt_diag_x(&self, weights: &Array1<f64>) -> Array2<f64> {
         match &self.design {
             SurvivalDesign::Flat { x_derivative, .. } => fast_xt_diag_x(x_derivative, weights),
@@ -1245,45 +1203,6 @@ impl WorkingModelSurvival {
                     h.slice_mut(ndarray::s![p_time.., p_time..]).assign(&cc);
                 }
                 h
-            }
-        }
-    }
-
-    /// Compute the gradient contribution for the interval terms:
-    ///   grad = X_exit^T w_exit_grad - X_entry^T w_entry_grad
-    fn interval_gradient_blas(
-        &self,
-        w_exit_grad: &Array1<f64>,
-        w_entry_grad: &Array1<f64>,
-    ) -> Array1<f64> {
-        match &self.design {
-            SurvivalDesign::Flat {
-                x_entry, x_exit, ..
-            } => {
-                let mut g = fast_atv(x_exit, w_exit_grad);
-                g -= &fast_atv(x_entry, w_entry_grad);
-                g
-            }
-            SurvivalDesign::TimeCovariateShared {
-                time_entry,
-                time_exit,
-                covariates,
-                ..
-            } => {
-                let p_time = time_exit.ncols();
-                let p_cov = covariates.ncols();
-                let mut g = Array1::<f64>::zeros(p_time + p_cov);
-                {
-                    let mut gt = fast_atv(time_exit, w_exit_grad);
-                    gt -= &fast_atv(time_entry, w_entry_grad);
-                    g.slice_mut(ndarray::s![..p_time]).assign(&gt);
-                }
-                if p_cov > 0 {
-                    let w_diff = w_exit_grad - w_entry_grad;
-                    g.slice_mut(ndarray::s![p_time..])
-                        .assign(&fast_atv(covariates, &w_diff));
-                }
-                g
             }
         }
     }
@@ -1990,10 +1909,44 @@ impl WorkingModelSurvival {
         //   H_interval = X_exit^T diag(w_exit) X_exit - X_entry^T diag(w_entry) X_entry
         //   grad_interval = X_exit^T w_exit - X_entry^T w_entry
         let mut h = self.interval_hessian_blas(w_hess_exit, w_hess_entry);
-        let mut grad = self.interval_gradient_blas(w_hess_exit, w_hess_entry);
-
-        grad -= &self.exit_transpose_vector_multiply(w_event);
-        grad -= &self.derivative_transpose_vector_multiply(w_event_inv_deriv);
+        // At large smoothing penalties the event-Jacobian score nearly cancels
+        // the interval score. Compensated row accumulation keeps the final KKT
+        // residual accurate enough for the outer LAML envelope check.
+        let mut grad = Array1::<f64>::zeros(p);
+        let mut grad_comp = Array1::<f64>::zeros(p);
+        let mut row_exit = vec![0.0_f64; p];
+        let mut row_entry = vec![0.0_f64; p];
+        let mut row_derivative = vec![0.0_f64; p];
+        for i in 0..n {
+            let w_interval_exit = w_hess_exit[i];
+            let w_interval_entry = w_hess_entry[i];
+            let w_event_exit = w_event[i];
+            let w_event_derivative = w_event_inv_deriv[i];
+            if w_interval_exit == 0.0
+                && w_interval_entry == 0.0
+                && w_event_exit == 0.0
+                && w_event_derivative == 0.0
+            {
+                continue;
+            }
+            self.fill_exit_row(i, &mut row_exit);
+            self.fill_entry_row(i, &mut row_entry);
+            self.fill_derivative_row(i, &mut row_derivative);
+            for j in 0..p {
+                let contribution = w_interval_exit * row_exit[j]
+                    - w_interval_entry * row_entry[j]
+                    - w_event_exit * row_exit[j]
+                    - w_event_derivative * row_derivative[j];
+                let t = grad[j] + contribution;
+                if grad[j].abs() >= contribution.abs() {
+                    grad_comp[j] += (grad[j] - t) + contribution;
+                } else {
+                    grad_comp[j] += (contribution - t) + grad[j];
+                }
+                grad[j] = t;
+            }
+        }
+        grad += &grad_comp;
 
         h += &self.derivative_xt_diag_x(w_event_outer);
 
@@ -2583,7 +2536,7 @@ impl WorkingModelSurvival {
         // rho = [-0.5 .. 8] range exercised by the consistency gates.
         {
             const POLISH_MAX_ITERS: usize = 400;
-            const POLISH_TOL: f64 = 1e-11;
+            const POLISH_TOL: f64 = 1e-13;
             // Armijo sufficient-decrease constant and backtracking factor.
             const ARMIJO_C: f64 = 1e-4;
             const BACKTRACK: f64 = 0.5;
@@ -2712,7 +2665,57 @@ impl WorkingModelSurvival {
         // convention of this shim.
         let rho_arr = Array1::from_vec(rho.to_vec());
         let state = candidate.update_state(&beta)?;
-        candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
+        let h_dense = state.hessian.to_dense();
+        let (mut cost, gradient) =
+            candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)?;
+
+        // The shim is finite-differenced directly in rho. On the rho=6 boundary
+        // fixture the Hessian is SPD but highly ill-conditioned, so use the
+        // Cholesky logdet value and first-order Newton residual correction for
+        // the scalar value while leaving the unified analytic gradient as the
+        // source of truth.
+        let factor = crate::faer_ndarray::FaerCholesky::cholesky(&h_dense, faer::Side::Lower)
+            .map_err(|err| {
+                EstimationError::InvalidInput(format!(
+                    "survival LAML value polish Hessian factorization failed: {err}"
+                ))
+            })?;
+        let chol_logdet = 2.0 * factor.diag().iter().map(|v| v.ln()).sum::<f64>();
+        {
+            use crate::estimate::reml::reml_outer_engine::{
+                DenseSpectralOperator, HessianOperator,
+            };
+            let spectral_logdet = DenseSpectralOperator::from_symmetric(&h_dense)
+                .map_err(EstimationError::InvalidInput)?
+                .logdet();
+            cost += 0.5 * (chol_logdet - spectral_logdet);
+        }
+        let stationarity = match candidate.monotonicity_linear_constraints() {
+            Some(constraints) => projected_linear_constraint_stationarity_vector(
+                &state.gradient,
+                &beta,
+                &constraints,
+                None,
+            )
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "survival LAML value polish could not project the monotonicity KKT residual"
+                        .to_string(),
+                )
+            })?,
+            None => state.gradient.clone(),
+        };
+        let beta_error = factor.solvevec(&stationarity);
+        let dh_beta_error = candidate.survival_hessian_derivative_correction(&beta, &beta_error)?;
+        let mut trace_hinv_dh = 0.0_f64;
+        for col_idx in 0..dh_beta_error.ncols() {
+            let solved = factor.solvevec(&dh_beta_error.column(col_idx).to_owned());
+            trace_hinv_dh += solved[col_idx];
+        }
+        let objective_correction = -0.5 * stationarity.dot(&beta_error);
+        let logdet_correction = -0.5 * trace_hinv_dh;
+        cost += objective_correction + logdet_correction;
+        Ok((cost, gradient))
     }
 }
 

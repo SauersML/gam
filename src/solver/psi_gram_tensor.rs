@@ -125,7 +125,12 @@ pub const PSI_GRAM_SKIP_RRQR_MARGIN_MIN: f64 = 16.0;
 
 /// Number of equispaced scan points used to locate the RRQR-pivot-stable skip
 /// sub-window at build (each probe is a k×k Gram-derived RRQR — cheap).
-pub const PSI_GRAM_SKIP_SCAN_POINTS: usize = 64;
+///
+/// Keep this at the same granularity as the production gate's non-vacuous
+/// witness scan: the skip path is only sound over a very narrow low-ψ prefix on
+/// standardized 1-D Duchon geometry, so a coarse 64-point scan either admits too
+/// much drift or misses the stable interval entirely.
+pub const PSI_GRAM_SKIP_SCAN_POINTS: usize = 256;
 
 /// Maximum growth in `||X(ψ)ᵀWX(ψ)||_F` admitted inside the design-revision
 /// skip window.
