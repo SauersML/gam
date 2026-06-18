@@ -319,6 +319,8 @@ impl SurvivalMarginalSlopeFamily {
                         let mut cv1 = [0.0; 4];
                         let mut cu2 = [0.0; 4];
                         let mut cv2 = [0.0; 4];
+                        let mut cuv1 = [0.0; 4];
+                        let mut cuv2 = [0.0; 4];
                         for c in 0..p {
                             let suc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
                             let svc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, v, c);
@@ -333,6 +335,24 @@ impl SurvivalMarginalSlopeFamily {
                                 }
                             }
                         }
+                        self.add_cell_pair_third_coeff_dir(
+                            primary,
+                            &fx.coeff_bbu,
+                            u,
+                            v,
+                            dir1,
+                            -1.0,
+                            &mut cuv1,
+                        );
+                        self.add_cell_pair_third_coeff_dir(
+                            primary,
+                            &fx.coeff_bbu,
+                            u,
+                            v,
+                            dir2,
+                            -1.0,
+                            &mut cuv2,
+                        );
                         let d1v = exact_kernel::cell_third_derivative_from_moments(
                             nc,
                             &cu,
@@ -341,7 +361,7 @@ impl SurvivalMarginalSlopeFamily {
                             &sc,
                             &cu1,
                             &cv1,
-                            &[0.0; 4],
+                            &cuv1,
                             &st.moments,
                         )?;
                         f_uv_d1[[u, v]] += d1v;
@@ -356,7 +376,7 @@ impl SurvivalMarginalSlopeFamily {
                             &sc,
                             &cu2,
                             &cv2,
-                            &[0.0; 4],
+                            &cuv2,
                             &st.moments,
                         )?;
                         f_uv_d2[[u, v]] += d2v;
