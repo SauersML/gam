@@ -152,14 +152,17 @@ fn jumprelu_ste_value_converges_to_hard_threshold_as_eps_shrinks() {
     let n_obs = 100;
     let weight = 1.0;
 
-    // Build targets well clear of each threshold (no boundary cases).
+    // Build targets on an exact grid and compare with the same hard-threshold
+    // predicate as the ε→0 limit. Values may lie near (but not exactly on) a
+    // threshold; for sufficiently small ε their smoothed contribution still
+    // converges to τ · 1[z > τ].
     let mut target = Array1::<f64>::zeros(n_obs * d);
     let mut hard_total = 0.0;
     for row in 0..n_obs {
         for axis in 0..d {
-            let z = (row as f64 + 1.0) / (n_obs as f64) * 1.2;
+            let z = (row as f64 + 0.37) / (n_obs as f64) * 1.2;
             target[row * d + axis] = z;
-            if z > thresholds[axis] + 0.05 {
+            if z > thresholds[axis] {
                 hard_total += weight * thresholds[axis];
             }
         }

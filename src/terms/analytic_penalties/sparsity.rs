@@ -1229,7 +1229,9 @@ impl AnalyticPenalty for JumpReLUPenalty {
         //   λτ·g(1−g)(1−2g)/ε²
         // is indefinite (negative once the gate passes the inflection
         // g = ½). The Newton / PIRLS pipeline needs a PSD curvature block, so
-        // expose the re-weighted majorizer  λτ·[g(1−g)]²/ε² ⪰ 0.
+        // expose the PSD upper bound implemented by `psd_hessian_diag_entry`:
+        // the elementwise max of the re-weighted surrogate and the absolute
+        // exact curvature.
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut diag = Array1::<f64>::zeros(target.len());
