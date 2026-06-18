@@ -6,3 +6,4 @@
 
 include!("../../../tests/src_modules/smooth_design_assembly_constraint_tests.rs");
 include!("../../../tests/src_modules/smooth_adaptive_bounded_duchon_tests.rs");
+include!("../../../tests/src_modules/smooth_matern_nfree_rekey_topology_tests.rs");
