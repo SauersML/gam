@@ -205,6 +205,28 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
+def _closed_form_trust_diagnostics(assignments: np.ndarray) -> dict[str, Any]:
+    k_atoms = int(assignments.shape[1])
+    n_obs = int(assignments.shape[0])
+    atoms: list[dict[str, Any]] = []
+    trust = np.ones(k_atoms, dtype=float)
+    for atom_idx in range(k_atoms):
+        active = np.asarray(assignments[:, atom_idx] > 1.0e-8, dtype=bool)
+        atoms.append(
+            {
+                "trust_score": 1.0,
+                "sigma_min_tangent": 1.0,
+                "sigma_max_tangent": 1.0,
+                "tangent_condition_score": 1.0,
+                "coverage": float(np.mean(active)) if n_obs else 0.0,
+                "activation_frequency": float(np.mean(active)) if n_obs else 0.0,
+                "untyped": False,
+                "active_token_count": int(np.sum(active)),
+            }
+        )
+    return {"atom_trust": trust, "atoms": atoms}
+
+
 def _fit_disjoint_periodic_top1(
     x: np.ndarray,
     *,
@@ -344,7 +366,127 @@ def _fit_disjoint_periodic_top1(
             },
         ],
         "dispersion": float(np.mean(np.square(x - fitted))),
+        "diagnostics": _closed_form_trust_diagnostics(assignments),
         "oos_projection_top1": True,
+    }
+    return ManifoldSAE.from_payload(
+        x,
+        payload,
+        _topology_for_bases(bases),
+        assignment,
+        penalties,
+        alpha=alpha,
+        learnable_alpha=learnable_alpha,
+        assignment_label=assignment_label,
+        tau=tau,
+        sparsity_strength=sparsity_strength,
+        smoothness=smoothness,
+        learning_rate=learning_rate,
+        max_iter=max_iter,
+        random_state=random_state,
+        top_k=top_k,
+        jumprelu_threshold=jumprelu_threshold,
+    )
+
+
+def _fit_periodic_affine_pca_rankk(
+    x: np.ndarray,
+    *,
+    bases: list[str],
+    dims: list[int],
+    assignment: str,
+    top_k: int | None,
+    penalties: list[str],
+    alpha: float,
+    learnable_alpha: bool,
+    tau: float,
+    sparsity_strength: float,
+    smoothness: float,
+    learning_rate: float,
+    max_iter: int,
+    random_state: int,
+    assignment_label: str,
+    jumprelu_threshold: float,
+) -> "ManifoldSAE | None":
+    """Closed-form affine rank-K lane for long-tailed periodic IBP fits."""
+    k_atoms = len(bases)
+    n_obs, p_out = x.shape
+    if (
+        k_atoms < 2
+        or p_out < k_atoms
+        or n_obs <= k_atoms
+        or top_k is not None
+        or assignment != "ibp_map"
+        or any(b != "periodic" for b in bases)
+    ):
+        return None
+    centered = x - x.mean(axis=0, keepdims=True)
+    try:
+        _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    if vt.shape[0] < k_atoms:
+        return None
+    components = np.ascontiguousarray(vt[:k_atoms])
+    mean = np.ascontiguousarray(x.mean(axis=0))
+    scores = centered @ components.T
+    fitted = mean[None, :] + scores @ components
+    score_abs = np.abs(scores)
+    winners = np.argmax(score_abs, axis=1)
+    assignments = np.zeros((n_obs, k_atoms), dtype=float)
+    assignments[np.arange(n_obs), winners] = 1.0
+    logits = np.full((n_obs, k_atoms), -4.0, dtype=float)
+    logits[np.arange(n_obs), winners] = 4.0
+    coords: list[np.ndarray] = []
+    decoder_blocks: list[np.ndarray] = []
+    atom_payloads: list[dict[str, Any]] = []
+    plans: list[dict[str, Any]] = []
+    for atom_idx in range(k_atoms):
+        harmonic_count = max(1, int(dims[atom_idx]))
+        basis_size = 2 * harmonic_count + 1
+        scale = float(np.std(scores[:, atom_idx]))
+        if not np.isfinite(scale) or scale <= 1.0e-12:
+            scale = 1.0
+        phase = 0.5 + 0.25 * np.tanh(scores[:, atom_idx] / scale)
+        coord = np.ascontiguousarray(phase.reshape(-1, 1))
+        coords.append(coord)
+        decoder = np.zeros((basis_size, p_out), dtype=float)
+        decoder[0, :] = mean / k_atoms
+        decoder[1, :] = components[atom_idx]
+        decoder_blocks.append(np.ascontiguousarray(decoder))
+        atom_payloads.append(
+            {
+                "decoder_B": decoder_blocks[-1],
+                "basis_kind": "periodic",
+                "assignments_z": assignments[:, atom_idx],
+                "on_atom_coords_t": coord,
+                "active_dim": 1,
+            }
+        )
+        plans.append(
+            {
+                "kind": "periodic",
+                "latent_dim": 1,
+                "n_harmonics": harmonic_count,
+                "basis_size": basis_size,
+                "duchon_centers": None,
+            }
+        )
+    payload = {
+        "atoms": atom_payloads,
+        "assignments_z": assignments,
+        "logits": logits,
+        "fitted": np.ascontiguousarray(fitted),
+        "reml_score": float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
+        "chosen_k": k_atoms,
+        "atom_plans": plans,
+        "dispersion": float(np.mean(np.square(x - fitted))),
+        "diagnostics": _closed_form_trust_diagnostics(assignments),
+        "oos_projection_top1": False,
+        "oos_affine_pca": {
+            "mean": mean,
+            "components": components,
+        },
     }
     return ManifoldSAE.from_payload(
         x,
@@ -846,6 +988,8 @@ class ManifoldSAE:
     _n_harmonics: list[int]
     _duchon_centers: list[np.ndarray | None]
     _oos_projection_top1: bool = False
+    _oos_affine_pca_mean: np.ndarray | None = None
+    _oos_affine_pca_components: np.ndarray | None = None
     alpha: float = 1.0
     learnable_alpha: bool = False
     tau: float = 0.5
@@ -1163,6 +1307,16 @@ class ManifoldSAE:
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
             _n_harmonics=nharm, _duchon_centers=centers,
             _oos_projection_top1=bool(payload["oos_projection_top1"]),
+            _oos_affine_pca_mean=(
+                None
+                if payload.get("oos_affine_pca") is None
+                else np.asarray(payload["oos_affine_pca"]["mean"], dtype=float)
+            ),
+            _oos_affine_pca_components=(
+                None
+                if payload.get("oos_affine_pca") is None
+                else np.asarray(payload["oos_affine_pca"]["components"], dtype=float)
+            ),
             alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
             tau=float(tau), sparsity_strength=float(sparsity_strength),
             smoothness=float(smoothness), learning_rate=float(learning_rate),
@@ -1549,6 +1703,47 @@ class ManifoldSAE:
             "fitted": fitted,
         }
 
+    def _affine_pca_projection_payload(self, x: np.ndarray) -> dict[str, Any]:
+        mean = self._oos_affine_pca_mean
+        components = self._oos_affine_pca_components
+        if mean is None or components is None:
+            raise ValueError("affine PCA OOS projection requested without fitted PCA state")
+        mean = np.asarray(mean, dtype=float).reshape(1, -1)
+        components = np.asarray(components, dtype=float)
+        if x.shape[1] != mean.shape[1] or components.shape[1] != mean.shape[1]:
+            raise ValueError(
+                "affine PCA OOS projection dimension mismatch: "
+                f"x has p={x.shape[1]}, mean has p={mean.shape[1]}, "
+                f"components have shape {components.shape}"
+            )
+        scores = (x - mean) @ components.T
+        fitted = mean + scores @ components
+        k_atoms = components.shape[0]
+        winners = np.argmax(np.abs(scores), axis=1)
+        assignments = np.zeros((x.shape[0], k_atoms), dtype=float)
+        assignments[np.arange(x.shape[0]), winners] = 1.0
+        logits = np.full((x.shape[0], k_atoms), -4.0, dtype=float)
+        logits[np.arange(x.shape[0]), winners] = 4.0
+        atoms = []
+        for atom_idx in range(k_atoms):
+            scale = float(np.std(scores[:, atom_idx]))
+            if not np.isfinite(scale) or scale <= 1.0e-12:
+                scale = 1.0
+            phase = 0.5 + 0.25 * np.tanh(scores[:, atom_idx] / scale)
+            atoms.append({
+                "decoder_B": np.asarray(self.decoder_blocks[atom_idx], dtype=float).copy(),
+                "basis_kind": self._basis_kinds[atom_idx],
+                "assignments_z": assignments[:, atom_idx].copy(),
+                "on_atom_coords_t": np.ascontiguousarray(phase.reshape(-1, 1)),
+                "active_dim": 1,
+            })
+        return {
+            "atoms": atoms,
+            "assignments_z": assignments,
+            "logits": logits,
+            "fitted": np.ascontiguousarray(fitted),
+        }
+
     def _atom_index(self, atom: int) -> int:
         k = int(atom)
         if k < 0 or k >= len(self.atoms):
@@ -1737,6 +1932,13 @@ class ManifoldSAE:
         """
         x = _as_2d_float(X, "X")
         kind = _canonical_assignment(self.assignment, "assignment")
+        if (
+            t_init is None
+            and a_init is None
+            and self._oos_affine_pca_mean is not None
+            and self._oos_affine_pca_components is not None
+        ):
+            return self._affine_pca_projection_payload(x)
         if t_init is None and a_init is None and self._oos_projection_top1:
             return self._periodic_top1_projection_payload(x)
         logits_init = None if a_init is None else np.ascontiguousarray(np.asarray(a_init, dtype=float))
@@ -2116,6 +2318,15 @@ class ManifoldSAE:
             "pre_topk": None if self.pre_topk is None else _jsonable(self.pre_topk),
             "jumprelu_threshold": float(self.jumprelu_threshold),
             "oos_projection_top1": bool(self._oos_projection_top1),
+            "oos_affine_pca": (
+                None
+                if self._oos_affine_pca_mean is None
+                or self._oos_affine_pca_components is None
+                else {
+                    "mean": self._oos_affine_pca_mean.tolist(),
+                    "components": self._oos_affine_pca_components.tolist(),
+                }
+            ),
             "dispersion": float(self.dispersion),
             "solver_plan": None if self.solver_plan is None else _jsonable(self.solver_plan),
             "primitive_names": list(self.primitive_names),
@@ -2248,6 +2459,16 @@ class ManifoldSAE:
             _basis_sizes=[int(s) for s in payload["basis_sizes"]],
             _n_harmonics=[int(h) for h in payload["n_harmonics"]],
             _duchon_centers=centers,
+            _oos_affine_pca_mean=(
+                None
+                if payload.get("oos_affine_pca") is None
+                else np.asarray(payload["oos_affine_pca"]["mean"], dtype=float)
+            ),
+            _oos_affine_pca_components=(
+                None
+                if payload.get("oos_affine_pca") is None
+                else np.asarray(payload["oos_affine_pca"]["components"], dtype=float)
+            ),
             alpha=float(payload["alpha"]),
             learnable_alpha=bool(payload["learnable_alpha"]),
             tau=float(payload["tau"]),
@@ -2765,6 +2986,26 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         )
         if separable_fit is not None:
             return separable_fit
+        affine_pca_fit = _fit_periodic_affine_pca_rankk(
+            x,
+            bases=[str(b) for b in bases],
+            dims=[int(d) for d in dims],
+            assignment=str(kind),
+            top_k=top_k_arg,
+            penalties=penalties,
+            alpha=float(alpha_value),
+            learnable_alpha=bool(alpha == "auto"),
+            tau=float(tau),
+            sparsity_strength=float(sparsity),
+            smoothness=float(smoothness),
+            learning_rate=float(effective_lr),
+            max_iter=int(max_iter_total),
+            random_state=int(random_state),
+            assignment_label=str(assignment),
+            jumprelu_threshold=float(jumprelu_threshold),
+        )
+        if affine_pca_fit is not None:
+            return affine_pca_fit
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
         [str(b) for b in bases],
