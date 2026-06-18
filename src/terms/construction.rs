@@ -2207,6 +2207,46 @@ pub fn stable_reparameterizationwith_invariant(
         }
     }
     let log_det = log_det_sum.sum();
+    // #1266 DIAG (env DIAG1266, zero prod effect): the penalty pseudo-logdet and
+    // trace floor the LAMBDA-WEIGHTED `range_eigs_sorted` at `eigenvalue_floor`,
+    // which is computed in the UNWEIGHTED balanced frame (~1e-12). At small
+    // λ_bend a genuinely-positive soft bend mode's λ-weighted eigenvalue can fall
+    // below that floor and be floored UP, inflating log|S|+ and understating the
+    // trace/gradient → spurious λ_bend collapse (EDF inflation). This prints, at
+    // every reparam call (the converged one carries the final λ's), the floored
+    // count among the penalized modes and the true-vs-floored logdet gap so the
+    // mechanism can be quantified before/after the frame-consistent floor fix.
+    if std::env::var("DIAG1266").is_ok() {
+        let mut floored_count = 0usize;
+        let mut true_log_det = KahanSum::default();
+        for (idx, &ev) in range_eigs_sorted.iter().enumerate() {
+            if idx >= penalized_rank {
+                break;
+            }
+            if ev < eigenvalue_floor {
+                floored_count += 1;
+            }
+            true_log_det.add(ev.max(f64::MIN_POSITIVE).ln());
+        }
+        let min_pen_ev = range_eigs_sorted
+            .iter()
+            .take(penalized_rank)
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "[DIAG1266] lambdas={:?} eigenvalue_floor={:.3e} penalized_rank={} \
+             floored_count={} min_penalized_ev={:.3e} logdet_floored={:.6} \
+             logdet_true={:.6} gap={:.6}",
+            lambdas,
+            eigenvalue_floor,
+            penalized_rank,
+            floored_count,
+            min_pen_ev,
+            log_det,
+            true_log_det.sum(),
+            log_det - true_log_det.sum(),
+        );
+    }
     let delta = 0.0;
 
     // The det1 contractions are independent once the eigensystem is fixed.  Use
