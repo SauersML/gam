@@ -16,11 +16,8 @@ fn linear_dataset(seed: u64, n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![x.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(
-        ["x", "y"].into_iter().map(String::from).collect(),
-        rows,
-    )
-    .expect("encode")
+    encode_recordswith_inferred_schema(["x", "y"].into_iter().map(String::from).collect(), rows)
+        .expect("encode")
 }
 
 fn fit_edf(formula: &str, data: &gam::data::EncodedDataset) -> f64 {
@@ -47,10 +44,7 @@ fn bspline_double_penalty_does_not_inflate_linear_edf() {
     let mut edf_off = Vec::new();
     for seed in 0..5 {
         let data = linear_dataset(seed, 800);
-        edf_on.push(fit_edf(
-            "y ~ s(x, k=20, bs=ps, double_penalty=True)",
-            &data,
-        ));
+        edf_on.push(fit_edf("y ~ s(x, k=20, bs=ps, double_penalty=True)", &data));
         edf_off.push(fit_edf(
             "y ~ s(x, k=20, bs=ps, double_penalty=False)",
             &data,
