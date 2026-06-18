@@ -60,6 +60,8 @@ mod bug_hunt_corrected_covariance_response_scale_not_equivariant;
 mod bug_hunt_cyclic_period_option;
 #[path = "regressions/bug_hunt_debug_assert_ban_gate_marginal_slope.rs"]
 mod bug_hunt_debug_assert_ban_gate_marginal_slope;
+#[path = "regressions/bug_hunt_double_penalty_inflates_edf_instead_of_shrinking.rs"]
+mod bug_hunt_double_penalty_inflates_edf_instead_of_shrinking;
 #[path = "regressions/bug_hunt_decoder_incoherence_hvp_is_gauss_newton_not_exact.rs"]
 mod bug_hunt_decoder_incoherence_hvp_is_gauss_newton_not_exact;
 #[path = "regressions/bug_hunt_diagnose_drops_response_column.rs"]
