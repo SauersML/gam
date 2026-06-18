@@ -362,6 +362,33 @@ impl CostStallGuard {
         self.publish_stall(rho, self.best_value, self.best_grad_norm)
     }
 
+    /// Publish the current finite probe as a constrained-stationary point.
+    ///
+    /// This is deliberately narrower than a generic cost stall: ARC can evaluate a
+    /// bound-pinned separation probe whose raw gradient still points out of the
+    /// feasible box. That point already satisfies the constrained KKT condition,
+    /// but it may not be the guard's lowest raw-cost observation, so the generic
+    /// best-so-far publication can resurrect an older non-stationary iterate and
+    /// report `converged=false`. In that separation case the current feasible
+    /// probe is the certificate-bearing point and should be returned directly.
+    pub(crate) fn observe_constrained_stationary(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+    ) -> CostStallVerdict {
+        if !value.is_finite() {
+            return CostStallVerdict::Continue;
+        }
+        self.infeasible_streak = 0;
+        self.accepted_iters = self.accepted_iters.saturating_add(1);
+        self.best_value = value;
+        self.best_rho = Some(rho.clone());
+        self.best_grad_norm = grad_norm;
+        self.no_improve_streak = self.window;
+        self.publish_stall(rho, value, grad_norm)
+    }
+
     /// Publish the best iterate to the shared exit cell and decide the stall
     /// verdict. Shared by the finite-stall and infeasible-stall paths.
     fn publish_stall(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) -> CostStallVerdict {
@@ -1170,12 +1197,12 @@ impl OuterSecondOrderBridge<'_> {
         };
         let guard = self.cost_stall.as_mut()?;
         let projected_g_norm = projected_gradient_norm(x, &eval.gradient, bounds.as_ref());
-        let stall_grad_norm = if separation_bound_stationary {
-            0.0
+        let verdict = if separation_bound_stationary {
+            guard.observe_constrained_stationary(x, eval.cost, 0.0)
         } else {
-            projected_g_norm
+            guard.observe(x, eval.cost, projected_g_norm)
         };
-        match guard.observe(x, eval.cost, stall_grad_norm) {
+        match verdict {
             CostStallVerdict::Continue => None,
             CostStallVerdict::Converged => {
                 log::info!(

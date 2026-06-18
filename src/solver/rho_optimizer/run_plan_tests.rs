@@ -1684,6 +1684,34 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
 }
 
 #[test]
+fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    let stale_seed = array![0.0, 0.0];
+    guard.observe_seed(&stale_seed, 1.0, 2.0);
+
+    let boundary_probe = array![-10.0, -10.0];
+    let verdict = guard.observe_constrained_stationary(&boundary_probe, 1.25, 0.0);
+    assert!(
+        matches!(verdict, CostStallVerdict::Converged),
+        "a finite constrained-stationary separation probe should halt immediately"
+    );
+
+    let published = exit
+        .lock()
+        .unwrap()
+        .take()
+        .expect("stationary probe published");
+    assert_eq!(
+        published.rho, boundary_probe,
+        "publish the KKT-certified boundary probe, not the older raw-cost best"
+    );
+    assert_eq!(published.value, 1.25);
+    assert_eq!(published.grad_norm, 0.0);
+    assert!(published.converged);
+}
+
+#[test]
 fn lower_bound_outward_axes_mark_separation_stationarity() {
     let lower = array![-10.0, -10.0, -10.0, -10.0];
     let upper = array![10.0, 10.0, 10.0, 10.0];
