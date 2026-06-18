@@ -5082,19 +5082,19 @@ fn build_tensor_bspline_basis(
             .into_iter()
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
                 let matrix = gauge.restrict_penalty(&candidate.matrix);
+                // Re-normalize in the *actual* coefficient chart used by the
+                // fit.  The tensor sum-to-zero transform is not norm-preserving
+                // for each overlapping marginal penalty, so carrying the raw
+                // marginal Frobenius scale into the restricted space changes the
+                // relative amount of smoothing seen by the LAML/REML optimizer.
+                // Keep the physical scale in metadata and give the optimizer
+                // unit-scale constrained penalties for every tensor margin.
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
-                let preserve_margin_scale =
-                    matches!(&candidate.source, PenaltySource::TensorMarginal { .. });
-                let (matrix, normalization_scale) = if preserve_margin_scale {
-                    (matrix.mapv(|v| v * c_new), candidate.normalization_scale)
-                } else {
-                    (matrix, candidate.normalization_scale * c_new)
-                };
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: candidate.nullspace_dim_hint,
                     matrix,
                     source: candidate.source,
-                    normalization_scale,
+                    normalization_scale: candidate.normalization_scale * c_new,
                     // Z^T S Z is no longer a Kronecker product of the original
                     // marginal factors, so the Kronecker fast path in construction.rs
                     // must not be taken. Clearing kronecker_factors forces the generic
@@ -6966,24 +6966,9 @@ fn build_single_local_smooth_term(
         .map(
             |((matrix, info), op_in)| -> Result<PenaltyCandidate, BasisError> {
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
-                let preserve_margin_scale =
-                    matches!(&info.source, PenaltySource::TensorMarginal { .. });
-                let (matrix, normalization_scale, op_scale, kronecker_scale) =
-                    if preserve_margin_scale {
-                        (
-                            matrix.mapv(|v| v * c_new),
-                            info.normalization_scale,
-                            1.0,
-                            1.0,
-                        )
-                    } else {
-                        (
-                            matrix,
-                            info.normalization_scale * c_new,
-                            1.0 / c_new,
-                            1.0 / c_new,
-                        )
-                    };
+                let normalization_scale = info.normalization_scale * c_new;
+                let op_scale = 1.0 / c_new;
+                let kronecker_scale = 1.0 / c_new;
                 // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
                 // so `op.as_dense() == matrix` post-normalization.
                 let scaled_op = if op_scale > 0.0 && op_scale.is_finite() {
