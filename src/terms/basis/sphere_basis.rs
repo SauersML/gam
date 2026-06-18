@@ -7,6 +7,15 @@ pub fn build_spherical_spline_basis(
     if matches!(spec.method, SphereMethod::Harmonic) {
         return build_spherical_harmonic_basis(data, spec);
     }
+    if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
+        let mut harmonic_spec = spec.clone();
+        harmonic_spec.method = SphereMethod::Harmonic;
+        harmonic_spec.max_degree = Some(
+            spec.max_degree
+                .unwrap_or_else(|| harmonic_degree_for_wahba_basis_width(spec, data.nrows())),
+        );
+        return build_spherical_harmonic_basis(data, &harmonic_spec);
+    }
     validate_lat_lon_matrix(data, "spherical spline", spec.radians)?;
     if !(1..=4).contains(&spec.penalty_order) {
         crate::bail_invalid_basis!(
@@ -135,6 +144,31 @@ pub fn build_spherical_spline_basis(
 }
 
 const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 2;
+
+fn harmonic_degree_for_wahba_basis_width(spec: &SphericalSplineBasisSpec, n_rows: usize) -> usize {
+    let target = match &spec.center_strategy {
+        CenterStrategy::Auto(inner) => match inner.as_ref() {
+            CenterStrategy::FarthestPoint { num_centers }
+            | CenterStrategy::EqualMass { num_centers }
+            | CenterStrategy::EqualMassCovarRepresentative { num_centers }
+            | CenterStrategy::KMeans { num_centers, .. } => *num_centers,
+            CenterStrategy::UniformGrid { points_per_dim } => points_per_dim.saturating_pow(2),
+            CenterStrategy::UserProvided(centers) => centers.nrows(),
+            CenterStrategy::Auto(_) => default_num_centers(n_rows, 2),
+        },
+        CenterStrategy::FarthestPoint { num_centers } => *num_centers,
+        CenterStrategy::EqualMass { num_centers } => *num_centers,
+        CenterStrategy::EqualMassCovarRepresentative { num_centers } => *num_centers,
+        CenterStrategy::KMeans { num_centers, .. } => *num_centers,
+        CenterStrategy::UniformGrid { points_per_dim } => points_per_dim.saturating_pow(2),
+        CenterStrategy::UserProvided(centers) => centers.nrows(),
+    }
+    .max(1);
+    (1..=32)
+        .find(|&l| l * (l + 2) >= target)
+        .unwrap_or_else(|| default_spherical_harmonic_degree(n_rows))
+        .max(2)
+}
 
 fn real_spherical_harmonic_design_up_to_degree(
     data: ArrayView2<'_, f64>,
