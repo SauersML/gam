@@ -167,11 +167,14 @@ const MULTINOMIAL_FORMULA_PENALTY_SCALE: f64 = 0.5;
 /// the gradient-only route — where the #715 quality arm showed every
 /// wiggliness ρ driven onto the ±10 box bound (smooths collapsed toward their
 /// polynomial null space, truth-RMSE behind VGAM). `12 = 2 × 6` preserves the
-/// original classification boundary under the doubled penalty count:
-/// smooth-by-factor models (one global plus one per-level smooth, old
-/// `D = 8`, now `D = 16` for `K = 3`) stay on the exact-gradient quasi-Newton
-/// route where the O(D^2) dense outer Hessian dominates runtime.
-const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 12;
+/// original classification boundary under the doubled penalty count while
+/// keeping the four-smooth penguin species quality fixture on the exact ARC
+/// path: that model is `D = 16`, and first-order BFGS can cycle along the
+/// near-separable lambda-to-zero ridge until the wall-clock budget expires
+/// (#1082). ARC observes the same exact curvature and can halt through the
+/// bound-aware cost-stall guard once the REML surface stops making useful
+/// progress.
+const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 16;
 
 fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
     total_rho_dim <= MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM
@@ -1755,13 +1758,13 @@ mod fisher_override_tests {
     }
 
     #[test]
-    fn formula_outer_route_uses_first_order_for_smooth_by_factor_d16() {
-        // Smooth-by-factor (one global + one per-level smooth, K = 3) is
-        // D = 16 under double-penalty terms and must avoid the O(D^2) dense
-        // outer Hessian.
+    fn formula_outer_route_uses_exact_curvature_for_d16_penguin_fixture() {
+        // Four k=10 penguin smooths (K = 3) are D = 16 under double-penalty
+        // terms. They must reach the exact ARC route so the #1082 cost-stall
+        // halt is available on the near-separable lambda-to-zero ridge.
         assert!(
-            !multinomial_formula_use_outer_hessian(16),
-            "D=16 smooth-by-factor multinomial fits must avoid the O(D^2) dense outer Hessian"
+            multinomial_formula_use_outer_hessian(16),
+            "D=16 multinomial fits need exact ARC curvature for the #1082 stall halt"
         );
     }
 
