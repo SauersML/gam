@@ -55,26 +55,13 @@ pub fn build_spherical_spline_basis(
     )?;
     let raw_design =
         build_wahba_decomposed_design(raw_kernel_design.view(), data, spec.radians, &decomposition);
-    let mut raw_penalty = build_wahba_decomposed_penalty(center_kernel.view(), &decomposition);
-    let kernel_rank = decomposition.kernel_basis.ncols();
-    let diag_scale = if kernel_rank > 0 {
-        (0..kernel_rank)
-            .map(|i| raw_penalty[[i, i]].abs())
-            .sum::<f64>()
-            / kernel_rank as f64
-    } else {
-        0.0
-    };
-    if diag_scale.is_finite() && diag_scale > 0.0 {
-        // The raw finite-center chart is intentionally not coefficient-gauged.
-        // Tie a small coefficient ridge to the primary RKHS penalty so REML
-        // cannot disable all raw-chart stabilization by driving the separate
-        // double-penalty block to zero. This damps sparse polar center leverage
-        // without adding another smoothing parameter.
-        for i in 0..kernel_rank {
-            raw_penalty[[i, i]] += 10.0 * diag_scale;
-        }
-    }
+    // Keep the finite-center Wahba block on the canonical RKHS scale: the
+    // penalty is K_cc restricted to the penalized coefficient subspace, with
+    // explicit low-degree spherical harmonics carried as the unpenalized block.
+    // Adding an auxiliary coefficient ridge here changes the estimator (and is
+    // not part of the S² spline variational problem), so stabilization belongs
+    // in the basis decomposition / global identifiability transform instead.
+    let raw_penalty = build_wahba_decomposed_penalty(center_kernel.view(), &decomposition);
     let raw_width = raw_design.ncols();
     // Realized-design transform. The Wahba kernels are built without the l=0
     // spherical-harmonic mode, so an additional finite-center coefficient
