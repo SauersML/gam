@@ -102,11 +102,12 @@ fn tp_single_penalty_does_not_overfit_linear_data_1271() {
                         .copied()
                         .filter(|&v| v > dmax * 1e-14)
                         .fold(f64::INFINITY, f64::min);
+                    let range = format!("{:?}", bp.col_range);
+                    let dyn_range = dmax / dmin_pos.max(1e-300);
                     eprintln!(
-                        "[#1271] {formula} penalty block {:?}: dim={rows} fro={fro:.3e} \
+                        "[#1271] {formula} penalty block {range}: dim={rows} fro={fro:.3e} \
                          diag_max={dmax:.3e} diag_min_pos={dmin_pos:.3e} \
-                         diag_dyn_range={:.3e}",
-                        dmax / dmin_pos.max(1e-300),
+                         diag_dyn_range={dyn_range:.3e}"
                     );
                 }
             }
