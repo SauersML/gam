@@ -62,7 +62,7 @@ pub fn build_spherical_spline_basis(
         // double-penalty block to zero. This damps sparse polar center leverage
         // without adding another smoothing parameter.
         for i in 0..kernel_rank {
-            raw_penalty[[i, i]] += 0.1 * diag_scale;
+            raw_penalty[[i, i]] += 10.0 * diag_scale;
         }
     }
     let raw_width = raw_design.ncols();
