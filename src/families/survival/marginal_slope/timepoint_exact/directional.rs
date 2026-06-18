@@ -282,20 +282,17 @@ impl SurvivalMarginalSlopeFamily {
                             let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
                             let neg_dc_daa: [f64; 4] = fixed.dc_daa.map(|v| -v);
 
-                            // f_aa: r=s=a.
-                            f_aa_dir += boundary(&neg_dc_da, &neg_dc_da, &neg_dc_daa);
-
-                            // f_au[u]: r=a, s=u.
-                            for u in 0..p {
-                                let neg_coeff_u = fixed.coeff_u[u].map(|v| -v);
-                                let neg_coeff_au = fixed.coeff_au[u].map(|v| -v);
-                                f_au_dir[u] +=
-                                    boundary(&neg_dc_da, &neg_coeff_u, &neg_coeff_au);
-                            }
-
                             // f_uv[u][v]: r=u, s=v, cross via the b-family
                             // `coeff_bu` (exactly `cell_pair_second_coeff`, the
                             // same cross the fixed-domain `f_uv` integrates).
+                            //
+                            // Do not apply this to f_aa_dir or f_au_dir. Those
+                            // lower-order integrands remain continuous across
+                            // the artificial link-knot partition at zero
+                            // deviation, so their moving-edge terms cancel in
+                            // the full integral. Adding them per cell
+                            // double-counts the partition motion and breaks the
+                            // independent rigid-tower oracle.
                             for u in 0..p {
                                 let neg_coeff_u = fixed.coeff_u[u].map(|val| -val);
                                 for v in u..p {

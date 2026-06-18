@@ -3298,7 +3298,7 @@ mod empirical_flex_jet_oracle_tests {
             1.785_714_3,
             2.5,
         ]);
-        DeviationRuntime::try_new(knots, 0.0, 1).expect("deviation runtime")
+        DeviationRuntime::try_new(knots, 0.0, 2).expect("deviation runtime")
     }
 
     fn make_fixture(is_score_warp: bool) -> FlexFixture {
