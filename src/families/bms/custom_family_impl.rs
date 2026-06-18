@@ -92,19 +92,21 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .max(self.coefficient_gradient_cost(specs));
         let dense_available = self.outer_hyper_hessian_dense_available(specs);
         let hvp_available = self.outer_hyper_hessian_hvp_available(specs);
-        // Flex (`score_warp` / `link_dev`) without a matrix-free outer θ-HVP
-        // would force the dense fourth-order outer-Hessian assembly, whose
-        // per-cell flex-jet cost is prohibitive at scale — so that case stays
-        // first-order. But when the exact profiled outer θ-HVP is available the
-        // operator reuses the flex row stream once per Hv (near-gradient cost)
-        // and PCG converges in a handful of iters; the outer Newton then
-        // converges in ≤ a couple of iterations instead of several BFGS line
-        // searches. Fall through to the HVP-aware order selection in that case
-        // rather than demoting flex to BFGS.
-        if flex_active && !hvp_available {
+        // FLEX (`score_warp` / `link_dev`) is the large-scale #979 wall-clock
+        // path. The generic outer-Hessian "operator" is exact, but its build
+        // still precomputes K^2 callback/cross-trace tables and the contracted
+        // ψψ matvec still streams every output ψ row. At n>=30k the exact
+        // gradient path is the bounded route: it keeps the same objective and
+        // analytic first derivative, uses the BMS row-subsampled pilot schedule,
+        // and avoids the K^2 Jeffreys/outer-Hessian setup entirely.
+        if flex_active
+            && (self.y.len()
+                >= crate::custom_family::OuterDerivativePolicy::STAGED_KAPPA_TRIGGER_N
+                || !hvp_available)
+        {
             if log_exact_work(self.y.len()) {
                 log::info!(
-                    "[BMS outer-derivative-policy] n={} p={} flex=true order=First reason=flex-outer-hessian-fourth-order-cost dense_available={} outer_hvp_available={} coefficient_work={}",
+                    "[BMS outer-derivative-policy] n={} p={} flex=true order=First reason=flex-outer-hessian-k2-cost dense_available={} outer_hvp_available={} coefficient_work={}",
                     self.y.len(),
                     specs.iter().map(|spec| spec.design.ncols()).sum::<usize>(),
                     dense_available,
@@ -170,7 +172,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if n_params == 0 {
             return config;
         }
-        config.max_seeds = if n_params <= 6 { 6 } else { 4 };
+        // #979: BMS startup seed screening runs real inner solves. With the
+        // default multi-seed pool, large marginal-slope fits can spend minutes
+        // rejecting equivalent seeds before the first outer step. The solver
+        // already budgets one seed for this family; generate exactly one so the
+        // expensive screening cascade is skipped rather than paid and discarded.
+        config.max_seeds = 1;
         config.seed_budget = 1;
         // Two cycles is below the observed KKT reachability floor for
         // marginal-slope startup seeds: it rejects every candidate, then pays
