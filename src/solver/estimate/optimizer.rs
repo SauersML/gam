@@ -601,17 +601,18 @@ where
         // those fits stay byte-identical.
         let weight_log_geom_mean: f64 = reml_state.rho_weight_anchor();
         let gaussian_risk = matches!(reml_seed_config.risk_profile, SeedRiskProfile::Gaussian);
-        // The Gaussian path historically skipped the objective-grid prepass and
-        // seeded the outer search from the weight-independent origin 0. That is
-        // exactly correct for an UNWEIGHTED fit (anchor 0), but breaks the
-        // weight-scale invariance of λ̂ the moment a global rescale shifts the
-        // optimum off 0 (issue #877). Run the anchored prepass for Gaussian ONLY
-        // when the weight scale is non-trivial, so unweighted Gaussian fits stay
-        // byte-identical while up-/down-weighted fits seed at the shifted optimum.
+        // The prepass evaluates the *actual* REML/LAML objective on a tiny,
+        // deterministic log-λ grid and only changes startup when that same
+        // criterion improves.  It is therefore part of initialization, not a
+        // compatibility fallback.  Gaussian fits used to skip this when the
+        // weights were on the unit scale, leaving single-start BFGS/ARC tied to
+        // the arbitrary λ=1 origin; flat or multi-penalty REML surfaces could
+        // then spend the finite outer budget getting into the right basin rather
+        // than resolving the optimum that controls EDF and truth recovery.  Run
+        // the same criterion-ranked startup for Gaussian as for GLM/survival,
+        // while retaining the weight-scale anchor from issue #877.
         let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
-        let prepass_seed: Option<Array1<f64>> = if gaussian_risk && !run_gaussian_anchored_prepass {
-            None
-        } else {
+        let prepass_seed: Option<Array1<f64>> = {
             let bnds = reml_seed_config.bounds;
             let (lo, hi) = if bnds.0 <= bnds.1 {
                 bnds
