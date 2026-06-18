@@ -1314,6 +1314,7 @@ fn survival_boundary_rho_six_fd_step_scan_probe_931() {
             "[931-SCAN] h={h:.1e} fd={fd:.15e} rel_fd={rel_fd:.3e}  rich={rich:.15e} rel_rich={rel_rich:.3e}"
         );
     }
+    panic!("[931-SCAN] probe complete (intentional fail to surface captured stdout)");
 }
 
 // --- Regime R2: near-degenerate eigenvalue pair (Daleckii–Krein) -------
