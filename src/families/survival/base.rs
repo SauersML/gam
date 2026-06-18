@@ -2457,9 +2457,7 @@ impl WorkingModelSurvival {
     /// Re-converge the survival inner mode at `λ = exp(ρ)` from warm-start
     /// `beta0`, returning the λ-set model candidate and the converged `β̂(ρ)`.
     /// This is the shared inner-solve used by
-    /// [`evaluate_survival_lamlcost_and_gradient`](Self::evaluate_survival_lamlcost_and_gradient)
-    /// and the converged-mode accessor
-    /// [`survival_converged_mode_at_rho`](Self::survival_converged_mode_at_rho):
+    /// [`evaluate_survival_lamlcost_and_gradient`](Self::evaluate_survival_lamlcost_and_gradient):
     /// inner PIRLS to a tight relative certificate, followed by a
     /// Levenberg–Marquardt / exact-Cholesky stationarity polish that drives the
     /// absolute penalized residual `‖S β̂ − ∇ℓ‖` below the FD round-off floor so
@@ -2686,68 +2684,6 @@ impl WorkingModelSurvival {
         }
 
         Ok((candidate, beta))
-    }
-
-    /// Converged-mode survival-LAML quantities at `ρ`, for the cancellation-free
-    /// large-λ objective↔gradient consistency oracle (#931). Re-converges the
-    /// inner mode (PIRLS + stationarity polish) exactly as the value path does,
-    /// then returns
-    /// `(analytic_rho_gradient, half_logdet_lambda_s, penalized_nll, hessian, penalty_rank)`:
-    ///
-    /// * `analytic_rho_gradient` — the unified analytic ρ-gradient at `β̂(ρ)`.
-    /// * `half_logdet_lambda_s` — ½·log|λS|₊ (the value's penalty-logdet term).
-    /// * `penalized_nll` — −ℓ(β̂) + ½β̂ᵀ(λS)β̂ (the value's likelihood+quadratic part).
-    /// * `hessian` — the dense penalized Hessian H at the converged mode.
-    /// * `penalty_rank` — Σ rank of the active penalty blocks (so the structural
-    ///   ½·log|λS| ρ-derivative is exactly ½·rank).
-    ///
-    /// The caller forms the ½·log|H| ρ-derivative as a *cancellation-free* matrix
-    /// trace-FD `½·tr(H⁻¹·ΔH/2h)` (never differencing two logdets), which at
-    /// extreme λ is the only finite-difference of that term that is not destroyed
-    /// by catastrophic cancellation — see the boundary test for the full analysis.
-    pub fn survival_converged_mode_at_rho(
-        &self,
-        rho: &[f64],
-        beta0: &Array1<f64>,
-    ) -> Result<(Array1<f64>, f64, f64, Array2<f64>, usize), EstimationError> {
-        use crate::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
-
-        let (candidate, beta) = self.reconverge_survival_inner_mode(rho, beta0)?;
-        let rho_arr = Array1::from_vec(rho.to_vec());
-        let state = candidate.update_state(&beta)?;
-        let (_cost, gradient) =
-            candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)?;
-
-        let penalized_nll = -state.log_likelihood + state.penalty_term;
-        let h_dense = state.hessian.to_dense();
-
-        let mut half_logdet_lambda_s = 0.0_f64;
-        let mut penalty_rank = 0usize;
-        let mut active_idx = 0usize;
-        for block in candidate.penalties.blocks.iter() {
-            if block.lambda > 0.0 {
-                let lam = rho[active_idx].exp();
-                let scaled = &block.matrix * lam;
-                half_logdet_lambda_s += 0.5
-                    * DenseSpectralOperator::from_symmetric(&scaled)
-                        .map_err(EstimationError::InvalidInput)?
-                        .logdet();
-                penalty_rank += block
-                    .matrix
-                    .diag()
-                    .iter()
-                    .filter(|&&d| d.abs() > 0.0)
-                    .count();
-                active_idx += 1;
-            }
-        }
-        Ok((
-            gradient,
-            half_logdet_lambda_s,
-            penalized_nll,
-            h_dense,
-            penalty_rank,
-        ))
     }
 }
 
