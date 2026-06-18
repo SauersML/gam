@@ -166,6 +166,8 @@ mod periodic_spline_1d;
 mod precision_gamma_hyperprior;
 #[path = "basis_smooth/psi_gram_tensor_adversarial.rs"]
 mod psi_gram_tensor_adversarial;
+#[path = "basis_smooth/psi_gram_tensor_independent_audit.rs"]
+mod psi_gram_tensor_independent_audit;
 #[path = "basis_smooth/reml_iter_reduction_correctness.rs"]
 mod reml_iter_reduction_correctness;
 #[path = "basis_smooth/reml_scale_invariance.rs"]
