@@ -610,7 +610,7 @@ pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
     monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
 }
 
-const THIN_PLATE_RADIAL_RETAIN_REL_TOL: f64 = 1.0e-1;
+const THIN_PLATE_RADIAL_RETAIN_REL_TOL: f64 = 1.0e-8;
 
 fn thin_plate_retained_radial_indices(evals: &Array1<f64>) -> Vec<usize> {
     if evals.is_empty() {
@@ -1155,8 +1155,9 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
     // block diagonal. Numerically near-null radial directions are not part of
     // the polynomial null space; keeping them as almost-free columns lets REML
     // spend EDF on wiggle with effectively zero curvature cost (#1271). Drop
-    // them from the exposed basis so only genuinely penalized radial directions
-    // remain.
+    // only numerical nulls: legitimate low-curvature large-scale modes are the
+    // scientific signal in small-k TPS/Duchon regimes and must remain available
+    // to REML rather than being removed by an arbitrary coarse cutoff.
     let (radial_reparam, radial_eigvals): (Array2<f64>, Array1<f64>) = if let Some(frozen) =
         frozen_radial_reparam
     {
