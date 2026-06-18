@@ -83,8 +83,19 @@ where
         for i in 0..three_n {
             let fd = (eta_plus[i] - eta0[i]) / FD_EPS;
             let analytic = jac[[i, j]];
+            let abs_err = (fd - analytic).abs();
+            // Absolute-tolerance fallback for near-zero targets: when both the
+            // analytic entry and the FD are numerical zero, the relative error
+            // is meaningless (e.g. analytic=0 vs fd~1e-8 from O(eps) round-off
+            // in eta_fn divided by FD_EPS gives rel_err≈1.0 against a zero
+            // target). Accept any entry whose ABSOLUTE deviation is within the
+            // FD noise floor before falling back to the relative test.
+            const ABS_ERR_TOL: f64 = 1e-6;
+            if abs_err < ABS_ERR_TOL {
+                continue;
+            }
             let denom = fd.abs().max(analytic.abs()).max(1e-12);
-            let rel_err = (fd - analytic).abs() / denom;
+            let rel_err = abs_err / denom;
             assert!(
                 rel_err < REL_ERR_TOL,
                 "{name}: row={i} col={j} analytic={analytic:.8e} fd={fd:.8e} rel_err={rel_err:.2e} > {REL_ERR_TOL:.0e}",

@@ -116,32 +116,28 @@ fn survival_marginal_slope_channel_hessian_matches_fd() {
         })
         .collect();
 
-    // Build pilot arrays for SurvivalRowHessian constructor.
-    let q0 = Array1::from_iter(states.iter().map(|s| s[0]));
-    let q1 = Array1::from_iter(states.iter().map(|s| s[1]));
-    let qd1 = Array1::from_iter(states.iter().map(|s| s[2]));
-    let g = Array1::from_iter(states.iter().map(|s| s[3]));
-    let z_arr = Array1::from_elem(N, z);
-    let w_arr = Array1::from_elem(N, w);
-
     for &d in &data_d {
-        let d_arr = Array1::from_elem(N, d);
-        let row_hess = SurvivalRowHessian::from_pilot_primary_state(
-            &q0, &q1, &qd1, &g, &z_arr, &w_arr, &d_arr, dguard, pscale,
-        )
-        .expect("SurvivalRowHessian::from_pilot_primary_state failed");
-
         for i in 0..N {
             let u = states[i];
             let f = |uu: &[f64]| survival_row_nll(uu, z, w, d, dguard, pscale);
             let fd = fd_hessian(&f, &u, 4, FD_H);
 
-            let mut buf = [0.0f64; 16];
-            row_hess.fill_subject(i, &mut buf);
+            // Compare the FD against the RAW analytic Hessian, not the
+            // PSD-CLAMPED per-row tensor that `from_pilot_primary_state`
+            // stores. The clamp projects negative eigenvalues to zero for the
+            // optimizer's curvature model, so on an indefinite censored-row
+            // NLL the clamped [q0,q0] entry legitimately differs from the true
+            // (negative) curvature the FD measures — that is a property of the
+            // clamp, not a derivative error. The derivative-correctness check
+            // this test exists for is the RAW Hessian vs FD.
+            let (_, _, hess) = survival_row_nll_grad_hess(
+                u[0], u[1], u[2], u[3], z, w, d, dguard, pscale,
+            )
+            .expect("survival_row_nll_grad_hess failed");
 
             for a in 0..4 {
                 for b in 0..4 {
-                    let got = buf[a * 4 + b];
+                    let got = hess[a][b];
                     let ref_val = fd[a][b];
                     // Skip NaN FD entries (numerical issues at boundary rows).
                     if !ref_val.is_finite() {
