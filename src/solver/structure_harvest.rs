@@ -2486,13 +2486,29 @@ mod tests {
         // Production cap: a warm child re-equilibrates in very few iters.
         let (capped, cap_fitted) = run(4);
 
-        // The accepted-move trajectory (verdicts + structural hashes) must be
-        // identical: the cap must not flip a single e-gate decision.
-        let ref_ledger = serde_json::to_string(&reference.rounds).unwrap();
-        let cap_ledger = serde_json::to_string(&capped.rounds).unwrap();
+        // The accepted-move trajectory — the per-round `moves` (each carrying the
+        // proposed `mv`, its `trigger`, `structure_hash`, `claim`, and the e-gate
+        // `verdict`) — must be identical: the cap must not flip a single e-gate
+        // decision. We compare ONLY `moves`, NOT the per-round `collapse_events`.
+        // The collapse-event log is the #976 active-mass guard's per-INNER-iteration
+        // diagnostic trail: a full-iter refit runs more inner Newton steps than a
+        // capped one, so it legitimately records more reseed/terminal guard fires
+        // for the SAME structural outcome. Those events are a refit-trajectory
+        // diagnostic, not an e-gate decision — the move verdicts already encode
+        // their structural effect — so comparing them would assert a property the
+        // cap is not meant to preserve (and the adopted-fit check below is the
+        // real guarantee that the converged state matches).
+        let round_moves =
+            |rounds: &[SearchLedger]| -> String {
+                serde_json::to_string(
+                    &rounds.iter().map(|r| &r.moves).collect::<Vec<_>>(),
+                )
+                .unwrap()
+            };
         assert_eq!(
-            ref_ledger, cap_ledger,
-            "scoring-iteration cap changed the accepted-move ledger — the e-gate \
+            round_moves(&reference.rounds),
+            round_moves(&capped.rounds),
+            "scoring-iteration cap changed the accepted-move trajectory — the e-gate \
              decisions are NOT cap-invariant (the #1026 economy is unsound)"
         );
         assert_eq!(
