@@ -8,6 +8,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rayon::prelude::*;
 
+use crate::terms::basis::duchon_kernel_math::centered_aniso_metric_weights;
 use crate::terms::basis::{BasisError, MaternNu};
 
 /// Default row-chunk size for streaming the `(data × centers)` distance scan.
@@ -68,18 +69,14 @@ impl StreamingMaternBasisGradientEvaluator {
                         centers.ncols()
                     );
                 }
-                eta.iter()
-                    .enumerate()
-                    .map(|(axis, value)| {
-                        if !value.is_finite() {
-                            Err(BasisError::InvalidInput(format!(
-                                "aniso_log_scales[{axis}] must be finite"
-                            )))
-                        } else {
-                            Ok((2.0 * value).exp())
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
+                for (axis, value) in eta.iter().enumerate() {
+                    if !value.is_finite() {
+                        return Err(BasisError::InvalidInput(format!(
+                            "aniso_log_scales[{axis}] must be finite"
+                        )));
+                    }
+                }
+                centered_aniso_metric_weights(eta)
             }
             None => vec![1.0; centers.ncols()],
         };
@@ -156,7 +153,8 @@ impl StreamingMaternBasisGradientEvaluator {
                             if r2 == 0.0 {
                                 0.0
                             } else {
-                                d_log_kappa * axis_component / r2
+                                let centered_component = axis_component - r2 / dim as f64;
+                                d_log_kappa * centered_component / r2
                             }
                         }
                     };
@@ -327,7 +325,8 @@ mod tests {
         for i in 0..data.nrows() {
             for j in 0..centers.nrows() {
                 let value_at = |axis_eta: f64| {
-                    let weights = [(2.0 * eta[0]).exp(), (2.0 * axis_eta).exp()];
+                    let eta_trial = [eta[0], axis_eta];
+                    let weights = centered_aniso_metric_weights(&eta_trial);
                     let r = ((0..2)
                         .map(|axis| {
                             let d = data[[i, axis]] - centers[[j, axis]];
