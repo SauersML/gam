@@ -1267,89 +1267,34 @@ fn survival_objective_gradient_consistent_interior() {
 // custom large-λ boundary. The unified survival LAML must keep its value
 // and ρ-gradient consistent there.
 //
-// ρ≥6 is DELIBERATELY EXCLUDED from this self-FD loop because the FD oracle is
-// structurally unsound there — its measurement noise exceeds the quantity it
-// measures. At large λ = exp(ρ) the inner penalized problem becomes severely
-// ill-conditioned, and the re-converged inner mode pins the LAML *gradient* to
-// the 1e-11 inner tolerance but leaves the scalar *value* V(ρ) uncertain at the
-// ~1e-5 absolute level (the conditioning amplifies the residual into the value's
-// logdet-H term). Meanwhile the true ∂V/∂ρ shrinks with λ: it is ~1.3e-3 at ρ=6
-// and only ~3.0e-4 at ρ=8. A centered FD subtracts two V(ρ±h) values whose true
-// difference is ~2h·∂V/∂ρ, so at ρ=8 the signal over 2h is ~6e-7 while the value
-// noise is ~7e-6 — the FD is then 10× noise, not derivative. An MSI value probe
-// confirmed this directly: at ρ=8, V(8±h) differences are random ±1e-5 across
-// h ∈ [1e-5, 4e-3] with no consistent sign, and the FD swings between −0.34%·… and
-// +50% of the analytic. The analytic ρ-gradient itself is CORRECT at large λ:
-// the same LAML-derivative machinery is independently certified to rel < 2e-5
+// ρ≥6 is DELIBERATELY EXCLUDED from this self-FD loop because the finite
+// difference of the *value* surface is structurally unsound there, while the
+// analytic gradient is provably correct. This was established by isolating the
+// LAML value into its terms (V = −ℓ + ½β'Sβ + ½log|H| − ½log|λS|) and finite-
+// differencing each at the re-converged mode (rnorm ~ 2e-11, deterministic):
+//
+//   * ½log|λS| derivative is structurally exact (0.5000000 for the rank-1 block).
+//   * −ℓ and ½β'Sβ derivatives are stable (~±1.9e-4).
+//   * ½log|H| is the unsound term. At ρ=8 (λ≈2981) H spans exp(η)·n ≈ exp(9.1)·n
+//     down to λ·(small), so log|H| ≈ 5.6 is a sum of widely-separated log-eigen-
+//     values. Differencing two such logdets, V's ρ-derivative of ½log|H| swings
+//     0.998 → 0.516 → 0.496 → 0.501 across h ∈ [1e-5, 2e-3] — catastrophic
+//     cancellation, not a derivative. Because ½log|H| and ½log|λS| nearly cancel
+//     (both ≈ 0.5) and the true ∂V/∂ρ is only ~3.0e-4 at ρ=8, the value's FD is
+//     dominated by this cancellation noise (the total fdCost swings ±50% of the
+//     analytic and even changes sign with h).
+//
+// The analytic ½log|H| ρ-derivative tr(H⁻¹Ḣ) is CORRECT: differencing the
+// Hessian MATRIX and forming ½tr(H⁻¹·ΔH/2h) — which never subtracts two logdets,
+// so it is cancellation-free — gives ≈ 0.502, matching the analytic-implied
+// half_trace_logH = 0.50010 (and NOT the noisy logdet-FD's 0.496). So the
+// analytic gradient is right; only the self-FD of the value is unusable here.
+// Independently, the same LAML-derivative machinery is certified to rel < 2e-5
 // against a textbook erfc-LAML scalar on a well-conditioned (unconstrained,
 // Hessian condition < 100) probit fixture in `survival_laml_erfc_oracle_931`.
-// That independent oracle — not a self-FD whose noise floor exceeds the
-// derivative — is the large-λ objective↔gradient consistency gate. Here we keep
-// the largest-λ point at which the gradient signal still clears the value-noise
+// That oracle is the large-λ objective↔gradient consistency gate. Here we keep
+// the largest-λ point at which the value's FD still clears the cancellation
 // floor (ρ=4), whose FD is sound.
-
-#[test]
-fn survival_rho_eight_term_split_probe_931() {
-    let model = survival_single_block_model(1.0);
-    let beta0 = array![-2.5_f64, 1.0];
-    // Determinism: same (rho, beta0) twice.
-    let a = model.survival_lamlterm_split_931(&[8.0], &beta0).unwrap();
-    let b = model.survival_lamlterm_split_931(&[8.0], &beta0).unwrap();
-    println!(
-        "[931-TS] determinism: dCost={:.3e} dGrad={:.3e} dPnll={:.3e} dLdH={:.3e} dLdS={:.3e} dQuad={:.3e} dBeta={:.3e}",
-        (a.0 - b.0).abs(),
-        (a.1 - b.1).abs(),
-        (a.2 - b.2).abs(),
-        (a.3 - b.3).abs(),
-        (a.4 - b.4).abs(),
-        (a.5 - b.5).abs(),
-        (&a.7 - &b.7).iter().map(|v| v.abs()).fold(0.0, f64::max),
-    );
-    // Per-term FD across the probe at rho=8.
-    let h_list = [1.0e-5_f64, 1.0e-4, 5.0e-4, 1.0e-3, 2.0e-3];
-    let base = model.survival_lamlterm_split_931(&[8.0], &beta0).unwrap();
-    println!(
-        "[931-TS] @rho=8: cost={:.12e} analyticGrad={:.12e} pnll={:.12e} halfLdH={:.12e} halfLdS={:.12e} quadHalf={:.12e} rnorm={:.3e} beta={:?}",
-        base.0, base.1, base.2, base.3, base.4, base.5, base.6, base.7.to_vec()
-    );
-    // Clean ½·d log|H|/dρ via matrix trace-FD: ½·tr(H⁻¹·(H₊−H₋)/2h). This avoids
-    // logdet cancellation entirely, so it is a NOISE-FREE reference for the term.
-    // The analytic half_trace_logH (implied) = analyticGrad − d(pnll) + d(½ldS)
-    //   = base.1 − ~1.92e-4 + 0.5.
-    let h_base = base.8.clone();
-    let hinv = {
-        // Solve H X = I by Cholesky to get H⁻¹ (2x2, tiny).
-        let n = h_base.nrows();
-        let mut inv = ndarray::Array2::<f64>::zeros((n, n));
-        let det = h_base[[0, 0]] * h_base[[1, 1]] - h_base[[0, 1]] * h_base[[1, 0]];
-        inv[[0, 0]] = h_base[[1, 1]] / det;
-        inv[[1, 1]] = h_base[[0, 0]] / det;
-        inv[[0, 1]] = -h_base[[0, 1]] / det;
-        inv[[1, 0]] = -h_base[[1, 0]] / det;
-        inv
-    };
-    for h in h_list {
-        let p = model.survival_lamlterm_split_931(&[8.0 + h], &beta0).unwrap();
-        let m = model.survival_lamlterm_split_931(&[8.0 - h], &beta0).unwrap();
-        let fd_cost = (p.0 - m.0) / (2.0 * h);
-        let fd_pnll = (p.2 - m.2) / (2.0 * h);
-        let fd_ldh = (p.3 - m.3) / (2.0 * h);
-        let fd_lds = (p.4 - m.4) / (2.0 * h);
-        let fd_quad = (p.5 - m.5) / (2.0 * h);
-        let dbeta = (&p.7 - &m.7).iter().map(|v| v.abs()).fold(0.0, f64::max);
-        // Clean ½·tr(H⁻¹ dH/dρ).
-        let dh = (&p.8 - &m.8).mapv(|v| v / (2.0 * h));
-        let hinv_dh = hinv.dot(&dh);
-        let trace = (0..hinv_dh.nrows()).map(|i| hinv_dh[[i, i]]).sum::<f64>();
-        let clean_half_ldh = 0.5 * trace;
-        println!(
-            "[931-TS] h={h:.1e} fdCost={fd_cost:.6e} | d(pnll)/dr={fd_pnll:.6e} d(½ldH)logdetFD={fd_ldh:.6e} d(½ldH)traceFD={clean_half_ldh:.6e} d(½ldS)/dr={fd_lds:.6e} d(quad½)/dr={fd_quad:.6e} | dBeta(±h)={dbeta:.3e}"
-        );
-    }
-    let analytic_half_ldh = base.1 - 1.923e-4 + 0.5;
-    println!("[931-TS] analytic-implied half_trace_logH ≈ {analytic_half_ldh:.9e} (compare to traceFD column)");
-    panic!("[931-TS] term-split probe complete (intentional fail to surface stdout)");
-}
 
 #[test]
 fn survival_objective_gradient_consistent_at_large_lambda_boundary() {
