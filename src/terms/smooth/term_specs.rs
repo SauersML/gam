@@ -686,7 +686,7 @@ pub enum FactorSmoothFlavour {
     Re,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TensorBSplineSpec {
     pub marginalspecs: Vec<BSplineBasisSpec>,
     #[serde(default)]

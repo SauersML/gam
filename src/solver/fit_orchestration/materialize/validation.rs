@@ -133,7 +133,7 @@ pub(super) fn reject_flexible_link_for_nonbinomial(
                  non-binomial family), for which the link offset has no solver and would \
                  otherwise be silently discarded. Use the plain base link, or fit a binomial \
                  response.",
-                family.response_family_name()
+                family.pretty_name()
             ),
         });
     }
