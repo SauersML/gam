@@ -167,6 +167,27 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         order
     }
 
+    fn outer_derivative_policy(
+        &self,
+        specs: &[ParameterBlockSpec],
+        psi_dim: usize,
+        options: &BlockwiseFitOptions,
+    ) -> crate::custom_family::OuterDerivativePolicy {
+        let capability = self.exact_outer_derivative_order(specs, options);
+        let grad_cost = self.coefficient_gradient_cost(specs);
+        let hess_cost = self.coefficient_hessian_cost(specs);
+        let (predicted_gradient_work, predicted_hessian_work) =
+            crate::custom_family::default_outer_derivative_policy_costs(
+                specs, psi_dim, grad_cost, hess_cost,
+            );
+        crate::custom_family::OuterDerivativePolicy {
+            capability,
+            predicted_gradient_work,
+            predicted_hessian_work,
+            subsample_capable: true,
+        }
+    }
+
     fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
         let mut config = crate::seeding::SeedConfig::default();
         if n_params == 0 {
