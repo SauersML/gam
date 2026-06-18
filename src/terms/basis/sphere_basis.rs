@@ -26,13 +26,29 @@ pub fn build_spherical_spline_basis(
             found: centers.nrows(),
         });
     }
-    let raw_penalty = spherical_wahba_kernel_matrix_with_kind(
+    let mut raw_penalty = spherical_wahba_kernel_matrix_with_kind(
         centers.view(),
         centers.view(),
         spec.penalty_order,
         spec.radians,
         spec.wahba_kernel,
     )?;
+    let diag_scale = raw_penalty
+        .diag()
+        .iter()
+        .map(|v| v.abs())
+        .sum::<f64>()
+        / raw_penalty.nrows().max(1) as f64;
+    if diag_scale.is_finite() && diag_scale > 0.0 {
+        // The raw finite-center chart is intentionally not coefficient-gauged.
+        // Tie a small coefficient ridge to the primary RKHS penalty so REML
+        // cannot disable all raw-chart stabilization by driving the separate
+        // double-penalty block to zero. This damps sparse polar center leverage
+        // without adding another smoothing parameter.
+        for i in 0..raw_penalty.nrows() {
+            raw_penalty[[i, i]] += 0.1 * diag_scale;
+        }
+    }
     // Realized-design transform. The Wahba kernels are built without the l=0
     // spherical-harmonic mode, so an additional finite-center coefficient
     // sum-to-zero gauge is not intrinsic to the smooth and can distort sparse
@@ -333,6 +349,11 @@ pub(crate) fn build_spherical_harmonic_basis(
         })?;
     }
     // Diagonal Laplace-Beltrami eigenvalue penalty [l(l+1)]^m per (l, m).
+    // For explicit high-degree bases (L > 2), fold an extra [l(l+1)] factor
+    // into modes l > 2 in this same primary block. Keeping the shrinkage tied
+    // to the primary lambda prevents REML from fitting dense equatorial noise
+    // with separately under-penalized high-degree modes and then degrading in
+    // sparse polar latitude bands.
     //
     // This is already in the natural coefficient coordinates for the real
     // spherical harmonics: the basis is orthonormal on S², so X'X/n is O(1)
@@ -345,7 +366,11 @@ pub(crate) fn build_spherical_harmonic_basis(
     let mut penalty = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
-        let eig = (l as f64 * (l as f64 + 1.0)).powi(spec.penalty_order as i32);
+        let laplace = l as f64 * (l as f64 + 1.0);
+        let mut eig = laplace.powi(spec.penalty_order as i32);
+        if l > 2 {
+            eig *= laplace;
+        }
         for _ in 0..(2 * l + 1) {
             penalty[[col, col]] = eig;
             col += 1;
@@ -359,29 +384,6 @@ pub(crate) fn build_spherical_harmonic_basis(
         kronecker_factors: None,
         op: None,
     }];
-    if l_max > 2 {
-        let mut high_degree = Array2::<f64>::zeros((p, p));
-        let mut col = 0usize;
-        for l in 1..=l_max {
-            let eig = if l > 2 {
-                (l as f64 * (l as f64 + 1.0)).powi((spec.penalty_order + 1) as i32)
-            } else {
-                0.0
-            };
-            for _ in 0..(2 * l + 1) {
-                high_degree[[col, col]] = eig;
-                col += 1;
-            }
-        }
-        candidates.push(PenaltyCandidate {
-            matrix: high_degree,
-            nullspace_dim_hint: 8,
-            source: PenaltySource::Other("SphereHarmonicHighDegree".to_string()),
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            op: None,
-        });
-    }
     if spec.double_penalty {
         let ridge = Array2::<f64>::eye(p);
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
