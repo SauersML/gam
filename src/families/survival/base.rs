@@ -2665,57 +2665,7 @@ impl WorkingModelSurvival {
         // convention of this shim.
         let rho_arr = Array1::from_vec(rho.to_vec());
         let state = candidate.update_state(&beta)?;
-        let h_dense = state.hessian.to_dense();
-        let (mut cost, gradient) =
-            candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)?;
-
-        // The shim is finite-differenced directly in rho. On the rho=6 boundary
-        // fixture the Hessian is SPD but highly ill-conditioned, so use the
-        // Cholesky logdet value and first-order Newton residual correction for
-        // the scalar value while leaving the unified analytic gradient as the
-        // source of truth.
-        let factor = crate::faer_ndarray::FaerCholesky::cholesky(&h_dense, faer::Side::Lower)
-            .map_err(|err| {
-                EstimationError::InvalidInput(format!(
-                    "survival LAML value polish Hessian factorization failed: {err}"
-                ))
-            })?;
-        let chol_logdet = 2.0 * factor.diag().iter().map(|v| v.ln()).sum::<f64>();
-        {
-            use crate::estimate::reml::reml_outer_engine::{
-                DenseSpectralOperator, HessianOperator,
-            };
-            let spectral_logdet = DenseSpectralOperator::from_symmetric(&h_dense)
-                .map_err(EstimationError::InvalidInput)?
-                .logdet();
-            cost += 0.5 * (chol_logdet - spectral_logdet);
-        }
-        let stationarity = match candidate.monotonicity_linear_constraints() {
-            Some(constraints) => projected_linear_constraint_stationarity_vector(
-                &state.gradient,
-                &beta,
-                &constraints,
-                None,
-            )
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "survival LAML value polish could not project the monotonicity KKT residual"
-                        .to_string(),
-                )
-            })?,
-            None => state.gradient.clone(),
-        };
-        let beta_error = factor.solvevec(&stationarity);
-        let dh_beta_error = candidate.survival_hessian_derivative_correction(&beta, &beta_error)?;
-        let mut trace_hinv_dh = 0.0_f64;
-        for col_idx in 0..dh_beta_error.ncols() {
-            let solved = factor.solvevec(&dh_beta_error.column(col_idx).to_owned());
-            trace_hinv_dh += solved[col_idx];
-        }
-        let objective_correction = -0.5 * stationarity.dot(&beta_error);
-        let logdet_correction = -0.5 * trace_hinv_dh;
-        cost += objective_correction + logdet_correction;
-        Ok((cost, gradient))
+        candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
     }
 }
 
