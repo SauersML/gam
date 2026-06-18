@@ -3380,7 +3380,9 @@ pub fn build_matern_collocation_operator_matrices(
                 if r > R_EPS {
                     for c in 0..d {
                         let delta = centers[[k, c]] - centers[[j, c]];
-                        d1_chunk[[local_k * d + c, j]] = scale_k * phi_r_over_r * delta;
+                        let axis_scale = metric_weights.as_ref().map(|w| w[c]).unwrap_or(1.0);
+                        d1_chunk[[local_k * d + c, j]] =
+                            scale_k * phi_r_over_r * axis_scale * delta;
                     }
                 } else {
                     // Symmetry at center-center coincidence.
