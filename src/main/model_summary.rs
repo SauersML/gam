@@ -1,68 +1,12 @@
 use super::*;
 
-/// Effective degrees of freedom attributable to one term (one smooth, one
-/// random effect), defined as the trace of the linear-smoother influence matrix
-/// `F = H⁻¹X'WX` restricted to that term's coefficient block:
-///
-/// ```text
-/// edf_term = Σ_{j ∈ coeff_range} F[j,j]
-///          = |coeff_range| − Σ_{kk ∈ term} tr_kk,   tr_kk = λ_kk·tr(H⁻¹ S_kk).
-/// ```
-///
-/// The two forms are algebraically identical (each penalty `S_kk` is local to
-/// the term's coefficient range, so the rows it touches outside the range are
-/// zero, and `Σ_{j∈range} diag(H⁻¹S) = Σ_{kk∈term} tr_kk`). Both are additive
-/// across terms and sum exactly to `edf_total = p − Σ_all tr_kk`, so a term's
-/// EDF can never exceed the model total.
-///
-/// The legacy decomposition summed the per-penalty-block EDFs
-/// `Σ_kk(rank(S_kk) − tr_kk)`. That is a valid split only when penalty blocks act
-/// on *disjoint* coefficient ranges (`Σ_kk rank(S_kk) = |coeff_range|`). For a
-/// tensor product (`te`/`ti`) — and anisotropic/adaptive smooths — several
-/// marginal penalties span the *same* shared coefficient block, so
-/// `Σ_kk rank(S_kk) ≫ |coeff_range|` and the sum double-counts, reporting a
-/// per-term EDF larger than `edf_total` and even than the design column count
-/// (issue #1219).
-///
-/// Resolution order: the influence-matrix trace (the model's own definition,
-/// available whenever the full `F` was materialised); else the basis-invariant
-/// `|coeff_range| − Σ tr_kk` from the stored per-block traces (covers the
-/// large-model path where `F` is not formed); else, only if neither is
-/// available, the legacy block-sum as a last resort.
-fn per_term_edf(
-    fit: &UnifiedFitResult,
-    coeff_range: std::ops::Range<usize>,
-    penalty_cursor: usize,
-    k: usize,
-) -> f64 {
-    let dim = coeff_range.len() as f64;
-    // Primary: trace of the influence matrix over the term's coefficient block.
-    if let Some(f) = fit.coefficient_influence()
-        && coeff_range.end <= f.nrows()
-        && coeff_range.end <= f.ncols()
-    {
-        let tr = coeff_range.clone().map(|j| f[[j, j]]).sum::<f64>();
-        return tr.clamp(0.0, dim);
-    }
-    // Fallback: |coeff_range| − Σ tr_kk from the stored per-block traces. Equal
-    // to the influence-matrix trace and basis-invariant, so it is exact even
-    // when `F` was never materialised (large models).
-    let traces = fit.penalty_block_trace();
-    if k == 0 {
-        // Unpenalised term: every coefficient carries one full degree of freedom.
-        return dim;
-    }
-    if let Some(block) = traces.get(penalty_cursor..penalty_cursor + k) {
-        let sum_trace = block.iter().sum::<f64>();
-        return (dim - sum_trace).clamp(0.0, dim);
-    }
-    // Last resort: the legacy per-block EDF sum. Correct for disjoint penalties;
-    // retained only for fits that recorded neither `F` nor per-block traces.
-    fit.edf_by_block()
-        .get(penalty_cursor..penalty_cursor + k)
-        .map(|block| block.iter().sum::<f64>())
-        .unwrap_or(0.0)
-}
+// The per-term effective-degrees-of-freedom decomposition lives on
+// `UnifiedFitResult::per_term_edf` (in the library crate) so that BOTH this
+// in-process CLI/report summary and the persisted-model summary the Python API
+// reads (`crates/gam-pyffi` → `summary_smooth_terms`) resolve it identically.
+// A previous copy here meant the #1219 influence-trace fix shipped only on the
+// in-process path while the persisted path kept double-counting shared tensor
+// coefficients (#1277).
 
 pub(crate) fn build_model_summary(
     design: &gam::smooth::TermCollectionDesign,
@@ -228,7 +172,7 @@ pub(crate) fn build_model_summary(
     let mut smooth_terms = Vec::<SmoothTermSummary>::new();
     let mut penalty_cursor = 0usize;
     for (name, range) in &design.random_effect_ranges {
-        let edf = per_term_edf(fit, range.clone(), penalty_cursor, 1);
+        let edf = fit.per_term_edf(range.clone(), penalty_cursor, 1);
         penalty_cursor += 1;
         // Random-effect smooths are variance-component tests on the boundary;
         // a naive coefficient Wald χ² p-value is anti-conservative, so only EDF is reported.
@@ -248,7 +192,7 @@ pub(crate) fn build_model_summary(
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
         let term_penalty_start = penalty_cursor;
-        let edf = per_term_edf(fit, term.coeff_range.clone(), penalty_cursor, k);
+        let edf = fit.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
         penalty_cursor += k;
         let smooth_test = if term.shape == gam::smooth::ShapeConstraint::None {
             cov_forwald.and_then(|cov| {

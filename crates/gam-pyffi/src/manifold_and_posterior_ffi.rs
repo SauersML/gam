@@ -1901,12 +1901,11 @@ fn summary_smooth_terms(
 
     let mut out = Vec::<SummarySmoothTermRow>::new();
     let mut penalty_cursor = 0usize;
-    for (name, _range) in &design.random_effect_ranges {
-        let edf = fit
-            .edf_by_block()
-            .get(penalty_cursor)
-            .copied()
-            .unwrap_or(0.0);
+    for (name, range) in &design.random_effect_ranges {
+        // Per-term EDF as the influence-matrix trace over the term's coefficient
+        // block (#1219, #1277) — never the legacy per-block-EDF sum, which
+        // double-counts shared coefficients and can exceed the model total.
+        let edf = fit.per_term_edf(range.clone(), penalty_cursor, 1);
         penalty_cursor += 1;
         // Random-effect smooths are boundary variance-component tests; a naive
         // coefficient Wald χ² is anti-conservative, so only EDF is reported.
@@ -1920,11 +1919,14 @@ fn summary_smooth_terms(
     }
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
-        let edf = fit
-            .edf_by_block()
-            .get(penalty_cursor..penalty_cursor + k)
-            .map(|block: &[f64]| block.iter().sum::<f64>())
-            .unwrap_or(0.0);
+        // Per-term EDF as the influence-matrix trace over the term's coefficient
+        // block, NOT the legacy `Σ_kk edf_by_block` per-penalty sum. For a tensor
+        // product `te`/`ti` (and anisotropic / adaptive smooths) several penalty
+        // blocks span the SAME shared coefficient range, so the block-sum
+        // double-counts and reports a per-term EDF exceeding the model total and
+        // the design column count (#1219 fixed the in-process summary; #1277 is
+        // this persisted-model path the Python API reads via `summary()`).
+        let edf = fit.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
         penalty_cursor += k;
         let smooth_test = if term.shape == ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
