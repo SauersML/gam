@@ -26,34 +26,53 @@ pub fn build_spherical_spline_basis(
             found: centers.nrows(),
         });
     }
-    let raw_penalty = spherical_wahba_kernel_matrix_with_kind(
+    let center_kernel = spherical_wahba_kernel_matrix_with_kind(
         centers.view(),
         centers.view(),
         spec.penalty_order,
         spec.radians,
         spec.wahba_kernel,
     )?;
-    let low_degree_residual = wahba_low_degree_residual_projector(
+    let decomposition = wahba_low_degree_decomposition(
         centers.view(),
+        center_kernel.view(),
         spec.radians,
+    )?;
+
+    let raw_kernel_design = spherical_wahba_kernel_matrix_with_kind(
+        data,
+        centers.view(),
         spec.penalty_order,
+        spec.radians,
         spec.wahba_kernel,
     )?;
-    let mut raw_penalty = low_degree_residual
-        .dot(&raw_penalty)
-        .dot(&low_degree_residual);
-    let diag_scale =
-        raw_penalty.diag().iter().map(|v| v.abs()).sum::<f64>() / raw_penalty.nrows().max(1) as f64;
+    let raw_design = build_wahba_decomposed_design(
+        raw_kernel_design.view(),
+        data,
+        spec.radians,
+        &decomposition,
+    );
+    let mut raw_penalty = build_wahba_decomposed_penalty(center_kernel.view(), &decomposition);
+    let kernel_rank = decomposition.kernel_basis.ncols();
+    let diag_scale = if kernel_rank > 0 {
+        (0..kernel_rank)
+            .map(|i| raw_penalty[[i, i]].abs())
+            .sum::<f64>()
+            / kernel_rank as f64
+    } else {
+        0.0
+    };
     if diag_scale.is_finite() && diag_scale > 0.0 {
         // The raw finite-center chart is intentionally not coefficient-gauged.
         // Tie a small coefficient ridge to the primary RKHS penalty so REML
         // cannot disable all raw-chart stabilization by driving the separate
         // double-penalty block to zero. This damps sparse polar center leverage
         // without adding another smoothing parameter.
-        for i in 0..raw_penalty.nrows() {
+        for i in 0..kernel_rank {
             raw_penalty[[i, i]] += 0.1 * diag_scale;
         }
     }
+    let raw_width = raw_design.ncols();
     // Realized-design transform. The Wahba kernels are built without the l=0
     // spherical-harmonic mode, so an additional finite-center coefficient
     // sum-to-zero gauge is not intrinsic to the smooth and can distort sparse
@@ -62,71 +81,22 @@ pub fn build_spherical_spline_basis(
     // orthogonalization onto this transform and freezes it for prediction.
     let z = match &spec.identifiability {
         SphericalSplineIdentifiability::FrozenTransform { transform } => {
-            if transform.nrows() != centers.nrows() {
+            if transform.nrows() != raw_width {
                 crate::bail_dim_basis!(
-                    "frozen spherical identifiability transform mismatch: {} centers but transform has {} rows",
-                    centers.nrows(),
+                    "frozen spherical identifiability transform mismatch: {} raw basis columns but transform has {} rows",
+                    raw_width,
                     transform.nrows()
                 );
             }
             transform.clone()
         }
-        SphericalSplineIdentifiability::CenterSumToZero => Array2::<f64>::eye(centers.nrows()),
+        SphericalSplineIdentifiability::CenterSumToZero => Array2::<f64>::eye(raw_width),
     };
     let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]);
     let penalty = gauge.restrict_penalty(&raw_penalty);
-    // Prefer the device truncated-spectral kernel whenever
-    // `sphere_kernel_decision` reports the (n, m, lmax) workload is
-    // worth GPU dispatch — this short-circuits the CPU streaming
-    // evaluator at the same time. We still keep the streaming fallback
-    // for the (rare) case where the kernel is Sobolev/Pseudo (untruncated)
-    // or the GPU runtime refuses the call.
-    let gpu_raw_design = try_build_truncated_sphere_design_gpu(
-        data,
-        centers.view(),
-        spec.wahba_kernel,
-        spec.penalty_order,
-        spec.radians,
-    );
-    let sphere_auto_chunk = if gpu_raw_design.is_some() {
-        None
-    } else {
-        auto_streaming_chunk_size_for_dense(data.nrows(), z.ncols())
-    };
-    let design = if let Some(raw_design) = gpu_raw_design {
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            gauge.restrict_design(&raw_design),
-        ))
-    } else if let Some(chunk) = sphere_auto_chunk {
-        log::info!(
-            "Sphere basis auto-streaming evaluator: n={} p={} chunk_size={}",
-            data.nrows(),
-            z.ncols(),
-            chunk,
-        );
-        let op = StreamingSphereEvaluator::new(
-            Arc::new(data.as_standard_layout().to_owned()),
-            Arc::new(centers.clone()),
-            spec.penalty_order,
-            spec.radians,
-            spec.wahba_kernel,
-            Some(Arc::new(gauge.clone())),
-            Some(chunk),
-        )
-        .map_err(BasisError::InvalidInput)?;
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
-    } else {
-        let raw_design = spherical_wahba_kernel_matrix_with_kind(
-            data,
-            centers.view(),
-            spec.penalty_order,
-            spec.radians,
-            spec.wahba_kernel,
-        )?;
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            gauge.restrict_design(&raw_design),
-        ))
-    };
+    let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        gauge.restrict_design(&raw_design),
+    ));
     let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
     let mut candidates = vec![PenaltyCandidate {
         matrix: penalty_norm,
@@ -137,9 +107,7 @@ pub fn build_spherical_spline_basis(
         op: None,
     }];
     if spec.double_penalty {
-        let null_shrinkage =
-            &Array2::<f64>::eye(low_degree_residual.nrows()) - &low_degree_residual;
-        let null_shrinkage = (&null_shrinkage + &null_shrinkage.t()) * 0.5;
+        let null_shrinkage = build_wahba_decomposed_null_shrinkage(&decomposition);
         let ridge = gauge.restrict_penalty(&null_shrinkage);
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
