@@ -2396,6 +2396,50 @@ impl<'d> SpatialJointContext<'d> {
         Ok(())
     }
 
+    fn stage_frozen_glm_trial_statistics(
+        &mut self,
+        theta: &Array1<f64>,
+        warm_beta: Option<&Array1<f64>>,
+        allow_gradient: bool,
+    ) -> Result<(), EstimationError> {
+        let kind = self.kind;
+        let mut staged_gram: Option<Array2<f64>> = None;
+        let mut staged_deriv: Option<(Array2<f64>, Array1<f64>)> = None;
+        if theta.len() == self.rho_dim + 1 {
+            let psi = theta[self.rho_dim];
+            if let (Some(tensor), Some(beta)) = (self.frozen_glm_tensor.as_ref(), warm_beta)
+                && tensor.contains(psi)
+                && let Some((current_w, _)) = self.frozen_glm_working_state(beta)?
+            {
+                const FROZEN_GLM_WEIGHT_DRIFT_RTOL: f64 = 1e-3;
+                if tensor.weight_drift_within(current_w.view(), FROZEN_GLM_WEIGHT_DRIFT_RTOL) {
+                    staged_gram = Some(tensor.gram_at(psi));
+                    log::debug!(
+                        "[STAGE] {} trial at psi={psi:.6}: serving frozen-W GLM \
+                         first-Fisher-step XᵀWX n-free (weight drift within tol)",
+                        kind.label(),
+                    );
+                }
+                if allow_gradient
+                    && tensor.contains_for_gradient(psi)
+                    && let Some((dgram_dpsi, drhs_dpsi)) =
+                        tensor.gradient_pair_if_sound(psi, current_w.view())
+                {
+                    staged_deriv = Some((dgram_dpsi, drhs_dpsi));
+                    log::debug!(
+                        "[STAGE] {} trial at psi={psi:.6}: serving frozen-W GLM \
+                         ψ-gradient (∂G/∂ψ, ∂b/∂ψ) n-free (gradient weight drift within \
+                         tight tol); B_j stays exact",
+                        kind.label(),
+                    );
+                }
+            }
+        }
+        self.evaluator.stage_glm_first_step_gram(staged_gram);
+        self.evaluator.stage_glm_psi_gram_deriv(staged_deriv);
+        Ok(())
+    }
+
     /// Full evaluation on the current realized design + hyper_dirs.
     fn eval_full(
         &mut self,
@@ -2505,75 +2549,14 @@ impl<'d> SpatialJointContext<'d> {
         }
         let warm_beta = self.evaluator.current_beta();
         self.ensure_frozen_glm_tensor(theta, warm_beta.as_ref())?;
-        // #1111 / #1033 mechanism (c): when the certified frozen-weight GLM
-        // ψ-tensor covers this trial's ψ AND the trial's converged working
-        // weight has not drifted past tolerance from the frozen snapshot, the
-        // first Fisher-scoring iteration's XᵀWX is faithfully reproduced by the
-        // tensor's n-free k×k assembly. Stage it on the evaluator so
-        // `prepare_eval_state` installs it onto the inner REML surface (after
-        // `reset_surface`, on BOTH the slow and design-revision fast paths) —
-        // the GLM inner P-IRLS then serves its first-iteration Gram n-free
-        // instead of restreaming the dominant O(n·p²) weighted cross-product.
-        // Outside the window or past the drift tolerance we clear the slot so a
-        // stale previous-ψ Gram is never consumed; the exact stream then runs.
-        {
-            let mut staged_gram: Option<Array2<f64>> = None;
-            if theta.len() == self.rho_dim + 1 {
-                let psi = theta[self.rho_dim];
-                if let (Some(tensor), Some(beta)) =
-                    (self.frozen_glm_tensor.as_ref(), warm_beta.as_ref())
-                    && tensor.contains(psi)
-                    && let Some((current_w, _)) = self.frozen_glm_working_state(beta)?
-                {
-                    const FROZEN_GLM_WEIGHT_DRIFT_RTOL: f64 = 1e-3;
-                    if tensor.weight_drift_within(current_w.view(), FROZEN_GLM_WEIGHT_DRIFT_RTOL) {
-                        staged_gram = Some(tensor.gram_at(psi));
-                        log::debug!(
-                            "[STAGE] {} eval_full at psi={psi:.6}: serving frozen-W GLM \
-                             first-Fisher-step XᵀWX n-free (weight drift within tol)",
-                            kind.label(),
-                        );
-                    }
-                }
-            }
-            self.evaluator.stage_glm_first_step_gram(staged_gram);
-        }
-        // #1033 / #1111: stage the GLM frozen-W conditioned-frame ψ-gradient
-        // derivative `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)` whenever the certified
-        // frozen-weight tensor covers this trial's ψ for the gradient. The
-        // provider `gradient_pair_if_sound` applies its OWN tight
-        // `GRADIENT_WEIGHT_DRIFT_RTOL` (1e-9) drift check against the trial's
-        // converged working weight, so it refuses (`None`) unless the frozen-W
-        // snapshot is a bit-tight stand-in for the trial's `XᵀWX` — independent
-        // of the looser first-step value gate above. When it serves, the GLM
-        // ψ-gradient HyperCoord forms `a_j` / `g_j` from these k×k objects
-        // instead of the n×k ∂X/∂ψ slab; `B_j` (the moving-W Hessian curvature)
-        // is irreducibly n-dependent and stays the exact slab (#1033). Outside
-        // the window or past the tight tolerance we stage `None`, clearing the
-        // slot so a stale previous-ψ pair is never consumed; the exact slab
-        // gradient then runs.
-        {
-            let mut staged_deriv: Option<(Array2<f64>, Array1<f64>)> = None;
-            if !allow_second_order && theta.len() == self.rho_dim + 1 {
-                let psi = theta[self.rho_dim];
-                if let (Some(tensor), Some(beta)) =
-                    (self.frozen_glm_tensor.as_ref(), warm_beta.as_ref())
-                    && tensor.contains_for_gradient(psi)
-                    && let Some((current_w, _)) = self.frozen_glm_working_state(beta)?
-                    && let Some((dgram_dpsi, drhs_dpsi)) =
-                        tensor.gradient_pair_if_sound(psi, current_w.view())
-                {
-                    staged_deriv = Some((dgram_dpsi, drhs_dpsi));
-                    log::debug!(
-                        "[STAGE] {} eval_full at psi={psi:.6}: serving frozen-W GLM \
-                         ψ-gradient (∂G/∂ψ, ∂b/∂ψ) n-free (gradient weight drift within \
-                         tight tol); B_j stays exact",
-                        kind.label(),
-                    );
-                }
-            }
-            self.evaluator.stage_glm_psi_gram_deriv(staged_deriv);
-        }
+        // #1033 / #1111: stage the GLM frozen-W first-step Gram and conditioned
+        // ψ-gradient whenever the certified frozen-weight tensor covers this
+        // trial's ψ. The provider applies its drift guards, so misses clear the
+        // staged slots and the exact streamed path runs.
+        //
+        // Stage through a shared helper because cost-only line-search probes use
+        // the same first-Fisher-step Gram; they simply pass `allow_gradient=false`.
+        self.stage_frozen_glm_trial_statistics(theta, warm_beta.as_ref(), !allow_second_order)?;
         // #1033: reuse the ψ-invariant hyper-direction slab when the realized
         // design has not advanced (the certified Gaussian skip path never
         // re-realizes it), retiring the per-trial basis ψ-derivative + O(n·k²)
@@ -2758,9 +2741,38 @@ impl<'d> SpatialJointContext<'d> {
                 Err(_) => self.evaluator.stage_fast_path_penalty(None),
             }
         }
+        let warm_beta = self.evaluator.current_beta();
+        if let Err(err) = self.ensure_frozen_glm_tensor(theta, warm_beta.as_ref()) {
+            log::warn!(
+                "[STAGE] {} value-probe at psi={:.6}: frozen-W GLM tensor setup failed ({err}); \
+                 falling back to exact streamed Gram",
+                self.kind.label(),
+                if theta.len() > self.rho_dim {
+                    theta[self.rho_dim]
+                } else {
+                    f64::NAN
+                },
+            );
+            self.evaluator.stage_glm_first_step_gram(None);
+            self.evaluator.stage_glm_psi_gram_deriv(None);
+        } else if let Err(err) =
+            self.stage_frozen_glm_trial_statistics(theta, warm_beta.as_ref(), false)
+        {
+            log::warn!(
+                "[STAGE] {} value-probe at psi={:.6}: frozen-W GLM staging failed ({err}); \
+                 falling back to exact streamed Gram",
+                self.kind.label(),
+                if theta.len() > self.rho_dim {
+                    theta[self.rho_dim]
+                } else {
+                    f64::NAN
+                },
+            );
+            self.evaluator.stage_glm_first_step_gram(None);
+            self.evaluator.stage_glm_psi_gram_deriv(None);
+        }
         let design_revision = Some(self.cache.design_revision());
         let cost_label = self.kind.label();
-        let warm_beta = self.evaluator.current_beta();
         let result = {
             let design = self.cache.design();
             self.evaluator.evaluate_cost_only(

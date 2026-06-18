@@ -1039,19 +1039,15 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             self.reml_state
                 .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
             self.reml_state.setwarm_start_original_beta(warm_start_beta);
-            // #1111 / #1033 mechanism (c): a BFGS line-search VALUE probe runs at
-            // a DIFFERENT ψ than the full eval that staged the frozen-W first-step
-            // Gram. On the design-revision fast path `reset_surface` is skipped, so
-            // a Gram installed for a prior trial's ψ would otherwise leak into this
-            // probe's inner P-IRLS first iteration — a wrong-ψ Gram. The frozen
-            // first-step lane is gradient/full-eval-only (eval_full is the sole
-            // stager), so unconditionally clear the slot here; the probe restreams
-            // its first-iteration Gram exactly.
-            self.reml_state.clear_glm_first_step_gram();
-            // Same wrong-ψ-leak reasoning for the GLM frozen-W ψ-gradient
-            // derivative (#1033 / #1111): clear it so a prior trial's ψ pair
-            // never serves this probe's gradient; it restreams the exact slab.
-            self.reml_state.clear_glm_psi_gram_deriv();
+            // #1111 / #1033 mechanism (c): a BFGS line-search VALUE probe can
+            // carry its own ψ-keyed frozen-W first-step Gram staged by
+            // `SpatialJointContext::eval_cost`. Install that staged Gram here on
+            // the same fast path as full evals; when no current-probe value was
+            // staged, this call clears any prior ψ's slot so stale GLM statistics
+            // never leak into the probe. Cost-only probes do not consume the GLM
+            // ψ-gradient derivative, so the stager passes `None` for that slot
+            // and this call clears it as well.
+            self.install_pending_glm_trial_statistics();
             // #1033: the Gaussian-identity `gaussian_fixed_cache` is ALSO keyed to
             // the trial's ψ (the certified ψ-Gram tensor's `XᵀWX(ψ)/XᵀWz(ψ)`), and
             // a VALUE probe runs at a different ψ than the eval that installed it.
@@ -1126,6 +1122,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.last_canonical_revision = design_revision;
         // #1264: freeze the reduced-basis reference ψ this slow-path reset pins.
         self.record_reset_psi(theta, rho_dim);
+        self.install_pending_glm_trial_statistics();
         self.install_psi_gram_statistics(theta, rho_dim);
         // #1033 penalty lane: the slow cost-only path rebuilt `S` from the freshly
         // realized design — drop any staged n-free penalty so a later fast-path
