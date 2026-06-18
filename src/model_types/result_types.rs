@@ -1693,14 +1693,14 @@ impl UnifiedFitResult {
         }
         // Last resort: the legacy per-block EDF sum. Correct for disjoint penalties;
         // retained only for fits that recorded neither `F` nor per-block traces.
-        // Clamp to `[0, dim]`: a term's EDF is a sub-block trace of the influence
-        // operator and can never exceed the term's own coefficient count, so even
-        // this over-counting fallback must not report more than `dim` (without the
-        // clamp a `te`/`ti` block-sum reports e.g. 40 EDF for a 36-coefficient term
-        // and exceeds the model total — #1277).
+        // Clamp to the invariants that remain knowable without `F` or `tr_kk`:
+        // a term sub-trace cannot exceed its coefficient count or the full-model
+        // trace. Without this guard a `te`/`ti` block-sum reports e.g. 40 EDF for
+        // a 36-coefficient model with total EDF 28 (#1277).
+        let upper = self.edf_total().unwrap_or(dim).min(dim).max(0.0);
         self.edf_by_block()
             .get(penalty_cursor..penalty_cursor + k)
-            .map(|block| block.iter().sum::<f64>().clamp(0.0, dim))
+            .map(|block| block.iter().sum::<f64>().clamp(0.0, upper))
             .unwrap_or(0.0)
     }
 
