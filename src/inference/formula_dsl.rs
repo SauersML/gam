@@ -31,8 +31,9 @@ pow_op = { "^" }
 unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 
-primary = { function_call | list_lit | ident | number | string_lit | "(" ~ expr ~ ")" }
+primary = { function_call | list_lit | tuple_lit | ident | number | string_lit | "(" ~ expr ~ ")" }
 list_lit = @{ "[" ~ (!"]" ~ ANY)* ~ "]" }
+tuple_lit = @{ "(" ~ (!")" ~ ANY)* ~ "," ~ (!")" ~ ANY)* ~ ")" }
 function_call = { ident ~ "(" ~ arg_list? ~ ")" }
 arg_list = { arg ~ ("," ~ arg)* }
 arg = { named_arg | expr }
@@ -126,10 +127,9 @@ impl From<String> for FormulaDslError {
 
 pub fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String> {
     validate_balanced_delimiters(formula, "invalid formula syntax")?;
-    reject_tuple_parameter_syntax(formula, "invalid formula syntax")?;
     let mut parsed =
         FormulaParser::parse(Rule::formula, formula).map_err(|e| FormulaDslError::ParseError {
-            reason: add_tuple_parameter_hint(formula, format!("invalid formula syntax: {e}")),
+            reason: format!("invalid formula syntax: {e}"),
         })?;
     let formula_pair = parsed.next().ok_or_else(|| FormulaDslError::ParseError {
         reason: "invalid formula syntax: empty parse".to_string(),
@@ -211,128 +211,6 @@ fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String>
         .into());
     }
     Ok(())
-}
-
-fn add_tuple_parameter_hint(input: &str, reason: String) -> String {
-    match tuple_parameter_hint(input) {
-        Some(hint) => format!("{reason}\nhelp: {hint}"),
-        None => reason,
-    }
-}
-
-fn reject_tuple_parameter_syntax(input: &str, prefix: &str) -> Result<(), String> {
-    if let Some(hint) = tuple_parameter_hint(input) {
-        return Err(FormulaDslError::ParseError {
-            reason: format!("{prefix}: {hint}"),
-        }
-        .into());
-    }
-    Ok(())
-}
-
-fn is_ident_continue_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.')
-}
-
-const COMMON_SMOOTH_PARAMETER_NAMES: &[&str] = &[
-    "alpha",
-    "basis_dim",
-    "bs",
-    "by",
-    "centers",
-    "cyclic",
-    "degree",
-    "double_penalty",
-    "identifiability",
-    "k",
-    "knots",
-    "length_scale",
-    "m",
-    "nu",
-    "period",
-    "periodic",
-    "penalty_order",
-    "power",
-    "scale_dims",
-    "shape",
-    "type",
-];
-
-fn tuple_parameter_hint(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut eq_idx = 0usize;
-    while eq_idx < bytes.len() {
-        if bytes[eq_idx] != b'=' {
-            eq_idx += 1;
-            continue;
-        }
-
-        let mut key_end = eq_idx;
-        while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
-            key_end -= 1;
-        }
-        let mut key_start = key_end;
-        while key_start > 0 && is_ident_continue_byte(bytes[key_start - 1]) {
-            key_start -= 1;
-        }
-        if key_start == key_end {
-            eq_idx += 1;
-            continue;
-        }
-
-        let mut value_start = eq_idx + 1;
-        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
-            value_start += 1;
-        }
-        if value_start >= bytes.len() || bytes[value_start] != b'(' {
-            eq_idx += 1;
-            continue;
-        }
-
-        let mut depth = 1usize;
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut has_top_level_comma = false;
-        let mut close_idx = None;
-        let mut idx = value_start + 1;
-        while idx < bytes.len() {
-            let byte = bytes[idx];
-            match byte {
-                b'\'' if !in_double => in_single = !in_single,
-                b'"' if !in_single => in_double = !in_double,
-                b'(' | b'[' | b'{' if !in_single && !in_double => depth += 1,
-                b')' if !in_single && !in_double => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        close_idx = Some(idx);
-                        break;
-                    }
-                }
-                b']' | b'}' if !in_single && !in_double && depth > 1 => depth -= 1,
-                b',' if !in_single && !in_double && depth == 1 => has_top_level_comma = true,
-                _ => {}
-            }
-            idx += 1;
-        }
-
-        if let Some(close_idx) = close_idx {
-            if !has_top_level_comma {
-                eq_idx += 1;
-                continue;
-            }
-            let key = input[key_start..key_end].trim();
-            let inside = input[value_start + 1..close_idx].trim();
-            if !inside.is_empty() {
-                return Some(format!(
-                    "tuple syntax is not valid for formula parameter `{key}`; use a list literal with square brackets, e.g. `{key}=[{inside}]`. Valid smooth parameter names include: [{}]",
-                    COMMON_SMOOTH_PARAMETER_NAMES.join(", ")
-                ));
-            }
-        }
-
-        eq_idx += 1;
-    }
-    None
 }
 
 fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
@@ -796,10 +674,9 @@ fn is_exact_ident(raw: &str) -> bool {
 
 pub fn parse_function_call(input: &str) -> Result<FunctionCallSpec, String> {
     validate_balanced_delimiters(input, "invalid function call syntax")?;
-    reject_tuple_parameter_syntax(input, "invalid function call syntax")?;
     let mut parsed = FormulaParser::parse(Rule::top_function_call, input).map_err(|e| {
         FormulaDslError::ParseError {
-            reason: add_tuple_parameter_hint(input, format!("invalid function call syntax: {e}")),
+            reason: format!("invalid function call syntax: {e}"),
         }
     })?;
     let top = parsed.next().ok_or_else(|| FormulaDslError::ParseError {
@@ -1030,6 +907,14 @@ mod tests {
                 value: "['periodic', 'periodic']".to_string(),
             }
         );
+        let tuple_call = parse_function_call("te(x, y, k=(20, 12))").expect("tuple-valued k");
+        assert_eq!(
+            tuple_call.args[2],
+            CallArgSpec::Named {
+                key: "k".to_string(),
+                value: "(20, 12)".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1045,50 +930,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_formula_reports_tuple_smooth_parameter_hint() {
-        let err = parse_formula("z ~ te(x, y, k=(20, 20))")
-            .expect_err("tuple-style smooth parameter must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("tuple syntax is not valid for formula parameter `k`"),
-            "error should explain tuple-style parameter syntax, got: {msg}"
-        );
-        assert!(
-            msg.contains("`k=[20, 20]`"),
-            "error should suggest the square-bracket list syntax, got: {msg}"
-        );
-        assert!(
-            msg.contains("Valid smooth parameter names include"),
-            "error should list valid smooth parameter names, got: {msg}"
-        );
-    }
+    fn parse_formula_accepts_tuple_smooth_options() {
+        let parsed = parse_formula("z ~ te(x, y, k=(20, 20))")
+            .expect("tuple-valued smooth option should parse");
+        assert_eq!(parsed.terms.len(), 1);
 
-    #[test]
-    fn parse_formula_dsl_suggests_square_brackets_for_tuple_smooth_options() {
-        let err = parse_formula_dsl("z ~ te(x, y, k=(20, 20))")
-            .expect_err("tuple-valued smooth option should fail with a hint");
-        assert!(
-            err.contains("k=[20, 20]"),
-            "error should suggest square-bracket list syntax, got: {err}"
-        );
-        assert!(
-            err.contains("Valid smooth parameter names include"),
-            "error should list valid smooth parameter names, got: {err}"
-        );
-        assert!(
-            !err.contains("expected add_op"),
-            "tuple diagnostic should replace the generic pest operator error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_function_call_suggests_square_brackets_for_tuple_options() {
-        let err = parse_function_call("te(x, y, k=(20, 20))")
-            .expect_err("tuple-valued smooth option should fail with a hint");
-        assert!(
-            err.contains("k=[20, 20]"),
-            "error should suggest square-bracket list syntax, got: {err}"
-        );
+        let dsl = parse_formula_dsl("z ~ te(x, y, k=(20, 20))")
+            .expect("tuple-valued smooth option should parse in the DSL layer");
+        assert_eq!(dsl.rhs_terms, vec!["te(x, y, k=(20, 20))"]);
     }
 
     #[test]
