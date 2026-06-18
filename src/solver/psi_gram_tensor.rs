@@ -127,6 +127,19 @@ pub const PSI_GRAM_SKIP_RRQR_MARGIN_MIN: f64 = 16.0;
 /// sub-window at build (each probe is a k×k Gram-derived RRQR — cheap).
 pub const PSI_GRAM_SKIP_SCAN_POINTS: usize = 64;
 
+/// Maximum growth in `||X(ψ)ᵀWX(ψ)||_F` admitted inside the design-revision
+/// skip window.
+///
+/// The skip path keeps the realized REML surface pinned at the first ψ in a
+/// design revision and only re-keys k-space sufficient statistics. Matching the
+/// RRQR rank and pivot order is necessary, but #1264 showed it is not
+/// sufficient on the wide standardized Duchon window: the high-ψ end can keep
+/// the same pivot metadata while the reduced solve geometry has drifted enough
+/// to change β̂. Keep the skip in the low-ψ, well-conditioned prefix where the
+/// Gram scale remains close to the pinning surface; later trials take the full
+/// slow path.
+pub const PSI_GRAM_SKIP_FROB_GROWTH_MAX: f64 = 16.0;
+
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
 ///
 /// Holds the one-time n-pass products; every per-trial accessor is O(D²k²)
@@ -159,9 +172,10 @@ pub struct PsiGramTensor {
     /// the reduced basis are unchanged. On the WIDE standardized window (#1215)
     /// the radial-kernel frame can pivot while the conditioning ratio still looks
     /// tame, so a conditioning-only gate silently pairs a stale reduced basis
-    /// with a re-keyed Gram → a wrong β̂. This sub-window is the largest scanned
-    /// contiguous ψ-range whose Gram-derived RRQR rank and permutation match;
-    /// outside it the caller must take the full `reset_surface` slow path.
+    /// with a re-keyed Gram → a wrong β̂. This sub-window is the low-ψ prefix
+    /// whose Gram-derived RRQR rank/permutation match and whose Gram Frobenius
+    /// scale stays close to the reference; outside it the caller must take the
+    /// full `reset_surface` slow path.
     skip_psi_lo: f64,
     skip_psi_hi: f64,
     /// Original row count of the design whose Gram was tensorized. Needed to run
@@ -600,11 +614,11 @@ impl PsiGramTensor {
         }
     }
 
-    /// Locate the largest scanned RRQR-pivot-stable sub-window `[skip_psi_lo,
+    /// Locate the low-ψ, RRQR-pivot-stable skip sub-window `[skip_psi_lo,
     /// skip_psi_hi]`, and store it (#1264). The #1033 design-revision fast path
-    /// (re-key Gram + penalty on a frozen reference surface) is only sound here;
-    /// outside it the reduced basis has moved and the caller must take the full
-    /// slow path.
+    /// (re-key Gram + penalty on a frozen reference surface) is only sound in
+    /// this prefix; outside it the reduced basis or conditioning has moved and
+    /// the caller must take the full slow path.
     ///
     /// n-free: `gram_at` is k-space, and each pivot probe is a Gram-derived k×k
     /// RRQR with the tall-design rank tolerance.
@@ -615,9 +629,13 @@ impl PsiGramTensor {
             permutation: Vec<usize>,
         }
 
-        let frame_at = |me: &Self, psi: f64| -> Option<Frame> {
+        let frame_and_frob_at = |me: &Self, psi: f64| -> Option<(Frame, f64)> {
             let g = me.gram_at(psi);
             if g.iter().any(|v| !v.is_finite()) {
+                return None;
+            }
+            let frob = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if !frob.is_finite() || frob <= 0.0 {
                 return None;
             }
             let rrqr = crate::linalg::faer_ndarray::rrqr_from_gram_with_permutation(
@@ -631,10 +649,13 @@ impl PsiGramTensor {
             {
                 return None;
             }
-            Some(Frame {
-                rank: rrqr.rank,
-                permutation: rrqr.column_permutation,
-            })
+            Some((
+                Frame {
+                    rank: rrqr.rank,
+                    permutation: rrqr.column_permutation,
+                },
+                frob,
+            ))
         };
         let span = self.psi_hi - self.psi_lo;
         if !(span.is_finite() && span > 0.0) {
@@ -643,38 +664,36 @@ impl PsiGramTensor {
             return;
         }
         let n = PSI_GRAM_SKIP_SCAN_POINTS;
-        let probes: Vec<(f64, Option<Frame>)> = (0..=n)
+        let probes: Vec<(f64, Option<(Frame, f64)>)> = (0..=n)
             .map(|i| {
                 let psi = self.psi_lo + span * (i as f64) / (n as f64);
-                (psi, frame_at(self, psi))
+                (psi, frame_and_frob_at(self, psi))
             })
             .collect();
 
-        let mut best_start = None;
-        let mut best_end = None;
-        let mut best_len = 0usize;
-        let mut start = 0usize;
-        while start < probes.len() {
-            let Some(frame) = probes[start].1.as_ref() else {
-                start += 1;
-                continue;
+        let Some(start) = probes.iter().position(|(_, probe)| probe.is_some()) else {
+            self.skip_psi_lo = f64::NAN;
+            self.skip_psi_hi = f64::NAN;
+            return;
+        };
+        let Some((reference_frame, reference_frob)) = probes[start].1.as_ref() else {
+            self.skip_psi_lo = f64::NAN;
+            self.skip_psi_hi = f64::NAN;
+            return;
+        };
+        let frob_ceiling = *reference_frob * PSI_GRAM_SKIP_FROB_GROWTH_MAX;
+        let mut end = start;
+        while end + 1 < probes.len() {
+            let Some((frame, frob)) = probes[end + 1].1.as_ref() else {
+                break;
             };
-            let mut end = start;
-            while end + 1 < probes.len() && probes[end + 1].1.as_ref() == Some(frame) {
-                end += 1;
+            if frame != reference_frame || *frob > frob_ceiling {
+                break;
             }
-            let len = end - start + 1;
-            if len > best_len {
-                best_len = len;
-                best_start = Some(start);
-                best_end = Some(end);
-            }
-            start = end + 1;
+            end += 1;
         }
 
-        if let (Some(start), Some(end)) = (best_start, best_end)
-            && best_len >= 3
-        {
+        if end - start + 1 >= 3 {
             self.skip_psi_lo = probes[start].0;
             self.skip_psi_hi = probes[end].0;
         } else {
