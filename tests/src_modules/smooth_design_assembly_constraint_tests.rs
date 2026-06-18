@@ -4880,7 +4880,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         0,
         "no slow-path reset before the first eval"
     );
-    let (c_a, _g_a, beta_a) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a));
+    let (c_a, _g_a, beta_a) =
+        eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true);
     assert_eq!(
         tensor_eval.slow_path_reset_count(),
         1,
@@ -4920,7 +4921,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // Trial 2 (ψ_B): value-covered ⇒ the production gate fires the skip (no
     // slow-path reset), regardless of the basis-equality witness verdict.
     let before_b = tensor_eval.slow_path_reset_count();
-    let (c_b, _g_b, beta_b) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b));
+    let (c_b, _g_b, beta_b) =
+        eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b), false);
     let after_b = tensor_eval.slow_path_reset_count();
     assert_eq!(
         after_b - before_b,
@@ -4952,7 +4954,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
          further toward the edge"
     );
     let before_c = tensor_eval.slow_path_reset_count();
-    let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c));
+    let (c_c, _g_c, beta_c) =
+        eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c), false);
     let after_c = tensor_eval.slow_path_reset_count();
     assert_eq!(
         after_c - before_c,
