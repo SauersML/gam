@@ -2235,6 +2235,135 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
 }
 
 #[test]
+#[ignore = "debug FD-localization harness for #932/#979 flex directional third"]
+fn debug_flex_directional_quantities_fd_localize() {
+    // FD-localize WHICH directional timepoint quantity (eta_uv_dir / chi_uv_dir
+    // / d_uv_dir) disagrees with a central difference of its base counterpart
+    // along `dir`, on the zero-deviation rigid fixture where the exit timepoint
+    // depends only on (q1, g). Prints per-quantity, per-(u,v) absolute gaps.
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let event = 1.0_f64;
+    let weight = 0.75_f64;
+    let z_row = -0.2_f64;
+    let q0v = -0.4_f64;
+    let q1v = 0.6_f64;
+    let qd1v = 0.85_f64;
+    let gv = 0.32_f64;
+
+    let family = SurvivalMarginalSlopeFamily {
+        n: 1,
+        event: Arc::new(array![event]),
+        weights: Arc::new(array![weight]),
+        z: Arc::new(array![z_row].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![q1v]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+    let primary = flex_primary_slices(&family);
+    let p = primary.total;
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+    let beta_h = Array1::<f64>::zeros(h_dim);
+    let beta_w = Array1::<f64>::zeros(w_dim);
+
+    // Direction confined to (q0,q1,qd1,g); exit timepoint reads (q1, g).
+    let mut dir = Array1::<f64>::zeros(p);
+    dir[primary.q0] = 0.7;
+    dir[primary.q1] = -1.3;
+    dir[primary.qd1] = 0.5;
+    dir[primary.g] = 0.9;
+
+    // Base + directional at the EXIT timepoint.
+    let (a1, d1) = family
+        .solve_row_survival_intercept_with_slot(
+            q1v,
+            gv,
+            Some(&beta_h),
+            Some(&beta_w),
+            Some((0, SurvivalInterceptSlotKind::Exit)),
+        )
+        .expect("exit intercept");
+    let base = family
+        .compute_survival_timepoint_exact(
+            0, &primary, q1v, primary.q1, a1, gv, d1, Some(&beta_h), Some(&beta_w), 0.0, true,
+        )
+        .expect("exit base");
+    let ext = family
+        .compute_survival_timepoint_directional_exact(
+            0, &primary, q1v, primary.q1, a1, gv, Some(&beta_h), Some(&beta_w), &dir, true,
+        )
+        .expect("exit directional");
+
+    // FD of base eta_uv/chi_uv/d_uv along dir: perturb (q1,g) by ±h·dir, re-solve a.
+    let base_at = |s: f64| -> SurvivalFlexTimepointExact {
+        let q = q1v + s * dir[primary.q1];
+        let g = gv + s * dir[primary.g];
+        let (a, d) = family
+            .solve_row_survival_intercept_with_slot(
+                q,
+                g,
+                Some(&beta_h),
+                Some(&beta_w),
+                Some((0, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("perturbed exit intercept");
+        family
+            .compute_survival_timepoint_exact(
+                0, &primary, q, primary.q1, a, g, d, Some(&beta_h), Some(&beta_w), 0.0, true,
+            )
+            .expect("perturbed exit base")
+    };
+    let fd = |sel: &dyn Fn(&SurvivalFlexTimepointExact) -> f64, h: f64| -> f64 {
+        let coarse = (sel(&base_at(h)) - sel(&base_at(-h))) / (2.0 * h);
+        let fine = (sel(&base_at(h * 0.5)) - sel(&base_at(-h * 0.5))) / h;
+        (4.0 * fine - coarse) / 3.0
+    };
+
+    let g = primary.g;
+    let q1 = primary.q1;
+    let probe = [(q1, q1), (g, q1), (g, g)];
+    for &(u, v) in &probe {
+        let eta_fd = fd(&|b| b.eta_uv[[u, v]], 4e-3);
+        let chi_fd = fd(&|b| b.chi_uv[[u, v]], 4e-3);
+        let d_fd = fd(&|b| b.d_uv[[u, v]], 4e-3);
+        eprintln!(
+            "[{u},{v}] eta_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | chi_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | d_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
+            ext.eta_uv_dir[[u, v]], eta_fd, (ext.eta_uv_dir[[u, v]] - eta_fd).abs(),
+            ext.chi_uv_dir[[u, v]], chi_fd, (ext.chi_uv_dir[[u, v]] - chi_fd).abs(),
+            ext.d_uv_dir[[u, v]], d_fd, (ext.d_uv_dir[[u, v]] - d_fd).abs(),
+        );
+    }
+    // d_u_dir localization too.
+    for &u in &[q1, g] {
+        let d_u_fd = fd(&|b| b.d_u[u], 4e-3);
+        eprintln!(
+            "[{u}] d_u_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
+            ext.d_u_dir[u], d_u_fd, (ext.d_u_dir[u] - d_u_fd).abs()
+        );
+    }
+}
+
+#[test]
 fn link_flex_family_supports_second_order_exact_outer_path() {
     let score_runtime = test_deviation_runtime();
     let link_runtime = test_deviation_runtime();
