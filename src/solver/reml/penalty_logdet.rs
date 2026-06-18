@@ -227,10 +227,11 @@ impl PenaltyPseudologdet {
     /// of a single `p × p` spectral solve. When blocks overlap, falls back
     /// to assembling the full combined penalty and eigendecomposing once.
     ///
-    /// This is the preferred entry point for REML logdet computation.  No
-    /// metadata-based structural-nullity hint is consumed; the positive
-    /// eigenspace is identified purely from the assembled spectrum (see
-    /// [`Self::from_assembled`]).
+    /// This is the preferred entry point for REML logdet computation.  For
+    /// canonical penalties, the structural positive rank is computed from the
+    /// unweighted active penalty span and then applied to the current weighted
+    /// spectrum. That keeps real range-space modes active even when one lambda
+    /// is tiny relative to another same-block penalty.
     pub fn from_penalties(
         penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
@@ -571,8 +572,8 @@ impl PenaltyPseudologdet {
     /// additive `r·I` already applied to the diagonal. The caller is expected
     /// to have assembled the matrix in exactly that form.
     ///
-    /// The positive/null eigenspace split is determined entirely from the
-    /// eigenspectrum of `s_total`, with no auxiliary structural-nullity hint:
+    /// By default, the positive/null eigenspace split is determined entirely
+    /// from the eigenspectrum of `s_total`:
     ///
     /// * When `ridge` is `Some(r)`, a direction is structurally null iff its
     ///   eigenvalue is within machine-precision tolerance of `r` (i.e. the
@@ -581,15 +582,11 @@ impl PenaltyPseudologdet {
     ///   or below the relative noise floor `positive_eigenvalue_threshold`
     ///   (`100 · p · ε · max|e|`).
     ///
-    /// In both regimes the tolerance band is the only authority — there is no
-    /// supplementary `m0` parameter, no metadata cross-check, and no error
-    /// path for nullity mismatches.  When a "barely-active" eigenvalue
-    /// `λ_k σ_k < band` sits within the band, the contribution to `log|S|₊`
-    /// would be `log(r + λ_k σ_k) ≈ log r` and is dominated by the ridge
-    /// term; dropping such directions is consistent with the regularizer.
-    /// This makes the pseudo-logdet a C∞ function of ρ over the positive
-    /// eigenspace and removes the redundant metadata invariant that issues
-    /// #192 and #318 both stemmed from.
+    /// This no-hint path is kept for callers that only have an assembled
+    /// matrix. Canonical callers should prefer
+    /// [`Self::from_assembled_with_rank_hint`] when multiple active penalty
+    /// components share a block, because the current weighted spectrum can hide
+    /// small but structurally real modes below a relative threshold.
     pub fn from_assembled(s_total: Array2<f64>, ridge: Option<f64>) -> Result<Self, String> {
         Self::from_assembled_with_rank_hint(s_total, ridge, None)
     }
