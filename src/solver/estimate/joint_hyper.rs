@@ -656,8 +656,12 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // `reset_surface` work entirely. Hyper-direction conditioning still
         // runs (hyper_dirs are freshly constructed per call) and the
         // warm-start beta / penalty-shrinkage floor still need refreshing.
+        let skip_window_allows_fast_path = match (self.psi_gram_tensor.as_ref(), theta.len()) {
+            (Some(tensor), len) if len == rho_dim + 1 => tensor.contains_for_skip(theta[rho_dim]),
+            _ => true,
+        };
         let fast_path = match (design_revision, self.last_canonical_revision) {
-            (Some(rev), Some(last)) => rev == last,
+            (Some(rev), Some(last)) => rev == last && skip_window_allows_fast_path,
             _ => false,
         };
 
@@ -971,8 +975,12 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // full `reset_surface`, the cached surface's X, canonical penalties,
         // gaussian-fixed cache, and PIRLS cache are all still keyed to the
         // exact same (X, y, w, offset) — skip the eigendecomp + cache wipe.
+        let skip_window_allows_fast_path = match (self.psi_gram_tensor.as_ref(), theta.len()) {
+            (Some(tensor), len) if len == rho_dim + 1 => tensor.contains_for_skip(theta[rho_dim]),
+            _ => true,
+        };
         let fast_path = match (design_revision, self.last_canonical_revision) {
-            (Some(rev), Some(last)) => rev == last,
+            (Some(rev), Some(last)) => rev == last && skip_window_allows_fast_path,
             _ => false,
         };
         if fast_path {
