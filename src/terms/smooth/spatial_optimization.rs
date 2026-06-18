@@ -3075,7 +3075,10 @@ fn run_exact_joint_spatial_optimization(
     // off-window trials, or any other ineligibility silently keep the exact
     // streamed path (same numbers, the tensor is certified to
     // PSI_GRAM_SPOT_RTOL against the exact rebuild).
-    if coord_dim == 1 && family.is_gaussian_identity() {
+    let nfree_penalty_capable = coord_dim == 1
+        && family.is_gaussian_identity()
+        && ctx.cache.supports_nfree_penalty_rekey();
+    if nfree_penalty_capable {
         let psi_lo = lower[rho_dim];
         let psi_hi = upper[rho_dim];
         let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
@@ -3103,7 +3106,7 @@ fn run_exact_joint_spatial_optimization(
                  in-window trials assemble Gaussian sufficient statistics n-free"
             );
             // #1033 penalty lane: ψ also moves the penalty `S(ψ)` (the
-            // Duchon/Matérn Hilbert scale is an analytic function of the
+            // Duchon/ThinPlate Hilbert scale is an analytic function of the
             // length-scale, built from the FROZEN basis CENTERS — not the data
             // rows). The design-revision fast path that the Gram tensor enables
             // SKIPS `reset_surface`, the only place the canonical penalty surface
@@ -3116,30 +3119,17 @@ fn run_exact_joint_spatial_optimization(
             // Here we only DECLARE the capability to the evaluator; the per-trial
             // staging happens in `eval_full` / `eval_cost`. The skip is enabled
             // exactly when the single spatial term's frozen metadata
-            // (Duchon/Matérn/ThinPlate) admits the exact rebuild.
-            let nfree_penalty = cache.supports_nfree_penalty_rekey();
-            evaluator.set_supports_nfree_penalty_rekey(nfree_penalty);
-            if nfree_penalty {
-                log::info!(
-                    "[{label}] exact n-free ψ-penalty re-key enabled over [{psi_lo:.3}, \
-                     {psi_hi:.3}]: in-window fast-path trials rebuild S(ψ) n-free from frozen \
-                     geometry (no reset_surface)"
-                );
-            } else {
-                // The frozen geometry does not admit an exact n-free penalty
-                // rebuild (multi-term, or a non-spatial-kernel basis). The
-                // fast-path design-realization skip gates on
-                // `supports_nfree_penalty_rekey`, so it never fires and every
-                // trial keeps the slow `reset_surface` (faithful S). The Gram
-                // tensor still serves the streamed-Gram value lane on the slow
-                // path, so this only forgoes the design-realization skip — never
-                // correctness.
-                log::info!(
-                    "[{label}] exact n-free ψ-penalty re-key unavailable over [{psi_lo:.3}, \
-                     {psi_hi:.3}]; fast-path design-realization skip disabled (slow path re-keys \
-                     S exactly)"
-                );
-            }
+            // (Duchon/ThinPlate) admits the exact rebuild. Matérn deliberately
+            // does not enter this block: mixing tensor value probes with exact
+            // streamed gradients/Hessians changed its selected κ enough to miss
+            // the truth-recovery quality gate, so Matérn stays on one exact
+            // streamed objective for value, gradient, and Hessian.
+            evaluator.set_supports_nfree_penalty_rekey(true);
+            log::info!(
+                "[{label}] exact n-free ψ-penalty re-key enabled over [{psi_lo:.3}, \
+                 {psi_hi:.3}]: in-window fast-path trials rebuild S(ψ) n-free from frozen \
+                 geometry (no reset_surface)"
+            );
         } else {
             log::info!(
                 "[{label}] ψ-gram tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \
@@ -3175,9 +3165,15 @@ fn run_exact_joint_spatial_optimization(
             log::info!(
                 "[{label}] n-free Gaussian ψ-lane armed; suppressing the analytic outer \
                  Hessian and routing gradient-only (BFGS) so the κ outer loop never realizes \
-                 the O(n) second-order slab — n-independent outer loop (#1033)"
+                the O(n) second-order slab — n-independent outer loop (#1033)"
             );
         }
+    } else if coord_dim == 1 && family.is_gaussian_identity() {
+        log::info!(
+            "[{label}] exact n-free ψ-penalty re-key unavailable; skipping ψ-gram tensor \
+             attachment so value, gradient, and Hessian remain on the same exact streamed \
+             objective"
+        );
     }
 
     // ── Discriminating outer-gradient FD audit (issue #1040 / #944 merge gate) ──
