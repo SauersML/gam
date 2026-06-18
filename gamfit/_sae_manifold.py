@@ -389,6 +389,149 @@ def _fit_disjoint_periodic_top1(
     )
 
 
+def _fit_dense_periodic_ibp_lsq(
+    x: np.ndarray,
+    *,
+    bases: list[str],
+    dims: list[int],
+    assignment: str,
+    top_k: int | None,
+    penalties: list[str],
+    alpha: float,
+    learnable_alpha: bool,
+    tau: float,
+    sparsity_strength: float,
+    smoothness: float,
+    learning_rate: float,
+    max_iter: int,
+    random_state: int,
+    assignment_label: str,
+    jumprelu_threshold: float,
+) -> "ManifoldSAE | None":
+    """Dense IBP periodic dictionary fit from PCA-phase coordinates plus LSQ."""
+    k_atoms = len(bases)
+    n_obs, p_out = x.shape
+    if (
+        k_atoms < 2
+        or p_out < 2 * k_atoms
+        or top_k is not None
+        or assignment != "ibp_map"
+        or learnable_alpha
+        or any(b != "periodic" for b in bases)
+    ):
+        return None
+    harmonics = [max(1, int(d)) for d in dims]
+    basis_sizes = [2 * h + 1 for h in harmonics]
+    if not (alpha > 0.0 and tau > 0.0):
+        return None
+
+    centered = x - x.mean(axis=0, keepdims=True)
+    try:
+        _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    if vt.shape[0] < 2 * k_atoms:
+        return None
+
+    ratio = alpha / (alpha + 1.0)
+    priors = np.asarray([ratio ** k for k in range(k_atoms)], dtype=float)
+    gate_level = 1.0 / (1.0 + np.exp(-6.0))
+    assignments = np.tile(priors * gate_level, (n_obs, 1))
+    logits = np.full((n_obs, k_atoms), 6.0 * tau, dtype=float)
+
+    coords: list[np.ndarray] = []
+    phi_blocks: list[np.ndarray] = []
+    for atom_idx in range(k_atoms):
+        pair = centered @ vt[2 * atom_idx : 2 * atom_idx + 2].T
+        phase = np.arctan2(pair[:, 1], pair[:, 0]) / (2.0 * np.pi)
+        phase = phase - np.floor(phase)
+        coord = np.ascontiguousarray(phase.reshape(-1, 1))
+        coords.append(coord)
+        phi = np.asarray(
+            rust_module().basis_with_jet(
+                "periodic",
+                coord,
+                {"n_harmonics": harmonics[atom_idx]},
+            )[0],
+            dtype=float,
+        )
+        if phi.shape != (n_obs, basis_sizes[atom_idx]) or not np.all(np.isfinite(phi)):
+            return None
+        phi_blocks.append(np.ascontiguousarray(phi))
+
+    design = np.concatenate(
+        [phi_blocks[k] * assignments[:, [k]] for k in range(k_atoms)],
+        axis=1,
+    )
+    if not np.all(np.isfinite(design)):
+        return None
+    try:
+        coef, *_ = np.linalg.lstsq(design, x, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    fitted = design @ coef
+    if not np.all(np.isfinite(fitted)):
+        return None
+
+    decoder_blocks: list[np.ndarray] = []
+    offset = 0
+    for m in basis_sizes:
+        decoder_blocks.append(np.ascontiguousarray(coef[offset : offset + m]))
+        offset += m
+
+    score = float(rust_module().sae_manifold_reconstruction_r2(x, fitted))
+    if not np.isfinite(score):
+        return None
+    payload = {
+        "atoms": [
+            {
+                "decoder_B": decoder_blocks[k],
+                "basis_kind": "periodic",
+                "assignments_z": assignments[:, k],
+                "on_atom_coords_t": coords[k],
+                "active_dim": 1,
+            }
+            for k in range(k_atoms)
+        ],
+        "assignments_z": assignments,
+        "logits": logits,
+        "fitted": fitted,
+        "reml_score": score,
+        "chosen_k": k_atoms,
+        "atom_plans": [
+            {
+                "kind": "periodic",
+                "latent_dim": 1,
+                "n_harmonics": harmonics[k],
+                "basis_size": basis_sizes[k],
+                "duchon_centers": None,
+            }
+            for k in range(k_atoms)
+        ],
+        "dispersion": float(np.mean(np.square(x - fitted))),
+        "diagnostics": _closed_form_trust_diagnostics(assignments),
+        "oos_projection_top1": False,
+    }
+    return ManifoldSAE.from_payload(
+        x,
+        payload,
+        _topology_for_bases(bases),
+        assignment,
+        penalties,
+        alpha=alpha,
+        learnable_alpha=learnable_alpha,
+        assignment_label=assignment_label,
+        tau=tau,
+        sparsity_strength=sparsity_strength,
+        smoothness=smoothness,
+        learning_rate=learning_rate,
+        max_iter=max_iter,
+        random_state=random_state,
+        top_k=top_k,
+        jumprelu_threshold=jumprelu_threshold,
+    )
+
+
 def _functional_basis_params(plan: Mapping[str, Any]) -> dict[str, Any] | None:
     kind = str(plan["kind"]).lower().replace("-", "_")
     if kind in {"periodic", "periodic_spline", "circle"}:
@@ -2843,6 +2986,26 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         )
         if separable_fit is not None:
             return separable_fit
+        dense_periodic_fit = _fit_dense_periodic_ibp_lsq(
+            x,
+            bases=[str(b) for b in bases],
+            dims=[int(d) for d in dims],
+            assignment=str(kind),
+            top_k=top_k_arg,
+            penalties=penalties,
+            alpha=float(alpha_value),
+            learnable_alpha=bool(alpha == "auto"),
+            tau=float(tau),
+            sparsity_strength=float(sparsity),
+            smoothness=float(smoothness),
+            learning_rate=float(effective_lr),
+            max_iter=int(max_iter_total),
+            random_state=int(random_state),
+            assignment_label=str(assignment),
+            jumprelu_threshold=float(jumprelu_threshold),
+        )
+        if dense_periodic_fit is not None:
+            return dense_periodic_fit
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
         [str(b) for b in bases],
