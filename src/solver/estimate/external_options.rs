@@ -83,10 +83,27 @@ pub(crate) fn resolve_external_family(
     family: &crate::types::LikelihoodSpec,
     firth_override: Option<bool>,
 ) -> Result<(GlmLikelihoodSpec, bool), EstimationError> {
-    if family.is_royston_parmar() {
+    let external_glm_supported = match (&family.response, family.link_function()) {
+        (ResponseFamily::Gaussian, LinkFunction::Identity)
+        | (ResponseFamily::Poisson, LinkFunction::Log)
+        | (ResponseFamily::Gamma, LinkFunction::Log)
+        | (ResponseFamily::Tweedie { .. }, LinkFunction::Log)
+        | (ResponseFamily::NegativeBinomial { .. }, LinkFunction::Log)
+        | (ResponseFamily::Binomial, LinkFunction::Logit)
+        | (ResponseFamily::Binomial, LinkFunction::Probit)
+        | (ResponseFamily::Binomial, LinkFunction::CLogLog)
+        | (ResponseFamily::Binomial, LinkFunction::Sas)
+        | (ResponseFamily::Binomial, LinkFunction::BetaLogistic) => true,
+        (ResponseFamily::Beta { .. }, LinkFunction::Logit) => false,
+        _ => false,
+    };
+    if !external_glm_supported {
         crate::bail_invalid_estim!(
-            "optimize_external_design does not support RoystonParmar; use survival training APIs"
-                .to_string(),
+            "optimize_external_design requires a supported standard GLM family/link; got {}. \
+             The external-design route supports Gaussian(identity), Binomial(logit/probit/cloglog/SAS/Beta-Logistic), \
+             and Poisson/Gamma/Tweedie/Negative-Binomial(log). Beta regression is a dispersion-family model; \
+             use the formula location-scale route with noise_formula for Beta precision modeling",
+            family.pretty_name(),
         );
     }
 
@@ -103,10 +120,6 @@ pub(crate) fn resolve_external_family(
             crate::bail_invalid_estim!("optimize_external_design requires a GLM family; Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases"
                     .to_string(),);
         }
-    }
-    if matches!(family.response, ResponseFamily::RoystonParmar) {
-        crate::bail_invalid_estim!("optimize_external_design requires a GLM family; RoystonParmar is survival-specific and not a GLM likelihood"
-                .to_string(),);
     }
     Ok((
         GlmLikelihoodSpec::canonical(family.clone()),

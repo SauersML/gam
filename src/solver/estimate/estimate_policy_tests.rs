@@ -709,6 +709,24 @@ fn resolve_external_family_rejects_unsupported_firth_request() {
 }
 
 #[test]
+fn resolve_external_family_rejects_beta_regression_route() {
+    let err = resolve_external_family(
+        &LikelihoodSpec::new(
+            ResponseFamily::Beta { phi: 5.0 },
+            InverseLink::Standard(StandardLink::Logit),
+        ),
+        None,
+    )
+    .expect_err("external-design policy should reject beta regression");
+    let message = err.to_string();
+    assert!(
+        message.contains("supported standard GLM family/link")
+            && message.contains("Beta regression is a dispersion-family model"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
 fn resolve_external_family_accepts_supported_nonlogit_firth_request() {
     let (_, firth) = resolve_external_family(
         &LikelihoodSpec::new(
