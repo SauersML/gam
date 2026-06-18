@@ -42,11 +42,17 @@ fn bspline_double_penalty_does_not_inflate_linear_edf() {
 
     let mut edf_on = Vec::new();
     let mut edf_off = Vec::new();
+    // degree=2 keeps this regression on the sparse-native REML P-spline path.
+    // The exact spline-scan route is deliberately single-penalty, so the
+    // double_penalty=false arm would otherwise bypass the EDF code under test.
     for seed in 0..5 {
         let data = linear_dataset(seed, 800);
-        edf_on.push(fit_edf("y ~ s(x, k=20, bs=ps, double_penalty=True)", &data));
+        edf_on.push(fit_edf(
+            "y ~ s(x, k=20, bs=ps, degree=2, double_penalty=True)",
+            &data,
+        ));
         edf_off.push(fit_edf(
-            "y ~ s(x, k=20, bs=ps, double_penalty=False)",
+            "y ~ s(x, k=20, bs=ps, degree=2, double_penalty=False)",
             &data,
         ));
     }
