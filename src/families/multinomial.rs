@@ -210,6 +210,7 @@ const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 /// refit. Keep enough iterations for ordinary interior fits to certify quickly,
 /// but hand slow/non-interior probes to the proper-prior refit promptly.
 const MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER: usize = 20;
+const MULTINOMIAL_FIRTH_REFIT_OUTER_MAX_ITER: usize = 20;
 
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
@@ -1323,6 +1324,10 @@ pub fn fit_penalized_multinomial_formula(
     unbiased_probe_options.outer_max_iter = unbiased_probe_options
         .outer_max_iter
         .min(MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER);
+    let mut firth_refit_options = options.clone();
+    firth_refit_options.outer_max_iter = firth_refit_options
+        .outer_max_iter
+        .min(MULTINOMIAL_FIRTH_REFIT_OUTER_MAX_ITER);
 
     let fit = match fit_custom_family_with_rho_prior(
         &family,
@@ -1349,7 +1354,7 @@ pub fn fit_penalized_multinomial_formula(
             fit_custom_family_with_rho_prior(
                 &firth_family,
                 &blocks,
-                &options,
+                &firth_refit_options,
                 crate::types::RhoPrior::Flat,
             )
             .map_err(|err| {
