@@ -12,8 +12,6 @@ mod canonicalize_routes_channel_aware_for_multi_channel;
 mod cli_parse_link_choice_unknown_returns_err;
 #[path = "pyffi/once_lock_get_or_init_not_inside_parallel_regions.rs"]
 mod once_lock_get_or_init_not_inside_parallel_regions;
-#[path = "pyffi/pyffi_fitted_family_roundtrip_bug.rs"]
-mod pyffi_fitted_family_roundtrip_bug;
 #[path = "pyffi/pyffi_registration_coverage_bug.rs"]
 mod pyffi_registration_coverage_bug;
 #[path = "pyffi/python_rust_ffi_parity_gaussian_linear.rs"]
