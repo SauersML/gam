@@ -3281,29 +3281,31 @@ mod empirical_flex_jet_oracle_tests {
         EmpiricalZGrid::new(nodes, weights, "empirical flex jet oracle").expect("valid grid")
     }
 
-    /// Build a `DeviationRuntime` over a small knot range; the constant
-    /// smoothness-nullspace drop yields a low-dimensional, well-conditioned
-    /// cubic basis for the independent finite-difference witness.
+    /// Build a `DeviationRuntime` over a small knot range; the smoothness-
+    /// nullspace drop yields a low-dimensional, well-conditioned cubic basis
+    /// for the independent finite-difference witness.
     fn build_runtime() -> DeviationRuntime {
-        // Degree-3 I-spline needs >=8 knots; 8 uniform knots over [-2.5, 2.5]
-        // keep the basis low-dimensional and well-conditioned for this
-        // row-local oracle.
-        let knots = Array1::from_vec(vec![
-            -2.5_f64,
-            -1.785_714_3,
-            -1.071_428_6,
-            -0.357_142_9,
-            0.357_142_9,
-            1.071_428_6,
-            1.785_714_3,
-            2.5,
-        ]);
-        // Order-1 smoothness penalty: its null space (the constants) is the
-        // non-trivial direction `try_new` drops for location-block absorption.
-        // An order-2 penalty over this knot basis is full-rank here (no
-        // null directions to drop), so `try_new` rejects it — the fixture must
-        // request the order that leaves an absorbable null space.
-        DeviationRuntime::try_new(knots, 0.0, 1).expect("deviation runtime")
+        // 11 uniform knots over [-2.5, 2.5] (10 spans). The cubic I-spline
+        // DEVIATION basis is built from strictly-monotone increments, so its
+        // span contains NO constant and NO linear function. An order-`m`
+        // smoothness penalty's null space is the polynomials of degree `< m`:
+        //   - order 1 (null = constants)  -> NOT in the I-spline span -> the raw
+        //     penalty is full-rank -> `smoothness_nullspace_orthogonal_complement`
+        //     finds nothing to drop and `try_new` rejects it;
+        //   - order 2 (null = linears)    -> likewise NOT in the span -> rejected;
+        //   - order 3 (null = quadratics) -> quadratics ARE in the cubic span,
+        //     giving a genuine 3-dim droppable null space for location-block
+        //     absorption.
+        // Order 3 is therefore the ONLY mathematically valid order for an
+        // I-spline value basis — do NOT flip this back to 1 or 2 (both panic
+        // with "smoothness penalty has no null directions"). 10 spans leave
+        // ~7 columns after the 3-dim drop, comfortably enough for the oracle's
+        // q/b/deviation axes.
+        let n_knots = 11usize;
+        let knots = Array1::from_iter((0..n_knots).map(|i| {
+            -2.5_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)
+        }));
+        DeviationRuntime::try_new(knots, 0.0, 3).expect("deviation runtime")
     }
 
     fn make_fixture(is_score_warp: bool) -> FlexFixture {
