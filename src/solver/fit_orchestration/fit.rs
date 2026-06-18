@@ -184,10 +184,13 @@ pub(crate) fn fit_standard_model(
             &request.options,
         )
         .map_err(|e| e.to_string())?;
+        let resolvedspec =
+            crate::smooth::freeze_term_collection_from_design(&request.spec, &fitted.design)
+                .map_err(|e| e.to_string())?;
         crate::terms::smooth::FittedTermCollectionWithSpec {
             fit: fitted.fit,
             design: fitted.design,
-            resolvedspec: request.spec.clone(),
+            resolvedspec,
             adaptive_diagnostics: fitted.adaptive_diagnostics,
             kappa_timing: None,
         }

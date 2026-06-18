@@ -67,7 +67,7 @@ use crate::smooth::{
     build_term_collection_design,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_latent_coord_optimization,
-    fit_term_collectionwith_spatial_length_scale_optimization,
+    fit_term_collectionwith_spatial_length_scale_optimization, freeze_term_collection_from_design,
 };
 
 use crate::solver::latent_cache::LatentRetractionRegistry;
