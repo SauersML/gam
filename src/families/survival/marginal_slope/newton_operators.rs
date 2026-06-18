@@ -173,10 +173,11 @@ impl SurvivalMarginalSlopeFamily {
                         &primary,
                     )?
                     .2;
-                let u_d = self.row_primary_direction_from_flat_dynamic(
+                let u_d = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
                     row,
                     block_states,
                     &slices,
+                    q_geom,
                     d_beta_flat,
                 )?;
                 let mut t_ud =
@@ -232,10 +233,20 @@ impl SurvivalMarginalSlopeFamily {
             .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
                 let (state, q_geom) = &mut acc;
                 self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
-                let ud =
-                    self.row_primary_direction_from_flat_dynamic(row, block_states, &slices, d_u)?;
-                let ue =
-                    self.row_primary_direction_from_flat_dynamic(row, block_states, &slices, d_v)?;
+                let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                    row,
+                    block_states,
+                    &slices,
+                    q_geom,
+                    d_u,
+                )?;
+                let ue = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                    row,
+                    block_states,
+                    &slices,
+                    q_geom,
+                    d_v,
+                )?;
                 let mut q_de =
                     self.row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
                 let t_d = self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;

@@ -176,13 +176,30 @@ impl SurvivalMarginalSlopeFamily {
         slices: &BlockSlices,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+            row,
+            block_states,
+            slices,
+            &q_geom,
+            d_beta_flat,
+        )
+    }
+
+    pub(crate) fn row_primary_direction_from_flat_dynamic_with_q_geometry(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
         let flex_primary = self
             .effective_flex_active(block_states)?
             .then(|| flex_primary_slices(self));
         let mut out = Array1::<f64>::zeros(flex_primary.as_ref().map_or(N_PRIMARY, |p| p.total));
         let d_time = d_beta_flat.slice(s![slices.time.clone()]);
         let d_marginal = d_beta_flat.slice(s![slices.marginal.clone()]);
-        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
 
         let q0_dir = q_geom.dq0_time.dot(&d_time) + q_geom.dq0_marginal.dot(&d_marginal);
         let q1_dir = q_geom.dq1_time.dot(&d_time) + q_geom.dq1_marginal.dot(&d_marginal);

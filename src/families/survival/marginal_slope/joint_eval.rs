@@ -837,10 +837,11 @@ impl SurvivalMarginalSlopeFamily {
                         &q_geom,
                         &primary,
                     )?;
-                    let u_d = self.row_primary_direction_from_flat_dynamic(
+                    let u_d = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
                         row,
                         block_states,
                         &slices,
+                        &q_geom,
                         d_beta_flat,
                     )?;
                     let t_ud =
@@ -1462,10 +1463,11 @@ impl SurvivalMarginalSlopeFamily {
                             &primary,
                         )?
                         .2;
-                    let u_d = self.row_primary_direction_from_flat_dynamic(
+                    let u_d = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
                         row,
                         block_states,
                         &slices,
+                        &q_geom,
                         d_beta_flat,
                     )?;
                     let t_ud =
@@ -1543,16 +1545,18 @@ impl SurvivalMarginalSlopeFamily {
                 || Array2::<f64>::zeros((p_total, p_total)),
                 |mut acc, row| -> Result<Array2<f64>, String> {
                     let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    let ud = self.row_primary_direction_from_flat_dynamic(
+                    let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
                         row,
                         block_states,
                         &slices,
+                        &q_geom,
                         d_u,
                     )?;
-                    let ue = self.row_primary_direction_from_flat_dynamic(
+                    let ue = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
                         row,
                         block_states,
                         &slices,
+                        &q_geom,
                         d_v,
                     )?;
                     let q_de =
