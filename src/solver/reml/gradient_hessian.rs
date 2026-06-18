@@ -3604,6 +3604,7 @@ impl<'a> RemlState<'a> {
             gaussian_psi_gram_deriv: RwLock::new(None),
             glm_psi_gram_deriv: RwLock::new(None),
             glm_first_step_gram: RwLock::new(None),
+            flat_glm_first_step_gram: RwLock::new(None),
             alo_frozen_nuisance: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
             persistent_latent_values_fingerprint: None,
@@ -3671,6 +3672,9 @@ impl<'a> RemlState<'a> {
         // The frozen-W GLM first-step Gram is keyed to the same design + ψ; a
         // new design invalidates it. The installing trial repopulates it.
         *self.glm_first_step_gram.write().unwrap() = None;
+        // The flat-warm-start GLM first-step Gram is keyed to the previous
+        // surface's design and warm β; a surface reset invalidates both.
+        *self.flat_glm_first_step_gram.write().unwrap() = None;
         *self.alo_frozen_nuisance.write().unwrap() = None;
         *self.persistent_warm_start_key.write().unwrap() = None;
         self.persistent_warm_start_loaded
@@ -4319,6 +4323,7 @@ impl<'a> RemlState<'a> {
         }
         match pr.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
+                self.update_flat_glm_first_step_gram_from(pr);
                 let frame_was_original = matches!(
                     pr.coordinate_frame,
                     pirls::PirlsCoordinateFrame::OriginalSparseNative
@@ -4415,6 +4420,41 @@ impl<'a> RemlState<'a> {
                 // accounting), so we only clear predictor state here.
                 self.clear_warm_start_predictor_state();
             }
+        }
+    }
+
+    fn update_flat_glm_first_step_gram_from(&self, pr: &PirlsResult) {
+        if self.config.firth_bias_reduction
+            || matches!(reml_spec(&self.config.likelihood).response, ResponseFamily::Gaussian)
+            || pr.cache_compacted
+            || pr.reparam_result.s_transformed.nrows()
+                != pr.penalized_hessian_transformed.nrows()
+            || pr.reparam_result.s_transformed.ncols()
+                != pr.penalized_hessian_transformed.ncols()
+        {
+            *self.flat_glm_first_step_gram.write().unwrap() = None;
+            return;
+        }
+
+        let mut gram_transformed = pr.penalized_hessian_transformed.to_dense();
+        gram_transformed -= &pr.reparam_result.s_transformed;
+        crate::matrix::symmetrize_in_place(&mut gram_transformed);
+
+        let mut gram_original = match pr.coordinate_frame {
+            pirls::PirlsCoordinateFrame::OriginalSparseNative => gram_transformed,
+            pirls::PirlsCoordinateFrame::TransformedQs => {
+                let left = crate::faer_ndarray::fast_ab(&pr.reparam_result.qs, &gram_transformed);
+                crate::faer_ndarray::fast_ab(&left, &pr.reparam_result.qs.t().to_owned())
+            }
+        };
+        crate::matrix::symmetrize_in_place(&mut gram_original);
+        if gram_original.nrows() == self.p
+            && gram_original.ncols() == self.p
+            && gram_original.iter().all(|value| value.is_finite())
+        {
+            *self.flat_glm_first_step_gram.write().unwrap() = Some(Arc::new(gram_original));
+        } else {
+            *self.flat_glm_first_step_gram.write().unwrap() = None;
         }
     }
 
@@ -5373,6 +5413,14 @@ impl<'a> RemlState<'a> {
             .map(Arc::clone)
     }
 
+    pub(crate) fn flat_glm_first_step_gram(&self) -> Option<Arc<ndarray::Array2<f64>>> {
+        self.flat_glm_first_step_gram
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+    }
+
     /// Install the conditioned-frame exact ψ-derivative pair
     /// `(∂XᵀWX/∂ψ, ∂XᵀW(y−offset)/∂ψ)` for the single design-moving spatial
     /// hyperparameter (#1033b). Shapes must match the current `p` (k×k Gram
@@ -6057,7 +6105,20 @@ impl<'a> RemlState<'a> {
             // (installed by the spatial GLM ψ-trial when it covers ψ and the
             // working weight has not drifted) serves the GLM inner P-IRLS first
             // iteration's XᵀWX n-free.
-            let glm_first_step_handle = self.glm_first_step_gram();
+            let staged_glm_first_step_handle = self.glm_first_step_gram();
+            let flat_glm_first_step_handle = if staged_glm_first_step_handle.is_none()
+                && !in_screening
+                && !config.firth_bias_reduction
+                && warm_start_ref.is_some()
+                && (predicted_warm_start.is_none()
+                    || matches!(prediction_source, Some(WarmStartPredictionSource::Flat)))
+            {
+                self.flat_glm_first_step_gram()
+            } else {
+                None
+            };
+            let glm_first_step_handle =
+                staged_glm_first_step_handle.or(flat_glm_first_step_handle);
             let problem = pirls::PirlsProblem {
                 x: &self.x,
                 offset: self.offset.view(),

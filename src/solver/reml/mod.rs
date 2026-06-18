@@ -4767,6 +4767,16 @@ pub(crate) struct RemlState<'a> {
     /// own slot, consumed once per inner solve. Invalidated with the design in
     /// `reset_surface`.
     pub(crate) glm_first_step_gram: RwLock<Option<Arc<ndarray::Array2<f64>>>>,
+    /// Previous successful non-Gaussian fixed-design data-fit Gram `XᵀWX` in
+    /// the conditioned original frame, keyed to `warm_start_beta`.
+    ///
+    /// When the next outer trial uses a flat warm start, its first PIRLS
+    /// curvature build evaluates at the same `η = Xβ` as the previous converged
+    /// solve, so the Hessian weights and `XᵀWX` are identical. Reusing this
+    /// original-frame Gram skips one dense `O(n·p²)` pass per warm-started
+    /// trial while still letting later PIRLS iterations restream the moving
+    /// weights. IFT/tangent-predicted starts do not consume this cache.
+    pub(crate) flat_glm_first_step_gram: RwLock<Option<Arc<ndarray::Array2<f64>>>>,
     /// Frozen ALO robustness weights for this REML surface.
     ///
     /// The PSIS influence scale is a non-smooth function of the current hat
