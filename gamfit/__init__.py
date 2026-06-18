@@ -300,6 +300,7 @@ from ._sae_manifold import (
     gumbel_linear_schedule,
     gumbel_reciprocal_iter_schedule,
     plot,
+    sae_ev_vs_k_frontier,
     sae_manifold_fit,
 )
 from ._sae_viz import plot_atom, plot_fit

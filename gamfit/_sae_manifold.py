@@ -10,6 +10,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from ._binding import rust_module
+from ._linear_dictionary import linear_dictionary_fit
 from ._penalty_bridge import (
     GumbelTemperatureSchedule,
     validate_gumbel_schedule_fields as _validate_gumbel_schedule_fields,
@@ -739,6 +740,171 @@ def wager_verdict(
         }
     )
     return result
+
+
+def _frontier_reconstruction_ev(x: np.ndarray, fitted: np.ndarray) -> float:
+    x = _as_2d_float(x, "X")
+    fitted = _as_2d_float(fitted, "fitted")
+    if fitted.shape != x.shape:
+        raise ValueError(
+            "fitted reconstruction must have the same shape as X; "
+            f"got fitted={fitted.shape}, X={x.shape}"
+        )
+    ss_res = float(np.sum((x - fitted) ** 2))
+    ss_tot = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
+    return 1.0 - ss_res / max(ss_tot, 1.0e-12)
+
+
+def _frontier_k_values(k_values: Any) -> list[int]:
+    try:
+        values = [int(k) for k in k_values]
+    except TypeError as exc:
+        raise ValueError("k_values must be a non-empty iterable of positive integers") from exc
+    if not values:
+        raise ValueError("k_values must contain at least one K")
+    if any(k <= 0 for k in values):
+        raise ValueError(f"k_values must be positive; got {values}")
+    if len(set(values)) != len(values):
+        raise ValueError(f"k_values must not contain duplicates; got {values}")
+    return values
+
+
+def _frontier_basis_for_k(hybrid_atom_basis: Any, k: int) -> list[str]:
+    if callable(hybrid_atom_basis):
+        raw = hybrid_atom_basis(k)
+    elif isinstance(hybrid_atom_basis, Mapping):
+        if k not in hybrid_atom_basis:
+            raise ValueError(
+                f"hybrid_atom_basis is missing an explicit basis plan for K={k}"
+            )
+        raw = hybrid_atom_basis[k]
+    else:
+        raw = hybrid_atom_basis
+    if isinstance(raw, str):
+        raise ValueError(
+            "hybrid_atom_basis must resolve to a per-atom basis list, not a "
+            f"scalar basis {raw!r}; pass one basis name per atom so the curved "
+            "plus linear-tail split is explicit"
+        )
+    basis = [str(v) for v in raw]
+    if len(basis) != k:
+        raise ValueError(
+            f"hybrid_atom_basis for K={k} must contain exactly {k} entries; "
+            f"got {len(basis)}"
+        )
+    return basis
+
+
+def _frontier_d_atom_for_k(d_atom: Any, k: int) -> Any:
+    if callable(d_atom):
+        raw = d_atom(k)
+    elif isinstance(d_atom, Mapping):
+        if k not in d_atom:
+            raise ValueError(f"d_atom is missing an explicit entry for K={k}")
+        raw = d_atom[k]
+    else:
+        raw = d_atom
+    if isinstance(raw, int):
+        if raw < 1:
+            raise ValueError(f"d_atom for K={k} must be >= 1; got {raw}")
+        return int(raw)
+    dims = [int(d) for d in raw]
+    if len(dims) != k or any(d < 1 for d in dims):
+        raise ValueError(
+            f"d_atom for K={k} must be an int >= 1 or a length-{k} "
+            f"positive sequence; got {raw!r}"
+        )
+    return dims
+
+
+def sae_ev_vs_k_frontier(
+    train: Any,
+    test: Any,
+    k_values: Any,
+    *,
+    hybrid_atom_basis: Any,
+    d_atom: Any = 1,
+    sae_fit_kwargs: Mapping[str, Any] | None = None,
+    linear_fit_kwargs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure the held-out hybrid-vs-linear EV-vs-K frontier (#1026).
+
+    ``train`` and ``test`` are explicit disjoint activation matrices. For every
+    requested ``K``, this fits:
+
+    * a manifold SAE whose per-atom basis plan comes from
+      ``hybrid_atom_basis`` (a mapping ``K -> list[str]`` or callable
+      ``K -> list[str]``), so the curved plus linear-tail split is explicit;
+    * the Rust-backed pure-linear dictionary at the same ``K``.
+
+    The returned frontier is scored only on ``test`` with frozen fitted
+    decoders. It includes the existing #1026 knee selection and wager verdict so
+    a corpus can report whether the hybrid reaches the linear ceiling at lower
+    dictionary size.
+    """
+    x_train = _as_2d_float(train, "train")
+    x_test = _as_2d_float(test, "test")
+    if x_train.shape[1] != x_test.shape[1]:
+        raise ValueError(
+            "train and test must have the same feature dimension; "
+            f"got train p={x_train.shape[1]}, test p={x_test.shape[1]}"
+        )
+    ks = _frontier_k_values(k_values)
+    sae_kwargs = {} if sae_fit_kwargs is None else dict(sae_fit_kwargs)
+    linear_kwargs = {} if linear_fit_kwargs is None else dict(linear_fit_kwargs)
+
+    basis_by_k = {k: _frontier_basis_for_k(hybrid_atom_basis, k) for k in ks}
+    d_atom_by_k = {k: _frontier_d_atom_for_k(d_atom, k) for k in ks}
+
+    rows: list[dict[str, Any]] = []
+    hybrid_ev_by_k: dict[int, float] = {}
+    linear_ev_by_k: dict[int, float] = {}
+    for k in ks:
+        basis = basis_by_k[k]
+        dims = d_atom_by_k[k]
+
+        hybrid_model = sae_manifold_fit(
+            x_train,
+            K=k,
+            d_atom=dims,
+            atom_basis=basis,
+            **sae_kwargs,
+        )
+        hybrid_fitted = hybrid_model.predict(x_test)
+        hybrid_ev = _frontier_reconstruction_ev(x_test, hybrid_fitted)
+
+        linear_model = linear_dictionary_fit(x_train, K=k, **linear_kwargs)
+        linear_codes = linear_model.transform(x_test)
+        linear_fitted = linear_model.reconstruct(linear_codes)
+        linear_ev = _frontier_reconstruction_ev(x_test, linear_fitted)
+
+        hybrid_ev_by_k[k] = float(hybrid_ev)
+        linear_ev_by_k[k] = float(linear_ev)
+        rows.append(
+            {
+                "K": int(k),
+                "hybrid_ev": float(hybrid_ev),
+                "linear_ev": float(linear_ev),
+                "hybrid_minus_linear": float(hybrid_ev - linear_ev),
+                "hybrid_basis": list(basis),
+                "hybrid_chosen_k": int(hybrid_model.chosen_k),
+                "hybrid_atom_topologies": list(hybrid_model.atom_topologies),
+                "hybrid_split": (
+                    None
+                    if hybrid_model.hybrid_split is None
+                    else dict(hybrid_model.hybrid_split)
+                ),
+                "linear_top_k": int(linear_model.top_k),
+            }
+        )
+
+    return {
+        "rows": rows,
+        "hybrid": hybrid_ev_by_k,
+        "linear": linear_ev_by_k,
+        "knee": ev_knee_k(hybrid_ev_by_k, return_details=True),
+        "verdict": wager_verdict(hybrid_ev_by_k, linear_ev_by_k),
+    }
 
 
 def _weighted_row_mean(rows: np.ndarray, weights: np.ndarray | None) -> np.ndarray | None:
@@ -3510,4 +3676,4 @@ def plot(atom: Any, **kwargs: Any) -> Any:
 
 __all__ = ["GumbelTemperatureSchedule", "ManifoldSAE", "SaeManifoldAtomFit", "SaeManifoldFitResult",
            "gumbel_geometric_schedule", "gumbel_linear_schedule", "gumbel_reciprocal_iter_schedule",
-           "align", "featurize", "fit", "plot", "sae_manifold_fit"]
+           "align", "featurize", "fit", "plot", "sae_ev_vs_k_frontier", "sae_manifold_fit"]
