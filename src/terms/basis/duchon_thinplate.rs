@@ -610,7 +610,7 @@ pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
     monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
 }
 
-const THIN_PLATE_RADIAL_RETAIN_REL_TOL: f64 = 1.0e-3;
+const THIN_PLATE_RADIAL_RETAIN_REL_TOL: f64 = 1.0e-2;
 
 fn thin_plate_retained_radial_indices(evals: &Array1<f64>) -> Vec<usize> {
     if evals.is_empty() {
