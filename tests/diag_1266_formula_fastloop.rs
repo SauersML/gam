@@ -32,14 +32,14 @@ fn fit_edf(formula: &str, seed: u64) -> f64 {
     let (headers, rows) = linear_records(800, seed);
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode");
     let cfg = FitConfig {
-        compute_inference: true,
+        family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, &ds, &cfg).expect("fit");
     match result {
         FitResult::Standard(fit) => fit.fit.edf_total().unwrap_or(f64::NAN),
-        other => {
-            eprintln!("[1266-fastloop] non-standard result variant: {other:?}");
+        _ => {
+            eprintln!("[1266-fastloop] non-standard result variant");
             f64::NAN
         }
     }
