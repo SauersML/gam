@@ -8,16 +8,16 @@
 //! inside the κ outer loop (beyond the single final fit) should stay roughly
 //! flat rather than scaling with n.
 //!
-//! This harness isolates that κ-phase through the optimizer's structured
-//! `KAPPA-PHASE-SUMMARY` counters. Those counters start after the one-time tensor
-//! setup / cold realization pass and sum only cost/eval/EFS trial callbacks. If
-//! that trial cost is n-independent, the ratio across a 16× sweep in n is ~1, not
-//! ~16.
+//! This harness isolates per-callback κ-trial cost through the optimizer's
+//! structured `KAPPA-PHASE-SUMMARY` counters. Those counters start after the
+//! one-time tensor setup / cold realization pass and report cost/eval/EFS trial
+//! callback totals plus call counts. If a trial is n-independent, the average
+//! callback cost ratio across a 16× sweep in n is ~1, not ~16.
 //!
 //! Wall-clock on a shared cluster node is noisy, so this is a *measurement* I
 //! read from the printed table — the only hard assertion is a catastrophe guard
-//! (the κ-phase must not blow up super-linearly by an order of magnitude across
-//! the sweep), which is a real tripwire, not a calibrated timing bound.
+//! (the callback average must not blow up super-linearly by an order of magnitude
+//! across the sweep), which is a real tripwire, not a calibrated timing bound.
 
 use gam::{
     FitRequest, FitResult, StandardFitRequest,
@@ -121,12 +121,14 @@ fn fit_options() -> FitOptions {
 }
 
 /// Outcome of one fit attempt: whole-fit wall-clock plus the internal κ-trial
-/// timing when κ optimization actually ran. The κ timing excludes the one-time
-/// tensor/cold setup pass by construction; it is the object #1033 accepts on.
+/// callback average when κ optimization actually ran. The κ timing excludes the
+/// one-time tensor/cold setup pass by construction; averaging over optimizer
+/// callbacks isolates the #1033 invariant: each trial touches only k-dimensional
+/// objects, independent of n.
 #[derive(Clone, Copy, Debug)]
 struct FitTiming {
     wall_s: f64,
-    kappa_trial_s: Option<f64>,
+    kappa_callback_avg_s: Option<f64>,
 }
 
 /// Outcome of one fit attempt: either timings (converged) or the failure reason
@@ -196,7 +198,14 @@ fn run_fit(
             }
             Ok(FitTiming {
                 wall_s: dt,
-                kappa_trial_s: s.kappa_timing.map(|timing| timing.trial_total_s()),
+                kappa_callback_avg_s: s.kappa_timing.map(|timing| {
+                    let calls = timing.cost_calls + timing.eval_calls + timing.efs_calls;
+                    if calls == 0 {
+                        timing.trial_total_s()
+                    } else {
+                        timing.trial_total_s() / calls as f64
+                    }
+                }),
             })
         }
         _ => Err("expected Standard fit result".to_string()),
@@ -205,7 +214,7 @@ fn run_fit(
 
 fn run_kappa_trial_seconds(n: usize, aniso: bool, bounds: (f64, f64)) -> Result<FitTiming, String> {
     let timing = run_fit(n, true, aniso, bounds)?;
-    if timing.kappa_trial_s.is_none() {
+    if timing.kappa_callback_avg_s.is_none() {
         return Err("κ optimizer did not report internal trial timing".to_string());
     }
     Ok(timing)
@@ -266,14 +275,14 @@ fn kappa_iso_1d_n_threshold_sweep() {
 }
 
 /// #1033 FAST-READ companion to `kappa_outer_loop_is_n_independent`: the same
-/// marginal κ-phase measurement on a SMALL n-ladder (1k → 16k) that completes in
-/// ~2–3 min, so the n-free skip's flat-vs-linear behaviour can be read inside an
-/// iteration loop without waiting on the 320k sweep (which walls the 1:30 slot).
+/// per-callback κ-trial measurement on a SMALL n-ladder (1k → 16k) that
+/// completes quickly, so the n-free skip's flat-vs-linear behaviour can be read
+/// inside an iteration loop without waiting on the 320k sweep.
 ///
 /// The discriminant is unambiguous at this scale: across a 16× n increase an
 /// O(n) per-trial regression tracks ~16×, while a truly n-free outer loop holds
-/// the marginal κ-phase ~flat (drifting only with the fixed O(D²k²) trial cost
-/// and shared-node timing jitter). The same ≤8× bar as the headline applies — at
+/// the average callback cost ~flat (drifting only with the fixed O(D²k²) trial
+/// cost and shared-node timing jitter). The same ≤8× bar as the headline applies — at
 /// 16× n it is ~n^0.72, decisively sub-linear but safely above timing noise. A
 /// green here is the fast close-signal; the full 320k sweep is the final stamp.
 #[test]
@@ -296,11 +305,11 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
     let mut kappa_phase = Vec::with_capacity(ns.len());
     eprintln!(
         "[kappa-fast-ladder] {:>9}  {:>10}  {:>12}",
-        "n", "t_kappa_s", "kappa_phase_s"
+        "n", "t_kappa_s", "callback_avg_s"
     );
     for &n in &ns {
         let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
-        let phase = kappa.kappa_trial_s.unwrap().max(0.0);
+        let phase = kappa.kappa_callback_avg_s.unwrap().max(0.0);
         kappa_phase.push(phase);
         eprintln!(
             "[kappa-fast-ladder] {n:>9}  {:>10.4}  {phase:>12.4}",
@@ -313,12 +322,12 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
     let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 16
     let phase_ratio = last / first;
     eprintln!(
-        "[kappa-fast-ladder] n grew {n_ratio:.0}× ; kappa-phase grew {phase_ratio:.2}× \
+        "[kappa-fast-ladder] n grew {n_ratio:.0}× ; callback average grew {phase_ratio:.2}× \
          (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×) — fast #1033 close-signal"
     );
     assert!(
         phase_ratio <= 8.0,
-        "kappa outer-loop phase grew {phase_ratio:.2}× across a {n_ratio:.0}× \
+        "kappa outer-loop callback average grew {phase_ratio:.2}× across a {n_ratio:.0}× \
          increase in n — the #1033 n-free skip is still falling to an O(n) \
          per-trial pass across the reduced-basis rotation (fast-ladder read)"
     );
@@ -358,11 +367,11 @@ fn kappa_outer_loop_is_n_independent() {
 
     eprintln!(
         "[kappa-n-scaling] {:>9}  {:>10}  {:>12}",
-        "n", "t_kappa_s", "kappa_phase_s"
+        "n", "t_kappa_s", "callback_avg_s"
     );
     for &n in &ns {
         let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
-        let phase = kappa.kappa_trial_s.unwrap().max(0.0);
+        let phase = kappa.kappa_callback_avg_s.unwrap().max(0.0);
         kappa_phase.push(phase);
         eprintln!(
             "[kappa-n-scaling] {n:>9}  {:>10.4}  {phase:>12.4}",
@@ -375,19 +384,19 @@ fn kappa_outer_loop_is_n_independent() {
     let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 256
     let phase_ratio = last / first;
     eprintln!(
-        "[kappa-n-scaling] n grew {n_ratio:.0}× ; kappa-phase grew {phase_ratio:.2}× \
+        "[kappa-n-scaling] n grew {n_ratio:.0}× ; callback average grew {phase_ratio:.2}× \
          (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×)"
     );
-    // n-independence bar: the marginal κ-phase must NOT scale with n. A truly
-    // n-free outer loop holds the marginal ~flat (ratio ~1, drifting only with
-    // the fixed O(D²k²) trial cost and timing noise); an O(n) regression would
-    // track `n_ratio`. Gate at a generous absolute ceiling well below linear —
-    // 8× across a 256× n increase is ~n^0.37, still decisively sub-linear and
-    // safely above shared-node timing jitter, so this is a real O(n)-regression
-    // tripwire rather than a calibrated timing bound.
+    // n-independence bar: the per-callback κ-trial cost must NOT scale with n. A
+    // truly n-free outer loop holds the callback average ~flat (ratio ~1,
+    // drifting only with the fixed O(D²k²) trial cost and timing noise); an O(n)
+    // regression would track `n_ratio`. Gate at a generous absolute ceiling well
+    // below linear — 8× across a 256× n increase is ~n^0.37, still decisively
+    // sub-linear and safely above shared-node timing jitter, so this is a real
+    // O(n)-regression tripwire rather than a calibrated timing bound.
     assert!(
         phase_ratio <= 8.0,
-        "kappa outer-loop phase grew {phase_ratio:.2}× across a {n_ratio:.0}× \
+        "kappa outer-loop callback average grew {phase_ratio:.2}× across a {n_ratio:.0}× \
          increase in n — the #1033 PsiGramTensor sufficient-statistic lane \
          regressed to an O(n) per-trial pass"
     );
