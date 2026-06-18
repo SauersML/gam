@@ -62,6 +62,8 @@ mod bspline_partition_unity_degree_3;
 mod bspline_partition_unity_degree_4;
 #[path = "basis_smooth/bspline_partition_unity_degree_5.rs"]
 mod bspline_partition_unity_degree_5;
+#[path = "basis_smooth/double_penalty_edf_inflation_repro_1266.rs"]
+mod double_penalty_edf_inflation_repro_1266;
 #[path = "basis_smooth/cyclic_bspline_first_derivative_periodicity_breaks.rs"]
 mod cyclic_bspline_first_derivative_periodicity_breaks;
 #[path = "basis_smooth/cyclic_bspline_second_derivative_periodicity_breaks.rs"]
