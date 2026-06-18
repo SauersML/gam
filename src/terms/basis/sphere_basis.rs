@@ -10,6 +10,7 @@ pub fn build_spherical_spline_basis(
     if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
         let mut harmonic_spec = spec.clone();
         harmonic_spec.method = SphereMethod::Harmonic;
+        harmonic_spec.penalty_order = 2;
         harmonic_spec.max_degree = Some(
             spec.max_degree
                 .unwrap_or_else(|| harmonic_degree_for_wahba_basis_width(spec, data.nrows())),
