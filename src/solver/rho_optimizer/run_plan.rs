@@ -908,6 +908,22 @@ pub(crate) fn run_outer_with_plan(
                         .threshold(seed_eval.cost, arc_seed_grad_norm)
                         .max(COST_STALL_PROJECTED_GRAD_FLOOR);
 
+                    let mut cost_stall_guard = CostStallGuard::new(
+                        cost_stall_rel_tol,
+                        ARC_COST_STALL_WINDOW,
+                        cost_stall_grad_threshold,
+                        cost_stall_exit.clone(),
+                    );
+                    cost_stall_guard.observe_seed(
+                        &seed,
+                        seed_eval.cost,
+                        projected_gradient_norm(
+                            &seed,
+                            &seed_eval.gradient,
+                            Some(&(lo.clone(), hi.clone())),
+                        ),
+                    );
+
                     let objective = OuterSecondOrderBridge {
                         obj,
                         layout,
@@ -918,12 +934,7 @@ pub(crate) fn run_outer_with_plan(
                         g_norm_initial: None,
                         last_g_norm: None,
                         last_value_grad_rho: None,
-                        cost_stall: Some(CostStallGuard::new(
-                            cost_stall_rel_tol,
-                            ARC_COST_STALL_WINDOW,
-                            cost_stall_grad_threshold,
-                            cost_stall_exit.clone(),
-                        )),
+                        cost_stall: Some(cost_stall_guard),
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
                     };
 

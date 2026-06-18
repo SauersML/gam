@@ -1641,6 +1641,49 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
     assert_eq!(published.value, 1.0, "published cost is the feasible cost");
 }
 
+/// Regression for the `with_initial_sample` ARC route: opt serves the seed
+/// sample from its internal cache, so the bridge never sees an `eval_hessian`
+/// call at that feasible point. The cost-stall guard must still know about the
+/// seed before infeasible λ→0 trial probes arrive; otherwise
+/// `observe_infeasible` has no best finite iterate to publish and ARC can grind
+/// to `max_iter`.
+#[test]
+fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    let seed = array![0.0, 0.0];
+    guard.observe_seed(&seed, 10.0, 5.0e-4);
+
+    let separating_probe = array![-10.0, -10.0];
+    assert!(
+        matches!(
+            guard.observe_infeasible(&separating_probe),
+            CostStallVerdict::Continue
+        ),
+        "first infeasible probe should only start the streak"
+    );
+    assert!(
+        matches!(
+            guard.observe_infeasible(&separating_probe),
+            CostStallVerdict::Continue
+        ),
+        "second infeasible probe should still be below the window"
+    );
+    assert!(
+        matches!(
+            guard.observe_infeasible(&separating_probe),
+            CostStallVerdict::Converged
+        ),
+        "third infeasible probe should halt back to the cached seed"
+    );
+
+    let published = exit.lock().unwrap().take().expect("seed best published");
+    assert_eq!(published.rho, seed);
+    assert_eq!(published.value, 10.0);
+    assert_eq!(published.grad_norm, 5.0e-4);
+    assert!(published.converged);
+}
+
 // Phase 5 (Cargo dep at opt 0.3) replaces the gam-side bridge
 // seed cache with `opt::{Bfgs, Arc, NewtonTrustRegion}::with_initial_sample`.
 // The two cache tests that lived here have been removed;

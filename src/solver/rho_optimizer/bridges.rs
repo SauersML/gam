@@ -260,6 +260,25 @@ impl CostStallGuard {
         }
     }
 
+    /// Register a precomputed feasible seed that the optimizer consumes from
+    /// its internal cache instead of routing through the bridge. ARC's
+    /// `with_initial_sample` path does exactly that: the first finite
+    /// `(cost, gradient, Hessian)` is already known to the runner, so
+    /// `eval_hessian` is not called at the seed. Without this hook the
+    /// infeasible-trial stall path has no finite best iterate to halt back to
+    /// when the next few ARC probes run into the λ→0 separating region.
+    pub(crate) fn observe_seed(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        self.best_value = value;
+        self.best_rho = Some(rho.clone());
+        self.best_grad_norm = grad_norm;
+        self.no_improve_streak = 0;
+        self.infeasible_streak = 0;
+        self.accepted_iters = self.accepted_iters.saturating_add(1);
+    }
+
     /// Fold one accepted-iterate `(ρ, cost, ‖g‖)` into the guard. Returns a
     /// [`CostStallVerdict`]: `Continue` while the score is still improving,
     /// `Converged` when the score has stalled AND the projected gradient norm
