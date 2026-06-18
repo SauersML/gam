@@ -5031,6 +5031,21 @@ impl<'a> RemlState<'a> {
         {
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
+        // #1082 / #1033: fixed-design non-Gaussian outer trials can reuse the
+        // previous converged data-fit Gram for the next first Fisher step only
+        // when the seed is exactly the previous beta. Prefer that flat seed once
+        // the Gram exists; IFT/tangent predictions would change W(eta) and force
+        // the dense X'WX rebuild this cache is meant to retire.
+        if !self.config.firth_bias_reduction
+            && !matches!(
+                reml_spec(&self.config.likelihood).response,
+                ResponseFamily::Gaussian
+            )
+            && self.flat_glm_first_step_gram.read().unwrap().is_some()
+            && let Some(cur_beta) = self.warm_start_beta.read().unwrap().clone()
+        {
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
+        }
         // Try the IFT-based predictor first. It uses the exact first-order
         // Jacobian of β(ρ) at the cached solve and beats the tangent-line
         // predictor whenever a converged H_pen is available — which is
