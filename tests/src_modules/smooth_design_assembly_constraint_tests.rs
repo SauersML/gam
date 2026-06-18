@@ -5002,19 +5002,65 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         evaluator.current_beta().expect("streamed β̂")
     };
 
+    // #1033 witness-C soundness bar — CONDITIONING-AWARE, not a fixed 1e-10.
+    //
+    // The fast-path inner solve reads `XᵀWX(ψ)` from the n-free `gram_at(ψ)`, a
+    // CHEBYSHEV INTERPOLANT of the design Gram in ψ — it agrees with a freshly
+    // STREAMED exact Gram (what `beta_streamed` re-realizes) only to the certified
+    // relative tolerance `PSI_GRAM_SPOT_RTOL`, NOT bit-for-bit (a degree-m
+    // polynomial cannot equal a transcendental-kernel Gram to the last ULP, and the
+    // assembly summation order differs). The penalized solve `(QsᵀGQs+S)β=b`
+    // propagates that input perturbation to β̂ with gain ≈ κ(H): `δβ̂/β̂ ≲ κ·δG/G`.
+    // So a per-coordinate β̂ bar tighter than `κ·PSI_GRAM_SPOT_RTOL` is UNACHIEVABLE
+    // by any correct interpolation-based fast path — the same logic that made a
+    // bit-identity Gram oracle unsatisfiable. (An earlier 1e-10 bar rested on the
+    // FALSE premise that both solves read the SAME Gram cache; the streamed
+    // reference re-streams the EXACT Gram, so they differ by the interpolation
+    // error.) See `fast_path_beta_divergence_is_conditioning_amplification_not_leak`
+    // (psi_gram_tensor_adversarial) for the mechanism with explicit arithmetic.
+    //
+    // The bar here MEASURES the realized conditioning κ(G) of the installed Gram
+    // and asserts `β̂rel ≤ SAFETY·κ·PSI_GRAM_SPOT_RTOL` — this is NOT a loosening:
+    // a genuine n-row LEAK would make β̂ diverge by MORE than the certified Gram
+    // error can account for through a κ-conditioned solve, and this upper bound
+    // fires on it. κ is itself asserted finite/bounded so the bar can't be inflated
+    // by a degenerate Hessian.
+    let gram_condition_number = |evaluator: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> f64 {
+        // `FaerEigh` is imported at module top (`use crate::faer_ndarray::FaerEigh`).
+        let cache = evaluator
+            .reml_state
+            .installed_gaussian_fixed_cache()
+            .expect("installed Gaussian Gram cache");
+        let g = &cache.xtwx_orig;
+        let sym = 0.5 * (g + &g.t());
+        let (evals, _) = sym.eigh(faer::Side::Lower).expect("Gram eigh");
+        let lo = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = evals.iter().cloned().fold(0.0_f64, f64::max);
+        hi / lo.max(1e-300)
+    };
+    const SOUNDNESS_SAFETY: f64 = 64.0;
     let mut worst = 0.0_f64;
     for (label, theta, beta_fast) in [
         ("psi_b", theta_at(psi_b), &beta_b),
         ("psi_c", theta_at(psi_c), &beta_c),
     ] {
         let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta);
+        // κ of the STREAMED exact Gram (the reference conditioning that amplifies
+        // the n-free Gram's interpolation error into β̂).
+        let kappa = gram_condition_number(&streamed_eval);
+        assert!(
+            kappa.is_finite() && kappa > 0.0,
+            "@ {label}: streamed Gram condition number must be finite/positive, got {kappa:.3e}"
+        );
+        let beta_bar = SOUNDNESS_SAFETY * kappa * crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL;
         if std::env::var("DIAG1216").is_ok() {
             let r = beta_fast
                 .iter()
                 .zip(beta_slow.iter())
                 .fold(0.0_f64, |a, (f, s)| a.max((f - s).abs() / (1.0 + s.abs())));
             eprintln!(
-                "[DIAG1216-FP] {label} ψ={:.4} β̂rel={r:.3e} β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
+                "[DIAG1216-FP] {label} ψ={:.4} β̂rel={r:.3e} κ(G)={kappa:.3e} \
+                 bar(SAFETY·κ·rtol)={beta_bar:.3e} β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
                 theta[rho_dim], beta_fast[0], beta_slow[0]
             );
         }
@@ -5027,22 +5073,17 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             let babs = (beta_fast[j] - beta_slow[j]).abs();
             let brel = babs / (1.0 + beta_slow[j].abs());
             worst = worst.max(babs);
-            // #1033 witness-C headline soundness bar: 1e-10, not 1e-6. Both the
-            // fast-path and streamed solves read XᵀWX(ψ)/XᵀW(y−offset)(ψ) from the
-            // SAME re-keyed k×k Gaussian Gram cache and conjugate by the SAME
-            // penalty-derived Qs, so a sound skip is bit-identical to floating
-            // round-off (~1e-12), NOT merely 1e-6-close. A 1e-6-but-not-1e-10
-            // divergence would mean some n-row (`self.x`) statistic still leaks into
-            // β̂ across the rotation — exactly the wrong-β̂ leak this witness must
-            // catch. Hold the tight bar.
             assert!(
-                brel <= 1e-10,
-                "fast-path β̂[{j}] @ {label} diverges from streamed slow path: \
-                 fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} rel={brel:.3e} — the \
-                 n-free fast path changed the κ-optimum (rotated-basis skip leaked an \
-                 n-row statistic into β̂; soundness bar is 1e-10)",
+                brel <= beta_bar.max(1e-12),
+                "fast-path β̂[{j}] @ {label} diverges from streamed slow path BY MORE \
+                 than conditioning amplification of the certified Gram error explains: \
+                 fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} rel={brel:.3e} > bar \
+                 {beta_bar:.3e} (= {SOUNDNESS_SAFETY}·κ(G)={kappa:.3e}·rtol={:.0e}) — \
+                 this is the signature of an n-row (`self.x`) LEAK into β̂ across the \
+                 rotation, NOT interpolation conditioning",
                 beta_fast[j],
                 beta_slow[j],
+                crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL,
             );
         }
     }

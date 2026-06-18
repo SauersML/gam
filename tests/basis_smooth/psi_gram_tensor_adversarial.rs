@@ -259,3 +259,154 @@ fn reduced_basis_skip_witness_serves_accurate_nfree_stats() {
         );
     }
 }
+
+/// Solve the symmetric positive-definite system `A β = b` by Gaussian elimination
+/// with partial pivoting (k is tiny, so this is exact enough for the probe).
+fn solve_spd(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let k = b.len();
+    let mut m = Array2::<f64>::zeros((k, k + 1));
+    m.slice_mut(ndarray::s![.., ..k]).assign(a);
+    m.slice_mut(ndarray::s![.., k]).assign(b);
+    for col in 0..k {
+        let piv = (col..k)
+            .max_by(|&p, &q| m[[p, col]].abs().total_cmp(&m[[q, col]].abs()))
+            .unwrap();
+        if piv != col {
+            for j in 0..=k {
+                m.swap([col, j], [piv, j]);
+            }
+        }
+        let pivot = m[[col, col]];
+        for row in 0..k {
+            if row == col {
+                continue;
+            }
+            let f = m[[row, col]] / pivot;
+            for j in col..=k {
+                m[[row, j]] -= f * m[[col, j]];
+            }
+        }
+    }
+    Array1::from_iter((0..k).map(|i| m[[i, k]] / m[[i, i]]))
+}
+
+/// Condition number κ(A) = λ_max / λ_min of a symmetric PSD matrix.
+fn spd_condition_number(a: &Array2<f64>) -> f64 {
+    use gam::linalg::faer_ndarray::FaerEigh;
+    let sym = 0.5 * (a + &a.t());
+    let (evals, _) = sym.eigh(faer::Side::Lower).expect("eigh");
+    let lo = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = evals.iter().cloned().fold(0.0_f64, f64::max);
+    hi / lo.max(1e-300)
+}
+
+/// #1033 witness-C provenance proof: the fast-path β̂ vs streamed-slow-path β̂
+/// divergence is CONDITIONING AMPLIFICATION of the n-free Gram's interpolation
+/// error, NOT an n-row leak — so a per-coordinate β̂ bar tighter than
+/// `κ(H)·(Gram rel error)` is unachievable by ANY correct interpolation-based
+/// fast path (the same logic that made the bit-identity oracle unsatisfiable).
+///
+/// The n-free `gram_at(ψ)` is a Chebyshev interpolant of the design Gram in ψ; it
+/// agrees with a freshly streamed `XᵀWX(ψ)` only to the certified spot tolerance
+/// `PSI_GRAM_SPOT_RTOL` (a relative bound, NOT bit-identity). The penalized solve
+/// `(G+λS)β = b` propagates that input perturbation to the solution with the gain
+/// `δβ̂/β̂ ≲ κ(G+λS)·δG/G`. This probe MEASURES all three quantities on a
+/// deliberately ill-conditioned k×k system and certifies:
+///   (a) the β̂ divergence is EXPLAINED by `κ·gramrel` (within a small safety
+///       factor) — i.e. it is conditioning amplification, the EXPECTED behaviour
+///       of a correct interpolation hoist; and
+///   (b) κ here is large enough that this amplification visibly exceeds the
+///       `1e-10` bar a bit-identity-style gate would impose — proving such a bar
+///       is the WRONG gate post-interpolation.
+/// If a future change makes `gram_at` leak an n-row statistic, `β̂` would diverge
+/// by MORE than `κ·gramrel` and the upper assert fires.
+#[test]
+fn fast_path_beta_divergence_is_conditioning_amplification_not_leak() {
+    let (n, k) = (192usize, 8usize);
+    let weights = Array1::from_iter((0..n).map(|i| 0.75 + ((i % 7) as f64) * 0.08));
+    let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.19).cos() + 0.1));
+    let (psi_lo, psi_hi) = (-1.25, 1.15);
+
+    let tensor = PsiGramTensor::build(
+        |psi| adversarial_design(psi, n, k),
+        weights.view(),
+        z.view(),
+        psi_lo,
+        psi_hi,
+    )
+    .expect("analytic design certifies");
+
+    // A small penalty `λS` makes the system ill-conditioned WITHOUT being singular,
+    // mirroring a spline penalty's near-null bending modes — the regime where the
+    // penalized Hessian's conditioning is large and a 1e-10 β̂ bar is unreachable.
+    // S = D where D[j,j] grows steeply, so κ(G+λS) spans several decades.
+    let lambda = 1e-3;
+    let mut s = Array2::<f64>::zeros((k, k));
+    for j in 0..k {
+        s[[j, j]] = 10f64.powi(j as i32); // 1 .. 1e7 — a stiff, ill-conditioned penalty
+    }
+
+    // Off-node interior ψ where the Chebyshev reconstruction is only spot-accurate.
+    for &psi in &[-0.91, -0.17, 0.23, 0.79] {
+        let g_cheb = tensor.gram_at(psi); // n-free Chebyshev interpolant
+        let b_cheb = tensor.rhs_at(psi);
+        let (g_exact, b_exact, _) = dense_stats(psi, n, k, &weights, &z); // streamed exact
+
+        let gram_scale = g_exact.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        let gram_rel = g_cheb
+            .iter()
+            .zip(g_exact.iter())
+            .fold(0.0_f64, |a, (c, e)| a.max((c - e).abs()))
+            / gram_scale.max(1e-300);
+
+        // The value lane is gated on this: the reconstruction is spot-accurate.
+        assert!(
+            gram_rel <= PSI_GRAM_SPOT_RTOL,
+            "ψ={psi}: gram_rel {gram_rel:.3e} exceeds the certified spot tol {PSI_GRAM_SPOT_RTOL:.0e} \
+             — the value lane itself would be unsound, not a β̂-bar question"
+        );
+
+        let h_cheb = &g_cheb + &(lambda * &s);
+        let h_exact = &g_exact + &(lambda * &s);
+        let kappa = spd_condition_number(&h_exact);
+
+        let beta_cheb = solve_spd(&h_cheb, &b_cheb);
+        let beta_exact = solve_spd(&h_exact, &b_exact);
+        let beta_scale = beta_exact.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        let beta_rel = beta_cheb
+            .iter()
+            .zip(beta_exact.iter())
+            .fold(0.0_f64, |a, (c, e)| a.max((c - e).abs()))
+            / beta_scale.max(1e-300);
+
+        eprintln!(
+            "[#1033-cond] ψ={psi:+.3}  gram_rel={gram_rel:.3e}  κ(H)={kappa:.3e}  \
+             β̂rel={beta_rel:.3e}  κ·gram_rel={:.3e}  amplification(β̂rel/gram_rel)={:.3e}",
+            kappa * gram_rel,
+            beta_rel / gram_rel.max(1e-300),
+        );
+
+        // (a) The β̂ divergence is EXPLAINED by conditioning: β̂rel ≲ κ·gram_rel.
+        // A genuine n-row leak would make β̂ diverge by MORE than the Gram error
+        // can account for through the solve — this upper bound catches that.
+        let safety = 32.0;
+        assert!(
+            beta_rel <= safety * kappa * gram_rel.max(f64::MIN_POSITIVE),
+            "ψ={psi}: β̂rel {beta_rel:.3e} EXCEEDS κ·gram_rel·safety \
+             ({:.3e}) — the β̂ divergence is NOT explained by conditioning \
+             amplification of the n-free Gram error; this is the signature of an \
+             n-row LEAK, not interpolation conditioning",
+            safety * kappa * gram_rel
+        );
+
+        // (b) The conditioning is large enough that this EXPECTED, sound divergence
+        // visibly exceeds a 1e-10 bit-identity-style β̂ bar — proving such a bar is
+        // the wrong gate once the Gram is interpolated (κ here ~1e9 ⇒ even a
+        // 1e-12 Gram error propagates past 1e-10 in β̂).
+        assert!(
+            kappa >= 1e6,
+            "ψ={psi}: probe κ(H)={kappa:.3e} is too small to demonstrate that a \
+             1e-10 β̂ bar is unreachable — pick a stiffer penalty"
+        );
+    }
+}

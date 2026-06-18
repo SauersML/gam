@@ -774,9 +774,36 @@ pub(crate) fn compute_outer_hessian(
     // ── ext-ext block ── (uses shared helpers for all trace computations)
 
     if let Some(ref ext_pair_fn) = solution.ext_coord_pair_fn {
+        // The per-pair `ext_pair_fn(ii, jj)` call carries the family's
+        // second-order ψψ likelihood term, which for the flex marginal-slope
+        // families is a full directional-jet cell sweep — by far the dominant
+        // cost of this K² block (gam#979). Each (ii, jj) call is independent and
+        // the closure is `Send + Sync`, so fan the K(K+1)/2 upper-triangle pairs
+        // across the pool with the nested-BLAS guard (any inner GEMM stays
+        // `Par::Seq`), exactly as the rigid row-kernel all-axes sweep does. The
+        // results are collected index-ordered so the subsequent trace/write loop
+        // is byte-identical to the prior serial `ext_pair_fn` evaluation order.
+        let ext_pairs: Vec<crate::reml_contracts::HyperCoordPair> = {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let pair_count = ext_dim * (ext_dim + 1) / 2;
+            (0..pair_count)
+                .into_par_iter()
+                .map(|pair_idx| {
+                    let (ii, jj) = crate::linalg::matrix::kronecker::upper_triangle_pair_from_index(
+                        pair_idx, ext_dim,
+                    );
+                    crate::linalg::faer_ndarray::with_nested_parallel(|| ext_pair_fn(ii, jj))
+                })
+                .collect()
+        };
+        let ext_pair_at = |ii: usize, jj: usize| -> usize {
+            // Upper-triangle row-major index for (ii <= jj), the exact inverse of
+            // `upper_triangle_pair_from_index`: row_start = ii*(2*ext_dim-ii+1)/2.
+            ii * (2 * ext_dim - ii + 1) / 2 + (jj - ii)
+        };
         for ii in 0..ext_dim {
             for jj in ii..ext_dim {
-                let pair = ext_pair_fn(ii, jj);
+                let pair = &ext_pairs[ext_pair_at(ii, jj)];
                 let coord_i = &solution.ext_coords[ii];
                 let coord_j = &solution.ext_coords[jj];
 
