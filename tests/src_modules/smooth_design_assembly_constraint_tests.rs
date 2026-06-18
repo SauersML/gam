@@ -4847,14 +4847,9 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         if realize {
             cache.ensure_theta(theta).expect("ensure_theta");
         }
-        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-            data.view(),
-            cache.spec(),
-            cache.design(),
-            &spatial_terms,
-        )
-        .unwrap()
-        .unwrap();
+        let hyper_dirs = cache
+            .hyper_dirs_for_current_design(data.view(), SpatialHyperKind::Isotropic)
+            .expect("hyper_dirs");
         let penalty = cache
             .canonical_penalties_at(theta)
             .expect("exact n-free S(ψ) rebuild");
