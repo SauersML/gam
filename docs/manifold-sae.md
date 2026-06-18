@@ -81,6 +81,7 @@ of typed shapes:
 
 | `atom_topology` / `atom_basis` | Intrinsic dim `d_atom` | Underlying basis | Shape |
 | --- | --- | --- | --- |
+| `linear` | 1 | affine rank-1 line | true linear atom `gamma(t)=b0+t*b1` |
 | `circle` (aliases `periodic`, `periodic_spline`) | 1 (each axis if `d>1`) | periodic Fourier `cos/sin(2π·h·t)` | closed loop, seamless at the wrap |
 | `euclidean` (alias `euclidean_patch`) | any | monomial / polynomial patch | open Euclidean patch (a "line" at `d_atom=1`) |
 | `duchon` | any | Duchon thin-plate RKHS | open Euclidean patch with the thin-plate roughness Gram |
@@ -99,8 +100,10 @@ differs from the flat patch only where feature density grows toward the ball
 boundary (tree-/hierarchy-like structure). String matching is
 case-insensitive and treats `-` and `_` interchangeably.
 
-A `d_atom=1` Euclidean atom is the **line** primitive; a `d_atom=1` circle is
-the **loop**. Mixing topologies across atoms is supported — pass an
+A `d_atom=1` linear atom is the true rank-1 **line** primitive. A
+`d_atom=1` Euclidean atom is a stronger polynomial patch, not the pure-linear
+baseline used for #1026 reconstruction parity. A `d_atom=1` circle is the
+**loop**. Mixing topologies across atoms is supported — pass an
 `atom_basis=[...]` list and read the resolved per-atom labels off
 `fit.atom_topologies` (the scalar `fit.atom_topology` collapses to `"mixed"`
 when atoms disagree).
