@@ -83,7 +83,7 @@ impl SurvivalMarginalSlopeFamily {
                         &neg_coeff_a_dir,
                         &state.moments,
                     )?;
-                    let f_aa_dir = exact_kernel::cell_third_derivative_from_moments(
+                    let mut f_aa_dir = exact_kernel::cell_third_derivative_from_moments(
                         neg_cell,
                         &neg_dc_da,
                         &neg_dc_da,
@@ -208,6 +208,101 @@ impl SurvivalMarginalSlopeFamily {
                             )?;
                             f_uv_dir[u * p + v] = dir_val;
                             f_uv_dir[v * p + u] = dir_val;
+                        }
+                    }
+
+                    // Moving-domain (Leibniz) boundary correction for the
+                    // slope direction. The cell-integral derivatives above hold
+                    // the integration domain `[cell.left, cell.right]` FIXED,
+                    // but a cell edge that is a link-knot crossing `z=(τ-a)/b`
+                    // MOVES with the slope `b`: `∂z_c/∂b = -(τ-a)/b² = -z_c/b`.
+                    // So `∂_dir ∫_{z_L}^{z_R} F dz` gains
+                    // `F(z_R)·z_R'(dir) - F(z_L)·z_L'(dir)` on top of the
+                    // fixed-domain part, where `z_•'(dir) = (∂z_•/∂b)·dir[g]`
+                    // (the slope component of the direction). For the VALUE and
+                    // HESSIAN these cross-cell boundary terms cancel (the
+                    // integrand is continuous across the crossing), which is why
+                    // the base `f_uv` matches FD; for the b-DIRECTIONAL third
+                    // the pair-integrand `F_rs` jumps across the crossing (the
+                    // cell cubic coefficients differ between adjacent cells), so
+                    // they do not cancel — this is the term whose omission
+                    // sign-flipped `f_uv_dir`/`f_au_dir` on the slope axis
+                    // (gam#979). `Fixed` edges do not move, so contribute 0.
+                    let dir_g = if primary.g < p { dir[primary.g] } else { 0.0 };
+                    if dir_g != 0.0 && b != 0.0 {
+                        let part = &cell_entry.partition_cell;
+                        let edge_velocity = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                             z: f64|
+                         -> f64 {
+                            match edge {
+                                crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
+                                    ..
+                                } => -(z / b) * dir_g,
+                                crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                            }
+                        };
+                        let v_right = edge_velocity(part.right_edge, neg_cell.right);
+                        let v_left = edge_velocity(part.left_edge, neg_cell.left);
+                        if v_right != 0.0 || v_left != 0.0 {
+                            // Boundary integrand in the SAME `(neg_cell, neg_*)`
+                            // convention the fixed-domain moment reductions use
+                            // above, so the Leibniz term and the interior term
+                            // it corrects are the same `F`. (Passing `neg_cell`
+                            // negates η, and the negated `r,s,rs` coefficients
+                            // make the pair integrand the exact value the
+                            // matching `cell_second_derivative_from_moments`
+                            // call integrates.)
+                            let boundary =
+                                |neg_r: &[f64], neg_s: &[f64], neg_rs: &[f64]| -> f64 {
+                                    let fr = crate::families::cubic_cell_kernel::cell_second_derivative_boundary_integrand(
+                                    neg_cell, neg_r, neg_s, neg_rs, neg_cell.right,
+                                );
+                                    let fl = crate::families::cubic_cell_kernel::cell_second_derivative_boundary_integrand(
+                                    neg_cell, neg_r, neg_s, neg_rs, neg_cell.left,
+                                );
+                                    fr * v_right - fl * v_left
+                                };
+
+                            let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
+                            let neg_dc_daa: [f64; 4] = fixed.dc_daa.map(|v| -v);
+
+                            // f_aa: r=s=a.
+                            f_aa_dir += boundary(&neg_dc_da, &neg_dc_da, &neg_dc_daa);
+
+                            // f_au[u]: r=a, s=u.
+                            for u in 0..p {
+                                let neg_coeff_u = fixed.coeff_u[u].map(|v| -v);
+                                let neg_coeff_au = fixed.coeff_au[u].map(|v| -v);
+                                f_au_dir[u] +=
+                                    boundary(&neg_dc_da, &neg_coeff_u, &neg_coeff_au);
+                            }
+
+                            // f_uv[u][v]: r=u, s=v, cross via the b-family
+                            // `coeff_bu` (exactly `cell_pair_second_coeff`, the
+                            // same cross the fixed-domain `f_uv` integrates).
+                            for u in 0..p {
+                                let neg_coeff_u = fixed.coeff_u[u].map(|val| -val);
+                                for v in u..p {
+                                    let neg_coeff_v = fixed.coeff_u[v].map(|val| -val);
+                                    let neg_sc_uv = self
+                                        .cell_pair_second_coeff(
+                                            primary,
+                                            &fixed.coeff_bu,
+                                            u,
+                                            v,
+                                        )
+                                        .map(|val| -val);
+                                    let bval = boundary(
+                                        &neg_coeff_u,
+                                        &neg_coeff_v,
+                                        &neg_sc_uv,
+                                    );
+                                    f_uv_dir[u * p + v] += bval;
+                                    if u != v {
+                                        f_uv_dir[v * p + u] += bval;
+                                    }
+                                }
+                            }
                         }
                     }
 

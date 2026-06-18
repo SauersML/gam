@@ -1913,6 +1913,50 @@ pub fn cell_second_derivative_from_moments(
     Ok((second_term - eta_term) * INV_TWO_PI)
 }
 
+/// Pointwise value of the cell second-derivative integrand
+/// `(∂²/∂r∂s) exp(-q(z))/2π` at a single `z`, evaluated from the SAME
+/// `(r, s, rs)` coefficient polynomials the moment reduction
+/// [`cell_second_derivative_from_moments`] integrates:
+///
+/// ```text
+///   F_rs(z) = ( c_rs(z) - η(z)·c_r(z)·c_s(z) ) · exp(-q(z)) · 1/2π ,
+/// ```
+///
+/// with `c_•(z) = Σ_k coeff_•[k]·zᵏ`, `η(z)` the cell cubic, and
+/// `q(z) = ½(z² + η(z)²)`. This is the integrand whose `[cell.left,
+/// cell.right]` integral the from-moments form returns — needed for the
+/// Leibniz boundary term when a cell edge (a link-knot crossing
+/// `z=(τ-a)/b`) moves with a parameter (the slope `b`): the directional
+/// derivative of `∫_{z_L}^{z_R} F_rs dz` picks up
+/// `F_rs(z_R)·z_R'(dir) - F_rs(z_L)·z_L'(dir)` on top of the fixed-domain
+/// part. Coefficient sign convention matches the simpson reference
+/// (`numeric_ab`): pass the ACTUAL derivative-coefficient polynomials
+/// `∂c/∂r` etc. (not the negated `neg_dc_d•` the moment path consumes).
+#[inline]
+pub fn cell_second_derivative_boundary_integrand(
+    cell: DenestedCubicCell,
+    first_coefficients_r: &[f64],
+    first_coefficients_s: &[f64],
+    second_coefficients_rs: &[f64],
+    z: f64,
+) -> f64 {
+    let eta = cell.eta(z);
+    let c_r = poly_eval_at(first_coefficients_r, z);
+    let c_s = poly_eval_at(first_coefficients_s, z);
+    let c_rs = poly_eval_at(second_coefficients_rs, z);
+    (c_rs - eta * c_r * c_s) * (-cell.q(z)).exp() * INV_TWO_PI
+}
+
+/// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
+#[inline]
+fn poly_eval_at(coefficients: &[f64], z: f64) -> f64 {
+    let mut acc = 0.0_f64;
+    for &c in coefficients.iter().rev() {
+        acc = acc.mul_add(z, c);
+    }
+    acc
+}
+
 #[inline]
 fn moment_dot_with_coefficients(
     coefficients: &[f64],
