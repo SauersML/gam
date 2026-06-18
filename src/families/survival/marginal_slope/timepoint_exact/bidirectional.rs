@@ -145,6 +145,21 @@ impl SurvivalMarginalSlopeFamily {
                 let mut caa2 = [0.0; 4];
                 let mut cd12 = [0.0; 4];
                 let mut ca12 = [0.0; 4];
+                let coeff_view = SparsePrimaryCoeffJetView::new(
+                    primary.g,
+                    primary.h.as_ref(),
+                    primary.w.as_ref(),
+                    &fx.coeff_u,
+                    &fx.coeff_au,
+                    &fx.coeff_bu,
+                    &fx.coeff_aau,
+                    &fx.coeff_abu,
+                    &fx.coeff_bbu,
+                    &fx.coeff_aaau,
+                    &fx.coeff_aabu,
+                    &fx.coeff_abbu,
+                    &fx.coeff_bbbu,
+                );
                 for c in 0..p {
                     for k in 0..4 {
                         if dir1[c] != 0.0 {
@@ -175,6 +190,9 @@ impl SurvivalMarginalSlopeFamily {
                         }
                     }
                 }
+                let caa12 = coeff_view
+                    .mixed_directional_from_b_family(&fx.coeff_aabu, dir1, dir2, COEFF_SUPPORT_GHW)
+                    .map(|value| -value);
 
                 f_a_d1 += exact_kernel::cell_second_derivative_from_moments(
                     nc,
@@ -239,7 +257,7 @@ impl SurvivalMarginalSlopeFamily {
                     &caa2,
                     &ca12,
                     &ca12,
-                    &[0.0; 4],
+                    &caa12,
                     &st.moments,
                 )?;
 
@@ -258,6 +276,18 @@ impl SurvivalMarginalSlopeFamily {
                     let mut cau1 = [0.0; 4];
                     let mut cu2 = [0.0; 4];
                     let mut cau2 = [0.0; 4];
+                    let cu12 = coeff_view
+                        .param_mixed_from_bb_family(&fx.coeff_bbu, u, dir1, dir2, COEFF_SUPPORT_GHW)
+                        .map(|value| -value);
+                    let cau12 = coeff_view
+                        .param_mixed_from_bb_family(
+                            &fx.coeff_abbu,
+                            u,
+                            dir1,
+                            dir2,
+                            COEFF_SUPPORT_GHW,
+                        )
+                        .map(|value| -value);
                     for c in 0..p {
                         let sc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
                         let sca = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, c);
@@ -309,8 +339,8 @@ impl SurvivalMarginalSlopeFamily {
                         &cau1,
                         &cau2,
                         &ca12,
-                        &[0.0; 4],
-                        &[0.0; 4],
+                        &cu12,
+                        &cau12,
                         &st.moments,
                     )?;
                 }
@@ -338,6 +368,34 @@ impl SurvivalMarginalSlopeFamily {
                         let mut cv2 = [0.0; 4];
                         let mut cuv1 = [0.0; 4];
                         let mut cuv2 = [0.0; 4];
+                        let cu12 = coeff_view
+                            .param_mixed_from_bb_family(
+                                &fx.coeff_bbu,
+                                u,
+                                dir1,
+                                dir2,
+                                COEFF_SUPPORT_GHW,
+                            )
+                            .map(|value| -value);
+                        let cv12 = coeff_view
+                            .param_mixed_from_bb_family(
+                                &fx.coeff_bbu,
+                                v,
+                                dir1,
+                                dir2,
+                                COEFF_SUPPORT_GHW,
+                            )
+                            .map(|value| -value);
+                        let cuv12 = coeff_view
+                            .pair_mixed_from_bbb_family(
+                                &fx.coeff_bbbu,
+                                u,
+                                v,
+                                dir1,
+                                dir2,
+                                COEFF_SUPPORT_GHW,
+                            )
+                            .map(|value| -value);
                         for c in 0..p {
                             let suc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
                             let svc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, v, c);
@@ -412,11 +470,11 @@ impl SurvivalMarginalSlopeFamily {
                             &cv1,
                             &cv2,
                             &cd12,
-                            &[0.0; 4],
-                            &[0.0; 4],
-                            &[0.0; 4],
-                            &[0.0; 4],
-                            &[0.0; 4],
+                            &cuv1,
+                            &cuv2,
+                            &cu12,
+                            &cv12,
+                            &cuv12,
                             &st.moments,
                         )?;
                         f_uv_d12[[u, v]] += d12v;
