@@ -39,7 +39,11 @@ fn dense_stats(
         *slot = w * zi;
         zt_w_z += w * zi * zi;
     }
-    (design.t().dot(&weighted_design), design.t().dot(&wz), zt_w_z)
+    (
+        design.t().dot(&weighted_design),
+        design.t().dot(&wz),
+        zt_w_z,
+    )
 }
 
 #[test]
@@ -64,7 +68,10 @@ fn psi_gram_tensor_cache_matches_dense_xtwx_bit_identically_and_is_n_free() {
     let build_calls = calls.get();
 
     for &psi in &[-0.91, -0.17, 0.23, 0.79] {
-        assert!(tensor.contains(psi), "psi sample must be in the certified window");
+        assert!(
+            tensor.contains(psi),
+            "psi sample must be in the certified window"
+        );
         let cache = tensor.gaussian_fixed_cache_at(psi);
         assert_eq!(
             calls.get(),
