@@ -53,6 +53,7 @@ use ndarray::{Array1, Array2};
 use std::sync::{Mutex, Once};
 
 static CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static TEST_LOG_LOCK: Mutex<()> = Mutex::new(());
 
 struct CapturingLogger;
 impl log::Log for CapturingLogger {
@@ -168,6 +169,7 @@ fn aniso_signal_dataset(n: usize) -> (Array2<f64>, Array1<f64>) {
 /// penalty-quad — with the default double-penalty (nullspace shrinkage) active.
 #[test]
 fn matern_2d_iso_kappa_outer_gradient_matches_fd() {
+    let _guard = TEST_LOG_LOCK.lock().unwrap();
     init();
     if let Ok(mut g) = CAPTURE.lock() {
         g.clear();
@@ -262,6 +264,7 @@ fn matern_2d_iso_kappa_outer_gradient_matches_fd() {
 /// perturbations, so the optimizer has a real descent direction at theta0.
 #[test]
 fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
+    let _guard = TEST_LOG_LOCK.lock().unwrap();
     init();
     if let Ok(mut g) = CAPTURE.lock() {
         g.clear();
