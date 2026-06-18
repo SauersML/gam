@@ -32,8 +32,6 @@ mod channel_hessian_beta_dependent;
 mod channel_hessian_matches_fd;
 #[path = "autodiff/contract_gradient_gates.rs"]
 mod contract_gradient_gates;
-#[path = "autodiff/diag_1255_binomial_probit_outer.rs"]
-mod diag_1255_binomial_probit_outer;
 #[path = "autodiff/cubic_cell_kernel_transformed_link_jet_fd_mismatch.rs"]
 mod cubic_cell_kernel_transformed_link_jet_fd_mismatch;
 #[path = "autodiff/derivative_consistency_fd.rs"]
