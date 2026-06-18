@@ -828,41 +828,6 @@ impl PsiGramTensor {
         out
     }
 
-    /// n-free `(∂(XᵀWX)/∂ψ, ∂(XᵀWz)/∂ψ)` by a CENTRAL DIFFERENCE of the certified
-    /// value lane — for ψ inside the value window `[psi_lo, psi_hi]` but OUTSIDE the
-    /// narrower analytic-derivative sub-window (#1033 gradient-coverage gap).
-    ///
-    /// The analytic `dgram_dpsi`/`drhs_dpsi` use `T_d′ ∼ d·U_{d−1}` (∼ d² growth),
-    /// which is only bit-tight on the interior `[grad_psi_lo, grad_psi_hi]`. But the
-    /// VALUE reconstruction `gram_at`/`rhs_at` is certified to `PSI_GRAM_SPOT_RTOL`
-    /// across the FULL window, so a central difference of it is an n-free k×k
-    /// ψ-gradient accurate to ≈ `PSI_GRAM_SPOT_RTOL / h` — well inside the
-    /// outer-gradient tolerance — over the whole value window. `h` is clamped so
-    /// `ψ ± h` stays inside `[psi_lo, psi_hi]` (one-sided near an edge would lose a
-    /// digit; the symmetric clamp keeps both stencil points certified). Returns
-    /// `None` when `ψ` is outside the value window or the window is degenerate.
-    pub fn fd_psi_gram_deriv(&self, psi: f64) -> Option<(Array2<f64>, Array1<f64>)> {
-        if !self.contains(psi) {
-            return None;
-        }
-        let span = self.psi_hi - self.psi_lo;
-        if !(span > 0.0) {
-            return None;
-        }
-        // Base step ~ a small fraction of the window; clamp so ψ ± h ∈ window.
-        let h0 = (1.0e-4 * span).max(f64::MIN_POSITIVE);
-        let h = h0
-            .min(psi - self.psi_lo)
-            .min(self.psi_hi - psi);
-        if !(h > 0.0) {
-            return None;
-        }
-        let inv = 0.5 / h;
-        let dgram = (self.gram_at(psi + h) - self.gram_at(psi - h)).mapv(|v| v * inv);
-        let drhs = (self.rhs_at(psi + h) - self.rhs_at(psi - h)).mapv(|v| v * inv);
-        Some((dgram, drhs))
-    }
-
     /// Exact `∂²(XᵀWX)/∂ψ²` from the SAME representation as the value/gradient —
     /// the n-free curvature that lets the outer Newton/ARC step read the τ-τ
     /// Hessian's design-moving block without re-streaming an O(n) slab Gram

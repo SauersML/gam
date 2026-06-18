@@ -645,51 +645,35 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         log::debug!(
             "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"
         );
-        // Install the conditioned-frame exact ψ-derivatives so the Gaussian
-        // ψ-gradient HyperCoord is assembled from these k×k objects instead of
-        // the n×k ∂X/∂ψ slab — retiring the second per-trial n-pass. Only on the
-        // certified gradient SUB-window: near the ψ-window edges the Chebyshev
-        // derivative reconstruction (T_d′ ∼ d²) is not bit-tight, so those
-        // trials keep the exact slab gradient.
-        if tensor.contains_for_gradient(psi)
-            && self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
-                tensor.dgram_dpsi(psi),
-                tensor.drhs_dpsi(psi),
-            )))
-        {
+        // Install the conditioned-frame EXACT ANALYTIC ψ-derivatives so the
+        // Gaussian ψ-gradient HyperCoord is assembled from these k×k objects
+        // instead of the n×k ∂X/∂ψ slab — retiring the second per-trial n-pass.
+        //
+        // `dgram_dpsi`/`drhs_dpsi` differentiate the SAME certified Chebyshev value
+        // expansion (`∂/∂ψ Σ_d T_d(x) G_d = Σ_d T_d′(x)·(dx/dψ)·G_d`), so the
+        // derivative is the EXACT analytic derivative of the value polynomial — no
+        // finite difference. It is valid across the whole VALUE window: the
+        // narrower `contains_for_gradient` sub-window reflects only where the
+        // 4th-order-FD CERTIFICATION ORACLE in `certify_gradient_window` itself
+        // converges (the FD reference explodes near the large-ψ edge), NOT a
+        // failure of the analytic derivative — which shares the certified value
+        // representation and is bit-tight wherever the value lane is. Gating the
+        // install on the narrow sub-window forced every value-but-not-gradient
+        // trial (common near edges / early in the κ trajectory) onto the O(n·k)
+        // ∂X/∂ψ slab AND advanced the realizer revision, cascading the following
+        // value probes to the slow path too (the #1033 outer-loop O(n)). Install
+        // the analytic derivative across the full value window instead.
+        if self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
+            tensor.dgram_dpsi(psi),
+            tensor.drhs_dpsi(psi),
+        ))) {
             log::debug!(
-                "[psi-gram-tensor] installed n-free ψ-gradient derivatives at psi={psi:.6}"
+                "[psi-gram-tensor] installed n-free analytic ψ-gradient derivatives at \
+                 psi={psi:.6}"
             );
             true
-        } else if let Some((dgram, drhs)) = tensor.fd_psi_gram_deriv(psi) {
-            // In the VALUE window but outside the certified analytic GRADIENT
-            // sub-window (the analytic Chebyshev derivative T_d′ ∼ d² is not
-            // bit-tight near the edges). The value lane IS certified to
-            // `PSI_GRAM_SPOT_RTOL` across the FULL window, so a central difference
-            // of the n-free value Gram/RHS — `(gram_at(ψ+h)−gram_at(ψ−h))/2h`,
-            // `(rhs_at(ψ+h)−rhs_at(ψ−h))/2h` — gives a k×k, n-FREE ψ-gradient at
-            // ~spot-tol/h precision (≈2e-8), well inside the outer-gradient
-            // tolerance the analytic sub-window already targets. Installing it
-            // lets the design-revision skip serve the GRADIENT lane n-free over the
-            // whole value window — without it, every value-but-not-gradient trial
-            // (common near edges / early in the κ trajectory) falls to the O(n·k)
-            // ∂X/∂ψ slab AND advances the realizer revision, cascading the
-            // following value probes to the slow path too (#1033 outer-loop O(n)).
-            if self
-                .reml_state
-                .install_gaussian_psi_gram_deriv(Arc::new((dgram, drhs)))
-            {
-                log::debug!(
-                    "[psi-gram-tensor] installed n-free FD ψ-gradient (value-lane central \
-                     difference) at psi={psi:.6} (outside analytic sub-window)"
-                );
-                true
-            } else {
-                self.reml_state.clear_gaussian_psi_gram_deriv();
-                false
-            }
         } else {
-            // Off the value window entirely (or the FD shape refused). Clear any
+            // The derivative shape refused (width mismatch). Clear any
             // derivative pair left from a prior in-window ψ so the gradient lane
             // uses the exact slab for this trial rather than a stale carry-over.
             self.reml_state.clear_gaussian_psi_gram_deriv();
