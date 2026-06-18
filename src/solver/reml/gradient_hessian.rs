@@ -4425,12 +4425,13 @@ impl<'a> RemlState<'a> {
 
     fn update_flat_glm_first_step_gram_from(&self, pr: &PirlsResult) {
         if self.config.firth_bias_reduction
-            || matches!(reml_spec(&self.config.likelihood).response, ResponseFamily::Gaussian)
+            || matches!(
+                reml_spec(&self.config.likelihood).response,
+                ResponseFamily::Gaussian
+            )
             || pr.cache_compacted
-            || pr.reparam_result.s_transformed.nrows()
-                != pr.penalized_hessian_transformed.nrows()
-            || pr.reparam_result.s_transformed.ncols()
-                != pr.penalized_hessian_transformed.ncols()
+            || pr.reparam_result.s_transformed.nrows() != pr.penalized_hessian_transformed.nrows()
+            || pr.reparam_result.s_transformed.ncols() != pr.penalized_hessian_transformed.ncols()
         {
             *self.flat_glm_first_step_gram.write().unwrap() = None;
             return;
@@ -6117,8 +6118,7 @@ impl<'a> RemlState<'a> {
             } else {
                 None
             };
-            let glm_first_step_handle =
-                staged_glm_first_step_handle.or(flat_glm_first_step_handle);
+            let glm_first_step_handle = staged_glm_first_step_handle.or(flat_glm_first_step_handle);
             let problem = pirls::PirlsProblem {
                 x: &self.x,
                 offset: self.offset.view(),
