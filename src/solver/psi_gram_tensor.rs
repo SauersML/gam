@@ -102,10 +102,9 @@ pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
 /// beta-hat soundness gate: the inner penalized solve `β̂ = (G+λS)⁻¹r`
 /// amplifies Gram residuals by the radial-kernel conditioning, especially after
 /// the production skip was relaxed to cross a reduced-basis rotation. Start at
-/// 257 nodes so the production gate no longer accepts the shallow tensor; keep a
-/// 513-node fallback for geometries whose assembled-Gram spot check still
-/// refuses or whose weakly-penalized solve needs the deeper product surface.
-pub const PSI_GRAM_NODE_LADDER: [usize; 2] = [257, 513];
+/// 513 nodes so the production gate no longer accepts the shallower tensors that
+/// pass the Gram spot check but still move the weakly-penalized beta solve.
+pub const PSI_GRAM_NODE_LADDER: [usize; 1] = [513];
 
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
