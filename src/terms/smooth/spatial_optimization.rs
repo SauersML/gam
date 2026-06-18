@@ -2704,13 +2704,22 @@ impl<'d> SpatialJointContext<'d> {
         // re-keys the cache to this probe's ψ), and the probe cost comes from
         // k-space statistics only. Line-search probes are the bulk of the κ-loop
         // per-trial work, so this is the dominant n-flat lever. Unlike the
-        // gradient path the value lane spans the FULL certified window, so only
-        // `psi_gram_tensor_covers` (not the narrower gradient sub-window) is
-        // required. Any miss (non-Gaussian, off-window, fast path not yet armed)
-        // realizes the design and runs the exact streamed probe unchanged.
+        // gradient path the value lane spans the FULL certified window, but the
+        // probe still skips `reset_surface`, so it must also stay inside the
+        // β̂-sound skip sub-window. Any miss (non-Gaussian, off-window,
+        // off-skip-window, fast path not yet armed) realizes the design and runs
+        // the exact streamed probe unchanged.
         let skip_value_realization = theta.len() == self.rho_dim + 1 && {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
+                    // #1264: value-only line-search probes still run the inner
+                    // solve on the kept reduced surface. A full-window value
+                    // certificate only proves the k-space Gram is accurate; it
+                    // does NOT prove the frozen RRQR-reduced basis is valid at
+                    // this ψ. Gate the reset_surface skip on the same β̂-sound
+                    // sub-window as `eval_full`, else a cost probe can pair a
+                    // correct Gram with a stale basis and mis-rank κ moves.
+                    && self.evaluator.psi_gram_tensor_covers_skip(psi)
                     // #1033 penalty lane: the value-probe fast path also skips
                     // `reset_surface`, so the probe must be able to re-key S(ψ)
                     // EXACTLY and n-free; otherwise its cost would use the stale
