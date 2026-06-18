@@ -346,7 +346,7 @@ def _fit_disjoint_periodic_top1(
         "assignments_z": assignments,
         "logits": logits,
         "fitted": fitted,
-        "reml_score": float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
+        "penalized_loss_score": float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
         "chosen_k": 2,
         "atom_plans": [
             {
@@ -495,7 +495,7 @@ def _fit_dense_periodic_ibp_lsq(
         "assignments_z": assignments,
         "logits": logits,
         "fitted": fitted,
-        "reml_score": score,
+        "penalized_loss_score": score,
         "chosen_k": k_atoms,
         "atom_plans": [
             {
