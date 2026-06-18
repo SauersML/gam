@@ -395,8 +395,8 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
                 "<span class=\"conv-ok\">consistent</span> \
                  (grad\u{00B7}v={:.3e}, fd\u{00B7}v={:.3e}\u{00B1}{:.1e}, z={:.2})",
                 cert.analytic_directional,
-                cert.fd_directional,
-                cert.fd_error,
+                cert.fd_directional, // fd-ok: FD-audit certificate, not in math path
+                cert.fd_error,       // fd-ok: FD-audit certificate, not in math path
                 cert.agreement_z // fd-ok: FD-audit certificate, not in math path
             )
         } else {
