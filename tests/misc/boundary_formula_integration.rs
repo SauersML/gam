@@ -87,7 +87,10 @@ fn boundary_conditioned_saved_spec_rebuilds_for_prediction() {
 fn one_sided_anchored_bspline_is_predictable_after_freeze() {
     init_parallelism();
     // Linear-ish response anchored at 0 at x = 0, exactly the documented idiom.
-    let headers = ["x", "y"].into_iter().map(str::to_string).collect::<Vec<_>>();
+    let headers = ["x", "y"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let rows = (0..200)
         .map(|i| {
             let x = i as f64 / 199.0;
@@ -121,7 +124,9 @@ fn one_sided_anchored_bspline_is_predictable_after_freeze() {
             new_data[[i, 0]] = xp;
         }
         let design = build_term_collection_design(new_data.view(), &fit.resolvedspec)
-            .unwrap_or_else(|e| panic!("frozen one-sided anchored spec must rebuild `{formula}`: {e:?}"));
+            .unwrap_or_else(|e| {
+                panic!("frozen one-sided anchored spec must rebuild `{formula}`: {e:?}")
+            });
         assert_eq!(
             design.design.ncols(),
             p_beta,
