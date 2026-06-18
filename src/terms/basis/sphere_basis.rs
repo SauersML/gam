@@ -627,11 +627,13 @@ pub(crate) fn build_spherical_harmonic_basis(
         })?;
     }
     // Diagonal Laplace-Beltrami eigenvalue penalty [l(l+1)]^m per (l, m).
-    // For explicit high-degree bases (L > 2), fold an extra [l(l+1)] factor
-    // into modes l > 2 in this same primary block. Keeping the shrinkage tied
-    // to the primary lambda prevents REML from fitting dense equatorial noise
-    // with separately under-penalized high-degree modes and then degrading in
-    // sparse polar latitude bands.
+    // Degree-2 modes carry real low-frequency sphere signal, but they still
+    // need primary-penalty shrinkage under noisy finite samples. For explicit
+    // high-degree bases (L > 2), fold an additional [l(l+1)] factor into modes
+    // l > 2 in this same primary block. Keeping that tail shrinkage tied to the
+    // primary lambda prevents REML from fitting dense equatorial noise with
+    // separately under-penalized high-degree modes and then degrading in sparse
+    // polar latitude bands.
     //
     // This is already in the natural coefficient coordinates for the real
     // spherical harmonics: the basis is orthonormal on S², so X'X/n is O(1)
@@ -647,8 +649,10 @@ pub(crate) fn build_spherical_harmonic_basis(
         let laplace = l as f64 * (l as f64 + 1.0);
         let eig = if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
             0.0
-        } else {
+        } else if l <= 2 {
             laplace.powi((spec.penalty_order + 1) as i32)
+        } else {
+            laplace.powi((spec.penalty_order + 2) as i32)
         };
         for _ in 0..(2 * l + 1) {
             penalty[[col, col]] = eig;
