@@ -2190,6 +2190,19 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         d
     };
 
+    let q_geom = family
+        .row_dynamic_q_geometry(0, &block_states)
+        .expect("diagnostic q geometry");
+    let (_, _, prod_hess) = family
+        .compute_row_flex_primary_gradient_hessian_exact(0, &block_states, &q_geom, &primary)
+        .expect("diagnostic production flex hessian");
+    let witness_h_gw = central_rich(&[(gi, 1), (wi0, 1)], 6e-3);
+    eprintln!(
+        "#932 diagnostic base hess[g,w0]: production {:+.6e} witness {:+.6e}",
+        prod_hess[[gi, wi0]],
+        witness_h_gw
+    );
+
     // ── Third order: production D_dir H[u,v] vs witness ∂³ along (u,v,dir) ───
     // Contract along the logslope axis g; check cross blocks touching the
     // deviation coordinates (the channels Arm A cannot reach).
@@ -2308,12 +2321,31 @@ fn debug_flex_directional_quantities_fd_localize() {
         .expect("exit intercept");
     let base = family
         .compute_survival_timepoint_exact(
-            0, &primary, q1v, primary.q1, a1, gv, d1, Some(&beta_h), Some(&beta_w), 0.0, true,
+            0,
+            &primary,
+            q1v,
+            primary.q1,
+            a1,
+            gv,
+            d1,
+            Some(&beta_h),
+            Some(&beta_w),
+            0.0,
+            true,
         )
         .expect("exit base");
     let ext = family
         .compute_survival_timepoint_directional_exact(
-            0, &primary, q1v, primary.q1, a1, gv, Some(&beta_h), Some(&beta_w), &dir, true,
+            0,
+            &primary,
+            q1v,
+            primary.q1,
+            a1,
+            gv,
+            Some(&beta_h),
+            Some(&beta_w),
+            &dir,
+            true,
         )
         .expect("exit directional");
 
@@ -2332,7 +2364,17 @@ fn debug_flex_directional_quantities_fd_localize() {
             .expect("perturbed exit intercept");
         family
             .compute_survival_timepoint_exact(
-                0, &primary, q, primary.q1, a, g, d, Some(&beta_h), Some(&beta_w), 0.0, true,
+                0,
+                &primary,
+                q,
+                primary.q1,
+                a,
+                g,
+                d,
+                Some(&beta_h),
+                Some(&beta_w),
+                0.0,
+                true,
             )
             .expect("perturbed exit base")
     };
@@ -2355,10 +2397,17 @@ fn debug_flex_directional_quantities_fd_localize() {
         let d_fd_fine = fd(&|b| b.d_uv[[u, v]], 8e-4);
         eprintln!(
             "[{u},{v}] eta_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | chi_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | d_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} (fine {:+.6e} gap {:.2e})",
-            ext.eta_uv_dir[[u, v]], eta_fd, (ext.eta_uv_dir[[u, v]] - eta_fd).abs(),
-            ext.chi_uv_dir[[u, v]], chi_fd, (ext.chi_uv_dir[[u, v]] - chi_fd).abs(),
-            ext.d_uv_dir[[u, v]], d_fd, (ext.d_uv_dir[[u, v]] - d_fd).abs(),
-            d_fd_fine, (ext.d_uv_dir[[u, v]] - d_fd_fine).abs(),
+            ext.eta_uv_dir[[u, v]],
+            eta_fd,
+            (ext.eta_uv_dir[[u, v]] - eta_fd).abs(),
+            ext.chi_uv_dir[[u, v]],
+            chi_fd,
+            (ext.chi_uv_dir[[u, v]] - chi_fd).abs(),
+            ext.d_uv_dir[[u, v]],
+            d_fd,
+            (ext.d_uv_dir[[u, v]] - d_fd).abs(),
+            d_fd_fine,
+            (ext.d_uv_dir[[u, v]] - d_fd_fine).abs(),
         );
     }
     // d_u_dir localization too — INCLUDING w0 (the untested deviation index).
@@ -2367,8 +2416,11 @@ fn debug_flex_directional_quantities_fd_localize() {
         let d_u_fd_fine = fd(&|b| b.d_u[u], 1e-3);
         eprintln!(
             "[{u}] d_u_dir prod {:+.6e} fd {:+.6e} gap {:.2e} (fine {:+.6e} gap {:.2e})",
-            ext.d_u_dir[u], d_u_fd, (ext.d_u_dir[u] - d_u_fd).abs(),
-            d_u_fd_fine, (ext.d_u_dir[u] - d_u_fd_fine).abs()
+            ext.d_u_dir[u],
+            d_u_fd,
+            (ext.d_u_dir[u] - d_u_fd).abs(),
+            d_u_fd_fine,
+            (ext.d_u_dir[u] - d_u_fd_fine).abs()
         );
     }
     // Per-term d_uv_dir localization at the (w0,w0) probe block: FD each base
@@ -2389,7 +2441,16 @@ fn debug_flex_directional_quantities_fd_localize() {
                 .expect("perturbed dir intercept");
             let e = family
                 .compute_survival_timepoint_directional_exact(
-                    0, &primary, q, primary.q1, a, g, Some(&beta_h), Some(&beta_w), &dir, true,
+                    0,
+                    &primary,
+                    q,
+                    primary.q1,
+                    a,
+                    g,
+                    Some(&beta_h),
+                    Some(&beta_w),
+                    &dir,
+                    true,
                 )
                 .expect("perturbed dir");
             e.debug_d_uv_terms.expect("debug terms").0
@@ -2402,7 +2463,10 @@ fn debug_flex_directional_quantities_fd_localize() {
             let fd_i = (plus[i] - minus[i]) / (2.0 * h);
             eprintln!(
                 "[w0,w0] term t{}: T_i_dir(analytic)={:+.6e} D_dir(T_i)(fd)={:+.6e} gap={:.2e}",
-                i + 1, dir_terms[i], fd_i, (dir_terms[i] - fd_i).abs()
+                i + 1,
+                dir_terms[i],
+                fd_i,
+                (dir_terms[i] - fd_i).abs()
             );
         }
     }
@@ -2410,13 +2474,18 @@ fn debug_flex_directional_quantities_fd_localize() {
     // chi_dir (=D_dir chi), eta_dir (=D_dir eta), and D_dir eta_u[u].
     eprintln!(
         "scalar: chi base {:+.6e} D_dir(chi) fd {:+.6e} | eta base {:+.6e} D_dir(eta) fd {:+.6e}",
-        base.chi, fd(&|b| b.chi, 4e-3), base.eta, fd(&|b| b.eta, 4e-3),
+        base.chi,
+        fd(&|b| b.chi, 4e-3),
+        base.eta,
+        fd(&|b| b.eta, 4e-3),
     );
     for &u in &[q1, g] {
         eprintln!(
             "[{u}] eta_u base {:+.6e} D_dir(eta_u) fd {:+.6e} | chi_u base {:+.6e} D_dir(chi_u) fd {:+.6e}",
-            base.eta_u[u], fd(&|b| b.eta_u[u], 4e-3),
-            base.chi_u[u], fd(&|b| b.chi_u[u], 4e-3),
+            base.eta_u[u],
+            fd(&|b| b.eta_u[u], 4e-3),
+            base.chi_u[u],
+            fd(&|b| b.chi_u[u], 4e-3),
         );
     }
     // Direct cross-check: FD of base eta_uv[q1,q1] sanity (recompute from a
