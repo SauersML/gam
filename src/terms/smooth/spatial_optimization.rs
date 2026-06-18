@@ -6011,6 +6011,75 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
 /// (classic Matérn κ/η fits) keeps cheap exact second-order geometry.
 const EXACT_JOINT_SECOND_ORDER_THETA_CAP: usize = 8;
 
+fn exact_joint_seed_config(
+    risk_profile: crate::seeding::SeedRiskProfile,
+    auxiliary_dim: usize,
+) -> crate::seeding::SeedConfig {
+    let mut config = crate::seeding::SeedConfig {
+        risk_profile,
+        num_auxiliary_trailing: auxiliary_dim,
+        ..Default::default()
+    };
+    match risk_profile {
+        crate::seeding::SeedRiskProfile::Gaussian => {
+            config.max_seeds = 4;
+            config.seed_budget = 2;
+        }
+        crate::seeding::SeedRiskProfile::GeneralizedLinear => {
+            // Bernoulli marginal-slope Matérn fits use the exact-joint spatial
+            // driver rather than the family-local BMS outer. Mirror BMS proper:
+            // screen one principled heuristic seed deeply enough to reach the
+            // KKT basin instead of spending minutes screening equivalent starts.
+            config.max_seeds = 1;
+            config.seed_budget = 1;
+            config.screen_max_inner_iterations = 8;
+        }
+        crate::seeding::SeedRiskProfile::Survival => {
+            // Survival marginal-slope has an additional time/hazard block and
+            // is the most sensitive Matérn startup regime. Keep more of the
+            // coherent SPDE candidate manifold alive through truncation and
+            // validate enough starts that one bad transient does not report
+            // "no candidate seeds" before reaching a viable basin.
+            config.max_seeds = 8;
+            config.seed_budget = 4;
+            config.screen_max_inner_iterations = 8;
+        }
+    }
+    config
+}
+
+#[cfg(test)]
+mod exact_joint_seed_config_tests {
+    use super::*;
+
+    #[test]
+    fn exact_joint_marginal_slope_profiles_get_deeper_startup_validation() {
+        let bms = exact_joint_seed_config(crate::seeding::SeedRiskProfile::GeneralizedLinear, 2);
+        assert_eq!(bms.max_seeds, 1);
+        assert_eq!(bms.seed_budget, 1);
+        assert_eq!(bms.screen_max_inner_iterations, 8);
+        assert_eq!(bms.num_auxiliary_trailing, 2);
+
+        let survival = exact_joint_seed_config(crate::seeding::SeedRiskProfile::Survival, 3);
+        assert_eq!(survival.max_seeds, 8);
+        assert_eq!(survival.seed_budget, 4);
+        assert_eq!(survival.screen_max_inner_iterations, 8);
+        assert_eq!(survival.num_auxiliary_trailing, 3);
+    }
+
+    #[test]
+    fn exact_joint_gaussian_keeps_tight_historical_multistart_budget() {
+        let gaussian = exact_joint_seed_config(crate::seeding::SeedRiskProfile::Gaussian, 1);
+        assert_eq!(gaussian.max_seeds, 4);
+        assert_eq!(gaussian.seed_budget, 2);
+        assert_eq!(
+            gaussian.screen_max_inner_iterations,
+            crate::seeding::SeedConfig::default().screen_max_inner_iterations
+        );
+        assert_eq!(gaussian.num_auxiliary_trailing, 1);
+    }
+}
+
 pub(crate) fn exact_joint_multistart_outer_problem(
     theta0: &Array1<f64>,
     lower: &Array1<f64>,
@@ -6084,13 +6153,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_initial_rho(theta0.clone())
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
-        .with_seed_config(crate::seeding::SeedConfig {
-            max_seeds: 4,
-            seed_budget: 2,
-            risk_profile,
-            num_auxiliary_trailing: auxiliary_dim,
-            ..Default::default()
-        })
+        .with_seed_config(exact_joint_seed_config(risk_profile, auxiliary_dim))
         .with_rho_bound(12.0)
         .with_heuristic_lambdas(seed_heuristic);
     if let Some((n_obs, p_cols)) = profiled_objective_size {
