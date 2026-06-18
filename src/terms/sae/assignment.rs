@@ -59,13 +59,15 @@ pub(crate) const SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO: f64 = 1.0e-3;
 /// explained-variance below which a K>=2 dictionary is judged to have
 /// CO-collapsed — every atom degenerate together, so the median-relative
 /// [`SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO`] test sees no atom "behind" its peers
-/// and stays silent. This is the real-data K=2 failure (both atoms fall into one
-/// seed/basin and the fit explains ~0 variance). The floor sits far below any
-/// healthy curved-dictionary fit (real OLMo K=1 reaches EV ~0.22, K=3 ~0.40), so
-/// only a genuinely degenerate dictionary trips it; a merely-difficult target
-/// never does. When tripped, the guard reseeds all-but-the-strongest atom onto
+/// and stays silent. This is the real-data K>=2 failure: atoms can split enough
+/// signal to avoid a relative-norm breach while still under-recovering the
+/// long-tailed target. The floor therefore lives above the committed
+/// OLMo-mixed-layer held-out acceptance bar (0.5 × rank-8 PCA EV ≈ 0.27515),
+/// so a partial co-collapse is re-diversified instead of being accepted as a
+/// merely-difficult fit. K=1 returns before this guard, so the single-atom OLMo
+/// path is unchanged. When tripped, the guard reseeds the dictionary onto
 /// distinct residual PCs to break the shared basin.
-pub(crate) const SAE_DICTIONARY_COLLAPSE_EV_FLOOR: f64 = 0.02;
+pub(crate) const SAE_DICTIONARY_COLLAPSE_EV_FLOOR: f64 = 0.28;
 
 /// #976 / #1117 K>1 robustness: bounded DICTIONARY-level multi-start budget for
 /// the simultaneous co-collapse arm (the EV-floor branch of
