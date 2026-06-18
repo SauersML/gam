@@ -1,4 +1,5 @@
 use super::*;
+use crate::inference::formula_dsl::LinkMode;
 
 pub(crate) fn reject_marginal_slope_controls_for_transformation_normal(
     config: &FitConfig,
