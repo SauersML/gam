@@ -31,8 +31,9 @@ pow_op = { "^" }
 unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 
-primary = { function_call | list_lit | ident | number | string_lit | "(" ~ expr ~ ")" }
+primary = { function_call | list_lit | tuple_lit | ident | number | string_lit | "(" ~ expr ~ ")" }
 list_lit = @{ "[" ~ (!"]" ~ ANY)* ~ "]" }
+tuple_lit = @{ "(" ~ (!")" ~ ANY)* ~ "," ~ (!")" ~ ANY)* ~ ")" }
 function_call = { ident ~ "(" ~ arg_list? ~ ")" }
 arg_list = { arg ~ ("," ~ arg)* }
 arg = { named_arg | expr }
@@ -126,7 +127,6 @@ impl From<String> for FormulaDslError {
 
 pub fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String> {
     validate_balanced_delimiters(formula, "invalid formula syntax")?;
-    reject_tuple_named_argument_values(formula)?;
     let mut parsed =
         FormulaParser::parse(Rule::formula, formula).map_err(|e| FormulaDslError::ParseError {
             reason: format!("invalid formula syntax: {e}"),
@@ -211,76 +211,6 @@ fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String>
         .into());
     }
     Ok(())
-}
-
-fn reject_tuple_named_argument_values(input: &str) -> Result<(), String> {
-    for (idx, _) in input.match_indices('=') {
-        let Some(key) = named_argument_key_before(input, idx) else {
-            continue;
-        };
-        let after_equal = input[idx + 1..].trim_start();
-        if !after_equal.starts_with('(') {
-            continue;
-        }
-        let open_idx = input.len() - after_equal.len();
-        let Some(close_idx) = matching_tuple_close_with_top_level_comma(input, open_idx) else {
-            continue;
-        };
-        let body = input[open_idx + 1..close_idx].trim();
-        return Err(FormulaDslError::ParseError {
-            reason: format!(
-                "invalid smooth parameter syntax `{key}=({body})`: tuple-style parameter values are not supported. Did you mean `{key}=[{body}]`? Valid smooth parameter names include: {}",
-                common_smooth_parameter_names()
-            ),
-        }
-        .into());
-    }
-    Ok(())
-}
-
-fn named_argument_key_before(input: &str, equal_idx: usize) -> Option<String> {
-    let before = input[..equal_idx].trim_end();
-    let start = before
-        .char_indices()
-        .rev()
-        .find_map(|(idx, ch)| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
-                None
-            } else {
-                Some(idx + ch.len_utf8())
-            }
-        })
-        .unwrap_or(0);
-    let key = &before[start..];
-    let mut chars = key.chars();
-    let first = chars.next()?;
-    ((first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
-    .then(|| key.to_string())
-}
-
-fn matching_tuple_close_with_top_level_comma(input: &str, open_idx: usize) -> Option<usize> {
-    let mut nested = 0_i32;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut saw_comma = false;
-    for (offset, ch) in input[open_idx + 1..].char_indices() {
-        let idx = open_idx + 1 + offset;
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '(' | '[' | '{' if !in_single && !in_double => nested += 1,
-            ')' if !in_single && !in_double && nested == 0 => return saw_comma.then_some(idx),
-            ')' | ']' | '}' if !in_single && !in_double && nested > 0 => nested -= 1,
-            ',' if !in_single && !in_double && nested == 0 => saw_comma = true,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn common_smooth_parameter_names() -> &'static str {
-    "bs, type, by, k, basis_dim, knots, knot_placement, degree, penalty_order, m, boundary, period, periods, periodic, length_scale, centers, nu, power, double_penalty, identifiability"
 }
 
 fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
@@ -744,7 +674,6 @@ fn is_exact_ident(raw: &str) -> bool {
 
 pub fn parse_function_call(input: &str) -> Result<FunctionCallSpec, String> {
     validate_balanced_delimiters(input, "invalid function call syntax")?;
-    reject_tuple_named_argument_values(input)?;
     let mut parsed = FormulaParser::parse(Rule::top_function_call, input).map_err(|e| {
         FormulaDslError::ParseError {
             reason: format!("invalid function call syntax: {e}"),
