@@ -280,7 +280,9 @@ pub fn build_bspline_basis_1d(
             spec.penalty_order,
             greville_for_penalty.as_ref().map(|g| g.view()),
         )?;
-        if spec.double_penalty && let Some(shrinkage) = build_nullspace_shrinkage_penalty(&s_bend_raw)? {
+        if spec.double_penalty
+            && let Some(shrinkage) = build_nullspace_shrinkage_penalty(&s_bend_raw)?
+        {
             s_bend_raw += &shrinkage.sym_penalty;
         }
         let mut penalties_raw = vec![PenaltyCandidate {

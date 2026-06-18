@@ -2,9 +2,8 @@ use super::*;
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy, Dense, DuchonBasisSpec,
-    DuchonNullspaceOrder,
-    DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
-    SpatialIdentifiability, ThinPlateBasisSpec,
+    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec,
+    MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
 };
 use crate::estimate::AdaptiveRegularizationOptions;
 use crate::faer_ndarray::{FaerEigh, FaerSvd};
