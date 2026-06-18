@@ -34,7 +34,7 @@ fn wahba_kernel_is_longitude_periodic_and_symmetric() {
 }
 
 #[test]
-fn spherical_basis_builds_constrained_design_and_penalties() {
+fn spherical_basis_builds_raw_wahba_design_and_penalties() {
     let data = array![
         [-80.0, -170.0],
         [-40.0, -60.0],
@@ -57,9 +57,9 @@ fn spherical_basis_builds_constrained_design_and_penalties() {
 
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere basis");
     assert_eq!(built.design.nrows(), data.nrows());
-    assert_eq!(built.design.ncols(), data.nrows() - 1);
+    assert_eq!(built.design.ncols(), data.nrows());
     assert_eq!(built.penalties.len(), 2);
-    assert_eq!(built.penalties[0].nrows(), data.nrows() - 1);
+    assert_eq!(built.penalties[0].nrows(), data.nrows());
 
     match built.metadata {
         BasisMetadata::Sphere {
@@ -75,16 +75,18 @@ fn spherical_basis_builds_constrained_design_and_penalties() {
             assert_eq!(method, gam::basis::SphereMethod::Wahba);
             assert_eq!(max_degree, None);
             assert_eq!(wahba_kernel, Default::default());
-            let z = constraint_transform.expect("coefficient constraint transform");
-            let weights = centers
-                .column(0)
-                .mapv(|lat: f64| lat.to_radians().cos().max(0.0));
-            for col in 0..z.ncols() {
-                let weighted_sum = weights.dot(&z.column(col));
-                assert!(
-                    weighted_sum.abs() < 1e-12,
-                    "constraint column {col} weighted sum {weighted_sum}"
-                );
+            let z = constraint_transform.expect("raw coefficient chart transform");
+            assert_eq!(z.nrows(), centers.nrows());
+            assert_eq!(z.ncols(), centers.nrows());
+            for r in 0..z.nrows() {
+                for c in 0..z.ncols() {
+                    let expected = if r == c { 1.0 } else { 0.0 };
+                    assert!(
+                        (z[(r, c)] - expected).abs() < 1e-12,
+                        "raw Wahba chart should keep identity transform; z[{r},{c}]={}",
+                        z[(r, c)]
+                    );
+                }
             }
         }
         other => panic!("unexpected metadata: {other:?}"),
