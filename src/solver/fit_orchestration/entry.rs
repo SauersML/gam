@@ -326,10 +326,16 @@ fn constant_gaussian_standard_fit(
         .map_err(|err| WorkflowError::IntegrationFailed {
             reason: format!("constant Gaussian shortcut produced invalid fit: {err}"),
         })?;
+    let resolvedspec =
+        freeze_term_collection_from_design(&request.spec, &design).map_err(|err| {
+            WorkflowError::InvalidConfig {
+                reason: format!("constant Gaussian shortcut could not freeze design: {err}"),
+            }
+        })?;
     Ok(StandardFitResult {
         fit,
         design,
-        resolvedspec: request.spec.clone(),
+        resolvedspec,
         adaptive_diagnostics: None,
         kappa_timing: None,
         saved_link_state: crate::estimate::FittedLinkState::Standard(None),
