@@ -2667,6 +2667,97 @@ impl WorkingModelSurvival {
         let state = candidate.update_state(&beta)?;
         candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
     }
+
+    /// TEMPORARY #931 diagnostic: re-converge the inner mode exactly like
+    /// `evaluate_survival_lamlcost_and_gradient` and return a value-term split
+    /// for one active-block ρ so a test can FD each term separately and pin
+    /// whether a value-path jump (e.g. penalty rank/logdet-S detection) or
+    /// solver non-determinism produces the large-λ FD blow-up. Returns
+    /// (total_cost, analytic_grad0, penalized_nll, half_logdet_h, half_logdet_s,
+    ///  penalty_quad_half, r_norm, beta_hat).
+    #[doc(hidden)]
+    pub fn survival_lamlterm_split_931(
+        &self,
+        rho: &[f64],
+        beta0: &Array1<f64>,
+    ) -> Result<(f64, f64, f64, f64, f64, f64, f64, Array1<f64>), EstimationError> {
+        use crate::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
+
+        // Re-converge with the SAME settings as the shim.
+        let mut candidate = self.clone();
+        let mut lambdas: Vec<f64> = candidate.penalties.blocks.iter().map(|b| b.lambda).collect();
+        let mut active_idx = 0usize;
+        for (block, lambda) in candidate.penalties.blocks.iter().zip(lambdas.iter_mut()) {
+            if block.lambda > 0.0 {
+                *lambda = rho[active_idx].exp();
+                active_idx += 1;
+            }
+        }
+        candidate.set_penalty_lambdas(&lambdas)?;
+        let opts = crate::pirls::WorkingModelPirlsOptions {
+            max_iterations: 600,
+            convergence_tolerance: 1e-12,
+            adaptive_kkt_tolerance: None,
+            max_step_halving: 40,
+            min_step_size: 1e-12,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+            initial_lm_lambda: None,
+            geodesic_acceleration: false,
+            arrow_schur: None,
+        };
+        let summary = crate::pirls::runworking_model_pirls(
+            &mut candidate,
+            Coefficients::new(beta0.clone()),
+            &opts,
+            |_| {},
+        )?;
+        let beta = summary.beta.as_ref().to_owned();
+        let state = candidate.update_state(&beta)?;
+        let rho_arr = Array1::from_vec(rho.to_vec());
+        let (total_cost, grad) =
+            candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)?;
+
+        // Value-term split from the re-converged mode.
+        let penalized_nll = -state.log_likelihood + state.penalty_term;
+        let penalty_quad_half = state.penalty_term; // = 1/2 beta' S_lambda beta
+        let h_dense = state.hessian.to_dense();
+        let half_logdet_h = 0.5
+            * DenseSpectralOperator::from_symmetric(&h_dense)
+                .map_err(EstimationError::InvalidInput)?
+                .logdet();
+        // half log|S_lambda|_+ : single rank-1 penalty block of eigenvalue 1,
+        // so log|lambda*S|_+ = rho * rank. Compute from the active penalty.
+        let mut half_logdet_s = 0.0_f64;
+        active_idx = 0;
+        for block in candidate.penalties.blocks.iter() {
+            if block.lambda > 0.0 {
+                let rank = block.matrix.diag().iter().filter(|&&d| d.abs() > 0.0).count();
+                // log|lambda*S|_+ over the rank-dim range = rho*rank + log|S|_+,
+                // but we only need the lambda-dependent part for the FD; include
+                // both by eigen-summing lambda*S nonzero eigenvalues.
+                let lam = rho[active_idx].exp();
+                let scaled = &block.matrix * lam;
+                let ev = DenseSpectralOperator::from_symmetric(&scaled)
+                    .map_err(EstimationError::InvalidInput)?;
+                let _ = rank;
+                half_logdet_s += 0.5 * ev.logdet();
+                active_idx += 1;
+            }
+        }
+        let r_norm = state.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        Ok((
+            total_cost,
+            grad[0],
+            penalized_nll,
+            half_logdet_h,
+            half_logdet_s,
+            penalty_quad_half,
+            r_norm,
+            beta,
+        ))
+    }
 }
 
 /// Derivative provider that adapts survival third-derivative Hessian corrections

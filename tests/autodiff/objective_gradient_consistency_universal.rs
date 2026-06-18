@@ -1289,6 +1289,47 @@ fn survival_objective_gradient_consistent_interior() {
 // floor (ρ=4), whose FD is sound.
 
 #[test]
+fn survival_rho_eight_term_split_probe_931() {
+    let model = survival_single_block_model(1.0);
+    let beta0 = array![-2.5_f64, 1.0];
+    // Determinism: same (rho, beta0) twice.
+    let a = model.survival_lamlterm_split_931(&[8.0], &beta0).unwrap();
+    let b = model.survival_lamlterm_split_931(&[8.0], &beta0).unwrap();
+    println!(
+        "[931-TS] determinism: dCost={:.3e} dGrad={:.3e} dPnll={:.3e} dLdH={:.3e} dLdS={:.3e} dQuad={:.3e} dBeta={:.3e}",
+        (a.0 - b.0).abs(),
+        (a.1 - b.1).abs(),
+        (a.2 - b.2).abs(),
+        (a.3 - b.3).abs(),
+        (a.4 - b.4).abs(),
+        (a.5 - b.5).abs(),
+        (&a.7 - &b.7).iter().map(|v| v.abs()).fold(0.0, f64::max),
+    );
+    // Per-term FD across the probe at rho=8.
+    let h_list = [1.0e-5_f64, 1.0e-4, 5.0e-4, 1.0e-3, 2.0e-3];
+    let base = model.survival_lamlterm_split_931(&[8.0], &beta0).unwrap();
+    println!(
+        "[931-TS] @rho=8: cost={:.12e} analyticGrad={:.12e} pnll={:.12e} halfLdH={:.12e} halfLdS={:.12e} quadHalf={:.12e} rnorm={:.3e} beta={:?}",
+        base.0, base.1, base.2, base.3, base.4, base.5, base.6, base.7.to_vec()
+    );
+    for h in h_list {
+        let p = model.survival_lamlterm_split_931(&[8.0 + h], &beta0).unwrap();
+        let m = model.survival_lamlterm_split_931(&[8.0 - h], &beta0).unwrap();
+        let fd_cost = (p.0 - m.0) / (2.0 * h);
+        let fd_pnll = (p.2 - m.2) / (2.0 * h);
+        let fd_ldh = (p.3 - m.3) / (2.0 * h);
+        let fd_lds = (p.4 - m.4) / (2.0 * h);
+        let fd_quad = (p.5 - m.5) / (2.0 * h);
+        let dbeta = (&p.7 - &m.7).iter().map(|v| v.abs()).fold(0.0, f64::max);
+        println!(
+            "[931-TS] h={h:.1e} fdCost={fd_cost:.6e} | d(pnll)/dr={fd_pnll:.6e} d(½ldH)/dr={fd_ldh:.6e} d(½ldS)/dr={fd_lds:.6e} d(quad½)/dr={fd_quad:.6e} | dBeta(±h)={dbeta:.3e} rnorm+={:.2e} rnorm-={:.2e}",
+            p.6, m.6
+        );
+    }
+    panic!("[931-TS] term-split probe complete (intentional fail to surface stdout)");
+}
+
+#[test]
 fn survival_objective_gradient_consistent_at_large_lambda_boundary() {
     let model = survival_single_block_model(1.0);
     let beta0 = array![-2.5_f64, 1.0];
