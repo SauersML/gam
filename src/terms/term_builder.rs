@@ -2568,7 +2568,10 @@ pub fn build_smooth_basis(
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
-                cap_default_spatial_centers(options, plan.centers),
+                cap_default_spatial_centers(
+                    options,
+                    default_matern_center_count(ds.values.nrows(), cols.len(), plan.centers),
+                ),
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
@@ -3840,6 +3843,16 @@ pub(crate) fn cap_default_spatial_centers(
         Some(cap) => default_count.min(cap),
         None => default_count,
     }
+}
+
+fn default_matern_center_count(n: usize, d: usize, planned_count: usize) -> usize {
+    // The generic spatial heuristic intentionally caps defaults at n/4 for
+    // high-dimensional operator conditioning.  A 1-D Matérn smooth with very
+    // small n needs a few more centers to avoid a two-column centered kernel
+    // block that is numerically fragile and too stiff for simple polynomial
+    // recovery tests.  Keep this Matérn-specific and still bounded by n.
+    let low_n_floor = (d + 4).min(n);
+    planned_count.max(low_n_floor).max(1)
 }
 
 pub fn parse_countwith_basis_alias(

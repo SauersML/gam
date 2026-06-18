@@ -3003,9 +3003,11 @@ pub(crate) fn matern_rank_reduce_centers(
 ) -> Result<Array2<f64>, BasisError> {
     let k = centers.nrows();
     let n = data.nrows();
-    // Need at least as many rows as columns for a column rank to be meaningful;
-    // the kernel design is n × K, and a 0/1-center basis can never be deficient.
-    if k <= 1 || n < k {
+    // A 0/1-center basis can never be internally deficient.  Otherwise always
+    // inspect the realized n × K kernel block, including the low-n / K > n
+    // case: its column rank is at most n, and leaving all K centers in place
+    // simply defers the inevitable rank-deficiency to the fit audit.
+    if k <= 1 {
         return Ok(centers.clone());
     }
     let mut kernel_block = Array2::<f64>::zeros((n, k));
