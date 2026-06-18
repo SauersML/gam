@@ -42,8 +42,37 @@ impl SurvivalMarginalSlopeFamily {
         dir: &Array1<f64>,
         need_d_uv_dir: bool,
     ) -> Result<SurvivalFlexTimepointDirectionalExact, String> {
-        let p = primary.total;
         let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
+        self.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            primary,
+            q,
+            q_index,
+            a,
+            b,
+            beta_h,
+            beta_w,
+            &cached,
+            dir,
+            need_d_uv_dir,
+        )
+    }
+
+    pub(crate) fn compute_survival_timepoint_directional_exact_from_cached(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        cached: &CachedPartitionCells,
+        dir: &Array1<f64>,
+        need_d_uv_dir: bool,
+    ) -> Result<SurvivalFlexTimepointDirectionalExact, String> {
+        let p = primary.total;
 
         // ── Pre-pass: the intercept directional motion a_dir ───────────────
         // The fixed-domain moment reductions below produce the PARTIAL

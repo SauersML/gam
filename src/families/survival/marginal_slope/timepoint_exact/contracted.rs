@@ -65,11 +65,36 @@ impl SurvivalMarginalSlopeFamily {
             Some((row, SurvivalInterceptSlotKind::Exit)),
         )?;
 
-        let entry = self.compute_survival_timepoint_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl, false,
+        let entry_cached = self.build_cached_partition(&primary, a0, g, beta_h, beta_w)?;
+        let exit_cached = self.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
+
+        let entry = self.compute_survival_timepoint_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            d0,
+            beta_h,
+            beta_w,
+            o_infl,
+            false,
+            &entry_cached,
         )?;
-        let exit = self.compute_survival_timepoint_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl, true,
+        let exit = self.compute_survival_timepoint_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            d1,
+            beta_h,
+            beta_w,
+            o_infl,
+            true,
+            &exit_cached,
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
@@ -82,11 +107,31 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let entry_ext = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir, false,
+        let entry_ext = self.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            beta_h,
+            beta_w,
+            &entry_cached,
+            dir,
+            false,
         )?;
-        let exit_ext = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir, true,
+        let exit_ext = self.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            beta_h,
+            beta_w,
+            &exit_cached,
+            dir,
+            true,
         )?;
 
         // Delegate the per-(u, v) assembly to the Block 10 GPU-substrate
@@ -178,11 +223,36 @@ impl SurvivalMarginalSlopeFamily {
             Some((row, SurvivalInterceptSlotKind::Exit)),
         )?;
 
-        let entry_base = self.compute_survival_timepoint_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl, false,
+        let entry_cached = self.build_cached_partition(&primary, a0, g, beta_h, beta_w)?;
+        let exit_cached = self.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
+
+        let entry_base = self.compute_survival_timepoint_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            d0,
+            beta_h,
+            beta_w,
+            o_infl,
+            false,
+            &entry_cached,
         )?;
-        let exit_base = self.compute_survival_timepoint_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl, true,
+        let exit_base = self.compute_survival_timepoint_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            d1,
+            beta_h,
+            beta_w,
+            o_infl,
+            true,
+            &exit_cached,
         )?;
 
         if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
@@ -195,26 +265,86 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let entry_ext_u = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir_u, false,
+        let entry_ext_u = self.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            beta_h,
+            beta_w,
+            &entry_cached,
+            dir_u,
+            false,
         )?;
-        let entry_ext_v = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir_v, false,
+        let entry_ext_v = self.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            beta_h,
+            beta_w,
+            &entry_cached,
+            dir_v,
+            false,
         )?;
-        let exit_ext_u = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir_u, true,
+        let exit_ext_u = self.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            beta_h,
+            beta_w,
+            &exit_cached,
+            dir_u,
+            true,
         )?;
-        let exit_ext_v = self.compute_survival_timepoint_directional_exact(
-            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir_v, true,
+        let exit_ext_v = self.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            beta_h,
+            beta_w,
+            &exit_cached,
+            dir_v,
+            true,
         )?;
 
         // Bidirectional extensions D_{d1} D_{d2} (η_uv, χ_uv, D_uv) via exact
         // IFT second-order recursion through the cell kernel.
-        let entry_bi = self.compute_survival_timepoint_bidirectional_exact(
-            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir_u, dir_v,
+        let entry_bi = self.compute_survival_timepoint_bidirectional_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            beta_h,
+            beta_w,
+            &entry_cached,
+            dir_u,
+            dir_v,
         )?;
-        let exit_bi = self.compute_survival_timepoint_bidirectional_exact(
-            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir_u, dir_v,
+        let exit_bi = self.compute_survival_timepoint_bidirectional_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            beta_h,
+            beta_w,
+            &exit_cached,
+            dir_u,
+            dir_v,
         )?;
 
         // Delegate the per-(u, v) assembly + averaged-ordered
