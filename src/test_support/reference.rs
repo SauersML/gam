@@ -334,6 +334,14 @@ pub fn run_r(columns: &[Column<'_>], body: &str) -> ReferenceResult {
 /// absent — never the gam-side claim. Every other reference dependency remains a
 /// hard failure via [`run_r`]/[`run_python`].
 pub fn r_package_available(pkg: &str) -> bool {
+    if ReferenceKind::r()
+        .command()
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return false;
+    }
     // `requireNamespace` is contractually non-throwing (returns FALSE and warns
     // on a failed load), so the probe interpreter always exits zero and this is
     // never itself a hard failure. `as.numeric(TRUE/FALSE)` -> 1/0.
