@@ -54,6 +54,14 @@ const DEFAULT_BSPLINE_DEGREE: usize = 3;
 /// `m=`) option is absent. Second-order (curvature) is the standard P-spline
 /// convention.
 const DEFAULT_PENALTY_ORDER: usize = 2;
+
+/// Default basis dimension for one-dimensional cyclic cubic P-splines.
+///
+/// Periodic smooths spend no coefficients on free endpoints, so they should not
+/// inherit the larger open B-spline knot ceiling by default.  This is still only
+/// a default: callers can request a richer periodic space with `k=`.
+const CYCLIC_DEFAULT_BASIS_DIM: usize = 12;
+
 /// Default shared-marginal basis dimension for `bs="fs"`/`bs="sz"` factor smooths,
 /// matching mgcv's factor-smooth default `k=10`. A factor smooth shares one
 /// marginal across all levels; a modest basis recovers the shared signal without
@@ -1935,7 +1943,21 @@ pub fn build_smooth_basis(
             if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 default_internal = default_internal.min(1);
             }
-            let default_basis = default_internal + degree + 1;
+            // A periodic cubic spline has no free endpoint behaviour to spend
+            // degrees of freedom on: the wrap constraint removes the ordinary
+            // boundary wiggle, and the cyclic second-difference penalty leaves
+            // only the constant direction (handled by the smooth
+            // identifiability constraint).  Reusing the open-spline default
+            // ceiling (often 20 internal knots, i.e. 24 cyclic coefficients)
+            // gives small binomial/continuation-ratio fits a large penalized
+            // nuisance space whose REML/LAML optimum is driven by finite-sample
+            // Bernoulli noise rather than the low-frequency periodic signal.
+            // Match the mgcv `bs="cc"` spirit: default to a modest cyclic
+            // basis unless the caller explicitly requests `k=...`; high-
+            // frequency periodic structure remains available through that
+            // explicit contract.
+            let cyclic_default_basis_cap = CYCLIC_DEFAULT_BASIS_DIM.max(degree + 1);
+            let default_basis = (default_internal + degree + 1).min(cyclic_default_basis_cap);
             let num_basis = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
                 .unwrap_or(default_basis);
             if num_basis < degree + 1 {
