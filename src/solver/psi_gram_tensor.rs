@@ -258,6 +258,34 @@ fn cheb_t_double_prime(x: f64, n: usize) -> Vec<f64> {
     tpp
 }
 
+fn kahan_scaled_add_array2(
+    out: &mut Array2<f64>,
+    comp: &mut Array2<f64>,
+    scale: f64,
+    x: &Array2<f64>,
+) {
+    for ((slot, c), &value) in out.iter_mut().zip(comp.iter_mut()).zip(x.iter()) {
+        let y = scale * value - *c;
+        let t = *slot + y;
+        *c = (t - *slot) - y;
+        *slot = t;
+    }
+}
+
+fn kahan_scaled_add_array1(
+    out: &mut Array1<f64>,
+    comp: &mut Array1<f64>,
+    scale: f64,
+    x: &Array1<f64>,
+) {
+    for ((slot, c), &value) in out.iter_mut().zip(comp.iter_mut()).zip(x.iter()) {
+        let y = scale * value - *c;
+        let t = *slot + y;
+        *c = (t - *slot) - y;
+        *slot = t;
+    }
+}
+
 impl PsiGramTensor {
     /// Build and certify the tensor over `psi ∈ [psi_lo, psi_hi]`.
     ///
@@ -341,9 +369,10 @@ impl PsiGramTensor {
         for d in 0..m {
             let gamma = if d == 0 { 1.0 } else { 2.0 };
             let mut slab = Array2::<f64>::zeros((n, k));
+            let mut slab_comp = Array2::<f64>::zeros((n, k));
             for (i, design) in designs.iter().enumerate() {
                 let wgt = gamma / m as f64 * t_at_nodes[i][d];
-                slab.scaled_add(wgt, design);
+                kahan_scaled_add_array2(&mut slab, &mut slab_comp, wgt, design);
             }
             coeff_slabs.push(slab);
         }
@@ -387,9 +416,14 @@ impl PsiGramTensor {
         }
         let mut wz = Array1::<f64>::zeros(z.len());
         let mut zt_w_z = 0.0_f64;
+        let mut zt_w_z_comp = 0.0_f64;
         for ((slot, &w), &zv) in wz.iter_mut().zip(weights.iter()).zip(z.iter()) {
             *slot = w * zv;
-            zt_w_z += w * zv * zv;
+            let add = w * zv * zv;
+            let y = add - zt_w_z_comp;
+            let t = zt_w_z + y;
+            zt_w_z_comp = (t - zt_w_z) - y;
+            zt_w_z = t;
         }
         // One-time n-pass products: G̃[d][e] = X_dᵀ W X_e, c̃[d] = X_dᵀ W z.
         let mut weighted: Vec<Array2<f64>> = Vec::with_capacity(m);
@@ -417,11 +451,15 @@ impl PsiGramTensor {
         let mut gram: Vec<Array2<f64>> = (0..(2 * m - 1))
             .map(|_| Array2::<f64>::zeros((k, k)))
             .collect();
+        let mut gram_comp: Vec<Array2<f64>> = (0..(2 * m - 1))
+            .map(|_| Array2::<f64>::zeros((k, k)))
+            .collect();
         for d in 0..m {
             for e in 0..m {
                 let product = &gram_products[d * m + e];
-                gram[d + e].scaled_add(0.5, product);
-                gram[d.abs_diff(e)].scaled_add(0.5, product);
+                kahan_scaled_add_array2(&mut gram[d + e], &mut gram_comp[d + e], 0.5, product);
+                let folded = d.abs_diff(e);
+                kahan_scaled_add_array2(&mut gram[folded], &mut gram_comp[folded], 0.5, product);
             }
         }
         drop(gram_products);
@@ -749,8 +787,9 @@ impl PsiGramTensor {
         let x = self.mapped(psi);
         let t = cheb_t(x, self.gram.len());
         let mut out = Array2::<f64>::zeros((self.k, self.k));
+        let mut comp = Array2::<f64>::zeros((self.k, self.k));
         for (d, td) in t.iter().enumerate() {
-            out.scaled_add(*td, &self.gram[d]);
+            kahan_scaled_add_array2(&mut out, &mut comp, *td, &self.gram[d]);
         }
         out
     }
@@ -760,8 +799,9 @@ impl PsiGramTensor {
         let x = self.mapped(psi);
         let t = cheb_t(x, self.n_coeff);
         let mut out = Array1::<f64>::zeros(self.k);
+        let mut comp = Array1::<f64>::zeros(self.k);
         for (d, td) in t.iter().enumerate() {
-            out.scaled_add(*td, &self.rhs[d]);
+            kahan_scaled_add_array1(&mut out, &mut comp, *td, &self.rhs[d]);
         }
         out
     }
@@ -774,8 +814,9 @@ impl PsiGramTensor {
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
         let tp = cheb_t_prime(x, self.gram.len());
         let mut out = Array2::<f64>::zeros((self.k, self.k));
+        let mut comp = Array2::<f64>::zeros((self.k, self.k));
         for (d, tpd) in tp.iter().enumerate() {
-            out.scaled_add(*tpd * dx_dpsi, &self.gram[d]);
+            kahan_scaled_add_array2(&mut out, &mut comp, *tpd * dx_dpsi, &self.gram[d]);
         }
         out
     }
@@ -786,8 +827,9 @@ impl PsiGramTensor {
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
         let tp = cheb_t_prime(x, self.n_coeff);
         let mut out = Array1::<f64>::zeros(self.k);
+        let mut comp = Array1::<f64>::zeros(self.k);
         for (d, tpd) in tp.iter().enumerate() {
-            out.scaled_add(*tpd * dx_dpsi, &self.rhs[d]);
+            kahan_scaled_add_array1(&mut out, &mut comp, *tpd * dx_dpsi, &self.rhs[d]);
         }
         out
     }
@@ -806,8 +848,9 @@ impl PsiGramTensor {
         let dx_dpsi_sq = dx_dpsi * dx_dpsi;
         let tpp = cheb_t_double_prime(x, self.gram.len());
         let mut out = Array2::<f64>::zeros((self.k, self.k));
+        let mut comp = Array2::<f64>::zeros((self.k, self.k));
         for (d, tppd) in tpp.iter().enumerate() {
-            out.scaled_add(*tppd * dx_dpsi_sq, &self.gram[d]);
+            kahan_scaled_add_array2(&mut out, &mut comp, *tppd * dx_dpsi_sq, &self.gram[d]);
         }
         out
     }
@@ -819,8 +862,9 @@ impl PsiGramTensor {
         let dx_dpsi_sq = dx_dpsi * dx_dpsi;
         let tpp = cheb_t_double_prime(x, self.n_coeff);
         let mut out = Array1::<f64>::zeros(self.k);
+        let mut comp = Array1::<f64>::zeros(self.k);
         for (d, tppd) in tpp.iter().enumerate() {
-            out.scaled_add(*tppd * dx_dpsi_sq, &self.rhs[d]);
+            kahan_scaled_add_array1(&mut out, &mut comp, *tppd * dx_dpsi_sq, &self.rhs[d]);
         }
         out
     }
