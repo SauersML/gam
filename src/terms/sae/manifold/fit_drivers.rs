@@ -2804,6 +2804,23 @@ impl SaeManifoldTerm {
             self.accumulate_decoder_gram(&mut grams);
             self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
         }
+        // #1026 — keep the best real reconstruction basin found inside this
+        // bounded inner solve. The co-collapse guard can reseed onto a high-EV
+        // PC-periodic dictionary and then a later Newton step can drift back into
+        // the same low-EV basin before `into_fitted` gets a chance to compare
+        // against the pristine seed. Track an incumbent over states that have
+        // passed the identifiability audit and restore it if the final iterate
+        // degraded. This is not a PCA shortcut: the incumbent is the normal SAE
+        // dictionary state (coords, logits, decoder blocks) produced by the
+        // existing seed/reseed plus LSQ machinery.
+        let mut best_reconstruction_ev = self
+            .dictionary_reconstruction_ev(target, rho)
+            .unwrap_or(f64::NEG_INFINITY);
+        let mut best_reconstruction_state = if best_reconstruction_ev.is_finite() {
+            Some(self.snapshot_mutable_state())
+        } else {
+            None
+        };
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
@@ -3079,12 +3096,38 @@ impl SaeManifoldTerm {
                 self.refresh_active_frames_from_data(target, rho)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
+            if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
+                if ev.is_finite() && ev > best_reconstruction_ev + SAE_FINAL_EV_DEGRADATION_TOL {
+                    best_reconstruction_ev = ev;
+                    best_reconstruction_state = Some(self.snapshot_mutable_state());
+                }
+            }
         }
         // #1117 — the rank-`r_k` oracle is already pinned: each rank-deficient
         // atom was reparametrized onto its data-supported subspace at fit entry
         // (`reduce_atoms_to_data_supported_rank`), so its decoder lives in the
         // reduced `r_k`-wide coordinate by construction and carries no data-null
         // component to project away. No post-loop projection is needed.
+        if let Some(best_state) = best_reconstruction_state.as_ref() {
+            if let Ok(final_ev) = self.dictionary_reconstruction_ev(target, rho) {
+                if best_reconstruction_ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR
+                    && final_ev.is_finite()
+                    && final_ev + SAE_FINAL_EV_DEGRADATION_TOL < best_reconstruction_ev
+                {
+                    log::warn!(
+                        "[#1026] restoring inner-fit reconstruction incumbent after EV degraded \
+                         from {best_reconstruction_ev:.4} to {final_ev:.4}"
+                    );
+                    self.restore_mutable_state(best_state);
+                    if self.frames_active() {
+                        self.refresh_active_frames_from_data(target, rho)
+                            .map_err(|err| {
+                                format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
+                            })?;
+                    }
+                }
+            }
+        }
         // ρ is owned by the outer engine and unchanged here; just return the
         // converged inner loss at the fixed ρ.
         self.loss(target, rho)
