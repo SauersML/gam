@@ -47,10 +47,8 @@ impl SurvivalMarginalSlopeFamily {
                 let state = &cell_entry.state;
                 let fixed = &cell_entry.fixed;
                 let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
-                f_a_pre += exact_kernel::cell_first_derivative_from_moments(
-                    &neg_dc_da,
-                    &state.moments,
-                )?;
+                f_a_pre +=
+                    exact_kernel::cell_first_derivative_from_moments(&neg_dc_da, &state.moments)?;
                 let mut neg_coeff_dir = [0.0; 4];
                 for c in 0..p {
                     if dir[c] == 0.0 {
@@ -269,7 +267,8 @@ impl SurvivalMarginalSlopeFamily {
                             // TOTAL D_dir(f_uv) (gam#932/#979). `∂³c/∂u∂v∂a` is
                             // the `coeff_abu` a-cross (nonzero only when u or v
                             // is the slope g).
-                            let sc_uva = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, v);
+                            let sc_uva =
+                                self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, v);
                             for k in 0..4 {
                                 neg_coeff_u_dir[k] -= a_dir * fixed.coeff_au[u][k];
                                 neg_coeff_v_dir[k] -= a_dir * fixed.coeff_au[v][k];
@@ -615,7 +614,6 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-
         // D_u_dir: directional derivative of the density normalization first derivative.
         let d_u_dir_cell_accums = cached
             .cells
@@ -795,8 +793,7 @@ impl SurvivalMarginalSlopeFamily {
         if need_d_uv_dir {
             // #932 debug probe block: (w0, w0) deviation diagonal.
             #[cfg(test)]
-            let dbg_target: Option<(usize, usize)> =
-                primary.w.as_ref().map(|w| (w.start, w.start));
+            let dbg_target: Option<(usize, usize)> = primary.w.as_ref().map(|w| (w.start, w.start));
             let d_uv_dir_cell_accums = cached
                 .cells
                 .iter()
@@ -1279,6 +1276,95 @@ impl SurvivalMarginalSlopeFamily {
                                 ),
                             );
 
+                            let jet_poly = |base: &[f64], d1: &[f64]| -> Vec<MultiDirJet> {
+                                let count = base.len().max(d1.len());
+                                (0..count)
+                                    .map(|idx| {
+                                        MultiDirJet::bilinear(
+                                            *base.get(idx).unwrap_or(&0.0),
+                                            *d1.get(idx).unwrap_or(&0.0),
+                                            0.0,
+                                            0.0,
+                                        )
+                                    })
+                                    .collect()
+                            };
+                            let scalar_jet =
+                                |base: f64, d1: f64| MultiDirJet::bilinear(base, d1, 0.0, 0.0);
+                            let eta_poly_jet = jet_poly(&eta_poly, &eta_dir_poly);
+                            let chi_poly_jet = jet_poly(&chi_poly, &chi_dir_poly);
+                            let eta_aa_poly_jet = jet_poly(&eta_aa_poly, &eta_aa_dir_poly);
+                            let eta_aaa_poly_jet = jet_poly(&eta_aaa_poly, &eta_aaa_dir_poly);
+                            let eta_u_poly_jet_u = jet_poly(&eta_u_poly[u], &eta_u_dir_poly_u);
+                            let eta_u_poly_jet_v = jet_poly(&eta_u_poly[v], &eta_u_dir_poly_v);
+                            let chi_u_poly_jet_u = jet_poly(&chi_u_poly[u], &chi_u_dir_poly_u);
+                            let chi_u_poly_jet_v = jet_poly(&chi_u_poly[v], &chi_u_dir_poly_v);
+                            let eta_uv_poly_jet = jet_poly(&eta_uv_poly, &eta_uv_dir_poly);
+                            let a_u_jet = scalar_jet(a_u[u], a_u_dir[u]);
+                            let a_v_jet = scalar_jet(a_u[v], a_u_dir[v]);
+                            let a_uv_jet = scalar_jet(a_uv[[u, v]], a_uv_dir[[u, v]]);
+                            let a_u_prod_jet = a_u_jet.mul(&a_v_jet);
+                            let coeff_aau_u_jet =
+                                jet_poly(fixed.coeff_aau[u].as_ref(), &coeff_aau_dir_u);
+                            let coeff_aau_v_jet =
+                                jet_poly(fixed.coeff_aau[v].as_ref(), &coeff_aau_dir_v);
+                            let chi_uv_fixed_base = if u == primary.g {
+                                fixed.coeff_abu[v].to_vec()
+                            } else if v == primary.g {
+                                fixed.coeff_abu[u].to_vec()
+                            } else {
+                                vec![0.0; 4]
+                            };
+                            let chi_uv_fixed_jet = jet_poly(&chi_uv_fixed_base, &r1_uv_dir);
+                            let t1_jet = poly_add_jets(
+                                &poly_add_jets(
+                                    &poly_scale_jets(&eta_aa_poly_jet, &a_uv_jet),
+                                    &poly_scale_jets(&eta_aaa_poly_jet, &a_u_prod_jet),
+                                ),
+                                &poly_add_jets(
+                                    &poly_scale_jets(&coeff_aau_u_jet, &a_v_jet),
+                                    &poly_add_jets(
+                                        &poly_scale_jets(&coeff_aau_v_jet, &a_u_jet),
+                                        &chi_uv_fixed_jet,
+                                    ),
+                                ),
+                            );
+                            let t2_jet = poly_scale_jets(
+                                &poly_mul_jets(
+                                    &poly_mul_jets(&chi_u_poly_jet_v, &eta_poly_jet),
+                                    &eta_u_poly_jet_u,
+                                ),
+                                &MultiDirJet::constant(2, -1.0),
+                            );
+                            let t3_jet = poly_scale_jets(
+                                &poly_mul_jets(
+                                    &poly_mul_jets(&chi_u_poly_jet_u, &eta_poly_jet),
+                                    &eta_u_poly_jet_v,
+                                ),
+                                &MultiDirJet::constant(2, -1.0),
+                            );
+                            let t4_jet = poly_scale_jets(
+                                &poly_mul_jets(
+                                    &chi_poly_jet,
+                                    &poly_add_jets(
+                                        &poly_mul_jets(&eta_u_poly_jet_u, &eta_u_poly_jet_v),
+                                        &poly_mul_jets(&eta_poly_jet, &eta_uv_poly_jet),
+                                    ),
+                                ),
+                                &MultiDirJet::constant(2, -1.0),
+                            );
+                            let t5_jet = poly_mul_jets(
+                                &chi_poly_jet,
+                                &poly_mul_jets(
+                                    &poly_mul_jets(&eta_poly_jet, &eta_poly_jet),
+                                    &poly_mul_jets(&eta_u_poly_jet_u, &eta_u_poly_jet_v),
+                                ),
+                            );
+                            let t1_dir = poly_coeff_mask(&t1_jet, 1);
+                            let t2_dir = poly_coeff_mask(&t2_jet, 1);
+                            let t3_dir = poly_coeff_mask(&t3_jet, 1);
+                            let t4_dir = poly_coeff_mask(&t4_jet, 1);
+                            let t5_dir = poly_coeff_mask(&t5_jet, 1);
                             let i_base_dir = poly_add(
                                 &poly_add(&poly_add(&t1_dir, &t2_dir), &t3_dir),
                                 &poly_add(&t4_dir, &t5_dir),
