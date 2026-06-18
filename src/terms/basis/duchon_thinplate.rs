@@ -610,7 +610,16 @@ pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
     monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
 }
 
-const THIN_PLATE_RADIAL_RETAIN_REL_TOL: f64 = 1.0e-1;
+// Keep every numerically identifiable radial direction in the low-rank TPS
+// basis.  The eigendecomposition below is not a rank-revealing compression
+// step in Wood's TPRS construction: the user-visible `k` already is the model
+// dimension budget, and small positive bending-eigenvalue directions are the
+// smoothest penalized directions, not junk.  A previous 10% relative cutoff
+// routinely discarded several of the `k - dim(null(P))` radial columns for
+// k=10 two-dimensional smooths, collapsing the model space and forcing REML to
+// recover curved signal with too few degrees of freedom.  Only drop eigenvalues
+// at the numerical roundoff floor of the largest curvature eigenvalue.
+const THIN_PLATE_RADIAL_RETAIN_REL_TOL: f64 = 1.0e-12;
 
 fn thin_plate_retained_radial_indices(evals: &Array1<f64>) -> Vec<usize> {
     if evals.is_empty() {
