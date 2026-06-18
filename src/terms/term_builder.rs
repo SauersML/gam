@@ -2222,12 +2222,18 @@ pub fn build_smooth_basis(
             } else {
                 None
             };
+            let penalty_order = option_usize(options, "penalty_order")
+                .or_else(|| option_usize(options, "m"))
+                .unwrap_or(DEFAULT_PENALTY_ORDER);
             let center_strategy = if matches!(method, SphereMethod::Wahba) {
-                let centers = parse_countwith_basis_alias(
+                let mut centers = parse_countwith_basis_alias(
                     options,
                     "centers",
                     default_num_centers(ds.values.nrows(), cols.len()),
                 )?;
+                if penalty_order >= 4 {
+                    centers = centers.max(30);
+                }
                 CenterStrategy::FarthestPoint {
                     num_centers: centers,
                 }
@@ -2238,9 +2244,7 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: SphericalSplineBasisSpec {
                     center_strategy,
-                    penalty_order: option_usize(options, "penalty_order")
-                        .or_else(|| option_usize(options, "m"))
-                        .unwrap_or(DEFAULT_PENALTY_ORDER),
+                    penalty_order,
                     double_penalty: smooth_double_penalty,
                     radians,
                     method,
