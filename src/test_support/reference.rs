@@ -418,6 +418,243 @@ pub fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// Compact, reusable diagnostics for truth/reference quality tests.
+#[derive(Clone, Debug)]
+pub struct QualityDiagnostics {
+    pub label: String,
+    pub rmse_vs_truth: Option<f64>,
+    pub rmse_vs_reference: Option<f64>,
+    pub reference_rmse_vs_truth: Option<f64>,
+    pub edf_total: Option<f64>,
+    pub rho: Vec<f64>,
+    pub lambda: Vec<f64>,
+    pub design: Option<DesignDiagnostics>,
+    pub penalties: Vec<PenaltyDiagnostics>,
+    pub prediction: Option<PredictionFingerprint>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DesignDiagnostics {
+    pub nrows: usize,
+    pub ncols: usize,
+    pub rank: usize,
+    pub condition: f64,
+    pub sigma_min: f64,
+    pub sigma_max: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PenaltyDiagnostics {
+    pub index: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+    pub rank: usize,
+    pub lambda: Option<f64>,
+    pub eig_min: f64,
+    pub eig_max: f64,
+    pub trace: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PredictionFingerprint {
+    pub n: usize,
+    pub mean: f64,
+    pub sd: f64,
+    pub min: f64,
+    pub max: f64,
+    pub first: f64,
+    pub last: f64,
+}
+
+impl QualityDiagnostics {
+    pub fn from_standard_fit(label: impl Into<String>, fit: &crate::StandardFitResult) -> Self {
+        let design = design_diagnostics(&fit.design.design).ok();
+        let penalties = penalty_diagnostics(
+            &fit.design.penalties,
+            fit.fit.lambdas.as_slice().unwrap_or(&[]),
+        );
+        Self {
+            label: label.into(),
+            rmse_vs_truth: None,
+            rmse_vs_reference: None,
+            reference_rmse_vs_truth: None,
+            edf_total: fit.fit.inference.as_ref().map(|i| i.edf_total),
+            rho: fit.fit.log_lambdas.to_vec(),
+            lambda: fit.fit.lambdas.to_vec(),
+            design,
+            penalties,
+            prediction: None,
+        }
+    }
+    pub fn with_truth_rmse(mut self, pred: &[f64], truth: &[f64]) -> Self {
+        self.rmse_vs_truth = Some(rmse(pred, truth));
+        self.prediction = Some(prediction_fingerprint(pred));
+        self
+    }
+    pub fn with_reference_gap(
+        mut self,
+        pred: &[f64],
+        reference: &[f64],
+        truth: Option<&[f64]>,
+    ) -> Self {
+        self.rmse_vs_reference = Some(rmse(pred, reference));
+        if let Some(truth) = truth {
+            self.reference_rmse_vs_truth = Some(rmse(reference, truth));
+        }
+        self
+    }
+    pub fn emit(&self) {
+        eprintln!("{}", self.report());
+    }
+    pub fn report(&self) -> String {
+        let mut out = format!("[quality-diagnostics] label={}", self.label);
+        if let Some(v) = self.rmse_vs_truth {
+            out.push_str(&format!(" rmse_truth={v:.6}"));
+        }
+        if let Some(v) = self.rmse_vs_reference {
+            out.push_str(&format!(" rmse_reference_gap={v:.6}"));
+        }
+        if let Some(v) = self.reference_rmse_vs_truth {
+            out.push_str(&format!(" reference_rmse_truth={v:.6}"));
+        }
+        if let Some(v) = self.edf_total {
+            out.push_str(&format!(" edf_total={v:.3}"));
+        }
+        if !self.rho.is_empty() {
+            out.push_str(&format!(" rho={:?}", Rounded(&self.rho)));
+        }
+        if !self.lambda.is_empty() {
+            out.push_str(&format!(" lambda={:?}", Rounded(&self.lambda)));
+        }
+        if let Some(d) = &self.design {
+            out.push_str(&format!(
+                " design={}x{} rank={} cond={:.3e} sigma=[{:.3e},{:.3e}]",
+                d.nrows, d.ncols, d.rank, d.condition, d.sigma_min, d.sigma_max
+            ));
+        }
+        if let Some(p) = &self.prediction {
+            out.push_str(&format!(
+                " pred[n={} mean={:.4} sd={:.4} range=[{:.4},{:.4}] edge=[{:.4},{:.4}]]",
+                p.n, p.mean, p.sd, p.min, p.max, p.first, p.last
+            ));
+        }
+        if !self.penalties.is_empty() {
+            out.push_str(" penalties=");
+            for p in &self.penalties {
+                out.push_str(&format!(
+                    " #{} cols={}..{} rank={} lambda={} eig=[{:.3e},{:.3e}] tr={:.3e};",
+                    p.index,
+                    p.col_start,
+                    p.col_end,
+                    p.rank,
+                    p.lambda
+                        .map(|v| format!("{v:.3e}"))
+                        .unwrap_or_else(|| "NA".into()),
+                    p.eig_min,
+                    p.eig_max,
+                    p.trace
+                ));
+            }
+        }
+        out
+    }
+}
+
+struct Rounded<'a>(&'a [f64]);
+impl std::fmt::Debug for Rounded<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[")?;
+        for (i, v) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{v:.3e}")?;
+        }
+        f.write_str("]")
+    }
+}
+
+pub fn prediction_fingerprint(values: &[f64]) -> PredictionFingerprint {
+    let n = values.len();
+    let mean = values.iter().sum::<f64>() / n.max(1) as f64;
+    let var = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n.max(1) as f64;
+    PredictionFingerprint {
+        n,
+        mean,
+        sd: var.sqrt(),
+        min: values.iter().copied().fold(f64::INFINITY, f64::min),
+        max: values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        first: values.first().copied().unwrap_or(f64::NAN),
+        last: values.last().copied().unwrap_or(f64::NAN),
+    }
+}
+
+pub fn design_diagnostics(
+    design: &crate::matrix::DesignMatrix,
+) -> Result<DesignDiagnostics, String> {
+    use crate::faer_ndarray::FaerSvd;
+    let dense = design
+        .try_to_dense_by_chunks_budgeted("quality diagnostics design SVD", 256 * 1024 * 1024)?;
+    let (_u, s, _vt) = dense.svd(false, false).map_err(|e| e.to_string())?;
+    let sigma_max = s.iter().copied().fold(0.0, f64::max);
+    let tol = (design.nrows().max(design.ncols()) as f64) * f64::EPSILON * sigma_max.max(1.0);
+    let rank = s.iter().filter(|&&v| v > tol).count();
+    let sigma_min = s
+        .iter()
+        .copied()
+        .filter(|v| *v > tol)
+        .fold(0.0_f64, |a, v| if a == 0.0 { v } else { a.min(v) });
+    Ok(DesignDiagnostics {
+        nrows: design.nrows(),
+        ncols: design.ncols(),
+        rank,
+        condition: if sigma_min > 0.0 {
+            sigma_max / sigma_min
+        } else {
+            f64::INFINITY
+        },
+        sigma_min,
+        sigma_max,
+    })
+}
+
+pub fn penalty_diagnostics(
+    penalties: &[crate::terms::smooth::BlockwisePenalty],
+    lambdas: &[f64],
+) -> Vec<PenaltyDiagnostics> {
+    use crate::faer_ndarray::FaerEigh;
+    use faer::Side;
+    penalties
+        .iter()
+        .enumerate()
+        .map(|(index, p)| {
+            let evals = p
+                .local
+                .eigh(Side::Lower)
+                .map(|(e, _)| e)
+                .unwrap_or_else(|_| ndarray::Array1::from_vec(vec![f64::NAN]));
+            let scale = evals
+                .iter()
+                .copied()
+                .map(f64::abs)
+                .fold(0.0, f64::max)
+                .max(1.0);
+            let tol = scale * 1.0e-10;
+            let rank = evals.iter().filter(|&&v| v > tol).count();
+            PenaltyDiagnostics {
+                index,
+                col_start: p.col_range.start,
+                col_end: p.col_range.end,
+                rank,
+                lambda: lambdas.get(index).copied(),
+                eig_min: evals.iter().copied().fold(f64::INFINITY, f64::min),
+                eig_max: evals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                trace: p.local.diag().sum(),
+            }
+        })
+        .collect()
+}
+
 /// A Double Machine Learning (DML) reference estimate of the average linear
 /// effect `θ = E[∂E(Y|D,X)/∂D]` of a treatment/dose `D` on outcome `Y` after
 /// partialling out confounders `X`, computed by a mature Python DML library
