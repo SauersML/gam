@@ -2140,10 +2140,10 @@ fn b10_fourth_ordered(
     let qd1_d1 = if qd1_index < p { dir1[qd1_index] } else { 0.0 };
     let qd1_d2 = if qd1_index < p { dir2[qd1_index] } else { 0.0 };
 
-    let entry_eta_u_d1 = b10_mat_dot(&entry_base.eta_uv, dir1, p);
-    let entry_eta_u_d2 = b10_mat_dot(&entry_base.eta_uv, dir2, p);
-    let exit_eta_u_d1 = b10_mat_dot(&exit_base.eta_uv, dir1, p);
-    let exit_eta_u_d2 = b10_mat_dot(&exit_base.eta_uv, dir2, p);
+    let entry_eta_u_d1 = entry_ext1.eta_u_dir.clone();
+    let entry_eta_u_d2 = entry_ext2.eta_u_dir.clone();
+    let exit_eta_u_d1 = exit_ext1.eta_u_dir.clone();
+    let exit_eta_u_d2 = exit_ext2.eta_u_dir.clone();
     let exit_chi_u_d1 = b10_mat_dot(&exit_base.chi_uv, dir1, p);
     let exit_chi_u_d2 = b10_mat_dot(&exit_base.chi_uv, dir2, p);
     let exit_d_u_d2 = b10_mat_dot(&exit_base.d_uv, dir2, p);
@@ -2153,8 +2153,8 @@ fn b10_fourth_ordered(
     let exit_chi_d12 = b10_dot(&exit_chi_u_d2, dir1);
     let exit_d_d12 = b10_dot(&exit_d_u_d2, dir1);
 
-    let entry_eta_u_d12 = b10_mat_dot(&entry_ext2.eta_uv_dir, dir1, p);
-    let exit_eta_u_d12 = b10_mat_dot(&exit_ext2.eta_uv_dir, dir1, p);
+    let entry_eta_u_d12 = entry_bi.eta_u_uv.clone();
+    let exit_eta_u_d12 = exit_bi.eta_u_uv.clone();
     let exit_chi_u_d12 = b10_mat_dot(&exit_ext2.chi_uv_dir, dir1, p);
     let exit_d_u_d12 = b10_mat_dot(&exit_ext2.d_uv_dir, dir1, p);
 
