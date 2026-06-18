@@ -1702,14 +1702,30 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // exact quadratic problem (i.e. converge in one cycle when the
             // model is exact). The trust-region globalization above must not
             // truncate the very first proposal merely because the hard-coded
-            // initial radius (1.0) is smaller than the natural Newton-step
-            // 2-norm. Bumping the radius up to the post-barrier Newton-step
-            // norm on cycle 0 preserves quadratic convergence on
-            // well-conditioned problems while leaving the standard adaptive
-            // shrink/expand for subsequent cycles. Family feasibility
-            // constraints and the adaptive trust radius remain the safeguards
-            // against runaway proposals.
+            // initial radius (1.0) is smaller than the natural Newton-step norm.
+            //
+            // There are two norms in play:
+            //   * the constrained-QP / dogleg paths truncate per block against
+            //     `joint_block_trust_radii`;
+            //   * the exact spectral trust-region path solves one global
+            //     Moré–Sorensen problem against `joint_trust_radius`.
+            //
+            // The old cycle-0 bump only raised the per-block radii and then set the
+            // global radius to `max(block_norms)`. For a multiblock exact quadratic
+            // with a diagonal metric that leaves a full Newton step like
+            // `[0.8, 0.8]` inside every per-block ball (`max = 0.8`) but outside
+            // the global spectral ball (`sqrt(0.8² + 0.8²) = 1.13`). Once the
+            // constrained branch started populating `joint_spectrum` for the
+            // Newton-decrement certificate, the line search correctly used the
+            // spectral path and incorrectly clipped that exact feasible Newton
+            // step to radius 1.0, preventing one-cycle KKT convergence. Bump the
+            // global radius to the full metric norm while still bumping each block
+            // radius to its own block norm; this keeps the first exact Newton step
+            // untruncated in both globalization modes and leaves the standard
+            // adaptive shrink/expand for subsequent cycles.
             if cycle == 0 && joint_step_spectral_nullity == 0 {
+                let initial_global_norm =
+                    joint_trust_region_metric_step_norm(&delta, &joint_trust_metric_diag);
                 let initial_block_norms = joint_trust_region_block_metric_norms(
                     &delta,
                     &ranges,
@@ -1720,10 +1736,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         *radius = norm;
                     }
                 }
-                joint_trust_radius = joint_block_trust_radii
+                let block_radius = joint_block_trust_radii
                     .iter()
                     .copied()
                     .fold(0.0_f64, f64::max);
+                joint_trust_radius = if initial_global_norm.is_finite() {
+                    block_radius.max(initial_global_norm)
+                } else {
+                    block_radius
+                };
                 if !joint_trust_radius.is_finite() || joint_trust_radius <= 0.0 {
                     joint_trust_radius = 1.0;
                 }
@@ -1909,7 +1930,28 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     // resulting (unconstrained) step is projected back onto the cone
                     // just below (gam#1108), preserving this step's fast convergence
                     // while keeping every accepted iterate feasible.
-                    trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
+                    //
+                    // If the already-computed Newton/QP step lies inside the
+                    // current global trust ball, take it directly instead of asking
+                    // the trust-region solver to recover the boundary solution at
+                    // `r == ‖δ_N‖`. The boundary multiplier is mathematically zero
+                    // in that case, but finite precision can produce a tiny positive
+                    // multiplier and perturb an exact quadratic one-step solve by
+                    // O(1e-6), which is large relative to the inner KKT floor. The
+                    // direct step is the exact unconstrained minimizer of the local
+                    // model and is still trust-region feasible.
+                    let search_norm = joint_trust_region_metric_step_norm(
+                        &search_delta,
+                        &joint_trust_metric_diag,
+                    );
+                    if search_norm.is_finite()
+                        && joint_trust_radius.is_finite()
+                        && search_norm <= joint_trust_radius * (1.0 + 1e-12)
+                    {
+                        trial_delta = search_delta.clone();
+                    } else {
+                        trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
+                    }
                     joint_trust_region_block_metric_norms(
                         &trial_delta,
                         &ranges,
