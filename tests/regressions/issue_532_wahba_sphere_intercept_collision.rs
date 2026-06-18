@@ -99,8 +99,7 @@ fn fit_predict_and_rmse(formula: &str) -> (Vec<f64>, f64) {
         m[[i, 1]] = *lon;
     }
     // Rebuild the design from the FROZEN resolved spec — this is the predict-time
-    // path that must replay the composed `z · z_parametric` transform, not
-    // recompute the center-space `z`.
+    // path that must replay the composed raw-chart/parametric transform.
     let design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .expect("rebuild Wahba-sphere design at predict time (frozen transform replay)");
     let pred = design.design.apply(&fit.fit.beta).to_vec();

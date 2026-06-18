@@ -3575,12 +3575,11 @@ fn freeze_smooth_basis_from_metadata(
             s.method = *method;
             s.max_degree = *max_degree;
             s.wahba_kernel = *wahba_kernel;
-            // #532: freeze the realized-design transform (the composed
-            // `z · z_parametric` captured at fit time) so the predict-time
-            // rebuild reuses it verbatim instead of recomputing the
-            // center-space `z`, which would drop the parametric
-            // orthogonalization and resurrect the intercept collision. The
-            // Harmonic method never carries a constraint transform.
+            // #532: freeze the realized-design transform captured at fit time
+            // so the predict-time rebuild reuses it verbatim instead of
+            // dropping the parametric orthogonalization and resurrecting the
+            // intercept collision. The Harmonic method never carries a
+            // constraint transform.
             s.identifiability = match constraint_transform {
                 Some(z) => SphericalSplineIdentifiability::FrozenTransform {
                     transform: z.clone(),

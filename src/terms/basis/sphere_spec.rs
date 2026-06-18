@@ -137,16 +137,16 @@ pub struct SphericalSplineBasisSpec {
     pub wahba_kernel: SphereWahbaKernel,
     /// Realized-design identifiability policy for the Wahba sphere (#532).
     ///
-    /// The Wahba kernel design `K(data, centers) · z` spans the constant on the
-    /// data rows even after the center-space area-weighted sum-to-zero `z`
-    /// (`z` constrains `1ᵀ W α = 0` over the *centers*, not the realized rows).
+    /// The finite-center Wahba kernel design `K(data, centers) · z` can span a
+    /// near-constant direction on the data rows even though the continuous
+    /// kernel omits the l=0 mode.
     /// In any model with a parametric intercept this collides with the global
     /// intercept — the #531 constant-vs-intercept rank-1 collision class. The
     /// fix (mirroring `MaternIdentifiability::FrozenTransform`) lets the global
     /// identifiability pipeline compose a parametric-orthogonalization onto `z`
     /// and freeze the composed transform here, so the predict-time rebuild
-    /// reuses the exact fit-time realized transform instead of recomputing `z`
-    /// from the centers (which would silently drop the orthogonalization).
+    /// reuses the exact fit-time realized transform instead of silently dropping
+    /// the orthogonalization.
     #[serde(default)]
     pub identifiability: SphericalSplineIdentifiability,
 }
@@ -154,15 +154,15 @@ pub struct SphericalSplineBasisSpec {
 /// Realized-design identifiability policy for the Wahba spherical spline (#532).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum SphericalSplineIdentifiability {
-    /// Fit-time default: build the area-weighted center sum-to-zero transform
-    /// `z` from the realized centers, then let the global identifiability
-    /// pipeline residualize the realized design against the parametric block.
+    /// Fit-time default: keep the raw center coefficient chart, then let the
+    /// global identifiability pipeline residualize the realized design against
+    /// the parametric block.
     #[default]
     CenterSumToZero,
     /// Predict-time replay: use this frozen realized-design transform directly
-    /// (the composed `z · z_parametric` captured at fit time) instead of
-    /// recomputing `z` from the centers. `transform.nrows()` equals the number
-    /// of centers; `transform.ncols()` is the constrained smooth dimension.
+    /// (the composed raw-chart/parametric transform captured at fit time).
+    /// `transform.nrows()` equals the number of centers; `transform.ncols()` is
+    /// the constrained smooth dimension.
     FrozenTransform { transform: Array2<f64> },
 }
 
