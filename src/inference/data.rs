@@ -691,14 +691,28 @@ fn infer_delimited_column(
         // numeric ones). Without this pass, a column like
         // "0, 0, ..., 0, foo" mixes raw doubles with level codes, breaking
         // the categorical encoding invariant.
+        //
+        // First discover every distinct level, then sort the level set
+        // lexicographically so the encoding is canonical (matching R `factor()`
+        // / pandas `Categorical`) and independent of row order — the same
+        // contract the column-major Python path enforces (#1319). Recode in a
+        // second pass against the sorted level → index map.
         for row_idx in 0..total_rows {
             let raw = raw_fields[row_idx * n_cols + col].as_str();
-            let idx = *level_index.entry(raw.to_string()).or_insert_with(|| {
+            level_index.entry(raw.to_string()).or_insert_with(|| {
                 let new_idx = levels.len();
                 levels.push(raw.to_string());
                 new_idx
             });
-            values[row_idx] = idx as f64;
+        }
+        levels.sort();
+        level_index.clear();
+        for (idx, level) in levels.iter().enumerate() {
+            level_index.insert(level.clone(), idx);
+        }
+        for row_idx in 0..total_rows {
+            let raw = raw_fields[row_idx * n_cols + col].as_str();
+            values[row_idx] = level_index[raw] as f64;
         }
     }
 
@@ -937,14 +951,27 @@ fn load_delimited_with_schema(
                 // numeric-looking strings like "0" become their own levels
                 // instead of leaking through as raw f64 values that would
                 // collide with real level codes.
-                for (row_idx, raw) in &infer_strings[j] {
+                //
+                // First discover the full level set, then sort it
+                // lexicographically and recode against the canonical order, so
+                // the encoding matches R `factor()` / pandas `Categorical` and
+                // is independent of row order (#1319) — the same contract as the
+                // schema-less and column-major inference paths.
+                for (_, raw) in &infer_strings[j] {
                     let levels_ref = &mut infer_levels[j];
-                    let code = *infer_level_index[j].entry(raw.clone()).or_insert_with(|| {
+                    infer_level_index[j].entry(raw.clone()).or_insert_with(|| {
                         let new_idx = levels_ref.len();
                         levels_ref.push(raw.clone());
                         new_idx
                     });
-                    col_vecs[j][*row_idx] = code as f64;
+                }
+                infer_levels[j].sort();
+                infer_level_index[j].clear();
+                for (idx, level) in infer_levels[j].iter().enumerate() {
+                    infer_level_index[j].insert(level.clone(), idx);
+                }
+                for (row_idx, raw) in &infer_strings[j] {
+                    col_vecs[j][*row_idx] = infer_level_index[j][raw] as f64;
                 }
                 col_meta[j].schema_col.levels = infer_levels[j].clone();
             }
@@ -1895,6 +1922,12 @@ fn infer_schema_column(
     } else {
         ColumnKindTag::Categorical
     };
+    // Canonical (sorted) level order — see `infer_and_encode_column_major`. The
+    // record-driven and column-major inference paths must produce byte-identical
+    // schemas, so both sort the level set lexicographically (#1319).
+    if matches!(kind, ColumnKindTag::Categorical) {
+        levels.sort();
+    }
     Ok(SchemaColumn {
         name: name.to_string(),
         kind,
@@ -1994,6 +2027,21 @@ pub fn infer_and_encode_column_major(
     } else {
         ColumnKindTag::Categorical
     };
+    // Canonical level ordering: sort factor levels lexicographically rather than
+    // recording them in first-appearance order. Every reference tool a gam user
+    // comes from — R `factor()` (C-locale sort), pandas `Categorical`, sklearn
+    // `LabelEncoder` — orders categorical levels canonically, and downstream
+    // consumers key off that order: the multinomial driver lays out one output
+    // probability column per level and takes the *last* level as the softmax
+    // reference, so first-appearance order made the `(n, K)` prediction columns
+    // depend on which class happened to appear first in the training rows (a
+    // row-shuffle would permute the output) instead of on the class labels
+    // (#1319). Sorting makes the encoding a deterministic function of the label
+    // *set*, independent of row order, and matches the factor convention so
+    // column `k` of a multinomial prediction is class `levels[k]`.
+    if matches!(kind, ColumnKindTag::Categorical) {
+        levels.sort();
+    }
     let schema = SchemaColumn {
         name: name.to_string(),
         kind,
