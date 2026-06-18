@@ -170,6 +170,88 @@ fn gaussian_te() {
     time_fit("gaussian_te te(x,z,k=7)", "y ~ te(x, z, k=7)", &ds, &cfg);
 }
 
+/// #1082 penguin multinomial: the near-separable K=3 softmax fit whose outer
+/// REML/ARC loop pays a ~5.7s exact 16-dim outer-Hessian eval per iteration and
+/// times out before converging. Same formula/data/stride as the no-suffix arm
+/// `gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet`
+/// (TEST_STRIDE=4 train split). Prints the gam fit's wall-clock seconds.
+fn penguin() {
+    use gam::families::multinomial::fit_penalized_multinomial_formula;
+    const PENGUINS_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/penguins.csv");
+    let file = std::fs::File::open(Path::new(PENGUINS_CSV)).expect("open penguins.csv");
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(file));
+    let header = lines.next().expect("hdr").expect("hdr");
+    let cols: Vec<&str> = header.trim().split(',').collect();
+    let idx = |n: &str| cols.iter().position(|c| *c == n).expect("col");
+    let (is, ibl, ibd, ifl, im) = (
+        idx("species"),
+        idx("bill_length_mm"),
+        idx("bill_depth_mm"),
+        idx("flipper_length_mm"),
+        idx("body_mass_g"),
+    );
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for line in lines {
+        let line = line.expect("row");
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        if [ibl, ibd, ifl, im]
+            .iter()
+            .any(|&c| f[c] == "NA" || f[c].is_empty())
+        {
+            continue;
+        }
+        rows.push(vec![
+            f[ibl].to_string(),
+            f[ibd].to_string(),
+            f[ifl].to_string(),
+            f[im].to_string(),
+            f[is].to_string(),
+        ]);
+    }
+    // TEST_STRIDE=4 train split (no-suffix arm): keep rows where i%4 != 0.
+    let train: Vec<csv::StringRecord> = rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 4 != 0)
+        .map(|(_, r)| csv::StringRecord::from(r.clone()))
+        .collect();
+    let headers: Vec<String> = [
+        "bill_length_mm",
+        "bill_depth_mm",
+        "flipper_length_mm",
+        "body_mass_g",
+        "species",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let train_ds =
+        encode_recordswith_inferred_schema(headers, train).expect("encode penguin train");
+    let cfg = FitConfig::default();
+    let t0 = Instant::now();
+    let model = fit_penalized_multinomial_formula(
+        &train_ds,
+        "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
+        &cfg,
+        1.0,
+        100,
+        1e-8,
+    );
+    let dt = t0.elapsed().as_secs_f64();
+    match model {
+        Ok(m) => eprintln!(
+            "[repro1082] penguin DONE :: {dt:.2}s  K={} classes={:?}",
+            m.class_levels.len(),
+            m.class_levels
+        ),
+        Err(e) => eprintln!("[repro1082] penguin FAILED :: {dt:.2}s  err={e:?}"),
+    }
+}
+
 fn main() {
     init_parallelism();
     let args: Vec<String> = std::env::args().collect();
@@ -181,6 +263,7 @@ fn main() {
         "poisson_real" => poisson_real(),
         "cyclic" => cyclic(),
         "gaussian_te" => gaussian_te(),
+        "penguin" => penguin(),
         other => eprintln!("[repro1082] unknown case {other}"),
     }
 }
