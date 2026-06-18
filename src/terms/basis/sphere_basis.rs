@@ -33,14 +33,12 @@ pub fn build_spherical_spline_basis(
         spec.radians,
         spec.wahba_kernel,
     )?;
-    // Realized-design constraint transform. At fit time this is the
-    // area-weighted center sum-to-zero `z` (the global identifiability pipeline
-    // then composes the parametric-orthogonalization onto it and freezes the
-    // result). At predict time the frozen composed transform `z · z_parametric`
-    // is replayed verbatim so the realized design reproduces the fit-time
-    // basis exactly (#532) — recomputing `z` from the centers would drop the
-    // parametric orthogonalization and resurrect the constant-vs-intercept
-    // collision.
+    // Realized-design transform. The Wahba kernels are built without the l=0
+    // spherical-harmonic mode, so an additional finite-center coefficient
+    // sum-to-zero gauge is not intrinsic to the smooth and can distort sparse
+    // polar fits. Keep the raw center coefficients here; the global
+    // identifiability pipeline still composes the realized parametric
+    // orthogonalization onto this transform and freezes it for prediction.
     let z = match &spec.identifiability {
         SphericalSplineIdentifiability::FrozenTransform { transform } => {
             if transform.nrows() != centers.nrows() {
@@ -52,10 +50,7 @@ pub fn build_spherical_spline_basis(
             }
             transform.clone()
         }
-        SphericalSplineIdentifiability::CenterSumToZero => {
-            let weights = sphere_area_weights(centers.view(), spec.radians);
-            weighted_coefficient_sum_to_zero_transform(weights.view())?
-        }
+        SphericalSplineIdentifiability::CenterSumToZero => Array2::<f64>::eye(centers.nrows()),
     };
     let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z.clone()]);
     let penalty = gauge.restrict_penalty(&raw_penalty);
