@@ -27,6 +27,55 @@ impl SurvivalMarginalSlopeFamily {
         let p = primary.total;
         let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
 
+        // ── Pre-pass: the intercept directional motion a_dir ───────────────
+        // The fixed-domain moment reductions below produce the PARTIAL
+        // θ-derivatives of `f_a/f_aa/f_au/f_uv` (the calibration `F`'s a-jets),
+        // holding the implicit calibration intercept `a` fixed. But `a = a(θ)`
+        // on the calibration manifold, so the TOTAL directional derivative each
+        // `f_*_dir` must carry also includes the intercept chain
+        // `∂(f_*)/∂a · a_dir`. We fold that chain in by differentiating along
+        // the TOTAL cell-index velocity `∂c/∂dir_total = ∂c/∂(direct θ)·dir
+        // + ∂c/∂a · a_dir`, i.e. by augmenting every dir cell-coefficient with
+        // `a_dir · (its next a-derivative)`. `a_dir` needs only the first-order
+        // jets `a_u = -f_u/f_a`, so compute it in a cheap pre-pass here (the
+        // q-marginal RHS self term `+φ(q)` on `f_u[q_index]` is part of it).
+        let a_dir = {
+            let mut f_a_pre = 0.0;
+            let mut f_dir_pre = 0.0;
+            for cell_entry in &cached.cells {
+                let neg_cell = cell_entry.neg_cell;
+                let state = &cell_entry.state;
+                let fixed = &cell_entry.fixed;
+                let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
+                f_a_pre += exact_kernel::cell_first_derivative_from_moments(
+                    &neg_dc_da,
+                    &state.moments,
+                )?;
+                let mut neg_coeff_dir = [0.0; 4];
+                for c in 0..p {
+                    if dir[c] == 0.0 {
+                        continue;
+                    }
+                    for k in 0..4 {
+                        neg_coeff_dir[k] -= fixed.coeff_u[c][k] * dir[c];
+                    }
+                }
+                let _ = neg_cell;
+                f_dir_pre += exact_kernel::cell_first_derivative_from_moments(
+                    &neg_coeff_dir,
+                    &state.moments,
+                )?;
+            }
+            // q-marginal RHS self term: f_u[q_index] += φ(q), so its dir
+            // contraction adds dir[q_index]·φ(q) to f_dir.
+            let phi_q = crate::probability::normal_pdf(q);
+            if q_index < p {
+                f_dir_pre += dir[q_index] * phi_q;
+            }
+            // a_u = -f_u/f_a ⇒ a_dir = a_u·dir = -(f_dir)/f_a.
+            -f_dir_pre / f_a_pre
+        };
+
         struct DirectionalTimepointCellAccum {
             f_a: f64,
             f_aa: f64,
@@ -49,6 +98,7 @@ impl SurvivalMarginalSlopeFamily {
                     let fixed = &cell_entry.fixed;
                     let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
                     let neg_dc_daa: [f64; 4] = fixed.dc_daa.map(|v| -v);
+                    let neg_dc_daaa: [f64; 4] = fixed.dc_daaa.map(|v| -v);
 
                     let f_a = exact_kernel::cell_first_derivative_from_moments(
                         &neg_dc_da,
@@ -62,6 +112,12 @@ impl SurvivalMarginalSlopeFamily {
                         &state.moments,
                     )?;
 
+                    // TOTAL directional cell-coefficient jets along `dir`:
+                    // `∂c/∂dir_total = ∂c/∂(direct θ)·dir + a_dir·∂c/∂a`.
+                    // The trailing `a_dir·(next a-derivative)` is the intercept
+                    // chain that makes each `f_*_dir` the TOTAL D_dir of `f_*`
+                    // (not just the partial), so the `a_uv_dir` chain rule below
+                    // is exact (gam#932/#979).
                     let mut neg_coeff_dir = [0.0; 4];
                     let mut neg_coeff_a_dir = [0.0; 4];
                     let mut neg_coeff_aa_dir = [0.0; 4];
@@ -74,6 +130,11 @@ impl SurvivalMarginalSlopeFamily {
                             neg_coeff_a_dir[k] -= fixed.coeff_au[c][k] * dir[c];
                             neg_coeff_aa_dir[k] -= fixed.coeff_aau[c][k] * dir[c];
                         }
+                    }
+                    for k in 0..4 {
+                        neg_coeff_dir[k] += a_dir * neg_dc_da[k];
+                        neg_coeff_a_dir[k] += a_dir * neg_dc_daa[k];
+                        neg_coeff_aa_dir[k] += a_dir * neg_dc_daaa[k];
                     }
 
                     let f_a_dir = exact_kernel::cell_second_derivative_from_moments(
@@ -128,6 +189,14 @@ impl SurvivalMarginalSlopeFamily {
                                 neg_coeff_u_dir[k] -= sc[k] * dir[c];
                                 neg_coeff_au_dir[k] -= sca[k] * dir[c];
                             }
+                        }
+                        // Intercept chain for the (u, dir) and (a, u, dir)
+                        // cross coefficients: `∂²c/∂u∂dir_total` and
+                        // `∂³c/∂a∂u∂dir_total` pick up `a_dir·∂²c/∂u∂a` and
+                        // `a_dir·∂³c/∂a²∂u` respectively (gam#932/#979).
+                        for k in 0..4 {
+                            neg_coeff_u_dir[k] += a_dir * neg_coeff_au[k];
+                            neg_coeff_au_dir[k] -= a_dir * fixed.coeff_aau[u][k];
                         }
 
                         f_au_dir[u] = exact_kernel::cell_third_derivative_from_moments(
@@ -194,6 +263,18 @@ impl SurvivalMarginalSlopeFamily {
                                 -1.0,
                                 &mut neg_coeff_uv_dir,
                             );
+                            // Intercept chain for the (u, dir), (v, dir) and
+                            // (u, v, dir) cross coefficients: each picks up
+                            // `a_dir·(its a-derivative)` so f_uv_dir is the
+                            // TOTAL D_dir(f_uv) (gam#932/#979). `∂³c/∂u∂v∂a` is
+                            // the `coeff_abu` a-cross (nonzero only when u or v
+                            // is the slope g).
+                            let sc_uva = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, v);
+                            for k in 0..4 {
+                                neg_coeff_u_dir[k] -= a_dir * fixed.coeff_au[u][k];
+                                neg_coeff_v_dir[k] -= a_dir * fixed.coeff_au[v][k];
+                                neg_coeff_uv_dir[k] -= a_dir * sc_uva[k];
+                            }
 
                             let dir_val = exact_kernel::cell_third_derivative_from_moments(
                                 neg_cell,
@@ -534,20 +615,6 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        #[cfg(test)]
-        {
-            let qq = primary.q1;
-            // Only emit for the #932 debug fixture's exit timepoint (q1=0.6),
-            // identified by its distinctive intercept geometry, to avoid
-            // polluting every other survival test that exercises this path.
-            if qq < p && (q - 0.6_f64).abs() < 1e-9 {
-                eprintln!(
-                    "DBG932 q_index={q_index} qq={qq}: a_uv[qq,qq]={:+.6e} a_uv_dir[qq,qq]={:+.6e} eta_aa_dir={:+.6e} a_u[qq]={:+.6e} a_u_dir[qq]={:+.6e} chi_dir={:+.6e} chi_val={:+.6e} eta_aa={:+.6e} | f_a={:+.6e} f_a_dir={:+.6e} f_aa={:+.6e} f_aa_dir={:+.6e} f_uv_dir[qq,qq]={:+.6e} f_au[qq]={:+.6e} f_au_dir[qq]={:+.6e}",
-                    a_uv[[qq, qq]], a_uv_dir[[qq, qq]], eta_aa_dir, a_u[qq], a_u_dir[qq], chi_dir, chi_val, eta_aa,
-                    f_a, f_a_dir, f_aa, f_aa_dir, f_uv_dir[[qq, qq]], f_au[qq], f_au_dir[qq],
-                );
-            }
-        }
 
         // D_u_dir: directional derivative of the density normalization first derivative.
         let d_u_dir_cell_accums = cached
