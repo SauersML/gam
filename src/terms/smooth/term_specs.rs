@@ -4566,6 +4566,29 @@ fn build_periodic_fourier_margin(
     Ok((basis, penalty, knots))
 }
 
+fn limit_tensor_open_margin_knot_count(spec: &mut BSplineBasisSpec, x: ArrayView1<'_, f64>) {
+    const MAX_OPEN_TENSOR_MARGIN_COLS: usize = 12;
+    let mut unique = Vec::<f64>::new();
+    for &v in x.iter().filter(|v| v.is_finite()) {
+        if !unique.iter().any(|u| (*u - v).abs() <= 1e-12) {
+            unique.push(v);
+        }
+    }
+    let support_cap = (unique.len() / 2).max(spec.degree + 2);
+    let col_cap = MAX_OPEN_TENSOR_MARGIN_COLS.min(support_cap).max(spec.degree + 2);
+    let max_internal = col_cap.saturating_sub(spec.degree + 1);
+    match &mut spec.knotspec {
+        BSplineKnotSpec::Generate { num_internal_knots, .. }
+        | BSplineKnotSpec::Automatic {
+            num_internal_knots: Some(num_internal_knots),
+            ..
+        } => {
+            *num_internal_knots = (*num_internal_knots).min(max_internal);
+        }
+        _ => {}
+    }
+}
+
 fn tensor_product_design_from_sparse_marginals(
     marginal_sparse: &[&SparseColMat<usize, f64>],
 ) -> Result<SparseColMat<usize, f64>, BasisError> {
@@ -4821,6 +4844,7 @@ fn build_tensor_bspline_basis(
         } else {
             let mut marginal_unconstrained = marginalspec.clone();
             marginal_unconstrained.identifiability = BSplineIdentifiability::None;
+            limit_tensor_open_margin_knot_count(&mut marginal_unconstrained, data.column(col));
             let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
             let knots = match built.metadata {
                 BasisMetadata::BSpline1D { knots, .. } => knots,

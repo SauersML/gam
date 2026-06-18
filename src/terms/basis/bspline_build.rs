@@ -1639,22 +1639,19 @@ fn bspline_penalty_candidates(
         None
     };
 
-    // Without an active null-space block, preserve the historical single-penalty
-    // geometry exactly: the bending penalty ships un-normalized with scale 1.0,
-    // so `double_penalty = False` (and boundary-conditioned) fits are byte-for-
-    // byte unchanged.
+    let (bend_norm, bend_scale) = normalize_penalty(s_bend_raw);
+
     let Some(shrinkage) = shrinkage else {
         return Ok(vec![PenaltyCandidate {
-            matrix: s_bend_raw.clone(),
+            matrix: bend_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::Primary,
-            normalization_scale: 1.0,
+            normalization_scale: bend_scale,
             kronecker_factors: None,
             op: None,
         }]);
     };
 
-    let (bend_norm, bend_scale) = normalize_penalty(s_bend_raw);
     let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage.sym_penalty);
     Ok(vec![
         PenaltyCandidate {
