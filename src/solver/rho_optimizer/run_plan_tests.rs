@@ -1621,7 +1621,6 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
             // Before the window fills, infeasible trials surface as the normal
             // recoverable non-finite-cost error (the optimizer shrinks + retries).
             Err(ObjectiveEvalError::Recoverable { .. }) => {}
-            Err(other) => panic!("unexpected ARC bridge error: {other:?}"),
         }
     }
     assert!(
