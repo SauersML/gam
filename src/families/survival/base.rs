@@ -2713,7 +2713,82 @@ impl WorkingModelSurvival {
             &opts,
             |_| {},
         )?;
-        let beta = summary.beta.as_ref().to_owned();
+        let mut beta = summary.beta.as_ref().to_owned();
+        // Replicate the production shim's LM/Cholesky stationarity polish so the
+        // term-split is taken at the SAME re-converged mode.
+        {
+            const POLISH_MAX_ITERS: usize = 400;
+            const POLISH_TOL: f64 = 1e-13;
+            const ARMIJO_C: f64 = 1e-4;
+            const BACKTRACK: f64 = 0.5;
+            const MAX_BACKTRACK: usize = 80;
+            let p = beta.len();
+            let penalized_objective =
+                |st: &WorkingState| -> f64 { -st.log_likelihood + st.penalty_term };
+            for _ in 0..POLISH_MAX_ITERS {
+                let st = match candidate.update_state(&beta) {
+                    Ok(st) => st,
+                    Err(_) => break,
+                };
+                let r = st.gradient.clone();
+                let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if !r_norm.is_finite() || r_norm < POLISH_TOL {
+                    break;
+                }
+                let h = st.hessian.to_dense();
+                let f0 = penalized_objective(&st);
+                let h_scale = (0..p).map(|d| h[[d, d]].abs()).fold(0.0_f64, f64::max).max(1.0);
+                let mut step: Option<Array1<f64>> = None;
+                let mut dir_deriv = 0.0_f64;
+                for lm_pow in 0..18 {
+                    let lambda_lm =
+                        if lm_pow == 0 { 0.0 } else { 1e-12 * h_scale * 10f64.powi(lm_pow) };
+                    let mut h_reg = h.clone();
+                    for d in 0..p {
+                        h_reg[[d, d]] += lambda_lm;
+                    }
+                    let factor =
+                        match crate::faer_ndarray::FaerCholesky::cholesky(&h_reg, faer::Side::Lower) {
+                            Ok(f) => f,
+                            Err(_) => continue,
+                        };
+                    let candidate_step = factor.solvevec(&r);
+                    if candidate_step.iter().any(|v| !v.is_finite()) {
+                        continue;
+                    }
+                    let dd = -r.dot(&candidate_step);
+                    if dd.is_finite() && dd < -1e-14 * r_norm * r_norm {
+                        step = Some(candidate_step);
+                        dir_deriv = dd;
+                        break;
+                    }
+                }
+                let (step, dir_deriv) = match step {
+                    Some(s) => (s, dir_deriv),
+                    None => (r.clone(), -r_norm * r_norm),
+                };
+                let mut alpha = 1.0_f64;
+                let mut accepted = false;
+                for _ in 0..MAX_BACKTRACK {
+                    let trial = &beta - &(alpha * &step);
+                    if let Ok(ts) = candidate.update_state(&trial) {
+                        let ft = penalized_objective(&ts);
+                        let tn = ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        let armijo_ok = ft.is_finite() && ft <= f0 + ARMIJO_C * alpha * dir_deriv;
+                        let residual_ok = tn.is_finite() && tn < r_norm;
+                        if armijo_ok || residual_ok {
+                            beta = trial;
+                            accepted = true;
+                            break;
+                        }
+                    }
+                    alpha *= BACKTRACK;
+                }
+                if !accepted {
+                    break;
+                }
+            }
+        }
         let state = candidate.update_state(&beta)?;
         let rho_arr = Array1::from_vec(rho.to_vec());
         let (total_cost, grad) =
