@@ -25,6 +25,23 @@ fn eval_poly_derivative_slice(coefficients: &[f64], z: f64) -> f64 {
     acc
 }
 
+#[inline]
+fn reciprocal_bilinear_jet(value: MultiDirJet) -> MultiDirJet {
+    let x0 = value.coeff(0);
+    let x1 = value.coeff(1);
+    let x2 = value.coeff(2);
+    let x12 = value.coeff(3);
+    let inv = 1.0 / x0;
+    let inv2 = inv * inv;
+    let inv3 = inv2 * inv;
+    MultiDirJet::bilinear(
+        inv,
+        -x1 * inv2,
+        -x2 * inv2,
+        2.0 * x1 * x2 * inv3 - x12 * inv2,
+    )
+}
+
 impl SurvivalMarginalSlopeFamily {
     /// Exact mixed bidirectional extension D_{d1} D_{d2} of the timepoint
     /// quantities. This carries the calibration solve, observed eta/chi
@@ -538,28 +555,28 @@ impl SurvivalMarginalSlopeFamily {
         let ad12 = aud2.dot(dir1);
         let aud12 = auvd2.dot(dir1);
         let mut auvd12 = Array2::<f64>::zeros((p, p));
+        let f_a_jet = MultiDirJet::bilinear(f_a, f_a_d1, f_a_d2, f_a_d12);
+        let f_a_recip_jet = reciprocal_bilinear_jet(f_a_jet);
+        let f_aa_jet = MultiDirJet::bilinear(f_aa, f_aa_d1, f_aa_d2, f_aa_d12);
         for u in 0..p {
             for v in u..p {
-                let n = f_uv_d12[[u, v]]
-                    + f_au_d12[u] * au[v]
-                    + f_au_d1[u] * aud2[v]
-                    + f_au_d2[u] * aud1[v]
-                    + f_au[u] * aud12[v]
-                    + f_au_d12[v] * au[u]
-                    + f_au_d1[v] * aud2[u]
-                    + f_au_d2[v] * aud1[u]
-                    + f_au[v] * aud12[u]
-                    + f_aa_d12 * au[u] * au[v]
-                    + f_aa_d1 * (aud2[u] * au[v] + au[u] * aud2[v])
-                    + f_aa_d2 * (aud1[u] * au[v] + au[u] * aud1[v])
-                    + f_aa
-                        * (aud12[u] * au[v]
-                            + aud1[u] * aud2[v]
-                            + aud2[u] * aud1[v]
-                            + au[u] * aud12[v]);
-                let val =
-                    -(n + f_a_d12 * auv[[u, v]] + f_a_d1 * auvd2[[u, v]] + f_a_d2 * auvd1[[u, v]])
-                        * inv;
+                let f_uv_jet = MultiDirJet::bilinear(
+                    f_uv[[u, v]],
+                    f_uv_d1[[u, v]],
+                    f_uv_d2[[u, v]],
+                    f_uv_d12[[u, v]],
+                );
+                let f_au_u_jet =
+                    MultiDirJet::bilinear(f_au[u], f_au_d1[u], f_au_d2[u], f_au_d12[u]);
+                let f_au_v_jet =
+                    MultiDirJet::bilinear(f_au[v], f_au_d1[v], f_au_d2[v], f_au_d12[v]);
+                let a_u_jet = MultiDirJet::bilinear(au[u], aud1[u], aud2[u], aud12[u]);
+                let a_v_jet = MultiDirJet::bilinear(au[v], aud1[v], aud2[v], aud12[v]);
+                let numerator = f_uv_jet
+                    .add(&f_au_u_jet.mul(&a_v_jet))
+                    .add(&f_au_v_jet.mul(&a_u_jet))
+                    .add(&f_aa_jet.mul(&a_u_jet.mul(&a_v_jet)));
+                let val = numerator.mul(&f_a_recip_jet).scale(-1.0).coeff(3);
                 auvd12[[u, v]] = val;
                 auvd12[[v, u]] = val;
             }
