@@ -592,8 +592,7 @@ impl SurvivalMarginalSlopeFamily {
                                     };
                                     right - left
                                 };
-                                0.5 * (flux(v, &d_u_integrand_poly[u])
-                                    + flux(u, &d_u_integrand_poly[v]))
+                                flux(v, &d_u_integrand_poly[u]) + flux(u, &d_u_integrand_poly[v])
                             } else {
                                 0.0
                             };
