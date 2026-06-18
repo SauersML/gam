@@ -60,6 +60,83 @@ impl SurvivalMarginalSlopeFamily {
         let p = primary.total;
         let zero4 = [0.0; 4];
 
+        let (cal_ad1, cal_ad2, cal_ad12) = {
+            let mut f_a = 0.0f64;
+            let mut f_aa = 0.0f64;
+            let mut f_u = Array1::<f64>::zeros(p);
+            let mut f_au = Array1::<f64>::zeros(p);
+            let mut f_uv = Array2::<f64>::zeros((p, p));
+            for ce in &cached.cells {
+                let nc = ce.neg_cell;
+                let st = &ce.state;
+                let fx = &ce.fixed;
+                let da = fx.dc_da.map(|value| -value);
+                let daa = fx.dc_daa.map(|value| -value);
+                f_a += exact_kernel::cell_first_derivative_from_moments(&da, &st.moments)?;
+                f_aa += exact_kernel::cell_second_derivative_from_moments(
+                    nc,
+                    &da,
+                    &da,
+                    &daa,
+                    &st.moments,
+                )?;
+                for u in 0..p {
+                    let cu = fx.coeff_u[u].map(|value| -value);
+                    let cau = fx.coeff_au[u].map(|value| -value);
+                    f_u[u] += exact_kernel::cell_first_derivative_from_moments(&cu, &st.moments)?;
+                    f_au[u] += exact_kernel::cell_second_derivative_from_moments(
+                        nc,
+                        &da,
+                        &cu,
+                        &cau,
+                        &st.moments,
+                    )?;
+                }
+                for u in 0..p {
+                    for v in u..p {
+                        let cu = fx.coeff_u[u].map(|value| -value);
+                        let cv = fx.coeff_u[v].map(|value| -value);
+                        let cuv = self
+                            .cell_pair_second_coeff(primary, &fx.coeff_bu, u, v)
+                            .map(|value| -value);
+                        let value = exact_kernel::cell_second_derivative_from_moments(
+                            nc,
+                            &cu,
+                            &cv,
+                            &cuv,
+                            &st.moments,
+                        )?;
+                        f_uv[[u, v]] += value;
+                        if u != v {
+                            f_uv[[v, u]] += value;
+                        }
+                    }
+                }
+            }
+            let phi_q = crate::probability::normal_pdf(q);
+            f_u[q_index] += phi_q;
+            f_uv[[q_index, q_index]] += -q * phi_q;
+            let inv = 1.0 / f_a;
+            let mut au = Array1::<f64>::zeros(p);
+            for u in 0..p {
+                au[u] = -f_u[u] * inv;
+            }
+            let mut auv = Array2::<f64>::zeros((p, p));
+            for u in 0..p {
+                for v in u..p {
+                    let value =
+                        -(f_uv[[u, v]] + f_au[u] * au[v] + f_au[v] * au[u] + f_aa * au[u] * au[v])
+                            * inv;
+                    auv[[u, v]] = value;
+                    auv[[v, u]] = value;
+                }
+            }
+            let ad1 = au.dot(dir1);
+            let ad2 = au.dot(dir2);
+            let aud2 = auv.dot(dir2);
+            (ad1, ad2, aud2.dot(dir1))
+        };
+
         struct BiDirectionalTimepointCellAccum {
             f_a: f64,
             f_aa: f64,
@@ -106,6 +183,7 @@ impl SurvivalMarginalSlopeFamily {
                 let fx = &ce.fixed;
                 let da = fx.dc_da.map(|v| -v);
                 let daa = fx.dc_daa.map(|v| -v);
+                let daaa = fx.dc_daaa.map(|v| -v);
 
                 f_a += exact_kernel::cell_first_derivative_from_moments(&da, &st.moments)?;
                 f_aa += exact_kernel::cell_second_derivative_from_moments(
@@ -122,6 +200,8 @@ impl SurvivalMarginalSlopeFamily {
                 let mut cd2 = [0.0; 4];
                 let mut ca2 = [0.0; 4];
                 let mut caa2 = [0.0; 4];
+                let mut caaa1 = [0.0; 4];
+                let mut caaa2 = [0.0; 4];
                 let mut cd12 = [0.0; 4];
                 let mut ca12 = [0.0; 4];
                 let coeff_view = SparsePrimaryCoeffJetView::new(
@@ -145,11 +225,13 @@ impl SurvivalMarginalSlopeFamily {
                             cd1[k] -= fx.coeff_u[c][k] * dir1[c];
                             ca1[k] -= fx.coeff_au[c][k] * dir1[c];
                             caa1[k] -= fx.coeff_aau[c][k] * dir1[c];
+                            caaa1[k] -= fx.coeff_aaau[c][k] * dir1[c];
                         }
                         if dir2[c] != 0.0 {
                             cd2[k] -= fx.coeff_u[c][k] * dir2[c];
                             ca2[k] -= fx.coeff_au[c][k] * dir2[c];
                             caa2[k] -= fx.coeff_aau[c][k] * dir2[c];
+                            caaa2[k] -= fx.coeff_aaau[c][k] * dir2[c];
                         }
                     }
                 }
@@ -169,80 +251,108 @@ impl SurvivalMarginalSlopeFamily {
                         }
                     }
                 }
-                let caa12 = coeff_view
+                let caa12_direct = coeff_view
                     .mixed_directional_from_b_family(&fx.coeff_aabu, dir1, dir2, COEFF_SUPPORT_GHW)
                     .map(|value| -value);
+                let mut cd1_total = cd1;
+                let mut ca1_total = ca1;
+                let mut caa1_total = caa1;
+                let mut cd2_total = cd2;
+                let mut ca2_total = ca2;
+                let mut caa2_total = caa2;
+                let mut cd12_total = cd12;
+                let mut ca12_total = ca12;
+                let mut caa12_total = caa12_direct;
+                for k in 0..4 {
+                    cd1_total[k] += cal_ad1 * da[k];
+                    ca1_total[k] += cal_ad1 * daa[k];
+                    caa1_total[k] += cal_ad1 * daaa[k];
+                    cd2_total[k] += cal_ad2 * da[k];
+                    ca2_total[k] += cal_ad2 * daa[k];
+                    caa2_total[k] += cal_ad2 * daaa[k];
+                    cd12_total[k] += cal_ad1 * ca2[k]
+                        + cal_ad2 * ca1[k]
+                        + cal_ad12 * da[k]
+                        + cal_ad1 * cal_ad2 * daa[k];
+                    ca12_total[k] += cal_ad1 * caa2[k]
+                        + cal_ad2 * caa1[k]
+                        + cal_ad12 * daa[k]
+                        + cal_ad1 * cal_ad2 * daaa[k];
+                    caa12_total[k] += cal_ad1 * caaa2[k] + cal_ad2 * caaa1[k] + cal_ad12 * daaa[k];
+                }
 
                 f_a_d1 += exact_kernel::cell_second_derivative_from_moments(
                     nc,
                     &da,
-                    &cd1,
-                    &ca1,
+                    &cd1_total,
+                    &ca1_total,
                     &st.moments,
                 )?;
                 f_a_d2 += exact_kernel::cell_second_derivative_from_moments(
                     nc,
                     &da,
-                    &cd2,
-                    &ca2,
+                    &cd2_total,
+                    &ca2_total,
                     &st.moments,
                 )?;
                 f_a_d12 += exact_kernel::cell_third_derivative_from_moments(
                     nc,
                     &da,
-                    &cd1,
-                    &cd2,
-                    &ca1,
-                    &ca2,
-                    &cd12,
-                    &ca12,
+                    &cd1_total,
+                    &cd2_total,
+                    &ca1_total,
+                    &ca2_total,
+                    &cd12_total,
+                    &ca12_total,
                     &st.moments,
                 )?;
                 f_aa_d1 += exact_kernel::cell_third_derivative_from_moments(
                     nc,
                     &da,
                     &da,
-                    &cd1,
+                    &cd1_total,
                     &daa,
-                    &ca1,
-                    &ca1,
-                    &caa1,
+                    &ca1_total,
+                    &ca1_total,
+                    &caa1_total,
                     &st.moments,
                 )?;
                 f_aa_d2 += exact_kernel::cell_third_derivative_from_moments(
                     nc,
                     &da,
                     &da,
-                    &cd2,
+                    &cd2_total,
                     &daa,
-                    &ca2,
-                    &ca2,
-                    &caa2,
+                    &ca2_total,
+                    &ca2_total,
+                    &caa2_total,
                     &st.moments,
                 )?;
                 f_aa_d12 += exact_kernel::cell_fourth_derivative_from_moments(
                     nc,
                     &da,
                     &da,
-                    &cd1,
-                    &cd2,
+                    &cd1_total,
+                    &cd2_total,
                     &daa,
-                    &ca1,
-                    &ca2,
-                    &ca1,
-                    &ca2,
-                    &cd12,
-                    &caa1,
-                    &caa2,
-                    &ca12,
-                    &ca12,
-                    &caa12,
+                    &ca1_total,
+                    &ca2_total,
+                    &ca1_total,
+                    &ca2_total,
+                    &cd12_total,
+                    &caa1_total,
+                    &caa2_total,
+                    &ca12_total,
+                    &ca12_total,
+                    &caa12_total,
                     &st.moments,
                 )?;
 
                 for u in 0..p {
                     let cu = fx.coeff_u[u].map(|v| -v);
                     let cau = fx.coeff_au[u].map(|v| -v);
+                    let caau = fx.coeff_aau[u].map(|v| -v);
+                    let caaau = fx.coeff_aaau[u].map(|v| -v);
                     f_u[u] += exact_kernel::cell_first_derivative_from_moments(&cu, &st.moments)?;
                     f_au[u] += exact_kernel::cell_second_derivative_from_moments(
                         nc,
@@ -253,8 +363,10 @@ impl SurvivalMarginalSlopeFamily {
                     )?;
                     let mut cu1 = [0.0; 4];
                     let mut cau1 = [0.0; 4];
+                    let mut caau1 = [0.0; 4];
                     let mut cu2 = [0.0; 4];
                     let mut cau2 = [0.0; 4];
+                    let mut caau2 = [0.0; 4];
                     let cu12 = coeff_view
                         .param_mixed_from_bb_family(&fx.coeff_bbu, u, dir1, dir2, COEFF_SUPPORT_GHW)
                         .map(|value| -value);
@@ -270,56 +382,79 @@ impl SurvivalMarginalSlopeFamily {
                     for c in 0..p {
                         let sc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
                         let sca = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, c);
+                        let scaa = self.cell_pair_second_coeff(primary, &fx.coeff_aabu, u, c);
                         for k in 0..4 {
                             if dir1[c] != 0.0 {
                                 cu1[k] -= sc[k] * dir1[c];
                                 cau1[k] -= sca[k] * dir1[c];
+                                caau1[k] -= scaa[k] * dir1[c];
                             }
                             if dir2[c] != 0.0 {
                                 cu2[k] -= sc[k] * dir2[c];
                                 cau2[k] -= sca[k] * dir2[c];
+                                caau2[k] -= scaa[k] * dir2[c];
                             }
                         }
+                    }
+                    let mut cu1_total = cu1;
+                    let mut cau1_total = cau1;
+                    let mut cu2_total = cu2;
+                    let mut cau2_total = cau2;
+                    let mut cu12_total = cu12;
+                    let mut cau12_total = cau12;
+                    for k in 0..4 {
+                        cu1_total[k] += cal_ad1 * cau[k];
+                        cau1_total[k] += cal_ad1 * caau[k];
+                        cu2_total[k] += cal_ad2 * cau[k];
+                        cau2_total[k] += cal_ad2 * caau[k];
+                        cu12_total[k] += cal_ad1 * cau2[k]
+                            + cal_ad2 * cau1[k]
+                            + cal_ad12 * cau[k]
+                            + cal_ad1 * cal_ad2 * caau[k];
+                        cau12_total[k] += cal_ad1 * caau2[k]
+                            + cal_ad2 * caau1[k]
+                            + cal_ad12 * caau[k]
+                            + cal_ad1 * cal_ad2 * caaau[k];
                     }
                     f_au_d1[u] += exact_kernel::cell_third_derivative_from_moments(
                         nc,
                         &da,
                         &cu,
-                        &cd1,
+                        &cd1_total,
                         &cau,
-                        &ca1,
-                        &cu1,
-                        &cau1,
+                        &ca1_total,
+                        &cu1_total,
+                        &cau1_total,
                         &st.moments,
                     )?;
                     f_au_d2[u] += exact_kernel::cell_third_derivative_from_moments(
                         nc,
                         &da,
                         &cu,
-                        &cd2,
+                        &cd2_total,
                         &cau,
-                        &ca2,
-                        &cu2,
-                        &cau2,
+                        &ca2_total,
+                        &cu2_total,
+                        &cau2_total,
                         &st.moments,
                     )?;
                     f_au_d12[u] += exact_kernel::cell_fourth_derivative_from_moments(
                         nc,
                         &da,
                         &cu,
-                        &cd1,
-                        &cd2,
+                        &cd1_total,
+                        &cd2_total,
                         &cau,
-                        &ca1,
-                        &ca2,
-                        &cu1,
-                        &cu2,
-                        &cd12,
-                        &cau1,
-                        &cau2,
-                        &ca12,
-                        &cu12,
-                        &cau12,
+                        &ca1_total,
+                        &ca2_total,
+                        &cu1_total,
+                        &cu2_total,
+                        &cd12_total,
+                        &cau1_total,
+                        &cau2_total,
+                        &ca12_total,
+                        &cu12_total,
+                        &cau12_total,
                         &st.moments,
                     )?;
                 }
@@ -327,8 +462,18 @@ impl SurvivalMarginalSlopeFamily {
                     for v in u..p {
                         let cu = fx.coeff_u[u].map(|x| -x);
                         let cv = fx.coeff_u[v].map(|x| -x);
+                        let cau = fx.coeff_au[u].map(|x| -x);
+                        let cav = fx.coeff_au[v].map(|x| -x);
+                        let caau = fx.coeff_aau[u].map(|x| -x);
+                        let caav = fx.coeff_aau[v].map(|x| -x);
                         let sc = self
                             .cell_pair_second_coeff(primary, &fx.coeff_bu, u, v)
+                            .map(|x| -x);
+                        let sca = self
+                            .cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, v)
+                            .map(|x| -x);
+                        let scaa = self
+                            .cell_pair_second_coeff(primary, &fx.coeff_aabu, u, v)
                             .map(|x| -x);
                         let bv = exact_kernel::cell_second_derivative_from_moments(
                             nc,
@@ -347,6 +492,10 @@ impl SurvivalMarginalSlopeFamily {
                         let mut cv2 = [0.0; 4];
                         let mut cuv1 = [0.0; 4];
                         let mut cuv2 = [0.0; 4];
+                        let mut cau1 = [0.0; 4];
+                        let mut cav1 = [0.0; 4];
+                        let mut cau2 = [0.0; 4];
+                        let mut cav2 = [0.0; 4];
                         let cu12 = coeff_view
                             .param_mixed_from_bb_family(
                                 &fx.coeff_bbu,
@@ -378,14 +527,20 @@ impl SurvivalMarginalSlopeFamily {
                         for c in 0..p {
                             let suc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, c);
                             let svc = self.cell_pair_second_coeff(primary, &fx.coeff_bu, v, c);
+                            let sauc = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, c);
+                            let savc = self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, v, c);
                             for k in 0..4 {
                                 if dir1[c] != 0.0 {
                                     cu1[k] -= suc[k] * dir1[c];
                                     cv1[k] -= svc[k] * dir1[c];
+                                    cau1[k] -= sauc[k] * dir1[c];
+                                    cav1[k] -= savc[k] * dir1[c];
                                 }
                                 if dir2[c] != 0.0 {
                                     cu2[k] -= suc[k] * dir2[c];
                                     cv2[k] -= svc[k] * dir2[c];
+                                    cau2[k] -= sauc[k] * dir2[c];
+                                    cav2[k] -= savc[k] * dir2[c];
                                 }
                             }
                         }
@@ -407,15 +562,62 @@ impl SurvivalMarginalSlopeFamily {
                             -1.0,
                             &mut cuv2,
                         );
+                        let cuv_a1 = coeff_view
+                            .pair_directional_from_bb_family(
+                                &fx.coeff_abbu,
+                                u,
+                                v,
+                                dir1,
+                                COEFF_SUPPORT_GHW,
+                            )
+                            .map(|value| -value);
+                        let cuv_a2 = coeff_view
+                            .pair_directional_from_bb_family(
+                                &fx.coeff_abbu,
+                                u,
+                                v,
+                                dir2,
+                                COEFF_SUPPORT_GHW,
+                            )
+                            .map(|value| -value);
+                        let mut cu1_total = cu1;
+                        let mut cv1_total = cv1;
+                        let mut cu2_total = cu2;
+                        let mut cv2_total = cv2;
+                        let mut cuv1_total = cuv1;
+                        let mut cuv2_total = cuv2;
+                        let mut cu12_total = cu12;
+                        let mut cv12_total = cv12;
+                        let mut cuv12_total = cuv12;
+                        for k in 0..4 {
+                            cu1_total[k] += cal_ad1 * cau[k];
+                            cv1_total[k] += cal_ad1 * cav[k];
+                            cu2_total[k] += cal_ad2 * cau[k];
+                            cv2_total[k] += cal_ad2 * cav[k];
+                            cuv1_total[k] += cal_ad1 * sca[k];
+                            cuv2_total[k] += cal_ad2 * sca[k];
+                            cu12_total[k] += cal_ad1 * cau2[k]
+                                + cal_ad2 * cau1[k]
+                                + cal_ad12 * cau[k]
+                                + cal_ad1 * cal_ad2 * caau[k];
+                            cv12_total[k] += cal_ad1 * cav2[k]
+                                + cal_ad2 * cav1[k]
+                                + cal_ad12 * cav[k]
+                                + cal_ad1 * cal_ad2 * caav[k];
+                            cuv12_total[k] += cal_ad1 * cuv_a2[k]
+                                + cal_ad2 * cuv_a1[k]
+                                + cal_ad12 * sca[k]
+                                + cal_ad1 * cal_ad2 * scaa[k];
+                        }
                         let d1v = exact_kernel::cell_third_derivative_from_moments(
                             nc,
                             &cu,
                             &cv,
-                            &cd1,
+                            &cd1_total,
                             &sc,
-                            &cu1,
-                            &cv1,
-                            &cuv1,
+                            &cu1_total,
+                            &cv1_total,
+                            &cuv1_total,
                             &st.moments,
                         )?;
                         f_uv_d1[[u, v]] += d1v;
@@ -426,11 +628,11 @@ impl SurvivalMarginalSlopeFamily {
                             nc,
                             &cu,
                             &cv,
-                            &cd2,
+                            &cd2_total,
                             &sc,
-                            &cu2,
-                            &cv2,
-                            &cuv2,
+                            &cu2_total,
+                            &cv2_total,
+                            &cuv2_total,
                             &st.moments,
                         )?;
                         f_uv_d2[[u, v]] += d2v;
@@ -441,19 +643,19 @@ impl SurvivalMarginalSlopeFamily {
                             nc,
                             &cu,
                             &cv,
-                            &cd1,
-                            &cd2,
+                            &cd1_total,
+                            &cd2_total,
                             &sc,
-                            &cu1,
-                            &cu2,
-                            &cv1,
-                            &cv2,
-                            &cd12,
-                            &cuv1,
-                            &cuv2,
-                            &cu12,
-                            &cv12,
-                            &cuv12,
+                            &cu1_total,
+                            &cu2_total,
+                            &cv1_total,
+                            &cv2_total,
+                            &cd12_total,
+                            &cuv1_total,
+                            &cuv2_total,
+                            &cu12_total,
+                            &cv12_total,
+                            &cuv12_total,
                             &st.moments,
                         )?;
                         f_uv_d12[[u, v]] += d12v;
