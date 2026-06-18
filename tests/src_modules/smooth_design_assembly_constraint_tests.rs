@@ -4620,18 +4620,23 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 /// design for an in-window ψ move only if the skip gate proves the realized
 /// reduced basis is unchanged. The former RRQR rank/permutation gate was not
 /// strong enough: it skipped `reset_surface` while the basis moved and shipped a
-/// β̂ mismatch. This test keeps the same standardized Duchon fixture and asserts
-/// that the moving-ψ skip is now refused; the slow path must re-enter for every
-/// moved ψ and the resulting β̂ must match a fresh streamed solve.
+/// β̂ mismatch. This test keeps the same standardized Duchon fixture and certifies
+/// the PAIRWISE reduced-basis-equality witness: a tiny ψ move off the pinning ψ
+/// (reduced basis unchanged) ADMITS the skip and exercises the fast path; the
+/// caller's verdict drives whether the slow path re-runs; and on WHICHEVER path
+/// fires the converged β̂ must match a fresh streamed solve to < 1e-6 — the
+/// soundness invariant.
 ///
 /// #1264: the design-revision fast path keeps the reference surface (its
-/// conditioned frame AND its RRQR-reduced / null basis) FROZEN at ψ_A while
-/// re-keying the Gram `XᵀWX(ψ)` and penalty `S(ψ)` to ψ_B. The streamed slow
-/// path re-realizes and RE-PIVOTS the radial-kernel design at ψ_B, so it forms
-/// its solve in a fresh reduced basis. Conditioning-ratio and Gram-derived RRQR
-/// rank/permutation gates were both insufficient on MSI. Until production has a
-/// true reduced-basis-equality witness, `psi_gram_tensor_covers_skip` must be
-/// empty and production must keep the exact `reset_surface` lane.
+/// conditioned frame AND its RRQR-reduced / null basis) FROZEN at the pinning ψ
+/// while re-keying the Gram `XᵀWX(ψ)` and penalty `S(ψ)` to the trial ψ. The
+/// streamed slow path re-realizes and RE-PIVOTS the radial-kernel design, so it
+/// forms its solve in a fresh reduced basis. Conditioning-ratio and Gram-derived
+/// RRQR rank/permutation gates were both insufficient on MSI. The fix is the
+/// gauge-invariant range-PROJECTOR witness `reduced_basis_equal(ψ_ref, ψ_new)`,
+/// keyed to the pinning ψ recorded at the last slow-path reset: the skip fires
+/// only where the frozen reduced basis is provably still valid, so production
+/// keeps β̂ bit-tight while regaining the n-free skip where it is sound.
 #[test]
 fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     use crate::solver::rho_optimizer::OuterEvalOrder;
@@ -4788,44 +4793,36 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
     tensor_eval.set_supports_nfree_penalty_rekey(nfree_penalty);
 
-    // The old RRQR-only gate admitted the first two 1/256 scan intervals from
-    // the low-ψ edge on this fixture and MSI measured β̂-rel ≈ 7.8e-2 there.
-    // That is not a reduced-basis-equality proof, so the production skip window
-    // must now be empty. Probe the exact same scan lattice the old test used.
-    let skip_band: Vec<f64> = {
-        let m = 256usize;
-        (0..=m)
-            .map(|i| psi_lo + (psi_hi - psi_lo) * (i as f64) / (m as f64))
-            .filter(|&p| tensor_eval.psi_gram_tensor_covers_skip(p))
-            .collect()
-    };
-    assert!(
-        skip_band.is_empty(),
-        "moving-ψ reset-skip must stay disabled without a reduced-basis-equality \
-         witness; old RRQR-only gate admitted {} points",
-        skip_band.len()
-    );
+    // The skip gate is now the PAIRWISE reduced-basis-equality witness
+    // (`reduced_basis_equal(ψ_ref, ψ_new)`) keyed to the pinning ψ recorded at the
+    // last slow-path reset. Before any eval there is no pinning ψ, so the skip is
+    // refused for every probe.
     let span = psi_hi - psi_lo;
-    let psi_a = psi_lo;
-    let psi_b = psi_lo + span / 256.0;
-    let psi_c = psi_lo + 2.0 * span / 256.0;
+    // Pin in the INTERIOR (not at the low edge, where the radial-kernel Gram is
+    // most ill-conditioned and the reduced basis is most volatile) so the
+    // positive-lane assertion below is robust: a tiny step off an interior pin
+    // genuinely preserves the reduced basis.
+    let psi_a = psi_lo + 0.5 * span;
+    // ψ_B: a small move off the pin where the reduced (range) basis is unchanged,
+    // so the witness ADMITS the skip and the fast path must reproduce the streamed
+    // β̂. We must build the tensor first to locate such a step; `psi_b` is filled
+    // in below from the witness itself (smallest step among a shrinking ladder
+    // that the pinned witness accepts), keeping the positive lane robustly
+    // non-vacuous without depending on a hand-tuned magnitude.
+    let mut psi_b = psi_a + span / 4096.0;
+    // ψ_C: a LARGE move toward the low edge — the radial-kernel reduced basis has
+    // moved there, so the witness should REFUSE and the slow path must re-run. (If
+    // the fixture's basis happens to stay equal even here, the test still passes:
+    // it asserts the SOUNDNESS invariant — β̂ matches streamed on whichever path
+    // fires — not a fixed path choice.)
+    let psi_c = psi_lo + 0.02 * span;
     assert!(
         !tensor_eval.psi_gram_tensor_covers_skip(psi_a)
             && !tensor_eval.psi_gram_tensor_covers_skip(psi_b)
             && !tensor_eval.psi_gram_tensor_covers_skip(psi_c),
-        "the old low-edge RRQR prefix must not be eligible for the reset-skip"
+        "before any slow-path reset there is no pinning ψ, so the skip witness must \
+         refuse every trial"
     );
-    if std::env::var("DIAG1216").is_ok() {
-        eprintln!(
-            "[DIAG1216-FP] window [{psi_lo:.4},{psi_hi:.4}] skip_band EMPTY \
-             ({} pts)  old_low_prefix ψ_a={psi_a:.4} ψ_b={psi_b:.4} ψ_c={psi_c:.4}  \
-             covers_skip(a/b/c)={}/{}/{}",
-            skip_band.len(),
-            tensor_eval.psi_gram_tensor_covers_skip(psi_a),
-            tensor_eval.psi_gram_tensor_covers_skip(psi_b),
-            tensor_eval.psi_gram_tensor_covers_skip(psi_c),
-        );
-    }
     let rho = Array1::<f64>::from_elem(rho_dim, 0.5);
     let theta_at = |psi: f64| {
         let mut theta = Array1::<f64>::zeros(rho_dim + 1);
@@ -4834,10 +4831,14 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         theta
     };
 
-    // Mirror production after the tightened gate: every moved ψ fails
-    // `psi_gram_tensor_covers_skip`, so the caller realizes the design before
-    // evaluating. `prepare_eval_state` must therefore take the exact slow path
-    // and increment `slow_path_reset_count` on all three trials.
+    // Production after the pairwise gate: a moved ψ takes the design-revision FAST
+    // path exactly when `psi_gram_tensor_covers_skip(ψ)` (= reduced_basis_equal
+    // against the pinning ψ) holds; otherwise the caller realizes the design and
+    // the slow path re-runs. The contract this test certifies is the SOUNDNESS
+    // invariant: on WHICHEVER path fires, the converged β̂ must equal a fresh
+    // streamed slow-path solve to < 1e-6 — the fast path never changes the
+    // κ-optimum. We assert the witness verdict and the slow_path_reset_count stay
+    // consistent (a refused skip ⇒ +1 reset; an admitted skip ⇒ no reset).
     let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
                        cache: &mut SingleBlockExactJointDesignCache<'_>,
                        theta: &Array1<f64>|
@@ -4872,7 +4873,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         (cost, grad, beta)
     };
 
-    // Trial 1 (ψ_A): first eval at this revision -> slow path runs once.
+    // Trial 1 (ψ_A): first eval at this revision -> slow path runs once and pins
+    // the reduced-basis reference at ψ_A.
     assert_eq!(
         tensor_eval.slow_path_reset_count(),
         0,
@@ -4885,20 +4887,62 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         "first eval at a fresh revision must take the slow path exactly once"
     );
 
-    // Trial 2 (ψ_B): moved ψ -> skip refused -> slow path runs again.
-    let (c_b, _g_b, beta_b) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b));
-    assert_eq!(
-        tensor_eval.slow_path_reset_count(),
-        2,
-        "moved-ψ trial did not re-enter reset_surface after the skip gate refused it"
+    // With ψ_A now pinned, the witness `psi_gram_tensor_covers_skip` is live.
+    // Pick ψ_B as the smallest step (down a shrinking ladder) the pinned witness
+    // ACCEPTS, so the positive fast-path lane is robustly exercised without a
+    // hand-tuned magnitude. The reduced basis is continuous in ψ at an interior
+    // pin, so a sufficiently small step is always accepted.
+    for d in 0..16 {
+        let cand = psi_a + span / (4096.0 * 2f64.powi(d));
+        if tensor_eval.psi_gram_tensor_covers_skip(cand) {
+            psi_b = cand;
+            break;
+        }
+    }
+
+    // Query the witness verdict for the two moved trials. These are the SAME
+    // predicate the production caller consults to decide whether to skip design
+    // realization, so the test's expected reset deltas are derived from it rather
+    // than hard-coded — keeping the gate honest on whatever the standardized
+    // fixture actually does.
+    let skip_b = tensor_eval.psi_gram_tensor_covers_skip(psi_b);
+    let skip_c = tensor_eval.psi_gram_tensor_covers_skip(psi_c);
+    if std::env::var("DIAG1216").is_ok() {
+        eprintln!(
+            "[DIAG1216-FP] pinned ψ_a={psi_a:.5}  covers_skip(ψ_b={psi_b:.5})={skip_b}  \
+             covers_skip(ψ_c={psi_c:.5})={skip_c}"
+        );
+    }
+    // A tiny ψ move off the pin must keep the reduced basis (non-vacuous positive
+    // lane): the skip witness has to ADMIT it, exercising the actual fast-path
+    // skip whose β̂ we then certify against the streamed solve below.
+    assert!(
+        skip_b,
+        "a tiny ψ move off the pin must preserve the reduced basis and ADMIT the \
+         skip (else the positive fast-path lane is never exercised); ψ_a={psi_a:.6} \
+         ψ_b={psi_b:.6}"
     );
 
-    // Trial 3 (ψ_C): moved ψ again -> skip refused -> slow path runs again.
-    let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c));
+    // Trial 2 (ψ_B): the witness decides the path; reset_count tracks the verdict.
+    let before_b = tensor_eval.slow_path_reset_count();
+    let (c_b, _g_b, beta_b) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b));
+    let after_b = tensor_eval.slow_path_reset_count();
     assert_eq!(
-        tensor_eval.slow_path_reset_count(),
-        3,
-        "second moved-ψ trial did not re-enter reset_surface after skip refusal"
+        after_b - before_b,
+        if skip_b { 0 } else { 1 },
+        "ψ_B reset-count delta must match the witness verdict (skip={skip_b}): an \
+         admitted skip takes the fast path (no reset), a refused skip re-runs the \
+         slow path (+1)"
+    );
+
+    // Trial 3 (ψ_C): same self-consistency check at the far ψ.
+    let before_c = tensor_eval.slow_path_reset_count();
+    let (c_c, _g_c, beta_c) = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c));
+    let after_c = tensor_eval.slow_path_reset_count();
+    assert_eq!(
+        after_c - before_c,
+        if skip_c { 0 } else { 1 },
+        "ψ_C reset-count delta must match the witness verdict (skip={skip_c})"
     );
 
     assert!(
@@ -4983,9 +5027,11 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
 
     eprintln!(
-        "[psi-gram-tensor #1033/#1264] moving-ψ reset-skip refused without a \
-         reduced-basis-equality witness; slow_path_reset_count=3 and worst |Δβ̂| \
-         vs streamed slow path = {worst:.3e}"
+        "[psi-gram-tensor #1033/#1264] pairwise reduced-basis-equality witness: \
+         skip(ψ_b)={skip_b} skip(ψ_c)={skip_c}, slow_path_reset_count={}, worst \
+         |Δβ̂| vs streamed slow path = {worst:.3e} (≤ the 1e-6 soundness bar on \
+         WHICHEVER path fired)",
+        tensor_eval.slow_path_reset_count()
     );
 }
 

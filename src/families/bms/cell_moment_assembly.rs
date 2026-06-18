@@ -3298,7 +3298,12 @@ mod empirical_flex_jet_oracle_tests {
             1.785_714_3,
             2.5,
         ]);
-        DeviationRuntime::try_new(knots, 0.0, 2).expect("deviation runtime")
+        // Order-1 smoothness penalty: its null space (the constants) is the
+        // non-trivial direction `try_new` drops for location-block absorption.
+        // An order-2 penalty over this knot basis is full-rank here (no
+        // null directions to drop), so `try_new` rejects it — the fixture must
+        // request the order that leaves an absorbable null space.
+        DeviationRuntime::try_new(knots, 0.0, 1).expect("deviation runtime")
     }
 
     fn make_fixture(is_score_warp: bool) -> FlexFixture {
