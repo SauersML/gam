@@ -900,8 +900,10 @@ pub(crate) fn run_outer_with_plan(
                     // KKT-stationary even though its raw ∂V/∂ρ never vanishes).
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
-                    let cost_stall_rel_tol =
-                        (config.tolerance * 1.0e-2).max(COST_STALL_REL_TOL_FLOOR);
+                    let cost_stall_rel_tol = config
+                        .rel_cost_tolerance
+                        .unwrap_or(config.tolerance * 1.0e-2)
+                        .max(COST_STALL_REL_TOL_FLOOR);
                     let arc_seed_grad_norm =
                         seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                     let cost_stall_grad_threshold = grad_tol
@@ -1254,8 +1256,10 @@ pub(crate) fn run_outer_with_plan(
                     // tolerances do not disable the mgcv-style flat-valley stop.
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
-                    let cost_stall_rel_tol =
-                        (config.tolerance * 1.0e-2).max(COST_STALL_REL_TOL_FLOOR);
+                    let cost_stall_rel_tol = config
+                        .rel_cost_tolerance
+                        .unwrap_or(config.tolerance * 1.0e-2)
+                        .max(COST_STALL_REL_TOL_FLOOR);
                     // Stationarity gate for the cost-stall exit. Convergence must
                     // mean stationarity, not cost-flatness: a cost stall only
                     // counts as a converged optimum when the projected gradient
