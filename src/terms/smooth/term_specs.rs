@@ -4502,70 +4502,6 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     }
 }
 
-fn build_periodic_fourier_margin(
-    x: ArrayView1<'_, f64>,
-    period: f64,
-    requested_cols: usize,
-    penalty_order: usize,
-) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>), BasisError> {
-    if !period.is_finite() || period <= 0.0 {
-        crate::bail_invalid_basis!(
-            "periodic tensor margin requires finite positive period, got {period}"
-        );
-    }
-    let q = requested_cols.max(3);
-    let harmonics = q / 2;
-    let has_nyquist_cos = q.is_multiple_of(2);
-    let mut basis = Array2::<f64>::zeros((x.len(), q));
-    basis.column_mut(0).fill(1.0);
-    for (i, &xi) in x.iter().enumerate() {
-        let angle = 2.0 * std::f64::consts::PI * xi / period;
-        let mut col = 1usize;
-        for h in 1..=harmonics {
-            if col >= q {
-                break;
-            }
-            basis[[i, col]] = (h as f64 * angle).cos();
-            col += 1;
-            if col >= q {
-                break;
-            }
-            basis[[i, col]] = (h as f64 * angle).sin();
-            col += 1;
-        }
-        if has_nyquist_cos && q > 1 {
-            basis[[i, q - 1]] = (harmonics as f64 * angle).cos();
-        }
-    }
-    let mut penalty = Array2::<f64>::zeros((q, q));
-    let order = penalty_order.max(1) as i32;
-    let mut col = 1usize;
-    for h in 1..=harmonics {
-        let w = (h as f64).powi(2 * order);
-        if col < q {
-            penalty[[col, col]] = w;
-            col += 1;
-        }
-        if col < q {
-            penalty[[col, col]] = w;
-            col += 1;
-        }
-    }
-    if has_nyquist_cos && q > 1 {
-        penalty[[q - 1, q - 1]] = (harmonics as f64).powi(2 * order);
-    }
-    // The Fourier margin has no B-spline knots; this vector is a placeholder
-    // that downstream code (the tensor freeze) treats as carrying the periodic
-    // control-site count in its *length* and the domain start in `[0]`. Its
-    // length MUST equal the basis column count `q` (= `basis.ncols()`): the
-    // freeze records `num_basis = knots.len()` and the predict-time rebuild
-    // re-derives `q` columns from it, so a `q + 1`-length vector reconstructs
-    // one extra column per periodic axis and breaks the frozen identifiability
-    // transform (issue #498).
-    let knots = Array1::linspace(0.0, period, q);
-    Ok((basis, penalty, knots))
-}
-
 fn tensor_product_design_from_sparse_marginals(
     marginal_sparse: &[&SparseColMat<usize, f64>],
 ) -> Result<SparseColMat<usize, f64>, BasisError> {
@@ -4673,6 +4609,24 @@ fn tensor_product_design_from_sparse_marginals(
     })
 }
 
+fn dense_local_margin_to_sparse(
+    dense: &Array2<f64>,
+) -> Result<SparseColMat<usize, f64>, BasisError> {
+    let expected_row_nnz = dense.ncols().min(4);
+    let mut triplets =
+        Vec::<Triplet<usize, usize, f64>>::with_capacity(dense.nrows() * expected_row_nnz);
+    for ((row, col), &value) in dense.indexed_iter() {
+        if value != 0.0 {
+            triplets.push(Triplet::new(row, col, value));
+        }
+    }
+    SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets).map_err(|e| {
+        BasisError::SparseCreation(format!(
+            "failed to convert tensor marginal design to sparse form: {e:?}"
+        ))
+    })
+}
+
 struct TensorMarginRangeNullProjectors {
     range: Array2<f64>,
     null: Array2<f64>,
@@ -4753,9 +4707,9 @@ fn build_tensor_bspline_basis(
     let mut marginalnum_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     let mut marginal_designs = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
-    // Per-margin effective period: either user-set via `spec.periods` (forcing
-    // the Fourier path) or implied by a `PeriodicUniform` marginal knotspec
-    // (which the 1D B-spline builder already realizes as a periodic basis).
+    // Per-margin effective period: either user-set via `spec.periods` or
+    // implied by a `PeriodicUniform` marginal knotspec (which the 1D B-spline
+    // builder realizes as a cyclic B-spline basis).
     // Captured here so freeze→reload round-trips both routes back to a
     // `PeriodicUniform` marginal knotspec; otherwise a `PeriodicUniform`
     // margin specified without `spec.periods` would freeze as a plain
@@ -4764,9 +4718,10 @@ fn build_tensor_bspline_basis(
     // Per-marginal sparse representation, populated when the 1D builder returned
     // a `DesignMatrix::Sparse`. Used to assemble the Khatri-Rao tensor product
     // sparsely (only ∏(degree+1) nonzeros per row) instead of densifying to
-    // shape (n, ∏ q_j) up front. When any marginal lacks a sparse form (e.g.
-    // periodic B-splines currently realize a dense Array2), we fall back to the
-    // existing dense Khatri-Rao path.
+    // shape (n, ∏ q_j) up front. Periodic B-spline margins are local-support
+    // bases too; when the 1D builder returns them densely, we convert that
+    // marginal back to sparse form so cylinder/torus tensor products keep the
+    // same scale behavior as open tensor products.
     let mut marginal_sparse =
         Vec::<Option<SparseColMat<usize, f64>>>::with_capacity(feature_cols.len());
 
@@ -4781,100 +4736,76 @@ fn build_tensor_bspline_basis(
         // identifiability constraints here would change marginal penalty sizes
         // without changing the tensor design construction, causing dimension
         // mismatch. Keep marginal builders unconstrained at this stage.
-        if let Some(period) = spec.periods.get(dim).and_then(|p| *p) {
-            let requested_cols = match marginalspec.knotspec {
-                BSplineKnotSpec::Generate {
-                    num_internal_knots, ..
-                } => num_internal_knots + marginalspec.degree + 1,
-                BSplineKnotSpec::Provided(ref knots) => {
-                    knots.len().saturating_sub(marginalspec.degree + 1)
-                }
-                BSplineKnotSpec::Automatic {
-                    num_internal_knots, ..
-                } => {
-                    // Fallback internal-knot count when an automatic marginal has
-                    // not yet resolved its knot count at periodic-margin build
-                    // time; matches the modest default used for a 1-D `s()`.
-                    const DEFAULT_AUTOMATIC_INTERNAL_KNOTS: usize = 8;
-                    num_internal_knots.unwrap_or(DEFAULT_AUTOMATIC_INTERNAL_KNOTS)
-                        + marginalspec.degree
-                        + 1
-                }
-                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
-            };
-            let (basis, penalty, knots) = build_periodic_fourier_margin(
-                data.column(col),
-                period,
-                requested_cols,
-                marginalspec.penalty_order,
-            )?;
-            marginal_knots.push(knots);
-            marginal_degrees.push(marginalspec.degree);
-            marginalnum_basis.push(basis.ncols());
-            marginal_designs.push(basis);
-            marginal_penalties.push(penalty);
-            // Periodic Fourier margins are realized densely; no sparse form
-            // is available, so record `None` and force the dense fall-back
-            // for the tensor product if any dimension is periodic.
-            marginal_sparse.push(None);
-            marginal_effective_periods.push(Some(period));
-        } else {
-            let mut marginal_unconstrained = marginalspec.clone();
-            marginal_unconstrained.identifiability = BSplineIdentifiability::None;
-            let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
-            let knots = match built.metadata {
-                BasisMetadata::BSpline1D { knots, .. } => knots,
-                _ => {
-                    crate::bail_invalid_basis!(
-                        "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
-                    );
-                }
-            };
-            marginal_knots.push(knots);
-            marginal_degrees.push(marginalspec.degree);
-            marginalnum_basis.push(built.design.ncols());
-            // Capture the sparse representation of this marginal (when the
-            // 1D builder produced one) before densifying for the dense
-            // marginal cache used by `tensor_product_design_from_marginals`
-            // and `TensorProductDesignOperator`.
-            let sparse_view: Option<SparseColMat<usize, f64>> =
-                built.design.as_sparse().map(|sd| {
-                    let inner: &SparseColMat<usize, f64> = sd;
-                    inner.clone()
-                });
-            marginal_sparse.push(sparse_view);
-            marginal_designs.push(built.design.to_dense());
-            marginal_penalties.push(
-                built
-                    .penalties
-                    .first()
-                    .ok_or_else(|| {
-                        BasisError::InvalidInput(format!(
-                            "internal TensorBSpline error at dim {dim}: missing marginal penalty"
-                        ))
-                    })?
-                    .clone(),
-            );
-            built.nullspace_dims.first().ok_or_else(|| {
-                BasisError::InvalidInput(format!(
-                    "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
-                ))
-            })?;
-            // A `PeriodicUniform` marginal knotspec implies the margin is
-            // wrap-around: the 1D builder already realized it as a periodic
-            // basis, so the tensor product inherits that periodicity. Record
-            // the period derived from the knotspec's data range so freeze
-            // restores `PeriodicUniform` on the marginal — otherwise the
-            // round-trip downgrades it to `Provided(knots)` (an open spline)
-            // and predict-time wraps disappear.
-            let implied_period = match marginalspec.knotspec {
-                BSplineKnotSpec::PeriodicUniform { data_range, .. } => {
-                    Some(data_range.1 - data_range.0)
+        let mut marginal_unconstrained = marginalspec.clone();
+        marginal_unconstrained.identifiability = BSplineIdentifiability::None;
+        let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
+        let knots = match built.metadata {
+            BasisMetadata::BSpline1D { knots, .. } => knots,
+            _ => {
+                crate::bail_invalid_basis!(
+                    "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
+                );
+            }
+        };
+        let metadata_knots = match marginalspec.knotspec {
+            BSplineKnotSpec::PeriodicUniform {
+                data_range,
+                num_basis,
+            } => Array1::linspace(data_range.0, data_range.1, num_basis),
+            _ => knots,
+        };
+        marginal_knots.push(metadata_knots);
+        marginal_degrees.push(marginalspec.degree);
+        marginalnum_basis.push(built.design.ncols());
+        // Capture the sparse representation of this marginal (when the
+        // 1D builder produced one) before densifying for the dense
+        // marginal cache used by `tensor_product_design_from_marginals`
+        // and `TensorProductDesignOperator`.
+        let dense_marginal = built.design.to_dense();
+        let sparse_view: Option<SparseColMat<usize, f64>> = match built.design.as_sparse() {
+            Some(sd) => {
+                let inner: &SparseColMat<usize, f64> = sd;
+                Some(inner.clone())
+            }
+            None => match marginalspec.knotspec {
+                BSplineKnotSpec::PeriodicUniform { .. } => {
+                    Some(dense_local_margin_to_sparse(&dense_marginal)?)
                 }
                 _ => None,
-            };
-            marginal_effective_periods.push(implied_period);
-        }
+            },
+        };
+        marginal_sparse.push(sparse_view);
+        marginal_designs.push(dense_marginal);
+        marginal_penalties.push(
+            built
+                .penalties
+                .first()
+                .ok_or_else(|| {
+                    BasisError::InvalidInput(format!(
+                        "internal TensorBSpline error at dim {dim}: missing marginal penalty"
+                    ))
+                })?
+                .clone(),
+        );
+        built.nullspace_dims.first().ok_or_else(|| {
+            BasisError::InvalidInput(format!(
+                "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
+            ))
+        })?;
+        // A `PeriodicUniform` marginal knotspec implies the margin is
+        // wrap-around: the 1D builder already realized it as a periodic
+        // basis, so the tensor product inherits that periodicity. Record
+        // the period derived from the knotspec's data range so freeze
+        // restores `PeriodicUniform` on the marginal — otherwise the
+        // round-trip downgrades it to `Provided(knots)` (an open spline)
+        // and predict-time wraps disappear.
+        let implied_period = match marginalspec.knotspec {
+            BSplineKnotSpec::PeriodicUniform { data_range, .. } => {
+                Some(data_range.1 - data_range.0)
+            }
+            _ => spec.periods.get(dim).and_then(|p| *p),
+        };
+        marginal_effective_periods.push(implied_period);
     }
 
     let total_cols: usize = marginalnum_basis.iter().product();
