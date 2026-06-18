@@ -534,6 +534,21 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
+        #[cfg(test)]
+        {
+            let qq = primary.q1;
+            // Only emit for the #932 debug fixture's exit timepoint (q1=0.6),
+            // identified by its distinctive intercept geometry, to avoid
+            // polluting every other survival test that exercises this path.
+            if qq < p && (q - 0.6_f64).abs() < 1e-9 {
+                eprintln!(
+                    "DBG932 q_index={q_index} qq={qq}: a_uv[qq,qq]={:+.6e} a_uv_dir[qq,qq]={:+.6e} eta_aa_dir={:+.6e} a_u[qq]={:+.6e} a_u_dir[qq]={:+.6e} chi_dir={:+.6e} chi_val={:+.6e} eta_aa={:+.6e} | f_a={:+.6e} f_a_dir={:+.6e} f_aa={:+.6e} f_aa_dir={:+.6e} f_uv_dir[qq,qq]={:+.6e} f_au[qq]={:+.6e} f_au_dir[qq]={:+.6e}",
+                    a_uv[[qq, qq]], a_uv_dir[[qq, qq]], eta_aa_dir, a_u[qq], a_u_dir[qq], chi_dir, chi_val, eta_aa,
+                    f_a, f_a_dir, f_aa, f_aa_dir, f_uv_dir[[qq, qq]], f_au[qq], f_au_dir[qq],
+                );
+            }
+        }
+
         // D_u_dir: directional derivative of the density normalization first derivative.
         let d_u_dir_cell_accums = cached
             .cells
