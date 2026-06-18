@@ -115,33 +115,6 @@ pub const PSI_GRAM_NODE_LADDER: [usize; 5] = [9, 17, 33, 65, 129];
 /// Number of deterministic off-node spot-check ψ values.
 pub const PSI_GRAM_SPOT_POINTS: usize = 3;
 
-/// Minimum RRQR rank-verdict margin accepted for the low-edge fast-path skip
-/// frame.
-///
-/// The skip gate's primary safety condition is locality at the low-ψ edge; this
-/// margin only rejects rank decisions already on the wrong side of the RRQR
-/// tolerance cliff. Later / high-ψ components are never admitted by this gate.
-pub const PSI_GRAM_SKIP_RRQR_MARGIN_MIN: f64 = 1.0;
-
-/// Number of equispaced scan points used to locate the RRQR-pivot-stable skip
-/// sub-window at build (each probe is a k×k Gram-derived RRQR — cheap).
-///
-/// Keep this at the same granularity as the production gate's non-vacuous
-/// witness scan: the skip path is only sound over a very narrow low-ψ prefix on
-/// standardized 1-D Duchon geometry, so a coarse 64-point scan either admits too
-/// much drift or misses the stable interval entirely.
-pub const PSI_GRAM_SKIP_SCAN_POINTS: usize = 256;
-
-/// Number of scan intervals admitted from the low-ψ edge.
-///
-/// Matching RRQR rank and pivot order is necessary, but #1264 showed it is not
-/// sufficient over a wide high-ψ band. The design-revision skip is therefore a
-/// strictly local low-ψ fast path: it may cover only the first three scan probes
-/// from `psi_lo`, keeping the pinned reference surface close to every skipped
-/// trial and excluding later high-ψ components entirely. Wider moves take the
-/// full `reset_surface` path.
-pub const PSI_GRAM_SKIP_MAX_SCAN_INTERVALS: usize = 2;
-
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
 ///
 /// Holds the one-time n-pass products; every per-trial accessor is O(D²k²)
@@ -162,11 +135,10 @@ pub struct PsiGramTensor {
     /// still spans the full window.
     grad_psi_lo: f64,
     grad_psi_hi: f64,
-    /// RRQR-pivot-stable sub-window `[skip_psi_lo, skip_psi_hi] ⊆ [psi_lo,
-    /// psi_hi]` over which the design's REDUCED BASIS is ψ-invariant enough that
-    /// the #1033 design-revision FAST PATH (which skips `reset_surface` and
-    /// re-keys only the Gram + penalty on a surface pinned at a reference ψ) is
-    /// SOUND (#1264).
+    /// Reduced-basis-equality sub-window `[skip_psi_lo, skip_psi_hi] ⊆
+    /// [psi_lo, psi_hi]` over which the #1033 design-revision FAST PATH (which
+    /// skips `reset_surface` and re-keys only the Gram + penalty on a surface
+    /// pinned at a reference ψ) is SOUND (#1264).
     ///
     /// The fast path keeps the conditioned reduced design / null-space basis
     /// frozen at the revision-pinning ψ and only swaps in `gram_at(ψ_new)` and
@@ -174,9 +146,11 @@ pub struct PsiGramTensor {
     /// the reduced basis are unchanged. On the WIDE standardized window (#1215)
     /// the radial-kernel frame can pivot while the conditioning ratio still looks
     /// tame, so a conditioning-only gate silently pairs a stale reduced basis
-    /// with a re-keyed Gram → a wrong β̂. This sub-window is the local low-ψ
-    /// prefix whose Gram-derived RRQR rank/permutation match; outside it the
-    /// caller must take the full `reset_surface` slow path.
+    /// with a re-keyed Gram → a wrong β̂. Gram-derived RRQR rank/permutation is
+    /// only a necessary condition and has shipped β̂-rel ≈ 7.8e-2 on the
+    /// standardized gate fixture. Until the caller can prove the realized
+    /// reduced basis itself is equal, this sub-window is deliberately empty and
+    /// callers must take the full `reset_surface` slow path for moving-ψ trials.
     skip_psi_lo: f64,
     skip_psi_hi: f64,
     /// Original row count of the design whose Gram was tensorized. Needed to run
@@ -305,7 +279,7 @@ impl PsiGramTensor {
                         // interior (the value lane keeps the full window).
                         candidate.certify_gradient_window(&mut eval_design, weights);
                         // Narrow the design-revision skip lane to the
-                        // RRQR-pivot-stable interior (#1264).
+                        // reduced-basis-equality interior (#1264).
                         candidate.compute_skip_window();
                         return Some(candidate);
                     }
@@ -615,65 +589,17 @@ impl PsiGramTensor {
         }
     }
 
-    /// Locate the low-ψ, RRQR-pivot-stable skip sub-window `[skip_psi_lo,
-    /// skip_psi_hi]`, and store it (#1264). The #1033 design-revision fast path
-    /// (re-key Gram + penalty on a frozen reference surface) is only sound in
-    /// this prefix; outside it the reduced basis or conditioning has moved and
-    /// the caller must take the full slow path.
+    /// Locate the reduced-basis-equality skip sub-window `[skip_psi_lo,
+    /// skip_psi_hi]`, and store it (#1264).
     ///
-    /// n-free: `gram_at` is k-space, and each pivot probe is a Gram-derived k×k
-    /// RRQR with the tall-design rank tolerance.
+    /// The previous implementation accepted a tiny low-ψ prefix when
+    /// Gram-derived RRQR rank and pivot permutation matched the reference frame.
+    /// A real MSI run refuted that guard: the prefix still let a stale realized
+    /// reduced basis pair with `XᵀWX(ψ_new)` and produced β̂-rel ≈ 7.8e-2. The
+    /// tensor only knows k-space Grams, not the realized basis transform the
+    /// slow path rebuilds inside `reset_surface`; therefore it cannot prove
+    /// reduced-basis equality. Refuse the skip window until such a guard exists.
     fn compute_skip_window(&mut self) {
-        #[derive(Clone, Eq, PartialEq)]
-        struct Frame {
-            rank: usize,
-            permutation: Vec<usize>,
-        }
-
-        let frame_at = |me: &Self, psi: f64| -> Option<Frame> {
-            let g = me.gram_at(psi);
-            if g.iter().any(|v| !v.is_finite()) {
-                return None;
-            }
-            let rrqr = crate::linalg::faer_ndarray::rrqr_from_gram_with_permutation(
-                &g,
-                me.n_rows,
-                crate::linalg::faer_ndarray::default_rrqr_rank_alpha(),
-            )
-            .ok()?;
-            if !rrqr.verdict_margin.is_finite()
-                || rrqr.verdict_margin < PSI_GRAM_SKIP_RRQR_MARGIN_MIN
-            {
-                return None;
-            }
-            Some(Frame {
-                rank: rrqr.rank,
-                permutation: rrqr.column_permutation,
-            })
-        };
-        let span = self.psi_hi - self.psi_lo;
-        if !(span.is_finite() && span > 0.0) {
-            self.skip_psi_lo = f64::NAN;
-            self.skip_psi_hi = f64::NAN;
-            return;
-        }
-        let n = PSI_GRAM_SKIP_SCAN_POINTS;
-        let probes: Vec<(f64, Option<Frame>)> = (0..=PSI_GRAM_SKIP_MAX_SCAN_INTERVALS)
-            .map(|i| {
-                let psi = self.psi_lo + span * (i as f64) / (n as f64);
-                (psi, frame_at(self, psi))
-            })
-            .collect();
-
-        if probes.len() >= 3
-            && let Some(reference_frame) = probes[0].1.as_ref()
-            && probes[1].1.as_ref() == Some(reference_frame)
-            && probes[2].1.as_ref() == Some(reference_frame)
-        {
-            self.skip_psi_lo = probes[0].0;
-            self.skip_psi_hi = probes[2].0;
-            return;
-        }
         self.skip_psi_lo = f64::NAN;
         self.skip_psi_hi = f64::NAN;
     }
