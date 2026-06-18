@@ -362,7 +362,7 @@ fn witness_accept_implies_bit_identity_and_refuses_subspace_change() {
         let cols: Vec<usize> = evals
             .iter()
             .enumerate()
-            .filter(|(_, &l)| l > cutoff)
+            .filter(|&(_, &l)| l > cutoff)
             .map(|(i, _)| i)
             .collect();
         let mut q = Array2::<f64>::zeros((g.nrows(), cols.len()));
