@@ -1288,13 +1288,16 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
             spec.identifiability,
             MaternIdentifiability::CenterSumToZero | MaternIdentifiability::CenterLinearOrthogonal
         ),
-        // Wahba sphere (`bs="sos"`, method=Wahba): the finite-center kernel
-        // chart can still span a near-constant realized direction on the data
-        // rows, so it requires global parametric orthogonalization (#532). The
-        // Harmonic method starts at degree l=1 and never spans the constant, so
-        // it is excluded.
+        // Wahba sphere (`bs="sos"`, method=Wahba): the finite-center Sobolev
+        // kernel chart can still span a near-constant realized direction on
+        // the data rows, so it requires global parametric orthogonalization
+        // (#532). Pseudo is resolved by the basis builder to the harmonic
+        // engine, whose degree l=1 start never spans the constant; forcing it
+        // through this post-build transform would also renormalize away the
+        // harmonic engine's physical spectral penalty scale.
         SmoothBasisSpec::Sphere { spec, .. } => {
             matches!(spec.method, crate::basis::SphereMethod::Wahba)
+                && !matches!(spec.wahba_kernel, crate::basis::SphereWahbaKernel::Pseudo)
                 && matches!(
                     spec.identifiability,
                     SphericalSplineIdentifiability::CenterSumToZero
