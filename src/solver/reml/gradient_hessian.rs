@@ -5617,6 +5617,7 @@ impl<'a> RemlState<'a> {
             xtwx_orig: xtwx,
             xtwy_orig: xtwy,
             centered_weighted_y_sq,
+            row_prediction_is_stale: false,
             xtwx_sparse_orig,
         });
         log::info!(

@@ -1090,33 +1090,88 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let baseridge = pls_result.ridge_used;
 
         let priorweights_owned = priorweights.to_owned();
-        // eta = offset + X Qs beta (composed, no materialization)
+        // eta = offset + X Qs beta (composed, no materialization) unless a
+        // design-moving ψ tensor cache explicitly says the surface rows are a
+        // stale reference. In that lane the Gaussian objective and gradient are
+        // fully determined by (G, r, y'Wy), so applying `x_original` would both
+        // reintroduce per-trial row work and evaluate the wrong ψ.
         let qbeta = transform_active
             .as_ref()
             .map(|transform| transform.apply(beta_transformed.as_ref()))
             .unwrap_or_else(|| beta_transformed.as_ref().clone());
-        let mut eta = offset.to_owned();
-        eta += &x_original.apply(&qbeta);
-        let final_eta = eta.clone();
-        let finalmu = eta.clone();
-        let finalz = y.to_owned();
+        let stale_row_cache = cache_for_solve.filter(|cache| cache.row_prediction_is_stale);
+        let (final_eta, finalmu, finalz, gradient_data, deviance, log_likelihood, max_abs_eta) =
+            if let Some(cache) = stale_row_cache {
+                let final_eta = offset.to_owned();
+                let finalmu = final_eta.clone();
+                let finalz = y.to_owned();
+                let mut grad_orig = cache.xtwx_orig.dot(&qbeta);
+                grad_orig -= &cache.xtwy_orig;
+                let gradient_data = transform_active
+                    .as_ref()
+                    .map(|transform| transform.apply_transpose(&grad_orig))
+                    .unwrap_or(grad_orig);
+                let weighted_rss = (cache.centered_weighted_y_sq
+                    - 2.0 * qbeta.dot(&cache.xtwy_orig)
+                    + qbeta.dot(&cache.xtwx_orig.dot(&qbeta)))
+                .max(0.0);
+                let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);
+                let deviance = if phi.is_finite() && phi > 0.0 {
+                    weighted_rss / phi
+                } else {
+                    f64::NAN
+                };
+                let log_likelihood = -0.5 * deviance;
+                let max_abs_eta = inf_norm(finalmu.iter().copied());
+                (
+                    final_eta,
+                    finalmu,
+                    finalz,
+                    gradient_data,
+                    deviance,
+                    log_likelihood,
+                    max_abs_eta,
+                )
+            } else {
+                let mut eta = offset.to_owned();
+                eta += &x_original.apply(&qbeta);
+                let final_eta = eta.clone();
+                let finalmu = eta.clone();
+                let finalz = y.to_owned();
 
-        let mut weighted_residual = finalmu.clone();
-        weighted_residual -= &finalz;
-        weighted_residual *= &priorweights_owned;
-        // gradient = Qs^T X^T (w * residual) (composed)
-        let xt_wr = x_original.apply_transpose(&weighted_residual);
-        let gradient_data = transform_active
-            .as_ref()
-            .map(|transform| transform.apply_transpose(&xt_wr))
-            .unwrap_or(xt_wr);
+                let mut weighted_residual = finalmu.clone();
+                weighted_residual -= &finalz;
+                weighted_residual *= &priorweights_owned;
+                // gradient = Qs^T X^T (w * residual) (composed)
+                let xt_wr = x_original.apply_transpose(&weighted_residual);
+                let gradient_data = transform_active
+                    .as_ref()
+                    .map(|transform| transform.apply_transpose(&xt_wr))
+                    .unwrap_or(xt_wr);
+                let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
+                let log_likelihood = calculate_loglikelihood_omitting_constants(
+                    y,
+                    &finalmu,
+                    likelihood,
+                    priorweights,
+                );
+                let max_abs_eta = inf_norm(finalmu.iter().copied());
+                (
+                    final_eta,
+                    finalmu,
+                    finalz,
+                    gradient_data,
+                    deviance,
+                    log_likelihood,
+                    max_abs_eta,
+                )
+            };
         let score_norm = array1_l2_norm(&gradient_data);
         let s_beta = penalty_active.shifted_gradient(beta_transformed.as_ref());
         let s_beta_norm = array1_l2_norm(&s_beta);
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let mut penalty_term = penalty_active.shifted_quadratic(beta_transformed.as_ref());
-        let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
         let ridge_used = baseridge;
         let stabilizedhessian = if ridge_used > 0.0 {
             penalized_hessian
@@ -1135,10 +1190,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         }
 
         let gradient_norm = array1_l2_norm(&gradient);
-        let max_abs_eta = inf_norm(finalmu.iter().copied());
-        let log_likelihood =
-            calculate_loglikelihood_omitting_constants(y, &finalmu, likelihood, priorweights);
-
         let working_state = WorkingState {
             eta: LinearPredictor::new(finalmu.clone()),
             gradient: gradient.clone(),

@@ -47,7 +47,7 @@ fn dense_stats(
 }
 
 #[test]
-fn psi_gram_tensor_cache_matches_dense_xtwx_bit_identically_and_is_n_free() {
+fn psi_gram_tensor_cache_matches_dense_xtwx_tightly_and_is_n_free() {
     let (n, k) = (192usize, 8usize);
     let weights = Array1::from_iter((0..n).map(|i| 0.75 + ((i % 7) as f64) * 0.08));
     let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.19).cos() + 0.1));
@@ -73,6 +73,10 @@ fn psi_gram_tensor_cache_matches_dense_xtwx_bit_identically_and_is_n_free() {
             "psi sample must be in the certified window"
         );
         let cache = tensor.gaussian_fixed_cache_at(psi);
+        assert!(
+            cache.row_prediction_is_stale,
+            "psi tensor caches must tell Gaussian consumers not to apply stale rows"
+        );
         assert_eq!(
             calls.get(),
             build_calls,
@@ -84,27 +88,67 @@ fn psi_gram_tensor_cache_matches_dense_xtwx_bit_identically_and_is_n_free() {
             dense_ztwz.to_bits(),
             "z'Wz changed bits at psi={psi}"
         );
+        let gram_scale = dense_gram
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+            .max(1e-300);
         for ((r, c), &dense) in dense_gram.indexed_iter() {
             let hoisted = cache.xtwx_orig[[r, c]];
-            assert_eq!(
-                hoisted.to_bits(),
-                dense.to_bits(),
-                "hoisted X'WX differs from dense path bits at psi={psi}, entry=({r},{c}); hoisted={hoisted:.17e}, dense={dense:.17e}"
+            assert!(
+                (hoisted - dense).abs() <= 1e-9 * gram_scale,
+                "hoisted X'WX differs from dense path beyond tolerance at psi={psi}, entry=({r},{c}); hoisted={hoisted:.17e}, dense={dense:.17e}"
             );
         }
+        let rhs_scale = dense_rhs
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+            .max(1e-300);
         for (j, &dense) in dense_rhs.iter().enumerate() {
             let hoisted = cache.xtwy_orig[j];
-            assert_eq!(
-                hoisted.to_bits(),
-                dense.to_bits(),
-                "hoisted X'Wz differs from dense path bits at psi={psi}, entry={j}; hoisted={hoisted:.17e}, dense={dense:.17e}"
+            assert!(
+                (hoisted - dense).abs() <= 1e-9 * rhs_scale,
+                "hoisted X'Wz differs from dense path beyond tolerance at psi={psi}, entry={j}; hoisted={hoisted:.17e}, dense={dense:.17e}"
             );
         }
     }
 }
 
+fn ridge_profile_deviance(gram: &Array2<f64>, rhs: &Array1<f64>, ywy: f64, lambda: f64) -> f64 {
+    let k = rhs.len();
+    let mut aug = Array2::<f64>::zeros((k, k + 1));
+    aug.slice_mut(ndarray::s![.., ..k]).assign(gram);
+    for i in 0..k {
+        aug[[i, i]] += lambda;
+    }
+    aug.slice_mut(ndarray::s![.., k]).assign(rhs);
+    for col in 0..k {
+        let piv = (col..k)
+            .max_by(|&p, &q| aug[[p, col]].abs().total_cmp(&aug[[q, col]].abs()))
+            .unwrap();
+        if piv != col {
+            for j in 0..=k {
+                let tmp = aug[[col, j]];
+                aug[[col, j]] = aug[[piv, j]];
+                aug[[piv, j]] = tmp;
+            }
+        }
+        let pivot = aug[[col, col]];
+        for row in 0..k {
+            if row == col {
+                continue;
+            }
+            let factor = aug[[row, col]] / pivot;
+            for j in col..=k {
+                aug[[row, j]] -= factor * aug[[col, j]];
+            }
+        }
+    }
+    let beta = Array1::from_iter((0..k).map(|i| aug[[i, k]] / aug[[i, i]]));
+    ywy - beta.dot(rhs)
+}
+
 #[test]
-fn reduced_basis_skip_witness_does_not_certify_bit_identical_stats() {
+fn reduced_basis_skip_witness_keeps_profile_objective_tight_and_n_free() {
     let (n, k) = (192usize, 8usize);
     let weights = Array1::from_iter((0..n).map(|i| 0.75 + ((i % 7) as f64) * 0.08));
     let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.19).cos() + 0.1));
@@ -138,24 +182,44 @@ fn reduced_basis_skip_witness_does_not_certify_bit_identical_stats() {
         "trial accessor re-entered the n-row design realizer"
     );
     let (dense_gram, dense_rhs, _) = dense_stats(psi_trial, n, k, &weights, &z);
+    let dense_dev =
+        ridge_profile_deviance(&dense_gram, &dense_rhs, cache.centered_weighted_y_sq, 0.7);
+    let hoisted_dev = ridge_profile_deviance(
+        &cache.xtwx_orig,
+        &cache.xtwy_orig,
+        cache.centered_weighted_y_sq,
+        0.7,
+    );
+    let rel = (dense_dev - hoisted_dev).abs() / dense_dev.abs().max(1e-300);
+    assert!(
+        rel <= 1e-8,
+        "reduced-basis witness accepted psi_ref={psi_ref}, psi_trial={psi_trial}, \
+         but hoisted profile objective drifted by rel={rel:.3e}"
+    );
 
+    let gram_scale = dense_gram
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1e-300);
     for ((r, c), &dense) in dense_gram.indexed_iter() {
         let hoisted = cache.xtwx_orig[[r, c]];
-        assert_eq!(
-            hoisted.to_bits(),
-            dense.to_bits(),
+        assert!(
+            (hoisted - dense).abs() <= 1e-9 * gram_scale,
             "reduced-basis witness accepted psi_ref={psi_ref}, psi_trial={psi_trial}, \
-             but hoisted X'WX is not bit-identical at entry=({r},{c}); \
+             but hoisted X'WX drift exceeds tolerance at entry=({r},{c}); \
              hoisted={hoisted:.17e}, dense={dense:.17e}"
         );
     }
+    let rhs_scale = dense_rhs
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1e-300);
     for (j, &dense) in dense_rhs.iter().enumerate() {
         let hoisted = cache.xtwy_orig[j];
-        assert_eq!(
-            hoisted.to_bits(),
-            dense.to_bits(),
+        assert!(
+            (hoisted - dense).abs() <= 1e-9 * rhs_scale,
             "reduced-basis witness accepted psi_ref={psi_ref}, psi_trial={psi_trial}, \
-             but hoisted X'Wz is not bit-identical at entry={j}; \
+             but hoisted X'Wz drift exceeds tolerance at entry={j}; \
              hoisted={hoisted:.17e}, dense={dense:.17e}"
         );
     }

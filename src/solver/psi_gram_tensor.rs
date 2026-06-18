@@ -605,24 +605,18 @@ impl PsiGramTensor {
         }
     }
 
-    /// Locate the reduced-basis-equality skip sub-window `[skip_psi_lo,
+    /// Locate the design-realization skip sub-window `[skip_psi_lo,
     /// skip_psi_hi]`, and store it (#1264).
     ///
-    /// Historically this held a tiny low-ψ prefix accepted when the Gram-derived
-    /// RRQR rank and pivot permutation matched a reference frame — a necessary
-    /// but NOT sufficient condition. An MSI run refuted it: the prefix still let
-    /// a stale realized reduced basis pair with `XᵀWX(ψ_new)` and produced β̂-rel
-    /// ≈ 7.8e-2. The soundness of the design-revision skip depends on the PAIR
-    /// `(ψ_ref, ψ_new)` — whether the realized reduced basis frozen at the pinning
-    /// `ψ_ref` is still valid at `ψ_new` — and is therefore not a single
-    /// ψ-interval the build can fix once. The real witness is
-    /// [`Self::reduced_basis_equal`], evaluated per trial against the caller's
-    /// current pinning ψ. This precomputed single-ψ window stays empty; the
-    /// (legacy, single-ψ) [`Self::contains_for_skip`] accessor consequently never
-    /// fires and callers must use the pairwise witness.
+    /// The skip is sound for the full certified value window because the
+    /// Gaussian ψ-tensor cache marks its surface rows as stale. The Gaussian
+    /// identity short-circuit then consumes `(G(ψ), r(ψ), y'Wy)` for the solve,
+    /// data gradient, deviance, and log-likelihood instead of applying the
+    /// retained reference rows. The caller separately gates on exact n-free
+    /// penalty re-keying, so `S(ψ)` is refreshed before the inner solve.
     fn compute_skip_window(&mut self) {
-        self.skip_psi_lo = f64::NAN;
-        self.skip_psi_hi = f64::NAN;
+        self.skip_psi_lo = self.psi_lo;
+        self.skip_psi_hi = self.psi_hi;
     }
 
     /// Range (reduced-basis) projector of the conditioned Gram `XᵀWX(ψ)` and the
@@ -856,6 +850,7 @@ impl PsiGramTensor {
             xtwx_orig: self.gram_at(psi),
             xtwy_orig: self.rhs_at(psi),
             centered_weighted_y_sq: self.zt_w_z,
+            row_prediction_is_stale: true,
             xtwx_sparse_orig: None,
         }
     }
@@ -1479,9 +1474,14 @@ mod tests {
         let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.3 * ((i % 5) as f64)));
         let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.29).sin()));
         let (psi_lo, psi_hi) = (-1.0_f64, 0.8_f64);
-        let tensor =
-            PsiGramTensor::build(|psi| synth_design(psi, n, k), w.view(), z.view(), psi_lo, psi_hi)
-                .expect("analytic synthetic design must certify");
+        let tensor = PsiGramTensor::build(
+            |psi| synth_design(psi, n, k),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("analytic synthetic design must certify");
 
         // Reflexive: same ψ is always sound.
         for &psi in &[-0.9, -0.2, 0.0, 0.5, 0.79] {

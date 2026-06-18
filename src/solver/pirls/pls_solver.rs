@@ -49,6 +49,11 @@ pub struct GaussianFixedCache {
     /// sufficient statistic needed to evaluate the Gaussian penalized RSS
     /// exactly at any λ without re-streaming the rows.
     pub centered_weighted_y_sq: f64,
+    /// When true, the caller is deliberately serving a design-moving trial from
+    /// sufficient statistics and the `DesignMatrix` rows on the current REML
+    /// surface may be a stale reference surface. Consumers must not apply those
+    /// rows for fitted values, RSS, or likelihood summaries.
+    pub row_prediction_is_stale: bool,
     /// `XᵀWX` precomputed for the sparse path, aligned with the symbolic
     /// pattern of `SparseXtWxCache::new(x)` on the original sparse design.
     /// `None` when the design has no sparse form (e.g. dense-only fits).
@@ -189,12 +194,18 @@ pub(super) fn solve_penalized_least_squares_implicit(
         };
         let standard_deviation = match link_function {
             LinkFunction::Identity => {
-                let residuals = &y - &fitted_vals;
-                let weighted_rss: f64 = weights
-                    .iter()
-                    .zip(residuals.iter())
-                    .map(|(&w, &r)| w * r * r)
-                    .sum();
+                let weighted_rss = if let Some(cache) = gaussian_fixed_cache {
+                    let quadratic = betavec.dot(&cache.xtwx_orig.dot(&betavec));
+                    (cache.centered_weighted_y_sq - 2.0 * betavec.dot(&cache.xtwy_orig) + quadratic)
+                        .max(0.0)
+                } else {
+                    let residuals = &y - &fitted_vals;
+                    weights
+                        .iter()
+                        .zip(residuals.iter())
+                        .map(|(&w, &r)| w * r * r)
+                        .sum()
+                };
                 let effective_n = y.len() as f64;
                 (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
             }
@@ -384,12 +395,18 @@ pub(super) fn solve_penalized_least_squares_implicit(
     fitted += &offset;
     let standard_deviation = match link_function {
         LinkFunction::Identity => {
-            let residuals = &y - &fitted;
-            let weighted_rss: f64 = weights
-                .iter()
-                .zip(residuals.iter())
-                .map(|(&w, &r)| w * r * r)
-                .sum();
+            let weighted_rss = if let Some(cache) = gaussian_fixed_cache {
+                let quadratic = qbeta.dot(&cache.xtwx_orig.dot(&qbeta));
+                (cache.centered_weighted_y_sq - 2.0 * qbeta.dot(&cache.xtwy_orig) + quadratic)
+                    .max(0.0)
+            } else {
+                let residuals = &y - &fitted;
+                weights
+                    .iter()
+                    .zip(residuals.iter())
+                    .map(|(&w, &r)| w * r * r)
+                    .sum()
+            };
             let effective_n = y.len() as f64;
             (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
         }
