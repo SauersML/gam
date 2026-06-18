@@ -229,6 +229,7 @@ pub(crate) const COEFF_SUPPORT_GW: CoeffSupport = CoeffSupport {
 /// (F, D, D_uv) that previously each rebuilt partition cells independently.
 pub(crate) struct CachedPartitionCells {
     pub(crate) cells: Vec<CachedCellEntry>,
+    pub(crate) calibration_f_a: f64,
 }
 
 pub(crate) struct CachedCellEntry {

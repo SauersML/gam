@@ -323,13 +323,39 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
             return Ok(Some(Vec::new()));
         }
         let psi_indices: Vec<usize> = (0..total).collect();
-        self.family.psi_terms_inner_batched_with_options(
+        if let Some(terms) = self.family.psi_terms_inner_batched_with_options(
             &self.block_states,
             &self.derivative_blocks,
             &psi_indices,
             self.cache.as_ref(),
             &self.options,
-        )
+        )? {
+            return Ok(Some(terms));
+        }
+
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let per_axis: Result<Vec<Option<ExactNewtonJointPsiTerms>>, String> = psi_indices
+            .into_par_iter()
+            .map(|psi_index| {
+                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    self.family.psi_terms_inner_with_options(
+                        &self.block_states,
+                        &self.derivative_blocks,
+                        psi_index,
+                        self.cache.as_ref(),
+                        &self.options,
+                    )
+                })
+            })
+            .collect();
+        let mut terms = Vec::with_capacity(total);
+        for maybe_term in per_axis? {
+            let Some(term) = maybe_term else {
+                return Ok(None);
+            };
+            terms.push(term);
+        }
+        Ok(Some(terms))
     }
 
     fn both_sigma_aux_second_order(&self, psi_i: usize, psi_j: usize) -> bool {

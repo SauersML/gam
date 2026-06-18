@@ -58,15 +58,11 @@ impl SurvivalMarginalSlopeFamily {
         // jets `a_u = -f_u/f_a`, so compute it in a cheap pre-pass here (the
         // q-marginal RHS self term `+φ(q)` on `f_u[q_index]` is part of it).
         let a_dir = {
-            let mut f_a_pre = 0.0;
             let mut f_dir_pre = 0.0;
             for cell_entry in &cached.cells {
                 let neg_cell = cell_entry.neg_cell;
                 let state = &cell_entry.state;
                 let fixed = &cell_entry.fixed;
-                let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
-                f_a_pre +=
-                    exact_kernel::cell_first_derivative_from_moments(&neg_dc_da, &state.moments)?;
                 let mut neg_coeff_dir = [0.0; 4];
                 for c in 0..p {
                     if dir[c] == 0.0 {
@@ -89,7 +85,7 @@ impl SurvivalMarginalSlopeFamily {
                 f_dir_pre += dir[q_index] * phi_q;
             }
             // a_u = -f_u/f_a ⇒ a_dir = a_u·dir = -(f_dir)/f_a.
-            -f_dir_pre / f_a_pre
+            -f_dir_pre / cached.calibration_f_a
         };
 
         struct DirectionalTimepointCellAccum {
