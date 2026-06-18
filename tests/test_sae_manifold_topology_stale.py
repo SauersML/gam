@@ -122,12 +122,12 @@ def test_linear_topology_is_distinct_from_euclidean_quadratic_patch() -> None:
 
     assert linear.atom_topology == "linear"
     assert linear.basis_specs == ["linear"]
-    assert linear.atoms[0].basis_kind == "linear"
+    assert linear.atoms[0].basis == "linear"
     assert linear.atoms[0].decoder_coefficients.shape[0] == 2
 
     assert euclidean.atom_topology == "euclidean"
     assert euclidean.basis_specs == ["euclidean_patch"]
-    assert euclidean.atoms[0].basis_kind == "euclidean_patch"
+    assert euclidean.atoms[0].basis == "euclidean_patch"
     assert euclidean.atoms[0].decoder_coefficients.shape[0] > linear.atoms[0].decoder_coefficients.shape[0]
 
 
