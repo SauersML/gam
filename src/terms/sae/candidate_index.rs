@@ -1154,7 +1154,7 @@ mod tests {
             inner: &sketch,
             project_calls: std::cell::Cell::new(0),
         };
-        let _ = index.propose(&counting, dirs[5].view(), 32, cfg.multiprobe);
+        drop(index.propose(&counting, dirs[5].view(), 32, cfg.multiprobe));
         assert_eq!(
             counting.project_calls.get(),
             0,

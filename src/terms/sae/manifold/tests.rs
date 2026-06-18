@@ -213,14 +213,12 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
     // reversal budget = 1·(RESEED_BUDGET + 1) + 1 = 6. Each direction reversal
     // charges one; a sustained oscillation exhausts the budget and refuses.
     let mut last_ok = 2usize;
-    let mut hi = true;
     let oscillation = [9usize, 2, 9, 2, 9, 2, 9, 2, 9, 2, 9, 2, 9, 2];
     let mut errored = false;
     for &c in &oscillation {
         match term.record_evidence_gauge_deflation_count(c) {
             Ok(()) => {
                 last_ok = c;
-                hi = !hi;
             }
             Err(err) => {
                 assert!(
@@ -237,7 +235,6 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
             }
         }
     }
-    let _ = hi;
     assert!(
         errored,
         "a sustained oscillation must exceed the reversal budget and error"

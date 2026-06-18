@@ -1461,14 +1461,10 @@ mod sphere_gpu_tests {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping raw-kernel parity");
             return;
         };
-        let backend = match SphereGpuBackend::probe() {
-            Ok(b) => b,
-            Err(err) => {
-                eprintln!("[sphere_gpu test] backend probe failed: {err}");
-                return;
-            }
-        };
-        let _ = backend;
+        if let Err(err) = SphereGpuBackend::probe() {
+            eprintln!("[sphere_gpu test] backend probe failed: {err}");
+            return;
+        }
 
         let data_ll = small_latlon_grid(7, 9);
         let centers_ll = small_latlon_grid(5, 7);
@@ -1540,7 +1536,7 @@ mod sphere_gpu_tests {
             CenterStrategy, SphereMethod, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
             build_spherical_spline_basis, sobolev_s2_truncated_coefficients,
         };
-        let _ = sobolev_s2_truncated_coefficients(1, 1);
+        drop(sobolev_s2_truncated_coefficients(1, 1));
 
         // (n=10_000, m=200) → n·m = 2_000_000 ≥ 1_000_000 → GPU eligible.
         let data = small_latlon_grid(100, 100);
@@ -1716,7 +1712,7 @@ mod sphere_gpu_tests {
             kind: SphereSpectralKernelKind::Sobolev,
             layout: DeviceMatrixLayout::ColumnMajor,
         };
-        let _ = build_kernel_matrix_device(inputs_warm.clone()).expect("warmup");
+        drop(build_kernel_matrix_device(inputs_warm.clone()).expect("warmup"));
 
         // Measure GPU.
         let t0 = std::time::Instant::now();
@@ -1783,10 +1779,10 @@ mod sphere_gpu_tests {
         };
 
         // Warm-up GPU build.
-        let _ = build_spherical_spline_basis(data_ll.view(), &spec_gpu).expect("warmup build");
+        drop(build_spherical_spline_basis(data_ll.view(), &spec_gpu).expect("warmup build"));
 
         let t0 = std::time::Instant::now();
-        let _ = build_spherical_spline_basis(data_ll.view(), &spec_gpu).expect("gpu build");
+        drop(build_spherical_spline_basis(data_ll.view(), &spec_gpu).expect("gpu build"));
         let gpu_secs = t0.elapsed().as_secs_f64();
 
         // CPU comparison: directly invoke the CPU helper and apply the

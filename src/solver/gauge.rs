@@ -856,7 +856,7 @@ mod tests {
     #[should_panic(expected = "removes at least one direction")]
     fn sum_to_zero_rejects_identity_section() {
         // A square z removes no direction — that is not a centring section.
-        let _ = Gauge::sum_to_zero(Array2::<f64>::eye(3));
+        drop(Gauge::sum_to_zero(Array2::<f64>::eye(3)));
     }
 
     #[test]
