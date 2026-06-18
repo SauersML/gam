@@ -60,6 +60,20 @@ def _try_import(name: str) -> Any | None:
         return None
 
 
+# Sentinel prefix marking a cell that originates from a genuinely-categorical
+# (string / object / categorical-dtype) source column. The Rust column-kind
+# inference (`infer_and_encode_column_major`) treats any sentinel-prefixed cell
+# as categorical regardless of whether its text parses as a number, then strips
+# the sentinel before recording the level. This preserves the dtype intent of a
+# pandas/polars/pyarrow column whose level labels happen to be numeric strings
+# ("0", "1", "2"): without it such a column is silently lowered to a numeric
+# by-variable, annihilating the "0" level and forcing amplitude ∝ label (#1317).
+# A leading NUL never appears in a numeric literal and is stripped on the Rust
+# side before any level matching, so predict frames (which re-run this same
+# stringification) match the clean training levels.
+CATEGORICAL_CELL_SENTINEL = "\x00"
+
+
 def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
     if isinstance(data, PreNormalizedTable):
         return data.headers, data.rows, data.kind
@@ -70,11 +84,72 @@ def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
     row_count = len(columns[headers[0]])
     if row_count == 0:
         raise ValueError("table data cannot be empty")
+    categorical = categorical_dtype_columns(data, kind)
     rows = [
-        [stringify_cell(columns[header][row_index]) for header in headers]
+        [
+            _stringify_marked(columns[header][row_index], header in categorical)
+            for header in headers
+        ]
         for row_index in range(row_count)
     ]
     return headers, rows, kind
+
+
+def _stringify_marked(value: Any, is_categorical: bool) -> str:
+    text = stringify_cell(value)
+    if is_categorical:
+        return CATEGORICAL_CELL_SENTINEL + text
+    return text
+
+
+def categorical_dtype_columns(data: Any, kind: str) -> frozenset[str]:
+    """Names of columns whose *source dtype* is non-numeric (string / object /
+    categorical), independent of whether the rendered cell text parses as a
+    number. Only typed table libraries carry this signal; untyped inputs
+    (mappings, record/row sequences, numpy) return an empty set and keep the
+    value-based numeric inference.
+    """
+    try:
+        if kind == "pandas":
+            import pandas as pd
+
+            out = set()
+            for index, name in enumerate(str(c) for c in data.columns):
+                dtype = data.iloc[:, index].dtype
+                if isinstance(dtype, pd.CategoricalDtype) or not (
+                    pd.api.types.is_numeric_dtype(dtype)
+                    or pd.api.types.is_bool_dtype(dtype)
+                ):
+                    out.add(name)
+            return frozenset(out)
+        if kind == "polars":
+            import polars as pl
+
+            out = set()
+            for name in (str(c) for c in data.columns):
+                dtype = data.schema[name]
+                if dtype in (pl.Utf8, pl.Categorical, pl.Enum) or dtype == pl.Object:
+                    out.add(name)
+            return frozenset(out)
+        if kind == "pyarrow":
+            import pyarrow as pa
+
+            out = set()
+            for field in data.schema:
+                t = field.type
+                if (
+                    pa.types.is_string(t)
+                    or pa.types.is_large_string(t)
+                    or pa.types.is_dictionary(t)
+                ):
+                    out.add(str(field.name))
+            return frozenset(out)
+    except Exception:
+        # Dtype introspection is a best-effort enhancement; if a library's
+        # introspection API shifts, fall back to value-based inference rather
+        # than fail the fit.
+        return frozenset()
+    return frozenset()
 
 
 def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:

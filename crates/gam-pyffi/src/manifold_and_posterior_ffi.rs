@@ -3963,7 +3963,15 @@ fn project_frame_to_model_columns(
     // the canonical width validation in `string_records_from_rows` instead of
     // risking an out-of-bounds projection here.
     let width_consistent = rows.iter().all(|row| row.len() == headers.len());
-    if keep.len() == headers.len() || !width_consistent {
+    // Never collapse the frame to zero columns: a covariate-free model
+    // (`y ~ 1`) consumes none of the held-out frame's columns, but the frame
+    // still carries the one thing prediction needs — its row count. Dropping
+    // every column hands `string_records_from_rows` an empty table and aborts
+    // with "table must have at least one column" on a perfectly valid frame
+    // (#1316). Keeping the frame verbatim is safe because every downstream
+    // consumer resolves columns by name and an intercept-only model references
+    // none of them.
+    if keep.is_empty() || keep.len() == headers.len() || !width_consistent {
         return Ok((headers.to_vec(), rows.to_vec()));
     }
     let filtered_headers = keep.iter().map(|&i| headers[i].clone()).collect::<Vec<_>>();
@@ -4001,7 +4009,15 @@ fn string_records_from_rows(
                     headers.len()
                 ));
             }
-            Ok(StringRecord::from(row.clone()))
+            // A typed Python frame marks categorical-dtype cells with a leading
+            // sentinel (forces factor inference at fit time, #1317/#1318). The
+            // saved schema stores clean level labels, so strip the marker here
+            // before the schema-guided encode matches a cell against a level.
+            let cleaned: Vec<&str> = row
+                .iter()
+                .map(|cell| gam::inference::data::strip_categorical_sentinel(cell).0)
+                .collect();
+            Ok(StringRecord::from(cleaned))
         })
         .collect()
 }

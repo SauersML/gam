@@ -319,6 +319,26 @@ pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, DataE
 /// Maximum number of rows used for schema inference when no schema is provided.
 const SCHEMA_SAMPLE_ROWS: usize = 1024;
 
+/// Prefix a typed Python frame stamps onto a cell that originates from a
+/// genuinely-categorical source column (string / object / categorical dtype).
+/// The column-major inference (`infer_and_encode_column_major`) and the
+/// schema-guided predict ingest (`gam-pyffi::string_records_from_rows`) both
+/// strip this prefix before recording or matching a level; its presence forces
+/// the column to `Categorical` even when every label parses as a number, so a
+/// string column labeled "0","1","2" is one centred factor level per label
+/// rather than a numeric ramp (#1317 / #1318). A leading NUL never appears in a
+/// numeric literal, so an untyped CSV/array frame (no prefix) is unaffected.
+pub const CATEGORICAL_CELL_SENTINEL: char = '\u{0}';
+
+/// Strip the leading [`CATEGORICAL_CELL_SENTINEL`] from a cell if present,
+/// returning the clean text and whether the marker was found.
+pub fn strip_categorical_sentinel(cell: &str) -> (&str, bool) {
+    match cell.strip_prefix(CATEGORICAL_CELL_SENTINEL) {
+        Some(rest) => (rest, true),
+        None => (cell, false),
+    }
+}
+
 fn resolve_requested_columns(
     all_headers: &[String],
     requested_columns: &[String],
@@ -1909,8 +1929,13 @@ pub fn infer_and_encode_column_major(
         }
         .into());
     }
-    let mut all_numeric = true;
-    let mut all_binary = true;
+    // A typed Python frame prefixes every cell of a categorical-dtype column
+    // with `CATEGORICAL_CELL_SENTINEL` so the column is encoded as a factor even
+    // when its labels parse as numbers ("0","1","2"). Detect and strip the
+    // marker before inference; its presence forces `Categorical` (#1317/#1318).
+    let force_categorical = column.iter().any(|c| strip_categorical_sentinel(c).1);
+    let mut all_numeric = !force_categorical;
+    let mut all_binary = !force_categorical;
     let mut levels = Vec::<String>::new();
     let mut level_index = HashMap::<String, usize>::new();
     let mut trimmed = Vec::<&str>::with_capacity(column.len());
@@ -1922,34 +1947,42 @@ pub fn infer_and_encode_column_major(
     // field `i` parsed as a finite f64; categorical columns ignore it.
     let mut parsed = Vec::<Option<f64>>::with_capacity(column.len());
     for (i, raw_field) in column.iter().enumerate() {
-        let raw = raw_field.trim();
+        // Strip the categorical marker (if any) so the recorded level label and
+        // any numeric parse see the user's clean text, not the sentinel.
+        let (raw, _) = strip_categorical_sentinel(raw_field);
+        let raw = raw.trim();
         if raw.is_empty() {
             return Err(DataError::EmptyInput {
                 reason: format!("empty field at row {}, column '{}'", i + 1, name),
             }
             .into());
         }
-        if let Ok(v) = raw.parse::<f64>() {
-            if !v.is_finite() {
-                return Err(DataError::InvalidValue {
-                    reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
+        // When the source column is dtype-categorical, every cell is a level
+        // regardless of whether its label parses as a number.
+        if !force_categorical {
+            if let Ok(v) = raw.parse::<f64>() {
+                if !v.is_finite() {
+                    return Err(DataError::InvalidValue {
+                        reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
+                    }
+                    .into());
                 }
-                .into());
+                if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
+                    all_binary = false;
+                }
+                parsed.push(Some(v));
+                trimmed.push(raw);
+                continue;
             }
-            if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
-                all_binary = false;
-            }
-            parsed.push(Some(v));
-        } else {
             all_numeric = false;
             all_binary = false;
-            level_index.entry(raw.to_string()).or_insert_with(|| {
-                let idx = levels.len();
-                levels.push(raw.to_string());
-                idx
-            });
-            parsed.push(None);
         }
+        level_index.entry(raw.to_string()).or_insert_with(|| {
+            let idx = levels.len();
+            levels.push(raw.to_string());
+            idx
+        });
+        parsed.push(None);
         trimmed.push(raw);
     }
     let kind = if all_numeric {
