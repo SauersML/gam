@@ -92,29 +92,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .max(self.coefficient_gradient_cost(specs));
         let dense_available = self.outer_hyper_hessian_dense_available(specs);
         let hvp_available = self.outer_hyper_hessian_hvp_available(specs);
-        // FLEX (`score_warp` / `link_dev`) is the large-scale #979 wall-clock
-        // path. The generic outer-Hessian "operator" is exact, but its build
-        // still precomputes K^2 callback/cross-trace tables and the contracted
-        // ψψ matvec still streams every output ψ row. At n>=30k the exact
-        // gradient path is the bounded route: it keeps the same objective and
-        // analytic first derivative, uses the BMS row-subsampled pilot schedule,
-        // and avoids the K^2 Jeffreys/outer-Hessian setup entirely.
-        if flex_active
-            && (self.y.len() >= crate::custom_family::OuterDerivativePolicy::STAGED_KAPPA_TRIGGER_N
-                || !hvp_available)
-        {
-            if log_exact_work(self.y.len()) {
-                log::info!(
-                    "[BMS outer-derivative-policy] n={} p={} flex=true order=First reason=flex-outer-hessian-k2-cost dense_available={} outer_hvp_available={} coefficient_work={}",
-                    self.y.len(),
-                    specs.iter().map(|spec| spec.design.ncols()).sum::<usize>(),
-                    dense_available,
-                    hvp_available,
-                    coefficient_work,
-                );
-            }
-            return ExactOuterDerivativeOrder::First;
-        }
         if !dense_available && !hvp_available {
             if log_exact_work(self.y.len()) {
                 log::info!(
@@ -192,12 +169,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if n_params == 0 {
             return config;
         }
-        // #979: BMS startup seed screening runs real inner solves. With the
-        // default multi-seed pool, large marginal-slope fits can spend minutes
-        // rejecting equivalent seeds before the first outer step. The solver
-        // already budgets one seed for this family; generate exactly one so the
-        // expensive screening cascade is skipped rather than paid and discarded.
-        config.max_seeds = 1;
+        // #979: BMS startup seed screening runs real inner solves. Keep the
+        // GLM anchor pool broad enough to include the stable symmetric
+        // over-smoothing anchors, but budget only the best screened candidate
+        // for the expensive startup solve.
+        config.max_seeds = n_params;
         config.seed_budget = 1;
         // Two cycles is below the observed KKT reachability floor for
         // marginal-slope startup seeds: it rejects every candidate, then pays
