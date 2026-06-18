@@ -15,6 +15,7 @@ use crate::custom_family::{
 };
 use crate::families::block_layout::block_count::validate_block_count;
 use crate::gamlss::GamlssError;
+use crate::matrix::LinearOperator;
 use crate::model_types::UnifiedFitResult;
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
@@ -738,9 +739,24 @@ pub(crate) fn dispersion_location_scale_warm_start(
     let disp_beta = if let Some(beta) = disp_beta_hint {
         beta.clone()
     } else {
-        // η_d ≈ 0 ⇒ precision ≈ 1 baseline; project the constant onto the
-        // dispersion design so any non-intercept columns start at zero.
-        let target = Array1::<f64>::zeros(y.len());
+        // Seed the precision block from a smoothed method-of-moments surface
+        // rather than the old flat η_d=0 constant.  A single observation cannot
+        // identify its own variance, but for the Fisher-orthogonal dispersion
+        // members the residual-squared moment contains the correct first-order
+        // signal:
+        //
+        //   Gamma:   Var(Y)=μ²/ν              ⇒ log ν     ≈ log(μ²/e²)
+        //   NB2:     Var(Y)=μ+μ²/θ            ⇒ log θ     ≈ log(μ²/(e²-μ))
+        //   Tweedie: Var(Y)=φ μ^p, η_d=log1/φ ⇒ η_d       ≈ log(μ^p/e²)
+        //
+        // The targets are deliberately conservative (finite residual floor,
+        // precision cap, and no fixture-specific constants): they only give the
+        // block-cyclic likelihood solve a correctly-signed non-flat starting
+        // surface, while the final estimate is still the penalized joint MLE.
+        let mean_eta = mean_block.design.apply(&mean_beta) + &mean_block.offset;
+        let target = Array1::from_shape_fn(y.len(), |i| {
+            dispersion_moment_log_precision_seed(kind, y[i], mean_eta[i])
+        });
         solve_penalizedweighted_projection(
             &disp_block.design,
             &disp_block.offset,
@@ -752,6 +768,43 @@ pub(crate) fn dispersion_location_scale_warm_start(
         )?
     };
     Ok((mean_beta, disp_beta))
+}
+
+#[inline]
+fn dispersion_moment_log_precision_seed(kind: DispersionFamilyKind, yi: f64, eta_mu: f64) -> f64 {
+    const LOG_PRECISION_FLOOR: f64 = -10.0;
+    const LOG_PRECISION_CEILING: f64 = 10.0;
+    let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+    let raw = match kind {
+        DispersionFamilyKind::Beta => {
+            // Beta's mean and precision scores are not Fisher-orthogonal in
+            // the (logit μ, log φ) parameterization.  Per-row residual moments
+            // therefore make a poor block-cyclic seed: an outlying y near 0/1
+            // can imply a near-zero φ and pull the coupled mean block onto the
+            // boundary before the joint likelihood has had a chance to settle.
+            // Keep the neutral precision seed for this one coupled member; the
+            // exact Beta cross-Hessian below still drives the joint solve and
+            // covariance with the coherent two-block likelihood geometry.
+            0.0
+        }
+        DispersionFamilyKind::Gamma => {
+            let mu = em.exp().max(1e-12);
+            let e2 = (yi - mu).powi(2).max(1e-8 * mu * mu);
+            (mu * mu / e2).max(1e-6).ln()
+        }
+        DispersionFamilyKind::NegativeBinomial => {
+            let mu = em.exp().max(1e-12);
+            let e2 = (yi - mu).powi(2);
+            let excess = (e2 - mu).max(1e-6 * (mu + mu * mu));
+            (mu * mu / excess).max(1e-6).ln()
+        }
+        DispersionFamilyKind::Tweedie { p } => {
+            let mu = em.exp().max(1e-12);
+            let e2 = (yi - mu).powi(2).max(1e-8 * mu.powf(p));
+            (mu.powf(p) / e2).max(1e-6).ln()
+        }
+    };
+    raw.clamp(LOG_PRECISION_FLOOR, LOG_PRECISION_CEILING)
 }
 
 impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
