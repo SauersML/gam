@@ -1210,15 +1210,20 @@ fn assert_survival_consistent(
     tol: f64,
 ) {
     let analytic = survival_grad(model, beta0, rho);
-    // The rho=6 large-lambda survival boundary has an ill-conditioned inner mode:
-    // the analytic envelope derivative is stable, but the scalar value's
-    // logdet-H term loses several digits when FD probes use the global 1e-5
-    // step. Keep the same boundary tolerance, but use a wider centered step
-    // only at that identified point so the FD oracle measures the smooth value
-    // surface instead of f64 jitter.
+    // The rho=6 large-lambda survival boundary has an ill-conditioned inner
+    // mode: the analytic envelope derivative is stable (independently certified
+    // against the textbook erfc-LAML scalar in survival_laml_erfc_oracle_931),
+    // but the scalar value's logdet-H term subtracts two ~44.146 logdets whose
+    // difference is ~1e-3, so a small centered step is dominated by catastrophic
+    // cancellation. A step scan at rho=6 (analytic = 1.25401e-3) shows the plain
+    // centered FD recovering the analytic only once the step clears the
+    // cancellation floor: h=1e-5 -> 9.18e-4 (27% off), h=5e-4 -> 1.273e-3
+    // (1.5% off), and a clean plateau at h=1.5e-3..2e-3 where FD = 1.2520..52e-3
+    // (<0.16% off). Probe the smooth value surface at that plateau step at the
+    // identified point; the global step stays untouched elsewhere.
     let fd_step = if regime == "boundary/large-lambda" && rho.iter().any(|v| (*v - 6.0).abs() < 0.1)
     {
-        5.0e-4
+        1.5e-3
     } else {
         FD_STEP
     };
@@ -1289,32 +1294,6 @@ fn survival_objective_gradient_consistent_at_large_lambda_boundary() {
     ] {
         assert_survival_consistent("boundary/large-lambda", &model, &beta0, &rho, TOL_BOUNDARY);
     }
-}
-
-#[test]
-fn survival_boundary_rho_six_fd_step_scan_probe_931() {
-    let model = survival_single_block_model(1.0);
-    let beta0 = array![-2.5_f64, 1.0];
-    let rho = array![6.0_f64];
-    let analytic = survival_grad(&model, &beta0, &rho)[0];
-    let fd_at = |h: f64| -> f64 {
-        let mut rp = rho.clone();
-        rp[0] += h;
-        let mut rm = rho.clone();
-        rm[0] -= h;
-        (survival_cost(&model, &beta0, &rp) - survival_cost(&model, &beta0, &rm)) / (2.0 * h)
-    };
-    println!("[931-SCAN] analytic={analytic:.15e}");
-    for h in [1.0e-5_f64, 5.0e-5, 1.0e-4, 2.5e-4, 5.0e-4, 1.0e-3, 2.0e-3, 4.0e-3] {
-        let fd = fd_at(h);
-        let rich = (4.0 * fd_at(h / 2.0) - fd) / 3.0;
-        let rel_fd = (fd - analytic).abs() / analytic.abs().max(1.0);
-        let rel_rich = (rich - analytic).abs() / analytic.abs().max(1.0);
-        println!(
-            "[931-SCAN] h={h:.1e} fd={fd:.15e} rel_fd={rel_fd:.3e}  rich={rich:.15e} rel_rich={rel_rich:.3e}"
-        );
-    }
-    panic!("[931-SCAN] probe complete (intentional fail to surface captured stdout)");
 }
 
 // --- Regime R2: near-degenerate eigenvalue pair (Daleckii–Krein) -------
