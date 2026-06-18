@@ -23,7 +23,10 @@
 
 use gam::{
     FitRequest, FitResult, StandardFitRequest,
-    basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu},
+    basis::{
+        CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+        OneDimensionalBoundary, SpatialIdentifiability,
+    },
     estimate::FitOptions,
     smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
@@ -50,27 +53,44 @@ fn simulate_1d_gaussian(n: usize) -> (Array2<f64>, Array1<f64>) {
 }
 
 fn spec_1d(aniso: bool) -> TermCollectionSpec {
+    // 1-D Gaussian HYBRID DUCHON (length_scale=Some) — the basis on which the
+    // #1033 n-free κ lane is COMPLETE: the value-lane PsiGramTensor attaches AND
+    // `supports_nfree_penalty_rekey()` is true (Duchon metadata re-keys S(ψ)
+    // exactly n-free from the frozen centers/collocation points), so the design-
+    // realization skip fires and the BFGS-routing arm (#1033 b437d9ff2) engages.
+    //
+    // NOT Matérn: the realized Matérn design carries the operator-triplet penalty
+    // (mass/tension/stiffness), which the n-free re-key cannot reproduce, so #1270
+    // (d69b52e66) deliberately drops Matérn from `supports_nfree_penalty_rekey` →
+    // the skip is permanently disabled for Matérn and every trial re-realizes the
+    // O(n) design. Measuring n-independence on Matérn would test a basis the n-free
+    // architecture intentionally does NOT cover. This is exactly the config the
+    // passing bit-identity gate `psi_gram_tensor_fast_path_skips_n_row_lane_and_
+    // matches_streamed` uses to exercise the armed skip.
     TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
-            name: "matern_1d".to_string(),
-            basis: SmoothBasisSpec::Matern {
+            name: "duchon_1d".to_string(),
+            basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
-                spec: MaternBasisSpec {
+                spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     periodic: None,
-                    length_scale: 1.0,
-                    nu: MaternNu::FiveHalves,
-                    include_intercept: false,
-                    double_penalty: false,
-                    identifiability: MaternIdentifiability::CenterSumToZero,
-                    // None routes the isotropic analytic κ optimizer; Some(_)
-                    // routes the per-axis (anisotropic) optimizer even for a
-                    // single axis — the discriminator under test.
+                    length_scale: Some(1.0),
+                    power: 1.0,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::default(),
+                    // None routes the isotropic κ optimizer (the n-free-arming
+                    // case); Some(_) routes the per-axis (anisotropic) optimizer
+                    // even for a single axis — the discriminator under test.
                     aniso_log_scales: if aniso { Some(vec![0.0]) } else { None },
-                    nullspace_shrinkage_survived: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    boundary: OneDimensionalBoundary::Open,
                 },
+                // PRODUCTION geometry: None lets the 1-D axis auto-standardize
+                // (#1214/#1215), the real default-fit path. An input_scales:[1.0]
+                // pin would be a gamed gate masking the open geometry gap.
                 input_scales: None,
             },
             shape: ShapeConstraint::None,
@@ -183,7 +203,7 @@ fn kappa_iso_1d_convergence_diagnostic() {
         ("aniso/ tight", true, tight),
         ("aniso/ wide ", true, wide),
     ];
-    eprintln!("[kappa-diag] n={n}  (1-D Matérn ν=5/2, Gaussian-identity, single penalty)");
+    eprintln!("[kappa-diag] n={n}  (1-D hybrid Duchon, Gaussian-identity, single penalty)");
     let mut outcomes = Vec::new();
     for (label, aniso, bounds) in configs {
         let r = run_fit(n, true, aniso, bounds);
@@ -202,7 +222,7 @@ fn kappa_iso_1d_convergence_diagnostic() {
 
 /// Pin the sample-size threshold at which the isotropic-analytic κ optimizer
 /// tips from converging to non-converging on the *same* well-conditioned 1-D
-/// Matérn Gaussian fixture (gentle `y=sin(t)`, 12 centers, single penalty, tight
+/// Duchon Gaussian fixture (gentle `y=sin(t)`, 12 centers, single penalty, tight
 /// bounds). n=600 converges; earlier runs showed n=1000 failing with a stuck
 /// `grad_norm≈1.9e3`. This sweep brackets the transition so the defect report
 /// carries an exact reproducer. Report-only (the printed sweep is the
@@ -210,7 +230,7 @@ fn kappa_iso_1d_convergence_diagnostic() {
 #[test]
 fn kappa_iso_1d_n_threshold_sweep() {
     let bounds = (1e-2, 1e2);
-    eprintln!("[kappa-nthresh] iso-1D Matérn ν=5/2, Gaussian, single penalty, bounds={bounds:?}");
+    eprintln!("[kappa-nthresh] iso-1D hybrid Duchon, Gaussian, single penalty, bounds={bounds:?}");
     for &n in &[600usize, 800, 1000, 1200] {
         match run_fit(n, true, false, bounds) {
             Ok(dt) => eprintln!("[kappa-nthresh] n={n:>5}: CONVERGED in {dt:.1}s"),
