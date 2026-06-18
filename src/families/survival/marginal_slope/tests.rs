@@ -2479,13 +2479,17 @@ fn debug_flex_directional_quantities_fd_localize() {
         base.eta,
         fd(&|b| b.eta, 4e-3),
     );
-    for &u in &[q1, g] {
+    for &u in &[q1, g, w0] {
         eprintln!(
-            "[{u}] eta_u base {:+.6e} D_dir(eta_u) fd {:+.6e} | chi_u base {:+.6e} D_dir(chi_u) fd {:+.6e}",
+            "[{u}] eta_u base {:+.6e} D_dir(eta_u) prod {:+.6e} fd {:+.6e} gap {:.2e} | chi_u base {:+.6e} D_dir(chi_u) prod {:+.6e} fd {:+.6e} gap {:.2e}",
             base.eta_u[u],
+            ext.eta_u_dir[u],
             fd(&|b| b.eta_u[u], 4e-3),
+            (ext.eta_u_dir[u] - fd(&|b| b.eta_u[u], 4e-3)).abs(),
             base.chi_u[u],
+            ext.chi_u_dir[u],
             fd(&|b| b.chi_u[u], 4e-3),
+            (ext.chi_u_dir[u] - fd(&|b| b.chi_u[u], 4e-3)).abs(),
         );
     }
     // Direct cross-check: FD of base eta_uv[q1,q1] sanity (recompute from a
