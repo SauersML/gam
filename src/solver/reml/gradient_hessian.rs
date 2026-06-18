@@ -6109,7 +6109,7 @@ impl<'a> RemlState<'a> {
             let staged_glm_first_step_handle = self.glm_first_step_gram();
             let flat_glm_first_step_handle = if staged_glm_first_step_handle.is_none()
                 && !in_screening
-                && !config.firth_bias_reduction
+                && !self.config.firth_bias_reduction
                 && warm_start_ref.is_some()
                 && (predicted_warm_start.is_none()
                     || matches!(prediction_source, Some(WarmStartPredictionSource::Flat)))
