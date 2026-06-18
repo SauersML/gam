@@ -609,10 +609,21 @@ pub fn build_termspec(
                     })? {
                         ColumnKindTag::Categorical => {
                             let levels = encoded_levels_for_column(ds, ColIdx::new(by_col));
-                            // Add an unpenalized treatment-coded fixed main effect for the factor, unless present already.
+                            let penalized_group_owner_present = terms.iter().any(|other| {
+                                matches!(other, ParsedTerm::RandomEffect { name } if name == &by_name)
+                            });
+                            // Add an unpenalized treatment-coded fixed main
+                            // effect for a standalone factor-by smooth, unless
+                            // the same factor already has an explicit
+                            // `group(factor)` term.  In that mixed-model form
+                            // the penalized random intercept is the coherent
+                            // owner of level offsets; adding a no-pooling fixed
+                            // factor effect would bypass random-effect
+                            // shrinkage and degrade BLUP-style predictions.
                             if !random_terms
                                 .iter()
                                 .any(|rt| rt.name == by_name && !rt.penalized)
+                                && !penalized_group_owner_present
                             {
                                 random_terms.push(RandomEffectTermSpec {
                                     name: by_name.clone(),

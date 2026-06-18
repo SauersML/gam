@@ -130,3 +130,29 @@ fn termspec_routes_new_constructs_to_new_variants() {
         matches!(spec.smooth_terms[0].basis, SmoothBasisSpec::FactorSmooth { ref spec } if matches!(spec.flavour, FactorSmoothFlavour::Fs { .. }))
     );
 }
+
+#[test]
+fn factor_by_smooth_defers_level_offsets_to_explicit_random_intercept() {
+    let data = ds();
+    let col_map = data.column_map();
+    let policy = ResourcePolicy::default_library();
+
+    let parsed = parse_formula("y ~ s(x, by=fac) + group(fac)").unwrap();
+    let spec = build_termspec(&parsed.terms, &data, &col_map, &mut vec![], &policy).unwrap();
+
+    assert_eq!(
+        spec.random_effect_terms
+            .iter()
+            .filter(|term| term.name == "fac" && term.penalized)
+            .count(),
+        1,
+        "the explicit group(fac) term should own the factor offsets"
+    );
+    assert!(
+        !spec
+            .random_effect_terms
+            .iter()
+            .any(|term| term.name == "fac" && !term.penalized),
+        "factor-by smooths must not add a no-pooling fixed factor effect when group(fac) is present"
+    );
+}
