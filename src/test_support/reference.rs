@@ -335,13 +335,24 @@ pub fn run_r(columns: &[Column<'_>], body: &str) -> ReferenceResult {
 /// hard failure via [`run_r`]/[`run_python`].
 pub fn r_package_available(pkg: &str) -> bool {
     // `requireNamespace` is contractually non-throwing (returns FALSE and warns
-    // on a failed load), so the probe interpreter always exits zero and this is
-    // never itself a hard failure. `as.numeric(TRUE/FALSE)` -> 1/0.
-    let probe = run_r(
-        &[Column::new("probe", &[0.0])],
-        &format!("emit(\"ok\", as.numeric(requireNamespace(\"{pkg}\", quietly = TRUE)))"),
+    // on a failed load), so a present probe interpreter exits zero and this is
+    // never itself a hard failure. Treat a missing `Rscript` binary the same as
+    // a missing package for this narrowly-scoped environmental gate: callers
+    // that use the gate still assert their tool-free gam quality bars and skip
+    // only the external-reference arm.
+    let script = format!(
+        "cat(if (requireNamespace(\"{pkg}\", quietly = TRUE)) \"1\\n\" else \"0\\n\")"
     );
-    probe.scalar("ok") != 0.0
+    let output = match Command::new("Rscript")
+        .arg("--vanilla")
+        .arg("-e")
+        .arg(script)
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
 }
 
 /// Run a Python reference body. The columns are exposed as a pandas `df` (or,
