@@ -30,6 +30,12 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_rust_files(&path, out);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("._"))
+        {
+            continue;
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             out.push(path);
         }
@@ -38,6 +44,9 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn is_test_only_source_file(path: &Path) -> bool {
     let file_name = path.file_name().and_then(|name| name.to_str());
+    if file_name.is_some_and(|name| name.starts_with("._")) {
+        return true;
+    }
     if matches!(file_name, Some("tests.rs" | "test_support.rs"))
         || file_name.is_some_and(|name| name.ends_with("_tests.rs"))
     {
@@ -415,6 +424,7 @@ fn test_only_source_file_classification_covers_out_of_line_test_modules() {
         "src/test_support/fd_checker.rs",
         "src/testing/mod.rs",
         "src/foo/tests/bar.rs",
+        "src/foo/._bar.rs",
     ] {
         assert!(is_test_only_source_file(Path::new(path)), "{path}");
     }
