@@ -275,24 +275,12 @@ pub fn build_bspline_basis_1d(
     };
     if let Some((knots, p_raw, chunk)) = auto_chunk_streaming {
         let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
-        let mut s_bend_raw = create_difference_penalty_matrix(
+        let s_bend_raw = create_difference_penalty_matrix(
             p_raw,
             spec.penalty_order,
             greville_for_penalty.as_ref().map(|g| g.view()),
         )?;
-        if spec.double_penalty
-            && let Some(shrinkage) = build_nullspace_shrinkage_penalty(&s_bend_raw)?
-        {
-            s_bend_raw += &shrinkage.sym_penalty;
-        }
-        let penalties_raw = vec![PenaltyCandidate {
-            matrix: s_bend_raw.clone(),
-            nullspace_dim_hint: 0,
-            source: PenaltySource::Primary,
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            op: None,
-        }];
+        let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec)?;
         let penalties_raw_mats = penalties_raw
             .iter()
             .map(|candidate| candidate.matrix.clone())
@@ -467,29 +455,12 @@ pub fn build_bspline_basis_1d(
         .or_else(|| design_dense_opt.as_ref().map(Array2::ncols))
         .expect("B-spline basis should be present");
     let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
-    let mut s_bend_raw = create_difference_penalty_matrix(
+    let s_bend_raw = create_difference_penalty_matrix(
         p_raw,
         spec.penalty_order,
         greville_for_penalty.as_ref().map(|g| g.view()),
     )?;
-    // For ordinary B-splines, nullspace shrinkage must be additive shrinkage on
-    // the same REML coordinate as the wiggliness penalty. A separate
-    // nullspace-only coordinate can let REML weaken the wiggle penalty enough to
-    // inflate EDF when `double_penalty` is enabled (#1266).
-    if spec.double_penalty
-        && spec.boundary_conditions.is_free()
-        && let Some(shrinkage) = build_nullspace_shrinkage_penalty(&s_bend_raw)?
-    {
-        s_bend_raw += &shrinkage.sym_penalty;
-    }
-    let penalties_raw = vec![PenaltyCandidate {
-        matrix: s_bend_raw.clone(),
-        nullspace_dim_hint: 0,
-        source: PenaltySource::Primary,
-        normalization_scale: 1.0,
-        kronecker_factors: None,
-        op: None,
-    }];
+    let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec)?;
     let penalties_raw_mats: Vec<Array2<f64>> = penalties_raw
         .iter()
         .map(|candidate| candidate.matrix.clone())
@@ -1636,6 +1607,73 @@ pub(crate) fn validated_kronecker_factors(
         .zip(matrix.iter())
         .fold(0.0_f64, |acc, (&lhs, &rhs)| acc.max((lhs - rhs).abs()));
     (max_abs_diff <= scale * 1e-10).then_some(factors)
+}
+
+/// Assemble the raw (pre-identifiability) penalty candidates for a 1-D B-spline.
+///
+/// The wiggliness penalty `S_bend` is always present. When `double_penalty` is
+/// enabled on a free (non-boundary-conditioned) basis we additionally emit the
+/// Marra & Wood (2011) null-space shrinkage block `Z Zᵀ` as a *separate* REML
+/// coordinate, so that REML can drive an unsupported term's constant/linear
+/// part to `EDF → 0` independently of its wiggliness (mgcv `select = TRUE`).
+///
+/// Both candidates are Frobenius-normalized to unit norm exactly the way the
+/// Duchon / constant-curvature / tensor-B-spline paths already normalize their
+/// own primary + `DoublePenaltyNullspace` blocks. This normalization is what
+/// makes the second smoothing parameter `λ_nullspace` *identifiable*: an
+/// un-normalized `Z Zᵀ` (largest eigenvalue 1) sits on a wildly different scale
+/// from the raw bending penalty, leaving the outer REML objective nearly flat
+/// along the `λ_nullspace` coordinate. Under that flat coordinate REML weakened
+/// the wiggliness penalty instead of shrinking the term out, which *inflated*
+/// the smooth's EDF rather than reducing it (#1266). With both blocks on a
+/// common (unit-Frobenius) scale the coordinate is identified and the double
+/// penalty shrinks — never inflates — null-space / unsupported terms.
+fn bspline_penalty_candidates(
+    s_bend_raw: &Array2<f64>,
+    spec: &BSplineBasisSpec,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let want_nullspace = spec.double_penalty && spec.boundary_conditions.is_free();
+    let shrinkage = if want_nullspace {
+        build_nullspace_shrinkage_penalty(s_bend_raw)?
+    } else {
+        None
+    };
+
+    // Without an active null-space block, preserve the historical single-penalty
+    // geometry exactly: the bending penalty ships un-normalized with scale 1.0,
+    // so `double_penalty = False` (and boundary-conditioned) fits are byte-for-
+    // byte unchanged.
+    let Some(shrinkage) = shrinkage else {
+        return Ok(vec![PenaltyCandidate {
+            matrix: s_bend_raw.clone(),
+            nullspace_dim_hint: 0,
+            source: PenaltySource::Primary,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        }]);
+    };
+
+    let (bend_norm, bend_scale) = normalize_penalty(s_bend_raw);
+    let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage.sym_penalty);
+    Ok(vec![
+        PenaltyCandidate {
+            matrix: bend_norm,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::Primary,
+            normalization_scale: bend_scale,
+            kronecker_factors: None,
+            op: None,
+        },
+        PenaltyCandidate {
+            matrix: ridge_norm,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+            normalization_scale: ridge_scale,
+            kronecker_factors: None,
+            op: None,
+        },
+    ])
 }
 
 /// Build the double-penalty ridge from the structural null space of a PSD penalty.
