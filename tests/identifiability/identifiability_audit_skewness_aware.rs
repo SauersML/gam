@@ -36,13 +36,42 @@
 //! 5. **μ_3 estimator finite-sample correction**: verify that `compute_skewness_mu3`
 //!    produces the correct sign and rough magnitude for a known skewed distribution.
 
-use gam::families::custom_family::{ParameterBlockSpec, RowScaledJacobian};
+use gam::families::custom_family::{
+    BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian,
+};
 use gam::identifiability::audit::{
-    audit_identifiability, bias_shift_for_pair, compute_skewness_mu3,
+    audit_identifiability, audit_identifiability_with_state, bias_shift_for_pair,
+    compute_skewness_mu3,
 };
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
+
+struct FirstBetaScaledJacobian {
+    base: Array2<f64>,
+    alias: Array2<f64>,
+}
+
+impl BlockEffectiveJacobian for FirstBetaScaledJacobian {
+    fn effective_jacobian_rows(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.base.nrows();
+        let rows = rows.start.min(n)..rows.end.min(n);
+        let scale = state.beta.first().copied().unwrap_or(0.0);
+        let mut out = self
+            .base
+            .slice(ndarray::s![rows.start..rows.end, ..])
+            .to_owned();
+        out += &self
+            .alias
+            .slice(ndarray::s![rows.start..rows.end, ..])
+            .mapv(|v| scale * v);
+        Ok(out)
+    }
+}
 
 fn spec_from_dense(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
     let n = design.nrows();
@@ -534,4 +563,45 @@ fn no_row_scaling_symmetric_form_matches_t11() {
             "no-scaling pairs must have bias_shift = 0"
         );
     }
+}
+
+#[test]
+fn audit_with_state_passes_block_local_beta_to_effective_jacobians() {
+    let n = 64usize;
+    let mut design = Array2::<f64>::zeros((n, 1));
+    let mut orthogonal_base = Array2::<f64>::zeros((n, 1));
+    for i in 0..n {
+        let x = -1.0 + 2.0 * i as f64 / (n - 1) as f64;
+        design[[i, 0]] = 1.0;
+        orthogonal_base[[i, 0]] = x;
+    }
+
+    let spec_a = spec_from_dense("active_block", design.clone());
+    let mut spec_b = spec_from_dense("local_beta_sensitive_block", orthogonal_base.clone());
+    spec_b.jacobian_callback = Some(Arc::new(FirstBetaScaledJacobian {
+        base: orthogonal_base,
+        alias: design,
+    }));
+
+    let beta = [1.0, 0.0];
+    let state = FamilyLinearizationState {
+        beta: &beta,
+        family_scalars: None,
+        channel_hessian: None,
+        probit_frailty_scale: 1.0,
+    };
+
+    let audit =
+        audit_identifiability_with_state(&[spec_a, spec_b], &state).expect("audit must run");
+    assert!(
+        !audit.fatal,
+        "the second block's local beta is zero, so its effective Jacobian is the \
+         orthogonal base column and cannot alias the first block; summary: {}",
+        audit.summary
+    );
+    assert!(
+        audit.aliased_pairs.is_empty(),
+        "zero effective-Jacobian block must not create a cross-block alias; got {:?}",
+        audit.aliased_pairs
+    );
 }

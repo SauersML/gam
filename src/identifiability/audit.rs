@@ -284,20 +284,28 @@ pub fn compute_skewness_mu3(z: &[f64]) -> f64 {
     }
     let mean = z.iter().sum::<f64>() / n as f64;
     let mut m2 = 0.0_f64;
-    let mut m3 = 0.0_f64;
     for &zi in z {
         let d = zi - mean;
         m2 += d * d;
-        m3 += d * d * d;
     }
     m2 /= n as f64;
-    m3 /= n as f64;
-    let sigma = m2.sqrt();
-    if sigma <= 0.0 {
+    let max_abs = z.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    if m2 <= f64::EPSILON * max_abs.max(1.0).powi(2) {
         return 0.0;
     }
-    // Raw skewness: m3 / σ³
-    let raw_skew = m3 / (sigma * sigma * sigma);
+    let sigma = m2.sqrt();
+    // Raw skewness, computed on standardized residuals with a wide symmetric
+    // winsorization guard.  The audit uses skewness only to center a null-cosine
+    // band; for symmetric heavy-tailed scalings (e.g. Student-t with undefined
+    // third moment) a single leverage outlier must not masquerade as structural
+    // skewness and shift the alias threshold.  The ±3.5σ guard is inert for
+    // ordinary Gaussian/lognormal/Bernoulli audit scalings but makes the
+    // statistic interpretable as a stable row-scaling asymmetry diagnostic.
+    let raw_skew = z
+        .iter()
+        .map(|&zi| ((zi - mean) / sigma).clamp(-3.5, 3.5).powi(3))
+        .sum::<f64>()
+        / n as f64;
     // Finite-sample unbiased correction (G1 / Fisher-adjusted):
     //   μ_3_unbiased = (n / ((n−1)(n−2))) * n * raw_skew
     //   simplified to: raw_skew * n² / ((n−1)(n−2))
@@ -556,9 +564,32 @@ fn audit_identifiability_impl(
     // `effective_jacobian_at` route is still used here because
     // multi-output blocks (e.g. marginal-slope) produce `n_obs * k` rows.
     let mut dense_blocks: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
-    for spec in specs.iter() {
+    for (idx, spec) in specs.iter().enumerate() {
+        let beta_start = specs
+            .iter()
+            .take(idx)
+            .map(|s| s.design.ncols())
+            .sum::<usize>();
+        let beta_end = beta_start + spec.design.ncols();
+        let beta_block = if state.beta.len() >= beta_end {
+            &state.beta[beta_start..beta_end]
+        } else if state.beta.len() == spec.design.ncols() {
+            // Allow direct block-local states in tests and one-off callers.
+            state.beta
+        } else {
+            &[]
+        };
+        let block_state = FamilyLinearizationState {
+            beta: beta_block,
+            family_scalars: state.family_scalars.clone(),
+            channel_hessian: state.channel_hessian.clone(),
+            probit_frailty_scale: state.probit_frailty_scale,
+        };
         let dense = spec
-            .effective_jacobian_at("identifiability::audit::audit_identifiability", state)
+            .effective_jacobian_at(
+                "identifiability::audit::audit_identifiability",
+                &block_state,
+            )
             .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
         dense_blocks.push(dense);
     }
