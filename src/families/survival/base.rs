@@ -2594,22 +2594,14 @@ impl WorkingModelSurvival {
             // `state.hessian`. `update_state` exposes the pieces directly.
             let penalized_objective =
                 |st: &WorkingState| -> f64 { -st.log_likelihood + st.penalty_term };
-            let dbg = std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some();
-            let mut iters_done = 0usize;
-            let mut exit_reason = "max_iters";
             for _ in 0..POLISH_MAX_ITERS {
-                iters_done += 1;
                 let st = match candidate.update_state(&beta) {
                     Ok(st) => st,
-                    Err(_) => {
-                        exit_reason = "update_state_err";
-                        break;
-                    }
+                    Err(_) => break,
                 };
                 let r = st.gradient.clone();
                 let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
                 if !r_norm.is_finite() || r_norm < POLISH_TOL {
-                    exit_reason = "converged";
                     break;
                 }
                 let h = st.hessian.to_dense();
@@ -2709,30 +2701,7 @@ impl WorkingModelSurvival {
                     alpha *= BACKTRACK;
                 }
                 if !accepted {
-                    exit_reason = "linesearch_no_decrease";
                     break;
-                }
-            }
-            if dbg {
-                let final_r = candidate
-                    .update_state(&beta)
-                    .map(|st| st.gradient.iter().map(|v| v * v).sum::<f64>().sqrt())
-                    .unwrap_or(f64::NAN);
-                let line = format!(
-                    "[931-POLISH] rho={:?} iters={} exit_reason={} final_r_norm={:+.6e}\n",
-                    rho, iters_done, exit_reason, final_r
-                );
-                // Flush to stderr so a slow/killed sbatch job still surfaces the
-                // datum, and append to a file so it survives a scancel.
-                use std::io::Write;
-                let _ = std::io::stderr().write_all(line.as_bytes());
-                let _ = std::io::stderr().flush();
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/931_polish.txt")
-                {
-                    let _ = f.write_all(line.as_bytes());
                 }
             }
         }
@@ -2743,18 +2712,7 @@ impl WorkingModelSurvival {
         // convention of this shim.
         let rho_arr = Array1::from_vec(rho.to_vec());
         let state = candidate.update_state(&beta)?;
-        let out = candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr);
-        if std::env::var_os("GAM_931_RHOGRAD_DEBUG").is_some() {
-            if let Ok((v, g)) = &out {
-                eprintln!(
-                    "[931-SHIM] rho={:?} laml_value={:+.12e} analytic_grad={:?}",
-                    rho,
-                    v,
-                    g.to_vec()
-                );
-            }
-        }
-        out
+        candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
     }
 }
 
