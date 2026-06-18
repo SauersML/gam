@@ -48,7 +48,14 @@ impl LcgNormal {
             .state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        (self.state >> 33) as u32
+        // Take the top 32 bits of the 64-bit state. A `>> 33` shift would
+        // yield only a 31-bit value, capping `next_unit()` at ~0.5 and
+        // collapsing it to a (0, 0.5] "uniform" — which silently corrupts the
+        // Bernoulli draws (mean y ≈ 0.91 instead of p ≈ 0.5) and the Poisson
+        // interarrival sampler (counts ≈ half the intended rate), so the
+        // generated data no longer matches the probability/rate surfaces these
+        // tests measure recovery against (issue #1263).
+        (self.state >> 32) as u32
     }
 
     /// Uniform on (0, 1].
