@@ -241,7 +241,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          sccache: true
+          sccache: false
           target: ${{ matrix.target }}
           args: >-
             --release
