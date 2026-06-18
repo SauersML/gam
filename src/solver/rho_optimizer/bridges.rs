@@ -287,7 +287,22 @@ impl CostStallGuard {
             self.best_rho = Some(rho.clone());
             self.best_grad_norm = grad_norm;
         }
-        if improvement <= floor {
+        // KKT-stationary-at-bound (#1082/#1237). On a near-separable multinomial
+        // the outer REML criterion keeps decreasing as λ→0, so several log-λ
+        // directions slam to the lower box bound: the BOUND-PROJECTED gradient
+        // is already below the outer tolerance (the iterate is KKT-stationary),
+        // yet the raw cost keeps dropping by more than `floor` along those
+        // bound-pinned directions — so a pure cost-improvement test resets the
+        // no-improvement streak forever and the loop never certifies. Once the
+        // projected gradient clears the stationarity threshold there is no
+        // FEASIBLE descent left; further raw progress is bound-pinned drift, not
+        // optimization. Treat such a trial as no-improvement so the window can
+        // fill and the guard halts at the (stationary) best feasible iterate.
+        // `opt::Arc`'s own gradient-tolerance check never trips here because it
+        // tests the RAW gradient, which points out of the box forever.
+        let kkt_stationary_at_bound =
+            grad_norm.is_finite() && grad_norm <= self.grad_threshold;
+        if improvement <= floor || kkt_stationary_at_bound {
             self.no_improve_streak = self.no_improve_streak.saturating_add(1);
         } else {
             self.no_improve_streak = 0;
