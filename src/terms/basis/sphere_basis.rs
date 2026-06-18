@@ -144,7 +144,7 @@ pub fn build_spherical_spline_basis(
     })
 }
 
-const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 2;
+const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 1;
 
 fn harmonic_degree_for_wahba_basis_width(spec: &SphericalSplineBasisSpec, n_rows: usize) -> usize {
     let target = match &spec.center_strategy {
