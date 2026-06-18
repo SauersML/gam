@@ -2347,14 +2347,18 @@ fn debug_flex_directional_quantities_fd_localize() {
     let w0 = w_range.start;
     let probe = [(q1, q1), (g, q1), (g, g), (g, w0), (w0, w0)];
     for &(u, v) in &probe {
-        let eta_fd = fd(&|b| b.eta_uv[[u, v]], 4e-3);
-        let chi_fd = fd(&|b| b.chi_uv[[u, v]], 4e-3);
-        let d_fd = fd(&|b| b.d_uv[[u, v]], 4e-3);
+        let eta_fd = fd(&|b| b.eta_uv[[u, v]], 2e-3);
+        let chi_fd = fd(&|b| b.chi_uv[[u, v]], 2e-3);
+        let d_fd = fd(&|b| b.d_uv[[u, v]], 2e-3);
+        // Convergence check: a genuine bug holds the gap as h shrinks; a
+        // knot-crossing kink artifact moves the FD value as h changes.
+        let d_fd_fine = fd(&|b| b.d_uv[[u, v]], 8e-4);
         eprintln!(
-            "[{u},{v}] eta_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | chi_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | d_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
+            "[{u},{v}] eta_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | chi_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | d_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} (fine {:+.6e} gap {:.2e})",
             ext.eta_uv_dir[[u, v]], eta_fd, (ext.eta_uv_dir[[u, v]] - eta_fd).abs(),
             ext.chi_uv_dir[[u, v]], chi_fd, (ext.chi_uv_dir[[u, v]] - chi_fd).abs(),
             ext.d_uv_dir[[u, v]], d_fd, (ext.d_uv_dir[[u, v]] - d_fd).abs(),
+            d_fd_fine, (ext.d_uv_dir[[u, v]] - d_fd_fine).abs(),
         );
     }
     // d_u_dir localization too.
