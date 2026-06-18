@@ -331,6 +331,7 @@ fn constant_gaussian_standard_fit(
         design,
         resolvedspec: request.spec.clone(),
         adaptive_diagnostics: None,
+        kappa_timing: None,
         saved_link_state: crate::estimate::FittedLinkState::Standard(None),
         wiggle_knots: None,
         wiggle_degree: None,

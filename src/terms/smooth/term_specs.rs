@@ -2216,12 +2216,31 @@ pub struct FittedTermCollection {
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpatialLengthScaleOptimizationTiming {
+    pub log_kappa_dim: usize,
+    pub cost_calls: usize,
+    pub cost_total_s: f64,
+    pub eval_calls: usize,
+    pub eval_total_s: f64,
+    pub efs_calls: usize,
+    pub efs_total_s: f64,
+    pub optim_total_s: f64,
+}
+
+impl SpatialLengthScaleOptimizationTiming {
+    pub fn trial_total_s(self) -> f64 {
+        self.cost_total_s + self.eval_total_s + self.efs_total_s
+    }
+}
+
 #[derive(Clone)]
 pub struct FittedTermCollectionWithSpec {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
+    pub kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
 }
 
 #[derive(Clone)]

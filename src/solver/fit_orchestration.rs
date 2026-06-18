@@ -62,8 +62,9 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, stat
 
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, LinearTermSpec,
-    SpatialLengthScaleOptimizationOptions, StandardLatentCoordConfig, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_design,
+    SpatialLengthScaleOptimizationOptions, SpatialLengthScaleOptimizationTiming,
+    StandardLatentCoordConfig, TermCollectionDesign, TermCollectionSpec,
+    build_term_collection_design,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_latent_coord_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization,

@@ -2069,7 +2069,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     } else {
         SpatialHyperKind::Isotropic
     };
-    let outcome = run_exact_joint_spatial_optimization(
+    let (outcome, kappa_timing) = run_exact_joint_spatial_optimization(
         kind,
         data,
         y,
@@ -2127,6 +2127,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
                 family,
                 options,
                 baseline_score,
+                Some(kappa_timing),
             )?));
         }
     };
@@ -2153,6 +2154,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
             family,
             options,
             baseline_score,
+            Some(kappa_timing),
         )?));
     }
 
@@ -2181,6 +2183,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         design: optimized.design,
         resolvedspec,
         adaptive_diagnostics: optimized.adaptive_diagnostics,
+        kappa_timing: Some(kappa_timing),
     };
 
     Ok(Some(optimized_result))
@@ -2220,6 +2223,7 @@ fn fit_frozen_baseline_geometry(
     family: LikelihoodSpec,
     options: &FitOptions,
     baseline_score: f64,
+    kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
     let baseline = fit_term_collection_forspecwith_heuristic_lambdas(
         data,
@@ -2238,6 +2242,7 @@ fn fit_frozen_baseline_geometry(
         design: baseline.design,
         resolvedspec: resolvedspec.clone(),
         adaptive_diagnostics: baseline.adaptive_diagnostics,
+        kappa_timing,
     })
 }
 
@@ -2920,6 +2925,17 @@ enum SpatialJointOutcome {
     },
 }
 
+fn kphase_log_norms(theta: &Array1<f64>, rho_dim: usize) -> (f64, f64) {
+    let theta_norm = theta.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let log_kappa_norm = theta
+        .iter()
+        .skip(rho_dim)
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt();
+    (theta_norm, log_kappa_norm)
+}
+
 fn run_exact_joint_spatial_optimization(
     kind: SpatialHyperKind,
     data: ArrayView2<'_, f64>,
@@ -2937,7 +2953,7 @@ fn run_exact_joint_spatial_optimization(
     upper: &Array1<f64>,
     rho_dim: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<SpatialJointOutcome, EstimationError> {
+) -> Result<(SpatialJointOutcome, SpatialLengthScaleOptimizationTiming), EstimationError> {
     let label = kind.label();
     // Use bounds and design metadata for validation.
     assert!(
@@ -3236,6 +3252,15 @@ fn run_exact_joint_spatial_optimization(
         }
     }
 
+    let kphase_cost_calls = std::cell::Cell::new(0usize);
+    let kphase_eval_calls = std::cell::Cell::new(0usize);
+    let kphase_efs_calls = std::cell::Cell::new(0usize);
+    let kphase_cost_total_s = std::cell::Cell::new(0.0);
+    let kphase_eval_total_s = std::cell::Cell::new(0.0);
+    let kphase_efs_total_s = std::cell::Cell::new(0.0);
+    let kphase_optim_start = std::time::Instant::now();
+    let kphase_log_kappa_dim = coord_dim;
+
     let problem = exact_joint_multistart_outer_problem(
         theta0,
         lower,
@@ -3286,7 +3311,22 @@ fn run_exact_joint_spatial_optimization(
                       theta: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
-        match ctx.eval_full(theta, order, analytic_outer_hessian_available) {
+        let t0 = std::time::Instant::now();
+        let raw = ctx.eval_full(theta, order, analytic_outer_hessian_available);
+        let elapsed_s = t0.elapsed().as_secs_f64();
+        kphase_eval_calls.set(kphase_eval_calls.get() + 1);
+        kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
+        let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, rho_dim);
+        log::info!(
+            "[KAPPA-PHASE] phase=eval_outer call={} order={:?} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+            kphase_eval_calls.get(),
+            order,
+            Some(ctx.cache.design_revision()),
+            theta_norm,
+            log_kappa_norm,
+            elapsed_s,
+        );
+        match raw {
             Ok((cost, grad, hess)) => Ok(OuterEval {
                 cost,
                 gradient: grad,
@@ -3313,7 +3353,23 @@ fn run_exact_joint_spatial_optimization(
 
     let mut obj = problem.build_objective_with_eval_order(
         &mut ctx,
-        |ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
+        |ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| {
+            let t0 = std::time::Instant::now();
+            let cost = ctx.eval_cost(theta);
+            let elapsed_s = t0.elapsed().as_secs_f64();
+            kphase_cost_calls.set(kphase_cost_calls.get() + 1);
+            kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
+            let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, rho_dim);
+            log::info!(
+                "[KAPPA-PHASE] phase=cost call={} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+                kphase_cost_calls.get(),
+                Some(ctx.cache.design_revision()),
+                theta_norm,
+                log_kappa_norm,
+                elapsed_s,
+            );
+            Ok(cost)
+        },
         |ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| {
             eval_outer(
                 ctx,
@@ -3340,7 +3396,23 @@ fn run_exact_joint_spatial_optimization(
         Some(|ctx: &mut &mut SpatialJointContext<'_>| {
             ctx.reset();
         }),
-        Some(|ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
+        Some(|ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| {
+            let t0 = std::time::Instant::now();
+            let eval = ctx.eval_efs(theta);
+            let elapsed_s = t0.elapsed().as_secs_f64();
+            kphase_efs_calls.set(kphase_efs_calls.get() + 1);
+            kphase_efs_total_s.set(kphase_efs_total_s.get() + elapsed_s);
+            let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, rho_dim);
+            log::info!(
+                "[KAPPA-PHASE] phase=efs call={} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+                kphase_efs_calls.get(),
+                Some(ctx.cache.design_revision()),
+                theta_norm,
+                log_kappa_norm,
+                elapsed_s,
+            );
+            eval
+        }),
     );
 
     let run_label = match kind {
@@ -3353,6 +3425,28 @@ fn run_exact_joint_spatial_optimization(
             kind.adjective(),
         ))
     })?;
+    let kphase_total_s = kphase_optim_start.elapsed().as_secs_f64();
+    log::info!(
+        "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} optim_total_s={:.4}",
+        kphase_log_kappa_dim,
+        kphase_cost_calls.get(),
+        kphase_cost_total_s.get(),
+        kphase_eval_calls.get(),
+        kphase_eval_total_s.get(),
+        kphase_efs_calls.get(),
+        kphase_efs_total_s.get(),
+        kphase_total_s,
+    );
+    let timing = SpatialLengthScaleOptimizationTiming {
+        log_kappa_dim: kphase_log_kappa_dim,
+        cost_calls: kphase_cost_calls.get(),
+        cost_total_s: kphase_cost_total_s.get(),
+        eval_calls: kphase_eval_calls.get(),
+        eval_total_s: kphase_eval_total_s.get(),
+        efs_calls: kphase_efs_calls.get(),
+        efs_total_s: kphase_efs_total_s.get(),
+        optim_total_s: kphase_total_s,
+    };
     if !result.converged {
         // Mirror `fit_term_collectionwith_exact_spatial_adaptive_regularization`
         // (commit 0267d082): the strict absolute-floor gradient criterion is too
@@ -3406,11 +3500,14 @@ fn run_exact_joint_spatial_optimization(
                 result.final_value,
                 result.final_grad_norm_report(),
             );
-            return Ok(SpatialJointOutcome::NonConverged {
-                iterations: result.iterations,
-                final_value: result.final_value,
-                final_grad_norm: result.final_grad_norm,
-            });
+            return Ok((
+                SpatialJointOutcome::NonConverged {
+                    iterations: result.iterations,
+                    final_value: result.final_value,
+                    final_grad_norm: result.final_grad_norm,
+                },
+                timing,
+            ));
         } else {
             // A non-finite terminal cost is a genuine numerical blowup (NaN/inf
             // propagating through the gradient/Hessian wiring), not the ordinary
@@ -3436,10 +3533,13 @@ fn run_exact_joint_spatial_optimization(
     // optimization. For the anisotropic kind the decomposition into (ψ̄, η)
     // happens later in apply_tospec.
     let theta_star = result.rho;
-    Ok(SpatialJointOutcome::Optimized {
-        theta_star,
-        final_value: result.final_value,
-    })
+    Ok((
+        SpatialJointOutcome::Optimized {
+            theta_star,
+            final_value: result.final_value,
+        },
+        timing,
+    ))
 }
 
 fn set_spatial_length_scale(
@@ -5590,6 +5690,7 @@ pub struct SpatialLengthScaleOptimizationResult<FitOut> {
     pub resolved_specs: Vec<TermCollectionSpec>,
     pub designs: Vec<TermCollectionDesign>,
     pub fit: FitOut,
+    pub timing: Option<SpatialLengthScaleOptimizationTiming>,
 }
 
 /// Exact-joint hyper-parameter setup for N-block spatial length-scale optimization.
@@ -6107,6 +6208,7 @@ where
             resolved_specs,
             designs,
             fit,
+            timing: None,
         });
     }
 
@@ -6699,6 +6801,7 @@ where
                         resolved_specs,
                         designs,
                         fit,
+                        timing: None,
                     });
                 }
                 return Err(message);
@@ -6725,6 +6828,16 @@ where
         kphase_efs_total_s.get(),
         kphase_total_s,
     );
+    let timing = SpatialLengthScaleOptimizationTiming {
+        log_kappa_dim: kphase_log_kappa_dim,
+        cost_calls: kphase_cost_calls.get(),
+        cost_total_s: kphase_cost_total_s.get(),
+        eval_calls: kphase_eval_calls.get(),
+        eval_total_s: kphase_eval_total_s.get(),
+        efs_calls: kphase_efs_calls.get(),
+        efs_total_s: kphase_efs_total_s.get(),
+        optim_total_s: kphase_total_s,
+    };
 
     let theta_star = result.rho;
 
@@ -6804,6 +6917,7 @@ where
         resolved_specs,
         designs,
         fit,
+        timing: Some(timing),
     })
 }
 
@@ -7194,6 +7308,7 @@ fn try_exact_joint_latent_coord_optimization(
         design: optimized.design,
         resolvedspec: resolvedspec.clone(),
         adaptive_diagnostics: optimized.adaptive_diagnostics,
+        kappa_timing: None,
     })
 }
 
@@ -7293,6 +7408,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             design: out.design,
             resolvedspec,
             adaptive_diagnostics: out.adaptive_diagnostics,
+            kappa_timing: None,
         });
     }
     if kappa_options.max_outer_iter == 0 {
@@ -7367,6 +7483,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             design: fitted.design,
             resolvedspec,
             adaptive_diagnostics: fitted.adaptive_diagnostics,
+            kappa_timing: None,
         });
     }
     let initial_score = fit_score(&best.fit);

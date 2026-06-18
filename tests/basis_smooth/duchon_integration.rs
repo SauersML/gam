@@ -351,6 +351,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
         fit: fitted.fit,
         design: fitted.design,
         adaptive_diagnostics: fitted.adaptive_diagnostics,
+        kappa_timing: None,
     };
 
     // Coefficients must be finite.
@@ -493,6 +494,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
         fit: fitted.fit,
         design: fitted.design,
         adaptive_diagnostics: fitted.adaptive_diagnostics,
+        kappa_timing: None,
     };
 
     // Coefficients must be finite.

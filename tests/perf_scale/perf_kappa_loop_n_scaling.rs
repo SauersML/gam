@@ -8,13 +8,11 @@
 //! inside the κ outer loop (beyond the single final fit) should stay roughly
 //! flat rather than scaling with n.
 //!
-//! This harness isolates that κ-phase without any internal A/B switch (the
-//! tensor auto-installs; there is no off-flag, by design). For each n it times:
-//!   * `t_kappa`  — a fit with the κ outer loop ENABLED (several outer iters), and
-//!   * `t_single` — the same fit with the loop DISABLED (one length-scale, one fit).
-//! The difference `t_kappa - t_single` is the marginal cost of the κ search on
-//! top of one ordinary fit, i.e. the κ-phase. If that marginal cost is
-//! n-independent, the ratio across a 16× sweep in n is ~1, not ~16.
+//! This harness isolates that κ-phase through the optimizer's structured
+//! `KAPPA-PHASE-SUMMARY` counters. Those counters start after the one-time tensor
+//! setup / cold realization pass and sum only cost/eval/EFS trial callbacks. If
+//! that trial cost is n-independent, the ratio across a 16× sweep in n is ~1, not
+//! ~16.
 //!
 //! Wall-clock on a shared cluster node is noisy, so this is a *measurement* I
 //! read from the printed table — the only hard assertion is a catastrophe guard
@@ -122,9 +120,23 @@ fn fit_options() -> FitOptions {
     }
 }
 
-/// Outcome of one fit attempt: either the wall-clock seconds (converged) or the
-/// failure reason string (so the diagnostic can tabulate instead of aborting).
-fn run_fit(n: usize, kappa_enabled: bool, aniso: bool, bounds: (f64, f64)) -> Result<f64, String> {
+/// Outcome of one fit attempt: whole-fit wall-clock plus the internal κ-trial
+/// timing when κ optimization actually ran. The κ timing excludes the one-time
+/// tensor/cold setup pass by construction; it is the object #1033 accepts on.
+#[derive(Clone, Copy, Debug)]
+struct FitTiming {
+    wall_s: f64,
+    kappa_trial_s: Option<f64>,
+}
+
+/// Outcome of one fit attempt: either timings (converged) or the failure reason
+/// string (so the diagnostic can tabulate instead of aborting).
+fn run_fit(
+    n: usize,
+    kappa_enabled: bool,
+    aniso: bool,
+    bounds: (f64, f64),
+) -> Result<FitTiming, String> {
     let (x, y) = simulate_1d_gaussian(n);
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);
@@ -182,10 +194,21 @@ fn run_fit(n: usize, kappa_enabled: bool, aniso: bool, bounds: (f64, f64)) -> Re
                      degenerate optimum"
                 ));
             }
-            Ok(dt)
+            Ok(FitTiming {
+                wall_s: dt,
+                kappa_trial_s: s.kappa_timing.map(|timing| timing.trial_total_s()),
+            })
         }
         _ => Err("expected Standard fit result".to_string()),
     }
+}
+
+fn run_kappa_trial_seconds(n: usize, aniso: bool, bounds: (f64, f64)) -> Result<FitTiming, String> {
+    let timing = run_fit(n, true, aniso, bounds)?;
+    if timing.kappa_trial_s.is_none() {
+        return Err("κ optimizer did not report internal trial timing".to_string());
+    }
+    Ok(timing)
 }
 
 /// Diagnostic: which 1-D Gaussian κ configuration actually converges? Isolates
@@ -208,7 +231,7 @@ fn kappa_iso_1d_convergence_diagnostic() {
     for (label, aniso, bounds) in configs {
         let r = run_fit(n, true, aniso, bounds);
         match &r {
-            Ok(dt) => eprintln!("[kappa-diag] {label}: CONVERGED in {dt:.3}s"),
+            Ok(timing) => eprintln!("[kappa-diag] {label}: CONVERGED in {:.3}s", timing.wall_s),
             Err(reason) => eprintln!("[kappa-diag] {label}: FAILED — {reason}"),
         }
         outcomes.push((label, r.is_ok()));
@@ -233,7 +256,10 @@ fn kappa_iso_1d_n_threshold_sweep() {
     eprintln!("[kappa-nthresh] iso-1D hybrid Duchon, Gaussian, single penalty, bounds={bounds:?}");
     for &n in &[600usize, 800, 1000, 1200] {
         match run_fit(n, true, false, bounds) {
-            Ok(dt) => eprintln!("[kappa-nthresh] n={n:>5}: CONVERGED in {dt:.1}s"),
+            Ok(timing) => eprintln!(
+                "[kappa-nthresh] n={n:>5}: CONVERGED in {:.1}s",
+                timing.wall_s
+            ),
             Err(reason) => eprintln!("[kappa-nthresh] n={n:>5}: FAILED — {reason}"),
         }
     }
@@ -260,7 +286,10 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
              regression in the tensor-eligible isotropic length-scale optimizer"
         )
     });
-    eprintln!("[kappa-fast-ladder] warm-up fit primed caches in {warm:.4}s");
+    eprintln!(
+        "[kappa-fast-ladder] warm-up fit primed caches in {:.4}s",
+        warm.wall_s
+    );
 
     // Small ladder: 1k → 16k (16×). Enough to read the slope; ~2–3 min total.
     let ns = [1_000usize, 4_000, 16_000];
@@ -270,15 +299,23 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
         "n", "t_kappa_s", "t_single_s", "kappa_phase_s"
     );
     for &n in &ns {
-        let t_kappa = run_fit(n, true, aniso, bounds)
-            .unwrap()
-            .min(run_fit(n, true, aniso, bounds).unwrap());
+        let kappa_a = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
+        let kappa_b = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
+        let kappa = if kappa_a.kappa_trial_s.unwrap() <= kappa_b.kappa_trial_s.unwrap() {
+            kappa_a
+        } else {
+            kappa_b
+        };
         let t_single = run_fit(n, false, aniso, bounds)
             .unwrap()
-            .min(run_fit(n, false, aniso, bounds).unwrap());
-        let phase = (t_kappa - t_single).max(0.0);
+            .wall_s
+            .min(run_fit(n, false, aniso, bounds).unwrap().wall_s);
+        let phase = kappa.kappa_trial_s.unwrap().max(0.0);
         kappa_phase.push(phase);
-        eprintln!("[kappa-fast-ladder] {n:>9}  {t_kappa:>10.4}  {t_single:>10.4}  {phase:>12.4}");
+        eprintln!(
+            "[kappa-fast-ladder] {n:>9}  {:>10.4}  {t_single:>10.4}  {phase:>12.4}",
+            kappa.wall_s
+        );
     }
 
     let first = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
@@ -317,16 +354,15 @@ fn kappa_outer_loop_is_n_independent() {
              regression in the tensor-eligible isotropic length-scale optimizer"
         )
     });
-    eprintln!("[kappa-n-scaling] warm-up fit primed caches in {warm:.4}s");
+    eprintln!(
+        "[kappa-n-scaling] warm-up fit primed caches in {:.4}s",
+        warm.wall_s
+    );
 
-    // #1033 acceptance sweep: 1e3 → 2.56e5 (256×). `t_single` (κ loop OFF, one
-    // length-scale, one fit) absorbs the one-time O(n) tensor build + the final
-    // O(n) PIRLS assembly; `t_single` therefore scales with n. The MARGINAL
-    // `t_kappa - t_single` isolates the cost of the OUTER κ-trial loop on top of
-    // one ordinary fit — the object the issue requires to be n-INDEPENDENT. If
-    // the per-trial design realization were still O(n) it would grow ~256× here;
-    // the PsiGramTensor sufficient-statistic lane keeps it flat (the only n-work
-    // left is the single build, which lands in `t_single`, not the marginal).
+    // #1033 acceptance sweep: 1e3 → 320k. The asserted quantity is the structured
+    // κ-trial callback time reported by `KAPPA-PHASE-SUMMARY`, not whole-fit
+    // wall-clock subtraction. The one-time tensor build is intentionally outside
+    // this counter; the issue accepts n-independence after that initial pass.
     let ns = [1_000usize, 4_000, 16_000, 64_000, 256_000, 320_000];
     let mut kappa_phase = Vec::with_capacity(ns.len());
 
@@ -336,15 +372,23 @@ fn kappa_outer_loop_is_n_independent() {
     );
     for &n in &ns {
         // Best-of-two to suppress shared-cluster wall-clock noise.
-        let t_kappa = run_fit(n, true, aniso, bounds)
-            .unwrap()
-            .min(run_fit(n, true, aniso, bounds).unwrap());
+        let kappa_a = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
+        let kappa_b = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
+        let kappa = if kappa_a.kappa_trial_s.unwrap() <= kappa_b.kappa_trial_s.unwrap() {
+            kappa_a
+        } else {
+            kappa_b
+        };
         let t_single = run_fit(n, false, aniso, bounds)
             .unwrap()
-            .min(run_fit(n, false, aniso, bounds).unwrap());
-        let phase = (t_kappa - t_single).max(0.0);
+            .wall_s
+            .min(run_fit(n, false, aniso, bounds).unwrap().wall_s);
+        let phase = kappa.kappa_trial_s.unwrap().max(0.0);
         kappa_phase.push(phase);
-        eprintln!("[kappa-n-scaling] {n:>9}  {t_kappa:>10.4}  {t_single:>10.4}  {phase:>12.4}");
+        eprintln!(
+            "[kappa-n-scaling] {n:>9}  {:>10.4}  {t_single:>10.4}  {phase:>12.4}",
+            kappa.wall_s
+        );
     }
 
     let first = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);

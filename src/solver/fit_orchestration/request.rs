@@ -158,6 +158,7 @@ pub struct StandardFitResult {
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
+    pub kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
     pub saved_link_state: FittedLinkState,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,

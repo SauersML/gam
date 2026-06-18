@@ -189,6 +189,7 @@ pub(crate) fn fit_standard_model(
             design: fitted.design,
             resolvedspec: request.spec.clone(),
             adaptive_diagnostics: fitted.adaptive_diagnostics,
+            kappa_timing: None,
         }
     } else {
         fit_term_collectionwith_spatial_length_scale_optimization(
@@ -210,6 +211,7 @@ pub(crate) fn fit_standard_model(
         design: fitted.design,
         resolvedspec: fitted.resolvedspec,
         adaptive_diagnostics: fitted.adaptive_diagnostics,
+        kappa_timing: fitted.kappa_timing,
         wiggle_knots: None,
         wiggle_degree: None,
     };
@@ -283,6 +285,7 @@ pub(crate) fn fit_standard_model(
         design: solved.design,
         resolvedspec: solved.resolvedspec,
         adaptive_diagnostics: result.adaptive_diagnostics,
+        kappa_timing: result.kappa_timing,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
     })
