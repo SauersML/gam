@@ -3863,11 +3863,19 @@ mod empirical_flex_jet_oracle_tests {
                 &fx.grid,
             )
             .expect("fourth contracted recompute");
-        let wit_qb_b_d = central_rich(&fx, &p0, &[(q, 1), (b, 2), (dev0, 1)], 6e-3);
+        let wit_qd_b_d = central_rich(&fx, &p0, &[(q, 1), (b, 1), (dev0, 2)], 6e-3);
         assert!(
-            (fourth[[q, b]] - wit_qb_b_d).abs() <= 2e-2 * wit_qb_b_d.abs().max(1.0) + 1e-6,
-            "fourth_contracted[q,b] {:+.6e} != witness {wit_qb_b_d:+.6e}",
-            fourth[[q, b]]
+            (fourth[[q, dev0]] - wit_qd_b_d).abs() <= 2e-2 * wit_qd_b_d.abs().max(1.0) + 1e-6,
+            "fourth_contracted[q,dev0] {:+.6e} != witness {wit_qd_b_d:+.6e}",
+            fourth[[q, dev0]]
         );
+        let flipped_fourth = -fourth[[q, dev0]];
+        if wit_qd_b_d.abs() > 1e-6 {
+            assert!(
+                (flipped_fourth - wit_qd_b_d).abs()
+                    > 2e-2 * wit_qd_b_d.abs().max(1.0) + 1e-6,
+                "witness failed to reject a planted fourth-order sign flip (flipped {flipped_fourth:+.6e} vs witness {wit_qd_b_d:+.6e})"
+            );
+        }
     }
 }
