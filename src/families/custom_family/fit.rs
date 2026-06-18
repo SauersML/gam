@@ -1493,7 +1493,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     screening_cap.store(0, Ordering::Relaxed);
 
     let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
-    let final_seed = obj.state.warm_cache.clone();
+    let final_seed = obj
+        .state
+        .warm_cache
+        .clone()
+        .filter(|seed| warm_start_matches_block_log_lambdas(seed, &per_block));
     let mut final_options = options.clone();
     final_options.outer_inner_max_iterations = None;
     let mut inner = inner_blockwise_fit(
