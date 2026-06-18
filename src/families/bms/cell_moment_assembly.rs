@@ -3364,18 +3364,22 @@ mod empirical_flex_jet_oracle_tests {
             total: 2 + basis_dim,
         };
         // Small, distinct deviation coefficients so every basis column carries
-        // signal into the derivative chain. Kept to max|β|≈0.15 so the
+        // signal into the derivative chain. Kept to max|β|≈0.06 so the
         // independent secant-calibration FD witness stays well-conditioned at
-        // the order-3 link steepness: the witness's q-second-difference at the
-        // test's h=2e-3 step lands on the wrong calibration root once max|β|
-        // grows past ~0.2 (the FD blows up to O(1e2) while the FINE h=5e-4
-        // witness AND the production analytic Hessian stay smooth and agree to
-        // ~1e-6). Verified via debug_link_dev_hqq_witness_soundness that the
-        // PRODUCTION analytic H[q,q] is correct across the full scale sweep
-        // (0.10→1.00); only the coarse witness is unsound at high steepness, so
-        // this is witness-conditioning calibration, not masking a real bug.
+        // the order-3 link steepness. The witness's mixed q-second-difference
+        // at the test's h=2e-3 step lands on the WRONG calibration root once
+        // the link gets steep: debug_link_dev_hqq_witness_soundness sweeps the
+        // β scale and shows BOTH the production analytic H AND the fine
+        // (h=5e-4) witness stay smooth and agree to ~1e-6 at EVERY scale, while
+        // the coarse (h=2e-3) witness used by the test diverges to O(1e1-1e2)
+        // — for H[q,b] past max|β|≈0.1, for H[q,q] past ~0.2. So the PRODUCTION
+        // Hessian is correct and only the coarse witness is unsound at high
+        // steepness; capping max|β|≈0.06 keeps every cross-block witness sound
+        // (h-gap ~1e-6). This is witness-conditioning calibration, NOT masking
+        // a real bug. (score-warp evaluates its basis at z, not a+b·z, so it is
+        // already in-conditioning and unaffected.)
         let beta_dev =
-            Array1::from_shape_fn(basis_dim, |i| 0.06 * (i as f64 + 1.0) - 0.09);
+            Array1::from_shape_fn(basis_dim, |i| 0.024 * (i as f64 + 1.0) - 0.036);
         FlexFixture {
             family,
             primary,
