@@ -4841,9 +4841,12 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // consistent (a refused skip ⇒ +1 reset; an admitted skip ⇒ no reset).
     let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
                        cache: &mut SingleBlockExactJointDesignCache<'_>,
-                       theta: &Array1<f64>|
+                       theta: &Array1<f64>,
+                       realize: bool|
      -> (f64, Array1<f64>, Array1<f64>) {
-        cache.ensure_theta(theta).expect("ensure_theta");
+        if realize {
+            cache.ensure_theta(theta).expect("ensure_theta");
+        }
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(),
             cache.spec(),
