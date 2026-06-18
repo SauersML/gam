@@ -3109,8 +3109,11 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
     }
 
     if dim > 1 && !result.penalties_first.is_empty() {
-        let scalar_bundle =
-            build_matern_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
+        let scalar_bundle = build_matern_basis_log_kappa_derivativeswithworkspace(
+            data,
+            spec,
+            &mut BasisWorkspace::default(),
+        )?;
         let scalar_first = scalar_bundle.first.penalties_derivative;
         if scalar_first.len() != result.penalties_first[0].len() {
             return Err(BasisError::InvalidInput(format!(
