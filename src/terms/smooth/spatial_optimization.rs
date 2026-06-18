@@ -2921,13 +2921,23 @@ fn run_exact_joint_spatial_optimization(
     // converges to the same optimum strictly cheaper per eval; below it,
     // exact second-order keeps the ARC/TR-CG geometry. The budget's
     // derivation is owned by `EXACT_JOINT_SECOND_ORDER_THETA_CAP`.
-    let prefer_gradient_only = theta_dim > EXACT_JOINT_SECOND_ORDER_THETA_CAP;
+    let mut prefer_gradient_only = theta_dim > EXACT_JOINT_SECOND_ORDER_THETA_CAP;
     if prefer_gradient_only {
         log::info!(
             "[{label}] joint θ-dim {theta_dim} exceeds the exact pair-Hessian budget \
              ({EXACT_JOINT_SECOND_ORDER_THETA_CAP}); routing gradient-only quasi-Newton"
         );
     }
+    // #1033: set when the n-free Gaussian ψ-lane arms below. It must SUPPRESS the
+    // declared analytic outer Hessian (force `Unavailable`), not merely prefer
+    // gradient-only: the planner keeps the second-order ARC solver whenever an
+    // analytic Hessian is declared `Either`, even under `prefer_gradient_only`
+    // (see `plan_prefer_gradient_only_does_not_hide_analytic_hessian`). A
+    // `ValueGradientHessian` eval forces the O(n) design re-realization because
+    // the outer Hessian curvature slab `B_j` is irreducibly n-dependent, so only
+    // routing to a gradient-only solver (BFGS) keeps every in-window κ-trial on
+    // the n-free `ValueAndGradient` skip.
+    let mut suppress_outer_hessian_for_nfree = false;
 
     log::trace!(
         "[{}] starting analytic optimization: rho_dim={}, coord_dim={}, dims_per_term={:?}",
@@ -3061,6 +3071,34 @@ fn run_exact_joint_spatial_optimization(
                  keeping the exact per-trial path"
             );
         }
+        // #1033 (n-independent outer loop): with the n-free Gaussian lane fully
+        // armed (Gram tensor attached + exact n-free penalty re-key), the design-
+        // realization skip serves the criterion AND the ψ-gradient `(a_j, g_j)`
+        // n-free for every in-window trial — but ONLY a `ValueAndGradient` eval
+        // takes that skip. A `ValueGradientHessian` eval sets `allow_second_order`,
+        // which forces `ensure_theta` → `reset_surface` (the O(n) design re-
+        // realization) because the outer Hessian curvature `B_j` is the exact
+        // n-dependent slab. So second-order outer steps are the LAST O(n) per-trial
+        // cost in the κ search, and they make the outer loop scale with n. Route
+        // gradient-only here: the spatial length-scale objective is smooth and the
+        // budget policy already establishes that gradient-only quasi-Newton
+        // converges to the same optimum strictly cheaper per eval past the pair-
+        // Hessian budget — and with the tensor, the realized Hessian is the only
+        // remaining expensive operation, so the same argument applies for ANY n
+        // once the lane is armed. This keeps every in-window κ-trial on the n-free
+        // `ValueAndGradient` skip, delivering the n-independent outer loop. The
+        // exact second-order geometry is preserved whenever the lane is NOT armed
+        // (non-Gaussian, multi-term, or an uncertified window), where it still pays
+        // O(n) per Hessian but correctly.
+        if attached && evaluator.supports_nfree_penalty_rekey() {
+            suppress_outer_hessian_for_nfree = true;
+            prefer_gradient_only = true;
+            log::info!(
+                "[{label}] n-free Gaussian ψ-lane armed; suppressing the analytic outer \
+                 Hessian and routing gradient-only (BFGS) so the κ outer loop never realizes \
+                 the O(n) second-order slab — n-independent outer loop (#1033)"
+            );
+        }
     }
 
     // ── Discriminating outer-gradient FD audit (issue #1040 / #944 merge gate) ──
@@ -3141,16 +3179,27 @@ fn run_exact_joint_spatial_optimization(
         coord_dim,
         theta_dim,
         Derivative::Analytic,
-        if analytic_outer_hessian_available {
+        if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
             DeclaredHessianForm::Either
         } else {
+            // `Unavailable` when the n-free Gaussian ψ-lane is armed (#1033): the
+            // planner then selects BFGS instead of ARC, so the κ loop issues only
+            // `ValueAndGradient` evals and every in-window trial takes the n-free
+            // design-realization skip.
             DeclaredHessianForm::Unavailable
         },
         prefer_gradient_only,
         // Single-block spatial path: penalty-like rho + spatial psi.
-        // EFS/HybridEFS remain eligible; the Wood-Fasiolo PSD structure holds
-        // for single-block families with β-independent joint H_L.
-        false,
+        // EFS/HybridEFS remain eligible (the Wood-Fasiolo PSD structure holds
+        // for single-block families with β-independent joint H_L) UNLESS the
+        // n-free Gaussian ψ-lane is armed (#1033): HybridEFS forms the trace Gram
+        // `tr(H⁻¹ B_d H⁻¹ B_e)` from the n-dependent curvature slab `B_d`, so it
+        // realizes O(n) per step exactly like a Hessian eval. Disabling the
+        // fixed-point lane there forces the planner to BFGS (`(Analytic,
+        // Unavailable)` → `S::Bfgs`), keeping every in-window κ-trial on the
+        // n-free `ValueAndGradient` skip even when `n_params` exceeds the small-
+        // BFGS threshold (aniso / multi-ψ).
+        suppress_outer_hessian_for_nfree,
         seed_risk_profile_for_likelihood_family(&family),
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
