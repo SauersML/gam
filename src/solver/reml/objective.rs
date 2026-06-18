@@ -2871,10 +2871,7 @@ impl<'a> RemlState<'a> {
         let cost = screening_residual_penalty(result.cost, bundle.pirls_result.as_ref());
         let use_sparse_fd_gradient = bundle.backend_kind() == GeometryBackendKind::SparseExactSpd
             && p.len() > 1
-            && matches!(
-                order,
-                crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient
-            );
+            && !matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::Value);
         let gradient = if use_sparse_fd_gradient {
             self.finite_difference_cost_gradient(p, Some(cost))?
         } else {
