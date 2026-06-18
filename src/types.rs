@@ -457,9 +457,7 @@ pub enum ResponseFamily {
         /// (the #802 default). Carried on the family variant — the canonical
         /// `theta` store — so the estimated-vs-fixed contract can never desync
         /// from the value itself; `default_scale_metadata` derives the
-        /// matching scale variant. Serde-defaulted so pre-#983 saved models
-        /// (always estimated) deserialize unchanged.
-        #[serde(default)]
+        /// matching scale variant.
         theta_fixed: bool,
     },
     Beta {
