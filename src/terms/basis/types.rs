@@ -500,15 +500,15 @@ pub enum CenterStrategyKind {
 /// The basis size is the sub-linear `ceil(8 * d_factor * n^0.4)`, clamped above
 /// at `K_MAX = 2000` and below at a *data-proportional* floor `min(200, n/8)` so
 /// the floor only engages once there are enough observations to support a rich
-/// basis. The result is additionally capped at `n/4` so the penalty matrices
+/// basis. The result is additionally capped at `n/20` so the penalty matrices
 /// stay well-conditioned relative to the data:
 ///
 /// | n      | d=1  | d=2  | d=5  |
 /// |--------|------|------|------|
-/// | 800    | 116  | 134  | 186  |
-/// | 1 000  | 127  | 146  | 200  |
-/// | 2 000  | 200  | 200  | 268  |
-/// | 10 000 | 319  | 367  | 510  |
+/// | 800    | 40   | 40   | 40   |
+/// | 1 000  | 50   | 50   | 50   |
+/// | 2 000  | 100  | 100  | 100  |
+/// | 10 000 | 319  | 367  | 500  |
 /// | 100 000| 801  | 921  | 1281 |
 /// | 400 000| 1393 | 1602 | 2000 |
 /// | 1 000 000| 2000 | 2000 | 2000 |
@@ -520,6 +520,10 @@ pub enum CenterStrategyKind {
 /// REML fit into an `O(n·p² + p³)` grind at `p ≈ 200` (#718). Smoothness is
 /// already controlled by REML's penalty weight λ, not by the center count, so a
 /// data-proportional floor recovers the same surface at a fraction of the cost.
+/// The final `n/20` conditioning cap keeps the broad/pathological quality sweeps
+/// on the dense standard-GAM path instead of letting moderate one-dimensional
+/// radial smooths (for example n≈300 narrow-bump cases) spend minutes in dense
+/// REML startup with no predictive benefit over the REML-selected smaller basis.
 ///
 /// # Arguments
 /// * `n` - sample size (number of observations)
@@ -538,9 +542,10 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
     /// forced up to a dense `K_MIN`-column design.
     const FLOOR_N_DIVISOR: usize = 8;
     /// Divisor for the conditioning cap: the center count never exceeds `n /
-    /// COND_N_DIVISOR`, keeping the penalty matrices well-conditioned relative
-    /// to the data.
-    const COND_N_DIVISOR: usize = 4;
+    /// COND_N_DIVISOR`, keeping dense REML startup well-conditioned and bounded
+    /// for broad quality sweeps while still leaving a REML-selectable basis
+    /// for moderate samples.
+    const COND_N_DIVISOR: usize = 20;
 
     let d_factor = 1.0 + PER_DIM_GROWTH * (d.max(1) - 1) as f64;
     let raw = (C * d_factor * (n as f64).powf(ALPHA)).ceil() as usize;
