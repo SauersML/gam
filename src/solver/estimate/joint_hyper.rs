@@ -483,14 +483,14 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     }
 
     /// True when a certified ψ-Gram tensor is installed AND `psi` lies inside its
-    /// CONDITIONING-STABLE skip sub-window — the region where the design-revision
-    /// fast-path skip (re-key Gram + penalty on a frozen reference surface)
-    /// reproduces the exact slow-path β̂ (#1216, item 3). On the wide standardized
-    /// window the radial-kernel Gram conditioning (hence the reduced-rank basis)
-    /// moves with ψ; a skip across that move would pair a stale reduced basis with
-    /// a re-keyed Gram and yield a wrong β̂. The caller gates the
-    /// design-realization skip on this so the fast path fires only where it is
-    /// sound; elsewhere the full `reset_surface` slow path runs.
+    /// reduced-basis-equality skip sub-window — the region where the
+    /// design-revision fast-path skip (re-key Gram + penalty on a frozen
+    /// reference surface) reproduces the exact slow-path β̂ (#1216, item 3).
+    /// On the wide standardized window the radial-kernel reduced basis moves
+    /// with ψ; a skip across that move pairs a stale reduced basis with a
+    /// re-keyed Gram and yields a wrong β̂. The current tensor cannot prove that
+    /// reduced basis equality, so this gate is empty and moving-ψ trials take the
+    /// full `reset_surface` slow path.
     pub(crate) fn psi_gram_tensor_covers_skip(&self, psi: f64) -> bool {
         self.psi_gram_tensor
             .as_ref()
