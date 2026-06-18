@@ -731,16 +731,30 @@ impl SurvivalLocationScaleFamily {
     /// current trait contract.
     #[inline]
     pub(crate) fn row_kernel_joint_hessian_supported(&self) -> bool {
-        self.x_link_wiggle.is_none()
+        // Keep the coefficient working-set path on the bespoke exact
+        // assembler. Besides avoiding the oversized `Tower4<9>` cache, the
+        // bespoke path is the derivative path that currently tracks the
+        // survival location-scale likelihood for every supported residual
+        // distribution and time-varying channel layout.
+        false
     }
 
     /// First directional derivatives require third qdot map derivatives when
-    /// threshold/log-sigma derivative designs are present; those live in
-    /// `SurvivalJointQuantities`, so every non-wiggle shape can use the
-    /// `RowKernel<9>` path.
+    /// threshold/log-sigma derivative designs are present.
     #[inline]
     pub(crate) fn row_kernel_directional_supported(&self) -> bool {
-        self.x_link_wiggle.is_none()
+        // The dense `Tower4<9>` directional path materializes a complete
+        // fourth-order tensor over the nine survival location-scale primary
+        // channels. That is the wrong representation here: every row program
+        // builds multiple ~50 KiB tower values and operator chains copy them
+        // by value, which has caused stack overflows and severe timeouts in
+        // exact location-scale survival fits.  The non-wiggle family already
+        // has an exact hand-derived first-directional implementation below
+        // this gate (the same path required for link-wiggle, where the
+        // coefficient-to-primary Jacobian is beta-dependent), so route all
+        // first directional derivatives through that exact implementation
+        // until the generic tower grows a packed/heap-backed tensor layout.
+        false
     }
 
     pub(crate) fn survival_ls_row_kernel<'a>(
