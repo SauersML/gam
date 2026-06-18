@@ -102,3 +102,61 @@ fn psi_gram_tensor_cache_matches_dense_xtwx_bit_identically_and_is_n_free() {
         }
     }
 }
+
+#[test]
+fn reduced_basis_skip_witness_does_not_certify_bit_identical_stats() {
+    let (n, k) = (192usize, 8usize);
+    let weights = Array1::from_iter((0..n).map(|i| 0.75 + ((i % 7) as f64) * 0.08));
+    let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.19).cos() + 0.1));
+    let (psi_lo, psi_hi) = (-1.25, 1.15);
+    let calls = Cell::new(0usize);
+
+    let tensor = PsiGramTensor::build(
+        |psi| {
+            calls.set(calls.get() + 1);
+            adversarial_design(psi, n, k)
+        },
+        weights.view(),
+        z.view(),
+        psi_lo,
+        psi_hi,
+    )
+    .expect("analytic design should certify");
+    let build_calls = calls.get();
+    let psi_ref = -0.91;
+    let psi_trial = 0.79;
+
+    assert!(
+        tensor.reduced_basis_equal(psi_ref, psi_trial),
+        "full-rank projector witness should accept this pair; if it refuses, this \
+         test no longer exercises the production skip gate"
+    );
+    let cache = tensor.gaussian_fixed_cache_at(psi_trial);
+    assert_eq!(
+        calls.get(),
+        build_calls,
+        "trial accessor re-entered the n-row design realizer"
+    );
+    let (dense_gram, dense_rhs, _) = dense_stats(psi_trial, n, k, &weights, &z);
+
+    for ((r, c), &dense) in dense_gram.indexed_iter() {
+        let hoisted = cache.xtwx_orig[[r, c]];
+        assert_eq!(
+            hoisted.to_bits(),
+            dense.to_bits(),
+            "reduced-basis witness accepted psi_ref={psi_ref}, psi_trial={psi_trial}, \
+             but hoisted X'WX is not bit-identical at entry=({r},{c}); \
+             hoisted={hoisted:.17e}, dense={dense:.17e}"
+        );
+    }
+    for (j, &dense) in dense_rhs.iter().enumerate() {
+        let hoisted = cache.xtwy_orig[j];
+        assert_eq!(
+            hoisted.to_bits(),
+            dense.to_bits(),
+            "reduced-basis witness accepted psi_ref={psi_ref}, psi_trial={psi_trial}, \
+             but hoisted X'Wz is not bit-identical at entry={j}; \
+             hoisted={hoisted:.17e}, dense={dense:.17e}"
+        );
+    }
+}
