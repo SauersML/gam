@@ -56,7 +56,6 @@ impl SurvivalMarginalSlopeFamily {
         let a_dir = {
             let mut f_dir_pre = 0.0;
             for cell_entry in &cached.cells {
-                let neg_cell = cell_entry.neg_cell;
                 let state = &cell_entry.state;
                 let fixed = &cell_entry.fixed;
                 let mut neg_coeff_dir = [0.0; 4];
@@ -68,7 +67,6 @@ impl SurvivalMarginalSlopeFamily {
                         neg_coeff_dir[k] -= fixed.coeff_u[c][k] * dir[c];
                     }
                 }
-                let _ = neg_cell;
                 f_dir_pre += exact_kernel::cell_first_derivative_from_moments(
                     &neg_coeff_dir,
                     &state.moments,

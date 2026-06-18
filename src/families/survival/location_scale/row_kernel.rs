@@ -1904,16 +1904,15 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
-    /// Survival log value and ratio derivatives, with the same signature as the
-    /// rescaled PDF path.  The CLogLog survival ratio is
+    /// Survival log value and ratio derivatives.  The CLogLog survival ratio is
     /// `r = exp(eta)`, and its derivatives are also `exp(eta)`; these are not
     /// derivative-rescaled because they are already ratio derivatives with
-    /// respect to the unshifted predictor.  The function value
-    /// (`-exp(eta)` = `log S`) is returned unshifted.
+    /// respect to the unshifted predictor.  Unlike the rescaled PDF path, this
+    /// evaluator therefore does not depend on the derivative log-scale.  The
+    /// function value (`-exp(eta)` = `log S`) is returned unshifted.
     pub(crate) fn exact_survival_neglog_derivatives_fourth_rescaled(
         inverse_link: &InverseLink,
         eta: f64,
-        deriv_log_scale: f64,
     ) -> Result<(f64, f64, f64, f64, f64), String> {
         match inverse_link {
             InverseLink::Standard(StandardLink::Probit) => {
@@ -1936,7 +1935,6 @@ impl SurvivalLocationScaleFamily {
                 ))
             }
             InverseLink::Standard(StandardLink::CLogLog) => {
-                let _ = deriv_log_scale;
                 let t = eta.exp();
                 Ok((-t, t, t, t, t))
             }
@@ -2081,14 +2079,10 @@ impl SurvivalLocationScaleFamily {
         let u1 = state.h1 + state.q1;
 
         let (log_s0, r0, dr0, ddr0, dddr0) =
-            Self::exact_survival_neglog_derivatives_fourth_rescaled(
-                &self.inverse_link,
-                u0,
-                deriv_log_scale,
-            )
-            .map_err(|e| {
-                format!("inverse-link survival evaluation failed at row {row} entry: {e}")
-            })?;
+            Self::exact_survival_neglog_derivatives_fourth_rescaled(&self.inverse_link, u0)
+                .map_err(|e| {
+                    format!("inverse-link survival evaluation failed at row {row} entry: {e}")
+                })?;
 
         // Fast path: for CLogLog the survival and log-pdf evaluators both need
         // `exp(u1)`, and the PDF derivatives also need
@@ -2104,7 +2098,6 @@ impl SurvivalLocationScaleFamily {
                 let surv = Self::exact_survival_neglog_derivatives_fourth_rescaled(
                     &self.inverse_link,
                     u1,
-                    deriv_log_scale,
                 )
                 .map_err(|e| {
                     format!("inverse-link survival evaluation failed at row {row} exit: {e}")

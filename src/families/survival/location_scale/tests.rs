@@ -26,13 +26,11 @@ struct SurvivalLsLocationScaleNllProgram<'a> {
 fn survival_ls_log_survival_stack(
     inverse_link: &InverseLink,
     eta: f64,
-    deriv_log_scale: f64,
 ) -> Result<[f64; 5], String> {
     let (log_s, r, dr, ddr, dddr) =
         SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
             inverse_link,
             eta,
-            deriv_log_scale,
         )?;
     Ok([log_s, -r, -dr, -ddr, -dddr])
 }
@@ -142,8 +140,7 @@ impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNll
         let q_exit = (self.row.exit_index - eta_location.v) * inv_sigma.v;
         let g = self.row.exit_index_derivative * inv_sigma.v;
 
-        let stack_entry =
-            survival_ls_log_survival_stack(self.inverse_link, q_entry, self.deriv_log_scale)?;
+        let stack_entry = survival_ls_log_survival_stack(self.inverse_link, q_entry)?;
         let mut kernel = SurvivalExactRowKernel {
             w: self.row.weight,
             d: self.row.event,
@@ -171,8 +168,7 @@ impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNll
 
         let censored_weight = self.row.weight * (1.0 - self.row.event);
         if censored_weight != 0.0 {
-            let stack_exit =
-                survival_ls_log_survival_stack(self.inverse_link, q_exit, self.deriv_log_scale)?;
+            let stack_exit = survival_ls_log_survival_stack(self.inverse_link, q_exit)?;
             kernel.log_s1 = stack_exit[0];
             kernel.r1 = -stack_exit[1];
             kernel.dr1 = -stack_exit[2];
@@ -806,7 +802,7 @@ fn hand_survival_ls_channels(
     let mut channels = SlsHandWitnessChannels::zero();
     channels.add_unary(
         &q_entry,
-        survival_ls_log_survival_stack(inverse_link, q_entry.v, 0.0)
+        survival_ls_log_survival_stack(inverse_link, q_entry.v)
             .expect("survival witness log-survival stack"),
         row.weight,
     );
@@ -814,7 +810,7 @@ fn hand_survival_ls_channels(
     if censored_weight != 0.0 {
         channels.add_unary(
             &q_exit,
-            survival_ls_log_survival_stack(inverse_link, q_exit.v, 0.0)
+            survival_ls_log_survival_stack(inverse_link, q_exit.v)
                 .expect("survival witness log-survival stack"),
             -censored_weight,
         );
@@ -986,22 +982,14 @@ impl crate::families::jet_tower::RowNllProgram<SLS_ROW_K> for SurvivalLsJointNll
         // log_likelihood` / `nll_index_tower` (left truncation divides the
         // likelihood by S(u0), so its log ADDS to the NLL).
         let mut nll = u0
-            .compose_unary(survival_ls_log_survival_stack(
-                self.inverse_link,
-                u0.v,
-                0.0,
-            )?)
+            .compose_unary(survival_ls_log_survival_stack(self.inverse_link, u0.v)?)
             .scale(w);
 
         let censored_weight = w * (1.0 - d);
         if censored_weight != 0.0 {
             nll = nll
-                + u1.compose_unary(survival_ls_log_survival_stack(
-                    self.inverse_link,
-                    u1.v,
-                    0.0,
-                )?)
-                .scale(-censored_weight);
+                + u1.compose_unary(survival_ls_log_survival_stack(self.inverse_link, u1.v)?)
+                    .scale(-censored_weight);
         }
 
         let event_weight = w * d;
@@ -3164,7 +3152,7 @@ fn survival_log_survival_and_pdf_stacks_match_independent_fd_witness() {
         // log S(eta): value = slot 0; analytic derivatives are -r, -dr, -ddr, -dddr.
         let log_s_value = |eta: f64| {
             SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                link, eta, 0.0,
+                link, eta,
             )
             .expect("log-survival stack")
             .0
@@ -3178,7 +3166,7 @@ fn survival_log_survival_and_pdf_stacks_match_independent_fd_witness() {
         for &eta in &etas {
             let (_, r, dr, ddr, dddr) =
                 SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                    link, eta, 0.0,
+                    link, eta,
                 )
                 .expect("log-survival stack");
             let log_s_analytic = [-r, -dr, -ddr, -dddr];
@@ -3272,7 +3260,6 @@ fn exact_survival_neglog_derivatives_rescaled_do_not_scale_cloglog_ratio() {
         SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
             &InverseLink::Standard(StandardLink::CLogLog),
             eta,
-            log_scale,
         )
         .expect("rescaled cloglog survival derivatives");
 
@@ -3309,7 +3296,6 @@ fn exact_survival_neglog_derivatives_match_identity_closed_form() {
         SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
             &InverseLink::Standard(StandardLink::Identity),
             eta,
-            0.0,
         )
         .expect("exact identity survival derivatives");
     assert!((log_s - s.ln()).abs() <= 1e-15);
