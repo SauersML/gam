@@ -108,9 +108,9 @@ mod per_term_edf_tests {
                 penalty_block_trace: Vec::new(),
                 edf_total: 28.0,
                 smoothing_correction: None,
-                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(
-                    eye(36),
-                ),
+                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(
+                    36,
+                )),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,

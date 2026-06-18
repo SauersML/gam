@@ -3079,10 +3079,7 @@ impl DerivativeStorageBackend for ZeroDerivativeMatrix {
         None
     }
 
-    fn design_forward_mul_original(
-        &self,
-        u: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
+    fn design_forward_mul_original(&self, u: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         if self.cols != u.len() {
             crate::bail_invalid_estim!(
                 "zero hyper design derivative forward_mul_original width mismatch: matrix={}x{}, vector={}",
