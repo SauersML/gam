@@ -7,6 +7,24 @@
 
 use super::*;
 
+#[inline]
+fn eval_poly_slice(coefficients: &[f64], z: f64) -> f64 {
+    let mut acc = 0.0;
+    for &coefficient in coefficients.iter().rev() {
+        acc = acc * z + coefficient;
+    }
+    acc
+}
+
+#[inline]
+fn eval_poly_derivative_slice(coefficients: &[f64], z: f64) -> f64 {
+    let mut acc = 0.0;
+    for (power, &coefficient) in coefficients.iter().enumerate().skip(1).rev() {
+        acc = acc * z + (power as f64) * coefficient;
+    }
+    acc
+}
+
 impl SurvivalMarginalSlopeFamily {
     /// Exact mixed bidirectional extension D_{d1} D_{d2} of the timepoint
     /// quantities. This carries the calibration solve, observed eta/chi
@@ -1278,6 +1296,7 @@ impl SurvivalMarginalSlopeFamily {
                         );
 
                         let i_base = poly_coeff_mask(&i_base_jet, 0);
+                        let i_base_d1 = poly_coeff_mask(&i_base_jet, 1);
                         let i_base_d2 = poly_coeff_mask(&i_base_jet, 2);
                         let i_base_d12 = poly_coeff_mask(&i_base_jet, 3);
                         let eta_poly = poly_coeff_mask(&eta_poly_jet, 0);
@@ -1302,6 +1321,68 @@ impl SurvivalMarginalSlopeFamily {
                             "survival D_t second derivative bidirectional",
                         )?;
                         d_uv_uv[[u, v]] += value;
+                        if b != 0.0 {
+                            let part = &ce.partition_cell;
+                            let dir_g1 = dir1[primary.g];
+                            let dir_g2 = dir2[primary.g];
+                            let edge_velocity = |
+                                edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                z: f64,
+                            | -> (f64, f64, f64) {
+                                match edge {
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
+                                        ..
+                                    } => {
+                                        let z1 = -(ad1 + z * dir_g1) / b;
+                                        let z2 = -(ad2 + z * dir_g2) / b;
+                                        let z12 = -(ad12 + z2 * dir_g1 + z1 * dir_g2) / b;
+                                        (z1, z2, z12)
+                                    }
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
+                                        (0.0, 0.0, 0.0)
+                                    }
+                                }
+                            };
+                            let density_z_derivative = |z: f64| -> f64 {
+                                let eta = cell.eta(z);
+                                let eta_z = cell.c1
+                                    + 2.0 * cell.c2 * z
+                                    + 3.0 * cell.c3 * z * z;
+                                let amp = eval_poly_slice(&i_base, z);
+                                let amp_z = eval_poly_derivative_slice(&i_base, z);
+                                let q_z = z + eta * eta_z;
+                                (amp_z - amp * q_z) * (-cell.q(z)).exp()
+                                    / std::f64::consts::TAU
+                            };
+                            let i_d1_poly = poly_sub(
+                                &i_base_d1,
+                                &poly_mul(&poly_mul(&eta_poly, &eta_d1_poly), &i_base),
+                            );
+                            let i_d2_poly = poly_sub(
+                                &i_base_d2,
+                                &poly_mul(&poly_mul(&eta_poly, &eta_d2_poly), &i_base),
+                            );
+                            let boundary = |z: f64, z1: f64, z2: f64, z12: f64| -> f64 {
+                                z12 * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                    cell, &i_base, z,
+                                )
+                                    + z2 * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                        cell, &i_d1_poly, z,
+                                    )
+                                    + z1 * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                        cell, &i_d2_poly, z,
+                                    )
+                                    + z1 * z2 * density_z_derivative(z)
+                            };
+                            let (r1, r2, r12) = edge_velocity(part.right_edge, cell.right);
+                            if r1 != 0.0 || r2 != 0.0 || r12 != 0.0 {
+                                d_uv_uv[[u, v]] += boundary(cell.right, r1, r2, r12);
+                            }
+                            let (l1, l2, l12) = edge_velocity(part.left_edge, cell.left);
+                            if l1 != 0.0 || l2 != 0.0 || l12 != 0.0 {
+                                d_uv_uv[[u, v]] -= boundary(cell.left, l1, l2, l12);
+                            }
+                        }
                         d_uv_uv[[v, u]] = d_uv_uv[[u, v]];
                     }
                 }
