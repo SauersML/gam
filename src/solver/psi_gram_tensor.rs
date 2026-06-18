@@ -671,35 +671,45 @@ impl PsiGramTensor {
             })
             .collect();
 
-        let Some(start) = probes.iter().position(|(_, probe)| probe.is_some()) else {
+        let Some(reference_frob) = probes
+            .iter()
+            .filter_map(|(_, probe)| probe.as_ref().map(|(_, frob)| *frob))
+            .min_by(f64::total_cmp)
+        else {
             self.skip_psi_lo = f64::NAN;
             self.skip_psi_hi = f64::NAN;
             return;
         };
-        let Some((reference_frame, reference_frob)) = probes[start].1.as_ref() else {
-            self.skip_psi_lo = f64::NAN;
-            self.skip_psi_hi = f64::NAN;
-            return;
-        };
-        let frob_ceiling = *reference_frob * PSI_GRAM_SKIP_FROB_GROWTH_MAX;
-        let mut end = start;
-        while end + 1 < probes.len() {
-            let Some((frame, frob)) = probes[end + 1].1.as_ref() else {
-                break;
+        let frob_ceiling = reference_frob * PSI_GRAM_SKIP_FROB_GROWTH_MAX;
+        let mut start = 0usize;
+        while start < probes.len() {
+            let Some((reference_frame, start_frob)) = probes[start].1.as_ref() else {
+                start += 1;
+                continue;
             };
-            if frame != reference_frame || *frob > frob_ceiling {
-                break;
+            if *start_frob > frob_ceiling {
+                start += 1;
+                continue;
             }
-            end += 1;
+            let mut end = start;
+            while end + 1 < probes.len() {
+                let Some((frame, frob)) = probes[end + 1].1.as_ref() else {
+                    break;
+                };
+                if frame != reference_frame || *frob > frob_ceiling {
+                    break;
+                }
+                end += 1;
+            }
+            if end - start + 1 >= 3 {
+                self.skip_psi_lo = probes[start].0;
+                self.skip_psi_hi = probes[end].0;
+                return;
+            }
+            start = end + 1;
         }
-
-        if end - start + 1 >= 3 {
-            self.skip_psi_lo = probes[start].0;
-            self.skip_psi_hi = probes[end].0;
-        } else {
-            self.skip_psi_lo = f64::NAN;
-            self.skip_psi_hi = f64::NAN;
-        }
+        self.skip_psi_lo = f64::NAN;
+        self.skip_psi_hi = f64::NAN;
     }
 
     /// True when `psi` lies inside the certified window.
