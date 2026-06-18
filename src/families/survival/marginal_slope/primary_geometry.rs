@@ -264,6 +264,7 @@ pub(crate) struct SurvivalFlexTimepointFirstOrderExact {
 /// NLL contraction.
 pub(crate) struct SurvivalFlexTimepointDirectionalExact {
     pub(crate) eta_uv_dir: Array2<f64>,
+    pub(crate) eta_u_dir: Array1<f64>,
     pub(crate) chi_u_dir: Array1<f64>,
     pub(crate) chi_uv_dir: Array2<f64>,
     pub(crate) d_u_dir: Array1<f64>,

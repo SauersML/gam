@@ -1884,6 +1884,7 @@ pub struct SurvivalFlexBlock10TimepointBase {
 #[derive(Clone, Debug)]
 pub struct SurvivalFlexBlock10TimepointDirectional {
     pub eta_uv_dir: Vec<f64>,
+    pub eta_u_dir: Vec<f64>,
     pub chi_u_dir: Vec<f64>,
     pub chi_uv_dir: Vec<f64>,
     pub d_u_dir: Vec<f64>,
@@ -2025,8 +2026,8 @@ pub fn cpu_oracle_third_contraction(
         0.0
     };
 
-    let entry_eta_u_dir = b10_mat_dot(&entry.eta_uv, inputs.dir, p);
-    let exit_eta_u_dir = b10_mat_dot(&exit.eta_uv, inputs.dir, p);
+    let entry_eta_u_dir = &entry_ext.eta_u_dir;
+    let exit_eta_u_dir = &exit_ext.eta_u_dir;
     let exit_chi_u_dir = &exit_ext.chi_u_dir;
     let exit_d_u_dir = &exit_ext.d_u_dir;
 
