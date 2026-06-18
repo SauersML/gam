@@ -2319,8 +2319,11 @@ fn debug_flex_directional_quantities_fd_localize() {
             Some((0, SurvivalInterceptSlotKind::Exit)),
         )
         .expect("exit intercept");
+    let cached = family
+        .build_cached_partition(&primary, a1, gv, Some(&beta_h), Some(&beta_w))
+        .expect("exit cached partition");
     let base = family
-        .compute_survival_timepoint_exact(
+        .compute_survival_timepoint_exact_from_cached(
             0,
             &primary,
             q1v,
@@ -2332,10 +2335,11 @@ fn debug_flex_directional_quantities_fd_localize() {
             Some(&beta_w),
             0.0,
             true,
+            &cached,
         )
         .expect("exit base");
     let ext = family
-        .compute_survival_timepoint_directional_exact(
+        .compute_survival_timepoint_directional_exact_from_cached(
             0,
             &primary,
             q1v,
@@ -2344,6 +2348,7 @@ fn debug_flex_directional_quantities_fd_localize() {
             gv,
             Some(&beta_h),
             Some(&beta_w),
+            &cached,
             &dir,
             true,
         )
@@ -2440,18 +2445,22 @@ fn debug_flex_directional_quantities_fd_localize() {
                 )
                 .expect("perturbed dir intercept");
             let e = family
-                .compute_survival_timepoint_directional_exact(
-                    0,
-                    &primary,
-                    q,
-                    primary.q1,
-                    a,
-                    g,
-                    Some(&beta_h),
-                    Some(&beta_w),
-                    &dir,
-                    true,
-                )
+                .build_cached_partition(&primary, a, g, Some(&beta_h), Some(&beta_w))
+                .and_then(|cached| {
+                    family.compute_survival_timepoint_directional_exact_from_cached(
+                        0,
+                        &primary,
+                        q,
+                        primary.q1,
+                        a,
+                        g,
+                        Some(&beta_h),
+                        Some(&beta_w),
+                        &cached,
+                        &dir,
+                        true,
+                    )
+                })
                 .expect("perturbed dir");
             e.debug_d_uv_terms.expect("debug terms").0
         };
@@ -3028,9 +3037,12 @@ fn link_flex_bidirectional_timepoint_returns_finite_transport() {
         dir_v[w_range.start] = -0.01;
     }
 
+    let cached = family
+        .build_cached_partition(&primary, a1, g, beta_h, beta_w)
+        .expect("active bidirectional cached partition");
     let active = family
-        .compute_survival_timepoint_bidirectional_exact(
-            0, &primary, q_geom.q1, primary.q1, a1, g, beta_h, beta_w, &dir_u, &dir_v,
+        .compute_survival_timepoint_bidirectional_exact_from_cached(
+            0, &primary, q_geom.q1, primary.q1, a1, g, beta_h, beta_w, &cached, &dir_u, &dir_v,
         )
         .expect("active bidirectional transport");
     assert!(active.eta_uv_uv.iter().all(|value| value.is_finite()));
@@ -7080,32 +7092,117 @@ fn flex_primary_timepoint_jets_for_test(
         Some((row, SurvivalInterceptSlotKind::Exit)),
     )?;
 
-    let entry_base = family.compute_survival_timepoint_exact(
-        row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, 0.0, false,
+    let entry_cached = family.build_cached_partition(&primary, a0, g, beta_h, beta_w)?;
+    let exit_cached = family.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
+
+    let entry_base = family.compute_survival_timepoint_exact_from_cached(
+        row,
+        &primary,
+        q0,
+        primary.q0,
+        a0,
+        g,
+        d0,
+        beta_h,
+        beta_w,
+        0.0,
+        false,
+        &entry_cached,
     )?;
-    let exit_base = family.compute_survival_timepoint_exact(
-        row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, 0.0, true,
+    let exit_base = family.compute_survival_timepoint_exact_from_cached(
+        row,
+        &primary,
+        q1,
+        primary.q1,
+        a1,
+        g,
+        d1,
+        beta_h,
+        beta_w,
+        0.0,
+        true,
+        &exit_cached,
     )?;
 
-    let entry_ext1 = family.compute_survival_timepoint_directional_exact(
-        row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, false,
+    let entry_ext1 = family.compute_survival_timepoint_directional_exact_from_cached(
+        row,
+        &primary,
+        q0,
+        primary.q0,
+        a0,
+        g,
+        beta_h,
+        beta_w,
+        &entry_cached,
+        dir1,
+        false,
     )?;
-    let exit_ext1 = family.compute_survival_timepoint_directional_exact(
-        row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, true,
+    let exit_ext1 = family.compute_survival_timepoint_directional_exact_from_cached(
+        row,
+        &primary,
+        q1,
+        primary.q1,
+        a1,
+        g,
+        beta_h,
+        beta_w,
+        &exit_cached,
+        dir1,
+        true,
     )?;
 
     let (entry_ext2, exit_ext2, entry_bi, exit_bi) = if let Some(dir2_arr) = dir2 {
-        let entry_ext2 = family.compute_survival_timepoint_directional_exact(
-            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir2_arr, false,
+        let entry_ext2 = family.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            beta_h,
+            beta_w,
+            &entry_cached,
+            dir2_arr,
+            false,
         )?;
-        let exit_ext2 = family.compute_survival_timepoint_directional_exact(
-            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir2_arr, true,
+        let exit_ext2 = family.compute_survival_timepoint_directional_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            beta_h,
+            beta_w,
+            &exit_cached,
+            dir2_arr,
+            true,
         )?;
-        let entry_bi = family.compute_survival_timepoint_bidirectional_exact(
-            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, dir1, dir2_arr,
+        let entry_bi = family.compute_survival_timepoint_bidirectional_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            beta_h,
+            beta_w,
+            &entry_cached,
+            dir1,
+            dir2_arr,
         )?;
-        let exit_bi = family.compute_survival_timepoint_bidirectional_exact(
-            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, dir1, dir2_arr,
+        let exit_bi = family.compute_survival_timepoint_bidirectional_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            beta_h,
+            beta_w,
+            &exit_cached,
+            dir1,
+            dir2_arr,
         )?;
         (
             Some(entry_ext2),

@@ -25,39 +25,6 @@ fn eval_poly_derivative_slice(coefficients: &[f64], z: f64) -> f64 {
 }
 
 impl SurvivalMarginalSlopeFamily {
-    /// Compute directional extensions of a timepoint's exact quantities.
-    /// Given the base `SurvivalFlexTimepointExact`, returns the directional
-    /// derivatives eta_uv_dir, chi_uv_dir, d_u_dir, d_uv_dir contracted
-    /// with `dir`.
-    pub(crate) fn compute_survival_timepoint_directional_exact(
-        &self,
-        row: usize,
-        primary: &FlexPrimarySlices,
-        q: f64,
-        q_index: usize,
-        a: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        dir: &Array1<f64>,
-        need_d_uv_dir: bool,
-    ) -> Result<SurvivalFlexTimepointDirectionalExact, String> {
-        let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
-        self.compute_survival_timepoint_directional_exact_from_cached(
-            row,
-            primary,
-            q,
-            q_index,
-            a,
-            b,
-            beta_h,
-            beta_w,
-            &cached,
-            dir,
-            need_d_uv_dir,
-        )
-    }
-
     pub(crate) fn compute_survival_timepoint_directional_exact_from_cached(
         &self,
         row: usize,

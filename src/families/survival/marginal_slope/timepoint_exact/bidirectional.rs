@@ -43,46 +43,6 @@ fn reciprocal_bilinear_jet(value: MultiDirJet) -> MultiDirJet {
 }
 
 impl SurvivalMarginalSlopeFamily {
-    /// Exact mixed bidirectional extension D_{d1} D_{d2} of the timepoint
-    /// quantities. This carries the calibration solve, observed eta/chi
-    /// transport, and density-normalization transport analytically.
-    pub(crate) fn compute_survival_timepoint_bidirectional_exact(
-        &self,
-        row: usize,
-        primary: &FlexPrimarySlices,
-        q: f64,
-        q_index: usize,
-        a: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        dir1: &Array1<f64>,
-        dir2: &Array1<f64>,
-    ) -> Result<SurvivalFlexTimepointBiDirectionalExact, String> {
-        self.compute_survival_timepoint_bidirectional_exact_full(
-            row, primary, q, q_index, a, b, beta_h, beta_w, dir1, dir2,
-        )
-    }
-
-    pub(crate) fn compute_survival_timepoint_bidirectional_exact_full(
-        &self,
-        row: usize,
-        primary: &FlexPrimarySlices,
-        q: f64,
-        q_index: usize,
-        a: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        dir1: &Array1<f64>,
-        dir2: &Array1<f64>,
-    ) -> Result<SurvivalFlexTimepointBiDirectionalExact, String> {
-        let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
-        self.compute_survival_timepoint_bidirectional_exact_from_cached(
-            row, primary, q, q_index, a, b, beta_h, beta_w, &cached, dir1, dir2,
-        )
-    }
-
     pub(crate) fn compute_survival_timepoint_bidirectional_exact_from_cached(
         &self,
         row: usize,
