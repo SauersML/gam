@@ -1287,6 +1287,43 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         Ok(dirs)
     }
 
+    fn nfree_tensor_gradient_hyper_dirs(
+        &mut self,
+        theta: &Array1<f64>,
+    ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
+        let psi = &theta
+            .as_slice()
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "nfree_tensor_gradient_hyper_dirs: theta is not contiguous".to_string(),
+                )
+            })?[self.rho_dim..];
+        let (global_range, p_total, s_psi_components) = self
+            .realizer
+            .canonical_penalty_derivatives_at_psi(&self.spatial_terms, psi)
+            .map_err(EstimationError::InvalidInput)?;
+        let zero_x = crate::estimate::reml::HyperDesignDerivative::zero(
+            self.realizer.design().design.nrows(),
+            p_total,
+        );
+        let components = s_psi_components
+            .into_iter()
+            .enumerate()
+            .map(|(penalty_index, local)| {
+                (
+                    penalty_index,
+                    crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                        local,
+                        global_range.clone(),
+                        p_total,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(DirectionalHyperParam::new_compact(zero_x, components, None, None)?.not_penalty_like())
+            .map(|dir| vec![dir])
+    }
+
     fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
         if self
             .current_theta
@@ -2575,11 +2612,17 @@ impl<'d> SpatialJointContext<'d> {
         // Stage through a shared helper because cost-only line-search probes use
         // the same first-Fisher-step Gram; they simply pass `allow_gradient=false`.
         self.stage_frozen_glm_trial_statistics(theta, warm_beta.as_ref(), !allow_second_order)?;
-        // #1033: reuse the ψ-invariant hyper-direction slab when the realized
-        // design has not advanced (the certified Gaussian skip path never
-        // re-realizes it), retiring the per-trial basis ψ-derivative + O(n·k²)
-        // rotation rebuild. A slow-path trial advances the revision and rebuilds.
-        let hyper_dirs = self.cache.hyper_dirs_for_current_design(self.data, kind)?;
+        // #1033: on the certified Gaussian skip path the value and ψ-gradient
+        // are both served by k-space tensor statistics, so the row-wise X_ψ slab
+        // is dead. Build only the exact n-free S_ψ components from frozen
+        // geometry and attach a zero-storage design derivative placeholder.
+        // Edge-gradient/Hessian/non-certified trials keep the exact row-wise
+        // builder, because those lanes genuinely consume X_ψ.
+        let hyper_dirs = if skip_design_realization {
+            self.cache.nfree_tensor_gradient_hyper_dirs(theta)?
+        } else {
+            self.cache.hyper_dirs_for_current_design(self.data, kind)?
+        };
 
         let design_revision = Some(self.cache.design_revision());
         // #1033 penalty lane: stage the EXACT n-free `S(ψ)` for this trial so the
@@ -4969,6 +5012,175 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             "nfree-psi-penalty",
         )
         .map_err(|e| e.to_string())
+    }
+
+    fn canonical_penalty_derivatives_at_psi(
+        &mut self,
+        spatial_terms: &[usize],
+        psi: &[f64],
+    ) -> Result<(Range<usize>, usize, Vec<Array2<f64>>), String> {
+        if spatial_terms.len() != 1 {
+            return Err(format!(
+                "n-free penalty derivative re-key requires exactly one spatial term, found {}",
+                spatial_terms.len()
+            ));
+        }
+        let term_idx = spatial_terms[0];
+        let (ls_opt, aniso_from_psi) = spatial_term_psi_to_length_scale_and_aniso(psi);
+        let termspec =
+            self.spec.smooth_terms.get(term_idx).ok_or_else(|| {
+                format!("spatial term {term_idx} out of range for n-free penalty derivative")
+            })?;
+        let term = self
+            .design
+            .smooth
+            .terms
+            .get(term_idx)
+            .ok_or_else(|| format!("realized smooth term {term_idx} out of range"))?;
+        let p_total = self.design.design.ncols();
+        let smooth_start = p_total.saturating_sub(self.design.smooth.total_smooth_cols());
+        let global_range = (smooth_start + term.coeff_range.start)
+            ..(smooth_start + term.coeff_range.end);
+
+        let locals = match &term.metadata {
+            BasisMetadata::Duchon {
+                centers,
+                identifiability_transform,
+                operator_collocation_points,
+                power,
+                nullspace_order,
+                aniso_log_scales,
+                input_scales,
+                ..
+            } => {
+                let mut spec = match &termspec.basis {
+                    SmoothBasisSpec::Duchon { spec, .. } => spec.clone(),
+                    _ => {
+                        return Err(
+                            "Duchon n-free penalty derivative requires a Duchon term spec"
+                                .to_string(),
+                        );
+                    }
+                };
+                let effective_ls = match input_scales.as_deref() {
+                    Some(scales) => {
+                        compensate_optional_length_scale_for_standardization(ls_opt, scales)
+                    }
+                    None => ls_opt,
+                };
+                spec.length_scale = effective_ls;
+                spec.power = *power;
+                spec.nullspace_order = *nullspace_order;
+                spec.aniso_log_scales = aniso_log_scales.clone();
+                if spec.length_scale.is_none() {
+                    return Err(
+                        "Duchon n-free penalty derivative requires a hybrid length-scale"
+                            .to_string(),
+                    );
+                }
+                let collocation = operator_collocation_points
+                    .as_ref()
+                    .map(|points| points.view())
+                    .unwrap_or_else(|| centers.view());
+                let (_sources, first, _second) =
+                    crate::basis::build_duchon_operator_penalty_psi_derivatives(
+                        collocation,
+                        centers.view(),
+                        &spec,
+                        identifiability_transform.as_ref(),
+                        &mut self.basisworkspace,
+                    )
+                    .map_err(|e| e.to_string())?;
+                first
+            }
+            BasisMetadata::Matern {
+                centers,
+                periodic,
+                nu,
+                include_intercept,
+                identifiability_transform,
+                aniso_log_scales,
+                input_scales,
+                ..
+            } => {
+                let ls = ls_opt.ok_or_else(|| {
+                    "Matérn n-free penalty derivative requires a finite length-scale".to_string()
+                })?;
+                let effective_ls = match input_scales.as_deref() {
+                    Some(scales) => compensate_length_scale_for_standardization(ls, scales),
+                    None => ls,
+                };
+                let penalty_centers =
+                    crate::basis::expand_periodic_centers(&centers.to_owned(), periodic.as_deref())
+                        .map_err(|e| e.to_string())?;
+                let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
+                let (first, _second) = crate::basis::build_matern_operator_penalty_psi_derivatives(
+                    penalty_centers.view(),
+                    effective_ls,
+                    *nu,
+                    *include_intercept,
+                    identifiability_transform.as_ref(),
+                    aniso_for_penalty,
+                )
+                .map_err(|e| e.to_string())?;
+                first
+            }
+            BasisMetadata::ThinPlate {
+                centers,
+                identifiability_transform,
+                radial_reparam,
+                ..
+            } => {
+                let ls = ls_opt.ok_or_else(|| {
+                    "thin-plate n-free penalty derivative requires a finite length-scale"
+                        .to_string()
+                })?;
+                let mut spec = match &termspec.basis {
+                    SmoothBasisSpec::ThinPlate { spec, .. } => spec.clone(),
+                    _ => {
+                        return Err(
+                            "thin-plate n-free penalty derivative requires a ThinPlate term spec"
+                                .to_string(),
+                        );
+                    }
+                };
+                spec.length_scale = ls;
+                if spec.radial_reparam.is_none() {
+                    spec.radial_reparam = radial_reparam.clone();
+                }
+                let (primary, _primary_second) =
+                    crate::basis::build_thin_plate_penalty_psi_derivativeswithworkspace(
+                        centers.view(),
+                        &spec,
+                        identifiability_transform.as_ref(),
+                        &mut self.basisworkspace,
+                    )
+                    .map_err(|e| e.to_string())?;
+                if self.design.penalties.len() > 1 {
+                    vec![
+                        primary.clone(),
+                        Array2::<f64>::zeros(primary.raw_dim()),
+                    ]
+                } else {
+                    vec![primary]
+                }
+            }
+            other => {
+                return Err(format!(
+                    "n-free penalty derivative re-key unsupported for basis metadata {:?}",
+                    std::mem::discriminant(other)
+                ));
+            }
+        };
+        if locals.len() != self.design.penalties.len() {
+            return Err(format!(
+                "n-free penalty derivative re-key produced {} blocks but the frozen design carries {} \
+                 — penalty topology is not ψ-stable",
+                locals.len(),
+                self.design.penalties.len()
+            ));
+        }
+        Ok((global_range, p_total, locals))
     }
 
     fn apply_log_kappa(
