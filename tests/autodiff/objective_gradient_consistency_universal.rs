@@ -1363,15 +1363,27 @@ fn assert_survival_grad_matches_cancellation_free_oracle(
         clean_fd_acc += d_pnll + half_tr - d_half_lds;
     }
     let clean_fd = clean_fd_acc / steps.len() as f64;
+    // DIAGNOSTIC dump (per-step term split) to quantify the β̂-chain scatter on
+    // the ~0.5-magnitude half_tr term vs the tiny total gradient.
+    for &h in &steps {
+        let (_gp, _ldsp, pnll_p, hp, _rp) =
+            model.survival_converged_mode_at_rho(&[rho + h], beta0).unwrap();
+        let (_gm, _ldsm, pnll_m, hm, _rm) =
+            model.survival_converged_mode_at_rho(&[rho - h], beta0).unwrap();
+        let d_pnll = (pnll_p - pnll_m) / (2.0 * h);
+        let dh = (&hp - &hm).mapv(|v| v / (2.0 * h));
+        let hinv_dh = hinv.dot(&dh);
+        let half_tr = 0.5 * (hinv_dh[[0, 0]] + hinv_dh[[1, 1]]);
+        println!(
+            "[931-TR] rho={rho} h={h:.1e} d_pnll={d_pnll:.6e} half_tr={half_tr:.9e} half_tr-0.5rank={:.6e} total={:.6e} analytic={analytic:.6e}",
+            half_tr - 0.5 * rank as f64,
+            d_pnll + half_tr - 0.5 * rank as f64
+        );
+    }
     let scale = analytic.abs().max(clean_fd.abs()).max(1.0e-3);
     let rel = (analytic - clean_fd).abs() / scale;
-    assert!(
-        rel < tol_rel,
-        "#931 extreme-λ analytic ρ-gradient disagrees with the cancellation-free \
-         trace-FD oracle at rho={rho}: analytic={analytic:.9e}, clean_fd={clean_fd:.9e}, \
-         rel={rel:.3e} (>= tol {tol_rel:.1e}). The analytic gradient and the value's \
-         ρ-derivative (reconstructed cancellation-free) have drifted apart."
-    );
+    println!("[931-TR] rho={rho}: analytic={analytic:.9e} clean_fd={clean_fd:.9e} rel={rel:.3e}");
+    let _ = tol_rel;
 }
 
 #[test]
@@ -1384,6 +1396,7 @@ fn survival_objective_gradient_consistent_at_extreme_lambda_via_trace_oracle() {
     for rho in [6.0_f64, 8.0_f64] {
         assert_survival_grad_matches_cancellation_free_oracle(&model, &beta0, rho, 2.0e-2);
     }
+    panic!("[931-TR] diagnostic dump complete");
 }
 
 // --- Regime R2: near-degenerate eigenvalue pair (Daleckii–Krein) -------
