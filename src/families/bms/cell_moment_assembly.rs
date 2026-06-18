@@ -3714,6 +3714,42 @@ mod empirical_flex_jet_oracle_tests {
     }
 
     #[test]
+    #[ignore = "diagnostic: is link_dev H[q,q] an unsound witness or a real bug? (#932)"]
+    fn debug_link_dev_hqq_witness_soundness() {
+        // Decide whether empirical_flex_link_dev's H[0,0]=[q,q] failure is an
+        // UNSOUND WITNESS (production analytic H correct; the secant-calibration
+        // FD witness blows up at the steep order-3 link with beta_dev=0.66) vs a
+        // REAL link-dev Hessian bug. Sweep the deviation-coefficient SCALE: a
+        // sound production H varies smoothly and tracks the witness at small
+        // scale (where the FD is well-conditioned), while an unsound witness
+        // diverges only as the scale (link steepness) grows.
+        let fx = make_fixture(false);
+        let r = fx.primary.total;
+        let q0 = 0.2_f64;
+        let b0 = 0.35_f64;
+        let q = fx.primary.q;
+        let dev_range = fx.primary.w.clone().unwrap();
+        for scale in [0.1_f64, 0.25, 0.5, 1.0] {
+            let mut fxs = make_fixture(false);
+            fxs.beta_dev = fx.beta_dev.mapv(|v| v * scale);
+            let mut p0 = vec![0.0; r];
+            p0[fx.primary.q] = q0;
+            p0[fx.primary.logslope] = b0;
+            for (k, i) in dev_range.clone().enumerate() {
+                p0[i] = fxs.beta_dev[k];
+            }
+            let prod = prod_flex_coeff(&fxs, &p0, &[q, q]);
+            let wit_coarse = central_along(&fxs, &p0, &[(q, 2)], 2e-3);
+            let wit_fine = central_along(&fxs, &p0, &[(q, 2)], 5e-4);
+            let max_beta = fxs.beta_dev.iter().cloned().fold(0.0_f64, |m, v| m.max(v.abs()));
+            eprintln!(
+                "scale={scale:.2} max|beta|={max_beta:.3}: prod H[q,q]={prod:+.6e} wit(h=2e-3)={wit_coarse:+.6e} wit(h=5e-4)={wit_fine:+.6e} (witness h-stable? gap={:.2e})",
+                (wit_coarse - wit_fine).abs()
+            );
+        }
+    }
+
+    #[test]
     fn empirical_flex_contracted_recompute_matches_witness_and_catches_sign_flip() {
         // Exercise the row_{third,fourth}_contracted_recompute entry points
         // (the production-facing API) and confirm the independent witness both
