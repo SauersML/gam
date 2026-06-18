@@ -1301,17 +1301,18 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
                 )
         }
         // Constant-curvature geodesic kernel: same #531 collision class as the
-        // Wahba sphere — the coefficient-space sum-to-zero `z` leaves the
-        // realized `K·z` design spanning the constant on the data rows, so the
-        // global parametric orthogonalization must compose onto `z` (#532).
+        // raw finite-center Wahba sphere. Its coefficient-space sum-to-zero `z`
+        // leaves the realized `K·z` design spanning the constant on the data
+        // rows, so the global parametric orthogonalization must compose onto
+        // `z` (#532).
         SmoothBasisSpec::ConstantCurvature { spec, .. } => matches!(
             spec.identifiability,
             ConstantCurvatureIdentifiability::CenterSumToZero
         ),
-        // Measure-jet representer: identical #531 collision class — Gaussian
-        // RBF columns times the center-space sum-to-zero `z` still span the
-        // constant on the data rows, so `z` must absorb the parametric
-        // orthogonalization (#532).
+        // Measure-jet representer: identical #531 collision class to the raw
+        // finite-center Wahba sphere. Gaussian RBF columns times the
+        // center-space sum-to-zero `z` still span the constant on the data rows,
+        // so `z` must absorb the parametric orthogonalization (#532).
         SmoothBasisSpec::MeasureJet { spec, .. } => matches!(
             spec.identifiability,
             MeasureJetIdentifiability::CenterSumToZero

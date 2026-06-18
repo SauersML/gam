@@ -5,7 +5,7 @@
 //! difference) in latitude then longitude and compare the resulting numeric
 //! derivative against the analytic jet returned by
 //! [`spherical_spline_design_jet`]. The jet must align column-for-column with
-//! the forward design (same sum-to-zero transform for the Wahba kernels, same
+//! the forward design (same raw-or-frozen transform for the Wahba kernels, same
 //! real-spherical-harmonic column order for harmonic), so the comparison is a
 //! direct entrywise relative-error check.
 
@@ -28,7 +28,7 @@ fn sample_points() -> Array2<f64> {
 }
 
 /// Explicit Wahba centers (degrees) — fixed across point perturbations so the
-/// sum-to-zero transform `z` is identical at `points` and `points ± h`.
+/// raw/frozen transform `z` is identical at `points` and `points ± h`.
 fn sample_centers() -> Array2<f64> {
     ndarray::array![
         [0.0, 0.0],
