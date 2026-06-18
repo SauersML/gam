@@ -1762,8 +1762,11 @@ class ManifoldSAE:
         kind = _canonical_assignment(self.assignment, "assignment")
         if t_init is None and a_init is None and self._oos_projection_top1:
             return self._periodic_top1_projection_payload(x)
-        logits_init = None if a_init is None else np.ascontiguousarray(np.asarray(a_init, dtype=float))
-        coords_init = None if t_init is None else np.ascontiguousarray(np.asarray(t_init, dtype=float))
+        if t_init is None and a_init is None:
+            coords_init, logits_init = self._nearest_training_latent_seed(x)
+        else:
+            logits_init = None if a_init is None else np.ascontiguousarray(np.asarray(a_init, dtype=float))
+            coords_init = None if t_init is None else np.ascontiguousarray(np.asarray(t_init, dtype=float))
         payload = rust_module().sae_manifold_predict_oos(
             np.ascontiguousarray(x), list(self._basis_kinds), list(self._atom_dims),
             [np.ascontiguousarray(b) for b in self.decoder_blocks],
@@ -1782,6 +1785,58 @@ class ManifoldSAE:
             hybrid_linear_images=self._hybrid_linear_images_for_oos(),
         )
         return dict(payload)
+
+    def _nearest_training_latent_seed(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Seed OOS refinement from the fitted train row in the same activation
+        basin (#1026).
+
+        The frozen-decoder OOS objective is non-convex on periodic atoms. A cold
+        PCA/projection seed can land long-tailed held-out activations in the
+        wrong chart basin even when a nearby training row already converged to
+        the right atom coordinates and routing. Use nearest-neighbor transfer as
+        the default OOS seed; the Rust fixed-decoder solve still performs the
+        actual refinement and returns the converged latents.
+        """
+        train = np.asarray(self.training_data, dtype=float)
+        if train.ndim != 2 or x.ndim != 2 or train.shape[1] != x.shape[1]:
+            raise ValueError(
+                "OOS seed requires X to have the same feature dimension as the "
+                f"training data; got X shape {x.shape}, train shape {train.shape}"
+            )
+        n = int(x.shape[0])
+        k = len(self.coords)
+        d_max = max((int(d) for d in self._atom_dims), default=1)
+        coords_seed = np.zeros((k, n, d_max), dtype=float)
+        if n == 0:
+            return np.ascontiguousarray(coords_seed), np.zeros((0, k), dtype=float)
+
+        train_sq = np.einsum("ij,ij->i", train, train, optimize=True)
+        x_sq = np.einsum("ij,ij->i", x, x, optimize=True)
+        nearest = np.empty(n, dtype=np.int64)
+        # Keep the distance slab bounded for large OOS batches while preserving
+        # exact nearest-neighbor semantics.
+        chunk_rows = max(1, min(n, max(1, 2_000_000 // max(1, train.shape[0]))))
+        for start in range(0, n, chunk_rows):
+            stop = min(n, start + chunk_rows)
+            d2 = x_sq[start:stop, None] + train_sq[None, :] - 2.0 * x[start:stop] @ train.T
+            nearest[start:stop] = np.argmin(d2, axis=1)
+
+        for atom_idx, coord in enumerate(self.coords):
+            c = np.asarray(coord, dtype=float)
+            d = int(self._atom_dims[atom_idx])
+            if c.ndim != 2 or c.shape[0] != train.shape[0] or c.shape[1] < d:
+                raise ValueError(
+                    "stored SAE coordinates are incompatible with training data: "
+                    f"atom {atom_idx} coords shape {c.shape}, train rows {train.shape[0]}, dim {d}"
+                )
+            coords_seed[atom_idx, :, :d] = c[nearest, :d]
+        logits = np.asarray(self.low_level_logits, dtype=float)
+        if logits.ndim != 2 or logits.shape != (train.shape[0], k):
+            raise ValueError(
+                "stored SAE logits are incompatible with training data: "
+                f"logits shape {logits.shape}, expected {(train.shape[0], k)}"
+            )
+        return np.ascontiguousarray(coords_seed), np.ascontiguousarray(logits[nearest])
 
     def _hybrid_linear_images_for_oos(
         self,
