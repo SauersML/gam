@@ -2405,36 +2405,6 @@ fn debug_flex_directional_quantities_fd_localize() {
                 i + 1, dir_terms[i], fd_i, (dir_terms[i] - fd_i).abs()
             );
         }
-        // Per-poly check: ∫chi_u·m and ∫eta_u·m base vs analytic D_dir.
-        let polys_base = |s: f64| -> [f64; 2] {
-            let q = q1v + s * dir[primary.q1];
-            let g = gv + s * dir[primary.g];
-            let (a, _d) = family
-                .solve_row_survival_intercept_with_slot(
-                    q, g, Some(&beta_h), Some(&beta_w),
-                    Some((0, SurvivalInterceptSlotKind::Exit)),
-                )
-                .expect("perturbed poly intercept");
-            family
-                .compute_survival_timepoint_directional_exact(
-                    0, &primary, q, primary.q1, a, g, Some(&beta_h), Some(&beta_w), &dir, true,
-                )
-                .expect("perturbed poly")
-                .debug_d_u_polys
-                .expect("polys")
-                .0
-        };
-        let analytic = ext.debug_d_u_polys.expect("polys").1;
-        let bp = polys_base(h);
-        let bm = polys_base(-h);
-        let names = ["chi_u", "eta_u"];
-        for i in 0..2 {
-            let fd_i = (bp[i] - bm[i]) / (2.0 * h);
-            eprintln!(
-                "[w0] poly {} ∫·m: D_dir(analytic-total)={:+.6e} fd={:+.6e} gap={:.2e}",
-                names[i], analytic[i], fd_i, (analytic[i] - fd_i).abs()
-            );
-        }
     }
     // Scalar/first-order base quantities to localize the eta_uv_dir error:
     // chi_dir (=D_dir chi), eta_dir (=D_dir eta), and D_dir eta_u[u].

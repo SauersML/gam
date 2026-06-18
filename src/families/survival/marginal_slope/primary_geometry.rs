@@ -274,13 +274,6 @@ pub(crate) struct SurvivalFlexTimepointDirectionalExact {
     /// builds; `None` otherwise.
     #[cfg(test)]
     pub(crate) debug_d_uv_terms: Option<([f64; 5], [f64; 5])>,
-    /// #932 debug: for the w0 probe in the d_u_dir block, the base cell-poly
-    /// integrals (∫chi_u·m, ∫eta_u·m) and their analytic full directional
-    /// derivatives D_dir(∫chi_u·m), D_dir(∫eta_u·m). The harness FDs the base
-    /// pair and compares to the dir pair to pin which per-u poly's D_dir drops
-    /// the β_w cross / a-chain.
-    #[cfg(test)]
-    pub(crate) debug_d_u_polys: Option<([f64; 2], [f64; 2])>,
 }
 
 pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {
