@@ -4915,12 +4915,21 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
          skip gate can fire; ψ_b={psi_b:.6} (covers={covers_b}) ψ_c={psi_c:.6} \
          (covers={covers_c})"
     );
+    let installed_gram =
+        |e: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> ndarray::Array2<f64> {
+            e.reml_state
+                .installed_gaussian_fixed_cache()
+                .expect("installed Gaussian Gram cache")
+                .xtwx_orig
+                .clone()
+        };
 
     // Trial 2 (ψ_B): value-covered ⇒ the production gate fires the skip (no
     // slow-path reset), regardless of the basis-equality witness verdict.
     let before_b = tensor_eval.slow_path_reset_count();
     let (c_b, _g_b, beta_b) =
         eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b), false);
+    let g_fast_b = installed_gram(&tensor_eval);
     let after_b = tensor_eval.slow_path_reset_count();
     assert_eq!(
         after_b - before_b,
@@ -4954,6 +4963,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     let before_c = tensor_eval.slow_path_reset_count();
     let (c_c, _g_c, beta_c) =
         eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c), false);
+    let g_fast_c = installed_gram(&tensor_eval);
     let after_c = tensor_eval.slow_path_reset_count();
     assert_eq!(
         after_c - before_c,
@@ -5025,24 +5035,25 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // error can account for through a κ-conditioned solve, and this upper bound
     // fires on it. κ is itself asserted finite/bounded so the bar can't be inflated
     // by a degenerate Hessian.
-    let gram_condition_number = |evaluator: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> f64 {
-        // `FaerEigh` is imported at module top (`use crate::faer_ndarray::FaerEigh`).
-        let cache = evaluator
-            .reml_state
-            .installed_gaussian_fixed_cache()
-            .expect("installed Gaussian Gram cache");
-        let g = &cache.xtwx_orig;
-        let sym = 0.5 * (g + &g.t());
-        let (evals, _) = sym.eigh(faer::Side::Lower).expect("Gram eigh");
-        let lo = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        let hi = evals.iter().cloned().fold(0.0_f64, f64::max);
-        hi / lo.max(1e-300)
-    };
+    let gram_condition_number =
+        |evaluator: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> f64 {
+            // `FaerEigh` is imported at module top (`use crate::faer_ndarray::FaerEigh`).
+            let cache = evaluator
+                .reml_state
+                .installed_gaussian_fixed_cache()
+                .expect("installed Gaussian Gram cache");
+            let g = &cache.xtwx_orig;
+            let sym = 0.5 * (g + &g.t());
+            let (evals, _) = sym.eigh(faer::Side::Lower).expect("Gram eigh");
+            let lo = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = evals.iter().cloned().fold(0.0_f64, f64::max);
+            hi / lo.max(1e-300)
+        };
     const SOUNDNESS_SAFETY: f64 = 64.0;
     let mut worst = 0.0_f64;
-    for (label, theta, beta_fast) in [
-        ("psi_b", theta_at(psi_b), &beta_b),
-        ("psi_c", theta_at(psi_c), &beta_c),
+    for (label, theta, beta_fast, g_fast) in [
+        ("psi_b", theta_at(psi_b), &beta_b, &g_fast_b),
+        ("psi_c", theta_at(psi_c), &beta_c, &g_fast_c),
     ] {
         let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta);
         // GATE 1b INLINE — the LOAD-BEARING INPUT to the conditioning conclusion:
@@ -5052,15 +5063,6 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         // β̂ INPUT error is genuine round-off ON THIS DUCHON FIXTURE — without it,
         // a β̂rel~1e-5 could be unconverted INPUT error, not amplification, and the
         // conditioning-aware β̂ tolerance would be unjustified (closer-1's gate).
-        let installed_gram =
-            |e: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> ndarray::Array2<f64> {
-                e.reml_state
-                    .installed_gaussian_fixed_cache()
-                    .expect("installed Gaussian Gram cache")
-                    .xtwx_orig
-                    .clone()
-            };
-        let g_fast = installed_gram(&tensor_eval);
         let g_exact = installed_gram(&streamed_eval);
         assert_eq!(g_fast.dim(), g_exact.dim(), "@ {label}: Gram dim mismatch");
         let gram_scale = g_exact.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));

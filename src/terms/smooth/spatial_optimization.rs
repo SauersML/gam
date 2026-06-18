@@ -1401,6 +1401,11 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
             .supports_nfree_penalty_rekey(&self.spatial_terms)
     }
 
+    fn supports_nfree_gradient_only_routing(&self) -> bool {
+        self.realizer
+            .supports_nfree_gradient_only_routing(&self.spatial_terms)
+    }
+
     /// Build the EXACT canonical penalty surface `S(ψ)` at the length-scale
     /// implied by `theta`'s ψ tail, entirely n-free (#1033). Maps ψ→length-scale
     /// with the IDENTICAL `spatial_term_psi_to_length_scale_and_aniso` the slow
@@ -3101,9 +3106,13 @@ fn run_exact_joint_spatial_optimization(
         // once the lane is armed. This keeps every in-window κ-trial on the n-free
         // `ValueAndGradient` skip, delivering the n-independent outer loop. The
         // exact second-order geometry is preserved whenever the lane is NOT armed
-        // (non-Gaussian, multi-term, or an uncertified window), where it still pays
-        // O(n) per Hessian but correctly.
-        if attached && evaluator.supports_nfree_penalty_rekey() {
+        // for gradient-only routing (non-Gaussian, multi-term, Matérn, or an
+        // uncertified window), where it still pays O(n) per Hessian but keeps the
+        // quality-sensitive exact second-order path.
+        if attached
+            && evaluator.supports_nfree_penalty_rekey()
+            && cache.supports_nfree_gradient_only_routing()
+        {
             suppress_outer_hessian_for_nfree = true;
             prefer_gradient_only = true;
             log::info!(
@@ -4747,6 +4756,25 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     | BasisMetadata::ThinPlate { .. }
                     | BasisMetadata::Matern { .. }
             )
+        )
+    }
+
+    /// True when the armed n-free Gaussian lane should suppress exact outer
+    /// Hessians and route κ search through gradient-only BFGS.
+    ///
+    /// This is deliberately narrower than [`Self::supports_nfree_penalty_rekey`]:
+    /// Matérn has an exact n-free operator-triplet `S(ψ)` re-key (#1274), but its
+    /// quality gate still depends on the exact second-order outer route. Duchon
+    /// and ThinPlate are the #1033 n-independent acceptance lane where the exact
+    /// Hessian slab is the remaining O(n) per-trial cost.
+    fn supports_nfree_gradient_only_routing(&self, spatial_terms: &[usize]) -> bool {
+        if spatial_terms.len() != 1 {
+            return false;
+        }
+        let term_idx = spatial_terms[0];
+        matches!(
+            self.design.smooth.terms.get(term_idx).map(|t| &t.metadata),
+            Some(BasisMetadata::Duchon { .. } | BasisMetadata::ThinPlate { .. })
         )
     }
 
