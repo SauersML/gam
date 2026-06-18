@@ -35,7 +35,7 @@ fn fit_options() -> FitOptions {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        compute_inference: false,
+        compute_inference: true, // need edf_total()/edf_by_block() (read from inference)
         skip_rho_posterior_inference: false,
         max_iter: 200,
         tol: 1e-10,
@@ -154,13 +154,22 @@ fn double_penalty_edf_inflation_localization_1266() {
         let edf_off = fit_off.fit.edf_total().unwrap_or(f64::NAN);
         // Double penalty ships [primary(bend), DoublePenaltyNullspace(ridge)] in
         // that order; lambdas align with the canonical penalty list.
-        let lam = fit_on.fit.lambdas.as_slice();
+        let lam = fit_on.fit.lambdas.to_vec();
         let lambda_bend = lam.first().copied().unwrap_or(f64::NAN);
         let lambda_null = lam.get(1).copied().unwrap_or(f64::NAN);
+        // Per-block EDF: with one smooth term the double penalty's two blocks
+        // (range/bend and null/ridge) are reported as edf_by_block. The split
+        // says whether the inflation is the RANGE (wiggle) or NULL block.
+        let edf_blocks = fit_on.fit.edf_by_block();
+        let edf_block_str = edf_blocks
+            .iter()
+            .map(|v| format!("{v:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
 
         eprintln!(
             "[1266-repro] {seed:>4}  {edf_on:>10.4}  {edf_off:>10.4}  {lambda_bend:>14.4e}  \
-             {lambda_null:>14.4e}  {:>12.4}",
+             {lambda_null:>14.4e}  {:>12.4}  edf_by_block=[{edf_block_str}]",
             fit_on.fit.reml_score
         );
         on_vals.push(edf_on);
