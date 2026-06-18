@@ -3092,7 +3092,26 @@ fn run_exact_joint_spatial_optimization(
         })();
         // END-FD-OK
         match audit {
-            Ok(audit) => audit.log_verdict("spatial-exact-joint"),
+            Ok(audit) => {
+                audit.log_verdict("spatial-exact-joint");
+                if coord_dim > 1 {
+                    let psi_grad = audit
+                        .components
+                        .iter()
+                        .filter(|component| component.index >= rho_dim)
+                        .map(|component| component.analytic)
+                        .collect::<Vec<_>>();
+                    if psi_grad.len() >= 2 {
+                        let contrast = psi_grad[0] - psi_grad[1];
+                        eprintln!(
+                            "[ANISO-CONTRAST-GRAD/spatial-exact-joint] theta0 psi_grad={psi_grad:?} first_contrast={contrast:.6e}"
+                        );
+                        log::warn!(
+                            "[ANISO-CONTRAST-GRAD/spatial-exact-joint] theta0 psi_grad={psi_grad:?} first_contrast={contrast:.6e}"
+                        );
+                    }
+                }
+            }
             Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
         }
     }
