@@ -285,7 +285,7 @@ pub fn build_bspline_basis_1d(
         {
             s_bend_raw += &shrinkage.sym_penalty;
         }
-        let mut penalties_raw = vec![PenaltyCandidate {
+        let penalties_raw = vec![PenaltyCandidate {
             matrix: s_bend_raw.clone(),
             nullspace_dim_hint: 0,
             source: PenaltySource::Primary,
@@ -482,7 +482,7 @@ pub fn build_bspline_basis_1d(
     {
         s_bend_raw += &shrinkage.sym_penalty;
     }
-    let mut penalties_raw = vec![PenaltyCandidate {
+    let penalties_raw = vec![PenaltyCandidate {
         matrix: s_bend_raw.clone(),
         nullspace_dim_hint: 0,
         source: PenaltySource::Primary,
