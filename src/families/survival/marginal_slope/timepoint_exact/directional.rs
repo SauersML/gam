@@ -640,8 +640,10 @@ impl SurvivalMarginalSlopeFamily {
                     );
                 }
 
+                let eta_aaa_poly = fixed.dc_daaa.to_vec();
                 let mut coeff_dir_poly = vec![0.0; 4];
                 let mut coeff_a_dir_poly = vec![0.0; 4];
+                let mut coeff_aa_dir_poly = vec![0.0; 4];
                 for c in 0..p {
                     if dir[c] == 0.0 {
                         continue;
@@ -649,9 +651,15 @@ impl SurvivalMarginalSlopeFamily {
                     for k in 0..4 {
                         coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
                         coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
+                        coeff_aa_dir_poly[k] += fixed.coeff_aau[c][k] * dir[c];
                     }
                 }
+                // TOTAL directional derivatives of the cell index jets (chain
+                // through both the direct params AND the calibration intercept a):
+                //   D_dir(η)    = chi·a_dir + ∂c/∂(direct)
+                //   D_dir(∂c/∂a)= eta_aa·a_dir + ∂²c/∂a∂(direct)
                 let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
+                let chi_dir_poly = poly_add(&poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly);
 
                 for u in 0..p {
                     let mut eta_u_dir_fixed = vec![0.0; 4];
@@ -667,20 +675,37 @@ impl SurvivalMarginalSlopeFamily {
                             chi_u_dir_fixed[k] += sca[k] * dir[c];
                         }
                     }
+                    // TOTAL D_dir(eta_u) = D_dir(chi·a_u + ∂c/∂u)
+                    //   = chi_dir·a_u + chi·a_u_dir + [∂²c/∂u∂(direct) + a_dir·∂²c/∂a∂u].
+                    // The intercept chain `a_dir·coeff_au[u]` and the `coeff_a_dir·a_u`
+                    // direct cross were dropped here, leaving d_u_dir/d_uv_dir wrong
+                    // at the deviation (β_w) indices once the link is curved
+                    // (gam#932/#979 — invisible at β=0 and on the q/g axes where
+                    // coeff_au/coeff_aau vanish).
                     let eta_u_dir_poly = poly_add(
                         &poly_add(
-                            &poly_scale(&chi_poly, a_u_dir[u]),
-                            &poly_scale(&eta_aa_poly, a_u[u] * a_dir),
+                            &poly_add(
+                                &poly_scale(&chi_poly, a_u_dir[u]),
+                                &poly_scale(&chi_dir_poly, a_u[u]),
+                            ),
+                            &eta_u_dir_fixed,
                         ),
-                        &eta_u_dir_fixed,
+                        &poly_scale(fixed.coeff_au[u].as_ref(), a_dir),
                     );
-                    let eta_aaa_poly = fixed.dc_daaa.to_vec();
+                    // TOTAL D_dir(chi_u) = D_dir(eta_aa·a_u + ∂²c/∂a∂u)
+                    //   = eta_aa_dir·a_u + eta_aa·a_u_dir
+                    //     + [∂³c/∂a∂u∂(direct) + a_dir·∂³c/∂a²∂u].
+                    let eta_aa_dir_poly =
+                        poly_add(&poly_scale(&eta_aaa_poly, a_dir), &coeff_aa_dir_poly);
                     let chi_u_dir_poly = poly_add(
                         &poly_add(
-                            &poly_scale(&eta_aa_poly, a_u_dir[u]),
-                            &poly_scale(&eta_aaa_poly, a_u[u] * a_dir),
+                            &poly_add(
+                                &poly_scale(&eta_aa_poly, a_u_dir[u]),
+                                &poly_scale(&eta_aa_dir_poly, a_u[u]),
+                            ),
+                            &chi_u_dir_fixed,
                         ),
-                        &chi_u_dir_fixed,
+                        &poly_scale(fixed.coeff_aau[u].as_ref(), a_dir),
                     );
 
                     // D_u integrand: chi_u - chi * eta * eta_u
@@ -688,12 +713,13 @@ impl SurvivalMarginalSlopeFamily {
                         &chi_u_poly[u],
                         &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
                     );
-                    // Polynomial derivative of integrand w.r.t. dir
+                    // Polynomial derivative of integrand w.r.t. dir, with the FULL
+                    // total D_dir(chi) = chi_dir_poly (not just its direct part).
                     let integrand_dir = poly_sub(
                         &poly_sub(
                             &poly_sub(
                                 &chi_u_dir_poly,
-                                &poly_mul(&poly_mul(&coeff_a_dir_poly, &eta_poly), &eta_u_poly[u]),
+                                &poly_mul(&poly_mul(&chi_dir_poly, &eta_poly), &eta_u_poly[u]),
                             ),
                             &poly_mul(&poly_mul(&chi_poly, &eta_dir_poly), &eta_u_poly[u]),
                         ),
