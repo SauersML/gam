@@ -62,7 +62,10 @@ fn anisotropic_penalty_contrast_derivative_matches_finite_difference() {
     };
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
     assert_eq!(deriv.penalties_first.len(), 2);
-    assert_eq!(deriv.penalties_first[0].len(), deriv.penalties_first[1].len());
+    assert_eq!(
+        deriv.penalties_first[0].len(),
+        deriv.penalties_first[1].len()
+    );
 
     let build_penalties_at = |delta: f64| {
         let mut trial = spec.clone();

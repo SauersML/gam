@@ -1000,8 +1000,7 @@ pub(crate) fn run_outer_with_plan(
                             // exactly as the BFGS branch does. A non-converged
                             // cost-stall flows into the same best-so-far
                             // non-convergence reporting as MaxIterations.
-                            let exit =
-                                cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
+                            let exit = cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
                             match exit {
                                 Some(exit) => Ok(outer_result_with_gradient_norm(
                                     exit.rho,

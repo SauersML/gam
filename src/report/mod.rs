@@ -397,7 +397,7 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
                 cert.analytic_directional,
                 cert.fd_directional, // fd-ok: FD-audit certificate, not in math path
                 cert.fd_error,       // fd-ok: FD-audit certificate, not in math path
-                cert.agreement_z // fd-ok: FD-audit certificate, not in math path
+                cert.agreement_z     // fd-ok: FD-audit certificate, not in math path
             )
         } else {
             let mut flags = Vec::new();

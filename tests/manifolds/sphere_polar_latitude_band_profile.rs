@@ -69,8 +69,7 @@ fn band_rmse(fit: &gam::StandardFitResult, lat_lo: f64, lat_hi: f64) -> f64 {
             row += 1;
         }
     }
-    let design =
-        build_term_collection_design(m.view(), &fit.resolvedspec).expect("predict design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("predict design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let mse = pred
         .iter()

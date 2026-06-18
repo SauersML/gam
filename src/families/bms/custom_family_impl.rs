@@ -100,8 +100,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // analytic first derivative, uses the BMS row-subsampled pilot schedule,
         // and avoids the K^2 Jeffreys/outer-Hessian setup entirely.
         if flex_active
-            && (self.y.len()
-                >= crate::custom_family::OuterDerivativePolicy::STAGED_KAPPA_TRIGGER_N
+            && (self.y.len() >= crate::custom_family::OuterDerivativePolicy::STAGED_KAPPA_TRIGGER_N
                 || !hvp_available)
         {
             if log_exact_work(self.y.len()) {
