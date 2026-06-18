@@ -2361,6 +2361,27 @@ fn debug_flex_directional_quantities_fd_localize() {
             ext.d_u_dir[u], d_u_fd, (ext.d_u_dir[u] - d_u_fd).abs()
         );
     }
+    // Scalar/first-order base quantities to localize the eta_uv_dir error:
+    // chi_dir (=D_dir chi), eta_dir (=D_dir eta), and D_dir eta_u[u].
+    eprintln!(
+        "scalar: chi base {:+.6e} D_dir(chi) fd {:+.6e} | eta base {:+.6e} D_dir(eta) fd {:+.6e}",
+        base.chi, fd(&|b| b.chi, 4e-3), base.eta, fd(&|b| b.eta, 4e-3),
+    );
+    for &u in &[q1, g] {
+        eprintln!(
+            "[{u}] eta_u base {:+.6e} D_dir(eta_u) fd {:+.6e} | chi_u base {:+.6e} D_dir(chi_u) fd {:+.6e}",
+            base.eta_u[u], fd(&|b| b.eta_u[u], 4e-3),
+            base.chi_u[u], fd(&|b| b.chi_u[u], 4e-3),
+        );
+    }
+    // Direct cross-check: FD of base eta_uv[q1,q1] sanity (recompute from a
+    // wider/narrower h to confirm the harness isn't aliasing the q-self term).
+    eprintln!(
+        "[q1,q1] eta_uv base {:+.6e} | eta_uv(+h) {:+.6e} eta_uv(-h) {:+.6e}",
+        base.eta_uv[[q1, q1]],
+        base_at(4e-3).eta_uv[[q1, q1]],
+        base_at(-4e-3).eta_uv[[q1, q1]],
+    );
 }
 
 #[test]
