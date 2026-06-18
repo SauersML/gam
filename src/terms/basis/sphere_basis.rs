@@ -466,16 +466,8 @@ pub(crate) fn build_spherical_harmonic_basis(
             col += 1;
         }
     }
-    let mut candidates = vec![PenaltyCandidate {
-        matrix: penalty,
-        nullspace_dim_hint: 0,
-        source: PenaltySource::Primary,
-        normalization_scale: 1.0,
-        kronecker_factors: None,
-        op: None,
-    }];
-    if spec.double_penalty {
-        let mut ridge = Array2::<f64>::eye(p);
+    let mut ridge = Array2::<f64>::eye(p);
+    {
         let mut col = 0usize;
         for l in 1..=l_max {
             for _ in 0..(2 * l + 1) {
@@ -485,6 +477,50 @@ pub(crate) fn build_spherical_harmonic_basis(
                 col += 1;
             }
         }
+    }
+
+    // Realized-design identifiability gauge (#1246). The global smooth
+    // identifiability pipeline can residualize this harmonic term against the
+    // model intercept / overlapping parametric columns and FREEZES the resulting
+    // column transform onto `spec.identifiability` as a `FrozenTransform` so that
+    // prediction reproduces the exact fit-time basis. Unlike the Wahba path the
+    // harmonic builder used to ignore that frozen transform entirely: at predict
+    // time it rebuilt the RAW (un-residualized) harmonic design while the fitted
+    // coefficients lived in the transformed coordinate system. Applying those
+    // coefficients to the raw design produced finite-but-wrong predictions even
+    // on the training rows (observed RMSE-vs-truth ≈ 0.59 for a degree-≤2 truth
+    // that the basis recovers exactly, i.e. the coefficients were correct but the
+    // replayed design was not). Honor the frozen transform here exactly as the
+    // Wahba builder does: apply it to the design and every penalty through a
+    // `Gauge`, and re-freeze it into the metadata for the next rebuild. A
+    // `CenterSumToZero` (fresh-fit) spec carries the identity, so first-fit
+    // builds are unchanged.
+    let transform = match &spec.identifiability {
+        SphericalSplineIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != p {
+                crate::bail_dim_basis!(
+                    "frozen spherical-harmonic identifiability transform mismatch: {p} basis columns but transform has {} rows",
+                    transform.nrows()
+                );
+            }
+            transform.clone()
+        }
+        SphericalSplineIdentifiability::CenterSumToZero => Array2::<f64>::eye(p),
+    };
+    let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[transform.clone()]);
+    let design = gauge.restrict_design(&design);
+    let penalty = gauge.restrict_penalty(&penalty);
+    let ridge = gauge.restrict_penalty(&ridge);
+
+    let mut candidates = vec![PenaltyCandidate {
+        matrix: penalty,
+        nullspace_dim_hint: 0,
+        source: PenaltySource::Primary,
+        normalization_scale: 1.0,
+        kronecker_factors: None,
+        op: None,
+    }];
+    if spec.double_penalty {
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
@@ -508,7 +544,7 @@ pub(crate) fn build_spherical_harmonic_basis(
             method: SphereMethod::Harmonic,
             max_degree: Some(l_max),
             wahba_kernel: spec.wahba_kernel,
-            constraint_transform: None,
+            constraint_transform: Some(transform),
         },
         kronecker_factored: None,
         ops,
