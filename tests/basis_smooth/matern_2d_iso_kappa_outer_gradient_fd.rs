@@ -38,7 +38,18 @@
 //! Reference-as-truth: every assertion is against the analytic FD of gam's own
 //! profiled REML criterion — never another tool's output.
 
-use gam::{FitConfig, encode_recordswith_inferred_schema};
+use gam::{
+    FitConfig, FitRequest, FitResult, StandardFitRequest, encode_recordswith_inferred_schema,
+    estimate::FitOptions,
+    fit_model,
+    smooth::{
+        ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
+        TermCollectionSpec,
+    },
+    terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu},
+    types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink},
+};
+use ndarray::{Array1, Array2};
 use std::sync::{Mutex, Once};
 
 static CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -138,6 +149,19 @@ fn parse_components(lines: &[String]) -> Vec<(String, f64, f64, f64)> {
     out
 }
 
+fn aniso_signal_dataset(n: usize) -> (Array2<f64>, Array1<f64>) {
+    let mut x = Array2::<f64>::zeros((n, 2));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let x1 = (i as f64) / (n as f64 - 1.0) * 6.0 - 3.0;
+        let x2 = ((i as f64 * 0.618_033_988_749_894_9).fract()) * 6.0 - 3.0;
+        x[[i, 0]] = x1;
+        x[[i, 1]] = x2;
+        y[i] = (2.0 * x1).sin();
+    }
+    (x, y)
+}
+
 /// MERGE GATE (#1122 / #901): the analytic outer REML gradient w.r.t. the
 /// Matérn log-κ coordinate matches a central finite difference of the FULL
 /// profiled REML criterion at θ₀ — data-fit + logdet (both Sλ-side AND H-side) +
@@ -229,4 +253,161 @@ fn matern_2d_iso_kappa_outer_gradient_matches_fd() {
             gap / scale
         );
     }
+}
+
+/// #1259: at the symmetric anisotropic Matérn init, the FULL outer REML
+/// criterion must have a nonzero per-axis eta contrast in the direction that
+/// increases the signal-axis eta. The audit is stronger than checking the final
+/// fitted eta split: it verifies the value path itself sees trial eta
+/// perturbations, so the optimizer has a real descent direction at theta0.
+#[test]
+fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
+    init();
+    if let Ok(mut g) = CAPTURE.lock() {
+        g.clear();
+    }
+
+    let n = 180;
+    let (x, y) = aniso_signal_dataset(n);
+    let spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "matern_2d_aniso".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                    periodic: None,
+                    length_scale: 1.0,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: Some(vec![0.0, 0.0]),
+                    nullspace_shrinkage_survived: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+
+    let outcome = fit_model(FitRequest::Standard(StandardFitRequest {
+        data: x,
+        y,
+        weights: Array1::ones(n),
+        offset: Array1::zeros(n),
+        spec,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ),
+        options: FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            skip_rho_posterior_inference: false,
+            max_iter: 2,
+            tol: 1e-6,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+            persist_warm_start_disk: false,
+        },
+        kappa_options: SpatialLengthScaleOptimizationOptions {
+            enabled: true,
+            max_outer_iter: 2,
+            rel_tol: 1e-5,
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: 1e-2,
+            max_length_scale: 1e2,
+            pilot_subsample_threshold: 0,
+        },
+        wiggle: None,
+        coefficient_groups: Vec::new(),
+        penalty_block_gamma_priors: Vec::new(),
+        latent_coord: None,
+        _marker: std::marker::PhantomData,
+    }));
+    match outcome {
+        Ok(FitResult::Standard(_)) => eprintln!("[ANISO-ETA-GRAD] fit returned Ok"),
+        Ok(_) => panic!("expected standard fit"),
+        Err(e) => eprintln!("[ANISO-ETA-GRAD] fit returned Err after audit: {e}"),
+    }
+
+    let lines = CAPTURE.lock().unwrap().clone();
+    let gate: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("gate eligible="))
+        .collect();
+    assert!(
+        !gate.is_empty(),
+        "expected an [OUTER-FD-AUDIT] gate line; captured {} lines: {:#?}",
+        lines.len(),
+        lines
+    );
+    let psi_dim: usize = gate
+        .iter()
+        .filter_map(|l| field(l, "psi_dim=").parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        psi_dim >= 2,
+        "anisotropic Matérn must enroll both eta axes as ψ coordinates; gate lines: {gate:#?}"
+    );
+
+    let comps = parse_components(&lines);
+    let eta_comps: Vec<&(String, f64, f64, f64)> = comps
+        .iter()
+        .filter(|(block, ..)| block.starts_with("psi_kappa"))
+        .take(2)
+        .collect();
+    assert!(
+        eta_comps.len() >= 2,
+        "expected two eta-axis psi_kappa components; got blocks: {:?}",
+        comps.iter().map(|c| &c.0).collect::<Vec<_>>()
+    );
+    let (_, g_signal, fd_signal, gap_signal) = eta_comps[0];
+    let (_, g_noise, fd_noise, gap_noise) = eta_comps[1];
+    let analytic_contrast = g_signal - g_noise;
+    let fd_contrast = fd_signal - fd_noise;
+    eprintln!(
+        "[ANISO-ETA-GRAD] theta0 psi_grad=[{g_signal:.6e}, {g_noise:.6e}] \
+         fd=[{fd_signal:.6e}, {fd_noise:.6e}] analytic_contrast={analytic_contrast:.6e} \
+         fd_contrast={fd_contrast:.6e}"
+    );
+
+    for (block, a, fd, gap) in eta_comps {
+        assert!(
+            a.is_finite() && fd.is_finite(),
+            "non-finite anisotropic eta gradient component {block}: analytic={a} fd={fd}"
+        );
+        let scale = a.abs().max(fd.abs()).max(1e-6);
+        assert!(
+            gap / scale < 5e-2,
+            "anisotropic eta outer-gradient analytic≠FD on {block}: analytic={a:.6e} \
+             fd={fd:.6e} gap={gap:.3e} rel={:.3e}",
+            gap / scale
+        );
+    }
+    assert!(
+        fd_contrast < -1e-3,
+        "theta0 FD eta contrast must point toward increasing the signal-axis eta; \
+         got fd_signal-fd_noise={fd_contrast:.6e}"
+    );
+    assert!(
+        analytic_contrast < -1e-3,
+        "theta0 analytic eta contrast must point toward increasing the signal-axis eta; \
+         got g_signal-g_noise={analytic_contrast:.6e}"
+    );
 }
