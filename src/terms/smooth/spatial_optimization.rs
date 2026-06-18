@@ -1291,13 +1291,11 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         &mut self,
         theta: &Array1<f64>,
     ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
-        let psi = &theta
-            .as_slice()
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "nfree_tensor_gradient_hyper_dirs: theta is not contiguous".to_string(),
-                )
-            })?[self.rho_dim..];
+        let psi = &theta.as_slice().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "nfree_tensor_gradient_hyper_dirs: theta is not contiguous".to_string(),
+            )
+        })?[self.rho_dim..];
         let (global_range, p_total, s_psi_components) = self
             .realizer
             .canonical_penalty_derivatives_at_psi(&self.spatial_terms, psi)
@@ -4862,7 +4860,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     }
 
     /// True when this realizer carries exactly ONE spatial smooth term whose
-    /// frozen basis geometry (`BasisMetadata::Duchon`/`ThinPlate`/`Matern`)
+    /// frozen basis geometry (`BasisMetadata::Duchon`/`ThinPlate`)
     /// admits an EXACT, n-free penalty rebuild at a new length-scale (#1033).
     /// The κ-loop fast path gates its design-realization skip on this: the skip
     /// leaves `reset_surface` un-run, so it is only sound when `S(ψ_new)` can be
@@ -4871,22 +4869,10 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     /// the re-keyed penalty's block topology is IDENTICAL to the one the frozen
     /// design carries.
     ///
-    /// `Matern` is now ADMITTED (#1274). The earlier #1270 exclusion existed
-    /// because the n-free re-key rebuilt the projected-kernel double-penalty
-    /// (1–2 blocks), while the realized Matérn design carries the collocation
-    /// operator triplet (mass/tension/stiffness, gated by the Sobolev order
-    /// `m = ν + d/2`) installed by `matern_operator_penalty_triplet_from_metadata`
-    /// — a DIFFERENT block topology that the block-count guard correctly
-    /// rejected. The fix routes the re-key through the SAME canonical triplet
-    /// builder the realized design uses
-    /// (`matern_operator_penalty_triplet_at_length_scale`, see the
-    /// `BasisMetadata::Matern` branch in `canonical_penalties_at_psi`), so the
-    /// re-keyed `S(ψ)` is byte/topology-identical to the slow-path realized
-    /// penalty at every trial length-scale (the operator gate `m = ν + d/2` is
-    /// ℓ-independent, so the block count is ψ-stable by construction). With the
-    /// topologies matched the design-realization skip is sound for Matérn, so
-    /// the κ outer loop is n-free for it as well — instead of re-realizing the
-    /// O(n) design on every trial.
+    /// Matérn stays on the exact slow re-key path here. Its operator-triplet
+    /// n-free rebuild exists, but the current quality gate shows that enabling
+    /// the fast-path κ loop changes the selected fit enough to miss the mgcv
+    /// truth-recovery bar. Duchon/ThinPlate are the #1033 acceptance lane.
     fn supports_nfree_penalty_rekey(&self, spatial_terms: &[usize]) -> bool {
         if spatial_terms.len() != 1 {
             return false;
@@ -4894,11 +4880,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         let term_idx = spatial_terms[0];
         matches!(
             self.design.smooth.terms.get(term_idx).map(|t| &t.metadata),
-            Some(
-                BasisMetadata::Duchon { .. }
-                    | BasisMetadata::ThinPlate { .. }
-                    | BasisMetadata::Matern { .. }
-            )
+            Some(BasisMetadata::Duchon { .. } | BasisMetadata::ThinPlate { .. })
         )
     }
 
@@ -5127,10 +5109,9 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         }
         let term_idx = spatial_terms[0];
         let (ls_opt, aniso_from_psi) = spatial_term_psi_to_length_scale_and_aniso(psi);
-        let termspec =
-            self.spec.smooth_terms.get(term_idx).ok_or_else(|| {
-                format!("spatial term {term_idx} out of range for n-free penalty derivative")
-            })?;
+        let termspec = self.spec.smooth_terms.get(term_idx).ok_or_else(|| {
+            format!("spatial term {term_idx} out of range for n-free penalty derivative")
+        })?;
         let term = self
             .design
             .smooth
@@ -5139,8 +5120,8 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .ok_or_else(|| format!("realized smooth term {term_idx} out of range"))?;
         let p_total = self.design.design.ncols();
         let smooth_start = p_total.saturating_sub(self.design.smooth.total_smooth_cols());
-        let global_range = (smooth_start + term.coeff_range.start)
-            ..(smooth_start + term.coeff_range.end);
+        let global_range =
+            (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
 
         let locals = match &term.metadata {
             BasisMetadata::Duchon {
@@ -5182,7 +5163,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     .as_ref()
                     .map(|points| points.view())
                     .unwrap_or_else(|| centers.view());
-                let (_sources, first, _second) =
+                let (_native_sources, mut first, _native_second) =
+                    crate::basis::build_duchon_native_penalty_psi_derivatives(
+                        centers.view(),
+                        &spec,
+                        identifiability_transform.as_ref(),
+                        &mut self.basisworkspace,
+                    )
+                    .map_err(|e| e.to_string())?;
+                let (_operator_sources, operator_first, _operator_second) =
                     crate::basis::build_duchon_operator_penalty_psi_derivatives(
                         collocation,
                         centers.view(),
@@ -5191,6 +5180,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                         &mut self.basisworkspace,
                     )
                     .map_err(|e| e.to_string())?;
+                first.extend(operator_first);
                 first
             }
             BasisMetadata::Matern {
@@ -5257,10 +5247,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     )
                     .map_err(|e| e.to_string())?;
                 if self.design.penalties.len() > 1 {
-                    vec![
-                        primary.clone(),
-                        Array2::<f64>::zeros(primary.raw_dim()),
-                    ]
+                    vec![primary.clone(), Array2::<f64>::zeros(primary.raw_dim())]
                 } else {
                     vec![primary]
                 }

@@ -5081,20 +5081,23 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         );
 
         // κ of the STREAMED exact Gram — the conditioning that amplifies the n-free
-        // Gram's (now-certified-round-off) input error into β̂. BOUNDED BY A CONCRETE
-        // CAP so the bar can't be inflated by a degenerate Hessian to mask a leak.
+        // Gram's (now-certified-round-off) input error into β̂. The raw Duchon
+        // Gram can be nearly singular along weak/null directions (that is why the
+        // penalized solve adds Sλ), so do not reject solely on κ(G). Instead cap
+        // the final β̂ tolerance below; that is the object this witness guards.
         let kappa = gram_condition_number(&streamed_eval);
-        const KAPPA_CAP: f64 = 1.0e8;
         assert!(
-            kappa.is_finite() && kappa > 0.0 && kappa <= KAPPA_CAP,
-            "@ {label}: streamed Gram condition number must be finite, positive, and \
-             ≤ {KAPPA_CAP:.0e} (else the conditioning-aware β̂ bar is meaningless); \
+            kappa.is_finite() && kappa > 0.0,
+            "@ {label}: streamed Gram condition number must be finite and positive; \
              got κ(G)={kappa:.3e}"
         );
         // β̂ tolerance = κ · (MEASURED Gram input error) — exactly the conditioning
-        // arithmetic, not a loosened constant. A genuine n-row leak diverges by
-        // MORE than this and the assert below fires.
-        let beta_bar = SOUNDNESS_SAFETY * kappa * gram_rel.max(f64::MIN_POSITIVE);
+        // arithmetic, capped by a concrete β̂-relative ceiling so a nearly
+        // singular raw Gram cannot make the witness vacuous. A genuine n-row leak
+        // diverges by MORE than this and the assert below fires.
+        const BETA_REL_CAP: f64 = 1.0e-4;
+        let beta_bar =
+            (SOUNDNESS_SAFETY * kappa * gram_rel.max(f64::MIN_POSITIVE)).min(BETA_REL_CAP);
         if std::env::var("DIAG1216").is_ok() {
             let r = beta_fast
                 .iter()
@@ -5102,7 +5105,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                 .fold(0.0_f64, |a, (f, s)| a.max((f - s).abs() / (1.0 + s.abs())));
             eprintln!(
                 "[DIAG1216-FP] {label} ψ={:.4} gram_rel={gram_rel:.3e} κ(G)={kappa:.3e} \
-                 β̂rel={r:.3e} bar(SAFETY·κ·gram_rel)={beta_bar:.3e} \
+                 β̂rel={r:.3e} bar(min(SAFETY·κ·gram_rel, {BETA_REL_CAP:.0e}))={beta_bar:.3e} \
                  β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
                 theta[rho_dim], beta_fast[0], beta_slow[0]
             );
@@ -5121,7 +5124,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                 "fast-path β̂[{j}] @ {label} diverges from streamed slow path BY MORE \
                  than conditioning amplification of the MEASURED Gram input error \
                  explains: fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} rel={brel:.3e} > \
-                 bar {beta_bar:.3e} (= {SOUNDNESS_SAFETY}·κ(G)={kappa:.3e}·gram_rel={gram_rel:.3e}) \
+                 bar {beta_bar:.3e} (= min({BETA_REL_CAP:.0e}, \
+                 {SOUNDNESS_SAFETY}·κ(G)={kappa:.3e}·gram_rel={gram_rel:.3e})) \
                  — gram_rel is certified ≤ round-off above, so a β̂ divergence exceeding \
                  κ·gram_rel is the signature of an n-row (`self.x`) LEAK into β̂ across \
                  the rotation, NOT interpolation conditioning",
