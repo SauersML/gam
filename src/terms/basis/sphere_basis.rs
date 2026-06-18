@@ -26,13 +26,15 @@ pub fn build_spherical_spline_basis(
             found: centers.nrows(),
         });
     }
-    let mut raw_penalty = spherical_wahba_kernel_matrix_with_kind(
+    let raw_penalty = spherical_wahba_kernel_matrix_with_kind(
         centers.view(),
         centers.view(),
         spec.penalty_order,
         spec.radians,
         spec.wahba_kernel,
     )?;
+    let low_degree_residual = wahba_low_degree_residual_projector(centers.view(), spec.radians)?;
+    let mut raw_penalty = low_degree_residual.dot(&raw_penalty).dot(&low_degree_residual);
     let diag_scale = raw_penalty
         .diag()
         .iter()
@@ -132,7 +134,7 @@ pub fn build_spherical_spline_basis(
         op: None,
     }];
     if spec.double_penalty {
-        let ridge = Array2::<f64>::eye(design.ncols());
+        let ridge = gauge.restrict_penalty(&low_degree_residual);
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
@@ -163,6 +165,95 @@ pub fn build_spherical_spline_basis(
         null_eigenvectors,
         joint_null_rotation: None,
     })
+}
+
+const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 2;
+
+fn real_spherical_harmonic_design_up_to_degree(
+    data: ArrayView2<'_, f64>,
+    max_degree: usize,
+    radians: bool,
+) -> Array2<f64> {
+    let p = max_degree * (max_degree + 2);
+    let to_rad = if radians {
+        1.0
+    } else {
+        std::f64::consts::PI / 180.0
+    };
+    let norms = precompute_harmonic_norms(max_degree);
+    let l_cap = max_degree + 1;
+    let mut out = Array2::<f64>::zeros((data.nrows(), p));
+    let mut p_buf = vec![0.0_f64; l_cap * l_cap];
+    for (i, mut row) in out.outer_iter_mut().enumerate() {
+        let lat_raw = data[(i, 0)] * to_rad;
+        let lat = lat_raw.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+        let lon = data[(i, 1)] * to_rad;
+        fill_real_spherical_harmonics_row(
+            lat,
+            lon,
+            max_degree,
+            p_buf.as_mut_slice(),
+            norms.as_slice(),
+            row.view_mut(),
+        );
+    }
+    out
+}
+
+fn orthonormal_column_basis(matrix: ArrayView2<'_, f64>, rel_tol: f64) -> Array2<f64> {
+    let n = matrix.nrows();
+    let mut cols: Vec<Vec<f64>> = Vec::new();
+    let mut scale = 0.0_f64;
+    for col in matrix.columns() {
+        scale = scale.max(col.iter().map(|v| v * v).sum::<f64>().sqrt());
+    }
+    let tol = rel_tol * scale.max(1.0);
+    for col in matrix.columns() {
+        let mut v = col.to_vec();
+        for _ in 0..2 {
+            for q in &cols {
+                let dot = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f64>();
+                for (vi, qi) in v.iter_mut().zip(q.iter()) {
+                    *vi -= dot * qi;
+                }
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > tol {
+            for vi in &mut v {
+                *vi /= norm;
+            }
+            cols.push(v);
+        }
+    }
+    let mut q = Array2::<f64>::zeros((n, cols.len()));
+    for (j, col) in cols.iter().enumerate() {
+        for i in 0..n {
+            q[(i, j)] = col[i];
+        }
+    }
+    q
+}
+
+fn wahba_low_degree_residual_projector(
+    centers: ArrayView2<'_, f64>,
+    radians: bool,
+) -> Result<Array2<f64>, BasisError> {
+    let low_cols = SPHERE_UNPENALIZED_LOW_DEGREE * (SPHERE_UNPENALIZED_LOW_DEGREE + 2);
+    if centers.nrows() <= low_cols {
+        return Ok(Array2::<f64>::eye(centers.nrows()));
+    }
+    let harmonics = real_spherical_harmonic_design_up_to_degree(
+        centers,
+        SPHERE_UNPENALIZED_LOW_DEGREE,
+        radians,
+    );
+    let q = orthonormal_column_basis(harmonics.view(), 1e-10);
+    if q.ncols() == 0 {
+        return Ok(Array2::<f64>::eye(centers.nrows()));
+    }
+    let projector = Array2::<f64>::eye(centers.nrows()) - q.dot(&q.t());
+    Ok((&projector + &projector.t()) * 0.5)
 }
 
 /// Precomputed √(2)·N(l,m) coefficients for the real spherical-harmonic
@@ -367,10 +458,11 @@ pub(crate) fn build_spherical_harmonic_basis(
     let mut col = 0usize;
     for l in 1..=l_max {
         let laplace = l as f64 * (l as f64 + 1.0);
-        let mut eig = laplace.powi(spec.penalty_order as i32);
-        if l > 2 {
-            eig *= laplace;
-        }
+        let eig = if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
+            0.0
+        } else {
+            laplace.powi((spec.penalty_order + 1) as i32)
+        };
         for _ in 0..(2 * l + 1) {
             penalty[[col, col]] = eig;
             col += 1;
@@ -385,7 +477,16 @@ pub(crate) fn build_spherical_harmonic_basis(
         op: None,
     }];
     if spec.double_penalty {
-        let ridge = Array2::<f64>::eye(p);
+        let mut ridge = Array2::<f64>::eye(p);
+        let mut col = 0usize;
+        for l in 1..=l_max {
+            for _ in 0..(2 * l + 1) {
+                if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
+                    ridge[[col, col]] = 0.0;
+                }
+                col += 1;
+            }
+        }
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
