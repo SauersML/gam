@@ -351,7 +351,7 @@ fn build_wahba_decomposed_null_shrinkage(
             out[[i, i]] = 1.0;
         }
     } else {
-        for i in decomposition.kernel_basis.ncols()..p {
+        for i in 0..decomposition.kernel_basis.ncols() {
             out[[i, i]] = 1.0;
         }
     }
