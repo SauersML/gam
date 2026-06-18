@@ -5536,6 +5536,20 @@ impl<'a> RemlState<'a> {
             .map(Arc::clone)
     }
 
+    /// Return the currently installed Gaussian sufficient-statistic cache
+    /// without constructing one from `self.x`. The ψ fast path uses this to
+    /// capture the exact slow-reset anchor cache, if the slow Gaussian solve
+    /// already built it, while preserving the no-new-row-pass contract.
+    pub(crate) fn installed_gaussian_fixed_cache(
+        &self,
+    ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {
+        self.gaussian_fixed_cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+    }
+
     pub(crate) fn gaussian_fixed_cache_if_eligible(
         &self,
     ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {

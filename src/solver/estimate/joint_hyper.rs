@@ -130,6 +130,13 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// statistics are frame-exact against the streamed ones.
     pub(crate) psi_gram_tensor:
         Option<std::sync::Arc<crate::solver::psi_gram_tensor::PsiGramTensor>>,
+    /// Exact k-space correction from the slow-reset Gaussian cache at
+    /// `last_reset_psi`: `(psi_ref, G_exact(ref)-G_tensor(ref),
+    /// r_exact(ref)-r_tensor(ref))`. The initial slow path already paid the row
+    /// pass and built the exact Gaussian cache for its inner solve; the
+    /// design-revision fast path can reuse that anchor to remove the tensor's
+    /// residual without realizing rows again.
+    pub(crate) psi_gram_anchor_correction: Option<(f64, Array2<f64>, Array1<f64>)>,
     /// EXACT n-free per-ψ canonical penalty surface `S(ψ)` staged for the
     /// CURRENT ψ-trial (#1033, penalty lane). For a spatial smooth ψ (= log
     /// length-scale) moves BOTH the design Gram AND the penalty `S(ψ)` (the
@@ -263,6 +270,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             last_canonical_revision: None,
             last_reset_psi: None,
             psi_gram_tensor: None,
+            psi_gram_anchor_correction: None,
             pending_psi_penalty: None,
             supports_nfree_penalty_rekey: false,
             pending_glm_first_step_gram: None,
@@ -399,6 +407,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         match tensor {
             Some(tensor) => {
                 self.psi_gram_tensor = Some(std::sync::Arc::new(tensor));
+                self.psi_gram_anchor_correction = None;
                 true
             }
             None => false,
@@ -594,7 +603,38 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // Clone the Arc handle so the immutable borrow of `self.psi_gram_tensor`
         // is released before the `&mut self.reml_state` installs below.
         let tensor = std::sync::Arc::clone(tensor);
-        let cache = tensor.gaussian_fixed_cache_at(psi);
+        let mut cache = tensor.gaussian_fixed_cache_at(psi);
+        if let Some(psi_ref) = self.last_reset_psi.filter(|p| tensor.contains(*p)) {
+            let correction_is_current = self
+                .psi_gram_anchor_correction
+                .as_ref()
+                .is_some_and(|(p, _, _)| *p == psi_ref);
+            if !correction_is_current
+                && let Some(anchor) = self.reml_state.installed_gaussian_fixed_cache()
+                && !anchor.row_prediction_is_stale
+                && anchor.xtwx_orig.dim() == cache.xtwx_orig.dim()
+                && anchor.xtwy_orig.len() == cache.xtwy_orig.len()
+            {
+                let tensor_at_ref = tensor.gaussian_fixed_cache_at(psi_ref);
+                if tensor_at_ref.xtwx_orig.dim() == anchor.xtwx_orig.dim()
+                    && tensor_at_ref.xtwy_orig.len() == anchor.xtwy_orig.len()
+                {
+                    self.psi_gram_anchor_correction = Some((
+                        psi_ref,
+                        &anchor.xtwx_orig - &tensor_at_ref.xtwx_orig,
+                        &anchor.xtwy_orig - &tensor_at_ref.xtwy_orig,
+                    ));
+                }
+            }
+            if let Some((p, gram_delta, rhs_delta)) = &self.psi_gram_anchor_correction
+                && *p == psi_ref
+                && gram_delta.dim() == cache.xtwx_orig.dim()
+                && rhs_delta.len() == cache.xtwy_orig.len()
+            {
+                cache.xtwx_orig += gram_delta;
+                cache.xtwy_orig += rhs_delta;
+            }
+        }
         if !self
             .reml_state
             .install_gaussian_fixed_cache(Arc::new(cache))
@@ -824,6 +864,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // #1264: freeze the reduced-basis reference ψ this slow-path reset pins,
         // so the next design-revision fast path can certify its skip against it.
         self.record_reset_psi(theta, rho_dim);
+        self.psi_gram_anchor_correction = None;
         // #1216 hybrid: on the SLOW path the design was just REALIZED (the n×k
         // `x_fit` is live in `reset_surface` above), so the inner PLS forms the
         // EXACT `XᵀWX(ψ)` from it. We deliberately do NOT install the certified
@@ -1122,6 +1163,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.last_canonical_revision = design_revision;
         // #1264: freeze the reduced-basis reference ψ this slow-path reset pins.
         self.record_reset_psi(theta, rho_dim);
+        self.psi_gram_anchor_correction = None;
         self.install_pending_glm_trial_statistics();
         self.install_psi_gram_statistics(theta, rho_dim);
         // #1033 penalty lane: the slow cost-only path rebuilt `S` from the freshly
