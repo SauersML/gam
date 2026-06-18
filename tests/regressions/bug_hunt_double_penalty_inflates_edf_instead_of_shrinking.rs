@@ -20,21 +20,43 @@ fn linear_dataset(seed: u64, n: usize) -> gam::data::EncodedDataset {
         .expect("encode")
 }
 
-fn fit_edf(formula: &str, data: &gam::data::EncodedDataset) -> f64 {
+struct FitSnapshot {
+    edf: f64,
+    lambdas: Vec<f64>,
+    path: &'static str,
+}
+
+impl FitSnapshot {
+    fn describe(&self) -> String {
+        format!(
+            "path={}, edf={:.6}, lambdas={:?}",
+            self.path, self.edf, self.lambdas
+        )
+    }
+}
+
+fn fit_snapshot(formula: &str, data: &gam::data::EncodedDataset) -> FitSnapshot {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("fit ok");
     match result {
-        FitResult::Standard(fit) => {
-            fit.fit
+        FitResult::Standard(fit) => FitSnapshot {
+            edf: fit
+                .fit
                 .inference
                 .as_ref()
                 .expect("default fit must compute inference")
-                .edf_total
-        }
-        FitResult::SplineScan(scan) => scan.edf(),
+                .edf_total,
+            lambdas: fit.fit.lambdas.to_vec(),
+            path: "standard",
+        },
+        FitResult::SplineScan(scan) => FitSnapshot {
+            edf: scan.edf(),
+            lambdas: Vec::new(),
+            path: "spline_scan",
+        },
         _ => panic!("expected a standard Gaussian or spline-scan fit"),
     }
 }
@@ -45,13 +67,16 @@ fn bspline_double_penalty_does_not_inflate_linear_edf() {
 
     let mut edf_on = Vec::new();
     let mut edf_off = Vec::new();
+    let mut snapshots_on: Vec<String> = Vec::new();
+    let mut snapshots_off: Vec<String> = Vec::new();
     for seed in 0..5 {
         let data = linear_dataset(seed, 800);
-        edf_on.push(fit_edf("y ~ s(x, k=20, bs=ps, double_penalty=True)", &data));
-        edf_off.push(fit_edf(
-            "y ~ s(x, k=20, bs=ps, double_penalty=False)",
-            &data,
-        ));
+        let on = fit_snapshot("y ~ s(x, k=20, bs=ps, double_penalty=True)", &data);
+        let off = fit_snapshot("y ~ s(x, k=20, bs=ps, double_penalty=False)", &data);
+        edf_on.push(on.edf);
+        edf_off.push(off.edf);
+        snapshots_on.push(on.describe());
+        snapshots_off.push(off.describe());
     }
 
     let mean_on = edf_on.iter().sum::<f64>() / edf_on.len() as f64;
@@ -59,12 +84,14 @@ fn bspline_double_penalty_does_not_inflate_linear_edf() {
     assert!(
         mean_on <= 2.35,
         "B-spline double penalty did not reach the mgcv linear-data EDF target \
-         (~2.10): double_penalty=true mean={mean_on:.6}, values={edf_on:?}"
+         (~2.10): double_penalty=true mean={mean_on:.6}, values={edf_on:?}, \
+         snapshots={snapshots_on:?}"
     );
     assert!(
         mean_on <= mean_off + 1.0e-8,
         "enabling B-spline double penalty inflated EDF on linear data: \
          double_penalty=true mean={mean_on:.6}, values={edf_on:?}; \
-         double_penalty=false mean={mean_off:.6}, values={edf_off:?}"
+         double_penalty=false mean={mean_off:.6}, values={edf_off:?}, \
+         snapshots_on={snapshots_on:?}, snapshots_off={snapshots_off:?}"
     );
 }
