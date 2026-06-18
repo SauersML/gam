@@ -1190,8 +1190,8 @@ impl<'a> RemlState<'a> {
         //
         // The analogous rank-deficiency concern — that a nonzero ridge
         // δ would contribute `(p − rank(X'WX + S)) · log(δ)` to
-        // `logdet_h` while `sparse_penalty_logdet_runtime` excludes that
-        // subspace from `log|S|_+` — is structurally out of reach on the
+        // `logdet_h` while the combined penalty pseudo-logdet excludes that
+        // subspace from `log|ΣλS|_+` — is structurally out of reach on the
         // backends that select sparse-exact:
         //
         //   1. `estimate_sparse_native_decision` gates on H density, which
@@ -1206,7 +1206,7 @@ impl<'a> RemlState<'a> {
         // No projection correction is emitted here; pass 0.0 through to
         // `finish_assembly`.  If a future test exercise ever finds a
         // sparse-native fit with `ridge_used > 0` AND genuine null
-        // directions of `X'WX + S`, extend `sparse_penalty_logdet_runtime`
+        // directions of `X'WX + S`, extend the combined penalty pseudo-logdet
         // to include the ridge-matched null contributions (keeping both
         // sides of the LAML ratio on the same p-dim space) rather than
         // reintroducing the range(S_+) projection; Cholesky can't cheaply

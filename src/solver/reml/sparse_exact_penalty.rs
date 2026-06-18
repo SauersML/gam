@@ -6,25 +6,16 @@
 
 use crate::construction::CanonicalPenalty;
 use crate::estimate::EstimationError;
-use crate::types::PenaltyIdx;
-use rayon::prelude::*;
-use std::sync::Arc;
 
-#[derive(Clone)]
-pub(crate) struct SparsePenaltyBlock {
-    pub(crate) penalty_idx: PenaltyIdx,
-    pub(crate) positive_eigenvalues: Arc<Vec<f64>>,
-}
-
-/// Build sparse penalty blocks from canonical penalties, avoiding redundant
-/// block-range scanning and eigendecomposition. Uses the pre-computed col_range
-/// and positive_eigenvalues from `CanonicalPenalty`.
-pub(crate) fn build_sparse_penalty_blocks_from_canonical(
+/// Return the count of block-separable canonical penalties eligible for the
+/// sparse-exact REML path. `None` means at least two penalties overlap in
+/// coefficient range, so the sparse backend must not use block-local assembly.
+pub(crate) fn sparse_penalty_block_count_from_canonical(
     penalties: &[CanonicalPenalty],
     p: usize,
-) -> Result<Option<Vec<SparsePenaltyBlock>>, EstimationError> {
+) -> Result<Option<usize>, EstimationError> {
     if penalties.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(0));
     }
 
     // Check for overlapping ranges.
@@ -49,22 +40,7 @@ pub(crate) fn build_sparse_penalty_blocks_from_canonical(
         }
     }
 
-    // `par_iter()` over a slice is indexed, and Rayon preserves the input
-    // sequence when collecting into a `Vec`, so the final blocks remain in
-    // canonical penalty order even though each block is built independently.
-    let block_results: Vec<Result<SparsePenaltyBlock, EstimationError>> = penalties
-        .par_iter()
-        .enumerate()
-        .map(|(penalty_ordinal, cp)| {
-            Ok(SparsePenaltyBlock {
-                penalty_idx: PenaltyIdx::new(penalty_ordinal),
-                positive_eigenvalues: Arc::new(cp.positive_eigenvalues.clone()),
-            })
-        })
-        .collect();
-
-    let blocks = block_results.into_iter().collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(blocks))
+    Ok(Some(penalties.len()))
 }
 
 #[cfg(test)]
@@ -92,21 +68,17 @@ mod tests {
     }
 
     #[test]
-    fn canonical_sparse_penalty_blocks_preserve_input_order() {
+    fn canonical_sparse_penalty_block_count_accepts_non_overlapping_ranges() {
         let penalties = vec![
             canonical_penalty(2..4, array![[2.0, 0.5], [0.5, 3.0]], vec![2.0, 3.0], 5),
             canonical_penalty(0..1, array![[7.0]], vec![7.0], 5),
             canonical_penalty(4..5, array![[11.0]], vec![11.0], 5),
         ];
 
-        let blocks = build_sparse_penalty_blocks_from_canonical(&penalties, 5)
+        let block_count = sparse_penalty_block_count_from_canonical(&penalties, 5)
             .unwrap()
             .expect("non-overlapping canonical blocks should be sparse-block compatible");
 
-        let observed: Vec<usize> = blocks.iter().map(|block| block.penalty_idx.get()).collect();
-        assert_eq!(observed, vec![0, 1, 2]);
-        assert_eq!(&*blocks[0].positive_eigenvalues, &vec![2.0, 3.0]);
-        assert_eq!(&*blocks[1].positive_eigenvalues, &vec![7.0]);
-        assert_eq!(&*blocks[2].positive_eigenvalues, &vec![11.0]);
+        assert_eq!(block_count, 3);
     }
 }

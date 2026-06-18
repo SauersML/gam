@@ -102,7 +102,7 @@ impl<'a> RemlState<'a> {
         let Some(x_sparse) = x_sparse else {
             return dense_backend("design_not_sparse", None, None);
         };
-        let Some(blocks) = self.sparse_penalty_blocks.as_ref() else {
+        let Some(block_count) = self.sparse_penalty_block_count else {
             return dense_backend("penalty_blocks_not_separable", None, None);
         };
         // Small-problem dense fast-path: the previous heuristic densified
@@ -128,7 +128,7 @@ impl<'a> RemlState<'a> {
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
         match workspace.sparse_penalized_system_stats(x_sparse, &s_lambda) {
             Ok(stats)
-                if stats.density_upper < Self::SPARSE_HESSIAN_MAX_DENSITY && !blocks.is_empty() =>
+                if stats.density_upper < Self::SPARSE_HESSIAN_MAX_DENSITY && block_count > 0 =>
             {
                 SparseRemlDecision {
                     geometry: RemlGeometry::SparseExactSpd,

@@ -20,7 +20,7 @@
 // concern submodules below inherit them via their own `use super::*;`.
 pub(crate) use super::*;
 
-pub(crate) use super::build_sparse_penalty_blocks_from_canonical;
+pub(crate) use super::sparse_penalty_block_count_from_canonical;
 pub(crate) use crate::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };

@@ -3556,9 +3556,8 @@ impl<'a> RemlState<'a> {
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
 
-        let sparse_penalty_blocks =
-            build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
-                .map(Arc::new);
+        let sparse_penalty_block_count =
+            sparse_penalty_block_count_from_canonical(canonical_penalties.as_ref(), p)?;
 
         let runtime_mixture_link_state = config.link_kind.mixture_state().cloned();
         let runtime_sas_link_state = config.link_kind.sas_state().copied();
@@ -3571,7 +3570,7 @@ impl<'a> RemlState<'a> {
             canonical_penalties,
             balanced_penalty_root,
             reparam_invariant,
-            sparse_penalty_blocks,
+            sparse_penalty_block_count,
             p,
             config,
             runtime_mixture_link_state,
@@ -3644,15 +3643,14 @@ impl<'a> RemlState<'a> {
             create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
-        let sparse_penalty_blocks =
-            build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
-                .map(Arc::new);
+        let sparse_penalty_block_count =
+            sparse_penalty_block_count_from_canonical(canonical_penalties.as_ref(), p)?;
 
         self.x = x.into();
         self.canonical_penalties = canonical_penalties;
         self.balanced_penalty_root = balanced_penalty_root;
         self.reparam_invariant = reparam_invariant;
-        self.sparse_penalty_blocks = sparse_penalty_blocks;
+        self.sparse_penalty_block_count = sparse_penalty_block_count;
         self.p = p;
         self.nullspace_dims = nullspace_dims;
         self.coefficient_lower_bounds = coefficient_lower_bounds;
@@ -3706,7 +3704,7 @@ impl<'a> RemlState<'a> {
     /// — but for a spatial smooth ψ ALSO moves the penalty matrix `S(ψ)` (the
     /// Duchon/Matérn Hilbert scale is built as a function of the length scale).
     /// `reset_surface` is the only place the canonical penalty surface
-    /// (`balanced_penalty_root` / `reparam_invariant` / `sparse_penalty_blocks`)
+    /// (`balanced_penalty_root` / `reparam_invariant` / `sparse_penalty_block_count`)
     /// is rebuilt, and the fast path skips it — so without this the inner solve
     /// would pair `XᵀWX(ψ_new)` with the STALE `S(ψ_old)` and converge to the
     /// wrong β̂ / κ-optimum. This re-keys `S(ψ_new)` from the supplied canonical
@@ -3745,14 +3743,13 @@ impl<'a> RemlState<'a> {
             create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
-        let sparse_penalty_blocks =
-            build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
-                .map(Arc::new);
+        let sparse_penalty_block_count =
+            sparse_penalty_block_count_from_canonical(canonical_penalties.as_ref(), p)?;
 
         self.canonical_penalties = canonical_penalties;
         self.balanced_penalty_root = balanced_penalty_root;
         self.reparam_invariant = reparam_invariant;
-        self.sparse_penalty_blocks = sparse_penalty_blocks;
+        self.sparse_penalty_block_count = sparse_penalty_block_count;
         self.nullspace_dims = nullspace_dims;
         // The penalized Hessian / logdet depend on S(ψ); a new penalty
         // invalidates every memoized factorization and eval. The design-keyed
@@ -5634,39 +5631,6 @@ impl<'a> RemlState<'a> {
         &self.canonical_penalties
     }
 
-    /// Compute the exact pseudo-logdet for the sparse penalty path.
-    ///
-    /// For each sparse penalty block k with precomputed positive eigenvalues
-    /// {σ_1, ..., σ_r}, the exact pseudo-logdet of λ_k S_k is:
-    ///
-    ///   L(λ_k S_k) = Σ_i log(λ_k σ_i) = r ρ_k + Σ_i log σ_i
-    ///
-    /// The first derivative is:
-    ///   ∂/∂ρ_k L = r  (the rank, i.e. number of positive eigenvalues)
-    pub(super) fn sparse_penalty_logdet_runtime(
-        &self,
-        rho: &Array1<f64>,
-        blocks: &[SparsePenaltyBlock],
-    ) -> (usize, f64, Array1<f64>) {
-        let mut logdet = 0.0_f64;
-        let mut det1 = Array1::<f64>::zeros(rho.len());
-        let mut penalty_rank = 0usize;
-        for block in blocks {
-            // L(λ_k S_k) = Σ_{positive} log(λ_k σ_i).
-            for &eig in block.positive_eigenvalues.iter() {
-                logdet += rho[block.penalty_idx.get()] + eig.ln();
-            }
-
-            penalty_rank += block.positive_eigenvalues.len();
-            // ∂/∂ρ_k L = rank (number of positive eigenvalues).
-            // Since ∂/∂ρ_k log(λ_k σ_i) = ∂/∂ρ_k (ρ_k + log σ_i) = 1.
-            if block.penalty_idx.get() < det1.len() {
-                det1[block.penalty_idx.get()] = block.positive_eigenvalues.len() as f64;
-            }
-        }
-        (penalty_rank.min(self.p), logdet, det1)
-    }
-
     pub(super) fn prepare_dense_eval_bundlewithkey(
         &self,
         rho: &Array1<f64>,
@@ -5786,15 +5750,11 @@ impl<'a> RemlState<'a> {
                 "sparse exact geometry requires sparse original design".to_string(),
             )
         })?;
-        let penalty_blocks = self
-            .sparse_penalty_blocks
-            .as_ref()
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "sparse exact geometry requires block-separable penalties".to_string(),
-                )
-            })?
-            .clone();
+        self.sparse_penalty_block_count.ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "sparse exact geometry requires block-separable penalties".to_string(),
+            )
+        })?;
 
         let lambdas = rho.mapv(f64::exp);
         let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
@@ -5832,8 +5792,22 @@ impl<'a> RemlState<'a> {
             ridge_passport.delta,
             precomputed_xtwx,
         )?;
-        let (penalty_rank, logdet_s_pos, det1_values) =
-            self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
+        let lambdas_slice = lambdas.as_slice().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "non-contiguous lambda storage in sparse penalty logdet".to_string(),
+            )
+        })?;
+        let penalty_logdet = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
+            &self.canonical_penalties,
+            lambdas_slice,
+            ridge_passport.penalty_logdet_ridge(),
+            self.p,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        let penalty_rank = penalty_logdet.rank();
+        let logdet_s_pos = penalty_logdet.value();
+        let (det1_values, _) =
+            penalty_logdet.rho_derivatives_from_penalties(&self.canonical_penalties, lambdas_slice);
         let firth_dense_operator_original = if let Some(jeffreys_link) =
             reml_robust_jeffreys_link(&self.config)
         {

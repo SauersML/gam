@@ -28,9 +28,7 @@ mod rho_key;
 mod sparse_exact_penalty;
 mod trace;
 
-pub(crate) use sparse_exact_penalty::{
-    SparsePenaltyBlock, build_sparse_penalty_blocks_from_canonical,
-};
+pub(crate) use sparse_exact_penalty::sparse_penalty_block_count_from_canonical;
 
 pub(crate) const EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 pub(crate) const FIRTH_MAX_OBSERVATIONS: usize = 20_000;
@@ -4544,7 +4542,7 @@ pub(crate) struct RemlState<'a> {
     pub(crate) canonical_penalties: Arc<Vec<crate::construction::CanonicalPenalty>>,
     pub(crate) balanced_penalty_root: Array2<f64>,
     pub(crate) reparam_invariant: ReparamInvariant,
-    pub(crate) sparse_penalty_blocks: Option<Arc<Vec<SparsePenaltyBlock>>>,
+    pub(crate) sparse_penalty_block_count: Option<usize>,
     pub(crate) p: usize,
     pub(crate) config: Arc<RemlConfig>,
     pub(crate) runtime_mixture_link_state: Option<crate::types::MixtureLinkState>,
