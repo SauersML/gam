@@ -29,6 +29,14 @@ model.predict(
 | `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"` for table-shaped outputs. Defaults to the input table kind, falling back to the training table kind. |
 | `id_column` | `None` | Name of a column in `data` whose stringified values are carried through into table outputs and `SurvivalPrediction`. |
 
+When the table target is `"dict"` (either explicitly or because no input /
+training table kind determines a richer container), the returned object is a
+`PredictionResult`: it is still a normal mapping, so `pred["mean"]` works, and
+it also exposes prediction columns as attributes such as `pred.mean`,
+`pred.std_error`, `pred.mean_lower`, and `pred.mean_upper`. For convenience,
+`pred.lower`, `pred.upper`, and `pred.se_mean` alias the interval columns
+`mean_lower`, `mean_upper`, and `std_error`.
+
 ## Return value by model class
 
 | Model class | Default return | Columns / fields |
@@ -51,6 +59,11 @@ first.
 ```python
 preds = model.predict(test_df, interval=0.95)
 # columns: linear_predictor, mean, std_error, mean_lower, mean_upper
+
+pred_dict = model.predict(test_df, interval=0.95, return_type="dict")
+mu = pred_dict["mean"]       # mapping access
+mu_attr = pred_dict.mean     # same column on PredictionResult output
+lo = pred_dict.mean_lower    # also available as pred_dict.lower
 ```
 
 Intervals are computed from the asymptotic covariance of the fitted

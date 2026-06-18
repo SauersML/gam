@@ -7,6 +7,31 @@ from typing import Any, cast
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
 
 
+class PredictionResult(dict[str, list[Any]]):
+    """Dict-shaped prediction table with attribute access to columns.
+
+    ``Model.predict(..., return_type="dict")`` and dict-shaped tabular
+    defaults return this class. It behaves like a normal ``dict`` for
+    subscription and iteration, while also allowing field access such as
+    ``pred.mean``, ``pred.std_error``, and ``pred.mean_lower``.
+    """
+
+    _ALIASES = {
+        "lower": "mean_lower",
+        "upper": "mean_upper",
+        "se_mean": "std_error",
+    }
+
+    def __getattr__(self, name: str) -> list[Any]:
+        key = self._ALIASES.get(name, name)
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(
+                f"{type(self).__name__!s} has no prediction column {name!r}"
+            ) from exc
+
+
 class PreNormalizedTable:
     """A table already normalized to ``(headers, rows, kind)`` form.
 
@@ -109,7 +134,7 @@ def restore_output_table(
             f"unsupported return_type '{target}'; use one of: {allowed}"
         )
     if target == "dict":
-        return columns
+        return PredictionResult(columns)
     if target == "pandas":
         import pandas as pd
 

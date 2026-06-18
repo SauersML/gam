@@ -138,7 +138,7 @@ class Model:
 
         Returns
         -------
-        ndarray | dict | DataFrame | SurvivalPrediction | CompetingRisksPrediction
+        ndarray | PredictionResult | DataFrame | SurvivalPrediction | CompetingRisksPrediction
             The shape depends on the model class and on whether ``interval``,
             ``id_column``, or ``return_type`` was set:
 
@@ -153,6 +153,10 @@ class Model:
               (response-scale standard error including both fixed-effect and
               smoothing uncertainty) plus ``mean_lower`` / ``mean_upper``
               (interval endpoints).
+              When the requested table container is ``"dict"``, the return is
+              a ``PredictionResult``: it supports normal mapping access
+              (``pred["mean"]``) and column attributes (``pred.mean``,
+              ``pred.std_error``, ``pred.mean_lower``, ``pred.mean_upper``).
             * Bernoulli marginal-slope: a 1-D ``ndarray`` of probabilities.
             * Transformation-normal: a 1-D ``ndarray`` of z-scores.
             * Survival models: :class:`SurvivalPrediction`.

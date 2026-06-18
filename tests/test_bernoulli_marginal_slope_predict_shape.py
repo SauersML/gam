@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from gamfit import _predict_shape
-from gamfit._tables import restore_output_table
+from gamfit._tables import PredictionResult, restore_output_table
 
 
 class _FakeRust:
@@ -140,6 +140,7 @@ def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
     )
 
     assert isinstance(out, dict)
+    assert isinstance(out, PredictionResult)
     assert set(out) == {
         "linear_predictor",
         "mean",
@@ -151,11 +152,15 @@ def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
     # band reconstructs as link^{-1}(η ± z·std_error).
     np.testing.assert_allclose(out["linear_predictor"], [-1.0, 0.0, 1.0])
     np.testing.assert_allclose(out["mean"], [0.16, 0.50, 0.84])
+    np.testing.assert_allclose(out.mean, [0.16, 0.50, 0.84])
     # std_error is the η-scale SE — untouched, not clipped.
     np.testing.assert_allclose(out["std_error"], [0.30, 0.20, 0.30])
+    np.testing.assert_allclose(out.se_mean, [0.30, 0.20, 0.30])
     # Probability-scale bounds clipped into [0, 1].
     np.testing.assert_allclose(out["mean_lower"], [0.0, 0.42, 0.70])
     np.testing.assert_allclose(out["mean_upper"], [0.40, 0.58, 1.0])
+    np.testing.assert_allclose(out.lower, [0.0, 0.42, 0.70])
+    np.testing.assert_allclose(out.upper, [0.40, 0.58, 1.0])
 
 
 def test_bernoulli_marginal_slope_no_interval_stays_1d(monkeypatch: Any) -> None:
@@ -226,7 +231,9 @@ def test_standard_gam_with_return_type_returns_table(monkeypatch: Any) -> None:
     )
 
     assert isinstance(out, dict)
+    assert isinstance(out, PredictionResult)
     assert list(out) == ["linear_predictor", "mean"]
+    np.testing.assert_allclose(out.mean, [0.2, 0.5, 0.8])
 
 
 def test_standard_gam_with_id_column_returns_table(monkeypatch: Any) -> None:

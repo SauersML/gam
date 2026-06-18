@@ -12,7 +12,7 @@ class _Pytest(Protocol):
 
 pytest = cast(_Pytest, import_module("pytest"))
 
-from gamfit._tables import normalize_table, restore_output_table
+from gamfit._tables import PredictionResult, normalize_table, restore_output_table
 
 
 def test_normalize_table_dict_of_numpy_float64_arrays_renders_native_numbers() -> None:
@@ -74,6 +74,41 @@ def test_restore_output_table_rejects_unknown_return_type() -> None:
             input_kind="mapping",
             training_kind=None,
         )
+
+
+def test_restore_output_table_dict_returns_prediction_result_with_field_access() -> None:
+    restored = restore_output_table(
+        {
+            "linear_predictor": [0.5, 1.5],
+            "mean": [1.0, 2.0],
+            "std_error": [0.1, 0.2],
+            "mean_lower": [0.8, 1.6],
+            "mean_upper": [1.2, 2.4],
+        },
+        requested="dict",
+        input_kind="mapping",
+        training_kind=None,
+    )
+
+    assert isinstance(restored, dict)
+    assert isinstance(restored, PredictionResult)
+    assert list(restored) == [
+        "linear_predictor",
+        "mean",
+        "std_error",
+        "mean_lower",
+        "mean_upper",
+    ]
+    assert restored["mean"] == [1.0, 2.0]
+    assert restored.mean == [1.0, 2.0]
+    assert restored.std_error == [0.1, 0.2]
+    assert restored.mean_lower == [0.8, 1.6]
+    assert restored.mean_upper == [1.2, 2.4]
+    assert restored.lower == [0.8, 1.6]
+    assert restored.upper == [1.2, 2.4]
+    assert restored.se_mean == [0.1, 0.2]
+    with pytest.raises(AttributeError, match="no prediction column 'median'"):
+        _ = restored.median
 
 
 def test_restore_output_table_supports_pyarrow_output() -> None:

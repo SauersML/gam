@@ -76,14 +76,16 @@ else the training kind, else `dict`. Override with `return_type=`:
 | `return_type` | Returns |
 | --- | --- |
 | `None` | Tabular path only: input kind for pandas/polars/numpy/pyarrow inputs, else training kind, else `dict`. |
-| `"dict"` | `dict[str, list]`. |
+| `"dict"` | `PredictionResult`, a `dict[str, list]` with attribute access to prediction columns. |
 | `"numpy"` | 2-D `numpy.ndarray` with columns in fixed order. |
 | `"pandas"` | `pandas.DataFrame`. |
 | `"polars"` | `polars.DataFrame`. |
 | `"pyarrow"` | `pyarrow.Table`. |
 
 ```python
-model.predict(test_df, return_type="dict")
+pred = model.predict(test_df, return_type="dict")
+pred["mean"]
+pred.mean
 model.predict(test_df, return_type="numpy")
 model.predict(test_df, return_type="pandas")
 ```
