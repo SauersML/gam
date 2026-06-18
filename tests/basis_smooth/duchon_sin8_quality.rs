@@ -14,7 +14,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, QualityDiagnostics, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -44,7 +44,13 @@ fn make_sin_dataset(freq: f64, sigma: f64, n: usize, seed: u64) -> gam::data::En
     encode_recordswith_inferred_schema(headers, rows).expect("encode sin dataset")
 }
 
-fn fit_and_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f64]) -> Vec<f64> {
+fn fit_and_predict_diagnostics(
+    label: &str,
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    x_test: &[f64],
+    truth: &[f64],
+) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -61,7 +67,11 @@ fn fit_and_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f6
     }
     let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .expect("rebuild design from frozen spec");
-    test_design.design.apply(&fit.fit.beta).to_vec()
+    let pred = test_design.design.apply(&fit.fit.beta).to_vec();
+    QualityDiagnostics::from_standard_fit(label, &fit)
+        .with_truth_rmse(&pred, truth)
+        .emit();
+    pred
 }
 
 fn mgcv_duchon_predict(data: &gam::data::EncodedDataset, x_test: &[f64], k: usize) -> Vec<f64> {
@@ -120,7 +130,13 @@ fn duchon_sin8_max_error_within_budget() {
     ];
     let mut violations = Vec::<String>::new();
     for (label, body) in absolute_cases {
-        let yhat = fit_and_predict(&format!("y ~ {body}"), &data, &x_test);
+        let yhat = fit_and_predict_diagnostics(
+            label,
+            &format!("y ~ {body}"),
+            &data,
+            &x_test,
+            &y_truth_test,
+        );
         let m = max_abs_err(&yhat, &y_truth_test);
         eprintln!("[duchon-sin8] {label:18} max_err={m:.4}");
         if m > budget {
@@ -135,7 +151,13 @@ fn duchon_sin8_max_error_within_budget() {
         violations.join("\n  - "),
     );
 
-    let gam_centers20 = fit_and_predict("y ~ duchon(x, centers=20)", &data, &x_test);
+    let gam_centers20 = fit_and_predict_diagnostics(
+        "duchon-centers20",
+        "y ~ duchon(x, centers=20)",
+        &data,
+        &x_test,
+        &y_truth_test,
+    );
     let mgcv_centers20 = mgcv_duchon_predict(&data, &x_test, 20);
     let gam_max = max_abs_err(&gam_centers20, &y_truth_test);
     let mgcv_max = max_abs_err(&mgcv_centers20, &y_truth_test);
