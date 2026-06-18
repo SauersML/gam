@@ -310,7 +310,7 @@ takes the same options as `te(...)`.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `k` (`basis_dim`) | auto, per margin | Basis dim per margin. List form `k=[k1, k2]` accepted. |
+| `k` (`basis_dim`) | auto, per margin | Basis dim per margin. Scalar `k=20` applies to every margin; list/tuple forms `k=[k1, k2]`, `k=(k1, k2)`, and `k=c(k1, k2)` set per-margin sizes. Per-margin aliases such as `k_x=12, k_time=8` are also accepted. |
 | `knots` | auto, per margin | Interior knots per margin. List form accepted. |
 | `degree` | 3 | Polynomial degree (all margins). |
 | `penalty_order` | 2 | Difference-penalty order. |
@@ -326,6 +326,8 @@ Examples:
 
 ```python
 gamfit.fit(df, "y ~ te(space, time, k=[12, 8])")
+gamfit.fit(df, "y ~ te(space, time, k=(12, 8))")
+gamfit.fit(df, "y ~ te(space, time, k_space=12, k_time=8)")
 gamfit.fit(df, "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=5)")
 gamfit.fit(df, "y ~ te(u, v, bc=['periodic', 'periodic'], period=[2*pi, 2*pi], k=5)")
 ```
