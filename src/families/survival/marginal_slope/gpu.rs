@@ -2027,7 +2027,7 @@ pub fn cpu_oracle_third_contraction(
     let entry_eta_u_dir = b10_mat_dot(&entry.eta_uv, inputs.dir, p);
     let exit_eta_u_dir = b10_mat_dot(&exit.eta_uv, inputs.dir, p);
     let exit_chi_u_dir = b10_mat_dot(&exit.chi_uv, inputs.dir, p);
-    let exit_d_u_dir = b10_mat_dot(&exit.d_uv, inputs.dir, p);
+    let exit_d_u_dir = &exit_ext.d_u_dir;
 
     let chi_inv = 1.0 / chi;
     let chi_inv2 = chi_inv * chi_inv;

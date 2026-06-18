@@ -142,7 +142,7 @@ impl SurvivalMarginalSlopeFamily {
                         &neg_coeff_a_dir,
                         &state.moments,
                     )?;
-                    let mut f_aa_dir = exact_kernel::cell_third_derivative_from_moments(
+                    let f_aa_dir = exact_kernel::cell_third_derivative_from_moments(
                         neg_cell,
                         &neg_dc_da,
                         &neg_dc_da,
@@ -1155,127 +1155,6 @@ impl SurvivalMarginalSlopeFamily {
                                 }
                                 acc
                             };
-                            let t1_dir = poly_add(
-                                &poly_add(
-                                    // D_dir(eta_aa·a_uv)
-                                    &poly_add(
-                                        &poly_scale(&eta_aa_dir_poly, a_uv[[u, v]]),
-                                        &poly_scale(&eta_aa_poly, a_uv_dir[[u, v]]),
-                                    ),
-                                    // D_dir(eta_aaa·a_u·a_v)
-                                    &poly_add(
-                                        &poly_scale(&eta_aaa_dir_poly, a_u[u] * a_u[v]),
-                                        &poly_scale(
-                                            &eta_aaa_poly,
-                                            a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v],
-                                        ),
-                                    ),
-                                ),
-                                &poly_add(
-                                    // D_dir(coeff_aau[u]·a_v + coeff_aau[v]·a_u)
-                                    &poly_add(
-                                        &poly_add(
-                                            &poly_scale(&coeff_aau_dir_u, a_u[v]),
-                                            &poly_scale(fixed.coeff_aau[u].as_ref(), a_u_dir[v]),
-                                        ),
-                                        &poly_add(
-                                            &poly_scale(&coeff_aau_dir_v, a_u[u]),
-                                            &poly_scale(fixed.coeff_aau[v].as_ref(), a_u_dir[u]),
-                                        ),
-                                    ),
-                                    // D_dir(r1_uv)
-                                    &r1_uv_dir,
-                                ),
-                            );
-                            let t2_dir = poly_scale(
-                                &poly_add(
-                                    &poly_add(
-                                        &poly_mul(
-                                            &poly_mul(&chi_u_dir_poly_v, &eta_poly),
-                                            &eta_u_poly[u],
-                                        ),
-                                        &poly_mul(
-                                            &poly_mul(&chi_u_poly[v], &eta_dir_poly),
-                                            &eta_u_poly[u],
-                                        ),
-                                    ),
-                                    &poly_mul(
-                                        &poly_mul(&chi_u_poly[v], &eta_poly),
-                                        &eta_u_dir_poly_u,
-                                    ),
-                                ),
-                                -1.0,
-                            );
-                            let t3_dir = poly_scale(
-                                &poly_add(
-                                    &poly_add(
-                                        &poly_mul(
-                                            &poly_mul(&chi_u_dir_poly_u, &eta_poly),
-                                            &eta_u_poly[v],
-                                        ),
-                                        &poly_mul(
-                                            &poly_mul(&chi_u_poly[u], &eta_dir_poly),
-                                            &eta_u_poly[v],
-                                        ),
-                                    ),
-                                    &poly_mul(
-                                        &poly_mul(&chi_u_poly[u], &eta_poly),
-                                        &eta_u_dir_poly_v,
-                                    ),
-                                ),
-                                -1.0,
-                            );
-                            let t4_dir = poly_scale(
-                                &poly_add(
-                                    &poly_mul(
-                                        &chi_dir_poly,
-                                        &poly_add(
-                                            &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                                            &poly_mul(&eta_poly, &eta_uv_poly),
-                                        ),
-                                    ),
-                                    &poly_mul(
-                                        &chi_poly,
-                                        &poly_add(
-                                            &poly_add(
-                                                &poly_mul(&eta_u_dir_poly_u, &eta_u_poly[v]),
-                                                &poly_mul(&eta_u_poly[u], &eta_u_dir_poly_v),
-                                            ),
-                                            &poly_add(
-                                                &poly_mul(&eta_dir_poly, &eta_uv_poly),
-                                                &poly_mul(&eta_poly, &eta_uv_dir_poly),
-                                            ),
-                                        ),
-                                    ),
-                                ),
-                                -1.0,
-                            );
-                            let t5_dir = poly_add(
-                                &poly_mul(
-                                    &chi_dir_poly,
-                                    &poly_mul(
-                                        &poly_mul(&eta_poly, &eta_poly),
-                                        &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                                    ),
-                                ),
-                                &poly_mul(
-                                    &chi_poly,
-                                    &poly_add(
-                                        &poly_mul(
-                                            &poly_scale(&poly_mul(&eta_dir_poly, &eta_poly), 2.0),
-                                            &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                                        ),
-                                        &poly_mul(
-                                            &poly_mul(&eta_poly, &eta_poly),
-                                            &poly_add(
-                                                &poly_mul(&eta_u_dir_poly_u, &eta_u_poly[v]),
-                                                &poly_mul(&eta_u_poly[u], &eta_u_dir_poly_v),
-                                            ),
-                                        ),
-                                    ),
-                                ),
-                            );
-
                             let jet_poly = |base: &[f64], d1: &[f64]| -> Vec<MultiDirJet> {
                                 let count = base.len().max(d1.len());
                                 (0..count)
