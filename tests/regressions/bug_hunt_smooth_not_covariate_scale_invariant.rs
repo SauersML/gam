@@ -103,6 +103,55 @@ fn fit_scan_log_lambda(a: f64, n: usize) -> f64 {
     }
 }
 
+/// Same fixed synthetic dataset as [`dataset_with_covariate_scale`], but the
+/// covariate is *translated* by a constant `b` (`x → x + b`) instead of scaled.
+/// The response and noise realization are identical for every `b`, so two
+/// datasets differ only by the additive covariate offset.
+fn dataset_with_covariate_offset(b: f64, n: usize) -> gam::data::EncodedDataset {
+    let mut rng = StdRng::seed_from_u64(20240616);
+    let u = Uniform::new(0.0_f64, 1.0).expect("uniform");
+    let noise = Normal::new(0.0, 0.2).expect("normal");
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|_| {
+            let x = u.sample(&mut rng);
+            let y = (2.0 * std::f64::consts::PI * x).sin() + noise.sample(&mut rng);
+            StringRecord::from(vec![(x + b).to_string(), y.to_string()])
+        })
+        .collect();
+    let headers = ["x", "y"].into_iter().map(String::from).collect();
+    encode_recordswith_inferred_schema(headers, rows).expect("encode")
+}
+
+/// Fit `formula` (Gaussian) on the `x → x + b` translated covariate and predict
+/// at a fixed grid of *relative* points mapped into the same offset coordinate,
+/// so two offset-`b` fits are directly comparable as functions.
+fn fit_grid_predictions_offset(formula: &str, b: f64, n: usize) -> Vec<f64> {
+    let data = dataset_with_covariate_offset(b, n);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
+    let probes: Vec<f64> = (0..15).map(|i| 0.05 + 0.90 * (i as f64) / 14.0).collect();
+    match result {
+        FitResult::Standard(fit) => {
+            let mut grid = Array2::<f64>::zeros((probes.len(), 2));
+            for (i, &v) in probes.iter().enumerate() {
+                grid[[i, 0]] = v + b;
+                grid[[i, 1]] = 0.0;
+            }
+            let design =
+                build_term_collection_design(grid.view(), &fit.resolvedspec).expect("design");
+            design.design.apply(&fit.fit.beta).to_vec()
+        }
+        FitResult::SplineScan(scan) => probes
+            .iter()
+            .map(|&v| scan.predict(v + b).expect("predict").0)
+            .collect(),
+        _ => panic!("unexpected fit result variant for {formula}"),
+    }
+}
+
 fn centered(v: &[f64]) -> Vec<f64> {
     let mean = v.iter().sum::<f64>() / v.len() as f64;
     v.iter().map(|x| x - mean).collect()
@@ -145,6 +194,40 @@ fn cr_smooth_is_invariant_to_covariate_rescaling() {
             (got - expected).abs() < 1.0e-3,
             "s(x, bs=\"cr\") log λ̂ not equivariant under covariate rescale a={a:.0e}: \
              got {got:.6}, expected {expected:.6} (= log λ̂(1) + 3·ln a)."
+        );
+    }
+}
+
+#[test]
+fn tp_smooth_is_invariant_to_covariate_translation() {
+    init_parallelism();
+    let formula = "y ~ s(x, bs=\"tp\")";
+    let n = 400;
+    let base = fit_grid_predictions_offset(formula, 0.0, n);
+
+    // A thin-plate spline is an exactly translation-EQUIVARIANT functional of the
+    // data: both the radial kernel `η(x_i − x_j)` and the `∫(f'')²` penalty depend
+    // only on coordinate differences, and the polynomial null space `{1, x}` is
+    // shift-closed (`{1, x + b}` spans the same space). So fitting on `x` and on
+    // `x + b` and predicting at correspondingly shifted points must return
+    // identical curves. Before #1269 the null-space block was assembled at the
+    // *absolute* coordinate, so a large offset near-collinearized `{1, x}`,
+    // ill-conditioned the design, and drifted REML λ̂ — moving the fit ~1.4% of
+    // signal range (saturating with |b|). The fix builds the basis in the knot
+    // cloud's centred frame, so the fit is location-free like `bs="cr"`/`"ps"`.
+    // Offsets span the issue's reported table (drift saturated at ~2.8e-2 for
+    // b ≥ 50). Capped at 100: building the centred frame from a knot mean ≈ b
+    // incurs an unavoidable `b·ε` cancellation when subtracting it back off the
+    // raw coordinate, so the achievable floor grows with |b| (~2e-14 at b=100);
+    // a 1e-10 ceiling stays ~6 orders below the bug while above that floor.
+    for &b in &[1.0, 10.0, 50.0, 100.0] {
+        let drift = max_shape_drift(&base, &fit_grid_predictions_offset(formula, b, n));
+        assert!(
+            drift < 1.0e-10,
+            "s(x, bs=\"tp\") fitted function changed under covariate translation b={b:.0e}: \
+             max |shape(0) − shape(b)| = {drift:.3e} over a signal of range ~2 \
+             (must be ~1e-13 — the kernel and penalty are translation-invariant; \
+             observed ~3e-2 before the polynomial null space was built in a centred frame)."
         );
     }
 }

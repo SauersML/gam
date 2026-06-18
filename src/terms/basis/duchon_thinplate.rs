@@ -986,6 +986,34 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
         crate::bail_invalid_basis!("thin-plate length_scale must be finite and positive");
     }
 
+    // Translation-invariant frame (#1269). The thin-plate kernel reads only
+    // coordinate *differences* `data − knots`, so it is already invariant to a
+    // covariate translation `x → x + c`; the polynomial null-space block
+    // `P = {1, x, x², …}` and the side-constraint nullspace `P(knots)ᵀα = 0`,
+    // however, are assembled at the *absolute* coordinate. When the covariate is
+    // offset (e.g. a centred-vs-raw "year", or this term's standardized axis
+    // carrying a large mean), the `{1, x}` columns become near-collinear, the
+    // design ill-conditions, and REML λ-selection lands in a slightly different
+    // basin — moving the fit by ~1% of signal range even though the model space
+    // is identical (`{1, x − x̄}` spans the same null space). Subtract the knot
+    // cloud's per-axis mean from both `data` and `knots` so the polynomial block
+    // is built in a location-standardized, well-conditioned frame. The knots are
+    // frozen (`UserProvided`) after fit, so this offset is identical at predict;
+    // and under `x → x + c` the knots (selected from the data) shift by the same
+    // `c`, so the centred coordinate — hence the whole basis — is invariant.
+    let knot_mean: Vec<f64> = (0..d)
+        .map(|c| knots.column(c).sum() / (k.max(1) as f64))
+        .collect();
+    let mut data_centered = data.to_owned();
+    let mut knots_centered = knots.to_owned();
+    for c in 0..d {
+        let mu = knot_mean[c];
+        data_centered.column_mut(c).mapv_inplace(|v| v - mu);
+        knots_centered.column_mut(c).mapv_inplace(|v| v - mu);
+    }
+    let data = data_centered.view();
+    let knots = knots_centered.view();
+
     // K block: radial basis evaluations data -> knots
     let mut kernel_block = Array2::<f64>::zeros((n, k));
     let kernel_result: Result<(), BasisError> = kernel_block
