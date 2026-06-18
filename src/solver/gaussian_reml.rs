@@ -2645,11 +2645,14 @@ fn optimize_rho(
 
     const GRID_INTERVALS: usize = 96;
     let mut stationary = Vec::<f64>::new();
+    let mut grid = Vec::<(f64, f64)>::with_capacity(GRID_INTERVALS + 1);
     let mut prev_rho = RHO_LOWER;
     let mut prev_eval = prepared.evaluate(prev_rho);
+    grid.push((prev_rho, prev_eval.cost));
     for i in 1..=GRID_INTERVALS {
         let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (GRID_INTERVALS as f64);
         let eval = prepared.evaluate(rho);
+        grid.push((rho, eval.cost));
         if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
             push_candidate(
                 &mut stationary,
@@ -2666,6 +2669,9 @@ fn optimize_rho(
     if let Some(rho0) = init_rho {
         push_candidate(&mut candidates, rho0);
     }
+    if let Some(rho) = refine_best_grid_cell(prepared, &grid) {
+        push_candidate(&mut candidates, rho);
+    }
 
     // Evaluate each candidate exactly once. `min_by` over a comparator that
     // re-evaluates would do O(n log n) extra `prepared.evaluate` calls during
@@ -2680,6 +2686,65 @@ fn optimize_rho(
                 "Gaussian REML optimizer produced no candidates".to_string(),
             )
         })
+}
+
+fn refine_best_grid_cell(prepared: &GaussianRemlPrepared, grid: &[(f64, f64)]) -> Option<f64> {
+    let best_idx = grid
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, cost))| cost.is_finite())
+        .min_by(|(_, (_, a)), (_, (_, b))| a.total_cmp(b))
+        .map(|(idx, _)| idx)?;
+    if best_idx == 0 || best_idx + 1 == grid.len() {
+        return Some(grid[best_idx].0);
+    }
+    Some(golden_section_rho(
+        |rho| prepared.evaluate(rho).cost,
+        grid[best_idx - 1].0,
+        grid[best_idx + 1].0,
+    ))
+}
+
+fn golden_section_rho<F>(mut cost: F, mut lo: f64, mut hi: f64) -> f64
+where
+    F: FnMut(f64) -> f64,
+{
+    const INV_PHI: f64 = 0.618_033_988_749_894_8;
+    const INV_PHI2: f64 = 0.381_966_011_250_105_1;
+    lo = lo.clamp(RHO_LOWER, RHO_UPPER);
+    hi = hi.clamp(RHO_LOWER, RHO_UPPER);
+    if !(lo.is_finite() && hi.is_finite()) || lo >= hi {
+        return lo.min(hi).clamp(RHO_LOWER, RHO_UPPER);
+    }
+    let mut x1 = lo + INV_PHI2 * (hi - lo);
+    let mut x2 = lo + INV_PHI * (hi - lo);
+    let mut f1 = cost(x1);
+    let mut f2 = cost(x2);
+    for _ in 0..80 {
+        if (hi - lo).abs() <= 1.0e-10 * (1.0 + 0.5 * (lo.abs() + hi.abs())) {
+            break;
+        }
+        if !f1.is_finite() || (f2.is_finite() && f2 < f1) {
+            lo = x1;
+            x1 = x2;
+            f1 = f2;
+            x2 = lo + INV_PHI * (hi - lo);
+            f2 = cost(x2);
+        } else {
+            hi = x2;
+            x2 = x1;
+            f2 = f1;
+            x1 = lo + INV_PHI2 * (hi - lo);
+            f1 = cost(x1);
+        }
+    }
+    let mid = 0.5 * (lo + hi);
+    [(lo, cost(lo)), (mid, cost(mid)), (hi, cost(hi))]
+        .into_iter()
+        .filter(|(_, c)| c.is_finite())
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(rho, _)| rho)
+        .unwrap_or(mid)
 }
 
 fn fill_weighted_rhs_no_alloc(
@@ -2787,8 +2852,10 @@ fn optimize_rho_no_alloc(
     let mut best_cost = lower_eval.cost;
 
     const GRID_INTERVALS: usize = 96;
+    let mut grid = Vec::<(f64, f64)>::with_capacity(GRID_INTERVALS + 1);
     let mut prev_rho = RHO_LOWER;
     let mut prev_eval = lower_eval;
+    grid.push((prev_rho, prev_eval.cost));
     for i in 1..=GRID_INTERVALS {
         let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (GRID_INTERVALS as f64);
         let eval = evaluate_reml_parts(
@@ -2799,6 +2866,7 @@ fn optimize_rho_no_alloc(
             n_outputs,
             rho,
         );
+        grid.push((rho, eval.cost));
         if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
             let stationary_rho = refine_stationary_rho_no_alloc(
                 cache,
@@ -2823,6 +2891,43 @@ fn optimize_rho_no_alloc(
         }
         prev_rho = rho;
         prev_eval = eval;
+    }
+    if let Some(best_idx) = grid
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, cost))| cost.is_finite())
+        .min_by(|(_, (_, a)), (_, (_, b))| a.total_cmp(b))
+        .map(|(idx, _)| idx)
+    {
+        let refined = if best_idx == 0 || best_idx + 1 == grid.len() {
+            grid[best_idx].0
+        } else {
+            golden_section_rho(
+                |rho| {
+                    evaluate_reml_parts(
+                        cache,
+                        ywy,
+                        projected_rhs_squared,
+                        n_observations,
+                        n_outputs,
+                        rho,
+                    )
+                    .cost
+                },
+                grid[best_idx - 1].0,
+                grid[best_idx + 1].0,
+            )
+        };
+        consider_rho_no_alloc(
+            cache,
+            ywy,
+            projected_rhs_squared,
+            n_observations,
+            n_outputs,
+            refined,
+            &mut best_rho,
+            &mut best_cost,
+        );
     }
 
     consider_rho_no_alloc(
