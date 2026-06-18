@@ -302,10 +302,12 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
             }
         }))
     );
-    assert_eq!(
-        family_state.get("link").and_then(Value::as_str),
-        Some("Sas")
-    );
+    // The coarse `link` tag is `Option<StandardLink>`, and `StandardLink` only
+    // carries the stateless links (Logit/Probit/CLogLog/Identity/Log). SAS is a
+    // parametric link whose full state lives in `likelihood.link = {"Sas": ..}`
+    // and in the synchronized `sas_state` below, so it has no `StandardLink`
+    // representation and the coarse tag stays null.
+    assert_eq!(family_state.get("link"), Some(&Value::Null));
     assert_eq!(
         family_state.get("sas_state"),
         Some(&serde_json::to_value(sas_state).expect("sas state json")),
