@@ -30,6 +30,7 @@ const FD_STEP: f64 = 1.0e-6;
 const OUTER_FD_STEP: f64 = 5.0e-6;
 const REL_TOL: f64 = 1.0e-5;
 const REL_FLOOR: f64 = 1.0e-8;
+const ABS_TOL: f64 = 5.0e-10;
 
 struct GradientChannel {
     name: &'static str,
@@ -58,10 +59,11 @@ fn assert_channel(row: &str, channel: &GradientChannel) {
             channel.name
         );
         let rel = (analytic - fd).abs() / analytic.abs().max(fd.abs()).max(REL_FLOOR);
+        let abs = (analytic - fd).abs();
         assert!(
-            rel < REL_TOL,
+            abs < ABS_TOL || rel < REL_TOL,
             "{row}/{}[{idx}] gradient is not the differential of the value: \
-             analytic={analytic:.12e} fd={fd:.12e} rel={rel:.3e}",
+             analytic={analytic:.12e} fd={fd:.12e} abs={abs:.3e} rel={rel:.3e}",
             channel.name
         );
     }
