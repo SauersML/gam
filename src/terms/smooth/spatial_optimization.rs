@@ -2463,9 +2463,12 @@ impl<'d> SpatialJointContext<'d> {
                     // null-space basis frozen at the revision-pinning ψ and only
                     // re-keys the Gram + penalty. That is exact only where the
                     // reduced basis is proven equal. RRQR rank/permutation was
-                    // not sufficient on the standardized fixture, so the tensor
-                    // currently exposes an empty skip band and moving-ψ trials
-                    // take the full `reset_surface` slow path.
+                    // not sufficient on the standardized fixture; the pairwise
+                    // range-projector witness (`reduced_basis_equal`) certifies
+                    // subspace equality between the pinning ψ and this trial ψ
+                    // n-free, so the skip fires only where the frozen reduced
+                    // basis is still valid — otherwise the full `reset_surface`
+                    // slow path runs.
                     && self.evaluator.psi_gram_tensor_covers_skip(psi)
                     // #1033 penalty lane: ψ moves S(ψ) too, and the skip leaves
                     // `reset_surface` un-run; only skip when the penalty can be

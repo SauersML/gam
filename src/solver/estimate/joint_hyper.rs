@@ -112,6 +112,14 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     /// revision yet recorded" — every subsequent call is treated as a
     /// fresh-canonical case and the slow path runs.
     pub(crate) last_canonical_revision: Option<u64>,
+    /// The ψ at which the last full `reset_surface` (slow path) realized and
+    /// froze the reduced-basis reference surface (#1264). The design-revision
+    /// fast path keeps that surface frozen while re-keying the Gram/penalty to
+    /// the trial ψ; the skip is sound only when the realized reduced basis at
+    /// this pinning ψ is still valid at the trial ψ, certified n-free by
+    /// [`crate::solver::psi_gram_tensor::PsiGramTensor::reduced_basis_equal`].
+    /// `None` until the first slow-path reset records a single-ψ trial.
+    pub(crate) last_reset_psi: Option<f64>,
     /// Certified Chebyshev-in-ψ Gram tensor for the SINGLE design-moving
     /// hyperparameter (#1033b, isotropic spatial κ): when present and the
     /// trial ψ lies inside the certified window, `prepare_eval_state`
@@ -253,6 +261,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             kronecker_factored: opts.kronecker_factored.clone(),
             reml_state,
             last_canonical_revision: None,
+            last_reset_psi: None,
             psi_gram_tensor: None,
             pending_psi_penalty: None,
             supports_nfree_penalty_rekey: false,
@@ -269,6 +278,19 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// checking this counter is unchanged across a repeat-revision eval.
     pub(crate) fn slow_path_reset_count(&self) -> u64 {
         self.slow_path_reset_count.get()
+    }
+
+    /// Record the pinning ψ frozen by a slow-path `reset_surface` (#1264): the
+    /// single design-moving ψ when `theta` carries one (`theta.len() == rho_dim +
+    /// 1`), else `None` (multi-ψ / no-ψ fits have no single-ψ skip witness). The
+    /// design-revision fast path certifies its skip against this ψ via
+    /// `psi_gram_tensor_covers_skip`.
+    fn record_reset_psi(&mut self, theta: &Array1<f64>, rho_dim: usize) {
+        self.last_reset_psi = if theta.len() == rho_dim + 1 {
+            Some(theta[rho_dim])
+        } else {
+            None
+        };
     }
 
     /// Stage (or clear) the frozen-weight GLM first-Fisher-step Gram for the
@@ -482,19 +504,26 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains(psi))
     }
 
-    /// True when a certified ψ-Gram tensor is installed AND `psi` lies inside its
-    /// reduced-basis-equality skip sub-window — the region where the
-    /// design-revision fast-path skip (re-key Gram + penalty on a frozen
-    /// reference surface) reproduces the exact slow-path β̂ (#1216, item 3).
-    /// On the wide standardized window the radial-kernel reduced basis moves
-    /// with ψ; a skip across that move pairs a stale reduced basis with a
-    /// re-keyed Gram and yields a wrong β̂. The current tensor cannot prove that
-    /// reduced basis equality, so this gate is empty and moving-ψ trials take the
-    /// full `reset_surface` slow path.
+    /// True when a certified ψ-Gram tensor is installed AND the design-revision
+    /// fast-path skip to `psi` is SOUND given the reduced-basis reference surface
+    /// frozen at the last slow-path reset ψ (`last_reset_psi`) (#1264, #1216 item
+    /// 3). The skip re-keys the Gram + penalty on the frozen reference surface;
+    /// it reproduces the exact slow-path β̂ only when the realized reduced basis
+    /// (the range / null split of the conditioned data Gram) at the pinning ψ is
+    /// still valid at `psi`. On the wide standardized window the radial-kernel
+    /// reduced subspace can rotate with ψ; a skip across that rotation pairs a
+    /// stale reduced basis with a re-keyed Gram and yields a wrong β̂. The pairwise
+    /// witness [`PsiGramTensor::reduced_basis_equal`] compares the gauge-invariant
+    /// range projectors at the two ψ's n-free; the skip fires only where they
+    /// span the same subspace. Without a recorded pinning ψ the skip is refused.
     pub(crate) fn psi_gram_tensor_covers_skip(&self, psi: f64) -> bool {
-        self.psi_gram_tensor
-            .as_ref()
-            .is_some_and(|t| t.contains_for_skip(psi))
+        let Some(tensor) = self.psi_gram_tensor.as_ref() else {
+            return false;
+        };
+        let Some(psi_ref) = self.last_reset_psi else {
+            return false;
+        };
+        tensor.reduced_basis_equal(psi_ref, psi)
     }
 
     /// True when the design-revision fast path of [`Self::prepare_eval_state`]
@@ -656,8 +685,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // `reset_surface` work entirely. Hyper-direction conditioning still
         // runs (hyper_dirs are freshly constructed per call) and the
         // warm-start beta / penalty-shrinkage floor still need refreshing.
-        let skip_window_allows_fast_path = match (self.psi_gram_tensor.as_ref(), theta.len()) {
-            (Some(tensor), len) if len == rho_dim + 1 => tensor.contains_for_skip(theta[rho_dim]),
+        let skip_window_allows_fast_path = match (self.psi_gram_tensor.is_some(), theta.len()) {
+            (true, len) if len == rho_dim + 1 => self.psi_gram_tensor_covers_skip(theta[rho_dim]),
             _ => true,
         };
         let fast_path = match (design_revision, self.last_canonical_revision) {
@@ -780,6 +809,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
         self.last_canonical_revision = design_revision;
+        // #1264: freeze the reduced-basis reference ψ this slow-path reset pins,
+        // so the next design-revision fast path can certify its skip against it.
+        self.record_reset_psi(theta, rho_dim);
         // #1216 hybrid: on the SLOW path the design was just REALIZED (the n×k
         // `x_fit` is live in `reset_surface` above), so the inner PLS forms the
         // EXACT `XᵀWX(ψ)` from it. We deliberately do NOT install the certified
@@ -975,8 +1007,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // full `reset_surface`, the cached surface's X, canonical penalties,
         // gaussian-fixed cache, and PIRLS cache are all still keyed to the
         // exact same (X, y, w, offset) — skip the eigendecomp + cache wipe.
-        let skip_window_allows_fast_path = match (self.psi_gram_tensor.as_ref(), theta.len()) {
-            (Some(tensor), len) if len == rho_dim + 1 => tensor.contains_for_skip(theta[rho_dim]),
+        let skip_window_allows_fast_path = match (self.psi_gram_tensor.is_some(), theta.len()) {
+            (true, len) if len == rho_dim + 1 => self.psi_gram_tensor_covers_skip(theta[rho_dim]),
             _ => true,
         };
         let fast_path = match (design_revision, self.last_canonical_revision) {
@@ -1072,6 +1104,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
         self.last_canonical_revision = design_revision;
+        // #1264: freeze the reduced-basis reference ψ this slow-path reset pins.
+        self.record_reset_psi(theta, rho_dim);
         self.install_psi_gram_statistics(theta, rho_dim);
         // #1033 penalty lane: the slow cost-only path rebuilt `S` from the freshly
         // realized design — drop any staged n-free penalty so a later fast-path
