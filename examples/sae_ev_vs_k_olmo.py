@@ -21,11 +21,13 @@ PROTOCOL (matches the real-data numbers posted to #1026):
   2. 80/20 train/test split (seeded). NO leakage.
   3. PCA fit on TRAIN ONLY, keep top --pcs components (default 32 = figH top-PC
      budget). Project both splits; global scale from TRAIN only (unit RMS).
-  4. For each K on the ladder, fit BOTH a curved (circle / periodic d=1) and a
-     true-linear (`atom_topology="linear"`, d=1) dictionary through the production engine, then
-     measure HELD-OUT reconstruction EV via `m.reconstruct(X_test)` (frozen
-     decoder re-seated on test-row latent coords).
-  5. Print the EV(K) table + the curved-minus-linear margin per K. The
+  4. For each K on the ladder, fit BOTH a curved-seeded hybrid (circle /
+     periodic d=1, with the fitted hybrid-split collapse honored by
+     `m.reconstruct`) and a true-linear (`atom_topology="linear"`, d=1)
+     dictionary through the production engine, then measure HELD-OUT
+     reconstruction EV via `m.reconstruct(X_test)` (frozen decoder re-seated on
+     test-row latent coords).
+  5. Print the EV(K) table + the hybrid-minus-linear margin per K. The
      discriminating signature (issue's H_flat vs H_curved): curved climbs fast
      then flattens; pure-linear keeps climbing by shattering each curved family
      into ~Theta/(2*sqrt(2*eps)) secants.
@@ -103,6 +105,18 @@ def _ev(target: np.ndarray, fitted: np.ndarray) -> float:
     return 1.0 - float(np.sum(resid**2)) / denom
 
 
+def _jsonable(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
 def _fit_ev(
     z_tr,
     z_te,
@@ -112,7 +126,7 @@ def _fit_ev(
     n_iter: int,
     max_fit_seconds: float,
     max_reconstruct_seconds: float,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, dict | None, list[str]]:
     """Fit one dictionary through the production engine; return HELD-OUT EV."""
     from gamfit import sae_manifold_fit
 
@@ -141,7 +155,15 @@ def _fit_ev(
             f"{topology} K={k} held-out reconstruct exceeded wall-clock guard: "
             f"{reconstruct_seconds:.1f}s > {max_reconstruct_seconds:.1f}s"
         )
-    return _ev(z_te, fitted_test), fit_seconds, reconstruct_seconds
+    hybrid_split = getattr(m, "hybrid_split", None)
+    atom_topologies = [str(v) for v in getattr(m, "atom_topologies", [])]
+    return (
+        _ev(z_te, fitted_test),
+        fit_seconds,
+        reconstruct_seconds,
+        None if hybrid_split is None else _jsonable(hybrid_split),
+        atom_topologies,
+    )
 
 
 def _parse_ladder(value: str) -> list[int]:
@@ -166,7 +188,6 @@ def _acceptance_report(
     required = set(REQUIRED_ACCEPTANCE_LADDER)
     missing = sorted(required - set(ladder))
     full_ladder_measured = required.issubset(measured)
-    best_curved = max((float(row["curved_ev_out"]) for row in rows), default=float("nan"))
     best_linear = max((float(row["linear_ev_out"]) for row in rows), default=float("nan"))
     best_hybrid = max((float(row["hybrid_ev_out"]) for row in rows), default=float("nan"))
     parity_ev = max(best_linear, official_reference_ev)
@@ -196,7 +217,6 @@ def _acceptance_report(
         "requested_ladder": [int(k) for k in ladder],
         "official_qwen_w32k_ev": float(official_reference_ev),
         "full_ladder_measured": bool(full_ladder_measured),
-        "best_curved_ev": float(best_curved),
         "best_linear_ev": float(best_linear),
         "best_hybrid_ev": float(best_hybrid),
         "parity_ev_bar": float(parity_ev),
@@ -265,8 +285,8 @@ def main() -> None:
     else:
         print("Acceptance ladder: K={8,32,128,512}; parity bar includes the official Qwen W32K held-out EV.")
     print(
-        f"{'K':>4}  {'curved_EV_out':>13}  {'linear_EV_out':>13}  "
-        f"{'(curved - linear)':>17}  {'curved_s':>9}  {'linear_s':>9}  {'recon_s':>9}"
+        f"{'K':>4}  {'hybrid_EV_out':>13}  {'linear_EV_out':>13}  "
+        f"{'(hybrid - linear)':>17}  {'hybrid_s':>9}  {'linear_s':>9}  {'recon_s':>9}"
     )
     rows = []
     for k in ladder:
@@ -274,7 +294,7 @@ def main() -> None:
         # routing-collapse-protected outer homotopy walk both grow with K, so the
         # budget must scale with K rather than gate every rung on the K=1 time.
         k_max_fit_seconds = args.max_fit_seconds * k
-        ev_c, fit_c, recon_c = _fit_ev(
+        ev_h, fit_h, recon_h, hybrid_split, hybrid_topologies = _fit_ev(
             z_tr,
             z_te,
             k,
@@ -284,7 +304,7 @@ def main() -> None:
             k_max_fit_seconds,
             args.max_reconstruct_seconds,
         )
-        ev_l, fit_l, recon_l = _fit_ev(
+        ev_l, fit_l, recon_l, linear_split, linear_topologies = _fit_ev(
             z_tr,
             z_te,
             k,
@@ -295,27 +315,32 @@ def main() -> None:
             args.max_reconstruct_seconds,
         )
         print(
-            f"{k:>4}  {ev_c:>13.6f}  {ev_l:>13.6f}  {ev_c - ev_l:>17.6f}  "
-            f"{fit_c:>9.1f}  {fit_l:>9.1f}  {max(recon_c, recon_l):>9.1f}"
+            f"{k:>4}  {ev_h:>13.6f}  {ev_l:>13.6f}  {ev_h - ev_l:>17.6f}  "
+            f"{fit_h:>9.1f}  {fit_l:>9.1f}  {max(recon_h, recon_l):>9.1f}"
         )
         rows.append(
             {
                 "K": k,
-                "curved_ev_out": ev_c,
-                "hybrid_ev_out": ev_c,
+                "hybrid_ev_out": ev_h,
                 "linear_ev_out": ev_l,
-                "curved_minus_linear": ev_c - ev_l,
-                "curved_fit_seconds": fit_c,
+                "hybrid_minus_linear": ev_h - ev_l,
+                "hybrid_fit_seconds": fit_h,
                 "linear_fit_seconds": fit_l,
-                "max_reconstruct_seconds": max(recon_c, recon_l),
+                "max_reconstruct_seconds": max(recon_h, recon_l),
+                "hybrid_seed_topology": "circle",
+                "hybrid_atom_topologies": hybrid_topologies,
+                "hybrid_split": hybrid_split,
+                "linear_atom_topologies": linear_topologies,
+                "linear_split": linear_split,
             }
         )
 
     print(
-        "\nDiscriminating read (issue H_flat vs H_curved): curved should DOMINATE linear at "
-        "matched K and CLIMB-then-FLATTEN; pure-linear should keep climbing by shattering each "
-        "curved family into ~Theta/(2*sqrt(2*eps)) secants. The in-tree predictor for this curve "
-        "is tests/sae/sae_ev_vs_k_frontier.rs."
+        "\nDiscriminating read (issue H_flat vs H_curved): the curved-seeded hybrid should "
+        "DOMINATE linear at matched K and CLIMB-then-FLATTEN; pure-linear should keep climbing "
+        "by shattering each curved family into ~Theta/(2*sqrt(2*eps)) secants. Inspect each "
+        "row's hybrid_split.atoms for fitted_turning Θ and LOAO ΔEV; the in-tree predictor for "
+        "this curve is tests/sae/sae_ev_vs_k_frontier.rs."
     )
     acceptance = _acceptance_report(
         rows,
