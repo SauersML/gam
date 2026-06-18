@@ -52,11 +52,40 @@ extern crate self as gam;
 #[macro_use]
 mod macros;
 
+/// Stack reserved for each worker in the global Rayon pool.
+///
+/// The deep numerical kernels run on Rayon workers, not just the calling
+/// thread: the survival location-scale row Hessian/derivative operators
+/// contract a `Tower4<9>` jet program (9⁴ fourth-order entries, ≈59 KiB per
+/// scalar held by value, several towers live at once — see
+/// `families::survival::location_scale::row_kernel::row_nll_tower`) inside
+/// `RowSet::par_reduce_fold` and `into_par_iter` reductions, and faer's matmul
+/// / factorization recursions fan out over the pool too. A single
+/// `[Tower4<9>; 9]` array is already ≈0.5 MiB, so one row evaluation plus its
+/// temporaries overruns Rayon's default ~2 MiB worker stack and aborts with
+/// "thread '…' has overflowed its stack". The CLI entry point already drives
+/// the *serial* path on a wide-stack worker (`CLI_WORKER_STACK_SIZE` in
+/// `main.rs`); the Rayon pool that evaluates the identical kernel in parallel
+/// for `n ≥ EVALUATE_PARALLEL_ROW_THRESHOLD` models must get the same headroom
+/// or the parallel path overflows where the serial path no longer does. The
+/// reservation is virtual address space — pages commit lazily, so the headroom
+/// costs nothing until the deep jet paths actually use it.
+const RAYON_WORKER_STACK_SIZE: usize = 64 << 20;
+
 /// Initialize faer's global parallelism backend to a Rayon pool sized at
 /// `rayon::current_num_threads()`. Rayon's pool itself honors the standard
 /// `RAYON_NUM_THREADS` environment variable on first use, so callers that
 /// need to constrain the worker count (e.g. the benchmark harnesses) set it
 /// once on the spawned subprocess and rayon picks it up natively.
+///
+/// The global pool is built explicitly here with a wide per-worker stack
+/// (`RAYON_WORKER_STACK_SIZE`) so the survival-LS `Tower4<9>` jet kernel — and
+/// every other deep recursion that dispatches onto Rayon — has the same stack
+/// headroom on a pool worker as it does on the CLI's wide-stack driver thread.
+/// `build_global` only succeeds on the first thread to touch the pool; if some
+/// earlier caller already initialized it we keep that pool rather than failing,
+/// because the CLI drives `init_parallelism` before any Rayon use and so always
+/// wins the race that matters.
 ///
 /// Idempotent: only the first call has effect (guarded by `std::sync::Once`).
 /// Without this, faer's global default is `Par::Seq` and matmul/factorizations
@@ -64,6 +93,12 @@ mod macros;
 pub fn init_parallelism() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
+        // Ignore the error returned when the global pool was already built by
+        // an earlier caller: we cannot resize an existing pool, and the only
+        // path that strictly needs the wide stack (the CLI) reaches this first.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(RAYON_WORKER_STACK_SIZE)
+            .build_global();
         faer::set_global_parallelism(faer::Par::rayon(0));
     });
 }
