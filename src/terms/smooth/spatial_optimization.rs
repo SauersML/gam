@@ -3246,6 +3246,21 @@ fn run_exact_joint_spatial_optimization(
         }
     }
 
+    let kphase_prime_order = if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
+        OuterEvalOrder::ValueGradientHessian
+    } else {
+        OuterEvalOrder::ValueAndGradient
+    };
+    let kphase_prime_start = std::time::Instant::now();
+    let _ = ctx.eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?;
+    log::info!(
+        "[KAPPA-PHASE-PRIME] order={:?} elapsed_s={:.4} slow_path_resets_total={} design_revision={}",
+        kphase_prime_order,
+        kphase_prime_start.elapsed().as_secs_f64(),
+        ctx.evaluator.slow_path_reset_count(),
+        ctx.cache.design_revision(),
+    );
+
     let kphase_cost_calls = std::cell::Cell::new(0usize);
     let kphase_eval_calls = std::cell::Cell::new(0usize);
     let kphase_efs_calls = std::cell::Cell::new(0usize);

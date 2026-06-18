@@ -326,11 +326,13 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
         let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
         let timing = kappa.kappa_timing.unwrap();
         let phase = timing.trial_total_s().max(0.0);
+        let callback_avg = kappa.kappa_callback_avg_s().unwrap_or(0.0).max(0.0);
         kappa_phase.push(phase);
         eprintln!(
-            "[kappa-fast-ladder] {n:>9}  {:>10.4}  {:>12.4}  {phase:>12.4}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9.4}  {:>9.4}  {:>9.4}",
+            "[kappa-fast-ladder] {n:>9}  {:>10.4}  {:>12.4}  {:>12.4}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9.4}  {:>9.4}  {:>9.4}",
             kappa.wall_s,
             timing.trial_total_s(),
+            callback_avg,
             timing.slow_path_resets,
             timing.design_revision_delta,
             timing.cost_calls,
@@ -409,11 +411,13 @@ fn kappa_outer_loop_is_n_independent() {
         let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
         let timing = kappa.kappa_timing.unwrap();
         let phase = timing.trial_total_s().max(0.0);
+        let callback_avg = kappa.kappa_callback_avg_s().unwrap_or(0.0).max(0.0);
         kappa_phase.push(phase);
         eprintln!(
-            "[kappa-n-scaling] {n:>9}  {:>10.4}  {:>12.4}  {phase:>12.4}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9.4}  {:>9.4}  {:>9.4}",
+            "[kappa-n-scaling] {n:>9}  {:>10.4}  {:>12.4}  {:>12.4}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9.4}  {:>9.4}  {:>9.4}",
             kappa.wall_s,
             timing.trial_total_s(),
+            callback_avg,
             timing.slow_path_resets,
             timing.design_revision_delta,
             timing.cost_calls,
