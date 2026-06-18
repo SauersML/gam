@@ -540,7 +540,14 @@ def _functional_basis_params(plan: Mapping[str, Any]) -> dict[str, Any] | None:
             basis_size = int(plan.get("basis_size", 0))
             n_harmonics = (basis_size - 1) // 2
         return {"n_harmonics": max(1, n_harmonics)}
-    if kind in {"duchon", "euclidean", "euclidean_patch"}:
+    if kind in {
+        "linear",
+        "linear_rank1",
+        "affine",
+        "duchon",
+        "euclidean",
+        "euclidean_patch",
+    }:
         centers = plan.get("duchon_centers")
         if centers is None:
             return None
@@ -2575,14 +2582,16 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     atom_topology
         Shared topology label used when ``atom_basis`` is not supplied. Common
         values are ``"circle"``, ``"periodic"``, ``"sphere"``, ``"torus"``,
-        and ``"euclidean"``. If omitted, the default is ``"circle"``.
+        ``"linear"``, and ``"euclidean"``. If omitted, the default is
+        ``"circle"``.
 
         NOTE (#1201): ``"euclidean"`` is a degree-2 QUADRATIC monomial patch
         (``{1, t, t²}`` at ``d_atom=1``), NOT a single straight decoder direction
         ``γ(t)=t·b``. Do not treat ``atom_topology="euclidean"`` as the "linear"
         SAE baseline — a curved-vs-``"euclidean"`` comparison is curved-vs-
-        quadratic. The genuinely linear per-atom secant is the hybrid-split LINEAR
-        candidate (see :attr:`ManifoldSAE.hybrid_split`).
+        quadratic. Use ``atom_topology="linear"`` for the genuinely linear
+        affine atom ``{1, t}``; the same candidate is used by the hybrid-split
+        LINEAR verdicts (see :attr:`ManifoldSAE.hybrid_split`).
     assignment
         Assignment/gating family. ``"ibp_map"`` uses the IBP-MAP gate path,
         ``"softmax"`` uses soft mixture masses, and ``"jumprelu"`` uses the
@@ -3321,10 +3330,13 @@ def _dims(k_atoms: int, d_atom: Any) -> list[int]:
 
 _TOPOLOGY_TO_BASIS = {
     "circle": "periodic", "periodic": "periodic",
-    "sphere": "sphere", "torus": "torus", "euclidean": "euclidean",
+    "sphere": "sphere", "torus": "torus",
+    "linear": "linear", "linear_rank1": "linear", "affine": "linear",
+    "euclidean": "euclidean",
 }
 _BASIS_TO_TOPOLOGY = {
     "periodic": "circle", "sphere": "sphere", "torus": "torus",
+    "linear": "linear", "linear_rank1": "linear", "affine": "linear",
     "duchon": "euclidean", "euclidean": "euclidean", "euclidean_patch": "euclidean",
 }
 
