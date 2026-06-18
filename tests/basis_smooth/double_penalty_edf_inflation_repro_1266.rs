@@ -90,15 +90,20 @@ fn bspline_spec(double_penalty: bool) -> TermCollectionSpec {
                     penalty_order: 2,
                     knotspec: BSplineKnotSpec::Generate {
                         data_range: (0.0, 1.0),
-                        // 10 internal knots → ~13 basis fns: still a soft 2nd-diff
-                        // spectrum (the #1266 mechanism), but keeps the
-                        // single-penalty unpenalized boundary columns full-rank
-                        // (16 knots aliased boundary cols [0,19,20] → pre-fit rank
-                        // deficiency on the single-penalty fit).
-                        num_internal_knots: 10,
+                        // 16 internal knots ≈ k=20 basis fns — the issue's config,
+                        // where the ps double penalty inflates EDF (2.56→5.28).
+                        // 10 knots did NOT reproduce the inflation (λ_bend stayed
+                        // large/correct, EDF≈1.2) → the bug is knot-count
+                        // dependent; probe at the config that actually inflates.
+                        num_internal_knots: 16,
                     },
                     double_penalty,
-                    identifiability: BSplineIdentifiability::None,
+                    // Sum-to-zero centering matches gamfit's `s(x)` (the mgcv
+                    // convention the issue's reproducer uses). `None` left the
+                    // unpenalized constant aliased → the single-penalty fit was
+                    // pre-fit rank deficient (NaN), and the raw frame did not
+                    // reproduce the gamfit-path inflation.
+                    identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
                 },
