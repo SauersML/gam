@@ -557,13 +557,20 @@ impl PenaltyPseudologdet {
         // custom-family/multinomial value (joint_newton) and gradient
         // (`rho_derivatives` via `compute_block_penalty_logdet_derivs`) paths —
         // both routed through `from_components` — agree by construction.
-        if let Some(blocks) = disjoint_diagonal_blocks(s_k_matrices)
-            && blocks.len() > 1
-        {
-            return Self::from_assembled_block_local(s_total, ridge_hint, &blocks);
+        if let Some(blocks) = disjoint_diagonal_blocks(s_k_matrices) {
+            if blocks.len() > 1 {
+                return Self::from_assembled_block_local(s_total, ridge_hint, &blocks);
+            }
         }
 
-        Self::from_assembled_with_rank_hint(s_total, ridge_hint, None)
+        let mut structural_total = Array2::<f64>::zeros((p_dim, p_dim));
+        for (k, s_k) in s_k_matrices.iter().enumerate() {
+            if k < lambdas.len() && lambdas[k] > 0.0 {
+                structural_total.scaled_add(1.0, s_k);
+            }
+        }
+        let structural_rank = structural_rank_from_assembled(&structural_total)?;
+        Self::from_assembled_with_rank_hint(s_total, ridge_hint, Some(structural_rank))
     }
 
     /// Build from a pre-assembled penalty matrix.
@@ -1858,6 +1865,27 @@ mod tests {
         );
 
         let (det1, _) = pld.rho_derivatives_from_penalties(&penalties, &lambdas);
+        assert!((det1[0] - 2.0).abs() < 1e-9);
+        assert!((det1[1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    pub(crate) fn test_dense_components_keep_structural_rank_under_lambda_imbalance() {
+        let lambdas = [1.0e12_f64, 1.0e-6_f64];
+        let penalties = vec![
+            array![[100.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+            array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        ];
+
+        let pld = PenaltyPseudologdet::from_components(&penalties, &lambdas, 0.0)
+            .expect("dense same-block double penalty pseudo-logdet");
+        assert_eq!(
+            pld.rank(),
+            3,
+            "dense component double penalty must keep positive-lambda structural rank"
+        );
+
+        let (det1, _) = pld.rho_derivatives(&penalties, &lambdas);
         assert!((det1[0] - 2.0).abs() < 1e-9);
         assert!((det1[1] - 1.0).abs() < 1e-9);
     }
