@@ -789,9 +789,8 @@ pub(crate) fn compute_outer_hessian(
             (0..pair_count)
                 .into_par_iter()
                 .map(|pair_idx| {
-                    let (ii, jj) = crate::linalg::matrix::kronecker::upper_triangle_pair_from_index(
-                        pair_idx, ext_dim,
-                    );
+                    let (ii, jj) =
+                        crate::linalg::matrix::upper_triangle_pair_from_index(pair_idx, ext_dim);
                     crate::linalg::faer_ndarray::with_nested_parallel(|| ext_pair_fn(ii, jj))
                 })
                 .collect()
