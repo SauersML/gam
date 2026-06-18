@@ -22,8 +22,14 @@ now() { date +%H:%M:%S; }; ep() { date +%s; }
 # the target dir and wastes ~90s). If disk is too low, point the caller at MSI.
 free_gb="$(df -g "$REPO" 2>/dev/null | awk 'NR==2{print $4}')"
 if [[ -n "$free_gb" && "$free_gb" -lt "$MIN_FREE_GB" ]]; then
-  echo "[build.sh] only ${free_gb}G free (< ${MIN_FREE_GB}G) — refusing to build locally (would ENOSPC at link)." >&2
-  echo "[build.sh] route to MSI instead: bash /Users/user/msi_test.sh <test_name>" >&2
+  echo "[build.sh] only ${free_gb}G free (< ${MIN_FREE_GB}G) — a local build would ENOSPC at link." >&2
+  # Pluggable remote backend: set GAM_REMOTE_RUN=<runner> (kept out of the repo)
+  # to auto-route heavy builds/tests off this box. Keeps build.sh backend-agnostic.
+  if [[ -n "${GAM_REMOTE_RUN:-}" ]]; then
+    echo "[build.sh] routing to remote runner: $GAM_REMOTE_RUN $*" >&2
+    exec "$GAM_REMOTE_RUN" "$@"
+  fi
+  echo "[build.sh] set GAM_REMOTE_RUN=<remote runner> to auto-route, or run on a box with disk." >&2
   exit 70
 fi
 

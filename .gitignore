@@ -205,3 +205,6 @@ build.err
 slurm-*.out
 *.slurm.out
 .buildd/
+gam-target*/
+gam_env.sh
+*.trace
