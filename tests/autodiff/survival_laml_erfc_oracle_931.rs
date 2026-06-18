@@ -13,6 +13,7 @@ use ndarray::{Array1, Array2, array};
 
 const RHO: f64 = 6.0;
 const FD_STEP: f64 = 2.5e-4;
+const MAX_ORACLE_HESSIAN_CONDITION: f64 = 1.0e2;
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
@@ -29,6 +30,19 @@ fn normal_survival_erfc(x: f64) -> f64 {
 #[inline]
 fn normal_pdf(x: f64) -> f64 {
     INV_SQRT_2PI * (-0.5 * x * x).exp()
+}
+
+fn symmetric_2x2_condition_number(h: [[f64; 2]; 2]) -> f64 {
+    let trace = h[0][0] + h[1][1];
+    let diff = h[0][0] - h[1][1];
+    let gap = (diff * diff + 4.0 * h[0][1] * h[1][0]).sqrt();
+    let lo = 0.5 * (trace - gap);
+    let hi = 0.5 * (trace + gap);
+    assert!(
+        lo > 0.0 && hi.is_finite(),
+        "oracle Hessian must be SPD, eigenvalues=({lo:.6e}, {hi:.6e}), h={h:?}"
+    );
+    hi / lo
 }
 
 #[derive(Clone)]
@@ -127,6 +141,11 @@ impl ProbitOracle {
             grad[0].hypot(grad[1]) < 1.0e-10,
             "oracle inner solve did not reach stationarity: beta={beta:?}, grad={grad:?}"
         );
+        let condition = symmetric_2x2_condition_number(h);
+        assert!(
+            condition < MAX_ORACLE_HESSIAN_CONDITION,
+            "oracle inner Hessian must stay well-conditioned: condition={condition:.6e}, h={h:?}"
+        );
         (beta, h, nll)
     }
 
@@ -140,8 +159,12 @@ impl ProbitOracle {
         penalized_nll + 0.5 * det_h.ln() - 0.5 * rho
     }
 
+    fn fd_laml_derivative_at_rho_six_with_step(&self, step: f64) -> f64 {
+        (self.laml_value(RHO + step) - self.laml_value(RHO - step)) / (2.0 * step)
+    }
+
     fn fd_laml_derivative_at_rho_six(&self) -> f64 {
-        (self.laml_value(RHO + FD_STEP) - self.laml_value(RHO - FD_STEP)) / (2.0 * FD_STEP)
+        self.fd_laml_derivative_at_rho_six_with_step(FD_STEP)
     }
 }
 
@@ -191,6 +214,13 @@ fn production_probit_gradient_at_rho_six(oracle: &ProbitOracle) -> f64 {
 fn issue_931_rho_six_laml_derivative_matches_independent_erfc_oracle() {
     let oracle = ProbitOracle::new();
     let fd = oracle.fd_laml_derivative_at_rho_six();
+    for step in [1.0e-5, 5.0e-4, 1.0e-3] {
+        let probe = oracle.fd_laml_derivative_at_rho_six_with_step(step);
+        assert!(
+            (probe - fd).abs() < 1.0e-8,
+            "#931 erfc oracle FD is step-sensitive at rho=6: baseline={fd:.12e}, step={step:.1e}, probe={probe:.12e}"
+        );
+    }
     let analytic = production_probit_gradient_at_rho_six(&oracle);
     let scale = analytic.abs().max(fd.abs()).max(1.0);
     let rel = (analytic - fd).abs() / scale;
