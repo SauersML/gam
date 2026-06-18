@@ -755,25 +755,6 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     Ok(z)
 }
 
-#[inline]
-pub(crate) fn spherical_chord_distance2(
-    a: ArrayView1<'_, f64>,
-    b: ArrayView1<'_, f64>,
-    radians: bool,
-) -> f64 {
-    let to_rad = if radians {
-        1.0
-    } else {
-        std::f64::consts::PI / 180.0
-    };
-    let lat_a = a[0] * to_rad;
-    let lon_a = a[1] * to_rad;
-    let lat_b = b[0] * to_rad;
-    let lon_b = b[1] * to_rad;
-    let cos_gamma = lat_a.sin() * lat_b.sin() + lat_a.cos() * lat_b.cos() * (lon_a - lon_b).cos();
-    2.0 * (1.0 - cos_gamma.clamp(-1.0, 1.0))
-}
-
 pub fn select_spherical_farthest_point_centers(
     data: ArrayView2<'_, f64>,
     num_centers: usize,
