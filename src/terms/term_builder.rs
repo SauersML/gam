@@ -1346,7 +1346,8 @@ fn tensor_k_axis_option_axis(
 }
 
 fn is_tensor_k_axis_option_key(key: &str) -> bool {
-    key.strip_prefix("k_").is_some_and(|suffix| !suffix.is_empty())
+    key.strip_prefix("k_")
+        .is_some_and(|suffix| !suffix.is_empty())
 }
 
 /// Parse a per-margin basis dimension list (`k=<scalar>`, `k=[k0, k1, ...]`,
@@ -3792,7 +3793,7 @@ pub fn validate_known_options(
                 format!(" — did you mean one of [{}]?", suggestions.join(", "))
             };
             return Err(TermBuilderError::invalid_option(format!(
-                "{term_name}() does not accept option `{key}`{hint} Known options: [{}]",
+                "{term_name}() does not accept option `{key}`{hint}. Valid options: [{}]",
                 {
                     let mut sorted = known.to_vec();
                     sorted.sort_unstable();
@@ -4239,6 +4240,30 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn validate_known_options_lists_valid_option_names_for_unknown_parameter() {
+        let mut options = BTreeMap::new();
+        options.insert("lengt_scale".to_string(), "0.25".to_string());
+        let err = validate_known_options(
+            "matern",
+            &options,
+            &["type", "bs", "length_scale", "centers", "k", "nu"],
+        )
+        .expect_err("unknown smooth option should be rejected");
+        assert!(
+            err.contains("matern() does not accept option `lengt_scale`"),
+            "error should name the invalid option, got: {err}"
+        );
+        assert!(
+            err.contains("did you mean one of [length_scale]"),
+            "error should suggest the closest valid option, got: {err}"
+        );
+        assert!(
+            err.contains("Valid options: ["),
+            "error should list valid option names, got: {err}"
+        );
     }
 
     #[test]
