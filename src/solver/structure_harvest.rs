@@ -1481,6 +1481,11 @@ pub fn run_structure_search_rounds(
         SaeManifoldRho,
         &[usize],
     ) -> (SaeManifoldTerm, SaeManifoldRho),
+    mut finalize_round: impl FnMut(
+        SaeManifoldTerm,
+        SaeManifoldRho,
+        &[usize],
+    ) -> (SaeManifoldTerm, SaeManifoldRho),
 ) -> Result<StructureSearchResult, String> {
     let RoundDriverConfig {
         n_shards,
@@ -1551,10 +1556,23 @@ pub fn run_structure_search_rounds(
         });
         rounds.push(round_ledger);
 
-        term = next_term;
-        rho = next_rho;
-
-        if !applied {
+        if applied {
+            // The adopted winner reached its restructured form through the cheap
+            // capped-iteration SCORING refit; re-refit it at the full inner
+            // budget (same estimation-row weighting) before it becomes the next
+            // round's parent and the returned dictionary, so the cap is a
+            // scoring-only economy and the adopted state matches a direct
+            // full-iter refit (the inner solve is convergent; the capped score
+            // was only a worse starting iterate). When no move landed, the state
+            // is byte-identical to the unrefit pre-search parent and needs no
+            // polish.
+            let (polished_term, polished_rho) =
+                finalize_round(next_term, next_rho, &split.estimation_rows);
+            term = polished_term;
+            rho = polished_rho;
+        } else {
+            term = next_term;
+            rho = next_rho;
             break;
         }
     }
@@ -1736,8 +1754,25 @@ fn sse_accumulate(sse: &mut f64, d: f64) {
 /// the outer SAE fit drove its inner Arrow-Schur joint fit with).
 #[derive(Clone, Copy, Debug)]
 pub struct ProductionRefitParams {
-    /// Inner Newton iterations per shard refit.
+    /// Inner Newton iterations for the FULL refit that produces the adopted
+    /// state (the round winner that becomes the next round's parent and the
+    /// returned dictionary). Quality-bearing — kept at the outer fit's budget.
     pub inner_max_iter: usize,
+    /// Inner Newton iterations for the per-candidate SCORING refit only (the
+    /// many rejected / contested candidates the e-gate ranks each round). A
+    /// structural move yields a WARM child — the parent's converged dictionary
+    /// with one atom restructured (see [`apply_structure_move`]) — so only the
+    /// touched atom must re-equilibrate before the held-out evidence gate can
+    /// rank it; a small budget suffices. This caps the dominant cost of the
+    /// search (≈ K·rounds full-dictionary refits) WITHOUT changing the adopted
+    /// state: every round's winner is re-refit at the full `inner_max_iter`
+    /// budget before it is adopted, so cap-then-polish reaches the same inner
+    /// optimum as a direct full-iter refit (the inner solve is convergent; the
+    /// capped score is only a worse starting iterate for the polish). The e-gate
+    /// DECISION reads the capped score, so this is the one quantity that can in
+    /// principle differ from a full-iter search; it is held to a tight
+    /// match-or-equivalent bar (#1026).
+    pub scoring_inner_max_iter: usize,
     /// Inner Newton step size.
     pub learning_rate: f64,
     /// Ext-coordinate ridge.
@@ -1767,51 +1802,82 @@ pub fn run_production_structure_search(
     refit_params: ProductionRefitParams,
     ledger: &mut StructureLedger,
 ) -> Result<StructureSearchResult, String> {
-    let full_target = target.to_owned();
-    let n = full_target.nrows();
+    let n = target.nrows();
+    // Refit a restructured candidate on the ESTIMATION rows only at a chosen
+    // inner-iteration budget: the held-out evaluation rows carry a near-zero
+    // weight (vanishing fitting pressure) via the per-row reconstruction-weight
+    // seam, so the candidate is the predictable plug-in the held-out shards are
+    // scored against. The seam requires strictly-positive weights, so a tiny
+    // epsilon stands in for the structural zero; after mean-1 normalization the
+    // estimation rows carry weight ≈ n/n_est and the held-out rows ≈ 0. A
+    // non-converging inner solve returns the unchanged candidate (infallible at
+    // the boundary). `inner_max_iter` is the only knob that varies between the
+    // cheap per-candidate scoring pass and the full-iter polish of the adopted
+    // winner; `full_target` is borrowed by reference so the helper holds no owned
+    // capture and can be called from both closures below.
+    let refit_at = |full_target: ArrayView2<'_, f64>,
+                    mut cand_term: SaeManifoldTerm,
+                    mut cand_rho: SaeManifoldRho,
+                    estimation_rows: &[usize],
+                    inner_max_iter: usize|
+     -> (SaeManifoldTerm, SaeManifoldRho) {
+        const HELD_OUT_WEIGHT: f64 = 1e-12;
+        let mut weights = vec![HELD_OUT_WEIGHT; n];
+        for &r in estimation_rows {
+            if r < n {
+                weights[r] = 1.0;
+            }
+        }
+        if cand_term.set_row_loss_weights(weights).is_err() {
+            return (cand_term, cand_rho);
+        }
+        if cand_term
+            .run_joint_fit_arrow_schur(
+                full_target,
+                &mut cand_rho,
+                None,
+                inner_max_iter,
+                refit_params.learning_rate,
+                refit_params.ridge_ext_coord,
+                refit_params.ridge_beta,
+            )
+            .is_err()
+        {
+            return (cand_term, cand_rho);
+        }
+        (cand_term, cand_rho)
+    };
+    let scoring_iters = refit_params.scoring_inner_max_iter;
+    let full_iters = refit_params.inner_max_iter;
+    let full_target_score = target.to_owned();
+    let full_target_polish = target.to_owned();
     run_structure_search_rounds(
         term,
         rho,
         target,
         config,
         ledger,
-        move |mut cand_term, mut cand_rho, estimation_rows| {
-            // Refit the restructured candidate on the ESTIMATION rows only: the
-            // held-out evaluation rows carry a near-zero weight (vanishing
-            // fitting pressure) via the per-row reconstruction-weight seam, so
-            // the candidate is the predictable plug-in the held-out shards are
-            // scored against. The seam requires strictly-positive weights, so a
-            // tiny epsilon stands in for the structural zero; after mean-1
-            // normalization the estimation rows carry weight ≈ n/n_est and the
-            // held-out rows ≈ 0. A non-converging inner solve returns the
-            // unchanged candidate (the closure is infallible at the boundary).
-            const HELD_OUT_WEIGHT: f64 = 1e-12;
-            let mut weights = vec![HELD_OUT_WEIGHT; n];
-            for &r in estimation_rows {
-                if r < n {
-                    weights[r] = 1.0;
-                }
-            }
-            if cand_term.set_row_loss_weights(weights).is_err() {
-                return (cand_term, cand_rho);
-            }
-            // A non-converging inner solve leaves the candidate as-is (the gate
-            // then sees no improvement — a conservative, valid degradation).
-            if cand_term
-                .run_joint_fit_arrow_schur(
-                    full_target.view(),
-                    &mut cand_rho,
-                    None,
-                    refit_params.inner_max_iter,
-                    refit_params.learning_rate,
-                    refit_params.ridge_ext_coord,
-                    refit_params.ridge_beta,
-                )
-                .is_err()
-            {
-                return (cand_term, cand_rho);
-            }
-            (cand_term, cand_rho)
+        // Per-candidate SCORING refit: capped (warm child, few iters).
+        move |cand_term, cand_rho, estimation_rows| {
+            refit_at(
+                full_target_score.view(),
+                cand_term,
+                cand_rho,
+                estimation_rows,
+                scoring_iters,
+            )
+        },
+        // Full-iter POLISH of each round's adopted winner before it becomes the
+        // next round's parent / the returned dictionary, so the cap is a
+        // scoring-only economy and the adopted state matches a full-iter refit.
+        move |adopted_term, adopted_rho, estimation_rows| {
+            refit_at(
+                full_target_polish.view(),
+                adopted_term,
+                adopted_rho,
+                estimation_rows,
+                full_iters,
+            )
         },
     )
 }
@@ -2321,9 +2387,17 @@ mod tests {
             // Deterministic no-op fit: the scripted gate sees the unrefit
             // candidate (the engine's determinism is what this asserts, not the
             // SAE inner solve).
-            run_structure_search_rounds(term, rho, target.view(), config, &mut ledger, |t, r, _| {
-                (t, r)
-            })
+            run_structure_search_rounds(
+                term,
+                rho,
+                target.view(),
+                config,
+                &mut ledger,
+                |t, r, _| (t, r),
+                // No-op polish: this determinism oracle scripts the gate and
+                // never runs the SAE inner solve.
+                |t, r, _| (t, r),
+            )
             .unwrap()
         };
 
@@ -2336,6 +2410,109 @@ mod tests {
             "identical inputs must produce a byte-identical ledger"
         );
         assert_eq!(a.term.k_atoms(), b.term.k_atoms());
+    }
+
+    /// #1026 move-equivalence oracle for the candidate-SCORING iteration cap.
+    ///
+    /// The production structure search caps the per-candidate scoring refit's
+    /// inner iterations (`scoring_inner_max_iter`) well below the outer fit's
+    /// `inner_max_iter`, then re-refits each round's adopted winner at the full
+    /// budget. The economy is sound only if it does NOT change WHICH moves the
+    /// e-gate accepts (the gate ranks the capped-score candidate) NOR the adopted
+    /// dictionary (the winner is polished to the full-iter optimum). This runs
+    /// the real `run_production_structure_search` driver — same residual-bearing
+    /// target, seed, splits, budgets — twice: a full-iter REFERENCE
+    /// (`scoring_inner_max_iter == inner_max_iter`) and the CAPPED production
+    /// path, and asserts the accepted-move ledger is byte-identical and the
+    /// final fitted reconstruction matches to a tight tolerance. On a tractable
+    /// K/n where the full-iter reference completes, equivalence here certifies
+    /// the cap is a pure scoring-cost economy (the #1026 perf fix is quality- and
+    /// decision-preserving).
+    #[test]
+    fn scoring_iter_cap_preserves_moves_and_adopted_fit() {
+        // A residual-bearing single-atom fit so the birth channel mines a real
+        // shared-structure candidate the gate can certify (mirrors
+        // `residual_bearing_fit_harvests_birth_proposal`'s planted factor).
+        let n = 40usize;
+        let active: Vec<Vec<bool>> = (0..n).map(|_| vec![true]).collect();
+        let p = 4usize;
+        let u = [0.6_f64, -0.4, 0.5, -0.3];
+        let mut target = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let amp = 1.0 + (row as f64) / (n as f64);
+            for c in 0..p {
+                target[[row, c]] = amp * u[c % u.len()];
+            }
+        }
+        let config = RoundDriverConfig {
+            n_shards: 4,
+            budget: MoveBudget {
+                max_moves: 4,
+                alpha: 0.05,
+            },
+            max_rounds: 2,
+            harvest_params: HarvestParams {
+                max_fusions: 2,
+                max_fissions: 2,
+                max_births: 2,
+            },
+        };
+        let full_iters = 24usize;
+        let run = |scoring_inner_max_iter: usize| {
+            let (term, rho) = planted_term(&active);
+            let mut ledger = StructureLedger::new();
+            let refit_params = ProductionRefitParams {
+                inner_max_iter: full_iters,
+                scoring_inner_max_iter,
+                learning_rate: 1.0,
+                ridge_ext_coord: 1e-6,
+                ridge_beta: 1e-6,
+            };
+            let result = run_production_structure_search(
+                term,
+                rho,
+                target.view(),
+                config,
+                refit_params,
+                &mut ledger,
+            )
+            .unwrap();
+            let fitted = result.term.try_fitted().unwrap();
+            (result, fitted)
+        };
+
+        // Full-iter reference: scoring budget == full budget (no economy).
+        let (reference, ref_fitted) = run(full_iters);
+        // Production cap: a warm child re-equilibrates in very few iters.
+        let (capped, cap_fitted) = run(4);
+
+        // The accepted-move trajectory (verdicts + structural hashes) must be
+        // identical: the cap must not flip a single e-gate decision.
+        let ref_ledger = serde_json::to_string(&reference.rounds).unwrap();
+        let cap_ledger = serde_json::to_string(&capped.rounds).unwrap();
+        assert_eq!(
+            ref_ledger, cap_ledger,
+            "scoring-iteration cap changed the accepted-move ledger — the e-gate \
+             decisions are NOT cap-invariant (the #1026 economy is unsound)"
+        );
+        assert_eq!(
+            reference.term.k_atoms(),
+            capped.term.k_atoms(),
+            "scoring cap changed the discovered dictionary size"
+        );
+
+        // The adopted dictionary's reconstruction must match: the full-iter
+        // polish lands the capped path on the same inner optimum.
+        assert_eq!(ref_fitted.dim(), cap_fitted.dim());
+        let mut max_abs = 0.0_f64;
+        for (a, b) in ref_fitted.iter().zip(cap_fitted.iter()) {
+            max_abs = max_abs.max((a - b).abs());
+        }
+        assert!(
+            max_abs < 1e-6,
+            "capped-scoring adopted fit diverged from the full-iter reference by \
+             {max_abs:.3e} (> 1e-6); the polish did not reach the same optimum"
+        );
     }
 
     /// Estimation/eval split oracle: the split reserves estimation rows and

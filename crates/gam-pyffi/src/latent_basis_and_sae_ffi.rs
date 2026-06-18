@@ -2670,8 +2670,20 @@ fn sae_manifold_fit_inner<'py>(
             max_fissions: fissions_per_round,
             max_births: births_per_round,
         };
+        // The per-candidate scoring refit is capped well below the outer fit's
+        // `max_iter`: a structural move yields a WARM child (the parent's
+        // converged dictionary with one atom restructured), so only the touched
+        // atom must re-equilibrate before the held-out evidence gate can rank the
+        // candidate. The dominant cost of the search is ≈ (moves · rounds)
+        // full-dictionary refits over all N rows; capping the SCORING budget cuts
+        // it several-fold. Each round's accepted winner is re-refit at the full
+        // `max_iter` before adoption, so the returned dictionary still converges
+        // to the full-iter inner optimum — only the gate's ranking reads the
+        // capped score (#1026, verified move-equivalent on a tractable proxy).
+        const STRUCTURE_SCORING_INNER_MAX_ITER: usize = 8;
         let refit_params = gam::solver::structure_harvest::ProductionRefitParams {
             inner_max_iter: max_iter,
+            scoring_inner_max_iter: STRUCTURE_SCORING_INNER_MAX_ITER.min(max_iter),
             learning_rate,
             ridge_ext_coord,
             ridge_beta,
