@@ -8,7 +8,7 @@
 
 use gam::estimate::{ExternalOptimOptions, evaluate_externalgradient};
 use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
 use ndarray::{Array1, Array2, array};
 
 const RHO: f64 = 6.0;
@@ -167,7 +167,7 @@ fn production_probit_gradient_at_rho_six(oracle: &ProbitOracle) -> f64 {
         linear_constraints: None,
         firth_bias_reduction: None,
         penalty_shrinkage_floor: None,
-        rho_prior: Default::default(),
+        rho_prior: RhoPrior::Flat,
         kronecker_penalty_system: None,
         kronecker_factored: None,
         persist_warm_start_disk: false,
