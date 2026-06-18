@@ -108,13 +108,13 @@ fn poisson_level_diagnostic(
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit");
     };
-    let beta = &fit.fit.beta;
+    let beta: Array1<f64> = fit.fit.beta.clone();
     let n = y.len() as f64;
 
     // --- gam's fitted training mean from its converged beta on the SAME design ---
     let train_design = build_term_collection_design(train_rows.view(), &fit.resolvedspec)
         .expect("rebuild training design");
-    let eta_gam = train_design.design.apply(beta);
+    let eta_gam = train_design.design.apply(&beta);
     let mu_gam: Array1<f64> = eta_gam.mapv(f64::exp);
     let sum_mu = mu_gam.sum();
     let sum_y: f64 = y.iter().sum();
