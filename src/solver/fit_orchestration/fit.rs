@@ -872,20 +872,14 @@ fn survival_working_reml_score(state: &crate::pirls::WorkingState) -> f64 {
     0.5 * (state.deviance + state.penalty_term)
 }
 
-/// Recover the fitted Weibull baseline config from the anchor-CENTERED linear
-/// `[1, log t]` time-basis coefficients.
+/// Recover the fitted Weibull baseline config from the linear `[1, log t]`
+/// time-basis coefficients.
 ///
-/// The fit centers the time basis at the survival time anchor
-/// (`center_survival_time_designs_at_anchor`), which zeroes the constant column,
-/// so the constant-column coefficient `beta[0]` is UNIDENTIFIED (left at its
-/// stale seed). The identified baseline the model carries is
-/// `eta(t) = beta[1] * (log t - log anchor)`, exactly the Weibull form
-/// `eta(t) = shape * (log t - log scale)` with `shape = beta[1]` and
-/// `scale = anchor`. Reconstructing `scale` from `beta[0]` (the old
-/// `exp(-beta[0]/shape)`) reads the stale constant column and produces a wrong
-/// saved scale, misleading every consumer that rebuilds `H0(t) = (t/scale)^shape`
-/// from the saved scale (e.g. competing-risks CIF). Recover `scale` from the
-/// identified anchor instead (issue #899).
+/// The linear survival-time basis preserves its leading constant column during
+/// anchor centering, while centering only the log-time slope.  Thus the fitted
+/// time predictor is `β0 + β1·(log t - log anchor)`, which is equivalent to
+/// `shape·(log t - log scale)` with `shape = β1` and
+/// `log(scale) = log(anchor) - β0 / shape`.
 fn fitted_weibull_baseline_from_linear_time_beta(
     beta: &Array1<f64>,
     anchor: f64,
@@ -900,7 +894,14 @@ fn fitted_weibull_baseline_from_linear_time_beta(
     if !anchor.is_finite() || anchor <= 0.0 {
         return None;
     }
-    let scale = anchor;
+    let intercept = beta[0];
+    if !intercept.is_finite() {
+        return None;
+    }
+    let scale = (anchor.ln() - intercept / shape).exp();
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
     Some(
         crate::families::survival::construction::SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::Weibull,
@@ -1935,7 +1936,7 @@ pub(crate) fn fit_survival_transformation_model(
             // plain quadratic `λ βᵀSβ`; a non-zero centering would need an offset
             // the survival PenaltyBlock does not model, so such blocks are left to
             // the ridge rather than mis-applied.
-            for cov_penalty in &covariate_design.penalties {
+            for (penalty_idx, cov_penalty) in covariate_design.penalties.iter().enumerate() {
                 let cr = &cov_penalty.col_range;
                 let block_dim = cr.end - cr.start;
                 let matches_dims = cov_penalty.local.nrows() == block_dim
@@ -1949,7 +1950,11 @@ pub(crate) fn fit_survival_transformation_model(
                         matrix: cov_penalty.local.clone(),
                         lambda: 1e-2,
                         range: (p_time_total + cr.start)..(p_time_total + cr.end),
-                        nullspace_dim: 0,
+                        nullspace_dim: covariate_design
+                            .nullspace_dims
+                            .get(penalty_idx)
+                            .copied()
+                            .unwrap_or(0),
                     });
                 }
             }

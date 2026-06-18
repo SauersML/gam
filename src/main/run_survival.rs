@@ -58,20 +58,13 @@ pub(crate) fn build_survival_time_initial_beta(
     )
 }
 
-/// Recover the fitted Weibull `(scale, shape)` baseline from the anchor-CENTERED
-/// linear `[1, log t]` time-basis coefficients.
+/// Recover the fitted Weibull `(scale, shape)` baseline from the linear
+/// `[1, log t]` time-basis coefficients.
 ///
-/// The fit centers the time basis at the survival time anchor
-/// (`center_survival_time_designs_at_anchor`), which zeroes the constant column,
-/// so the constant-column coefficient `beta[0]` is UNIDENTIFIED (left at its
-/// stale seed). The identified baseline the model actually carries is
-/// `eta(t) = beta[1] * (log t - log anchor)`, exactly the Weibull form
-/// `eta(t) = shape * (log t - log scale)` with `shape = beta[1]` and
-/// `scale = anchor`. Reconstructing `scale` from `beta[0]` (the old
-/// `exp(-beta[0]/shape)`) reads the stale constant column and produces a wrong
-/// scale, so any consumer that rebuilds `H0(t) = (t/scale)^shape` from the saved
-/// scale (e.g. competing-risks CIF) is misled. Recover `scale` from the
-/// identified anchor instead (issue #899).
+/// The linear basis keeps its intercept column uncentered and centers only the
+/// log-time slope, so `η(t)=β0+β1·(log t-log anchor)`.  This is equivalent to
+/// `shape·(log t-log scale)` with `shape=β1` and
+/// `log(scale)=log(anchor)-β0/shape`.
 pub(crate) fn fitted_weibull_baseline_from_linear_time_beta(
     beta: &Array1<f64>,
     anchor: f64,
@@ -86,7 +79,14 @@ pub(crate) fn fitted_weibull_baseline_from_linear_time_beta(
     if !anchor.is_finite() || anchor <= 0.0 {
         return None;
     }
-    let scale = anchor;
+    let intercept = beta[0];
+    if !intercept.is_finite() {
+        return None;
+    }
+    let scale = (anchor.ln() - intercept / shape).exp();
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
     Some((scale, shape))
 }
 

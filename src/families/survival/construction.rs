@@ -1972,8 +1972,19 @@ pub fn center_survival_time_designs_at_anchor(
     // materialize to dense.  This only runs once at construction time.
     fn center_dense(dm: &mut DesignMatrix, anchor: &Array1<f64>) {
         let mut dense = dm.to_dense();
+        let preserve_leading_constant = !anchor.is_empty()
+            && (anchor[0] - 1.0).abs() <= 1e-12
+            && dense
+                .column(0)
+                .iter()
+                .all(|&value| (value - 1.0).abs() <= 1e-12);
         for mut row in dense.rows_mut() {
-            row -= &anchor.view();
+            for j in 0..row.len() {
+                if preserve_leading_constant && j == 0 {
+                    continue;
+                }
+                row[j] -= anchor[j];
+            }
         }
         *dm = DesignMatrix::Dense(DenseDesignMatrix::from(dense));
     }

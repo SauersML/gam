@@ -254,13 +254,26 @@ pub(crate) fn materialize_survival<'a>(
             config.time_smooth_lambda,
         )?
     };
-    // Marginal-slope centers the baseline-hazard I-spline at a robust interior
-    // exit-scale time (median exit) rather than the earliest entry age: under
-    // left truncation the earliest entry is a positive left-tail point and
-    // centering there inflates the unpenalized linear-trend column, blowing up
-    // the time-block seed score so REML rejects every seed (issue #751).
-    // Location-scale keeps the earliest-entry anchor.
-    let time_anchor = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+    // Transformation-scale models center the time basis at a robust interior
+    // exit-scale time (median exit) rather than at the right-censored entry
+    // origin.  The common right-censored shorthand has `entry == 0` for every
+    // row; anchoring a log-time basis there means `log(SURVIVAL_TIME_FLOOR)`,
+    // which turns the fitted Weibull/RP time slope into a huge one-signed
+    // column and leaves the baseline level to be reconstructed indirectly by
+    // the covariate intercept.  That is numerically ill-conditioned and makes
+    // the saved Weibull baseline/prediction calibration depend on an arbitrary
+    // time floor.  The median observed exit time is an interior, data-scale
+    // anchor: it is an exact affine reparameterization of η(t), but keeps the
+    // centered log-time/I-spline columns small and two-sided, improving AFT
+    // baseline recovery and monotone RP smoothing.  Location-scale keeps its
+    // historical entry-origin anchor because its reduced AFT parameterization
+    // intentionally carries the log-time baseline on the location channel.
+    let time_anchor = if matches!(
+        survival_mode,
+        SurvivalLikelihoodMode::MarginalSlope
+            | SurvivalLikelihoodMode::Transformation
+            | SurvivalLikelihoodMode::Weibull
+    ) {
         resolve_survival_marginal_slope_time_anchor_value(&age_entry, &age_exit, None)?
     } else {
         resolve_survival_time_anchor_value(&age_entry, None)?
