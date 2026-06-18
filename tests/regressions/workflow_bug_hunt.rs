@@ -53,6 +53,33 @@ fn resolve_family_accepts_binomial_logit_with_underscore_alias() {
 }
 
 #[test]
+fn resolve_family_accepts_bernoulli_aliases_for_binomial() {
+    let y = array![0.0, 1.0, 1.0, 0.0];
+    for (raw, expected_link) in [
+        ("bernoulli", StandardLink::Logit),
+        ("bernoulli_logit", StandardLink::Logit),
+        ("bernoulli-probit", StandardLink::Probit),
+        ("bernoulli(cloglog)", StandardLink::CLogLog),
+    ] {
+        let resolved = resolve_family(
+            Some(raw),
+            None,
+            None,
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .unwrap_or_else(|err| panic!("{raw} should resolve as a Bernoulli/Binomial alias: {err}"));
+        assert_eq!(
+            resolved.response,
+            ResponseFamily::Binomial,
+            "{raw} should map to the scalar Bernoulli/Binomial response family"
+        );
+        assert_eq!(resolved.link, InverseLink::Standard(expected_link));
+    }
+}
+
+#[test]
 fn resolve_family_binomial_with_explicit_link_overrides_default_logit() {
     // GitHub issue #155: family='binomial' + link='probit'/'cloglog' must be
     // accepted because the bare 'binomial' family name does not pin a link.
@@ -119,6 +146,10 @@ fn resolve_family_rejects_unknown_family_names() {
     assert!(
         err.contains("unknown family"),
         "unknown family error should include plain-language context"
+    );
+    assert!(
+        err.contains("bernoulli") && err.contains("gaussian") && err.contains("poisson"),
+        "unknown family error should list common accepted family values, got: {err}"
     );
 }
 

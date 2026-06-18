@@ -1,5 +1,11 @@
 use super::*;
 
+const SCALAR_FAMILY_NAMES_HELP: &str = "auto, gaussian, binomial/bernoulli, \
+binomial-logit/bernoulli-logit, binomial-probit/bernoulli-probit, \
+binomial-cloglog/bernoulli-cloglog, latent-cloglog-binomial, poisson, gamma, \
+beta/beta-regression, tweedie/tw, negative-binomial/negbin/nb, \
+royston-parmar, transformation-normal";
+
 /// Project an ingest-layer [`ColumnKindTag`] (plus the column's level table)
 /// onto the [`ResponseColumnKind`] consumed by the family layer.
 ///
@@ -236,28 +242,28 @@ pub fn resolve_family(
                     ),
                     false,
                 ),
-                "binomial" => (
+                "binomial" | "bernoulli" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Binomial,
                         InverseLink::Standard(StandardLink::Logit),
                     ),
                     false,
                 ),
-                "binomial-logit" => (
+                "binomial-logit" | "bernoulli-logit" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Binomial,
                         InverseLink::Standard(StandardLink::Logit),
                     ),
                     true,
                 ),
-                "binomial-probit" => (
+                "binomial-probit" | "bernoulli-probit" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Binomial,
                         InverseLink::Standard(StandardLink::Probit),
                     ),
                     true,
                 ),
-                "binomial-cloglog" => (
+                "binomial-cloglog" | "bernoulli-cloglog" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Binomial,
                         InverseLink::Standard(StandardLink::CLogLog),
@@ -395,7 +401,9 @@ pub fn resolve_family(
                 }
                 _ => {
                     return Err(WorkflowError::InvalidConfig {
-                        reason: format!("unknown family '{name}'"),
+                        reason: format!(
+                            "unknown family '{name}'; expected one of: {SCALAR_FAMILY_NAMES_HELP}"
+                        ),
                     }
                     .into());
                 }

@@ -2772,6 +2772,42 @@ fn gaussian_multistart_compares_converged_seed_costs() {
     assert_eq!(result.final_value, 0.0);
 }
 
+/// #1082 separable-multinomial guard: on an expensive-solver risk profile
+/// (ARC + GeneralizedLinear, `seed_budget = 2`), a first seed that lands a
+/// FEASIBLE cost-stall flat-valley result (the near-separable λ→0 ridge: finite
+/// cost, gradient never clears tolerance) must STOP the multi-start instead of
+/// paying a second expensive seed that cannot reach a stationary point.
+/// Regression for the penguin-species timeout where the wasted second seed
+/// crawled ~70s/eval.
+#[test]
+fn expensive_multistart_stops_after_feasible_nonstationary_seed() {
+    let plan = OuterPlan {
+        solver: Solver::Arc,
+        hessian_source: HessianSource::Analytic,
+    };
+    let mut result = OuterResult::new(array![0.0], 12.0, 9, false, plan);
+    result.final_grad_norm = Some(5.0);
+    result.operator_stop_reason = Some(OperatorTrustRegionStopReason::CostStallFlatValley);
+
+    assert!(
+        should_stop_expensive_multistart_after_best(Some(&result), Some(2), false),
+        "a finite cost-stall flat-valley result is the separable-fit signature; \
+         trying another expensive seed only repeats the λ→0 crawl (#1082)"
+    );
+
+    let mut plain_nonconverged = result.clone();
+    plain_nonconverged.operator_stop_reason = Some(OperatorTrustRegionStopReason::IterationBudget);
+    assert!(
+        !should_stop_expensive_multistart_after_best(Some(&plain_nonconverged), Some(2), false),
+        "ordinary finite nonconvergence may still be seed-sensitive and must keep the \
+         second expensive seed"
+    );
+    assert!(
+        !should_stop_expensive_multistart_after_best(Some(&result), Some(2), true),
+        "Gaussian quality-compare mode intentionally evaluates remaining seeds"
+    );
+}
+
 #[test]
 fn run_starts_solver_with_direct_startup_eval() {
     let mut seed_config = crate::seeding::SeedConfig::default();

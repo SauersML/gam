@@ -823,7 +823,15 @@ def fit(
         Wilkinson-style formula string (e.g. ``"y ~ s(x1) + te(x2, x3)"``).
     family:
         Likelihood family, or ``"auto"`` to infer from the response. Corresponds
-        to the ``--family`` CLI flag.
+        to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
+        ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
+        ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
+        ``"negbin"`` / ``"nb"``. Binomial/Bernoulli link spellings accept
+        ``"-logit"``, ``"-probit"``, ``"-cloglog"``, or mgcv-style
+        parentheses such as ``"bernoulli(probit)"``. Specialized values include
+        ``"gaussian-location-scale"`` when ``noise_formula`` is supplied,
+        ``"bernoulli-marginal-slope"``, ``"royston-parmar"``, and
+        ``"transformation-normal"``.
     offset:
         Name of the offset column. Corresponds to ``--offset-column``.
     weights:

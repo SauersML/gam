@@ -1017,14 +1017,22 @@ pub(crate) fn run_outer_with_plan(
                             // non-convergence reporting as MaxIterations.
                             let exit = cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
                             match exit {
-                                Some(exit) => Ok(outer_result_with_gradient_norm(
-                                    exit.rho,
-                                    exit.value,
-                                    exit.iterations,
-                                    Some(exit.grad_norm),
-                                    exit.converged,
-                                    *the_plan,
-                                )),
+                                Some(exit) => {
+                                    let mut result = outer_result_with_gradient_norm(
+                                        exit.rho,
+                                        exit.value,
+                                        exit.iterations,
+                                        Some(exit.grad_norm),
+                                        exit.converged,
+                                        *the_plan,
+                                    );
+                                    if !exit.converged {
+                                        result.operator_stop_reason = Some(
+                                            OperatorTrustRegionStopReason::CostStallFlatValley,
+                                        );
+                                    }
+                                    Ok(result)
+                                }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
                                     "ARC cost-stall sentinel fired without a published best \
                                      iterate ({context})"
@@ -1504,14 +1512,22 @@ pub(crate) fn run_outer_with_plan(
                             // panic and not a silently-relabeled optimum.
                             let exit = cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
                             match exit {
-                                Some(exit) => Ok(outer_result_with_gradient_norm(
-                                    exit.rho,
-                                    exit.value,
-                                    exit.iterations,
-                                    Some(exit.grad_norm),
-                                    exit.converged,
-                                    *the_plan,
-                                )),
+                                Some(exit) => {
+                                    let mut result = outer_result_with_gradient_norm(
+                                        exit.rho,
+                                        exit.value,
+                                        exit.iterations,
+                                        Some(exit.grad_norm),
+                                        exit.converged,
+                                        *the_plan,
+                                    );
+                                    if !exit.converged {
+                                        result.operator_stop_reason = Some(
+                                            OperatorTrustRegionStopReason::CostStallFlatValley,
+                                        );
+                                    }
+                                    Ok(result)
+                                }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
                                     "BFGS cost-stall sentinel fired without a published best \
                                      iterate ({context})"
@@ -1629,7 +1645,8 @@ pub(crate) fn run_outer_with_plan(
                     candidate.final_value,
                     candidate.converged,
                 );
-                if candidate_improves_best(&candidate, best.as_ref()) {
+                let candidate_improved = candidate_improves_best(&candidate, best.as_ref());
+                if candidate_improved {
                     best = Some(candidate);
                 }
                 let quality_compare_remaining_gaussian_seeds = matches!(
@@ -1640,6 +1657,48 @@ pub(crate) fn run_outer_with_plan(
                 if best.as_ref().is_some_and(|b| b.converged)
                     && !quality_compare_remaining_gaussian_seeds
                 {
+                    break;
+                }
+                // Separable-fit multi-start guard (#1082). On a near-separable
+                // fit (the penguin-species multinomial) the unpenalized MLE is
+                // unbounded, so NO seed certifies outer convergence: every seed's
+                // projected gradient plateaus above tolerance on the λ→0 ridge,
+                // and the cost-stall guard publishes a feasible-but-`converged =
+                // false` best. The converged-break above therefore never fires,
+                // and the existing `expensive_seed_limit` only counts seeds that
+                // FAIL outright (Err / non-finite cost). So the optimizer pays a
+                // SECOND expensive seed which lands in a deeper-separation ρ whose
+                // inner joint-Newton crawls (~70s/eval), spending hundreds of
+                // wall-clock seconds to "refine" a feasible fit it provably cannot
+                // beat — the penguin 360s timeout.
+                //
+                // Once an expensive seed has produced a FEASIBLE (finite-cost)
+                // best, stop: paying another expensive seed to chase a stationary
+                // point that does not exist (the separating MLE is at λ = 0) is
+                // the budget waste #1082 is about. This is gated on the
+                // expensive-solver risk profiles (`expensive_seed_limit.is_some()`
+                // — ARC GeneralizedLinear/Survival; the cheap-EFS and Gaussian
+                // quality-compare paths are untouched) and only triggers AFTER a
+                // feasible result exists, so a seed that fails to produce any
+                // usable fit still falls through to the next seed exactly as
+                // before. The published best is the converged-or-best-feasible
+                // iterate either way, so accuracy is unchanged; only the wasted
+                // second expensive crawl is removed.
+                if should_stop_expensive_multistart_after_best(
+                    best.as_ref(),
+                    expensive_seed_limit,
+                    quality_compare_remaining_gaussian_seeds,
+                ) {
+                    log::info!(
+                        "[OUTER] {context}: stopping expensive multi-start: a feasible \
+                         NON-stationary best is in hand (value={:.6e}); the projected gradient \
+                         plateaued without certifying (the near-separable λ→0 ridge), so further \
+                         expensive {:?} seeds cannot reach a stationary point and only burn \
+                         wall-clock",
+                        best.as_ref().map(|b| b.final_value).unwrap_or(f64::NAN),
+                        the_plan.solver,
+                    );
+                    stopped_early_due_to_limit = true;
                     break;
                 }
                 if !candidate_converged && matches!(expensive_seed_limit, Some(limit) if limit > 0)

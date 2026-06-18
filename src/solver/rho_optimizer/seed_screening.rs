@@ -486,3 +486,21 @@ pub(crate) fn candidate_improves_best(candidate: &OuterResult, best: Option<&Out
         Some(best) => candidate.final_value < best.final_value,
     }
 }
+
+#[inline]
+pub(crate) fn should_stop_expensive_multistart_after_best(
+    best: Option<&OuterResult>,
+    expensive_seed_limit: Option<usize>,
+    quality_compare_remaining_gaussian_seeds: bool,
+) -> bool {
+    !quality_compare_remaining_gaussian_seeds
+        && expensive_seed_limit.is_some()
+        && best.is_some_and(|b| {
+            b.final_value.is_finite()
+                && !b.converged
+                && matches!(
+                    b.operator_stop_reason,
+                    Some(OperatorTrustRegionStopReason::CostStallFlatValley)
+                )
+        })
+}

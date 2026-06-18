@@ -1327,6 +1327,7 @@ pub enum OperatorTrustRegionStopReason {
     Converged,
     RejectFloor,
     IterationBudget,
+    CostStallFlatValley,
     /// Family returned a non-operator Hessian mid-flight after routing into
     /// the operator path. Best-effort `x_k` returned with this reason; the
     /// caller should consider re-fitting under a different solver class
