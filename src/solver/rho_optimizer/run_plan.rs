@@ -1272,6 +1272,13 @@ pub(crate) fn run_outer_with_plan(
                     let cost_stall_grad_threshold = grad_tol
                         .threshold(seed_eval.cost, seed_grad_norm)
                         .max(COST_STALL_PROJECTED_GRAD_FLOOR);
+                    let mut cost_stall_guard = CostStallGuard::new(
+                        cost_stall_rel_tol,
+                        COST_STALL_WINDOW,
+                        cost_stall_grad_threshold,
+                        cost_stall_exit.clone(),
+                    );
+                    cost_stall_guard.observe_seed(seed, seed_eval.cost, seed_grad_norm);
                     let objective = OuterFirstOrderBridge {
                         obj,
                         layout,
@@ -1281,12 +1288,7 @@ pub(crate) fn run_outer_with_plan(
                         last_g_norm: None,
                         last_value_grad_rho: None,
                         value_probe_cache: Vec::new(),
-                        cost_stall: Some(CostStallGuard::new(
-                            cost_stall_rel_tol,
-                            COST_STALL_WINDOW,
-                            cost_stall_grad_threshold,
-                            cost_stall_exit.clone(),
-                        )),
+                        cost_stall: Some(cost_stall_guard),
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
                         consecutive_probe_refusals: 0,
                     };

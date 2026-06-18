@@ -7625,14 +7625,30 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
     };
     let rigid = derived_third_contracted(&program, 0, &dir4).unwrap();
 
-    eprintln!("=== FAILURE1 third-contracted (q0,q1,qd1,g) block ===");
+    const THIRD_CONTRACTED_TOL: f64 = 1e-5;
     for (u, &bu) in bidx.iter().enumerate() {
         for (v, &bv) in bidx.iter().enumerate() {
-            eprintln!(
-                "[{u},{v}] flex={:+.6e} fd_flexhess={:+.6e} rigid={:+.6e}",
-                flex_third[[bu, bv]],
-                fd_rich[[bu, bv]],
-                rigid[u][v]
+            let flex = flex_third[[bu, bv]];
+            let fd = fd_rich[[bu, bv]];
+            let rigid = rigid[u][v];
+
+            assert_close(
+                flex,
+                fd,
+                THIRD_CONTRACTED_TOL,
+                &format!("third-contracted flex vs FD at primary block ({u}, {v})"),
+            );
+            assert_close(
+                flex,
+                rigid,
+                THIRD_CONTRACTED_TOL,
+                &format!("third-contracted flex vs rigid at primary block ({u}, {v})"),
+            );
+            assert_close(
+                fd,
+                rigid,
+                THIRD_CONTRACTED_TOL,
+                &format!("third-contracted FD vs rigid at primary block ({u}, {v})"),
             );
         }
     }

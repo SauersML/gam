@@ -1684,6 +1684,69 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
 }
 
 #[test]
+fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
+    let seed = array![0.0];
+    let trial = array![1.0];
+    let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        |_: &mut (), _: &Array1<f64>| Ok(1.0),
+        |_: &mut (), _: &Array1<f64>| {
+            Err(EstimationError::InvalidInput(
+                "legacy eager eval should not run".to_string(),
+            ))
+        },
+        |_: &mut (), _: &Array1<f64>, _: OuterEvalOrder| Ok(OuterEval::infeasible(1)),
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, 1.0e-3, exit.clone());
+    guard.observe_seed(&seed, 10.0, 5.0e-4);
+    let lo = array![-10.0];
+    let hi = array![10.0];
+    let mut bridge = OuterFirstOrderBridge {
+        obj: &mut obj,
+        layout: OuterThetaLayout::new(1, 0),
+        outer_inner_cap: None,
+        iter_count: 0,
+        g_norm_initial: None,
+        last_g_norm: None,
+        last_value_grad_rho: None,
+        value_probe_cache: Vec::new(),
+        cost_stall: Some(guard),
+        cost_stall_bounds: Some((lo, hi)),
+        consecutive_probe_refusals: 0,
+    };
+
+    let mut sentinel_fired = false;
+    for _ in 0..(COST_STALL_WINDOW + 2) {
+        match ZerothOrderObjective::eval_cost(&mut bridge, &trial) {
+            Ok(cost) => panic!("infeasible probe unexpectedly returned finite cost {cost}"),
+            Err(ObjectiveEvalError::Fatal { message }) => {
+                assert_eq!(
+                    message, COST_STALL_CONVERGED_SENTINEL,
+                    "BFGS infeasible-probe halt must use the shared cost-stall sentinel"
+                );
+                sentinel_fired = true;
+                break;
+            }
+            Err(ObjectiveEvalError::Recoverable { .. }) => {}
+        }
+    }
+    assert!(
+        sentinel_fired,
+        "BFGS bridge must halt after {} consecutive infeasible probes when a finite seed is cached",
+        COST_STALL_WINDOW
+    );
+    let published = exit.lock().unwrap().take().expect("seed best published");
+    assert_eq!(published.rho, seed);
+    assert_eq!(published.value, 10.0);
+    assert_eq!(published.grad_norm, 5.0e-4);
+    assert!(published.converged);
+}
+
+#[test]
 fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());

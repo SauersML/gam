@@ -623,6 +623,37 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     trial_rho_distance,
                     self.iter_count
                 );
+                if let Some(guard) = self.cost_stall.as_mut() {
+                    match guard.observe_infeasible(x) {
+                        CostStallVerdict::Continue => {}
+                        CostStallVerdict::Converged => {
+                            log::info!(
+                                "[OUTER] cost-stall convergence (infeasible BFGS probes): {} \
+                                 consecutive infeasible probes after a finite seed/iterate; \
+                                 accepting best-so-far as a stationary optimum (value={:.6e}).",
+                                guard.infeasible_streak,
+                                guard.best_value,
+                            );
+                            return Err(ObjectiveEvalError::Fatal {
+                                message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                            });
+                        }
+                        CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
+                            log::warn!(
+                                "[OUTER] cost-stall halt (infeasible BFGS probes): {} \
+                                 consecutive infeasible probes after a finite seed/iterate; \
+                                 halting at best-so-far with residual |g|={:.3e} \
+                                 (value={:.6e}).",
+                                guard.infeasible_streak,
+                                residual_grad_norm,
+                                guard.best_value,
+                            );
+                            return Err(ObjectiveEvalError::Fatal {
+                                message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                            });
+                        }
+                    }
+                }
                 // Non-termination guard (#NaN-outer-loop): when every
                 // line-search probe is infeasible and BFGS has never
                 // accepted a gradient step (`iter_count == 0`), the
