@@ -1308,6 +1308,20 @@ pub(crate) fn direct_joint_hyper_inner_tolerance_follows_outer_target() {
     let (rho_only, _) = derivative_quality_options_and_warm_start(&tighter_options, None, false);
     assert_eq!(rho_only.inner_tol, tighter_options.inner_tol);
     assert_eq!(rho_only.inner_max_cycles, tighter_options.inner_max_cycles);
+
+    let explicitly_tight_options = BlockwiseFitOptions {
+        inner_tol: 1e-12,
+        outer_tol: 1e-10,
+        inner_max_cycles: 100,
+        ..BlockwiseFitOptions::default()
+    };
+    let (explicitly_tight, _) =
+        derivative_quality_options_and_warm_start(&explicitly_tight_options, None, true);
+    assert_eq!(
+        explicitly_tight.inner_tol, 1e-12,
+        "an explicitly sub-default inner tolerance should be honored down to the explicit direct joint-hyper floor instead of being loosened to outer_tol"
+    );
+    assert_eq!(explicitly_tight.inner_max_cycles, 100);
 }
 
 #[test]

@@ -2124,9 +2124,15 @@ pub(crate) fn derivative_quality_options_and_warm_start(
     // noise below the requested optimization accuracy without rejecting all
     // startup seeds after hundreds of accepted but numerically flat Newton
     // steps.
-    let direct_joint_hyper_inner_tol = eval_options
-        .outer_tol
-        .max(DIRECT_JOINT_HYPER_INNER_TOL_FLOOR);
+    let default_inner_tol = BlockwiseFitOptions::default().inner_tol;
+    let requested_tighter_than_default = eval_options.inner_tol < default_inner_tol;
+    let direct_joint_hyper_inner_tol = if requested_tighter_than_default {
+        eval_options.inner_tol.max(1.0e-12)
+    } else {
+        eval_options
+            .outer_tol
+            .max(DIRECT_JOINT_HYPER_INNER_TOL_FLOOR)
+    };
     let tolerance_differs = eval_options.inner_tol != direct_joint_hyper_inner_tol;
     let tightening = eval_options.inner_tol > direct_joint_hyper_inner_tol;
     let align = eval_options.inner_max_cycles > 1 && tolerance_differs;
