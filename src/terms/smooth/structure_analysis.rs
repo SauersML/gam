@@ -249,3 +249,100 @@ pub fn analyze_smooth_ownership(smoothspecs: &[SmoothTermSpec]) -> SmoothStructu
         term_owners,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::basis::{BSplineBasisSpec, BSplineKnotSpec, OneDimensionalBoundary};
+    use crate::terms::smooth::{BySmoothKind, ByVariableSpec, ShapeConstraint};
+
+    fn bspline(feature_col: usize) -> SmoothBasisSpec {
+        SmoothBasisSpec::BSpline1D {
+            feature_col,
+            spec: BSplineBasisSpec {
+                degree: 3,
+                penalty_order: 2,
+                knotspec: BSplineKnotSpec::Generate {
+                    data_range: (0.0, 1.0),
+                    num_internal_knots: 5,
+                },
+                double_penalty: false,
+                identifiability: BSplineIdentifiability::None,
+                boundary: OneDimensionalBoundary::Open,
+                boundary_conditions: Default::default(),
+            },
+        }
+    }
+
+    fn term(name: &str, basis: SmoothBasisSpec) -> SmoothTermSpec {
+        SmoothTermSpec {
+            name: name.to_string(),
+            basis,
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }
+    }
+
+    fn level_by_term(
+        name: &str,
+        feature_col: usize,
+        by_col: usize,
+        level_bits: u64,
+    ) -> SmoothTermSpec {
+        term(
+            name,
+            SmoothBasisSpec::ByVariable {
+                inner: Box::new(bspline(feature_col)),
+                by_col,
+                kind: BySmoothKind::Level { level_bits },
+                by: ByVariableSpec::Level {
+                    value_bits: level_bits,
+                    label: name.to_string(),
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn ungated_smooth_does_not_own_factor_by_level_smooth() {
+        let specs = vec![term("s(x)", bspline(0)), level_by_term("s(x):B", 0, 1, 42)];
+
+        let analysis = analyze_smooth_ownership(&specs);
+
+        assert_eq!(
+            analysis.term_owners[1],
+            Vec::<usize>::new(),
+            "ungated s(x) must not own the row-gated by-factor deviation smooth"
+        );
+    }
+
+    #[test]
+    fn same_factor_by_level_gate_keeps_normal_subset_ownership() {
+        let specs = vec![
+            level_by_term("s(x):B", 0, 2, 42),
+            term(
+                "te(x,z):B",
+                SmoothBasisSpec::ByVariable {
+                    inner: Box::new(SmoothBasisSpec::TensorBSpline {
+                        feature_cols: vec![0, 1],
+                        spec: Default::default(),
+                    }),
+                    by_col: 2,
+                    kind: BySmoothKind::Level { level_bits: 42 },
+                    by: ByVariableSpec::Level {
+                        value_bits: 42,
+                        label: "B".to_string(),
+                    },
+                },
+            ),
+        ];
+
+        let analysis = analyze_smooth_ownership(&specs);
+
+        assert_eq!(
+            analysis.term_owners[1],
+            vec![0],
+            "matching by-level gates may still use the ordinary nested smooth ownership rule"
+        );
+    }
+}
