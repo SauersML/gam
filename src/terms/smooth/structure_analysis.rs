@@ -157,7 +157,38 @@ fn compare_smooth_ownership_priority(
         .then(lhs_idx.cmp(&rhs_idx))
 }
 
+/// The `(by_col, level_bits)` row-gate of a factor-`by=` level smooth
+/// (`s(x, by=fac)`, treatment-contrast level), or `None` for any other smooth
+/// (including numeric-`by` scaling, which is NOT row-gated).
+///
+/// A level-gated smooth's design is zero on every row outside its level, so its
+/// columns are NOT in the column span of an un-gated (full-support) smooth on
+/// the same covariate. Ownership/orthogonalization must therefore skip it
+/// (otherwise the per-group deviation is residualized away to zero — #1276).
+fn factor_by_level_gate_of(term: &SmoothTermSpec) -> Option<(usize, u64)> {
+    match &term.basis {
+        SmoothBasisSpec::ByVariable {
+            by_col,
+            by: crate::terms::smooth::ByVariableSpec::Level { value_bits, .. },
+            ..
+        } => Some((*by_col, *value_bits)),
+        _ => None,
+    }
+}
+
 fn smooth_is_owned_by_prior_term(owner: &SmoothTermSpec, target: &SmoothTermSpec) -> bool {
+    // A factor-`by=` level smooth is row-gated (zero off its level), so its
+    // columns lie outside the span of any owner that is not gated to the SAME
+    // (by_col, level): the un-gated population smooth `s(x)` does not span the
+    // group deviation `s(x, by=g==level)`. Residualizing the gated deviation
+    // against the population smooth collapses it to zero (#1276). Identifiability
+    // of the deviation comes from its own factor-level gate + penalty, handled
+    // by `factor_by_level_gate` in design construction — not from ownership.
+    if let Some(target_gate) = factor_by_level_gate_of(target) {
+        if factor_by_level_gate_of(owner) != Some(target_gate) {
+            return false;
+        }
+    }
     let owner_features = smooth_term_feature_cols(owner)
         .into_iter()
         .collect::<BTreeSet<_>>();
