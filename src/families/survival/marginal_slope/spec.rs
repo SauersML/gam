@@ -310,7 +310,12 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
                 .into());
             }
         }
-        for ((row, col), &value) in spec.time_block.design_derivative_exit.indexed_iter() {
+        let derivative_design = spec
+            .time_block
+            .design_derivative_exit
+            .try_to_dense_by_chunks("survival marginal-slope coordinate-cone derivative audit")
+            .map_err(|reason| SurvivalMarginalSlopeError::IncompatibleDimensions { reason })?;
+        for ((row, col), &value) in derivative_design.indexed_iter() {
             if !value.is_finite() {
                 return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
                     reason: format!(
