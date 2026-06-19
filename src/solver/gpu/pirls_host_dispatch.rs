@@ -42,7 +42,6 @@ use std::sync::Arc;
 ///
 /// `materialize_reparam` is called lazily — only when every gating condition
 /// is satisfied — to produce the `ReparamResult` the GPU input needs.
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub(crate) fn try_gaussian_pls_gpu<F>(
     link_function: LinkFunction,
     config: &PirlsConfig,
@@ -64,6 +63,32 @@ pub(crate) fn try_gaussian_pls_gpu<F>(
 where
     F: FnOnce() -> Result<ReparamResult, EstimationError>,
 {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let callback_size = std::mem::size_of_val(&materialize_reparam);
+        log::trace!(
+            "[PIRLS GPU Gaussian PLS] declined on non-linux \
+             (link_bytes={}, max_iter={}, lower_bounds={}, original_constraints={}, \
+             fixed_cache={}, dense_penalty={}, qs={}, x_ptr={:p}, sparse_native={}, p={}, \
+             callback_size={}, y_len={}, prior_len={}, offset_len={}, frame_bytes={}, constraints={})",
+            std::mem::size_of_val(&link_function),
+            config.max_iterations,
+            penalty_coefficient_lower_bounds.is_some(),
+            penalty_linear_constraints_original.is_some(),
+            gaussian_fixed_cache.is_some(),
+            matches!(penalty_active, PirlsPenalty::Dense { .. }),
+            qs_arc.is_some(),
+            x_original,
+            use_sparse_native,
+            penalty_p,
+            callback_size,
+            y.len(),
+            priorweights.len(),
+            offset.len(),
+            std::mem::size_of_val(&coordinate_frame),
+            linear_constraints.is_some(),
+        );
+    }
     #[cfg(target_os = "linux")]
     if matches!(link_function, LinkFunction::Identity)
         && config.likelihood.spec.is_gaussian_identity()
@@ -142,7 +167,6 @@ where
 ///
 /// `materialize_reparam` is called lazily — only when the admission shim
 /// confirms the fit is eligible.
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub(crate) fn try_pirls_loop_gpu<F>(
     config: &PirlsConfig,
     penalty_active: &PirlsPenalty,
@@ -164,6 +188,32 @@ pub(crate) fn try_pirls_loop_gpu<F>(
 where
     F: FnOnce() -> Result<ReparamResult, EstimationError>,
 {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let callback_size = std::mem::size_of_val(&materialize_reparam);
+        log::trace!(
+            "[PIRLS GPU dispatch] declined on non-linux \
+             (max_iter={}, dense_penalty={}, no_kronecker={}, sparse_native={}, constraints={}, \
+             x_ptr={:p}, qs={}, p={}, result_x_ptr={:p}, callback_size={}, y_len={}, prior_len={}, \
+             offset_len={}, beta_len={}, link_bytes={}, frame_bytes={})",
+            config.max_iterations,
+            matches!(penalty_active, PirlsPenalty::Dense { .. }),
+            kronecker_runtime_is_none,
+            use_sparse_native,
+            linear_constraints.is_some(),
+            x_original,
+            qs_arc.is_some(),
+            penalty_p,
+            x_original_for_result,
+            callback_size,
+            y.len(),
+            priorweights.len(),
+            offset.len(),
+            initial_beta.len(),
+            std::mem::size_of_val(&link_function),
+            std::mem::size_of_val(&coordinate_frame),
+        );
+    }
     #[cfg(target_os = "linux")]
     use crate::solver::pirls::HessianCurvatureKind;
     #[cfg(target_os = "linux")]
