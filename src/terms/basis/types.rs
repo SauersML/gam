@@ -1038,6 +1038,18 @@ pub struct DuchonBasisSpec {
     pub operator_penalties: DuchonOperatorPenaltySpec,
     #[serde(default)]
     pub boundary: OneDimensionalBoundary,
+    /// Data-metric radial reparameterization `V` (#1355), mirroring the
+    /// thin-plate Wood-TPRS reparam. When `Some`, the constrained kernel
+    /// transform is folded to `Z·V` so the realized design columns rotate into
+    /// the `G_c`-orthonormal generalized eigenbasis of `Ω_c v = μ G_c v` and the
+    /// native penalty becomes the diagonal curvature-per-unit-data-variance
+    /// spectrum (mgcv's cliff), preventing the REML over-smoothing collapse to
+    /// EDF = 1. Frozen at the cold dense build and replayed verbatim by the
+    /// predict / κ-trial / ψ-derivative paths so they stay bit-consistent with
+    /// the fit-time design. `None` on the lazy/streaming path (huge `n`), which
+    /// retains the original constrained basis.
+    #[serde(default)]
+    pub radial_reparam: Option<Array2<f64>>,
 }
 
 impl DuchonBasisSpec {

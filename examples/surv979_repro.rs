@@ -14,8 +14,23 @@ const HEART_CSV: &str = concat!(
     "/bench/datasets/heart_failure_clinical_records_dataset.csv"
 );
 
+struct StderrInfoLogger;
+impl log::Log for StderrInfoLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("{}", record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+static LOGGER: StderrInfoLogger = StderrInfoLogger;
+
 fn main() {
     init_parallelism();
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
     let mut ds = load_csvwith_inferred_schema(Path::new(HEART_CSV)).expect("load heart-failure csv");
     let n_full = ds.values.nrows();
     let analysis_rows: Vec<usize> = (0..n_full).filter(|&i| i % 3 != 2).collect();
